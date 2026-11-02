@@ -14,8 +14,8 @@
 
 A step calls :meth:`Placement.begin` (clear the allocation state), then the row pass writes into its slots
 (:meth:`Placement.place_sorted_contact_rows`, :meth:`Placement.latch_status`, :meth:`Placement.warn_overflow`),
-:meth:`Placement.diagonals` and :meth:`Placement.pack_rows` (``Z = L^-1 P J^T`` with ``|Z|^2 + cfm``),
-:meth:`Placement.whiten_free_bodies`, :meth:`Placement.prepare_impulses` and :meth:`Placement.pack_free_body_meta`.
+:meth:`Placement.diagonals`, :meth:`Placement.whiten_free_bodies` (the free-body rows' headers),
+:meth:`Placement.prepare_impulses` and :meth:`Placement.pack_free_body_meta`.
 
 It also holds which placement the class takes: the native sparse size, the sparse-diagonal pair, the row producers and
 the local owners' per-world claim. The row pass and the sweeps read its fields.
@@ -1049,73 +1049,28 @@ class Placement:
         )
         self.unit_source = wp.full((self.forest.world_count, rows), 0, dtype=wp.int32, device=self.model.device)
 
-    def pack_rows(self, v_hat: wp.array, *, write_diag: int) -> None:
-        """Pack and whiten every world's dense rows and store the general worlds' diagonals as ``write_diag`` asks
-        (:func:`.packed_rows.pack_kernel`, one launch; :meth:`diagonals`). The one writer's rows (``walks``) are
-        whitened where they are written (:mod:`.walk_rows`)."""
-        if not self.mf_sweeps or self.walks:
-            return
-        # The local owners whiten their worlds' rows in the kernel and the keyed tiers walk theirs: the build leaves them,
-        # and keyed rows and the row packets keep them out of the store.
-        # A compact or sparse size keeps a placeholder factor: its rows have no dense factor.
-        sizes = tuple(sorted(size for size in self.forest.size_groups if self.factor.L_by_size[size].shape[1] == size))
-        wp.launch(
-            packed_rows.pack_kernel(sizes),
-            dim=self.forest.world_count * self.dense_max_constraints,
-            inputs=[
-                *(self.factor.L_by_size[size] for size in sizes),
-                self.row_sides,
-                self.forest.articulation_response_dof_count,
-                self.forest.art_group_idx,
-                self.forest.articulation_world_dof_offset,
-                self.forest.articulation_dof_start,
-                self.constraint_count,
-                self.dense_first,
-                self.mf_count_or_dummy(),
-                int(self.ink_skip_rows()),
-                self.local_solve_owner,
-                int(self.row_packets is not None or self.keyed_rows is not None),
-                self.row_cfm,
-                int(self.packed_dense),
-                write_diag,
-                v_hat,
-            ],
-            outputs=[self.packed_Z, self.diag, self.row_incident],
-            device=self.model.device,
-        )
-
-    def diagonals(self, v_hat: wp.array) -> int:
-        """The dense rows' diagonals, by the placement that holds them (:attr:`.step_plan.StepPlan.response`: the packed
-        rows; the sparse diagonal's and native sparse factors' writers store theirs); what the packed rows' build owes (:meth:`pack_rows`,
-        :func:`.packed_rows.pack_kernel`'s ``write_diag``): 0 nothing, 2 ``|Z|^2 + cfm``."""
-        if self.packed_response:
-            # The packed rows' build stores |Z|^2 + cfm in the general worlds; local row packets keep their worlds'
-            # private seeds.
-            if self.row_packets is None:
-                self.diag.zero_()
-            return 2
-        # Native sparse factors (case K1) and the sparse diagonal (K2, walk_rows): their writers store the diagonal with
-        # its CFM.
-        return 0
+    def diagonals(self) -> None:
+        """The dense rows' diagonals, by the placement that holds them (:attr:`.step_plan.StepPlan.response`): the packed
+        rows' start from zero for the one writer's ``|Z|^2 + cfm`` (local row packets keep their worlds' private seeds);
+        the sparse diagonal's and native sparse factors' writers store theirs with its CFM."""
+        if self.packed_response and self.row_packets is None:
+            self.diag.zero_()
 
     def whiten_free_bodies(self, v_hat: wp.array, dt: float):
-        """MF PGS setup: the free-body rows' diagonals and RHS, each row whitened through its body's held factor, or
-        by the walk where the placement walks (:func:`.walk_rows.free_body_headers_kernel`: the writer walked them)."""
+        """MF PGS setup: the free-body rows' diagonals and RHS, from the rows the one writer walked
+        (:func:`.walk_rows.free_body_headers_kernel`)."""
+        from .walk_rows import free_body_headers_kernel  # noqa: PLC0415
+
         model = self.model
         self.mf_eff_mass_inv.zero_()
-        if self.walks:
-            from .walk_rows import free_body_headers_kernel  # noqa: PLC0415
-
-            build, operands = free_body_headers_kernel, (self.factor.walk_view(), self.forest.body_to_articulation)
-        else:
-            build, operands = response_builds_rows.free_body_rows_kernel, (self.factor.view(),)
         wp.launch(
-            build,
+            free_body_headers_kernel,
             dim=self.forest.world_count * self.mf_max_constraints,
             inputs=[
                 bind_mf_rows(self),
                 self.mf_constraint_count,
-                *operands,
+                self.factor.walk_view(),
+                self.forest.body_to_articulation,
                 int(self.forest.has_prescribed_response),
                 v_hat,
                 self.laws.rigid_body_max_depenetration_velocity,

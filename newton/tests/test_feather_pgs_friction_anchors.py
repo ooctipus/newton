@@ -6,14 +6,15 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import field_group, response_builds_rows
+from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows, MfRows
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
-    BodyFactors,
     compute_world_contact_bias,
 )
+from newton._src.solvers.feather_pgs.tree_factor import WalkTrees
+from newton._src.solvers.feather_pgs.walk_rows import free_body_headers_kernel
 from newton.tests.feather_pgs_law_harness import row_lines
 
 _MU_JAW, _MU_BOX = 5.0, 0.5
@@ -363,7 +364,7 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, device="cpu"):
         wp.launch(compute_world_contact_bias, dim=(1, 3), inputs=inputs, device=device)
     elif family == "mf_setup":
         wp.launch(
-            response_builds_rows.free_body_rows_kernel,
+            free_body_headers_kernel,
             dim=3,
             inputs=[
                 field_group.upload(
@@ -382,7 +383,8 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, device="cpu"):
                     first=row_lines(device),
                 ),
                 count,
-                BodyFactors(),
+                WalkTrees(),
+                wp.zeros(1, dtype=wp.int32, device=device),
                 0,
                 wp.zeros((1,), dtype=wp.float32, device=device),
                 inf,

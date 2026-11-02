@@ -13,7 +13,9 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import kernels, response_builds_rows, row_laws
+from newton._src.solvers.feather_pgs import kernels, row_laws
+from newton._src.solvers.feather_pgs.tree_factor import WalkTrees
+from newton._src.solvers.feather_pgs.walk_rows import free_body_headers_kernel
 from newton.tests.feather_pgs_law_harness import (
     call,
     joint_type,
@@ -167,21 +169,31 @@ def _mf_layout(rng, worlds, rows):
     }
 
 
-def _body_factors(rng, bodies, device, *, identity=False):
-    """Each body's leaf-first factor of an SPD 6x6 mass matrix (``L_by_size[6]``, one per body: ``P H P^T = L L^T``
-    with ``P`` the coordinates reversed), its articulation the body."""
-    if identity:
-        lower = np.tile(np.eye(6), (bodies, 1, 1))
-    else:
-        a = rng.normal(size=(bodies, 6, 6))
-        lower = np.linalg.cholesky(a @ np.transpose(a, (0, 2, 1)) + 6.0 * np.eye(6))
-    factors = kernels.BodyFactors()
-    factors.body_to_articulation = wp.array(np.arange(bodies, dtype=np.int32), device=device)
-    factors.factor_index = wp.array(np.arange(bodies, dtype=np.int32), device=device)
-    factors.dof_start = wp.array((6 * np.arange(bodies)).astype(np.int32), device=device)
-    factors.dof_factor = wp.array(np.full(6 * bodies, -1, dtype=np.int32), device=device)
-    factors.L = wp.array(lower.astype(np.float32), dtype=float, device=device)
-    return factors, lower.astype(np.float32).astype(np.float64)
+@wp.kernel
+def _row_incident(
+    mf_body_a: wp.array2d[int],
+    mf_body_b: wp.array2d[int],
+    mf_J_a: wp.array3d[float],
+    mf_J_b: wp.array3d[float],
+    body_to_articulation: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    incident_velocity: wp.array[float],
+    incident: wp.array2d[float],
+):
+    """Each free-body row's ``J v_hat``, its sides in turn (the order :func:`_law_mf_position_rhs` sums)."""
+    world, i = wp.tid()
+    value = float(0.0)
+    ba = mf_body_a[world, i]
+    if ba >= 0:
+        dof_start = articulation_dof_start[body_to_articulation[ba]]
+        for k in range(6):
+            value += mf_J_a[world, i, k] * incident_velocity[dof_start + k]
+    bb = mf_body_b[world, i]
+    if bb >= 0:
+        dof_start = articulation_dof_start[body_to_articulation[bb]]
+        for k in range(6):
+            value += mf_J_b[world, i, k] * incident_velocity[dof_start + k]
+    incident[world, i] = value
 
 
 @wp.kernel
@@ -250,13 +262,16 @@ def _law_mf_position_rhs(
 
 
 def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
-    """Equal the free-body rows' build (``free_body_rows_kernel``): the contact law with its bodies' depenetration cap
-    and weights."""
+    """Equal the free-body rows' headers (``walk_rows.free_body_headers_kernel``): the contact law with its bodies'
+    depenetration cap and weights, from the incident velocity the walk summed."""
     rng = np.random.default_rng(13)
     worlds, rows = 8, 48
     layout = _mf_layout(rng, worlds, rows)
     phi = scalars(rng, worlds * rows, 0.02).reshape(worlds, rows)
     kind = rng.choice(np.array([0, 0, 0, 2, 4], dtype=np.int32), (worlds, rows))
+    # A speed row's diagonal walks its body's covector, which needs the body's walk: here its rows name no body.
+    for side in "ab":
+        layout[f"mf_body_{side}"] = np.where(kind == 4, -1, layout[f"mf_body_{side}"]).astype(np.int32)
     target = scalars(rng, worlds * rows).reshape(worlds, rows)
     restitution = rng.choice(np.array([0.0, 0.0, 0.5, 1.0], dtype=np.float32), (worlds, rows))
     shared = {
@@ -272,19 +287,29 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
         "contact_speculative_scale": 0.9,
         "restitution_velocity_threshold": 0.2,
     }
-    factors, lower = _body_factors(rng, 2 * worlds, device)
+    # Each row's incident velocity J v_hat, which the one writer sums along its walks (here in the law's order).
+    incident = call(
+        _row_incident,
+        (worlds, rows),
+        device,
+        mf_J_a=shared["mf_Z_a"],
+        mf_J_b=shared["mf_Z_b"],
+        incident=np.zeros((worlds, rows), dtype=np.float32),
+        **shared,
+    )["incident"]
     out = call(
-        response_builds_rows.free_body_rows_kernel,
+        free_body_headers_kernel,
         worlds * rows,
         device,
         mf_constraint_count=np.full(worlds, rows, dtype=np.int32),
-        factors=factors,
+        walk=WalkTrees(),
+        v_hat=layout["incident_velocity"],
         pgs_cfm=1.0e-6,
         mf_max_constraints=rows,
         weighted=1,
         material=0,
         mf_eff_mass_inv=np.zeros((worlds, rows), dtype=np.float32),
-        mf_row_incident=np.zeros((worlds, rows), dtype=np.float32),
+        mf_row_incident=incident,
         mf_rhs=np.zeros((worlds, rows), dtype=np.float32),
         mf_row_w=np.ones((worlds, rows), dtype=np.float32),
         **shared,
@@ -299,24 +324,17 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
         mf_J_b=shared["mf_Z_b"],
         **shared,
     )
-    # The whitened rows: Z = L^-1 P J^T per body (factor coordinate i at position 5 - i; a speed row keeps its axis),
-    # and A_ii = cfm + J H^-1 J^T with H = P^T L L^T P.
-    Z = {side: out[f"mf_Z_{side}"].numpy().astype(np.float64) for side in "ab"}
+    # The walked rows' diagonal: A_ii = cfm + |Z_a|^2 + |Z_b|^2 over the bodies a row names.
     diagonal = np.full((worlds, rows), 1.0e-6)
-    for side, bodies in (("a", layout["mf_body_a"]), ("b", layout["mf_body_b"])):
-        J = shared[f"mf_Z_{side}"].astype(np.float64)
-        for world, row in zip(*np.nonzero(bodies >= 0), strict=True):
-            factor = lower[bodies[world, row]]
-            whitened = np.linalg.solve(factor, J[world, row][::-1])[::-1]
-            expected = J[world, row] if kind[world, row] == 4 else whitened
-            np.testing.assert_allclose(Z[side][world, row], expected, rtol=1e-5, atol=1e-5)
-            diagonal[world, row] += J[world, row] @ np.linalg.solve((factor @ factor.T)[::-1, ::-1], J[world, row])
+    for side in "ab":
+        bodies, Z = layout[f"mf_body_{side}"], layout[f"mf_Z_{side}"].astype(np.float64)
+        diagonal += np.where(bodies >= 0, (Z * Z).sum(axis=2), 0.0)
     np.testing.assert_allclose(out["mf_eff_mass_inv"].numpy(), 1.0 / diagonal, rtol=1e-5)
     reference_rhs, law_rhs = out["mf_rhs"].numpy(), law["rhs"].numpy()
     np.testing.assert_array_equal(out["mf_row_w"].numpy(), law["row_w"].numpy())
     magnitude = np.abs(phi) * 60.0 + np.abs(target)
     test.assertLessEqual(
-        unified("mf rhs (free_body_rows_kernel)", reference_rhs.ravel(), law_rhs.ravel(), magnitude.ravel(), 2.0),
+        unified("mf rhs (free_body_headers_kernel)", reference_rhs.ravel(), law_rhs.ravel(), magnitude.ravel(), 2.0),
         2.0,
     )
     # Rows whose bias the variant does not touch (speed rows, restitution) stay bitwise.

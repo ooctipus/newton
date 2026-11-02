@@ -1,43 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Build the row responses of the free-body and factor-row representations, and publish their velocities.
+"""The free-body rows' headers and addressing, the bilateral closure and the pairs' qualification.
 
-A :class:`.response_operator.ResponseOperator` owns the arithmetic a sweep runs on a row's response. Its *build*
-forms that response from the row's Jacobian and the mass operator. This module holds the builds of three
-representations, and the publication of the one whose sweep leaves its velocity change outside the kernel:
+The rows are the walk's (:mod:`.walk_rows`: the one writer walks every row's seeds into its whitened form ``Z``). This
+module holds what is built around them:
 
-- :class:`.response_operator.FreeBodyZ` (rows over at most two free bodies): each row whitened per body, ``Z =
-  L^-1 J^T`` through the body's held factor, and ``1 / A_ii``, and the rows' body coordinates in each addressing a
-  mapping reads (a world's local body slots, world and global coordinates, the packed row word);
-- :class:`.response_operator.SparseFactor` (rows ``Z = L^-1 P J^T`` packed by support): the factor and its inverse
-  that its predictor reads; its rows and their leave are the walk's (:mod:`.walk_rows`);
-- :class:`.response_operator.FactorRows` (a pair's rows in factor coordinates, a lane per coordinate): the packed
-  rows at their world coordinates (:mod:`.packed_rows`);
+- the free-body rows (:class:`.response_operator.FreeBodyZ`, rows over at most two free bodies): each row's header
+  (:func:`free_body_row_header`: ``1 / A_ii``, ``rhs`` and the row's weight from its incident velocity), its bodies'
+  coordinates in the addressing a mapping reads (:func:`free_body_coordinates_kernel`) and the packed row word
+  (:func:`free_body_meta_kernel`, which :meth:`.FreeBodyZ.consume` decodes);
+- the bilateral closure (:func:`close_block`, :func:`close_row`, :func:`seed_blocks_kernel`), the Schur transform the
+  one writer's block phase applies to fold a world's bilateral block into the responses of its other rows;
+- the paired factor rows' qualification (:func:`paired_components_kernel`).
 
-and the bilateral closure (:func:`close_block`, :func:`close_row`, :func:`seed_blocks_kernel`), the Schur transform the
-one writer's block phase applies to fold a world's bilateral block into the responses of its other rows.
-
-**API.** Each operator class returns its build from ``build()`` (``FreeBodyZ.build()``, ``SparseFactor.build()``,
-``FactorRows.build()``; the sparse diagonal's rows are the walk's, :mod:`.walk_rows`): a frozen descriptor whose
-members are the Warp kernels (or cached factories of kernel variants, or a Warp function) of each step of the build
-and of the publication; the solver's launch sites call them directly. The arithmetic of a step is one function per representation and mapping, called by
-every kernel that runs the step:
-
-- the Warp kernels call Warp functions (``free_body_response``, ``packed_product``...),
-  one expression tree on both devices;
-- the native kernels call the operator's emitters (:meth:`.FreeBodyZ.pack` writes the row word that
-  :meth:`.FreeBodyZ.consume` decodes; :func:`factor_rows` packs factor rows from their support, the layout
-  :class:`.SparseFactor` reads; :meth:`.FactorRows.transposed` is the factor product of a lane per coordinate).
-
-Where two forms of a step differ only by accident (the order of an operation, a guard), the step keeps each form,
-chosen by a compile-time argument, and its documentation names the difference for their unification.
+The Warp kernels call Warp functions, one expression tree on both devices; the native kernels call the operators'
+emitters.
 """
 
 from __future__ import annotations
 
-import dataclasses
-from collections.abc import Callable
 from functools import cache
 
 import warp as wp
@@ -50,9 +32,6 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
-    BodyFactors,
-    factor_whiten,
-    free_body_factor,
 )
 from .paired_components import FREE_BODY_DOFS, PAIRED_COMPONENT_THREADS, PairedComponentData
 from .projection_laws import BILATERAL_PIVOT
@@ -73,11 +52,10 @@ from .solver_fields import Preelim
 # ---------------------------------------------------------------------------------------------------------------------
 #
 # A free-body row acts on at most two free rigid bodies, ``a`` and ``b`` (a negative body for none), through six
-# entries each. A free body is a one-node tree whose mass matrix ``H = L L^T`` the dynamics factor (its held factor,
-# armature included: :class:`.kernels.BodyFactors`), and its rows are whitened: the writers store each side's ``J``
-# and the build replaces it with ``Z = L^-1 J^T``, so ``A_ii = cfm + |Z_a|^2 + |Z_b|^2`` and the sweeps hold the
-# change of the bodies' velocities in factor coordinates ``u = L^T dv``. A body's six velocity coordinates start at its
-# articulation's first coordinate, in the addressing the mapping reads: global (``articulation_dof_start``) or world
+# entries each. A free body is a one-node tree; the one writer walks each side's seed into ``Z = L^-1 J^T`` (its walk's
+# factor, armature included), so ``A_ii = cfm + |Z_a|^2 + |Z_b|^2`` and the sweeps hold the change of the bodies'
+# velocities in factor coordinates ``u = L^T dv``. A body's six velocity coordinates start at its articulation's first
+# coordinate, in the addressing the mapping reads: global (``articulation_dof_start``) or world
 # (``articulation_world_dof_offset``).
 
 
@@ -87,75 +65,6 @@ def body_coordinate(body: int, body_to_articulation: wp.array[int], first: wp.ar
     if body < 0:
         return -1
     return first[body_to_articulation[body]]
-
-
-@wp.func
-def free_body_whiten(Z: wp.array3d[float], world: int, row: int, body: int, factors: BodyFactors, store: bool):
-    """Whiten one side of row ``row``, ``Z = L^-1 J^T`` (in place when ``store``), and return its term ``|Z|^2`` of
-    the diagonal (zero for no body)."""
-    if body < 0:
-        return 0.0
-    jacobian = wp.spatial_vector(
-        Z[world, row, 0], Z[world, row, 1], Z[world, row, 2], Z[world, row, 3], Z[world, row, 4], Z[world, row, 5]
-    )
-    z = factor_whiten(factors.L, free_body_factor(body, factors), jacobian)
-    if store:
-        for k in range(6):
-            Z[world, row, k] = z[k]
-    return wp.dot(z, z)
-
-
-@wp.func
-def free_body_response(
-    Z_a: wp.array3d[float],
-    Z_b: wp.array3d[float],
-    world: int,
-    row: int,
-    body_a: int,
-    body_b: int,
-    row_type: int,
-    factors: BodyFactors,
-    cfm: float,
-) -> float:
-    """Whiten row ``row``'s sides and return its stored diagonal ``1 / A_ii``.
-
-    ``A_ii = cfm + |Z_a|^2 + |Z_b|^2`` adds each present body's term in turn to ``cfm``; a non-positive ``A_ii``
-    stores zero (the row does not move). A speed row keeps its axis ``J = e_k`` unwhitened (its law reads the body's
-    velocity through the factor, not a row) and takes ``A_ii = cfm + |L^-1 e_k|^2``.
-    """
-    store = row_type != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
-    diagonal = cfm
-    diagonal += free_body_whiten(Z_a, world, row, body_a, factors, store)
-    diagonal += free_body_whiten(Z_b, world, row, body_b, factors, store)
-    if diagonal > 0.0:
-        return 1.0 / diagonal
-    return 0.0
-
-
-@wp.func
-def free_body_jacobian_velocity(
-    J_a: wp.array3d[float],
-    J_b: wp.array3d[float],
-    world: int,
-    row: int,
-    body_a: int,
-    body_b: int,
-    body_to_articulation: wp.array[int],
-    first: wp.array[int],
-    velocity: wp.array[float],
-) -> float:
-    """``J_row v`` of the writers' (unwhitened) rows over a velocity in the addressing ``first``: from zero, body
-    ``a``'s six products, then ``b``'s."""
-    value = float(0.0)
-    if body_a >= 0:
-        start = body_coordinate(body_a, body_to_articulation, first)
-        for k in range(6):
-            value += J_a[world, row, k] * velocity[start + k]
-    if body_b >= 0:
-        start = body_coordinate(body_b, body_to_articulation, first)
-        for k in range(6):
-            value += J_b[world, row, k] * velocity[start + k]
-    return value
 
 
 @wp.func
@@ -257,76 +166,6 @@ def free_body_row_header(
 
 
 @wp.kernel(enable_backward=False)
-def free_body_rows_kernel(
-    mf: MfRows,
-    mf_constraint_count: wp.array[int],
-    factors: BodyFactors,
-    has_target_velocity: int,
-    incident_velocity: wp.array[float],
-    rigid_body_max_depenetration_velocity: wp.array[float],
-    pgs_cfm: float,
-    pgs_beta: float,
-    contact_w: float,
-    dt: float,
-    contact_speculative_scale: float,
-    restitution_velocity_threshold: float,
-    mf_max_constraints: int,
-    weighted: int,
-    material: int,
-    # outputs
-    mf_eff_mass_inv: wp.array2d[float],
-    mf_row_w: wp.array2d[float],
-):
-    """Whiten each free-body row (:func:`free_body_response`) and store its header (:func:`free_body_row_header`).
-
-    One thread per row slot (``world * mf_max_constraints + row``). A row's incident velocity ``J v_hat`` comes from
-    the writers' ``J`` (a speed row, which carries no ``J``, zero). A class whose placement walks writes its rows by
-    the walk and builds them with :func:`.walk_rows.free_body_headers_kernel`.
-    """
-    tid = wp.tid()
-    world = tid // mf_max_constraints
-    i = tid % mf_max_constraints
-    if i >= mf_constraint_count[world]:
-        return
-    mf_line = mf.first[world]
-    body_a = mf.body_a[mf_line, i]
-    body_b = mf.body_b[mf_line, i]
-    row_type = mf.row_type[mf_line, i]
-    incident = float(0.0)
-    if row_type != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
-        incident = free_body_jacobian_velocity(
-            mf.Z_a,
-            mf.Z_b,
-            mf_line,
-            i,
-            body_a,
-            body_b,
-            factors.body_to_articulation,
-            factors.dof_start,
-            incident_velocity,
-        )
-    inverse = free_body_response(mf.Z_a, mf.Z_b, mf_line, i, body_a, body_b, row_type, factors, pgs_cfm)
-    free_body_row_header(
-        mf,
-        mf_line,
-        i,
-        incident,
-        inverse,
-        has_target_velocity,
-        rigid_body_max_depenetration_velocity,
-        pgs_beta,
-        contact_w,
-        dt,
-        contact_speculative_scale,
-        restitution_velocity_threshold,
-        weighted,
-        material,
-        mf_eff_mass_inv,
-        mf_row_w,
-    )
-
-
-@wp.kernel(enable_backward=False)
 def free_body_coordinates_kernel(
     mf_first: wp.array[int],
     mf_constraint_count: wp.array[int],
@@ -397,28 +236,6 @@ def free_body_meta_kernel(mf_max_constraints: int, device_arch: str) -> wp.Kerne
         composed=True,
         native_name="free_body_meta_native",
     ).kernel()
-
-
-@dataclasses.dataclass(frozen=True)
-class FreeBodyZBuild:
-    """The build of free-body rows (:class:`.response_operator.FreeBodyZ`).
-
-    Attributes:
-        rows: Each row's whitened entries, stored inverse diagonal, incident velocity and ``rhs``
-            (:func:`free_body_rows_kernel`).
-        coordinates: Each row's bodies' first world coordinates (:func:`free_body_coordinates_kernel`).
-        meta: The factory of the row-word pack (:func:`free_body_meta_kernel`).
-    """
-
-    rows: wp.Kernel
-    coordinates: wp.Kernel
-    meta: Callable[[int, str], wp.Kernel]
-
-
-FREE_BODY_Z = FreeBodyZBuild(
-    rows=free_body_rows_kernel, coordinates=free_body_coordinates_kernel, meta=free_body_meta_kernel
-)
-"""The free-body rows' build (:meth:`.FreeBodyZ.build`)."""
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -719,19 +536,3 @@ def paired_components_kernel(primary_size: int, secondary_size: int = FREE_BODY_
         dual=True,
         native_name="paired_components_native",
     ).kernel()
-
-
-@dataclasses.dataclass(frozen=True)
-class FactorRowsBuild:
-    """The build of a pair's factor rows (:class:`.response_operator.FactorRows`): the rows themselves are the packed
-    rows at their world coordinates (:mod:`.packed_rows`).
-
-    Attributes:
-        components: The factory of the qualification (:func:`paired_components_kernel`).
-    """
-
-    components: Callable[..., wp.Kernel]
-
-
-FACTOR_ROWS = FactorRowsBuild(components=paired_components_kernel)
-"""The paired factor rows' build (:meth:`.FactorRows.build`)."""

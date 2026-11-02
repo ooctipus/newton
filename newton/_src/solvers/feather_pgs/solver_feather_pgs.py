@@ -1181,13 +1181,12 @@ class SolverFeatherPGS(SolverBase):
         # The diagonals (the packed rows' |Z|^2 + cfm, the sparse diagonal's) and the bias (the sweeps compute J v
         # each iteration).
         with wp.ScopedTimer("S4_HinvJt_Diag_RHS", print=False, use_nvtx=self._nvtx, synchronize=False):
-            packed_diag = self.placement.diagonals(self.v_hat)
+            self.placement.diagonals()
             if self.placement.walks and self.routes.case != "K2":
                 # The one writer: seeds walked into the packed rows or the support sink, their headers (walk_rows). The
                 # sparse diagonal's rows are written whole in the row pass (RowLaws.write_slot_rows).
                 self.laws.write_walked(self, state_in, contacts, dt)
             else:
-                self.placement.pack_rows(self.v_hat, write_diag=packed_diag)
                 self.laws.write_rhs(self, dt)
 
         # MF: whiten the rows (Z = L^-1 J^T), their mf_rhs, mf_eff_mass_inv and incident velocities

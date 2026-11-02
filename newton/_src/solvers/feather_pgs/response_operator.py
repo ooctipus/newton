@@ -640,16 +640,6 @@ class FreeBodyZ(ResponseOperator):
         if self.entry is not None and self.lanes.parallel:
             raise ValueError("staged entries take the one-thread layout")
 
-    # -- build (response_builds_rows) ---------------------------------------------------------------------------------
-
-    @staticmethod
-    def build():
-        """The rows' build and publication (:data:`.response_builds_rows.FREE_BODY_Z`): each row's ``Z`` and
-        ``1 / A_ii``, the rows' body coordinates and words (:meth:`pack`), and ``v += L^-T sum Z lambda``."""
-        from .response_builds_rows import FREE_BODY_Z  # noqa: PLC0415
-
-        return FREE_BODY_Z
-
     def pack(self, word: str, dof_a: str, dof_b: str, inverse: str, rhs: str, kind: str, parent: str, indent: str):
         """Declare ``int4 word``, a row's packed word as :meth:`consume` decodes it.
 
@@ -1981,16 +1971,6 @@ class FactorRows(ResponseOperator):
     diagonal: Callable[[str], str] | None = None
     inverse: Callable[[str], str] | None = None
     name = "factor_rows"
-
-    # -- build (response_builds_rows) ---------------------------------------------------------------------------------
-
-    @staticmethod
-    def build():
-        """The rows' build (:data:`.response_builds_rows.FACTOR_ROWS`): the rows ``Z = L^-1 J^T`` (``A_ii = |Z|^2 +
-        cfm``) are the packed rows at their world coordinates (:mod:`.packed_rows`)."""
-        from .response_builds_rows import FACTOR_ROWS  # noqa: PLC0415
-
-        return FACTOR_ROWS
 
     def load(self, row: str) -> str:
         """This lane's coordinate of row ``row`` (zero past ``dofs``)."""
