@@ -18,7 +18,8 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.paired_components import PairedComponentData
-from newton._src.solvers.feather_pgs.response_operator import FactorRows, FreeBodyZ, SparseFactor
+from newton._src.solvers.feather_pgs.response_operator import FactorRows, FreeBodyZ
+from newton._src.solvers.feather_pgs.tree_factor import WALK_COORDINATE
 from newton.tests.feather_pgs_law_harness import row_lines
 
 DEVICE = "cpu"
@@ -86,12 +87,10 @@ class TestFreeBodyZBuild(unittest.TestCase):
         np.testing.assert_allclose(1.0 / solver.placement.mf_eff_mass_inv.numpy()[0, :rows], expected, rtol=1e-5)
 
 
-def _lower_factors(rng, groups, size):
-    factor = np.tril(rng.normal(size=(groups, size, size))) * 0.3
-    for group in range(groups):
-        factor[group][np.diag_indices(size)] = rng.uniform(0.5, 2.0, size)
-    factor[0, 2, 2] = 0.0  # a zero pivot: the solves' zero convention
-    return factor.astype(np.float32)
+def _walk_records(rng, trees, size):
+    """The walk's records (:data:`.tree_factor.WALK_COORDINATE` floats a coordinate) of ``trees`` trees of ``size``
+    coordinates, one after another: finite and bounded, the qualification's read of each primary tree's factor."""
+    return (rng.normal(size=(trees * size, WALK_COORDINATE)) * 0.3).astype(np.float32)
 
 
 def _components_data(P, rng, *, qualified=True):
@@ -109,9 +108,9 @@ def _components_data(P, rng, *, qualified=True):
         meta[:, row * 4 + 1] = np.float32(0.5).view(np.int32)
         meta[:, row * 4 + 2] = np.float32(0.1).view(np.int32)
         meta[:, row * 4 + 3] = np.array(kind | (parent << 16), np.uint32).view(np.int32)
-    L = _lower_factors(rng, 2, P)
+    walk = _walk_records(rng, 2, P)
     if not qualified:
-        L[0, 0, 0] = np.inf
+        walk[0, 0] = np.inf
     return field_group.upload(
         PairedComponentData,
         DEVICE,
@@ -123,7 +122,9 @@ def _components_data(P, rng, *, qualified=True):
         primary_group=np.array([0, 1], np.int32),
         selector=np.full(2, 7, np.int32),
         Y=Y,
-        L=L,
+        primary_art=np.array([0, 1], np.int32),
+        dof_start=np.array([0, P], np.int32),
+        walk=walk,
         rhs=rng.normal(size=(2, M)).astype(np.float32),
         diag=rng.uniform(0.1, 1.0, (2, M)).astype(np.float32),
         mu=np.full((2, M), 0.5, np.float32),
@@ -180,7 +181,6 @@ class TestNativeBuildsAssemble(unittest.TestCase):
     def test_native_builds_assemble_without_spills(self):
         builds = {
             "free-body words": lambda: FreeBodyZ.build().meta(64, "sm_120"),
-            "factor": lambda: SparseFactor.build().factor(12, 30),
             "paired components": lambda: FactorRows.build().components(22),
         }
         for name, build in builds.items():
