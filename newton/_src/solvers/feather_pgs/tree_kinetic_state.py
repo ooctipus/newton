@@ -1662,7 +1662,7 @@ def _solve_operations(layout: TreeLayout, classes: tuple) -> dict[str, str]:
         "PASSIVE": _FORCE.passive("plan.q_index.data[group*$DOFS+i]", "dof"),
         "VELOCITY": _FORCE.velocity("dof", "f.qdd.data[dof]"),
         "STATUS": "d.status.data[group]",
-        "FORWARD_STAGE": walk_fetch(layout, classes) + walk_tree(layout, classes, up=True, down=True),
+        "FORWARD_STAGE": walk_trial(layout, classes),
         "TRANSPOSE_ACTION": "float value=s[$WHITE+col];",
         "RESPONSE_PHYSICAL": "col",
     }
@@ -1934,6 +1934,81 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
                 if (b >= k * WIDTH) t = h.l[k][m];
             l[m] = READ(t, b & (WIDTH - 1));
         }
+    };
+    // HELD_UP(h, n, nb, x, u, state): WALK_UP_TREE on the held walk; lane 0 writes u and the join states.
+    const auto HELD_UP = [&](const WalkHold& h, const int n, const int nb, const float* x, float* u, float* state) {
+        for (int k = lane; k < 6 * nb; k += WIDTH) state[k] = 0.0f;
+        WARP_SYNC();
+        float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        #pragma unroll 1
+        for (int b = nb - 1; b >= 0; --b) {
+            for (int k = 0; k < 6; ++k) p[k] += state[6 * b + k];
+            const int f0 = HOLD_PICK(h.first, b), f1 = HOLD_PICK(h.first, b + 1);
+            #pragma unroll 1
+            for (int c = f1 - 1; c >= f0; --c) {
+                float d[13];
+                HOLD_RECORD(h, c, d);
+                const float z = (x[c] + ((d[0] * p[0] + d[1] * p[1] + d[2] * p[2]) + (d[3] * p[3] + d[4] * p[4] + d[5] * p[5])))
+                                * d[12];
+                for (int k = 0; k < 6; ++k) p[k] -= d[6 + k] * z;
+                if (lane == 0) u[c] = z;
+            }
+            const int up = HOLD_PICK(h.parent, b);
+            float l[3];
+            HOLD_LINK(h, b, l);
+            if (up >= 0) {
+                const float fx = p[0], fy = p[1], fz = p[2];
+                p[3] -= l[1] * fz - l[2] * fy;
+                p[4] -= l[2] * fx - l[0] * fz;
+                p[5] -= l[0] * fy - l[1] * fx;
+            }
+            if (up != b - 1) {
+                if (up >= 0) {
+                    if (lane == 0)
+                        for (int k = 0; k < 6; ++k) state[6 * up + k] += p[k];
+                    WARP_SYNC();
+                }
+                for (int k = 0; k < 6; ++k) p[k] = 0.0f;
+            }
+        }
+        WARP_SYNC();
+    };
+    // HELD_DOWN(h, n, nb, u, qd, twist): WALK_DOWN_TREE on the held walk, u read into the lanes first (u == qd allowed);
+    // lane 0 writes qd, every lane the twists (one value).
+    const auto HELD_DOWN = [&](const WalkHold& h, const int n, const int nb, const float* u, float* qd, float* twist) {
+        float uh[$HOLD];
+        #pragma unroll
+        for (int k = 0; k < $HOLD; ++k) uh[k] = lane + k * WIDTH < n ? u[lane + k * WIDTH] : 0.0f;
+        WARP_SYNC();
+        float V[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        #pragma unroll 1
+        for (int b = 0; b < nb; ++b) {
+            const int up = HOLD_PICK(h.parent, b);
+            float l[3];
+            HOLD_LINK(h, b, l);
+            if (up < 0) {
+                for (int k = 0; k < 6; ++k) V[k] = 0.0f;
+            } else {
+                if (up != b - 1)
+                    for (int k = 0; k < 6; ++k) V[k] = twist[6 * up + k];
+                V[0] += l[1] * V[5] - l[2] * V[4];
+                V[1] += l[2] * V[3] - l[0] * V[5];
+                V[2] += l[0] * V[4] - l[1] * V[3];
+            }
+            const int f0 = HOLD_PICK(h.first, b), f1 = HOLD_PICK(h.first, b + 1);
+            #pragma unroll 1
+            for (int c = f0; c < f1; ++c) {
+                float d[13];
+                HOLD_RECORD(h, c, d);
+                const float uc = HOLD_PICK(uh, c);
+                const float q = (uc - ((d[6] * V[0] + d[7] * V[1] + d[8] * V[2]) + (d[9] * V[3] + d[10] * V[4] + d[11] * V[5])))
+                                * d[12];
+                if (lane == 0) qd[c] = q;
+                for (int k = 0; k < 6; ++k) V[k] += d[k] * q;
+            }
+            for (int k = 0; k < 6; ++k) twist[6 * b + k] = V[k];
+        }
+        WARP_SYNC();
     };
     // HELD_RELEASE(at, z, transposed): z <- R_j z (WALK_SLIP) or z <- R_j^T z (WALK_SLIP_T) for the slip at at, its
     // steps loaded by the lanes in one trip; lane 0 writes z.
@@ -2280,7 +2355,7 @@ def border_solve(layout: TreeLayout, classes: tuple) -> str:
     another's walk. Nothing is added to the block (H8: g1's predictor sits at the RTX PRO 6000's 64 KB carveout line):
     the release's work, the pivots and a dense column, lies in the dead body-wrench words, else in the walk's
     scratch."""
-    from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_PIVOT  # noqa: PLC0415
+    from .tree_factor import WALK_COORDINATE, WALK_LINK  # noqa: PLC0415
 
     roots = [(r, offset) for r, offset, _ in _walked(layout, classes)]
     if not roots:
@@ -2347,23 +2422,61 @@ def border_solve(layout: TreeLayout, classes: tuple) -> str:
         "2*n<=room||2*n<=6*nb);\n"
         "        }}}}\n"
     )
-    held_apply = (
-        "        if((moved&{bit})&&lane<WIDTH) {{const int a={art};\n"
+    held_step = (
+        "        if((moved&{bit})&&lane<WIDTH) {{{head}" + nb + hold + "\n"
+        "            HELD_UP(h,n,nb,s+$SIX_BODIES+{offset},s+$WHITE+{offset},s);\n"
         "            const int cap=walk.release.dof.shape[1],depth=walk.release.b.shape[2];\n"
         "            for(int j=0;j<slips{r};++j)HELD_RELEASE(((size_t)a*cap+j)*depth,s+$WHITE+{offset},false);\n"
         "            for(int j=slips{r}-1;j>=0;--j)HELD_RELEASE(((size_t)a*cap+j)*depth,s+$WHITE+{offset},true);\n"
+        "            HELD_DOWN(h,n,nb,s+$WHITE+{offset},s+$WHITE+{offset},s);\n"
         "        }}\n"
     )
-    lambdas = substitute(_HELD, HOLD=words, coordinate=WALK_COORDINATE, link=WALK_LINK, pivot=WALK_PIVOT)
-    held = (
-        f"{lambdas}\n        {declarations}\n{each(held_frame)}        SYNC();\n{up}"
-        + "".join(
-            held_apply.format(bit=2 << r, r=r, offset=offset, art=_root_articulation(layout, r)) for r, offset in roots
-        )
-        + f"        SYNC();\n{down}"
-    )
+    held = f"        {declarations}\n{each(held_frame)}        SYNC();\n{each(held_step)}        SYNC();\n"
     text = f"    {{\n#if defined(__CUDA_ARCH__)\n{held}#else\n{serial}#endif\n    }}\n"
     return substitute(text, {**layout.sizes(), "WALK_COORDINATE": WALK_COORDINATE, "WALK_LINK": WALK_LINK})
+
+
+def held_lambdas(layout: TreeLayout) -> str:
+    """The held walk's native lambdas (:data:`_HELD`) for the layout's words a lane, CUDA only, declared once ahead of the
+    trial; nothing for a tree past two words a lane (:func:`_held_words`)."""
+    from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_PIVOT  # noqa: PLC0415
+
+    words = _held_words(layout)
+    if not words:
+        return ""
+    lambdas = substitute(_HELD, HOLD=words, coordinate=WALK_COORDINATE, link=WALK_LINK, pivot=WALK_PIVOT)
+    return f"#if defined(__CUDA_ARCH__)\n{lambdas}\n#endif\n"
+
+
+def walk_trial(layout: TreeLayout, classes: tuple) -> str:
+    """Native statements of the trial's response (Z4.2): each walked root's walk up of the force words into the response
+    words and the walk down in place. On CUDA, a tree whose walk a lane holds in two words (:func:`_held_words`) is
+    walked by its segment in lockstep on the walk held in registers (``HOLD_LOAD``, ``HELD_UP``, ``HELD_DOWN``: one
+    parallel load trip, then every step's values by shuffle, no global load on the chain); otherwise, and on the CPU,
+    lane 0 runs the class emitter's walks (:func:`walk_tree`)."""
+    emitted = walk_fetch(layout, classes) + walk_tree(layout, classes, up=True, down=True)
+    if not _held_words(layout):
+        return emitted
+    walked = {r for r, _, _ in _walked(layout, classes)}
+    held, zeros = [], []
+    for r, offset, _ in _walk_roots(layout):
+        if r not in walked:
+            zeros.append(f"for(int k=0;k<{layout.root_coordinates[r]};++k)s[$WHITE+{offset}+k]=0.0f;")
+            continue
+        held.append(
+            "{" + _walk_head(layout, r) + "const int n=walk.dofs.data[a],nb=walk.joint_end.data[a]-j0;"
+            "WalkHold h;HOLD_LOAD(h,data,link,reinterpret_cast<const int*>(walk.path.data+j0),n,nb);"
+            f"HELD_UP(h,n,nb,s+$SIX_BODIES+{offset},s+$WHITE+{offset},s);"
+            f"HELD_DOWN(h,n,nb,s+$WHITE+{offset},s+$WHITE+{offset},s);}}"
+        )
+    text = (
+        "if(lane<WIDTH) {\n"
+        + "\n".join(held)
+        + "\n}\n"
+        + ("if(lane==0) {" + "".join(zeros) + "}\n" if zeros else "")
+        + "SYNC();\n"
+    )
+    return f"#if defined(__CUDA_ARCH__)\n{substitute(text, layout.sizes())}#else\n{emitted}#endif\n"
 
 
 def clear_slips(layout: TreeLayout) -> str:
@@ -2440,7 +2553,8 @@ def get_predictor_kernel(
         ),
         SCRATCH=_placed_block(layout, "s", "$PRED_SCRATCH"),
         CLEAR_SLIPS=clear_slips(layout),
-        TRIAL=substitute(
+        TRIAL=held_lambdas(layout)
+        + substitute(
             _SOLVE,
             layout.sizes(),
             **trial,
