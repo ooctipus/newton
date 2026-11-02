@@ -736,20 +736,10 @@ SPARSE_FACTOR_BODY = """
     }
     SYNC();
     $FACTOR
-    for (int col = lane; col < $N; col += stride) {
-        const int drive = drive_row_by_dof.data[start + indices.permutation.data[col]];
-        if (drive < 0) continue;
-        const int diagonal = indices.row_offsets.data[col + 1] - 1;
-        float pivot = row_H.data[drive];
-        for (int entry = indices.row_offsets.data[col]; entry < diagonal; ++entry) pivot -= factor[entry] * factor[entry];
-        row_P.data[drive] = pivot;
-    }
     $INVERSE
 """
-"""The sparse factor of one tree, ``L^-1`` included, and each drive's pivot without its ``K`` (``row_P``: its ``H_ii`` less
-the squares its pivot subtracts after adding ``K``, so that pivot keeps its order): the caller binds ``indices``,
-``status``, ``geometric``, ``R_group``, ``drive_row_by_dof``, ``row_K``, ``row_H``, ``row_P``, ``factor`` and ``inverse``,
-and synchronizes after it."""
+"""The sparse factor of one tree, ``L^-1`` included: the caller binds ``indices``, ``status``, ``geometric``, ``R_group``,
+``drive_row_by_dof``, ``row_K``, ``row_H``, ``factor`` and ``inverse``, and synchronizes after it."""
 
 
 def sparse_factor_body(dof_count: int, nonzero_count: int) -> str:
@@ -787,7 +777,6 @@ def sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_per_block:
             ("drive_row_by_dof", wp.array[int]),
             ("row_K", wp.array[float]),
             ("row_H", wp.array[float]),
-            ("row_P", wp.array[float]),
             ("indices", _SparseMassMatrixIndices),
             ("Linv_group", wp.array2d[float]),
             ("status", wp.array[int]),

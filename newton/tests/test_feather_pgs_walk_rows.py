@@ -7,7 +7,7 @@
   both and one to three slipping drives, the release then the closure (``R``, then the projector of ``R Z_B``'s
   orthonormal basis) gives the decided closed-loop operator ``J_c [A_F^-1 - A_F^-1 J_B^T (J_B A_F^-1 J_B^T)^+ J_B
   A_F^-1] J_c^T`` in float64, and in float32 with the split pivot at the level of a float32 refactor of ``A_F``.
-- **The device release** (:func:`.tree_factor.walk_release_tree`, W9's verdict): on a tree whose drives saturate,
+- **The device release** (:func:`.tree_kinetic_state.border_solve`, the predictor's border; W9's verdict): on a tree whose drives saturate,
   ``R^T R`` equals ``I + B C^-1 B^T`` of the float64 walk, ``R`` keeps every row's support (tree-lower), and the rows
   the writer stores give the decided operator ``J A_F^-1 J^T``, not the all-``K`` one: without the release a row on a
   slipping joint takes ``(I + K) / I`` its impulse.
@@ -90,10 +90,11 @@ def orth(M: np.ndarray, tol: float = 1.0e-5) -> np.ndarray:
 
 
 def release(walk, S: list[int], K: np.ndarray, pivots: np.ndarray, dtype) -> np.ndarray:
-    """The slips' release ``R`` in ``dtype`` (an ``n x n`` matrix by coordinate), as :func:`.tree_factor.walk_release_tree`
-    forms it on ``walk`` (the all-``K`` walk): the slips ``S`` root-most first, each one's column ``b = W e_i`` (the walk
-    of ``e_i`` with the earlier releases applied), then FL3.4's recurrence along its path, leaf first, with ``K`` the
-    released stiffness and ``pivots`` each slip's split pivot (before its released ``K``)."""
+    """The slips' release ``R`` in ``dtype`` (an ``n x n`` matrix by coordinate), as the predictor's border
+    (:func:`.tree_kinetic_state.border_solve`) forms it on ``walk`` (the all-``K`` walk): the slips ``S`` root-most
+    first, each one's column ``b = W e_i`` (the walk of ``e_i`` with the earlier releases applied), then FL3.4's
+    recurrence along its path, leaf first, with ``K`` the released stiffness and ``pivots`` each slip's split pivot
+    (before its released ``K``)."""
     n = walk.s.shape[0]
     body = np.searchsorted(walk.first, np.arange(n), side="right") - 1
     d = (walk.ell * walk.ell).astype(dtype)
@@ -633,7 +634,7 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
                 if bound > 0.0:
                     out["free_rows"] = max(out["free_rows"], abs(term - incident_row) / bound)
     # The leave: the published dv against the float64 walk's leave of the step's du (the final rows' Z lambda), a
-    # slipping tree's after its rows' release, R^T du (the device's release, tree_factor.walk_release_tree).
+    # slipping tree's after its rows' release, R^T du (the device's release, the predictor's border).
     view = factor.walk_view()
     for art in range(sizes.size):
         world, n = int(art_world[art]), int(sizes[art])
@@ -988,7 +989,7 @@ def support_rows(solver) -> dict:
 def support_frames(solver, joint_q: np.ndarray) -> dict:
     """Case K1's rows against their physical ``J v_hat`` and its leave against the float64 walk's, as
     :func:`walked_frames` reads the general placement's. A slipping tree's rows are the release ``R`` of the walk's
-    (:func:`.tree_factor.walk_release_tree`, its device data): ``z . R^-T u_hat`` is ``J v_hat`` and the leave is the
+    (the predictor's border, its device data): ``z . R^-T u_hat`` is ``J v_hat`` and the leave is the
     walk down of ``R^T du``."""
     forest, placement, factor = solver.forest, solver.placement, solver.factor
     size = int(placement.sparse_mass_matrix_size)

@@ -1580,7 +1580,7 @@ class LocalBlock(ResidualBlock):
     :meth:`walk_floats`, :meth:`walk_ints`; with ``wrenches`` the step's columns and links too, for wrench seeds);
     without, it is read in place for the leave. With ``release`` the class's drives can slip: a walked row takes the
     release ``R`` of its tree's slips along their paths (``WALK_RELEASE``, the one writer's rows carry it already) and
-    the leave ``R^T`` (:func:`.tree_factor.walk_release_tree`).
+    the leave ``R^T`` (:func:`.tree_kinetic_state.border_solve`, the predictor's border).
     With ``free``, the world's free-body rows (``free_count``, :class:`FreeBodyZ` entries read in place, their
     ``mf_meta`` words from ``off_meta``) follow the dense rows in the block: they act on the paired free body, whose
     coordinates are the last block's, so a free row's terms are its ``Z`` against the body's ``u`` and the dense rows'

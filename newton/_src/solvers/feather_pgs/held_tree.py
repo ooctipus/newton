@@ -20,7 +20,7 @@ import warp as wp
 
 from . import host_index
 from .device_proof import DeviceProof
-from .response_builds_dense import DenseFactorPlan, dense_factor_kernel, dense_factor_plan
+from .response_builds_dense import dense_factor_kernel, dense_factor_plan
 from .response_builds_rows import sparse_factor_kernel
 from .sparse_factor import SparseData, bind_operator_plan, operator_metadata
 from .tree_kinetic_owner import TreeKineticState, launch_switches, proof_runs, stage_clocks_on
@@ -41,7 +41,6 @@ def _diagonal_geometry(
     drive_row: wp.array[int],
     drive_k: wp.array[float],
     row_H: wp.array[float],
-    row_P: wp.array[float],
     n: int,
     inverse: wp.array[float],
 ):
@@ -54,9 +53,7 @@ def _diagonal_geometry(
     mass = geometric[geometry_group[group], geometry_index[local]] + armature[group, local]
     row = drive_row[dof]
     if row >= 0:
-        # A diagonal pivot is its own H_ii: without K it is the H_ii (tree_kinetic_state.release).
         row_H[row] = mass
-        row_P[row] = mass
         if drive_k[row] > 0.0:
             mass += drive_k[row]
     inverse[dof] = 1.0 / mass
@@ -239,7 +236,6 @@ class TreeSparseOperator:
         self.plan = bind_operator_plan(solver, n, self.host)
         self.data = SparseData()
         self.data.W = solver.factor.sparse_Linv
-        self.data.W_trial = solver.factor.sparse_Linv_trial
         # The native factor publishes status instead of a second validity bit.
         # Initial and reset mass requests are consumed before any prediction.
         self.data.valid = wp.ones(self.plan.group_to_art.size, dtype=int, device=device)
@@ -264,7 +260,6 @@ class TreeSparseOperator:
                 s.factor.drive_row_by_dof,
                 s.factor.aug_row_K,
                 s.factor.aug_row_H,
-                s.factor.aug_row_P,
                 s.factor.sparse_mass_matrix_indices,
             ],
             outputs=[s.factor.sparse_Linv, s.factor.sparse_mass_matrix_status],
@@ -273,8 +268,7 @@ class TreeSparseOperator:
         )
 
     def bind_response(self):
-        """Bind what the predictor's trial and release read."""
-        self.data.W_trial = self.solver.factor.sparse_Linv_trial
+        """Bind what the predictor reads."""
         self.data.indices = self.solver.factor.sparse_mass_matrix_indices
 
 
@@ -300,14 +294,11 @@ class TreeHeldOperator:
         self.geometry_group = wp.array(np.arange(count, dtype=np.int32), dtype=int, device=device)
         if self.diagonal:
             self.data.inverse = solver.factor.diagonal_inverse_mass
-            self.data.inverse_trial = solver.factor.diagonal_inverse_trial
             self.geometry_index = wp.array(np.diag(physical_index).copy(), dtype=int, device=device)
             self.refresh_kernel = _diagonal_geometry
         else:
             self.data.lower = self._lower
-            self.data.trial = self._trial
             self.factor_plan = dense_factor_plan(physical_index, device)
-            self.data.factor_plans = wp.array([self.factor_plan], dtype=DenseFactorPlan, device=device)
             self.refresh_kernel = dense_factor_kernel(size)
         self.kinetic_state = None
 
@@ -315,16 +306,6 @@ class TreeHeldOperator:
     def _lower(self):
         """The trees' factors: their range of the size group's."""
         return self.solver.factor.L_by_size[self.size][self.span[0] : self.span[1]]
-
-    @property
-    def _trial(self):
-        """The trees' trial factors: their range of the size group's, or its placeholder where no tree holds a drive."""
-        trial = self.solver.factor.T_by_size[self.size]
-        return (
-            trial[self.span[0] : self.span[1]]
-            if trial.shape == self.solver.factor.L_by_size[self.size].shape
-            else trial
-        )
 
     def refresh(self, state_aug):
         """Refresh only original requested factor groups from their current geometry."""
@@ -346,7 +327,6 @@ class TreeHeldOperator:
                     solver.factor.drive_row_by_dof,
                     solver.factor.aug_row_K,
                     solver.factor.aug_row_H,
-                    solver.factor.aug_row_P,
                     size,
                 ],
                 outputs=[solver.factor.diagonal_inverse_mass],
@@ -366,7 +346,6 @@ class TreeHeldOperator:
                     solver.factor.drive_row_by_dof,
                     solver.factor.aug_row_K,
                     solver.factor.aug_row_H,
-                    solver.factor.aug_row_P,
                     self.kinetic_state.geometric,
                 ],
                 outputs=[self._lower],
@@ -378,10 +357,8 @@ class TreeHeldOperator:
         """Bind current held-array descriptors before a new launch or capture."""
         if self.diagonal:
             self.data.inverse = self.solver.factor.diagonal_inverse_mass
-            self.data.inverse_trial = self.solver.factor.diagonal_inverse_trial
         else:
             self.data.lower = self._lower
-            self.data.trial = self._trial
 
 
 class PrescribedRootOperator:
@@ -570,9 +547,7 @@ class ForestHeldOperator:
             if any(f < 0 for f in self.root_families)
             else wp.zeros(model.joint_dof_count, dtype=float, device=device)
         )
-        self.data.inverse_trial = solver.factor.diagonal_inverse_trial
         factor_index = np.zeros((worlds, len(self.root_families)), np.int32)
-        factor_plans = [DenseFactorPlan() for _ in self.root_families]
         self.families = []
         for r, family in enumerate(self.root_families):
             if family == 0:
@@ -598,30 +573,24 @@ class ForestHeldOperator:
             factor_index[:, r] = [position[int(a)] for a in arts[:, r]]
             # The family's factor groups read this root's block of their
             # world's geometry record (one record per forest group).
-            factor_plans[r] = dense_factor_plan(
-                physical_index[offset : offset + family, offset : offset + family], device
-            )
+            factor_plan = dense_factor_plan(physical_index[offset : offset + family, offset : offset + family], device)
             self.families.append(
                 (
                     r,
                     family,
                     dense_factor_kernel(family),
-                    factor_plans[r],
+                    factor_plan,
                     None,
                     wp.array(art_world[group].astype(np.int32), dtype=int, device=device),
                 )
             )
             setattr(self.data, root_field("lower", r), solver.factor.L_by_size[family])
-            setattr(self.data, root_field("trial", r), solver.factor.T_by_size[family])
         if not any(f > 0 for f in self.root_families):
             self.data.lower = wp.zeros((1, 1, 1), dtype=float, device=device)
-            self.data.trial = self.data.lower
         for r, family in enumerate(self.root_families):
             if family <= 0 and r > 0:
                 setattr(self.data, f"lower{r}", self.data.lower)
-                setattr(self.data, f"trial{r}", self.data.trial)
         self.data.factor_index = wp.array(factor_index, dtype=int, device=device)
-        self.data.factor_plans = wp.array(factor_plans, dtype=DenseFactorPlan, device=device)
         self.kinetic_state = None
 
     def refresh(self, state_aug):
@@ -644,7 +613,6 @@ class ForestHeldOperator:
                         solver.factor.drive_row_by_dof,
                         solver.factor.aug_row_K,
                         solver.factor.aug_row_H,
-                        solver.factor.aug_row_P,
                         size,
                     ],
                     outputs=[solver.factor.diagonal_inverse_mass],
@@ -664,7 +632,6 @@ class ForestHeldOperator:
                     solver.factor.drive_row_by_dof,
                     solver.factor.aug_row_K,
                     solver.factor.aug_row_H,
-                    solver.factor.aug_row_P,
                     self.kinetic_state.geometric,
                 ],
                 outputs=[solver.factor.L_by_size[family]],
@@ -677,7 +644,6 @@ class ForestHeldOperator:
         for r, family in enumerate(self.root_families):
             if family > 0:
                 setattr(self.data, root_field("lower", r), self.solver.factor.L_by_size[family])
-                setattr(self.data, root_field("trial", r), self.solver.factor.T_by_size[family])
 
 
 class HeldTree:

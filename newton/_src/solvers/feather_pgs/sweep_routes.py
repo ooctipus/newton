@@ -96,12 +96,12 @@ MF_GS_ABI = kernel_template.params(
 def walk_leave(art: str, values: str, size: str, *, frame: bool, pad: str = "") -> str:
     """Articulation ``art``'s tree leaves the walk's coordinates in place on its ``size`` values at the native pointer
     ``values``: ``dv = P^T L^-T R^T du``, the slips' release transposed first where the class can slip (``frame``,
-    :func:`.tree_factor.walk_release_tree`), then the walk down (``WALK_DOWN`` of
+    :func:`.tree_kinetic_state.border_solve`, the predictor's border), then the walk down (``WALK_DOWN`` of
     :func:`.tree_factor.walk_paths_prelude`, its twists in the walk's scratch). Every placement that walks its rows
     leaves by it, so the rows and the leave share one frame (FL3_design §1.2)."""
     slipped = ""
     if frame:
-        # The slips' release: du <- R^T du (tree_factor.walk_release_tree).
+        # The slips' release: du <- R^T du (the predictor's border's R).
         slipped = f"WALK_RELEASE_T(walk.release, {art}, {values});\n"
     text = f"""{{
 const int j0 = walk.joint_start.data[{art}], d0 = walk.dof_start.data[{art}];

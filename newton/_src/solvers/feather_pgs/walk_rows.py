@@ -33,7 +33,7 @@ factor sweep's) share the walk's one frame (FL3_design §1.2).
 a world's lane group strides over its units, a lane walks a unit's rows together (a contact's 1, 3 or 4, a joint row's
 1) through the class's path table in constant memory, and stores each footprint at its rank in the row's support
 (factor coordinates), the unit's Gram, its records and its header from the same walk. A slipping drive's ``K`` leaves
-the rows and the leave by its release along its path (:func:`.tree_factor.walk_release_tree`): the block primitive with
+the rows and the leave by its release along its path (the predictor's border, :func:`.tree_kinetic_state.border_solve`): the block primitive with
 the path's coordinate basis, which keeps every row inside its support. The leave is :func:`support_publish_kernel`.
 """
 
@@ -76,12 +76,10 @@ from .tree_factor import (
     WALK_LINK,
     WALK_NOW,
     WalkRelease,
-    WalkSlips,
     WalkTrees,
     release_path,
     walk_into,
     walk_prelude,
-    walk_release_tree,
 )
 
 __all__ = [
@@ -92,7 +90,6 @@ __all__ = [
     "free_body_headers_kernel",
     "support_publish_kernel",
     "support_rows_kernel",
-    "walk_release_kernel",
     "walked_rows_kernel",
     "write_contact_units",
     "write_free_body_rows",
@@ -238,7 +235,7 @@ def release_side(
 ):
     """The slips' release on articulation ``art``'s side of row ``slot`` (in the size group ``group``'s rows where they
     are not packed): ``z <- R z``, the root-most slip first, each along its path leaf first
-    (:func:`.tree_factor.walk_release_tree`), the decided operator's row on the all-``K`` walk. The side holds the whole
+    (the predictor's border, :func:`.tree_kinetic_state.border_solve`), the decided operator's row on the all-``K`` walk. The side holds the whole
     tree, and ``R`` keeps every row's support."""
     if art < 0:
         return
@@ -577,15 +574,15 @@ WRITER_THREADS = 256
 
 
 @cache
-def walked_rows_kernel(release: bool, blocks: int, mimic_blocks: bool) -> wp.Kernel:
+def walked_rows_kernel(blocks: int, mimic_blocks: bool) -> wp.Kernel:
     """The one writer of the general placement, world-major: a world's group of ``lanes`` lanes (:func:`writer_lanes`)
-    writes its rows in the block primitive's phases (FL3_design §1.4, W9), the group synchronized between them:
+    writes its rows in the block primitive's phases (FL3_design §1.4, W9), the group synchronized between them. The
+    slips' release ``R`` (the first phase) is the predictor's border's (:func:`.tree_kinetic_state.border_solve`), which
+    each row takes on the sides that slip (:func:`release_side`):
 
-    1. *release* (``release``, a class whose drives can saturate): the lanes take the world's walked trees, each tree's
-       slips released (:func:`.tree_factor.walk_release_tree`);
-    2. *rows*: the lanes write every row of the world, except a world an in-kernel owner holds (``owned``: the local
+    1. *rows*: the lanes write every row of the world, except a world an in-kernel owner holds (``owned``: the local
        owners' packets walk their own seeds);
-    3. *closure* (``blocks``, the largest bilateral block's rows; 0 for none): the lanes close each of the world's
+    2. *closure* (``blocks``, the largest bilateral block's rows; 0 for none): the lanes close each of the world's
        blocks (:func:`.response_builds_rows.close_block`; its rows are the links', and the mimics' with
        ``mimic_blocks``), then correct every other row on the blocks its sides touch
        (:func:`.response_builds_rows.close_row`).
@@ -606,7 +603,6 @@ def walked_rows_kernel(release: bool, blocks: int, mimic_blocks: bool) -> wp.Ker
         data: ContactInput,
         law: PatchRowLaw,
         walk: WalkTrees,
-        slips: WalkSlips,
         preelim: Preelim,
         mimic_slot: wp.array[int],
         link_slot: wp.array[int],
@@ -633,12 +629,8 @@ def walked_rows_kernel(release: bool, blocks: int, mimic_blocks: bool) -> wp.Ker
         world, lane = wp.tid()
         count = wp.min(counts[world], packed_Z.shape[1])
         line = rows.first[world]
-        if wp.static(release):
-            for i in range(slips.world_start[world] + lane, slips.world_start[world + 1], lanes):
-                walk_release_tree(slips.world_arts[i], walk, slips, v_hat)
-            world_sync(lanes)
         # A world an in-kernel owner holds (``owned`` and ``owner`` nonzero: the local owners' packets, whose kernels
-        # walk their seeds and read the release built above) is not the writer's.
+        # walk their seeds) is not the writer's: its whole group returns before any barrier.
         if owned != 0 and owner[world] != 0:
             return
         for slot in range(lane, count, lanes):
@@ -662,30 +654,23 @@ def walked_rows_kernel(release: bool, blocks: int, mimic_blocks: bool) -> wp.Ker
                         rows.rhs, rows.diag,
                     )  # fmt: skip
 
-    name = "write_walked_rows" + ("_release" if release else "") + (f"_blocks{blocks}" if has_blocks else "")
+    name = "write_walked_rows" + (f"_blocks{blocks}" if has_blocks else "")
     name += "_mimics" if mimic_blocks else ""
     return python_kernel(kernel, name, launch_bounds=(WRITER_THREADS, 3))
 
 
 def writer_kernel(solver) -> wp.Kernel:
-    """The one writer's variant for the solver's class (:func:`walked_rows_kernel`), from its topology: the release
-    phase where a drive can saturate, the block phase where bilateral blocks exist (mimics among them under
-    ``enable_bilateral_preelimination``)."""
+    """The one writer's variant for the solver's class (:func:`walked_rows_kernel`), from its topology: the block phase
+    where bilateral blocks exist (mimics among them under ``enable_bilateral_preelimination``)."""
     factor = solver.factor
     blocks = factor.block_capacity if factor.eliminates else 0
-    return walked_rows_kernel(
-        factor.walk_slip_capacity > 0, blocks, bool(blocks and solver.options.enable_bilateral_preelimination)
-    )
+    return walked_rows_kernel(blocks, bool(blocks and solver.options.enable_bilateral_preelimination))
+
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # The support placement (case K1, FL3.4): the support sink, a lane per unit, the release and the leave
 # ---------------------------------------------------------------------------------------------------------------------
-
-
-@wp.kernel(enable_backward=False)
-def walk_release_kernel(arts: wp.array[int], walk: WalkTrees, slips: WalkSlips, v_hat: wp.array[float]):
-    """The support placement's release (case K1), a thread per tree: each walked tree's slips released
-    (:func:`.tree_factor.walk_release_tree`, the builder the general placement's one writer runs in its first phase)."""
-    walk_release_tree(arts[wp.tid()], walk, slips, v_hat)
 
 
 _SUPPORT_TABLE = """    static __constant__ int SUPPORT_NODE[$n] = {$node};"""
@@ -845,7 +830,7 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                 WALK_UP(data, link, now, now_link, local, WALK_FIRST_OF(local + 1) - 1, p, w, sink);
             }
         }
-        // A slipping tree's release (walk_release_kernel), root-most slip first, on the side's entries along each
+        // A slipping tree's release (the predictor's border), root-most slip first, on the side's entries along each
         // slip's path: entries off the row's support stay zero, so the side keeps its support.
         const int slips = release.count.data[art];
         if (slips > 0) {
@@ -1139,27 +1124,8 @@ _PUBLISH = """    if (tid >= arts.shape[0]) return;
     float u[$n];
     const float* du = delta.data + (size_t)world * delta.shape[1] + offset;
     for (int c = 0; c < $n; ++c) u[c] = du[SUPPORT_NODE[c]];
-    // The release's transpose, the last slip first: along each path, root first (walk_rows.walk_release_kernel).
-    const int slips = release.count.data[art];
-    const int cap = release.dof.shape[1], width = release.b.shape[2];
-    for (int j = slips - 1; j >= 0; --j) {
-        const int i = release.dof.data[art * cap + j];
-        const size_t at = ((size_t)art * cap + j) * width;
-        const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
-        int path[$n], length = 0;
-        for (int body = walk.dof_body.data[d0 + i], c = i; body >= 0;) {
-            for (; c >= WALK_FIRST_OF(body); --c) path[length++] = c;
-            body = WALK_PARENT_OF(body);
-            if (body >= 0) c = WALK_FIRST_OF(body + 1) - 1;
-        }
-        float t = 0.0f;
-        for (int k = length - 1; k >= 0; --k) {
-            const int c = path[k];
-            const float x = g[k] * u[c] + a[k] * t;
-            u[c] = x;
-            t -= b[k] * x;
-        }
-    }
+    // The release's transpose, the last slip first, each along its path root first (the predictor's border's R).
+    WALK_RELEASE_T(release, art, u);
     WALK_DOWN(walk.data.data + (size_t)d0 * $coordinate, walk.link.data + (size_t)j0 * $link, u, u,
               reinterpret_cast<float*>(walk.scratch.data + j0));
     for (int c = 0; c < $n; ++c) v_out.data[d0 + c] = v_hat.data[d0 + c] + u[c];

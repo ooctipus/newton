@@ -933,8 +933,12 @@ class Placement:
         result["patch_frames"] = frame_status is not None and bool(frame_status.numpy()[0])
         pool = getattr(self, "contact_pool", None)
         result["contact_launches"] = pool is not None and pool.launch_failed(clear=clear)
+        # The predictor's border (tree_kinetic_state.border_solve): bit 0, a tree slipped past its frame's capacity; bit 2,
+        # a tree the walk does not hold took a decided step.
+        result["slip_frames"] = bool(int(self.factor.walk_release_status.numpy()[0]) & 5)
         if clear:
             self.constraint_capacity_status.zero_()
+            self.factor.walk_release_status.zero_()
             if frame_status is not None:
                 frame_status.zero_()
         return result

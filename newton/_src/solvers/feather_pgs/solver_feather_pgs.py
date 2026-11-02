@@ -734,10 +734,18 @@ class SolverFeatherPGS(SolverBase):
             )
         if self.placement.local_internal_fast_path and not self.placement.walks:
             raise ValueError("The local owners walk their rows and leave (FL3.6): their class must walk.")
-        # Every responding tree; the keyed tiers walk their keyed rows in the kernel, and the test pin walk_predictor
-        # solves the predictor's trial by the walk (Z4.0).
-        if general or self.placement.ink_skip_rows() or self._route_pins.get("walk_predictor", False):
-            self.factor.plan_walk(np.flatnonzero(self.forest.response_dof_count > 0))
+        # The walk is held for every responding tree where a placement walks it, where the keyed tiers walk their keyed
+        # rows in the kernel, where the predictor's border decides a step (a tree that can slip, FL3.9), and under the
+        # test pin walk_predictor, which solves the predictor's trial by it (Z4.0); the sparse diagonal's arms alone
+        # otherwise.
+        responding = np.flatnonzero(self.forest.response_dof_count > 0)
+        if (
+            general
+            or self.placement.ink_skip_rows()
+            or self._route_pins.get("walk_predictor", False)
+            or (responding.size and self.factor.slip_capacity(responding) > 0)
+        ):
+            self.factor.plan_walk(responding)
         elif diagonal:
             self.factor.plan_walk(self.placement.sparse_diagonal_dense_arts_host)
         if self.placement.walks:
@@ -1189,8 +1197,6 @@ class SolverFeatherPGS(SolverBase):
             else:
                 self.placement.pack_rows(self.v_hat, write_diag=packed_diag)
                 self.laws.write_rhs(self, dt)
-                # The keyed tiers walk their rows in the kernel and release their trees' slips along their paths.
-                self.sweep.release_tiers(self.v_hat)
 
         # MF: whiten the rows (Z = L^-1 J^T), their mf_rhs, mf_eff_mass_inv and incident velocities
         if self.forest.has_free_rigid_bodies:
@@ -1271,7 +1277,12 @@ class SolverFeatherPGS(SolverBase):
         launch of a captured graph, the solver's or the collision pipeline's
         sharing its contact rows, that the graph's last replay skipped: its
         device graph updater failed closed after the capture emitted it, or its
-        count passed the captured bound. Flags remain set across later successful
+        count passed the captured bound. ``slip_frames`` identifies a step in which a
+        tree's saturated drives outnumbered its release's capacity (its first
+        ``tree_factor.RELEASE_SLIPS`` slipping, the rest keeping their ``K``), or
+        in which a drive saturated on a tree that held no limited drive when
+        the solver was built (its step keeps every ``K``).
+        Flags remain set across later successful
         steps and :meth:`reset` calls; ``contact_launches`` until a replay runs
         the launch again.
 

@@ -59,19 +59,15 @@ AUGMENTED_DRIVE_ROWS = FieldGroup(
     Field("aug_row_K", wp.float32, ("drive_row",), owner="factor"),
     Field("aug_row_Kd", wp.float32, ("drive_row",), owner="factor"),
     Field("aug_row_H", wp.float32, ("drive_row",), owner="factor"),
-    Field("aug_row_P", wp.float32, ("drive_row",), owner="factor"),
     Field("aug_row_dv", wp.float32, ("drive_row",), owner="factor"),
     Field("aug_drive", wp.vec4, ("dof",), owner="factor"),
-    Field("aug_decided", wp.int32, ("articulation",), owner="factor"),
 )
-"""Augmented drive rows, ``max_dofs`` per articulation: each row's ``K``, which the trial factor holds; the ``K`` the step's
-factor holds once the saturation decision has taken some out (``aug_row_Kd``, the passive damper's on a saturated drive);
-the ``H_ii`` (armature in, ``K`` out) its factor last refreshed from; its pivot there without its ``K`` (``aug_row_P``),
-which a release of the drive pivots on (:func:`.tree_kinetic_state.release`); what last step's rows did to its coordinate;
-per coordinate, what the step's saturation decision reads on every drive
+"""Augmented drive rows, ``max_dofs`` per articulation: each row's ``K``, which the factor holds; the ``K`` the saturation
+decision left it (``aug_row_Kd``, the passive damper's on a saturated drive, whose ``K - Kd`` the border releases,
+:func:`.tree_kinetic_state.border_solve`); the ``H_ii`` (armature in, ``K`` out) its factor last refreshed from; what last
+step's rows did to its coordinate; per coordinate, what the step's saturation decision reads on every drive
 (:data:`.tree_kinetic_state.SATURATE_DRIVES`): ``aug_drive``, the drive's own ``K``, the passive damper's, the effort limit
-and the unlimited ``u0``, one read of one record; and per articulation whether its step factor holds a decided set
-(``aug_decided``), which the trial factor then keeps all of ``K`` beside."""
+and the unlimited ``u0``, one read of one record."""
 
 DRIVE_ROWS = (
     Field("row_K", wp.float32, ("drive_row",), owner="factor", attr="aug_row_K"),
@@ -91,8 +87,8 @@ def hold_drive_row(
     rows: DriveRows, row: int, articulation: int, dof: int, u0: float, K: float, passive: float, limit: float
 ) -> float:
     """Hold a drive's ``u0`` and ``K``, its passive damper's within, and return the limited force the trial solves with.
-    A ``K`` the trial factor does not hold (new gains, the first step) requests the articulation's factor refresh; a
-    saturation never does, since the decision keeps its ``K`` in the step factor beside it (``aug_row_Kd``). Only a drive
+    A ``K`` the factor does not hold (new gains, the first step) requests the articulation's factor refresh; a
+    saturation never does, since the border releases its ``K`` from the factor's walk (``aug_row_Kd``). Only a drive
     with an excess reads ``row_dv``, last step's ``v_out - v_hat``, what its rows did to the coordinate.
     """
     if rows.row_K[row] != K:
@@ -125,12 +121,10 @@ STATE_AUX = FieldGroup(
 
 SIZE_FACTORS = FieldGroup(
     Field("L", wp.float32, ("factor_art", "factor_size", "factor_size")),
-    Field("T", wp.float32, ("trial_art", "trial_size", "trial_size")),
     Field("R", wp.float32, ("art", "size")),
 )
-"""One size group's mass factor, its trial factor and its armature (the tree factor's); compact and sparse sizes keep
-(1, 1, 1) placeholders of the factors, and so does the trial factor of a size whose articulations hold no drive. The
-step reads ``L``; ``T`` keeps every drive's ``K`` while ``L`` holds a decided set (:data:`AUGMENTED_DRIVE_ROWS`)."""
+"""One size group's mass factor, every drive's ``K`` in it, and its armature (the tree factor's); compact and sparse sizes
+keep (1, 1, 1) placeholders of the factor."""
 
 SIZE_JACOBIAN = FieldGroup(Field("J", wp.float32, ("response_art", "response_row", "response_size")))
 """One size group's Jacobian. The matrix-free sweeps' producers write the packed rows instead (:mod:`.packed_rows`):
@@ -241,11 +235,10 @@ index, the block's kept rows and their count, and the block's world and constrai
 
 SPARSE_FACTOR = FieldGroup(
     Field("sparse_Linv", wp.float32, ("group", "nonzero"), owner="factor"),
-    Field("sparse_Linv_trial", wp.float32, ("trial_group", "nonzero"), owner="factor"),
     Field("sparse_mass_matrix_status", wp.int32, ("group",), owner="factor"),
 )
-"""The native sparse factor's inverse entries, its trial inverse (every drive's ``K``, kept while the step's holds a
-decided set; one placeholder group without drives) and its status, per articulation of the factored size."""
+"""The native sparse factor's inverse entries, every drive's ``K`` in it, and its status, per articulation of the factored
+size."""
 
 SPARSE_ROWS = FieldGroup(
     Field("sparse_row_dof", wp.int32, ("index_world", "index_row", "index_support"), fill=None, owner="placement"),

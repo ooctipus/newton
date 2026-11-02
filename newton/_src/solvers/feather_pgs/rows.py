@@ -824,11 +824,10 @@ class RowLaws:
                     device=model.device,
                 )
 
-        # The sparse diagonal on the walk (FL3.5): its rows read the slips' release, its contact producers among them.
+        # The sparse diagonal on the walk (FL3.5): its rows read the slips' release (the predictor's border), its
+        # contact producers among them.
         slots = solver.placement.walks and solver.placement.sparse_diagonal_contact_solve
         slots_written = False
-        if slots:
-            solver.sweep.release_diagonal(solver.v_hat)
 
         if (
             contacts is not None
@@ -1249,7 +1248,6 @@ class RowLaws:
             contact_input,
             patch_row_law(solver),
             factor.walk_view(),
-            factor.walk_slips(),
             factor.blocks() if blocks else Preelim(),
             self.mimic_slot if blocks and self.mimic_slot is not None else dummy_int,
             self.link_slot if blocks and self.link_slot is not None else dummy_int,
@@ -1280,10 +1278,9 @@ class RowLaws:
         )
 
     def write_support(self, solver, state_in, contacts: Contacts | None, dt: float) -> None:
-        """Case K1's writer (:func:`.walk_rows.support_rows_kernel`), after the release of this step's slipping drives
-        (:meth:`.sweep_plan.SweepPlan.release_walk`): a world's lane group over its units, into the support sink."""
+        """Case K1's writer (:func:`.walk_rows.support_rows_kernel`): a world's lane group over its units, into the support
+        sink, each row of a slipping tree released by the predictor's border."""
         placement, model, sweep = solver.placement, solver.model, solver.sweep
-        sweep.release_walk(solver.v_hat)
         contact_input = (
             bind_contact_input(solver, state_in, solver.factor, contacts, dt, 1.0)
             if contacts is not None

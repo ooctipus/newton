@@ -139,7 +139,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         under the default patch friction, so no patch frame can be left empty.
         """
         solver = SolverFeatherPGS(newton.ModelBuilder().finalize(device="cpu"), row_watermark=False)
-        clear = dict.fromkeys(("dense", "matrix_free", "patch_frames", "contact_launches"), False)
+        clear = dict.fromkeys(("dense", "matrix_free", "patch_frames", "contact_launches", "slip_frames"), False)
         self.assertEqual(solver.constraint_capacity_status(), clear)
         self.assertEqual(solver.constraint_capacity_status(clear=True), clear)
         solver.check_constraint_capacity()

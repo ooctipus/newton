@@ -54,7 +54,6 @@ SparsePlan = field_group.struct("SparsePlan", SPARSE_PLAN, __name__)
 @wp.struct
 class SparseData:
     W: wp.array2d[float]
-    W_trial: wp.array2d[float]
     valid: wp.array[int]
     status: wp.array[int]
     indices: _SparseMassMatrixIndices

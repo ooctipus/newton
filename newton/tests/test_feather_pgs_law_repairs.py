@@ -419,12 +419,43 @@ def _huber_rollout(mass, ke, kd, limit, target, steps, dt=H):
 
 
 def _decided_K(solver) -> np.ndarray:
-    """The ``K`` each drive row holds in a step factor that holds a decided set; the trial factor holds every drive's."""
+    """The ``K`` the last step's decision left each saturated drive (its passive damper's): the drives the border released
+    from the factor, which holds every drive's ``K``."""
     factor = solver.factor
+    if factor.walk_arts is None:
+        return np.zeros(0, dtype=np.float32)
     rows = factor.drive_row_by_dof.numpy()
     rows = rows[rows >= 0]
-    decided = factor.aug_decided.numpy()[rows // solver.forest.articulation_max_dofs] != 0
-    return factor.aug_row_Kd.numpy()[rows[decided]]
+    slipped = factor.walk_view().release.count.numpy()[rows // solver.forest.articulation_max_dofs] > 0
+    Kd, K = factor.aug_row_Kd.numpy()[rows], factor.aug_row_K.numpy()[rows]
+    return Kd[slipped & (Kd != K)]
+
+
+def _decided_operator(solver, joint_q: np.ndarray) -> tuple[float, int]:
+    """Every tree's release from the border against the decided operator in float64: ``R^T R = I + B C^-1 B^T``
+    with ``B`` the float64 walk's columns of its slipping coordinates and ``C = K_S^-1 - B^T B`` (SAT_PHYS §1.2), the
+    worst relative error over the trees that slipped, and how many did."""
+    from newton.tests.test_feather_pgs_walk_rows import device_release  # noqa: PLC0415
+
+    factor, model = solver.factor, solver.model
+    view = factor.walk_view()
+    starts, qd = model.articulation_start.numpy(), model.joint_qd_start.numpy()
+    rows_by_dof = factor.drive_row_by_dof.numpy()
+    K, Kd = factor.aug_row_K.numpy().astype(np.float64), factor.aug_row_Kd.numpy().astype(np.float64)
+    slips = view.release.count.numpy()
+    worst, trees = 0.0, 0
+    for art in np.flatnonzero(slips > 0):
+        d0, n = int(qd[starts[art]]), int(qd[starts[art + 1]] - qd[starts[art]])
+        rows = rows_by_dof[d0 : d0 + n]
+        released = np.where(rows >= 0, K[np.maximum(rows, 0)] - Kd[np.maximum(rows, 0)], 0.0)
+        S = np.flatnonzero(released > 0.0)
+        walk = factor.walk(joint_q, int(art))
+        B = np.stack([walk.up(covector=np.eye(n)[i])[0] for i in S], axis=1)
+        expected = np.eye(n) + B @ np.linalg.solve(np.diag(1.0 / released[S]) - B.T @ B, B.T)
+        R = device_release(view, int(art), n)
+        worst = max(worst, float(np.linalg.norm(R.T @ R - expected) / np.linalg.norm(expected)))
+        trees += 1
+    return worst, trees
 
 
 def _drive_roll(model, control, steps, *, dt=H, **options):
@@ -593,8 +624,8 @@ class TestDriveSaturation(unittest.TestCase):
         np.testing.assert_array_equal(out.body_q.numpy(), state.body_q.numpy())
 
     def test_a_step_at_a_limit_launches_what_a_quiet_step_does(self):
-        """The decision, the release and the second solve are the predictor's: no launch of their own, so a world
-        with nothing to do pays no launch and a launch does not wait on another for its slowest world."""
+        """The decision and the border's decided step are the predictor's: no launch of their own, so a world with
+        nothing to do pays no launch and a launch does not wait on another for its slowest world."""
         launches, moved = [], []
         for limit in (1.0e6, 0.5):
             model, control = _driven_hinges((0.02, 0.01), ke=1.0e3, kd=20.0, effort=limit, target=[0.6, -0.8])
@@ -609,22 +640,67 @@ class TestDriveSaturation(unittest.TestCase):
         self.assertEqual(moved[0].size, 0)
         self.assertLess(float(moved[1].min()), 1.0e-6)
 
-    def test_a_stiff_drive_releases_without_losing_digits(self):
-        """A saturated drive's ``K`` leaves the step factor by a release whose pivot is the factor's own pivot without
-        ``K``, never ``L_ii^2 - K``: at ``K`` of 5e5 times the light mode's inertia, where that subtraction keeps about
-        one digit in float32, the released factor is a refresh's to rounding."""
+    def test_a_stiff_drive_slips_without_losing_digits(self):
+        """A saturated drive's ``K`` leaves the step by the border, whose capacitance takes the pivot with the decided
+        ``K`` alone (the walk's ``P0 + Kd``), never ``1 / K - |B|^2``: at ``K`` of 5e5 times the light mode's inertia,
+        where that subtraction keeps about one digit in float32, the frame is the decided operator to 1e-4."""
         for saturated in ((1.0e4, -1.0e4), (1.0e4, 0.0)):
             with self.subTest(targets=saturated):
                 model, control = _driven_hinges((0.02, 0.8), ke=0.0, kd=6.0e5, effort=1.0, target=[0.0, 0.0])
                 control.joint_target_qd.assign(np.asarray(saturated, dtype=np.float32))
-                _, solver = _drive_roll(model, control, 3, update_mass_matrix_interval=2)
+                history, solver = _drive_roll(model, control, 3, update_mass_matrix_interval=2)
                 decided = _decided_K(solver)
                 self.assertEqual(int((decided < 1.0e-6).sum()), int(np.count_nonzero(saturated)))
-                held = {size: np.tril(factor.numpy()) for size, factor in solver.factor.L_by_size.items()}
-                _refresh_decided(solver)
-                for size, factor in solver.factor.L_by_size.items():
-                    fresh = np.tril(factor.numpy())
-                    np.testing.assert_allclose(held[size], fresh, rtol=0.0, atol=4.0e-6 * float(np.abs(fresh).max()))
+                joint_q = history[-2, : model.joint_coord_count].astype(np.float64)
+                worst, trees = _decided_operator(solver, joint_q)
+                self.assertEqual(trees, 1)
+                self.assertLess(worst, 1.0e-4)
+
+    def test_a_branched_tree_slips_along_its_own_paths(self):
+        """Each slip's column walks up its own root path: from a finger to the palm, then the palm's coordinates when the
+        palm is free, never the fingers between. On each device the border is the decided operator to 1e-4 at every
+        step, its slips in several fingers at once."""
+        for device in ("cpu", "cuda:0") if wp.is_cuda_available() else ("cpu",):
+            for floating in (False, True):
+                with self.subTest(device=device, floating=floating):
+                    model, control = _driven_hand(device, floating)
+                    solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_iterations=4)
+                    state, out = model.state(), model.state()
+                    rng = np.random.default_rng(1)
+                    for _ in range(12):
+                        control.joint_target_q.assign(rng.uniform(-2.0, 2.0, model.joint_dof_count).astype(np.float32))
+                        joint_q = solver.cut.mirror(state).joint_q.numpy().astype(np.float64)
+                        solver.step(state, out, control, None, 1.0 / 60.0)
+                        state, out = out, state
+                        worst, trees = _decided_operator(solver, joint_q)
+                        self.assertEqual(trees, 2)
+                        self.assertLess(worst, 1.0e-4)
+                    self.assertGreater(int(solver.factor.walk_view().release.count.numpy().min()), 3)
+
+    def test_slips_past_a_trees_frame_flag_its_capacity(self):
+        """The border holds a tree's slips in its frame, as many as the tree has limited drives up to
+        ``tree_factor.RELEASE_SLIPS``: a chain of 40 drives all at their limits passes it and flags ``slip_frames``, two
+        hinges never do."""
+        for scene, flagged in ((_driven_chain, True), (_driven_forest, False)):
+            with self.subTest(scene=scene.__name__):
+                model, control = scene("cpu")
+                targets = np.random.default_rng(1).uniform(-1.0, 1.0, model.joint_dof_count).astype(np.float32)
+                control.joint_target_q.assign(targets)
+                _, solver = _drive_roll(model, control, 4, dt=1.0 / 60.0)
+                self.assertEqual(solver.constraint_capacity_status()["slip_frames"], flagged)
+
+    def test_a_limit_set_after_construction_is_flagged(self):
+        """A tree with no limited drive when the solver is built has no room in the slips' frame (and, unless its class
+        walks, no walk): a limit written later saturates its drive, the step keeps that drive's ``K`` and
+        ``slip_frames`` says so, rather than reading past an array."""
+        model, control = _driven_hinges((0.02, 0.01), ke=1.0e3, kd=20.0, effort=float("inf"), target=[0.6, -0.8])
+        solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_iterations=4)
+        self.assertEqual(solver.factor.slip_capacity([0]), 0)
+        model.joint_effort_limit.assign(np.full(model.joint_dof_count, 0.5, dtype=np.float32))
+        state, out = model.state(), model.state()
+        solver.step(state, out, control, None, H)
+        self.assertTrue(np.all(np.isfinite(out.joint_qd.numpy())))
+        self.assertTrue(solver.constraint_capacity_status()["slip_frames"])
 
     def test_a_saturation_change_refreshes_a_stale_factor(self):
         """Hold ``update_mass_matrix_interval=2`` to the every-step result where ``H`` is constant: only ``K`` moves."""
@@ -876,6 +952,38 @@ def _driven_forest(device):
     return model, model.control()
 
 
+def _driven_hand(device, floating: bool):
+    """A palm, fixed or free, with three fingers of three hinges in each of two worlds, with drives that saturate: a
+    slip's root path leaves its finger at the palm, past the other fingers' coordinates."""
+    template = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    palm = template.add_link(mass=2.0, inertia=wp.mat33(np.eye(3) * 0.05))
+    joints = [template.add_joint_free(child=palm) if floating else template.add_joint_fixed(parent=-1, child=palm)]
+    for finger in range(3):
+        parent = palm
+        for k in range(3):
+            link = template.add_link(mass=0.3, inertia=wp.mat33(np.eye(3) * (0.01 + 0.004 * k + 0.002 * finger)))
+            joints.append(
+                template.add_joint_revolute(
+                    parent=parent,
+                    child=link,
+                    axis=(0.0, 0.0, 1.0) if k else (1.0, 0.0, 0.0),
+                    parent_xform=wp.transform((0.05 * (finger - 1), 0.0, 0.1 if k == 0 else 0.05), wp.quat_identity()),
+                    target_ke=80.0,
+                    target_kd=4.0,
+                    effort_limit=1.0,
+                    armature=0.0,
+                    limit_lower=-1.0e6,
+                    limit_upper=1.0e6,
+                )
+            )
+            parent = link
+    template.add_articulation(joints)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.replicate(template, 2)
+    model = builder.finalize(device=device)
+    return model, model.control()
+
+
 def _driven_chain(device):
     """A chain of 40 hinges in each of two worlds, past a warp of lanes, with drives that saturate."""
     template = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
@@ -901,17 +1009,6 @@ def _driven_chain(device):
     builder.replicate(template, 2)
     model = builder.finalize(device=device)
     return model, model.control()
-
-
-def _refresh_decided(solver) -> None:
-    """Refresh every step factor from the held geometry with the ``K`` it holds, its decided set's where it holds one."""
-    factor = solver.factor
-    decided = factor.aug_decided.numpy()
-    rows = np.arange(factor.aug_row_K.shape[0])
-    held = decided[rows // solver.forest.articulation_max_dofs] != 0
-    factor.aug_row_K.assign(np.where(held, factor.aug_row_Kd.numpy(), factor.aug_row_K.numpy()).astype(np.float32))
-    factor.mass_update_mask.fill_(1)
-    factor.held.refresh(factor)
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "the held tree's natives run on CUDA")
@@ -952,20 +1049,17 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
         self.assertLess(float(_decided_K(solver).min()), 1.0e-6)
         np.testing.assert_allclose(history[:20], reference[:20], rtol=0.0, atol=2.0e-2)
 
-    def test_a_release_is_the_factor_kernels(self):
-        """The factor the predictor released to the ``K`` it left is, to rounding, the one a refresh makes from the same
-        geometry and ``K``: a float32 factor's rounding at its scale, since the two take different sums (the CUDA refresh
-        sums each pivot across its lanes)."""
+    def test_the_border_is_the_decided_operator(self):
+        """On each evaluator the border's frame of the last step's slips is, to float32 rounding, the decided operator
+        ``(H + R + K_F)^-1`` on the all-``K`` walk (the factor holds every drive's ``K``, untouched)."""
         for device, pins in (("cpu", {}), ("cuda:0", {}), ("cuda:0", {"grouping": "forest"})):
             with self.subTest(device=device, pins=pins):
                 _, solver = self._roll(device, pins)
                 self.assertLess(float(_decided_K(solver).min()), 1.0e-6)
                 self.assertGreater(float(solver.factor.aug_row_K.numpy().max()), 1.0e-3)
-                held = {size: np.tril(factor.numpy()) for size, factor in solver.factor.L_by_size.items()}
-                _refresh_decided(solver)
-                for size, factor in solver.factor.L_by_size.items():
-                    fresh = np.tril(factor.numpy())
-                    np.testing.assert_allclose(held[size], fresh, rtol=0.0, atol=4.0e-6 * float(np.abs(fresh).max()))
+                worst, trees = _decided_operator(solver, solver.model.joint_q.numpy().astype(np.float64))
+                self.assertGreater(trees, 0)
+                self.assertLess(worst, 1.0e-4)
 
     def test_a_captured_graph_decides_like_an_eager_step(self):
         """The decision in a graph: steps at their limits, then quiet steps, then at their limits again."""
@@ -1026,12 +1120,16 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
         arms = [self._sparse_roll(dense, 60, 1)[0] for dense in (False, True)]
         np.testing.assert_allclose(arms[1], arms[0], rtol=0.0, atol=2.0e-2)
 
-    def test_a_sparse_release_is_the_factor_kernels(self):
-        """``L^-1`` included. An odd step count: the last finish left the geometry the step's factors read."""
+    def test_the_decision_leaves_the_sparse_factor_whole(self):
+        """No factor array is downdated (DECISIONS 11-01): after steps whose drives slip, the held sparse factor, ``L^-1``
+        included, is the factor kernels' refresh with every drive's ``K``. An odd step count: the last finish left the
+        geometry the step's factors read."""
         _, solver = self._sparse_roll(False, 5, 2)
-        held = solver.factor.sparse_Linv.numpy().copy()
-        _refresh_decided(solver)
-        np.testing.assert_allclose(held, solver.factor.sparse_Linv.numpy(), rtol=2.0e-6, atol=1.0e-7)
+        factor = solver.factor
+        held = factor.sparse_Linv.numpy().copy()
+        factor.mass_update_mask.fill_(1)
+        factor.held.refresh(factor)
+        np.testing.assert_allclose(held, factor.sparse_Linv.numpy(), rtol=2.0e-6, atol=1.0e-7)
 
     def test_a_compact_diagonal_decides_in_its_predictor(self):
         """A tree group of diagonal mass, the star pin keeping it from scalar branches: its inverse is the coordinate's own,

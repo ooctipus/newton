@@ -164,11 +164,8 @@ class TreeFactor:
         self.armature = None
         self.armature_floor = None
         self.L_by_size: dict[int, wp.array] = {}
-        self.T_by_size: dict[int, wp.array] = {}
         self.R_by_size: dict[int, wp.array] = {}
         self.diagonal_inverse_mass = None
-        self.diagonal_inverse_trial = None
-        self.driven_articulations = np.zeros(0, dtype=bool)
         self.body_factors = None
         self.eliminates = False
         self.block_capacity = 0
@@ -177,6 +174,9 @@ class TreeFactor:
         self.dynamics_stream = None
         self.walk_arts = None
         self.walk_slip_capacity = 0
+        # The border's status word (tree_kinetic_state.border_solve): bit 0 a tree past its slip capacity, bit 1 a
+        # pivot not positive, bit 2 a decided step on a tree the walk does not hold.
+        self.walk_release_status = wp.zeros(1, dtype=wp.int32, device=model.device)
 
     # ---------------------------------------------------------------------------------------------------------------
     # Construction
@@ -393,7 +393,6 @@ class TreeFactor:
         else:
             self._arrays.release(AUGMENTED_DRIVE_ROWS)
         self.parallel_drives = False
-        self.driven_articulations = np.zeros(model.articulation_count, dtype=bool)
         self.drive_row_by_dof = wp.full((max(1, int(model.joint_dof_count)),), -1, dtype=wp.int32, device=model.device)
         self.drive_q_index_by_dof = None
         self.drive_target_index_by_dof = None
@@ -446,13 +445,7 @@ class TreeFactor:
         self.drive_target_index_by_dof = wp.array(drive_target_index_by_dof, dtype=wp.int32, device=model.device)
         self.aug_row_counts.assign(row_counts)
         self.aug_row_dof_index.assign(row_dof_index)
-        self.driven_articulations = row_counts > 0
         self.parallel_drives = True
-
-    def _driven(self, articulations) -> bool:
-        """Whether any of ``articulations`` holds a drive row, so its factor needs a trial factor beside it."""
-        articulations = np.asarray(articulations, dtype=np.int64)
-        return bool(self.driven_articulations.size and np.any(self.driven_articulations[articulations]))
 
     def allocate_common(self) -> None:
         """Allocate the mass-update mask, the compact diagonal's inverse mass, the body inertia records (with the COM
@@ -464,10 +457,6 @@ class TreeFactor:
             arrays.release(ARTICULATION_WORK)
         self.diagonal_inverse_mass = (
             wp.zeros_like(model.joint_qd) if forest.diagonal_mass_sizes else arrays.placeholder(wp.float32)
-        )
-        driven_diagonal = any(self._driven(forest.group_to_art_host[size]) for size in forest.diagonal_mass_sizes)
-        self.diagonal_inverse_trial = (
-            wp.zeros_like(model.joint_qd) if driven_diagonal else arrays.placeholder(wp.float32)
         )
         if model.body_count:
             arrays.allocate(BODY_INERTIA, body=model.body_count)
@@ -492,8 +481,7 @@ class TreeFactor:
         inverse entries and its status."""
         self.sparse_mass_matrix_plan = plan
         self.sparse_mass_matrix_indices = factor_indices(plan, self.model.device)
-        trial = articulations if self.driven_articulations.any() else 1
-        self._arrays.allocate(SPARSE_FACTOR, group=articulations, trial_group=trial, nonzero=plan.nonzero_count)
+        self._arrays.allocate(SPARSE_FACTOR, group=articulations, nonzero=plan.nonzero_count)
 
     def allocate_size_groups(self, placeholder_sizes) -> None:
         """Allocate each size group's factor L and armature R; ``placeholder_sizes`` (the compact diagonal and the
@@ -502,15 +490,7 @@ class TreeFactor:
             n_arts = self.forest.n_arts_by_size[size]
             placeholder = size in placeholder_sizes
             factor = 1 if placeholder else 0
-            trial = factor or (0 if self._driven(self.forest.group_to_art_host[size]) else 1)
-            sizes = {
-                "art": n_arts,
-                "size": size,
-                "factor_art": factor or n_arts,
-                "factor_size": factor or size,
-                "trial_art": trial or n_arts,
-                "trial_size": trial or size,
-            }
+            sizes = {"art": n_arts, "size": size, "factor_art": factor or n_arts, "factor_size": factor or size}
             for name, array in self._arrays.allocate(SIZE_FACTORS, owner={}, **sizes).items():
                 getattr(self, f"{name}_by_size")[size] = array
 
@@ -828,9 +808,9 @@ class TreeFactor:
 
     def predict(self, state_in, control, qd: wp.array, ready: wp.Event | None, dt: float, v_hat: wp.array) -> None:
         """Stage 3: ``v_hat = qd + h H^-1 (tau - c)``, the free-root correction included. Each tree's launch holds the
-        drives' saturation decision and, where it moved a drive, the tree's new step factor and solve
-        (:data:`.tree_kinetic_state.SATURATE_DRIVES`); the trial factor keeps every ``K`` while the step factor holds a
-        decided set, so no saturation ever asks the refresh for a factor."""
+        drives' saturation decision and, where it moved a drive, the decided step by the border on the walk
+        (:data:`.tree_kinetic_state.SATURATE_DRIVES`, :func:`.tree_kinetic_state.border_solve`); the factor keeps every
+        ``K``, so no saturation ever asks the refresh for a factor."""
         with wp.ScopedTimer("S3_Trisolve_Vhat", print=False, use_nvtx=self.nvtx, synchronize=False):
             if ready is not None:
                 wp.get_stream(self.model.device).wait_event(ready)
@@ -969,65 +949,42 @@ class TreeFactor:
         body_joint = np.full(max(int(model.body_count), 1), -1, dtype=np.int32)
         body_joint[: joint_of.size] = joint_of[: body_joint.size]
         view.body_joint = wp.array(body_joint, dtype=wp.int32, device=device)
-        # The slips' release (walk_release_tree, the one writer's first phase): as many slips per tree as it has limited, driven coordinates (from
-        # the model's gains and effort limits, data-sized), at most RELEASE_SLIPS; none without a limited drive. Each
-        # slip's release is stored by its path's steps, leaf first, as deep as the class's deepest root path.
-        slips = 0
+        # The release of each tree's slips, which the predictor's border writes (tree_kinetic_state.border_solve): as
+        # many slips a tree as it has limited drives (at most RELEASE_SLIPS), each as deep as the class's deepest root
+        # path.
+        self.walk_slip_capacity = self.slip_capacity(arts)
         depth = 1
-        self.walk_limited = np.zeros(max(int(model.articulation_count), 1), dtype=np.int64)
-        if self.parallel_drives and model.joint_dof_count:
-            ke, kd = model.joint_target_ke.numpy(), model.joint_target_kd.numpy()
-            damping, limit = self.passive_joint_damping.numpy(), model.joint_effort_limit.numpy()
-            driven = self.drive_row_by_dof.numpy() >= 0
-            limited = driven & ((ke > 0) | (kd > 0) | (damping > 0)) & (limit > 0) & np.isfinite(limit)
-            starts, counts = forest.articulation_dof_start_host, forest.articulation_dof_count_host
-            for art in arts.tolist():
-                self.walk_limited[art] = int(np.count_nonzero(limited[starts[art] : starts[art] + counts[art]]))
-                slips = max(slips, int(self.walk_limited[art]))
-                j0, j1 = int(start[art]), int(end[art])
-                reach = np.zeros(j1 - j0, dtype=np.int64)
-                for j in range(j0, j1):
-                    up = int(path[j][0])
-                    reach[j - j0] = (reach[up] if up >= 0 else 0) + int(qd_start[j + 1] - qd_start[j])
-                depth = max(depth, int(reach.max(initial=0)))
-        self.walk_slip_capacity = min(slips, RELEASE_SLIPS)
-        cap = max(self.walk_slip_capacity, 1)
-        trees = max(int(model.articulation_count), 1) if self.walk_slip_capacity else 1
-        steps = depth if self.walk_slip_capacity else 1
-        release = WalkRelease()
-        release.count = wp.zeros(max(int(model.articulation_count), 1), dtype=wp.int32, device=device)
-        release.dof = wp.zeros((trees, cap), dtype=wp.int32, device=device)
-        release.coordinate = wp.full((trees, cap, steps), -1, dtype=wp.int32, device=device)
-        release.b = wp.zeros((trees, cap, steps), dtype=wp.float32, device=device)
-        release.a = wp.zeros((trees, cap, steps), dtype=wp.float32, device=device)
-        release.g = wp.zeros((trees, cap, steps), dtype=wp.float32, device=device)
-        view.release = release
-        width = max(int(forest.articulation_max_dofs), 1) if self.walk_slip_capacity else 1
-        self.walk_release_work = wp.zeros((trees, 2, width), dtype=wp.float32, device=device)
-        self.walk_release_status = wp.zeros(1, dtype=wp.int32, device=device)
+        for art in arts.tolist():
+            j0, j1 = int(start[art]), int(end[art])
+            reach = np.zeros(j1 - j0, dtype=np.int64)
+            for j in range(j0, j1):
+                parent = int(path[j][0])
+                reach[j - j0] = (reach[parent] if parent >= 0 else 0) + int(qd_start[j + 1] - qd_start[j])
+            depth = max(depth, int(reach.max(initial=1)))
+        view.release = release_view(
+            max(int(model.articulation_count), 1),
+            self.walk_slip_capacity,
+            depth if self.walk_slip_capacity else 1,
+            device,
+        )
         self.walk_trees = view
 
     def slip_capacity(self, articulations) -> int:
-        """The most slips any of ``articulations`` can release: its limited drives, at most :data:`RELEASE_SLIPS` (0
-        where none can slip, so a consumer compiles no release)."""
-        arts = np.asarray(articulations, dtype=np.int64)
-        return min(int(self.walk_limited[arts].max()) if arts.size else 0, RELEASE_SLIPS)
-
-    def walk_slips(self) -> WalkSlips:
-        """What the one writer's release phase reads (:class:`WalkSlips`, :func:`walk_release_tree`): the predictor's
-        decided set and each world's walked trees."""
-        slips = WalkSlips()
-        placeholder = self._arrays.placeholder
-        drives = self.parallel_drives and self.walk_slip_capacity > 0
-        slips.decided = self.aug_decided if drives else placeholder(wp.int32)
-        slips.row_counts = self.aug_row_counts if drives else placeholder(wp.int32)
-        slips.row_dof = self.aug_row_dof_index if drives else placeholder(wp.int32)
-        slips.row_K = self.aug_row_K if drives else placeholder(wp.float32)
-        slips.row_Kd = self.aug_row_Kd if drives else placeholder(wp.float32)
-        slips.max_dofs = int(self.forest.articulation_max_dofs)
-        slips.world_start, slips.world_arts = self.walk_world_start, self.walk_world_arts
-        slips.work, slips.status = self.walk_release_work, self.walk_release_status
-        return slips
+        """The most drives of one of ``articulations`` that can slip, at most :data:`RELEASE_SLIPS`: its driven
+        coordinates with a gain and a finite effort limit (the model's data at construction). A tree's border holds that
+        many; 0 where none can slip, so a consumer compiles no release."""
+        model, forest = self.model, self.forest
+        if not self.parallel_drives or not model.joint_dof_count:
+            return 0
+        ke, kd = model.joint_target_ke.numpy(), model.joint_target_kd.numpy()
+        damping, limit = self.passive_joint_damping.numpy(), model.joint_effort_limit.numpy()
+        driven = self.drive_row_by_dof.numpy() >= 0
+        limited = driven & ((ke > 0) | (kd > 0) | (damping > 0)) & (limit > 0) & np.isfinite(limit)
+        starts, counts = forest.articulation_dof_start_host, forest.articulation_dof_count_host
+        slips = 0
+        for art in np.asarray(articulations, dtype=np.int64).tolist():
+            slips = max(slips, int(np.count_nonzero(limited[starts[art] : starts[art] + counts[art]])))
+        return min(slips, RELEASE_SLIPS)
 
     def walk_view(self) -> WalkTrees:
         """The walk's view (:class:`WalkTrees`) the one writer, the leave and the audit read."""
@@ -1613,59 +1570,64 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
             for (int k = 0; k < 6; ++k) twist[6 * b + k] = V[k];
         }
     };
-    // The slips' release of tree art (WalkRelease, walk_release_tree; W9's verdict: R = L_F^-1 L_K, tree-lower, so
-    // every row keeps its support), slip j's steps along its root path leaf first at release.*[art, j, :]:
-    // WALK_RELEASE(release, art, z, stride): a row's footprints z <- R z (coordinate c at z[c * stride]), the first
-    // slip first, each leaf first.
-    // WALK_RELEASE_T(release, art, u): the leave's u <- R^T u, the last slip first, each root first.
-    // WALK_RELEASE_IT(release, art, u): the audit's coordinates u <- R^-T u, the first slip first, each root first.
+    // The slips' release of tree art (WalkRelease, written by the predictor's border; W9's verdict: R = L_F^-1 L_K,
+    // tree-lower, so every row keeps its support). Slip j's steps along its root path, leaf first, start at
+    // at = (art * cap + j) * steps of release.coordinate, .b, .a, .g; a coordinate of -1 ends the path.
+    // WALK_SLIP(release, at, z, stride): z <- R_j z (coordinate c at z[c * stride]), leaf first.
+    // WALK_SLIP_T(release, at, u): u <- R_j^T u, root first. WALK_SLIP_IT(release, at, u): u <- R_j^-T u, root first.
+    // WALK_RELEASE(release, art, z, stride): a row's footprints z <- R z, the first slip first.
+    // WALK_RELEASE_T(release, art, u): the leave's u <- R^T u, the last slip first.
+    // WALK_RELEASE_IT(release, art, u): the audit's coordinates u <- R^-T u, the first slip first.
+    const auto WALK_SLIP = [&](const auto& release, const size_t at, float* z, const int stride) {
+        const int steps = release.b.shape[2];
+        const int* coordinate = release.coordinate.data + at;
+        const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
+        float s = 0.0f;
+        for (int k = 0; k < steps; ++k) {
+            const int c = coordinate[k];
+            if (c < 0) break;
+            const float x = z[c * stride] - b[k] * s;
+            s += a[k] * x;
+            z[c * stride] = g[k] * x;
+        }
+    };
+    const auto WALK_SLIP_T = [&](const auto& release, const size_t at, float* u) {
+        const int steps = release.b.shape[2];
+        const int* coordinate = release.coordinate.data + at;
+        const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
+        float t = 0.0f;
+        for (int k = steps - 1; k >= 0; --k) {
+            const int c = coordinate[k];
+            if (c < 0) continue;
+            const float x = g[k] * u[c] + a[k] * t;
+            u[c] = x;
+            t -= b[k] * x;
+        }
+    };
+    const auto WALK_SLIP_IT = [&](const auto& release, const size_t at, float* u) {
+        const int steps = release.b.shape[2];
+        const int* coordinate = release.coordinate.data + at;
+        const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
+        float t = 0.0f;
+        for (int k = steps - 1; k >= 0; --k) {
+            const int c = coordinate[k];
+            if (c < 0) continue;
+            const float x = u[c];
+            u[c] = (x - a[k] * t) / g[k];
+            t -= b[k] * x;
+        }
+    };
     const auto WALK_RELEASE = [&](const auto& release, const int art, float* z, const int stride = 1) {
         const int cap = release.b.shape[1], steps = release.b.shape[2];
-        for (int j = 0; j < release.count.data[art]; ++j) {
-            const size_t at = ((size_t)art * cap + j) * steps;
-            const int* coordinate = release.coordinate.data + at;
-            const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
-            float s = 0.0f;
-            for (int k = 0; k < steps; ++k) {
-                const int c = coordinate[k];
-                if (c < 0) break;
-                const float x = z[c * stride] - b[k] * s;
-                s += a[k] * x;
-                z[c * stride] = g[k] * x;
-            }
-        }
+        for (int j = 0; j < release.count.data[art]; ++j) WALK_SLIP(release, ((size_t)art * cap + j) * steps, z, stride);
     };
     const auto WALK_RELEASE_T = [&](const auto& release, const int art, float* u) {
         const int cap = release.b.shape[1], steps = release.b.shape[2];
-        for (int j = release.count.data[art] - 1; j >= 0; --j) {
-            const size_t at = ((size_t)art * cap + j) * steps;
-            const int* coordinate = release.coordinate.data + at;
-            const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
-            float t = 0.0f;
-            for (int k = steps - 1; k >= 0; --k) {
-                const int c = coordinate[k];
-                if (c < 0) continue;
-                const float x = g[k] * u[c] + a[k] * t;
-                u[c] = x;
-                t -= b[k] * x;
-            }
-        }
+        for (int j = release.count.data[art] - 1; j >= 0; --j) WALK_SLIP_T(release, ((size_t)art * cap + j) * steps, u);
     };
     const auto WALK_RELEASE_IT = [&](const auto& release, const int art, float* u) {
         const int cap = release.b.shape[1], steps = release.b.shape[2];
-        for (int j = 0; j < release.count.data[art]; ++j) {
-            const size_t at = ((size_t)art * cap + j) * steps;
-            const int* coordinate = release.coordinate.data + at;
-            const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
-            float t = 0.0f;
-            for (int k = steps - 1; k >= 0; --k) {
-                const int c = coordinate[k];
-                if (c < 0) continue;
-                const float x = u[c];
-                u[c] = (x - a[k] * t) / g[k];
-                t -= b[k] * x;
-            }
-        }
+        for (int j = 0; j < release.count.data[art]; ++j) WALK_SLIP_IT(release, ((size_t)art * cap + j) * steps, u);
     };"""
 
 
@@ -1739,20 +1701,39 @@ def walk_paths_prelude(
 
 @wp.struct
 class WalkRelease:
-    """The release of each tree's slipping drives this step (:func:`walk_release_tree`, W9's verdict): its slips
-    (``count``, 0 for none), each one's coordinate within its tree (``dof``, root-most first), and at each step of each
+    """The release of each tree's slipping drives this step, which the predictor's border writes
+    (:func:`.tree_kinetic_state.border_solve`, W9): its slips (``count``, 0 for none), each one's coordinate within its
+    tree (``dof``, root-most first) and its root (``root``, its path's root-most coordinate), and at each step of each
     one's root path, leaf first, the step's coordinate (``coordinate``, -1 past the path), the column ``b`` of the
     released inverse and the recurrence's ``a`` (``beta d^1/2``) and ``g`` (``(d / dbar)^1/2``): ``[tree, slip, step]``,
-    as deep as the class's deepest root path. Slip ``j``'s release ``R_j`` runs along its path leaf first,
-    ``u = x_c - b s; s += a u; x_c = g u`` from ``s = 0``; ``R = R_(s-1) ... R_0`` is the decided factor's whitening on
-    the all-``K`` walk's (``R = L_F^-1 L_K``, tree-lower: every row keeps its support)."""
+    as deep as the class's deepest root path. Slip ``j``'s ``R_j`` maps a footprint ``z`` along its path, leaf first,
+    ``u = z_c - b s``, ``s += a u``, ``z_c = g u``; ``R = R_(s-1) ... R_0 = L_F^-1 L_K``, the decided factor's whitening on
+    the all-``K`` walk, which keeps every row's support (``WALK_RELEASE``, ``WALK_RELEASE_T``, ``WALK_RELEASE_IT``; the
+    Warp twin :func:`release_path`). Two slips' paths meet if and only if their roots are equal (their ``R_j`` touch
+    disjoint coordinates otherwise, and commute), and a footprint whose support holds every ancestor of its coordinates
+    (a row's) meets slip ``j``'s path if and only if it holds ``root[j]``."""
 
     count: wp.array[int]
     dof: wp.array2d[int]
+    root: wp.array2d[int]
     coordinate: wp.array3d[int]
     b: wp.array3d[float]
     a: wp.array3d[float]
     g: wp.array3d[float]
+
+
+def release_view(articulations: int, capacity: int, depth: int, device) -> WalkRelease:
+    """A :class:`WalkRelease` of ``capacity`` slips a tree and ``depth`` steps a slip; no slip room without a capacity."""
+    view = WalkRelease()
+    trees = articulations if capacity else 0
+    view.count = wp.zeros(articulations, dtype=wp.int32, device=device)
+    view.dof = wp.zeros((trees, max(capacity, 1)), dtype=wp.int32, device=device)
+    view.root = wp.zeros((trees, max(capacity, 1)), dtype=wp.int32, device=device)
+    view.coordinate = wp.full((trees, max(capacity, 1), depth), -1, dtype=wp.int32, device=device)
+    view.b = wp.zeros((trees, max(capacity, 1), depth), dtype=wp.float32, device=device)
+    view.a = wp.zeros((trees, max(capacity, 1), depth), dtype=wp.float32, device=device)
+    view.g = wp.zeros((trees, max(capacity, 1), depth), dtype=wp.float32, device=device)
+    return view
 
 
 @wp.struct
@@ -1770,8 +1751,9 @@ class WalkTrees:
     - each articulation's first joint, joint end, first coordinate and coordinates (a free rigid body is a one-body
       tree of six coordinates);
     - ``dof_body``: each coordinate's body within its tree; ``body_joint``: each body's joint;
-    - ``release``: the slips' release of each tree (the block primitive's first phase, :class:`WalkRelease`), so that
-      the rows take ``R``, the leave ``R^T`` and the audit's coordinates ``R^-T``.
+    - ``release``: the release of each tree's slips (the block primitive's first phase, :class:`WalkRelease`), which the
+      predictor's border writes (:func:`.tree_kinetic_state.border_solve`, FL3.9): the rows take ``R``, the leave
+      ``R^T`` and the audit's coordinates ``R^-T``.
     """
 
     data: wp.array2d[float]
@@ -1789,6 +1771,28 @@ class WalkTrees:
     release: WalkRelease
 
 
+def empty_walk_view(model, forest) -> WalkTrees:
+    """A :class:`WalkTrees` that holds no tree: the predictor's border reads it where no tree could slip at construction
+    and the walk is not held (:meth:`TreeFactor.plan_walk`), and clears its slip counts. Its coordinate ranges are the
+    forest's and its data has no row, so a decided step there (a limit set after construction) finds no tree, keeps its
+    trial and flags the border's status (``constraint_capacity_status()["slip_frames"]``), never reading past an array."""
+    device = model.device
+    view = WalkTrees()
+    view.data = wp.zeros((0, WALK_COORDINATE), dtype=wp.float32, device=device)
+    view.link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
+    view.path = wp.zeros(1, dtype=wp.vec2i, device=device)
+    view.now = wp.zeros((1, WALK_NOW), dtype=wp.float32, device=device)
+    view.now_link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
+    view.scratch = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+    view.joint_start = model.articulation_start
+    view.joint_end = forest.articulation_joint_end
+    view.dof_start = forest.articulation_dof_start
+    view.dofs = forest.articulation_dof_count
+    view.dof_body = view.body_joint = wp.zeros(1, dtype=wp.int32, device=device)
+    view.release = release_view(max(int(model.articulation_count), 1), 0, 1, device)
+    return view
+
+
 _ENTER = """    if (tid >= arts.shape[0]) return;
     const int art = arts.data[tid];
     const int world = art_to_world.data[art], offset = world_offset.data[art];
@@ -1798,7 +1802,7 @@ _ENTER = """    if (tid >= arts.shape[0]) return;
     float* u = coordinates.data + (size_t)world * coordinates.shape[1] + offset;
     WALK_ENTER(walk.data.data + (size_t)d0 * $coordinate, walk.link.data + (size_t)j0 * $link, velocity.data + d0, u,
                reinterpret_cast<float*>(walk.scratch.data + j0));
-    // The rows' release: u <- R^-T u (walk_release_tree).
+    // The rows' release: u <- R^-T u (the predictor's border's R).
     WALK_RELEASE_IT(walk.release, art, u);
 """
 
@@ -1894,31 +1898,15 @@ def walk_into(
 
 
 RELEASE_SLIPS = 16
-"""The most slipping drives a tree's release holds: a tree past it keeps its first ``RELEASE_SLIPS`` and the release's
-status flags it."""
-
-
-@wp.struct
-class WalkSlips:
-    """What the release reads (:func:`walk_release_tree`): the predictor's decided set (H7's ``decided``, each drive
-    row's coordinate and its trial and decided ``K``, ``max_dofs`` rows a tree), each world's walked trees (CSR), the
-    release's scratch (``work[tree, 2, coordinates]``) and its status word."""
-
-    decided: wp.array[int]
-    row_counts: wp.array[int]
-    row_dof: wp.array[int]
-    row_K: wp.array[float]
-    row_Kd: wp.array[float]
-    max_dofs: int
-    world_start: wp.array[int]
-    world_arts: wp.array[int]
-    work: wp.array3d[float]
-    status: wp.array[int]
+"""The most slipping drives a tree's release holds (:class:`WalkRelease`, three floats and a coordinate a slip and path
+step): a tree past it keeps the rest's ``K`` and ``constraint_capacity_status()["slip_frames"]`` flags it. It bounds the
+release's memory until a data-sized arena holds it (DECISIONS 10-24); nothing else reads it."""
 
 
 @wp.func
 def release_path(release: WalkRelease, art: int, j: int, x: wp.array3d[float], line: int, slot: int, entry: int):
-    """``x[line, slot, entry + c] <- (R_j x)_c``: slip ``j``'s release along its path, leaf first (:class:`WalkRelease`)."""
+    """``x[line, slot, entry + c] <- (R_j x)_c``: slip ``j``'s release along its path, leaf first (:class:`WalkRelease`;
+    the Warp twin of ``WALK_RELEASE``)."""
     s = float(0.0)
     for t in range(release.b.shape[2]):
         c = release.coordinate[art, j, t]
@@ -1927,102 +1915,6 @@ def release_path(release: WalkRelease, art: int, j: int, x: wp.array3d[float], l
         u = x[line, slot, entry + c] - release.b[art, j, t] * s
         s += release.a[art, j, t] * u
         x[line, slot, entry + c] = release.g[art, j, t] * u
-
-
-@wp.func
-def walk_release_tree(art: int, walk: WalkTrees, slips: WalkSlips, qd: wp.array[float]):
-    """Tree ``art``'s release, if its predictor decided a set (``decided``, H7's): FL3.4's block primitive
-    ``z <- z + U (Sigma - I) U^T z`` with ``U`` the coordinates of each slip's path and ``Sigma`` the release
-    ``R = Dbar^-1/2 G^-1 D^1/2`` (Gill, Golub, Murray and Saunders' rank-1 downdate) on the walk's footprints. A slip is
-    a drive row whose decided ``K`` is below its trial's (released stiffness ``row_K - row_Kd``); the slips are released
-    root-most first, each from the split pivot ``P0_i + Kd_i``. Its column ``b = W e_i`` of the inverse released so far
-    is the walk of ``e_i`` with the earlier releases applied (``work[tree, 1]``, by coordinate); ``work[tree, 0]``
-    carries each coordinate's current pivot. The rows ``R W P J^T`` and the leave ``P^T W^T R^T`` are then the decided
-    factor's, each row inside its support (W9: ``R`` is the only square root of ``I + B C^-1 B^T`` that keeps it). ``qd``
-    is what :func:`walk_into` reads for a seed's incident (unused by the release's columns)."""
-    release = walk.release
-    decided, row_counts, row_dof = slips.decided, slips.row_counts, slips.row_dof
-    row_K, row_Kd, max_dofs, work, status = slips.row_K, slips.row_Kd, slips.max_dofs, slips.work, slips.status
-    release.count[art] = 0
-    if decided[art] == 0:
-        return
-    cap = release.dof.shape[1]
-    n = walk.dofs[art]
-    d0 = walk.dof_start[art]
-    j0 = walk.joint_start[art]
-    bodies = walk.joint_end[art] - j0
-    # The slips, sorted by coordinate: in a tree's coordinates every ancestor comes first (root-most first).
-    s = int(0)
-    for r in range(row_counts[art]):
-        row = art * max_dofs + r
-        if row_Kd[row] != row_K[row] and row_K[row] - row_Kd[row] > 0.0:
-            if s < cap:
-                k = s
-                dof = row_dof[row] - d0
-                while k > 0 and release.dof[art, k - 1] > dof:
-                    release.dof[art, k] = release.dof[art, k - 1]
-                    k -= 1
-                release.dof[art, k] = dof
-                s += 1
-            else:
-                status[0] = 1
-    if s == 0:
-        return
-    tree = art
-    for c in range(n):
-        work[tree, 0, c] = 1.0 / (walk.data[d0 + c, 12] * walk.data[d0 + c, 12])
-    steps = release.b.shape[2]
-    for j in range(s):
-        i = release.dof[art, j]
-        # The slip's drive row: the decided and the trial K.
-        Kd = float(0.0)
-        K = float(0.0)
-        for r in range(row_counts[art]):
-            row = art * max_dofs + r
-            if row_dof[row] - d0 == i:
-                Kd = row_Kd[row]
-                K = row_K[row]
-        # b = W e_i: the walk of e_i, then the earlier releases.
-        for c in range(n):
-            work[tree, 1, c] = 0.0
-        walk_into(walk, j0, d0, bodies, n, walk.dof_body[d0 + i], wp.spatial_vector(), i, 1.0, qd, 0, work, tree, 1, 0)
-        for k in range(j):
-            release_path(release, art, k, work, tree, 1, 0)
-        # The recurrence along the path, leaf first: the released pivots and the column transform's two factors.
-        alpha = Kd - K
-        body = walk.dof_body[d0 + i]
-        c = i
-        t = int(0)
-        while body >= 0:
-            first = walk.path[j0 + body][1]
-            while c >= first:
-                d = work[tree, 0, c]
-                scale = wp.sqrt(d)
-                b = work[tree, 1, c]
-                dbar = d + alpha * (b * scale) * (b * scale)
-                if c == i:
-                    dbar = walk.data[d0 + i, WALK_PIVOT] + Kd
-                if not (dbar > 0.0) or not wp.isfinite(dbar):
-                    status[0] = 1
-                beta = alpha * b * scale / dbar
-                alpha = alpha * d / dbar
-                release.coordinate[art, j, t] = c
-                release.b[art, j, t] = b
-                release.a[art, j, t] = beta * scale
-                release.g[art, j, t] = scale / wp.sqrt(dbar)
-                work[tree, 0, c] = dbar
-                c -= 1
-                t += 1
-            body = walk.path[j0 + body][0]
-            if body >= 0:
-                # The parent's last coordinate: the next body's first, less one.
-                if body + 1 < bodies:
-                    c = walk.path[j0 + body + 1][1] - 1
-                else:
-                    c = n - 1
-        for k in range(t, steps):
-            release.coordinate[art, j, k] = -1
-    release.count[art] = s
 
 
 # ---------------------------------------------------------------------------------------------------------------------

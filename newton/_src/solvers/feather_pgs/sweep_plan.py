@@ -859,31 +859,6 @@ class Sweep:
             self._support_sink = sink
         return self._support_sink
 
-    def release_walk(self, v_hat: wp.array) -> None:
-        """Case K1: the release of every tree whose predictor decided a set this step (:func:`.walk_rows.walk_release_kernel`),
-        before the writer reads it; nothing where no drive can slip."""
-        size = self.placement.sparse_mass_matrix_size
-        self._release(self.forest.group_to_art[size], self.forest.n_arts_by_size[size], v_hat)
-
-    def release_diagonal(self, v_hat: wp.array) -> None:
-        """Case K2: the release of every dense arm whose predictor decided a set this step
-        (:func:`.walk_rows.walk_release_kernel`), before its rows read it; nothing where no drive can slip. A key's slip
-        is its own scalar, already in the factor's diagonal inverse mass its step reads."""
-        self._release(self.placement.sparse_diagonal_dense_arts, self.forest.world_count, v_hat)
-
-    def _release(self, arts: wp.array, count: int, v_hat: wp.array) -> None:
-        """The release of ``arts``' slipping drives (W9's one slip basis, the factor's :class:`.tree_factor.WalkRelease`),
-        a thread per tree."""
-        factor = self.factor
-        if not factor.walk_slip_capacity:
-            return
-        wp.launch(
-            walk_rows.walk_release_kernel,
-            dim=count,
-            inputs=[arts, factor.walk_view(), factor.walk_slips(), v_hat],
-            device=self.model.device,
-        )
-
     def admit_paired(self) -> None:
         """Case K5, a tree beside one free body: the paired response and its factor coordinates."""
         model = self.model
@@ -999,23 +974,6 @@ class Sweep:
             elif sizes is not None:
                 reason = f"The dense row capacity {self.placement.dense_max_constraints} holds no tier of four rows."
         self.routes.reasons["K4"] = reason
-
-    def _hold_tier_release(self) -> None:
-        """The keyed tiers' trees whose slips the release builds each step (:meth:`release_tiers`): every articulation
-        of a tier size whose trees can slip (:meth:`_tier_frame`); none where no tree of theirs can slip."""
-        sizes = [size for size, cap in zip(self.placement.ink_sizes[:2], self._tier_frame(), strict=True) if cap]
-        if not sizes:
-            return
-        arts = np.concatenate([self.forest.group_to_art[size].numpy() for size in sizes]).astype(np.int32)
-        self.tier_release_arts = wp.array(arts, dtype=wp.int32, device=self.model.device)
-
-    def release_tiers(self, v_hat: wp.array) -> None:
-        """The keyed tiers' release this step, of every tree whose predictor decided a set
-        (:func:`.walk_rows.walk_release_kernel`): their rows take ``R`` and their leave ``R^T``. Nothing where no tree of
-        theirs can slip."""
-        if self.tier_release_arts is None:
-            return
-        self._release(self.tier_release_arts, self.tier_release_arts.shape[0], v_hat)
 
     def _tier_frame(self) -> tuple[int, int]:
         """Each of the tiers' trees' slip capacity (:meth:`.tree_factor.TreeFactor.slip_capacity`): the release its rows
@@ -1372,7 +1330,6 @@ class Sweep:
         # The Jacobi tiers ahead of the matrix-free sweep (SweepTier), and their keyed rows' release.
         self.tiers = []
         self.tier_worlds = None
-        self.tier_release_arts = None
         # The sweeps start from the impulses the rows carry: the warm start's, the closed loop's projection.
         self.seeded = bool(self.options.pgs_warmstart or self.factor.eliminates)
         if self.placement.mf_sweeps:
@@ -1467,8 +1424,6 @@ class Sweep:
                     parallel_factory = get_parallel_factory(parallel_factory, self.placement.keyed_rows.layout)
                 tiers = [(min(first + 32, parallel_rows), first) for first in range(0, parallel_rows, 32)]
                 self.par_tiers = list(tiers)
-                if self.placement.keyed_rows is not None:
-                    self._hold_tier_release()
                 if len(tiers) >= _TIER_LIST_MIN_TIERS:
                     dev = model.device
                     self.tier_lo = wp.array([lo for _, lo in tiers], dtype=wp.int32, device=dev)

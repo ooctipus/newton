@@ -116,8 +116,8 @@ def _diagonal(solver, art) -> np.ndarray:
     group = int(forest.art_group_idx.numpy()[art])
     added = solver.factor.R_by_size[size].numpy()[group].astype(np.float64).copy()
     rows = solver.factor.drive_row_by_dof.numpy()[start : start + size]
-    # The step factor holds every drive's K, or its decided set's.
-    K = (solver.factor.aug_row_Kd if solver.factor.aug_decided.numpy()[art] else solver.factor.aug_row_K).numpy()
+    # The factor holds every drive's K: a saturated drive's is released by the predictor's border, not the factor.
+    K = solver.factor.aug_row_K.numpy()
     added += np.where(rows >= 0, np.maximum(K[np.maximum(rows, 0)], 0.0), 0.0)
     return added
 
