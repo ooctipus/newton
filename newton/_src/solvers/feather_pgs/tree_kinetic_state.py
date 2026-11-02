@@ -1805,7 +1805,7 @@ _BORDER = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step
             #pragma unroll 1
             for (; c >= WALK_FIRST_OF(body); --c, ++t) {
                 float d[$unpacked];
-                WALK_LOAD_RECORD(d, data + $coordinate * c);
+                $record(d, data + $coordinate * c);
                 const float z = (x + ((d[0] * p[0] + d[1] * p[1] + d[2] * p[2]) + (d[3] * p[3] + d[4] * p[4] + d[5] * p[5])))
                                 * d[12];
                 x = 0.0f;
@@ -1917,15 +1917,51 @@ _BORDER = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step
 
 
 @functools.cache
-def walk_tree_prelude() -> DevicePrelude:
+def walk_tree_prelude(both: bool = True) -> DevicePrelude:
     """The predictor's border, for both devices: :func:`.tree_factor.walk_paths_prelude`'s path table and walks (the
     slips' paths read it) and the border's build (:data:`_BORDER`). The whole-tree walks are the class emitter's
-    (:func:`walk_tree`)."""
+    (:func:`walk_tree`). ``both``: whether a tree of the predictor's classes has a column of two halves (else its
+    records are read with no side load, :func:`record_load`)."""
     from .tree_factor import WALK_COORDINATE, WALK_UNPACKED, walk_paths_prelude  # noqa: PLC0415
 
     walk = walk_paths_prelude(1)
-    tree = substitute(_BORDER, coordinate=WALK_COORDINATE, unpacked=WALK_UNPACKED)
-    return DevicePrelude("walk_tree", walk.source + "\n" + tree, cpu=walk.cpu + "\n" + tree)
+    tree = substitute(_BORDER, coordinate=WALK_COORDINATE, unpacked=WALK_UNPACKED, record=record_load(both))
+    if both:
+        return DevicePrelude("walk_tree", walk.source + "\n" + tree, cpu=walk.cpu + "\n" + tree)
+    return DevicePrelude(
+        "walk_tree_one_half",
+        walk.source + "\n" + _ONE_HALF + "\n" + tree,
+        cpu=walk.cpu + "\n" + _ONE_HALF_CPU + "\n" + tree,
+    )
+
+
+_ONE_HALF = """#ifndef WALK_LOAD_ONE_HALF
+// WALK_LOAD_ONE_HALF(d, p): WALK_LOAD_RECORD for a reader whose trees have no column of two halves (its classes'
+// data): no side load.
+#define WALK_LOAD_ONE_HALF(d, p)                                                                                \
+    {                                                                                                          \
+        const float4* walk_q_ = reinterpret_cast<const float4*>(p);                                            \
+        const float4 walk_a_ = __ldg(walk_q_), walk_b_ = __ldg(walk_q_ + 1), walk_e_ = __ldg(walk_q_ + 2);     \
+        const float4 walk_v_ = make_float4(0.0f, 0.0f, 0.0f, 0.0f);                                            \
+        WALK_UNPACK(d, walk_a_, walk_b_, walk_e_, walk_v_);                                                    \
+    }
+#endif"""
+_ONE_HALF_CPU = """#ifndef WALK_LOAD_ONE_HALF
+#define WALK_LOAD_ONE_HALF(d, p) WALK_LOAD_RECORD(d, p)
+#endif"""
+
+
+def record_load(both: bool) -> str:
+    """The record's load for a reader of classes with (``both``) or without a column of two halves: without, no side
+    load (the predictor's register line, offline sm_120 on g1: 20 fewer local stores)."""
+    return "WALK_LOAD_RECORD" if both else "WALK_LOAD_ONE_HALF"
+
+
+def classes_have_both(classes: tuple) -> bool:
+    """Whether a walked class of ``classes`` has a column of two halves, or names none (:class:`.tree_factor.WalkClass`)."""
+    from .tree_factor import WALK_BOTH  # noqa: PLC0415
+
+    return any(cls.half_of(c) == WALK_BOTH for cls in classes if cls is not None for c in range(cls.coordinates))
 
 
 _HELD = """    // The border held by the tree's segment (CUDA, every tree whose coordinates and bodies fit $HOLD words a lane): the
@@ -1954,7 +1990,7 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
             const int x = lane + k * WIDTH;
             if (x < n) {
                 float d[$unpacked];
-                WALK_LOAD_RECORD(d, data + $coordinate * x);
+                $record(d, data + $coordinate * x);
                 #pragma unroll
                 for (int m = 0; m < 13; ++m) h.r[k][m] = d[m];
             } else {
@@ -2459,7 +2495,7 @@ def border_solve(layout: TreeLayout, classes: tuple) -> str:
     return substitute(text, {**layout.sizes(), "WALK_COORDINATE": WALK_COORDINATE, "WALK_LINK": WALK_LINK})
 
 
-def held_lambdas(layout: TreeLayout, slips: int) -> str:
+def held_lambdas(layout: TreeLayout, slips: int, both: bool = True) -> str:
     """The held walk's native lambdas (:data:`_HELD`) for the layout's words a lane, CUDA only, declared once ahead of the
     trial; nothing for a tree past two words a lane (:func:`_held_words`). ``slips`` is the class's slip capacity
     (:meth:`.tree_factor.TreeFactor.slip_capacity`): the build's lanes, one a slip, at most the segment's width."""
@@ -2469,7 +2505,9 @@ def held_lambdas(layout: TreeLayout, slips: int) -> str:
     if not words:
         return ""
     bound = max(1, min(slips, layout.lanes, 32))
-    lambdas = substitute(_HELD, HOLD=words, SLIPS=bound, coordinate=WALK_COORDINATE, unpacked=WALK_UNPACKED)
+    lambdas = substitute(
+        _HELD, HOLD=words, SLIPS=bound, coordinate=WALK_COORDINATE, unpacked=WALK_UNPACKED, record=record_load(both)
+    )
     return f"#if defined(__CUDA_ARCH__)\n{lambdas}\n#endif\n"
 
 
@@ -2687,12 +2725,12 @@ def get_predictor_kernel(
         _RESPONSE_HALF,
         preludes=(
             *SPATIAL.preludes(),
-            walk_tree_prelude(),
+            walk_tree_prelude(classes_have_both(walked)),
             *((walk_down_prelude(walked, PREDICTOR_UNROLL, PREDICTOR_AHEAD),) if walked else ()),
         ),
         PHYSICAL_TABLE=layout.physical_table(),
         SCRATCH=_placed_block(layout, "s", "$PRED_SCRATCH"),
-        TRIAL=held_lambdas(layout, slips)
+        TRIAL=held_lambdas(layout, slips, classes_have_both(walked))
         + substitute(
             _RESPONSE_STAGE,
             layout.sizes(),
