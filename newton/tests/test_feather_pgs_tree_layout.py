@@ -15,7 +15,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import tree_kinetic_plan, tree_kinetic_state
 from newton._src.solvers.feather_pgs import tree_scan as ts
-from newton._src.solvers.feather_pgs.tree_factor import WalkClass
+from newton._src.solvers.feather_pgs.tree_factor import RELEASE_SLIPS, WalkClass
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
@@ -139,6 +139,7 @@ class TestTreeLayoutRender(unittest.TestCase):
                         response="cholesky",
                         twists=tree_kinetic_state.publishes_twists(layout, schedules, cuda=True),
                         classes=walk_classes(layout),
+                        slips=RELEASE_SLIPS,
                     )
                     predictor_natives = [
                         f for f in predictor.adj.get_references()[2] if getattr(f, "native_snippet", None)
