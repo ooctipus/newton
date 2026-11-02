@@ -49,7 +49,7 @@ from .sweep import (
     speed_rows_pass,
     velocity_limit_pass,
 )
-from .tree_factor import FRAME_SLIPS, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_paths_prelude
+from .tree_factor import WALK_COORDINATE, WALK_LINK, WalkTrees, walk_paths_prelude
 
 # The row loops leave the velocity-limit rows to the passes at the end of every sweep (the last word).
 _DENSE_ADMISSION = f"if (row_type == {VELOCITY_LIMIT}) continue;"
@@ -152,31 +152,33 @@ class FactorCoordinates:
         """Every marked articulation leaves factor coordinates in place, a thread per bitmap word. With ``walk`` (the
         general placement's one writer, :mod:`.walk_rows`) a tree leaves by the walk down (``WALK_DOWN`` of
         :func:`.tree_factor.walk_paths_prelude`, its twists in the walk's scratch), with ``frame`` (a class whose
-        drives can saturate) after its rows' frame; a free rigid body keeps its 6x6 factor."""
+        drives can saturate) after its rows' release's transpose ``R^T``; a free rigid body keeps its 6x6 factor."""
         factors = self.op.factors
         coordinates = lambda k: f"s_v[d + {k}]"  # noqa: E731
         walked = ""
         if walk:
             slipped = ""
             if frame:
-                slipped = f"""            const int slips = walk.slips.data[art];
-            if (slips > 0) {{
-                // The slips' frame: du <- F^T du = du + Bh (Ln - I) Bh^T du (tree_factor.walk_frame_kernel).
-                const int width = walk.basis.shape[2], cap = walk.scale.shape[2];
-                const float* basis = walk.basis.data + (size_t)art * walk.basis.shape[1] * width;
-                const float* scale = walk.scale.data + (size_t)art * walk.scale.shape[1] * cap;
-                float y[{FRAME_SLIPS}];
-                for (int j = 0; j < slips; ++j) {{
-                    float acc = 0.0f;
-                    for (int c = 0; c < size; ++c) acc += basis[j * width + c] * s_v[d + c];
-                    y[j] = acc;
-                }}
-                for (int j = 0; j < slips; ++j) {{
-                    float shift = -y[j];
-                    for (int k = 0; k <= j; ++k) shift += scale[j * cap + k] * y[k];
-                    for (int c = 0; c < size; ++c) s_v[d + c] += shift * basis[j * width + c];
-                }}
-            }}
+                slipped = """            {
+                // The slips' release: du <- R^T du, the last slip first, each along its path root first
+                // (tree_factor.walk_release_kernel).
+                const auto& release = walk.release;
+                const int slips = release.count.data[art];
+                const int cap = release.b.shape[1], steps = release.b.shape[2];
+                for (int j = slips - 1; j >= 0; --j) {
+                    const size_t at = ((size_t)art * cap + j) * steps;
+                    const int* coordinate = release.coordinate.data + at;
+                    const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
+                    float t = 0.0f;
+                    for (int k = steps - 1; k >= 0; --k) {
+                        const int c = coordinate[k];
+                        if (c < 0) continue;
+                        const float x = g[k] * s_v[d + c] + a[k] * t;
+                        s_v[d + c] = x;
+                        t -= b[k] * x;
+                    }
+                }
+            }
 """
             walked = f"""        if (walk.free.data[art] == 0) {{
             const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];

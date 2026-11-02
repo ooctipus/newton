@@ -1383,9 +1383,9 @@ class RowLaws:
     def write_walked(self, solver, state_in, contacts: Contacts | None, dt: float) -> None:
         """The general placement's one writer (:func:`.walk_rows.write_walked_rows`): every dense row's seed walked
         into the packed rows, its diagonal, incident velocity and rhs, once the predictor's ``v_hat`` and its slips'
-        frame are known."""
+        release are known."""
         placement, factor, model = solver.placement, solver.factor, solver.model
-        factor.walk_frames(solver.v_hat)
+        factor.walk_releases(solver.v_hat)
         # Without contacts no row is a contact's: the writer reads no contact input.
         contact_input = (
             bind_contact_input(solver, state_in, factor, contacts, dt, 1.0) if contacts is not None else ContactInput()

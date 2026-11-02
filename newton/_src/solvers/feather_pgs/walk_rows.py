@@ -48,7 +48,7 @@ from .kernels import row_bias
 from .response_builds_dense import _Vec6, whiten_six
 from .row_build import write_contact_row
 from .row_laws import LINK_ROWS
-from .tree_factor import WalkTrees, _FrameVector, walk_into
+from .tree_factor import WalkTrees, release_path, walk_into
 
 __all__ = ["write_contact_units", "write_walked_rows"]
 
@@ -173,35 +173,22 @@ def walk_covector(
 
 @wp.func
 def slips_on(walk: WalkTrees, art: int) -> int:
-    """Whether articulation ``art`` (-1 for none) slips this step: its rows take the frame."""
+    """Whether articulation ``art`` (-1 for none) slips this step: its rows take the release."""
     if art < 0:
         return 0
-    return walk.slips[art]
+    return walk.release.count[art]
 
 
 @wp.func
-def frame_side(walk: WalkTrees, support: RowSupport, sides: wp.vec2i, art: int, packed_Z: wp.array3d[float], slot: int):
-    """The slips' frame on articulation ``art``'s side of row ``slot``: ``z <- z + Bh (Ln^T - I) Bh^T z``
-    (:func:`.tree_factor.walk_frame_kernel`), the decided operator's row on the all-``K`` walk."""
+def release_side(walk: WalkTrees, support: RowSupport, sides: wp.vec2i, art: int, packed_Z: wp.array3d[float], slot: int):
+    """The slips' release on articulation ``art``'s side of row ``slot``: ``z <- R z``, the root-most slip first, each
+    along its path leaf first (:func:`.tree_factor.walk_release_kernel`), the decided operator's row on the all-``K``
+    walk. The packed side holds the whole tree, and ``R`` keeps every row's support."""
     if art < 0:
         return
-    s = walk.slips[art]
-    if s == 0:
-        return
     at = jacobian_row(support, 0, art, sides)
-    n = walk.dofs[art]
-    y = _FrameVector()
-    for j in range(s):
-        acc = float(0.0)
-        for c in range(n):
-            acc += walk.basis[art, j, c] * packed_Z[at[0], slot, at[1] + c]
-        y[j] = acc
-    for j in range(s):
-        w = -y[j]
-        for k in range(j, s):
-            w += walk.scale[art, k, j] * y[k]
-        for c in range(n):
-            packed_Z[at[0], slot, at[1] + c] += w * walk.basis[art, j, c]
+    for j in range(walk.release.count[art]):
+        release_path(walk.release, art, j, packed_Z, at[0], slot, at[1])
 
 
 @wp.kernel(enable_backward=False)
@@ -320,12 +307,12 @@ def write_walked_rows(
                 walk, support, sides, sides[0], mimic_dof1[index], -mimic_coef1[index], v_hat, 1, packed_Z, slot
             )
             summed = False
-        # The block's first phase: the slips' frame on each side that slips (the closure follows, on these rows).
+        # The block's first phase: the slips' release on each side that slips (the closure follows, on these rows).
         if slips_on(walk, sides[0]) != 0:
-            frame_side(walk, support, sides, sides[0], packed_Z, slot)
+            release_side(walk, support, sides, sides[0], packed_Z, slot)
             summed = False
         if sides[1] != sides[0] and slips_on(walk, sides[1]) != 0:
-            frame_side(walk, support, sides, sides[1], packed_Z, slot)
+            release_side(walk, support, sides, sides[1], packed_Z, slot)
             summed = False
         norm = walked[1]
         if not summed:
