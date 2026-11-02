@@ -48,7 +48,7 @@ from newton._src.solvers.feather_pgs.rows import velocity_prescale_launch
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton._src.solvers.feather_pgs.tree_factor import WALK_COORDINATE, WALK_LINK, WalkTrees, release_view
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import row_lines, unpacked_rows
+from newton.tests.feather_pgs_law_harness import leave_walk, row_lines, unpacked_rows
 from newton.tests.feather_pgs_mass_reference import MassReference
 from newton.tests.feather_pgs_patch_parity import (
     SLIDING_FEET,
@@ -744,8 +744,8 @@ class TestParallelPatchReference(unittest.TestCase):
                 self.assertNotIn("s_vlim", _source(plain))
                 self.assertEqual(text.count("s_vlim[i] = row_type == 4 ? 1 : 0;"), 1)
                 self.assertEqual(text.count("const float r_vlim = s_rhs[i] + part;"), 1)
-                # The pass runs between the final sweep and the velocity reconstruction.
-                self.assertLess(text.index("const float r_vlim"), text.index("v_out.data[global_dof] ="))
+                # The pass runs between the final sweep and the velocity change's publish to the step's leave.
+                self.assertLess(text.index("const float r_vlim"), text.index("walk.du.data[global_dof] +="))
                 self.assertGreater(text.index("const float r_vlim"), text.index("for (; sweep <"))
 
     def test_solver_builds_the_pass_for_limited_linked_tiers(self):
@@ -1301,6 +1301,7 @@ def identity_walk(dofs: int, device) -> WalkTrees:
     ):
         setattr(walk, name, wp.array(values, dtype=wp.int32, device=device))
     walk.release = release_view(1, 0, 1, device)
+    walk.du = wp.zeros(dofs, dtype=wp.float32, device=device)
     return walk
 
 
@@ -1359,6 +1360,7 @@ def _launch_parallel(tier, case, *, device):
         for name in inspect.signature(kernel.func).parameters
     ]
     wp.launch_tiled(kernel, dim=[1], inputs=inputs, block_dim=tier.block_dim, device=device)
+    leave_walk(values["walk"], values["v_out"], device)
     u = values["v_out"].numpy().astype(np.float64)
     return values["world_impulses"].numpy()[0, :count], np.linalg.solve(L.T, u[::-1])[::-1]
 

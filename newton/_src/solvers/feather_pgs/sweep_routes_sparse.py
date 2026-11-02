@@ -6,7 +6,8 @@
 The sweep solves a world's rows in factor coordinates: row ``i`` is ``Z_i = L^-1 P J_i^T``, the walk's footprints
 packed as the coordinates and values of its support (:func:`.walk_rows.support_rows_kernel`), and the velocity it
 acts on is the factor-coordinate delta from ``v_hat``, staged per world and published once
-(``factor_velocity_delta``); the walk down decodes it (:func:`.walk_rows.support_publish_kernel`). A configuration chooses:
+(``factor_velocity_delta``); the step's one leave walks it down (:func:`.tree_factor.walk_leave_kernel`, through
+``Sweep.support_du_index``). A configuration chooses:
 
 - the **mapping**: 32, 16 or 8 lanes per world, ``64 / lanes`` worlds per block of 64 threads, with launch bounds
   from the data (:func:`launch_bounds`);

@@ -132,16 +132,17 @@ class TestLocalOwnedRoute(unittest.TestCase):
         self.assertIn("SHARED LocalScratch localscratch[8];", body)
         self.assertIn("#define s_A localscratch[SUB].s_A", body)
         self.assertIn("#undef s_A", body)
-        # The trees' factor is the walk's (FL3.6): no staged factor, and the rows and the leave are the walk's,
-        # contactless owners included.
+        # The trees' factor is the walk's (FL3.6): no staged factor; the rows are the walk's, contactless owners
+        # included, and the change goes to the step's one leave in the walk's coordinates.
         self.assertNotIn("s_L", body)
         self.assertIn("WALK_TREE(", body)
-        self.assertIn("WALK_DOWN_PATHS(walk_data, walk_link, s_v, s_v,", body)
+        self.assertIn("walk.du.data[dof] += s_v[d];", body)
+        self.assertNotIn("WALK_DOWN", body)
         self.assertNotIn("value/diagonal", body)
-        # A paired owner walks its free body down too; the packets' owner stages the walk in shared memory.
+        # A paired owner's free body goes the same way; the packets' owner stages the walk in shared memory.
         paired, _ = sweep_routes_local.local_owned_source(192, 20, 9, 6, warps_per_block=2)
         self.assertNotIn("s_L", paired)
-        self.assertIn("WALK_DOWN_PATHS(free_data, free_link, s_v + 9, s_v + 9,", paired)
+        self.assertIn("walk.du.data[dof] += s_v[d];", paired)
         _, staged = sweep_routes_local.local_owned_source(192, 20, 9, 6, warps_per_block=2, row_inputs=_row_inputs(9))
         self.assertGreater(
             staged.bytes, sweep_routes_local.local_owned_source(192, 20, 9, 6, warps_per_block=2)[1].bytes
@@ -249,7 +250,6 @@ class TestResponseOperators(unittest.TestCase):
             staged=True,
             wrenches=True,
             release=True,
-            dense_capacity=20,
             lanes=Lanes(32),
             free=FreeBodyZ(Lanes(32)),
         )
@@ -298,14 +298,9 @@ class TestResponseOperators(unittest.TestCase):
         commit = block.commit("")
         self.assertIn("u += s_Z[r * 15 + d] * s_app[r];", commit)
         self.assertIn("u += mf_Z_a.data[row6 + d - row_a] * applied;", commit)
-        # The leave, for either row source: the tree's release R^T and walk down on lane 0, the free body's walk down
-        # on lane 1, their twists in the spent s_Z.
+        # No leave in the block, for either row source: the change goes to the step's one leave.
         for source in (block, stored_block):
-            leave = source.leave("")
-            self.assertIn("WALK_RELEASE_T(walk.release, art, s_v);", leave)
-            self.assertIn("if (lane == 1) {", leave)
-            self.assertIn("WALK_DOWN_PATHS(free_data, free_link, s_v + 9, s_v + 9,", leave)
-        self.assertIn("WALK_DOWN_PATHS(walk_data, walk_link, s_v, s_v, s_Z);", block.leave(""))
+            self.assertFalse(hasattr(source, "leave"))
 
     def test_factor_rows_fuse_a_pair_ladder(self):
         rows = FactorRows(23, (FactorComponent(17, "o", "l", "L", "b"),), Lanes(32), diagonal=lambda r: f"s_diag[{r}]")

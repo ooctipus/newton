@@ -10,7 +10,8 @@ _FEATHER_PGS = Path(__file__).parents[1] / "_src" / "solvers" / "feather_pgs"
 # Kernel factories: cached, so that a variant is built once per process.
 _KERNEL_FACTORIES = {
     "response_builds_dense.py": ("dense_factor_kernel",),
-    "walk_rows.py": ("support_rows_kernel", "support_publish_kernel"),
+    "walk_rows.py": ("support_rows_kernel",),
+    "tree_factor.py": ("walk_down_prelude", "walk_leave_kernel"),
     "response_builds_rows.py": (
         "free_body_meta_kernel",
         "sparse_factor_kernel",

@@ -517,7 +517,7 @@ def _sparse_mass_matrix(solver) -> dict:
                 "local_factors": bool(solver.sweep.sparse_local_factors),
                 "factor_warps_per_block": int(solver.factor.sparse_factor_warps_per_block),
                 "writer_kernel": _key(solver.sweep.support_rows),
-                "leave_kernel": _key(solver.sweep.support_publish),
+                "leave_kernel": _key(solver.factor.walk_leave),
                 "sweep_kernel": _key(solver.sweep.sparse_kernel),
                 # The sweep's launch bounds from its shared memory and register budget (threads, minimum blocks).
                 "launch_bounds": json_value(solver.sweep.sparse_kernel.options.get("launch_bounds")),

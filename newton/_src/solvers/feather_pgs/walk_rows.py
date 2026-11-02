@@ -34,7 +34,8 @@ a world's lane group strides over its units, a lane walks a unit's rows together
 1) through the class's path table in constant memory, and stores each footprint at its rank in the row's support
 (factor coordinates), the unit's Gram, its records and its header from the same walk. A slipping drive's ``K`` leaves
 the rows and the leave by its release along its path (the predictor's border, :func:`.tree_kinetic_state.border_solve`): the block primitive with
-the path's coordinate basis, which keeps every row inside its support. The leave is :func:`support_publish_kernel`.
+the path's coordinate basis, which keeps every row inside its support. Its sweep's change goes to the step's one leave
+(:func:`.tree_factor.walk_leave_kernel`).
 """
 
 from __future__ import annotations
@@ -62,7 +63,7 @@ from .dense_rows import (
 from .device_preludes import DevicePrelude, dual_native, lane_group, substitute
 from .field_group import Field
 from .friction_patches import PatchRowLaw
-from .kernel_template import THREADS, KernelTemplate, python_kernel
+from .kernel_template import python_kernel
 from .kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT, free_body_contact, free_body_contact_records, row_bias
 from .projection_laws import friction_pair_metric
 from .response_builds_rows import close_block, close_row, free_body_row_header
@@ -88,7 +89,6 @@ __all__ = [
     "SupportUnit",
     "bind_slot_rows",
     "free_body_headers_kernel",
-    "support_publish_kernel",
     "support_rows_kernel",
     "walked_rows_kernel",
     "write_contact_units",
@@ -1115,48 +1115,6 @@ def support_rows_kernel(
     return python_kernel(kernel, name, launch_bounds=(256, 2))
 
 
-_PUBLISH = """    if (tid >= arts.shape[0]) return;
-    const int art = arts.data[tid];
-    const int world = art_to_world.data[art], offset = world_offset.data[art];
-    if (world < 0 || offset < 0) return;
-    const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
-    float u[$n];
-    const float* du = delta.data + (size_t)world * delta.shape[1] + offset;
-    for (int c = 0; c < $n; ++c) u[c] = du[SUPPORT_NODE[c]];
-    // The release's transpose, the last slip first, each along its path root first (the predictor's border's R).
-    WALK_RELEASE_T(release, art, u);
-    WALK_DOWN_PATHS(walk.data.data + (size_t)d0 * $coordinate, walk.link.data + (size_t)j0 * $link, u, u,
-              reinterpret_cast<float*>(walk.scratch.data + j0));
-    for (int c = 0; c < $n; ++c) v_out.data[d0 + c] = v_hat.data[d0 + c] + u[c];
-"""
-
-
-@cache
-def support_publish_kernel(parent: tuple[int, ...], first: tuple[int, ...], node: tuple[int, ...]) -> wp.Kernel:
-    """The support placement's leave (case K1), a thread per tree: ``v = v_hat + P^T L^-T R^T du`` from a world's
-    velocity change in factor coordinates (``delta``, by the support's coordinates): the release's transpose, then the
-    walk down (``WALK_DOWN_PATHS``) in the rows' frame."""
-    body = substitute(_PUBLISH, n=len(node), coordinate=WALK_COORDINATE, link=WALK_LINK)
-    return KernelTemplate(
-        f"support_publish_{len(node)}_{abs(hash((parent, first, node))) % (1 << 32):08x}",
-        (
-            ("arts", wp.array[int]),
-            ("walk", WalkTrees),
-            ("release", WalkRelease),
-            ("art_to_world", wp.array[int]),
-            ("world_offset", wp.array[int]),
-            ("delta", wp.array2d[float]),
-            ("v_hat", wp.array[float]),
-            ("v_out", wp.array[float]),
-        ),
-        body,
-        THREADS,
-        preludes=(walk_prelude(parent, first, 1), _support_table(node)),
-        dual=True,
-        native_name="support_publish_native",
-    ).kernel()
-
-
 # ---------------------------------------------------------------------------------------------------------------------
 # The sparse diagonal (case K2): a tree beside a star, its rows into the slots sink (FL3.5)
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1165,7 +1123,7 @@ def support_publish_kernel(parent: tuple[int, ...], first: tuple[int, ...], node
 # A row's seed on the arm walks into the row's dense part, the arm's coordinates in the walk's order; a seed on a key is
 # one step to the world, z = (s . w) / ell, the key's step J entry over the root of its pivot (the J / sqrt(m) slot,
 # 1 / ell = sqrt(m^-1) of the factor's diagonal), into the row's two slots. The sweep reads the dense part and the slots
-# (:class:`.response_operator.SparsePairZ`) and leaves the arm by the walk (:func:`.sweep_routes.walk_leave`), the
+# (:class:`.response_operator.SparsePairZ`) and leaves the arm by the walk (:func:`.tree_factor.walk_leave_kernel`), the
 # release its rows carry.
 
 SLOT_ROWS = (

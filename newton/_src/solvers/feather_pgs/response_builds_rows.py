@@ -791,8 +791,8 @@ def sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_per_block:
 @dataclasses.dataclass(frozen=True)
 class SparseFactorBuild:
     """The factor of the factor rows (:class:`.response_operator.SparseFactor`): its rows and their leave are the
-    walk's (:func:`.walk_rows.support_rows_kernel`, :func:`.walk_rows.support_publish_kernel`); the factor and its
-    inverse serve the predictor until the walk becomes the factor (Z4).
+    walk's (:func:`.walk_rows.support_rows_kernel`, the step's one leave :func:`.tree_factor.walk_leave_kernel`); the
+    factor and its inverse serve the predictor until the walk becomes the factor (Z4).
 
     Attributes:
         factor: The factory of the factor and its inverse (:func:`sparse_factor_kernel`).

@@ -1117,46 +1117,15 @@ class WalkedRows:
         return _lines(row, indent)
 
     def publish(self, z: Callable[[str], str], applied: Callable[[str], str], indent: str) -> str:
-        """``v = v_in + P^T L^-T R^T u`` with ``u = sum_i Z_i applied_i`` (``z(i)``: ``Z_i`` at coordinate ``d``), in row
-        order; each tree's walk down on one lane (the primary's on lane 0, the secondary's on the next warp's first
-        lane, or lane 1 in one warp), its twists in the walk's scratch. The world's trees are read here again, not held
-        through the sweeps."""
-        from .tree_factor import WALK_COORDINATE, WALK_LINK  # noqa: PLC0415
-
+        """``u = sum_i Z_i applied_i`` (``z(i)``: ``Z_i`` at coordinate ``d``), in row order, in the walk's coordinates
+        to the step's one leave (:attr:`.tree_factor.WalkTrees.du`, :func:`.tree_factor.walk_leave_kernel`), which
+        walks each tree down: ``v = v_in + P^T L^-T R^T u``."""
         lane, width, D = self.lanes.lane, self.lanes.width, self.dofs
-        frames = {side: n for side, n, _ in self._sides()}
-        trees = (
-            (0, "art_a", self.primary_offset, "0"),
-            (1, "art_b", self.secondary_offset, "32" if width > 32 else "1"),
-        )
-        leaves = list(self._tree())
-        for side, art, offset, owner in trees[: 2 if self.secondary else 1]:
-
-            # The rows' square root of the decided operator, transposed: the release R^T (the keyed rows' and the one
-            # writer's rows both carry R).
-            release = [f"WALK_RELEASE_T(walk.release, {art}, &s_dv[{offset}]);"] if side in frames else []
-            leave = [
-                *release,
-                f"const int j0 = walk.joint_start.data[{art}], d0 = walk.dof_start.data[{art}];",
-                f"WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), walk.joint_end.data[{art}] - j0,",
-                f"          walk.dofs.data[{art}]);",
-                f"WALK_DOWN_PATHS(walk.data.data + (size_t)d0 * {WALK_COORDINATE}, walk.link.data + (size_t)j0 * {WALK_LINK},",
-                f"          &s_dv[{offset}], &s_dv[{offset}], reinterpret_cast<float*>(walk.scratch.data + j0));",
-            ]
-            leaves += [f"if ({art} >= 0 && {lane} == {owner}) {{", *("    " + line for line in leave), "}"]
         lines = [
             f"for (int d = {lane}; d < {D}; d += {width}) {{",
             *("    " + line for line in _applied_sum("u", "0.0f", z, applied, self.rows)),
-            "    s_dv[d] = u;",
-            "}",
-            "SYNC();",
-            "{",
-            *("    " + line for line in leaves),
-            "}",
-            "SYNC();",
-            f"for (int d = {lane}; d < {D}; d += {width}) {{",
             "    const int global_dof = world_dof_indices.data[dof_map_base + d];",
-            "    if (global_dof >= 0) v_out.data[global_dof] = s_v[d] + s_dv[d];",
+            "    if (global_dof >= 0) walk.du.data[global_dof] += u;",
             "}",
         ]
         return _lines(lines, indent)
@@ -1578,9 +1547,9 @@ class LocalBlock(ResidualBlock):
     (:class:`.row_inputs.StoredLocalRows`). With ``bodies`` (at most the primary tree's bodies) the kernel walks
     seeds, and the walk's data of the world's trees is staged in shared memory once (``s_walk``, ``s_walk_path``:
     :meth:`walk_floats`, :meth:`walk_ints`; with ``wrenches`` the step's columns and links too, for wrench seeds);
-    without, it is read in place for the leave. With ``release`` the class's drives can slip: a walked row takes the
-    release ``R`` of its tree's slips along their paths (``WALK_RELEASE``, the one writer's rows carry it already) and
-    the leave ``R^T`` (:func:`.tree_kinetic_state.border_solve`, the predictor's border).
+    without, it is read in place. With ``release`` the class's drives can slip: a walked row takes the release ``R`` of
+    its tree's slips along their paths (``WALK_RELEASE``, the one writer's rows carry it already; the step's one leave
+    takes ``R^T``, :func:`.tree_factor.walk_leave_kernel`).
     With ``free``, the world's free-body rows (``free_count``, :class:`FreeBodyZ` entries read in place, their
     ``mf_meta`` words from ``off_meta``) follow the dense rows in the block: they act on the paired free body, whose
     coordinates are the last block's, so a free row's terms are its ``Z`` against the body's ``u`` and the dense rows'
@@ -1592,8 +1561,8 @@ class LocalBlock(ResidualBlock):
     zero (:meth:`assemble`); either row of an entry reads it. The residuals
     start at the rows' right-hand sides, their incident velocities included.
     The velocity change is committed once after the sweeps, ``u = sum_r Z_r
-    applied_r`` over every row of the block in row order (:meth:`commit`), then
-    leaves the walk's coordinates, ``dv = P^T L^-T R^T u`` (:meth:`leave`). A view of the free-body rows
+    applied_r`` over every row of the block in row order (:meth:`commit`), and goes to
+    the step's one leave in the walk's coordinates (:attr:`.tree_factor.WalkTrees.du`). A view of the free-body rows
     addresses them from block row ``first``.
     """
 
@@ -1604,7 +1573,6 @@ class LocalBlock(ResidualBlock):
     staged: bool = False
     wrenches: bool = False
     release: bool = False
-    dense_capacity: int = 0
     lanes: Lanes = Lanes()
     dense: str = "row_count"
     free: FreeBodyZ | None = None
@@ -1791,38 +1759,6 @@ class LocalBlock(ResidualBlock):
                     "};",
                 ]
         return "\n".join(lines)
-
-    def twists(self) -> tuple[str, str]:
-        """The leave's twist scratch of the primary tree and of the free body: the spent ``s_Z`` (``dense_capacity``
-        rows) where it holds both trees' bodies, else the walk's scratch."""
-        if self.bodies and self.dense_capacity * self.dofs >= 6 * (self.bodies + 1):
-            return "s_Z", f"s_Z + {6 * self.bodies}"
-        return (
-            "reinterpret_cast<float*>(walk.scratch.data + walk_j0)",
-            "reinterpret_cast<float*>(walk.scratch.data + free_j0)",
-        )
-
-    def leave(self, indent: str) -> str:
-        """The committed velocity change leaves the walk's coordinates in place, ``dv = P^T L^-T R^T u``: on lane 0 the
-        primary tree's release transposed (``WALK_RELEASE_T``) and its walk down (``WALK_DOWN_PATHS``), on lane 1 the paired
-        free body's walk down."""
-        lane = self.lanes.lane
-        primary, free = self.twists()
-        lines = [
-            f"if ({lane} == 0) {{",
-            *(["    WALK_RELEASE_T(walk.release, art, s_v);"] if self.release else []),
-            "    walk_primary();",
-            f"    WALK_DOWN_PATHS(walk_data, walk_link, s_v, s_v, {primary});",
-            "}",
-        ]
-        if self.secondary:
-            lines += [
-                f"if ({lane} == 1) {{",
-                "    walk_free();",
-                f"    WALK_DOWN_PATHS(free_data, free_link, s_v + {self.primary}, s_v + {self.primary}, {free});",
-                "}",
-            ]
-        return "\n".join(indent + line if line.strip() else line for line in "\n".join(lines).split("\n"))
 
     def respond(self, source, indent: str) -> str:
         """Stage row ``row``'s footprints ``z`` in ``s_Z``, in the caller's loop over ``row``: the row source's

@@ -49,7 +49,7 @@ from .sweep import (
     speed_rows_pass,
     velocity_limit_pass,
 )
-from .tree_factor import WALK_COORDINATE, WALK_LINK, WalkTrees, walk_paths_prelude
+from .tree_factor import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude, walk_paths_prelude
 
 # The row loops leave the velocity-limit rows to the passes at the end of every sweep (the last word).
 _DENSE_ADMISSION = f"if (row_type == {VELOCITY_LIMIT}) continue;"
@@ -91,25 +91,6 @@ MF_GS_ABI = kernel_template.params(
     ("v_out", wp.array[float]),
 )
 """The matrix-free sweep's native ABI: one world per call (the world queue's dispatch)."""
-
-
-def walk_leave(art: str, values: str, size: str, *, frame: bool, pad: str = "") -> str:
-    """Articulation ``art``'s tree leaves the walk's coordinates in place on its ``size`` values at the native pointer
-    ``values``: ``dv = P^T L^-T R^T du``, the slips' release transposed first where the class can slip (``frame``,
-    :func:`.tree_kinetic_state.border_solve`, the predictor's border), then the walk down (``WALK_DOWN_PATHS`` of
-    :func:`.tree_factor.walk_paths_prelude`, its twists in the walk's scratch). Every placement that walks its rows
-    leaves by it, so the rows and the leave share one frame (FL3_design §1.2)."""
-    slipped = ""
-    if frame:
-        # The slips' release: du <- R^T du (the predictor's border's R).
-        slipped = f"WALK_RELEASE_T(walk.release, {art}, {values});\n"
-    text = f"""{{
-const int j0 = walk.joint_start.data[{art}], d0 = walk.dof_start.data[{art}];
-{slipped}WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), walk.joint_end.data[{art}] - j0, {size});
-WALK_DOWN_PATHS(walk.data.data + (size_t)d0 * {WALK_COORDINATE}, walk.link.data + (size_t)j0 * {WALK_LINK}, {values}, {values},
-          reinterpret_cast<float*>(walk.scratch.data + j0));
-}}"""
-    return indent(text, pad)
 
 
 class FactorCoordinates:
@@ -154,9 +135,13 @@ class FactorCoordinates:
 }}"""
 
     def walk_leave(self, first: str, values: str) -> str:
-        """The walk down of the free body (a one-body tree) whose first world coordinate is ``first``, in place on its
-        six ``values``: ``v = P^T L^-T u``."""
-        return self._walked(first, f"WALK_DOWN_PATHS(data, link, {values}, {values}, twist)")
+        """The walk down of the free body (a one-body tree, :data:`.tree_factor.FREE_BODY_WALK`) whose first world
+        coordinate is ``first``, in place on its six ``values``: ``v = P^T L^-T u``."""
+        return self._walked(
+            first,
+            f"WALK_DOWN(0, data, link, [&](const int c) -> float {{ return {values}[c]; }}, "
+            f"[&](const int c, const float q) {{ {values}[c] = q; }}, [](const int, const float*) {{}})",
+        )
 
     def walk_enter(self, first: str, velocity: str, out: str) -> str:
         """The walk in of that free body: ``out = L^T P velocity``."""
@@ -188,25 +173,12 @@ class FactorCoordinates:
     }}
 }}"""
 
-    def leave_all(
-        self, dofs: int, thread: str, threads: str, sync: str, *, walk: bool = False, frame: bool = False
-    ) -> str:
-        """Every marked articulation leaves factor coordinates in place, a thread per bitmap word. With ``walk`` (the
-        general placement's one writer, :mod:`.walk_rows`) every tree, a free rigid body's six coordinates too, leaves
-        by the walk down (``WALK_DOWN_PATHS`` of :func:`.tree_factor.walk_paths_prelude`, its twists in the walk's scratch),
-        with ``frame`` (a class whose drives can saturate) after its rows' frame."""
+    def leave_all(self, dofs: int, thread: str, threads: str, sync: str) -> str:
+        """Every marked articulation leaves factor coordinates in place, a thread per bitmap word, by its factor (the
+        leaf-first ``L^-T``, a free body's six coordinates unrolled). A sweep whose rows walk leaves none: it adds its
+        change to the walk's ``du`` and the step's one leave walks every tree (:func:`.tree_factor.walk_leave_kernel`)."""
         factors = self.op.factors
         coordinates = lambda k: f"s_v[d + {k}]"  # noqa: E731
-        # The factor's way back: the walk down, or the leaf-first L^-T (a free body's six coordinates unrolled).
-        leave = f"""        const float* factor = reinterpret_cast<const float*>({factors}.address.data[art]);
-        if (size == 6) {{
-{indent(CholeskySolve(6, "factor", unroll=True).leave(coordinates, coordinates), "            ")}
-        }} else {{
-{indent(CholeskySolve("size", "factor").leave(coordinates, coordinates), "            ")}
-        }}
-"""
-        if walk:
-            leave = walk_leave("art", "(&s_v[d])", "size", frame=frame, pad="        ") + "\n"
         return f"""for (int w = {thread}; w < {self.words(dofs)}; w += {threads}) {{
     unsigned bits = s_factor_marks[w];
     while (bits != 0u) {{
@@ -214,7 +186,13 @@ class FactorCoordinates:
         bits &= bits - 1u;
         const int art = {factors}.first_art.data[world_dof_indices.data[dof_map_base + d]];
         const int size = {factors}.size.data[art];
-{leave}    }}
+        const float* factor = reinterpret_cast<const float*>({factors}.address.data[art]);
+        if (size == 6) {{
+{indent(CholeskySolve(6, "factor", unroll=True).leave(coordinates, coordinates), "            ")}
+        }} else {{
+{indent(CholeskySolve("size", "factor").leave(coordinates, coordinates), "            ")}
+        }}
+    }}
 }}
 {sync}"""
 
@@ -664,7 +642,6 @@ def mf_gs_source(
     seeded: bool = False,
     wide_rows: bool = False,
     walk: bool = False,
-    walk_frame: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the matrix-free Gauss-Seidel sweep: a world's dense rows (:func:`packed_operator`, packed
     whitened rows of ``max_row_dofs`` entries, by default as many as the world's coordinates) and its free-body rows
@@ -833,6 +810,26 @@ def mf_gs_source(
         }}
         if ({"!__syncthreads_or(velocity_moved != 0)" if colored else "BALLOT(velocity_moved != 0) == 0u"}) iteration_changed = 0;
 """
+    # The way back: with ``walk`` the change in the walk's coordinates goes to the step's one leave (WalkTrees.du,
+    # tree_factor.walk_leave_kernel); otherwise the marked articulations leave by their factors here.
+    marks = leave = ""
+    out = "walk.du" if walk else "v_out"
+    if not walk:
+        marks = f"""{indent(bodies.clear(D, "lane"), "    ")}
+{end_first_warp}    {barrier}
+    // The articulations this launch's rows touch: the bodies of its free-body rows, the sides of every dense row.
+{indent(bodies.mark("0", "m_mf", thread, threads), "    ")}
+{indent(bodies.mark_sides("m_dense", thread, threads), "    ")}
+    {barrier}
+"""
+        leave = f"""    {barrier}
+{indent(bodies.leave_all(D, thread, threads, sync), "    ")}
+"""
+    else:
+        marks = f"""{end_first_warp}    {barrier}
+"""
+        leave = f"""    {barrier}
+"""
     body = f"""{head}
 
     {dense_count}
@@ -865,13 +862,7 @@ def mf_gs_source(
         {mf_load}
     }}
     for (int d = lane; d < {D}; d += STRIDE) s_v[d] = 0.0f;
-{indent(bodies.clear(D, "lane"), "    ")}
-{end_first_warp}    {barrier}
-    // The articulations this launch's rows touch: the bodies of its free-body rows, the sides of every dense row.
-{indent(bodies.mark("0", "m_mf", thread, threads), "    ")}
-{indent(bodies.mark_sides("m_dense", thread, threads), "    ")}
-    {barrier}
-{seed}{metric_build}
+{marks}{seed}{metric_build}
 
     for (int iter = 0; iter < iterations; iter++) {{
         int iteration_changed = 0;
@@ -883,11 +874,9 @@ def mf_gs_source(
 {first_warp}{chr(10).join(passes)}
 {end_first_warp}{sweep_vote}{sweep_end}    }}
 
-    {barrier}
-{indent(bodies.leave_all(D, thread, threads, sync, walk=walk, frame=walk_frame), "    ")}
-{first_warp}    for (int d = lane; d < {D}; d += STRIDE) {{
+{leave}{first_warp}    for (int d = lane; d < {D}; d += STRIDE) {{
         int global_dof = world_dof_indices.data[dof_map_base + d];
-        if (global_dof >= 0{owned}) v_out.data[global_dof] += s_v[d];
+        if (global_dof >= 0{owned}) {out}.data[global_dof] += s_v[d];
     }}
     for (int i = lane; i < m_dense; i += STRIDE) {{
         world_impulses.data[off_dense + i] = s_lam_dense[i];
@@ -903,7 +892,7 @@ def mf_gs_source(
         PACKED_SIDES,
         *law_preludes(PROJECTION_LAW, *((CONE_LAW,) if contact_torsion else ())),
         *solve_policy.preludes,
-        *((walk_paths_prelude(1),) if walk else ()),
+        *((walk_paths_prelude(1), walk_down_prelude((FREE_BODY_WALK,))) if walk else ()),
     )
     if lanes == 1:
         return dual_native(body, preludes=(*preludes, CPU_MATH)), staging
@@ -935,7 +924,6 @@ def mf_gs_kernel(
     seeded: bool = False,
     wide_rows: bool = False,
     walk: bool = False,
-    walk_frame: bool = False,
 ) -> wp.Kernel:
     """The matrix-free Gauss-Seidel sweep kernel of a thread mapping (:func:`mf_gs_source`): the warp's launches a
     warp per world item (one thread on the CPU, :func:`.launch.device_lanes`) and takes :data:`MF_GS_ABI`
@@ -964,7 +952,6 @@ def mf_gs_kernel(
         seeded=seeded,
         wide_rows=wide_rows,
         walk=walk,
-        walk_frame=walk_frame,
     )
     colored = mapping == "colored"
     staging.check(f"the {mapping} matrix-free sweep", arch_budget(device_arch))
@@ -985,7 +972,6 @@ def mf_gs_kernel(
         + ("_seeded" if seeded else "")
         + ("_wide" if wide_rows else "")
         + ("_walk" if walk else "")
-        + ("frame" if walk_frame else "")
         + solve_policy.suffix
     )
     return KernelTemplate.from_abi(

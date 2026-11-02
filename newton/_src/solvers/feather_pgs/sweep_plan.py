@@ -262,11 +262,6 @@ class Sweep:
         self.placement.sparse_diagonal_dense_arts_host = (
             sparse_diagonal_pair[4] if sparse_diagonal_pair is not None else np.zeros(0, dtype=np.int32)
         )
-        self.placement.sparse_diagonal_dense_arts = wp.array(
-            sparse_diagonal_pair[4] if sparse_diagonal_pair is not None else np.zeros(1, dtype=np.int32),
-            dtype=wp.int32,
-            device=model.device,
-        )
 
     def _select_fused_diagonal_limits(self) -> None:
         """Select independent position limits that can remain outside the dense row system."""
@@ -541,7 +536,9 @@ class Sweep:
         """Select sparse articulation factors with independent rigid-body response blocks."""
         self.placement.sparse_mass_matrix_size = None
         self.sparse_velocity_limits = False
-        self.support_rows = self.support_publish = self._support_sink = None
+        self.support_rows = self._support_sink = None
+        self.support_du_index = None
+        self.leaves = False
         self.placement.sparse_row_support = _SparseRowSupport()
         self.sparse_contact_triplets = False
         # Route details for get_path_selection(), set where the sparse owner is admitted.
@@ -806,7 +803,8 @@ class Sweep:
 
         The class's tree (every articulation of the factored size shares it) and each coordinate's factor coordinate,
         the support masks' bit, are baked into the writer (:func:`.walk_rows.support_rows_kernel`) and the leave
-        (:func:`.walk_rows.support_publish_kernel`). The writer's lane group is the smallest power of two at or above a
+        (the step's one leave, :func:`.tree_factor.walk_leave_kernel`, reading the sparse sweep's change through
+        ``support_du_index``). The writer's lane group is the smallest power of two at or above a
         world's unit bound (its internal rows and a contact unit per three rows of the rest of its capacity), at most a
         warp. The release is the factor's (:attr:`.tree_factor.WalkTrees.release`), built by
         :func:`.walk_rows.walk_release_kernel`.
@@ -833,7 +831,18 @@ class Sweep:
             records=self.placement.sparse_contact_records is not None,
             torsion=bool(self.laws.contact_torsion_enabled),
         )
-        self.support_publish = walk_rows.support_publish_kernel(parent, first, node)
+        # Where the step's one leave reads each coordinate's change (tree_factor.walk_leave_kernel): the sparse sweep
+        # publishes it in factor coordinates (factor_velocity_delta), so a tree coordinate reads its factor
+        # coordinate, the support masks' bit.
+        width = int(forest.max_world_dofs)
+        du_index = np.zeros(max(int(model.joint_dof_count), 1), dtype=np.int32)
+        art_world = forest.art_to_world.numpy()
+        offsets = forest.articulation_world_dof_offset.numpy()
+        dof_start = forest.articulation_dof_start_host
+        for art in arts.tolist():
+            for c, k in enumerate(node):
+                du_index[dof_start[art] + c] = art_world[art] * width + offsets[art] + k
+        self.support_du_index = wp.array(du_index, dtype=wp.int32, device=model.device)
         capacity = int(self.placement.dense_max_constraints)
         internal = min(int(self.placement.internal_rows_per_world(model)), capacity)
         units = max(internal + (capacity - internal + 2) // 3, 1)
@@ -892,8 +901,6 @@ class Sweep:
         self.paired_factor_secondary_groups_by_world = None
         self.paired_factor_primary_offsets_by_world = None
         self.paired_factor_secondary_offsets_by_world = None
-        self.paired_factor_primary_arts_by_world = None
-        self.paired_factor_secondary_arts_by_world = None
         if self.paired_factor_coordinates:
             primary_arts = self.forest.group_to_art_host[response_pair[0]]
             secondary_arts = self.forest.group_to_art_host[response_pair[1]]
@@ -901,9 +908,6 @@ class Sweep:
             secondary_groups = np.empty(self.forest.world_count, dtype=np.int32)
             primary_offsets = np.empty(self.forest.world_count, dtype=np.int32)
             secondary_offsets = np.empty(self.forest.world_count, dtype=np.int32)
-            # Each world's two articulations: where the walk's leave finds their trees (sweep_routes_local).
-            primary_by_world = np.full(self.forest.world_count, -1, dtype=np.int32)
-            secondary_by_world = np.full(self.forest.world_count, -1, dtype=np.int32)
             articulation_world = self.forest.articulation_world
             articulation_dof_start = self.forest.articulation_dof_start_host
             for primary_group, primary_art in enumerate(primary_arts):
@@ -912,8 +916,6 @@ class Sweep:
                 secondary_art = int(secondary_arts[secondary_group])
                 primary_groups[world] = primary_group
                 secondary_groups[world] = secondary_group
-                primary_by_world[world] = int(primary_art)
-                secondary_by_world[world] = secondary_art
                 primary_first = articulation_dof_start[primary_art] < articulation_dof_start[secondary_art]
                 primary_offsets[world] = 0 if primary_first else response_pair[1]
                 secondary_offsets[world] = response_pair[0] if primary_first else 0
@@ -924,10 +926,6 @@ class Sweep:
             self.paired_factor_primary_offsets_by_world = wp.array(primary_offsets, dtype=wp.int32, device=model.device)
             self.paired_factor_secondary_offsets_by_world = wp.array(
                 secondary_offsets, dtype=wp.int32, device=model.device
-            )
-            self.paired_factor_primary_arts_by_world = wp.array(primary_by_world, dtype=wp.int32, device=model.device)
-            self.paired_factor_secondary_arts_by_world = wp.array(
-                secondary_by_world, dtype=wp.int32, device=model.device
             )
 
     def plan_tier_rows(self) -> None:
@@ -979,7 +977,9 @@ class Sweep:
         """Each of the tiers' trees' slip capacity (:meth:`.tree_factor.TreeFactor.slip_capacity`): the release its rows
         and leave compile, none where no tree of that size holds a limited drive."""
         na, nb = self.placement.ink_sizes[0], self.placement.ink_sizes[1]
-        return tuple(self.factor.slip_capacity(self.forest.group_to_art[size].numpy()) if size else 0 for size in (na, nb))
+        return tuple(
+            self.factor.slip_capacity(self.forest.group_to_art[size].numpy()) if size else 0 for size in (na, nb)
+        )
 
     def _parallel_velocity_limit_pass(self) -> bool:
         """Whether the parallel tiers end with the last-word velocity-limit pass (``routes.sweep.tiers``).
@@ -1198,9 +1198,8 @@ class Sweep:
                 contact_units=self.factor_coordinate_contact_units,
                 weighted=self.laws.set.weighted,
                 torsion=self.laws.contact_torsion_enabled,
-                # The rows the one writer walked leave by the walk, the slips' release where a drive can saturate.
+                # The rows the one writer walked add their change to the walk's du: the step's one leave walks it.
                 walk=bool(self.placement.walks),
-                walk_frame=bool(self.placement.walks) and self.factor.walk_slip_capacity > 0,
             )
             if self.paired_factor_coordinates
             else None
@@ -1310,8 +1309,6 @@ class Sweep:
                 contact_units=self.placement.sparse_diagonal_contact_units,
                 weighted=self.laws.set.weighted,
                 torsion=self.laws.contact_torsion_enabled,
-                # The dense arm leaves by the walk: its slips' release is compiled where a drive can saturate.
-                walk_frame=bool(self.factor.walk_slip_capacity),
             )
             if self.placement.sparse_diagonal_contact_solve
             else None
@@ -1383,9 +1380,8 @@ class Sweep:
                 "max_row_dofs": self.placement.packed_support,
                 "seeded": self.seeded,
                 "wide_rows": self.placement.packed_dense == packed_rows.WIDE,
+                # The rows the one writer walked add their change to the walk's du: the step's one leave walks it.
                 "walk": bool(self.placement.walks),
-                # The slips' release in the leave only where a drive can saturate (topology, FL3_design §1.4).
-                "walk_frame": bool(self.placement.walks) and self.factor.walk_slip_capacity > 0,
             }
             mf_gs_shape = (
                 self.placement.dense_max_constraints,
@@ -1456,6 +1452,9 @@ class Sweep:
                     self.tiers.append(dataclasses.replace(tier, tier=tier_index))
             # No matrix-free sweep enters a world without rows; the readout counts those solves as skipped.
             self.readout.register_skipped(world_count=int(self.forest.world_count), device=model.device)
+        # The sweeps that walk their rows (and the Jacobi tiers, which always leave by the walk) add their change to the
+        # walk's du in its coordinates; the step's one leave walks every tree down (tree_factor.walk_leave_kernel).
+        self.leaves = self.factor.walk_arts is not None and bool(self.placement.walks or self.tiers)
 
     def open_streams(self, *, overlap: bool) -> None:
         """Initialize CUDA streams for parallel kernel launches across size groups.
@@ -1684,12 +1683,23 @@ class Sweep:
         if self.options.pgs_iterations <= 0 and not self.seeded:
             return
         operands = self._operands(v_hat, v_out)
+        if self.leaves and self.routes.case != "K1":
+            # The sweeps add their change into the walk's du from zero.
+            self.factor.walk_view().du.zero_()
         if self.routes.case == "K1":
             self._solve_packed(operands)
         elif self.routes.case == "K2":
             self._solve_diagonal(operands)
         elif self.forest.max_world_dofs:
             self._solve_claims(operands)
+        if self.leaves:
+            # The step's one leave: every walking tree's change in the walk's coordinates (the sparse sweep's in its
+            # factor coordinates).
+            if self.routes.case == "K1":
+                delta = self.placement.sparse_factor_velocity_delta
+                self.factor.leave(v_out, delta.reshape((delta.size,)), self.support_du_index)
+            else:
+                self.factor.leave(v_out)
 
     def _solve_packed(self, operands: dict) -> None:
         """Case K1: the sparse sweep in factor coordinates, then its velocity change back onto ``v_out``."""
@@ -1707,23 +1717,6 @@ class Sweep:
             support=placement.sparse_row_support,
             contact_records=placement.sparse_contact_records,
         )
-        # The leave in the rows' frame: the release's transpose, then the walk down (walk_rows.support_publish_kernel).
-        size = placement.sparse_mass_matrix_size
-        wp.launch(
-            self.support_publish,
-            dim=self.forest.n_arts_by_size[size],
-            inputs=[
-                self.forest.group_to_art[size],
-                self.factor.walk_view(),
-                self.factor.walk_view().release,
-                self.forest.art_to_world,
-                self.forest.articulation_world_dof_offset,
-                placement.sparse_factor_velocity_delta,
-                operands["v_hat"],
-                operands["v_out"],
-            ],
-            device=self.model.device,
-        )
 
     def _solve_diagonal(self, operands: dict) -> None:
         """Case K2: the sparse-diagonal sweep over the schedule of :meth:`claim`."""
@@ -1740,7 +1733,6 @@ class Sweep:
             sparse_contact_serial_normals=placement.sparse_contact_serial_normals,
             dense_offsets=placement.sparse_diagonal_dense_offsets,
             dense_groups=placement.sparse_diagonal_dense_groups,
-            dense_arts=placement.sparse_diagonal_dense_arts,
             walk=self.factor.walk_view(),
             dense_Z=placement.J_by_size[dense_size],
             sparse_row_dof=placement.sparse_diagonal_row_dof,
@@ -1798,11 +1790,7 @@ class Sweep:
 
         walked = {}
         if factor_kernel is not None and self.placement.walks:
-            walked = {
-                "walk": self.factor.walk_view(),
-                "primary_art_by_world": self.paired_factor_primary_arts_by_world,
-                "secondary_art_by_world": self.paired_factor_secondary_arts_by_world,
-            }
+            walked = {"walk": self.factor.walk_view()}
 
         def launch_factor_solve():
             with self.timed(f"factor_pgs_iters{iterations}"):

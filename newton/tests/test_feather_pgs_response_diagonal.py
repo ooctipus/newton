@@ -28,7 +28,14 @@ from newton._src.solvers.feather_pgs.sweep_levels import (
 )
 from newton._src.solvers.feather_pgs.sweep_routes_diag import sparse_diagonal_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_local import paired_factor_kernel, paired_factor_source
-from newton._src.solvers.feather_pgs.tree_factor import WALK_COORDINATE, WALK_LINK, WalkRelease, WalkTrees
+from newton._src.solvers.feather_pgs.tree_factor import (
+    WALK_COORDINATE,
+    WALK_LINK,
+    WalkClass,
+    WalkRelease,
+    WalkTrees,
+    walk_leave_kernel,
+)
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import row_lines, row_velocity
 
@@ -271,16 +278,21 @@ _UNIT_EDGES = (
 )
 
 
-def _diagonal_walk(inverse, device):
+def _diagonal_walk(inverse, device, dofs=None, offsets=None):
     """The walk of each world's dense articulation whose mass matrix is diagonal, ``H = diag(1 / inverse[w])``, as the
-    sparse-diagonal sweep leaves it (:func:`.sweep_routes.walk_leave`): world ``w``'s articulation ``w``, a chain of one
+    step's one leave walks it (:func:`.tree_factor.walk_leave_kernel`, :func:`_leave`): world ``w``'s articulation
+    ``w`` at its world's ``offsets[w]`` of ``dofs`` coordinates (global coordinate ``w dofs + d``), a chain of one
     coordinate a body whose columns and lifts are zero, so ``WALK_DOWN`` leaves ``u_c / ell_c = u_c sqrt(m_c^-1)``.
-    Returns its articulations by world and its :class:`.tree_factor.WalkTrees`."""
+    Returns its :class:`.tree_factor.WalkTrees`."""
     inverse = np.asarray(inverse, np.float32)
     worlds, n = inverse.shape
+    dofs = n if dofs is None else int(dofs)
+    offsets = np.zeros(worlds, np.int32) if offsets is None else np.asarray(offsets, np.int32)
+    first = (np.arange(worlds) * dofs + offsets).astype(np.int32)
     walk = WalkTrees()
-    data = np.zeros((worlds * n, WALK_COORDINATE), np.float32)
-    data[:, 12] = np.sqrt(inverse.reshape(-1))
+    data = np.zeros((worlds * dofs, WALK_COORDINATE), np.float32)
+    for world in range(worlds):
+        data[first[world] : first[world] + n, 12] = np.sqrt(inverse[world])
     walk.data = wp.array(data, device=device)
     walk.link = wp.zeros((worlds * n, WALK_LINK), dtype=wp.float32, device=device)
     path = np.stack([np.arange(n) - 1, np.arange(n)], axis=1).astype(np.int32)
@@ -289,7 +301,7 @@ def _diagonal_walk(inverse, device):
     starts = (np.arange(worlds) * n).astype(np.int32)
     walk.joint_start = wp.array(starts, device=device)
     walk.joint_end = wp.array(starts + n, device=device)
-    walk.dof_start = wp.array(starts, device=device)
+    walk.dof_start = wp.array(first, device=device)
     walk.dofs = wp.full(worlds, n, dtype=wp.int32, device=device)
     release = WalkRelease()
     release.count = wp.zeros(worlds, dtype=wp.int32, device=device)
@@ -297,7 +309,31 @@ def _diagonal_walk(inverse, device):
     release.coordinate = wp.full((1, 1, 1), -1, dtype=wp.int32, device=device)
     release.b, release.a, release.g = (wp.zeros((1, 1, 1), dtype=wp.float32, device=device) for _ in range(3))
     walk.release = release
-    return wp.array(np.arange(worlds, dtype=np.int32), device=device), walk
+    walk.du = wp.zeros(worlds * dofs, dtype=wp.float32, device=device)
+    return walk
+
+
+def _leave(walk, velocity, device):
+    """The step's one leave of :func:`_diagonal_walk`'s chains: the sweep's change in ``walk.du`` walked onto
+    ``velocity``."""
+    worlds, n = walk.dofs.shape[0], walk.dofs.numpy()[0]
+    chain = WalkClass(tuple(range(-1, n - 1)), tuple(range(n + 1)))
+    lanes = 4 if wp.get_device(device).is_cuda else 1
+    wp.launch(
+        walk_leave_kernel((chain,), False),
+        dim=worlds * lanes,
+        inputs=[
+            wp.array(np.arange(worlds, dtype=np.int32), device=device),
+            lanes,
+            walk,
+            wp.zeros(worlds, dtype=wp.int32, device=device),
+            walk.du,
+            wp.array(np.arange(walk.du.shape[0], dtype=np.int32), device=device),
+            velocity,
+        ],
+        device=device,
+    )
+    walk.du.zero_()
 
 
 def _whiten_slots(sparse_dof, jacobian, inverse):
@@ -950,6 +986,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         upper_lambda = wp.zeros_like(lower_lambda)
         velocity = wp.array(initial_velocity, dtype=wp.float32, device=device)
         kernel = sparse_diagonal_kernel(max_constraints, world_dofs, dense_dofs, str(device.arch), contact_triples=True)
+        walk = _diagonal_walk(inverse_mass[None, :dense_dofs], device, world_dofs)
         wp.launch_tiled(
             kernel,
             dim=[1],
@@ -971,7 +1008,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 wp.empty((1, (max_constraints + 2) // 3), dtype=wp.int32, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
-                *_diagonal_walk(inverse_mass[None, :dense_dofs], device),
+                walk,
                 wp.array(dense_j * np.sqrt(inverse_mass[:dense_dofs]), device=device),
                 wp.array(sparse_dof, device=device),
                 wp.array(
@@ -992,6 +1029,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             block_dim=32,
             device=device,
         )
+        _leave(walk, velocity, device)
 
         np.testing.assert_allclose(velocity.numpy(), expected_velocity, rtol=2.0e-5, atol=2.0e-6)
         np.testing.assert_allclose(impulses.numpy()[0, :3], expected_impulses, rtol=2.0e-5, atol=2.0e-6)
@@ -1054,6 +1092,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             contact_triples=True,
             speculative_contact_batches=True,
         )
+        walk = _diagonal_walk(inverse_mass[None, :dense_dofs], device, world_dofs)
         wp.launch_tiled(
             kernel,
             dim=[1],
@@ -1075,7 +1114,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 wp.array(normal_rows[None, :], device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
-                *_diagonal_walk(inverse_mass[None, :dense_dofs], device),
+                walk,
                 wp.array(dense_j * np.sqrt(inverse_mass[:dense_dofs]), device=device),
                 wp.array(sparse_dof, device=device),
                 wp.array(
@@ -1100,6 +1139,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             block_dim=32,
             device=device,
         )
+        _leave(walk, velocity, device)
 
         np.testing.assert_allclose(velocity.numpy(), expected_velocity, rtol=2.0e-5, atol=2.0e-6)
         np.testing.assert_allclose(impulses.numpy()[0], expected_impulses, rtol=2.0e-5, atol=2.0e-6)
@@ -1349,6 +1389,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                         contact_units=units,
                         speculative_contact_batches=batches,
                     )
+                    walk = _diagonal_walk(rows["dense_inverse"], device, dofs, rows["dense_offsets"])
                     wp.launch_tiled(
                         kernel,
                         dim=[worlds],
@@ -1370,7 +1411,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                             wp.array(serial_heads, device=device),
                             wp.array(rows["dense_offsets"], device=device),
                             wp.array(rows["dense_groups"], device=device),
-                            *_diagonal_walk(rows["dense_inverse"], device),
+                            walk,
                             wp.array(rows["dense_Z"], device=device),
                             wp.array(schedule["sparse_row_dof"], device=device),
                             wp.array(rows["sparse_z"], device=device),
@@ -1386,6 +1427,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                         block_dim=32,
                         device=device,
                     )
+                    _leave(walk, velocity, device)
                     results[label] = {
                         "impulses": impulses.numpy(),
                         "velocity": velocity.numpy(),

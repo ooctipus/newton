@@ -66,6 +66,8 @@ from .spatial_laws import drive_force, drive_stiffness, spring_damper_stiffness
 from .tree_plan import TreePlan
 
 __all__ = [
+    "FREE_BODY_WALK",
+    "LEAVE_LANES",
     "WALK_ADDED",
     "WALK_ARMATURE",
     "WALK_COORDINATE",
@@ -79,6 +81,7 @@ __all__ = [
     "WalkClass",
     "prepare_augmented_drives",
     "walk_down_prelude",
+    "walk_leave_kernel",
     "walk_paths_prelude",
     "walk_prelude",
 ]
@@ -179,6 +182,9 @@ class TreeFactor:
         self.held = None
         self.dynamics_stream = None
         self.walk_arts = None
+        self.walk_classes: tuple[WalkClass, ...] = ()
+        self.walk_class = None
+        self.walk_leave = None
         self.walk_slip_capacity = 0
         # The border's status word (tree_kinetic_state.border_solve): bit 0 a tree past its slip capacity, bit 1 a
         # pivot not positive, bit 2 a decided step on a tree the walk does not hold.
@@ -910,6 +916,19 @@ class TreeFactor:
                 dof_body[qd_start[j] : qd_start[j + 1]] = j - j0
         joints, dofs = max(int(model.joint_count), 1), max(int(model.joint_dof_count), 1)
         self.walk_arts = wp.array(arts, dtype=wp.int32, device=device)
+        # The walking classes: each held tree's topology, which the step's one leave emits as its walk
+        # (walk_leave_kernel), and each articulation's class among them.
+        classes: dict[WalkClass, int] = {}
+        walk_class = np.full(max(int(model.articulation_count), 1), -1, dtype=np.int32)
+        for art in arts.tolist():
+            j0, j1 = int(start[art]), int(end[art])
+            table = WalkClass(
+                tuple(int(p) for p in path[j0:j1, 0]),
+                (*(int(f) for f in path[j0:j1, 1]), int(qd_start[j1] - qd_start[j0])),
+            )
+            walk_class[art] = classes.setdefault(table, len(classes))
+        self.walk_classes = tuple(classes)
+        self.walk_class = wp.array(walk_class, dtype=wp.int32, device=device)
         # A tree's lane group in the step's walk kernel (walk_step_kernel): a lane a row of the inward pass's 6x6
         # algebra on CUDA, one thread a tree on the CPU.
         self.walk_lanes = WALK_LANES if device.is_cuda else 1
@@ -951,6 +970,9 @@ class TreeFactor:
                 parent = int(path[j][0])
                 reach[j - j0] = (reach[parent] if parent >= 0 else 0) + int(qd_start[j + 1] - qd_start[j])
             depth = max(depth, int(reach.max(initial=1)))
+        view.du = wp.zeros(dofs, dtype=wp.float32, device=device)
+        # The leave reads the walk's du at each coordinate itself.
+        self.walk_du_index = wp.array(np.arange(dofs, dtype=np.int32), dtype=wp.int32, device=device)
         view.release = release_view(
             max(int(model.articulation_count), 1),
             self.walk_slip_capacity,
@@ -958,6 +980,30 @@ class TreeFactor:
             device,
         )
         self.walk_trees = view
+        # The step's one leave of every walking tree (walk_leave_kernel), the release compiled where a tree can slip.
+        self.walk_leave = walk_leave_kernel(self.walk_classes, self.walk_slip_capacity > 0) if classes else None
+
+    def leave(self, v_out: wp.array, du: wp.array | None = None, du_index: wp.array | None = None) -> None:
+        """The step's one leave (:func:`walk_leave_kernel`): every walking tree's velocity change walked down onto
+        ``v_out`` (``v += P^T L^-T R^T du``): coordinate ``c``'s change is ``du[du_index[c]]``, by default the walk's
+        own :attr:`WalkTrees.du`, which the sweeps add into from zero each step."""
+        if self.walk_leave is None:
+            return
+        lanes = LEAVE_LANES if self.model.device.is_cuda else 1
+        wp.launch(
+            self.walk_leave,
+            dim=self.walk_arts.shape[0] * lanes,
+            inputs=[
+                self.walk_arts,
+                lanes,
+                self.walk_trees,
+                self.walk_class,
+                self.walk_trees.du if du is None else du,
+                self.walk_du_index if du_index is None else du_index,
+                v_out,
+            ],
+            device=self.model.device,
+        )
 
     def slips_by_tree(self, articulations) -> np.ndarray:
         """Each of ``articulations``' drives that can slip: its driven coordinates with a gain and a finite effort
@@ -1534,23 +1580,6 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
         V[4] = W[4];
         V[5] = W[5];
     };
-    // WALK_DOWN_PATHS(data, link, u, qd, twist): the leave P^T L^-T u of the class's trees, root first: each coordinate c
-    // takes qd_c = (u_c - ut_c . V) / ell_c, then V += s_c qd_c, V its body's twist; twist receives every body's
-    // twist (v, w) at its frame, six floats a body.
-    const auto WALK_DOWN_PATHS = [&](const float* data, const float* link, const float* u, float* qd, float* twist) {
-        for (int b = 0; b < WALK_BODIES; ++b) {
-            float V[6];
-            WALK_PARENT_TWIST(link, twist, b, V);
-            for (int c = WALK_FIRST_OF(b); c < WALK_FIRST_OF(b + 1); ++c) {
-                const float* d = data + $coordinate * c;
-                const float q = (u[c] - ((d[6] * V[0] + d[7] * V[1] + d[8] * V[2])
-                                         + (d[9] * V[3] + d[10] * V[4] + d[11] * V[5]))) * d[12];
-                qd[c] = q;
-                for (int k = 0; k < 6; ++k) V[k] += d[k] * q;
-            }
-            for (int k = 0; k < 6; ++k) twist[6 * b + k] = V[k];
-        }
-    };
     // WALK_ENTER(data, link, qd, u, twist): the walk's coordinates of known velocities qd, u = L^T P qd (the leave
     // inverted), root first: u_c = ell_c qd_c + ut_c . V, then V += s_c qd_c, V its body's twist (the audit's).
     const auto WALK_ENTER = [&](const float* data, const float* link, const float* qd, float* u, float* twist) {
@@ -1636,7 +1665,8 @@ def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int) -> 
     - ``WALK_UP`` and ``WALK_SEED``, the rows: a lane per seed walks its ``rows`` rows up the seed's root path, every
       load shared (Z_UNION Theorem B), and gives each footprint, with the step's ``J`` entry it whitens, to the
       caller's sink, the placement's store;
-    - ``WALK_DOWN_PATHS``, the leave, and ``WALK_ENTER``, its inverse: a lane per tree, root first.
+    - ``WALK_ENTER``, the leave's inverse: a lane per tree, root first (the leave is the class's emitted walk down,
+      :func:`walk_down_prelude`, in the step's one leave, :func:`walk_leave_kernel`).
 
     No step launches it (FL3.1). The data is :meth:`TreeWalk.device_data`'s.
 
@@ -1884,12 +1914,16 @@ for (int b = {bodies - 1}; b >= 0; --b) {{
         return "\n".join(tables) + "\n" + Template(loop).substitute(width=width)
 
 
+FREE_BODY_WALK = WalkClass((-1,), (0, 6))
+"""A free rigid body's walking class: one body of six coordinates."""
+
 _WALK_ACCESS = """    // The walk's read-only loads (its records and links are never written while a walk runs, so the loads leave the
     // chain), and a lane group's fetch of a byte range into L1, one line a lane a trip.
     const auto WALK_LOAD = [&](const float* p) -> float { return __ldg(p); };
     const auto WALK_RECORD = [&](const float* p) -> float4 { return __ldg(reinterpret_cast<const float4*>(p)); };
     // A product rounded on its own: the chain's coordinate is a float32 value before any consumer adds it.
     const auto WALK_MUL = [&](const float a, const float b) -> float { return __fmul_rn(a, b); };
+    const auto WALK_INDEX = [&](const int* p) -> int { return __ldg(p); };
     const auto WALK_FETCH = [&](const void* start, const int bytes, const int lane, const int lanes) {
         const size_t end = reinterpret_cast<size_t>(start) + (size_t)bytes;
         for (size_t line = (reinterpret_cast<size_t>(start) & ~(size_t)127) + (size_t)128 * lane; line < end;
@@ -1903,6 +1937,7 @@ _WALK_ACCESS_CPU = """    struct WalkRecord {
     const auto WALK_LOAD = [&](const float* p) -> float { return *p; };
     const auto WALK_RECORD = [&](const float* p) -> WalkRecord { return WalkRecord{p[0], p[1], p[2], p[3]}; };
     const auto WALK_MUL = [&](const float a, const float b) -> float { return a * b; };
+    const auto WALK_INDEX = [&](const int* p) -> int { return *p; };
     const auto WALK_FETCH = [&](const void*, const int, const int, const int) {};"""
 
 _DOWN_JOINT = """{
@@ -1979,8 +2014,8 @@ def walk_down_prelude(classes: tuple[WalkClass, ...]) -> DevicePrelude:
       (straight-line code up to :data:`WALK_UNROLL` coordinates), its records read through the read-only path
       (``WALK_LOAD``, ``WALK_RECORD``), every twist a register, handed to ``twist(b, V)`` after its body.
 
-    No shared memory and no scratch. Every caller of the leave takes it: the support placement's publish
-    (:func:`.walk_rows.support_publish_kernel`) and the sweeps' leave (:meth:`.sweep_routes.FactorCoordinates.leave_all`).
+    No shared memory and no scratch. The step's one leave takes it (:func:`walk_leave_kernel`), and the general sweep's
+    free bodies' speed rows on their one-body class (:data:`FREE_BODY_WALK`).
 
     Args:
         classes: The walking classes, indexed by ``cls``.
@@ -1993,6 +2028,85 @@ def walk_down_prelude(classes: tuple[WalkClass, ...]) -> DevicePrelude:
         _WALK_ACCESS + "\n" + _walk_down(classes, True),
         cpu=_WALK_ACCESS_CPU + "\n" + _walk_down(classes, False),
     )
+
+
+LEAVE_LANES = 4
+"""Lanes of a tree's group in the step's leave (:func:`walk_leave_kernel`) on CUDA: they fetch the tree's lines into L1
+in one parallel trip and one of them walks (WALK_MAPPING §4, B5: 4 lanes ran at or under 8 on g1, franka and
+allegro)."""
+
+_LEAVE = """    const int tree = tid / lanes, lane = tid - tree * lanes;
+    if (tree >= arts.shape[0]) return;
+    const int art = arts.data[tree];
+    const int cls = walk_class.data[art];
+    if (cls < 0) return;
+    const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art], n = walk.dofs.data[art];
+    // Coordinate c's change is du[at[c]]: the walk's du at the coordinate itself, or a sweep's own layout.
+    const int* const at = du_index.data + d0;
+    float* const v = v_out.data + d0;
+    // The group's lanes fetch the tree's change indices and velocity beside its records (WALK_LEAVE).
+    WALK_FETCH(at, n * 4, lane, lanes);
+    WALK_FETCH(v, n * 4, lane, lanes);
+$release    WALK_LEAVE(
+        cls, walk.data.data + (size_t)d0 * $coordinate, walk.link.data + (size_t)j0 * $link, n,
+        walk.joint_end.data[art] - j0, lane, lanes, 0, ready, $read, [&](const int c, const float q) { v[c] += q; },
+        [](const int, const float*) {});
+"""
+
+_LEAVE_RELEASE = """    // The slips' release transposed, R^T du, on a copy where the tree slips (the predictor's border's R).
+    float r[$width];
+    bool slipped = false;
+    const auto ready = [&]() {
+        if (walk.release.count.data[art] == 0) return;
+        for (int c = 0; c < n; ++c) r[c] = du.data[at[c]];
+        WALK_RELEASE_T(walk.release, art, r);
+        slipped = true;
+    };
+"""
+
+
+@functools.cache
+def walk_leave_kernel(classes: tuple[WalkClass, ...], release: bool) -> wp.Kernel:
+    """The step's one leave, ``v += P^T L^-T R^T du``, of every walking tree (``arts``), a lane group a tree (``lanes``:
+    :data:`LEAVE_LANES` on CUDA, one on the CPU; ``dim`` trees times lanes), by the walk down's unit (``WALK_LEAVE`` of
+    :func:`walk_down_prelude`, the tree's class at ``walk_class``). Each coordinate's change is ``du[du_index[dof]]``:
+    every placement's sweep adds its change in the walk's coordinates into :attr:`WalkTrees.du` (the index the
+    coordinate itself), the support placement's sparse sweep publishes it in its factor coordinates (the index its
+    factor coordinate). This kernel takes the slips' release transposed where the class can slip (``release``) and
+    walks each tree down onto ``v_out``, which holds the predictor and the changes of the placements that do not walk.
+
+    Args:
+        classes: The walking classes, indexed by ``walk_class``.
+        release: Whether a tree of the classes can slip (:attr:`TreeFactor.walk_slip_capacity`).
+    """
+    from .kernel_template import THREADS, KernelTemplate  # noqa: PLC0415
+
+    width = max(walk.coordinates for walk in classes)
+    if release:
+        head = substitute(_LEAVE_RELEASE, width=width)
+        read = "[&](const int c) -> float { return slipped ? r[c] : WALK_LOAD(du.data + WALK_INDEX(at + c)); }"
+    else:
+        head = "    const auto ready = []() {};\n"
+        read = "[&](const int c) -> float { return WALK_LOAD(du.data + WALK_INDEX(at + c)); }"
+    body = substitute(_LEAVE, release=head, read=read, coordinate=WALK_COORDINATE, link=WALK_LINK)
+    tag = hashlib.sha256(repr(classes).encode()).hexdigest()[:8]
+    return KernelTemplate(
+        f"walk_leave_{len(classes)}_{tag}" + ("_release" if release else ""),
+        (
+            ("arts", wp.array[int]),
+            ("lanes", int),
+            ("walk", WalkTrees),
+            ("walk_class", wp.array[int]),
+            ("du", wp.array[float]),
+            ("du_index", wp.array[int]),
+            ("v_out", wp.array[float]),
+        ),
+        body,
+        THREADS,
+        preludes=((walk_paths_prelude(1),) if release else ()) + (walk_down_prelude(classes),),
+        dual=True,
+        native_name="walk_leave_native",
+    ).kernel()
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -2052,6 +2166,8 @@ class WalkTrees:
     - each articulation's first joint, joint end, first coordinate and coordinates (a free rigid body is a one-body
       tree of six coordinates);
     - ``dof_body``: each coordinate's body within its tree; ``body_joint``: each body's joint;
+    - ``du``: each coordinate's velocity change in the walk's coordinates, which the sweeps add into from zero each
+      step and the step's one leave walks down (:func:`walk_leave_kernel`);
     - ``release``: the release of each tree's slips (the block primitive's first phase, :class:`WalkRelease`), which the
       predictor's border writes (:func:`.tree_kinetic_state.border_solve`, FL3.9): the rows take ``R``, the leave
       ``R^T`` and the audit's coordinates ``R^-T``.
@@ -2070,6 +2186,7 @@ class WalkTrees:
     dof_body: wp.array[int]
     body_joint: wp.array[int]
     release: WalkRelease
+    du: wp.array[float]
 
 
 def empty_walk_view(model, forest) -> WalkTrees:
@@ -2090,6 +2207,7 @@ def empty_walk_view(model, forest) -> WalkTrees:
     view.dof_start = forest.articulation_dof_start
     view.dofs = forest.articulation_dof_count
     view.dof_body = view.body_joint = wp.zeros(1, dtype=wp.int32, device=device)
+    view.du = wp.zeros(1, dtype=wp.float32, device=device)
     view.release = release_view(max(int(model.articulation_count), 1), 0, 1, device)
     return view
 

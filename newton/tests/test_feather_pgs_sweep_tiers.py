@@ -211,31 +211,31 @@ class TestJacobiLaw(unittest.TestCase):
 
 
 class TestResponseOperators(unittest.TestCase):
-    """The tiers' response operator: rows by the walk, the leave by the walk down, no factor staged."""
+    """The tiers' response operator: rows by the walk, the change to the step's one leave, no factor staged."""
 
     def test_the_tiers_walk_their_rows_and_leave_by_the_walk(self):
         for label, args, kwargs in CALLS:
             with self.subTest(label):
                 source = _source(args, kwargs)
                 self.assertNotIn("s_L", source)
-                # Each tree leaves by the walk down; the keyed rows walk their seeds, the others read the one writer's.
-                self.assertEqual(source.count("WALK_DOWN_PATHS("), 2 if kwargs["inkernel_response"][1] else 1)
+                # The change goes to the step's one leave in the walk's coordinates (no walk down in the sweep); the
+                # keyed rows walk their seeds, the others read the one writer's.
+                self.assertIn("if (global_dof >= 0) walk.du.data[global_dof] += u;", source)
+                self.assertNotIn("WALK_DOWN", source)
                 keyed = "row_inputs" in kwargs
                 self.assertEqual("TIER_WALK(" in source, keyed)
                 self.assertEqual("incident = row_incident.data[off_dense + i];" in source, not keyed)
                 self.assertIn("s_rhs[i] += incident;", source)
 
     def test_the_release_compiles_where_a_tree_can_slip(self):
-        """A slipping drive's release ``R`` (the walk's ``WALK_RELEASE``) on the keyed rows and its transpose on the
-        leave (``WALK_RELEASE_T``); the stored rows carry ``R`` from their writer, so their leave takes ``R^T`` too. Only
-        on the trees of the capacity the tier names."""
+        """A slipping drive's release ``R`` (the walk's ``WALK_RELEASE``) on the keyed rows, only on the trees of the
+        capacity the tier names; the stored rows carry ``R`` from their writer. Its transpose is the step's one leave's
+        (``tree_factor.walk_leave_kernel``), never the tier's."""
         for label, args, kwargs in (CALLS[0], CALLS[2]):
             with self.subTest(label):
                 self.assertNotIn("WALK_RELEASE(walk.release", _source(args, kwargs))
-                self.assertNotIn("WALK_RELEASE_T(walk.release", _source(args, kwargs))
                 framed = _source(args, {**kwargs, "frame": (4, 0)})
-                self.assertNotIn("WALK_RELEASE_T(walk.release, art_b", framed)
-                self.assertEqual(framed.count("WALK_RELEASE_T(walk.release, art_a"), 1)
+                self.assertNotIn("WALK_RELEASE_T(", framed)
                 keyed = "row_inputs" in kwargs
                 self.assertEqual(framed.count("WALK_RELEASE(walk.release, art_a"), 1 if keyed else 0)
 

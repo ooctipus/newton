@@ -45,7 +45,7 @@ from newton._src.solvers.feather_pgs.solve_policy import (
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import chain_walk, local_packed_rows, row_lines, walked_rows
+from newton.tests.feather_pgs_law_harness import chain_walk, leave_walk, local_packed_rows, row_lines, walked_rows
 
 SWEEPS = SolvePolicy(readout="sweeps")
 STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
@@ -253,6 +253,7 @@ class _LocalCase:
             block_dim=32,
             device=self.device,
         )
+        leave_walk(self.walk, self.outputs[2], self.device)
 
     def read(self):
         """Per-world outputs: the impulses, the articulation's velocities and the diagonal."""

@@ -5,7 +5,8 @@
 
 :func:`.tree_factor.walk_prelude` declares the walk for both devices: the class's path table in constant memory, a lane
 per seed walking its rows up (``WALK_UP``, ``WALK_SEED``) into the caller's sink, with the step's ``J`` entry each
-footprint whitens, and a lane per tree walking down (the leave, ``WALK_DOWN_PATHS``). These tests run it on
+footprint whitens; :func:`.tree_factor.walk_down_prelude` emits a class's walk down (the leave, ``WALK_DOWN``), a
+lane per tree, straight-line up to ``WALK_UNROLL`` coordinates and the loop form past it. These tests run them on
 the CPU and, where there is one, on a CUDA device, against the float64 walk (:class:`.tree_factor.TreeWalk`, which
 :mod:`.test_feather_pgs_walk` holds to the factor), and hold every placement to one frame:
 

@@ -22,7 +22,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton._src.solvers.feather_pgs.solver_fields import LocalOwners
 from newton._src.solvers.feather_pgs.sweep_routes_local import local_owned_kernel
-from newton.tests.feather_pgs_law_harness import chain_walk, local_packed_rows, row_lines, walked_rows
+from newton.tests.feather_pgs_law_harness import chain_walk, leave_walk, local_packed_rows, row_lines, walked_rows
 
 
 class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
@@ -192,6 +192,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
             block_dim=32,
             device=device,
         )
+        leave_walk(walk, velocity_out, device)
         wp.synchronize_device(device)
 
         mass = (lower @ lower.T)[::-1, ::-1]  # the leaf-first factor: P H P^T = L L^T
@@ -272,6 +273,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 block_dim=32 * warps_per_block,
                 device=device,
             )
+            leave_walk(walk, variant_velocity, device)
             wp.synchronize_device(device)
             return variant_diagonal.numpy(), variant_impulses.numpy(), variant_velocity.numpy()
 
@@ -354,11 +356,12 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 diagonal,
                 impulses,
                 velocity,
-                chain_walk(device, [np.eye(dof_count)]),
+                (walk := chain_walk(device, [np.eye(dof_count)])),
             ],
             block_dim=32,
             device=device,
         )
+        leave_walk(walk, velocity, device)
         wp.synchronize_device(device)
 
         # The pooled normal impulse gives radius 2. The unconstrained coupled
@@ -483,11 +486,12 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 diagonal,
                 dense_impulses,
                 velocity,
-                chain_walk(device, [np.eye(primary_dofs), np.eye(secondary_dofs)]),
+                (walk := chain_walk(device, [np.eye(primary_dofs), np.eye(secondary_dofs)])),
             ],
             block_dim=64,
             device=device,
         )
+        leave_walk(walk, velocity, device)
         wp.synchronize_device(device)
 
         dense_jacobian = np.concatenate([primary_jacobian[0, 0], secondary_jacobian[1, 0]])
@@ -614,6 +618,7 @@ def _patch_ring_solves(device, load):
             block_dim=32,
             device=device,
         )
+        leave_walk(walk, velocity, device)
         results[name] = (diagonal.numpy(), impulses.numpy(), velocity.numpy())
     return results
 

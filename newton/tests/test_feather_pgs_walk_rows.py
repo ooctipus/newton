@@ -467,36 +467,21 @@ class TestSupportSlipRelease(unittest.TestCase):
         self.assertGreater(np.linalg.norm(B.T @ B - decided) / scale, 1.0e-1)
         # The release keeps each column inside its path: R L^-1 is the decided factor's L_F^-1, of L's pattern.
         self.assertTrue(np.all(B_F[np.abs(B) == 0.0] == 0.0))
-        # The leave takes the release's transpose (walk_rows.support_publish_kernel): dv = L^-T R^T du, the decided
-        # factor's leave, against the float64 walk of R^T du.
-        from newton._src.solvers.feather_pgs import walk_rows  # noqa: PLC0415
-
-        path_table = tuple(int(p) for p, _ in path)
-        first = (*(int(f) for _, f in path), n)
-        publish = walk_rows.support_publish_kernel(path_table, first, tuple(range(n)))
+        # The step's one leave takes the release's transpose (tree_factor.walk_leave_kernel): dv = L^-T R^T du, the
+        # decided factor's leave, against the float64 walk of R^T du.
         du = np.random.default_rng(5).normal(size=(1, n)).astype(np.float32)
-        v_hat = wp.zeros(n, dtype=float, device="cpu")
-        v_out = wp.zeros(n, dtype=float, device="cpu")
-        forest = solver.forest
-        wp.launch(
-            publish,
-            dim=1,
-            inputs=[
-                wp.array([0], dtype=wp.int32, device="cpu"),
-                solver.factor.walk_view(),
-                release,
-                forest.art_to_world,
-                forest.articulation_world_dof_offset,
-                wp.array(du, device="cpu"),
-                v_hat,
-                v_out,
-            ],
-            device="cpu",
-        )
+        walk_view = solver.factor.walk_view()
+        d0 = int(solver.forest.articulation_dof_start_host[0])
+        values = np.zeros(walk_view.du.shape[0], dtype=np.float32)
+        values[d0 : d0 + n] = du[0]
+        walk_view.du.assign(values)
+        v_out = wp.zeros(walk_view.du.shape[0], dtype=float, device="cpu")
+        solver.factor.leave(v_out)
+        v_out = v_out.numpy()[d0 : d0 + n]
         R = release_rows(release, 0, n, path, dof_body, np.eye(n))
         walk = solver.factor.walk(joint_q, 0)
         expected = walk.down(R.T @ du[0].astype(np.float64))[0]
-        self.assertLess(np.linalg.norm(v_out.numpy() - expected) / np.linalg.norm(expected), 1.0e-5)
+        self.assertLess(np.linalg.norm(v_out - expected) / np.linalg.norm(expected), 1.0e-5)
 
 
 def _hinges_step(pins: dict, iterations: int = 30) -> tuple:
@@ -656,7 +641,7 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
             continue
         out["free_bodies"] += int(free[art] != 0)
         if slips[art]:
-            # R^T du: the last slip first, each along its path root first (the leave's text, sweep_routes.walk_leave).
+            # R^T du: the last slip first, each along its path root first (the step's one leave, walk_leave_kernel).
             release = view.release
             coordinate, b, a, g = (getattr(release, k).numpy()[art] for k in ("coordinate", "b", "a", "g"))
             du = du.copy()
@@ -694,7 +679,7 @@ def slot_frames(solver, joint_q: np.ndarray, capture) -> dict:
     slot_dof = placement.sparse_diagonal_row_dof.numpy()
     slot_z = placement.sparse_diagonal_row_z.numpy().astype(np.float64)
     groups = placement.sparse_diagonal_dense_groups.numpy()
-    arts = placement.sparse_diagonal_dense_arts.numpy()
+    arts = placement.sparse_diagonal_dense_arts_host
     world_dofs = forest.world_dof_indices.numpy()
     inverse_mass = factor.diagonal_inverse_mass.numpy().astype(np.float64)
     starts = forest.articulation_dof_start.numpy()
@@ -800,7 +785,7 @@ class TestSlotFrame(unittest.TestCase):
         state, out = model.state(), model.state()
         joint_q = state.joint_q.numpy().astype(np.float64)
         solver.step(state, out, control, None, 1.0 / 60.0)
-        art = int(solver.placement.sparse_diagonal_dense_arts.numpy()[0])
+        art = int(solver.placement.sparse_diagonal_dense_arts_host[0])
         self.assertEqual(int(solver.factor.walk_view().release.count.numpy()[art]), 3)
         walk = solver.factor.walk(joint_q, art)
         n = walk.s.shape[0]
@@ -912,7 +897,10 @@ class TestPairedPlacement(unittest.TestCase):
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     solver = SolverFeatherPGS(
-                        model, pgs_iterations=16, enable_joint_limits=True, dense_max_constraints=96,
+                        model,
+                        pgs_iterations=16,
+                        enable_joint_limits=True,
+                        dense_max_constraints=96,
                         mf_max_constraints=32,
                     )
                 self.assertEqual(solver.routes.case, "K5")
@@ -945,6 +933,8 @@ class TestPairedPlacement(unittest.TestCase):
                 self.assertLess(worst["rows"], BOUND, worst)
                 self.assertLess(worst["free_rows"], BOUND, worst)
                 self.assertLess(worst["leave"], BOUND, worst)
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # The support placement (case K1, CUDA): its rows from the support sink, one frame with its leave, the release
 # ---------------------------------------------------------------------------------------------------------------------

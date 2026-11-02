@@ -25,7 +25,15 @@ from newton._src.solvers.feather_pgs.device_preludes import cuda_native, dual_na
 from newton._src.solvers.feather_pgs.friction_patches import PatchRowLaw
 from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.solver_fields import Mimics
-from newton._src.solvers.feather_pgs.tree_factor import WALK_COORDINATE, WALK_LINK, WALK_NOW, WalkRelease, WalkTrees
+from newton._src.solvers.feather_pgs.tree_factor import (
+    WALK_COORDINATE,
+    WALK_LINK,
+    WALK_NOW,
+    WalkClass,
+    WalkRelease,
+    WalkTrees,
+    walk_leave_kernel,
+)
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 FAMILIES = (contact_laws.CONTACT_LAW, row_laws.ROW_LAW, projection_laws.PROJECTION_LAW, projection_laws.CONE_LAW)
@@ -797,7 +805,38 @@ def chain_walk(device, lowers) -> WalkTrees:
     release.coordinate = wp.full((1, 1, 1), -1, dtype=wp.int32, device=device)
     release.b, release.a, release.g = (wp.zeros((1, 1, 1), dtype=wp.float32, device=device) for _ in range(3))
     walk.release = release
+    walk.du = wp.zeros(total, dtype=wp.float32, device=device)
     return walk
+
+
+def leave_walk(walk: WalkTrees, velocity, device) -> None:
+    """The step's one leave of a hand-built walk (:func:`.tree_factor.walk_leave_kernel`), after a sweep launched by
+    hand: each tree's change, which the sweep added into ``walk.du``, walked down onto ``velocity``; ``du`` cleared for
+    the next launch."""
+    joint_start, joint_end = walk.joint_start.numpy(), walk.joint_end.numpy()
+    dofs, path = walk.dofs.numpy(), walk.path.numpy()
+    classes: dict = {}
+    index = []
+    for art in range(joint_start.shape[0]):
+        rows = path[joint_start[art] : joint_end[art]]
+        table = WalkClass(tuple(int(p) for p in rows[:, 0]), (*(int(f) for f in rows[:, 1]), int(dofs[art])))
+        index.append(classes.setdefault(table, len(classes)))
+    lanes = 4 if wp.get_device(device).is_cuda else 1
+    wp.launch(
+        walk_leave_kernel(tuple(classes), True),
+        dim=len(index) * lanes,
+        inputs=[
+            wp.array(np.arange(len(index), dtype=np.int32), device=device),
+            lanes,
+            walk,
+            wp.array(np.asarray(index, dtype=np.int32), device=device),
+            walk.du,
+            wp.array(np.arange(walk.du.shape[0], dtype=np.int32), device=device),
+            velocity,
+        ],
+        device=device,
+    )
+    walk.du.zero_()
 
 
 def walked_rows(lower, jacobian) -> np.ndarray:
