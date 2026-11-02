@@ -69,7 +69,7 @@ HeldPlan = field_group.struct("HeldPlan", HELD_PLAN, __name__)
 KINETIC_CACHE = field_group.FieldGroup(
     Field("bias", wp.float32, ("group", "dof"), fill=None, owner="cache"),
     Field("com_offset", wp.vec3, ("group", "body"), fill=None, owner="cache"),
-    Field("geometric", wp.float32, ("group", "entry"), fill=None, owner="cache"),
+    Field("diagonal", wp.float32, ("group", "diagonal"), fill=None, owner="cache"),
     Field("current_valid", wp.int32, ("articulation",), owner="factor", attr="fk_id_cache_valid"),
     Field("geometry_valid", wp.int32, ("group",), owner="cache"),
     Field("generation", wp.int64, ("group",), owner="cache"),
@@ -79,7 +79,8 @@ KINETIC_CACHE = field_group.FieldGroup(
     Field("source_qd", wp.uint64, ("group",), owner="cache"),
     Field("stage_clocks", wp.int64, ("group", "stage"), owner="step"),
 )
-"""The held tree's cache. Geometry, forces and source tags follow factor groups (the cache allocates them);
+"""The held tree's cache. ``diagonal`` is a compact diagonal's ``H_ii`` (a group without one has none). Geometry, forces
+and source tags follow factor groups (the cache allocates them);
 current validity follows articulation IDs, shared with the ordinary FK/ID cache (the solver's); the stage clocks
 are the owner's."""
 
@@ -540,9 +541,7 @@ def _twist_block() -> str:
     return device_branches("    if(f.publish_twists!=0) {\n        SYNC();\n" + scan.cuda + "    }\n", CUDA_ONLY)
 
 
-_COLLECT = r"""    $PHYSICAL_TABLE
-
-    float* s=reinterpret_cast<float*>(address);
+_COLLECT = r"""    float* s=reinterpret_cast<float*>(address);
 #if defined(__CUDA_ARCH__)
     const int lane=LANE,stride=STRIDE;
 #else
@@ -562,35 +561,32 @@ $CLOCK1    for(int dof=lane;dof<$DOFS;dof+=stride) {
 #endif
         }
         if(refresh) {
+            // The coordinate's diagonal entry of H, S^T (I S) with I its body's subtree moment, is all a group reads of
+            // H (the walk refreshes from the step's columns): the drives' K-free mass H_ii + R_ii on their rows (the
+            // saturation decision's inertia), and a compact diagonal's H_ii (_DIAGONAL).
             const float* t=s+$MOMENT+13*body,*axis=s+$AXIS+6*dof;
             const wp::vec3 l(axis[0],axis[1],axis[2]),w(axis[3],axis[4],axis[5]),h(t[1],t[2],t[3]);
             const wp::vec3 linear=t[0]*l+wp::cross(w,h);
             wp::vec3 angular=wp::cross(h,l);
             for(int i=0;i<3;++i)for(int j=0;j<3;++j)angular[i]+=t[4+3*i+j]*w[j];
-            for(int k=0;k<3;++k){s[6*dof+k]=linear[k];s[6*dof+3+k]=angular[k];}
-$DRIVE_MASS        }
-    }
+            float mass=0.0f;
+            for(int k=0;k<3;++k)mass+=axis[k]*linear[k];
+            for(int k=0;k<3;++k)mass+=axis[3+k]*angular[k];
+            const int drive=data.drive_row.data[ds+dof];
+            if(drive>=0)data.row_H.data[drive]=mass+data.armature.data[ds+dof];
+$DIAGONAL            if(!wp::isfinite(mass)) {
 #if defined(__CUDA_ARCH__)
-    SYNC();
-#endif
-$CLOCK2    if(refresh)for(int e=lane;e<$NNZ;e+=stride) {
-        const int row=$PHYSICAL_ROW,col=$PHYSICAL_COL,src=p.source.data[e];
-        const int projection=src==col?row:col;
-        float value=0.0f;
-        for(int k=0;k<6;++k)value+=s[$AXIS+6*projection+k]*s[6*src+k];
-        cache.geometric.data[group*$NNZ+e]=value;
-        if(!wp::isfinite(value)) {
-#if defined(__CUDA_ARCH__)
-            atomicOr(&cache.status.data[group],2);
+                atomicOr(&cache.status.data[group],2);
 #else
-            cache.status.data[group]|=2;
+                cache.status.data[group]|=2;
 #endif
+            }
         }
     }
 #if defined(__CUDA_ARCH__)
     SYNC();
 #endif
-$CLOCK3    if(lane==0) {
+$CLOCK2    if(lane==0) {
         cache.generation.data[group]+=1;
         $CURRENT_VALID
         cache.geometry_valid.data[group]=refresh&&cache.status.data[group]==0;
@@ -598,18 +594,9 @@ $CLOCK3    if(lane==0) {
     }
 """
 
-_DRIVE_MASS = r"""            // A drive's mass without K, H_ii + R_ii (the saturation decision's inertia): the coordinate's diagonal
-            // entry of H, S^T (I S) from the same words in the same order as the geometry below, where I S is formed.
-            const int drive=data.drive_row.data[ds+dof];
-            if(drive>=0) {
-                float value=0.0f;
-                for(int k=0;k<3;++k)value+=axis[k]*linear[k];
-                for(int k=0;k<3;++k)value+=axis[3+k]*angular[k];
-                data.row_H.data[drive]=value+data.armature.data[ds+dof];
-            }
-"""
-"""The collection's write of the drives' K-free mass (``row_H``), every group's: no factor forms ``H_ii``, so the finish
-(and a refreshing repair) is its one writer."""
+_DIAGONAL = "            cache.diagonal.data[group*$DOFS+dof]=mass;\n"
+"""A compact diagonal's ``H_ii`` (its refresh adds ``R`` and ``K`` and inverts), for a group whose response reads it
+(:func:`get_helpers`'s ``diagonal``)."""
 
 _FORCE = cached_force.ForceOperands(
     q="f.joint_q.data",
@@ -880,25 +867,24 @@ def get_helpers(
     body_velocity: bool = False,
     *,
     clocked: bool = False,
+    diagonal: bool = False,
 ):
     """Bind one physical tree evaluation to its storage and its scans' schedules.
 
-    ``clocked`` adds the collection (``stage_clocks`` columns 13-15) and body
-    term (16-21) counters. It changes the emitted code, so it is an argument (a
-    cache-key member), never an environment read.
+    ``clocked`` adds the collection (``stage_clocks`` columns 13-14) and body
+    term (16-21) counters; ``diagonal`` has the collection keep ``H_ii`` for a
+    compact diagonal's refresh (:data:`_DIAGONAL`). They change the emitted
+    code, so they are arguments (cache-key members), never environment reads.
     """
     pose_source = _down(layout, ts.TRANSFORM, schedules.pose, _POSE_SLOTS)
     motion_source = _down(layout, ts.TWIST if layout.own_bias else _MOTION, schedules.motion, _MOTION_SLOTS)
     reduction = _reduction(_REDUCE, schedules.reduce, _REDUCE_SLOTS)
     collect_source = layout.native(
         _COLLECT,
-        PHYSICAL_TABLE=layout.physical_table(),
-        PHYSICAL_ROW=layout.physical("p.row.data[e]"),
-        PHYSICAL_COL=layout.physical("p.col.data[e]"),
         REDUCE=reduction,
         CURRENT_VALID=_current_valid(layout),
-        DRIVE_MASS=_DRIVE_MASS,
-        **_native_clocks(clocked, "cache", stages=3, column=13),
+        DIAGONAL=_DIAGONAL if diagonal else "",
+        **_native_clocks(clocked, "cache", stages=2, column=13),
     )
 
     @wp.func_native(layout.native(_STORAGE_SOURCE, BLOCK=_placed_block(layout, "values", "$TOTAL")))
@@ -1073,6 +1059,7 @@ def get_state_kernel(
     listed: bool = False,
     bank_coordinates: int = 0,
     clocked: bool = False,
+    diagonal: bool = False,
 ):
     """Build a complete repair, or with ``finish`` a complete finish, from its stage functions.
 
@@ -1108,7 +1095,8 @@ def get_state_kernel(
     pass of its own would cost a launch. Classified launches compare in
     :func:`get_bank_kernel` instead. ``schedules`` are the scans' schedules;
     ``clocked`` selects the stage counters (``stage_clocks`` columns 0-7 for
-    the stages, 22-24 for motion; see :func:`get_helpers`).
+    the stages, 22-24 for motion; see :func:`get_helpers`); ``diagonal`` keeps
+    a compact diagonal's ``H_ii`` (:data:`_DIAGONAL`).
     """
     if finish and motion_velocity:
         raise ValueError("Alternate motion velocity is a repair-only contract")
@@ -1118,7 +1106,7 @@ def get_state_kernel(
         raise ValueError("A listed launch is a contract of the repair of ordinary motion")
     if bank_coordinates and (finish or motion_velocity or listed):
         raise ValueError("A compared input bank is a contract of the one-pass repair of ordinary motion")
-    h = get_helpers(layout, schedules, body_velocity, clocked=clocked)
+    h = get_helpers(layout, schedules, body_velocity, clocked=clocked, diagonal=diagonal)
     _lanes, _sync, _sub, _different_motion = _thread_helpers(layout)
     banked = bank_coordinates != 0
     _bank_matches = _bank_binding(bank_coordinates, layout) if banked else None
@@ -1567,6 +1555,8 @@ def get_state_kernel(
         name += "_listed"
     if banked:
         name += "_banked"
+    if diagonal:
+        name += "_diagonal"
     return python_kernel(kinetic_state, name)
 
 

@@ -33,24 +33,24 @@ def _diagonal_geometry(
     group_to_art: wp.array[int],
     dof_start: wp.array[int],
     mask: wp.array[int],
-    geometry_index: wp.array[int],
+    offset: int,
     geometry_group: wp.array[int],
-    geometric: wp.array2d[float],
+    diagonal: wp.array2d[float],
     armature: wp.array2d[float],
     drive_row: wp.array[int],
     drive_k: wp.array[float],
     n: int,
     inverse: wp.array[float],
 ):
-    """The compact diagonal's inverse mass ``1 / (H_ii + R + K)`` from the held geometry (the collection writes the
-    drives' ``H_ii + R``, ``row_H``)."""
+    """The compact diagonal's inverse mass ``1 / (H_ii + R + K)`` from ``H_ii`` as the collection keeps it (its held
+    group's coordinate ``offset + local``), with the ``K`` the drives hold now."""
     element = wp.tid()
     group, local = element // n, element % n
     art = group_to_art[group]
     if mask[art] == 0:
         return
     dof = dof_start[art] + local
-    mass = geometric[geometry_group[group], geometry_index[local]] + armature[group, local]
+    mass = diagonal[geometry_group[group], offset + local] + armature[group, local]
     row = drive_row[dof]
     if row >= 0:
         if drive_k[row] > 0.0:
@@ -238,6 +238,7 @@ class TreeSparseOperator:
         # The walk has no factor status: a pivot that is not positive reaches the predictor as a non-finite response.
         self.data.valid = wp.ones(self.plan.group_to_art.size, dtype=int, device=device)
         self.data.status = wp.zeros(self.plan.group_to_art.size, dtype=int, device=device)
+        self.diagonal_mass = False
         self.kinetic_state = None
 
     def refresh(self, state_aug):
@@ -260,6 +261,8 @@ class TreeHeldOperator:
         device = solver.model.device
         count = span[1] - span[0]
         self.diagonal = size == solver._compact_diagonal_mass_size
+        # The compact diagonal's refresh reads H's diagonal, which the collection keeps.
+        self.diagonal_mass = self.diagonal
         self.free_root, mass, self.host, self.layout = _size_group(solver, size, span, diagonal=self.diagonal)
         self.mass = mass
         self.plan = bind_operator_plan(
@@ -271,7 +274,6 @@ class TreeHeldOperator:
         if self.diagonal:
             self.data.inverse = solver.factor.diagonal_inverse_mass
             self.geometry_group = wp.array(np.arange(count, dtype=np.int32), dtype=int, device=device)
-            self.geometry_index = wp.array(np.diag(mass.physical_lookup).copy(), dtype=int, device=device)
         else:
             self.data.lower = self._lower
         self.kinetic_state = None
@@ -295,9 +297,9 @@ class TreeHeldOperator:
                 self.plan.group_to_art,
                 solver.forest.articulation_dof_start,
                 solver.factor.mass_update_mask,
-                self.geometry_index,
+                0,
                 self.geometry_group,
-                self.kinetic_state.geometric,
+                self.kinetic_state.mass_diagonal,
                 solver.factor.R_by_size[size][self.span[0] : self.span[1]],
                 solver.factor.drive_row_by_dof,
                 solver.factor.aug_row_K,
@@ -337,6 +339,7 @@ class PrescribedRootOperator:
             raise ValueError("No prescribed articulations to own")
         self.free_root = True
         self.diagonal = True
+        self.diagonal_mass = False
         self.group_to_art = wp.array(arts, dtype=int, device=device)
         self.mass, self.host, self.layout = _prescribed_group(solver, self.group_to_art)
         self.plan = bind_operator_plan(solver, 6, self.host, group_to_art=self.group_to_art)
@@ -368,6 +371,7 @@ class RestOperator:
         arts = solver.forest.rest_articulations[span[0] : span[1]]
         self.free_root = False
         self.diagonal = True
+        self.diagonal_mass = False
         self.group_to_art = wp.array(arts, dtype=int, device=device)
         first, end = model.articulation_start.numpy()[arts[0]], solver.forest.articulation_joint_end_host[arts[0]]
         parents = local_parents(model.joint_ancestor.numpy(), [first], end - first)[0]
@@ -499,9 +503,9 @@ class ForestHeldOperator:
             if any(f < 0 for f in self.root_families)
             else wp.zeros(model.joint_dof_count, dtype=float, device=device)
         )
-        # Each diagonal-mass root's refresh reads its diagonal of the forest's geometry (physical (row, col) -> forest
-        # entry); a walking root refreshes nothing of its own.
-        physical_index = mass.physical_lookup
+        # Each diagonal-mass root's refresh reads its coordinates' H_ii from the forest's collection (from the root's
+        # offset); a walking root refreshes nothing of its own.
+        self.diagonal_mass = any(f < 0 for f in self.root_families)
         self.families = []
         factor_index = np.zeros((worlds, len(self.root_families)), np.int32)
         for r, family in enumerate(self.root_families):
@@ -513,13 +517,12 @@ class ForestHeldOperator:
                 setattr(self.data, root_field("lower", r), solver.factor.L_by_size[family])
             if family >= 0:
                 continue
-            size, offset = -family, self.layout.root_offsets[r]
+            size = -family
             group = solver.forest.group_to_art[size].numpy()
-            block = physical_index[offset : offset + size, offset : offset + size]
             self.families.append(
                 (
                     size,
-                    wp.array(np.diag(block).astype(np.int32), dtype=int, device=device),
+                    int(self.layout.root_offsets[r]),
                     wp.array(art_world[group].astype(np.int32), dtype=int, device=device),
                 )
             )
@@ -534,7 +537,7 @@ class ForestHeldOperator:
     def refresh(self, state_aug):
         """Refresh every diagonal-mass root's inverse mass from the forest geometry."""
         solver = self.solver
-        for size, geometry_index, geometry_group in self.families:
+        for size, offset, geometry_group in self.families:
             wp.launch(
                 _diagonal_geometry,
                 dim=solver.forest.n_arts_by_size[size] * size,
@@ -542,9 +545,9 @@ class ForestHeldOperator:
                     solver.forest.group_to_art[size],
                     solver.forest.articulation_dof_start,
                     solver.factor.mass_update_mask,
-                    geometry_index,
+                    offset,
                     geometry_group,
-                    self.kinetic_state.geometric,
+                    self.kinetic_state.mass_diagonal,
                     solver.factor.R_by_size[size],
                     solver.factor.drive_row_by_dof,
                     solver.factor.aug_row_K,

@@ -303,9 +303,15 @@ class TreeKineticState:
             scratch=np.zeros(self.group_count * self.layout.total if self.layout.global_block else 1, np.float32),
         )
         groups = self.group_count
+        # Whether the group's refresh reads H's diagonal (a compact diagonal's inverse): its collection keeps H_ii.
+        self.diagonal_mass = bool(getattr(sparse_owner, "diagonal_mass", False))
         self.data = native.KineticData()
         field_group.SolverArrays(self.data, device).allocate(
-            native.KINETIC_CACHE.owned("cache"), group=groups, dof=dofs, body=bodies, entry=self.layout.entries
+            native.KINETIC_CACHE.owned("cache"),
+            group=groups,
+            dof=dofs,
+            body=bodies,
+            diagonal=dofs if self.diagonal_mass else 0,
         )
         self.data.current_valid = solver.factor.fk_id_cache_valid
         self.data.stage_clocks = cached_state_binding.stage_clocks(solver)
@@ -322,7 +328,7 @@ class TreeKineticState:
         self._classify_above = _CLASSIFIED_GRIDS * self._repair_grid
         self.data.current_valid.zero_()
         self.bias = self.data.bias
-        self.geometric = self.data.geometric
+        self.mass_diagonal = self.data.diagonal
         self.geometry_valid = self.data.geometry_valid
         self.status = self.data.status
         self._body_velocity = getattr(sparse_owner, "requires_body_velocity", False)
@@ -368,6 +374,7 @@ class TreeKineticState:
             body_velocity=self._body_velocity,
             motion_velocity=self.motion_velocity,
             clocked=self.clocked,
+            diagonal=self.diagonal_mass,
         )
         # A classified repair compares in a pass of its own over the blocks its classification
         # lists for comparison. Otherwise a second one-pass repair kernel compares inside its
@@ -385,6 +392,7 @@ class TreeKineticState:
                 body_velocity=self._body_velocity,
                 bank_coordinates=self.bank_coordinates,
                 clocked=self.clocked,
+                diagonal=self.diagonal_mass,
             )
         self.classify_kernel = self.listed_repair_kernel = None
         if self.classify_first:
@@ -397,6 +405,7 @@ class TreeKineticState:
                 body_velocity=self._body_velocity,
                 listed=True,
                 clocked=self.clocked,
+                diagonal=self.diagonal_mass,
             )
         self.finish_kernel = native.get_state_kernel(
             True,
@@ -404,6 +413,7 @@ class TreeKineticState:
             layout=layout,
             body_velocity=self._body_velocity,
             clocked=self.clocked,
+            diagonal=self.diagonal_mass,
         )
         classes = self._walk_classes()
         self.force_kernel = native.get_force_kernel(

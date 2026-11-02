@@ -909,14 +909,14 @@ class TestFeatherPGSCapturedRepair(unittest.TestCase):
                             **{field: getattr(rollout.states[0], field).numpy() for field in STATE_FIELDS},
                             "generation": _generations(owner),
                             "geometry_generation": [group.data.geometry_generation.numpy() for group in _groups(owner)],
-                            "geometric": [group.geometric.numpy() for group in _groups(owner)],
+                            "bias": [group.bias.numpy() for group in _groups(owner)],
                         }
                     )
                 for key in ("generation", "geometry_generation"):
                     for eager, replayed in zip(finals[0][key], finals[1][key], strict=True):
                         np.testing.assert_array_equal(replayed, eager, err_msg=key)
-                for eager, replayed in zip(finals[0]["geometric"], finals[1]["geometric"], strict=True):
-                    np.testing.assert_allclose(replayed, eager, rtol=0.0, atol=2e-6, err_msg="geometric")
+                for eager, replayed in zip(finals[0]["bias"], finals[1]["bias"], strict=True):
+                    np.testing.assert_allclose(replayed, eager, rtol=0.0, atol=2e-6, err_msg="bias")
                 for field in STATE_FIELDS:
                     np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=0.0, atol=2e-6, err_msg=field)
 

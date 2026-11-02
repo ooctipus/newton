@@ -6,7 +6,8 @@
 The reference route is the held tree on the general placement (:data:`.test_feather_pgs_conformance.REFERENCE_CUDA`).
 What keeps it honest is outside the solver: after a few steps of each model,
 
-- the held geometry equals the float64 mass matrix ``H`` at the step's output (:mod:`.feather_pgs_mass_reference`);
+- what the finish forms of ``H`` (the drives' ``H_ii + R_ii``, a compact diagonal's ``H_ii``) equals the float64 mass
+  matrix's at the step's output (:mod:`.feather_pgs_mass_reference`);
 - the walk (the factor) holds ``|L L^T - (H + R + K)|`` at the step's input and the response ``|A y - x|``,
   ``y = A^-1 x``;
 - the swept rows hold ``|A Y_i - J_i|``, ``Y_i = L^-T Z_i``: their whitening and the walk agree.
@@ -86,15 +87,6 @@ def _held_groups(solver):
         yield group, operator, arts
 
 
-def _physical(geometric, host) -> np.ndarray:
-    """A group's packed geometry as its symmetric physical matrix."""
-    n = host["physical"].size
-    H = np.zeros((n, n))
-    rows, cols = host["physical"][host["row"]], host["physical"][host["col"]]
-    H[rows, cols] = H[cols, rows] = geometric
-    return H
-
-
 def _block(reference, joint_q, arts) -> np.ndarray:
     """The mass matrix of the trees ``arts`` side by side."""
     blocks = [reference.mass_matrix(joint_q, int(art)) for art in arts]
@@ -123,13 +115,29 @@ def _diagonal(solver, art) -> np.ndarray:
 
 
 def check_geometry(test, evaluated, reference) -> None:
-    """The held geometry against the float64 mass matrix at the last step's output."""
-    for group, operator, arts in _held_groups(evaluated.solver):
-        geometric = group.geometric.numpy().astype(np.float64)
+    """What the finish forms of ``H`` against the float64 mass matrix at the last step's output: each drive's K-free
+    mass ``H_ii + R_ii`` (``row_H``) and a compact diagonal's ``H_ii``."""
+    solver = evaluated.solver
+    forest, factor = solver.forest, solver.factor
+    row_H, drive_rows, armature = factor.aug_row_H.numpy(), factor.drive_row_by_dof.numpy(), factor.dof_armature.numpy()
+    for group, operator, arts in _held_groups(solver):
+        kept = group.mass_diagonal.numpy().astype(np.float64) if group.diagonal_mass else None
         for index in (0, len(arts) - 1):
             H = _block(reference, evaluated.joint_q_out, arts[index])
-            error = np.abs(_physical(geometric[index], operator.host) - H).max()
-            test.assertLessEqual(error, _bound(H), f"H of group {index}, {type(operator).__name__}")
+            dofs = np.concatenate(
+                [
+                    np.arange(forest.articulation_dof_start_host[a], forest.articulation_dof_start_host[a] + n)
+                    for a in arts[index]
+                    for n in (int(forest.articulation_dof_count_host[a]),)
+                ]
+            )
+            driven = drive_rows[dofs] >= 0
+            mass = np.diag(H)[driven] + armature[dofs[driven]]
+            error = np.abs(row_H[drive_rows[dofs[driven]]] - mass).max(initial=0.0)
+            test.assertLessEqual(error, _bound(H), f"row_H of group {index}, {type(operator).__name__}")
+            if kept is not None:
+                error = np.abs(kept[index] - np.diag(H)).max()
+                test.assertLessEqual(error, _bound(H), f"H_ii of group {index}, {type(operator).__name__}")
 
 
 def check_factor(test, evaluated, reference) -> None:
