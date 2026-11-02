@@ -2435,45 +2435,42 @@ def _walk_frame(
 
 
 @wp.func
-def _walk_column(
-    walk_now: wp.array2d[float],
-    walk_data: wp.array2d[float],
-    refresh: bool,
-    dof: int,
-    column: wp.spatial_vector,
-    armature: wp.array[float],
-    drive_row_by_dof: wp.array[int],
-    row_K: wp.array[float],
-):
-    """Store coordinate ``dof``'s motion column ``s`` at its body's frame at the step's poses; on a refresh also as the
-    factor's, with what the factor adds to its diagonal (:data:`WALK_ARMATURE`, :data:`WALK_ADDED`)."""
+def _walk_column(walk_now: wp.array2d[float], dof: int, column: wp.spatial_vector):
+    """Store coordinate ``dof``'s motion column ``s`` at its body's frame at the step's poses."""
     for k in range(6):
         walk_now[dof, k] = column[k]
-    if refresh:
-        for k in range(6):
-            walk_data[dof, k] = column[k]
-        added = armature[dof]
-        walk_data[dof, WALK_ARMATURE] = added
-        row = drive_row_by_dof[dof]
-        if row >= 0:
-            if row_K[row] > 0.0:
-                added += row_K[row]
-        walk_data[dof, WALK_ADDED] = added
 
 
 _INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, by the tree's lane group (TreeWalk's, on the factor's
-    // diagonal), after walk_step_kernel's geometry left each coordinate's column with its R and R + K in data and each
-    // body's link and frame point in link. The lane feed (FEED, leaves to root) hands the chain one body at a time: a
+    // diagonal), after walk_step_kernel's geometry left each coordinate's column in now and each body's link and frame
+    // point in now_link: on a refresh they become the factor's frames. The lane feed (FEED, leaves to root) hands the chain one body at a time: a
     // lane builds each body of a batch (its spatial inertia at its frame, from the body's pose, centre of mass, mass and
     // inertia; its link offset, its path entry, its join slots and its last coordinate's record), so the chain's state
     // (the articulated inertia h, symmetric: A 6, B 9, D 6) lives in registers. Per coordinate: Is = h s, own = s . Is,
     // 1/ell = (own + R + K)^-1/2, ut = Is / ell, P0 = own + R, h -= ut ut^T. Per body: h lifted to its parent's frame,
     // [A, A X + B; ., D - X (A X + B) + B^T X] with X the skew of d (the parent's frame less the body's), carried when
     // the parent is the next joint inward, else added into the parent's join slot (joins[parent], a lane's registers
-    // on CUDA) until the chain reaches it. The chain's only stores are each coordinate's ut, 1/ell and P0.
+    // on CUDA) until the chain reaches it. The outputs leave whole: each body's link row (its lane, in the batch) and
+    // each coordinate's record (s, ut, 1/ell, P0, R, R + K: four float4, one lane), each written once.
     SYNC();
-    const float* Lk = link.data;
+    const float* Lk = now_link.data;
+    const float* Nw = now.data;
+    float* Lo = link.data;
     float* Dt = data.data;
+    const float* Ra = armature.data;
+    const int* Dr = drive_row_by_dof.data;
+    const float* Kr = row_K.data;
+    // A coordinate's column at the step's poses and what the factor adds to its diagonal, R and R + K.
+    const auto COLUMN = [&](int c, float* x) {
+        for (int k = 0; k < 6; ++k) x[k] = Nw[$now * c + k];
+        float added = Ra[c];
+        x[6] = added;
+        const int row = Dr[c];
+        if (row >= 0) {
+            if (Kr[row] > 0.0f) added += Kr[row];
+        }
+        x[7] = added;
+    };
     const int* Pt = reinterpret_cast<const int*>(path.data);
     const int* Jt = joins.data;
     const int* Ct = joint_child.data;
@@ -2488,7 +2485,11 @@ _INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, 
     const auto PREFETCH = [](const void* p) {};
     constexpr int HELD = $slots;
 #endif
-    for (int c = dof0 + LANE; c < dof1; c += LANES) PREFETCH(Dt + $coordinate * c);
+    for (int c = dof0 + LANE; c < dof1; c += LANES) {
+        PREFETCH(Nw + $now * c);
+        PREFETCH(Ra + c);
+        PREFETCH(Dr + c);
+    }
     // The join slots: lane k holds slot k on CUDA (HELD 1), the CPU's one thread every slot.
     float held[HELD][21];
     for (int s = 0; s < HELD; ++s)
@@ -2531,6 +2532,13 @@ _INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, 
                 into = up >= 0 ? Jt[j0 + up] : -1;
                 const float* Lr = Lk + $link * mine;
                 for (int k = 0; k < 3; ++k) r.w[OFFSET + k] = Lr[k];
+                // The body's link row becomes the factor's.
+#if defined(__CUDA_ARCH__)
+                reinterpret_cast<float4*>(Lo + $link * mine)[0] = reinterpret_cast<const float4*>(Lr)[0];
+                reinterpret_cast<float4*>(Lo + $link * mine)[1] = reinterpret_cast<const float4*>(Lr)[1];
+#else
+                for (int k = 0; k < $link; ++k) Lo[$link * mine + k] = Lr[k];
+#endif
                 const int b = Ct[mine];
                 const float* q = Qb + 7 * b;
                 const float* com = Cb + 3 * b;
@@ -2556,12 +2564,7 @@ _INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, 
                 for (int a = 0; a < 3; ++a)
                     for (int e = a; e < 3; ++e)
                         r.w[ROT + SYM(a, e)] = (RI[a][0] * R[e][0] + RI[a][1] * R[e][1] + RI[a][2] * R[e][2]) + mc[a] * -c[e] + (a == e ? m * cc : 0.0f);
-                if (hi > lo) {
-                    const float* d = Dt + $coordinate * (hi - 1);
-                    for (int k = 0; k < 6; ++k) r.w[RECORD + k] = d[k];
-                    r.w[RECORD + 6] = d[$armature];
-                    r.w[RECORD + 7] = d[$added];
-                }
+                if (hi > lo) COLUMN(hi - 1, r.w + RECORD);
             }
             r.w[UP] = __int_as_float(up);
             r.w[LO] = __int_as_float(lo);
@@ -2592,12 +2595,7 @@ _INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, 
             for (int dof = b_hi - 1; dof >= b_lo; --dof) {
                 // The next coordinate's record, loaded before this one stores (a body with several coordinates).
                 float next[8];
-                if (dof > b_lo) {
-                    const float* d = Dt + $coordinate * (dof - 1);
-                    for (int k = 0; k < 6; ++k) next[k] = d[k];
-                    next[6] = d[$armature];
-                    next[7] = d[$added];
-                }
+                if (dof > b_lo) COLUMN(dof - 1, next);
                 const float* A = h;
                 const float* B = h + 6;
                 const float* D = h + 15;
@@ -2618,9 +2616,20 @@ _INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, 
                 for (int k = 0; k < 6; ++k) ut[k] = Is[k] * inv;
                 if (LANE == 0) {
                     float* o = Dt + $coordinate * dof;
+#if defined(__CUDA_ARCH__)
+                    float4* o4 = reinterpret_cast<float4*>(o);
+                    o4[0] = make_float4(s[0], s[1], s[2], s[3]);
+                    o4[1] = make_float4(s[4], s[5], ut[0], ut[1]);
+                    o4[2] = make_float4(ut[2], ut[3], ut[4], ut[5]);
+                    o4[3] = make_float4(inv, own + s[6], s[6], s[7]);
+#else
+                    for (int k = 0; k < 6; ++k) o[k] = s[k];
                     for (int k = 0; k < 6; ++k) o[6 + k] = ut[k];
                     o[12] = inv;
                     o[$pivot] = own + s[6];
+                    o[$armature] = s[6];
+                    o[$added] = s[7];
+#endif
                 }
                 // h -= ut ut^T
                 for (int a = 0; a < 3; ++a)
@@ -2667,6 +2676,7 @@ def _walk_inward_snippet() -> str:
             _INWARD,
             coordinate=WALK_COORDINATE,
             link=WALK_LINK,
+            now=WALK_NOW,
             frame=WALK_FRAME,
             pivot=WALK_PIVOT,
             armature=WALK_ARMATURE,
@@ -2686,17 +2696,23 @@ def walk_inward(
     dof1: int,
     path: wp.array[wp.vec2i],
     joins: wp.array[int],
-    link: wp.array2d[float],
-    data: wp.array2d[float],
+    now: wp.array2d[float],
+    now_link: wp.array2d[float],
+    armature: wp.array[float],
+    drive_row_by_dof: wp.array[int],
+    row_K: wp.array[float],
     joint_child: wp.array[int],
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
     body_mass: wp.array[float],
     body_inertia: wp.array[wp.mat33],
+    link: wp.array2d[float],
+    data: wp.array2d[float],
 ):
     """The refresh's inward pass of the tree of joints ``[j0, j1)`` and coordinates ``[dof0, dof1)`` by its group of
-    ``lanes`` (one thread on the CPU), after :func:`walk_step_kernel`'s geometry: each coordinate's ``ut``,
-    ``1 / ell`` and ``P0``, with each body's spatial inertia built in the pass from its pose and mass properties."""
+    ``lanes`` (one thread on the CPU), after :func:`walk_step_kernel`'s geometry (``now``, ``now_link``): the factor's
+    frames (each body's ``link``) and each coordinate's whole record in ``data`` (``s``, ``ut``, ``1 / ell``, ``P0``,
+    ``R``, ``R + K``), with each body's spatial inertia built in the pass from its pose and mass properties."""
     ...
 
 
@@ -2770,16 +2786,16 @@ def walk_step_kernel(
         d0 = joint_qd_start[j]
         if kind == JointType.REVOLUTE:
             column = wp.spatial_vector(wp.vec3(0.0), wp.quat_rotate(R_a, joint_axis[d0]))
-            _walk_column(walk_now, walk_data, refresh, d0, column, armature, drive_row_by_dof, row_K)
+            _walk_column(walk_now, d0, column)
         elif kind == JointType.PRISMATIC:
             column = wp.spatial_vector(wp.quat_rotate(R_a, joint_axis[d0]), wp.vec3(0.0))
-            _walk_column(walk_now, walk_data, refresh, d0, column, armature, drive_row_by_dof, row_K)
+            _walk_column(walk_now, d0, column)
         elif kind == JointType.BALL:
             for k in range(3):
                 e = wp.vec3(0.0)
                 e[k] = 1.0
                 column = wp.spatial_vector(wp.vec3(0.0), wp.quat_rotate(R_a, e))
-                _walk_column(walk_now, walk_data, refresh, d0 + k, column, armature, drive_row_by_dof, row_K)
+                _walk_column(walk_now, d0 + k, column)
         elif free:
             first = joint_child[j0]
             origin = wp.transform_point(body_q[first], body_com[first])
@@ -2788,17 +2804,17 @@ def walk_step_kernel(
                 e[k] = 1.0
                 w = wp.quat_rotate(R_a, e)
                 column = wp.spatial_vector(w, wp.vec3(0.0))
-                _walk_column(walk_now, walk_data, refresh, d0 + k, column, armature, drive_row_by_dof, row_K)
+                _walk_column(walk_now, d0 + k, column)
                 # The factor turns a free joint about the articulation's origin: the same twist at the body's frame.
                 column = wp.spatial_vector(wp.cross(w, frame - origin), w)
-                _walk_column(walk_now, walk_data, refresh, d0 + 3 + k, column, armature, drive_row_by_dof, row_K)
+                _walk_column(walk_now, d0 + 3 + k, column)
         elif kind == JointType.D6:
             lin = joint_dof_dim[j, 0]
             ang = joint_dof_dim[j, 1]
             slide = wp.vec3(0.0)
             for k in range(lin):
                 column = wp.spatial_vector(wp.quat_rotate(R_a, joint_axis[d0 + k]), wp.vec3(0.0))
-                _walk_column(walk_now, walk_data, refresh, d0 + k, column, armature, drive_row_by_dof, row_K)
+                _walk_column(walk_now, d0 + k, column)
                 slide += joint_axis[d0 + k] * joint_q[q0 + k]
             turned = wp.quat_identity()
             for k in range(ang):
@@ -2806,13 +2822,10 @@ def walk_step_kernel(
                 w = wp.quat_rotate(R_a, axis)
                 # A turn about the pivot the slides moved, at the anchor: v = (R_a slide) x w.
                 column = wp.spatial_vector(wp.cross(wp.quat_rotate(R_a, slide), w), w)
-                _walk_column(walk_now, walk_data, refresh, d0 + lin + k, column, armature, drive_row_by_dof, row_K)
+                _walk_column(walk_now, d0 + lin + k, column)
                 turned = wp.quat_from_axis_angle(axis, joint_q[q0 + lin + k]) * turned
         for k in range(3):
             walk_now_link[j, 4 + k] = frame[k]
-        if refresh:
-            for k in range(3):
-                walk_link[j, 4 + k] = frame[k]
     # Each body's link, its parent's frame less its own, from the frame points the group just stored.
     walk_group_sync(lanes)
     for j in range(j0 + lane, j1, lanes):
@@ -2827,9 +2840,6 @@ def walk_step_kernel(
             )
         for k in range(3):
             walk_now_link[j, k] = offset[k]
-        if refresh:
-            for k in range(3):
-                walk_link[j, k] = offset[k]
     if refresh:
         walk_inward(
             lanes,
@@ -2839,11 +2849,16 @@ def walk_step_kernel(
             joint_qd_start[j1],
             walk_path,
             walk_joins,
-            walk_link,
-            walk_data,
+            walk_now,
+            walk_now_link,
+            armature,
+            drive_row_by_dof,
+            row_K,
             joint_child,
             body_q,
             body_com,
             body_mass,
             body_inertia,
+            walk_link,
+            walk_data,
         )
