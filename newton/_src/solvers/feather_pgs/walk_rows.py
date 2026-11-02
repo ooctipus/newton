@@ -1043,43 +1043,15 @@ _GENERATE = """    // The rows in generator form (WALK_MAPPING D5H, Z_UNION 1.2)
         if (key[k] >= 0 && slot_of(key[k]) < 0) mine = false;
     if (!mine) return 0;
     const int rows = unit.rows, line = unit.line, first = unit.slot, art_a = unit.art_a, art_b = unit.art_b;
-    // The seeds: body a's wrenches, body b's negated, each at its body's frame (the factor's).
     const int seed_body[2] = {key[0], key[1]}, seed_art[2] = {art_a, art_b};
     int seed_slot[2];
-    float seed[2][$rows][6];
+    unsigned long long seed_mask[2] = {0ull, 0ull};
 #pragma unroll
     for (int k = 0; k < 2; ++k) {
         seed_slot[k] = slot_of(seed_body[k]);
-        const float sign = k == 0 ? 1.0f : -1.0f;
-        const int joint = seed_slot[k] < 0 ? 0 : walk.body_joint.data[seed_body[k]];
-        const float* o = walk.link.data + (size_t)joint * $link + $frame;
-#pragma unroll
-        for (int r = 0; r < $rows; ++r) {
-            float* q = seed[k][r];
-            const float* e = unit.frame.data[r == 1 || r == 2 ? r : 0];
-            const auto& x = r == 0 ? unit.point : unit.friction_point;
-            const float f[3] = {sign * e[0], sign * e[1], sign * e[2]};
-            const float l[3] = {x[0] - o[0], x[1] - o[1], x[2] - o[2]};
-            if ($spin && r == 3) {
-                q[0] = q[1] = q[2] = 0.0f;
-                q[3] = f[0];
-                q[4] = f[1];
-                q[5] = f[2];
-            } else {
-                q[0] = f[0];
-                q[1] = f[1];
-                q[2] = f[2];
-                q[3] = l[1] * f[2] - l[2] * f[1];
-                q[4] = l[2] * f[0] - l[0] * f[2];
-                q[5] = l[0] * f[1] - l[1] * f[0];
-            }
-        }
+        if (seed_slot[k] >= 0) seed_mask[k] = sink.body_mask.data[seed_body[k]];
     }
     // The sides, as the direct walker takes them: a's tree, then b's; two seeds on one tree share its side.
-    unsigned long long seed_mask[2] = {0ull, 0ull};
-#pragma unroll
-    for (int k = 0; k < 2; ++k)
-        if (seed_slot[k] >= 0) seed_mask[k] = sink.body_mask.data[seed_body[k]];
     unsigned long long mask0 = 0ull, mask1 = 0ull;
     int art0 = -1, art1 = -1, seeds0 = 0, seeds1 = 0;
     if (art_a >= 0 && sink.response_dofs.data[art_a] > 0) {
@@ -1092,42 +1064,99 @@ _GENERATE = """    // The rows in generator form (WALK_MAPPING D5H, Z_UNION 1.2)
         if (seed_slot[1] >= 0 && seed_art[1] == art_b) mask1 = seed_mask[1], seeds1 = 2;
         if (mask1 != 0ull) art1 = art_b;
     }
+    const int base1 = COUNT(mask0), count = base1 + COUNT(mask1);
     const int row0 = line * sink.row_factor.shape[1] + first;
     float* const Z = sink.row_factor.data + (size_t)row0 * S;
     int* const D = sink.row_dof.data + (size_t)row0 * S;
     const bool explicit_dofs = support.enabled == 0;
-    float norm[$rows], cross[6];
+    // Two seeds on one side add where their paths meet: the side is cleared first and re-read for the squares.
+    const bool shared = seeds0 == 3;
+    if (shared)
+        for (int r = 0; r < rows; ++r)
+            for (int p = 0; p < base1; ++p) Z[r * S + p] = 0.0f;
+    float norm[$rows], cross[6], incident[$rows];
 #pragma unroll
-    for (int r = 0; r < $rows; ++r) norm[r] = 0.0f;
+    for (int r = 0; r < $rows; ++r) norm[r] = incident[r] = 0.0f;
 #pragma unroll
     for (int k = 0; k < 6; ++k) cross[k] = 0.0f;
-    int e = 0;
+    // One seed at a time (its wrenches in registers): body a's, then body b's negated, each at its body's frame.
+#pragma unroll 1
+    for (int k = 0; k < 2; ++k) {
+        if (seed_slot[k] < 0) continue;
+        const bool second = k == 1 && art1 >= 0;
+        const unsigned long long side_mask = second ? mask1 : mask0;
+        const int side_base = second ? base1 : 0, offset = sink.world_offset.data[second ? art1 : art0];
+        const float sign = k == 0 ? 1.0f : -1.0f;
+        const float* o = walk.link.data + (size_t)walk.body_joint.data[seed_body[k]] * $link + $frame;
+        float w[$rows][6];
 #pragma unroll
-    for (int side = 0; side < 2; ++side) {
-        const int seeds = side == 0 ? seeds0 : seeds1;
-        const int offset = (side == 0 ? art0 : art1) >= 0 ? sink.world_offset.data[side == 0 ? art0 : art1] : 0;
-        for (unsigned long long bits = side == 0 ? mask0 : mask1; bits != 0ull; bits &= bits - 1ull, ++e) {
-            const int n = FIRST(bits);
+        for (int r = 0; r < $rows; ++r) {
+            float* q = w[r];
+            const float* e = unit.frame.data[r == 1 || r == 2 ? r : 0];
+            const auto& x = r == 0 ? unit.point : unit.friction_point;
+            const float f[3] = {sign * e[0], sign * e[1], sign * e[2]};
+            if ($spin && r == 3) {
+                q[0] = q[1] = q[2] = 0.0f;
+                q[3] = f[0];
+                q[4] = f[1];
+                q[5] = f[2];
+            } else {
+                const float l[3] = {x[0] - o[0], x[1] - o[1], x[2] - o[2]};
+                q[0] = f[0];
+                q[1] = f[1];
+                q[2] = f[2];
+                q[3] = l[1] * f[2] - l[2] * f[1];
+                q[4] = l[2] * f[0] - l[0] * f[2];
+                q[5] = l[0] * f[1] - l[1] * f[0];
+            }
+        }
+        const float* Gk = GAMMA + seed_slot[k] * SLOT;
+#pragma unroll
+        for (int r = 0; r < $rows; ++r) {
+            const float* g = Gk + 6 * PATHS;
+            incident[r] += (g[0] * w[r][0] + g[1] * w[r][1] + g[2] * w[r][2]) + (g[3] * w[r][3] + g[4] * w[r][4] + g[5] * w[r][5]);
+        }
+        // The seed's entries, its path in rank order (Gamma's rows), at their ranks in the side's support.
+        int t = 0;
+        for (unsigned long long bits = seed_mask[k]; bits != 0ull; bits &= bits - 1ull, ++t) {
+            const int n = FIRST(bits), e = side_base + COUNT(side_mask & ((1ull << n) - 1ull));
+            const float* G = Gk + t;
+            const float g0 = G[0], g1 = G[PATHS], g2 = G[2 * PATHS], g3 = G[3 * PATHS], g4 = G[4 * PATHS];
+            const float g5 = G[5 * PATHS];
             float z[$rows];
 #pragma unroll
-            for (int r = 0; r < $rows; ++r) z[r] = 0.0f;
-#pragma unroll
-            for (int k = 0; k < 2; ++k) {
-                if (((seeds >> k) & 1) == 0 || ((seed_mask[k] >> n) & 1ull) == 0ull) continue;
-                const float* G = GAMMA + seed_slot[k] * SLOT + COUNT(seed_mask[k] & ((1ull << n) - 1ull));
-                const float g0 = G[0], g1 = G[PATHS], g2 = G[2 * PATHS], g3 = G[3 * PATHS], g4 = G[4 * PATHS];
-                const float g5 = G[5 * PATHS];
-#pragma unroll
-                for (int r = 0; r < $rows; ++r) {
-                    const float* v = seed[k][r];
-                    z[r] += (g0 * v[0] + g1 * v[1] + g2 * v[2]) + (g3 * v[3] + g4 * v[4] + g5 * v[5]);
-                }
+            for (int r = 0; r < $rows; ++r) {
+                const float* v = w[r];
+                z[r] = (g0 * v[0] + g1 * v[1] + g2 * v[2]) + (g3 * v[3] + g4 * v[4] + g5 * v[5]);
+                if (r >= rows) continue;
+                if (shared)
+                    Z[r * S + e] += z[r];
+                else
+                    Z[r * S + e] = z[r];
+                if (explicit_dofs) D[r * S + e] = offset + n;
             }
+            if (shared) continue;
+#pragma unroll
+            for (int r = 0; r < $rows; ++r) norm[r] += z[r] * z[r];
+            if ($rows >= 3) {
+                cross[0] += z[0] * z[1];
+                cross[1] += z[0] * z[2];
+                cross[2] += z[1] * z[2];
+            }
+            if ($rows >= 4) {
+                cross[3] += z[0] * z[$last];
+                cross[4] += z[1] * z[$last];
+                cross[5] += z[2] * z[$last];
+            }
+        }
+    }
+    if (shared) {
+        // Two seeds on one side: the squares and the Gram of the rows as written.
+        for (int p = 0; p < count; ++p) {
+            float z[$rows];
 #pragma unroll
             for (int r = 0; r < $rows; ++r) {
-                if (r >= rows) continue;
-                Z[r * S + e] = z[r];
-                if (explicit_dofs) D[r * S + e] = offset + n;
+                z[r] = r < rows ? Z[r * S + p] : 0.0f;
                 norm[r] += z[r] * z[r];
             }
             if ($rows >= 3) {
@@ -1144,7 +1173,7 @@ _GENERATE = """    // The rows in generator form (WALK_MAPPING D5H, Z_UNION 1.2)
     }
     // The pad past the support.
     for (int r = 0; r < rows; ++r)
-        for (int p = e; p < S; ++p) {
+        for (int p = count; p < S; ++p) {
             Z[r * S + p] = 0.0f;
             if (explicit_dofs) D[r * S + p] = -1;
         }
@@ -1152,16 +1181,8 @@ _GENERATE = """    // The rows in generator form (WALK_MAPPING D5H, Z_UNION 1.2)
 #pragma unroll
     for (int r = 0; r < $rows; ++r) {
         if (r >= rows) continue;
-        float incident = 0.0f;
-#pragma unroll
-        for (int k = 0; k < 2; ++k) {
-            if (seed_slot[k] < 0) continue;
-            const float* g = GAMMA + seed_slot[k] * SLOT + 6 * PATHS;
-            const float* v = seed[k][r];
-            incident += (g[0] * v[0] + g[1] * v[1] + g[2] * v[2]) + (g[3] * v[3] + g[4] * v[4] + g[5] * v[5]);
-        }
         sink.diag.data[row0 + r] = norm[r] + sink.row_cfm.data[row0 + r];
-        sink.row_incident.data[row0 + r] = incident;
+        sink.row_incident.data[row0 + r] = incident[r];
     }
     if (!explicit_dofs) {
         const auto side_of = [&](int body, int art) {
