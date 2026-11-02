@@ -2017,7 +2017,7 @@ class WalkClass:
         Args:
             joint: Body ``$b``'s joint to its parent: ``$V`` from ``$P`` root first, ``$V`` into ``$P`` leaf first.
             step: Coordinate ``$c`` of body ``$b`` on its state ``$V``.
-            begin: Body ``$b``'s statements before its coordinates, on ``$V``.
+            begin: Body ``$b``'s statements before its coordinates, on ``$V`` (``$up`` its parent, -1 at a root).
             end: Body ``$b``'s statements after its coordinates, on ``$V``.
             root_first: The walk's direction.
             width: Floats of a body's state.
@@ -2071,7 +2071,7 @@ class WalkClass:
                 return out + (fetch(order[k + depth]) if k + depth < len(order) else [])
 
             def body_text(b, state):
-                out = [_fill(begin, b=b, V=state)] if begin else []
+                out = [_fill(begin, b=b, V=state, up=self.parent[b])] if begin else []
                 for c in coordinates_of(b):
                     out += take(("x", c))
                     out.append(_fill(step, b=b, c=c, V=state, X=f"walk_x{c}"))
@@ -2186,7 +2186,7 @@ class WalkClass:
             else:
                 head = [gather]
             if begin:
-                head.append(_fill(begin, b="b", V="V"))
+                head.append(_fill(begin, b="b", V="V", up=f"{name}_PARENT[b]"))
             lines.append(f"if (({name}_STEP[at] >> 16) & 1) {{\n{indent_text(chr(10).join(head), 4)}\n}}")
             lines.append(f"if (c >= 0) {{\n{indent_text(_fill(step, b='b', c='c', V='V', **names), 4)}\n}}")
             tail = [_fill(end, b="b", V="V")] if end else []
@@ -2901,8 +2901,9 @@ _REFRESH = """    // The refresh's arithmetic on one tree, float32 (TreeWalk's i
     // now_link: on a refresh they become the factor's frames. A schedule (the lane feed's batches, or a thread a tree
     // with the class's topology compiled in) runs it leaf first; the chain's state is the articulated inertia h,
     // symmetric (A 00 01 02 11 12 22, B row-major 3x3, D 00 01 02 11 12 22), in registers.
-    //   BODY(j, r): body j's inertia at its frame [m 1, -m X; m X, R I R^T - m X X] (X the skew of c, its centre of
-    //     mass less its frame) as words m, m c, rot, and its link offset d; its link row becomes the factor's.
+    //   BODY(j, up, r): body j's inertia at its frame [m 1, -m X; m X, R I R^T - m X X] (X the skew of c, its centre of
+    //     mass less its frame) as words m, m c, rot, and its link offset d (WALK_OFFSET from its parent's frame point,
+    //     up's, and its own); its link row (d, its frame point) becomes the factor's.
     //   ADD(h, r): h += body r's inertia.
     //   STEP(h, s, c): coordinate c of column s (s 6, R, R + K): Is = h s, own = s . Is, 1/ell = (own + R + K)^-1/2,
     //     ut = Is / ell, P0 = own + R, h -= ut ut^T; its record (s, ut, 1/ell, P0, R, R + K) leaves whole, once.
@@ -2949,14 +2950,22 @@ _REFRESH = """    // The refresh's arithmetic on one tree, float32 (TreeWalk's i
         PREFETCH(Ib + 9 * b + 8);
         PREFETCH(Lk + $link * j);
     };
-    const auto BODY = [&](int j, float* r) {
+    // WALK_OFFSET(p, f, d): a body's link offset d, its parent's frame point p (null at a root) less its own f: the
+    // one place a walk forms it from the frame points the finish published.
+    const auto WALK_OFFSET = [](const float* p, const float* f, float* d) {
+        for (int k = 0; k < 3; ++k) d[k] = p != nullptr ? p[k] - f[k] : 0.0f;
+    };
+    const auto BODY = [&](int j, int up, float* r) {
         const float* Lr = Lk + $link * j;
-        for (int k = 0; k < 3; ++k) r[OFFSET + k] = Lr[k];
+        float offset[3];
+        WALK_OFFSET(up >= 0 ? Lk + $link * up + $frame : nullptr, Lr + $frame, offset);
+        for (int k = 0; k < 3; ++k) r[OFFSET + k] = offset[k];
 #if defined(__CUDA_ARCH__)
-        reinterpret_cast<float4*>(Lo + $link * j)[0] = reinterpret_cast<const float4*>(Lr)[0];
+        reinterpret_cast<float4*>(Lo + $link * j)[0] = make_float4(offset[0], offset[1], offset[2], Lr[3]);
         reinterpret_cast<float4*>(Lo + $link * j)[1] = reinterpret_cast<const float4*>(Lr)[1];
 #else
-        for (int k = 0; k < $link; ++k) Lo[$link * j + k] = Lr[k];
+        for (int k = 0; k < 3; ++k) Lo[$link * j + k] = offset[k];
+        for (int k = 3; k < $link; ++k) Lo[$link * j + k] = Lr[k];
 #endif
         const int b = Ct[j];
         const float* q = Qb + 7 * b;
@@ -3105,7 +3114,7 @@ _INWARD = (
                 hi = mine + 1 < j1 ? dof0 + Pt[2 * (mine + 1) + 1] : dof1;
                 slot = Jt[mine];
                 into = up >= 0 ? Jt[j0 + up] : -1;
-                BODY(mine, r.w);
+                BODY(mine, up >= 0 ? j0 + up : -1, r.w);
                 if (hi > lo) COLUMN(hi - 1, r.w + RECORD);
             }
             r.w[UP] = __int_as_float(up);
@@ -3152,7 +3161,7 @@ _INWARD_CLASS_JOINT = """{
     for (int k = 0; k < 21; ++k) $P[k] += $V[k];
 }"""
 _INWARD_CLASS_BEGIN = """float body$b[INERTIA];
-BODY(j0 + $b, body$b);
+BODY(j0 + $b, $up >= 0 ? j0 + $up : -1, body$b);
 ADD($V, body$b, true);"""
 _INWARD_CLASS_STEP = """{
     float s[8];

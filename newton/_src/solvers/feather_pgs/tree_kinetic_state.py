@@ -1424,19 +1424,6 @@ def get_state_kernel(
         """Publish each body's pose and twist with its bias wrench and moments."""
         for local in range(g.lane, bodies, g.stride):
             body = data.joint_child[g.js + local]
-            if data.walk_now_link.shape[0] > 0:
-                # The walk's link at the step's poses: the parent's frame less the body's, from the frame points the
-                # motion stage stored.
-                joint = g.js + local
-                parent = plan.parent[local]
-                for k in range(3):
-                    offset = float(0.0)
-                    if parent >= 0:
-                        offset = (
-                            data.walk_now_link[g.js + parent, wp.static(WALK_FRAME) + k]
-                            - data.walk_now_link[joint, wp.static(WALK_FRAME) + k]
-                        )
-                    data.walk_now_link[joint, k] = offset
             if wp.static(forest):
                 origin = _load_origin(g.address, 2 * plan.root_of[local])
                 shift = _load_origin(g.address, 2 * plan.root_of[local] + 1)
