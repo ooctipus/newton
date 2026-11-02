@@ -2648,9 +2648,6 @@ def get_force_kernel(schedules: HeldSchedules, *, layout: TreeLayout = REFERENCE
     return _tiled(layout, name, _predictor_params(response), source)
 
 
-WALK_SOLVE_UNROLL = 0
-"""Coordinates up to which the walk's solve emits straight-line code: none (see :func:`get_walk_solve_kernel`)."""
-
 _WALK_SOLVE = r"""    const int group = tid / $ROOT_COUNT, r = tid - group * $ROOT_COUNT;
     if (group >= groups) return;
     const int art = p.group_to_art.data[group];
@@ -2667,7 +2664,7 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
     walk up of ``trial.force`` into registers and the walk down into ``trial.response``, ``P^T L^-T L^-1 P f`` on the
     all-``K`` walk. A prescribed root responds with zero."""
     from .kernel_template import THREADS  # noqa: PLC0415
-    from .tree_factor import WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude  # noqa: PLC0415
+    from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_UNROLL, WalkTrees, walk_down_prelude  # noqa: PLC0415
 
     walked = {r: k for r, _, k in _walked(layout, classes)}
     cases = []
@@ -2687,7 +2684,7 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
                 "const float* __restrict__ x = trial.force.data + d0;\n"
                 "float* __restrict__ out = trial.response.data + d0;\n"
                 f"float u[{max(cls.coordinates, 1)}];\n"
-                + walk_up(cls, WALK_SOLVE_UNROLL, None)
+                + walk_up(cls, WALK_UNROLL, None)
                 + f"\nWALK_DOWN({walked[r]}, data, link, [&](const int c) {{ return u[c]; }},"
                 " [](const int) -> float { return 0.0f; }, [&](const int c, const float q, const float) { out[c] = q; },"
                 " [](const int, const float*) {});"
@@ -2707,7 +2704,7 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
         ),
         source,
         THREADS,
-        preludes=(walk_down_prelude(walked_classes, WALK_SOLVE_UNROLL),) if walked_classes else (),
+        preludes=(walk_down_prelude(walked_classes, WALK_UNROLL),) if walked_classes else (),
         dual=True,
         native_name="tree_kinetic_walk_native",
     ).kernel()
