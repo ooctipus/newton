@@ -1573,16 +1573,16 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
     const auto WALK_UP = [&](const float* data, const float* link, const float* now, const float* now_link, int body,
                              int top, float* p, float* w, auto&& sink) {
         for (int b = body; b >= 0; b = WALK_PARENT_OF(b)) {
-            const float* l = link + $link * b;
+$link_b
             for (int c = b == body ? top : WALK_FIRST_OF(b + 1) - 1; c >= WALK_FIRST_OF(b); --c) {
-                const float* d = data + $coordinate * c;
+$record_c
                 // The step's column at the factor's frame: its linear part shifted there from the step's frame, its
                 // angular part as is (the frames read at each coordinate, so no register holds them across the walk;
                 // once for every row).
-                const float* S = now != nullptr ? now + $now * c : d;
+$column_c
                 float e0 = 0.0f, e1 = 0.0f, e2 = 0.0f;
                 if (now != nullptr) {
-                    const float* f = now_link + $nowlink * b + $nowframe;
+$point_b
                     const float o0 = l[$frame] - f[0], o1 = l[$frame + 1] - f[1], o2 = l[$frame + 2] - f[2];
                     e0 = S[0] + (S[4] * o2 - S[5] * o1);
                     e1 = S[1] + (S[5] * o0 - S[3] * o2);
@@ -1627,7 +1627,7 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
     // velocity limit's), on the states p: z = (x + s_c . p) / ell_c, its J entry x[r]. WALK_UP continues from c - 1 of
     // c's body.
     const auto WALK_SEED = [&](const float* data, int c, const float* x, float* p, auto&& sink) {
-        const float* d = data + $coordinate * c;
+$record_seed
         for (int r = 0; r < $rows; ++r) {
             float* q = p + 6 * r;
             const float z = (x[r] + ((d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) + (d[3] * q[3] + d[4] * q[4] + d[5] * q[5])))
@@ -1644,7 +1644,7 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
             return;
         }
         const float* W = twist + 6 * up;
-        const float* l = link + $link * b;
+$link_twist
         V[0] = W[0] + (l[1] * W[5] - l[2] * W[4]);
         V[1] = W[1] + (l[2] * W[3] - l[0] * W[5]);
         V[2] = W[2] + (l[0] * W[4] - l[1] * W[3]);
@@ -1659,7 +1659,7 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
             float V[6];
             WALK_PARENT_TWIST(link, twist, b, V);
             for (int c = WALK_FIRST_OF(b); c < WALK_FIRST_OF(b + 1); ++c) {
-                const float* d = data + $coordinate * c;
+$record_enter
                 u[c] = qd[c] / d[12] + ((d[6] * V[0] + d[7] * V[1] + d[8] * V[2])
                                         + (d[9] * V[3] + d[10] * V[4] + d[11] * V[5]));
                 for (int k = 0; k < 6; ++k) V[k] += d[k] * qd[c];
@@ -1728,6 +1728,86 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
     };"""
 
 
+_WALK_LOADS = """#ifndef WALK_LOAD_RECORD
+// The walk's field groups and their loads, the one place the device layout lives (WALK_COORDINATE, WALK_LINK,
+// WALK_NOW): a coordinate's record, 16 floats as four aligned float4 (s 6, ut 6, 1 / ell, P0, R, R + K); a body's link,
+// two float4 (its offset to its parent's frame, its frame point); a step column, 6 floats as three float2; a step
+// link's frame point, one float4. Each fills a register array, one read-only vector load (LDG.128, the global path;
+// no walk writes them while a reader runs) a field group.
+#if defined(__CUDA_ARCH__)
+#define WALK_LOAD_RECORD(d, p)                                                                                  \
+    {                                                                                                          \
+        const float4* walk_q_ = reinterpret_cast<const float4*>(p);                                             \
+        const float4 walk_a_ = __ldg(walk_q_), walk_b_ = __ldg(walk_q_ + 1), walk_c_ = __ldg(walk_q_ + 2), walk_e_ = __ldg(walk_q_ + 3);   \
+        d[0] = walk_a_.x; d[1] = walk_a_.y; d[2] = walk_a_.z; d[3] = walk_a_.w;                                \
+        d[4] = walk_b_.x; d[5] = walk_b_.y; d[6] = walk_b_.z; d[7] = walk_b_.w;                                \
+        d[8] = walk_c_.x; d[9] = walk_c_.y; d[10] = walk_c_.z; d[11] = walk_c_.w;                              \
+        d[12] = walk_e_.x; d[13] = walk_e_.y; d[14] = walk_e_.z; d[15] = walk_e_.w;                            \
+    }
+#define WALK_LOAD_LINK(l, p)                                                                                    \
+    {                                                                                                          \
+        const float4* walk_q_ = reinterpret_cast<const float4*>(p);                                             \
+        const float4 walk_a_ = __ldg(walk_q_), walk_b_ = __ldg(walk_q_ + 1);                                                \
+        l[0] = walk_a_.x; l[1] = walk_a_.y; l[2] = walk_a_.z; l[3] = walk_a_.w;                                \
+        l[4] = walk_b_.x; l[5] = walk_b_.y; l[6] = walk_b_.z; l[7] = walk_b_.w;                                \
+    }
+#define WALK_LOAD_COLUMN(S, p)                                                                                  \
+    {                                                                                                          \
+        const float2* walk_q_ = reinterpret_cast<const float2*>(p);                                             \
+        const float2 walk_a_ = __ldg(walk_q_), walk_b_ = __ldg(walk_q_ + 1), walk_c_ = __ldg(walk_q_ + 2);                          \
+        S[0] = walk_a_.x; S[1] = walk_a_.y; S[2] = walk_b_.x; S[3] = walk_b_.y; S[4] = walk_c_.x; S[5] = walk_c_.y; \
+    }
+#define WALK_LOAD_POINT(f, p)                                                                                   \
+    {                                                                                                          \
+        const float4 walk_a_ = __ldg(reinterpret_cast<const float4*>(p));                                             \
+        f[0] = walk_a_.x; f[1] = walk_a_.y; f[2] = walk_a_.z; f[3] = walk_a_.w;                                \
+    }
+#else
+#define WALK_LOAD_RECORD(d, p) { for (int walk_k_ = 0; walk_k_ < 16; ++walk_k_) d[walk_k_] = (p)[walk_k_]; }
+#define WALK_LOAD_LINK(l, p) { for (int walk_k_ = 0; walk_k_ < 8; ++walk_k_) l[walk_k_] = (p)[walk_k_]; }
+#define WALK_LOAD_COLUMN(S, p) { for (int walk_k_ = 0; walk_k_ < 6; ++walk_k_) S[walk_k_] = (p)[walk_k_]; }
+#define WALK_LOAD_POINT(f, p) { for (int walk_k_ = 0; walk_k_ < 4; ++walk_k_) f[walk_k_] = (p)[walk_k_]; }
+#endif
+#endif"""
+
+
+def _walk_loads(coordinate: int, link: int, now: int) -> dict[str, str]:
+    """The shared walk text's loads (``_WALK``'s ``$record_*``, ``$link_*``, ``$column_c``, ``$point_b`` slots) for a
+    layout: the device layout's field groups by their vector loads (:data:`_WALK_LOADS`), a kernel's staged copy of it
+    (another stride, in shared memory) by pointer."""
+    device = (coordinate, link, now) == (WALK_COORDINATE, WALK_LINK, WALK_NOW)
+
+    def record(indent):
+        pad = " " * indent
+        if device:
+            return f"{pad}float d[{WALK_COORDINATE}];\n{pad}WALK_LOAD_RECORD(d, data + {WALK_COORDINATE} * c);"
+        return f"{pad}const float* d = data + {coordinate} * c;"
+
+    def body_link(indent):
+        pad = " " * indent
+        if link == WALK_LINK:
+            return f"{pad}float l[{WALK_LINK}];\n{pad}WALK_LOAD_LINK(l, link + {WALK_LINK} * b);"
+        return f"{pad}const float* l = link + {link} * b;"
+
+    if device:
+        column = (
+            "                float S[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};\n"
+            f"                if (now != nullptr) WALK_LOAD_COLUMN(S, now + {WALK_NOW} * c);"
+        )
+    else:
+        column = f"                const float* S = now != nullptr ? now + {now} * c : d;"
+    point = f"                    float f[4];\n                    WALK_LOAD_POINT(f, now_link + {WALK_LINK} * b + {WALK_FRAME});"
+    return {
+        "record_c": record(16),
+        "record_seed": record(8),
+        "record_enter": record(16),
+        "link_b": body_link(12),
+        "link_twist": body_link(8),
+        "column_c": column,
+        "point_b": point,
+    }
+
+
 @functools.cache
 def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int) -> DevicePrelude:
     """The device walk of a class of trees (one tree, or a world's forest), for both devices: a prelude declaring
@@ -1758,15 +1838,16 @@ def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int) -> 
         "parent": ", ".join(str(b) for b in parent),
         "first": ", ".join(str(c) for c in first),
     }
-    walk = substitute(
-        _WALK,
-        rows=rows,
-        coordinate=WALK_COORDINATE,
-        link=WALK_LINK,
-        now=WALK_NOW,
-        frame=WALK_FRAME,
-        nowlink=WALK_LINK,
-        nowframe=WALK_FRAME,
+    walk = (
+        _WALK_LOADS
+        + "\n"
+        + substitute(
+            _WALK,
+            rows=rows,
+            now=WALK_NOW,
+            frame=WALK_FRAME,
+            **_walk_loads(WALK_COORDINATE, WALK_LINK, WALK_NOW),
+        )
     )
     return DevicePrelude(
         f"walk_{rows}_{len(parent)}",
@@ -1796,17 +1877,16 @@ def walk_paths_prelude(
     if rows < 1:
         raise ValueError(f"a lane walks at least one row, got {rows}")
     walk = (
-        _WALK_PATHS
+        _WALK_LOADS
+        + "\n"
+        + _WALK_PATHS
         + "\n"
         + substitute(
             _WALK,
             rows=rows,
-            coordinate=coordinate,
-            link=link,
             now=now,
             frame=frame,
-            nowlink=WALK_LINK,
-            nowframe=WALK_FRAME,
+            **_walk_loads(coordinate, link, now),
         )
     )
     layout = (coordinate, link, now, frame)
