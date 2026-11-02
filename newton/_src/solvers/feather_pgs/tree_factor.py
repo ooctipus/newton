@@ -1778,7 +1778,6 @@ _WALK_LOADS = """#ifndef WALK_LOAD_RECORD
 // two float4 (its offset to its parent's frame, its frame point); a step column, 6 floats as three float2; a step
 // link's frame point, one float4. Each fills a register array, one read-only vector load (LDG.128, the global path;
 // no walk writes them while a reader runs) a field group.
-#if defined(__CUDA_ARCH__)
 #define WALK_LOAD_RECORD(d, p)                                                                                  \
     {                                                                                                          \
         const float4* walk_q_ = reinterpret_cast<const float4*>(p);                                             \
@@ -1806,13 +1805,15 @@ _WALK_LOADS = """#ifndef WALK_LOAD_RECORD
         const float4 walk_a_ = __ldg(reinterpret_cast<const float4*>(p));                                             \
         f[0] = walk_a_.x; f[1] = walk_a_.y; f[2] = walk_a_.z; f[3] = walk_a_.w;                                \
     }
-#else
+#endif"""
+
+_WALK_LOADS_CPU = """#ifndef WALK_LOAD_RECORD
 #define WALK_LOAD_RECORD(d, p) { for (int walk_k_ = 0; walk_k_ < 16; ++walk_k_) d[walk_k_] = (p)[walk_k_]; }
 #define WALK_LOAD_LINK(l, p) { for (int walk_k_ = 0; walk_k_ < 8; ++walk_k_) l[walk_k_] = (p)[walk_k_]; }
 #define WALK_LOAD_COLUMN(S, p) { for (int walk_k_ = 0; walk_k_ < 6; ++walk_k_) S[walk_k_] = (p)[walk_k_]; }
 #define WALK_LOAD_POINT(f, p) { for (int walk_k_ = 0; walk_k_ < 4; ++walk_k_) f[walk_k_] = (p)[walk_k_]; }
-#endif
 #endif"""
+"""The CPU twin of :data:`_WALK_LOADS`: each prelude carries its device's text under the snippet's one guard."""
 
 
 def _walk_loads(coordinate: int, link: int, now: int) -> dict[str, str]:
@@ -1882,22 +1883,18 @@ def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int) -> 
         "parent": ", ".join(str(b) for b in parent),
         "first": ", ".join(str(c) for c in first),
     }
-    walk = (
-        _WALK_LOADS
-        + "\n"
-        + substitute(
-            _WALK,
-            rows=rows,
-            now=WALK_NOW,
-            frame=WALK_FRAME,
-            batch=WALK_SLIP_BATCH,
-            **_walk_loads(WALK_COORDINATE, WALK_LINK, WALK_NOW),
-        )
+    walk = substitute(
+        _WALK,
+        rows=rows,
+        now=WALK_NOW,
+        frame=WALK_FRAME,
+        batch=WALK_SLIP_BATCH,
+        **_walk_loads(WALK_COORDINATE, WALK_LINK, WALK_NOW),
     )
     return DevicePrelude(
         f"walk_{rows}_{len(parent)}",
-        substitute(_WALK_TABLE, table) + "\n" + walk,
-        cpu=substitute(_WALK_TABLE_CPU, table) + "\n" + walk,
+        _WALK_LOADS + "\n" + substitute(_WALK_TABLE, table) + "\n" + walk,
+        cpu=_WALK_LOADS_CPU + "\n" + substitute(_WALK_TABLE_CPU, table) + "\n" + walk,
     )
 
 
@@ -1922,9 +1919,7 @@ def walk_paths_prelude(
     if rows < 1:
         raise ValueError(f"a lane walks at least one row, got {rows}")
     walk = (
-        _WALK_LOADS
-        + "\n"
-        + _WALK_PATHS
+        _WALK_PATHS
         + "\n"
         + substitute(
             _WALK,
@@ -1939,7 +1934,7 @@ def walk_paths_prelude(
     name = f"walk_paths_{rows}" + (
         "" if layout == (WALK_COORDINATE, WALK_LINK, WALK_NOW, WALK_FRAME) else f"_{coordinate}_{link}_{now}_{frame}"
     )
-    return DevicePrelude(name, walk, cpu=walk)
+    return DevicePrelude(name, _WALK_LOADS + "\n" + walk, cpu=_WALK_LOADS_CPU + "\n" + walk)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
