@@ -756,7 +756,7 @@ def chain_walk(device, lowers) -> WalkTrees:
     """The walk (:class:`.tree_factor.WalkTrees`) of chains whose factors are the given leaf-first ``L`` (one an
     articulation, their coordinates one after another): body ``c`` holds coordinate ``c`` (a chain of at most six),
     ``s_c = e_c``, ``ut_c[k] = A[c, k]`` below the diagonal and ``1 / ell_c = 1 / A[c, c]`` (:func:`walk_factor`), its
-    links zero, and the step's columns the factor's, so a wrench seed's ``J`` is its first coordinates' components and
+    links and frames zero, and the step's motion columns the factor's, so a wrench seed's ``J`` is its first coordinates' components and
     a covector's footprints and the leave are ``A^-T`` and ``A^-1``. No tree slips."""
     factors = [walk_factor(lower) for lower in lowers]
     sizes = [A.shape[0] for A in factors]
@@ -785,8 +785,8 @@ def chain_walk(device, lowers) -> WalkTrees:
     walk.data = wp.array(data, dtype=wp.float32, device=device)
     walk.link = wp.zeros((total, WALK_LINK), dtype=wp.float32, device=device)
     walk.path = wp.array(path, dtype=wp.vec2i, device=device)
-    walk.now = wp.array(now, dtype=wp.float32, device=device)
-    walk.now_link = wp.zeros((total, WALK_LINK), dtype=wp.float32, device=device)
+    walk.motion = wp.array(now, dtype=wp.spatial_vector, device=device)
+    walk.origin = wp.zeros(len(factors), dtype=wp.vec3, device=device)
     walk.scratch = wp.zeros(total, dtype=wp.spatial_vector, device=device)
     walk.joint_start, walk.joint_end = ints(start[:-1]), ints(start[1:])
     walk.dof_start, walk.dofs = ints(start[:-1]), ints(sizes)

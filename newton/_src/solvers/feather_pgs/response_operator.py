@@ -1049,7 +1049,7 @@ class WalkedRows:
     def _walk(self) -> str:
         """``TIER_WALK``: one seed of row ``i`` on the world's tree ``side`` (:func:`.tree_factor.walk_into`'s walk), its
         footprints added at the tree's world coordinates and its ``J`` entries against ``s_v`` into ``incident``."""
-        from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_NOW  # noqa: PLC0415
+        from .tree_factor import WALK_COORDINATE, WALK_LINK  # noqa: PLC0415
 
         return f"""const auto TIER_WALK = [&](const int side, const int body, const int k, const float* seed) {{
     const int art = side == 0 ? art_a : art_b, offset = side == 0 ? {self.primary_offset} : {self.secondary_offset};
@@ -1057,8 +1057,9 @@ class WalkedRows:
     WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), walk.joint_end.data[art] - j0, walk.dofs.data[art]);
     const float* data = walk.data.data + (size_t)d0 * {WALK_COORDINATE};
     const float* link = walk.link.data + (size_t)j0 * {WALK_LINK};
-    const float* now = walk.now.data + (size_t)d0 * {WALK_NOW};
-    const float* now_link = walk.now_link.data + (size_t)j0 * {WALK_LINK};
+    // The step's geometry: the finish's motion columns about the articulation's origin.
+    const float* now = reinterpret_cast<const float*>(walk.motion.data + d0);
+    const float* origin = reinterpret_cast<const float*>(walk.origin.data + art);
     const auto sink = [&](int, int c, float z, float j) {{
         Zi[(offset + c) * ZS] += z;
         incident += j * s_v[offset + c];
@@ -1071,7 +1072,7 @@ class WalkedRows:
         top = k - 1;
         now = nullptr;
     }}
-    WALK_UP(data, link, now, now_link, body, top, p, w, sink);
+    WALK_UP(data, link, now, origin, body, top, p, w, sink);
 }};"""
 
     def _sides(self) -> tuple[tuple[int, int, str], ...]:
@@ -1633,20 +1634,22 @@ class LocalBlock(ResidualBlock):
     @property
     def coordinate_floats(self) -> int:
         """Staged floats a coordinate: ``s``, ``ut``, ``1 / ell`` (:data:`.tree_factor.WALK_COORDINATE`'s first 13),
-        then with ``wrenches`` its step column (:data:`.tree_factor.WALK_NOW`)."""
+        then with ``wrenches`` the finish's motion column (:data:`.tree_factor.WALK_NOW`)."""
         from .tree_factor import WALK_NOW, WALK_STAGED  # noqa: PLC0415 (tree_factor imports this module)
 
         return WALK_STAGED + (WALK_NOW if self.wrenches else 0)
 
     @property
     def link_floats(self) -> int:
-        """Staged floats a body: its offset to its parent's frame, then with ``wrenches`` the same at the step's
-        poses."""
+        """Staged floats a body: its offset to its parent's frame, then with ``wrenches`` its frame point (the factor's,
+        where the step's motion columns are shifted)."""
         return 6 if self.wrenches else 3
 
     def walk_floats(self) -> int:
-        """Floats a lane group stages of the walk: every coordinate's, then every primary body's."""
-        return self.dofs * self.coordinate_floats + self.bodies * self.link_floats if self.staged else 0
+        """Floats a lane group stages of the walk: every coordinate's, then every primary body's (and with
+        ``wrenches`` the free body's)."""
+        free = 1 if self.wrenches and self.secondary else 0
+        return self.dofs * self.coordinate_floats + (self.bodies + free) * self.link_floats if self.staged else 0
 
     def walk_ints(self) -> int:
         """Ints a lane group stages: the primary's path table, the free body's entry, each primary coordinate's body."""
@@ -1659,7 +1662,7 @@ class LocalBlock(ResidualBlock):
 
         if self.staged:
             return walk_paths_prelude(
-                1, coordinate=self.coordinate_floats, link=self.link_floats, now=self.coordinate_floats
+                1, coordinate=self.coordinate_floats, link=self.link_floats, now=self.coordinate_floats, frame=3
             )
         return walk_paths_prelude(1)
 
@@ -1670,7 +1673,7 @@ class LocalBlock(ResidualBlock):
         the walk's functions; and with ``seeds`` the row seeds' walks a lane runs into ``s_Z`` (``walk_covector`` and,
         with ``wrenches``, ``walk_wrench``: each returns its incident velocity, the step's ``J`` entries against the
         staged velocity)."""
-        from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_NOW, WALK_STAGED  # noqa: PLC0415 (tree_factor imports this module)
+        from .tree_factor import WALK_COORDINATE, WALK_FRAME, WALK_LINK, WALK_STAGED  # noqa: PLC0415 (tree_factor imports this module)
 
         P, S, L = self.primary, self.secondary, self.lanes.width
         lane = self.lanes.lane
@@ -1692,8 +1695,8 @@ class LocalBlock(ResidualBlock):
                 lines.append("const int* walk_dof_body = walk.dof_body.data + walk_d0;")
             if self.wrenches and self.seeds:
                 lines += [
-                    f"const float* walk_now = walk.now.data + (size_t)walk_d0 * {WALK_NOW};",
-                    f"const float* walk_now_link = walk.now_link.data + (size_t)walk_j0 * {WALK_LINK};",
+                    "const float* walk_now = reinterpret_cast<const float*>(walk.motion.data + walk_d0);",
+                    "const float* walk_origin = reinterpret_cast<const float*>(walk.origin.data + art);",
                 ]
             if S:
                 lines += [
@@ -1702,26 +1705,28 @@ class LocalBlock(ResidualBlock):
                     "const int* free_path = reinterpret_cast<const int*>(walk.path.data + free_j0);",
                 ]
                 if self.wrenches and self.seeds:
-                    lines.append(f"const float* free_now = walk.now.data + (size_t)free_d0 * {WALK_NOW};")
+                    lines += [
+                        "const float* free_now = reinterpret_cast<const float*>(walk.motion.data + free_d0);",
+                        "const float* free_origin = reinterpret_cast<const float*>(walk.origin.data + secondary_art);",
+                    ]
         else:
             C, K, B = self.coordinate_floats, self.link_floats, self.bodies
             coordinate = "walk_d0 + c" if not S else f"c < {P} ? walk_d0 + c : free_d0 + c - {P}"
             column = (
                 f"k < {WALK_STAGED} ? walk.data.data[(size_t)d * {WALK_COORDINATE} + k] "
-                f": walk.now.data[(size_t)d * {WALK_NOW} + k - {WALK_STAGED}]"
+                f": reinterpret_cast<const float*>(walk.motion.data + d)[k - {WALK_STAGED}]"
                 if self.wrenches
                 else f"walk.data.data[(size_t)d * {WALK_COORDINATE} + k]"
             )
             offset = (
-                f"k < 3 ? walk.link.data[(size_t)(walk_j0 + b) * {WALK_LINK} + k] "
-                f": walk.now_link.data[(size_t)(walk_j0 + b) * {WALK_LINK} + k - 3]"
+                f"walk.link.data[(size_t)(walk_j0 + b) * {WALK_LINK} + (k < 3 ? k : {WALK_FRAME} + k - 3)]"
                 if self.wrenches
                 else f"walk.link.data[(size_t)(walk_j0 + b) * {WALK_LINK} + k]"
             )
             lines += [
                 "// The walk's data of the world's trees staged once (FL3_design section 4), every load in flight together:",
-                "// each coordinate's s, ut and 1 / ell (and its step column), each body's link offset (and at the step's",
-                "// poses), the path tables and each primary coordinate's body.",
+                "// each coordinate's s, ut and 1 / ell (and the finish's motion column), each body's link offset (and its",
+                "// frame point), the path tables and each primary coordinate's body.",
                 f"for (int i = {lane}; i < {self.dofs * C}; i += {L}) {{",
                 f"    const int c = i / {C}, k = i - c * {C};",
                 f"    const int d = {coordinate};",
@@ -1746,7 +1751,7 @@ class LocalBlock(ResidualBlock):
             if self.wrenches:
                 lines += [
                     f"const float* walk_now = s_walk + {WALK_STAGED};",
-                    "const float* walk_now_link = walk_link + 3;",
+                    "const float* walk_origin = reinterpret_cast<const float*>(walk.origin.data + art);",
                 ]
             if S:
                 lines += [
@@ -1755,7 +1760,14 @@ class LocalBlock(ResidualBlock):
                     f"const int* free_path = s_walk_path + {2 * B};",
                 ]
                 if self.wrenches:
-                    lines.append(f"const float* free_now = free_data + {WALK_STAGED};")
+                    # The free body's own link: its frame point, where its motion columns are shifted.
+                    lines += [
+                        f"for (int k = {lane}; k < {K}; k += {L})",
+                        f"    s_walk[{self.dofs * C + B * K} + k] = walk.link.data[(size_t)free_j0 * {WALK_LINK} + (k < 3 ? k : {WALK_FRAME} + k - 3)];",
+                        f"const float* free_now = free_data + {WALK_STAGED};",
+                        f"free_link = s_walk + {self.dofs * C + B * K};",
+                        "const float* free_origin = reinterpret_cast<const float*>(walk.origin.data + secondary_art);",
+                    ]
         lines.append(f"const auto walk_primary = [&]() {{ WALK_TREE(walk_path, walk_bodies, {P}); }};")
         if S:
             lines.append(f"const auto walk_free = [&]() {{ WALK_TREE(free_path, 1, {S}); }};")
@@ -1770,20 +1782,20 @@ class LocalBlock(ResidualBlock):
                 "        incident += j * s_v[c];",
                 "    };",
                 "    WALK_SEED(walk_data, dof, x, p, sink);",
-                "    WALK_UP(walk_data, walk_link, nullptr, walk_link, walk_dof_body[dof], dof - 1, p, w, sink);",
+                "    WALK_UP(walk_data, walk_link, nullptr, nullptr, walk_dof_body[dof], dof - 1, p, w, sink);",
                 "    return incident;",
                 "};",
             ]
             if self.wrenches:
                 lines += [
-                    "// A wrench seed at body b's walk frame at the step's poses, walked into the footprints z of a tree",
-                    "// (data, link, now, now_link: its walk; v its staged velocity); its incident.",
+                    "// A wrench seed at body b's walk frame (the factor's), walked into the footprints z of a tree (data,",
+                    "// link, now, origin: its walk and the finish's motion columns; v its staged velocity); its incident.",
                     "const auto walk_wrench = [&](float* z, const float* v, const float* data, const float* link,",
-                    "                             const float* now, const float* now_link, const int b,",
+                    "                             const float* now, const float* origin, const int b,",
                     "                             const float* wrench) -> float {",
                     "    float p[6], w[6], incident = 0.0f;",
                     "    for (int k = 0; k < 6; ++k) p[k] = w[k] = wrench[k];",
-                    "    WALK_UP(data, link, now, now_link, b, WALK_FIRST_OF(b + 1) - 1, p, w, [&](int, int c, float y, float j) {",
+                    "    WALK_UP(data, link, now, origin, b, WALK_FIRST_OF(b + 1) - 1, p, w, [&](int, int c, float y, float j) {",
                     "        z[c] += y;",
                     "        incident += j * v[c];",
                     "    });",

@@ -125,7 +125,7 @@ def _row_source(*, layout, patch=False, weighted=False, torsion=False):
     A prefix row's key ``~(2 d + side)`` gives its seed, the covector ``+-e_d`` on the tree holding world coordinate
     ``d``. A contact row takes its geometry, frame, target and materials from the contact laws and its rhs from the row
     laws (:data:`ROW_PRELUDES`); its seed on each body of a tree of the world is the wrench of its direction at its row
-    point, ``(d, (p - o) x d)`` at the body's frame ``o`` at the step's poses (the spin row's ``(0, n)``), the second
+    point, ``(d, (p - o) x d)`` at the body's frame ``o`` (the factor's; the spin row's ``(0, n)``), the second
     body's negated. No Jacobian is formed.
     ``patch`` writes the persistent patch row law: tangent rows act at the patch friction location for both the
     seed and the prescribed target, carry the anchor's tangential phi and correct it with ``patch_law.beta``;
@@ -150,13 +150,13 @@ def _row_source(*, layout, patch=False, weighted=False, torsion=False):
     """
     spin = "r == 3" if torsion else "false"
     seeds = f"""
-        // Each body's seed on its tree of the world: the row's wrench at the body's frame at the step's poses.
+        // Each body's seed on its tree of the world: the row's wrench at the body's frame (the factor's).
         for (int end = 0; end < 2; ++end) {{
             const int body = end == 0 ? ba : bb, art = end == 0 ? aa : ab;
             const int side = art >= 0 && art == art_a ? 0 : (art >= 0 && art == art_b ? 1 : -1);
             if (body < 0 || side < 0) continue;
             const int joint = walk.body_joint.data[body];
-            const float* o = walk.now_link.data + (size_t)joint * {WALK_LINK} + {WALK_FRAME};
+            const float* o = walk.link.data + (size_t)joint * {WALK_LINK} + {WALK_FRAME};
             const float sign = end == 0 ? 1.0f : -1.0f;
             const float d0 = sign * direction[0], d1 = sign * direction[1], d2 = sign * direction[2];
             const float r0 = row_point[0] - o[0], r1 = row_point[1] - o[1], r2 = row_point[2] - o[2];

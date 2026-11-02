@@ -9,12 +9,13 @@ producer records with the row's slot and records, in place of a Jacobian. After 
 row of a world on the world's lanes (:func:`walked_rows_kernel`):
 
 - **the seed**, from the row's law (:data:`.dense_rows.UNIT_CONTACT` and the other kinds): a contact row's wrench on
-  each of its bodies, ``(d, (p - o) x d)`` at the body's frame ``o`` at the step's poses (its spin row's ``(0, n)``),
+  each of its bodies, ``(d, (p - o) x d)`` at the body's frame ``o`` (the factor's; its spin row's ``(0, n)``),
   the second body's negated; a link row's unit wrench at its two pieces' centres of mass, the shadow's negated; a joint
   limit's and a velocity limit's covector ``+-e_c``, a mimic's ``e_f - c e_l``;
 - **the walk** (:func:`.tree_factor.walk_paths_prelude`): each seed walked up its root path into the packed sink at its
-  side's entries, stored, a second seed on one tree adding where their paths meet. A wrench enters as ``J`` at the
-  step's frames (:meth:`.tree_factor.TreeFactor.walk_step`) and the refresh's factor whitens it, so a step between
+  side's entries, stored, a second seed on one tree adding where their paths meet. A wrench enters as the step's ``J``,
+  the finish's motion columns shifted to the walk's frames (:attr:`.tree_factor.WalkTrees.motion`), and the refresh's
+  factor whitens it, so a step between
   refreshes whitens the step's ``J`` by the held factor, as the dense rows do. A free rigid body is a one-body tree:
   its side is a six-step walk;
 - **the header**: the diagonal ``|z|^2 + cfm`` (the walks' sums of squares, or the row's entries where two seeds share
@@ -57,7 +58,6 @@ from .dense_rows import (
     MfRows,
     RowSupport,
     jacobian_row,
-    unit_source,
 )
 from .device_preludes import DevicePrelude, dual_native, lane_group, substitute
 from .field_group import Field
@@ -66,7 +66,7 @@ from .kernel_template import THREADS, KernelTemplate, python_kernel
 from .kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT, free_body_contact, free_body_contact_records, row_bias
 from .projection_laws import friction_pair_metric
 from .response_builds_rows import close_block, close_row, free_body_row_header
-from .row_build import write_contact_records, write_contact_row
+from .row_build import write_contact_records
 from .row_laws import LINK_ROWS
 from .solver_fields import Preelim
 from .sparse_mass_matrix import _SparseRowSupport
@@ -74,10 +74,10 @@ from .tree_factor import (
     WALK_COORDINATE,
     WALK_FRAME,
     WALK_LINK,
-    WALK_NOW,
     WalkRelease,
     WalkTrees,
     release_path,
+    walk_covector_into,
     walk_into,
     walk_prelude,
 )
@@ -131,13 +131,13 @@ def walk_wrench(
 @wp.func
 def body_wrench(walk: WalkTrees, body: int, direction: wp.vec3, point: wp.vec3, torque: bool) -> wp.spatial_vector:
     """The seed of a row acting on ``body`` along ``direction`` at ``point`` (a pure ``torque`` about it), by the
-    contact law (:func:`.contact_laws.contact_seed`, :func:`.contact_laws.spin_seed`): a wrench at the body's frame at
-    the step's poses (:attr:`.tree_factor.WalkTrees.now_link`), where the walk's columns ``now`` hold the step's
+    contact law (:func:`.contact_laws.contact_seed`, :func:`.contact_laws.spin_seed`): a wrench at the body's frame, the
+    factor's (:attr:`.tree_factor.WalkTrees.link`), where the walk shifts the finish's motion columns to take the step's
     ``J``. The lever arm is the world points' difference here; the law takes it from wherever it is formed."""
     if torque:
         return spin_seed(direction)
     j = walk.body_joint[body]
-    frame = wp.vec3(walk.now_link[j, 4], walk.now_link[j, 5], walk.now_link[j, 6])
+    frame = wp.vec3(walk.link[j, 4], walk.link[j, 5], walk.link[j, 6])
     return contact_seed(direction, point - frame)
 
 
@@ -160,14 +160,13 @@ def walk_body(
     j0 = walk.joint_start[art]
     return walk_into(
         walk,
+        art,
         j0,
         walk.dof_start[art],
         walk.joint_end[art] - j0,
         walk.dofs[art],
         walk.body_joint[body] - j0,
         wrench,
-        -1,
-        0.0,
         v_hat,
         add,
         sink,
@@ -201,14 +200,13 @@ def walk_covector(
     d0 = walk.dof_start[art]
     j0 = walk.joint_start[art]
     at = jacobian_row(support, group, art, sides)
-    return walk_into(
+    return walk_covector_into(
         walk,
         j0,
         d0,
         walk.joint_end[art] - j0,
         walk.dofs[art],
         walk.dof_body[dof],
-        wp.spatial_vector(),
         dof - d0,
         value,
         v_hat,
@@ -344,14 +342,13 @@ def free_body_headers_kernel(
             k = int(0)
             if mf.Z_a[line, i, 3] != 0.0:
                 k = 3
-            seed = walk_into(
+            seed = walk_covector_into(
                 walk,
                 j0,
                 d0,
                 walk.joint_end[art] - j0,
                 walk.dofs[art],
                 walk.dof_body[d0 + k],
-                wp.spatial_vector(),
                 k,
                 1.0,
                 v_hat,
@@ -653,7 +650,6 @@ def writer_kernel(solver) -> wp.Kernel:
     return walked_rows_kernel(blocks, bool(blocks and solver.options.enable_bilateral_preelimination))
 
 
-
 # ---------------------------------------------------------------------------------------------------------------------
 # The support placement (case K1, FL3.4): the support sink, a lane per unit, the release and the leave
 # ---------------------------------------------------------------------------------------------------------------------
@@ -744,8 +740,8 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
         }
         const float* data = walk.data.data + (size_t)d0 * $coordinate;
         const float* link = walk.link.data + (size_t)j0 * $link;
-        const float* now = walk.now.data + (size_t)d0 * $now;
-        const float* now_link = walk.now_link.data + (size_t)j0 * $link;
+        const float* now = reinterpret_cast<const float*>(walk.motion.data + d0);
+        const float* origin = reinterpret_cast<const float*>(walk.origin.data + art);
         const float* vh = sink.v_hat.data + d0;
         const auto rank = [&](int c) -> int { return base + POPC(mask & ((1ull << SUPPORT_NODE[c]) - 1ull)); };
         const auto store = [&](int r, int c, float z, float) {
@@ -773,7 +769,7 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                     for (int e = base; e < rank(c); ++e) Z[e] = 0.0f;
                 for (int i = 0; i < 6 * $rows; ++i) p[i] = w[i] = 0.0f;
                 WALK_SEED(data, c, x, p, store);
-                WALK_UP(data, link, nullptr, now_link, walk.dof_body.data[d0 + c], c - 1, p, w, store);
+                WALK_UP(data, link, nullptr, nullptr, walk.dof_body.data[d0 + c], c - 1, p, w, store);
                 incident[0] += x[0] * vh[c];
             }
         } else {
@@ -782,8 +778,9 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                 if (body < 0 || (k == 0 ? art_a : art_b) != art) continue;
                 const float sign = k == 0 ? 1.0f : -1.0f;
                 const int j = walk.body_joint.data[body];
-                // The seeds' wrenches at the body's frame at the step's poses, where the walk's columns are J's.
-                const float* o = walk.now_link.data + (size_t)j * $link + $frame;
+                const int local = j - j0;
+                // The seeds' wrenches at the body's frame (the factor's), where the walk's shifted columns are J's.
+                const float* o = walk.link.data + (size_t)j * $link + $frame;
                 for (int r = 0; r < $rows; ++r) {
                     float* q = p + 6 * r;
                     const float* d = unit.frame.data[r == 1 || r == 2 ? r : 0];
@@ -812,8 +809,7 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                     if (r < rows) incident[r] += j * vh[c];
                     store(r, c, z, j);
                 };
-                const int local = j - j0;
-                WALK_UP(data, link, now, now_link, local, WALK_FIRST_OF(local + 1) - 1, p, w, sink);
+                WALK_UP(data, link, now, origin, local, WALK_FIRST_OF(local + 1) - 1, p, w, sink);
             }
         }
         // A slipping tree's release (the predictor's border), root-most slip first, on the side's entries along each
@@ -911,7 +907,7 @@ _SPIN_TAIL = """        record[4] = cross[3];
 
 _GENERATE = """    // The rows in generator form (WALK_MAPPING D5H, Z_UNION 1.2), a world's lane group over a batch of its units, every
     // lane calling: rows seeded on one body share its generator Gamma (path x 6), the walk of the six unit wrenches at
-    // the body's frame at the step's poses (the held step included: the walk is linear in its seed), so a row is
+    // the body's frame (the factor's; the held step included: the walk is linear in its seed), so a row is
     // z = Gamma w, 6 FMA an entry. 1. Every lane reads the batch's contact units by shuffles and keeps the same table:
     // the bodies that carry at least two units take a slot, the most loaded first (lane order on a tie), at most $slots
     // a world (the carveout's budget). 2. Six lanes a slot walk the unit wrenches into Gamma ([6][$paths] in shared
@@ -1008,8 +1004,8 @@ _GENERATE = """    // The rows in generator form (WALK_MAPPING D5H, Z_UNION 1.2)
         const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
         const float* data = walk.data.data + (size_t)d0 * $coordinate;
         const float* link = walk.link.data + (size_t)j0 * $link;
-        const float* now = walk.now.data + (size_t)d0 * $now;
-        const float* now_link = walk.now_link.data + (size_t)j0 * $link;
+        const float* now = reinterpret_cast<const float*>(walk.motion.data + d0);
+        const float* origin = reinterpret_cast<const float*>(walk.origin.data + art);
         const float* vh = sink.v_hat.data + d0;
         float* G = GAMMA + f * SLOT + k * PATHS;
         const auto rank = [&](int c) -> int { return COUNT(mask & ((1ull << SUPPORT_NODE[c]) - 1ull)); };
@@ -1021,7 +1017,7 @@ _GENERATE = """    // The rows in generator form (WALK_MAPPING D5H, Z_UNION 1.2)
             incident += j * vh[c];
         };
         const int local = walk.body_joint.data[body] - j0;
-        WALK_UP(data, link, now, now_link, local, WALK_FIRST_OF(local + 1) - 1, p, w, put);
+        WALK_UP(data, link, now, origin, local, WALK_FIRST_OF(local + 1) - 1, p, w, put);
         GAMMA[f * SLOT + 6 * PATHS + k] = incident;
         // The release along each slip's path, leaf first, on the column's entries (off the mask: zero, skipped).
         const int slips = release.count.data[art];
@@ -1066,7 +1062,7 @@ _GENERATE = """    // The rows in generator form (WALK_MAPPING D5H, Z_UNION 1.2)
             at[0][c] = READ(unit.point[c], u);
             at[1][c] = READ(unit.friction_point[c], u);
         }
-        // The seeds: body a's wrenches, body b's negated, each at its body's frame at the step's poses.
+        // The seeds: body a's wrenches, body b's negated, each at its body's frame (the factor's).
         const int seed_body[2] = {key_a, key_b}, seed_art[2] = {art_a, art_b};
         int seed_slot[2];
         float seed[2][$rows][6];
@@ -1074,8 +1070,9 @@ _GENERATE = """    // The rows in generator form (WALK_MAPPING D5H, Z_UNION 1.2)
         for (int k = 0; k < 2; ++k) {
             seed_slot[k] = slot_of(seed_body[k]);
             const float sign = k == 0 ? 1.0f : -1.0f;
+            // The seed at its body's frame (the factor's).
             const int joint = seed_slot[k] < 0 ? 0 : walk.body_joint.data[seed_body[k]];
-            const float* o = walk.now_link.data + (size_t)joint * $link + $frame;
+            const float* o = walk.link.data + (size_t)joint * $link + $frame;
 #pragma unroll
             for (int r = 0; r < $rows; ++r) {
                 float* q = seed[k][r];
@@ -1244,7 +1241,6 @@ def _generate_snippet(parent: tuple, first: tuple, node: tuple, rows: int, recor
         last=rows - 1,
         coordinate=WALK_COORDINATE,
         link=WALK_LINK,
-        now=WALK_NOW,
         frame=WALK_FRAME,
         spin=int(spin),
         sums=f"SUM({sums});",
@@ -1272,7 +1268,6 @@ def _support_snippet(parent: tuple, first: tuple, node: tuple, rows: int, record
         last=rows - 1,
         coordinate=WALK_COORDINATE,
         link=WALK_LINK,
-        now=WALK_NOW,
         frame=WALK_FRAME,
         spin=int(spin),
         record=record,
