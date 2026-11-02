@@ -7,8 +7,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs.sweep_routes_diag import sparse_diagonal_kernel
-from newton.tests.feather_pgs_law_harness import row_velocity
-from newton.tests.test_feather_pgs_response_diagonal import _diagonal_walk, _leave
+from newton.tests.feather_pgs_law_harness import diagonal_walk, leave_walk, row_velocity
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "contact batch screening requires CUDA")
@@ -112,7 +111,7 @@ class TestWideContactBatches(unittest.TestCase):
         results = []
         for batch in (False, True):
             arrays = []
-            walk = _diagonal_walk(np.ones((worlds, width), np.float32), device, dofs)
+            walk = diagonal_walk(np.ones((worlds, width), np.float32), device, dofs)
             for value in host:
                 if isinstance(value, str):
                     arrays.append(walk)
@@ -125,7 +124,7 @@ class TestWideContactBatches(unittest.TestCase):
                 capacity, dofs, width, str(device.arch), contact_triples=True, speculative_contact_batches=batch
             )
             wp.launch_tiled(kernel, dim=[worlds], inputs=arrays[:28], outputs=arrays[28:], block_dim=32, device=device)
-            _leave(walk, arrays[30], device)
+            leave_walk(walk, arrays[30], device)
             results.append([arrays[i].numpy() for i in (6, 28, 29, 30)])
         for reference, candidate in zip(*results, strict=True):
             np.testing.assert_allclose(candidate, reference, rtol=2.0e-5, atol=2.0e-6)

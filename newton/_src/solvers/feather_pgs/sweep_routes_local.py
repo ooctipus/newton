@@ -572,7 +572,6 @@ def paired_factor_source(
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
-    walk: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the paired factor sweep: a world's rows in the factor coordinates of its articulation and
     free body (:class:`.FactorRows`), a warp per world, the velocity change from the predictor, ``u = L^T dv``, from
@@ -587,9 +586,9 @@ def paired_factor_source(
     ``independent_components`` a world whose signed free-body row count is negative solves only its articulation's
     coordinates (its free body's rows run in the matrix-free sweep).
 
-    With ``walk`` (a class whose placement walks its rows, :mod:`.walk_rows`) the velocity change in the walk's
-    coordinates goes to the step's one leave (:attr:`.tree_factor.WalkTrees.du`, :func:`.tree_factor.walk_leave_kernel`),
-    which walks each component's tree down in the rows' frame.
+    The rows are the walk's (:mod:`.walk_rows`): the velocity change in the walk's coordinates goes to the step's one
+    leave (:attr:`.tree_factor.WalkTrees.du`, :func:`.tree_factor.walk_leave_kernel`), which walks each component's
+    tree down in the rows' frame.
 
     Returns the body and its staging.
     """
@@ -606,8 +605,8 @@ def paired_factor_source(
     op = FactorRows(
         D,
         (
-            FactorComponent(P, "primary_offset", "primary_lane", "primary_L", "primary_matrix_base"),
-            FactorComponent(S, "secondary_offset", "secondary_lane", "secondary_L", "secondary_matrix_base"),
+            FactorComponent(P, "primary_offset", "primary_lane"),
+            FactorComponent(S, "secondary_offset", "secondary_lane"),
         ),
         lanes,
         diagonal=lambda row: f"s_diag[{row}]",
@@ -671,12 +670,7 @@ def paired_factor_source(
         mu_load = f"""
     for (int contact = lane; contact < contact_count; contact += 32)
         s_contact_mu[contact] = world_row_mu.data[off + contact_start + contact * {stride} + 1];"""
-    leave = f"""    // Back to physical coordinates, dv = L^-T u per component.
-{op.leave("physical_output", "    ")}
-    if ({write}) v_out.data[global_dof] += physical_output;
-    for (int i = lane; i < m; i += 32) world_impulses.data[off + i] = s_lam[i];"""
-    if walk:
-        leave = f"""    for (int i = lane; i < m; i += 32) world_impulses.data[off + i] = s_lam[i];
+    leave = f"""    for (int i = lane; i < m; i += 32) world_impulses.data[off + i] = s_lam[i];
     // The velocity change in the walk's coordinates, each lane's coordinate, to the step's one leave
     // (tree_factor.walk_leave_kernel), which walks each component's tree down in the rows' frame.
     if ({write}) walk.du.data[global_dof] += {op.velocity};"""
@@ -962,11 +956,9 @@ def paired_factor_kernel(
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
-    walk: bool = False,
 ) -> wp.Kernel:
     """The paired factor sweep kernel; weighted rows' and material contacts' operands (:func:`.sweep.weight_arguments`,
-    :func:`.sweep.material_arguments`), a readout's operand and, with ``walk``, the walk's view and each world's two
-    articulations follow ``v_out``."""
+    :func:`.sweep.material_arguments`), a readout's operand and the walk's view follow ``v_out``."""
     snippet, staging = paired_factor_source(
         max_constraints,
         max_world_dofs,
@@ -979,7 +971,6 @@ def paired_factor_kernel(
         solve_policy=solve_policy,
         weighted=weighted,
         material=material,
-        walk=walk,
     )
     staging.check("the paired factor sweep", arch_budget(device_arch))
     name = (
@@ -990,10 +981,10 @@ def paired_factor_kernel(
         + ("_weighted" if weighted else "")
         + ("_material" if material else "")
         + ("_torsion" if torsion else "")
-        + ("_walk" if walk else "")
+        + "_walk"
         + solve_policy.suffix
     )
-    walked = (RowArgument("walk", WalkTrees),) if walk else ()
+    walked = (RowArgument("walk", WalkTrees),)
     return KernelTemplate.from_abi(
         name,
         PAIRED_FACTOR_ABI,

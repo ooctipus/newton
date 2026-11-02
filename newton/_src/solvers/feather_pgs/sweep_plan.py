@@ -1196,8 +1196,6 @@ class Sweep:
                 contact_units=self.factor_coordinate_contact_units,
                 weighted=self.laws.set.weighted,
                 torsion=self.laws.contact_torsion_enabled,
-                # The rows the one writer walked add their change to the walk's du: the step's one leave walks it.
-                walk=bool(self.placement.walks),
             )
             if self.paired_factor_coordinates
             else None
@@ -1378,8 +1376,6 @@ class Sweep:
                 "max_row_dofs": self.placement.packed_support,
                 "seeded": self.seeded,
                 "wide_rows": self.placement.packed_dense == packed_rows.WIDE,
-                # The rows the one writer walked add their change to the walk's du: the step's one leave walks it.
-                "walk": bool(self.placement.walks),
             }
             mf_gs_shape = (
                 self.placement.dense_max_constraints,

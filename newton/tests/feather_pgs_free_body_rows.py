@@ -20,6 +20,7 @@ import warp as wp
 from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT, BodyFactors
 from newton._src.solvers.feather_pgs.tree_factor import unpack_walk_records
+from newton.tests.feather_pgs_law_harness import chain_walk
 
 
 def free_body_jacobians(solver, Z_a=None, Z_b=None):
@@ -120,6 +121,8 @@ def sweep_free_body_rows(
         "mf_row_mu": per_row(mu),
         "mf_row_w": per_row(np.ones(rows) if weights is None else weights),
         "factors": factors,
+        # The body's unit factor as a walk: the sweep adds its change into walk.du, which no row reads back.
+        "walk": chain_walk(device, [np.eye(6)]),
         "iterations": int(iterations),
         "omega": 1.0,
         "regularize": int(regularize),

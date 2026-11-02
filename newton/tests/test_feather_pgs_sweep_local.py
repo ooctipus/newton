@@ -17,7 +17,6 @@ from pathlib import Path
 
 from newton._src.solvers.feather_pgs import row_packets, sweep_routes_local
 from newton._src.solvers.feather_pgs.response_operator import (
-    CholeskySolve,
     FactorComponent,
     FactorRows,
     FreeBodyZ,
@@ -224,24 +223,6 @@ class TestPairedFactorRoute(unittest.TestCase):
 class TestResponseOperators(unittest.TestCase):
     """The operators the two routes add: the local response block and the factor-coordinate rows."""
 
-    def test_reciprocal_cholesky_multiplies_by_the_staged_inverse_diagonal(self):
-        solve = CholeskySolve(3, "s_L", reciprocal=True, ascending=True)
-        staged = solve.stage(lambda i: f"L[{i}]", "lane", 32)
-        # The reciprocals take a loop of their own: the copy's loads carry no division.
-        self.assertIn("if (i % 4 != 0) (s_L)[i] = L[(i)];", staged)
-        self.assertIn("(s_L)[i * 4] = factor != 0.0f ? 1.0f / factor : 0.0f;", staged)
-        out = lambda i: f"x[{i}]"  # noqa: E731
-        # The leaf-first factor: factor row ``row`` writes the vector's physical position ``3 - 1 - row``.
-        self.assertIn("x[(3-1-(row))]=value*diagonal;", solve.whiten(out, out))
-        transposed = solve.leave(out, out)
-        self.assertIn("for(int step=0;step<3;++step)", transposed)
-        self.assertIn("const int row=3-1-step;", transposed)
-        self.assertNotIn("1.0f / factor", CholeskySolve(3, "s_L").stage(lambda i: f"L[{i}]", "lane", 32))
-        # Entering factor coordinates with the staged reciprocal divides the diagonal term by it (a zero gives zero).
-        entered = solve.enter(out, out)
-        self.assertIn("float value=(s_L)[row*3+row]!=0.0f?x[(3-1-(row))]/(s_L)[row*3+row]:0.0f;", entered)
-        self.assertIn("for(int k=row+1;k<3;++k)", entered)
-
     def test_local_block_views_and_packed_entries(self):
         block = LocalBlock(
             15,
@@ -304,7 +285,7 @@ class TestResponseOperators(unittest.TestCase):
             self.assertFalse(hasattr(source, "leave"))
 
     def test_factor_rows_fuse_a_pair_ladder(self):
-        rows = FactorRows(23, (FactorComponent(17, "o", "l", "L", "b"),), Lanes(32), diagonal=lambda r: f"s_diag[{r}]")
+        rows = FactorRows(23, (FactorComponent(17, "o", "l"),), Lanes(32), diagonal=lambda r: f"s_diag[{r}]")
         rhs = lambda r: f"s_rhs[{r}]"  # noqa: E731
         fused = rows.pair_terms("i", "sib", rhs, "", own=True)
         self.assertIn("SUM(residual, residual_terms, sibling_residual, sibling_residual_terms, cross);", fused)
@@ -315,10 +296,8 @@ class TestResponseOperators(unittest.TestCase):
         self.assertIn("factor_velocity += row_z * d;", rows.apply("d", ""))
         self.assertIn("factor_velocity += sibling_z * d;", rows.apply_row("sib", "d", ""))
         self.assertIn("const int l = lane - o;", rows.lanes_of("")[0])
-        # Leaving runs the factor's back substitution on the lanes: no explicit inverse.
-        leave = rows.leave("out", "")
-        self.assertIn("value -= L.data[b + ((17-1-(s))) * 17 + ((17-1-(l)))] * x;", leave)
-        self.assertIn("const float x = READ(out, source);", leave)
+        # No leave on the lanes: the change goes to the step's one leave.
+        self.assertFalse(hasattr(rows, "leave"))
 
 
 def _kernel_sass():

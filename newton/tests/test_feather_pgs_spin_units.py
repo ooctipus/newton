@@ -24,7 +24,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_TORSION,
 )
-from newton.tests.feather_pgs_law_harness import row_lines
+from newton.tests.feather_pgs_law_harness import diagonal_walk, leave_walk, row_lines
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices
 
 WORLDS, CONTACTS, PRIMARY, SECONDARY = 8, 3, 7, 6
@@ -66,7 +66,8 @@ def _fixture(rng):
 
 
 def _solve(fixture, schedule, device, iterations):
-    """Run the paired factor sweep with spin rows under ``schedule``; return the impulses and velocity."""
+    """Run the paired factor sweep with spin rows under ``schedule`` and the step's leave of its change (identity
+    factors: a unit diagonal walk, :func:`.diagonal_walk`); return the impulses and velocity."""
     kernel = sweep_routes_local.paired_factor_kernel(
         CAPACITY, DOFS, PRIMARY, SECONDARY, str(device.arch), torsion=True, **schedule
     )
@@ -77,7 +78,6 @@ def _solve(fixture, schedule, device, iterations):
             dtype = wp.int32 if value.dtype == np.int32 else wp.float32
         return wp.array(value, dtype=dtype, device=device)
 
-    eye = lambda n: np.repeat(np.eye(n, dtype=np.float32)[None], WORLDS, axis=0)  # noqa: E731
     values = {
         "world_count": WORLDS,
         "world_constraint_count": array(np.full(WORLDS, CAPACITY, np.int32)),
@@ -95,8 +95,9 @@ def _solve(fixture, schedule, device, iterations):
         "world_row_parent": array(fixture["parents"]),
         "world_row_mu": array(fixture["mu"]),
         "world_mf_constraint_count": array(np.zeros(WORLDS, np.int32)),
-        "primary_L": array(eye(PRIMARY)),
-        "secondary_L": array(eye(SECONDARY)),
+        # The held factors' arrays, which the walk's sweep does not read.
+        "primary_L": wp.zeros((1, 1, 1), dtype=wp.float32, device=device),
+        "secondary_L": wp.zeros((1, 1, 1), dtype=wp.float32, device=device),
         "primary_group_by_world": array(np.arange(WORLDS, dtype=np.int32)),
         "secondary_group_by_world": array(np.arange(WORLDS, dtype=np.int32)),
         "primary_offset_by_world": array(np.zeros(WORLDS, np.int32)),
@@ -104,10 +105,12 @@ def _solve(fixture, schedule, device, iterations):
         "iterations": iterations,
         "omega": 1.0,
         "v_out": array(fixture["velocity"].copy()),
+        "walk": diagonal_walk(np.ones((WORLDS, DOFS), np.float32), device),
     }
     arguments = [values[name] for name in inspect.signature(kernel.func).parameters]
     blocks = (WORLDS + 1) // 2
     wp.launch_tiled(kernel, dim=[blocks], inputs=arguments, block_dim=64, device=device)
+    leave_walk(values["walk"], values["v_out"], device)
     return values["world_impulses"].numpy(), values["v_out"].numpy()
 
 

@@ -875,6 +875,42 @@ def chain_walk(device, lowers) -> WalkTrees:
     return walk
 
 
+def diagonal_walk(inverse, device, dofs=None, offsets=None):
+    """The walk of each world's dense articulation whose mass matrix is diagonal, ``H = diag(1 / inverse[w])``, as the
+    step's one leave walks it (:func:`.tree_factor.walk_leave_kernel`, :func:`leave_walk`): world ``w``'s articulation
+    ``w`` at its world's ``offsets[w]`` of ``dofs`` coordinates (global coordinate ``w dofs + d``), a chain of one
+    coordinate a body whose columns and lifts are zero, so ``WALK_DOWN`` leaves ``u_c / ell_c = u_c sqrt(m_c^-1)``.
+    Returns its :class:`.tree_factor.WalkTrees`."""
+    inverse = np.asarray(inverse, np.float32)
+    worlds, n = inverse.shape
+    dofs = n if dofs is None else int(dofs)
+    offsets = np.zeros(worlds, np.int32) if offsets is None else np.asarray(offsets, np.int32)
+    first = (np.arange(worlds) * dofs + offsets).astype(np.int32)
+    walk = WalkTrees()
+    root = np.zeros(worlds * dofs, np.float32)
+    for world in range(worlds):
+        root[first[world] : first[world] + n] = np.sqrt(inverse[world])
+    zero = np.zeros((worlds * dofs, 6), np.float32)
+    walk.data = wp.array(pack_walk_records(zero, zero, root, np.zeros(worlds * dofs)), device=device)
+    walk.link = wp.zeros((worlds * n, WALK_LINK), dtype=wp.float32, device=device)
+    path = np.stack([np.arange(n) - 1, np.arange(n)], axis=1).astype(np.int32)
+    walk.path = wp.array(np.tile(path, (worlds, 1)), dtype=wp.vec2i, device=device)
+    walk.scratch = wp.zeros(worlds * n, dtype=wp.spatial_vector, device=device)
+    starts = (np.arange(worlds) * n).astype(np.int32)
+    walk.joint_start = wp.array(starts, device=device)
+    walk.joint_end = wp.array(starts + n, device=device)
+    walk.dof_start = wp.array(first, device=device)
+    walk.dofs = wp.full(worlds, n, dtype=wp.int32, device=device)
+    release = WalkRelease()
+    release.count = wp.zeros(worlds, dtype=wp.int32, device=device)
+    release.dof = wp.zeros((1, 1), dtype=wp.int32, device=device)
+    release.coordinate = wp.full((1, 1, 1), -1, dtype=wp.int32, device=device)
+    release.b, release.a, release.g = (wp.zeros((1, 1, 1), dtype=wp.float32, device=device) for _ in range(3))
+    walk.release = release
+    walk.du = wp.zeros(worlds * dofs, dtype=wp.float32, device=device)
+    return walk
+
+
 def leave_walk(walk: WalkTrees, velocity, device) -> None:
     """The step's one leave of a hand-built walk (:func:`.tree_factor.walk_leave_kernel`), after a sweep launched by
     hand: each tree's change, which the sweep added into ``walk.du``, walked down onto ``velocity``; ``du`` cleared for

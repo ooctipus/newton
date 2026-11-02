@@ -4,19 +4,15 @@
 """Author response actions independently of force production and publication.
 
 Vector operands are functions from an index expression to the native expression
-of the element at that index. The caller binds storage offsets in them. A forward
-action maps force into factor coordinates; its transpose maps back to physical
-response. Cholesky solves retain their dependency order; inverse factors retain
-products.
+of the element at that index. The caller binds storage offsets in them. The rows
+are whitened by the walk (:mod:`.walk_rows`), and the velocity change in factor
+coordinates leaves by the walk (:func:`.tree_factor.walk_leave_kernel`).
 
-Every dense factor is the tree's leaf-first factor: ``L`` of ``P H P^T`` with ``P``
-the reversal of an articulation's coordinates (factor coordinate ``i`` is physical
-coordinate ``n - 1 - i``). Numbering a tree parent-first makes the reversal
-leaf-first, so ``L`` has no fill (:meth:`.TreePlan.factor`'s order for a
-depth-first numbering). ``L`` is indexed in factor coordinates; a vector the dense
-actions read or write sits in physical positions, its factor coordinate ``i`` at
-position ``n - 1 - i`` (:func:`leaf_first`), so whitened rows and factor
-velocities share their physical vectors' storage and an action may work in place.
+A tree's factor is leaf-first: ``L`` of ``P H P^T`` with ``P`` the reversal of an
+articulation's coordinates (factor coordinate ``i`` is physical coordinate
+``n - 1 - i``). A vector in factor coordinates that shares a physical vector's
+storage sits in physical positions, its factor coordinate ``i`` at position
+``n - 1 - i`` (:func:`leaf_first`).
 
 These generators allocate no storage and impose no launch boundary. Owners
 supply scratch, lane ownership, synchronization between dependent actions,
@@ -47,296 +43,14 @@ def leaf_first(size: int | str, index: str) -> str:
     return f"({size}-1-({index}))"
 
 
-@dataclass(frozen=True)
-class Reversed:
-    """A vector operand that names factor coordinate ``k`` itself (``at(k)``): its element at physical position
-    ``size - 1 - k``, typically a pointer to the vector's last element read backwards, so a solve's address steps
-    down with ``k`` instead of recomputing ``size - 1 - k`` per access (the runtime-size loops)."""
-
-    at: Vector
-
-
 def _operand(expression: str) -> str:
     """``expression`` as an operand: parenthesized unless it is a name or a literal."""
     return expression if expression.replace("_", "x").replace(".", "x").isalnum() else f"({expression})"
 
 
-def _accumulate(coefficient: str, operand: str) -> str:
-    return f"value+={coefficient}*{operand};"
-
-
 def indent_lines(text: str, pad: str) -> str:
     """``text`` with every non-empty line indented by ``pad``."""
     return "\n".join(pad + line if line.strip() else line for line in text.split("\n"))
-
-
-def _unrolled(head: str, pad: str, unroll: bool) -> str:
-    """The loop ``head``, after an unroll directive on a line of its own (indented by ``pad``) when ``unroll``."""
-    return f"#pragma unroll\n{pad}{head}" if unroll else head
-
-
-@dataclass(frozen=True)
-class CholeskySolve:
-    """Apply the leaf-first factor's L^-1 and L^-T with the owner's zero-diagonal convention.
-
-    ``L`` is indexed in factor coordinates and every vector operand in physical
-    positions (:func:`leaf_first`): :meth:`whiten` maps a physical vector into
-    factor coordinates (``x = L^-1 P b``), :meth:`leave` maps back (``P^T L^-T``)
-    and :meth:`enter` maps a velocity in (``L^T P v``): the three actions of the
-    whitened rows. Both operands of an action keep the same positions, so an
-    action may work in place; ``whiten`` then ``leave`` is the response ``H^-1``.
-    One lane owns each complete solve. The output may alias the input; an
-    optional post-row statement retains per-owner finite-state reporting.
-    A zero diagonal produces zero, as in the retained predictor/fallback law.
-    With ``reciprocal`` the factor's diagonal holds ``1 / L_ii`` (zero for a
-    zero diagonal, as :meth:`stage` writes it) and each step multiplies by it.
-    ``ascending`` counts the transposed solve's steps upward (``row = size -
-    1 - step``), the loop form NVCC unrolls like the forward solve's when the
-    solution is a register array.
-
-    ``lower`` is the factor's row-major storage (a pointer expression read as
-    ``lower[row * size + col]``, which staging needs) or a :data:`Matrix`
-    operand. ``unroll`` unrolls both solves' loops (a compile-time ``size``),
-    the form of a solution held in a register array.
-
-    The zero-diagonal conventions, by option: a zero diagonal produces zero
-    (Z0, the default: ``d != 0 ? v / d : 0``); ``reciprocal`` multiplies by a
-    staged ``d != 0 ? 1 / d : 0`` (Zr0).
-    """
-
-    size: int | str
-    lower: str | Matrix
-    reciprocal: bool = False
-    ascending: bool = False
-    unroll: bool = False
-
-    def _entry(self, row: str, col: str) -> str:
-        """``L[row][col]``."""
-        if callable(self.lower):
-            return self.lower(row, col)
-        return f"({self.lower})[{row}*{self.size}+{col}]"
-
-    def _at(self, vector: Vector | Reversed, index: str) -> str:
-        """Factor coordinate ``index`` of a vector operand: its element at position ``size - 1 - index``."""
-        if isinstance(vector, Reversed):
-            return vector.at(f"({index})")
-        return vector(leaf_first(self.size, index))
-
-    def _finish(self) -> str:
-        return "value*diagonal" if self.reciprocal else "diagonal!=0.0f?value/diagonal:0.0f"
-
-    def _diagonal(self) -> str:
-        """The step's read of the factor's diagonal, on a line of its own."""
-        return f"\n            const float diagonal={self._entry('row', 'row')};"
-
-    def whiten(self, rhs: Vector, output: Vector) -> str:
-        """Whiten: solve ``L x = P rhs`` in increasing row order."""
-        rows = _unrolled(f"for(int row=0;row<{self.size};++row){{", "        ", self.unroll)
-        terms = _unrolled("for(int k=0;k<row;++k)", "            ", self.unroll)
-        return f"""{rows}
-            float value={self._at(rhs, "row")};
-            {terms}value-={self._entry("row", "k")}*{self._at(output, "k")};{self._diagonal()}
-            {self._at(output, "row")}={self._finish()};
-        }}"""
-
-    def leave(self, rhs: Vector, output: Vector, *, post_row: str = "") -> str:
-        """Leave factor coordinates: solve ``L^T P x = rhs`` in decreasing row order."""
-        head = (
-            f"for(int step=0;step<{self.size};++step){{\n            const int row={self.size}-1-step;"
-            if self.ascending
-            else f"for(int row={self.size}-1;row>=0;--row){{"
-        )
-        post = f"\n            {post_row}"
-        terms = _unrolled(f"for(int k=row+1;k<{self.size};++k)", "            ", self.unroll)
-        return f"""{_unrolled(head, "        ", self.unroll)}
-            float value={self._at(rhs, "row")};
-            {terms}value-={self._entry("k", "row")}*{self._at(output, "k")};{self._diagonal()}
-            {self._at(output, "row")}={self._finish()};{post}
-        }}"""
-
-    def _coordinate(self, rhs: Vector, row: str, pad: str, unroll: bool) -> str:
-        """Factor coordinate ``row`` of ``L^T P rhs`` into ``value``: the diagonal term (with ``reciprocal`` divided by
-        the staged ``1 / L_ii``: a staged zero, a zero pivot, adds zero), then the terms below it, ascending."""
-        if self.reciprocal:
-            diagonal = self._entry(row, row)
-            value, first = f"{diagonal}!=0.0f?{self._at(rhs, row)}/{diagonal}:0.0f", f"{row}+1"
-        else:
-            value, first = "0.0f", row
-        terms = _unrolled(f"for(int k={first};k<{self.size};++k)", pad, unroll)
-        return f"float value={value};\n{pad}{terms}value+={self._entry('k', row)}*{self._at(rhs, 'k')};"
-
-    def enter(self, rhs: Vector, output: Vector) -> str:
-        """Enter factor coordinates: ``x = L^T P rhs`` in increasing row order (the output may alias the input: row
-        ``r`` reads rows ``r`` on)."""
-        rows = _unrolled(f"for(int row=0;row<{self.size};++row){{", "        ", self.unroll)
-        return f"""{rows}
-            {self._coordinate(rhs, "row", "            ", self.unroll)}
-            {self._at(output, "row")}=value;
-        }}"""
-
-    def stage(self, source: Vector, lane: str, width: int | str) -> str:
-        """Copy the factor from ``source`` into ``lower``, lane-strided; a reciprocal solve's diagonal becomes ``1 / L_ii``.
-
-        The reciprocals take a loop of their own over the diagonal, so the copy's loads carry no division (whose slow
-        path, a call, would order them one after another)."""
-        n = self.size
-        count, step = (n * n, n + 1) if isinstance(n, int) else (f"{n} * {n}", f"({n} + 1)")
-        if not self.reciprocal:
-            return (
-                f"for (int i = {lane}; i < {count}; i += {width}) {{\n"
-                f"    float factor = {_at(source, 'i')};\n"
-                f"    ({self.lower})[i] = factor;\n"
-                "}"
-            )
-        return (
-            f"for (int i = {lane}; i < {count}; i += {width})\n"
-            f"    if (i % {step} != 0) ({self.lower})[i] = {_at(source, 'i')};\n"
-            f"for (int i = {lane}; i < {n}; i += {width}) {{\n"
-            f"    const float factor = {_at(source, f'i * {step}')};\n"
-            f"    ({self.lower})[i * {step}] = factor != 0.0f ? 1.0f / factor : 0.0f;\n"
-            "}"
-        )
-
-
-@dataclass(frozen=True)
-class LaneCholeskySolve:
-    """Apply L^-1 and L^-T with one lane per coordinate and one shuffle per step.
-
-    The same law as :class:`CholeskySolve` (zero diagonal produces zero, the
-    leaf-first factor: lane ``i`` owns factor row ``i``, whose right-hand side
-    and solution sit at physical position ``size - 1 - i``), with
-    the dependency chain shared across the lanes of one warp group: at step
-    ``k`` the lane holding row ``k`` finalizes its coordinate, every lane reads
-    it through a shuffle and subtracts its own ``L[i, k]`` term. The forward
-    pass runs rows upward, the transposed pass downward. ``size`` is a
-    compile-time constant of at most the group's lane count; the caller
-    supplies the lane variable, the group's shuffle mask and shuffle width
-    (by default the names the tree layout's thread prelude declares), and
-    scratch index bases for the right-hand side and the output. Lanes past
-    ``size`` take part in every shuffle and write nothing.
-    """
-
-    size: int
-    lower: str
-
-    def solve(self, rhs_base: str, output_base: str, *, lane: str = "lane", mask: str = "MASK", width: str = "WIDTH"):
-        n = self.size
-        # Each lane's factor row (forward) and column (transposed) are loaded
-        # into registers before the loops so the per-step chain is a shuffle
-        # and a multiply-add, not a global load. Indices are static after
-        # unrolling; an idle lane loads row 0 and writes nothing.
-        return f"""{{
-            const float* Lr={self.lower};
-            const int i={lane};
-            const bool active=i<{n};
-            const int ic=active?i:0;
-            float row[{n}],col[{n}];
-            #pragma unroll
-            for(int k=0;k<{n};++k){{row[k]=Lr[ic*{n}+k];col[k]=Lr[k*{n}+ic];}}
-            const float diagonal=Lr[ic*{n}+ic];
-            float value=active?s[{rhs_base}+{n - 1}-i]:0.0f;
-            float x=0.0f;
-            #pragma unroll
-            for(int k=0;k<{n};++k){{
-                if(i==k)x=diagonal!=0.0f?value/diagonal:0.0f;
-                const float xk=__shfl_sync({mask},x,k,{width});
-                if(active&&i>k)value-=row[k]*xk;
-            }}
-            value=x;
-            float z=0.0f;
-            #pragma unroll
-            for(int k={n}-1;k>=0;--k){{
-                if(i==k)z=diagonal!=0.0f?value/diagonal:0.0f;
-                const float zk=__shfl_sync({mask},z,k,{width});
-                if(active&&i<k)value-=col[k]*zk;
-            }}
-            if(active)s[{output_base}+{n - 1}-i]=z;
-        }}"""
-
-
-@dataclass(frozen=True)
-class IndexedSupport:
-    """Visit packed lower entries through a lookup grid and explicit column supports."""
-
-    size: int | str
-    index: str
-    column_count: str
-    column_nodes: str
-    column_width: int | str
-
-    def row(self, row: str, operation: str) -> str:
-        return f"""for(int col=0;col<=({row});++col){{
-            const int entry={self.index}[({row})*{self.size}+col];
-            if(entry>=0){{{operation}}}
-        }}"""
-
-    def column(self, col: str, operation: str) -> str:
-        return f"""for(int k=0;k<{self.column_count}[{col}];++k){{
-            const int row={self.column_nodes}[({col})*{self.column_width}+k];
-            const int entry={self.index}[row*{self.size}+({col})];
-            {operation}
-        }}"""
-
-
-@dataclass(frozen=True)
-class CompressedSupport:
-    """Visit the owner's existing CSR rows and CSC entry references."""
-
-    row_offsets: str
-    columns: str
-    column_offsets: str
-    column_entries: str
-    entry_rows: str
-
-    def row(self, row: str, operation: str) -> str:
-        return f"""for(int entry={self.row_offsets}[{row}];entry<{self.row_offsets}[({row})+1];++entry){{
-            const int col={self.columns}[entry];
-            {operation}
-        }}"""
-
-    def column(self, col: str, operation: str) -> str:
-        return f"""for(int position={self.column_offsets}[{col}];position<{self.column_offsets}[({col})+1];++position){{
-            const int entry={self.column_entries}[position];
-            const int row={self.entry_rows}[entry];
-            {operation}
-        }}"""
-
-
-@dataclass(frozen=True)
-class SparseInverseFactor:
-    """Apply the same sparse factor arithmetic through either retained storage map."""
-
-    factor: str
-    support: IndexedSupport | CompressedSupport
-
-    def forward(self, row: str, rhs: Vector) -> str:
-        """Compute one sparse forward row, preserving the support's traversal order."""
-        operation = _accumulate(f"({self.factor})[entry]", _at(rhs, "col"))
-        return "float value=0.0f;" + self.support.row(row, operation)
-
-    def transpose(self, col: str, rhs: Vector) -> str:
-        """Compute one sparse transpose column from completed forward coordinates."""
-        operation = _accumulate(f"({self.factor})[entry]", _at(rhs, "row"))
-        return "float value=0.0f;" + self.support.column(col, operation)
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# Response operators of the sweeps: one implementation per representation of a row's response
-# ---------------------------------------------------------------------------------------------------------------------
-#
-# A Gauss-Seidel or Jacobi row update needs four things of its row's response, whatever holds it:
-#
-# * the residual's velocity term, ``J_i v`` (or ``C_i lambda`` in impulse space), of the visited row and of a row
-#   outside the visit (a friction sibling, an end-of-sweep row);
-# * the diagonal ``A_ii`` the step divides by, and the step ``-r / A_ii`` itself;
-# * the coupling of a friction pair, ``J_i Y_s`` (the pair's off-diagonal block entry), with the sibling's residual
-#   (the pair's terms);
-# * the apply, ``v += Y_i delta`` (or nothing, in impulse space), of the row, of its sibling, or of both in one pass.
-#
-# A :class:`ResponseOperator` emits each as native statements over one row index, for the lanes that update the row
-# together (:class:`Lanes`): the lanes split the sum's terms and reduce them with the lane group's ``SUM``, or one
-# thread sums them in order. The lane layout and the representation fix the floating-point order, so an operator
-# writes exactly one order per layout: the one the sweeps it replaces compute.
 
 
 @dataclass(frozen=True)
@@ -610,9 +324,9 @@ class FreeBodyZ(ResponseOperator):
     the row's own residual where the pair reduces it (``own``). The builder
     stores ``1 / A_ii`` (``A_ii = cfm + |Z_a|^2 + |Z_b|^2``).
 
-    ``factors`` names the native :class:`.kernels.BodyFactors` operand and
-    ``factor`` maps a body's first velocity coordinate (in the sweep's
-    addressing) to the index of its factor in ``factors.L``.
+    ``factors`` names the native :class:`.kernels.BodyFactors` operand; a
+    body's speed row reads its velocity by its walk (``walk_leave``,
+    ``walk_enter``).
     """
 
     lanes: Lanes = Lanes()
@@ -626,11 +340,9 @@ class FreeBodyZ(ResponseOperator):
     """One thread: where entry ``k`` of a row's ``Z_a`` or ``Z_b`` (the array's name) is read, ``entry(array, row,
     k)``, when a mapping stages the rows elsewhere (default: the array, by row)."""
     factors: str = "factors"
-    factor: Callable[[str], str] | None = None
     walk_leave: Callable[[str, str], str] | None = None
-    """Where the bodies leave by the walk (a placement that walks, :mod:`.walk_rows`): the code mapping the six
-    values ``values`` of the body whose first coordinate is ``first`` back in place, ``walk_leave(first, values)``,
-    ``v = P^T L^-T u`` by the walk down, in place of the held factor's solve (:meth:`leave`)."""
+    """The code mapping the six values ``values`` of the body whose first coordinate is ``first`` back in place,
+    ``walk_leave(first, values)``, ``v = P^T L^-T u`` by the walk down (:mod:`.walk_rows`); a speed row needs it."""
     walk_enter: Callable[[str, str, str], str] | None = None
     """With ``walk_leave``: the code giving ``u = L^T P v`` of the six values ``velocity`` in ``out``,
     ``walk_enter(first, velocity, out)``."""
@@ -655,16 +367,6 @@ class FreeBodyZ(ResponseOperator):
             f"{indent}{word}.w = static_cast<int>(static_cast<unsigned int>({kind}) | "
             f"(static_cast<unsigned int>({parent}) << 16));"
         )
-
-    # -- the bodies' factor: entering and leaving factor coordinates ------------------------------------------------
-
-    def lower(self, factor: str) -> str:
-        """The native pointer of factor ``factor``'s ``L`` (row-major, lower)."""
-        return f"({self.factors}.L.data + ({factor}) * 36)"
-
-    def leave(self, velocity: Vector, factor: str) -> str:
-        """Map a body's six coordinates ``velocity`` back in place, ``v = L^-T u`` (one thread)."""
-        return CholeskySolve(6, self.lower(factor), unroll=True).leave(velocity, velocity)
 
     # -- software pipeline: the packed row word (bodies, inverse diagonal, rhs, type and parent) and the entries ---
 
@@ -848,17 +550,15 @@ class FreeBodyZ(ResponseOperator):
         """``const float out``: the magnitude of the body's physical velocity coordinates ``[axis, axis + 3)``.
 
         The body's coordinates from ``body`` hold ``u``; every lane forms its physical velocity ``speed_v = L^-T u``
-        (:meth:`leave`) on the predictor, which ``v_out`` holds through the sweep, and the magnitude, the squares added
+        (``walk_leave``) on the predictor, which ``v_out`` holds through the sweep, and the magnitude, the squares added
         in coordinate order. The lanes then synchronize, so :meth:`scale_speed` may write ``u``.
         """
-        if self.walk_leave is not None:
-            leave = self.walk_leave(body, "speed_v")
-        else:
-            leave = self.leave(lambda k: f"speed_v[{k}]", self.factor(body))
+        if self.walk_leave is None:
+            raise ValueError("a free body's speed row reads its velocity by its walk (walk_leave)")
         lines = [
             "float speed_v[6];",
             "for (int k = 0; k < 6; ++k) speed_v[k] = " + self._v(body, "k") + ";",
-            leave,
+            self.walk_leave(body, "speed_v"),
             f"for (int k = 0; k < 6; ++k) speed_v[k] += v_out.data[world_dof_indices.data[dof_map_base + {body} + k]];",
             f"const float {out} = sqrtf((speed_v[{axis}] * speed_v[{axis}] + speed_v[{axis} + 1] * speed_v[{axis} + 1])"
             f" + speed_v[{axis} + 2] * speed_v[{axis} + 2]);",
@@ -873,19 +573,13 @@ class FreeBodyZ(ResponseOperator):
             "float speed_dv[6];",
             f"for (int k = 0; k < 6; ++k) speed_dv[k] = k >= {axis} && k < {axis} + 3 ? {scale} * speed_v[k] : 0.0f;",
         ]
-        if self.walk_enter is not None:
-            lines += [
-                "float speed_du[6];",
-                self.walk_enter(body, "speed_dv", "speed_du"),
-                "for (int k = 0; k < 6; ++k) " + self._v(body, "k") + " += speed_du[k];",
-            ]
-        else:
-            lines += [
-                CholeskySolve(6, self.lower(self.factor(body)), unroll=True).enter(
-                    lambda k: f"speed_dv[{k}]", lambda k: f"speed_dv[{k}]"
-                ),
-                "for (int k = 0; k < 6; ++k) " + self._v(body, "k") + " += speed_dv[k];",
-            ]
+        if self.walk_enter is None:
+            raise ValueError("a free body's speed row pushes its velocity by its walk (walk_enter)")
+        lines += [
+            "float speed_du[6];",
+            self.walk_enter(body, "speed_dv", "speed_du"),
+            "for (int k = 0; k < 6; ++k) " + self._v(body, "k") + " += speed_du[k];",
+        ]
         text = "\n".join(lines)
         if self.lanes.parallel:
             text = f"if ({self.lanes.lane} == 0) {{\n{text}\n}}"
@@ -1920,25 +1614,15 @@ class LocalBlock(ResidualBlock):
 
 @dataclass(frozen=True)
 class FactorComponent:
-    """One diagonal block of a block-diagonal factor ``L``: ``size`` coordinates from lane ``offset``.
+    """One diagonal block of a block-diagonal factor: ``size`` coordinates from lane ``offset``.
 
-    ``lane`` is this lane's coordinate in the block (``LANE - offset``, out of range on other lanes); ``L`` holds the
-    block's leaf-first lower factor in factor coordinates, row-major from ``base``: a Warp array, or with ``staged``
-    the block's own shared array. A lane's coordinate is a physical position: factor coordinate ``i`` sits on lane
-    ``size - 1 - i`` (:func:`leaf_first`).
+    ``lane`` is this lane's coordinate in the block (``LANE - offset``, out of range on other lanes). A lane's coordinate
+    is a physical position: factor coordinate ``i`` sits on lane ``size - 1 - i`` (:func:`leaf_first`).
     """
 
     size: int
     offset: str
     lane: str
-    L: str
-    base: str
-    staged: bool = False
-
-    def element(self, row: str, col: str) -> str:
-        """Entry ``(row, col)`` of the block's ``L``."""
-        data = self.L if self.staged else f"{self.L}.data"
-        return f"{data}[{self.base} + ({row}) * {self.size} + ({col})]"
 
 
 @dataclass(frozen=True)
@@ -2054,39 +1738,6 @@ class FactorRows(ResponseOperator):
     def lanes_of(self, indent: str) -> list[str]:
         """Lines declaring each component's lane (``LANE - offset``)."""
         return [f"{indent}const int {c.lane} = {self.lanes.lane} - {c.offset};" for c in self.components]
-
-    def leave(self, out: str, indent: str) -> str:
-        """Declare ``out = P^T L^-T velocity`` (this lane's physical velocity): the components' back substitutions
-        run side by side, one step per factor row from the last (lane 0 of the component) and one shuffle a step:
-        the lane that holds the row divides by its pivot (a zero pivot gives zero), every later lane of its
-        component subtracts its term."""
-        steps = max(c.size for c in self.components)
-        lines = [f"{indent}float {out} = 0.0f;", f"{indent}{{", f"{indent}    float value = {self.velocity};"]
-        lines += [
-            "#pragma unroll",
-            f"{indent}    for (int s = 0; s < {steps}; ++s) {{",
-            f"{indent}        int source = 0;",
-        ]
-        for c in self.components:
-            mine = f"{c.lane} >= 0 && {c.lane} < {c.size} && s < {c.size}"
-            pivot = c.element(leaf_first(c.size, "s"), leaf_first(c.size, "s"))
-            lines += [
-                f"{indent}        if ({mine}) {{",
-                f"{indent}            source = {c.offset} + s;",
-                f"{indent}            if ({c.lane} == s) {{",
-                f"{indent}                const float pivot = {pivot};",
-                f"{indent}                {out} = pivot != 0.0f ? value / pivot : 0.0f;",
-                f"{indent}            }}",
-                f"{indent}        }}",
-            ]
-        lines.append(f"{indent}        const float x = READ({out}, source);")
-        for c in self.components:
-            entry = c.element(leaf_first(c.size, "s"), leaf_first(c.size, c.lane))
-            lines.append(
-                f"{indent}        if ({c.lane} > s && {c.lane} < {c.size} && s < {c.size}) value -= {entry} * x;"
-            )
-        lines += [f"{indent}    }}", f"{indent}}}"]
-        return "\n".join(lines)
 
 
 @dataclass(frozen=True)
