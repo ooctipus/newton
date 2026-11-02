@@ -1178,8 +1178,10 @@ class RowLaws:
         )
         if solver.placement.keyed_rows is not None:
             solver.placement.keyed_rows.finish_rows()
-        # The patch link runs after every row producer: the keyed rows' general worlds take their records last.
-        self._link_friction_patches(solver, contacts)
+        # The patch link runs after every row's records are written: the keyed rows' general worlds take theirs last
+        # here; the one writer writes its contact rows' records after the row pass (write_walked), and links there.
+        if not self._writer_records(solver):
+            self._link_friction_patches(solver, contacts)
         solver.placement.latch_status(contacts)
         solver.sweep.claim()
         solver.placement.warn_overflow()
@@ -1221,7 +1223,19 @@ class RowLaws:
         placement's (case K1, :meth:`write_support`)."""
         if solver.routes.case == "K1":
             self.write_support(solver, state_in, contacts, dt)
-            return
+        else:
+            self.write_general(solver, state_in, contacts, dt)
+        if self._writer_records(solver):
+            self._link_friction_patches(solver, contacts)
+
+    @staticmethod
+    def _writer_records(solver) -> bool:
+        """Whether the one writer writes the contact rows' records after the row pass (the general placement's and the
+        support placement's: the patch link then runs after it)."""
+        return bool(solver.placement.walks) and solver.routes.case != "K2"
+
+    def write_general(self, solver, state_in, contacts: Contacts | None, dt: float) -> None:
+        """The general placement's one writer (:func:`.walk_rows.walked_rows_kernel`)."""
         placement, factor, model = solver.placement, solver.factor, solver.model
         # Without contacts no row is a contact's: the writer reads no contact input.
         contact_input = (
