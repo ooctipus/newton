@@ -734,15 +734,21 @@ class SolverFeatherPGS(SolverBase):
             )
         if self.placement.local_internal_fast_path and not self.placement.walks:
             raise ValueError("The local owners walk their rows and leave (FL3.6): their class must walk.")
+        # Scalar branches take a diagonal-mass group of world-fixed roots over one-coordinate leaves (scalar_branches.py),
+        # which the held-tree owner then publishes: the compact diagonal's admission planned them. A leaf decides its
+        # drive's saturation itself, so the predictor's border never walks a branch.
+        self._scalar_branches, self._scalar_branches_reason = plan_scalar_branches(self)
         # The walk is held for every responding tree where a placement walks its rows (the keyed tiers walk theirs in
         # the kernel) and under the test pin walk_predictor, which solves the predictor's trial by it (Z4.0). Elsewhere
         # it holds the trees that walk (the sparse diagonal's arms) and the trees whose drives can slip, where the
-        # predictor's border decides a step (FL3.9): a tree that can do neither takes no walk.
+        # predictor's border decides a step (FL3.9): a tree that can do neither, or a scalar branch, takes no walk.
         responding = np.flatnonzero(self.forest.response_dof_count > 0)
         if general or self.placement.ink_skip_rows() or self._route_pins.get("walk_predictor", False):
             self.factor.plan_walk(responding)
         else:
             held = responding[self.factor.slips_by_tree(responding) > 0]
+            if self._scalar_branches is not None:
+                held = np.setdiff1d(held, self.forest.group_to_art_host[self._scalar_branches.size])
             if diagonal:
                 held = np.union1d(held, self.placement.sparse_diagonal_dense_arts_host)
             if held.size:
@@ -757,11 +763,6 @@ class SolverFeatherPGS(SolverBase):
 
         self._audit = Audit(self) if self.options.pgs_audit else None
         self.placement.allocate_status()
-
-        # Scalar branches take a diagonal-mass group of world-fixed roots over
-        # one-coordinate leaves (scalar_branches.py), which the held-tree owner
-        # then publishes: the compact diagonal's admission planned them.
-        self._scalar_branches, self._scalar_branches_reason = plan_scalar_branches(self)
 
         # The tree factor's evaluator: the held tree.
         self.factor.install(self)
