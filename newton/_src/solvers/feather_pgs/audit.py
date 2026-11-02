@@ -497,7 +497,13 @@ class Audit:
             row=solver.placement.dense_max_constraints,
             mf_row=solver.placement.mf_max_constraints,
         )
-        self.sizes = tuple(size for size in forest.size_groups if solver.factor.L_by_size[size].shape[1] == size)
+        # A class whose placement walks reads every tree's coordinates in the walk's frame; only a placement that still
+        # whitens its rows by the dense factor reads that factor's.
+        self.sizes = (
+            ()
+            if solver.placement.walks
+            else tuple(size for size in forest.size_groups if solver.factor.L_by_size[size].shape[1] == size)
+        )
         self.coordinates_hat = wp.zeros_like(self.coordinates)
         # A class whose local owners read the one writer's rows (FL3.6, no packets) has every world's rows stored: the
         # audit reads every world as the general placement's.

@@ -495,16 +495,19 @@ def _light_apply_free_root_velocity_corrections(
     joint_child: wp.array[int],
     body_to_articulation: wp.array[int],
     is_free_rigid: wp.array[int],
-    art_group_index: wp.array[int],
     kinematic_joint_mask: wp.array[int],
     body_q: wp.array[wp.transform],
     body_inertia: wp.array[wp.mat33],
-    cholesky: wp.array3d[float],
+    walk: wp.array2d[float],
     joint_qd: wp.array[float],
     dt: float,
     v_hat: wp.array[float],
 ):
-    """The isolated rigid-body gyroscopic update of a free root's predicted velocity."""
+    """The isolated rigid-body gyroscopic update of a free root's predicted velocity. Its effective angular inertia is
+    the angular block of the body's walk, ``L_aa L_aa^T`` (armature included), with ``L_aa`` from the walk's records
+    of the body's coordinates (``walk``, :data:`.tree_factor.WALK_COORDINATE` floats a global coordinate): the walk
+    eliminates the angular coordinates first, last first, so ``L(i, i) = ell_i`` and ``L(i, k) = s_i . ut_k`` for the
+    coordinate ``k > i`` eliminated before ``i``."""
     d = _active_free_root_dof_start(free_root_joint_indices, joint_qd_start, kinematic_joint_mask, root_index)
     if d < 0:
         return
@@ -535,13 +538,20 @@ def _light_apply_free_root_velocity_corrections(
         and (inertia[2, 1] == 0.0)
     ):
         return
-    group = art_group_index[art]
-    # The angular block of the leaf-first factor P H P^T = L L^T: physical coordinate 3 + r is factor row 2 - r, so
-    # with ``lower[r] = L[2 - r]`` the block is ``lower lower^T``.
+    # The angular block of the walk's leaf-first factor P H P^T = L L^T: row r is physical coordinate 3 + r, column c
+    # the coordinate 5 - c eliminated c-th, so the block is ``lower lower^T``.
     lower = wp.mat33(0.0)
     for r in range(3):
+        i = d + 3 + r
         for c in range(3 - r):
-            lower[r, c] = cholesky[group, 2 - r, c]
+            k = d + 5 - c
+            if k == i:
+                lower[r, c] = 1.0 / walk[i, 12]
+            else:
+                value = float(0.0)
+                for m in range(6):
+                    value += walk[i, m] * walk[k, 6 + m]
+                lower[r, c] = value
     rotation = wp.transform_get_rotation(body_q[body])
     basis = wp.quat_to_matrix(rotation)
     effective = wp.transpose(basis) * (lower * wp.transpose(lower)) * basis
@@ -559,11 +569,10 @@ def apply_free_root_velocity_corrections(
     joint_child: wp.array[int],
     body_to_articulation: wp.array[int],
     is_free_rigid: wp.array[int],
-    art_group_index: wp.array[int],
     kinematic_joint_mask: wp.array[int],
     body_q: wp.array[wp.transform],
     body_inertia: wp.array[wp.mat33],
-    cholesky: wp.array3d[float],
+    walk: wp.array2d[float],
     joint_qd: wp.array[float],
     dt: float,
     v_hat: wp.array[float],
@@ -575,11 +584,10 @@ def apply_free_root_velocity_corrections(
         joint_child,
         body_to_articulation,
         is_free_rigid,
-        art_group_index,
         kinematic_joint_mask,
         body_q,
         body_inertia,
-        cholesky,
+        walk,
         joint_qd,
         dt,
         v_hat,

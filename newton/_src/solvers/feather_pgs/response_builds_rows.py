@@ -830,12 +830,15 @@ _PAIRED_COMPONENTS = r"""
         if (m < 0 || m > M || mf < 1 || mf > F) continue;
         const int po = data.primary_offset.data[world];
         const int so = data.secondary_offset.data[world];
-        const int group = data.primary_group.data[world];
-        if (!((po == 0 && so == $PRIMARY) || (po == $SECONDARY && so == 0))
-            || group < 0 || group >= data.L.shape[0]) continue;
+        const int art = data.primary_art.data[world];
+        if (!((po == 0 && so == $PRIMARY) || (po == $SECONDARY && so == 0)) || art < 0
+            || art >= data.dof_start.shape[0]) continue;
+        // The articulation's factor is its walk: every record of its coordinates finite and bounded.
         int valid = 1;
-        for (int k = LANE; k < $PRIMARY * $PRIMARY; k += STRIDE) {
-            const float x = data.L.data[group * $PRIMARY * $PRIMARY + k];
+        const int records = data.walk.shape[1];
+        const float* walk = data.walk.data + (size_t)data.dof_start.data[art] * records;
+        for (int k = LANE; k < $PRIMARY * records; k += STRIDE) {
+            const float x = walk[k];
             valid &= wp::isfinite(x) && wp::abs(x) <= 1.0e15f;
         }
         for (int row = LANE; row < m; row += STRIDE) {

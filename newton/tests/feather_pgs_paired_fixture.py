@@ -87,10 +87,16 @@ def bind_components(host, device="cpu"):
     data = components.PairedComponentData()
     data.world_count = len(host["counts"])
     for name, value in host.items():
-        if name != "J":  # Only the whitened rows are stored.
+        if name not in ("J", "L"):  # Only the whitened rows are stored; the factor is the walk's records below.
             dtype = wp.int32 if value.dtype == np.int32 else wp.float32
             setattr(data, name, wp.array(value, dtype=dtype, device=device))
     data.first = data.mf_first = row_lines(device)
+    # The primary articulation of a world is its group's; its walk records hold the factor's rows (16 floats a
+    # coordinate, as the walk's), so a factor entry the qualification must reject is a record entry.
+    arts, n = host["L"].shape[0], host["L"].shape[1]
+    data.primary_art = wp.array(host["primary_group"], dtype=wp.int32, device=device)
+    data.dof_start = wp.array(np.arange(arts, dtype=np.int32) * n, dtype=wp.int32, device=device)
+    data.walk = wp.array(host["L"][:, :, :16].reshape(arts * n, 16), dtype=wp.float32, device=device)
     return data
 
 
@@ -157,7 +163,7 @@ def solve_fixture(device):
         "world_row_w": array(np.ones((5, 8), np.float32)),
         "mf_row_w": array(np.ones((5, 6), np.float32)),
         "mf_contact_rows_end": array(np.full(5, 3, np.int32)),
-        "primary_L": data.L,
+        "primary_L": array(host["L"]),
         "secondary_L": array(np.repeat((np.eye(6) / np.sqrt(0.7))[None], 5, axis=0).astype(np.float32)),
         "primary_group_by_world": data.primary_group,
         "secondary_group_by_world": array(np.arange(5, dtype=np.int32)),
