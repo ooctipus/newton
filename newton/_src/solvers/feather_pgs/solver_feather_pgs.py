@@ -734,20 +734,19 @@ class SolverFeatherPGS(SolverBase):
             )
         if self.placement.local_internal_fast_path and not self.placement.walks:
             raise ValueError("The local owners walk their rows and leave (FL3.6): their class must walk.")
-        # The walk is held for every responding tree where a placement walks it, where the keyed tiers walk their keyed
-        # rows in the kernel, where the predictor's border decides a step (a tree that can slip, FL3.9), and under the
-        # test pin walk_predictor, which solves the predictor's trial by it (Z4.0); the sparse diagonal's arms alone
-        # otherwise.
+        # The walk is held for every responding tree where a placement walks its rows (the keyed tiers walk theirs in
+        # the kernel) and under the test pin walk_predictor, which solves the predictor's trial by it (Z4.0). Elsewhere
+        # it holds the trees that walk (the sparse diagonal's arms) and the trees whose drives can slip, where the
+        # predictor's border decides a step (FL3.9): a tree that can do neither takes no walk.
         responding = np.flatnonzero(self.forest.response_dof_count > 0)
-        if (
-            general
-            or self.placement.ink_skip_rows()
-            or self._route_pins.get("walk_predictor", False)
-            or (responding.size and self.factor.slip_capacity(responding) > 0)
-        ):
+        if general or self.placement.ink_skip_rows() or self._route_pins.get("walk_predictor", False):
             self.factor.plan_walk(responding)
-        elif diagonal:
-            self.factor.plan_walk(self.placement.sparse_diagonal_dense_arts_host)
+        else:
+            held = responding[self.factor.slips_by_tree(responding) > 0]
+            if diagonal:
+                held = np.union1d(held, self.placement.sparse_diagonal_dense_arts_host)
+            if held.size:
+                self.factor.plan_walk(held)
         if self.placement.walks:
             self.placement.hold_units()
             if self.routes.case == "K1":
