@@ -688,12 +688,14 @@ def _run_rolling(
     return pose, velocity, np.mean(final_velocity, axis=0)
 
 
-def _within_family(test, actual, references, index, delta):
-    """``actual``'s entry ``index`` within ``delta`` of the span of the reference runs' (one-ulp draws of the launch)."""
-    value = float(actual[index[0]][index[1]])
+def _families_meet(test, actuals, references, index, delta):
+    """The default runs' entry ``index`` and the reference runs' (each a launch's one-ulp draws) meet within ``delta``:
+    their spans, one of them widened by ``delta``, overlap. A force that moves every default draw past every reference
+    draw by more than ``delta`` fails."""
+    values = [float(a[index[0]][index[1]]) for a in actuals]
     family = [float(r[index[0]][index[1]]) for r in references]
-    test.assertGreaterEqual(value, min(family) - delta, f"{index}: {value} against {family}")
-    test.assertLessEqual(value, max(family) + delta, f"{index}: {value} against {family}")
+    test.assertGreaterEqual(max(values), min(family) - delta, f"{index}: {values} against {family}")
+    test.assertLessEqual(min(values), max(family) + delta, f"{index}: {values} against {family}")
 
 
 class TestFeatherPGSFrictionPatches(unittest.TestCase):
@@ -707,27 +709,28 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             # matrix compares default patches against full point friction.
             faceted = geometry in ("mesh", "convex_hull")
             reference_beta = 1.0e-8 if faceted else 0.0
-            # A faceted wheel's travel is bimodal under its facet impacts: one rounding unit of the launch moves the
-            # reference run by more than the bound (main 64e61f3a, mesh: 0.83045, +1 ulp 0.83977, -1 ulp 0.82722).
-            # The default run is held to the reference's one-ulp family, its three draws, each within the bound of
-            # the family's span; a persistent rearward friction force falls below the whole family.
+            # A faceted wheel's travel is bimodal under its facet impacts (about 0.827 and 0.838-0.840 on the mesh):
+            # one rounding unit of the launch moves a run between the modes, more than the bound (main 64e61f3a,
+            # mesh reference: 0.83045, +1 ulp 0.83977, -1 ulp 0.82722). Both runs are taken as their launch's
+            # one-ulp family (0, +1, -1 ulp), and the families must meet within the bound; a persistent rearward
+            # friction force moves every default draw below every reference draw.
             draws = (0, 1, -1) if faceted else (0,)
             references = [
                 _run_rolling(geometry, device, deterministic=True, friction_anchor_beta=reference_beta, launch_ulp=u)
                 for u in draws
             ]
-            actual = _run_rolling(geometry, device, deterministic=True)
-            for result in (*references, actual):
+            actuals = [_run_rolling(geometry, device, deterministic=True, launch_ulp=u) for u in draws]
+            for result in (*references, *actuals):
                 self.assertTrue(all(np.isfinite(value).all() for value in result))
-            reference = references[0]
+            reference, actual = references[0], actuals[0]
 
             with self.subTest(geometry=geometry):
-                _within_family(self, actual, references, (0, 0), 0.01)
-                _within_family(self, actual, references, (0, 1), 0.01)
+                _families_meet(self, actuals, references, (0, 0), 0.01)
+                _families_meet(self, actuals, references, (0, 1), 0.01)
                 # Facet impacts lose energy even without positional correction;
                 # compare averaged speed rather than individual impact phases.
-                _within_family(self, actual, references, (2, 0), 0.02)
-                _within_family(self, actual, references, (2, 4), 0.4)
+                _families_meet(self, actuals, references, (2, 0), 0.02)
+                _families_meet(self, actuals, references, (2, 4), 0.4)
                 self.assertLess(abs(float(actual[2][1])), 0.01)
                 if geometry not in ("mesh", "convex_hull"):
                     self.assertAlmostEqual(float(actual[1][0]), float(reference[1][0]), delta=0.01)
