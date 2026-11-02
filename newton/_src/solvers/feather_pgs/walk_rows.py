@@ -81,6 +81,7 @@ from .tree_factor import (
     WALK_NOW,
     WalkRelease,
     WalkTrees,
+    held_fits,
     release_path,
     walk_covector_into,
     walk_covector_into_one_half,
@@ -964,18 +965,23 @@ _RELEASE_IN_PLACE = """            WALK_RELEASE_ON(release, art, Z, rows, S, [&]
                 return ((mask >> SUPPORT_NODE[c]) & 1ull) != 0ull ? rank(c) : -1;
             });"""
 
-RELEASE_HELD_COORDINATES = 16
-"""The most coordinates of a class whose writer holds a unit's side in its own array for the slips' release
-(:data:`_RELEASE_HELD`, at most four rows a coordinate). Measured on the GB300 (``SP/core/FL/HANDOFF_ZK.md`` §17):
-franka-reach's 9 16% faster; g1's 43 (a 688 B array at the writer's 128 registers) 3% slower, where the release runs
-on 0.01 slips a tree. Past it the release runs on the stored entries in place."""
+SUPPORT_BLOCK, SUPPORT_BLOCKS = 256, 2
+"""The support writer's block and its blocks a multiprocessor (its launch bound): 128 registers a thread."""
+
+SUPPORT_REGISTERS = 65536 // (SUPPORT_BLOCK * SUPPORT_BLOCKS)
+"""The support writer's register budget a thread, from its launch bound: what a unit's held side must fit
+(:func:`.tree_factor.held_fits`, :data:`_RELEASE_HELD`).
+
+The held side is a unit's at most four rows over its class's coordinates. Measured (``SP/core/FL/HANDOFF_ZK.md``
+§17): franka-reach's 36 words held, its writer 16% faster (GB300); g1's 172 words held, 3% slower (GB300), so g1's
+release runs in place."""
 
 
 def _support_snippet(parent: tuple, first: tuple, node: tuple, rows: int, records: bool, spin: bool) -> str:
     record = ""
     if records:
         record = substitute(_SUPPORT_RECORD, rows=rows, tail=_SPIN_TAIL if spin else "")
-    held = first[-1] <= RELEASE_HELD_COORDINATES
+    held = held_fits(4 * first[-1], SUPPORT_REGISTERS)
     release = substitute(_RELEASE_HELD, rows=rows, coordinates=first[-1]) if held else _RELEASE_IN_PLACE
     body = substitute(
         _SUPPORT,
@@ -1282,7 +1288,7 @@ def support_rows_kernel(
     name += ("_records" if records else "") + ("_torsion" if torsion else "")
     # Two blocks of 256 a multiprocessor within the register file (128 registers): the four-row walker holds 166
     # unbounded, and the bound costs it 16 B of stack (sm_120, ptxas).
-    return python_kernel(kernel, name, launch_bounds=(256, 2))
+    return python_kernel(kernel, name, launch_bounds=(SUPPORT_BLOCK, SUPPORT_BLOCKS))
 
 
 def support_threads(units: int, device) -> int:
@@ -1291,7 +1297,7 @@ def support_threads(units: int, device) -> int:
     device = wp.get_device(device)
     if not device.is_cuda:
         return 1
-    return max(min(2 * 2 * 256 * int(device.sm_count), int(units)), 1)
+    return max(min(2 * SUPPORT_BLOCKS * SUPPORT_BLOCK * int(device.sm_count), int(units)), 1)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
