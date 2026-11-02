@@ -1319,7 +1319,6 @@ class RowLaws:
                 int(self.set.weighted),
                 int(solver.options.contact_compliance),
             ],
-            block_dim=walk_rows.SUPPORT_THREADS,
             device=model.device,
         )
 
