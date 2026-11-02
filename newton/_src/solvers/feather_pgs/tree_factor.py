@@ -2461,8 +2461,8 @@ def walk_group(bodies: int, joins: int, trees: int, sms: int) -> int:
 def walk_schedule(classes: tuple[WalkClass, ...], trees: int, sms: int) -> bool:
     """Whether the refresh runs a thread a tree with each class's topology compiled in (WM's A7r) rather than the lane
     feed's batches, from the classes' data: every class small enough that one thread's walk (its coordinates in
-    straight-line code) is shorter than the group's batches, against the trees in flight, the device at least full
-    at one lane a tree.
+    straight-line code) is shorter than the group's batches, against the trees in flight: at least a warp of trees
+    a multiprocessor (:data:`WALK_THREAD_TREES`).
 
     Args:
         classes: The walking classes.
@@ -2471,7 +2471,7 @@ def walk_schedule(classes: tuple[WalkClass, ...], trees: int, sms: int) -> bool:
     """
     if not classes or len(classes) > WALK_THREAD_CLASSES:
         return False
-    if trees < sms * WALK_RESIDENT // WALK_THREAD_FILL:
+    if trees < sms * WALK_THREAD_TREES:
         return False
     return max(walk.coordinates for walk in classes) <= WALK_THREAD_COORDINATES
 
@@ -2482,8 +2482,9 @@ WALK_THREAD_COORDINATES = 22
 WALK_THREAD_CLASSES = 4
 """The most classes one thread-a-tree launch compiles in (a switch over them)."""
 
-WALK_THREAD_FILL = 4
-"""The fraction of the device's resident threads a thread-a-tree launch fills at least (one lane a tree)."""
+WALK_THREAD_TREES = 32
+"""Trees a multiprocessor at least, one warp's worth, for a thread a tree: with fewer, the group's lanes spread a
+tree's work over the device's idle threads."""
 
 WALK_RESIDENT = 512
 """Threads of :func:`walk_step_kernel` one multiprocessor holds: its 125-127 registers (``kernel_sass``, sm_120 and
