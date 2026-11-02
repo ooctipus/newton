@@ -23,7 +23,7 @@
   "friction_patches._reset_history": "c0593949f72aca98aeb214e9f565b85fb3a15b1edeeeffd8162fee7524387533",
   "friction_patches.link_patch_routes": "f65e607f604751028563c2455d802bcb687d06e0cbad425de351b9811370b668",
   "friction_patches.seed_patch_routes": "a993470ccef188aa932295ccf4e9fe28045a9091791c260ca23c909089e2a980",
-  "held_tree._diagonal_geometry": "43facd0a12cfce24af237dd799a1a58d846510e606683c17b8eedb2e9d88acc7",
+  "held_tree._diagonal_geometry": "0f915debd052a98db8c86fd32b3bf2a9db1fcd1ba8392d72a0827de8dc7d92db",
   "kernels.allocate_joint_velocity_limit_slots": "67a0ff56c1f8c3b2c06c107d41a822cc71d55b3afce89319351b1c88a057bea7",
   "kernels.allocate_link_slots": "486e985b17405adbd3051190872d26f2d534932c4b2ecd98f50d915c769c8337",
   "kernels.allocate_mimic_slots": "7bf8888ddf69cb404e90796adf5fb089615cf3abf1b6a1afb81a4ed55d7d3d36",
