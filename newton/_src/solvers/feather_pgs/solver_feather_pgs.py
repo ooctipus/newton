@@ -715,12 +715,11 @@ class SolverFeatherPGS(SolverBase):
         # writer and the sweeps' leaves read it. The local owners' packets walk their seeds in their kernel and the one
         # writer their general worlds' rows; every local kernel leaves by the walk. The Jacobi tiers (case K4, FL3.7)
         # read the one writer's rows, or walk their keyed rows in the kernel, and leave by the walk; the keyed rows'
-        # general worlds keep their J until they convert. The support placement (case K1, FL3.4) whitens and leaves its
+        # general worlds are the one writer's (keyed_rows.keyed_general_units). The support placement (case K1, FL3.4) whitens and leaves its
         # rows by the walk too, into its support sink.
         general = self.routes.case == "K1" or bool(
             self.routes.case in ("K6", "K5", "K3", "K4")
             and self.placement.mf_sweeps
-            and self.placement.keyed_rows is None
             and np.any(self.forest.response_dof_count > 0)
         )
         # The sparse diagonal (case K2, FL3.5) walks each world's dense arm into its rows' dense parts and leaves it

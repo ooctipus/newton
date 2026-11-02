@@ -592,7 +592,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     {"case": "K4", "keyed_rows": SimpleNamespace(patch=not point, layout=layout)},
                     (16, 6),
                     "keyed_rows",
-                    same((16, 6), "keyed_rows", ["scatter_contact_keys", "materialize_general_rows"]),
+                    same((16, 6), "keyed_rows", ["scatter_contact_keys", "keyed_general_units", "write_walked_rows"]),
                 ),
                 (
                     {"compact_contact_boundary": True, "walks": True, **diagonal, **schedule},

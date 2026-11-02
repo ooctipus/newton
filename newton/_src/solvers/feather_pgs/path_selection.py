@@ -374,12 +374,12 @@ def _row_builder(solver, plan, size, source) -> dict:
         # The packets' producer records every row and its unit source; the one writer walks the general worlds' rows.
         kernels = (row_packets.produce_contacts, walk_rows.writer_kernel(solver))
     elif method == "keyed_rows":
-        from . import keyed_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
+        from . import keyed_rows, walk_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
 
         patch = bool(solver.placement.keyed_rows.patch)
-        # The parallel tiers (routes.sweep.tiers) build the direct rows in the sweep; the fallback
-        # materializes the rows of every other world.
-        kernels = (keyed_rows.scatter_contact_keys, keyed_rows.materialize_general_rows)
+        # The parallel tiers (routes.sweep.tiers) build the direct rows in the sweep; the one writer walks the rows
+        # of every other world (keyed_general_units hands them over).
+        kernels = (keyed_rows.scatter_contact_keys, keyed_rows.keyed_general_units, walk_rows.writer_kernel(solver))
     elif method == "compact_contact_boundary":
         from . import compact_contact, walk_rows  # noqa: PLC0415 - the owner's modules; loaded with the owner
 

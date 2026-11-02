@@ -988,6 +988,8 @@ class TestKeyedPatchRows(unittest.TestCase):
         size = keyed.placement.keyed_rows.layout.primary
         expected["J"] = {size: _walked_jacobian(general, joint_q, expected)}
         actual = _linked_rows(keyed, state, contacts, dt)
+        # The keyed class's general worlds are the one writer's walked rows too (keyed_rows.keyed_general_units).
+        actual["J"] = {size: _walked_jacobian(keyed, joint_q, actual)}
         live = int(contacts.rigid_contact_count.numpy()[0])
         owner = _contact_rows_by_id(expected, live)
         self.assertEqual(owner, _contact_rows_by_id(actual, live))
@@ -1722,7 +1724,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     self.assertEqual((record["producer"], record["law"]), ("keyed_rows", law))
                     builder = {
                         "method": "keyed_rows",
-                        "kernels": ["scatter_contact_keys", "materialize_general_rows"],
+                        "kernels": ["scatter_contact_keys", "keyed_general_units", "write_walked_rows"],
                         "law": law,
                         "direct_rows": "routes.sweep.tiers",
                     }

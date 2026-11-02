@@ -35,7 +35,7 @@ ROW_BUILDER_KERNELS = frozenset(
         "populate_world_J_for_compact_size",
         "produce_contacts",
         "scatter_contact_keys",
-        "materialize_general_rows",
+        "keyed_general_units",
     )
 )
 # Kernels their factories name: the support placement's writer, the sparse-diagonal schedule marker and the one
@@ -83,8 +83,8 @@ def install_cpu_keyed_rows(solver):
     )
     solver.placement.mf_constraint_count = wp.zeros(solver.forest.world_count, dtype=int, device=model.device)
     solver.placement.ink_rows = 4
-    # Case K4's rows: the producers store J for the in-kernel whitening, not the general placement's unit sources.
-    solver.placement.walks = False
+    # Case K4's class walks: the tiers walk their keyed rows in the kernel, the one writer the general worlds' rows.
+    solver.placement.walks = True
     solver.routes.case = "K4"
     solver.routes.row = dataclasses.replace(solver.routes.row, case="K4", producer="keyed_rows")
     solver.placement.keyed_rows = keyed_rows.KeyedRows(solver)
