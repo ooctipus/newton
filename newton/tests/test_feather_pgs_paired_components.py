@@ -181,7 +181,7 @@ class TestPairedComponents(unittest.TestCase):
             self.assertNotIn("split_component", sources[index])
             self.assertIn("split_component", sources[index + 2])
             begin = "for (int iter = 0; iter < iterations;"
-            end = "if (global_dof >= 0) v_out.data[global_dof] +="
+            end = "if (global_dof >= 0) walk.du.data[global_dof] +="
             original_sweep = sources[index][sources[index].index(begin) : sources[index].index(end)]
             changed_sweep = sources[index + 2][sources[index + 2].index(begin) :]
             self.assertTrue(changed_sweep.startswith(original_sweep))
@@ -253,7 +253,8 @@ class TestPairedComponentsCUDA(unittest.TestCase):
                 launch_solve_pair(baseline, old, enabled=False, device=device, iterations=iterations)
                 launch_solve_pair(candidate, new, enabled=True, device=device, iterations=iterations)
                 np.testing.assert_array_equal(candidate.selector.numpy(), [-1, -1, 3, 0, -1])
-                for name in ("v_out", "world_impulses", "mf_impulses"):
+                # The velocity change both sweeps leave in the walk's coordinates, and the impulses.
+                for name in ("du", "world_impulses", "mf_impulses"):
                     np.testing.assert_allclose(new[name].numpy(), old[name].numpy(), rtol=2e-5, atol=3e-6, err_msg=name)
                 for name, before in immutable.items():
                     np.testing.assert_array_equal(getattr(candidate, name).numpy(), before)

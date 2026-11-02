@@ -25,7 +25,7 @@ from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import articulation_factor, row_lines, whitened_rows
+from newton.tests.feather_pgs_law_harness import articulation_factor, chain_walk, leave_walk, row_lines, whitened_rows
 
 # Every serial sweep generator with velocity-limit rows: (factory, arguments, options, law sites).
 # Each site is the law call one visit of a velocity-limit row compiles (projection_laws.velocity_limit_update and
@@ -148,8 +148,9 @@ def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MAS
     """Inputs of a matrix-free sweep kernel holding the chain's two velocity-limit rows in ``order``.
 
     The rows are packed (:mod:`.packed_rows`): whitened by the chain's leaf-first factor of ``mass``, at their
-    coordinates. ``first_row`` puts that many inactive velocity-limit rows (no Jacobian, zero diagonal) before the
-    chain's, which then occupy rows ``first_row`` and ``first_row + 1``.
+    coordinates. The sweep adds its change into ``walk.du`` (the chain's walk, :func:`.chain_walk`), which the step's
+    leave (:func:`.leave_walk`) carries onto ``v_out``. ``first_row`` puts that many inactive velocity-limit rows (no
+    Jacobian, zero diagonal) before the chain's, which then occupy rows ``first_row`` and ``first_row + 1``.
     """
     rows = list(order)
     count = first_row + 2
@@ -203,6 +204,7 @@ def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MAS
         "mf_Z_a": zero_spatial,
         "mf_Z_b": zero_spatial,
         "factors": factors,
+        "walk": chain_walk(device, [factor]),
         "mf_row_mu": zero_float,
         "mf_row_w": zero_float,
         "iterations": iterations,
@@ -232,6 +234,7 @@ class TestVelocityLimitLawKernels(unittest.TestCase):
         for order in ((0, 1), (1, 0)):
             values = _dense_row_values(device, order=order, iterations=64)
             wp.launch_tiled(kernel, dim=[1], inputs=_launch_inputs(kernel, values), block_dim=32, device=device)
+            leave_walk(values["walk"], values["v_out"], device)
             velocities[order] = values["v_out"].numpy().astype(np.float64)
             expected, impulses = serial_velocity_limit_reference(
                 _CHAIN_MASS, _CHAIN_VELOCITY, _CHAIN_JACOBIAN[list(order)], _CHAIN_BIAS[list(order)], iterations=64

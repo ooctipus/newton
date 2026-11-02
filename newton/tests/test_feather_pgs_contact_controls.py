@@ -10,12 +10,11 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import field_group, response_builds_rows
+from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.contact_input import ContactInput, ContactRoutes
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows, MfRows
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.kernels import (
-    BodyFactors,
     allocate_world_contact_slots,
     compute_contact_linear_force_from_impulses,
     compute_world_contact_bias,
@@ -23,6 +22,8 @@ from newton._src.solvers.feather_pgs.kernels import (
     populate_world_J_for_size,
     prepare_world_contact_rows,
 )
+from newton._src.solvers.feather_pgs.tree_factor import WalkTrees
+from newton._src.solvers.feather_pgs.walk_rows import free_body_headers_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import group_rows, row_lines
 from newton.tests.feather_pgs_patch_parity import row_law
@@ -246,7 +247,7 @@ def _mf_speculative_rhs(scale: float) -> float:
     """Return the MF setup RHS for a requested speculative scale."""
     rhs = wp.zeros((1, 1), dtype=wp.float32, device="cpu")
     wp.launch(
-        response_builds_rows.free_body_rows_kernel,
+        free_body_headers_kernel,
         dim=1,
         inputs=[
             field_group.upload(
@@ -265,7 +266,8 @@ def _mf_speculative_rhs(scale: float) -> float:
                 first=row_lines("cpu"),
             ),
             wp.array([1], dtype=wp.int32, device="cpu"),
-            BodyFactors(),
+            WalkTrees(),
+            wp.zeros(1, dtype=wp.int32, device="cpu"),
             0,
             wp.zeros((1,), dtype=wp.float32, device="cpu"),
             wp.array([float("inf")], dtype=wp.float32, device="cpu"),

@@ -332,7 +332,8 @@ def _solve_parent_rows(device, parents):
         inputs=[values[name] for name in inspect.signature(kernel.func).parameters],
     )
     impulses = values["mf_impulses"].numpy()
-    return values["v_out"].numpy(), np.asarray([impulses[w, p : p + 3] for w, p in enumerate(parents)])
+    # The velocity change the sweep leaves in the walk's coordinates (the step's one leave walks it down).
+    return values["du"].numpy(), np.asarray([impulses[w, p : p + 3] for w, p in enumerate(parents)])
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "MF-GS native solve requires CUDA")

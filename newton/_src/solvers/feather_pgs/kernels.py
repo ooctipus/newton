@@ -1998,9 +1998,8 @@ def populate_world_J_for_compact_size(
 # free-body row is whitened, ``Z = L^-1 P J^T`` per body, and the sweeps hold the change of the body's velocity in
 # factor coordinates ``u = L^T P dv``: a row's velocity term is ``Z^T u``, its update ``u += Z dlambda``, and ``dv = P^T
 # L^-T u`` leaves them. Factor coordinate ``i`` of ``Z`` and ``u`` sits at position ``5 - i``, the physical coordinate it
-# reverses (:func:`.response_operator.leaf_first`). The factor's two actions below take
-# :class:`.response_operator.CholeskySolve`'s orders and its zero-diagonal convention (a zero pivot gives zero),
-# which the native sweeps emit.
+# reverses (:func:`.response_operator.leaf_first`). The walk whitens the rows and leaves them (:mod:`.walk_rows`,
+# :func:`.tree_factor.walk_leave_kernel`).
 
 
 @wp.struct
@@ -2025,27 +2024,6 @@ class BodyFactors:
     size: wp.array[int]
     world_offset: wp.array[int]
     address: wp.array[wp.uint64]
-
-
-@wp.func
-def free_body_factor(body: int, factors: BodyFactors) -> int:
-    """The index of ``body``'s held factor in ``factors.L``, -1 for no body."""
-    if body < 0:
-        return -1
-    return factors.factor_index[factors.body_to_articulation[body]]
-
-
-@wp.func
-def factor_whiten(L: wp.array3d[float], factor: int, x: wp.spatial_vector) -> wp.spatial_vector:
-    """``z = L^-1 P x``: rows ascending, each ``x`` less the earlier rows' terms in order, over its pivot."""
-    z = wp.spatial_vector()
-    for row in range(6):
-        value = x[5 - row]
-        for k in range(row):
-            value -= L[factor, row, k] * z[5 - k]
-        pivot = L[factor, row, row]
-        z[5 - row] = wp.where(pivot != 0.0, value / pivot, 0.0)
-    return z
 
 
 @wp.kernel

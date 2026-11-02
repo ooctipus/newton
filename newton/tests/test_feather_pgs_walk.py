@@ -140,22 +140,14 @@ def catalogue() -> list:
 
 
 class Capture:
-    """The rows a step builds, around their whitening (:meth:`.Placement.pack_rows`, the free bodies'
-    :meth:`.Placement.whiten_free_bodies`): each call keeps its last values."""
+    """The rows a step builds, around the free bodies' headers (:meth:`.Placement.whiten_free_bodies`): each call keeps
+    its last values."""
 
     def __init__(self, solver):
         self.solver = solver
-        self.J = self.Z = self.mf = None
+        self.mf = None
         placement = solver.placement
-        pack, free = placement.pack_rows, placement.whiten_free_bodies
-
-        def pack_rows(*args, **kwargs):
-            J = placement.packed_Z.numpy().copy()
-            result = pack(*args, **kwargs)
-            self.J, self.Z = J, placement.packed_Z.numpy().copy()
-            self.sides = placement.row_sides.numpy().copy()
-            self.counts = placement.constraint_count.numpy().copy()
-            return result
+        free = placement.whiten_free_bodies
 
         def whiten_free_bodies(*args, **kwargs):
             J = (placement.mf_Z_a.numpy().copy(), placement.mf_Z_b.numpy().copy())
@@ -164,7 +156,6 @@ class Capture:
             self.mf = (J, Z)
             return result
 
-        placement.pack_rows = pack_rows
         placement.whiten_free_bodies = whiten_free_bodies
 
     def finish(self):
@@ -334,48 +325,12 @@ def check_rows(solver, joint_q: np.ndarray, capture: Capture, rng) -> RowCheck:
             out.seed = max(out.seed, np.linalg.norm(z_seed - written) / np.linalg.norm(written))
             seeds.setdefault(art, []).append((body, w, z_seed))
 
-    if capture.J is not None:
-        for world, count in enumerate(capture.counts):
-            seeds, line = {}, int(capture.dense_first[world])
-            for row in range(int(count)):
-                out.rows += 1
-                first = 0
-                for art in capture.sides[line, row]:
-                    if art < 0:
-                        continue
-                    n, offset = int(sizes[art]), int(offsets[art])
-                    at = offset if dense else first
-                    first += n
-                    entries = slice(at, at + n)
-                    x = capture.J[line, row, entries].astype(np.float64)
-                    compare(art, x, capture.Z[line, row, entries].astype(np.float64), seeds)
-            # Two walks meet at their LCA: pairs of seeded sides of one tree.
-            for art, sided in seeds.items():
-                walk = walks[art][0]
-                for _ in range(min(8, len(sided) ** 2)):
-                    (k, w_k, z_k), (l, w_l, z_l) = sided[rng.integers(len(sided))], sided[rng.integers(len(sided))]
-                    met = walk.meet(k, w_k, l, w_l)
-                    out.meet = max(out.meet, abs(met - z_k @ z_l) / (np.linalg.norm(z_k) * np.linalg.norm(z_l)))
-    body_art = forest.body_to_articulation.numpy()
     # The walked free-body rows form no J (walk_rows): test_feather_pgs_walk_rows holds them to their J v_hat.
-    if capture.mf is not None and not getattr(solver.placement, "walks", False):
-        (J_a, J_b), (Z_a, Z_b) = capture.mf
-        _, _, _, counts, body_a, body_b, _, _, kinds = capture.mf_final
-        for world, count in enumerate(counts):
-            line = int(capture.mf_first[world])
-            for row in range(int(count)):
-                if kinds[line, row] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
-                    continue
-                out.free_rows += 1
-                for body, J, Z in ((body_a, J_a, Z_a), (body_b, J_b, Z_b)):
-                    if body[line, row] >= 0:
-                        art = int(body_art[body[line, row]])
-                        compare(art, J[line, row].astype(np.float64), Z[line, row].astype(np.float64), {})
     # The leave: the step's du is sum Z lambda over its final rows; each articulation leaves it once.
     D = int(forest.max_world_dofs)
     du = np.zeros((int(forest.world_count), max(D, 1)))
-    # Every stored row's footprints, the pack's or the one writer's (FL3.3, whose rows form no J).
-    if capture.J is not None or getattr(solver.placement, "walks", False):
+    # Every stored row's footprints, the one writer's (FL3.3, whose rows form no J).
+    if getattr(solver.placement, "walks", False):
         for world, count in enumerate(capture.counts):
             line = int(capture.dense_first[world])
             for row in range(int(count)):
@@ -392,7 +347,7 @@ def check_rows(solver, joint_q: np.ndarray, capture: Capture, rng) -> RowCheck:
                     first += n
     ball = np.zeros(du.shape[0], dtype=bool)
     if capture.mf_final is not None:
-        Z_a, Z_b, lam, counts, body_a, body_b, dof_a, dof_b, kinds = capture.mf_final
+        Z_a, Z_b, lam, counts, _, _, dof_a, dof_b, kinds = capture.mf_final
         for world, count in enumerate(counts):
             line = int(capture.mf_first[world])
             for row in range(int(count)):

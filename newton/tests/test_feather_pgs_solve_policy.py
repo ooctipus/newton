@@ -224,6 +224,19 @@ def _vote_census():
             yield name, factory, args, kwargs
 
 
+def _with_readout(name: str, labels: list[str], count: int) -> list[str]:
+    """Factory ``name``'s labels with ``count`` readout operands appended: last, but before the paired sweep's walk,
+    which it takes after them."""
+    if name == "paired":
+        return labels[:-1] + ["readout"] * count + labels[-1:]
+    return labels + ["readout"] * count
+
+
+def _readout_arg(kernel):
+    """The kernel's readout operand."""
+    return next(argument for argument in kernel.adj.args if argument.label == "readout")
+
+
 class TestSolvePolicy(unittest.TestCase):
     """The frozen policy, its emitters and the factories that take it."""
 
@@ -284,15 +297,16 @@ class TestSolvePolicy(unittest.TestCase):
                 self.assertNotIn("solve_readout_sweeps", "".join(_native_snippets(kernel)))
 
     def test_readout_appends_one_operand_prelude_and_exit_record(self):
-        """Append the readout operand last, declare its prelude after the law and record every solve once."""
+        """Append the readout operand last (the paired sweep's walk follows it), declare its prelude after the law
+        and record every solve once."""
         for name, factory, args, kwargs in _factory_calls():
             with self.subTest(factory=name):
                 exact = factory(*args, **kwargs)
                 kernel = factory(*args, solve_policy=SWEEPS, **kwargs)
                 self.assertEqual(kernel.key, exact.key + "_sweeps")
                 labels = [argument.label for argument in kernel.adj.args]
-                self.assertEqual(labels, [argument.label for argument in exact.adj.args] + ["readout"])
-                self.assertIs(kernel.adj.args[-1].type, SolveReadout)
+                self.assertEqual(labels, _with_readout(name, [argument.label for argument in exact.adj.args], 1))
+                self.assertIs(_readout_arg(kernel).type, SolveReadout)
                 snippets = {snippet for snippet in _native_snippets(kernel) if "solve_readout_sweeps" in snippet}
                 self.assertEqual(len(snippets), 1)
                 (snippet,) = snippets
@@ -436,7 +450,9 @@ class TestExitLaw(unittest.TestCase):
                 kernel = factory(*args, solve_policy=policy, **kwargs)
                 self.assertEqual(kernel.key, plain.key + policy.suffix, kwargs)
                 labels = [argument.label for argument in kernel.adj.args]
-                self.assertEqual(labels, [argument.label for argument in plain.adj.args] + ["readout"] * policy.counts)
+                self.assertEqual(
+                    labels, _with_readout(name, [argument.label for argument in plain.adj.args], policy.counts)
+                )
                 snippet = max(_native_snippets(kernel), key=len)
                 if len(_LAW_SITE.findall(snippet)) != law_sites or ("s_meta_dense" in snippet) != (
                     "s_meta_dense" in body
@@ -476,7 +492,7 @@ class TestExitLaw(unittest.TestCase):
         for name, factory, args, kwargs in _factory_calls():
             with self.subTest(factory=name):
                 kernel = factory(*args, solve_policy=TRACE, **kwargs)
-                self.assertIs(kernel.adj.args[-1].type, SolveTrace)
+                self.assertIs(_readout_arg(kernel).type, SolveTrace)
                 snippet = _policy_snippet(self, kernel, "solve_trace_sweep(")
                 body = snippet.split(SWEEP_TRACE.source, 1)[1]
                 votes = sum("changed = 1;" in line for line in body.splitlines())
@@ -500,7 +516,7 @@ class TestExitLaw(unittest.TestCase):
         self.assertIn("ProjectionLaw::friction_ball(", snippet)
         self.assertIn("ConeLaw::ball(", snippet)
         kernel = sweep_routes.mf_gs_kernel.__wrapped__(64, 32, 12, "120", solve_policy=SWEEPS, **options)
-        self.assertIs(kernel.adj.args[-1].type, SolveReadout)
+        self.assertIs(_readout_arg(kernel).type, SolveReadout)
 
     def test_active_rows_stop_only_once_every_unvisited_row_is_quiet(self):
         """Stop an active-row sparse sweep only after a scan finds no unvisited zero-impulse row a visit would move

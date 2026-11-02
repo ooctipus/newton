@@ -151,8 +151,7 @@ DENSE_ROWS = FieldGroup(
     Field("row_sides", wp.vec2i, ("world", "row"), owner="placement"),
 )
 """Every world's dense rows: the system and the row records (with each row's sides). ``row_incident`` is each row's
-incident velocity ``J v_hat``, written where its ``J`` is in registers: its producer, or the rows' pass
-(:func:`.packed_rows.pack_kernel`)."""
+incident velocity ``J v_hat``, written where its walk sums it: the one writer (:mod:`.walk_rows`)."""
 
 DENSE_ROW_WEIGHTS = FieldGroup(Field("row_w", wp.float32, ("world", "row"), fill=1.0, owner="placement"))
 """Per-row weights of the regularized row law: the relative option's (speculative and restitution rows keep the rigid

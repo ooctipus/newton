@@ -16,9 +16,9 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import field_group
+from newton._src.solvers.feather_pgs import field_group, response_builds_rows
 from newton._src.solvers.feather_pgs.paired_components import PairedComponentData
-from newton._src.solvers.feather_pgs.response_operator import FactorRows, FreeBodyZ
+from newton._src.solvers.feather_pgs.response_operator import FreeBodyZ
 from newton._src.solvers.feather_pgs.tree_factor import WALK_COORDINATE
 from newton.tests.feather_pgs_law_harness import row_lines, walk_inverse
 
@@ -38,7 +38,7 @@ class TestFreeBodyZBuild(unittest.TestCase):
         self.assertIn("int dof_b = (packed_dofs << 16) >> 16;", consume)
         self.assertIn("float mf_diag = __int_as_float(meta.y);", consume)
         with self.assertRaises(ValueError):
-            FreeBodyZ.build().meta(70000, "sm_120")
+            response_builds_rows.free_body_meta_kernel(70000, "sm_120")
 
     def test_rows_see_the_dynamics_mass_matrix(self):
         """Whiten a free box's contact rows by the factor of its dynamics' mass matrix, armature included.
@@ -148,7 +148,9 @@ class TestFactorRowsBuild(unittest.TestCase):
             for qualified in (True, False):
                 with self.subTest(primary=P, qualified=qualified):
                     data = _components_data(P, np.random.default_rng(37), qualified=qualified)
-                    wp.launch(FactorRows.build().components(P), dim=(2, 128), inputs=[2, data], device=DEVICE)
+                    wp.launch(
+                        response_builds_rows.paired_components_kernel(P), dim=(2, 128), inputs=[2, data], device=DEVICE
+                    )
                     self.assertEqual(list(data.selector.numpy()), [-1 if qualified else 3, 3])
 
 
@@ -180,8 +182,8 @@ class TestNativeBuildsAssemble(unittest.TestCase):
 
     def test_native_builds_assemble_without_spills(self):
         builds = {
-            "free-body words": lambda: FreeBodyZ.build().meta(64, "sm_120"),
-            "paired components": lambda: FactorRows.build().components(22),
+            "free-body words": lambda: response_builds_rows.free_body_meta_kernel(64, "sm_120"),
+            "paired components": lambda: response_builds_rows.paired_components_kernel(22),
         }
         for name, build in builds.items():
             with self.subTest(build=name):

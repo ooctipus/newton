@@ -22,8 +22,9 @@ solved, not that they are right.
 
 Each row store fills the rows' ``J_i v+ + eps_i lambda_i`` (:func:`packed_rows`, :func:`sparse_rows`,
 :func:`diagonal_rows`, :func:`free_rows`), and one kernel applies the law to the stores (:func:`audit_world`). Packed
-rows are read as ``Z_i^T u+`` with ``u+ = L^T P v+`` and the sparse diagonal's likewise, so a defect in leaving factor
-coordinates shows too, and corrected rows and targets agree on a closure. Native sparse rows hold no dense factor and
+rows are read as ``Z_i^T u+`` with ``u+`` the walk's coordinates of ``v+`` (:func:`.tree_factor.walk_enter_kernel`) and
+the sparse diagonal's likewise, so a defect in leaving factor coordinates shows too, and corrected rows and targets agree
+on a closure. Native sparse rows hold no dense factor and
 read their own ``J_i v_hat + Z_i^T du``. A world whose rows exist only inside its sweep (keyed rows, row packets) has
 none to read: it reports NaN and is not summed.
 """
@@ -119,38 +120,6 @@ def tier_world(a: AuditRows, world: int) -> bool:
 def local_world(a: AuditRows, world: int) -> bool:
     """Whether the row packets hold ``world``'s rows."""
     return a.skip_local != 0 and a.owner[world] != PGS_LOCAL_SOLVE_OWNER_GENERAL
-
-
-@wp.kernel(enable_backward=False)
-def enter(
-    a: AuditRows,
-    L: wp.array3d[float],
-    group_to_art: wp.array[int],
-    art_to_world: wp.array[int],
-    dof_start: wp.array[int],
-    world_offset: wp.array[int],
-    n: int,
-    velocity: wp.array[float],
-    coordinates: wp.array2d[float],
-):
-    """One thread per articulation of a size group: its coordinates as its world's rows read them, ``u = L^T P v`` at
-    the factor's reversed positions where the rows are whitened, ``v`` where the store keeps ``J``."""
-    group = wp.tid()
-    art = group_to_art[group]
-    world = art_to_world[art]
-    offset = world_offset[art]
-    if world < 0 or offset < 0:
-        return
-    start = dof_start[art]
-    if tier_world(a, world) or a.owner[world] != PGS_LOCAL_SOLVE_OWNER_GENERAL:
-        for e in range(n):
-            coordinates[world, offset + e] = velocity[start + e]
-        return
-    for k in range(n):
-        u = float(0.0)
-        for j in range(k, n):
-            u += L[group, j, k] * velocity[start + n - 1 - j]
-        coordinates[world, offset + n - 1 - k] = u
 
 
 @wp.func
@@ -304,25 +273,6 @@ def limit_row(total: wp.vec3, impulse: float, term: float, bias: float) -> wp.ve
 
 
 @wp.func
-def free_side(
-    Z: wp.array3d[float], line: int, row: int, body: int, factors: BodyFactors, velocity: wp.array[float]
-) -> float:
-    """``Z_side^T (L^T P v)``: one side of a whitened free-body row over the published velocity."""
-    if body < 0:
-        return 0.0
-    art = factors.body_to_articulation[body]
-    start = factors.dof_start[art]
-    factor = factors.factor_index[art]
-    out = float(0.0)
-    for k in range(6):
-        u = float(0.0)
-        for j in range(k, 6):
-            u += factors.L[factor, j, k] * velocity[start + 5 - j]
-        out += Z[line, row, 5 - k] * u
-    return out
-
-
-@wp.func
 def walked_side(
     Z: wp.array3d[float],
     line: int,
@@ -353,14 +303,12 @@ def free_rows(
     weights: wp.array2d[float],
     inverse_diagonals: wp.array2d[float],
     v: wp.array[float],
-    walked: int,
     world_offset: wp.array[int],
     coordinates: wp.array2d[float],
     velocity: wp.array2d[float],
 ):
-    """One thread per world: each free-body row's ``J_i v+ + eps_i lambda_i``, its sides in the held factor's
-    coordinates, or with ``walked`` (a placement that walks) the walk's (``coordinates``, by world coordinate). A speed
-    row's term is ``-|v|`` of the coordinates its unwhitened axis marks, linear from ``e_0`` or angular from ``e_3``,
+    """One thread per world: each free-body row's ``J_i v+ + eps_i lambda_i``, its sides over the walk's coordinates
+    (``coordinates``, by world coordinate). A speed row's term is ``-|v|`` of the coordinates its unwhitened axis marks, linear from ``e_0`` or angular from ``e_3``,
     its bias the limit (:func:`.projection_laws.speed_row`)."""
     world = wp.tid()
     line = mf.first[world]
@@ -373,13 +321,8 @@ def free_rows(
                 start += 3
             velocity[world, i] = -wp.length(wp.vec3(v[start], v[start + 1], v[start + 2]))
             continue
-        term = float(0.0)
-        if walked != 0:
-            term = walked_side(mf.Z_a, line, i, body, factors, world, world_offset, coordinates)
-            term += walked_side(mf.Z_b, line, i, mf.body_b[line, i], factors, world, world_offset, coordinates)
-        else:
-            term = free_side(mf.Z_a, line, i, body, factors, v)
-            term += free_side(mf.Z_b, line, i, mf.body_b[line, i], factors, v)
+        term = walked_side(mf.Z_a, line, i, body, factors, world, world_offset, coordinates)
+        term += walked_side(mf.Z_b, line, i, mf.body_b[line, i], factors, world, world_offset, coordinates)
         inverse = inverse_diagonals[line, i]
         if inverse > 0.0:
             weight = float(1.0)
@@ -497,13 +440,6 @@ class Audit:
             row=solver.placement.dense_max_constraints,
             mf_row=solver.placement.mf_max_constraints,
         )
-        # A class whose placement walks reads every tree's coordinates in the walk's frame; only a placement that still
-        # whitens its rows by the dense factor reads that factor's.
-        self.sizes = (
-            ()
-            if solver.placement.walks
-            else tuple(size for size in forest.size_groups if solver.factor.L_by_size[size].shape[1] == size)
-        )
         self.coordinates_hat = wp.zeros_like(self.coordinates)
         # A class whose local owners read the one writer's rows (FL3.6, no packets) has every world's rows stored: the
         # audit reads every world as the general placement's.
@@ -604,22 +540,6 @@ class Audit:
             ]
             wp.launch(fused_limits, dim=worlds, inputs=limits, outputs=[self.fused], device=device)
         else:
-            for size in self.sizes:
-                inputs = [
-                    a,
-                    solver.factor.L_by_size[size],
-                    forest.group_to_art[size],
-                    forest.art_to_world,
-                    forest.articulation_dof_start,
-                    forest.articulation_world_dof_offset,
-                    size,
-                    v,
-                ]
-                dim = forest.n_arts_by_size[size]
-                wp.launch(enter, dim=dim, inputs=inputs, outputs=[self.coordinates], device=device)
-                wp.launch(
-                    enter, dim=dim, inputs=[*inputs[:-1], solver.v_hat], outputs=[self.coordinates_hat], device=device
-                )
             if solver.placement.walks:
                 # The one writer's rows are the walk's (walk_rows): their trees' coordinates are the walk's too.
                 self._walk_coordinates(v, self.coordinates)
@@ -643,7 +563,6 @@ class Audit:
                 solver.placement.mf_row_w,
                 solver.placement.mf_eff_mass_inv,
                 v,
-                int(solver.placement.walks),
                 forest.articulation_world_dof_offset,
                 self.coordinates,
             ]

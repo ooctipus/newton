@@ -141,7 +141,11 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
 
     def test_free_body_one_thread(self):
         op = FreeBodyZ(
-            Lanes(1), velocity=Velocity("s_vel"), inverse=lambda row: f"inv[{row}]", factor=lambda f: f"F[{f}]"
+            Lanes(1),
+            velocity=Velocity("s_vel"),
+            inverse=lambda row: f"inv[{row}]",
+            walk_leave=lambda first, values: f"WALK_LEAVE_OF({first}, {values});",
+            walk_enter=lambda first, velocity, out: f"WALK_ENTER_OF({first}, {velocity}, {out});",
         )
         residual = op.residual("jv", "")
         # Each side's six products as one expression, added to the residual: a's, then b's.
@@ -159,16 +163,25 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
         coupling = op.coupling("cross", "i", "sib", "")
         self.assertIn("float cross = 0.0f;", coupling)
         self.assertIn("cross += mf_Z_a.data[mf6_base + i * 6 + k] * mf_Z_a.data[mf6_base + sib * 6 + k];", coupling)
-        # A speed row reads the body's physical velocity v = L^-T u through its factor, then pushes u by L^T dv.
+        # A speed row reads the body's physical velocity v = L^-T u by its walk, then pushes u by L^T dv the same way.
         speed = op.speed("speed", "f", "axis", "")
         self.assertIn("speed_v[k] = s_vel[f + k];", speed)
-        self.assertIn("(factors.L.data + (F[f]) * 36)", speed)
+        self.assertIn("WALK_LEAVE_OF(f, speed_v);", speed)
         self.assertIn("sqrtf((speed_v[axis] * speed_v[axis] + speed_v[axis + 1] * speed_v[axis + 1])", speed)
-        self.assertIn("s_vel[f + k] += speed_dv[k];", op.scale_speed("s", "f", "axis", ""))
+        scaled = op.scale_speed("s", "f", "axis", "")
+        self.assertIn("WALK_ENTER_OF(f, speed_dv, speed_du);", scaled)
+        self.assertIn("s_vel[f + k] += speed_du[k];", scaled)
+        # Without its walk a body has no velocity for a speed row to read.
+        with self.assertRaises(ValueError):
+            FreeBodyZ(Lanes(1)).speed("speed", "f", "axis", "")
         self.assertEqual(op.step("r", "i"), "-r * inv[i]")
 
     def test_free_body_lanes_keep_their_text(self):
-        op = FreeBodyZ(Lanes(32), factor=lambda f: f"F[{f}]")
+        op = FreeBodyZ(
+            Lanes(32),
+            walk_leave=lambda first, values: f"WALK_LEAVE_OF({first}, {values});",
+            walk_enter=lambda first, velocity, out: f"WALK_ENTER_OF({first}, {velocity}, {out});",
+        )
         self.assertIn(
             "SUM(sibling_residual);\nsibling_residual += rhs;", op.sibling_residual("sibling_residual", "s", "", "rhs")
         )
