@@ -1288,8 +1288,9 @@ class RowLaws:
         )
 
     def write_support(self, solver, state_in, contacts: Contacts | None, dt: float) -> None:
-        """Case K1's writer (:func:`.walk_rows.support_rows_kernel`): a world's lane group over its units, into the support
-        sink, each row of a slipping tree released by the predictor's border."""
+        """Case K1's writer in two launches: the step's units listed, with the contact rows' records
+        (:func:`.walk_rows.support_units_kernel`), then the walkers over the list into the support sink, a lane a unit
+        (:func:`.walk_rows.support_rows_kernel`), each row of a slipping tree released by the predictor's border."""
         placement, model, sweep = solver.placement, solver.model, solver.sweep
         contact_input = (
             bind_contact_input(solver, state_in, solver.factor, contacts, dt, 1.0)
@@ -1298,16 +1299,27 @@ class RowLaws:
         )
         mimics = self.mimic_count > 0
         dummy_int, dummy_float = placement.dummy_is_free_rigid, placement.contact_row_eps_dummy.flatten()
+        dense_rows, law = bind_dense_rows(placement), patch_row_law(solver)
+        sink = sweep.support_sink(solver.v_hat)
+        units = sweep.support_units
+        units.count.zero_()
+        wp.launch(
+            sweep.support_units_kernel,
+            dim=(solver.forest.world_count, sweep.support_lanes),
+            inputs=[dense_rows, placement.unit_source, placement.constraint_count, contact_input, law, units],
+            device=model.device,
+        )
         wp.launch(
             sweep.support_rows,
-            dim=(solver.forest.world_count, sweep.support_lanes),
+            dim=sweep.support_threads,
             inputs=[
-                bind_dense_rows(placement),
+                dense_rows,
                 placement.unit_source,
-                placement.constraint_count,
+                units,
+                sweep.support_threads,
                 contact_input,
-                patch_row_law(solver),
-                sweep.support_sink(solver.v_hat),
+                law,
+                sink,
                 self._mimic_dof0 if mimics else dummy_int,
                 self._mimic_dof1 if mimics else dummy_int,
                 model.constraint_mimic_coef1 if mimics else dummy_float,

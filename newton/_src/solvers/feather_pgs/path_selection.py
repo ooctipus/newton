@@ -362,12 +362,12 @@ def _row_builder(solver, plan, size, source) -> dict:
         # walks every row (walk_rows): the general placement's into its packed rows, the support placement's (K1)
         # into its support sink, the sparse diagonal's (K2) into its slots sink.
         if solver.routes.case == "K1":
-            writer = solver.sweep.support_rows
+            writers = (solver.sweep.support_units_kernel, solver.sweep.support_rows)
         elif solver.routes.case == "K2":
-            writer = walk_rows.write_slot_rows
+            writers = (walk_rows.write_slot_rows,)
         else:
-            writer = walk_rows.writer_kernel(solver)
-        kernels = (writer, *marker)
+            writers = (walk_rows.writer_kernel(solver),)
+        kernels = (*writers, *marker)
     elif method == "local_packets":
         from . import row_packets, walk_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
 
@@ -515,6 +515,7 @@ def _sparse_mass_matrix(solver) -> dict:
                 "max_row_support": json_value(solver.placement.sparse_max_row_support),
                 "solve_lanes": int(solver.sweep.sparse_solve_lanes),
                 "local_factors": bool(solver.sweep.sparse_local_factors),
+                "units_kernel": _key(solver.sweep.support_units_kernel),
                 "writer_kernel": _key(solver.sweep.support_rows),
                 "leave_kernel": _key(solver.factor.walk_leave),
                 "sweep_kernel": _key(solver.sweep.sparse_kernel),
