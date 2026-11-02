@@ -535,7 +535,8 @@ class Sweep:
         """Select sparse articulation factors with independent rigid-body response blocks."""
         self.placement.sparse_mass_matrix_size = None
         self.sparse_velocity_limits = False
-        self.support_rows = self._support_sink = None
+        self.support_rows = self.support_units_kernel = self._support_sink = None
+        self.support_units = None
         self.support_du_index = None
         self.leaves = False
         self.placement.sparse_row_support = _SparseRowSupport()
@@ -788,12 +789,12 @@ class Sweep:
         (:meth:`.tree_factor.TreeFactor.plan_walk`).
 
         The class's tree (every articulation of the factored size shares it) and each coordinate's factor coordinate,
-        the support masks' bit, are baked into the writer (:func:`.walk_rows.support_rows_kernel`) and the leave
-        (the step's one leave, :func:`.tree_factor.walk_leave_kernel`, reading the sparse sweep's change through
-        ``support_du_index``). The writer's lane group is the smallest power of two at or above a
-        world's unit bound (its internal rows and a contact unit per three rows of the rest of its capacity), at most a
-        warp. The release is the factor's (:attr:`.tree_factor.WalkTrees.release`), built by
-        :func:`.walk_rows.walk_release_kernel`.
+        the support masks' bit, are baked into the writer's walkers (:func:`.walk_rows.support_rows_kernel`) and the
+        leave (the step's one leave, :func:`.tree_factor.walk_leave_kernel`, reading the sparse sweep's change through
+        ``support_du_index``). The writer's first launch (:func:`.walk_rows.support_units_kernel`) lists the step's
+        units, a world's lane group of :data:`.walk_rows.SUPPORT_UNIT_LANES` over its rows; its walkers stride over the
+        list on lanes sized to the GPU (:func:`.walk_rows.support_threads`). The release is the factor's
+        (:attr:`.tree_factor.WalkTrees.release`), built by :func:`.walk_rows.walk_release_kernel`.
 
         Raises:
             ValueError: For a factored size whose articulations do not share one tree.
@@ -810,17 +811,11 @@ class Sweep:
         parent = tuple(int(p) for p, _ in table)
         first = (*(int(f) for _, f in table), int(size))
         node = tuple(int(k) for k in factor.sparse_mass_matrix_plan.inverse_permutation)
-        capacity = int(self.placement.dense_max_constraints)
-        internal = min(int(self.placement.internal_rows_per_world(model)), capacity)
-        units = max(internal + (capacity - internal + 2) // 3, 1)
-        self.support_lanes = min(32, 1 << (units - 1).bit_length())
+        torsion = bool(self.laws.contact_torsion_enabled)
+        self.support_lanes = walk_rows.SUPPORT_UNIT_LANES if wp.get_device(model.device).is_cuda else 1
+        self.support_units_kernel = walk_rows.support_units_kernel(4 if torsion else 3, self.support_lanes)
         self.support_rows = walk_rows.support_rows_kernel(
-            parent,
-            first,
-            node,
-            records=self.placement.sparse_contact_records is not None,
-            torsion=bool(self.laws.contact_torsion_enabled),
-            lanes=self.support_lanes,
+            parent, first, node, records=self.placement.sparse_contact_records is not None, torsion=torsion
         )
         # Where the step's one leave reads each coordinate's change (tree_factor.walk_leave_kernel): the sparse sweep
         # publishes it in factor coordinates (factor_velocity_delta), so a tree coordinate reads its factor
@@ -853,6 +848,9 @@ class Sweep:
             records = placement.sparse_contact_records
             sink.records = records if records is not None else placement.sparse_row_factor
             self._support_sink = sink
+            worlds, capacity = sink.row_factor.shape[0], sink.row_factor.shape[1]
+            self.support_units = walk_rows.unit_list(worlds, capacity, self.model.device)
+            self.support_threads = walk_rows.support_threads(worlds * capacity, self.model.device)
         return self._support_sink
 
     def admit_paired(self) -> None:

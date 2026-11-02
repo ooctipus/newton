@@ -31,10 +31,12 @@ the rhs.
 No ``J`` is formed. The rows and the sweeps' leave (:class:`.sweep_routes.FactorCoordinates`, ``walk``; the paired
 factor sweep's) share the walk's one frame (FL3_design §1.2).
 
-**The support placement (case K1, FL3.4)** writes the same rows into its support sink (:func:`support_rows_kernel`):
-a world's lane group strides over its units, a lane walks a unit's rows together (a contact's 1, 3 or 4, a joint row's
-1) through the class's path table in constant memory, and stores each footprint at its rank in the row's support
-(factor coordinates), the unit's Gram, its records and its header from the same walk. A slipping drive's ``K`` leaves
+**The support placement (case K1, FL3.4)** writes the same rows into its support sink in two launches: the step's
+units listed (:func:`support_units_kernel`, :class:`UnitList`: a world's lane group over its rows, the contact rows'
+records with them), then the walkers over the list (:func:`support_rows_kernel`), the work sized by the step's units
+and not by the rows' capacity: a lane walks a unit's rows together (a contact's 1, 3 or 4, a joint row's 1) through the
+class's path table in constant memory, the units of one walker together, and stores each footprint at its rank in the
+row's support (factor coordinates), the unit's Gram, its records and its header from the same walk. A slipping drive's ``K`` leaves
 the rows and the leave by its release along its path (the predictor's border, :func:`.tree_kinetic_state.border_solve`): the block primitive with
 the path's coordinate basis, which keeps every row inside its support. Its sweep's change goes to the step's one leave
 (:func:`.tree_factor.walk_leave_kernel`).
@@ -85,12 +87,17 @@ from .tree_factor import (
 )
 
 __all__ = [
+    "SUPPORT_UNIT_LANES",
     "SlotRows",
     "SupportSink",
     "SupportUnit",
+    "UnitList",
     "bind_slot_rows",
     "free_body_headers_kernel",
     "support_rows_kernel",
+    "support_threads",
+    "support_units_kernel",
+    "unit_list",
     "walked_rows_kernel",
     "write_free_body_rows",
     "write_slot_rows",
@@ -975,24 +982,150 @@ class SupportUnit:
     value1: float
 
 
+SUPPORT_UNIT_LANES = 16
+"""A world's lane group in the support writer's first launch (:func:`support_units_kernel`): its rows' records and
+units, a lane a row; the walkers' lanes (:func:`support_threads`) do not depend on it."""
+
+UNIT_BUCKETS = 16
+"""The unit list's buckets (:class:`UnitList`): a world's units go to bucket ``world % UNIT_BUCKETS``, so the lane
+groups' reservations spread over that many counters of each kind."""
+
+
+@wp.struct
+class UnitList:
+    """The step's units, one fixed slot each (:func:`support_units_kernel` appends, :func:`support_rows_kernel`
+    walks). A unit is a row's seed and the rows it walks together, at least one row, so a world's units fit its rows'
+    ``capacity``: the list holds every world's at that bound and cannot overflow. Bucket ``b`` holds its worlds' units
+    in ``span`` slots, the wide units (two rows or more: a contact's) from the front and the one-row units from the
+    back, each as ``line * capacity + slot`` of its first row; ``count[2 b]`` and ``count[2 b + 1]`` are its wide and
+    one-row counts, zeroed before the step's append. The order within a bucket is the lane groups' arrival, on which
+    no unit's rows depend."""
+
+    entry: wp.array[int]
+    count: wp.array[int]
+    span: int
+    capacity: int
+
+
+def unit_list(worlds: int, capacity: int, device) -> UnitList:
+    """An empty :class:`UnitList` for ``worlds`` worlds of ``capacity`` rows each."""
+    units = UnitList()
+    units.capacity = int(capacity)
+    units.span = -(-int(worlds) // UNIT_BUCKETS) * int(capacity)
+    units.entry = wp.empty(max(UNIT_BUCKETS * units.span, 1), dtype=int, device=device)
+    units.count = wp.zeros(2 * UNIT_BUCKETS, dtype=int, device=device)
+    return units
+
+
+_UNIT_APPEND = """    // This round's units of the world's lane group into its bucket: one reservation a kind for the group.
+    const unsigned wide_votes = BALLOT(wide != 0), one_votes = BALLOT(one != 0);
+    const int wide_first = RESERVE(units.count.data + 2 * bucket, COUNT(wide_votes));
+    const int one_first = RESERVE(units.count.data + 2 * bucket + 1, COUNT(one_votes));
+    int* const region = units.entry.data + (size_t)bucket * units.span;
+    if (wide != 0) region[wide_first + BELOW(wide_votes)] = entry;
+    if (one != 0) region[units.span - 1 - (one_first + BELOW(one_votes))] = entry;"""
+
+
+@wp.func_native(dual_native(_UNIT_APPEND, preludes=(lane_group("lanes"),)))
+def unit_append(lanes: int, units: UnitList, bucket: int, wide: int, one: int, entry: int):
+    """Append this lane's unit, ``wide`` (two rows or more) or ``one`` (one row), to bucket ``bucket`` of ``units``
+    (:class:`UnitList`); every lane of the world's group of ``lanes`` calls it together."""
+
+
+@wp.func
+def unit_total(units: UnitList) -> int:
+    """The list's units over its buckets."""
+    total = int(0)
+    for k in range(2 * UNIT_BUCKETS):
+        total += units.count[k]
+    return total
+
+
+@wp.func
+def unit_entry(units: UnitList, item: int) -> int:
+    """The list's ``item``-th unit: its wide units first, bucket by bucket, then its one-row units."""
+    wide = int(0)
+    for b in range(UNIT_BUCKETS):
+        wide += units.count[2 * b]
+    kind = int(0)
+    rank = item
+    if item >= wide:
+        kind = 1
+        rank = item - wide
+    b = int(0)
+    n = units.count[kind]
+    while rank >= n:
+        rank -= n
+        b += 1
+        n = units.count[2 * b + kind]
+    at = rank
+    if kind == 1:
+        at = units.span - 1 - rank
+    return units.entry[b * units.span + at]
+
+
+@cache
+def support_units_kernel(unit_rows: int, lanes: int) -> wp.Kernel:
+    """The support placement's units (case K1, the writer's first launch): ``dim = (worlds, lanes)``, a world's lane
+    group of ``lanes`` striding over its rows, a lane a row: each contact row's records by the contact law
+    (:func:`.row_build.write_contact_row`, its unit source written where its slot is reserved,
+    :func:`.kernels.allocate_world_contact_slots`), and each unit's first row appended to the step's
+    :class:`UnitList`: a contact's ``min(slots_needed, unit_rows)`` rows as one unit, a joint row (a limit, a velocity
+    limit, a mimic) alone. The walkers (:func:`support_rows_kernel`) read the records after this launch."""
+
+    def kernel(
+        rows: DenseRows,
+        sources: wp.array2d[int],
+        counts: wp.array[int],
+        data: ContactInput,
+        law: PatchRowLaw,
+        units: UnitList,
+    ):
+        world, lane = wp.tid()
+        line = rows.first[world]
+        count = wp.min(counts[world], units.capacity)
+        bucket = world % UNIT_BUCKETS
+        for base in range(0, count, wp.static(lanes)):
+            slot = base + lane
+            wide = int(0)
+            one = int(0)
+            if slot < count:
+                source = sources[line, slot]
+                kind = source >> UNIT_SHIFT
+                index = source & ((1 << UNIT_SHIFT) - 1)
+                if kind == UNIT_CONTACT:
+                    c = index // 4
+                    row = index - 4 * c
+                    write_contact_row(data, law, c, row, False)
+                    if row == 0:
+                        if wp.min(data.slots_needed[c], wp.static(unit_rows)) > 1:
+                            wide = 1
+                        else:
+                            one = 1
+                elif kind == UNIT_LIMIT or kind == UNIT_VELOCITY or kind == UNIT_MIMIC:
+                    one = 1
+            unit_append(wp.static(lanes), units, bucket, wide, one, line * units.capacity + slot)
+
+    return python_kernel(kernel, f"support_units_{unit_rows}_{lanes}")
+
+
 @cache
 def support_rows_kernel(
-    parent: tuple[int, ...], first: tuple[int, ...], node: tuple[int, ...], *, records: bool, torsion: bool, lanes: int
+    parent: tuple[int, ...], first: tuple[int, ...], node: tuple[int, ...], *, records: bool, torsion: bool
 ) -> wp.Kernel:
-    """The support placement's one writer (case K1): ``dim = (worlds, lanes)``, a world's lane group of ``lanes``
-    striding over its rows: first each contact row's records by the contact law (a lane a row: the producer's work,
-    folded), then a lane per unit (a contact's rows from its first, a joint row alone). The generator form
-    (Gamma per body, ``z = Gamma w``) measured slower on g1 than this direct walk, so the writer walks each unit.
+    """The support placement's walkers (case K1, the writer's second launch): ``threads`` lanes, sized to the GPU,
+    striding over the step's :class:`UnitList` (:func:`support_units_kernel`), its wide units first, so a warp runs one
+    walker. A lane walks a unit: a contact's rows from its first, a joint row alone. The generator form (Gamma per body,
+    ``z = Gamma w``) measured slower on g1 than this direct walk, so the writer walks each unit.
 
     The class's tree (``parent``, ``first``: :func:`.tree_factor.walk_prelude`'s table) and each coordinate's factor
     coordinate ``node`` (the support masks' bit) are baked into constant memory. A contact unit of three rows (four
     under contact ``torsion``) is walked together and its Gram writes its block record where ``records`` (the
-    triplet sweeps'); a unit of one row (a normal alone, a limit, a velocity limit, a mimic) by the one-row walker. Each
-    contact row's records are written here by the contact law, its unit source where its slot is reserved
-    (:func:`.kernels.allocate_world_contact_slots`); a joint row's records and unit source are its producer's (the
-    limit, velocity-limit and mimic producers); the writer stores its footprints at their ranks in its support (``row_factor``, with the
-    coordinates ``row_dof`` or the support class ``row_class``), its diagonal ``|z|^2 + cfm``, its incident ``J v_hat``
-    and its rhs by the row law (:func:`.kernels.row_bias`).
+    triplet sweeps'); a unit of one row (a normal alone, a limit, a velocity limit, a mimic) by the one-row walker. The
+    contact rows' records are the first launch's; a joint row's records and unit source are its producer's (the limit,
+    velocity-limit and mimic producers). The walker stores its footprints at their ranks in its support
+    (``row_factor``, with the coordinates ``row_dof`` or the support class ``row_class``), its diagonal ``|z|^2 + cfm``,
+    its incident ``J v_hat`` and its rhs by the row law (:func:`.kernels.row_bias`).
     """
     unit_rows = 4 if torsion else 3
 
@@ -1010,7 +1143,8 @@ def support_rows_kernel(
     def kernel(
         rows: DenseRows,
         sources: wp.array2d[int],
-        counts: wp.array[int],
+        units: UnitList,
+        threads: int,
         data: ContactInput,
         law: PatchRowLaw,
         sink: SupportSink,
@@ -1025,20 +1159,12 @@ def support_rows_kernel(
         weighted: int,
         material: int,
     ):
-        world, lane = wp.tid()
-        line = rows.first[world]
-        count = wp.min(counts[world], sink.row_factor.shape[1])
-        # The contact rows' records by the contact law, a lane a row (the producer's work, folded into the writer),
-        # before any row's header reads them.
-        for slot in range(lane, count, wp.static(lanes)):
-            source = sources[line, slot]
-            if source >> UNIT_SHIFT == UNIT_CONTACT:
-                index = source & ((1 << UNIT_SHIFT) - 1)
-                c = index // 4
-                write_contact_row(data, law, c, index - 4 * c, False)
-        world_sync(wp.static(lanes))
-        # A lane a unit: a contact's rows from its first, a joint row alone.
-        for slot in range(lane, count, wp.static(lanes)):
+        # The list's counts are read again at each unit (L1 hits): nothing but the item lives across a walk.
+        item = wp.tid()
+        while item < unit_total(units):
+            entry = unit_entry(units, item)
+            line = entry // units.capacity
+            slot = entry - line * units.capacity
             source = sources[line, slot]
             kind = source >> UNIT_SHIFT
             index = source & ((1 << UNIT_SHIFT) - 1)
@@ -1053,8 +1179,6 @@ def support_rows_kernel(
             unit.dof1 = -1
             if kind == UNIT_CONTACT:
                 c = index // 4
-                if index - 4 * c != 0:
-                    continue  # the unit's first row's lane writes it
                 unit.rows = wp.min(data.slots_needed[c], wp.static(unit_rows))
                 body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
                 unit.art_a = data.art0[c]
@@ -1064,7 +1188,7 @@ def support_rows_kernel(
                 unit.frame = wp.matrix_from_rows(normal, tangent0, tangent1)
                 unit.point = point
                 unit.friction_point = friction_point
-            elif kind == UNIT_LIMIT or kind == UNIT_VELOCITY or kind == UNIT_MIMIC:
+            else:
                 unit.art_a = rows.sides[line, slot][0]
                 unit.dof0 = index // 2
                 unit.value0 = 1.0 - 2.0 * float(index - 2 * unit.dof0)
@@ -1075,8 +1199,6 @@ def support_rows_kernel(
                     unit.value0 = 1.0
                     unit.dof1 = mimic_dof1[index]
                     unit.value1 = -mimic_coef1[index]
-            else:
-                continue
             if unit.rows == 1:
                 walk_one(sink, unit)
             else:
@@ -1099,12 +1221,22 @@ def support_rows_kernel(
                     rows, line, slot + r, incident, dt, contact_speculative_scale, contact_w,
                     restitution_velocity_threshold, weighted, material,
                 )  # fmt: skip
+            item += threads
 
     name = f"support_rows_{len(node)}_{abs(hash((parent, first, node))) % (1 << 32):08x}"
-    name += ("_records" if records else "") + ("_torsion" if torsion else "") + f"_{lanes}"
+    name += ("_records" if records else "") + ("_torsion" if torsion else "")
     # Two blocks of 256 a multiprocessor within the register file (128 registers): the four-row walker holds 166
     # unbounded, and the bound costs it 16 B of stack (sm_120, ptxas).
     return python_kernel(kernel, name, launch_bounds=(256, 2))
+
+
+def support_threads(units: int, device) -> int:
+    """The walkers' lanes (:func:`support_rows_kernel`): two waves of its two blocks of 256 a multiprocessor, at most
+    ``units`` (the list's bound); one thread on the CPU."""
+    device = wp.get_device(device)
+    if not device.is_cuda:
+        return 1
+    return max(min(2 * 2 * 256 * int(device.sm_count), int(units)), 1)
 
 
 # ---------------------------------------------------------------------------------------------------------------------

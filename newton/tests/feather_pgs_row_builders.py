@@ -38,9 +38,14 @@ ROW_BUILDER_KERNELS = frozenset(
         "keyed_general_units",
     )
 )
-# Kernels their factories name: the support placement's writer, the sparse-diagonal schedule marker and the one
-# writer's variants (its release and block phases).
-_GENERATED_PREFIXES = ("support_rows_", "mark_independent_sparse_contact_candidates", "write_walked_rows_")
+# Kernels their factories name: the support placement's writer (its units and its walkers), the sparse-diagonal
+# schedule marker and the one writer's variants (its release and block phases).
+_GENERATED_PREFIXES = (
+    "support_rows_",
+    "support_units_",
+    "mark_independent_sparse_contact_candidates",
+    "write_walked_rows_",
+)
 # Builders that launch once for every DOF size whose entry names them. Every other named builder serves all
 # the sizes that name it in one launch per step (the row metadata, a producer's contact kernels and fallback, a
 # combined masked launch), except the masked builder's per-size method, "masked".

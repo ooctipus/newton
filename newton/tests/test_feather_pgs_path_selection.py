@@ -558,6 +558,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         layout = KeyedLayout(16, 6, 0, 16, 128, False, 0)
         marker = SimpleNamespace(key="mark_independent_sparse_contact_candidates_stand_in")
         response = SimpleNamespace(key="support_rows_stand_in")
+        units = SimpleNamespace(key="support_units_stand_in")
         prepare, compact = "prepare_world_contact_rows", "populate_world_J_for_compact_size"
         per_contact = ["populate_world_J_for_size"]
         named, methods = set(), set()
@@ -574,7 +575,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 "case": "K1",
                 "sparse_mass_matrix_size": 18,
                 "walks": True,
-                "sweep": SimpleNamespace(support_rows=response),
+                "sweep": SimpleNamespace(support_rows=response, support_units_kernel=units),
             }
 
             def same(sizes, method, kernels):
@@ -603,7 +604,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                         6: ("compact_contact_boundary", ["produce_contacts", "write_slot_rows"]),
                     },
                 ),
-                (sparse, (18,), "walk", {18: ("walk", [response.key])}),
+                (sparse, (18,), "walk", {18: ("walk", [units.key, response.key])}),
                 (
                     {**diagonal, **schedule, "walks": True},
                     (108, 6),
@@ -1049,7 +1050,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                         self.assertEqual(record["producer"], "walk")
                         (entry,) = record["builder_by_dof"].values()
                         self.assertEqual(entry["method"], "walk")
-                        self.assertEqual(entry["kernels"], [solver.sweep.support_rows.key])
+                        self.assertEqual(
+                            entry["kernels"], [solver.sweep.support_units_kernel.key, solver.sweep.support_rows.key]
+                        )
                     if name == "compact_jacobian":
                         # A class of the local owners walks through the one writer (FL3.6); one that keeps the compact
                         # Jacobian names its builders.
