@@ -327,6 +327,8 @@ class TreeKineticState:
         self.status = self.data.status
         self._body_velocity = getattr(sparse_owner, "requires_body_velocity", False)
         self._response = response
+        # The walk's classes hold no factor that forms H_ii: their collection writes the drives' K-free mass.
+        self.drive_mass = response == "sparse"
         # Pointers of the bank every current group is stamped with after the last
         # finish (its output bank) or repair (its input bank), as the host knows it,
         # and the capture that launch was recorded in (0 eagerly). It only chooses
@@ -368,6 +370,7 @@ class TreeKineticState:
             body_velocity=self._body_velocity,
             motion_velocity=self.motion_velocity,
             clocked=self.clocked,
+            drive_mass=self.drive_mass,
         )
         # A classified repair compares in a pass of its own over the blocks its classification
         # lists for comparison. Otherwise a second one-pass repair kernel compares inside its
@@ -385,6 +388,7 @@ class TreeKineticState:
                 body_velocity=self._body_velocity,
                 bank_coordinates=self.bank_coordinates,
                 clocked=self.clocked,
+                drive_mass=self.drive_mass,
             )
         self.classify_kernel = self.listed_repair_kernel = None
         if self.classify_first:
@@ -397,6 +401,7 @@ class TreeKineticState:
                 body_velocity=self._body_velocity,
                 listed=True,
                 clocked=self.clocked,
+                drive_mass=self.drive_mass,
             )
         self.finish_kernel = native.get_state_kernel(
             True,
@@ -404,6 +409,7 @@ class TreeKineticState:
             layout=layout,
             body_velocity=self._body_velocity,
             clocked=self.clocked,
+            drive_mass=self.drive_mass,
         )
         classes = self._walk_classes()
         self.force_kernel = native.get_force_kernel(

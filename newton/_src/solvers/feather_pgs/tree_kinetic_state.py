@@ -568,7 +568,7 @@ $CLOCK1    for(int dof=lane;dof<$DOFS;dof+=stride) {
             wp::vec3 angular=wp::cross(h,l);
             for(int i=0;i<3;++i)for(int j=0;j<3;++j)angular[i]+=t[4+3*i+j]*w[j];
             for(int k=0;k<3;++k){s[6*dof+k]=linear[k];s[6*dof+3+k]=angular[k];}
-        }
+$DRIVE_MASS        }
     }
 #if defined(__CUDA_ARCH__)
     SYNC();
@@ -597,6 +597,20 @@ $CLOCK3    if(lane==0) {
         if(refresh)cache.geometry_generation.data[group]=cache.generation.data[group];
     }
 """
+
+_DRIVE_MASS = r"""            // A drive's mass without K, H_ii + R_ii (the saturation decision's inertia): the coordinate's diagonal
+            // entry of H, S^T (I S) from the same words in the same order as the geometry below, where I S is formed.
+            const int drive=data.drive_row.data[ds+dof];
+            if(drive>=0) {
+                float value=0.0f;
+                for(int k=0;k<3;++k)value+=axis[k]*linear[k];
+                for(int k=0;k<3;++k)value+=axis[3+k]*angular[k];
+                data.row_H.data[drive]=value+data.armature.data[ds+dof];
+            }
+"""
+"""The collection's write of the drives' K-free mass (``row_H``), for a group whose response holds no factor that forms
+``H_ii`` (the walk's classes: :func:`get_helpers`'s ``drive_mass``); a dense factor and the diagonal geometry write it
+where they form ``H_ii + R``."""
 
 _FORCE = cached_force.ForceOperands(
     q="f.joint_q.data",
@@ -867,11 +881,13 @@ def get_helpers(
     body_velocity: bool = False,
     *,
     clocked: bool = False,
+    drive_mass: bool = False,
 ):
     """Bind one physical tree evaluation to its storage and its scans' schedules.
 
     ``clocked`` adds the collection (``stage_clocks`` columns 13-15) and body
-    term (16-21) counters. Both arguments change the emitted code, so they are
+    term (16-21) counters; ``drive_mass`` has the collection write the drives'
+    K-free mass (:data:`_DRIVE_MASS`). They change the emitted code, so they are
     arguments (cache-key members), never environment reads.
     """
     pose_source = _down(layout, ts.TRANSFORM, schedules.pose, _POSE_SLOTS)
@@ -884,6 +900,7 @@ def get_helpers(
         PHYSICAL_COL=layout.physical("p.col.data[e]"),
         REDUCE=reduction,
         CURRENT_VALID=_current_valid(layout),
+        DRIVE_MASS=_DRIVE_MASS if drive_mass else "",
         **_native_clocks(clocked, "cache", stages=3, column=13),
     )
 
@@ -1022,7 +1039,14 @@ def get_helpers(
 
     @wp.func_native(collect_source)
     def _collect(
-        address: wp.uint64, group: int, p: sparse_factor.SparsePlan, plan: HeldPlan, cache: KineticData, refresh: int
+        address: wp.uint64,
+        group: int,
+        ds: int,
+        p: sparse_factor.SparsePlan,
+        plan: HeldPlan,
+        data: PublicationData,
+        cache: KineticData,
+        refresh: int,
     ): ...
 
     return SimpleNamespace(
@@ -1052,6 +1076,7 @@ def get_state_kernel(
     listed: bool = False,
     bank_coordinates: int = 0,
     clocked: bool = False,
+    drive_mass: bool = False,
 ):
     """Build a complete repair, or with ``finish`` a complete finish, from its stage functions.
 
@@ -1087,7 +1112,9 @@ def get_state_kernel(
     pass of its own would cost a launch. Classified launches compare in
     :func:`get_bank_kernel` instead. ``schedules`` are the scans' schedules;
     ``clocked`` selects the stage counters (``stage_clocks`` columns 0-7 for
-    the stages, 22-24 for motion; see :func:`get_helpers`).
+    the stages, 22-24 for motion; see :func:`get_helpers`); ``drive_mass`` has
+    the collection write the drives' K-free mass (a group whose response holds
+    no factor, :data:`_DRIVE_MASS`).
     """
     if finish and motion_velocity:
         raise ValueError("Alternate motion velocity is a repair-only contract")
@@ -1097,7 +1124,7 @@ def get_state_kernel(
         raise ValueError("A listed launch is a contract of the repair of ordinary motion")
     if bank_coordinates and (finish or motion_velocity or listed):
         raise ValueError("A compared input bank is a contract of the one-pass repair of ordinary motion")
-    h = get_helpers(layout, schedules, body_velocity, clocked=clocked)
+    h = get_helpers(layout, schedules, body_velocity, clocked=clocked, drive_mass=drive_mass)
     _lanes, _sync, _sub, _different_motion = _thread_helpers(layout)
     banked = bank_coordinates != 0
     _bank_matches = _bank_binding(bank_coordinates, layout) if banked else None
@@ -1437,7 +1464,7 @@ def get_state_kernel(
         qd: wp.array[float],
     ):
         """Collect bias, geometry and validity, and record the state bank the cache now holds."""
-        collect(g.address, g.group, p, plan, cache, g.refresh)
+        collect(g.address, g.group, g.ds, p, plan, data, cache, g.refresh)
         if g.lane == 0:
             if wp.static(motion_velocity):
                 # An override source must not be reused when a later begin returns to
@@ -1546,6 +1573,8 @@ def get_state_kernel(
         name += "_listed"
     if banked:
         name += "_banked"
+    if drive_mass:
+        name += "_mass"
     return python_kernel(kinetic_state, name)
 
 

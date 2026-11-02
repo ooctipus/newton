@@ -64,9 +64,9 @@ AUGMENTED_DRIVE_ROWS = FieldGroup(
 )
 """Augmented drive rows, ``max_dofs`` per articulation: each row's ``K``, which the factor holds; the ``K`` the saturation
 decision left it (``aug_row_Kd``, the passive damper's on a saturated drive, whose ``K - Kd`` the border releases,
-:func:`.tree_kinetic_state.border_solve`); the ``H_ii`` (armature in, ``K`` out) its factor last refreshed from; what last
-step's rows did to its coordinate; per coordinate, what the step's saturation decision reads on every drive
-(:data:`.tree_kinetic_state.SATURATE_DRIVES`): ``aug_drive``, the drive's own ``K``, the passive damper's, the effort limit
+:func:`.tree_kinetic_state.border_solve`); the ``H_ii`` (armature in, ``K`` out) last formed where the tree's
+representation forms its mass diagonal; what last step's rows did to its coordinate; per coordinate, what the step's
+saturation decision reads on every drive (:data:`.tree_kinetic_state.SATURATE_DRIVES`): ``aug_drive``, the drive's own ``K``, the passive damper's, the effort limit
 and the unlimited ``u0``, one read of one record."""
 
 DRIVE_ROWS = (
