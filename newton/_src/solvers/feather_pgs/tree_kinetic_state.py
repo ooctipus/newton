@@ -1943,9 +1943,8 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
     // segment's lanes (one warp, or a packed tree's lanes) load the tree's walk, each coordinate's record and body and
     // each body's parent, first coordinate and link, into registers in one parallel trip, lane l holding coordinates and
     // bodies l, l + WIDTH, ...; then the release is built coordinate-major, a lane a slip (HELD_BUILD), and the
-    // decided step's chains (the two tree walks, R and R^T) run on every lane of the segment in lockstep, reading each
-    // step's values by shuffle, with no global load on a chain. The operations and their order per value are the
-    // serial text's (BORDER_SLIPS, BORDER_COLUMN, BORDER_GROUP, BORDER_APPLY).
+    // decided step's two tree walks run on every lane of the segment in lockstep, reading each step's values by
+    // shuffle, with no global load on a chain; between them the release's primitive applies R^T R (BORDER_APPLY).
     struct WalkHold {
         float r[$HOLD][13];
         int parent[$HOLD], first[$HOLD];
@@ -2081,45 +2080,6 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
                 for (int k = 0; k < 6; ++k) V[k] += d[k] * q;
             }
             for (int k = 0; k < 6; ++k) twist[6 * b + k] = V[k];
-        }
-        WARP_SYNC();
-    };
-    // HELD_RELEASE(at, z, transposed): z <- R_j z (WALK_SLIP) or z <- R_j^T z (WALK_SLIP_T) for the slip at at, its
-    // steps loaded by the lanes in one trip; lane 0 writes z.
-    const auto HELD_RELEASE = [&](const size_t at, float* z, const bool transposed) {
-        auto& release = walk.release;
-        const int steps = release.b.shape[2];
-        int rc[$HOLD];
-        float rb[$HOLD], ra[$HOLD], rg[$HOLD];
-        #pragma unroll
-        for (int k = 0; k < $HOLD; ++k) {
-            const int t = lane + k * WIDTH;
-            rc[k] = t < steps ? release.coordinate.data[at + t] : -1;
-            rb[k] = t < steps ? release.b.data[at + t] : 0.0f;
-            ra[k] = t < steps ? release.a.data[at + t] : 0.0f;
-            rg[k] = t < steps ? release.g.data[at + t] : 0.0f;
-        }
-        float s = 0.0f;
-        if (!transposed) {
-            #pragma unroll 1
-            for (int t = 0; t < steps; ++t) {
-                const int c = HOLD_PICK(rc, t);
-                if (c < 0) break;
-                const float x = z[c] - HOLD_PICK(rb, t) * s;
-                s += HOLD_PICK(ra, t) * x;
-                const float w = HOLD_PICK(rg, t) * x;
-                if (lane == 0) z[c] = w;
-            }
-        } else {
-            #pragma unroll 1
-            for (int t = steps - 1; t >= 0; --t) {
-                const int c = HOLD_PICK(rc, t);
-                const float b = HOLD_PICK(rb, t), a = HOLD_PICK(ra, t), g = HOLD_PICK(rg, t);
-                if (c < 0) continue;
-                const float x = g * z[c] + a * s;
-                if (lane == 0) z[c] = x;
-                s -= b * x;
-            }
         }
         WARP_SYNC();
     };
@@ -2415,12 +2375,12 @@ def border_solve(layout: TreeLayout, classes: tuple) -> str:
     coordinate-major, a lane a slip, every value a register (``HELD_BUILD``); otherwise lane 0 lists the slips and their
     groups (``BORDER_SLIPS``), a lane a slip walks the columns (``BORDER_COLUMN``) and a lane a group runs its slips'
     recurrences (``BORDER_GROUP``). Then each changed root takes its decided step from the force words into the response
-    words on the trial's walks (:func:`walk_tree`): lane 0's walk up, ``R^T R`` (held: in lockstep; else a lane a group,
-    ``BORDER_APPLY``), lane 0's walk down. A root whose step its trial already gives (bit ``1 + r`` of ``moved`` clear)
-    keeps its trial's response. The releases are built for every root first: the marks of one root lie in the states of
-    another's walk. Nothing is added to the block (H8: g1's predictor sits at the RTX PRO 6000's 64 KB carveout line):
-    the release's work, the pivots and a dense column, lies in the dead body-wrench words, else in the walk's
-    scratch."""
+    words: the walk up (held: the segment in lockstep; else lane 0's, :func:`walk_tree`), ``R^T R`` by the release's
+    one primitive, a lane a group (``BORDER_APPLY``: ``WALK_SLIP``, ``WALK_SLIP_T``), the walk down. A root whose step
+    its trial already gives (bit ``1 + r`` of ``moved`` clear) keeps its trial's response. The releases are built for
+    every root first: the marks of one root lie in the states of another's walk. Nothing is added to the block (H8: g1's
+    predictor sits at the RTX PRO 6000's 64 KB carveout line): the serial build's work, the pivots and a dense column,
+    lies in the dead body-wrench words, else in the walk's scratch; the held build's is registers."""
     from .tree_factor import WALK_COORDINATE, WALK_LINK  # noqa: PLC0415
 
     roots = [(r, offset) for r, offset, _ in _walked(layout, classes)]
@@ -2488,9 +2448,9 @@ def border_solve(layout: TreeLayout, classes: tuple) -> str:
     held_step = (
         "        if((moved&{bit})&&lane<WIDTH) {{{head}" + nb + hold + "\n"
         "            HELD_UP(h,n,nb,s+$SIX_BODIES+{offset},s+$WHITE+{offset},s);\n"
-        "            const int cap=walk.release.dof.shape[1],depth=walk.release.b.shape[2];\n"
-        "            for(int j=0;j<slips{r};++j)HELD_RELEASE(((size_t)a*cap+j)*depth,s+$WHITE+{offset},false);\n"
-        "            for(int j=slips{r}-1;j>=0;--j)HELD_RELEASE(((size_t)a*cap+j)*depth,s+$WHITE+{offset},true);\n"
+        # R^T R between the walks by the release's one primitive (WALK_SLIP, WALK_SLIP_T), a lane a group.
+        "            for(int k=lane;k<slips{r};k+=WIDTH)BORDER_APPLY(a,s+$WHITE+{offset},k,slips{r});\n"
+        "            WARP_SYNC();\n"
         "            HELD_DOWN(h,n,nb,s+$WHITE+{offset},s+$WHITE+{offset},s);\n"
         "        }}\n"
     )
