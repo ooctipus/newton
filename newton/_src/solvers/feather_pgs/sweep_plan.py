@@ -683,7 +683,12 @@ class Sweep:
             and size == self.forest.max_world_dofs
             and np.all(offsets[articulated] == 0)
         ):
-            classes = tree.support_classes(body_masks, max_support)
+            # The classes of the bodies a contact can name (those with shapes; the row width is theirs too): a
+            # shape-less body takes the empty class.
+            contact_bodies = np.zeros(body_masks.shape[0], dtype=bool)
+            shape_body = model.shape_body.numpy()
+            contact_bodies[shape_body[shape_body >= 0]] = True
+            classes = tree.support_classes(np.where(contact_bodies, body_masks, np.uint64(0)), max_support)
             if classes is not None:
                 table_bytes = sum(
                     getattr(classes, name).nbytes for name in ("body_class", "pair_class", "class_dof", "limit_class")
