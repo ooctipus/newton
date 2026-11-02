@@ -440,9 +440,10 @@ def write_row(
         r = index - 4 * c
         # The row's records by the contact law (the producer's, folded into the writer), then its seeds.
         body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
-        _a, _b, direction, row_point = write_contact_records(
+        write_contact_records(
             data, law, c, r, False, body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point
         )
+        direction, row_point = contact_row_frame(r, normal, tangent0, tangent1, point, friction_point)
         sides = rows.sides[line, slot]
         spin = r == CONTACT_SPIN_ROW
         art_a = data.art0[c]
@@ -1408,7 +1409,7 @@ def support_rows_kernel(
                         )
                         # The unit's records by the contact law (the producer's, folded into the writer).
                         for r in range(unit.rows):
-                            _a, _b, _d, _p = write_contact_records(
+                            write_contact_records(
                                 data, law, c, r, False, body_a, body_b, normal, point, phi, tangent0, tangent1,
                                 friction_point,
                             )  # fmt: skip
@@ -1790,9 +1791,10 @@ def write_slot_rows(
             r = index - 4 * c
             # The row's records by the contact law (the producer's, folded into the writer), then its seeds.
             body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
-            _a, _b, direction, row_point = write_contact_records(
+            write_contact_records(
                 data, law, c, r, False, body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point
             )
+            direction, row_point = contact_row_frame(r, normal, tangent0, tangent1, point, friction_point)
             sides = rows.sides[line, slot]
             walked, coord_a, z_a, coord_b, z_b = contact_seeds(
                 walk,

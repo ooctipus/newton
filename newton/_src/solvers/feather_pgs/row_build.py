@@ -348,12 +348,13 @@ def contact_normal_beta(data: ContactInput, c: int, body_a: int, body_b: int, ph
 @wp.func
 def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, with_rhs: bool):
     """Write contact ``c``'s row ``row`` from its front end (:func:`.contact_input.contact_frame`): the records of
-    :func:`write_contact_records`, which returns its bodies and frame ``(body_a, body_b, direction, row_point)``."""
+    :func:`write_contact_records`; return its bodies and frame ``(body_a, body_b, direction, row_point)``."""
     body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
-    a, b, direction, row_point = write_contact_records(
+    write_contact_records(
         data, law, c, row, with_rhs, body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point
     )
-    return a, b, direction, row_point
+    direction, row_point = contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
+    return body_a, body_b, direction, row_point
 
 
 @wp.func
@@ -374,7 +375,7 @@ def write_contact_records(
 ):
     """Write contact ``c``'s row ``row`` (0 the normal, 1 and 2 the tangents, 3 the spin row under contact torsion)
     at ``slot + row`` from its front end (:func:`.contact_input.contact_frame`, given): its dense records and,
-    ``with_rhs``, its position-pass ``rhs`` and the CFM seed of its diagonal; return its bodies and frame ``(body_a, body_b, direction, row_point)``.
+    ``with_rhs``, its position-pass ``rhs`` and the CFM seed of its diagonal.
 
     Every contact row producer writes its records here; the general route forms its rhs later. A tangent row follows
     the friction row law (:func:`.friction_patches.patch_tangent_row`): the anchor's tangential displacement as its
@@ -472,4 +473,3 @@ def write_contact_records(
         data.diag[line, slot + row] = data.cfm
         if data.contact_w < 1.0:
             data.row_w[line, slot + row] = weight
-    return body_a, body_b, direction, row_point
