@@ -165,6 +165,9 @@ def _plan_stand_in(law, sizes=(108, 6), case="K6", **attributes):
         "forest": SimpleNamespace(size_groups=list(sizes)),
         "routes": SimpleNamespace(case=case),
         "_compact_contact_jacobian": False,
+        # The one writer's variant: no slips, no bilateral blocks.
+        "factor": SimpleNamespace(walk_slip_capacity=0, eliminates=False, block_capacity=0),
+        "options": SimpleNamespace(enable_bilateral_preelimination=False),
     }
     placement = {
         "row_packets": None,

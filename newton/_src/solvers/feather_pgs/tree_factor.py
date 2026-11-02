@@ -171,7 +171,7 @@ class TreeFactor:
         self.driven_articulations = np.zeros(0, dtype=bool)
         self.body_factors = None
         self.eliminates = False
-        self.elimination = None
+        self.block_capacity = 0
         self.block_count = 0
         self.held = None
         self.dynamics_stream = None
@@ -315,7 +315,7 @@ class TreeFactor:
             self.passive_joint_damping = damping
 
     def plan_blocks(self, forest, laws) -> None:
-        """The bilateral blocks' tables (:func:`.response_builds_rows.elimination`).
+        """The bilateral blocks' tables (the closure, :func:`.response_builds_rows.close_block`).
 
         A block holds a linked component's constraints: its trees' mimics and its links' six rows each. Its buffers
         are sized once from the model's largest block (CUDA-graph-safe); its slots and its factor are rebuilt every
@@ -337,54 +337,43 @@ class TreeFactor:
         entries = np.concatenate((mimics, -np.arange(links, dtype=np.int64) - 1))
         rows = np.concatenate((np.ones(mimics.size, dtype=np.int64), np.full(links, LINK_ROWS, dtype=np.int64)))
         heads, block = np.unique(owner, return_inverse=True)
+        # Blocks ordered by world: the one writer's lanes of a world close its blocks (each world's range, CSR).
+        world_of = forest.articulation_world[heads]
+        by_world = np.argsort(world_of, kind="stable")
+        renumber = np.empty_like(by_world)
+        renumber[by_world] = np.arange(by_world.size)
+        block = renumber[block]
         bounds, order = host_index.group_by(block, heads.size)
         capacity = int(np.bincount(block, weights=rows).max())
         self.block_count = n = int(heads.size)
+        self.block_capacity = capacity
         self.eliminates = True
-        self.elimination = response_builds_rows.elimination(capacity)
         art_to_block = np.full(arts, -1, dtype=np.int32)
         held = np.isin(component, heads)
-        art_to_block[held] = np.searchsorted(heads, component[held])
+        art_to_block[held] = renumber[np.searchsorted(heads, component[held])]
         self._preelim_art_to_idx = wp.array(art_to_block, dtype=wp.int32, device=model.device)
         self._arrays.allocate(PREELIMINATION, preelim=n, preelim_row=n * capacity)
+        world_blocks = np.bincount(world_of, minlength=forest.world_count)
         self._arrays.upload(
             PREELIMINATION_PLAN,
-            _preelim_world=forest.articulation_world[heads],
+            _preelim_world=world_of[by_world],
             _preelim_start=bounds,
             _preelim_entry=entries[order],
+            _preelim_world_start=host_index.offsets(world_blocks, dtype=np.int32),
         )
-        self._no_slots = self._arrays.placeholder(wp.int32)
 
-    def eliminate(self, *, first, Z, sides, counts, owners, cfm, rhs, incident, diag, impulses) -> None:
-        """Make each block's rows orthonormal, then correct every other row, its right-hand side and its diagonal, and
-        give the block's rows the projection's impulses, which the sweep seeds
-        (:func:`.response_builds_rows.elimination`). Runs once the right-hand sides are final (bias and restitution)."""
-        block = field_group.bind(Preelim, factor=self)
+    def blocks(self):
+        """The bilateral blocks (:data:`.solver_fields.Preelim`) the one writer's block phase closes."""
+        return field_group.bind(Preelim, factor=self)
+
+    def seed_blocks(self, *, first, rhs, impulses) -> None:
+        """The closure's seed, once the warm start has gathered the rows' impulses: each block's kept rows take
+        ``-r_Q`` (:func:`.response_builds_rows.seed_blocks_kernel`); the one writer closed the blocks and corrected the
+        other rows."""
         wp.launch(
-            self.elimination.setup,
+            response_builds_rows.seed_blocks_kernel,
             dim=self.block_count,
-            inputs=[
-                first,
-                block,
-                self._no_slots if self.laws.mimic_slot is None else self.laws.mimic_slot,
-                self._no_slots if self.laws.link_slot is None else self.laws.link_slot,
-                owners,
-                cfm,
-            ],
-            outputs=[Z, rhs, incident, diag],
-            device=self.model.device,
-        )
-        wp.launch(
-            self.elimination.correct,
-            dim=sides.shape[0] * sides.shape[1],
-            inputs=[first, block, sides, counts, owners, cfm],
-            outputs=[Z, rhs, diag],
-            device=self.model.device,
-        )
-        wp.launch(
-            self.elimination.weights,
-            dim=self.block_count,
-            inputs=[first, block, rhs],
+            inputs=[first, self.block_capacity, self.blocks(), rhs],
             outputs=[impulses],
             device=self.model.device,
         )
@@ -959,6 +948,22 @@ class TreeFactor:
                 dof_body[qd_start[j] : qd_start[j + 1]] = j - j0
         joints, dofs = max(int(model.joint_count), 1), max(int(model.joint_dof_count), 1)
         self.walk_arts = wp.array(arts, dtype=wp.int32, device=device)
+        # Each world's walked trees (CSR, by world): the one writer's lanes of a world release its trees' slips.
+        world_of = forest.articulation_world[arts]
+        in_world = world_of >= 0
+        by_world = np.argsort(world_of[in_world], kind="stable")
+        self.walk_world_arts = wp.array(
+            np.asarray(arts[in_world][by_world], dtype=np.int32).reshape(-1)
+            if in_world.any()
+            else np.zeros(1, np.int32),
+            dtype=wp.int32,
+            device=device,
+        )
+        self.walk_world_start = wp.array(
+            host_index.offsets(np.bincount(world_of[in_world], minlength=forest.world_count), dtype=np.int32),
+            dtype=wp.int32,
+            device=device,
+        )
         # A tree's lane group in the step's walk kernel (walk_step_kernel): a lane a row of the inward pass's 6x6
         # algebra on CUDA, one thread a tree on the CPU.
         self.walk_lanes = WALK_LANES if device.is_cuda else 1
@@ -987,7 +992,7 @@ class TreeFactor:
         body_joint = np.full(max(int(model.body_count), 1), -1, dtype=np.int32)
         body_joint[: joint_of.size] = joint_of[: body_joint.size]
         view.body_joint = wp.array(body_joint, dtype=wp.int32, device=device)
-        # The slips' release (walk_release_kernel): as many slips per tree as it has limited, driven coordinates (from
+        # The slips' release (walk_release_tree, the one writer's first phase): as many slips per tree as it has limited, driven coordinates (from
         # the model's gains and effort limits, data-sized), at most RELEASE_SLIPS; none without a limited drive. Each
         # slip's release is stored by its path's steps, leaf first, as deep as the class's deepest root path.
         slips = 0
@@ -1023,31 +1028,21 @@ class TreeFactor:
         self.walk_release_status = wp.zeros(1, dtype=wp.int32, device=device)
         self.walk_trees = view
 
-    def walk_releases(self, v_hat: wp.array) -> None:
-        """The slips' release of every tree whose predictor decided a set this step (:func:`walk_release_kernel`): the
-        block primitive's first phase, before the one writer releases its rows and the leave reads it. ``v_hat`` is
-        the predictor's velocity, which :func:`walk_into` reads for a seed's incident (unused by the release's
-        columns)."""
-        if self.walk_arts is None or not self.walk_slip_capacity:
-            return
-        view = self.walk_trees
-        wp.launch(
-            walk_release_kernel,
-            dim=self.walk_arts.shape[0],
-            inputs=[
-                self.walk_arts,
-                view,
-                self.aug_decided,
-                self.aug_row_counts,
-                self.aug_row_dof_index,
-                self.aug_row_K,
-                self.aug_row_Kd,
-                self.forest.articulation_max_dofs,
-                v_hat,
-            ],
-            outputs=[self.walk_release_work, self.walk_release_status],
-            device=self.model.device,
-        )
+    def walk_slips(self) -> WalkSlips:
+        """What the one writer's release phase reads (:class:`WalkSlips`, :func:`walk_release_tree`): the predictor's
+        decided set and each world's walked trees."""
+        slips = WalkSlips()
+        placeholder = self._arrays.placeholder
+        drives = self.parallel_drives and self.walk_slip_capacity > 0
+        slips.decided = self.aug_decided if drives else placeholder(wp.int32)
+        slips.row_counts = self.aug_row_counts if drives else placeholder(wp.int32)
+        slips.row_dof = self.aug_row_dof_index if drives else placeholder(wp.int32)
+        slips.row_K = self.aug_row_K if drives else placeholder(wp.float32)
+        slips.row_Kd = self.aug_row_Kd if drives else placeholder(wp.float32)
+        slips.max_dofs = int(self.forest.articulation_max_dofs)
+        slips.world_start, slips.world_arts = self.walk_world_start, self.walk_world_arts
+        slips.work, slips.status = self.walk_release_work, self.walk_release_status
+        return slips
 
     def walk_view(self) -> WalkTrees:
         """The walk's view (:class:`WalkTrees`) the one writer, the leave and the audit read."""
@@ -1691,7 +1686,7 @@ def walk_paths_prelude(rows: int) -> DevicePrelude:
 
 @wp.struct
 class WalkRelease:
-    """The release of each tree's slipping drives this step (:func:`walk_release_kernel`, W9's verdict): its slips
+    """The release of each tree's slipping drives this step (:func:`walk_release_tree`, W9's verdict): its slips
     (``count``, 0 for none), each one's coordinate within its tree (``dof``, root-most first), and at each step of each
     one's root path, leaf first, the step's coordinate (``coordinate``, -1 past the path), the column ``b`` of the
     released inverse and the recurrence's ``a`` (``beta d^1/2``) and ``g`` (``(d / dbar)^1/2``): ``[tree, slip, step]``,
@@ -1750,7 +1745,7 @@ _ENTER = """    if (tid >= arts.shape[0]) return;
     float* u = coordinates.data + (size_t)world * coordinates.shape[1] + offset;
     WALK_ENTER(walk.data.data + (size_t)d0 * $coordinate, walk.link.data + (size_t)j0 * $link, velocity.data + d0, u,
                reinterpret_cast<float*>(walk.scratch.data + j0));
-    // The rows' release: u <- R^-T u, the first slip first, each along its path root first (walk_release_kernel).
+    // The rows' release: u <- R^-T u, the first slip first, each along its path root first (walk_release_tree).
     const auto& release = walk.release;
     const int slips = release.count.data[art];
     const int cap = release.b.shape[1], steps = release.b.shape[2];
@@ -1865,6 +1860,24 @@ RELEASE_SLIPS = 16
 status flags it."""
 
 
+@wp.struct
+class WalkSlips:
+    """What the release reads (:func:`walk_release_tree`): the predictor's decided set (H7's ``decided``, each drive
+    row's coordinate and its trial and decided ``K``, ``max_dofs`` rows a tree), each world's walked trees (CSR), the
+    release's scratch (``work[tree, 2, coordinates]``) and its status word."""
+
+    decided: wp.array[int]
+    row_counts: wp.array[int]
+    row_dof: wp.array[int]
+    row_K: wp.array[float]
+    row_Kd: wp.array[float]
+    max_dofs: int
+    world_start: wp.array[int]
+    world_arts: wp.array[int]
+    work: wp.array3d[float]
+    status: wp.array[int]
+
+
 @wp.func
 def release_path(release: WalkRelease, art: int, j: int, x: wp.array3d[float], line: int, slot: int, entry: int):
     """``x[line, slot, entry + c] <- (R_j x)_c``: slip ``j``'s release along its path, leaf first (:class:`WalkRelease`)."""
@@ -1879,19 +1892,7 @@ def release_path(release: WalkRelease, art: int, j: int, x: wp.array3d[float], l
 
 
 @wp.func
-def walk_release_tree(
-    art: int,
-    walk: WalkTrees,
-    decided: wp.array[int],
-    row_counts: wp.array[int],
-    row_dof: wp.array[int],
-    row_K: wp.array[float],
-    row_Kd: wp.array[float],
-    max_dofs: int,
-    qd: wp.array[float],
-    work: wp.array3d[float],
-    status: wp.array[int],
-):
+def walk_release_tree(art: int, walk: WalkTrees, slips: WalkSlips, qd: wp.array[float]):
     """Tree ``art``'s release, if its predictor decided a set (``decided``, H7's): FL3.4's block primitive
     ``z <- z + U (Sigma - I) U^T z`` with ``U`` the coordinates of each slip's path and ``Sigma`` the release
     ``R = Dbar^-1/2 G^-1 D^1/2`` (Gill, Golub, Murray and Saunders' rank-1 downdate) on the walk's footprints. A slip is
@@ -1899,8 +1900,11 @@ def walk_release_tree(
     root-most first, each from the split pivot ``P0_i + Kd_i``. Its column ``b = W e_i`` of the inverse released so far
     is the walk of ``e_i`` with the earlier releases applied (``work[tree, 1]``, by coordinate); ``work[tree, 0]``
     carries each coordinate's current pivot. The rows ``R W P J^T`` and the leave ``P^T W^T R^T`` are then the decided
-    factor's, each row inside its support (W9: ``R`` is the only square root of ``I + B C^-1 B^T`` that keeps it)."""
+    factor's, each row inside its support (W9: ``R`` is the only square root of ``I + B C^-1 B^T`` that keeps it). ``qd``
+    is what :func:`walk_into` reads for a seed's incident (unused by the release's columns)."""
     release = walk.release
+    decided, row_counts, row_dof = slips.decided, slips.row_counts, slips.row_dof
+    row_K, row_Kd, max_dofs, work, status = slips.row_K, slips.row_Kd, slips.max_dofs, slips.work, slips.status
     release.count[art] = 0
     if decided[art] == 0:
         return
@@ -1981,27 +1985,6 @@ def walk_release_tree(
         for k in range(t, steps):
             release.coordinate[art, j, k] = -1
     release.count[art] = s
-
-
-@wp.kernel(enable_backward=False)
-def walk_release_kernel(
-    arts: wp.array[int],
-    walk: WalkTrees,
-    decided: wp.array[int],
-    row_counts: wp.array[int],
-    row_dof: wp.array[int],
-    row_K: wp.array[float],
-    row_Kd: wp.array[float],
-    max_dofs: int,
-    qd: wp.array[float],
-    # outputs
-    work: wp.array3d[float],
-    status: wp.array[int],
-):
-    """The release of each tree whose predictor decided a set (:func:`walk_release_tree`), a thread per tree."""
-    walk_release_tree(
-        arts[wp.tid()], walk, decided, row_counts, row_dof, row_K, row_Kd, max_dofs, qd, work, status
-    )
 
 
 # ---------------------------------------------------------------------------------------------------------------------

@@ -7,7 +7,7 @@
   both and one to three slipping drives, the release then the closure (``R``, then the projector of ``R Z_B``'s
   orthonormal basis) gives the decided closed-loop operator ``J_c [A_F^-1 - A_F^-1 J_B^T (J_B A_F^-1 J_B^T)^+ J_B
   A_F^-1] J_c^T`` in float64, and in float32 with the split pivot at the level of a float32 refactor of ``A_F``.
-- **The device release** (:func:`.tree_factor.walk_release_kernel`, W9's verdict): on a tree whose drives saturate,
+- **The device release** (:func:`.tree_factor.walk_release_tree`, W9's verdict): on a tree whose drives saturate,
   ``R^T R`` equals ``I + B C^-1 B^T`` of the float64 walk, ``R`` keeps every row's support (tree-lower), and the rows
   the writer stores give the decided operator ``J A_F^-1 J^T``, not the all-``K`` one: without the release a row on a
   slipping joint takes ``(I + K) / I`` its impulse.
@@ -84,7 +84,7 @@ def orth(M: np.ndarray, tol: float = 1.0e-5) -> np.ndarray:
 
 
 def release(walk, S: list[int], K: np.ndarray, pivots: np.ndarray, dtype) -> np.ndarray:
-    """The slips' release ``R`` in ``dtype`` (an ``n x n`` matrix by coordinate), as :func:`.tree_factor.walk_release_kernel`
+    """The slips' release ``R`` in ``dtype`` (an ``n x n`` matrix by coordinate), as :func:`.tree_factor.walk_release_tree`
     forms it on ``walk`` (the all-``K`` walk): the slips ``S`` root-most first, each one's column ``b = W e_i`` (the walk
     of ``e_i`` with the earlier releases applied), then FL3.4's recurrence along its path, leaf first, with ``K`` the
     released stiffness and ``pivots`` each slip's split pivot (before its released ``K``)."""

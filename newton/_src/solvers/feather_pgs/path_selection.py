@@ -356,7 +356,7 @@ def _row_builder(solver, plan, size, source) -> dict:
         from . import walk_rows  # noqa: PLC0415 - the one writer's module
 
         # The row pass writes the records and unit sources; the one writer walks every row (walk_rows).
-        kernels = (walk_rows.write_contact_units, walk_rows.write_walked_rows)
+        kernels = (walk_rows.write_contact_units, walk_rows.writer_kernel(solver))
     elif method == "local_packets":
         from . import row_packets  # noqa: PLC0415 - the owner's module; loaded with the owner
 

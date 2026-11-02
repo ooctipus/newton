@@ -337,7 +337,7 @@ def _sparse_contact_calls():
 
 
 def _dense_build_calls():
-    """The dense rows' builds without variants: their packed build and the bilateral elimination."""
+    """The dense rows' builds: their packed build and the one writer's variants."""
     from newton._src.solvers.feather_pgs import packed_rows  # noqa: PLC0415
 
     # The dense rows packed by support: their build (by the side sizes it whitens), the velocity of their impulses
@@ -346,14 +346,12 @@ def _dense_build_calls():
         yield "packed_rows.pack_kernel", packed_rows.pack_kernel.__wrapped__, (sizes,), {}
     from newton._src.solvers.feather_pgs import response_builds_rows  # noqa: PLC0415
 
-    # The bilateral elimination of blocks of up to eight rows: its setup, correction and projection weights.
-    for part in ("setup", "correct", "weights"):
-        yield (
-            f"response_builds_rows.elimination.{part}",
-            lambda rows, part=part: getattr(response_builds_rows.elimination.__wrapped__(rows), part),
-            (8,),
-            {},
-        )
+    # The general placement's one writer: plain, with the slips' release, with blocks of up to eight rows (the closure),
+    # mimics among them.
+    from newton._src.solvers.feather_pgs import walk_rows  # noqa: PLC0415
+
+    for args in ((False, 0, False), (True, 0, False), (False, 8, False), (True, 8, True)):
+        yield "walk_rows.walked_rows_kernel", walk_rows.walked_rows_kernel.__wrapped__, args, {}
 
     # The sparse-diagonal rows whitened in place, with their diagonals.
     yield (

@@ -418,7 +418,7 @@ class SolverFeatherPGS(SolverBase):
             enable_joint_limits (bool, optional): Enforce joint position limits as unilateral PGS
                 constraints. Each active limit side adds one constraint row. Defaults to False.
             enable_bilateral_preelimination (bool, optional): Eliminate mimic rows exactly, as a loop joint's rows
-                always are (:func:`.response_builds_rows.elimination`): every other row (contacts especially) takes
+                always are (:func:`.response_builds_rows.close_block`): every other row (contacts especially) takes
                 the closed-loop response, ``Z' = (I - Q Q^T) Z``, and the predictor velocity is projected onto the
                 closures once per step. Blocks are sized from the model; a row that depends on the others leaves
                 its block. Defaults to False.
@@ -723,6 +723,11 @@ class SolverFeatherPGS(SolverBase):
             and not self.placement.local_internal_fast_path
             and np.any(self.forest.response_dof_count > 0)
         )
+        if self.factor.eliminates and not self.placement.walks:
+            raise RuntimeError(
+                "Bilateral blocks are closed in the one writer's block phase (walk_rows): their class must walk "
+                f"(case K6 with the matrix-free sweeps), not case {self.routes.case}."
+            )
         if self.placement.walks:
             self.factor.plan_walk(np.flatnonzero(self.forest.response_dof_count > 0))
             self.placement.hold_units()
@@ -1191,19 +1196,10 @@ class SolverFeatherPGS(SolverBase):
 
         with wp.ScopedTimer("S5_GatherJY", print=False, use_nvtx=self._nvtx, synchronize=False):
             if self.factor.eliminates:
-                # Bilateral elimination: the other rows take the closed-loop response, their right-hand sides
-                # and diagonals (the rows' closed-loop inertia).
-                self.factor.eliminate(
-                    first=self.placement.dense_first,
-                    Z=self.placement.packed_Z,
-                    sides=self.placement.row_sides,
-                    counts=self.placement.constraint_count,
-                    owners=self.placement.local_solve_owner,
-                    cfm=self.placement.row_cfm,
-                    rhs=self.placement.rhs,
-                    incident=self.placement.row_incident,
-                    diag=self.placement.diag,
-                    impulses=self.placement.impulses,
+                # The closure's seed: the one writer closed the bilateral blocks and corrected the other rows; the
+                # blocks' kept rows start at -r_Q, after the warm start's gather.
+                self.factor.seed_blocks(
+                    first=self.placement.dense_first, rhs=self.placement.rhs, impulses=self.placement.impulses
                 )
 
             # The sweeps add their velocity change to the predictor; a world without rows keeps it.

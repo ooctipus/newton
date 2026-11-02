@@ -140,7 +140,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         model = _build_overcapacity_mixed_bilateral_model()
         solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8)
         self.assertTrue(solver.factor.eliminates)
-        self.assertEqual(solver.factor.elimination.rows, 12)
+        self.assertEqual(solver.factor.block_capacity, 12)
         state_0, state_1 = model.state(), model.state()
         control = model.control()
         for _ in range(16):

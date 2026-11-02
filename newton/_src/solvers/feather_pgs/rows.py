@@ -80,6 +80,7 @@ from .solver_fields import (
     VELOCITY_LIMIT_SLOTS,
     Links,
     Mimics,
+    Preelim,
 )
 from .sparse_contact import finalize_sparse_joint_limit_rows
 
@@ -1397,11 +1398,11 @@ class RowLaws:
         )
 
     def write_walked(self, solver, state_in, contacts: Contacts | None, dt: float) -> None:
-        """The general placement's one writer (:func:`.walk_rows.write_walked_rows`): every dense row's seed walked
-        into the packed rows, its diagonal, incident velocity and rhs, once the predictor's ``v_hat`` and its slips'
-        release are known."""
+        """The general placement's one writer (:func:`.walk_rows.walked_rows_kernel`), once the predictor's ``v_hat`` and
+        its decided set are known: a world's lanes release its trees' slips, write and close its bilateral blocks, then
+        walk every other row into the packed rows with its diagonal, incident velocity and rhs, corrected on the blocks
+        it touches."""
         placement, factor, model = solver.placement, solver.factor, solver.model
-        factor.walk_releases(solver.v_hat)
         # Without contacts no row is a contact's: the writer reads no contact input.
         contact_input = (
             bind_contact_input(solver, state_in, factor, contacts, dt, 1.0) if contacts is not None else ContactInput()
@@ -1409,36 +1410,43 @@ class RowLaws:
         mimics = self.mimic_count > 0
         links = self.link_count > 0
         dummy_int, dummy_float = placement.dummy_is_free_rigid, placement.contact_row_eps_dummy.flatten()
-        lanes = min(placement.dense_max_constraints, BIAS_LANES)
+        blocks = factor.block_capacity if factor.eliminates else 0
+        lanes = walk_rows.writer_lanes(placement.dense_max_constraints, model.device)
+        inputs = [
+            bind_dense_rows(placement),
+            placement.row_support(),
+            placement.constraint_count,
+            lanes,
+            contact_input,
+            patch_row_law(solver),
+            factor.walk_view(),
+            factor.walk_slips(),
+            factor.blocks() if blocks else Preelim(),
+            self.mimic_slot if blocks and self.mimic_slot is not None else dummy_int,
+            self.link_slot if blocks and self.link_slot is not None else dummy_int,
+            solver.forest.body_to_articulation,
+            self._mimic_dof0 if mimics else dummy_int,
+            self._mimic_dof1 if mimics else dummy_int,
+            model.constraint_mimic_coef1 if mimics else dummy_float,
+            self._link_primary if links else dummy_int,
+            self._link_shadow if links else dummy_int,
+            self.velocity_limit_sign if self.velocity_limit_slot is not None else dummy_float,
+            state_in.body_q,
+            model.body_com,
+            solver.v_hat,
+            dt,
+            solver.options.contact_speculative_scale,
+            self.contact_w,
+            self.effective_restitution_velocity_threshold,
+            int(self.set.weighted),
+            int(solver.options.contact_compliance),
+        ]
         wp.launch(
-            walk_rows.write_walked_rows,
+            walk_rows.writer_kernel(solver),
             dim=(solver.forest.world_count, lanes),
-            inputs=[
-                bind_dense_rows(placement),
-                placement.row_support(),
-                placement.constraint_count,
-                lanes,
-                contact_input,
-                patch_row_law(solver),
-                factor.walk_view(),
-                solver.forest.body_to_articulation,
-                self._mimic_dof0 if mimics else dummy_int,
-                self._mimic_dof1 if mimics else dummy_int,
-                model.constraint_mimic_coef1 if mimics else dummy_float,
-                self._link_primary if links else dummy_int,
-                self._link_shadow if links else dummy_int,
-                self.velocity_limit_sign if self.velocity_limit_slot is not None else dummy_float,
-                state_in.body_q,
-                model.body_com,
-                solver.v_hat,
-                dt,
-                solver.options.contact_speculative_scale,
-                self.contact_w,
-                self.effective_restitution_velocity_threshold,
-                int(self.set.weighted),
-                int(solver.options.contact_compliance),
-            ],
+            inputs=inputs,
             outputs=[placement.packed_Z, placement.row_incident],
+            block_dim=walk_rows.WRITER_THREADS if lanes <= 32 else lanes,
             device=model.device,
         )
 

@@ -19,8 +19,8 @@ representations, and the publication of the one whose sweep leaves its velocity 
 - :class:`.response_operator.FactorRows` (a pair's rows in factor coordinates, a lane per coordinate): the packed
   rows at their world coordinates (:mod:`.packed_rows`);
 
-and :class:`BilateralElimination`, the Schur transform of a dense response build that folds a
-world's bilateral block into the responses of its other rows.
+and the bilateral closure (:func:`close_block`, :func:`close_row`, :func:`seed_blocks_kernel`), the Schur transform the
+one writer's block phase applies to fold a world's bilateral block into the responses of its other rows.
 
 **API.** Each operator class returns its build from ``build()`` (``FreeBodyZ.build()``, ``SparsePairZ.build()``,
 ``SparseFactor.build()``, ``FactorRows.build()``): a frozen descriptor whose members are the Warp kernels (or cached
@@ -69,7 +69,6 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_MIMIC,
     PGS_CONSTRAINT_TYPE_TORSION,
-    PGS_LOCAL_SOLVE_OWNER_GENERAL,
     BodyFactors,
     factor_whiten,
     free_body_factor,
@@ -868,9 +867,10 @@ SPARSE_PAIR = SparsePairBuild(
 # Bilateral elimination: the exact Schur transform of the packed rows
 # ---------------------------------------------------------------------------------------------------------------------
 #
-# The bilateral rows of a linked component of trees (:mod:`.body_cut`), its mimics and its links, form a block ``B``.
-# On the packed rows (:mod:`.packed_rows`, ``Z_i = L^-1 P J_i^T`` on each side), wide over the world's coordinates, the
-# transform makes the block's rows orthonormal in place by modified Gram-Schmidt, the right-hand sides following:
+# The bilateral rows of a linked component of trees (:mod:`.body_cut`), its mimics and its links, form a block ``B``:
+# the block primitive's second phase, the closure, after the slips' release (FL3_design §1.4), in the one writer's
+# block phase (:mod:`.walk_rows`). On the packed rows (:mod:`.packed_rows`, ``Z_i = L^-1 P J_i^T`` on each side), wide
+# over the world's coordinates, the transform makes the block's rows orthonormal in place by modified Gram-Schmidt, the right-hand sides following:
 # ``Q^T Q = I``, a linear combination of the same constraints. A row whose remainder falls to
 # :data:`.projection_laws.BILATERAL_PIVOT` of its own norm depends on the rows before it (a planar loop's out-of-plane
 # axis, a mimic a closure fixes): it leaves the block, inert. With ``Pi = I - Q Q^T`` the exact projector onto the
@@ -938,148 +938,110 @@ def bilateral_rows(
     return n
 
 
-@dataclasses.dataclass(frozen=True)
-class BilateralElimination:
-    """The exact Schur transform of the packed rows by bilateral blocks of up to ``rows`` rows, and its projection.
+@wp.func
+def close_block(
+    pe: int,
+    capacity: int,
+    line: int,
+    preelim: Preelim,
+    mimic_slot: wp.array[int],
+    link_slot: wp.array[int],
+    world_row_cfm: wp.array2d[float],
+    packed_Z: wp.array3d[float],
+    world_rhs: wp.array2d[float],
+    world_incident: wp.array2d[float],
+    world_diag: wp.array2d[float],
+):
+    """Block ``pe``'s closure (the one writer's block phase, once its rows are written): modified Gram-Schmidt over the
+    block's rows, in its constraints' order, in place on line ``line``. Each row takes out the rows kept before it, then
+    joins them unit, or leaves the block inert where nothing of it remains; its right-hand side follows, its incident
+    velocity joined to it first, and its diagonal is ``|Q_i|^2 + cfm``. ``preelim.slots`` ends with the kept rows
+    (``preelim.nB`` of them)."""
+    base = pe * capacity
+    entries = packed_Z.shape[2]
+    m = bilateral_rows(pe, base, preelim, mimic_slot, link_slot)
+    kept = int(0)
+    for p in range(m):
+        row = preelim.slots[base + p]
+        # The row's incident velocity joins its right-hand side: both follow the row through the transform.
+        world_rhs[line, row] += world_incident[line, row]
+        world_incident[line, row] = 0.0
+        own = wide_product(packed_Z, line, row, row, entries)
+        for q in range(kept):
+            other = preelim.slots[base + q]
+            along = wide_product(packed_Z, line, other, row, entries)
+            subtract_row(packed_Z, line, row, along, other, entries)
+            world_rhs[line, row] -= along * world_rhs[line, other]
+        rest = wide_product(packed_Z, line, row, row, entries)
+        scale = float(0.0)
+        if rest > BILATERAL_PIVOT * own:
+            scale = 1.0 / wp.sqrt(rest)
+            preelim.slots[base + kept] = row
+            kept += 1
+        scale_row(packed_Z, line, row, scale, entries)
+        world_rhs[line, row] *= scale
+        world_diag[line, row] = scale * scale * rest + world_row_cfm[line, row]
+    for p in range(kept, capacity):
+        preelim.slots[base + p] = -1
+    preelim.nB[pe] = kept
 
-    Attributes:
-        rows: The block capacity: the model's largest block (its mimic rows plus six per link).
-        setup: Make each block's rows orthonormal, once the right-hand sides are final.
-        correct: Correct the other rows and their right-hand sides and diagonals.
-        weights: The projection: the block rows' impulses, which the sweep seeds.
-    """
 
-    rows: int
-    setup: wp.Kernel
-    correct: wp.Kernel
-    weights: wp.Kernel
-
-
-@cache
-def elimination(rows: int) -> BilateralElimination:
-    """The bilateral elimination of the packed rows for blocks of up to ``rows`` rows (see the section's comment)."""
-
-    def setup(
-        dense_first: wp.array[int],
-        preelim: Preelim,
-        mimic_slot: wp.array[int],
-        link_slot: wp.array[int],
-        local_solve_owner: wp.array[int],
-        world_row_cfm: wp.array2d[float],
-        # outputs
-        packed_Z: wp.array3d[float],
-        world_rhs: wp.array2d[float],
-        world_incident: wp.array2d[float],
-        world_diag: wp.array2d[float],
-    ):
-        # Modified Gram-Schmidt over a block's rows, in order, in place: each takes out the rows kept before it, then
-        # joins them unit, or leaves the block inert where nothing of it remains. preelim.slots ends with the kept rows
-        # (preelim.nB of them). One thread per block.
-        pe = wp.tid()
-        base = pe * wp.static(rows)
-        world = preelim.world[pe]
-        line = dense_first[world]
-        entries = packed_Z.shape[2]
-        m = bilateral_rows(pe, base, preelim, mimic_slot, link_slot)
-        kept = int(0)
-        for p in range(m):
-            row = preelim.slots[base + p]
-            # The row's incident velocity joins its right-hand side: both follow the row through the transform.
-            world_rhs[line, row] += world_incident[line, row]
-            world_incident[line, row] = 0.0
-            own = wide_product(packed_Z, world, row, row, entries)
-            for q in range(kept):
-                other = preelim.slots[base + q]
-                along = wide_product(packed_Z, world, other, row, entries)
-                subtract_row(packed_Z, world, row, along, other, entries)
-                world_rhs[line, row] -= along * world_rhs[line, other]
-            rest = wide_product(packed_Z, world, row, row, entries)
-            scale = float(0.0)
-            if rest > BILATERAL_PIVOT * own:
-                scale = 1.0 / wp.sqrt(rest)
-                preelim.slots[base + kept] = row
-                kept += 1
-            scale_row(packed_Z, world, row, scale, entries)
-            world_rhs[line, row] *= scale
-            if local_solve_owner[world] == PGS_LOCAL_SOLVE_OWNER_GENERAL:
-                world_diag[line, row] = scale * scale * rest + world_row_cfm[line, row]
-        for p in range(kept, wp.static(rows)):
-            preelim.slots[base + p] = -1
-        preelim.nB[pe] = kept
-
-    def correct(
-        dense_first: wp.array[int],
-        preelim: Preelim,
-        row_sides: wp.array2d[wp.vec2i],
-        constraint_count: wp.array[int],
-        local_solve_owner: wp.array[int],
-        world_row_cfm: wp.array2d[float],
-        # outputs
-        packed_Z: wp.array3d[float],
-        world_rhs: wp.array2d[float],
-        world_diag: wp.array2d[float],
-    ):
-        # Correct every other row on the blocks its sides touch, Pi Z_i = Z_i - Z_B y_i with y_i = G^-1 Z_B^T Z_i, take
-        # y_i^T b_B back from its right-hand side and store its diagonal |Pi Z_i|^2 + cfm (the squares summed in entry
-        # order, the padding's zeros included; in the worlds the general solver owns). One thread per world row, after
-        # the right-hand sides are final. A row the block does not see (Z_B^T Z_i exactly zero) keeps its entries; the
-        # block's rows, kept or dropped, keep theirs. Blocks hold different trees, so their projectors commute.
-        tid = wp.tid()
-        capacity = row_sides.shape[1]
-        world = tid // capacity
-        row = tid - world * capacity
-        if world >= constraint_count.shape[0] or row >= constraint_count[world]:
-            return
-        line = dense_first[world]
-        sides = row_sides[line, row]
-        entries = packed_Z.shape[2]
-        touched = int(0)
-        last = int(-1)
-        for side in range(2):
-            art = sides[side]
-            if art < 0:
-                continue
-            pe = preelim.art_to_preelim[art]
-            if pe < 0 or pe == last:
-                continue
-            last = pe
-            touched = 1
-            m = preelim.nB[pe]
-            base = pe * wp.static(rows)
-            for p in range(wp.static(rows)):
-                if preelim.slots[base + p] == row:
-                    return
-            for p in range(m):
-                other = preelim.slots[base + p]
-                along = wide_product(packed_Z, world, other, row, entries)
-                if along != 0.0:
-                    subtract_row(packed_Z, world, row, along, other, entries)
-                    world_rhs[line, row] -= along * world_rhs[line, other]
-        if touched != 0 and local_solve_owner[world] == PGS_LOCAL_SOLVE_OWNER_GENERAL:
-            world_diag[line, row] = wide_product(packed_Z, world, row, row, entries) + world_row_cfm[line, row]
-
-    def weights(
-        dense_first: wp.array[int],
-        preelim: Preelim,
-        world_rhs: wp.array2d[float],
-        # outputs
-        world_impulses: wp.array2d[float],
-    ):
-        # The projection: the kept rows' impulses -r_Q, their residual at zero change, one thread per block.
-        pe = wp.tid()
-        base = pe * wp.static(rows)
-        world = preelim.world[pe]
-        line = dense_first[world]
+@wp.func
+def close_row(
+    line: int,
+    row: int,
+    sides: wp.vec2i,
+    capacity: int,
+    preelim: Preelim,
+    world_row_cfm: wp.array2d[float],
+    packed_Z: wp.array3d[float],
+    world_rhs: wp.array2d[float],
+    world_diag: wp.array2d[float],
+):
+    """Correct row ``row`` (not a block row) on the blocks its sides touch, once they are closed: ``Pi Z_i = Z_i - Q
+    Q^T Z_i``, its right-hand side taking back ``(Q^T Z_i) . r_Q``, its diagonal ``|Pi Z_i|^2 + cfm`` (the squares summed
+    in entry order, the padding's zeros included). A row the block does not see (``Q^T Z_i`` exactly zero) keeps its
+    entries. Blocks hold different trees, so their projectors commute."""
+    entries = packed_Z.shape[2]
+    touched = int(0)
+    last = int(-1)
+    for side in range(2):
+        art = sides[side]
+        if art < 0:
+            continue
+        pe = preelim.art_to_preelim[art]
+        if pe < 0 or pe == last:
+            continue
+        last = pe
+        touched = 1
+        base = pe * capacity
         for p in range(preelim.nB[pe]):
-            slot = preelim.slots[base + p]
-            world_impulses[line, slot] = -world_rhs[line, slot]
+            other = preelim.slots[base + p]
+            along = wide_product(packed_Z, line, other, row, entries)
+            if along != 0.0:
+                subtract_row(packed_Z, line, row, along, other, entries)
+                world_rhs[line, row] -= along * world_rhs[line, other]
+    if touched != 0:
+        world_diag[line, row] = wide_product(packed_Z, line, row, row, entries) + world_row_cfm[line, row]
 
-    return BilateralElimination(
-        rows,
-        python_kernel(setup, f"bilateral_setup_{rows}"),
-        python_kernel(correct, f"bilateral_correct_{rows}"),
-        python_kernel(weights, f"bilateral_weights_{rows}"),
-    )
+
+@wp.kernel(enable_backward=False)
+def seed_blocks_kernel(
+    dense_first: wp.array[int],
+    capacity: int,
+    preelim: Preelim,
+    world_rhs: wp.array2d[float],
+    # outputs
+    world_impulses: wp.array2d[float],
+):
+    """The closure's seed, after the warm start's gather: the kept rows' impulses ``-r_Q``, their residual at zero
+    change (the sweeps' :func:`.sweep.impulse_seed` installs them), a thread per block."""
+    pe = wp.tid()
+    base = pe * capacity
+    line = dense_first[preelim.world[pe]]
+    for p in range(preelim.nB[pe]):
+        slot = preelim.slots[base + p]
+        world_impulses[line, slot] = -world_rhs[line, slot]
 
 
 # ---------------------------------------------------------------------------------------------------------------------
