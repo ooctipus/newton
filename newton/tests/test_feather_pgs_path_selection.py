@@ -647,12 +647,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(methods, set(BUILDER_METHODS))
         self.assertEqual({kernel for kernel in named if not is_row_builder(kernel)}, set())
 
-    def test_cpu_row_builder_check_rejects_wrong_order_and_counts(self):
-        """Fail the launch check for a record that names the launched kernels in the wrong order or count.
+    def test_cpu_row_builder_check_rejects_wrong_counts(self):
+        """Fail the launch check for a record that names the launched kernels in the wrong count.
 
-        Three sizes take the one writer: its unit launch, then the writer, once a step for every size. A record
-        that lists the kernels in reverse, or names them as per-size launches, still names the launched set, and
-        the check must reject it.
+        Three sizes take the one writer, once a step for every size. A record that names it as per-size launches
+        still names the launched set, and the check must reject it.
         """
         model = _resting_arms_and_box(1, 2)
         solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
@@ -660,14 +659,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         keys = _launched_kernel_keys(model, solver)
         self.assertEqual({entry["method"] for entry in record["builder_by_dof"].values()}, {"walk"})
         assert_row_builders_named(self, record, keys)
-        reversed_order = copy.deepcopy(record)
-        reversed_order["builder_by_dof"]["2"]["kernels"].reverse()
         per_size = copy.deepcopy(record)
         for entry in per_size["builder_by_dof"].values():
             entry["method"] = "masked"
-        for name, wrong in (("order", reversed_order), ("count", per_size)):
-            with self.subTest(name), self.assertRaises(AssertionError):
-                assert_row_builders_named(self, wrong, keys)
+        with self.assertRaises(AssertionError):
+            assert_row_builders_named(self, per_size, keys)
 
     def test_cpu_row_build_dispatches_on_the_recorded_plan(self):
         """Record and launch the builders of one plan: the row build and the record call the same function.

@@ -241,7 +241,8 @@ def release_side(
         release_path(walk.release, art, j, packed_Z, at[0], slot, at[1])
 
 
-@wp.kernel(enable_backward=False)
+# Two blocks of 256 a multiprocessor (128 registers): the walk's one-row seeds with their held step sit at the bound.
+@wp.kernel(enable_backward=False, launch_bounds=(256, 2))
 def write_free_body_rows(
     mf: MfRows,
     data: ContactInput,
@@ -919,12 +920,6 @@ _GENERATE = """    // The rows in generator form (WALK_MAPPING D5H, Z_UNION 1.2)
     const auto& support = sink.support;
     const int S = sink.row_factor.shape[2];
     constexpr int SLOTS = $slots, PATHS = $paths, SLOT = 6 * PATHS + 6, TABLE = $table;
-#if defined(__CUDA_ARCH__)
-    __shared__ float GAMMA_BLOCK[$groups * SLOTS * SLOT];
-    float* const GAMMA = GAMMA_BLOCK + SUB * (SLOTS * SLOT);
-#else
-    float GAMMA[SLOTS * SLOT];
-#endif
     // This lane's unit: its responding sides' bodies (-1: none).
     int key[2] = {-1, -1}, owner[2] = {-1, -1};
     if (eligible != 0) {
@@ -1224,6 +1219,22 @@ def generator_slots(parent: tuple, first: tuple, lanes: int) -> int:
     return max(min(lanes // 6, GAMMA_BYTES // (groups * slot)), 0)
 
 
+_GAMMA = """    // The world group's generators (walk_rows._GENERATE): $slots slots of $slot floats, in the block's static shared
+    // memory, a group's after its predecessors'.
+    __shared__ float GAMMA_BLOCK[$groups * $slots * $slot];
+    float* const GAMMA = GAMMA_BLOCK + SUB * ($slots * $slot);"""
+
+_GAMMA_CPU = """    float GAMMA[$slots * $slot];"""
+
+
+def _gamma(groups: int, slots: int, slot: int) -> DevicePrelude:
+    """The generators' storage: a world group's slots in the block's shared memory (one thread a world on the CPU)."""
+    values = {"groups": groups, "slots": max(slots, 1), "slot": slot}
+    return DevicePrelude(
+        f"support_gamma_{groups}_{slots}_{slot}", substitute(_GAMMA, values), cpu=substitute(_GAMMA_CPU, values)
+    )
+
+
 def _generate_snippet(parent: tuple, first: tuple, node: tuple, rows: int, records: bool, spin: bool, lanes: int):
     record = substitute(_GENERATE_RECORD, rows=rows, tail=_SPIN_TAIL if spin else "") if records else ""
     crosses = (6 if rows >= 4 else 3) if rows >= 3 else 0
@@ -1233,7 +1244,6 @@ def _generate_snippet(parent: tuple, first: tuple, node: tuple, rows: int, recor
         slots=generator_slots(parent, first, lanes),
         paths=_path_coordinates(parent, first),
         table=8,
-        groups=SUPPORT_THREADS // lanes,
         rows=rows,
         last=rows - 1,
         coordinate=WALK_COORDINATE,
@@ -1243,7 +1253,9 @@ def _generate_snippet(parent: tuple, first: tuple, node: tuple, rows: int, recor
         sums=f"SUM({sums});",
         record=record,
     )
-    return dual_native(body, preludes=(walk_prelude(parent, first, 1), _support_table(node), lane_group(lanes)))
+    slots, paths = generator_slots(parent, first, lanes), _path_coordinates(parent, first)
+    gamma = _gamma(SUPPORT_THREADS // lanes, slots, 6 * paths + 6)
+    return dual_native(body, preludes=(lane_group(lanes), walk_prelude(parent, first, 1), _support_table(node), gamma))
 
 
 @cache

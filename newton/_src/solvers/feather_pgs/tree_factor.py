@@ -1456,24 +1456,21 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
                              int top, float* p, float* w, auto&& sink) {
         for (int b = body; b >= 0; b = WALK_PARENT_OF(b)) {
             const float* l = link + $link * b;
-            float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f;
-            if (now != nullptr) {
-                o0 = l[$frame] - origin[0];
-                o1 = l[$frame + 1] - origin[1];
-                o2 = l[$frame + 2] - origin[2];
-            }
             for (int c = b == body ? top : WALK_FIRST_OF(b + 1) - 1; c >= WALK_FIRST_OF(b); --c) {
                 const float* d = data + $coordinate * c;
-                const float* S = now != nullptr ? now + $now * c : d;
-                // The step's column at the body's frame: S's linear part shifted there, its angular part as is.
-                const float e0 = S[0] + (S[4] * o2 - S[5] * o1);
-                const float e1 = S[1] + (S[5] * o0 - S[3] * o2);
-                const float e2 = S[2] + (S[3] * o1 - S[4] * o0);
                 for (int r = 0; r < $rows; ++r) {
                     float* q = p + 6 * r;
                     float x = (d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) + (d[3] * q[3] + d[4] * q[4] + d[5] * q[5]);
                     float j = 0.0f;
                     if (now != nullptr) {
+                        // The step's column at the body's frame: S's linear part shifted there, its angular part as
+                        // is (the frame read where it is used, so no register holds it across the walk).
+                        const float* S = now + $now * c;
+                        const float o0 = l[$frame] - origin[0], o1 = l[$frame + 1] - origin[1];
+                        const float o2 = l[$frame + 2] - origin[2];
+                        const float e0 = S[0] + (S[4] * o2 - S[5] * o1);
+                        const float e1 = S[1] + (S[5] * o0 - S[3] * o2);
+                        const float e2 = S[2] + (S[3] * o1 - S[4] * o0);
                         const float* v = w + 6 * r;
                         x += ((e0 - d[0]) * v[0] + (e1 - d[1]) * v[1] + (e2 - d[2]) * v[2])
                              + ((S[3] - d[3]) * v[3] + (S[4] - d[4]) * v[4] + (S[5] - d[5]) * v[5]);
