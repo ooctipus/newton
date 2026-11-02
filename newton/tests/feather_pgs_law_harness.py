@@ -25,6 +25,7 @@ from newton._src.solvers.feather_pgs.device_preludes import cuda_native, dual_na
 from newton._src.solvers.feather_pgs.friction_patches import PatchRowLaw
 from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.solver_fields import Mimics
+from newton._src.solvers.feather_pgs.tree_factor import WALK_COORDINATE, WALK_LINK, WALK_NOW, WalkRelease, WalkTrees
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 FAMILIES = (contact_laws.CONTACT_LAW, row_laws.ROW_LAW, projection_laws.PROJECTION_LAW, projection_laws.CONE_LAW)
@@ -684,11 +685,12 @@ def group_rows(device) -> RowSupport:
     return support
 
 
-def local_packed_rows(device, art_world, rows_by_art) -> list:
+def local_packed_rows(device, art_world, rows_by_art, incident=None) -> list:
     """The local owners' row operands (:data:`.sweep_routes_local.LOCAL_ABI`): ``packed_Z``, ``row_sides``,
-    ``response_dofs``, ``articulation_world_dof_offset`` and ``packed_dense`` (1). ``rows_by_art[a]`` is articulation
-    ``a``'s Jacobian rows ``[rows, n]`` (its size group's); each world's rows hold its articulations' coordinates in
-    articulation order (dense), every row on every articulation of its world, so a row's entries are the group rows'."""
+    ``row_incident``, ``response_dofs``, ``articulation_world_dof_offset`` and ``packed_dense`` (1). ``rows_by_art[a]``
+    is articulation ``a``'s rows ``[rows, n]`` as the one writer stores them (whitened, :func:`chain_walk`'s ``Z``);
+    each world's rows hold its articulations' coordinates in articulation order (dense), every row on every
+    articulation of its world. ``incident`` is each world's rows' ``J v_hat`` ``[worlds, rows]`` (zero by default)."""
     art_world = np.asarray(art_world, dtype=np.int32)
     rows_by_art = [np.asarray(rows, dtype=np.float32) for rows in rows_by_art]
     dofs = np.array([rows.shape[1] for rows in rows_by_art], dtype=np.int32)
@@ -703,9 +705,12 @@ def local_packed_rows(device, art_world, rows_by_art) -> list:
         packed[world, :, offsets[art] : offsets[art] + dofs[art]] = rows_by_art[art]
         side = 0 if sides[world, 0, 0] < 0 else 1
         sides[world, :, side] = art
+    if incident is None:
+        incident = np.zeros((worlds, capacity), dtype=np.float32)
     return [
         wp.array(packed, dtype=wp.float32, device=device),
         wp.array(sides, dtype=wp.vec2i, device=device),
+        wp.array(np.asarray(incident, dtype=np.float32), dtype=wp.float32, device=device),
         wp.array(dofs, dtype=wp.int32, device=device),
         wp.array(offsets, dtype=wp.int32, device=device),
         1,
@@ -721,14 +726,84 @@ def _walked_coordinates(solver):
     from newton._src.solvers.feather_pgs.tree_factor import walk_enter_kernel  # noqa: PLC0415
 
     forest, factor = solver.forest, solver.factor
-    coordinates = wp.zeros((forest.world_count, max(int(forest.max_world_dofs), 1)), dtype=float, device=solver.model.device)
+    coordinates = wp.zeros(
+        (forest.world_count, max(int(forest.max_world_dofs), 1)), dtype=float, device=solver.model.device
+    )
     wp.launch(
         walk_enter_kernel(),
         dim=factor.walk_arts.shape[0],
-        inputs=[factor.walk_arts, factor.walk_view(), forest.art_to_world, forest.articulation_world_dof_offset, solver.v_hat, coordinates],
+        inputs=[
+            factor.walk_arts,
+            factor.walk_view(),
+            forest.art_to_world,
+            forest.articulation_world_dof_offset,
+            solver.v_hat,
+            coordinates,
+        ],
         device=solver.model.device,
     )
     return coordinates.numpy().astype(np.float64)
+
+
+def walk_factor(lower) -> np.ndarray:
+    """``A = P L^T P`` of a leaf-first factor ``L`` (``P H P^T = L L^T``): lower triangular in coordinate order, the
+    walk's ``u = A qd`` of :func:`chain_walk`, ``H = A^T A``; a row's footprints are ``z = A^-T J^T``."""
+    lower = np.asarray(lower, dtype=np.float64)
+    return lower.T[::-1, ::-1].copy()
+
+
+def chain_walk(device, lowers) -> WalkTrees:
+    """The walk (:class:`.tree_factor.WalkTrees`) of chains whose factors are the given leaf-first ``L`` (one an
+    articulation, their coordinates one after another): body ``c`` holds coordinate ``c`` (a chain of at most six),
+    ``s_c = e_c``, ``ut_c[k] = A[c, k]`` below the diagonal and ``1 / ell_c = 1 / A[c, c]`` (:func:`walk_factor`), its
+    links zero, and the step's columns the factor's, so a wrench seed's ``J`` is its first coordinates' components and
+    a covector's footprints and the leave are ``A^-T`` and ``A^-1``. No tree slips."""
+    factors = [walk_factor(lower) for lower in lowers]
+    sizes = [A.shape[0] for A in factors]
+    if max(sizes) > 6:
+        raise ValueError("a chain walk holds at most six coordinates an articulation")
+    start = np.cumsum([0, *sizes]).astype(np.int32)
+    total = int(start[-1])
+    data = np.zeros((total, WALK_COORDINATE), dtype=np.float32)
+    now = np.zeros((total, WALK_NOW), dtype=np.float32)
+    path = np.zeros((total, 2), dtype=np.int32)
+    dof_body = np.zeros(total, dtype=np.int32)
+    for art, A in enumerate(factors):
+        for c in range(A.shape[0]):
+            d = int(start[art]) + c
+            data[d, c] = now[d, c] = 1.0
+            data[d, 6 : 6 + c] = A[c, :c]
+            data[d, 12] = 1.0 / A[c, c]
+            path[d] = (c - 1, c)
+            dof_body[d] = c
+    arts = len(factors)
+
+    def ints(values):
+        return wp.array(np.asarray(values, dtype=np.int32), dtype=wp.int32, device=device)
+
+    walk = WalkTrees()
+    walk.data = wp.array(data, dtype=wp.float32, device=device)
+    walk.link = wp.zeros((total, WALK_LINK), dtype=wp.float32, device=device)
+    walk.path = wp.array(path, dtype=wp.vec2i, device=device)
+    walk.now = wp.array(now, dtype=wp.float32, device=device)
+    walk.now_link = wp.zeros((total, WALK_LINK), dtype=wp.float32, device=device)
+    walk.scratch = wp.zeros(total, dtype=wp.spatial_vector, device=device)
+    walk.joint_start, walk.joint_end = ints(start[:-1]), ints(start[1:])
+    walk.dof_start, walk.dofs = ints(start[:-1]), ints(sizes)
+    walk.dof_body, walk.body_joint = ints(dof_body), ints(np.arange(total))
+    release = WalkRelease()
+    release.count = ints(np.zeros(arts))
+    release.dof = wp.zeros((1, 1), dtype=wp.int32, device=device)
+    release.coordinate = wp.full((1, 1, 1), -1, dtype=wp.int32, device=device)
+    release.b, release.a, release.g = (wp.zeros((1, 1, 1), dtype=wp.float32, device=device) for _ in range(3))
+    walk.release = release
+    return walk
+
+
+def walked_rows(lower, jacobian) -> np.ndarray:
+    """The one writer's rows ``z = A^-T J^T`` of Jacobian rows ``[rows, n]`` on :func:`chain_walk`'s factor."""
+    A = walk_factor(lower)
+    return np.linalg.solve(A.T, np.asarray(jacobian, dtype=np.float64).T).T.astype(np.float32)
 
 
 def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:

@@ -709,18 +709,18 @@ class SolverFeatherPGS(SolverBase):
                 if self.placement.keyed_rows is not None
                 else "Keyed rows need the Jacobi tiers (routes.sweep.tiers) and a plain matrix-free policy."
             )
-        # The general placement (case K6) and the paired factor coordinates (case K5, a tree beside one free body)
-        # whiten and leave their rows by the walk (FL3.3): the factor holds the walk's data for every responding tree,
-        # a free rigid body's six coordinates included, and the one writer, the free bodies' writer and the sweeps'
-        # leaves read it. Rows that an in-kernel owner sweeps (local owners, tiers, their packets and keyed rows) keep
-        # the old pack until their owners convert (FL3.6, FL3.7): their sweeps whiten their worlds' J in the kernel.
+        # The general placement (case K6), the paired factor coordinates (case K5, a tree beside one free body) and the
+        # local owners (case K3, FL3.6) whiten and leave their rows by the walk (FL3.3): the factor holds the walk's data
+        # for every responding tree, a free rigid body's six coordinates included, and the one writer, the free bodies'
+        # writer and the sweeps' leaves read it. The local owners' packets walk their seeds in their kernel and the one
+        # writer their general worlds' rows; every local kernel leaves by the walk. Rows that the tiers sweep (case K4,
+        # their keyed rows) keep the old pack until their owner converts (FL3.7): its sweep whitens its worlds' J in the
+        # kernel.
         self.placement.walks = bool(
-            self.routes.case in ("K6", "K5")
+            self.routes.case in ("K6", "K5", "K3")
             and self.placement.mf_sweeps
-            and self.placement.row_packets is None
             and self.placement.keyed_rows is None
             and not self.placement.ink_skip_rows()
-            and not self.placement.local_internal_fast_path
             and np.any(self.forest.response_dof_count > 0)
         )
         if self.factor.eliminates and not self.placement.walks:
@@ -728,6 +728,8 @@ class SolverFeatherPGS(SolverBase):
                 "Bilateral blocks are closed in the one writer's block phase (walk_rows): their class must walk "
                 f"(case K6 with the matrix-free sweeps), not case {self.routes.case}."
             )
+        if self.placement.local_internal_fast_path and not self.placement.walks:
+            raise ValueError("The local owners walk their rows and leave (FL3.6): their class must walk.")
         if self.placement.walks:
             self.factor.plan_walk(np.flatnonzero(self.forest.response_dof_count > 0))
             self.placement.hold_units()

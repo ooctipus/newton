@@ -19,6 +19,7 @@ from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.field_group import SolverArrays
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, link_patch_routes, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
+from newton._src.solvers.feather_pgs.tree_factor import WALK_LINK, WalkTrees
 from newton.tests.feather_pgs_law_harness import group_rows, row_lines, row_velocity
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
@@ -174,13 +175,60 @@ def _patch_fixture(device="cpu"):
         counts=array(dense_rows, int),
         # Each size's groups are permuted against the worlds.
         groups=array([group for w in range(WORLDS) for group in ((2, 0, 1)[w], (1, 2, 0)[w])], int),
+        walk=_walk_fixture(device, rng),
     )
     return data, layout
 
 
+def _walk_fixture(device, rng):
+    """The walk's step geometry the packets' seeds read: each body its own joint (the arm's two, then the box's), the
+    arm's first joint and the box's per world, and each body's walk frame point."""
+    walk = WalkTrees()
+    joints = 3 * WORLDS
+    link = np.zeros((joints, WALK_LINK), dtype=np.float32)
+    link[:, 4:7] = rng.normal(0.0, 0.5, (joints, 3))
+    walk.now_link = wp.array(link, dtype=float, device=device)
+    walk.body_joint = wp.array(np.arange(joints, dtype=np.int32), dtype=int, device=device)
+    walk.joint_start = wp.array(
+        np.array([3 * w + 2 * a for w in range(WORLDS) for a in range(2)], dtype=np.int32), dtype=int, device=device
+    )
+    return walk
+
+
+def _seed_jacobian(packet, data, walk) -> np.ndarray:
+    """The packets' seeds as rows of the pair's coordinates: a seed ``(f, t)`` at its body's walk frame ``o`` is the
+    row ``S_lin . f + S_ang . (t + (o - origin) x f)`` on each coordinate that moves the body (its mask), with the
+    fixture's motion columns about each articulation's origin; NaN where no seed was written."""
+    seeds, codes = packet.seed.numpy().astype(np.float64), packet.seed_body.numpy()
+    motion, origin = data.motion.numpy().astype(np.float64), data.origin.numpy().astype(np.float64)
+    mask, start = data.body_mask.numpy(), data.dof_start.numpy()
+    frames = walk.now_link.numpy()[:, 4:7].astype(np.float64)
+    out = np.full((WORLDS, PACKETS, PRIMARY + SECONDARY), np.nan)
+    for w in range(WORLDS):
+        for row in range(PACKETS):
+            if np.any(codes[w, row] == -777):
+                continue
+            out[w, row] = 0.0
+            for side in range(2):
+                code = codes[w, row, side]
+                if code == rp.SEED_NONE:
+                    continue
+                art, local = (2 * w, code) if code >= 0 else (2 * w + 1, 2)
+                body = 3 * w + local
+                f, t = seeds[w, row, 6 * side : 6 * side + 3], seeds[w, row, 6 * side + 3 : 6 * side + 6]
+                moment = t + np.cross(frames[body] - origin[art], f)
+                size, first = (PRIMARY, 0) if code >= 0 else (SECONDARY, PRIMARY)
+                for c in range(size):
+                    if mask[body] & (1 << c):
+                        column = motion[start[art] + c]
+                        out[w, row, first + c] += column[:3] @ f + column[3:] @ moment
+    return out
+
+
 def _packet(device):
     packet = rp.ContactPacketData()
-    packet.jacobian = wp.full((WORLDS, PACKETS, PRIMARY + SECONDARY), float("nan"), dtype=float, device=device)
+    packet.seed = wp.full((WORLDS, PACKETS, 12), float("nan"), dtype=float, device=device)
+    packet.seed_body = wp.full((WORLDS, PACKETS, 2), -777, dtype=int, device=device)
     packet.row_contact = wp.full((WORLDS, PACKETS), -1, dtype=int, device=device)
     return packet
 
@@ -249,6 +297,11 @@ def _run_general(data, layout, beta):
     bias = rows.rhs.numpy().copy()
     right_hand_sides(data.restitution_threshold)
     return rows, jacobians, bias
+
+
+def _units(device):
+    """The one writer's unit sources, by world line and row (:attr:`.dense_rows.RowSupport.units`)."""
+    return wp.full((WORLDS, ROWS), -1, dtype=int, device=device)
 
 
 def _launch(kernel, data, layout, *inputs):
@@ -387,6 +440,7 @@ def _owner_solver(device, *, anchors, beta=0.0):
             mf_body_a=ints(worlds, 4),
             mf_body_b=ints(worlds, 4),
             mf_row_type=ints(worlds, 4),
+            unit_source=ints(worlds, ROWS),
             J_by_size={
                 size: wp.zeros((worlds, ROWS, size), dtype=float, device=device) for size in (PRIMARY, SECONDARY)
             },
@@ -405,6 +459,9 @@ def _owner_solver(device, *, anchors, beta=0.0):
         # The owner's placeholders come from the solver's allocator.
         _arrays=SolverArrays(None, wp.get_device(device)),
     )
+    # The packets' seeds enter at the walk's step geometry.
+    walk = WalkTrees()
+    solver.factor = SimpleNamespace(walk_view=lambda: walk)
     # The producers write the size groups' rows (dense_rows.jacobian_row).
     solver.placement.row_support = lambda: group_rows(device)
     solver.placement.jacobian_rows = lambda size: solver.placement.J_by_size[size]
@@ -438,8 +495,10 @@ class _PatchRowTwins:
         beta = 0.35
         data, layout = _patch_fixture(self.device)
         general, jacobians, bias = _run_general(data, layout, beta)
-        packet = _packet(layout.device)
-        _launch(rp.produce_contacts, data, layout, _law(layout.view, beta), packet, PRIMARY, SECONDARY)
+        packet, units = _packet(layout.device), _units(layout.device)
+        _launch(
+            rp.produce_contacts, data, layout, _law(layout.view, beta), layout.walk, packet, PRIMARY, SECONDARY, units
+        )
         owned = _owned_rows(data)
         # The general route writes the metadata of allocated rows alone; the producer also seeds their
         # diagonals with cfm and, with contact_w 1, leaves row_w alone. Other rows keep their poison.
@@ -464,7 +523,13 @@ class _PatchRowTwins:
                 jacobian[w, row, :PRIMARY] = jacobians[PRIMARY].numpy()[groups[2 * w], row]
                 jacobian[w, row, PRIMARY:] = jacobians[SECONDARY].numpy()[groups[2 * w + 1], row]
         self.assert_same(packet.row_contact.numpy(), row_contact)
-        self.assert_same(packet.jacobian.numpy(), jacobian)
+        # Every row's unit source, from which the one writer walks the general worlds' rows (FL3.6).
+        lines, sources = data.first.numpy(), units.numpy()
+        for c, w, first, count in _contact_rows(data):
+            for r in range(count):
+                self.assertEqual(sources[lines[w], first + r], (1 << 28) | (4 * c + r), f"contact {c} row {r}")
+        # The seeds write the general route's rows (FL3.6: the local kernel walks them), to rounding.
+        np.testing.assert_allclose(_seed_jacobian(packet, data, layout.walk), jacobian, rtol=1.0e-4, atol=2.0e-5)
         # The fixture bounces, holds anchors with and without tangent rows and overflows the packets.
         weight = layout.view.weight.numpy()
         contacts = list(_contact_rows(data))
@@ -481,48 +546,6 @@ class _PatchRowTwins:
         linked = [parents[w, first] for c, w, first, count in contacts if count == 1]
         self.assertTrue(any(parent >= 0 for parent in linked), "A normal-only unit must join a ring")
 
-    def test_patch_fallback_matches_the_general_jacobians(self):
-        """Materialize only general worlds' patch rows, with the general route's Jacobians.
-
-        Whole buffers are compared: a general world's rows past its contacts' allocations keep their
-        cleared zeros, and a locally owned world's rows stay stale.
-        """
-        data, layout = _patch_fixture(self.device)
-        _, jacobians, _ = _run_general(data, layout, 0.35)
-        law, groups = _law(layout.view), layout.groups.numpy()
-        # The second world is locally owned, or every world falls back to the general response.
-        for owners in ((0, 2, 0), (0, 0, 0)):
-            with self.subTest(owners=owners):
-                owner = wp.array(owners, dtype=int, device=layout.device)
-                J, expected = {}, {}
-                for size in (PRIMARY, SECONDARY):
-                    # materialize_general_prefix has cleared the general worlds' rows; a local world's are stale.
-                    values = np.zeros((WORLDS, ROWS, size), dtype=np.float32)
-                    expected[size] = jacobians[size].numpy().copy()
-                    for w in np.flatnonzero(owners):
-                        group = groups[2 * w + int(size == SECONDARY)]
-                        values[group] = expected[size][group] = np.nan
-                    J[size] = wp.array(values, dtype=float, device=layout.device)
-                wp.launch(
-                    rp.materialize_fallback,
-                    dim=128,
-                    inputs=[
-                        128,
-                        data,
-                        law,
-                        owner,
-                        PRIMARY,
-                        SECONDARY,
-                        layout.groups,
-                        group_rows(layout.device),
-                        J[PRIMARY],
-                        J[SECONDARY],
-                    ],
-                    device=layout.device,
-                )
-                for size in (PRIMARY, SECONDARY):
-                    self.assert_same(J[size].numpy(), expected[size], err_msg=f"size {size}")
-
     def test_patch_tangent_rows_replace_the_point_law(self):
         """Keep the point law's normal rows and move only the tangent rows to the patch law.
 
@@ -535,9 +558,13 @@ class _PatchRowTwins:
         data, layout = _patch_fixture(self.device)
         point, _ = _patch_fixture(self.device)
         packet, point_packet = _packet(layout.device), _packet(layout.device)
-        _launch(rp.produce_contacts, data, layout, _law(layout.view, beta), packet, PRIMARY, SECONDARY)
+        units = _units(layout.device)
+        _launch(
+            rp.produce_contacts, data, layout, _law(layout.view, beta), layout.walk, packet, PRIMARY, SECONDARY, units
+        )
         point_law = point_row_law(layout.device, layout.view.phi.shape[0])
-        _launch(rp.produce_contacts, point, layout, point_law, point_packet, PRIMARY, SECONDARY)
+        _launch(rp.produce_contacts, point, layout, point_law, layout.walk, point_packet, PRIMARY, SECONDARY, units)
+        seeds, point_seeds = packet.seed.numpy(), point_packet.seed.numpy()
         phi = layout.view.phi.numpy()
         moved = 0.0
         for c, w, first, count in _contact_rows(data):
@@ -549,7 +576,8 @@ class _PatchRowTwins:
                 data.rhs.numpy()[w, first], point.rhs.numpy()[w, first], rtol=1.0e-6, atol=1.0e-6
             )
             if first < PACKETS:
-                self.assert_same(packet.jacobian.numpy()[w, first], point_packet.jacobian.numpy()[w, first])
+                self.assert_same(seeds[w, first], point_seeds[w, first])
+                self.assert_same(packet.seed_body.numpy()[w, first], point_packet.seed_body.numpy()[w, first])
             if count != 3:
                 continue
             tangents = slice(first + 1, first + 3)
@@ -564,7 +592,7 @@ class _PatchRowTwins:
                 moved, float(np.max(np.abs(data.target.numpy()[w, tangents] - point.target.numpy()[w, tangents])))
             )
             if first + 2 < PACKETS:
-                difference = packet.jacobian.numpy()[w, tangents] - point_packet.jacobian.numpy()[w, tangents]
+                difference = seeds[w, tangents] - point_seeds[w, tangents]
                 moved = max(moved, float(np.max(np.abs(difference))))
         self.assertGreater(moved, 1.0e-3, "Tangent rows must act at the patch friction location")
 
@@ -574,21 +602,14 @@ class TestRowPacketPatchRows(_PatchRowTwins, unittest.TestCase):
 
     def test_patch_producers_share_one_row_law(self):
         """Write patch rows through the contact row frame law and the patch tangent row in the packet and compact producers."""
-        producers = (
-            rp.produce_contacts,
-            rp.materialize_fallback,
-            compact_contact.produce_contacts,
-        )
-        for kernel in producers:
+        for kernel in (rp.produce_contacts, compact_contact.produce_contacts):
             name = f"{kernel.func.__module__}.{kernel.key}"
             called = _called_functions(kernel)
             self.assertIn(contact_laws.contact_row_frame, called, name)
-            # The fallback writes Jacobians alone; the producers also write the tangent rows' metadata.
-            if kernel is not rp.materialize_fallback:
-                self.assertIn(friction_patches.patch_tangent_row, called, name)
+            self.assertIn(friction_patches.patch_tangent_row, called, name)
 
     def test_owner_launches_the_friction_law_it_was_built_with(self):
-        """Launch the producer and fallback with the solver's patch view and beta under either friction law.
+        """Launch the producer with the solver's patch view and beta under either friction law.
 
         Point friction is the patch law with beta 0 and a disabled view. ``friction_anchor_beta`` is read at
         each launch, as the general route reads it, so a change after construction reaches the next step's rows.
@@ -608,22 +629,17 @@ class TestRowPacketPatchRows(_PatchRowTwins, unittest.TestCase):
                     ):
                         owner.produce_contacts(contact_input)
                         owner.finish_rows()
-                    fallback = rp.materialize_fallback
-                    self.assertEqual(
-                        [call.args[0] for call in launch.call_args_list], [rp.finalize_and_queue, fallback]
-                    )
-                    self.assertEqual(
-                        [call.args[0] for call in tiled.call_args_list],
-                        [rp.produce_contacts, rp.materialize_general_prefix, rp.materialize_general_prefix],
-                    )
-                    laws = []
-                    for call in (tiled.call_args_list[0], launch.call_args_list[1]):
-                        inputs = call.kwargs["inputs"]
-                        self.assertIs(inputs[1], contact_input)
-                        # The row law follows the contact input.
-                        self.assertIsInstance(inputs[2], rp.PatchRowLaw.cls)
-                        laws.append(inputs[2])
-                    self.assertIs(tiled.call_args_list[0].kwargs["inputs"][3], owner.packet)
+                    # The one writer walks the general worlds' rows: no materialization follows the queue.
+                    self.assertEqual([call.args[0] for call in launch.call_args_list], [rp.finalize_and_queue])
+                    self.assertEqual([call.args[0] for call in tiled.call_args_list], [rp.produce_contacts])
+                    inputs = tiled.call_args_list[0].kwargs["inputs"]
+                    self.assertIs(inputs[1], contact_input)
+                    # The row law follows the contact input.
+                    self.assertIsInstance(inputs[2], rp.PatchRowLaw.cls)
+                    laws = [inputs[2]]
+                    self.assertIs(inputs[3], solver.factor.walk_view())
+                    self.assertIs(inputs[4], owner.packet)
+                    self.assertIs(inputs[7], solver.placement.unit_source)
                     view = solver.laws.friction_patches.view
                     for law in laws:
                         self.assertEqual(law.beta, beta)
@@ -787,10 +803,10 @@ class TestRowPacketsCUDA(unittest.TestCase):
         self.assertEqual(routes["friction"]["law"], "patch")
         self.assertEqual(routes["contact_rows"]["producer"], "local_packets")
         self.assertEqual(routes["sweep"]["local"]["factory"], "row_packets")
-        # The packets' patch producer and the fallback materialization of the general worlds, for every size.
+        # The packets' patch producer and the one writer, which walks the general worlds' rows, for every size.
         builder = {
             "method": "local_packets",
-            "kernels": ["produce_contacts", "materialize_fallback"],
+            "kernels": ["produce_contacts", "write_walked_rows"],
             "law": "patch",
         }
         builders = routes["contact_rows"]["builder_by_dof"]

@@ -504,6 +504,9 @@ class Audit:
         )
         self.sizes = tuple(size for size in forest.size_groups if solver.factor.L_by_size[size].shape[1] == size)
         self.coordinates_hat = wp.zeros_like(self.coordinates)
+        # A class whose local owners read the one writer's rows (FL3.6, no packets) has every world's rows stored: the
+        # audit reads every world as the general placement's.
+        self.general_owners = wp.zeros(max(forest.world_count, 1), dtype=wp.int32, device=solver.model.device)
 
     def record(self) -> dict:
         """Which rows the audit reads, for ``routes.diagnostics.audit``."""
@@ -525,7 +528,9 @@ class Audit:
         a.impulses = solver.placement.impulses
         a.counts = solver.placement.constraint_count
         a.mf_counts = solver.placement.mf_constraint_count
-        a.owner = solver.placement.local_solve_owner
+        # The local owners' packets keep their worlds' seeds (no stored row): the audit reads only the general worlds.
+        stored = solver.placement.walks and solver.placement.row_packets is None
+        a.owner = self.general_owners if stored else solver.placement.local_solve_owner
         a.skip_rows_le = int(solver.placement.ink_skip_rows())
         a.skip_local = int(solver.placement.row_packets is not None)
         a.keyed = int(solver.placement.keyed_rows is not None)

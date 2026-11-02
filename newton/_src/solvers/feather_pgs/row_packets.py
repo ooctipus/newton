@@ -5,11 +5,13 @@
 
 A world made of one primary articulation (the one carrying joint limits and
 mimic rows) and at most one secondary articulation (a free body, say) solves
-its rows in the fused local kernels, which read the rows' physical Jacobians
-directly. This producer writes those rows where the local kernels read them:
-the limit and mimic prefix as sparse coefficients, the contact rows as dense
-packets in the world's physical coordinates, both with the complete row
-metadata and right-hand sides of the ordinary producers. Only worlds the
+its rows in the fused local kernels, which walk each row's seeds in the kernel
+(FL3.6, :class:`.row_inputs.CompactLocalRows`). This producer writes those
+seeds where the local kernels read them: the limit and mimic prefix as
+covectors (sparse coefficients at the primary's coordinates), each contact row
+as a wrench at each of its bodies' walk frames at the step's poses (a side code
+and six floats a side), both with the complete row metadata and right-hand
+sides of the ordinary producers. Only worlds the
 local owners decline (too many rows, matrix-free rows of another body,
 unsupported row kinds) have their rows materialized into the ordinary
 per-size buffers and run the ordinary response. Every size here comes from
@@ -38,7 +40,7 @@ from .contact_laws import (
     contact_row_frame,
     contact_tangent_basis,
 )
-from .dense_rows import RowSupport, jacobian_row
+from .dense_rows import UNIT_CONTACT, UNIT_LIMIT, UNIT_MIMIC, UNIT_SHIFT, unit_source
 from .device_preludes import (
     lane_group,
     reserved_count,
@@ -52,10 +54,12 @@ from .friction_patches import PatchRowLaw, patch_friction_location, patch_row_la
 from .kernel_template import KernelTemplate, substitute
 from .kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
 from .prefix_rows import LAW, limits, prefix_rows
-from .row_build import _contact_in_sizes, endpoint_projection, populate_contact_J, write_contact_row
-from .row_inputs import CompactLocalRows, RowArgument
+from .row_build import write_contact_row
+from .row_inputs import SEED_NONE, SEED_SECONDARY, CompactLocalRows, RowArgument
 from .row_laws import ROW_LAW
 from .step_plan import JOINT_TOPOLOGY, TopologyPin, first_failed
+from .tree_factor import WalkTrees
+from .walk_rows import body_wrench
 
 WARPS_PER_BLOCK = 4
 PREFIX_WIDTH = 2  # a limit row has one coefficient, a mimic row two
@@ -83,10 +87,12 @@ PREFIX = (
     Field("mimic_slot", wp.int32, ("mimic",), owner="mimics"),
     Field("first_rejected_slot", wp.int32, ("world",), attr="dense_first_rejected_slot", owner="placement"),
     Field("impulses", wp.float32, ("world", "row"), owner="placement"),
+    Field("units", wp.int32, ("world", "row"), attr="unit_source", owner="placement"),
 )
 """The prefix kernel's inputs and outputs: the size group, the mimic tables (``mimics``: the solver's, or the
-placeholders of a model without mimics), the prefix law and the dense rows (:data:`.prefix_rows.LAW`), and the
-private prefix packets."""
+placeholders of a model without mimics), the prefix law and the dense rows (:data:`.prefix_rows.LAW`), the
+private prefix packets, and each row's unit source (``units``, :func:`.dense_rows.unit_source`), which the one writer
+reads for the general worlds' rows."""
 
 PrefixData = field_group.struct("PrefixData", PREFIX, __name__)
 
@@ -94,8 +100,14 @@ PrefixData = field_group.struct("PrefixData", PREFIX, __name__)
 PACKETS = FieldGroup(*(field for field in PREFIX if field.owner == "packets"))
 """The prefix's private packets: its coefficients and the contact of each packet row (-1 for none)."""
 
-CONTACT_PACKETS = (Field("jacobian", wp.float32, ("world", "packet", "coordinate")), PACKETS["row_contact"])
-"""The contact packets: each packet row's Jacobian over the pair's coordinates, and its contact."""
+CONTACT_PACKETS = (
+    Field("seed", wp.float32, ("world", "packet", 12)),
+    Field("seed_body", wp.int32, ("world", "packet", 2)),
+    PACKETS["row_contact"],
+)
+"""The contact packets: each packet row's seed, a wrench at each of its two sides' walk frames (six floats a side) and
+the side's code (:data:`.row_inputs.SEED_NONE`, :data:`.row_inputs.SEED_SECONDARY` or the primary body's index in its
+tree), and its contact."""
 
 ContactPacketData = field_group.struct("ContactPacketData", CONTACT_PACKETS, __name__)
 
@@ -163,8 +175,12 @@ _SINK = """            const int sparse = (world * $PACKETS + slot) * 2;
             data.weights.data[sparse + 1] = w1;
             data.diag.data[at] = data.cfm;
             data.impulses.data[at] = 0.0f;
-            if (mimic >= 0) data.mimic_slot.data[mimic] = slot;"""
-"""The packets' sink: a row's sparse coefficients, its diagonal seed and impulse, and its mimic's slot."""
+            if (mimic >= 0) data.mimic_slot.data[mimic] = slot;
+            data.units.data[prefix_line * data.units.shape[1] + slot] =
+                mimic >= 0 ? ($MIMIC << $SHIFT) | mimic : ($LIMIT << $SHIFT) | (2 * dof + side);"""
+"""The packets' sink: a row's sparse coefficients, its diagonal seed and impulse, its mimic's slot, and its unit source
+(:func:`.dense_rows.unit_source`: a mimic's, or a limit's coordinate and side), which the one writer walks where the
+world is general."""
 
 
 @cache
@@ -183,7 +199,7 @@ def get_prefix_kernel(primary: int, mimics: int, packets: int):
     rows = prefix_rows(
         ((*positions, limits(tuple(range(primary)), "first_dof + d", "data.")), ()),
         law="data.",
-        sink=substitute(_SINK, PACKETS=packets),
+        sink=substitute(_SINK, PACKETS=packets, MIMIC=int(UNIT_MIMIC), LIMIT=int(UNIT_LIMIT), SHIFT=int(UNIT_SHIFT)),
         ordered=True,
         rhs=True,
         locals_="int mimic = -1;",
@@ -201,8 +217,9 @@ def get_prefix_kernel(primary: int, mimics: int, packets: int):
 
 
 @cache
-def get_local_factory(primary: int, secondary: int, packets: int):
-    """Bind the packet layout to the shared local row-input interface."""
+def get_local_factory(primary: int, secondary: int, packets: int, bodies: int):
+    """Bind the packet layout to the shared local row-input interface: ``bodies`` is the most bodies of a primary
+    tree, whose walk the local kernels stage."""
     inputs = CompactLocalRows(
         primary,
         secondary,
@@ -210,6 +227,7 @@ def get_local_factory(primary: int, secondary: int, packets: int):
         packets,
         PREFIX_WIDTH,
         (RowArgument("prefix", PrefixData), RowArgument("packets", ContactPacketData)),
+        bodies,
     )
     return partial(sweep_routes_local.local_owned_kernel, row_inputs=inputs)
 
@@ -315,58 +333,62 @@ def finalize_and_queue(
         queue.residual_pair[slot] = residual_secondary
 
 
-@wp.kernel
-def materialize_general_prefix(
-    workers: int,
-    prefix: PrefixData,
-    queue: QueueData,
-    group_start: wp.array[int],
-    group_art: wp.array[int],
-    art_group: wp.array[int],
-    size: int,
-    support: RowSupport,
-    J: wp.array3d[float],
+@wp.func
+def packet_seed(
+    walk: WalkTrees,
+    data: ContactInput,
+    body: int,
+    art: int,
+    primary: int,
+    secondary: int,
+    sign: float,
+    direction: wp.vec3,
+    point: wp.vec3,
+    torque: bool,
 ):
-    """Populate the current general worlds' rows at this size's articulations' coordinates, zeros included: their
-    prefix rows, and zeros the contact rows' producer (:func:`materialize_fallback`) overwrites at their sides
-    (:func:`.dense_rows.jacobian_row`; the packed rows here are dense)."""
-    worker, lane = wp.tid()
-    for entry in range(worker, queue.general_count[0], workers):
-        world = queue.general[entry]
-        for item in range(group_start[world], group_start[world + 1]):
-            art = group_art[item]
-            at = jacobian_row(support, art_group[art], art, wp.vec2i(art, -1))
-            for coefficient in range(lane, queue.count[world] * size, warp_stride()):
-                row, dof = coefficient // size, coefficient % size
-                value = float(0.0)
-                if art == queue.primary[world] and row < prefix.bounds[world, 0]:
-                    for component in range(PREFIX_WIDTH):
-                        if prefix.dofs[world, row, component] == dof:
-                            value += prefix.weights[world, row, component]
-                J[at[0], row, at[1] + dof] = value
+    """A contact row's seed on one of its bodies: the side's code (the body's index in the primary's tree, or
+    :data:`.row_inputs.SEED_SECONDARY` for the paired free body, :data:`.row_inputs.SEED_NONE` for a body without
+    response coordinates) and the contact law's seed of ``sign`` along ``direction`` at ``point`` (a pure ``torque``
+    about it) at the body's walk frame at the step's poses (:func:`.walk_rows.body_wrench`, the one writer's)."""
+    code = int(SEED_NONE)
+    w = wp.spatial_vector()
+    if body >= 0 and art >= 0:
+        size = data.response_dofs[art]
+        if size > 0 and (size == primary or size == secondary):
+            w = body_wrench(walk, body, direction * sign, point, torque)
+            code = int(SEED_SECONDARY)
+            if size == primary:
+                code = walk.body_joint[body] - walk.joint_start[art]
+    return code, w
 
 
 @wp.kernel(enable_backward=False)
 def produce_contacts(
-    workers: int, data: ContactInput, law: PatchRowLaw, packet: ContactPacketData, primary: int, secondary: int
+    workers: int,
+    data: ContactInput,
+    law: PatchRowLaw,
+    walk: WalkTrees,
+    packet: ContactPacketData,
+    primary: int,
+    secondary: int,
+    units: wp.array2d[int],
 ):
-    """Cooperatively project current contacts into physical packets after allocation; a lane per row writes its
-    records and rhs (:func:`.row_build.write_contact_row`).
+    """Cooperatively write current contacts' seeds into the packets after allocation, a lane per row: its seed on
+    each body (:func:`packet_seed`), its records and rhs (:func:`.row_build.write_contact_row`) and its unit source,
+    from which the one writer walks the row where its world is general (no local owner's).
 
     Tangent rows act at the friction location and follow the row law that the compact producer shares
     (``contact_laws.contact_row_frame`` and ``patch_tangent_row``): under persistent patches at the patch
     friction location with the anchor's tangential phi, ``law.beta`` and the undivided coefficient; under point
     friction (beta 0, a disabled view with a zero phi) at the contact's friction points. Every rhs is the row
-    law's (``row_laws``), as the general route's, so the rows equal it bitwise. A bouncing normal row sums its
-    incident velocity per body instead of per world coordinate. It agrees with the general route's to rounding,
-    unless the incident velocity lies within a rounding of a bounce threshold, where the two routes can
-    disagree on whether the row bounces.
+    law's (``row_laws``), as the general route's. A bouncing normal row sums its incident velocity per body instead
+    of per world coordinate. It agrees with the general route's to rounding, unless the incident velocity lies
+    within a rounding of a bounce threshold, where the two routes can disagree on whether the row bounces.
     """
     worker, _logical_lane = wp.tid()
     lane = warp_lane()
     stride = warp_stride()
-    capacity = packet.jacobian.shape[1]
-    width = primary + secondary
+    capacity = packet.seed.shape[1]
     total = data.count[0]
     for contact in range(worker, total, workers):
         if data.path[contact] != 0 or data.slot[contact] < 0:
@@ -401,53 +423,22 @@ def produce_contacts(
         friction_point = point
         if law.patches.enabled != 0:
             friction_point = patch_friction_location(law.patches, contact)
-        for coefficient in range(lane, rows * width, stride):
-            row = coefficient // width
-            coordinate = coefficient % width
-            output_row = slot + row
-            if output_row < capacity:
-                size = primary
-                dof = coordinate
-                if coordinate >= primary:
-                    size = secondary
-                    dof -= primary
-                direction, row_point = contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
-                value = endpoint_projection(data, body0, art0, size, dof, row, row_point, direction)
-                value -= endpoint_projection(data, body1, art1, size, dof, row, row_point, direction)
-                packet.jacobian[world, output_row, coordinate] = value
-        warp_sync()
-        # A lane per row writes its records and rhs with the row law the owners share.
         for row in range(lane, rows, stride):
+            if slot + row < capacity:
+                direction, row_point = contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
+                spin = row == CONTACT_SPIN_ROW
+                code_a, w_a = packet_seed(walk, data, body0, art0, primary, secondary, 1.0, direction, row_point, spin)
+                code_b, w_b = packet_seed(walk, data, body1, art1, primary, secondary, -1.0, direction, row_point, spin)
+                for k in range(6):
+                    packet.seed[world, slot + row, k] = w_a[k]
+                    packet.seed[world, slot + row, 6 + k] = w_b[k]
+                packet.seed_body[world, slot + row, 0] = code_a
+                packet.seed_body[world, slot + row, 1] = code_b
             write_contact_row(data, law, contact, row, True)
+            units[data.first[world], slot + row] = unit_source(UNIT_CONTACT, 4 * contact + row)
             if slot + row < capacity:
                 packet.row_contact[world, slot + row] = contact * 3 + row
         warp_sync()
-
-
-@wp.kernel(enable_backward=False)
-def materialize_fallback(
-    threads: int,
-    data: ContactInput,
-    law: PatchRowLaw,
-    owner: wp.array[int],
-    size_a: int,
-    size_b: int,
-    groups: wp.array[int],
-    support: RowSupport,
-    J_a: wp.array3d[float],
-    J_b: wp.array3d[float],
-):
-    """Write the general worlds' contact Jacobian with the masked builder's lanes (:mod:`.row_build`): one thread per
-    (contact, coordinate) of the larger size, every row at the row law's friction location."""
-    tid = wp.tid()
-    lanes = wp.max(size_a, size_b)
-    for c in range(tid // lanes, data.count[0], threads // lanes):
-        if data.path[c] != 0 or data.slot[c] < 0 or owner[data.world[c]] != 0:
-            continue
-        a_in, b_in = _contact_in_sizes(data, c, size_a, size_b)
-        flags = 1 | wp.where(data.slots_needed[c] >= 3, 2, 0) | wp.where(a_in, 4, 0) | wp.where(b_in, 8, 0)
-        flags |= wp.where(data.slots_needed[c] > CONTACT_SPIN_ROW, 16, 0)
-        populate_contact_J(c, tid % lanes, data, size_a, groups, law, flags, support, J_a, J_b)
 
 
 TOPOLOGY = (*JOINT_TOPOLOGY, "constraint_mimic_joint0", "constraint_mimic_joint1", "constraint_mimic_world")
@@ -516,9 +507,12 @@ class LocalRowPackets:
         self.prefix = PrefixData()
         arrays = SolverArrays(None, device)
         self._packets = SimpleNamespace(**arrays.allocate(PACKETS, owner={}, world=worlds, packet=self.packets))
-        sizes = {"world": worlds, "packet": self.packets, "coordinate": self.primary + self.secondary}
+        sizes = {"world": worlds, "packet": self.packets}
         self.packet = field_group.bind(
-            ContactPacketData, packets=self._packets, jacobian=arrays.array(CONTACT_PACKETS[0], sizes)
+            ContactPacketData,
+            packets=self._packets,
+            seed=arrays.array(CONTACT_PACKETS[0], sizes),
+            seed_body=arrays.array(CONTACT_PACKETS[1], sizes),
         )
         # A model without mimics binds the prefix's mimic tables to placeholders: no mimic per articulation.
         placeholder = solver._arrays.placeholder
@@ -544,7 +538,12 @@ class LocalRowPackets:
         self._prefix_kernel = get_prefix_kernel(self.primary, self.mimics, self.packets)
 
     def local_factory(self):
-        return get_local_factory(self.primary, self.secondary, self.packets)
+        """The local kernels' factory over these packets, staging the walk of the class's largest primary tree."""
+        forest = self.solver.forest
+        starts = self.solver.model.articulation_start.numpy()
+        primaries = np.flatnonzero(forest.response_dof_count == self.primary)
+        bodies = int(np.max(forest.articulation_joint_end_host[primaries] - starts[primaries], initial=1))
+        return get_local_factory(self.primary, self.secondary, self.packets, max(bodies, 1))
 
     def validate_notification(self, flags: ModelFlags | int = ModelFlags.ALL):
         """Refuse a structural change the packet topology does not survive (:class:`.step_plan.TopologyPin`)."""
@@ -586,7 +585,8 @@ class LocalRowPackets:
         )
 
     def produce_contacts(self, contact_input):
-        """Publish private current J and complete canonical contact metadata/RHS from the step's bound contact input.
+        """Publish each current contact row's seeds and complete canonical metadata/RHS from the step's bound contact
+        input; the seeds enter at the walk's step geometry (:meth:`.tree_factor.TreeFactor.walk_geometry`).
 
         Persistent patch friction writes its tangent rows with the patch row law. The patch link
         runs after this producer; :meth:`finish_rows` writes neither row parents nor coefficients.
@@ -597,13 +597,22 @@ class LocalRowPackets:
         wp.launch_tiled(
             produce_contacts,
             dim=[self.workers],
-            inputs=[self.workers, self.contact_input, self.law, self.packet, self.primary, self.secondary],
+            inputs=[
+                self.workers,
+                self.contact_input,
+                self.law,
+                self.solver.factor.walk_view(),
+                self.packet,
+                self.primary,
+                self.secondary,
+                self.solver.placement.unit_source,
+            ],
             block_dim=32,
             device=self.solver.model.device,
         )
 
     def finish_rows(self):
-        """Finalize and route current counts, then reconstruct only the general path."""
+        """Finalize and route current counts: each world's owner, and the general worlds the one writer walks."""
         solver, queue = self.solver, self.queue
         queue.general_count.zero_()
         queue.pair_count.zero_()
@@ -621,39 +630,6 @@ class LocalRowPackets:
             ],
             device=solver.model.device,
         )
-        support = solver.placement.row_support()
-        for size in solver.forest.size_groups:
-            wp.launch_tiled(
-                materialize_general_prefix,
-                dim=[self.workers],
-                inputs=[
-                    self.workers,
-                    self.prefix,
-                    queue,
-                    solver.forest.world_response_group_art_start[size],
-                    solver.forest.world_response_group_to_art[size],
-                    solver.forest.art_group_idx,
-                    size,
-                    support,
-                    solver.placement.jacobian_rows(size),
-                ],
-                block_dim=32,
-                device=solver.model.device,
-            )
-        if self.contact_input is not None:
-            size_b = self.secondary or self.primary
-            wp.launch(
-                materialize_fallback,
-                dim=self.workers * 32,
-                inputs=[self.workers * 32, self.contact_input, self.law, queue.owner, self.primary, size_b],
-                outputs=[
-                    solver.forest.art_group_idx,
-                    support,
-                    solver.placement.jacobian_rows(self.primary),
-                    solver.placement.jacobian_rows(size_b),
-                ],
-                device=solver.model.device,
-            )
 
 
 def decline(solver) -> str | None:

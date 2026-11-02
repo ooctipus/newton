@@ -457,8 +457,8 @@ def census_calls():
             local,
         ),
         (
-            "row_packets.get_local_factory(9, 6, 40)",
-            row_packets.get_local_factory.__wrapped__(9, 6, 40),
+            "row_packets.get_local_factory(9, 6, 40, 11)",
+            row_packets.get_local_factory.__wrapped__(9, 6, 40, 11),
             ((192, 20, 9, ARCH),),
             local,
         ),

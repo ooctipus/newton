@@ -1495,12 +1495,13 @@ LOCAL_KINEMATIC = Route(
 LOCAL_OWNED = Route(
     "local_owned",
     "cuda",
+    # Without the packets the local owners' class walks through the one writer (FL3.6): the kernel reads its rows.
     options=_MF,
     pins={"producer": "compact_jacobian"},
     expect={
         "local_solve.enabled": True,
         "sweep.local.factory": "local_owned",
-        "contact_rows.producer": "compact_jacobian",
+        "contact_rows.producer": "walk",
         "held_tree.owner": "mixed",
     },
 )

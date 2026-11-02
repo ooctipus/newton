@@ -229,7 +229,7 @@ def _readout_calls():
     for units in (False, True):
         kwargs = {"contact_units": True, **readout} if units else readout
         yield "sweep_routes_local.paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, False, True), kwargs, units
-    packets = row_packets.get_local_factory.__wrapped__(9, 6, 40)
+    packets = row_packets.get_local_factory.__wrapped__(9, 6, 40, 11)
     pair = {"paired_dof_count": 6, "persistent_queue": True, "warps_per_block": 2}
     for args, kwargs in (
         (
@@ -239,7 +239,7 @@ def _readout_calls():
         ((192, 20, 9, _ARCH), pair),
         ((192, 40, 9, _ARCH), {**pair, "mf_max_constraints": 64, "local_mf_max_constraints": 12}),
     ):
-        yield "row_packets.get_local_factory(9, 6, 40)", packets, args, {**kwargs, **readout}, False
+        yield "row_packets.get_local_factory(9, 6, 40, 11)", packets, args, {**kwargs, **readout}, False
 
 
 def _patch_only_factory_labels():
@@ -442,7 +442,7 @@ def _spliced_sweep_calls():
     from newton._src.solvers.feather_pgs import row_packets, sweep_routes_local  # noqa: PLC0415
 
     local = sweep_routes_local.local_owned_kernel.__wrapped__
-    packets = row_packets.get_local_factory.__wrapped__(9, 6, 40)
+    packets = row_packets.get_local_factory.__wrapped__(9, 6, 40, 11)
     pair = {"paired_dof_count": 6, "persistent_queue": True}
     for args, options in (
         ((192, 9, 9, _ARCH), {"lanes_per_world": 8, "contact_capable": False}),
@@ -451,7 +451,7 @@ def _spliced_sweep_calls():
     ):
         kwargs = {**options, "warps_per_block": 2}
         yield "sweep_routes_local.local_owned_kernel", local, args, kwargs
-        yield "row_packets.get_local_factory(9, 6, 40)", packets, args, kwargs
+        yield "row_packets.get_local_factory(9, 6, 40, 11)", packets, args, kwargs
 
 
 def _suite_shape_calls():

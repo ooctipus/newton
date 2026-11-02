@@ -1645,17 +1645,22 @@ class SparsePairZ(ResponseOperator):
 
 @dataclass(frozen=True)
 class LocalBlock(ResidualBlock):
-    """The response block of a local owner's rows, whitened in the kernel and stored as a packed lower triangle.
+    """The response block of a local owner's rows, whitened by the walk and stored as a packed lower triangle (FL3.6).
 
-    The owner's ``dense`` rows act on its ``dofs`` coordinates: one
-    articulation's, then a paired free body's, each a diagonal block of ``H``
-    with its staged factor (``factors``, in coordinate order). The block holds
-    each row whitened, ``Z = L^-1 P J^T`` block by block, staged in ``s_Z``
-    (row ``r`` from ``r * dofs``, :meth:`respond`). With ``free``, the world's free-body rows (``free_count``,
-    :class:`FreeBodyZ` entries read in place, their ``mf_meta`` words from
-    ``off_meta``) follow the dense rows in the block: they act on the paired
-    free body, whose factor coordinates are the last block's, so a free row's
-    terms are its ``Z`` against the body's ``u`` and the dense rows' ``Z`` there.
+    The owner's ``dense`` rows act on its ``dofs`` coordinates: its tree's ``primary`` coordinates, in the tree's
+    coordinate order, then a paired free body's ``secondary`` six, a one-body tree of the same walk. The block holds
+    each row's footprints ``z``, staged in ``s_Z`` (row ``r`` from ``r * dofs``, :meth:`respond`): the walk of the
+    row's seeds in the kernel (:class:`.row_inputs.CompactLocalRows`), or the one writer's stored rows
+    (:class:`.row_inputs.StoredLocalRows`). With ``bodies`` (at most the primary tree's bodies) the kernel walks
+    seeds, and the walk's data of the world's trees is staged in shared memory once (``s_walk``, ``s_walk_path``:
+    :meth:`walk_floats`, :meth:`walk_ints`; with ``wrenches`` the step's columns and links too, for wrench seeds);
+    without, it is read in place for the leave. With ``release`` the class's drives can slip: a walked row takes the
+    release ``R`` of its tree's slips along their paths (``WALK_RELEASE``, the one writer's rows carry it already) and
+    the leave ``R^T`` (:func:`.tree_factor.walk_release_tree`).
+    With ``free``, the world's free-body rows (``free_count``, :class:`FreeBodyZ` entries read in place, their
+    ``mf_meta`` words from ``off_meta``) follow the dense rows in the block: they act on the paired free body, whose
+    coordinates are the last block's, so a free row's terms are its ``Z`` against the body's ``u`` and the dense rows'
+    ``Z`` there.
 
     ``s_A`` holds the lower triangle of the Gram matrix ``A = Z^T Z``:
     ``A[hi][lo] = Z_hi Z_lo`` (``hi >= lo``) at ``hi (hi + 1) / 2 + lo``, built
@@ -1664,12 +1669,18 @@ class LocalBlock(ResidualBlock):
     start at the rows' right-hand sides, their incident velocities included.
     The velocity change is committed once after the sweeps, ``u = sum_r Z_r
     applied_r`` over every row of the block in row order (:meth:`commit`), then
-    leaves factor coordinates (:meth:`leave`). A view of the free-body rows
+    leaves the walk's coordinates, ``dv = P^T L^-T R^T u`` (:meth:`leave`). A view of the free-body rows
     addresses them from block row ``first``.
     """
 
     dofs: int
-    factors: tuple[CholeskySolve, ...] = ()
+    primary: int = 0
+    bodies: int = 0
+    seeds: bool = False
+    staged: bool = False
+    wrenches: bool = False
+    release: bool = False
+    dense_capacity: int = 0
     lanes: Lanes = Lanes()
     dense: str = "row_count"
     free: FreeBodyZ | None = None
@@ -1691,69 +1702,219 @@ class LocalBlock(ResidualBlock):
         a, b = _operand(source), _operand(target)
         return f"const int hi = {a} > {b} ? {a} : {b}, lo = {a} > {b} ? {b} : {a};", "hi * (hi + 1) / 2 + lo"
 
-    def _blocks(self):
-        """Each factor block's solve and first coordinate in the block."""
-        offset = 0
-        for solve in self.factors:
-            yield solve, offset
-            offset += solve.size
-        if offset != self.dofs:
-            raise ValueError(f"the factor blocks span {offset} coordinates, the block {self.dofs}")
+    @property
+    def secondary(self) -> int:
+        return self.dofs - self.primary
 
-    def _velocity(self, offset: int):
-        def velocity(i):
-            return f"s_v[{offset} + {i}]" if offset else f"s_v[{i}]"
+    @property
+    def coordinate_floats(self) -> int:
+        """Staged floats a coordinate: ``s``, ``ut``, ``1 / ell`` (:data:`.tree_factor.WALK_COORDINATE`'s first 13),
+        then with ``wrenches`` its step column (:data:`.tree_factor.WALK_NOW`)."""
+        from .tree_factor import WALK_NOW, WALK_STAGED  # noqa: PLC0415 (tree_factor imports this module)
 
-        return velocity
+        return WALK_STAGED + (WALK_NOW if self.wrenches else 0)
+
+    @property
+    def link_floats(self) -> int:
+        """Staged floats a body: its offset to its parent's frame, then with ``wrenches`` the same at the step's
+        poses."""
+        return 6 if self.wrenches else 3
+
+    def walk_floats(self) -> int:
+        """Floats a lane group stages of the walk: every coordinate's, then every primary body's."""
+        return self.dofs * self.coordinate_floats + self.bodies * self.link_floats if self.staged else 0
+
+    def walk_ints(self) -> int:
+        """Ints a lane group stages: the primary's path table, the free body's entry, each primary coordinate's body."""
+        return 2 * self.bodies + 2 + self.primary if self.staged else 0
+
+    def walk_prelude(self):
+        """The walk's functions over this block's layout (:func:`.tree_factor.walk_paths_prelude`): the staged copy's
+        strides, or the device walk's."""
+        from .tree_factor import walk_paths_prelude  # noqa: PLC0415 (tree_factor imports this module)
+
+        if self.staged:
+            return walk_paths_prelude(
+                1, coordinate=self.coordinate_floats, link=self.link_floats, now=self.coordinate_floats
+            )
+        return walk_paths_prelude(1)
+
+    def prologue(self) -> str:
+        """Bind the world's trees on the walk (``walk``, :class:`.tree_factor.WalkTrees`; articulation ``art``, and
+        ``secondary_art`` with a free body): their data, links and path tables, staged here once (``staged``, the
+        primary tree of at most ``bodies`` bodies) or in place; ``walk_primary()`` and ``walk_free()`` select a tree for
+        the walk's functions; and with ``seeds`` the row seeds' walks a lane runs into ``s_Z`` (``walk_covector`` and,
+        with ``wrenches``, ``walk_wrench``: each returns its incident velocity, the step's ``J`` entries against the
+        staged velocity)."""
+        from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_NOW, WALK_STAGED  # noqa: PLC0415 (tree_factor imports this module)
+
+        P, S, L = self.primary, self.secondary, self.lanes.width
+        lane = self.lanes.lane
+        lines = [
+            "const int walk_j0 = walk.joint_start.data[art], walk_d0 = walk.dof_start.data[art];",
+            "const int walk_bodies = walk.joint_end.data[art] - walk_j0;",
+        ]
+        if S:
+            lines.append(
+                "const int free_j0 = walk.joint_start.data[secondary_art], free_d0 = walk.dof_start.data[secondary_art];"
+            )
+        if not self.staged:
+            lines += [
+                f"const float* walk_data = walk.data.data + (size_t)walk_d0 * {WALK_COORDINATE};",
+                f"const float* walk_link = walk.link.data + (size_t)walk_j0 * {WALK_LINK};",
+                "const int* walk_path = reinterpret_cast<const int*>(walk.path.data + walk_j0);",
+            ]
+            if self.seeds:
+                lines.append("const int* walk_dof_body = walk.dof_body.data + walk_d0;")
+            if self.wrenches and self.seeds:
+                lines += [
+                    f"const float* walk_now = walk.now.data + (size_t)walk_d0 * {WALK_NOW};",
+                    f"const float* walk_now_link = walk.now_link.data + (size_t)walk_j0 * {WALK_LINK};",
+                ]
+            if S:
+                lines += [
+                    f"const float* free_data = walk.data.data + (size_t)free_d0 * {WALK_COORDINATE};",
+                    f"const float* free_link = walk.link.data + (size_t)free_j0 * {WALK_LINK};",
+                    "const int* free_path = reinterpret_cast<const int*>(walk.path.data + free_j0);",
+                ]
+                if self.wrenches and self.seeds:
+                    lines.append(f"const float* free_now = walk.now.data + (size_t)free_d0 * {WALK_NOW};")
+        else:
+            C, K, B = self.coordinate_floats, self.link_floats, self.bodies
+            coordinate = "walk_d0 + c" if not S else f"c < {P} ? walk_d0 + c : free_d0 + c - {P}"
+            column = (
+                f"k < {WALK_STAGED} ? walk.data.data[(size_t)d * {WALK_COORDINATE} + k] "
+                f": walk.now.data[(size_t)d * {WALK_NOW} + k - {WALK_STAGED}]"
+                if self.wrenches
+                else f"walk.data.data[(size_t)d * {WALK_COORDINATE} + k]"
+            )
+            offset = (
+                f"k < 3 ? walk.link.data[(size_t)(walk_j0 + b) * {WALK_LINK} + k] "
+                f": walk.now_link.data[(size_t)(walk_j0 + b) * {WALK_LINK} + k - 3]"
+                if self.wrenches
+                else f"walk.link.data[(size_t)(walk_j0 + b) * {WALK_LINK} + k]"
+            )
+            lines += [
+                "// The walk's data of the world's trees staged once (FL3_design section 4), every load in flight together:",
+                "// each coordinate's s, ut and 1 / ell (and its step column), each body's link offset (and at the step's",
+                "// poses), the path tables and each primary coordinate's body.",
+                f"for (int i = {lane}; i < {self.dofs * C}; i += {L}) {{",
+                f"    const int c = i / {C}, k = i - c * {C};",
+                f"    const int d = {coordinate};",
+                f"    s_walk[i] = {column};",
+                "}",
+                f"for (int i = {lane}; i < walk_bodies * {K}; i += {L}) {{",
+                f"    const int b = i / {K}, k = i - b * {K};",
+                f"    s_walk[{self.dofs * C} + i] = {offset};",
+                "}",
+                f"for (int i = {lane}; i < 2 * walk_bodies; i += {L})",
+                "    s_walk_path[i] = reinterpret_cast<const int*>(walk.path.data + walk_j0)[i];",
+                f"for (int i = {lane}; i < {P}; i += {L}) s_walk_path[{2 * B + 2} + i] = walk.dof_body.data[walk_d0 + i];",
+                f"if ({lane} == 0) {{",
+                f"    s_walk_path[{2 * B}] = -1;",
+                f"    s_walk_path[{2 * B + 1}] = 0;",
+                "}",
+                "const float* walk_data = s_walk;",
+                f"const float* walk_link = s_walk + {self.dofs * C};",
+                "const int* walk_path = s_walk_path;",
+                f"const int* walk_dof_body = s_walk_path + {2 * B + 2};",
+            ]
+            if self.wrenches:
+                lines += [
+                    f"const float* walk_now = s_walk + {WALK_STAGED};",
+                    "const float* walk_now_link = walk_link + 3;",
+                ]
+            if S:
+                lines += [
+                    f"const float* free_data = s_walk + {P * C};",
+                    "const float* free_link = walk_link;",
+                    f"const int* free_path = s_walk_path + {2 * B};",
+                ]
+                if self.wrenches:
+                    lines.append(f"const float* free_now = free_data + {WALK_STAGED};")
+        lines.append(f"const auto walk_primary = [&]() {{ WALK_TREE(walk_path, walk_bodies, {P}); }};")
+        if S:
+            lines.append(f"const auto walk_free = [&]() {{ WALK_TREE(free_path, 1, {S}); }};")
+        if self.seeds:
+            lines += [
+                "// A covector seed weight e_dof of the primary tree walked into the row's footprints z; its incident.",
+                "const auto walk_covector = [&](float* z, const int dof, const float weight) -> float {",
+                "    float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}, w[6], incident = 0.0f;",
+                "    const float x[1] = {weight};",
+                "    const auto sink = [&](int, int c, float y, float j) {",
+                "        z[c] += y;",
+                "        incident += j * s_v[c];",
+                "    };",
+                "    WALK_SEED(walk_data, dof, x, p, sink);",
+                "    WALK_UP(walk_data, walk_link, nullptr, walk_link, walk_dof_body[dof], dof - 1, p, w, sink);",
+                "    return incident;",
+                "};",
+            ]
+            if self.wrenches:
+                lines += [
+                    "// A wrench seed at body b's walk frame at the step's poses, walked into the footprints z of a tree",
+                    "// (data, link, now, now_link: its walk; v its staged velocity); its incident.",
+                    "const auto walk_wrench = [&](float* z, const float* v, const float* data, const float* link,",
+                    "                             const float* now, const float* now_link, const int b,",
+                    "                             const float* wrench) -> float {",
+                    "    float p[6], w[6], incident = 0.0f;",
+                    "    for (int k = 0; k < 6; ++k) p[k] = w[k] = wrench[k];",
+                    "    WALK_UP(data, link, now, now_link, b, WALK_FIRST_OF(b + 1) - 1, p, w, [&](int, int c, float y, float j) {",
+                    "        z[c] += y;",
+                    "        incident += j * v[c];",
+                    "    });",
+                    "    return incident;",
+                    "};",
+                ]
+        return "\n".join(lines)
+
+    def twists(self) -> tuple[str, str]:
+        """The leave's twist scratch of the primary tree and of the free body: the spent ``s_Z`` (``dense_capacity``
+        rows) where it holds both trees' bodies, else the walk's scratch."""
+        if self.bodies and self.dense_capacity * self.dofs >= 6 * (self.bodies + 1):
+            return "s_Z", f"s_Z + {6 * self.bodies}"
+        return (
+            "reinterpret_cast<float*>(walk.scratch.data + walk_j0)",
+            "reinterpret_cast<float*>(walk.scratch.data + free_j0)",
+        )
 
     def leave(self, indent: str) -> str:
-        """The committed velocity change leaves factor coordinates, ``dv = P^T L^-T u`` in place, block ``b``'s back
-        substitution on lane ``b``."""
-        lane, lines = self.lanes.lane, []
-        for block, (solve, offset) in enumerate(self._blocks()):
-            velocity = self._velocity(offset)
-            lines += [f"if ({lane} == {block}) {{", solve.leave(velocity, velocity), "}"]
-        return "\n".join(indent + line if line.strip() else line for line in "\n".join(lines).split("\n"))
-
-    def respond(self, reads: tuple[str, ...], indent: str) -> str:
-        """Stage row ``row``'s whitened entries ``Z`` in ``s_Z``, in the caller's loop over ``row``.
-
-        ``reads[b]`` is coordinate ``i`` of the row's ``J`` on factor block
-        ``b`` (native, in ``row`` and ``i``), whitened in registers by the
-        block's forward solve and stored once. Declares ``active`` (some entry
-        of ``J`` is nonzero), ``incident`` (``J v`` over the staged velocity,
-        summed block by block in coordinate order) and ``row_diagonal``
-        (``|Z|^2``, likewise). The solves' loop variable shadows ``row``, so
-        the row's staged offset is bound first.
-        """
+        """The committed velocity change leaves the walk's coordinates in place, ``dv = P^T L^-T R^T u``: on lane 0 the
+        primary tree's release transposed (``WALK_RELEASE_T``) and its walk down (``WALK_DOWN``), on lane 1 the paired
+        free body's walk down."""
+        lane = self.lanes.lane
+        primary, free = self.twists()
         lines = [
-            f"const int staged = row * {self.dofs};",
-            "int active = 0;",
-            "float row_diagonal = 0.0f, incident = 0.0f;",
+            f"if ({lane} == 0) {{",
+            *(["    WALK_RELEASE_T(walk.release, art, s_v);"] if self.release else []),
+            "    walk_primary();",
+            f"    WALK_DOWN(walk_data, walk_link, s_v, s_v, {primary});",
+            "}",
         ]
-        blocks = list(self._blocks())
-        if len(blocks) != len(reads):
-            raise ValueError("one Jacobian read per factor block")
-        for block, ((solve, offset), read) in enumerate(zip(blocks, reads, strict=True)):
-            first = f"staged + {offset}" if offset else "staged"
-
-            def whitened(i, block=block):
-                return f"whitened_{block}[{i}]"
-
+        if self.secondary:
             lines += [
-                f"float whitened_{block}[{solve.size}];",
-                f"for (int i = 0; i < {solve.size}; ++i) {{",
-                f"    const float jacobian = {read};",
-                f"    {whitened('i')} = jacobian;",
-                "    if (jacobian != 0.0f) active = 1;",
-                f"    incident += jacobian * {self._velocity(offset)('i')};",
-                "}",
-                solve.whiten(whitened, whitened),
-                f"for (int i = 0; i < {solve.size}; ++i) {{",
-                f"    s_Z[{first} + i] = {whitened('i')};",
-                f"    row_diagonal += {whitened('i')} * {whitened('i')};",
+                f"if ({lane} == 1) {{",
+                "    walk_free();",
+                f"    WALK_DOWN(free_data, free_link, s_v + {self.primary}, s_v + {self.primary}, {free});",
                 "}",
             ]
+        return "\n".join(indent + line if line.strip() else line for line in "\n".join(lines).split("\n"))
+
+    def respond(self, source, indent: str) -> str:
+        """Stage row ``row``'s footprints ``z`` in ``s_Z``, in the caller's loop over ``row``: the row source's
+        (``source.stage``: the walk of its seeds, or the one writer's stored rows) and declare ``active`` (some entry is
+        nonzero), ``incident`` (its ``J v_hat``) and ``row_diagonal`` (``|z|^2``, in coordinate order)."""
+        lines = [
+            f"const int staged = row * {self.dofs};",
+            source.stage(self),
+            "int active = 0;",
+            "float row_diagonal = 0.0f;",
+            f"for (int c = 0; c < {self.dofs}; ++c) {{",
+            "    const float z = s_Z[staged + c];",
+            "    row_diagonal += z * z;",
+            "    if (z != 0.0f) active = 1;",
+            "}",
+        ]
         return "\n".join(indent + line if line.strip() else line for line in "\n".join(lines).split("\n"))
 
     def _free_row(self, free: str, name: str, indent: str, *, word: bool = False) -> str:

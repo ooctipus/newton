@@ -1454,6 +1454,10 @@ class TreeWalk:
 # The walk on the device (FL3.1): a lane per seed up, a lane per tree down, the path table in constant memory
 # ---------------------------------------------------------------------------------------------------------------------
 
+WALK_STAGED = 13
+"""The floats of a coordinate's record the walk's functions read (``s``, ``ut``, ``1 / ell``): what a kernel stages of
+:data:`WALK_COORDINATE` in shared memory (:class:`.response_operator.LocalBlock`)."""
+
 WALK_COORDINATE = 16
 """Floats per coordinate of the device walk's data: ``s`` and ``ut`` (``(v, w)``, six each), ``1 / ell``, the pivot
 without any drive's ``K`` (``P0 = s^T I s + R``, the split pivot's, SAT_PHYS §1.2), and the diagonal the refresh adds,
@@ -1623,6 +1627,59 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
             }
             for (int k = 0; k < 6; ++k) twist[6 * b + k] = V[k];
         }
+    };
+    // The slips' release of tree art (WalkRelease, walk_release_tree; W9's verdict: R = L_F^-1 L_K, tree-lower, so
+    // every row keeps its support), slip j's steps along its root path leaf first at release.*[art, j, :]:
+    // WALK_RELEASE(release, art, z): a row's footprints z <- R z, the first slip first, each leaf first.
+    // WALK_RELEASE_T(release, art, u): the leave's u <- R^T u, the last slip first, each root first.
+    // WALK_RELEASE_IT(release, art, u): the audit's coordinates u <- R^-T u, the first slip first, each root first.
+    const auto WALK_RELEASE = [&](const auto& release, const int art, float* z) {
+        const int cap = release.b.shape[1], steps = release.b.shape[2];
+        for (int j = 0; j < release.count.data[art]; ++j) {
+            const size_t at = ((size_t)art * cap + j) * steps;
+            const int* coordinate = release.coordinate.data + at;
+            const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
+            float s = 0.0f;
+            for (int k = 0; k < steps; ++k) {
+                const int c = coordinate[k];
+                if (c < 0) break;
+                const float x = z[c] - b[k] * s;
+                s += a[k] * x;
+                z[c] = g[k] * x;
+            }
+        }
+    };
+    const auto WALK_RELEASE_T = [&](const auto& release, const int art, float* u) {
+        const int cap = release.b.shape[1], steps = release.b.shape[2];
+        for (int j = release.count.data[art] - 1; j >= 0; --j) {
+            const size_t at = ((size_t)art * cap + j) * steps;
+            const int* coordinate = release.coordinate.data + at;
+            const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
+            float t = 0.0f;
+            for (int k = steps - 1; k >= 0; --k) {
+                const int c = coordinate[k];
+                if (c < 0) continue;
+                const float x = g[k] * u[c] + a[k] * t;
+                u[c] = x;
+                t -= b[k] * x;
+            }
+        }
+    };
+    const auto WALK_RELEASE_IT = [&](const auto& release, const int art, float* u) {
+        const int cap = release.b.shape[1], steps = release.b.shape[2];
+        for (int j = 0; j < release.count.data[art]; ++j) {
+            const size_t at = ((size_t)art * cap + j) * steps;
+            const int* coordinate = release.coordinate.data + at;
+            const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
+            float t = 0.0f;
+            for (int k = steps - 1; k >= 0; --k) {
+                const int c = coordinate[k];
+                if (c < 0) continue;
+                const float x = u[c];
+                u[c] = (x - a[k] * t) / g[k];
+                t -= b[k] * x;
+            }
+        }
     };"""
 
 
@@ -1664,7 +1721,9 @@ def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int) -> 
 
 
 @functools.cache
-def walk_paths_prelude(rows: int) -> DevicePrelude:
+def walk_paths_prelude(
+    rows: int, *, coordinate: int = WALK_COORDINATE, link: int = WALK_LINK, now: int = WALK_NOW
+) -> DevicePrelude:
     """The device walk of any tree, for both devices: :func:`walk_prelude`'s functions over a path table in global
     memory, one tree at a time (``WALK_TREE(path, bodies, coordinates)`` before its walks), the table
     :attr:`TreeFactor.walk_path` holds for every articulation. The general placement's worlds hold any forest, so its
@@ -1672,11 +1731,19 @@ def walk_paths_prelude(rows: int) -> DevicePrelude:
 
     Args:
         rows: The rows a lane walks together (:func:`walk_prelude`).
+        coordinate: Floats a coordinate's record, ``link`` a body's and ``now`` a step column's: the device walk's
+            layout (:data:`WALK_COORDINATE`, :data:`WALK_LINK`, :data:`WALK_NOW`), or a kernel's staged copy of it
+            (:class:`.response_operator.LocalBlock`: a coordinate's step column interleaved after its
+            :data:`WALK_STAGED` floats, so ``now == coordinate``).
     """
     if rows < 1:
         raise ValueError(f"a lane walks at least one row, got {rows}")
-    walk = _WALK_PATHS + "\n" + substitute(_WALK, rows=rows, coordinate=WALK_COORDINATE, link=WALK_LINK, now=WALK_NOW)
-    return DevicePrelude(f"walk_paths_{rows}", walk, cpu=walk)
+    walk = _WALK_PATHS + "\n" + substitute(_WALK, rows=rows, coordinate=coordinate, link=link, now=now)
+    layout = (coordinate, link, now)
+    name = f"walk_paths_{rows}" + (
+        "" if layout == (WALK_COORDINATE, WALK_LINK, WALK_NOW) else f"_{coordinate}_{link}_{now}"
+    )
+    return DevicePrelude(name, walk, cpu=walk)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1745,23 +1812,8 @@ _ENTER = """    if (tid >= arts.shape[0]) return;
     float* u = coordinates.data + (size_t)world * coordinates.shape[1] + offset;
     WALK_ENTER(walk.data.data + (size_t)d0 * $coordinate, walk.link.data + (size_t)j0 * $link, velocity.data + d0, u,
                reinterpret_cast<float*>(walk.scratch.data + j0));
-    // The rows' release: u <- R^-T u, the first slip first, each along its path root first (walk_release_tree).
-    const auto& release = walk.release;
-    const int slips = release.count.data[art];
-    const int cap = release.b.shape[1], steps = release.b.shape[2];
-    for (int j = 0; j < slips; ++j) {
-        const size_t at = ((size_t)art * cap + j) * steps;
-        const int* coordinate = release.coordinate.data + at;
-        const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
-        float t = 0.0f;
-        for (int k = steps - 1; k >= 0; --k) {
-            const int c = coordinate[k];
-            if (c < 0) continue;
-            const float x = u[c];
-            u[c] = (x - a[k] * t) / g[k];
-            t -= b[k] * x;
-        }
-    }
+    // The rows' release: u <- R^-T u (walk_release_tree).
+    WALK_RELEASE_IT(walk.release, art, u);
 """
 
 
@@ -2405,6 +2457,4 @@ def walk_step_kernel(
             for k in range(3):
                 walk_link[j, k] = offset[k]
     if refresh:
-        walk_inward(
-            j0, j1, joint_qd_start[j0], joint_qd_start[j1], walk_path, walk_link, walk_data, walk_inertia
-        )
+        walk_inward(j0, j1, joint_qd_start[j0], joint_qd_start[j1], walk_path, walk_link, walk_data, walk_inertia)

@@ -21,8 +21,9 @@ the CPU and, where there is one, on a CUDA device, against the float64 walk (:cl
   route and on the CUDA catalogue's routes;
 - **F1 on CUDA**: Z0's F1 on the CUDA placements: the general rows' footprints and leave, and the worlds whose sweep
   whitens their rows in the kernel (the local owners, the Jacobi tiers, the paired factor), whose store keeps ``J``,
-  through the walk's response of their impulses. Native sparse factors, the sparse diagonal, the compact boundary,
-  the keyed rows and the row packets store neither ``J`` nor a packed ``Z``: :data:`UNSTORED` names their routes.
+  through the walk's response of their impulses; the row packets' worlds (FL3.6) through the walk's response of their
+  impulses to the packets' seeds. Native sparse factors, the sparse diagonal, the compact boundary and the keyed rows
+  store neither ``J`` nor a packed ``Z``: :data:`UNSTORED` names their routes.
 
 ``python -m newton.tests.test_feather_pgs_walk_device report`` prints the measured tables.
 """
@@ -457,15 +458,18 @@ def placement_frames(solver, joint_q: np.ndarray, capture) -> dict:
     forest, placement = solver.forest, solver.placement
     out = {"rows": 0.0, "frame": 0.0, "tight": 0.0, "leave": 0.0, "kernel": 0.0, "general": 0, "in_kernel": 0}
     out["unstored"] = 0
-    if getattr(placement, "walks", False):
+    walks = getattr(placement, "walks", False)
+    if walks:
         # The general placement's one writer (FL3.3): its rows are walked from seeds, no J is stored. Its rows against
-        # their physical J v_hat and its leave against the float64 walk's (test_feather_pgs_walk_rows).
+        # their physical J v_hat and its leave against the float64 walk's (test_feather_pgs_walk_rows); the local
+        # owners' packets' worlds below, in the kernel.
         from newton.tests.test_feather_pgs_walk_rows import walked_frames  # noqa: PLC0415
 
         walked = walked_frames(solver, joint_q, capture)
         out.update(rows=walked["rows"], leave=walked["leave"], general=walked["worlds"])
-        return out
-    if capture.J is None or solver.routes.case in ("K1", "K2"):
+        if placement.row_packets is None:
+            return out
+    elif capture.J is None or solver.routes.case in ("K1", "K2"):
         out["unstored"] = int(forest.world_count)
         return out
     sizes = forest.articulation_response_dof_count.numpy()
@@ -479,13 +483,13 @@ def placement_frames(solver, joint_q: np.ndarray, capture) -> dict:
     dense = bool(placement.packed_dense)
     joint_q = np.asarray(joint_q, dtype=np.float64)
     worlds, D = int(forest.world_count), max(int(forest.max_world_dofs), 1)
-    walks = {}
+    trees = {}
 
     def walk_of(art):
-        if art not in walks:
+        if art not in trees:
             walk = solver.factor.walk(joint_q, art)
-            walks[art] = (walk, float(np.linalg.cond(factor_matrix(walk))))
-        return walks[art]
+            trees[art] = (walk, float(np.linalg.cond(factor_matrix(walk))))
+        return trees[art]
 
     def sides(line, row):
         """The row's sides: ``(art, entries in the store, world coordinates)``."""
@@ -525,14 +529,57 @@ def placement_frames(solver, joint_q: np.ndarray, capture) -> dict:
                     if dof[line, row] >= 0:
                         du[world, dof[line, row] : dof[line, row] + 6] += Z[line, row] * lam[line, row]
 
+    packets = placement.row_packets
+    if packets is not None:
+        primaries = solver.sweep.local_primary_articulation.numpy()
+        slips = solver.factor.walk_view().release.count.numpy()
+        seeds, codes = packets.packet.seed.numpy().astype(np.float64), packets.packet.seed_body.numpy()
+        contacts = packets.packet.row_contact.numpy()
+        prefix_dofs, prefix_weights = packets._packets.dofs.numpy(), packets._packets.weights.numpy()
     for world, live in enumerate(capture.counts):
         count = int(live)
         if count == 0 or ball[world]:
             continue
         tier = skip_rows > 0 and count <= skip_rows and mf_counts[world] == 0
         local = owner[world] != PGS_LOCAL_SOLVE_OWNER_GENERAL
-        if (tier and placement.keyed_rows is not None) or (local and placement.row_packets is not None):
-            out["unstored"] += 1  # The keyed rows and the row packets keep their worlds' rows out of the store.
+        if walks and not (local and packets is not None):
+            continue  # The one writer's worlds: walked_frames above.
+        if tier and placement.keyed_rows is not None:
+            out["unstored"] += 1  # The keyed rows keep their worlds' rows out of the store.
+            continue
+        if local and packets is not None:
+            # The row packets (FL3.6): the kernel walks each row's seeds and leaves by the walk. Their published dv
+            # against the float64 walk's response of the impulses to the same seeds: a covector at a coordinate, a
+            # wrench at a body's frame. A tree that slips this step carries its release (TestLocalSlipFrame).
+            art = int(primaries[world])
+            line = int(capture.dense_first[world])
+            if art < 0 or slips[art]:
+                continue
+            walk, kappa = walk_of(art)
+            n = int(sizes[art])
+            response = np.zeros(n)
+            for row in range(count):
+                lam = float(capture.impulses[line, row])
+                if lam == 0.0:
+                    continue
+                if contacts[world, row] < 0:
+                    for dof, weight in zip(prefix_dofs[world, row], prefix_weights[world, row], strict=True):
+                        if dof >= 0 and weight != 0.0:
+                            x = np.zeros(n)
+                            x[dof] = weight
+                            response += walk.up(covector=x)[0] * lam
+                    continue
+                for side in range(2):
+                    if codes[world, row, side] >= 0:
+                        response += (
+                            walk.up(int(codes[world, row, side]), seeds[world, row, 6 * side : 6 * side + 6])[0] * lam
+                        )
+            at = slice(int(offsets[art]), int(offsets[art]) + n)
+            if np.any(dv[world, at]):
+                published = 2.0 * ROUNDING * (np.linalg.norm(v_out[world, at]) + np.linalg.norm(v_hat[world, at]))
+                scale = n * ROUNDING * kappa + published / np.linalg.norm(dv[world, at])
+                out["kernel"] = max(out["kernel"], relative(dv[world, at], walk.down(response)[0]) / scale)
+            out["in_kernel"] += 1
             continue
         line = int(capture.dense_first[world])
         if (tier or local) and solver.factor.eliminates:

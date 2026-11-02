@@ -381,8 +381,10 @@ class Sweep:
             mf_rows: int = 0,
             *,
             warps_per_block: int = 1,
+            bodies: int = 0,
         ) -> bool:
-            """Whether a local owner's block staging (its kernel's own declaration) fits the device's budget."""
+            """Whether a local owner's block staging (its kernel's own declaration, the walk of a tree of ``bodies``
+            staged as where it walks seeds) fits the device's budget."""
             staging = sweep_routes_local.local_staging(
                 self.local_solve_max_rows if max_rows is None else max_rows,
                 primary_dofs,
@@ -390,22 +392,27 @@ class Sweep:
                 warps_per_block=warps_per_block,
                 contact_capable=secondary_dofs > 0,
                 local_mf_max_constraints=mf_rows,
+                walk_bodies=bodies,
             )
             return staging.fits(local_budget)
 
         if local_base_supported:
             articulation_dof_start = self.forest.articulation_dof_start_host
+            articulation_start = model.articulation_start.numpy()
             for world, response_arts in enumerate(response_by_world):
                 nonfree_arts = [art for art in response_arts if self.forest.is_free_rigid_host[art] == 0]
                 if len(nonfree_arts) != 1:
                     continue
                 primary_art = nonfree_arts[0]
                 primary_dofs = int(self.forest.response_dof_count[primary_art])
+                bodies = int(self.forest.articulation_joint_end_host[primary_art] - articulation_start[primary_art])
                 if (
                     primary_dofs <= 0
                     or primary_dofs > _LOCAL_INTERNAL_MAX_DOF
                     or self.execution_plan.use_tiled_hinv_jt(primary_dofs)
-                    or not local_fits(primary_dofs, max_rows=min(self.local_solve_max_rows, primary_dofs))
+                    or not local_fits(
+                        primary_dofs, max_rows=min(self.local_solve_max_rows, primary_dofs), bodies=bodies
+                    )
                 ):
                     continue
                 local_primary_articulation[world] = primary_art
@@ -419,7 +426,7 @@ class Sweep:
                 if (
                     secondary_dofs != 6
                     or self.execution_plan.use_tiled_hinv_jt(secondary_dofs)
-                    or not local_fits(primary_dofs, secondary_dofs)
+                    or not local_fits(primary_dofs, secondary_dofs, bodies=bodies)
                 ):
                     continue
                 local_pair_articulation[world] = secondary_art
@@ -432,7 +439,11 @@ class Sweep:
                     articulation_dof_start[secondary_art]
                 )
                 if primary_first_layout and local_fits(
-                    primary_dofs, secondary_dofs, self.local_residual_max_rows, self.local_residual_mf_max_rows
+                    primary_dofs,
+                    secondary_dofs,
+                    self.local_residual_max_rows,
+                    self.local_residual_mf_max_rows,
+                    bodies=bodies,
                 ):
                     local_residual_pair_articulation[world] = secondary_art
                     local_residual_candidates[primary_dofs].append(primary_art)
@@ -1141,6 +1152,9 @@ class Sweep:
             local_factory = self.placement.row_packets.local_factory()
         # The contact owners solve contact torsion's spin rows with their pairs.
         local_torsion = {"torsion": True} if self.laws.contact_torsion_enabled else {}
+        # The local owners' walked rows take their trees' release, and their leave its transpose, where a drive can
+        # slip.
+        walk_release = self.factor.walk_arts is not None and self.factor.walk_slip_capacity > 0
         if self.placement.local_internal_fast_path:
             for size, count in self.local_internal.counts.items():
                 if count > 0:
@@ -1164,6 +1178,7 @@ class Sweep:
                         warps_per_block=warps_per_block,
                         lanes_per_world=lanes_per_world,
                         contact_capable=False,
+                        walk_release=walk_release,
                     )
             for size, solver_blocks in self.local_pair.launch_items.items():
                 warps_per_block = 2 if solver_blocks % 2 == 0 else 1
@@ -1178,6 +1193,7 @@ class Sweep:
                     paired_dof_count=6,
                     persistent_queue=True,
                     warps_per_block=warps_per_block,
+                    walk_release=walk_release,
                     **local_torsion,
                 )
             for size, warps_per_block in self.local_residual.warps_per_block.items():
@@ -1191,6 +1207,7 @@ class Sweep:
                     paired_dof_count=6,
                     persistent_queue=True,
                     warps_per_block=warps_per_block,
+                    walk_release=walk_release,
                     mf_max_constraints=self.placement.mf_max_constraints,
                     local_mf_max_constraints=self.local_residual_mf_max_rows,
                     **local_torsion,
@@ -1594,11 +1611,9 @@ class Sweep:
                 active_candidate_count=tier.active_counts.get(size),
                 candidate_grid_stride=count,
                 expected_owner=tier.owner,
-                articulation_group_index=self.forest.art_group_idx,
                 articulation_world=self.forest.art_to_world,
                 articulation_dof_start=self.forest.articulation_dof_start,
-                L_group=self.factor.L_by_size[size],
-                secondary_L_group=self.factor.L_by_size[tier.secondary_size or size],
+                walk=self.factor.walk_view(),
                 **rows,
             )
 

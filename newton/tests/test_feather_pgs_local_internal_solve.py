@@ -22,7 +22,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton._src.solvers.feather_pgs.solver_fields import LocalOwners
 from newton._src.solvers.feather_pgs.sweep_routes_local import local_owned_kernel
-from newton.tests.feather_pgs_law_harness import local_packed_rows, row_lines
+from newton.tests.feather_pgs_law_harness import chain_walk, local_packed_rows, row_lines, walked_rows
 
 
 class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
@@ -152,11 +152,17 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         row_type[0, :2] = [PGS_CONSTRAINT_TYPE_MIMIC, PGS_CONSTRAINT_TYPE_JOINT_LIMIT]
         row_type[1, 0] = PGS_CONSTRAINT_TYPE_MIMIC
 
+        # The one writer's rows on the walk of each world's factor (z = A^-T J^T), their incident velocities and
+        # diagonals |z|^2 + cfm; the second world's factor is the identity and its rows are no local owner's.
+        walk = chain_walk(device, [lower, np.eye(dof_count)])
+        stored = [walked_rows(lower, jacobian[0]), jacobian[1]]
+        incident = np.stack([jacobian[0] @ velocity[:dof_count], jacobian[1] @ velocity[dof_count:]])
+        stored_diagonal = cfm.copy()
+        stored_diagonal[0] += np.sum(stored[0] * stored[0], axis=1)
         impulses = wp.zeros((2, max_constraints), dtype=wp.float32, device=device)
-        diagonal_out = wp.array(cfm, dtype=wp.float32, device=device)
+        diagonal_out = wp.array(stored_diagonal, dtype=wp.float32, device=device)
         velocity_out = wp.array(velocity, dtype=wp.float32, device=device)
         candidate_articulations = wp.array([0, 1], dtype=wp.int32, device=device)
-        lower_group = wp.array(np.stack([lower, np.eye(dof_count, dtype=np.float32)]), dtype=wp.float32, device=device)
         kernel = local_owned_kernel(max_constraints, local_max_constraints, dof_count, device.arch)
         wp.launch_tiled(
             kernel,
@@ -166,14 +172,11 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 candidate_articulations,
                 1,
                 wp.array([0, 1], dtype=wp.int32, device=device),
-                wp.array([0, 1], dtype=wp.int32, device=device),
                 wp.array([0, 3], dtype=wp.int32, device=device),
                 wp.array([1, 0], dtype=wp.int32, device=device),
                 wp.array([2, 1], dtype=wp.int32, device=device),
                 row_lines(device),
-                lower_group,
-                lower_group,
-                *local_packed_rows(device, [0, 1], jacobian),
+                *local_packed_rows(device, [0, 1], stored, incident),
                 wp.array(rhs, dtype=wp.float32, device=device),
                 wp.array(row_type, dtype=wp.int32, device=device),
                 wp.full((2, max_constraints), -1, dtype=wp.int32, device=device),
@@ -181,8 +184,11 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 *self._empty_mf_inputs(2, device),
                 iterations,
                 omega,
+                diagonal_out,
+                impulses,
+                velocity_out,
+                walk,
             ],
-            outputs=[diagonal_out, impulses, velocity_out],
             block_dim=32,
             device=device,
         )
@@ -205,7 +211,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         np.testing.assert_allclose(velocity_out.numpy()[:dof_count], expected_velocity, rtol=0.0, atol=2.0e-6)
         np.testing.assert_allclose(impulses.numpy()[0, :2], expected_impulses, rtol=0.0, atol=2.0e-6)
         np.testing.assert_allclose(diagonal_out.numpy()[0, :2], diagonal, rtol=0.0, atol=2.0e-6)
-        np.testing.assert_array_equal(diagonal_out.numpy()[1], cfm[1])
+        np.testing.assert_array_equal(diagonal_out.numpy()[1], stored_diagonal[1])
         np.testing.assert_array_equal(velocity_out.numpy()[dof_count:], velocity[dof_count:])
         np.testing.assert_array_equal(impulses.numpy()[1], np.zeros(max_constraints, dtype=np.float32))
 
@@ -217,7 +223,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
             persistent_queue: bool = False,
             active_count: int = 2,
         ):
-            variant_diagonal = wp.array(cfm, dtype=wp.float32, device=device)
+            variant_diagonal = wp.array(stored_diagonal, dtype=wp.float32, device=device)
             variant_impulses = wp.zeros((2, max_constraints), dtype=wp.float32, device=device)
             variant_velocity = wp.array(velocity, dtype=wp.float32, device=device)
             variant_kernel = local_owned_kernel(
@@ -237,14 +243,11 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 [
                     PGS_LOCAL_SOLVE_OWNER_SINGLE,
                     wp.array([0, 1], dtype=wp.int32, device=device),
-                    wp.array([0, 1], dtype=wp.int32, device=device),
                     wp.array([0, 3], dtype=wp.int32, device=device),
                     wp.array([PGS_LOCAL_SOLVE_OWNER_SINGLE] * 2, dtype=wp.int32, device=device),
                     wp.array([2, 1], dtype=wp.int32, device=device),
                     row_lines(device),
-                    lower_group,
-                    lower_group,
-                    *local_packed_rows(device, [0, 1], jacobian),
+                    *local_packed_rows(device, [0, 1], stored, incident),
                     wp.array(rhs, dtype=wp.float32, device=device),
                     wp.array(row_type, dtype=wp.int32, device=device),
                     wp.full((2, max_constraints), -1, dtype=wp.int32, device=device),
@@ -252,6 +255,10 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                     *self._empty_mf_inputs(2, device),
                     iterations,
                     omega,
+                    variant_diagonal,
+                    variant_impulses,
+                    variant_velocity,
+                    walk,
                 ]
             )
             worlds_per_block = warps_per_block * 32 // lanes_per_world
@@ -262,7 +269,6 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 variant_kernel,
                 dim=[block_count],
                 inputs=inputs,
-                outputs=[variant_diagonal, variant_impulses, variant_velocity],
                 block_dim=32 * warps_per_block,
                 device=device,
             )
@@ -298,13 +304,13 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         dof_count = 2
         max_constraints = 4
         candidate = wp.array([0], dtype=wp.int32, device=device)
-        lower = wp.array(np.eye(dof_count, dtype=np.float32)[None], dtype=wp.float32, device=device)
         jacobian = wp.array(
             [[[0.0, 0.0], [1.0, 0.0], [0.5, 1.0], [0.0, 0.0]]],
             dtype=wp.float32,
             device=device,
         )
-        diagonal = wp.array([[1.0, 0.0, 0.0, 1.0]], dtype=wp.float32, device=device)
+        # The one writer's diagonals |z|^2 + cfm on the identity factor (z = J).
+        diagonal = wp.array([[1.0, 1.0, 1.25, 1.0]], dtype=wp.float32, device=device)
         impulses = wp.array([[0.0, 0.0, 0.0, 4.0]], dtype=wp.float32, device=device)
         velocity = wp.zeros(dof_count, dtype=wp.float32, device=device)
         kernel = local_owned_kernel(
@@ -322,12 +328,9 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 PGS_LOCAL_SOLVE_OWNER_SINGLE,
                 wp.array([0], dtype=wp.int32, device=device),
                 wp.array([0], dtype=wp.int32, device=device),
-                wp.array([0], dtype=wp.int32, device=device),
                 wp.array([PGS_LOCAL_SOLVE_OWNER_SINGLE], dtype=wp.int32, device=device),
                 wp.array([max_constraints], dtype=wp.int32, device=device),
                 row_lines(device),
-                lower,
-                lower,
                 *local_packed_rows(device, [0], jacobian.numpy()),
                 wp.array([[0.0, -1.0, -2.0, 0.0]], dtype=wp.float32, device=device),
                 wp.array(
@@ -348,8 +351,11 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 *self._empty_mf_inputs(1, device),
                 1,
                 1.0,
+                diagonal,
+                impulses,
+                velocity,
+                chain_walk(device, [np.eye(dof_count)]),
             ],
-            outputs=[diagonal, impulses, velocity],
             block_dim=32,
             device=device,
         )
@@ -426,7 +432,11 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
 
         dense_impulses = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
         mf_impulses = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
-        diagonal = wp.array(dense_cfm, dtype=wp.float32, device=device)
+        # Both factors are the identity: the one writer's rows are J, their diagonals |J|^2 + cfm.
+        dense_row = np.concatenate([primary_jacobian[0], secondary_jacobian[1]], axis=1)
+        stored_diagonal = dense_cfm + np.sum(dense_row * dense_row, axis=1)[None]
+        incident = (dense_row @ initial_velocity)[None]
+        diagonal = wp.array(stored_diagonal, dtype=wp.float32, device=device)
         velocity = wp.array(initial_velocity, dtype=wp.float32, device=device)
         kernel = local_owned_kernel(
             max_constraints,
@@ -448,15 +458,12 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 wp.array([1], dtype=wp.int32, device=device),
                 2,
                 PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
-                wp.array([0, 1], dtype=wp.int32, device=device),
                 wp.array([0, 0], dtype=wp.int32, device=device),
                 wp.array([0, primary_dofs], dtype=wp.int32, device=device),
                 wp.array([PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL], dtype=wp.int32, device=device),
                 wp.array([1], dtype=wp.int32, device=device),
                 row_lines(device),
-                wp.array(np.stack([np.eye(primary_dofs, dtype=np.float32)] * 2), device=device),
-                wp.array(np.stack([np.eye(secondary_dofs, dtype=np.float32)] * 2), device=device),
-                *local_packed_rows(device, [0, 0], [primary_jacobian[0], secondary_jacobian[1]]),
+                *local_packed_rows(device, [0, 0], [primary_jacobian[0], secondary_jacobian[1]], incident),
                 wp.array(dense_rhs, device=device),
                 wp.array([[PGS_CONSTRAINT_TYPE_MIMIC, 0, 0, 0]], dtype=wp.int32, device=device),
                 wp.full((1, max_constraints), -1, dtype=wp.int32, device=device),
@@ -473,8 +480,11 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 wp.zeros((1, max_constraints), dtype=wp.float32, device=device),
                 iterations,
                 1.0,
+                diagonal,
+                dense_impulses,
+                velocity,
+                chain_walk(device, [np.eye(primary_dofs), np.eye(secondary_dofs)]),
             ],
-            outputs=[diagonal, dense_impulses, velocity],
             block_dim=64,
             device=device,
         )
@@ -522,8 +532,9 @@ def _patch_ring_solves(device, load):
     """Solve one world's patch ring with the group-Jacobian and the row-packet local kernels.
 
     Normal rows 0 and 3 form the ring and hold no Jacobian; row 3 carries ``load`` and the tangent
-    pair of row 0 reads the pooled load. The packets hold the group Jacobian's rows and no prefix
-    row. Returns, per kernel, the diagonal, impulses and velocity after one sweep.
+    pair of row 0 reads the pooled load. The group kernel reads the one writer's rows on the identity
+    factor (``z = J``); the packets hold seeds that write the same rows, a wrench at the chain's second
+    body, and no prefix row. Returns, per kernel, the diagonal, impulses and velocity after one sweep.
     """
     dof_count, max_constraints = 2, 4
     rows = [[0.0, 0.0], [1.0, 0.0], [0.5, 1.0], [0.0, 0.0]]
@@ -531,8 +542,18 @@ def _patch_ring_solves(device, load):
     prefix.dofs = wp.full((1, max_constraints, row_packets.PREFIX_WIDTH), -1, dtype=wp.int32, device=device)
     prefix.weights = wp.zeros((1, max_constraints, row_packets.PREFIX_WIDTH), dtype=wp.float32, device=device)
     packets = row_packets.ContactPacketData()
-    packets.jacobian = wp.array([rows], dtype=wp.float32, device=device)
+    seed = np.zeros((1, max_constraints, 12), dtype=np.float32)
+    body = np.full((1, max_constraints, 2), row_packets.SEED_NONE, dtype=np.int32)
+    for row, values in enumerate(rows):
+        if any(values):
+            seed[0, row, :dof_count] = values
+            body[0, row, 0] = dof_count - 1
+    packets.seed = wp.array(seed, dtype=wp.float32, device=device)
+    packets.seed_body = wp.array(body, dtype=wp.int32, device=device)
     packets.row_contact = wp.array([[0, 1, 2, 3]], dtype=wp.int32, device=device)
+    walk = chain_walk(device, [np.eye(dof_count)])
+    # The group kernel reads the one writer's diagonals |z|^2 + cfm; the packets' walk adds |z|^2 to the cfm seed.
+    seeds = {"group": [1.0, 1.0, 1.25, 1.0], "packets": [1.0, 0.0, 0.0, 1.0]}
     arch = wp.get_device(device).arch
     kernels = {
         "group": (
@@ -540,18 +561,17 @@ def _patch_ring_solves(device, load):
             [],
         ),
         "packets": (
-            row_packets.get_local_factory(dof_count, 0, max_constraints)(
+            row_packets.get_local_factory(dof_count, 0, max_constraints, dof_count)(
                 max_constraints, max_constraints, dof_count, arch
             ),
             [prefix, packets],
         ),
     }
     candidate = wp.array([0], dtype=wp.int32, device=device)
-    lower = wp.array(np.eye(dof_count, dtype=np.float32)[None], dtype=wp.float32, device=device)
     jacobian = wp.array([rows], dtype=wp.float32, device=device)
     results = {}
     for name, (kernel, operands) in kernels.items():
-        diagonal = wp.array([[1.0, 0.0, 0.0, 1.0]], dtype=wp.float32, device=device)
+        diagonal = wp.array([seeds[name]], dtype=wp.float32, device=device)
         impulses = wp.array([[0.0, 0.0, 0.0, load]], dtype=wp.float32, device=device)
         velocity = wp.zeros(dof_count, dtype=wp.float32, device=device)
         wp.launch_tiled(
@@ -563,12 +583,9 @@ def _patch_ring_solves(device, load):
                 PGS_LOCAL_SOLVE_OWNER_SINGLE,
                 wp.array([0], dtype=wp.int32, device=device),
                 wp.array([0], dtype=wp.int32, device=device),
-                wp.array([0], dtype=wp.int32, device=device),
                 wp.array([PGS_LOCAL_SOLVE_OWNER_SINGLE], dtype=wp.int32, device=device),
                 wp.array([max_constraints], dtype=wp.int32, device=device),
                 row_lines(device),
-                lower,
-                lower,
                 *local_packed_rows(device, [0], jacobian.numpy()),
                 wp.array([[0.0, -1.0, -2.0, 0.0]], dtype=wp.float32, device=device),
                 wp.array(
@@ -588,8 +605,12 @@ def _patch_ring_solves(device, load):
                 *TestFeatherPGSLocalInternalSolve._empty_mf_inputs(1, device),
                 1,
                 1.0,
+                diagonal,
+                impulses,
+                velocity,
+                *operands,
+                walk,
             ],
-            outputs=[diagonal, impulses, velocity, *operands],
             block_dim=32,
             device=device,
         )

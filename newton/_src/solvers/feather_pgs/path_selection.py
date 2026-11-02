@@ -358,9 +358,10 @@ def _row_builder(solver, plan, size, source) -> dict:
         # The row pass writes the records and unit sources; the one writer walks every row (walk_rows).
         kernels = (walk_rows.write_contact_units, walk_rows.writer_kernel(solver))
     elif method == "local_packets":
-        from . import row_packets  # noqa: PLC0415 - the owner's module; loaded with the owner
+        from . import row_packets, walk_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
 
-        kernels = (row_packets.produce_contacts, row_packets.materialize_fallback)
+        # The packets' producer records every row and its unit source; the one writer walks the general worlds' rows.
+        kernels = (row_packets.produce_contacts, walk_rows.write_walked_rows)
     elif method == "keyed_rows":
         from . import keyed_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
 

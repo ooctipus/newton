@@ -1416,6 +1416,9 @@ class RowLaws:
             bind_dense_rows(placement),
             placement.row_support(),
             placement.constraint_count,
+            # The local owners' packets keep their worlds' seeds: the writer walks the general worlds' rows.
+            placement.local_solve_owner,
+            int(placement.row_packets is not None),
             lanes,
             contact_input,
             patch_row_law(solver),

@@ -75,17 +75,19 @@ def contact_row_plan(solver) -> ContactRowPlan:
     law = "patch" if solver.laws.friction_anchors_enabled else "point"
     sizes = solver.forest.size_groups
     case = solver.routes.case
-    if getattr(solver.placement, "walks", False):
-        # The general placement's one writer (walk_rows): the row pass writes each contact row's records and unit
-        # source, and the writer walks its seed.
-        return ContactRowPlan("walk", law, dict.fromkeys(sizes, "walk"))
     owned = {
         "K3": "local_packets" if solver.placement.row_packets is not None else None,
         "K4": "keyed_rows" if solver.placement.keyed_rows is not None else None,
         "K2": "compact_contact_boundary" if solver.placement.compact_contact_boundary else None,
     }.get(case)
     if owned is not None:
+        # An in-kernel owner's producer; where its class walks (the local packets) it records the general worlds'
+        # unit sources too, which the one writer walks.
         return ContactRowPlan(owned, law, dict.fromkeys(sizes, owned))
+    if getattr(solver.placement, "walks", False):
+        # The general placement's one writer (walk_rows): the row pass writes each contact row's records and unit
+        # source, and the writer walks its seed.
+        return ContactRowPlan("walk", law, dict.fromkeys(sizes, "walk"))
     if case in ("K1", "K2") or solver._compact_contact_jacobian:
         methods = {}
         for size in sizes:

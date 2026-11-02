@@ -45,7 +45,7 @@ from newton._src.solvers.feather_pgs.solve_policy import (
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import local_packed_rows, row_lines
+from newton.tests.feather_pgs_law_harness import chain_walk, local_packed_rows, row_lines, walked_rows
 
 SWEEPS = SolvePolicy(readout="sweeps")
 STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
@@ -197,12 +197,19 @@ class _LocalCase:
         row_type[0, :2] = [PGS_CONSTRAINT_TYPE_MIMIC, PGS_CONSTRAINT_TYPE_JOINT_LIMIT]
         row_type[1, 0] = PGS_CONSTRAINT_TYPE_MIMIC
         candidates = wp.array([0, 1], dtype=wp.int32, device=device)
-        lower_group = wp.array(np.stack([lower, np.eye(dofs, dtype=np.float32)]), dtype=wp.float32, device=device)
-        # Outputs: the diagonal (initially the compliance), the impulses and the articulations' velocities.
+        velocity = np.array([0.3, -0.5, 0.1, 9.0, 8.0, 7.0], dtype=np.float32)
+        # The one writer's rows on the walk of each world's factor (z = A^-T J^T), their incident velocities and
+        # diagonals |z|^2 + cfm (FL3.6: the local kernel reads them and leaves by the walk).
+        stored = [walked_rows(lower, jacobian[0]), jacobian[1]]
+        incident = np.stack([jacobian[0] @ velocity[:dofs], jacobian[1] @ velocity[dofs:]])
+        diagonal = cfm.copy()
+        diagonal[0] += np.sum(stored[0] * stored[0], axis=1)
+        self.walk = chain_walk(device, [lower, np.eye(dofs)])
+        # Outputs: the diagonal (initially the one writer's), the impulses and the articulations' velocities.
         self.initial = (
-            wp.array(cfm, dtype=wp.float32, device=device),
+            wp.array(diagonal, dtype=wp.float32, device=device),
             wp.zeros((2, rows), dtype=wp.float32, device=device),
-            wp.array([0.3, -0.5, 0.1, 9.0, 8.0, 7.0], dtype=wp.float32, device=device),
+            wp.array(velocity, dtype=wp.float32, device=device),
         )
         self.outputs = tuple(wp.clone(array) for array in self.initial)
         self.inputs = [
@@ -210,15 +217,12 @@ class _LocalCase:
             candidates,
             PGS_LOCAL_SOLVE_OWNER_SINGLE,
             wp.array([0, 1], dtype=wp.int32, device=device),
-            wp.array([0, 1], dtype=wp.int32, device=device),
             wp.array([0, 3], dtype=wp.int32, device=device),
             # World 1 belongs to another owner: its solve returns before any sweep.
             wp.array([PGS_LOCAL_SOLVE_OWNER_SINGLE, 0], dtype=wp.int32, device=device),
             wp.array([2, 1], dtype=wp.int32, device=device),
             row_lines(device),
-            lower_group,
-            lower_group,
-            *local_packed_rows(device, [0, 1], jacobian),
+            *local_packed_rows(device, [0, 1], stored, incident),
             wp.array(rhs, dtype=wp.float32, device=device),
             wp.array(row_type, dtype=wp.int32, device=device),
             wp.full((2, rows), -1, dtype=wp.int32, device=device),
@@ -245,8 +249,7 @@ class _LocalCase:
         wp.launch_tiled(
             kernel,
             dim=[self.worlds],
-            inputs=[*self.inputs, iterations, 1.0],
-            outputs=[*self.outputs, *extra],
+            inputs=[*self.inputs, iterations, 1.0, *self.outputs, self.walk, *extra],
             block_dim=32,
             device=self.device,
         )

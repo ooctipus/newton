@@ -547,7 +547,8 @@ def walked_rows_kernel(release: bool, blocks: int, mimic_blocks: bool) -> wp.Ker
 
     1. *release* (``release``, a class whose drives can saturate): the lanes take the world's walked trees, each tree's
        slips released (:func:`.tree_factor.walk_release_tree`);
-    2. *rows*: the lanes write every row of the world;
+    2. *rows*: the lanes write every row of the world, except a world an in-kernel owner holds (``owned``: the local
+       owners' packets walk their own seeds);
     3. *closure* (``blocks``, the largest bilateral block's rows; 0 for none): the lanes close each of the world's
        blocks (:func:`.response_builds_rows.close_block`; its rows are the links', and the mimics' with
        ``mimic_blocks``), then correct every other row on the blocks its sides touch
@@ -563,6 +564,8 @@ def walked_rows_kernel(release: bool, blocks: int, mimic_blocks: bool) -> wp.Ker
         rows: DenseRows,
         support: RowSupport,
         counts: wp.array[int],
+        owner: wp.array[int],
+        owned: int,
         lanes: int,
         data: ContactInput,
         law: PatchRowLaw,
@@ -598,6 +601,10 @@ def walked_rows_kernel(release: bool, blocks: int, mimic_blocks: bool) -> wp.Ker
             for i in range(slips.world_start[world] + lane, slips.world_start[world + 1], lanes):
                 walk_release_tree(slips.world_arts[i], walk, slips, v_hat)
             world_sync(lanes)
+        # A world an in-kernel owner holds (``owned`` and ``owner`` nonzero: the local owners' packets, whose kernels
+        # walk their seeds and read the release built above) is not the writer's.
+        if owned != 0 and owner[world] != 0:
+            return
         for slot in range(lane, count, lanes):
             write_row(
                 rows, support, line, slot, data, law, walk, body_to_articulation, mimic_dof0, mimic_dof1, mimic_coef1,

@@ -52,7 +52,7 @@ PAIRED_SCHEDULES = ({}, {"contact_triples": True}, {"contact_units": True})
 
 def _row_inputs(primary: int):
     """The row packets' row inputs for a primary articulation of ``primary`` coordinates and a free body."""
-    return row_packets.get_local_factory.__wrapped__(primary, 6, 40).keywords["row_inputs"]
+    return row_packets.get_local_factory.__wrapped__(primary, 6, 40, primary + 2).keywords["row_inputs"]
 
 
 def _local_variants():
@@ -132,9 +132,20 @@ class TestLocalOwnedRoute(unittest.TestCase):
         self.assertIn("SHARED LocalScratch localscratch[8];", body)
         self.assertIn("#define s_A localscratch[SUB].s_A", body)
         self.assertIn("#undef s_A", body)
-        # Every local owner stages the factor's reciprocal diagonal and multiplies by it, contactless ones included.
-        self.assertIn("(s_L)[i * 10] = factor != 0.0f ? 1.0f / factor : 0.0f;", body)
+        # The trees' factor is the walk's (FL3.6): no staged factor, and the rows and the leave are the walk's,
+        # contactless owners included.
+        self.assertNotIn("s_L", body)
+        self.assertIn("WALK_TREE(", body)
+        self.assertIn("WALK_DOWN(walk_data, walk_link, s_v, s_v,", body)
         self.assertNotIn("value/diagonal", body)
+        # A paired owner walks its free body down too; the packets' owner stages the walk in shared memory.
+        paired, _ = sweep_routes_local.local_owned_source(192, 20, 9, 6, warps_per_block=2)
+        self.assertNotIn("s_L", paired)
+        self.assertIn("WALK_DOWN(free_data, free_link, s_v + 9, s_v + 9,", paired)
+        _, staged = sweep_routes_local.local_owned_source(192, 20, 9, 6, warps_per_block=2, row_inputs=_row_inputs(9))
+        self.assertGreater(
+            staged.bytes, sweep_routes_local.local_owned_source(192, 20, 9, 6, warps_per_block=2)[1].bytes
+        )
 
 
 class TestPairedFactorRoute(unittest.TestCase):
@@ -230,24 +241,56 @@ class TestResponseOperators(unittest.TestCase):
         self.assertIn("for(int k=row+1;k<3;++k)", entered)
 
     def test_local_block_views_and_packed_entries(self):
-        block = LocalBlock(15, (CholeskySolve(9, "s_L"), CholeskySolve(6, "s_S")), Lanes(32), free=FreeBodyZ(Lanes(32)))
+        block = LocalBlock(
+            15,
+            9,
+            11,
+            seeds=True,
+            staged=True,
+            wrenches=True,
+            release=True,
+            dense_capacity=20,
+            lanes=Lanes(32),
+            free=FreeBodyZ(Lanes(32)),
+        )
         self.assertEqual(block.rows, "row_count + mf_count")
         self.assertEqual(block.residual("jv", ""), "float jv = s_res[i];")
-        free = LocalBlock(15, block.factors, Lanes(32), free=FreeBodyZ(Lanes(32)), first="row_count")
+        free = LocalBlock(15, 9, lanes=Lanes(32), free=FreeBodyZ(Lanes(32)), first="row_count")
         self.assertEqual(free.residual("jv", ""), "float jv = s_res[row_count + i];")
         coupling = free.coupling("cross", "i", "sib", "")
         self.assertIn("(row_count + sib) > (row_count + i)", coupling)
         self.assertIn("s_A[hi * (hi + 1) / 2 + lo]", coupling)
+        packets = row_packets.get_local_factory(9, 6, 20, 11).keywords["row_inputs"]
         with self.assertRaises(ValueError):
-            LocalBlock(16, block.factors, Lanes(32)).respond(("a", "b"), "")
-        # Whitened rows: the forward solve only, the Gram block A = Z^T Z, the commit in factor coordinates.
-        respond = block.respond(("a", "b"), "")
-        # Whitened in registers, stored once.
-        self.assertIn("whitened_0[i] = jacobian;", respond)
-        self.assertIn("s_Z[staged + 9 + i] = whitened_1[i];", respond)
-        self.assertIn("row_diagonal += whitened_1[i] * whitened_1[i];", respond)
-        self.assertIn("incident += jacobian * s_v[9 + i];", respond)
-        self.assertNotIn("step", respond)
+            LocalBlock(16, 9, 11, seeds=True, wrenches=True, lanes=Lanes(32)).respond(packets, "")
+        # The packets' seeds walked in the kernel (FL3.6) on the world's staged walk: the tree's and the paired free
+        # body's (a one-body tree), the release of the tree's slips along their paths, then |z|^2 in coordinate order.
+        prologue = block.prologue()
+        self.assertIn("s_walk[i] = ", prologue)
+        self.assertIn("const auto walk_free = [&]() { WALK_TREE(free_path, 1, 6); };", prologue)
+        self.assertNotIn("walk.data.data + (size_t)walk_d0", prologue)
+        respond = block.respond(packets, "")
+        self.assertIn(
+            "walk_wrench(&s_Z[staged], s_v, walk_data, walk_link, walk_now, walk_now_link, code, wrench)", respond
+        )
+        self.assertIn(
+            "walk_wrench(&s_Z[staged + 9], s_v + 9, free_data, free_link, free_now, walk_now_link, 0,", respond
+        )
+        self.assertIn("incident += walk_covector(&s_Z[staged], dof, weight);", respond)
+        self.assertIn("WALK_RELEASE(walk.release, art, &s_Z[staged]);", respond)
+        self.assertIn("row_diagonal += z * z;", respond)
+        self.assertNotIn("s_L", respond)
+        # Read in place, the same walks take the device walk's data (a data-chosen layout).
+        in_place = LocalBlock(15, 9, 11, seeds=True, wrenches=True, lanes=Lanes(32)).prologue()
+        self.assertIn("const float* walk_now = walk.now.data + (size_t)walk_d0 * 6;", in_place)
+        self.assertNotIn("s_walk", in_place)
+        # The one writer's stored rows: read, not whitened again; the walk read in place for the leave.
+        stored_block = LocalBlock(15, 9, release=True, lanes=Lanes(32))
+        stored = stored_block.respond(sweep_routes_local.StoredLocalRows(), "")
+        self.assertIn("Z_row[first_p + c]", stored)
+        self.assertIn("const float incident = row_incident.data[world_row_base + row];", stored)
+        self.assertNotIn("WALK_", stored)
+        self.assertNotIn("s_walk", stored_block.prologue())
         assembled = block.assemble(lambda r: f"rhs[{r}]", "")
         self.assertIn("a += s_Z[hi * 15 + d] * s_Z[lo * 15 + d];", assembled)
         self.assertNotIn("s_v", assembled)
@@ -255,7 +298,14 @@ class TestResponseOperators(unittest.TestCase):
         commit = block.commit("")
         self.assertIn("u += s_Z[r * 15 + d] * s_app[r];", commit)
         self.assertIn("u += mf_Z_a.data[row6 + d - row_a] * applied;", commit)
-        self.assertIn("if (lane == 1) {", block.leave(""))
+        # The leave, for either row source: the tree's release R^T and walk down on lane 0, the free body's walk down
+        # on lane 1, their twists in the spent s_Z.
+        for source in (block, stored_block):
+            leave = source.leave("")
+            self.assertIn("WALK_RELEASE_T(walk.release, art, s_v);", leave)
+            self.assertIn("if (lane == 1) {", leave)
+            self.assertIn("WALK_DOWN(free_data, free_link, s_v + 9, s_v + 9,", leave)
+        self.assertIn("WALK_DOWN(walk_data, walk_link, s_v, s_v, s_Z);", block.leave(""))
 
     def test_factor_rows_fuse_a_pair_ladder(self):
         rows = FactorRows(23, (FactorComponent(17, "o", "l", "L", "b"),), Lanes(32), diagonal=lambda r: f"s_diag[{r}]")

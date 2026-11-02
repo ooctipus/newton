@@ -6,10 +6,10 @@
 Every kernel's working set fits the static budget of the device it is built for (:func:`.staging.arch_budget`).
 
 - :func:`local_owned_kernel`: one lane group (8, 16 or 32 lanes) per candidate articulation, or articulation and
-  free body, with several groups per block. The group stages the factors and rows, whitens each row in the kernel
-  and solves the rows over the packed Gram block ``A = Z^T Z`` (:class:`.response_operator.LocalBlock`), its residuals
-  maintained and the velocity change committed after the sweeps. The residual owner's free-body rows follow the dense
-  rows in the block.
+  free body, with several groups per block. The group stages its rows, walks each row's seeds on the tree's factor in
+  the kernel (or reads the one writer's rows) and solves the rows over the packed Gram block ``A = Z^T Z``
+  (:class:`.response_operator.LocalBlock`), its residuals maintained and the velocity change committed after the
+  sweeps, which leaves by the walk. The residual owner's free-body rows follow the dense rows in the block.
 - :func:`paired_factor_kernel`: one warp per world of an articulation and a free body, rows in factor coordinates
   (:class:`.response_operator.FactorRows`) on the velocity change from the predictor, which leaves per component,
   under one of three schedules: row by row, contact triples after a prefix, or contact units.
@@ -28,11 +28,11 @@ from .kernel_template import KernelTemplate
 from .law_source import law_preludes
 from .packed_rows import PACKED_SIDES
 from .projection_laws import CONE_LAW, PROJECTION_LAW
-from .response_operator import CholeskySolve, FactorComponent, FactorRows, FreeBodyZ, Lanes, LocalBlock
-from .row_inputs import RowArgument
+from .response_operator import FactorComponent, FactorRows, FreeBodyZ, Lanes, LocalBlock
+from .row_inputs import RowArgument, StoredLocalRows
 from .row_metadata import _mf_parent_expression
 from .solve_policy import DEFAULT_POLICY, SolvePolicy
-from .staging import Buffer, Staging, arch_budget
+from .staging import Buffer, Staging, arch_budget, resident_blocks
 from .sweep import (
     CONTACT,
     FRICTION,
@@ -57,6 +57,7 @@ from .sweep import (
     weight_arguments,
 )
 from .sweep_routes import walk_leave
+from .sweep_routes_tiers import REGISTER_WARPS
 from .tree_factor import WalkTrees, walk_paths_prelude
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -68,16 +69,14 @@ LOCAL_ABI = kernel_template.params(
     ("candidate_articulations", wp.array[int]),
     ("candidate_secondary_articulations", wp.array[int]),
     ("expected_owner", int),
-    ("articulation_group_index", wp.array[int]),
     ("articulation_world", wp.array[int]),
     ("articulation_dof_start", wp.array[int]),
     ("local_solve_owner", wp.array[int]),
     ("world_constraint_count", wp.array[int]),
     ("dense_first", wp.array[int]),
-    ("L_group", wp.array3d[float]),
-    ("secondary_L_group", wp.array3d[float]),
     ("packed_Z", wp.array3d[float]),
     ("row_sides", wp.array2d[wp.vec2i]),
+    ("row_incident", wp.array2d[float]),
     ("response_dofs", wp.array[int]),
     ("articulation_world_dof_offset", wp.array[int]),
     ("packed_dense", int),
@@ -101,7 +100,11 @@ LOCAL_ABI = kernel_template.params(
     ("world_impulses", wp.array2d[float]),
     ("v_out", wp.array[float]),
 )
-"""The local owners' native ABI: one candidate per lane group (``candidates`` or ``candidate_queue`` dispatch)."""
+"""The local owners' native ABI: one candidate per lane group (``candidates`` or ``candidate_queue`` dispatch). Every
+local kernel also takes the walk (``walk``, :class:`.tree_factor.WalkTrees`), last of its row operands."""
+
+WALK_ARGUMENT = RowArgument("walk", WalkTrees)
+"""The tree factor's walk (:meth:`.tree_factor.TreeFactor.walk_view`), whose rows and leave the local kernels share."""
 
 
 def _check_local_options(
@@ -129,9 +132,11 @@ def local_staging(
     lanes_per_world: int = 32,
     contact_capable: bool = True,
     local_mf_max_constraints: int = 0,
+    walk_bodies: int = 0,
 ) -> Staging:
-    """The shared working set of a local owner's block: per lane group the factors, the rows' whitened entries,
-    impulses and metadata, the velocity, the paired free body's impulses and the packed Gram block.
+    """The shared working set of a local owner's block: per lane group the walk's data of its trees where the kernel
+    walks seeds (``walk_bodies``, the primary tree's most bodies: :class:`.response_operator.LocalBlock`), the rows'
+    whitened entries, impulses and metadata, the velocity, the paired free body's impulses and the packed Gram block.
 
     The solver admits an owner, and sizes its blocks, from it (:meth:`.Staging.fits` against
     :func:`.staging.arch_budget`).
@@ -144,10 +149,14 @@ def local_staging(
         int(lanes_per_world),
     )
     T, block_rows = P + S, R + MFR
+    walk = LocalBlock(T, P, int(walk_bodies), staged=bool(walk_bodies), wrenches=contact_capable)
     return Staging(
         (
-            Buffer("s_L", "float", P * P),
-            *((Buffer("s_L_secondary", "float", S * S),) if S else ()),
+            *(
+                (Buffer("s_walk", "float", walk.walk_floats()), Buffer("s_walk_path", "int", walk.walk_ints()))
+                if walk_bodies
+                else ()
+            ),
             Buffer("s_Z", "float", R * T),
             Buffer("s_v", "float", T),
             *(Buffer(name, "float", R) for name in ("s_lam", "s_rhs", "s_inv_diag")),
@@ -165,6 +174,15 @@ def local_staging(
     )
 
 
+def local_bounds(staging: Staging, device_arch) -> tuple[int, int]:
+    """A local owner's launch bounds: its threads, and the blocks its shared memory keeps resident on ``device_arch``
+    (:func:`.staging.resident_blocks`), at most :data:`.sweep_routes_tiers.REGISTER_WARPS` warps of them. ptxas fits the
+    registers of the kernel's longest phase, the walk of a row's seeds, to the occupancy shared memory admits, so the
+    walk costs the sweeps no resident block."""
+    blocks = resident_blocks(staging.bytes, device_arch)
+    return staging.threads, max(1, min(blocks, REGISTER_WARPS // (staging.threads // 32)))
+
+
 def local_owned_source(
     max_constraints: int,
     local_max_constraints: int,
@@ -180,17 +198,23 @@ def local_owned_source(
     torsion: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     material: bool = False,
+    walk_release: bool = False,
+    walk_staged: bool = True,
 ) -> tuple[str, Staging]:
     """The native body of a local owner's sweep: an articulation's rows (and a paired free body's coordinates and,
     for the residual owner, its free-body rows) over the response block the lane group builds in the kernel. Under
     ``torsion`` a friction pair solves with its contact's spin row (the friction triple).
 
-    The group stages the factors, the rows' impulses, right-hand sides and metadata and the predictor; takes each
-    row's incident velocity ``J v_hat`` into its right-hand side and whitens it, ``Z = L^-1 P J^T``, from its Jacobian
-    (``row_inputs``' packets, or the world's packed rows); stores the effective diagonal ``|Z|^2 + cfm`` back to
-    ``world_diag`` and stages its inverse; builds the Gram block and the residuals (:class:`.LocalBlock`); then runs
-    the sweeps with the shared row law, the dense rows in slot order and then the free-body rows, commits the velocity
-    change, which leaves factor coordinates and adds to the predictor, and the impulses of the rows with a Jacobian.
+    The group stages the walk's data of its trees (where it walks seeds), the rows' impulses, right-hand sides and
+    metadata and the predictor; takes each row's footprints on the walk of the trees' factors, ``z = R L^-1 P J^T``
+    (``R`` the release of slipping drives, ``walk_release``; the walk staged in shared memory with ``walk_staged``
+    where it walks seeds), and its incident velocity ``J v_hat`` into its
+    right-hand side: from its seeds, walked in the kernel (``row_inputs``' packets,
+    :class:`.row_inputs.CompactLocalRows`), or from the one writer's stored rows (:class:`.row_inputs.StoredLocalRows`);
+    stores the effective diagonal ``|z|^2 + cfm`` back to ``world_diag`` and stages its inverse; builds the Gram block
+    and the residuals (:class:`.LocalBlock`); then runs the sweeps with the shared row law, the dense rows in slot
+    order and then the free-body rows, commits the velocity change, which leaves the walk's coordinates and adds to
+    the predictor, and the impulses of the rows with a footprint.
 
     Returns the body and its staging.
     """
@@ -204,13 +228,20 @@ def local_owned_source(
     laws = RowLaws(
         regularize=contact_capable, material=material and contact_capable, torsion=torsion, policy=solve_policy
     )
-    factors = (CholeskySolve(P, "s_L", reciprocal=True, ascending=True),)
-    if S:
-        factors += (CholeskySolve(S, "s_L_secondary", reciprocal=True, ascending=True),)
+    # The packets' seeds are walked here, on the world's walk staged in shared memory; the one writer's stored rows
+    # are read, and the walk only for the leave, in place.
+    bodies = 0 if row_inputs is None else row_inputs.bodies
+    staged = row_inputs is not None and walk_staged
     op = LocalBlock(
         T,
-        factors,
-        lanes,
+        P,
+        bodies,
+        seeds=row_inputs is not None,
+        staged=staged,
+        wrenches=contact_capable,
+        release=walk_release,
+        dense_capacity=R,
+        lanes=lanes,
         dense="row_count",
         free=free,
         inverse=lambda row: "inverse_diagonal" if row == "i" else f"s_inv_diag[{row}]",
@@ -223,38 +254,19 @@ def local_owned_source(
         lanes_per_world=L,
         contact_capable=contact_capable,
         local_mf_max_constraints=MFR,
+        walk_bodies=bodies if staged else 0,
     )
 
-    # The rows' Jacobians: the producers' packed rows, which the build leaves in these worlds (packed_rows), each
-    # articulation's entries where it is a side.
-    sides = ""
-    primary_read = "(first_p >= 0 ? J_row[first_p + i] : 0.0f)"
-    secondary_read = "(first_s >= 0 ? J_row[first_s + i] : 0.0f)"
-    if row_inputs is not None:
-        primary_read, secondary_read = row_inputs.read(P, S)
-    else:
-        sides = (
-            "        const wp::vec2i sides_r = row_sides.data[world_row_base + row];\n"
-            "        const float* J_row = &packed_Z.data[(size_t)(world_row_base + row) * packed_Z.shape[2]];\n"
-            "        const int first_p = PACKED_FIRST(sides_r, art);\n"
-            + ("        const int first_s = PACKED_FIRST(sides_r, secondary_art);\n" if S else "")
-        )
-    reads = (primary_read, secondary_read)[: len(factors)]
+    # The rows: the packets' seeds walked here, or the one writer's stored rows (the class walks through it).
+    source = StoredLocalRows() if row_inputs is None else row_inputs
 
     pair = ""
     dof = "articulation_dof_start.data[art] + d"
     if S:
-        pair = f"""
+        pair = """
     const int secondary_art = candidate_secondary_articulations.data[candidate];
-    if (articulation_world.data[secondary_art] != world) return;
-    const int secondary_group = articulation_group_index.data[secondary_art];
-    const int secondary_group_l_base = secondary_group * {S * S};"""
+    if (articulation_world.data[secondary_art] != world) return;"""
         dof = f"d < {P} ? articulation_dof_start.data[art] + d : articulation_dof_start.data[secondary_art] + d - {P}"
-    factor_loads = [factors[0].stage(lambda i: f"L_group.data[group_l_base + {i}]", "lane", L)]
-    if S:
-        factor_loads.append(
-            factors[1].stage(lambda i: f"secondary_L_group.data[secondary_group_l_base + {i}]", "lane", L)
-        )
     metadata = (
         "\n        s_parent[row] = world_row_parent.data[world_row_base + row];"
         "\n        s_mu[row] = world_row_mu.data[world_row_base + row];"
@@ -281,7 +293,6 @@ def local_owned_source(
     sweeps = _local_sweeps(op, laws, lanes, R, MFS, MFR, contact_capable)
     body = f"""    const int lane = LANE;
     const int art = candidate_articulations.data[candidate];
-    const int group = articulation_group_index.data[art];
     const int world = articulation_world.data[art];
     if (local_solve_owner.data[world] != expected_owner) return;
     const int row_count = world_constraint_count.data[world];
@@ -289,11 +300,9 @@ def local_owned_source(
 
     const int line = dense_first.data[world];
     __builtin_assume(line >= 0);
-    const int world_row_base = line * {M};
-    const int group_l_base = group * {P * P};{pair}
+    const int world_row_base = line * {M};{pair}
 {staging.declarations("    ")}{mf_setup}
-
-{indent(chr(10).join(factor_loads), "    ")}
+{indent(op.prologue(), "    ")}
     for (int row = lane; row < row_count; row += {L}) {{
         s_lam[row] = world_impulses.data[world_row_base + row];
         s_rhs[row] = rhs_bias.data[world_row_base + row];
@@ -305,13 +314,13 @@ def local_owned_source(
     }}
     SYNC();
 
-    // Each row's incident velocity and whitened row, Z = L^-1 P J^T, its effective diagonal |Z|^2 + cfm (stored back)
-    // and its inverse.
+    // Each row's incident velocity and footprints on the walk, z = R L^-1 P J^T, its effective diagonal |z|^2 + cfm
+    // (stored back) and its inverse.
     for (int row = lane; row < row_count; row += {L}) {{
-{sides}{op.respond(reads, "        ")}
+{op.respond(source, "        ")}
         s_rhs[row] += incident;
         s_active[row] = active;
-        const float effective_diagonal = row_diagonal + world_diag.data[world_row_base + row];
+        const float effective_diagonal = {source.diagonal("row_diagonal")};
         s_inv_diag[row] = effective_diagonal > 0.0f ? 1.0f / effective_diagonal : 0.0f;
         world_diag.data[world_row_base + row] = effective_diagonal;
     }}
@@ -323,7 +332,7 @@ def local_owned_source(
 
 {op.commit("    ")}
     SYNC();
-    // The velocity change leaves factor coordinates, dv = P^T L^-T u, block by block.
+    // The velocity change leaves the walk's coordinates, dv = P^T L^-T R^T u, tree by tree.
 {op.leave("    ")}
     SYNC();
     for (int d = lane; d < {T}; d += {L}) {{
@@ -343,6 +352,7 @@ def local_owned_source(
         PACKED_SIDES,
         *law_preludes(PROJECTION_LAW, *((CONE_LAW,) if torsion else ())),
         *solve_policy.preludes,
+        op.walk_prelude(),
     )
     return cuda_native(body, preludes=preludes), staging
 
@@ -458,11 +468,14 @@ def local_owned_kernel(
     torsion: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     material: bool = False,
+    walk_release: bool = False,
+    walk_staged: bool = True,
 ) -> wp.Kernel:
     """A local owner's sweep kernel.
 
-    ``row_inputs`` (:class:`.row_inputs.CompactLocalRows`) reads the rows' Jacobians from its packets, whose
-    operands follow the ABI's; a solve readout's operand comes last.
+    ``row_inputs`` (:class:`.row_inputs.CompactLocalRows`) walks the rows' seeds from its packets, whose operands
+    follow the ABI's, then the walk's; without it the kernel reads the one writer's rows. A solve readout's operand
+    comes last.
     """
     snippet, staging = local_owned_source(
         max_constraints,
@@ -478,6 +491,8 @@ def local_owned_kernel(
         torsion=torsion,
         solve_policy=solve_policy,
         material=material,
+        walk_release=walk_release,
+        walk_staged=walk_staged,
     )
     staging.check("the local owner's sweep", arch_budget(device_arch))
     family = "sweep_local" if row_inputs is None else "sweep_local_packet"
@@ -490,10 +505,17 @@ def local_owned_kernel(
         + ("_queue" if persistent_queue else "")
         + ("_material" if material else "")
         + ("_torsion" if torsion else "")
+        + (f"_walk{row_inputs.bodies}" if row_inputs is not None else "")
+        + ("_inplace" if row_inputs is not None and not walk_staged else "")
+        + ("_release" if walk_release else "")
         + solve_policy.suffix
     )
     queue = kernel_template.candidate_queue if persistent_queue else kernel_template.candidates
-    arguments = (*(() if row_inputs is None else row_inputs.arguments), *material_arguments(material))
+    arguments = (
+        *(() if row_inputs is None else row_inputs.arguments),
+        WALK_ARGUMENT,
+        *material_arguments(material),
+    )
     return KernelTemplate.from_abi(
         name,
         LOCAL_ABI,
@@ -502,6 +524,7 @@ def local_owned_kernel(
         extra=arguments + solve_policy.arguments,
         composed=True,
         native_name="sweep_local_native",
+        launch_bounds=local_bounds(staging, device_arch),
     ).kernel()
 
 

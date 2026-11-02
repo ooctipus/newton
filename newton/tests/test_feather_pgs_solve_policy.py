@@ -93,7 +93,7 @@ _SCALED_VOTES = {
 
 def _factory_calls():
     """One call of every sweep factory that takes a policy: ``(name, factory, args, kwargs)``."""
-    packets = row_packets.get_local_factory.__wrapped__(9, 6, 40)
+    packets = row_packets.get_local_factory.__wrapped__(9, 6, 40, 11)
     return (
         (
             "sparse",
@@ -208,7 +208,7 @@ def _vote_census():
             (_axis("contact_triples"), _axis("independent_components"), _axis("contact_units")),
         ),
         ("local", sweep_routes_local.local_owned_kernel.__wrapped__, (192, 20, 9, "120"), local),
-        ("packets", row_packets.get_local_factory.__wrapped__(9, 6, 40), (192, 20, 9, "120"), local),
+        ("packets", row_packets.get_local_factory.__wrapped__(9, 6, 40, 11), (192, 20, 9, "120"), local),
         (
             "sparse_diagonal",
             sweep_routes_diag.sparse_diagonal_kernel.__wrapped__,

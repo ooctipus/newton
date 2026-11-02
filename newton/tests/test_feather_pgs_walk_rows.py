@@ -308,6 +308,82 @@ class TestSlipRelease(unittest.TestCase):
                 self.assertGreater(np.linalg.norm(W_all - W_decided) / scale_W, 1.0e-1)
 
 
+def slipping_hinges_beside_a_body(device):
+    """:func:`slipping_hinges` with limits only near their upper sides (one row each at the joint limit activation gap
+    of 0.1) and a free box apart in the same world: a small tree beside a body, the local owners' class (case K3)."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    parent, joints = -1, []
+    for inertia, (lo, hi) in zip((0.05, 0.01, 0.02), ((-0.2, 0.0), (-0.15, 0.0), (-0.3, 0.05)), strict=True):
+        link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * inertia))
+        joints.append(
+            builder.add_joint_revolute(
+                parent=parent,
+                child=link,
+                axis=(0.0, 0.0, 1.0),
+                target_ke=2.0e3,
+                target_kd=20.0,
+                effort_limit=1.0,
+                armature=0.0,
+                limit_lower=lo,
+                limit_upper=hi,
+                parent_xform=wp.transform(wp.vec3(0.3, 0.0, 0.0), wp.quat_identity()),
+            )
+        )
+        parent = link
+    builder.add_articulation(joints)
+    builder.add_body(xform=wp.transform(wp.vec3(5.0, 0.0, 0.0), wp.quat_identity()), mass=1.0)
+    model = builder.finalize(device=device)
+    control = model.control()
+    target = control.joint_target_q.numpy()
+    target[:3] = (3.0, -3.0, 3.0)
+    control.joint_target_q.assign(target)
+    return model, control
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "The local owners are a CUDA placement")
+class TestLocalSlipFrame(unittest.TestCase):
+    """The local owners (case K3, FL3.6) take the decided operator: the packets' rows walked in the kernel and the one
+    writer's rows both carry the release ``R`` of the slipping drives along their paths, and the local leave ``R^T``
+    (W9's verdict), so each step equals the general placement's (:class:`TestSlipFrame`'s decided operator)."""
+
+    def test_the_local_kernel_takes_the_decided_operator(self):
+        from unittest import mock  # noqa: PLC0415
+
+        model, control = slipping_hinges_beside_a_body("cuda:0")
+        steps = {}
+        # The packets' seeds walked in the kernel; the one writer's rows the kernel reads (no packets); the general
+        # placement.
+        routes = (("packets", {}), ("stored", {"producer": "compact_jacobian"}), ("general", {"placement": "general"}))
+        for name, pins in routes:
+            with mock.patch.object(SolverFeatherPGS, "_route_pins", pins), warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                solver = SolverFeatherPGS(
+                    model,
+                    angular_damping=0.0,
+                    pgs_iterations=30,
+                    enable_joint_limits=True,
+                    joint_limit_activation_gap=0.1,
+                )
+            state, out = model.state(), model.state()
+            solver.step(state, out, control, None, 1.0 / 60.0)
+            steps[name] = (solver, out.joint_qd.numpy()[:3].astype(np.float64))
+        general = steps["general"][0]
+        self.assertEqual(general.routes.case, "K6")
+        qd_general = steps["general"][1]
+        self.assertGreater(np.linalg.norm(qd_general), 1.0e-3)
+        for name, packets in (("packets", True), ("stored", False)):
+            with self.subTest(route=name):
+                local, qd_local = steps[name]
+                self.assertEqual(local.routes.case, "K3")
+                self.assertEqual(local.placement.row_packets is not None, packets)
+                self.assertTrue(local.placement.walks)
+                self.assertEqual(int(local.placement.local_solve_owner.numpy()[0]), 1)
+                # Every hinge slips this step: both row sources carry the tree's release.
+                self.assertEqual(int(local.factor.walk_view().release.count.numpy()[0]), 3)
+                self.assertGreater(int(local.placement.constraint_count.numpy()[0]), 0)
+                self.assertLess(np.linalg.norm(qd_local - qd_general) / np.linalg.norm(qd_general), 1.0e-5)
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # One frame per placement: the walked rows and the leave of the general worlds
 # ---------------------------------------------------------------------------------------------------------------------
@@ -319,9 +395,13 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
     (and ``u`` of the incident velocity), and ``n u kappa |dv|`` (FL3.1's leave bound) with the publication's rounding
     of ``v_hat`` and ``v_out``. A free rigid body is a one-body tree of six coordinates. A tree whose drives slip this
     step leaves ``R^T du`` (its rows carry the release and are checked by :class:`TestSlipRelease`); the closure's
-    corrected rows (``test_feather_pgs_preelim``) and a world whose speed ball acted (its ``du`` is a law's, not
-    ``sum Z lambda``) are left to their own checks."""
+    corrected rows (``test_feather_pgs_preelim``), a world whose speed ball acted (its ``du`` is a law's, not
+    ``sum Z lambda``) and a world the local owners' packets hold (its rows are walked in the kernel, no store holds
+    them: ``test_feather_pgs_walk_device.placement_frames``) are left to their own checks."""
     forest, placement, factor = solver.forest, solver.placement, solver.factor
+    owned = np.zeros(int(forest.world_count), dtype=bool)
+    if placement.row_packets is not None:
+        owned = placement.local_solve_owner.numpy() != 0
     out = {"rows": 0.0, "free_rows": 0.0, "leave": 0.0, "worlds": 0, "free_bodies": 0, "slipping": 0}
     sizes = forest.articulation_response_dof_count.numpy()
     offsets = forest.articulation_world_dof_offset.numpy()
@@ -352,7 +432,7 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
 
     for world in range(int(forest.world_count)):
         line, count = int(first[world]), int(counts[world])
-        if count == 0:
+        if count == 0 or owned[world]:
             continue
         for row in range(count):
             term, scale_z, scale_u, length = 0.0, 0.0, 0.0, 0
@@ -404,11 +484,11 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
                 if bound > 0.0:
                     out["free_rows"] = max(out["free_rows"], abs(term - incident_row) / bound)
     # The leave: the published dv against the float64 walk's leave of the step's du (the final rows' Z lambda), a
-    # slipping tree's after its rows' release, R^T du (the device's release, tree_factor.walk_release_kernel).
+    # slipping tree's after its rows' release, R^T du (the device's release, tree_factor.walk_release_tree).
     view = factor.walk_view()
     for art in range(sizes.size):
         world, n = int(art_world[art]), int(sizes[art])
-        if world < 0 or n == 0 or solver.factor.eliminates or ball[world]:
+        if world < 0 or n == 0 or solver.factor.eliminates or ball[world] or owned[world]:
             continue
         line, count = int(first[world]), int(counts[world])
         du = np.zeros(n) + free_du.get(art, 0.0)

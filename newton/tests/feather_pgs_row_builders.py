@@ -36,7 +36,6 @@ ROW_BUILDER_KERNELS = frozenset(
         "sparse_pair_contact_rows_kernel",
         "clear_contact_response",
         "produce_contacts",
-        "materialize_fallback",
         "scatter_contact_keys",
         "materialize_general_rows",
     )

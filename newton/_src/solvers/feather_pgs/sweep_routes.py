@@ -101,27 +101,8 @@ def walk_leave(art: str, values: str, size: str, *, frame: bool, pad: str = "") 
     leaves by it, so the rows and the leave share one frame (FL3_design §1.2)."""
     slipped = ""
     if frame:
-        slipped = f"""{{
-    // The slips' release: du <- R^T du, the last slip first, each along its path root first
-    // (tree_factor.walk_release_tree).
-    const auto& release = walk.release;
-    const int slips = release.count.data[{art}];
-    const int cap = release.b.shape[1], steps = release.b.shape[2];
-    for (int j = slips - 1; j >= 0; --j) {{
-        const size_t at = ((size_t){art} * cap + j) * steps;
-        const int* coordinate = release.coordinate.data + at;
-        const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
-        float t = 0.0f;
-        for (int k = steps - 1; k >= 0; --k) {{
-            const int c = coordinate[k];
-            if (c < 0) continue;
-            const float x = g[k] * {values}[c] + a[k] * t;
-            {values}[c] = x;
-            t -= b[k] * x;
-        }}
-    }}
-}}
-"""
+        # The slips' release: du <- R^T du (tree_factor.walk_release_tree).
+        slipped = f"WALK_RELEASE_T(walk.release, {art}, {values});\n"
     text = f"""{{
 const int j0 = walk.joint_start.data[{art}], d0 = walk.dof_start.data[{art}];
 {slipped}WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), walk.joint_end.data[{art}] - j0, {size});

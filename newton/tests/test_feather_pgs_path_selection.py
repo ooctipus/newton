@@ -583,7 +583,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     {"case": "K3", "row_packets": SimpleNamespace()},
                     (18, 6),
                     "local_packets",
-                    same((18, 6), "local_packets", ["produce_contacts", "materialize_fallback"]),
+                    same((18, 6), "local_packets", ["produce_contacts", "write_walked_rows"]),
                 ),
                 (
                     {"case": "K4", "keyed_rows": SimpleNamespace(patch=not point, layout=layout)},
@@ -1027,8 +1027,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 small,
                 {},
                 lambda beta: _pinned(small, {"storage": "dense"}, friction_anchor_beta=beta),
-                "compact_jacobian",
-                dict.fromkeys(("6", "1"), "compact_jacobian"),
+                None,
+                None,
             ),
             (
                 "walk",
@@ -1060,7 +1060,15 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                         self.assertEqual(entry["method"], "sparse_response")
                         self.assertEqual(entry["kernels"], [solver.placement.sparse_contact_response_kernel.key])
                     if name == "compact_jacobian":
-                        builder = ["prepare_world_contact_rows", "populate_world_J_for_compact_size"]
+                        # A class of the local owners walks through the one writer (FL3.6); one that keeps the compact
+                        # Jacobian names its builders.
+                        walked = solver.placement.walks
+                        self.assertEqual(record["producer"], "walk" if walked else "compact_jacobian")
+                        builder = (
+                            ["write_contact_units", "write_walked_rows"]
+                            if walked
+                            else ["prepare_world_contact_rows", "populate_world_J_for_compact_size"]
+                        )
                         self.assertEqual(
                             {tuple(entry["kernels"]) for entry in record["builder_by_dof"].values()}, {tuple(builder)}
                         )
