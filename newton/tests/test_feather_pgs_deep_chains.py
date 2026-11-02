@@ -190,8 +190,8 @@ def family_response(model, devices_to_run=(), *, float32_poses: bool = False) ->
 
 
 def main_on_chain(model) -> dict:
-    """A chain's tip contact (three rows) through main's float32 dense factor (:func:`dense_factor32` of ``H`` with the
-    conditioning armature the solver adds), applied in float32, and through the float32 walk without armature, both
+    """A chain's tip contact (three rows) through main's float32 dense factor (:func:`dense_factor32` of the float32 ``H``
+    about the origin with the conditioning armature the solver adds), applied in float32, and through the float32 walk without armature, both
     against the float64 walk without armature (F2's comparison, :func:`.test_feather_pgs_walk.chain_precision`)."""
     from scipy.linalg import solve_triangular
 
@@ -208,7 +208,8 @@ def main_on_chain(model) -> dict:
     dv64 = np.stack([truth.down(z64[:, r])[0] for r in range(3)], axis=1)
     z32, _ = walk32.up(body, W.astype(np.float32))
     dv32 = np.stack([walk32.down(z32[:, r])[0] for r in range(3)], axis=1)
-    L32 = dense_factor32(MassReference(model).mass_matrix(joint_q, 0) + np.diag(solver.factor.diagonal(0)))
+    H32 = MassReference(model, np.float32).mass_matrix(joint_q, 0).astype(np.float64)
+    L32 = dense_factor32(H32 + np.diag(solver.factor.diagonal(0)))
     with np.errstate(all="ignore"):
         x32 = jacobian(truth, body, W).astype(np.float32)[::-1]
         z_main = solve_triangular(L32, x32, lower=True, check_finite=False)

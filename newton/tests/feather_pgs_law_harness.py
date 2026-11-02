@@ -793,11 +793,12 @@ def walk_inverse(solver, art: int) -> np.ndarray:
 
 
 def dense_factor32(A) -> np.ndarray:
-    """Main's float32 dense factor of the symmetric matrix ``A`` (physical order, ``H + R + K``): the leaf-first
-    ``P A P^T = L L^T`` the held tree built before the walk replaced it, over ``A`` rounded to float32, in its order:
-    each pivot subtracts its row's squares from the first column on and takes the square root, and each entry below
-    subtracts its products and scales by the pivot's reciprocal. A reference for the walk's precision, not a solver
-    path; main's own float32 geometry is not in it. Returns ``L``, float32 lower triangular, leaf first."""
+    """Main's float32 dense factor of the symmetric matrix ``A`` (physical order, ``H + R + K``; main's ``H`` is the float32
+    assembly about the origin, :class:`.feather_pgs_mass_reference.MassReference` at ``dtype=np.float32``): the
+    leaf-first ``P A P^T = L L^T`` the held tree built before the walk replaced it, over ``A`` rounded to float32, in its
+    order: each pivot subtracts its row's squares from the first column on and takes the square root, and each entry
+    below subtracts its products and scales by the pivot's reciprocal. A reference for the walk's precision, not a
+    solver path. Returns ``L``, float32 lower triangular, leaf first."""
     A = np.asarray(A, dtype=np.float64).astype(np.float32)[::-1, ::-1]
     n = A.shape[0]
     L = np.zeros((n, n), np.float32)

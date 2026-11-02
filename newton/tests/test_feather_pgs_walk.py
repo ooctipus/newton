@@ -500,7 +500,8 @@ def chain_precision(links: int, rng) -> Chain:
     n = links + 6
     added = solver.factor.armature[:n].astype(np.float64) - model.joint_armature.numpy()[:n]
     H = MassReference(model).mass_matrix(joint_q, 0)
-    L32 = dense_factor32(H + np.diag(solver.factor.diagonal(0)))
+    H32 = MassReference(model, np.float32).mass_matrix(joint_q, 0).astype(np.float64)
+    L32 = dense_factor32(H32 + np.diag(solver.factor.diagonal(0)))
     truth = TreeWalk(*local_frames(model, joint_q, 0), np.zeros(n))
     walk32 = TreeWalk(*local_frames(model, joint_q, 0), np.zeros(n), dtype=np.float32)
     body, W = ground_contact(model, newton_state_body_q(model, joint_q), links)
@@ -596,8 +597,9 @@ def unconditioned(links: int, steps: int = 30) -> Unconditioned:
         state.clear_forces()
         pipeline.collide(state, contacts)
         H = MassReference(model).mass_matrix(state.joint_q.numpy(), 0)
+        H32 = MassReference(model, np.float32).mass_matrix(state.joint_q.numpy(), 0).astype(np.float64)
         solver.step(state, out, control, contacts, scene.dt)
-        L = dense_factor32(H + np.diag(solver.factor.diagonal(0))).astype(np.float64)
+        L = dense_factor32(H32 + np.diag(solver.factor.diagonal(0))).astype(np.float64)
         ok = bool(np.all(np.isfinite(np.tril(L))) and np.all(np.isfinite(out.joint_qd.numpy())))
         if first is None:
             pivots = np.diag(L) ** 2
