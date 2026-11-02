@@ -1978,8 +1978,9 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
     // segment's lanes (one warp, or a packed tree's lanes) load the tree's walk, each coordinate's record and body and
     // each body's parent, first coordinate and link, into registers in one parallel trip, lane l holding coordinates and
     // bodies l, l + WIDTH, ...; then the release is built coordinate-major, a lane a slip (HELD_BUILD), and the
-    // decided step's two tree walks run on every lane of the segment in lockstep, reading each step's values by
-    // shuffle, with no global load on a chain; between them the release's primitive applies R^T R (BORDER_APPLY).
+    // decided step's two tree walks (held_walks: the class's straight-line text) run on every lane of the segment in
+    // lockstep, reading each step's values by shuffle from their fixed lane, with no global load on a chain; between
+    // them HELD_APPLY applies R^T R.
     struct WalkHold {
         float r[$HOLD][13];
         int parent[$HOLD], first[$HOLD];
@@ -2042,81 +2043,6 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
                 if (b >= k * WIDTH) t = h.l[k][m];
             l[m] = READ(t, b & (WIDTH - 1));
         }
-    };
-    // HELD_UP(h, n, nb, x, u, state): WALK_UP_TREE on the held walk; lane 0 writes u and the join states.
-    const auto HELD_UP = [&](const WalkHold& h, const int n, const int nb, const float* x, float* u, float* state) {
-        for (int k = lane; k < 6 * nb; k += WIDTH) state[k] = 0.0f;
-        WARP_SYNC();
-        float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-        #pragma unroll 1
-        for (int b = nb - 1; b >= 0; --b) {
-            for (int k = 0; k < 6; ++k) p[k] += state[6 * b + k];
-            const int f0 = HOLD_PICK(h.first, b), f1 = HOLD_PICK(h.first, b + 1);
-            #pragma unroll 1
-            for (int c = f1 - 1; c >= f0; --c) {
-                float d[13];
-                HOLD_RECORD(h, c, d);
-                const float z = (x[c] + ((d[0] * p[0] + d[1] * p[1] + d[2] * p[2]) + (d[3] * p[3] + d[4] * p[4] + d[5] * p[5])))
-                                * d[12];
-                for (int k = 0; k < 6; ++k) p[k] -= d[6 + k] * z;
-                if (lane == 0) u[c] = z;
-            }
-            const int up = HOLD_PICK(h.parent, b);
-            float l[3];
-            HOLD_LINK(h, b, l);
-            if (up >= 0) {
-                const float fx = p[0], fy = p[1], fz = p[2];
-                p[3] -= l[1] * fz - l[2] * fy;
-                p[4] -= l[2] * fx - l[0] * fz;
-                p[5] -= l[0] * fy - l[1] * fx;
-            }
-            if (up != b - 1) {
-                if (up >= 0) {
-                    if (lane == 0)
-                        for (int k = 0; k < 6; ++k) state[6 * up + k] += p[k];
-                    WARP_SYNC();
-                }
-                for (int k = 0; k < 6; ++k) p[k] = 0.0f;
-            }
-        }
-        WARP_SYNC();
-    };
-    // HELD_DOWN(h, n, nb, u, qd, twist): WALK_DOWN_TREE on the held walk, u read into the lanes first (u == qd allowed);
-    // lane 0 writes qd, every lane the twists (one value).
-    const auto HELD_DOWN = [&](const WalkHold& h, const int n, const int nb, const float* u, float* qd, float* twist) {
-        float uh[$HOLD];
-        #pragma unroll
-        for (int k = 0; k < $HOLD; ++k) uh[k] = lane + k * WIDTH < n ? u[lane + k * WIDTH] : 0.0f;
-        WARP_SYNC();
-        float V[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-        #pragma unroll 1
-        for (int b = 0; b < nb; ++b) {
-            const int up = HOLD_PICK(h.parent, b);
-            float l[3];
-            HOLD_LINK(h, b, l);
-            if (up < 0) {
-                for (int k = 0; k < 6; ++k) V[k] = 0.0f;
-            } else {
-                if (up != b - 1)
-                    for (int k = 0; k < 6; ++k) V[k] = twist[6 * up + k];
-                V[0] += l[1] * V[5] - l[2] * V[4];
-                V[1] += l[2] * V[3] - l[0] * V[5];
-                V[2] += l[0] * V[4] - l[1] * V[3];
-            }
-            const int f0 = HOLD_PICK(h.first, b), f1 = HOLD_PICK(h.first, b + 1);
-            #pragma unroll 1
-            for (int c = f0; c < f1; ++c) {
-                float d[13];
-                HOLD_RECORD(h, c, d);
-                const float uc = HOLD_PICK(uh, c);
-                const float q = (uc - ((d[6] * V[0] + d[7] * V[1] + d[8] * V[2]) + (d[9] * V[3] + d[10] * V[4] + d[11] * V[5])))
-                                * d[12];
-                if (lane == 0) qd[c] = q;
-                for (int k = 0; k < 6; ++k) V[k] += d[k] * q;
-            }
-            for (int k = 0; k < 6; ++k) twist[6 * b + k] = V[k];
-        }
-        WARP_SYNC();
     };
     // HELD_APPLY(a, u, slips): u <- R^T R u, every slip's release on its own lane at once (the segment's lane j holds
     // slip j; at most WIDTH slips, as HELD_BUILD keeps). R_j is applied leaf first and R_j^T root first along slip j's
@@ -2311,6 +2237,77 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
         return slips;
     };
 """
+
+
+def held_walks(cls, x: str, u: str, state: str, words: int) -> tuple[str, str]:
+    """Native statements of the decided step's two held walks of class ``cls`` (CUDA, :data:`_HELD`'s ``h`` in scope):
+    the walk up of ``x`` into ``u`` (``u = L^-1 P x``) and the walk down of ``u`` in place (``P^T L^-T u``), on every
+    lane of the segment in lockstep, straight-line from the class's table: each coordinate's record and each body's link
+    read by shuffle from the lane and word that hold them (``HOLD_RECORD``, ``HOLD_LINK`` at a constant), no loop and no
+    pick of a parent or a first coordinate on the chain. A body's state passes to a parent that is not the body before it
+    through ``state`` (six words a body, lane 0 writes), the walk down's twists through the same words (every lane
+    writes them, as each body's twist out); a body no other child joins adds the zero state as ``+ 0.0f``, the walk
+    up's addition of an untouched slot. Lane 0 writes ``u`` (both walks). ``words``: the words a lane holds
+    (:func:`_held_words`)."""
+    parent, first = cls.parent, cls.first
+    bodies = len(parent)
+    up, joined = [], set()
+    up.append("{\n    float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};")
+    for b in range(bodies - 1, -1, -1):
+        if b in joined:
+            up.append(f"    for (int k = 0; k < 6; ++k) p[k] += {state}[{6 * b} + k];")
+        else:
+            up.append("    for (int k = 0; k < 6; ++k) p[k] += 0.0f;")
+        for c in range(first[b + 1] - 1, first[b] - 1, -1):
+            up.append(
+                f"    {{float d[13];HOLD_RECORD(h,{c},d);const float z=({x}[{c}]+((d[0]*p[0]+d[1]*p[1]+d[2]*p[2])"
+                "+(d[3]*p[3]+d[4]*p[4]+d[5]*p[5])))*d[12];"
+                f"for(int k=0;k<6;++k)p[k]-=d[6+k]*z;if(lane==0){u}[{c}]=z;}}"
+            )
+        parent_b = parent[b]
+        if parent_b >= 0:
+            up.append(
+                f"    {{float l[3];HOLD_LINK(h,{b},l);const float fx=p[0],fy=p[1],fz=p[2];"
+                "p[3]-=l[1]*fz-l[2]*fy;p[4]-=l[2]*fx-l[0]*fz;p[5]-=l[0]*fy-l[1]*fx;}"
+            )
+        if parent_b != b - 1:
+            if parent_b >= 0:
+                if parent_b in joined:
+                    up.append(f"    if(lane==0)for(int k=0;k<6;++k){state}[{6 * parent_b}+k]+=p[k];")
+                else:
+                    up.append(f"    if(lane==0)for(int k=0;k<6;++k){state}[{6 * parent_b}+k]=0.0f+p[k];")
+                    joined.add(parent_b)
+                up.append("    WARP_SYNC();")
+            if b > 0:
+                up.append("    for (int k = 0; k < 6; ++k) p[k] = 0.0f;")
+    up.append("    WARP_SYNC();\n}")
+    down = [
+        f"{{\n    float uh[{words}];",
+        "    #pragma unroll",
+        f"    for (int k = 0; k < {words}; ++k) uh[k] = lane + k * WIDTH < {cls.coordinates} ? {u}[lane + k * WIDTH] : 0.0f;",
+        "    WARP_SYNC();",
+        "    float V[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};",
+    ]
+    for b in range(bodies):
+        parent_b = parent[b]
+        if parent_b < 0:
+            down.append("    for (int k = 0; k < 6; ++k) V[k] = 0.0f;")
+        else:
+            if parent_b != b - 1:
+                down.append(f"    for (int k = 0; k < 6; ++k) V[k] = {state}[{6 * parent_b} + k];")
+            down.append(
+                f"    {{float l[3];HOLD_LINK(h,{b},l);V[0]+=l[1]*V[5]-l[2]*V[4];V[1]+=l[2]*V[3]-l[0]*V[5];"
+                "V[2]+=l[0]*V[4]-l[1]*V[3];}"
+            )
+        for c in range(first[b], first[b + 1]):
+            down.append(
+                f"    {{float d[13];HOLD_RECORD(h,{c},d);const float q=(HOLD_PICK(uh,{c})-((d[6]*V[0]+d[7]*V[1]+d[8]*V[2])"
+                "+(d[9]*V[3]+d[10]*V[4]+d[11]*V[5])))*d[12];"
+                f"if(lane==0){u}[{c}]=q;for(int k=0;k<6;++k)V[k]+=d[k]*q;}}"
+            )
+        down.append(f"    for (int k = 0; k < 6; ++k) {state}[{6 * b} + k] = V[k];")
+    down.append("    WARP_SYNC();\n}")
+    return "\n".join(up), "\n".join(down)
 
 
 def _held_words(layout: TreeLayout) -> int:
@@ -2556,15 +2553,18 @@ def border_solve(layout: TreeLayout, classes: tuple) -> str:
         "            slips{r}=HELD_BUILD(h,a,n,nb,data,s+$WHITE+{offset},s+{offset});\n"
         "        }}}}\n"
     )
-    held_step = (
-        "        if((moved&{bit})&&lane<WIDTH) {{{head}" + nb + hold + "\n"
-        "            HELD_UP(h,n,nb,s+$SIX_BODIES+{offset},s+$WHITE+{offset},s);\n"
-        # R^T R between the walks, every slip on its lane at once (HELD_APPLY).
-        "            HELD_APPLY(a,s+$WHITE+{offset},slips{r});\n"
-        "            HELD_DOWN(h,n,nb,s+$WHITE+{offset},s+$WHITE+{offset},s);\n"
-        "        }}\n"
-    )
-    held = f"        {declarations}\n{each(held_frame)}        SYNC();\n{each(held_step)}        SYNC();\n"
+
+    def held_step(r, offset):
+        # The class's walk up of the force words into the response words, R^T R between the walks, every slip on its
+        # lane at once (HELD_APPLY), the walk down in place; the join states and the twists in the dead body words.
+        walk_up, walk_down = held_walks(classes[r], f"(s+$SIX_BODIES+{offset})", f"(s+$WHITE+{offset})", "s", words)
+        return (
+            f"        if((moved&{2 << r})&&lane<WIDTH) {{{head.format(art=_root_articulation(layout, r))}{nb}{hold}\n"
+            f"{walk_up}\n            HELD_APPLY(a,s+$WHITE+{offset},slips{r});\n{walk_down}\n        }}\n"
+        )
+
+    steps = "".join(held_step(r, offset) for r, offset in roots)
+    held = f"        {declarations}\n{each(held_frame)}        SYNC();\n{steps}        SYNC();\n"
     text = f"    {{\n#if defined(__CUDA_ARCH__)\n{held}#else\n{serial}#endif\n    }}\n"
     return substitute(text, {**layout.sizes(), "WALK_COORDINATE": WALK_COORDINATE, "WALK_LINK": WALK_LINK})
 
