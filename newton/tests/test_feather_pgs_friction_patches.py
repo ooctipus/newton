@@ -648,8 +648,11 @@ class TestFrictionPatchHistory(unittest.TestCase):
         self.assertEqual(float(patches.view.weight.numpy().max()), 0.0)
 
 
-def _run_rolling(geometry, device, *, friction_anchor_beta=None, segments=64, hz=240, direction=1, deterministic=False):
-    """Roll a generated wheel for one second and average speed over its final quarter."""
+def _run_rolling(
+    geometry, device, *, friction_anchor_beta=None, segments=64, hz=240, direction=1, deterministic=False, launch_ulp=0
+):
+    """Roll a generated wheel for one second and average speed over its final quarter; ``launch_ulp`` (+-1) moves the
+    launch velocity's components by one float32 ulp, a draw of the run's one-ulp family."""
     builder = newton.ModelBuilder()
     builder.add_ground_plane()
     body = builder.add_body(xform=wp.transform(wp.vec3(0, 0, 0.05), wp.quat_identity()))
@@ -667,7 +670,10 @@ def _run_rolling(geometry, device, *, friction_anchor_beta=None, segments=64, hz
     pipeline = newton.CollisionPipeline(model, deterministic=deterministic)
     contacts = pipeline.contacts()
     s0, s1 = model.state(), model.state()
-    s0.joint_qd.assign([direction, 0, 0, 0, 20 * direction, 0])
+    launch = np.array([direction, 0, 0, 0, 20 * direction, 0], dtype=np.float32)
+    if launch_ulp:
+        launch = np.where(launch != 0, np.nextafter(launch, np.float32(launch_ulp * np.inf)), launch).astype(np.float32)
+    s0.joint_qd.assign(launch)
     newton.eval_fk(model, s0.joint_q, s0.joint_qd, s0)
     control = model.control()
     final_velocity = []
@@ -682,29 +688,46 @@ def _run_rolling(geometry, device, *, friction_anchor_beta=None, segments=64, hz
     return pose, velocity, np.mean(final_velocity, axis=0)
 
 
+def _within_family(test, actual, references, index, delta):
+    """``actual``'s entry ``index`` within ``delta`` of the span of the reference runs' (one-ulp draws of the launch)."""
+    value = float(actual[index[0]][index[1]])
+    family = [float(r[index[0]][index[1]]) for r in references]
+    test.assertGreaterEqual(value, min(family) - delta, f"{index}: {value} against {family}")
+    test.assertLessEqual(value, max(family) + delta, f"{index}: {value} against {family}")
+
+
 class TestFeatherPGSFrictionPatches(unittest.TestCase):
     def test_default_friction_preserves_free_rolling(self):
         """Match velocity-only free rolling without adding a persistent rearward friction force."""
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         for geometry in ("sphere", "capsule", "cylinder", "mesh", "convex_hull"):
-            results = []
             # Isolate displacement persistence from row reduction on faceted
             # wheels: a negligible positive gain keeps the same patch rows with
             # effectively no positional correction. The separate tessellation
             # matrix compares default patches against full point friction.
-            reference_beta = 1.0e-8 if geometry in ("mesh", "convex_hull") else 0.0
-            for kwargs in ({"friction_anchor_beta": reference_beta}, {}):
-                result = _run_rolling(geometry, device, deterministic=True, **kwargs)
+            faceted = geometry in ("mesh", "convex_hull")
+            reference_beta = 1.0e-8 if faceted else 0.0
+            # A faceted wheel's travel is bimodal under its facet impacts: one rounding unit of the launch moves the
+            # reference run by more than the bound (main 64e61f3a, mesh: 0.83045, +1 ulp 0.83977, -1 ulp 0.82722).
+            # The default run is held to the reference's one-ulp family, its three draws, each within the bound of
+            # the family's span; a persistent rearward friction force falls below the whole family.
+            draws = (0, 1, -1) if faceted else (0,)
+            references = [
+                _run_rolling(geometry, device, deterministic=True, friction_anchor_beta=reference_beta, launch_ulp=u)
+                for u in draws
+            ]
+            actual = _run_rolling(geometry, device, deterministic=True)
+            for result in (*references, actual):
                 self.assertTrue(all(np.isfinite(value).all() for value in result))
-                results.append(result)
+            reference = references[0]
+
             with self.subTest(geometry=geometry):
-                reference, actual = results
-                self.assertAlmostEqual(float(actual[0][0]), float(reference[0][0]), delta=0.01)
-                self.assertLess(abs(float(actual[0][1] - reference[0][1])), 0.01)
+                _within_family(self, actual, references, (0, 0), 0.01)
+                _within_family(self, actual, references, (0, 1), 0.01)
                 # Facet impacts lose energy even without positional correction;
                 # compare averaged speed rather than individual impact phases.
-                self.assertAlmostEqual(float(actual[2][0]), float(reference[2][0]), delta=0.02)
-                self.assertAlmostEqual(float(actual[2][4]), float(reference[2][4]), delta=0.4)
+                _within_family(self, actual, references, (2, 0), 0.02)
+                _within_family(self, actual, references, (2, 4), 0.4)
                 self.assertLess(abs(float(actual[2][1])), 0.01)
                 if geometry not in ("mesh", "convex_hull"):
                     self.assertAlmostEqual(float(actual[1][0]), float(reference[1][0]), delta=0.01)
