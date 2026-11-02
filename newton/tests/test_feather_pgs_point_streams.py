@@ -330,7 +330,7 @@ def _support_writer_calls():
 
     tree = ((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11), tuple(range(10, -1, -1)))
     for records, torsion in ((False, False), (True, False), (True, True)):
-        kwargs = {"records": records, "torsion": torsion}
+        kwargs = {"records": records, "torsion": torsion, "lanes": 32}
         yield "walk_rows.support_rows_kernel", walk_rows.support_rows_kernel.__wrapped__, tree, kwargs
     yield "walk_rows.support_publish_kernel", walk_rows.support_publish_kernel.__wrapped__, tree, {}
 

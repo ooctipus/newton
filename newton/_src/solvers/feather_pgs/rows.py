@@ -1295,7 +1295,6 @@ class RowLaws:
                 bind_dense_rows(placement),
                 placement.unit_source,
                 placement.constraint_count,
-                sweep.support_lanes,
                 contact_input,
                 patch_row_law(solver),
                 sweep.support_sink(solver.v_hat),
@@ -1310,6 +1309,7 @@ class RowLaws:
                 int(self.set.weighted),
                 int(solver.options.contact_compliance),
             ],
+            block_dim=walk_rows.SUPPORT_THREADS,
             device=model.device,
         )
 

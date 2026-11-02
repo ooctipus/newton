@@ -923,6 +923,349 @@ _SPIN_TAIL = """        record[4] = cross[3];
         record[5] = cross[4];
         record[6] = cross[5];"""
 
+_GENERATE = """    // The rows in generator form (WALK_MAPPING D5H, Z_UNION 1.2), a world's lane group over a batch of its units, every
+    // lane calling: rows seeded on one body share its generator Gamma (path x 6), the walk of the six unit wrenches at
+    // the body's frame at the step's poses (the held step included: the walk is linear in its seed), so a row is
+    // z = Gamma w, 6 FMA an entry. 1. Every lane reads the batch's contact units by shuffles and keeps the same table:
+    // the bodies that carry at least two units take a slot, the most loaded first (lane order on a tie), at most $slots
+    // a world (the carveout's budget). 2. Six lanes a slot walk the unit wrenches into Gamma ([6][$paths] in shared
+    // memory, by rank in the body's support mask) and its incident covector (the step's J entries against v_hat), and
+    // release Gamma's columns along each slip's path (the predictor's border: R Gamma w = (R Gamma) w, once a body).
+    // 3. Each unit whose responding bodies all hold a slot: lane e forms entry e of its rows from Gamma's row of the
+    // entry's coordinate and stores it (a row's entries by consecutive lanes), its coordinate or the pad; the squares
+    // and the Gram summed over the group; the unit's own lane writes its diagonal, incident and record. Returns 1 when
+    // this lane's unit was written here; its lane walks it otherwise (joint rows, bodies without a slot).
+    const auto& walk = sink.walk;
+    const auto& release = sink.release;
+    const auto& support = sink.support;
+    const int S = sink.row_factor.shape[2];
+    constexpr int SLOTS = $slots, PATHS = $paths, SLOT = 6 * PATHS + 6, TABLE = $table;
+#if defined(__CUDA_ARCH__)
+    __shared__ float GAMMA_BLOCK[$groups * SLOTS * SLOT];
+    float* const GAMMA = GAMMA_BLOCK + SUB * (SLOTS * SLOT);
+#else
+    float GAMMA[SLOTS * SLOT];
+#endif
+    // This lane's unit: its responding sides' bodies (-1: none).
+    int key[2] = {-1, -1}, owner[2] = {-1, -1};
+    if (eligible != 0) {
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const int body = k == 0 ? unit.body_a : unit.body_b, art = k == 0 ? unit.art_a : unit.art_b;
+            if (body >= 0 && art >= 0 && sink.response_dofs.data[art] > 0 && sink.body_mask.data[body] != 0ull) {
+                key[k] = body;
+                owner[k] = art;
+            }
+        }
+    }
+    // 1. The table, the same on every lane.
+    int table[TABLE], table_art[TABLE], load[TABLE];
+#pragma unroll
+    for (int i = 0; i < TABLE; ++i) table[i] = table_art[i] = -1, load[i] = 0;
+#pragma unroll 1
+    for (int u = 0; u < LANES; ++u) {
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const int body = READ(key[k], u), art = READ(owner[k], u);
+            if (body < 0 || (k == 1 && body == READ(key[0], u))) continue;
+            bool placed = false;
+#pragma unroll
+            for (int i = 0; i < TABLE; ++i) {
+                if (placed) continue;
+                if (table[i] == body) {
+                    ++load[i];
+                    placed = true;
+                } else if (table[i] < 0) {
+                    table[i] = body;
+                    table_art[i] = art;
+                    load[i] = 1;
+                    placed = true;
+                }
+            }
+        }
+    }
+    int slot_body[SLOTS], slot_art[SLOTS];
+    int slots = 0;
+#pragma unroll
+    for (int f = 0; f < SLOTS; ++f) {
+        int best = -1, most = 1;
+#pragma unroll
+        for (int i = 0; i < TABLE; ++i)
+            if (load[i] > most) best = i, most = load[i];
+        slot_body[f] = slot_art[f] = -1;
+#pragma unroll
+        for (int i = 0; i < TABLE; ++i)
+            if (i == best) {
+                slot_body[f] = table[i];
+                slot_art[f] = table_art[i];
+                load[i] = 0;
+            }
+        if (best >= 0) slots = f + 1;
+    }
+    const auto slot_of = [&](int body) -> int {
+        int found = -1;
+#pragma unroll
+        for (int f = 0; f < SLOTS; ++f)
+            if (body >= 0 && slot_body[f] == body) found = f;
+        return found;
+    };
+    if (slots == 0) return 0;
+    SYNC();  // the group's last batch read its generators
+    // 2. Gamma: lane 6 f + k walks unit wrench k of slot f, then releases its column.
+    for (int i = LANE; i < 6 * slots; i += STRIDE) {
+        const int f = i / 6, k = i - 6 * f;
+        int body = -1, art = -1;
+#pragma unroll
+        for (int q = 0; q < SLOTS; ++q)
+            if (q == f) body = slot_body[q], art = slot_art[q];
+        const unsigned long long mask = sink.body_mask.data[body];
+        const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
+        const float* data = walk.data.data + (size_t)d0 * $coordinate;
+        const float* link = walk.link.data + (size_t)j0 * $link;
+        const float* now = walk.now.data + (size_t)d0 * $now;
+        const float* now_link = walk.now_link.data + (size_t)j0 * $link;
+        const float* vh = sink.v_hat.data + d0;
+        float* G = GAMMA + f * SLOT + k * PATHS;
+        const auto rank = [&](int c) -> int { return COUNT(mask & ((1ull << SUPPORT_NODE[c]) - 1ull)); };
+        float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}, w[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        p[k] = w[k] = 1.0f;
+        float incident = 0.0f;
+        const auto put = [&](int, int c, float z, float j) {
+            G[rank(c)] = z;
+            incident += j * vh[c];
+        };
+        const int local = walk.body_joint.data[body] - j0;
+        WALK_UP(data, link, now, now_link, local, WALK_FIRST_OF(local + 1) - 1, p, w, put);
+        GAMMA[f * SLOT + 6 * PATHS + k] = incident;
+        // The release along each slip's path, leaf first, on the column's entries (off the mask: zero, skipped).
+        const int slips = release.count.data[art];
+        const int cap = release.dof.shape[1], width = release.b.shape[2];
+        for (int j = 0; j < slips; ++j) {
+            const int d = release.dof.data[art * cap + j];
+            const size_t at = ((size_t)art * cap + j) * width;
+            const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
+            float s = 0.0f;
+            for (int up = walk.dof_body.data[d0 + d], c = d, t = 0; up >= 0;) {
+                for (; c >= WALK_FIRST_OF(up); --c, ++t) {
+                    if (((mask >> SUPPORT_NODE[c]) & 1ull) == 0ull) continue;
+                    float* entry = G + rank(c);
+                    const float x = *entry - b[t] * s;
+                    s += a[t] * x;
+                    *entry = g[t] * x;
+                }
+                up = WALK_PARENT_OF(up);
+                if (up >= 0) c = WALK_FIRST_OF(up + 1) - 1;
+            }
+        }
+    }
+    SYNC();
+    // 3. The units whose responding bodies all hold a slot.
+    bool mine = eligible != 0 && (key[0] >= 0 || key[1] >= 0);
+#pragma unroll
+    for (int k = 0; k < 2; ++k)
+        if (key[k] >= 0 && slot_of(key[k]) < 0) mine = false;
+#pragma unroll 1
+    for (int u = 0; u < LANES; ++u) {
+        if (READ((int)mine, u) == 0) continue;
+        const int rows = READ(unit.rows, u), line = READ(unit.line, u), first = READ(unit.slot, u);
+        const int art_a = READ(unit.art_a, u), art_b = READ(unit.art_b, u);
+        const int key_a = READ(key[0], u), key_b = READ(key[1], u);
+        float d[3][3], at[2][3];
+#pragma unroll
+        for (int r = 0; r < 3; ++r)
+#pragma unroll
+            for (int c = 0; c < 3; ++c) d[r][c] = READ(unit.frame.data[r][c], u);
+#pragma unroll
+        for (int c = 0; c < 3; ++c) {
+            at[0][c] = READ(unit.point[c], u);
+            at[1][c] = READ(unit.friction_point[c], u);
+        }
+        // The seeds: body a's wrenches, body b's negated, each at its body's frame at the step's poses.
+        const int seed_body[2] = {key_a, key_b}, seed_art[2] = {art_a, art_b};
+        int seed_slot[2];
+        float seed[2][$rows][6];
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            seed_slot[k] = slot_of(seed_body[k]);
+            const float sign = k == 0 ? 1.0f : -1.0f;
+            const int joint = seed_slot[k] < 0 ? 0 : walk.body_joint.data[seed_body[k]];
+            const float* o = walk.now_link.data + (size_t)joint * $link + $frame;
+#pragma unroll
+            for (int r = 0; r < $rows; ++r) {
+                float* q = seed[k][r];
+                const float* e = d[r == 1 || r == 2 ? r : 0];
+                const float* x = at[r == 0 ? 0 : 1];
+                const float f[3] = {sign * e[0], sign * e[1], sign * e[2]};
+                const float l[3] = {x[0] - o[0], x[1] - o[1], x[2] - o[2]};
+                if ($spin && r == 3) {
+                    q[0] = q[1] = q[2] = 0.0f;
+                    q[3] = f[0];
+                    q[4] = f[1];
+                    q[5] = f[2];
+                } else {
+                    q[0] = f[0];
+                    q[1] = f[1];
+                    q[2] = f[2];
+                    q[3] = l[1] * f[2] - l[2] * f[1];
+                    q[4] = l[2] * f[0] - l[0] * f[2];
+                    q[5] = l[0] * f[1] - l[1] * f[0];
+                }
+            }
+        }
+        // The sides, as the direct walker takes them: a's tree, then b's; two seeds on one tree share its side.
+        unsigned long long seed_mask[2] = {0ull, 0ull};
+#pragma unroll
+        for (int k = 0; k < 2; ++k)
+            if (seed_slot[k] >= 0) seed_mask[k] = sink.body_mask.data[seed_body[k]];
+        // Side 0 (a's tree) and side 1 (b's, past side 0's entries): each side's mask, tree and seeds.
+        unsigned long long mask0 = 0ull, mask1 = 0ull;
+        int art0 = -1, art1 = -1, seeds0 = 0, seeds1 = 0;
+        if (art_a >= 0 && sink.response_dofs.data[art_a] > 0) {
+#pragma unroll
+            for (int k = 0; k < 2; ++k)
+                if (seed_slot[k] >= 0 && seed_art[k] == art_a) mask0 |= seed_mask[k], seeds0 |= 1 << k;
+            if (mask0 != 0ull) art0 = art_a;
+        }
+        if (art_b >= 0 && art_b != art_a && sink.response_dofs.data[art_b] > 0) {
+            if (seed_slot[1] >= 0 && seed_art[1] == art_b) mask1 = seed_mask[1], seeds1 = 2;
+            if (mask1 != 0ull) art1 = art_b;
+        }
+        const int base1 = COUNT(mask0), count = base1 + COUNT(mask1);
+        const int row0 = line * sink.row_factor.shape[1] + first;
+        float* const Z = sink.row_factor.data + (size_t)row0 * S;
+        int* const D = sink.row_dof.data + (size_t)row0 * S;
+        const bool explicit_dofs = support.enabled == 0;
+        float norm[$rows], cross[6];
+        for (int r = 0; r < $rows; ++r) norm[r] = 0.0f;
+        for (int k = 0; k < 6; ++k) cross[k] = 0.0f;
+        for (int e = LANE; e < S; e += STRIDE) {
+            float z[$rows];
+            for (int r = 0; r < $rows; ++r) z[r] = 0.0f;
+            int coordinate = -1;
+            if (e < count) {
+                const bool second = e >= base1;
+                unsigned long long bits = second ? mask1 : mask0;
+                for (int q = second ? base1 : 0; q < e; ++q) bits &= bits - 1ull;
+                const int n = FIRST(bits), seeds = second ? seeds1 : seeds0;
+                coordinate = sink.world_offset.data[second ? art1 : art0] + n;
+#pragma unroll
+                for (int k = 0; k < 2; ++k) {
+                    if (((seeds >> k) & 1) == 0 || ((seed_mask[k] >> n) & 1ull) == 0ull) continue;
+                    const float* G = GAMMA + seed_slot[k] * SLOT + COUNT(seed_mask[k] & ((1ull << n) - 1ull));
+                    for (int r = 0; r < $rows; ++r) {
+                        const float* v = seed[k][r];
+                        z[r] += (G[0] * v[0] + G[PATHS] * v[1] + G[2 * PATHS] * v[2])
+                                + (G[3 * PATHS] * v[3] + G[4 * PATHS] * v[4] + G[5 * PATHS] * v[5]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < $rows; ++r) {
+                if (r >= rows) continue;
+                Z[r * S + e] = z[r];
+                if (explicit_dofs) D[r * S + e] = coordinate;
+            }
+            for (int r = 0; r < $rows; ++r) norm[r] += z[r] * z[r];
+            if ($rows >= 3) {
+                cross[0] += z[0] * z[1];
+                cross[1] += z[0] * z[2];
+                cross[2] += z[1] * z[2];
+            }
+            if ($rows >= 4) {
+                cross[3] += z[0] * z[$last];
+                cross[4] += z[1] * z[$last];
+                cross[5] += z[2] * z[$last];
+            }
+        }
+        $sums
+        if (LANE != u) continue;
+        // The unit's own lane: its header, its support class (the table) and its record.
+#pragma unroll
+        for (int r = 0; r < $rows; ++r) {
+            if (r >= rows) continue;
+            float incident = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                if (seed_slot[k] < 0) continue;
+                const float* g = GAMMA + seed_slot[k] * SLOT + 6 * PATHS;
+                const float* v = seed[k][r];
+                incident += (g[0] * v[0] + g[1] * v[1] + g[2] * v[2]) + (g[3] * v[3] + g[4] * v[4] + g[5] * v[5]);
+            }
+            sink.diag.data[row0 + r] = norm[r] + sink.row_cfm.data[row0 + r];
+            sink.row_incident.data[row0 + r] = incident;
+        }
+        if (!explicit_dofs) {
+            const auto side_of = [&](int body, int art) {
+                return body >= 0 && art >= 0 && sink.response_dofs.data[art] > 0 && sink.body_mask.data[body] != 0ull;
+            };
+            const bool a = side_of(unit.body_a, art_a), b = side_of(unit.body_b, art_b);
+            const int class_a = a ? support.body_class.data[unit.body_a] : 0;
+            const int class_b = b ? support.body_class.data[unit.body_b] : 0;
+            const int cls = support.pair_class.data[class_a * support.pair_class.shape[1] + class_b];
+            for (int r = 0; r < rows; ++r) support.row_class.data[row0 + r] = cls;
+        }
+$record
+    }
+    return mine ? 1 : 0;"""
+"""The support sink's rows in generator form, a world's lane group calling (:func:`support_rows_kernel`)."""
+
+_GENERATE_RECORD = """        if (rows == $rows) {
+            float* record = sink.records.data + ((size_t)line * sink.records.shape[1] + first / 3) * sink.records.shape[2];
+            record[0] = cross[0];
+            record[1] = cross[1];
+            record[2] = cross[2];
+            record[3] = 1.0f / (norm[0] + sink.row_cfm.data[row0]);
+$tail
+        }"""
+
+GAMMA_BYTES = 8_832
+"""Static shared memory the support writer's generators may take a block of :data:`SUPPORT_THREADS`: the PRO's driver
+keeps the 64 KB carveout while 6 such blocks' static shared memory (Warp's 2,048 B with the driver's reserve, plus
+this, in 128 B granules) fits it (HANDOFF_H8: the carveout is sized for the blocks the thread limit allows)."""
+
+SUPPORT_THREADS = 256
+"""Threads of a block of the support writer: whole world groups."""
+
+
+def _path_coordinates(parent: tuple, first: tuple) -> int:
+    """The most coordinates on one body's root path: a generator's rows."""
+    reach = []
+    for b, p in enumerate(parent):
+        reach.append((reach[p] if p >= 0 else 0) + first[b + 1] - first[b])
+    return max(reach, default=1)
+
+
+def generator_slots(parent: tuple, first: tuple, lanes: int) -> int:
+    """A world's generator slots in the support writer (:data:`_GENERATE`): six lanes a slot within the world's
+    ``lanes``, and the block's world groups' generators within :data:`GAMMA_BYTES`; 0 (no generator form) on a group
+    narrower than six lanes."""
+    groups = SUPPORT_THREADS // lanes
+    slot = (6 * _path_coordinates(parent, first) + 6) * 4
+    return max(min(lanes // 6, GAMMA_BYTES // (groups * slot)), 0)
+
+
+def _generate_snippet(parent: tuple, first: tuple, node: tuple, rows: int, records: bool, spin: bool, lanes: int):
+    record = substitute(_GENERATE_RECORD, rows=rows, tail=_SPIN_TAIL if spin else "") if records else ""
+    crosses = (6 if rows >= 4 else 3) if rows >= 3 else 0
+    sums = ", ".join([f"norm[{r}]" for r in range(rows)] + [f"cross[{k}]" for k in range(crosses)])
+    body = substitute(
+        _GENERATE,
+        slots=generator_slots(parent, first, lanes),
+        paths=_path_coordinates(parent, first),
+        table=8,
+        groups=SUPPORT_THREADS // lanes,
+        rows=rows,
+        last=rows - 1,
+        coordinate=WALK_COORDINATE,
+        link=WALK_LINK,
+        now=WALK_NOW,
+        frame=WALK_FRAME,
+        spin=int(spin),
+        sums=f"SUM({sums});",
+        record=record,
+    )
+    return dual_native(body, preludes=(walk_prelude(parent, first, 1), _support_table(node), lane_group(lanes)))
+
 
 @cache
 def _support_table(node: tuple[int, ...]) -> DevicePrelude:
@@ -998,10 +1341,13 @@ class SupportUnit:
 
 @cache
 def support_rows_kernel(
-    parent: tuple[int, ...], first: tuple[int, ...], node: tuple[int, ...], *, records: bool, torsion: bool
+    parent: tuple[int, ...], first: tuple[int, ...], node: tuple[int, ...], *, records: bool, torsion: bool, lanes: int
 ) -> wp.Kernel:
-    """The support placement's one writer (case K1): ``dim = (worlds, lanes)``, a world's lane group striding over its
-    rows, a lane per unit (a contact's rows from its first, a joint row alone).
+    """The support placement's one writer (case K1): ``dim = (worlds, lanes)``, a world's lane group of ``lanes``
+    taking its units in batches of ``lanes``, a lane per unit (a contact's rows from its first, a joint row alone).
+    A batch's contact units on a body that carries two or more of them are written in generator form by the whole
+    group (:data:`_GENERATE`: the body's six unit walks, then each row ``z = Gamma w`` with its entries across the
+    lanes); every other unit is walked by its own lane.
 
     The class's tree (``parent``, ``first``: :func:`.tree_factor.walk_prelude`'s table) and each coordinate's factor
     coordinate ``node`` (the support masks' bit) are baked into constant memory. A contact unit of three rows (four
@@ -1024,12 +1370,16 @@ def support_rows_kernel(
 
     walk_one = walker(1, False)
     walk_unit = walker(unit_rows, records)
+    generate = generator_slots(parent, first, lanes) > 0
+
+    @wp.func_native(_generate_snippet(parent, first, node, unit_rows, records, torsion, lanes))
+    def support_generate(sink: SupportSink, unit: SupportUnit, eligible: int) -> int:
+        """The batch's rows in generator form (:data:`_GENERATE`); 1 where this lane's unit was written."""
 
     def kernel(
         rows: DenseRows,
         sources: wp.array2d[int],
         counts: wp.array[int],
-        lanes: int,
         data: ContactInput,
         law: PatchRowLaw,
         sink: SupportSink,
@@ -1047,49 +1397,63 @@ def support_rows_kernel(
         world, lane = wp.tid()
         line = rows.first[world]
         count = wp.min(counts[world], sink.row_factor.shape[1])
-        for slot in range(lane, count, lanes):
-            source = sources[line, slot]
-            kind = source >> UNIT_SHIFT
-            index = source & ((1 << UNIT_SHIFT) - 1)
+        # Batches of a unit a lane: every lane of the group takes part in each batch's generators.
+        for batch in range((count + wp.static(lanes - 1)) // wp.static(lanes)):
+            slot = batch * wp.static(lanes) + lane
             unit = SupportUnit()
             unit.line = line
             unit.slot = slot
             unit.rows = 1
+            unit.art_a = -1
             unit.art_b = -1
             unit.body_a = -1
             unit.body_b = -1
             unit.dof0 = -1
             unit.dof1 = -1
-            if kind == UNIT_CONTACT:
-                c = index // 4
-                if index - 4 * c != 0:
-                    continue  # the unit's first row's lane writes it
-                unit.rows = wp.min(data.slots_needed[c], wp.static(unit_rows))
-                body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
-                unit.art_a = data.art0[c]
-                unit.body_a = body_a
-                unit.art_b = data.art1[c]
-                unit.body_b = body_b
-                unit.frame = wp.matrix_from_rows(normal, tangent0, tangent1)
-                unit.point = point
-                unit.friction_point = friction_point
-            elif kind == UNIT_LIMIT or kind == UNIT_VELOCITY or kind == UNIT_MIMIC:
-                unit.art_a = rows.sides[line, slot][0]
-                unit.dof0 = index // 2
-                unit.value0 = 1.0 - 2.0 * float(index - 2 * unit.dof0)
-                if kind == UNIT_VELOCITY:
-                    unit.value0 = velocity_limit_sign[index]
-                if kind == UNIT_MIMIC:
-                    unit.dof0 = mimic_dof0[index]
-                    unit.value0 = 1.0
-                    unit.dof1 = mimic_dof1[index]
-                    unit.value1 = -mimic_coef1[index]
-            else:
-                continue
-            if unit.rows == 1:
-                walk_one(sink, unit)
-            else:
-                walk_unit(sink, unit)
+            valid = 0
+            contact = 0
+            if slot < count:
+                source = sources[line, slot]
+                kind = source >> UNIT_SHIFT
+                index = source & ((1 << UNIT_SHIFT) - 1)
+                if kind == UNIT_CONTACT:
+                    c = index // 4
+                    # The unit's first row's lane writes it.
+                    if index - 4 * c == 0:
+                        unit.rows = wp.min(data.slots_needed[c], wp.static(unit_rows))
+                        body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(
+                            data, law, c
+                        )
+                        unit.art_a = data.art0[c]
+                        unit.body_a = body_a
+                        unit.art_b = data.art1[c]
+                        unit.body_b = body_b
+                        unit.frame = wp.matrix_from_rows(normal, tangent0, tangent1)
+                        unit.point = point
+                        unit.friction_point = friction_point
+                        valid = 1
+                        contact = 1
+                elif kind == UNIT_LIMIT or kind == UNIT_VELOCITY or kind == UNIT_MIMIC:
+                    unit.art_a = rows.sides[line, slot][0]
+                    unit.dof0 = index // 2
+                    unit.value0 = 1.0 - 2.0 * float(index - 2 * unit.dof0)
+                    if kind == UNIT_VELOCITY:
+                        unit.value0 = velocity_limit_sign[index]
+                    if kind == UNIT_MIMIC:
+                        unit.dof0 = mimic_dof0[index]
+                        unit.value0 = 1.0
+                        unit.dof1 = mimic_dof1[index]
+                        unit.value1 = -mimic_coef1[index]
+                    valid = 1
+            generated = 0
+            if wp.static(generate):
+                generated = support_generate(sink, unit, contact)
+            if valid != 0:
+                if generated == 0:
+                    if unit.rows == 1:
+                        walk_one(sink, unit)
+                    else:
+                        walk_unit(sink, unit)
                 if wp.static(records and not torsion):
                     if unit.rows == 3:
                         # The friction pair's metric of the diagonals as written, which the triplet sweeps reuse.
@@ -1102,15 +1466,15 @@ def support_rows_kernel(
                         sink.records[line, k, 5] = smallest
                         sink.records[line, k, 6] = axis[0]
                         sink.records[line, k, 7] = axis[1]
-            for r in range(unit.rows):
-                incident = sink.row_incident[line, slot + r]
-                row_bias(
-                    rows, line, slot + r, incident, dt, contact_speculative_scale, contact_w,
-                    restitution_velocity_threshold, weighted, material,
-                )  # fmt: skip
+                for r in range(unit.rows):
+                    incident = sink.row_incident[line, slot + r]
+                    row_bias(
+                        rows, line, slot + r, incident, dt, contact_speculative_scale, contact_w,
+                        restitution_velocity_threshold, weighted, material,
+                    )  # fmt: skip
 
     name = f"support_rows_{len(node)}_{abs(hash((parent, first, node))) % (1 << 32):08x}"
-    name += ("_records" if records else "") + ("_torsion" if torsion else "")
+    name += ("_records" if records else "") + ("_torsion" if torsion else "") + f"_{lanes}"
     # Two blocks of 256 a multiprocessor within the register file (128 registers): the four-row walker holds 166
     # unbounded, and the bound costs it 16 B of stack (sm_120, ptxas).
     return python_kernel(kernel, name, launch_bounds=(256, 2))
