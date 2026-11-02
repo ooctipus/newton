@@ -759,6 +759,46 @@ def checked(result: dict) -> bool:
     return result["general"] + result["in_kernel"] > 0
 
 
+def two_schedules(device, bodies: int, rng) -> dict:
+    """One refresh of a random tree (its joins included) by both schedules of walk_step_kernel's refresh, the lane
+    feed's batches and a thread a tree with the tree's class compiled in: each against the float64 walk (worst
+    relative error of ``s``, ``ut``, ``1/ell`` and ``P0``) and against each other."""
+    model, q = random_tree(rng, bodies, device)
+    model.joint_q.assign(q)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        solver = SolverFeatherPGS(model, pgs_iterations=4)
+    state = model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+    factor = solver.factor
+    if factor.walk_arts is None:
+        factor.plan_walk(np.arange(model.articulation_count, dtype=np.int32))
+    factor.mass_update_mask.fill_(1)
+    walk = factor.walk(q, 0)
+    n = walk.s.shape[0]
+    pivots = walk.own_pivots + factor.armature[:n]
+    data = {}
+    for thread in (False, True):
+        factor.walk_thread = thread
+        factor.walk_step(state)
+        data[thread] = factor.walk_data.numpy()[:n].astype(np.float64)
+
+    def error(d):
+        return max(
+            np.abs(d[:, 0:6] - walk.s).max(),
+            np.abs(d[:, 6:12] - walk.ut).max() / max(np.abs(walk.ut).max(), 1.0e-30),
+            np.abs(1.0 / d[:, 12] - walk.ell).max() / max(walk.ell.max(), 1.0e-30),
+            np.abs(d[:, 13] - pivots).max() / max(np.abs(walk.own_pivots).max(), 1.0e-30),
+        )
+
+    scale = max(np.abs(data[False][:, 6:14]).max(), 1.0e-30)
+    return {
+        "feed": error(data[False]),
+        "thread": error(data[True]),
+        "between": np.abs(data[False][:, 6:14] - data[True][:, 6:14]).max() / scale,
+    }
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------------------------------------------------
@@ -817,6 +857,18 @@ class TestWalkDevice(unittest.TestCase):
                 result = placement_frames(solver, joint_q, capture)
                 for name in ("rows", "frame", "tight", "leave", "kernel"):
                     self.assertLessEqual(result[name], BOUND, f"{name}: {result}")
+
+    def test_the_refresh_schedules_agree(self):
+        """walk_step_kernel's refresh by the lane feed and by a thread a tree with the class compiled in (both picked
+        by walk_schedule from data): each within float32 rounding of the float64 walk, and of each other, on random
+        trees with joins."""
+        for device in devices():
+            for bodies in (3, 8, 14):
+                with self.subTest(device=device, bodies=bodies):
+                    result = two_schedules(device, bodies, np.random.default_rng(bodies))
+                    self.assertLess(result["feed"], 1.0e-4, f"{result}")
+                    self.assertLess(result["thread"], 1.0e-4, f"{result}")
+                    self.assertLess(result["between"], 1.0e-4, f"{result}")
 
     def test_the_class_emitter_walks_both_ways(self):
         """The class emitter's walk root first and leaf first, unrolled and in the loop form, on trees with joins and
