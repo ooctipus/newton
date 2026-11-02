@@ -2131,8 +2131,9 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
     // lane and hands its b, a, g and the coordinate's new pivot to the later lanes, and each later slip on the
     // coordinate applies R_k's step to its column with its pair state (R_k meets a column only where both paths hold
     // the coordinate: from their meeting point). Every value is a register: the columns, the pivots (one a coordinate),
-    // the pair states; nothing of the release is read back. Each value's operations and their order are the serial
-    // text's (BORDER_COLUMN, BORDER_GROUP), so the stored release (WalkRelease) is the same. Returns the slips.
+    // the pair states; nothing of the release is read back. The column and R_k's steps are the serial text's
+    // (BORDER_COLUMN, BORDER_GROUP); the recurrence takes one rsqrt of each new pivot and multiplies where the serial
+    // text takes two square roots and two divides (rounding). Returns the slips.
     const auto HELD_BUILD = [&](const WalkHold& h, const int a, const int n, const int nb, const float* data,
                                 const float* released, const float* kept) -> int {
         auto& release = walk.release;
@@ -2188,22 +2189,27 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
                     for (int q = 0; q < 6; ++q) p[q] -= d[6 + q] * z;
                     root = c;
                 }
-                float pivot = 1.0f / (d[12] * d[12]);
+                // The coordinate's pivot and its square root (1/ell: the record's d[12] is 1/sqrt(P)), each slip's
+                // step taking one rsqrt of its new pivot for the rest.
+                float pivot = 1.0f / (d[12] * d[12]), root = 1.0f / d[12];
                 #pragma unroll
                 for (int k = 0; k < $SLIPS; ++k) {
+                    if (k >= slips) break;
                     if (!((slipping >> k) & 1u)) continue;
-                    float bk = 0.0f, ak = 0.0f, gk = 0.0f, dk = 0.0f;
+                    float bk = 0.0f, ak = 0.0f, gk = 0.0f, dk = 0.0f, rk = 0.0f;
                     if (lane == k) {
-                        const float dd = pivot, scale = sqrtf(dd);
+                        const float dd = pivot, scale = root;
                         float dbar = dd + alpha * (z * scale) * (z * scale);
                         if (c == i) dbar = pivot0 + keep;
                         if (!(dbar > 0.0f) || !wp::isfinite(dbar)) FRAME_STATUS(2);
-                        const float beta = alpha * z * scale / dbar;
-                        alpha = alpha * dd / dbar;
+                        const float r = rsqrtf(dbar), inverse = r * r;
+                        const float beta = alpha * z * scale * inverse;
+                        alpha = alpha * dd * inverse;
                         bk = z;
                         ak = beta * scale;
-                        gk = scale / sqrtf(dbar);
+                        gk = scale * r;
                         dk = dbar;
+                        rk = dbar * r;
                         if (t < depth) {
                             release.coordinate.data[at + t] = c;
                             release.b.data[at + t] = bk;
@@ -2216,6 +2222,7 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
                     ak = READ(ak, k);
                     gk = READ(gk, k);
                     pivot = READ(dk, k);
+                    root = READ(rk, k);
                     if (on && lane > k) {
                         const float x = z - bk * pair[k];
                         pair[k] += ak * x;
@@ -2480,14 +2487,8 @@ def border_solve(layout: TreeLayout, classes: tuple) -> str:
     )
     held_step = (
         "        if((moved&{bit})&&lane<WIDTH) {{{head}" + nb + hold + "\n"
-        "            const int cap=walk.release.dof.shape[1],depth=walk.release.b.shape[2];\n"
-        # The built release into L1 in one parallel trip, so R and R^T read it there.
-        "            {{const size_t base=(size_t)a*cap*depth;const int bytes=4*slips{r}*depth;"
-        "BORDER_FETCH(walk.release.coordinate.data+base,bytes,lane,WIDTH);"
-        "BORDER_FETCH(walk.release.b.data+base,bytes,lane,WIDTH);"
-        "BORDER_FETCH(walk.release.a.data+base,bytes,lane,WIDTH);"
-        "BORDER_FETCH(walk.release.g.data+base,bytes,lane,WIDTH);}}\n"
         "            HELD_UP(h,n,nb,s+$SIX_BODIES+{offset},s+$WHITE+{offset},s);\n"
+        "            const int cap=walk.release.dof.shape[1],depth=walk.release.b.shape[2];\n"
         "            for(int j=0;j<slips{r};++j)HELD_RELEASE(((size_t)a*cap+j)*depth,s+$WHITE+{offset},false);\n"
         "            for(int j=slips{r}-1;j>=0;--j)HELD_RELEASE(((size_t)a*cap+j)*depth,s+$WHITE+{offset},true);\n"
         "            HELD_DOWN(h,n,nb,s+$WHITE+{offset},s+$WHITE+{offset},s);\n"
