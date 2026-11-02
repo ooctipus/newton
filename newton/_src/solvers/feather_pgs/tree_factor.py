@@ -960,9 +960,21 @@ class TreeFactor:
         self.walk_class = wp.array(walk_class, dtype=wp.int32, device=device)
         # A tree's group in the step's walk kernel (walk_step_kernel, walk_group): on CUDA a lane a body of a batch of
         # the inward pass and a join slot; one thread a tree on the CPU.
-        walked = int(np.count_nonzero(free[arts] == 0)) if forest.is_free_rigid is not None else int(arts.size)
+        walked = int(arts.size)
         self.walk_lanes = walk_group(bodies, held, walked, device.sm_count) if device.is_cuda else 1
         self.walk_block = WALK_BLOCK
+        # The trees' classes (their topology): a thread a tree with the class compiled in where the classes' data
+        # choose it (walk_schedule), else the lane feed's batches.
+        classes: dict[WalkClass, int] = {}
+        walk_class = np.zeros(max(int(model.articulation_count), 1), dtype=np.int32)
+        for art in arts.tolist():
+            j0, j1 = int(start[art]), int(end[art])
+            first = tuple(int(path[j, 1]) for j in range(j0, j1)) + (int(qd_start[j1] - qd_start[j0]),)
+            key = WalkClass(tuple(int(path[j, 0]) for j in range(j0, j1)), first)
+            walk_class[art] = classes.setdefault(key, len(classes))
+        self.walk_classes = tuple(classes)
+        self.walk_class = wp.array(walk_class, dtype=wp.int32, device=device)
+        self.walk_thread = device.is_cuda and walk_schedule(self.walk_classes, walked, device.sm_count)
         self.walk_path = wp.array(path, dtype=wp.vec2i, device=device)
         self.walk_joins = wp.array(joins, dtype=wp.int32, device=device)
         # Each joint's parent body (-1 at a root): the step's geometry reads its pose in one load.
@@ -1072,6 +1084,39 @@ class TreeFactor:
         if self.walk_arts is None:
             return
         model = self.model
+        if self.walk_thread:
+            wp.launch(
+                walk_step_class_kernel(self.walk_classes),
+                dim=self.walk_arts.shape[0],
+                inputs=[
+                    self.walk_arts,
+                    self.walk_class,
+                    self.mass_update_mask,
+                    model.articulation_start,
+                    self.forest.articulation_joint_end,
+                    self.walk_path,
+                    self.walk_parent_body,
+                    model.joint_type,
+                    model.joint_dof_dim,
+                    model.joint_child,
+                    model.joint_q_start,
+                    model.joint_qd_start,
+                    model.joint_X_p,
+                    model.joint_axis,
+                    state.joint_q,
+                    state.body_q,
+                    model.body_mass,
+                    model.body_com,
+                    model.body_inertia,
+                    self.walk_armature,
+                    self.drive_row_by_dof,
+                    self.aug_row_K if self.parallel_drives else self._arrays.placeholder(wp.float32),
+                ],
+                outputs=[self.walk_now, self.walk_now_link, self.walk_data, self.walk_link],
+                block_dim=WALK_BLOCK,
+                device=model.device,
+            )
+            return
         lanes = self.walk_lanes
         wp.launch(
             walk_step_kernel,
@@ -2400,7 +2445,7 @@ def walk_group(bodies: int, joins: int, trees: int, sms: int) -> int:
     Args:
         bodies: The most bodies of one of the class's walked trees.
         joins: The most joins one of its trees holds at once (:meth:`TreeFactor.plan_walk`).
-        trees: The class's walked trees (the free rigid bodies take the geometry only).
+        trees: The trees the launch walks.
         sms: The device's multiprocessors.
     """
     fit = max(sms * WALK_RESIDENT // max(trees, 1), 1)
@@ -2412,6 +2457,33 @@ def walk_group(bodies: int, joins: int, trees: int, sms: int) -> int:
         lanes *= 2
     return lanes
 
+
+def walk_schedule(classes: tuple[WalkClass, ...], trees: int, sms: int) -> bool:
+    """Whether the refresh runs a thread a tree with each class's topology compiled in (WM's A7r) rather than the lane
+    feed's batches, from the classes' data: every class small enough that one thread's walk (its coordinates in
+    straight-line code) is shorter than the group's batches, against the trees in flight, the device at least full
+    at one lane a tree.
+
+    Args:
+        classes: The walking classes.
+        trees: The trees the launch walks.
+        sms: The device's multiprocessors.
+    """
+    if not classes or len(classes) > WALK_THREAD_CLASSES:
+        return False
+    if trees < sms * WALK_RESIDENT // WALK_THREAD_FILL:
+        return False
+    return max(walk.coordinates for walk in classes) <= WALK_THREAD_COORDINATES
+
+
+WALK_THREAD_COORDINATES = 22
+"""The most coordinates of a class whose refresh runs a thread a tree (WM §2: A7r wins up to about 22 on the PRO)."""
+
+WALK_THREAD_CLASSES = 4
+"""The most classes one thread-a-tree launch compiles in (a switch over them)."""
+
+WALK_THREAD_FILL = 4
+"""The fraction of the device's resident threads a thread-a-tree launch fills at least (one lane a tree)."""
 
 WALK_RESIDENT = 512
 """Threads of :func:`walk_step_kernel` one multiprocessor holds: its 125-127 registers (``kernel_sass``, sm_120 and
@@ -2451,18 +2523,17 @@ def _walk_column(walk_now: wp.array2d[float], dof: int, column: wp.spatial_vecto
         walk_now[dof, k] = column[k]
 
 
-_INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, by the tree's lane group (TreeWalk's, on the factor's
-    // diagonal), after walk_step_kernel's geometry left each coordinate's column in now and each body's link and frame
-    // point in now_link: on a refresh they become the factor's frames. The lane feed (FEED, leaves to root) hands the chain one body at a time: a
-    // lane builds each body of a batch (its spatial inertia at its frame, from the body's pose, centre of mass, mass and
-    // inertia; its link offset, its path entry, its join slots and its last coordinate's record), so the chain's state
-    // (the articulated inertia h, symmetric: A 6, B 9, D 6) lives in registers. Per coordinate: Is = h s, own = s . Is,
-    // 1/ell = (own + R + K)^-1/2, ut = Is / ell, P0 = own + R, h -= ut ut^T. Per body: h lifted to its parent's frame,
-    // [A, A X + B; ., D - X (A X + B) + B^T X] with X the skew of d (the parent's frame less the body's), carried when
-    // the parent is the next joint inward, else added into the parent's join slot (joins[parent], a lane's registers
-    // on CUDA) until the chain reaches it. The outputs leave whole: each body's link row (its lane, in the batch) and
-    // each coordinate's record (s, ut, 1/ell, P0, R, R + K: four float4, one lane), each written once.
-    SYNC();
+_REFRESH = """    // The refresh's arithmetic on one tree, float32 (TreeWalk's inward pass, on the factor's diagonal), after
+    // walk_step_kernel's geometry left each coordinate's column in now and each body's link and frame point in
+    // now_link: on a refresh they become the factor's frames. A schedule (the lane feed's batches, or a thread a tree
+    // with the class's topology compiled in) runs it leaf first; the chain's state is the articulated inertia h,
+    // symmetric (A 00 01 02 11 12 22, B row-major 3x3, D 00 01 02 11 12 22), in registers.
+    //   BODY(j, r): body j's inertia at its frame [m 1, -m X; m X, R I R^T - m X X] (X the skew of c, its centre of
+    //     mass less its frame) as words m, m c, rot, and its link offset d; its link row becomes the factor's.
+    //   ADD(h, r): h += body r's inertia.
+    //   STEP(h, s, c): coordinate c of column s (s 6, R, R + K): Is = h s, own = s . Is, 1/ell = (own + R + K)^-1/2,
+    //     ut = Is / ell, P0 = own + R, h -= ut ut^T; its record (s, ut, 1/ell, P0, R, R + K) leaves whole, once.
+    //   LIFT(h, d): h to the parent's frame, [A, A X + B; ., D - X (A X + B) + B^T X], X the skew of d.
     const float* Lk = now_link.data;
     const float* Nw = now.data;
     float* Lo = link.data;
@@ -2470,6 +2541,18 @@ _INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, 
     const float* Ra = armature.data;
     const int* Dr = drive_row_by_dof.data;
     const float* Kr = row_K.data;
+    const int* Ct = joint_child.data;
+    const float* Qb = reinterpret_cast<const float*>(body_q.data);
+    const float* Cb = reinterpret_cast<const float*>(body_com.data);
+    const float* Mb = body_mass.data;
+    const float* Ib = reinterpret_cast<const float*>(body_inertia.data);
+#if defined(__CUDA_ARCH__)
+    const auto PREFETCH = [](const void* p) { asm volatile("prefetch.global.L1 [%0];" ::"l"(p)); };
+#else
+    const auto PREFETCH = [](const void* p) {};
+#endif
+    const auto SYM = [](int a, int b) -> int { return a <= b ? (a == 0 ? b : (a == 1 ? 2 + b : 5)) : (b == 0 ? a : (b == 1 ? 2 + a : 5)); };
+    enum { M = 0, MC = 1, ROT = 4, OFFSET = 10, INERTIA = 13 };
     // A coordinate's column at the step's poses and what the factor adds to its diagonal, R and R + K.
     const auto COLUMN = [&](int c, float* x) {
         for (int k = 0; k < 6; ++k) x[k] = Nw[$now * c + k];
@@ -2481,18 +2564,136 @@ _INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, 
         }
         x[7] = added;
     };
-    const int* Pt = reinterpret_cast<const int*>(path.data);
-    const int* Jt = joins.data;
-    const int* Ct = joint_child.data;
-    const float* Qb = reinterpret_cast<const float*>(body_q.data);
-    const float* Cb = reinterpret_cast<const float*>(body_com.data);
-    const float* Mb = body_mass.data;
-    const float* Ib = reinterpret_cast<const float*>(body_inertia.data);
+    // Every line one body's inertia and link read.
+    const auto AHEAD = [&](int j) {
+        const int b = Ct[j];
+        PREFETCH(Qb + 7 * b);
+        PREFETCH(Qb + 7 * b + 6);
+        PREFETCH(Cb + 3 * b);
+        PREFETCH(Cb + 3 * b + 2);
+        PREFETCH(Mb + b);
+        PREFETCH(Ib + 9 * b);
+        PREFETCH(Ib + 9 * b + 8);
+        PREFETCH(Lk + $link * j);
+    };
+    const auto BODY = [&](int j, float* r) {
+        const float* Lr = Lk + $link * j;
+        for (int k = 0; k < 3; ++k) r[OFFSET + k] = Lr[k];
 #if defined(__CUDA_ARCH__)
-    const auto PREFETCH = [](const void* p) { asm volatile("prefetch.global.L1 [%0];" ::"l"(p)); };
+        reinterpret_cast<float4*>(Lo + $link * j)[0] = reinterpret_cast<const float4*>(Lr)[0];
+        reinterpret_cast<float4*>(Lo + $link * j)[1] = reinterpret_cast<const float4*>(Lr)[1];
+#else
+        for (int k = 0; k < $link; ++k) Lo[$link * j + k] = Lr[k];
+#endif
+        const int b = Ct[j];
+        const float* q = Qb + 7 * b;
+        const float* com = Cb + 3 * b;
+        const float* I = Ib + 9 * b;
+        const float m = Mb[b];
+        // The body's rotation and its centre of mass less its frame, c.
+        const float x = q[3], y = q[4], z = q[5], w = q[6];
+        const float R[3][3] = {
+            {1.0f - 2.0f * (y * y + z * z), 2.0f * (x * y - z * w), 2.0f * (x * z + y * w)},
+            {2.0f * (x * y + z * w), 1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z - x * w)},
+            {2.0f * (x * z - y * w), 2.0f * (y * z + x * w), 1.0f - 2.0f * (x * x + y * y)}};
+        float c[3], mc[3];
+        for (int a = 0; a < 3; ++a)
+            c[a] = (q[a] + (R[a][0] * com[0] + R[a][1] * com[1] + R[a][2] * com[2])) - Lr[$frame + a];
+        for (int a = 0; a < 3; ++a) mc[a] = m * c[a];
+        // R I R^T - m X X, X the skew of c: -m X X = m (|c|^2 1 - c c^T).
+        float RI[3][3];
+        for (int a = 0; a < 3; ++a)
+            for (int e = 0; e < 3; ++e) RI[a][e] = R[a][0] * I[e] + R[a][1] * I[3 + e] + R[a][2] * I[6 + e];
+        const float cc = c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
+        r[M] = m;
+        for (int a = 0; a < 3; ++a) r[MC + a] = mc[a];
+        for (int a = 0; a < 3; ++a)
+            for (int e = a; e < 3; ++e)
+                r[ROT + SYM(a, e)] = (RI[a][0] * R[e][0] + RI[a][1] * R[e][1] + RI[a][2] * R[e][2]) + mc[a] * -c[e] + (a == e ? m * cc : 0.0f);
+    };
+    // h = body + h (carrying) or h = body.
+    const auto ADD = [&](float* h, const float* r, bool carrying) {
+        const float bm = r[M];
+        const float* bc = r + MC;
+        const float* br = r + ROT;
+        const float body[21] = {bm, 0.0f, 0.0f, bm, 0.0f, bm,
+                                0.0f, bc[2], -bc[1], -bc[2], 0.0f, bc[0], bc[1], -bc[0], 0.0f,
+                                br[0], br[1], br[2], br[3], br[4], br[5]};
+        for (int k = 0; k < 21; ++k) h[k] = carrying ? body[k] + h[k] : body[k];
+    };
+    const auto STEP = [&](float* h, const float* s, int dof) {
+        const float* A = h;
+        const float* B = h + 6;
+        const float* D = h + 15;
+        float Is[6];
+        for (int a = 0; a < 3; ++a) {
+            Is[a] = (A[SYM(a, 0)] * s[0] + A[SYM(a, 1)] * s[1] + A[SYM(a, 2)] * s[2])
+                    + (B[3 * a] * s[3] + B[3 * a + 1] * s[4] + B[3 * a + 2] * s[5]);
+            Is[3 + a] = (B[a] * s[0] + B[3 + a] * s[1] + B[6 + a] * s[2])
+                        + (D[SYM(a, 0)] * s[3] + D[SYM(a, 1)] * s[4] + D[SYM(a, 2)] * s[5]);
+        }
+        const float own = (Is[0] * s[0] + Is[1] * s[1] + Is[2] * s[2]) + (Is[3] * s[3] + Is[4] * s[4] + Is[5] * s[5]);
+#if defined(__CUDA_ARCH__)
+        const float inv = rsqrtf(own + s[7]);
+#else
+        const float inv = 1.0f / sqrtf(own + s[7]);
+#endif
+        float ut[6];
+        for (int k = 0; k < 6; ++k) ut[k] = Is[k] * inv;
+        if (LANE == 0) {
+            float* o = Dt + $coordinate * dof;
+#if defined(__CUDA_ARCH__)
+            float4* o4 = reinterpret_cast<float4*>(o);
+            o4[0] = make_float4(s[0], s[1], s[2], s[3]);
+            o4[1] = make_float4(s[4], s[5], ut[0], ut[1]);
+            o4[2] = make_float4(ut[2], ut[3], ut[4], ut[5]);
+            o4[3] = make_float4(inv, own + s[6], s[6], s[7]);
+#else
+            for (int k = 0; k < 6; ++k) o[k] = s[k];
+            for (int k = 0; k < 6; ++k) o[6 + k] = ut[k];
+            o[12] = inv;
+            o[$pivot] = own + s[6];
+            o[$armature] = s[6];
+            o[$added] = s[7];
+#endif
+        }
+        // h -= ut ut^T
+        for (int a = 0; a < 3; ++a)
+            for (int e = a; e < 3; ++e) {
+                h[SYM(a, e)] -= ut[a] * ut[e];
+                h[15 + SYM(a, e)] -= ut[3 + a] * ut[3 + e];
+            }
+        for (int a = 0; a < 3; ++a)
+            for (int e = 0; e < 3; ++e) h[6 + 3 * a + e] -= ut[a] * ut[3 + e];
+    };
+    const auto LIFT = [&](float* h, const float* bd) {
+        // B' = B + A X, D' = D - X B' + B^T X (its symmetric part).
+        const float X[3][3] = {{0.0f, -bd[2], bd[1]}, {bd[2], 0.0f, -bd[0]}, {-bd[1], bd[0], 0.0f}};
+        float Bn[9];
+        for (int a = 0; a < 3; ++a)
+            for (int e = 0; e < 3; ++e)
+                Bn[3 * a + e] = h[6 + 3 * a + e] + (h[SYM(a, 0)] * X[0][e] + h[SYM(a, 1)] * X[1][e] + h[SYM(a, 2)] * X[2][e]);
+        for (int a = 0; a < 3; ++a)
+            for (int e = a; e < 3; ++e) {
+                const float xb = X[a][0] * Bn[e] + X[a][1] * Bn[3 + e] + X[a][2] * Bn[6 + e];
+                const float bx = h[6 + a] * X[0][e] + h[9 + a] * X[1][e] + h[12 + a] * X[2][e];
+                h[15 + SYM(a, e)] = (h[15 + SYM(a, e)] - xb) + bx;
+            }
+        for (int k = 0; k < 9; ++k) h[6 + k] = Bn[k];
+    };
+"""
+
+_INWARD = """    // The refresh by the tree's lane group (walk_group): the lane feed (FEED, leaves to root) hands the chain one body
+    // at a time; a lane builds each body of a batch (BODY, its path entry, its join slots and its last coordinate's
+    // column), every lane runs the chain on it, read by shuffle. A body's lifted inertia is carried when its parent is
+    // the next joint inward, else added into the parent's join slot (joins[parent], lane k's registers on CUDA, the
+    // CPU's one thread every slot) until the chain reaches it. On the CPU one thread is the group.
+    SYNC();
+""" + _REFRESH + """    const int* Pt = reinterpret_cast<const int*>(path.data);
+    const int* Jt = joins.data;
+#if defined(__CUDA_ARCH__)
     constexpr int HELD = 1;
 #else
-    const auto PREFETCH = [](const void* p) {};
     constexpr int HELD = $slots;
 #endif
     for (int c = dof0 + LANE; c < dof1; c += LANES) {
@@ -2500,38 +2701,26 @@ _INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, 
         PREFETCH(Ra + c);
         PREFETCH(Dr + c);
     }
-    // The join slots: lane k holds slot k on CUDA (HELD 1), the CPU's one thread every slot.
     float held[HELD][21];
     for (int s = 0; s < HELD; ++s)
         for (int k = 0; k < 21; ++k) held[s][k] = 0.0f;
     const auto OWNS = [&](int slot) -> bool { return HELD > 1 || LANE == slot; };
     const auto AT = [&](int slot) -> int { return HELD > 1 ? slot : 0; };
-    // h: A (00 01 02 11 12 22), B (row-major 3x3), D (00 01 02 11 12 22).
     float h[21];
     for (int k = 0; k < 21; ++k) h[k] = 0.0f;
     bool carrying = false;
-    const auto SYM = [](int a, int b) -> int { return a <= b ? (a == 0 ? b : (a == 1 ? 2 + b : 5)) : (b == 0 ? a : (b == 1 ? 2 + a : 5)); };
-    // A body as the feed hands it to the chain: m, m c (c its centre of mass less its frame), R I R^T - m X X (6), its
-    // link offset d (3), its last coordinate's record (s 6, R, R + K), and as bits its parent, coordinates [lo, hi),
-    // its own join slot and its parent's.
-    struct Body { float w[26]; };
-    enum { M = 0, MC = 1, ROT = 4, OFFSET = 10, RECORD = 13, UP = 21, LO = 22, HI = 23, SLOT = 24, INTO = 25 };
+    // A body as the feed hands it to the chain: BODY's words, its last coordinate's column (s 6, R, R + K), and as
+    // bits its parent, coordinates [lo, hi), its own join slot and its parent's.
+    struct Feed { float w[26]; };
+    enum { RECORD = INERTIA, UP = RECORD + 8, LO = UP + 1, HI = LO + 1, SLOT = HI + 1, INTO = SLOT + 1 };
     FEED(j0, j1 - 1, -1,
         [&](int j) {
-            const int b = Ct[j];
-            PREFETCH(Qb + 7 * b);
-            PREFETCH(Qb + 7 * b + 6);
-            PREFETCH(Cb + 3 * b);
-            PREFETCH(Cb + 3 * b + 2);
-            PREFETCH(Mb + b);
-            PREFETCH(Ib + 9 * b);
-            PREFETCH(Ib + 9 * b + 8);
-            PREFETCH(Lk + $link * j);
+            AHEAD(j);
             PREFETCH(Pt + 2 * j);
             PREFETCH(Jt + j);
         },
-        [&](int mine, bool valid) -> Body {
-            Body r;
+        [&](int mine, bool valid) -> Feed {
+            Feed r;
             for (int k = 0; k < 26; ++k) r.w[k] = 0.0f;
             int up = -1, lo = 0, hi = 0, slot = -1, into = -1;
             if (valid) {
@@ -2540,40 +2729,7 @@ _INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, 
                 hi = mine + 1 < j1 ? dof0 + Pt[2 * (mine + 1) + 1] : dof1;
                 slot = Jt[mine];
                 into = up >= 0 ? Jt[j0 + up] : -1;
-                const float* Lr = Lk + $link * mine;
-                for (int k = 0; k < 3; ++k) r.w[OFFSET + k] = Lr[k];
-                // The body's link row becomes the factor's.
-#if defined(__CUDA_ARCH__)
-                reinterpret_cast<float4*>(Lo + $link * mine)[0] = reinterpret_cast<const float4*>(Lr)[0];
-                reinterpret_cast<float4*>(Lo + $link * mine)[1] = reinterpret_cast<const float4*>(Lr)[1];
-#else
-                for (int k = 0; k < $link; ++k) Lo[$link * mine + k] = Lr[k];
-#endif
-                const int b = Ct[mine];
-                const float* q = Qb + 7 * b;
-                const float* com = Cb + 3 * b;
-                const float* I = Ib + 9 * b;
-                const float m = Mb[b];
-                // The body's rotation and its centre of mass less its frame, c.
-                const float x = q[3], y = q[4], z = q[5], w = q[6];
-                const float R[3][3] = {
-                    {1.0f - 2.0f * (y * y + z * z), 2.0f * (x * y - z * w), 2.0f * (x * z + y * w)},
-                    {2.0f * (x * y + z * w), 1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z - x * w)},
-                    {2.0f * (x * z - y * w), 2.0f * (y * z + x * w), 1.0f - 2.0f * (x * x + y * y)}};
-                float c[3], mc[3];
-                for (int a = 0; a < 3; ++a)
-                    c[a] = (q[a] + (R[a][0] * com[0] + R[a][1] * com[1] + R[a][2] * com[2])) - Lr[$frame + a];
-                for (int a = 0; a < 3; ++a) mc[a] = m * c[a];
-                // R I R^T - m X X, X the skew of c: -m X X = m (|c|^2 1 - c c^T).
-                float RI[3][3];
-                for (int a = 0; a < 3; ++a)
-                    for (int e = 0; e < 3; ++e) RI[a][e] = R[a][0] * I[e] + R[a][1] * I[3 + e] + R[a][2] * I[6 + e];
-                const float cc = c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
-                r.w[M] = m;
-                for (int a = 0; a < 3; ++a) r.w[MC + a] = mc[a];
-                for (int a = 0; a < 3; ++a)
-                    for (int e = a; e < 3; ++e)
-                        r.w[ROT + SYM(a, e)] = (RI[a][0] * R[e][0] + RI[a][1] * R[e][1] + RI[a][2] * R[e][2]) + mc[a] * -c[e] + (a == e ? m * cc : 0.0f);
+                BODY(mine, r.w);
                 if (hi > lo) COLUMN(hi - 1, r.w + RECORD);
             }
             r.w[UP] = __int_as_float(up);
@@ -2583,90 +2739,28 @@ _INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, 
             r.w[INTO] = __int_as_float(into);
             return r;
         },
-        [&](int b, const Body& r) {
-            // The body's inertia at its frame: [m 1, -m X; m X, rot], X the skew of c.
-            const float bm = r.w[M];
-            const float* bc = r.w + MC;
-            const float* br = r.w + ROT;
-            const float* bd = r.w + OFFSET;
+        [&](int b, const Feed& r) {
             float s[8];
             for (int k = 0; k < 8; ++k) s[k] = r.w[RECORD + k];
             const int b_up = __float_as_int(r.w[UP]), b_lo = __float_as_int(r.w[LO]), b_hi = __float_as_int(r.w[HI]);
             const int b_slot = __float_as_int(r.w[SLOT]), b_into = __float_as_int(r.w[INTO]);
-            const float body[21] = {bm, 0.0f, 0.0f, bm, 0.0f, bm,
-                                    0.0f, bc[2], -bc[1], -bc[2], 0.0f, bc[0], bc[1], -bc[0], 0.0f,
-                                    br[0], br[1], br[2], br[3], br[4], br[5]};
-            for (int k = 0; k < 21; ++k) h[k] = carrying ? body[k] + h[k] : body[k];
+            ADD(h, r.w, carrying);
             if (b_slot >= 0) {
                 for (int k = 0; k < 21; ++k) h[k] += READ(held[AT(b_slot)][k], b_slot);
                 if (OWNS(b_slot))
                     for (int k = 0; k < 21; ++k) held[AT(b_slot)][k] = 0.0f;
             }
             for (int dof = b_hi - 1; dof >= b_lo; --dof) {
-                // The next coordinate's record, loaded before this one stores (a body with several coordinates).
+                // The next coordinate's column, loaded before this one stores (a body with several coordinates).
                 float next[8];
                 if (dof > b_lo) COLUMN(dof - 1, next);
-                const float* A = h;
-                const float* B = h + 6;
-                const float* D = h + 15;
-                float Is[6];
-                for (int a = 0; a < 3; ++a) {
-                    Is[a] = (A[SYM(a, 0)] * s[0] + A[SYM(a, 1)] * s[1] + A[SYM(a, 2)] * s[2])
-                            + (B[3 * a] * s[3] + B[3 * a + 1] * s[4] + B[3 * a + 2] * s[5]);
-                    Is[3 + a] = (B[a] * s[0] + B[3 + a] * s[1] + B[6 + a] * s[2])
-                                + (D[SYM(a, 0)] * s[3] + D[SYM(a, 1)] * s[4] + D[SYM(a, 2)] * s[5]);
-                }
-                const float own = (Is[0] * s[0] + Is[1] * s[1] + Is[2] * s[2]) + (Is[3] * s[3] + Is[4] * s[4] + Is[5] * s[5]);
-#if defined(__CUDA_ARCH__)
-                const float inv = rsqrtf(own + s[7]);
-#else
-                const float inv = 1.0f / sqrtf(own + s[7]);
-#endif
-                float ut[6];
-                for (int k = 0; k < 6; ++k) ut[k] = Is[k] * inv;
-                if (LANE == 0) {
-                    float* o = Dt + $coordinate * dof;
-#if defined(__CUDA_ARCH__)
-                    float4* o4 = reinterpret_cast<float4*>(o);
-                    o4[0] = make_float4(s[0], s[1], s[2], s[3]);
-                    o4[1] = make_float4(s[4], s[5], ut[0], ut[1]);
-                    o4[2] = make_float4(ut[2], ut[3], ut[4], ut[5]);
-                    o4[3] = make_float4(inv, own + s[6], s[6], s[7]);
-#else
-                    for (int k = 0; k < 6; ++k) o[k] = s[k];
-                    for (int k = 0; k < 6; ++k) o[6 + k] = ut[k];
-                    o[12] = inv;
-                    o[$pivot] = own + s[6];
-                    o[$armature] = s[6];
-                    o[$added] = s[7];
-#endif
-                }
-                // h -= ut ut^T
-                for (int a = 0; a < 3; ++a)
-                    for (int e = a; e < 3; ++e) {
-                        h[SYM(a, e)] -= ut[a] * ut[e];
-                        h[15 + SYM(a, e)] -= ut[3 + a] * ut[3 + e];
-                    }
-                for (int a = 0; a < 3; ++a)
-                    for (int e = 0; e < 3; ++e) h[6 + 3 * a + e] -= ut[a] * ut[3 + e];
+                STEP(h, s, dof);
                 if (dof > b_lo)
                     for (int k = 0; k < 8; ++k) s[k] = next[k];
             }
             carrying = false;
             if (b_up >= 0) {
-                // The lift: B' = B + A X, D' = D - X B' + B^T X (its symmetric part).
-                const float X[3][3] = {{0.0f, -bd[2], bd[1]}, {bd[2], 0.0f, -bd[0]}, {-bd[1], bd[0], 0.0f}};
-                float Bn[9];
-                for (int a = 0; a < 3; ++a)
-                    for (int e = 0; e < 3; ++e)
-                        Bn[3 * a + e] = h[6 + 3 * a + e] + (h[SYM(a, 0)] * X[0][e] + h[SYM(a, 1)] * X[1][e] + h[SYM(a, 2)] * X[2][e]);
-                for (int a = 0; a < 3; ++a)
-                    for (int e = a; e < 3; ++e) {
-                        const float xb = X[a][0] * Bn[e] + X[a][1] * Bn[3 + e] + X[a][2] * Bn[6 + e];
-                        const float bx = h[6 + a] * X[0][e] + h[9 + a] * X[1][e] + h[12 + a] * X[2][e];
-                        h[15 + SYM(a, e)] = (h[15 + SYM(a, e)] - xb) + bx;
-                    }
-                for (int k = 0; k < 9; ++k) h[6 + k] = Bn[k];
+                LIFT(h, r.w + OFFSET);
                 if (b_up == b - j0 - 1) {
                     carrying = true;
                 } else if (OWNS(b_into)) {
@@ -2674,6 +2768,43 @@ _INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, 
                 }
             }
         });
+"""
+
+_INWARD_CLASS_JOINT = """{
+    LIFT($V, body$b + OFFSET);
+    for (int k = 0; k < 21; ++k) $P[k] += $V[k];
+}"""
+_INWARD_CLASS_BEGIN = """float body$b[INERTIA];
+BODY(j0 + $b, body$b);
+ADD($V, body$b, true);"""
+_INWARD_CLASS_STEP = """{
+    float s[8];
+    COLUMN(dof0 + $c, s);
+    STEP($V, s, dof0 + $c);
+}"""
+
+
+def _walk_inward_class_text(classes: tuple[WalkClass, ...], cuda: bool) -> str:
+    """The refresh by a thread a tree with each class's topology compiled in (:meth:`WalkClass.walk`, leaf first):
+    each body's state an array of constant indices (registers), the lift into its parent's a register add."""
+    walks = [
+        walk.walk(_INWARD_CLASS_JOINT, _INWARD_CLASS_STEP, begin=_INWARD_CLASS_BEGIN, root_first=False, width=21,
+                  cuda=cuda)
+        for walk in classes
+    ]
+    cases = "\n".join(f"case {k}: {{\n{indent_text(text, 4)}\n    break;\n}}" for k, text in enumerate(walks))
+    return f"""    // The refresh by a thread a tree, the class's topology compiled in (WalkClass.walk, leaf first): every line the
+    // tree reads is prefetched first, then the class's straight-line walk runs BODY, ADD, STEP and LIFT with constant
+    // indices, each body's state in registers, a parent gathering its children's lifted inertias.
+    for (int j = j0; j < j1; ++j) AHEAD(j);
+    for (int c = dof0; c < dof1; ++c) {{
+        PREFETCH(Nw + $now * c);
+        PREFETCH(Ra + c);
+        PREFETCH(Dr + c);
+    }}
+    switch (cls) {{
+{indent_text(cases, 4)}
+    }}
 """
 
 
@@ -2740,16 +2871,14 @@ def walk_group_sync(lanes: int):
     ...
 
 
-@wp.kernel(enable_backward=False)
-def walk_step_kernel(
-    arts: wp.array[int],
+@wp.func
+def _walk_geometry(
+    j0: int,
+    j1: int,
+    lane: int,
     lanes: int,
-    mass_update_mask: wp.array[int],
-    articulation_start: wp.array[int],
-    articulation_joint_end: wp.array[int],
     walk_path: wp.array[wp.vec2i],
     walk_parent_body: wp.array[int],
-    walk_joins: wp.array[int],
     joint_type: wp.array[int],
     joint_dof_dim: wp.array2d[int],
     joint_child: wp.array[int],
@@ -2759,33 +2888,16 @@ def walk_step_kernel(
     joint_axis: wp.array[wp.vec3],
     joint_q: wp.array[float],
     body_q: wp.array[wp.transform],
-    body_mass: wp.array[float],
     body_com: wp.array[wp.vec3],
-    body_inertia: wp.array[wp.mat33],
-    armature: wp.array[float],
-    drive_row_by_dof: wp.array[int],
-    row_K: wp.array[float],
-    # outputs
     walk_now: wp.array2d[float],
     walk_now_link: wp.array2d[float],
-    walk_data: wp.array2d[float],
-    walk_link: wp.array2d[float],
 ):
-    """The walk's one launch a step, a group of ``lanes`` threads per held tree (:meth:`TreeFactor.walk_step`),
-    float32, at the poses ``body_q`` holds.
-
-    The step's geometry, the group striding over the tree's joints: each body's frame (its joint's anchor, a free
-    body's centre of mass), its coordinates' columns there in world axes, as :func:`local_frames` takes them (a free
-    joint turns about the articulation's origin, its first body's centre of mass; a D6 joint's turns about the pivot
-    its slides moved), and its link (:data:`WALK_LINK`'s layout: its parent's frame less its own, its frame's world
-    point). The rows' seeds enter the walk here. On a tree the refresh just factored (``mass_update_mask``), the same geometry becomes the factor's frames, with each coordinate's ``R`` and ``R + K``
-    (the diagonal the refresh's ``L`` holds, :meth:`TreeFactor.diagonal`), and the group runs the inward pass
-    (:func:`walk_inward`), which builds each body's spatial inertia itself, so the walk and ``L`` are one factor."""
-    tree, lane = wp.tid()
-    art = arts[tree]
-    j0 = articulation_start[art]
-    j1 = articulation_joint_end[art]
-    refresh = mass_update_mask[art] != 0
+    """The step's geometry of the tree of joints ``[j0, j1)`` by its group of ``lanes`` (this thread ``lane``),
+    striding over its joints: each body's frame (its joint's anchor, a free body's centre of mass), its coordinates'
+    columns there in world axes, as :func:`local_frames` takes them (a free joint turns about the articulation's
+    origin, its first body's centre of mass; a D6 joint's turns about the pivot its slides moved), and its link
+    (:data:`WALK_LINK`'s layout: its parent's frame less its own, its frame's world point), into ``now`` and
+    ``now_link``. The rows' seeds enter the walk here."""
     for j in range(j0 + lane, j1, lanes):
         X = _walk_frame(j, walk_parent_body[j], joint_type, joint_child, joint_X_p, body_q, body_com)
         R_a = wp.transform_get_rotation(X)
@@ -2850,7 +2962,52 @@ def walk_step_kernel(
             )
         for k in range(3):
             walk_now_link[j, k] = offset[k]
-    if refresh:
+
+
+@wp.kernel(enable_backward=False)
+def walk_step_kernel(
+    arts: wp.array[int],
+    lanes: int,
+    mass_update_mask: wp.array[int],
+    articulation_start: wp.array[int],
+    articulation_joint_end: wp.array[int],
+    walk_path: wp.array[wp.vec2i],
+    walk_parent_body: wp.array[int],
+    walk_joins: wp.array[int],
+    joint_type: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    joint_child: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_q: wp.array[float],
+    body_q: wp.array[wp.transform],
+    body_mass: wp.array[float],
+    body_com: wp.array[wp.vec3],
+    body_inertia: wp.array[wp.mat33],
+    armature: wp.array[float],
+    drive_row_by_dof: wp.array[int],
+    row_K: wp.array[float],
+    # outputs
+    walk_now: wp.array2d[float],
+    walk_now_link: wp.array2d[float],
+    walk_data: wp.array2d[float],
+    walk_link: wp.array2d[float],
+):
+    """The walk's one launch a step, a group of ``lanes`` threads per tree (:meth:`TreeFactor.walk_step`), float32,
+    at the poses ``body_q`` holds: the step's geometry (:func:`_walk_geometry`); on a tree the refresh just factored
+    (``mass_update_mask``) the same geometry becomes the factor's frames, and the group runs the refresh
+    (:func:`walk_inward`, the lane feed's batches), so the walk and ``L`` are one factor."""
+    tree, lane = wp.tid()
+    art = arts[tree]
+    j0 = articulation_start[art]
+    j1 = articulation_joint_end[art]
+    _walk_geometry(
+        j0, j1, lane, lanes, walk_path, walk_parent_body, joint_type, joint_dof_dim, joint_child, joint_q_start,
+        joint_qd_start, joint_X_p, joint_axis, joint_q, body_q, body_com, walk_now, walk_now_link,
+    )
+    if mass_update_mask[art] != 0:
         walk_inward(
             lanes,
             j0,
@@ -2872,3 +3029,110 @@ def walk_step_kernel(
             walk_link,
             walk_data,
         )
+
+
+@functools.cache
+def walk_step_class_kernel(classes: tuple[WalkClass, ...]) -> wp.Kernel:
+    """The walk's one launch a step for trees of ``classes`` by a thread a tree (WM's A7r): the step's geometry
+    (:func:`_walk_geometry`, the thread over its tree's joints) and, on a refresh, the refresh with each class's
+    topology compiled in (:func:`_walk_inward_class_text`): ``walk_class[art]`` indexes ``classes``. Chosen by
+    :func:`walk_schedule` from the classes' data."""
+    from .device_preludes import CPU_MATH, dual_native, lane_group  # noqa: PLC0415
+
+    tag = hashlib.sha256(repr(classes).encode()).hexdigest()[:8]
+    snippet = dual_native(
+        substitute(
+            _REFRESH + _walk_inward_class_text(classes, True),
+            coordinate=WALK_COORDINATE,
+            link=WALK_LINK,
+            now=WALK_NOW,
+            frame=WALK_FRAME,
+            pivot=WALK_PIVOT,
+            armature=WALK_ARMATURE,
+            added=WALK_ADDED,
+        ),
+        preludes=(lane_group(1), CPU_MATH),
+    )
+
+    def inward(
+        cls: int,
+        j0: int,
+        j1: int,
+        dof0: int,
+        dof1: int,
+        now: wp.array2d[float],
+        now_link: wp.array2d[float],
+        armature: wp.array[float],
+        drive_row_by_dof: wp.array[int],
+        row_K: wp.array[float],
+        joint_child: wp.array[int],
+        body_q: wp.array[wp.transform],
+        body_com: wp.array[wp.vec3],
+        body_mass: wp.array[float],
+        body_inertia: wp.array[wp.mat33],
+        link: wp.array2d[float],
+        data: wp.array2d[float],
+    ): ...
+
+    inward.__name__ = inward.__qualname__ = f"walk_inward_class_{tag}"
+    inward = wp.func_native(snippet)(inward)
+
+    def kernel(
+        arts: wp.array[int],
+        walk_class: wp.array[int],
+        mass_update_mask: wp.array[int],
+        articulation_start: wp.array[int],
+        articulation_joint_end: wp.array[int],
+        walk_path: wp.array[wp.vec2i],
+        walk_parent_body: wp.array[int],
+        joint_type: wp.array[int],
+        joint_dof_dim: wp.array2d[int],
+        joint_child: wp.array[int],
+        joint_q_start: wp.array[int],
+        joint_qd_start: wp.array[int],
+        joint_X_p: wp.array[wp.transform],
+        joint_axis: wp.array[wp.vec3],
+        joint_q: wp.array[float],
+        body_q: wp.array[wp.transform],
+        body_mass: wp.array[float],
+        body_com: wp.array[wp.vec3],
+        body_inertia: wp.array[wp.mat33],
+        armature: wp.array[float],
+        drive_row_by_dof: wp.array[int],
+        row_K: wp.array[float],
+        walk_now: wp.array2d[float],
+        walk_now_link: wp.array2d[float],
+        walk_data: wp.array2d[float],
+        walk_link: wp.array2d[float],
+    ):
+        tree = wp.tid()
+        art = arts[tree]
+        j0 = articulation_start[art]
+        j1 = articulation_joint_end[art]
+        _walk_geometry(
+            j0, j1, 0, 1, walk_path, walk_parent_body, joint_type, joint_dof_dim, joint_child, joint_q_start,
+            joint_qd_start, joint_X_p, joint_axis, joint_q, body_q, body_com, walk_now, walk_now_link,
+        )
+        if mass_update_mask[art] != 0:
+            inward(
+                walk_class[art],
+                j0,
+                j1,
+                joint_qd_start[j0],
+                joint_qd_start[j1],
+                walk_now,
+                walk_now_link,
+                armature,
+                drive_row_by_dof,
+                row_K,
+                joint_child,
+                body_q,
+                body_com,
+                body_mass,
+                body_inertia,
+                walk_link,
+                walk_data,
+            )
+
+    kernel.__name__ = kernel.__qualname__ = f"walk_step_class_{tag}"
+    return wp.kernel(enable_backward=False, module="unique")(kernel)
