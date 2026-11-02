@@ -642,12 +642,7 @@ $START_RESPONSE    for(int col=lane;col<$DOFS;col+=stride) {
     SYNC();
 #endif
 """
-_SOLVE = _FORCE_STAGE + _RESPONSE_STAGE
-"""A tree's solve, written twice in a predictor (:data:`_PREDICT`). A loop around one copy would be a back edge: it keeps
-every array it hoists in registers across the stages, from 72 to 134 on a dense tree, and occupancy pays for those
-registers in every world of every launch. Text the rare branch holds costs its code and no registers."""
-
-_PREDICT = r"""    $PHYSICAL_TABLE
+_FORCE_HALF = r"""    $PHYSICAL_TABLE
 
     const int art=p.group_to_art.data[group];
     const int ds=p.art_dof_start.data[art],js=p.art_joint_start.data[art];
@@ -686,22 +681,8 @@ $CLOCK0#if defined(__CUDA_ARCH__)
     SYNC();
 #endif
 $CLOCK1$REDUCE
-    $TRIAL
-$CLOCK4    if(moved!=0) {
-    $SATURATE
-    $BORDER
-    $SECOND_RESPONSE
-    }
-    // A prescribed (kinematic) free root keeps its given velocity: no transport.
-    $TRANSPORT_BLOCK
-$TWIST_BLOCK$CLOCK5"""
-
-
-_FORCE_HALF = (
-    _PREDICT[: _PREDICT.index("    $TRIAL")]
-    + r"""$FORCE_STAGE    for(int i=lane;i<$DOFS;i+=stride)trial.force.data[ds+i]=s[$SIX_BODIES+i];
+$FORCE_STAGE    for(int i=lane;i<$DOFS;i+=stride)trial.force.data[ds+i]=s[$SIX_BODIES+i];
 """
-)
 """The predictor's force half (Z4.2): the external wrenches' reduction and the force on each coordinate
 (:data:`_FORCE_STAGE`), stored to ``trial.force`` at its global coordinate for the walk's solve (:func:`get_walk_solve_kernel`),
 which answers in ``trial.response``."""
