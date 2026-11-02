@@ -888,6 +888,7 @@ class Sweep:
         self.paired_factor_secondary_groups_by_world = None
         self.paired_factor_primary_offsets_by_world = None
         self.paired_factor_secondary_offsets_by_world = None
+        self.paired_factor_primary_arts_by_world = None
         if self.paired_factor_coordinates:
             primary_arts = self.forest.group_to_art_host[response_pair[0]]
             secondary_arts = self.forest.group_to_art_host[response_pair[1]]
@@ -895,6 +896,8 @@ class Sweep:
             secondary_groups = np.empty(self.forest.world_count, dtype=np.int32)
             primary_offsets = np.empty(self.forest.world_count, dtype=np.int32)
             secondary_offsets = np.empty(self.forest.world_count, dtype=np.int32)
+            # Each world's articulation: where the paired components' check reads its walk (paired_components).
+            primary_by_world = np.full(self.forest.world_count, -1, dtype=np.int32)
             articulation_world = self.forest.articulation_world
             articulation_dof_start = self.forest.articulation_dof_start_host
             for primary_group, primary_art in enumerate(primary_arts):
@@ -903,6 +906,7 @@ class Sweep:
                 secondary_art = int(secondary_arts[secondary_group])
                 primary_groups[world] = primary_group
                 secondary_groups[world] = secondary_group
+                primary_by_world[world] = int(primary_art)
                 primary_first = articulation_dof_start[primary_art] < articulation_dof_start[secondary_art]
                 primary_offsets[world] = 0 if primary_first else response_pair[1]
                 secondary_offsets[world] = response_pair[0] if primary_first else 0
@@ -914,6 +918,7 @@ class Sweep:
             self.paired_factor_secondary_offsets_by_world = wp.array(
                 secondary_offsets, dtype=wp.int32, device=model.device
             )
+            self.paired_factor_primary_arts_by_world = wp.array(primary_by_world, dtype=wp.int32, device=model.device)
 
     def plan_tier_rows(self) -> None:
         """Choose the Jacobi tiers from the class (case K4): their row bound and their in-kernel response.
