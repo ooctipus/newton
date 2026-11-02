@@ -44,6 +44,11 @@ PUBLICATION = (
     # column at its joint's frame, each joint's link offset and frame point (tree_factor.WALK_LINK floats).
     Field("walk_now", wp.spatial_vector, ("dof",), owner="factor"),
     Field("walk_now_link", wp.float32, ("joint", "link"), owner="factor"),
+    # The drives' K-free mass, ``H_ii + R_ii`` (tree_kinetic_state.SATURATE_DRIVES), which the collection writes where it
+    # forms ``H_ii``: each coordinate's drive row (-1: none), the rows' masses and each coordinate's armature ``R``.
+    Field("drive_row", wp.int32, ("dof",), owner="factor", attr="drive_row_by_dof"),
+    Field("row_H", wp.float32, ("drive_row",), owner="factor", attr="aug_row_H"),
+    Field("armature", wp.float32, ("dof",), owner="factor", attr="dof_armature"),
     Field("body_v_s", wp.spatial_vector, ("body",), owner="state_aug"),
     Field("body_a_s", wp.spatial_vector, ("body",), owner="state_aug"),
     Field("body_f_s", wp.spatial_vector, ("body",), owner="state_aug"),

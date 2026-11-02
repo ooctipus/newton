@@ -223,30 +223,6 @@ def compact_decline(solver, size, *, scalar) -> str | None:
     return None
 
 
-@wp.kernel(enable_backward=False)
-def _sparse_drive_mass(
-    group_to_art: wp.array[int],
-    dof_start: wp.array[int],
-    mask: wp.array[int],
-    diagonal: wp.array[int],
-    geometric: wp.array2d[float],
-    armature: wp.array2d[float],
-    drive_row: wp.array[int],
-    row_H: wp.array[float],
-    n: int,
-):
-    """Each drive's mass without ``K``, ``H_ii + R_ii`` (``row_H``), on a refresh: the decision's inertia
-    (:data:`.tree_kinetic_state.SATURATE_DRIVES`), which the sparse factor used to write as it assembled."""
-    element = wp.tid()
-    group, local = element // n, element % n
-    art = group_to_art[group]
-    if mask[art] == 0:
-        return
-    row = drive_row[dof_start[art] + local]
-    if row >= 0:
-        row_H[row] = geometric[group, diagonal[local]] + armature[group, local]
-
-
 class TreeSparseOperator:
     """Respond through the walk over the sparse class's pattern (its plan): the walk is the factor (Z4.3), refreshed by
     :meth:`.tree_factor.TreeFactor.walk_step`, so the group holds no factor array and refreshes nothing of its own."""
@@ -262,33 +238,11 @@ class TreeSparseOperator:
         # The walk has no factor status: a pivot that is not positive reaches the predictor as a non-finite response.
         self.data.valid = wp.ones(self.plan.group_to_art.size, dtype=int, device=device)
         self.data.status = wp.zeros(self.plan.group_to_art.size, dtype=int, device=device)
-        # Each physical coordinate's diagonal entry of the mass pattern, for the drives' K-free mass.
-        diagonal = np.zeros(mass.dof_count, np.int32)
-        for entry, (row, col) in enumerate(zip(mass.entry_rows, mass.columns, strict=True)):
-            if row == col:
-                diagonal[mass.permutation[row]] = entry
-        self.diagonal = wp.array(diagonal, dtype=wp.int32, device=device)
         self.kinetic_state = None
 
     def refresh(self, state_aug):
-        """The drives' K-free mass (``row_H``) on the trees the step refreshes; the walk's refresh is the factor's."""
-        s, n = self.solver, self.solver.placement.sparse_mass_matrix_size
-        wp.launch(
-            _sparse_drive_mass,
-            dim=s.forest.n_arts_by_size[n] * n,
-            inputs=[
-                s.forest.group_to_art[n],
-                s.forest.articulation_dof_start,
-                s.factor.mass_update_mask,
-                self.diagonal,
-                self.kinetic_state.geometric,
-                s.factor.R_by_size[n],
-                s.factor.drive_row_by_dof,
-                s.factor.aug_row_H,
-                n,
-            ],
-            device=s.model.device,
-        )
+        """Nothing to refresh: the walk's refresh is the factor's, and the drives' K-free mass (``row_H``) is the
+        finish's collection's, where it forms ``H_ii``."""
 
     def bind_response(self):
         """Nothing to bind: the predictor reads the walk."""

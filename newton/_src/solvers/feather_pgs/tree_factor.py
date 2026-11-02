@@ -170,6 +170,8 @@ class TreeFactor:
         self.kinematic_dof_mask_host = None
         self.armature = None
         self.armature_floor = None
+        # The effective armature by coordinate (scatter_armature): the walk's diagonal and the drives' K-free mass.
+        self.dof_armature = wp.zeros(max(1, int(model.joint_dof_count)), dtype=wp.float32, device=model.device)
         self.L_by_size: dict[int, wp.array] = {}
         self.R_by_size: dict[int, wp.array] = {}
         self.diagonal_inverse_mass = None
@@ -507,9 +509,9 @@ class TreeFactor:
                 getattr(self, f"{name}_by_size")[size] = array
 
     def scatter_armature(self) -> None:
-        """Copy the effective armature (DOF-ordered) to the size groups' R, and to the walk's where it is held."""
-        if self.walk_arts is not None:
-            self.walk_armature.assign(self.armature.astype(np.float32))
+        """Copy the effective armature (DOF-ordered) to the coordinates' (:attr:`dof_armature`) and the size groups' R."""
+        if self.armature is not None and self.armature.size:
+            self.dof_armature.assign(self.armature.astype(np.float32))
         if not self.forest.size_groups:
             return
 
@@ -973,9 +975,6 @@ class TreeFactor:
         self.walk_data = wp.zeros((dofs, WALK_COORDINATE), dtype=wp.float32, device=device)
         self.walk_link = wp.zeros((joints, WALK_LINK), dtype=wp.float32, device=device)
         self.walk_leave_twist = wp.zeros(joints, dtype=wp.spatial_vector, device=device)
-        self.walk_armature = wp.zeros(dofs, dtype=wp.float32, device=device)
-        if self.armature is not None and self.armature.size:
-            self.walk_armature.assign(self.armature.astype(np.float32))
         # The step's geometry, which the held tree's finish publishes with its motion columns (every step, no launch
         # of the walk's): each coordinate's column at its body's frame and each body's link there. A seed enters as J
         # there, and a refresh takes it as the factor's frames.
@@ -1097,7 +1096,7 @@ class TreeFactor:
                     model.body_mass,
                     model.body_com,
                     model.body_inertia,
-                    self.walk_armature,
+                    self.dof_armature,
                     self.drive_row_by_dof,
                     self.aug_row_K if self.parallel_drives else self._arrays.placeholder(wp.float32),
                     self.walk_now,
@@ -1126,7 +1125,7 @@ class TreeFactor:
                 model.body_mass,
                 model.body_com,
                 model.body_inertia,
-                self.walk_armature,
+                self.dof_armature,
                 self.drive_row_by_dof,
                 self.aug_row_K if self.parallel_drives else self._arrays.placeholder(wp.float32),
                 self.walk_now,
