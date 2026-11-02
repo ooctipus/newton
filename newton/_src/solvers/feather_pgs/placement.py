@@ -316,7 +316,7 @@ class Placement:
         if has_velocity_limit_rows and joint_velocity_limit_arr is None:
             has_velocity_limit_rows = False
         if not (has_position_limit_rows or has_velocity_limit_rows):
-            return 0
+            return int(np.max(per_world)) if per_world.size else 0
 
         joint_limit_lower = joint_limit_lower_arr.numpy() if has_position_limit_rows else None
         joint_limit_upper = joint_limit_upper_arr.numpy() if has_position_limit_rows else None

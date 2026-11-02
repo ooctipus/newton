@@ -1411,7 +1411,7 @@ class RowLaws:
         links = self.link_count > 0
         dummy_int, dummy_float = placement.dummy_is_free_rigid, placement.contact_row_eps_dummy.flatten()
         blocks = factor.block_capacity if factor.eliminates else 0
-        lanes = walk_rows.writer_lanes(placement.dense_max_constraints, model.device)
+        lanes = walk_rows.writer_lanes(placement.dense_internal_max_rows, placement.dense_max_constraints, model.device)
         inputs = [
             bind_dense_rows(placement),
             placement.row_support(),
@@ -1446,7 +1446,7 @@ class RowLaws:
             dim=(solver.forest.world_count, lanes),
             inputs=inputs,
             outputs=[placement.packed_Z, placement.row_incident],
-            block_dim=walk_rows.WRITER_THREADS if lanes <= 32 else lanes,
+            block_dim=walk_rows.WRITER_THREADS,
             device=model.device,
         )
 

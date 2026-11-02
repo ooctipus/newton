@@ -518,23 +518,26 @@ def block_row(source: int, mimic_blocks: int) -> int:
 
 @wp.func_native(dual_native("    SYNC();\n", preludes=(lane_group("lanes"),)))
 def world_sync(lanes: int):
-    """Synchronize this thread's world group of ``lanes`` lanes (a power of two up to 32 within a warp, or the whole
-    block; nothing on the CPU, where one thread runs the world)."""
+    """Synchronize this thread's world group of ``lanes`` lanes (a power of two up to 32, within a warp; nothing on the
+    CPU, where one thread runs the world)."""
 
 
-def writer_lanes(rows: int, device) -> int:
-    """A world's lane group in the one writer: its row capacity, up to a block, rounded to a power of two up to 32 or to
-    whole warps, so a world's lanes synchronize (:func:`world_sync`); one thread on the CPU."""
+def writer_lanes(rows: int, capacity: int, device) -> int:
+    """A world's lane group in the one writer: the smallest power of two at or above the rows its topology fixes
+    (``rows``: links, mimics and limits; contacts stride over it), at most the row capacity and a warp, so a world's
+    lanes synchronize within their warp (:func:`world_sync`); one thread on the CPU.
+
+    A world's release and closure run serially on one of its lanes, so lanes beyond its rows idle there. Measured
+    (FL33D, GB300, 4,096 worlds of 6 or 12 bilateral rows, or 6 limit rows with three slips): groups of 8 and 16 ran
+    the writer's phases 31-37% under the separate launches, groups of 32 and 64 (the capacity) at par to 42% over."""
     if not wp.get_device(device).is_cuda:
         return 1
-    lanes = max(min(int(rows), WRITER_THREADS), 1)
-    if lanes <= 32:
-        return 1 << (lanes - 1).bit_length()
-    return (lanes + 31) // 32 * 32
+    lanes = max(min(int(rows), int(capacity), 32), 1)
+    return 1 << (lanes - 1).bit_length()
 
 
 WRITER_THREADS = 256
-"""Threads of a block of the one writer: a block holds whole world groups of up to 32 lanes, or one world's group."""
+"""Threads of a block of the one writer: whole world groups of up to 32 lanes."""
 
 
 @cache
