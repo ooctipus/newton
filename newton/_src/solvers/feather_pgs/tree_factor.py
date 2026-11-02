@@ -1511,6 +1511,10 @@ WALK_LINK = 8
 WALK_PIVOT = 13
 """Where a coordinate's record holds its pivot without ``K`` (:data:`WALK_COORDINATE`)."""
 
+WALK_SLIP_BATCH = 8
+"""The steps of a slip's transposed release a walk loads together (``WALK_SLIP_BACK``: the leave's, the audit's): one
+global round trip a batch of its path, in place of one a step."""
+
 WALK_FRAME = 4
 """Where a body's record holds its frame's world point (:data:`WALK_LINK`), at the refresh's poses: the factor's
 inertias are taken there."""
@@ -1665,49 +1669,89 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
     // The slips' release of tree art (WalkRelease, written by the predictor's border; W9's verdict: R = L_F^-1 L_K,
     // tree-lower, so every row keeps its support). Slip j's steps along its root path, leaf first, start at
     // at = (art * cap + j) * steps of release.coordinate, .b, .a, .g; a coordinate of -1 ends the path.
+    // WALK_SLIP_ON(release, at, z, rows, stride, place): z <- R_j z on rows rows (at most $rows) of a footprint whose
+    // coordinate c sits at z[place(c) + r * stride] (place(c) < 0 where the footprint's support does not hold c: zero
+    // there, and every coordinate of the path below the support's is off it), leaf first, a step at a time: its
+    // readers are row kernels at their register line (the support writer, the local owners' packets), where a batch's
+    // registers cost more than its round trips save (measured, HANDOFF_ZW2 §3).
+    // The transposed forms (WALK_SLIP_BACK: the leave, a thread a tree, the audit) walk a slip's steps in batches of
+    // $batch: the batch's coordinates and coefficients loaded together, then its entries, then the recurrence in
+    // registers, then its stores. A path's coordinates are distinct, so no step's load waits on another step's store
+    // (one global round trip a batch, not a step).
     // WALK_SLIP(release, at, z, stride): z <- R_j z (coordinate c at z[c * stride]), leaf first.
     // WALK_SLIP_T(release, at, u): u <- R_j^T u, root first. WALK_SLIP_IT(release, at, u): u <- R_j^-T u, root first.
-    // WALK_RELEASE(release, art, z, stride): a row's footprints z <- R z, the first slip first.
+    // WALK_RELEASE_ON(release, art, z, rows, stride, place), WALK_RELEASE(release, art, z, stride): a row's footprints
+    // z <- R z, the first slip first.
     // WALK_RELEASE_T(release, art, u): the leave's u <- R^T u, the last slip first.
     // WALK_RELEASE_IT(release, art, u): the audit's coordinates u <- R^-T u, the first slip first.
-    const auto WALK_SLIP = [&](const auto& release, const size_t at, float* z, const int stride) {
+    const auto WALK_SLIP_ON = [&](const auto& release, const size_t at, float* z, const int rows, const int stride,
+                                  auto&& place) {
         const int steps = release.b.shape[2];
         const int* coordinate = release.coordinate.data + at;
         const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
-        float s = 0.0f;
+        float s[$rows];
+        for (int r = 0; r < $rows; ++r) s[r] = 0.0f;
         for (int k = 0; k < steps; ++k) {
             const int c = coordinate[k];
             if (c < 0) break;
-            const float x = z[c * stride] - b[k] * s;
-            s += a[k] * x;
-            z[c * stride] = g[k] * x;
+            const int e = place(c);
+            if (e < 0) continue;
+            for (int r = 0; r < rows; ++r) {
+                const float u = z[e + r * stride] - b[k] * s[r];
+                s[r] += a[k] * u;
+                z[e + r * stride] = g[k] * u;
+            }
+        }
+    };
+    const auto WALK_SLIP = [&](const auto& release, const size_t at, float* z, const int stride) {
+        WALK_SLIP_ON(release, at, z, 1, 0, [&](const int c) { return c * stride; });
+    };
+    // The transposed forms, root first: a batch of the steps above the last one taken, the path's end (-1) skipped.
+    const auto WALK_SLIP_BACK = [&](const auto& release, const size_t at, float* u, auto&& step) {
+        const int steps = release.b.shape[2];
+        const int* coordinate = release.coordinate.data + at;
+        const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
+        float t = 0.0f;
+        for (int k1 = steps - 1; k1 >= 0; k1 -= $batch) {
+            int cq[$batch];
+            float bk[$batch], ak[$batch], gk[$batch], x[$batch];
+#pragma unroll
+            for (int q = 0; q < $batch; ++q) {
+                const int k = k1 - q;
+                cq[q] = k >= 0 ? coordinate[k] : -1;
+                bk[q] = k >= 0 ? b[k] : 0.0f;
+                ak[q] = k >= 0 ? a[k] : 0.0f;
+                gk[q] = k >= 0 ? g[k] : 0.0f;
+            }
+#pragma unroll
+            for (int q = 0; q < $batch; ++q) x[q] = cq[q] >= 0 ? u[cq[q]] : 0.0f;
+#pragma unroll
+            for (int q = 0; q < $batch; ++q)
+                if (cq[q] >= 0) x[q] = step(x[q], t, bk[q], ak[q], gk[q]);
+#pragma unroll
+            for (int q = 0; q < $batch; ++q)
+                if (cq[q] >= 0) u[cq[q]] = x[q];
         }
     };
     const auto WALK_SLIP_T = [&](const auto& release, const size_t at, float* u) {
-        const int steps = release.b.shape[2];
-        const int* coordinate = release.coordinate.data + at;
-        const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
-        float t = 0.0f;
-        for (int k = steps - 1; k >= 0; --k) {
-            const int c = coordinate[k];
-            if (c < 0) continue;
-            const float x = g[k] * u[c] + a[k] * t;
-            u[c] = x;
-            t -= b[k] * x;
-        }
+        WALK_SLIP_BACK(release, at, u, [](const float v, float& t, const float b, const float a, const float g) {
+            const float x = g * v + a * t;
+            t -= b * x;
+            return x;
+        });
     };
     const auto WALK_SLIP_IT = [&](const auto& release, const size_t at, float* u) {
-        const int steps = release.b.shape[2];
-        const int* coordinate = release.coordinate.data + at;
-        const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
-        float t = 0.0f;
-        for (int k = steps - 1; k >= 0; --k) {
-            const int c = coordinate[k];
-            if (c < 0) continue;
-            const float x = u[c];
-            u[c] = (x - a[k] * t) / g[k];
-            t -= b[k] * x;
-        }
+        WALK_SLIP_BACK(release, at, u, [](const float v, float& t, const float b, const float a, const float g) {
+            const float x = (v - a * t) / g;
+            t -= b * v;
+            return x;
+        });
+    };
+    const auto WALK_RELEASE_ON = [&](const auto& release, const int art, float* z, const int rows, const int stride,
+                                     auto&& place) {
+        const int cap = release.b.shape[1], steps = release.b.shape[2];
+        for (int j = 0; j < release.count.data[art]; ++j)
+            WALK_SLIP_ON(release, ((size_t)art * cap + j) * steps, z, rows, stride, place);
     };
     const auto WALK_RELEASE = [&](const auto& release, const int art, float* z, const int stride = 1) {
         const int cap = release.b.shape[1], steps = release.b.shape[2];
@@ -1762,6 +1806,7 @@ def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int) -> 
         frame=WALK_FRAME,
         nowlink=WALK_LINK,
         nowframe=WALK_FRAME,
+        batch=WALK_SLIP_BATCH,
     )
     return DevicePrelude(
         f"walk_{rows}_{len(parent)}",
@@ -1802,6 +1847,7 @@ def walk_paths_prelude(
             frame=frame,
             nowlink=WALK_LINK,
             nowframe=WALK_FRAME,
+            batch=WALK_SLIP_BATCH,
         )
     )
     layout = (coordinate, link, now, frame)
