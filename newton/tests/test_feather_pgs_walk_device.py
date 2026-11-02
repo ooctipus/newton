@@ -53,6 +53,7 @@ from newton._src.solvers.feather_pgs.tree_factor import (
     WALK_NOW,
     TreeWalk,
     local_frames,
+    pack_walk_columns,
     unpack_walk_records,
 )
 from newton.solvers import SolverFeatherPGS
@@ -90,10 +91,10 @@ def devices() -> list:
 # ---------------------------------------------------------------------------------------------------------------------
 
 _UP = """    if (tid >= body.shape[0]) return;
-    const int n = now.shape[1], bodies = link.shape[1];
+    const int n = z.shape[2], bodies = link.shape[1];
     const float* d = data.data + (size_t)tree.data[tid] * data.shape[1] * $coordinate;
     const float* l = link.data + (size_t)tree.data[tid] * bodies * $link;
-    const float* s = now.data + (size_t)tree.data[tid] * n * $now;
+    const float* s = now.data + (size_t)tree.data[tid] * now.shape[1] * $now;
     const float* f = now_link.data + (size_t)tree.data[tid] * bodies * $link;
     float* out = z.data + (size_t)tid * $rows * n;
     float* entries = jz.data + (size_t)tid * $rows * n;
@@ -204,7 +205,7 @@ class DeviceWalk:
         self.step_frames = np.stack([frame_points(walk) for walk in step])
         now_link = np.stack([walk.device_data()[1] for walk in step])
         now_link[:, :, WALK_FRAME : WALK_FRAME + 3] = self.step_frames
-        self.now = wp.array(np.stack([np.asarray(walk.s) for walk in step]), dtype=float, device=device)
+        self.now = wp.array(np.stack([pack_walk_columns(walk.s) for walk in step]), dtype=float, device=device)
         self.now_link = wp.array(now_link, dtype=float, device=device)
 
     def up(self, tree, body, top, seeded, wrench, covector, entries: bool = False):

@@ -413,11 +413,11 @@ def joint_columns(
     joint_q: wp.array[float],
     q_start: int,
     qd_start: int,
-    columns: wp.array[wp.spatial_vector],
 ):
-    """Store a joint's motion-subspace columns about the point ``anchor`` is relative to in ``columns`` and return them:
-    its sliding columns (up to three, a prismatic joint's and a D6 joint's linear axes, a free joint's translations)
-    then its turning columns (up to three), zero past the joint's.
+    """A joint's motion-subspace columns about the point ``anchor`` is relative to: its sliding columns (up to three,
+    a prismatic joint's and a D6 joint's linear axes, a free joint's translations) then its turning columns (up to
+    three), zero past the joint's. Its coordinates take its ``lin_axis_count`` sliding columns, then its
+    ``ang_axis_count`` turning ones (:func:`store_columns`).
 
     ``anchor`` is the joint's parent anchor relative to that point (the origin for ``S``; the joint's own frame, its
     rotation alone, for the walk's step columns); every column is :func:`motion_axis` of an axis (the kind a constant
@@ -434,24 +434,19 @@ def joint_columns(
     a2 = wp.spatial_vector()
     if joint_type == JointType.PRISMATIC:
         l0 = motion_axis(anchor, joint_axis[qd_start], False)
-        columns[qd_start] = l0
     elif joint_type == JointType.REVOLUTE:
         a0 = motion_axis(anchor, joint_axis[qd_start], True)
-        columns[qd_start] = a0
     elif joint_type == JointType.D6:
         position = wp.vec3(0.0)
         # Unrolled, each axis kind a constant, as the one-axis branches.
         if lin_axis_count > 0:
             l0 = motion_axis(anchor, joint_axis[qd_start + 0], False)
-            columns[qd_start + 0] = l0
             position += joint_axis[qd_start + 0] * joint_q[q_start + 0]
         if lin_axis_count > 1:
             l1 = motion_axis(anchor, joint_axis[qd_start + 1], False)
-            columns[qd_start + 1] = l1
             position += joint_axis[qd_start + 1] * joint_q[q_start + 1]
         if lin_axis_count > 2:
             l2 = motion_axis(anchor, joint_axis[qd_start + 2], False)
-            columns[qd_start + 2] = l2
             position += joint_axis[qd_start + 2] * joint_q[q_start + 2]
         first = qd_start + lin_axis_count
         angle = q_start + lin_axis_count
@@ -473,20 +468,14 @@ def joint_columns(
             )
         if ang_axis_count > 0:
             a0 = motion_axis(pivot, axis_0, True)
-            columns[first + 0] = a0
         if ang_axis_count > 1:
             a1 = motion_axis(pivot, axis_1, True)
-            columns[first + 1] = a1
         if ang_axis_count > 2:
             a2 = motion_axis(pivot, axis_2, True)
-            columns[first + 2] = a2
     elif joint_type == JointType.BALL:
         a0 = motion_axis(anchor, wp.vec3(1.0, 0.0, 0.0), True)
         a1 = motion_axis(anchor, wp.vec3(0.0, 1.0, 0.0), True)
         a2 = motion_axis(anchor, wp.vec3(0.0, 0.0, 1.0), True)
-        columns[qd_start + 0] = a0
-        columns[qd_start + 1] = a1
-        columns[qd_start + 2] = a2
     elif joint_type == JointType.FREE or joint_type == JointType.DISTANCE:
         rotation = wp.transform_get_rotation(anchor)
         ex = wp.quat_rotate(rotation, wp.vec3(1.0, 0.0, 0.0))
@@ -498,13 +487,36 @@ def joint_columns(
         a0 = wp.spatial_vector(wp.vec3(), ex)
         a1 = wp.spatial_vector(wp.vec3(), ey)
         a2 = wp.spatial_vector(wp.vec3(), ez)
-        columns[qd_start + 0] = l0
-        columns[qd_start + 1] = l1
-        columns[qd_start + 2] = l2
-        columns[qd_start + 3] = a0
-        columns[qd_start + 4] = a1
-        columns[qd_start + 5] = a2
     return l0, l1, l2, a0, a1, a2
+
+
+@wp.func
+def store_columns(
+    columns: wp.array[wp.spatial_vector],
+    qd_start: int,
+    lin_axis_count: int,
+    ang_axis_count: int,
+    l0: wp.spatial_vector,
+    l1: wp.spatial_vector,
+    l2: wp.spatial_vector,
+    a0: wp.spatial_vector,
+    a1: wp.spatial_vector,
+    a2: wp.spatial_vector,
+):
+    """Store a joint's columns (:func:`joint_columns`) at its coordinates: its sliding columns, then its turning ones."""
+    if lin_axis_count > 0:
+        columns[qd_start + 0] = l0
+    if lin_axis_count > 1:
+        columns[qd_start + 1] = l1
+    if lin_axis_count > 2:
+        columns[qd_start + 2] = l2
+    first = qd_start + lin_axis_count
+    if ang_axis_count > 0:
+        columns[first + 0] = a0
+    if ang_axis_count > 1:
+        columns[first + 1] = a1
+    if ang_axis_count > 2:
+        columns[first + 2] = a2
 
 
 @SPATIAL.law(cuda=False)
@@ -528,8 +540,9 @@ def joint_motion(
     :func:`twist_compose`; every other joint's own bias is zero.
     """
     l0, l1, l2, a0, a1, a2 = joint_columns(
-        joint_type, joint_axis, lin_axis_count, ang_axis_count, anchor, joint_q, q_start, qd_start, joint_S_s
+        joint_type, joint_axis, lin_axis_count, ang_axis_count, anchor, joint_q, q_start, qd_start
     )
+    store_columns(joint_S_s, qd_start, lin_axis_count, ang_axis_count, l0, l1, l2, a0, a1, a2)
     bias = wp.spatial_vector()
     if joint_type == JointType.PRISMATIC:
         return l0 * joint_qd[qd_start], bias

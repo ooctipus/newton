@@ -27,10 +27,10 @@ from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.solver_fields import Mimics
 from newton._src.solvers.feather_pgs.tree_factor import (
     WALK_LINK,
-    WALK_NOW,
     WalkClass,
     WalkRelease,
     WalkTrees,
+    pack_walk_columns,
     pack_walk_records,
     walk_leave_kernel,
 )
@@ -775,7 +775,7 @@ def chain_walk(device, lowers) -> WalkTrees:
     s = np.zeros((total, 6), dtype=np.float32)
     ut = np.zeros((total, 6), dtype=np.float32)
     inverse = np.zeros(total, dtype=np.float32)
-    now = np.zeros((total, WALK_NOW), dtype=np.float32)
+    now = np.zeros((total, 6), dtype=np.float32)
     path = np.zeros((total, 2), dtype=np.int32)
     dof_body = np.zeros(total, dtype=np.int32)
     for art, A in enumerate(factors):
@@ -795,7 +795,7 @@ def chain_walk(device, lowers) -> WalkTrees:
     walk.data = wp.array(pack_walk_records(s, ut, inverse, np.zeros(total)), dtype=wp.float32, device=device)
     walk.link = wp.zeros((total, WALK_LINK), dtype=wp.float32, device=device)
     walk.path = wp.array(path, dtype=wp.vec2i, device=device)
-    walk.now = wp.array(now, dtype=wp.spatial_vector, device=device)
+    walk.now = wp.array(pack_walk_columns(now), dtype=wp.float32, device=device)
     walk.now_link = wp.zeros((total, WALK_LINK), dtype=wp.float32, device=device)
     walk.scratch = wp.zeros(total, dtype=wp.spatial_vector, device=device)
     walk.joint_start, walk.joint_end = ints(start[:-1]), ints(start[1:])

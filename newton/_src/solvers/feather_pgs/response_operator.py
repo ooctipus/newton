@@ -1049,7 +1049,7 @@ class WalkedRows:
     def _walk(self) -> str:
         """``TIER_WALK``: one seed of row ``i`` on the world's tree ``side`` (:func:`.tree_factor.walk_into`'s walk), its
         footprints added at the tree's world coordinates and its ``J`` entries against ``s_v`` into ``incident``."""
-        from .tree_factor import WALK_COORDINATE, WALK_LINK  # noqa: PLC0415
+        from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_NOW  # noqa: PLC0415
 
         return f"""const auto TIER_WALK = [&](const int side, const int body, const int k, const float* seed) {{
     const int art = side == 0 ? art_a : art_b, offset = side == 0 ? {self.primary_offset} : {self.secondary_offset};
@@ -1058,7 +1058,7 @@ class WalkedRows:
     const float* data = walk.data.data + (size_t)d0 * {WALK_COORDINATE};
     const float* link = walk.link.data + (size_t)j0 * {WALK_LINK};
     // The step's geometry the finish published: its columns and links at the step's poses.
-    const float* now = reinterpret_cast<const float*>(walk.now.data + d0);
+    const float* now = walk.now.data + (size_t)d0 * {WALK_NOW};
     const float* now_link = walk.now_link.data + (size_t)j0 * {WALK_LINK};
     const auto sink = [&](int, int c, float z, float j) {{
         Zi[(offset + c) * ZS] += z;
@@ -1602,10 +1602,10 @@ class LocalBlock(ResidualBlock):
     @property
     def coordinate_floats(self) -> int:
         """Staged floats a coordinate: ``s``, ``ut``, ``1 / ell`` (its record unpacked, :data:`.tree_factor.WALK_STAGED`),
-        then with ``wrenches`` the step's column the finish published (:data:`.tree_factor.WALK_NOW`)."""
-        from .tree_factor import WALK_NOW, WALK_STAGED  # noqa: PLC0415 (tree_factor imports this module)
+        then with ``wrenches`` the step's column the finish published, unpacked (six floats, :data:`.tree_factor.WALK_NOW`)."""
+        from .tree_factor import WALK_STAGED  # noqa: PLC0415 (tree_factor imports this module)
 
-        return WALK_STAGED + (WALK_NOW if self.wrenches else 0)
+        return WALK_STAGED + (6 if self.wrenches else 0)
 
     @property
     def link_floats(self) -> int:
@@ -1644,6 +1644,7 @@ class LocalBlock(ResidualBlock):
         from .tree_factor import (  # noqa: PLC0415 (tree_factor imports this module)
             WALK_COORDINATE,
             WALK_LINK,
+            WALK_NOW,
             WALK_STAGED,
             WALK_UNPACKED,
         )
@@ -1668,7 +1669,7 @@ class LocalBlock(ResidualBlock):
                 lines.append("const int* walk_dof_body = walk.dof_body.data + walk_d0;")
             if self.wrenches and self.seeds:
                 lines += [
-                    "const float* walk_now = reinterpret_cast<const float*>(walk.now.data + walk_d0);",
+                    f"const float* walk_now = walk.now.data + (size_t)walk_d0 * {WALK_NOW};",
                     f"const float* walk_now_link = walk.now_link.data + (size_t)walk_j0 * {WALK_LINK};",
                 ]
             if S:
@@ -1679,7 +1680,7 @@ class LocalBlock(ResidualBlock):
                 ]
                 if self.wrenches and self.seeds:
                     lines += [
-                        "const float* free_now = reinterpret_cast<const float*>(walk.now.data + free_d0);",
+                        f"const float* free_now = walk.now.data + (size_t)free_d0 * {WALK_NOW};",
                         f"const float* free_now_link = walk.now_link.data + (size_t)free_j0 * {WALK_LINK};",
                     ]
         else:
@@ -1687,8 +1688,9 @@ class LocalBlock(ResidualBlock):
             coordinate = "walk_d0 + c" if not S else f"c < {P} ? walk_d0 + c : free_d0 + c - {P}"
             now = (
                 [
-                    f"    for (int k = 0; k < {C - WALK_STAGED}; ++k)",
-                    f"        s_walk[c * {C} + {WALK_STAGED} + k] = reinterpret_cast<const float*>(walk.now.data + d)[k];",
+                    "    float S[6];",
+                    f"    WALK_LOAD_COLUMN(S, walk.now.data + (size_t)d * {WALK_NOW});",
+                    f"    for (int k = 0; k < 6; ++k) s_walk[c * {C} + {WALK_STAGED} + k] = S[k];",
                 ]
                 if self.wrenches
                 else []

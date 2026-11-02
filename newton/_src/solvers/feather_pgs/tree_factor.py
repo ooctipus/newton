@@ -184,7 +184,7 @@ class TreeFactor:
         self.walk_leave = None
         self.walk_slip_capacity = 0
         # The walk's step geometry, which the finish publishes where a walk is held (plan_walk sizes it): empty here.
-        self.walk_now = wp.zeros(0, dtype=wp.spatial_vector, device=model.device)
+        self.walk_now = wp.zeros((0, WALK_NOW), dtype=wp.float32, device=model.device)
         self.walk_now_link = wp.zeros((0, WALK_LINK), dtype=wp.float32, device=model.device)
         # The border's status word (tree_kinetic_state.border_solve): bit 0 a tree past its slip capacity, bit 1 a
         # pivot not positive, bit 2 a decided step on a tree the walk does not hold.
@@ -987,7 +987,7 @@ class TreeFactor:
         # The step's geometry, which the held tree's finish publishes with its motion columns (every step, no launch
         # of the walk's): each coordinate's column at its body's frame and each body's link there. A seed enters as J
         # there, and a refresh takes it as the factor's frames.
-        self.walk_now = wp.zeros(dofs, dtype=wp.spatial_vector, device=device)
+        self.walk_now = wp.zeros(((2 if both else 1) * dofs, WALK_NOW), dtype=wp.float32, device=device)
         self.walk_now_link = wp.zeros((joints, WALK_LINK), dtype=wp.float32, device=device)
         view = WalkTrees()
         view.data, view.link, view.path = self.walk_data, self.walk_link, self.walk_path
@@ -1588,9 +1588,87 @@ WALK_FRAME = 0
 """Where a body's link holds its frame's world point (:data:`WALK_LINK`), at the refresh's poses: the factor's
 inertias are taken there."""
 
-WALK_NOW = 6
-"""Floats per coordinate of the step's columns (:attr:`WalkTrees.now`, at its body's frame at the step's poses; its
-links, :attr:`WalkTrees.now_link`, take :data:`WALK_LINK`'s layout)."""
+WALK_NOW = 4
+"""Floats per coordinate of the step's columns (:attr:`WalkTrees.now`, at its body's frame at the step's poses), one
+aligned ``float4``: the column's non-zero half and its tag, 0 for the linear half, 1 for the angular half, and for a
+column of two halves (the record's kinds, :data:`WALK_COORDINATE`) the offset in floats to its linear half's ``float4`` in
+the rows' second half, with the angular half here (:func:`store_walk_columns`, ``WALK_LOAD_COLUMN``). Its links,
+:attr:`WalkTrees.now_link`, take :data:`WALK_LINK`'s layout."""
+
+
+@wp.func
+def store_walk_column(now: wp.array2d[float], c: int, side: int, column: wp.spatial_vector):
+    """Store coordinate ``c``'s step column (:data:`WALK_NOW`): its non-zero half and tag; with both halves its linear
+    half ``side`` rows on (``side`` 0: the rows hold no second half, and no joint of theirs has two)."""
+    v = wp.spatial_top(column)
+    w = wp.spatial_bottom(column)
+    turns = w[0] != 0.0 or w[1] != 0.0 or w[2] != 0.0
+    h = v
+    tag = float(0.0)
+    if turns:
+        h = w
+        tag = 1.0
+        if side > 0 and (v[0] != 0.0 or v[1] != 0.0 or v[2] != 0.0):
+            tag = float(side * WALK_NOW)
+            now[c + side, 0] = v[0]
+            now[c + side, 1] = v[1]
+            now[c + side, 2] = v[2]
+            now[c + side, 3] = 0.0
+    now[c, 0] = h[0]
+    now[c, 1] = h[1]
+    now[c, 2] = h[2]
+    now[c, 3] = tag
+
+
+@wp.func
+def store_walk_columns(
+    now: wp.array2d[float],
+    dofs: int,
+    start: int,
+    lin_axis_count: int,
+    ang_axis_count: int,
+    l0: wp.spatial_vector,
+    l1: wp.spatial_vector,
+    l2: wp.spatial_vector,
+    a0: wp.spatial_vector,
+    a1: wp.spatial_vector,
+    a2: wp.spatial_vector,
+):
+    """Store a joint's step columns (:func:`.spatial_laws.joint_columns`) at its coordinates from ``start``, its sliding
+    columns then its turning ones, by :func:`store_walk_column`; ``dofs`` the model's coordinates (the second half's
+    rows on, where ``now`` holds one)."""
+    side = 0
+    if now.shape[0] > dofs:
+        side = now.shape[0] // 2
+    if lin_axis_count > 0:
+        store_walk_column(now, start + 0, side, l0)
+    if lin_axis_count > 1:
+        store_walk_column(now, start + 1, side, l1)
+    if lin_axis_count > 2:
+        store_walk_column(now, start + 2, side, l2)
+    first = start + lin_axis_count
+    if ang_axis_count > 0:
+        store_walk_column(now, first + 0, side, a0)
+    if ang_axis_count > 1:
+        store_walk_column(now, first + 1, side, a1)
+    if ang_axis_count > 2:
+        store_walk_column(now, first + 2, side, a2)
+
+
+def pack_walk_columns(s: np.ndarray) -> np.ndarray:
+    """Step columns ``s`` (``[n, 6]``) as the finish stores them (:data:`WALK_NOW`, :func:`store_walk_column`),
+    float32; with any column of two halves the rows double."""
+    s = np.asarray(s, dtype=np.float32).reshape(-1, 6)
+    n = s.shape[0]
+    turns = np.any(s[:, 3:6] != 0.0, axis=1)
+    both = turns & np.any(s[:, 0:3] != 0.0, axis=1)
+    now = np.zeros((2 * n if both.any() else n, WALK_NOW), dtype=np.float32)
+    now[:n, 0:3] = np.where(turns[:, None], s[:, 3:6], s[:, 0:3])
+    now[:n, 3] = np.where(both, float(WALK_NOW * n), np.where(turns, 1.0, 0.0))
+    if both.any():
+        now[n:, 0:3] = np.where(both[:, None], s[:, 0:3], 0.0)
+    return now
+
 
 _WALK_TABLE = """    static __constant__ int WALK_PARENT[$bodies] = {$parent};
     static __constant__ int WALK_FIRST[$ends] = {$first};
@@ -1841,7 +1919,8 @@ _WALK_LOADS = """#ifndef WALK_LOAD_RECORD
 // WALK_NOW): a coordinate's record, three aligned float4 (its column's non-zero half and 1 / ell; ut 0..3; ut 4..5, P0
 // and the side offset); a body's link, its frame point, one float4, read with its parent's (WALK_LOAD_LINK(l, p, b, up):
 // l the offset to the parent's frame, the difference of the two points, WALK_OFFSET's (zero at a root), then the
-// frame point); a step column, 6 floats as three float2; a step link's frame point, one float4. Each fills a register
+// frame point); a step column, one float4 (its non-zero half and its tag, WALK_NOW) unpacked as six floats; a step
+// link's frame point, one float4. Each fills a register
 // array, one read-only vector load (LDG.128, the global path; no walk writes them while a reader runs) a field group.
 // WALK_UNPACK(d, a, b, e, v): a record's three float4 a, b, e (and its side float4 v, zero without one) as the walk's
 // WALK_UNPACKED floats d: s (the half 1 / ell's sign bit names, the other half v's), ut, 1 / ell, P0. The half not
@@ -1876,9 +1955,15 @@ _WALK_LOADS = """#ifndef WALK_LOAD_RECORD
     }
 #define WALK_LOAD_COLUMN(S, p)                                                                                  \
     {                                                                                                          \
-        const float2* walk_q_ = reinterpret_cast<const float2*>(p);                                             \
-        const float2 walk_a_ = __ldg(walk_q_), walk_b_ = __ldg(walk_q_ + 1), walk_c_ = __ldg(walk_q_ + 2);                          \
-        S[0] = walk_a_.x; S[1] = walk_a_.y; S[2] = walk_b_.x; S[3] = walk_b_.y; S[4] = walk_c_.x; S[5] = walk_c_.y; \
+        const float* walk_p_ = (p);                                                                            \
+        const float4 walk_a_ = __ldg(reinterpret_cast<const float4*>(walk_p_));                                \
+        const int walk_tag_ = (int)walk_a_.w;                                                                  \
+        const float4 walk_v_ = walk_tag_ > 1 ? __ldg(reinterpret_cast<const float4*>(walk_p_ + walk_tag_))      \
+                                             : make_float4(0.0f, 0.0f, 0.0f, 0.0f);                           \
+        const bool walk_t_ = walk_tag_ != 0;                                                                   \
+        S[0] = walk_t_ ? walk_v_.x : walk_a_.x; S[1] = walk_t_ ? walk_v_.y : walk_a_.y;                        \
+        S[2] = walk_t_ ? walk_v_.z : walk_a_.z; S[3] = walk_t_ ? walk_a_.x : 0.0f;                             \
+        S[4] = walk_t_ ? walk_a_.y : 0.0f; S[5] = walk_t_ ? walk_a_.z : 0.0f;                                  \
     }
 #define WALK_LOAD_POINT(f, p)                                                                                   \
     {                                                                                                          \
@@ -1912,7 +1997,15 @@ _WALK_LOADS_CPU = """#ifndef WALK_LOAD_RECORD
             l[3 + walk_k_] = walk_f_[walk_k_];                                                                 \
         }                                                                                                      \
     }
-#define WALK_LOAD_COLUMN(S, p) { for (int walk_k_ = 0; walk_k_ < 6; ++walk_k_) S[walk_k_] = (p)[walk_k_]; }
+#define WALK_LOAD_COLUMN(S, p)                                                                                  \
+    {                                                                                                          \
+        const float* walk_p_ = (p);                                                                            \
+        const int walk_tag_ = (int)walk_p_[3];                                                                 \
+        for (int walk_k_ = 0; walk_k_ < 3; ++walk_k_) {                                                        \
+            S[walk_k_] = walk_tag_ != 0 ? (walk_tag_ > 1 ? walk_p_[walk_tag_ + walk_k_] : 0.0f) : walk_p_[walk_k_]; \
+            S[3 + walk_k_] = walk_tag_ != 0 ? walk_p_[walk_k_] : 0.0f;                                          \
+        }                                                                                                      \
+    }
 #define WALK_LOAD_POINT(f, p) { for (int walk_k_ = 0; walk_k_ < 4; ++walk_k_) f[walk_k_] = (p)[walk_k_]; }
 #endif"""
 """The CPU twin of :data:`_WALK_LOADS`: each prelude carries its device's text under the snippet's one guard."""
@@ -2838,7 +2931,7 @@ class WalkTrees:
     data: wp.array2d[float]
     link: wp.array2d[float]
     path: wp.array[wp.vec2i]
-    now: wp.array[wp.spatial_vector]
+    now: wp.array2d[float]
     now_link: wp.array2d[float]
     scratch: wp.array[wp.spatial_vector]
     joint_start: wp.array[int]
@@ -2861,7 +2954,7 @@ def empty_walk_view(model, forest) -> WalkTrees:
     view.data = wp.zeros((0, WALK_COORDINATE), dtype=wp.float32, device=device)
     view.link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
     view.path = wp.zeros(1, dtype=wp.vec2i, device=device)
-    view.now = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+    view.now = wp.zeros((1, WALK_NOW), dtype=wp.float32, device=device)
     view.now_link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
     view.scratch = wp.zeros(1, dtype=wp.spatial_vector, device=device)
     view.joint_start = model.articulation_start
@@ -2915,6 +3008,7 @@ def walk_enter_kernel() -> wp.Kernel:
 _WALK_INTO = """    WALK_TREE(reinterpret_cast<const int*>(walk.path.data + joint0), bodies, coordinates);
     const float* data = walk.data.data + (size_t)dof0 * $coordinate;
     const float* link = walk.link.data + (size_t)joint0 * $link;
+    const float* now = walk.now.data + (size_t)dof0 * $now;
     float* row = out.data + ((size_t)line * out.shape[1] + slot) * out.shape[2] + entry;
     const float* v = qd.data + dof0;
     float incident = 0.0f, squares = 0.0f;
@@ -2932,10 +3026,11 @@ _WALK_INTO = """    WALK_TREE(reinterpret_cast<const int*>(walk.path.data + join
 
 _WRENCH_SEED = """float p[6], w[6];
     for (int k = 0; k < 6; ++k) p[k] = w[k] = wrench[k];
-    WALK_UP(data, link, reinterpret_cast<const float*>(walk.now.data + dof0), walk.now_link.data + (size_t)joint0 * $link,
+    WALK_UP(data, link, now, walk.now_link.data + (size_t)joint0 * $link,
             body, WALK_FIRST_OF(body + 1) - 1, p, w, sink);"""
 
-_COVECTOR_SEED = """float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}, w[6];
+_COVECTOR_SEED = """(void)now;
+    float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}, w[6];
     const float x[1] = {value};
     WALK_SEED(data, coordinate, x, p, sink);
     WALK_UP(data, link, nullptr, nullptr, body, coordinate - 1, p, w, sink);"""
@@ -2946,7 +3041,7 @@ def _walk_into_snippet(seed: str) -> str:
     from .device_preludes import dual_native  # noqa: PLC0415
 
     return dual_native(
-        substitute(_WALK_INTO.replace("$seed", seed), coordinate=WALK_COORDINATE, link=WALK_LINK),
+        substitute(_WALK_INTO.replace("$seed", seed), coordinate=WALK_COORDINATE, link=WALK_LINK, now=WALK_NOW),
         preludes=(walk_paths_prelude(1),),
     )
 
@@ -3109,8 +3204,8 @@ _REFRESH = """    // The refresh's arithmetic on one tree, float32 (TreeWalk's i
     const float* Lk = now_link.data;
     // A column of two halves keeps its linear half WALK_SIDE floats past its record, in data's second half (its rows
     // doubled where a joint's column can have two halves: TreeFactor's walk_data).
-    const int WALK_SIDE = data.shape[0] > now.shape[0] ? $coordinate * now.shape[0] : 0;
-    const float* Nw = reinterpret_cast<const float*>(now.data);
+    const int WALK_SIDE = data.shape[0] > armature.shape[0] ? $coordinate * armature.shape[0] : 0;
+    const float* Nw = now.data;
     float* Lo = link.data;
     float* Dt = data.data;
     const float* Ra = armature.data;
@@ -3130,7 +3225,13 @@ _REFRESH = """    // The refresh's arithmetic on one tree, float32 (TreeWalk's i
     enum { M = 0, MC = 1, ROT = 4, OFFSET = 10, INERTIA = 13 };
     // A coordinate's column at the step's poses and what the factor adds to its diagonal, R and R + K.
     const auto COLUMN = [&](int c, float* x) {
-        for (int k = 0; k < 6; ++k) x[k] = Nw[$now * c + k];
+        // The step column (WALK_NOW): its non-zero half by its tag, the other half's linear part at its side offset.
+        const float* n = Nw + $now * c;
+        const int tag = (int)n[3];
+        for (int k = 0; k < 3; ++k) {
+            x[k] = tag != 0 ? (tag > 1 ? n[tag + k] : 0.0f) : n[k];
+            x[3 + k] = tag != 0 ? n[k] : 0.0f;
+        }
         float added = Ra[c];
         x[6] = added;
         const int row = Dr[c];
@@ -3429,7 +3530,7 @@ def walk_inward(
     dof1: int,
     path: wp.array[wp.vec2i],
     joins: wp.array[int],
-    now: wp.array[wp.spatial_vector],
+    now: wp.array2d[float],
     now_link: wp.array2d[float],
     armature: wp.array[float],
     drive_row_by_dof: wp.array[int],
@@ -3466,7 +3567,7 @@ def walk_step_kernel(
     armature: wp.array[float],
     drive_row_by_dof: wp.array[int],
     row_K: wp.array[float],
-    walk_now: wp.array[wp.spatial_vector],
+    walk_now: wp.array2d[float],
     walk_now_link: wp.array2d[float],
     # outputs
     walk_data: wp.array2d[float],
@@ -3530,7 +3631,7 @@ def walk_step_class_kernel(classes: tuple[WalkClass, ...]) -> wp.Kernel:
         j1: int,
         dof0: int,
         dof1: int,
-        now: wp.array[wp.spatial_vector],
+        now: wp.array2d[float],
         now_link: wp.array2d[float],
         armature: wp.array[float],
         drive_row_by_dof: wp.array[int],
@@ -3562,7 +3663,7 @@ def walk_step_class_kernel(classes: tuple[WalkClass, ...]) -> wp.Kernel:
         armature: wp.array[float],
         drive_row_by_dof: wp.array[int],
         row_K: wp.array[float],
-        walk_now: wp.array[wp.spatial_vector],
+        walk_now: wp.array2d[float],
         walk_now_link: wp.array2d[float],
         walk_data: wp.array2d[float],
         walk_link: wp.array2d[float],

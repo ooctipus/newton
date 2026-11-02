@@ -42,7 +42,7 @@ PUBLICATION = (
     Field("articulation_origin", wp.vec3, ("articulation",), owner="factor"),
     # The walk's step geometry (tree_factor.WalkTrees.now, .now_link; empty where nothing walks): each coordinate's
     # column at its joint's frame, each joint's frame point (tree_factor.WALK_LINK floats).
-    Field("walk_now", wp.spatial_vector, ("dof",), owner="factor"),
+    Field("walk_now", wp.float32, ("dof", "now"), owner="factor"),
     Field("walk_now_link", wp.float32, ("joint", "link"), owner="factor"),
     Field("body_v_s", wp.spatial_vector, ("body",), owner="state_aug"),
     Field("body_a_s", wp.spatial_vector, ("body",), owner="state_aug"),

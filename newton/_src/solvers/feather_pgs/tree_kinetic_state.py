@@ -1106,7 +1106,7 @@ def get_state_kernel(
     _store_origin, _load_origin, _store_axis = h._store_origin, h._load_origin, h._store_axis
     bodies, dofs, pack, free_root = layout.bodies, layout.dofs, layout.pack, layout.free_root
     roots, free_roots, forest, own_bias = len(layout.roots), layout.free_root_count, layout.forest, layout.own_bias
-    from .tree_factor import WALK_FRAME  # noqa: PLC0415 (tree_factor imports the finish's kernels' modules)
+    from .tree_factor import WALK_FRAME, store_walk_columns  # noqa: PLC0415 (tree_factor imports this module)
 
     @wp.func
     def admit(
@@ -1366,23 +1366,23 @@ def get_state_kernel(
                 free = kind == JointType.FREE or kind == JointType.DISTANCE
                 if free:
                     point = wp.transform_point(_load_pose(g.address, local), data.body_com[data.joint_child[joint]])
-                joint_columns(
+                lin, ang = data.joint_dof_dim[joint, 0], data.joint_dof_dim[joint, 1]
+                l0, l1, l2, a0, a1, a2 = joint_columns(
                     kind,
                     data.joint_axis,
-                    data.joint_dof_dim[joint, 0],
-                    data.joint_dof_dim[joint, 1],
+                    lin,
+                    ang,
                     wp.transform(wp.vec3(), wp.transform_get_rotation(anchor)),
                     q,
                     data.joint_q_start[joint],
                     start,
-                    data.walk_now,
                 )
                 if free:
                     # A free joint turns about the articulation's origin: the same twist at its frame.
-                    for k in range(3):
-                        turn = data.walk_now[start + 3 + k]
-                        w = wp.spatial_bottom(turn)
-                        data.walk_now[start + 3 + k] = wp.spatial_vector(wp.cross(w, point - origin), w)
+                    a0 = wp.spatial_vector(wp.cross(wp.spatial_bottom(a0), point - origin), wp.spatial_bottom(a0))
+                    a1 = wp.spatial_vector(wp.cross(wp.spatial_bottom(a1), point - origin), wp.spatial_bottom(a1))
+                    a2 = wp.spatial_vector(wp.cross(wp.spatial_bottom(a2), point - origin), wp.spatial_bottom(a2))
+                store_walk_columns(data.walk_now, data.joint_qd.shape[0], start, lin, ang, l0, l1, l2, a0, a1, a2)
                 frame = point + shift
                 for k in range(3):
                     data.walk_now_link[joint, wp.static(WALK_FRAME) + k] = frame[k]
