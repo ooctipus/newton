@@ -415,7 +415,9 @@ def joint_columns(
     qd_start: int,
     columns: wp.array[wp.spatial_vector],
 ):
-    """Store a joint's motion-subspace columns about the point ``anchor`` is relative to in ``columns``.
+    """Store a joint's motion-subspace columns about the point ``anchor`` is relative to in ``columns`` and return them:
+    its sliding columns (up to three, a prismatic joint's and a D6 joint's linear axes, a free joint's translations)
+    then its turning columns (up to three), zero past the joint's.
 
     ``anchor`` is the joint's parent anchor relative to that point (the origin for ``S``; the joint's own frame, its
     rotation alone, for the walk's step columns); every column is :func:`motion_axis` of an axis (the kind a constant
@@ -424,21 +426,32 @@ def joint_columns(
     anchor's, then each angular axis, carried through the rotations before it, turns about the joint origin the linear
     coordinates moved.
     """
+    l0 = wp.spatial_vector()
+    l1 = wp.spatial_vector()
+    l2 = wp.spatial_vector()
+    a0 = wp.spatial_vector()
+    a1 = wp.spatial_vector()
+    a2 = wp.spatial_vector()
     if joint_type == JointType.PRISMATIC:
-        columns[qd_start] = motion_axis(anchor, joint_axis[qd_start], False)
+        l0 = motion_axis(anchor, joint_axis[qd_start], False)
+        columns[qd_start] = l0
     elif joint_type == JointType.REVOLUTE:
-        columns[qd_start] = motion_axis(anchor, joint_axis[qd_start], True)
+        a0 = motion_axis(anchor, joint_axis[qd_start], True)
+        columns[qd_start] = a0
     elif joint_type == JointType.D6:
         position = wp.vec3(0.0)
         # Unrolled, each axis kind a constant, as the one-axis branches.
         if lin_axis_count > 0:
-            columns[qd_start + 0] = motion_axis(anchor, joint_axis[qd_start + 0], False)
+            l0 = motion_axis(anchor, joint_axis[qd_start + 0], False)
+            columns[qd_start + 0] = l0
             position += joint_axis[qd_start + 0] * joint_q[q_start + 0]
         if lin_axis_count > 1:
-            columns[qd_start + 1] = motion_axis(anchor, joint_axis[qd_start + 1], False)
+            l1 = motion_axis(anchor, joint_axis[qd_start + 1], False)
+            columns[qd_start + 1] = l1
             position += joint_axis[qd_start + 1] * joint_q[q_start + 1]
         if lin_axis_count > 2:
-            columns[qd_start + 2] = motion_axis(anchor, joint_axis[qd_start + 2], False)
+            l2 = motion_axis(anchor, joint_axis[qd_start + 2], False)
+            columns[qd_start + 2] = l2
             position += joint_axis[qd_start + 2] * joint_q[q_start + 2]
         first = qd_start + lin_axis_count
         angle = q_start + lin_axis_count
@@ -459,26 +472,39 @@ def joint_columns(
                 joint_q[angle + 1],
             )
         if ang_axis_count > 0:
-            columns[first + 0] = motion_axis(pivot, axis_0, True)
+            a0 = motion_axis(pivot, axis_0, True)
+            columns[first + 0] = a0
         if ang_axis_count > 1:
-            columns[first + 1] = motion_axis(pivot, axis_1, True)
+            a1 = motion_axis(pivot, axis_1, True)
+            columns[first + 1] = a1
         if ang_axis_count > 2:
-            columns[first + 2] = motion_axis(pivot, axis_2, True)
+            a2 = motion_axis(pivot, axis_2, True)
+            columns[first + 2] = a2
     elif joint_type == JointType.BALL:
-        columns[qd_start + 0] = motion_axis(anchor, wp.vec3(1.0, 0.0, 0.0), True)
-        columns[qd_start + 1] = motion_axis(anchor, wp.vec3(0.0, 1.0, 0.0), True)
-        columns[qd_start + 2] = motion_axis(anchor, wp.vec3(0.0, 0.0, 1.0), True)
+        a0 = motion_axis(anchor, wp.vec3(1.0, 0.0, 0.0), True)
+        a1 = motion_axis(anchor, wp.vec3(0.0, 1.0, 0.0), True)
+        a2 = motion_axis(anchor, wp.vec3(0.0, 0.0, 1.0), True)
+        columns[qd_start + 0] = a0
+        columns[qd_start + 1] = a1
+        columns[qd_start + 2] = a2
     elif joint_type == JointType.FREE or joint_type == JointType.DISTANCE:
         rotation = wp.transform_get_rotation(anchor)
         ex = wp.quat_rotate(rotation, wp.vec3(1.0, 0.0, 0.0))
         ey = wp.quat_rotate(rotation, wp.vec3(0.0, 1.0, 0.0))
         ez = wp.quat_rotate(rotation, wp.vec3(0.0, 0.0, 1.0))
-        columns[qd_start + 0] = wp.spatial_vector(ex, wp.vec3())
-        columns[qd_start + 1] = wp.spatial_vector(ey, wp.vec3())
-        columns[qd_start + 2] = wp.spatial_vector(ez, wp.vec3())
-        columns[qd_start + 3] = wp.spatial_vector(wp.vec3(), ex)
-        columns[qd_start + 4] = wp.spatial_vector(wp.vec3(), ey)
-        columns[qd_start + 5] = wp.spatial_vector(wp.vec3(), ez)
+        l0 = wp.spatial_vector(ex, wp.vec3())
+        l1 = wp.spatial_vector(ey, wp.vec3())
+        l2 = wp.spatial_vector(ez, wp.vec3())
+        a0 = wp.spatial_vector(wp.vec3(), ex)
+        a1 = wp.spatial_vector(wp.vec3(), ey)
+        a2 = wp.spatial_vector(wp.vec3(), ez)
+        columns[qd_start + 0] = l0
+        columns[qd_start + 1] = l1
+        columns[qd_start + 2] = l2
+        columns[qd_start + 3] = a0
+        columns[qd_start + 4] = a1
+        columns[qd_start + 5] = a2
+    return l0, l1, l2, a0, a1, a2
 
 
 @SPATIAL.law(cuda=False)
@@ -495,37 +521,38 @@ def joint_motion(
     joint_S_s: wp.array[wp.spatial_vector],
 ) -> tuple[wp.spatial_vector, wp.spatial_vector]:
     """Store a joint's motion-subspace columns about the origin in ``joint_S_s`` (:func:`joint_columns`); return its
-    twist and its own bias acceleration.
+    twist and its own bias acceleration, formed from the columns as they are stored.
 
     ``anchor`` is the joint's parent anchor relative to the origin. A free joint's twist is its root's velocity and
     angular velocity in its rotated frame. A D6 joint's twist and own bias acceleration are its chain's, composed by
     :func:`twist_compose`; every other joint's own bias is zero.
     """
-    joint_columns(joint_type, joint_axis, lin_axis_count, ang_axis_count, anchor, joint_q, q_start, qd_start, joint_S_s)
+    l0, l1, l2, a0, a1, a2 = joint_columns(
+        joint_type, joint_axis, lin_axis_count, ang_axis_count, anchor, joint_q, q_start, qd_start, joint_S_s
+    )
     bias = wp.spatial_vector()
-    if joint_type == JointType.PRISMATIC or joint_type == JointType.REVOLUTE:
-        return joint_S_s[qd_start] * joint_qd[qd_start], bias
+    if joint_type == JointType.PRISMATIC:
+        return l0 * joint_qd[qd_start], bias
+    if joint_type == JointType.REVOLUTE:
+        return a0 * joint_qd[qd_start], bias
     if joint_type == JointType.D6:
         twist = wp.spatial_vector()
         if lin_axis_count > 0:
-            twist += joint_S_s[qd_start + 0] * joint_qd[qd_start + 0]
+            twist += l0 * joint_qd[qd_start + 0]
         if lin_axis_count > 1:
-            twist += joint_S_s[qd_start + 1] * joint_qd[qd_start + 1]
+            twist += l1 * joint_qd[qd_start + 1]
         if lin_axis_count > 2:
-            twist += joint_S_s[qd_start + 2] * joint_qd[qd_start + 2]
+            twist += l2 * joint_qd[qd_start + 2]
         first = qd_start + lin_axis_count
         if ang_axis_count > 0:
-            twist, bias = twist_compose(twist, bias, joint_S_s[first + 0] * joint_qd[first + 0], wp.spatial_vector())
+            twist, bias = twist_compose(twist, bias, a0 * joint_qd[first + 0], wp.spatial_vector())
         if ang_axis_count > 1:
-            twist, bias = twist_compose(twist, bias, joint_S_s[first + 1] * joint_qd[first + 1], wp.spatial_vector())
+            twist, bias = twist_compose(twist, bias, a1 * joint_qd[first + 1], wp.spatial_vector())
         if ang_axis_count > 2:
-            twist, bias = twist_compose(twist, bias, joint_S_s[first + 2] * joint_qd[first + 2], wp.spatial_vector())
+            twist, bias = twist_compose(twist, bias, a2 * joint_qd[first + 2], wp.spatial_vector())
         return twist, bias
     if joint_type == JointType.BALL:
-        x = joint_S_s[qd_start + 0]
-        y = joint_S_s[qd_start + 1]
-        z = joint_S_s[qd_start + 2]
-        return x * joint_qd[qd_start + 0] + y * joint_qd[qd_start + 1] + z * joint_qd[qd_start + 2], bias
+        return a0 * joint_qd[qd_start + 0] + a1 * joint_qd[qd_start + 1] + a2 * joint_qd[qd_start + 2], bias
     if joint_type == JointType.FREE or joint_type == JointType.DISTANCE:
         rotation = wp.transform_get_rotation(anchor)
         linear = wp.vec3(joint_qd[qd_start + 0], joint_qd[qd_start + 1], joint_qd[qd_start + 2])
