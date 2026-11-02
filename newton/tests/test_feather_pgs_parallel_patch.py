@@ -46,7 +46,7 @@ from newton._src.solvers.feather_pgs.placement import Placement
 from newton._src.solvers.feather_pgs.route_table import RouteTable
 from newton._src.solvers.feather_pgs.rows import velocity_prescale_launch
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep
-from newton._src.solvers.feather_pgs.tree_factor import WALK_COORDINATE, WALK_LINK, WalkTrees
+from newton._src.solvers.feather_pgs.tree_factor import WALK_COORDINATE, WALK_LINK, WalkTrees, release_view
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import row_lines, unpacked_rows
 from newton.tests.feather_pgs_mass_reference import MassReference
@@ -1290,7 +1290,6 @@ def identity_walk(dofs: int, device) -> WalkTrees:
     walk.path = wp.array([(-1, 0)], dtype=wp.vec2i, device=device)
     walk.now = wp.zeros((dofs, 6), dtype=wp.float32, device=device)
     walk.now_link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
-    walk.twist = wp.zeros(1, dtype=wp.spatial_vector, device=device)
     walk.scratch = wp.zeros(1, dtype=wp.spatial_vector, device=device)
     for name, values in (
         ("joint_start", [0]),
@@ -1299,14 +1298,9 @@ def identity_walk(dofs: int, device) -> WalkTrees:
         ("dofs", [dofs]),
         ("dof_body", [0] * dofs),
         ("body_joint", [0]),
-        ("free", [0]),
-        ("group", [0]),
-        ("slips", [0]),
     ):
         setattr(walk, name, wp.array(values, dtype=wp.int32, device=device))
-    walk.L6 = wp.zeros((1, 6, 6), dtype=wp.float32, device=device)
-    walk.basis = wp.zeros((1, 1, 1), dtype=wp.float32, device=device)
-    walk.scale = wp.zeros((1, 1, 1), dtype=wp.float32, device=device)
+    walk.release = release_view(1, 0, 1, device)
     return walk
 
 
