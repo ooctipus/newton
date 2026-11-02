@@ -2720,10 +2720,17 @@ $ROOTS
 """
 
 
+WALK_SOLVE_UNROLL = 64
+"""Coordinates up to which the walk's solve is straight-line code (:meth:`.tree_factor.WalkClass.walk`): the solve has no
+launch bound, so a class's ``u`` and states are registers, where the loop form indexes them on the stack. g1's 43
+coordinates take 141 registers and no stack (the loop form: 120 and 272 B, 41 local loads and 43 stores; RTX PRO 6000
+78 -> 58 us a launch); about three registers a coordinate, so past 64 the loop form keeps them in reach."""
+
+
 @functools.cache
 def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
     """The walk's solve of the trial (Z4.2, WALK_MAPPING E5): a thread a tree root, the class's walk compiled into
-    straight-line code (:meth:`.tree_factor.WalkClass.walk` up to :data:`.tree_factor.WALK_UNROLL` coordinates), the
+    straight-line code (:meth:`.tree_factor.WalkClass.walk` up to :data:`WALK_SOLVE_UNROLL` coordinates), the
     walk up of ``trial.force`` into registers and the walk down into ``trial.response``, ``P^T L^-T L^-1 P f`` on the
     all-``K`` walk. A prescribed root responds with zero."""
     from .kernel_template import THREADS  # noqa: PLC0415
@@ -2737,9 +2744,10 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
         walk_down_texts,
     )
 
-    up = {**_up_texts(), "unroll": WALK_UNROLL}
+    walked_classes = tuple(cls for cls in classes if cls is not None)
+    up = {**_up_texts(), "unroll": WALK_SOLVE_UNROLL}
     # The walk down's inputs: the walk up's u, no prior; its output the trial's response.
-    down = {**walk_down_texts(), "unroll": WALK_UNROLL}
+    down = {**walk_down_texts(), "unroll": WALK_SOLVE_UNROLL}
     down["fetch_step"] = f"WALK_IN(data + {WALK_COORDINATE} * ($c), u[$c], 0.0f, $half)"
     hand = "WalkIn{$X.s, $X.t, $X.w, $X.e, u[$c], 0.0f}"
 
@@ -2770,7 +2778,6 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
                 + "\n#endif\n"
             )
         cases.append(f"    case {r}: {{\n{body}\n        break;\n    }}")
-    walked_classes = tuple(cls for cls in classes if cls is not None)
     source = substitute(_WALK_SOLVE, ROOT_COUNT=len(_walk_roots(layout)), ROOTS="\n".join(cases))
     name = _predictor_name("tree_kinetic_walk", layout, None, "sparse", classes)
     return KernelTemplate(
