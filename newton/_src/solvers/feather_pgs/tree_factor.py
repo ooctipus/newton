@@ -945,8 +945,8 @@ class TreeFactor:
             raise ValueError(f"The walk holds at most {WALK_JOIN_SLOTS} joins of a tree at once, a tree needs {held}")
         joints, dofs = max(int(model.joint_count), 1), max(int(model.joint_dof_count), 1)
         self.walk_arts = wp.array(arts, dtype=wp.int32, device=device)
-        # The walking classes: each held tree's topology, which the step's one leave emits as its walk
-        # (walk_leave_kernel), and each articulation's class among them.
+        # The walking classes: each held tree's topology, which the step's one leave (walk_leave_kernel) and the
+        # thread-a-tree refresh (walk_step_class_kernel) emit as its walk, and each articulation's class among them.
         classes: dict[WalkClass, int] = {}
         walk_class = np.full(max(int(model.articulation_count), 1), -1, dtype=np.int32)
         for art in arts.tolist():
@@ -966,17 +966,8 @@ class TreeFactor:
         walked = int(np.count_nonzero(sizes > 1)) or int(arts.size)
         self.walk_lanes = walk_group(bodies, held, walked, device.sm_count) if device.is_cuda else 1
         self.walk_block = WALK_BLOCK
-        # The trees' classes (their topology): a thread a tree with the class compiled in where the classes' data
-        # choose it (walk_schedule), else the lane feed's batches.
-        classes: dict[WalkClass, int] = {}
-        walk_class = np.zeros(max(int(model.articulation_count), 1), dtype=np.int32)
-        for art in arts.tolist():
-            j0, j1 = int(start[art]), int(end[art])
-            first = tuple(int(path[j, 1]) for j in range(j0, j1)) + (int(qd_start[j1] - qd_start[j0]),)
-            key = WalkClass(tuple(int(path[j, 0]) for j in range(j0, j1)), first)
-            walk_class[art] = classes.setdefault(key, len(classes))
-        self.walk_classes = tuple(classes)
-        self.walk_class = wp.array(walk_class, dtype=wp.int32, device=device)
+        # The refresh runs a thread a tree with the class compiled in where the classes' data choose it
+        # (walk_schedule), else the lane feed's batches.
         self.walk_thread = device.is_cuda and walk_schedule(self.walk_classes, walked, device.sm_count)
         self.walk_path = wp.array(path, dtype=wp.vec2i, device=device)
         self.walk_joins = wp.array(joins, dtype=wp.int32, device=device)
