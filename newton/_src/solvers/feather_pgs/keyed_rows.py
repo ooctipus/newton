@@ -283,13 +283,15 @@ ${WEIGHT}${ROW_LAW}        c.row_cfm.data[at] = c.cfm;
 @wp.kernel(enable_backward=False)
 def keyed_general_units(
     z: KineticRows,
-    data: ContactInput,
     counts: wp.array[int],
     mf_counts: wp.array[int],
     parallel_rows: int,
     primary: int,
     primary_offset: int,
     secondary_offset: int,
+    first: wp.array[int],
+    dof_start: wp.array[int],
+    sides: wp.array2d[wp.vec2i],
     units: wp.array2d[int],
     owner: wp.array[int],
 ):
@@ -297,14 +299,15 @@ def keyed_general_units(
     matrix-free rows) to the one writer (:func:`.walk_rows.walked_rows_kernel`), a thread a world: each row's unit
     source from its key (a contact row's ``4 c + r``, a prefix row's covector ``~(2 d + side)`` at its tree's
     coordinate) and a prefix row's sides; ``owner`` is 1 where the tiers hold the world (the writer skips it), 0 where
-    the writer walks its rows. The general worlds' rows then take the walk and the release ``R`` as every walked row."""
+    the writer walks its rows. The general worlds' rows then take the walk and the release ``R`` as every walked row.
+    It reads no contact input: a step without contacts binds none."""
     world = wp.tid()
     count = counts[world]
     if count <= parallel_rows and mf_counts[world] == 0:
         owner[world] = 1
         return
     owner[world] = 0
-    line = data.first[world]
+    line = first[world]
     for row in range(wp.min(count, units.shape[1])):
         key = z.rowkeys[line, row]
         if key < 0:
@@ -316,8 +319,8 @@ def keyed_general_units(
                 side = 1
                 local = q - secondary_offset
             art = z.maps.arts[world, side]
-            data.sides[line, row] = wp.vec2i(art, -1)
-            units[line, row] = unit_source(UNIT_LIMIT, 2 * (data.dof_start[art] + local) + token % 2)
+            sides[line, row] = wp.vec2i(art, -1)
+            units[line, row] = unit_source(UNIT_LIMIT, 2 * (dof_start[art] + local) + token % 2)
         else:
             units[line, row] = unit_source(UNIT_CONTACT, key)
 
@@ -486,15 +489,16 @@ class KeyedRows:
             dim=s.forest.world_count,
             inputs=[
                 self.data,
-                self.data.contact,
                 s.placement.constraint_count,
                 s.placement.mf_constraint_count,
                 layout.parallel_rows,
                 na,
                 layout.primary_offset,
                 layout.secondary_offset,
+                s.placement.dense_first,
+                s.forest.articulation_dof_start,
             ],
-            outputs=[s.placement.unit_source, self.owner],
+            outputs=[s.placement.row_sides, s.placement.unit_source, self.owner],
             device=s.model.device,
         )
 
