@@ -544,9 +544,10 @@ def walked_rows_kernel(release: bool, blocks: int, mimic_blocks: bool) -> wp.Ker
 
     1. *release* (``release``, a class whose drives can saturate): the lanes take the world's walked trees, each tree's
        slips released (:func:`.tree_factor.walk_release_tree`);
-    2. *block* (``blocks``, the largest bilateral block's rows; 0 for none): the lanes write the block rows (links', and
-       mimics' with ``mimic_blocks``), then close each of the world's blocks (:func:`.response_builds_rows.close_block`);
-    3. *units*: the lanes write every other row, each corrected on the blocks its sides touch
+    2. *rows*: the lanes write every row of the world;
+    3. *closure* (``blocks``, the largest bilateral block's rows; 0 for none): the lanes close each of the world's
+       blocks (:func:`.response_builds_rows.close_block`; its rows are the links', and the mimics' with
+       ``mimic_blocks``), then correct every other row on the blocks its sides touch
        (:func:`.response_builds_rows.close_row`).
 
     The closure's seed stays a launch after the warm start's gather (:meth:`.tree_factor.TreeFactor.seed_blocks`).
@@ -594,15 +595,13 @@ def walked_rows_kernel(release: bool, blocks: int, mimic_blocks: bool) -> wp.Ker
             for i in range(slips.world_start[world] + lane, slips.world_start[world + 1], lanes):
                 walk_release_tree(slips.world_arts[i], walk, slips, v_hat)
             world_sync(lanes)
+        for slot in range(lane, count, lanes):
+            write_row(
+                rows, support, line, slot, data, law, walk, body_to_articulation, mimic_dof0, mimic_dof1, mimic_coef1,
+                link_primary, link_shadow, velocity_limit_sign, body_q, body_com, v_hat, dt, contact_speculative_scale,
+                contact_w, restitution_velocity_threshold, weighted, material, packed_Z, row_incident,
+            )  # fmt: skip
         if wp.static(has_blocks):
-            for slot in range(lane, count, lanes):
-                if block_row(support.units[line, slot], wp.static(mimics)) != 0:
-                    write_row(
-                        rows, support, line, slot, data, law, walk, body_to_articulation, mimic_dof0, mimic_dof1,
-                        mimic_coef1, link_primary, link_shadow, velocity_limit_sign, body_q, body_com, v_hat, dt,
-                        contact_speculative_scale, contact_w, restitution_velocity_threshold, weighted, material,
-                        packed_Z, row_incident,
-                    )  # fmt: skip
             world_sync(lanes)
             for pe in range(preelim.world_start[world] + lane, preelim.world_start[world + 1], lanes):
                 close_block(
@@ -610,18 +609,8 @@ def walked_rows_kernel(release: bool, blocks: int, mimic_blocks: bool) -> wp.Ker
                     rows.rhs, row_incident, rows.diag,
                 )  # fmt: skip
             world_sync(lanes)
-        for slot in range(lane, count, lanes):
-            closed = int(0)
-            if wp.static(has_blocks):
-                closed = block_row(support.units[line, slot], wp.static(mimics))
-            if closed == 0:
-                write_row(
-                    rows, support, line, slot, data, law, walk, body_to_articulation, mimic_dof0, mimic_dof1,
-                    mimic_coef1, link_primary, link_shadow, velocity_limit_sign, body_q, body_com, v_hat, dt,
-                    contact_speculative_scale, contact_w, restitution_velocity_threshold, weighted, material,
-                    packed_Z, row_incident,
-                )  # fmt: skip
-                if wp.static(has_blocks):
+            for slot in range(lane, count, lanes):
+                if block_row(support.units[line, slot], wp.static(mimics)) == 0:
                     close_row(
                         line, slot, rows.sides[line, slot], wp.static(capacity), preelim, rows.row_cfm, packed_Z,
                         rows.rhs, rows.diag,
