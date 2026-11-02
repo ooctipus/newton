@@ -1961,11 +1961,10 @@ def walk_tree_prelude() -> DevicePrelude:
 _HELD = """    // The border held by the tree's segment (CUDA, every tree whose coordinates and bodies fit $HOLD words a lane): the
     // segment's lanes (one warp, or a packed tree's lanes) load the tree's walk, each coordinate's record and body and
     // each body's parent, first coordinate and link, into registers in one parallel trip, lane l holding coordinates and
-    // bodies l, l + WIDTH, ...; then every chain of the border along a path (the slips' paths, the columns, the
-    // release's recurrence, R and R^T) runs on every lane of the segment in lockstep, reading each
-    // step's values by shuffle, with no global load on a chain. A path's step t is kept by lane t % WIDTH and stored
-    // coalesced. The operations and their order are the serial text's (BORDER_SLIPS, BORDER_COLUMN, BORDER_GROUP,
-    // BORDER_APPLY). The decided step's two whole-tree walks are the class emitter's, as the trial's (walk_tree).
+    // bodies l, l + WIDTH, ...; then the release is built coordinate-major, a lane a slip (HELD_BUILD), and the
+    // decided step's chains (the two tree walks, R and R^T) run on every lane of the segment in lockstep, reading each
+    // step's values by shuffle, with no global load on a chain. The operations and their order per value are the
+    // serial text's (BORDER_SLIPS, BORDER_COLUMN, BORDER_GROUP, BORDER_APPLY).
     struct WalkHold {
         float r[$HOLD][13];
         int parent[$HOLD], first[$HOLD];
@@ -2143,145 +2142,129 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
         }
         WARP_SYNC();
     };
-    // HELD_BUILD(h, a, n, data, released, kept, pivot, column, fits): BORDER_SLIPS by one ballot over the coordinates'
-    // released stiffness, then each slip root-most first: its column walked up its path on the held walk (step t kept
-    // by lane t % WIDTH), the releases before it in its group applied through the dense column, the recurrence with its
-    // values in the lanes, its steps stored by the lanes. Returns the slips.
-    const auto HELD_BUILD = [&](const WalkHold& h, const int a, const int n, const int* bodies, const float* data,
-                                const float* released, const float* kept, float* pivot, float* column,
-                                const bool fits) -> int {
+    // HELD_BUILD(h, a, n, nb, data, released, kept): the release of the tree's slips, coordinate-major. The slips are
+    // its coordinates whose released stiffness is positive, root-most first (ascending), one a lane (lane j holds slip
+    // j: at most $SLIPS, the class's slip capacity, and the release's; a slip past them keeps its K and raises status
+    // bit 0). One leaf-first sweep over the coordinates the slips' paths hold: at each, every slip on it takes its
+    // column step (b = L^-1 P e_i) from the held record; then in slip order slip k takes its recurrence step on its
+    // lane and hands its b, a, g and the coordinate's new pivot to the later lanes, and each later slip on the
+    // coordinate applies R_k's step to its column with its pair state (R_k meets a column only where both paths hold
+    // the coordinate: from their meeting point). Every value is a register: the columns, the pivots (one a coordinate),
+    // the pair states; nothing of the release is read back. Each value's operations and their order are the serial
+    // text's (BORDER_COLUMN, BORDER_GROUP), so the stored release (WalkRelease) is the same. Returns the slips.
+    const auto HELD_BUILD = [&](const WalkHold& h, const int a, const int n, const int nb, const float* data,
+                                const float* released, const float* kept) -> int {
         auto& release = walk.release;
         const int depth = release.b.shape[2];
         const int cap = a < release.dof.shape[0] ? release.dof.shape[1] : 0;
-        unsigned long long slips = 0ull;
+        unsigned long long candidates = 0ull;
         #pragma unroll
         for (int k = 0; k < $HOLD; ++k) {
             const int x = lane + k * WIDTH;
-            slips |= (unsigned long long)BALLOT(x < n && released[x] > 0.0f) << (k * WIDTH);
+            candidates |= (unsigned long long)BALLOT(x < n && released[x] > 0.0f) << (k * WIDTH);
         }
-        if (slips != 0ull && fits) {
-            for (int c = lane; c < n; c += WIDTH) {
-                const float inverse = data[$coordinate * c + 12];
-                pivot[c] = 1.0f / (inverse * inverse);
-                column[c] = 0.0f;
-            }
-            WARP_SYNC();
+        const int total = COUNT(candidates);
+        const int slips = min(total, min(cap, $SLIPS));
+        if (total > slips && lane == 0) FRAME_STATUS(1);
+        int i = -1;
+        if (lane < slips) {
+            unsigned long long rest = candidates;
+            for (int q = 0; q < lane; ++q) rest &= rest - 1ull;
+            i = FIRST(rest);
         }
-        int s = 0;
+        const bool mine = i >= 0;
+        // The slip's own values, loaded once: its released and kept stiffness and its pivot without K.
+        float alpha = 0.0f, keep = 0.0f, pivot0 = 0.0f;
+        if (mine) {
+            alpha = -released[i];
+            keep = kept[i];
+            pivot0 = __ldg(data + $coordinate * i + $pivot);
+        }
+        float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}, z = 0.0f, pair[$SLIPS];
+        #pragma unroll
+        for (int k = 0; k < $SLIPS; ++k) pair[k] = 0.0f;
+        // next: the slip's next coordinate, leaf first along its path (-1 once past its root); t: its steps so far.
+        int next = i, t = 0, root = i;
+        const size_t at = ((size_t)a * cap + (mine ? lane : 0)) * depth;
+        const int deepest = slips > 0 ? READ(i, slips - 1) : -1;
         #pragma unroll 1
-        while (slips != 0ull) {
-            const int i = FIRST(slips);
-            slips &= slips - 1ull;
-            const int body0 = bodies[i];
-            int length = 0, root = i;
+        for (int b = nb - 1; b >= 0 && slips > 0; --b) {
+            const int f0 = HOLD_PICK(h.first, b), f1 = HOLD_PICK(h.first, b + 1);
+            if (f0 > deepest) continue;
+            const bool in = next >= f0 && next < f1;
+            if (BALLOT(in) == 0u) continue;
+            const int start = in ? next : -1;
             #pragma unroll 1
-            for (int body = body0, c = i; body >= 0;) {
-                const int f0 = HOLD_PICK(h.first, body);
-                for (; c >= f0; --c, ++length) root = c;
-                body = HOLD_PICK(h.parent, body);
-                if (body >= 0) c = HOLD_PICK(h.first, body + 1) - 1;
-            }
-            if (!fits || s >= cap || length > depth) {
-                if (lane == 0) FRAME_STATUS(1);
-                continue;
-            }
-            const int j = s++;
-            if (lane == 0) {
-                release.dof.data[a * cap + j] = i;
-                release.root.data[a * cap + j] = root;
-            }
-            // The column b = L^-1 P e_i up the path (BORDER_COLUMN), step t on lane t % WIDTH.
-            float pz[$HOLD];
-            int pc[$HOLD];
-            #pragma unroll
-            for (int k = 0; k < $HOLD; ++k) { pz[k] = 0.0f; pc[k] = -1; }
-            float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-            float x = 1.0f;
-            int t = 0;
-            #pragma unroll 1
-            for (int body = body0, c = i; body >= 0;) {
-                const int f0 = HOLD_PICK(h.first, body);
-                #pragma unroll 1
-                for (; c >= f0; --c, ++t) {
-                    float d[13];
-                    HOLD_RECORD(h, c, d);
-                    const float z = (x + ((d[0] * p[0] + d[1] * p[1] + d[2] * p[2]) + (d[3] * p[3] + d[4] * p[4] + d[5] * p[5])))
-                                    * d[12];
-                    x = 0.0f;
+            for (int c = f1 - 1; c >= f0; --c) {
+                const bool on = c <= start;
+                const unsigned slipping = BALLOT(on);
+                if (slipping == 0u) continue;
+                float d[13];
+                HOLD_RECORD(h, c, d);
+                if (on) {
+                    z = ((c == i ? 1.0f : 0.0f) + ((d[0] * p[0] + d[1] * p[1] + d[2] * p[2]) + (d[3] * p[3] + d[4] * p[4] + d[5] * p[5])))
+                        * d[12];
                     for (int q = 0; q < 6; ++q) p[q] -= d[6 + q] * z;
-                    #pragma unroll
-                    for (int k = 0; k < $HOLD; ++k)
-                        if (t == lane + k * WIDTH) { pz[k] = z; pc[k] = c; }
+                    root = c;
                 }
-                const int up = HOLD_PICK(h.parent, body);
-                float l[3];
-                HOLD_LINK(h, body, l);
+                float pivot = 1.0f / (d[12] * d[12]);
+                #pragma unroll
+                for (int k = 0; k < $SLIPS; ++k) {
+                    if (!((slipping >> k) & 1u)) continue;
+                    float bk = 0.0f, ak = 0.0f, gk = 0.0f, dk = 0.0f;
+                    if (lane == k) {
+                        const float dd = pivot, scale = sqrtf(dd);
+                        float dbar = dd + alpha * (z * scale) * (z * scale);
+                        if (c == i) dbar = pivot0 + keep;
+                        if (!(dbar > 0.0f) || !wp::isfinite(dbar)) FRAME_STATUS(2);
+                        const float beta = alpha * z * scale / dbar;
+                        alpha = alpha * dd / dbar;
+                        bk = z;
+                        ak = beta * scale;
+                        gk = scale / sqrtf(dbar);
+                        dk = dbar;
+                        if (t < depth) {
+                            release.coordinate.data[at + t] = c;
+                            release.b.data[at + t] = bk;
+                            release.a.data[at + t] = ak;
+                            release.g.data[at + t] = gk;
+                        }
+                        ++t;
+                    }
+                    bk = READ(bk, k);
+                    ak = READ(ak, k);
+                    gk = READ(gk, k);
+                    pivot = READ(dk, k);
+                    if (on && lane > k) {
+                        const float x = z - bk * pair[k];
+                        pair[k] += ak * x;
+                        z = gk * x;
+                    }
+                }
+            }
+            const int up = HOLD_PICK(h.parent, b);
+            const int last = HOLD_PICK(h.first, up + 1) - 1;
+            float l[3];
+            HOLD_LINK(h, b, l);
+            if (in) {
                 if (up >= 0) {
                     const float fx = p[0], fy = p[1], fz = p[2];
                     p[3] -= l[1] * fz - l[2] * fy;
                     p[4] -= l[2] * fx - l[0] * fz;
                     p[5] -= l[0] * fy - l[1] * fx;
-                    c = HOLD_PICK(h.first, up + 1) - 1;
                 }
-                body = up;
+                next = up >= 0 ? last : -1;
             }
-            const int length_j = t;
-            // The releases before it in its group (b_j' = R_<j b_j, W9 P4), through the dense column.
-            bool earlier = false;
-            #pragma unroll 1
-            for (int k = 0; k < j; ++k) earlier |= release.root.data[a * cap + k] == root;
-            if (earlier) {
-                #pragma unroll
-                for (int k = 0; k < $HOLD; ++k)
-                    if (pc[k] >= 0) column[pc[k]] = pz[k];
-                WARP_SYNC();
-                #pragma unroll 1
-                for (int k = 0; k < j; ++k)
-                    if (release.root.data[a * cap + k] == root) HELD_RELEASE(((size_t)a * cap + k) * depth, column, false);
-                #pragma unroll
-                for (int k = 0; k < $HOLD; ++k)
-                    if (pc[k] >= 0) pz[k] = column[pc[k]];
-                WARP_SYNC();
-            }
-            // The recurrence along the path, leaf first, its values on the lanes (BORDER_GROUP's).
-            float pd[$HOLD], pa[$HOLD], pg[$HOLD];
-            #pragma unroll
-            for (int k = 0; k < $HOLD; ++k) { pd[k] = pc[k] >= 0 ? pivot[pc[k]] : 1.0f; pa[k] = pg[k] = 0.0f; }
-            float alpha = -released[i];
-            #pragma unroll 1
-            for (int tt = 0; tt < length_j; ++tt) {
-                const int c = HOLD_PICK(pc, tt);
-                const float dd = HOLD_PICK(pd, tt), scale = sqrtf(dd), b = HOLD_PICK(pz, tt);
-                float dbar = dd + alpha * (b * scale) * (b * scale);
-                if (c == i) dbar = data[$coordinate * i + $pivot] + kept[i];
-                if ((!(dbar > 0.0f) || !wp::isfinite(dbar)) && lane == 0) FRAME_STATUS(2);
-                const float beta = alpha * b * scale / dbar;
-                alpha = alpha * dd / dbar;
-                const float av = beta * scale, gv = scale / sqrtf(dbar);
-                #pragma unroll
-                for (int k = 0; k < $HOLD; ++k)
-                    if (tt == lane + k * WIDTH) { pa[k] = av; pg[k] = gv; pd[k] = dbar; }
-            }
-            const size_t at = ((size_t)a * cap + j) * depth;
-            #pragma unroll
-            for (int k = 0; k < $HOLD; ++k) {
-                const int tt = lane + k * WIDTH;
-                if (tt < length_j) {
-                    release.coordinate.data[at + tt] = pc[k];
-                    release.b.data[at + tt] = pz[k];
-                    release.a.data[at + tt] = pa[k];
-                    release.g.data[at + tt] = pg[k];
-                    pivot[pc[k]] = pd[k];
-                    column[pc[k]] = 0.0f;
-                } else if (tt < depth) {
-                    release.coordinate.data[at + tt] = -1;
-                }
-            }
-            for (int tt = lane + $HOLD * WIDTH; tt < depth; tt += WIDTH) release.coordinate.data[at + tt] = -1;
-            WARP_SYNC();
         }
-        if (lane == 0) release.count.data[a] = s;
-        return s;
+        if (mine) {
+            if (t > depth) FRAME_STATUS(1);
+            release.dof.data[a * cap + lane] = i;
+            release.root.data[a * cap + lane] = root;
+            for (int tt = t; tt < depth; ++tt) release.coordinate.data[at + tt] = -1;
+        }
+        if (lane == 0) release.count.data[a] = slips;
+        WARP_SYNC();
+        return slips;
     };
 """
 
@@ -2440,8 +2423,8 @@ def _predictor_bounds(layout: TreeLayout) -> tuple[int, int]:
 def border_solve(layout: TreeLayout, classes: tuple) -> str:
     """Native statements of the decided step (FL3.9, W9). The block's lanes build each changed root's release (into
     :class:`.tree_factor.WalkRelease`, from the marks :data:`SATURATE_DRIVES` left): on CUDA, for a tree whose walk a
-    lane holds in two words (:data:`_HELD`), the tree's segment holds the walk in registers and runs every path's chain
-    in lockstep (the slips by one ballot, the columns, the recurrence); otherwise lane 0 lists the slips and their
+    lane holds in two words (:data:`_HELD`), the tree's segment holds the walk in registers and builds the release
+    coordinate-major, a lane a slip, every value a register (``HELD_BUILD``); otherwise lane 0 lists the slips and their
     groups (``BORDER_SLIPS``), a lane a slip walks the columns (``BORDER_COLUMN``) and a lane a group runs its slips'
     recurrences (``BORDER_GROUP``). Then each changed root takes its decided step from the force words into the response
     words on the trial's walks (:func:`walk_tree`): lane 0's walk up, ``R^T R`` (held: in lockstep; else a lane a group,
@@ -2511,16 +2494,19 @@ def border_solve(layout: TreeLayout, classes: tuple) -> str:
         "        if(moved&{bit}) {{{head}\n"
         "        if(d0+n>walk.data.shape[0]) {{if(lane==0) {{FRAME_STATUS(4);moved&=~{bit};}}}}\n"
         "        else if(lane<WIDTH) {{" + nb + hold + "\n"
-        "            const int room=$SIX_BODIES-$DOFS;\n"
-        "            float* const work=2*n<=room?s+$DOFS:reinterpret_cast<float*>(walk.scratch.data+j0);\n"
-        "            slips{r}=HELD_BUILD(h,a,n,walk.dof_body.data+d0,data,s+$WHITE+{offset},s+{offset},work,work+n,"
-        "2*n<=room||2*n<=6*nb);\n"
+        "            slips{r}=HELD_BUILD(h,a,n,nb,data,s+$WHITE+{offset},s+{offset});\n"
         "        }}}}\n"
     )
     held_step = (
         "        if((moved&{bit})&&lane<WIDTH) {{{head}" + nb + hold + "\n"
-        "            HELD_UP(h,n,nb,s+$SIX_BODIES+{offset},s+$WHITE+{offset},s);\n"
         "            const int cap=walk.release.dof.shape[1],depth=walk.release.b.shape[2];\n"
+        # The built release into L1 in one parallel trip, so R and R^T read it there.
+        "            {{const size_t base=(size_t)a*cap*depth;const int bytes=4*slips{r}*depth;"
+        "BORDER_FETCH(walk.release.coordinate.data+base,bytes,lane,WIDTH);"
+        "BORDER_FETCH(walk.release.b.data+base,bytes,lane,WIDTH);"
+        "BORDER_FETCH(walk.release.a.data+base,bytes,lane,WIDTH);"
+        "BORDER_FETCH(walk.release.g.data+base,bytes,lane,WIDTH);}}\n"
+        "            HELD_UP(h,n,nb,s+$SIX_BODIES+{offset},s+$WHITE+{offset},s);\n"
         "            for(int j=0;j<slips{r};++j)HELD_RELEASE(((size_t)a*cap+j)*depth,s+$WHITE+{offset},false);\n"
         "            for(int j=slips{r}-1;j>=0;--j)HELD_RELEASE(((size_t)a*cap+j)*depth,s+$WHITE+{offset},true);\n"
         "            HELD_DOWN(h,n,nb,s+$WHITE+{offset},s+$WHITE+{offset},s);\n"
@@ -2531,15 +2517,17 @@ def border_solve(layout: TreeLayout, classes: tuple) -> str:
     return substitute(text, {**layout.sizes(), "WALK_COORDINATE": WALK_COORDINATE, "WALK_LINK": WALK_LINK})
 
 
-def held_lambdas(layout: TreeLayout) -> str:
+def held_lambdas(layout: TreeLayout, slips: int) -> str:
     """The held walk's native lambdas (:data:`_HELD`) for the layout's words a lane, CUDA only, declared once ahead of the
-    trial; nothing for a tree past two words a lane (:func:`_held_words`)."""
+    trial; nothing for a tree past two words a lane (:func:`_held_words`). ``slips`` is the class's slip capacity
+    (:meth:`.tree_factor.TreeFactor.slip_capacity`): the build's lanes, one a slip, at most the segment's width."""
     from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_PIVOT  # noqa: PLC0415
 
     words = _held_words(layout)
     if not words:
         return ""
-    lambdas = substitute(_HELD, HOLD=words, coordinate=WALK_COORDINATE, link=WALK_LINK, pivot=WALK_PIVOT)
+    bound = max(1, min(slips, layout.lanes, 32))
+    lambdas = substitute(_HELD, HOLD=words, SLIPS=bound, coordinate=WALK_COORDINATE, link=WALK_LINK, pivot=WALK_PIVOT)
     return f"#if defined(__CUDA_ARCH__)\n{lambdas}\n#endif\n"
 
 
@@ -2723,6 +2711,7 @@ def get_predictor_kernel(
     clocked: bool = False,
     twists: bool,
     classes: tuple,
+    slips: int,
 ):
     """The predictor's response half (Z4.2, :data:`_RESPONSE_HALF`), after the force half (:func:`get_force_kernel`) and
     the walk's solve (:func:`get_walk_solve_kernel`): the trial's response read back into the block, ``qdd`` and
@@ -2731,8 +2720,9 @@ def get_predictor_kernel(
 
     ``schedules`` are the scans' schedules; ``clocked`` adds the predictor stage counters (see :func:`get_helpers`);
     ``twists`` holds the twist publication (:func:`publishes_twists`), which only CUDA builds; ``classes`` holds each
-    root's walking class (:class:`.tree_factor.WalkClass`, ``None`` for a prescribed root). ``response`` names only
-    the factor data still bound as ``d``.
+    root's walking class (:class:`.tree_factor.WalkClass`, ``None`` for a prescribed root); ``slips`` the classes'
+    slip capacity, the border's build lanes (:func:`held_lambdas`). ``response`` names only the factor data still bound
+    as ``d``.
     """
     if response not in ("sparse", "cholesky", "diagonal"):
         raise ValueError("Unknown held tree response representation")
@@ -2762,7 +2752,7 @@ def get_predictor_kernel(
         ),
         PHYSICAL_TABLE=layout.physical_table(),
         SCRATCH=_placed_block(layout, "s", "$PRED_SCRATCH"),
-        TRIAL=held_lambdas(layout)
+        TRIAL=held_lambdas(layout, slips)
         + substitute(
             _RESPONSE_STAGE,
             layout.sizes(),
