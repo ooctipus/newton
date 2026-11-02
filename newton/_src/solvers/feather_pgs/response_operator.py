@@ -1064,7 +1064,8 @@ class WalkedRows:
         Zi[(offset + c) * ZS] += z;
         incident += j * s_v[offset + c];
     }};
-    float p[6], w[6];
+    float p[6], w[6], shift[3];
+    WALK_SHIFT(walk, art, shift);
     int top = WALK_FIRST_OF(body + 1) - 1;
     for (int e = 0; e < 6; ++e) p[e] = w[e] = k < 0 ? seed[e] : 0.0f;
     if (k >= 0) {{
@@ -1072,7 +1073,7 @@ class WalkedRows:
         top = k - 1;
         now = nullptr;
     }}
-    WALK_UP(data, link, now, now_link, body, top, p, w, sink);
+    WALK_UP(data, link, now, now_link, shift, body, top, p, w, sink);
 }};"""
 
     def _sides(self) -> tuple[tuple[int, int, str], ...]:
@@ -1671,6 +1672,8 @@ class LocalBlock(ResidualBlock):
                 lines += [
                     f"const float* walk_now = walk.now.data + (size_t)walk_d0 * {WALK_NOW};",
                     f"const float* walk_now_link = walk.now_link.data + (size_t)walk_j0 * {WALK_LINK};",
+                    "float walk_shift[3];",
+                    "WALK_SHIFT(walk, art, walk_shift);",
                 ]
             if S:
                 lines += [
@@ -1682,6 +1685,8 @@ class LocalBlock(ResidualBlock):
                     lines += [
                         f"const float* free_now = walk.now.data + (size_t)free_d0 * {WALK_NOW};",
                         f"const float* free_now_link = walk.now_link.data + (size_t)free_j0 * {WALK_LINK};",
+                        "float free_shift[3];",
+                        "WALK_SHIFT(walk, secondary_art, free_shift);",
                     ]
         else:
             C, K, B = self.coordinate_floats, self.link_floats, self.bodies
@@ -1728,6 +1733,8 @@ class LocalBlock(ResidualBlock):
                 lines += [
                     f"const float* walk_now = s_walk + {WALK_STAGED};",
                     f"const float* walk_now_link = walk.now_link.data + (size_t)walk_j0 * {WALK_LINK};",
+                    "float walk_shift[3];",
+                    "WALK_SHIFT(walk, art, walk_shift);",
                 ]
             if S:
                 lines += [
@@ -1746,6 +1753,8 @@ class LocalBlock(ResidualBlock):
                         f"const float* free_now = free_data + {WALK_STAGED};",
                         f"free_link = s_walk + {self.dofs * C + B * K};",
                         f"const float* free_now_link = walk.now_link.data + (size_t)free_j0 * {WALK_LINK};",
+                        "float free_shift[3];",
+                        "WALK_SHIFT(walk, secondary_art, free_shift);",
                     ]
         lines.append(f"const auto walk_primary = [&]() {{ WALK_TREE(walk_path, walk_bodies, {P}); }};")
         if S:
@@ -1761,21 +1770,22 @@ class LocalBlock(ResidualBlock):
                 "        incident += j * s_v[c];",
                 "    };",
                 "    WALK_SEED(walk_data, dof, x, p, sink);",
-                "    WALK_UP(walk_data, walk_link, nullptr, nullptr, walk_dof_body[dof], dof - 1, p, w, sink);",
+                "    WALK_UP(walk_data, walk_link, nullptr, nullptr, nullptr, walk_dof_body[dof], dof - 1, p, w, sink);",
                 "    return incident;",
                 "};",
             ]
             if self.wrenches:
                 lines += [
                     "// A wrench seed at body b's walk frame (the factor's), walked into the footprints z of a tree (data,",
-                    "// link, now, now_link: its walk and the step's geometry the finish published; v its staged velocity); its",
-                    "// incident.",
+                    "// link, now, now_link, shift: its walk, the step's geometry the finish published and its origins'",
+                    "// difference; v its staged velocity); its incident.",
                     "const auto walk_wrench = [&](float* z, const float* v, const float* data, const float* link,",
-                    "                             const float* now, const float* now_link, const int b,",
+                    "                             const float* now, const float* now_link, const float* shift, const int b,",
                     "                             const float* wrench) -> float {",
                     "    float p[6], w[6], incident = 0.0f;",
                     "    for (int k = 0; k < 6; ++k) p[k] = w[k] = wrench[k];",
-                    "    WALK_UP(data, link, now, now_link, b, WALK_FIRST_OF(b + 1) - 1, p, w, [&](int, int c, float y, float j) {",
+                    "    WALK_UP(data, link, now, now_link, shift, b, WALK_FIRST_OF(b + 1) - 1, p, w,",
+                    "            [&](int, int c, float y, float j) {",
                     "        z[c] += y;",
                     "        incident += j * v[c];",
                     "    });",

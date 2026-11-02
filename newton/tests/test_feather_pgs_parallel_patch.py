@@ -1300,6 +1300,8 @@ def identity_walk(dofs: int, device) -> WalkTrees:
     walk.path = wp.array([(-1, 0)], dtype=wp.vec2i, device=device)
     walk.now = wp.zeros((dofs, WALK_NOW), dtype=wp.float32, device=device)
     walk.now_link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
+    walk.now_com = wp.zeros(1, dtype=wp.vec3, device=device)
+    walk.origin = walk.now_origin = wp.zeros(1, dtype=wp.vec3, device=device)
     walk.scratch = wp.zeros(1, dtype=wp.spatial_vector, device=device)
     for name, values in (
         ("joint_start", [0]),
@@ -1308,6 +1310,7 @@ def identity_walk(dofs: int, device) -> WalkTrees:
         ("dofs", [dofs]),
         ("dof_body", [0] * dofs),
         ("body_joint", [0]),
+        ("joint_art", [0]),
     ):
         setattr(walk, name, wp.array(values, dtype=wp.int32, device=device))
     walk.release = release_view(1, 0, 1, device)

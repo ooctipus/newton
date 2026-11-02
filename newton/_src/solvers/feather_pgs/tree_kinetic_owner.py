@@ -320,6 +320,7 @@ class TreeKineticState:
             diagonal=dofs if self.diagonal_mass else 0,
         )
         self.data.current_valid = solver.factor.fk_id_cache_valid
+        self.data.com_offset = solver.factor.joint_com_offset
         self.data.stage_clocks = cached_state_binding.stage_clocks(solver)
         # A classified repair's block lists (at most one entry per block each) and their
         # counts (repair, comparison), allocated before any capture.
