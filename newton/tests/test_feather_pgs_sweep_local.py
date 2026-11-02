@@ -271,16 +271,18 @@ class TestResponseOperators(unittest.TestCase):
         self.assertNotIn("walk.data.data + (size_t)walk_d0", prologue)
         respond = block.respond(packets, "")
         self.assertIn(
-            "walk_wrench(&s_Z[staged], s_v, walk_data, walk_link, walk_now, walk_origin, code, wrench)", respond
+            "walk_wrench(&s_Z[staged], s_v, walk_data, walk_link, walk_now, walk_now_link, code, wrench)", respond
         )
-        self.assertIn("walk_wrench(&s_Z[staged + 9], s_v + 9, free_data, free_link, free_now, free_origin, 0,", respond)
+        self.assertIn(
+            "walk_wrench(&s_Z[staged + 9], s_v + 9, free_data, free_link, free_now, free_now_link, 0,", respond
+        )
         self.assertIn("incident += walk_covector(&s_Z[staged], dof, weight);", respond)
         self.assertIn("WALK_RELEASE(walk.release, art, &s_Z[staged]);", respond)
         self.assertIn("row_diagonal += z * z;", respond)
         self.assertNotIn("s_L", respond)
         # Read in place, the same walks take the device walk's data (a data-chosen layout).
         in_place = LocalBlock(15, 9, 11, seeds=True, wrenches=True, lanes=Lanes(32)).prologue()
-        self.assertIn("const float* walk_now = reinterpret_cast<const float*>(walk.motion.data + walk_d0);", in_place)
+        self.assertIn("const float* walk_now = reinterpret_cast<const float*>(walk.now.data + walk_d0);", in_place)
         self.assertNotIn("s_walk", in_place)
         # The one writer's stored rows: read, not whitened again; the walk read in place for the leave.
         stored_block = LocalBlock(15, 9, release=True, lanes=Lanes(32))

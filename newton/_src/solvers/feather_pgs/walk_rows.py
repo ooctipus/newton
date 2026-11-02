@@ -14,7 +14,8 @@ row of a world on the world's lanes (:func:`walked_rows_kernel`):
   limit's and a velocity limit's covector ``+-e_c``, a mimic's ``e_f - c e_l``;
 - **the walk** (:func:`.tree_factor.walk_paths_prelude`): each seed walked up its root path into the packed sink at its
   side's entries, stored, a second seed on one tree adding where their paths meet. A wrench enters as the step's ``J``,
-  the finish's motion columns shifted to the walk's frames (:attr:`.tree_factor.WalkTrees.motion`), and the refresh's
+  the step's columns the finish published, shifted to the walk's frames (:attr:`.tree_factor.WalkTrees.now`), and the
+  refresh's
   factor whitens it, so a step between
   refreshes whitens the step's ``J`` by the held factor, as the dense rows do. A free rigid body is a one-body tree:
   its side is a six-step walk;
@@ -132,8 +133,8 @@ def walk_wrench(
 def body_wrench(walk: WalkTrees, body: int, direction: wp.vec3, point: wp.vec3, torque: bool) -> wp.spatial_vector:
     """The seed of a row acting on ``body`` along ``direction`` at ``point`` (a pure ``torque`` about it), by the
     contact law (:func:`.contact_laws.contact_seed`, :func:`.contact_laws.spin_seed`): a wrench at the body's frame, the
-    factor's (:attr:`.tree_factor.WalkTrees.link`), where the walk shifts the finish's motion columns to take the step's
-    ``J``. The lever arm is the world points' difference here; the law takes it from wherever it is formed."""
+    factor's (:attr:`.tree_factor.WalkTrees.link`), where the walk shifts the step's columns the finish published to
+    take the step's ``J``. The lever arm is the world points' difference here; the law takes it from wherever it is formed."""
     if torque:
         return spin_seed(direction)
     j = walk.body_joint[body]
@@ -160,7 +161,6 @@ def walk_body(
     j0 = walk.joint_start[art]
     return walk_into(
         walk,
-        art,
         j0,
         walk.dof_start[art],
         walk.joint_end[art] - j0,
@@ -738,8 +738,8 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
         }
         const float* data = walk.data.data + (size_t)d0 * $coordinate;
         const float* link = walk.link.data + (size_t)j0 * $link;
-        const float* now = reinterpret_cast<const float*>(walk.motion.data + d0);
-        const float* origin = reinterpret_cast<const float*>(walk.origin.data + art);
+        const float* now = reinterpret_cast<const float*>(walk.now.data + d0);
+        const float* now_link = walk.now_link.data + (size_t)j0 * $link;
         const float* vh = sink.v_hat.data + d0;
         const auto rank = [&](int c) -> int { return base + POPC(mask & ((1ull << SUPPORT_NODE[c]) - 1ull)); };
         const auto store = [&](int r, int c, float z, float) {
@@ -807,7 +807,7 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                     if (r < rows) incident[r] += j * vh[c];
                     store(r, c, z, j);
                 };
-                WALK_UP(data, link, now, origin, local, WALK_FIRST_OF(local + 1) - 1, p, w, sink);
+                WALK_UP(data, link, now, now_link, local, WALK_FIRST_OF(local + 1) - 1, p, w, sink);
             }
         }
         // A slipping tree's release (the predictor's border), root-most slip first, on the side's entries along each
@@ -902,6 +902,7 @@ $tail
 _SPIN_TAIL = """        record[4] = cross[3];
         record[5] = cross[4];
         record[6] = cross[5];"""
+
 
 @cache
 def _support_table(node: tuple[int, ...]) -> DevicePrelude:
@@ -1005,6 +1006,7 @@ def support_rows_kernel(
 
     walk_one = walker(1, False)
     walk_unit = walker(unit_rows, records)
+
     def kernel(
         rows: DenseRows,
         sources: wp.array2d[int],

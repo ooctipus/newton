@@ -93,7 +93,7 @@ _UP = """    if (tid >= body.shape[0]) return;
     const float* d = data.data + (size_t)tree.data[tid] * n * $coordinate;
     const float* l = link.data + (size_t)tree.data[tid] * bodies * $link;
     const float* s = now.data + (size_t)tree.data[tid] * n * $now;
-    const float* f = origin.data + (size_t)tree.data[tid] * 3;
+    const float* f = now_link.data + (size_t)tree.data[tid] * bodies * $link;
     float* out = z.data + (size_t)tid * $rows * n;
     float* entries = jz.data + (size_t)tid * $rows * n;
     const auto sink = [&](int r, int c, float value, float j) {
@@ -131,7 +131,7 @@ _UP_PARAMS = params(
     ("data", wp.array3d[float]),
     ("link", wp.array3d[float]),
     ("now", wp.array3d[float]),
-    ("origin", wp.array2d[float]),
+    ("now_link", wp.array3d[float]),
     ("tree", wp.array[int]),
     ("body", wp.array[int]),
     ("top", wp.array[int]),
@@ -195,19 +195,15 @@ class DeviceWalk:
         link[:, :, WALK_FRAME : WALK_FRAME + 3] = self.frames
         self.data = wp.array(np.stack(data), dtype=float, device=device)
         self.link = wp.array(link, dtype=float, device=device)
-        # The step's geometry (WalkTrees.motion, .origin): the motion columns about the origin of the walks' own poses,
-        # or of ``step``'s walks, the same trees at a step's poses after the refresh's (its frames at the step's).
+        # The step's geometry (WalkTrees.now, .now_link): the columns at each body's frame and the links of the walks'
+        # own poses, or of ``step``'s walks, the same trees at a step's poses after the refresh's (its frames at the
+        # step's).
         step = walks if step is None else step
         self.step_frames = np.stack([frame_points(walk) for walk in step])
-        motion = []
-        for walk, frames in zip(step, self.step_frames, strict=True):
-            s = np.asarray(walk.s, dtype=np.float64).copy()
-            for b in range(walk.parent.size):
-                for c in range(int(walk.first[b]), int(walk.first[b + 1])):
-                    s[c, 0:3] -= np.cross(s[c, 3:6], frames[b])
-            motion.append(s)
-        self.now = wp.array(np.stack(motion), dtype=float, device=device)
-        self.origin = wp.zeros((len(walks), 3), dtype=float, device=device)
+        now_link = np.stack([walk.device_data()[1] for walk in step])
+        now_link[:, :, WALK_FRAME : WALK_FRAME + 3] = self.step_frames
+        self.now = wp.array(np.stack([np.asarray(walk.s) for walk in step]), dtype=float, device=device)
+        self.now_link = wp.array(now_link, dtype=float, device=device)
 
     def up(self, tree, body, top, seeded, wrench, covector, entries: bool = False):
         """Footprints ``[seeds, rows, n]`` of seeds of ``rows`` rows: wrenches ``[seeds, rows, 6]`` at their bodies'
@@ -234,7 +230,7 @@ class DeviceWalk:
                 self.data,
                 self.link,
                 self.now,
-                self.origin,
+                self.now_link,
                 array(tree, int),
                 array(body, int),
                 array(top, int),
@@ -796,10 +792,12 @@ def two_schedules(device, bodies: int, rng) -> dict:
         warnings.simplefilter("ignore")
         solver = SolverFeatherPGS(model, pgs_iterations=4)
     state = model.state()
-    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
     factor = solver.factor
     if factor.walk_arts is None:
         factor.plan_walk(np.arange(model.articulation_count, dtype=np.int32))
+    # The held tree's repair publishes the state's poses and the walk's step geometry, as a step's would.
+    factor.last_step_dt = 1.0 / 240.0
+    factor.fk_id(state, model.state(), 0, wp.zeros_like(state.joint_qd))
     factor.mass_update_mask.fill_(1)
     walk = factor.walk(q, 0)
     n = walk.s.shape[0]

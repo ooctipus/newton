@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import warp as wp
 
-from ...sim import BodyFlags
+from ...sim import BodyFlags, JointType
 from . import (
     cached_force,
     field_group,
@@ -1124,6 +1124,7 @@ def get_state_kernel(
     _store_origin, _load_origin, _store_axis = h._store_origin, h._load_origin, h._store_axis
     bodies, dofs, pack, free_root = layout.bodies, layout.dofs, layout.pack, layout.free_root
     roots, free_roots, forest, own_bias = len(layout.roots), layout.free_root_count, layout.forest, layout.own_bias
+    from .tree_factor import WALK_FRAME  # noqa: PLC0415 (tree_factor imports the finish's kernels' modules)
 
     @wp.func
     def admit(
@@ -1353,7 +1354,9 @@ def get_state_kernel(
                 anchor = _load_pose(g.address, parent) * anchor
             else:
                 anchor = wp.transform(wp.transform_get_translation(anchor) - shift, wp.transform_get_rotation(anchor))
-            anchor = wp.transform(wp.transform_get_translation(anchor) - origin, wp.transform_get_rotation(anchor))
+            # The joint's frame point (shifted with the root): its anchor, a free joint's child's centre of mass.
+            point = wp.transform_get_translation(anchor)
+            anchor = wp.transform(point - origin, wp.transform_get_rotation(anchor))
             if wp.static(clocked):
                 clock_m1 = _clock()
             velocity, bias = joint_motion(
@@ -1374,6 +1377,34 @@ def get_state_kernel(
             count = data.joint_dof_dim[joint, 0] + data.joint_dof_dim[joint, 1]
             for k in range(count):
                 _store_axis(g.address, start - g.ds + k, data.joint_S_s[start + k])
+            if data.walk_now.shape[0] > 0:
+                # The walk's step geometry (tree_factor.WalkTrees.now): the same columns at the joint's frame, so a
+                # walk takes them there without S's lever about the origin, and the frame's world point.
+                kind = data.joint_type[joint]
+                free = kind == JointType.FREE or kind == JointType.DISTANCE
+                if free:
+                    point = wp.transform_point(_load_pose(g.address, local), data.body_com[data.joint_child[joint]])
+                joint_motion(
+                    kind,
+                    data.joint_axis,
+                    data.joint_dof_dim[joint, 0],
+                    data.joint_dof_dim[joint, 1],
+                    wp.transform(wp.vec3(), wp.transform_get_rotation(anchor)),
+                    q,
+                    data.joint_q_start[joint],
+                    qd,
+                    start,
+                    data.walk_now,
+                )
+                if free:
+                    # A free joint turns about the articulation's origin: the same twist at its frame.
+                    for k in range(3):
+                        turn = data.walk_now[start + 3 + k]
+                        w = wp.spatial_bottom(turn)
+                        data.walk_now[start + 3 + k] = wp.spatial_vector(wp.cross(w, point - origin), w)
+                frame = point + shift
+                for k in range(3):
+                    data.walk_now_link[joint, wp.static(WALK_FRAME) + k] = frame[k]
             _store_motion(g.address, local, velocity)
             if wp.static(own_bias):
                 _store_bias(g.address, local, bias)
@@ -1393,6 +1424,19 @@ def get_state_kernel(
         """Publish each body's pose and twist with its bias wrench and moments."""
         for local in range(g.lane, bodies, g.stride):
             body = data.joint_child[g.js + local]
+            if data.walk_now_link.shape[0] > 0:
+                # The walk's link at the step's poses: the parent's frame less the body's, from the frame points the
+                # motion stage stored.
+                joint = g.js + local
+                parent = plan.parent[local]
+                for k in range(3):
+                    offset = float(0.0)
+                    if parent >= 0:
+                        offset = (
+                            data.walk_now_link[g.js + parent, wp.static(WALK_FRAME) + k]
+                            - data.walk_now_link[joint, wp.static(WALK_FRAME) + k]
+                        )
+                    data.walk_now_link[joint, k] = offset
             if wp.static(forest):
                 origin = _load_origin(g.address, 2 * plan.root_of[local])
                 shift = _load_origin(g.address, 2 * plan.root_of[local] + 1)
