@@ -183,6 +183,7 @@ class TreeFactor:
         self.walk_arts = None
         self.walk_classes: tuple[WalkClass, ...] = ()
         self.walk_half_host = None
+        self.walk_side = True
         self.walk_class = None
         self.walk_leave = None
         self.walk_slip_capacity = 0
@@ -993,6 +994,8 @@ class TreeFactor:
         self.walk_path = wp.array(path, dtype=wp.vec2i, device=device)
         self.walk_joins = wp.array(joins, dtype=wp.int32, device=device)
         self.walk_path_host = path
+        # The one flag every walk reader's text is chosen by: whether a record (and a step column) can have a side.
+        self.walk_side = both
         self.walk_data = wp.zeros(((2 if both else 1) * dofs, WALK_COORDINATE), dtype=wp.float32, device=device)
         self.walk_link = wp.zeros((joints, WALK_LINK), dtype=wp.float32, device=device)
         self.walk_leave_twist = wp.zeros(joints, dtype=wp.spatial_vector, device=device)
@@ -2026,17 +2029,44 @@ _WALK_LOADS_CPU = """#ifndef WALK_LOAD_RECORD
 """The CPU twin of :data:`_WALK_LOADS`: each prelude carries its device's text under the snippet's one guard."""
 
 
+_WALK_ONE_HALF = """#ifndef WALK_LOAD_ONE_HALF
+// The loads for a reader whose trees have no column of two halves (TreeFactor.walk_side false): a record's and a step
+// column's, with no side load.
+#define WALK_LOAD_ONE_HALF(d, p)                                                                                \
+    {                                                                                                          \
+        const float4* walk_q_ = reinterpret_cast<const float4*>(p);                                            \
+        const float4 walk_a_ = __ldg(walk_q_), walk_b_ = __ldg(walk_q_ + 1), walk_e_ = __ldg(walk_q_ + 2);     \
+        const float4 walk_v_ = make_float4(0.0f, 0.0f, 0.0f, 0.0f);                                            \
+        WALK_UNPACK(d, walk_a_, walk_b_, walk_e_, walk_v_);                                                    \
+    }
+#define WALK_LOAD_COLUMN_ONE_HALF(S, p)                                                                         \
+    {                                                                                                          \
+        const float4 walk_a_ = __ldg(reinterpret_cast<const float4*>(p));                                      \
+        const bool walk_t_ = (int)walk_a_.w != 0;                                                              \
+        S[0] = walk_t_ ? 0.0f : walk_a_.x; S[1] = walk_t_ ? 0.0f : walk_a_.y; S[2] = walk_t_ ? 0.0f : walk_a_.z; \
+        S[3] = walk_t_ ? walk_a_.x : 0.0f; S[4] = walk_t_ ? walk_a_.y : 0.0f; S[5] = walk_t_ ? walk_a_.z : 0.0f; \
+    }
+#endif"""
+
+_WALK_ONE_HALF_CPU = """#ifndef WALK_LOAD_ONE_HALF
+#define WALK_LOAD_ONE_HALF(d, p) WALK_LOAD_RECORD(d, p)
+#define WALK_LOAD_COLUMN_ONE_HALF(S, p) WALK_LOAD_COLUMN(S, p)
+#endif"""
+"""The CPU twin of :data:`_WALK_ONE_HALF`: the CPU reads the side where there is one, so the full loads serve."""
+
 WALK_LINK_FRAME = 3
 """Where a body's link, as a walk reads it (``WALK_LOAD_LINK``'s registers, or a kernel's staged copy), holds its frame
 point: after its offset to its parent's frame."""
 
 
-def _walk_loads_text(cuda: bool) -> str:
-    """The loads text (:data:`_WALK_LOADS`, or its CPU twin) at the device layout."""
-    return substitute(_WALK_LOADS if cuda else _WALK_LOADS_CPU, link=WALK_LINK)
+def _walk_loads_text(cuda: bool, side: bool = True) -> str:
+    """The loads text (:data:`_WALK_LOADS`, or its CPU twin) at the device layout, with :data:`_WALK_ONE_HALF` for a
+    reader of trees without a side (``side`` false, :attr:`TreeFactor.walk_side`)."""
+    text = substitute(_WALK_LOADS if cuda else _WALK_LOADS_CPU, link=WALK_LINK)
+    return text if side else text + "\n" + (_WALK_ONE_HALF if cuda else _WALK_ONE_HALF_CPU)
 
 
-def _walk_loads(coordinate: int, link: int, now: int) -> dict[str, str]:
+def _walk_loads(coordinate: int, link: int, now: int, side: bool = True) -> dict[str, str]:
     """The shared walk text's loads (``_WALK``'s ``$record_*``, ``$link_*``, ``$column_c``, ``$point_b`` slots) for a
     layout: the device layout's field groups by their vector loads (:data:`_WALK_LOADS`), a kernel's staged copy of it
     (another stride, in shared memory) by pointer."""
@@ -2045,7 +2075,8 @@ def _walk_loads(coordinate: int, link: int, now: int) -> dict[str, str]:
     def record(indent):
         pad = " " * indent
         if device:
-            return f"{pad}float d[{WALK_UNPACKED}];\n{pad}WALK_LOAD_RECORD(d, data + {WALK_COORDINATE} * c);"
+            load = "WALK_LOAD_RECORD" if side else "WALK_LOAD_ONE_HALF"
+            return f"{pad}float d[{WALK_UNPACKED}];\n{pad}{load}(d, data + {WALK_COORDINATE} * c);"
         return f"{pad}const float* d = data + {coordinate} * c;"
 
     def body_link(indent, up):
@@ -2057,7 +2088,7 @@ def _walk_loads(coordinate: int, link: int, now: int) -> dict[str, str]:
     if device:
         column = (
             "                float S[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};\n"
-            f"                if (now != nullptr) WALK_LOAD_COLUMN(S, now + {WALK_NOW} * c);"
+            f"                if (now != nullptr) {'WALK_LOAD_COLUMN' if side else 'WALK_LOAD_COLUMN_ONE_HALF'}(S, now + {WALK_NOW} * c);"
         )
     else:
         column = f"                const float* S = now != nullptr ? now + {now} * c : d;"
@@ -2120,7 +2151,7 @@ def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int) -> 
 
 @functools.cache
 def walk_paths_prelude(
-    rows: int, *, coordinate: int = WALK_COORDINATE, link: int = WALK_LINK, now: int = WALK_NOW
+    rows: int, *, coordinate: int = WALK_COORDINATE, link: int = WALK_LINK, now: int = WALK_NOW, side: bool = True
 ) -> DevicePrelude:
     """The device walk of any tree, for both devices: :func:`walk_prelude`'s functions over a path table in global
     memory, one tree at a time (``WALK_TREE(path, bodies, coordinates)`` before its walks), the table
@@ -2133,7 +2164,9 @@ def walk_paths_prelude(
             layout (:data:`WALK_COORDINATE`, :data:`WALK_LINK`, :data:`WALK_NOW`), or a kernel's staged copy of it, a
             body's link unpacked (its offset, then its frame point at :data:`WALK_LINK_FRAME`)
             (:class:`.response_operator.LocalBlock`: a coordinate's step column interleaved after its
-            :data:`WALK_STAGED` floats, so ``now == coordinate``). The step's frame points (``now_link``) are read
+            :data:`WALK_STAGED` floats, so ``now == coordinate``).
+        side: Whether a record or step column can have a side (:attr:`TreeFactor.walk_side`); without, the device
+            loads take none. The step's frame points (``now_link``) are read
             at :data:`WALK_LINK`'s layout wherever the rest is.
     """
     if rows < 1:
@@ -2147,15 +2180,16 @@ def walk_paths_prelude(
             now=now,
             frame=WALK_LINK_FRAME,
             batch=WALK_SLIP_BATCH,
-            **_walk_loads(coordinate, link, now),
+            **_walk_loads(coordinate, link, now, side),
         )
     )
     layout = (coordinate, link, now)
     name = f"walk_paths_{rows}" + (
         "" if layout == (WALK_COORDINATE, WALK_LINK, WALK_NOW) else f"_{coordinate}_{link}_{now}"
     )
+    name += "" if side else "_one_half"
     return DevicePrelude(
-        name, _walk_loads_text(cuda=True) + "\n" + walk, cpu=_walk_loads_text(cuda=False) + "\n" + walk
+        name, _walk_loads_text(True, side) + "\n" + walk, cpu=_walk_loads_text(False, side) + "\n" + walk
     )
 
 
@@ -3125,12 +3159,12 @@ _COVECTOR_SEED = """(void)now;
 
 
 @functools.cache
-def _walk_into_snippet(seed: str) -> str:
+def _walk_into_snippet(seed: str, side: bool = True) -> str:
     from .device_preludes import dual_native  # noqa: PLC0415
 
     return dual_native(
         substitute(_WALK_INTO.replace("$seed", seed), coordinate=WALK_COORDINATE, link=WALK_LINK, now=WALK_NOW),
-        preludes=(walk_paths_prelude(1),),
+        preludes=(walk_paths_prelude(1, side=side),),
     )
 
 
@@ -3177,6 +3211,47 @@ def walk_covector_into(
 ) -> wp.vec2:
     """Walk one row's covector seed ``value e_coordinate`` (local coordinate of local ``body``) into
     ``out[line, slot, entry + c]`` as :func:`walk_into` does; its incident is ``value qd[coordinate]``."""
+    ...
+
+
+@wp.func_native(_walk_into_snippet(_WRENCH_SEED, side=False))
+def walk_into_one_half(
+    walk: WalkTrees,
+    joint0: int,
+    dof0: int,
+    bodies: int,
+    coordinates: int,
+    body: int,
+    wrench: wp.spatial_vector,
+    qd: wp.array[float],
+    add: int,
+    out: wp.array3d[float],
+    line: int,
+    slot: int,
+    entry: int,
+) -> wp.vec2:
+    """:func:`walk_into` for a model whose records have no side (:attr:`TreeFactor.walk_side` false)."""
+    ...
+
+
+@wp.func_native(_walk_into_snippet(_COVECTOR_SEED, side=False))
+def walk_covector_into_one_half(
+    walk: WalkTrees,
+    joint0: int,
+    dof0: int,
+    bodies: int,
+    coordinates: int,
+    body: int,
+    coordinate: int,
+    value: float,
+    qd: wp.array[float],
+    add: int,
+    out: wp.array3d[float],
+    line: int,
+    slot: int,
+    entry: int,
+) -> wp.vec2:
+    """:func:`walk_covector_into` for a model whose records have no side (:attr:`TreeFactor.walk_side` false)."""
     ...
 
 

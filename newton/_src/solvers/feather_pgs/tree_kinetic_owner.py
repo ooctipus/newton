@@ -424,6 +424,7 @@ class TreeKineticState:
             twists=self._predicts_twists,
             classes=classes,
             slips=self.solver.factor.walk_slip_capacity,
+            side=self.solver.factor.walk_side,
         )
         # The trial's words between the predictor's halves and the walk's solve, at their global coordinates.
         if getattr(self, "trial", None) is None:
