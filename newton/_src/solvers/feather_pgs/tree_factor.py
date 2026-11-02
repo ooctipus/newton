@@ -2222,6 +2222,15 @@ loads and 43 stores): straight-line, g1's walk solve runs 78.0 -> 58.1 us a laun
 6000, 16,384 worlds; ZP5, ZV). An earlier bench (ZE: the loop form faster on g1, 41.6 against 51.9 us) predates the
 record's vector loads and the touches."""
 
+
+def held_fits(words: int, registers: int) -> bool:
+    """Whether a thread may hold ``words`` floats of a walk's data across the walk: they fit ``registers``, the kernel's
+    budget a thread (:data:`WALK_REGISTERS` without a launch bound). The one rule by which a walk solve holds its
+    class's items for both walks (:meth:`WalkClass.walk_twice`) and the support writer holds a unit's side for the
+    slips' release (:data:`.walk_rows._RELEASE_HELD`)."""
+    return words <= registers
+
+
 WALK_AHEAD = 4
 """Items (a body's joint input, a coordinate's step input) a walk keeps in flight ahead of its serial chain
 (:meth:`WalkClass.ahead`): each step of the chain then waits on no load, and a lane holds this many items' inputs in
@@ -2583,7 +2592,7 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
         coordinate ``$c`` (its own values in place of the first walk's); each item's line is touched before the
         fetches. Past that, each walk fetches its own items ahead of its chain and touches them (:meth:`walk`).
         """
-        if self.coordinates > first.get("unroll", WALK_UNROLL) or self.held_words > registers:
+        if self.coordinates > first.get("unroll", WALK_UNROLL) or not held_fits(self.held_words, registers):
             return "{\n" + self.walk(**first, cuda=cuda) + "\n}\n{\n" + self.walk(**second, cuda=cuda) + "\n}"
         bare = {"fetch_joint": "", "fetch_step": "", "touch_joint": "", "touch_step": ""}
         # Every held item's line asked of L1 first, then the fetches: on the RTX PRO 6000 the bare fetches of a free
