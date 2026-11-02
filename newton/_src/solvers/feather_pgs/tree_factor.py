@@ -2405,6 +2405,11 @@ class WalkClass:
             table("STEP", flags),
             table("COORDINATE", [c for _, c, _, _ in sequence]),
         ]
+        # The class's column halves (half_of): a table where none has both, so the walk's fetch takes no side; else
+        # each record's own.
+        one_half = bool(self.half) and max(self.half) < WALK_BOTH
+        if one_half:
+            tables.append(table("HALF", list(self.half)))
         if count:
             tables.append(table("SLOT", slots))
         each = "for (int k = 0; k < $width; ++k)"
@@ -2416,8 +2421,9 @@ class WalkClass:
                 body = f"({name}_STEP[{at}] & 0xffff)"
                 out.append(f"walk_l{j} = {_fill(fetch_joint, b=body, up=f'{name}_PARENT[{body}]')};")
             if fetch_step:
+                coordinate = f"(({name}_COORDINATE[{at}]) < 0 ? 0 : {name}_COORDINATE[{at}])"
                 out.append(
-                    f"walk_x{j} = {_fill(fetch_step, c=f'(({name}_COORDINATE[{at}]) < 0 ? 0 : {name}_COORDINATE[{at}])', half=WALK_BOTH)};"
+                    f"walk_x{j} = {_fill(fetch_step, c=coordinate, half=f'({name}_HALF[{coordinate}] & 1)' if one_half else WALK_BOTH)};"
                 )
             return out
 
@@ -2461,7 +2467,8 @@ class WalkClass:
                 if fetch_joint:
                     lines.append(f"const auto walk_l = {_fill(fetch_joint, b='b', up=f'{name}_PARENT[b]')};")
                 if fetch_step:
-                    lines.append(f"const auto walk_x = {_fill(fetch_step, c='(c < 0 ? 0 : c)', half=WALK_BOTH)};")
+                    half = f"({name}_HALF[c < 0 ? 0 : c] & 1)" if one_half else WALK_BOTH
+                    lines.append(f"const auto walk_x = {_fill(fetch_step, c='(c < 0 ? 0 : c)', half=half)};")
             if root_first:
                 head = [f"const int up = {name}_PARENT[b];", f"if (up < 0) {{\n    {each} V[k] = 0.0f;\n}} else {{"]
                 head += [indent_text(parent_state, 4), indent_text(_fill(joint, b="b", V="V", P="P", **names), 4), "}"]
