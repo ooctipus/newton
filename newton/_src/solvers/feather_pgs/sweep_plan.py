@@ -536,7 +536,7 @@ class Sweep:
         self.placement.sparse_mass_matrix_size = None
         self.sparse_velocity_limits = False
         self.support_rows = self._support_sink = None
-        self.support_du_index = None
+        self.support_du_base = None
         self.leaves = False
         self.placement.sparse_row_support = _SparseRowSupport()
         self.sparse_contact_triplets = False
@@ -789,8 +789,8 @@ class Sweep:
 
         The class's tree (every articulation of the factored size shares it) and each coordinate's factor coordinate,
         the support masks' bit, are baked into the writer (:func:`.walk_rows.support_rows_kernel`) and the leave
-        (the step's one leave, :func:`.tree_factor.walk_leave_kernel`, reading the sparse sweep's change through
-        ``support_du_index``). The writer's lane group is the smallest power of two at or above a
+        (the step's one leave, :func:`.tree_factor.walk_leave_kernel`, reading the sparse sweep's change at
+        ``support_du_base`` and the class's nodes). The writer's lane group is the smallest power of two at or above a
         world's unit bound (its internal rows and a contact unit per three rows of the rest of its capacity), at most a
         warp. The release is the factor's (:attr:`.tree_factor.WalkTrees.release`), built by
         :func:`.walk_rows.walk_release_kernel`.
@@ -823,17 +823,20 @@ class Sweep:
             lanes=self.support_lanes,
         )
         # Where the step's one leave reads each coordinate's change (tree_factor.walk_leave_kernel): the sparse sweep
-        # publishes it in factor coordinates (factor_velocity_delta), so a tree coordinate reads its factor
-        # coordinate, the support masks' bit.
+        # publishes it in factor coordinates (factor_velocity_delta), so a tree's changes start at its offset in its
+        # world's and a coordinate reads its factor coordinate, the support masks' bit.
         width = int(forest.max_world_dofs)
-        du_index = np.zeros(max(int(model.joint_dof_count), 1), dtype=np.int32)
         art_world = forest.art_to_world.numpy()
         offsets = forest.articulation_world_dof_offset.numpy()
-        dof_start = forest.articulation_dof_start_host
-        for art in arts.tolist():
-            for c, k in enumerate(node):
-                du_index[dof_start[art] + c] = art_world[art] * width + offsets[art] + k
-        self.support_du_index = wp.array(du_index, dtype=wp.int32, device=model.device)
+        du_base = np.zeros(max(int(model.articulation_count), 1), dtype=np.int32)
+        du_base[arts] = art_world[arts] * width + offsets[arts]
+        self.support_du_base = wp.array(du_base, dtype=wp.int32, device=model.device)
+        factor.plan_leave(
+            tuple(
+                node if (walk.parent, walk.first) == (parent, first) else tuple(range(walk.coordinates))
+                for walk in factor.walk_classes
+            )
+        )
 
     def support_sink(self, v_hat: wp.array) -> walk_rows.SupportSink:
         """Case K1: what its writer reads and writes besides each unit's seeds (:class:`.walk_rows.SupportSink`), bound
@@ -1689,7 +1692,7 @@ class Sweep:
             # factor coordinates).
             if self.routes.case == "K1":
                 delta = self.placement.sparse_factor_velocity_delta
-                self.factor.leave(v_out, delta.reshape((delta.size,)), self.support_du_index)
+                self.factor.leave(v_out, delta.reshape((delta.size,)), self.support_du_base)
             else:
                 self.factor.leave(v_out)
 

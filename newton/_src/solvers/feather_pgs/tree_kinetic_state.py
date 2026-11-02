@@ -1424,19 +1424,6 @@ def get_state_kernel(
         """Publish each body's pose and twist with its bias wrench and moments."""
         for local in range(g.lane, bodies, g.stride):
             body = data.joint_child[g.js + local]
-            if data.walk_now_link.shape[0] > 0:
-                # The walk's link at the step's poses: the parent's frame less the body's, from the frame points the
-                # motion stage stored.
-                joint = g.js + local
-                parent = plan.parent[local]
-                for k in range(3):
-                    offset = float(0.0)
-                    if parent >= 0:
-                        offset = (
-                            data.walk_now_link[g.js + parent, wp.static(WALK_FRAME) + k]
-                            - data.walk_now_link[joint, wp.static(WALK_FRAME) + k]
-                        )
-                    data.walk_now_link[joint, k] = offset
             if wp.static(forest):
                 origin = _load_origin(g.address, 2 * plan.root_of[local])
                 shift = _load_origin(g.address, 2 * plan.root_of[local] + 1)
@@ -2302,6 +2289,11 @@ def _walk_roots(layout: TreeLayout) -> list[tuple[int, int, int]]:
     return [(0, 0, layout.dofs)]
 
 
+PREDICTOR_AHEAD = 0
+"""Items whose inputs the predictor's walks hold in registers ahead of the chain (:data:`.tree_factor.WALK_AHEAD`):
+none, as for :data:`PREDICTOR_UNROLL`: the predictor's launch bound holds 56 registers on g1's block, and the walk's
+touches (prefetch hints, no register) still ask L1 for its lines ahead."""
+
 PREDICTOR_UNROLL = 0
 """Coordinates up to which the predictor's walks are straight-line code (:data:`.tree_factor.WALK_UNROLL`): none. The
 predictor's launch bound holds 56 registers on g1's block (:func:`_predictor_bounds`), and a straight walk's hoisted
@@ -2310,31 +2302,31 @@ on the path the group's lanes fetched into L1 (WALK_MAPPING §4: B3 against B4).
 
 
 _UP_STEP = """{
-    const float* d = data + $coordinate * ($c);
-    const auto s = WALK_RECORD(d), t = WALK_RECORD(d + 4), w = WALK_RECORD(d + 8);
     const float z = WALK_MUL(
-        x[$c] + ((s.x * $V[0] + s.y * $V[1] + s.z * $V[2]) + (s.w * $V[3] + t.x * $V[4] + t.y * $V[5])), WALK_LOAD(d + 12));
+        $X.u + (($X.s.x * $V[0] + $X.s.y * $V[1] + $X.s.z * $V[2]) + ($X.s.w * $V[3] + $X.t.x * $V[4] + $X.t.y * $V[5])),
+        $X.e);
     u[$c] = z;
-    $V[0] -= t.z * z;
-    $V[1] -= t.w * z;
-    $V[2] -= w.x * z;
-    $V[3] -= w.y * z;
-    $V[4] -= w.z * z;
-    $V[5] -= w.w * z;
+    $V[0] -= $X.t.z * z;
+    $V[1] -= $X.t.w * z;
+    $V[2] -= $X.w.x * z;
+    $V[3] -= $X.w.y * z;
+    $V[4] -= $X.w.z * z;
+    $V[5] -= $X.w.w * z;
 }"""
 """A coordinate of the walk up (leaf first, ``u = L^-1 P x``): ``z_c = (x_c + s_c . p) / ell_c``, ``p -= ut_c z_c``, ``p``
-its body's state, ``z_c`` rounded on its own (``WALK_MUL``)."""
+its body's state, ``z_c`` rounded on its own (``WALK_MUL``); its record and ``x_c`` fetched ahead of the chain
+(``$X``, :meth:`.tree_factor.WalkClass.walk`)."""
 
 _UP_JOINT = """{
-    const auto l = WALK_RECORD(link + $link * ($b));
     $P[0] += $V[0];
     $P[1] += $V[1];
     $P[2] += $V[2];
-    $P[3] += $V[3] - (l.y * $V[2] - l.z * $V[1]);
-    $P[4] += $V[4] - (l.z * $V[0] - l.x * $V[2]);
-    $P[5] += $V[5] - (l.x * $V[1] - l.y * $V[0]);
+    $P[3] += $V[3] - ($L.y * $V[2] - $L.z * $V[1]);
+    $P[4] += $V[4] - ($L.z * $V[0] - $L.x * $V[2]);
+    $P[5] += $V[5] - ($L.x * $V[1] - $L.y * $V[0]);
 }"""
-"""A joint of the walk up: the body's state ``(f, t)`` passes to its parent's frame, ``t - d x f``, and adds into it."""
+"""A joint of the walk up: the body's state ``(f, t)`` passes to its parent's frame, ``t - d x f`` (``$L`` the body's
+link, fetched ahead), and adds into it."""
 
 
 def _walked(layout: TreeLayout, classes: tuple) -> list[tuple[int, int, int]]:
@@ -2376,21 +2368,27 @@ def walk_fetch(layout: TreeLayout, classes: tuple, guard: str = "") -> str:
     return f"#if defined(__CUDA_ARCH__)\n{text}#endif\n"
 
 
-def walk_up(cls, unroll: int = PREDICTOR_UNROLL) -> str:
+def walk_up(cls, unroll: int = PREDICTOR_UNROLL, ahead: int | None = PREDICTOR_AHEAD) -> str:
     """Native statements of the walk up of class ``cls`` (the emitter's leaf-first walk, straight-line up to
-    :data:`.tree_factor.WALK_UNROLL` coordinates): ``u = L^-1 P x``, with ``x``, ``u``, ``data`` and ``link`` in
-    scope."""
+    ``unroll`` coordinates, its records, links and ``x`` loaded ``ahead`` items ahead of the chain and asked of L1
+    before that, as the walk down's): ``u = L^-1 P x``, with ``x``, ``u``, ``data`` and ``link`` in scope."""
     from string import Template  # noqa: PLC0415
 
     from .tree_factor import WALK_COORDINATE, WALK_LINK  # noqa: PLC0415
 
     step = Template(_UP_STEP).safe_substitute(coordinate=WALK_COORDINATE)
     joint = Template(_UP_JOINT).safe_substitute(link=WALK_LINK)
+    inputs = {
+        "fetch_joint": f"WALK_RECORD(link + {WALK_LINK} * ($b))",
+        "fetch_step": f"WALK_IN(data + {WALK_COORDINATE} * ($c), x[$c], 0.0f)",
+        "touch_joint": f"WALK_TOUCH(link + {WALK_LINK} * ($b));",
+        "touch_step": f"WALK_TOUCH(data + {WALK_COORDINATE} * ($c));",
+    }
     return (
         "{\n#if defined(__CUDA_ARCH__)\n"
-        + cls.walk(joint, step, root_first=False, cuda=True, unroll=unroll)
+        + cls.walk(joint, step, root_first=False, cuda=True, unroll=unroll, ahead=ahead, **inputs)
         + "\n#else\n"
-        + cls.walk(joint, step, root_first=False, cuda=False, unroll=unroll)
+        + cls.walk(joint, step, root_first=False, cuda=False, unroll=unroll, ahead=ahead, **inputs)
         + "\n#endif\n}"
     )
 
@@ -2413,8 +2411,8 @@ def walk_tree(layout: TreeLayout, classes: tuple, *, up: bool, down: bool, guard
             body.append(walk_up(classes[r]))
         if down:
             body.append(
-                f"WALK_DOWN({walked[r]},data,link,[&](const int c){{return u[c];}},"
-                "[&](const int c,const float q){u[c]=q;},[](const int,const float*){});"
+                f"WALK_DOWN({walked[r]},data,link,[&](const int c){{return u[c];}},[](const int){{return 0.0f;}},"
+                "[&](const int c,const float q,const float){u[c]=q;},[](const int,const float*){});"
             )
         blocks.append(guard.format(bit=2 << r) + "{\n" + "\n".join(body) + "\n}")
     text = "if(lane==0) {\n" + "\n".join(blocks) + "\n}\n#if defined(__CUDA_ARCH__)\nSYNC();\n#endif\n"
@@ -2650,9 +2648,6 @@ def get_force_kernel(schedules: HeldSchedules, *, layout: TreeLayout = REFERENCE
     return _tiled(layout, name, _predictor_params(response), source)
 
 
-WALK_SOLVE_UNROLL = 0
-"""Coordinates up to which the walk's solve emits straight-line code: none (see :func:`get_walk_solve_kernel`)."""
-
 _WALK_SOLVE = r"""    const int group = tid / $ROOT_COUNT, r = tid - group * $ROOT_COUNT;
     if (group >= groups) return;
     const int art = p.group_to_art.data[group];
@@ -2669,7 +2664,7 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
     walk up of ``trial.force`` into registers and the walk down into ``trial.response``, ``P^T L^-T L^-1 P f`` on the
     all-``K`` walk. A prescribed root responds with zero."""
     from .kernel_template import THREADS  # noqa: PLC0415
-    from .tree_factor import WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude  # noqa: PLC0415
+    from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_UNROLL, WalkTrees, walk_down_prelude  # noqa: PLC0415
 
     walked = {r: k for r, _, k in _walked(layout, classes)}
     cases = []
@@ -2689,9 +2684,10 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
                 "const float* __restrict__ x = trial.force.data + d0;\n"
                 "float* __restrict__ out = trial.response.data + d0;\n"
                 f"float u[{max(cls.coordinates, 1)}];\n"
-                + walk_up(cls, WALK_SOLVE_UNROLL)
+                + walk_up(cls, WALK_UNROLL, None)
                 + f"\nWALK_DOWN({walked[r]}, data, link, [&](const int c) {{ return u[c]; }},"
-                " [&](const int c, const float q) { out[c] = q; }, [](const int, const float*) {});"
+                " [](const int) -> float { return 0.0f; }, [&](const int c, const float q, const float) { out[c] = q; },"
+                " [](const int, const float*) {});"
             )
         cases.append(f"    case {r}: {{\n{body}\n        break;\n    }}")
     walked_classes = tuple(cls for cls in classes if cls is not None)
@@ -2708,7 +2704,7 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
         ),
         source,
         THREADS,
-        preludes=(walk_down_prelude(walked_classes, WALK_SOLVE_UNROLL),) if walked_classes else (),
+        preludes=(walk_down_prelude(walked_classes, WALK_UNROLL),) if walked_classes else (),
         dual=True,
         native_name="tree_kinetic_walk_native",
     ).kernel()
@@ -2758,7 +2754,7 @@ def get_predictor_kernel(
         preludes=(
             *SPATIAL.preludes(),
             walk_tree_prelude(),
-            *((walk_down_prelude(walked, PREDICTOR_UNROLL),) if walked else ()),
+            *((walk_down_prelude(walked, PREDICTOR_UNROLL, PREDICTOR_AHEAD),) if walked else ()),
         ),
         PHYSICAL_TABLE=layout.physical_table(),
         SCRATCH=_placed_block(layout, "s", "$PRED_SCRATCH"),

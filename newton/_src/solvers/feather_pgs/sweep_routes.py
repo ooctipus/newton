@@ -140,7 +140,8 @@ class FactorCoordinates:
         return self._walked(
             first,
             f"WALK_DOWN(0, data, link, [&](const int c) -> float {{ return {values}[c]; }}, "
-            f"[&](const int c, const float q) {{ {values}[c] = q; }}, [](const int, const float*) {{}})",
+            "[](const int) -> float { return 0.0f; }, "
+            f"[&](const int c, const float q, const float) {{ {values}[c] = q; }}, [](const int, const float*) {{}})",
         )
 
     def walk_enter(self, first: str, velocity: str, out: str) -> str:

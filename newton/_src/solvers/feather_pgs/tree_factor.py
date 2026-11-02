@@ -1006,8 +1006,6 @@ class TreeFactor:
                 reach[j - j0] = (reach[parent] if parent >= 0 else 0) + int(qd_start[j + 1] - qd_start[j])
             depth = max(depth, int(reach.max(initial=1)))
         view.du = wp.zeros(dofs, dtype=wp.float32, device=device)
-        # The leave reads the walk's du at each coordinate itself.
-        self.walk_du_index = wp.array(np.arange(dofs, dtype=np.int32), dtype=wp.int32, device=device)
         view.release = release_view(
             max(int(model.articulation_count), 1),
             self.walk_slip_capacity,
@@ -1015,13 +1013,20 @@ class TreeFactor:
             device,
         )
         self.walk_trees = view
-        # The step's one leave of every walking tree (walk_leave_kernel), the release compiled where a tree can slip.
-        self.walk_leave = walk_leave_kernel(self.walk_classes, self.walk_slip_capacity > 0) if classes else None
+        self.plan_leave()
 
-    def leave(self, v_out: wp.array, du: wp.array | None = None, du_index: wp.array | None = None) -> None:
+    def plan_leave(self, nodes: tuple[tuple[int, ...], ...] | None = None) -> None:
+        """The step's one leave of every walking tree (:func:`walk_leave_kernel`), the release compiled where a tree
+        can slip, reading each class's coordinate ``c`` at ``node(c)`` of its tree's changes: ``nodes`` (each class's,
+        a sweep's own layout), or the walk's own coordinates."""
+        classes = getattr(self, "walk_classes", ())
+        self.walk_leave = walk_leave_kernel(classes, self.walk_slip_capacity > 0, nodes) if classes else None
+
+    def leave(self, v_out: wp.array, du: wp.array | None = None, du_base: wp.array | None = None) -> None:
         """The step's one leave (:func:`walk_leave_kernel`): every walking tree's velocity change walked down onto
-        ``v_out`` (``v += P^T L^-T R^T du``): coordinate ``c``'s change is ``du[du_index[c]]``, by default the walk's
-        own :attr:`WalkTrees.du`, which the sweeps add into from zero each step."""
+        ``v_out`` (``v += P^T L^-T R^T du``): coordinate ``c``'s change is ``du[du_base[art] + node(c)]``, by default
+        the walk's own :attr:`WalkTrees.du` at the tree's coordinates, which the sweeps add into from zero each
+        step."""
         if self.walk_leave is None:
             return
         lanes = LEAVE_LANES if self.model.device.is_cuda else 1
@@ -1034,7 +1039,7 @@ class TreeFactor:
                 self.walk_trees,
                 self.walk_class,
                 self.walk_trees.du if du is None else du,
-                self.walk_du_index if du_index is None else du_index,
+                self.walk_trees.dof_start if du_base is None else du_base,
                 v_out,
             ],
             device=self.model.device,
@@ -1568,16 +1573,16 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
     const auto WALK_UP = [&](const float* data, const float* link, const float* now, const float* now_link, int body,
                              int top, float* p, float* w, auto&& sink) {
         for (int b = body; b >= 0; b = WALK_PARENT_OF(b)) {
-            const float* l = link + $link * b;
+$link_b
             for (int c = b == body ? top : WALK_FIRST_OF(b + 1) - 1; c >= WALK_FIRST_OF(b); --c) {
-                const float* d = data + $coordinate * c;
+$record_c
                 // The step's column at the factor's frame: its linear part shifted there from the step's frame, its
                 // angular part as is (the frames read at each coordinate, so no register holds them across the walk;
                 // once for every row).
-                const float* S = now != nullptr ? now + $now * c : d;
+$column_c
                 float e0 = 0.0f, e1 = 0.0f, e2 = 0.0f;
                 if (now != nullptr) {
-                    const float* f = now_link + $nowlink * b + $nowframe;
+$point_b
                     const float o0 = l[$frame] - f[0], o1 = l[$frame + 1] - f[1], o2 = l[$frame + 2] - f[2];
                     e0 = S[0] + (S[4] * o2 - S[5] * o1);
                     e1 = S[1] + (S[5] * o0 - S[3] * o2);
@@ -1622,7 +1627,7 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
     // velocity limit's), on the states p: z = (x + s_c . p) / ell_c, its J entry x[r]. WALK_UP continues from c - 1 of
     // c's body.
     const auto WALK_SEED = [&](const float* data, int c, const float* x, float* p, auto&& sink) {
-        const float* d = data + $coordinate * c;
+$record_seed
         for (int r = 0; r < $rows; ++r) {
             float* q = p + 6 * r;
             const float z = (x[r] + ((d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) + (d[3] * q[3] + d[4] * q[4] + d[5] * q[5])))
@@ -1639,7 +1644,7 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
             return;
         }
         const float* W = twist + 6 * up;
-        const float* l = link + $link * b;
+$link_twist
         V[0] = W[0] + (l[1] * W[5] - l[2] * W[4]);
         V[1] = W[1] + (l[2] * W[3] - l[0] * W[5]);
         V[2] = W[2] + (l[0] * W[4] - l[1] * W[3]);
@@ -1654,7 +1659,7 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
             float V[6];
             WALK_PARENT_TWIST(link, twist, b, V);
             for (int c = WALK_FIRST_OF(b); c < WALK_FIRST_OF(b + 1); ++c) {
-                const float* d = data + $coordinate * c;
+$record_enter
                 u[c] = qd[c] / d[12] + ((d[6] * V[0] + d[7] * V[1] + d[8] * V[2])
                                         + (d[9] * V[3] + d[10] * V[4] + d[11] * V[5]));
                 for (int k = 0; k < 6; ++k) V[k] += d[k] * qd[c];
@@ -1723,6 +1728,86 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
     };"""
 
 
+_WALK_LOADS = """#ifndef WALK_LOAD_RECORD
+// The walk's field groups and their loads, the one place the device layout lives (WALK_COORDINATE, WALK_LINK,
+// WALK_NOW): a coordinate's record, 16 floats as four aligned float4 (s 6, ut 6, 1 / ell, P0, R, R + K); a body's link,
+// two float4 (its offset to its parent's frame, its frame point); a step column, 6 floats as three float2; a step
+// link's frame point, one float4. Each fills a register array, one read-only vector load (LDG.128, the global path;
+// no walk writes them while a reader runs) a field group.
+#if defined(__CUDA_ARCH__)
+#define WALK_LOAD_RECORD(d, p)                                                                                  \
+    {                                                                                                          \
+        const float4* walk_q_ = reinterpret_cast<const float4*>(p);                                             \
+        const float4 walk_a_ = __ldg(walk_q_), walk_b_ = __ldg(walk_q_ + 1), walk_c_ = __ldg(walk_q_ + 2), walk_e_ = __ldg(walk_q_ + 3);   \
+        d[0] = walk_a_.x; d[1] = walk_a_.y; d[2] = walk_a_.z; d[3] = walk_a_.w;                                \
+        d[4] = walk_b_.x; d[5] = walk_b_.y; d[6] = walk_b_.z; d[7] = walk_b_.w;                                \
+        d[8] = walk_c_.x; d[9] = walk_c_.y; d[10] = walk_c_.z; d[11] = walk_c_.w;                              \
+        d[12] = walk_e_.x; d[13] = walk_e_.y; d[14] = walk_e_.z; d[15] = walk_e_.w;                            \
+    }
+#define WALK_LOAD_LINK(l, p)                                                                                    \
+    {                                                                                                          \
+        const float4* walk_q_ = reinterpret_cast<const float4*>(p);                                             \
+        const float4 walk_a_ = __ldg(walk_q_), walk_b_ = __ldg(walk_q_ + 1);                                                \
+        l[0] = walk_a_.x; l[1] = walk_a_.y; l[2] = walk_a_.z; l[3] = walk_a_.w;                                \
+        l[4] = walk_b_.x; l[5] = walk_b_.y; l[6] = walk_b_.z; l[7] = walk_b_.w;                                \
+    }
+#define WALK_LOAD_COLUMN(S, p)                                                                                  \
+    {                                                                                                          \
+        const float2* walk_q_ = reinterpret_cast<const float2*>(p);                                             \
+        const float2 walk_a_ = __ldg(walk_q_), walk_b_ = __ldg(walk_q_ + 1), walk_c_ = __ldg(walk_q_ + 2);                          \
+        S[0] = walk_a_.x; S[1] = walk_a_.y; S[2] = walk_b_.x; S[3] = walk_b_.y; S[4] = walk_c_.x; S[5] = walk_c_.y; \
+    }
+#define WALK_LOAD_POINT(f, p)                                                                                   \
+    {                                                                                                          \
+        const float4 walk_a_ = __ldg(reinterpret_cast<const float4*>(p));                                             \
+        f[0] = walk_a_.x; f[1] = walk_a_.y; f[2] = walk_a_.z; f[3] = walk_a_.w;                                \
+    }
+#else
+#define WALK_LOAD_RECORD(d, p) { for (int walk_k_ = 0; walk_k_ < 16; ++walk_k_) d[walk_k_] = (p)[walk_k_]; }
+#define WALK_LOAD_LINK(l, p) { for (int walk_k_ = 0; walk_k_ < 8; ++walk_k_) l[walk_k_] = (p)[walk_k_]; }
+#define WALK_LOAD_COLUMN(S, p) { for (int walk_k_ = 0; walk_k_ < 6; ++walk_k_) S[walk_k_] = (p)[walk_k_]; }
+#define WALK_LOAD_POINT(f, p) { for (int walk_k_ = 0; walk_k_ < 4; ++walk_k_) f[walk_k_] = (p)[walk_k_]; }
+#endif
+#endif"""
+
+
+def _walk_loads(coordinate: int, link: int, now: int) -> dict[str, str]:
+    """The shared walk text's loads (``_WALK``'s ``$record_*``, ``$link_*``, ``$column_c``, ``$point_b`` slots) for a
+    layout: the device layout's field groups by their vector loads (:data:`_WALK_LOADS`), a kernel's staged copy of it
+    (another stride, in shared memory) by pointer."""
+    device = (coordinate, link, now) == (WALK_COORDINATE, WALK_LINK, WALK_NOW)
+
+    def record(indent):
+        pad = " " * indent
+        if device:
+            return f"{pad}float d[{WALK_COORDINATE}];\n{pad}WALK_LOAD_RECORD(d, data + {WALK_COORDINATE} * c);"
+        return f"{pad}const float* d = data + {coordinate} * c;"
+
+    def body_link(indent):
+        pad = " " * indent
+        if link == WALK_LINK:
+            return f"{pad}float l[{WALK_LINK}];\n{pad}WALK_LOAD_LINK(l, link + {WALK_LINK} * b);"
+        return f"{pad}const float* l = link + {link} * b;"
+
+    if device:
+        column = (
+            "                float S[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};\n"
+            f"                if (now != nullptr) WALK_LOAD_COLUMN(S, now + {WALK_NOW} * c);"
+        )
+    else:
+        column = f"                const float* S = now != nullptr ? now + {now} * c : d;"
+    point = f"                    float f[4];\n                    WALK_LOAD_POINT(f, now_link + {WALK_LINK} * b + {WALK_FRAME});"
+    return {
+        "record_c": record(16),
+        "record_seed": record(8),
+        "record_enter": record(16),
+        "link_b": body_link(12),
+        "link_twist": body_link(8),
+        "column_c": column,
+        "point_b": point,
+    }
+
+
 @functools.cache
 def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int) -> DevicePrelude:
     """The device walk of a class of trees (one tree, or a world's forest), for both devices: a prelude declaring
@@ -1753,15 +1838,16 @@ def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int) -> 
         "parent": ", ".join(str(b) for b in parent),
         "first": ", ".join(str(c) for c in first),
     }
-    walk = substitute(
-        _WALK,
-        rows=rows,
-        coordinate=WALK_COORDINATE,
-        link=WALK_LINK,
-        now=WALK_NOW,
-        frame=WALK_FRAME,
-        nowlink=WALK_LINK,
-        nowframe=WALK_FRAME,
+    walk = (
+        _WALK_LOADS
+        + "\n"
+        + substitute(
+            _WALK,
+            rows=rows,
+            now=WALK_NOW,
+            frame=WALK_FRAME,
+            **_walk_loads(WALK_COORDINATE, WALK_LINK, WALK_NOW),
+        )
     )
     return DevicePrelude(
         f"walk_{rows}_{len(parent)}",
@@ -1791,17 +1877,16 @@ def walk_paths_prelude(
     if rows < 1:
         raise ValueError(f"a lane walks at least one row, got {rows}")
     walk = (
-        _WALK_PATHS
+        _WALK_LOADS
+        + "\n"
+        + _WALK_PATHS
         + "\n"
         + substitute(
             _WALK,
             rows=rows,
-            coordinate=coordinate,
-            link=link,
             now=now,
             frame=frame,
-            nowlink=WALK_LINK,
-            nowframe=WALK_FRAME,
+            **_walk_loads(coordinate, link, now),
         )
     )
     layout = (coordinate, link, now, frame)
@@ -1815,12 +1900,23 @@ def walk_paths_prelude(
 # The class emitter (ZB): a class's walk as straight-line native code, and the one walk down on it
 # ---------------------------------------------------------------------------------------------------------------------
 
-WALK_UNROLL = 64
+WALK_UNROLL = 24
 """Coordinates of a class up to which :meth:`WalkClass.walk` emits its walk as straight-line code; a larger class takes
-the loop form. Chosen from data (WALK_MAPPING §4, §8): unrolled, every load of the walk issues ahead of its serial
-chain and every body's state is a register, while the code grows by about 20 instructions a coordinate; a deep chain
-gains nothing from straight-line code once its loads leave the chain (its state is one body's), and K1's trees, which
-the support masks bound at 64 coordinates, all unroll."""
+the loop form. Chosen from data (the step's leave on synthetic walk data, ZE's bench, PRO and GB300): straight-line
+code is faster on allegro's 16-coordinate hand (GB300 35.5 against 43.7 us cold in the loop form), the loop form on
+g1's 43 coordinates (41.6 against 51.9) and on chain_106: straight-line code holds every item's inputs as named
+values, which ptxas schedules next to their use under its register target, while the loop form's ring keeps
+:data:`WALK_AHEAD` items in flight by construction; the loop's table reads and branches cost a short tree more than
+its latency."""
+
+WALK_TOUCH = 16
+"""Items a walk asks L1 for ahead of its chain (:meth:`WalkClass.touch`): a hint without a register or a scoreboard,
+so the loads :data:`WALK_AHEAD` items ahead find their lines in L1."""
+
+WALK_AHEAD = 4
+"""Items (a body's joint input, a coordinate's step input) a walk keeps in flight ahead of its serial chain
+(:meth:`WalkClass.ahead`): each step of the chain then waits on no load, and a lane holds this many items' inputs in
+registers."""
 
 
 @functools.cache
@@ -1895,6 +1991,11 @@ class WalkClass:
         width: int = 6,
         cuda: bool = True,
         unroll: int = WALK_UNROLL,
+        fetch_joint: str = "",
+        fetch_step: str = "",
+        touch_joint: str = "",
+        touch_step: str = "",
+        ahead: int | None = None,
     ) -> str:
         """Native statements that walk the class's tree on a state of ``width`` floats a body, in either direction.
 
@@ -1903,59 +2004,155 @@ class WalkClass:
         gathers what its children pass through ``joint`` (written into ``$P``, the parent's), then ``begin``, its
         coordinates last first and ``end``; then it passes to its parent.
 
-        Up to :data:`WALK_UNROLL` coordinates the walk is straight-line code: each body's state an array of constant
-        indices (registers), every load free to issue ahead of the serial chain. Past it, the loop form over the class's
-        table in constant memory: a chain's state in registers, a join's in a slot (:func:`_walk_slots`).
+        **Loads ahead of the chain.** A walk's inputs do not depend on its chain: ``fetch_joint`` (body ``$b``'s, an
+        expression) and ``fetch_step`` (coordinate ``$c``'s) are evaluated :meth:`ahead` items before the joint (as
+        ``$L``) and the step (as ``$X``) that read them, in the walk's order, so each load is in flight while the chain
+        computes the items before it, and no store of the chain stands between a load and its issue.
+
+        Up to ``unroll`` coordinates the walk is straight-line code: each body's state an array of constant indices
+        (registers), each fetched value a named register. Past it, the loop form over the class's table in constant
+        memory: a chain's state in registers, a join's in a slot (:func:`_walk_slots`), the fetched values in two
+        register rings (bodies and coordinates), each :meth:`ahead` deep.
 
         Args:
             joint: Body ``$b``'s joint to its parent: ``$V`` from ``$P`` root first, ``$V`` into ``$P`` leaf first.
             step: Coordinate ``$c`` of body ``$b`` on its state ``$V``.
-            begin: Body ``$b``'s statements before its coordinates, on ``$V``.
+            begin: Body ``$b``'s statements before its coordinates, on ``$V`` (``$up`` its parent, -1 at a root).
             end: Body ``$b``'s statements after its coordinates, on ``$V``.
             root_first: The walk's direction.
             width: Floats of a body's state.
             cuda: The CUDA text (its tables in constant memory) or its CPU twin.
-            unroll: Coordinates up to which the walk is straight-line code (:data:`WALK_UNROLL`): a caller whose
-                kernel cannot hold a straight walk's hoisted loads in its registers takes the loop form.
+            unroll: Coordinates up to which the walk is straight-line code (:data:`WALK_UNROLL`).
+            fetch_joint: Body ``$b``'s joint inputs (an expression), read by ``joint`` as ``$L``; none if empty.
+            fetch_step: Coordinate ``$c``'s step inputs (an expression), read by ``step`` as ``$X``; none if empty.
+            touch_joint: Body ``$b``'s statement asking L1 for its joint inputs' lines (a hint, no register).
+            touch_step: Coordinate ``$c``'s statement asking L1 for its step inputs' lines.
+            ahead: Items whose inputs a lane holds in registers ahead of the chain (:data:`WALK_AHEAD` by default; a
+                kernel whose launch bound has no room for them takes 0 and keeps the touches).
         """
-        bodies = len(self.parent)
+        bodies, coordinates = len(self.parent), self.coordinates
         zero = "{" + ", ".join(["0.0f"] * width) + "}"
+        bodies_order = range(bodies) if root_first else range(bodies - 1, -1, -1)
 
-        def body_text(b, state, coordinates):
-            out = [_fill(begin, b=b, V=state)] if begin else []
-            out += [_fill(step, b=b, c=c, V=state) for c in coordinates]
-            out += [_fill(end, b=b, V=state)] if end else []
-            return out
+        def coordinates_of(b):
+            span = range(self.first[b], self.first[b + 1])
+            return span if root_first else reversed(span)
 
-        if self.coordinates <= unroll:
-            lines = []
+        if coordinates <= unroll:
+            # The fetched items in the walk's order: a body's joint input where it has a parent (root first before its
+            # coordinates, leaf first after them), each coordinate's step input.
+            order = []
+            for b in bodies_order:
+                if root_first and (fetch_joint or touch_joint) and self.parent[b] >= 0:
+                    order.append(("l", b))
+                if fetch_step or touch_step:
+                    order += [("x", c) for c in coordinates_of(b)]
+                if not root_first and (fetch_joint or touch_joint) and self.parent[b] >= 0:
+                    order.append(("l", b))
+            depth = self.ahead(len(order), ahead) if fetch_joint or fetch_step else 0
+            early = self.touch(len(order)) if touch_joint or touch_step else 0
+            position = {item: k for k, item in enumerate(order)}
+
+            def fetch(item):
+                kind, index = item
+                text = _fill(fetch_joint, b=index) if kind == "l" else _fill(fetch_step, c=index)
+                return [f"const auto walk_{kind}{index} = {text};"] if text else []
+
+            def touched(item):
+                kind, index = item
+                text = _fill(touch_joint, b=index) if kind == "l" else _fill(touch_step, c=index)
+                return [text] if text else []
+
+            def take(item):
+                k = position.get(item, -1)
+                if k < 0:
+                    return []
+                out = touched(order[k + early]) if k + early < len(order) else []
+                return out + (fetch(order[k + depth]) if k + depth < len(order) else [])
+
+            def body_text(b, state):
+                out = [_fill(begin, b=b, V=state, up=self.parent[b])] if begin else []
+                for c in coordinates_of(b):
+                    out += take(("x", c))
+                    out.append(_fill(step, b=b, c=c, V=state, X=f"walk_x{c}"))
+                out += [_fill(end, b=b, V=state)] if end else []
+                return out
+
+            lines = [line for item in order[:early] for line in touched(item)]
+            lines += [line for item in order[:depth] for line in fetch(item)]
             if root_first:
                 for b, up in enumerate(self.parent):
                     state = f"walk{b}"
                     if up < 0:
                         lines.append(f"float {state}[{width}] = {zero};")
                     else:
-                        lines += [f"float {state}[{width}];", _fill(joint, b=b, V=state, P=f"walk{up}")]
-                    lines += body_text(b, state, range(self.first[b], self.first[b + 1]))
+                        lines += [f"float {state}[{width}];", *take(("l", b))]
+                        lines.append(_fill(joint, b=b, V=state, P=f"walk{up}", L=f"walk_l{b}"))
+                    lines += body_text(b, state)
             else:
                 lines.append(f"float {', '.join(f'walk{b}[{width}] = {zero}' for b in range(bodies))};")
-                for b in reversed(range(bodies)):
+                for b in bodies_order:
                     up = self.parent[b]
-                    lines += body_text(b, f"walk{b}", reversed(range(self.first[b], self.first[b + 1])))
+                    lines += body_text(b, f"walk{b}")
                     if up >= 0:
-                        lines.append(_fill(joint, b=b, V=f"walk{b}", P=f"walk{up}"))
+                        lines += take(("l", b))
+                        lines.append(_fill(joint, b=b, V=f"walk{b}", P=f"walk{up}", L=f"walk_l{b}"))
             return "\n".join(lines)
+
+        # The loop form: the walk's steps as a sequence of slots in the walk's order, a slot per coordinate and one
+        # for a body without coordinates, each naming its body, its coordinate (-1 for none) and whether it is the
+        # first (the body's joint before it root first, its gathering leaf first) or the last of its body's (the
+        # body's end after it, and leaf first its joint). The fetched inputs sit in a register ring of `ahead`
+        # slots: the loop body is that many copies of the slot's text, so copy j reads ring slot j and refills it
+        # with the inputs `ahead` slots on, which no later copy reads before the next pass: each load has the whole
+        # pass to arrive, and no copy of an arriving value stands in its way.
         slots, count = _walk_slots(self.parent)
+        sequence = []
+        for b in bodies_order:
+            span = list(coordinates_of(b)) or [-1]
+            sequence += [(b, c, k == 0, k == len(span) - 1) for k, c in enumerate(span)]
+        steps = len(sequence)
+        depth = self.ahead(steps, ahead) if fetch_joint or fetch_step else 0
         memory = "__constant__" if cuda else "const"
         name = f"WALK_CLASS_{self.tag}"
+        flags = [b | (int(first) << 16) | (int(last) << 17) for b, _, first, last in sequence]
+
+        def table(suffix, values):
+            return f"static {memory} int {name}_{suffix}[{len(values)}] = {{{', '.join(map(str, values))}}};"
+
         tables = [
-            f"static {memory} int {name}_PARENT[{bodies}] = {{{', '.join(map(str, self.parent))}}};",
-            f"static {memory} int {name}_FIRST[{bodies + 1}] = {{{', '.join(map(str, self.first))}}};",
+            table("PARENT", self.parent),
+            table("STEP", flags),
+            table("COORDINATE", [c for _, c, _, _ in sequence]),
         ]
         if count:
-            tables.append(f"static {memory} int {name}_SLOT[{bodies}] = {{{', '.join(map(str, slots))}}};")
+            tables.append(table("SLOT", slots))
         each = "for (int k = 0; k < $width; ++k)"
         slot = f"S[{name}_SLOT[$at]]"
+
+        def fetched(j, at):
+            out = []
+            if fetch_joint:
+                out.append(f"walk_l{j} = {_fill(fetch_joint, b=f'({name}_STEP[{at}] & 0xffff)')};")
+            if fetch_step:
+                out.append(
+                    f"walk_x{j} = {_fill(fetch_step, c=f'(({name}_COORDINATE[{at}]) < 0 ? 0 : {name}_COORDINATE[{at}])')};"
+                )
+            return out
+
+        ring = [f"auto {line}" for j in range(depth) for line in fetched(j, min(j, steps - 1))]
+        early = self.touch(steps) if touch_joint or touch_step else 0
+
+        def touched(at):
+            out = []
+            if touch_joint:
+                out.append(_fill(touch_joint, b=f"({name}_STEP[{at}] & 0xffff)"))
+            if touch_step:
+                out.append(_fill(touch_step, c=f"(({name}_COORDINATE[{at}]) < 0 ? 0 : {name}_COORDINATE[{at}])"))
+            return out
+
+        if early:
+            ring.append(f"for (int at = 0; at < {early}; ++at) {{\n{indent_text(chr(10).join(touched('at')), 4)}\n}}")
         if root_first:
             parent_state = f"{each} P[k] = V[k];"
             if count:
@@ -1963,22 +2160,7 @@ class WalkClass:
                     f"if (up == b - 1) {{\n    {each} P[k] = V[k];\n}} else {{\n"
                     f"    {each} P[k] = {_fill(slot, at='up')}[k];\n}}"
                 )
-            loop = f"""float V[$width], P[$width];{f" float S[{count}][$width];" if count else ""}
-for (int b = 0; b < {bodies}; ++b) {{
-    const int up = {name}_PARENT[b];
-    if (up < 0) {{
-        {each} V[k] = 0.0f;
-    }} else {{
-{indent_text(parent_state, 8)}
-{indent_text(_fill(joint, b="b", V="V", P="P"), 8)}
-    }}
-{indent_text(_fill(begin, b="b", V="V"), 4) if begin else ""}
-    for (int c = {name}_FIRST[b]; c < {name}_FIRST[b + 1]; ++c) {{
-{indent_text(_fill(step, b="b", c="c", V="V"), 8)}
-    }}
-{indent_text(_fill(end, b="b", V="V"), 4) if end else ""}
-{indent_text(f"if ({name}_SLOT[b] >= 0)" + chr(10) + f"    {each} {_fill(slot, at='b')}[k] = V[k];", 4) if count else ""}
-}}"""
+            state = f"float V[$width], P[$width];{f' float S[{count}][$width];' if count else ''}"
         else:
             gather = f"{each} {{\n    V[k] = N[k];\n    N[k] = 0.0f;\n}}"
             if count:
@@ -1986,148 +2168,237 @@ for (int b = 0; b < {bodies}; ++b) {{
                     f"if ({name}_SLOT[b] >= 0) {{\n    {each} {{\n        V[k] = {_fill(slot, at='b')}[k];\n"
                     f"        {_fill(slot, at='b')}[k] = 0.0f;\n    }}\n}} else {{\n{indent_text(gather, 4)}\n}}"
                 )
-            give = _fill(joint, b="b", V="V", P="N")
-            if count:
-                give = (
-                    f"if ({name}_SLOT[up] >= 0) {{\n{indent_text(_fill(joint, b='b', V='V', P=_fill(slot, at='up')), 4)}\n"
-                    f"}} else {{\n{indent_text(give, 4)}\n}}"
+            state = f"float V[$width], N[$width] = {zero};{f' float S[{count}][$width] = {{}};' if count else ''}"
+
+        def copy(j):
+            """The text of slot `at` with ring slot j (or the inputs loaded in place, without a ring)."""
+            lines = [f"const int b = {name}_STEP[at] & 0xffff, c = {name}_COORDINATE[at];"]
+            names = {"L": f"walk_l{j}", "X": f"walk_x{j}"}
+            if not depth:
+                names = {"L": "walk_l", "X": "walk_x"}
+                if fetch_joint:
+                    lines.append(f"const auto walk_l = {_fill(fetch_joint, b='b')};")
+                if fetch_step:
+                    lines.append(f"const auto walk_x = {_fill(fetch_step, c='(c < 0 ? 0 : c)')};")
+            if root_first:
+                head = [f"const int up = {name}_PARENT[b];", f"if (up < 0) {{\n    {each} V[k] = 0.0f;\n}} else {{"]
+                head += [indent_text(parent_state, 4), indent_text(_fill(joint, b="b", V="V", P="P", **names), 4), "}"]
+            else:
+                head = [gather]
+            if begin:
+                head.append(_fill(begin, b="b", V="V", up=f"{name}_PARENT[b]"))
+            lines.append(f"if (({name}_STEP[at] >> 16) & 1) {{\n{indent_text(chr(10).join(head), 4)}\n}}")
+            lines.append(f"if (c >= 0) {{\n{indent_text(_fill(step, b='b', c='c', V='V', **names), 4)}\n}}")
+            tail = [_fill(end, b="b", V="V")] if end else []
+            if root_first and count:
+                tail.append(f"if ({name}_SLOT[b] >= 0)\n    {each} {_fill(slot, at='b')}[k] = V[k];")
+            if not root_first:
+                give = _fill(joint, b="b", V="V", P="N", **names)
+                if count:
+                    into = _fill(joint, b="b", V="V", P=_fill(slot, at="up"), **names)
+                    give = (
+                        f"if ({name}_SLOT[up] >= 0) {{\n{indent_text(into, 4)}\n}} else {{\n{indent_text(give, 4)}\n}}"
+                    )
+                tail.append(f"const int up = {name}_PARENT[b];\nif (up >= 0) {{\n{indent_text(give, 4)}\n}}")
+            if tail:
+                lines.append(f"if (({name}_STEP[at] >> 17) & 1) {{\n{indent_text(chr(10).join(tail), 4)}\n}}")
+            if depth:
+                lines += fetched(j, f"(at + {depth} < {steps} ? at + {depth} : {steps - 1})")
+            if early:
+                lines.append(
+                    f"if (at + {early} < {steps}) {{\n{indent_text(chr(10).join(touched(f'at + {early}')), 4)}\n}}"
                 )
-            loop = f"""float V[$width], N[$width] = {zero};{f" float S[{count}][$width] = {{}};" if count else ""}
-for (int b = {bodies - 1}; b >= 0; --b) {{
-{indent_text(gather, 4)}
-{indent_text(_fill(begin, b="b", V="V"), 4) if begin else ""}
-    for (int c = {name}_FIRST[b + 1] - 1; c >= {name}_FIRST[b]; --c) {{
-{indent_text(_fill(step, b="b", c="c", V="V"), 8)}
-    }}
-{indent_text(_fill(end, b="b", V="V"), 4) if end else ""}
-    const int up = {name}_PARENT[b];
-    if (up >= 0) {{
-{indent_text(give, 8)}
-    }}
+            return "\n".join(lines)
+
+        width_of_pass = max(depth, 1)
+        copies = "\n".join(
+            f"if (at0 + {j} < {steps}) {{\n    const int at = at0 + {j};\n{indent_text(copy(j), 4)}\n}}"
+            for j in range(width_of_pass)
+        )
+        loop = f"""{state}
+{chr(10).join(ring)}
+for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
+{indent_text(copies, 4)}
 }}"""
         return "\n".join(tables) + "\n" + Template(loop).substitute(width=width)
+
+    def touch(self, items: int) -> int:
+        """How many items ahead of its chain a walk asks L1 for an item's lines: :data:`WALK_TOUCH`, at most the
+        walk's ``items``."""
+        return max(0, min(WALK_TOUCH, items))
+
+    def ahead(self, items: int, ahead: int | None = None) -> int:
+        """How many fetched items a walk keeps in flight ahead of its chain: ``ahead`` (:data:`WALK_AHEAD` by default),
+        at most the walk's ``items`` (a short tree's every load issues before its first step)."""
+        return max(0, min(WALK_AHEAD if ahead is None else ahead, items))
 
 
 FREE_BODY_WALK = WalkClass((-1,), (0, 6))
 """A free rigid body's walking class: one body of six coordinates."""
 
-_WALK_ACCESS = """    // The walk's read-only loads (its records and links are never written while a walk runs, so the loads leave the
-    // chain), and a lane group's fetch of a byte range into L1, one line a lane a trip.
-    const auto WALK_LOAD = [&](const float* p) -> float { return __ldg(p); };
-    const auto WALK_RECORD = [&](const float* p) -> float4 { return __ldg(reinterpret_cast<const float4*>(p)); };
+_WALK_ACCESS = """    // The walk's loads, and a lane group's fetch of a byte range into L1, one line a lane a trip. A walk's loads are
+    // plain (coherent) loads: the walk issues each where its text places it, WALK_AHEAD items ahead of the step that
+    // reads it (WalkClass.walk), and a store of the chain after it keeps it there; ptxas moves a non-coherent load
+    // down to its use.
+    const auto WALK_LOAD = [&](const float* p) -> float { return *p; };
+    const auto WALK_RECORD = [&](const float* p) -> float4 { return *reinterpret_cast<const float4*>(p); };
+    // A walk's step input (WALK_IN): a coordinate's s (s, t.xy), ut (t.zw, w) and 1 / ell (e), and the caller's
+    // two values: the step's input (u) and the prior value its output updates (p).
+    struct WalkIn {
+        float4 s, t, w;
+        float e, u, p;
+    };
     // A product rounded on its own: the chain's coordinate is a float32 value before any consumer adds it.
     const auto WALK_MUL = [&](const float a, const float b) -> float { return __fmul_rn(a, b); };
-    const auto WALK_INDEX = [&](const int* p) -> int { return __ldg(p); };
     const auto WALK_FETCH = [&](const void* start, const int bytes, const int lane, const int lanes) {
         const size_t end = reinterpret_cast<size_t>(start) + (size_t)bytes;
         for (size_t line = (reinterpret_cast<size_t>(start) & ~(size_t)127) + (size_t)128 * lane; line < end;
              line += (size_t)128 * lanes)
             asm volatile("prefetch.global.L1 [%0];" ::"l"(line));
-    };"""
+    };
+    // WALK_TOUCH(p): ask L1 for the line of p, a hint ahead of the load that reads it (no register, no scoreboard).
+    const auto WALK_TOUCH = [&](const void* p) { asm volatile("prefetch.global.L1 [%0];" ::"l"(p)); };"""
 
 _WALK_ACCESS_CPU = """    struct WalkRecord {
         float x, y, z, w;
     };
     const auto WALK_LOAD = [&](const float* p) -> float { return *p; };
     const auto WALK_RECORD = [&](const float* p) -> WalkRecord { return WalkRecord{p[0], p[1], p[2], p[3]}; };
+    struct WalkIn {
+        WalkRecord s, t, w;
+        float e, u, p;
+    };
     const auto WALK_MUL = [&](const float a, const float b) -> float { return a * b; };
-    const auto WALK_INDEX = [&](const int* p) -> int { return *p; };
-    const auto WALK_FETCH = [&](const void*, const int, const int, const int) {};"""
+    const auto WALK_FETCH = [&](const void*, const int, const int, const int) {};
+    const auto WALK_TOUCH = [&](const void*) {};"""
+
+_DOWN_IN = """    // WALK_IN(d, u, p): coordinate record d's step input and the caller's two values, read off the chain.
+    const auto WALK_IN = [&](const float* d, const float u, const float p) -> WalkIn {
+        return WalkIn{WALK_RECORD(d), WALK_RECORD(d + 4), WALK_RECORD(d + 8), WALK_LOAD(d + 12), u, p};
+    };"""
+
+_DOWN_FETCH_JOINT = "WALK_RECORD(link + $link * ($b))"
+"""A body's joint input in the walk down: its link (the offset to its parent's frame)."""
+
+_DOWN_FETCH_STEP = "WALK_IN(data + $coordinate * ($c), u($c), prior($c))"
+"""A coordinate's step input in the walk down: its record, its ``u`` and its output's prior value."""
+
+_DOWN_TOUCH_JOINT = "WALK_TOUCH(link + $link * ($b));"
+_DOWN_TOUCH_STEP = "WALK_TOUCH(data + $coordinate * ($c));"
+"""The lines of a body's link and a coordinate's record, asked of L1 :data:`WALK_TOUCH` items ahead of the chain."""
 
 _DOWN_JOINT = """{
-    const auto l = WALK_RECORD(link + $link * ($b));
-    $V[0] = $P[0] + (l.y * $P[5] - l.z * $P[4]);
-    $V[1] = $P[1] + (l.z * $P[3] - l.x * $P[5]);
-    $V[2] = $P[2] + (l.x * $P[4] - l.y * $P[3]);
+    $V[0] = $P[0] + ($L.y * $P[5] - $L.z * $P[4]);
+    $V[1] = $P[1] + ($L.z * $P[3] - $L.x * $P[5]);
+    $V[2] = $P[2] + ($L.x * $P[4] - $L.y * $P[3]);
     $V[3] = $P[3];
     $V[4] = $P[4];
     $V[5] = $P[5];
 }"""
 
 _DOWN_STEP = """{
-    const float* d = data + $coordinate * ($c);
-    const auto s = WALK_RECORD(d), t = WALK_RECORD(d + 4), w = WALK_RECORD(d + 8);
     const float q = WALK_MUL(
-        u($c) - ((t.z * $V[0] + t.w * $V[1] + w.x * $V[2]) + (w.y * $V[3] + w.z * $V[4] + w.w * $V[5])), WALK_LOAD(d + 12));
-    qd($c, q);
-    $V[0] += s.x * q;
-    $V[1] += s.y * q;
-    $V[2] += s.z * q;
-    $V[3] += s.w * q;
-    $V[4] += t.x * q;
-    $V[5] += t.y * q;
+        $X.u - (($X.t.z * $V[0] + $X.t.w * $V[1] + $X.w.x * $V[2]) + ($X.w.y * $V[3] + $X.w.z * $V[4] + $X.w.w * $V[5])),
+        $X.e);
+    qd($c, q, $X.p);
+    $V[0] += $X.s.x * q;
+    $V[1] += $X.s.y * q;
+    $V[2] += $X.s.z * q;
+    $V[3] += $X.s.w * q;
+    $V[4] += $X.t.x * q;
+    $V[5] += $X.t.y * q;
 }"""
 
 
-def _walk_down(classes: tuple[WalkClass, ...], cuda: bool, unroll: int = WALK_UNROLL) -> str:
+def _walk_down(classes: tuple[WalkClass, ...], cuda: bool, unroll: int, ahead: int | None) -> str:
     joint = Template(_DOWN_JOINT).safe_substitute(link=WALK_LINK)
     step = Template(_DOWN_STEP).safe_substitute(coordinate=WALK_COORDINATE)
-    bodies = [walk.walk(joint, step, end="twist($b, $V);", cuda=cuda, unroll=unroll) for walk in classes]
+    fetch_joint = Template(_DOWN_FETCH_JOINT).safe_substitute(link=WALK_LINK)
+    fetch_step = Template(_DOWN_FETCH_STEP).safe_substitute(coordinate=WALK_COORDINATE)
+    bodies = [
+        walk.walk(
+            joint,
+            step,
+            end="twist($b, $V);",
+            cuda=cuda,
+            unroll=unroll,
+            fetch_joint=fetch_joint,
+            fetch_step=fetch_step,
+            touch_joint=Template(_DOWN_TOUCH_JOINT).safe_substitute(link=WALK_LINK),
+            touch_step=Template(_DOWN_TOUCH_STEP).safe_substitute(coordinate=WALK_COORDINATE),
+            ahead=ahead,
+        )
+        for walk in classes
+    ]
     if len(bodies) == 1:
         walk = indent_text(bodies[0], 8)
     else:
         cases = (f"case {k}: {{\n{indent_text(body, 4)}\n    break;\n}}" for k, body in enumerate(bodies))
         walk = indent_text("switch (cls) {\n" + "\n".join(cases) + "\n}", 8)
-    return f"""    // WALK_DOWN(cls, data, link, u, qd, twist): the chain of the leave P^T L^-T u of one tree of class cls (an index
-    // into the classes the prelude was emitted for), on one lane, root first: each coordinate c takes
-    // qd_c = (u_c - ut_c . V) / ell_c, then V += s_c qd_c, V its body's twist (v, w) at its frame, a register, which
-    // twist(b, V) receives after the body's coordinates. u(c) reads coordinate c and qd(c, q) writes it (in place
-    // allowed: u(c) is read before qd(c, q)).
-    const auto WALK_DOWN = [&](const int cls, const float* __restrict__ data, const float* __restrict__ link, auto&& u,
-                               auto&& qd, auto&& twist) {{
+    return f"""{_DOWN_IN}
+    // WALK_DOWN(cls, data, link, u, prior, qd, twist): the chain of the leave P^T L^-T u of one tree of class cls (an
+    // index into the classes the prelude was emitted for), on one lane, root first: each coordinate c takes
+    // q = (u_c - ut_c . V) / ell_c, then V += s_c q, V its body's twist (v, w) at its frame, a register, which
+    // twist(b, V) receives after the body's coordinates. u(c) reads coordinate c, prior(c) the value its output
+    // updates (or 0), and qd(c, q, prior) writes the output. Every coordinate's record, link, u and prior are read
+    // WALK_AHEAD items ahead of the chain (WalkClass.walk), so qd may write in place, but not into a coordinate after c.
+    const auto WALK_DOWN = [&](const int cls, const float* data, const float* link, auto&& u, auto&& prior, auto&& qd,
+                               auto&& twist) {{
         (void)cls;
 {walk}
     }};
-    // WALK_LEAVE(cls, data, link, coordinates, bodies, lane, lanes, walker, ready, u, qd, twist): the walk down's unit,
-    // one tree by a lane group. Inputs: the tree's class cls, its records (coordinates x {WALK_COORDINATE} floats at
-    // data) and links (bodies x {WALK_LINK} floats at link), this thread's lane among the group's lanes, and the lane
-    // that walks. The group's lanes fetch the records and links into L1 in one parallel trip, off the chain (no
-    // barrier: a fetch is a hint); then lane walker runs ready() (the caller's preparation of u, while the lines
-    // arrive) and WALK_DOWN, the serial chain, its state (a body's twist) in registers. The chain is handed u(c), the
-    // tree's coordinate c in the factor's frame, and hands back qd(c, q) and twist(b, V). No shared memory, no scratch.
-    const auto WALK_LEAVE = [&](const int cls, const float* data, const float* link, const int coordinates,
-                                const int bodies, const int lane, const int lanes, const int walker, auto&& ready,
-                                auto&& u, auto&& qd, auto&& twist) {{
-        WALK_FETCH(data, coordinates * {4 * WALK_COORDINATE}, lane, lanes);
-        WALK_FETCH(link, bodies * {4 * WALK_LINK}, lane, lanes);
+    // WALK_LEAVE(cls, data, link, lane, walker, ready, u, prior, qd, twist): the walk down's unit, one tree by a lane
+    // group: lane walker runs ready() (the caller's preparation of u) and WALK_DOWN, the serial chain, its state (a
+    // body's twist) in registers, its records and links asked of L1 WALK_TOUCH items ahead and loaded WALK_AHEAD items
+    // ahead (a whole tree fetched into L1 at the start overflows it: chain_106's 22 trees an SM hold 230 KB). The
+    // chain is handed u(c), the tree's coordinate c in the factor's frame, and prior(c), and hands back
+    // qd(c, q, prior) and twist(b, V). No shared memory, no scratch.
+    const auto WALK_LEAVE = [&](const int cls, const float* data, const float* link, const int lane, const int walker,
+                                auto&& ready, auto&& u, auto&& prior, auto&& qd, auto&& twist) {{
         if (lane != walker) return;
         ready();
-        WALK_DOWN(cls, data, link, u, qd, twist);
+        WALK_DOWN(cls, data, link, u, prior, qd, twist);
     }};"""
 
 
 @functools.cache
-def walk_down_prelude(classes: tuple[WalkClass, ...], unroll: int = WALK_UNROLL) -> DevicePrelude:
+def walk_down_prelude(
+    classes: tuple[WalkClass, ...], unroll: int = WALK_UNROLL, ahead: int | None = None
+) -> DevicePrelude:
     """The one walk down (the leave ``P^T L^-T u``) of the walking classes ``classes``, for both devices: a prelude
     declaring
 
-    - ``WALK_LEAVE(cls, data, link, coordinates, bodies, lane, lanes, walker, ready, u, qd, twist)``, the leave's unit:
-      a caller's lane group fetches one tree's records and links into L1 in one parallel trip (``WALK_FETCH``), then
-      one of its lanes prepares ``u`` (``ready``) and runs the chain (WALK_MAPPING §4, B5);
-    - ``WALK_DOWN(cls, data, link, u, qd, twist)``, the chain: each class's walk emitted by :meth:`WalkClass.walk`
-      (straight-line code up to :data:`WALK_UNROLL` coordinates), its records read through the read-only path
-      (``WALK_LOAD``, ``WALK_RECORD``), every twist a register, handed to ``twist(b, V)`` after its body.
+    - ``WALK_LEAVE(cls, data, link, lane, walker, ready, u, prior, qd, twist)``, the leave's unit: one lane of a
+      caller's group prepares ``u`` (``ready``) and runs the chain;
+    - ``WALK_DOWN(cls, data, link, u, prior, qd, twist)``, the chain: each class's walk emitted by
+      :meth:`WalkClass.walk` (straight-line code up to ``unroll`` coordinates), its links, records, ``u`` and prior
+      outputs read :data:`WALK_AHEAD` items ahead of the chain (``WALK_IN``), every twist a register, handed to
+      ``twist(b, V)`` after its body.
 
     No shared memory and no scratch. The step's one leave takes it (:func:`walk_leave_kernel`), and the general sweep's
     free bodies' speed rows on their one-body class (:data:`FREE_BODY_WALK`).
 
     Args:
         classes: The walking classes, indexed by ``cls``.
+        unroll: Coordinates up to which a class's walk is straight-line code (:data:`WALK_UNROLL`).
+        ahead: Items whose inputs the chain's lane holds in registers ahead of it (:meth:`WalkClass.walk`).
     """
     if not classes:
         raise ValueError("a walk down needs a class")
-    tag = hashlib.sha256(repr((classes, unroll)).encode()).hexdigest()[:8]
+    tag = hashlib.sha256(
+        repr((classes, unroll, WALK_AHEAD if ahead is None else ahead, WALK_TOUCH)).encode()
+    ).hexdigest()[:8]
     return DevicePrelude(
         f"walk_down_{tag}",
-        _WALK_ACCESS + "\n" + _walk_down(classes, True, unroll),
-        cpu=_WALK_ACCESS_CPU + "\n" + _walk_down(classes, False, unroll),
+        _WALK_ACCESS + "\n" + _walk_down(classes, True, unroll, ahead),
+        cpu=_WALK_ACCESS_CPU + "\n" + _walk_down(classes, False, unroll, ahead),
     )
 
 
 LEAVE_LANES = 4
-"""Lanes of a tree's group in the step's leave (:func:`walk_leave_kernel`) on CUDA: they fetch the tree's lines into L1
-in one parallel trip and one of them walks (WALK_MAPPING §4, B5: 4 lanes ran at or under 8 on g1, franka and
-allegro)."""
+"""Lanes of a tree's group in the step's leave (:func:`walk_leave_kernel`) on CUDA: they fetch the tree's changes and
+velocities into L1 in one parallel trip and one of them walks, its records and links asked of L1 :data:`WALK_TOUCH`
+items ahead (WALK_MAPPING §4, B5: 4 lanes ran at or under 8 on g1, franka and allegro)."""
 
 _LEAVE = """    const int tree = tid / lanes, lane = tid - tree * lanes;
     if (tree >= arts.shape[0]) return;
@@ -2135,55 +2406,144 @@ _LEAVE = """    const int tree = tid / lanes, lane = tid - tree * lanes;
     const int cls = walk_class.data[art];
     if (cls < 0) return;
     const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art], n = walk.dofs.data[art];
-    // Coordinate c's change is du[at[c]]: the walk's du at the coordinate itself, or a sweep's own layout.
-    const int* const at = du_index.data + d0;
+    // Coordinate c's change is change[node(c)]: the walk's du at the tree's coordinates (node(c) = c), or a sweep's
+    // own layout (the tree's base there, and its class's node of each coordinate).
+    const float* const change = du.data + du_base.data[art];
     float* const v = v_out.data + d0;
-    // The group's lanes fetch the tree's change indices and velocity beside its records (WALK_LEAVE).
-    WALK_FETCH(at, n * 4, lane, lanes);
+    const float* const data = walk.data.data + (size_t)d0 * $coordinate;
+    const float* const link = walk.link.data + (size_t)j0 * $link;
+    const auto prior = [&](const int c) -> float { return v[c]; };
+    const auto qd = [&](const int c, const float q, const float p) { v[c] = p + q; };
+    const auto twist = [](const int, const float*) {};
+$classes"""
+
+_LEAVE_CLASS = """    // The group's lanes fetch the tree's changes and velocity beside its records (WALK_LEAVE).
+    WALK_FETCH(change, $span, lane, lanes);
     WALK_FETCH(v, n * 4, lane, lanes);
-$release    WALK_LEAVE(
-        cls, walk.data.data + (size_t)d0 * $coordinate, walk.link.data + (size_t)j0 * $link, n,
-        walk.joint_end.data[art] - j0, lane, lanes, 0, ready, $read, [&](const int c, const float q) { v[c] += q; },
-        [](const int, const float*) {});
+$release    WALK_LEAVE($cls, data, link, lane, 0, ready, read, prior, qd, twist);
 """
 
-_LEAVE_RELEASE = """    // The slips' release transposed, R^T du, on a copy where the tree slips (the predictor's border's R).
-    float r[$width];
+_LEAVE_PLAIN = """    const auto ready = []() {};
+    const auto read = [&](const int c) -> float { return WALK_LOAD(change + $node); };
+"""
+
+_LEAVE_RELEASE = """    // The slips' release transposed, R^T du, on a copy where the tree slips (the predictor's border's R): slip j's
+    // R_j^T along its root path, root first, the last slip first (WALK_RELEASE_T). $how
+    float r[$coordinates];
     bool slipped = false;
+    const auto read = [&](const int c) -> float { return slipped ? r[c] : WALK_LOAD(change + $node); };
     const auto ready = [&]() {
         if (walk.release.count.data[art] == 0) return;
-        for (int c = 0; c < n; ++c) r[c] = du.data[at[c]];
-        WALK_RELEASE_T(walk.release, art, r);
+$copy
         slipped = true;
     };
 """
 
+_LEAVE_SLIPS = """        const int cap = walk.release.b.shape[1], steps = walk.release.b.shape[2];
+        for (int j = walk.release.count.data[art] - 1; j >= 0; --j) {
+            const size_t at = ((size_t)art * cap + j) * steps;
+            const float *g = walk.release.g.data + at, *a = walk.release.a.data + at, *b = walk.release.b.data + at;
+            float t = 0.0f;
+            switch (walk.release.coordinate.data[at]) {
+$paths
+            }
+        }"""
+
+
+def _root_path(walk: WalkClass, c: int) -> list[int]:
+    """Coordinate ``c``'s root path in the class, leaf first: ``c`` down to its body's first, then each ancestor's
+    coordinates last first (the release's path, :class:`WalkRelease`)."""
+    body = max(b for b in range(len(walk.parent)) if walk.first[b] <= c < walk.first[b + 1])
+    path = []
+    while body >= 0:
+        path += list(range(c, walk.first[body] - 1, -1))
+        body = walk.parent[body]
+        c = walk.first[body + 1] - 1 if body >= 0 else -1
+    return path
+
+
+def _leave_class(k: int, walk: WalkClass, node: tuple[int, ...] | None, release: bool, unroll: int) -> str:
+    """The leave of a tree of class ``k``: its read of the change, the release where the class can slip, the unit."""
+    n = walk.coordinates
+    at = "c" if node is None else f"LEAVE_NODE_{k}[c]"
+    table = ""
+    if node is not None:
+        table = (
+            "#if defined(__CUDA_ARCH__)\n"
+            f"    static __constant__ int LEAVE_NODE_{k}[{max(n, 1)}] = {{{', '.join(map(str, node))}}};\n"
+            "#else\n"
+            f"    static const int LEAVE_NODE_{k}[{max(n, 1)}] = {{{', '.join(map(str, node))}}};\n"
+            "#endif\n"
+        )
+    span = "n * 4" if node is None else str(4 * (max(node, default=-1) + 1))
+    if not release:
+        head = substitute(_LEAVE_PLAIN, node=at)
+    elif n <= unroll:
+        # Every index into the copy is a constant (the class's coordinates, each slip's path by a switch on its
+        # coordinate), so the copy stays in registers.
+        steps = []
+        for c in range(n):
+            path = _root_path(walk, c)
+            body = " ".join(
+                f"{{ const float x = g[{t}] * r[{d}] + a[{t}] * t; r[{d}] = x; t -= b[{t}] * x; }}"
+                for t, d in reversed(list(enumerate(path)))
+            )
+            steps.append(f"case {c}: {{ {body} }} break;")
+        copy = f"        #pragma unroll\n        for (int c = 0; c < {n}; ++c) r[c] = WALK_LOAD(change + {at});\n"
+        copy += substitute(_LEAVE_SLIPS, paths=indent_text("\n".join(steps), 12))
+        head = substitute(
+            _LEAVE_RELEASE,
+            how="Each index a constant: the copy is registers.",
+            coordinates=max(n, 1),
+            node=at,
+            copy=copy,
+        )
+    else:
+        copy = f"        for (int c = 0; c < {n}; ++c) r[c] = WALK_LOAD(change + {at});\n"
+        copy += "        WALK_RELEASE_T(walk.release, art, r);"
+        head = substitute(
+            _LEAVE_RELEASE, how="A loop-form class: the copy on the stack.", coordinates=max(n, 1), node=at, copy=copy
+        )
+    return table + substitute(_LEAVE_CLASS, span=span, release=head, cls=k)
+
 
 @functools.cache
-def walk_leave_kernel(classes: tuple[WalkClass, ...], release: bool) -> wp.Kernel:
+def walk_leave_kernel(
+    classes: tuple[WalkClass, ...], release: bool, nodes: tuple[tuple[int, ...], ...] | None = None
+) -> wp.Kernel:
     """The step's one leave, ``v += P^T L^-T R^T du``, of every walking tree (``arts``), a lane group a tree (``lanes``:
     :data:`LEAVE_LANES` on CUDA, one on the CPU; ``dim`` trees times lanes), by the walk down's unit (``WALK_LEAVE`` of
-    :func:`walk_down_prelude`, the tree's class at ``walk_class``). Each coordinate's change is ``du[du_index[dof]]``:
-    every placement's sweep adds its change in the walk's coordinates into :attr:`WalkTrees.du` (the index the
-    coordinate itself), the support placement's sparse sweep publishes it in its factor coordinates (the index its
-    factor coordinate). This kernel takes the slips' release transposed where the class can slip (``release``) and
-    walks each tree down onto ``v_out``, which holds the predictor and the changes of the placements that do not walk.
+    :func:`walk_down_prelude`, the tree's class at ``walk_class``). Coordinate ``c``'s change is
+    ``du[du_base[art] + node(c)]``: every placement's sweep adds its change in the walk's coordinates into
+    :attr:`WalkTrees.du` (the base the tree's first coordinate, ``node(c) = c``), the support placement's sparse sweep
+    publishes it in its factor coordinates (the base the tree's offset in its world's, ``node`` its class's factor
+    coordinates, ``nodes``). Where the class can slip (``release``) the leave takes the slips' release transposed on a
+    copy of the tree's changes, in registers for a straight-line class (each slip's root path by a switch on its
+    coordinate), and walks each tree down onto ``v_out``, which holds the predictor and the changes of the placements
+    that do not walk.
 
     Args:
         classes: The walking classes, indexed by ``walk_class``.
         release: Whether a tree of the classes can slip (:attr:`TreeFactor.walk_slip_capacity`).
+        nodes: Each class's node of each coordinate, or ``None`` for the walk's own coordinates.
     """
     from .kernel_template import THREADS, KernelTemplate  # noqa: PLC0415
 
-    width = max(walk.coordinates for walk in classes)
-    if release:
-        head = substitute(_LEAVE_RELEASE, width=width)
-        read = "[&](const int c) -> float { return slipped ? r[c] : WALK_LOAD(du.data + WALK_INDEX(at + c)); }"
+    if nodes is not None and (
+        len(nodes) != len(classes) or any(len(k) != walk.coordinates for k, walk in zip(nodes, classes, strict=True))
+    ):
+        raise ValueError("the leave needs a node for each coordinate of each class")
+    bodies = [
+        _leave_class(k, walk, None if nodes is None else nodes[k], release, WALK_UNROLL)
+        for k, walk in enumerate(classes)
+    ]
+    if len(bodies) == 1:
+        text = bodies[0]
     else:
-        head = "    const auto ready = []() {};\n"
-        read = "[&](const int c) -> float { return WALK_LOAD(du.data + WALK_INDEX(at + c)); }"
-    body = substitute(_LEAVE, release=head, read=read, coordinate=WALK_COORDINATE, link=WALK_LINK)
-    tag = hashlib.sha256(repr(classes).encode()).hexdigest()[:8]
+        cases = (f"case {k}: {{\n{indent_text(body, 4)}\n    break;\n}}" for k, body in enumerate(bodies))
+        text = indent_text("switch (cls) {\n" + "\n".join(cases) + "\n}", 4) + "\n"
+    body = substitute(_LEAVE, classes=text, coordinate=WALK_COORDINATE, link=WALK_LINK)
+    tag = hashlib.sha256(repr((classes, nodes)).encode()).hexdigest()[:8]
     return KernelTemplate(
         f"walk_leave_{len(classes)}_{tag}" + ("_release" if release else ""),
         (
@@ -2192,12 +2552,12 @@ def walk_leave_kernel(classes: tuple[WalkClass, ...], release: bool) -> wp.Kerne
             ("walk", WalkTrees),
             ("walk_class", wp.array[int]),
             ("du", wp.array[float]),
-            ("du_index", wp.array[int]),
+            ("du_base", wp.array[int]),
             ("v_out", wp.array[float]),
         ),
         body,
         THREADS,
-        preludes=((walk_paths_prelude(1),) if release else ()) + (walk_down_prelude(classes),),
+        preludes=((walk_paths_prelude(1),) if release else ()) + (walk_down_prelude(classes, WALK_UNROLL),),
         dual=True,
         native_name="walk_leave_native",
     ).kernel()
@@ -2541,8 +2901,9 @@ _REFRESH = """    // The refresh's arithmetic on one tree, float32 (TreeWalk's i
     // now_link: on a refresh they become the factor's frames. A schedule (the lane feed's batches, or a thread a tree
     // with the class's topology compiled in) runs it leaf first; the chain's state is the articulated inertia h,
     // symmetric (A 00 01 02 11 12 22, B row-major 3x3, D 00 01 02 11 12 22), in registers.
-    //   BODY(j, r): body j's inertia at its frame [m 1, -m X; m X, R I R^T - m X X] (X the skew of c, its centre of
-    //     mass less its frame) as words m, m c, rot, and its link offset d; its link row becomes the factor's.
+    //   BODY(j, up, r): body j's inertia at its frame [m 1, -m X; m X, R I R^T - m X X] (X the skew of c, its centre of
+    //     mass less its frame) as words m, m c, rot, and its link offset d (WALK_OFFSET from its parent's frame point,
+    //     up's, and its own); its link row (d, its frame point) becomes the factor's.
     //   ADD(h, r): h += body r's inertia.
     //   STEP(h, s, c): coordinate c of column s (s 6, R, R + K): Is = h s, own = s . Is, 1/ell = (own + R + K)^-1/2,
     //     ut = Is / ell, P0 = own + R, h -= ut ut^T; its record (s, ut, 1/ell, P0, R, R + K) leaves whole, once.
@@ -2589,14 +2950,22 @@ _REFRESH = """    // The refresh's arithmetic on one tree, float32 (TreeWalk's i
         PREFETCH(Ib + 9 * b + 8);
         PREFETCH(Lk + $link * j);
     };
-    const auto BODY = [&](int j, float* r) {
+    // WALK_OFFSET(p, f, d): a body's link offset d, its parent's frame point p (null at a root) less its own f: the
+    // one place a walk forms it from the frame points the finish published.
+    const auto WALK_OFFSET = [](const float* p, const float* f, float* d) {
+        for (int k = 0; k < 3; ++k) d[k] = p != nullptr ? p[k] - f[k] : 0.0f;
+    };
+    const auto BODY = [&](int j, int up, float* r) {
         const float* Lr = Lk + $link * j;
-        for (int k = 0; k < 3; ++k) r[OFFSET + k] = Lr[k];
+        float offset[3];
+        WALK_OFFSET(up >= 0 ? Lk + $link * up + $frame : nullptr, Lr + $frame, offset);
+        for (int k = 0; k < 3; ++k) r[OFFSET + k] = offset[k];
 #if defined(__CUDA_ARCH__)
-        reinterpret_cast<float4*>(Lo + $link * j)[0] = reinterpret_cast<const float4*>(Lr)[0];
+        reinterpret_cast<float4*>(Lo + $link * j)[0] = make_float4(offset[0], offset[1], offset[2], Lr[3]);
         reinterpret_cast<float4*>(Lo + $link * j)[1] = reinterpret_cast<const float4*>(Lr)[1];
 #else
-        for (int k = 0; k < $link; ++k) Lo[$link * j + k] = Lr[k];
+        for (int k = 0; k < 3; ++k) Lo[$link * j + k] = offset[k];
+        for (int k = 3; k < $link; ++k) Lo[$link * j + k] = Lr[k];
 #endif
         const int b = Ct[j];
         const float* q = Qb + 7 * b;
@@ -2745,7 +3114,7 @@ _INWARD = (
                 hi = mine + 1 < j1 ? dof0 + Pt[2 * (mine + 1) + 1] : dof1;
                 slot = Jt[mine];
                 into = up >= 0 ? Jt[j0 + up] : -1;
-                BODY(mine, r.w);
+                BODY(mine, up >= 0 ? j0 + up : -1, r.w);
                 if (hi > lo) COLUMN(hi - 1, r.w + RECORD);
             }
             r.w[UP] = __int_as_float(up);
@@ -2792,7 +3161,7 @@ _INWARD_CLASS_JOINT = """{
     for (int k = 0; k < 21; ++k) $P[k] += $V[k];
 }"""
 _INWARD_CLASS_BEGIN = """float body$b[INERTIA];
-BODY(j0 + $b, body$b);
+BODY(j0 + $b, $up >= 0 ? j0 + $up : -1, body$b);
 ADD($V, body$b, true);"""
 _INWARD_CLASS_STEP = """{
     float s[8];

@@ -831,7 +831,7 @@ def leave_walk(walk: WalkTrees, velocity, device) -> None:
             walk,
             wp.array(np.asarray(index, dtype=np.int32), device=device),
             walk.du,
-            wp.array(np.arange(walk.du.shape[0], dtype=np.int32), device=device),
+            walk.dof_start,
             velocity,
         ],
         device=device,

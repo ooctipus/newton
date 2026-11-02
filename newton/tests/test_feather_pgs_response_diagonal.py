@@ -328,7 +328,7 @@ def _leave(walk, velocity, device):
             walk,
             wp.zeros(worlds, dtype=wp.int32, device=device),
             walk.du,
-            wp.array(np.arange(walk.du.shape[0], dtype=np.int32), device=device),
+            walk.dof_start,
             velocity,
         ],
         device=device,
