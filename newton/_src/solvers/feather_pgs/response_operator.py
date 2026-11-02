@@ -2115,16 +2115,6 @@ class SparseFactor(ResponseOperator):
     name = "sparse_factor"
     fused_pair_apply = True
 
-    # -- build (response_builds_rows) ---------------------------------------------------------------------------------
-
-    @staticmethod
-    def build():
-        """The rows' build and publication (:data:`.response_builds_rows.SPARSE_FACTOR`): the factor, rows packed
-        from their support with ``A_ii = |Z|^2`` (:func:`.response_builds_rows.factor_rows`), and ``v = v_hat + P^T
-        L^-T u``."""
-        from .response_builds_rows import SPARSE_FACTOR  # noqa: PLC0415
-
-        return SPARSE_FACTOR
 
     @property
     def width(self) -> int:

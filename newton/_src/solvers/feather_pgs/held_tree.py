@@ -21,7 +21,6 @@ import warp as wp
 from . import host_index
 from .device_proof import DeviceProof
 from .response_builds_dense import dense_factor_kernel, dense_factor_plan
-from .response_builds_rows import sparse_factor_kernel
 from .sparse_factor import SparseData, bind_operator_plan, operator_metadata
 from .tree_kinetic_owner import TreeKineticState, launch_switches, proof_runs, stage_clocks_on
 from .tree_kinetic_plan import FREE_JOINTS, make_plan, tree_joints
@@ -225,51 +224,27 @@ def compact_decline(solver, size, *, scalar) -> str | None:
 
 
 class TreeSparseOperator:
-    """Respond through the solver's native sparse factor, refreshed from the held geometry."""
+    """Respond through the walk over the sparse class's pattern (its plan): the walk is the factor (Z4.3), refreshed by
+    :meth:`.tree_factor.TreeFactor.walk_step`, so the group holds no factor array and refreshes nothing of its own."""
 
     def __init__(self, solver):
         self.solver = solver
         self.requires_body_velocity = True
         mass = solver.factor.sparse_mass_matrix_plan
-        n, device = mass.dof_count, solver.model.device
+        device = solver.model.device
         self.host = operator_metadata(mass)
-        self.plan = bind_operator_plan(solver, n, self.host)
+        self.plan = bind_operator_plan(solver, mass.dof_count, self.host)
         self.data = SparseData()
-        self.data.W = solver.factor.sparse_Linv
-        # The native factor publishes status instead of a second validity bit.
-        # Initial and reset mass requests are consumed before any prediction.
+        # The walk has no factor status: a pivot that is not positive reaches the predictor as a non-finite response.
         self.data.valid = wp.ones(self.plan.group_to_art.size, dtype=int, device=device)
-        self.data.status = solver.factor.sparse_mass_matrix_status
-        self.refresh_kernel = sparse_factor_kernel(
-            n, mass.nonzero_count, warps_per_block=solver.factor.sparse_factor_warps_per_block
-        )
+        self.data.status = wp.zeros(self.plan.group_to_art.size, dtype=int, device=device)
         self.kinetic_state = None
 
     def refresh(self, state_aug):
-        """Read cached physical mass terms through the unchanged sparse factor."""
-        s, n = self.solver, self.solver.placement.sparse_mass_matrix_size
-        wp.launch(
-            self.refresh_kernel,
-            dim=s.forest.n_arts_by_size[n] * 32,
-            inputs=[
-                s.forest.group_to_art[n],
-                s.factor.mass_update_mask,
-                s.forest.articulation_dof_start,
-                self.kinetic_state.geometric,
-                s.factor.R_by_size[n],
-                s.factor.drive_row_by_dof,
-                s.factor.aug_row_K,
-                s.factor.aug_row_H,
-                s.factor.sparse_mass_matrix_indices,
-            ],
-            outputs=[s.factor.sparse_Linv, s.factor.sparse_mass_matrix_status],
-            block_dim=32 * s.factor.sparse_factor_warps_per_block,
-            device=s.model.device,
-        )
+        """Nothing: the walk's refresh is the factor's."""
 
     def bind_response(self):
-        """Bind what the predictor reads."""
-        self.data.indices = self.solver.factor.sparse_mass_matrix_indices
+        """Nothing to bind: the predictor reads the walk."""
 
 
 class TreeHeldOperator:

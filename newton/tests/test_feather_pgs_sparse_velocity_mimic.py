@@ -111,6 +111,13 @@ def _case(enabled, offset=0.025, scale=-0.5, error=-0.015, *, friction_anchor_be
     return model, solver, state, out, control, pipeline, pipeline.contacts()
 
 
+def _records(solver, group: int) -> np.ndarray:
+    """The walk records of the sparse group's ``group``-th articulation (the factor the walk refreshes)."""
+    art = int(solver.forest.group_to_art[solver.placement.sparse_mass_matrix_size].numpy()[group])
+    d0 = int(solver.forest.articulation_dof_start.numpy()[art])
+    return solver.factor.walk_data.numpy()[d0 : d0 + int(solver.forest.articulation_dof_count.numpy()[art])].copy()
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
 class TestSparseVelocityMimicPhysics(unittest.TestCase):
     def _assert_state(self, reference, candidate):
@@ -156,13 +163,13 @@ class TestSparseVelocityMimicPhysics(unittest.TestCase):
         self.assertTrue(candidate[1].sweep.sparse_velocity_limits)
         for case in (reference, candidate):
             sparse_scene.step(case)
-        held = candidate[1].factor.sparse_Linv.numpy().copy()
+        held = _records(candidate[1], 1)
         for model, solver, state, *_ in (reference, candidate):
             solver.reset(state, wp.array([True, False], dtype=bool, device=model.device))
         for case in (reference, candidate):
             sparse_scene.step(case)
         np.testing.assert_array_equal(candidate[1].factor.mass_update_mask.numpy(), [1, 0])
-        np.testing.assert_array_equal(candidate[1].factor.sparse_Linv.numpy()[1], held[1])
+        np.testing.assert_array_equal(_records(candidate[1], 1), held)
         self._assert_state(reference, candidate)
         with wp.ScopedCapture("cuda:0") as capture:
             sparse_scene.step(candidate)

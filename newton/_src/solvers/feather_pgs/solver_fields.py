@@ -233,13 +233,6 @@ Preelim = field_group.struct(
 """The bilateral elimination of :data:`PREELIMINATION` and :data:`PREELIMINATION_PLAN`: each articulation's block
 index, the block's kept rows and their count, and the block's world and constraints."""
 
-SPARSE_FACTOR = FieldGroup(
-    Field("sparse_Linv", wp.float32, ("group", "nonzero"), owner="factor"),
-    Field("sparse_mass_matrix_status", wp.int32, ("group",), owner="factor"),
-)
-"""The native sparse factor's inverse entries, every drive's ``K`` in it, and its status, per articulation of the factored
-size."""
-
 SPARSE_ROWS = FieldGroup(
     Field("sparse_row_dof", wp.int32, ("index_world", "index_row", "index_support"), fill=None, owner="placement"),
     Field("sparse_row_factor", wp.float32, ("world", "row", "support"), fill=None, owner="placement"),

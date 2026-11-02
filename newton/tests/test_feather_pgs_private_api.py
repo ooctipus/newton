@@ -14,7 +14,6 @@ _KERNEL_FACTORIES = {
     "tree_factor.py": ("walk_down_prelude", "walk_leave_kernel"),
     "response_builds_rows.py": (
         "free_body_meta_kernel",
-        "sparse_factor_kernel",
         "paired_components_kernel",
     ),
 }

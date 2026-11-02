@@ -504,9 +504,6 @@ def _suite_shape_calls():
             kwargs = {"rows": rows, "min_rows": min_rows, "sweeps": 24, "inkernel_response": blocks}
             yield "keyed_rows.get_parallel_factory", parallel, (layout, *shape), kwargs
     yield "keyed_row_layout.prefix_kernel", limit_prefix, (limited,), {}
-    factory = response_builds_rows.sparse_factor_kernel.__wrapped__
-    for size in ((6, 21), (9, 44), (14, 81), (18, 117), (18, 135), (25, 194), (27, 243), (43, 434)):
-        yield "response_builds_rows.sparse_factor_kernel", factory, size, {}
     yield "row_packets.get_prefix_kernel", row_packets.get_prefix_kernel.__wrapped__, (9, 1, 40), {}
     components = response_builds_rows.paired_components_kernel.__wrapped__
     yield "response_builds_rows.paired_components_kernel", components, (23, 6), {}

@@ -205,6 +205,13 @@ def _case(
     return model, solver, state, out, control, pipeline, pipeline.contacts()
 
 
+def _records(solver, group: int) -> np.ndarray:
+    """The walk records of the sparse group's ``group``-th articulation (the factor the walk refreshes)."""
+    art = int(solver.forest.group_to_art[solver.placement.sparse_mass_matrix_size].numpy()[group])
+    d0 = int(solver.forest.articulation_dof_start.numpy()[art])
+    return solver.factor.walk_data.numpy()[d0 : d0 + int(solver.forest.articulation_dof_count.numpy()[art])].copy()
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
 class TestSparseVelocityLimitPhysics(unittest.TestCase):
     def _assert_state(self, reference, candidate):
@@ -214,7 +221,6 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
             self.assertFalse(case[1].placement.constraint_overflow.numpy().any())
             for name in sparse_scene.STATE_FIELDS:
                 self.assertTrue(np.isfinite(getattr(case[2], name).numpy()).all(), name)
-        np.testing.assert_array_equal(candidate[1].factor.sparse_mass_matrix_status.numpy(), 0)
         if candidate[1].laws.friction_anchors_enabled:
             # Called unbound so that suites reusing this check (mimic rows) inherit it.
             TestSparseVelocityLimitPhysics._assert_patch(self, reference, candidate)
@@ -338,7 +344,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
         self.assertTrue(candidate[1].sweep.sparse_velocity_limits)
         for case in (reference, candidate):
             sparse_scene.step(case)
-        held = candidate[1].factor.sparse_Linv.numpy().copy()
+        held = _records(candidate[1], 1)
         for model, solver, state, *_ in (reference, candidate):
             q = state.joint_q.numpy().copy()
             q[2] += 0.002
@@ -348,7 +354,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
         for case in (reference, candidate):
             sparse_scene.step(case)
         np.testing.assert_array_equal(candidate[1].factor.mass_update_mask.numpy(), [1, 0])
-        np.testing.assert_array_equal(candidate[1].factor.sparse_Linv.numpy()[1], held[1])
+        np.testing.assert_array_equal(_records(candidate[1], 1), held)
         self._assert_state(reference, candidate)
         with wp.ScopedCapture("cuda:0") as capture:
             sparse_scene.step(candidate)

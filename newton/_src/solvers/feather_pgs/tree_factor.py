@@ -55,7 +55,6 @@ from .solver_fields import (
     PREELIMINATION,
     PREELIMINATION_PLAN,
     SIZE_FACTORS,
-    SPARSE_FACTOR,
     STATE_AUX,
     DriveRows,
     Preelim,
@@ -488,11 +487,10 @@ class TreeFactor:
         arrays.allocate(ARTICULATION_ORIGIN, articulation=model.articulation_count)
 
     def allocate_sparse(self, plan, articulations: int) -> None:
-        """The native sparse factor of ``articulations`` of one size: its pattern ``plan``, its device indices, its
-        inverse entries and its status."""
+        """The sparse class's pattern ``plan`` and its device indices (the support writer's ancestor masks): the walk is
+        its factor (Z4.3), so it holds no factor array."""
         self.sparse_mass_matrix_plan = plan
         self.sparse_mass_matrix_indices = factor_indices(plan, self.model.device)
-        self._arrays.allocate(SPARSE_FACTOR, group=articulations, nonzero=plan.nonzero_count)
 
     def allocate_size_groups(self, placeholder_sizes) -> None:
         """Allocate each size group's factor L and armature R; ``placeholder_sizes`` (the compact diagonal and the

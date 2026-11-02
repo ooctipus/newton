@@ -307,7 +307,6 @@ class TestTreeForestCache(unittest.TestCase):
         native._step(case)
         public_state(self, case[0], case[3])
         np.testing.assert_array_equal(case[1].factor.held.groups[0].data.current_valid.numpy(), 1)
-        np.testing.assert_array_equal(case[1].factor.sparse_mass_matrix_status.numpy(), 0)
 
 
 if __name__ == "__main__":

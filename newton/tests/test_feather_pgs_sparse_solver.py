@@ -231,6 +231,47 @@ def _step(case):
         wp.copy(getattr(state, name), getattr(out, name))
 
 
+def _walk_inverse(solver, art: int) -> np.ndarray:
+    """``L^-1`` of articulation ``art``'s walk in its physical coordinates (float64 from the walk's float32 records):
+    column ``i`` is the walk up of the unit force at coordinate ``i`` (``WALK_UP_TREE``'s steps), the factor the rows
+    are whitened by."""
+    factor = solver.factor
+    d0 = int(solver.forest.articulation_dof_start.numpy()[art])
+    j0, j1 = int(solver.model.articulation_start.numpy()[art]), int(solver.forest.articulation_joint_end_host[art])
+    path = factor.walk_path_host[j0:j1]
+    n = int(solver.forest.articulation_dof_count.numpy()[art])
+    data = factor.walk_data.numpy()[d0 : d0 + n].astype(np.float64)
+    link = factor.walk_link.numpy()[j0:j1].astype(np.float64)
+    first = [int(f) for f in path[:, 1]] + [n]
+    inverse = np.zeros((n, n))
+    for i in range(n):
+        x = np.zeros(n)
+        x[i] = 1.0
+        state, p = np.zeros((len(path), 6)), np.zeros(6)
+        for b in range(len(path) - 1, -1, -1):
+            p += state[b]
+            for c in range(first[b + 1] - 1, first[b] - 1, -1):
+                z = (x[c] + data[c, :6] @ p) * data[c, 12]
+                p -= data[c, 6:12] * z
+                inverse[c, i] = z
+            up = int(path[b, 0])
+            if up >= 0:
+                p[3:] -= np.cross(link[b, :3], p[:3])
+            if up != b - 1:
+                if up >= 0:
+                    state[up] += p
+                p = np.zeros(6)
+    return inverse
+
+
+def _tree(case, group: int, records: np.ndarray) -> np.ndarray:
+    """The walk records of the sparse group's ``group``-th articulation."""
+    solver = case[1]
+    art = int(solver.forest.group_to_art[solver.placement.sparse_mass_matrix_size].numpy()[group])
+    d0 = int(solver.forest.articulation_dof_start.numpy()[art])
+    return records[d0 : d0 + int(solver.forest.articulation_dof_count.numpy()[art])]
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "Sparse integrated solve requires CUDA")
 class TestFeatherPGSSparseSolver(unittest.TestCase):
     def test_shared_row_support_matches_explicit_indices(self):
@@ -286,7 +327,6 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         self.assertEqual(size, 9)
         for array in (solver.placement.J_by_size[size], solver.factor.L_by_size[size]):
             self.assertEqual(array.shape, (1, 1, 1))  # Only argument stand-ins remain.
-        np.testing.assert_array_equal(solver.factor.sparse_mass_matrix_status.numpy(), 0)
         self.assertFalse(solver.placement.constraint_overflow.numpy().any())
         for name in STATE_FIELDS:
             self.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), name)
@@ -328,11 +368,10 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             self.assertEqual(len(set(support[valid])), int(valid.sum()))
             z[row, support[valid]] = values[world, row, valid]
         physical_j = np.zeros_like(z)
-        for group, art in enumerate(solver.forest.group_to_art[size].numpy()):
+        for art in solver.forest.group_to_art[size].numpy():
             if solver.forest.art_to_world.numpy()[art] != world:
                 continue
-            inverse = np.zeros((size, size))
-            inverse[plan.entry_rows, plan.columns] = solver.factor.sparse_Linv.numpy()[group]
+            inverse = _walk_inverse(solver, int(art))[np.ix_(plan.permutation, plan.permutation)]
             offset = int(solver.forest.articulation_world_dof_offset.numpy()[art])
             physical_j[:, offset + plan.permutation] = np.linalg.solve(inverse, z[:, offset : offset + size].T).T
         if solver.forest.has_free_rigid_bodies:
@@ -416,7 +455,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             sparse = _case(True, robot_count=2)
         self.assertFalse(sparse[1].sweep.sparse_active_rows)
         self.assertEqual(sparse[1].placement.sparse_mass_matrix_size, 9)
-        self.assertEqual(sparse[1].factor.sparse_Linv.shape[0], 4)
+        self.assertEqual(sparse[1].forest.group_to_art[9].shape[0], 4)
         self.assertEqual(sparse[1].forest.world_count, 2)
         contact_seen = False
         for _ in range(16):
@@ -464,7 +503,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         self.assert_sparse_state(sparse)
         for case in (dense, sparse):
             _step(case)  # Step32 refreshes globally; step33 is a held-mass step.
-        held = sparse[1].factor.sparse_Linv.numpy().copy()
+        held = sparse[1].factor.walk_data.numpy().copy()
         for model, solver, state, *_ in (dense, sparse):
             q = state.joint_q.numpy()
             q[2] += 0.02
@@ -474,7 +513,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         for case in (dense, sparse):
             _step(case)
         np.testing.assert_array_equal(sparse[1].factor.mass_update_mask.numpy(), [1, 0])
-        np.testing.assert_array_equal(sparse[1].factor.sparse_Linv.numpy()[1], held[1])
+        np.testing.assert_array_equal(_tree(sparse, 1, sparse[1].factor.walk_data.numpy()), _tree(sparse, 1, held))
         self.assert_states_close(dense[2], sparse[2])
         for model, solver, *_ in (dense, sparse):
             mass = model.body_mass.numpy()
@@ -484,7 +523,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         for case in (dense, sparse):
             _step(case)
         np.testing.assert_array_equal(sparse[1].factor.mass_update_mask.numpy(), [1, 1])
-        self.assertFalse(np.array_equal(sparse[1].factor.sparse_Linv.numpy()[0], held[0]))
+        self.assertFalse(np.array_equal(_tree(sparse, 0, sparse[1].factor.walk_data.numpy()), _tree(sparse, 0, held)))
         self.assert_states_close(dense[2], sparse[2])
         self.assert_sparse_state(sparse)
 

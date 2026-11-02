@@ -201,7 +201,6 @@ class TestTreePhysicalCUDA(TestTreePhysicalCPU):
                     wp.capture_launch(graph)
             for case in cases:
                 public_state(self, case[0], case[3])
-                np.testing.assert_array_equal(case[1].factor.sparse_mass_matrix_status.numpy(), 0)
             for field in ("joint_q", "joint_qd", "body_q", "body_qd"):
                 np.testing.assert_allclose(
                     getattr(cases[1][3], field).numpy(), getattr(cases[0][3], field).numpy(), atol=4e-4, rtol=4e-4

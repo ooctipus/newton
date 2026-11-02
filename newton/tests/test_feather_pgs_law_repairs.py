@@ -1120,17 +1120,6 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
         arms = [self._sparse_roll(dense, 60, 1)[0] for dense in (False, True)]
         np.testing.assert_allclose(arms[1], arms[0], rtol=0.0, atol=2.0e-2)
 
-    def test_the_decision_leaves_the_sparse_factor_whole(self):
-        """No factor array is downdated (DECISIONS 11-01): after steps whose drives slip, the held sparse factor, ``L^-1``
-        included, is the factor kernels' refresh with every drive's ``K``. An odd step count: the last finish left the
-        geometry the step's factors read."""
-        _, solver = self._sparse_roll(False, 5, 2)
-        factor = solver.factor
-        held = factor.sparse_Linv.numpy().copy()
-        factor.mass_update_mask.fill_(1)
-        factor.held.refresh(factor)
-        np.testing.assert_allclose(held, factor.sparse_Linv.numpy(), rtol=2.0e-6, atol=1.0e-7)
-
     def test_a_compact_diagonal_decides_in_its_predictor(self):
         """A tree group of diagonal mass, the star pin keeping it from scalar branches: its inverse is the coordinate's own,
         on a step without a mass update."""
