@@ -31,6 +31,7 @@ from .spatial_laws import (
     inertia_at,
     inertia_matrix,
     inertia_record,
+    joint_columns,
     joint_frame_pose,
     joint_motion,
     joint_transform,
@@ -1384,7 +1385,7 @@ def get_state_kernel(
                 free = kind == JointType.FREE or kind == JointType.DISTANCE
                 if free:
                     point = wp.transform_point(_load_pose(g.address, local), data.body_com[data.joint_child[joint]])
-                joint_motion(
+                joint_columns(
                     kind,
                     data.joint_axis,
                     data.joint_dof_dim[joint, 0],
@@ -1392,7 +1393,6 @@ def get_state_kernel(
                     wp.transform(wp.vec3(), wp.transform_get_rotation(anchor)),
                     q,
                     data.joint_q_start[joint],
-                    qd,
                     start,
                     data.walk_now,
                 )
