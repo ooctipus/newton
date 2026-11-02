@@ -351,6 +351,7 @@ def held_tree_calls():
     ``scalar_branches``, which the pins family records.
     """
     from newton._src.solvers.feather_pgs import tree_kinetic_state as native  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.tree_factor import RELEASE_SLIPS  # noqa: PLC0415
 
     state = _unwrapped(native.get_state_kernel)
     predictor = _unwrapped(native.get_predictor_kernel)
@@ -374,7 +375,14 @@ def held_tree_calls():
             if options.keys() <= {"clocked"}:
                 # The CUDA predictor: it holds the twist publication where the layout admits it.
                 twists = native.publishes_twists(tree, schedules, cuda=True)
-                kwargs = {**layout, "response": response, "twists": twists, "classes": walk_classes(tree), **options}
+                kwargs = {
+                    **layout,
+                    "response": response,
+                    "twists": twists,
+                    "classes": walk_classes(tree),
+                    "slips": RELEASE_SLIPS,
+                    **options,
+                }
                 yield "tree_kinetic_state.get_predictor_kernel", predictor, (schedules,), kwargs
         # A group's coordinates: a free root's quaternion takes one more than its three rotation velocities.
         coordinates = tree.dofs + tree.free_root_count
