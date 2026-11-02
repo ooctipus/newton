@@ -421,10 +421,24 @@ class TestSparseContactTriplets(unittest.TestCase):
         while high - low > 1:
             middle = (low + high) // 2
             low, high = (middle, high) if staging(middle).fits(budget) else (low, middle)
+        # The tiny batch: the largest capacity whose support table (its classes, and a class a row) costs at least the
+        # explicit indices (a coordinate an entry), the admission's rule, from this tree's classes.
+        probe = SolverFeatherPGS(
+            model,
+            friction_anchor_beta=0.0,
+            enable_joint_velocity_limits=False,
+            pgs_warmstart=False,
+            dense_max_constraints=192,
+        )
+        support = probe.placement.sparse_row_support
+        classes = sum(
+            getattr(support, name).numpy().nbytes for name in ("body_class", "pair_class", "class_dof", "limit_class")
+        )
+        tiny = classes // (4 * model.world_count * (int(probe.placement.sparse_max_row_support) - 1))
         cases = (
             (192, {"contact_units": None}, False),
             (192, {}, True),
-            (40, {}, False),  # The tiny batch's support table costs more than explicit indices.
+            (tiny, {}, False),  # The tiny batch's support table costs more than explicit indices.
             (192, {"active_rows": False}, False),
             (192, {"row_support": False}, False),
             (low, {}, True),
