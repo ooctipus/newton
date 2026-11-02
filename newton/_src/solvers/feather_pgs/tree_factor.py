@@ -960,7 +960,10 @@ class TreeFactor:
         self.walk_class = wp.array(walk_class, dtype=wp.int32, device=device)
         # A tree's group in the step's walk kernel (walk_step_kernel, walk_group): on CUDA a lane a body of a batch of
         # the inward pass and a join slot; one thread a tree on the CPU.
-        walked = int(arts.size)
+        # The trees in flight are the trees with a chain to walk: a one-body tree (a free rigid body) leaves its group
+        # after the batch's first body.
+        sizes = np.array([int(end[a]) - int(start[a]) for a in arts.tolist()], dtype=np.int64)
+        walked = int(np.count_nonzero(sizes > 1)) or int(arts.size)
         self.walk_lanes = walk_group(bodies, held, walked, device.sm_count) if device.is_cuda else 1
         self.walk_block = WALK_BLOCK
         # The trees' classes (their topology): a thread a tree with the class compiled in where the classes' data
