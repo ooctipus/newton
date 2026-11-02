@@ -705,6 +705,23 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
         return __builtin_ctzll(bits);
 #endif
     };
+    // The writer's own accesses, typed (no generic LD.E / ST.E): its inputs read-only (RD, the non-coherent path;
+    // nothing here writes them), its outputs stored (ST), and the footprints it adds into read back (RW).
+#if defined(__CUDA_ARCH__)
+    const auto RD = [](const auto* p) { return __ldg(p); };
+    const auto ST = [](auto* p, const auto v) {
+        __builtin_assume(__isGlobal(p));
+        *p = v;
+    };
+    const auto RW = [](const float* p) -> float {
+        __builtin_assume(__isGlobal(p));
+        return *p;
+    };
+#else
+    const auto RD = [](const auto* p) { return *p; };
+    const auto ST = [](auto* p, const auto v) { *p = v; };
+    const auto RW = [](const float* p) -> float { return *p; };
+#endif
     const auto& walk = sink.walk;
     const auto& release = sink.release;
     const auto& support = sink.support;
@@ -735,24 +752,24 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
     bool reread = false;
     for (int side = 0; side < 2; ++side) {
         const int art = side == 0 ? art_a : art_b;
-        if (art < 0 || (side == 1 && art == art_a) || sink.response_dofs.data[art] <= 0) continue;
-        const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
+        if (art < 0 || (side == 1 && art == art_a) || RD(sink.response_dofs.data + art) <= 0) continue;
+        const int j0 = RD(walk.joint_start.data + art), d0 = RD(walk.dof_start.data + art);
         unsigned long long mask = 0ull;
         int seeds = 0;
         if (covector) {
-            mask = sink.dof_mask.data[dof0 - d0];
+            mask = RD(sink.dof_mask.data + (dof0 - d0));
             seeds = 1;
             if (dof1 >= 0) {
-                mask |= sink.dof_mask.data[dof1 - d0];
+                mask |= RD(sink.dof_mask.data + (dof1 - d0));
                 seeds = 2;
             }
         } else {
             if (body_a >= 0 && art_a == art) {
-                mask |= sink.body_mask.data[body_a];
+                mask |= RD(sink.body_mask.data + body_a);
                 ++seeds;
             }
             if (body_b >= 0 && art_b == art) {
-                mask |= sink.body_mask.data[body_b];
+                mask |= RD(sink.body_mask.data + body_b);
                 ++seeds;
             }
         }
@@ -766,7 +783,7 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
         if (add) {
             reread = true;
             for (int r = 0; r < rows; ++r)
-                for (int e = base; e < count; ++e) Z[r * S + e] = 0.0f;
+                for (int e = base; e < count; ++e) ST(Z + r * S + e, 0.0f);
         }
         const float* data = walk.data.data + (size_t)d0 * $coordinate;
         const float* link = walk.link.data + (size_t)j0 * $link;
@@ -789,9 +806,9 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
             float* entry = Z + rank(c);
             for (int k = 0; k < rows; ++k) {
                 if (add)
-                    entry[k * S] += footprint[k];
+                    ST(entry + k * S, RW(entry + k * S) + footprint[k]);
                 else
-                    entry[k * S] = footprint[k];
+                    ST(entry + k * S, footprint[k]);
             }
             if (!add && rows == $rows) gram();
         };
@@ -805,18 +822,18 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                 // A covector enters at its coordinate: its body's coordinates after it (below it in factor order) are
                 // the row's zeros.
                 if (!add)
-                    for (int e = base; e < rank(c); ++e) Z[e] = 0.0f;
+                    for (int e = base; e < rank(c); ++e) ST(Z + e, 0.0f);
                 for (int i = 0; i < 6 * $rows; ++i) p[i] = w[i] = 0.0f;
                 WALK_SEED(data, c, x, p, store);
-                WALK_UP(data, link, nullptr, nullptr, walk.dof_body.data[d0 + c], c - 1, p, w, store);
-                incident[0] += x[0] * vh[c];
+                WALK_UP(data, link, nullptr, nullptr, RD(walk.dof_body.data + d0 + c), c - 1, p, w, store);
+                incident[0] += x[0] * RD(vh + c);
             }
         } else {
             for (int k = 0; k < 2; ++k) {
                 const int body = k == 0 ? body_a : body_b;
                 if (body < 0 || (k == 0 ? art_a : art_b) != art) continue;
                 const float sign = k == 0 ? 1.0f : -1.0f;
-                const int j = walk.body_joint.data[body];
+                const int j = RD(walk.body_joint.data + body);
                 const int local = j - j0;
                 // The seeds' wrenches at the body's frame (the factor's), where the walk's shifted columns are J's.
                 const float* o = walk.link.data + (size_t)j * $link + $frame;
@@ -825,7 +842,7 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                     const float* d = unit.frame.data[r == 1 || r == 2 ? r : 0];
                     const auto& at = r == 0 ? unit.point : unit.friction_point;
                     const float f[3] = {sign * d[0], sign * d[1], sign * d[2]};
-                    const float l[3] = {at[0] - o[0], at[1] - o[1], at[2] - o[2]};
+                    const float l[3] = {at[0] - RD(o), at[1] - RD(o + 1), at[2] - RD(o + 2)};
                     if (r >= rows) {
                         for (int i = 0; i < 6; ++i) q[i] = 0.0f;
                     } else if ($spin && r == 3) {
@@ -845,7 +862,7 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                 }
                 // The step's J entry of each footprint against v_hat: the rows' incident velocity.
                 const auto sink = [&](int r, int c, float z, float j) {
-                    if (r < rows) incident[r] += j * vh[c];
+                    if (r < rows) incident[r] += j * RD(vh + c);
                     store(r, c, z, j);
                 };
                 WALK_UP(data, link, now, now_link, local, WALK_FIRST_OF(local + 1) - 1, p, w, sink);
@@ -853,7 +870,7 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
         }
         // A slipping tree's release (the predictor's border), root-most slip first, on the side's entries along each
         // slip's path (WALK_RELEASE_ON): entries off the row's support stay zero, so the side keeps its support.
-        if (release.count.data[art] > 0) {
+        if (RD(release.count.data + art) > 0) {
             reread = true;
             WALK_RELEASE_ON(release, art, Z, rows, S, [&](const int c) -> int {
                 return ((mask >> SUPPORT_NODE[c]) & 1ull) != 0ull ? rank(c) : -1;
@@ -862,47 +879,47 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
     }
     // The pad past the support; the rows' coordinates (explicit) or their support class (the table).
     for (int r = 0; r < rows; ++r)
-        for (int e = count; e < S; ++e) Z[r * S + e] = 0.0f;
+        for (int e = count; e < S; ++e) ST(Z + r * S + e, 0.0f);
     if (support.enabled == 0) {
         int* const D = sink.row_dof.data + (size_t)row0 * S;
         for (int side = 0; side < 2; ++side) {
             if (masks[side] == 0ull) continue;
             int e = bases[side];
-            const int offset = sink.world_offset.data[side == 0 ? art_a : art_b];
+            const int offset = RD(sink.world_offset.data + (side == 0 ? art_a : art_b));
             for (unsigned long long bits = masks[side]; bits != 0ull; bits &= bits - 1ull, ++e)
-                for (int r = 0; r < rows; ++r) D[r * S + e] = offset + LOW(bits);
+                for (int r = 0; r < rows; ++r) ST(D + r * S + e, offset + LOW(bits));
         }
         for (int r = 0; r < rows; ++r)
-            for (int e = count; e < S; ++e) D[r * S + e] = -1;
+            for (int e = count; e < S; ++e) ST(D + r * S + e, -1);
     } else {
         int cls = 0;
         if (covector) {
-            cls = support.limit_class.data[dof0 - walk.dof_start.data[art_a]];
+            cls = RD(support.limit_class.data + (dof0 - RD(walk.dof_start.data + art_a)));
         } else {
             const auto side_of = [&](int body, int art) {
-                return body >= 0 && art >= 0 && sink.response_dofs.data[art] > 0 && sink.body_mask.data[body] != 0ull;
+                return body >= 0 && art >= 0 && RD(sink.response_dofs.data + art) > 0 && RD(sink.body_mask.data + body) != 0ull;
             };
             const bool a = side_of(body_a, art_a), b = side_of(body_b, art_b);
-            const int class_a = a ? support.body_class.data[body_a] : 0;
-            const int class_b = b ? support.body_class.data[body_b] : 0;
-            cls = support.pair_class.data[class_a * support.pair_class.shape[1] + class_b];
+            const int class_a = a ? RD(support.body_class.data + body_a) : 0;
+            const int class_b = b ? RD(support.body_class.data + body_b) : 0;
+            cls = RD(support.pair_class.data + (class_a * support.pair_class.shape[1] + class_b));
         }
-        for (int r = 0; r < rows; ++r) support.row_class.data[row0 + r] = cls;
+        for (int r = 0; r < rows; ++r) ST(support.row_class.data + row0 + r, cls);
     }
     if (reread) {
         for (int r = 0; r < $rows; ++r) norm[r] = zc[r] = 0.0f;
         for (int k = 0; k < 6; ++k) cross[k] = 0.0f;
         for (int e = 0; e < count; ++e) {
             for (int r = 0; r < rows; ++r) {
-                zc[r] = Z[r * S + e];
+                zc[r] = RW(Z + r * S + e);
                 norm[r] += zc[r] * zc[r];
             }
             if (rows == $rows) gram();
         }
     }
     for (int r = 0; r < rows; ++r) {
-        sink.diag.data[row0 + r] = norm[r] + sink.row_cfm.data[row0 + r];
-        sink.row_incident.data[row0 + r] = incident[r];
+        ST(sink.diag.data + row0 + r, norm[r] + RD(sink.row_cfm.data + row0 + r));
+        ST(sink.row_incident.data + row0 + r, incident[r]);
     }
 $record"""
 """The support sink's unit walker, ``$rows`` rows a lane (:func:`support_rows_kernel`)."""
@@ -913,16 +930,16 @@ _SUPPORT_RECORD = """    // A full unit's block record from its Gram (sparse_con
     if (rows == $rows) {
         float* record = sink.records.data + ((size_t)unit.line * sink.records.shape[1] + unit.slot / 3)
                         * sink.records.shape[2];
-        record[0] = cross[0];
-        record[1] = cross[1];
-        record[2] = cross[2];
-        record[3] = 1.0f / (norm[0] + sink.row_cfm.data[row0]);
+        ST(record + 0, cross[0]);
+        ST(record + 1, cross[1]);
+        ST(record + 2, cross[2]);
+        ST(record + 3, 1.0f / (norm[0] + RD(sink.row_cfm.data + row0)));
 $tail
     }
 """
-_SPIN_TAIL = """        record[4] = cross[3];
-        record[5] = cross[4];
-        record[6] = cross[5];"""
+_SPIN_TAIL = """        ST(record + 4, cross[3]);
+        ST(record + 5, cross[4]);
+        ST(record + 6, cross[5]);"""
 
 
 @cache
