@@ -818,32 +818,12 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
             }
         }
         // A slipping tree's release (the predictor's border), root-most slip first, on the side's entries along each
-        // slip's path: entries off the row's support stay zero, so the side keeps its support.
-        const int slips = release.count.data[art];
-        if (slips > 0) {
+        // slip's path (WALK_RELEASE_ON): entries off the row's support stay zero, so the side keeps its support.
+        if (release.count.data[art] > 0) {
             reread = true;
-            const int cap = release.dof.shape[1], width = release.b.shape[2];
-            for (int j = 0; j < slips; ++j) {
-                const int i = release.dof.data[art * cap + j];
-                const size_t at = ((size_t)art * cap + j) * width;
-                const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
-                float s[$rows];
-                for (int r = 0; r < $rows; ++r) s[r] = 0.0f;
-                // The path, leaf first (step t); a coordinate off the row's support holds zero and leaves s at zero.
-                for (int body = walk.dof_body.data[d0 + i], c = i, t = 0; body >= 0;) {
-                    for (; c >= WALK_FIRST_OF(body); --c, ++t) {
-                        if (((mask >> SUPPORT_NODE[c]) & 1ull) == 0ull) continue;
-                        float* entry = Z + rank(c);
-                        for (int r = 0; r < rows; ++r) {
-                            const float u = entry[r * S] - b[t] * s[r];
-                            s[r] += a[t] * u;
-                            entry[r * S] = g[t] * u;
-                        }
-                    }
-                    body = WALK_PARENT_OF(body);
-                    if (body >= 0) c = WALK_FIRST_OF(body + 1) - 1;
-                }
-            }
+            WALK_RELEASE_ON(release, art, Z, rows, S, [&](const int c) -> int {
+                return ((mask >> SUPPORT_NODE[c]) & 1ull) != 0ull ? rank(c) : -1;
+            });
         }
     }
     // The pad past the support; the rows' coordinates (explicit) or their support class (the table).
