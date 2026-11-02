@@ -35,7 +35,7 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
     row_type = solver.placement.mf_row_type.numpy()
     if getattr(solver.placement, "walks", False):
         records = solver.factor.walk_view().data.numpy()
-        data = unpack_walk_records(records, max(int(solver.model.joint_dof_count), 1)).astype(np.float64)
+        data = unpack_walk_records(records, records.shape[0]).astype(np.float64)
         starts = solver.forest.articulation_dof_start.numpy()
 
         def physical(art, z):
