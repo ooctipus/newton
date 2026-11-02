@@ -1427,7 +1427,7 @@ class SparsePairZ(ResponseOperator):
 
     The sparse-diagonal rows: a world pairs one compact dense articulation (its group ``group``, first coordinate
     ``offset``) with diagonal-mass coordinates, and the sweep holds the velocity change in factor coordinates: ``u =
-    F^-T L^T P dv`` on the dense articulation (the walk's factor and its slips' frame) and ``u = sqrt(m) dv`` on a
+    R^-T L^T P dv`` on the dense articulation (the walk's factor and its slips' release) and ``u = sqrt(m) dv`` on a
     diagonal coordinate (a star's factor is diagonal). Row ``i``'s dense part is its walk's footprints ``Z = F L^-1 P
     J^T`` at ``Z[(group * rows + i) * dofs + l]`` on coordinate ``offset + l`` (the walk's coordinate ``l``); its sparse
     part is two slots ``s``: coordinate ``sparse_dof[(base + i) * 2 + s]`` (``-1`` for none, below ``-1`` an

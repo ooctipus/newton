@@ -5,7 +5,7 @@
 
 :func:`sparse_diagonal_kernel`: a world's dense group plus diagonal-mass coordinates as whitened rows
 (:class:`.SparsePairZ`), one warp per world, on the velocity change from the predictor in factor coordinates, from zero:
-``du = F^-T L^T P dv`` on the dense articulation (the walk's factor and its slips' frame, the frame its rows were whitened
+``du = R^-T L^T P dv`` on the dense articulation (the walk's factor and its slips' release, the frame its rows were whitened
 in) and ``du = sqrt(m) dv`` on a diagonal coordinate, left once and added to the predictor. Each sweep runs its coordinates' fused joint limits, its independent scalar contacts one lane per chain, then its
 coupled rows in order (plain, contact triples or contact units, optionally with speculative batches), a loaded coupled
 contact unit by the unit law (:class:`_UnitPairZ`, :func:`.sweep.contact_unit`). Its working set fits the static

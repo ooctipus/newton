@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The general placement's one writer (FL3.3): rows by the walk, the slips' frame and the leave in one frame.
+"""The one writer (FL3.3-FL3.5): rows by the walk, the slips' release and the leave in one frame.
 
 - **The block's exactness** (FL3_design §1.4, ``exp_block``, W9's release): on random trees with a weld, a mimic or
   both and one to three slipping drives, the release then the closure (``R``, then the projector of ``R Z_B``'s
@@ -14,8 +14,9 @@
 - **One frame per placement** (general worlds, the CPU catalogue): every walked row against its physical ``J v_hat``
   (``Z_i^T L^T P v_hat`` against the incident velocity its walk summed), and the step's leave against the float64
   walk's.
-- **The sparse diagonal** (FL3.5, CUDA): its arm's rows of a slipping tree give the decided operator, and the keyboard's
-  rows (arm and keys) and its arm's leave hold the same invariant on each of its routes.
+- **The sparse diagonal** (FL3.5, CUDA): its arm's rows of a slipping tree, released along the slips' paths (W9's
+  ``R``), give the decided operator, and the keyboard's rows (arm and keys) and its arm's leave hold the same invariant
+  on each of its routes.
 """
 
 import unittest
@@ -346,7 +347,7 @@ def slipping_hinges_beside_a_body(device):
 class TestLocalSlipFrame(unittest.TestCase):
     """The local owners (case K3, FL3.6) take the decided operator: the packets' rows walked in the kernel and the one
     writer's rows both carry the release ``R`` of the slipping drives along their paths, and the local leave ``R^T``
-    (W9's verdict), so each step equals the general placement's (:class:`TestSlipFrame`'s decided operator)."""
+    (W9's verdict), so each step equals the general placement's (:class:`TestSlipRelease`'s decided operator)."""
 
     def test_the_local_kernel_takes_the_decided_operator(self):
         from unittest import mock  # noqa: PLC0415
@@ -658,7 +659,7 @@ def slot_frames(solver, joint_q: np.ndarray, capture) -> dict:
     world_dofs = forest.world_dof_indices.numpy()
     inverse_mass = factor.diagonal_inverse_mass.numpy().astype(np.float64)
     starts = forest.articulation_dof_start.numpy()
-    slips = factor.walk_view().slips.numpy()
+    slips = factor.walk_view().release.count.numpy()
     incident = placement.row_incident.numpy().astype(np.float64)
     first = placement.dense_first.numpy()
     for world in range(int(forest.world_count)):
@@ -749,6 +750,8 @@ class TestSlotFrame(unittest.TestCase):
     """The sparse diagonal on the walk (FL3.5): the arm's rows of H7's decided set, the keyboard's rows and leave."""
 
     def test_arm_rows_take_the_decided_operator(self):
+        """The arm's limit rows, released along the slips' paths (W9's ``R``), give the decided operator's Gram
+        ``J A_F^-1 J^T``; without the release they would give the all-``K`` one."""
         model, control = star_beside_hinges("cuda:0")
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -759,33 +762,34 @@ class TestSlotFrame(unittest.TestCase):
         joint_q = state.joint_q.numpy().astype(np.float64)
         solver.step(state, out, control, None, 1.0 / 60.0)
         art = int(solver.placement.sparse_diagonal_dense_arts.numpy()[0])
-        view = solver.factor.walk_view()
-        slips = int(view.slips.numpy()[art])
-        self.assertEqual(slips, 3)
+        self.assertEqual(int(solver.factor.walk_view().release.count.numpy()[art]), 3)
         walk = solver.factor.walk(joint_q, art)
         n = walk.s.shape[0]
-        dofs = solver.forest.articulation_dof_start.numpy()[art] + np.arange(n)
-        drive_rows = solver.factor.drive_row_by_dof.numpy()[dofs]
+        start = int(solver.forest.articulation_dof_start.numpy()[art])
+        drive_rows = solver.factor.drive_row_by_dof.numpy()[start + np.arange(n)]
         K = solver.factor.aug_row_K.numpy()[drive_rows].astype(np.float64)
         Kd = solver.factor.aug_row_Kd.numpy()[drive_rows].astype(np.float64)
         released = K - Kd
-        B = np.stack([walk.up(covector=np.eye(n)[i])[0] for i in range(n)], axis=1)
-        basis = view.basis.numpy()[art, :slips, :n].astype(np.float64).T
-        scale = np.tril(view.scale.numpy()[art, :slips, :slips].astype(np.float64))
-        F = np.eye(n) + basis @ (scale.T - np.eye(slips)) @ basis.T
-        # The hinges' limit rows in the arm's dense parts: their Gram is the decided operator's (TestSlipFrame).
+        # The rows' physical J from their unit sources: each a joint limit, +-e_dof.
         p = solver.placement
         count = int(p.constraint_count.numpy()[0])
         self.assertGreater(count, 0)
+        line = int(p.dense_first.numpy()[0])
+        units = p.unit_source.numpy()[line, :count]
+        J = np.zeros((count, n))
+        for row, source in enumerate(units):
+            self.assertEqual(source >> 28, 2)  # UNIT_LIMIT
+            index = source & ((1 << 28) - 1)
+            J[row, index // 2 - start] = 1.0 - 2.0 * (index % 2)
         group = int(p.sparse_diagonal_dense_groups.numpy()[0])
         Z = p.J_by_size[n].numpy()[group, :count, :n].astype(np.float64)
-        J = Z @ np.linalg.inv(F).T @ np.linalg.inv(B).T
+        B = np.stack([walk.up(covector=np.eye(n)[i])[0] for i in range(n)], axis=1)
         A = np.linalg.inv(B.T @ B)
         W_rows = Z @ Z.T
         W_decided = J @ np.linalg.solve(A - np.diag(released), J.T)
         W_all = J @ np.linalg.solve(A, J.T)
         scale_W = np.linalg.norm(W_decided)
-        self.assertLess(np.linalg.norm(W_rows - W_decided) / scale_W, 1.0e-4)
+        self.assertLess(np.linalg.norm(W_rows - W_decided) / scale_W, 1.0e-5)
         self.assertGreater(np.linalg.norm(W_all - W_decided) / scale_W, 1.0e-1)
 
     def test_one_frame_on_the_keyboard(self):

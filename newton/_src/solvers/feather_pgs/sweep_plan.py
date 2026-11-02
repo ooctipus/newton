@@ -862,14 +862,25 @@ class Sweep:
     def release_walk(self, v_hat: wp.array) -> None:
         """Case K1: the release of every tree whose predictor decided a set this step (:func:`.walk_rows.walk_release_kernel`),
         before the writer reads it; nothing where no drive can slip."""
+        size = self.placement.sparse_mass_matrix_size
+        self._release(self.forest.group_to_art[size], self.forest.n_arts_by_size[size], v_hat)
+
+    def release_diagonal(self, v_hat: wp.array) -> None:
+        """Case K2: the release of every dense arm whose predictor decided a set this step
+        (:func:`.walk_rows.walk_release_kernel`), before its rows read it; nothing where no drive can slip. A key's slip
+        is its own scalar, already in the factor's diagonal inverse mass its step reads."""
+        self._release(self.placement.sparse_diagonal_dense_arts, self.forest.world_count, v_hat)
+
+    def _release(self, arts: wp.array, count: int, v_hat: wp.array) -> None:
+        """The release of ``arts``' slipping drives (W9's one slip basis, the factor's :class:`.tree_factor.WalkRelease`),
+        a thread per tree."""
         factor = self.factor
         if not factor.walk_slip_capacity:
             return
-        size = self.placement.sparse_mass_matrix_size
         wp.launch(
             walk_rows.walk_release_kernel,
-            dim=self.forest.n_arts_by_size[size],
-            inputs=[self.forest.group_to_art[size], factor.walk_view(), factor.walk_slips(), v_hat],
+            dim=count,
+            inputs=[arts, factor.walk_view(), factor.walk_slips(), v_hat],
             device=self.model.device,
         )
 
@@ -1318,7 +1329,7 @@ class Sweep:
                 contact_units=self.placement.sparse_diagonal_contact_units,
                 weighted=self.laws.set.weighted,
                 torsion=self.laws.contact_torsion_enabled,
-                # The dense arm leaves by the walk: its slips' frame is compiled where a drive can saturate.
+                # The dense arm leaves by the walk: its slips' release is compiled where a drive can saturate.
                 walk_frame=bool(self.factor.walk_slip_capacity),
             )
             if self.placement.sparse_diagonal_contact_solve

@@ -824,9 +824,11 @@ class RowLaws:
                     device=model.device,
                 )
 
-        # The sparse diagonal on the walk (FL3.5): its rows, its contact producers among them.
+        # The sparse diagonal on the walk (FL3.5): its rows read the slips' release, its contact producers among them.
         slots = solver.placement.walks and solver.placement.sparse_diagonal_contact_solve
         slots_written = False
+        if slots:
+            solver.sweep.release_diagonal(solver.v_hat)
 
         if (
             contacts is not None
