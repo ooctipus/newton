@@ -872,9 +872,7 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
         // slip's path (WALK_RELEASE_ON): entries off the row's support stay zero, so the side keeps its support.
         if (RD(release.count.data + art) > 0) {
             reread = true;
-            WALK_RELEASE_ON(release, art, Z, rows, S, [&](const int c) -> int {
-                return ((mask >> SUPPORT_NODE[c]) & 1ull) != 0ull ? rank(c) : -1;
-            });
+$release
         }
     }
     // The pad past the support; the rows' coordinates (explicit) or their support class (the table).
@@ -951,13 +949,38 @@ def _support_table(node: tuple[int, ...]) -> DevicePrelude:
     )
 
 
+_RELEASE_HELD = """            // The side's entries held in the thread's own array while every slip's steps run over them: one load and
+            // one store an entry, not a global read-modify-write a step.
+            float held[$rows * $coordinates];
+            const int span = count - base;
+            for (int r = 0; r < rows; ++r)
+                for (int e = 0; e < span; ++e) held[r * $coordinates + e] = RW(Z + r * S + base + e);
+            WALK_RELEASE_ON(release, art, held, rows, $coordinates, [&](const int c) -> int {
+                return ((mask >> SUPPORT_NODE[c]) & 1ull) != 0ull ? rank(c) - base : -1;
+            });
+            for (int r = 0; r < rows; ++r)
+                for (int e = 0; e < span; ++e) ST(Z + r * S + base + e, held[r * $coordinates + e]);"""
+_RELEASE_IN_PLACE = """            WALK_RELEASE_ON(release, art, Z, rows, S, [&](const int c) -> int {
+                return ((mask >> SUPPORT_NODE[c]) & 1ull) != 0ull ? rank(c) : -1;
+            });"""
+
+RELEASE_HELD_COORDINATES = 16
+"""The most coordinates of a class whose writer holds a unit's side in its own array for the slips' release
+(:data:`_RELEASE_HELD`, at most four rows a coordinate). Measured on the GB300 (``SP/core/FL/HANDOFF_ZK.md`` §17):
+franka-reach's 9 16% faster; g1's 43 (a 688 B array at the writer's 128 registers) 3% slower, where the release runs
+on 0.01 slips a tree. Past it the release runs on the stored entries in place."""
+
+
 def _support_snippet(parent: tuple, first: tuple, node: tuple, rows: int, records: bool, spin: bool) -> str:
     record = ""
     if records:
         record = substitute(_SUPPORT_RECORD, rows=rows, tail=_SPIN_TAIL if spin else "")
+    held = first[-1] <= RELEASE_HELD_COORDINATES
+    release = substitute(_RELEASE_HELD, rows=rows, coordinates=first[-1]) if held else _RELEASE_IN_PLACE
     body = substitute(
         _SUPPORT,
         rows=rows,
+        release=release,
         last=rows - 1,
         coordinate=WALK_COORDINATE,
         link=WALK_LINK,
