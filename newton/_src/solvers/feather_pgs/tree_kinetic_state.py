@@ -2242,9 +2242,11 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
 def held_walks(cls, x: str, u: str, state: str, words: int) -> tuple[str, str]:
     """Native statements of the decided step's two held walks of class ``cls`` (CUDA, :data:`_HELD`'s ``h`` in scope):
     the walk up of ``x`` into ``u`` (``u = L^-1 P x``) and the walk down of ``u`` in place (``P^T L^-T u``), on every
-    lane of the segment in lockstep, straight-line from the class's table: each coordinate's record and each body's link
-    read by shuffle from the lane and word that hold them (``HOLD_RECORD``, ``HOLD_LINK`` at a constant), no loop and no
-    pick of a parent or a first coordinate on the chain. A body's state passes to a parent that is not the body before it
+    lane of the segment in lockstep, straight-line from the class's table, no loop and no pick of a parent or a first
+    coordinate on the chain. Each coordinate's step runs on every lane from the lane's own held word of the records (the
+    coordinate's lane: its own record), and the walk's six-float state is then read from the coordinate's lane (six
+    shuffles, where reading the record took thirteen); each body's link by shuffle from the lane that holds it
+    (``HOLD_LINK`` at a constant). A body's state passes to a parent that is not the body before it
     through ``state`` (six words a body, lane 0 writes), the walk down's twists through the same words (every lane
     writes them, as each body's twist out); a body no other child joins adds the zero state as ``+ 0.0f``, the walk
     up's addition of an untouched slot. Lane 0 writes ``u`` (both walks). ``words``: the words a lane holds
@@ -2260,9 +2262,10 @@ def held_walks(cls, x: str, u: str, state: str, words: int) -> tuple[str, str]:
             up.append("    for (int k = 0; k < 6; ++k) p[k] += 0.0f;")
         for c in range(first[b + 1] - 1, first[b] - 1, -1):
             up.append(
-                f"    {{float d[13];HOLD_RECORD(h,{c},d);const float z=({x}[{c}]+((d[0]*p[0]+d[1]*p[1]+d[2]*p[2])"
+                f"    {{const float* d=h.r[{c}/WIDTH];const float z=({x}[{c}]+((d[0]*p[0]+d[1]*p[1]+d[2]*p[2])"
                 "+(d[3]*p[3]+d[4]*p[4]+d[5]*p[5])))*d[12];"
-                f"for(int k=0;k<6;++k)p[k]-=d[6+k]*z;if(lane==0){u}[{c}]=z;}}"
+                f"float q[6];for(int k=0;k<6;++k)q[k]=p[k]-d[6+k]*z;if(lane=={c}%WIDTH){u}[{c}]=z;"
+                f"for(int k=0;k<6;++k)p[k]=READ(q[k],{c}%WIDTH);}}"
             )
         parent_b = parent[b]
         if parent_b >= 0:
@@ -2301,9 +2304,10 @@ def held_walks(cls, x: str, u: str, state: str, words: int) -> tuple[str, str]:
             )
         for c in range(first[b], first[b + 1]):
             down.append(
-                f"    {{float d[13];HOLD_RECORD(h,{c},d);const float q=(HOLD_PICK(uh,{c})-((d[6]*V[0]+d[7]*V[1]+d[8]*V[2])"
+                f"    {{const float* d=h.r[{c}/WIDTH];const float q=(uh[{c}/WIDTH]-((d[6]*V[0]+d[7]*V[1]+d[8]*V[2])"
                 "+(d[9]*V[3]+d[10]*V[4]+d[11]*V[5])))*d[12];"
-                f"if(lane==0){u}[{c}]=q;for(int k=0;k<6;++k)V[k]+=d[k]*q;}}"
+                f"float W[6];for(int k=0;k<6;++k)W[k]=V[k]+d[k]*q;if(lane=={c}%WIDTH){u}[{c}]=q;"
+                f"for(int k=0;k<6;++k)V[k]=READ(W[k],{c}%WIDTH);}}"
             )
         down.append(f"    for (int k = 0; k < 6; ++k) {state}[{6 * b} + k] = V[k];")
     down.append("    WARP_SYNC();\n}")
