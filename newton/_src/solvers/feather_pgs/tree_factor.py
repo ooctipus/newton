@@ -2204,15 +2204,6 @@ def walk_paths_prelude(
 # The class emitter (ZB): a class's walk as straight-line native code, and the one walk down on it
 # ---------------------------------------------------------------------------------------------------------------------
 
-WALK_UNROLL = 24
-"""Coordinates of a class up to which :meth:`WalkClass.walk` emits its walk as straight-line code; a larger class takes
-the loop form. Chosen from data (the step's leave on synthetic walk data, ZE's bench, PRO and GB300): straight-line
-code is faster on allegro's 16-coordinate hand (GB300 35.5 against 43.7 us cold in the loop form), the loop form on
-g1's 43 coordinates (41.6 against 51.9) and on chain_106: straight-line code holds every item's inputs as named
-values, which ptxas schedules next to their use under its register target, while the loop form's ring keeps
-:data:`WALK_AHEAD` items in flight by construction; the loop's table reads and branches cost a short tree more than
-its latency."""
-
 WALK_TOUCH = 16
 """Items a walk asks L1 for ahead of its chain (:meth:`WalkClass.touch`): a hint without a register or a scoreboard,
 so the loads :data:`WALK_AHEAD` items ahead find their lines in L1."""
@@ -2220,6 +2211,16 @@ so the loads :data:`WALK_AHEAD` items ahead find their lines in L1."""
 WALK_REGISTERS = 255
 """Registers a thread holds at most (the ISA's line): what a kernel without a launch bound may spend holding a walk's
 items for its two passes (:meth:`WalkClass.walk_twice`)."""
+
+WALK_UNROLL = WALK_REGISTERS // 4
+"""Coordinates of a class up to which :meth:`WalkClass.walk` emits its walk as straight-line code; a larger class takes
+the loop form. From the registers: a straight-line walk holds a class's states and values as named registers, about
+three a coordinate with its loads ahead (g1's 43-coordinate walk solve 141 registers, no stack), so up to a quarter of
+:data:`WALK_REGISTERS` coordinates fit with room for the chain; past it (chain_106's 112) the loop form's ring keeps
+:data:`WALK_AHEAD` items in flight. The loop form indexes its states on the stack (g1's walk solve: 272 B, 41 local
+loads and 43 stores): straight-line, g1's walk solve runs 78.0 -> 58.1 us a launch and its leave 47.1 -> 40.0 (RTX PRO
+6000, 16,384 worlds; ZP5, ZV). An earlier bench (ZE: the loop form faster on g1, 41.6 against 51.9 us) predates the
+record's vector loads and the touches."""
 
 WALK_AHEAD = 4
 """Items (a body's joint input, a coordinate's step input) a walk keeps in flight ahead of its serial chain

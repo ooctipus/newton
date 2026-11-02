@@ -2118,6 +2118,67 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
         }
         WARP_SYNC();
     };
+    // HELD_APPLY(a, u, slips): u <- R^T R u, every slip's release on its own lane at once (the segment's lane j holds
+    // slip j; at most WIDTH slips, as HELD_BUILD keeps). R_j is applied leaf first and R_j^T root first along slip j's
+    // root path, the same steps as WALK_SLIP and WALK_SLIP_T. Slips that share a coordinate share their path from it to
+    // their root (release.root, their group), so a coordinate's depth is the same on every path through it: lane j takes
+    // the coordinate at depth d (0 at the root) on turn (deepest - d) + rank for R, d + (size - 1 - rank) for R^T, its
+    // rank among its group's slips in order. Every coordinate then takes its slips' steps in BORDER_APPLY's order (R:
+    // the group's slips in order, R^T: last first), each slip's chain in its own order, with no two lanes on one
+    // coordinate in a turn: the same operations in the same order, over deepest + the largest group turns a direction,
+    // where one lane a group took the sum of its slips' paths.
+    const auto HELD_APPLY = [&](const int a, float* u, const int slips) {
+        auto& release = walk.release;
+        const int depth = release.b.shape[2], cap = release.dof.shape[1];
+        const bool mine = lane < slips;
+        const size_t at = ((size_t)a * cap + (mine ? lane : 0)) * depth;
+        const int* const coordinate = release.coordinate.data + at;
+        const float *const b = release.b.data + at, *const ar = release.a.data + at, *const g = release.g.data + at;
+        int len = 0, group = -1;
+        if (mine) {
+            group = release.root.data[a * cap + lane];
+            while (len < depth && coordinate[len] >= 0) ++len;
+        }
+        int rank = 0, size = 0, deepest = 0, widest = 0;
+        #pragma unroll 1
+        for (int k = 0; k < slips; ++k) {
+            const int gk = READ(group, k), lk = READ(len, k);
+            if (mine && gk == group) {
+                rank += k < lane ? 1 : 0;
+                ++size;
+            }
+            deepest = max(deepest, lk);
+        }
+        #pragma unroll 1
+        for (int k = 0; k < slips; ++k) widest = max(widest, READ(size, k));
+        const int turns = deepest + widest - 1;
+        float r = 0.0f;
+        const int lead = deepest - len + rank;
+        #pragma unroll 1
+        for (int T = 0; T < turns; ++T) {
+            const int t = T - lead;
+            if (mine && t >= 0 && t < len) {
+                const int c = coordinate[t];
+                const float x = u[c] - b[t] * r;
+                r += ar[t] * x;
+                u[c] = g[t] * x;
+            }
+            WARP_SYNC();
+        }
+        r = 0.0f;
+        const int back = size - 1 - rank;
+        #pragma unroll 1
+        for (int T = 0; T < turns; ++T) {
+            const int t = len - 1 - (T - back);
+            if (mine && T >= back && t >= 0) {
+                const int c = coordinate[t];
+                const float x = g[t] * u[c] + ar[t] * r;
+                r -= b[t] * x;
+                u[c] = x;
+            }
+            WARP_SYNC();
+        }
+    };
     // HELD_BUILD(h, a, n, nb, data, released, kept): the release of the tree's slips, coordinate-major. The slips are
     // its coordinates whose released stiffness is positive, root-most first (ascending), one a lane (lane j holds slip
     // j: at most $SLIPS, the class's slip capacity, and the release's; a slip past them keeps its K and raises status
@@ -2498,9 +2559,8 @@ def border_solve(layout: TreeLayout, classes: tuple) -> str:
     held_step = (
         "        if((moved&{bit})&&lane<WIDTH) {{{head}" + nb + hold + "\n"
         "            HELD_UP(h,n,nb,s+$SIX_BODIES+{offset},s+$WHITE+{offset},s);\n"
-        # R^T R between the walks by the release's one primitive (WALK_SLIP, WALK_SLIP_T), a lane a group.
-        "            for(int k=lane;k<slips{r};k+=WIDTH)BORDER_APPLY(a,s+$WHITE+{offset},k,slips{r});\n"
-        "            WARP_SYNC();\n"
+        # R^T R between the walks, every slip on its lane at once (HELD_APPLY).
+        "            HELD_APPLY(a,s+$WHITE+{offset},slips{r});\n"
         "            HELD_DOWN(h,n,nb,s+$WHITE+{offset},s+$WHITE+{offset},s);\n"
         "        }}\n"
     )
@@ -2658,6 +2718,7 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
         walk_down_texts,
     )
 
+    walked_classes = tuple(cls for cls in classes if cls is not None)
     up = {**_up_texts(), "unroll": WALK_UNROLL}
     # The walk down's inputs: the walk up's u, no prior; its output the trial's response.
     down = {**walk_down_texts(), "unroll": WALK_UNROLL}
@@ -2691,7 +2752,6 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
                 + "\n#endif\n"
             )
         cases.append(f"    case {r}: {{\n{body}\n        break;\n    }}")
-    walked_classes = tuple(cls for cls in classes if cls is not None)
     source = substitute(_WALK_SOLVE, ROOT_COUNT=len(_walk_roots(layout)), ROOTS="\n".join(cases))
     name = _predictor_name("tree_kinetic_walk", layout, None, "sparse", classes)
     return KernelTemplate(
