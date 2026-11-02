@@ -19,6 +19,7 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT, BodyFactors
+from newton._src.solvers.feather_pgs.tree_factor import unpack_walk_records
 
 
 def free_body_jacobians(solver, Z_a=None, Z_b=None):
@@ -33,12 +34,15 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
     group = solver.forest.art_group_idx.numpy()
     row_type = solver.placement.mf_row_type.numpy()
     if getattr(solver.placement, "walks", False):
-        data = solver.factor.walk_view().data.numpy().astype(np.float64)
+        records = solver.factor.walk_view().data.numpy()
+        data = unpack_walk_records(records, max(int(solver.model.joint_dof_count), 1)).astype(np.float64)
         starts = solver.forest.articulation_dof_start.numpy()
 
         def physical(art, z):
             d = data[starts[art] : starts[art] + 6]
-            return np.array([z[c] / d[c, 12] + sum(d[c, :6] @ d[k, 6:12] * z[k] for k in range(c + 1, 6)) for c in range(6)])
+            return np.array(
+                [z[c] / d[c, 12] + sum(d[c, :6] @ d[k, 6:12] * z[k] for k in range(c + 1, 6)) for c in range(6)]
+            )
 
     else:
         factors = solver.factor.L_by_size[6].numpy().astype(np.float64)

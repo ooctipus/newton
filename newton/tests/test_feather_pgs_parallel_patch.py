@@ -46,7 +46,7 @@ from newton._src.solvers.feather_pgs.placement import Placement
 from newton._src.solvers.feather_pgs.route_table import RouteTable
 from newton._src.solvers.feather_pgs.rows import RowLaws, velocity_prescale_launch
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep
-from newton._src.solvers.feather_pgs.tree_factor import WALK_COORDINATE, WALK_LINK, WalkTrees, release_view
+from newton._src.solvers.feather_pgs.tree_factor import WALK_LINK, WalkTrees, pack_walk_records, release_view
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import leave_walk, row_lines, unpacked_rows
 from newton.tests.feather_pgs_mass_reference import MassReference
@@ -1294,9 +1294,8 @@ def identity_walk(dofs: int, device) -> WalkTrees:
     """The walk of one body of ``dofs`` coordinates whose factor is the identity (``s = ut = 0``, ``ell = 1``): its
     rows are the coordinates' own, and its leave is ``u`` itself."""
     walk = WalkTrees()
-    data = np.zeros((dofs, WALK_COORDINATE), np.float32)
-    data[:, 12] = 1.0
-    walk.data = wp.array(data, dtype=wp.float32, device=device)
+    zero = np.zeros((dofs, 6), np.float32)
+    walk.data = wp.array(pack_walk_records(zero, zero, np.ones(dofs), np.zeros(dofs)), dtype=wp.float32, device=device)
     walk.link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
     walk.path = wp.array([(-1, 0)], dtype=wp.vec2i, device=device)
     walk.now = wp.zeros(dofs, dtype=wp.spatial_vector, device=device)

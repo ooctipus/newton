@@ -29,11 +29,11 @@ from newton._src.solvers.feather_pgs.sweep_levels import (
 from newton._src.solvers.feather_pgs.sweep_routes_diag import sparse_diagonal_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_local import paired_factor_kernel, paired_factor_source
 from newton._src.solvers.feather_pgs.tree_factor import (
-    WALK_COORDINATE,
     WALK_LINK,
     WalkClass,
     WalkRelease,
     WalkTrees,
+    pack_walk_records,
     walk_leave_kernel,
 )
 from newton.solvers import SolverFeatherPGS
@@ -290,10 +290,11 @@ def _diagonal_walk(inverse, device, dofs=None, offsets=None):
     offsets = np.zeros(worlds, np.int32) if offsets is None else np.asarray(offsets, np.int32)
     first = (np.arange(worlds) * dofs + offsets).astype(np.int32)
     walk = WalkTrees()
-    data = np.zeros((worlds * dofs, WALK_COORDINATE), np.float32)
+    root = np.zeros(worlds * dofs, np.float32)
     for world in range(worlds):
-        data[first[world] : first[world] + n, 12] = np.sqrt(inverse[world])
-    walk.data = wp.array(data, device=device)
+        root[first[world] : first[world] + n] = np.sqrt(inverse[world])
+    zero = np.zeros((worlds * dofs, 6), np.float32)
+    walk.data = wp.array(pack_walk_records(zero, zero, root, np.zeros(worlds * dofs)), device=device)
     walk.link = wp.zeros((worlds * n, WALK_LINK), dtype=wp.float32, device=device)
     path = np.stack([np.arange(n) - 1, np.arange(n)], axis=1).astype(np.int32)
     walk.path = wp.array(np.tile(path, (worlds, 1)), dtype=wp.vec2i, device=device)

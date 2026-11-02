@@ -26,12 +26,12 @@ from newton._src.solvers.feather_pgs.friction_patches import PatchRowLaw
 from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.solver_fields import Mimics
 from newton._src.solvers.feather_pgs.tree_factor import (
-    WALK_COORDINATE,
     WALK_LINK,
     WALK_NOW,
     WalkClass,
     WalkRelease,
     WalkTrees,
+    pack_walk_records,
     walk_leave_kernel,
 )
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -772,16 +772,18 @@ def chain_walk(device, lowers) -> WalkTrees:
         raise ValueError("a chain walk holds at most six coordinates an articulation")
     start = np.cumsum([0, *sizes]).astype(np.int32)
     total = int(start[-1])
-    data = np.zeros((total, WALK_COORDINATE), dtype=np.float32)
+    s = np.zeros((total, 6), dtype=np.float32)
+    ut = np.zeros((total, 6), dtype=np.float32)
+    inverse = np.zeros(total, dtype=np.float32)
     now = np.zeros((total, WALK_NOW), dtype=np.float32)
     path = np.zeros((total, 2), dtype=np.int32)
     dof_body = np.zeros(total, dtype=np.int32)
     for art, A in enumerate(factors):
         for c in range(A.shape[0]):
             d = int(start[art]) + c
-            data[d, c] = now[d, c] = 1.0
-            data[d, 6 : 6 + c] = A[c, :c]
-            data[d, 12] = 1.0 / A[c, c]
+            s[d, c] = now[d, c] = 1.0
+            ut[d, :c] = A[c, :c]
+            inverse[d] = 1.0 / A[c, c]
             path[d] = (c - 1, c)
             dof_body[d] = c
     arts = len(factors)
@@ -790,7 +792,7 @@ def chain_walk(device, lowers) -> WalkTrees:
         return wp.array(np.asarray(values, dtype=np.int32), dtype=wp.int32, device=device)
 
     walk = WalkTrees()
-    walk.data = wp.array(data, dtype=wp.float32, device=device)
+    walk.data = wp.array(pack_walk_records(s, ut, inverse, np.zeros(total)), dtype=wp.float32, device=device)
     walk.link = wp.zeros((total, WALK_LINK), dtype=wp.float32, device=device)
     walk.path = wp.array(path, dtype=wp.vec2i, device=device)
     walk.now = wp.array(now, dtype=wp.spatial_vector, device=device)

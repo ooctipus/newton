@@ -27,13 +27,13 @@ from .contact_laws import (
     contact_points,
     contact_responds,
     contact_row_frame,
-    contact_tangent_basis,
     contact_seed,
-    spin_seed,
+    contact_tangent_basis,
     jacobian_entry,
     prescribed_spin_target,
     prescribed_target,
     spin_entry,
+    spin_seed,
 )
 from .dense_rows import (
     UNIT_CONTACT,
@@ -506,7 +506,8 @@ def _light_apply_free_root_velocity_corrections(
 ):
     """The isolated rigid-body gyroscopic update of a free root's predicted velocity. Its effective angular inertia is
     the angular block of the body's walk, ``L_aa L_aa^T`` (armature included), with ``L_aa`` from the walk's records
-    of the body's coordinates (``walk``, :data:`.tree_factor.WALK_COORDINATE` floats a global coordinate): the walk
+    of the body's coordinates (``walk``, :data:`.tree_factor.WALK_COORDINATE` floats a global coordinate, each column by
+    its non-zero half, ``ut`` at 4..9, ``1 / ell`` signed at 3): the walk
     eliminates the angular coordinates first, last first, so ``L(i, i) = ell_i`` and ``L(i, k) = s_i . ut_k`` for the
     coordinate ``k > i`` eliminated before ``i``."""
     d = _active_free_root_dof_start(free_root_joint_indices, joint_qd_start, kinematic_joint_mask, root_index)
@@ -547,11 +548,18 @@ def _light_apply_free_root_velocity_corrections(
         for c in range(3 - r):
             k = d + 5 - c
             if k == i:
-                lower[r, c] = 1.0 / walk[i, 12]
+                lower[r, c] = 1.0 / wp.abs(walk[i, 3])
             else:
+                # s_i by its stored half (a free root's turns: the angular half, 1 / ell's sign set), dotted with ut_k.
+                turns = walk[i, 3] < 0.0
                 value = float(0.0)
                 for m in range(6):
-                    value += walk[i, m] * walk[k, 6 + m]
+                    s = float(0.0)
+                    if turns and m >= 3:
+                        s = walk[i, m - 3]
+                    if (not turns) and m < 3:
+                        s = walk[i, m]
+                    value += s * walk[k, 4 + m]
                 lower[r, c] = value
     rotation = wp.transform_get_rotation(body_q[body])
     basis = wp.quat_to_matrix(rotation)

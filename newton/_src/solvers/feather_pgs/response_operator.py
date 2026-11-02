@@ -1601,7 +1601,7 @@ class LocalBlock(ResidualBlock):
 
     @property
     def coordinate_floats(self) -> int:
-        """Staged floats a coordinate: ``s``, ``ut``, ``1 / ell`` (:data:`.tree_factor.WALK_COORDINATE`'s first 13),
+        """Staged floats a coordinate: ``s``, ``ut``, ``1 / ell`` (its record unpacked, :data:`.tree_factor.WALK_STAGED`),
         then with ``wrenches`` the step's column the finish published (:data:`.tree_factor.WALK_NOW`)."""
         from .tree_factor import WALK_NOW, WALK_STAGED  # noqa: PLC0415 (tree_factor imports this module)
 
@@ -1646,6 +1646,7 @@ class LocalBlock(ResidualBlock):
             WALK_FRAME,
             WALK_LINK,
             WALK_STAGED,
+            WALK_UNPACKED,
         )
 
         P, S, L = self.primary, self.secondary, self.lanes.width
@@ -1685,11 +1686,13 @@ class LocalBlock(ResidualBlock):
         else:
             C, K, B = self.coordinate_floats, self.link_floats, self.bodies
             coordinate = "walk_d0 + c" if not S else f"c < {P} ? walk_d0 + c : free_d0 + c - {P}"
-            column = (
-                f"k < {WALK_STAGED} ? walk.data.data[(size_t)d * {WALK_COORDINATE} + k] "
-                f": reinterpret_cast<const float*>(walk.now.data + d)[k - {WALK_STAGED}]"
+            now = (
+                [
+                    f"    for (int k = 0; k < {C - WALK_STAGED}; ++k)",
+                    f"        s_walk[c * {C} + {WALK_STAGED} + k] = reinterpret_cast<const float*>(walk.now.data + d)[k];",
+                ]
                 if self.wrenches
-                else f"walk.data.data[(size_t)d * {WALK_COORDINATE} + k]"
+                else []
             )
             offset = (
                 f"walk.link.data[(size_t)(walk_j0 + b) * {WALK_LINK} + (k < 3 ? k : {WALK_FRAME} + k - 3)]"
@@ -1698,12 +1701,14 @@ class LocalBlock(ResidualBlock):
             )
             lines += [
                 "// The walk's data of the world's trees staged once (FL3_design section 4), every load in flight together:",
-                "// each coordinate's s, ut and 1 / ell (and the step's column the finish published), each body's link offset",
+                "// each coordinate's s, ut and 1 / ell unpacked (and the step's column the finish published), each body's link offset",
                 "// (and its frame point), the path tables and each primary coordinate's body.",
-                f"for (int i = {lane}; i < {self.dofs * C}; i += {L}) {{",
-                f"    const int c = i / {C}, k = i - c * {C};",
+                f"for (int c = {lane}; c < {self.dofs}; c += {L}) {{",
                 f"    const int d = {coordinate};",
-                f"    s_walk[i] = {column};",
+                f"    float r[{WALK_UNPACKED}];",
+                f"    WALK_LOAD_RECORD(r, walk.data.data + (size_t)d * {WALK_COORDINATE});",
+                f"    for (int k = 0; k < {WALK_STAGED}; ++k) s_walk[c * {C} + k] = r[k];",
+                *now,
                 "}",
                 f"for (int i = {lane}; i < walk_bodies * {K}; i += {L}) {{",
                 f"    const int b = i / {K}, k = i - b * {K};",

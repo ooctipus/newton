@@ -17,6 +17,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
 from newton._src.solvers.feather_pgs.staging import arch_budget
+from newton._src.solvers.feather_pgs.tree_factor import unpack_walk_records
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import unpacked_rows
 
@@ -240,7 +241,7 @@ def _walk_inverse(solver, art: int) -> np.ndarray:
     j0, j1 = int(solver.model.articulation_start.numpy()[art]), int(solver.forest.articulation_joint_end_host[art])
     path = factor.walk_path_host[j0:j1]
     n = int(solver.forest.articulation_dof_count.numpy()[art])
-    data = factor.walk_data.numpy()[d0 : d0 + n].astype(np.float64)
+    data = unpack_walk_records(factor.walk_data.numpy(), d0 + n)[d0:].astype(np.float64)
     link = factor.walk_link.numpy()[j0:j1].astype(np.float64)
     first = [int(f) for f in path[:, 1]] + [n]
     inverse = np.zeros((n, n))

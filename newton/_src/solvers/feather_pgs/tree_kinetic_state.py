@@ -1804,7 +1804,8 @@ _BORDER = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step
         for (int body = walk.dof_body.data[d0 + i], c = i; body >= 0;) {
             #pragma unroll 1
             for (; c >= WALK_FIRST_OF(body); --c, ++t) {
-                const float* const d = data + $coordinate * c;
+                float d[$unpacked];
+                WALK_LOAD_RECORD(d, data + $coordinate * c);
                 const float z = (x + ((d[0] * p[0] + d[1] * p[1] + d[2] * p[2]) + (d[3] * p[3] + d[4] * p[4] + d[5] * p[5])))
                                 * d[12];
                 x = 0.0f;
@@ -1870,7 +1871,7 @@ _BORDER = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step
                     const float d = pivot[c], scale = sqrtf(d), b = column[c];
                     float dbar = d + alpha * (b * scale) * (b * scale);
                     if (c == i)
-                        dbar = data[$coordinate * i + $pivot] + kept[i];
+                        dbar = WALK_LOAD_PIVOT(data + $coordinate * i) + kept[i];
                     if (!(dbar > 0.0f) || !wp::isfinite(dbar))
                         FRAME_STATUS(2);
                     const float beta = alpha * b * scale / dbar;
@@ -1919,10 +1920,10 @@ def walk_tree_prelude() -> DevicePrelude:
     """The predictor's border, for both devices: :func:`.tree_factor.walk_paths_prelude`'s path table and walks (the
     slips' paths read it) and the border's build (:data:`_BORDER`). The whole-tree walks are the class emitter's
     (:func:`walk_tree`)."""
-    from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_PIVOT, walk_paths_prelude  # noqa: PLC0415
+    from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_UNPACKED, walk_paths_prelude  # noqa: PLC0415
 
     walk = walk_paths_prelude(1)
-    tree = substitute(_BORDER, coordinate=WALK_COORDINATE, link=WALK_LINK, pivot=WALK_PIVOT)
+    tree = substitute(_BORDER, coordinate=WALK_COORDINATE, link=WALK_LINK, unpacked=WALK_UNPACKED)
     return DevicePrelude("walk_tree", walk.source + "\n" + tree, cpu=walk.cpu + "\n" + tree)
 
 
@@ -1951,12 +1952,10 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
         for (int k = 0; k < $HOLD; ++k) {
             const int x = lane + k * WIDTH;
             if (x < n) {
-                const float4* q = reinterpret_cast<const float4*>(data + $coordinate * x);
-                const float4 x0 = __ldg(q), x1 = __ldg(q + 1), x2 = __ldg(q + 2);
-                h.r[k][0] = x0.x; h.r[k][1] = x0.y; h.r[k][2] = x0.z; h.r[k][3] = x0.w;
-                h.r[k][4] = x1.x; h.r[k][5] = x1.y; h.r[k][6] = x1.z; h.r[k][7] = x1.w;
-                h.r[k][8] = x2.x; h.r[k][9] = x2.y; h.r[k][10] = x2.z; h.r[k][11] = x2.w;
-                h.r[k][12] = __ldg(data + $coordinate * x + 12);
+                float d[$unpacked];
+                WALK_LOAD_RECORD(d, data + $coordinate * x);
+                #pragma unroll
+                for (int m = 0; m < 13; ++m) h.r[k][m] = d[m];
             } else {
                 #pragma unroll
                 for (int m = 0; m < 13; ++m) h.r[k][m] = 0.0f;
@@ -2107,7 +2106,7 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
         if (mine) {
             alpha = -released[i];
             keep = kept[i];
-            pivot0 = __ldg(data + $coordinate * i + $pivot);
+            pivot0 = WALK_LOAD_PIVOT(data + $coordinate * i);
         }
         float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}, z = 0.0f, pair[$SLIPS];
         #pragma unroll
@@ -2411,7 +2410,7 @@ def border_solve(layout: TreeLayout, classes: tuple) -> str:
         + "            slips{r}=walk.release.count.data[a];\n"
         "            if(slips{r}>0) {{\n"
         "            for(int c=lane;c<n;c+=stride) {{"
-        "const float inverse=data[$WALK_COORDINATE*c+12];work[c]=1.0f/(inverse*inverse);work[n+c]=0.0f;}}\n"
+        "const float inverse=WALK_LOAD_INVERSE(data+$WALK_COORDINATE*c);work[c]=1.0f/(inverse*inverse);work[n+c]=0.0f;}}\n"
         "            for(int k=lane;k<slips{r};k+=stride)BORDER_COLUMN(a,d0,data,link,k);"
         + sync
         + "            for(int k=lane;k<slips{r};k+=stride)"
@@ -2461,13 +2460,15 @@ def held_lambdas(layout: TreeLayout, slips: int) -> str:
     """The held walk's native lambdas (:data:`_HELD`) for the layout's words a lane, CUDA only, declared once ahead of the
     trial; nothing for a tree past two words a lane (:func:`_held_words`). ``slips`` is the class's slip capacity
     (:meth:`.tree_factor.TreeFactor.slip_capacity`): the build's lanes, one a slip, at most the segment's width."""
-    from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_PIVOT  # noqa: PLC0415
+    from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_UNPACKED  # noqa: PLC0415
 
     words = _held_words(layout)
     if not words:
         return ""
     bound = max(1, min(slips, layout.lanes, 32))
-    lambdas = substitute(_HELD, HOLD=words, SLIPS=bound, coordinate=WALK_COORDINATE, link=WALK_LINK, pivot=WALK_PIVOT)
+    lambdas = substitute(
+        _HELD, HOLD=words, SLIPS=bound, coordinate=WALK_COORDINATE, link=WALK_LINK, unpacked=WALK_UNPACKED
+    )
     return f"#if defined(__CUDA_ARCH__)\n{lambdas}\n#endif\n"
 
 

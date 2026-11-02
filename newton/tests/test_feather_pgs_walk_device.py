@@ -53,6 +53,7 @@ from newton._src.solvers.feather_pgs.tree_factor import (
     WALK_NOW,
     TreeWalk,
     local_frames,
+    unpack_walk_records,
 )
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
@@ -89,8 +90,8 @@ def devices() -> list:
 # ---------------------------------------------------------------------------------------------------------------------
 
 _UP = """    if (tid >= body.shape[0]) return;
-    const int n = data.shape[1], bodies = link.shape[1];
-    const float* d = data.data + (size_t)tree.data[tid] * n * $coordinate;
+    const int n = now.shape[1], bodies = link.shape[1];
+    const float* d = data.data + (size_t)tree.data[tid] * data.shape[1] * $coordinate;
     const float* l = link.data + (size_t)tree.data[tid] * bodies * $link;
     const float* s = now.data + (size_t)tree.data[tid] * n * $now;
     const float* f = now_link.data + (size_t)tree.data[tid] * bodies * $link;
@@ -114,8 +115,8 @@ _UP = """    if (tid >= body.shape[0]) return;
 """
 
 _TREE = """    if (tid >= u.shape[0]) return;
-    const int n = data.shape[1], bodies = link.shape[1];
-    const float* d = data.data + (size_t)tree.data[tid] * n * $coordinate;
+    const int n = u.shape[1], bodies = link.shape[1];
+    const float* d = data.data + (size_t)tree.data[tid] * data.shape[1] * $coordinate;
     const float* l = link.data + (size_t)tree.data[tid] * bodies * $link;
     const float* in = u.data + (size_t)tid * n;
     float* out = qd.data + (size_t)tid * n;
@@ -807,7 +808,7 @@ def two_schedules(device, bodies: int, rng) -> dict:
     for thread in (False, True):
         factor.walk_thread = thread
         factor.walk_step(state)
-        data[thread] = factor.walk_data.numpy()[:n].astype(np.float64)
+        data[thread] = unpack_walk_records(factor.walk_data.numpy(), n).astype(np.float64)
 
     def error(d):
         return max(
