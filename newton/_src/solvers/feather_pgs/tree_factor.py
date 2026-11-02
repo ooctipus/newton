@@ -960,7 +960,8 @@ class TreeFactor:
         self.walk_class = wp.array(walk_class, dtype=wp.int32, device=device)
         # A tree's group in the step's walk kernel (walk_step_kernel, walk_group): on CUDA a lane a body of a batch of
         # the inward pass and a join slot; one thread a tree on the CPU.
-        self.walk_lanes = walk_group(bodies, held) if device.is_cuda else 1
+        walked = int(np.count_nonzero(free[arts] == 0)) if forest.is_free_rigid is not None else int(arts.size)
+        self.walk_lanes = walk_group(bodies, held, walked, device.sm_count) if device.is_cuda else 1
         self.walk_block = WALK_BLOCK
         self.walk_path = wp.array(path, dtype=wp.vec2i, device=device)
         self.walk_joins = wp.array(joins, dtype=wp.int32, device=device)
@@ -2387,25 +2388,34 @@ WALK_ADDED = 15
 of :data:`WALK_COORDINATE`)."""
 
 
-def walk_group(bodies: int, joins: int) -> int:
-    """The lane group of a tree in :func:`walk_step_kernel` on CUDA, from the class's data: a batch of the inward pass
-    builds one body a lane, so a group has no more lanes than its tree's bodies; it holds the tree's joins in flight,
-    one a lane; and it stays within a warp.
+def walk_group(bodies: int, joins: int, trees: int, sms: int) -> int:
+    """The lane group of a tree in :func:`walk_step_kernel` on CUDA, from the class's data: the bodies a batch of the
+    inward pass builds, one a lane, against the trees in flight. The group is the largest power of two with which the
+    class's walked trees still fit the device in one wave (:data:`WALK_RESIDENT` threads an SM), within the tree (no
+    more lanes than its bodies) and a warp, and never fewer lanes than the joins a tree holds at once (one a lane).
+
+    Measured on both GPUs (``SP/core/FL/HANDOFF_ZR.md``): with more trees than the device holds a group of four
+    wins (g1, kuka, franka-reach at 16,384 trees: 4 lanes), with fewer the batch widens (chain_106 at 4,096: 16).
 
     Args:
-        bodies: The most bodies of one of the class's trees.
+        bodies: The most bodies of one of the class's walked trees.
         joins: The most joins one of its trees holds at once (:meth:`TreeFactor.plan_walk`).
+        trees: The class's walked trees (the free rigid bodies take the geometry only).
+        sms: The device's multiprocessors.
     """
+    fit = max(sms * WALK_RESIDENT // max(trees, 1), 1)
+    top = min(bodies, 32)
     lanes = 1
-    while lanes < min(max(bodies, joins), WALK_BATCH):
+    while lanes * 2 <= fit and lanes < top:
         lanes *= 2
     while lanes < joins:
         lanes *= 2
     return lanes
 
 
-WALK_BATCH = 8
-"""The bodies a batch of the inward pass builds at most, a lane each, before its chain consumes them."""
+WALK_RESIDENT = 512
+"""Threads of :func:`walk_step_kernel` one multiprocessor holds: its 125-127 registers (``kernel_sass``, sm_120 and
+sm_103) leave 16 warps an SM."""
 
 WALK_BLOCK = 64
 """Threads of a block of :func:`walk_step_kernel` on CUDA: whole groups, so a group never straddles a warp."""
