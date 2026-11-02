@@ -182,7 +182,7 @@ def family_response(model, devices_to_run=(), *, float32_poses: bool = False) ->
             tops = [int(truth.first[b + 1]) - 1 for b in bodies]
             z = walk.up([0] * count, bodies, tops, [0] * count, [W.T] * count, [np.zeros(3)] * count)
             for k in range(count):
-                dv = walk.down([0, 0, 0], z[k], z[k])[0].T
+                dv = walk.down([0, 0, 0], z[k])[0].T
                 worst[str(device)] = max(worst[str(device)], relative(dv, dv64[k]))
     return worst
 
