@@ -895,7 +895,12 @@ class TreeFactor:
         """
         model, forest = self.model, self.forest
         device = model.device
+        free = forest.is_free_rigid_host if forest.is_free_rigid is not None else np.zeros(1, dtype=np.int32)
         arts = np.asarray(articulations, dtype=np.int32)
+        if forest.is_free_rigid is not None:
+            # The free rigid bodies (one-body trees) after the articulated trees, so no group of an articulated
+            # tree shares its warp with one.
+            arts = np.concatenate([arts[free[arts] == 0], arts[free[arts] != 0]]).astype(np.int32)
         start = model.articulation_start.numpy()
         end = forest.articulation_joint_end_host
         qd_start = model.joint_qd_start.numpy()
@@ -2458,16 +2463,14 @@ def _walk_column(
 
 _INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, by the tree's lane group (TreeWalk's, on the factor's
     // diagonal), after walk_step_kernel's geometry left each coordinate's column with its R and R + K in data and each
-    // body's link and frame point in link. The bodies go in batches of the group's lanes, from the tree's last joint
-    // down: each lane builds one body of the batch (its spatial inertia at its frame, from the body's pose, centre of
-    // mass, mass and inertia; its link offset, its path entry and its last coordinate's record), then every lane runs
-    // the same chain over the batch, each body's data read from its lane by shuffle, so the chain's state (the
-    // articulated inertia h, symmetric: A 6, B 9, D 6) lives in registers. Per coordinate: Is = h s, own = s . Is,
+    // body's link and frame point in link. The lane feed (FEED, leaves to root) hands the chain one body at a time: a
+    // lane builds each body of a batch (its spatial inertia at its frame, from the body's pose, centre of mass, mass and
+    // inertia; its link offset, its path entry, its join slots and its last coordinate's record), so the chain's state
+    // (the articulated inertia h, symmetric: A 6, B 9, D 6) lives in registers. Per coordinate: Is = h s, own = s . Is,
     // 1/ell = (own + R + K)^-1/2, ut = Is / ell, P0 = own + R, h -= ut ut^T. Per body: h lifted to its parent's frame,
     // [A, A X + B; ., D - X (A X + B) + B^T X] with X the skew of d (the parent's frame less the body's), carried when
     // the parent is the next joint inward, else added into the parent's join slot (joins[parent], a lane's registers
-    // on CUDA) until the chain reaches it. Every input line is prefetched first; the chain's only stores are each
-    // coordinate's ut, 1/ell and P0. On the CPU one thread runs the group, a batch of one body.
+    // on CUDA) until the chain reaches it. The chain's only stores are each coordinate's ut, 1/ell and P0.
     SYNC();
     const float* Lk = link.data;
     float* Dt = data.data;
@@ -2480,24 +2483,12 @@ _INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, 
     const float* Ib = reinterpret_cast<const float*>(body_inertia.data);
 #if defined(__CUDA_ARCH__)
     const auto PREFETCH = [](const void* p) { asm volatile("prefetch.global.L1 [%0];" ::"l"(p)); };
-    for (int j = j0 + LANE; j < j1; j += LANES) {
-        const int b = Ct[j];
-        PREFETCH(Qb + 7 * b);
-        PREFETCH(Qb + 7 * b + 6);
-        PREFETCH(Cb + 3 * b);
-        PREFETCH(Cb + 3 * b + 2);
-        PREFETCH(Mb + b);
-        PREFETCH(Ib + 9 * b);
-        PREFETCH(Ib + 9 * b + 8);
-        PREFETCH(Lk + $link * j);
-        PREFETCH(Pt + 2 * j);
-        PREFETCH(Jt + j);
-    }
-    for (int c = dof0 + LANE; c < dof1; c += LANES) PREFETCH(Dt + $coordinate * c);
     constexpr int HELD = 1;
 #else
+    const auto PREFETCH = [](const void* p) {};
     constexpr int HELD = $slots;
 #endif
+    for (int c = dof0 + LANE; c < dof1; c += LANES) PREFETCH(Dt + $coordinate * c);
     // The join slots: lane k holds slot k on CUDA (HELD 1), the CPU's one thread every slot.
     float held[HELD][21];
     for (int s = 0; s < HELD; ++s)
@@ -2509,61 +2500,86 @@ _INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, 
     for (int k = 0; k < 21; ++k) h[k] = 0.0f;
     bool carrying = false;
     const auto SYM = [](int a, int b) -> int { return a <= b ? (a == 0 ? b : (a == 1 ? 2 + b : 5)) : (b == 0 ? a : (b == 1 ? 2 + a : 5)); };
-    for (int base = j1 - 1; base >= j0; base -= LANES) {
-        // This lane's body of the batch.
-        const int mine = base - LANE;
-        float m = 0.0f, mc[3] = {0.0f, 0.0f, 0.0f}, rot[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-        float d[3] = {0.0f, 0.0f, 0.0f}, rec[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-        int up = -1, lo = 0, hi = 0, slot = -1, into = -1;
-        if (mine >= j0) {
-            up = Pt[2 * mine];
-            lo = dof0 + Pt[2 * mine + 1];
-            hi = mine + 1 < j1 ? dof0 + Pt[2 * (mine + 1) + 1] : dof1;
-            slot = Jt[mine];
-            into = up >= 0 ? Jt[j0 + up] : -1;
-            const float* Lr = Lk + $link * mine;
-            for (int k = 0; k < 3; ++k) d[k] = Lr[k];
-            const int b = Ct[mine];
-            const float* q = Qb + 7 * b;
-            const float* com = Cb + 3 * b;
-            const float* I = Ib + 9 * b;
-            m = Mb[b];
-            // The body's rotation and its centre of mass less its frame, c.
-            const float x = q[3], y = q[4], z = q[5], w = q[6];
-            const float R[3][3] = {
-                {1.0f - 2.0f * (y * y + z * z), 2.0f * (x * y - z * w), 2.0f * (x * z + y * w)},
-                {2.0f * (x * y + z * w), 1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z - x * w)},
-                {2.0f * (x * z - y * w), 2.0f * (y * z + x * w), 1.0f - 2.0f * (x * x + y * y)}};
-            float c[3];
-            for (int a = 0; a < 3; ++a)
-                c[a] = (q[a] + (R[a][0] * com[0] + R[a][1] * com[1] + R[a][2] * com[2])) - Lr[$frame + a];
-            for (int a = 0; a < 3; ++a) mc[a] = m * c[a];
-            // R I R^T - m X X, X the skew of c: -m X X = m (|c|^2 1 - c c^T).
-            float RI[3][3];
-            for (int a = 0; a < 3; ++a)
-                for (int e = 0; e < 3; ++e) RI[a][e] = R[a][0] * I[e] + R[a][1] * I[3 + e] + R[a][2] * I[6 + e];
-            const float cc = c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
-            for (int a = 0; a < 3; ++a)
-                for (int e = a; e < 3; ++e)
-                    rot[SYM(a, e)] = (RI[a][0] * R[e][0] + RI[a][1] * R[e][1] + RI[a][2] * R[e][2]) + mc[a] * -c[e] + (a == e ? m * cc : 0.0f);
-            if (hi > lo) {
-                const float* r = Dt + $coordinate * (hi - 1);
-                for (int k = 0; k < 6; ++k) rec[k] = r[k];
-                rec[6] = r[$armature];
-                rec[7] = r[$added];
+    // A body as the feed hands it to the chain: m, m c (c its centre of mass less its frame), R I R^T - m X X (6), its
+    // link offset d (3), its last coordinate's record (s 6, R, R + K), and as bits its parent, coordinates [lo, hi),
+    // its own join slot and its parent's.
+    struct Body { float w[26]; };
+    enum { M = 0, MC = 1, ROT = 4, OFFSET = 10, RECORD = 13, UP = 21, LO = 22, HI = 23, SLOT = 24, INTO = 25 };
+    FEED(j0, j1 - 1, -1,
+        [&](int j) {
+            const int b = Ct[j];
+            PREFETCH(Qb + 7 * b);
+            PREFETCH(Qb + 7 * b + 6);
+            PREFETCH(Cb + 3 * b);
+            PREFETCH(Cb + 3 * b + 2);
+            PREFETCH(Mb + b);
+            PREFETCH(Ib + 9 * b);
+            PREFETCH(Ib + 9 * b + 8);
+            PREFETCH(Lk + $link * j);
+            PREFETCH(Pt + 2 * j);
+            PREFETCH(Jt + j);
+        },
+        [&](int mine, bool valid) -> Body {
+            Body r;
+            for (int k = 0; k < 26; ++k) r.w[k] = 0.0f;
+            int up = -1, lo = 0, hi = 0, slot = -1, into = -1;
+            if (valid) {
+                up = Pt[2 * mine];
+                lo = dof0 + Pt[2 * mine + 1];
+                hi = mine + 1 < j1 ? dof0 + Pt[2 * (mine + 1) + 1] : dof1;
+                slot = Jt[mine];
+                into = up >= 0 ? Jt[j0 + up] : -1;
+                const float* Lr = Lk + $link * mine;
+                for (int k = 0; k < 3; ++k) r.w[OFFSET + k] = Lr[k];
+                const int b = Ct[mine];
+                const float* q = Qb + 7 * b;
+                const float* com = Cb + 3 * b;
+                const float* I = Ib + 9 * b;
+                const float m = Mb[b];
+                // The body's rotation and its centre of mass less its frame, c.
+                const float x = q[3], y = q[4], z = q[5], w = q[6];
+                const float R[3][3] = {
+                    {1.0f - 2.0f * (y * y + z * z), 2.0f * (x * y - z * w), 2.0f * (x * z + y * w)},
+                    {2.0f * (x * y + z * w), 1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z - x * w)},
+                    {2.0f * (x * z - y * w), 2.0f * (y * z + x * w), 1.0f - 2.0f * (x * x + y * y)}};
+                float c[3], mc[3];
+                for (int a = 0; a < 3; ++a)
+                    c[a] = (q[a] + (R[a][0] * com[0] + R[a][1] * com[1] + R[a][2] * com[2])) - Lr[$frame + a];
+                for (int a = 0; a < 3; ++a) mc[a] = m * c[a];
+                // R I R^T - m X X, X the skew of c: -m X X = m (|c|^2 1 - c c^T).
+                float RI[3][3];
+                for (int a = 0; a < 3; ++a)
+                    for (int e = 0; e < 3; ++e) RI[a][e] = R[a][0] * I[e] + R[a][1] * I[3 + e] + R[a][2] * I[6 + e];
+                const float cc = c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
+                r.w[M] = m;
+                for (int a = 0; a < 3; ++a) r.w[MC + a] = mc[a];
+                for (int a = 0; a < 3; ++a)
+                    for (int e = a; e < 3; ++e)
+                        r.w[ROT + SYM(a, e)] = (RI[a][0] * R[e][0] + RI[a][1] * R[e][1] + RI[a][2] * R[e][2]) + mc[a] * -c[e] + (a == e ? m * cc : 0.0f);
+                if (hi > lo) {
+                    const float* d = Dt + $coordinate * (hi - 1);
+                    for (int k = 0; k < 6; ++k) r.w[RECORD + k] = d[k];
+                    r.w[RECORD + 6] = d[$armature];
+                    r.w[RECORD + 7] = d[$added];
+                }
             }
-        }
-        const int count = base - j0 + 1 < LANES ? base - j0 + 1 : LANES;
-        for (int i = 0; i < count; ++i) {
-            const int b = base - i;
+            r.w[UP] = __int_as_float(up);
+            r.w[LO] = __int_as_float(lo);
+            r.w[HI] = __int_as_float(hi);
+            r.w[SLOT] = __int_as_float(slot);
+            r.w[INTO] = __int_as_float(into);
+            return r;
+        },
+        [&](int b, const Body& r) {
             // The body's inertia at its frame: [m 1, -m X; m X, rot], X the skew of c.
-            const float bm = READ(m, i);
-            float bc[3], br[6], bd[3], s[8];
-            for (int k = 0; k < 3; ++k) bc[k] = READ(mc[k], i);
-            for (int k = 0; k < 6; ++k) br[k] = READ(rot[k], i);
-            for (int k = 0; k < 3; ++k) bd[k] = READ(d[k], i);
-            for (int k = 0; k < 8; ++k) s[k] = READ(rec[k], i);
-            const int b_up = READ(up, i), b_lo = READ(lo, i), b_hi = READ(hi, i), b_slot = READ(slot, i), b_into = READ(into, i);
+            const float bm = r.w[M];
+            const float* bc = r.w + MC;
+            const float* br = r.w + ROT;
+            const float* bd = r.w + OFFSET;
+            float s[8];
+            for (int k = 0; k < 8; ++k) s[k] = r.w[RECORD + k];
+            const int b_up = __float_as_int(r.w[UP]), b_lo = __float_as_int(r.w[LO]), b_hi = __float_as_int(r.w[HI]);
+            const int b_slot = __float_as_int(r.w[SLOT]), b_into = __float_as_int(r.w[INTO]);
             const float body[21] = {bm, 0.0f, 0.0f, bm, 0.0f, bm,
                                     0.0f, bc[2], -bc[1], -bc[2], 0.0f, bc[0], bc[1], -bc[0], 0.0f,
                                     br[0], br[1], br[2], br[3], br[4], br[5]};
@@ -2577,10 +2593,10 @@ _INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, 
                 // The next coordinate's record, loaded before this one stores (a body with several coordinates).
                 float next[8];
                 if (dof > b_lo) {
-                    const float* r = Dt + $coordinate * (dof - 1);
-                    for (int k = 0; k < 6; ++k) next[k] = r[k];
-                    next[6] = r[$armature];
-                    next[7] = r[$added];
+                    const float* d = Dt + $coordinate * (dof - 1);
+                    for (int k = 0; k < 6; ++k) next[k] = d[k];
+                    next[6] = d[$armature];
+                    next[7] = d[$added];
                 }
                 const float* A = h;
                 const float* B = h + 6;
@@ -2601,10 +2617,10 @@ _INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, 
                 float ut[6];
                 for (int k = 0; k < 6; ++k) ut[k] = Is[k] * inv;
                 if (LANE == 0) {
-                    float* r = Dt + $coordinate * dof;
-                    for (int k = 0; k < 6; ++k) r[6 + k] = ut[k];
-                    r[12] = inv;
-                    r[$pivot] = own + s[6];
+                    float* o = Dt + $coordinate * dof;
+                    for (int k = 0; k < 6; ++k) o[6 + k] = ut[k];
+                    o[12] = inv;
+                    o[$pivot] = own + s[6];
                 }
                 // h -= ut ut^T
                 for (int a = 0; a < 3; ++a)
@@ -2638,14 +2654,13 @@ _INWARD = """    // The refresh's inward pass of one tree, float32, leaf first, 
                     for (int k = 0; k < 21; ++k) held[AT(b_into)][k] += h[k];
                 }
             }
-        }
-    }
+        });
 """
 
 
 @functools.cache
 def _walk_inward_snippet() -> str:
-    from .device_preludes import dual_native, lane_group  # noqa: PLC0415
+    from .device_preludes import CPU_MATH, LANE_FEED, dual_native, lane_group  # noqa: PLC0415
 
     return dual_native(
         substitute(
@@ -2658,7 +2673,7 @@ def _walk_inward_snippet() -> str:
             added=WALK_ADDED,
             slots=WALK_JOIN_SLOTS,
         ),
-        preludes=(lane_group("lanes"),),
+        preludes=(lane_group("lanes"), CPU_MATH, LANE_FEED),
     )
 
 

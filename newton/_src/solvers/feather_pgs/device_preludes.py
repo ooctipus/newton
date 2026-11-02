@@ -309,6 +309,38 @@ def lane_group(lanes: int | str) -> DevicePrelude:
     return DevicePrelude(f"lane_group_{lanes}", substitute(_LANE_GROUP, lanes=lanes), _LANE_GROUP_CPU)
 
 
+_LANE_FEED = """    // FEED(first, last, step, ahead, build, chain): a lane group feeding one serial chain over the records
+    // [first, last] of a tree, with no global scratch. step -1 walks from last down to first (leaves to root), +1 from
+    // first up to last (root to leaves). First the group strides over every record calling ahead(index) (its lines'
+    // prefetch: every load of the chain's inputs leaves the chain). Then, in batches of LANES records in the walk's
+    // order, lane k calls build(index, valid) for the batch's k-th record (valid false past the tree: return zeros);
+    // build loads and forms what the chain needs of that record and returns it as a struct whose one member is
+    // float w[N] (ints as their bits). Every lane then calls chain(index, record) for each record of the batch in
+    // order, the record read from its lane by N shuffles, so every lane runs the same chain and its state stays in
+    // registers. On the CPU one thread is the group: batches of one record.
+    const auto FEED = [&](int first, int last, int step, auto ahead, auto build, auto chain) {
+        const int total = last - first + 1;
+        const int start = step < 0 ? last : first;
+        for (int k = LANE; k < total; k += LANES) ahead(start + step * k);
+        for (int done = 0; done < total; done += LANES) {
+            const int base = start + step * done;
+            const auto mine = build(base + step * LANE, LANE < total - done);
+            constexpr int words = sizeof(mine.w) / sizeof(float);
+            const int count = total - done < LANES ? total - done : LANES;
+            for (int i = 0; i < count; ++i) {
+                auto record = mine;
+                for (int k = 0; k < words; ++k) record.w[k] = READ(mine.w[k], i);
+                chain(base + step * i, record);
+            }
+        }
+    };"""
+
+LANE_FEED = DevicePrelude("lane_feed", _LANE_FEED, _LANE_FEED)
+"""``FEED(first, last, step, ahead, build, chain)``, a lane group feeding one serial chain (the walk's refresh leaves
+to root, its walk down root to leaves): its records' loads leave the chain, each lane builds one record of a batch, and
+every lane runs the chain on the batch's records in order, read by shuffle. After a lane-group prelude."""
+
+
 SHARED_STORAGE = DevicePrelude("shared_storage", "    #define SHARED __shared__", "    #define SHARED")
 """``SHARED``, the storage of a block's working set (:meth:`.staging.Staging.declarations`): CUDA's shared memory, or
 the stack of the CPU's one thread, which runs the block's lane groups."""
