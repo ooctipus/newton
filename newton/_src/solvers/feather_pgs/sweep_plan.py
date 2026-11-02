@@ -65,7 +65,7 @@ from .solve_policy import SolvePolicy, SolveReadoutRecord
 from .solver_fields import SPARSE_CONTACT_RECORDS, SPARSE_ROWS, LocalOwners
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport, row_supports
-from .staging import arch_budget, factor_budget
+from .staging import arch_budget
 from .step_plan import first_failed
 from .sweep_levels import (
     _get_build_independent_sparse_contact_groups_kernel,
@@ -79,7 +79,6 @@ __all__ = ["Sweep"]
 # Parallel tiers grid-stride over per-tier world lists from this many tiers on: one classify launch against
 # (tiers - 1) x worlds idle block entries.
 _TIER_LIST_MIN_TIERS = 3
-_CRBA_CHOLESKY_WARPS_PER_BLOCK = 4
 _CONTACT_JACOBIAN_MAX_DOF = 10
 # A persistent queue avoids launching one expensive general-solver block for
 # every mostly local world. Eight blocks per SM preserves general-only latency.
@@ -729,19 +728,6 @@ class Sweep:
                 f"Row capacity needs {solve.bytes} bytes of shared memory for sparse solving; limit is {budget}."
             )
             return
-        # The factor build's warps share a block within the offline static budget.
-        shared_limit = factor_budget(model.device)
-        shared_bytes_per_warp = 4 * (2 * plan.nonzero_count + 6 * size)
-        self.factor.sparse_factor_warps_per_block = min(
-            _CRBA_CHOLESKY_WARPS_PER_BLOCK,
-            shared_limit // shared_bytes_per_warp,
-        )
-        if self.factor.sparse_factor_warps_per_block < 1:
-            self.routes.reasons["K1"] = (
-                f"One sparse factor warp needs {shared_bytes_per_warp} bytes of shared memory; limit is {shared_limit}."
-            )
-            return
-
         self.routes.reasons["K1"] = (
             f"Automatic sparse selection: {size}-DOF topology and row policy admitted; "
             f"solve uses {solve.bytes}/{budget} bytes of shared memory."

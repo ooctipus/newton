@@ -160,14 +160,6 @@ def static_budget(arch: int) -> int:
     return STATIC_SHARED_BYTES
 
 
-def factor_budget(device) -> int:
-    """The static working set a block of a factor build may declare on ``device`` [B]: the offline limit, or less on a
-    CUDA device that loads less; :data:`CPU_STAGING_BYTES` on the CPU."""
-    if not device.is_cuda:
-        return CPU_STAGING_BYTES
-    return min(STATIC_SHARED_BYTES, int(device.max_shared_memory_per_block))
-
-
 def arch_budget(device_arch) -> int:
     """The working set a block of a kernel factory's ``device_arch`` may declare [B]: :func:`static_budget` of a CUDA
     architecture number, :data:`CPU_STAGING_BYTES` for the CPU (architecture 0) and :data:`STATIC_SHARED_BYTES` for an

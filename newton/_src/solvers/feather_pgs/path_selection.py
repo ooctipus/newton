@@ -515,7 +515,6 @@ def _sparse_mass_matrix(solver) -> dict:
                 "max_row_support": json_value(solver.placement.sparse_max_row_support),
                 "solve_lanes": int(solver.sweep.sparse_solve_lanes),
                 "local_factors": bool(solver.sweep.sparse_local_factors),
-                "factor_warps_per_block": int(solver.factor.sparse_factor_warps_per_block),
                 "writer_kernel": _key(solver.sweep.support_rows),
                 "leave_kernel": _key(solver.factor.walk_leave),
                 "sweep_kernel": _key(solver.sweep.sparse_kernel),
