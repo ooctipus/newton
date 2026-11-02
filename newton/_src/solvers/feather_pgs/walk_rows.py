@@ -935,8 +935,10 @@ _GENERATE = """    // The rows in generator form (WALK_MAPPING D5H, Z_UNION 1.2)
     int table[TABLE], table_art[TABLE], load[TABLE];
 #pragma unroll
     for (int i = 0; i < TABLE; ++i) table[i] = table_art[i] = -1, load[i] = 0;
+    // The batch's lanes that hold a contact unit, lowest first.
 #pragma unroll 1
-    for (int u = 0; u < LANES; ++u) {
+    for (unsigned live = BALLOT(key[0] >= 0 || key[1] >= 0); live != 0u; live &= live - 1u) {
+        const int u = FIRST(live);
 #pragma unroll
         for (int k = 0; k < 2; ++k) {
             const int body = READ(key[k], u), art = READ(owner[k], u);
