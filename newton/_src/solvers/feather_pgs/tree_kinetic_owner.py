@@ -430,7 +430,7 @@ class TreeKineticState:
         """Each root's walking class (:class:`.tree_factor.WalkClass`, its path table in the walk the predictor solves
         by), or ``None`` for a prescribed root (no coordinates to solve); every group's tree of a root has the same
         table."""
-        from .tree_factor import WalkClass  # noqa: PLC0415
+        from .tree_factor import WALK_BOTH, WalkClass  # noqa: PLC0415
 
         factor, layout = self.solver.factor, self.layout
         path = getattr(factor, "walk_path_host", None)
@@ -449,7 +449,11 @@ class TreeKineticState:
                 if not np.array_equal(path[starts[art] : ends[art]], table):
                     raise ValueError("A predictor group's trees of one root must share their walk's path table")
             count = int(self.solver.forest.articulation_dof_count.numpy()[first])
-            classes.append(WalkClass(tuple(int(x) for x in table[:, 0]), (*(int(x) for x in table[:, 1]), count)))
+            # Each coordinate's column half where every tree of the root agrees, else read from its record.
+            d0 = self.solver.forest.articulation_dof_start.numpy()
+            halves = np.stack([factor.walk_half_host[int(d0[a]) : int(d0[a]) + count] for a in arts.tolist()])
+            half = tuple(int(h[0]) if np.all(h == h[0]) else WALK_BOTH for h in halves.T)
+            classes.append(WalkClass(tuple(int(x) for x in table[:, 0]), (*(int(x) for x in table[:, 1]), count), half))
         return tuple(classes)
 
     def _walk(self):

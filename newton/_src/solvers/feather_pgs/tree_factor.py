@@ -180,6 +180,7 @@ class TreeFactor:
         self.dynamics_stream = None
         self.walk_arts = None
         self.walk_classes: tuple[WalkClass, ...] = ()
+        self.walk_half_host = None
         self.walk_class = None
         self.walk_leave = None
         self.walk_slip_capacity = 0
@@ -942,6 +943,26 @@ class TreeFactor:
             raise ValueError(f"The walk holds at most {WALK_JOIN_SLOTS} joins of a tree at once, a tree needs {held}")
         joints, dofs = max(int(model.joint_count), 1), max(int(model.joint_dof_count), 1)
         self.walk_arts = wp.array(arts, dtype=wp.int32, device=device)
+        # Each coordinate's column half at its body's frame, from its joint's kind (WALK_COORDINATE): a joint's
+        # sliding coordinates the linear half, its turning ones the angular half, but a D6 joint's turns after its
+        # slides and a free joint's turns below a root, which can have both (WALK_BOTH): their linear halves sit in the
+        # records' side half.
+        kinds, dims = model.joint_type.numpy(), model.joint_dof_dim.numpy()
+        self.walk_half_host = np.full(dofs, WALK_BOTH, dtype=np.int32)
+        walked = np.zeros(max(int(model.joint_count), 1), dtype=bool)
+        for art in arts.tolist():
+            walked[int(start[art]) : int(end[art])] = True
+        both = False
+        for j in range(kinds.size):
+            lin, ang = int(dims[j, 0]), int(dims[j, 1])
+            two = ang > 0 and (
+                (kinds[j] == int(JointType.D6) and lin > 0)
+                or (kinds[j] in (int(JointType.FREE), int(JointType.DISTANCE)) and path[j, 0] >= 0)
+            )
+            c = int(qd_start[j])
+            self.walk_half_host[c : c + lin] = WALK_LINEAR
+            self.walk_half_host[c + lin : c + lin + ang] = WALK_BOTH if two else WALK_ANGULAR
+            both = both or bool(two and walked[j])
         # The walking classes: each held tree's topology, which the step's one leave (walk_leave_kernel) and the
         # thread-a-tree refresh (walk_step_class_kernel) emit as its walk, and each articulation's class among them.
         classes: dict[WalkClass, int] = {}
@@ -951,6 +972,7 @@ class TreeFactor:
             table = WalkClass(
                 tuple(int(p) for p in path[j0:j1, 0]),
                 (*(int(f) for f in path[j0:j1, 1]), int(qd_start[j1] - qd_start[j0])),
+                tuple(int(h) for h in self.walk_half_host[int(qd_start[j0]) : int(qd_start[j1])]),
             )
             walk_class[art] = classes.setdefault(table, len(classes))
         self.walk_classes = tuple(classes)
@@ -969,15 +991,6 @@ class TreeFactor:
         self.walk_path = wp.array(path, dtype=wp.vec2i, device=device)
         self.walk_joins = wp.array(joins, dtype=wp.int32, device=device)
         self.walk_path_host = path
-        # A joint whose column at its body's frame can have two halves (a D6 joint's turns after its slides, a free
-        # joint's turns below a root) keeps their linear halves in the records' side half (WALK_COORDINATE).
-        kinds, dims = model.joint_type.numpy(), model.joint_dof_dim.numpy()
-        walked = np.zeros(max(int(model.joint_count), 1), dtype=bool)
-        for art in arts.tolist():
-            walked[int(start[art]) : int(end[art])] = True
-        turns_after_slides = (kinds == int(JointType.D6)) & (dims[:, 0] > 0) & (dims[:, 1] > 0)
-        free_below_root = np.isin(kinds, (int(JointType.FREE), int(JointType.DISTANCE))) & (path[: kinds.size, 0] >= 0)
-        both = bool(np.any(walked[: kinds.size] & (turns_after_slides | free_below_root)))
         self.walk_data = wp.zeros(((2 if both else 1) * dofs, WALK_COORDINATE), dtype=wp.float32, device=device)
         self.walk_link = wp.zeros((joints, WALK_LINK), dtype=wp.float32, device=device)
         self.walk_leave_twist = wp.zeros(joints, dtype=wp.spatial_vector, device=device)
@@ -1528,6 +1541,9 @@ turns after its slides and a free joint's turns below a root: the record names i
 the angular half), and a column with both halves keeps its linear half in a side ``float4`` whose offset in floats from
 the record its last word holds (zero: none; :func:`pack_walk_records`). Readers take it unpacked, :data:`WALK_UNPACKED`
 floats (``s`` 6, ``ut`` 6, ``1 / ell``, ``P0``), through ``WALK_LOAD_RECORD``."""
+
+WALK_LINEAR, WALK_ANGULAR, WALK_BOTH = 0, 1, 2
+"""A column's half at its body's frame: the linear one, the angular one, or both (the linear in the record's side)."""
 
 WALK_UNPACKED = 14
 """Floats of a coordinate's record unpacked (``WALK_LOAD_RECORD``): ``s`` 6, ``ut`` 6, ``1 / ell``, ``P0``."""
@@ -2214,10 +2230,19 @@ class WalkClass:
 
     parent: tuple[int, ...]
     first: tuple[int, ...]
+    half: tuple[int, ...] = ()
+    """Each coordinate's column half (:data:`WALK_LINEAR`, :data:`WALK_ANGULAR`, or :data:`WALK_BOTH`, read from the
+    record), compiled into the class's walk; empty: every coordinate's read from its record."""
 
     def __post_init__(self):
         if len(self.first) != len(self.parent) + 1 or any(p >= b for b, p in enumerate(self.parent)):
             raise ValueError("a walk's class needs every parent before its children and a first coordinate per body")
+        if self.half and len(self.half) != self.first[-1]:
+            raise ValueError("a walk's class names a half for every coordinate or for none")
+
+    def half_of(self, c: int) -> int:
+        """Coordinate ``c``'s column half as the class's walk compiles it (:data:`WALK_BOTH`: read from the record)."""
+        return self.half[c] if self.half else WALK_BOTH
 
     @property
     def coordinates(self) -> int:
@@ -2226,7 +2251,7 @@ class WalkClass:
     @property
     def tag(self) -> str:
         """A short name of the table, for the class's emitted names and its kernels' names."""
-        return hashlib.sha256(repr((self.parent, self.first)).encode()).hexdigest()[:8]
+        return hashlib.sha256(repr((self.parent, self.first, self.half)).encode()).hexdigest()[:8]
 
     def walk(
         self,
@@ -2273,7 +2298,9 @@ class WalkClass:
             unroll: Coordinates up to which the walk is straight-line code (:data:`WALK_UNROLL`).
             fetch_joint: Body ``$b``'s joint inputs (an expression; ``$up`` its parent), read by ``joint`` as ``$L``; none
                 if empty.
-            fetch_step: Coordinate ``$c``'s step inputs (an expression), read by ``step`` as ``$X``; none if empty.
+            fetch_step: Coordinate ``$c``'s step inputs (an expression; ``$half`` its column half, :meth:`half_of`, a
+                constant in straight-line code, :data:`WALK_BOTH` in the loop form), read by ``step`` as ``$X``; none
+                if empty.
             touch_joint: Body ``$b``'s statement asking L1 for its joint inputs' lines (a hint, no register).
             touch_step: Coordinate ``$c``'s statement asking L1 for its step inputs' lines.
             ahead: Items whose inputs a lane holds in registers ahead of the chain (:data:`WALK_AHEAD` by default; a
@@ -2304,7 +2331,11 @@ class WalkClass:
 
             def fetch(item):
                 kind, index = item
-                text = _fill(fetch_joint, b=index, up=self.parent[index]) if kind == "l" else _fill(fetch_step, c=index)
+                text = (
+                    _fill(fetch_joint, b=index, up=self.parent[index])
+                    if kind == "l"
+                    else _fill(fetch_step, c=index, half=self.half_of(index))
+                )
                 return [f"const auto walk_{kind}{index} = {text};"] if text else []
 
             def touched(item):
@@ -2386,7 +2417,7 @@ class WalkClass:
                 out.append(f"walk_l{j} = {_fill(fetch_joint, b=body, up=f'{name}_PARENT[{body}]')};")
             if fetch_step:
                 out.append(
-                    f"walk_x{j} = {_fill(fetch_step, c=f'(({name}_COORDINATE[{at}]) < 0 ? 0 : {name}_COORDINATE[{at}])')};"
+                    f"walk_x{j} = {_fill(fetch_step, c=f'(({name}_COORDINATE[{at}]) < 0 ? 0 : {name}_COORDINATE[{at}])', half=WALK_BOTH)};"
                 )
             return out
 
@@ -2430,7 +2461,7 @@ class WalkClass:
                 if fetch_joint:
                     lines.append(f"const auto walk_l = {_fill(fetch_joint, b='b', up=f'{name}_PARENT[b]')};")
                 if fetch_step:
-                    lines.append(f"const auto walk_x = {_fill(fetch_step, c='(c < 0 ? 0 : c)')};")
+                    lines.append(f"const auto walk_x = {_fill(fetch_step, c='(c < 0 ? 0 : c)', half=WALK_BOTH)};")
             if root_first:
                 head = [f"const int up = {name}_PARENT[b];", f"if (up < 0) {{\n    {each} V[k] = 0.0f;\n}} else {{"]
                 head += [indent_text(parent_state, 4), indent_text(_fill(joint, b="b", V="V", P="P", **names), 4), "}"]
@@ -2484,7 +2515,7 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
         return max(0, min(WALK_AHEAD if ahead is None else ahead, items))
 
 
-FREE_BODY_WALK = WalkClass((-1,), (0, 6))
+FREE_BODY_WALK = WalkClass((-1,), (0, 6), (0, 0, 0, 1, 1, 1))
 """A free rigid body's walking class: one body of six coordinates."""
 
 _WALK_ACCESS = """    // The walk's loads, and a lane group's fetch of a byte range into L1, one line a lane a trip. A walk's loads are
@@ -2550,13 +2581,18 @@ _WALK_ACCESS_CPU = """    struct WalkRecord {
 
 _DOWN_IN = """    // WALK_IN(d, u, p): coordinate record d's step input and the caller's two values, read off the chain: the
     // record's three float4 (and its side float4 for a column of two halves) unpacked as WALK_LOAD_RECORD does.
-    const auto WALK_IN = [&](const float* d, const float u, const float p) -> WalkIn {
+    // half: the column's half where the class's walk compiles it (WALK_LINEAR 0, WALK_ANGULAR 1: no flag, no side
+    // load), else (WALK_BOTH) the record's own.
+    const auto WALK_IN = [&](const float* d, const float u, const float p, const int half) -> WalkIn {
         const auto a = WALK_RECORD(d), b = WALK_RECORD(d + 4), e = WALK_RECORD(d + 8);
-        const int side = WALK_BITS(e.w);
         auto v = a;
         v.x = v.y = v.z = 0.0f;
-        if (side != 0) v = WALK_RECORD(d + side);
-        const bool turns = WALK_BITS(a.w) < 0;
+        bool turns = half == 1;
+        if (half > 1) {
+            const int side = WALK_BITS(e.w);
+            if (side != 0) v = WALK_RECORD(d + side);
+            turns = WALK_BITS(a.w) < 0;
+        }
         WalkIn in;
         in.s.x = turns ? v.x : a.x;
         in.s.y = turns ? v.y : a.y;
@@ -2579,7 +2615,7 @@ _DOWN_IN = """    // WALK_IN(d, u, p): coordinate record d's step input and the 
 _DOWN_FETCH_JOINT = "WALK_LINK_IN(link, $b, $up)"
 """A body's joint input in the walk down: its offset to its parent's frame (``WALK_LINK_IN``)."""
 
-_DOWN_FETCH_STEP = "WALK_IN(data + $coordinate * ($c), u($c), prior($c))"
+_DOWN_FETCH_STEP = "WALK_IN(data + $coordinate * ($c), u($c), prior($c), $half)"
 """A coordinate's step input in the walk down: its record, its ``u`` and its output's prior value."""
 
 _DOWN_TOUCH_JOINT = "WALK_TOUCH(link + $link * ($b));"

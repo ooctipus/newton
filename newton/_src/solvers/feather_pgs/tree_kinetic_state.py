@@ -2313,7 +2313,7 @@ def walk_up(cls, unroll: int = PREDICTOR_UNROLL, ahead: int | None = PREDICTOR_A
     joint = Template(_UP_JOINT).safe_substitute(link=WALK_LINK)
     inputs = {
         "fetch_joint": "WALK_LINK_IN(link, $b, $up)",
-        "fetch_step": f"WALK_IN(data + {WALK_COORDINATE} * ($c), x[$c], 0.0f)",
+        "fetch_step": f"WALK_IN(data + {WALK_COORDINATE} * ($c), x[$c], 0.0f, $half)",
         "touch_joint": f"WALK_TOUCH(link + {WALK_LINK} * ($b));",
         "touch_step": f"WALK_TOUCH(data + {WALK_COORDINATE} * ($c));",
     }
