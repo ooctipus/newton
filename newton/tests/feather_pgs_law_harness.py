@@ -26,12 +26,14 @@ from newton._src.solvers.feather_pgs.friction_patches import PatchRowLaw
 from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.solver_fields import Mimics
 from newton._src.solvers.feather_pgs.tree_factor import (
+    WALK_FRAME,
     WALK_LINK,
     WalkClass,
     WalkRelease,
     WalkTrees,
     pack_walk_columns,
     pack_walk_records,
+    unpack_walk_records,
     walk_leave_kernel,
 )
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -753,6 +755,67 @@ def _walked_coordinates(solver):
     return coordinates.numpy().astype(np.float64)
 
 
+def walk_inverse(solver, art: int) -> np.ndarray:
+    """``L^-1`` of articulation ``art``'s walk in its physical coordinates (float64 from the walk's float32 records):
+    column ``i`` is the walk up of the unit force at coordinate ``i`` (``WALK_UP_TREE``'s steps), the factor the rows
+    are whitened by. With ``inverse`` this, ``H^-1 = inverse^T inverse`` (the walk's ``L L^T = H`` with
+    ``L = inverse^-1``), a row's footprints are ``z = inverse J^T`` and its response ``H^-1 J^T = inverse^T z``."""
+    factor = solver.factor
+    d0 = int(solver.forest.articulation_dof_start.numpy()[art])
+    j0, j1 = int(solver.model.articulation_start.numpy()[art]), int(solver.forest.articulation_joint_end_host[art])
+    path = factor.walk_path_host[j0:j1]
+    n = int(solver.forest.articulation_dof_count.numpy()[art])
+    data = unpack_walk_records(factor.walk_data.numpy(), d0 + n)[d0:].astype(np.float64)
+    # Each body's offset to its parent's frame, as the walk forms it: the float32 difference of the two frame points.
+    frames = factor.walk_link.numpy()[j0:j1, WALK_FRAME : WALK_FRAME + 3]
+    link = np.array([frames[p] - frames[b] if p >= 0 else np.zeros(3, np.float32) for b, p in enumerate(path[:, 0])])
+    link = link.astype(np.float64)
+    first = [int(f) for f in path[:, 1]] + [n]
+    inverse = np.zeros((n, n))
+    for i in range(n):
+        x = np.zeros(n)
+        x[i] = 1.0
+        state, p = np.zeros((len(path), 6)), np.zeros(6)
+        for b in range(len(path) - 1, -1, -1):
+            p += state[b]
+            for c in range(first[b + 1] - 1, first[b] - 1, -1):
+                z = (x[c] + data[c, :6] @ p) * data[c, 12]
+                p -= data[c, 6:12] * z
+                inverse[c, i] = z
+            up = int(path[b, 0])
+            if up >= 0:
+                p[3:] -= np.cross(link[b, :3], p[:3])
+            if up != b - 1:
+                if up >= 0:
+                    state[up] += p
+                p = np.zeros(6)
+    return inverse
+
+
+def dense_factor32(A) -> np.ndarray:
+    """Main's float32 dense factor of the symmetric matrix ``A`` (physical order, ``H + R + K``): the leaf-first
+    ``P A P^T = L L^T`` the held tree built before the walk replaced it, over ``A`` rounded to float32, in its order:
+    each pivot subtracts its row's squares from the first column on and takes the square root, and each entry below
+    subtracts its products and scales by the pivot's reciprocal. A reference for the walk's precision, not a solver
+    path; main's own float32 geometry is not in it. Returns ``L``, float32 lower triangular, leaf first."""
+    A = np.asarray(A, dtype=np.float64).astype(np.float32)[::-1, ::-1]
+    n = A.shape[0]
+    L = np.zeros((n, n), np.float32)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        for col in range(n):
+            value = A[col, col]
+            for k in range(col):
+                value = np.float32(value - np.float32(L[col, k] * L[col, k]))
+            L[col, col] = np.sqrt(value)
+            reciprocal = np.float32(1.0) / L[col, col]
+            for row in range(col + 1, n):
+                value = A[row, col]
+                for k in range(col):
+                    value = np.float32(value - np.float32(L[row, k] * L[col, k]))
+                L[row, col] = np.float32(value * reciprocal)
+    return L
+
+
 def walk_factor(lower) -> np.ndarray:
     """``A = P L^T P`` of a leaf-first factor ``L`` (``P H P^T = L L^T``): lower triangular in coordinate order, the
     walk's ``u = A qd`` of :func:`chain_walk`, ``H = A^T A``; a row's footprints are ``z = A^-T J^T``."""
@@ -962,13 +1025,13 @@ def packed_coordinates(solver) -> np.ndarray:
 
 def unpacked_rows(solver) -> tuple[np.ndarray, np.ndarray]:
     """The matrix-free sweeps' dense rows over their worlds' coordinates, from the packed rows (:mod:`.packed_rows`),
-    float64 ``[world, row, coordinate]``: the Jacobian ``J`` (``P^T L z`` on each side, the side's entries found by
-    their coordinates) and the response ``H^-1 J^T`` (``P^T L^-T z``)."""
+    float64 ``[world, row, coordinate]``: the Jacobian ``J`` (``inverse^-1 z`` on each side, the side's entries found by
+    their coordinates) and the response ``H^-1 J^T`` (``inverse^T z``), through each side's walk (:func:`walk_inverse`)."""
     dof = packed_coordinates(solver)
     Z = solver.placement.packed_Z.numpy().astype(np.float64)
     sides, sizes = solver.placement.row_sides.numpy(), solver.forest.articulation_response_dof_count.numpy()
-    groups, offsets = solver.forest.art_group_idx.numpy(), solver.forest.articulation_world_dof_offset.numpy()
-    factors = {}
+    offsets = solver.forest.articulation_world_dof_offset.numpy()
+    walks = {}
     shape = (*dof.shape[:2], solver.forest.max_world_dofs)
     jacobian, response = np.zeros(shape), np.zeros(shape)
     for world, count in enumerate(solver.placement.constraint_count.numpy()):
@@ -978,13 +1041,15 @@ def unpacked_rows(solver) -> tuple[np.ndarray, np.ndarray]:
                     continue
                 n, first = int(sizes[art]), int(offsets[art])
                 held = (dof[world, row] >= first) & (dof[world, row] < first + n)
-                coordinates = dof[world, row, held]
-                if n not in factors:
-                    factors[n] = solver.factor.L_by_size[n].numpy().astype(np.float64)
-                L = np.tril(factors[n][groups[art]])
-                # Leaf-first positions: factor coordinate i is the side's coordinate n - 1 - i.
-                jacobian[world, row, coordinates] = (L @ Z[world, row, held][::-1])[::-1]
-                response[world, row, coordinates] = np.linalg.solve(L.T, Z[world, row, held][::-1])[::-1]
+                if int(art) not in walks:
+                    inverse = walk_inverse(solver, int(art))
+                    walks[int(art)] = (np.linalg.inv(inverse), inverse.T)
+                lower, response_of = walks[int(art)]
+                # The walk's footprints sit at their coordinates (not reversed).
+                z = np.zeros(n)
+                z[dof[world, row, held] - first] = Z[world, row, held]
+                jacobian[world, row, first : first + n] = lower @ z
+                response[world, row, first : first + n] = response_of @ z
     return jacobian, response
 
 

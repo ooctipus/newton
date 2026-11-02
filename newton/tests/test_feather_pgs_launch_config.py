@@ -584,7 +584,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             enable_joint_limits=False,
             dense_max_constraints=16,
         )
-        self.assertEqual(optimized._plan.factor[3].name, reference._plan.factor[3].name)
+        self.assertEqual(optimized._plan.response[3].name, reference._plan.response[3].name)
 
         q = np.tile(np.array([0.15, -0.2, 0.3], dtype=np.float32), 2)
         qd = np.tile(np.array([0.1, -0.05, 0.2], dtype=np.float32), 2)

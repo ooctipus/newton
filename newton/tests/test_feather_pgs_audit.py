@@ -15,6 +15,7 @@ from newton._src.solvers.feather_pgs.audit import AUDIT_SLOTS
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conformance
+from newton.tests.feather_pgs_law_harness import walk_inverse
 
 H = 1.0 / 240.0
 G0 = 9.81
@@ -78,14 +79,14 @@ def _rollout(model, *, steps, dt=H, before=None, **options):
 
 
 def _free_coordinates(solver, velocity):
-    """Each free body's ``u = L^T P v``, by body: the metric of the kinetic energy."""
-    factors = solver.factor.L_by_size[6].numpy()
+    """Each free body's ``u = L^T v`` through its walk (``H = L L^T``, :func:`walk_inverse`), by body: the metric of the
+    kinetic energy."""
     start = solver.forest.articulation_dof_start.numpy()
     groups = solver.forest.group_to_art[6].numpy()
     u = np.zeros((groups.size, 6))
     for group, art in enumerate(groups):
         v = velocity[start[art] : start[art] + 6].astype(np.float64)
-        u[group] = factors[group].astype(np.float64).T @ v[::-1]
+        u[group] = np.linalg.inv(walk_inverse(solver, int(art))).T @ v
     return u
 
 
@@ -185,7 +186,7 @@ class TestAudit(unittest.TestCase):
 
         solver, _state = _rollout(_hinge_model(self.device, limit=limit), steps=3, before=before)
         self.assertGreater(float(solver.placement.impulses.numpy()[0, :2].sum()), 1.0e-2)
-        factor = float(solver.factor.L_by_size[1].numpy()[0, 0, 0])
+        factor = 1.0 / float(walk_inverse(solver, 0)[0, 0])
         u_hat, u_out = factor * float(solver.v_hat.numpy()[0]), factor * float(solver.v_out.numpy()[0])
         rows, biased = _store_sums(solver)
         kinetic_change = 0.5 * (u_out * u_out - u_hat * u_hat)

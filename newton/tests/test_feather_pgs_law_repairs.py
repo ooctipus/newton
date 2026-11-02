@@ -635,7 +635,7 @@ class TestDriveSaturation(unittest.TestCase):
             launches.append(_launched(lambda: solver.step(out, state, control, None, H)))  # noqa: B023
             moved.append(_decided_K(solver))
         self.assertEqual(launches[0], launches[1])
-        for stage in ("dense_factor", "tree_kinetic_predict"):
+        for stage in ("walk_step", "tree_kinetic_predict"):
             self.assertEqual(sum(name.startswith(stage) for name in launches[0]), 1, stage)
         self.assertEqual(moved[0].size, 0)
         self.assertLess(float(moved[1].min()), 1.0e-6)

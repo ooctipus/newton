@@ -297,7 +297,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         with assert_host_only():
             selected = solver.get_path_selection()
         self.assertIn("CUDA", selected["reasons"]["sparse_mass_matrix"])
-        self.assertEqual(selected["routes"]["stages"]["factor"]["1"]["route"], "held")
+        self.assertEqual(set(selected["routes"]["stages"]), {"response", "jacobian_clear_dofs"})
         # Benchmark results store this record with json.dumps(..., allow_nan=False).
         json.dumps(selected, allow_nan=False)
         selected["reasons"]["publication"] = "edited"

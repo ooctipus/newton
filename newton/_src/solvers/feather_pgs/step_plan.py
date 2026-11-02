@@ -90,8 +90,6 @@ class SolveRoute:
 class StepPlan:
     """The per-stage dispatch tables of one solver, built once by :meth:`build`."""
 
-    factor: Mapping[int, Route]
-    """Per size: ``none`` (no dense factor) or ``held`` (the held tree refreshes the factor)."""
     response: Mapping[int, Route]
     """Stage 4, per size, where its rows are whitened: ``owner`` (a contact owner publishes the response),
     ``sparse_diagonal`` or ``packed`` (the packed rows' build)."""
@@ -107,7 +105,6 @@ class StepPlan:
         """Read the plan from the solver's route ``row`` and its mapping (sizes, resource rules, kernel choices)."""
         solve = _solve(row)
         return cls(
-            factor=MappingProxyType(_factor(row, solver)),
             response=MappingProxyType(_response(row, solver)),
             solve=solve,
             jacobian_clear_sizes=()
@@ -126,22 +123,9 @@ class StepPlan:
             return {str(int(size)): route.record() for size, route in routes.items()}
 
         return {
-            "factor": table(self.factor),
             "response": table(self.response),
             "jacobian_clear_dofs": [int(size) for size in self.jacobian_clear_sizes],
         }
-
-
-def _factor(row: RouteRow, solver) -> dict[int, Route]:
-    routes = {}
-    for size in solver.forest.size_groups:
-        if size == row.sizes["diagonal"]:
-            routes[size] = Route("none", "The compact diagonal size stores its inverse mass directly; no dense factor.")
-        elif size == row.sizes["packed"]:
-            routes[size] = Route("none", row.reasons["K1"])
-        else:
-            routes[size] = Route("held", "The held tree refreshes the factor from its geometry.")
-    return routes
 
 
 def _response(row: RouteRow, solver) -> dict[int, Route]:

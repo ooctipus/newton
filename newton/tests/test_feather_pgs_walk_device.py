@@ -59,6 +59,8 @@ from newton._src.solvers.feather_pgs.tree_factor import (
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conformance
+from newton.tests.feather_pgs_law_harness import dense_factor32
+from newton.tests.feather_pgs_mass_reference import MassReference
 from newton.tests.test_feather_pgs_walk import (
     BOUND,
     CHAINS,
@@ -454,7 +456,8 @@ def frames_on_chain(links: int, device) -> dict:
     joint_q = state.joint_q.numpy().astype(np.float64)
     solver.step(state, out, control, None, 1.0 / 240.0)
     n = int(model.joint_dof_count)
-    L32 = np.tril(solver.factor.L_by_size[n].numpy()[0]).astype(np.float64)
+    H = MassReference(model).mass_matrix(joint_q, 0)
+    L32 = dense_factor32(H + np.diag(solver.factor.diagonal(0))).astype(np.float64)
     walk = solver.factor.walk(joint_q, 0)
     walk32 = solver.factor.walk(joint_q, 0, dtype=np.float32)
     body, W = ground_contact(model, newton_state_body_q(model, joint_q), links)

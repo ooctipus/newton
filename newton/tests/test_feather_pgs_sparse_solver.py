@@ -17,9 +17,8 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
 from newton._src.solvers.feather_pgs.staging import arch_budget
-from newton._src.solvers.feather_pgs.tree_factor import WALK_FRAME, unpack_walk_records
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import unpacked_rows
+from newton.tests.feather_pgs_law_harness import unpacked_rows, walk_inverse
 
 DT = 1.0 / 400.0
 STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
@@ -232,42 +231,6 @@ def _step(case):
         wp.copy(getattr(state, name), getattr(out, name))
 
 
-def _walk_inverse(solver, art: int) -> np.ndarray:
-    """``L^-1`` of articulation ``art``'s walk in its physical coordinates (float64 from the walk's float32 records):
-    column ``i`` is the walk up of the unit force at coordinate ``i`` (``WALK_UP_TREE``'s steps), the factor the rows
-    are whitened by."""
-    factor = solver.factor
-    d0 = int(solver.forest.articulation_dof_start.numpy()[art])
-    j0, j1 = int(solver.model.articulation_start.numpy()[art]), int(solver.forest.articulation_joint_end_host[art])
-    path = factor.walk_path_host[j0:j1]
-    n = int(solver.forest.articulation_dof_count.numpy()[art])
-    data = unpack_walk_records(factor.walk_data.numpy(), d0 + n)[d0:].astype(np.float64)
-    # Each body's offset to its parent's frame, as the walk forms it: the float32 difference of the two frame points.
-    frames = factor.walk_link.numpy()[j0:j1, WALK_FRAME : WALK_FRAME + 3]
-    link = np.array([frames[p] - frames[b] if p >= 0 else np.zeros(3, np.float32) for b, p in enumerate(path[:, 0])])
-    link = link.astype(np.float64)
-    first = [int(f) for f in path[:, 1]] + [n]
-    inverse = np.zeros((n, n))
-    for i in range(n):
-        x = np.zeros(n)
-        x[i] = 1.0
-        state, p = np.zeros((len(path), 6)), np.zeros(6)
-        for b in range(len(path) - 1, -1, -1):
-            p += state[b]
-            for c in range(first[b + 1] - 1, first[b] - 1, -1):
-                z = (x[c] + data[c, :6] @ p) * data[c, 12]
-                p -= data[c, 6:12] * z
-                inverse[c, i] = z
-            up = int(path[b, 0])
-            if up >= 0:
-                p[3:] -= np.cross(link[b, :3], p[:3])
-            if up != b - 1:
-                if up >= 0:
-                    state[up] += p
-                p = np.zeros(6)
-    return inverse
-
-
 def _tree(case, group: int, records: np.ndarray) -> np.ndarray:
     """The walk records of the sparse group's ``group``-th articulation."""
     solver = case[1]
@@ -375,7 +338,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         for art in solver.forest.group_to_art[size].numpy():
             if solver.forest.art_to_world.numpy()[art] != world:
                 continue
-            inverse = _walk_inverse(solver, int(art))[np.ix_(plan.permutation, plan.permutation)]
+            inverse = walk_inverse(solver, int(art))[np.ix_(plan.permutation, plan.permutation)]
             offset = int(solver.forest.articulation_world_dof_offset.numpy()[art])
             physical_j[:, offset + plan.permutation] = np.linalg.solve(inverse, z[:, offset : offset + size].T).T
         if solver.forest.has_free_rigid_bodies:

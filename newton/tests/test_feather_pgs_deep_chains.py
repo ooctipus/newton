@@ -38,6 +38,8 @@ from newton._src.solvers.feather_pgs.body_cut import BodyCut
 from newton._src.solvers.feather_pgs.tree_factor import TreeWalk, local_frames
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
+from newton.tests.feather_pgs_law_harness import dense_factor32
+from newton.tests.feather_pgs_mass_reference import MassReference
 from newton.tests.test_feather_pgs_connect import _LOOP_FRAMES, _four_bar_bars
 from newton.tests.test_feather_pgs_regimes import LIMIT, known_failure
 from newton.tests.test_feather_pgs_walk import (
@@ -188,9 +190,9 @@ def family_response(model, devices_to_run=(), *, float32_poses: bool = False) ->
 
 
 def main_on_chain(model) -> dict:
-    """A chain's tip contact (three rows) through main's float32 dense factor, with the conditioning armature it adds,
-    applied in float32, and through the float32 walk without armature, both against the float64 walk without armature
-    (F2's comparison, :func:`.test_feather_pgs_walk.chain_precision`)."""
+    """A chain's tip contact (three rows) through main's float32 dense factor (:func:`dense_factor32` of ``H`` with the
+    conditioning armature the solver adds), applied in float32, and through the float32 walk without armature, both
+    against the float64 walk without armature (F2's comparison, :func:`.test_feather_pgs_walk.chain_precision`)."""
     from scipy.linalg import solve_triangular
 
     joint_q = model.joint_q.numpy().astype(np.float64)
@@ -200,15 +202,13 @@ def main_on_chain(model) -> dict:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         solver = SolverFeatherPGS(model, dense_max_constraints=8)
-    state, out, control = model.state(), model.state(), model.control()
-    solver.step(state, out, control, None, 1.0 / 240.0)
     body = truth.parent.size - 1
     W = contact_wrenches(np.array([0.05, 0.0, -0.02]))
     z64, _ = truth.up(body, W)
     dv64 = np.stack([truth.down(z64[:, r])[0] for r in range(3)], axis=1)
     z32, _ = walk32.up(body, W.astype(np.float32))
     dv32 = np.stack([walk32.down(z32[:, r])[0] for r in range(3)], axis=1)
-    L32 = np.tril(solver.factor.L_by_size[n].numpy()[0]).astype(np.float32)
+    L32 = dense_factor32(MassReference(model).mass_matrix(joint_q, 0) + np.diag(solver.factor.diagonal(0)))
     with np.errstate(all="ignore"):
         x32 = jacobian(truth, body, W).astype(np.float32)[::-1]
         z_main = solve_triangular(L32, x32, lower=True, check_finite=False)

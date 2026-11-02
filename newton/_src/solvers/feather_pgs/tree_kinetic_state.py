@@ -608,9 +608,8 @@ _DRIVE_MASS = r"""            // A drive's mass without K, H_ii + R_ii (the satu
                 data.row_H.data[drive]=value+data.armature.data[ds+dof];
             }
 """
-"""The collection's write of the drives' K-free mass (``row_H``), for a group whose response holds no factor that forms
-``H_ii`` (the walk's classes: :func:`get_helpers`'s ``drive_mass``); a dense factor and the diagonal geometry write it
-where they form ``H_ii + R``."""
+"""The collection's write of the drives' K-free mass (``row_H``), every group's: no factor forms ``H_ii``, so the finish
+(and a refreshing repair) is its one writer."""
 
 _FORCE = cached_force.ForceOperands(
     q="f.joint_q.data",
@@ -881,14 +880,12 @@ def get_helpers(
     body_velocity: bool = False,
     *,
     clocked: bool = False,
-    drive_mass: bool = False,
 ):
     """Bind one physical tree evaluation to its storage and its scans' schedules.
 
     ``clocked`` adds the collection (``stage_clocks`` columns 13-15) and body
-    term (16-21) counters; ``drive_mass`` has the collection write the drives'
-    K-free mass (:data:`_DRIVE_MASS`). They change the emitted code, so they are
-    arguments (cache-key members), never environment reads.
+    term (16-21) counters. It changes the emitted code, so it is an argument (a
+    cache-key member), never an environment read.
     """
     pose_source = _down(layout, ts.TRANSFORM, schedules.pose, _POSE_SLOTS)
     motion_source = _down(layout, ts.TWIST if layout.own_bias else _MOTION, schedules.motion, _MOTION_SLOTS)
@@ -900,7 +897,7 @@ def get_helpers(
         PHYSICAL_COL=layout.physical("p.col.data[e]"),
         REDUCE=reduction,
         CURRENT_VALID=_current_valid(layout),
-        DRIVE_MASS=_DRIVE_MASS if drive_mass else "",
+        DRIVE_MASS=_DRIVE_MASS,
         **_native_clocks(clocked, "cache", stages=3, column=13),
     )
 
@@ -1076,7 +1073,6 @@ def get_state_kernel(
     listed: bool = False,
     bank_coordinates: int = 0,
     clocked: bool = False,
-    drive_mass: bool = False,
 ):
     """Build a complete repair, or with ``finish`` a complete finish, from its stage functions.
 
@@ -1112,9 +1108,7 @@ def get_state_kernel(
     pass of its own would cost a launch. Classified launches compare in
     :func:`get_bank_kernel` instead. ``schedules`` are the scans' schedules;
     ``clocked`` selects the stage counters (``stage_clocks`` columns 0-7 for
-    the stages, 22-24 for motion; see :func:`get_helpers`); ``drive_mass`` has
-    the collection write the drives' K-free mass (a group whose response holds
-    no factor, :data:`_DRIVE_MASS`).
+    the stages, 22-24 for motion; see :func:`get_helpers`).
     """
     if finish and motion_velocity:
         raise ValueError("Alternate motion velocity is a repair-only contract")
@@ -1124,7 +1118,7 @@ def get_state_kernel(
         raise ValueError("A listed launch is a contract of the repair of ordinary motion")
     if bank_coordinates and (finish or motion_velocity or listed):
         raise ValueError("A compared input bank is a contract of the one-pass repair of ordinary motion")
-    h = get_helpers(layout, schedules, body_velocity, clocked=clocked, drive_mass=drive_mass)
+    h = get_helpers(layout, schedules, body_velocity, clocked=clocked)
     _lanes, _sync, _sub, _different_motion = _thread_helpers(layout)
     banked = bank_coordinates != 0
     _bank_matches = _bank_binding(bank_coordinates, layout) if banked else None
@@ -1573,8 +1567,6 @@ def get_state_kernel(
         name += "_listed"
     if banked:
         name += "_banked"
-    if drive_mass:
-        name += "_mass"
     return python_kernel(kinetic_state, name)
 
 

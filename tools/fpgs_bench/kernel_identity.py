@@ -144,12 +144,10 @@ def factory_calls():
     Each matrix-free Gauss-Seidel flag is toggled alone on two bases (the pins
     hold the suite's shapes); the fallback and linked parallel tiers of a
     second keyed-row coordinate layout (one articulation, no secondary block)
-    and the Cholesky factor families follow. Calls a factory rejects are
-    recorded as rejected.
+    follow. Calls a factory rejects are recorded as rejected.
     """
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
         keyed_rows,
-        response_builds_dense,
         sweep_routes,
         sweep_routes_tiers,
     )
@@ -184,9 +182,6 @@ def factory_calls():
             "linked_rows": True,
         }
         yield "keyed_rows.get_parallel_factory", parallel, (layout, 72, 32, 18, ARCH), kwargs
-
-    dense = "response_builds_dense."
-    yield dense + "dense_factor_kernel", _unwrapped(response_builds_dense.dense_factor_kernel), (0,), {}
 
 
 def _schedules(layout, chain):

@@ -29,6 +29,7 @@ from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_references as refs
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conformance
+from newton.tests.feather_pgs_law_harness import walk_inverse
 
 H = 1.0 / 240.0
 G0 = refs.GRAVITY
@@ -819,7 +820,8 @@ class TestQ12Chain(unittest.TestCase):
         state.joint_q.assign(angles)
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
         solver.step(state, out, model.control(), None, H)
-        L = np.tril(solver.factor.L_by_size[links].numpy()[0].astype(np.float64))
+        # The walk (the factor): its pivots ell^2 on the diagonal of L = inverse^-1, triangular in its leaf-first order.
+        L = np.linalg.inv(walk_inverse(solver, 0))
         rows = L @ L.T
         pivots = np.diag(L) ** 2 / np.diag(rows)
         return float(pivots.min()), 4.0 * links * 2.0**-24

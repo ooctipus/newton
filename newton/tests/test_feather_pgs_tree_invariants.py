@@ -7,8 +7,9 @@ The reference route is the held tree on the general placement (:data:`.test_feat
 What keeps it honest is outside the solver: after a few steps of each model,
 
 - the held geometry equals the float64 mass matrix ``H`` at the step's output (:mod:`.feather_pgs_mass_reference`);
-- the factor holds ``|L L^T - P (H + R + K) P^T|`` at the step's input and the response ``|A y - x|``, ``y = A^-1 x``;
-- the swept rows hold ``|A Y_i - J_i|``, ``Y_i = P^T L^-T Z_i``: their whitening and the factor agree.
+- the walk (the factor) holds ``|L L^T - (H + R + K)|`` at the step's input and the response ``|A y - x|``,
+  ``y = A^-1 x``;
+- the swept rows hold ``|A Y_i - J_i|``, ``Y_i = L^-T Z_i``: their whitening and the walk agree.
 
 Each bound is a multiple of the coordinates times the float32 rounding of the matrix's largest entry.
 """
@@ -22,7 +23,7 @@ import warp as wp
 import newton
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_conformance as conformance
-from newton.tests.feather_pgs_law_harness import unpacked_rows
+from newton.tests.feather_pgs_law_harness import unpacked_rows, walk_inverse
 from newton.tests.feather_pgs_mass_reference import MassReference
 
 STEPS = 8
@@ -113,8 +114,7 @@ def _diagonal(solver, art) -> np.ndarray:
     """The armature and drive stiffness of articulation ``art``'s coordinates."""
     forest = solver.forest
     start, size = int(forest.articulation_dof_start_host[art]), int(forest.articulation_dof_count_host[art])
-    group = int(forest.art_group_idx.numpy()[art])
-    added = solver.factor.R_by_size[size].numpy()[group].astype(np.float64).copy()
+    added = solver.factor.dof_armature.numpy()[start : start + size].astype(np.float64)
     rows = solver.factor.drive_row_by_dof.numpy()[start : start + size]
     # The factor holds every drive's K: a saturated drive's is released by the predictor's border, not the factor.
     K = solver.factor.aug_row_K.numpy()
@@ -133,20 +133,20 @@ def check_geometry(test, evaluated, reference) -> None:
 
 
 def check_factor(test, evaluated, reference) -> None:
-    """The factor against the float64 matrix at the last step's input, and its solve."""
+    """The walk (the factor) against the float64 matrix at the last step's input, and its solve."""
     solver = evaluated.solver
     rng = np.random.default_rng(11)
     for _, operator, arts in _held_groups(solver):
         if getattr(operator, "diagonal", False) or arts.shape[1] != 1:
             continue
-        L_group = solver.factor.L_by_size[operator.size].numpy().astype(np.float64)
         for index in (0, len(arts) - 1):
             art = int(arts[index, 0])
             A = reference.mass_matrix(evaluated.joint_q_in, art) + np.diag(_diagonal(solver, art))
-            L = np.tril(L_group[index])
-            test.assertLessEqual(np.abs(L @ L.T - A[::-1, ::-1]).max(), _bound(A), "L L^T")
+            inverse = walk_inverse(solver, art)
+            L = np.linalg.inv(inverse)
+            test.assertLessEqual(np.abs(L @ L.T - A).max(), _bound(A), "L L^T")
             x = rng.normal(size=A.shape[0])
-            y = np.linalg.solve(L.T, np.linalg.solve(L, x[::-1]))[::-1]
+            y = inverse.T @ (inverse @ x)
             test.assertLessEqual(
                 np.abs(A @ y - x).max(), _bound(A) * np.abs(y).max() + BOUND * ROUNDING * np.abs(x).max(), "A y - x"
             )

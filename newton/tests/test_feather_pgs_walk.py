@@ -38,6 +38,7 @@ from newton._src.solvers.feather_pgs.tree_factor import TreeWalk, local_frames
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conformance
+from newton.tests.feather_pgs_law_harness import dense_factor32
 from newton.tests.feather_pgs_mass_reference import MassReference
 
 ROUNDING = 2.0**-24
@@ -498,7 +499,8 @@ def chain_precision(links: int, rng) -> Chain:
     solver.step(state, out, control, None, scene.dt)
     n = links + 6
     added = solver.factor.armature[:n].astype(np.float64) - model.joint_armature.numpy()[:n]
-    L32 = np.tril(solver.factor.L_by_size[n].numpy()[0]).astype(np.float32)
+    H = MassReference(model).mass_matrix(joint_q, 0)
+    L32 = dense_factor32(H + np.diag(solver.factor.diagonal(0)))
     truth = TreeWalk(*local_frames(model, joint_q, 0), np.zeros(n))
     walk32 = TreeWalk(*local_frames(model, joint_q, 0), np.zeros(n), dtype=np.float32)
     body, W = ground_contact(model, newton_state_body_q(model, joint_q), links)
@@ -507,7 +509,6 @@ def chain_precision(links: int, rng) -> Chain:
     dv64, _ = truth.down(z64)
     u = rng.normal(size=n)
     v64, _ = truth.down(u)
-    H = MassReference(model).mass_matrix(joint_q, 0)
     floor = relative(dv64, np.linalg.solve(H, x))
     physics = solver.factor.walk(joint_q, 0)  # main's own physics: its armature and drives, in float64
     dv_physics, _ = physics.down(physics.up(body, W)[0])
@@ -590,17 +591,16 @@ def unconditioned(links: int, steps: int = 30) -> Unconditioned:
     contacts = pipeline.contacts()
     state, out, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-    n = links + 6
     first, finite = None, 0
     for step in range(steps):
         state.clear_forces()
         pipeline.collide(state, contacts)
+        H = MassReference(model).mass_matrix(state.joint_q.numpy(), 0)
         solver.step(state, out, control, contacts, scene.dt)
-        L = solver.factor.L_by_size[n].numpy()[0].astype(np.float64)
+        L = dense_factor32(H + np.diag(solver.factor.diagonal(0))).astype(np.float64)
         ok = bool(np.all(np.isfinite(np.tril(L))) and np.all(np.isfinite(out.joint_qd.numpy())))
         if first is None:
             pivots = np.diag(L) ** 2
-            H = MassReference(model).mass_matrix(state.joint_q.numpy(), 0)
             ratios = pivots / np.diag(H)[::-1]
             first = (
                 ok,

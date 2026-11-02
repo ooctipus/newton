@@ -6,10 +6,11 @@
 One owner (:class:`HeldTree`) composes the groups that evaluate every articulation
 (:class:`~.tree_kinetic_owner.TreeKineticState`, plus the scalar branches' group). The solver's data chooses them:
 the native sparse factor, when the solver admitted one, makes one complete group (:class:`TreeSparseOperator`);
-otherwise each size group of the dense factors is a group with its held leaf-first Cholesky or diagonal response
+otherwise each size group is a group that responds by its walk or by the compact diagonal
 (:class:`TreeHeldOperator`), kinematic free bodies a zero-response group (:class:`PrescribedRootOperator`), or one
-group per world spans its articulations (:class:`ForestHeldOperator`). :func:`decline` names why a representation
-does not fit; :func:`install` returns the owner.
+group per world spans its articulations (:class:`ForestHeldOperator`). Every group's collection writes its drives' K-free
+mass (``row_H``) where it forms the mass diagonal; the compact diagonal's refresh forms its inverse mass.
+:func:`decline` names why a representation does not fit; :func:`install` returns the owner.
 """
 
 import itertools
@@ -20,7 +21,6 @@ import warp as wp
 
 from . import host_index
 from .device_proof import DeviceProof
-from .response_builds_dense import dense_factor_kernel, dense_factor_plan
 from .sparse_factor import SparseData, bind_operator_plan, operator_metadata
 from .tree_kinetic_owner import TreeKineticState, launch_switches, proof_runs, stage_clocks_on
 from .tree_kinetic_plan import FREE_JOINTS, make_plan, tree_joints
@@ -39,10 +39,11 @@ def _diagonal_geometry(
     armature: wp.array2d[float],
     drive_row: wp.array[int],
     drive_k: wp.array[float],
-    row_H: wp.array[float],
     n: int,
     inverse: wp.array[float],
 ):
+    """The compact diagonal's inverse mass ``1 / (H_ii + R + K)`` from the held geometry (the collection writes the
+    drives' ``H_ii + R``, ``row_H``)."""
     element = wp.tid()
     group, local = element // n, element % n
     art = group_to_art[group]
@@ -52,7 +53,6 @@ def _diagonal_geometry(
     mass = geometric[geometry_group[group], geometry_index[local]] + armature[group, local]
     row = drive_row[dof]
     if row >= 0:
-        row_H[row] = mass
         if drive_k[row] > 0.0:
             mass += drive_k[row]
     inverse[dof] = 1.0 / mass
@@ -249,8 +249,10 @@ class TreeSparseOperator:
 
 
 class TreeHeldOperator:
-    """Bind packed physical geometry to an unchanged Cholesky or diagonal action, over the range ``span`` of a size
-    group: the trees of one topology, whose factors and armature are that range of the size group's."""
+    """The range ``span`` of a size group as a held group: the trees of one topology, whose armature is that range of
+    the size group's. A walking group refreshes nothing of its own (the walk's refresh is its factor, its collection
+    writes ``row_H``); the compact diagonal refreshes its inverse mass from the held geometry. The walking group's
+    ``lower`` binding (its range of the size group's ``L``, which nothing builds or reads) goes with ``L``."""
 
     def __init__(self, solver, size, span):
         self.solver, self.size, self.span = solver, size, span
@@ -263,71 +265,47 @@ class TreeHeldOperator:
         self.plan = bind_operator_plan(
             solver, size, self.host, group_to_art=solver.forest.group_to_art[size][span[0] : span[1]]
         )
-        physical_index = mass.physical_lookup
         self.data = HeldResponse()
         self.data.valid = wp.ones(count, dtype=int, device=device)
         self.data.status = wp.zeros(count, dtype=int, device=device)
-        self.geometry_group = wp.array(np.arange(count, dtype=np.int32), dtype=int, device=device)
         if self.diagonal:
             self.data.inverse = solver.factor.diagonal_inverse_mass
-            self.geometry_index = wp.array(np.diag(physical_index).copy(), dtype=int, device=device)
-            self.refresh_kernel = _diagonal_geometry
+            self.geometry_group = wp.array(np.arange(count, dtype=np.int32), dtype=int, device=device)
+            self.geometry_index = wp.array(np.diag(mass.physical_lookup).copy(), dtype=int, device=device)
         else:
             self.data.lower = self._lower
-            self.factor_plan = dense_factor_plan(physical_index, device)
-            self.refresh_kernel = dense_factor_kernel(size)
         self.kinetic_state = None
 
     @property
     def _lower(self):
-        """The trees' factors: their range of the size group's."""
+        """The trees' range of the size group's ``L``."""
         return self.solver.factor.L_by_size[self.size][self.span[0] : self.span[1]]
 
     def refresh(self, state_aug):
-        """Refresh only original requested factor groups from their current geometry."""
+        """The compact diagonal's inverse mass from the requested groups' current geometry; a walking group has nothing
+        to refresh."""
+        if not self.diagonal:
+            return
         solver, size = self.solver, self.size
         count = self.span[1] - self.span[0]
-        armature = solver.factor.R_by_size[size][self.span[0] : self.span[1]]
-        if self.diagonal:
-            wp.launch(
-                self.refresh_kernel,
-                dim=count * size,
-                inputs=[
-                    self.plan.group_to_art,
-                    solver.forest.articulation_dof_start,
-                    solver.factor.mass_update_mask,
-                    self.geometry_index,
-                    self.geometry_group,
-                    self.kinetic_state.geometric,
-                    armature,
-                    solver.factor.drive_row_by_dof,
-                    solver.factor.aug_row_K,
-                    solver.factor.aug_row_H,
-                    size,
-                ],
-                outputs=[solver.factor.diagonal_inverse_mass],
-                device=solver.model.device,
-            )
-        else:
-            wp.launch(
-                self.refresh_kernel,
-                dim=count * 32,
-                inputs=[
-                    solver.forest.articulation_dof_start,
-                    solver.factor.mass_update_mask,
-                    self.plan.group_to_art,
-                    self.geometry_group,
-                    self.factor_plan,
-                    armature,
-                    solver.factor.drive_row_by_dof,
-                    solver.factor.aug_row_K,
-                    solver.factor.aug_row_H,
-                    self.kinetic_state.geometric,
-                ],
-                outputs=[self._lower],
-                block_dim=128,
-                device=solver.model.device,
-            )
+        wp.launch(
+            _diagonal_geometry,
+            dim=count * size,
+            inputs=[
+                self.plan.group_to_art,
+                solver.forest.articulation_dof_start,
+                solver.factor.mass_update_mask,
+                self.geometry_index,
+                self.geometry_group,
+                self.kinetic_state.geometric,
+                solver.factor.R_by_size[size][self.span[0] : self.span[1]],
+                solver.factor.drive_row_by_dof,
+                solver.factor.aug_row_K,
+                size,
+            ],
+            outputs=[solver.factor.diagonal_inverse_mass],
+            device=solver.model.device,
+        )
 
     def bind_response(self):
         """Bind current held-array descriptors before a new launch or capture."""
@@ -478,9 +456,9 @@ def forest_families(solver):
 class ForestHeldOperator:
     """Own every articulation of a world as one group: shared scratch, one launch per phase.
 
-    Each root keeps its own held factor family (the solver's dense factor
-    for its size, refreshed from the forest's geometry) or responds with zero
-    when prescribed. Roots, families and offsets come from the topology.
+    Each root responds by its walk, by the compact diagonal (refreshed from
+    the forest's geometry) or with zero when prescribed. Roots, families and
+    offsets come from the topology.
     """
 
     def __init__(self, solver):
@@ -497,8 +475,8 @@ class ForestHeldOperator:
         world_bounds, order = host_index.group_by(art_world, worlds)
         arts = order.reshape(worlds, int(world_bounds[1] - world_bounds[0])).astype(np.int32)
         self.forest_arts = arts
-        # Family per root: its coordinate count for a held Cholesky factor,
-        # negated for a diagonal-mass size (compact inverse), 0 when prescribed.
+        # Family per root: its coordinate count for a walking root, negated
+        # for a diagonal-mass size (compact inverse), 0 when prescribed.
         diagonal = solver._compact_diagonal_mass_size
         self.root_families = tuple(
             0 if prescribed[a] else (-int(counts[a]) if counts[a] == diagonal else int(counts[a])) for a in arts[0]
@@ -513,8 +491,6 @@ class ForestHeldOperator:
         self.plan = bind_operator_plan(solver, 0, self.host, group_to_art=self.group_to_art)
         self.size = mass.dof_count
         self.layout, _ = make_plan(model, self, complete=False)
-        # Physical (row, col) -> forest entry, for each root family's refresh.
-        physical_index = mass.physical_lookup
         self.data = HeldResponse()
         self.data.valid = wp.ones(worlds, dtype=int, device=device)
         self.data.status = wp.zeros(worlds, dtype=int, device=device)
@@ -523,44 +499,30 @@ class ForestHeldOperator:
             if any(f < 0 for f in self.root_families)
             else wp.zeros(model.joint_dof_count, dtype=float, device=device)
         )
-        factor_index = np.zeros((worlds, len(self.root_families)), np.int32)
+        # Each diagonal-mass root's refresh reads its diagonal of the forest's geometry (physical (row, col) -> forest
+        # entry); a walking root refreshes nothing of its own.
+        physical_index = mass.physical_lookup
         self.families = []
+        factor_index = np.zeros((worlds, len(self.root_families)), np.int32)
         for r, family in enumerate(self.root_families):
-            if family == 0:
+            if family > 0:
+                # The walking root's binding of its size group's L, which nothing builds or reads, goes with L.
+                group = solver.forest.group_to_art[family].numpy()
+                position = {int(a): g for g, a in enumerate(group)}
+                factor_index[:, r] = [position[int(a)] for a in arts[:, r]]
+                setattr(self.data, root_field("lower", r), solver.factor.L_by_size[family])
+            if family >= 0:
                 continue
-            offset = self.layout.root_offsets[r]
-            if family < 0:
-                size = -family
-                group = solver.forest.group_to_art[size].numpy()
-                block = physical_index[offset : offset + size, offset : offset + size]
-                self.families.append(
-                    (
-                        r,
-                        family,
-                        _diagonal_geometry,
-                        None,
-                        wp.array(np.diag(block).astype(np.int32), dtype=int, device=device),
-                        wp.array(art_world[group].astype(np.int32), dtype=int, device=device),
-                    )
-                )
-                continue
-            group = solver.forest.group_to_art[family].numpy()
-            position = {int(a): g for g, a in enumerate(group)}
-            factor_index[:, r] = [position[int(a)] for a in arts[:, r]]
-            # The family's factor groups read this root's block of their
-            # world's geometry record (one record per forest group).
-            factor_plan = dense_factor_plan(physical_index[offset : offset + family, offset : offset + family], device)
+            size, offset = -family, self.layout.root_offsets[r]
+            group = solver.forest.group_to_art[size].numpy()
+            block = physical_index[offset : offset + size, offset : offset + size]
             self.families.append(
                 (
-                    r,
-                    family,
-                    dense_factor_kernel(family),
-                    factor_plan,
-                    None,
+                    size,
+                    wp.array(np.diag(block).astype(np.int32), dtype=int, device=device),
                     wp.array(art_world[group].astype(np.int32), dtype=int, device=device),
                 )
             )
-            setattr(self.data, root_field("lower", r), solver.factor.L_by_size[family])
         if not any(f > 0 for f in self.root_families):
             self.data.lower = wp.zeros((1, 1, 1), dtype=float, device=device)
         for r, family in enumerate(self.root_families):
@@ -570,53 +532,30 @@ class ForestHeldOperator:
         self.kinetic_state = None
 
     def refresh(self, state_aug):
-        """Refresh every root family's dense factor from the forest geometry."""
+        """Refresh every diagonal-mass root's inverse mass from the forest geometry."""
         solver = self.solver
-        for _r, family, kernel, factor_plan, geometry_index, geometry_group in self.families:
-            if family < 0:
-                size = -family
-                wp.launch(
-                    kernel,
-                    dim=solver.forest.n_arts_by_size[size] * size,
-                    inputs=[
-                        solver.forest.group_to_art[size],
-                        solver.forest.articulation_dof_start,
-                        solver.factor.mass_update_mask,
-                        geometry_index,
-                        geometry_group,
-                        self.kinetic_state.geometric,
-                        solver.factor.R_by_size[size],
-                        solver.factor.drive_row_by_dof,
-                        solver.factor.aug_row_K,
-                        solver.factor.aug_row_H,
-                        size,
-                    ],
-                    outputs=[solver.factor.diagonal_inverse_mass],
-                    device=solver.model.device,
-                )
-                continue
+        for size, geometry_index, geometry_group in self.families:
             wp.launch(
-                kernel,
-                dim=solver.forest.n_arts_by_size[family] * 32,
+                _diagonal_geometry,
+                dim=solver.forest.n_arts_by_size[size] * size,
                 inputs=[
+                    solver.forest.group_to_art[size],
                     solver.forest.articulation_dof_start,
                     solver.factor.mass_update_mask,
-                    solver.forest.group_to_art[family],
+                    geometry_index,
                     geometry_group,
-                    factor_plan,
-                    solver.factor.R_by_size[family],
+                    self.kinetic_state.geometric,
+                    solver.factor.R_by_size[size],
                     solver.factor.drive_row_by_dof,
                     solver.factor.aug_row_K,
-                    solver.factor.aug_row_H,
-                    self.kinetic_state.geometric,
+                    size,
                 ],
-                outputs=[solver.factor.L_by_size[family]],
-                block_dim=128,
+                outputs=[solver.factor.diagonal_inverse_mass],
                 device=solver.model.device,
             )
 
     def bind_response(self):
-        """Rebind the solver's held factors before a launch or capture."""
+        """Rebind the walking roots' ``L`` (unread; it goes with ``L``) before a launch or capture."""
         for r, family in enumerate(self.root_families):
             if family > 0:
                 setattr(self.data, root_field("lower", r), self.solver.factor.L_by_size[family])
