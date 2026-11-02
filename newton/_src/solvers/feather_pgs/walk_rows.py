@@ -911,10 +911,9 @@ _GENERATE = """    // The rows in generator form (WALK_MAPPING D5H, Z_UNION 1.2)
     // a world (the carveout's budget). 2. Six lanes a slot walk the unit wrenches into Gamma ([6][$paths] in shared
     // memory, by rank in the body's support mask) and its incident covector (the step's J entries against v_hat), and
     // release Gamma's columns along each slip's path (the predictor's border: R Gamma w = (R Gamma) w, once a body).
-    // 3. Each unit whose responding bodies all hold a slot: lane e forms entry e of its rows from Gamma's row of the
-    // entry's coordinate and stores it (a row's entries by consecutive lanes), its coordinate or the pad; the squares
-    // and the Gram summed over the group; the unit's own lane writes its diagonal, incident and record. Returns 1 when
-    // this lane's unit was written here; its lane walks it otherwise (joint rows, bodies without a slot).
+    // 3. Each lane's unit whose responding bodies all hold a slot: its rows from Gamma, its squares, Gram, header and
+    // record. Returns 1 when this lane's unit was written here; its lane walks it otherwise (joint rows, bodies
+    // without a slot).
     const auto& walk = sink.walk;
     const auto& release = sink.release;
     const auto& support = sink.support;
@@ -1033,114 +1032,102 @@ _GENERATE = """    // The rows in generator form (WALK_MAPPING D5H, Z_UNION 1.2)
         }
     }
     SYNC();
-    // 3. The units whose responding bodies all hold a slot.
+    // 3. This lane's unit, where its responding bodies all hold a slot: its rows z = Gamma w, entry by entry in rank
+    // order (6 FMA an entry a row), with their squares, Gram, header and record; the lanes form their units' rows
+    // together, each its own.
     bool mine = eligible != 0 && (key[0] >= 0 || key[1] >= 0);
 #pragma unroll
     for (int k = 0; k < 2; ++k)
         if (key[k] >= 0 && slot_of(key[k]) < 0) mine = false;
-#pragma unroll 1
-    for (int u = 0; u < LANES; ++u) {
-        if (READ((int)mine, u) == 0) continue;
-        const int rows = READ(unit.rows, u), line = READ(unit.line, u), first = READ(unit.slot, u);
-        const int art_a = READ(unit.art_a, u), art_b = READ(unit.art_b, u);
-        const int key_a = READ(key[0], u), key_b = READ(key[1], u);
-        float d[3][3], at[2][3];
+    if (!mine) return 0;
+    const int rows = unit.rows, line = unit.line, first = unit.slot, art_a = unit.art_a, art_b = unit.art_b;
+    // The seeds: body a's wrenches, body b's negated, each at its body's frame (the factor's).
+    const int seed_body[2] = {key[0], key[1]}, seed_art[2] = {art_a, art_b};
+    int seed_slot[2];
+    float seed[2][$rows][6];
 #pragma unroll
-        for (int r = 0; r < 3; ++r)
+    for (int k = 0; k < 2; ++k) {
+        seed_slot[k] = slot_of(seed_body[k]);
+        const float sign = k == 0 ? 1.0f : -1.0f;
+        const int joint = seed_slot[k] < 0 ? 0 : walk.body_joint.data[seed_body[k]];
+        const float* o = walk.link.data + (size_t)joint * $link + $frame;
 #pragma unroll
-            for (int c = 0; c < 3; ++c) d[r][c] = READ(unit.frame.data[r][c], u);
-#pragma unroll
-        for (int c = 0; c < 3; ++c) {
-            at[0][c] = READ(unit.point[c], u);
-            at[1][c] = READ(unit.friction_point[c], u);
-        }
-        // The seeds: body a's wrenches, body b's negated, each at its body's frame (the factor's).
-        const int seed_body[2] = {key_a, key_b}, seed_art[2] = {art_a, art_b};
-        int seed_slot[2];
-        float seed[2][$rows][6];
-#pragma unroll
-        for (int k = 0; k < 2; ++k) {
-            seed_slot[k] = slot_of(seed_body[k]);
-            const float sign = k == 0 ? 1.0f : -1.0f;
-            // The seed at its body's frame (the factor's).
-            const int joint = seed_slot[k] < 0 ? 0 : walk.body_joint.data[seed_body[k]];
-            const float* o = walk.link.data + (size_t)joint * $link + $frame;
-#pragma unroll
-            for (int r = 0; r < $rows; ++r) {
-                float* q = seed[k][r];
-                const float* e = d[r == 1 || r == 2 ? r : 0];
-                const float* x = at[r == 0 ? 0 : 1];
-                const float f[3] = {sign * e[0], sign * e[1], sign * e[2]};
-                const float l[3] = {x[0] - o[0], x[1] - o[1], x[2] - o[2]};
-                if ($spin && r == 3) {
-                    q[0] = q[1] = q[2] = 0.0f;
-                    q[3] = f[0];
-                    q[4] = f[1];
-                    q[5] = f[2];
-                } else {
-                    q[0] = f[0];
-                    q[1] = f[1];
-                    q[2] = f[2];
-                    q[3] = l[1] * f[2] - l[2] * f[1];
-                    q[4] = l[2] * f[0] - l[0] * f[2];
-                    q[5] = l[0] * f[1] - l[1] * f[0];
-                }
+        for (int r = 0; r < $rows; ++r) {
+            float* q = seed[k][r];
+            const float* e = unit.frame.data[r == 1 || r == 2 ? r : 0];
+            const auto& x = r == 0 ? unit.point : unit.friction_point;
+            const float f[3] = {sign * e[0], sign * e[1], sign * e[2]};
+            const float l[3] = {x[0] - o[0], x[1] - o[1], x[2] - o[2]};
+            if ($spin && r == 3) {
+                q[0] = q[1] = q[2] = 0.0f;
+                q[3] = f[0];
+                q[4] = f[1];
+                q[5] = f[2];
+            } else {
+                q[0] = f[0];
+                q[1] = f[1];
+                q[2] = f[2];
+                q[3] = l[1] * f[2] - l[2] * f[1];
+                q[4] = l[2] * f[0] - l[0] * f[2];
+                q[5] = l[0] * f[1] - l[1] * f[0];
             }
         }
-        // The sides, as the direct walker takes them: a's tree, then b's; two seeds on one tree share its side.
-        unsigned long long seed_mask[2] = {0ull, 0ull};
+    }
+    // The sides, as the direct walker takes them: a's tree, then b's; two seeds on one tree share its side.
+    unsigned long long seed_mask[2] = {0ull, 0ull};
+#pragma unroll
+    for (int k = 0; k < 2; ++k)
+        if (seed_slot[k] >= 0) seed_mask[k] = sink.body_mask.data[seed_body[k]];
+    unsigned long long mask0 = 0ull, mask1 = 0ull;
+    int art0 = -1, art1 = -1, seeds0 = 0, seeds1 = 0;
+    if (art_a >= 0 && sink.response_dofs.data[art_a] > 0) {
 #pragma unroll
         for (int k = 0; k < 2; ++k)
-            if (seed_slot[k] >= 0) seed_mask[k] = sink.body_mask.data[seed_body[k]];
-        // Side 0 (a's tree) and side 1 (b's, past side 0's entries): each side's mask, tree and seeds.
-        unsigned long long mask0 = 0ull, mask1 = 0ull;
-        int art0 = -1, art1 = -1, seeds0 = 0, seeds1 = 0;
-        if (art_a >= 0 && sink.response_dofs.data[art_a] > 0) {
+            if (seed_slot[k] >= 0 && seed_art[k] == art_a) mask0 |= seed_mask[k], seeds0 |= 1 << k;
+        if (mask0 != 0ull) art0 = art_a;
+    }
+    if (art_b >= 0 && art_b != art_a && sink.response_dofs.data[art_b] > 0) {
+        if (seed_slot[1] >= 0 && seed_art[1] == art_b) mask1 = seed_mask[1], seeds1 = 2;
+        if (mask1 != 0ull) art1 = art_b;
+    }
+    const int row0 = line * sink.row_factor.shape[1] + first;
+    float* const Z = sink.row_factor.data + (size_t)row0 * S;
+    int* const D = sink.row_dof.data + (size_t)row0 * S;
+    const bool explicit_dofs = support.enabled == 0;
+    float norm[$rows], cross[6];
 #pragma unroll
-            for (int k = 0; k < 2; ++k)
-                if (seed_slot[k] >= 0 && seed_art[k] == art_a) mask0 |= seed_mask[k], seeds0 |= 1 << k;
-            if (mask0 != 0ull) art0 = art_a;
-        }
-        if (art_b >= 0 && art_b != art_a && sink.response_dofs.data[art_b] > 0) {
-            if (seed_slot[1] >= 0 && seed_art[1] == art_b) mask1 = seed_mask[1], seeds1 = 2;
-            if (mask1 != 0ull) art1 = art_b;
-        }
-        const int base1 = COUNT(mask0), count = base1 + COUNT(mask1);
-        const int row0 = line * sink.row_factor.shape[1] + first;
-        float* const Z = sink.row_factor.data + (size_t)row0 * S;
-        int* const D = sink.row_dof.data + (size_t)row0 * S;
-        const bool explicit_dofs = support.enabled == 0;
-        float norm[$rows], cross[6];
-        for (int r = 0; r < $rows; ++r) norm[r] = 0.0f;
-        for (int k = 0; k < 6; ++k) cross[k] = 0.0f;
-        for (int e = LANE; e < S; e += STRIDE) {
+    for (int r = 0; r < $rows; ++r) norm[r] = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 6; ++k) cross[k] = 0.0f;
+    int e = 0;
+#pragma unroll
+    for (int side = 0; side < 2; ++side) {
+        const int seeds = side == 0 ? seeds0 : seeds1;
+        const int offset = (side == 0 ? art0 : art1) >= 0 ? sink.world_offset.data[side == 0 ? art0 : art1] : 0;
+        for (unsigned long long bits = side == 0 ? mask0 : mask1; bits != 0ull; bits &= bits - 1ull, ++e) {
+            const int n = FIRST(bits);
             float z[$rows];
-            for (int r = 0; r < $rows; ++r) z[r] = 0.0f;
-            int coordinate = -1;
-            if (e < count) {
-                const bool second = e >= base1;
-                unsigned long long bits = second ? mask1 : mask0;
-                for (int q = second ? base1 : 0; q < e; ++q) bits &= bits - 1ull;
-                const int n = FIRST(bits), seeds = second ? seeds1 : seeds0;
-                coordinate = sink.world_offset.data[second ? art1 : art0] + n;
 #pragma unroll
-                for (int k = 0; k < 2; ++k) {
-                    if (((seeds >> k) & 1) == 0 || ((seed_mask[k] >> n) & 1ull) == 0ull) continue;
-                    const float* G = GAMMA + seed_slot[k] * SLOT + COUNT(seed_mask[k] & ((1ull << n) - 1ull));
-                    for (int r = 0; r < $rows; ++r) {
-                        const float* v = seed[k][r];
-                        z[r] += (G[0] * v[0] + G[PATHS] * v[1] + G[2 * PATHS] * v[2])
-                                + (G[3 * PATHS] * v[3] + G[4 * PATHS] * v[4] + G[5 * PATHS] * v[5]);
-                    }
+            for (int r = 0; r < $rows; ++r) z[r] = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                if (((seeds >> k) & 1) == 0 || ((seed_mask[k] >> n) & 1ull) == 0ull) continue;
+                const float* G = GAMMA + seed_slot[k] * SLOT + COUNT(seed_mask[k] & ((1ull << n) - 1ull));
+                const float g0 = G[0], g1 = G[PATHS], g2 = G[2 * PATHS], g3 = G[3 * PATHS], g4 = G[4 * PATHS];
+                const float g5 = G[5 * PATHS];
+#pragma unroll
+                for (int r = 0; r < $rows; ++r) {
+                    const float* v = seed[k][r];
+                    z[r] += (g0 * v[0] + g1 * v[1] + g2 * v[2]) + (g3 * v[3] + g4 * v[4] + g5 * v[5]);
                 }
             }
 #pragma unroll
             for (int r = 0; r < $rows; ++r) {
                 if (r >= rows) continue;
                 Z[r * S + e] = z[r];
-                if (explicit_dofs) D[r * S + e] = coordinate;
+                if (explicit_dofs) D[r * S + e] = offset + n;
+                norm[r] += z[r] * z[r];
             }
-            for (int r = 0; r < $rows; ++r) norm[r] += z[r] * z[r];
             if ($rows >= 3) {
                 cross[0] += z[0] * z[1];
                 cross[1] += z[0] * z[2];
@@ -1152,36 +1139,40 @@ _GENERATE = """    // The rows in generator form (WALK_MAPPING D5H, Z_UNION 1.2)
                 cross[5] += z[2] * z[$last];
             }
         }
-        $sums
-        if (LANE != u) continue;
-        // The unit's own lane: its header, its support class (the table) and its record.
-#pragma unroll
-        for (int r = 0; r < $rows; ++r) {
-            if (r >= rows) continue;
-            float incident = 0.0f;
-#pragma unroll
-            for (int k = 0; k < 2; ++k) {
-                if (seed_slot[k] < 0) continue;
-                const float* g = GAMMA + seed_slot[k] * SLOT + 6 * PATHS;
-                const float* v = seed[k][r];
-                incident += (g[0] * v[0] + g[1] * v[1] + g[2] * v[2]) + (g[3] * v[3] + g[4] * v[4] + g[5] * v[5]);
-            }
-            sink.diag.data[row0 + r] = norm[r] + sink.row_cfm.data[row0 + r];
-            sink.row_incident.data[row0 + r] = incident;
-        }
-        if (!explicit_dofs) {
-            const auto side_of = [&](int body, int art) {
-                return body >= 0 && art >= 0 && sink.response_dofs.data[art] > 0 && sink.body_mask.data[body] != 0ull;
-            };
-            const bool a = side_of(unit.body_a, art_a), b = side_of(unit.body_b, art_b);
-            const int class_a = a ? support.body_class.data[unit.body_a] : 0;
-            const int class_b = b ? support.body_class.data[unit.body_b] : 0;
-            const int cls = support.pair_class.data[class_a * support.pair_class.shape[1] + class_b];
-            for (int r = 0; r < rows; ++r) support.row_class.data[row0 + r] = cls;
-        }
-$record
     }
-    return mine ? 1 : 0;"""
+    // The pad past the support.
+    for (int r = 0; r < rows; ++r)
+        for (int p = e; p < S; ++p) {
+            Z[r * S + p] = 0.0f;
+            if (explicit_dofs) D[r * S + p] = -1;
+        }
+    // The header, the support class (the table) and the record.
+#pragma unroll
+    for (int r = 0; r < $rows; ++r) {
+        if (r >= rows) continue;
+        float incident = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            if (seed_slot[k] < 0) continue;
+            const float* g = GAMMA + seed_slot[k] * SLOT + 6 * PATHS;
+            const float* v = seed[k][r];
+            incident += (g[0] * v[0] + g[1] * v[1] + g[2] * v[2]) + (g[3] * v[3] + g[4] * v[4] + g[5] * v[5]);
+        }
+        sink.diag.data[row0 + r] = norm[r] + sink.row_cfm.data[row0 + r];
+        sink.row_incident.data[row0 + r] = incident;
+    }
+    if (!explicit_dofs) {
+        const auto side_of = [&](int body, int art) {
+            return body >= 0 && art >= 0 && sink.response_dofs.data[art] > 0 && sink.body_mask.data[body] != 0ull;
+        };
+        const bool a = side_of(unit.body_a, art_a), b = side_of(unit.body_b, art_b);
+        const int class_a = a ? support.body_class.data[unit.body_a] : 0;
+        const int class_b = b ? support.body_class.data[unit.body_b] : 0;
+        const int cls = support.pair_class.data[class_a * support.pair_class.shape[1] + class_b];
+        for (int r = 0; r < rows; ++r) support.row_class.data[row0 + r] = cls;
+    }
+$record
+    return 1;"""
 """The support sink's rows in generator form, a world's lane group calling (:func:`support_rows_kernel`)."""
 
 _GENERATE_RECORD = """        if (rows == $rows) {
@@ -1237,8 +1228,6 @@ def _gamma(groups: int, slots: int, slot: int) -> DevicePrelude:
 
 def _generate_snippet(parent: tuple, first: tuple, node: tuple, rows: int, records: bool, spin: bool, lanes: int):
     record = substitute(_GENERATE_RECORD, rows=rows, tail=_SPIN_TAIL if spin else "") if records else ""
-    crosses = (6 if rows >= 4 else 3) if rows >= 3 else 0
-    sums = ", ".join([f"norm[{r}]" for r in range(rows)] + [f"cross[{k}]" for k in range(crosses)])
     body = substitute(
         _GENERATE,
         slots=generator_slots(parent, first, lanes),
@@ -1250,7 +1239,6 @@ def _generate_snippet(parent: tuple, first: tuple, node: tuple, rows: int, recor
         link=WALK_LINK,
         frame=WALK_FRAME,
         spin=int(spin),
-        sums=f"SUM({sums});",
         record=record,
     )
     slots, paths = generator_slots(parent, first, lanes), _path_coordinates(parent, first)
@@ -1388,6 +1376,15 @@ def support_rows_kernel(
         world, lane = wp.tid()
         line = rows.first[world]
         count = wp.min(counts[world], sink.row_factor.shape[1])
+        # The contact rows' records by the contact law, a lane a row (the producer's work, folded into the writer),
+        # before any row's header reads them.
+        for slot in range(lane, count, wp.static(lanes)):
+            source = sources[line, slot]
+            if source >> UNIT_SHIFT == UNIT_CONTACT:
+                index = source & ((1 << UNIT_SHIFT) - 1)
+                c = index // 4
+                write_contact_row(data, law, c, index - 4 * c, False)
+        world_sync(wp.static(lanes))
         # Batches of a unit a lane: every lane of the group takes part in each batch's generators.
         for batch in range((count + wp.static(lanes - 1)) // wp.static(lanes)):
             slot = batch * wp.static(lanes) + lane
@@ -1415,9 +1412,6 @@ def support_rows_kernel(
                         body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(
                             data, law, c
                         )
-                        # The unit's records by the contact law (the producer's, folded into the writer).
-                        for r in range(unit.rows):
-                            write_contact_row(data, law, c, r, False)
                         unit.art_a = data.art0[c]
                         unit.body_a = body_a
                         unit.art_b = data.art1[c]
