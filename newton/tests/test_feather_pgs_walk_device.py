@@ -186,14 +186,14 @@ def frame_points(walk: TreeWalk) -> np.ndarray:
 class DeviceWalk:
     """The device walk of trees of one topology (one path table), their data from their float32 walks."""
 
-    def __init__(self, walks: list, device, rows: int = 3, step: list | None = None):
+    def __init__(self, walks: list, device, rows: int = 3, step: list | None = None, frames: list | None = None):
         self.walks, self.device, self.rows = walks, device, rows
         self.n, self.bodies = walks[0].s.shape[0], walks[0].parent.size
         self.up_kernel, self.tree_kernel = walk_kernels(walks[0].path_table, rows)
         data, link = zip(*(walk.device_data() for walk in walks), strict=True)
         link = np.stack(link)
         # Each body's frame point (the trees' roots at the origin), at the refresh's poses: the link's frame.
-        self.frames = np.stack([frame_points(walk) for walk in walks])
+        self.frames = np.stack(frames if frames is not None else [frame_points(walk) for walk in walks])
         link[:, :, WALK_FRAME : WALK_FRAME + 3] = self.frames
         self.data = wp.array(np.stack(data), dtype=float, device=device)
         self.link = wp.array(link, dtype=float, device=device)
@@ -416,12 +416,18 @@ def chain_on_device(links: int, device) -> dict:
     model = scenes.long_chain(links=links, armature=0.0).build("cpu")
     joint_q = model.joint_q.numpy().astype(np.float64)
     n = int(model.joint_dof_count)
-    truth = TreeWalk(*local_frames(model, joint_q, 0), np.zeros(n))
-    walk32 = TreeWalk(*local_frames(model, joint_q, 0), np.zeros(n), dtype=np.float32)
+    parent, first, columns, inertia, offset = local_frames(model, joint_q, 0)
+    # The device walk holds each body's float32 frame point and forms its offset as the difference of two (WALK_LINK):
+    # the truth and the host's float32 walk take the chain of those offsets, so the bar measures the walk on its data.
+    frames = frame_points(TreeWalk(parent, first, columns, inertia, offset, np.zeros(n))).astype(np.float32)
+    offset = np.array([frames[up] - frames[b] if up >= 0 else np.zeros(3, np.float32) for b, up in enumerate(parent)])
+    offset = offset.astype(np.float64)
+    truth = TreeWalk(parent, first, columns, inertia, offset, np.zeros(n))
+    walk32 = TreeWalk(parent, first, columns, inertia, offset, np.zeros(n), dtype=np.float32)
     body, W = ground_contact(model, newton_state_body_q(model, joint_q), links)
     z64, _ = truth.up(body, W)
     dv64 = np.stack([truth.down(z64[:, r])[0] for r in range(3)], axis=1)
-    device_walk = DeviceWalk([walk32], device)
+    device_walk = DeviceWalk([walk32], device, frames=[frames])
     z = device_walk.up([0], [body], [int(truth.first[body + 1]) - 1], [0], [W.T], [np.zeros(3)])[0].T
     dv = device_walk.down([0, 0, 0], z.T)[0].T
     host32, _ = walk32.up(body, W.astype(np.float32))

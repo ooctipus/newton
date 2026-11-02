@@ -145,7 +145,7 @@ def body_wrench(walk: WalkTrees, body: int, direction: wp.vec3, point: wp.vec3, 
     if torque:
         return spin_seed(direction)
     j = walk.body_joint[body]
-    frame = wp.vec3(walk.link[j, 4], walk.link[j, 5], walk.link[j, 6])
+    frame = wp.vec3(walk.link[j, WALK_FRAME], walk.link[j, WALK_FRAME + 1], walk.link[j, WALK_FRAME + 2])
     return contact_seed(direction, point - frame)
 
 

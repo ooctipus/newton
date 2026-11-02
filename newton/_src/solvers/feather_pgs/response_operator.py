@@ -1630,7 +1630,7 @@ class LocalBlock(ResidualBlock):
 
         if self.staged:
             return walk_paths_prelude(
-                1, coordinate=self.coordinate_floats, link=self.link_floats, now=self.coordinate_floats, frame=3
+                1, coordinate=self.coordinate_floats, link=self.link_floats, now=self.coordinate_floats
             )
         return walk_paths_prelude(1)
 
@@ -1643,7 +1643,6 @@ class LocalBlock(ResidualBlock):
         staged velocity)."""
         from .tree_factor import (  # noqa: PLC0415 (tree_factor imports this module)
             WALK_COORDINATE,
-            WALK_FRAME,
             WALK_LINK,
             WALK_STAGED,
             WALK_UNPACKED,
@@ -1694,11 +1693,6 @@ class LocalBlock(ResidualBlock):
                 if self.wrenches
                 else []
             )
-            offset = (
-                f"walk.link.data[(size_t)(walk_j0 + b) * {WALK_LINK} + (k < 3 ? k : {WALK_FRAME} + k - 3)]"
-                if self.wrenches
-                else f"walk.link.data[(size_t)(walk_j0 + b) * {WALK_LINK} + k]"
-            )
             lines += [
                 "// The walk's data of the world's trees staged once (FL3_design section 4), every load in flight together:",
                 "// each coordinate's s, ut and 1 / ell unpacked (and the step's column the finish published), each body's link offset",
@@ -1710,9 +1704,11 @@ class LocalBlock(ResidualBlock):
                 f"    for (int k = 0; k < {WALK_STAGED}; ++k) s_walk[c * {C} + k] = r[k];",
                 *now,
                 "}",
-                f"for (int i = {lane}; i < walk_bodies * {K}; i += {L}) {{",
-                f"    const int b = i / {K}, k = i - b * {K};",
-                f"    s_walk[{self.dofs * C} + i] = {offset};",
+                f"for (int b = {lane}; b < walk_bodies; b += {L}) {{",
+                "    float l[6];",
+                f"    WALK_LOAD_LINK(l, walk.link.data + (size_t)walk_j0 * {WALK_LINK}, b,",
+                "                   reinterpret_cast<const int*>(walk.path.data + walk_j0)[2 * b]);",
+                f"    for (int k = 0; k < {K}; ++k) s_walk[{self.dofs * C} + b * {K} + k] = l[k];",
                 "}",
                 f"for (int i = {lane}; i < 2 * walk_bodies; i += {L})",
                 "    s_walk_path[i] = reinterpret_cast<const int*>(walk.path.data + walk_j0)[i];",
@@ -1740,8 +1736,11 @@ class LocalBlock(ResidualBlock):
                 if self.wrenches:
                     # The free body's own link: its frame point, where its step columns are shifted.
                     lines += [
-                        f"for (int k = {lane}; k < {K}; k += {L})",
-                        f"    s_walk[{self.dofs * C + B * K} + k] = walk.link.data[(size_t)free_j0 * {WALK_LINK} + (k < 3 ? k : {WALK_FRAME} + k - 3)];",
+                        f"if ({lane} == 0) {{",
+                        "    float l[6];",
+                        f"    WALK_LOAD_LINK(l, walk.link.data + (size_t)free_j0 * {WALK_LINK}, 0, -1);",
+                        f"    for (int k = 0; k < {K}; ++k) s_walk[{self.dofs * C + B * K} + k] = l[k];",
+                        "}",
                         f"const float* free_now = free_data + {WALK_STAGED};",
                         f"free_link = s_walk + {self.dofs * C + B * K};",
                         f"const float* free_now_link = walk.now_link.data + (size_t)free_j0 * {WALK_LINK};",

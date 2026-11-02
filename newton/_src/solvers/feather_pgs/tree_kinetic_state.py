@@ -1815,7 +1815,8 @@ _BORDER = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step
             }
             const int up = WALK_PARENT_OF(body);
             if (up >= 0) {
-                const float* const l = link + $link * body;
+                float l[6];
+                WALK_LOAD_LINK(l, link, body, up);
                 const float fx = p[0], fy = p[1], fz = p[2];
                 p[3] -= l[1] * fz - l[2] * fy;
                 p[4] -= l[2] * fx - l[0] * fz;
@@ -1920,10 +1921,10 @@ def walk_tree_prelude() -> DevicePrelude:
     """The predictor's border, for both devices: :func:`.tree_factor.walk_paths_prelude`'s path table and walks (the
     slips' paths read it) and the border's build (:data:`_BORDER`). The whole-tree walks are the class emitter's
     (:func:`walk_tree`)."""
-    from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_UNPACKED, walk_paths_prelude  # noqa: PLC0415
+    from .tree_factor import WALK_COORDINATE, WALK_UNPACKED, walk_paths_prelude  # noqa: PLC0415
 
     walk = walk_paths_prelude(1)
-    tree = substitute(_BORDER, coordinate=WALK_COORDINATE, link=WALK_LINK, unpacked=WALK_UNPACKED)
+    tree = substitute(_BORDER, coordinate=WALK_COORDINATE, unpacked=WALK_UNPACKED)
     return DevicePrelude("walk_tree", walk.source + "\n" + tree, cpu=walk.cpu + "\n" + tree)
 
 
@@ -1963,9 +1964,11 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
             if (x < nb) {
                 h.parent[k] = __ldg(path + 2 * x);
                 h.first[k] = __ldg(path + 2 * x + 1);
-                h.l[k][0] = __ldg(link + $link * x);
-                h.l[k][1] = __ldg(link + $link * x + 1);
-                h.l[k][2] = __ldg(link + $link * x + 2);
+                float l[6];
+                WALK_LOAD_LINK(l, link, x, h.parent[k]);
+                h.l[k][0] = l[0];
+                h.l[k][1] = l[1];
+                h.l[k][2] = l[2];
             } else {
                 h.parent[k] = -1;
                 h.first[k] = n;
@@ -2309,7 +2312,7 @@ def walk_up(cls, unroll: int = PREDICTOR_UNROLL, ahead: int | None = PREDICTOR_A
     step = Template(_UP_STEP).safe_substitute(coordinate=WALK_COORDINATE)
     joint = Template(_UP_JOINT).safe_substitute(link=WALK_LINK)
     inputs = {
-        "fetch_joint": f"WALK_RECORD(link + {WALK_LINK} * ($b))",
+        "fetch_joint": "WALK_LINK_IN(link, $b, $up)",
         "fetch_step": f"WALK_IN(data + {WALK_COORDINATE} * ($c), x[$c], 0.0f)",
         "touch_joint": f"WALK_TOUCH(link + {WALK_LINK} * ($b));",
         "touch_step": f"WALK_TOUCH(data + {WALK_COORDINATE} * ($c));",
@@ -2460,15 +2463,13 @@ def held_lambdas(layout: TreeLayout, slips: int) -> str:
     """The held walk's native lambdas (:data:`_HELD`) for the layout's words a lane, CUDA only, declared once ahead of the
     trial; nothing for a tree past two words a lane (:func:`_held_words`). ``slips`` is the class's slip capacity
     (:meth:`.tree_factor.TreeFactor.slip_capacity`): the build's lanes, one a slip, at most the segment's width."""
-    from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_UNPACKED  # noqa: PLC0415
+    from .tree_factor import WALK_COORDINATE, WALK_UNPACKED  # noqa: PLC0415
 
     words = _held_words(layout)
     if not words:
         return ""
     bound = max(1, min(slips, layout.lanes, 32))
-    lambdas = substitute(
-        _HELD, HOLD=words, SLIPS=bound, coordinate=WALK_COORDINATE, link=WALK_LINK, unpacked=WALK_UNPACKED
-    )
+    lambdas = substitute(_HELD, HOLD=words, SLIPS=bound, coordinate=WALK_COORDINATE, unpacked=WALK_UNPACKED)
     return f"#if defined(__CUDA_ARCH__)\n{lambdas}\n#endif\n"
 
 

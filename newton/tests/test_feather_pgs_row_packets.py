@@ -19,7 +19,7 @@ from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.field_group import SolverArrays
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, link_patch_routes, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
-from newton._src.solvers.feather_pgs.tree_factor import WALK_LINK, WalkTrees
+from newton._src.solvers.feather_pgs.tree_factor import WALK_FRAME, WALK_LINK, WalkTrees
 from newton.tests.feather_pgs_law_harness import group_rows, row_lines, row_velocity
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
@@ -186,7 +186,7 @@ def _walk_fixture(device, rng):
     walk = WalkTrees()
     joints = 3 * WORLDS
     link = np.zeros((joints, WALK_LINK), dtype=np.float32)
-    link[:, 4:7] = rng.normal(0.0, 0.5, (joints, 3))
+    link[:, WALK_FRAME : WALK_FRAME + 3] = rng.normal(0.0, 0.5, (joints, 3))
     walk.link = wp.array(link, dtype=float, device=device)
     walk.body_joint = wp.array(np.arange(joints, dtype=np.int32), dtype=int, device=device)
     walk.joint_start = wp.array(
@@ -202,7 +202,7 @@ def _seed_jacobian(packet, data, walk) -> np.ndarray:
     seeds, codes = packet.seed.numpy().astype(np.float64), packet.seed_body.numpy()
     motion, origin = data.motion.numpy().astype(np.float64), data.origin.numpy().astype(np.float64)
     mask, start = data.body_mask.numpy(), data.dof_start.numpy()
-    frames = walk.link.numpy()[:, 4:7].astype(np.float64)
+    frames = walk.link.numpy()[:, WALK_FRAME : WALK_FRAME + 3].astype(np.float64)
     out = np.full((WORLDS, PACKETS, PRIMARY + SECONDARY), np.nan)
     for w in range(WORLDS):
         for row in range(PACKETS):

@@ -1490,12 +1490,20 @@ class TreeWalk:
 
     def device_data(self) -> tuple[np.ndarray, np.ndarray]:
         """The walk's data as the device walks it (:func:`walk_prelude`), float32: each coordinate's record
-        (:func:`pack_walk_records` of ``s``, ``ut`` and ``1 / ell``), and each body's :data:`WALK_LINK` floats, the
-        offset to its parent's frame."""
+        (:func:`pack_walk_records` of ``s``, ``ut`` and ``1 / ell``), and each body's link (:data:`WALK_LINK`), its
+        frame point (:meth:`frame_points`)."""
         data = pack_walk_records(self.s, self.ut, 1.0 / self.ell, np.zeros(self.s.shape[0]))
         link = np.zeros((self.parent.size, WALK_LINK), dtype=np.float32)
-        link[:, 0:3] = self.offset
+        link[:, 0:3] = self.frame_points()
         return data, link
+
+    def frame_points(self) -> np.ndarray:
+        """Each body's frame point with the roots at the origin: its parent's less its offset (``[bodies, 3]``)."""
+        frames = np.zeros((self.parent.size, 3))
+        for b, up in enumerate(self.parent):
+            if up >= 0:
+                frames[b] = frames[up] - np.asarray(self.offset[b], dtype=np.float64)
+        return frames
 
     @property
     def path_table(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -1524,8 +1532,10 @@ floats (``s`` 6, ``ut`` 6, ``1 / ell``, ``P0``), through ``WALK_LOAD_RECORD``.""
 WALK_UNPACKED = 14
 """Floats of a coordinate's record unpacked (``WALK_LOAD_RECORD``): ``s`` 6, ``ut`` 6, ``1 / ell``, ``P0``."""
 
-WALK_LINK = 8
-"""Floats per body of the device walk's data: its parent's frame less its own, a pad, its frame's world point, a pad."""
+WALK_LINK = 4
+"""Floats per body of the device walk's data: its frame's world point and a pad, one aligned ``float4``. A walk forms a
+body's offset to its parent's frame from the two frame points (``WALK_LOAD_LINK``, ``WALK_LINK_IN``), the float32
+difference the refresh takes (``WALK_OFFSET``); the step's links (:attr:`WalkTrees.now_link`) take the same layout."""
 
 WALK_PIVOT = 13
 """Where a coordinate's unpacked record holds its pivot without ``K`` (:data:`WALK_UNPACKED`)."""
@@ -1574,8 +1584,8 @@ WALK_SLIP_BATCH = 8
 """The steps of a slip's transposed release a walk loads together (``WALK_SLIP_BACK``: the leave's, the audit's): one
 global round trip a batch of its path, in place of one a step."""
 
-WALK_FRAME = 4
-"""Where a body's record holds its frame's world point (:data:`WALK_LINK`), at the refresh's poses: the factor's
+WALK_FRAME = 0
+"""Where a body's link holds its frame's world point (:data:`WALK_LINK`), at the refresh's poses: the factor's
 inertias are taken there."""
 
 WALK_NOW = 6
@@ -1829,9 +1839,10 @@ $record_enter
 _WALK_LOADS = """#ifndef WALK_LOAD_RECORD
 // The walk's field groups and their loads, the one place the device layout lives (WALK_COORDINATE, WALK_LINK,
 // WALK_NOW): a coordinate's record, three aligned float4 (its column's non-zero half and 1 / ell; ut 0..3; ut 4..5, P0
-// and the side offset); a body's link, two float4 (its offset to its parent's frame, its frame point); a step column, 6
-// floats as three float2; a step link's frame point, one float4. Each fills a register array, one read-only vector load
-// (LDG.128, the global path; no walk writes them while a reader runs) a field group.
+// and the side offset); a body's link, its frame point, one float4, read with its parent's (WALK_LOAD_LINK(l, p, b, up):
+// l the offset to the parent's frame, the difference of the two points, WALK_OFFSET's (zero at a root), then the
+// frame point); a step column, 6 floats as three float2; a step link's frame point, one float4. Each fills a register
+// array, one read-only vector load (LDG.128, the global path; no walk writes them while a reader runs) a field group.
 // WALK_UNPACK(d, a, b, e, v): a record's three float4 a, b, e (and its side float4 v, zero without one) as the walk's
 // WALK_UNPACKED floats d: s (the half 1 / ell's sign bit names, the other half v's), ut, 1 / ell, P0. The half not
 // stored is zero: the same products as a stored zero's, up to the sign of a zero.
@@ -1856,12 +1867,12 @@ _WALK_LOADS = """#ifndef WALK_LOAD_RECORD
     }
 #define WALK_LOAD_PIVOT(p) __ldg((p) + 10)
 #define WALK_LOAD_INVERSE(p) fabsf(__ldg((p) + 3))
-#define WALK_LOAD_LINK(l, p)                                                                                    \
+#define WALK_LOAD_LINK(l, p, b, up)                                                                             \
     {                                                                                                          \
-        const float4* walk_q_ = reinterpret_cast<const float4*>(p);                                             \
-        const float4 walk_a_ = __ldg(walk_q_), walk_b_ = __ldg(walk_q_ + 1);                                                \
-        l[0] = walk_a_.x; l[1] = walk_a_.y; l[2] = walk_a_.z; l[3] = walk_a_.w;                                \
-        l[4] = walk_b_.x; l[5] = walk_b_.y; l[6] = walk_b_.z; l[7] = walk_b_.w;                                \
+        const float4 walk_f_ = __ldg(reinterpret_cast<const float4*>((p) + $link * (b)));                      \
+        const float4 walk_u_ = (up) >= 0 ? __ldg(reinterpret_cast<const float4*>((p) + $link * (up))) : walk_f_; \
+        l[0] = walk_u_.x - walk_f_.x; l[1] = walk_u_.y - walk_f_.y; l[2] = walk_u_.z - walk_f_.z;              \
+        l[3] = walk_f_.x; l[4] = walk_f_.y; l[5] = walk_f_.z;                                                  \
     }
 #define WALK_LOAD_COLUMN(S, p)                                                                                  \
     {                                                                                                          \
@@ -1892,11 +1903,29 @@ _WALK_LOADS_CPU = """#ifndef WALK_LOAD_RECORD
     }
 #define WALK_LOAD_PIVOT(p) ((p)[10])
 #define WALK_LOAD_INVERSE(p) __builtin_fabsf((p)[3])
-#define WALK_LOAD_LINK(l, p) { for (int walk_k_ = 0; walk_k_ < 8; ++walk_k_) l[walk_k_] = (p)[walk_k_]; }
+#define WALK_LOAD_LINK(l, p, b, up)                                                                             \
+    {                                                                                                          \
+        const float* walk_f_ = (p) + $link * (b);                                                              \
+        const float* walk_u_ = (up) >= 0 ? (p) + $link * (up) : walk_f_;                                       \
+        for (int walk_k_ = 0; walk_k_ < 3; ++walk_k_) {                                                        \
+            l[walk_k_] = walk_u_[walk_k_] - walk_f_[walk_k_];                                                  \
+            l[3 + walk_k_] = walk_f_[walk_k_];                                                                 \
+        }                                                                                                      \
+    }
 #define WALK_LOAD_COLUMN(S, p) { for (int walk_k_ = 0; walk_k_ < 6; ++walk_k_) S[walk_k_] = (p)[walk_k_]; }
 #define WALK_LOAD_POINT(f, p) { for (int walk_k_ = 0; walk_k_ < 4; ++walk_k_) f[walk_k_] = (p)[walk_k_]; }
 #endif"""
 """The CPU twin of :data:`_WALK_LOADS`: each prelude carries its device's text under the snippet's one guard."""
+
+
+WALK_LINK_FRAME = 3
+"""Where a body's link, as a walk reads it (``WALK_LOAD_LINK``'s registers, or a kernel's staged copy), holds its frame
+point: after its offset to its parent's frame."""
+
+
+def _walk_loads_text(cuda: bool) -> str:
+    """The loads text (:data:`_WALK_LOADS`, or its CPU twin) at the device layout."""
+    return substitute(_WALK_LOADS if cuda else _WALK_LOADS_CPU, link=WALK_LINK)
 
 
 def _walk_loads(coordinate: int, link: int, now: int) -> dict[str, str]:
@@ -1911,10 +1940,10 @@ def _walk_loads(coordinate: int, link: int, now: int) -> dict[str, str]:
             return f"{pad}float d[{WALK_UNPACKED}];\n{pad}WALK_LOAD_RECORD(d, data + {WALK_COORDINATE} * c);"
         return f"{pad}const float* d = data + {coordinate} * c;"
 
-    def body_link(indent):
+    def body_link(indent, up):
         pad = " " * indent
         if link == WALK_LINK:
-            return f"{pad}float l[{WALK_LINK}];\n{pad}WALK_LOAD_LINK(l, link + {WALK_LINK} * b);"
+            return f"{pad}float l[6];\n{pad}WALK_LOAD_LINK(l, link, b, {up});"
         return f"{pad}const float* l = link + {link} * b;"
 
     if device:
@@ -1929,8 +1958,8 @@ def _walk_loads(coordinate: int, link: int, now: int) -> dict[str, str]:
         "record_c": record(16),
         "record_seed": record(8),
         "record_enter": record(16),
-        "link_b": body_link(12),
-        "link_twist": body_link(8),
+        "link_b": body_link(12, "WALK_PARENT_OF(b)"),
+        "link_twist": body_link(8, "up"),
         "column_c": column,
         "point_b": point,
     }
@@ -1970,20 +1999,20 @@ def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int) -> 
         _WALK,
         rows=rows,
         now=WALK_NOW,
-        frame=WALK_FRAME,
+        frame=WALK_LINK_FRAME,
         batch=WALK_SLIP_BATCH,
         **_walk_loads(WALK_COORDINATE, WALK_LINK, WALK_NOW),
     )
     return DevicePrelude(
         f"walk_{rows}_{len(parent)}",
-        _WALK_LOADS + "\n" + substitute(_WALK_TABLE, table) + "\n" + walk,
-        cpu=_WALK_LOADS_CPU + "\n" + substitute(_WALK_TABLE_CPU, table) + "\n" + walk,
+        _walk_loads_text(cuda=True) + "\n" + substitute(_WALK_TABLE, table) + "\n" + walk,
+        cpu=_walk_loads_text(cuda=False) + "\n" + substitute(_WALK_TABLE_CPU, table) + "\n" + walk,
     )
 
 
 @functools.cache
 def walk_paths_prelude(
-    rows: int, *, coordinate: int = WALK_COORDINATE, link: int = WALK_LINK, now: int = WALK_NOW, frame: int = WALK_FRAME
+    rows: int, *, coordinate: int = WALK_COORDINATE, link: int = WALK_LINK, now: int = WALK_NOW
 ) -> DevicePrelude:
     """The device walk of any tree, for both devices: :func:`walk_prelude`'s functions over a path table in global
     memory, one tree at a time (``WALK_TREE(path, bodies, coordinates)`` before its walks), the table
@@ -1992,9 +2021,9 @@ def walk_paths_prelude(
 
     Args:
         rows: The rows a lane walks together (:func:`walk_prelude`).
-        coordinate: Floats a coordinate's record, ``link`` a body's (its frame point at ``frame``) and ``now`` a step
-            column's: the device walk's layout (:data:`WALK_COORDINATE`, :data:`WALK_LINK`, :data:`WALK_FRAME`,
-            :data:`WALK_NOW`), or a kernel's staged copy of it
+        coordinate: Floats a coordinate's record, ``link`` a body's and ``now`` a step column's: the device walk's
+            layout (:data:`WALK_COORDINATE`, :data:`WALK_LINK`, :data:`WALK_NOW`), or a kernel's staged copy of it, a
+            body's link unpacked (its offset, then its frame point at :data:`WALK_LINK_FRAME`)
             (:class:`.response_operator.LocalBlock`: a coordinate's step column interleaved after its
             :data:`WALK_STAGED` floats, so ``now == coordinate``). The step's frame points (``now_link``) are read
             at :data:`WALK_LINK`'s layout wherever the rest is.
@@ -2008,16 +2037,18 @@ def walk_paths_prelude(
             _WALK,
             rows=rows,
             now=now,
-            frame=frame,
+            frame=WALK_LINK_FRAME,
             batch=WALK_SLIP_BATCH,
             **_walk_loads(coordinate, link, now),
         )
     )
-    layout = (coordinate, link, now, frame)
+    layout = (coordinate, link, now)
     name = f"walk_paths_{rows}" + (
-        "" if layout == (WALK_COORDINATE, WALK_LINK, WALK_NOW, WALK_FRAME) else f"_{coordinate}_{link}_{now}_{frame}"
+        "" if layout == (WALK_COORDINATE, WALK_LINK, WALK_NOW) else f"_{coordinate}_{link}_{now}"
     )
-    return DevicePrelude(name, _WALK_LOADS + "\n" + walk, cpu=_WALK_LOADS_CPU + "\n" + walk)
+    return DevicePrelude(
+        name, _walk_loads_text(cuda=True) + "\n" + walk, cpu=_walk_loads_text(cuda=False) + "\n" + walk
+    )
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -2147,7 +2178,8 @@ class WalkClass:
             width: Floats of a body's state.
             cuda: The CUDA text (its tables in constant memory) or its CPU twin.
             unroll: Coordinates up to which the walk is straight-line code (:data:`WALK_UNROLL`).
-            fetch_joint: Body ``$b``'s joint inputs (an expression), read by ``joint`` as ``$L``; none if empty.
+            fetch_joint: Body ``$b``'s joint inputs (an expression; ``$up`` its parent), read by ``joint`` as ``$L``; none
+                if empty.
             fetch_step: Coordinate ``$c``'s step inputs (an expression), read by ``step`` as ``$X``; none if empty.
             touch_joint: Body ``$b``'s statement asking L1 for its joint inputs' lines (a hint, no register).
             touch_step: Coordinate ``$c``'s statement asking L1 for its step inputs' lines.
@@ -2179,12 +2211,12 @@ class WalkClass:
 
             def fetch(item):
                 kind, index = item
-                text = _fill(fetch_joint, b=index) if kind == "l" else _fill(fetch_step, c=index)
+                text = _fill(fetch_joint, b=index, up=self.parent[index]) if kind == "l" else _fill(fetch_step, c=index)
                 return [f"const auto walk_{kind}{index} = {text};"] if text else []
 
             def touched(item):
                 kind, index = item
-                text = _fill(touch_joint, b=index) if kind == "l" else _fill(touch_step, c=index)
+                text = _fill(touch_joint, b=index, up=self.parent[index]) if kind == "l" else _fill(touch_step, c=index)
                 return [text] if text else []
 
             def take(item):
@@ -2257,7 +2289,8 @@ class WalkClass:
         def fetched(j, at):
             out = []
             if fetch_joint:
-                out.append(f"walk_l{j} = {_fill(fetch_joint, b=f'({name}_STEP[{at}] & 0xffff)')};")
+                body = f"({name}_STEP[{at}] & 0xffff)"
+                out.append(f"walk_l{j} = {_fill(fetch_joint, b=body, up=f'{name}_PARENT[{body}]')};")
             if fetch_step:
                 out.append(
                     f"walk_x{j} = {_fill(fetch_step, c=f'(({name}_COORDINATE[{at}]) < 0 ? 0 : {name}_COORDINATE[{at}])')};"
@@ -2270,7 +2303,8 @@ class WalkClass:
         def touched(at):
             out = []
             if touch_joint:
-                out.append(_fill(touch_joint, b=f"({name}_STEP[{at}] & 0xffff)"))
+                body = f"({name}_STEP[{at}] & 0xffff)"
+                out.append(_fill(touch_joint, b=body, up=f"{name}_PARENT[{body}]"))
             if touch_step:
                 out.append(_fill(touch_step, c=f"(({name}_COORDINATE[{at}]) < 0 ? 0 : {name}_COORDINATE[{at}])"))
             return out
@@ -2301,7 +2335,7 @@ class WalkClass:
             if not depth:
                 names = {"L": "walk_l", "X": "walk_x"}
                 if fetch_joint:
-                    lines.append(f"const auto walk_l = {_fill(fetch_joint, b='b')};")
+                    lines.append(f"const auto walk_l = {_fill(fetch_joint, b='b', up=f'{name}_PARENT[b]')};")
                 if fetch_step:
                     lines.append(f"const auto walk_x = {_fill(fetch_step, c='(c < 0 ? 0 : c)')};")
             if root_first:
@@ -2368,6 +2402,18 @@ _WALK_ACCESS = """    // The walk's loads, and a lane group's fetch of a byte ra
     const auto WALK_RECORD = [&](const float* p) -> float4 { return *reinterpret_cast<const float4*>(p); };
     const auto WALK_BITS = [](const float x) -> int { return __float_as_int(x); };
     const auto WALK_ABS = [](const float x) -> float { return fabsf(x); };
+    // WALK_LINK_IN(link, b, up): body b's offset to its parent up's frame (zero at a root, up < 0), the difference of
+    // the two frame points the links hold (WALK_LINK floats a body): the refresh's WALK_OFFSET, the same float32
+    // subtraction. The parent's line is the one its own joint read.
+    const auto WALK_LINK_IN = [&](const float* link, const int b, const int up) -> float4 {
+        const float4 f = WALK_RECORD(link + $link * b);
+        float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (up >= 0) {
+            const float4 p = WALK_RECORD(link + $link * up);
+            o = make_float4(p.x - f.x, p.y - f.y, p.z - f.z, 0.0f);
+        }
+        return o;
+    };
     // A walk's step input (WALK_IN): a coordinate's s (s, t.xy), ut (t.zw, w) and 1 / ell (e), and the caller's
     // two values: the step's input (u) and the prior value its output updates (p).
     struct WalkIn {
@@ -2392,6 +2438,15 @@ _WALK_ACCESS_CPU = """    struct WalkRecord {
     const auto WALK_RECORD = [&](const float* p) -> WalkRecord { return WalkRecord{p[0], p[1], p[2], p[3]}; };
     const auto WALK_BITS = [](const float x) -> int { return __builtin_bit_cast(int, x); };
     const auto WALK_ABS = [](const float x) -> float { return __builtin_fabsf(x); };
+    const auto WALK_LINK_IN = [&](const float* link, const int b, const int up) -> WalkRecord {
+        const WalkRecord f = WALK_RECORD(link + $link * b);
+        WalkRecord o{0.0f, 0.0f, 0.0f, 0.0f};
+        if (up >= 0) {
+            const WalkRecord p = WALK_RECORD(link + $link * up);
+            o = WalkRecord{p.x - f.x, p.y - f.y, p.z - f.z, 0.0f};
+        }
+        return o;
+    };
     struct WalkIn {
         WalkRecord s, t, w;
         float e, u, p;
@@ -2428,8 +2483,8 @@ _DOWN_IN = """    // WALK_IN(d, u, p): coordinate record d's step input and the 
         return in;
     };"""
 
-_DOWN_FETCH_JOINT = "WALK_RECORD(link + $link * ($b))"
-"""A body's joint input in the walk down: its link (the offset to its parent's frame)."""
+_DOWN_FETCH_JOINT = "WALK_LINK_IN(link, $b, $up)"
+"""A body's joint input in the walk down: its offset to its parent's frame (``WALK_LINK_IN``)."""
 
 _DOWN_FETCH_STEP = "WALK_IN(data + $coordinate * ($c), u($c), prior($c))"
 """A coordinate's step input in the walk down: its record, its ``u`` and its output's prior value."""
@@ -2464,7 +2519,7 @@ _DOWN_STEP = """{
 def _walk_down(classes: tuple[WalkClass, ...], cuda: bool, unroll: int, ahead: int | None) -> str:
     joint = Template(_DOWN_JOINT).safe_substitute(link=WALK_LINK)
     step = Template(_DOWN_STEP).safe_substitute(coordinate=WALK_COORDINATE)
-    fetch_joint = Template(_DOWN_FETCH_JOINT).safe_substitute(link=WALK_LINK)
+    fetch_joint = _DOWN_FETCH_JOINT
     fetch_step = Template(_DOWN_FETCH_STEP).safe_substitute(coordinate=WALK_COORDINATE)
     bodies = [
         walk.walk(
@@ -2541,8 +2596,8 @@ def walk_down_prelude(
     ).hexdigest()[:8]
     return DevicePrelude(
         f"walk_down_{tag}",
-        _WALK_ACCESS + "\n" + _walk_down(classes, True, unroll, ahead),
-        cpu=_WALK_ACCESS_CPU + "\n" + _walk_down(classes, False, unroll, ahead),
+        substitute(_WALK_ACCESS, link=WALK_LINK) + "\n" + _walk_down(classes, True, unroll, ahead),
+        cpu=substitute(_WALK_ACCESS_CPU, link=WALK_LINK) + "\n" + _walk_down(classes, False, unroll, ahead),
     )
 
 
@@ -3046,7 +3101,7 @@ _REFRESH = """    // The refresh's arithmetic on one tree, float32 (TreeWalk's i
     // symmetric (A 00 01 02 11 12 22, B row-major 3x3, D 00 01 02 11 12 22), in registers.
     //   BODY(j, up, r): body j's inertia at its frame [m 1, -m X; m X, R I R^T - m X X] (X the skew of c, its centre of
     //     mass less its frame) as words m, m c, rot, and its link offset d (WALK_OFFSET from its parent's frame point,
-    //     up's, and its own); its link row (d, its frame point) becomes the factor's.
+    //     up's, and its own); its frame point becomes the factor's link (every walk forms d from the two points).
     //   ADD(h, r): h += body r's inertia.
     //   STEP(h, s, c): coordinate c of column s (s 6, R, R + K): Is = h s, own = s . Is, 1/ell = (own + R + K)^-1/2,
     //     ut = Is / ell, P0 = own + R, h -= ut ut^T; its record (s by its half, ut, 1/ell, P0) leaves whole, once.
@@ -3107,11 +3162,9 @@ _REFRESH = """    // The refresh's arithmetic on one tree, float32 (TreeWalk's i
         WALK_OFFSET(up >= 0 ? Lk + $link * up + $frame : nullptr, Lr + $frame, offset);
         for (int k = 0; k < 3; ++k) r[OFFSET + k] = offset[k];
 #if defined(__CUDA_ARCH__)
-        reinterpret_cast<float4*>(Lo + $link * j)[0] = make_float4(offset[0], offset[1], offset[2], Lr[3]);
-        reinterpret_cast<float4*>(Lo + $link * j)[1] = reinterpret_cast<const float4*>(Lr)[1];
+        reinterpret_cast<float4*>(Lo + $link * j)[0] = reinterpret_cast<const float4*>(Lr)[0];
 #else
-        for (int k = 0; k < 3; ++k) Lo[$link * j + k] = offset[k];
-        for (int k = 3; k < $link; ++k) Lo[$link * j + k] = Lr[k];
+        for (int k = 0; k < $link; ++k) Lo[$link * j + k] = Lr[k];
 #endif
         const int b = Ct[j];
         const float* q = Qb + 7 * b;
@@ -3175,7 +3228,7 @@ _REFRESH = """    // The refresh's arithmetic on one tree, float32 (TreeWalk's i
             const bool turns = s[3] != 0.0f || s[4] != 0.0f || s[5] != 0.0f;
             const bool both = WALK_SIDE != 0 && turns && (s[0] != 0.0f || s[1] != 0.0f || s[2] != 0.0f);
             const int side = both ? WALK_SIDE : 0;
-            const float* half = turns ? s + 3 : s;
+            const float half[3] = {turns ? s[3] : s[0], turns ? s[4] : s[1], turns ? s[5] : s[2]};
 #if defined(__CUDA_ARCH__)
             float4* o4 = reinterpret_cast<float4*>(o);
             o4[0] = make_float4(half[0], half[1], half[2], turns ? -inv : inv);

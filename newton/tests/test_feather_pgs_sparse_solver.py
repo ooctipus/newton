@@ -17,7 +17,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
 from newton._src.solvers.feather_pgs.staging import arch_budget
-from newton._src.solvers.feather_pgs.tree_factor import unpack_walk_records
+from newton._src.solvers.feather_pgs.tree_factor import WALK_FRAME, unpack_walk_records
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import unpacked_rows
 
@@ -242,7 +242,10 @@ def _walk_inverse(solver, art: int) -> np.ndarray:
     path = factor.walk_path_host[j0:j1]
     n = int(solver.forest.articulation_dof_count.numpy()[art])
     data = unpack_walk_records(factor.walk_data.numpy(), d0 + n)[d0:].astype(np.float64)
-    link = factor.walk_link.numpy()[j0:j1].astype(np.float64)
+    # Each body's offset to its parent's frame, as the walk forms it: the float32 difference of the two frame points.
+    frames = factor.walk_link.numpy()[j0:j1, WALK_FRAME : WALK_FRAME + 3]
+    link = np.array([frames[p] - frames[b] if p >= 0 else np.zeros(3, np.float32) for b, p in enumerate(path[:, 0])])
+    link = link.astype(np.float64)
     first = [int(f) for f in path[:, 1]] + [n]
     inverse = np.zeros((n, n))
     for i in range(n):
