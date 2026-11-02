@@ -57,15 +57,13 @@ def _kappa(solver, joint_q: np.ndarray) -> tuple[int, float]:
 
 
 def walked_coordinates(solver) -> np.ndarray:
-    """The coordinates whose trees the walk holds: every articulation's but a free rigid body's, which keeps its 6x6
-    factor until the free bodies convert (FL3.3 stage two C walks them)."""
-    model, view = solver.model, solver.factor.walk_view()
+    """The coordinates whose trees the walk holds (:attr:`.tree_factor.TreeFactor.walk_arts`): every responding
+    articulation's, a free rigid body's six coordinates included."""
+    model = solver.model
     starts, qd = model.articulation_start.numpy(), model.joint_qd_start.numpy()
-    free = view.free.numpy()
     mask = np.zeros(int(model.joint_dof_count), dtype=bool)
-    for art in range(int(model.articulation_count)):
-        if not free[art]:
-            mask[qd[starts[art]] : qd[starts[art + 1]]] = True
+    for art in solver.factor.walk_arts.numpy().tolist():
+        mask[qd[starts[art]] : qd[starts[art + 1]]] = True
     return mask
 
 

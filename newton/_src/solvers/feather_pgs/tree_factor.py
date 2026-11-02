@@ -904,22 +904,6 @@ class TreeFactor:
                 dof_body[qd_start[j] : qd_start[j + 1]] = j - j0
         joints, dofs = max(int(model.joint_count), 1), max(int(model.joint_dof_count), 1)
         self.walk_arts = wp.array(arts, dtype=wp.int32, device=device)
-        # Each world's walked trees (CSR, by world): the one writer's lanes of a world release its trees' slips.
-        world_of = forest.articulation_world[arts]
-        in_world = world_of >= 0
-        by_world = np.argsort(world_of[in_world], kind="stable")
-        self.walk_world_arts = wp.array(
-            np.asarray(arts[in_world][by_world], dtype=np.int32).reshape(-1)
-            if in_world.any()
-            else np.zeros(1, np.int32),
-            dtype=wp.int32,
-            device=device,
-        )
-        self.walk_world_start = wp.array(
-            host_index.offsets(np.bincount(world_of[in_world], minlength=forest.world_count), dtype=np.int32),
-            dtype=wp.int32,
-            device=device,
-        )
         # A tree's lane group in the step's walk kernel (walk_step_kernel): a lane a row of the inward pass's 6x6
         # algebra on CUDA, one thread a tree on the CPU.
         self.walk_lanes = WALK_LANES if device.is_cuda else 1
@@ -969,22 +953,28 @@ class TreeFactor:
         )
         self.walk_trees = view
 
-    def slip_capacity(self, articulations) -> int:
-        """The most drives of one of ``articulations`` that can slip, at most :data:`RELEASE_SLIPS`: its driven
-        coordinates with a gain and a finite effort limit (the model's data at construction). A tree's border holds that
-        many; 0 where none can slip, so a consumer compiles no release."""
+    def slips_by_tree(self, articulations) -> np.ndarray:
+        """Each of ``articulations``' drives that can slip: its driven coordinates with a gain and a finite effort
+        limit (the model's data at construction)."""
         model, forest = self.model, self.forest
+        arts = np.asarray(articulations, dtype=np.int64)
         if not self.parallel_drives or not model.joint_dof_count:
-            return 0
+            return np.zeros(arts.size, dtype=np.int64)
         ke, kd = model.joint_target_ke.numpy(), model.joint_target_kd.numpy()
         damping, limit = self.passive_joint_damping.numpy(), model.joint_effort_limit.numpy()
         driven = self.drive_row_by_dof.numpy() >= 0
         limited = driven & ((ke > 0) | (kd > 0) | (damping > 0)) & (limit > 0) & np.isfinite(limit)
         starts, counts = forest.articulation_dof_start_host, forest.articulation_dof_count_host
-        slips = 0
-        for art in np.asarray(articulations, dtype=np.int64).tolist():
-            slips = max(slips, int(np.count_nonzero(limited[starts[art] : starts[art] + counts[art]])))
-        return min(slips, RELEASE_SLIPS)
+        return np.array(
+            [int(np.count_nonzero(limited[starts[a] : starts[a] + counts[a]])) for a in arts.tolist()], dtype=np.int64
+        )
+
+    def slip_capacity(self, articulations) -> int:
+        """The most drives of one of ``articulations`` that can slip (:meth:`slips_by_tree`), at most
+        :data:`RELEASE_SLIPS`. A tree's border holds that many; 0 where none can slip, so a consumer compiles no
+        release."""
+        slips = self.slips_by_tree(articulations)
+        return min(int(slips.max(initial=0)), RELEASE_SLIPS)
 
     def walk_view(self) -> WalkTrees:
         """The walk's view (:class:`WalkTrees`) the one writer, the leave and the audit read."""

@@ -2018,20 +2018,6 @@ def factor_whiten(L: wp.array3d[float], factor: int, x: wp.spatial_vector) -> wp
     return z
 
 
-@wp.func
-def factor_leave(L: wp.array3d[float], factor: int, u: wp.spatial_vector) -> wp.spatial_vector:
-    """``v = P^T L^-T u``: rows descending, each ``u`` less the later rows' terms in order, over its pivot."""
-    v = wp.spatial_vector()
-    for step in range(6):
-        row = 5 - step
-        value = u[5 - row]
-        for k in range(row + 1, 6):
-            value -= L[factor, k, row] * v[5 - k]
-        pivot = L[factor, row, row]
-        v[5 - row] = wp.where(pivot != 0.0, value / pivot, 0.0)
-    return v
-
-
 @wp.kernel
 def populate_world_J_for_size(
     data: ContactInput,
