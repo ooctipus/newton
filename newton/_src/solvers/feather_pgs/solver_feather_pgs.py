@@ -736,10 +736,11 @@ class SolverFeatherPGS(SolverBase):
         # Scalar branches take a diagonal-mass group of world-fixed roots over one-coordinate leaves (scalar_branches.py),
         # which the held-tree owner then publishes: the compact diagonal's admission planned them.
         self._scalar_branches, self._scalar_branches_reason = plan_scalar_branches(self)
-        # The walk is the trees' factor (Z4): the predictor solves every responding tree by it, the placements that
-        # walk read it for their rows and leave, and the border decides a slipping tree's step on it. A scalar branch
-        # predicts and decides in its own kernels (scalar_branches.py) and takes no walk.
-        responding = np.flatnonzero(self.forest.response_dof_count > 0)
+        # The walk is the trees' factor (Z4): the predictor solves every tree of its groups by it, a prescribed tree
+        # beside a responding one in a size group included (the dense factor held it before Z4.2), the placements
+        # that walk read it for their rows and leave, and the border decides a slipping tree's step on it. A scalar
+        # branch predicts and decides in its own kernels (scalar_branches.py) and takes no walk.
+        responding = np.flatnonzero(self.forest.articulation_dof_count_host > 0)
         if self._scalar_branches is not None:
             responding = np.setdiff1d(responding, self.forest.group_to_art_host[self._scalar_branches.size])
         if responding.size:
