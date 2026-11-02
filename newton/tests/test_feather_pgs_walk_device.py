@@ -121,7 +121,8 @@ _TREE = """    if (tid >= u.shape[0]) return;
     float* out = qd.data + (size_t)tid * n;
     float* twists = twist.data + (size_t)tid * bodies * 6;
     WALK_DOWN(
-        0, d, l, [&](const int c) -> float { return in[c]; }, [&](const int c, const float q) { out[c] = q; },
+        0, d, l, [&](const int c) -> float { return in[c]; }, [](const int) -> float { return 0.0f; },
+        [&](const int c, const float q, const float) { out[c] = q; },
         [&](const int b, const float* V) {
             for (int k = 0; k < 6; ++k) twists[6 * b + k] = V[k];
         });
