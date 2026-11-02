@@ -749,17 +749,26 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
         const float* now_link = walk.now_link.data + (size_t)j0 * $link;
         const float* vh = sink.v_hat.data + d0;
         const auto rank = [&](int c) -> int { return base + POPC(mask & ((1ull << SUPPORT_NODE[c]) - 1ull)); };
+        // A coordinate's footprints leave together after its last row (the walk gives each coordinate's rows in
+        // turn): no store between a coordinate's rows, so the walk's loads of that coordinate serve all its rows.
+        float footprint[$rows];
         const auto store = [&](int r, int c, float z, float) {
-            if (r >= rows) return;
-            float* entry = Z + r * S + rank(c);
-            if (add) {
-                *entry += z;
-                return;
+            if (r < rows) {
+                footprint[r] = z;
+                if (!add) {
+                    norm[r] += z * z;
+                    zc[r] = z;
+                }
             }
-            *entry = z;
-            norm[r] += z * z;
-            zc[r] = z;
-            if (r == $last) gram();
+            if (r != $last) return;
+            float* entry = Z + rank(c);
+            for (int k = 0; k < rows; ++k) {
+                if (add)
+                    entry[k * S] += footprint[k];
+                else
+                    entry[k * S] = footprint[k];
+            }
+            if (!add && rows == $rows) gram();
         };
         float p[6 * $rows], w[6 * $rows];
         if (covector) {
