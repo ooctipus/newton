@@ -26,7 +26,6 @@ from newton._src.solvers.feather_pgs import keyed_rows
 # new producer kernel here: a launched builder missing from this list is invisible to the check below.
 ROW_BUILDER_KERNELS = frozenset(
     (
-        "write_contact_units",
         "write_walked_rows",
         "write_slot_rows",
         "populate_world_J_for_size",

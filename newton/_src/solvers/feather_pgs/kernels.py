@@ -36,6 +36,7 @@ from .contact_laws import (
     spin_entry,
 )
 from .dense_rows import (
+    UNIT_CONTACT,
     UNIT_LIMIT,
     UNIT_LINK,
     UNIT_MIMIC,
@@ -1497,8 +1498,12 @@ def allocate_world_contact_slots(
     mf_dropped_contact_rows: wp.array[int],
     dense_first_rejected_slot: wp.array[int],
     mf_first_rejected_slot: wp.array[int],
+    units: wp.array2d[int],
 ):
     """Classify and allocate the rows of every active contact, with work proportional to the materialized prefix.
+
+    Where the one writer takes the rows (``units`` holds the placement's unit sources; empty otherwise), each dense
+    row's unit source is written with its slot: the contact's rows are the writer's to fill.
 
     A contact admitted by :func:`_admit_contact` reserves 1 slot for the normal row and, when enabled below the
     friction gap threshold (and, under persistent patches, for a loaded anchor), 2 adjacent slots for the friction
@@ -1603,6 +1608,9 @@ def allocate_world_contact_slots(
         data.art0[c] = art_a
         data.art1[c] = art_b
         data.path[c] = is_mf
+        if is_mf == 0 and units.shape[0] > 0:
+            for r in range(slots_needed):
+                units[data.first[world], slot + r] = unit_source(UNIT_CONTACT, 4 * c + r)
 
 
 # The allocator above reserves each contact's rows with an atomic on its world's counter, so on CUDA a
@@ -1758,13 +1766,16 @@ def place_world_contact_runs(
     global_lead: int,
     global_trail_start: int,
     lanes: int,
+    dense_first: wp.array[int],
     # outputs
     run_first: wp.array2d[int],
     run_last: wp.array2d[int],
     run_rows: wp.array2d[wp.vec2i],
     contact_slot: wp.array[int],
+    units: wp.array2d[int],
 ):
-    """Place each world's recorded contact runs in block order and reset the records for the next step.
+    """Place each world's recorded contact runs in block order and reset the records for the next step, with each
+    placed dense row's unit source where ``units`` holds the one writer's (:func:`allocate_world_contact_slots`).
 
     Launched over ``(world_count, lanes)``: one complete warp per world on CUDA (``lanes`` 32),
     one thread on CPU (``lanes`` 1). Each family's runs start at the slot where the allocator's
@@ -1803,6 +1814,9 @@ def place_world_contact_runs(
             mf_below = warp_scan(mf)
             if dense > 0:
                 contact_slot[c] = next_dense + dense_below
+                if units.shape[0] > 0:
+                    for r in range(dense):
+                        units[dense_first[world], next_dense + dense_below + r] = unit_source(UNIT_CONTACT, 4 * c + r)
             if mf > 0:
                 contact_slot[c] = next_mf + mf_below
             next_dense += warp_sum(dense)

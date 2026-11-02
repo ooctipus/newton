@@ -70,6 +70,7 @@ def _allocator_arrays(capacity, *, route=0, count=205, device="cpu"):
         "dense_first_rejected_slot": integers([2**31 - 1]),
         "mf_first_rejected_slot": integers([2**31 - 1]),
         "capacity_status": zeros(2),
+        "units": wp.zeros((0, 0), dtype=wp.int32, device=device),
     }
 
 

@@ -168,6 +168,7 @@ def _allocate(kernel, resolved, patch_friction=False):
         "mf_dropped_contact_rows": integers([0, 0]),
         "dense_first_rejected_slot": integers([2**31 - 1] * 2),
         "mf_first_rejected_slot": integers([2**31 - 1] * 2),
+        "units": wp.zeros((0, 0), dtype=wp.int32, device="cpu"),
     }
     data, _arrays = contact_input(arrays, "cpu")
     values = {**arrays, "data": data}

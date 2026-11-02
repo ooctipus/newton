@@ -66,7 +66,7 @@ from .kernel_template import THREADS, KernelTemplate, python_kernel
 from .kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT, free_body_contact, free_body_contact_records, row_bias
 from .projection_laws import friction_pair_metric
 from .response_builds_rows import close_block, close_row, free_body_row_header
-from .row_build import write_contact_row
+from .row_build import write_contact_records, write_contact_row
 from .row_laws import LINK_ROWS
 from .solver_fields import Preelim
 from .sparse_mass_matrix import _SparseRowSupport
@@ -91,7 +91,6 @@ __all__ = [
     "support_publish_kernel",
     "support_rows_kernel",
     "walked_rows_kernel",
-    "write_contact_units",
     "write_free_body_rows",
     "write_slot_rows",
     "writer_kernel",
@@ -242,23 +241,6 @@ def release_side(
     at = jacobian_row(support, group, art, sides)
     for j in range(walk.release.count[art]):
         release_path(walk.release, art, j, packed_Z, at[0], slot, at[1])
-
-
-@wp.kernel(enable_backward=False)
-def write_contact_units(data: ContactInput, total_threads: int, law: PatchRowLaw, units: wp.array2d[int]):
-    """Each dense contact row's records (:func:`.row_build.write_contact_row`) and unit source, four threads a contact
-    (grid-stride): its rows are those its allocation reserved (``slots_needed``: the normal, the friction pair, the spin
-    row)."""
-    tid = wp.tid()
-    r = tid % 4
-    for c in range(tid // 4, data.count[0], total_threads // 4):
-        if data.path[c] != 0:
-            continue
-        slot = data.slot[c]
-        if slot < 0 or r >= data.slots_needed[c]:
-            continue
-        write_contact_row(data, law, c, r, False)
-        units[data.first[data.world[c]], slot + r] = unit_source(UNIT_CONTACT, 4 * c + r)
 
 
 @wp.kernel(enable_backward=False)
@@ -459,8 +441,12 @@ def write_row(
     if kind == UNIT_CONTACT:
         c = index // 4
         r = index - 4 * c
-        body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
-        direction, row_point = contact_row_frame(r, normal, tangent0, tangent1, point, friction_point)
+        # The row's records by the contact law (the producer's, folded into the writer), then its seeds.
+        body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
+        _a, _b, direction, row_point = write_contact_records(
+            data, law, c, r, False, body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point
+        )
+        sides = rows.sides[line, slot]
         spin = r == CONTACT_SPIN_ROW
         art_a = data.art0[c]
         art_b = data.art1[c]
@@ -1353,8 +1339,9 @@ def support_rows_kernel(
     coordinate ``node`` (the support masks' bit) are baked into constant memory. A contact unit of three rows (four
     under contact ``torsion``) is walked together and its Gram writes its block record where ``records`` (the
     triplet sweeps'); a unit of one row (a normal alone, a limit, a velocity limit, a mimic) by the one-row walker. Each
-    row's records and unit source are the producers' (:func:`write_contact_units`, the limit, velocity-limit and
-    mimic producers); the writer stores its footprints at their ranks in its support (``row_factor``, with the
+    contact row's records are written here by the contact law, its unit source where its slot is reserved
+    (:func:`.kernels.allocate_world_contact_slots`); a joint row's records and unit source are its producer's (the
+    limit, velocity-limit and mimic producers); the writer stores its footprints at their ranks in its support (``row_factor``, with the
     coordinates ``row_dof`` or the support class ``row_class``), its diagonal ``|z|^2 + cfm``, its incident ``J v_hat``
     and its rhs by the row law (:func:`.kernels.row_bias`).
     """
@@ -1421,9 +1408,15 @@ def support_rows_kernel(
                     # The unit's first row's lane writes it.
                     if index - 4 * c == 0:
                         unit.rows = wp.min(data.slots_needed[c], wp.static(unit_rows))
-                        body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(
+                        body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point = contact_frame(
                             data, law, c
                         )
+                        # The unit's records by the contact law (the producer's, folded into the writer).
+                        for r in range(unit.rows):
+                            _a, _b, _d, _p = write_contact_records(
+                                data, law, c, r, False, body_a, body_b, normal, point, phi, tangent0, tangent1,
+                                friction_point,
+                            )  # fmt: skip
                         unit.art_a = data.art0[c]
                         unit.body_a = body_a
                         unit.art_b = data.art1[c]
@@ -1800,8 +1793,12 @@ def write_slot_rows(
         if kind == UNIT_CONTACT:
             c = index // 4
             r = index - 4 * c
-            body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
-            direction, row_point = contact_row_frame(r, normal, tangent0, tangent1, point, friction_point)
+            # The row's records by the contact law (the producer's, folded into the writer), then its seeds.
+            body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
+            _a, _b, direction, row_point = write_contact_records(
+                data, law, c, r, False, body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point
+            )
+            sides = rows.sides[line, slot]
             walked, coord_a, z_a, coord_b, z_b = contact_seeds(
                 walk,
                 support,

@@ -693,6 +693,7 @@ def test_contact_endpoints_match_row_allocation(test, device):
         row_capacity_telemetry=0,
         friction_patches=_patches(rng, contacts, device, 0),
         resolved_worlds=np.zeros(0, dtype=np.int32),
+        units=np.zeros((0, 0), dtype=np.int32),
         contact_world=np.full(contacts, -7, dtype=np.int32),
         contact_slot=np.full(contacts, -7, dtype=np.int32),
         contact_art_a=np.full(contacts, -7, dtype=np.int32),

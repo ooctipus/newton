@@ -222,10 +222,10 @@ def check_compact_records(test, solvers, law):
         # The one writer walks every row from its unit source; the boundary writes the contact rows and the writer
         # its limit prefix.
         producer = "walk" if arm == "walk" else "compact_contact_boundary"
-        first = "write_contact_units" if arm == "walk" else "produce_contacts"
+        first = [] if arm == "walk" else ["produce_contacts"]
         expected = {
-            "108": (producer, [first, "write_slot_rows", marker]),
-            "6": (producer, [first, "write_slot_rows"]),
+            "108": (producer, [*first, "write_slot_rows", marker]),
+            "6": (producer, [*first, "write_slot_rows"]),
         }
         test.assertEqual(record["producer"], producer)
         test.assertEqual(record["law"], law)

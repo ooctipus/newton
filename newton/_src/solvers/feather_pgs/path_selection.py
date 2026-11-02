@@ -358,16 +358,16 @@ def _row_builder(solver, plan, size, source) -> dict:
     if method == "walk":
         from . import walk_rows  # noqa: PLC0415 - the one writer's module
 
-        # The row pass writes the records and unit sources; the one writer walks every row (walk_rows): the general
-        # placement's into its packed rows, the support placement's (K1) into its support sink, the sparse diagonal's
-        # (K2) into its slots sink.
+        # The allocator writes the contact rows' unit sources; the one writer writes every contact row's records and
+        # walks every row (walk_rows): the general placement's into its packed rows, the support placement's (K1)
+        # into its support sink, the sparse diagonal's (K2) into its slots sink.
         if solver.routes.case == "K1":
             writer = solver.sweep.support_rows
         elif solver.routes.case == "K2":
             writer = walk_rows.write_slot_rows
         else:
             writer = walk_rows.writer_kernel(solver)
-        kernels = (walk_rows.write_contact_units, writer, *marker)
+        kernels = (writer, *marker)
     elif method == "local_packets":
         from . import row_packets, walk_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
 

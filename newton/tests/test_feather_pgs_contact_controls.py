@@ -119,6 +119,7 @@ def _launch_contact_allocator(
             counters["mf_dropped"],
             counters["dense_first_rejected"],
             counters["mf_first_rejected"],
+            wp.zeros((0, 0), dtype=wp.int32, device=device),
         ],
         device=device,
     )
@@ -196,6 +197,7 @@ def _launch_articulation_pair_contact_allocator(
             mf_dropped,
             wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
             wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
+            wp.zeros((0, 0), dtype=wp.int32, device=device),
         ],
         device=device,
     )
