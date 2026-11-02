@@ -17,6 +17,7 @@ import newton
 from newton._src.solvers.feather_pgs import tree_kinetic_state
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
+from newton._src.solvers.feather_pgs.tree_factor import WalkClass
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.tests.test_feather_pgs_mixed_tree_free_body import _build
@@ -49,6 +50,7 @@ def _kernels(clocked):
             response="cholesky",
             clocked=clocked,
             twists=tree_kinetic_state.publishes_twists(_LAYOUT, schedules, cuda=True),
+            classes=(WalkClass(tuple(int(p) for p in _TREE.parent), tuple(int(f) for f in _TREE.dof_start)),),
         ),
     )
 

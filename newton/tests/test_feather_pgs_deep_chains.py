@@ -305,12 +305,9 @@ def floor_cases() -> list:
 class TestDeepChainRegime(unittest.TestCase):
     """A tip impulse on ``long_chain(N)`` without armature, the solver's step against float64."""
 
-    @known_failure(
-        "Z4.L",
-        "main's float32 dense factor, with the conditioning armature it adds to every path of 32 joints, answers a tip "
-        "impulse 2.6e-3 to 6.6e-3 off float64 from 106 links; the walk without armature reads about 6e-7",
-    )
     def test_a_tip_impulse_answers_within_1e_4(self):
+        """Main's float32 dense factor, with the conditioning armature, answered 2.6e-3 to 6.6e-3 off float64 from 106
+        links; since the predictor solves by the walk (Z4.2) the step holds 1e-4, the armature still in place."""
         worst = max(tip_impulse(links)["solver"] for links in DEEP)
         self.assertLess(worst, REGIME_TOLERANCE)
 

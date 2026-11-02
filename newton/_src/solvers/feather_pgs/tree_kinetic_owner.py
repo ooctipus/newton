@@ -253,6 +253,7 @@ class TreeKineticState:
         root_of = np.searchsorted(tree.roots, tree.root_of).astype(np.int32)
         arts = getattr(sparse_owner, "forest_arts", None)
         arts = np.asarray(arts, np.int32) if arts is not None else group_to_art.reshape(-1, 1).astype(np.int32)
+        self._root_arts = arts
         # Predicted body twists for the resolved-world classifier: the predictor holds their publication for
         # warp-sized trees whose scans keep to their lane groups (a CUDA register scan), and publishes them unless
         # the test pin predicted_twists=False leaves the classifier to its own kernel.
@@ -399,16 +400,40 @@ class TreeKineticState:
             body_velocity=self._body_velocity,
             clocked=self.clocked,
         )
-        # The test pin walk_predictor solves the trial by the walk (Z4.0): no route selects it.
-        self.walk_predictor = bool(self.solver._route_pins.get("walk_predictor", False))
         self.predictor_kernel = native.get_predictor_kernel(
             self.schedules,
             layout=layout,
             response=self._response,
             clocked=self.clocked,
             twists=self._predicts_twists,
-            walk=self.walk_predictor,
+            classes=self._walk_classes(),
         )
+
+    def _walk_classes(self):
+        """Each root's walking class (:class:`.tree_factor.WalkClass`, its path table in the walk the predictor solves
+        by), or ``None`` for a prescribed root (no coordinates to solve); every group's tree of a root has the same
+        table."""
+        from .tree_factor import WalkClass  # noqa: PLC0415
+
+        factor, layout = self.solver.factor, self.layout
+        path = getattr(factor, "walk_path_host", None)
+        starts, ends = self.solver.model.articulation_start.numpy(), self.solver.forest.articulation_joint_end_host
+        classes = []
+        for r, family in enumerate(layout.root_families if layout.forest else (layout.dofs,)):
+            if family == 0:
+                classes.append(None)
+                continue
+            if path is None:
+                raise RuntimeError("The predictor solves by the walk: the solver holds it for every responding tree")
+            arts = self._root_arts[:, r]
+            first = arts[0]
+            table = path[starts[first] : ends[first]]
+            for art in arts[1:].tolist():
+                if not np.array_equal(path[starts[art] : ends[art]], table):
+                    raise ValueError("A predictor group's trees of one root must share their walk's path table")
+            count = int(self.solver.forest.articulation_dof_count.numpy()[first])
+            classes.append(WalkClass(tuple(int(x) for x in table[:, 0]), (*(int(x) for x in table[:, 1]), count)))
+        return tuple(classes)
 
     def _walk(self):
         """The walk the predictor's border reads (:func:`.tree_kinetic_state.border_solve`): the factor's, or, where no

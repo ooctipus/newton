@@ -1874,6 +1874,7 @@ class WalkClass:
         root_first: bool = True,
         width: int = 6,
         cuda: bool = True,
+        unroll: int = WALK_UNROLL,
     ) -> str:
         """Native statements that walk the class's tree on a state of ``width`` floats a body, in either direction.
 
@@ -1894,6 +1895,8 @@ class WalkClass:
             root_first: The walk's direction.
             width: Floats of a body's state.
             cuda: The CUDA text (its tables in constant memory) or its CPU twin.
+            unroll: Coordinates up to which the walk is straight-line code (:data:`WALK_UNROLL`): a caller whose
+                kernel cannot hold a straight walk's hoisted loads in its registers takes the loop form.
         """
         bodies = len(self.parent)
         zero = "{" + ", ".join(["0.0f"] * width) + "}"
@@ -1904,7 +1907,7 @@ class WalkClass:
             out += [_fill(end, b=b, V=state)] if end else []
             return out
 
-        if self.coordinates <= WALK_UNROLL:
+        if self.coordinates <= unroll:
             lines = []
             if root_first:
                 for b, up in enumerate(self.parent):
@@ -2036,10 +2039,10 @@ _DOWN_STEP = """{
 }"""
 
 
-def _walk_down(classes: tuple[WalkClass, ...], cuda: bool) -> str:
+def _walk_down(classes: tuple[WalkClass, ...], cuda: bool, unroll: int = WALK_UNROLL) -> str:
     joint = Template(_DOWN_JOINT).safe_substitute(link=WALK_LINK)
     step = Template(_DOWN_STEP).safe_substitute(coordinate=WALK_COORDINATE)
-    bodies = [walk.walk(joint, step, end="twist($b, $V);", cuda=cuda) for walk in classes]
+    bodies = [walk.walk(joint, step, end="twist($b, $V);", cuda=cuda, unroll=unroll) for walk in classes]
     if len(bodies) == 1:
         walk = indent_text(bodies[0], 8)
     else:
@@ -2074,7 +2077,7 @@ def _walk_down(classes: tuple[WalkClass, ...], cuda: bool) -> str:
 
 
 @functools.cache
-def walk_down_prelude(classes: tuple[WalkClass, ...]) -> DevicePrelude:
+def walk_down_prelude(classes: tuple[WalkClass, ...], unroll: int = WALK_UNROLL) -> DevicePrelude:
     """The one walk down (the leave ``P^T L^-T u``) of the walking classes ``classes``, for both devices: a prelude
     declaring
 
@@ -2093,11 +2096,11 @@ def walk_down_prelude(classes: tuple[WalkClass, ...]) -> DevicePrelude:
     """
     if not classes:
         raise ValueError("a walk down needs a class")
-    tag = hashlib.sha256(repr(classes).encode()).hexdigest()[:8]
+    tag = hashlib.sha256(repr((classes, unroll)).encode()).hexdigest()[:8]
     return DevicePrelude(
         f"walk_down_{tag}",
-        _WALK_ACCESS + "\n" + _walk_down(classes, True),
-        cpu=_WALK_ACCESS_CPU + "\n" + _walk_down(classes, False),
+        _WALK_ACCESS + "\n" + _walk_down(classes, True, unroll),
+        cpu=_WALK_ACCESS_CPU + "\n" + _walk_down(classes, False, unroll),
     )
 
 

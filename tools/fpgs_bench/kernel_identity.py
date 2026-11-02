@@ -309,6 +309,31 @@ def held_tree_layouts():
     }
 
 
+def walk_classes(layout):
+    """Each root's walking class of a held layout (the predictor solves by the walk): a chain over the root's bodies,
+    the root body holding its root's coordinates (one for a fixed root) and every next body one until the root's
+    family is spent; ``None`` for a prescribed root."""
+    from newton._src.solvers.feather_pgs.tree_factor import WalkClass  # noqa: PLC0415
+
+    bounds = (*layout.roots, layout.bodies)
+    families = layout.root_families if layout.forest else (layout.dofs,)
+    classes = []
+    for r, family in enumerate(families):
+        if family == 0:
+            classes.append(None)
+            continue
+        bodies = bounds[r + 1] - bounds[r]
+        counts = [min(layout.root_coordinates[r] or 1, family)]
+        for _ in range(1, bodies):
+            counts.append(min(1, family - sum(counts)))
+        counts[-1] += family - sum(counts)
+        first = [0]
+        for count in counts:
+            first.append(first[-1] + count)
+        classes.append(WalkClass(tuple(range(-1, bodies - 1)), tuple(first)))
+    return tuple(classes)
+
+
 def held_tree_calls():
     """Yield every held-tree layout's kernels as they run, plus the switch variants of four layouts.
 
@@ -349,7 +374,7 @@ def held_tree_calls():
             if options.keys() <= {"clocked"}:
                 # The CUDA predictor: it holds the twist publication where the layout admits it.
                 twists = native.publishes_twists(tree, schedules, cuda=True)
-                kwargs = {**layout, "response": response, "twists": twists, **options}
+                kwargs = {**layout, "response": response, "twists": twists, "classes": walk_classes(tree), **options}
                 yield "tree_kinetic_state.get_predictor_kernel", predictor, (schedules,), kwargs
         # A group's coordinates: a free root's quaternion takes one more than its three rotation velocities.
         coordinates = tree.dofs + tree.free_root_count

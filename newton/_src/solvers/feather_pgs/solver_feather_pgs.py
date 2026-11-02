@@ -735,24 +735,16 @@ class SolverFeatherPGS(SolverBase):
         if self.placement.local_internal_fast_path and not self.placement.walks:
             raise ValueError("The local owners walk their rows and leave (FL3.6): their class must walk.")
         # Scalar branches take a diagonal-mass group of world-fixed roots over one-coordinate leaves (scalar_branches.py),
-        # which the held-tree owner then publishes: the compact diagonal's admission planned them. A leaf decides its
-        # drive's saturation itself, so the predictor's border never walks a branch.
+        # which the held-tree owner then publishes: the compact diagonal's admission planned them.
         self._scalar_branches, self._scalar_branches_reason = plan_scalar_branches(self)
-        # The walk is held for every responding tree where a placement walks its rows (the keyed tiers walk theirs in
-        # the kernel) and under the test pin walk_predictor, which solves the predictor's trial by it (Z4.0). Elsewhere
-        # it holds the trees that walk (the sparse diagonal's arms) and the trees whose drives can slip, where the
-        # predictor's border decides a step (FL3.9): a tree that can do neither, or a scalar branch, takes no walk.
+        # The walk is the trees' factor (Z4): the predictor solves every responding tree by it, the placements that
+        # walk read it for their rows and leave, and the border decides a slipping tree's step on it. A scalar branch
+        # predicts and decides in its own kernels (scalar_branches.py) and takes no walk.
         responding = np.flatnonzero(self.forest.response_dof_count > 0)
-        if general or self.placement.ink_skip_rows() or self._route_pins.get("walk_predictor", False):
+        if self._scalar_branches is not None:
+            responding = np.setdiff1d(responding, self.forest.group_to_art_host[self._scalar_branches.size])
+        if responding.size:
             self.factor.plan_walk(responding)
-        else:
-            held = responding[self.factor.slips_by_tree(responding) > 0]
-            if self._scalar_branches is not None:
-                held = np.setdiff1d(held, self.forest.group_to_art_host[self._scalar_branches.size])
-            if diagonal:
-                held = np.union1d(held, self.placement.sparse_diagonal_dense_arts_host)
-            if held.size:
-                self.factor.plan_walk(held)
         if self.placement.walks:
             self.placement.hold_units()
             if self.routes.case == "K1":
