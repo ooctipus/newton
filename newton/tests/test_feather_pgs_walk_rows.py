@@ -484,12 +484,14 @@ class TestSupportSlipRelease(unittest.TestCase):
         self.assertLess(np.linalg.norm(v_out - expected) / np.linalg.norm(expected), 1.0e-5)
 
 
-def _hinges_step(pins: dict, iterations: int = 30) -> tuple:
+def _hinges_step(pins: dict, iterations: int = 30, **options) -> tuple:
     """One step of :func:`slipping_hinges` on CUDA under route ``pins``: the solver and its published velocity."""
     model, control = slipping_hinges("cuda:0")
     with patch.dict(SolverFeatherPGS._route_pins, pins), warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_iterations=iterations, enable_joint_limits=True)
+        solver = SolverFeatherPGS(
+            model, angular_damping=0.0, pgs_iterations=iterations, enable_joint_limits=True, **options
+        )
     state, out = model.state(), model.state()
     solver.step(state, out, control, None, 1.0 / 60.0)
     return solver, out.joint_qd.numpy().astype(np.float64)
@@ -517,6 +519,20 @@ class TestTierSlipFrame(unittest.TestCase):
                 # The keyed rows and the writer's rows release their slips along their paths (R).
                 self.assertEqual(int(solver.factor.walk_view().release.count.numpy()[0]), 3)
                 self.assertLess(np.linalg.norm(qd - reference) / scale, 1.0e-4, f"{qd} {reference}")
+
+    def test_keyed_general_worlds_take_the_decided_operator(self):
+        """A keyed class's world of more rows than its tier holds goes to the general sweep through the one writer:
+        its rows carry the release ``R`` as the tiers' do, so its step is the decided operator's (the all-K factor's
+        rows missed it while the predictor took the decided step)."""
+        general, reference = _hinges_step({"tiers": 0}, enable_joint_velocity_limits=True)
+        scale = float(np.linalg.norm(reference))
+        solver, qd = _hinges_step({"tiers": 4}, enable_joint_velocity_limits=True)
+        self.assertIsNotNone(solver.placement.keyed_rows)
+        self.assertGreater(
+            int(solver.placement.constraint_count.numpy()[0]), solver.placement.keyed_rows.layout.parallel_rows
+        )
+        self.assertEqual(int(solver.factor.walk_view().release.count.numpy()[0]), 3)
+        self.assertLess(np.linalg.norm(qd - reference) / scale, 1.0e-4, f"{qd} {reference}")
 
 
 # ---------------------------------------------------------------------------------------------------------------------

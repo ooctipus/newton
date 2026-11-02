@@ -272,6 +272,8 @@ class Placement:
         # The general placement's one writer (walk_rows): each row's unit source, by world line and row.
         self.walks = False
         self.dummy_units = self.arrays.placeholder(wp.int32, (1, 1))
+        # No unit sources: the contact allocator writes none (a producer other than the one writer fills the rows).
+        self.no_units = wp.zeros((0, 0), dtype=wp.int32, device=model.device)
         self.unit_source = None
 
     # ---------------------------------------------------------------------------------------------------------------
@@ -760,7 +762,9 @@ class Placement:
             device=self.model.device,
         )
 
-    def place_sorted_contact_rows(self, contacts, contact_build_threads, mf_slot_counter, mf_first_rejected_slot):
+    def place_sorted_contact_rows(
+        self, contacts, contact_build_threads, mf_slot_counter, mf_first_rejected_slot, units: wp.array
+    ):
         """Give each world's contact rows the order of sorted contacts, whatever order the allocator reserved them in.
 
         Runs only when the contacts come from a deterministic collision pipeline
@@ -768,7 +772,8 @@ class Placement:
         solver is deterministic as well; the default pipeline keeps the allocator's atomic
         reservation, whose order on CUDA follows the warps. A captured step keeps the order of
         its capture. Dense rows are placed unless the local row packets or keyed rows place
-        their own; matrix-free rows are placed with free rigid bodies.
+        their own; matrix-free rows are placed with free rigid bodies. ``units``: the one writer's unit sources, which
+        follow the placed slots (empty where the writer does not take the contact rows).
         """
         order_dense = int(self.row_packets is None and self.keyed_rows is None)
         order_mf = int(self.forest.has_free_rigid_bodies)
@@ -813,8 +818,9 @@ class Placement:
                 mf_first_rejected_slot,
                 *blocks,
                 lanes,
+                self.dense_first,
             ],
-            outputs=[*runs, self.contact_slot],
+            outputs=[*runs, self.contact_slot, units],
             device=device,
         )
 

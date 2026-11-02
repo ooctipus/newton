@@ -824,12 +824,17 @@ class Sweep:
         parent = tuple(int(p) for p, _ in table)
         first = (*(int(f) for _, f in table), int(size))
         node = tuple(int(k) for k in factor.sparse_mass_matrix_plan.inverse_permutation)
+        capacity = int(self.placement.dense_max_constraints)
+        internal = min(int(self.placement.internal_rows_per_world(model)), capacity)
+        units = max(internal + (capacity - internal + 2) // 3, 1)
+        self.support_lanes = min(32, 1 << (units - 1).bit_length())
         self.support_rows = walk_rows.support_rows_kernel(
             parent,
             first,
             node,
             records=self.placement.sparse_contact_records is not None,
             torsion=bool(self.laws.contact_torsion_enabled),
+            lanes=self.support_lanes,
         )
         # Where the step's one leave reads each coordinate's change (tree_factor.walk_leave_kernel): the sparse sweep
         # publishes it in factor coordinates (factor_velocity_delta), so a tree coordinate reads its factor
@@ -843,10 +848,6 @@ class Sweep:
             for c, k in enumerate(node):
                 du_index[dof_start[art] + c] = art_world[art] * width + offsets[art] + k
         self.support_du_index = wp.array(du_index, dtype=wp.int32, device=model.device)
-        capacity = int(self.placement.dense_max_constraints)
-        internal = min(int(self.placement.internal_rows_per_world(model)), capacity)
-        units = max(internal + (capacity - internal + 2) // 3, 1)
-        self.support_lanes = min(32, 1 << (units - 1).bit_length())
 
     def support_sink(self, v_hat: wp.array) -> walk_rows.SupportSink:
         """Case K1: what its writer reads and writes besides each unit's seeds (:class:`.walk_rows.SupportSink`), bound

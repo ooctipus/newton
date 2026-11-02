@@ -48,6 +48,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton._src.solvers.feather_pgs.tree_factor import (
     WALK_COORDINATE,
+    WALK_FRAME,
     WALK_LINK,
     WALK_NOW,
     TreeWalk,
@@ -92,7 +93,7 @@ _UP = """    if (tid >= body.shape[0]) return;
     const float* d = data.data + (size_t)tree.data[tid] * n * $coordinate;
     const float* l = link.data + (size_t)tree.data[tid] * bodies * $link;
     const float* s = now.data + (size_t)tree.data[tid] * n * $now;
-    const float* f = now_link.data + (size_t)tree.data[tid] * bodies * $link;
+    const float* f = origin.data + (size_t)tree.data[tid] * 3;
     float* out = z.data + (size_t)tid * $rows * n;
     float* entries = jz.data + (size_t)tid * $rows * n;
     const auto sink = [&](int r, int c, float value, float j) {
@@ -130,7 +131,7 @@ _UP_PARAMS = params(
     ("data", wp.array3d[float]),
     ("link", wp.array3d[float]),
     ("now", wp.array3d[float]),
-    ("now_link", wp.array3d[float]),
+    ("origin", wp.array2d[float]),
     ("tree", wp.array[int]),
     ("body", wp.array[int]),
     ("top", wp.array[int]),
@@ -171,6 +172,15 @@ def walk_kernels(table: tuple, rows: int) -> tuple:
     return up.kernel(), tree.kernel()
 
 
+def frame_points(walk: TreeWalk) -> np.ndarray:
+    """Each body's frame point of ``walk``, its root's at the origin: the parent's less the body's offset."""
+    frames = np.zeros((walk.parent.size, 3))
+    for b in range(walk.parent.size):
+        if walk.parent[b] >= 0:
+            frames[b] = frames[walk.parent[b]] - np.asarray(walk.offset[b], dtype=np.float64)
+    return frames
+
+
 class DeviceWalk:
     """The device walk of trees of one topology (one path table), their data from their float32 walks."""
 
@@ -179,19 +189,36 @@ class DeviceWalk:
         self.n, self.bodies = walks[0].s.shape[0], walks[0].parent.size
         self.up_kernel, self.tree_kernel = walk_kernels(walks[0].path_table, rows)
         data, link = zip(*(walk.device_data() for walk in walks), strict=True)
+        link = np.stack(link)
+        # Each body's frame point (the trees' roots at the origin), at the refresh's poses: the link's frame.
+        self.frames = np.stack([frame_points(walk) for walk in walks])
+        link[:, :, WALK_FRAME : WALK_FRAME + 3] = self.frames
         self.data = wp.array(np.stack(data), dtype=float, device=device)
-        self.link = wp.array(np.stack(link), dtype=float, device=device)
-        # The step's geometry (WalkTrees.now, .now_link): the columns and links of the walks' own poses, or of
-        # ``step``'s walks, the same trees at a step's poses after the refresh's.
+        self.link = wp.array(link, dtype=float, device=device)
+        # The step's geometry (WalkTrees.motion, .origin): the motion columns about the origin of the walks' own poses,
+        # or of ``step``'s walks, the same trees at a step's poses after the refresh's (its frames at the step's).
         step = walks if step is None else step
-        self.now = wp.array(np.stack([np.asarray(walk.s) for walk in step]), dtype=float, device=device)
-        self.now_link = wp.array(np.stack([walk.device_data()[1] for walk in step]), dtype=float, device=device)
+        self.step_frames = np.stack([frame_points(walk) for walk in step])
+        motion = []
+        for walk, frames in zip(step, self.step_frames, strict=True):
+            s = np.asarray(walk.s, dtype=np.float64).copy()
+            for b in range(walk.parent.size):
+                for c in range(int(walk.first[b]), int(walk.first[b + 1])):
+                    s[c, 0:3] -= np.cross(s[c, 3:6], frames[b])
+            motion.append(s)
+        self.now = wp.array(np.stack(motion), dtype=float, device=device)
+        self.origin = wp.zeros((len(walks), 3), dtype=float, device=device)
 
     def up(self, tree, body, top, seeded, wrench, covector, entries: bool = False):
         """Footprints ``[seeds, rows, n]`` of seeds of ``rows`` rows: wrenches ``[seeds, rows, 6]`` at their bodies'
         frames from coordinate ``top``, plus covectors ``[seeds, rows]`` at ``top`` where ``seeded``; with ``entries``,
         also the step's ``J`` entries the sink received beside each footprint."""
         count = len(body)
+        # The wrenches at the bodies' frames at the step's poses, moved to their frames in the walk's links.
+        wrench = np.array(np.reshape(wrench, (count, self.rows, 6)), dtype=np.float64)
+        for i in range(count):
+            moved = self.step_frames[tree[i], body[i]] - self.frames[tree[i], body[i]]
+            wrench[i, :, 3:6] += np.cross(moved, wrench[i, :, 0:3])
         z = wp.zeros((count, self.rows, self.n), dtype=float, device=self.device)
         jz = wp.zeros((count, self.rows, self.n), dtype=float, device=self.device)
 
@@ -207,7 +234,7 @@ class DeviceWalk:
                 self.data,
                 self.link,
                 self.now,
-                self.now_link,
+                self.origin,
                 array(tree, int),
                 array(body, int),
                 array(top, int),

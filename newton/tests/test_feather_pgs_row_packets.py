@@ -181,13 +181,13 @@ def _patch_fixture(device="cpu"):
 
 
 def _walk_fixture(device, rng):
-    """The walk's step geometry the packets' seeds read: each body its own joint (the arm's two, then the box's), the
+    """The walk's frames the packets' seeds read: each body its own joint (the arm's two, then the box's), the
     arm's first joint and the box's per world, and each body's walk frame point."""
     walk = WalkTrees()
     joints = 3 * WORLDS
     link = np.zeros((joints, WALK_LINK), dtype=np.float32)
     link[:, 4:7] = rng.normal(0.0, 0.5, (joints, 3))
-    walk.now_link = wp.array(link, dtype=float, device=device)
+    walk.link = wp.array(link, dtype=float, device=device)
     walk.body_joint = wp.array(np.arange(joints, dtype=np.int32), dtype=int, device=device)
     walk.joint_start = wp.array(
         np.array([3 * w + 2 * a for w in range(WORLDS) for a in range(2)], dtype=np.int32), dtype=int, device=device
@@ -202,7 +202,7 @@ def _seed_jacobian(packet, data, walk) -> np.ndarray:
     seeds, codes = packet.seed.numpy().astype(np.float64), packet.seed_body.numpy()
     motion, origin = data.motion.numpy().astype(np.float64), data.origin.numpy().astype(np.float64)
     mask, start = data.body_mask.numpy(), data.dof_start.numpy()
-    frames = walk.now_link.numpy()[:, 4:7].astype(np.float64)
+    frames = walk.link.numpy()[:, 4:7].astype(np.float64)
     out = np.full((WORLDS, PACKETS, PRIMARY + SECONDARY), np.nan)
     for w in range(WORLDS):
         for row in range(PACKETS):

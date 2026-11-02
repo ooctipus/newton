@@ -44,7 +44,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.placement import Placement
 from newton._src.solvers.feather_pgs.route_table import RouteTable
-from newton._src.solvers.feather_pgs.rows import velocity_prescale_launch
+from newton._src.solvers.feather_pgs.rows import RowLaws, velocity_prescale_launch
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton._src.solvers.feather_pgs.tree_factor import WALK_COORDINATE, WALK_LINK, WalkTrees, release_view
 from newton.solvers import SolverFeatherPGS
@@ -831,18 +831,27 @@ _ROW_ARRAYS = (
 
 
 def _linked_rows(solver, state, contacts, dt):
-    """Step until the contact rows are built and linked, and return host copies of the rows."""
+    """Step until the contact rows are built and linked, and return host copies of the rows: the row pass's (its
+    ``J``), with the records the one writer writes and links after it where the placement walks."""
     rows = {}
     finalize = Placement.latch_status
+    write_walked = RowLaws.write_walked
 
     def capture(self, step_contacts):
         finalize(self, step_contacts)
         if self is solver.placement:
             rows.update({name: getattr(self, name).numpy().copy() for name in _ROW_ARRAYS})
             rows["J"] = {size: self.jacobian_rows(size).numpy().copy() for size in self.forest.size_groups}
+            if not self.walks:
+                raise _RowsBuilt
+
+    def walked(self, step_solver, *args):
+        write_walked(self, step_solver, *args)
+        if step_solver is solver:
+            rows.update({name: getattr(solver.placement, name).numpy().copy() for name in _ROW_ARRAYS})
             raise _RowsBuilt
 
-    with patch.object(Placement, "latch_status", capture):
+    with patch.object(Placement, "latch_status", capture), patch.object(RowLaws, "write_walked", walked):
         try:
             solver.step(state, solver.model.state(), solver.model.control(), contacts, dt)
         except _RowsBuilt:
@@ -979,6 +988,8 @@ class TestKeyedPatchRows(unittest.TestCase):
         size = keyed.placement.keyed_rows.layout.primary
         expected["J"] = {size: _walked_jacobian(general, joint_q, expected)}
         actual = _linked_rows(keyed, state, contacts, dt)
+        # The keyed class's general worlds are the one writer's walked rows too (keyed_rows.keyed_general_units).
+        actual["J"] = {size: _walked_jacobian(keyed, joint_q, actual)}
         live = int(contacts.rigid_contact_count.numpy()[0])
         owner = _contact_rows_by_id(expected, live)
         self.assertEqual(owner, _contact_rows_by_id(actual, live))
@@ -1288,8 +1299,8 @@ def identity_walk(dofs: int, device) -> WalkTrees:
     walk.data = wp.array(data, dtype=wp.float32, device=device)
     walk.link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
     walk.path = wp.array([(-1, 0)], dtype=wp.vec2i, device=device)
-    walk.now = wp.zeros((dofs, 6), dtype=wp.float32, device=device)
-    walk.now_link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
+    walk.motion = wp.zeros(dofs, dtype=wp.spatial_vector, device=device)
+    walk.origin = wp.zeros(1, dtype=wp.vec3, device=device)
     walk.scratch = wp.zeros(1, dtype=wp.spatial_vector, device=device)
     for name, values in (
         ("joint_start", [0]),
@@ -1715,7 +1726,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     self.assertEqual((record["producer"], record["law"]), ("keyed_rows", law))
                     builder = {
                         "method": "keyed_rows",
-                        "kernels": ["scatter_contact_keys", "materialize_general_rows"],
+                        "kernels": ["scatter_contact_keys", "keyed_general_units", "write_walked_rows"],
                         "law": law,
                         "direct_rows": "routes.sweep.tiers",
                     }

@@ -410,7 +410,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertIsNone(routes["contact_rows"]["general_method_by_dof"])
         # Every size names its builder and the law it writes; the one writer builds both sizes.
         self.assertEqual(routes["contact_rows"]["law"], "patch")
-        walked = {"method": "walk", "kernels": ["write_contact_units", "write_walked_rows"], "law": "patch"}
+        walked = {"method": "walk", "kernels": ["write_walked_rows"], "law": "patch"}
         self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"6": walked, "1": walked})
         self.assertFalse(routes["contact_rows"]["row_packets"]["enabled"])
         # The packet producer implements patch friction; its laws need the joint-limit rows this model lacks.
@@ -457,7 +457,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertNotIn("resolved-world classifier", friction["reason"])
         # The general placement's one writer takes the patch row law (its records by write_contact_row).
         self.assertIsNone(routes["contact_rows"]["general_method_by_dof"])
-        kernels = ["write_contact_units", "write_walked_rows"]
+        kernels = ["write_walked_rows"]
         builder = {"method": "walk", "kernels": kernels, "law": "patch"}
         self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"6": builder, "1": builder})
         # Contact torsion keeps ordinary factors and serial sweeps; its rows take the one writer, as the solver's
@@ -592,7 +592,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     {"case": "K4", "keyed_rows": SimpleNamespace(patch=not point, layout=layout)},
                     (16, 6),
                     "keyed_rows",
-                    same((16, 6), "keyed_rows", ["scatter_contact_keys", "materialize_general_rows"]),
+                    same((16, 6), "keyed_rows", ["scatter_contact_keys", "keyed_general_units", "write_walked_rows"]),
                 ),
                 (
                     {"compact_contact_boundary": True, "walks": True, **diagonal, **schedule},
@@ -603,21 +603,21 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                         6: ("compact_contact_boundary", ["produce_contacts", "write_slot_rows"]),
                     },
                 ),
-                (sparse, (18,), "walk", {18: ("walk", ["write_contact_units", response.key])}),
+                (sparse, (18,), "walk", {18: ("walk", [response.key])}),
                 (
                     {**diagonal, **schedule, "walks": True},
                     (108, 6),
                     "walk",
                     {
-                        108: ("walk", ["write_contact_units", "write_slot_rows", marker.key]),
-                        6: ("walk", ["write_contact_units", "write_slot_rows"]),
+                        108: ("walk", ["write_slot_rows", marker.key]),
+                        6: ("walk", ["write_slot_rows"]),
                     },
                 ),
                 (
                     {**diagonal, "sweep": SimpleNamespace(sparse_contact_marker=None), "walks": True},
                     (108, 6),
                     "walk",
-                    same((108, 6), "walk", ["write_contact_units", "write_slot_rows"]),
+                    same((108, 6), "walk", ["write_slot_rows"]),
                 ),
                 (
                     {"_compact_contact_jacobian": True},
@@ -625,7 +625,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     "compact_jacobian",
                     same((6, 1), "compact_jacobian", [prepare, compact]),
                 ),
-                ({"walks": True}, (6, 1), "walk", same((6, 1), "walk", ["write_contact_units", "write_walked_rows"])),
+                ({"walks": True}, (6, 1), "walk", same((6, 1), "walk", ["write_walked_rows"])),
                 ({}, (6, 2, 1), "general", same((6, 2, 1), "masked", masked)),
                 ({}, (34, 6), "general", {34: ("per_contact", per_contact), 6: ("masked_combined", masked)}),
             )
@@ -647,12 +647,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(methods, set(BUILDER_METHODS))
         self.assertEqual({kernel for kernel in named if not is_row_builder(kernel)}, set())
 
-    def test_cpu_row_builder_check_rejects_wrong_order_and_counts(self):
-        """Fail the launch check for a record that names the launched kernels in the wrong order or count.
+    def test_cpu_row_builder_check_rejects_wrong_counts(self):
+        """Fail the launch check for a record that names the launched kernels in the wrong count.
 
-        Three sizes take the one writer: its unit launch, then the writer, once a step for every size. A record
-        that lists the kernels in reverse, or names them as per-size launches, still names the launched set, and
-        the check must reject it.
+        Three sizes take the one writer, once a step for every size. A record that names it as per-size launches
+        still names the launched set, and the check must reject it.
         """
         model = _resting_arms_and_box(1, 2)
         solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
@@ -660,14 +659,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         keys = _launched_kernel_keys(model, solver)
         self.assertEqual({entry["method"] for entry in record["builder_by_dof"].values()}, {"walk"})
         assert_row_builders_named(self, record, keys)
-        reversed_order = copy.deepcopy(record)
-        reversed_order["builder_by_dof"]["2"]["kernels"].reverse()
         per_size = copy.deepcopy(record)
         for entry in per_size["builder_by_dof"].values():
             entry["method"] = "masked"
-        for name, wrong in (("order", reversed_order), ("count", per_size)):
-            with self.subTest(name), self.assertRaises(AssertionError):
-                assert_row_builders_named(self, wrong, keys)
+        with self.assertRaises(AssertionError):
+            assert_row_builders_named(self, per_size, keys)
 
     def test_cpu_row_build_dispatches_on_the_recorded_plan(self):
         """Record and launch the builders of one plan: the row build and the record call the same function.
@@ -682,9 +678,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         launched = _launched_kernel_keys(model, solver)
         self.assertEqual(record["producer"], "walk")
         assert_row_builders_named(self, record, launched)
-        builders = ("write_contact_units", "write_walked_rows", "contact_row_prelude", "populate_world_J_for_size")
-        # One unit launch for every size, then the writer; no Jacobian builder.
-        self.assertEqual([key for key in launched if key in builders], list(builders[:2]))
+        builders = ("write_walked_rows", "contact_row_prelude", "populate_world_J_for_size")
+        # The one writer for every size; no Jacobian builder.
+        self.assertEqual([key for key in launched if key in builders], list(builders[:1]))
 
     def test_cpu_route_reports_free_body_velocity_limit_rows(self):
         """Report free-body velocity-limit rows on the CPU, where the row builder allocates them as well."""
@@ -993,7 +989,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 self.assertEqual(selected["cached_prediction"], "tree")
                 self.assertTrue(routes["paired_response"]["factor_coordinates"])
                 # The one writer walks both sizes' rows, under either friction law.
-                kernels = ["write_contact_units", "write_walked_rows"]
+                kernels = ["write_walked_rows"]
                 builder = {"method": "walk", "kernels": kernels, "law": law}
                 self.assertEqual(routes["contact_rows"]["producer"], "walk")
                 self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"18": builder, "6": builder})
@@ -1053,14 +1049,14 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                         self.assertEqual(record["producer"], "walk")
                         (entry,) = record["builder_by_dof"].values()
                         self.assertEqual(entry["method"], "walk")
-                        self.assertEqual(entry["kernels"], ["write_contact_units", solver.sweep.support_rows.key])
+                        self.assertEqual(entry["kernels"], [solver.sweep.support_rows.key])
                     if name == "compact_jacobian":
                         # A class of the local owners walks through the one writer (FL3.6); one that keeps the compact
                         # Jacobian names its builders.
                         walked = solver.placement.walks
                         self.assertEqual(record["producer"], "walk" if walked else "compact_jacobian")
                         builder = (
-                            ["write_contact_units", "write_walked_rows"]
+                            ["write_walked_rows"]
                             if walked
                             else ["prepare_world_contact_rows", "populate_world_J_for_compact_size"]
                         )

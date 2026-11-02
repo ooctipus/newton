@@ -21,10 +21,9 @@ import warp as wp
 
 from ...sim import ModelFlags
 from . import field_group
-from .contact_input import ContactInput, contact_frame
-from .contact_laws import CONTACT_LAW, CONTACT_SPIN_ROW, contact_friction, contact_row_frame
-from .dense_rows import RowSupport, jacobian_row
-from .device_preludes import warp_stride
+from .contact_input import ContactInput
+from .contact_laws import CONTACT_LAW, CONTACT_SPIN_ROW, contact_friction
+from .dense_rows import UNIT_CONTACT, UNIT_LIMIT, unit_source
 from .field_group import Field, FieldGroup, SolverArrays
 from .friction_patches import PatchRowLaw, patch_row_law
 from .kernel_template import substitute
@@ -34,7 +33,7 @@ from .keyed_row_layout import topology_plan as direct_topology_plan
 from .law_source import law_preludes
 from .prefix_rows import LAW, VELOCITY_LAW
 from .route_table import capable
-from .row_build import contact_torsion_mu, endpoint_projection, write_contact_row
+from .row_build import contact_torsion_mu
 from .row_inputs import ParallelRowInputs, RowArgument
 from .row_laws import ROW_LAW
 from .step_plan import JOINT_TOPOLOGY, TopologyPin
@@ -125,7 +124,7 @@ def _row_source(*, layout, patch=False, weighted=False, torsion=False):
     A prefix row's key ``~(2 d + side)`` gives its seed, the covector ``+-e_d`` on the tree holding world coordinate
     ``d``. A contact row takes its geometry, frame, target and materials from the contact laws and its rhs from the row
     laws (:data:`ROW_PRELUDES`); its seed on each body of a tree of the world is the wrench of its direction at its row
-    point, ``(d, (p - o) x d)`` at the body's frame ``o`` at the step's poses (the spin row's ``(0, n)``), the second
+    point, ``(d, (p - o) x d)`` at the body's frame ``o`` (the factor's; the spin row's ``(0, n)``), the second
     body's negated. No Jacobian is formed.
     ``patch`` writes the persistent patch row law: tangent rows act at the patch friction location for both the
     seed and the prescribed target, carry the anchor's tangential phi and correct it with ``patch_law.beta``;
@@ -150,13 +149,13 @@ def _row_source(*, layout, patch=False, weighted=False, torsion=False):
     """
     spin = "r == 3" if torsion else "false"
     seeds = f"""
-        // Each body's seed on its tree of the world: the row's wrench at the body's frame at the step's poses.
+        // Each body's seed on its tree of the world: the row's wrench at the body's frame (the factor's).
         for (int end = 0; end < 2; ++end) {{
             const int body = end == 0 ? ba : bb, art = end == 0 ? aa : ab;
             const int side = art >= 0 && art == art_a ? 0 : (art >= 0 && art == art_b ? 1 : -1);
             if (body < 0 || side < 0) continue;
             const int joint = walk.body_joint.data[body];
-            const float* o = walk.now_link.data + (size_t)joint * {WALK_LINK} + {WALK_FRAME};
+            const float* o = walk.link.data + (size_t)joint * {WALK_LINK} + {WALK_FRAME};
             const float sign = end == 0 ? 1.0f : -1.0f;
             const float d0 = sign * direction[0], d1 = sign * direction[1], d2 = sign * direction[2];
             const float r0 = row_point[0] - o[0], r1 = row_point[1] - o[1], r2 = row_point[2] - o[2];
@@ -282,61 +281,48 @@ ${WEIGHT}${ROW_LAW}        c.row_cfm.data[at] = c.cfm;
 
 
 @wp.kernel(enable_backward=False)
-def materialize_general_rows(
+def keyed_general_units(
     z: KineticRows,
-    data: ContactInput,
-    law: PatchRowLaw,
     counts: wp.array[int],
     mf_counts: wp.array[int],
     parallel_rows: int,
     primary: int,
-    secondary: int,
     primary_offset: int,
     secondary_offset: int,
-    support: RowSupport,
-    J_a: wp.array3d[float],
-    J_b: wp.array3d[float],
+    first: wp.array[int],
+    dof_start: wp.array[int],
+    sides: wp.array2d[wp.vec2i],
+    units: wp.array2d[int],
+    owner: wp.array[int],
 ):
-    """Write the rows of the worlds the parallel tiers leave to the general sweep: those of more rows than the tiers
-    hold or with matrix-free rows, at each articulation's side (:func:`.dense_rows.jacobian_row`; the packed rows are
-    dense, the parallel tiers read them at their coordinates). A warp per world (its lanes over the row coefficients)
-    writes every coefficient,
-    a prefix row's unit coefficient from its key ``~(2 d + side)`` and a contact row's Jacobian entry at its row
-    frame (:func:`.row_build.endpoint_projection`), and a contact row's records and rhs
-    (:func:`.row_build.write_contact_row`)."""
-    world, lane = wp.tid()
+    """Hand the worlds the parallel tiers leave to the general sweep (those of more rows than the tiers hold or with
+    matrix-free rows) to the one writer (:func:`.walk_rows.walked_rows_kernel`), a thread a world: each row's unit
+    source from its key (a contact row's ``4 c + r``, a prefix row's covector ``~(2 d + side)`` at its tree's
+    coordinate) and a prefix row's sides; ``owner`` is 1 where the tiers hold the world (the writer skips it), 0 where
+    the writer walks its rows. The general worlds' rows then take the walk and the release ``R`` as every walked row.
+    It reads no contact input: a step without contacts binds none."""
+    world = wp.tid()
     count = counts[world]
     if count <= parallel_rows and mf_counts[world] == 0:
+        owner[world] = 1
         return
-    line = data.first[world]
-    dofs = primary + secondary
-    for coefficient in range(lane, count * dofs, warp_stride()):
-        row, q = coefficient // dofs, coefficient % dofs
-        size, local = primary, q - primary_offset
-        if q < primary_offset or q >= primary_offset + primary:
-            size, local = secondary, q - secondary_offset
+    owner[world] = 0
+    line = first[world]
+    for row in range(wp.min(count, units.shape[1])):
         key = z.rowkeys[line, row]
-        value = float(0.0)
         if key < 0:
             token = -1 - key
-            if q == token // 2:
-                value = wp.where(token % 2 == 0, 1.0, -1.0)
-                data.sides[line, row] = wp.vec2i(z.maps.arts[world, wp.where(size == primary, 0, 1)], -1)
+            q = token // 2
+            side = int(0)
+            local = q - primary_offset
+            if local < 0 or local >= primary:
+                side = 1
+                local = q - secondary_offset
+            art = z.maps.arts[world, side]
+            sides[line, row] = wp.vec2i(art, -1)
+            units[line, row] = unit_source(UNIT_LIMIT, 2 * (dof_start[art] + local) + token % 2)
         else:
-            c, r = key // 4, key % 4
-            body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
-            direction, row_point = contact_row_frame(r, normal, tangent0, tangent1, point, friction_point)
-            value = endpoint_projection(data, body_a, data.art0[c], size, local, r, row_point, direction)
-            value -= endpoint_projection(data, body_b, data.art1[c], size, local, r, row_point, direction)
-            if q == 0:
-                write_contact_row(data, law, c, r, True)
-        side = wp.where(size == primary, 0, 1)
-        art = z.maps.arts[world, side]
-        at = jacobian_row(support, z.maps.groups[world, side], art, wp.vec2i(art, -1))
-        if size == primary:
-            J_a[at[0], row, at[1] + local] = value
-        else:
-            J_b[at[0], row, at[1] + local] = value
+            units[line, row] = unit_source(UNIT_CONTACT, key)
 
 
 def _key_kind(key: str, torsion: bool) -> str:
@@ -428,6 +414,8 @@ class KeyedRows:
         self.data.first = solver.placement.dense_first
         self.data.rowkeys = SolverArrays(None, dev).array(KINETIC_ROWS[0], {"world": worlds, "row": capacity})
         self.maps = field_group.upload(RowMaps, dev, groups=groups, starts=starts, arts=arts)
+        # Each world's holder this step: 1 the tiers (their rows walked in the kernel), 0 the one writer.
+        self.owner = wp.ones(worlds, dtype=wp.int32, device=dev)
         self.contact_input = None
         # The placeholders of absent prefix tables, allocated before any capture.
         solver._arrays.placeholder(wp.int32)
@@ -480,13 +468,13 @@ class KeyedRows:
         self.law = patch_row_law(self.solver)
 
     def finish_rows(self):
-        """Scatter the contact keys, then write the general worlds' rows (:func:`materialize_general_rows`).
+        """Scatter the contact keys, then hand the general worlds' rows to the one writer (:func:`keyed_general_units`).
 
         Under patch friction the keys carry each row's type, parent and undivided coefficient, and the general
         worlds' records the same; the patch link, which runs after every row producer, links and divides them.
         """
         s, layout = self.solver, self.layout
-        na, nb = layout.primary, layout.secondary
+        na = layout.primary
         if self.contact_input is not None:
             pool = s.placement.contact_pool
             pool.launch(
@@ -496,25 +484,21 @@ class KeyedRows:
                 extent=self.contact_input.count,
                 max_blocks=s.placement.contact_capacity_blocks,
             )
-        wp.launch_tiled(
-            materialize_general_rows,
-            dim=[s.forest.world_count],
+        wp.launch(
+            keyed_general_units,
+            dim=s.forest.world_count,
             inputs=[
                 self.data,
-                self.data.contact,
-                self.law,
                 s.placement.constraint_count,
                 s.placement.mf_constraint_count,
                 layout.parallel_rows,
                 na,
-                nb,
                 layout.primary_offset,
                 layout.secondary_offset,
-                s.placement.row_support(),
-                s.placement.jacobian_rows(na),
-                s.placement.jacobian_rows(nb or na),
+                s.placement.dense_first,
+                s.forest.articulation_dof_start,
             ],
-            block_dim=32,
+            outputs=[s.placement.row_sides, s.placement.unit_source, self.owner],
             device=s.model.device,
         )
 

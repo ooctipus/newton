@@ -358,28 +358,28 @@ def _row_builder(solver, plan, size, source) -> dict:
     if method == "walk":
         from . import walk_rows  # noqa: PLC0415 - the one writer's module
 
-        # The row pass writes the records and unit sources; the one writer walks every row (walk_rows): the general
-        # placement's into its packed rows, the support placement's (K1) into its support sink, the sparse diagonal's
-        # (K2) into its slots sink.
+        # The allocator writes the contact rows' unit sources; the one writer writes every contact row's records and
+        # walks every row (walk_rows): the general placement's into its packed rows, the support placement's (K1)
+        # into its support sink, the sparse diagonal's (K2) into its slots sink.
         if solver.routes.case == "K1":
             writer = solver.sweep.support_rows
         elif solver.routes.case == "K2":
             writer = walk_rows.write_slot_rows
         else:
             writer = walk_rows.writer_kernel(solver)
-        kernels = (walk_rows.write_contact_units, writer, *marker)
+        kernels = (writer, *marker)
     elif method == "local_packets":
         from . import row_packets, walk_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
 
         # The packets' producer records every row and its unit source; the one writer walks the general worlds' rows.
         kernels = (row_packets.produce_contacts, walk_rows.writer_kernel(solver))
     elif method == "keyed_rows":
-        from . import keyed_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
+        from . import keyed_rows, walk_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
 
         patch = bool(solver.placement.keyed_rows.patch)
-        # The parallel tiers (routes.sweep.tiers) build the direct rows in the sweep; the fallback
-        # materializes the rows of every other world.
-        kernels = (keyed_rows.scatter_contact_keys, keyed_rows.materialize_general_rows)
+        # The parallel tiers (routes.sweep.tiers) build the direct rows in the sweep; the one writer walks the rows
+        # of every other world (keyed_general_units hands them over).
+        kernels = (keyed_rows.scatter_contact_keys, keyed_rows.keyed_general_units, walk_rows.writer_kernel(solver))
     elif method == "compact_contact_boundary":
         from . import compact_contact, walk_rows  # noqa: PLC0415 - the owner's modules; loaded with the owner
 

@@ -851,6 +851,11 @@ class RowLaws:
             # The friction row law every producer writes: point friction is the patch law with beta 0.
             law = patch_row_law(solver)
 
+            # The class's case names the producer that writes every contact row (contact_row_plan):
+            # get_path_selection() records the same plan (routes.contact_rows). The one writer's contact rows are
+            # its own to fill: their unit sources are written where their slots are reserved.
+            plan = contact_row_plan(solver)
+            units = solver.placement.unit_source if plan.producer == "walk" else solver.placement.no_units
             # Under persistent patch friction, contacts of resolved worlds that the complete path would
             # give rows are marked so the patch finish releases their anchors (kernels.py).
             pool.launch(
@@ -883,28 +888,18 @@ class RowLaws:
                     mf_dropped_rows,
                     solver.placement.dense_first_rejected_slot,
                     mf_first_rejected_slot,
+                    units,
                 ],
                 extent=count,
                 clamp=True,
             )
             if contacts.rigid_contacts_pair_sorted:
                 solver.placement.place_sorted_contact_rows(
-                    contacts, contact_build_threads, mf_slot_counter, mf_first_rejected_slot
+                    contacts, contact_build_threads, mf_slot_counter, mf_first_rejected_slot, units
                 )
 
-            # The class's case names the producer that writes every contact row (contact_row_plan):
-            # get_path_selection() records the same plan (routes.contact_rows).
-            plan = contact_row_plan(solver)
-            if plan.producer == "walk":
-                pool.launch(
-                    walk_rows.write_contact_units,
-                    contact_build_threads * 4,
-                    inputs=[contact_input, contact_build_threads * 4, law, solver.placement.unit_source],
-                    extent=count,
-                    scale=4,
-                    clamp=True,
-                )
-            elif plan.producer == "local_packets":
+            # The one writer's contact rows ("walk") take their records in the writer (walk_rows).
+            if plan.producer == "local_packets":
                 solver.placement.row_packets.produce_contacts(contact_input)
             elif plan.producer == "keyed_rows":
                 solver.placement.keyed_rows.produce_contacts(contact_input)
@@ -939,7 +934,7 @@ class RowLaws:
                         extent=count,
                         clamp=True,
                     )
-            else:
+            elif plan.producer != "walk":
                 # The masked builder: a prelude writes the row records and per-contact flags, then one
                 # thread per (contact, DOF) writes the Jacobian; one launch pair serves the combined sizes.
                 flags = solver.placement.rows_prelude_flags
@@ -1183,8 +1178,10 @@ class RowLaws:
         )
         if solver.placement.keyed_rows is not None:
             solver.placement.keyed_rows.finish_rows()
-        # The patch link runs after every row producer: the keyed rows' general worlds take their records last.
-        self._link_friction_patches(solver, contacts)
+        # The patch link runs after every row's records are written: the keyed rows' general worlds take theirs last
+        # here; the one writer writes its contact rows' records after the row pass (write_walked), and links there.
+        if not self._writer_records(solver):
+            self._link_friction_patches(solver, contacts)
         solver.placement.latch_status(contacts)
         solver.sweep.claim()
         solver.placement.warn_overflow()
@@ -1226,7 +1223,19 @@ class RowLaws:
         placement's (case K1, :meth:`write_support`)."""
         if solver.routes.case == "K1":
             self.write_support(solver, state_in, contacts, dt)
-            return
+        else:
+            self.write_general(solver, state_in, contacts, dt)
+        if self._writer_records(solver):
+            self._link_friction_patches(solver, contacts)
+
+    @staticmethod
+    def _writer_records(solver) -> bool:
+        """Whether the one writer writes the contact rows' records after the row pass (the general placement's and the
+        support placement's: the patch link then runs after it)."""
+        return bool(solver.placement.walks) and solver.routes.case != "K2"
+
+    def write_general(self, solver, state_in, contacts: Contacts | None, dt: float) -> None:
+        """The general placement's one writer (:func:`.walk_rows.walked_rows_kernel`)."""
         placement, factor, model = solver.placement, solver.factor, solver.model
         # Without contacts no row is a contact's: the writer reads no contact input.
         contact_input = (
@@ -1241,9 +1250,10 @@ class RowLaws:
             bind_dense_rows(placement),
             placement.row_support(),
             placement.constraint_count,
-            # The local owners' packets keep their worlds' seeds: the writer walks the general worlds' rows.
-            placement.local_solve_owner,
-            int(placement.row_packets is not None),
+            # The local owners' packets and the keyed tiers keep their worlds' seeds: the writer walks the general
+            # worlds' rows.
+            placement.keyed_rows.owner if placement.keyed_rows is not None else placement.local_solve_owner,
+            int(placement.row_packets is not None or placement.keyed_rows is not None),
             lanes,
             contact_input,
             patch_row_law(solver),
@@ -1295,7 +1305,6 @@ class RowLaws:
                 bind_dense_rows(placement),
                 placement.unit_source,
                 placement.constraint_count,
-                sweep.support_lanes,
                 contact_input,
                 patch_row_law(solver),
                 sweep.support_sink(solver.v_hat),

@@ -9,7 +9,7 @@ its rows in the fused local kernels, which walk each row's seeds in the kernel
 (FL3.6, :class:`.row_inputs.CompactLocalRows`). This producer writes those
 seeds where the local kernels read them: the limit and mimic prefix as
 covectors (sparse coefficients at the primary's coordinates), each contact row
-as a wrench at each of its bodies' walk frames at the step's poses (a side code
+as a wrench at each of its bodies' walk frames (the factor's; a side code
 and six floats a side), both with the complete row metadata and right-hand
 sides of the ordinary producers. Only worlds the
 local owners decline (too many rows, matrix-free rows of another body,
@@ -349,7 +349,7 @@ def packet_seed(
     """A contact row's seed on one of its bodies: the side's code (the body's index in the primary's tree, or
     :data:`.row_inputs.SEED_SECONDARY` for the paired free body, :data:`.row_inputs.SEED_NONE` for a body without
     response coordinates) and the contact law's seed of ``sign`` along ``direction`` at ``point`` (a pure ``torque``
-    about it) at the body's walk frame at the step's poses (:func:`.walk_rows.body_wrench`, the one writer's)."""
+    about it) at the body's walk frame (:func:`.walk_rows.body_wrench`, the one writer's)."""
     code = int(SEED_NONE)
     w = wp.spatial_vector()
     if body >= 0 and art >= 0:

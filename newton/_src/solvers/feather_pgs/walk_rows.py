@@ -9,12 +9,13 @@ producer records with the row's slot and records, in place of a Jacobian. After 
 row of a world on the world's lanes (:func:`walked_rows_kernel`):
 
 - **the seed**, from the row's law (:data:`.dense_rows.UNIT_CONTACT` and the other kinds): a contact row's wrench on
-  each of its bodies, ``(d, (p - o) x d)`` at the body's frame ``o`` at the step's poses (its spin row's ``(0, n)``),
+  each of its bodies, ``(d, (p - o) x d)`` at the body's frame ``o`` (the factor's; its spin row's ``(0, n)``),
   the second body's negated; a link row's unit wrench at its two pieces' centres of mass, the shadow's negated; a joint
   limit's and a velocity limit's covector ``+-e_c``, a mimic's ``e_f - c e_l``;
 - **the walk** (:func:`.tree_factor.walk_paths_prelude`): each seed walked up its root path into the packed sink at its
-  side's entries, stored, a second seed on one tree adding where their paths meet. A wrench enters as ``J`` at the
-  step's frames (:meth:`.tree_factor.TreeFactor.walk_step`) and the refresh's factor whitens it, so a step between
+  side's entries, stored, a second seed on one tree adding where their paths meet. A wrench enters as the step's ``J``,
+  the finish's motion columns shifted to the walk's frames (:attr:`.tree_factor.WalkTrees.motion`), and the refresh's
+  factor whitens it, so a step between
   refreshes whitens the step's ``J`` by the held factor, as the dense rows do. A free rigid body is a one-body tree:
   its side is a six-step walk;
 - **the header**: the diagonal ``|z|^2 + cfm`` (the walks' sums of squares, or the row's entries where two seeds share
@@ -58,7 +59,6 @@ from .dense_rows import (
     MfRows,
     RowSupport,
     jacobian_row,
-    unit_source,
 )
 from .device_preludes import DevicePrelude, dual_native, lane_group, substitute
 from .field_group import Field
@@ -75,10 +75,10 @@ from .tree_factor import (
     WALK_COORDINATE,
     WALK_FRAME,
     WALK_LINK,
-    WALK_NOW,
     WalkRelease,
     WalkTrees,
     release_path,
+    walk_covector_into,
     walk_into,
     walk_prelude,
 )
@@ -91,7 +91,6 @@ __all__ = [
     "free_body_headers_kernel",
     "support_rows_kernel",
     "walked_rows_kernel",
-    "write_contact_units",
     "write_free_body_rows",
     "write_slot_rows",
     "writer_kernel",
@@ -132,13 +131,13 @@ def walk_wrench(
 @wp.func
 def body_wrench(walk: WalkTrees, body: int, direction: wp.vec3, point: wp.vec3, torque: bool) -> wp.spatial_vector:
     """The seed of a row acting on ``body`` along ``direction`` at ``point`` (a pure ``torque`` about it), by the
-    contact law (:func:`.contact_laws.contact_seed`, :func:`.contact_laws.spin_seed`): a wrench at the body's frame at
-    the step's poses (:attr:`.tree_factor.WalkTrees.now_link`), where the walk's columns ``now`` hold the step's
+    contact law (:func:`.contact_laws.contact_seed`, :func:`.contact_laws.spin_seed`): a wrench at the body's frame, the
+    factor's (:attr:`.tree_factor.WalkTrees.link`), where the walk shifts the finish's motion columns to take the step's
     ``J``. The lever arm is the world points' difference here; the law takes it from wherever it is formed."""
     if torque:
         return spin_seed(direction)
     j = walk.body_joint[body]
-    frame = wp.vec3(walk.now_link[j, 4], walk.now_link[j, 5], walk.now_link[j, 6])
+    frame = wp.vec3(walk.link[j, 4], walk.link[j, 5], walk.link[j, 6])
     return contact_seed(direction, point - frame)
 
 
@@ -161,14 +160,13 @@ def walk_body(
     j0 = walk.joint_start[art]
     return walk_into(
         walk,
+        art,
         j0,
         walk.dof_start[art],
         walk.joint_end[art] - j0,
         walk.dofs[art],
         walk.body_joint[body] - j0,
         wrench,
-        -1,
-        0.0,
         v_hat,
         add,
         sink,
@@ -202,14 +200,13 @@ def walk_covector(
     d0 = walk.dof_start[art]
     j0 = walk.joint_start[art]
     at = jacobian_row(support, group, art, sides)
-    return walk_into(
+    return walk_covector_into(
         walk,
         j0,
         d0,
         walk.joint_end[art] - j0,
         walk.dofs[art],
         walk.dof_body[dof],
-        wp.spatial_vector(),
         dof - d0,
         value,
         v_hat,
@@ -244,24 +241,8 @@ def release_side(
         release_path(walk.release, art, j, packed_Z, at[0], slot, at[1])
 
 
-@wp.kernel(enable_backward=False)
-def write_contact_units(data: ContactInput, total_threads: int, law: PatchRowLaw, units: wp.array2d[int]):
-    """Each dense contact row's records (:func:`.row_build.write_contact_row`) and unit source, four threads a contact
-    (grid-stride): its rows are those its allocation reserved (``slots_needed``: the normal, the friction pair, the spin
-    row)."""
-    tid = wp.tid()
-    r = tid % 4
-    for c in range(tid // 4, data.count[0], total_threads // 4):
-        if data.path[c] != 0:
-            continue
-        slot = data.slot[c]
-        if slot < 0 or r >= data.slots_needed[c]:
-            continue
-        write_contact_row(data, law, c, r, False)
-        units[data.first[data.world[c]], slot + r] = unit_source(UNIT_CONTACT, 4 * c + r)
-
-
-@wp.kernel(enable_backward=False)
+# Two blocks of 256 a multiprocessor (128 registers): the walk's one-row seeds with their held step sit at the bound.
+@wp.kernel(enable_backward=False, launch_bounds=(256, 2))
 def write_free_body_rows(
     mf: MfRows,
     data: ContactInput,
@@ -362,14 +343,13 @@ def free_body_headers_kernel(
             k = int(0)
             if mf.Z_a[line, i, 3] != 0.0:
                 k = 3
-            seed = walk_into(
+            seed = walk_covector_into(
                 walk,
                 j0,
                 d0,
                 walk.joint_end[art] - j0,
                 walk.dofs[art],
                 walk.dof_body[d0 + k],
-                wp.spatial_vector(),
                 k,
                 1.0,
                 v_hat,
@@ -459,8 +439,9 @@ def write_row(
     if kind == UNIT_CONTACT:
         c = index // 4
         r = index - 4 * c
-        body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
-        direction, row_point = contact_row_frame(r, normal, tangent0, tangent1, point, friction_point)
+        # The row's records by the contact law (the producer's, folded into the writer), then its seeds.
+        body_a, body_b, direction, row_point = write_contact_row(data, law, c, r, False)
+        sides = rows.sides[line, slot]
         spin = r == CONTACT_SPIN_ROW
         art_a = data.art0[c]
         art_b = data.art1[c]
@@ -757,8 +738,8 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
         }
         const float* data = walk.data.data + (size_t)d0 * $coordinate;
         const float* link = walk.link.data + (size_t)j0 * $link;
-        const float* now = walk.now.data + (size_t)d0 * $now;
-        const float* now_link = walk.now_link.data + (size_t)j0 * $link;
+        const float* now = reinterpret_cast<const float*>(walk.motion.data + d0);
+        const float* origin = reinterpret_cast<const float*>(walk.origin.data + art);
         const float* vh = sink.v_hat.data + d0;
         const auto rank = [&](int c) -> int { return base + POPC(mask & ((1ull << SUPPORT_NODE[c]) - 1ull)); };
         const auto store = [&](int r, int c, float z, float) {
@@ -786,7 +767,7 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                     for (int e = base; e < rank(c); ++e) Z[e] = 0.0f;
                 for (int i = 0; i < 6 * $rows; ++i) p[i] = w[i] = 0.0f;
                 WALK_SEED(data, c, x, p, store);
-                WALK_UP(data, link, nullptr, now_link, walk.dof_body.data[d0 + c], c - 1, p, w, store);
+                WALK_UP(data, link, nullptr, nullptr, walk.dof_body.data[d0 + c], c - 1, p, w, store);
                 incident[0] += x[0] * vh[c];
             }
         } else {
@@ -795,8 +776,9 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                 if (body < 0 || (k == 0 ? art_a : art_b) != art) continue;
                 const float sign = k == 0 ? 1.0f : -1.0f;
                 const int j = walk.body_joint.data[body];
-                // The seeds' wrenches at the body's frame at the step's poses, where the walk's columns are J's.
-                const float* o = walk.now_link.data + (size_t)j * $link + $frame;
+                const int local = j - j0;
+                // The seeds' wrenches at the body's frame (the factor's), where the walk's shifted columns are J's.
+                const float* o = walk.link.data + (size_t)j * $link + $frame;
                 for (int r = 0; r < $rows; ++r) {
                     float* q = p + 6 * r;
                     const float* d = unit.frame.data[r == 1 || r == 2 ? r : 0];
@@ -825,8 +807,7 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                     if (r < rows) incident[r] += j * vh[c];
                     store(r, c, z, j);
                 };
-                const int local = j - j0;
-                WALK_UP(data, link, now, now_link, local, WALK_FIRST_OF(local + 1) - 1, p, w, sink);
+                WALK_UP(data, link, now, origin, local, WALK_FIRST_OF(local + 1) - 1, p, w, sink);
             }
         }
         // A slipping tree's release (the predictor's border), root-most slip first, on the side's entries along each
@@ -922,7 +903,6 @@ _SPIN_TAIL = """        record[4] = cross[3];
         record[5] = cross[4];
         record[6] = cross[5];"""
 
-
 @cache
 def _support_table(node: tuple[int, ...]) -> DevicePrelude:
     """The class's factor coordinate of each tree coordinate, in constant memory: the support mask's bit."""
@@ -942,7 +922,6 @@ def _support_snippet(parent: tuple, first: tuple, node: tuple, rows: int, record
         last=rows - 1,
         coordinate=WALK_COORDINATE,
         link=WALK_LINK,
-        now=WALK_NOW,
         frame=WALK_FRAME,
         spin=int(spin),
         record=record,
@@ -997,17 +976,20 @@ class SupportUnit:
 
 @cache
 def support_rows_kernel(
-    parent: tuple[int, ...], first: tuple[int, ...], node: tuple[int, ...], *, records: bool, torsion: bool
+    parent: tuple[int, ...], first: tuple[int, ...], node: tuple[int, ...], *, records: bool, torsion: bool, lanes: int
 ) -> wp.Kernel:
-    """The support placement's one writer (case K1): ``dim = (worlds, lanes)``, a world's lane group striding over its
-    rows, a lane per unit (a contact's rows from its first, a joint row alone).
+    """The support placement's one writer (case K1): ``dim = (worlds, lanes)``, a world's lane group of ``lanes``
+    striding over its rows: first each contact row's records by the contact law (a lane a row: the producer's work,
+    folded), then a lane per unit (a contact's rows from its first, a joint row alone). The generator form
+    (Gamma per body, ``z = Gamma w``) measured slower on g1 than this direct walk, so the writer walks each unit.
 
     The class's tree (``parent``, ``first``: :func:`.tree_factor.walk_prelude`'s table) and each coordinate's factor
     coordinate ``node`` (the support masks' bit) are baked into constant memory. A contact unit of three rows (four
     under contact ``torsion``) is walked together and its Gram writes its block record where ``records`` (the
     triplet sweeps'); a unit of one row (a normal alone, a limit, a velocity limit, a mimic) by the one-row walker. Each
-    row's records and unit source are the producers' (:func:`write_contact_units`, the limit, velocity-limit and
-    mimic producers); the writer stores its footprints at their ranks in its support (``row_factor``, with the
+    contact row's records are written here by the contact law, its unit source where its slot is reserved
+    (:func:`.kernels.allocate_world_contact_slots`); a joint row's records and unit source are its producer's (the
+    limit, velocity-limit and mimic producers); the writer stores its footprints at their ranks in its support (``row_factor``, with the
     coordinates ``row_dof`` or the support class ``row_class``), its diagonal ``|z|^2 + cfm``, its incident ``J v_hat``
     and its rhs by the row law (:func:`.kernels.row_bias`).
     """
@@ -1023,12 +1005,10 @@ def support_rows_kernel(
 
     walk_one = walker(1, False)
     walk_unit = walker(unit_rows, records)
-
     def kernel(
         rows: DenseRows,
         sources: wp.array2d[int],
         counts: wp.array[int],
-        lanes: int,
         data: ContactInput,
         law: PatchRowLaw,
         sink: SupportSink,
@@ -1046,7 +1026,17 @@ def support_rows_kernel(
         world, lane = wp.tid()
         line = rows.first[world]
         count = wp.min(counts[world], sink.row_factor.shape[1])
-        for slot in range(lane, count, lanes):
+        # The contact rows' records by the contact law, a lane a row (the producer's work, folded into the writer),
+        # before any row's header reads them.
+        for slot in range(lane, count, wp.static(lanes)):
+            source = sources[line, slot]
+            if source >> UNIT_SHIFT == UNIT_CONTACT:
+                index = source & ((1 << UNIT_SHIFT) - 1)
+                c = index // 4
+                write_contact_row(data, law, c, index - 4 * c, False)
+        world_sync(wp.static(lanes))
+        # A lane a unit: a contact's rows from its first, a joint row alone.
+        for slot in range(lane, count, wp.static(lanes)):
             source = sources[line, slot]
             kind = source >> UNIT_SHIFT
             index = source & ((1 << UNIT_SHIFT) - 1)
@@ -1109,7 +1099,7 @@ def support_rows_kernel(
                 )  # fmt: skip
 
     name = f"support_rows_{len(node)}_{abs(hash((parent, first, node))) % (1 << 32):08x}"
-    name += ("_records" if records else "") + ("_torsion" if torsion else "")
+    name += ("_records" if records else "") + ("_torsion" if torsion else "") + f"_{lanes}"
     # Two blocks of 256 a multiprocessor within the register file (128 registers): the four-row walker holds 166
     # unbounded, and the bound costs it 16 B of stack (sm_120, ptxas).
     return python_kernel(kernel, name, launch_bounds=(256, 2))
@@ -1393,8 +1383,9 @@ def write_slot_rows(
         if kind == UNIT_CONTACT:
             c = index // 4
             r = index - 4 * c
-            body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
-            direction, row_point = contact_row_frame(r, normal, tangent0, tangent1, point, friction_point)
+            # The row's records by the contact law (the producer's, folded into the writer), then its seeds.
+            body_a, body_b, direction, row_point = write_contact_row(data, law, c, r, False)
+            sides = rows.sides[line, slot]
             walked, coord_a, z_a, coord_b, z_b = contact_seeds(
                 walk,
                 support,
