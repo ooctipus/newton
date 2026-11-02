@@ -2366,27 +2366,31 @@ def walk_fetch(layout: TreeLayout, classes: tuple, guard: str = "") -> str:
     return f"#if defined(__CUDA_ARCH__)\n{text}#endif\n"
 
 
-def walk_up(cls, unroll: int = PREDICTOR_UNROLL, ahead: int | None = PREDICTOR_AHEAD) -> str:
-    """Native statements of the walk up of class ``cls`` (the emitter's leaf-first walk, straight-line up to
-    ``unroll`` coordinates, its records, links and ``x`` loaded ``ahead`` items ahead of the chain and asked of L1
-    before that, as the walk down's): ``u = L^-1 P x``, with ``x``, ``u``, ``data`` and ``link`` in scope."""
-    from string import Template  # noqa: PLC0415
-
+def _up_texts() -> dict[str, str]:
+    """The walk up's :meth:`.tree_factor.WalkClass.walk` keywords: its joint, step, fetches and touches, leaf first."""
     from .tree_factor import WALK_COORDINATE, WALK_LINK  # noqa: PLC0415
 
-    step = Template(_UP_STEP).safe_substitute(coordinate=WALK_COORDINATE)
-    joint = Template(_UP_JOINT).safe_substitute(link=WALK_LINK)
-    inputs = {
+    return {
+        "joint": _UP_JOINT,
+        "step": _UP_STEP,
+        "root_first": False,
         "fetch_joint": "WALK_LINK_IN(link, $b, $up)",
         "fetch_step": f"WALK_IN(data + {WALK_COORDINATE} * ($c), x[$c], 0.0f, $half)",
         "touch_joint": f"WALK_TOUCH(link + {WALK_LINK} * ($b));",
         "touch_step": f"WALK_TOUCH(data + {WALK_COORDINATE} * ($c));",
     }
+
+
+def walk_up(cls, unroll: int = PREDICTOR_UNROLL, ahead: int | None = PREDICTOR_AHEAD) -> str:
+    """Native statements of the walk up of class ``cls`` (the emitter's leaf-first walk, straight-line up to
+    ``unroll`` coordinates, its records, links and ``x`` loaded ``ahead`` items ahead of the chain and asked of L1
+    before that, as the walk down's): ``u = L^-1 P x``, with ``x``, ``u``, ``data`` and ``link`` in scope."""
+    up = {**_up_texts(), "unroll": unroll, "ahead": ahead}
     return (
         "{\n#if defined(__CUDA_ARCH__)\n"
-        + cls.walk(joint, step, root_first=False, cuda=True, unroll=unroll, ahead=ahead, **inputs)
+        + cls.walk(**up, cuda=True)
         + "\n#else\n"
-        + cls.walk(joint, step, root_first=False, cuda=False, unroll=unroll, ahead=ahead, **inputs)
+        + cls.walk(**up, cuda=False)
         + "\n#endif\n}"
     )
 
@@ -2663,7 +2667,21 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
     walk up of ``trial.force`` into registers and the walk down into ``trial.response``, ``P^T L^-T L^-1 P f`` on the
     all-``K`` walk. A prescribed root responds with zero."""
     from .kernel_template import THREADS  # noqa: PLC0415
-    from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_UNROLL, WalkTrees, walk_down_prelude  # noqa: PLC0415
+    from .tree_factor import (  # noqa: PLC0415
+        WALK_COORDINATE,
+        WALK_LINK,
+        WALK_REGISTERS,
+        WALK_UNROLL,
+        WalkTrees,
+        walk_down_prelude,
+        walk_down_texts,
+    )
+
+    up = {**_up_texts(), "unroll": WALK_UNROLL}
+    # The walk down's inputs: the walk up's u, no prior; its output the trial's response.
+    down = {**walk_down_texts(), "unroll": WALK_UNROLL}
+    down["fetch_step"] = f"WALK_IN(data + {WALK_COORDINATE} * ($c), u[$c], 0.0f, $half)"
+    hand = "WalkIn{$X.s, $X.t, $X.w, $X.e, u[$c], 0.0f}"
 
     walked = {r: k for r, _, k in _walked(layout, classes)}
     cases = []
@@ -2683,10 +2701,13 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
                 "const float* __restrict__ x = trial.force.data + d0;\n"
                 "float* __restrict__ out = trial.response.data + d0;\n"
                 f"float u[{max(cls.coordinates, 1)}];\n"
-                + walk_up(cls, WALK_UNROLL, None)
-                + f"\nWALK_DOWN({walked[r]}, data, link, [&](const int c) {{ return u[c]; }},"
-                " [](const int) -> float { return 0.0f; }, [&](const int c, const float q, const float) { out[c] = q; },"
-                " [](const int, const float*) {});"
+                "const auto qd = [&](const int c, const float q, const float) { out[c] = q; };\n"
+                "const auto twist = [](const int, const float*) {};\n"
+                "#if defined(__CUDA_ARCH__)\n"
+                + cls.walk_twice(up, down, hand=hand, registers=WALK_REGISTERS, cuda=True)
+                + "\n#else\n"
+                + cls.walk_twice(up, down, hand=hand, registers=WALK_REGISTERS, cuda=False)
+                + "\n#endif\n"
             )
         cases.append(f"    case {r}: {{\n{body}\n        break;\n    }}")
     walked_classes = tuple(cls for cls in classes if cls is not None)

@@ -2176,6 +2176,10 @@ WALK_TOUCH = 16
 """Items a walk asks L1 for ahead of its chain (:meth:`WalkClass.touch`): a hint without a register or a scoreboard,
 so the loads :data:`WALK_AHEAD` items ahead find their lines in L1."""
 
+WALK_REGISTERS = 255
+"""Registers a thread holds at most (the ISA's line): what a kernel without a launch bound may spend holding a walk's
+items for its two passes (:meth:`WalkClass.walk_twice`)."""
+
 WALK_AHEAD = 4
 """Items (a body's joint input, a coordinate's step input) a walk keeps in flight ahead of its serial chain
 (:meth:`WalkClass.ahead`): each step of the chain then waits on no load, and a lane holds this many items' inputs in
@@ -2520,6 +2524,52 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
         at most the walk's ``items`` (a short tree's every load issues before its first step)."""
         return max(0, min(WALK_AHEAD if ahead is None else ahead, items))
 
+    @property
+    def held_words(self) -> int:
+        """Registers a lane spends holding every item of the class for two walks over it: a coordinate's record
+        (:data:`WALK_STAGED` floats) and its value, a body's link where it has a parent (one ``float4``)."""
+        return (WALK_STAGED + 1) * self.coordinates + 4 * sum(1 for up in self.parent if up >= 0)
+
+    def walk_twice(self, first: dict, second: dict, *, hand: str, registers: int, cuda: bool = True) -> str:
+        """Native statements of two walks over one tree of the class (a solve's walk up, then its walk down), each
+        :meth:`walk`'s keywords (``first``, ``second``), their records and links the same items.
+
+        **Each item fetched once, when the class's items fit the kernel's registers.** A straight-line class whose
+        :attr:`held_words` fit ``registers`` (the kernel's budget, :data:`WALK_REGISTERS` without a launch bound) fetches
+        every item once, with the first walk's inputs (``first``'s ``fetch_joint``, ``fetch_step``), before either walk,
+        and hands each to both: the second walk's step input is ``hand``, built from the held item ``$X`` of
+        coordinate ``$c`` (its own values in place of the first walk's); each item's line is touched before the
+        fetches. Past that, each walk fetches its own items ahead of its chain and touches them (:meth:`walk`).
+        """
+        if self.coordinates > first.get("unroll", WALK_UNROLL) or self.held_words > registers:
+            return "{\n" + self.walk(**first, cuda=cuda) + "\n}\n{\n" + self.walk(**second, cuda=cuda) + "\n}"
+        bare = {"fetch_joint": "", "fetch_step": "", "touch_joint": "", "touch_step": ""}
+        # Every held item's line asked of L1 first, then the fetches: on the RTX PRO 6000 the bare fetches of a free
+        # cube's records ran 9.2 -> 12.6 us; touched first, 8.3 (hold p2).
+        items = [_fill(first["touch_step"], c=c) for c in range(self.coordinates) if first.get("touch_step")]
+        items += [
+            _fill(first["touch_joint"], b=b) for b, up in enumerate(self.parent) if up >= 0 and first.get("touch_joint")
+        ]
+        items += [
+            f"const auto walk_l{b} = {_fill(first['fetch_joint'], b=b, up=up)};"
+            for b, up in enumerate(self.parent)
+            if up >= 0
+        ]
+        items += [
+            f"const auto walk_x{c} = {_fill(first['fetch_step'], c=c, half=self.half_of(c))};"
+            for c in range(self.coordinates)
+        ]
+        step = Template(second["step"]).safe_substitute(X="walk_h")
+        handed = f"{{\nconst auto walk_h = {hand};\n{step}\n}}"
+        return (
+            "\n".join(items)
+            + "\n{\n"
+            + self.walk(**{**first, **bare}, cuda=cuda)
+            + "\n}\n{\n"
+            + self.walk(**{**second, **bare, "step": handed}, cuda=cuda)
+            + "\n}"
+        )
+
 
 FREE_BODY_WALK = WalkClass((-1,), (0, 6), (0, 0, 0, 1, 1, 1))
 """A free rigid body's walking class: one body of six coordinates."""
@@ -2651,26 +2701,22 @@ _DOWN_STEP = """{
 }"""
 
 
+def walk_down_texts() -> dict[str, str]:
+    """The one walk down's :meth:`WalkClass.walk` keywords (its joint, step, end, fetches and touches): ``u(c)``,
+    ``prior(c)``, ``qd(c, q, prior)`` and ``twist(b, V)`` are the caller's (:func:`walk_down_prelude`'s ``WALK_DOWN``)."""
+    return {
+        "joint": Template(_DOWN_JOINT).safe_substitute(link=WALK_LINK),
+        "step": Template(_DOWN_STEP).safe_substitute(coordinate=WALK_COORDINATE),
+        "end": "twist($b, $V);",
+        "fetch_joint": _DOWN_FETCH_JOINT,
+        "fetch_step": Template(_DOWN_FETCH_STEP).safe_substitute(coordinate=WALK_COORDINATE),
+        "touch_joint": Template(_DOWN_TOUCH_JOINT).safe_substitute(link=WALK_LINK),
+        "touch_step": Template(_DOWN_TOUCH_STEP).safe_substitute(coordinate=WALK_COORDINATE),
+    }
+
+
 def _walk_down(classes: tuple[WalkClass, ...], cuda: bool, unroll: int, ahead: int | None) -> str:
-    joint = Template(_DOWN_JOINT).safe_substitute(link=WALK_LINK)
-    step = Template(_DOWN_STEP).safe_substitute(coordinate=WALK_COORDINATE)
-    fetch_joint = _DOWN_FETCH_JOINT
-    fetch_step = Template(_DOWN_FETCH_STEP).safe_substitute(coordinate=WALK_COORDINATE)
-    bodies = [
-        walk.walk(
-            joint,
-            step,
-            end="twist($b, $V);",
-            cuda=cuda,
-            unroll=unroll,
-            fetch_joint=fetch_joint,
-            fetch_step=fetch_step,
-            touch_joint=Template(_DOWN_TOUCH_JOINT).safe_substitute(link=WALK_LINK),
-            touch_step=Template(_DOWN_TOUCH_STEP).safe_substitute(coordinate=WALK_COORDINATE),
-            ahead=ahead,
-        )
-        for walk in classes
-    ]
+    bodies = [walk.walk(**walk_down_texts(), cuda=cuda, unroll=unroll, ahead=ahead) for walk in classes]
     if len(bodies) == 1:
         walk = indent_text(bodies[0], 8)
     else:
