@@ -955,7 +955,6 @@ class TreeFactor:
         walked = np.zeros(max(int(model.joint_count), 1), dtype=bool)
         for art in arts.tolist():
             walked[int(start[art]) : int(end[art])] = True
-        both = False
         for j in range(kinds.size):
             lin, ang = int(dims[j, 0]), int(dims[j, 1])
             two = ang > 0 and (
@@ -965,7 +964,7 @@ class TreeFactor:
             c = int(qd_start[j])
             self.walk_half_host[c : c + lin] = WALK_LINEAR
             self.walk_half_host[c + lin : c + lin + ang] = WALK_BOTH if two else WALK_ANGULAR
-            both = both or bool(two and walked[j])
+        both = self.two_halves(np.flatnonzero(np.repeat(walked[: kinds.size], np.diff(qd_start[: kinds.size + 1]))))
         # The walking classes: each held tree's topology, which the step's one leave (walk_leave_kernel) and the
         # thread-a-tree refresh (walk_step_class_kernel) emit as its walk, and each articulation's class among them.
         classes: dict[WalkClass, int] = {}
@@ -1159,6 +1158,14 @@ class TreeFactor:
             block_dim=max(self.walk_block, lanes),
             device=model.device,
         )
+
+    def two_halves(self, coordinates) -> bool:
+        """Whether a coordinate of ``coordinates`` has a step column of two halves at its frame (:data:`WALK_BOTH`, from
+        its joint's kind): the one rule a walk reader's text is chosen by. :attr:`walk_side` is it over the walked
+        coordinates; a held group's finish reads it over its own (:class:`.tree_kinetic_owner.TreeKineticState`)."""
+        if self.walk_half_host is None:
+            return False
+        return bool(np.any(self.walk_half_host[np.asarray(coordinates, dtype=np.int64)] == WALK_BOTH))
 
     def diagonal(self, articulation: int) -> np.ndarray:
         """What this factor adds to ``articulation``'s mass matrix: each coordinate's effective armature ``R``

@@ -305,6 +305,12 @@ class TreeKineticState:
         groups = self.group_count
         # Whether the group's refresh reads H's diagonal (a compact diagonal's inverse): its collection keeps H_ii.
         self.diagonal_mass = bool(getattr(sparse_owner, "diagonal_mass", False))
+        # Whether a coordinate of the group's trees has a step column of two halves at its frame (the walk's one rule,
+        # tree_factor.TreeFactor.two_halves; walk_side is it over every walked tree): only then does its finish form
+        # the walk's columns a second time.
+        owned = self._root_arts.reshape(-1)
+        owner, local = expand(solver.forest.articulation_dof_count_host[owned])
+        self.two_half = solver.factor.two_halves(solver.forest.articulation_dof_start_host[owned][owner] + local)
         self.data = native.KineticData()
         field_group.SolverArrays(self.data, device).allocate(
             native.KINETIC_CACHE.owned("cache"),
@@ -375,6 +381,7 @@ class TreeKineticState:
             motion_velocity=self.motion_velocity,
             clocked=self.clocked,
             diagonal=self.diagonal_mass,
+            two_half=self.two_half,
         )
         # A classified repair compares in a pass of its own over the blocks its classification
         # lists for comparison. Otherwise a second one-pass repair kernel compares inside its
@@ -393,6 +400,7 @@ class TreeKineticState:
                 bank_coordinates=self.bank_coordinates,
                 clocked=self.clocked,
                 diagonal=self.diagonal_mass,
+                two_half=self.two_half,
             )
         self.classify_kernel = self.listed_repair_kernel = None
         if self.classify_first:
@@ -406,6 +414,7 @@ class TreeKineticState:
                 listed=True,
                 clocked=self.clocked,
                 diagonal=self.diagonal_mass,
+                two_half=self.two_half,
             )
         self.finish_kernel = native.get_state_kernel(
             True,
@@ -414,6 +423,7 @@ class TreeKineticState:
             body_velocity=self._body_velocity,
             clocked=self.clocked,
             diagonal=self.diagonal_mass,
+            two_half=self.two_half,
         )
         classes = self._walk_classes()
         self.force_kernel = native.get_force_kernel(

@@ -1060,6 +1060,7 @@ def get_state_kernel(
     bank_coordinates: int = 0,
     clocked: bool = False,
     diagonal: bool = False,
+    two_half: bool = False,
 ):
     """Build a complete repair, or with ``finish`` a complete finish, from its stage functions.
 
@@ -1096,7 +1097,10 @@ def get_state_kernel(
     :func:`get_bank_kernel` instead. ``schedules`` are the scans' schedules;
     ``clocked`` selects the stage counters (``stage_clocks`` columns 0-7 for
     the stages, 22-24 for motion; see :func:`get_helpers`); ``diagonal`` keeps
-    a compact diagonal's ``H_ii`` (:data:`_DIAGONAL`).
+    a compact diagonal's ``H_ii`` (:data:`_DIAGONAL`); ``two_half`` (the group
+    holds a joint whose step column has two halves at its frame,
+    :data:`.tree_factor.WALK_BOTH`) forms the walk's step columns a second time
+    at the anchor's rotation, where every other group stores S's halves.
     """
     if finish and motion_velocity:
         raise ValueError("Alternate motion velocity is a repair-only contract")
@@ -1115,7 +1119,11 @@ def get_state_kernel(
     _store_origin, _load_origin, _store_axis = h._store_origin, h._load_origin, h._store_axis
     bodies, dofs, pack, free_root = layout.bodies, layout.dofs, layout.pack, layout.free_root
     roots, free_roots, forest, own_bias = len(layout.roots), layout.free_root_count, layout.forest, layout.own_bias
-    from .tree_factor import WALK_FRAME, store_walk_columns  # noqa: PLC0415 (tree_factor imports this module)
+    from .tree_factor import (  # noqa: PLC0415 (tree_factor imports this module)
+        WALK_FRAME,
+        store_walk_column,
+        store_walk_columns,
+    )
 
     @wp.func
     def admit(
@@ -1365,33 +1373,50 @@ def get_state_kernel(
             if wp.static(clocked):
                 clock_m2 = _clock()
             start = data.joint_qd_start[joint]
-            count = data.joint_dof_dim[joint, 0] + data.joint_dof_dim[joint, 1]
-            for k in range(count):
-                _store_axis(g.address, start - g.ds + k, data.joint_S_s[start + k])
-            if data.walk_now.shape[0] > 0:
-                # The walk's step geometry (tree_factor.WalkTrees.now): the same columns at the joint's frame, so a
-                # walk takes them there without S's lever about the origin, and the frame's world point.
+            lin, ang = data.joint_dof_dim[joint, 0], data.joint_dof_dim[joint, 1]
+            walks = data.walk_now.shape[0] > 0
+            # The walk's step geometry (tree_factor.WalkTrees.now): each coordinate's column at its joint's frame, so
+            # a walk takes it there without S's lever about the origin, and the frame's world point (a free joint's
+            # child's centre of mass).
+            for k in range(lin + ang):
+                column = data.joint_S_s[start + k]
+                _store_axis(g.address, start - g.ds + k, column)
+                if wp.static(not two_half):
+                    if walks:
+                        # A column of one half (every joint but two_half's) is that half of S at the frame, the same
+                        # words: S carries the anchor's point only into a turn's linear half, which the frame drops.
+                        if k < lin:
+                            store_walk_column(
+                                data.walk_now, start + k, 0, wp.spatial_vector(wp.spatial_top(column), wp.vec3())
+                            )
+                        else:
+                            store_walk_column(
+                                data.walk_now, start + k, 0, wp.spatial_vector(wp.vec3(), wp.spatial_bottom(column))
+                            )
+            if walks:
                 kind = data.joint_type[joint]
                 free = kind == JointType.FREE or kind == JointType.DISTANCE
                 if free:
                     point = wp.transform_point(_load_pose(g.address, local), data.body_com[data.joint_child[joint]])
-                lin, ang = data.joint_dof_dim[joint, 0], data.joint_dof_dim[joint, 1]
-                l0, l1, l2, a0, a1, a2 = joint_columns(
-                    kind,
-                    data.joint_axis,
-                    lin,
-                    ang,
-                    wp.transform(wp.vec3(), wp.transform_get_rotation(anchor)),
-                    q,
-                    data.joint_q_start[joint],
-                    start,
-                )
-                if free:
-                    # A free joint turns about the articulation's origin: the same twist at its frame.
-                    a0 = wp.spatial_vector(wp.cross(wp.spatial_bottom(a0), point - origin), wp.spatial_bottom(a0))
-                    a1 = wp.spatial_vector(wp.cross(wp.spatial_bottom(a1), point - origin), wp.spatial_bottom(a1))
-                    a2 = wp.spatial_vector(wp.cross(wp.spatial_bottom(a2), point - origin), wp.spatial_bottom(a2))
-                store_walk_columns(data.walk_now, data.joint_qd.shape[0], start, lin, ang, l0, l1, l2, a0, a1, a2)
+                if wp.static(two_half):
+                    # A group with a joint whose column has two halves at its frame (a D6 joint's turns after its
+                    # slides, a free joint's turns below a root): the columns again, at the anchor's rotation alone.
+                    l0, l1, l2, a0, a1, a2 = joint_columns(
+                        kind,
+                        data.joint_axis,
+                        lin,
+                        ang,
+                        wp.transform(wp.vec3(), wp.transform_get_rotation(anchor)),
+                        q,
+                        data.joint_q_start[joint],
+                        start,
+                    )
+                    if free:
+                        # A free joint turns about the articulation's origin: the same twist at its frame.
+                        a0 = wp.spatial_vector(wp.cross(wp.spatial_bottom(a0), point - origin), wp.spatial_bottom(a0))
+                        a1 = wp.spatial_vector(wp.cross(wp.spatial_bottom(a1), point - origin), wp.spatial_bottom(a1))
+                        a2 = wp.spatial_vector(wp.cross(wp.spatial_bottom(a2), point - origin), wp.spatial_bottom(a2))
+                    store_walk_columns(data.walk_now, data.joint_qd.shape[0], start, lin, ang, l0, l1, l2, a0, a1, a2)
                 frame = point + shift
                 for k in range(3):
                     data.walk_now_link[joint, wp.static(WALK_FRAME) + k] = frame[k]
@@ -1557,6 +1582,8 @@ def get_state_kernel(
         name += "_banked"
     if diagonal:
         name += "_diagonal"
+    if two_half:
+        name += "_halves"
     return python_kernel(kinetic_state, name)
 
 
