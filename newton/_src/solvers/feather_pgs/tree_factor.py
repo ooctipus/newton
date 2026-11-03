@@ -54,7 +54,7 @@ from .solver_fields import (
     BODY_INERTIA,
     PREELIMINATION,
     PREELIMINATION_PLAN,
-    SIZE_FACTORS,
+    SIZE_ARMATURE,
     STATE_AUX,
     DriveRows,
     Preelim,
@@ -171,7 +171,6 @@ class TreeFactor:
         self.armature_floor = None
         # The effective armature by coordinate (scatter_armature): the walk's diagonal and the drives' K-free mass.
         self.dof_armature = wp.zeros(max(1, int(model.joint_dof_count)), dtype=wp.float32, device=model.device)
-        self.L_by_size: dict[int, wp.array] = {}
         self.R_by_size: dict[int, wp.array] = {}
         self.diagonal_inverse_mass = None
         self.body_factors = None
@@ -501,15 +500,11 @@ class TreeFactor:
         self.sparse_mass_matrix_plan = plan
         self.sparse_mass_matrix_indices = factor_indices(plan, self.model.device)
 
-    def allocate_size_groups(self, placeholder_sizes) -> None:
-        """Allocate each size group's factor L and armature R; ``placeholder_sizes`` (the compact diagonal and the
-        native sparse factor) keep (1, 1, 1) placeholders of L."""
+    def allocate_size_groups(self) -> None:
+        """Allocate each size group's armature R."""
         for size in self.forest.size_groups:
-            n_arts = self.forest.n_arts_by_size[size]
-            placeholder = size in placeholder_sizes
-            factor = 1 if placeholder else 0
-            sizes = {"art": n_arts, "size": size, "factor_art": factor or n_arts, "factor_size": factor or size}
-            for name, array in self._arrays.allocate(SIZE_FACTORS, owner={}, **sizes).items():
+            sizes = {"art": self.forest.n_arts_by_size[size], "size": size}
+            for name, array in self._arrays.allocate(SIZE_ARMATURE, owner={}, **sizes).items():
                 getattr(self, f"{name}_by_size")[size] = array
 
     def scatter_armature(self) -> None:
@@ -523,7 +518,7 @@ class TreeFactor:
         art_dof_start_np = self.forest.articulation_dof_start_host
         art_H_rows_np = self.forest.articulation_dof_count_host
 
-        # R_by_size is sized to the actual DOF count (as the factor L).
+        # R_by_size is sized to the actual DOF count.
         for size in self.forest.size_groups:
             n_arts = self.forest.n_arts_by_size[size]
             R_np = np.zeros((n_arts, size), dtype=np.float32)
@@ -538,54 +533,25 @@ class TreeFactor:
             self.R_by_size[size].assign(R_np)
 
     def build_body_factors(self) -> None:
-        """Build each free body's held factor and coordinates (:class:`.kernels.BodyFactors`): the dynamics' size-6
-        factors ``L_by_size[6]`` (armature included), which whiten its rows and map its velocity into factor
-        coordinates, and the lookup of a body's factor by its first global coordinate. Built once with the buffers: a
-        captured step allocates and copies nothing."""
+        """Build where each body's tree and coordinates live (:class:`.kernels.BodyFactors`): each body's articulation,
+        each articulation's first coordinate, and the articulation whose coordinates start at each global coordinate.
+        Built once with the buffers: a captured step allocates and copies nothing."""
         model, forest = self.model, self.forest
         device = model.device
-        dof_factor = np.full(max(int(model.joint_dof_count), 1), -1, dtype=np.int32)
-        if forest.has_free_rigid_bodies:
-            free = np.flatnonzero(forest.is_free_rigid_host != 0)
-            factor_index = forest.art_group_idx.numpy()[free]
-            starts = forest.articulation_dof_start.numpy()[free]
-            held = factor_index >= 0
-            dof_factor[starts[held]] = factor_index[held]
-        factors = BodyFactors()
-        factors.body_to_articulation = forest.body_to_articulation
-        factors.factor_index = forest.art_group_idx
-        factors.dof_start = forest.articulation_dof_start
-        factors.dof_factor = wp.array(dof_factor, dtype=wp.int32, device=device)
-        lower = self.L_by_size.get(6) if forest.has_free_rigid_bodies else None
-        factors.L = lower if lower is not None else wp.zeros((1, 6, 6), dtype=wp.float32, device=device)
-        # Every articulation's dense factor, by address: the size groups' factors are allocated once, with the buffers.
-        art_count = max(int(model.articulation_count), 1)
         first_art = np.full(max(int(model.joint_dof_count), 1), -1, dtype=np.int32)
-        sizes = np.zeros(art_count, dtype=np.int32)
-        offsets = np.zeros(art_count, dtype=np.int32)
-        addresses = np.zeros(art_count, dtype=np.uint64)
         if int(model.articulation_count) > 0:
             starts = forest.articulation_dof_start.numpy()
-            counts = forest.articulation_response_dof_count.numpy()
-            world_offsets = forest.articulation_world_dof_offset
-            offsets[:] = world_offsets.numpy() if world_offsets is not None else 0
-            sizes[:] = counts
-            responding = np.flatnonzero(counts > 0)
+            responding = np.flatnonzero(forest.articulation_response_dof_count.numpy() > 0)
             first_art[starts[responding]] = responding
-            for size, lower_group in self.L_by_size.items():
-                if lower_group.shape[1] != size or size not in forest.group_to_art:
-                    continue  # A compact or sparse size keeps a placeholder: no dense factor.
-                arts = forest.group_to_art[size].numpy()
-                addresses[arts] = lower_group.ptr + np.arange(len(arts), dtype=np.uint64) * np.uint64(size * size * 4)
+        factors = BodyFactors()
+        factors.body_to_articulation = forest.body_to_articulation
+        factors.dof_start = forest.articulation_dof_start
         factors.first_art = wp.array(first_art, dtype=wp.int32, device=device)
-        factors.size = wp.array(sizes, dtype=wp.int32, device=device)
-        factors.world_offset = wp.array(offsets, dtype=wp.int32, device=device)
-        factors.address = wp.array(addresses, dtype=wp.uint64, device=device)
         self.body_factors = factors
 
     def view(self) -> BodyFactors:
-        """The operand struct of the factor's whiten device functions: the free bodies' factors and every
-        articulation's dense factor by address (:meth:`build_body_factors`)."""
+        """The operand struct of the walk's free-body reads: where each body's tree and coordinates live
+        (:meth:`build_body_factors`)."""
         return self.body_factors
 
     def install(self, solver) -> None:

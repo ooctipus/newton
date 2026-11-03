@@ -24,7 +24,7 @@ from .device_proof import DeviceProof
 from .sparse_factor import SparseData, bind_operator_plan, operator_metadata
 from .tree_kinetic_owner import TreeKineticState, launch_switches, proof_runs, stage_clocks_on
 from .tree_kinetic_plan import FREE_JOINTS, make_plan, tree_joints
-from .tree_kinetic_state import HeldResponse, root_field
+from .tree_kinetic_state import HeldResponse
 from .tree_plan import TreePlan, local_parents
 
 
@@ -252,8 +252,7 @@ class TreeSparseOperator:
 class TreeHeldOperator:
     """The range ``span`` of a size group as a held group: the trees of one topology, whose armature is that range of
     the size group's. A walking group refreshes nothing of its own (the walk's refresh is its factor, its collection
-    writes ``row_H``); the compact diagonal refreshes its inverse mass from the held geometry. The walking group's
-    ``lower`` binding (its range of the size group's ``L``, which nothing builds or reads) goes with ``L``."""
+    writes ``row_H``); the compact diagonal refreshes its inverse mass from the held geometry."""
 
     def __init__(self, solver, size, span):
         self.solver, self.size, self.span = solver, size, span
@@ -274,14 +273,7 @@ class TreeHeldOperator:
         if self.diagonal:
             self.data.inverse = solver.factor.diagonal_inverse_mass
             self.geometry_group = wp.array(np.arange(count, dtype=np.int32), dtype=int, device=device)
-        else:
-            self.data.lower = self._lower
         self.kinetic_state = None
-
-    @property
-    def _lower(self):
-        """The trees' range of the size group's ``L``."""
-        return self.solver.factor.L_by_size[self.size][self.span[0] : self.span[1]]
 
     def refresh(self, state_aug):
         """The compact diagonal's inverse mass from the requested groups' current geometry; a walking group has nothing
@@ -310,11 +302,9 @@ class TreeHeldOperator:
         )
 
     def bind_response(self):
-        """Bind current held-array descriptors before a new launch or capture."""
+        """Bind the compact diagonal's inverse before a new launch or capture; a walking group binds nothing."""
         if self.diagonal:
             self.data.inverse = self.solver.factor.diagonal_inverse_mass
-        else:
-            self.data.lower = self._lower
 
 
 class PrescribedRootOperator:
@@ -507,14 +497,7 @@ class ForestHeldOperator:
         # offset); a walking root refreshes nothing of its own.
         self.diagonal_mass = any(f < 0 for f in self.root_families)
         self.families = []
-        factor_index = np.zeros((worlds, len(self.root_families)), np.int32)
         for r, family in enumerate(self.root_families):
-            if family > 0:
-                # The walking root's binding of its size group's L, which nothing builds or reads, goes with L.
-                group = solver.forest.group_to_art[family].numpy()
-                position = {int(a): g for g, a in enumerate(group)}
-                factor_index[:, r] = [position[int(a)] for a in arts[:, r]]
-                setattr(self.data, root_field("lower", r), solver.factor.L_by_size[family])
             if family >= 0:
                 continue
             size = -family
@@ -526,12 +509,6 @@ class ForestHeldOperator:
                     wp.array(art_world[group].astype(np.int32), dtype=int, device=device),
                 )
             )
-        if not any(f > 0 for f in self.root_families):
-            self.data.lower = wp.zeros((1, 1, 1), dtype=float, device=device)
-        for r, family in enumerate(self.root_families):
-            if family <= 0 and r > 0:
-                setattr(self.data, f"lower{r}", self.data.lower)
-        self.data.factor_index = wp.array(factor_index, dtype=int, device=device)
         self.kinetic_state = None
 
     def refresh(self, state_aug):
@@ -558,10 +535,7 @@ class ForestHeldOperator:
             )
 
     def bind_response(self):
-        """Rebind the walking roots' ``L`` (unread; it goes with ``L``) before a launch or capture."""
-        for r, family in enumerate(self.root_families):
-            if family > 0:
-                setattr(self.data, root_field("lower", r), self.solver.factor.L_by_size[family])
+        """Nothing rebinds: the walking roots read the walk, the diagonal roots the solver's inverse."""
 
 
 class HeldTree:

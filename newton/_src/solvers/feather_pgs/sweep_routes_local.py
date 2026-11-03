@@ -544,10 +544,6 @@ PAIRED_FACTOR_ABI = kernel_template.params(
     ("world_row_parent", wp.array2d[int]),
     ("world_row_mu", wp.array2d[float]),
     ("world_mf_constraint_count", wp.array[int]),
-    ("primary_L", wp.array3d[float]),
-    ("secondary_L", wp.array3d[float]),
-    ("primary_group_by_world", wp.array[int]),
-    ("secondary_group_by_world", wp.array[int]),
     ("primary_offset_by_world", wp.array[int]),
     ("secondary_offset_by_world", wp.array[int]),
     ("iterations", int),
@@ -685,12 +681,8 @@ def paired_factor_source(
     const int off = line * {M};
     const int row_base = off * {D};
     const int dof_map_base = world * {D};
-    const int primary_group = primary_group_by_world.data[world];
-    const int secondary_group = secondary_group_by_world.data[world];
     const int primary_offset = primary_offset_by_world.data[world];
     const int secondary_offset = secondary_offset_by_world.data[world];
-    const int primary_matrix_base = primary_group * {P * P};
-    const int secondary_matrix_base = secondary_group * {S * S};
     // A contact normal's patch ring links the region's next normal (-1 ends a point contact).
     const auto ring_parent = [&](int r) {{ return world_row_parent.data[off + r]; }};
     const auto ring_impulse = [&](int r) {{ return s_lam[r]; }};{layout}

@@ -733,11 +733,6 @@ def _launch_paired_factor_solve(kernel, rows, device, *, primary, components, it
             array(rows["row_parent"], wp.int32),
             array(rows["row_mu"], wp.float32),
             array(selector, wp.int32),
-            # The held factors' arrays, which the walk's sweep does not read.
-            wp.zeros((1, 1, 1), dtype=wp.float32, device=device),
-            wp.zeros((1, 1, 1), dtype=wp.float32, device=device),
-            array(np.arange(worlds, dtype=np.int32), wp.int32),
-            array(np.arange(worlds, dtype=np.int32), wp.int32),
             array(np.where(odd, secondary, 0).astype(np.int32), wp.int32),
             array(np.where(odd, 0, primary).astype(np.int32), wp.int32),
             iterations,

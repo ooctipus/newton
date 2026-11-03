@@ -99,20 +99,9 @@ class StateBank:
 
 @wp.struct
 class HeldResponse:
-    lower: wp.array3d[float]
     inverse: wp.array[float]
     valid: wp.array[int]
     status: wp.array[int]
-    # Forest groups: one held factor family per root and each root's index in it.
-    lower1: wp.array3d[float]
-    lower2: wp.array3d[float]
-    lower3: wp.array3d[float]
-    factor_index: wp.array2d[int]
-
-
-def root_field(name: str, root: int) -> str:
-    """The :class:`HeldResponse` field of a forest's root ``root``."""
-    return name if root == 0 else f"{name}{root}"
 
 
 FORCE_INPUT = (
