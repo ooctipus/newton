@@ -838,25 +838,22 @@ class Sweep:
             )
         )
 
-    def support_sink(self, v_hat: wp.array) -> walk_rows.SupportSink:
-        """Case K1: what its writer reads and writes besides each unit's seeds (:class:`.walk_rows.SupportSink`), bound
-        once: every array is the placement's for the solver's life."""
+    def support_sink(self, v_hat: wp.array) -> walk_rows.RowSink:
+        """Case K1: what its writer reads and writes besides each unit's seeds (:class:`.walk_rows.RowSink`): the
+        support table, the support masks, the articulations' first world coordinates, and the rows' factor entries,
+        coordinates and block records, bound once: every array is the placement's for the solver's life."""
         if self._support_sink is None:
             placement, factor, forest = self.placement, self.factor, self.forest
-            sink = walk_rows.SupportSink()
-            walk = factor.walk_view()
-            sink.walk, sink.release, sink.support = walk, walk.release, placement.sparse_row_support
+            sink = walk_rows.row_sink(factor, forest, placement, v_hat)
+            sink.support = placement.sparse_row_support
             sink.body_mask = placement.sparse_body_dof_mask
             sink.dof_mask = factor.sparse_ancestor_mask
             sink.world_offset = forest.articulation_world_dof_offset
-            sink.response_dofs = forest.articulation_response_dof_count
-            sink.v_hat, sink.row_cfm, sink.diag = v_hat, placement.row_cfm, placement.diag
-            sink.row_factor, sink.row_dof = placement.sparse_row_factor, placement.sparse_row_dof
-            sink.row_incident = placement.row_incident
+            sink.entries, sink.row_dof = placement.sparse_row_factor, placement.sparse_row_dof
             records = placement.sparse_contact_records
             sink.records = records if records is not None else placement.sparse_row_factor
             self._support_sink = sink
-            worlds, capacity = sink.row_factor.shape[0], sink.row_factor.shape[1]
+            worlds, capacity = sink.entries.shape[0], sink.entries.shape[1]
             self.support_units = walk_rows.unit_list(worlds, capacity, self.model.device)
             self.support_threads = walk_rows.support_threads(worlds * capacity, self.model.device)
         return self._support_sink

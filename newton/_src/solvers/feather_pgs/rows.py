@@ -1263,19 +1263,6 @@ class RowLaws:
         seeds.body_com = model.body_com
         return seeds
 
-    @staticmethod
-    def packed_sink(solver) -> walk_rows.PackedSink:
-        """The general placement's sink (:class:`.walk_rows.PackedSink`): the walk and its release, the packed rows'
-        layout and entries, the predictor ``v_hat``, and the rows' ``cfm``, incident velocities and diagonals."""
-        placement, factor = solver.placement, solver.factor
-        sink = walk_rows.PackedSink()
-        walk = factor.walk_view()
-        sink.walk, sink.release, sink.support = walk, walk.release, placement.row_support()
-        sink.response_dofs = solver.forest.articulation_response_dof_count
-        sink.v_hat, sink.row_cfm, sink.diag = solver.v_hat, placement.row_cfm, placement.diag
-        sink.packed, sink.row_incident = placement.packed_Z, placement.row_incident
-        return sink
-
     def write_general(self, solver, state_in, contacts: Contacts | None, dt: float) -> None:
         """The general placement's one writer (:func:`.walk_rows.walked_rows_kernel`)."""
         placement, factor, model = solver.placement, solver.factor, solver.model
@@ -1297,7 +1284,7 @@ class RowLaws:
             lanes,
             contact_input,
             patch_row_law(solver),
-            self.packed_sink(solver),
+            walk_rows.packed_sink(solver),
             factor.blocks() if blocks else Preelim(),
             self.mimic_slot if blocks and self.mimic_slot is not None else dummy_int,
             self.link_slot if blocks and self.link_slot is not None else dummy_int,
@@ -1373,7 +1360,7 @@ class RowLaws:
                 bind_dense_rows(placement),
                 placement.row_support(),
                 walk_rows.bind_slot_rows(solver),
-                walk_rows.slot_sink(solver),
+                walk_rows.packed_sink(solver),
                 placement.slot_counter,
                 placement.dense_phase_bounds,
                 int(prefix),

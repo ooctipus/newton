@@ -17,15 +17,14 @@ import warp as wp
 from .contact_input import ContactInput
 from .dense_rows import UNIT_CONTACT, DenseRows, unit_source
 from .friction_patches import PatchRowLaw, patch_row_law
-from .row_build import write_contact_row
 from .walk_rows import (
     JointSeeds,
-    PackedSink,
+    RowSink,
     SlotRows,
     bind_slot_rows,
+    packed_sink,
     read_slot_unit,
     slot_header,
-    slot_sink,
     walk_slot_row,
 )
 
@@ -54,7 +53,7 @@ def produce_contacts(
     data: ContactInput,
     rows: DenseRows,
     slots: SlotRows,
-    sink: PackedSink,
+    sink: RowSink,
     law: PatchRowLaw,
     dt: float,
     contact_speculative_scale: float,
@@ -80,11 +79,8 @@ def produce_contacts(
     if data.path[contact] != 0 or slot < 0 or row >= data.slots_needed[contact]:
         return
     world = data.world[contact]
-    body_a, body_b, direction, row_point = write_contact_row(data, law, contact, row, False)
-    unit = read_slot_unit(
-        rows, data, law, JointSeeds(), data.first[world], slot + row, unit_source(UNIT_CONTACT, 4 * contact + row),
-        body_a, body_b, direction, row_point,
-    )  # fmt: skip
+    source = unit_source(UNIT_CONTACT, 4 * contact + row)
+    unit = read_slot_unit(rows, data, law, JointSeeds(), data.first[world], slot + row, source)
     unit.group = slots.dense_group[world]
     walk_slot_row(sink, unit)
     slot_header(
@@ -109,7 +105,7 @@ def launch_contacts(solver, data: ContactInput, dt: float) -> None:
             data,
             bind_dense_rows(solver.placement),
             bind_slot_rows(solver),
-            slot_sink(solver),
+            packed_sink(solver),
             patch_row_law(solver),
             dt,
             solver.options.contact_speculative_scale,

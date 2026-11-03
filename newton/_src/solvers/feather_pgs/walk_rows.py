@@ -79,15 +79,15 @@ from .tree_scan import held_fits
 __all__ = [
     "SUPPORT_UNIT_LANES",
     "JointSeeds",
-    "PackedSink",
+    "RowSink",
     "RowUnit",
     "SlotRows",
-    "SupportSink",
-    "SupportUnit",
     "UnitList",
     "bind_slot_rows",
     "free_body_headers_kernel",
+    "packed_sink",
     "packed_walker",
+    "row_sink",
     "support_rows_kernel",
     "support_threads",
     "support_units_kernel",
@@ -381,27 +381,19 @@ it, five (96 registers: 97 unbounded, and six spilled 88 B a thread, sm_120)."""
 
 
 @cache
-def unit_reader(links: bool) -> wp.Function:
-    """The general placement's and the sparse diagonal's unit reader (:func:`row_unit`): a row a unit, so their
-    world-major writers keep a lane a row; with the link rows' seeds where the writer closes bilateral blocks (the
-    general placement's block variants; the sparse diagonal admits none). The support placement lists a contact's rows as one unit
-    (:func:`support_units_kernel`) and reads its units in its walkers."""
+def unit_reader(links: bool, unit_rows: int = 1) -> wp.Function:
+    """Every placement's unit reader (:func:`row_unit`). A contact's unit is its rows from its first, at most
+    ``unit_rows``, from the contact's frame: the support placement's, whose unit list holds a contact's rows as one unit
+    and whose first launch wrote their records (:func:`support_units_kernel`). With ``unit_rows`` 1 it is the row
+    alone, its records written here by the contact law: the world-major writers', a lane a row (the producer's, folded
+    into the writer). ``links``: with the link rows' seeds, where the writer closes bilateral blocks (the general
+    placement's block variants; the sparse diagonal and the support placement admit none)."""
 
     def row_unit(
-        rows: DenseRows,
-        data: ContactInput,
-        law: PatchRowLaw,
-        seeds: JointSeeds,
-        line: int,
-        slot: int,
-        source: int,
-        body_a: int,
-        body_b: int,
-        direction: wp.vec3,
-        row_point: wp.vec3,
+        rows: DenseRows, data: ContactInput, law: PatchRowLaw, seeds: JointSeeds, line: int, slot: int, source: int
     ):
-        """Row ``slot``'s unit by its law (its unit source ``source``): a contact's row, its bodies, direction and point
-        as its records' writer gave them (``body_a``, ``body_b``, ``direction``, ``row_point``:
+        """The unit at row ``slot`` by its law (its unit source ``source``): a contact's rows, its bodies, frame rows
+        and points (:func:`.contact_input.contact_frame`; a row alone, its direction and point,
         :func:`.row_build.write_contact_row`; the spin row a torque about the normal); a link's row, the unit wrench at
         its two pieces' centres of mass (the shadow's negated; a pure torque for an angular row); a joint limit's, a
         velocity limit's or a mimic's covectors (:func:`joint_seeds`)."""
@@ -410,26 +402,30 @@ def unit_reader(links: bool) -> wp.Function:
         unit = RowUnit()
         unit.line = line
         unit.slot = slot
-        unit.rows = 0
-        unit.art_a = -1
+        unit.rows = 1
         unit.art_b = -1
         unit.body_a = -1
         unit.body_b = -1
         unit.dof0 = -1
         unit.dof1 = -1
-        unit.sides = rows.sides[line, slot]
         if kind == UNIT_CONTACT:
             c = index // 4
-            unit.rows = 1
             unit.row = index - 4 * c
+            if wp.static(unit_rows > 1):
+                unit.rows = wp.min(data.slots_needed[c], wp.static(unit_rows))
+                body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
+                unit.frame = wp.matrix_from_rows(normal, tangent0, tangent1)
+                unit.friction_point = friction_point
+            else:
+                body_a, body_b, direction, point = write_contact_row(data, law, c, unit.row, False)
+                unit.frame = wp.matrix_from_rows(direction, direction, direction)
+                unit.friction_point = point
             unit.art_a = data.art0[c]
             unit.body_a = body_a
             unit.art_b = data.art1[c]
             unit.body_b = body_b
-            unit.frame = wp.matrix_from_rows(direction, direction, direction)
-            unit.point = row_point
-            unit.point_b = row_point
-            unit.friction_point = row_point
+            unit.point = point
+            unit.point_b = point
             if unit.row == CONTACT_SPIN_ROW:
                 unit.torque = 1
         elif wp.static(links) and kind == UNIT_LINK:
@@ -439,7 +435,6 @@ def unit_reader(links: bool) -> wp.Function:
             direction[row % 3] = 1.0
             primary = seeds.link_primary[k]
             shadow = seeds.link_shadow[k]
-            unit.rows = 1
             unit.art_a = seeds.body_to_articulation[primary]
             unit.body_a = primary
             unit.art_b = seeds.body_to_articulation[shadow]
@@ -450,9 +445,8 @@ def unit_reader(links: bool) -> wp.Function:
             unit.friction_point = unit.point
             if row >= 3:
                 unit.torque = 1
-        elif kind != UNIT_CONTACT:
-            unit.rows = 1
-            unit.art_a = unit.sides[0]
+        else:
+            unit.art_a = rows.sides[line, slot][0]
             dof0, value0, dof1, value1 = joint_seeds(seeds, kind, index)
             unit.dof0 = dof0
             unit.value0 = value0
@@ -460,7 +454,8 @@ def unit_reader(links: bool) -> wp.Function:
             unit.value1 = value1
         return unit
 
-    row_unit.__name__ = row_unit.__qualname__ = "row_unit" + ("_links" if links else "")
+    name = "row_unit" + ("_links" if links else "") + (f"_{unit_rows}" if unit_rows > 1 else "")
+    row_unit.__name__ = row_unit.__qualname__ = name
     return wp.func(row_unit)
 
 
@@ -470,8 +465,8 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool = True) -> wp
     writes its rows in the block primitive's phases (FL3_design §1.4, W9), the group synchronized between them:
 
     1. *rows*: a lane a row, every row of the world but a world an in-kernel owner holds (``owned``: the local owners'
-       packets walk their own seeds): a contact row's records by the contact law (the producer's, folded into the
-       writer), then the row walked as its own unit by the one unit walker with the packed rows as its sink
+       packets walk their own seeds): a contact row's records by the contact law, then the row as its own unit
+       (:func:`unit_reader`), walked by the one unit walker with the packed rows as its sink
        (:func:`packed_walker`; the spin row a torque), each side's slips released by the
        predictor's border's ``R`` (:func:`.tree_kinetic_state.border_solve`), then its rhs by the row law
        (:func:`.kernels.row_bias`). A row a lane, not a contact a lane: the world's lanes stay busy (the support
@@ -501,7 +496,7 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool = True) -> wp
         lanes: int,
         data: ContactInput,
         law: PatchRowLaw,
-        sink: PackedSink,
+        sink: RowSink,
         preelim: Preelim,
         mimic_slot: wp.array[int],
         link_slot: wp.array[int],
@@ -514,24 +509,14 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool = True) -> wp
         material: int,
     ):
         world, lane = wp.tid()
-        count = wp.min(counts[world], sink.packed.shape[1])
+        count = wp.min(counts[world], sink.entries.shape[1])
         line = rows.first[world]
         # A world an in-kernel owner holds (``owned`` and ``owner`` nonzero: the local owners' packets, whose kernels
         # walk their seeds) is not the writer's: its whole group returns before any barrier.
         if owned != 0 and owner[world] != 0:
             return
         for slot in range(lane, count, lanes):
-            source = support.units[line, slot]
-            body_a = int(-1)
-            body_b = int(-1)
-            direction = wp.vec3(0.0)
-            row_point = wp.vec3(0.0)
-            if source >> UNIT_SHIFT == UNIT_CONTACT:
-                # The row's records by the contact law (the producer's, folded into the writer), then its seeds.
-                index = source & ((1 << UNIT_SHIFT) - 1)
-                c = index // 4
-                body_a, body_b, direction, row_point = write_contact_row(data, law, c, index - 4 * c, False)
-            unit = read_unit(rows, data, law, seeds, line, slot, source, body_a, body_b, direction, row_point)
+            unit = read_unit(rows, data, law, seeds, line, slot, support.units[line, slot])
             if unit.rows > 0:
                 walk(sink, unit)
                 row_bias(
@@ -542,14 +527,14 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool = True) -> wp
             world_sync(lanes)
             for pe in range(preelim.world_start[world] + lane, preelim.world_start[world + 1], lanes):
                 close_block(
-                    pe, wp.static(capacity), line, preelim, mimic_slot, link_slot, rows.row_cfm, sink.packed,
+                    pe, wp.static(capacity), line, preelim, mimic_slot, link_slot, rows.row_cfm, sink.entries,
                     rows.rhs, sink.row_incident, rows.diag,
                 )  # fmt: skip
             world_sync(lanes)
             for slot in range(lane, count, lanes):
                 if block_row(support.units[line, slot], wp.static(mimics)) == 0:
                     close_row(
-                        line, slot, rows.sides[line, slot], wp.static(capacity), preelim, rows.row_cfm, sink.packed,
+                        line, slot, rows.sides[line, slot], wp.static(capacity), preelim, rows.row_cfm, sink.entries,
                         rows.rhs, rows.diag,
                     )  # fmt: skip
 
@@ -615,9 +600,9 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
     const auto& support = sink.support;
     const int rows = unit.rows, art_a = unit.art_a, art_b = unit.art_b, body_a = unit.body_a, body_b = unit.body_b;
     const int dof0 = unit.dof0, dof1 = unit.dof1;
-    const int S = sink.$entries.shape[2];
-    const int row0 = unit.line * sink.$entries.shape[1] + unit.slot;
-    float* const Z = sink.$entries.data + (size_t)$zrow * S;
+    const int S = sink.entries.shape[2];
+    const int row0 = unit.line * sink.entries.shape[1] + unit.slot;
+    float* const Z = sink.entries.data + (size_t)$zrow * S;
     const bool covector = dof0 >= 0;
     float incident[$rows], norm[$rows], zc[$rows], cross[6];
     for (int r = 0; r < $rows; ++r) incident[r] = norm[r] = zc[r] = 0.0f;
@@ -882,7 +867,6 @@ def _support_snippet(parent: tuple, first: tuple, node: tuple, rows: int, record
         now=WALK_NOW,
         frame=WALK_FRAME,
         record=record,
-        entries="row_factor",
         start="",
         side=_SUPPORT_SIDE,
         rank="base + POPC(mask & ((1ull << SUPPORT_NODE[c]) - 1ull))",
@@ -898,66 +882,30 @@ def _support_snippet(parent: tuple, first: tuple, node: tuple, rows: int, record
 
 
 @wp.struct
-class SupportSink:
-    """What the support placement's writer reads and writes besides a unit's seeds (:func:`support_rows_kernel`): the
-    walk and its release, the support table, each body's and coordinate's support mask (factor coordinates), each
-    articulation's first world coordinate and response coordinates, the predictor ``v_hat``, and the rows' ``cfm``,
-    entries, coordinates, incident velocities, diagonals and block records."""
+class RowSink:
+    """What a placement's writer reads and writes besides a unit's seeds, every placement's (:data:`_SUPPORT`): the walk
+    and its release, each articulation's response coordinates, the predictor ``v_hat``, and the rows' ``cfm``, entries,
+    incident velocities and diagonals; the support placement's (case K1, :func:`support_rows_kernel`) support table,
+    each body's and coordinate's support mask (factor coordinates), each articulation's first world coordinate, and the
+    rows' coordinates and block records; the packed rows' layout, where each side's entries sit in a packed row
+    (:class:`.dense_rows.RowSupport`, :func:`packed_walker`), and the star's coordinates (the sparse diagonal's). A
+    placement binds what its writer reads."""
 
     walk: WalkTrees
     release: WalkRelease
+    response_dofs: wp.array[int]
+    v_hat: wp.array[float]
+    row_cfm: wp.array2d[float]
+    entries: wp.array3d[float]
+    row_incident: wp.array2d[float]
+    diag: wp.array2d[float]
     support: _SparseRowSupport
     body_mask: wp.array[wp.uint64]
     dof_mask: wp.array[wp.uint64]
     world_offset: wp.array[int]
-    response_dofs: wp.array[int]
-    v_hat: wp.array[float]
-    row_cfm: wp.array2d[float]
-    row_factor: wp.array3d[float]
     row_dof: wp.array3d[int]
-    row_incident: wp.array2d[float]
-    diag: wp.array2d[float]
     records: wp.array3d[float]
-
-
-@wp.struct
-class SupportUnit:
-    """One unit's rows (``line``, ``slot``, ``rows``) and seeds: a contact's two bodies and their articulations with its
-    frame's rows (the normal, then the tangents) at its ``point`` and ``friction_point``, or a joint row's covectors
-    ``value e_dof`` (``dof0 >= 0``; a mimic's second at ``dof1``) on articulation ``art_a``."""
-
-    line: int
-    slot: int
-    rows: int
-    art_a: int
-    body_a: int
-    art_b: int
-    body_b: int
-    frame: wp.mat33
-    point: wp.vec3
-    friction_point: wp.vec3
-    dof0: int
-    value0: float
-    dof1: int
-    value1: float
-
-
-@wp.struct
-class PackedSink:
-    """What the general placement's writer reads and writes besides a unit's seeds (:func:`packed_walker`): the walk
-    and its release, where each side's entries sit in a packed row (:class:`.dense_rows.RowSupport`), each
-    articulation's response coordinates, the predictor ``v_hat``, and the rows' ``cfm``, entries, incident velocities and
-    diagonals."""
-
-    walk: WalkTrees
-    release: WalkRelease
-    support: RowSupport
-    response_dofs: wp.array[int]
-    v_hat: wp.array[float]
-    row_cfm: wp.array2d[float]
-    packed: wp.array3d[float]
-    row_incident: wp.array2d[float]
-    diag: wp.array2d[float]
+    layout: RowSupport
     star: int
 
 
@@ -966,9 +914,8 @@ class RowUnit:
     """One unit's rows (``line``, ``slot``, ``rows``) and seeds, every placement's (:func:`unit_reader`): a contact's two
     bodies and their articulations with its frame's rows (the normal, then the tangents) at its ``point`` (body b's at
     ``point_b``: a link row's second piece) and ``friction_point``, a pure ``torque`` (a link's angular row), or a joint
-    row's covectors ``value e_dof`` (``dof0 >= 0``; a mimic's second at ``dof1``) on articulation ``art_a``; its row's
-    sides (:func:`.dense_rows.row_sides`, the packed row's layout) and its dense part's size group (``group``, the
-    sparse diagonal's)."""
+    row's covectors ``value e_dof`` (``dof0 >= 0``; a mimic's second at ``dof1``) on articulation ``art_a``; its dense
+    part's size group (``group``, the sparse diagonal's)."""
 
     line: int
     group: int
@@ -984,19 +931,30 @@ class RowUnit:
     point_b: wp.vec3
     friction_point: wp.vec3
     torque: int
-    sides: wp.vec2i
     dof0: int
     value0: float
     dof1: int
     value1: float
 
 
+def unit_walker(name: str, snippet: str) -> wp.Function:
+    """The one unit walker's native function of name ``name`` over a placement's sink and a unit (:class:`RowSink`,
+    :class:`RowUnit`): ``snippet`` is :data:`_SUPPORT` with the placement's slots filled."""
+
+    def native(sink: RowSink, unit: RowUnit): ...
+
+    native.__name__ = native.__qualname__ = name
+    return wp.func_native(snippet)(native)
+
+
 _PACKED_START = """    // The unit's packed rows cleared: each side's walk stores its path's entries, the rest of the row stays zero.
     for (int r = 0; r < rows; ++r)
         for (int e = 0; e < S; ++e) ST(Z + r * S + e, 0.0f);
+    // The row's first side (its layout, dense_rows.row_sides), read after its records' writer wrote it.
+    const int first = RD(sink.layout.sides.data + ((size_t)unit.line * sink.layout.sides.shape[1] + unit.slot)).c[0];
 """
 
-_PACKED_SIDE = """        WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), RD(walk.joint_end.data + art) - j0,
+_PACKED_SIDE = """$skip        WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), RD(walk.joint_end.data + art) - j0,
                   RD(walk.dofs.data + art));
         int seeds = 0;
         if (covector) {
@@ -1006,13 +964,18 @@ _PACKED_SIDE = """        WALK_TREE(reinterpret_cast<const int*>(walk.path.data 
             if (body_b >= 0 && art_b == art) ++seeds;
         }
         if (seeds == 0) continue;
-        // The side's first entry in the packed row (dense_rows.jacobian_row): the articulation's first world
-        // coordinate (dense), or after the row's first side.
-        const int base = support.dense != 0 ? RD(support.offset.data + art)
-                                             : (art == unit.sides[0] ? 0 : RD(support.dofs.data + unit.sides[0]));
+        // The side's first entry (dense_rows.jacobian_row): in a packed row the articulation's first world coordinate
+        // (dense) or after the row's first side; in a size group's dense part (the star's arm) entry 0.
+        const int base = $base;
         // Two seeds on one tree add where their paths meet, then the rows are re-read for their norms.
         const bool add = seeds > 1;
         if (add) reread = true;"""
+
+_PACKED_BASE = """sink.layout.dense != 0 ? RD(sink.layout.offset.data + art) : (art == first ? 0 : RD(sink.layout.dofs.data + first))"""
+
+_STAR_SKIP = """        // A key of the star is one step to the world, into the row's slot (star_step): the writer's, not the walk's.
+        if (RD(sink.response_dofs.data + art) == sink.star) continue;
+"""
 
 _PACKED_WRENCH = """                    const auto& at = r == 0 ? (k == 0 ? unit.point : unit.point_b) : unit.friction_point;
                     WALK_WRENCH(q, sign, unit.frame.data[r == 1 || r == 2 ? r : 0], at.c, origin_o, frame_o,
@@ -1021,24 +984,6 @@ _PACKED_WRENCH = """                    const auto& at = r == 0 ? (k == 0 ? unit
 _PACKED_RELEASE = (
     """            WALK_RELEASE_ON(release, art, Z, rows, S, [&](const int c) -> int { return rank(c); });"""
 )
-
-
-_STAR_SIDE = """        // A key of the star is one step to the world, into the row's slot (star_step): the writer's, not the walk's.
-        if (RD(sink.response_dofs.data + art) == sink.star) continue;
-        WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), RD(walk.joint_end.data + art) - j0,
-                  RD(walk.dofs.data + art));
-        int seeds = 0;
-        if (covector) {
-            seeds = dof1 >= 0 ? 2 : 1;
-        } else {
-            if (body_a >= 0 && art_a == art) ++seeds;
-            if (body_b >= 0 && art_b == art) ++seeds;
-        }
-        if (seeds == 0) continue;
-        // The arm's side from entry 0 of the row's dense part (its size group's row, dense_rows.jacobian_row).
-        const int base = 0;
-        const bool add = seeds > 1;
-        if (add) reread = true;"""
 
 
 @cache
@@ -1060,26 +1005,25 @@ def packed_walker(rows: int, spin: bool, side: bool, star: bool = False) -> wp.F
         now=WALK_NOW,
         frame=WALK_FRAME,
         record="",
-        entries="packed",
         start=_PACKED_START,
-        side=_STAR_SIDE if star else _PACKED_SIDE,
+        side=substitute(
+            _PACKED_SIDE,
+            skip=_STAR_SKIP if star else "",
+            base="0" if star else _PACKED_BASE,
+        ),
         rank="base + c",
         below="",
         wrench=substitute(_PACKED_WRENCH, spin=int(spin)),
         close="",
         entries_end="S",
-        zrow="(unit.group * sink.packed.shape[1] + unit.slot)" if star else "row0",
+        zrow="(unit.group * sink.entries.shape[1] + unit.slot)" if star else "row0",
         diag="norm[r]" if star else _HEADER_DIAG,
         # RD a plain load here, not the support writer's non-coherent __ldg: the K2 writer ran 1.4% faster on sm_120.
         rd="*p",
     )
-
-    def native(sink: PackedSink, unit: RowUnit): ...
-
     tag = ("_spin" if spin else "") + ("" if side else "_one_half") + ("_star" if star else "")
-    native.__name__ = native.__qualname__ = f"packed_walk_{rows}{tag}"
     snippet = dual_native(body, preludes=(walk_paths_prelude(rows, side=side), walk_row_prelude(rows)))
-    return wp.func_native(snippet)(native)
+    return unit_walker(f"packed_walk_{rows}{tag}", snippet)
 
 
 SUPPORT_UNIT_LANES = 16
@@ -1230,15 +1174,12 @@ def support_rows_kernel(
     unit_rows = 4 if torsion else 3
 
     def walker(rows: int, with_records: bool):
-        """The unit walker of ``rows`` rows (:data:`_SUPPORT`): a native function of its own name."""
-
-        def native(sink: SupportSink, unit: SupportUnit): ...
-
-        native.__name__ = native.__qualname__ = f"support_walk_{rows}"
-        return wp.func_native(_support_snippet(parent, first, node, rows, with_records, torsion and rows == 4))(native)
+        snippet = _support_snippet(parent, first, node, rows, with_records, torsion and rows == 4)
+        return unit_walker(f"support_walk_{rows}", snippet)
 
     walk_one = walker(1, False)
     walk_unit = walker(unit_rows, records)
+    read_unit = unit_reader(False, unit_rows)
 
     def kernel(
         rows: DenseRows,
@@ -1247,7 +1188,7 @@ def support_rows_kernel(
         threads: int,
         data: ContactInput,
         law: PatchRowLaw,
-        sink: SupportSink,
+        sink: RowSink,
         seeds: JointSeeds,
         dt: float,
         contact_speculative_scale: float,
@@ -1262,36 +1203,7 @@ def support_rows_kernel(
             entry = unit_entry(units, item)
             line = entry // units.capacity
             slot = entry - line * units.capacity
-            source = sources[line, slot]
-            kind = source >> UNIT_SHIFT
-            index = source & ((1 << UNIT_SHIFT) - 1)
-            unit = SupportUnit()
-            unit.line = line
-            unit.slot = slot
-            unit.rows = 1
-            unit.art_b = -1
-            unit.body_a = -1
-            unit.body_b = -1
-            unit.dof0 = -1
-            unit.dof1 = -1
-            if kind == UNIT_CONTACT:
-                c = index // 4
-                unit.rows = wp.min(data.slots_needed[c], wp.static(unit_rows))
-                body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
-                unit.art_a = data.art0[c]
-                unit.body_a = body_a
-                unit.art_b = data.art1[c]
-                unit.body_b = body_b
-                unit.frame = wp.matrix_from_rows(normal, tangent0, tangent1)
-                unit.point = point
-                unit.friction_point = friction_point
-            else:
-                unit.art_a = rows.sides[line, slot][0]
-                dof0, value0, dof1, value1 = joint_seeds(seeds, kind, index)
-                unit.dof0 = dof0
-                unit.value0 = value0
-                unit.dof1 = dof1
-                unit.value1 = value1
+            unit = read_unit(rows, data, law, seeds, line, slot, sources[line, slot])
             if unit.rows == 1:
                 walk_one(sink, unit)
             else:
@@ -1474,7 +1386,7 @@ def write_slot_rows(
     rows: DenseRows,
     support: RowSupport,
     slots: SlotRows,
-    sink: PackedSink,
+    sink: RowSink,
     counts: wp.array[int],
     bounds: wp.array2d[int],
     prefix: int,
@@ -1492,8 +1404,8 @@ def write_slot_rows(
     """The one writer on the sparse diagonal: a world's ``lanes`` threads stride over its rows (``dim = (worlds,
     lanes)``), every row (``counts``, the allocation's watermark) or its limit prefix alone (``prefix``:
     ``bounds[:, 1]``, where the compact boundary writes the contact rows in its producer), a row a lane: a contact row's
-    records by the contact law, then each row walked as its own unit by the one unit walker with the star
-    (:data:`walk_slot_row`; the spin row a torque) and finished (:func:`slot_header`)."""
+    records by the contact law, then each row as its own unit (:data:`read_slot_unit`), walked by the one unit walker
+    with the star (:data:`walk_slot_row`; the spin row a torque) and finished (:func:`slot_header`)."""
     world, lane = wp.tid()
     end = counts[world]
     if prefix != 0:
@@ -1501,17 +1413,7 @@ def write_slot_rows(
     end = wp.min(end, support.units.shape[1])
     line = rows.first[world]
     for slot in range(lane, end, lanes):
-        source = support.units[line, slot]
-        body_a = int(-1)
-        body_b = int(-1)
-        direction = wp.vec3(0.0)
-        row_point = wp.vec3(0.0)
-        if source >> UNIT_SHIFT == UNIT_CONTACT:
-            # The row's records by the contact law (the producer's, folded into the writer), then its seeds.
-            index = source & ((1 << UNIT_SHIFT) - 1)
-            c = index // 4
-            body_a, body_b, direction, row_point = write_contact_row(data, law, c, index - 4 * c, False)
-        unit = read_slot_unit(rows, data, law, JointSeeds(), line, slot, source, body_a, body_b, direction, row_point)
+        unit = read_slot_unit(rows, data, law, JointSeeds(), line, slot, support.units[line, slot])
         if unit.rows > 0:
             unit.group = slots.dense_group[world]
             walk_slot_row(sink, unit)
@@ -1521,17 +1423,28 @@ def write_slot_rows(
             )  # fmt: skip
 
 
-def slot_sink(solver) -> PackedSink:
-    """The sparse diagonal's sink (:class:`PackedSink`): the walk and its release, the rows' dense parts by size group
-    (:data:`SLOT_ROWS`' ``Z``), the star's coordinates, the predictor ``v_hat``, and the rows' ``cfm``, incident
-    velocities and diagonals."""
-    placement, factor = solver.placement, solver.factor
-    sink = PackedSink()
+def row_sink(factor, forest, placement, v_hat: wp.array) -> RowSink:
+    """Every placement's sink (:class:`RowSink`) as far as they share it: the walk and its release, each articulation's
+    response coordinates, the predictor ``v_hat``, and the rows' ``cfm``, incident velocities and diagonals."""
+    sink = RowSink()
     walk = factor.walk_view()
-    sink.walk, sink.release, sink.support = walk, walk.release, placement.row_support()
-    sink.response_dofs = solver.forest.articulation_response_dof_count
-    sink.v_hat, sink.row_cfm, sink.diag = solver.v_hat, placement.row_cfm, placement.diag
-    sink.packed = placement.J_by_size[placement.sparse_diagonal_dense_size]
+    sink.walk, sink.release = walk, walk.release
+    sink.response_dofs = forest.articulation_response_dof_count
+    sink.v_hat, sink.row_cfm, sink.diag = v_hat, placement.row_cfm, placement.diag
     sink.row_incident = placement.row_incident
-    sink.star = int(placement.sparse_diagonal_response_size)
+    return sink
+
+
+def packed_sink(solver) -> RowSink:
+    """The packed placements' sink (:class:`RowSink`, :func:`packed_walker`): where each side's entries sit in a packed
+    row (:class:`.dense_rows.RowSupport`) and the entries, the general placement's packed rows, or the sparse diagonal's
+    dense parts by size group (:data:`SLOT_ROWS`' ``Z``) with its star's coordinates."""
+    placement = solver.placement
+    sink = row_sink(solver.factor, solver.forest, placement, solver.v_hat)
+    sink.layout = placement.row_support()
+    if solver.routes.case == "K2":
+        sink.entries = placement.J_by_size[placement.sparse_diagonal_dense_size]
+        sink.star = int(placement.sparse_diagonal_response_size)
+    else:
+        sink.entries = placement.packed_Z
     return sink
