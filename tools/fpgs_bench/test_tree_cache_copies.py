@@ -39,12 +39,10 @@ class TestTreeCacheCopies(unittest.TestCase):
         owner.finish(state, solver.factor, output, DT, True)
         bank = copy_state(model, output)
         before = generations(owner)
-        geometry = [group.geometric.numpy().copy() for group in owner.groups]
         # The caches were published into ``output``; its exact copy keeps them.
         owner.begin(bank, solver.factor, bank.joint_qd, DT, True, state_out=output)
-        for group, previous, mass in zip(owner.groups, before, geometry, strict=True):
+        for group, previous in zip(owner.groups, before, strict=True):
             np.testing.assert_array_equal(group.data.generation.numpy(), previous)
-            np.testing.assert_array_equal(group.geometric.numpy(), mass)
         public_state(self, model, bank)
 
         # Generalized coordinates alone do not prove that public body state was copied.

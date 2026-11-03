@@ -748,7 +748,7 @@ class Sweep:
         self.sparse_local_factors = local_factors
         self.placement.sparse_max_row_support = int(max_support)
         self.sparse_velocity_limits = velocity_candidate
-        self.factor.allocate_sparse(plan, self.forest.n_arts_by_size[size])
+        self.factor.allocate_sparse(plan)
         self.placement.sparse_body_dof_mask = wp.array(body_masks, dtype=wp.uint64, device=model.device)
         if use_support_table:
             self.placement.sparse_row_support = row_supports(
@@ -847,7 +847,7 @@ class Sweep:
             walk = factor.walk_view()
             sink.walk, sink.release, sink.support = walk, walk.release, placement.sparse_row_support
             sink.body_mask = placement.sparse_body_dof_mask
-            sink.dof_mask = factor.sparse_mass_matrix_indices.ancestor_mask
+            sink.dof_mask = factor.sparse_ancestor_mask
             sink.world_offset = forest.articulation_world_dof_offset
             sink.response_dofs = forest.articulation_response_dof_count
             sink.v_hat, sink.row_cfm, sink.diag = v_hat, placement.row_cfm, placement.diag
@@ -890,16 +890,12 @@ class Sweep:
         self.factor_coordinate_contact_units = bool(
             self.paired_factor_coordinates and laws.contact == "patch" and not laws.compliance
         )
-        self.paired_factor_primary_groups_by_world = None
-        self.paired_factor_secondary_groups_by_world = None
         self.paired_factor_primary_offsets_by_world = None
         self.paired_factor_secondary_offsets_by_world = None
         self.paired_factor_primary_arts_by_world = None
         if self.paired_factor_coordinates:
             primary_arts = self.forest.group_to_art_host[response_pair[0]]
             secondary_arts = self.forest.group_to_art_host[response_pair[1]]
-            primary_groups = np.empty(self.forest.world_count, dtype=np.int32)
-            secondary_groups = np.empty(self.forest.world_count, dtype=np.int32)
             primary_offsets = np.empty(self.forest.world_count, dtype=np.int32)
             secondary_offsets = np.empty(self.forest.world_count, dtype=np.int32)
             # Each world's articulation: where the paired components' check reads its walk (paired_components).
@@ -910,16 +906,10 @@ class Sweep:
                 world = int(articulation_world[primary_art])
                 secondary_group = int(response_pair[2][primary_group])
                 secondary_art = int(secondary_arts[secondary_group])
-                primary_groups[world] = primary_group
-                secondary_groups[world] = secondary_group
                 primary_by_world[world] = int(primary_art)
                 primary_first = articulation_dof_start[primary_art] < articulation_dof_start[secondary_art]
                 primary_offsets[world] = 0 if primary_first else response_pair[1]
                 secondary_offsets[world] = response_pair[0] if primary_first else 0
-            self.paired_factor_primary_groups_by_world = wp.array(primary_groups, dtype=wp.int32, device=model.device)
-            self.paired_factor_secondary_groups_by_world = wp.array(
-                secondary_groups, dtype=wp.int32, device=model.device
-            )
             self.paired_factor_primary_offsets_by_world = wp.array(primary_offsets, dtype=wp.int32, device=model.device)
             self.paired_factor_secondary_offsets_by_world = wp.array(
                 secondary_offsets, dtype=wp.int32, device=model.device
@@ -1800,10 +1790,6 @@ class Sweep:
                     world_mf_constraint_count=(
                         self.placement.mf_constraint_count if components is None else components.selector
                     ),
-                    primary_L=self.factor.L_by_size[self.paired_response_primary_size],
-                    secondary_L=self.factor.L_by_size[self.paired_response_secondary_size],
-                    primary_group_by_world=self.paired_factor_primary_groups_by_world,
-                    secondary_group_by_world=self.paired_factor_secondary_groups_by_world,
                     primary_offset_by_world=self.paired_factor_primary_offsets_by_world,
                     secondary_offset_by_world=self.paired_factor_secondary_offsets_by_world,
                     **walked,

@@ -55,7 +55,7 @@ class TestPairedComponents(unittest.TestCase):
         np.testing.assert_array_equal(data.selector.numpy(), expected_selector)
         # The rows are already whitened (packed at their world coordinates): the qualification reads them only.
         for name, before in host.items():
-            if name not in ("selector", "J", "L"):
+            if name not in ("selector", "J", "L", "primary_group"):
                 np.testing.assert_array_equal(getattr(data, name).numpy(), before, err_msg=name)
 
     def test_reject_current_coupling_metadata_and_nonfinite(self):

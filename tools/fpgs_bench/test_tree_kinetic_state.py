@@ -83,7 +83,7 @@ def fixture(floating, device):
     count = model.joint_dof_count // 2
     mass = TreePlan.build(parents, np.diff(model.joint_qd_start.numpy())[: len(parents)]).factor
     solver.placement.sparse_mass_matrix_size = count
-    solver.factor.allocate_sparse(mass, 2)
+    solver.factor.allocate_sparse(mass)
     solver.factor.sparse_factor_warps_per_block = 4
     operator = TreeSparseOperator(solver)
     owner = TreeKineticState(operator)
@@ -114,16 +114,13 @@ class TestTreePhysicalCPU(unittest.TestCase):
                     public_state(self, model, state)
                     physical = physical_mass(model, state)
                     matrices = [physical[i * count : (i + 1) * count, i * count : (i + 1) * count] for i in range(2)]
-                    geometry = owner.geometric.numpy()
-                    for group, matrix in enumerate(matrices):
-                        expected = matrix[np.ix_(mass.permutation, mass.permutation)][mass.entry_rows, mass.columns]
-                        np.testing.assert_allclose(geometry[group], expected, atol=3e-6, rtol=3e-5)
                     solver.factor.mass_update_mask.fill_(1)
                     operator.refresh(solver.factor)
                     response = force_response(owner, solver, state, control, state.joint_qd, dt).reshape(2, count)
                     forces = control.joint_f.numpy().reshape(2, count).astype(float)
                     for group, matrix in enumerate(matrices):
-                        held_matrix = matrix + np.diag(solver.factor.R_by_size[count].numpy()[group])
+                        armature = solver.factor.dof_armature.numpy()[group * count : (group + 1) * count]
+                        held_matrix = matrix + np.diag(armature)
                         expected = np.linalg.solve(held_matrix, forces[group])
                         np.testing.assert_allclose(response[group], expected, atol=3e-5, rtol=3e-4)
                     solver.v_out.assign(solver.v_hat)

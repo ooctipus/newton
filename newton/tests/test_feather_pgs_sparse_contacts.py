@@ -15,7 +15,6 @@ from newton._src.solvers.feather_pgs.kernels import (
     compute_world_contact_bias,
     prepare_world_contact_rows,
 )
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import factor_indices
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.feather_pgs_patch_parity import row_law
@@ -99,7 +98,6 @@ def _fixture(device="cpu", joint_dof_count=(3, 2, 1, 0)):
     return {
         "tree": tree,
         "plan": plan,
-        "indices": factor_indices(plan, device),
         "inverse": inverse,
         "packed": array(inverse[plan.entry_rows, plan.columns][None, :]),
         "patches": patches,

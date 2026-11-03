@@ -803,7 +803,7 @@ def local_packed_rows(device, art_world, rows_by_art, incident=None) -> list:
 def _walked_coordinates(solver):
     """Where the placement walks (:mod:`.walk_rows`), ``u_hat`` in the walk's frame, ``[world, world coordinate]``: the
     walk's enter of ``v_hat`` (:func:`.tree_factor.walk_enter_kernel`, the audit's), the coordinates its rows are
-    whitened against; ``None`` elsewhere (the held factors' ``L^T P v_hat``)."""
+    whitened against; ``None`` where nothing walks (no coordinate responds, so no row has a side)."""
     if not getattr(solver.placement, "walks", False):
         return None
     from newton._src.solvers.feather_pgs.tree_factor import walk_enter_kernel  # noqa: PLC0415
@@ -1026,8 +1026,7 @@ def walked_rows(lower, jacobian) -> np.ndarray:
 
 def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
     """:func:`incident_gaps` of the free-body rows: each row's ``|mf_row_incident - Z^T u_hat|`` over its two bodies'
-    six coordinates, ``u_hat = L^T P v_hat`` through the body's factor, and its terms' magnitude."""
-    v_hat = solver.v_hat.numpy().astype(np.float64)
+    six coordinates, ``u_hat`` the walk's enter of ``v_hat`` (:func:`_walked_coordinates`), and its terms' magnitude."""
     incident = solver.placement.mf_row_incident.numpy().astype(np.float64)
     Z_a, Z_b = solver.placement.mf_Z_a.numpy().astype(np.float64), solver.placement.mf_Z_b.numpy().astype(np.float64)
     bodies_a, bodies_b, kinds = (
@@ -1036,8 +1035,6 @@ def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
         solver.placement.mf_row_type.numpy(),
     )
     body_art = solver.forest.body_to_articulation.numpy()
-    starts, groups = solver.forest.articulation_dof_start.numpy(), solver.forest.art_group_idx.numpy()
-    factors = solver.factor.L_by_size[6].numpy().astype(np.float64) if 6 in solver.factor.L_by_size else None
     walked, offsets = _walked_coordinates(solver), solver.forest.articulation_world_dof_offset.numpy()
     gaps, terms = np.zeros(incident.shape), np.zeros(incident.shape)
     for world, count in enumerate(solver.placement.mf_constraint_count.numpy()):
@@ -1048,15 +1045,9 @@ def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
             for body, Z in ((bodies_a[world, row], Z_a), (bodies_b[world, row], Z_b)):
                 if body < 0:
                     continue
-                art = body_art[body]
-                if walked is not None:
-                    # The walk's coordinates, by coordinate (not reversed): the walked rows' frame.
-                    first = int(offsets[art])
-                    term = np.concatenate((term, Z[world, row] * walked[world, first : first + 6]))
-                    continue
-                L = np.tril(factors[groups[art]])
-                u_hat = L.T @ v_hat[int(starts[art]) : int(starts[art]) + 6][::-1]
-                term = np.concatenate((term, Z[world, row][::-1] * u_hat))
+                # The walk's coordinates, by coordinate (not reversed): the walked rows' frame.
+                first = int(offsets[body_art[body]])
+                term = np.concatenate((term, Z[world, row] * walked[world, first : first + 6]))
             gaps[world, row] = abs(incident[world, row] - term.sum())
             terms[world, row] = np.abs(term).sum()
     return gaps, terms
@@ -1086,24 +1077,14 @@ def recomputing(solver):
     return solver
 
 
-_FACTOR_STORAGE = []
-"""The factors :func:`articulation_factor` addresses, kept alive while the tests run."""
-
-
 def articulation_factor(mass, device):
     """The :class:`.kernels.BodyFactors` of one articulation on global coordinates ``0..n-1`` with mass matrix
     ``mass``, and its leaf-first factor ``L`` (``P mass P^T = L L^T``, ``P`` reversing the coordinates, float64)."""
     mass = np.asarray(mass, dtype=np.float64)
     n = mass.shape[0]
-    L = np.linalg.cholesky(mass[::-1, ::-1])
-    storage = wp.array(L.astype(np.float32), dtype=wp.float32, device=device)
-    _FACTOR_STORAGE.append(storage)
     factors = kernels.BodyFactors()
     factors.first_art = wp.array([0] + [-1] * (n - 1), dtype=wp.int32, device=device)
-    factors.size = wp.array([n], dtype=wp.int32, device=device)
-    factors.world_offset = wp.array([0], dtype=wp.int32, device=device)
-    factors.address = wp.array([storage.ptr], dtype=wp.uint64, device=device)
-    return factors, L
+    return factors, np.linalg.cholesky(mass[::-1, ::-1])
 
 
 def whitened_rows(jacobian, L) -> np.ndarray:
@@ -1169,15 +1150,14 @@ def unpacked_rows(solver) -> tuple[np.ndarray, np.ndarray]:
 
 def incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
     """BACKBONE's placement invariant ``|J v - Z^T u|`` at the predictor, over the matrix-free sweeps' dense rows:
-    each row's ``|row_incident - Z^T u_hat|`` with ``u_hat = L^T P v_hat`` on each side, and the magnitude of the
+    each row's ``|row_incident - Z^T u_hat|`` with ``u_hat`` the walk's enter of ``v_hat`` on each side
+    (:func:`_walked_coordinates`), and the magnitude of the
     sum's terms it rounds against (:mod:`.solve_policy`), float64 ``[world, row]``, zero past a world's rows."""
     dof = packed_coordinates(solver)
     Z = solver.placement.packed_Z.numpy().astype(np.float64)
-    v_hat = solver.v_hat.numpy().astype(np.float64)
     incident = solver.placement.row_incident.numpy().astype(np.float64)
     sides, sizes = solver.placement.row_sides.numpy(), solver.forest.articulation_response_dof_count.numpy()
-    groups, offsets = solver.forest.art_group_idx.numpy(), solver.forest.articulation_world_dof_offset.numpy()
-    starts = solver.forest.articulation_dof_start.numpy()
+    offsets = solver.forest.articulation_world_dof_offset.numpy()
     gaps, terms = np.zeros(dof.shape[:2]), np.zeros(dof.shape[:2])
     walked = _walked_coordinates(solver)
     for world, count in enumerate(solver.placement.constraint_count.numpy()):
@@ -1188,13 +1168,8 @@ def incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
                     continue
                 n, first = int(sizes[art]), int(offsets[art])
                 held = (dof[world, row] >= first) & (dof[world, row] < first + n)
-                if walked is not None:
-                    # The walked rows' frame: each held entry against the walk's coordinate it sits at.
-                    term = np.concatenate((term, Z[world, row, held] * walked[world, dof[world, row, held]]))
-                    continue
-                L = np.tril(solver.factor.L_by_size[n].numpy().astype(np.float64)[groups[art]])
-                u_hat = L.T @ v_hat[int(starts[art]) : int(starts[art]) + n][::-1]
-                term = np.concatenate((term, Z[world, row, held][::-1] * u_hat))
+                # The walked rows' frame: each held entry against the walk's coordinate it sits at.
+                term = np.concatenate((term, Z[world, row, held] * walked[world, dof[world, row, held]]))
             gaps[world, row] = abs(incident[world, row] - term.sum())
             terms[world, row] = np.abs(term).sum()
     return gaps, terms

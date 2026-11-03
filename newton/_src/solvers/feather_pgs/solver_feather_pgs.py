@@ -1065,8 +1065,6 @@ class SolverFeatherPGS(SolverBase):
         if not model.articulation_count:
             return
 
-        # The tree factor's L and R (compact and sparse sizes keep (1, 1, 1) placeholders of L).
-        self.factor.allocate_size_groups((self._compact_diagonal_mass_size, self.placement.sparse_mass_matrix_size))
         self.placement.allocate_contact_rows(model)
 
     def read_audit(self) -> dict:

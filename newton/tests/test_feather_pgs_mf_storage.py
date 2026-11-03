@@ -684,41 +684,16 @@ def _walk(du):
 
 
 def _body_factors(host, device):
-    """Each world's free bodies' factors (a scaled identity per body) and their first global coordinates."""
+    """Every world's two articulations (packed_rows' sides), its articulated block and then its free body, found from
+    their first global coordinates."""
     indices = host["world_dof_indices"]
-    dof_factor = np.full(indices.size, -1, np.int32)
-    lower = []
-    for world, count in enumerate(host["mf_constraint_count"]):
-        for row in range(count):
-            packed = int(host["mf_meta"][world, 4 * row])
-            for half in (packed >> 16, ((packed << 16) & 0xFFFFFFFF) >> 16):
-                first = half - 65536 if half >= 32768 else half
-                if first >= 0 and dof_factor[indices[world, first]] < 0:
-                    dof_factor[indices[world, first]] = len(lower)
-                    lower.append(np.eye(6) * (0.8 + 0.1 * (len(lower) % 5)))
-    factors = BodyFactors()
-    factors.dof_factor = wp.array(dof_factor, dtype=wp.int32, device=device)
-    factors.L = wp.array(np.array(lower or [np.eye(6)], np.float32), dtype=wp.float32, device=device)
-    # Every world's two articulations (packed_rows' sides): its articulated block, then its free body, each with a
-    # scaled-identity factor found by address from its first global coordinate.
     worlds, dofs = indices.shape
-    sizes = np.tile(np.array([dofs - 6, 6], np.int32), worlds)
-    offsets = np.tile(np.array([0, dofs - 6], np.int32), worlds)
     first_art = np.full(indices.size, -1, np.int32)
     first_art[indices[:, 0]] = 2 * np.arange(worlds)
     first_art[indices[:, dofs - 6]] = 2 * np.arange(worlds) + 1
-    blocks = [np.eye(int(n), dtype=np.float32).ravel() * (0.7 + 0.1 * (a % 4)) for a, n in enumerate(sizes)]
-    storage = wp.array(np.concatenate(blocks), dtype=wp.float32, device=device)
-    starts = np.concatenate([[0], np.cumsum([b.size for b in blocks])[:-1]]).astype(np.uint64)
+    factors = BodyFactors()
     factors.first_art = wp.array(first_art, dtype=wp.int32, device=device)
-    factors.size = wp.array(sizes, dtype=wp.int32, device=device)
-    factors.world_offset = wp.array(offsets, dtype=wp.int32, device=device)
-    factors.address = wp.array(storage.ptr + starts * np.uint64(4), dtype=wp.uint64, device=device)
-    _FACTOR_STORAGE.append(storage)  # The addresses stay valid while the test runs.
     return factors
-
-
-_FACTOR_STORAGE = []
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "MF-GS native solve requires CUDA")

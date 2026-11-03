@@ -57,7 +57,7 @@ def fixture(floating, device, *, permuted=True, motion=False):
     count = model.joint_dof_count // arts
     mass = TreePlan.build(parents, np.diff(model.joint_qd_start.numpy())[: len(parents)]).factor
     solver.placement.sparse_mass_matrix_size = count
-    solver.factor.allocate_sparse(mass, arts)
+    solver.factor.allocate_sparse(mass)
     solver.factor.sparse_factor_warps_per_block = 4
     groups = np.array([3, 0, 5, 1, 4, 2] if permuted else list(range(arts)), np.int32)
     solver.forest.group_to_art[count].assign(groups)
@@ -118,14 +118,12 @@ class TestTreeForestCache(unittest.TestCase):
                 physical = physical_mass(model, state)
                 solver.factor.joint_tau.zero_()
                 owner.begin(state, solver.factor, velocity, dt, True)
-                geometry = owner.geometric.numpy()
                 expected = np.empty_like(forces)
-                for group, art in enumerate(groups):
+                for art in groups:
                     block = physical[art * count : (art + 1) * count, art * count : (art + 1) * count]
-                    packed = block[np.ix_(mass.permutation, mass.permutation)][mass.entry_rows, mass.columns]
-                    np.testing.assert_allclose(geometry[group], packed, atol=3e-6, rtol=3e-5)
                     expected[art] = np.linalg.solve(
-                        block + np.diag(solver.factor.R_by_size[count].numpy()[group]), forces[art]
+                        block + np.diag(solver.factor.dof_armature.numpy()[art * count : (art + 1) * count]),
+                        forces[art],
                     )
                 solver.factor.mass_update_mask.fill_(1)
                 operator.refresh(solver.factor)
@@ -248,10 +246,10 @@ class TestTreeForestCache(unittest.TestCase):
         operator.refresh(solver.factor)
         response = force_response(owner, solver, state, control, state.joint_qd, native.DT)
         regularization = np.empty(model.joint_dof_count)
-        for group, art in enumerate(operator.plan.group_to_art.numpy()):
-            regularization[art * mass.dof_count : (art + 1) * mass.dof_count] = solver.factor.R_by_size[
-                mass.dof_count
-            ].numpy()[group]
+        armature = solver.factor.dof_armature.numpy()
+        for art in operator.plan.group_to_art.numpy():
+            span = slice(art * mass.dof_count, (art + 1) * mass.dof_count)
+            regularization[span] = armature[span]
         expected = np.linalg.solve(physical + np.diag(regularization), control.joint_f.numpy().astype(float))
         np.testing.assert_allclose(response, expected, atol=4e-5, rtol=4e-4)
         solver.v_out.assign(solver.v_hat)

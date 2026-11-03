@@ -247,7 +247,7 @@ def predict_prismatic_branches(
     damping: wp.array[float],
     kinematic_dof_mask: wp.array[int],
     mass_update_mask: wp.array[int],
-    armature: wp.array2d[float],
+    armature: wp.array[float],
     drive_row_by_dof: wp.array[int],
     drive_target_index_by_dof: wp.array[int],
     joint_target_ke: wp.array[float],
@@ -285,7 +285,7 @@ def predict_prismatic_branches(
     q = joint_q[joint_q_start[root_joint] + local]
     qd = joint_qd[dof]
     linear = wp.spatial_top(motion)
-    leaf_inertia = mass * wp.dot(linear, linear) + armature[group, local]
+    leaf_inertia = mass * wp.dot(linear, linear) + armature[dof]
     u0, stiffness = _drive_terms(
         dof,
         q,
@@ -785,7 +785,7 @@ class ScalarBranchState:
             solver.factor.passive_joint_damping,
             solver.factor.kinematic_dof_mask,
             solver.factor.mass_update_mask,
-            solver.factor.R_by_size[self.size],
+            solver.factor.dof_armature,
             solver.factor.drive_row_by_dof,
             solver.factor.drive_target_index_by_dof,
             model.joint_target_ke,

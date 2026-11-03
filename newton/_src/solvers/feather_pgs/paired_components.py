@@ -33,7 +33,6 @@ PAIRED_COMPONENTS = (
     Field("mf_first", wp.int32, ("world",), owner="placement"),
     Field("primary_offset", wp.int32, ("world",), owner="sweep", attr="paired_factor_primary_offsets_by_world"),
     Field("secondary_offset", wp.int32, ("world",), owner="sweep", attr="paired_factor_secondary_offsets_by_world"),
-    Field("primary_group", wp.int32, ("world",), owner="sweep", attr="paired_factor_primary_groups_by_world"),
     Field("selector", wp.int32, ("world",), owner="components"),
     Field("Y", wp.float32, ("world", "row", "world_dof"), attr="packed_Z", owner="placement"),
     Field("primary_art", wp.int32, ("world",), owner="sweep", attr="paired_factor_primary_arts_by_world"),

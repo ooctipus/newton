@@ -134,14 +134,12 @@ def _permuted_slots(solver, contacts, shift):
             contact_world=solver.placement.contact_world,
             contact_slots_needed=solver.placement.contact_slots_needed,
             sparse_mass_matrix_size=None,
-            walks=solver.placement.walks,
         ),
         laws=SimpleNamespace(friction_patches=solver.laws.friction_patches),
-        # The bodies' factors, which whitened the rows: their held factors, or the walk where the placement walks.
-        factor=SimpleNamespace(L_by_size=solver.factor.L_by_size, walk_view=solver.factor.walk_view),
+        # The walk, which whitened the rows.
+        factor=SimpleNamespace(walk_view=solver.factor.walk_view),
         forest=SimpleNamespace(
             body_to_articulation=solver.forest.body_to_articulation,
-            art_group_idx=solver.forest.art_group_idx,
             articulation_dof_start=solver.forest.articulation_dof_start,
         ),
     )

@@ -20,12 +20,11 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import joint_table
-from newton._src.solvers.feather_pgs.held_tree import HeldTree
+from newton._src.solvers.feather_pgs.held_tree import HeldTree, operator_metadata
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
-from newton._src.solvers.feather_pgs.sparse_factor import operator_metadata
 from newton._src.solvers.feather_pgs.tree_kinetic_plan import make_plan
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
@@ -176,7 +175,7 @@ def _solver_snapshot(solver):
         "joint_armature_effective": solver.factor.armature,
         "fk_id_cache_valid": solver.factor.fk_id_cache_valid,
         "mass_update_requested": solver.factor.mass_update_requested,
-        **{f"R_by_size[{size}]": solver.factor.R_by_size[size] for size in solver.forest.size_groups},
+        "dof_armature": solver.factor.dof_armature,
     }
     owner = solver.factor.held
     for index, group in enumerate(getattr(owner, "groups", ())):

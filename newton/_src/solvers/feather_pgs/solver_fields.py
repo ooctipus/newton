@@ -119,13 +119,6 @@ STATE_AUX = FieldGroup(
 # Size groups
 # ---------------------------------------------------------------------------------------------------------------------
 
-SIZE_FACTORS = FieldGroup(
-    Field("L", wp.float32, ("factor_art", "factor_size", "factor_size")),
-    Field("R", wp.float32, ("art", "size")),
-)
-"""One size group's mass factor, every drive's ``K`` in it, and its armature (the tree factor's); compact and sparse sizes
-keep (1, 1, 1) placeholders of the factor."""
-
 SIZE_JACOBIAN = FieldGroup(Field("J", wp.float32, ("response_art", "response_row", "response_size")))
 """One size group's Jacobian. The matrix-free sweeps' producers write the packed rows instead (:mod:`.packed_rows`):
 their Jacobian is a (1, 1, 1) placeholder."""

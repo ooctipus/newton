@@ -149,27 +149,21 @@ class TestMixedTreeCache(unittest.TestCase):
             starts = solver.forest.articulation_dof_start.numpy()
             for group in owner.groups:
                 operator, n = group.sparse, group.layout.dofs
-                mass = operator.mass
-                for index, art in enumerate(operator.plan.group_to_art.numpy()):
+                for art in operator.plan.group_to_art.numpy():
                     ids = np.arange(starts[art], starts[art] + n)
                     block = physical[np.ix_(ids, ids)]
-                    packed = block[np.ix_(mass.permutation, mass.permutation)][mass.entry_rows, mass.columns]
-                    np.testing.assert_allclose(group.geometric.numpy()[index], packed, atol=4e-6, rtol=4e-5)
                     expected[ids] = np.linalg.solve(
-                        block + np.diag(solver.factor.R_by_size[n].numpy()[index]), forces[ids]
+                        block + np.diag(solver.factor.dof_armature.numpy()[ids]), forces[ids]
                     )
-                    if not model.device.is_cuda and not operator.diagonal:
-                        lower = solver.factor.L_by_size[n].numpy()
-                        lower[index] = np.linalg.cholesky(block + np.diag(solver.factor.R_by_size[n].numpy()[index]))
-                        solver.factor.L_by_size[n].assign(lower)
             solver.factor.mass_update_mask.fill_(1)
             owner.refresh(solver.factor)
+            # Each group's held response: the compact diagonal's inverse, or the walk (the factor).
             held = {
                 group.layout.dofs: (
-                    solver.factor.diagonal_inverse_mass.numpy().copy()
-                    if group.sparse.diagonal
-                    else solver.factor.L_by_size[group.layout.dofs].numpy().copy()
+                    solver.factor.diagonal_inverse_mass if group.sparse.diagonal else solver.factor.walk_data
                 )
+                .numpy()
+                .copy()
                 for group in owner.groups
             }
             response = force_response(owner, solver, state, control, state.joint_qd, DT)
@@ -212,11 +206,7 @@ class TestMixedTreeCache(unittest.TestCase):
             solver.factor.mass_update_mask.zero_()
             owner.refresh(solver.factor)
             for group in owner.groups:
-                value = (
-                    solver.factor.diagonal_inverse_mass
-                    if group.sparse.diagonal
-                    else solver.factor.L_by_size[group.layout.dofs]
-                )
+                value = solver.factor.diagonal_inverse_mass if group.sparse.diagonal else solver.factor.walk_data
                 np.testing.assert_array_equal(value.numpy(), held[group.layout.dofs])
             if model.device.is_cuda:
                 wp.synchronize()  # Complete fixture allocations before graph capture.

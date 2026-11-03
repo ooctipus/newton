@@ -14,6 +14,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
 )
+from newton.tests.feather_pgs_law_harness import walk_inverse
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
     assert_history_close,
@@ -104,22 +105,23 @@ class TestMixedTreeSteps(unittest.TestCase):
             np.testing.assert_array_equal(group.data.current_valid.numpy(), 1)
 
     def assert_factor(self, case, state):
-        """Check original held factors against public-twist mass and drive diagonals."""
+        """Check the held factors (the walk, or the compact diagonal's inverse) against public-twist mass and drive
+        diagonals."""
         model, solver, *_ = case
         physical = physical_mass(model, state)
         starts = solver.forest.articulation_dof_start.numpy()
         rows, coefficients = solver.factor.drive_row_by_dof.numpy(), solver.factor.aug_row_K.numpy()
         for group in solver.factor.held.groups:
             operator, size = group.sparse, group.layout.dofs
-            for index, art in enumerate(operator.plan.group_to_art.numpy()):
+            for art in operator.plan.group_to_art.numpy():
                 ids = np.arange(starts[art], starts[art] + size)
-                regularizer = solver.factor.R_by_size[size].numpy()[index].astype(float)
+                regularizer = solver.factor.dof_armature.numpy()[ids].astype(float)
                 regularizer += [max(0.0, float(coefficients[rows[dof]])) if rows[dof] >= 0 else 0 for dof in ids]
                 expected = physical[np.ix_(ids, ids)] + np.diag(regularizer)
                 if operator.diagonal:
                     actual = np.diag(1.0 / solver.factor.diagonal_inverse_mass.numpy()[ids])
                 else:
-                    lower = np.tril(solver.factor.L_by_size[size].numpy()[index].astype(float))
+                    lower = np.linalg.inv(walk_inverse(solver, int(art)))
                     actual = lower @ lower.T
                 np.testing.assert_allclose(actual, expected, atol=5e-6, rtol=5e-5)
 
@@ -144,11 +146,11 @@ class TestMixedTreeSteps(unittest.TestCase):
                     if arm and index == 0:
                         self.assert_factor(cases[arm], state)
                         held = (
-                            solver.factor.L_by_size[9].numpy().copy(),
+                            solver.factor.walk_data.numpy().copy(),
                             solver.factor.diagonal_inverse_mass.numpy().copy(),
                         )
                     if arm and index == 1:
-                        np.testing.assert_array_equal(solver.factor.L_by_size[9].numpy(), held[0])
+                        np.testing.assert_array_equal(solver.factor.walk_data.numpy(), held[0])
                         np.testing.assert_array_equal(solver.factor.diagonal_inverse_mass.numpy(), held[1])
                 self.assert_pair(cases)
             wp.synchronize()  # Finish auxiliary streams before replacing this fixture.

@@ -3,12 +3,9 @@
 
 """Read a FeatherPGS solver's free-body rows back in physical coordinates, and sweep given free-body rows.
 
-The rows' build whitens each side, ``Z = L^-1 P J^T`` with the body's held leaf-first factor ``L`` (``L_by_size[6]``
-at its articulation's group index, ``P`` the coordinates reversed; factor coordinate ``i`` of ``Z`` at position
-``5 - i``), so a test that checks a row against physical velocities recovers ``J = P^T L Z``. Where the placement
-walks (:mod:`.walk_rows`) a side is the walk of the body's seed, ``z_c = (J_c - sum_{k > c} (s_c . ut_k) z_k) /
-ell_c`` over its six coordinates from the last, so ``J_c = ell_c z_c + sum_{k > c} (s_c . ut_k) z_k`` from the walk's
-data. A speed row keeps its unwhitened axis. :func:`sweep_free_body_rows` runs rows a test writes through the general
+The rows' build whitens each side by the walk (:mod:`.walk_rows`): a side is the walk of the body's seed,
+``z_c = (J_c - sum_{k > c} (s_c . ut_k) z_k) / ell_c`` over its six coordinates from the last, so a test that checks a
+row against physical velocities recovers ``J_c = ell_c z_c + sum_{k > c} (s_c . ut_k) z_k`` from the walk's data. A speed row keeps its unwhitened axis. :func:`sweep_free_body_rows` runs rows a test writes through the general
 sweep. The module defines no tests.
 """
 
@@ -32,24 +29,16 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
     Z_a = solver.placement.mf_Z_a.numpy() if Z_a is None else np.asarray(Z_a)
     Z_b = solver.placement.mf_Z_b.numpy() if Z_b is None else np.asarray(Z_b)
     articulation = solver.forest.body_to_articulation.numpy()
-    group = solver.forest.art_group_idx.numpy()
     row_type = solver.placement.mf_row_type.numpy()
-    if getattr(solver.placement, "walks", False):
-        records = solver.factor.walk_view().data.numpy()
-        data = unpack_walk_records(records, records.shape[0]).astype(np.float64)
-        starts = solver.forest.articulation_dof_start.numpy()
+    records = solver.factor.walk_view().data.numpy()
+    data = unpack_walk_records(records, records.shape[0]).astype(np.float64)
+    starts = solver.forest.articulation_dof_start.numpy()
 
-        def physical(art, z):
-            d = data[starts[art] : starts[art] + 6]
-            return np.array(
-                [z[c] / d[c, 12] + sum(d[c, :6] @ d[k, 6:12] * z[k] for k in range(c + 1, 6)) for c in range(6)]
-            )
-
-    else:
-        factors = solver.factor.L_by_size[6].numpy().astype(np.float64)
-
-        def physical(art, z):
-            return (factors[group[art]] @ z[::-1])[::-1]
+    def physical(art, z):
+        d = data[starts[art] : starts[art] + 6]
+        return np.array(
+            [z[c] / d[c, 12] + sum(d[c, :6] @ d[k, 6:12] * z[k] for k in range(c + 1, 6)) for c in range(6)]
+        )
 
     jacobians = []
     for Z, bodies in ((Z_a, solver.placement.mf_body_a.numpy()), (Z_b, solver.placement.mf_body_b.numpy())):
@@ -99,12 +88,7 @@ def sweep_free_body_rows(
         return wp.array(out, device=device)
 
     factors = BodyFactors()
-    factors.dof_factor = wp.array(np.array((0, -1, -1, -1, -1, -1), np.int32), device=device)
-    factors.L = wp.array(np.eye(6, dtype=np.float32)[None], device=device)
     factors.first_art = wp.array(np.array((0, -1, -1, -1, -1, -1), np.int32), device=device)
-    factors.size = wp.array(np.array((6,), np.int32), device=device)
-    factors.world_offset = wp.zeros(1, dtype=wp.int32, device=device)
-    factors.address = wp.array(np.array((factors.L.ptr,), np.uint64), dtype=wp.uint64, device=device)
     values = {
         "general_world_count": wp.array((1,), dtype=wp.int32, device=device),
         "general_worlds": wp.zeros(1, dtype=wp.int32, device=device),

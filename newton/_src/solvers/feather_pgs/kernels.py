@@ -1645,37 +1645,24 @@ def populate_world_J_for_compact_size(
 # ---------------------------------------------------------------------------------------------------------------------
 #
 # A free body is a one-node tree: its six velocity coordinates (its center-of-mass velocity, then its angular
-# velocity) have the 6x6 mass matrix ``H`` the dynamics factor leaf-first, ``P H P^T = L L^T`` with ``P`` the
-# coordinates reversed, armature included (``L_by_size[6]`` at its articulation's group index, lower, row-major). A
-# free-body row is whitened, ``Z = L^-1 P J^T`` per body, and the sweeps hold the change of the body's velocity in
-# factor coordinates ``u = L^T P dv``: a row's velocity term is ``Z^T u``, its update ``u += Z dlambda``, and ``dv = P^T
-# L^-T u`` leaves them. Factor coordinate ``i`` of ``Z`` and ``u`` sits at position ``5 - i``, the physical coordinate it
+# velocity) have the 6x6 mass matrix ``H`` the walk factors leaf-first, ``P H P^T = L L^T`` with ``P`` the
+# coordinates reversed, armature included. A free-body row is whitened, ``Z = L^-1 P J^T`` per body, and the sweeps
+# hold the change of the body's velocity in factor coordinates ``u = L^T P dv``: a row's velocity term is ``Z^T u``,
+# its update ``u += Z dlambda``, and ``dv = P^T L^-T u`` leaves them. Factor coordinate ``i`` of ``Z`` and ``u`` sits at position ``5 - i``, the physical coordinate it
 # reverses (:func:`.response_operator.leaf_first`). The walk whitens the rows and leaves them (:mod:`.walk_rows`,
 # :func:`.tree_factor.walk_leave_kernel`).
 
 
 @wp.struct
 class BodyFactors:
-    """Where each free body's held factor and velocity coordinates live: its articulation, the articulation's index
-    in ``L_by_size[6]`` (``factor_index``, the solver's ``art_group_idx``) and first coordinate (``dof_start``), the
-    factor index of the free body whose coordinates start at each global coordinate (``dof_factor``, -1 elsewhere:
-    the native sweeps' lookup), and the size-6 factors ``L``.
-
-    Every articulation's factor too, for the sweeps that hold a world's articulations in factor coordinates
-    (:class:`.sweep_routes.FactorCoordinates`): the articulation whose coordinates start at each global coordinate
-    (``first_art``, -1 elsewhere), and each articulation's coordinates (``size``), first world coordinate
-    (``world_offset``) and the address of its row-major leaf-first factor (``address``: ``L_by_size[size]`` at its
-    group index, 0 without a dense factor)."""
+    """Where each body's tree and velocity coordinates live: its articulation (``body_to_articulation``), the
+    articulation's first coordinate (``dof_start``), and the articulation whose coordinates start at each global
+    coordinate (``first_art``, -1 elsewhere), by which the sweeps find a free body's tree to walk
+    (:class:`.sweep_routes.FactorCoordinates`)."""
 
     body_to_articulation: wp.array[int]
-    factor_index: wp.array[int]
     dof_start: wp.array[int]
-    dof_factor: wp.array[int]
-    L: wp.array3d[float]
     first_art: wp.array[int]
-    size: wp.array[int]
-    world_offset: wp.array[int]
-    address: wp.array[wp.uint64]
 
 
 @wp.kernel
