@@ -86,6 +86,7 @@ __all__ = [
     "walk_leave_kernel",
     "walk_paths_prelude",
     "walk_prelude",
+    "walk_row_prelude",
 ]
 
 
@@ -2122,6 +2123,33 @@ def walk_paths_prelude(
     )
 
 
+_WALK_ROW = """    // WALK_ROW(data, link, now, now_link, shift, body, k, seed, sink): every reader's seed walk, after a walk
+    // prelude (walk_prelude, walk_paths_prelude). Rows seeded at body walked up its root path into sink: the wrench
+    // seed[6 r + i] at body's frame (k < 0; now, now_link and shift its step's geometry, as WALK_UP takes them), or the
+    // covector seed[r] e_k at body's coordinate k (WALK_SEED, then WALK_UP from k - 1, without the step's geometry).
+    const auto WALK_ROW = [&](const float* data, const float* link, const float* now, const float* now_link,
+                              const float* shift, const int body, const int k, const float* seed, auto&& sink) {
+        float p[6 * $rows], w[6 * $rows];
+        int top = WALK_FIRST_OF(body + 1) - 1;
+        for (int e = 0; e < 6 * $rows; ++e) p[e] = w[e] = k < 0 ? seed[e] : 0.0f;
+        if (k >= 0) {
+            WALK_SEED(data, k, seed, p, sink);
+            top = k - 1;
+            now = nullptr;
+        }
+        WALK_UP(data, link, now, now_link, shift, body, top, p, w, sink);
+    };"""
+
+
+@functools.cache
+def walk_row_prelude(rows: int) -> DevicePrelude:
+    """The seed walk of ``rows`` rows (``WALK_ROW``), for both devices: every row reader's (the one writer's units and
+    natives, the parallel tiers' rows, the local blocks' seeds) binds its sink to it. It follows the walk prelude whose
+    ``WALK_UP`` and ``WALK_SEED`` it calls, and only readers that walk seeds declare it."""
+    text = substitute(_WALK_ROW, rows=rows)
+    return DevicePrelude(f"walk_row_{rows}", text, cpu=text)
+
+
 FREE_BODY_WALK = WalkClass((-1,), (0, 6), (0, 0, 0, 1, 1, 1))
 """A free rigid body's walking class: one body of six coordinates."""
 
@@ -2606,7 +2634,6 @@ def walk_enter_kernel() -> wp.Kernel:
 _WALK_INTO = """    WALK_TREE(reinterpret_cast<const int*>(walk.path.data + joint0), bodies, coordinates);
     const float* data = walk.data.data + (size_t)dof0 * $coordinate;
     const float* link = walk.link.data + (size_t)joint0 * $link;
-    const float* now = walk.now.data + (size_t)dof0 * $now;
     float* row = out.data + ((size_t)line * out.shape[1] + slot) * out.shape[2] + entry;
     const float* v = qd.data + dof0;
     float incident = 0.0f, squares = 0.0f;
@@ -2618,36 +2645,26 @@ _WALK_INTO = """    WALK_TREE(reinterpret_cast<const int*>(walk.path.data + join
         squares += z * z;
         incident += j * v[c];
     };
-    $seed
+    // A wrench enters at the step's geometry, shifted by the articulation's origins; a covector takes none.
+    float shift[3] = {0.0f, 0.0f, 0.0f};
+    if (k < 0) WALK_SHIFT(walk, walk.joint_art.data[joint0], shift);
+    WALK_ROW(data, link, walk.now.data + (size_t)dof0 * $now, walk.now_link.data + (size_t)joint0 * $link, shift, body,
+             k, &seed[0], sink);
     return wp::vec2(incident, squares);
 """
 
-_WRENCH_SEED = """float p[6], w[6];
-    for (int k = 0; k < 6; ++k) p[k] = w[k] = wrench[k];
-    const int art = walk.joint_art.data[joint0];
-    float shift[3];
-    WALK_SHIFT(walk, art, shift);
-    WALK_UP(data, link, now, walk.now_link.data + (size_t)joint0 * $link, shift,
-            body, WALK_FIRST_OF(body + 1) - 1, p, w, sink);"""
-
-_COVECTOR_SEED = """(void)now;
-    float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}, w[6];
-    const float x[1] = {value};
-    WALK_SEED(data, coordinate, x, p, sink);
-    WALK_UP(data, link, nullptr, nullptr, nullptr, body, coordinate - 1, p, w, sink);"""
-
 
 @functools.cache
-def _walk_into_snippet(seed: str, side: bool = True) -> str:
+def _walk_into_snippet(side: bool) -> str:
     from .device_preludes import dual_native  # noqa: PLC0415
 
     return dual_native(
-        substitute(_WALK_INTO.replace("$seed", seed), coordinate=WALK_COORDINATE, link=WALK_LINK, now=WALK_NOW),
-        preludes=(walk_paths_prelude(1, side=side),),
+        substitute(_WALK_INTO, coordinate=WALK_COORDINATE, link=WALK_LINK, now=WALK_NOW),
+        preludes=(walk_paths_prelude(1, side=side), walk_row_prelude(1)),
     )
 
 
-@wp.func_native(_walk_into_snippet(_WRENCH_SEED))
+@wp.func_native(_walk_into_snippet(True))
 def walk_into(
     walk: WalkTrees,
     joint0: int,
@@ -2655,7 +2672,8 @@ def walk_into(
     bodies: int,
     coordinates: int,
     body: int,
-    wrench: wp.spatial_vector,
+    k: int,
+    seed: wp.spatial_vector,
     qd: wp.array[float],
     add: int,
     out: wp.array3d[float],
@@ -2663,37 +2681,16 @@ def walk_into(
     slot: int,
     entry: int,
 ) -> wp.vec2:
-    """Walk one row's wrench seed at local ``body``'s frame (the factor's, :attr:`WalkTrees.link`) into
-    ``out[line, slot, entry + c]``, on the tree of path table ``joint0``: the step's columns the finish published,
-    shifted to the path's frames, are its ``J``. Stores the footprints (adds them with ``add`` 1: a second
-    seed on one tree; stores none with ``add`` -1) and returns the seed's incident ``J qd`` (the step's ``J`` entries
-    the walk passes, against ``qd``) and the sum of its footprints' squares."""
+    """Walk one row's seed (``WALK_ROW``) into ``out[line, slot, entry + c]``, on the tree of path table ``joint0``:
+    the wrench ``seed`` at local ``body``'s frame (``k < 0``; the factor's, :attr:`WalkTrees.link`), where the step's
+    columns the finish published, shifted to the path's frames, are its ``J``, or the covector ``seed[0] e_k`` at
+    ``body``'s local coordinate ``k``. Stores the footprints (adds them with ``add`` 1: a second seed on one tree;
+    stores none with ``add`` -1) and returns the seed's incident ``J qd`` (the step's ``J`` entries the walk passes,
+    against ``qd``; a covector's ``seed[0] qd[k]``) and the sum of its footprints' squares."""
     ...
 
 
-@wp.func_native(_walk_into_snippet(_COVECTOR_SEED))
-def walk_covector_into(
-    walk: WalkTrees,
-    joint0: int,
-    dof0: int,
-    bodies: int,
-    coordinates: int,
-    body: int,
-    coordinate: int,
-    value: float,
-    qd: wp.array[float],
-    add: int,
-    out: wp.array3d[float],
-    line: int,
-    slot: int,
-    entry: int,
-) -> wp.vec2:
-    """Walk one row's covector seed ``value e_coordinate`` (local coordinate of local ``body``) into
-    ``out[line, slot, entry + c]`` as :func:`walk_into` does; its incident is ``value qd[coordinate]``."""
-    ...
-
-
-@wp.func_native(_walk_into_snippet(_WRENCH_SEED, side=False))
+@wp.func_native(_walk_into_snippet(False))
 def walk_into_one_half(
     walk: WalkTrees,
     joint0: int,
@@ -2701,7 +2698,8 @@ def walk_into_one_half(
     bodies: int,
     coordinates: int,
     body: int,
-    wrench: wp.spatial_vector,
+    k: int,
+    seed: wp.spatial_vector,
     qd: wp.array[float],
     add: int,
     out: wp.array3d[float],
@@ -2710,27 +2708,6 @@ def walk_into_one_half(
     entry: int,
 ) -> wp.vec2:
     """:func:`walk_into` for a model whose records have no side (:attr:`TreeFactor.walk_side` false)."""
-    ...
-
-
-@wp.func_native(_walk_into_snippet(_COVECTOR_SEED, side=False))
-def walk_covector_into_one_half(
-    walk: WalkTrees,
-    joint0: int,
-    dof0: int,
-    bodies: int,
-    coordinates: int,
-    body: int,
-    coordinate: int,
-    value: float,
-    qd: wp.array[float],
-    add: int,
-    out: wp.array3d[float],
-    line: int,
-    slot: int,
-    entry: int,
-) -> wp.vec2:
-    """:func:`walk_covector_into` for a model whose records have no side (:attr:`TreeFactor.walk_side` false)."""
     ...
 
 

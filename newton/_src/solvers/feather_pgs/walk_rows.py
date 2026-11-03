@@ -83,8 +83,6 @@ from .tree_factor import (
     WalkRelease,
     WalkTrees,
     release_path,
-    walk_covector_into,
-    walk_covector_into_one_half,
     walk_into,
     walk_into_one_half,
     walk_prelude,
@@ -252,7 +250,7 @@ def free_body_headers_kernel(
             k = int(0)
             if mf.Z_a[line, i, 3] != 0.0:
                 k = 3
-            seed = walk_covector_into(
+            seed = walk_into(
                 walk,
                 j0,
                 d0,
@@ -260,7 +258,7 @@ def free_body_headers_kernel(
                 walk.dofs[art],
                 walk.dof_body[d0 + k],
                 k,
-                1.0,
+                wp.spatial_vector(1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
                 v_hat,
                 -1,
                 mf.Z_a,
@@ -344,12 +342,11 @@ def _variant(function, tag: str):
 
 @cache
 def row_functions(side: bool) -> tuple:
-    """The rows' seed walks: :func:`walk_wrench`, :func:`walk_body` (the free bodies' six entries) and
-    :func:`walk_covector`, for records with or without a side (:attr:`.tree_factor.TreeFactor.walk_side`): without,
-    they take :func:`.tree_factor.walk_into_one_half` and :func:`.tree_factor.walk_covector_into_one_half`, which load
+    """The rows' seed walks (:func:`.tree_factor.walk_into`): :func:`walk_wrench`, :func:`walk_body` (the free bodies'
+    six entries) and :func:`walk_covector`, for records with or without a side
+    (:attr:`.tree_factor.TreeFactor.walk_side`): without, they take :func:`.tree_factor.walk_into_one_half`, which loads
     no side (on kuka the side's predicated loads cost the writer 4%: ``SP/core/FL/HANDOFF_ZK.md`` §11)."""
     into = walk_into if side else walk_into_one_half
-    covector_into = walk_covector_into if side else walk_covector_into_one_half
     tag = "" if side else "_one_half"
 
     def walk_wrench(
@@ -404,6 +401,7 @@ def row_functions(side: bool) -> tuple:
             walk.joint_end[art] - j0,
             walk.dofs[art],
             walk.body_joint[body] - j0,
+            -1,
             wrench,
             v_hat,
             add,
@@ -436,7 +434,7 @@ def row_functions(side: bool) -> tuple:
         d0 = walk.dof_start[art]
         j0 = walk.joint_start[art]
         at = jacobian_row(support, group, art, sides)
-        return covector_into(
+        return into(
             walk,
             j0,
             d0,
@@ -444,7 +442,7 @@ def row_functions(side: bool) -> tuple:
             walk.dofs[art],
             walk.dof_body[dof],
             dof - d0,
-            value,
+            wp.spatial_vector(value, 0.0, 0.0, 0.0, 0.0, 0.0),
             v_hat,
             add,
             packed_Z,
