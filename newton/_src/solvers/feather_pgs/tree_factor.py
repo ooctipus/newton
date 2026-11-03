@@ -1746,7 +1746,7 @@ _WALK_LOADS = """#ifndef WALK_READ
 // a step column, six floats (WALK_NOW, S's layout); a step link's frame point, one quad. Each read
 // takes its load kind, the reader's data: WALK_LDG the read-only path (no walk writes them while a reader runs; ptxas
 // may move it down to its use), WALK_PLAIN a coherent load issued where the text places it (the class emitter's, a
-// store of the chain after it keeps it there). A kernel's staged copy is read by pointer (tree_factor._walk_loads).
+// store of the chain after it keeps it there). A kernel's staged copy is read by pointer (tree_factor._walk_placement).
 // WALK_READ(load, d, p, half): record p as the walk's WALK_UNPACKED floats d: s, ut, 1 / ell, P0. half is the
 // column's half as the reader knows it, its class's data: 0 linear, 1 angular (compiled: no flag, no side load),
 // else named by the record (1 / ell's sign bit set: the angular half), 3 (WALK_EITHER) in a model without a column
@@ -1869,52 +1869,32 @@ def walk_loads_prelude() -> DevicePrelude:
     return DevicePrelude("walk_loads", _walk_loads_text(True), cpu=_walk_loads_text(False))
 
 
-def _walk_loads(coordinate: int, link: int, now: int, half: int = WALK_BOTH) -> dict[str, str]:
-    """The shared walk text's reads (``_WALK``'s ``$record_*``, ``$link_*``, ``$column_c``, ``$point_b`` slots) for a
-    layout: the device layout by the one access (:data:`_WALK_LOADS`, the read-only load kind, its records and columns
-    of ``half``), a kernel's staged copy of it (another stride, in shared memory, unpacked) by pointer."""
-    device = (coordinate, link, now) == (WALK_COORDINATE, WALK_LINK, WALK_NOW)
-    if device:
+def _walk_placement(
+    name: str, table: dict[bool, str], rows: int, coordinate: int, link: int, now: int, half: int
+) -> DevicePrelude:
+    """The walk of ``rows`` rows (:data:`_WALK`) placed on a path table (``table``, each device's text declaring
+    ``WALK_PARENT_OF``, ``WALK_FIRST_OF`` and ``WALK_BODIES``) and a layout, after the one access: :func:`walk_prelude`
+    and :func:`walk_paths_prelude` are its two placements. The layout's reads (``_WALK``'s ``$record_*``, ``$link_*``,
+    ``$column_c`` and ``$point_b``): the device layout by the one access (:data:`_WALK_LOADS`, the read-only load kind,
+    its records and columns of ``half``), a kernel's staged copy of it (another stride, in shared memory, unpacked) by
+    pointer."""
+    if rows < 1:
+        raise ValueError(f"a lane walks at least one row, got {rows}")
+    if (coordinate, link, now) == (WALK_COORDINATE, WALK_LINK, WALK_NOW):
         record = f"float d[{WALK_UNPACKED}];\nWALK_READ(WALK_LDG, d, data + {WALK_COORDINATE} * c, {half});"
+        column = (
+            "float S[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};\nif (now != nullptr)\n"
+            f"    WALK_READ_COLUMN(WALK_LDG, S, now + {WALK_NOW} * c, data + {WALK_COORDINATE} * c, {half});"
+        )
     else:
         record = f"const float* d = data + {coordinate} * c;"
+        column = f"const float* S = now != nullptr ? now + {now} * c : d;"
 
     def body_link(up):
         if link == WALK_LINK:
             return f"float l[6];\nWALK_READ_LINK(WALK_LDG, l, link, b, {up});"
         return f"const float* l = link + {link} * b;"
 
-    if device:
-        column = (
-            "                float S[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};\n"
-            f"                if (now != nullptr)\n"
-            f"                    WALK_READ_COLUMN(WALK_LDG, S, now + {WALK_NOW} * c, data + {WALK_COORDINATE} * c, {half});"
-        )
-    else:
-        column = f"                const float* S = now != nullptr ? now + {now} * c : d;"
-    point = (
-        "                    float f[4];\n"
-        f"                    WALK_READ_POINT(WALK_LDG, f, now_link + {WALK_LINK} * b + {WALK_FRAME});"
-    )
-    return {
-        "record_c": ts.indent_text(record, 16),
-        "record_seed": ts.indent_text(record, 8),
-        # A body's link where the root path opens it (ts.root_path's begin: one line, the path's indent).
-        "link_b": body_link("WALK_PARENT_OF(b)").replace("\n", " "),
-        "link_twist": ts.indent_text(body_link("up"), 8),
-        "column_c": column,
-        "point_b": point,
-    }
-
-
-def _walk_placement(
-    name: str, table: dict[bool, str], rows: int, coordinate: int, link: int, now: int, half: int
-) -> DevicePrelude:
-    """The walk of ``rows`` rows (:data:`_WALK`) placed on a path table (``table``, each device's text declaring
-    ``WALK_PARENT_OF``, ``WALK_FIRST_OF`` and ``WALK_BODIES``) and a layout (:func:`_walk_loads`), after the one access:
-    :func:`walk_prelude` and :func:`walk_paths_prelude` are its two placements."""
-    if rows < 1:
-        raise ValueError(f"a lane walks at least one row, got {rows}")
     walk = substitute(
         _WALK,
         rows=rows,
@@ -1922,7 +1902,15 @@ def _walk_placement(
         now=now,
         frame=WALK_LINK_FRAME,
         batch=WALK_SLIP_BATCH,
-        **_walk_loads(coordinate, link, now, half),
+        record_c=ts.indent_text(record, 16),
+        record_seed=ts.indent_text(record, 8),
+        # A body's link where the root path opens it (ts.root_path's begin: one line, the path's indent).
+        link_b=body_link("WALK_PARENT_OF(b)").replace("\n", " "),
+        link_twist=ts.indent_text(body_link("up"), 8),
+        column_c=ts.indent_text(column, 16),
+        point_b=ts.indent_text(
+            f"float f[4];\nWALK_READ_POINT(WALK_LDG, f, now_link + {WALK_LINK} * b + {WALK_FRAME});", 20
+        ),
     )
     text = {cuda: _walk_loads_text(cuda) + "\n" + table[cuda] + "\n" + walk for cuda in (True, False)}
     return DevicePrelude(name, text[True], cpu=text[False])
