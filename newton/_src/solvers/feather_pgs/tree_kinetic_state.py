@@ -2081,9 +2081,7 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
             const int t = T - lead;
             if (mine && t >= 0 && t < len) {
                 const int c = coordinate[t];
-                const float x = u[c] - b[t] * r;
-                r += ar[t] * x;
-                u[c] = g[t] * x;
+                $apply_r
             }
             WARP_SYNC();
         }
@@ -2094,9 +2092,7 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
             const int t = len - 1 - (T - back);
             if (mine && T >= back && t >= 0) {
                 const int c = coordinate[t];
-                const float x = g[t] * u[c] + ar[t] * r;
-                r -= b[t] * x;
-                u[c] = x;
+                $apply_rt
             }
             WARP_SYNC();
         }
@@ -2199,9 +2195,7 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
                     pivot = READ(dk, k);
                     root = READ(rk, k);
                     if (on && lane > k) {
-                        const float x = z - bk * pair[k];
-                        pair[k] += ak * x;
-                        z = gk * x;
+                        $build_r
                     }
                 }
             }
@@ -2558,6 +2552,9 @@ def held_lambdas(layout: TreeLayout, slips: int, side: bool = True) -> str:
         unpacked=WALK_UNPACKED,
         record=record_load(side),
         held_step=ts.statements([*_HELD_COLUMN, "root = c;"], 20),
+        apply_r=ts.statements(ts.slip("R", "u[c]", "r", "b[t]", "ar[t]", "g[t]", "u[c] = {};"), 16),
+        apply_rt=ts.statements(ts.slip("RT", "u[c]", "r", "b[t]", "ar[t]", "g[t]", "u[c] = {};"), 16),
+        build_r=ts.statements(ts.slip("R", "z", "pair[k]", "bk", "ak", "gk", "z = {};"), 24),
         edge_p=ts.statements(_EDGE_UP, 20),
     )
     return f"#if defined(__CUDA_ARCH__)\n{lambdas}\n#endif\n"

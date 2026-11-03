@@ -1802,9 +1802,7 @@ $record_enter
             const int e = place(c);
             if (e < 0) continue;
             for (int r = 0; r < rows; ++r) {
-                const float u = z[e + r * stride] - b[k] * s[r];
-                s[r] += a[k] * u;
-                z[e + r * stride] = g[k] * u;
+                $slip_on
             }
         }
     };
@@ -1840,16 +1838,12 @@ $record_enter
     };
     const auto WALK_SLIP_T = [&](const auto& release, const size_t at, float* u) {
         WALK_SLIP_BACK(release, at, u, [](const float v, float& t, const float b, const float a, const float g) {
-            const float x = g * v + a * t;
-            t -= b * x;
-            return x;
+            $slip_t
         });
     };
     const auto WALK_SLIP_IT = [&](const auto& release, const size_t at, float* u) {
         WALK_SLIP_BACK(release, at, u, [](const float v, float& t, const float b, const float a, const float g) {
-            const float x = (v - a * t) / g;
-            t -= b * v;
-            return x;
+            $slip_it
         });
     };
     const auto WALK_RELEASE_ON = [&](const auto& release, const int art, float* z, const int rows, const int stride,
@@ -1883,6 +1877,11 @@ _WALK_TEXTS = {
     "edge_v": ts.statements(ts.edge(ts.Direction.UP, ts.LOADED.lever, "v"), 24),
     "edge_twist": ts.statements(ts.edge(ts.Direction.DOWN, ts.LOADED.lever, "W", into="V"), 8),
     "enter_V": ts.statements(ts.enter(ts.LOADED, "V", "qd[c]", "u[c]"), 16),
+    "slip_on": ts.statements(
+        ts.slip("R", "z[e + r * stride]", "s[r]", "b[k]", "a[k]", "g[k]", "z[e + r * stride] = {};"), 16
+    ),
+    "slip_t": ts.statements(ts.slip("RT", "v", "t", "b", "a", "g", "return {};"), 12),
+    "slip_it": ts.statements(ts.slip("RIT", "v", "t", "b", "a", "g", "return {};"), 12),
 }
 """The path walk's arithmetic (:data:`_WALK`): the rows' steps up (the held pose a source of statements, ``x``), a
 covector seed's first step, the joints of the rows' and the seed wrenches' up and of a parent's twist down, and the
@@ -2888,7 +2887,9 @@ def _leave_class(k: int, walk: WalkClass, node: tuple[int, ...] | None, release:
         for c in range(n):
             path = walk.root_path(c)
             body = " ".join(
-                f"{{ const float x = g[{t}] * r[{d}] + a[{t}] * t; r[{d}] = x; t -= b[{t}] * x; }}"
+                "{ "
+                + " ".join(ts.slip("RT", f"r[{d}]", "t", f"b[{t}]", f"a[{t}]", f"g[{t}]", f"r[{d}] = {{}};"))
+                + " }"
                 for t, d in reversed(list(enumerate(path)))
             )
             steps.append(f"case {c}: {{ {body} }} break;")

@@ -103,6 +103,7 @@ __all__ = [
     "scan_arrays",
     "schedule_costs",
     "schedule_features",
+    "slip",
     "statements",
     "step",
     "tree_scan",
@@ -1102,3 +1103,18 @@ def root_path(body: str, c: str, *, count: str = "", joint=()) -> tuple[str, str
 
 def _indented(lines, pad: int) -> list[str]:
     return [" " * pad + line for line in "\n".join(lines).split("\n")] if lines else []
+
+
+def slip(kind: str, value: str, carry: str, b: str, a: str, g: str, out: str) -> list[str]:
+    """One step of a slip's release along its root path (``R = L_F^-1 L_K``, a rank-one recurrence on the walk's
+    coordinates, :class:`.tree_factor.WalkRelease`): ``"R"`` leaf first, ``x = value - b s``, ``s += a x``, out
+    ``g x``; ``"RT"`` its transpose root first, ``x = g value + a t``, ``t -= b x``, out ``x``; ``"RIT"`` the
+    transpose's inverse, ``x = (value - a t) / g``, ``t -= b value``, out ``x``. ``carry`` is the recurrence's ``s``
+    or ``t``; ``out`` a statement with ``{}`` for the step's output."""
+    if kind == "R":
+        return [f"const float x = {value} - {b} * {carry};", f"{carry} += {a} * x;", out.format(f"{g} * x")]
+    if kind == "RT":
+        return [f"const float x = {g} * {value} + {a} * {carry};", f"{carry} -= {b} * x;", out.format("x")]
+    if kind == "RIT":
+        return [f"const float x = ({value} - {a} * {carry}) / {g};", f"{carry} -= {b} * {value};", out.format("x")]
+    raise ValueError(f"a slip's step is R, RT or RIT, not {kind}")
