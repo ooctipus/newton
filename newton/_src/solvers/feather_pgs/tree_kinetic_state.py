@@ -18,7 +18,7 @@ from . import (
     kernels,
 )
 from . import tree_scan as ts
-from .device_preludes import CUDA_ONLY, DevicePrelude, device_branches, substitute
+from .device_preludes import CUDA_ONLY, device_branches, substitute
 from .field_group import Field
 from .kernel_template import Dispatch, KernelTemplate, python_kernel
 from .publication_data import PublicationData
@@ -1755,14 +1755,6 @@ _HELD_COLUMN = [
 added there only (no ``0 +`` after it: the sign of a zero footprint is the walk's own)."""
 
 
-def walk_loads_prelude() -> DevicePrelude:
-    """The walk's one access and its step's pin (:func:`.tree_factor._walk_loads_text`), for both devices: all the
-    border reads of the walk (:data:`_HELD`)."""
-    from .tree_factor import _walk_loads_text  # noqa: PLC0415
-
-    return DevicePrelude("walk_loads", _walk_loads_text(True), cpu=_walk_loads_text(False))
-
-
 _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step on its all-K walk, with no factor array. The release
     // R = L_F^-1 L_K, built from the all-K walk's columns and the K-free pivot, is the decided factor's whitening; the
     // predictor's step takes R then R^T between its two walks, the rows R, the leave R^T, the audit R^-T (WalkRelease).
@@ -2426,6 +2418,8 @@ def get_predictor_kernel(
     slip capacity, the border's build lanes (:func:`held_lambdas`); ``side`` the factor's
     :attr:`.tree_factor.TreeFactor.walk_side`. ``response`` names the group's kind in the kernel's name only.
     """
+    from .tree_factor import walk_loads_prelude  # noqa: PLC0415 (tree_factor imports this module)
+
     if len(classes) != len(_walk_roots(layout)):
         raise ValueError("The predictor needs a walking class (or None) for each root")
     clocks = _native_clocks(clocked, "f", stages=5, column=8)

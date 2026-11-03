@@ -1657,10 +1657,9 @@ $record_enter
     // $batch: the batch's coordinates and coefficients loaded together, then its entries, then the recurrence in
     // registers, then its stores. A path's coordinates are distinct, so no step's load waits on another step's store
     // (one global round trip a batch, not a step).
-    // WALK_SLIP(release, at, z, stride): z <- R_j z (coordinate c at z[c * stride]), leaf first.
     // WALK_SLIP_T(release, at, u): u <- R_j^T u, root first. WALK_SLIP_IT(release, at, u): u <- R_j^-T u, root first.
-    // WALK_RELEASE_ON(release, art, z, rows, stride, place), WALK_RELEASE(release, art, z, stride): a row's footprints
-    // z <- R z, the first slip first.
+    // WALK_RELEASE_ON(release, art, z, rows, stride, place): a row's footprints z <- R z, the first slip first;
+    // WALK_RELEASE(release, art, z, stride) the same on one row whose coordinate c sits at z[c * stride].
     // WALK_RELEASE_T(release, art, u): the leave's u <- R^T u, the last slip first.
     // WALK_RELEASE_IT(release, art, u): the audit's coordinates u <- R^-T u, the first slip first.
     const auto WALK_SLIP_ON = [&](const auto& release, const size_t at, float* z, const int rows, const int stride,
@@ -1679,9 +1678,6 @@ $record_enter
                 $slip_on
             }
         }
-    };
-    const auto WALK_SLIP = [&](const auto& release, const size_t at, float* z, const int stride) {
-        WALK_SLIP_ON(release, at, z, 1, 0, [&](const int c) { return c * stride; });
     };
     // The transposed forms, root first: a batch of the steps above the last one taken, the path's end (-1) skipped.
     const auto WALK_SLIP_BACK = [&](const auto& release, const size_t at, float* u, auto&& step) {
@@ -1727,8 +1723,7 @@ $record_enter
             WALK_SLIP_ON(release, ((size_t)art * cap + j) * steps, z, rows, stride, place);
     };
     const auto WALK_RELEASE = [&](const auto& release, const int art, float* z, const int stride = 1) {
-        const int cap = release.b.shape[1], steps = release.b.shape[2];
-        for (int j = 0; j < release.count.data[art]; ++j) WALK_SLIP(release, ((size_t)art * cap + j) * steps, z, stride);
+        WALK_RELEASE_ON(release, art, z, 1, 0, [&](const int c) { return c * stride; });
     };
     const auto WALK_RELEASE_T = [&](const auto& release, const int art, float* u) {
         const int cap = release.b.shape[1], steps = release.b.shape[2];
@@ -1871,8 +1866,16 @@ point: after its offset to its parent's frame."""
 
 
 def _walk_loads_text(cuda: bool) -> str:
-    """The walk's one access (:data:`_WALK_LOADS`) and the step's pin ``WALK_MUL`` at the device layout, for a device."""
+    """The walk's one access (:data:`_WALK_LOADS`) and the step's pin ``WALK_MUL`` at the device layout, for a device,
+    under its one guard: every walk prelude carries it."""
     return substitute(_WALK_LOADS, link=WALK_LINK, device=_WALK_DEVICE[cuda])
+
+
+@functools.cache
+def walk_loads_prelude() -> DevicePrelude:
+    """The walk's one access alone (:func:`_walk_loads_text`), for both devices: a reader of the records without a
+    walk (the predictor's border) declares it."""
+    return DevicePrelude("walk_loads", _walk_loads_text(True), cpu=_walk_loads_text(False))
 
 
 def _walk_loads(coordinate: int, link: int, now: int, half: int = WALK_BOTH) -> dict[str, str]:
@@ -2101,27 +2104,18 @@ _WALK_FETCH = {
 """The device's words of :data:`_WALK_ACCESS`: the L1 hints, which the CPU has none of."""
 
 
-def walk_down_texts() -> dict[str, str]:
-    """The one walk down, ``DOWN`` on the fetched record (:func:`.tree_scan.step`, :func:`.tree_scan.edge`), as
-    :meth:`WalkClass.walk`'s keywords: each body's offset to its parent's frame (``WALK_LINK_IN``) and each
-    coordinate's record, ``u`` and output's prior value (``WALK_IN``) fetched ahead, their lines asked of L1 first
-    (``WALK_TOUCH``). ``u(c)``, ``prior(c)``, ``qd(c, q, prior)`` and ``twist(b, V)`` are the caller's
-    (:func:`walk_down_prelude`'s ``WALK_DOWN``)."""
-    output, *update = ts.step(ts.Direction.DOWN, ts.FETCHED, "$V", source="$X.u", out="const float q")
-    record, link = f"data + {WALK_COORDINATE} * ($c)", f"link + {WALK_LINK} * ($b)"
-    return {
-        "joint": ts.braced(ts.edge(ts.Direction.DOWN, ts.FETCHED.lever, "$P", into="$V")),
-        "step": ts.braced([output, "qd($c, q, $X.p);", *update]),
-        "end": "twist($b, $V);",
-        "fetch_joint": "WALK_LINK_IN(link, $b, $up)",
-        "fetch_step": f"WALK_IN({record}, u($c), prior($c), $half)",
-        "touch_joint": f"WALK_TOUCH({link});",
-        "touch_step": f"WALK_TOUCH({record});",
-    }
-
-
 def _walk_down(classes: tuple[WalkClass, ...], cuda: bool, unroll: int, ahead: int | None) -> str:
-    walks = [walk.walk(**walk_down_texts(), cuda=cuda, unroll=unroll, ahead=ahead) for walk in classes]
+    texts = ts.walk_texts(
+        ts.Direction.DOWN,
+        source="$X.u",
+        sink="qd($c, q, $X.p);",
+        value="u($c)",
+        prior="prior($c)",
+        coordinate=WALK_COORDINATE,
+        link=WALK_LINK,
+        end="twist($b, $V);",
+    )
+    walks = [walk.walk(**texts, cuda=cuda, unroll=unroll, ahead=ahead) for walk in classes]
     walk = indent_text(ts.by_class(walks), 8)
     return f"""    // WALK_DOWN(cls, data, link, u, prior, qd, twist): the chain of the leave P^T L^-T u of one tree of class cls (an
     // index into the classes the prelude was emitted for), on one lane, root first: each coordinate c takes
