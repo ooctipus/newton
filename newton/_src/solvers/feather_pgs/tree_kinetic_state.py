@@ -656,17 +656,13 @@ $REDUCE
         float value=-cache.bias.data[group*$DOFS+i]+f.joint_f.data[dof]+f.u0.data[dof];
         if(nonzero){$PROJECT}
         if($SPRING_GUARD)value+=$PASSIVE;
-        s[$SIX_BODIES+i]=value;
+        trial.force.data[dof]=value;
     }
-#if defined(__CUDA_ARCH__)
-    SYNC();
-#endif
-    for(int i=lane;i<$DOFS;i+=stride)trial.force.data[ds+i]=s[$SIX_BODIES+i];
 """
 """The predictor's force half (Z4.2): the external wrenches' reduction (a tree whose bodies take none, ``nonzero``
-clear, skips it), then the force on each coordinate, ``s[$SIX_BODIES + i]``: bias, joint and control forces, the body
-wrenches projected (``s[6 body + k]``, dead once projected) and the passive springs; stored to ``trial.force`` at its
-global coordinate for the walk's solve (:func:`get_walk_solve_kernel`), which answers in ``trial.response``."""
+clear, skips it), then the force on each coordinate: bias, joint and control forces, the body wrenches projected
+(``s[6 body + k]``, dead once projected) and the passive springs, stored where it is computed, to ``trial.force`` at its
+global coordinate, for the walk's solve (:func:`get_walk_solve_kernel`), which answers in ``trial.response``."""
 
 _RESPONSE_STAGE = r"""$START    for(int col=lane;col<$DOFS;col+=stride) {
         $TRANSPOSE_ACTION
