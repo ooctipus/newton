@@ -431,8 +431,11 @@ def unit_reader(links: bool, unit_rows: int = 1) -> wp.Function:
         elif wp.static(links) and kind == UNIT_LINK:
             k = index // LINK_ROWS
             row = index - LINK_ROWS * k
-            direction = wp.vec3(0.0)
-            direction[row % 3] = 1.0
+            # The row's axis by selects: written through a runtime index it would sit in local memory.
+            axis = row % 3
+            direction = wp.vec3(
+                wp.where(axis == 0, 1.0, 0.0), wp.where(axis == 1, 1.0, 0.0), wp.where(axis == 2, 1.0, 0.0)
+            )
             primary = seeds.link_primary[k]
             shadow = seeds.link_shadow[k]
             unit.art_a = seeds.body_to_articulation[primary]
