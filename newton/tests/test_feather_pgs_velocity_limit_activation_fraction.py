@@ -6,56 +6,22 @@ import unittest
 import warp as wp
 
 import newton
-from newton._src.sim.enums import BodyFlags, JointType
+from newton._src.sim.enums import BodyFlags
 from newton._src.solvers.feather_pgs import field_group
-from newton._src.solvers.feather_pgs.joint_table import FreeBodies, JointTable
-from newton._src.solvers.feather_pgs.kernels import (
-    allocate_joint_velocity_limit_slots,
-    allocate_rigid_velocity_limit_slots,
-)
+from newton._src.solvers.feather_pgs.joint_table import FreeBodies
+from newton._src.solvers.feather_pgs.kernels import allocate_rigid_velocity_limit_slots
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import prefix_warp_rows
 
 
-def _allocated_joint_velocity_slots(qd: float, *, fraction: float, qdot_max: float = 1.0):
-    device = "cpu"
-    velocity_limit_slot = wp.full((2,), -1, dtype=wp.int32, device=device)
-    velocity_limit_sign = wp.zeros((2,), dtype=wp.float32, device=device)
-    world_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
-
-    wp.launch(
-        allocate_joint_velocity_limit_slots,
-        dim=1,
-        inputs=[
-            field_group.upload(
-                JointTable,
-                device,
-                articulation_start=[0, 1],
-                articulation_dof_start=[0],
-                articulation_H_rows=[1],
-                joint_type=[int(JointType.REVOLUTE)],
-                joint_qd_start=[0],
-                joint_dof_dim=[[0, 1]],
-                joint_velocity_limit=[qdot_max],
-                prescribed=[0],
-                art_to_world=[0],
-            ),
-            wp.array([qd], dtype=wp.float32, device=device),
-            fraction,
-            8,
-        ],
-        outputs=[
-            velocity_limit_slot,
-            velocity_limit_sign,
-            world_slot_counter,
-            wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
-        ],
-        device=device,
+def _joint_velocity_rows(qd: float, *, fraction: float, qdot_max: float = 1.0):
+    """One revolute coordinate's joint velocity-limit rows (the general route's warp, on the CPU): their J signs,
+    targets and count."""
+    rows = prefix_warp_rows(
+        "cpu", 1, 1, 8, velocity=True, velocity_limit=[qdot_max], vhat=[qd], activation=fraction, cfm=0.0
     )
-    return (
-        velocity_limit_slot.numpy().tolist(),
-        velocity_limit_sign.numpy().tolist(),
-        int(world_slot_counter.numpy()[0]),
-    )
+    count = int(rows["count"][0])
+    return rows["J"][0, :count, 0].tolist(), rows["target"][0, :count].tolist(), count
 
 
 def _allocated_rigid_velocity_slots(
@@ -122,28 +88,21 @@ class TestFeatherPGSVelocityLimitActivationFraction(unittest.TestCase):
         # regardless of the current joint velocity.
         for qd in (0.0, 0.5, -2.0):
             with self.subTest(qd=qd):
-                slots, signs, count = _allocated_joint_velocity_slots(qd, fraction=0.0)
-                self.assertEqual(slots, [0, 1])
+                signs, targets, count = _joint_velocity_rows(qd, fraction=0.0)
                 self.assertEqual(signs, [1.0, -1.0])
+                self.assertEqual(targets, [-1.0, -1.0])
                 self.assertEqual(count, 2)
 
     def test_fraction_gates_static_joint_dof_to_zero_rows(self):
-        slots, signs, count = _allocated_joint_velocity_slots(0.0, fraction=0.9)
-        self.assertEqual(slots, [-1, -1])
-        self.assertEqual(signs, [0.0, 0.0])
-        self.assertEqual(count, 0)
-
-        slots, signs, count = _allocated_joint_velocity_slots(0.85, fraction=0.9)
-        self.assertEqual(slots, [-1, -1])
-        self.assertEqual(count, 0)
+        self.assertEqual(_joint_velocity_rows(0.0, fraction=0.9), ([], [], 0))
+        self.assertEqual(_joint_velocity_rows(0.85, fraction=0.9), ([], [], 0))
 
     def test_joint_dof_past_threshold_allocates_rows_same_step(self):
         # The gate reads the same-step joint_qd input, so a DOF driven past
         # the threshold gets its row pair allocated in that very step.
         for qd in (0.95, -0.95, 1.5):
             with self.subTest(qd=qd):
-                slots, signs, count = _allocated_joint_velocity_slots(qd, fraction=0.9)
-                self.assertEqual(slots, [0, 1])
+                signs, _targets, count = _joint_velocity_rows(qd, fraction=0.9)
                 self.assertEqual(signs, [1.0, -1.0])
                 self.assertEqual(count, 2)
 

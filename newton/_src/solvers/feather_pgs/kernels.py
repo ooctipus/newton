@@ -37,10 +37,8 @@ from .contact_laws import (
 )
 from .dense_rows import (
     UNIT_CONTACT,
-    UNIT_LIMIT,
     UNIT_LINK,
     UNIT_MIMIC,
-    UNIT_VELOCITY,
     DenseRows,
     MfRows,
     RowSupport,
@@ -912,80 +910,6 @@ def build_mass_update_mask(
 
 
 # =============================================================================
-# Joint Limit Constraint Kernels
-# =============================================================================
-
-
-@wp.kernel
-def build_joint_limit_rows_for_size(
-    joints: JointTable,
-    joint_q: wp.array[float],
-    joint_limit_activation_gap: float,
-    group_to_art: wp.array[int],
-    max_constraints: int,
-    pgs_beta: float,
-    pgs_cfm: float,
-    resolved_worlds: wp.array[int],
-    support: RowSupport,
-    # outputs
-    world_slot_counter: wp.array[int],
-    first_rejected_slot: wp.array[int],
-    J_group: wp.array3d[float],
-    rows: DenseRows,
-):
-    """Allocate and populate active joint-limit rows in one articulation pass."""
-    group_idx = wp.tid()
-    art = group_to_art[group_idx]
-    world = joints.art_to_world[art]
-    if world >= 0 and world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
-        return
-    line = rows.first[world]
-    dof_start = joints.articulation_dof_start[art]
-
-    for j in range(joints.articulation_start[art], joints.articulation_start[art + 1]):
-        jtype = joints.joint_type[j]
-        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
-            continue
-
-        axis_count = joints.joint_dof_dim[j, 0] + joints.joint_dof_dim[j, 1]
-        qd_start = joints.joint_qd_start[j]
-        q_start = joints.joint_q_start[j]
-        for axis in range(axis_count):
-            dof = qd_start + axis
-            if joints.prescribed[dof] != 0:
-                continue
-            q_val = joint_q[q_start + axis]
-            lower = joints.joint_limit_lower[dof]
-            upper = joints.joint_limit_upper[dof]
-
-            local_dof = dof - dof_start
-
-            for side in range(2):
-                active, phi, sign = joint_limit_side(q_val, lower, upper, side, joint_limit_activation_gap)
-                if not active:
-                    continue
-
-                slot = reserve(world_slot_counter, world, 1, max_constraints, first_rejected_slot)
-                if slot < 0:
-                    continue
-
-                if support.walks != 0:
-                    support.units[line, slot] = unit_source(UNIT_LIMIT, 2 * dof + side)
-                else:
-                    at = jacobian_row(support, group_idx, art, wp.vec2i(art, -1))
-                    clear_side(support, J_group, at, slot, art)
-                    J_group[at[0], slot, at[1] + local_dof] = sign
-                rows.row_type[line, slot] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
-                rows.sides[line, slot] = wp.vec2i(art, -1)
-                rows.row_parent[line, slot] = -1
-                rows.row_mu[line, slot] = 0.0
-                rows.row_beta[line, slot] = pgs_beta
-                rows.row_cfm[line, slot] = pgs_cfm
-                rows.phi[line, slot] = phi
-                rows.target[line, slot] = 0.0
-
-
-# =============================================================================
 # Mimic (Joint Coupling) Constraint Kernels
 # =============================================================================
 # Bilateral equality rows enforcing ``q_follower = coef0 + coef1 * q_leader``
@@ -1254,179 +1178,6 @@ def write_link_rows(
         rows.row_cfm[line, slot] = pgs_cfm
         rows.phi[line, slot] = turn[axis] if angular else gap[axis]
         rows.target[line, slot] = 0.0
-
-
-# =============================================================================
-# Joint Velocity-Limit Constraint Kernels
-# =============================================================================
-# These kernels mirror the PhysX per-DOF velocity-limit formulation documented
-# in ``notes/investigations/velocity-spike/physx-deep-dive.md`` §4 and the math
-# appendix. They reuse the same allocation / populate shape as the
-# joint-position-limit kernels above, but finite velocity limits allocate both
-# sides of the bilateral velocity box rather than waiting for a violation.
-
-
-@wp.kernel
-def allocate_joint_velocity_limit_slots(
-    joints: JointTable,
-    joint_qd: wp.array[float],
-    velocity_limit_activation_fraction: float,
-    max_constraints: int,
-    # outputs
-    velocity_limit_slot: wp.array[int],
-    velocity_limit_sign: wp.array[float],
-    world_slot_counter: wp.array[int],
-    first_rejected_slot: wp.array[int],
-):
-    """Allocate lower/upper velocity-limit rows for every finitely limited DOF.
-
-    For each non-locked DOF of a PRISMATIC / REVOLUTE / D6 joint
-    with ``joint_velocity_limit[i] > 0``, two slots are atomically reserved in
-    the per-world counter. The sign encodes which side of the bilateral box
-    ``[-qdot_max, +qdot_max]`` each row enforces:
-
-    * ``sign = +1`` — lower-limit violation (``qdot_i < -qdot_max``). The row
-      pushes velocity back up (``J = +e_i``, ``target_vel = -qdot_max``).
-    * ``sign = -1`` — upper-limit violation (``qdot_i > +qdot_max``). The row
-      pushes velocity back down (``J = -e_i``, ``target_vel = -qdot_max``).
-
-    The sweeps project these rows as unilateral rows with a non-negative
-    total (:func:`.projection_laws.velocity_limit_update`): a violated side
-    accumulates the impulse that holds it on its limit, and a satisfied side
-    releases its impulse.
-
-    ``velocity_limit_activation_fraction`` proximity-gates the allocation:
-    with a positive fraction the lower/upper pair is reserved only when
-    ``|joint_qd[dof]| >= fraction * qdot_max``, i.e. the DOF is close enough
-    to the velocity box edge that the rows could act
-    (:func:`.row_laws.velocity_limit_active`). A fraction of ``0.0`` disables
-    the gate: every limited DOF takes its pair. Because the gate samples the pre-solve
-    velocity, a DOF that crosses the threshold during a step is clamped one
-    step late.
-
-    Outputs two entries per DOF in ``velocity_limit_slot`` (world-constraint
-    row, or -1) and ``velocity_limit_sign`` (+1 / -1).
-    """
-    art = wp.tid()
-    world = joints.art_to_world[art]
-
-    # Initialize all DOFs of this articulation to "no limit active"
-    dof_base = joints.articulation_dof_start[art]
-    dof_count = joints.articulation_H_rows[art]
-    for d in range(dof_count):
-        lower_idx = 2 * (dof_base + d)
-        upper_idx = lower_idx + 1
-        velocity_limit_slot[lower_idx] = -1
-        velocity_limit_slot[upper_idx] = -1
-        velocity_limit_sign[lower_idx] = 0.0
-        velocity_limit_sign[upper_idx] = 0.0
-
-    joint_start = joints.articulation_start[art]
-    joint_end = joints.articulation_start[art + 1]
-    n_eligible = int(0)
-
-    for j in range(joint_start, joint_end):
-        jtype = joints.joint_type[j]
-        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
-            continue
-
-        lin_count = joints.joint_dof_dim[j, 0]
-        ang_count = joints.joint_dof_dim[j, 1]
-        axis_count = lin_count + ang_count
-        qd_start = joints.joint_qd_start[j]
-
-        for axis in range(axis_count):
-            dof = qd_start + axis
-            # A non-positive limit is unlimited (PhysX pins ``recipResponse`` off for ``unitResponse <= 0``);
-            # a positive fraction admits only a DOF whose speed reaches that fraction of the limit.
-            if joints.prescribed[dof] != 0 or not velocity_limit_active(
-                joints.joint_velocity_limit[dof], joint_qd[dof], velocity_limit_activation_fraction
-            ):
-                continue
-
-            # Mark eligible; slots are reserved below with a single atomic per articulation (the
-            # per-DOF pair of atomics was a 2*dofs-long serial chain per thread).
-            velocity_limit_sign[2 * dof] = 1.0
-            n_eligible += 1
-
-    if n_eligible == 0:
-        return
-    # One reservation per articulation: its pairs fit together or none of them does.
-    slot = reserve(world_slot_counter, world, 2 * n_eligible, max_constraints, first_rejected_slot)
-    for d in range(dof_count):
-        dof = dof_base + d
-        lower_idx = 2 * dof
-        if velocity_limit_sign[lower_idx] != 1.0:
-            continue
-        if slot < 0:
-            velocity_limit_sign[lower_idx] = 0.0
-            continue
-        velocity_limit_slot[lower_idx] = slot
-        velocity_limit_slot[lower_idx + 1] = slot + 1
-        velocity_limit_sign[lower_idx + 1] = -1.0
-        slot += 2
-
-
-@wp.kernel
-def populate_joint_velocity_limit_J_for_size(
-    joints: JointTable,
-    velocity_limit_slot: wp.array[int],
-    velocity_limit_sign: wp.array[float],
-    group_to_art: wp.array[int],
-    pgs_cfm: float,
-    articulation_dof_count_of_size: int,
-    support: RowSupport,
-    # outputs
-    J_group: wp.array3d[float],
-    rows: DenseRows,
-):
-    """Populate Jacobian and metadata for joint velocity-limit rows.
-
-    Launched once per size group with ``dim = n_arts_of_size * size * 2`` (one thread per DOF side;
-    eligibility is read from ``velocity_limit_slot``, so no joint-type walk is needed). For every DOF
-    whose two ``velocity_limit_slot`` entries are non-negative, writes signed
-    ±1 entries into the local DOF column of the grouped Jacobian and sets the
-    constraint metadata. The rows have **no Baumgarte bias** (``beta = 0``,
-    ``phi = 0``) — PhysX's velocity-limit row has no ``data.erp`` either.
-    The target velocity is ``-qdot_max`` for both sides of the box: combined
-    with the sign flip on ``J``, this encodes the bilateral projection as
-    two unilateral ``J*v >= target_vel`` rows with ``lambda >= 0``.
-
-    DOFs skipped by :func:`allocate_joint_velocity_limit_slots` (the activation
-    gate, a prescribed coordinate) carry ``velocity_limit_slot == -1`` and are skipped here through the same
-    per-row slot check; this kernel needs no separate skip flag.
-    """
-    tid = wp.tid()
-    n_dofs = articulation_dof_count_of_size
-    side = tid % 2
-    local_dof = (tid // 2) % n_dofs
-    group_idx = tid // (2 * n_dofs)
-    art = group_to_art[group_idx]
-    world = joints.art_to_world[art]
-    dof = joints.articulation_dof_start[art] + local_dof
-    row_idx = 2 * dof + side
-    slot = velocity_limit_slot[row_idx]
-    if slot < 0:
-        return
-    line = rows.first[world]
-    qdot_max = joints.joint_velocity_limit[dof]
-    sign = velocity_limit_sign[row_idx]
-
-    if support.walks != 0:
-        support.units[line, slot] = unit_source(UNIT_VELOCITY, row_idx)
-    else:
-        at = jacobian_row(support, group_idx, art, wp.vec2i(art, -1))
-        clear_side(support, J_group, at, slot, art)
-        J_group[at[0], slot, at[1] + local_dof] = sign
-
-    rows.row_type[line, slot] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
-    rows.sides[line, slot] = wp.vec2i(art, -1)
-    rows.row_parent[line, slot] = -1
-    rows.row_mu[line, slot] = 0.0
-    rows.row_beta[line, slot] = 0.0
-    rows.row_cfm[line, slot] = pgs_cfm
-    rows.phi[line, slot] = 0.0
-    rows.target[line, slot] = -qdot_max
 
 
 # =============================================================================
@@ -2842,7 +2593,7 @@ def allocate_rigid_velocity_limit_slots(
     project onto that ball, along the current velocity.
 
     ``velocity_limit_activation_fraction`` proximity-gates the allocation,
-    mirroring :func:`allocate_joint_velocity_limit_slots`: a positive fraction
+    as the joint velocity limits (:func:`.prefix_rows.velocity_limits`): a positive fraction
     reserves a row only when the speed read from ``joint_qd`` at the free
     root's DOFs satisfies ``|v| >= fraction * limit``. A fraction of ``0.0``
     reserves every finitely limited speed's row without reading ``joint_qd``.

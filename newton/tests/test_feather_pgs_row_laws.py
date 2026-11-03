@@ -18,8 +18,8 @@ from newton._src.solvers.feather_pgs.tree_factor import WalkTrees
 from newton._src.solvers.feather_pgs.walk_rows import free_body_headers_kernel
 from newton.tests.feather_pgs_law_harness import (
     call,
-    joint_type,
     mismatches,
+    prefix_warp_rows,
     register_device_tests,
     scalars,
     unified,
@@ -591,7 +591,8 @@ def _law_joint_limit_candidates(
 
 
 def test_joint_limit_side_matches_limit_rows(test, device):
-    """Activate the sides ``build_joint_limit_rows_for_size`` builds rows for, with bitwise phi, in row order."""
+    """Activate the sides the joint-limit warp (``rows.joint_limit_warp_kernel``) builds rows for, with bitwise phi, in
+    row order."""
     rng = np.random.default_rng(20)
     arts, dofs = 8, 6
     count = arts * dofs
@@ -602,38 +603,17 @@ def test_joint_limit_side_matches_limit_rows(test, device):
     joint_q = (lower + rng.normal(scale=0.2, size=count)).astype(np.float32)
     joint_q[~np.isfinite(joint_q)] = 0.0
     rows = 2 * dofs
-    revolute = int(joint_type("REVOLUTE"))
-    out = call(
-        kernels.build_joint_limit_rows_for_size,
-        arts,
+    out = prefix_warp_rows(
         device,
-        articulation_start=(dofs * np.arange(arts + 1)).astype(np.int32),
-        articulation_dof_start=(dofs * np.arange(arts)).astype(np.int32),
-        joint_type=np.full(count, revolute, dtype=np.int32),
-        joint_q_start=np.arange(count + 1, dtype=np.int32),
-        joint_qd_start=np.arange(count + 1, dtype=np.int32),
-        joint_dof_dim=np.tile(np.array([[0, 1]], dtype=np.int32), (count, 1)),
-        joint_limit_lower=lower,
-        joint_limit_upper=upper,
-        prescribed=np.zeros(count, dtype=np.int32),
-        joint_q=joint_q,
-        joint_limit_activation_gap=0.05,
-        art_to_world=np.arange(arts, dtype=np.int32),
-        group_to_art=np.arange(arts, dtype=np.int32),
-        max_constraints=rows,
-        pgs_beta=0.2,
-        pgs_cfm=0.0,
-        resolved_worlds=np.zeros(0, dtype=np.int32),
-        world_slot_counter=np.zeros(arts, dtype=np.int32),
-        first_rejected_slot=np.full(arts, np.iinfo(np.int32).max, dtype=np.int32),
-        J_group=np.zeros((arts, rows, dofs), dtype=np.float32),
-        world_row_type=np.zeros((arts, rows), dtype=np.int32),
-        world_row_parent=np.zeros((arts, rows), dtype=np.int32),
-        world_row_mu=np.zeros((arts, rows), dtype=np.float32),
-        world_row_beta=np.zeros((arts, rows), dtype=np.float32),
-        world_row_cfm=np.zeros((arts, rows), dtype=np.float32),
-        world_phi=np.zeros((arts, rows), dtype=np.float32),
-        world_target_velocity=np.zeros((arts, rows), dtype=np.float32),
+        arts,
+        dofs,
+        rows,
+        lower=lower,
+        upper=upper,
+        q=joint_q,
+        activation_gap=0.05,
+        beta=0.2,
+        cfm=0.0,
     )
     law = call(
         _law_joint_limit_candidates,
@@ -647,8 +627,8 @@ def test_joint_limit_side_matches_limit_rows(test, device):
         phi=np.zeros((arts, rows), dtype=np.float32),
         count=np.zeros(arts, dtype=np.int32),
     )
-    np.testing.assert_array_equal(out["world_slot_counter"].numpy(), law["count"].numpy())
-    test.assertFalse(mismatches(out["world_phi"].numpy(), law["phi"].numpy()).any())
+    np.testing.assert_array_equal(out["count"], law["count"].numpy())
+    test.assertFalse(mismatches(out["phi"], law["phi"].numpy()).any())
 
 
 @wp.kernel
@@ -659,8 +639,9 @@ def _law_velocity_limit_active(
     active[dof] = wp.where(row_laws.velocity_limit_active(joint_velocity_limit[dof], joint_qd[dof], fraction), 1, 0)
 
 
-def test_velocity_limit_active_matches_velocity_limit_slots(test, device):
-    """Give rows to the coordinates ``allocate_joint_velocity_limit_slots`` gives rows to."""
+def test_velocity_limit_active_matches_velocity_limit_rows(test, device):
+    """Give rows to the coordinates the joint velocity-limit warp (``rows.velocity_limit_warp_kernel``) gives rows
+    to: a pair each, lower (``J = +1``) then upper, in coordinate order."""
     rng = np.random.default_rng(21)
     arts, dofs = 8, 6
     count = arts * dofs
@@ -668,38 +649,39 @@ def test_velocity_limit_active_matches_velocity_limit_slots(test, device):
     qd = scalars(rng, count, 2.0)
     for fraction in (0.0, 0.8):
         with test.subTest(fraction=fraction):
-            out = call(
-                kernels.allocate_joint_velocity_limit_slots,
+            out = prefix_warp_rows(
+                device,
                 arts,
-                device,
-                articulation_start=(dofs * np.arange(arts + 1)).astype(np.int32),
-                articulation_dof_start=(dofs * np.arange(arts)).astype(np.int32),
-                articulation_H_rows=np.full(arts, dofs, dtype=np.int32),
-                joint_type=np.full(count, int(joint_type("REVOLUTE")), dtype=np.int32),
-                joint_qd_start=np.arange(count + 1, dtype=np.int32),
-                joint_dof_dim=np.tile(np.array([[0, 1]], dtype=np.int32), (count, 1)),
-                joint_velocity_limit=limit,
-                prescribed=np.zeros(count, dtype=np.int32),
-                joint_qd=qd,
-                velocity_limit_activation_fraction=fraction,
-                art_to_world=np.arange(arts, dtype=np.int32),
-                max_constraints=4 * dofs,
-                velocity_limit_slot=np.full(2 * count, -1, dtype=np.int32),
-                velocity_limit_sign=np.zeros(2 * count, dtype=np.float32),
-                world_slot_counter=np.zeros(arts, dtype=np.int32),
-                first_rejected_slot=np.full(arts, np.iinfo(np.int32).max, dtype=np.int32),
+                dofs,
+                2 * dofs,
+                velocity=True,
+                velocity_limit=limit,
+                vhat=qd,
+                activation=fraction,
+                cfm=0.0,
             )
-            law = call(
-                _law_velocity_limit_active,
-                count,
-                device,
-                joint_velocity_limit=limit,
-                joint_qd=qd,
-                fraction=fraction,
-                active=np.zeros(count, dtype=np.int32),
+            law = (
+                call(
+                    _law_velocity_limit_active,
+                    count,
+                    device,
+                    joint_velocity_limit=limit,
+                    joint_qd=qd,
+                    fraction=fraction,
+                    active=np.zeros(count, dtype=np.int32),
+                )
+                .get("active")
+                .numpy()
+                .reshape(arts, dofs)
             )
-            rows = out["velocity_limit_slot"].numpy().reshape(count, 2)[:, 0] >= 0
-            np.testing.assert_array_equal(rows.astype(np.int32), law["active"].numpy())
+            np.testing.assert_array_equal(out["count"], 2 * law.sum(axis=1))
+            for art in range(arts):
+                coordinates = np.flatnonzero(law[art])
+                J = out["J"][art, : out["count"][art]]
+                expected = np.zeros_like(J)
+                expected[0::2][np.arange(coordinates.size), coordinates] = 1.0
+                expected[1::2][np.arange(coordinates.size), coordinates] = -1.0
+                np.testing.assert_array_equal(J, expected)
 
 
 class TestFeatherPGSRowLaws(unittest.TestCase):

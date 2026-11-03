@@ -9,83 +9,33 @@ import warp as wp
 import newton
 from newton._src.core.types import MAXVAL
 from newton._src.sim.enums import JointType
-from newton._src.solvers.feather_pgs import field_group
-from newton._src.solvers.feather_pgs.dense_rows import DenseRows
-from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
-    build_joint_limit_rows_for_size,
 )
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import group_rows, row_lines
+from newton.tests.feather_pgs_law_harness import prefix_warp_rows
 
 
 def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0, resolved: bool = False):
-    device = "cpu"
-    max_constraints = 8
-    world_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
-    J_group = wp.zeros((1, max_constraints, 1), dtype=wp.float32, device=device)
-    world_row_type = wp.zeros((1, max_constraints), dtype=wp.int32, device=device)
-    world_row_parent = wp.zeros((1, max_constraints), dtype=wp.int32, device=device)
-    world_row_mu = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
-    world_row_beta = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
-    world_row_cfm = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
-    world_phi = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
-    world_target_velocity = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
-
-    wp.launch(
-        build_joint_limit_rows_for_size,
-        dim=1,
-        inputs=[
-            field_group.upload(
-                JointTable,
-                device,
-                articulation_start=[0, 1],
-                articulation_dof_start=[0],
-                joint_type=[int(JointType.REVOLUTE)],
-                joint_q_start=[0],
-                joint_qd_start=[0],
-                joint_dof_dim=[[0, 1]],
-                joint_limit_lower=[lower],
-                joint_limit_upper=[upper],
-                prescribed=[0],
-                art_to_world=[0],
-            ),
-            wp.array([q], dtype=wp.float32, device=device),
-            gap,
-            wp.array([0], dtype=wp.int32, device=device),
-            max_constraints,
-            0.2,
-            0.0,
-            wp.array([int(resolved)], dtype=wp.int32, device=device),
-            group_rows(device),
-        ],
-        outputs=[
-            world_slot_counter,
-            wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
-            J_group,
-            field_group.upload(
-                DenseRows,
-                device,
-                row_type=world_row_type,
-                row_parent=world_row_parent,
-                row_mu=world_row_mu,
-                row_beta=world_row_beta,
-                row_cfm=world_row_cfm,
-                phi=world_phi,
-                target=world_target_velocity,
-                sides=wp.zeros(world_row_type.shape, dtype=wp.vec2i, device=device),
-                first=row_lines(device),
-            ),
-        ],
-        device=device,
+    """One revolute coordinate's joint-limit rows (the general route's warp, on the CPU): their J and phi."""
+    rows = prefix_warp_rows(
+        "cpu",
+        1,
+        1,
+        8,
+        resolved=[int(resolved)],
+        lower=[lower],
+        upper=[upper],
+        q=[q],
+        activation_gap=gap,
+        beta=0.2,
+        cfm=0.0,
     )
-    wp.synchronize()
-    count = int(world_slot_counter.numpy()[0])
-    return J_group.numpy()[0, :count, 0].tolist(), world_phi.numpy()[0, :count].tolist()
+    count = int(rows["count"][0])
+    return rows["J"][0, :count, 0].tolist(), rows["phi"][0, :count].tolist()
 
 
 def _make_phase_layout_run(
@@ -207,33 +157,47 @@ def _assert_mf_phase_layout(test_case: unittest.TestCase, solver: SolverFeatherP
     test_case.assertLess(mf_contact_end, mf_count)
 
 
-def _run_joint_limit_trajectory(use_warp_builder: bool):
-    """Run a short trajectory with one row builder."""
-    model, solver, state_in, state_out, control, contacts = _make_phase_layout_run("cuda:0", pgs_iterations=8)
-    if not use_warp_builder:
-        solver.laws.joint_limit_warp_kernels.clear()
+def _limit_law(q: np.ndarray, lower: np.ndarray, upper: np.ndarray, gap: float) -> list:
+    """The joint-limit rows' phi the row law gives (:func:`.row_laws.joint_limit_side`), in row order: each coordinate's
+    lower side (``q - lower``), then its upper side (``upper - q``), where its bound is finite and ``q`` within ``gap``."""
+    phi = []
+    for value, low, high in zip(q.astype(np.float32), lower.astype(np.float32), upper.astype(np.float32), strict=True):
+        if np.isfinite(low) and value <= low + np.float32(gap):
+            phi.append(value - low)
+        if np.isfinite(high) and value >= high - np.float32(gap):
+            phi.append(high - value)
+    return phi
 
+
+def _run_joint_limit_trajectory():
+    """Run a short trajectory; each step's joint-limit rows against the row law at the step's input coordinates."""
+    model, solver, state_in, state_out, control, contacts = _make_phase_layout_run("cuda:0", pgs_iterations=8)
+    revolute = np.flatnonzero(model.joint_type.numpy() == int(JointType.REVOLUTE))
+    coordinates = model.joint_q_start.numpy()[revolute]
+    dofs = model.joint_qd_start.numpy()[revolute]
     samples = []
     for _ in range(4):
+        q = state_in.joint_q.numpy()[coordinates]
         state_in.clear_forces()
         model.collide(state_in, contacts)
         solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
         dense_count = int(solver.placement.constraint_count.numpy()[0])
-        mf_count = int(solver.placement.mf_constraint_count.numpy()[0])
+        row_type = solver.placement.row_type.numpy()[0, :dense_count]
+        limit_rows = np.flatnonzero(row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
         samples.append(
             {
-                "counts": (dense_count, mf_count),
-                "bounds": solver.placement.dense_phase_bounds.numpy().copy(),
-                "row_type": solver.placement.row_type.numpy()[0, :dense_count].copy(),
-                "mf_row_type": solver.placement.mf_row_type.numpy()[0, :mf_count].copy(),
-                "impulses": solver.placement.impulses.numpy()[0, :dense_count].copy(),
-                "mf_impulses": solver.placement.mf_impulses.numpy()[0, :mf_count].copy(),
-                "joint_q": state_out.joint_q.numpy().copy(),
-                "joint_qd": state_out.joint_qd.numpy().copy(),
+                "phi": solver.placement.phi.numpy()[0, limit_rows].tolist(),
+                "law": _limit_law(
+                    q,
+                    model.joint_limit_lower.numpy()[dofs],
+                    model.joint_limit_upper.numpy()[dofs],
+                    solver.options.joint_limit_activation_gap,
+                ),
+                "impulses": solver.placement.impulses.numpy()[0, limit_rows].copy(),
             }
         )
         state_in, state_out = state_out, state_in
-    return solver, samples
+    return samples
 
 
 class TestFeatherPGSJointLimitActivationGap(unittest.TestCase):
@@ -256,33 +220,14 @@ class TestFeatherPGSJointLimitActivationGap(unittest.TestCase):
         _assert_dense_phase_layout(self, solver)
         _assert_mf_phase_layout(self, solver)
 
-    @unittest.skipUnless(wp.is_cuda_available(), "joint-limit trajectory parity requires CUDA")
-    def test_warp_builder_matches_scalar_trajectory(self):
-        """Match scalar joint-limit assembly over a trajectory."""
-        reference_solver, reference = _run_joint_limit_trajectory(use_warp_builder=False)
-        warp_solver, actual = _run_joint_limit_trajectory(use_warp_builder=True)
-
-        self.assertFalse(reference_solver.laws.joint_limit_warp_kernels)
-        self.assertTrue(any(kernel is not None for kernel in warp_solver.laws.joint_limit_warp_kernels.values()))
-        self.assertEqual(len(reference), len(actual))
-        for step, (expected, observed) in enumerate(zip(reference, actual, strict=True)):
-            self.assertEqual(observed["counts"], expected["counts"], f"row counts differed at step {step}")
-            for label in ("bounds", "row_type", "mf_row_type"):
-                np.testing.assert_array_equal(
-                    observed[label], expected[label], err_msg=f"{label} differed at step {step}"
-                )
-            for label in ("impulses", "mf_impulses", "joint_q", "joint_qd"):
-                np.testing.assert_allclose(
-                    observed[label],
-                    expected[label],
-                    rtol=1.0e-5,
-                    atol=2.0e-6,
-                    err_msg=f"{label} differed at step {step}",
-                )
-
-        limit_rows = np.flatnonzero(reference[0]["row_type"] == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
-        self.assertGreater(limit_rows.size, 0)
-        self.assertGreater(float(np.max(np.abs(reference[0]["impulses"][limit_rows]))), 0.0)
+    @unittest.skipUnless(wp.is_cuda_available(), "the matrix-free row families require CUDA")
+    def test_limit_rows_follow_the_law_over_a_trajectory(self):
+        """Give every step the joint-limit rows the row law gives at its input coordinates, with bitwise phi."""
+        samples = _run_joint_limit_trajectory()
+        for step, sample in enumerate(samples):
+            self.assertEqual(sample["phi"], sample["law"], f"limit rows differed at step {step}")
+        self.assertGreater(len(samples[0]["phi"]), 0)
+        self.assertGreater(float(np.max(np.abs(samples[0]["impulses"]))), 0.0)
 
     def test_solver_rejects_invalid_joint_limit_activation_gap(self):
         model = newton.ModelBuilder().finalize()

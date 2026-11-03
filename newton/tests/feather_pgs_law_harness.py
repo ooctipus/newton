@@ -695,6 +695,71 @@ def group_rows(device) -> RowSupport:
     return support
 
 
+PREFIX_RECORDS = {
+    "row_type": wp.int32,
+    "row_parent": wp.int32,
+    "row_mu": wp.float32,
+    "row_beta": wp.float32,
+    "row_cfm": wp.float32,
+    "phi": wp.float32,
+    "target": wp.float32,
+    "sides": wp.vec2i,
+}
+"""The records the general route's joint row warps write (:func:`prefix_warp_rows`), by their law's names."""
+
+
+def prefix_warp_rows(
+    device, arts: int, size: int, rows: int, *, velocity=False, resolved=None, warps_per_block=4, **law
+) -> dict:
+    """Launch the general route's joint-limit warp (:func:`.rows.joint_limit_warp_kernel`), or its joint
+    velocity-limit warp (``velocity``), as :meth:`.rows.RowLaws.write` launches it, on the size groups' rows.
+
+    Articulation ``a`` is world ``a`` and group ``a``, its ``size`` coordinates from ``a * size``; its world holds
+    ``rows`` rows. ``law`` holds the law's inputs by :data:`.prefix_rows.LAW`'s (and :data:`.prefix_rows.VELOCITY_LAW`'s)
+    names; every coordinate is a limit coordinate and none is prescribed unless it says. ``resolved`` is the worlds'
+    resolved mask (``None``: none). Returns each world's row count (``count``), the Jacobian rows ``J`` and the
+    records by name, as numpy arrays.
+    """
+    from newton._src.solvers.feather_pgs.prefix_rows import PrefixLaw, PrefixVelocityLaw  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.rows import (  # noqa: PLC0415
+        joint_limit_warp_kernel,
+        velocity_limit_warp_kernel,
+    )
+
+    dofs = arts * size
+    law = {"limit_q_index": np.arange(dofs), "prescribed": np.zeros(dofs), **law}
+    counter = wp.zeros(arts, dtype=wp.int32, device=device)
+    records = {name: wp.zeros((arts, rows), dtype=dtype, device=device) for name, dtype in PREFIX_RECORDS.items()}
+    struct = field_group.upload(
+        PrefixVelocityLaw if velocity else PrefixLaw,
+        device,
+        slot_counter=counter,
+        first=row_lines(device),
+        **records,
+        **law,
+    )
+    J = wp.zeros((arts, rows, size), dtype=wp.float32, device=device)
+    order = wp.array(np.arange(arts), dtype=wp.int32, device=device)
+    kernel = (velocity_limit_warp_kernel if velocity else joint_limit_warp_kernel)(size, warps_per_block)
+    wp.launch_tiled(
+        kernel,
+        dim=[(arts + warps_per_block - 1) // warps_per_block],
+        inputs=[
+            arts,
+            wp.array(size * np.arange(arts), dtype=wp.int32, device=device),
+            order,
+            order,
+            wp.array(np.zeros(0) if resolved is None else np.asarray(resolved), dtype=wp.int32, device=device),
+            struct,
+            group_rows(device),
+        ],
+        outputs=[J],
+        block_dim=32 * warps_per_block,
+        device=device,
+    )
+    return {"count": counter.numpy(), "J": J.numpy(), **{name: array.numpy() for name, array in records.items()}}
+
+
 def local_packed_rows(device, art_world, rows_by_art, incident=None) -> list:
     """The local owners' row operands (:data:`.sweep_routes_local.LOCAL_ABI`): ``packed_Z``, ``row_sides``,
     ``row_incident``, ``response_dofs``, ``articulation_world_dof_offset`` and ``packed_dense`` (1). ``rows_by_art[a]``
