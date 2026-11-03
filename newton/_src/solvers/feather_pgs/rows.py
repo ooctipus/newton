@@ -36,7 +36,7 @@ from .contact_input import ContactInput
 from .contact_input import bind as bind_contact_input
 from .contact_input import bind_routes as bind_contact_routes
 from .contact_row_plan import SHARED_METADATA_PRODUCERS, contact_row_plan
-from .dense_rows import RowSupport
+from .dense_rows import UNIT_LIMIT, UNIT_SHIFT, UNIT_VELOCITY, RowSupport
 from .dense_rows import bind as bind_dense_rows
 from .dense_rows import bind_mf as bind_mf_rows
 from .device_preludes import lane_group
@@ -82,7 +82,7 @@ from .solver_fields import (
     Preelim,
 )
 
-__all__ = ["RowLaws", "joint_limit_warp_kernel", "velocity_prescale_launch"]
+__all__ = ["RowLaws", "joint_limit_warp_kernel", "velocity_limit_warp_kernel", "velocity_prescale_launch"]
 
 _CALLER = 4
 """Warnings raised in :meth:`RowLaws.build` name the solver constructor's caller: build runs in the constructor body,
@@ -129,23 +129,30 @@ def velocity_prescale_launch(articulation_start: np.ndarray, *, joint_count: int
     return lanes, (count * lanes + 31) // 32 * 32
 
 
-JOINT_LIMIT_WARP_PARAMS = params(
-    ("articulation_count", int),
-    ("articulation_dof_start", wp.array[int]),
-    ("art_to_world", wp.array[int]),
-    ("group_to_art", wp.array[int]),
-    ("resolved_worlds", wp.array[int]),
-    ("law", prefix_rows.PrefixLaw),
-    ("support", RowSupport),
-    ("J_group", wp.array3d[float]),
-)
-"""The warp joint-limit row builder's operands: the rows' placement and Jacobian rows (:func:`.dense_rows.jacobian_row`:
-the packed rows, by world, or the size group's)."""
+def _prefix_warp_params(law) -> tuple:
+    """The warp prefix producers' operands: the family's law (:data:`.prefix_rows.LAW`, with the velocity family's
+    inputs for the velocity limits), the rows' placement and Jacobian rows (:func:`.dense_rows.jacobian_row`: the packed
+    rows, by world, or the size group's)."""
+    return params(
+        ("articulation_count", int),
+        ("articulation_dof_start", wp.array[int]),
+        ("art_to_world", wp.array[int]),
+        ("group_to_art", wp.array[int]),
+        ("resolved_worlds", wp.array[int]),
+        ("law", law),
+        ("support", RowSupport),
+        ("J_group", wp.array3d[float]),
+    )
 
 
 @cache
-def joint_limit_warp_kernel(size: int, warps_per_block: int) -> wp.Kernel:
-    """Build the general route's joint-limit rows, one warp per articulation (:func:`.prefix_rows.prefix_rows`)."""
+def _prefix_warp_kernel(size: int, warps_per_block: int, velocity: bool) -> wp.Kernel:
+    """A joint row family of the general route and the one writer, one warp per articulation of ``size`` coordinates
+    (:func:`.prefix_rows.prefix_rows`): its joint limits, or its joint velocity limits (``velocity``). The warp takes
+    each coordinate side's law, reserves the active rows on the world's counter, writes their records and publishes
+    each row's side: its unit source for the one writer, else its Jacobian row. The joint limits skip the resolved
+    worlds; every world takes its velocity limits."""
+    kind = int(UNIT_VELOCITY if velocity else UNIT_LIMIT)
     # A row's side: its articulation's coordinates in the packed rows (cleared, then the coefficient), or the size
     # group's row (cleared each step).
     sink = f"""            if (support.walks != 0) {{
@@ -153,7 +160,7 @@ def joint_limit_warp_kernel(size: int, warps_per_block: int) -> wp.Kernel:
                 // rows (the compact boundary keeps its limit prefix's alone).
                 if (slot < support.units.shape[1])
                     support.units.data[(size_t)prefix_line * support.units.shape[1] + slot] =
-                        (2 << 28) | (2 * (first_dof + d0) + (w0 < 0.0f ? 1 : 0));
+                        ({kind} << {int(UNIT_SHIFT)}) | (2 * (first_dof + d0) + (w0 < 0.0f ? 1 : 0));
             }} else {{
                 float* J_side = &J_group.data[((size_t)row_index * J_group.shape[1] + slot) * J_group.shape[2] + first];
                 if (support.packed != 0) {{
@@ -161,32 +168,49 @@ def joint_limit_warp_kernel(size: int, warps_per_block: int) -> wp.Kernel:
                 }}
                 J_side[d0] = w0;
             }}"""
+    family = prefix_rows.velocity_limits if velocity else prefix_rows.limits
     rows = prefix_rows.prefix_rows(
-        ((prefix_rows.limits(tuple(range(size)), "first_dof + d", "law."),),),
+        ((family(tuple(range(size)), "first_dof + d", "law."),),),
         law="law.",
         sink=sink,
         ordered=False,
         rhs=False,
         side="art",
     )
+    resolved = (
+        ""
+        if velocity
+        else "    if (world >= 0 && world < resolved_worlds.shape[0] && resolved_worlds.data[world] != 0) return;\n"
+    )
     snippet = f"""    const int group = block * {warps_per_block} + SUB;
     if (group >= articulation_count) return;
     const int art = group_to_art.data[group];
     const int world = art_to_world.data[art];
-    if (world >= 0 && world < resolved_worlds.shape[0] && resolved_worlds.data[world] != 0) return;
-    const int first_dof = articulation_dof_start.data[art];
+{resolved}    const int first_dof = articulation_dof_start.data[art];
     // The rows' first index and the side's first entry (dense_rows.jacobian_row; one side).
     const int row_index = support.packed != 0 ? support.first.data[world] : group;
     const int first = support.packed != 0 && support.dense != 0 ? support.offset.data[art] : 0;
 {rows}#endif
 """
+    name = "build_joint_velocity_limit_rows_warp" if velocity else "build_joint_limit_rows_warp"
     return KernelTemplate(
-        f"build_joint_limit_rows_warp_{size}_{warps_per_block}",
-        JOINT_LIMIT_WARP_PARAMS,
+        f"{name}_{size}_{warps_per_block}",
+        _prefix_warp_params(prefix_rows.PrefixVelocityLaw if velocity else prefix_rows.PrefixLaw),
         snippet,
         preludes=(lane_group(32), *ROW_LAW.preludes()),
-        native_name="joint_limit_warp_native",
+        native_name="velocity_limit_warp_native" if velocity else "joint_limit_warp_native",
     ).kernel()
+
+
+def joint_limit_warp_kernel(size: int, warps_per_block: int) -> wp.Kernel:
+    """The general route's and the one writer's joint-limit rows, one warp per articulation (:func:`_prefix_warp_kernel`)."""
+    return _prefix_warp_kernel(size, warps_per_block, False)
+
+
+def velocity_limit_warp_kernel(size: int, warps_per_block: int) -> wp.Kernel:
+    """The general route's and the one writer's joint velocity-limit rows, one warp per articulation
+    (:func:`_prefix_warp_kernel`)."""
+    return _prefix_warp_kernel(size, warps_per_block, True)
 
 
 class RowLaws:
@@ -310,12 +334,14 @@ class RowLaws:
 
     # --- the joint-limit tables ----------------------------------------------------------------------------------
     def _joint_limit_tables(self, model):
-        """The joint-limit tables: the limited sizes, each coordinate's limit coordinate, the warp limit kernels."""
+        """The joint-limit tables: the limited sizes, each coordinate's limit coordinate, the warp limit and velocity-limit
+        kernels."""
         if not model.articulation_count or not model.joint_count:
             self.joint_limit_sizes = frozenset()
             self.joint_limit_q_index = None
             self.joint_limit_q_index_host = np.zeros(model.joint_dof_count, dtype=np.int32)
             self.joint_limit_warp_kernels = {}
+            self.velocity_limit_warp_kernels = {}
             return
 
         response_dof_count = self.forest.response_dof_count
@@ -351,6 +377,15 @@ class RowLaws:
                 for size in self.joint_limit_sizes
             }
             if model.device.is_cuda
+            else {}
+        )
+        # The velocity limits sit on the same coordinates (limit_q_index >= 0), so on the same sizes.
+        self.velocity_limit_warp_kernels = (
+            {
+                size: velocity_limit_warp_kernel(size, warps_per_block=JOINT_LIMIT_WARPS_PER_BLOCK)
+                for size in self.joint_limit_sizes
+            }
+            if model.device.is_cuda and self.options.enable_joint_velocity_limits
             else {}
         )
 
@@ -763,16 +798,48 @@ class RowLaws:
                 device=model.device,
             )
 
-        # Allocate + populate joint velocity-limit rows (per-DOF clamp on
-        # |qdot_i| against model.joint_velocity_limit). Dense contact rows
-        # are allocated after this block so contact/friction rows form the
-        # trailing per-world slot segment; the sweeps visit velocity-limit
-        # rows in a dedicated final pass regardless of slot order.
-        if (
+        # The joint velocity-limit rows (per-DOF clamp on |qdot_i| against model.joint_velocity_limit). Dense contact
+        # rows are allocated after this block so contact/friction rows form the trailing per-world slot segment; the
+        # sweeps visit velocity-limit rows in a dedicated final pass regardless of slot order. On CUDA one warp per
+        # articulation reserves, writes and publishes them, as the joint limits (prefix_rows); the CPU allocates
+        # here and populates after the boundary.
+        velocity_limits = (
             solver.options.enable_joint_velocity_limits
             and self.velocity_limit_slot is not None
             and solver.placement.keyed_rows is None
-        ):
+        )
+        if velocity_limits and self.velocity_limit_warp_kernels:
+            velocity_law = field_group.bind(
+                prefix_rows.PrefixVelocityLaw,
+                solver=solver,
+                placement=solver.placement,
+                factor=solver.factor,
+                laws=self,
+                options=solver.options,
+                model=model,
+                state_in=state_in,
+                dt=dt,
+                vhat=solver.v_hat,
+            )
+            for size, warp_kernel in self.velocity_limit_warp_kernels.items():
+                n_arts = solver.forest.n_arts_by_size[size]
+                wp.launch_tiled(
+                    warp_kernel,
+                    dim=[(n_arts + JOINT_LIMIT_WARPS_PER_BLOCK - 1) // JOINT_LIMIT_WARPS_PER_BLOCK],
+                    inputs=[
+                        n_arts,
+                        solver.forest.articulation_dof_start,
+                        solver.forest.art_to_world,
+                        solver.forest.group_to_art[size],
+                        solver.sweep.resolved_worlds,
+                        velocity_law,
+                        support,
+                    ],
+                    outputs=[solver.placement.jacobian_rows(size)],
+                    block_dim=32 * JOINT_LIMIT_WARPS_PER_BLOCK,
+                    device=model.device,
+                )
+        elif velocity_limits:
             wp.launch(
                 allocate_joint_velocity_limit_slots,
                 dim=model.articulation_count,
@@ -801,11 +868,7 @@ class RowLaws:
                 device=model.device,
             )
 
-        if (
-            solver.options.enable_joint_velocity_limits
-            and self.velocity_limit_slot is not None
-            and solver.placement.keyed_rows is None
-        ):
+        if velocity_limits and not self.velocity_limit_warp_kernels:
             for size in solver.forest.size_groups:
                 n_arts = solver.forest.n_arts_by_size[size]
                 wp.launch(
@@ -1267,7 +1330,6 @@ class RowLaws:
             model.constraint_mimic_coef1 if mimics else dummy_float,
             self._link_primary if links else dummy_int,
             self._link_shadow if links else dummy_int,
-            self.velocity_limit_sign if self.velocity_limit_slot is not None else dummy_float,
             state_in.body_q,
             model.body_com,
             solver.v_hat,
@@ -1323,8 +1385,7 @@ class RowLaws:
                 self._mimic_dof0 if mimics else dummy_int,
                 self._mimic_dof1 if mimics else dummy_int,
                 model.constraint_mimic_coef1 if mimics else dummy_float,
-                self.velocity_limit_sign if self.velocity_limit_slot is not None else dummy_float,
-                dt,
+                    dt,
                 solver.options.contact_speculative_scale,
                 self.contact_w,
                 self.effective_restitution_velocity_threshold,

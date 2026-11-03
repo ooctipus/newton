@@ -8,7 +8,8 @@ velocity limits (``dense_phase_bounds`` holds both ends). :func:`prefix_rows` is
 prefix producer: a lane group walks an articulation's candidates in order, takes each one's law from
 :data:`.row_laws.ROW_LAW`, places the active rows in candidate order and writes their records. The producers differ
 in their families, in who owns the world's row counter and in the sink their consumer reads: the general route's
-joint limits (the per-size Jacobian) and the sparse factor's (packed ``L^-1`` columns) reserve on the shared counter;
+joint limits and joint velocity limits (the per-size Jacobian, or the one writer's unit sources) reserve on the
+shared counter;
 local row packets (mimic and limit rows into sparse coefficients) and keyed rows (limit and velocity-limit rows into
 row keys) own their worlds' counters.
 """
@@ -46,6 +47,9 @@ VELOCITY_LAW = (
     Field("activation", wp.float32, owner="options", attr="velocity_limit_activation_fraction"),
 )
 """The joint velocity-limit family's inputs."""
+
+PrefixVelocityLaw = field_group.struct("PrefixVelocityLaw", (*LAW, *VELOCITY_LAW), __name__)
+"""The prefix law with the velocity-limit family's inputs (the joint velocity limits' warp producer)."""
 
 
 def _family(coordinates, name: str, evaluation: str) -> tuple:
@@ -88,15 +92,16 @@ def limits(coordinates, dof: str, law: str) -> tuple:
 
 
 def velocity_limits(coordinates, dof: str, law: str) -> tuple:
-    """The joint velocity-limit family: a row pair with target ``-limit`` and no bias (:data:`VELOCITY_LAW`)."""
+    """The joint velocity-limit family: a row pair with target ``-limit`` and no bias (:data:`VELOCITY_LAW`), on a
+    limit joint's coordinate (a prismatic, revolute or D6 axis: ``limit_q_index >= 0``) that is not prescribed."""
     return _family(
         coordinates,
         "velocity_coordinates",
         f"""            dof = {dof};
             side = index & 1;
             const float limit = {law}velocity_limit.data[dof];
-            active = {law}prescribed.data[dof] == 0 && RowLaw::velocity_limit_active(limit, {law}vhat.data[dof],
-                                                                                     {law}activation);
+            active = {law}limit_q_index.data[dof] >= 0 && {law}prescribed.data[dof] == 0 &&
+                     RowLaw::velocity_limit_active(limit, {law}vhat.data[dof], {law}activation);
             type = 4;
             target = -limit;
             d0 = d;

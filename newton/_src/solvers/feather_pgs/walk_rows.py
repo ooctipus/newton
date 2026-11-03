@@ -433,7 +433,6 @@ def row_functions(side: bool) -> tuple:
         mimic_coef1: wp.array[float],
         link_primary: wp.array[int],
         link_shadow: wp.array[int],
-        velocity_limit_sign: wp.array[float],
         body_q: wp.array[wp.transform],
         body_com: wp.array[wp.vec3],
         v_hat: wp.array[float],
@@ -501,10 +500,9 @@ def row_functions(side: bool) -> tuple:
             )
             summed = shared == 0
         elif kind == UNIT_LIMIT or kind == UNIT_VELOCITY:
+            # Side 0 the lower (+e_dof), side 1 the upper (-e_dof), a limit's and a velocity limit's alike.
             dof = index // 2
             value = 1.0 - 2.0 * float(index - 2 * dof)
-            if kind == UNIT_VELOCITY:
-                value = velocity_limit_sign[index]
             walked += walk_covector(walk, support, sides, 0, sides[0], dof, value, v_hat, 0, packed_Z, slot)
         elif kind == UNIT_MIMIC:
             walked += walk_covector(walk, support, sides, 0, sides[0], mimic_dof0[index], 1.0, v_hat, 0, packed_Z, slot)
@@ -625,7 +623,6 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool = True) -> wp
         mimic_coef1: wp.array[float],
         link_primary: wp.array[int],
         link_shadow: wp.array[int],
-        velocity_limit_sign: wp.array[float],
         body_q: wp.array[wp.transform],
         body_com: wp.array[wp.vec3],
         v_hat: wp.array[float],
@@ -649,7 +646,7 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool = True) -> wp
         for slot in range(lane, count, lanes):
             write_row(
                 rows, support, line, slot, data, law, walk, body_to_articulation, mimic_dof0, mimic_dof1, mimic_coef1,
-                link_primary, link_shadow, velocity_limit_sign, body_q, body_com, v_hat, dt, contact_speculative_scale,
+                link_primary, link_shadow, body_q, body_com, v_hat, dt, contact_speculative_scale,
                 contact_w, restitution_velocity_threshold, weighted, material, packed_Z, row_incident,
             )  # fmt: skip
         if wp.static(has_blocks):
@@ -1218,7 +1215,6 @@ def support_rows_kernel(
         mimic_dof0: wp.array[int],
         mimic_dof1: wp.array[int],
         mimic_coef1: wp.array[float],
-        velocity_limit_sign: wp.array[float],
         dt: float,
         contact_speculative_scale: float,
         contact_w: float,
@@ -1259,8 +1255,6 @@ def support_rows_kernel(
                 unit.art_a = rows.sides[line, slot][0]
                 unit.dof0 = index // 2
                 unit.value0 = 1.0 - 2.0 * float(index - 2 * unit.dof0)
-                if kind == UNIT_VELOCITY:
-                    unit.value0 = velocity_limit_sign[index]
                 if kind == UNIT_MIMIC:
                     unit.dof0 = mimic_dof0[index]
                     unit.value0 = 1.0

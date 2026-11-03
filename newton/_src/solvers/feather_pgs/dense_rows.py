@@ -82,7 +82,7 @@ UNIT_MIMIC = wp.constant(3)
 UNIT_LINK = wp.constant(4)
 """A link's row: index ``6 link + row``."""
 UNIT_VELOCITY = wp.constant(5)
-"""A joint velocity limit's row: index ``2 dof + side``, its sign ``velocity_limit_sign``'s."""
+"""A joint velocity limit's row: index ``2 dof + side``, side 0 the lower (``+e_dof``), side 1 the upper (``-e_dof``)."""
 UNIT_SHIFT = wp.constant(28)
 """Bits of a unit source's index: its kind sits above them."""
 
