@@ -831,10 +831,10 @@ class TreeFactor:
 
     def plan_walk(self, articulations: np.ndarray) -> None:
         """Hold the walk's data for ``articulations`` (the converted class's, every responding tree): each coordinate's
-        :data:`WALK_COORDINATE` floats, each body's :data:`WALK_LINK` floats and the leave's twists, each body's path
-        entry (its parent and first coordinate within its tree, :func:`walk_paths_prelude`) and join slot, and the
-        trees' lane group (:func:`walk_group`), and the step's geometry the finish publishes (:attr:`WalkTrees.now`,
-        :attr:`WalkTrees.now_link`): the rows' seeds enter there. One launch on the factor's own refreshes
+        :data:`WALK_COORDINATE` floats, each body's :data:`WALK_LINK` floats and a twist of scratch, each body's path
+        entry (its parent and first coordinate within its tree, :func:`walk_paths_prelude`) and its class's join slot
+        (:attr:`.tree_scan.WalkClass.slots`), the trees' lane group (:func:`walk_group`), and the step's geometry the
+        finish publishes (:attr:`WalkTrees.now`, :attr:`WalkTrees.now_link`): the rows' seeds enter there. One launch on the factor's own refreshes
         (:meth:`walk_step`) takes that geometry as the factor's frames and runs the inward pass, so the walk is the
         factor ``L`` refreshes, to rounding.
 
@@ -867,29 +867,6 @@ class TreeFactor:
                     raise ValueError(f"The walk needs every parent before its children (articulation {art})")
                 path[j] = (parent, int(qd_start[j] - qd_start[j0]))
                 dof_body[qd_start[j] : qd_start[j + 1]] = j - j0
-        # The inward pass's join slots (walk_inward): leaf first, a parent waits in a slot for the lifted inertia of
-        # each child other than the joint after it, from the first such child until the pass reaches the parent.
-        joins = np.full(max(int(model.joint_count), 1), -1, dtype=np.int32)
-        held, bodies = 0, 1
-        for art in arts.tolist():
-            j0, j1 = int(start[art]), int(end[art])
-            bodies = max(bodies, j1 - j0)
-            free_slots: list[int] = []
-            used = 0
-            for j in range(j1 - 1, j0 - 1, -1):
-                if joins[j] >= 0:
-                    free_slots.append(int(joins[j]))
-                parent = int(path[j, 0])
-                if parent >= 0 and parent != j - j0 - 1 and joins[j0 + parent] < 0:
-                    if free_slots:
-                        free_slots.sort()
-                        joins[j0 + parent] = free_slots.pop(0)
-                    else:
-                        joins[j0 + parent] = used
-                        used += 1
-            held = max(held, used)
-        if held > WALK_JOIN_SLOTS:
-            raise ValueError(f"The walk holds at most {WALK_JOIN_SLOTS} joins of a tree at once, a tree needs {held}")
         joints, dofs = max(int(model.joint_count), 1), max(int(model.joint_dof_count), 1)
         self.walk_arts = wp.array(arts, dtype=wp.int32, device=device)
         # Each coordinate's column half at its body's frame, from its joint's kind (WALK_COORDINATE): a joint's
@@ -925,14 +902,22 @@ class TreeFactor:
             walk_class[art] = classes.setdefault(table, len(classes))
         self.walk_classes = tuple(classes)
         self.walk_class = wp.array(walk_class, dtype=wp.int32, device=device)
-        # A tree's group in the step's walk kernel (walk_step_kernel, walk_group): on CUDA a lane a body of a batch of
-        # the inward pass and a join slot; one thread a tree on the CPU.
-        # The trees in flight are the trees with a chain to walk: a one-body tree (a free rigid body) leaves its group
-        # after the batch's first body.
+        # The refresh's join slots (walk_inward) are its class's (WalkClass.slots): a parent waits in one for the
+        # lifted inertia of each child other than the joint after it.
+        joins = np.full(max(int(model.joint_count), 1), -1, dtype=np.int32)
+        for art in arts.tolist():
+            j0, j1 = int(start[art]), int(end[art])
+            joins[j0:j1] = self.walk_classes[walk_class[art]].slots[0]
+        held = max((walk.slots[1] for walk in classes), default=0)
+        if held > WALK_JOIN_SLOTS:
+            raise ValueError(f"The walk holds at most {WALK_JOIN_SLOTS} joins of a tree at once, a tree needs {held}")
+        # A tree's group in the refresh (walk_group): on CUDA a lane a body of a batch and a join slot, the trees in
+        # flight those with a chain to walk (a free rigid body leaves its group after the batch's first body); one
+        # thread a tree on the CPU.
+        bodies = max([1, *(len(walk.parent) for walk in classes)])
         sizes = np.array([int(end[a]) - int(start[a]) for a in arts.tolist()], dtype=np.int64)
         walked = int(np.count_nonzero(sizes > 1)) or int(arts.size)
         self.walk_lanes = walk_group(bodies, held, walked, device.sm_count) if device.is_cuda else 1
-        self.walk_block = WALK_BLOCK
         self.walk_path = wp.array(path, dtype=wp.vec2i, device=device)
         self.walk_joins = wp.array(joins, dtype=wp.int32, device=device)
         self.walk_path_host = path
@@ -940,7 +925,6 @@ class TreeFactor:
         self.walk_side = both
         self.walk_data = wp.zeros(((2 if both else 1) * dofs, WALK_COORDINATE), dtype=wp.float32, device=device)
         self.walk_link = wp.zeros((joints, WALK_LINK), dtype=wp.float32, device=device)
-        self.walk_leave_twist = wp.zeros(joints, dtype=wp.spatial_vector, device=device)
         # The step's geometry, which the held tree's finish publishes with its motion columns (every step, no launch
         # of the walk's): each coordinate's column at its body's frame and each body's link there. A seed enters as J
         # there, and a refresh takes it as the factor's frames.
@@ -954,7 +938,7 @@ class TreeFactor:
         view.now, view.now_link, view.now_com = self.walk_now, self.walk_now_link, self.joint_com_offset
         view.origin, view.now_origin = self.walk_origin, self.articulation_origin
         view.joint_art = model.joint_articulation
-        view.scratch = self.walk_leave_twist
+        view.scratch = wp.zeros(joints, dtype=wp.spatial_vector, device=device)
         view.joint_start = model.articulation_start
         view.joint_end = forest.articulation_joint_end
         view.dof_start = forest.articulation_dof_start
@@ -964,17 +948,9 @@ class TreeFactor:
         body_joint[: joint_of.size] = joint_of[: body_joint.size]
         view.body_joint = wp.array(body_joint, dtype=wp.int32, device=device)
         # The release of each tree's slips, which the predictor's border writes (tree_kinetic_state.border_solve): as
-        # many slips a tree as it has limited drives (at most RELEASE_SLIPS), each as deep as the class's deepest root
-        # path.
+        # many slips a tree as it has limited drives (at most RELEASE_SLIPS), each as deep as the deepest root path.
         self.walk_slip_capacity = self.slip_capacity(arts)
-        depth = 1
-        for art in arts.tolist():
-            j0, j1 = int(start[art]), int(end[art])
-            reach = np.zeros(j1 - j0, dtype=np.int64)
-            for j in range(j0, j1):
-                parent = int(path[j][0])
-                reach[j - j0] = (reach[parent] if parent >= 0 else 0) + int(qd_start[j + 1] - qd_start[j])
-            depth = max(depth, int(reach.max(initial=1)))
+        depth = max([1, *(len(walk.root_path(c)) for walk in classes for c in range(walk.coordinates))])
         view.du = wp.zeros(dofs, dtype=wp.float32, device=device)
         view.release = release_view(
             max(int(model.articulation_count), 1),
@@ -1077,7 +1053,7 @@ class TreeFactor:
                 self.articulation_origin,
             ],
             outputs=[self.walk_data, self.walk_link, self.walk_origin],
-            block_dim=max(self.walk_block, lanes),
+            block_dim=max(WALK_BLOCK, lanes),
             device=model.device,
         )
 
@@ -2532,7 +2508,7 @@ class WalkTrees:
       precision does not depend on where the articulation stands; a world point meets one through the origin, and a
       factor's frame meets the step's through the two origins' difference (``WALK_UP``'s ``shift``, zero on a refresh
       step); ``joint_art``: each joint's articulation;
-    - ``scratch``: the leave's and the audit's twists;
+    - ``scratch``: a twist a joint, the audit's (``WALK_ENTER``) and the predictor's border's work;
     - each articulation's first joint, joint end, first coordinate and coordinates (a free rigid body is a one-body
       tree of six coordinates);
     - ``dof_body``: each coordinate's body within its tree; ``body_joint``: each body's joint;

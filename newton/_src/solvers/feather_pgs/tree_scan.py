@@ -1333,6 +1333,11 @@ class WalkClass:
         return int(self.first[-1])
 
     @property
+    def slots(self) -> tuple[tuple[int, ...], int]:
+        """Each body's join slot and the slot count (:func:`_walk_slots`): the loop form's and the refresh's."""
+        return _walk_slots(self.parent)
+
+    @property
     def tag(self) -> str:
         """A short name of the table, for the class's emitted names and its kernels' names."""
         return hashlib.sha256(repr((self.parent, self.first, self.half)).encode()).hexdigest()[:8]
