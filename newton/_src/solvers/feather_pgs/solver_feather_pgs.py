@@ -1065,8 +1065,6 @@ class SolverFeatherPGS(SolverBase):
         if not model.articulation_count:
             return
 
-        # The tree factor's armature by size group.
-        self.factor.allocate_size_groups()
         self.placement.allocate_contact_rows(model)
 
     def read_audit(self) -> dict:

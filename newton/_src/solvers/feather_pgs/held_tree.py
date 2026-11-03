@@ -36,7 +36,7 @@ def _diagonal_geometry(
     offset: int,
     geometry_group: wp.array[int],
     diagonal: wp.array2d[float],
-    armature: wp.array2d[float],
+    armature: wp.array[float],
     drive_row: wp.array[int],
     drive_k: wp.array[float],
     n: int,
@@ -50,7 +50,7 @@ def _diagonal_geometry(
     if mask[art] == 0:
         return
     dof = dof_start[art] + local
-    mass = diagonal[geometry_group[group], offset + local] + armature[group, local]
+    mass = diagonal[geometry_group[group], offset + local] + armature[dof]
     row = drive_row[dof]
     if row >= 0:
         if drive_k[row] > 0.0:
@@ -250,8 +250,7 @@ class TreeSparseOperator:
 
 
 class TreeHeldOperator:
-    """The range ``span`` of a size group as a held group: the trees of one topology, whose armature is that range of
-    the size group's. A walking group refreshes nothing of its own (the walk's refresh is its factor, its collection
+    """The range ``span`` of a size group as a held group: the trees of one topology. A walking group refreshes nothing of its own (the walk's refresh is its factor, its collection
     writes ``row_H``); the compact diagonal refreshes its inverse mass from the held geometry."""
 
     def __init__(self, solver, size, span):
@@ -292,7 +291,7 @@ class TreeHeldOperator:
                 0,
                 self.geometry_group,
                 self.kinetic_state.mass_diagonal,
-                solver.factor.R_by_size[size][self.span[0] : self.span[1]],
+                solver.factor.dof_armature,
                 solver.factor.drive_row_by_dof,
                 solver.factor.aug_row_K,
                 size,
@@ -525,7 +524,7 @@ class ForestHeldOperator:
                     offset,
                     geometry_group,
                     self.kinetic_state.mass_diagonal,
-                    solver.factor.R_by_size[size],
+                    solver.factor.dof_armature,
                     solver.factor.drive_row_by_dof,
                     solver.factor.aug_row_K,
                     size,

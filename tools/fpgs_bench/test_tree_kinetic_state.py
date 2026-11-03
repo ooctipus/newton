@@ -119,7 +119,8 @@ class TestTreePhysicalCPU(unittest.TestCase):
                     response = force_response(owner, solver, state, control, state.joint_qd, dt).reshape(2, count)
                     forces = control.joint_f.numpy().reshape(2, count).astype(float)
                     for group, matrix in enumerate(matrices):
-                        held_matrix = matrix + np.diag(solver.factor.R_by_size[count].numpy()[group])
+                        armature = solver.factor.dof_armature.numpy()[group * count : (group + 1) * count]
+                        held_matrix = matrix + np.diag(armature)
                         expected = np.linalg.solve(held_matrix, forces[group])
                         np.testing.assert_allclose(response[group], expected, atol=3e-5, rtol=3e-4)
                     solver.v_out.assign(solver.v_hat)

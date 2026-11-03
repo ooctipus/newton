@@ -54,7 +54,6 @@ from .solver_fields import (
     BODY_INERTIA,
     PREELIMINATION,
     PREELIMINATION_PLAN,
-    SIZE_ARMATURE,
     STATE_AUX,
     DriveRows,
     Preelim,
@@ -135,7 +134,7 @@ class TreeFactor:
 
     Built in the solver's construction order: the cadence, the cache and the augmented state here, then
     :meth:`kinematic_state` and :meth:`apply_kinematic_state`, :meth:`plan` once the forest plan and the row laws
-    exist, :meth:`allocate_common`, :meth:`allocate_size_groups`, :meth:`build_body_factors`,
+    exist, :meth:`allocate_common`, :meth:`build_body_factors`,
     :meth:`scatter_armature` and :meth:`install`.
 
     Args:
@@ -171,7 +170,6 @@ class TreeFactor:
         self.armature_floor = None
         # The effective armature by coordinate (scatter_armature): the walk's diagonal and the drives' K-free mass.
         self.dof_armature = wp.zeros(max(1, int(model.joint_dof_count)), dtype=wp.float32, device=model.device)
-        self.R_by_size: dict[int, wp.array] = {}
         self.diagonal_inverse_mass = None
         self.body_factors = None
         self.eliminates = False
@@ -500,37 +498,10 @@ class TreeFactor:
         self.sparse_mass_matrix_plan = plan
         self.sparse_mass_matrix_indices = factor_indices(plan, self.model.device)
 
-    def allocate_size_groups(self) -> None:
-        """Allocate each size group's armature R."""
-        for size in self.forest.size_groups:
-            sizes = {"art": self.forest.n_arts_by_size[size], "size": size}
-            for name, array in self._arrays.allocate(SIZE_ARMATURE, owner={}, **sizes).items():
-                getattr(self, f"{name}_by_size")[size] = array
-
     def scatter_armature(self) -> None:
-        """Copy the effective armature (DOF-ordered) to the coordinates' (:attr:`dof_armature`) and the size groups' R."""
+        """Copy the effective armature (DOF-ordered) to the coordinates' (:attr:`dof_armature`)."""
         if self.armature is not None and self.armature.size:
             self.dof_armature.assign(self.armature.astype(np.float32))
-        if not self.forest.size_groups:
-            return
-
-        armature_np = self.armature
-        art_dof_start_np = self.forest.articulation_dof_start_host
-        art_H_rows_np = self.forest.articulation_dof_count_host
-
-        # R_by_size is sized to the actual DOF count.
-        for size in self.forest.size_groups:
-            n_arts = self.forest.n_arts_by_size[size]
-            R_np = np.zeros((n_arts, size), dtype=np.float32)
-
-            group_to_art_np = self.forest.group_to_art_host[size]
-            for group_idx in range(n_arts):
-                art_idx = group_to_art_np[group_idx]
-                dof_start = art_dof_start_np[art_idx]
-                dof_count = art_H_rows_np[art_idx]
-                R_np[group_idx, :dof_count] = armature_np[dof_start : dof_start + dof_count]
-
-            self.R_by_size[size].assign(R_np)
 
     def build_body_factors(self) -> None:
         """Build where each body's tree and coordinates live (:class:`.kernels.BodyFactors`): each body's articulation,

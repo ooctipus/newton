@@ -119,10 +119,11 @@ class TestTreeForestCache(unittest.TestCase):
                 solver.factor.joint_tau.zero_()
                 owner.begin(state, solver.factor, velocity, dt, True)
                 expected = np.empty_like(forces)
-                for group, art in enumerate(groups):
+                for art in groups:
                     block = physical[art * count : (art + 1) * count, art * count : (art + 1) * count]
                     expected[art] = np.linalg.solve(
-                        block + np.diag(solver.factor.R_by_size[count].numpy()[group]), forces[art]
+                        block + np.diag(solver.factor.dof_armature.numpy()[art * count : (art + 1) * count]),
+                        forces[art],
                     )
                 solver.factor.mass_update_mask.fill_(1)
                 operator.refresh(solver.factor)
@@ -245,10 +246,10 @@ class TestTreeForestCache(unittest.TestCase):
         operator.refresh(solver.factor)
         response = force_response(owner, solver, state, control, state.joint_qd, native.DT)
         regularization = np.empty(model.joint_dof_count)
-        for group, art in enumerate(operator.plan.group_to_art.numpy()):
-            regularization[art * mass.dof_count : (art + 1) * mass.dof_count] = solver.factor.R_by_size[
-                mass.dof_count
-            ].numpy()[group]
+        armature = solver.factor.dof_armature.numpy()
+        for art in operator.plan.group_to_art.numpy():
+            span = slice(art * mass.dof_count, (art + 1) * mass.dof_count)
+            regularization[span] = armature[span]
         expected = np.linalg.solve(physical + np.diag(regularization), control.joint_f.numpy().astype(float))
         np.testing.assert_allclose(response, expected, atol=4e-5, rtol=4e-4)
         solver.v_out.assign(solver.v_hat)

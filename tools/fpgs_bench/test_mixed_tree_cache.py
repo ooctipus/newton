@@ -149,11 +149,11 @@ class TestMixedTreeCache(unittest.TestCase):
             starts = solver.forest.articulation_dof_start.numpy()
             for group in owner.groups:
                 operator, n = group.sparse, group.layout.dofs
-                for index, art in enumerate(operator.plan.group_to_art.numpy()):
+                for art in operator.plan.group_to_art.numpy():
                     ids = np.arange(starts[art], starts[art] + n)
                     block = physical[np.ix_(ids, ids)]
                     expected[ids] = np.linalg.solve(
-                        block + np.diag(solver.factor.R_by_size[n].numpy()[index]), forces[ids]
+                        block + np.diag(solver.factor.dof_armature.numpy()[ids]), forces[ids]
                     )
             solver.factor.mass_update_mask.fill_(1)
             owner.refresh(solver.factor)

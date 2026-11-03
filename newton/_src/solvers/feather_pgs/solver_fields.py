@@ -119,9 +119,6 @@ STATE_AUX = FieldGroup(
 # Size groups
 # ---------------------------------------------------------------------------------------------------------------------
 
-SIZE_ARMATURE = FieldGroup(Field("R", wp.float32, ("art", "size")))
-"""One size group's armature by tree and coordinate (the tree factor's)."""
-
 SIZE_JACOBIAN = FieldGroup(Field("J", wp.float32, ("response_art", "response_row", "response_size")))
 """One size group's Jacobian. The matrix-free sweeps' producers write the packed rows instead (:mod:`.packed_rows`):
 their Jacobian is a (1, 1, 1) placeholder."""
