@@ -2661,11 +2661,17 @@ _WALK_INTO = """    WALK_TREE(reinterpret_cast<const int*>(walk.path.data + join
         squares += z * z;
         incident += j * v[c];
     };
-    // A wrench enters at the step's geometry, shifted by the articulation's origins; a covector takes none.
-    float shift[3] = {0.0f, 0.0f, 0.0f};
-    if (k < 0) WALK_SHIFT(walk, walk.joint_art.data[joint0], shift);
-    WALK_ROW(data, link, walk.now.data + (size_t)dof0 * $now, walk.now_link.data + (size_t)joint0 * $link, shift, body,
-             k, &seed[0], sink);
+    // The seed's kind is the caller's constant (covector), so each call site compiles one walk: a covector at local
+    // coordinate k takes no step geometry; a wrench enters at the step's geometry, shifted by the articulation's origins.
+    if (covector != 0) {
+        __builtin_assume(k >= 0);
+        WALK_ROW(data, link, nullptr, nullptr, nullptr, body, k, &seed[0], sink);
+    } else {
+        float shift[3];
+        WALK_SHIFT(walk, walk.joint_art.data[joint0], shift);
+        WALK_ROW(data, link, walk.now.data + (size_t)dof0 * $now, walk.now_link.data + (size_t)joint0 * $link, shift,
+                 body, -1, &seed[0], sink);
+    }
     return wp::vec2(incident, squares);
 """
 
@@ -2688,6 +2694,7 @@ def walk_into(
     bodies: int,
     coordinates: int,
     body: int,
+    covector: int,
     k: int,
     seed: wp.spatial_vector,
     qd: wp.array[float],
@@ -2698,9 +2705,10 @@ def walk_into(
     entry: int,
 ) -> wp.vec2:
     """Walk one row's seed (``WALK_ROW``) into ``out[line, slot, entry + c]``, on the tree of path table ``joint0``:
-    the wrench ``seed`` at local ``body``'s frame (``k < 0``; the factor's, :attr:`WalkTrees.link`), where the step's
-    columns the finish published, shifted to the path's frames, are its ``J``, or the covector ``seed[0] e_k`` at
-    ``body``'s local coordinate ``k``. Stores the footprints (adds them with ``add`` 1: a second seed on one tree;
+    the wrench ``seed`` at local ``body``'s frame (``covector`` 0; the factor's, :attr:`WalkTrees.link`), where the
+    step's columns the finish published, shifted to the path's frames, are its ``J``, or (``covector`` 1) the covector
+    ``seed[0] e_k`` at ``body``'s local coordinate ``k``. ``covector`` is each call site's constant, so the site
+    compiles one walk. Stores the footprints (adds them with ``add`` 1: a second seed on one tree;
     stores none with ``add`` -1) and returns the seed's incident ``J qd`` (the step's ``J`` entries the walk passes,
     against ``qd``; a covector's ``seed[0] qd[k]``) and the sum of its footprints' squares."""
     ...
@@ -2714,6 +2722,7 @@ def walk_into_one_half(
     bodies: int,
     coordinates: int,
     body: int,
+    covector: int,
     k: int,
     seed: wp.spatial_vector,
     qd: wp.array[float],
