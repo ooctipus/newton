@@ -168,6 +168,22 @@ class TestKernelSass(unittest.TestCase):
         ]
         self.assertEqual(sorted(classified), sorted(ordinary))
 
+    def test_walk_kernels_compile_at_their_launch_blocks(self):
+        """Compile the walk family's predictor halves at their layout's block, its solve and refresh at the owner's."""
+        from newton._src.solvers.feather_pgs import tree_factor, tree_kinetic_owner  # noqa: PLC0415
+
+        blocks = sass.launch_blocks(("walk",))
+        for name, _, args, kwargs in sass.identity.walk_calls():
+            block = blocks.get(sass.identity.label(name, args, kwargs))
+            if name.endswith(("get_force_kernel", "get_predictor_kernel")):
+                self.assertEqual(block, kwargs["layout"].value.block)
+            elif name.endswith("get_walk_solve_kernel"):
+                self.assertEqual(block, tree_kinetic_owner.WALK_SOLVE_THREADS)
+            elif name.endswith("walk_step_kernel"):
+                self.assertEqual(block, tree_factor.WALK_BLOCK)
+            else:
+                self.assertIsNone(block)
+
     def test_scalar_branch_kernels_group_at_their_launch_blocks(self):
         """Group the scalar-branch kernels at the blocks kernel_sass compiles them at: the repair at its launch block.
 

@@ -33,7 +33,8 @@ the FeatherPGS package, the held-tree owner's scalar-branch group included, and
 the pinned factory calls), the factory variants those pins do not reach
 (:func:`factory_calls`), a held-tree layout grid of the factory-built tree
 kernels (:func:`held_tree_calls`) and a census of every flag combination of the
-sweep factories that vote an exit (:func:`census_calls`), recorded by hash only.
+sweep factories that vote an exit (:func:`census_calls`), recorded by hash only, and the walk's readers over the
+suite's class shapes (:func:`walk_calls`).
 Nothing is compiled and no device is needed; a full record takes under three
 minutes on the CPU, the census about two of them.
 
@@ -61,7 +62,7 @@ import time
 from pathlib import Path
 
 ARCH = "120"
-FAMILIES = ("pins", "factories", "held_tree", "census")
+FAMILIES = ("pins", "factories", "held_tree", "walk", "census")
 COLUMNS = ("hash", "cuda", "cpu")
 # Import-time switches select other generated kernels (environment_flags.PREFIXES).
 SWITCH_PREFIXES = ("FEATHER_PGS_", "IL_NEWTON_FPGS_")
@@ -392,6 +393,130 @@ def held_tree_calls():
             yield "tree_kinetic_state.get_bank_kernel", bank, (), {**layout, "coordinates": coordinates}
 
 
+def _walk_class(parent, first, half):
+    from newton._src.solvers.feather_pgs.tree_factor import WalkClass  # noqa: PLC0415
+
+    return WalkClass(tuple(parent), tuple(first), tuple(half))
+
+
+def _limbs(base, limbs, length, start):
+    """Parents of ``limbs`` chains of ``length`` bodies each hung from body ``base``, numbered from ``start``."""
+    parent = []
+    for limb in range(limbs):
+        first = start + limb * length
+        parent += [base, *range(first, first + length - 1)]
+    return parent
+
+
+def walk_classes_of_the_suite():
+    """Return ``{name: WalkClass}`` at the suite's walking shapes, each coordinate's half compiled in.
+
+    ``g1``: a free root of six, two legs of six, a waist of three, two arms of seven with two two-link fingers each
+    (38 bodies, 43 coordinates, joins at the pelvis, the torso and the hands); ``franka``: a fixed arm of seven and two
+    fingers on the last link (9); ``allegro``: a palm fixed to the world and four fingers of four (16); ``cube``: a
+    free body (6); ``kuka``: an arm of seven, a palm and the allegro fingers (23); ``chain106``: 106 one-coordinate
+    bodies, past the emitter's straight-line limit (the loop form); ``d6``: a free root, a D6 joint whose turns follow
+    its slides (each turn's column of both halves, the record's side) and a revolute child.
+    """
+    linear, angular, both = 0, 1, 2
+    g1 = [-1, *_limbs(0, 2, 6, 1), 0, 13, 14]
+    g1 += [15, *range(16, 22), 22, 23, 22, 25, 15, *range(27, 33), 33, 34, 33, 36]
+    shapes = {
+        "g1": (g1, [0, 6, *range(7, 44)], (linear,) * 3 + (angular,) * 40),
+        "franka": ([-1, *range(7), 6], range(10), (angular,) * 7 + (linear,) * 2),
+        "allegro": ([-1, *_limbs(0, 4, 4, 1)], [0, *range(17)], (angular,) * 16),
+        "cube": ([-1], [0, 6], (linear,) * 3 + (angular,) * 3),
+        "kuka": ([-1, *range(7), *_limbs(7, 4, 4, 8)], [*range(8), *range(7, 24)], (angular,) * 23),
+        "chain106": ([-1, *range(105)], range(107), (angular,) * 106),
+        "d6": ([-1, 0, 1], [0, 6, 12, 13], (linear,) * 3 + (angular,) * 3 + (linear,) * 3 + (both,) * 3 + (angular,)),
+    }
+    return {name: _walk_class(*shape) for name, shape in shapes.items()}
+
+
+def walk_calls():
+    """Yield ``(name, factory, args, kwargs)`` for the walk's readers over the suite's class shapes
+    (:func:`walk_classes_of_the_suite`): every kernel whose text a walk operator writes.
+
+    The step's leave of each class, with and without the slips' release (and the support placement's nodes on g1),
+    and of allegro's hand with its cube; the audit's enter and the refresh; the walk's solve of each class (chain106
+    in the loop form); the predictor's force and response halves on a tree of each held width: one word a lane
+    (franka), two (g1, with joins) and none (chain106, the serial border); the support writer on g1 and kuka; the
+    general writer with and without sides; the free-body headers; and the sweeps that walk rows (the matrix-free
+    Gauss-Seidel's free bodies, the local owners' block, the parallel tiers' rows).
+    """
+    from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
+        sweep_routes,
+        sweep_routes_local,
+        sweep_routes_tiers,
+        tree_factor,
+        walk_rows,
+    )
+    from newton._src.solvers.feather_pgs import tree_kinetic_state as native  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout  # noqa: PLC0415
+
+    classes = walk_classes_of_the_suite()
+    named = {name: Named(f"({name},)", (cls,)) for name, cls in classes.items()}
+    leave = _unwrapped(tree_factor.walk_leave_kernel)
+    for name in classes:
+        for release in (False, True):
+            yield "tree_factor.walk_leave_kernel", leave, (named[name], release), {}
+    pair = Named("(allegro, cube)", (classes["allegro"], classes["cube"]))
+    yield "tree_factor.walk_leave_kernel", leave, (pair, True), {}
+    nodes = Named("g1 nodes", (tuple(range(classes["g1"].coordinates - 1, -1, -1)),))
+    yield "tree_factor.walk_leave_kernel", leave, (named["g1"], True, nodes), {}
+    yield "tree_factor.walk_enter_kernel", _unwrapped(tree_factor.walk_enter_kernel), (), {}
+    yield "tree_factor.walk_step_kernel", lambda: tree_factor.walk_step_kernel, (), {}
+
+    def layout(name, root):
+        cls = classes[name]
+        bodies, dofs = len(cls.parent), cls.coordinates
+        depth = max(_depth(cls.parent, b) for b in range(bodies))
+        tree = TreeLayout(bodies, dofs, dofs * (dofs + 1) // 2, dofs, depth, root, tuple(range(dofs - 1, -1, -1)))
+        return Named(f"{name} layout", tree)
+
+    solve = _unwrapped(native.get_walk_solve_kernel)
+    force = _unwrapped(native.get_force_kernel)
+    predictor = _unwrapped(native.get_predictor_kernel)
+    roots = {"g1": 6, "franka": 1, "kuka": 1, "chain106": 1, "d6": 6}
+    for name, root in roots.items():
+        tree = layout(name, root)
+        yield "tree_kinetic_state.get_walk_solve_kernel", solve, (), {"layout": tree, "classes": named[name]}
+    for name in ("franka", "g1", "chain106"):
+        tree = layout(name, roots[name])
+        schedules = Named("schedules", _schedules(tree.value, False))
+        kwargs = {"layout": tree, "response": "sparse", "classes": named[name]}
+        yield "tree_kinetic_state.get_force_kernel", force, (schedules,), kwargs
+        twists = native.publishes_twists(tree.value, schedules.value, cuda=True)
+        kwargs = {**kwargs, "twists": twists, "slips": tree_factor.RELEASE_SLIPS}
+        yield "tree_kinetic_state.get_predictor_kernel", predictor, (schedules,), kwargs
+        if name == "g1":
+            yield "tree_kinetic_state.get_predictor_kernel", predictor, (schedules,), {**kwargs, "side": False}
+    support = _unwrapped(walk_rows.support_rows_kernel)
+    for name in ("g1", "kuka"):
+        cls = classes[name]
+        node = tuple(range(cls.coordinates - 1, -1, -1))
+        for records, torsion in ((False, False), (True, True)):
+            args = (Named(f"{name} parent", cls.parent), Named(f"{name} first", cls.first), Named(f"{name} node", node))
+            yield "walk_rows.support_rows_kernel", support, args, {"records": records, "torsion": torsion}
+    for side in (False, True):
+        yield "walk_rows.walked_rows_kernel", _unwrapped(walk_rows.walked_rows_kernel), (8, True, side), {}
+    yield "walk_rows.free_body_headers_kernel", lambda: walk_rows.free_body_headers_kernel, (), {}
+    mf_gs = _unwrapped(sweep_routes.mf_gs_kernel)
+    free = {"factor_coordinates": True, "independent_components": True, "has_dense_velocity_limit_rows": False}
+    yield "sweep_routes.mf_gs_kernel", mf_gs, (64, 32, 12, ARCH), free
+    local = _unwrapped(sweep_routes_local.local_owned_kernel)
+    yield "sweep_routes_local.local_owned_kernel", local, (192, 20, 9, ARCH), {"warps_per_block": 2}
+    tiers = {"rows": 32, "min_rows": 0, "sweeps": 24, "inkernel_response": (18, 0, 0, 0)}
+    yield "sweep_routes_tiers.parallel_kernel", sweep_routes_tiers.parallel_kernel, (64, 32, 18, ARCH), tiers
+
+
+def _depth(parent, body):
+    depth = 0
+    while parent[body] >= 0:
+        body, depth = parent[body], depth + 1
+    return depth
+
+
 def _axis(name, values=(False, True)):
     """One census axis: a keyword over its values."""
     return tuple({name: value} for value in values)
@@ -599,7 +724,7 @@ def inventory(families, select=()):
         from newton.tests import test_feather_pgs_point_streams as pins  # noqa: PLC0415
 
         kernels.update((name, ("pins", kernel)) for name, kernel in pins._inventory().items())
-    for family, calls in (("factories", factory_calls), ("held_tree", held_tree_calls)):
+    for family, calls in (("factories", factory_calls), ("held_tree", held_tree_calls), ("walk", walk_calls)):
         if family not in families:
             continue
         for name, factory, args, kwargs in calls():

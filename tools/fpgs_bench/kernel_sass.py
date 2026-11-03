@@ -49,7 +49,9 @@ Run from the root of a Newton checkout with the import-time switches
     python tools/fpgs_bench/kernel_sass.py record child103.json --arch 103 --jobs 8
     python tools/fpgs_bench/kernel_sass.py diff parent.json child.json
 
-``--root`` imports Newton from another checkout, as in ``kernel_identity.py``.
+``--root`` imports Newton from another checkout, as in ``kernel_identity.py``;
+``--ptx DIR`` keeps each kernel's PTX for ``kernel_flow.py``, the next rung
+when the SASS of a kernel changed.
 ``diff`` exits 0 when no shared kernel changed, 1 when one changed or a kernel
 disappeared, and 2 when a kernel also keeps fewer blocks resident or spills
 more to local memory.
@@ -233,11 +235,12 @@ def ptxas_version() -> str:
     return _run(["ptxas", "--version"]).strip().splitlines()[-2].strip()
 
 
-def compile_module(module, *, arch=ARCH, block_dim=None):
+def compile_module(module, *, arch=ARCH, block_dim=None, ptx=None):
     """Build a module's binary as a launch at ``block_dim`` threads (default: its own) does; return its listings.
 
     NVRTC emits the module's PTX and ``ptxas`` assembles it, as the driver's
-    JIT does. Returns the ``cuobjdump`` resource usage and SASS listings.
+    JIT does. Returns the ``cuobjdump`` resource usage and SASS listings; a
+    ``ptx`` list receives the module's PTX.
     """
     import warp as wp  # noqa: PLC0415
 
@@ -251,6 +254,8 @@ def compile_module(module, *, arch=ARCH, block_dim=None):
         # Warp stores the PTX with the terminating NUL its loader passes on.
         source, cubin = Path(directory) / "module.ptx", Path(directory) / "module.cubin"
         source.write_bytes(sources[0].read_bytes().rstrip(b"\0"))
+        if ptx is not None:
+            ptx.append(source.read_text())
         _run(["ptxas", f"-arch=sm_{arch}", str(source), "-o", str(cubin)])
         usage = _run(["cuobjdump", "--dump-resource-usage", str(cubin)])
         sass = _run(["cuobjdump", "-sass", str(cubin)])
@@ -325,7 +330,9 @@ def launch_blocks(families):
     """Return ``{label: threads per block}`` for the inventory kernels whose launch block is known.
 
     A held-tree classification launches :func:`classify_block` threads per
-    block; every other held-tree kernel launches ``TreeLayout.block``. In the
+    block; every other held-tree kernel launches ``TreeLayout.block``, as do the
+    walk family's predictor halves (:func:`.kernel_identity.walk_calls`); its walk solve launches
+    ``WALK_SOLVE_THREADS`` and its refresh ``WALK_BLOCK``. In the
     pins family, the scalar-branch repair launches at
     :func:`scalar_branch_blocks`'s block.
     """
@@ -335,6 +342,19 @@ def launch_blocks(families):
         for name, _, args, kwargs in identity.held_tree_calls():
             block = classify if name.endswith(".get_classify_kernel") else identity._value(kwargs["layout"]).block
             blocks[identity.label(name, args, kwargs)] = block
+    if "walk" in families:
+        from newton._src.solvers.feather_pgs import tree_factor, tree_kinetic_owner  # noqa: PLC0415
+
+        # The predictor's halves launch at their layout's block, the walk's solve at the owner's, the refresh at the
+        # factor's (its lane groups fit in it).
+        for name, _, args, kwargs in identity.walk_calls():
+            key = identity.label(name, args, kwargs)
+            if name.endswith((".get_force_kernel", ".get_predictor_kernel")):
+                blocks[key] = identity._value(kwargs["layout"]).block
+            elif name.endswith(".get_walk_solve_kernel"):
+                blocks[key] = tree_kinetic_owner.WALK_SOLVE_THREADS
+            elif name.endswith(".walk_step_kernel"):
+                blocks[key] = tree_factor.WALK_BLOCK
     if "pins" in families:
         blocks.update(scalar_branch_blocks())
     return blocks
@@ -351,8 +371,9 @@ def _module_groups(kernels, blocks):
     return sorted(((keys, block_dim) for (_, block_dim), keys in groups.items()), key=lambda group: group[0][0])
 
 
-def _worker(root, families, select, arch, part, parts):
-    """Record every ``parts``-th module group of the inventory, starting at ``part``."""
+def _worker(root, families, select, arch, part, parts, ptx_dir=None):
+    """Record every ``parts``-th module group of the inventory, starting at ``part``; with ``ptx_dir``, store each
+    kernel's PTX entry there (:func:`.kernel_flow.ptx_path`)."""
     identity._import_newton(root)
     import warp as wp  # noqa: PLC0415
 
@@ -363,8 +384,9 @@ def _worker(root, families, select, arch, part, parts):
     for keys, block_dim in _module_groups(kernels, launch_blocks(families))[part::parts]:
         module = kernels[keys[0]][1].module
         started = time.perf_counter()
+        ptx = []
         try:
-            listings, failure = compile_module(module, arch=arch, block_dim=block_dim), None
+            listings, failure = compile_module(module, arch=arch, block_dim=block_dim, ptx=ptx), None
         except Exception as error:
             listings, failure = None, f"{type(error).__name__}: {error}"
         seconds = round(time.perf_counter() - started, 1)
@@ -378,13 +400,18 @@ def _worker(root, families, select, arch, part, parts):
                     row.update(kernel_resources(kernel, *listings))
                 except Exception as error:
                     row["error"] = f"{type(error).__name__}: {error}"
+                if ptx_dir and ptx:
+                    from tools.fpgs_bench import kernel_flow  # noqa: PLC0415
+
+                    entry = kernel_flow.entry(ptx[0], f"{kernel.get_mangled_name()}_cuda_kernel_forward")
+                    kernel_flow.ptx_path(ptx_dir, key).write_text(entry)
             row["cpu_twin"] = cpu_twin_digest(kernel)
             row["seconds"] = seconds
             rows[key] = row
     return rows, rejected
 
 
-def record(path, *, root=None, families=("held_tree",), select=(), jobs=1, arch=ARCH):
+def record(path, *, root=None, families=("held_tree",), select=(), jobs=1, arch=ARCH, ptx_dir=None):
     if arch not in TARGETS:
         raise SystemExit(f"Unsupported architecture {arch}; record one of {sorted(TARGETS)}")
     switches = identity._switches()
@@ -393,7 +420,9 @@ def record(path, *, root=None, families=("held_tree",), select=(), jobs=1, arch=
     started = time.perf_counter()
     context = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(max_workers=jobs, mp_context=context) as pool:
-        futures = [pool.submit(_worker, root, families, select, arch, part, jobs) for part in range(jobs)]
+        if ptx_dir:
+            Path(ptx_dir).mkdir(parents=True, exist_ok=True)
+        futures = [pool.submit(_worker, root, families, select, arch, part, jobs, ptx_dir) for part in range(jobs)]
         results = [future.result() for future in futures]
     rows, rejected = {}, {}
     for part_rows, part_rejected in results:
@@ -514,13 +543,14 @@ def main(argv=None):
     record_parser.add_argument("output", help="JSON file to write")
     record_parser.add_argument("--root", help="Newton checkout to import (default: the one holding this script)")
     record_parser.add_argument(
-        "--family", action="append", choices=identity.FAMILIES[:3], help="inventory families (default: held_tree)"
+        "--family", action="append", choices=identity.FAMILIES[:4], help="inventory families (default: held_tree)"
     )
     record_parser.add_argument("--select", action="append", default=[], help="keep labels containing this text")
     record_parser.add_argument(
         "--arch", type=int, default=ARCH, choices=sorted(TARGETS), help=f"compute capability (default: {ARCH})"
     )
     record_parser.add_argument("--jobs", type=int, default=1, help="compiling processes")
+    record_parser.add_argument("--ptx", help="directory for each kernel's PTX entry, for kernel_flow.py")
     diff_parser = commands.add_parser("diff", help="compare two records")
     diff_parser.add_argument("parent")
     diff_parser.add_argument("child")
@@ -536,6 +566,7 @@ def main(argv=None):
             select=tuple(arguments.select),
             jobs=max(1, arguments.jobs),
             arch=arguments.arch,
+            ptx_dir=arguments.ptx,
         )
         return 0
     parent, child = (json.loads(Path(path).read_text(encoding="utf-8")) for path in (arguments.parent, arguments.child))
