@@ -3,23 +3,21 @@
 
 """The compact boundary: the sparse diagonal's contact rows written whole where the contacts are read.
 
-A thread per contact row, in the contacts' collision order, calls the contact law (its records,
-:func:`.row_build.write_contact_row`) and walks the row's seeds into the slots sink (:func:`.walk_rows.contact_seeds`,
-:func:`.walk_rows.slot_header`): the same row the sparse diagonal's one writer (:func:`.walk_rows.write_slot_rows`)
-writes from a unit source, without the unit source's pass. Allocation, admission, scheduling and the solve stay the
-original pipeline's. Persistent patch friction writes its tangent rows with the patch row law; the patch link,
-``_FrictionPatchState.link``, runs after this producer and alone links the patch rings and divides the friction
-coefficient, in one ``link_patch_routes`` launch over every route.
+A thread per contact row, in the contacts' collision order, writes the row by the one writer's row on the slots sink
+(:data:`.walk_rows.write_slot_row`: its records by the contact law, its seeds walked, its header): the row the sparse
+diagonal's writer (:func:`.walk_rows.write_slot_rows`) writes from a unit source, without the unit source's pass.
+Allocation, admission, scheduling and the solve stay the original pipeline's. Persistent patch friction writes its
+tangent rows with the patch row law; the patch link, ``_FrictionPatchState.link``, runs after this producer and alone
+links the patch rings and divides the friction coefficient, in one ``link_patch_routes`` launch over every route.
 """
 
 import warp as wp
 
 from .contact_input import ContactInput
-from .dense_rows import DenseRows, RowSupport
+from .dense_rows import UNIT_CONTACT, DenseRows, RowSupport
 from .friction_patches import PatchRowLaw, patch_row_law
-from .row_build import write_contact_row
 from .tree_factor import WalkTrees
-from .walk_rows import SlotRows, bind_slot_rows, clear_dense_part, contact_seeds, slot_header
+from .walk_rows import JointSeeds, SlotRows, bind_slot_rows, write_slot_row
 
 
 def supported(solver) -> bool:
@@ -57,8 +55,7 @@ def produce_contacts(
     material: int,
 ):
     """Publish each contact's rows in their original collision order, one thread per row (3 per contact, 4 under
-    contact torsion): its records (:func:`.row_build.write_contact_row`), then its seeds walked into the slots sink and
-    its header (:func:`.walk_rows.contact_seeds`, :func:`.walk_rows.slot_header`).
+    contact torsion), by the one writer's row on the slots sink (:data:`.walk_rows.write_slot_row`).
 
     Tangent rows act at the friction location and follow the patch row law (``patch_tangent_row``): under
     persistent patches at the patch friction location with the anchor's tangential phi, ``law.beta`` and the
@@ -72,50 +69,11 @@ def produce_contacts(
     if data.path[contact] != 0 or slot < 0 or row >= data.slots_needed[contact]:
         return
     world = data.world[contact]
-    line = data.first[world]
-    group = slots.dense_group[world]
-    r = slot + row
-    body0, body1, direction, row_point = write_contact_row(data, law, contact, row, False)
-    sides = rows.sides[line, r]
-    clear_dense_part(slots, group, r)
-    walked, coord0, z0, coord1, z1 = contact_seeds(
-        walk,
-        support,
-        slots,
-        data,
-        data.incident,
-        sides,
-        group,
-        r,
-        row,
-        direction,
-        row_point,
-        body0,
-        data.art0[contact],
-        body1,
-        data.art1[contact],
-    )
-    slot_header(
-        rows,
-        support,
-        slots,
-        walk,
-        sides,
-        group,
-        line,
-        r,
-        walked,
-        coord0,
-        z0,
-        coord1,
-        z1,
-        dt,
-        contact_speculative_scale,
-        contact_w,
-        restitution_velocity_threshold,
-        weighted,
-        material,
-    )
+    write_slot_row(
+        rows, support, slots, data.first[world], slots.dense_group[world], slot + row, UNIT_CONTACT, 4 * contact + row,
+        data, law, walk, JointSeeds(), data.incident, dt, contact_speculative_scale, contact_w,
+        restitution_velocity_threshold, weighted, material, slots.Z, slots.incident,
+    )  # fmt: skip
 
 
 def launch_contacts(solver, data: ContactInput, dt: float) -> None:

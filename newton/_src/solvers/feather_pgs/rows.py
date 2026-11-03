@@ -1245,6 +1245,24 @@ class RowLaws:
         support placement's: the patch link then runs after it)."""
         return bool(solver.placement.walks) and solver.routes.case != "K2"
 
+    def joint_seeds(self, solver, state_in) -> walk_rows.JointSeeds:
+        """What the one writer's seeds read besides the contact input (:class:`.walk_rows.JointSeeds`): the mimics' and
+        links' tables where the model has them, else one-entry placeholders."""
+        placement, model = solver.placement, solver.model
+        mimics = self.mimic_count > 0
+        links = self.link_count > 0
+        dummy_int, dummy_float = placement.dummy_is_free_rigid, placement.contact_row_eps_dummy.flatten()
+        seeds = walk_rows.JointSeeds()
+        seeds.body_to_articulation = solver.forest.body_to_articulation
+        seeds.mimic_dof0 = self._mimic_dof0 if mimics else dummy_int
+        seeds.mimic_dof1 = self._mimic_dof1 if mimics else dummy_int
+        seeds.mimic_coef1 = model.constraint_mimic_coef1 if mimics else dummy_float
+        seeds.link_primary = self._link_primary if links else dummy_int
+        seeds.link_shadow = self._link_shadow if links else dummy_int
+        seeds.body_q = state_in.body_q
+        seeds.body_com = model.body_com
+        return seeds
+
     def write_general(self, solver, state_in, contacts: Contacts | None, dt: float) -> None:
         """The general placement's one writer (:func:`.walk_rows.walked_rows_kernel`)."""
         placement, factor, model = solver.placement, solver.factor, solver.model
@@ -1252,9 +1270,7 @@ class RowLaws:
         contact_input = (
             bind_contact_input(solver, state_in, factor, contacts, dt, 1.0) if contacts is not None else ContactInput()
         )
-        mimics = self.mimic_count > 0
-        links = self.link_count > 0
-        dummy_int, dummy_float = placement.dummy_is_free_rigid, placement.contact_row_eps_dummy.flatten()
+        dummy_int = placement.dummy_is_free_rigid
         blocks = factor.block_capacity if factor.eliminates else 0
         lanes = walk_rows.writer_lanes(placement.dense_internal_max_rows, placement.dense_max_constraints, model.device)
         inputs = [
@@ -1272,14 +1288,7 @@ class RowLaws:
             factor.blocks() if blocks else Preelim(),
             self.mimic_slot if blocks and self.mimic_slot is not None else dummy_int,
             self.link_slot if blocks and self.link_slot is not None else dummy_int,
-            solver.forest.body_to_articulation,
-            self._mimic_dof0 if mimics else dummy_int,
-            self._mimic_dof1 if mimics else dummy_int,
-            model.constraint_mimic_coef1 if mimics else dummy_float,
-            self._link_primary if links else dummy_int,
-            self._link_shadow if links else dummy_int,
-            state_in.body_q,
-            model.body_com,
+            self.joint_seeds(solver, state_in),
             solver.v_hat,
             dt,
             solver.options.contact_speculative_scale,
@@ -1307,8 +1316,6 @@ class RowLaws:
             if contacts is not None
             else ContactInput()
         )
-        mimics = self.mimic_count > 0
-        dummy_int, dummy_float = placement.dummy_is_free_rigid, placement.contact_row_eps_dummy.flatten()
         dense_rows, law = bind_dense_rows(placement), patch_row_law(solver)
         sink = sweep.support_sink(solver.v_hat)
         units = sweep.support_units
@@ -1330,9 +1337,7 @@ class RowLaws:
                 contact_input,
                 law,
                 sink,
-                self._mimic_dof0 if mimics else dummy_int,
-                self._mimic_dof1 if mimics else dummy_int,
-                model.constraint_mimic_coef1 if mimics else dummy_float,
+                self.joint_seeds(solver, state_in),
                 dt,
                 solver.options.contact_speculative_scale,
                 self.contact_w,

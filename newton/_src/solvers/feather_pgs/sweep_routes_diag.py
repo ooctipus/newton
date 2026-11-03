@@ -160,7 +160,7 @@ class _UnitPairZ(UnitOperator, ReducedPairCoupling, SparsePairZ):
     (:class:`.sweep.UnitOperator`).
 
     A contact's rows act on its two bodies' coordinates, which the build puts in the same slot of each row
-    (:func:`.walk_rows.slot_header`), so the lane that owns a coordinate holds all three rows' entries
+    (:data:`.walk_rows.write_slot_row`), so the lane that owns a coordinate holds all three rows' entries
     there: the unit reads the velocity there once (:meth:`unit_terms`) and writes it once (:meth:`unit_apply`). Its
     ladder reduces the pair's coupling too, and its rows vote on their reduced terms, as the rows' own visits do.
     Under contact torsion (``spin``) the unit's fourth row is its spin row (``head + 3``), on the same coordinates.

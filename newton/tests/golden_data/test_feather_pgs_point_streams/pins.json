@@ -12,7 +12,7 @@
   "body_cut._scatter": "ad1df08747087e583ee501b60d18af6ebd59d28e381270478954c08595fa1905",
   "body_cut._seat_shadows": "f3ee2eb1654aefee3812814f1bdb52a9fcde952f633f13473563f3f2cd9587a6",
   "body_cut._spread_unseated": "aabe3b9b8d44e2167f55ea7aaf0a564d26b97133d276ff5088a86ae8eac57e03",
-  "compact_contact.produce_contacts": "5771f82ef3a309d1a74195b2dda91f6b9c396b166a8cf13ad701473f1cde35fc",
+  "compact_contact.produce_contacts": "996813a50fd8e0bf8ec9127ce62e66e4235d3a538761f3e861ff2147f0c19d53",
   "device_proof._checksum_words": "539d4dfaf5523eb00eac977262740ec66706aa1a166614751c756013a3e15d62",
   "friction_patches._build": "0fc76a0cd5899642593142033f58311a0d43a286a9872e6408d4259eb7ec2c14",
   "friction_patches._finish_and_store": "c80211a516ac54390c82ea8573524ca1377584456be0431f2833f1ade0e56de1",
@@ -274,16 +274,16 @@
   "tree_factor.walk_leave_kernel((WalkClass(parent=(-1, 0, 1, 0, 3, 0), first=(0, 6, 7, 8, 9, 10, 11), half=()),), True)": "1e8b77a51956f00bb591bf75b4c5736ffa203e90dbb78f907a771a8cc126dbb0",
   "tree_factor.walk_step_kernel": "84d7c21b3a68be67c281c75db773a336b724bfe6780cc32ea8300ad397cbaece",
   "walk_rows.free_body_headers_kernel": "4b8f5e132e8553bdfa7af358042c69d965b027bfd87fb98d3f5732871107d925",
-  "walk_rows.support_rows_kernel((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11), (10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0), records=False, torsion=False)": "b7ae0cb7797478bf1dd6569134e91f9a0da1ba5dbcd046f0fb715c91975cc21a",
-  "walk_rows.support_rows_kernel((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11), (10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0), records=True, torsion=False)": "78d3d25dfd98f5271957510189107fecd86c3c5bb39abd702884930b9efbf05d",
-  "walk_rows.support_rows_kernel((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11), (10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0), records=True, torsion=True)": "0ee9188f52989a9a66a9d7f1bd47309f6a30dd0a52e5e4260666a87291b413f8",
+  "walk_rows.support_rows_kernel((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11), (10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0), records=False, torsion=False)": "f7651699f4c5ab5b2b558105973e206e1412a75face514873ac0012016fbd158",
+  "walk_rows.support_rows_kernel((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11), (10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0), records=True, torsion=False)": "d12af615f087fcb2f72e4228065ee2c26537801a3b61e386af7a4f1a4d2c0949",
+  "walk_rows.support_rows_kernel((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11), (10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0), records=True, torsion=True)": "211f4e09b456606e3084d17dfdfc62b249d071053a4b23d18154b02a9e735e28",
   "walk_rows.support_units_kernel(3, 16)": "d0a99b580e82fb3a781ba8f00080e66f3c6bfeff6400260d77dfd8234384cc4b",
   "walk_rows.support_units_kernel(4, 16)": "02cdd7284d3e0e0637be668a579e46afe9958e2583c1c9bf4d8c00bddb00023a",
-  "walk_rows.walked_rows_kernel(0, False)": "1a2fefc279e4a2ed31bab33513776728d3cb01d8ef8fa9a103109fee4bc51a99",
-  "walk_rows.walked_rows_kernel(8, False)": "cae8962971b53b69ccb589969760cdf25a3fa9b1cf6bd581228f0f9d9e028c7d",
-  "walk_rows.walked_rows_kernel(8, True)": "64908a4aa40c29661fb9256e38e38b2b1f0f6bf9787a4a3fe6eabda1b35d55ad",
-  "walk_rows.write_free_body_rows": "6bc4d2e41d4f4c9854473a2620aa983354159bd28b4b8de708397b02e2c38394",
-  "walk_rows.write_slot_rows": "705b3587ac10c56c6358cc791a50377717a4de2c00fc14f7cd74752fe2518e4c"
+  "walk_rows.walked_rows_kernel(0, False)": "90719a83a650e9afce7020f63b71418a2ac30f10848b4b6968182a4bbc6b453e",
+  "walk_rows.walked_rows_kernel(8, False)": "3baacc87d4d5bf548edb68ca91e0eedc22bb60e3854620f44c3d500bc2f6c00c",
+  "walk_rows.walked_rows_kernel(8, True)": "2d69ad57c3fa293da8401daf84c80675dbde8321aaeb6670bc3de35d95ea64fd",
+  "walk_rows.write_free_body_rows": "1b9ab688ea2948cc8ca80d59f1390975d8f2e1c7d496324f328f03684eb18ed1",
+  "walk_rows.write_slot_rows": "23f01722e084815c5eb259c2054a55d7c2346dc8dc8598b8227731608268a6aa"
  },
  "warp": "1.17.0"
 }
