@@ -343,7 +343,6 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, device="cpu"):
     row_type = wp.array([[contact, friction, friction]], dtype=wp.int32, device=device)
     phi_arr = wp.array([list(phi)], dtype=wp.float32, device=device)
     zeros3 = lambda: wp.zeros((1, 3), dtype=wp.float32, device=device)  # noqa: E731
-    neg1 = wp.full((1, 3), -1, dtype=wp.int32, device=device)
     zJ = lambda: wp.zeros((1, 3, 6), dtype=wp.float32, device=device)  # noqa: E731
     inf = wp.array([float("inf")], dtype=wp.float32, device=device)
     rhs = zeros3()
@@ -370,8 +369,8 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, device="cpu"):
                 field_group.upload(
                     MfRows,
                     device,
-                    body_a=neg1,
-                    body_b=neg1,
+                    sides=wp.full((1, 3), wp.vec2i(-1, -1), dtype=wp.vec2i, device=device),
+                    diag=zeros3(),
                     Z_a=zJ(),
                     Z_b=zJ(),
                     phi=phi_arr,
@@ -397,7 +396,7 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, device="cpu"):
                 0,
                 0,
             ],
-            outputs=[zeros3(), zeros3()],
+            outputs=[zeros3()],
             device=device,
         )
     else:

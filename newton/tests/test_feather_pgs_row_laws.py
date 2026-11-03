@@ -298,18 +298,25 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
         incident=np.zeros((worlds, rows), dtype=np.float32),
         **shared,
     )["incident"]
+    # Each body is its own one-node tree (articulation = body), its six coordinates from 6 body: the walk names a
+    # side's body by its first coordinate.
+    bodies = 2 * worlds
+    walk = WalkTrees()
+    walk.dof_start = wp.array(6 * np.arange(bodies, dtype=np.int32), dtype=wp.int32, device=device)
+    walk.dof_body = wp.array(np.repeat(np.arange(bodies, dtype=np.int32), 6), dtype=wp.int32, device=device)
     out = call(
         free_body_headers_kernel,
         worlds * rows,
         device,
         mf_constraint_count=np.full(worlds, rows, dtype=np.int32),
-        walk=WalkTrees(),
+        walk=walk,
         v_hat=layout["incident_velocity"],
         pgs_cfm=1.0e-6,
         mf_max_constraints=rows,
         weighted=1,
         material=0,
-        mf_eff_mass_inv=np.zeros((worlds, rows), dtype=np.float32),
+        mf_sides=np.stack((layout["mf_body_a"], layout["mf_body_b"]), axis=-1).astype(np.int32),
+        mf_diag=np.zeros((worlds, rows), dtype=np.float32),
         mf_row_incident=incident,
         mf_rhs=np.zeros((worlds, rows), dtype=np.float32),
         mf_row_w=np.ones((worlds, rows), dtype=np.float32),
@@ -330,7 +337,7 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
     for side in "ab":
         bodies, Z = layout[f"mf_body_{side}"], layout[f"mf_Z_{side}"].astype(np.float64)
         diagonal += np.where(bodies >= 0, (Z * Z).sum(axis=2), 0.0)
-    np.testing.assert_allclose(out["mf_eff_mass_inv"].numpy(), 1.0 / diagonal, rtol=1e-5)
+    np.testing.assert_allclose(out["mf_diag"].numpy(), diagonal, rtol=1e-5)
     reference_rhs, law_rhs = out["mf_rhs"].numpy(), law["rhs"].numpy()
     np.testing.assert_array_equal(out["mf_row_w"].numpy(), law["row_w"].numpy())
     magnitude = np.abs(phi) * 60.0 + np.abs(target)

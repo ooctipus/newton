@@ -619,6 +619,8 @@ MF_ROW_ARGUMENTS = {
     "rhs": "mf_rhs",
     "target": "mf_target_velocity",
     "eps": "mf_row_eps",
+    "diag": "mf_diag",
+    "sides": "mf_sides",
     "first": "mf_first",
 }
 """The scenes' names of the :data:`MfRows` fields: the placement's free-body attributes, and the free bodies' region
@@ -1047,12 +1049,8 @@ def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
     six coordinates, ``u_hat`` the walk's enter of ``v_hat`` (:func:`_walked_coordinates`), and its terms' magnitude."""
     incident = solver.placement.body_rows.row_incident.numpy().astype(np.float64)
     Z_a, Z_b = solver.placement.mf_Z_a.numpy().astype(np.float64), solver.placement.mf_Z_b.numpy().astype(np.float64)
-    bodies_a, bodies_b, kinds = (
-        solver.placement.mf_body_a.numpy(),
-        solver.placement.mf_body_b.numpy(),
-        solver.placement.body_rows.row_type.numpy(),
-    )
-    body_art = solver.forest.body_to_articulation.numpy()
+    # Each row's sides: its responding bodies' articulations (one-node trees), -1 for none.
+    sides, kinds = solver.placement.body_rows.row_sides.numpy(), solver.placement.body_rows.row_type.numpy()
     walked, offsets = _walked_coordinates(solver), solver.forest.articulation_world_dof_offset.numpy()
     gaps, terms = np.zeros(incident.shape), np.zeros(incident.shape)
     for world, count in enumerate(solver.placement.mf_constraint_count.numpy()):
@@ -1060,11 +1058,11 @@ def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
             if kinds[world, row] == kernels.PGS_CONSTRAINT_TYPE_SPEED:
                 continue  # A speed row carries no Z.
             term = np.zeros(0)
-            for body, Z in ((bodies_a[world, row], Z_a), (bodies_b[world, row], Z_b)):
-                if body < 0:
+            for art, Z in ((sides[world, row, 0], Z_a), (sides[world, row, 1], Z_b)):
+                if art < 0:
                     continue
                 # The walk's coordinates, by coordinate (not reversed): the walked rows' frame.
-                first = int(offsets[body_art[body]])
+                first = int(offsets[art])
                 term = np.concatenate((term, Z[world, row] * walked[world, first : first + 6]))
             gaps[world, row] = abs(incident[world, row] - term.sum())
             terms[world, row] = np.abs(term).sum()

@@ -95,7 +95,7 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
         slot = int(solver.placement.contact_slot.numpy()[0])
         self.assertGreaterEqual(slot, 0)
-        side = 0 if int(solver.placement.mf_body_a.numpy()[0, slot]) >= 0 else 1
+        side = 0 if int(solver.placement.body_rows.row_sides.numpy()[0, slot][0]) >= 0 else 1
         old_direction = free_body_jacobians(solver)[side][0, slot + 1, :3].copy()
         previous = solver.placement.body_region(solver.placement.ws_prev_dense_impulses).numpy()
         previous[0, slot : slot + 3] = (1.0, 0.5, 0.0)

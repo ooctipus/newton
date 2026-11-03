@@ -284,7 +284,7 @@ class TestAudit(unittest.TestCase):
         count = int(solver.placement.mf_constraint_count.numpy()[0])
         lam = solver.placement.body_rows.impulses.numpy()[0, :count]
         normal = solver.placement.body_rows.row_type.numpy()[0, :count] == 0
-        diagonal = 1.0 / solver.placement.mf_eff_mass_inv.numpy()[0, :count]
+        diagonal = solver.placement.body_rows.diag.numpy()[0, :count]
         compliance = np.sum(0.1 * diagonal[normal] * lam[normal] ** 2)
         self.assertGreater(compliance, 1.0e-6)
         self.assertLess(abs(float(audit["gap"][0])), 0.02 * compliance)

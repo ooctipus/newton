@@ -28,7 +28,7 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
     """
     Z_a = solver.placement.mf_Z_a.numpy() if Z_a is None else np.asarray(Z_a)
     Z_b = solver.placement.mf_Z_b.numpy() if Z_b is None else np.asarray(Z_b)
-    articulation = solver.forest.body_to_articulation.numpy()
+    sides = solver.placement.body_rows.row_sides.numpy()
     row_type = solver.placement.body_rows.row_type.numpy()
     records = solver.factor.walk_view().data.numpy()
     data = unpack_walk_records(records, records.shape[0]).astype(np.float64)
@@ -41,13 +41,13 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
         )
 
     jacobians = []
-    for Z, bodies in ((Z_a, solver.placement.mf_body_a.numpy()), (Z_b, solver.placement.mf_body_b.numpy())):
+    for Z, arts in ((Z_a, sides[..., 0]), (Z_b, sides[..., 1])):
         J = Z.astype(np.float64).copy()
         worlds, rows = np.nonzero(
-            (bodies[:, : Z.shape[1]] >= 0) & (row_type[:, : Z.shape[1]] != PGS_CONSTRAINT_TYPE_SPEED)
+            (arts[:, : Z.shape[1]] >= 0) & (row_type[:, : Z.shape[1]] != PGS_CONSTRAINT_TYPE_SPEED)
         )
         for world, row in zip(worlds, rows, strict=True):
-            J[world, row] = physical(articulation[bodies[world, row]], J[world, row])
+            J[world, row] = physical(arts[world, row], J[world, row])
         jacobians.append(J)
     return tuple(jacobians)
 

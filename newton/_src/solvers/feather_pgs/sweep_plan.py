@@ -1528,7 +1528,6 @@ class Sweep:
                     self.placement.constraint_count,
                     self.placement.dense_phase_bounds,
                     self.placement.mf_constraint_count,
-                    self.forest.body_to_articulation,
                     self.forest.articulation_dof_count,
                 ],
                 device=model.device,

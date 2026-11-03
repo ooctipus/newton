@@ -558,7 +558,6 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
     offsets = forest.articulation_world_dof_offset.numpy()
     starts = forest.articulation_dof_start.numpy()
     art_world = forest.art_to_world.numpy()
-    body_art = forest.body_to_articulation.numpy()
     free = forest.is_free_rigid_host if forest.is_free_rigid is not None else np.zeros(sizes.size, dtype=np.int32)
     slips = factor.walk_view().release.count.numpy()
     dense = bool(placement.packed_dense)
@@ -613,7 +612,7 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
     ball = np.zeros(int(forest.world_count), dtype=bool)
     free_du = {}
     if capture.mf_final is not None:
-        Z_a, Z_b, lam, mf_counts, body_a, body_b, _dof_a, _dof_b, kinds = capture.mf_final
+        Z_a, Z_b, lam, mf_counts, side_a, side_b, _dof_a, _dof_b, kinds = capture.mf_final
         mf_incident = placement.body_rows.row_incident.numpy().astype(np.float64)
         for world, count in enumerate(mf_counts):
             line = int(capture.mf_first[world])
@@ -622,10 +621,10 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
                     ball[world] |= lam[line, row] != 0.0
                     continue
                 term, scale_z, scale_u = 0.0, 0.0, 0.0
-                for body, Z in ((body_a, Z_a), (body_b, Z_b)):
-                    if body[line, row] < 0:
+                for side, Z in ((side_a, Z_a), (side_b, Z_b)):
+                    if side[line, row] < 0:
                         continue
-                    art = int(body_art[body[line, row]])
+                    art = int(side[line, row])
                     z, u_hat = Z[line, row], u_hat_of(art)
                     term += z @ u_hat
                     scale_z, scale_u = scale_z + z @ z, scale_u + u_hat @ u_hat

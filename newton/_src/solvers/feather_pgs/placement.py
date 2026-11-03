@@ -119,6 +119,8 @@ _BODY_RECORDS = (
     "impulses",
     "row_w",
     "row_eps",
+    "diag",
+    "row_sides",
 )
 """The row store's records the free bodies' rows read in their region (:meth:`Placement.body_region`)."""
 
@@ -1083,7 +1085,6 @@ class Placement:
         from .walk_rows import free_body_headers_kernel  # noqa: PLC0415
 
         model = self.model
-        self.mf_eff_mass_inv.zero_()
         wp.launch(
             free_body_headers_kernel,
             dim=self.forest.world_count * self.mf_max_constraints,
@@ -1104,26 +1105,8 @@ class Placement:
                 int(self.laws.set.weighted),
                 int(self.options.contact_compliance),
             ],
-            outputs=[self.mf_eff_mass_inv, self.body_rows.row_w],
+            outputs=[self.body_rows.row_w],
             device=model.device,
-        )
-
-    def free_body_coordinates(self):
-        """Each free-body row's world-relative coordinates, for the sweeps."""
-        wp.launch(
-            response_builds_rows.free_body_coordinates_kernel,
-            dim=self.forest.world_count * self.mf_max_constraints,
-            inputs=[
-                self.dense_first,
-                self.mf_constraint_count,
-                self.mf_body_a,
-                self.mf_body_b,
-                self.forest.body_to_articulation,
-                self.forest.articulation_world_dof_offset,
-                self.mf_max_constraints,
-            ],
-            outputs=[self.mf_dof_a, self.mf_dof_b],
-            device=self.model.device,
         )
 
     def pack_free_body_meta(self) -> None:
@@ -1139,9 +1122,9 @@ class Placement:
             inputs=[
                 self.mf_constraint_count,
                 self.dense_first,
-                self.mf_dof_a,
-                self.mf_dof_b,
-                self.mf_eff_mass_inv,
+                self.forest.articulation_world_dof_offset,
+                self.row_sides,
+                self.diag,
                 self.rhs,
                 self.row_incident,
                 self.row_type,

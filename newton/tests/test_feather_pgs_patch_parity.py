@@ -93,10 +93,9 @@ _MF_ROWS = (
     "body_rows.rhs",
     "body_rows.impulses",
     "body_rows.phi",
+    "body_rows.row_sides",
     "mf_Z_a",
     "mf_Z_b",
-    "mf_body_a",
-    "mf_body_b",
 )
 """The free-body rows' arrays a slot permutation moves: their records (the row store's free-body region) and their
 placement."""

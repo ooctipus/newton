@@ -91,14 +91,15 @@ def _pack_state(has_free_rigid_bodies):
     state = SimpleNamespace(
         pack_mf_meta_kernel=object(),
         model=SimpleNamespace(device="mock-device"),
-        forest=SimpleNamespace(has_free_rigid_bodies=has_free_rigid_bodies, world_count=7),
+        forest=SimpleNamespace(
+            has_free_rigid_bodies=has_free_rigid_bodies, world_count=7, articulation_world_dof_offset=object()
+        ),
     )
     for name in (
         "dense_first",
         "mf_constraint_count",
-        "mf_dof_a",
-        "mf_dof_b",
-        "mf_eff_mass_inv",
+        "row_sides",
+        "diag",
         "rhs",
         "row_incident",
         "row_type",

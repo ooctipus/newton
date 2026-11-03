@@ -442,9 +442,9 @@ def _owner_solver(device, *, anchors, beta=0.0):
         ),
         placement=SimpleNamespace(
             **rows,
-            mf_body_a=ints(worlds, 4),
-            mf_body_b=ints(worlds, 4),
-            body_rows=SimpleNamespace(row_type=ints(worlds, 4)),
+            body_rows=SimpleNamespace(
+                row_type=ints(worlds, 4), row_sides=wp.zeros((worlds, 4), dtype=wp.vec2i, device=device)
+            ),
             unit_source=ints(worlds, ROWS),
             J_by_size={
                 size: wp.zeros((worlds, ROWS, size), dtype=float, device=device) for size in (PRIMARY, SECONDARY)

@@ -50,10 +50,10 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
             device=device,
         )
         mf_count = wp.array([0, 0, 0, 1, 1, 0, 0, 0], dtype=wp.int32, device=device)
-        mf_body_a = wp.full((8, 1), -1, dtype=wp.int32, device=device)
-        mf_body_b = wp.array([[-1], [-1], [-1], [0], [1], [-1], [-1], [-1]], dtype=wp.int32, device=device)
+        # Each free-body row's sides: its responding bodies' articulations (none on side a).
+        b = (-1, -1, -1, 12, 99, -1, -1, -1)
+        mf_sides = wp.array([[(-1, art)] for art in b], dtype=wp.vec2i, device=device)
         mf_row_type = wp.full((8, 1), PGS_CONSTRAINT_TYPE_CONTACT, dtype=wp.int32, device=device)
-        body_to_articulation = wp.array([12, 99], dtype=wp.int32, device=device)
         articulation_dof_count_host = np.full(16, 20, dtype=np.int32)
         articulation_dof_count_host[5] = 7
         articulation_dof_count = wp.array(articulation_dof_count_host, device=device)
@@ -68,9 +68,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
             classify_local_solve_worlds,
             dim=8,
             inputs=[
-                field_group.upload(
-                    MfRows, device, body_a=mf_body_a, body_b=mf_body_b, row_type=mf_row_type, first=row_lines(device)
-                ),
+                field_group.upload(MfRows, device, sides=mf_sides, row_type=mf_row_type, first=row_lines(device)),
                 field_group.upload(
                     LocalOwners,
                     device,
@@ -87,7 +85,6 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 constraint_count,
                 phase_bounds,
                 mf_count,
-                body_to_articulation,
                 articulation_dof_count,
             ],
             device=device,

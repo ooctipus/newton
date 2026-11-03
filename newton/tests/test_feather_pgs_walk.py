@@ -168,15 +168,19 @@ class Capture:
         self.counts = placement.constraint_count.numpy().copy()
         self.mf_final = None
         if self.mf is not None:
+            # Each row's sides (its responding bodies' articulations) and their first world coordinates.
+            sides = placement.body_rows.row_sides.numpy().copy()
+            offsets = solver.forest.articulation_world_dof_offset.numpy()
+            dofs = np.where(sides >= 0, offsets[np.maximum(sides, 0)], -1)
             self.mf_final = (
                 placement.mf_Z_a.numpy().astype(np.float64),
                 placement.mf_Z_b.numpy().astype(np.float64),
                 placement.body_rows.impulses.numpy().astype(np.float64),
                 placement.mf_constraint_count.numpy().copy(),
-                placement.mf_body_a.numpy().copy(),
-                placement.mf_body_b.numpy().copy(),
-                placement.mf_dof_a.numpy().copy(),
-                placement.mf_dof_b.numpy().copy(),
+                sides[..., 0],
+                sides[..., 1],
+                dofs[..., 0],
+                dofs[..., 1],
                 placement.body_rows.row_type.numpy().copy(),
             )
         self.v_hat = solver.v_hat.numpy().astype(np.float64)

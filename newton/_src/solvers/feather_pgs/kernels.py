@@ -1997,8 +1997,9 @@ def free_body_contact_records(
     restitution: float,
     stiffness: float,
 ):
-    """Row ``row`` of free-body contact ``c``'s records at slot ``slot + row`` (:func:`free_body_contact`): its bodies,
-    kind, friction parent, coefficient and gap, restitution and target, and a material contact's rhs and compliance
+    """Row ``row`` of free-body contact ``c``'s records at slot ``slot + row`` (:func:`free_body_contact`): its sides
+    (the responding bodies' articulations, -1 for none), kind, friction parent, coefficient and gap, restitution and
+    target, and a material contact's rhs and compliance
     (:func:`.row_laws.contact_material_rhs`; its tangents take the contact's friction scale), as
     :func:`.row_build.write_contact_row` writes a dense row's. A tangent row folds the row law's beta into its gap
     (matrix-free rows keep no beta)."""
@@ -2007,8 +2008,13 @@ def free_body_contact_records(
     spin = row == CONTACT_SPIN_ROW
     art_a = data.art0[c]
     art_b = data.art1[c]
-    mf.body_a[mf_line, row_idx] = response_body_a
-    mf.body_b[mf_line, row_idx] = response_body_b
+    side_a = int(-1)
+    side_b = int(-1)
+    if response_body_a >= 0:
+        side_a = art_a
+    if response_body_b >= 0:
+        side_b = art_b
+    mf.sides[mf_line, row_idx] = wp.vec2i(side_a, side_b)
     if row == 0:
         mf.row_type[mf_line, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT
         mf.row_parent[mf_line, row_idx] = -1
@@ -2462,8 +2468,7 @@ def populate_rigid_velocity_limit_rows(
             mf.Z_b[mf_line, slot, k] = 0.0
         mf.Z_a[mf_line, slot, 3 * speed_axis] = 1.0
 
-        mf.body_a[mf_line, slot] = body
-        mf.body_b[mf_line, slot] = -1
+        mf.sides[mf_line, slot] = wp.vec2i(art, -1)
         mf.row_type[mf_line, slot] = PGS_CONSTRAINT_TYPE_SPEED
         mf.row_parent[mf_line, slot] = -1
         mf.row_mu[mf_line, slot] = 0.0
@@ -2513,7 +2518,6 @@ def classify_local_solve_worlds(
     world_constraint_count: wp.array[int],
     dense_phase_bounds: wp.array2d[int],
     mf_constraint_count: wp.array[int],
-    body_to_articulation: wp.array[int],
     articulation_dof_count: wp.array[int],
 ):
     """Assign exact solver ownership and compact active general worlds."""
@@ -2529,11 +2533,10 @@ def classify_local_solve_worlds(
     local_mf = mf_count > 0 and mf_count <= owners.residual_mf_max_rows and residual_pair_articulation >= 0
     mf_row = int(0)
     while mf_row < mf_count and local_mf:
-        body_a = mf.body_a[mf_line, mf_row]
-        body_b = mf.body_b[mf_line, mf_row]
-        if body_a >= 0 and body_to_articulation[body_a] != residual_pair_articulation:
+        sides = mf.sides[mf_line, mf_row]
+        if sides[0] >= 0 and sides[0] != residual_pair_articulation:
             local_mf = False
-        if body_b >= 0 and body_to_articulation[body_b] != residual_pair_articulation:
+        if sides[1] >= 0 and sides[1] != residual_pair_articulation:
             local_mf = False
         # The residual local loop does not implement the speed law (projection_laws.speed_row): keep worlds with speed
         # rows on the general owner.

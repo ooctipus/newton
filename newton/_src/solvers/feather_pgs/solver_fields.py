@@ -253,20 +253,16 @@ MF_COUNTERS = FieldGroup(
 """Per-world matrix-free row counts, reservation counter and first rejected slot."""
 
 MF_ROWS = FieldGroup(
-    Field("mf_body_a", wp.int32, ("world", "mf_row"), owner="placement"),
-    Field("mf_body_b", wp.int32, ("world", "mf_row"), owner="placement"),
     Field("mf_Z_a", wp.float32, ("world", "mf_row", 6), owner="placement"),
     Field("mf_Z_b", wp.float32, ("world", "mf_row", 6), owner="placement"),
-    Field("mf_eff_mass_inv", wp.float32, ("world", "mf_row"), owner="placement"),
-    Field("mf_dof_a", wp.int32, ("world", "mf_row"), owner="placement"),
-    Field("mf_dof_b", wp.int32, ("world", "mf_row"), owner="placement"),
     Field("mf_meta_packed", wp.int32, ("world", "mf_meta"), owner="placement"),
 )
-"""The free bodies' placement: each row's bodies and their first coordinates, each side's six entries (the row's
-Jacobian ``J`` as the writers store it, its whitened form ``Z = L^-1 J^T`` once the rows' build has run, ``L`` the
-body's held factor), its inverse effective mass, and the packed header the sweeps read: four ints per row (dof pair,
-inverse effective mass, the residual at zero velocity change, type and parent). The rows' records are the row store's
-(:data:`DENSE_ROWS`, from ``body_base``)."""
+"""The free bodies' placement: each side's six entries (the row's Jacobian ``J`` as the writers store it, its whitened
+form ``Z = L^-1 J^T`` once the rows' build has run, ``L`` the body's held factor; two one-node trees of six), and the
+packed header the sweeps read, which the placement stages each step from the records: four ints per row (dof pair,
+inverse effective mass ``1 / A_ii``, the residual at zero velocity change, type and parent). The rows' records are the
+row store's (:data:`DENSE_ROWS`, from ``body_base``): their sides are their responding bodies' articulations in the
+rows' ``a``/``b`` order (-1 for none) and their ``diag`` the effective mass ``A_ii``."""
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Capacity telemetry

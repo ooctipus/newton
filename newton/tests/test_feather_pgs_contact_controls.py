@@ -253,8 +253,8 @@ def _mf_speculative_rhs(scale: float) -> float:
             field_group.upload(
                 MfRows,
                 "cpu",
-                body_a=[[-1]],
-                body_b=[[-1]],
+                sides=wp.full((1, 1), wp.vec2i(-1, -1), dtype=wp.vec2i, device="cpu"),
+                diag=wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
                 Z_a=np.zeros((1, 1, 6), dtype=np.float32),
                 Z_b=np.zeros((1, 1, 6), dtype=np.float32),
                 phi=[[1.0]],
@@ -280,10 +280,7 @@ def _mf_speculative_rhs(scale: float) -> float:
             0,
             0,
         ],
-        outputs=[
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
-        ],
+        outputs=[wp.zeros((1, 1), dtype=wp.float32, device="cpu")],
         device="cpu",
     )
     return float(rhs.numpy()[0, 0])

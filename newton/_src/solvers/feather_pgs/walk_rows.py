@@ -171,6 +171,15 @@ def write_free_body_rows(
             )
 
 
+@wp.func
+def side_body(walk: WalkTrees, art: int) -> int:
+    """A free-body row side's body: its articulation's (a one-node tree's) first coordinate's, -1 for no side."""
+    body = int(-1)
+    if art >= 0:
+        body = walk.dof_body[walk.dof_start[art]]
+    return body
+
+
 @wp.kernel(enable_backward=False)
 def free_body_headers_kernel(
     mf: MfRows,
@@ -189,27 +198,26 @@ def free_body_headers_kernel(
     weighted: int,
     material: int,
     # outputs
-    mf_eff_mass_inv: wp.array2d[float],
     mf_row_w: wp.array2d[float],
 ):
     """The walked free-body rows' build, one thread per row slot: each row's header
     (:func:`.response_builds_rows.free_body_row_header`) from the incident velocity its walks summed
     (:func:`write_free_body_rows`) and its diagonal ``A_ii = cfm + |Z_a|^2 + |Z_b|^2``. A speed row keeps its axis
     ``e_k`` unwhitened (its law reads the body's velocity, :meth:`.response_operator.FreeBodyZ.speed`): its diagonal
-    takes the walk of the covector ``e_k``, ``|L^-1 P e_k|^2``, and its incident is zero."""
+    takes the walk of the covector ``e_k``, ``|L^-1 P e_k|^2``, and its incident is zero. A side is its responding
+    body's articulation, a one-node tree whose body is its first coordinate's."""
     tid = wp.tid()
     world = tid // mf_max_constraints
     i = tid % mf_max_constraints
     if i >= mf_constraint_count[world]:
         return
     line = mf.first[world]
-    body_a = mf.body_a[line, i]
-    body_b = mf.body_b[line, i]
+    sides = mf.sides[line, i]
     diagonal = pgs_cfm
     incident = float(0.0)
     if mf.row_type[line, i] == PGS_CONSTRAINT_TYPE_SPEED:
-        if body_a >= 0:
-            art = walk.body_art[body_a]
+        if sides[0] >= 0:
+            art = sides[0]
             j0 = walk.joint_start[art]
             d0 = walk.dof_start[art]
             k = int(0)
@@ -235,25 +243,24 @@ def free_body_headers_kernel(
             diagonal += seed[1]
     else:
         incident = mf.incident[line, i]
-        if body_a >= 0:
+        if sides[0] >= 0:
             squares = float(0.0)
             for k in range(6):
                 squares += mf.Z_a[line, i, k] * mf.Z_a[line, i, k]
             diagonal += squares
-        if body_b >= 0:
+        if sides[1] >= 0:
             squares = float(0.0)
             for k in range(6):
                 squares += mf.Z_b[line, i, k] * mf.Z_b[line, i, k]
             diagonal += squares
-    inverse = float(0.0)
-    if diagonal > 0.0:
-        inverse = 1.0 / diagonal
     free_body_row_header(
         mf,
         line,
         i,
+        side_body(walk, sides[0]),
+        side_body(walk, sides[1]),
         incident,
-        inverse,
+        diagonal,
         has_target_velocity,
         rigid_body_max_depenetration_velocity,
         pgs_beta,
@@ -263,7 +270,6 @@ def free_body_headers_kernel(
         restitution_velocity_threshold,
         weighted,
         material,
-        mf_eff_mass_inv,
         mf_row_w,
     )
 

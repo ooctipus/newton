@@ -7,9 +7,9 @@ The rows are the walk's (:mod:`.walk_rows`: the one writer walks every row's see
 module holds what is built around them:
 
 - the free-body rows (:class:`.response_operator.FreeBodyZ`, rows over at most two free bodies): each row's header
-  (:func:`free_body_row_header`: ``1 / A_ii``, ``rhs`` and the row's weight from its incident velocity), its bodies'
-  coordinates in the addressing a mapping reads (:func:`free_body_coordinates_kernel`) and the packed row word
-  (:func:`free_body_meta_kernel`, which :meth:`.FreeBodyZ.consume` decodes);
+  (:func:`free_body_row_header`: ``A_ii``, ``rhs`` and the row's weight from its incident velocity) and the packed row
+  word (:func:`free_body_meta_kernel`, which :meth:`.FreeBodyZ.consume` decodes: its sides' coordinates, ``1 /
+  A_ii``);
 - the bilateral closure (:func:`close_block`, :func:`close_row`, :func:`seed_blocks_kernel`), the Schur transform the
   one writer's block phase applies to fold a world's bilateral block into the responses of its other rows;
 - the paired factor rows' qualification (:func:`paired_components_kernel`).
@@ -57,14 +57,6 @@ from .solver_fields import Preelim
 # velocities in factor coordinates ``u = L^T dv``. A body's six velocity coordinates start at its articulation's first
 # coordinate, in the addressing the mapping reads: global (``articulation_dof_start``) or world
 # (``articulation_world_dof_offset``).
-
-
-@wp.func
-def body_coordinate(body: int, body_to_articulation: wp.array[int], first: wp.array[int]) -> int:
-    """The first velocity coordinate of ``body`` in the addressing ``first`` (per articulation), -1 for no body."""
-    if body < 0:
-        return -1
-    return first[body_to_articulation[body]]
 
 
 @wp.func
@@ -119,8 +111,10 @@ def free_body_row_header(
     mf: MfRows,
     line: int,
     i: int,
+    body_a: int,
+    body_b: int,
     incident: float,
-    inverse: float,
+    diagonal: float,
     has_target_velocity: int,
     rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_beta: float,
@@ -130,16 +124,15 @@ def free_body_row_header(
     restitution_velocity_threshold: float,
     weighted: int,
     material: int,
-    mf_eff_mass_inv: wp.array2d[float],
     weights: wp.array2d[float],
 ):
-    """Free-body row ``i``'s header from its incident velocity ``J v_hat`` and stored inverse diagonal ``1 / A_ii``:
-    both stored, then its ``rhs`` (:func:`free_body_row_rhs`). ``weighted`` rows store their relative regularization
+    """Free-body row ``i``'s header (its responding bodies ``body_a``, ``body_b``) from its incident velocity ``J v_hat``
+    and its diagonal ``A_ii``: both stored, then its ``rhs`` (:func:`free_body_row_rhs`). ``weighted`` rows store their relative regularization
     weight (in ``weights``: the row store's free-body region); a material contact (``material``: its writer stored its
     rhs and compliance ``eps``) keeps its rhs."""
     row_type = mf.row_type[line, i]
     mf.incident[line, i] = incident
-    mf_eff_mass_inv[line, i] = inverse
+    mf.diag[line, i] = diagonal
     if material != 0 and row_type == PGS_CONSTRAINT_TYPE_CONTACT:
         if mf.eps[line, i] > 0.0:
             return
@@ -147,8 +140,8 @@ def free_body_row_header(
     if has_target_velocity != 0:
         target = mf.target[line, i]
     rhs, row_w = free_body_row_rhs(
-        mf.body_a[line, i],
-        mf.body_b[line, i],
+        body_a,
+        body_b,
         row_type,
         mf.phi[line, i],
         target,
@@ -166,52 +159,31 @@ def free_body_row_header(
         weights[line, i] = row_w
 
 
-@wp.kernel(enable_backward=False)
-def free_body_coordinates_kernel(
-    first: wp.array[int],
-    mf_constraint_count: wp.array[int],
-    mf_body_a: wp.array2d[int],
-    mf_body_b: wp.array2d[int],
-    body_to_articulation: wp.array[int],
-    articulation_world_dof_offset: wp.array[int],
-    mf_max_constraints: int,
-    # outputs
-    mf_dof_a: wp.array2d[int],
-    mf_dof_b: wp.array2d[int],
-):
-    """Give each row its bodies' first world coordinates (:func:`body_coordinate`), one thread per row slot."""
-    tid = wp.tid()
-    world = tid // mf_max_constraints
-    c = tid % mf_max_constraints
-    if c >= mf_constraint_count[world]:
-        return
-    mf_line = first[world]
-    mf_dof_a[mf_line, c] = body_coordinate(mf_body_a[mf_line, c], body_to_articulation, articulation_world_dof_offset)
-    mf_dof_b[mf_line, c] = body_coordinate(mf_body_b[mf_line, c], body_to_articulation, articulation_world_dof_offset)
-
-
 @cache
 def free_body_meta_kernel(mf_max_constraints: int, pitch: int, base: int, device_arch: str) -> wp.Kernel:
     """Pack each world's free-body rows into the 128-bit word the matrix-free sweeps load (:meth:`.FreeBodyZ.pack`).
 
     A warp per world (``wp.launch_tiled`` over the worlds, 32 threads; one thread on the CPU), a lane per row; the
-    word holds the rows' world coordinates, stored inverse diagonal, right-hand side (the law's plus the row's incident
-    velocity: its residual at ``du = 0``), type and parent. The records are the row store's (``pitch`` rows a line,
-    the free bodies' from ``base``). ``device_arch`` keys the variant.
+    word holds the rows' sides' first world coordinates (``world_dof_offset`` of their articulations), the inverse of
+    their stored diagonal ``A_ii`` (the step's form of the law, cached in the header), right-hand side (the law's plus
+    the row's incident velocity: its residual at ``du = 0``), type and parent. The records are the row store's
+    (``pitch`` rows a line, the free bodies' from ``base``). ``device_arch`` keys the variant.
     """
     _validate_mf_metadata_encoding(mf_max_constraints)
-    word = FreeBodyZ().pack("packed", "da", "db", "diag", "rhs_val", "rt", "par", "        ")
+    word = FreeBodyZ().pack("packed", "da", "db", "inverse", "rhs_val", "rt", "par", "        ")
     body = f"""    int m_mf = mf_constraint_count.data[world];
     const int mf_line = first.data[world];
     __builtin_assume(mf_line >= 0);
-    int off_mf = mf_line * {mf_max_constraints};
-    int off_meta = off_mf * 4;
+    int off_meta = mf_line * {mf_max_constraints * 4};
     const int off_body = mf_line * {pitch} + {base};
 
     for (int i = LANE; i < m_mf; i += STRIDE) {{
-        int da = mf_dof_a.data[off_mf + i];
-        int db = mf_dof_b.data[off_mf + i];
-        float diag = mf_eff_mass_inv.data[off_mf + i];
+        const wp::vec2i sides = row_sides.data[off_body + i];
+        int da = sides.c[0] >= 0 ? world_dof_offset.data[sides.c[0]] : -1;
+        int db = sides.c[1] >= 0 ? world_dof_offset.data[sides.c[1]] : -1;
+        const float A = diag.data[off_body + i];
+        float inverse = 0.0f;
+        if (A > 0.0f) inverse = 1.0f / A;
         float rhs_val = rhs.data[off_body + i] + row_incident.data[off_body + i];
         int rt = row_type.data[off_body + i];
         int par = row_parent.data[off_body + i];
@@ -225,9 +197,9 @@ def free_body_meta_kernel(mf_max_constraints: int, pitch: int, base: int, device
         kernel_template.params(
             ("mf_constraint_count", wp.array[int]),
             ("first", wp.array[int]),
-            ("mf_dof_a", wp.array2d[int]),
-            ("mf_dof_b", wp.array2d[int]),
-            ("mf_eff_mass_inv", wp.array2d[float]),
+            ("world_dof_offset", wp.array[int]),
+            ("row_sides", wp.array2d[wp.vec2i]),
+            ("diag", wp.array2d[float]),
             ("rhs", wp.array2d[float]),
             ("row_incident", wp.array2d[float]),
             ("row_type", wp.array2d[int]),

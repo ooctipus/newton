@@ -82,9 +82,9 @@ class TestFreeBodyZBuild(unittest.TestCase):
         np.testing.assert_allclose(L @ L.T, H, rtol=1e-5, atol=1e-6)
         # The box is each row's one body (the ground has none): its side's Jacobian.
         J_a, J_b = (J[0, :rows] for J in free_body_jacobians(solver))
-        J = np.where((solver.placement.mf_body_a.numpy()[0, :rows] >= 0)[:, None], J_a, J_b)
+        J = np.where((solver.placement.body_rows.row_sides.numpy()[0, :rows, 0] >= 0)[:, None], J_a, J_b)
         expected = np.einsum("ri,ij,rj->r", J, np.linalg.inv(H), J) + solver.options.pgs_cfm
-        np.testing.assert_allclose(1.0 / solver.placement.mf_eff_mass_inv.numpy()[0, :rows], expected, rtol=1e-5)
+        np.testing.assert_allclose(solver.placement.body_rows.diag.numpy()[0, :rows], expected, rtol=1e-5)
 
 
 def _walk_records(rng, trees, size):

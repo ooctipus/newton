@@ -1186,15 +1186,11 @@ class SolverFeatherPGS(SolverBase):
             else:
                 self.laws.write_rhs(self, dt)
 
-        # MF: whiten the rows (Z = L^-1 J^T), their mf_rhs, mf_eff_mass_inv and incident velocities
+        # The free bodies' rows' headers: their diagonals A_ii, rhs and incident velocities.
         if self.forest.has_free_rigid_bodies:
             with wp.ScopedTimer("S4_MF_Setup", print=False, use_nvtx=self._nvtx, synchronize=False):
                 with self._sync_timed("s4_mf_setup"):
                     self.placement.whiten_free_bodies(self.v_hat, dt)
-
-                # MF: compute world-relative DOF offsets for two-phase GS kernel
-                with self._sync_timed("s4_mf_dof_offsets"):
-                    self.placement.free_body_coordinates()
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 5+6: PGS solve

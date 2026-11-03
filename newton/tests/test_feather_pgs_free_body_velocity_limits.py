@@ -227,6 +227,12 @@ def _step(run):
     return state_1.joint_qd.numpy()[run.dofs]
 
 
+def _inverse(diagonal):
+    """``1 / A_ii`` where ``A_ii > 0``, else zero: the free-body header's inverse (float32)."""
+    diagonal = np.asarray(diagonal, np.float32)
+    return np.where(diagonal > 0.0, np.float32(1.0) / np.where(diagonal > 0.0, diagonal, np.float32(1.0)), 0.0)
+
+
 def _free_body_rows(run):
     """Return each world's free-body row types, axes, signs, right-hand sides and impulses: [world, row].
 
@@ -244,7 +250,8 @@ def _free_body_rows(run):
         axis=axis,
         sign=np.sign(np.take_along_axis(jacobian, axis[..., None], axis=2)[..., 0]),
         rhs=solver.placement.body_rows.rhs.numpy()[:, :rows],
-        eff_mass_inv=solver.placement.mf_eff_mass_inv.numpy()[:, :rows],
+        # The step's inverse of each row's effective mass, as its header caches it.
+        eff_mass_inv=_inverse(solver.placement.body_rows.diag.numpy()[:, :rows]),
         impulses=solver.placement.body_rows.impulses.numpy()[:, :rows],
     )
 

@@ -277,17 +277,16 @@ def walked_side(
     Z: wp.array3d[float],
     line: int,
     row: int,
-    body: int,
-    walk: WalkTrees,
+    art: int,
     world: int,
     world_offset: wp.array[int],
     coordinates: wp.array2d[float],
 ) -> float:
-    """``Z_side^T u``: one side of a walked free-body row over the walk's coordinates of the published velocity
-    (:func:`.tree_factor.walk_enter_kernel`)."""
-    if body < 0:
+    """``Z_side^T u``: one side (articulation ``art``, -1 for none) of a walked free-body row over the walk's
+    coordinates of the published velocity (:func:`.tree_factor.walk_enter_kernel`)."""
+    if art < 0:
         return 0.0
-    start = world_offset[walk.body_art[body]]
+    start = world_offset[art]
     out = float(0.0)
     for k in range(6):
         out += Z[line, row, k] * coordinates[world, start + k]
@@ -301,7 +300,6 @@ def free_rows(
     walk: WalkTrees,
     impulses: wp.array2d[float],
     weights: wp.array2d[float],
-    inverse_diagonals: wp.array2d[float],
     v: wp.array[float],
     world_offset: wp.array[int],
     coordinates: wp.array2d[float],
@@ -314,24 +312,24 @@ def free_rows(
     line = mf.first[world]
     for i in range(a.mf_counts[world]):
         kind = mf.row_type[line, i]
-        body = mf.body_a[line, i]
+        sides = mf.sides[line, i]
         if kind == ROW_SPEED:
-            start = walk.dof_start[walk.body_art[body]]
+            start = walk.dof_start[sides[0]]
             if mf.Z_a[line, i, 3] != 0.0:
                 start += 3
             velocity[world, i] = -wp.length(wp.vec3(v[start], v[start + 1], v[start + 2]))
             continue
-        term = walked_side(mf.Z_a, line, i, body, walk, world, world_offset, coordinates)
-        term += walked_side(mf.Z_b, line, i, mf.body_b[line, i], walk, world, world_offset, coordinates)
-        inverse = inverse_diagonals[line, i]
-        if inverse > 0.0:
+        term = walked_side(mf.Z_a, line, i, sides[0], world, world_offset, coordinates)
+        term += walked_side(mf.Z_b, line, i, sides[1], world, world_offset, coordinates)
+        diagonal = mf.diag[line, i]
+        if diagonal > 0.0:
             weight = float(1.0)
             if a.weighted != 0:
                 weight = weights[line, i]
             eps = float(0.0)
             if a.material != 0:
                 eps = mf.eps[line, i]
-            term += row_compliance(kind, weight, eps, 1.0 / inverse) * impulses[line, i]
+            term += row_compliance(kind, weight, eps, diagonal) * impulses[line, i]
         velocity[world, i] = term
 
 
@@ -561,7 +559,6 @@ class Audit:
                 solver.factor.walk_view(),
                 solver.placement.body_rows.impulses,
                 solver.placement.body_rows.row_w,
-                solver.placement.mf_eff_mass_inv,
                 v,
                 forest.articulation_world_dof_offset,
                 self.coordinates,

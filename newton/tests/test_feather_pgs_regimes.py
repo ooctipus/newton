@@ -691,9 +691,8 @@ class TestQ11Stack(unittest.TestCase):
         counts = int(solver.placement.mf_constraint_count.numpy()[0])
         lam = solver.placement.body_rows.impulses.numpy()[0, :counts]
         kinds = solver.placement.body_rows.row_type.numpy()[0, :counts]
-        body_b = solver.placement.mf_body_b.numpy()[0, :counts]
-        body_a = solver.placement.mf_body_a.numpy()[0, :counts]
-        ground = (kinds == 0) & ((body_a < 0) | (body_b < 0))
+        sides = solver.placement.body_rows.row_sides.numpy()[0, :counts]
+        ground = (kinds == 0) & ((sides[:, 0] < 0) | (sides[:, 1] < 0))
         return float(np.sum(lam[ground])) / (H * mass * G0 * count), float(state.body_q.numpy()[-1, 2]) - (
             half + 2.0 * half * (count - 1)
         )
@@ -1403,7 +1402,7 @@ class Manufactured:
         impulses, through the stated rows, move the contact points from where the step's ``v+`` put them. Never
         ``lambda`` against ``lambda*``: a pattern that leaves it open admits any split."""
         rows = solver.placement
-        stores = rows.impulses.numpy().astype(np.float64), rows.mf_impulses.numpy().astype(np.float64)
+        stores = rows.impulses.numpy().astype(np.float64), rows.body_rows.impulses.numpy().astype(np.float64)
         held = self._held(solver)
         if any(h is None for h in held):
             return None
