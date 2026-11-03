@@ -906,7 +906,7 @@ class TreeFactor:
             self.walk_half_host[c + lin : c + lin + ang] = WALK_BOTH if two else WALK_ANGULAR
         both = self.two_halves(np.flatnonzero(np.repeat(walked[: kinds.size], np.diff(qd_start[: kinds.size + 1]))))
         # The walking classes: each held tree's topology, which the step's one leave (walk_leave_kernel) and the
-        # thread-a-tree refresh (walk_step_class_kernel) emit as its walk, and each articulation's class among them.
+        # predictor's solve emit as its walk, and each articulation's class among them.
         classes: dict[WalkClass, int] = {}
         walk_class = np.full(max(int(model.articulation_count), 1), -1, dtype=np.int32)
         for art in arts.tolist():
@@ -927,9 +927,6 @@ class TreeFactor:
         walked = int(np.count_nonzero(sizes > 1)) or int(arts.size)
         self.walk_lanes = walk_group(bodies, held, walked, device.sm_count) if device.is_cuda else 1
         self.walk_block = WALK_BLOCK
-        # The refresh runs a thread a tree with the class compiled in where the classes' data choose it
-        # (walk_schedule), else the lane feed's batches.
-        self.walk_thread = device.is_cuda and walk_schedule(self.walk_classes, walked, device.sm_count)
         self.walk_path = wp.array(path, dtype=wp.vec2i, device=device)
         self.walk_joins = wp.array(joins, dtype=wp.int32, device=device)
         self.walk_path_host = path
@@ -1048,34 +1045,6 @@ class TreeFactor:
         if self.walk_arts is None:
             return
         model = self.model
-        if self.walk_thread:
-            wp.launch(
-                walk_step_class_kernel(self.walk_classes),
-                dim=self.walk_arts.shape[0],
-                inputs=[
-                    self.walk_arts,
-                    self.walk_class,
-                    self.mass_update_mask,
-                    model.articulation_start,
-                    self.forest.articulation_joint_end,
-                    model.joint_child,
-                    model.joint_qd_start,
-                    state.body_q,
-                    model.body_mass,
-                    model.body_inertia,
-                    self.dof_armature,
-                    self.drive_row_by_dof,
-                    self.aug_row_K if self.parallel_drives else self._arrays.placeholder(wp.float32),
-                    self.walk_now,
-                    self.walk_now_link,
-                    self.joint_com_offset,
-                    self.articulation_origin,
-                ],
-                outputs=[self.walk_data, self.walk_link, self.walk_origin],
-                block_dim=WALK_BLOCK,
-                device=model.device,
-            )
-            return
         lanes = self.walk_lanes
         wp.launch(
             walk_step_kernel,
@@ -3388,38 +3357,6 @@ def walk_group(bodies: int, joins: int, trees: int, sms: int) -> int:
     return lanes
 
 
-def walk_schedule(classes: tuple[WalkClass, ...], trees: int, sms: int) -> bool:
-    """Whether the refresh runs a thread a tree with each class's topology compiled in (WM's A7r) rather than the lane
-    feed's batches, from the classes' data: every class small enough that one thread's walk (its coordinates in
-    straight-line code) is shorter than the group's batches, against the trees in flight: at least a warp of trees
-    a multiprocessor (:data:`WALK_THREAD_TREES`).
-
-    Args:
-        classes: The walking classes.
-        trees: The trees the launch walks.
-        sms: The device's multiprocessors.
-    """
-    if not classes or len(classes) > WALK_THREAD_CLASSES:
-        return False
-    if trees < sms * WALK_THREAD_TREES:
-        return False
-    return max(walk.coordinates for walk in classes) <= WALK_THREAD_COORDINATES
-
-
-WALK_THREAD_COORDINATES = 0
-"""The most coordinates of a class whose refresh runs a thread a tree. Measured on the PRO at 16,384 trees with the
-step's geometry kept as the lane-strided loop (one thread then walks its tree's joints through the generic joint
-branches): a thread a tree is 1.3-2.0x slower than the lane feed on cartpole (2 coordinates), franka-reach (9),
-franka, allegro, kuka and g1, its geometry half alone 1.3-2.6x slower. WM's A7r, which wins up to about 22, compiles
-the geometry in as well; no class qualifies until the geometry half leaves this kernel."""
-
-WALK_THREAD_CLASSES = 4
-"""The most classes one thread-a-tree launch compiles in (a switch over them)."""
-
-WALK_THREAD_TREES = 32
-"""Trees a multiprocessor at least, one warp's worth, for a thread a tree: with fewer, the group's lanes spread a
-tree's work over the device's idle threads."""
-
 WALK_RESIDENT = 512
 """Threads of :func:`walk_step_kernel` one multiprocessor holds: its 125-127 registers (``kernel_sass``, sm_120 and
 sm_103) leave 16 warps an SM."""
@@ -3430,8 +3367,8 @@ WALK_BLOCK = 64
 
 _REFRESH = """    // The refresh's arithmetic on one tree, float32 (TreeWalk's inward pass, on the factor's diagonal), at the step's
     // geometry the finish published, each coordinate's column in now and each body's link and frame point in
-    // now_link: on a refresh they become the factor's frames. A schedule (the lane feed's batches, or a thread a tree
-    // with the class's topology compiled in) runs it leaf first; the chain's state is the articulated inertia h,
+    // now_link: on a refresh they become the factor's frames. The lane feed's batches run it leaf first; the chain's
+    // state is the articulated inertia h,
     // symmetric (A 00 01 02 11 12 22, B row-major 3x3, D 00 01 02 11 12 22), in registers.
     //   BODY(j, up, r): body j's inertia at its frame [m 1, -m X; m X, R I R^T - m X X] (X the skew of c, its centre of
     //     mass less its frame, both as the finish published them in now_com and now_link) as words m, m c, rot, and
@@ -3704,44 +3641,6 @@ _INWARD = (
 """
 )
 
-_INWARD_CLASS_JOINT = """{
-    LIFT($V, body$b + OFFSET);
-    for (int k = 0; k < 21; ++k) $P[k] += $V[k];
-}"""
-_INWARD_CLASS_BEGIN = """float body$b[INERTIA];
-BODY(j0 + $b, $up >= 0 ? j0 + $up : -1, body$b);
-ADD($V, body$b, true);"""
-_INWARD_CLASS_STEP = """{
-    float s[8];
-    COLUMN(dof0 + $c, s);
-    STEP($V, s, dof0 + $c);
-}"""
-
-
-def _walk_inward_class_text(classes: tuple[WalkClass, ...], cuda: bool) -> str:
-    """The refresh by a thread a tree with each class's topology compiled in (:meth:`WalkClass.walk`, leaf first):
-    each body's state an array of constant indices (registers), the lift into its parent's a register add."""
-    walks = [
-        walk.walk(
-            _INWARD_CLASS_JOINT, _INWARD_CLASS_STEP, begin=_INWARD_CLASS_BEGIN, root_first=False, width=21, cuda=cuda
-        )
-        for walk in classes
-    ]
-    cases = "\n".join(f"case {k}: {{\n{indent_text(text, 4)}\n    break;\n}}" for k, text in enumerate(walks))
-    return f"""    // The refresh by a thread a tree, the class's topology compiled in (WalkClass.walk, leaf first): every line the
-    // tree reads is prefetched first, then the class's straight-line walk runs BODY, ADD, STEP and LIFT with constant
-    // indices, each body's state in registers, a parent gathering its children's lifted inertias.
-    for (int j = j0; j < j1; ++j) AHEAD(j);
-    for (int c = dof0; c < dof1; ++c) {{
-        PREFETCH(Nw + $now * c);
-        PREFETCH(Ra + c);
-        PREFETCH(Dr + c);
-    }}
-    switch (cls) {{
-{indent_text(cases, 4)}
-    }}
-"""
-
 
 @functools.cache
 def _walk_inward_snippet() -> str:
@@ -3848,98 +3747,3 @@ def walk_step_kernel(
     )
     if lane == 0:
         walk_origin[art] = articulation_origin[art]
-
-
-@functools.cache
-def walk_step_class_kernel(classes: tuple[WalkClass, ...]) -> wp.Kernel:
-    """The walk's refresh for trees of ``classes`` by a thread a tree (WM's A7r), on the trees the refresh just
-    factored, at the step's geometry the finish published: the refresh with each class's topology compiled in (:func:`_walk_inward_class_text`): ``walk_class[art]`` indexes ``classes``. Chosen by
-    :func:`walk_schedule` from the classes' data."""
-    from .device_preludes import CPU_MATH, dual_native, lane_group  # noqa: PLC0415
-
-    tag = hashlib.sha256(repr(classes).encode()).hexdigest()[:8]
-    snippet = dual_native(
-        substitute(
-            _REFRESH + _walk_inward_class_text(classes, True),
-            coordinate=WALK_COORDINATE,
-            link=WALK_LINK,
-            now=WALK_NOW,
-            frame=WALK_FRAME,
-        ),
-        preludes=(lane_group(1), CPU_MATH),
-    )
-
-    def inward(
-        cls: int,
-        j0: int,
-        j1: int,
-        dof0: int,
-        dof1: int,
-        now: wp.array2d[float],
-        now_link: wp.array2d[float],
-        now_com: wp.array[wp.vec3],
-        armature: wp.array[float],
-        drive_row_by_dof: wp.array[int],
-        row_K: wp.array[float],
-        joint_child: wp.array[int],
-        body_q: wp.array[wp.transform],
-        body_mass: wp.array[float],
-        body_inertia: wp.array[wp.mat33],
-        link: wp.array2d[float],
-        data: wp.array2d[float],
-    ): ...
-
-    inward.__name__ = inward.__qualname__ = f"walk_inward_class_{tag}"
-    inward = wp.func_native(snippet)(inward)
-
-    def kernel(
-        arts: wp.array[int],
-        walk_class: wp.array[int],
-        mass_update_mask: wp.array[int],
-        articulation_start: wp.array[int],
-        articulation_joint_end: wp.array[int],
-        joint_child: wp.array[int],
-        joint_qd_start: wp.array[int],
-        body_q: wp.array[wp.transform],
-        body_mass: wp.array[float],
-        body_inertia: wp.array[wp.mat33],
-        armature: wp.array[float],
-        drive_row_by_dof: wp.array[int],
-        row_K: wp.array[float],
-        walk_now: wp.array2d[float],
-        walk_now_link: wp.array2d[float],
-        walk_now_com: wp.array[wp.vec3],
-        articulation_origin: wp.array[wp.vec3],
-        walk_data: wp.array2d[float],
-        walk_link: wp.array2d[float],
-        walk_origin: wp.array[wp.vec3],
-    ):
-        tree = wp.tid()
-        art = arts[tree]
-        if mass_update_mask[art] == 0:
-            return
-        j0 = articulation_start[art]
-        j1 = articulation_joint_end[art]
-        inward(
-            walk_class[art],
-            j0,
-            j1,
-            joint_qd_start[j0],
-            joint_qd_start[j1],
-            walk_now,
-            walk_now_link,
-            walk_now_com,
-            armature,
-            drive_row_by_dof,
-            row_K,
-            joint_child,
-            body_q,
-            body_mass,
-            body_inertia,
-            walk_link,
-            walk_data,
-        )
-        walk_origin[art] = articulation_origin[art]
-
-    kernel.__name__ = kernel.__qualname__ = f"walk_step_class_{tag}"
-    return wp.kernel(enable_backward=False, module="unique")(kernel)
