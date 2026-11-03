@@ -447,7 +447,7 @@ class TestFeatherPGSContactControls(unittest.TestCase):
             dim=1,
             inputs=[
                 row_lines(device),
-                row_lines(device),
+                0,
                 field_group.upload(
                     ContactRoutes,
                     device,
@@ -458,11 +458,8 @@ class TestFeatherPGSContactControls(unittest.TestCase):
                     path=integers,
                 ),
                 poisoned,
-                poisoned,
                 integers,
                 integers,
-                row_metadata,
-                row_metadata,
                 row_metadata,
                 row_metadata,
                 1,

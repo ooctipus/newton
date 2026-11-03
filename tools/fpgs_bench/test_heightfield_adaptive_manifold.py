@@ -459,7 +459,7 @@ class TestAdaptiveManifold(unittest.TestCase):
                     total = int(scene.solver.placement.constraint_count.numpy()[0])
                     row_types = scene.solver.placement.row_type.numpy()[0, :total]
                     mf_total = int(scene.solver.placement.mf_constraint_count.numpy()[0])
-                    mf_types = scene.solver.placement.mf_row_type.numpy()[0, :mf_total]
+                    mf_types = scene.solver.placement.body_rows.row_type.numpy()[0, :mf_total]
                     count_records.append(
                         {
                             "raw": int(scene.contacts.rigid_contact_count.numpy()[0]),
@@ -487,9 +487,9 @@ class TestAdaptiveManifold(unittest.TestCase):
                     )
                     mf = cone_diagnostic(
                         mf_types,
-                        scene.solver.placement.mf_row_parent.numpy()[0, :mf_total],
-                        scene.solver.placement.mf_row_mu.numpy()[0, :mf_total],
-                        scene.solver.placement.mf_impulses.numpy()[0, :mf_total],
+                        scene.solver.placement.body_rows.row_parent.numpy()[0, :mf_total],
+                        scene.solver.placement.body_rows.row_mu.numpy()[0, :mf_total],
+                        scene.solver.placement.body_rows.impulses.numpy()[0, :mf_total],
                     )
                     law_records.append(
                         {

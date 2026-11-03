@@ -614,7 +614,7 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
     free_du = {}
     if capture.mf_final is not None:
         Z_a, Z_b, lam, mf_counts, body_a, body_b, _dof_a, _dof_b, kinds = capture.mf_final
-        mf_incident = placement.mf_row_incident.numpy().astype(np.float64)
+        mf_incident = placement.body_rows.row_incident.numpy().astype(np.float64)
         for world, count in enumerate(mf_counts):
             line = int(capture.mf_first[world])
             for row in range(int(count)):

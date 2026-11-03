@@ -646,13 +646,45 @@ def _patch_ring_rows(seed, *, worlds, dense_capacity, mf_capacity, dofs, velocit
     return host
 
 
+_STORE = {
+    "world_row_type": None,
+    "world_row_parent": None,
+    "world_row_mu": "mf_row_mu",
+    "rhs_bias": None,
+    "row_incident": None,
+    "world_diag": None,
+    "world_row_w": "mf_row_w",
+    "world_impulses": "mf_impulses",
+    "row_sides": None,
+}
+"""The row store's records and, where the free bodies' rows hold values, their free-body arrays of the host."""
+
+
+def _store(host):
+    """The host's rows in one row store: each world's line holds the dense rows, then the free bodies' from the dense
+    capacity (:mod:`.dense_rows`). The free-body records the sweep reads (``mf_impulses``, ``mf_row_mu``, ``mf_row_w``)
+    are the store's."""
+    stored = dict(host)
+    body = host["mf_impulses"].shape[1]
+    for name, free in _STORE.items():
+        dense = host[name]
+        region = np.zeros((dense.shape[0], body, *dense.shape[2:]), dense.dtype) if free is None else host[free]
+        stored[name] = np.concatenate((dense, region), axis=1)
+    for name, free in _STORE.items():
+        if free is not None:
+            stored[free] = stored[name]
+    return stored
+
+
 def _bind_rows(host, device):
-    """Bind the operands as the MF-GS launch takes them, with neutral queue and owner inputs."""
+    """Bind the operands as the MF-GS launch takes them (one row store, :func:`_store`), with neutral queue and owner
+    inputs."""
 
     def array(value):
         dtype = wp.int32 if value.dtype == np.int32 else wp.float32
         return wp.array(np.ascontiguousarray(value), dtype=dtype, device=device)
 
+    host = _store(host)
     worlds = len(host["world_constraint_count"])
     # Arrays bind as arrays; the scalars (packed_dense) pass as they are.
     values = {
@@ -777,7 +809,7 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                         )
                 if launch is launches[0]:
                     # The fixture exercises the rings: the full sweep loads tangent rows and moves impulses.
-                    impulses = banks[0]["world_impulses"].numpy()
+                    impulses = banks[0]["world_impulses"].numpy()[:, :dense_capacity]
                     tangents = host["world_row_type"] == PGS_CONSTRAINT_TYPE_FRICTION
                     self.assertFalse(np.array_equal(impulses, host["world_impulses"]), name)
                     self.assertTrue(np.any(impulses[tangents] != 0.0), name)
@@ -834,13 +866,13 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         self.assertNotEqual(step, np.float32(4.0))
 
         def diagonal(outside):
-            """The worlds' diagonals with ``outside`` past each world's row and before the first world's."""
-            padded = np.full(host["world_diag"].size + 1, outside, np.float32)
-            padded[1::capacity] = 1.0
+            """The worlds' diagonals with ``outside`` past each world's row and before the first world's (each world's
+            line of the row store holds its dense rows, then its free bodies')."""
+            pitch = capacity + mf_capacity
+            padded = np.full(worlds * pitch + 1, outside, np.float32)
+            padded[1::pitch] = 1.0
             storage = wp.array(padded, dtype=wp.float32, device=device)
-            return storage, wp.array(
-                ptr=storage.ptr + 4, shape=host["world_diag"].shape, dtype=wp.float32, device=device
-            )
+            return storage, wp.array(ptr=storage.ptr + 4, shape=(worlds, pitch), dtype=wp.float32, device=device)
 
         guarded, finite = diagonal(np.nan), diagonal(1.0)
         # The velocity change the sweep leaves in the walk's coordinates (du), and the impulses.

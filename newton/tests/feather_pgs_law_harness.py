@@ -608,8 +608,21 @@ DENSE_ROW_ARGUMENTS = {
 JOINT_TABLE_ARGUMENTS = {field.name: field.name for field in field_group.fields_of(JointTable)}
 """The scenes' names of the :data:`JointTable` fields: the fields' own."""
 
-MF_ROW_ARGUMENTS = {field.name: field.attr for field in field_group.fields_of(MfRows)}
-"""The scenes' names of the :data:`MfRows` fields: the solver's attributes."""
+MF_ROW_ARGUMENTS = {
+    **{field.name: field.attr for field in field_group.fields_of(MfRows) if field.attr.startswith("mf_")},
+    "row_type": "mf_row_type",
+    "row_parent": "mf_row_parent",
+    "row_mu": "mf_row_mu",
+    "phi": "mf_phi",
+    "restitution": "mf_row_restitution",
+    "incident": "mf_row_incident",
+    "rhs": "mf_rhs",
+    "target": "mf_target_velocity",
+    "eps": "mf_row_eps",
+    "first": "mf_first",
+}
+"""The scenes' names of the :data:`MfRows` fields: the placement's free-body attributes, and the free bodies' region
+of the row store (:meth:`.placement.Placement.body_region`) under ``mf_`` names."""
 
 STRUCT_ARGUMENTS = {
     ContactInput: CONTACT_ARGUMENTS,
@@ -738,6 +751,7 @@ def prefix_warp_rows(
         device,
         slot_counter=counter,
         first=row_lines(device),
+        capacity=rows,
         **records,
         **law,
     )
@@ -1031,12 +1045,12 @@ def walked_rows(lower, jacobian) -> np.ndarray:
 def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
     """:func:`incident_gaps` of the free-body rows: each row's ``|mf_row_incident - Z^T u_hat|`` over its two bodies'
     six coordinates, ``u_hat`` the walk's enter of ``v_hat`` (:func:`_walked_coordinates`), and its terms' magnitude."""
-    incident = solver.placement.mf_row_incident.numpy().astype(np.float64)
+    incident = solver.placement.body_rows.row_incident.numpy().astype(np.float64)
     Z_a, Z_b = solver.placement.mf_Z_a.numpy().astype(np.float64), solver.placement.mf_Z_b.numpy().astype(np.float64)
     bodies_a, bodies_b, kinds = (
         solver.placement.mf_body_a.numpy(),
         solver.placement.mf_body_b.numpy(),
-        solver.placement.mf_row_type.numpy(),
+        solver.placement.body_rows.row_type.numpy(),
     )
     body_art = solver.forest.body_to_articulation.numpy()
     walked, offsets = _walked_coordinates(solver), solver.forest.articulation_world_dof_offset.numpy()

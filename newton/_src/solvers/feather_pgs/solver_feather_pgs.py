@@ -663,11 +663,6 @@ class SolverFeatherPGS(SolverBase):
         self.sweep.admit_paired()
         self.placement.allocate_sparse_diagonal_rows()
         self.placement.allocate_free_body_rows(model)
-        self.placement.mf_target_velocity = (
-            wp.zeros_like(self.placement.mf_rhs)
-            if self.forest.has_prescribed_response
-            else self._arrays.placeholder(wp.float32, (1, 1))
-        )
         self.factor.scatter_armature()
         self.sweep.plan_tier_rows()
         self.placement.allocate_packed_rows()
@@ -725,6 +720,11 @@ class SolverFeatherPGS(SolverBase):
         # by the walk; a key of the star is one step to the world (walk_rows.star_step) and holds no walk data.
         diagonal = bool(self.routes.case == "K2" and self.placement.sparse_diagonal_contact_solve)
         self.placement.walks = general or diagonal
+        # Free bodies' rows are written by the walk only (walk_rows.write_free_body_rows). A responding free body gives
+        # every case a walking class: K1 and K2 never hold free bodies, and K3-K6 sweep matrix-free (a world with the
+        # body's six coordinates).
+        if self.forest.has_free_rigid_bodies and not self.placement.walks:
+            raise RuntimeError(f"Free bodies' rows are written by the walk: case {self.routes.case} must walk.")
         if self.factor.eliminates and not self.placement.walks:
             raise RuntimeError(
                 "Bilateral blocks are closed in the one writer's block phase (walk_rows): their class must walk "
@@ -1216,18 +1216,18 @@ class SolverFeatherPGS(SolverBase):
             wp.copy(self.v_out, self.v_hat)
 
             # Pack MF metadata into int4 structs for coalesced 128-bit loads
-            self.placement.pack_free_body_meta(self.placement.mf_rhs)
+            self.placement.pack_free_body_meta()
             if self.sweep.colored_units is not None:
                 # The colored worlds' units and colors follow the rows the pack just published.
                 self.sweep.colored_units.build(
                     self.placement.mf_constraint_count,
-                    self.placement.mf_first,
+                    self.placement.dense_first,
                     self.placement.mf_contact_rows_end,
                     self.placement.mf_meta_packed,
                     self.placement.mf_Z_a,
                     self.placement.mf_Z_b,
-                    self.placement.mf_row_mu,
-                    self.placement.mf_row_w,
+                    self.placement.body_rows.row_mu,
+                    self.placement.body_rows.row_w,
                     int(self.laws.set.weighted),
                 )
 

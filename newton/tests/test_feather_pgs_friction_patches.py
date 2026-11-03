@@ -1084,7 +1084,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         count = int(solver.placement.mf_constraint_count.numpy()[0])
         self.assertTrue(np.all(solver.placement.contact_path.numpy()[:4] == 1))
         J_a, _J_b = free_body_jacobians(solver)
-        solved = np.einsum("ij,i->j", J_a[0, :count], solver.placement.mf_impulses.numpy()[0, :count]) / dt
+        solved = np.einsum("ij,i->j", J_a[0, :count], solver.placement.body_rows.impulses.numpy()[0, :count]) / dt
         self.assertGreater(np.linalg.norm(solved[3:]), 0.01, "fixture must exercise a nonzero contact moment")
         solver.update_contacts(contacts)
         reported = contacts.force.numpy().sum(axis=0)
@@ -1178,7 +1178,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 contacts.rigid_contact_point1.assign([[-0.08, 0, 0], [0, 0, 0], [0.08, 0, 0]])
                 contacts.rigid_contact_normal.assign([[0, 0, -1]] * 3)
                 solver.step(model.state(), model.state(), model.control(), contacts, 0.005)
-                rows = solver.placement.mf_row_type.numpy()[0, : solver.placement.mf_constraint_count.numpy()[0]]
+                rows = solver.placement.body_rows.row_type.numpy()[0, : solver.placement.mf_constraint_count.numpy()[0]]
                 self.assertEqual(np.count_nonzero(rows == PGS_CONSTRAINT_TYPE_FRICTION), 2)
                 np.testing.assert_allclose(solver.laws.friction_patches.view.weight.numpy()[:3], [0, 1, 0])
 
@@ -1356,7 +1356,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             rows = np.concatenate(
                 [
                     solver.placement.row_type.numpy()[0, : solver.placement.constraint_count.numpy()[0]],
-                    solver.placement.mf_row_type.numpy()[0, : solver.placement.mf_constraint_count.numpy()[0]],
+                    solver.placement.body_rows.row_type.numpy()[0, : solver.placement.mf_constraint_count.numpy()[0]],
                 ]
             )
             normals = int(np.count_nonzero(rows == PGS_CONSTRAINT_TYPE_CONTACT))

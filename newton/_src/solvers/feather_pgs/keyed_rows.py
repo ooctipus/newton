@@ -406,7 +406,8 @@ class KeyedRows:
         self.keyed_rows = True
         self.layout, groups, starts, arts = direct_topology_plan(solver)
         self.prefix_layout = self.layout
-        dev, worlds, capacity = solver.model.device, solver.forest.world_count, solver.placement.dense_max_constraints
+        # The keys are a record of the row store's lines (its pitch), where the keyed rows' records sit.
+        dev, worlds, capacity = solver.model.device, solver.forest.world_count, solver.placement.row_pitch
         self.data, self.prefix = KineticRows(), PrefixInput()
         self.data.first = solver.placement.dense_first
         self.data.rowkeys = SolverArrays(None, dev).array(KINETIC_ROWS[0], {"world": worlds, "row": capacity})

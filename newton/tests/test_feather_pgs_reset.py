@@ -31,14 +31,15 @@ def _make_solver(model, *, warmstart: bool):
 
 
 def _history_specs(solver):
+    """The row store's impulses and its warm-start carry, both classes' rows."""
     specs = []
     if solver.options.pgs_warmstart:
-        specs.append(("dense impulses", solver.placement.impulses, 7.0, 0.0))
-    if solver.placement.ws_prev_mf_impulses is not None:
+        specs.append(("impulses", solver.placement.impulses, 7.0, 0.0))
+    if solver.placement.ws_prev_dense_impulses is not None:
         specs.extend(
             (
-                ("MF impulses", solver.placement.ws_prev_mf_impulses, 11.0, 0.0),
-                ("MF row types", solver.placement.ws_prev_mf_row_type, 13, -1),
+                ("carried impulses", solver.placement.ws_prev_dense_impulses, 11.0, 0.0),
+                ("carried row types", solver.placement.ws_prev_dense_row_type, 13, -1),
             )
         )
     return specs
@@ -130,7 +131,7 @@ class TestFeatherPGSReset(unittest.TestCase):
         valid_mask = wp.array((True, False), dtype=wp.bool, device=model.device)
         solver.reset(model.state(), valid_mask)
         np.testing.assert_array_equal(solver.placement.impulses.numpy(), before)
-        self.assertIsNone(solver.placement.ws_prev_mf_impulses)
+        self.assertIsNone(solver.placement.ws_prev_dense_impulses)
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph reset test requires CUDA")
     def test_reset_is_cuda_graph_capturable(self):

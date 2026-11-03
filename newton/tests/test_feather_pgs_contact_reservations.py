@@ -9,15 +9,13 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs.dense_rows import MfRows
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, PatchRowLaw
 from newton._src.solvers.feather_pgs.kernels import (
-    build_mf_contact_rows,
     populate_world_J_for_size,
     prepare_world_contact_rows,
 )
 from newton._src.solvers.feather_pgs.row_build import contact_row_prelude, populate_world_J_masked
-from newton.tests.feather_pgs_law_harness import bind_struct, contact_input, group_rows
+from newton.tests.feather_pgs_law_harness import contact_input, group_rows
 
 # Normal +X gives tangents +Z and -Y: against three unit translation dofs, these are the
 # Jacobian rows of a contact's normal and its two tangents.
@@ -95,8 +93,8 @@ def translation_dofs(device):
 
 
 def launch(kernel, values, threads, device):
-    """Launch an actual row producer using its declared argument names; ``data`` binds the contact input,
-    ``mf`` the matrix-free rows and ``law`` the friction row law."""
+    """Launch an actual row producer using its declared argument names; ``data`` binds the contact input and ``law``
+    the friction row law."""
     data, _arrays = contact_input(values, device)
     law = PatchRowLaw()
     law.patches = values["friction_patches"]
@@ -104,7 +102,6 @@ def launch(kernel, values, threads, device):
     arguments = {
         **values,
         "data": data,
-        "mf": bind_struct(MfRows, values, device)[0],
         "law": law,
         "support": group_rows(device),
     }
@@ -145,36 +142,11 @@ def launch_masked(values, device):
     return jacobian.numpy()[0], -9.0
 
 
-def launch_matrix_free(values, device):
-    """Route the contacts to the matrix-free builder, writing its row metadata into the same arrays."""
-    count = values["contact_path"].shape[0]
-    capacity = values["world_row_type"].shape[1]
-    jacobian = wp.full((1, capacity, 6), -9.0, dtype=float, device=device)
-    values.update(
-        contact_path=wp.ones(count, dtype=int, device=device),
-        has_target_velocity=0,
-        mf_body_a=wp.full((1, capacity), -9, dtype=int, device=device),
-        mf_body_b=wp.full((1, capacity), -9, dtype=int, device=device),
-        mf_Z_a=jacobian,
-        mf_Z_b=wp.full((1, capacity, 6), -9.0, dtype=float, device=device),
-        mf_row_type=values["world_row_type"],
-        mf_row_parent=values["world_row_parent"],
-        mf_row_mu=values["world_row_mu"],
-        mf_phi=values["world_phi"],
-        mf_target_velocity=values["world_target_velocity"],
-        mf_row_restitution=values["world_row_restitution"],
-    )
-    launch(build_mf_contact_rows, values, values["total_num_threads"], device)
-    # The linear part of a matrix-free row is its direction.
-    return jacobian.numpy()[0, :, :3], -9.0
-
-
 # Every producer that writes a contact's rows from its allocator reservation.
 ROW_BUILDERS = {
     "metadata": launch_metadata,
     "per_contact": launch_per_contact,
     "masked": launch_masked,
-    "matrix_free": launch_matrix_free,
 }
 
 

@@ -97,9 +97,9 @@ def _store_sums(solver):
     for impulses, velocity, rhs, counts in (
         (solver.placement.impulses, audit.velocity, solver.placement.rhs, solver.placement.constraint_count),
         (
-            solver.placement.mf_impulses,
+            solver.placement.body_rows.impulses,
             audit.mf_velocity,
-            solver.placement.mf_rhs,
+            solver.placement.body_rows.rhs,
             solver.placement.mf_constraint_count,
         ),
     ):
@@ -223,7 +223,9 @@ class TestAudit(unittest.TestCase):
         count = int(solver.placement.mf_constraint_count.numpy()[0])
         load = float(
             np.sum(
-                solver.placement.mf_impulses.numpy()[0, :count][solver.placement.mf_row_type.numpy()[0, :count] == 0]
+                solver.placement.body_rows.impulses.numpy()[0, :count][
+                    solver.placement.body_rows.row_type.numpy()[0, :count] == 0
+                ]
             )
         )
         self.assertAlmostEqual(load, G0 * H, delta=1.0e-3 * G0 * H)
@@ -280,8 +282,8 @@ class TestAudit(unittest.TestCase):
         )
         audit = solver.read_audit()
         count = int(solver.placement.mf_constraint_count.numpy()[0])
-        lam = solver.placement.mf_impulses.numpy()[0, :count]
-        normal = solver.placement.mf_row_type.numpy()[0, :count] == 0
+        lam = solver.placement.body_rows.impulses.numpy()[0, :count]
+        normal = solver.placement.body_rows.row_type.numpy()[0, :count] == 0
         diagonal = 1.0 / solver.placement.mf_eff_mass_inv.numpy()[0, :count]
         compliance = np.sum(0.1 * diagonal[normal] * lam[normal] ** 2)
         self.assertGreater(compliance, 1.0e-6)

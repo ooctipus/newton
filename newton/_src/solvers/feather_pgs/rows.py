@@ -51,7 +51,6 @@ from .kernels import (
     allocate_link_slots,
     allocate_rigid_velocity_limit_slots,
     allocate_world_contact_slots,
-    build_mf_contact_rows,
     compute_world_contact_bias,
     finalize_constraint_counts_with_status,
     gather_mf_warmstart,
@@ -655,8 +654,8 @@ class RowLaws:
         dense_rows = bind_dense_rows(solver.placement)
         joints = bind_joint_table(solver)
         mf_active = solver.forest.has_free_rigid_bodies
-        if solver.forest.has_prescribed_response:
-            solver.placement.mf_target_velocity.zero_()
+        if solver.forest.has_prescribed_response and mf_active:
+            solver.placement.body_rows.target_velocity.zero_()
 
         solver.placement.begin(solver._plan.jacobian_clear_sizes)
 
@@ -1027,8 +1026,8 @@ class RowLaws:
                         clamp=True,
                     )
 
-            # The free bodies' contact rows: by the walk where the placement walks (walk_rows), else as J.
-            if mf_active and solver.placement.walks:
+            # The free bodies' contact rows, by the walk (walk_rows): a class with free bodies always walks.
+            if mf_active:
                 pool.launch(
                     walk_rows.write_free_body_rows,
                     contact_build_threads,
@@ -1040,20 +1039,6 @@ class RowLaws:
                         law,
                         solver.factor.walk_view(),
                         solver.v_hat,
-                    ],
-                    extent=count,
-                    clamp=True,
-                )
-            elif mf_active:
-                pool.launch(
-                    build_mf_contact_rows,
-                    contact_build_threads,
-                    inputs=[
-                        bind_mf_rows(solver.placement),
-                        contact_input,
-                        contact_build_threads,
-                        int(solver.forest.has_prescribed_response),
-                        law,
                     ],
                     extent=count,
                     clamp=True,
@@ -1079,7 +1064,7 @@ class RowLaws:
                 # (covers vel-limit rows, padding tail, and any contact that
                 # returns early in the gather); here we gather matched contacts'
                 # previous impulses into their current slots by identity. The
-                # carry itself lives in ws_prev_mf_impulses.
+                # carry itself is the row store's (ws_prev_dense_*), in its free-body region.
                 if solver.options.pgs_warmstart:
                     match_index = getattr(contacts, "rigid_contact_match_index", None)
                     if match_index is None:
@@ -1097,9 +1082,9 @@ class RowLaws:
                             bind_mf_rows(solver.placement),
                             match_index,
                             solver.placement.ws_prev_slot_sorted,
-                            solver.placement.ws_prev_mf_impulses,
-                            solver.placement.ws_prev_mf_row_type,
-                            solver.placement.ws_prev_mf_row_parent,
+                            solver.placement.body_region(solver.placement.ws_prev_dense_impulses),
+                            solver.placement.body_region(solver.placement.ws_prev_dense_row_type),
+                            solver.placement.body_region(solver.placement.ws_prev_dense_row_parent),
                             solver.placement.mf_constraint_count,
                             solver.placement.ws_prev_contact_normal,
                             solver.options.pgs_warmstart_decay,
@@ -1108,7 +1093,7 @@ class RowLaws:
                             dt / solver.sweep.prev_dt if solver.sweep.prev_dt > 0.0 else 1.0,
                             solver.placement.mf_max_constraints,
                         ],
-                        outputs=[solver.placement.mf_impulses],
+                        outputs=[solver.placement.body_rows.impulses],
                         extent=count,
                         max_blocks=solver.placement.contact_capacity_blocks,
                     )

@@ -94,14 +94,15 @@ def _pack_state(has_free_rigid_bodies):
         forest=SimpleNamespace(has_free_rigid_bodies=has_free_rigid_bodies, world_count=7),
     )
     for name in (
-        "mf_first",
+        "dense_first",
         "mf_constraint_count",
         "mf_dof_a",
         "mf_dof_b",
         "mf_eff_mass_inv",
-        "mf_row_incident",
-        "mf_row_type",
-        "mf_row_parent",
+        "rhs",
+        "row_incident",
+        "row_type",
+        "row_parent",
         "mf_meta_packed",
     ):
         setattr(state, name, object())
@@ -111,14 +112,14 @@ def _pack_state(has_free_rigid_bodies):
 class TestFeatherPGSMFMetadata(unittest.TestCase):
     def test_pack_launch_requires_free_rigid_bodies(self):
         """Launch the metadata pack only when free rigid bodies can produce matrix-free rows."""
-        rhs = object()
         for has_free in (False, True):
             state = _pack_state(has_free)
+            rhs = state.rhs
             with (
                 self.subTest(has_free_rigid_bodies=has_free),
                 patch.object(fpgs.wp, "launch_tiled") as launch,
             ):
-                Placement.pack_free_body_meta(state, rhs)
+                Placement.pack_free_body_meta(state)
                 if not has_free:
                     launch.assert_not_called()
                 else:
@@ -133,7 +134,7 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
         """Preserve the existing word layout using defined unsigned shift arithmetic."""
         parents = np.array([-1, 0, 32767, 32768, 37247, 65534], np.int32)
         expected = (((parents.astype(np.int64) & 65535) << 16) | 2).astype(np.uint32).view(np.int32)
-        kernel = response_builds_rows.free_body_meta_kernel(65535, "cpu")
+        kernel = response_builds_rows.free_body_meta_kernel(65535, 8 + 65535, 8, "cpu")
         source = max(_native_snippets(kernel), key=len)
         result = wp.zeros(len(parents), dtype=int, device="cpu")
         wp.launch(
@@ -207,11 +208,11 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
     def test_capacity_guard_does_not_alias_the_parent_sentinel(self):
         """Reject unsupported packed capacity before allocating solver row buffers."""
         for capacity in (65535, 0):
-            response_builds_rows.free_body_meta_kernel(capacity, "cpu")
+            response_builds_rows.free_body_meta_kernel(capacity, 8 + capacity, 8, "cpu")
         for capacity in (65536, 100000):
             with self.subTest(capacity=capacity):
                 with self.assertRaisesRegex(ValueError, "mf_max_constraints.*65535"):
-                    response_builds_rows.free_body_meta_kernel(capacity, "cpu")
+                    response_builds_rows.free_body_meta_kernel(capacity, 8 + capacity, 8, "cpu")
                 # Only the CUDA sweeps pack the row metadata.
                 if wp.is_cuda_available():
                     with self.assertRaisesRegex(ValueError, "mf_max_constraints.*65535"):
@@ -291,9 +292,10 @@ def _solve_parent_rows(device, parents):
         mf_constraint_count=wp.array(np.asarray(parents) + 3, dtype=int, device=device),
         mf_contact_rows_end=wp.array(np.asarray(parents) + 3, dtype=int, device=device),
         mf_meta=wp.array(metadata, dtype=int, device=device),
-        mf_impulses=wp.zeros((worlds, capacity), device=device),
-        mf_row_mu=wp.full((worlds, capacity), 0.4, device=device),
-        mf_row_w=wp.ones((worlds, capacity), device=device),
+        # The row store's lines: 8 dense rows, then the free bodies'.
+        mf_impulses=wp.zeros((worlds, 8 + capacity), device=device),
+        mf_row_mu=wp.full((worlds, 8 + capacity), 0.4, device=device),
+        mf_row_w=wp.ones((worlds, 8 + capacity), device=device),
         mf_Z_a=wp.array(jacobian, device=device),
         mf_Z_b=wp.zeros((worlds, capacity, 6), device=device),
         v_out=wp.array(velocity.reshape(-1), device=device),
@@ -322,7 +324,7 @@ def _solve_parent_rows(device, parents):
     )
     impulses = values["mf_impulses"].numpy()
     # The velocity change the sweep leaves in the walk's coordinates (the step's one leave walks it down).
-    return values["du"].numpy(), np.asarray([impulses[w, p : p + 3] for w, p in enumerate(parents)])
+    return values["du"].numpy(), np.asarray([impulses[w, 8 + p : 8 + p + 3] for w, p in enumerate(parents)])
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "MF-GS native solve requires CUDA")
@@ -362,14 +364,17 @@ def _launch_pack_unconditionally(solver):
     """
     pack = Placement.pack_free_body_meta
     solver.placement.pack_mf_meta_kernel = response_builds_rows.free_body_meta_kernel(
-        solver.placement.mf_max_constraints, solver.model.device.arch
+        solver.placement.mf_max_constraints,
+        solver.placement.row_pitch,
+        solver.placement.body_base,
+        solver.model.device.arch,
     )
 
-    def unconditional(mf_rhs):
+    def unconditional():
         # The production launch, with the skip's only gate held open for the call.
         placement = solver.placement
         with patch.object(placement, "forest", dataclasses.replace(placement.forest, has_free_rigid_bodies=True)):
-            pack(placement, mf_rhs)
+            pack(placement)
 
     solver.placement.pack_free_body_meta = unconditional
 
@@ -427,7 +432,7 @@ class TestFeatherPGSMFMetadataPackCUDA(unittest.TestCase):
         # The legacy arm proves the call site ran on every step.
         self.assertEqual(len(legacy_packs), steps)
         for actual in legacy_packs:
-            self.assertIs(actual, legacy.placement.mf_rhs)
+            self.assertIs(actual, legacy.placement.body_rows.rhs)
         self.assertTrue(np.all(skipped["contact_count"] > 0))
         self.assertTrue(np.any(skipped["impulse_peak"] > 0.0))
         np.testing.assert_array_equal(skipped["mf_constraint_count"], 0)
@@ -453,7 +458,7 @@ class TestFeatherPGSMFMetadataPackCUDA(unittest.TestCase):
         self.assertTrue(pack["launched"])
         self.assertEqual(pack["kernel"], solver.placement.pack_mf_meta_kernel.key)
         for rhs in packed:
-            self.assertIs(rhs, solver.placement.mf_rhs)
+            self.assertIs(rhs, solver.placement.rhs)
 
 
 if __name__ == "__main__":

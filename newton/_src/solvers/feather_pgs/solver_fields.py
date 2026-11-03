@@ -4,7 +4,8 @@
 """The device fields SolverFeatherPGS allocates, declared once by group (see :mod:`.field_group`).
 
 Dimension names: ``dof`` (joint DOFs), ``articulation``, ``body``, ``world``,
-``row`` (dense rows per world), ``mf_row`` (matrix-free rows per world),
+``row`` (the row store's rows per world line: the dense class's, then the free bodies'), ``mf_row`` (free-body rows
+per world),
 ``mf_body`` (matrix-free bodies per world), ``world_dof`` (DOFs of the widest
 world), ``art``/``size`` (articulations and DOFs of one size group). A group
 that a feature does not use is allocated at the sizes of its placeholder (one
@@ -143,8 +144,10 @@ DENSE_ROWS = FieldGroup(
     Field("constraint_count", wp.int32, ("world",), owner="placement"),
     Field("row_sides", wp.vec2i, ("world", "row"), owner="placement"),
 )
-"""Every world's dense rows: the system and the row records (with each row's sides). ``row_incident`` is each row's
-incident velocity ``J v_hat``, written where its walk sums it: the one writer (:mod:`.walk_rows`)."""
+"""The row store: every world line's rows, the dense class's (``[0, dense_max_constraints)``) then the free bodies'
+(from ``body_base``): the system and the row records (with each dense row's sides). ``row_incident`` is each row's
+incident velocity ``J v_hat``, written where its walk sums it: the one writer (:mod:`.walk_rows`), the free bodies'
+writer (:func:`.walk_rows.write_free_body_rows`)."""
 
 DENSE_ROW_WEIGHTS = FieldGroup(Field("row_w", wp.float32, ("world", "row"), fill=1.0, owner="placement"))
 """Per-row weights of the regularized row law: the relative option's (speculative and restitution rows keep the rigid
@@ -159,7 +162,7 @@ DENSE_WARMSTART = FieldGroup(
     Field("ws_prev_dense_row_type", wp.int32, ("world", "row"), fill=-1, owner="placement"),
     Field("ws_prev_dense_row_parent", wp.int32, ("world", "row"), fill=-1, owner="placement"),
 )
-"""Identity-matched warm-start carry of the dense rows."""
+"""Identity-matched warm-start carry of the row store: last step's converged impulses and their row types."""
 
 FUSED_DIAGONAL_LIMITS = FieldGroup(
     Field("fused_diagonal_limit_active", wp.int32, ("world", "world_dof"), owner="placement"),
@@ -254,34 +257,16 @@ MF_ROWS = FieldGroup(
     Field("mf_body_b", wp.int32, ("world", "mf_row"), owner="placement"),
     Field("mf_Z_a", wp.float32, ("world", "mf_row", 6), owner="placement"),
     Field("mf_Z_b", wp.float32, ("world", "mf_row", 6), owner="placement"),
-    Field("mf_rhs", wp.float32, ("world", "mf_row"), owner="placement"),
-    Field("mf_impulses", wp.float32, ("world", "mf_row"), owner="placement"),
     Field("mf_eff_mass_inv", wp.float32, ("world", "mf_row"), owner="placement"),
-    Field("mf_row_type", wp.int32, ("world", "mf_row"), owner="placement"),
-    Field("mf_row_parent", wp.int32, ("world", "mf_row"), fill=-1, owner="placement"),
-    Field("mf_row_mu", wp.float32, ("world", "mf_row"), owner="placement"),
-    Field("mf_phi", wp.float32, ("world", "mf_row"), owner="placement"),
-    Field("mf_row_restitution", wp.float32, ("world", "mf_row"), owner="placement"),
-    Field("mf_row_incident", wp.float32, ("world", "mf_row"), owner="placement"),
     Field("mf_dof_a", wp.int32, ("world", "mf_row"), owner="placement"),
     Field("mf_dof_b", wp.int32, ("world", "mf_row"), owner="placement"),
     Field("mf_meta_packed", wp.int32, ("world", "mf_meta"), owner="placement"),
 )
-"""Every world's matrix-free (free-body) rows. Each side's six entries hold the row's Jacobian ``J`` as the writers
-store it and its whitened form ``Z = L^-1 J^T`` once the rows' build has run (``L`` the body's held factor); a
-row keeps its incident velocity ``J v_hat``. Packed metadata: four ints per row (dof pair, inverse effective mass, the
-residual at zero velocity change, type and parent)."""
-
-MF_ROW_WEIGHTS = FieldGroup(Field("mf_row_w", wp.float32, ("world", "mf_row"), fill=1.0, owner="placement"))
-
-MF_ROW_EPS = FieldGroup(Field("mf_row_eps", wp.float32, ("world", "mf_row"), owner="placement"))
-
-MF_WARMSTART = FieldGroup(
-    Field("ws_prev_mf_impulses", wp.float32, ("world", "mf_row"), owner="placement"),
-    Field("ws_prev_mf_row_type", wp.int32, ("world", "mf_row"), fill=-1, owner="placement"),
-    Field("ws_prev_mf_row_parent", wp.int32, ("world", "mf_row"), fill=-1, owner="placement"),
-)
-"""Matrix-free warm-start carry: last step's converged impulses and their row types."""
+"""The free bodies' placement: each row's bodies and their first coordinates, each side's six entries (the row's
+Jacobian ``J`` as the writers store it, its whitened form ``Z = L^-1 J^T`` once the rows' build has run, ``L`` the
+body's held factor), its inverse effective mass, and the packed header the sweeps read: four ints per row (dof pair,
+inverse effective mass, the residual at zero velocity change, type and parent). The rows' records are the row store's
+(:data:`DENSE_ROWS`, from ``body_base``)."""
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Capacity telemetry

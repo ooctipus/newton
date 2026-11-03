@@ -3,9 +3,10 @@
 
 """The row records every row producer writes, declared once as fields (:mod:`.field_group`).
 
-:data:`DenseRows` is the Warp struct of the dense rows; the contact producers' input
-(:data:`.contact_input.ContactInput`) carries the same fields. :data:`MfRows` is the struct of the
-matrix-free (free-body) rows, under the same record names.
+One store holds every world line's rows (:data:`.solver_fields.DENSE_ROWS`): the dense class's from row 0, then the
+free bodies' from the store's ``body_base``. :data:`DenseRows` is the Warp struct of the dense class's records; the
+contact producers' input (:data:`.contact_input.ContactInput`) carries the same fields. :data:`MfRows` reads the free
+bodies' rows: the same records at ``base``, and their placement (bodies, coordinates, ``Z``).
 """
 
 import dataclasses
@@ -14,7 +15,7 @@ import warp as wp
 
 from . import field_group
 from .field_group import Field
-from .solver_fields import MF_ROWS
+from .solver_fields import DENSE_ROWS, MF_ROWS
 
 RECORDS = (
     Field("row_type", wp.int32, ("world", "row"), owner="placement"),
@@ -152,29 +153,36 @@ MF_RECORDS = (
             ("dof_b", "mf_dof_b"),
             ("Z_a", "mf_Z_a"),
             ("Z_b", "mf_Z_b"),
-            ("row_type", "mf_row_type"),
-            ("row_parent", "mf_row_parent"),
-            ("row_mu", "mf_row_mu"),
-            ("phi", "mf_phi"),
-            ("restitution", "mf_row_restitution"),
-            ("incident", "mf_row_incident"),
-            ("rhs", "mf_rhs"),
         )
     ),
-    Field("target", wp.float32, ("world", "mf_row"), attr="mf_target_velocity", owner="placement"),
-    Field("eps", wp.float32, ("world", "mf_row"), attr="mf_row_eps", owner="placement"),
-    Field("first", wp.int32, ("world",), attr="mf_first", owner="placement"),
+    *(
+        dataclasses.replace(DENSE_ROWS[attr], name=name, attr=attr, owner="body")
+        for name, attr in (
+            ("row_type", "row_type"),
+            ("row_parent", "row_parent"),
+            ("row_mu", "row_mu"),
+            ("phi", "phi"),
+            ("restitution", "row_restitution"),
+            ("incident", "row_incident"),
+            ("rhs", "rhs"),
+            ("target", "target_velocity"),
+        )
+    ),
+    Field("eps", wp.float32, ("world", "row"), attr="row_eps", owner="body"),
+    Field("first", wp.int32, ("world",), attr="dense_first", owner="placement"),
 )
-"""Each matrix-free row's bodies, coordinates and per-body blocks (the writers' ``J``, whitened in place to ``Z``
-by the rows' build), and the dense records' kind, friction parent, coefficient, gap, restitution, incident velocity
-(``J v_hat``, stored by the build), rhs, target and material compliance, by world and row."""
+"""Each free-body row's bodies, coordinates and per-body blocks (the writers' ``J``, whitened in place to ``Z``
+by the rows' build), by world line and free-body row; and its records, the row store's region of the free bodies
+(:meth:`.placement.Placement.body_region`, row ``i`` the store's ``body_base + i``): kind, friction parent,
+coefficient, gap, restitution, incident velocity (``J v_hat``, stored by the build), rhs, target and material
+compliance."""
 
 MfRows = field_group.struct("MfRows", MF_RECORDS, __name__)
 
 
 def bind_mf(placement):
-    """Bind the placement's matrix-free row records into an :data:`MfRows`."""
-    return field_group.bind(MfRows, placement=placement)
+    """Bind the placement's free-body rows into an :data:`MfRows`: their records in the row store's free-body region."""
+    return field_group.bind(MfRows, placement=placement, body=placement.body_rows)
 
 
 def bind(placement, data=None):

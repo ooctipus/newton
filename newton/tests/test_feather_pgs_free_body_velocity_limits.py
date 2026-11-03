@@ -240,12 +240,12 @@ def _free_body_rows(run):
     axis = np.argmax(np.abs(jacobian), axis=2)
     return SimpleNamespace(
         count=count,
-        type=solver.placement.mf_row_type.numpy()[:, :rows],
+        type=solver.placement.body_rows.row_type.numpy()[:, :rows],
         axis=axis,
         sign=np.sign(np.take_along_axis(jacobian, axis[..., None], axis=2)[..., 0]),
-        rhs=solver.placement.mf_rhs.numpy()[:, :rows],
+        rhs=solver.placement.body_rows.rhs.numpy()[:, :rows],
         eff_mass_inv=solver.placement.mf_eff_mass_inv.numpy()[:, :rows],
-        impulses=solver.placement.mf_impulses.numpy()[:, :rows],
+        impulses=solver.placement.body_rows.impulses.numpy()[:, :rows],
     )
 
 

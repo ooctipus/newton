@@ -18,7 +18,7 @@ import warp as wp
 
 from ...sim import BodyFlags, JointType
 from .contact_filters import contact_normal_gap_limit
-from .contact_input import ContactInput, ContactRoutes, contact_frame
+from .contact_input import ContactInput, ContactRoutes
 from .contact_laws import (
     CONTACT_SPIN_ROW,
     contact_endpoints,
@@ -27,13 +27,11 @@ from .contact_laws import (
     contact_points,
     contact_responds,
     contact_row_frame,
-    contact_seed,
     contact_tangent_basis,
     jacobian_entry,
     prescribed_spin_target,
     prescribed_target,
     spin_entry,
-    spin_seed,
 )
 from .dense_rows import (
     UNIT_CONTACT,
@@ -710,23 +708,21 @@ def _light_update_qdd_from_velocity(
 @wp.func
 def _contact_linear_force(
     dense_first: wp.array[int],
-    mf_first: wp.array[int],
+    body_base: int,
     routes: ContactRoutes,
     c: int,
     world_impulses: wp.array2d[wp.float32],
-    mf_impulses: wp.array2d[wp.float32],
     world_constraint_count: wp.array[wp.int32],
     mf_constraint_count: wp.array[wp.int32],
     world_row_type: wp.array2d[wp.int32],
     world_row_parent: wp.array2d[wp.int32],
-    mf_row_type: wp.array2d[wp.int32],
-    mf_row_parent: wp.array2d[wp.int32],
     enable_friction: int,
     inv_dt: float,
     # outputs
     rigid_contact_force: wp.array[wp.vec3],
 ):
-    """Convert solved FeatherPGS contact impulses into world-frame forces."""
+    """Convert solved FeatherPGS contact impulses into world-frame forces: a free body's contact's rows (``path`` 1)
+    sit at ``body_base`` of its world's line."""
     total_contacts = routes.count[0]
     if c >= total_contacts:
         return
@@ -737,7 +733,6 @@ def _contact_linear_force(
 
     if slot >= 0 and path >= 0 and inv_dt > 0.0:
         world = routes.world[c]
-        mf_line = mf_first[world]
         line = dense_first[world]
         # Contacts store normals from shape 0 toward shape 1 (A-to-B). FeatherPGS
         # solves along the opposite direction internally, which corresponds to the
@@ -761,18 +756,19 @@ def _contact_linear_force(
                 lam_t0 = world_impulses[line, slot + 1]
                 lam_t1 = world_impulses[line, slot + 2]
         elif path == 1:
-            lam_n = mf_impulses[mf_line, slot]
+            row = body_base + slot
+            lam_n = world_impulses[line, row]
             count = mf_constraint_count[world]
             if (
                 enable_friction != 0
                 and slot + 2 < count
-                and mf_row_type[mf_line, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
-                and mf_row_parent[mf_line, slot + 1] == slot
-                and mf_row_type[mf_line, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
-                and mf_row_parent[mf_line, slot + 2] == slot
+                and world_row_type[line, row + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+                and world_row_parent[line, row + 1] == slot
+                and world_row_type[line, row + 2] == PGS_CONSTRAINT_TYPE_FRICTION
+                and world_row_parent[line, row + 2] == slot
             ):
-                lam_t0 = mf_impulses[mf_line, slot + 1]
-                lam_t1 = mf_impulses[mf_line, slot + 2]
+                lam_t0 = world_impulses[line, row + 1]
+                lam_t1 = world_impulses[line, row + 2]
 
         force = lam_n * normal
         if enable_friction != 0:
@@ -786,16 +782,13 @@ def _contact_linear_force(
 @wp.kernel
 def compute_contact_linear_force_from_impulses(
     dense_first: wp.array[int],
-    mf_first: wp.array[int],
+    body_base: int,
     routes: ContactRoutes,
     world_impulses: wp.array2d[wp.float32],
-    mf_impulses: wp.array2d[wp.float32],
     world_constraint_count: wp.array[wp.int32],
     mf_constraint_count: wp.array[wp.int32],
     world_row_type: wp.array2d[wp.int32],
     world_row_parent: wp.array2d[wp.int32],
-    mf_row_type: wp.array2d[wp.int32],
-    mf_row_parent: wp.array2d[wp.int32],
     enable_friction: int,
     inv_dt: float,
     # outputs
@@ -804,17 +797,14 @@ def compute_contact_linear_force_from_impulses(
     "Convert solved FeatherPGS contact impulses into world-frame forces."
     _contact_linear_force(
         dense_first,
-        mf_first,
+        body_base,
         routes,
         wp.tid(),
         world_impulses,
-        mf_impulses,
         world_constraint_count,
         mf_constraint_count,
         world_row_type,
         world_row_parent,
-        mf_row_type,
-        mf_row_parent,
         enable_friction,
         inv_dt,
         rigid_contact_force,
@@ -1904,33 +1894,26 @@ def prepare_world_impulses(
 
 @wp.kernel
 def reset_world_warmstart_buffers(
-    dense_first: wp.array[int],
-    mf_first: wp.array[int],
+    first: wp.array[int],
     world_mask: wp.array[wp.bool],
-    dense_impulses: wp.array2d[float],
-    prev_mf_impulses: wp.array2d[float],
-    prev_mf_row_type: wp.array2d[int],
-    prev_mf_row_parent: wp.array2d[int],
+    impulses: wp.array2d[float],
+    prev_impulses: wp.array2d[float],
+    prev_row_type: wp.array2d[int],
+    prev_row_parent: wp.array2d[int],
 ):
-    """Clear persistent warm-start state for selected worlds."""
+    """Clear persistent warm-start state for selected worlds: their lines of the row store, both classes' rows."""
     world = wp.tid()
     if world_mask and not world_mask[world]:
         return
-    mf_line = mf_first[world]
-    line = dense_first[world]
-
-    if world < dense_impulses.shape[0]:
-        for row in range(dense_impulses.shape[1]):
-            dense_impulses[line, row] = 0.0
-    if world < prev_mf_impulses.shape[0]:
-        for row in range(prev_mf_impulses.shape[1]):
-            prev_mf_impulses[mf_line, row] = 0.0
-    if world < prev_mf_row_type.shape[0]:
-        for row in range(prev_mf_row_type.shape[1]):
-            prev_mf_row_type[mf_line, row] = -1
-    if world < prev_mf_row_parent.shape[0]:
-        for row in range(prev_mf_row_parent.shape[1]):
-            prev_mf_row_parent[mf_line, row] = -1
+    line = first[world]
+    for row in range(impulses.shape[1]):
+        impulses[line, row] = 0.0
+    for row in range(prev_impulses.shape[1]):
+        prev_impulses[line, row] = 0.0
+    for row in range(prev_row_type.shape[1]):
+        prev_row_type[line, row] = -1
+    for row in range(prev_row_parent.shape[1]):
+        prev_row_parent[line, row] = -1
 
 
 @wp.kernel
@@ -2064,74 +2047,6 @@ def free_body_contact_records(
         mf.eps[mf_line, row_idx] = eps
 
 
-@wp.kernel
-def build_mf_contact_rows(
-    mf: MfRows,
-    data: ContactInput,
-    total_num_threads: int,
-    has_target_velocity: int,
-    law: PatchRowLaw,
-):
-    """Build matrix-free rows for contacts between free rigid bodies / ground, with a capacity-independent launch: each
-    row's records (:func:`free_body_contact_records`) and each side's Jacobian, which the rows' build whitens in place
-    (``Z = L^-1 J^T``). A class whose placement walks writes these rows by the walk instead
-    (:func:`.walk_rows.write_free_body_rows`).
-
-    For root free joints, the internal qd used here stores the COM-point linear
-    term and angular velocity, i.e. `qd = [v_com_point, omega]`, where the COM
-    point is the root body's world-space COM position. The MF contact Jacobian
-    uses contact position relative to that point:
-        J = [d, r x d]   (r = p_contact - p_com_world)
-    """
-    total_contacts = data.count[0]
-    for c in range(wp.tid(), total_contacts, total_num_threads):
-        slot = data.slot[c]
-        if data.path[c] != 1 or slot < 0:
-            continue
-        mf_line = mf.first[data.world[c]]
-        art_a = data.art0[c]
-        art_b = data.art1[c]
-        body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
-        response_body_a, response_body_b, mu, restitution, stiffness, rows = free_body_contact(data, c, body_a, body_b)
-        for row in range(rows):
-            row_idx = slot + row
-            direction, row_point = contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
-            # A free body's row about its articulation origin: its seed against its six unit columns, J = [d, r x d],
-            # opposite on body B; a spin row's [0, n]. The rows' build whitens it in place (Z = L^-1 J^T).
-            if response_body_a >= 0:
-                J_a = contact_seed(direction, row_point - data.origin[art_a])
-                if row == CONTACT_SPIN_ROW:
-                    J_a = spin_seed(normal)
-                for k in range(6):
-                    mf.Z_a[mf_line, row_idx, k] = J_a[k]
-            if response_body_b >= 0:
-                J_b = contact_seed(direction, row_point - data.origin[art_b])
-                if row == CONTACT_SPIN_ROW:
-                    J_b = spin_seed(normal)
-                for k in range(6):
-                    mf.Z_b[mf_line, row_idx, k] = -J_b[k]
-            free_body_contact_records(
-                mf,
-                data,
-                law,
-                has_target_velocity,
-                c,
-                slot,
-                row,
-                body_a,
-                body_b,
-                response_body_a,
-                response_body_b,
-                normal,
-                phi,
-                direction,
-                row_point,
-                mu,
-                restitution,
-                stiffness,
-            )
-
-
 @wp.func
 def _transport_warmstart_contact(
     normal: wp.vec3,
@@ -2208,9 +2123,9 @@ def gather_mf_warmstart(
     """Seed this step's MF impulse buffer from the previous step's converged
     impulses, matched by contact identity.
 
-    Runs after ``allocate_world_contact_slots`` + ``build_mf_contact_rows`` (so
-    ``contact_slot`` and ``mf_row_type`` are populated for this step) and after
-    the warm-start branch has zeroed ``mf_impulses``. One thread per contact;
+    Runs after ``allocate_world_contact_slots`` + ``walk_rows.write_free_body_rows`` (so
+    ``contact_slot`` and the rows' types are populated for this step) and after
+    the warm-start branch has zeroed their impulses (the row store's free-body region). One thread per contact;
     each writes only its own disjoint slot range, so unmatched / cold contacts
     keep the zero left by the memset and no stale slot survives.
 

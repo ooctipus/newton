@@ -398,7 +398,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(routes["sweep"]["route"], "matrix_free_gs")
         # The arm and the free box share a world, which one sweep of the general row solves.
         self.assertTrue(routes["free_rigid_bodies"]["mixed_worlds"])
-        self.assertEqual(routes["sweep"]["mf_meta_pack"]["kernel"], "free_body_meta_512")
+        self.assertEqual(routes["sweep"]["mf_meta_pack"]["kernel"], "free_body_meta_512_544")
         # The CPU's one thread keeps the impulses and streams the metadata: no shared memory to stage them in.
         storage = routes["sweep"]["mf_gs_storage"]
         self.assertEqual((storage["metadata"], storage["mf_impulses"]), ("streamed", "resident"))

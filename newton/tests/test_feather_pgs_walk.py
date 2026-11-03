@@ -171,19 +171,19 @@ class Capture:
             self.mf_final = (
                 placement.mf_Z_a.numpy().astype(np.float64),
                 placement.mf_Z_b.numpy().astype(np.float64),
-                placement.mf_impulses.numpy().astype(np.float64),
+                placement.body_rows.impulses.numpy().astype(np.float64),
                 placement.mf_constraint_count.numpy().copy(),
                 placement.mf_body_a.numpy().copy(),
                 placement.mf_body_b.numpy().copy(),
                 placement.mf_dof_a.numpy().copy(),
                 placement.mf_dof_b.numpy().copy(),
-                placement.mf_row_type.numpy().copy(),
+                placement.body_rows.row_type.numpy().copy(),
             )
         self.v_hat = solver.v_hat.numpy().astype(np.float64)
         self.v_out = solver.v_out.numpy().astype(np.float64)
         # The line of each family's store where a world's rows start (its row tables), as every step read takes it.
         self.dense_first = placement.dense_first.numpy().copy()
-        self.mf_first = placement.mf_first.numpy().copy()
+        self.mf_first = placement.dense_first.numpy().copy()
 
 
 def pipeline_options(scene) -> dict:
@@ -727,8 +727,8 @@ def _reversed_lines(self, *args, **kwargs):
     """A placement whose row tables put every world's rows on another world's line
     (:mod:`.test_feather_pgs_row_lines`)."""
     _construct(self, *args, **kwargs)
-    for table in (self.dense_first, self.mf_first):
-        table.assign(np.arange(table.shape[0] - 1, -1, -1, dtype=np.int32))
+    lines = self.dense_first.shape[0]
+    self.dense_first.assign(np.arange(lines - 1, -1, -1, dtype=np.int32))
 
 
 class TestWalkF1(unittest.TestCase):

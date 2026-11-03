@@ -418,7 +418,9 @@ def _owner_solver(device, *, anchors, beta=0.0):
             "local_general_worlds",
         )
     }
-    rows = {name: ints(worlds) for name in ("mf_constraint_count", "mf_first", "constraint_count", "local_solve_owner")}
+    rows = {
+        name: ints(worlds) for name in ("mf_constraint_count", "dense_first", "constraint_count", "local_solve_owner")
+    }
 
     def active():
         return SimpleNamespace(
@@ -442,7 +444,7 @@ def _owner_solver(device, *, anchors, beta=0.0):
             **rows,
             mf_body_a=ints(worlds, 4),
             mf_body_b=ints(worlds, 4),
-            mf_row_type=ints(worlds, 4),
+            body_rows=SimpleNamespace(row_type=ints(worlds, 4)),
             unit_source=ints(worlds, ROWS),
             J_by_size={
                 size: wp.zeros((worlds, ROWS, size), dtype=float, device=device) for size in (PRIMARY, SECONDARY)

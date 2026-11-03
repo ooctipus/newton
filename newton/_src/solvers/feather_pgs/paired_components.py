@@ -30,7 +30,6 @@ PAIRED_COMPONENTS = (
     Field("counts", wp.int32, ("world",), attr="constraint_count", owner="placement"),
     Field("mf_counts", wp.int32, ("world",), attr="mf_constraint_count", owner="placement"),
     Field("first", wp.int32, ("world",), attr="dense_first", owner="placement"),
-    Field("mf_first", wp.int32, ("world",), owner="placement"),
     Field("primary_offset", wp.int32, ("world",), owner="sweep", attr="paired_factor_primary_offsets_by_world"),
     Field("secondary_offset", wp.int32, ("world",), owner="sweep", attr="paired_factor_secondary_offsets_by_world"),
     Field("selector", wp.int32, ("world",), owner="components"),
@@ -46,10 +45,11 @@ PAIRED_COMPONENTS = (
     Field("mf_meta", wp.int32, ("world", "mf_meta"), owner="step"),
     Field("mf_Z_a", wp.float32, ("world", "mf_row", 6), owner="placement"),
     Field("mf_Z_b", wp.float32, ("world", "mf_row", 6), owner="placement"),
-    Field("mf_mu", wp.float32, ("world", "mf_row"), attr="mf_row_mu", owner="placement"),
+    Field("body_base", wp.int32, owner="placement"),
 )
-"""The component classifier's inputs: the dense rows (packed and whitened at their world coordinates,
-:mod:`.packed_rows`) and the matrix-free rows, the pair layout and its own selector."""
+"""The component classifier's inputs: the row store's records (the dense rows from row 0, packed and whitened at their
+world coordinates, :mod:`.packed_rows`; the free bodies' from ``body_base``) and the free bodies' placement, the pair
+layout and its own selector."""
 
 PairedComponentData = field_group.struct("PairedComponentData", PAIRED_COMPONENTS, __name__)
 

@@ -23,8 +23,8 @@ _construct = Placement.__init__
 
 def _reversed_lines(self, *args, **kwargs):
     _construct(self, *args, **kwargs)
-    for table in (self.dense_first, self.mf_first):
-        table.assign(np.arange(table.shape[0] - 1, -1, -1, dtype=np.int32))
+    lines = self.dense_first.shape[0]
+    self.dense_first.assign(np.arange(lines - 1, -1, -1, dtype=np.int32))
 
 
 def _states(group, route, device):

@@ -23,6 +23,8 @@ the local owners' per-world claim. The row pass and the sweeps read its fields.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import warp as wp
 
@@ -52,10 +54,7 @@ from .solver_fields import (
     DENSE_WARMSTART,
     FUSED_DIAGONAL_LIMITS,
     MF_COUNTERS,
-    MF_ROW_EPS,
-    MF_ROW_WEIGHTS,
     MF_ROWS,
-    MF_WARMSTART,
     OVERFLOW_WARNING,
     ROW_SLOT_UNBOUNDED,
     ROW_WATERMARKS,
@@ -108,9 +107,25 @@ def _accumulate_row_capacity_telemetry(
         wp.atomic_add(overflow_world_steps, 0, 1)
 
 
+_BODY_RECORDS = (
+    "row_type",
+    "row_parent",
+    "row_mu",
+    "phi",
+    "row_restitution",
+    "row_incident",
+    "rhs",
+    "target_velocity",
+    "impulses",
+    "row_w",
+    "row_eps",
+)
+"""The row store's records the free bodies' rows read in their region (:meth:`Placement.body_region`)."""
+
+
 @wp.kernel
 def _clear_dense_row_state(
-    mf_first: wp.array[int],
+    first: wp.array[int],
     slot_counter: wp.array[int],
     dropped: wp.array2d[int],
     dense_first_rejected_slot: wp.array[int],
@@ -118,11 +133,13 @@ def _clear_dense_row_state(
     mf_slot_counter: wp.array[int],
     mf_first_rejected_slot: wp.array[int],
     mf_constraint_count: wp.array[int],
-    mf_impulses: wp.array2d[float],
+    body_base: int,
+    impulses: wp.array2d[float],
 ):
-    """Clear allocation state, row-loss counters and free-body row state in one launch."""
+    """Clear allocation state, row-loss counters and the free-body rows' state (counters, and impulses from
+    ``body_base`` of each world's line) in one launch."""
     world, column = wp.tid()
-    mf_line = mf_first[world]
+    line = first[world]
     if column == 0:
         slot_counter[world] = 0
         for family in range(2):
@@ -133,7 +150,7 @@ def _clear_dense_row_state(
             mf_first_rejected_slot[world] = _ROW_SLOT_UNBOUNDED
             mf_constraint_count[world] = 0
     if has_free_rigid != 0:
-        mf_impulses[mf_line, column] = 0.0
+        impulses[line, body_base + column] = 0.0
 
 
 @wp.kernel
@@ -243,10 +260,10 @@ class Placement:
         self.laws = laws
         self.factor = factor
         self.arrays = SolverArrays(self, model.device)
-        # The line of its family's store where each world's rows start: a world's rows are contiguous from it.
+        # The line of the row store where each world's rows sit: the dense class's from row 0, the free bodies' from
+        # ``body_base``.
         worlds = np.arange(forest.world_count, dtype=np.int32)
         self.dense_first = wp.array(worlds, dtype=wp.int32, device=model.device)
-        self.mf_first = wp.array(worlds, dtype=wp.int32, device=model.device)
         # Launches over the contact capacity (the force export, the warm-start snapshot and gathers, the keyed-row key
         # scatters) grid-stride over about one wave of blocks.
         self.contact_capacity_blocks = contact_capacity_blocks(model.device)
@@ -254,20 +271,21 @@ class Placement:
         self.dense_max_constraints = options.dense_max_constraints + laws.link_rows_per_world
         self.mf_max_constraints = options.mf_max_constraints
         _validate_mf_metadata_encoding(self.mf_max_constraints)
+        # The row store's line: the dense class's rows, then (with free rigid bodies) the free bodies' from
+        # ``body_base``.
+        self.body_base = self.dense_max_constraints
+        self.row_pitch = self.dense_max_constraints + (self.mf_max_constraints if forest.has_free_rigid_bodies else 0)
         # The carry's tables, allocated with their rows only when enabled.
         self.ws_prev_dense_impulses = None
         self.ws_prev_dense_row_type = None
         self.ws_prev_dense_row_parent = None
         self.ws_prev_dense_slot_sorted = None
-        self.ws_prev_mf_impulses = None
-        self.ws_prev_mf_row_type = None
-        self.ws_prev_mf_row_parent = None
         self.ws_prev_slot_sorted = None
         # All inactive weight arguments alias this one element. Their producer kernels skip stores and their consumer
         # kernels skip reads when regularization is disabled.
         self.contact_row_w_dummy = self.arrays.placeholder(wp.float32, (1, 1), 1.0)
         self.contact_row_eps_dummy = self.arrays.placeholder(wp.float32, (1, 1))
-        self.row_eps = self.mf_row_eps = self.contact_row_eps_dummy
+        self.row_eps = self.contact_row_eps_dummy
         self.J_by_size: dict[int, wp.array] = {}
         # The general placement's one writer (walk_rows): each row's unit source, by world line and row.
         self.walks = False
@@ -467,12 +485,10 @@ class Placement:
         arrays = self.arrays
         # The widest world's DOFs exist where a world response mapping was built (the routes that read them).
         world_dof = self.forest.max_world_dofs
-        sizes = {"world": self.forest.world_count, "row": self.dense_max_constraints, "world_dof": world_dof}
+        sizes = {"world": self.forest.world_count, "row": self.row_pitch, "world_dof": world_dof}
         arrays.allocate(DENSE_ROWS, **sizes)
-        # Dense identity-matched warm-start carry buffers. Allocated here (not in the MF
-        # buffer path) so scenes WITHOUT free rigid bodies still get them —
-        # allocate_free_body_rows early-returns for such scenes and the matched
-        # carry must never silently degrade to index reuse.
+        # The row store's identity-matched warm-start carry, both classes' rows: the matched carry must never silently
+        # degrade to index reuse.
         if self.options.pgs_warmstart:
             arrays.allocate(DENSE_WARMSTART, **sizes)
             self.ws_prev_dense_slot_rows = self.contact_pool.rows(
@@ -526,7 +542,9 @@ class Placement:
         """
         # Only free rigid bodies produce matrix-free rows, which the CUDA step packs each step.
         self.pack_mf_meta_kernel = (
-            response_builds_rows.free_body_meta_kernel(self.mf_max_constraints, model.device.arch)
+            response_builds_rows.free_body_meta_kernel(
+                self.mf_max_constraints, self.row_pitch, self.body_base, model.device.arch
+            )
             if self.forest.has_free_rigid_bodies and self.mf_max_constraints > 0
             else None
         )
@@ -535,14 +553,17 @@ class Placement:
         rows = self.mf_max_constraints if self.forest.has_free_rigid_bodies else 1
         arrays.allocate(MF_COUNTERS, world=worlds)
         arrays.allocate(MF_ROWS, world=worlds, mf_row=rows, mf_meta=4 * rows)
-        if self.laws.set.weighted and self.forest.has_free_rigid_bodies:
-            arrays.allocate(MF_ROW_WEIGHTS, world=worlds, mf_row=rows)
-        else:
-            self.mf_row_w = self.contact_row_w_dummy
-        if self.options.contact_compliance and self.forest.has_free_rigid_bodies:
-            arrays.allocate(MF_ROW_EPS, world=worlds, mf_row=rows)
-        else:
-            self.mf_row_eps = self.contact_row_eps_dummy
+        # The free bodies' records: the row store's region from its body base (a feature's placeholder stays whole,
+        # and without free bodies no free-body row is read).
+        records = {name: getattr(self, name, self.contact_row_eps_dummy) for name in _BODY_RECORDS}
+        self.body_rows = SimpleNamespace(
+            **{
+                name: self.body_region(array)
+                if self.forest.has_free_rigid_bodies and array.shape[1] == self.row_pitch
+                else array
+                for name, array in records.items()
+            }
+        )
 
         if not self.forest.has_free_rigid_bodies:
             # Only the ``is not None`` checks observe this on the inactive
@@ -554,9 +575,8 @@ class Placement:
             )
             return
 
-        # MF warm-start carry buffers. Allocated ONLY when the feature is on so
-        # the default-off path has zero memory / CUDA-graph delta. ``prev_mf_*``
-        # snapshot last step's converged impulses + their row-type table;
+        # The free bodies' warm-start slots, allocated ONLY when the feature is on so the default-off path has zero
+        # memory / CUDA-graph delta (their impulses and row types are the row store's carry):
         # ``ws_prev_slot_sorted`` records, per *current sorted contact index*,
         # the base MF slot that contact occupied last step. Because FeatherPGS
         # consumes the already-sorted contact arrays, the contact array index is
@@ -564,7 +584,6 @@ class Placement:
         # references the previous frame's *sorted* index) indexes directly into
         # this table — no matcher permutation access required.
         if self.options.pgs_warmstart:
-            arrays.allocate(MF_WARMSTART, world=worlds, mf_row=rows)
             pool = getattr(self, "contact_pool", None)
             if pool is None:
                 self.ws_prev_slot_sorted = wp.full((1,), -1, dtype=wp.int32, device=model.device)
@@ -702,9 +721,8 @@ class Placement:
 
     def allocate_placeholders(self):
         """The operands of the features that are off."""
-        # Operands of the features that are off (SolverArrays.placeholder). reset_world_warmstart_buffers
-        # writes -1 into its row-type and parent arguments, so their sink holds -1; the matrix-free counters
-        # stand in at world width, and allocate_world_contact_slots writes none of them when has_free_rigid == 0.
+        # Operands of the features that are off (SolverArrays.placeholder). The matrix-free counters stand in at world
+        # width, and allocate_world_contact_slots writes none of them when has_free_rigid == 0.
         placeholder = self.arrays.placeholder
         self.dummy_contact_impulses = placeholder(wp.float32, (1, 1))
         self.dummy_world_J = placeholder(wp.float32, (1, 1, 1))
@@ -712,8 +730,6 @@ class Placement:
         self.dummy_mf_slot_counter = placeholder(wp.int32, (self.forest.world_count,))
         self.dummy_mf_impulses = placeholder(wp.float32, (1, 1))
         self.dummy_contact_count = placeholder(wp.int32, (1,))
-        self.reset_dummy_mf_row_type = placeholder(wp.int32, (1, 1), -1)
-        self.reset_dummy_mf_row_parent = placeholder(wp.int32, (1, 1), -1)
 
     # ---------------------------------------------------------------------------------------------------------------
     # Step: the rows' slots, counts and status
@@ -740,16 +756,15 @@ class Placement:
                 device=self.model.device,
             )
 
-        # One launch clears the world-level allocation state and, with free rigid bodies, the
-        # matrix-free counters and impulses (PGS reads mf_impulses before its first write; the
-        # warm-start seed pass re-gathers after build_mf_contact_rows). Other row buffers are
-        # fully overwritten by their producers.
+        # One launch clears the world-level allocation state and, with free rigid bodies, the free bodies'
+        # counters and impulses (PGS reads their impulses before its first write; the warm-start seed pass
+        # re-gathers after the free bodies' writer). Other row buffers are fully overwritten by their producers.
         mf_active = self.forest.has_free_rigid_bodies
         wp.launch(
             _clear_dense_row_state,
-            dim=(self.forest.world_count, self.mf_impulses.shape[1] if mf_active else 1),
+            dim=(self.forest.world_count, self.mf_max_constraints if mf_active else 1),
             inputs=[
-                self.mf_first,
+                self.dense_first,
                 self.slot_counter,
                 self.row_dropped_all,
                 self.dense_first_rejected_slot,
@@ -757,7 +772,8 @@ class Placement:
                 self.mf_slot_counter if mf_active else self.dummy_mf_slot_counter,
                 self.mf_first_rejected_slot if mf_active else self.dummy_mf_slot_counter,
                 self.mf_constraint_count if mf_active else self.dummy_mf_slot_counter,
-                self.mf_impulses if mf_active else self.dummy_mf_impulses,
+                self.body_base,
+                self.impulses if mf_active else self.dummy_mf_impulses,
             ],
             device=self.model.device,
         )
@@ -1049,6 +1065,11 @@ class Placement:
         )
         self.unit_source = wp.full((self.forest.world_count, rows), 0, dtype=wp.int32, device=self.model.device)
 
+    def body_region(self, records: wp.array) -> wp.array:
+        """The free bodies' region of a row store record: each world line's rows from ``body_base``, a view whose
+        row ``i`` is the free bodies' row ``i``, the frame their slots and parents count in."""
+        return records[:, self.body_base : self.row_pitch]
+
     def diagonals(self) -> None:
         """The dense rows' diagonals, by the placement that holds them (:attr:`.step_plan.StepPlan.response`): the packed
         rows' start from zero for the one writer's ``|Z|^2 + cfm`` (local row packets keep their worlds' private seeds);
@@ -1083,7 +1104,7 @@ class Placement:
                 int(self.laws.set.weighted),
                 int(self.options.contact_compliance),
             ],
-            outputs=[self.mf_eff_mass_inv, self.mf_row_w],
+            outputs=[self.mf_eff_mass_inv, self.body_rows.row_w],
             device=model.device,
         )
 
@@ -1093,7 +1114,7 @@ class Placement:
             response_builds_rows.free_body_coordinates_kernel,
             dim=self.forest.world_count * self.mf_max_constraints,
             inputs=[
-                self.mf_first,
+                self.dense_first,
                 self.mf_constraint_count,
                 self.mf_body_a,
                 self.mf_body_b,
@@ -1105,7 +1126,7 @@ class Placement:
             device=self.model.device,
         )
 
-    def pack_free_body_meta(self, mf_rhs: wp.array) -> None:
+    def pack_free_body_meta(self) -> None:
         """Pack matrix-free row metadata for the GS kernels, or skip when no such row can exist."""
         if not self.forest.has_free_rigid_bodies:
             # Only free rigid bodies produce matrix-free rows, and the model plan fixes
@@ -1117,14 +1138,14 @@ class Placement:
             dim=[self.forest.world_count],
             inputs=[
                 self.mf_constraint_count,
-                self.mf_first,
+                self.dense_first,
                 self.mf_dof_a,
                 self.mf_dof_b,
                 self.mf_eff_mass_inv,
-                mf_rhs,
-                self.mf_row_incident,
-                self.mf_row_type,
-                self.mf_row_parent,
+                self.rhs,
+                self.row_incident,
+                self.row_type,
+                self.row_parent,
             ],
             outputs=[self.mf_meta_packed],
             block_dim=32,

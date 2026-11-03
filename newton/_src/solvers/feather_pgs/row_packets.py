@@ -118,10 +118,10 @@ QUEUE = (
     Field("secondary", wp.int32, ("articulation",), owner="sweep", attr="local_pair_articulation"),
     Field("residual_secondary", wp.int32, ("articulation",), owner="sweep", attr="local_residual_pair_articulation"),
     Field("mf_count", wp.int32, ("world",), attr="mf_constraint_count", owner="placement"),
-    Field("mf_first", wp.int32, ("world",), owner="placement"),
+    Field("mf_first", wp.int32, ("world",), attr="dense_first", owner="placement"),
     Field("mf_body0", wp.int32, ("world", "mf_row"), attr="mf_body_a", owner="placement"),
     Field("mf_body1", wp.int32, ("world", "mf_row"), attr="mf_body_b", owner="placement"),
-    Field("mf_row_type", wp.int32, ("world", "mf_row"), owner="placement"),
+    Field("mf_row_type", wp.int32, ("world", "mf_row"), attr="row_type", owner="body"),
     Field("body_art", wp.int32, ("body",), owner="forest", attr="body_to_articulation"),
     Field("count", wp.int32, ("world",), attr="constraint_count", owner="placement"),
     Field("owner", wp.int32, ("world",), attr="local_solve_owner", owner="placement"),
@@ -274,9 +274,7 @@ def finalize_and_queue(
     """Fuse the dense-count clamp, the local ownership decision and the two queues."""
     world = wp.tid()
     mf_line = queue.mf_first[world]
-    rows = reserved_count(
-        prefix.slot_counter, world, prefix.row_type.shape[1], prefix.first_rejected_slot, queue.status, 0
-    )
+    rows = reserved_count(prefix.slot_counter, world, prefix.capacity, prefix.first_rejected_slot, queue.status, 0)
     queue.count[world] = rows
     mf_count = queue.mf_count[world]
     primary = queue.primary[world]
@@ -514,7 +512,13 @@ class LocalRowPackets:
             residual_pair=solver.sweep.local_residual.active_secondaries[self.primary],
         )
         self.queue = field_group.bind(
-            QueueData, sweep=solver.sweep, placement=solver.placement, forest=solver.forest, size=size, status=None
+            QueueData,
+            sweep=solver.sweep,
+            placement=solver.placement,
+            body=solver.placement.body_rows,
+            forest=solver.forest,
+            size=size,
+            status=None,
         )
         self.contact_input = None
         self.law = None

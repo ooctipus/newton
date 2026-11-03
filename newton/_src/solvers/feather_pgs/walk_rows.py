@@ -603,6 +603,8 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
     const int dof0 = unit.dof0, dof1 = unit.dof1;
     const int S = sink.entries.shape[2];
     const int row0 = unit.line * sink.entries.shape[1] + unit.slot;
+    // The row's records in the row store, whose line holds the free bodies' rows after the dense ones.
+    const int rec0 = unit.line * sink.diag.shape[1] + unit.slot;
     float* const Z = sink.entries.data + (size_t)$zrow * S;
     const bool covector = dof0 >= 0;
     float incident[$rows], norm[$rows], zc[$rows], cross[6];
@@ -718,8 +720,8 @@ $close    if (reread) {
         }
     }
     for (int r = 0; r < rows; ++r) {
-        ST(sink.diag.data + row0 + r, $diag);
-        ST(sink.row_incident.data + row0 + r, incident[r]);
+        ST(sink.diag.data + rec0 + r, $diag);
+        ST(sink.row_incident.data + rec0 + r, incident[r]);
     }
 $record"""
 """The support sink's unit walker, ``$rows`` rows a lane (:func:`support_rows_kernel`)."""
@@ -764,7 +766,7 @@ _SUPPORT_RECORD = """    // A full unit's block record from its Gram (sparse_con
         ST(record + 0, cross[0]);
         ST(record + 1, cross[1]);
         ST(record + 2, cross[2]);
-        ST(record + 3, 1.0f / (norm[0] + RD(sink.row_cfm.data + row0)));
+        ST(record + 3, 1.0f / (norm[0] + RD(sink.row_cfm.data + rec0)));
 $tail
     }
 """
@@ -841,7 +843,7 @@ _SUPPORT_SIDE = """        unsigned long long mask = 0ull;
                 for (int e = base; e < count; ++e) ST(Z + r * S + e, 0.0f);
         }"""
 
-_HEADER_DIAG = "norm[r] + RD(sink.row_cfm.data + row0 + r)"
+_HEADER_DIAG = "norm[r] + RD(sink.row_cfm.data + rec0 + r)"
 
 _SUPPORT_BELOW = """                if (!add)
                     for (int e = base; e < rank(c); ++e) ST(Z + e, 0.0f);

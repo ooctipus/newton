@@ -173,8 +173,8 @@ def run_native_hydro_fixture(*, articulated=True):
             paths = solver.placement.contact_path.numpy()[:count]
             if not np.all(paths == (0 if articulated else 1)):
                 raise AssertionError("Native hydro fixture did not use the requested contact route")
-            impulses = solver.placement.impulses if articulated else solver.placement.mf_impulses
-            row_types = solver.placement.row_type if articulated else solver.placement.mf_row_type
+            impulses = solver.placement.impulses if articulated else solver.placement.body_rows.impulses
+            row_types = solver.placement.row_type if articulated else solver.placement.body_rows.row_type
             results["compliant" if enabled else "stock_law"] = {
                 "body_z_m": float(output.body_q.numpy()[body, 2]),
                 "joint_velocity_m_s": float(output.joint_qd.numpy()[0]),

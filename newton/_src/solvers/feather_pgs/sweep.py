@@ -1286,14 +1286,15 @@ def dense_tier_world(
     *,
     rows: str,
     support: int,
+    pitch: int,
     pad: str = "    ",
 ) -> str:
     """Enter a world of a dense-row tier, or return: one without free-body rows and with more than ``min_rows`` and
     at most ``capacity`` dense rows.
 
     Declares ``m_dense``, ``m_mf``, ``rows`` (the rows the tier holds, ``m_dense``), ``dof_map_base``,
-    ``off_dense``, and the world's first packed row entry ``packed_base`` (rows of ``support`` entries:
-    :mod:`.packed_rows`).
+    ``off_dense`` (the world's line of the row store, ``pitch`` rows a line), and the world's first packed row entry
+    ``packed_base`` (rows of ``support`` entries: :mod:`.packed_rows`).
     """
     base = f"const size_t packed_base = (size_t)line * {max_constraints * int(support)};"
     return f"""{pad}int m_dense = world_constraint_count.data[world];
@@ -1305,7 +1306,7 @@ def dense_tier_world(
 {pad}const int dof_map_base = world * {dofs};
 {pad}const int line = dense_first.data[world];
 {pad}__builtin_assume(line >= 0);
-{pad}const int off_dense = line * {max_constraints};
+{pad}const int off_dense = line * {pitch};
 {pad}{base}"""
 
 

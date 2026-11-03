@@ -131,11 +131,12 @@ def free_body_row_header(
     weighted: int,
     material: int,
     mf_eff_mass_inv: wp.array2d[float],
-    mf_row_w: wp.array2d[float],
+    weights: wp.array2d[float],
 ):
     """Free-body row ``i``'s header from its incident velocity ``J v_hat`` and stored inverse diagonal ``1 / A_ii``:
     both stored, then its ``rhs`` (:func:`free_body_row_rhs`). ``weighted`` rows store their relative regularization
-    weight; a material contact (``material``: its writer stored its rhs and compliance ``eps``) keeps its rhs."""
+    weight (in ``weights``: the row store's free-body region); a material contact (``material``: its writer stored its
+    rhs and compliance ``eps``) keeps its rhs."""
     row_type = mf.row_type[line, i]
     mf.incident[line, i] = incident
     mf_eff_mass_inv[line, i] = inverse
@@ -162,12 +163,12 @@ def free_body_row_header(
     )
     mf.rhs[line, i] = rhs
     if weighted != 0:
-        mf_row_w[line, i] = row_w
+        weights[line, i] = row_w
 
 
 @wp.kernel(enable_backward=False)
 def free_body_coordinates_kernel(
-    mf_first: wp.array[int],
+    first: wp.array[int],
     mf_constraint_count: wp.array[int],
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -184,51 +185,53 @@ def free_body_coordinates_kernel(
     c = tid % mf_max_constraints
     if c >= mf_constraint_count[world]:
         return
-    mf_line = mf_first[world]
+    mf_line = first[world]
     mf_dof_a[mf_line, c] = body_coordinate(mf_body_a[mf_line, c], body_to_articulation, articulation_world_dof_offset)
     mf_dof_b[mf_line, c] = body_coordinate(mf_body_b[mf_line, c], body_to_articulation, articulation_world_dof_offset)
 
 
 @cache
-def free_body_meta_kernel(mf_max_constraints: int, device_arch: str) -> wp.Kernel:
+def free_body_meta_kernel(mf_max_constraints: int, pitch: int, base: int, device_arch: str) -> wp.Kernel:
     """Pack each world's free-body rows into the 128-bit word the matrix-free sweeps load (:meth:`.FreeBodyZ.pack`).
 
     A warp per world (``wp.launch_tiled`` over the worlds, 32 threads; one thread on the CPU), a lane per row; the
     word holds the rows' world coordinates, stored inverse diagonal, right-hand side (the law's plus the row's incident
-    velocity: its residual at ``du = 0``), type and parent. ``device_arch`` keys the variant.
+    velocity: its residual at ``du = 0``), type and parent. The records are the row store's (``pitch`` rows a line,
+    the free bodies' from ``base``). ``device_arch`` keys the variant.
     """
     _validate_mf_metadata_encoding(mf_max_constraints)
     word = FreeBodyZ().pack("packed", "da", "db", "diag", "rhs_val", "rt", "par", "        ")
     body = f"""    int m_mf = mf_constraint_count.data[world];
-    const int mf_line = mf_first.data[world];
+    const int mf_line = first.data[world];
     __builtin_assume(mf_line >= 0);
     int off_mf = mf_line * {mf_max_constraints};
     int off_meta = off_mf * 4;
+    const int off_body = mf_line * {pitch} + {base};
 
     for (int i = LANE; i < m_mf; i += STRIDE) {{
         int da = mf_dof_a.data[off_mf + i];
         int db = mf_dof_b.data[off_mf + i];
         float diag = mf_eff_mass_inv.data[off_mf + i];
-        float rhs_val = mf_rhs.data[off_mf + i] + mf_row_incident.data[off_mf + i];
-        int rt = mf_row_type.data[off_mf + i];
-        int par = mf_row_parent.data[off_mf + i];
+        float rhs_val = rhs.data[off_body + i] + row_incident.data[off_body + i];
+        int rt = row_type.data[off_body + i];
+        int par = row_parent.data[off_body + i];
 
 {word}
         *reinterpret_cast<int4*>(&mf_meta.data[off_meta + i * 4]) = packed;
     }}
 """
     return KernelTemplate(
-        f"free_body_meta_{mf_max_constraints}",
+        f"free_body_meta_{mf_max_constraints}_{pitch}",
         kernel_template.params(
             ("mf_constraint_count", wp.array[int]),
-            ("mf_first", wp.array[int]),
+            ("first", wp.array[int]),
             ("mf_dof_a", wp.array2d[int]),
             ("mf_dof_b", wp.array2d[int]),
             ("mf_eff_mass_inv", wp.array2d[float]),
-            ("mf_rhs", wp.array2d[float]),
-            ("mf_row_incident", wp.array2d[float]),
-            ("mf_row_type", wp.array2d[int]),
-            ("mf_row_parent", wp.array2d[int]),
+            ("rhs", wp.array2d[float]),
+            ("row_incident", wp.array2d[float]),
+            ("row_type", wp.array2d[int]),
+            ("row_parent", wp.array2d[int]),
             ("mf_meta", wp.array2d[int]),
         ),
         dual_native(body, preludes=(lane_group(32), CPU_MATH)),
@@ -436,6 +439,7 @@ _PAIRED_COMPONENTS = r"""
 #endif
     const int M = data.Y.shape[1];
     const int F = data.mf_meta.shape[1] / 4;
+    const int pitch = data.row_type.shape[1];
     for (int world = worker; world < data.world_count; world += workers) {
         const int m = data.counts.data[world];
         const int mf = data.mf_counts.data[world];
@@ -457,17 +461,18 @@ _PAIRED_COMPONENTS = r"""
         }
         for (int row = LANE; row < m; row += STRIDE) {
             const int r = data.first.data[world] * M + row;
-            const int type = data.row_type.data[r];
-            const float diag = data.diag.data[r];
-            const float mu = data.mu.data[r];
+            const int at = data.first.data[world] * pitch + row;
+            const int type = data.row_type.data[at];
+            const float diag = data.diag.data[at];
+            const float mu = data.mu.data[at];
             valid &= (type == 0 || type == 2 || type == 3)
                 && wp::isfinite(diag) && diag > 0.0f
-                && wp::isfinite(mu) && mu >= 0.0f && wp::isfinite(data.rhs.data[r]);
+                && wp::isfinite(mu) && mu >= 0.0f && wp::isfinite(data.rhs.data[at]);
             if (type == 2) {
-                const int p = data.row_parent.data[r];
+                const int p = data.row_parent.data[at];
                 if (p < 0 || p + 2 >= m || (row != p + 1 && row != p + 2)) valid = 0;
                 else {
-                    const int base = data.first.data[world] * M + p;
+                    const int base = data.first.data[world] * pitch + p;
                     valid &= data.row_type.data[base] == 0
                         && data.row_type.data[base + 1] == 2 && data.row_type.data[base + 2] == 2
                         && data.row_parent.data[base + 1] == p && data.row_parent.data[base + 2] == p;
@@ -480,14 +485,14 @@ _PAIRED_COMPONENTS = r"""
             }
         }
         for (int row = LANE; row < mf; row += STRIDE) {
-            const int r = data.mf_first.data[world] * F + row;
+            const int r = data.first.data[world] * F + row;
             const int packed = data.mf_meta.data[r * 4];
             const int a = packed >> 16, b = static_cast<int>(static_cast<short>(packed & 65535));
             const int tp = data.mf_meta.data[r * 4 + 3], type = tp & 65535;
             union { int bits; float value; } diag, rhs;
             diag.bits = data.mf_meta.data[r * 4 + 1];
             rhs.bits = data.mf_meta.data[r * 4 + 2];
-            const float mu = data.mf_mu.data[r];
+            const float mu = data.mu.data[data.first.data[world] * pitch + data.body_base + row];
             valid &= (a == -1 || a == so) && (b == -1 || b == so) && (a == so || b == so)
                 && (type == 0 || type == 2 || type == $SPEED)
                 && wp::isfinite(diag.value) && diag.value > 0.0f && wp::isfinite(rhs.value)
@@ -497,7 +502,7 @@ _PAIRED_COMPONENTS = r"""
                 const int p = encoded_parent == 65535 ? -1 : encoded_parent;
                 if (p < 0 || p + 2 >= mf || (row != p + 1 && row != p + 2)) valid = 0;
                 else {
-                    const int base = (data.mf_first.data[world] * F + p) * 4 + 3;
+                    const int base = (data.first.data[world] * F + p) * 4 + 3;
                     const int t1 = data.mf_meta.data[base + 4], t2 = data.mf_meta.data[base + 8];
                     valid &= (data.mf_meta.data[base] & 65535) == 0
                         && (t1 & 65535) == 2 && (t2 & 65535) == 2

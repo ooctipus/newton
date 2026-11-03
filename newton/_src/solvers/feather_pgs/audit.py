@@ -559,15 +559,15 @@ class Audit:
                 a,
                 mf,
                 solver.factor.walk_view(),
-                solver.placement.mf_impulses,
-                solver.placement.mf_row_w,
+                solver.placement.body_rows.impulses,
+                solver.placement.body_rows.row_w,
                 solver.placement.mf_eff_mass_inv,
                 v,
                 forest.articulation_world_dof_offset,
                 self.coordinates,
             ]
             wp.launch(free_rows, dim=worlds, inputs=inputs, outputs=[self.mf_velocity], device=device)
-        inputs = [a, mf, solver.placement.mf_impulses, self.velocity, self.mf_velocity, self.fused]
+        inputs = [a, mf, solver.placement.body_rows.impulses, self.velocity, self.mf_velocity, self.fused]
         wp.launch(audit_world, dim=worlds, inputs=inputs, outputs=[self.readout], device=device)
 
     def read(self) -> dict:

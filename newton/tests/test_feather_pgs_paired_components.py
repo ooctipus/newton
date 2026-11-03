@@ -54,9 +54,18 @@ class TestPairedComponents(unittest.TestCase):
         expected_selector[1:3] = [0, 3]
         np.testing.assert_array_equal(data.selector.numpy(), expected_selector)
         # The rows are already whitened (packed at their world coordinates): the qualification reads them only.
+        dense = host["mu"].shape[1]
         for name, before in host.items():
-            if name not in ("selector", "J", "L", "primary_group"):
-                np.testing.assert_array_equal(getattr(data, name).numpy(), before, err_msg=name)
+            if name in ("selector", "J", "L", "primary_group"):
+                continue
+            # The row store's records: the dense rows' from row 0, the free bodies' coefficients from the dense capacity.
+            if name == "mf_mu":
+                actual = data.mu.numpy()[:, dense:]
+            elif name in ("rhs", "diag", "mu", "row_type", "row_parent"):
+                actual = getattr(data, name).numpy()[:, :dense]
+            else:
+                actual = getattr(data, name).numpy()
+            np.testing.assert_array_equal(actual, before, err_msg=name)
 
     def test_reject_current_coupling_metadata_and_nonfinite(self):
         """Retain the complete mixed sweep on each independent rejection reason."""

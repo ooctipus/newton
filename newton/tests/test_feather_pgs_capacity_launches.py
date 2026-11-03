@@ -82,15 +82,15 @@ def _export_inputs(device, capacity, count, rng):
         slot=slot,
         path=path,
     )
+    # One row store: the free bodies' rows (path 1) from row ``rows`` of each world's line, laid out as the dense ones.
     return [
         row_lines(device),
-        row_lines(device),
+        rows,
         routes,
-        floats((worlds, rows)),
-        floats((worlds, rows)),
+        floats((worlds, 2 * rows)),
         counts,
         counts,
-        *(ints(values) for values in (row_type, row_parent) * 2),
+        *(ints(np.concatenate((values, values), axis=1)) for values in (row_type, row_parent)),
         1,
         240.0,
     ]

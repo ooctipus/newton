@@ -4,6 +4,7 @@
 """Check the slot-order and carrier independent patch-friction comparisons on CPU."""
 
 import contextlib
+import operator
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -86,17 +87,19 @@ def _ring_pool_dropped(solver):
 
 
 _MF_ROWS = (
-    "mf_row_type",
-    "mf_row_parent",
-    "mf_row_mu",
-    "mf_rhs",
-    "mf_impulses",
-    "mf_phi",
+    "body_rows.row_type",
+    "body_rows.row_parent",
+    "body_rows.row_mu",
+    "body_rows.rhs",
+    "body_rows.impulses",
+    "body_rows.phi",
     "mf_Z_a",
     "mf_Z_b",
     "mf_body_a",
     "mf_body_b",
 )
+"""The free-body rows' arrays a slot permutation moves: their records (the row store's free-body region) and their
+placement."""
 
 
 def _permuted_slots(solver, contacts, shift):
@@ -105,7 +108,7 @@ def _permuted_slots(solver, contacts, shift):
     slot, path = solver.placement.contact_slot.numpy().copy(), solver.placement.contact_path.numpy()
     world, needed = solver.placement.contact_world.numpy(), solver.placement.contact_slots_needed.numpy()
     routed = [c for c in range(count) if path[c] == 1 and slot[c] >= 0 and needed[c] > 0]
-    rows = {name: getattr(solver.placement, name).numpy() for name in _MF_ROWS}
+    rows = {name: operator.attrgetter(name)(solver.placement).numpy() for name in _MF_ROWS}
     permuted = {name: values.copy() for name, values in rows.items()}
     moved = {}
     for w in np.unique(world[routed]):
@@ -123,11 +126,15 @@ def _permuted_slots(solver, contacts, shift):
     for (w, old), new in moved.items():
         for name in _MF_ROWS:
             permuted[name][w, new] = rows[name][w, old]
-        parent = int(rows["mf_row_parent"][w, old])
-        permuted["mf_row_parent"][w, new] = moved.get((w, parent), parent)
+        parent = int(rows["body_rows.row_parent"][w, old])
+        permuted["body_rows.row_parent"][w, new] = moved.get((w, parent), parent)
+    arrays = {name: wp.array(values, device="cpu") for name, values in permuted.items()}
     stand_in = SimpleNamespace(
         placement=SimpleNamespace(
-            **{name: wp.array(values, device="cpu") for name, values in permuted.items()},
+            **{name: value for name, value in arrays.items() if "." not in name},
+            body_rows=SimpleNamespace(
+                **{name.split(".")[1]: value for name, value in arrays.items() if name.startswith("body_rows.")}
+            ),
             mf_constraint_count=solver.placement.mf_constraint_count,
             contact_slot=wp.array(slot, device="cpu"),
             contact_path=solver.placement.contact_path,

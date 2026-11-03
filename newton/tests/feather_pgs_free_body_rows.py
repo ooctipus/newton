@@ -29,7 +29,7 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
     Z_a = solver.placement.mf_Z_a.numpy() if Z_a is None else np.asarray(Z_a)
     Z_b = solver.placement.mf_Z_b.numpy() if Z_b is None else np.asarray(Z_b)
     articulation = solver.forest.body_to_articulation.numpy()
-    row_type = solver.placement.mf_row_type.numpy()
+    row_type = solver.placement.body_rows.row_type.numpy()
     records = solver.factor.walk_view().data.numpy()
     data = unpack_walk_records(records, records.shape[0]).astype(np.float64)
     starts = solver.forest.articulation_dof_start.numpy()
@@ -72,7 +72,8 @@ def sweep_free_body_rows(
     (``regularize``). Contact rows have no parent; a friction row's parent is its normal row.
     """
     Z = np.asarray(Z, np.float32)
-    rows, capacity = len(Z), 8
+    # The row store's line: 8 dense rows (none live), then the free bodies' from row 8.
+    rows, capacity, dense = len(Z), 8, 8
     impulses = np.zeros(rows, np.float32) if impulses is None else np.asarray(impulses, np.float32)
     diag = np.sum(Z.astype(np.float64) ** 2, axis=1)
     inverse = np.where(diag > 0.0, 1.0 / np.where(diag > 0.0, diag, 1.0), 0.0)
@@ -83,8 +84,8 @@ def sweep_free_body_rows(
     padded[0, :rows] = Z
 
     def per_row(values, dtype=np.float32):
-        out = np.zeros((1, capacity), dtype)
-        out[0, :rows] = values
+        out = np.zeros((1, dense + capacity), dtype)
+        out[0, dense : dense + rows] = values
         return wp.array(out, device=device)
 
     values = {
@@ -110,7 +111,7 @@ def sweep_free_body_rows(
         "v_out": wp.zeros(6, dtype=wp.float32, device=device),
     }
     kernel = sweep_routes.mf_gs_kernel(
-        8,
+        dense,
         capacity,
         6,
         str(wp.get_device(device).arch),
@@ -130,4 +131,4 @@ def sweep_free_body_rows(
         else:
             inputs.append(arguments[name].type(0))
     wp.launch_tiled(kernel, dim=[1], inputs=inputs, block_dim=32, device=device)
-    return values["mf_impulses"].numpy()[0, :rows].astype(np.float64)
+    return values["mf_impulses"].numpy()[0, dense : dense + rows].astype(np.float64)

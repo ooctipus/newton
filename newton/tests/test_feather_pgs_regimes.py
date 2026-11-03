@@ -689,8 +689,8 @@ class TestQ11Stack(unittest.TestCase):
         )
         mass = float(model.body_mass.numpy()[0])
         counts = int(solver.placement.mf_constraint_count.numpy()[0])
-        lam = solver.placement.mf_impulses.numpy()[0, :counts]
-        kinds = solver.placement.mf_row_type.numpy()[0, :counts]
+        lam = solver.placement.body_rows.impulses.numpy()[0, :counts]
+        kinds = solver.placement.body_rows.row_type.numpy()[0, :counts]
         body_b = solver.placement.mf_body_b.numpy()[0, :counts]
         body_a = solver.placement.mf_body_a.numpy()[0, :counts]
         ground = (kinds == 0) & ((body_a < 0) | (body_b < 0))
@@ -852,8 +852,8 @@ class TestQ13Indeterminate(unittest.TestCase):
         v = state.body_qd.numpy()[0]
         self.assertLess(float(np.abs(v).max()), 1.0e-3)
         count = int(solver.placement.mf_constraint_count.numpy()[0])
-        normal = solver.placement.mf_row_type.numpy()[0, :count] == 0
-        load = float(np.sum(solver.placement.mf_impulses.numpy()[0, :count][normal]))
+        normal = solver.placement.body_rows.row_type.numpy()[0, :count] == 0
+        load = float(np.sum(solver.placement.body_rows.impulses.numpy()[0, :count][normal]))
         weight = float(model.body_mass.numpy()[0]) * G0 * H
         self.assertAlmostEqual(load, weight, delta=1.0e-3 * weight)
 
@@ -1314,7 +1314,10 @@ class Manufactured:
     def held_offsets(self, solver):
         """Each loaded contact's held ``b`` less the stated one [m/s], and each unit's held tangent ``b`` (stated 0: a
         new anchor carries no displacement); 0 where a world's rows stay inside its sweep."""
-        stores = solver.placement.rhs.numpy().astype(np.float64), solver.placement.mf_rhs.numpy().astype(np.float64)
+        stores = (
+            solver.placement.rhs.numpy().astype(np.float64),
+            solver.placement.body_rows.rhs.numpy().astype(np.float64),
+        )
         held = self._held(solver)
         offsets = np.zeros(self.count)
         for c in np.flatnonzero(self.status != self.SEPARATED):

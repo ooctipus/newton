@@ -199,6 +199,7 @@ def local_owned_source(
     material: bool = False,
     walk_release: bool = False,
     walk_staged: bool = True,
+    pitch: int | None = None,
 ) -> tuple[str, Staging]:
     """The native body of a local owner's sweep: an articulation's rows (and a paired free body's coordinates and,
     for the residual owner, its free-body rows) over the response block the lane group builds in the kernel. Under
@@ -220,6 +221,8 @@ def local_owned_source(
     M, R, P, S = int(max_constraints), int(local_max_constraints), int(dof_count), int(paired_dof_count)
     T, MFS, MFR, L = P + S, int(mf_max_constraints), int(local_mf_max_constraints), int(lanes_per_world)
     _check_local_options(warps_per_block, L, contact_capable, T, S, MFS, MFR)
+    # The row store's line: the dense rows, then the free bodies' from M (:mod:`.dense_rows`).
+    pitch = M + MFS if pitch is None else int(pitch)
     lanes = Lanes(L)
     free = FreeBodyZ(lanes) if MFR else None
     if torsion and not contact_capable:
@@ -278,8 +281,8 @@ def local_owned_source(
     if (mf_count > {MFR}) mf_count = {MFR};
     const int mf_line = mf_first.data[world];
     __builtin_assume(mf_line >= 0);
-    const int off_mf = mf_line * {MFS};
-    const int off_meta = off_mf * 4;
+    const int off_mf = mf_line * {pitch} + {M};
+    const int off_meta = mf_line * {MFS * 4};
     const int mf6_base = mf_line * {MFS * 6};"""
         mf_load = (
             f"\n    for (int row = lane; row < mf_count; row += {L}) s_mf_lam[row] = mf_impulses.data[off_mf + row];"
@@ -298,7 +301,8 @@ def local_owned_source(
 
     const int line = dense_first.data[world];
     __builtin_assume(line >= 0);
-    const int world_row_base = line * {M};{pair}
+    const int world_row_base = line * {pitch};
+    const int packed_row_base = line * {M};{pair}
 {staging.declarations("    ")}{mf_setup}
 {indent(op.prologue(), "    ")}
     for (int row = lane; row < row_count; row += {L}) {{
@@ -467,6 +471,7 @@ def local_owned_kernel(
     material: bool = False,
     walk_release: bool = False,
     walk_staged: bool = True,
+    pitch: int | None = None,
 ) -> wp.Kernel:
     """A local owner's sweep kernel.
 
@@ -490,6 +495,7 @@ def local_owned_kernel(
         material=material,
         walk_release=walk_release,
         walk_staged=walk_staged,
+        pitch=pitch,
     )
     staging.check("the local owner's sweep", arch_budget(device_arch))
     family = "sweep_local" if row_inputs is None else "sweep_local_packet"
@@ -505,6 +511,7 @@ def local_owned_kernel(
         + (f"_walk{row_inputs.bodies}" if row_inputs is not None else "")
         + ("_inplace" if row_inputs is not None and not walk_staged else "")
         + ("_release" if walk_release else "")
+        + ("" if pitch is None or pitch == max_constraints + mf_max_constraints else f"_p{int(pitch)}")
         + solve_policy.suffix
     )
     queue = kernel_template.candidate_queue if persistent_queue else kernel_template.candidates
@@ -568,6 +575,7 @@ def paired_factor_source(
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
+    pitch: int | None = None,
 ) -> tuple[str, Staging]:
     """The native body of the paired factor sweep: a world's rows in the factor coordinates of its articulation and
     free body (:class:`.FactorRows`), a warp per world, the velocity change from the predictor, ``u = L^T dv``, from
@@ -589,6 +597,8 @@ def paired_factor_source(
     Returns the body and its staging.
     """
     M, D, P, S = int(max_constraints), int(max_world_dofs), int(primary_dofs), int(secondary_dofs)
+    # The row store's line (its dense rows, then the free bodies'); the packed rows keep M rows a world.
+    pitch = M if pitch is None else int(pitch)
     if M <= 0:
         raise ValueError("max_constraints must be positive")
     if P <= 0 or S <= 0 or P + S != D or D > 32:
@@ -678,8 +688,8 @@ def paired_factor_source(
 
     const int line = dense_first.data[world];
     __builtin_assume(line >= 0);
-    const int off = line * {M};
-    const int row_base = off * {D};
+    const int off = line * {pitch};
+    const int row_base = line * {M * D};
     const int dof_map_base = world * {D};
     const int primary_offset = primary_offset_by_world.data[world];
     const int secondary_offset = secondary_offset_by_world.data[world];
@@ -948,6 +958,7 @@ def paired_factor_kernel(
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
+    pitch: int | None = None,
 ) -> wp.Kernel:
     """The paired factor sweep kernel; weighted rows' and material contacts' operands (:func:`.sweep.weight_arguments`,
     :func:`.sweep.material_arguments`), a readout's operand and the walk's view follow ``v_out``."""
@@ -963,6 +974,7 @@ def paired_factor_kernel(
         solve_policy=solve_policy,
         weighted=weighted,
         material=material,
+        pitch=pitch,
     )
     staging.check("the paired factor sweep", arch_budget(device_arch))
     name = (
@@ -973,6 +985,7 @@ def paired_factor_kernel(
         + ("_weighted" if weighted else "")
         + ("_material" if material else "")
         + ("_torsion" if torsion else "")
+        + ("" if pitch is None or pitch == max_constraints else f"_p{int(pitch)}")
         + "_walk"
         + solve_policy.suffix
     )

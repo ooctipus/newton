@@ -287,7 +287,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
                     np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], fa[c], rtol=1.0e-6, atol=1.0e-9)
                     np.testing.assert_allclose(rb[slot[c] + 1 : slot[c] + 3], beta)
                 else:
-                    ph, rt = solver.placement.mf_phi.numpy()[0], solver.placement.mf_row_type.numpy()[0]
+                    ph, rt = solver.placement.body_rows.phi.numpy()[0], solver.placement.body_rows.row_type.numpy()[0]
                     if rt[slot[c] + 1] != PGS_CONSTRAINT_TYPE_FRICTION:
                         continue
                     np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], beta * fa[c], rtol=1.0e-5, atol=1.0e-9)

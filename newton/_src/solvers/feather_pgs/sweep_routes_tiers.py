@@ -161,6 +161,7 @@ def parallel_source(
     material: bool = False,
     frame: tuple[int, int] = (0, 0),
     walk_half: int = WALK_BOTH,
+    pitch: int | None = None,
 ) -> tuple[str, Staging]:
     """The native body of a parallel tier: a world's dense rows (at most ``rows``, more than ``min_rows``) under the
     Jacobi law, a thread per row; under ``torsion`` a contact's spin row steps and projects with its pair.
@@ -232,7 +233,7 @@ def parallel_source(
 
     last_word = jacobi_limit_pass(store, op) if velocity_limit_pass else ""
     body = f"""    const int lane = LANE;
-{dense_tier_world(AM, int(min_rows), D, M_D, rows="n_rows", support=D)}
+{dense_tier_world(AM, int(min_rows), D, M_D, rows="n_rows", support=D, pitch=M_D if pitch is None else int(pitch))}
 
 {staging.declarations("    ")}{trace_reduction}
 {op.registers("    ")}
@@ -288,6 +289,7 @@ def parallel_kernel(
     material: bool = False,
     frame: tuple[int, int] = (0, 0),
     walk_half: int = WALK_BOTH,
+    pitch: int | None = None,
 ) -> SweepTier:
     """A parallel tier: its kernel (:data:`PARALLEL_ABI`, the world queue) and its launch descriptor.
 
@@ -320,6 +322,7 @@ def parallel_kernel(
         material=material,
         frame=frame,
         walk_half=walk_half,
+        pitch=pitch,
     )
     staging.check("the parallel tier", arch_budget(device_arch))
     (NA, NB, OA, OB), operands = _operands(max_constraints, max_world_dofs, **options)
@@ -330,6 +333,7 @@ def parallel_kernel(
         f"_{max_world_dofs}_rows{AM}_min{int(min_rows)}_sweeps{int(sweeps)}_nt{NT}_ink{NA}_{NB}_o{OA}_{OB}"
         + (f"_frame{int(frame[0])}_{int(frame[1])}" if any(frame) else "")
         + ("" if walk_half == WALK_BOTH else f"_half{walk_half}")
+        + ("" if pitch is None or pitch == max_constraints else f"_p{int(pitch)}")
         + ("_linked" if linked_rows else "")
         + ("_lw" if velocity_limit_pass else "")
         + ("_weighted" if weighted else "")

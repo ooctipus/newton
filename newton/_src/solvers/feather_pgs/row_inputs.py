@@ -119,7 +119,7 @@ class StoredLocalRows:
         P, S = op.primary, op.secondary
         lines = [
             "const wp::vec2i sides_r = row_sides.data[world_row_base + row];",
-            "const float* Z_row = &packed_Z.data[(size_t)(world_row_base + row) * packed_Z.shape[2]];",
+            "const float* Z_row = &packed_Z.data[(size_t)(packed_row_base + row) * packed_Z.shape[2]];",
             "const int first_p = PACKED_FIRST(sides_r, art);",
             f"for (int c = 0; c < {P}; ++c) s_Z[staged + c] = first_p >= 0 ? Z_row[first_p + c] : 0.0f;",
         ]

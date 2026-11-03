@@ -590,6 +590,7 @@ def mf_gs_source(
     material: bool = False,
     seeded: bool = False,
     wide_rows: bool = False,
+    pitch: int | None = None,
 ) -> tuple[str, Staging]:
     """The native body of the matrix-free Gauss-Seidel sweep: a world's dense rows (:func:`packed_operator`, packed
     whitened rows of ``max_row_dofs`` entries, by default as many as the world's coordinates) and its free-body rows
@@ -624,6 +625,8 @@ def mf_gs_source(
         raise ValueError(f"the warp mapping runs 32 lanes or one thread, the colored mapping 32; got {lanes}")
     _validate_dense_metadata_encoding(max_constraints)
     M_D, M_MF, D = max_constraints, mf_max_constraints, max_world_dofs
+    # The row store's line: the dense rows, then the free bodies' from M_D (:mod:`.dense_rows`).
+    P = int(M_D + M_MF if pitch is None else pitch)
     max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
     row_lanes = Lanes(lanes)
     laws = RowLaws(regularize=True, material=material, torsion=contact_torsion, policy=solve_policy)
@@ -776,9 +779,9 @@ def mf_gs_source(
     __builtin_assume(line >= 0);
     const int mf_line = mf_first.data[world];
     __builtin_assume(mf_line >= 0);
-    int off_dense = line * {M_D};
-    int off_mf = mf_line * {M_MF};
-    int off_meta = off_mf * 4;{component}
+    int off_dense = line * {P};
+    int off_mf = mf_line * {P} + {M_D};
+    int off_meta = mf_line * {M_MF} * 4;{component}
     const size_t packed_base = (size_t)line * {M_D * int(max_row_dofs)};
     int mf6_base = mf_line * {M_MF} * 6;{offsets}
 
@@ -856,6 +859,7 @@ def mf_gs_kernel(
     material: bool = False,
     seeded: bool = False,
     wide_rows: bool = False,
+    pitch: int | None = None,
 ) -> wp.Kernel:
     """The matrix-free Gauss-Seidel sweep kernel of a thread mapping (:func:`mf_gs_source`): the warp's launches a
     warp per world item (one thread on the CPU, :func:`.launch.device_lanes`) and takes :data:`MF_GS_ABI`
@@ -883,6 +887,7 @@ def mf_gs_kernel(
         material=material,
         seeded=seeded,
         wide_rows=wide_rows,
+        pitch=pitch,
     )
     colored = mapping == "colored"
     staging.check(f"the {mapping} matrix-free sweep", arch_budget(device_arch))
@@ -902,6 +907,7 @@ def mf_gs_kernel(
         + ("_material" if material else "")
         + ("_seeded" if seeded else "")
         + ("_wide" if wide_rows else "")
+        + (f"_p{pitch}" if pitch is not None and pitch != max_constraints + mf_max_constraints else "")
         + "_walk"
         + solve_policy.suffix
     )

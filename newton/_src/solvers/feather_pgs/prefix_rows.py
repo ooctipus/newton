@@ -35,9 +35,11 @@ LAW = (
     Field("slot_counter", wp.int32, ("world",), owner="placement"),
     Field("bounds", wp.int32, ("world", 2), attr="dense_phase_bounds", owner="placement"),
     *(field for field in RECORDS if field.name not in ("row_w", "row_eps")),
+    Field("capacity", wp.int32, owner="placement", attr="dense_max_constraints"),
 )
 """The prefix law's inputs (the model's live limits; a prescribed coordinate takes no row, :data:`.joint_table.JOINTS`),
-the world's row counter and phase bounds, and the dense row records."""
+the world's row counter and phase bounds, and the dense row records with the dense class's capacity (its rows' line of
+the row store holds the free bodies' rows after them)."""
 
 PrefixLaw = field_group.struct("PrefixLaw", LAW, __name__)
 
@@ -158,7 +160,7 @@ _PHASE = """    for (int chunk = 0; chunk < $CANDIDATES; chunk += STRIDE) {
         int active = 0, type = 3, dof = 0, side = 0, d0 = -1, d1 = -1;
         float phi = 0.0f, target = 0.0f, beta = 0.0f, w0 = 0.0f, w1 = 0.0f;
 $LOCALS$EVALUATE        $SLOT
-        if (active && slot < LAW::row_type.shape[1]) {
+        if (active && slot < LAW::capacity) {
             const int at = prefix_line * LAW::row_type.shape[1] + slot;
             LAW::row_type.data[at] = type;
             LAW::row_parent.data[at] = -1;

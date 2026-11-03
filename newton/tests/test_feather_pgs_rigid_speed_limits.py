@@ -100,7 +100,7 @@ class TestFeatherPGSRigidSpeedLimits(unittest.TestCase):
         solver, _ = _step_boxes("cuda:0")
         count = solver.placement.mf_constraint_count.numpy()[:2]
         np.testing.assert_array_equal(count, 2)
-        types = solver.placement.mf_row_type.numpy()[:2, :2]
+        types = solver.placement.body_rows.row_type.numpy()[:2, :2]
         np.testing.assert_array_equal(types, PGS_CONSTRAINT_TYPE_SPEED)
         # A speed row keeps its axis unwhitened.
         jacobian = solver.placement.mf_Z_a.numpy()[:2, :2]

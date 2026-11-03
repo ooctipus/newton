@@ -1189,6 +1189,7 @@ class Sweep:
                 contact_units=self.factor_coordinate_contact_units,
                 weighted=self.laws.set.weighted,
                 torsion=self.laws.contact_torsion_enabled,
+                pitch=self.placement.row_pitch,
             )
             if self.paired_factor_coordinates
             else None
@@ -1226,6 +1227,7 @@ class Sweep:
                         lanes_per_world=lanes_per_world,
                         contact_capable=False,
                         walk_release=walk_release,
+                        pitch=self.placement.row_pitch,
                     )
             for size, solver_blocks in self.local_pair.launch_items.items():
                 warps_per_block = 2 if solver_blocks % 2 == 0 else 1
@@ -1241,6 +1243,7 @@ class Sweep:
                     persistent_queue=True,
                     warps_per_block=warps_per_block,
                     walk_release=walk_release,
+                    pitch=self.placement.row_pitch,
                     **local_torsion,
                 )
             for size, warps_per_block in self.local_residual.warps_per_block.items():
@@ -1257,6 +1260,7 @@ class Sweep:
                     walk_release=walk_release,
                     mf_max_constraints=self.placement.mf_max_constraints,
                     local_mf_max_constraints=self.local_residual_mf_max_rows,
+                    pitch=self.placement.row_pitch,
                     **local_torsion,
                 )
 
@@ -1355,6 +1359,7 @@ class Sweep:
                 )
             colored = capable.size > 0 and route_table.capable("colored", self.laws.set) is None
             mf_gs_options = {
+                "pitch": self.placement.row_pitch,
                 "has_dense_velocity_limit_rows": self.options.enable_joint_velocity_limits,
                 "shared_metadata": storage.shared_metadata,
                 "resident_row_metadata": storage.resident_row_metadata,
@@ -1435,6 +1440,7 @@ class Sweep:
                         weighted=self.laws.set.weighted,
                         frame=self._tier_frame(),
                         walk_half=classes_half(self.factor.walk_classes),
+                        pitch=self.placement.row_pitch,
                         **({"torsion": True} if self.laws.contact_torsion_enabled else {}),
                     )
                     self.tiers.append(dataclasses.replace(tier, tier=tier_index))
@@ -1615,15 +1621,16 @@ class Sweep:
             "world_row_parent": placement.row_parent,
             "world_row_mu": placement.row_mu,
             "mf_constraint_count": placement.mf_constraint_count,
-            "mf_first": placement.mf_first,
+            # The free bodies' records are the row store's, from its body base on each world's line.
+            "mf_first": placement.dense_first,
             "mf_contact_rows_end": placement.mf_contact_rows_end,
             "mf_meta": placement.mf_meta_packed,
-            "mf_impulses": placement.mf_impulses,
+            "mf_impulses": placement.impulses,
             "mf_Z_a": placement.mf_Z_a,
             "mf_Z_b": placement.mf_Z_b,
-            "mf_row_mu": placement.mf_row_mu,
-            "mf_row_w": placement.mf_row_w,
-            "mf_row_eps": placement.mf_row_eps,
+            "mf_row_mu": placement.row_mu,
+            "mf_row_w": placement.row_w,
+            "mf_row_eps": placement.row_eps,
             "regularize": int(self.laws.set.weighted),
             "iterations": self.options.pgs_iterations,
             "omega": self.options.pgs_omega,
@@ -1923,13 +1930,15 @@ class Sweep:
                 self.placement.dense_first,
             )
         if self.forest.has_free_rigid_bodies:
+            # The free bodies' rows: the row store's region from its body base, where their slots and parents count.
+            body = self.placement.body_region
             yield (
                 1,
-                self.placement.mf_row_parent,
-                self.placement.mf_row_mu,
-                self.placement.mf_impulses,
+                body(self.placement.row_parent),
+                body(self.placement.row_mu),
+                body(self.placement.impulses),
                 self.options.pgs_warmstart_decay if self.options.pgs_warmstart else 0.0,
-                self.placement.mf_first,
+                self.placement.dense_first,
             )
 
     def carry(self, state_in, state_out, contacts, dt: float) -> None:
@@ -1939,22 +1948,14 @@ class Sweep:
                 self.finish_patches(state_in, state_out, contacts, dt)
 
         if self.options.pgs_warmstart and self.placement.ws_prev_dense_impulses is not None:
-            with wp.ScopedTimer("S7_Dense_Warmstart_Carry", print=False, use_nvtx=self.nvtx, synchronize=self.nvtx):
+            # The row store's carry, both classes' rows.
+            with wp.ScopedTimer("S7_Warmstart_Carry", print=False, use_nvtx=self.nvtx, synchronize=self.nvtx):
                 wp.copy(self.placement.ws_prev_dense_impulses, self.placement.impulses)
                 wp.copy(self.placement.ws_prev_dense_row_type, self.placement.row_type)
                 wp.copy(self.placement.ws_prev_dense_row_parent, self.placement.row_parent)
                 if contacts is None:
                     self.placement.ws_prev_dense_row_type.fill_(-1)
                     self.placement.ws_prev_dense_row_parent.fill_(-1)
-
-        if self.options.pgs_warmstart and self.forest.has_free_rigid_bodies:
-            with wp.ScopedTimer("S7_MF_Warmstart_Carry", print=False, use_nvtx=self.nvtx, synchronize=self.nvtx):
-                wp.copy(self.placement.ws_prev_mf_impulses, self.placement.mf_impulses)
-                wp.copy(self.placement.ws_prev_mf_row_type, self.placement.mf_row_type)
-                wp.copy(self.placement.ws_prev_mf_row_parent, self.placement.mf_row_parent)
-                if contacts is None:
-                    self.placement.ws_prev_mf_row_type.fill_(-1)
-                    self.placement.ws_prev_mf_row_parent.fill_(-1)
 
         if self.options.pgs_warmstart:
             if contacts is not None:
@@ -1977,61 +1978,24 @@ class Sweep:
 
     def clear_history(self, world_mask: wp.array | None) -> None:
         """Discard solver impulses independently of latched capacity status."""
-        if self.forest.world_count == 0:
+        if self.forest.world_count == 0 or not self.options.pgs_warmstart:
             return
-        prev_mf_impulses = self.placement.ws_prev_mf_impulses
-        if not self.options.pgs_warmstart and prev_mf_impulses is None:
-            return
-
-        dense_impulses = (
-            self.placement.impulses if self.options.pgs_warmstart else self.placement.dummy_contact_impulses
-        )
-        if prev_mf_impulses is None:
-            prev_mf_impulses = self.placement.dummy_contact_impulses
-        prev_mf_row_type = self.placement.ws_prev_mf_row_type
-        prev_mf_row_parent = self.placement.ws_prev_mf_row_parent
-        if prev_mf_row_type is None:
-            # The dedicated reset sink: the kernel writes -1 into this buffer.
-            prev_mf_row_type = self.placement.reset_dummy_mf_row_type
-        if prev_mf_row_parent is None:
-            prev_mf_row_parent = self.placement.reset_dummy_mf_row_parent
-        # ws_prev_slot_sorted is intentionally NOT cleared here:
-        # gather_mf_warmstart only seeds impulses from prev slots whose
-        # prev_mf_row_type marks a contact row, so the row_type = -1 sentinel
-        # written below (together with the zeroed impulses) neutralizes any
-        # stale prev-slot mapping for reset worlds.
+        # ws_prev_slot_sorted is intentionally NOT cleared here: the warm start's gathers only seed impulses from
+        # previous slots whose carried row type marks a contact row, so the row_type = -1 sentinel written below
+        # (together with the zeroed impulses) neutralizes any stale previous-slot mapping for reset worlds.
         wp.launch(
             reset_world_warmstart_buffers,
             dim=self.forest.world_count,
             inputs=[
                 self.placement.dense_first,
-                self.placement.mf_first,
                 world_mask,
-                dense_impulses,
-                prev_mf_impulses,
-                prev_mf_row_type,
-                prev_mf_row_parent,
+                self.placement.impulses,
+                self.placement.ws_prev_dense_impulses,
+                self.placement.ws_prev_dense_row_type,
+                self.placement.ws_prev_dense_row_parent,
             ],
             device=self.model.device,
         )
-        if self.options.pgs_warmstart and self.placement.ws_prev_dense_impulses is not None:
-            # Neutralize the dense identity-matched carry for reset worlds
-            # (the kernel is width-generic: it zeroes impulses and writes -1
-            # into the row-type table).
-            wp.launch(
-                reset_world_warmstart_buffers,
-                dim=self.forest.world_count,
-                inputs=[
-                    self.placement.dense_first,
-                    self.placement.mf_first,
-                    world_mask,
-                    self.placement.dummy_contact_impulses,
-                    self.placement.ws_prev_dense_impulses,
-                    self.placement.ws_prev_dense_row_type,
-                    self.placement.ws_prev_dense_row_parent,
-                ],
-                device=self.model.device,
-            )
 
     def forces(self, contacts) -> None:
         """Export the linear contact forces of the last solve (:meth:`.SolverFeatherPGS.update_contacts`)."""
@@ -2047,16 +2011,13 @@ class Sweep:
             rows,
             inputs=[
                 self.placement.dense_first,
-                self.placement.mf_first,
+                self.placement.body_base,
                 bind_contact_routes(self, contacts),
                 self.placement.impulses,
-                self.placement.mf_impulses,
                 self.placement.constraint_count,
                 self.placement.mf_constraint_count,
                 self.placement.row_type,
                 self.placement.row_parent,
-                self.placement.mf_row_type,
-                self.placement.mf_row_parent,
                 int(self.options.enable_contact_friction),
                 inv_dt,
             ],

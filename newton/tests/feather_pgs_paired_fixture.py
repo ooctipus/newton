@@ -83,16 +83,31 @@ def component_fixture(worlds=4, capacity=8, mf_capacity=6):
     return host
 
 
+def store(dense, body):
+    """One row store line per world: the dense rows, then the free bodies' rows from the dense capacity."""
+    return np.concatenate((dense, body), axis=1)
+
+
 def bind_components(host, device="cpu"):
-    """Bind the fixture as the paired-component descriptor (packed two-dimensional metadata ABI)."""
+    """Bind the fixture as the paired-component descriptor (packed two-dimensional metadata ABI): its records in one
+    row store, the free bodies' coefficients (``mf_mu``) at the dense capacity."""
     data = components.PairedComponentData()
     data.world_count = len(host["counts"])
-    for name, value in host.items():
+    body = host["mf_mu"].shape
+    records = {
+        "rhs": store(host["rhs"], np.zeros(body, np.float32)),
+        "diag": store(host["diag"], np.zeros(body, np.float32)),
+        "mu": store(host["mu"], host["mf_mu"]),
+        "row_type": store(host["row_type"], np.zeros(body, np.int32)),
+        "row_parent": store(host["row_parent"], np.full(body, -1, np.int32)),
+    }
+    for name, value in {**host, **records}.items():
         # Only the whitened rows are stored; the factor is the walk's records below, its group the primary's.
-        if name not in ("J", "L", "primary_group"):
+        if name not in ("J", "L", "primary_group", "mf_mu"):
             dtype = wp.int32 if value.dtype == np.int32 else wp.float32
             setattr(data, name, wp.array(value, dtype=dtype, device=device))
-    data.first = data.mf_first = row_lines(device)
+    data.body_base = host["rhs"].shape[1]
+    data.first = row_lines(device)
     # The primary articulation of a world is its group's; its walk records hold the factor's rows (16 floats a
     # coordinate, as the walk's), so a factor entry the qualification must reject is a record entry.
     arts, n = host["L"].shape[0], host["L"].shape[1]
@@ -117,7 +132,7 @@ def launch_components(data, device="cpu"):
 def solve_kernels(enabled, arch="120", *, contact_triples=False):
     """Construct the two production sweep kernels, plain or with independent components."""
     paired = sweep_routes_local.paired_factor_kernel(
-        8, 29, 23, 6, arch, contact_triples=contact_triples, independent_components=enabled
+        8, 29, 23, 6, arch, contact_triples=contact_triples, independent_components=enabled, pitch=14
     )
     mixed = sweep_routes.mf_gs_kernel(
         8,
@@ -159,11 +174,9 @@ def solve_fixture(device):
         "dense_phase_bounds": array(np.array([[1, 1]] * 4 + [[0, 0]], np.int32)),
         "local_solve_owner": array(np.zeros(5, np.int32)),
         "world_dof_indices": array(np.arange(145, dtype=np.int32).reshape(5, 29)),
-        "row_incident": array(rng.normal(0, 0.2, (5, 8)).astype(np.float32)),
-        "world_impulses": array(np.full((5, 8), 0.01, np.float32)),
-        "mf_impulses": array(np.full((5, 6), 0.02, np.float32)),
-        "world_row_w": array(np.ones((5, 8), np.float32)),
-        "mf_row_w": array(np.ones((5, 6), np.float32)),
+        "row_incident": array(store(rng.normal(0, 0.2, (5, 8)).astype(np.float32), np.zeros((5, 6), np.float32))),
+        "world_impulses": array(store(np.full((5, 8), 0.01, np.float32), np.full((5, 6), 0.02, np.float32))),
+        "world_row_w": array(np.ones((5, 14), np.float32)),
         "mf_contact_rows_end": array(np.full(5, 3, np.int32)),
         "primary_offset_by_world": data.primary_offset,
         "secondary_offset_by_world": data.secondary_offset,
@@ -179,7 +192,7 @@ def solve_fixture(device):
         ("world_row_parent", "row_parent"),
         ("world_row_mu", "mu"),
         ("factor_rows", "Y"),
-        ("mf_row_mu", "mf_mu"),
+        ("mf_row_mu", "mu"),
         ("mf_meta", "mf_meta"),
         ("mf_Z_a", "mf_Z_a"),
         ("mf_Z_b", "mf_Z_b"),
@@ -192,6 +205,8 @@ def solve_fixture(device):
     walk.du = array(np.zeros(145, np.float32))
     arrays["walk"] = walk
     arrays["du"] = walk.du
+    # One row store: the free bodies' impulses and weights are the dense rows' arrays, from the dense capacity.
+    arrays["mf_impulses"], arrays["mf_row_w"] = arrays["world_impulses"], arrays["world_row_w"]
     _packed_rows(host, arrays, device)
     return data, arrays
 
@@ -236,7 +251,9 @@ def _packed_rows(host, arrays, device):
     arrays["articulation_world_dof_offset"] = wp.array(offsets, dtype=wp.int32, device=device)
     arrays["packed_dense"] = 1
     arrays["packed_Z"] = wp.array(host["Y"], dtype=wp.float32, device=device)
-    arrays["row_sides"] = wp.array(sides, dtype=wp.vec2i, device=device)
+    # The row store's lines: the dense rows' sides, then the free bodies' rows (none read here).
+    body = host["mf_mu"].shape[1]
+    arrays["row_sides"] = wp.array(store(sides, np.zeros((worlds, body, 2), np.int32)), dtype=wp.vec2i, device=device)
     arrays["walk"].first_art = wp.array(first_art, dtype=wp.int32, device=device)
 
 
@@ -248,7 +265,7 @@ def solve_pair_launches(data, arrays, *, enabled, arch, iterations=8):
     values = dict(arrays)
     values.update(
         dense_first=data.first,
-        mf_first=data.mf_first,
+        mf_first=data.first,
         world_count=5,
         general_world_grid_stride=5,
         use_general_world_queue=0,
