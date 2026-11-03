@@ -158,14 +158,8 @@ def _row_source(*, layout, patch=False, weighted=False, torsion=False):
             // The frame point is the articulation's (relative to its origin): the world point meets it through it.
             const float* o = walk.link.data + (size_t)joint * {WALK_LINK} + {WALK_FRAME};
             const wp::vec3 origin = walk.origin.data[art];
-            const float sign = end == 0 ? 1.0f : -1.0f;
-            const float d0 = sign * direction[0], d1 = sign * direction[1], d2 = sign * direction[2];
-            const float r0 = (row_point[0] - origin[0]) - o[0], r1 = (row_point[1] - origin[1]) - o[1],
-                        r2 = (row_point[2] - origin[2]) - o[2];
-            const bool torque = {spin};
-            const float seed[6] = {{torque ? 0.0f : d0, torque ? 0.0f : d1, torque ? 0.0f : d2,
-                                    torque ? d0 : r1 * d2 - r2 * d1, torque ? d1 : r2 * d0 - r0 * d2,
-                                    torque ? d2 : r0 * d1 - r1 * d0}};
+            float seed[6];
+            WALK_WRENCH(seed, end == 0 ? 1.0f : -1.0f, direction.c, row_point.c, origin.c, o, {spin});
             TIER_WALK(side, joint - walk.joint_start.data[art], -1, seed);
         }}
 """

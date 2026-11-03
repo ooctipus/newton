@@ -2123,7 +2123,22 @@ def walk_paths_prelude(
     )
 
 
-_WALK_ROW = """    // WALK_ROW(data, link, now, now_link, shift, body, k, seed, sink): every reader's seed walk, after a walk
+_WALK_ROW = """    // WALK_WRENCH(q, sign, d, at, origin, o, torque): a row's seed at a body's frame (the native twin of
+    // contact_laws.contact_seed and spin_seed): the force f = sign d at the world point at, its wrench (f, l x f) with
+    // l = (at - origin) - o the lever from the body's frame point o (the articulation's, relative to its origin), or
+    // the torque (0, f).
+    const auto WALK_WRENCH = [](float* q, const float sign, const float* d, const float* at, const float* origin,
+                                const float* o, const bool torque) {
+        const float f[3] = {sign * d[0], sign * d[1], sign * d[2]};
+        const float l[3] = {(at[0] - origin[0]) - o[0], (at[1] - origin[1]) - o[1], (at[2] - origin[2]) - o[2]};
+        q[0] = torque ? 0.0f : f[0];
+        q[1] = torque ? 0.0f : f[1];
+        q[2] = torque ? 0.0f : f[2];
+        q[3] = torque ? f[0] : l[1] * f[2] - l[2] * f[1];
+        q[4] = torque ? f[1] : l[2] * f[0] - l[0] * f[2];
+        q[5] = torque ? f[2] : l[0] * f[1] - l[1] * f[0];
+    };
+    // WALK_ROW(data, link, now, now_link, shift, body, k, seed, sink): every reader's seed walk, after a walk
     // prelude (walk_prelude, walk_paths_prelude). Rows seeded at body walked up its root path into sink: the wrench
     // seed[6 r + i] at body's frame (k < 0; now, now_link and shift its step's geometry, as WALK_UP takes them), or the
     // covector seed[r] e_k at body's coordinate k (WALK_SEED, then WALK_UP from k - 1, without the step's geometry).
@@ -2143,8 +2158,9 @@ _WALK_ROW = """    // WALK_ROW(data, link, now, now_link, shift, body, k, seed, 
 
 @functools.cache
 def walk_row_prelude(rows: int) -> DevicePrelude:
-    """The seed walk of ``rows`` rows (``WALK_ROW``), for both devices: every row reader's (the one writer's units and
-    natives, the parallel tiers' rows, the local blocks' seeds) binds its sink to it. It follows the walk prelude whose
+    """The seed walk of ``rows`` rows (``WALK_ROW``) and a wrench seed's formation (``WALK_WRENCH``), for both devices:
+    every row reader's (the one writer's units and natives, the parallel tiers' rows, the local blocks' seeds) binds its
+    sink to it. It follows the walk prelude whose
     ``WALK_UP`` and ``WALK_SEED`` it calls, and only readers that walk seeds declare it."""
     text = substitute(_WALK_ROW, rows=rows)
     return DevicePrelude(f"walk_row_{rows}", text, cpu=text)

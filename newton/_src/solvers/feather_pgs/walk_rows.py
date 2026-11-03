@@ -903,28 +903,17 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                 // frame point is the articulation's, so the world point meets it through the articulation's origin.
                 const float* o = walk.link.data + (size_t)j * $link + $frame;
                 const float* origin = reinterpret_cast<const float*>(walk.origin.data + art);
+                const float frame_o[3] = {RD(o), RD(o + 1), RD(o + 2)};
+                const float origin_o[3] = {RD(origin), RD(origin + 1), RD(origin + 2)};
                 for (int r = 0; r < $rows; ++r) {
                     float* q = seed + 6 * r;
-                    const float* d = unit.frame.data[r == 1 || r == 2 ? r : 0];
-                    const auto& at = r == 0 ? unit.point : unit.friction_point;
-                    const float f[3] = {sign * d[0], sign * d[1], sign * d[2]};
-                    const float l[3] = {(at[0] - RD(origin)) - RD(o), (at[1] - RD(origin + 1)) - RD(o + 1),
-                                        (at[2] - RD(origin + 2)) - RD(o + 2)};
                     if (r >= rows) {
                         for (int i = 0; i < 6; ++i) q[i] = 0.0f;
-                    } else if ($spin && r == 3) {
-                        q[0] = q[1] = q[2] = 0.0f;
-                        q[3] = f[0];
-                        q[4] = f[1];
-                        q[5] = f[2];
-                    } else {
-                        q[0] = f[0];
-                        q[1] = f[1];
-                        q[2] = f[2];
-                        q[3] = l[1] * f[2] - l[2] * f[1];
-                        q[4] = l[2] * f[0] - l[0] * f[2];
-                        q[5] = l[0] * f[1] - l[1] * f[0];
+                        continue;
                     }
+                    const auto& at = r == 0 ? unit.point : unit.friction_point;
+                    WALK_WRENCH(q, sign, unit.frame.data[r == 1 || r == 2 ? r : 0], at.c, origin_o, frame_o,
+                                $spin && r == 3);
                 }
                 // The step's J entry of each footprint against v_hat: the rows' incident velocity.
                 const auto sink = [&](int r, int c, float z, float j) {
