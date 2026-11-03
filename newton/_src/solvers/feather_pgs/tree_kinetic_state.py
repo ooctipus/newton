@@ -1104,7 +1104,7 @@ def get_state_kernel(
     the stages, 22-24 for motion; see :func:`get_helpers`); ``diagonal`` keeps
     a compact diagonal's ``H_ii`` (:data:`_DIAGONAL`); ``two_half`` (the group
     holds a joint whose step column has two halves at its frame,
-    :data:`.tree_factor.WALK_BOTH`) forms the walk's step columns a second time
+    :data:`.tree_scan.WALK_BOTH`) forms the walk's step columns a second time
     at the anchor's rotation, where every other group stores S's halves.
     """
     if finish and motion_velocity:
@@ -2239,12 +2239,12 @@ def _walk_roots(layout: TreeLayout) -> list[tuple[int, int, int]]:
 
 
 PREDICTOR_AHEAD = 0
-"""Items whose inputs the predictor's walks hold in registers ahead of the chain (:data:`.tree_factor.WALK_AHEAD`):
+"""Items whose inputs the predictor's walks hold in registers ahead of the chain (:data:`.tree_scan.WALK_AHEAD`):
 none, as for :data:`PREDICTOR_UNROLL`: the predictor's launch bound holds 56 registers on g1's block, and the walk's
 touches (prefetch hints, no register) still ask L1 for its lines ahead."""
 
 PREDICTOR_UNROLL = 0
-"""Coordinates up to which the predictor's walks are straight-line code (:data:`.tree_factor.WALK_UNROLL`): none. The
+"""Coordinates up to which the predictor's walks are straight-line code (:data:`.tree_scan.WALK_UNROLL`): none. The
 predictor's launch bound holds 56 registers on g1's block (:func:`_predictor_bounds`), and a straight walk's hoisted
 loads spill there (g1 3,808 B of stack, offline sm_120); the loop form keeps a chain's state in registers, its loads
 on the path the group's lanes fetched into L1 (WALK_MAPPING §4: B3 against B4)."""
@@ -2254,7 +2254,7 @@ _UP_OUTPUT, *_UP_UPDATE = ts.step(ts.Direction.UP, ts.FETCHED, "$V", source="$X.
 _UP_STEP = ts.braced([_UP_OUTPUT, "u[$c] = z;", *_UP_UPDATE])
 """A coordinate of the walk up (leaf first, ``u = L^-1 P x``): ``z_c = (x_c + s_c . p) / ell_c``, ``p -= ut_c z_c``, ``p``
 its body's state, ``z_c`` rounded on its own (``WALK_MUL``); its record and ``x_c`` fetched ahead of the chain
-(``$X``, :meth:`.tree_factor.WalkClass.walk`)."""
+(``$X``, :meth:`.tree_scan.WalkClass.walk`)."""
 
 _UP_JOINT = ts.braced(ts.edge(ts.Direction.UP, ts.FETCHED.lever, "$V", into="$P"))
 """A joint of the walk up: the body's state ``(f, t)`` passes to its parent's frame, ``t - d x f`` (``$L`` the body's
@@ -2301,7 +2301,7 @@ def walk_fetch(layout: TreeLayout, classes: tuple, guard: str = "") -> str:
 
 
 def _up_texts() -> dict[str, str]:
-    """The walk up's :meth:`.tree_factor.WalkClass.walk` keywords: its joint, step, fetches and touches, leaf first."""
+    """The walk up's :meth:`.tree_scan.WalkClass.walk` keywords: its joint, step, fetches and touches, leaf first."""
     from .tree_factor import WALK_COORDINATE, WALK_LINK  # noqa: PLC0415
 
     return {
@@ -2608,19 +2608,12 @@ $ROOTS
 @functools.cache
 def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
     """The walk's solve of the trial (Z4.2, WALK_MAPPING E5): a thread a tree root, the class's walk compiled into
-    straight-line code (:meth:`.tree_factor.WalkClass.walk` up to :data:`.tree_factor.WALK_UNROLL` coordinates), the
+    straight-line code (:meth:`.tree_scan.WalkClass.walk` up to :data:`.tree_scan.WALK_UNROLL` coordinates), the
     walk up of ``trial.force`` into registers and the walk down into ``trial.response``, ``P^T L^-T L^-1 P f`` on the
     all-``K`` walk. A prescribed root responds with zero."""
     from .kernel_template import THREADS  # noqa: PLC0415
-    from .tree_factor import (  # noqa: PLC0415
-        WALK_COORDINATE,
-        WALK_LINK,
-        WALK_REGISTERS,
-        WALK_UNROLL,
-        WalkTrees,
-        walk_down_prelude,
-        walk_down_texts,
-    )
+    from .tree_factor import WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude, walk_down_texts  # noqa: PLC0415
+    from .tree_scan import WALK_REGISTERS, WALK_UNROLL  # noqa: PLC0415
 
     walked_classes = tuple(cls for cls in classes if cls is not None)
     up = {**_up_texts(), "unroll": WALK_UNROLL}
@@ -2694,7 +2687,7 @@ def get_predictor_kernel(
 
     ``schedules`` are the scans' schedules; ``clocked`` adds the predictor stage counters (see :func:`get_helpers`);
     ``twists`` holds the twist publication (:func:`publishes_twists`), which only CUDA builds; ``classes`` holds each
-    root's walking class (:class:`.tree_factor.WalkClass`, ``None`` for a prescribed root); ``slips`` the classes'
+    root's walking class (:class:`.tree_scan.WalkClass`, ``None`` for a prescribed root); ``slips`` the classes'
     slip capacity, the border's build lanes (:func:`held_lambdas`); ``side`` the factor's
     :attr:`.tree_factor.TreeFactor.walk_side`. ``response`` names the group's kind (the sparse
     class's tree, a dense size group, a compact diagonal) in the kernel's name only.

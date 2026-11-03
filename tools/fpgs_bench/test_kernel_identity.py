@@ -152,13 +152,13 @@ class TestKernelIdentity(unittest.TestCase):
 
     def test_walk_family_covers_the_walk_shapes(self):
         """Record the walk's readers on a class with joins at g1's size, the loop form, side loads and every held width."""
-        from newton._src.solvers.feather_pgs import tree_factor  # noqa: PLC0415
         from newton._src.solvers.feather_pgs import tree_kinetic_state as native  # noqa: PLC0415
+        from newton._src.solvers.feather_pgs import tree_scan  # noqa: PLC0415
 
         classes = identity.walk_classes_of_the_suite()
         self.assertEqual((len(classes["g1"].parent), classes["g1"].coordinates), (38, 43))
-        self.assertGreater(classes["chain106"].coordinates, tree_factor.WALK_UNROLL)
-        self.assertIn(tree_factor.WALK_BOTH, classes["d6"].half)
+        self.assertGreater(classes["chain106"].coordinates, tree_scan.WALK_UNROLL)
+        self.assertIn(tree_scan.WALK_BOTH, classes["d6"].half)
         calls = list(identity.walk_calls())
         words = {
             native._held_words(kwargs["layout"].value)

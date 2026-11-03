@@ -17,9 +17,10 @@ import newton
 from newton._src.solvers.feather_pgs import tree_kinetic_state
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
-from newton._src.solvers.feather_pgs.tree_factor import RELEASE_SLIPS, WalkClass
+from newton._src.solvers.feather_pgs.tree_factor import RELEASE_SLIPS
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
+from newton._src.solvers.feather_pgs.tree_scan import WalkClass
 from newton.tests.test_feather_pgs_mixed_tree_free_body import _build
 
 # A packed, warp-sized fixed-root tree: the switch changes every kernel built for it.

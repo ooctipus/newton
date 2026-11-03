@@ -37,7 +37,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import tree_factor
+from newton._src.solvers.feather_pgs import tree_factor, tree_scan
 from newton._src.solvers.feather_pgs.device_preludes import DevicePrelude, substitute
 from newton._src.solvers.feather_pgs.kernel_template import THREADS, KernelTemplate, params
 from newton._src.solvers.feather_pgs.kernels import (
@@ -171,7 +171,7 @@ def walk_kernels(table: tuple, rows: int) -> tuple:
         _TREE_PARAMS,
         substitute(_TREE, coordinate=WALK_COORDINATE, link=WALK_LINK),
         THREADS,
-        (tree_factor.walk_down_prelude((tree_factor.WalkClass(*table),)),),
+        (tree_factor.walk_down_prelude((tree_scan.WalkClass(*table),)),),
         dual=True,
     )
     return up.kernel(), tree.kernel()
@@ -626,7 +626,7 @@ _BOTH_PARAMS = params(
 def both_ways_kernel(table: tuple):
     """A thread per case of one class: root first, each coordinate's sum of the weights of the bodies and the values of
     the coordinates on its root path up to it (``path``); leaf first, each body's sum over its subtree (``subtree``)."""
-    walk = tree_factor.WalkClass(*table)
+    walk = tree_scan.WalkClass(*table)
 
     def text(cuda: bool) -> str:
         down = walk.walk(
@@ -643,10 +643,10 @@ def both_ways_kernel(table: tuple):
         )
         return f"""    const auto WALK_BOTH = [&](const float* w, const float* x, float* down, float* up) {{
         {{
-{tree_factor.indent_text(down, 12)}
+{tree_scan.indent_text(down, 12)}
         }}
         {{
-{tree_factor.indent_text(up, 12)}
+{tree_scan.indent_text(up, 12)}
         }}
     }};"""
 
@@ -803,8 +803,8 @@ class TestWalkDevice(unittest.TestCase):
         """The class emitter's walk root first and leaf first, unrolled and in the loop form, on trees with joins and
         several roots: exact sums along each root path and over each subtree."""
         tables = emitter_tables(np.random.default_rng(1102))
-        self.assertTrue(any(first[-1] <= tree_factor.WALK_UNROLL for _, first in tables))
-        self.assertTrue(any(first[-1] > tree_factor.WALK_UNROLL for _, first in tables))
+        self.assertTrue(any(first[-1] <= tree_scan.WALK_UNROLL for _, first in tables))
+        self.assertTrue(any(first[-1] > tree_scan.WALK_UNROLL for _, first in tables))
         for device in devices():
             for table in tables:
                 with self.subTest(device=device, coordinates=table[1][-1]):

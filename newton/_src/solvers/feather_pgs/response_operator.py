@@ -1286,9 +1286,9 @@ class LocalBlock(ResidualBlock):
 
     @property
     def coordinate_floats(self) -> int:
-        """Staged floats a coordinate: ``s``, ``ut``, ``1 / ell`` (its record unpacked, :data:`.tree_factor.WALK_STAGED`),
+        """Staged floats a coordinate: ``s``, ``ut``, ``1 / ell`` (its record unpacked, :data:`.tree_scan.WALK_STAGED`),
         then with ``wrenches`` the step's column the finish published, unpacked (six floats, :data:`.tree_factor.WALK_NOW`)."""
-        from .tree_factor import WALK_STAGED  # noqa: PLC0415 (tree_factor imports this module)
+        from .tree_scan import WALK_STAGED  # noqa: PLC0415 (tree_factor imports this module)
 
         return WALK_STAGED + (6 if self.wrenches else 0)
 
@@ -1330,9 +1330,9 @@ class LocalBlock(ResidualBlock):
             WALK_COORDINATE,
             WALK_LINK,
             WALK_NOW,
-            WALK_STAGED,
             WALK_UNPACKED,
         )
+        from .tree_scan import WALK_STAGED  # noqa: PLC0415
 
         P, S, L = self.primary, self.secondary, self.lanes.width
         lane = self.lanes.lane

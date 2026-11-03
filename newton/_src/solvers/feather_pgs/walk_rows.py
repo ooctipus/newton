@@ -81,7 +81,6 @@ from .tree_factor import (
     WALK_NOW,
     WalkRelease,
     WalkTrees,
-    held_fits,
     release_path,
     walk_covector_into,
     walk_covector_into_one_half,
@@ -89,6 +88,7 @@ from .tree_factor import (
     walk_into_one_half,
     walk_prelude,
 )
+from .tree_scan import held_fits
 
 __all__ = [
     "SUPPORT_UNIT_LANES",
@@ -973,7 +973,7 @@ SUPPORT_BLOCK, SUPPORT_BLOCKS = 256, 2
 
 SUPPORT_REGISTERS = 65536 // (SUPPORT_BLOCK * SUPPORT_BLOCKS)
 """The support writer's register budget a thread, from its launch bound: what a unit's held side must fit
-(:func:`.tree_factor.held_fits`, :data:`_RELEASE_HELD`).
+(:func:`.tree_scan.held_fits`, :data:`_RELEASE_HELD`).
 
 The held side is a unit's at most four rows over its class's coordinates. Measured (``SP/core/FL/HANDOFF_ZK.md``
 §17): franka-reach's 36 words held, its writer 16% faster (GB300); g1's 172 words held, 3% slower (GB300), so g1's

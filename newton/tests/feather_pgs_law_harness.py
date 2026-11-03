@@ -27,7 +27,6 @@ from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.tree_factor import (
     WALK_FRAME,
     WALK_LINK,
-    WalkClass,
     WalkRelease,
     WalkTrees,
     pack_walk_columns,
@@ -35,6 +34,7 @@ from newton._src.solvers.feather_pgs.tree_factor import (
     unpack_walk_records,
     walk_leave_kernel,
 )
+from newton._src.solvers.feather_pgs.tree_scan import WalkClass
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 FAMILIES = (contact_laws.CONTACT_LAW, row_laws.ROW_LAW, projection_laws.PROJECTION_LAW, projection_laws.CONE_LAW)

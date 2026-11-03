@@ -309,7 +309,7 @@ def walk_classes(layout):
     """Each root's walking class of a held layout (the predictor solves by the walk): a chain over the root's bodies,
     the root body holding its root's coordinates (one for a fixed root) and every next body one until the root's
     family is spent; ``None`` for a prescribed root."""
-    from newton._src.solvers.feather_pgs.tree_factor import WalkClass  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.tree_scan import WalkClass  # noqa: PLC0415
 
     bounds = (*layout.roots, layout.bodies)
     families = layout.root_families if layout.forest else (layout.dofs,)
@@ -394,7 +394,7 @@ def held_tree_calls():
 
 
 def _walk_class(parent, first, half):
-    from newton._src.solvers.feather_pgs.tree_factor import WalkClass  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.tree_scan import WalkClass  # noqa: PLC0415
 
     return WalkClass(tuple(parent), tuple(first), tuple(half))
 

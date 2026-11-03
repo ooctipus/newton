@@ -449,10 +449,10 @@ class TreeKineticState:
             self.trial.response = wp.zeros(dofs, dtype=float, device=self.solver.model.device)
 
     def _walk_classes(self):
-        """Each root's walking class (:class:`.tree_factor.WalkClass`, its path table in the walk the predictor solves
+        """Each root's walking class (:class:`.tree_scan.WalkClass`, its path table in the walk the predictor solves
         by), or ``None`` for a prescribed root (no coordinates to solve); every group's tree of a root has the same
         table."""
-        from .tree_factor import WALK_BOTH, WalkClass  # noqa: PLC0415
+        from .tree_scan import WALK_BOTH, WalkClass  # noqa: PLC0415
 
         factor, layout = self.solver.factor, self.layout
         path = getattr(factor, "walk_path_host", None)

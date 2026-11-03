@@ -334,9 +334,9 @@ def _support_writer_calls():
         yield "walk_rows.support_rows_kernel", walk_rows.support_rows_kernel.__wrapped__, tree, kwargs
     for unit_rows in (3, 4):
         yield "walk_rows.support_units_kernel", walk_rows.support_units_kernel.__wrapped__, (unit_rows, 16), {}
-    from newton._src.solvers.feather_pgs import tree_factor  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import tree_factor, tree_scan  # noqa: PLC0415
 
-    walk = (tree_factor.WalkClass(*tree[:2]),)
+    walk = (tree_scan.WalkClass(*tree[:2]),)
     for release in (False, True):
         yield "tree_factor.walk_leave_kernel", tree_factor.walk_leave_kernel.__wrapped__, (walk, release), {}
 

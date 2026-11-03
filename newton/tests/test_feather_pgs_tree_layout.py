@@ -15,9 +15,10 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import tree_kinetic_plan, tree_kinetic_state
 from newton._src.solvers.feather_pgs import tree_scan as ts
-from newton._src.solvers.feather_pgs.tree_factor import RELEASE_SLIPS, WalkClass
+from newton._src.solvers.feather_pgs.tree_factor import RELEASE_SLIPS
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
+from newton._src.solvers.feather_pgs.tree_scan import WalkClass
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 
