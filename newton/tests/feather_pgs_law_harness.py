@@ -1043,7 +1043,7 @@ def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
     gaps, terms = np.zeros(incident.shape), np.zeros(incident.shape)
     for world, count in enumerate(solver.placement.mf_constraint_count.numpy()):
         for row in range(int(count)):
-            if kinds[world, row] == kernels.PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+            if kinds[world, row] == kernels.PGS_CONSTRAINT_TYPE_SPEED:
                 continue  # A speed row carries no Z.
             term = np.zeros(0)
             for body, Z in ((bodies_a[world, row], Z_a), (bodies_b[world, row], Z_b)):

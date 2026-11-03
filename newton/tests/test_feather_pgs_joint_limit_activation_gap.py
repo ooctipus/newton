@@ -14,6 +14,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    PGS_CONSTRAINT_TYPE_SPEED,
 )
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import prefix_warp_rows
@@ -146,7 +147,7 @@ def _assert_mf_phase_layout(test_case: unittest.TestCase, solver: SolverFeatherP
     mf_contact_end = int(solver.placement.mf_contact_rows_end.numpy()[0])
     contact_rows = np.flatnonzero(mf_types == PGS_CONSTRAINT_TYPE_CONTACT)
     friction_rows = np.flatnonzero(mf_types == PGS_CONSTRAINT_TYPE_FRICTION)
-    velocity_limit_rows = np.flatnonzero(mf_types == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
+    velocity_limit_rows = np.flatnonzero(mf_types == PGS_CONSTRAINT_TYPE_SPEED)
 
     test_case.assertGreater(contact_rows.size, 0, "expected matrix-free contact rows")
     test_case.assertGreater(friction_rows.size, 0, "expected matrix-free friction rows")

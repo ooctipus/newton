@@ -15,7 +15,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_SPEED
 from newton.solvers import SolverFeatherPGS
 
 DT = 1.0 / 60.0
@@ -101,7 +101,7 @@ class TestFeatherPGSRigidSpeedLimits(unittest.TestCase):
         count = solver.placement.mf_constraint_count.numpy()[:2]
         np.testing.assert_array_equal(count, 2)
         types = solver.placement.mf_row_type.numpy()[:2, :2]
-        np.testing.assert_array_equal(types, PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
+        np.testing.assert_array_equal(types, PGS_CONSTRAINT_TYPE_SPEED)
         # A speed row keeps its axis unwhitened.
         jacobian = solver.placement.mf_Z_a.numpy()[:2, :2]
         np.testing.assert_array_equal(np.sort(np.argmax(np.abs(jacobian), axis=2), axis=1), [[0, 3]] * 2)

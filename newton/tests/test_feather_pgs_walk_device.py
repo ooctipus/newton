@@ -41,7 +41,7 @@ from newton._src.solvers.feather_pgs import tree_factor, tree_scan
 from newton._src.solvers.feather_pgs.device_preludes import DevicePrelude, substitute
 from newton._src.solvers.feather_pgs.kernel_template import THREADS, KernelTemplate, params
 from newton._src.solvers.feather_pgs.kernels import (
-    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    PGS_CONSTRAINT_TYPE_SPEED,
     PGS_LOCAL_SOLVE_OWNER_GENERAL,
 )
 from newton._src.solvers.feather_pgs.tree_factor import (
@@ -544,7 +544,7 @@ def placement_frames(solver, joint_q: np.ndarray, capture) -> dict:
         for world, live in enumerate(counts):
             line = int(capture.mf_first[world])
             for row in range(int(live)):
-                if kinds[line, row] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+                if kinds[line, row] == PGS_CONSTRAINT_TYPE_SPEED:
                     ball[world] |= lam[line, row] != 0.0
 
     primaries = solver.sweep.local_primary_articulation.numpy()

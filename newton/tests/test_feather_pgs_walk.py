@@ -32,7 +32,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import tree_factor
 from newton._src.solvers.feather_pgs.conditioning import ArmatureFloor
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_SPEED
 from newton._src.solvers.feather_pgs.placement import Placement
 from newton._src.solvers.feather_pgs.tree_factor import TreeWalk, local_frames
 from newton.solvers import SolverFeatherPGS
@@ -351,7 +351,7 @@ def check_rows(solver, joint_q: np.ndarray, capture: Capture, rng) -> RowCheck:
         for world, count in enumerate(counts):
             line = int(capture.mf_first[world])
             for row in range(int(count)):
-                if kinds[line, row] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+                if kinds[line, row] == PGS_CONSTRAINT_TYPE_SPEED:
                     # A free body's speed row is its speed ball's: a magnitude against the body's velocity as each
                     # visit finds it, a law and not a row, so its world's du is not sum Z lambda.
                     ball[world] |= lam[line, row] != 0.0

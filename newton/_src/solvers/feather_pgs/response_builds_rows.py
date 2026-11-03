@@ -31,7 +31,7 @@ from .kernel_template import Dispatch, KernelTemplate
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
-    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    PGS_CONSTRAINT_TYPE_SPEED,
 )
 from .paired_components import FREE_BODY_DOFS, PAIRED_COMPONENT_THREADS, PairedComponentData
 from .projection_laws import BILATERAL_PIVOT
@@ -109,7 +109,7 @@ def free_body_row_rhs(
                 row_w = 1.0
     elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
         rhs, _w = row_rhs(row_type, phi, 1.0, target, inv_dt, 1.0, 0.0, 0.0, 1.0)
-    elif row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+    elif row_type == PGS_CONSTRAINT_TYPE_SPEED:
         rhs = phi - target
     return rhs, row_w
 
@@ -489,7 +489,7 @@ _PAIRED_COMPONENTS = r"""
             rhs.bits = data.mf_meta.data[r * 4 + 2];
             const float mu = data.mf_mu.data[r];
             valid &= (a == -1 || a == so) && (b == -1 || b == so) && (a == so || b == so)
-                && (type == 0 || type == 2 || type == 4)
+                && (type == 0 || type == 2 || type == $SPEED)
                 && wp::isfinite(diag.value) && diag.value > 0.0f && wp::isfinite(rhs.value)
                 && wp::isfinite(mu) && mu >= 0.0f;
             if (type == 2) {
@@ -524,7 +524,11 @@ def paired_components_kernel(primary_size: int, secondary_size: int = FREE_BODY_
         raise ValueError("Paired components take an articulation of at most 32 coordinates and one free rigid body")
     P = int(primary_size)
     source = kernel_template.substitute(
-        _PAIRED_COMPONENTS, PRIMARY=P, SECONDARY=secondary_size, WORLD=P + secondary_size
+        _PAIRED_COMPONENTS,
+        PRIMARY=P,
+        SECONDARY=secondary_size,
+        WORLD=P + secondary_size,
+        SPEED=int(PGS_CONSTRAINT_TYPE_SPEED),
     )
     return KernelTemplate(
         f"paired_components_{P}_{secondary_size}",

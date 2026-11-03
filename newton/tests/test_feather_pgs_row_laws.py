@@ -268,10 +268,11 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
     worlds, rows = 8, 48
     layout = _mf_layout(rng, worlds, rows)
     phi = scalars(rng, worlds * rows, 0.02).reshape(worlds, rows)
-    kind = rng.choice(np.array([0, 0, 0, 2, 4], dtype=np.int32), (worlds, rows))
+    speed = int(row_laws.ROW_SPEED)
+    kind = rng.choice(np.array([0, 0, 0, 2, speed], dtype=np.int32), (worlds, rows))
     # A speed row's diagonal walks its body's covector, which needs the body's walk: here its rows name no body.
     for side in "ab":
-        layout[f"mf_body_{side}"] = np.where(kind == 4, -1, layout[f"mf_body_{side}"]).astype(np.int32)
+        layout[f"mf_body_{side}"] = np.where(kind == speed, -1, layout[f"mf_body_{side}"]).astype(np.int32)
     target = scalars(rng, worlds * rows).reshape(worlds, rows)
     restitution = rng.choice(np.array([0.0, 0.0, 0.5, 1.0], dtype=np.float32), (worlds, rows))
     shared = {
@@ -338,7 +339,7 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
         2.0,
     )
     # Rows whose bias the variant does not touch (speed rows, restitution) stay bitwise.
-    untouched = (kind == 4).ravel()
+    untouched = (kind == speed).ravel()
     test.assertFalse(mismatches(reference_rhs.ravel()[untouched, None], law_rhs.ravel()[untouched, None]).any())
 
 

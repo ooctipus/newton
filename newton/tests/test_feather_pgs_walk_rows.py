@@ -29,7 +29,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_SPEED
 from newton._src.solvers.feather_pgs.tree_factor import TreeWalk, local_frames
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_response_diagonal import _build_mixed_response_model
@@ -618,7 +618,7 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
         for world, count in enumerate(mf_counts):
             line = int(capture.mf_first[world])
             for row in range(int(count)):
-                if kinds[line, row] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+                if kinds[line, row] == PGS_CONSTRAINT_TYPE_SPEED:
                     ball[world] |= lam[line, row] != 0.0
                     continue
                 term, scale_z, scale_u = 0.0, 0.0, 0.0

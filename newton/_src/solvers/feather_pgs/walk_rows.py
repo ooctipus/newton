@@ -55,7 +55,7 @@ from .device_preludes import DevicePrelude, dual_native, lane_group, substitute
 from .field_group import Field
 from .friction_patches import PatchRowLaw
 from .kernel_template import python_kernel
-from .kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT, free_body_contact, free_body_contact_records, row_bias
+from .kernels import PGS_CONSTRAINT_TYPE_SPEED, free_body_contact, free_body_contact_records, row_bias
 from .projection_laws import friction_pair_metric
 from .response_builds_rows import close_block, close_row, free_body_row_header
 from .row_build import write_contact_row
@@ -207,7 +207,7 @@ def free_body_headers_kernel(
     body_b = mf.body_b[line, i]
     diagonal = pgs_cfm
     incident = float(0.0)
-    if mf.row_type[line, i] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+    if mf.row_type[line, i] == PGS_CONSTRAINT_TYPE_SPEED:
         if body_a >= 0:
             art = walk.body_art[body_a]
             j0 = walk.joint_start[art]

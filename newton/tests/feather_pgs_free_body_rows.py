@@ -15,7 +15,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import sweep_routes
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_SPEED
 from newton._src.solvers.feather_pgs.tree_factor import unpack_walk_records
 from newton.tests.feather_pgs_law_harness import chain_walk
 
@@ -44,7 +44,7 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
     for Z, bodies in ((Z_a, solver.placement.mf_body_a.numpy()), (Z_b, solver.placement.mf_body_b.numpy())):
         J = Z.astype(np.float64).copy()
         worlds, rows = np.nonzero(
-            (bodies[:, : Z.shape[1]] >= 0) & (row_type[:, : Z.shape[1]] != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
+            (bodies[:, : Z.shape[1]] >= 0) & (row_type[:, : Z.shape[1]] != PGS_CONSTRAINT_TYPE_SPEED)
         )
         for world, row in zip(worlds, rows, strict=True):
             J[world, row] = physical(articulation[bodies[world, row]], J[world, row])

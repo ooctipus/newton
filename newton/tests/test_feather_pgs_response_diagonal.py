@@ -16,6 +16,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    PGS_CONSTRAINT_TYPE_SPEED,
     PGS_LOCAL_SOLVE_OWNER_GENERAL,
     PGS_LOCAL_SOLVE_OWNER_PAIR,
     PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
@@ -1744,10 +1745,10 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
 
         self.assertFalse(general_solver.placement.local_internal_fast_path)
         self.assertTrue(local_solver.placement.local_internal_fast_path)
-        limited = [sample for sample in local if np.any(sample[9] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)]
-        self.assertTrue(limited, "free body never produced a velocity-limit row")
+        limited = [sample for sample in local if np.any(sample[9] == PGS_CONSTRAINT_TYPE_SPEED)]
+        self.assertTrue(limited, "free body never produced a speed row")
         for sample in general + local:
-            np.testing.assert_array_equal(sample[8][sample[9] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT], 0.0)
+            np.testing.assert_array_equal(sample[8][sample[9] == PGS_CONSTRAINT_TYPE_SPEED], 0.0)
         # The residual owner is eligible for this world; only the velocity-limit rows keep it general.
         self.assertGreaterEqual(int(local_solver.sweep.local_residual_pair_articulation.numpy()[0]), 0)
         for sample in limited:

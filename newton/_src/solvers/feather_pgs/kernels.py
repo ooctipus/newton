@@ -82,7 +82,9 @@ from .solver_fields import Links, LocalOwners
 from .spatial_laws import free_root_transport
 
 PGS_CONSTRAINT_TYPE_CONTACT = 0
-# Type 1 was the PhysX drive row; drives fold into the mass matrix.
+# A free rigid body's speed row: it bounds the magnitude of the body's linear or angular velocity (type 1 was the
+# PhysX drive row; drives fold into the mass matrix).
+PGS_CONSTRAINT_TYPE_SPEED = 1
 PGS_CONSTRAINT_TYPE_FRICTION = 2
 PGS_CONSTRAINT_TYPE_JOINT_LIMIT = 3
 # Joint velocity-limit row. Mirrors the PhysX per-DOF velocity clamp (see
@@ -2547,11 +2549,10 @@ def populate_rigid_velocity_limit_rows(
 
         mf.body_a[mf_line, slot] = body
         mf.body_b[mf_line, slot] = -1
-        mf.row_type[mf_line, slot] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+        mf.row_type[mf_line, slot] = PGS_CONSTRAINT_TYPE_SPEED
         mf.row_parent[mf_line, slot] = -1
         mf.row_mu[mf_line, slot] = 0.0
-        # For velocity-limit rows mf_phi stores the speed limit; contact rows
-        # use it as geometric gap. Row type disambiguates the meaning.
+        # A speed row's ``phi`` stores the speed limit; a contact row's its gap.
         mf.phi[mf_line, slot] = limit
 
 
@@ -2619,9 +2620,9 @@ def classify_local_solve_worlds(
             local_mf = False
         if body_b >= 0 and body_to_articulation[body_b] != residual_pair_articulation:
             local_mf = False
-        # Free-body velocity-limit rows are speed rows (projection_laws.speed_row), which the residual local loop
-        # does not implement: keep such worlds on the general owner.
-        if mf.row_type[mf_line, mf_row] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+        # The residual local loop does not implement the speed law (projection_laws.speed_row): keep worlds with speed
+        # rows on the general owner.
+        if mf.row_type[mf_line, mf_row] == PGS_CONSTRAINT_TYPE_SPEED:
             local_mf = False
         mf_row += 1
 

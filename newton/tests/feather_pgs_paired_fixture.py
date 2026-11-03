@@ -15,6 +15,7 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs import paired_components as components
 from newton._src.solvers.feather_pgs import response_builds_rows, sweep_routes, sweep_routes_local
+from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_SPEED
 from newton._src.solvers.feather_pgs.tree_factor import WalkTrees
 from newton.tests.feather_pgs_law_harness import row_lines
 
@@ -135,7 +136,7 @@ def solve_fixture(device):
     host = component_fixture(5)
     host["mf_counts"][3] = 0
     host["mf_counts"][1] = 4
-    host["mf_meta"][1, 15] = pack_endpoints(-1, 4)
+    host["mf_meta"][1, 15] = pack_endpoints(-1, PGS_CONSTRAINT_TYPE_SPEED)
     host["counts"][4] = 0
     host["J"][2, 0, 23] = 0.35
     # The paired path owns a position-limit prefix then contact triples.

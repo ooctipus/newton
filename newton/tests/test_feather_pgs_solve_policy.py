@@ -683,7 +683,7 @@ class TestSolveReadoutRecord(unittest.TestCase):
         """Name every constraint type at its own index of the trace's kinds, followed by the kind of no change."""
         names = {
             kernels.PGS_CONSTRAINT_TYPE_CONTACT: "contact",
-            1: "unused",
+            kernels.PGS_CONSTRAINT_TYPE_SPEED: "speed",
             kernels.PGS_CONSTRAINT_TYPE_FRICTION: "friction",
             kernels.PGS_CONSTRAINT_TYPE_JOINT_LIMIT: "joint_limit",
             kernels.PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT: "velocity_limit",

@@ -29,6 +29,7 @@ from .staging import Buffer, Staging, arch_budget
 from .sweep import (
     CONTACT,
     FRICTION,
+    SPEED,
     VELOCITY_LIMIT,
     CachedPairMetric,
     FreeBodyRows,
@@ -50,9 +51,9 @@ from .sweep import (
 )
 from .tree_factor import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude, walk_paths_prelude
 
-# The row loops leave the velocity-limit rows to the passes at the end of every sweep (the last word).
+# The row loops leave the velocity-limit and speed rows to the passes at the end of every sweep (the last word).
 _DENSE_ADMISSION = f"if (row_type == {VELOCITY_LIMIT}) continue;"
-_MF_ADMISSION = f"if (mf_rt == {VELOCITY_LIMIT}) continue;"
+_MF_ADMISSION = f"if (mf_rt == {SPEED}) continue;"
 
 MF_GS_ABI = kernel_template.params(
     ("world", int),
@@ -729,6 +730,7 @@ def mf_gs_source(
                 "(mf_meta.data[off_meta + i * 4 + 3] & 0xFFFF)",
                 free_op.apply_row("i", "seed", "        "),
                 row_lanes.sync(),
+                skip=SPEED,
                 declare=(
                     "const int packed_dofs = mf_meta.data[off_meta + i * 4];",
                     "const int dof_a = packed_dofs >> 16, dof_b = (packed_dofs << 16) >> 16;",

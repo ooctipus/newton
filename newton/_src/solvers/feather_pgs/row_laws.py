@@ -34,6 +34,7 @@ ROW_LAW = LawFamily("RowLaw")
 
 # Row kinds (the solver's constraint types).
 ROW_CONTACT = wp.constant(0)
+ROW_SPEED = wp.constant(1)
 ROW_FRICTION = wp.constant(2)
 ROW_JOINT_LIMIT = wp.constant(3)
 ROW_JOINT_VELOCITY_LIMIT = wp.constant(4)

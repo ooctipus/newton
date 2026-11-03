@@ -26,7 +26,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    PGS_CONSTRAINT_TYPE_SPEED,
 )
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
@@ -253,7 +253,7 @@ def _velocity_limit_impulses(run):
     """Return the impulses the last sweep left in velocity-limit rows, zero in every other entry: [world, row]."""
     rows = _free_body_rows(run)
     live = np.arange(rows.type.shape[1])[None, :] < rows.count[:, None]
-    return np.where(live & (rows.type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT), rows.impulses, 0.0)
+    return np.where(live & (rows.type == PGS_CONSTRAINT_TYPE_SPEED), rows.impulses, 0.0)
 
 
 def _assert_on_limit_scale(actual, desired, limits=LIMITS):
@@ -285,7 +285,7 @@ class _FreeBodyVelocityLimitChecks:
         """Every box owns its two speed rows: the linear (axis 0) and the angular (axis 3) one."""
         rows = _free_body_rows(run)
         np.testing.assert_array_equal(rows.count, 2)
-        np.testing.assert_array_equal(rows.type, PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
+        np.testing.assert_array_equal(rows.type, PGS_CONSTRAINT_TYPE_SPEED)
         for world in range(rows.type.shape[0]):
             pairs = sorted(zip(rows.axis[world].tolist(), rows.sign[world].tolist(), strict=True))
             self.assertEqual(pairs, [(0, 1.0), (3, 1.0)])
@@ -376,7 +376,7 @@ class _FreeBodyVelocityLimitChecks:
                 velocity = _step(run)
                 rows = _free_body_rows(run)
                 contact = rows.type == PGS_CONSTRAINT_TYPE_CONTACT
-                limit = rows.type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+                limit = rows.type == PGS_CONSTRAINT_TYPE_SPEED
                 np.testing.assert_array_equal(contact.sum(axis=1), 1)
                 np.testing.assert_array_equal(limit.sum(axis=1), 2)
                 push = -rows.rhs[contact]

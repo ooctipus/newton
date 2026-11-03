@@ -43,9 +43,9 @@ from .packed_rows import WIDE
 from .row_laws import (
     ROW_CONTACT,
     ROW_FRICTION,
-    ROW_JOINT_VELOCITY_LIMIT,
     ROW_LINK,
     ROW_MIMIC,
+    ROW_SPEED,
     ROW_TORSION,
 )
 from .sparse_mass_matrix import _SparseRowSupport
@@ -315,7 +315,7 @@ def free_rows(
     for i in range(a.mf_counts[world]):
         kind = mf.row_type[line, i]
         body = mf.body_a[line, i]
-        if kind == ROW_JOINT_VELOCITY_LIMIT:
+        if kind == ROW_SPEED:
             start = walk.dof_start[walk.body_art[body]]
             if mf.Z_a[line, i, 3] != 0.0:
                 start += 3

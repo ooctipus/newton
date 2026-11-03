@@ -52,7 +52,7 @@ from .device_preludes import (
 from .field_group import Field, FieldGroup, SolverArrays
 from .friction_patches import PatchRowLaw, patch_friction_location, patch_row_law
 from .kernel_template import KernelTemplate, substitute
-from .kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+from .kernels import PGS_CONSTRAINT_TYPE_SPEED
 from .prefix_rows import LAW, limits, prefix_rows
 from .prefix_rows import mimics as mimic_rows
 from .row_build import write_contact_row
@@ -291,7 +291,7 @@ def finalize_and_queue(
             local_mf = False
         if body1 >= 0 and queue.body_art[body1] != residual_secondary:
             local_mf = False
-        if queue.mf_row_type[mf_line, mf_row] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+        if queue.mf_row_type[mf_line, mf_row] == PGS_CONSTRAINT_TYPE_SPEED:
             local_mf = False
         mf_row += 1
     owner = int(0)

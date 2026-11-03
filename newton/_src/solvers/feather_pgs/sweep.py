@@ -46,6 +46,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    PGS_CONSTRAINT_TYPE_SPEED,
     PGS_CONSTRAINT_TYPE_TORSION,
 )
 from .response_operator import Lanes, ResponseOperator
@@ -58,6 +59,7 @@ CONTACT = int(PGS_CONSTRAINT_TYPE_CONTACT)
 FRICTION = int(PGS_CONSTRAINT_TYPE_FRICTION)
 JOINT_LIMIT = int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
 VELOCITY_LIMIT = int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
+SPEED = int(PGS_CONSTRAINT_TYPE_SPEED)
 TORSION = int(PGS_CONSTRAINT_TYPE_TORSION)
 
 
@@ -1111,17 +1113,26 @@ def free_body_rows_block(
 
 
 def impulse_seed(
-    count: str, impulse: str, kind: str, apply: str, sync: str, *, declare: tuple[str, ...] = (), pad: str = "    "
+    count: str,
+    impulse: str,
+    kind: str,
+    apply: str,
+    sync: str,
+    *,
+    skip: int = VELOCITY_LIMIT,
+    declare: tuple[str, ...] = (),
+    pad: str = "    ",
 ) -> str:
     """Give the velocity change the response of the impulses a sweep starts from, ``du = sum_i Z_i lambda_i``, row by
     row in order, before the first sweep: the warm start's and the closed loop's. A velocity-limit row carries no
-    impulse into a sweep (and a free body's speed row no ``Z``). A row's lanes' updates never collide; ``sync``
-    serializes the rows.
+    impulse into a sweep, and a free body's speed row no ``Z``: rows of kind ``skip`` are left out. A row's lanes'
+    updates never collide; ``sync`` serializes the rows.
 
     Args:
         count: The rows.
         impulse: Row ``i``'s impulse.
         kind: Row ``i``'s type.
+        skip: The kind left out (``VELOCITY_LIMIT`` or ``SPEED``).
         apply: ``du += Z_i seed`` (the operator's ``apply_row``, indented for this block).
         sync: The lanes' barrier after a row.
         declare: Statements row ``i``'s ``apply`` needs.
@@ -1131,7 +1142,7 @@ def impulse_seed(
         f"for (int i = 0; i < {count}; ++i) {{",
         *(f"    {line}" for line in declare),
         f"    const float seed = {impulse};",
-        f"    if (seed != 0.0f && {kind} != {VELOCITY_LIMIT}) {{",
+        f"    if (seed != 0.0f && {kind} != {skip}) {{",
         apply,
         "    }",
         f"    {sync}",
@@ -1193,7 +1204,7 @@ def speed_rows_pass(rows: FreeBodyRows, op, laws: RowLaws, *, pad: str = "      
         "    int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i * 4]);",
         "    int packed_tp = meta.w;",
         "    int mf_rt = packed_tp & 0xFFFF;",
-        f"    if (mf_rt != {VELOCITY_LIMIT}) continue;",
+        f"    if (mf_rt != {SPEED}) continue;",
         "",
         "    int packed_dofs = meta.x;",
         "    int dof_a = packed_dofs >> 16;",
@@ -1251,7 +1262,7 @@ def speed_row(
         f"{pad}if (speed_row[2] != 0.0f) {{",
         change_vote(
             laws,
-            (Change("speed_row[1]", "bound_speed", str(VELOCITY_LIMIT), f"1.0f / {inverse}"),),
+            (Change("speed_row[1]", "bound_speed", str(SPEED), f"1.0f / {inverse}"),),
             pad + "    ",
         ),
         op.scale_speed("speed_row[2]", body, axis, pad + "    "),
