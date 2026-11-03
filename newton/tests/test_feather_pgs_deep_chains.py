@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The conditioning armature's law evidence (Z4.A): what deleting it (Z4.L) stands on.
+"""Deep chains and thin axes without armature (Z4.A, Z4.L): the solver and its float32 walk against float64.
 
-Main adds armature where its float32 dense Cholesky would fail: every coordinate near the head of a path of 32 joints
+Main added armature where its float32 dense Cholesky would fail: every coordinate near the head of a path of 32 joints
 or more (the deep-chain rule), and a floor on thin axes of every tree (the assembly floor). The walk, the leaf-first
-factor in local frames (:class:`.tree_factor.TreeWalk`), keeps its float32 pivots positive without either. These tests
-hold both sides to float64 references that share nothing with the solver:
+factor in local frames (:class:`.tree_factor.TreeWalk`), keeps its float32 pivots positive without either, so the
+solver adds neither (Z4.L). These tests hold both sides to float64 references that share nothing with the solver:
 
 - **the deep-chain regime:** a tip wrench on ``long_chain(N)`` without armature, N = 32, 106, 300 and 1,000, its
   velocity change after one step of the solver against ``H^-1 J^T`` in float64. Main reads 2.6e-3 to 6.6e-3 (F2) and
@@ -15,13 +15,13 @@ hold both sides to float64 references that share nothing with the solver:
   and loops cut at a body (the four-bar, the Stewart platform). The float32 walk's pivots stay positive and a leaf
   contact's response within 1e-5 of float64 without armature, on the host and on each device (FL3.1's device walk);
 - **thin links**, a chain whose links turn with 1e-6 of their own inertia: ``cond(H)`` 9e11 at 106 links, past float32.
-  The float32 walk without armature reads 7e-4 there, and main's factor with its armature fails (non-finite), 0.1 off
+  The float32 walk without armature reads 7e-4 there, and main's factor with its armature failed (non-finite), 0.1 off
   at 32 links where the walk reads 5e-5: the walk is the closer at every length, and 1e-5 is out of float32's reach
   (a documented limit, not a defect of either);
-- **the assembly floor's own cases** (:class:`.test_feather_pgs_conditioning.TestAssemblyFloor`): the thin ball loop at
-  every rocker inertia around the rounding, the thin ball 2 m out on a pure tree and the thin hinges, on the walk's
-  local pivots with no floor, from the float32 forward kinematics' poses (the floor's case: a thin body far from the
-  origin). If they hold, Z4.L deletes the floor with the deep-chain rule.
+- **the assembly floor's former cases**: the thin ball loop at every rocker inertia around the rounding, the thin ball
+  2 m out on a pure tree and the thin hinges, on the walk's local pivots with no floor, from the float32 forward
+  kinematics' poses (the floor's case: a thin body far from the origin), and the solver stepping the loop and a bare
+  100-link chain without either rule (:class:`TestStepsWithoutArmature`).
 
 ``python -m newton.tests.test_feather_pgs_deep_chains report`` prints the measured tables.
 """
@@ -40,7 +40,7 @@ from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests.feather_pgs_law_harness import dense_factor32
 from newton.tests.feather_pgs_mass_reference import MassReference
-from newton.tests.test_feather_pgs_connect import _LOOP_FRAMES, _four_bar_bars
+from newton.tests.test_feather_pgs_connect import _LOOP_FRAMES, _four_bar_bars, _loop_anchor_gap
 from newton.tests.test_feather_pgs_regimes import LIMIT, known_failure
 from newton.tests.test_feather_pgs_walk import (
     contact_wrenches,
@@ -96,12 +96,10 @@ def tip_impulse(links: int) -> dict:
     walk32 = TreeWalk(*local_frames(model, joint_q, 0), np.zeros(n), dtype=np.float32)
     dv64, _ = truth.down(truth.up(links, W)[0])
     dv32, _ = walk32.down(walk32.up(links, W.astype(np.float32))[0])
-    added = solver.factor.armature[:n].astype(np.float64) - model.joint_armature.numpy()[:n]
     return {
         "links": links,
         "solver": relative(dv, dv64),
         "walk32": relative(dv32, dv64),
-        "armature": int(np.count_nonzero(added > 0.0)),
         "finite": bool(np.all(np.isfinite(dv))),
     }
 
@@ -191,7 +189,7 @@ def family_response(model, devices_to_run=(), *, float32_poses: bool = False) ->
 
 def main_on_chain(model) -> dict:
     """A chain's tip contact (three rows) through main's float32 dense factor (:func:`dense_factor32` of the float32 ``H``
-    about the origin with the conditioning armature the solver adds), applied in float32, and through the float32 walk without armature, both
+    about the origin, no armature added), applied in float32, and through the float32 walk without armature, both
     against the float64 walk without armature (F2's comparison, :func:`.test_feather_pgs_walk.chain_precision`)."""
     from scipy.linalg import solve_triangular
 
@@ -239,11 +237,8 @@ def families() -> list:
 
 
 def thin_rocker(inertia: float):
-    """:class:`.test_feather_pgs_conditioning.TestAssemblyFloor`'s thin ball loop, cut at the rocker."""
-    bars, coupler, rocker = _four_bar_bars()
-    bars.body_inertia[rocker] = wp.mat33(inertia * np.eye(3))
-    bars.add_joint_ball(parent=coupler, child=rocker, **_LOOP_FRAMES)
-    return BodyCut.of(bars.finalize(device="cpu")).model
+    """The assembly floor's thin ball loop (:meth:`TestStepsWithoutArmature.rocker`), cut at the rocker."""
+    return BodyCut.of(TestStepsWithoutArmature.rocker(inertia)).model
 
 
 def thin_ball_far_out():
@@ -286,7 +281,7 @@ def thin_hinges():
 
 
 FLOOR_INERTIAS = (1.0e-7, 3.0e-8, 1.0e-8, 3.0e-9, 1.0e-9, 3.0e-10, 1.0e-10)
-"""``TestAssemblyFloor``'s rocker inertias, around the rounding of its shadow's ball joint's diagonal."""
+"""The thin ball loop's rocker inertias, around the rounding of its shadow's ball joint's diagonal."""
 
 
 def floor_cases() -> list:
@@ -307,8 +302,8 @@ class TestDeepChainRegime(unittest.TestCase):
     """A tip impulse on ``long_chain(N)`` without armature, the solver's step against float64."""
 
     def test_a_tip_impulse_answers_within_1e_4(self):
-        """Main's float32 dense factor, with the conditioning armature, answered 2.6e-3 to 6.6e-3 off float64 from 106
-        links; since the predictor solves by the walk (Z4.2) the step holds 1e-4, the armature still in place."""
+        """Main's float32 dense factor, with its conditioning armature, answered 2.6e-3 to 6.6e-3 off float64 from 106
+        links; the step, solved by the walk (Z4.2) with no armature added (Z4.L), holds 1e-4."""
         worst = max(tip_impulse(links)["solver"] for links in DEEP)
         self.assertLess(worst, REGIME_TOLERANCE)
 
@@ -339,13 +334,13 @@ class TestThinLinks(unittest.TestCase):
 
     def test_the_walk_is_closer_than_main(self):
         """The float32 walk without armature is finite, keeps its pivots positive and answers a tip contact within
-        1e-3 of float64, closer than main's factor with the armature it adds (which fails at 106 links)."""
+        1e-3 of float64, closer than main's float32 dense factor (a failed factor, NaN, is not closer)."""
         for links in (32, 106):
             with self.subTest(links=links):
                 result = main_on_chain(thin_chain(links))
                 self.assertTrue(result["pivots_positive"], f"{result}")
                 self.assertLess(result["walk32"], 1.0e-3, f"{result}")
-                self.assertLess(result["walk32"], result["main"], f"{result}")
+                self.assertFalse(result["main"] <= result["walk32"], f"{result}")
 
     @known_failure(LIMIT, "cond(H) 9.2e11 on 106 thin links: the float32 walk reads 7.2e-4, main's factor fails")
     def test_within_1e_5(self):
@@ -353,8 +348,7 @@ class TestThinLinks(unittest.TestCase):
 
 
 class TestAssemblyFloorOnTheWalk(unittest.TestCase):
-    """The assembly floor's cases on the walk's local pivots, no floor, from float32 poses: if they hold, the floor goes
-    with the deep-chain rule (Z4.L)."""
+    """The assembly floor's former cases on the walk's local pivots, no floor, from float32 poses."""
 
     def test_every_floor_case_without_the_floor(self):
         for name, model in floor_cases():
@@ -366,14 +360,74 @@ class TestAssemblyFloorOnTheWalk(unittest.TestCase):
                     self.assertLess(worst[str(where)], WALK_TOLERANCE, f"{where}: {worst}")
 
 
+class TestStepsWithoutArmature(unittest.TestCase):
+    """The solver steps the assembly floor's and the deep-chain rule's cases with no armature added."""
+
+    @staticmethod
+    def rocker(inertia: float):
+        """The four-bar closed by a ball joint at a thin rocker of axial ``inertia``."""
+        bars, coupler, rocker = _four_bar_bars()
+        bars.body_inertia[rocker] = wp.mat33(inertia * np.eye(3))
+        bars.add_joint_ball(parent=coupler, child=rocker, **_LOOP_FRAMES)
+        return bars.finalize(device="cpu")
+
+    def test_a_thin_ball_loop_steps(self):
+        """The rocker's axial inertia of 1e-9 kg m^2 is below the rounding of its shadow's ball joint's diagonal
+        about the origin, about 3e-9: main's factor went NaN at the first step without the floor. The loop closes."""
+        model = self.rocker(1.0e-9)
+        solver = SolverFeatherPGS(model, pgs_iterations=8, pgs_beta=0.1)
+        np.testing.assert_array_equal(solver.factor.armature, model.joint_armature.numpy())
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        targets = model.joint_target_q.numpy().copy()
+        targets[0] = 0.3
+        control.joint_target_q.assign(targets)
+        for _ in range(120):
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+        self.assertTrue(np.isfinite(state_0.body_q.numpy()).all())
+        self.assertLess(_loop_anchor_gap(model, state_0), 1.0e-5)
+        self.assertAlmostEqual(float(state_0.joint_q.numpy()[0]), 0.2879, delta=2.0e-3)
+
+    def test_every_inertia_around_the_rounding_steps(self):
+        """Rounding lands on either side of zero around the floor, so no inertia near it may fail."""
+        for inertia in FLOOR_INERTIAS:
+            with self.subTest(inertia=inertia):
+                model = self.rocker(inertia)
+                solver = SolverFeatherPGS(model, pgs_iterations=4, pgs_beta=0.1)
+                state_0, state_1, control = model.state(), model.state(), model.control()
+                for _ in range(8):
+                    state_0.clear_forces()
+                    solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+                    state_0, state_1 = state_1, state_0
+                self.assertTrue(np.isfinite(state_0.body_q.numpy()).all())
+
+    def test_a_bare_chain_stays_finite(self):
+        """Step a bare 100-link chain on the ground without a non-finite factor or velocity."""
+        scene = scenes.long_chain(armature=0.0)
+        model = scene.build("cpu")
+        solver = SolverFeatherPGS(model, dense_max_constraints=384)
+        np.testing.assert_array_equal(solver.factor.armature, model.joint_armature.numpy())
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=scene.rigid_contact_max)
+        contacts = pipeline.contacts()
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        for _ in range(scene.steps):
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, scene.dt)
+            state_0, state_1 = state_1, state_0
+        self.assertTrue(np.isfinite(state_0.joint_qd.numpy()).all())
+        self.assertTrue(np.isfinite(solver.factor.walk_data.numpy()).all())
+
+
 def report() -> None:
     """Print the measured tables."""
     print("deep-chain regime: tip impulse's dv after one step against float64 (no armature)")
     for links in DEEP:
         r = tip_impulse(links)
         print(
-            f"  N {links:5d}: solver {r['solver']:8.1e} (armature on {r['armature']} coordinates)  float32 walk "
-            f"{r['walk32']:8.1e}",
+            f"  N {links:5d}: solver {r['solver']:8.1e}  float32 walk {r['walk32']:8.1e}",
             flush=True,
         )
     where = devices()

@@ -13,8 +13,8 @@ factor and to the claims built on it:
 - **F1**: on every catalogue problem and both CPU routes, the walk's ``Z`` against the step's packed ``Z`` (and its
   free bodies' rows), and the walk's leave of the step's ``du`` against the step's velocity change;
 - **F2**: on ``long_chain(N)`` without armature, the float32 walk against the float64 truth, beside main's float32
-  factor with the conditioning armature it adds;
-- **F2b**: main's factor on the same chains with that armature off;
+  dense factor (the solver adds no armature: main's conditioning armature went with Z4.L);
+- **F2b**: where that dense factor fails on the same chains;
 - **F4, F5**: row entries per seed in a frame cut every 32 coordinates, and merged across seed-free stretches.
 
 ``python -m newton.tests.test_feather_pgs_walk report`` prints the measured tables.
@@ -30,8 +30,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import tree_factor
-from newton._src.solvers.feather_pgs.conditioning import ArmatureFloor
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_SPEED
 from newton._src.solvers.feather_pgs.placement import Placement
 from newton._src.solvers.feather_pgs.tree_factor import TreeWalk, local_frames
@@ -425,10 +423,6 @@ class Chain:
     coordinates: int
     condition: float
     """``cond(H)``, float64."""
-    armature_coordinates: int
-    armature_largest: float
-    armature_alone: float
-    """The armature's own change to ``dv``, in float64: main's physics against the truth."""
     truth_floor: float
     """The float64 walk against the float64 Cholesky of the independent mass matrix (the truth's own spread)."""
     main_factor: float
@@ -445,7 +439,7 @@ class Chain:
 
 
 def chain_precision(links: int, rng) -> Chain:
-    """Main's float32 factor of ``long_chain(links, armature=0)``, with the conditioning armature it adds, against the
+    """Main's float32 dense factor of ``long_chain(links, armature=0)``, no armature added, against the
     float32 walk in local frames with none, both against the float64 walk with none (the truth)."""
     scene = scenes.long_chain(links=links, armature=0.0)
     model = scene.build("cpu")
@@ -457,7 +451,6 @@ def chain_precision(links: int, rng) -> Chain:
     joint_q = state.joint_q.numpy().astype(np.float64)
     solver.step(state, out, control, None, scene.dt)
     n = links + 6
-    added = solver.factor.armature[:n].astype(np.float64) - model.joint_armature.numpy()[:n]
     H = MassReference(model).mass_matrix(joint_q, 0)
     H32 = MassReference(model, np.float32).mass_matrix(joint_q, 0).astype(np.float64)
     L32 = dense_factor32(H32 + np.diag(solver.factor.diagonal(0)))
@@ -470,8 +463,6 @@ def chain_precision(links: int, rng) -> Chain:
     u = rng.normal(size=n)
     v64, _ = truth.down(u)
     floor = relative(dv64, np.linalg.solve(H, x))
-    physics = solver.factor.walk(joint_q, 0)  # main's own physics: its armature and drives, in float64
-    dv_physics, _ = physics.down(physics.up(body, W)[0])
     A = (H + np.diag(solver.factor.diagonal(0)))[::-1, ::-1]
     L64 = L32.astype(np.float64)
 
@@ -505,9 +496,6 @@ def chain_precision(links: int, rng) -> Chain:
         links=links,
         coordinates=n,
         condition=float(np.linalg.cond(H)),
-        armature_coordinates=int(np.count_nonzero(added > 0.0)),
-        armature_largest=float(added.max(initial=0.0)),
-        armature_alone=relative(dv_physics, dv64),
         truth_floor=floor,
         main_factor=float(np.abs(L64 @ L64.T - A).max() / np.abs(A).max()) if np.all(np.isfinite(L64)) else np.inf,
         main=main,
@@ -519,13 +507,9 @@ def chain_precision(links: int, rng) -> Chain:
     )
 
 
-def _no_conditioning(model, armature, joint_forest):
-    return np.array(armature, dtype=np.float32, copy=True), ArmatureFloor(0, 0, 0.0, 0)
-
-
 @dataclasses.dataclass
 class Unconditioned:
-    """F2b at one length: main's factor with the conditioning armature off."""
+    """F2b at one length: main's dense float32 factor without armature."""
 
     links: int
     first_pose_finite: bool
@@ -539,11 +523,11 @@ class Unconditioned:
 
 
 def unconditioned(links: int, steps: int = 30) -> Unconditioned:
-    """Step ``long_chain(links, armature=0)`` on the ground with the conditioning armature off; record where the
-    float32 factor fails."""
+    """Step ``long_chain(links, armature=0)`` on the ground (the solver adds no armature); record where main's dense
+    float32 factor of its mass matrix fails."""
     scene = scenes.long_chain(links=links, armature=0.0)
     model = scene.build("cpu")
-    with mock.patch.object(tree_factor, "conditioning_armature", _no_conditioning), warnings.catch_warnings():
+    with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         solver = SolverFeatherPGS(model, dense_max_constraints=3 * links + 32)
     np.testing.assert_array_equal(solver.factor.armature, model.joint_armature.numpy())
@@ -778,7 +762,7 @@ class TestWalkF2(unittest.TestCase):
 
     def test_f2_float32_walk_needs_no_armature(self):
         """The float32 walk builds every chain without armature, and from 32 links it answers a tip impulse at least
-        twice as close to the float64 truth as main's float32 factor with the armature main adds."""
+        twice as close to the float64 truth as main's float32 dense factor."""
         rng = np.random.default_rng(3)
         for links in CHAINS:
             with self.subTest(links=links):
@@ -786,11 +770,12 @@ class TestWalkF2(unittest.TestCase):
                 self.assertTrue(chain.walk32_pivots_positive)
                 self.assertLess(chain.walk32["dv"], 1.0e-5)
                 if links >= 32:
-                    self.assertGreater(chain.main["dv"], 2.0 * chain.walk32["dv"])
+                    # A dense factor that failed (NaN) is not closer either.
+                    self.assertFalse(chain.main["dv"] <= 2.0 * chain.walk32["dv"], f"{chain.main}")
 
     def test_f2b_main_fails_without_its_armature(self):
-        """Without the conditioning armature, main's float32 factor of the chain fails at its first pose from 80 links
-        and holds below."""
+        """Without armature, main's float32 dense factor of the chain fails at its first pose from 80 links and holds
+        below."""
         for links in (8, 64, 80, 300):
             with self.subTest(links=links):
                 result = unconditioned(links, steps=2)
@@ -816,21 +801,20 @@ def report() -> None:
     rng = np.random.default_rng(3)
     print("F2  long_chain(N), armature 0: errors against the float64 walk without armature (the truth); dv = H^-1 J^T")
     print(
-        "     N   cond(H)  main armature: coords largest  dv alone | main factor | Z: main / walk32 | leave: main / "
+        "     N   cond(H) | main factor | Z: main / walk32 | leave: main / "
         "walk32 | dv: main (f64 solves) / walk32  ratio / walk32 on float32 poses | walk32 pivots"
     )
     for links in CHAINS:
         c = chain_precision(links, rng)
         ratio = c.main["dv"] / c.walk32["dv"] if c.walk32["dv"] > 0 else float("nan")
         print(
-            f"  {c.links:5d}  {c.condition:8.1e}  {c.armature_coordinates:5d} {c.armature_largest:9.2e} "
-            f"{c.armature_alone:8.1e} | {c.main_factor:8.1e} | {c.main['Z']:8.1e} / {c.walk32['Z']:8.1e} | "
+            f"  {c.links:5d}  {c.condition:8.1e} | {c.main_factor:8.1e} | {c.main['Z']:8.1e} / {c.walk32['Z']:8.1e} | "
             f"{c.main['leave']:8.1e} / {c.walk32['leave']:8.1e} | {c.main['dv']:8.1e} ({c.main['dv64']:8.1e}) / "
             f"{c.walk32['dv']:8.1e} {ratio:8.1f} / {c.walk32_poses['dv']:8.1e} | positive {c.walk32_pivots_positive} "
             f"{c.walk32_pivots:8.1e} (truth floor {c.truth_floor:.0e})",
             flush=True,
         )
-    print("F2b main without the conditioning armature")
+    print("F2b main's dense factor without armature")
     for links in sorted({*CHAINS, *BISECT}):
         u = unconditioned(links)
         print(

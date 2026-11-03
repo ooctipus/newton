@@ -20,7 +20,6 @@ import numpy as np
 
 from ...core.live_sort import SLOT_BITS
 from ...sim.contacts import CAPACITY_BLOCKS_PER_SM
-from .conditioning import DEEP_CHAIN_JOINTS
 from .contact_row_plan import contact_row_plan
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF
 
@@ -807,28 +806,6 @@ def _dynamics(solver) -> dict:
         "mimic_rows": int(solver.laws.mimic_count or 0),
         "link_rows": int(solver.laws.link_count or 0),
         "prescribed_response": bool(solver.forest.has_prescribed_response),
-        "armature_floor": _armature_floor(solver),
-    }
-
-
-def _armature_floor(solver) -> dict:
-    # Mirrors TreeFactor.kinematic_state: the armature conditioning_armature added to deep articulations.
-    floor = solver.factor.armature_floor
-    if floor.evaluated == 0:
-        reason = f"No articulation has a root-to-leaf path of {DEEP_CHAIN_JOINTS} joints or more; none is evaluated."
-    elif floor.coordinates == 0:
-        reason = "Every pivot of the evaluated mass matrices clears 4 n u of its diagonal; no armature is added."
-    else:
-        reason = (
-            "Pivots of the evaluated mass matrices fell below 4 n u of their diagonal, beyond float32 "
-            "factorization: the least armature that lifts them there is added."
-        )
-    return {
-        "evaluated_articulations": floor.evaluated,
-        "articulations": floor.articulations,
-        "coordinates": floor.coordinates,
-        "largest": float(floor.largest),
-        "reason": reason,
     }
 
 

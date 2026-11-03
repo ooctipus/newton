@@ -445,9 +445,10 @@ def chain_on_device(links: int, device) -> dict:
 
 
 def frames_on_chain(links: int, device) -> dict:
-    """One frame against two on ``long_chain(links)`` as main runs it (its armature in the walk's diagonal, so the walk
-    and main's ``L`` factor one matrix): the device walk's rows of a tip contact with the device walk's leave, and with
-    a leave by main's float32 ``L``: ``|J dv - Z^T du|`` over ``n u |Z| |du|``."""
+    """One frame against two on ``long_chain(links)`` without armature (the solver adds none, so the walk and main's
+    ``L`` factor one matrix): the device walk's rows of a tip contact with the device walk's leave, and with a leave by
+    main's float32 ``L``: ``|J dv - Z^T du|`` over ``n u |Z| |du|``. Main's float32 factor fails on this chain without
+    the armature it added (a non-finite leave), which is not within the bound either."""
     model = scenes.long_chain(links=links, armature=0.0).build("cpu")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -766,14 +767,14 @@ class TestWalkDevice(unittest.TestCase):
                 self.assertGreater(result["stale"], 1.0e3 * BOUND, f"{result}")
 
     def test_one_frame_tells_two_apart(self):
-        """``long_chain(106)`` as main runs it: the walk's rows with the walk's leave stay within ``BOUND n u`` of
-        ``|Z| |du|``; with a leave by main's float32 factor they do not. The invariant guards a placement that converts
-        its rows without its leave."""
+        """``long_chain(106)`` without armature: the walk's rows with the walk's leave stay within ``BOUND n u`` of
+        ``|Z| |du|``; with a leave by main's float32 factor they do not (a failed factor, NaN, is not within). The
+        invariant guards a placement that converts its rows without its leave."""
         for device in devices():
             with self.subTest(device=device):
                 frames = frames_on_chain(106, device)
                 self.assertLessEqual(frames["one_frame"], BOUND, f"{frames}")
-                self.assertGreater(frames["two_frames"], BOUND, f"{frames}")
+                self.assertFalse(frames["two_frames"] <= BOUND, f"{frames}")
 
     def test_one_frame_per_placement_cpu(self):
         """Every CPU catalogue route: its rows and its leave within ``BOUND n u kappa`` of the walk's."""

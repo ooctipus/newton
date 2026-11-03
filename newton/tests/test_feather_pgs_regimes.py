@@ -25,11 +25,13 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.tree_factor import TreeWalk, local_frames
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_references as refs
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conformance
 from newton.tests.feather_pgs_law_harness import walk_inverse
+from newton.tests.test_feather_pgs_walk import newton_state_body_q, relative, transform_point
 
 H = 1.0 / 240.0
 G0 = refs.GRAVITY
@@ -785,7 +787,12 @@ class TestQ19Wall(unittest.TestCase):
 
 
 class TestQ12Chain(unittest.TestCase):
-    """Q12: a chain's factor. The pivot floor holds in every configuration, not only the one it was read at."""
+    """Q12: a chain's factor in every configuration, not only the one it was built at. The walk's pivots stay positive
+    and a step answers a tip wrench within the deep-chain regime's bar (1e-4) of the float64 walk at the same float32
+    forward kinematics. No floor is asserted: with no armature added a pivot is the chain's own (a straight 100-link
+    chain's smallest is 3.5e-6 of its row), and the walk factors it in float32. The forward kinematics' own float32
+    floor is not the factor's: on the closed 100-link coil (every joint at the same 2 pi / 100) its frames alone put the
+    float64 walk 1.2e-4 off the float64 frames' answer."""
 
     @staticmethod
     def _chain(links):
@@ -810,23 +817,39 @@ class TestQ12Chain(unittest.TestCase):
         builder.add_articulation(joints)
         return builder.finalize(device=DEVICE)
 
-    def _floor(self, links, angles):
-        """The smallest pivot over its diagonal at ``angles``, against the floor the factor claims. The solver reads its
-        floor from the model's straight configuration, as a robot's construction does."""
+    def _step(self, links, angles):
+        """One step from rest at ``angles``, no gravity, under a wrench on the tip body's centre of mass: the walk's
+        smallest pivot (``ell^2`` over its row of ``L L^T``) and the step's ``dv`` against the float64 walk at Newton's
+        float32 forward kinematics, relative."""
         model = self._chain(links)
+        model.set_gravity((0.0, 0.0, 0.0))
         solver = SolverFeatherPGS(model, enable_joint_limits=False, **BASE)
         state, out = model.state(), model.state()
         state.joint_q.assign(angles)
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        tip = links - 1
+        body = int(model.joint_child.numpy()[tip])
+        force, torque = np.array([0.3, -0.2, 0.5]), np.array([0.0, 0.0, 0.01])
+        wrench = np.zeros((model.body_count, 6), dtype=np.float32)
+        wrench[body] = np.r_[force, torque]
+        state.body_f.assign(wrench)
         solver.step(state, out, model.control(), None, H)
-        # The walk (the factor): its pivots ell^2 on the diagonal of L = inverse^-1, triangular in its leaf-first order.
+        dv = (out.joint_qd.numpy().astype(np.float64) - state.joint_qd.numpy()) / H
         L = np.linalg.inv(walk_inverse(solver, 0))
-        rows = L @ L.T
-        pivots = np.diag(L) ** 2 / np.diag(rows)
-        return float(pivots.min()), 4.0 * links * 2.0**-24
+        pivots = np.diag(L) ** 2 / np.diag(L @ L.T)
+        # The float64 walk at the step's float32 poses, the wrench at the tip's frame (its joint's anchor, world axes).
+        joint_q = state.joint_q.numpy().astype(np.float64)
+        poses = newton_state_body_q(model, joint_q)
+        centre = transform_point(poses[body], model.body_com.numpy()[body].astype(np.float64))
+        parent, anchor = int(model.joint_parent.numpy()[tip]), model.joint_X_p.numpy()[tip, :3].astype(np.float64)
+        if parent >= 0:
+            anchor = transform_point(poses[parent], anchor)
+        truth = TreeWalk(*local_frames(model, joint_q, 0, poses), np.zeros(int(model.joint_dof_count)))
+        dv64, _ = truth.down(truth.up(tip, np.r_[force, torque + np.cross(centre - anchor, force)])[0])
+        return float(pivots.min()), relative(dv, dv64)
 
-    def test_pivots_hold_in_every_configuration(self):
-        """Straight, coiled and folded, a chain's smallest pivot stays above the float32 floor."""
+    def test_pivots_and_the_answer_hold_in_every_configuration(self):
+        """Straight, coiled, folded and random, a chain's walk keeps every pivot positive and answers within 1e-4."""
         rng = np.random.default_rng(7)
         for links in (1, 8, 32, 64, 100):
             shapes = {
@@ -837,9 +860,9 @@ class TestQ12Chain(unittest.TestCase):
             }
             for name, angles in shapes.items():
                 with self.subTest(links=links, shape=name):
-                    # The floor is ``4 n u``: float32 resolves such a pivot only to about ``n u``, so half is its margin.
-                    smallest, floor = self._floor(links, angles)
-                    self.assertGreaterEqual(smallest, floor * 0.5, f"{name} {links}: pivot {smallest:.3e}")
+                    smallest, error = self._step(links, angles)
+                    self.assertGreater(smallest, 0.0, f"{name} {links}: pivot {smallest:.3e}")
+                    self.assertLess(error, 1.0e-4, f"{name} {links}: dv {error:.2e} off float64")
 
 
 class TestQ13Indeterminate(unittest.TestCase):

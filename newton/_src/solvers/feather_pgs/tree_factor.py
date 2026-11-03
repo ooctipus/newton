@@ -33,7 +33,6 @@ import warp as wp
 from ...sim import BodyFlags, JointType, ModelFlags
 from . import field_group, host_index, response_builds_rows
 from . import tree_scan as ts
-from .conditioning import ArmatureFloor, conditioning_armature
 from .device_preludes import DevicePrelude, substitute
 from .field_group import SolverArrays
 from .joint_table import JointTable
@@ -60,7 +59,6 @@ from .solver_fields import (
     hold_drive_row,
 )
 from .spatial_laws import drive_force, drive_stiffness, spring_damper_stiffness
-from .tree_plan import TreePlan
 from .tree_scan import (
     WALK_AHEAD,
     WALK_ANGULAR,
@@ -174,7 +172,6 @@ class TreeFactor:
         self.kinematic_dof_mask = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
         self.kinematic_dof_mask_host = None
         self.armature = None
-        self.armature_floor = None
         # The effective armature by coordinate (scatter_armature): the walk's diagonal and the drives' K-free mass.
         self.dof_armature = wp.zeros(max(1, int(model.joint_dof_count)), dtype=wp.float32, device=model.device)
         self.diagonal_inverse_mass = None
@@ -204,23 +201,17 @@ class TreeFactor:
     # Construction
     # ---------------------------------------------------------------------------------------------------------------
 
-    def kinematic_state(
-        self, joint_forest: TreePlan, *, sparse_velocity_limits: bool = False
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, ArmatureFloor]:
+    def kinematic_state(self, *, sparse_velocity_limits: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Derive the kinematic masks and effective joint armature from the body flags, changing nothing.
-
-        The effective armature also holds the least armature that keeps the mass matrix of a deep
-        articulation within float32 factorization (:func:`conditioning_armature`).
 
         The coordinate mask is the rows' prescribed coordinates (:data:`.joint_table.JOINTS`): none takes a row on
         it alone.
 
         Args:
-            joint_forest: The model's joint forest (:func:`.forest_plan.joint_forest`).
             sparse_velocity_limits: Whether the native sparse factor carries velocity-limit rows.
 
         Returns:
-            ``(armature, joint_mask, dof_mask, floor)`` for :meth:`apply_kinematic_state`.
+            ``(armature, joint_mask, dof_mask)`` for :meth:`apply_kinematic_state`.
 
         Raises:
             RuntimeError: If the flags make a DOF of a sparse split or
@@ -258,21 +249,11 @@ class TreeFactor:
                         "A prescribed-response articulation changed kinematic membership; "
                         "reconstruct the solver and recapture its CUDA graph."
                     )
-        armature, floor = conditioning_armature(model, armature, joint_forest)
-        return armature, joint_mask, dof_mask, floor
+        return armature, joint_mask, dof_mask
 
-    def apply_kinematic_state(self, kinematic: tuple[np.ndarray, np.ndarray, np.ndarray, ArmatureFloor]) -> None:
+    def apply_kinematic_state(self, kinematic: tuple[np.ndarray, np.ndarray, np.ndarray]) -> None:
         """Publish derived kinematic masks and armature in place, where captured graphs read them."""
-        armature, joint_mask, dof_mask, floor = kinematic
-        if floor.coordinates and floor != self.armature_floor:
-            warnings.warn(
-                f"SolverFeatherPGS adds joint armature, up to {floor.largest:.3g}, to {floor.coordinates} "
-                f"coordinate(s) of {floor.articulations} articulation(s) whose mass matrix float32 cannot factor "
-                "without it (routes.dynamics.armature_floor). Give these joints armature to choose it yourself.",
-                UserWarning,
-                stacklevel=3,
-            )
-        self.armature_floor = floor
+        armature, joint_mask, dof_mask = kinematic
         self.armature = armature
         self.kinematic_dof_mask_host = dof_mask.copy()
         self.kinematic_joint_mask.assign(joint_mask)
@@ -1084,7 +1065,7 @@ class TreeFactor:
 
     def diagonal(self, articulation: int) -> np.ndarray:
         """What this factor adds to ``articulation``'s mass matrix: each coordinate's effective armature ``R``
-        (conditioning and kinematic coordinates included) and the drive stiffness ``K`` it last refreshed with."""
+        (kinematic coordinates included) and the drive stiffness ``K`` it last refreshed with."""
         qd_start = self.model.joint_qd_start.numpy()
         joints = self.model.articulation_start.numpy()[articulation : articulation + 2]
         dofs = np.arange(qd_start[joints[0]], qd_start[joints[1]])

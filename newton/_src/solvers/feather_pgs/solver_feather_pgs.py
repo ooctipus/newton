@@ -153,17 +153,6 @@ class SolverFeatherPGS(SolverBase):
     :meth:`check_constraint_capacity` outside capture at an observation boundary
     to reject incomplete physics. Ordinary stepping does not synchronize it.
 
-    The solver factors each articulation's mass matrix in float32. Along a
-    serial chain its pivots fall roughly as the cube of the chain's length, so
-    a long chain without joint armature leaves float32's resolution: where an
-    articulation with a root-to-leaf path of at least 32 joints has a pivot
-    below ``4 n u`` of its diagonal (``n`` coordinates, ``u = 2^-24``) at the
-    model's configuration, the solver adds the least joint armature that lifts
-    it there, warns, and reports it under ``routes.dynamics.armature_floor`` of
-    :meth:`get_path_selection`. Every tree likewise takes the least armature that keeps a rotation about a thin body's
-    own axis, far from the articulation's origin, above what float32 assembles (:func:`.conditioning.assembly_floor`).
-    Give such joints armature to choose it yourself.
-
     Single-body FREE-joint articulations use an energy-preserving local
     gyroscopic update to prevent explicit angular-bias runaway. Fast rotation
     can trigger bounded gyro microsteps inside the velocity predictor, without
@@ -558,9 +547,9 @@ class SolverFeatherPGS(SolverBase):
         self.factor = TreeFactor(model, options, nvtx=nvtx)
 
         self.forest: ForestPlan | None = None
-        # The model's joint forest (Model.joint_ancestor): conditioning depths, body maps, CRBA's ancestor test.
+        # The model's joint forest (Model.joint_ancestor): body maps, CRBA's ancestor test.
         forest = joint_forest(model)
-        self.factor.apply_kinematic_state(self.factor.kinematic_state(forest))
+        self.factor.apply_kinematic_state(self.factor.kinematic_state())
         # The forest plan: topology, groups, root kinds, world mapping, body maps. The matrix-free formulation
         # elides fully-kinematic free bases from the compact response mapping of its rows.
         self.forest = ForestPlan.build(self.cut, forest, self.factor.kinematic_dof_mask_host)
@@ -891,9 +880,7 @@ class SolverFeatherPGS(SolverBase):
         # Derive the kinematic state first: a body-flag change the solver
         # cannot absorb raises here, before any mask, cache or owner changes.
         kinematic = (
-            self.factor.kinematic_state(
-                self.forest.joint_forest, sparse_velocity_limits=self.sweep.sparse_velocity_limits
-            )
+            self.factor.kinematic_state(sparse_velocity_limits=self.sweep.sparse_velocity_limits)
             if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES)
             else None
         )
