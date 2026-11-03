@@ -39,7 +39,7 @@ import warp as wp
 
 from . import field_group
 from .contact_input import ContactInput, contact_frame
-from .contact_laws import CONTACT_SPIN_ROW, contact_row_entry, contact_row_frame, contact_seed, spin_seed
+from .contact_laws import CONTACT_SPIN_ROW, contact_row_entry, contact_seed, spin_seed
 from .dense_rows import (
     UNIT_CONTACT,
     UNIT_LIMIT,
@@ -50,12 +50,13 @@ from .dense_rows import (
     DenseRows,
     MfRows,
     RowSupport,
+    row_side,
 )
 from .device_preludes import DevicePrelude, dual_native, lane_group, substitute
 from .field_group import Field
 from .friction_patches import PatchRowLaw
 from .kernel_template import python_kernel
-from .kernels import PGS_CONSTRAINT_TYPE_SPEED, free_body_contact, free_body_contact_records, row_bias
+from .kernels import PGS_CONSTRAINT_TYPE_SPEED, row_bias
 from .projection_laws import friction_pair_metric
 from .response_builds_rows import close_block, close_row
 from .row_build import write_contact_row
@@ -120,57 +121,42 @@ def write_free_body_rows(
     mf: MfRows,
     data: ContactInput,
     total_threads: int,
-    has_target_velocity: int,
     law: PatchRowLaw,
     walk: WalkTrees,
     v_hat: wp.array[float],
 ):
-    """The bodies sink: each free-body contact row (``path`` 1, grid-stride over the contacts) by its law, its records
-    (:func:`.kernels.free_body_contact_records`), each responding body's seed walked into its six entries (``mf_Z``: side
-    ``a``'s from 0, side ``b``'s from 6; the second body's negated, a spin row a torque about the normal) and its incident velocity ``J v_hat``.
-    The rows' build stores their diagonals and rhs (:func:`.response_builds_rows.free_body_rows_kernel`)."""
+    """The bodies sink: each free-body contact row (``path`` 1, grid-stride over the contacts) by the contact row writer
+    (:func:`.row_build.write_contact_row`: its records and sides, as every contact row's), each responding body's seed
+    walked into its side's six entries of ``mf_Z`` (the row's sides in order, from 0 and from 6; the second body's
+    negated, a spin row a torque about the normal) and its incident velocity ``J v_hat``, body ``a``'s then ``b``'s.
+    The rows' build stores their diagonals and rhs (:func:`free_body_headers_kernel`)."""
     for c in range(wp.tid(), data.count[0], total_threads):
         slot = data.slot[c]
         if data.path[c] != 1 or slot < 0:
             continue
-        mf_line = mf.first[data.world[c]]
+        line = mf.first[data.world[c]]
         # The contact's rows' ``Z``, by the free bodies' own row (its slot counts in the line).
         z_row = slot - mf.base
         art_a = data.art0[c]
         art_b = data.art1[c]
-        body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
-        response_a, response_b, mu, restitution, stiffness, rows = free_body_contact(data, c, body_a, body_b)
+        # The allocation's extent: recomputing eligibility can cross a floating-point threshold.
+        rows = int(1)
+        if data.slots_needed[c] >= 3:
+            rows = data.slots_needed[c]
         for row in range(rows):
-            direction, row_point = contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
+            body_a, body_b, direction, row_point = write_contact_row(data, law, c, row, False)
             spin = row == CONTACT_SPIN_ROW
+            first = data.sides[line, slot + row][0]
             incident = float(0.0)
-            if response_a >= 0:
-                wrench = body_wrench(walk, response_a, direction, row_point, spin)
-                incident += walk_body(walk, art_a, response_a, wrench, v_hat, 0, mf.Z, mf_line, z_row + row, 0)[0]
-            if response_b >= 0:
-                wrench = body_wrench(walk, response_b, -direction, row_point, spin)
-                incident += walk_body(walk, art_b, response_b, wrench, v_hat, 0, mf.Z, mf_line, z_row + row, 6)[0]
-            mf.incident[mf_line, slot + row] = incident
-            free_body_contact_records(
-                mf,
-                data,
-                law,
-                has_target_velocity,
-                c,
-                slot,
-                row,
-                body_a,
-                body_b,
-                response_a,
-                response_b,
-                normal,
-                phi,
-                direction,
-                row_point,
-                mu,
-                restitution,
-                stiffness,
-            )
+            if body_a >= 0 and row_side(art_a, data.response_dofs) >= 0:
+                wrench = body_wrench(walk, body_a, direction, row_point, spin)
+                side = wp.where(art_a == first, 0, 6)
+                incident += walk_body(walk, art_a, body_a, wrench, v_hat, 0, mf.Z, line, z_row + row, side)[0]
+            if body_b >= 0 and row_side(art_b, data.response_dofs) >= 0:
+                wrench = body_wrench(walk, body_b, -direction, row_point, spin)
+                side = wp.where(art_b == first, 0, 6)
+                incident += walk_body(walk, art_b, body_b, wrench, v_hat, 0, mf.Z, line, z_row + row, side)[0]
+            mf.incident[line, slot + row] = incident
 
 
 @wp.kernel(enable_backward=False)

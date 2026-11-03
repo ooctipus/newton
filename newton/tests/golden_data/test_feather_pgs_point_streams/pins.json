@@ -280,7 +280,7 @@
   "walk_rows.walked_rows_kernel(0, False)": "31b290384f3f1a1f63f1b0a02e039441e17f48f39d1985a1fb1d312c022dc72f",
   "walk_rows.walked_rows_kernel(8, False)": "bb1b52700da1675647cf6951e45d3cfd0ba023e56c529ea3fae0cc875402227f",
   "walk_rows.walked_rows_kernel(8, True)": "1e32d0533623ed933541a92830fbae0306cdb6247dc76b7bdaa67c0db51acfa0",
-  "walk_rows.write_free_body_rows": "04490288218158793b43b697459012aa985c9d52ddf691bb5d233a58ea6c3eaf",
+  "walk_rows.write_free_body_rows": "80430ce93898fc199d35b6b1efe0b515aeb4af7c154bb20e0e04c8af87beed25",
   "walk_rows.write_slot_rows": "d8a3ebaacf6b7a1e34fe7ce4d548de7689721ebf2386c7b70effd96767616e8e"
  },
  "warp": "1.17.0"

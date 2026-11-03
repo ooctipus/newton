@@ -1030,7 +1030,6 @@ class RowLaws:
                         bind_mf_rows(solver.placement),
                         contact_input,
                         contact_build_threads,
-                        int(solver.forest.has_prescribed_response),
                         law,
                         solver.factor.walk_view(),
                         solver.v_hat,
