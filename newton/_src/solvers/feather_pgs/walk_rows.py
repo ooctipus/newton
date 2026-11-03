@@ -370,8 +370,10 @@ def writer_lanes(rows: int, capacity: int, device) -> int:
     return 1 << (lanes - 1).bit_length()
 
 
-WRITER_THREADS = 256
-"""Threads of a block of the one writer: whole world groups of up to 32 lanes."""
+WRITER_THREADS = 128
+"""Threads of a block of the one writer: whole world groups of up to 32 lanes. Blocks of 128, five a multiprocessor
+(96 registers), keep the general writer's resident warps near its old 80-register kernel's: at 256 threads two a
+multiprocessor (its 112-118 registers) it ran 38-43% slower on kuka, a latency-bound walk."""
 
 
 @cache
@@ -389,10 +391,16 @@ def unit_reader(links: bool) -> wp.Function:
         line: int,
         slot: int,
         source: int,
+        body_a: int,
+        body_b: int,
+        direction: wp.vec3,
+        row_point: wp.vec3,
     ):
-        """Row ``slot``'s unit by its law (its unit source ``source``): a contact's row ``row``, its direction at its
-        point (:func:`.contact_laws.contact_row_frame`; the spin row a torque about the normal); a link's row, the unit wrench at its two pieces' centres of mass (the shadow's negated; a pure torque for an
-        angular row); a joint limit's, a velocity limit's or a mimic's covectors (:func:`joint_seeds`)."""
+        """Row ``slot``'s unit by its law (its unit source ``source``): a contact's row, its bodies, direction and point
+        as its records' writer gave them (``body_a``, ``body_b``, ``direction``, ``row_point``:
+        :func:`.row_build.write_contact_row`; the spin row a torque about the normal); a link's row, the unit wrench at
+        its two pieces' centres of mass (the shadow's negated; a pure torque for an angular row); a joint limit's, a
+        velocity limit's or a mimic's covectors (:func:`joint_seeds`)."""
         kind = source >> UNIT_SHIFT
         index = source & ((1 << UNIT_SHIFT) - 1)
         unit = RowUnit()
@@ -410,8 +418,6 @@ def unit_reader(links: bool) -> wp.Function:
             c = index // 4
             unit.rows = 1
             unit.row = index - 4 * c
-            body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
-            direction, row_point = contact_row_frame(unit.row, normal, tangent0, tangent1, point, friction_point)
             unit.art_a = data.art0[c]
             unit.body_a = body_a
             unit.art_b = data.art1[c]
@@ -510,12 +516,16 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool = True) -> wp
             return
         for slot in range(lane, count, lanes):
             source = support.units[line, slot]
+            body_a = int(-1)
+            body_b = int(-1)
+            direction = wp.vec3(0.0)
+            row_point = wp.vec3(0.0)
             if source >> UNIT_SHIFT == UNIT_CONTACT:
                 # The row's records by the contact law (the producer's, folded into the writer), then its seeds.
                 index = source & ((1 << UNIT_SHIFT) - 1)
                 c = index // 4
-                write_contact_row(data, law, c, index - 4 * c, False)
-            unit = read_unit(rows, data, law, seeds, line, slot, source)
+                body_a, body_b, direction, row_point = write_contact_row(data, law, c, index - 4 * c, False)
+            unit = read_unit(rows, data, law, seeds, line, slot, source, body_a, body_b, direction, row_point)
             if unit.rows > 0:
                 walk(sink, unit)
                 row_bias(
@@ -539,7 +549,7 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool = True) -> wp
 
     name = "write_walked_rows" + (f"_blocks{blocks}" if has_blocks else "")
     name += "_mimics" if mimic_blocks else ""
-    return python_kernel(kernel, name, launch_bounds=(WRITER_THREADS, 2))
+    return python_kernel(kernel, name, launch_bounds=(WRITER_THREADS, 5))
 
 
 def writer_kernel(solver) -> wp.Kernel:
@@ -580,7 +590,7 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
     // The writer's own accesses, typed (no generic LD.E / ST.E): its inputs read-only (RD, the non-coherent path;
     // nothing here writes them), its outputs stored (ST), and the footprints it adds into read back (RW).
 #if defined(__CUDA_ARCH__)
-    const auto RD = [](const auto* p) { return __ldg(p); };
+    const auto RD = [](const auto* p) { return $rd; };
     const auto ST = [](auto* p, const auto v) {
         __builtin_assume(__isGlobal(p));
         *p = v;
@@ -876,6 +886,7 @@ def _support_snippet(parent: tuple, first: tuple, node: tuple, rows: int, record
         entries_end="count",
         zrow="row0",
         diag=_HEADER_DIAG,
+        rd="__ldg(p)",
     )
     return dual_native(body, preludes=(walk_prelude(parent, first, rows), walk_row_prelude(rows), _support_table(node)))
 
@@ -1053,6 +1064,8 @@ def packed_walker(rows: int, spin: bool, side: bool, star: bool = False) -> wp.F
         entries_end="S",
         zrow="(unit.group * sink.packed.shape[1] + unit.slot)" if star else "row0",
         diag="norm[r]" if star else _HEADER_DIAG,
+        # RD a plain load here, not the support writer's non-coherent __ldg: the K2 writer ran 1.4% faster on sm_120.
+        rd="*p",
     )
 
     def native(sink: PackedSink, unit: RowUnit): ...
@@ -1483,12 +1496,16 @@ def write_slot_rows(
     line = rows.first[world]
     for slot in range(lane, end, lanes):
         source = support.units[line, slot]
+        body_a = int(-1)
+        body_b = int(-1)
+        direction = wp.vec3(0.0)
+        row_point = wp.vec3(0.0)
         if source >> UNIT_SHIFT == UNIT_CONTACT:
             # The row's records by the contact law (the producer's, folded into the writer), then its seeds.
             index = source & ((1 << UNIT_SHIFT) - 1)
             c = index // 4
-            write_contact_row(data, law, c, index - 4 * c, False)
-        unit = read_slot_unit(rows, data, law, JointSeeds(), line, slot, source)
+            body_a, body_b, direction, row_point = write_contact_row(data, law, c, index - 4 * c, False)
+        unit = read_slot_unit(rows, data, law, JointSeeds(), line, slot, source, body_a, body_b, direction, row_point)
         if unit.rows > 0:
             unit.group = slots.dense_group[world]
             walk_slot_row(sink, unit)

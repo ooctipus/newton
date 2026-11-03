@@ -80,10 +80,11 @@ def produce_contacts(
     if data.path[contact] != 0 or slot < 0 or row >= data.slots_needed[contact]:
         return
     world = data.world[contact]
-    write_contact_row(data, law, contact, row, False)
+    body_a, body_b, direction, row_point = write_contact_row(data, law, contact, row, False)
     unit = read_slot_unit(
-        rows, data, law, JointSeeds(), data.first[world], slot + row, unit_source(UNIT_CONTACT, 4 * contact + row)
-    )
+        rows, data, law, JointSeeds(), data.first[world], slot + row, unit_source(UNIT_CONTACT, 4 * contact + row),
+        body_a, body_b, direction, row_point,
+    )  # fmt: skip
     unit.group = slots.dense_group[world]
     walk_slot_row(sink, unit)
     slot_header(
