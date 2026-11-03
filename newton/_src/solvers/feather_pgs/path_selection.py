@@ -242,7 +242,7 @@ def _tree_group(group) -> dict:
         # Factor family per root: its coordinate count, negated for a diagonal-mass family, 0 when prescribed.
         "root_families": json_value(layout.root_families),
         # The scans' schedules, chosen from the tree's data with its lanes (tree_kinetic_state.held_schedules).
-        "schedules": {name: getattr(group.schedules, name).value for name in ("pose", "motion", "reduce", "external")},
+        "schedules": {name: getattr(group.schedules, name).value for name in ("pose", "motion", "reduce")},
         "response": group._response,
         # "content": a repair whose input bank is not the bank the cache was published into
         # compares the two banks word for word; "identity": the bank's pointers alone.

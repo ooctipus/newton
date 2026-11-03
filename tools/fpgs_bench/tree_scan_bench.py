@@ -223,7 +223,7 @@ def bench_lanes(args, device):
         packing = plan.chain_packing(2)
         if packing is not None:
             chain_lanes = max(packing.lanes, 32 if plan.count <= 32 else 64)
-            configurations.append((chain_lanes, tree_kinetic_state.HeldSchedules(*(ts.Schedule.HEAVY_CHAIN,) * 4)))
+            configurations.append((chain_lanes, tree_kinetic_state.HeldSchedules(*(ts.Schedule.HEAVY_CHAIN,) * 3)))
         for lanes, schedules in configurations:
             model, solver = _held_tree(shape, args.worlds, device, lanes, schedules)
             owner = solver.factor.held

@@ -193,10 +193,10 @@ def _schedules(layout, chain):
 
     schedule = ts.Schedule
     if layout.lanes > 32 and not chain:
-        return native.HeldSchedules(schedule.JUMP_SMEM, schedule.JUMP_SMEM, schedule.LEVEL, schedule.LEVEL)
+        return native.HeldSchedules(schedule.JUMP_SMEM, schedule.JUMP_SMEM, schedule.LEVEL)
     if chain:
-        return native.HeldSchedules(*(schedule.HEAVY_CHAIN,) * 4)
-    return native.HeldSchedules(schedule.JUMP_SHFL, schedule.JUMP_SHFL, schedule.DFS_INTERVAL, schedule.LEVEL)
+        return native.HeldSchedules(*(schedule.HEAVY_CHAIN,) * 3)
+    return native.HeldSchedules(schedule.JUMP_SHFL, schedule.JUMP_SHFL, schedule.DFS_INTERVAL)
 
 
 def held_tree_layouts():

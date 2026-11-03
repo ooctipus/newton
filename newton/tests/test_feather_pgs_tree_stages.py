@@ -46,10 +46,8 @@ def _schedules(layout):
     """Schedules a layout's lanes run: shuffles and intervals within a warp, shared memory and levels over two."""
     schedule = ts.Schedule
     if layout.lanes <= 32:
-        return tree_kinetic_state.HeldSchedules(
-            schedule.JUMP_SHFL, schedule.JUMP_SHFL, schedule.DFS_INTERVAL, schedule.LEVEL
-        )
-    return tree_kinetic_state.HeldSchedules(schedule.JUMP_SMEM, schedule.JUMP_SMEM, schedule.LEVEL, schedule.LEVEL)
+        return tree_kinetic_state.HeldSchedules(schedule.JUMP_SHFL, schedule.JUMP_SHFL, schedule.DFS_INTERVAL)
+    return tree_kinetic_state.HeldSchedules(schedule.JUMP_SMEM, schedule.JUMP_SMEM, schedule.LEVEL)
 
 
 _ADMISSION = re.compile(r"admit_\d+\(")

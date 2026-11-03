@@ -9,7 +9,7 @@ that picks them.
   factor pattern and its support classes, articulation depths, body supports
   and local parents.
 * :class:`TestHeldTreePasses`: every held-tree scan (pose and motion scans,
-  subtree and external reductions, the twist publication) on every schedule it
+  subtree reductions, the twist publication) on every schedule it
   runs, close to a float64 reference: on CUDA its schedule, on the CPU its
   serial twin.
 * :class:`TestHeldTreeChains`: trees of 32 bodies or fewer whose heavy chains
@@ -28,7 +28,6 @@ from newton._src.solvers.feather_pgs import tree_scan as ts
 from newton._src.solvers.feather_pgs.device_preludes import dual_native, lane_group
 from newton._src.solvers.feather_pgs.tree_plan import UP_FIRST, UP_SUMS, TreePlan, local_parents
 from newton.tests.feather_pgs_tree_scan_fixture import (
-    EXTERNAL,
     MOTION,
     PASSES,
     POSE,
@@ -340,11 +339,9 @@ def reference(item, plan, layout, scratch, flag, vhat=None, axes=None):
             if p >= 0:
                 result[:, node] += result[:, p]
         return result, None
-    groups = [(layout.wrench_offset if item.combine is not EXTERNAL else 0, 6)]
-    if item.combine is not EXTERNAL and flag:
+    groups = [(layout.wrench_offset, 6)]
+    if flag:
         groups.append((layout.moment_offset, 13))
-    if item.combine is EXTERNAL and not flag:
-        return s, None
     for offset, width in groups:
         block = s[:, offset : offset + width * bodies].reshape(-1, bodies, width)
         for node in order[::-1]:
@@ -443,7 +440,7 @@ class TestHeldTreeChains(unittest.TestCase):
         from newton.tests.test_feather_pgs_sparse_solver import _make_solver  # noqa: PLC0415
 
         device = wp.get_cuda_device()
-        on_chains = tree_kinetic_state.HeldSchedules(*(ts.Schedule.HEAVY_CHAIN,) * 4)
+        on_chains = tree_kinetic_state.HeldSchedules(*(ts.Schedule.HEAVY_CHAIN,) * 3)
         for shape in ("g1_30", "binary31"):
             with self.subTest(shape=shape):
                 self.assertEqual(plan_of(shape).chain_packing(2).lanes, 64)

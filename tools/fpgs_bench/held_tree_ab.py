@@ -127,7 +127,7 @@ def _heavy_chains():
         return max(packing.lanes, 32 if tree.count <= 32 else 64)
 
     def schedules(tree, lanes, *, chains):
-        return tree_kinetic_state.HeldSchedules(*(ts.Schedule.HEAVY_CHAIN,) * 4)
+        return tree_kinetic_state.HeldSchedules(*(ts.Schedule.HEAVY_CHAIN,) * 3)
 
     with (
         unittest.mock.patch.object(tree_kinetic_state, "held_lanes", lanes),

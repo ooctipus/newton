@@ -38,7 +38,7 @@ def fixture(floating, device):
 
 
 # The reference forms' schedules: the factories' contracts hold at every schedule.
-_SCHEDULES = HeldSchedules(ts.Schedule.JUMP_SMEM, ts.Schedule.JUMP_SMEM, ts.Schedule.LEVEL, ts.Schedule.LEVEL)
+_SCHEDULES = HeldSchedules(ts.Schedule.JUMP_SMEM, ts.Schedule.JUMP_SMEM, ts.Schedule.LEVEL)
 
 
 class TestPrescaledTreeContract(unittest.TestCase):

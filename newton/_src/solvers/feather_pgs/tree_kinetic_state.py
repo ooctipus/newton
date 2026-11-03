@@ -381,18 +381,16 @@ class HeldSchedules:
     motion: ts.Schedule
     reduce: ts.Schedule
     """The bias wrench and inertia moment sums of the collection."""
-    external: ts.Schedule
-    """The predictor's external wrench sums."""
 
     @property
     def chains(self) -> bool:
         """Whether a scan runs on the heavy chains (whose texts address the block's threads)."""
-        return ts.Schedule.HEAVY_CHAIN in (self.pose, self.motion, self.reduce, self.external)
+        return ts.Schedule.HEAVY_CHAIN in (self.pose, self.motion, self.reduce)
 
     @property
     def tag(self) -> str:
         """The kernel-name suffix of the schedules."""
-        return "_" + "_".join(s.value for s in (self.pose, self.motion, self.reduce, self.external))
+        return "_" + "_".join(s.value for s in (self.pose, self.motion, self.reduce))
 
 
 def held_lanes(tree: TreePlan, groups: int, *, cuda: bool = True) -> int:
@@ -432,7 +430,6 @@ def held_schedules(tree: TreePlan, lanes: int, *, chains: bool) -> HeldSchedules
         choose(ts.TRANSFORM, ts.Direction.DOWN),
         choose(_MOTION, ts.Direction.DOWN),
         choose(_REDUCE, ts.Direction.UP),
-        choose(_EXTERNAL, ts.Direction.UP),
     )
 
 
@@ -452,11 +449,9 @@ _MOTION_SLOTS = ts.Storage(
     {"velocity": "s[$MOTION+6*({node})+({k})]", "acceleration": "s[$MOTION+$SIX_BODIES+6*({node})+({k})]"}
 )
 _REDUCE_SLOTS = ts.Storage({"wrench": "s[$WRENCH+6*({node})+({k})]", "moment": "s[$MOMENT+13*({node})+({k})]"})
-_EXTERNAL_SLOTS = ts.Storage({"wrench": "s[6*({node})+({k})]"})
 _MOTION = ts.TWIST.with_zero_acceleration()
 """The motion scan's combine where no joint has an own bias acceleration (:attr:`.TreeLayout.own_bias`)."""
 _REDUCE = ts.add(ts.Group("wrench", 6), ts.Group("moment", INERTIA_CHANNELS, "refresh"))
-_EXTERNAL = ts.add(ts.Group("wrench", 6))
 _TWIST_SUM = ts.add(ts.Group("twist", 6))
 # Predicted body twists for the resolved-world classifier: each lane sums its body's own axes against the final
 # predictor velocity, then pointer-jumps up the tree through shuffles (velocities at a common origin add).
@@ -576,12 +571,12 @@ _FORCE_HALF = r"""    if(lane==0){nonzero=0;$CLEAR_SLIPS}
         // its wrench must not reach its ancestors.
         auto input=f.body_f.data[body];
         if((f.body_flags.data[body]&$KINEMATIC_FLAG)!=0){for(int k=0;k<6;++k)input[k]=0.0f;}
-        $SHIFT
         bool active=false;for(int k=0;k<6;++k)active|=input[k]!=0.0f;
-        if(active)RAISE(nonzero,1);
+        if(active){RAISE(nonzero,1);$FRAME}
+        for(int k=0;k<6;++k)s[6*local+k]=input[k];
     }
     SYNC();
-$REDUCE
+$CARRY
     for(int i=lane;i<$DOFS;i+=stride) {
         const int dof=ds+i,body=p.dof_joint.data[i];
         float value=-cache.bias.data[group*$DOFS+i]+f.joint_f.data[dof]+f.u0.data[dof];
@@ -590,10 +585,53 @@ $REDUCE
         trial.force.data[dof]=value;
     }
 """
-"""The predictor's force half (Z4.2): the external wrenches' reduction (a tree whose bodies take none, ``nonzero``
-clear, skips it), then the force on each coordinate: bias, joint and control forces, the body wrenches projected
-(``s[6 body + k]``, dead once projected) and the passive springs, stored where it is computed, to ``trial.force`` at its
-global coordinate, for the walk's solve (:func:`get_walk_solve_kernel`), which answers in ``trial.response``."""
+"""The predictor's force half (Z4.2): ``J^T W`` of the external wrenches in the walk's local frames (a tree whose bodies
+take none, ``nonzero`` clear, skips it), then the force on each coordinate: bias, joint and control forces, the body
+wrenches projected (``s[6 body + k]``, dead once projected) and the passive springs, stored where it is computed, to
+``trial.force`` at its global coordinate, for the walk's solve (:func:`get_walk_solve_kernel`), which answers in
+``trial.response``.
+
+The wrenches never meet at the articulation's origin. There a coordinate's float32 force ``S . (f, n_O)`` rounds terms
+of the lever about the origin times the force, whatever its own size: the coordinates near a loaded tip, whose forces
+are a link's lever, err as much as the root's, a covector no wrench makes, which ``H^-1`` amplifies along a chain's soft
+modes (``long_chain(106)`` without armature: the step 1.1e-4 off float64; 2.9e-5 here). Each COM wrench moves to its
+body's frame (:data:`_EXTERNAL_FRAME`), the walk's carry takes each to its parent's (:data:`_EXTERNAL_CARRY`) and each
+coordinate reads its column there (:data:`_EXTERNAL_PROJECT`): every lever is one link long, so a coordinate's rounding
+is the size of its own force. The frames, levers and columns are the rows' seeds' (``WALK_UP``)."""
+
+_EXTERNAL_FRAME = r"""float P[4];WALK_READ_POINT(WALK_LDG,P,walk.now_link.data+$WALK_LINK*(js+local)+$WALK_FRAME);
+            const wp::vec3 c=cache.com_offset.data[js+local];
+            input=Spatial::wrench_shift(input,wp::vec3(c[0]-P[0],c[1]-P[1],c[2]-P[2]));"""
+"""A body's external wrench at its frame: the force keeps, the moment gains the centre of mass less the frame point
+(:func:`.spatial_laws.wrench_shift`), both the step's, the articulation's own (relative to its origin), as the walk's
+refresh forms its inertia's lever (``tree_factor.WalkTrees.now_com``, ``now_link``)."""
+
+_EXTERNAL_CARRY = r"""    if(nonzero) {
+        if(lane==0) {
+            for(int local=$BODIES-1;local>0;--local) {
+                const int up=plan.parent.data[local];
+                if(up<0)continue;
+                float l[6];
+                WALK_READ_LINK(WALK_LDG,l,walk.now_link.data,js+local,js+up);
+                const float* q=s+6*local;
+                float* w=s+6*up;
+                $EDGE
+            }
+        }
+        SYNC();
+    }
+"""
+"""The walk's carry of the subtree wrenches, leaf first, one lane a tree (the walk's own order, one text for both
+devices): each body's wrench passes its joint into its parent's at the parent's frame (:func:`.tree_scan.edge`, ``(f, t
+- d x f)``), ``d`` the parent's frame point less its own (``WALK_READ_LINK``, the step's links)."""
+
+_EXTERNAL_PROJECT = r"""float S[6];
+            WALK_READ_COLUMN(WALK_LDG,S,reinterpret_cast<const float*>(walk.now.data)+$WALK_NOW*dof,walk.data.data+$WALK_COORDINATE*dof,$HALF);
+            const float* w=s+6*body;
+            value+=$DOT;"""
+"""A coordinate's share of the subtree wrench at its body's frame: its step column there (``WALK_READ_COLUMN``, the
+rows' read) dotted as every walk dots (:func:`.tree_scan.dot`): the rows' ``J`` entry. A prescribed root's coordinates,
+which no walk holds, respond with zero (:func:`get_walk_solve_kernel`): their force is not read."""
 
 _RESPONSE_STAGE = r"""$START    for(int col=lane;col<$DOFS;col+=stride) {
         $TRANSPOSE_ACTION
@@ -2195,8 +2233,29 @@ def _half_kernel(prefix, schedules, layout, response, classes, flag, body, prelu
 @functools.cache
 def get_force_kernel(schedules: HeldSchedules, *, layout: TreeLayout = REFERENCE_LAYOUT, response="sparse", classes):
     """The predictor's force half (Z4.2, :data:`_FORCE_HALF`): the force on every coordinate into ``trial.force``; it
-    clears each root's slip count for the response half's border."""
-    reduction = "    if(nonzero) {\n" + _reduction(_EXTERNAL, schedules.external, _EXTERNAL_SLOTS) + "    }\n"
+    clears each root's slip count for the response half's border. The columns' half is the walked classes'
+    (:func:`.tree_scan.classes_half`). A group none of whose roots is walked holds no walk to read: its force takes no
+    external wrench, which no coordinate of it answers."""
+    from .tree_factor import WALK_COORDINATE, WALK_FRAME, WALK_LINK, WALK_NOW, walk_loads_prelude  # noqa: PLC0415
+
+    walked = tuple(cls for cls in classes if cls is not None)
+    external = dict.fromkeys(("FRAME", "CARRY", "PROJECT"), "")
+    if walked:
+        names = {
+            **layout.sizes(),
+            "WALK_COORDINATE": WALK_COORDINATE,
+            "WALK_FRAME": WALK_FRAME,
+            "WALK_LINK": WALK_LINK,
+            "WALK_NOW": WALK_NOW,
+        }
+        edge = ts.edge(ts.Direction.UP, ts.LOADED.lever, "q", into="w")
+        external = {
+            "FRAME": substitute(_EXTERNAL_FRAME, names),
+            "CARRY": substitute(_EXTERNAL_CARRY, names, EDGE=ts.statements(edge, 16)),
+            "PROJECT": substitute(
+                _EXTERNAL_PROJECT, names, HALF=ts.classes_half(walked), DOT=ts.dot(ts.channels("S"), ts.channels("w"))
+            ),
+        }
     return _half_kernel(
         "tree_kinetic_force",
         schedules,
@@ -2205,13 +2264,12 @@ def get_force_kernel(schedules: HeldSchedules, *, layout: TreeLayout = REFERENCE
         classes,
         "nonzero",
         _FORCE_HALF,
+        (walk_loads_prelude(),),
         CLEAR_SLIPS="".join(
             f"walk.release.count.data[{_root_articulation(layout, r)}]=0;" for r, _, _ in _walk_roots(layout)
         ),
         KINEMATIC_FLAG=str(int(BodyFlags.KINEMATIC)),
-        SHIFT=cached_force.shift_wrench("input", "cache.com_offset.data[js+local]", "s[6*local+k]", "s[6*local+3+k]"),
-        REDUCE=reduction,
-        PROJECT=cached_force.project_wrench("f.S.data[dof]", "s[6*body+k]", "value"),
+        **external,
         # Passive springs act on no root coordinate.
         SPRING_GUARD=f"i>={layout.root_dofs if layout.free_root else 0}"
         if not layout.forest

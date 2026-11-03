@@ -12,36 +12,6 @@ no storage and introduce no launch or synchronization boundary.
 from dataclasses import dataclass
 
 
-def shift_wrench(external, offset, linear, angular):
-    """Shift a COM wrench to the current articulation origin (:func:`.spatial_laws.wrench_shift`) and store it.
-
-    ``external`` is a ``wp::spatial_vector`` expression. Output expressions use
-    component index ``k``. The owner supplies the current COM offset, including
-    for independent free roots, and the spatial kit's preludes.
-    """
-    return f"""{{
-        const wp::spatial_vector shifted=Spatial::wrench_shift({external},{offset});
-        for(int k=0;k<3;++k){{{linear}=shifted[k];{angular}=shifted[3+k];}}
-    }}\n"""
-
-
-def project_wrench(axis, wrench, accumulator, *, bias=None, active=None, validate=""):
-    """Project a reduced wrench, retaining the owner's accumulation order.
-
-    Wrench is a component expression using ``k``; axis and optional spatial
-    bias are vector expressions. Scalar bias remains with the owner's force
-    sum. Validation precedes optional external-force screening.
-    """
-    operation = (
-        f"{accumulator}+=({axis})[k]*{wrench};"
-        if bias is None
-        else f"{accumulator}-=({axis})[k]*(({bias})[k]-{wrench});"
-    )
-    if active is not None:
-        operation = f"if({active})" + operation
-    return f"for(int k=0;k<6;++k){{{validate}{operation}}}\n"
-
-
 @dataclass(frozen=True)
 class ForceOperands:
     """Bind current scalar force inputs separately from predictor velocity.

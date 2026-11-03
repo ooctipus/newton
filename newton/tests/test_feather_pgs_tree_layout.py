@@ -117,12 +117,12 @@ class TestTreeLayoutRender(unittest.TestCase):
         for layout in _LAYOUTS:
             warp = layout.lanes <= 32
             choices = [
-                (schedule.JUMP_SHFL, schedule.JUMP_SHFL, schedule.DFS_INTERVAL, schedule.LEVEL)
+                (schedule.JUMP_SHFL, schedule.JUMP_SHFL, schedule.DFS_INTERVAL)
                 if warp
-                else (schedule.JUMP_SMEM, schedule.JUMP_SMEM, schedule.LEVEL, schedule.LEVEL)
+                else (schedule.JUMP_SMEM, schedule.JUMP_SMEM, schedule.LEVEL)
             ]
             if layout.lanes >= 32:
-                choices.append((schedule.HEAVY_CHAIN,) * 4)
+                choices.append((schedule.HEAVY_CHAIN,) * 3)
             for choice in choices:
                 schedules = tree_kinetic_state.HeldSchedules(*choice)
                 with self.subTest(lanes=layout.lanes, schedules=schedules.tag):

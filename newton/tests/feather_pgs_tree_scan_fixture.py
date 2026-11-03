@@ -158,7 +158,6 @@ class Pass:
 
 POSE, MOTION = ts.TRANSFORM, ts.TWIST.with_zero_acceleration()
 WRENCH_MOMENTS = ts.add(ts.Group("wrench", 6), ts.Group("moment", 13, "refresh"))
-EXTERNAL = ts.add(ts.Group("wrench", 6))
 TWIST_SUM = ts.add(ts.Group("twist", 6))
 
 PASSES = {
@@ -174,8 +173,6 @@ PASSES = {
         Pass("reduce_level", WRENCH_MOMENTS, ts.Direction.UP, ts.Schedule.LEVEL),
         Pass("reduce_interval", WRENCH_MOMENTS, ts.Direction.UP, ts.Schedule.DFS_INTERVAL),
         Pass("reduce_chain", WRENCH_MOMENTS, ts.Direction.UP, ts.Schedule.HEAVY_CHAIN),
-        Pass("external_level", EXTERNAL, ts.Direction.UP, ts.Schedule.LEVEL),
-        Pass("external_chain", EXTERNAL, ts.Direction.UP, ts.Schedule.HEAVY_CHAIN),
         Pass("twist_shfl", TWIST_SUM, ts.Direction.DOWN, ts.Schedule.JUMP_SHFL),
     )
 }
@@ -211,8 +208,6 @@ def storage(layout: TreeLayout, item: Pass) -> ts.Storage:
                 "acceleration": f"s[{motion + 6 * bodies}+6*({{node}})+({{k}})]",
             }
         )
-    if item.combine is EXTERNAL:
-        return ts.Storage({"wrench": "s[6*({node})+({k})]"})
     return ts.Storage(
         {
             "wrench": f"s[{layout.wrench_offset}+6*({{node}})+({{k}})]",
@@ -222,14 +217,14 @@ def storage(layout: TreeLayout, item: Pass) -> ts.Storage:
 
 
 # One native per pass with one signature, ``(address, plan, flag)``; ``flag`` is ``refresh`` for the subtree
-# reductions, ``nonzero`` for the external ones and the twist publication switch for the twist sum.
+# reductions and the twist publication switch for the twist sum.
 _REDUCE_SCOPE = """    float* s=reinterpret_cast<float*>(address);
 #if defined(__CUDA_ARCH__)
     const int lane=LANE,stride=STRIDE;
 #else
     const int lane=0,stride=1;
 #endif
-    const int refresh=flag,nonzero=flag;
+    const int refresh=flag;
 """
 
 _TWIST_SCOPE = """    const int lane=LANE;
@@ -273,8 +268,6 @@ def generated_text(item: Pass, plan: TreePlan, layout: TreeLayout, *, cpu: bool 
             "    if(f.publish_twists!=0) {\n        SYNC();\n" + scan.cuda + "    }\n", CUDA_ONLY
         )
     if reduction:
-        if item.combine is EXTERNAL:
-            return _REDUCE_SCOPE + "if(nonzero) {\n" + scan.text + "}\n"
         return _REDUCE_SCOPE + scan.text
     return "    float* s=reinterpret_cast<float*>(address);\n" + scan.text
 
