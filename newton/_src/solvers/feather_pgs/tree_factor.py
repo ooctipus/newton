@@ -25,6 +25,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import warnings
+from string import Template
 
 import numpy as np
 import warp as wp
@@ -1566,9 +1567,7 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
     // J v is the sum of j v_c along its walk.
     const auto WALK_UP = [&](const float* data, const float* link, const float* now, const float* now_link,
                              const float* shift, int body, int top, float* p, float* w, auto&& sink) {
-        for (int b = body; b >= 0; b = WALK_PARENT_OF(b)) {
-$link_b
-            for (int c = b == body ? top : WALK_FIRST_OF(b + 1) - 1; c >= WALK_FIRST_OF(b); --c) {
+$up_head
 $record_c
                 // The step's column at the factor's frame: its linear part shifted there from the step's frame, its
                 // angular part as is (the frames read at each coordinate, so no register holds them across the walk;
@@ -1595,20 +1594,7 @@ $point_b
                     $step_q
                     sink(r, c, z, j);
                 }
-            }
-            if (WALK_PARENT_OF(b) >= 0) {
-                for (int r = 0; r < $rows; ++r) {
-                    float* q = p + 6 * r;
-                    $edge_q
-                }
-                if (now != nullptr) {
-                    for (int r = 0; r < $rows; ++r) {
-                        float* v = w + 6 * r;
-                        $edge_v
-                    }
-                }
-            }
-        }
+$up_tail
     };
     // WALK_SEED(data, c, x, p, sink): the first step of rows seeded by the covector x[r] at coordinate c (a limit's, a
     // velocity limit's), on the states p: z = (x + s_c . p) / ell_c, its J entry x[r]. WALK_UP continues from c - 1 of
@@ -1734,6 +1720,27 @@ $record_enter
         for (int j = 0; j < release.count.data[art]; ++j) WALK_SLIP_IT(release, ((size_t)art * cap + j) * steps, u);
     };"""
 
+
+_UP_HEAD, _UP_TAIL = ts.root_path(
+    "body",
+    "top",
+    begin=["$link_b"],
+    joint=[
+        "for (int r = 0; r < $rows; ++r) {",
+        "    float* q = p + 6 * r;",
+        "    $edge_q",
+        "}",
+        "if (now != nullptr) {",
+        "    for (int r = 0; r < $rows; ++r) {",
+        "        float* v = w + 6 * r;",
+        "        $edge_v",
+        "    }",
+        "}",
+    ],
+)
+_WALK = Template(_WALK).safe_substitute(up_head=ts.indent_text(_UP_HEAD, 8), up_tail=ts.indent_text(_UP_TAIL, 8))
+"""``WALK_UP``'s root path, leaf first (:func:`.tree_scan.root_path`): each body's link where the path opens it, its
+coordinates, the rows' and the seed wrenches' joint to its parent."""
 
 _POSE = ("(e0 - d[0])", "(e1 - d[1])", "(e2 - d[2])", "(S[3] - d[3])", "(S[4] - d[4])", "(S[5] - d[5])")
 _WALK_TEXTS = {
@@ -1896,6 +1903,10 @@ def _walk_loads(coordinate: int, link: int, now: int, half: int = WALK_BOTH) -> 
             return f"{pad}float l[6];\n{pad}WALK_READ_LINK(WALK_LDG, l, link, b, {up});"
         return f"{pad}const float* l = link + {link} * b;"
 
+    def path_link():
+        # A body's link where the root path opens it (ts.root_path's begin: one line, the path's indent).
+        return " ".join(line.strip() for line in body_link(0, "WALK_PARENT_OF(b)").split("\n"))
+
     if device:
         column = (
             "                float S[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};\n"
@@ -1912,7 +1923,7 @@ def _walk_loads(coordinate: int, link: int, now: int, half: int = WALK_BOTH) -> 
         "record_c": record(16),
         "record_seed": record(8),
         "record_enter": record(16),
-        "link_b": body_link(12, "WALK_PARENT_OF(b)"),
+        "link_b": path_link(),
         "link_twist": body_link(8, "up"),
         "column_c": column,
         "point_b": point,
