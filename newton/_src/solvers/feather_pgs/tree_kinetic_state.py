@@ -18,7 +18,7 @@ from . import (
     kernels,
 )
 from . import tree_scan as ts
-from .device_preludes import CUDA_ONLY, device_branches, substitute
+from .device_preludes import CUDA_ONLY, STATUS_CLOCK, device_branches, dual_native, substitute
 from .field_group import Field
 from .kernel_template import Dispatch, KernelTemplate, python_kernel
 from .publication_data import PublicationData
@@ -174,58 +174,22 @@ class TreeGroup:
     admitted: int
 
 
-@wp.func_native("""
-#if defined(__CUDA_ARCH__)
-    return wp::int64(clock64());
-#else
-    return wp::int64(0);
-#endif
-""")
+@wp.func_native(dual_native("    return wp::int64(CLOCK());\n", preludes=(STATUS_CLOCK,)))
 def _clock() -> wp.int64: ...
 
 
-_LANES_SOURCE = r"""
-#if defined(__CUDA_ARCH__)
-    return wp::vec_t<3,int>(LANE,STRIDE,SUB);
-#else
-    return wp::vec_t<3,int>(0,1,0);
-#endif
-"""
-
-_SYNC_SOURCE = r"""
-#if defined(__CUDA_ARCH__)
-    SYNC();
-#endif
-"""
-
-_SUB_SOURCE = r"""
-#if defined(__CUDA_ARCH__)
-    return SUB;
-#else
-    return 0;
-#endif
-"""
-
-_LANE_STRIDE = r"""
-#if defined(__CUDA_ARCH__)
-    const int lane=LANE,stride=STRIDE;
-#else
-    const int lane=0,stride=1;
-#endif
-"""
+_LANES_SOURCE = "    return wp::vec_t<3,int>(LANE,STRIDE,SUB);\n"
+_SYNC_SOURCE = "    SYNC();\n"
+_SUB_SOURCE = "    return SUB;\n"
+_LANE_STRIDE = "    const int lane=LANE,stride=STRIDE;\n"
 
 
 _DIFFERENT_MOTION_SOURCE = r"""
     if(state_qd.data==motion_qd.data)return 0;
     int different=0;
-#if defined(__CUDA_ARCH__)
     for(int i=LANE;i<count;i+=STRIDE)
         different|=state_qd.data[start+i]!=motion_qd.data[start+i];
     return ANY(different);
-#else
-    for(int i=0;i<count;++i)different|=state_qd.data[start+i]!=motion_qd.data[start+i];
-    return different;
-#endif
 """
 
 
@@ -333,11 +297,7 @@ _BANK_MATCHES = r"""
         equal&=reinterpret_cast<const unsigned*>(body_qd.data+body)[k%6]==
             reinterpret_cast<const unsigned*>(bank.body_qd.data+body)[k%6];
     }
-#if defined(__CUDA_ARCH__)
     return ALL(equal);
-#else
-    return equal?1:0;
-#endif
 """
 
 
@@ -545,24 +505,14 @@ def _twist_block() -> str:
 
 
 _COLLECT = r"""    float* s=reinterpret_cast<float*>(address);
-#if defined(__CUDA_ARCH__)
     const int lane=LANE,stride=STRIDE;
-#else
-    const int lane=0,stride=1;
-#endif
 $CLOCK0$REDUCE
 $CLOCK1    for(int dof=lane;dof<$DOFS;dof+=stride) {
         const int body=p.dof_joint.data[dof];
         float bias=0.0f;
         for(int k=0;k<6;++k)bias+=s[$AXIS+6*dof+k]*s[$WRENCH+6*body+k];
         cache.bias.data[group*$DOFS+dof]=bias;
-        if(!wp::isfinite(bias)) {
-#if defined(__CUDA_ARCH__)
-            atomicOr(&cache.status.data[group],1);
-#else
-            cache.status.data[group]|=1;
-#endif
-        }
+        if(!wp::isfinite(bias))RAISE(cache.status.data[group],1);
         if(refresh) {
             // The coordinate's diagonal entry of H, S^T (I S) with I its body's subtree moment, is all a group reads of
             // H (the walk refreshes from the step's columns): the drives' K-free mass H_ii + R_ii on their rows (the
@@ -577,18 +527,10 @@ $CLOCK1    for(int dof=lane;dof<$DOFS;dof+=stride) {
             for(int k=0;k<3;++k)mass+=axis[3+k]*angular[k];
             const int drive=data.drive_row.data[ds+dof];
             if(drive>=0)data.row_H.data[drive]=mass+data.armature.data[ds+dof];
-$DIAGONAL            if(!wp::isfinite(mass)) {
-#if defined(__CUDA_ARCH__)
-                atomicOr(&cache.status.data[group],2);
-#else
-                cache.status.data[group]|=2;
-#endif
-            }
+$DIAGONAL            if(!wp::isfinite(mass))RAISE(cache.status.data[group],2);
         }
     }
-#if defined(__CUDA_ARCH__)
     SYNC();
-#endif
 $CLOCK2    if(lane==0) {
         cache.generation.data[group]+=1;
         $CURRENT_VALID
@@ -615,12 +557,11 @@ _HALF = r"""    $PHYSICAL_TABLE
 
     const int art=p.group_to_art.data[group];
     const int ds=p.art_dof_start.data[art],js=p.art_joint_start.data[art];
-#if defined(__CUDA_ARCH__)
     const int lane=LANE,stride=STRIDE;
+#if defined(__CUDA_ARCH__)
     $SCRATCH
     __shared__ int ${FLAG}_all[$PACK];int& $FLAG=${FLAG}_all[SUB];
 #else
-    const int lane=0,stride=1;
     float s[$PRED_SCRATCH];int $FLAG=0;
 #endif
 """
@@ -628,9 +569,7 @@ _HALF = r"""    $PHYSICAL_TABLE
 articulation, its lanes, its block of words ``s`` and the half's one flag a tree, ``$FLAG``."""
 
 _FORCE_HALF = r"""    if(lane==0){nonzero=0;$CLEAR_SLIPS}
-#if defined(__CUDA_ARCH__)
     SYNC();
-#endif
     for(int local=lane;local<$BODIES;local+=stride) {
         const int body=p.joint_child.data[js+local];
         // A kinematic body takes no external wrench, as in ordinary dynamics
@@ -639,17 +578,9 @@ _FORCE_HALF = r"""    if(lane==0){nonzero=0;$CLEAR_SLIPS}
         if((f.body_flags.data[body]&$KINEMATIC_FLAG)!=0){for(int k=0;k<6;++k)input[k]=0.0f;}
         $SHIFT
         bool active=false;for(int k=0;k<6;++k)active|=input[k]!=0.0f;
-        if(active) {
-#if defined(__CUDA_ARCH__)
-            atomicOr(&nonzero,1);
-#else
-            nonzero=1;
-#endif
-        }
+        if(active)RAISE(nonzero,1);
     }
-#if defined(__CUDA_ARCH__)
     SYNC();
-#endif
 $REDUCE
     for(int i=lane;i<$DOFS;i+=stride) {
         const int dof=ds+i,body=p.dof_joint.data[i];
@@ -670,37 +601,21 @@ _RESPONSE_STAGE = r"""$START    for(int col=lane;col<$DOFS;col+=stride) {
         const bool valid=cache.current_valid.data[art]&&d.valid.data[group]&&!(d.status.data[group])&&!cache.status.data[group]&&wp::isfinite(value);
         f.qdd.data[dof]=valid?value:NAN;
         f.vhat.data[dof]=$VELOCITY;
-        if(!valid) {
-#if defined(__CUDA_ARCH__)
-            atomicOr(&cache.status.data[group],4);
-#else
-            cache.status.data[group]|=4;
-#endif
-        }
+        if(!valid)RAISE(cache.status.data[group],4);
         $DECIDE
     }
-#if defined(__CUDA_ARCH__)
     SYNC();
-#endif
 """
 """A response's readout: each coordinate's ``qdd`` (its response word, ``NAN`` where the tree is not valid) and
 ``v_hat``; the trial's also takes the drives' decision (``$DECIDE``)."""
 
-_RESPONSE_HALF = r"""    const auto MOVE=[&](int bits){
-#if defined(__CUDA_ARCH__)
-        atomicOr(&moved,bits);
-#else
-        moved|=bits;
-#endif
-    };
+_RESPONSE_HALF = r"""    const auto MOVE=[&](int bits){RAISE(moved,bits);};
     if(lane==0)moved=0;
 $CLOCK0    for(int i=lane;i<$DOFS;i+=stride) {
         s[$SIX_BODIES+i]=trial.force.data[ds+i];
         s[$WHITE+i]=trial.response.data[ds+i];
     }
-#if defined(__CUDA_ARCH__)
     SYNC();
-#endif
 $CLOCK1    $TRIAL
 $CLOCK4    if(moved!=0) {
     $SATURATE
@@ -830,13 +745,13 @@ def _native_clocks(clocked, owner, *, stages, column):
     if not clocked:
         return {f"CLOCK{k}": "" for k in range(stages + 1)}
     copies = ",".join(f"c{k}=c0" for k in range(1, stages + 1))
-    fragments = {"CLOCK0": f"#if defined(__CUDA_ARCH__)\n    long long c0=clock64(),{copies};\n#endif\n"}
+    fragments = {"CLOCK0": f"    long long c0=CLOCK(),{copies};\n"}
     for k in range(1, stages + 1):
-        fragments[f"CLOCK{k}"] = f"#if defined(__CUDA_ARCH__)\n    c{k}=clock64();\n#endif\n"
+        fragments[f"CLOCK{k}"] = f"    c{k}=CLOCK();\n"
     durations = "".join(f"o[{k}]=c{k + 1}-c{k};" for k in range(stages))
     fragments[f"CLOCK{stages}"] += (
-        f"#if defined(__CUDA_ARCH__)\n    if(lane==0&&{owner}.stage_clocks.shape[0]>group){{long long* o={owner}.stage_clocks.data"
-        f"+group*{owner}.stage_clocks.shape[1]+{column};{durations}}}\n#endif\n"
+        f"    if(lane==0&&{owner}.stage_clocks.shape[0]>group){{long long* o={owner}.stage_clocks.data"
+        f"+group*{owner}.stage_clocks.shape[1]+{column};{durations}}}\n"
     )
     return fragments
 
@@ -873,6 +788,7 @@ def get_helpers(
     reduction = _reduction(_REDUCE, schedules.reduce, _REDUCE_SLOTS)
     collect_source = layout.native(
         _COLLECT,
+        preludes=(STATUS_CLOCK,),
         REDUCE=reduction,
         CURRENT_VALID=_current_valid(layout),
         DIAGONAL=_DIAGONAL if diagonal else "",
@@ -1769,13 +1685,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
     constexpr int HOLD_WORDS = ($items + WIDTH - 1) / WIDTH, HOLD_SLIPS = $slips;
     constexpr int HOLD_SLOTS = (HOLD_SLIPS + WIDTH - 1) / WIDTH;
     // FRAME_STATUS(bit): raise a bit of the border's status word, which every tree's lane 0 may write at once.
-    const auto FRAME_STATUS = [&](const int bit) {
-#if defined(__CUDA_ARCH__)
-        atomicOr(&f.frame_status.data[0], bit);
-#else
-        f.frame_status.data[0] |= bit;
-#endif
-    };
+    const auto FRAME_STATUS = [&](const int bit) { RAISE(f.frame_status.data[0], bit); };
     struct WalkHold {
         float r[HOLD_WORDS][13];
         int parent[HOLD_WORDS], first[HOLD_WORDS];
@@ -1785,29 +1695,21 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
     // lane: item x sits in lane x % WIDTH's word or slot x / WIDTH, read from that lane. HOLD_ROW(v, x, out): item x's
     // row of a held array of rows (a record, a link).
     const auto HOLD_PICK = [&](const auto& v, const int x) {
-#if defined(__CUDA_ARCH__)
         constexpr int words = sizeof(v) / sizeof(v[0]);
         auto t = v[0];
         #pragma unroll
         for (int k = 1; k < words; ++k)
             if (x >= k * WIDTH) t = v[k];
         return READ(t, x & (WIDTH - 1));
-#else
-        return v[x];  // the CPU's one lane holds every item
-#endif
     };
     const auto HOLD_ROW = [&](const auto& v, const int x, float* out) {
         #pragma unroll
         for (int m = 0; m < (int)(sizeof(v[0]) / sizeof(v[0][0])); ++m) {
-#if defined(__CUDA_ARCH__)
             float t = v[0][m];
             #pragma unroll
             for (int k = 1; k < HOLD_WORDS; ++k)
                 if (x >= k * WIDTH) t = v[k][m];
             out[m] = READ(t, x & (WIDTH - 1));
-#else
-            out[m] = v[x][m];
-#endif
         }
     };
     const auto HOLD_LOAD = [&](WalkHold& h, const float* data, const float* link, const int* path, const int n,
@@ -2258,7 +2160,7 @@ def _half_kernel(prefix, schedules, layout, response, classes, flag, body, prelu
 
     source = layout.native(
         _HALF + body,
-        preludes=(*SPATIAL.preludes(), *preludes),
+        preludes=(*SPATIAL.preludes(), STATUS_CLOCK, *preludes),
         PHYSICAL_TABLE=layout.physical_table(),
         SCRATCH=_placed_block(layout, "s", "$PRED_SCRATCH"),
         FLAG=flag,

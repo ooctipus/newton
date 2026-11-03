@@ -362,6 +362,18 @@ to root, its walk down root to leaves): its records' loads leave the chain, each
 every lane runs the chain on the batch's records in order, read by shuffle. After a lane-group prelude."""
 
 
+STATUS_CLOCK = DevicePrelude(
+    "status_clock",
+    """    const auto RAISE = [](auto& word, auto bits) { atomicOr(&word, bits); };
+    const auto CLOCK = []() -> long long { return clock64(); };""",
+    """    const auto RAISE = [](auto& word, auto bits) { word |= bits; };
+    const auto CLOCK = []() -> long long { return 0; };""",
+)
+"""``RAISE(word, bits)`` sets ``bits`` in a status word that any thread may write at once (CUDA's ``atomicOr``, a plain
+``|=`` of the CPU's one thread), and ``CLOCK()`` reads the cycle counter (0 on the CPU). Its own prelude, not the lane
+group's: a body that declares words it does not call can still schedule differently."""
+
+
 SHARED_STORAGE = DevicePrelude("shared_storage", "    #define SHARED __shared__", "    #define SHARED")
 """``SHARED``, the storage of a block's working set (:meth:`.staging.Staging.declarations`): CUDA's shared memory, or
 the stack of the CPU's one thread, which runs the block's lane groups."""
