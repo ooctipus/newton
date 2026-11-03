@@ -98,6 +98,7 @@ __all__ = [
     "device_plan",
     "dot",
     "edge",
+    "enter",
     "scan_arrays",
     "schedule_costs",
     "schedule_features",
@@ -1012,23 +1013,30 @@ def step(
     up = direction is Direction.UP
     if direction not in (Direction.UP, Direction.DOWN):
         raise ValueError(f"a coordinate's step runs up or down, not {direction.value}")
-    name = out.rsplit(maxsplit=1)[-1]
     if value is None:
         head = dot(record.s if up else record.ut, channels(state))
         value = f"{source} {'+' if up else '-'} {head}" if source else head
     output = f"{out} = WALK_MUL(\n    {value},\n    {record.inverse});"
+    return [output, *_update(up, record, state, out.rsplit(maxsplit=1)[-1], into, index)]
+
+
+def enter(record: Record, state: str, velocity: str, out: str, *, index: str = "k") -> list[str]:
+    """One coordinate's step of ``ENTER``, the walk down inverted (``u = L^T P qd``, root first): ``u = qd / (1 / ell)
+    + ut . V`` into ``out``, then ``V += s qd``, on the coordinate's known ``velocity``."""
+    head = f"{out} = {velocity} / {record.inverse} + {dot(record.ut, channels(state))};"
+    return [head, *_update(False, record, state, velocity, None, index)]
+
+
+def _update(up: bool, record: Record, state: str, name: str, into: str | None, index: str) -> list[str]:
+    """A step's state update by its output ``name``: ``p -= ut z`` up, ``V += s q`` down (:func:`step`)."""
     sign, terms = ("-", record.ut) if up else ("+", record.s)
     if record.indexed is not None:
         term = (record.indexed[1] if up else record.indexed[0]).format(k=index)
         target = f"{into}[{index}] = {state}[{index}] {sign}" if into else f"{state}[{index}] {sign}="
-        return [output, f"for (int {index} = 0; {index} < 6; ++{index}) {target} {term} * {name};"]
+        return [f"for (int {index} = 0; {index} < 6; ++{index}) {target} {term} * {name};"]
     if into:
-        return [output, *(f"{into}[{k}] = {state}[{k}] {sign} {terms[k]} * {name};" for k in range(6))]
-    return [output, *(f"{state}[{k}] {sign}= {terms[k]} * {name};" for k in range(6))]
-
-
-def _channels(state: str, start: int = 0) -> tuple[str, str, str]:
-    return tuple(f"{state}[{start + k}]" for k in range(3))
+        return [f"{into}[{k}] = {state}[{k}] {sign} {terms[k]} * {name};" for k in range(6)]
+    return [f"{state}[{k}] {sign}= {terms[k]} * {name};" for k in range(6)]
 
 
 def edge(direction: Direction, lever, state: str, *, into: str | None = None) -> list[str]:
@@ -1043,12 +1051,12 @@ def edge(direction: Direction, lever, state: str, *, into: str | None = None) ->
             force = ("fx", "fy", "fz")
             head = f"const float fx = {state}[0], fy = {state}[1], fz = {state}[2];"
             return [head] + [f"{state}[{3 + k}] -= {cross(lever, force, k)};" for k in range(3)]
-        force = _channels(state)
+        force = channels(state)[:3]
         return [f"{into}[{k}] += {state}[{k}];" for k in range(3)] + [
             f"{into}[{3 + k}] += {state}[{3 + k}] - ({cross(lever, force, k)});" for k in range(3)
         ]
     if direction is Direction.DOWN:
-        turn = _channels(state, 3)
+        turn = channels(state)[3:]
         if into is None:
             return [f"{state}[{k}] += {cross(lever, turn, k)};" for k in range(3)]
         return [f"{into}[{k}] = {state}[{k}] + ({cross(lever, turn, k)});" for k in range(3)] + [

@@ -2305,10 +2305,11 @@ def held_walks(cls, x: str, u: str, state: str, words: int) -> tuple[str, str]:
                 down.append(f"    for (int k = 0; k < 6; ++k) V[k] = {state}[{6 * parent_b} + k];")
             down.append(f"    {{float l[3];HOLD_LINK(h,{b},l);{''.join(_EDGE_DOWN)}}}")
         for c in range(first[b], first[b + 1]):
+            output, update = ts.step(
+                ts.Direction.DOWN, ts.LOADED, "V", source=f"uh[{c}/WIDTH]", out="const float q", into="W"
+            )
             down.append(
-                f"    {{const float* d=h.r[{c}/WIDTH];const float q=WALK_MUL(uh[{c}/WIDTH]-((d[6]*V[0]+d[7]*V[1]+d[8]*V[2])"
-                "+(d[9]*V[3]+d[10]*V[4]+d[11]*V[5])),d[12]);"
-                f"float W[6];for(int k=0;k<6;++k)W[k]=V[k]+d[k]*q;if(lane=={c}%WIDTH){u}[{c}]=q;"
+                f"    {{const float* d=h.r[{c}/WIDTH];{output}float W[6];{update}if(lane=={c}%WIDTH){u}[{c}]=q;"
                 f"for(int k=0;k<6;++k)V[k]=READ(W[k],{c}%WIDTH);}}"
             )
         down.append(f"    for (int k = 0; k < 6; ++k) {state}[{6 * b} + k] = V[k];")

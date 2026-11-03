@@ -1766,9 +1766,7 @@ $link_twist
             WALK_PARENT_TWIST(link, twist, b, V);
             for (int c = WALK_FIRST_OF(b); c < WALK_FIRST_OF(b + 1); ++c) {
 $record_enter
-                u[c] = qd[c] / d[12] + ((d[6] * V[0] + d[7] * V[1] + d[8] * V[2])
-                                        + (d[9] * V[3] + d[10] * V[4] + d[11] * V[5]));
-                for (int k = 0; k < 6; ++k) V[k] += d[k] * qd[c];
+                $enter_V
             }
             for (int k = 0; k < 6; ++k) twist[6 * b + k] = V[k];
         }
@@ -1884,9 +1882,11 @@ _WALK_TEXTS = {
     "edge_q": ts.statements(ts.edge(ts.Direction.UP, ts.LOADED.lever, "q"), 20),
     "edge_v": ts.statements(ts.edge(ts.Direction.UP, ts.LOADED.lever, "v"), 24),
     "edge_twist": ts.statements(ts.edge(ts.Direction.DOWN, ts.LOADED.lever, "W", into="V"), 8),
+    "enter_V": ts.statements(ts.enter(ts.LOADED, "V", "qd[c]", "u[c]"), 16),
 }
 """The path walk's arithmetic (:data:`_WALK`): the rows' steps up (the held pose a source of statements, ``x``), a
-covector seed's first step, the joints of the rows' and the seed wrenches' up and of a parent's twist down."""
+covector seed's first step, the joints of the rows' and the seed wrenches' up and of a parent's twist down, and the
+audit's step in (``ENTER``)."""
 
 
 _WALK_LOADS = """#ifndef WALK_LOAD_RECORD
@@ -2707,18 +2707,8 @@ _DOWN_TOUCH_STEP = "WALK_TOUCH(data + $coordinate * ($c));"
 
 _DOWN_JOINT = ts.braced(ts.edge(ts.Direction.DOWN, ts.FETCHED.lever, "$P", into="$V"))
 
-_DOWN_STEP = """{
-    const float q = WALK_MUL(
-        $X.u - (($X.t.z * $V[0] + $X.t.w * $V[1] + $X.w.x * $V[2]) + ($X.w.y * $V[3] + $X.w.z * $V[4] + $X.w.w * $V[5])),
-        $X.e);
-    qd($c, q, $X.p);
-    $V[0] += $X.s.x * q;
-    $V[1] += $X.s.y * q;
-    $V[2] += $X.s.z * q;
-    $V[3] += $X.s.w * q;
-    $V[4] += $X.t.x * q;
-    $V[5] += $X.t.y * q;
-}"""
+_DOWN_OUTPUT, *_DOWN_UPDATE = ts.step(ts.Direction.DOWN, ts.FETCHED, "$V", source="$X.u", out="const float q")
+_DOWN_STEP = ts.braced([_DOWN_OUTPUT, "qd($c, q, $X.p);", *_DOWN_UPDATE])
 
 
 def walk_down_texts() -> dict[str, str]:
