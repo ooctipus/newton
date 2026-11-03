@@ -1852,8 +1852,9 @@ _BORDER = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step
             for (; c >= WALK_FIRST_OF(body); --c, ++t) {
                 float d[$unpacked];
                 $record(d, data + $coordinate * c);
-                const float z = (x + ((d[0] * p[0] + d[1] * p[1] + d[2] * p[2]) + (d[3] * p[3] + d[4] * p[4] + d[5] * p[5])))
-                                * d[12];
+                const float z = WALK_MUL(
+                    x + ((d[0] * p[0] + d[1] * p[1] + d[2] * p[2]) + (d[3] * p[3] + d[4] * p[4] + d[5] * p[5])),
+                    d[12]);
                 x = 0.0f;
                 for (int q = 0; q < 6; ++q)
                     p[q] -= d[6 + q] * z;
@@ -2174,8 +2175,9 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
                 float d[13];
                 HOLD_RECORD(h, c, d);
                 if (on) {
-                    z = ((c == i ? 1.0f : 0.0f) + ((d[0] * p[0] + d[1] * p[1] + d[2] * p[2]) + (d[3] * p[3] + d[4] * p[4] + d[5] * p[5])))
-                        * d[12];
+                    z = WALK_MUL(
+                        (c == i ? 1.0f : 0.0f) + ((d[0] * p[0] + d[1] * p[1] + d[2] * p[2]) + (d[3] * p[3] + d[4] * p[4] + d[5] * p[5])),
+                        d[12]);
                     for (int q = 0; q < 6; ++q) p[q] -= d[6 + q] * z;
                     root = c;
                 }
@@ -2270,8 +2272,8 @@ def held_walks(cls, x: str, u: str, state: str, words: int) -> tuple[str, str]:
             up.append("    for (int k = 0; k < 6; ++k) p[k] += 0.0f;")
         for c in range(first[b + 1] - 1, first[b] - 1, -1):
             up.append(
-                f"    {{const float* d=h.r[{c}/WIDTH];const float z=({x}[{c}]+((d[0]*p[0]+d[1]*p[1]+d[2]*p[2])"
-                "+(d[3]*p[3]+d[4]*p[4]+d[5]*p[5])))*d[12];"
+                f"    {{const float* d=h.r[{c}/WIDTH];const float z=WALK_MUL({x}[{c}]+((d[0]*p[0]+d[1]*p[1]+d[2]*p[2])"
+                "+(d[3]*p[3]+d[4]*p[4]+d[5]*p[5])),d[12]);"
                 f"float q[6];for(int k=0;k<6;++k)q[k]=p[k]-d[6+k]*z;if(lane=={c}%WIDTH){u}[{c}]=z;"
                 f"for(int k=0;k<6;++k)p[k]=READ(q[k],{c}%WIDTH);}}"
             )
@@ -2312,8 +2314,8 @@ def held_walks(cls, x: str, u: str, state: str, words: int) -> tuple[str, str]:
             )
         for c in range(first[b], first[b + 1]):
             down.append(
-                f"    {{const float* d=h.r[{c}/WIDTH];const float q=(uh[{c}/WIDTH]-((d[6]*V[0]+d[7]*V[1]+d[8]*V[2])"
-                "+(d[9]*V[3]+d[10]*V[4]+d[11]*V[5])))*d[12];"
+                f"    {{const float* d=h.r[{c}/WIDTH];const float q=WALK_MUL(uh[{c}/WIDTH]-((d[6]*V[0]+d[7]*V[1]+d[8]*V[2])"
+                "+(d[9]*V[3]+d[10]*V[4]+d[11]*V[5])),d[12]);"
                 f"float W[6];for(int k=0;k<6;++k)W[k]=V[k]+d[k]*q;if(lane=={c}%WIDTH){u}[{c}]=q;"
                 f"for(int k=0;k<6;++k)V[k]=READ(W[k],{c}%WIDTH);}}"
             )

@@ -1718,7 +1718,7 @@ $point_b
                              + ((S[3] - d[3]) * v[3] + (S[4] - d[4]) * v[4] + (S[5] - d[5]) * v[5]);
                         j = (e0 * v[0] + e1 * v[1] + e2 * v[2]) + (S[3] * v[3] + S[4] * v[4] + S[5] * v[5]);
                     }
-                    const float z = x * d[12];
+                    const float z = WALK_MUL(x, d[12]);
                     for (int k = 0; k < 6; ++k) q[k] -= d[6 + k] * z;
                     sink(r, c, z, j);
                 }
@@ -1750,8 +1750,9 @@ $point_b
 $record_seed
         for (int r = 0; r < $rows; ++r) {
             float* q = p + 6 * r;
-            const float z = (x[r] + ((d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) + (d[3] * q[3] + d[4] * q[4] + d[5] * q[5])))
-                            * d[12];
+            const float z = WALK_MUL(
+                x[r] + ((d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) + (d[3] * q[3] + d[4] * q[4] + d[5] * q[5])),
+                d[12]);
             for (int k = 0; k < 6; ++k) q[k] -= d[6 + k] * z;
             sink(r, c, z, x[r]);
         }
@@ -1951,6 +1952,7 @@ _WALK_LOADS = """#ifndef WALK_LOAD_RECORD
         const wp::vec3 walk_o_ = (w).origin.data[a], walk_n_ = (w).now_origin.data[a];                         \
         for (int walk_k_ = 0; walk_k_ < 3; ++walk_k_) s[walk_k_] = walk_o_[walk_k_] - walk_n_[walk_k_];        \
     }
+$mul
 #endif"""
 
 _WALK_LOADS_CPU = """#ifndef WALK_LOAD_RECORD
@@ -1995,6 +1997,7 @@ _WALK_LOADS_CPU = """#ifndef WALK_LOAD_RECORD
         const wp::vec3 walk_o_ = (w).origin.data[a], walk_n_ = (w).now_origin.data[a];                         \
         for (int walk_k_ = 0; walk_k_ < 3; ++walk_k_) s[walk_k_] = walk_o_[walk_k_] - walk_n_[walk_k_];        \
     }
+$mul
 #endif"""
 """The CPU twin of :data:`_WALK_LOADS`: each prelude carries its device's text under the snippet's one guard."""
 
@@ -2029,10 +2032,21 @@ WALK_LINK_FRAME = 3
 point: after its offset to its parent's frame."""
 
 
+_WALK_MUL = """// WALK_MUL(a, b): a walk step's output, a product rounded on its own: the chain's coordinate is a float32 value before
+// any consumer adds it, whatever block the consumer sits in.
+#define WALK_MUL(a, b) __fmul_rn((a), (b))"""
+
+_WALK_MUL_CPU = """// The CPU's WALK_MUL is a function boundary, as CUDA's __fmul_rn: a product inside the consumer's expression could be
+// contracted into it.
+#define WALK_MUL(a, b) ([](const float walk_a_, const float walk_b_) -> float { return walk_a_ * walk_b_; }((a), (b)))"""
+
+
 def _walk_loads_text(cuda: bool, side: bool = True) -> str:
-    """The loads text (:data:`_WALK_LOADS`, or its CPU twin) at the device layout, with :data:`_WALK_ONE_HALF` for a
-    reader of trees without a side (``side`` false, :attr:`TreeFactor.walk_side`)."""
-    text = substitute(_WALK_LOADS if cuda else _WALK_LOADS_CPU, link=WALK_LINK)
+    """The loads text (:data:`_WALK_LOADS`, or its CPU twin, and the step's pin ``WALK_MUL``) at the device layout,
+    with :data:`_WALK_ONE_HALF` for a reader of trees without a side (``side`` false, :attr:`TreeFactor.walk_side`)."""
+    text = substitute(
+        _WALK_LOADS if cuda else _WALK_LOADS_CPU, link=WALK_LINK, mul=_WALK_MUL if cuda else _WALK_MUL_CPU
+    )
     return text if side else text + "\n" + (_WALK_ONE_HALF if cuda else _WALK_ONE_HALF_CPU)
 
 
@@ -2614,8 +2628,6 @@ _WALK_ACCESS = """    // The walk's loads, and a lane group's fetch of a byte ra
         float4 s, t, w;
         float e, u, p;
     };
-    // A product rounded on its own: the chain's coordinate is a float32 value before any consumer adds it.
-    const auto WALK_MUL = [&](const float a, const float b) -> float { return __fmul_rn(a, b); };
     const auto WALK_FETCH = [&](const void* start, const int bytes, const int lane, const int lanes) {
         const size_t end = reinterpret_cast<size_t>(start) + (size_t)bytes;
         for (size_t line = (reinterpret_cast<size_t>(start) & ~(size_t)127) + (size_t)128 * lane; line < end;
@@ -2645,7 +2657,6 @@ _WALK_ACCESS_CPU = """    struct WalkRecord {
         WalkRecord s, t, w;
         float e, u, p;
     };
-    const auto WALK_MUL = [&](const float a, const float b) -> float { return a * b; };
     const auto WALK_FETCH = [&](const void*, const int, const int, const int) {};
     const auto WALK_TOUCH = [&](const void*) {};"""
 
@@ -2789,11 +2800,18 @@ def walk_down_prelude(
     tag = hashlib.sha256(
         repr((classes, unroll, WALK_AHEAD if ahead is None else ahead, WALK_TOUCH)).encode()
     ).hexdigest()[:8]
-    return DevicePrelude(
-        f"walk_down_{tag}",
-        substitute(_WALK_ACCESS, link=WALK_LINK) + "\n" + _walk_down(classes, True, unroll, ahead),
-        cpu=substitute(_WALK_ACCESS_CPU, link=WALK_LINK) + "\n" + _walk_down(classes, False, unroll, ahead),
-    )
+    # The loads package carries the step's pin (WALK_MUL), under its one guard.
+    texts = {
+        cuda: "\n".join(
+            (
+                _walk_loads_text(cuda),
+                substitute(_WALK_ACCESS if cuda else _WALK_ACCESS_CPU, link=WALK_LINK),
+                _walk_down(classes, cuda, unroll, ahead),
+            )
+        )
+        for cuda in (True, False)
+    }
+    return DevicePrelude(f"walk_down_{tag}", texts[True], cpu=texts[False])
 
 
 LEAVE_LANES = 4
