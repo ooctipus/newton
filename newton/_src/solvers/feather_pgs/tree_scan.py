@@ -1644,9 +1644,8 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
         walk's six-float state is then read from the coordinate's lane (six shuffles, where reading the record took
         thirteen); each body's link by shuffle from the lane that holds it (``HOLD_LINK`` at a constant). A body's
         state passes to a parent that is not the body before it through ``state`` (six words a body, lane 0 writes),
-        the walk down's twists through the same words (every lane writes them, as each body's twist out); a body no
-        other child joins adds the zero state as ``+ 0.0f``, the walk up's addition of an untouched slot. Lane 0 writes
-        ``u`` (both walks). A lane holds ``HOLD_WORDS`` words of each held array (on the CPU's one lane, every item)."""
+        the walk down's twists through the same words (every lane writes them, as each body's twist out); a body's first
+        joining child stores its state, the later ones add theirs. Lane 0 writes ``u`` (both walks). A lane holds ``HOLD_WORDS`` words of each held array (on the CPU's one lane, every item)."""
         parent = self.parent
         edge_up = "".join(edge(Direction.UP, LOADED.lever, "p"))
         edge_down = "".join(edge(Direction.DOWN, LOADED.lever, "V"))
@@ -1655,8 +1654,6 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
         for b in self.bodies_in(False):
             if b in joined:
                 up.append(f"    for (int k = 0; k < 6; ++k) p[k] += {state}[{6 * b} + k];")
-            else:
-                up.append("    for (int k = 0; k < 6; ++k) p[k] += 0.0f;")
             for c in self.coordinates_in(b, False):
                 output, update = step(Direction.UP, LOADED, "p", source=f"{x}[{c}]", into="q")
                 up.append(
@@ -1671,7 +1668,7 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
                     if parent_b in joined:
                         up.append(f"    if(lane==0)for(int k=0;k<6;++k){state}[{6 * parent_b}+k]+=p[k];")
                     else:
-                        up.append(f"    if(lane==0)for(int k=0;k<6;++k){state}[{6 * parent_b}+k]=0.0f+p[k];")
+                        up.append(f"    if(lane==0)for(int k=0;k<6;++k){state}[{6 * parent_b}+k]=p[k];")
                         joined.add(parent_b)
                     up.append("    WARP_SYNC();")
                 if b > 0:

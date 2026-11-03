@@ -1756,8 +1756,13 @@ def get_classify_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT):
 
 _EDGE_UP = ts.edge(ts.Direction.UP, ts.LOADED.lever, "p")
 """A joint of the border's column walk up, on a loaded link ``l``."""
-_HELD_COLUMN = ts.step(ts.Direction.UP, ts.LOADED, "p", source="(c == i ? 1.0f : 0.0f)", out="z", index="q")
-"""A slip's column step, a unit covector walked in the dense form (1 at the slip's coordinate, then 0)."""
+_HELD_COLUMN = [
+    f"float x = {ts.dot(ts.LOADED.s, ts.channels('p'))};",
+    "if (c == i) x += 1.0f;",
+    *ts.step(ts.Direction.UP, ts.LOADED, "p", value="x", out="z", index="q"),
+]
+"""A slip's column step, ``L^-1 P e_i`` walked up its root path: the unit covector a seed at the slip's coordinate,
+added there only (no ``0 +`` after it: the sign of a zero footprint is the walk's own)."""
 
 
 def walk_loads_prelude(side: bool = True) -> DevicePrelude:
