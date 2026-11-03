@@ -123,7 +123,6 @@ _BODY_RECORDS = (
     "diag",
     "row_sides",
     "row_beta",
-    "row_cfm",
 )
 """The row store's records the free bodies' rows read in their region (:meth:`Placement.body_region`)."""
 
@@ -1055,8 +1054,8 @@ class Placement:
         return int(getattr(self, "ink_rows", 0))
 
     def inkernel_response_inputs(self) -> dict:
-        """The parallel tiers' operands beside the walk: the worlds' trees (``ink_meta``) and the rows' cfm."""
-        return {"ink_meta": self.ink_meta, "world_row_cfm": self.row_cfm}
+        """The parallel tiers' operands beside the walk: the worlds' trees (``ink_meta``) and the rows' law's cfm."""
+        return {"ink_meta": self.ink_meta, "cfm": self.options.pgs_cfm}
 
     # ---------------------------------------------------------------------------------------------------------------
     # Step: the whitening and the diagonals
@@ -1112,7 +1111,9 @@ class Placement:
     def body_dense_rows(self):
         """The free bodies' rows as :data:`.dense_rows.DenseRows`: the row store's records in their region
         (:meth:`body_region`), which the rows' law reads and writes as a dense row's."""
-        return bind_dense_rows(SimpleNamespace(**vars(self.body_rows), dense_first=self.dense_first))
+        return bind_dense_rows(
+            SimpleNamespace(**vars(self.body_rows), dense_first=self.dense_first), options=self.options
+        )
 
     def pack_free_body_meta(self) -> None:
         """Pack matrix-free row metadata for the GS kernels, or skip when no such row can exist."""

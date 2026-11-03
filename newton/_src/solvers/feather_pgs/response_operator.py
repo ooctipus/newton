@@ -812,8 +812,8 @@ class WalkedRows:
         return _lines(_push_velocity(out, lambda d: z("i", d), lanes, self.dofs), indent)
 
     def push_diagonal(self) -> str:
-        """``A_ii = |Z_i|^2 + cfm_i``, from the squares :meth:`push_velocity` reduced."""
-        return "zz + world_row_cfm.data[off_dense + i]"
+        """``A_ii = |Z_i|^2 + cfm`` (the rows' law's), from the squares :meth:`push_velocity` reduced."""
+        return "zz + cfm"
 
 
 @dataclass(frozen=True)

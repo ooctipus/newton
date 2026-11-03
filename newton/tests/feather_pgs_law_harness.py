@@ -582,7 +582,6 @@ CONTACT_ARGUMENTS = {
     "row_parent": "world_row_parent",
     "row_mu": "world_row_mu",
     "row_beta": "world_row_beta",
-    "row_cfm": "world_row_cfm",
     "phi": "world_phi",
     "target": "world_target_velocity",
     "restitution": "world_row_restitution",
@@ -591,11 +590,11 @@ CONTACT_ARGUMENTS = {
 
 
 DENSE_ROW_ARGUMENTS = {
+    "cfm": "pgs_cfm",
     "row_type": "world_row_type",
     "row_parent": "world_row_parent",
     "row_mu": "world_row_mu",
     "row_beta": "world_row_beta",
-    "row_cfm": "world_row_cfm",
     "phi": "world_phi",
     "target": "world_target_velocity",
     "restitution": "world_row_restitution",
@@ -709,7 +708,6 @@ PREFIX_RECORDS = {
     "row_parent": wp.int32,
     "row_mu": wp.float32,
     "row_beta": wp.float32,
-    "row_cfm": wp.float32,
     "phi": wp.float32,
     "target": wp.float32,
     "sides": wp.vec2i,

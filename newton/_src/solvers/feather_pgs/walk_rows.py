@@ -516,14 +516,14 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool = True) -> wp
             world_sync(lanes)
             for pe in range(preelim.world_start[world] + lane, preelim.world_start[world + 1], lanes):
                 close_block(
-                    pe, wp.static(capacity), line, preelim, mimic_slot, link_slot, rows.row_cfm, sink.entries,
+                    pe, wp.static(capacity), line, preelim, mimic_slot, link_slot, rows.cfm, sink.entries,
                     rows.rhs, sink.row_incident, rows.diag,
                 )  # fmt: skip
             world_sync(lanes)
             for slot in range(lane, count, lanes):
                 if block_row(support.units[line, slot], wp.static(mimics)) == 0:
                     close_row(
-                        line, slot, rows.sides[line, slot], wp.static(capacity), preelim, rows.row_cfm, sink.entries,
+                        line, slot, rows.sides[line, slot], wp.static(capacity), preelim, rows.cfm, sink.entries,
                         rows.rhs, rows.diag,
                     )  # fmt: skip
 
@@ -754,7 +754,7 @@ _SUPPORT_RECORD = """    // A full unit's block record from its Gram (sparse_con
         ST(record + 0, cross[0]);
         ST(record + 1, cross[1]);
         ST(record + 2, cross[2]);
-        ST(record + 3, 1.0f / (norm[0] + RD(sink.row_cfm.data + rec0)));
+        ST(record + 3, 1.0f / (norm[0] + sink.cfm));
 $tail
     }
 """
@@ -831,7 +831,7 @@ _SUPPORT_SIDE = """        unsigned long long mask = 0ull;
                 for (int e = base; e < count; ++e) ST(Z + r * S + e, 0.0f);
         }"""
 
-_HEADER_DIAG = "norm[r] + RD(sink.row_cfm.data + rec0 + r)"
+_HEADER_DIAG = "norm[r] + sink.cfm"
 
 _SUPPORT_BELOW = """                if (!add)
                     for (int e = base; e < rank(c); ++e) ST(Z + e, 0.0f);
@@ -886,7 +886,7 @@ class RowSink:
     release: WalkRelease
     response_dofs: wp.array[int]
     v_hat: wp.array[float]
-    row_cfm: wp.array2d[float]
+    cfm: float
     entries: wp.array3d[float]
     row_incident: wp.array2d[float]
     diag: wp.array2d[float]
@@ -1364,7 +1364,7 @@ def slot_header(
         sparse += z_a * z_a
     if coord_b >= 0:
         sparse += z_b * z_b
-    rows.diag[line, slot] = (rows.diag[line, slot] + sparse) + rows.row_cfm[line, slot]
+    rows.diag[line, slot] = (rows.diag[line, slot] + sparse) + rows.cfm
     slots.incident[line, slot] = incident
     row_bias(
         rows, line, slot, incident, dt, contact_speculative_scale, contact_w, restitution_velocity_threshold, weighted,
@@ -1428,7 +1428,7 @@ def row_sink(factor, forest, placement, v_hat: wp.array) -> RowSink:
     walk = factor.walk_view()
     sink.walk, sink.release = walk, walk.release
     sink.response_dofs = forest.articulation_response_dof_count
-    sink.v_hat, sink.row_cfm, sink.diag = v_hat, placement.row_cfm, placement.diag
+    sink.v_hat, sink.cfm, sink.diag = v_hat, placement.options.pgs_cfm, placement.diag
     sink.row_incident = placement.row_incident
     return sink
 

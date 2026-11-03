@@ -436,7 +436,8 @@ def world_case(solver, world=0):
     for art, n in enumerate(forest.articulation_response_dof_count.numpy()):
         if forest.art_to_world.numpy()[art] == world:
             velocity[offsets[art] : offsets[art] + n] = predicted[starts[art] : starts[art] + n]
-    cfm = solver.placement.row_cfm.numpy()[world, :count].astype(np.float64)
+    # The rows' law's regularization, one value (pgs_cfm).
+    cfm = np.full(count, solver.options.pgs_cfm, dtype=np.float32).astype(np.float64)
     case = {
         "J": J,
         "Y": Y,
@@ -818,7 +819,6 @@ _ROW_ARRAYS = (
     "row_parent",
     "row_mu",
     "row_beta",
-    "row_cfm",
     "phi",
     "target_velocity",
     "row_restitution",
@@ -999,7 +999,7 @@ class TestKeyedPatchRows(unittest.TestCase):
         for c, (world, first, needed) in owner.items():
             rows = slice(first, first + needed)
             with self.subTest(contact=c):
-                for name in ("row_type", "row_beta", "row_cfm", "row_restitution"):
+                for name in ("row_type", "row_beta", "row_restitution"):
                     np.testing.assert_array_equal(actual[name][world, rows], expected[name][world, rows], name)
                 # Ring links by contact: the next normal of the patch, the owning normal of a tangent row.
                 for rows_of in (expected, actual):
@@ -1335,6 +1335,8 @@ def _launch_parallel(tier, case, *, device):
         return wp.array(out, dtype=dtype, device=device)
 
     v_hat = case["velocity"] - case["impulses"] @ case["Y"]
+    # The rows' law's regularization: one value for every row.
+    (cfm,) = np.unique(np.asarray(case["cfm"], np.float32))
     Z = np.zeros((1, _CAPACITY, _DOFS), np.float32)
     Z[0, :count] = case["Z"]
     values = {
@@ -1355,7 +1357,7 @@ def _launch_parallel(tier, case, *, device):
         "world_row_type": rows(case["types"], wp.int32),
         "world_row_parent": rows(case["parents"], wp.int32),
         "world_row_mu": rows(case["mu"]),
-        "world_row_cfm": rows(np.full(count, case["cfm"])),
+        "cfm": float(cfm),
         "iterations": 1,
         "omega": 1.0,
         # The predictor: the case's velocity less the response of its starting impulses, which the tier applies.

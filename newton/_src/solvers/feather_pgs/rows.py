@@ -735,7 +735,6 @@ class RowLaws:
                     state_aug.joint_S_s,
                     solver.factor.articulation_origin,
                     solver.options.pgs_beta,
-                    solver.options.pgs_cfm,
                     support,
                 ],
                 outputs=[solver.placement.packed_Z, dense_rows],

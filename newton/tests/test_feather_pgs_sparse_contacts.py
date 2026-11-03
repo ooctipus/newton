@@ -137,7 +137,7 @@ class TestSparseContacts(unittest.TestCase):
         f["needed"] = _array([1, 3, 1], int)
         row_type = _full((1, 9), -9, int)
         row_parent = _full((1, 9), -9, int)
-        other = [_full((1, 9), -9.0) for _ in range(6)]
+        other = [_full((1, 9), -9.0) for _ in range(5)]
         data = _contact_input(
             f,
             body_v=_full(4, wp.spatial_vector(0.0), wp.spatial_vector),
@@ -149,7 +149,7 @@ class TestSparseContacts(unittest.TestCase):
             cfm=1.0e-6,
             row_type=row_type,
             row_parent=row_parent,
-            **dict(zip(("row_mu", "row_beta", "row_cfm", "phi", "target", "restitution"), other, strict=True)),
+            **dict(zip(("row_mu", "row_beta", "phi", "target", "restitution"), other, strict=True)),
         )
         wp.launch(prepare_world_contact_rows, dim=1, inputs=[data, 1, row_law(f["patches"])], device="cpu")
         self.assertEqual(row_type.numpy()[0, 0], PGS_CONSTRAINT_TYPE_CONTACT)

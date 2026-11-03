@@ -166,7 +166,6 @@ $LOCALS$EVALUATE        $SLOT
             LAW::row_parent.data[at] = -1;
             LAW::row_mu.data[at] = 0.0f;
             LAW::row_beta.data[at] = beta;
-            LAW::row_cfm.data[at] = LAW::cfm;
             LAW::phi.data[at] = phi;
             LAW::target.data[at] = target;
 $SIDES$RHS$SINK

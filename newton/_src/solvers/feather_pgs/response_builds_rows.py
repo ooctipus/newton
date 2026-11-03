@@ -187,7 +187,7 @@ def close_block(
     preelim: Preelim,
     mimic_slot: wp.array[int],
     link_slot: wp.array[int],
-    world_row_cfm: wp.array2d[float],
+    cfm: float,
     packed_Z: wp.array3d[float],
     world_rhs: wp.array2d[float],
     world_incident: wp.array2d[float],
@@ -221,7 +221,7 @@ def close_block(
             kept += 1
         scale_row(packed_Z, line, row, scale, entries)
         world_rhs[line, row] *= scale
-        world_diag[line, row] = scale * scale * rest + world_row_cfm[line, row]
+        world_diag[line, row] = scale * scale * rest + cfm
     for p in range(kept, capacity):
         preelim.slots[base + p] = -1
     preelim.nB[pe] = kept
@@ -234,7 +234,7 @@ def close_row(
     sides: wp.vec2i,
     capacity: int,
     preelim: Preelim,
-    world_row_cfm: wp.array2d[float],
+    cfm: float,
     packed_Z: wp.array3d[float],
     world_rhs: wp.array2d[float],
     world_diag: wp.array2d[float],
@@ -263,7 +263,7 @@ def close_row(
                 subtract_row(packed_Z, line, row, along, other, entries)
                 world_rhs[line, row] -= along * world_rhs[line, other]
     if touched != 0:
-        world_diag[line, row] = wide_product(packed_Z, line, row, row, entries) + world_row_cfm[line, row]
+        world_diag[line, row] = wide_product(packed_Z, line, row, row, entries) + cfm
 
 
 @wp.kernel(enable_backward=False)

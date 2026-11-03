@@ -359,7 +359,6 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             "row_parent",
             "row_mu",
             "row_beta",
-            "row_cfm",
             "phi",
             "target_velocity",
             "row_restitution",

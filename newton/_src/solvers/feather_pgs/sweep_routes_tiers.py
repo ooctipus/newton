@@ -49,12 +49,12 @@ from .tree_scan import WALK_BOTH
 PARALLEL_ABI = kernel_template.params(
     *MF_GS_ABI[:-1],
     ("ink_meta", wp.array[int]),
-    ("world_row_cfm", wp.array2d[float]),
+    ("cfm", float),
     ("v_out", wp.array[float]),
 )
 """The parallel tiers' native ABI: the matrix-free sweep's (the walk among it), then the worlds' trees (``ink_meta``:
-each world's articulation of each size and its first coordinate) and the rows' cfm before ``v_out``; keyed rows insert
-theirs after ``world_row_cfm``."""
+each world's articulation of each size and its first coordinate) and the rows' law's cfm before ``v_out``; keyed rows
+insert theirs after ``cfm``."""
 
 # The parallel tiers' automatic budget (tier_sweeps) grows with the serial sweep's iteration count, whose accuracy
 # every tier must match, and with the square root of a tier's row bound, as Jacobi sweeps with momentum need more passes
@@ -229,7 +229,7 @@ def parallel_source(
     loads = store.loads(**metadata, unilateral=(CONTACT, JOINT_LIMIT, VELOCITY_LIMIT))
 
     def scale(aii, bound, pad):
-        return jacobi_scale(aii, bound, cfm="world_row_cfm.data[off_dense + i]", pad=pad)
+        return jacobi_scale(aii, bound, cfm="cfm", pad=pad)
 
     last_word = jacobi_limit_pass(store, op) if velocity_limit_pass else ""
     body = f"""    const int lane = LANE;

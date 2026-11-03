@@ -22,7 +22,6 @@ RECORDS = (
     Field("row_parent", wp.int32, ("world", "row"), owner="placement"),
     Field("row_mu", wp.float32, ("world", "row"), owner="placement"),
     Field("row_beta", wp.float32, ("world", "row"), owner="placement"),
-    Field("row_cfm", wp.float32, ("world", "row"), owner="placement"),
     Field("phi", wp.float32, ("world", "row"), owner="placement"),
     Field("target", wp.float32, ("world", "row"), attr="target_velocity", owner="placement"),
     Field("restitution", wp.float32, ("world", "row"), attr="row_restitution", owner="placement"),
@@ -35,9 +34,12 @@ RECORDS = (
 )
 """Each dense row's kind, friction parent, coefficients, gap, targets and law outputs (a material contact's
 compliance ``row_eps`` among them), and its sides (the articulations whose response coordinates it touches:
-:func:`row_sides`), by world and row."""
+:func:`row_sides`), by world and row. The rows' regularization ``cfm`` is the law's parameter (``pgs_cfm``), one value:
+a row's diagonal is ``A_ii = |Z_i|^2 + cfm``."""
 
-DenseRows = field_group.struct("DenseRows", RECORDS, __name__)
+DenseRows = field_group.struct(
+    "DenseRows", (*RECORDS, Field("cfm", wp.float32, owner="options", attr="pgs_cfm")), __name__
+)
 
 
 @wp.func
@@ -185,6 +187,9 @@ def bind_mf(placement):
     return field_group.bind(MfRows, placement=placement, body=placement.body_rows)
 
 
-def bind(placement, data=None):
-    """Bind the placement's dense row records into a :data:`DenseRows` (``data``: an instance to refill)."""
-    return field_group.bind(DenseRows, data, placement=placement)
+def bind(placement, data=None, options=None):
+    """Bind the placement's dense row records and the law's ``cfm`` (``options``, by default the placement's) into a
+    :data:`DenseRows` (``data``: an instance to refill)."""
+    return field_group.bind(
+        DenseRows, data, placement=placement, options=placement.options if options is None else options
+    )

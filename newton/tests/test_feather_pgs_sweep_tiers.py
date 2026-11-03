@@ -35,8 +35,8 @@ _TIER = sweep_routes_tiers.parallel_kernel.__wrapped__
 
 
 def _scale(aii, bound, pad):
-    """The tiers' step scale (:func:`jacobi_scale`), with the rows' cfm read as the tiers read it."""
-    return jacobi_scale(aii, bound, cfm="world_row_cfm.data[off_dense + i]", pad=pad)
+    """The tiers' step scale (:func:`jacobi_scale`), with the rows' law's cfm as the tiers read it."""
+    return jacobi_scale(aii, bound, cfm="cfm", pad=pad)
 
 
 # The exit of a warp's sweep and of a block's, without readout: stop a quiet sweep once friction is active.

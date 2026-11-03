@@ -138,7 +138,6 @@ DENSE_ROWS = FieldGroup(
     Field("row_mu", wp.float32, ("world", "row"), owner="placement"),
     Field("row_restitution", wp.float32, ("world", "row"), owner="placement"),
     Field("row_beta", wp.float32, ("world", "row"), owner="placement"),
-    Field("row_cfm", wp.float32, ("world", "row"), owner="placement"),
     Field("phi", wp.float32, ("world", "row"), owner="placement"),
     Field("target_velocity", wp.float32, ("world", "row"), owner="placement"),
     Field("constraint_count", wp.int32, ("world",), owner="placement"),

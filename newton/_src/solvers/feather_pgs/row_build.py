@@ -417,7 +417,6 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
             material_rhs, eps = contact_material_rhs(phi, target, stiffness, data.damping[c], data.dt)
             data.rhs[line, r] = material_rhs
         data.row_eps[line, r] = eps
-    data.row_cfm[line, r] = data.cfm
     data.target[line, r] = target
     data.sides[line, r] = row_sides(art_a, art_b, data.response_dofs)
     if with_rhs:

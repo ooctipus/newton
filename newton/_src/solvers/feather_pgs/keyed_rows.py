@@ -256,8 +256,7 @@ ${RHS}
                                                                 c.restitution_threshold);
             ${BOUNCE}
         }
-${WEIGHT}${ROW_LAW}        c.row_cfm.data[at] = c.cfm;
-        c.phi.data[at] = phi; c.target.data[at] = target;
+${WEIGHT}${ROW_LAW}        c.phi.data[at] = phi; c.target.data[at] = target;
         c.restitution.data[at] = r == 0 ? restitution : 0.0f;
         c.rhs.data[at] = rhs; c.diag.data[at] = c.cfm;
         ${PRIVATE_METADATA}
@@ -349,7 +348,7 @@ def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=
     key = "kinetic_rows.rowkeys.data[off_dense + i]"
     built = "float built_rhs = 0.0f, built_mu = 0.0f;\n            int built_parent = -1;"
     publish = "{\n                s_rhs[i] = built_rhs; s_parent[i] = built_parent; s_mu[i] = built_mu;\n            }"
-    arguments = (RowArgument("kinetic_rows", KineticRows, after="world_row_cfm"),)
+    arguments = (RowArgument("kinetic_rows", KineticRows, after="cfm"),)
     parent = f"{key} < 0 ? world_row_parent.data[off_dense + i] : 0"
     mu = f"{key} < 0 ? world_row_mu.data[off_dense + i] : 0"
     if patch:

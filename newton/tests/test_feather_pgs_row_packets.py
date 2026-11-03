@@ -63,7 +63,6 @@ _ROW_OUTPUTS = {
     "row_parent": (int, -777),
     "row_mu": (float, float("nan")),
     "row_beta": (float, float("nan")),
-    "row_cfm": (float, float("nan")),
     "phi": (float, float("nan")),
     "target": (float, float("nan")),
     "restitution": (float, float("nan")),
@@ -573,7 +572,7 @@ class _PatchRowTwins:
         phi = layout.view.phi.numpy()
         moved = 0.0
         for c, w, first, count in _contact_rows(data):
-            for name in ("row_type", "row_parent", "row_mu", "row_beta", "row_cfm", "phi", "target", "restitution"):
+            for name in ("row_type", "row_parent", "row_mu", "row_beta", "phi", "target", "restitution"):
                 self.assert_same(
                     getattr(data, name).numpy()[w, first], getattr(point, name).numpy()[w, first], f"contact {c}"
                 )

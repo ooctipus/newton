@@ -990,7 +990,6 @@ def write_link_rows(
     joint_S_s: wp.array[wp.spatial_vector],
     articulation_origin: wp.array[wp.vec3],
     pgs_beta: float,
-    pgs_cfm: float,
     support: RowSupport,
     # outputs
     J: wp.array3d[float],
@@ -1062,7 +1061,6 @@ def write_link_rows(
         rows.row_parent[line, slot] = -1
         rows.row_mu[line, slot] = 0.0
         rows.row_beta[line, slot] = pgs_beta
-        rows.row_cfm[line, slot] = pgs_cfm
         rows.phi[line, slot] = turn[axis] if angular else gap[axis]
         rows.target[line, slot] = 0.0
 
