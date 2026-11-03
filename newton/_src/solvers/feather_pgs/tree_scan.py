@@ -124,6 +124,7 @@ __all__ = [
     "statements",
     "step",
     "tree_scan",
+    "walk_texts",
 ]
 
 
@@ -1209,6 +1210,31 @@ def inward_edge(lever, state: str) -> str:
         row[j], row[i] = lever[i], f"-{lever[j]}"
         rows.append("{" + ", ".join(row) + "}")
     return _INWARD_EDGE.substitute(h=state, skew="{" + ", ".join(rows) + "}")
+
+
+def walk_texts(
+    direction: Direction, *, source: str, sink: str, value: str, prior: str, coordinate: int, link: int, end: str = ""
+) -> dict[str, str]:
+    """A whole-tree walk on fetched items (:data:`FETCHED`), as :meth:`WalkClass.walk`'s keywords: ``UP`` leaf first
+    (the whitening, ``u = L^-1 P x``), ``DOWN`` root first (``P^T L^-T u``). Its joint is the edge (into the parent leaf
+    first, from it root first); its step the coordinate's :func:`step` on ``$V`` from ``source``, the caller's ``sink``
+    after the output and before the state's update; ``end`` a body's statements after its coordinates. Each step's
+    record and input (``value``, and ``prior``, its output's prior value) and each joint's link are fetched ahead of
+    the chain (``WALK_IN``, ``WALK_LINK_IN``) and asked of L1 before that (``WALK_TOUCH``); ``coordinate`` and ``link``
+    are the floats of a record and a link."""
+    up = direction is Direction.UP
+    output, *update = step(direction, FETCHED, "$V", source=source, out="const float z" if up else "const float q")
+    texts = {
+        "joint": braced(edge(direction, FETCHED.lever, "$V" if up else "$P", into="$P" if up else "$V")),
+        "step": braced([output, sink, *update]),
+        "end": end,
+        "root_first": not up,
+        "fetch_joint": "WALK_LINK_IN(link, $b, $up)",
+        "fetch_step": f"WALK_IN(data + {coordinate} * ($c), {value}, {prior}, $half)",
+        "touch_joint": f"WALK_TOUCH(link + {link} * ($b));",
+        "touch_step": f"WALK_TOUCH(data + {coordinate} * ($c));",
+    }
+    return texts
 
 
 WALK_STAGED = 13
