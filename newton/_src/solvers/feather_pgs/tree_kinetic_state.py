@@ -1777,6 +1777,10 @@ def _solve_operations(layout: TreeLayout, classes: tuple) -> dict[str, str]:
     return {name: substitute(text, layout.sizes()) for name, text in solve.items()}
 
 
+_EDGE_UP = ts.edge(ts.Direction.UP, ts.LOADED.lever, "p")
+_EDGE_DOWN = ts.edge(ts.Direction.DOWN, ts.LOADED.lever, "V")
+"""A joint of the border's walks, on a held or loaded link ``l``: the wrench ``p`` up, the twist ``V`` down."""
+
 _BORDER = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step on its all-K walk, with no factor array. The release
     // R = L_F^-1 L_K, built from the all-K walk's columns and the K-free pivot, is the decided factor's whitening; the
     // predictor's step takes R then R^T between its two walks, the rows R, the leave R^T, the audit R^-T (WalkRelease).
@@ -1864,10 +1868,7 @@ _BORDER = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step
             if (up >= 0) {
                 float l[6];
                 WALK_LOAD_LINK(l, link, body, up);
-                const float fx = p[0], fy = p[1], fz = p[2];
-                p[3] -= l[1] * fz - l[2] * fy;
-                p[4] -= l[2] * fx - l[0] * fz;
-                p[5] -= l[0] * fy - l[1] * fx;
+                $edge_p
                 c = WALK_FIRST_OF(up + 1) - 1;
             }
             body = up;
@@ -1972,7 +1973,13 @@ def walk_tree_prelude(side: bool = True) -> DevicePrelude:
     from .tree_factor import WALK_COORDINATE, WALK_UNPACKED, walk_paths_prelude  # noqa: PLC0415
 
     walk = walk_paths_prelude(1, side=side)
-    tree = substitute(_BORDER, coordinate=WALK_COORDINATE, unpacked=WALK_UNPACKED, record=record_load(side))
+    tree = substitute(
+        _BORDER,
+        coordinate=WALK_COORDINATE,
+        unpacked=WALK_UNPACKED,
+        record=record_load(side),
+        edge_p=ts.statements(_EDGE_UP, 16),
+    )
     name = "walk_tree" if side else "walk_tree_one_half"
     return DevicePrelude(name, walk.source + "\n" + tree, cpu=walk.cpu + "\n" + tree)
 
@@ -2228,10 +2235,7 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
             HOLD_LINK(h, b, l);
             if (in) {
                 if (up >= 0) {
-                    const float fx = p[0], fy = p[1], fz = p[2];
-                    p[3] -= l[1] * fz - l[2] * fy;
-                    p[4] -= l[2] * fx - l[0] * fz;
-                    p[5] -= l[0] * fy - l[1] * fx;
+                    $edge_p
                 }
                 next = up >= 0 ? last : -1;
             }
@@ -2279,10 +2283,7 @@ def held_walks(cls, x: str, u: str, state: str, words: int) -> tuple[str, str]:
             )
         parent_b = parent[b]
         if parent_b >= 0:
-            up.append(
-                f"    {{float l[3];HOLD_LINK(h,{b},l);const float fx=p[0],fy=p[1],fz=p[2];"
-                "p[3]-=l[1]*fz-l[2]*fy;p[4]-=l[2]*fx-l[0]*fz;p[5]-=l[0]*fy-l[1]*fx;}"
-            )
+            up.append(f"    {{float l[3];HOLD_LINK(h,{b},l);{''.join(_EDGE_UP)}}}")
         if parent_b != b - 1:
             if parent_b >= 0:
                 if parent_b in joined:
@@ -2308,10 +2309,7 @@ def held_walks(cls, x: str, u: str, state: str, words: int) -> tuple[str, str]:
         else:
             if parent_b != b - 1:
                 down.append(f"    for (int k = 0; k < 6; ++k) V[k] = {state}[{6 * parent_b} + k];")
-            down.append(
-                f"    {{float l[3];HOLD_LINK(h,{b},l);V[0]+=l[1]*V[5]-l[2]*V[4];V[1]+=l[2]*V[3]-l[0]*V[5];"
-                "V[2]+=l[0]*V[4]-l[1]*V[3];}"
-            )
+            down.append(f"    {{float l[3];HOLD_LINK(h,{b},l);{''.join(_EDGE_DOWN)}}}")
         for c in range(first[b], first[b + 1]):
             down.append(
                 f"    {{const float* d=h.r[{c}/WIDTH];const float q=WALK_MUL(uh[{c}/WIDTH]-((d[6]*V[0]+d[7]*V[1]+d[8]*V[2])"
@@ -2368,14 +2366,7 @@ _UP_STEP = """{
 its body's state, ``z_c`` rounded on its own (``WALK_MUL``); its record and ``x_c`` fetched ahead of the chain
 (``$X``, :meth:`.tree_factor.WalkClass.walk`)."""
 
-_UP_JOINT = """{
-    $P[0] += $V[0];
-    $P[1] += $V[1];
-    $P[2] += $V[2];
-    $P[3] += $V[3] - ($L.y * $V[2] - $L.z * $V[1]);
-    $P[4] += $V[4] - ($L.z * $V[0] - $L.x * $V[2]);
-    $P[5] += $V[5] - ($L.x * $V[1] - $L.y * $V[0]);
-}"""
+_UP_JOINT = ts.braced(ts.edge(ts.Direction.UP, ts.FETCHED.lever, "$V", into="$P"))
 """A joint of the walk up: the body's state ``(f, t)`` passes to its parent's frame, ``t - d x f`` (``$L`` the body's
 link, fetched ahead), and adds into it."""
 
@@ -2594,7 +2585,13 @@ def held_lambdas(layout: TreeLayout, slips: int, side: bool = True) -> str:
         return ""
     bound = max(1, min(slips, layout.lanes, 32))
     lambdas = substitute(
-        _HELD, HOLD=words, SLIPS=bound, coordinate=WALK_COORDINATE, unpacked=WALK_UNPACKED, record=record_load(side)
+        _HELD,
+        HOLD=words,
+        SLIPS=bound,
+        coordinate=WALK_COORDINATE,
+        unpacked=WALK_UNPACKED,
+        record=record_load(side),
+        edge_p=ts.statements(_EDGE_UP, 20),
     )
     return f"#if defined(__CUDA_ARCH__)\n{lambdas}\n#endif\n"
 

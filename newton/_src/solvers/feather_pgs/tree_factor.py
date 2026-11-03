@@ -32,6 +32,7 @@ import warp as wp
 
 from ...sim import BodyFlags, JointType, ModelFlags
 from . import field_group, host_index, response_builds_rows
+from . import tree_scan as ts
 from .conditioning import ArmatureFloor, conditioning_armature
 from .device_preludes import DevicePrelude, substitute
 from .field_group import SolverArrays
@@ -1726,18 +1727,12 @@ $point_b
             if (WALK_PARENT_OF(b) >= 0) {
                 for (int r = 0; r < $rows; ++r) {
                     float* q = p + 6 * r;
-                    const float fx = q[0], fy = q[1], fz = q[2];
-                    q[3] -= l[1] * fz - l[2] * fy;
-                    q[4] -= l[2] * fx - l[0] * fz;
-                    q[5] -= l[0] * fy - l[1] * fx;
+                    $edge_q
                 }
                 if (now != nullptr) {
                     for (int r = 0; r < $rows; ++r) {
                         float* v = w + 6 * r;
-                        const float fx = v[0], fy = v[1], fz = v[2];
-                        v[3] -= l[1] * fz - l[2] * fy;
-                        v[4] -= l[2] * fx - l[0] * fz;
-                        v[5] -= l[0] * fy - l[1] * fx;
+                        $edge_v
                     }
                 }
             }
@@ -1766,12 +1761,7 @@ $record_seed
         }
         const float* W = twist + 6 * up;
 $link_twist
-        V[0] = W[0] + (l[1] * W[5] - l[2] * W[4]);
-        V[1] = W[1] + (l[2] * W[3] - l[0] * W[5]);
-        V[2] = W[2] + (l[0] * W[4] - l[1] * W[3]);
-        V[3] = W[3];
-        V[4] = W[4];
-        V[5] = W[5];
+        $edge_twist
     };
     // WALK_ENTER(data, link, qd, u, twist): the walk's coordinates of known velocities qd, u = L^T P qd (the leave
     // inverted), root first: u_c = ell_c qd_c + ut_c . V, then V += s_c qd_c, V its body's twist (the audit's).
@@ -1887,6 +1877,14 @@ $record_enter
         const int cap = release.b.shape[1], steps = release.b.shape[2];
         for (int j = 0; j < release.count.data[art]; ++j) WALK_SLIP_IT(release, ((size_t)art * cap + j) * steps, u);
     };"""
+
+
+_WALK_EDGES = {
+    "edge_q": ts.statements(ts.edge(ts.Direction.UP, ts.LOADED.lever, "q"), 20),
+    "edge_v": ts.statements(ts.edge(ts.Direction.UP, ts.LOADED.lever, "v"), 24),
+    "edge_twist": ts.statements(ts.edge(ts.Direction.DOWN, ts.LOADED.lever, "W", into="V"), 8),
+}
+"""The path walk's joints (:data:`_WALK`): the rows' and the seed wrenches' up, a parent's twist down."""
 
 
 _WALK_LOADS = """#ifndef WALK_LOAD_RECORD
@@ -2121,6 +2119,7 @@ def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int) -> 
     walk = substitute(
         _WALK,
         rows=rows,
+        **_WALK_EDGES,
         now=WALK_NOW,
         frame=WALK_LINK_FRAME,
         batch=WALK_SLIP_BATCH,
@@ -2161,6 +2160,7 @@ def walk_paths_prelude(
         + substitute(
             _WALK,
             rows=rows,
+            **_WALK_EDGES,
             now=now,
             frame=WALK_LINK_FRAME,
             batch=WALK_SLIP_BATCH,
@@ -2703,14 +2703,7 @@ _DOWN_TOUCH_JOINT = "WALK_TOUCH(link + $link * ($b));"
 _DOWN_TOUCH_STEP = "WALK_TOUCH(data + $coordinate * ($c));"
 """The lines of a body's link and a coordinate's record, asked of L1 :data:`WALK_TOUCH` items ahead of the chain."""
 
-_DOWN_JOINT = """{
-    $V[0] = $P[0] + ($L.y * $P[5] - $L.z * $P[4]);
-    $V[1] = $P[1] + ($L.z * $P[3] - $L.x * $P[5]);
-    $V[2] = $P[2] + ($L.x * $P[4] - $L.y * $P[3]);
-    $V[3] = $P[3];
-    $V[4] = $P[4];
-    $V[5] = $P[5];
-}"""
+_DOWN_JOINT = ts.braced(ts.edge(ts.Direction.DOWN, ts.FETCHED.lever, "$P", into="$V"))
 
 _DOWN_STEP = """{
     const float q = WALK_MUL(

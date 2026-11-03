@@ -54,6 +54,11 @@ the same arrays. Sizes are literals from the plan, or names a caller's
 template fills.
 
 Generation is text substitution only (``str.format`` on the fragments below).
+
+The factor's walk (TREE_SCAN T8) is the same scan on the factor's records: a
+coordinate's step and a joint's edge, root first or leaf first. Its arithmetic
+is written once here (:func:`edge`, on a schedule's names for the record,
+:class:`Record`), and every walk's schedule writes its steps through it.
 """
 
 import enum
@@ -70,7 +75,9 @@ from .spatial_laws import SPATIAL
 from .tree_plan import TreePlan
 
 __all__ = [
+    "FETCHED",
     "INERTIA",
+    "LOADED",
     "SCAN_PLAN",
     "TRANSFORM",
     "TWIST",
@@ -78,16 +85,21 @@ __all__ = [
     "Direction",
     "Group",
     "PlanAccess",
+    "Record",
     "ScanPlan",
     "ScanSource",
     "Schedule",
     "Storage",
     "add",
+    "braced",
     "choose_schedule",
+    "cross",
     "device_plan",
+    "edge",
     "scan_arrays",
     "schedule_costs",
     "schedule_features",
+    "statements",
     "tree_scan",
 ]
 
@@ -915,3 +927,85 @@ def tree_scan(
     serial = "{\n" + (_serial_down if direction is Direction.DOWN else _serial_up)(context) + "}\n" if cpu else ""
     preludes = combine.preludes()
     return ScanSource(cuda, serial, preludes, schedule)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The factor's walk: its arithmetic, written once
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Record:
+    """How a walk's schedule names a coordinate's record and a body's lever: the column ``s`` and the row ``ut`` (six
+    floats each), the inverse pivot ``1 / ell``, and the lever ``d``, the body's offset to its parent's frame."""
+
+    s: tuple[str, ...]
+    ut: tuple[str, ...]
+    inverse: str
+    lever: tuple[str, str, str]
+
+
+LOADED = Record(
+    s=tuple(f"d[{k}]" for k in range(6)),
+    ut=tuple(f"d[{6 + k}]" for k in range(6)),
+    inverse="d[12]",
+    lever=("l[0]", "l[1]", "l[2]"),
+)
+"""A record loaded into registers (``WALK_LOAD_RECORD``'s ``d``, a held word's) and a link's lever ``l``."""
+
+FETCHED = Record(
+    s=("$X.s.x", "$X.s.y", "$X.s.z", "$X.s.w", "$X.t.x", "$X.t.y"),
+    ut=("$X.t.z", "$X.t.w", "$X.w.x", "$X.w.y", "$X.w.z", "$X.w.w"),
+    inverse="$X.e",
+    lever=("$L.x", "$L.y", "$L.z"),
+)
+"""A record and a link the class emitter fetches ahead of the chain (``WalkIn`` as ``$X``, ``WALK_LINK_IN`` as ``$L``)."""
+
+_SKEW = ((1, 2), (2, 0), (0, 1))
+"""``(a x b)_k = a_i b_j - a_j b_i`` for ``(i, j) = _SKEW[k]``."""
+
+
+def cross(a, b, k: int) -> str:
+    """Component ``k`` of ``a x b``, two names of three each."""
+    i, j = _SKEW[k]
+    return f"{a[i]} * {b[j]} - {a[j]} * {b[i]}"
+
+
+def _channels(state: str, start: int = 0) -> tuple[str, str, str]:
+    return tuple(f"{state}[{start + k}]" for k in range(3))
+
+
+def edge(direction: Direction, lever, state: str, *, into: str | None = None) -> list[str]:
+    """The statements that pass a joint of lever ``d`` (``lever``, three names).
+
+    ``UP``: a wrench ``(f, t)`` passes to the parent's frame as ``(f, t - d x f)``: in place on ``state``, its force
+    read first, or added into the parent's ``into``. ``DOWN``: a twist ``(v, w)`` passes to the child's frame as
+    ``(v + d x w, w)``: in place on ``state``, or from the parent's ``state`` into the child's ``into``.
+    """
+    if direction is Direction.UP:
+        if into is None:
+            force = ("fx", "fy", "fz")
+            head = f"const float fx = {state}[0], fy = {state}[1], fz = {state}[2];"
+            return [head] + [f"{state}[{3 + k}] -= {cross(lever, force, k)};" for k in range(3)]
+        force = _channels(state)
+        return [f"{into}[{k}] += {state}[{k}];" for k in range(3)] + [
+            f"{into}[{3 + k}] += {state}[{3 + k}] - ({cross(lever, force, k)});" for k in range(3)
+        ]
+    if direction is Direction.DOWN:
+        turn = _channels(state, 3)
+        if into is None:
+            return [f"{state}[{k}] += {cross(lever, turn, k)};" for k in range(3)]
+        return [f"{into}[{k}] = {state}[{k}] + ({cross(lever, turn, k)});" for k in range(3)] + [
+            f"{into}[{3 + k}] = {state}[{3 + k}];" for k in range(3)
+        ]
+    raise ValueError(f"a joint's edge runs up or down, not {direction.value}")
+
+
+def statements(lines, pad: int = 0) -> str:
+    """Native statements one a line, every line after the first indented by ``pad`` (the first takes its slot's)."""
+    return ("\n" + " " * pad).join(lines)
+
+
+def braced(lines) -> str:
+    """Native statements in a block of their own, indented by four."""
+    return "{\n" + "\n".join("    " + line for line in lines) + "\n}"
