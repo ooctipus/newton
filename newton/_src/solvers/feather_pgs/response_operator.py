@@ -1327,7 +1327,7 @@ class LocalBlock(ResidualBlock):
             WALK_NOW,
             WALK_UNPACKED,
         )
-        from .tree_scan import WALK_STAGED  # noqa: PLC0415
+        from .tree_scan import WALK_BOTH, WALK_STAGED  # noqa: PLC0415
 
         P, S, L = self.primary, self.secondary, self.lanes.width
         lane = self.lanes.lane
@@ -1373,7 +1373,7 @@ class LocalBlock(ResidualBlock):
             now = (
                 [
                     "    float S[6];",
-                    f"    WALK_LOAD_COLUMN(S, walk.now.data + (size_t)d * {WALK_NOW});",
+                    f"    WALK_READ_COLUMN(WALK_LDG, S, walk.now.data + (size_t)d * {WALK_NOW}, {WALK_BOTH});",
                     f"    for (int k = 0; k < 6; ++k) s_walk[c * {C} + {WALK_STAGED} + k] = S[k];",
                 ]
                 if self.wrenches
@@ -1386,13 +1386,13 @@ class LocalBlock(ResidualBlock):
                 f"for (int c = {lane}; c < {self.dofs}; c += {L}) {{",
                 f"    const int d = {coordinate};",
                 f"    float r[{WALK_UNPACKED}];",
-                f"    WALK_LOAD_RECORD(r, walk.data.data + (size_t)d * {WALK_COORDINATE});",
+                f"    WALK_READ(WALK_LDG, r, walk.data.data + (size_t)d * {WALK_COORDINATE}, {WALK_BOTH});",
                 f"    for (int k = 0; k < {WALK_STAGED}; ++k) s_walk[c * {C} + k] = r[k];",
                 *now,
                 "}",
                 f"for (int b = {lane}; b < walk_bodies; b += {L}) {{",
                 "    float l[6];",
-                f"    WALK_LOAD_LINK(l, walk.link.data + (size_t)walk_j0 * {WALK_LINK}, b,",
+                f"    WALK_READ_LINK(WALK_LDG, l, walk.link.data + (size_t)walk_j0 * {WALK_LINK}, b,",
                 "                   reinterpret_cast<const int*>(walk.path.data + walk_j0)[2 * b]);",
                 f"    for (int k = 0; k < {K}; ++k) s_walk[{self.dofs * C} + b * {K} + k] = l[k];",
                 "}",
@@ -1426,7 +1426,7 @@ class LocalBlock(ResidualBlock):
                     lines += [
                         f"if ({lane} == 0) {{",
                         "    float l[6];",
-                        f"    WALK_LOAD_LINK(l, walk.link.data + (size_t)free_j0 * {WALK_LINK}, 0, -1);",
+                        f"    WALK_READ_LINK(WALK_LDG, l, walk.link.data + (size_t)free_j0 * {WALK_LINK}, 0, -1);",
                         f"    for (int k = 0; k < {K}; ++k) s_walk[{self.dofs * C + B * K} + k] = l[k];",
                         "}",
                         f"const float* free_now = free_data + {WALK_STAGED};",

@@ -74,7 +74,7 @@ from .tree_factor import (
     walk_prelude,
     walk_row_prelude,
 )
-from .tree_scan import held_fits
+from .tree_scan import held_fits, record_half
 
 __all__ = [
     "SUPPORT_UNIT_LANES",
@@ -1024,8 +1024,9 @@ def packed_walker(rows: int, spin: bool, side: bool, star: bool = False) -> wp.F
         # RD a plain load here, not the support writer's non-coherent __ldg: the K2 writer ran 1.4% faster on sm_120.
         rd="*p",
     )
-    tag = ("_spin" if spin else "") + ("" if side else "_one_half") + ("_star" if star else "")
-    snippet = dual_native(body, preludes=(walk_paths_prelude(rows, side=side), walk_row_prelude(rows)))
+    walk = walk_paths_prelude(rows, half=record_half(side))
+    tag = ("_spin" if spin else "") + walk.name.removeprefix(f"walk_paths_{rows}") + ("_star" if star else "")
+    snippet = dual_native(body, preludes=(walk, walk_row_prelude(rows)))
     return unit_walker(f"packed_walk_{rows}{tag}", snippet)
 
 

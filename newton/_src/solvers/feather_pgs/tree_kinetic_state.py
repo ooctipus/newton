@@ -1761,21 +1761,12 @@ _HELD_COLUMN = [
 added there only (no ``0 +`` after it: the sign of a zero footprint is the walk's own)."""
 
 
-def walk_loads_prelude(side: bool = True) -> DevicePrelude:
-    """The walk's record and link loads and its step's pin (:func:`.tree_factor._walk_loads_text`), for both devices:
-    all the border reads of the walk (:data:`_HELD`). ``side``: the model's :attr:`.tree_factor.TreeFactor.walk_side`
-    (without one, the records are read with no side load, :func:`record_load`)."""
+def walk_loads_prelude() -> DevicePrelude:
+    """The walk's one access and its step's pin (:func:`.tree_factor._walk_loads_text`), for both devices: all the
+    border reads of the walk (:data:`_HELD`)."""
     from .tree_factor import _walk_loads_text  # noqa: PLC0415
 
-    return DevicePrelude(
-        "walk_loads" if side else "walk_loads_one_half", _walk_loads_text(True, side), cpu=_walk_loads_text(False, side)
-    )
-
-
-def record_load(side: bool) -> str:
-    """The record's load where records can have a side (:attr:`.tree_factor.TreeFactor.walk_side`), or none: without,
-    no side load (the predictor's register line, offline sm_120 on g1: 20 fewer local stores)."""
-    return "WALK_LOAD_RECORD" if side else "WALK_LOAD_ONE_HALF"
+    return DevicePrelude("walk_loads", _walk_loads_text(True), cpu=_walk_loads_text(False))
 
 
 _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step on its all-K walk, with no factor array. The release
@@ -1840,7 +1831,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
             const int x = lane + k * WIDTH;
             if (x < n) {
                 float d[$unpacked];
-                $record(d, data + $coordinate * x);
+                WALK_READ(WALK_LDG, d, data + $coordinate * x, $half);
                 #pragma unroll
                 for (int m = 0; m < 13; ++m) h.r[k][m] = d[m];
             } else {
@@ -1856,7 +1847,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
                 h.first[k] = path[2 * x + 1];
 #endif
                 float l[6];
-                WALK_LOAD_LINK(l, link, x, h.parent[k]);
+                WALK_READ_LINK(WALK_LDG, l, link, x, h.parent[k]);
                 h.l[k][0] = l[0];
                 h.l[k][1] = l[1];
                 h.l[k][2] = l[2];
@@ -2217,10 +2208,11 @@ def border_solve(layout: TreeLayout, classes: tuple) -> str:
     return substitute(text, {**layout.sizes(), "WALK_COORDINATE": WALK_COORDINATE, "WALK_LINK": WALK_LINK})
 
 
-def held_lambdas(layout: TreeLayout, slips: int, side: bool = True) -> str:
+def held_lambdas(layout: TreeLayout, slips: int, half: int = ts.WALK_BOTH) -> str:
     """The border's native lambdas (:data:`_HELD`), both devices, declared once ahead of the trial: the segment's words
     a lane hold the layout's coordinates and bodies (and one past the last body). ``slips`` is the class's slip capacity
-    (:meth:`.tree_factor.TreeFactor.slip_capacity`): the build's slips, a lane and slot each."""
+    (:meth:`.tree_factor.TreeFactor.slip_capacity`): the build's slips, a lane and slot each. ``half``: the records'
+    half as the border reads any tree's (``WALK_READ``, :func:`.tree_scan.record_half`)."""
     from .tree_factor import WALK_COORDINATE, WALK_UNPACKED  # noqa: PLC0415
 
     return substitute(
@@ -2229,7 +2221,7 @@ def held_lambdas(layout: TreeLayout, slips: int, side: bool = True) -> str:
         slips=max(1, slips),
         coordinate=WALK_COORDINATE,
         unpacked=WALK_UNPACKED,
-        record=record_load(side),
+        half=half,
         held_step=ts.statements([*_HELD_COLUMN, "root = c;"], 24),
         apply_r=ts.statements(ts.slip("R", "u[c]", "r", "b[t]", "ar[t]", "g[t]", "u[c] = {};"), 20),
         apply_rt=ts.statements(ts.slip("RT", "u[c]", "r", "b[t]", "ar[t]", "g[t]", "u[c] = {};"), 20),
@@ -2378,7 +2370,7 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
         end="twist($b, $V);",
         **sizes,
     )
-    hand = "WalkIn{$X.s, $X.t, $X.w, $X.e, u[$c], 0.0f}"
+    hand = "WALK_HAND($X, u[$c], 0.0f)"
     walked = {r: k for r, _, k in _walked(layout, classes)}
     cases = []
     for r, offset, _family in _walk_roots(layout):
@@ -2460,8 +2452,8 @@ def get_predictor_kernel(
         classes,
         "moved",
         _RESPONSE_HALF,
-        (walk_loads_prelude(side),),
-        TRIAL=held_lambdas(layout, slips, side)
+        (walk_loads_prelude(),),
+        TRIAL=held_lambdas(layout, slips, ts.record_half(side))
         + stage("float value=s[$WHITE+col];", clocks["CLOCK2"] + clocks["CLOCK3"], QUIET_DRIVE),
         SATURATE=substitute(SATURATE_DRIVES, layout.sizes(), ROOT=_root(layout)),
         BORDER=border_solve(layout, classes),

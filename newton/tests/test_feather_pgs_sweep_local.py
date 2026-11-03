@@ -248,7 +248,7 @@ class TestResponseOperators(unittest.TestCase):
         # The packets' seeds walked in the kernel (FL3.6) on the world's staged walk: the tree's and the paired free
         # body's (a one-body tree), the release of the tree's slips along their paths, then |z|^2 in coordinate order.
         prologue = block.prologue()
-        self.assertIn("WALK_LOAD_RECORD(r, walk.data.data + (size_t)d * ", prologue)
+        self.assertIn("WALK_READ(WALK_LDG, r, walk.data.data + (size_t)d * ", prologue)
         self.assertIn("const auto walk_free = [&]() { WALK_TREE(free_path, 1, 6); };", prologue)
         self.assertNotIn("walk.data.data + (size_t)walk_d0", prologue)
         respond = block.respond(packets, "")

@@ -87,6 +87,7 @@ __all__ = [
     "WALK_AHEAD",
     "WALK_ANGULAR",
     "WALK_BOTH",
+    "WALK_EITHER",
     "WALK_LINEAR",
     "WALK_REGISTERS",
     "WALK_STAGED",
@@ -116,6 +117,7 @@ __all__ = [
     "indent_text",
     "inward_edge",
     "inward_step",
+    "record_half",
     "root_path",
     "scan_arrays",
     "schedule_costs",
@@ -971,22 +973,25 @@ class Record:
     """``s`` and ``ut`` at a loop's index ``{k}``, for a record a loop reads (a state's update is then that loop)."""
 
 
-LOADED = Record(
-    s=tuple(f"d[{k}]" for k in range(6)),
-    ut=tuple(f"d[{6 + k}]" for k in range(6)),
-    inverse="d[12]",
-    lever=("l[0]", "l[1]", "l[2]"),
-    indexed=("d[{k}]", "d[6 + {k}]"),
-)
-"""A record loaded into registers (``WALK_LOAD_RECORD``'s ``d``, a held word's) and a link's lever ``l``."""
+def _unpacked(record: str, link: str, indexed: bool) -> Record:
+    """The one record vocabulary: a record unpacked as the walk's one access reads it (``WALK_READ``'s floats ``s``
+    0..5, ``ut`` 6..11, ``1 / ell`` 12) under the name ``record``, and a link's lever (``WALK_READ_LINK``'s offset) under
+    ``link``; ``indexed`` where a loop reads it."""
+    return Record(
+        s=tuple(f"{record}[{k}]" for k in range(6)),
+        ut=tuple(f"{record}[{6 + k}]" for k in range(6)),
+        inverse=f"{record}[12]",
+        lever=(f"{link}[0]", f"{link}[1]", f"{link}[2]"),
+        indexed=(f"{record}[{{k}}]", f"{record}[6 + {{k}}]") if indexed else None,
+    )
 
-FETCHED = Record(
-    s=("$X.s.x", "$X.s.y", "$X.s.z", "$X.s.w", "$X.t.x", "$X.t.y"),
-    ut=("$X.t.z", "$X.t.w", "$X.w.x", "$X.w.y", "$X.w.z", "$X.w.w"),
-    inverse="$X.e",
-    lever=("$L.x", "$L.y", "$L.z"),
-)
-"""A record and a link the class emitter fetches ahead of the chain (``WalkIn`` as ``$X``, ``WALK_LINK_IN`` as ``$L``)."""
+
+LOADED = _unpacked("d", "l", indexed=True)
+"""A record read into registers (``WALK_READ``'s ``d``, a held word's) and a link's lever ``l``."""
+
+FETCHED = _unpacked("$X.d", "$L.l", indexed=False)
+"""A record and a link the class emitter fetches ahead of the chain (``WalkIn`` as ``$X``, ``WalkLinkIn`` as ``$L``): the
+same names, its update written as six statements."""
 
 _SKEW = ((1, 2), (2, 0), (0, 1))
 """``(a x b)_k = a_i b_j - a_j b_i`` for ``(i, j) = _SKEW[k]``."""
@@ -1241,8 +1246,16 @@ WALK_STAGED = 13
 """The floats of a coordinate's record the walk's functions read (``s``, ``ut``, ``1 / ell``), unpacked
 (:data:`.tree_factor._WALK_LOADS`): what a kernel stages of a record in shared memory (:class:`.response_operator.LocalBlock`)."""
 
-WALK_LINEAR, WALK_ANGULAR, WALK_BOTH = 0, 1, 2
-"""A column's half at its body's frame: the linear one, the angular one, or both (the linear in the record's side)."""
+WALK_LINEAR, WALK_ANGULAR, WALK_BOTH, WALK_EITHER = 0, 1, 2, 3
+"""A column's half at its body's frame as a reader of its record knows it (``WALK_READ``'s ``half``): the linear one,
+the angular one (a class's data, compiled), or named by the record, with the side of a column of both halves
+(``WALK_BOTH``, the linear in the record's side) or in a model without one (``WALK_EITHER``)."""
+
+
+def record_half(side: bool) -> int:
+    """The half a reader of any tree's records passes the one access: named by the record, with the side where a
+    column can have two halves (``side``, :attr:`.tree_factor.TreeFactor.walk_side`)."""
+    return WALK_BOTH if side else WALK_EITHER
 
 
 # ---------------------------------------------------------------------------------------------------------------------
