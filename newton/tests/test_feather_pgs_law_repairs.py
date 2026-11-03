@@ -1139,7 +1139,9 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
         model.joint_limit_lower.fill_(-1.0e3)
         model.joint_limit_upper.fill_(1.0e3)
         solver = branch.recipe_solver(model, scalar=False, angular_damping=0.0, update_mass_matrix_interval=2)
-        self.assertTrue(any(getattr(group.sparse, "diagonal", False) for group in solver.factor.held.groups))
+        self.assertTrue(
+            any(getattr(group.sparse, "response", None) == "diagonal" for group in solver.factor.held.groups)
+        )
         control = model.control()
         state, out = model.state(), model.state()
         state.joint_q.zero_()

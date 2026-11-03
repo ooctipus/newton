@@ -4,14 +4,13 @@
 """The held-tree owner: the evaluator of articulated dynamics, its groups chosen from the topology.
 
 One owner (:class:`HeldTree`) composes the groups that evaluate every articulation
-(:class:`~.tree_kinetic_owner.TreeKineticState`, plus the scalar branches' group). The solver's data chooses them:
-the sparse class, when the solver admitted one, makes one complete group that walks its pattern
-(:class:`SparseHeldOperator`);
-otherwise each size group is a group that responds by its walk or by the compact diagonal
-(:class:`TreeHeldOperator`), kinematic free bodies a zero-response group (:class:`PrescribedRootOperator`), or one
-group per world spans its articulations (:class:`ForestHeldOperator`). Every group's collection writes its drives' K-free
-mass (``row_H``) where it forms the mass diagonal; the compact diagonal's refresh forms its inverse mass.
-:func:`decline` names why a representation does not fit; :func:`install` returns the owner.
+(:class:`~.tree_kinetic_owner.TreeKineticState`, plus the scalar branches' group), each over one :class:`HeldGroup`
+whose kind the solver's data chooses: the sparse class, when the solver admitted one, makes one complete group that
+walks its pattern (``"sparse"``); otherwise each size group is a group that responds by its walk or by the compact
+diagonal (``"tree"``), kinematic free bodies a zero-response group (``"prescribed"``), articulations without
+coordinates a group of none (``"rest"``), or one group per world spans its articulations (``"forest"``). Every group's
+collection writes its drives' K-free mass (``row_H``) where it forms the mass diagonal; the compact diagonal's refresh
+forms its inverse mass. :func:`decline` names why a representation does not fit; :func:`install` returns the owner.
 """
 
 import itertools
@@ -23,7 +22,7 @@ import warp as wp
 from . import field_group, host_index
 from .device_proof import DeviceProof
 from .tree_kinetic_owner import TreeKineticState, launch_switches, proof_runs, stage_clocks_on
-from .tree_kinetic_plan import FREE_JOINTS, make_plan, tree_joints
+from .tree_kinetic_plan import make_plan, tree_joints
 from .tree_kinetic_state import GroupTrees, HeldResponse
 from .tree_plan import TreePlan, local_parents
 
@@ -126,7 +125,7 @@ def _prescribed_articulations(solver):
 
 def _coverage(solver, compact):
     """Prove disjoint articulation and physical coordinate ownership; ``compact`` is the compact diagonal size the
-    groups carry. An articulation no size group holds has no coordinates (:class:`RestOperator`), and a body outside
+    groups carry. An articulation no size group holds has no coordinates (a ``"rest"`` group), and a body outside
     the articulations stays outside the solver."""
     model = solver.model
     prescribed = _prescribed_articulations(solver)
@@ -162,11 +161,25 @@ def _coverage(solver, compact):
     )
 
 
-def _plan_view(group_to_art, art_to_world, host, *, prescribed=False):
-    """What :func:`.make_plan` reads of a group's operator: its articulations, their worlds and its metadata."""
-    return SimpleNamespace(
-        plan=SimpleNamespace(group_to_art=group_to_art, art_to_world=art_to_world), host=host, prescribed=prescribed
-    )
+def _template(solver, first_art, last_art=None, *, coordinates=True):
+    """The mass pattern of the trees of articulations ``first_art`` through ``last_art`` (one tree by default; a
+    world's forest in local order), from their local parents and each joint's coordinates (none without
+    ``coordinates``)."""
+    model = solver.model
+    first = int(model.articulation_start.numpy()[first_art])
+    end = int(solver.forest.articulation_joint_end_host[first_art if last_art is None else last_art])
+    parents = local_parents(model.joint_ancestor.numpy(), [first], end - first)[0]
+    counts = np.diff(model.joint_qd_start.numpy())[first:end] if coordinates else np.zeros(end - first, np.int32)
+    return TreePlan.build(parents, counts).factor
+
+
+def _fit(solver, group_to_art, mass, *, prescribed=False, complete=False):
+    """The metadata (:func:`operator_metadata`) of a held group of the trees ``group_to_art`` on the pattern
+    ``mass``, once its layout fits (:func:`.make_plan`; raises ValueError where it does not)."""
+    host = operator_metadata(mass)
+    plan = SimpleNamespace(group_to_art=group_to_art, art_to_world=solver.forest.art_to_world)
+    make_plan(solver.model, SimpleNamespace(plan=plan, host=host, prescribed=prescribed), complete=complete)
+    return host
 
 
 def _topologies(solver, size) -> list:
@@ -175,38 +188,22 @@ def _topologies(solver, size) -> list:
     return [(int(first), int(last)) for first, last in itertools.pairwise(bounds)]
 
 
-def _size_group(solver, size, span, *, diagonal):
-    """The range ``span`` of size group ``size`` (:func:`_topologies`) as a held group: whether its trees stand on
-    free roots, their mass pattern, its metadata and its layout (:func:`.make_plan`). Raises ValueError where the
-    trees do not fit a held group."""
-    model = solver.model
+def _size_trees(solver, size, span, *, diagonal):
+    """The range ``span`` of size group ``size`` (:func:`_topologies`): its articulations, mass pattern and metadata.
+    Raises ValueError where the trees do not fit a held group."""
     group_to_art = solver.forest.group_to_art[size][span[0] : span[1]]
-    first_art = int(group_to_art.numpy()[0])
-    first, end = model.articulation_start.numpy()[first_art], solver.forest.articulation_joint_end_host[first_art]
-    parents = local_parents(model.joint_ancestor.numpy(), [first], end - first)[0]
-    counts = np.diff(model.joint_qd_start.numpy())[first:end]
-    root_type = model.joint_type.numpy()[first]
-    # A free rigid body is a one-body tree on a free root: its six coordinates
-    # share the held Cholesky action and the generic free-root transport. Any
-    # other root's coordinates (none, or a joint's) are a descendant's.
-    free_root = counts[0] == 6 and root_type in FREE_JOINTS
-    mass = TreePlan.build(parents, counts).factor
+    mass = _template(solver, int(group_to_art.numpy()[0]))
     if mass.dof_count != size:
         raise ValueError("Mixed tree physical and factor dimensions differ")
     if diagonal and mass.nonzero_count != size:
         raise ValueError("Compact diagonal cache requires independent physical coordinates")
-    host = operator_metadata(mass)
-    layout, _ = make_plan(model, _plan_view(group_to_art, solver.forest.art_to_world, host), complete=False)
-    return bool(free_root), mass, host, layout
+    return group_to_art, _fit(solver, group_to_art, mass)
 
 
-def _prescribed_group(solver, group_to_art):
-    """The prescribed free bodies as a held group: their mass pattern, metadata and layout (:func:`.make_plan`)."""
-    mass = TreePlan.build([-1], [6]).factor
-    host = operator_metadata(mass)
-    view = _plan_view(group_to_art, solver.forest.art_to_world, host, prescribed=True)
-    layout, _ = make_plan(solver.model, view, complete=False)
-    return mass, host, layout
+def _prescribed_trees(solver):
+    """The prescribed free bodies: their articulations and the metadata of their one-body six-coordinate pattern."""
+    group_to_art = wp.array(_prescribed_articulations(solver), dtype=int, device=solver.model.device)
+    return group_to_art, _fit(solver, group_to_art, TreePlan.build([-1], [6]).factor, prescribed=True)
 
 
 def sparse_decline(solver, size, plan, *, velocity_limits) -> str | None:
@@ -218,9 +215,8 @@ def sparse_decline(solver, size, plan, *, velocity_limits) -> str | None:
     reason = decline(solver, sparse=velocity_limits)
     if reason is not None:
         return reason
-    view = _plan_view(solver.forest.group_to_art[size], solver.forest.art_to_world, operator_metadata(plan))
     try:
-        make_plan(solver.model, view, complete=True)
+        _fit(solver, solver.forest.group_to_art[size], plan, complete=True)
     except ValueError as error:
         return f"The topology does not fit the held groups: {error}"
     return None
@@ -241,95 +237,108 @@ def compact_decline(solver, size, *, scalar) -> str | None:
         for group_size in solver.forest.size_groups:
             if group_size != size or not scalar:
                 for span in _topologies(solver, group_size):
-                    _size_group(solver, group_size, span, diagonal=group_size == size)
-        prescribed = _prescribed_articulations(solver)
-        if prescribed.size:
-            _prescribed_group(solver, wp.array(prescribed, dtype=int, device=solver.model.device))
+                    _size_trees(solver, group_size, span, diagonal=group_size == size)
+        if _prescribed_articulations(solver).size:
+            _prescribed_trees(solver)
     except ValueError as error:
         return f"The topology does not fit the held groups: {error}"
     return None
 
 
-class SparseHeldOperator:
-    """The sparse class's trees as one complete held group: it responds through the walk over the class's pattern
-    (:attr:`.tree_factor.TreeFactor.sparse_pattern`), refreshed by :meth:`.tree_factor.TreeFactor.walk_step`, and holds
-    and refreshes nothing of its own."""
+class HeldGroup:
+    """One held group: the trees ``group_to_art`` (for a forest, each world's first; ``forest_arts`` holds them all)
+    on one pattern, whose metadata is ``host`` (:func:`operator_metadata`), with their response's status.
 
-    def __init__(self, solver):
-        self.solver = solver
-        self.requires_body_velocity = True
-        mass = solver.factor.sparse_pattern
-        device = solver.model.device
-        self.host = operator_metadata(mass)
-        self.plan = bind_group_trees(solver, self.host, solver.forest.group_to_art[mass.dof_count])
+    ``kind`` names what the solver's data chose (the builders below): ``"sparse"``, ``"tree"``, ``"prescribed"``,
+    ``"rest"`` or ``"forest"``. Every group responds through the walk, whose refresh is the factor's, or with zero; its
+    collection writes the drives' K-free mass (``row_H``) where it forms ``H_ii``. Its own refresh forms only the
+    inverse mass of its compact diagonal ``families``, each ``(size, offset, group_to_art, geometry_group)``: the
+    articulations of one diagonal size and, per articulation, the group whose collection keeps its ``H_ii`` from
+    coordinate ``offset``.
+    """
+
+    requires_body_velocity = True
+
+    def __init__(
+        self,
+        solver,
+        kind,
+        group_to_art,
+        host,
+        *,
+        size,
+        response="cholesky",
+        families=(),
+        forest_arts=None,
+        root_families=(),
+    ):
+        self.solver, self.kind, self.size, self.host, self.response = solver, kind, size, host, response
+        self.prescribed = kind == "prescribed"
+        self.families = families
+        # The compact diagonal's refresh reads H's diagonal, which the collection keeps.
+        self.diagonal_mass = bool(families)
+        self.forest_arts, self.root_families = forest_arts, root_families
+        self.plan = bind_group_trees(solver, host, group_to_art)
+        count = self.plan.group_to_art.size
         self.data = HeldResponse()
         # The walk has no factor status: a pivot that is not positive reaches the predictor as a non-finite response.
-        self.data.valid = wp.ones(self.plan.group_to_art.size, dtype=int, device=device)
-        self.data.status = wp.zeros(self.plan.group_to_art.size, dtype=int, device=device)
-        self.diagonal_mass = False
+        self.data.valid = wp.ones(count, dtype=int, device=solver.model.device)
+        self.data.status = wp.zeros(count, dtype=int, device=solver.model.device)
         self.kinetic_state = None
 
     def refresh(self, state_aug):
-        """Nothing to refresh: the walk's refresh is the factor's, and the drives' K-free mass (``row_H``) is the
-        finish's collection's, where it forms ``H_ii``."""
-
-    def bind_response(self):
-        """Nothing to bind: the predictor reads the walk."""
-
-
-class TreeHeldOperator:
-    """The range ``span`` of a size group as a held group: the trees of one topology. A walking group refreshes nothing of its own (the walk's refresh is its factor, its collection
-    writes ``row_H``); the compact diagonal refreshes its inverse mass from the held geometry."""
-
-    def __init__(self, solver, size, span):
-        self.solver, self.size, self.span = solver, size, span
-        self.requires_body_velocity = True
-        device = solver.model.device
-        count = span[1] - span[0]
-        self.diagonal = size == solver._compact_diagonal_mass_size
-        # The compact diagonal's refresh reads H's diagonal, which the collection keeps.
-        self.diagonal_mass = self.diagonal
-        self.free_root, mass, self.host, self.layout = _size_group(solver, size, span, diagonal=self.diagonal)
-        self.mass = mass
-        self.plan = bind_group_trees(solver, self.host, solver.forest.group_to_art[size][span[0] : span[1]])
-        self.data = HeldResponse()
-        self.data.valid = wp.ones(count, dtype=int, device=device)
-        self.data.status = wp.zeros(count, dtype=int, device=device)
-        if self.diagonal:
-            self.geometry_group = wp.array(np.arange(count, dtype=np.int32), dtype=int, device=device)
-        self.kinetic_state = None
-
-    def refresh(self, state_aug):
-        """The compact diagonal's inverse mass from the requested groups' current geometry; a walking group has nothing
-        to refresh."""
-        if not self.diagonal:
-            return
-        solver, size = self.solver, self.size
-        count = self.span[1] - self.span[0]
-        wp.launch(
-            _diagonal_geometry,
-            dim=count * size,
-            inputs=[
-                self.plan.group_to_art,
-                solver.forest.articulation_dof_start,
-                solver.factor.mass_update_mask,
-                0,
-                self.geometry_group,
-                self.kinetic_state.mass_diagonal,
-                solver.factor.dof_armature,
-                solver.factor.drive_row_by_dof,
-                solver.factor.aug_row_K,
-                size,
-            ],
-            outputs=[solver.factor.diagonal_inverse_mass],
-            device=solver.model.device,
-        )
-
-    def bind_response(self):
-        """Nothing to bind: the predictor reads the walk, the compact diagonal's inverse is the solver's."""
+        """Each compact diagonal family's inverse mass from its groups' current geometry."""
+        solver = self.solver
+        for size, offset, group_to_art, geometry_group in self.families:
+            wp.launch(
+                _diagonal_geometry,
+                dim=group_to_art.size * size,
+                inputs=[
+                    group_to_art,
+                    solver.forest.articulation_dof_start,
+                    solver.factor.mass_update_mask,
+                    offset,
+                    geometry_group,
+                    self.kinetic_state.mass_diagonal,
+                    solver.factor.dof_armature,
+                    solver.factor.drive_row_by_dof,
+                    solver.factor.aug_row_K,
+                    size,
+                ],
+                outputs=[solver.factor.diagonal_inverse_mass],
+                device=solver.model.device,
+            )
 
 
-class PrescribedRootOperator:
+def sparse_group(solver) -> HeldGroup:
+    """The sparse class's trees as one complete group: it responds through the walk over the class's pattern
+    (:attr:`.tree_factor.TreeFactor.sparse_pattern`), refreshed by :meth:`.tree_factor.TreeFactor.walk_step`."""
+    mass = solver.factor.sparse_pattern
+    trees = solver.forest.group_to_art[mass.dof_count]
+    return HeldGroup(solver, "sparse", trees, operator_metadata(mass), size=None, response="sparse")
+
+
+def _tree_group(solver, size, span) -> HeldGroup:
+    """The range ``span`` of a size group as a held group: the trees of one topology. A walking group refreshes
+    nothing of its own; the compact diagonal refreshes its inverse mass from the held geometry."""
+    diagonal = size == solver._compact_diagonal_mass_size
+    group_to_art, host = _size_trees(solver, size, span, diagonal=diagonal)
+    if not diagonal:
+        return HeldGroup(solver, "tree", group_to_art, host, size=size)
+    count = span[1] - span[0]
+    geometry = wp.array(np.arange(count, dtype=np.int32), dtype=int, device=solver.model.device)
+    return HeldGroup(
+        solver,
+        "tree",
+        group_to_art,
+        host,
+        size=size,
+        response="diagonal",
+        families=((size, 0, group_to_art, geometry),),
+    )
+
+
+def _prescribed_group(solver) -> HeldGroup:
     """Own prescribed free bodies as zero-response roots of the same tree law.
 
     A kinematic free body has six prescribed coordinates and no factor. With no
@@ -339,68 +348,20 @@ class PrescribedRootOperator:
     publishes the body exactly as it does for a dynamic free body. This is
     the generic form of a per-world free-root slot.
     """
-
-    prescribed = True
-
-    def __init__(self, solver):
-        self.solver, self.size = solver, 6
-        self.requires_body_velocity = True
-        device = solver.model.device
-        arts = _prescribed_articulations(solver)
-        if not arts.size:
-            raise ValueError("No prescribed articulations to own")
-        self.free_root = True
-        self.diagonal = True
-        self.diagonal_mass = False
-        self.group_to_art = wp.array(arts, dtype=int, device=device)
-        self.mass, self.host, self.layout = _prescribed_group(solver, self.group_to_art)
-        self.plan = bind_group_trees(solver, self.host, self.group_to_art)
-        self.data = HeldResponse()
-        self.data.valid = wp.ones(len(arts), dtype=int, device=device)
-        self.data.status = wp.zeros(len(arts), dtype=int, device=device)
-        self.kinetic_state = None
-
-    def refresh(self, state_aug):
-        """Prescribed roots hold no factor; nothing to refresh."""
-
-    def bind_response(self):
-        """The zero inverse is owned here and never rebinds."""
+    group_to_art, host = _prescribed_trees(solver)
+    return HeldGroup(solver, "prescribed", group_to_art, host, size=6, response="diagonal")
 
 
-class RestOperator:
+def _rest_group(solver, span) -> HeldGroup:
     """Own the trees of the range ``span`` of the articulations without coordinates: a held group of none.
 
     Nothing responds, so there is no factor and every stage's loop over coordinates runs no time: the group holds
     the poses its joint frames give, as the tree law writes them.
     """
-
-    def __init__(self, solver, span):
-        self.solver, self.size = solver, 0
-        self.requires_body_velocity = True
-        model, device = solver.model, solver.model.device
-        arts = solver.forest.rest_articulations[span[0] : span[1]]
-        self.free_root = False
-        self.diagonal = True
-        self.diagonal_mass = False
-        self.group_to_art = wp.array(arts, dtype=int, device=device)
-        first, end = model.articulation_start.numpy()[arts[0]], solver.forest.articulation_joint_end_host[arts[0]]
-        parents = local_parents(model.joint_ancestor.numpy(), [first], end - first)[0]
-        self.mass = TreePlan.build(parents, np.zeros(end - first, np.int32)).factor
-        self.host = operator_metadata(self.mass)
-        self.layout, _ = make_plan(
-            model, _plan_view(self.group_to_art, solver.forest.art_to_world, self.host), complete=False
-        )
-        self.plan = bind_group_trees(solver, self.host, self.group_to_art)
-        self.data = HeldResponse()
-        self.data.valid = wp.ones(len(arts), dtype=int, device=device)
-        self.data.status = wp.zeros(len(arts), dtype=int, device=device)
-        self.kinetic_state = None
-
-    def refresh(self, state_aug):
-        """No coordinate, no factor."""
-
-    def bind_response(self):
-        """Nothing rebinds."""
+    arts = solver.forest.rest_articulations[span[0] : span[1]]
+    group_to_art = wp.array(arts, dtype=int, device=solver.model.device)
+    host = _fit(solver, group_to_art, _template(solver, arts[0], coordinates=False))
+    return HeldGroup(solver, "rest", group_to_art, host, size=0, response="diagonal")
 
 
 def forest_supported(solver):
@@ -466,90 +427,52 @@ def forest_families(solver):
     return families
 
 
-class ForestHeldOperator:
+def _forest_group(solver) -> HeldGroup:
     """Own every articulation of a world as one group: shared scratch, one launch per phase.
 
     Each root responds by its walk, by the compact diagonal (refreshed from
     the forest's geometry) or with zero when prescribed. Roots, families and
     offsets come from the topology.
     """
-
-    def __init__(self, solver):
-        self.solver = solver
-        self.requires_body_velocity = True
-        self.free_root = True
-        self.diagonal = False
-        model, device = solver.model, solver.model.device
-        worlds = int(solver.forest.world_count)
-        art_world = solver.forest.art_to_world.numpy()
-        prescribed = solver.forest.prescribed_articulation.numpy()
-        counts = solver.forest.articulation_dof_count_host
-        # Each world's articulations in ascending order, one row per world (forest_families admits equal counts).
-        world_bounds, order = host_index.group_by(art_world, worlds)
-        arts = order.reshape(worlds, int(world_bounds[1] - world_bounds[0])).astype(np.int32)
-        self.forest_arts = arts
-        # Family per root: its coordinate count for a walking root, negated
-        # for a diagonal-mass size (compact inverse), 0 when prescribed.
-        diagonal = solver._compact_diagonal_mass_size
-        self.root_families = tuple(
-            0 if prescribed[a] else (-int(counts[a]) if counts[a] == diagonal else int(counts[a])) for a in arts[0]
+    device = solver.model.device
+    worlds = int(solver.forest.world_count)
+    art_world = solver.forest.art_to_world.numpy()
+    prescribed = solver.forest.prescribed_articulation.numpy()
+    counts = solver.forest.articulation_dof_count_host
+    # Each world's articulations in ascending order, one row per world (forest_families admits equal counts).
+    world_bounds, order = host_index.group_by(art_world, worlds)
+    arts = order.reshape(worlds, int(world_bounds[1] - world_bounds[0])).astype(np.int32)
+    # Family per root: its coordinate count for a walking root, negated
+    # for a diagonal-mass size (compact inverse), 0 when prescribed.
+    diagonal = solver._compact_diagonal_mass_size
+    roots = tuple(
+        0 if prescribed[a] else (-int(counts[a]) if counts[a] == diagonal else int(counts[a])) for a in arts[0]
+    )
+    mass = _template(solver, arts[0, 0], arts[0, -1])
+    # Each diagonal-mass root's refresh reads its coordinates' H_ii from the forest's collection, from the root's
+    # offset (the coordinates of the world's trees before it).
+    offsets = np.concatenate(([0], np.cumsum(counts[arts[0]])))
+    families = tuple(
+        (
+            -family,
+            int(offsets[r]),
+            solver.forest.group_to_art[-family],
+            wp.array(art_world[solver.forest.group_to_art[-family].numpy()].astype(np.int32), dtype=int, device=device),
         )
-        first = int(model.articulation_start.numpy()[arts[0, 0]])
-        end = int(solver.forest.articulation_joint_end_host[arts[0, -1]])
-        parents = local_parents(model.joint_ancestor.numpy(), [first], end - first)[0]
-        joint_counts = np.diff(model.joint_qd_start.numpy())[first:end]
-        self.mass = mass = TreePlan.build(parents, joint_counts).factor
-        self.host = operator_metadata(mass)
-        self.group_to_art = wp.array(arts[:, 0].copy(), dtype=int, device=device)
-        self.plan = bind_group_trees(solver, self.host, self.group_to_art)
-        self.size = mass.dof_count
-        self.layout, _ = make_plan(model, self, complete=False)
-        self.data = HeldResponse()
-        self.data.valid = wp.ones(worlds, dtype=int, device=device)
-        self.data.status = wp.zeros(worlds, dtype=int, device=device)
-        # Each diagonal-mass root's refresh reads its coordinates' H_ii from the forest's collection (from the root's
-        # offset); a walking root refreshes nothing of its own.
-        self.diagonal_mass = any(f < 0 for f in self.root_families)
-        self.families = []
-        for r, family in enumerate(self.root_families):
-            if family >= 0:
-                continue
-            size = -family
-            group = solver.forest.group_to_art[size].numpy()
-            self.families.append(
-                (
-                    size,
-                    int(self.layout.root_offsets[r]),
-                    wp.array(art_world[group].astype(np.int32), dtype=int, device=device),
-                )
-            )
-        self.kinetic_state = None
-
-    def refresh(self, state_aug):
-        """Refresh every diagonal-mass root's inverse mass from the forest geometry."""
-        solver = self.solver
-        for size, offset, geometry_group in self.families:
-            wp.launch(
-                _diagonal_geometry,
-                dim=solver.forest.n_arts_by_size[size] * size,
-                inputs=[
-                    solver.forest.group_to_art[size],
-                    solver.forest.articulation_dof_start,
-                    solver.factor.mass_update_mask,
-                    offset,
-                    geometry_group,
-                    self.kinetic_state.mass_diagonal,
-                    solver.factor.dof_armature,
-                    solver.factor.drive_row_by_dof,
-                    solver.factor.aug_row_K,
-                    size,
-                ],
-                outputs=[solver.factor.diagonal_inverse_mass],
-                device=solver.model.device,
-            )
-
-    def bind_response(self):
-        """Nothing rebinds: the walking roots read the walk, the diagonal roots the solver's inverse."""
+        for r, family in enumerate(roots)
+        if family < 0
+    )
+    group_to_art = wp.array(arts[:, 0].copy(), dtype=int, device=device)
+    return HeldGroup(
+        solver,
+        "forest",
+        group_to_art,
+        operator_metadata(mass),
+        size=mass.dof_count,
+        families=families,
+        forest_arts=arts,
+        root_families=roots,
+    )
 
 
 class HeldTree:
@@ -572,65 +495,26 @@ class HeldTree:
             return
         if solver.placement.sparse_mass_matrix_size is not None:
             # The sparse class: one complete group, which proves its own coverage (make_plan).
-            self.coverage = self.forest_reason = None
-            operator = SparseHeldOperator(solver)
-            group = TreeKineticState(
-                operator,
-                admission=admission,
-                clocked=self.clocked,
-                skip=skip,
-                classify=classify,
-            )
-            operator.kinetic_state = group
-            self.groups = [group]
-            self.bank_compare = group.bank_compare
-            self.skip_captured_repairs = group.skip_captured_repairs
-            return
-        self.coverage = _coverage(solver, solver._compact_diagonal_mass_size)
-        self._dimensions = (solver.model.joint_count, solver.model.body_count, solver.model.articulation_count)
-        # The coverage proof's inputs, compared on the device on notification.
-        self._proof = DeviceProof(list(self._coverage_arrays()), solver.model.device)
-        # A size group of scalar branches (scalar_branches.py) is owned in place
-        # of a tree group: one thread per coordinate, no tree plan.
-        scalar = getattr(solver, "_scalar_branches", None)
-        override = solver._route_pins.get("grouping")
-        forest = override == "forest" if override is not None else forest_default(solver)
-        if forest and forest_supported(solver):
-            operators = [ForestHeldOperator(solver)]
-            self.forest_reason = (
-                "A test pin selects one group per world (grouping='forest')."
-                if override is not None
-                else "Default: a prescribed root and no diagonal-mass family make one group per world cheaper."
-            )
+            self.coverage = self.forest_reason = scalar = None
+            held = [sparse_group(solver)]
         else:
-            operators = [
-                TreeHeldOperator(solver, size, span)
-                for size in solver.forest.size_groups
-                if scalar is None or size != scalar.size
-                for span in _topologies(solver, size)
-            ]
-            if self.coverage[-1]:
-                operators.append(PrescribedRootOperator(solver))
-            operators += [RestOperator(solver, span) for span in itertools.pairwise(solver.forest.rest_topologies)]
-            if forest and scalar is not None:
-                self.forest_reason = "Scalar branches own the diagonal-mass group, so no group spans a world."
-            elif forest:
-                self.forest_reason = "The world layout does not admit one forest group."
-            elif override is not None:
-                self.forest_reason = "A test pin keeps per-size groups (grouping='per_size')."
-            else:
-                self.forest_reason = (
-                    "Default: per-size groups (the layout admits no forest, has no prescribed root, or has a "
-                    "diagonal-mass family the forest applies at a loss)."
-                )
+            self.coverage = _coverage(solver, solver._compact_diagonal_mass_size)
+            self._dimensions = (solver.model.joint_count, solver.model.body_count, solver.model.articulation_count)
+            # The coverage proof's inputs, compared on the device on notification.
+            self._proof = DeviceProof(list(self._coverage_arrays()), solver.model.device)
+            # A size group of scalar branches (scalar_branches.py) is owned in place
+            # of a tree group: one thread per coordinate, no tree plan.
+            scalar = getattr(solver, "_scalar_branches", None)
+            held = self._dense_groups(solver, scalar)
         self.groups = []
-        for operator in operators:
+        for operator in held:
+            complete = operator.kind == "sparse"
             group = TreeKineticState(
                 operator,
                 admission=admission,
-                chains=False,
-                complete=False,
-                response="diagonal" if operator.diagonal else "cholesky",
+                chains=complete,
+                complete=complete,
+                response=operator.response,
                 clocked=self.clocked,
                 skip=skip,
                 classify=classify,
@@ -656,6 +540,41 @@ class HeldTree:
         # input bank by identity, and the solver invalidates the whole owner.
         self.bank_compare = all(group.bank_compare for group in self.groups)
         self.skip_captured_repairs = all(group.skip_captured_repairs for group in self.groups)
+
+    def _dense_groups(self, solver, scalar) -> list:
+        """The held groups of dense or compact coordinates: one per world (a forest) where the default or a test pin
+        chooses it and the layout admits it, else one per size group's topology beside the prescribed and rest
+        groups; ``forest_reason`` names the choice."""
+        override = solver._route_pins.get("grouping")
+        forest = override == "forest" if override is not None else forest_default(solver)
+        if forest and forest_supported(solver):
+            self.forest_reason = (
+                "A test pin selects one group per world (grouping='forest')."
+                if override is not None
+                else "Default: a prescribed root and no diagonal-mass family make one group per world cheaper."
+            )
+            return [_forest_group(solver)]
+        groups = [
+            _tree_group(solver, size, span)
+            for size in solver.forest.size_groups
+            if scalar is None or size != scalar.size
+            for span in _topologies(solver, size)
+        ]
+        if self.coverage[-1]:
+            groups.append(_prescribed_group(solver))
+        groups += [_rest_group(solver, span) for span in itertools.pairwise(solver.forest.rest_topologies)]
+        if forest and scalar is not None:
+            self.forest_reason = "Scalar branches own the diagonal-mass group, so no group spans a world."
+        elif forest:
+            self.forest_reason = "The world layout does not admit one forest group."
+        elif override is not None:
+            self.forest_reason = "A test pin keeps per-size groups (grouping='per_size')."
+        else:
+            self.forest_reason = (
+                "Default: per-size groups (the layout admits no forest, has no prescribed root, or has a "
+                "diagonal-mass family the forest applies at a loss)."
+            )
+        return groups
 
     def _coverage_arrays(self):
         solver, model = self.solver, self.solver.model
@@ -721,7 +640,6 @@ class HeldTree:
     def predict(self, state, augmented, control, velocity, dt):
         """Project current forces and apply each original held response."""
         for group in self.groups:
-            group.sparse.bind_response()
             group.predict(state, augmented, control, velocity, dt)
 
     def finish(self, state, augmented, output, dt, refresh):

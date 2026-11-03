@@ -289,7 +289,7 @@ def _seed(walk: TreeWalk, x: np.ndarray):
 
 def check_rows(solver, joint_q: np.ndarray, capture: Capture, rng) -> RowCheck:
     """F1 on one run: every dense row's sides and every free-body row, then the leave of the step's ``du``."""
-    out = RowCheck(operators=tuple(type(group.sparse).__name__ for group in solver.factor.held.groups))
+    out = RowCheck(operators=tuple(getattr(group.sparse, "kind", "scalar") for group in solver.factor.held.groups))
     forest, placement = solver.forest, solver.placement
     sizes = forest.articulation_response_dof_count.numpy()
     offsets = forest.articulation_world_dof_offset.numpy()

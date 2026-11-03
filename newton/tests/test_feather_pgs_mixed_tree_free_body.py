@@ -502,6 +502,10 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                 layout = owner.groups[0].layout
                 self.assertEqual(layout.roots, (0, 4))
                 self.assertEqual(layout.root_families, (3, -2))
+                # The diagonal family's refresh reads H_ii from its root's offset in the layout.
+                self.assertEqual(
+                    [family[:2] for family in owner.groups[0].sparse.families], [(2, layout.root_offsets[1])]
+                )
                 self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
                 np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
                 np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)

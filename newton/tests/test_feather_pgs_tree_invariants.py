@@ -134,10 +134,10 @@ def check_geometry(test, evaluated, reference) -> None:
             driven = drive_rows[dofs] >= 0
             mass = np.diag(H)[driven] + armature[dofs[driven]]
             error = np.abs(row_H[drive_rows[dofs[driven]]] - mass).max(initial=0.0)
-            test.assertLessEqual(error, _bound(H), f"row_H of group {index}, {type(operator).__name__}")
+            test.assertLessEqual(error, _bound(H), f"row_H of group {index}, {operator.kind}")
             if kept is not None:
                 error = np.abs(kept[index] - np.diag(H)).max()
-                test.assertLessEqual(error, _bound(H), f"H_ii of group {index}, {type(operator).__name__}")
+                test.assertLessEqual(error, _bound(H), f"H_ii of group {index}, {operator.kind}")
 
 
 def check_factor(test, evaluated, reference) -> None:
@@ -145,7 +145,7 @@ def check_factor(test, evaluated, reference) -> None:
     solver = evaluated.solver
     rng = np.random.default_rng(11)
     for _, operator, arts in _held_groups(solver):
-        if getattr(operator, "diagonal", False) or arts.shape[1] != 1:
+        if operator.response == "diagonal" or arts.shape[1] != 1:
             continue
         for index in (0, len(arts) - 1):
             art = int(arts[index, 0])

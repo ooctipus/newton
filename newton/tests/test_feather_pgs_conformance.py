@@ -22,9 +22,8 @@ Routes
     parallel and keyed-parallel tiers, local owners (row packets and owned rows), the paired factor sweep
     and the sparse-diagonal sweep (sparse-diagonal rows and the compact contact
     boundary); on CPU, the general row of the matrix-free sweep, one thread per
-    world. Dynamics owners: ``SparseHeldOperator``,
-    ``TreeHeldOperator``, ``ForestHeldOperator``, scalar branches and ordinary
-    dynamics. Contact-row producers: sparse response, compact Jacobian, general
+    world. Dynamics owners: the held groups (sparse, tree and forest), scalar
+    branches and ordinary dynamics. Contact-row producers: sparse response, compact Jacobian, general
     (per contact and masked), keyed rows, local packets, sparse diagonal and
     compact contact boundary. Friction: point (``friction_anchor_beta=0``) and
     persistent patch friction (0.2).
@@ -1411,7 +1410,7 @@ MF_HELD = Route(
         "sweep.route": "matrix_free_gs",
         "sweep.tiers": None,
         "held_tree.owner": "mixed",
-        "held_tree.groups.0.operator": "TreeHeldOperator",
+        "held_tree.groups.0.operator": "tree",
     },
 )
 MF_PARALLEL = Route(
@@ -1445,7 +1444,7 @@ SPARSE = Route(
         "sweep.route": "sparse_pgs",
         "contact_rows.producer": "walk",
         "held_tree.owner": "tree",
-        "held_tree.groups.0.operator": "SparseHeldOperator",
+        "held_tree.groups.0.operator": "sparse",
         "sparse_mass_matrix.contact_triplets": False,
     },
 )
@@ -1477,7 +1476,7 @@ LOCAL_FOREST = Route(
         "local_solve.enabled": True,
         "contact_rows.producer": "local_packets",
         "held_tree.owner": "forest",
-        "held_tree.groups.0.operator": "ForestHeldOperator",
+        "held_tree.groups.0.operator": "forest",
     },
 )
 LOCAL_KINEMATIC = Route(
@@ -1489,7 +1488,7 @@ LOCAL_KINEMATIC = Route(
         "local_solve.enabled": True,
         "contact_rows.producer": "local_packets",
         "held_tree.owner": "forest",
-        "held_tree.groups.0.operator": "ForestHeldOperator",
+        "held_tree.groups.0.operator": "forest",
     },
 )
 LOCAL_OWNED = Route(
@@ -1567,7 +1566,7 @@ SPARSE_DIAGONAL_TREE = Route(
         "sweep.route": "sparse_diagonal",
         "contact_rows.producer": "walk",
         "held_tree.scalar_branches.enabled": False,
-        "held_tree.groups.0.operator": "TreeHeldOperator",
+        "held_tree.groups.0.operator": "tree",
     },
 )
 COMPACT_BOUNDARY = Route(

@@ -227,7 +227,7 @@ def _tree_group(group) -> dict:
         return _scalar_group(group)
     layout, operator = group.layout, group.sparse
     return {
-        "operator": type(operator).__name__,
+        "operator": operator.kind,
         "size": json_value(getattr(operator, "size", None)),
         "group_count": int(group.group_count),
         "bodies": int(layout.bodies),

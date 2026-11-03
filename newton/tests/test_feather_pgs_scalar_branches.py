@@ -1733,10 +1733,10 @@ class TestScalarBranchOwner(unittest.TestCase):
         self.assertTrue(held["scalar_branches"]["enabled"])
         self.assertIn("run as scalar branches", held["scalar_branches"]["reason"])
         groups = {group["operator"]: group for group in held["groups"]}
-        self.assertEqual(set(groups), {"TreeHeldOperator", "ScalarBranchState"})
+        self.assertEqual(set(groups), {"tree", "ScalarBranchState"})
         self.assertEqual(groups["ScalarBranchState"]["dofs"], STAR_LEAVES)
         self.assertEqual(groups["ScalarBranchState"]["kernels"]["predict"], sb.predict_prismatic_branches.key)
-        self.assertEqual(groups["TreeHeldOperator"]["dofs"], ARM_DOFS)
+        self.assertEqual(groups["tree"]["dofs"], ARM_DOFS)
         # The scalar group holds no bank stamps, so the arm group beside it validates a changed input
         # bank by identity, as the owner does, and binds no comparison pass or banked repair.
         for name, group in groups.items():

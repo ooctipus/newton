@@ -415,8 +415,8 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                             if forest == "1":
                                 self.assertEqual([group.layout.root_families for group in groups], [(0, 6)])
                             else:
-                                operators = sorted(type(group.sparse).__name__ for group in groups)
-                                self.assertEqual(operators, ["PrescribedRootOperator", "TreeHeldOperator"])
+                                operators = sorted(group.sparse.kind for group in groups)
+                                self.assertEqual(operators, ["prescribed", "tree"])
                         runs[cached] = self._phases(
                             model, solver, probe, (KINEMATIC, DYNAMIC), load=probe, wrench=wrench, steps=30
                         )

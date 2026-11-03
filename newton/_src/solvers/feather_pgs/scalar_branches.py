@@ -587,7 +587,7 @@ class ScalarBranchState:
     """Own one size group of scalar branches with the held-tree owner's group interface.
 
     The owner calls ``begin`` before any factor or force consumer, ``refresh``
-    at the mass cadence, ``bind_response`` and ``predict`` at stage 3, and
+    at the mass cadence, ``predict`` at stage 3, and
     ``finish`` to integrate and publish; ``invalidate`` and ``validate_model``
     follow resets and model notifications. ``sparse`` is the group itself: the
     inverse-mass refresh runs inside ``predict``, where the mass mask, the
@@ -753,9 +753,6 @@ class ScalarBranchState:
 
     def refresh(self, state_aug):
         """Nothing to do here: ``predict`` refreshes the inverse masses the mass mask selects."""
-
-    def bind_response(self):
-        """The inverse diagonal is the solver's and never rebinds."""
 
     def predict(self, state_in, state_aug, control, stage3_qd, dt):
         """Form each leaf's force and refresh, solve and predict its coordinate, deciding its drive's saturation."""
