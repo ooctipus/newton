@@ -1406,6 +1406,7 @@ class WalkClass:
         touch_joint: str = "",
         touch_step: str = "",
         ahead: int | None = None,
+        hold: bool = False,
     ) -> str:
         """Native statements that walk the class's tree on a state of ``width`` floats a body, in either direction.
 
@@ -1441,6 +1442,9 @@ class WalkClass:
             touch_step: Coordinate ``$c``'s statement asking L1 for its step inputs' lines.
             ahead: Items whose inputs a lane holds in registers ahead of the chain (:data:`WALK_AHEAD` by default; a
                 kernel whose launch bound has no room for them takes 0 and keeps the touches).
+            hold: Every item's line touched, then every item fetched, before the chain (straight-line code only): the
+                inputs held for a second walk over the same items (:meth:`walk_twice`). Touched first: on the RTX PRO
+                6000 the bare fetches of a free cube's records ran 9.2 -> 12.6 us; touched first, 8.3 (hold p2).
         """
         bodies, coordinates = len(self.parent), self.coordinates
         zero = "{" + ", ".join(["0.0f"] * width) + "}"
@@ -1460,8 +1464,8 @@ class WalkClass:
                     order += [("x", c) for c in coordinates_of(b)]
                 if not root_first and (fetch_joint or touch_joint) and self.parent[b] >= 0:
                     order.append(("l", b))
-            depth = self.ahead(len(order), ahead) if fetch_joint or fetch_step else 0
-            early = self.touch(len(order)) if touch_joint or touch_step else 0
+            depth = len(order) if hold else self.ahead(len(order), ahead) if fetch_joint or fetch_step else 0
+            early = len(order) if hold else self.touch(len(order)) if touch_joint or touch_step else 0
             position = {item: k for k, item in enumerate(order)}
 
             def fetch(item):
@@ -1514,6 +1518,8 @@ class WalkClass:
                         lines.append(_fill(joint, b=b, V=f"walk{b}", P=f"walk{up}", L=f"walk_l{b}"))
             return "\n".join(lines)
 
+        if hold:
+            raise ValueError("a walk holds its items in straight-line code only")
         # The loop form: the walk's steps as a sequence of slots in the walk's order, a slot per coordinate and one
         # for a body without coordinates, each naming its body, its coordinate (-1 for none) and whether it is the
         # first (the body's joint before it root first, its gathering leaf first) or the last of its body's (the
@@ -1751,28 +1757,9 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
         if self.coordinates > first.get("unroll", WALK_UNROLL) or not held_fits(self.held_words, registers):
             return "{\n" + self.walk(**first) + "\n}\n{\n" + self.walk(**second) + "\n}"
         bare = {"fetch_joint": "", "fetch_step": "", "touch_joint": "", "touch_step": ""}
-        # Every held item's line asked of L1 first, then the fetches: on the RTX PRO 6000 the bare fetches of a free
-        # cube's records ran 9.2 -> 12.6 us; touched first, 8.3 (hold p2).
-        items = [_fill(first["touch_step"], c=c) for c in range(self.coordinates) if first.get("touch_step")]
-        items += [
-            _fill(first["touch_joint"], b=b) for b, up in enumerate(self.parent) if up >= 0 and first.get("touch_joint")
-        ]
-        items += [
-            f"const auto walk_l{b} = {_fill(first['fetch_joint'], b=b, up=up)};"
-            for b, up in enumerate(self.parent)
-            if up >= 0
-        ]
-        items += [
-            f"const auto walk_x{c} = {_fill(first['fetch_step'], c=c, half=self.half_of(c))};"
-            for c in range(self.coordinates)
-        ]
         step = Template(second["step"]).safe_substitute(X="walk_h")
         handed = f"{{\nconst auto walk_h = {hand};\n{step}\n}}"
+        # The second walk in the first's scope, where the held items are.
         return (
-            "\n".join(items)
-            + "\n{\n"
-            + self.walk(**{**first, **bare})
-            + "\n}\n{\n"
-            + self.walk(**{**second, **bare, "step": handed})
-            + "\n}"
+            "{\n" + self.walk(**first, hold=True) + "\n{\n" + self.walk(**{**second, **bare, "step": handed}) + "\n}\n}"
         )
