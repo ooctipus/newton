@@ -1618,7 +1618,7 @@ $record_enter
     };
     // The slips' release of tree art (WalkRelease, written by the predictor's border; W9's verdict: R = L_F^-1 L_K,
     // tree-lower, so every row keeps its support). Slip j's steps along its root path, leaf first, start at
-    // at = (art * cap + j) * steps of release.coordinate, .b, .a, .g; a coordinate of -1 ends the path.
+    // at = (art * cap + j) * steps of release.step (WALK_STEP's records); a coordinate of -1 ends the path.
     // WALK_SLIP_ON(release, at, z, rows, stride, place): z <- R_j z on rows rows (at most $rows) of a footprint whose
     // coordinate c sits at z[place(c) + r * stride] (place(c) < 0 where the footprint's support does not hold c: zero
     // there, and every coordinate of the path below the support's is off it), leaf first, a step at a time: its
@@ -1635,13 +1635,14 @@ $record_enter
     // WALK_RELEASE_IT(release, art, u): the audit's coordinates u <- R^-T u, the first slip first.
     const auto WALK_SLIP_ON = [&](const auto& release, const size_t at, float* z, const int rows, const int stride,
                                   auto&& place) {
-        const int steps = release.b.shape[2];
-        const int* coordinate = release.coordinate.data + at;
-        const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
+        const int steps = release.step.shape[2];
+        const auto* records = release.step.data + at;
         float s[$rows];
         for (int r = 0; r < $rows; ++r) s[r] = 0.0f;
         for (int k = 0; k < steps; ++k) {
-            const int c = coordinate[k];
+            int c;
+            float b, a, g;
+            WALK_STEP(records + k, c, b, a, g);
             if (c < 0) break;
             const int e = place(c);
             if (e < 0) continue;
@@ -1652,9 +1653,8 @@ $record_enter
     };
     // The transposed forms, root first: a batch of the steps above the last one taken, the path's end (-1) skipped.
     const auto WALK_SLIP_BACK = [&](const auto& release, const size_t at, float* u, auto&& step) {
-        const int steps = release.b.shape[2];
-        const int* coordinate = release.coordinate.data + at;
-        const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
+        const int steps = release.step.shape[2];
+        const auto* records = release.step.data + at;
         float t = 0.0f;
         for (int k1 = steps - 1; k1 >= 0; k1 -= $batch) {
             int cq[$batch];
@@ -1662,10 +1662,9 @@ $record_enter
 #pragma unroll
             for (int q = 0; q < $batch; ++q) {
                 const int k = k1 - q;
-                cq[q] = k >= 0 ? coordinate[k] : -1;
-                bk[q] = k >= 0 ? b[k] : 0.0f;
-                ak[q] = k >= 0 ? a[k] : 0.0f;
-                gk[q] = k >= 0 ? g[k] : 0.0f;
+                cq[q] = -1;
+                bk[q] = ak[q] = gk[q] = 0.0f;
+                if (k >= 0) WALK_STEP(records + k, cq[q], bk[q], ak[q], gk[q]);
             }
 #pragma unroll
             for (int q = 0; q < $batch; ++q) x[q] = cq[q] >= 0 ? u[cq[q]] : 0.0f;
@@ -1689,7 +1688,7 @@ $record_enter
     };
     const auto WALK_RELEASE_ON = [&](const auto& release, const int art, float* z, const int rows, const int stride,
                                      auto&& place) {
-        const int cap = release.b.shape[1], steps = release.b.shape[2];
+        const int cap = release.step.shape[1], steps = release.step.shape[2];
         for (int j = 0; j < release.count.data[art]; ++j)
             WALK_SLIP_ON(release, ((size_t)art * cap + j) * steps, z, rows, stride, place);
     };
@@ -1697,11 +1696,11 @@ $record_enter
         WALK_RELEASE_ON(release, art, z, 1, 0, [&](const int c) { return c * stride; });
     };
     const auto WALK_RELEASE_T = [&](const auto& release, const int art, float* u) {
-        const int cap = release.b.shape[1], steps = release.b.shape[2];
+        const int cap = release.step.shape[1], steps = release.step.shape[2];
         for (int j = release.count.data[art] - 1; j >= 0; --j) WALK_SLIP_T(release, ((size_t)art * cap + j) * steps, u);
     };
     const auto WALK_RELEASE_IT = [&](const auto& release, const int art, float* u) {
-        const int cap = release.b.shape[1], steps = release.b.shape[2];
+        const int cap = release.step.shape[1], steps = release.step.shape[2];
         for (int j = 0; j < release.count.data[art]; ++j) WALK_SLIP_IT(release, ((size_t)art * cap + j) * steps, u);
     };"""
 
@@ -1738,9 +1737,7 @@ _WALK_TEXTS = {
     "edge_v": ts.statements(ts.edge(ts.Direction.UP, ts.LOADED.lever, "v"), 24),
     "edge_twist": ts.statements(ts.edge(ts.Direction.DOWN, ts.LOADED.lever, "W", into="V"), 8),
     "enter_V": ts.statements(ts.enter(ts.LOADED, "V", "qd[c]", "u[c]"), 16),
-    "slip_on": ts.statements(
-        ts.slip("R", "z[e + r * stride]", "s[r]", "b[k]", "a[k]", "g[k]", "z[e + r * stride] = {};"), 16
-    ),
+    "slip_on": ts.statements(ts.slip("R", "z[e + r * stride]", "s[r]", "b", "a", "g", "z[e + r * stride] = {};"), 16),
     "slip_t": ts.statements(ts.slip("RT", "v", "t", "b", "a", "g", "return {};"), 12),
     "slip_it": ts.statements(ts.slip("RIT", "v", "t", "b", "a", "g", "return {};"), 12),
 }
@@ -1822,6 +1819,13 @@ _WALK_LOADS = """#ifndef WALK_READ
         const wp::vec3 walk_o_ = (w).origin.data[a], walk_n_ = (w).now_origin.data[a];                         \
         for (int walk_k_ = 0; walk_k_ < 3; ++walk_k_) s[walk_k_] = walk_o_[walk_k_] - walk_n_[walk_k_];        \
     }
+// WALK_STEP(p, c, b, a, g): a slip's step record at p (WalkRelease.step: the step's coordinate as its bit pattern, -1
+// past the path, then b, a, g), one quad: c, b, a and g arrive in one load, on the line the slip's next steps share.
+#define WALK_STEP(p, c, b, a, g)                                                                                \
+    {                                                                                                          \
+        const WALK_QUAD walk_s_ = WALK_PLAIN(reinterpret_cast<const float*>(p));                               \
+        c = WALK_BITS(walk_s_.x); b = walk_s_.y; a = walk_s_.z; g = walk_s_.w;                                 \
+    }
 // WALK_MUL(a, b): a walk step's output, a product rounded on its own: the chain's coordinate is a float32 value before
 // any consumer adds it, whatever block the consumer sits in.
 $device
@@ -1835,6 +1839,7 @@ _WALK_DEVICE = {
 #define WALK_PLAIN_PAIR(p) (*reinterpret_cast<const float2*>(p))
 #define WALK_LOAD_PIVOT(p) __ldg((p) + 10)
 #define WALK_BITS(x) __float_as_int(x)
+#define WALK_FLOAT(i) __int_as_float(i)
 #define WALK_ABS(x) fabsf(x)
 #define WALK_MUL(a, b) __fmul_rn((a), (b))""",
     False: """// The CPU's quad is Warp's (four named floats); its loads are plain. Its WALK_MUL is a function boundary, as CUDA's
@@ -1846,6 +1851,7 @@ _WALK_DEVICE = {
 #define WALK_PLAIN_PAIR(p) WALK_LDG_PAIR(p)
 #define WALK_LOAD_PIVOT(p) ((p)[10])
 #define WALK_BITS(x) __builtin_bit_cast(int, x)
+#define WALK_FLOAT(i) __builtin_bit_cast(float, i)
 #define WALK_ABS(x) __builtin_fabsf(x)
 #define WALK_MUL(a, b) ([](const float walk_a_, const float walk_b_) -> float { return walk_a_ * walk_b_; }((a), (b)))""",
 }
@@ -2219,20 +2225,20 @@ $copy
     };
 """
 
-_LEAVE_SLIPS = """        const int cap = walk.release.b.shape[1], steps = walk.release.b.shape[2];
+_LEAVE_SLIPS = """        const int cap = walk.release.step.shape[1], steps = walk.release.step.shape[2];
         for (int j = walk.release.count.data[art] - 1; j >= 0; --j) {
-            const size_t at = ((size_t)art * cap + j) * steps;
-            const float *g = walk.release.g.data + at, *a = walk.release.a.data + at, *b = walk.release.b.data + at;
-            float t = 0.0f;
-            switch (walk.release.coordinate.data[at]) {
+            // Slip j's steps, one record each (WALK_STEP): its first holds the slip's coordinate.
+            const auto* records = walk.release.step.data + ((size_t)art * cap + j) * steps;
+            int slip;
+            float t = 0.0f, b0, a0, g0;
+            WALK_STEP(records, slip, b0, a0, g0);
+            switch (slip) {
 $paths
             }
         }"""
 
 
-def _leave_class(
-    k: int, walk: WalkClass, node: tuple[int, ...] | None, release: bool, unroll: int
-) -> tuple[str, str]:
+def _leave_class(k: int, walk: WalkClass, node: tuple[int, ...] | None, release: bool, unroll: int) -> tuple[str, str]:
     """The leave of a tree of class ``k``: its node table (where the class reads a sweep's own layout), and its read of
     the change, the release where the class can slip, the unit."""
     n = walk.coordinates
@@ -2255,9 +2261,21 @@ def _leave_class(
         steps = []
         for c in range(n):
             path = walk.root_path(c)
+            # Step t's record (WALK_STEP); step 0's arrived with the slip's coordinate.
             body = " ".join(
                 "{ "
-                + " ".join(ts.slip("RT", f"r[{d}]", "t", f"b[{t}]", f"a[{t}]", f"g[{t}]", f"r[{d}] = {{}};"))
+                + ("" if t == 0 else f"int c_; float b_, a_, g_; WALK_STEP(records + {t}, c_, b_, a_, g_); ")
+                + " ".join(
+                    ts.slip(
+                        "RT",
+                        f"r[{d}]",
+                        "t",
+                        "b0" if t == 0 else "b_",
+                        "a0" if t == 0 else "a_",
+                        "g0" if t == 0 else "g_",
+                        f"r[{d}] = {{}};",
+                    )
+                )
                 + " }"
                 for t, d in reversed(list(enumerate(path)))
             )
@@ -2369,9 +2387,10 @@ class WalkRelease:
     """The release of each tree's slipping drives this step, which the predictor's border writes
     (:func:`.tree_kinetic_state.border_solve`, W9): its slips (``count``, 0 for none), each one's coordinate within its
     tree (``dof``, root-most first) and its root (``root``, its path's root-most coordinate), and at each step of each
-    one's root path, leaf first, the step's coordinate (``coordinate``, -1 past the path), the column ``b`` of the
-    released inverse and the recurrence's ``a`` (``beta d^1/2``) and ``g`` (``(d / dbar)^1/2``): ``[tree, slip, step]``,
-    as deep as the class's deepest root path. Slip ``j``'s ``R_j`` maps a footprint ``z`` along its path, leaf first,
+    one's root path, leaf first, one 16 B record (``step``, ``[tree, slip, step]``, as deep as the class's deepest
+    root path): the step's coordinate as its bit pattern (-1 past the path), the column ``b`` of the released inverse and
+    the recurrence's ``a`` (``beta d^1/2``) and ``g`` (``(d / dbar)^1/2``), in the order the walks read them
+    (``WALK_STEP``): a slip's coordinate and its steps arrive together. Slip ``j``'s ``R_j`` maps a footprint ``z`` along its path, leaf first,
     ``u = z_c - b s``, ``s += a u``, ``z_c = g u``; ``R = R_(s-1) ... R_0 = L_F^-1 L_K``, the decided factor's whitening on
     the all-``K`` walk, which keeps every row's support (``WALK_RELEASE``, ``WALK_RELEASE_T``, ``WALK_RELEASE_IT``). Two slips' paths meet if and only if their roots are equal (their ``R_j`` touch
     disjoint coordinates otherwise, and commute), and a footprint whose support holds every ancestor of its coordinates
@@ -2380,10 +2399,7 @@ class WalkRelease:
     count: wp.array[int]
     dof: wp.array2d[int]
     root: wp.array2d[int]
-    coordinate: wp.array3d[int]
-    b: wp.array3d[float]
-    a: wp.array3d[float]
-    g: wp.array3d[float]
+    step: wp.array3d[wp.vec4]
 
 
 def release_view(articulations: int, capacity: int, depth: int, device) -> WalkRelease:
@@ -2393,11 +2409,15 @@ def release_view(articulations: int, capacity: int, depth: int, device) -> WalkR
     view.count = wp.zeros(articulations, dtype=wp.int32, device=device)
     view.dof = wp.zeros((trees, max(capacity, 1)), dtype=wp.int32, device=device)
     view.root = wp.zeros((trees, max(capacity, 1)), dtype=wp.int32, device=device)
-    view.coordinate = wp.full((trees, max(capacity, 1), depth), -1, dtype=wp.int32, device=device)
-    view.b = wp.zeros((trees, max(capacity, 1), depth), dtype=wp.float32, device=device)
-    view.a = wp.zeros((trees, max(capacity, 1), depth), dtype=wp.float32, device=device)
-    view.g = wp.zeros((trees, max(capacity, 1), depth), dtype=wp.float32, device=device)
+    view.step = release_steps((trees, max(capacity, 1), depth), device)
     return view
+
+
+def release_steps(shape, device) -> wp.array:
+    """:attr:`WalkRelease.step` records of ``shape``, every step past its path (coordinate -1, its bit pattern)."""
+    records = np.zeros((*shape, 4), dtype=np.float32)
+    records.view(np.int32)[..., 0] = -1
+    return wp.array(records, dtype=wp.vec4, device=device)
 
 
 @wp.struct

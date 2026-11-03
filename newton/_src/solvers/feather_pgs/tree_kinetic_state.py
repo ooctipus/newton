@@ -1855,10 +1855,9 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
     // commute: (H + R + K_F)^-1 x = P^T L^-T R^T R L^-1 P x, since R^T R = L_K^T A_F^-1 L_K.
     const auto HELD_APPLY = [&](const int a, float* u, const int slips) {
         auto& release = walk.release;
-        const int depth = release.b.shape[2], cap = release.dof.shape[1];
+        const int depth = release.step.shape[2], cap = release.dof.shape[1];
         bool mine[HOLD_SLOTS];
-        const int* coordinates[HOLD_SLOTS];
-        const float *bs[HOLD_SLOTS], *as[HOLD_SLOTS], *gs[HOLD_SLOTS];
+        const wp::vec4* steps[HOLD_SLOTS];
         int len[HOLD_SLOTS], group[HOLD_SLOTS], rank[HOLD_SLOTS], size[HOLD_SLOTS], lead[HOLD_SLOTS];
         float rs[HOLD_SLOTS];
         #pragma unroll
@@ -1866,15 +1865,12 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
             const int j = lane + m * WIDTH;
             mine[m] = j < slips;
             const size_t at = ((size_t)a * cap + (mine[m] ? j : 0)) * depth;
-            coordinates[m] = release.coordinate.data + at;
-            bs[m] = release.b.data + at;
-            as[m] = release.a.data + at;
-            gs[m] = release.g.data + at;
+            steps[m] = release.step.data + at;
             len[m] = 0;
             group[m] = -1;
             if (mine[m]) {
                 group[m] = release.root.data[a * cap + j];
-                while (len[m] < depth && coordinates[m][len[m]] >= 0) ++len[m];
+                while (len[m] < depth && WALK_BITS(steps[m][len[m]][0]) >= 0) ++len[m];
             }
             rank[m] = 0;
             size[m] = 0;
@@ -1908,8 +1904,9 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
             for (int m = 0; m < HOLD_SLOTS; ++m) {
                 const int t = T - lead[m];
                 if (mine[m] && t >= 0 && t < len[m]) {
-                    const int c = coordinates[m][t];
-                    const float *const b = bs[m], *const ar = as[m], *const g = gs[m];
+                    int c;
+                    float b, ar, g;
+                    WALK_STEP(steps[m] + t, c, b, ar, g);
                     float& r = rs[m];
                     $apply_r
                 }
@@ -1927,8 +1924,9 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
             for (int m = 0; m < HOLD_SLOTS; ++m) {
                 const int t = len[m] - 1 - (T - lead[m]);
                 if (mine[m] && T >= lead[m] && t >= 0) {
-                    const int c = coordinates[m][t];
-                    const float *const b = bs[m], *const ar = as[m], *const g = gs[m];
+                    int c;
+                    float b, ar, g;
+                    WALK_STEP(steps[m] + t, c, b, ar, g);
                     float& r = rs[m];
                     $apply_rt
                 }
@@ -1952,7 +1950,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
     const auto HELD_BUILD = [&](const WalkHold& h, const int a, const int n, const int nb, const float* data,
                                 const float* released, const float* kept) -> int {
         auto& release = walk.release;
-        const int depth = release.b.shape[2];
+        const int depth = release.step.shape[2];
         const int cap = a < release.dof.shape[0] ? release.dof.shape[1] : 0;
         // Each slot's slip: the (lane + m WIDTH)-th coordinate, ascending, whose released stiffness is positive.
         int is[HOLD_SLOTS], total = 0;
@@ -2067,12 +2065,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
                         gk = scale * r;
                         dk = dbar;
                         rk = dbar * r;
-                        if (t < depth) {
-                            release.coordinate.data[at + t] = c;
-                            release.b.data[at + t] = bk;
-                            release.a.data[at + t] = ak;
-                            release.g.data[at + t] = gk;
-                        }
+                        if (t < depth) release.step.data[at + t] = wp::vec4(WALK_FLOAT(c), bk, ak, gk);
                         ++t;
                     }
                     bk = READ(bk, k);
@@ -2109,7 +2102,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
                 if (ts[m] > depth) FRAME_STATUS(1);
                 release.dof.data[a * cap + lane + m * WIDTH] = is[m];
                 release.root.data[a * cap + lane + m * WIDTH] = roots[m];
-                for (int t = ts[m]; t < depth; ++t) release.coordinate.data[ats[m] + t] = -1;
+                for (int t = ts[m]; t < depth; ++t) release.step.data[ats[m] + t] = wp::vec4(WALK_FLOAT(-1), 0.0f, 0.0f, 0.0f);
             }
         if (lane == 0) release.count.data[a] = slips;
         WARP_SYNC();
@@ -2209,8 +2202,8 @@ def held_lambdas(layout: TreeLayout, slips: int, half: int = ts.WALK_BOTH) -> st
         unpacked=WALK_UNPACKED,
         half=half,
         held_step=ts.statements([*_HELD_COLUMN, "root = c;"], 24),
-        apply_r=ts.statements(ts.slip("R", "u[c]", "r", "b[t]", "ar[t]", "g[t]", "u[c] = {};"), 20),
-        apply_rt=ts.statements(ts.slip("RT", "u[c]", "r", "b[t]", "ar[t]", "g[t]", "u[c] = {};"), 20),
+        apply_r=ts.statements(ts.slip("R", "u[c]", "r", "b", "ar", "g", "u[c] = {};"), 20),
+        apply_rt=ts.statements(ts.slip("RT", "u[c]", "r", "b", "ar", "g", "u[c] = {};"), 20),
         build_r=ts.statements(ts.slip("R", "z", "pair[k]", "bk", "ak", "gk", "z = {};"), 28),
         edge_p=ts.statements(_EDGE_UP, 24),
     )

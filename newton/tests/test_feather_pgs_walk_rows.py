@@ -253,8 +253,9 @@ def device_release(view, art: int, n: int) -> np.ndarray:
     matrix by coordinate: each slip's recurrence along its stored path, leaf first, the root-most slip first."""
     release = view.release
     count = int(release.count.numpy()[art])
-    coordinate = release.coordinate.numpy()[art]
-    b, a, g = (getattr(release, k).numpy()[art].astype(np.float64) for k in ("b", "a", "g"))
+    steps = release.step.numpy()[art]
+    coordinate = np.ascontiguousarray(steps[..., 0]).view(np.int32)
+    b, a, g = (steps[..., k].astype(np.float64) for k in (1, 2, 3))
     R = np.eye(n)
     for j in range(count):
         s = np.zeros(n)
@@ -414,7 +415,8 @@ def release_rows(release, art: int, n: int, path: np.ndarray, dof_body: np.ndarr
     """The release of :func:`.walk_rows.walk_release_kernel` (its device data, by path step) applied to the columns of
     ``Z`` (by tree coordinate), slip by slip as the writer applies it: ``u = z - b s``, ``s += a u``, ``z = g u``."""
     Z = Z.astype(np.float64).copy()
-    b, a, g = (getattr(release, k).numpy()[art].astype(np.float64) for k in ("b", "a", "g"))
+    records = release.step.numpy()[art]
+    b, a, g = (records[..., k].astype(np.float64) for k in (1, 2, 3))
     for j in range(int(release.count.numpy()[art])):
         steps = release_path(path, n, dof_body, int(release.dof.numpy()[art, j]))
         s = np.zeros(Z.shape[1])
@@ -658,7 +660,9 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
         if slips[art]:
             # R^T du: the last slip first, each along its path root first (the step's one leave, walk_leave_kernel).
             release = view.release
-            coordinate, b, a, g = (getattr(release, k).numpy()[art] for k in ("coordinate", "b", "a", "g"))
+            steps = release.step.numpy()[art]
+            coordinate = np.ascontiguousarray(steps[..., 0]).view(np.int32)
+            b, a, g = (steps[..., k] for k in (1, 2, 3))
             du = du.copy()
             for j in reversed(range(int(slips[art]))):
                 t = 0.0

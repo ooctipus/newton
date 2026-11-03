@@ -30,6 +30,7 @@ from newton._src.solvers.feather_pgs.tree_factor import (
     WalkRelease,
     WalkTrees,
     pack_walk_records,
+    release_steps,
     unpack_walk_records,
     walk_leave_kernel,
 )
@@ -963,8 +964,7 @@ def chain_walk(device, lowers) -> WalkTrees:
     release = WalkRelease()
     release.count = ints(np.zeros(arts))
     release.dof = wp.zeros((1, 1), dtype=wp.int32, device=device)
-    release.coordinate = wp.full((1, 1, 1), -1, dtype=wp.int32, device=device)
-    release.b, release.a, release.g = (wp.zeros((1, 1, 1), dtype=wp.float32, device=device) for _ in range(3))
+    release.step = release_steps((1, 1, 1), device)
     walk.release = release
     walk.du = wp.zeros(total, dtype=wp.float32, device=device)
     return walk
@@ -999,8 +999,7 @@ def diagonal_walk(inverse, device, dofs=None, offsets=None):
     release = WalkRelease()
     release.count = wp.zeros(worlds, dtype=wp.int32, device=device)
     release.dof = wp.zeros((1, 1), dtype=wp.int32, device=device)
-    release.coordinate = wp.full((1, 1, 1), -1, dtype=wp.int32, device=device)
-    release.b, release.a, release.g = (wp.zeros((1, 1, 1), dtype=wp.float32, device=device) for _ in range(3))
+    release.step = release_steps((1, 1, 1), device)
     walk.release = release
     walk.du = wp.zeros(worlds * dofs, dtype=wp.float32, device=device)
     return walk
