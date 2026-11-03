@@ -32,7 +32,6 @@ from .sweep import (
     SPEED,
     VELOCITY_LIMIT,
     CachedPairMetric,
-    FreeBodyRows,
     ReducedPairCoupling,
     RowContext,
     RowLaws,
@@ -40,12 +39,11 @@ from .sweep import (
     WorldRows,
     cached_pair_law,
     contact_unit,
-    dense_rows_block,
     end_sweep,
-    free_body_rows_block,
     impulse_seed,
     indent,
     material_arguments,
+    rows_block,
     speed_rows_pass,
     velocity_limit_pass,
 )
@@ -89,6 +87,11 @@ MF_GS_ABI = kernel_template.params(
 """The matrix-free sweep's native ABI: one world per call (the world queue's dispatch). The free bodies' rows are the
 row store's (the ``world_*`` records, from the dense capacity of the world's line); their ``Z`` and headers the
 free bodies' placement (``mf_*``)."""
+
+
+def _dense_staging(shared_metadata: bool, resident_row_metadata: bool) -> str:
+    """The dense rows' staging policy (:class:`.sweep.WorldRows`) of a sweep's metadata options."""
+    return "shared" if shared_metadata else "resident" if resident_row_metadata else "streamed"
 
 
 class FreeBodyCoordinates:
@@ -313,11 +316,11 @@ def _colored_pair_metric(op: FreeBodyZ, pad: str) -> str:
     return indent("\n".join(lines), pad)
 
 
-def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int, units: int) -> str:
+def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str:
     """A color's units, one thread each, at block stride: each loads its slot's fields at once
     (:data:`.sweep_units.SLOT_FIELDS`, field by field across the color's ``units`` slots) and runs the free-body row
     law, unrolled over the unit's rows, on the world's staged velocity. No other unit of the color shares a body."""
-    unit_rows = FreeBodyRows(M_MF, stream=free.stream, lanes=Lanes(1))
+    unit_rows = WorldRows(M_MF, staging="header", stream=free.stream, lanes=Lanes(1))
     arrays = {"mf_Z_a": 0, "mf_Z_b": 1}
     torsion = laws.torsion
     layout = sweep_units.slot_layout(torsion)
@@ -543,10 +546,8 @@ def mf_gs_staging(
     """The shared working set of a world's matrix-free sweep block (:func:`mf_gs_source` declares it): the world's
     velocity, its dense rows' impulses and staged metadata, the free-body impulses unless they stream, and the colored
     mapping's color offsets (and its trace's warp maxima)."""
-    dense = WorldRows(
-        max_constraints, shared_metadata=shared_metadata, packed_types=shared_metadata or resident_row_metadata
-    )
-    free = FreeBodyRows(mf_max_constraints, stream=stream_mf_impulses)
+    dense = WorldRows(max_constraints, staging=_dense_staging(shared_metadata, resident_row_metadata))
+    free = WorldRows(mf_max_constraints, staging="header", stream=stream_mf_impulses)
     colored = ()
     if mapping == "colored":
         warps = COLORED_THREADS // 32
@@ -628,10 +629,8 @@ def mf_gs_source(
     max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
     row_lanes = Lanes(lanes)
     laws = RowLaws(regularize=True, material=material, torsion=contact_torsion, policy=solve_policy)
-    dense = WorldRows(
-        M_D, shared_metadata=shared_metadata, packed_types=shared_metadata or resident_row_metadata, lanes=row_lanes
-    )
-    free = FreeBodyRows(M_MF, stream=stream_mf_impulses, lanes=row_lanes)
+    dense = WorldRows(M_D, staging=_dense_staging(shared_metadata, resident_row_metadata), lanes=row_lanes)
+    free = WorldRows(M_MF, staging="header", stream=stream_mf_impulses, lanes=row_lanes)
     dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows)
     bodies = FREE_BODY_COORDINATES
     # The free bodies' speed rows leave and enter by the walk, as their rows were written (walk_rows).
@@ -674,8 +673,8 @@ def mf_gs_source(
         # The worlds of the other mapping, as the unit builder assigned them at the pack.
         mapped = f"\n    if (world_colored.data[world] {'==' if colored else '!='} 0) return;"
     dense_loads = indent(dense.loads("i"), "        ")
-    mf_load = free.load_line("i")
-    mf_store = free.store_line("i")
+    mf_load = free.loads("i")
+    mf_store = free.stores("i")
 
     passes = []
     if has_dense_velocity_limit_rows:
@@ -710,7 +709,7 @@ def mf_gs_source(
         head = "    const int lane = LANE;"
         first_warp = end_first_warp = ""
         barrier = "SYNC();"
-        free_phase = free_body_rows_block(free, free_op, laws, admission=_MF_ADMISSION, pad="    ")
+        free_phase = rows_block(free, free_op, laws, admission=_MF_ADMISSION, pad="    ")
         offsets = trace_reduction = ""
 
     thread, threads = ("tid", "(int)blockDim.x") if colored else ("lane", "STRIDE")
@@ -797,7 +796,7 @@ def mf_gs_source(
     for (int iter = 0; iter < iterations; iter++) {{
         int iteration_changed = 0;
 
-{first_warp}{dense_rows_block(dense, dense_op, laws, admission=_DENSE_ADMISSION, pad="        ")}
+{first_warp}{rows_block(dense, dense_op, laws, admission=_DENSE_ADMISSION, pad="        ")}
 {end_first_warp}{"        __syncthreads();" + chr(10) if colored else ""}
 {indent(free_phase, "    ")}
 
@@ -810,7 +809,7 @@ def mf_gs_source(
         if (global_dof >= 0{owned}) walk.du.data[global_dof] += s_v[d];
     }}
     for (int i = lane; i < m_dense; i += STRIDE) {{
-        world_impulses.data[off_dense + i] = s_lam_dense[i];
+        {dense.stores("i")}
     }}
     for (int i = lane; i < m_mf; i += STRIDE) {{
         {mf_store}

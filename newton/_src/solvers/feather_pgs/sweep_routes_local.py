@@ -375,22 +375,41 @@ def _local_sweeps(op: LocalBlock, laws: RowLaws, lanes: Lanes, R: int, MFS: int,
         friction=contacts,
     )
     torsion = laws.torsion
-    spin = {"load_spin": "s_lam[i + 2]"} if torsion else {}
-    dense = [
-        "for (int i = 0; i < row_count; ++i) {",
-        "    if (s_active[i] == 0) continue;",
-        "    const int row_type = s_type[i];",
-        f"    if (row_type == {TORSION}) continue;" if torsion else "",
-        "    const float inverse_diagonal = s_inv_diag[i];",
-        "    if (inverse_diagonal <= 0.0f) continue;",
-        admit_pair("row_type", "s_parent[i]", "    ", torsion=torsion) if contacts else "",
-        friction_radius("row_type", ctx.ring_load("parent"), "s_mu[i]", "s_lam[i]", "s_lam[i + 1]", "    ", **spin)
-        if contacts
-        else "",
-        op.residual("jv", "    "),
-        row_update(ctx, laws, residual="jv", pad="    "),
-        "}",
-    ]
+
+    def loop(count: str, head: tuple[str, ...], row: RowContext, parent: str, impulses: str, pairs: bool) -> list[str]:
+        """One class's rows in slot order: ``head`` declares the row's kind (skipping a spin row, which its pair
+        solves) and its stored inverse diagonal; with ``pairs`` a pair is admitted at its first tangent (``parent``)
+        and visited on its disk (the class's ``impulses``)."""
+        spin = {"load_spin": f"{impulses}[i + 2]"} if torsion else {}
+        kind = row.kind
+        return [
+            f"for (int i = 0; i < {count}; ++i) {{",
+            *head,
+            f"    if ({row.operator.inverse('i')} <= 0.0f) continue;",
+            admit_pair(kind, parent, "    ", torsion=torsion) if pairs else "",
+            friction_radius(
+                kind, row.ring_load("parent"), row.mu("i"), f"{impulses}[i]", f"{impulses}[i + 1]", "    ", **spin
+            )
+            if pairs
+            else "",
+            row.operator.residual("jv", "    "),
+            row_update(row, laws, residual="jv", pad="    "),
+            "}",
+        ]
+
+    dense = loop(
+        "row_count",
+        (
+            "    if (s_active[i] == 0) continue;",
+            "    const int row_type = s_type[i];",
+            *((f"    if (row_type == {TORSION}) continue;",) if torsion else ()),
+            "    const float inverse_diagonal = s_inv_diag[i];",
+        ),
+        ctx,
+        "s_parent[i]",
+        "s_lam",
+        contacts,
+    )
     free = []
     if MFR:
         meta_parent = _mf_parent_expression("mf_meta.data[off_meta + patch_row * 4 + 3]", MFS)
@@ -418,28 +437,20 @@ def _local_sweeps(op: LocalBlock, laws: RowLaws, lanes: Lanes, R: int, MFS: int,
             contact_kinds=(CONTACT,),
             record=lambda row, delta: lanes.first(f"s_app[row_count + {row}] += {delta};"),
         )
-        free = [
-            "for (int i = 0; i < mf_count; ++i) {",
-            "    const int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i * 4]);",
-            "    const float mf_inverse = __int_as_float(meta.y);",
-            "    const int packed_tp = meta.w;",
-            "    const int mf_rt = packed_tp & 0xFFFF;",
-            f"    if (mf_rt == {TORSION}) continue;" if torsion else "",
-            "    if (mf_inverse <= 0.0f) continue;",
-            admit_pair("mf_rt", _mf_parent_expression("packed_tp", MFS), "    ", torsion=torsion),
-            friction_radius(
-                "mf_rt",
-                free_ctx.ring_load("parent"),
-                free_ctx.mu("i"),
-                "s_mf_lam[i]",
-                "s_mf_lam[i + 1]",
-                "    ",
-                **({"load_spin": "s_mf_lam[i + 2]"} if torsion else {}),
+        free = loop(
+            "mf_count",
+            (
+                "    const int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i * 4]);",
+                "    const float mf_inverse = __int_as_float(meta.y);",
+                "    const int packed_tp = meta.w;",
+                "    const int mf_rt = packed_tp & 0xFFFF;",
+                *((f"    if (mf_rt == {TORSION}) continue;",) if torsion else ()),
             ),
-            free_op.residual("jv", "    "),
-            row_update(free_ctx, laws, residual="jv", pad="    "),
-            "}",
-        ]
+            free_ctx,
+            _mf_parent_expression("packed_tp", MFS),
+            "s_mf_lam",
+            True,
+        )
     rows = "\n".join(line for line in (*dense, *free) if line)
     head = ["    for (int iteration = 0; iteration < iterations; ++iteration) {", "        int iteration_changed = 0;"]
     return "\n".join([*head, indent(rows, "        "), end_sweep(laws.policy, iteration="iteration") + "    }"])
