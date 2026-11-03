@@ -16,7 +16,6 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import response_builds_rows, sweep_routes, sweep_routes_local
 from newton._src.solvers.feather_pgs import solver_feather_pgs as fpgs
-from newton._src.solvers.feather_pgs.kernels import BodyTrees
 from newton._src.solvers.feather_pgs.placement import Placement
 from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.feather_pgs_paired_fixture import solve_fixture
@@ -254,14 +253,12 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
                 np.testing.assert_array_equal(result.numpy(), parents)
 
 
-def _unit_body_trees(worlds, dofs, device):
-    """The tree lookup the sweeps' walk coordinates read for each world's free body at its first coordinate (body
-    ``w`` at global coordinate ``w * dofs``, six coordinates, at world coordinate 0)."""
-    body_trees = BodyTrees()
+def _unit_first_art(worlds, dofs, device):
+    """The walk's tree lookup (:attr:`.tree_factor.WalkTrees.first_art`) the sweeps read for each world's free body at
+    its first coordinate (body ``w`` at global coordinate ``w * dofs``, six coordinates, at world coordinate 0)."""
     first_art = np.full(worlds * dofs, -1, np.int32)
     first_art[np.arange(worlds) * dofs] = np.arange(worlds)
-    body_trees.first_art = wp.array(first_art, dtype=wp.int32, device=device)
-    return body_trees
+    return wp.array(first_art, dtype=wp.int32, device=device)
 
 
 def _solve_parent_rows(device, parents):
@@ -299,7 +296,6 @@ def _solve_parent_rows(device, parents):
         mf_row_w=wp.ones((worlds, capacity), device=device),
         mf_Z_a=wp.array(jacobian, device=device),
         mf_Z_b=wp.zeros((worlds, capacity, 6), device=device),
-        body_trees=_unit_body_trees(worlds, 29, device),
         v_out=wp.array(velocity.reshape(-1), device=device),
         general_world_grid_stride=worlds,
         use_general_world_queue=0,
@@ -307,6 +303,7 @@ def _solve_parent_rows(device, parents):
         omega=1.0,
         regularize=0,
     )
+    values["walk"].first_art = _unit_first_art(worlds, 29, device)
     kernel = sweep_routes.mf_gs_kernel(
         8,
         capacity,

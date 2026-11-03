@@ -43,17 +43,16 @@ from .sweep import (
     material_arguments,
 )
 from .sweep_routes import MF_GS_ABI
-from .tree_factor import WalkTrees, walk_paths_prelude, walk_row_prelude
+from .tree_factor import walk_paths_prelude, walk_row_prelude
 
 PARALLEL_ABI = kernel_template.params(
     *MF_GS_ABI[:-1],
     ("ink_meta", wp.array[int]),
     ("world_row_cfm", wp.array2d[float]),
-    ("walk", WalkTrees),
     ("v_out", wp.array[float]),
 )
-"""The parallel tiers' native ABI: the matrix-free sweep's, then the worlds' trees (``ink_meta``: each world's
-articulation of each size and its first coordinate), the rows' cfm and the walk before ``v_out``; keyed rows insert
+"""The parallel tiers' native ABI: the matrix-free sweep's (the walk among it), then the worlds' trees (``ink_meta``:
+each world's articulation of each size and its first coordinate) and the rows' cfm before ``v_out``; keyed rows insert
 theirs after ``world_row_cfm``."""
 
 # The parallel tiers' automatic budget (tier_sweeps) grows with the serial sweep's iteration count, whose accuracy

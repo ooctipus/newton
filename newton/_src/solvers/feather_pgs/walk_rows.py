@@ -176,7 +176,6 @@ def free_body_headers_kernel(
     mf: MfRows,
     mf_constraint_count: wp.array[int],
     walk: WalkTrees,
-    body_to_articulation: wp.array[int],
     has_target_velocity: int,
     v_hat: wp.array[float],
     rigid_body_max_depenetration_velocity: wp.array[float],
@@ -210,7 +209,7 @@ def free_body_headers_kernel(
     incident = float(0.0)
     if mf.row_type[line, i] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
         if body_a >= 0:
-            art = body_to_articulation[body_a]
+            art = walk.body_art[body_a]
             j0 = walk.joint_start[art]
             d0 = walk.dof_start[art]
             k = int(0)

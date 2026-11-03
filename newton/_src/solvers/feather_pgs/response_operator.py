@@ -324,8 +324,7 @@ class FreeBodyZ(ResponseOperator):
     the row's own residual where the pair reduces it (``own``). The builder
     stores ``1 / A_ii`` (``A_ii = cfm + |Z_a|^2 + |Z_b|^2``).
 
-    ``body_trees`` names the native :class:`.kernels.BodyTrees` operand; a
-    body's speed row reads its velocity by its walk (``walk_leave``,
+    A body's speed row reads its velocity by its walk (``walk_leave``,
     ``walk_enter``).
     """
 
@@ -339,7 +338,6 @@ class FreeBodyZ(ResponseOperator):
     entry: Callable[[str, str, str], str] | None = None
     """One thread: where entry ``k`` of a row's ``Z_a`` or ``Z_b`` (the array's name) is read, ``entry(array, row,
     k)``, when a mapping stages the rows elsewhere (default: the array, by row)."""
-    body_trees: str = "body_trees"
     walk_leave: Callable[[str, str], str] | None = None
     """The code mapping the six values ``values`` of the body whose first coordinate is ``first`` back in place,
     ``walk_leave(first, values)``, ``v = P^T L^-T u`` by the walk down (:mod:`.walk_rows`); a speed row needs it."""

@@ -1807,10 +1807,9 @@ class Sweep:
                 "general_worlds": self.local_general_worlds,
                 "general_world_grid_stride": self.mf_gs_block_count,
                 "use_general_world_queue": int(self.placement.local_internal_fast_path),
-                "body_trees": self.factor.body_trees,
             }
             if self.factor.walk_arts is not None:
-                # The general sweep built for the one writer's rows leaves by the walk (sweep_routes.leave_all).
+                # The sweeps leave by the walk (sweep_routes.leave_all) and find a free body's tree in it.
                 queue["walk"] = self.factor.walk_view()
             if components is not None:
                 queue["local_solve_owner"] = components.selector

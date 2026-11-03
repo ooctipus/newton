@@ -663,7 +663,6 @@ class SolverFeatherPGS(SolverBase):
         self.sweep.admit_paired()
         self.placement.allocate_sparse_diagonal_rows()
         self.placement.allocate_free_body_rows(model)
-        self.factor.build_body_trees()
         self.placement.mf_target_velocity = (
             wp.zeros_like(self.placement.mf_rhs)
             if self.forest.has_prescribed_response

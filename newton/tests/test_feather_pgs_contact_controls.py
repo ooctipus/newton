@@ -267,7 +267,6 @@ def _mf_speculative_rhs(scale: float) -> float:
             ),
             wp.array([1], dtype=wp.int32, device="cpu"),
             WalkTrees(),
-            wp.zeros(1, dtype=wp.int32, device="cpu"),
             0,
             wp.zeros((1,), dtype=wp.float32, device="cpu"),
             wp.array([float("inf")], dtype=wp.float32, device="cpu"),

@@ -22,7 +22,6 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
-    BodyTrees,
 )
 from newton._src.solvers.feather_pgs.row_metadata import _DENSE_META_MAX_PARENT
 from newton._src.solvers.feather_pgs.tree_factor import WalkTrees
@@ -666,34 +665,32 @@ def _bind_rows(host, device):
         general_world_count=array(np.array([worlds], np.int32)),
         general_worlds=array(np.random.default_rng(5).permutation(worlds).astype(np.int32)),
         local_solve_owner=array(np.zeros(worlds, np.int32)),
-        body_trees=_body_trees(host, device),
         dense_first=row_lines(device),
         mf_first=row_lines(device),
         du=wp.zeros(host["world_dof_indices"].size, dtype=wp.float32, device=device),
     )
-    values["walk"] = _walk(values["du"])
+    values["walk"] = _walk(values["du"], _first_art(host, device))
     return values
 
 
-def _walk(du):
-    """A walk view whose ``du`` takes the sweep's velocity change in the walk's coordinates: the fixtures' free-body
-    rows hold no speed row, so no tree is walked in a sweep."""
-    walk = WalkTrees()
-    walk.du = du
-    return walk
-
-
-def _body_trees(host, device):
+def _first_art(host, device):
     """Every world's two articulations (packed_rows' sides), its articulated block and then its free body, found from
-    their first global coordinates."""
+    their first global coordinates (:attr:`.tree_factor.WalkTrees.first_art`)."""
     indices = host["world_dof_indices"]
     worlds, dofs = indices.shape
     first_art = np.full(indices.size, -1, np.int32)
     first_art[indices[:, 0]] = 2 * np.arange(worlds)
     first_art[indices[:, dofs - 6]] = 2 * np.arange(worlds) + 1
-    body_trees = BodyTrees()
-    body_trees.first_art = wp.array(first_art, dtype=wp.int32, device=device)
-    return body_trees
+    return wp.array(first_art, dtype=wp.int32, device=device)
+
+
+def _walk(du, first_art):
+    """A walk view whose ``du`` takes the sweep's velocity change in the walk's coordinates (the fixtures' free-body
+    rows hold no speed row, so no tree is walked in a sweep) over the trees ``first_art`` finds."""
+    walk = WalkTrees()
+    walk.du = du
+    walk.first_art = first_art
+    return walk
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "MF-GS native solve requires CUDA")
@@ -753,7 +750,7 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                 for kernel, bank in zip(kernels, banks, strict=True):
                     for output in outputs:
                         wp.copy(bank[output], values[output])
-                    bound = {**values, **bank, **launch, "walk": _walk(bank["du"])}
+                    bound = {**values, **bank, **launch, "walk": _walk(bank["du"], values["walk"].first_art)}
                     wp.launch_tiled(
                         kernel,
                         dim=[launch["general_world_grid_stride"]],
@@ -871,7 +868,13 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                 results = []
                 for _storage, world_diag in (guarded, finite):
                     bank = {output: wp.clone(values[output]) for output in outputs}
-                    bound = {**values, **bank, **launch, "world_diag": world_diag, "walk": _walk(bank["du"])}
+                    bound = {
+                        **values,
+                        **bank,
+                        **launch,
+                        "world_diag": world_diag,
+                        "walk": _walk(bank["du"], values["walk"].first_art),
+                    }
                     wp.launch_tiled(
                         kernel,
                         dim=[grid],
@@ -1048,7 +1051,7 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                     )
                     bound = dict(values)
                     bound.update({name: wp.clone(values[name]) for name in outputs})
-                    bound["walk"] = _walk(bound["du"])
+                    bound["walk"] = _walk(bound["du"], values["walk"].first_art)
                     variants.append((kernel, bound))
 
                 def run(variants=variants):

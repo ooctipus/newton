@@ -9,8 +9,8 @@ velocities (BACKBONE §2).
 - the augmented state, the step's ``state_aug`` (joint forces, motion axes, body twists and wrenches);
 - the kinematic masks and the effective armature R (a kinematic coordinate holds 1e10 armature);
 - the drive topology and its rows K, prepared per coordinate apart from inverse dynamics;
-- the walk of every held tree (:class:`WalkTrees`, its refresh the factor), the compact diagonal's inverse mass
-  and where each body's tree and coordinates live (:class:`.kernels.BodyTrees`);
+- the walk of every held tree (:class:`WalkTrees`, its refresh the factor, where each body's tree and coordinates
+  live among it) and the compact diagonal's inverse mass;
 - the body inertia records, the articulation origins and the passive joint forces;
 - the mass-update cadence, its requests and the FK/ID cache.
 
@@ -38,7 +38,6 @@ from .device_preludes import DevicePrelude, substitute
 from .field_group import SolverArrays
 from .joint_table import JointTable
 from .kernels import (
-    BodyTrees,
     apply_free_root_velocity_corrections,
     build_mass_update_mask,
     compute_com_transforms,
@@ -143,8 +142,7 @@ class TreeFactor:
 
     Built in the solver's construction order: the cadence, the cache and the augmented state here, then
     :meth:`kinematic_state` and :meth:`apply_kinematic_state`, :meth:`plan` once the forest plan and the row laws
-    exist, :meth:`allocate_common`, :meth:`build_body_trees`,
-    :meth:`scatter_armature` and :meth:`install`.
+    exist, :meth:`allocate_common`, :meth:`scatter_armature`, :meth:`install` and :meth:`plan_walk`.
 
     Args:
         model: The solver's model.
@@ -180,7 +178,6 @@ class TreeFactor:
         # The effective armature by coordinate (scatter_armature): the walk's diagonal and the drives' K-free mass.
         self.dof_armature = wp.zeros(max(1, int(model.joint_dof_count)), dtype=wp.float32, device=model.device)
         self.diagonal_inverse_mass = None
-        self.body_trees = None
         self.eliminates = False
         self.block_capacity = 0
         self.block_count = 0
@@ -512,23 +509,6 @@ class TreeFactor:
         """Copy the effective armature (DOF-ordered) to the coordinates' (:attr:`dof_armature`)."""
         if self.armature is not None and self.armature.size:
             self.dof_armature.assign(self.armature.astype(np.float32))
-
-    def build_body_trees(self) -> None:
-        """Build where each body's tree and coordinates live (:class:`.kernels.BodyTrees`): each body's articulation,
-        each articulation's first coordinate, and the articulation whose coordinates start at each global coordinate.
-        Built once with the buffers: a captured step allocates and copies nothing."""
-        model, forest = self.model, self.forest
-        device = model.device
-        first_art = np.full(max(int(model.joint_dof_count), 1), -1, dtype=np.int32)
-        if int(model.articulation_count) > 0:
-            starts = forest.articulation_dof_start.numpy()
-            responding = np.flatnonzero(forest.articulation_response_dof_count.numpy() > 0)
-            first_art[starts[responding]] = responding
-        body_trees = BodyTrees()
-        body_trees.body_to_articulation = forest.body_to_articulation
-        body_trees.dof_start = forest.articulation_dof_start
-        body_trees.first_art = wp.array(first_art, dtype=wp.int32, device=device)
-        self.body_trees = body_trees
 
     def install(self, solver) -> None:
         """Hold the dynamics (:func:`.held_tree.install`); the drive rows' preparation overlaps FK/ID on a stream of
@@ -962,6 +942,14 @@ class TreeFactor:
             depth if self.walk_slip_capacity else 1,
             device,
         )
+        # Where each body's tree lives: its articulation, and the responding articulation whose coordinates start at
+        # each global coordinate (-1 elsewhere), by which a matrix-free sweep finds a free body's tree.
+        view.body_art = forest.body_to_articulation
+        first_art = np.full(dofs, -1, dtype=np.int32)
+        starts = forest.articulation_dof_start.numpy()
+        responding = np.flatnonzero(forest.articulation_response_dof_count.numpy() > 0)
+        first_art[starts[responding]] = responding
+        view.first_art = wp.array(first_art, dtype=wp.int32, device=device)
         self.walk_trees = view
         self.plan_leave()
 
@@ -2404,7 +2392,10 @@ class WalkTrees:
       step and the step's one leave walks down (:func:`walk_leave_kernel`);
     - ``release``: the release of each tree's slips (the block primitive's first phase, :class:`WalkRelease`), which the
       predictor's border writes (:func:`.tree_kinetic_state.border_solve`, FL3.9): the rows take ``R``, the leave
-      ``R^T`` and the audit's coordinates ``R^-T``.
+      ``R^T`` and the audit's coordinates ``R^-T``;
+    - ``body_art``: each body's articulation; ``first_art``: the responding articulation whose coordinates start at
+      each global coordinate (-1 elsewhere), by which a matrix-free sweep finds a free body's tree
+      (:class:`.sweep_routes.FreeBodyCoordinates`).
     """
 
     data: wp.array2d[float]
@@ -2425,6 +2416,8 @@ class WalkTrees:
     body_joint: wp.array[int]
     release: WalkRelease
     du: wp.array[float]
+    body_art: wp.array[int]
+    first_art: wp.array[int]
 
 
 def empty_walk_view(model, forest) -> WalkTrees:
@@ -2450,6 +2443,8 @@ def empty_walk_view(model, forest) -> WalkTrees:
     view.dof_body = view.body_joint = wp.zeros(1, dtype=wp.int32, device=device)
     view.du = wp.zeros(1, dtype=wp.float32, device=device)
     view.release = release_view(max(int(model.articulation_count), 1), 0, 1, device)
+    view.body_art = forest.body_to_articulation
+    view.first_art = wp.full(1, -1, dtype=wp.int32, device=device)
     return view
 
 

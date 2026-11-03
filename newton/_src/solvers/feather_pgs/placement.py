@@ -1070,7 +1070,6 @@ class Placement:
                 bind_mf_rows(self),
                 self.mf_constraint_count,
                 self.factor.walk_view(),
-                self.forest.body_to_articulation,
                 int(self.forest.has_prescribed_response),
                 v_hat,
                 self.laws.rigid_body_max_depenetration_velocity,

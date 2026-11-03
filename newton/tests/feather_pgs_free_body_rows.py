@@ -15,7 +15,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import sweep_routes
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT, BodyTrees
+from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
 from newton._src.solvers.feather_pgs.tree_factor import unpack_walk_records
 from newton.tests.feather_pgs_law_harness import chain_walk
 
@@ -87,8 +87,6 @@ def sweep_free_body_rows(
         out[0, :rows] = values
         return wp.array(out, device=device)
 
-    body_trees = BodyTrees()
-    body_trees.first_art = wp.array(np.array((0, -1, -1, -1, -1, -1), np.int32), device=device)
     values = {
         "general_world_count": wp.array((1,), dtype=wp.int32, device=device),
         "general_worlds": wp.zeros(1, dtype=wp.int32, device=device),
@@ -104,7 +102,6 @@ def sweep_free_body_rows(
         "mf_Z_b": wp.zeros((1, capacity, 6), dtype=wp.float32, device=device),
         "mf_row_mu": per_row(mu),
         "mf_row_w": per_row(np.ones(rows) if weights is None else weights),
-        "body_trees": body_trees,
         # The body's unit factor as a walk: the sweep adds its change into walk.du, which no row reads back.
         "walk": chain_walk(device, [np.eye(6)]),
         "iterations": int(iterations),

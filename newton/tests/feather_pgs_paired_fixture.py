@@ -15,7 +15,6 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs import paired_components as components
 from newton._src.solvers.feather_pgs import response_builds_rows, sweep_routes, sweep_routes_local
-from newton._src.solvers.feather_pgs.kernels import BodyTrees
 from newton._src.solvers.feather_pgs.tree_factor import WalkTrees
 from newton.tests.feather_pgs_law_harness import row_lines
 
@@ -185,9 +184,9 @@ def solve_fixture(device):
         ("mf_Z_b", "mf_Z_b"),
     ):
         arrays[target] = getattr(data, field)
-    arrays["body_trees"] = BodyTrees()
     # The sweeps add their velocity change in the walk's coordinates to the walk's du, from zero (the step's one leave
-    # walks it down): the fixture's rows hold no free-body speed row, so no tree is walked in a sweep.
+    # walks it down): the fixture's rows hold no free-body speed row, so no tree is walked in a sweep. Its trees'
+    # first coordinates (first_art) are set with the packed rows.
     walk = WalkTrees()
     walk.du = array(np.zeros(145, np.float32))
     arrays["walk"] = walk
@@ -237,7 +236,7 @@ def _packed_rows(host, arrays, device):
     arrays["packed_dense"] = 1
     arrays["packed_Z"] = wp.array(host["Y"], dtype=wp.float32, device=device)
     arrays["row_sides"] = wp.array(sides, dtype=wp.vec2i, device=device)
-    arrays["body_trees"].first_art = wp.array(first_art, dtype=wp.int32, device=device)
+    arrays["walk"].first_art = wp.array(first_art, dtype=wp.int32, device=device)
 
 
 def solve_pair_launches(data, arrays, *, enabled, arch, iterations=8):

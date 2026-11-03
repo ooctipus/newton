@@ -941,6 +941,11 @@ def chain_walk(device, lowers) -> WalkTrees:
     walk.joint_start, walk.joint_end = ints(start[:-1]), ints(start[1:])
     walk.dof_start, walk.dofs = ints(start[:-1]), ints(sizes)
     walk.dof_body, walk.body_joint = ints(dof_body), ints(np.arange(total))
+    # Each chain's articulation at its first coordinate (a free body's tree, found by a sweep).
+    walk.body_art = walk.joint_art
+    first_art = np.full(total, -1, dtype=np.int32)
+    first_art[start[:-1]] = np.arange(arts)
+    walk.first_art = ints(first_art)
     release = WalkRelease()
     release.count = ints(np.zeros(arts))
     release.dof = wp.zeros((1, 1), dtype=wp.int32, device=device)
@@ -1076,14 +1081,11 @@ def recomputing(solver):
     return solver
 
 
-def articulation_factor(mass, device):
-    """The :class:`.kernels.BodyTrees` of one articulation on global coordinates ``0..n-1`` with mass matrix
-    ``mass``, and its leaf-first factor ``L`` (``P mass P^T = L L^T``, ``P`` reversing the coordinates, float64)."""
+def articulation_factor(mass):
+    """The leaf-first factor ``L`` of one articulation with mass matrix ``mass`` (``P mass P^T = L L^T``, ``P``
+    reversing the coordinates, float64)."""
     mass = np.asarray(mass, dtype=np.float64)
-    n = mass.shape[0]
-    body_trees = kernels.BodyTrees()
-    body_trees.first_art = wp.array([0] + [-1] * (n - 1), dtype=wp.int32, device=device)
-    return body_trees, np.linalg.cholesky(mass[::-1, ::-1])
+    return np.linalg.cholesky(mass[::-1, ::-1])
 
 
 def whitened_rows(jacobian, L) -> np.ndarray:

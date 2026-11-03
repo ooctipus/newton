@@ -38,7 +38,7 @@ from .dense_rows import bind as bind_dense_rows
 from .dense_rows import bind_mf as bind_mf_rows
 from .field_group import Field, FieldGroup, SolverArrays
 from .friction_patches import patch_normal_load
-from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL, BodyTrees
+from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL
 from .packed_rows import WIDE
 from .row_laws import (
     ROW_CONTACT,
@@ -49,7 +49,7 @@ from .row_laws import (
     ROW_TORSION,
 )
 from .sparse_mass_matrix import _SparseRowSupport
-from .tree_factor import walk_enter_kernel
+from .tree_factor import WalkTrees, walk_enter_kernel
 
 __all__ = ["AUDIT_FIELDS", "AUDIT_SLOTS", "Audit"]
 
@@ -278,7 +278,7 @@ def walked_side(
     line: int,
     row: int,
     body: int,
-    body_trees: BodyTrees,
+    walk: WalkTrees,
     world: int,
     world_offset: wp.array[int],
     coordinates: wp.array2d[float],
@@ -287,7 +287,7 @@ def walked_side(
     (:func:`.tree_factor.walk_enter_kernel`)."""
     if body < 0:
         return 0.0
-    start = world_offset[body_trees.body_to_articulation[body]]
+    start = world_offset[walk.body_art[body]]
     out = float(0.0)
     for k in range(6):
         out += Z[line, row, k] * coordinates[world, start + k]
@@ -298,7 +298,7 @@ def walked_side(
 def free_rows(
     a: AuditRows,
     mf: MfRows,
-    body_trees: BodyTrees,
+    walk: WalkTrees,
     impulses: wp.array2d[float],
     weights: wp.array2d[float],
     inverse_diagonals: wp.array2d[float],
@@ -316,13 +316,13 @@ def free_rows(
         kind = mf.row_type[line, i]
         body = mf.body_a[line, i]
         if kind == ROW_JOINT_VELOCITY_LIMIT:
-            start = body_trees.dof_start[body_trees.body_to_articulation[body]]
+            start = walk.dof_start[walk.body_art[body]]
             if mf.Z_a[line, i, 3] != 0.0:
                 start += 3
             velocity[world, i] = -wp.length(wp.vec3(v[start], v[start + 1], v[start + 2]))
             continue
-        term = walked_side(mf.Z_a, line, i, body, body_trees, world, world_offset, coordinates)
-        term += walked_side(mf.Z_b, line, i, mf.body_b[line, i], body_trees, world, world_offset, coordinates)
+        term = walked_side(mf.Z_a, line, i, body, walk, world, world_offset, coordinates)
+        term += walked_side(mf.Z_b, line, i, mf.body_b[line, i], walk, world, world_offset, coordinates)
         inverse = inverse_diagonals[line, i]
         if inverse > 0.0:
             weight = float(1.0)
@@ -558,7 +558,7 @@ class Audit:
             inputs = [
                 a,
                 mf,
-                solver.factor.body_trees,
+                solver.factor.walk_view(),
                 solver.placement.mf_impulses,
                 solver.placement.mf_row_w,
                 solver.placement.mf_eff_mass_inv,

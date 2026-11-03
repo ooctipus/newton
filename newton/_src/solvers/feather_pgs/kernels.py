@@ -1634,32 +1634,6 @@ def populate_world_J_for_compact_size(
                 J_group[at[0], slot + CONTACT_SPIN_ROW, at[1] + local_dof] = spin_b
 
 
-# ---------------------------------------------------------------------------------------------------------------------
-# Free bodies in walk coordinates
-# ---------------------------------------------------------------------------------------------------------------------
-#
-# A free body is a one-node tree: its six velocity coordinates (its center-of-mass velocity, then its angular
-# velocity) have the 6x6 mass matrix ``H``, armature included, which the walk takes leaf-first (``P`` reverses the
-# coordinates). The walk whitens a free-body row, ``Z`` per body, and the sweeps hold the change of the body's
-# velocity in the walk's coordinates ``u``, the walk in of ``dv`` (``WALK_ENTER``; ``u . u = dv^T H dv``): a row's
-# velocity term is ``Z^T u`` (``J dv``), its update ``u += Z dlambda``, and the walk down leaves ``dv``. Walk
-# coordinate ``i`` of ``Z`` and ``u`` sits at position ``5 - i``, the physical coordinate it reverses
-# (:func:`.response_operator.leaf_first`). The walk whitens the rows and leaves them (:mod:`.walk_rows`,
-# :func:`.tree_factor.walk_leave_kernel`).
-
-
-@wp.struct
-class BodyTrees:
-    """Where each body's tree and velocity coordinates live: its articulation (``body_to_articulation``), the
-    articulation's first coordinate (``dof_start``), and the articulation whose coordinates start at each global
-    coordinate (``first_art``, -1 elsewhere), by which the sweeps find a free body's tree to walk
-    (:class:`.sweep_routes.FreeBodyCoordinates`)."""
-
-    body_to_articulation: wp.array[int]
-    dof_start: wp.array[int]
-    first_art: wp.array[int]
-
-
 @wp.kernel
 def populate_world_J_for_size(
     data: ContactInput,
@@ -1979,6 +1953,15 @@ def invalidate_articulation_fk_id_cache(
 # =============================================================================
 # Matrix-Free PGS Kernels for Free Rigid Bodies
 # =============================================================================
+#
+# A free body is a one-node tree: its six velocity coordinates (its center-of-mass velocity, then its angular
+# velocity) have the 6x6 mass matrix ``H``, armature included, which the walk takes leaf-first (``P`` reverses the
+# coordinates). The walk whitens a free-body row, ``Z`` per body, and the sweeps hold the change of the body's
+# velocity in the walk's coordinates ``u``, the walk in of ``dv`` (``WALK_ENTER``; ``u . u = dv^T H dv``): a row's
+# velocity term is ``Z^T u`` (``J dv``), its update ``u += Z dlambda``, and the walk down leaves ``dv``. Walk
+# coordinate ``i`` of ``Z`` and ``u`` sits at position ``5 - i``, the physical coordinate it reverses
+# (:func:`.response_operator.leaf_first`). The walk whitens the rows and leaves them (:mod:`.walk_rows`,
+# :func:`.tree_factor.walk_leave_kernel`).
 
 
 @wp.func

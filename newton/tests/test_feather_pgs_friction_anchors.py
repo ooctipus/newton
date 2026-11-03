@@ -384,7 +384,6 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, device="cpu"):
                 ),
                 count,
                 WalkTrees(),
-                wp.zeros(1, dtype=wp.int32, device=device),
                 0,
                 wp.zeros((1,), dtype=wp.float32, device=device),
                 inf,
