@@ -961,7 +961,7 @@ def support_rows(solver) -> dict:
     ``{art: z}``, read through the support table or the explicit coordinates (factor coordinates, the plan's
     ``permutation`` back to the tree's)."""
     forest, placement, factor = solver.forest, solver.placement, solver.factor
-    perm = np.asarray(factor.sparse_mass_matrix_plan.permutation)
+    perm = np.asarray(factor.sparse_pattern.permutation)
     size = int(placement.sparse_mass_matrix_size)
     Z = placement.sparse_row_factor.numpy().astype(np.float64)
     table = bool(placement.sparse_row_support.enabled)

@@ -12,7 +12,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import tree_kinetic_state
 from newton._src.solvers.feather_pgs import tree_scan as ts
-from newton._src.solvers.feather_pgs.held_tree import TreeSparseOperator
+from newton._src.solvers.feather_pgs.held_tree import SparseHeldOperator
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
@@ -85,7 +85,7 @@ def fixture(floating, device):
     solver.placement.sparse_mass_matrix_size = count
     solver.factor.allocate_sparse(mass)
     solver.factor.sparse_factor_warps_per_block = 4
-    operator = TreeSparseOperator(solver)
+    operator = SparseHeldOperator(solver)
     owner = TreeKineticState(operator)
     operator.kinetic_state = owner
     return model, solver, operator, owner, mass

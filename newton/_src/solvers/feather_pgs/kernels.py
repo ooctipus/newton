@@ -1641,24 +1641,25 @@ def populate_world_J_for_compact_size(
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Free bodies in factor coordinates
+# Free bodies in walk coordinates
 # ---------------------------------------------------------------------------------------------------------------------
 #
 # A free body is a one-node tree: its six velocity coordinates (its center-of-mass velocity, then its angular
-# velocity) have the 6x6 mass matrix ``H`` the walk factors leaf-first, ``P H P^T = L L^T`` with ``P`` the
-# coordinates reversed, armature included. A free-body row is whitened, ``Z = L^-1 P J^T`` per body, and the sweeps
-# hold the change of the body's velocity in factor coordinates ``u = L^T P dv``: a row's velocity term is ``Z^T u``,
-# its update ``u += Z dlambda``, and ``dv = P^T L^-T u`` leaves them. Factor coordinate ``i`` of ``Z`` and ``u`` sits at position ``5 - i``, the physical coordinate it
-# reverses (:func:`.response_operator.leaf_first`). The walk whitens the rows and leaves them (:mod:`.walk_rows`,
+# velocity) have the 6x6 mass matrix ``H``, armature included, which the walk takes leaf-first (``P`` reverses the
+# coordinates). The walk whitens a free-body row, ``Z`` per body, and the sweeps hold the change of the body's
+# velocity in the walk's coordinates ``u``, the walk in of ``dv`` (``WALK_ENTER``; ``u . u = dv^T H dv``): a row's
+# velocity term is ``Z^T u`` (``J dv``), its update ``u += Z dlambda``, and the walk down leaves ``dv``. Walk
+# coordinate ``i`` of ``Z`` and ``u`` sits at position ``5 - i``, the physical coordinate it reverses
+# (:func:`.response_operator.leaf_first`). The walk whitens the rows and leaves them (:mod:`.walk_rows`,
 # :func:`.tree_factor.walk_leave_kernel`).
 
 
 @wp.struct
-class BodyFactors:
+class BodyTrees:
     """Where each body's tree and velocity coordinates live: its articulation (``body_to_articulation``), the
     articulation's first coordinate (``dof_start``), and the articulation whose coordinates start at each global
     coordinate (``first_art``, -1 elsewhere), by which the sweeps find a free body's tree to walk
-    (:class:`.sweep_routes.FactorCoordinates`)."""
+    (:class:`.sweep_routes.FreeBodyCoordinates`)."""
 
     body_to_articulation: wp.array[int]
     dof_start: wp.array[int]

@@ -320,7 +320,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
 
     def _sparse_rows_physical(self, solver, world, count):
         """Recover physical Jacobians independently from the stored inverse factors."""
-        plan = solver.factor.sparse_mass_matrix_plan
+        plan = solver.factor.sparse_pattern
         size = plan.dof_count
         row_dof, values = solver.placement.sparse_row_dof.numpy(), solver.placement.sparse_row_factor.numpy()
         shared = solver.placement.sparse_row_support

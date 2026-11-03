@@ -22,7 +22,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
-    BodyFactors,
+    BodyTrees,
 )
 from newton._src.solvers.feather_pgs.row_metadata import _DENSE_META_MAX_PARENT
 from newton._src.solvers.feather_pgs.tree_factor import WalkTrees
@@ -666,7 +666,7 @@ def _bind_rows(host, device):
         general_world_count=array(np.array([worlds], np.int32)),
         general_worlds=array(np.random.default_rng(5).permutation(worlds).astype(np.int32)),
         local_solve_owner=array(np.zeros(worlds, np.int32)),
-        factors=_body_factors(host, device),
+        body_trees=_body_trees(host, device),
         dense_first=row_lines(device),
         mf_first=row_lines(device),
         du=wp.zeros(host["world_dof_indices"].size, dtype=wp.float32, device=device),
@@ -683,7 +683,7 @@ def _walk(du):
     return walk
 
 
-def _body_factors(host, device):
+def _body_trees(host, device):
     """Every world's two articulations (packed_rows' sides), its articulated block and then its free body, found from
     their first global coordinates."""
     indices = host["world_dof_indices"]
@@ -691,9 +691,9 @@ def _body_factors(host, device):
     first_art = np.full(indices.size, -1, np.int32)
     first_art[indices[:, 0]] = 2 * np.arange(worlds)
     first_art[indices[:, dofs - 6]] = 2 * np.arange(worlds) + 1
-    factors = BodyFactors()
-    factors.first_art = wp.array(first_art, dtype=wp.int32, device=device)
-    return factors
+    body_trees = BodyTrees()
+    body_trees.first_art = wp.array(first_art, dtype=wp.int32, device=device)
+    return body_trees
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "MF-GS native solve requires CUDA")
@@ -992,7 +992,7 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             with mock.patch.dict(fpgs.SolverFeatherPGS._route_pins, pins):
                 solvers[request] = fpgs.SolverFeatherPGS(model, **options)
         dofs = solvers["0"].forest.max_world_dofs
-        # The factor coordinates' bitmap (sweep_routes.FactorCoordinates): a word a 32 coordinates.
+        # The factor coordinates' bitmap (sweep_routes.FreeBodyCoordinates): a word a 32 coordinates.
         bitmaps = (dofs + 31) // 32
         if 128 + 4 * (dofs + bitmaps + 320 + 12288) > device.max_shared_memory_per_block:
             self.skipTest("The device streams these MF impulses by capacity")

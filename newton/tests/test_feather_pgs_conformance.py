@@ -22,7 +22,7 @@ Routes
     parallel and keyed-parallel tiers, local owners (row packets and owned rows), the paired factor sweep
     and the sparse-diagonal sweep (sparse-diagonal rows and the compact contact
     boundary); on CPU, the general row of the matrix-free sweep, one thread per
-    world. Dynamics owners: ``TreeSparseOperator``,
+    world. Dynamics owners: ``SparseHeldOperator``,
     ``TreeHeldOperator``, ``ForestHeldOperator``, scalar branches and ordinary
     dynamics. Contact-row producers: sparse response, compact Jacobian, general
     (per contact and masked), keyed rows, local packets, sparse diagonal and
@@ -1445,7 +1445,7 @@ SPARSE = Route(
         "sweep.route": "sparse_pgs",
         "contact_rows.producer": "walk",
         "held_tree.owner": "tree",
-        "held_tree.groups.0.operator": "TreeSparseOperator",
+        "held_tree.groups.0.operator": "SparseHeldOperator",
         "sparse_mass_matrix.contact_triplets": False,
     },
 )

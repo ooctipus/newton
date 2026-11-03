@@ -60,7 +60,7 @@ def row_sides(art_a: int, art_b: int, response_dofs: wp.array[int]) -> wp.vec2i:
     (:func:`row_side`), the first by index, then the second or -1 (none, or the same).
 
     Every side therefore holds coordinates at a first world coordinate, which every reader of the sides takes as given:
-    the packed rows' entries, the sweeps' factor coordinates (:class:`.sweep_routes.FactorCoordinates` marks a side
+    the packed rows' entries, the sweeps' factor coordinates (:class:`.sweep_routes.FreeBodyCoordinates` marks a side
     at that coordinate). The rows that name one articulation write its size group's articulation, which has them.
     Articulation indices ascend with a world's coordinates, so a packed row's entries (:mod:`.packed_rows`) ascend too.
     """

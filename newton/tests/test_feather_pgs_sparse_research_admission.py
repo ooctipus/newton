@@ -206,7 +206,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
                     dense_max_constraints=40,
                 )
                 self.assertEqual(solver.placement.sparse_mass_matrix_size, 18)
-                self.assertEqual(solver.factor.sparse_mass_matrix_plan.nonzero_count, nonzeros)
+                self.assertEqual(solver.factor.sparse_pattern.nonzero_count, nonzeros)
                 self.assertEqual(solver.placement.sparse_row_factor.shape[2], support)
                 self.assertIsNone(solver.sweep.mf_gs_kernel)
                 self.assertEqual(solver.sweep.tiers, [])

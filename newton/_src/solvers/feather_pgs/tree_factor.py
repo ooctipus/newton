@@ -9,7 +9,8 @@ velocities (BACKBONE §2).
 - the augmented state, the step's ``state_aug`` (joint forces, motion axes, body twists and wrenches);
 - the kinematic masks and the effective armature R (a kinematic coordinate holds 1e10 armature);
 - the drive topology and its rows K, prepared per coordinate apart from inverse dynamics;
-- L and R per size group, the compact diagonal's inverse mass and the free bodies' 6x6 factors;
+- the walk of every held tree (:class:`WalkTrees`, its refresh the factor), the compact diagonal's inverse mass
+  and where each body's tree and coordinates live (:class:`.kernels.BodyTrees`);
 - the body inertia records, the articulation origins and the passive joint forces;
 - the mass-update cadence, its requests and the FK/ID cache.
 
@@ -36,7 +37,7 @@ from .device_preludes import DevicePrelude, substitute
 from .field_group import SolverArrays
 from .joint_table import JointTable
 from .kernels import (
-    BodyFactors,
+    BodyTrees,
     apply_free_root_velocity_corrections,
     build_mass_update_mask,
     compute_com_transforms,
@@ -141,7 +142,7 @@ class TreeFactor:
 
     Built in the solver's construction order: the cadence, the cache and the augmented state here, then
     :meth:`kinematic_state` and :meth:`apply_kinematic_state`, :meth:`plan` once the forest plan and the row laws
-    exist, :meth:`allocate_common`, :meth:`build_body_factors`,
+    exist, :meth:`allocate_common`, :meth:`build_body_trees`,
     :meth:`scatter_armature` and :meth:`install`.
 
     Args:
@@ -178,7 +179,7 @@ class TreeFactor:
         # The effective armature by coordinate (scatter_armature): the walk's diagonal and the drives' K-free mass.
         self.dof_armature = wp.zeros(max(1, int(model.joint_dof_count)), dtype=wp.float32, device=model.device)
         self.diagonal_inverse_mass = None
-        self.body_factors = None
+        self.body_trees = None
         self.eliminates = False
         self.block_capacity = 0
         self.block_count = 0
@@ -502,7 +503,7 @@ class TreeFactor:
     def allocate_sparse(self, plan) -> None:
         """The sparse class's pattern ``plan`` and its coordinates' ancestor masks (the support writer's): the walk is
         its factor (Z4.3), so it holds no factor array."""
-        self.sparse_mass_matrix_plan = plan
+        self.sparse_pattern = plan
         self.sparse_ancestor_mask = wp.array(plan.ancestor_mask, dtype=wp.uint64, device=self.model.device)
 
     def scatter_armature(self) -> None:
@@ -510,8 +511,8 @@ class TreeFactor:
         if self.armature is not None and self.armature.size:
             self.dof_armature.assign(self.armature.astype(np.float32))
 
-    def build_body_factors(self) -> None:
-        """Build where each body's tree and coordinates live (:class:`.kernels.BodyFactors`): each body's articulation,
+    def build_body_trees(self) -> None:
+        """Build where each body's tree and coordinates live (:class:`.kernels.BodyTrees`): each body's articulation,
         each articulation's first coordinate, and the articulation whose coordinates start at each global coordinate.
         Built once with the buffers: a captured step allocates and copies nothing."""
         model, forest = self.model, self.forest
@@ -521,16 +522,11 @@ class TreeFactor:
             starts = forest.articulation_dof_start.numpy()
             responding = np.flatnonzero(forest.articulation_response_dof_count.numpy() > 0)
             first_art[starts[responding]] = responding
-        factors = BodyFactors()
-        factors.body_to_articulation = forest.body_to_articulation
-        factors.dof_start = forest.articulation_dof_start
-        factors.first_art = wp.array(first_art, dtype=wp.int32, device=device)
-        self.body_factors = factors
-
-    def view(self) -> BodyFactors:
-        """The operand struct of the walk's free-body reads: where each body's tree and coordinates live
-        (:meth:`build_body_factors`)."""
-        return self.body_factors
+        body_trees = BodyTrees()
+        body_trees.body_to_articulation = forest.body_to_articulation
+        body_trees.dof_start = forest.articulation_dof_start
+        body_trees.first_art = wp.array(first_art, dtype=wp.int32, device=device)
+        self.body_trees = body_trees
 
     def install(self, solver) -> None:
         """Hold the dynamics (:func:`.held_tree.install`); the drive rows' preparation overlaps FK/ID on a stream of

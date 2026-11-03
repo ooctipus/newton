@@ -17,7 +17,7 @@ import warp as wp
 from . import kernel_template, sweep_units
 from .device_preludes import CPU_MATH, RING, SHARED_STORAGE, cuda_native, dual_native, lane_group
 from .kernel_template import KernelTemplate
-from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL, BodyFactors
+from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL, BodyTrees
 from .launch import device_lanes
 from .law_source import law_preludes
 from .packed_rows import PACKED_SIDES
@@ -82,7 +82,7 @@ MF_GS_ABI = kernel_template.params(
     ("mf_impulses", wp.array2d[float]),
     ("mf_Z_a", wp.array3d[float]),
     ("mf_Z_b", wp.array3d[float]),
-    ("factors", BodyFactors),
+    ("body_trees", BodyTrees),
     ("mf_row_mu", wp.array2d[float]),
     ("mf_row_w", wp.array2d[float]),
     ("iterations", int),
@@ -93,14 +93,14 @@ MF_GS_ABI = kernel_template.params(
 """The matrix-free sweep's native ABI: one world per call (the world queue's dispatch)."""
 
 
-class FactorCoordinates:
-    """The way into and out of factor coordinates of a free body a matrix-free sweep's speed rows read (native).
+class FreeBodyCoordinates:
+    """The way into and out of a free body's walk coordinates, which a matrix-free sweep's speed rows read (native).
 
-    A sweep runs on the velocity change from the predictor in factor coordinates, ``du`` (``s_v``, from zero): a row's
+    A sweep runs on the velocity change from the predictor in walk coordinates, ``du`` (``s_v``, from zero): a row's
     residual is its right-hand side, which holds its incident velocity ``J v_hat``, plus ``Z^T du``, and its update
     ``du += Z delta``. The sweep adds its change to the walk's ``du`` and the step's one leave walks every tree down
     (:func:`.tree_factor.walk_leave_kernel`). A free body's speed row reads the body's physical velocity mid-sweep: its
-    tree (found from its first global coordinate, :class:`.kernels.BodyFactors`' ``first_art``) is walked down and
+    tree (found from its first global coordinate, :class:`.kernels.BodyTrees`' ``first_art``) is walked down and
     back in place (:meth:`walk_leave`, :meth:`walk_enter`).
     """
 
@@ -121,7 +121,7 @@ class FactorCoordinates:
         """``call`` (a walk of :func:`.tree_factor.walk_paths_prelude` on ``data``, ``link`` and ``twist``) on the tree
         whose first world coordinate is ``first``."""
         return f"""{{
-    const int body_art = {self.op.factors}.first_art.data[world_dof_indices.data[dof_map_base + {first}]];
+    const int body_art = {self.op.body_trees}.first_art.data[world_dof_indices.data[dof_map_base + {first}]];
     const int j0 = walk.joint_start.data[body_art], d0 = walk.dof_start.data[body_art];
     const float* data = walk.data.data + (size_t)d0 * {WALK_COORDINATE};
     const float* link = walk.link.data + (size_t)j0 * {WALK_LINK};
@@ -146,8 +146,8 @@ class FactorCoordinates:
         return self._walked(first, f"WALK_ENTER(data, link, {velocity}, {out}, twist)")
 
 
-FACTOR_COORDINATES = FactorCoordinates()
-"""The free bodies' way into and out of factor coordinates in a matrix-free sweep (:class:`FactorCoordinates`)."""
+FREE_BODY_COORDINATES = FreeBodyCoordinates()
+"""The free bodies' way into and out of walk coordinates in a matrix-free sweep (:class:`FreeBodyCoordinates`)."""
 
 
 def packed_operator(support: int, lanes: Lanes, *, wide: bool = False) -> SparseFactor:
@@ -559,7 +559,7 @@ def mf_gs_staging(
         (
             Buffer("s_v", "float", max_world_dofs),
             *((Buffer("s_sweep_v", "float", max_world_dofs),) if wide_rows else ()),
-            *FACTOR_COORDINATES.buffers(max_world_dofs),
+            *FREE_BODY_COORDINATES.buffers(max_world_dofs),
             *dense.buffers(),
             *free.buffers(),
             *colored,
@@ -593,11 +593,11 @@ def mf_gs_source(
 ) -> tuple[str, Staging]:
     """The native body of the matrix-free Gauss-Seidel sweep: a world's dense rows (:func:`packed_operator`, packed
     whitened rows of ``max_row_dofs`` entries, by default as many as the world's coordinates) and its free-body rows
-    (:class:`.FreeBodyZ`), then its end-of-sweep passes, on the world's velocity change from the predictor in factor
-    coordinates (:class:`FactorCoordinates`), from zero, or with ``seeded`` from the response of the impulses the
+    (:class:`.FreeBodyZ`), then its end-of-sweep passes, on the world's velocity change from the predictor in walk
+    coordinates (:class:`FreeBodyCoordinates`), from zero, or with ``seeded`` from the response of the impulses the
     rows carry (:func:`.sweep.impulse_seed`). The launch adds it to the walk's ``du`` (:attr:`.tree_factor.WalkTrees.du`),
     which the step's one leave walks down onto ``v_out`` (:func:`.tree_factor.walk_leave_kernel`); a free body's speed
-    row reads the body's velocity through its walk (:class:`FactorCoordinates`).
+    row reads the body's velocity through its walk (:class:`FreeBodyCoordinates`).
 
     ``mapping`` places the free-body rows on threads (:data:`MAPPINGS`): ``"warp"``, the world's warp visits them in
     row order; ``"colored"``, a block of :data:`COLORED_THREADS` visits their colors in order and a color's units at
@@ -632,7 +632,7 @@ def mf_gs_source(
     )
     free = FreeBodyRows(M_MF, stream=stream_mf_impulses, lanes=row_lanes)
     dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows)
-    bodies = FACTOR_COORDINATES
+    bodies = FREE_BODY_COORDINATES
     # The free bodies' speed rows leave and enter by the walk, as their rows were written (walk_rows).
     free_op = FreeBodyZ(row_lanes, walk_leave=bodies.walk_leave, walk_enter=bodies.walk_enter)
     staging = mf_gs_staging(
@@ -912,7 +912,7 @@ def mf_gs_kernel(
         extra=(
             *material_arguments(material),
             *solve_policy.arguments,
-            RowArgument("walk", WalkTrees, after="factors"),
+            RowArgument("walk", WalkTrees, after="body_trees"),
         ),
         composed=True,
         native_name="sweep_mf_colored_native" if colored else "sweep_mf_gs_native",

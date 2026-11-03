@@ -12,7 +12,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.held_tree import TreeSparseOperator
+from newton._src.solvers.feather_pgs.held_tree import SparseHeldOperator
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
 from newton._src.solvers.feather_pgs.tree_kinetic_plan import make_plan
@@ -68,7 +68,7 @@ def fixture(floating, device, *, permuted=True, motion=False):
     solver.factor.passive_spring_ref.fill_(-0.1)
     solver.factor.passive_joint_damping.fill_(0.19)
     model.joint_velocity_limit.fill_(0.25)
-    operator = TreeSparseOperator(solver)
+    operator = SparseHeldOperator(solver)
     owner = TreeKineticState(operator)
     operator.kinetic_state = owner
     return model, solver, operator, owner, mass

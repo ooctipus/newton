@@ -5,7 +5,8 @@
 
 One owner (:class:`HeldTree`) composes the groups that evaluate every articulation
 (:class:`~.tree_kinetic_owner.TreeKineticState`, plus the scalar branches' group). The solver's data chooses them:
-the native sparse factor, when the solver admitted one, makes one complete group (:class:`TreeSparseOperator`);
+the sparse class, when the solver admitted one, makes one complete group that walks its pattern
+(:class:`SparseHeldOperator`);
 otherwise each size group is a group that responds by its walk or by the compact diagonal
 (:class:`TreeHeldOperator`), kinematic free bodies a zero-response group (:class:`PrescribedRootOperator`), or one
 group per world spans its articulations (:class:`ForestHeldOperator`). Every group's collection writes its drives' K-free
@@ -249,14 +250,15 @@ def compact_decline(solver, size, *, scalar) -> str | None:
     return None
 
 
-class TreeSparseOperator:
-    """Respond through the walk over the sparse class's pattern (its plan): the walk is the factor (Z4.3), refreshed by
-    :meth:`.tree_factor.TreeFactor.walk_step`, so the group holds no factor array and refreshes nothing of its own."""
+class SparseHeldOperator:
+    """The sparse class's trees as one complete held group: it responds through the walk over the class's pattern
+    (:attr:`.tree_factor.TreeFactor.sparse_pattern`), refreshed by :meth:`.tree_factor.TreeFactor.walk_step`, and holds
+    and refreshes nothing of its own."""
 
     def __init__(self, solver):
         self.solver = solver
         self.requires_body_velocity = True
-        mass = solver.factor.sparse_mass_matrix_plan
+        mass = solver.factor.sparse_pattern
         device = solver.model.device
         self.host = operator_metadata(mass)
         self.plan = bind_group_trees(solver, self.host, solver.forest.group_to_art[mass.dof_count])
@@ -569,9 +571,9 @@ class HeldTree:
             self.bank_compare = self.skip_captured_repairs = True
             return
         if solver.placement.sparse_mass_matrix_size is not None:
-            # The native sparse factor: one complete group, which proves its own coverage (make_plan).
+            # The sparse class: one complete group, which proves its own coverage (make_plan).
             self.coverage = self.forest_reason = None
-            operator = TreeSparseOperator(solver)
+            operator = SparseHeldOperator(solver)
             group = TreeKineticState(
                 operator,
                 admission=admission,

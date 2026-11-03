@@ -156,7 +156,7 @@ def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MAS
     count = first_row + 2
     capacity, dofs = max(4, count), 2
     chain = slice(first_row, count)
-    factors, factor = articulation_factor(mass, device)
+    body_trees, factor = articulation_factor(mass, device)
     whitened = np.zeros((1, capacity, dofs))
     whitened[0, chain] = whitened_rows(_CHAIN_JACOBIAN[rows], factor)
     diagonal = np.zeros((1, capacity), np.float32)
@@ -203,7 +203,7 @@ def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MAS
         "mf_impulses": zero_float,
         "mf_Z_a": zero_spatial,
         "mf_Z_b": zero_spatial,
-        "factors": factors,
+        "body_trees": body_trees,
         "walk": chain_walk(device, [factor]),
         "mf_row_mu": zero_float,
         "mf_row_w": zero_float,

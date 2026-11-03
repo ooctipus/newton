@@ -815,7 +815,7 @@ class Sweep:
         table = next(iter(tables))
         parent = tuple(int(p) for p, _ in table)
         first = (*(int(f) for _, f in table), int(size))
-        node = tuple(int(k) for k in factor.sparse_mass_matrix_plan.inverse_permutation)
+        node = tuple(int(k) for k in factor.sparse_pattern.inverse_permutation)
         torsion = bool(self.laws.contact_torsion_enabled)
         self.support_lanes = walk_rows.SUPPORT_UNIT_LANES if wp.get_device(model.device).is_cuda else 1
         self.support_units_kernel = walk_rows.support_units_kernel(4 if torsion else 3, self.support_lanes)
@@ -1804,7 +1804,7 @@ class Sweep:
                 "general_worlds": self.local_general_worlds,
                 "general_world_grid_stride": self.mf_gs_block_count,
                 "use_general_world_queue": int(self.placement.local_internal_fast_path),
-                "factors": self.factor.view(),
+                "body_trees": self.factor.body_trees,
             }
             if self.factor.walk_arts is not None:
                 # The general sweep built for the one writer's rows leaves by the walk (sweep_routes.leave_all).
