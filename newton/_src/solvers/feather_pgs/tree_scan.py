@@ -104,6 +104,7 @@ __all__ = [
     "WalkClass",
     "add",
     "braced",
+    "by_class",
     "channels",
     "choose_schedule",
     "cross",
@@ -1115,6 +1116,14 @@ def root_path(body: str, c: str, *, count: str = "", joint=()) -> tuple[str, str
         "}",
     ]
     return "\n".join(head), "\n".join(tail)
+
+
+def by_class(texts: list[str]) -> str:
+    """A kernel's text for each of the walking classes it serves, switched on ``cls``; the one class's text alone."""
+    if len(texts) == 1:
+        return texts[0]
+    cases = (f"case {k}: {{\n{indent_text(text, 4)}\n    break;\n}}" for k, text in enumerate(texts))
+    return "switch (cls) {\n" + "\n".join(cases) + "\n}"
 
 
 def _indented(lines, pad: int) -> list[str]:

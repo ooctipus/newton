@@ -24,7 +24,6 @@ from __future__ import annotations
 import functools
 import hashlib
 import warnings
-from string import Template
 
 import numpy as np
 import warp as wp
@@ -2241,43 +2240,29 @@ _DOWN_IN = """    // WALK_IN(d, u, p): coordinate record d's step input and the 
         return in;
     };"""
 
-_DOWN_FETCH_JOINT = "WALK_LINK_IN(link, $b, $up)"
-"""A body's joint input in the walk down: its offset to its parent's frame (``WALK_LINK_IN``)."""
-
-_DOWN_FETCH_STEP = "WALK_IN(data + $coordinate * ($c), u($c), prior($c), $half)"
-"""A coordinate's step input in the walk down: its record, its ``u`` and its output's prior value."""
-
-_DOWN_TOUCH_JOINT = "WALK_TOUCH(link + $link * ($b));"
-_DOWN_TOUCH_STEP = "WALK_TOUCH(data + $coordinate * ($c));"
-"""The lines of a body's link and a coordinate's record, asked of L1 :data:`WALK_TOUCH` items ahead of the chain."""
-
-_DOWN_JOINT = ts.braced(ts.edge(ts.Direction.DOWN, ts.FETCHED.lever, "$P", into="$V"))
-
-_DOWN_OUTPUT, *_DOWN_UPDATE = ts.step(ts.Direction.DOWN, ts.FETCHED, "$V", source="$X.u", out="const float q")
-_DOWN_STEP = ts.braced([_DOWN_OUTPUT, "qd($c, q, $X.p);", *_DOWN_UPDATE])
-
 
 def walk_down_texts() -> dict[str, str]:
-    """The one walk down's :meth:`WalkClass.walk` keywords (its joint, step, end, fetches and touches): ``u(c)``,
-    ``prior(c)``, ``qd(c, q, prior)`` and ``twist(b, V)`` are the caller's (:func:`walk_down_prelude`'s ``WALK_DOWN``)."""
+    """The one walk down, ``DOWN`` on the fetched record (:func:`.tree_scan.step`, :func:`.tree_scan.edge`), as
+    :meth:`WalkClass.walk`'s keywords: each body's offset to its parent's frame (``WALK_LINK_IN``) and each
+    coordinate's record, ``u`` and output's prior value (``WALK_IN``) fetched ahead, their lines asked of L1 first
+    (``WALK_TOUCH``). ``u(c)``, ``prior(c)``, ``qd(c, q, prior)`` and ``twist(b, V)`` are the caller's
+    (:func:`walk_down_prelude`'s ``WALK_DOWN``)."""
+    output, *update = ts.step(ts.Direction.DOWN, ts.FETCHED, "$V", source="$X.u", out="const float q")
+    record, link = f"data + {WALK_COORDINATE} * ($c)", f"link + {WALK_LINK} * ($b)"
     return {
-        "joint": Template(_DOWN_JOINT).safe_substitute(link=WALK_LINK),
-        "step": Template(_DOWN_STEP).safe_substitute(coordinate=WALK_COORDINATE),
+        "joint": ts.braced(ts.edge(ts.Direction.DOWN, ts.FETCHED.lever, "$P", into="$V")),
+        "step": ts.braced([output, "qd($c, q, $X.p);", *update]),
         "end": "twist($b, $V);",
-        "fetch_joint": _DOWN_FETCH_JOINT,
-        "fetch_step": Template(_DOWN_FETCH_STEP).safe_substitute(coordinate=WALK_COORDINATE),
-        "touch_joint": Template(_DOWN_TOUCH_JOINT).safe_substitute(link=WALK_LINK),
-        "touch_step": Template(_DOWN_TOUCH_STEP).safe_substitute(coordinate=WALK_COORDINATE),
+        "fetch_joint": "WALK_LINK_IN(link, $b, $up)",
+        "fetch_step": f"WALK_IN({record}, u($c), prior($c), $half)",
+        "touch_joint": f"WALK_TOUCH({link});",
+        "touch_step": f"WALK_TOUCH({record});",
     }
 
 
 def _walk_down(classes: tuple[WalkClass, ...], cuda: bool, unroll: int, ahead: int | None) -> str:
-    bodies = [walk.walk(**walk_down_texts(), cuda=cuda, unroll=unroll, ahead=ahead) for walk in classes]
-    if len(bodies) == 1:
-        walk = indent_text(bodies[0], 8)
-    else:
-        cases = (f"case {k}: {{\n{indent_text(body, 4)}\n    break;\n}}" for k, body in enumerate(bodies))
-        walk = indent_text("switch (cls) {\n" + "\n".join(cases) + "\n}", 8)
+    walks = [walk.walk(**walk_down_texts(), cuda=cuda, unroll=unroll, ahead=ahead) for walk in classes]
+    walk = indent_text(ts.by_class(walks), 8)
     return f"""{_DOWN_IN}
     // WALK_DOWN(cls, data, link, u, prior, qd, twist): the chain of the leave P^T L^-T u of one tree of class cls (an
     // index into the classes the prelude was emitted for), on one lane, root first: each coordinate c takes
@@ -2289,18 +2274,6 @@ def _walk_down(classes: tuple[WalkClass, ...], cuda: bool, unroll: int, ahead: i
                                auto&& twist) {{
         (void)cls;
 {walk}
-    }};
-    // WALK_LEAVE(cls, data, link, lane, walker, ready, u, prior, qd, twist): the walk down's unit, one tree by a lane
-    // group: lane walker runs ready() (the caller's preparation of u) and WALK_DOWN, the serial chain, its state (a
-    // body's twist) in registers, its records and links asked of L1 WALK_TOUCH items ahead and loaded WALK_AHEAD items
-    // ahead (a whole tree fetched into L1 at the start overflows it: chain_106's 22 trees an SM hold 230 KB). The
-    // chain is handed u(c), the tree's coordinate c in the factor's frame, and prior(c), and hands back
-    // qd(c, q, prior) and twist(b, V). No shared memory, no scratch.
-    const auto WALK_LEAVE = [&](const int cls, const float* data, const float* link, const int lane, const int walker,
-                                auto&& ready, auto&& u, auto&& prior, auto&& qd, auto&& twist) {{
-        if (lane != walker) return;
-        ready();
-        WALK_DOWN(cls, data, link, u, prior, qd, twist);
     }};"""
 
 
@@ -2309,14 +2282,10 @@ def walk_down_prelude(
     classes: tuple[WalkClass, ...], unroll: int = WALK_UNROLL, ahead: int | None = None
 ) -> DevicePrelude:
     """The one walk down (the leave ``P^T L^-T u``) of the walking classes ``classes``, for both devices: a prelude
-    declaring
-
-    - ``WALK_LEAVE(cls, data, link, lane, walker, ready, u, prior, qd, twist)``, the leave's unit: one lane of a
-      caller's group prepares ``u`` (``ready``) and runs the chain;
-    - ``WALK_DOWN(cls, data, link, u, prior, qd, twist)``, the chain: each class's walk emitted by
-      :meth:`WalkClass.walk` (straight-line code up to ``unroll`` coordinates), its links, records, ``u`` and prior
-      outputs read :data:`WALK_AHEAD` items ahead of the chain (``WALK_IN``), every twist a register, handed to
-      ``twist(b, V)`` after its body.
+    declaring ``WALK_DOWN(cls, data, link, u, prior, qd, twist)``, the chain on one lane: each class's walk emitted by
+    :meth:`WalkClass.walk` (straight-line code up to ``unroll`` coordinates), its links, records, ``u`` and prior
+    outputs read :data:`WALK_AHEAD` items ahead of the chain (``WALK_IN``), every twist a register, handed to
+    ``twist(b, V)`` after its body.
 
     No shared memory and no scratch. The step's one leave takes it (:func:`walk_leave_kernel`), and the general sweep's
     free bodies' speed rows on their one-body class (:data:`FREE_BODY_WALK`).
@@ -2367,10 +2336,15 @@ _LEAVE = """    const int tree = tid / lanes, lane = tid - tree * lanes;
     const auto twist = [](const int, const float*) {};
 $classes"""
 
-_LEAVE_CLASS = """    // The group's lanes fetch the tree's changes and velocity beside its records (WALK_LEAVE).
+_LEAVE_CLASS = """    // The group's lanes fetch the tree's changes and velocity into L1; lane 0 prepares the change (ready) and walks the
+    // tree down (WALK_DOWN: its records and links asked of L1 WALK_TOUCH items ahead, loaded WALK_AHEAD items ahead;
+    // a whole tree fetched at the start overflows L1, chain_106's 22 trees an SM hold 230 KB).
     WALK_FETCH(change, $span, lane, lanes);
     WALK_FETCH(v, n * 4, lane, lanes);
-$release    WALK_LEAVE($cls, data, link, lane, 0, ready, read, prior, qd, twist);
+$release    if (lane == 0) {
+        ready();
+        WALK_DOWN($cls, data, link, read, prior, qd, twist);
+    }
 """
 
 _LEAVE_PLAIN = """    const auto ready = []() {};
@@ -2452,7 +2426,7 @@ def walk_leave_kernel(
     classes: tuple[WalkClass, ...], release: bool, nodes: tuple[tuple[int, ...], ...] | None = None
 ) -> wp.Kernel:
     """The step's one leave, ``v += P^T L^-T R^T du``, of every walking tree (``arts``), a lane group a tree (``lanes``:
-    :data:`LEAVE_LANES` on CUDA, one on the CPU; ``dim`` trees times lanes), by the walk down's unit (``WALK_LEAVE`` of
+    :data:`LEAVE_LANES` on CUDA, one on the CPU; ``dim`` trees times lanes), by the walk down (``WALK_DOWN`` of
     :func:`walk_down_prelude`, the tree's class at ``walk_class``). Coordinate ``c``'s change is
     ``du[du_base[art] + node(c)]``: every placement's sweep adds its change in the walk's coordinates into
     :attr:`WalkTrees.du` (the base the tree's first coordinate, ``node(c) = c``), the support placement's sparse sweep
@@ -2477,12 +2451,7 @@ def walk_leave_kernel(
         _leave_class(k, walk, None if nodes is None else nodes[k], release, WALK_UNROLL)
         for k, walk in enumerate(classes)
     ]
-    if len(bodies) == 1:
-        text = bodies[0]
-    else:
-        cases = (f"case {k}: {{\n{indent_text(body, 4)}\n    break;\n}}" for k, body in enumerate(bodies))
-        text = indent_text("switch (cls) {\n" + "\n".join(cases) + "\n}", 4) + "\n"
-    body = substitute(_LEAVE, classes=text, coordinate=WALK_COORDINATE, link=WALK_LINK)
+    body = substitute(_LEAVE, classes=indent_text(ts.by_class(bodies), 4), coordinate=WALK_COORDINATE, link=WALK_LINK)
     tag = hashlib.sha256(repr((classes, nodes)).encode()).hexdigest()[:8]
     return KernelTemplate(
         f"walk_leave_{len(classes)}_{tag}" + ("_release" if release else ""),
