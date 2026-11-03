@@ -1808,25 +1808,34 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
         int parent[HOLD_WORDS], first[HOLD_WORDS];
         float l[HOLD_WORDS][3];
     };
-    // HOLD_PICK(v, x): word x of a held array (x the same on every lane): its slot's register, from lane x % WIDTH.
+    // HOLD_PICK(v, x): item x of a held array (a word a lane) or a slotted one (a slip a lane), x the same on every
+    // lane: item x sits in lane x % WIDTH's word or slot x / WIDTH, read from that lane. HOLD_ROW(v, x, out): item x's
+    // row of a held array of rows (a record, a link).
     const auto HOLD_PICK = [&](const auto& v, const int x) {
 #if defined(__CUDA_ARCH__)
+        constexpr int words = sizeof(v) / sizeof(v[0]);
         auto t = v[0];
         #pragma unroll
-        for (int k = 1; k < HOLD_WORDS; ++k)
+        for (int k = 1; k < words; ++k)
             if (x >= k * WIDTH) t = v[k];
         return READ(t, x & (WIDTH - 1));
 #else
-        return v[x];  // the CPU's one lane holds word x
+        return v[x];  // the CPU's one lane holds every item
 #endif
     };
-    // SLOT_READ(v, j): slip j's value of a slotted array (j the same on every lane), from lane j % WIDTH.
-    const auto SLOT_READ = [&](const auto& v, const int j) {
-        auto t = v[0];
+    const auto HOLD_ROW = [&](const auto& v, const int x, float* out) {
         #pragma unroll
-        for (int m = 1; m < HOLD_SLOTS; ++m)
-            if (j >= m * WIDTH) t = v[m];
-        return READ(t, j);
+        for (int m = 0; m < (int)(sizeof(v[0]) / sizeof(v[0][0])); ++m) {
+#if defined(__CUDA_ARCH__)
+            float t = v[0][m];
+            #pragma unroll
+            for (int k = 1; k < HOLD_WORDS; ++k)
+                if (x >= k * WIDTH) t = v[k][m];
+            out[m] = READ(t, x & (WIDTH - 1));
+#else
+            out[m] = v[x][m];
+#endif
+        }
     };
     const auto HOLD_LOAD = [&](WalkHold& h, const float* data, const float* link, const int* path, const int n,
                                const int nb) {
@@ -1860,35 +1869,6 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
                 h.first[k] = n;
                 h.l[k][0] = h.l[k][1] = h.l[k][2] = 0.0f;
             }
-        }
-    };
-    // HOLD_RECORD(h, c, d): coordinate c's s, ut and 1 / ell into d[0..12].
-    const auto HOLD_RECORD = [&](const WalkHold& h, const int c, float* d) {
-        #pragma unroll
-        for (int m = 0; m < 13; ++m) {
-#if defined(__CUDA_ARCH__)
-            float t = h.r[0][m];
-            #pragma unroll
-            for (int k = 1; k < HOLD_WORDS; ++k)
-                if (c >= k * WIDTH) t = h.r[k][m];
-            d[m] = READ(t, c & (WIDTH - 1));
-#else
-            d[m] = h.r[c][m];
-#endif
-        }
-    };
-    const auto HOLD_LINK = [&](const WalkHold& h, const int b, float* l) {
-        #pragma unroll
-        for (int m = 0; m < 3; ++m) {
-#if defined(__CUDA_ARCH__)
-            float t = h.l[0][m];
-            #pragma unroll
-            for (int k = 1; k < HOLD_WORDS; ++k)
-                if (b >= k * WIDTH) t = h.l[k][m];
-            l[m] = READ(t, b & (WIDTH - 1));
-#else
-            l[m] = h.l[b][m];
-#endif
         }
     };
     // HELD_APPLY(a, u, slips): u <- R^T R u, every slip's release on its own lane and slot at once (at most HOLD_SLIPS,
@@ -1929,7 +1909,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
         int deepest = 0, widest = 0;
         #pragma unroll 1
         for (int k = 0; k < slips; ++k) {
-            const int gk = SLOT_READ(group, k), lk = SLOT_READ(len, k);
+            const int gk = HOLD_PICK(group, k), lk = HOLD_PICK(len, k);
             #pragma unroll
             for (int m = 0; m < HOLD_SLOTS; ++m)
                 if (mine[m] && gk == group[m]) {
@@ -1940,7 +1920,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
         }
         #pragma unroll 1
         for (int k = 0; k < slips; ++k) {
-            const int sk = SLOT_READ(size, k);
+            const int sk = HOLD_PICK(size, k);
             widest = sk > widest ? sk : widest;
         }
         const int turns = deepest + widest - 1;
@@ -2049,7 +2029,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
             ts[m] = 0;
             ats[m] = ((size_t)a * cap + (i >= 0 ? lane + m * WIDTH : 0)) * depth;
         }
-        const int deepest = slips > 0 ? SLOT_READ(is, slips - 1) : -1;
+        const int deepest = slips > 0 ? HOLD_PICK(is, slips - 1) : -1;
         #pragma unroll 1
         for (int b = nb - 1; b >= 0 && slips > 0; --b) {
             const int f0 = HOLD_PICK(h.first, b), f1 = HOLD_PICK(h.first, b + 1);
@@ -2074,7 +2054,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
                 }
                 if (slipping == 0u) continue;
                 float d[13];
-                HOLD_RECORD(h, c, d);
+                HOLD_ROW(h.r, c, d);
                 #pragma unroll
                 for (int m = 0; m < HOLD_SLOTS; ++m)
                     if (on[m]) {
@@ -2139,7 +2119,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
             const int up = HOLD_PICK(h.parent, b);
             const int last = HOLD_PICK(h.first, up + 1) - 1;
             float l[3];
-            HOLD_LINK(h, b, l);
+            HOLD_ROW(h.l, b, l);
             #pragma unroll
             for (int m = 0; m < HOLD_SLOTS; ++m)
                 if (in[m]) {
