@@ -124,6 +124,7 @@ __all__ = [
     "statements",
     "step",
     "tree_scan",
+    "walk_texts",
 ]
 
 
@@ -1211,6 +1212,31 @@ def inward_edge(lever, state: str) -> str:
     return _INWARD_EDGE.substitute(h=state, skew="{" + ", ".join(rows) + "}")
 
 
+def walk_texts(
+    direction: Direction, *, source: str, sink: str, value: str, prior: str, coordinate: int, link: int, end: str = ""
+) -> dict[str, str]:
+    """A whole-tree walk on fetched items (:data:`FETCHED`), as :meth:`WalkClass.walk`'s keywords: ``UP`` leaf first
+    (the whitening, ``u = L^-1 P x``), ``DOWN`` root first (``P^T L^-T u``). Its joint is the edge (into the parent leaf
+    first, from it root first); its step the coordinate's :func:`step` on ``$V`` from ``source``, the caller's ``sink``
+    after the output and before the state's update; ``end`` a body's statements after its coordinates. Each step's
+    record and input (``value``, and ``prior``, its output's prior value) and each joint's link are fetched ahead of
+    the chain (``WALK_IN``, ``WALK_LINK_IN``) and asked of L1 before that (``WALK_TOUCH``); ``coordinate`` and ``link``
+    are the floats of a record and a link."""
+    up = direction is Direction.UP
+    output, *update = step(direction, FETCHED, "$V", source=source, out="const float z" if up else "const float q")
+    texts = {
+        "joint": braced(edge(direction, FETCHED.lever, "$V" if up else "$P", into="$P" if up else "$V")),
+        "step": braced([output, sink, *update]),
+        "end": end,
+        "root_first": not up,
+        "fetch_joint": "WALK_LINK_IN(link, $b, $up)",
+        "fetch_step": f"WALK_IN(data + {coordinate} * ($c), {value}, {prior}, $half)",
+        "touch_joint": f"WALK_TOUCH(link + {link} * ($b));",
+        "touch_step": f"WALK_TOUCH(data + {coordinate} * ($c));",
+    }
+    return texts
+
+
 WALK_STAGED = 13
 """The floats of a coordinate's record the walk's functions read (``s``, ``ut``, ``1 / ell``), unpacked
 (:data:`.tree_factor._WALK_LOADS`): what a kernel stages of a record in shared memory (:class:`.response_operator.LocalBlock`)."""
@@ -1609,18 +1635,17 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
         span = range(self.first[b], self.first[b + 1])
         return span if root_first else reversed(span)
 
-    def held(self, x: str, u: str, state: str, words: int) -> tuple[str, str]:
-        """The ``HELD`` schedule: native statements of the decided step's two held walks (CUDA, the border's held
-        ``h`` in scope, :data:`.tree_kinetic_state._HELD`): the walk up of ``x`` into ``u`` (``u = L^-1 P x``) and the
+    def held(self, x: str, u: str, state: str) -> tuple[str, str]:
+        """The ``HELD`` schedule: native statements of the decided step's two held walks (both devices, the border's
+        held ``h`` in scope, :data:`.tree_kinetic_state._HELD`): the walk up of ``x`` into ``u`` (``u = L^-1 P x``) and the
         walk down of ``u`` in place (``P^T L^-T u``), on every lane of the segment in lockstep, straight-line in the
         class's order, no loop and no pick of a parent or a first coordinate on the chain. Each coordinate's step runs
         on every lane from the lane's own held word of the records (the coordinate's lane: its own record), and the
         walk's six-float state is then read from the coordinate's lane (six shuffles, where reading the record took
-        thirteen); each body's link by shuffle from the lane that holds it (``HOLD_LINK`` at a constant). A body's
+        thirteen); each body's link by shuffle from the lane that holds it (``HOLD_ROW`` at a constant). A body's
         state passes to a parent that is not the body before it through ``state`` (six words a body, lane 0 writes),
-        the walk down's twists through the same words (every lane writes them, as each body's twist out); a body no
-        other child joins adds the zero state as ``+ 0.0f``, the walk up's addition of an untouched slot. Lane 0 writes
-        ``u`` (both walks). ``words``: the words a lane holds (:func:`.tree_kinetic_state._held_words`)."""
+        the walk down's twists through the same words (every lane writes them, as each body's twist out); a body's first
+        joining child stores its state, the later ones add theirs. Lane 0 writes ``u`` (both walks). A lane holds ``HOLD_WORDS`` words of each held array (on the CPU's one lane, every item)."""
         parent = self.parent
         edge_up = "".join(edge(Direction.UP, LOADED.lever, "p"))
         edge_down = "".join(edge(Direction.DOWN, LOADED.lever, "V"))
@@ -1629,8 +1654,6 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
         for b in self.bodies_in(False):
             if b in joined:
                 up.append(f"    for (int k = 0; k < 6; ++k) p[k] += {state}[{6 * b} + k];")
-            else:
-                up.append("    for (int k = 0; k < 6; ++k) p[k] += 0.0f;")
             for c in self.coordinates_in(b, False):
                 output, update = step(Direction.UP, LOADED, "p", source=f"{x}[{c}]", into="q")
                 up.append(
@@ -1639,22 +1662,22 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
                 )
             parent_b = parent[b]
             if parent_b >= 0:
-                up.append(f"    {{float l[3];HOLD_LINK(h,{b},l);{edge_up}}}")
+                up.append(f"    {{float l[3];HOLD_ROW(h.l,{b},l);{edge_up}}}")
             if parent_b != b - 1:
                 if parent_b >= 0:
                     if parent_b in joined:
                         up.append(f"    if(lane==0)for(int k=0;k<6;++k){state}[{6 * parent_b}+k]+=p[k];")
                     else:
-                        up.append(f"    if(lane==0)for(int k=0;k<6;++k){state}[{6 * parent_b}+k]=0.0f+p[k];")
+                        up.append(f"    if(lane==0)for(int k=0;k<6;++k){state}[{6 * parent_b}+k]=p[k];")
                         joined.add(parent_b)
                     up.append("    WARP_SYNC();")
                 if b > 0:
                     up.append("    for (int k = 0; k < 6; ++k) p[k] = 0.0f;")
         up.append("    WARP_SYNC();\n}")
         down = [
-            f"{{\n    float uh[{words}];",
+            "{\n    float uh[HOLD_WORDS];",
             "    #pragma unroll",
-            f"    for (int k = 0; k < {words}; ++k) uh[k] = lane + k * WIDTH < {self.coordinates} ? {u}[lane + k * WIDTH] : 0.0f;",
+            f"    for (int k = 0; k < HOLD_WORDS; ++k) uh[k] = lane + k * WIDTH < {self.coordinates} ? {u}[lane + k * WIDTH] : 0.0f;",
             "    WARP_SYNC();",
             "    float V[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};",
         ]
@@ -1665,7 +1688,7 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
             else:
                 if parent_b != b - 1:
                     down.append(f"    for (int k = 0; k < 6; ++k) V[k] = {state}[{6 * parent_b} + k];")
-                down.append(f"    {{float l[3];HOLD_LINK(h,{b},l);{edge_down}}}")
+                down.append(f"    {{float l[3];HOLD_ROW(h.l,{b},l);{edge_down}}}")
             for c in self.coordinates_in(b, True):
                 output, update = step(
                     Direction.DOWN, LOADED, "V", source=f"uh[{c}/WIDTH]", out="const float q", into="W"
