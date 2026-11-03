@@ -152,7 +152,6 @@ class TestKernelIdentity(unittest.TestCase):
 
     def test_walk_family_covers_the_walk_shapes(self):
         """Record the walk's readers on a class with joins at g1's size, the loop form, side loads and every held width."""
-        from newton._src.solvers.feather_pgs import tree_kinetic_state as native  # noqa: PLC0415
         from newton._src.solvers.feather_pgs import tree_scan  # noqa: PLC0415
 
         classes = identity.walk_classes_of_the_suite()
@@ -160,12 +159,11 @@ class TestKernelIdentity(unittest.TestCase):
         self.assertGreater(classes["chain106"].coordinates, tree_scan.WALK_UNROLL)
         self.assertIn(tree_scan.WALK_BOTH, classes["d6"].half)
         calls = list(identity.walk_calls())
-        words = {
-            native._held_words(kwargs["layout"].value)
-            for name, _, _, kwargs in calls
-            if name == "tree_kinetic_state.get_predictor_kernel"
-        }
-        self.assertEqual(words, {0, 1, 2})
+        trees = [
+            kwargs["layout"].value for name, _, _, kwargs in calls if name == "tree_kinetic_state.get_predictor_kernel"
+        ]
+        words = {-(-max(tree.dofs, tree.bodies + 1) // min(tree.lanes, 32)) for tree in trees}
+        self.assertEqual(words, {1, 2, 4})
         names = {name for name, _, _, _ in calls}
         for name in ("walk_leave_kernel", "walk_enter_kernel", "walk_step_kernel", "get_walk_solve_kernel"):
             self.assertIn(f"tree_factor.{name}" if name.startswith("walk") else f"tree_kinetic_state.{name}", names)

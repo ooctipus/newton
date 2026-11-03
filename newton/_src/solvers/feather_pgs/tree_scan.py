@@ -1609,9 +1609,9 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
         span = range(self.first[b], self.first[b + 1])
         return span if root_first else reversed(span)
 
-    def held(self, x: str, u: str, state: str, words: int) -> tuple[str, str]:
-        """The ``HELD`` schedule: native statements of the decided step's two held walks (CUDA, the border's held
-        ``h`` in scope, :data:`.tree_kinetic_state._HELD`): the walk up of ``x`` into ``u`` (``u = L^-1 P x``) and the
+    def held(self, x: str, u: str, state: str) -> tuple[str, str]:
+        """The ``HELD`` schedule: native statements of the decided step's two held walks (both devices, the border's
+        held ``h`` in scope, :data:`.tree_kinetic_state._HELD`): the walk up of ``x`` into ``u`` (``u = L^-1 P x``) and the
         walk down of ``u`` in place (``P^T L^-T u``), on every lane of the segment in lockstep, straight-line in the
         class's order, no loop and no pick of a parent or a first coordinate on the chain. Each coordinate's step runs
         on every lane from the lane's own held word of the records (the coordinate's lane: its own record), and the
@@ -1620,7 +1620,7 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
         state passes to a parent that is not the body before it through ``state`` (six words a body, lane 0 writes),
         the walk down's twists through the same words (every lane writes them, as each body's twist out); a body no
         other child joins adds the zero state as ``+ 0.0f``, the walk up's addition of an untouched slot. Lane 0 writes
-        ``u`` (both walks). ``words``: the words a lane holds (:func:`.tree_kinetic_state._held_words`)."""
+        ``u`` (both walks). A lane holds ``HOLD_WORDS`` words of each held array (on the CPU's one lane, every item)."""
         parent = self.parent
         edge_up = "".join(edge(Direction.UP, LOADED.lever, "p"))
         edge_down = "".join(edge(Direction.DOWN, LOADED.lever, "V"))
@@ -1652,9 +1652,9 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
                     up.append("    for (int k = 0; k < 6; ++k) p[k] = 0.0f;")
         up.append("    WARP_SYNC();\n}")
         down = [
-            f"{{\n    float uh[{words}];",
+            "{\n    float uh[HOLD_WORDS];",
             "    #pragma unroll",
-            f"    for (int k = 0; k < {words}; ++k) uh[k] = lane + k * WIDTH < {self.coordinates} ? {u}[lane + k * WIDTH] : 0.0f;",
+            f"    for (int k = 0; k < HOLD_WORDS; ++k) uh[k] = lane + k * WIDTH < {self.coordinates} ? {u}[lane + k * WIDTH] : 0.0f;",
             "    WARP_SYNC();",
             "    float V[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};",
         ]

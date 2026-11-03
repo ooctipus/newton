@@ -1778,189 +1778,20 @@ def _solve_operations(layout: TreeLayout, classes: tuple) -> dict[str, str]:
 
 
 _EDGE_UP = ts.edge(ts.Direction.UP, ts.LOADED.lever, "p")
-_COLUMN = ts.step(ts.Direction.UP, ts.LOADED, "p", source="x", index="q")
+"""A joint of the border's column walk up, on a loaded link ``l``."""
 _HELD_COLUMN = ts.step(ts.Direction.UP, ts.LOADED, "p", source="(c == i ? 1.0f : 0.0f)", out="z", index="q")
-"""A slip's column step, a unit covector walked in the dense form (``x``: 1 at the slip's coordinate, then 0): the
-serial border's and the held border's."""
-"""A joint of the border's walks up, on a loaded link ``l``."""
-_SLIP_PATH = ("walk.dof_body.data[d0 + i]", "i")
-_COLUMN_PATH = ts.root_path(
-    *_SLIP_PATH, count="++t", joint=["float l[6];", "WALK_LOAD_LINK(l, link, body, up);", *_EDGE_UP]
-)
-_BORDER_PATHS = {
-    "slips_head": ts.statements([ts.root_path(*_SLIP_PATH, count="++length")[0]], 12),
-    "group_head": ts.statements([ts.root_path("body0", "i", count="++t")[0]], 12),
-    "path_tail": ts.statements([ts.root_path("body0", "i")[1]], 12),
-    "column_head": ts.statements([_COLUMN_PATH[0]], 8),
-    "column_tail": ts.statements([_COLUMN_PATH[1]], 8),
-}
-"""The border's root paths (:data:`_BORDER`): a slip's, its column's (the wrench up each joint), its group's."""
-
-_BORDER = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step on its all-K walk, with no factor array. The release
-    // R = L_F^-1 L_K, built from the all-K walk's columns and the K-free pivot, is the decided factor's whitening; the
-    // predictor's step takes R then R^T between its two walks, the rows R, the leave R^T, the audit R^-T (WalkRelease).
-    // BORDER_FETCH(address, bytes, lane, stride): the lanes prefetch the 128-byte lines of [address, address + bytes)
-    // into L1 (CUDA; nothing on the CPU).
-    const auto BORDER_FETCH = [&](const void* address, const int bytes, const int lane, const int stride) {
-#if defined(__CUDA_ARCH__)
-        const char* const first = reinterpret_cast<const char*>(reinterpret_cast<size_t>(address) & ~size_t(127));
-        const int lines = (int)((reinterpret_cast<const char*>(address) + bytes - first + 127) / 128);
-        for (int k = lane; k < lines; k += stride)
-            asm volatile("prefetch.global.L1 [%0];" ::"l"(first + 128 * k));
-#endif
-    };
-    // FRAME_STATUS(bit): raise a bit of the border's status word, which every tree's lane 0 may write at once.
-    const auto FRAME_STATUS = [&](const int bit) {
-#if defined(__CUDA_ARCH__)
-        atomicOr(&f.frame_status.data[0], bit);
-#else
-        f.frame_status.data[0] |= bit;
-#endif
-    };
-    // The release of articulation a's slips, its coordinates whose released stiffness released[c] = K - Kd is positive
-    // (kept[c] = Kd), root-most first (ascending coordinate), built on the block's lanes in three rounds. A slip's group
-    // is its root (walk.release.root, its path's root-most coordinate): two slips' paths meet if and only if their roots
-    // are equal, so groups touch disjoint coordinates and their lanes share one dense column and one pivot array (2n
-    // floats).
-    // BORDER_SLIPS(a, d0, n, released, fits), lane 0: the slips into walk.release.dof, .root and .count. A slip past the
-    // release's capacity or depth, or every slip of a tree whose work does not fit (fits false), keeps its K and flags
-    // bit 0 of f.frame_status.
-    const auto BORDER_SLIPS = [&](const int a, const int d0, const int n, const float* released, const bool fits) {
-        auto& release = walk.release;
-        const int depth = release.b.shape[2];
-        const int cap = a < release.dof.shape[0] ? release.dof.shape[1] : 0;
-        int s = 0;
-        #pragma unroll 1
-        for (int i = 0; i < n; ++i) {
-            if (!(released[i] > 0.0f))
-                continue;
-            int length = 0, root = i;
-            $slips_head
-                    root = c;
-            $path_tail
-            if (!fits || s >= cap || length > depth) {
-                FRAME_STATUS(1);
-                continue;
-            }
-            release.dof.data[a * release.dof.shape[1] + s] = i;
-            release.root.data[a * release.dof.shape[1] + s] = root;
-            ++s;
-        }
-        release.count.data[a] = s;
-    };
-    // BORDER_COLUMN(a, d0, data, link, k), a lane a slip: slip k's column b = L^-1 P e_i walked up its root path
-    // (WALK_SEED's step), one state of six, into walk.release.b leaf first. The lanes load every slip's column of a
-    // world at once.
-    const auto BORDER_COLUMN = [&](const int a, const int d0, const float* data, const float* link, const int k) {
-        auto& release = walk.release;
-        const int depth = release.b.shape[2], cap = release.dof.shape[1];
-        float* const column = release.b.data + ((size_t)a * cap + k) * depth;
-        const int i = release.dof.data[a * cap + k];
-        float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-        float x = 1.0f;
-        int t = 0;
-        $column_head
-                float d[$unpacked];
-                $record(d, data + $coordinate * c);
-                $column_step
-        $column_tail
-    };
-    // BORDER_GROUP(a, d0, data, released, kept, pivot, column, l, s), a lane a group: if slip l is its group's first,
-    // the group's slips in order, each column into the dense column, the group's releases before it applied (b_j' =
-    // R_<j b_j, still inside its path, W9 P4), then the rank-1 downdate's recurrence along its path, leaf first, with the
-    // split pivot P0 + Kd at the slip (Gill, Golub, Murray and Saunders; the pivot without K, so no cancellation): b,
-    // a = beta d^1/2, g = (d / dbar)^1/2 into walk.release, each coordinate's pivot updated and the column cleared behind
-    // it. A pivot that is not positive flags bit 1 (SAT_PHYS falsifier 1: the split capacitance not positive definite).
-    const auto BORDER_GROUP = [&](const int a, const int d0, const float* data, const float* released,
-                                  const float* kept, float* pivot, float* column, const int l, const int s) {
-        auto& release = walk.release;
-        const int depth = release.b.shape[2], cap = release.dof.shape[1];
-        const int* const group = release.root.data + a * cap;
-        #pragma unroll 1
-        for (int k = 0; k < l; ++k)
-            if (group[k] == group[l])
-                return;
-        #pragma unroll 1
-        for (int j = l; j < s; ++j) {
-            if (group[j] != group[l])
-                continue;
-            const size_t at = ((size_t)a * cap + j) * depth;
-            const int i = release.dof.data[a * cap + j], body0 = walk.dof_body.data[d0 + i];
-            int t = 0;
-            $group_head
-                    column[c] = release.b.data[at + t];
-            $path_tail
-            #pragma unroll 1
-            for (int k = l; k < j; ++k) {
-                if (group[k] != group[l])
-                    continue;
-                WALK_SLIP(release, ((size_t)a * cap + k) * depth, column, 1);
-            }
-            float alpha = -released[i];
-            t = 0;
-            $group_head
-                    const float d = pivot[c], scale = sqrtf(d), b = column[c];
-                    float dbar = d + alpha * (b * scale) * (b * scale);
-                    if (c == i)
-                        dbar = WALK_LOAD_PIVOT(data + $coordinate * i) + kept[i];
-                    if (!(dbar > 0.0f) || !wp::isfinite(dbar))
-                        FRAME_STATUS(2);
-                    const float beta = alpha * b * scale / dbar;
-                    alpha = alpha * d / dbar;
-                    release.coordinate.data[at + t] = c;
-                    release.b.data[at + t] = b;
-                    release.a.data[at + t] = beta * scale;
-                    release.g.data[at + t] = scale / sqrtf(dbar);
-                    pivot[c] = dbar;
-                    column[c] = 0.0f;
-            $path_tail
-            #pragma unroll 1
-            for (; t < depth; ++t)
-                release.coordinate.data[at + t] = -1;
-        }
-    };
-    // BORDER_APPLY(a, u, l, s), a lane a group, between the decided step's two walks: if slip l is its group's first,
-    // u <- R^T R u on the group's coordinates, R_j for its slips in order (WALK_SLIP), then R_j^T the last first
-    // (WALK_SLIP_T), each along its path. Groups touch disjoint coordinates, so their R_j commute:
-    // (H + R + K_F)^-1 x = P^T L^-T R^T R L^-1 P x, since R^T R = L_K^T A_F^-1 L_K.
-    const auto BORDER_APPLY = [&](const int a, float* u, const int l, const int s) {
-        auto& release = walk.release;
-        const int depth = release.b.shape[2], cap = release.dof.shape[1];
-        const int* const group = release.root.data + a * cap;
-        #pragma unroll 1
-        for (int k = 0; k < l; ++k)
-            if (group[k] == group[l])
-                return;
-        #pragma unroll 1
-        for (int j = l; j < s; ++j)
-            if (group[j] == group[l])
-                WALK_SLIP(release, ((size_t)a * cap + j) * depth, u, 1);
-        #pragma unroll 1
-        for (int j = s - 1; j >= l; --j)
-            if (group[j] == group[l])
-                WALK_SLIP_T(release, ((size_t)a * cap + j) * depth, u);
-    };"""
+"""A slip's column step, a unit covector walked in the dense form (1 at the slip's coordinate, then 0)."""
 
 
-@functools.cache
-def walk_tree_prelude(side: bool = True) -> DevicePrelude:
-    """The predictor's border, for both devices: :func:`.tree_factor.walk_paths_prelude`'s path table and walks (the
-    slips' paths read it) and the border's build (:data:`_BORDER`). The whole-tree walks are the class emitter's
-    (:func:`walk_tree`). ``side``: the model's :attr:`.tree_factor.TreeFactor.walk_side` (without one, the records are
-    read with no side load, :func:`record_load`)."""
-    from .tree_factor import WALK_COORDINATE, WALK_UNPACKED, walk_paths_prelude  # noqa: PLC0415
+def walk_loads_prelude(side: bool = True) -> DevicePrelude:
+    """The walk's record and link loads and its step's pin (:func:`.tree_factor._walk_loads_text`), for both devices:
+    all the border reads of the walk (:data:`_HELD`). ``side``: the model's :attr:`.tree_factor.TreeFactor.walk_side`
+    (without one, the records are read with no side load, :func:`record_load`)."""
+    from .tree_factor import _walk_loads_text  # noqa: PLC0415
 
-    walk = walk_paths_prelude(1, side=side)
-    tree = substitute(
-        _BORDER,
-        coordinate=WALK_COORDINATE,
-        unpacked=WALK_UNPACKED,
-        record=record_load(side),
-        column_step=ts.statements([_COLUMN[0], "x = 0.0f;", *_COLUMN[1:], "column[t] = z;"], 16),
-        **_BORDER_PATHS,
+    return DevicePrelude(
+        "walk_loads" if side else "walk_loads_one_half", _walk_loads_text(True, side), cpu=_walk_loads_text(False, side)
     )
-    name = "walk_tree" if side else "walk_tree_one_half"
-    return DevicePrelude(name, walk.source + "\n" + tree, cpu=walk.cpu + "\n" + tree)
 
 
 def record_load(side: bool) -> str:
@@ -1969,30 +1800,56 @@ def record_load(side: bool) -> str:
     return "WALK_LOAD_RECORD" if side else "WALK_LOAD_ONE_HALF"
 
 
-_HELD = """    // The border held by the tree's segment (CUDA, every tree whose coordinates and bodies fit $HOLD words a lane): the
-    // segment's lanes (one warp, or a packed tree's lanes) load the tree's walk, each coordinate's record and body and
-    // each body's parent, first coordinate and link, into registers in one parallel trip, lane l holding coordinates and
-    // bodies l, l + WIDTH, ...; then the release is built coordinate-major, a lane a slip (HELD_BUILD), and the
-    // decided step's two tree walks (WalkClass.held: the class's straight-line text) run on every lane of the segment in
-    // lockstep, reading each step's values by shuffle from their fixed lane, with no global load on a chain; between
+_HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step on its all-K walk, with no factor array. The release
+    // R = L_F^-1 L_K, built from the all-K walk's columns and the K-free pivot, is the decided factor's whitening; the
+    // predictor's step takes R then R^T between its two walks, the rows R, the leave R^T, the audit R^-T (WalkRelease).
+    // The tree's segment (one warp, or a packed tree's lanes; on the CPU the one thread, a segment of one lane) holds
+    // the tree's walk: each coordinate's record and body and each body's parent, first coordinate and link, loaded in
+    // one parallel trip, lane l holding items l, l + WIDTH, ... in HOLD_WORDS words. The slips sit the same way: slip j
+    // on lane j % WIDTH, in its slot j / WIDTH of HOLD_SLOTS (on CUDA one slot at the class's slip capacity; the CPU's
+    // lane holds every slip, the lanes as a loop). Then the release is built coordinate-major (HELD_BUILD), and the
+    // decided step's two tree walks (WalkClass.held: the class's straight-line text) run on every lane of the segment
+    // in lockstep, reading each step's values by shuffle from their fixed lane, with no global load on a chain; between
     // them HELD_APPLY applies R^T R.
+    constexpr int HOLD_WORDS = ($items + WIDTH - 1) / WIDTH, HOLD_SLIPS = $slips;
+    constexpr int HOLD_SLOTS = (HOLD_SLIPS + WIDTH - 1) / WIDTH;
+    // FRAME_STATUS(bit): raise a bit of the border's status word, which every tree's lane 0 may write at once.
+    const auto FRAME_STATUS = [&](const int bit) {
+#if defined(__CUDA_ARCH__)
+        atomicOr(&f.frame_status.data[0], bit);
+#else
+        f.frame_status.data[0] |= bit;
+#endif
+    };
     struct WalkHold {
-        float r[$HOLD][13];
-        int parent[$HOLD], first[$HOLD];
-        float l[$HOLD][3];
+        float r[HOLD_WORDS][13];
+        int parent[HOLD_WORDS], first[HOLD_WORDS];
+        float l[HOLD_WORDS][3];
     };
     // HOLD_PICK(v, x): word x of a held array (x the same on every lane): its slot's register, from lane x % WIDTH.
     const auto HOLD_PICK = [&](const auto& v, const int x) {
+#if defined(__CUDA_ARCH__)
         auto t = v[0];
         #pragma unroll
-        for (int k = 1; k < $HOLD; ++k)
+        for (int k = 1; k < HOLD_WORDS; ++k)
             if (x >= k * WIDTH) t = v[k];
         return READ(t, x & (WIDTH - 1));
+#else
+        return v[x];  // the CPU's one lane holds word x
+#endif
+    };
+    // SLOT_READ(v, j): slip j's value of a slotted array (j the same on every lane), from lane j % WIDTH.
+    const auto SLOT_READ = [&](const auto& v, const int j) {
+        auto t = v[0];
+        #pragma unroll
+        for (int m = 1; m < HOLD_SLOTS; ++m)
+            if (j >= m * WIDTH) t = v[m];
+        return READ(t, j);
     };
     const auto HOLD_LOAD = [&](WalkHold& h, const float* data, const float* link, const int* path, const int n,
                                const int nb) {
         #pragma unroll
-        for (int k = 0; k < $HOLD; ++k) {
+        for (int k = 0; k < HOLD_WORDS; ++k) {
             const int x = lane + k * WIDTH;
             if (x < n) {
                 float d[$unpacked];
@@ -2004,8 +1861,13 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
                 for (int m = 0; m < 13; ++m) h.r[k][m] = 0.0f;
             }
             if (x < nb) {
+#if defined(__CUDA_ARCH__)
                 h.parent[k] = __ldg(path + 2 * x);
                 h.first[k] = __ldg(path + 2 * x + 1);
+#else
+                h.parent[k] = path[2 * x];
+                h.first[k] = path[2 * x + 1];
+#endif
                 float l[6];
                 WALK_LOAD_LINK(l, link, x, h.parent[k]);
                 h.l[k][0] = l[0];
@@ -2022,157 +1884,247 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
     const auto HOLD_RECORD = [&](const WalkHold& h, const int c, float* d) {
         #pragma unroll
         for (int m = 0; m < 13; ++m) {
+#if defined(__CUDA_ARCH__)
             float t = h.r[0][m];
             #pragma unroll
-            for (int k = 1; k < $HOLD; ++k)
+            for (int k = 1; k < HOLD_WORDS; ++k)
                 if (c >= k * WIDTH) t = h.r[k][m];
             d[m] = READ(t, c & (WIDTH - 1));
+#else
+            d[m] = h.r[c][m];
+#endif
         }
     };
     const auto HOLD_LINK = [&](const WalkHold& h, const int b, float* l) {
         #pragma unroll
         for (int m = 0; m < 3; ++m) {
+#if defined(__CUDA_ARCH__)
             float t = h.l[0][m];
             #pragma unroll
-            for (int k = 1; k < $HOLD; ++k)
+            for (int k = 1; k < HOLD_WORDS; ++k)
                 if (b >= k * WIDTH) t = h.l[k][m];
             l[m] = READ(t, b & (WIDTH - 1));
+#else
+            l[m] = h.l[b][m];
+#endif
         }
     };
-    // HELD_APPLY(a, u, slips): u <- R^T R u, every slip's release on its own lane at once (the segment's lane j holds
-    // slip j; at most WIDTH slips, as HELD_BUILD keeps). R_j is applied leaf first and R_j^T root first along slip j's
-    // root path, the same steps as WALK_SLIP and WALK_SLIP_T. Slips that share a coordinate share their path from it to
-    // their root (release.root, their group), so a coordinate's depth is the same on every path through it: lane j takes
-    // the coordinate at depth d (0 at the root) on turn (deepest - d) + rank for R, d + (size - 1 - rank) for R^T, its
-    // rank among its group's slips in order. Every coordinate then takes its slips' steps in BORDER_APPLY's order (R:
-    // the group's slips in order, R^T: last first), each slip's chain in its own order, with no two lanes on one
-    // coordinate in a turn: the same operations in the same order, over deepest + the largest group turns a direction,
-    // where one lane a group took the sum of its slips' paths.
+    // HELD_APPLY(a, u, slips): u <- R^T R u, every slip's release on its own lane and slot at once (at most HOLD_SLIPS,
+    // as HELD_BUILD keeps). R_j is applied leaf first and R_j^T root first along slip j's root path (the release's slip
+    // steps, :func:`.tree_scan.slip`). Slips that share a coordinate share their path from it to their root
+    // (release.root, their group), so a coordinate's depth is the same on every path through it: slip j takes the
+    // coordinate at depth d (0 at the root) on turn (deepest - d) + rank for R, d + (size - 1 - rank) for R^T, its rank
+    // among its group's slips in order. Every coordinate then takes its slips' steps in the group's order (R: the
+    // group's slips in order, R^T: last first), each slip's chain in its own order, with no two slips on one coordinate
+    // in a turn, over deepest + the largest group turns a direction. Groups touch disjoint coordinates, so their R_j
+    // commute: (H + R + K_F)^-1 x = P^T L^-T R^T R L^-1 P x, since R^T R = L_K^T A_F^-1 L_K.
     const auto HELD_APPLY = [&](const int a, float* u, const int slips) {
         auto& release = walk.release;
         const int depth = release.b.shape[2], cap = release.dof.shape[1];
-        const bool mine = lane < slips;
-        const size_t at = ((size_t)a * cap + (mine ? lane : 0)) * depth;
-        const int* const coordinate = release.coordinate.data + at;
-        const float *const b = release.b.data + at, *const ar = release.a.data + at, *const g = release.g.data + at;
-        int len = 0, group = -1;
-        if (mine) {
-            group = release.root.data[a * cap + lane];
-            while (len < depth && coordinate[len] >= 0) ++len;
+        bool mine[HOLD_SLOTS];
+        const int* coordinates[HOLD_SLOTS];
+        const float *bs[HOLD_SLOTS], *as[HOLD_SLOTS], *gs[HOLD_SLOTS];
+        int len[HOLD_SLOTS], group[HOLD_SLOTS], rank[HOLD_SLOTS], size[HOLD_SLOTS], lead[HOLD_SLOTS];
+        float rs[HOLD_SLOTS];
+        #pragma unroll
+        for (int m = 0; m < HOLD_SLOTS; ++m) {
+            const int j = lane + m * WIDTH;
+            mine[m] = j < slips;
+            const size_t at = ((size_t)a * cap + (mine[m] ? j : 0)) * depth;
+            coordinates[m] = release.coordinate.data + at;
+            bs[m] = release.b.data + at;
+            as[m] = release.a.data + at;
+            gs[m] = release.g.data + at;
+            len[m] = 0;
+            group[m] = -1;
+            if (mine[m]) {
+                group[m] = release.root.data[a * cap + j];
+                while (len[m] < depth && coordinates[m][len[m]] >= 0) ++len[m];
+            }
+            rank[m] = 0;
+            size[m] = 0;
         }
-        int rank = 0, size = 0, deepest = 0, widest = 0;
+        int deepest = 0, widest = 0;
         #pragma unroll 1
         for (int k = 0; k < slips; ++k) {
-            const int gk = READ(group, k), lk = READ(len, k);
-            if (mine && gk == group) {
-                rank += k < lane ? 1 : 0;
-                ++size;
-            }
-            deepest = max(deepest, lk);
+            const int gk = SLOT_READ(group, k), lk = SLOT_READ(len, k);
+            #pragma unroll
+            for (int m = 0; m < HOLD_SLOTS; ++m)
+                if (mine[m] && gk == group[m]) {
+                    rank[m] += k < lane + m * WIDTH ? 1 : 0;
+                    ++size[m];
+                }
+            deepest = lk > deepest ? lk : deepest;
         }
         #pragma unroll 1
-        for (int k = 0; k < slips; ++k) widest = max(widest, READ(size, k));
+        for (int k = 0; k < slips; ++k) {
+            const int sk = SLOT_READ(size, k);
+            widest = sk > widest ? sk : widest;
+        }
         const int turns = deepest + widest - 1;
-        float r = 0.0f;
-        const int lead = deepest - len + rank;
+        #pragma unroll
+        for (int m = 0; m < HOLD_SLOTS; ++m) {
+            rs[m] = 0.0f;
+            lead[m] = deepest - len[m] + rank[m];
+        }
         #pragma unroll 1
         for (int T = 0; T < turns; ++T) {
-            const int t = T - lead;
-            if (mine && t >= 0 && t < len) {
-                const int c = coordinate[t];
-                $apply_r
+            #pragma unroll
+            for (int m = 0; m < HOLD_SLOTS; ++m) {
+                const int t = T - lead[m];
+                if (mine[m] && t >= 0 && t < len[m]) {
+                    const int c = coordinates[m][t];
+                    const float *const b = bs[m], *const ar = as[m], *const g = gs[m];
+                    float& r = rs[m];
+                    $apply_r
+                }
             }
             WARP_SYNC();
         }
-        r = 0.0f;
-        const int back = size - 1 - rank;
+        #pragma unroll
+        for (int m = 0; m < HOLD_SLOTS; ++m) {
+            rs[m] = 0.0f;
+            lead[m] = size[m] - 1 - rank[m];
+        }
         #pragma unroll 1
         for (int T = 0; T < turns; ++T) {
-            const int t = len - 1 - (T - back);
-            if (mine && T >= back && t >= 0) {
-                const int c = coordinate[t];
-                $apply_rt
+            #pragma unroll
+            for (int m = 0; m < HOLD_SLOTS; ++m) {
+                const int t = len[m] - 1 - (T - lead[m]);
+                if (mine[m] && T >= lead[m] && t >= 0) {
+                    const int c = coordinates[m][t];
+                    const float *const b = bs[m], *const ar = as[m], *const g = gs[m];
+                    float& r = rs[m];
+                    $apply_rt
+                }
             }
             WARP_SYNC();
         }
     };
     // HELD_BUILD(h, a, n, nb, data, released, kept): the release of the tree's slips, coordinate-major. The slips are
-    // its coordinates whose released stiffness is positive, root-most first (ascending), one a lane (lane j holds slip
-    // j: at most $SLIPS, the class's slip capacity, and the release's; a slip past them keeps its K and raises status
-    // bit 0). One leaf-first sweep over the coordinates the slips' paths hold: at each, every slip on it takes its
-    // column step (b = L^-1 P e_i) from the held record; then in slip order slip k takes its recurrence step on its
-    // lane and hands its b, a, g and the coordinate's new pivot to the later lanes, and each later slip on the
-    // coordinate applies R_k's step to its column with its pair state (R_k meets a column only where both paths hold
-    // the coordinate: from their meeting point). Every value is a register: the columns, the pivots (one a coordinate),
-    // the pair states; nothing of the release is read back. The column and R_k's steps are the serial text's
-    // (BORDER_COLUMN, BORDER_GROUP); the recurrence takes one rsqrt of each new pivot and multiplies where the serial
-    // text takes two square roots and two divides (rounding). Returns the slips.
+    // its coordinates whose released stiffness is positive, root-most first (ascending), slip j on lane j % WIDTH in
+    // slot j / WIDTH (at most HOLD_SLIPS, the class's slip capacity, and the release's; a slip past them keeps its K
+    // and raises status bit 0). A pivot that is not positive raises bit 1 (SAT_PHYS falsifier 1: the split
+    // capacitance not positive definite). One leaf-first sweep over the coordinates the slips' paths hold: at each,
+    // every slip on it takes its column step (b = L^-1 P e_i) from the held record; then in slip order slip k takes
+    // the rank-1 downdate's recurrence step (Gill, Golub, Murray and Saunders, with the split pivot P0 + Kd at the
+    // slip: the pivot without K, so no cancellation; b, a = beta d^1/2, g = (d / dbar)^1/2 into walk.release) and
+    // hands its b, a, g and the coordinate's new pivot to the later slips, and each later slip on the coordinate
+    // applies R_k's step to its column with its pair state (R_k meets a column only where both paths hold the
+    // coordinate: from their meeting point; b_j' = R_<j b_j, W9 P4). The recurrence takes one rsqrt of each new pivot
+    // (the CPU: one over a square root) and multiplies. Every value is a register: the columns, the pivots (one a
+    // coordinate), the pair states; nothing of the release is read back. Returns the slips.
     const auto HELD_BUILD = [&](const WalkHold& h, const int a, const int n, const int nb, const float* data,
                                 const float* released, const float* kept) -> int {
         auto& release = walk.release;
         const int depth = release.b.shape[2];
         const int cap = a < release.dof.shape[0] ? release.dof.shape[1] : 0;
-        unsigned long long candidates = 0ull;
+        // Each slot's slip: the (lane + m WIDTH)-th coordinate, ascending, whose released stiffness is positive.
+        int is[HOLD_SLOTS], total = 0;
         #pragma unroll
-        for (int k = 0; k < $HOLD; ++k) {
+        for (int m = 0; m < HOLD_SLOTS; ++m) is[m] = -1;
+        #pragma unroll
+        for (int k = 0; k < HOLD_WORDS; ++k) {
             const int x = lane + k * WIDTH;
-            candidates |= (unsigned long long)BALLOT(x < n && released[x] > 0.0f) << (k * WIDTH);
+            const unsigned candidates = BALLOT(x < n && released[x] > 0.0f);
+            const int count = COUNT(candidates);
+            #pragma unroll
+            for (int m = 0; m < HOLD_SLOTS; ++m) {
+                const int want = lane + m * WIDTH - total;
+                if (want >= 0 && want < count) {
+                    unsigned rest = candidates;
+                    for (int q = 0; q < want; ++q) rest &= rest - 1u;
+                    is[m] = k * WIDTH + FIRST(rest);
+                }
+            }
+            total += count;
         }
-        const int total = COUNT(candidates);
-        const int slips = min(total, min(cap, $SLIPS));
+        const int most = cap < HOLD_SLIPS ? cap : HOLD_SLIPS, slips = total < most ? total : most;
         if (total > slips && lane == 0) FRAME_STATUS(1);
-        int i = -1;
-        if (lane < slips) {
-            unsigned long long rest = candidates;
-            for (int q = 0; q < lane; ++q) rest &= rest - 1ull;
-            i = FIRST(rest);
-        }
-        const bool mine = i >= 0;
-        // The slip's own values, loaded once: its released and kept stiffness and its pivot without K.
-        float alpha = 0.0f, keep = 0.0f, pivot0 = 0.0f;
-        if (mine) {
-            alpha = -released[i];
-            keep = kept[i];
-            pivot0 = WALK_LOAD_PIVOT(data + $coordinate * i);
-        }
-        float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}, z = 0.0f, pair[$SLIPS];
+        // Each slip's own values, loaded once: its released and kept stiffness and its pivot without K; its column's
+        // state, value and pair states; its next coordinate, leaf first along its path (-1 once past its root), its
+        // steps so far and its root.
+        float alphas[HOLD_SLOTS], keeps[HOLD_SLOTS], pivots[HOLD_SLOTS], ps[HOLD_SLOTS][6], zs[HOLD_SLOTS];
+        float pairs[HOLD_SLOTS][HOLD_SLIPS];
+        int next[HOLD_SLOTS], ts[HOLD_SLOTS], roots[HOLD_SLOTS];
+        size_t ats[HOLD_SLOTS];
         #pragma unroll
-        for (int k = 0; k < $SLIPS; ++k) pair[k] = 0.0f;
-        // next: the slip's next coordinate, leaf first along its path (-1 once past its root); t: its steps so far.
-        int next = i, t = 0, root = i;
-        const size_t at = ((size_t)a * cap + (mine ? lane : 0)) * depth;
-        const int deepest = slips > 0 ? READ(i, slips - 1) : -1;
+        for (int m = 0; m < HOLD_SLOTS; ++m) {
+            if (lane + m * WIDTH >= slips) is[m] = -1;
+            const int i = is[m];
+            alphas[m] = keeps[m] = pivots[m] = 0.0f;
+            if (i >= 0) {
+                alphas[m] = -released[i];
+                keeps[m] = kept[i];
+                pivots[m] = WALK_LOAD_PIVOT(data + $coordinate * i);
+            }
+            #pragma unroll
+            for (int k = 0; k < 6; ++k) ps[m][k] = 0.0f;
+            zs[m] = 0.0f;
+            #pragma unroll
+            for (int k = 0; k < HOLD_SLIPS; ++k) pairs[m][k] = 0.0f;
+            next[m] = roots[m] = i;
+            ts[m] = 0;
+            ats[m] = ((size_t)a * cap + (i >= 0 ? lane + m * WIDTH : 0)) * depth;
+        }
+        const int deepest = slips > 0 ? SLOT_READ(is, slips - 1) : -1;
         #pragma unroll 1
         for (int b = nb - 1; b >= 0 && slips > 0; --b) {
             const int f0 = HOLD_PICK(h.first, b), f1 = HOLD_PICK(h.first, b + 1);
             if (f0 > deepest) continue;
-            const bool in = next >= f0 && next < f1;
-            if (BALLOT(in) == 0u) continue;
-            const int start = in ? next : -1;
+            bool in[HOLD_SLOTS], any = false;
+            int start[HOLD_SLOTS];
+            #pragma unroll
+            for (int m = 0; m < HOLD_SLOTS; ++m) {
+                in[m] = next[m] >= f0 && next[m] < f1;
+                if (BALLOT(in[m]) != 0u) any = true;
+                start[m] = in[m] ? next[m] : -1;
+            }
+            if (!any) continue;
             #pragma unroll 1
             for (int c = f1 - 1; c >= f0; --c) {
-                const bool on = c <= start;
-                const unsigned slipping = BALLOT(on);
+                bool on[HOLD_SLOTS];
+                unsigned slipping = 0u;
+                #pragma unroll
+                for (int m = 0; m < HOLD_SLOTS; ++m) {
+                    on[m] = c <= start[m];
+                    slipping |= BALLOT(on[m]) << (m * WIDTH);
+                }
                 if (slipping == 0u) continue;
                 float d[13];
                 HOLD_RECORD(h, c, d);
-                if (on) {
-                    $held_step
-                }
+                #pragma unroll
+                for (int m = 0; m < HOLD_SLOTS; ++m)
+                    if (on[m]) {
+                        const int i = is[m];
+                        float* const p = ps[m];
+                        float& z = zs[m];
+                        int& root = roots[m];
+                        $held_step
+                    }
                 // The coordinate's pivot and its square root (1/ell: the record's d[12] is 1/sqrt(P)), each slip's
                 // step taking one rsqrt of its new pivot for the rest.
                 float pivot = 1.0f / (d[12] * d[12]), root = 1.0f / d[12];
                 #pragma unroll
-                for (int k = 0; k < $SLIPS; ++k) {
+                for (int k = 0; k < HOLD_SLIPS; ++k) {
                     if (k >= slips) break;
                     if (!((slipping >> k) & 1u)) continue;
                     float bk = 0.0f, ak = 0.0f, gk = 0.0f, dk = 0.0f, rk = 0.0f;
-                    if (lane == k) {
+                    if (lane == k % WIDTH) {
+                        const int i = is[k / WIDTH];
+                        float& alpha = alphas[k / WIDTH];
+                        const float z = zs[k / WIDTH];
+                        int& t = ts[k / WIDTH];
+                        const size_t at = ats[k / WIDTH];
                         const float dd = pivot, scale = root;
                         float dbar = dd + alpha * (z * scale) * (z * scale);
-                        if (c == i) dbar = pivot0 + keep;
+                        if (c == i) dbar = pivots[k / WIDTH] + keeps[k / WIDTH];
                         if (!(dbar > 0.0f) || !wp::isfinite(dbar)) FRAME_STATUS(2);
+#if defined(__CUDA_ARCH__)
                         const float r = rsqrtf(dbar), inverse = r * r;
+#else
+                        const float r = 1.0f / sqrtf(dbar), inverse = r * r;
+#endif
                         const float beta = alpha * z * scale * inverse;
                         alpha = alpha * dd * inverse;
                         bk = z;
@@ -2193,41 +2145,42 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
                     gk = READ(gk, k);
                     pivot = READ(dk, k);
                     root = READ(rk, k);
-                    if (on && lane > k) {
-                        $build_r
-                    }
+                    #pragma unroll
+                    for (int m = 0; m < HOLD_SLOTS; ++m)
+                        if (on[m] && lane + m * WIDTH > k) {
+                            float& z = zs[m];
+                            float* const pair = pairs[m];
+                            $build_r
+                        }
                 }
             }
             const int up = HOLD_PICK(h.parent, b);
             const int last = HOLD_PICK(h.first, up + 1) - 1;
             float l[3];
             HOLD_LINK(h, b, l);
-            if (in) {
-                if (up >= 0) {
-                    $edge_p
+            #pragma unroll
+            for (int m = 0; m < HOLD_SLOTS; ++m)
+                if (in[m]) {
+                    float* const p = ps[m];
+                    if (up >= 0) {
+                        $edge_p
+                    }
+                    next[m] = up >= 0 ? last : -1;
                 }
-                next = up >= 0 ? last : -1;
+        }
+        #pragma unroll
+        for (int m = 0; m < HOLD_SLOTS; ++m)
+            if (is[m] >= 0) {
+                if (ts[m] > depth) FRAME_STATUS(1);
+                release.dof.data[a * cap + lane + m * WIDTH] = is[m];
+                release.root.data[a * cap + lane + m * WIDTH] = roots[m];
+                for (int t = ts[m]; t < depth; ++t) release.coordinate.data[ats[m] + t] = -1;
             }
-        }
-        if (mine) {
-            if (t > depth) FRAME_STATUS(1);
-            release.dof.data[a * cap + lane] = i;
-            release.root.data[a * cap + lane] = root;
-            for (int tt = t; tt < depth; ++tt) release.coordinate.data[at + tt] = -1;
-        }
         if (lane == 0) release.count.data[a] = slips;
         WARP_SYNC();
         return slips;
     };
 """
-
-
-def _held_words(layout: TreeLayout) -> int:
-    """Words a lane holds of a tree's walk in the border's held form (:data:`_HELD`): its coordinates and bodies (and
-    one past the last body) over the segment's lanes, at most two; 0 for a tree past that (the serial text)."""
-    width = min(layout.lanes, 32)
-    words = -(-max(layout.dofs, layout.bodies + 1) // width)
-    return words if words <= 2 else 0
 
 
 def _walk_roots(layout: TreeLayout) -> list[tuple[int, int, int]]:
@@ -2236,18 +2189,6 @@ def _walk_roots(layout: TreeLayout) -> list[tuple[int, int, int]]:
     if layout.forest:
         return list(zip(range(len(layout.roots)), layout.root_offsets, layout.root_families, strict=True))
     return [(0, 0, layout.dofs)]
-
-
-PREDICTOR_AHEAD = 0
-"""Items whose inputs the predictor's walks hold in registers ahead of the chain (:data:`.tree_scan.WALK_AHEAD`):
-none, as for :data:`PREDICTOR_UNROLL`: the predictor's launch bound holds 56 registers on g1's block, and the walk's
-touches (prefetch hints, no register) still ask L1 for its lines ahead."""
-
-PREDICTOR_UNROLL = 0
-"""Coordinates up to which the predictor's walks are straight-line code (:data:`.tree_scan.WALK_UNROLL`): none. The
-predictor's launch bound holds 56 registers on g1's block (:func:`_predictor_bounds`), and a straight walk's hoisted
-loads spill there (g1 3,808 B of stack, offline sm_120); the loop form keeps a chain's state in registers, its loads
-on the path the group's lanes fetched into L1 (WALK_MAPPING §4: B3 against B4)."""
 
 
 _UP_OUTPUT, *_UP_UPDATE = ts.step(ts.Direction.UP, ts.FETCHED, "$V", source="$X.u")
@@ -2272,34 +2213,6 @@ def _walked(layout: TreeLayout, classes: tuple) -> list[tuple[int, int, int]]:
     return walked
 
 
-def _walk_head(layout: TreeLayout, r: int) -> str:
-    """Native declarations of root ``r``'s tree in the walk: its articulation, first joint and coordinate, records and
-    links (read-only)."""
-    from .tree_factor import WALK_COORDINATE, WALK_LINK  # noqa: PLC0415
-
-    return (
-        f"const int a={_root_articulation(layout, r)};"
-        "const int j0=walk.joint_start.data[a],d0=walk.dof_start.data[a];"
-        f"const float* __restrict__ data=walk.data.data+(size_t)d0*{WALK_COORDINATE};"
-        f"const float* __restrict__ link=walk.link.data+(size_t)j0*{WALK_LINK};"
-    )
-
-
-def walk_fetch(layout: TreeLayout, classes: tuple, guard: str = "") -> str:
-    """Native statements of every lane of the tree's group asking L1 for the lines of each walked root's records and
-    links, one parallel trip, before lane 0 walks (WALK_MAPPING §4, B5); a hint, so no barrier. ``guard`` formats with
-    a root's ``bit`` (the decided step's changed roots)."""
-    from .tree_factor import WALK_COORDINATE, WALK_LINK  # noqa: PLC0415
-
-    text = "".join(
-        f"    {guard.format(bit=2 << r)}{{{_walk_head(layout, r)}"
-        f"WALK_FETCH(data,walk.dofs.data[a]*{4 * WALK_COORDINATE},lane,stride);"
-        f"WALK_FETCH(link,(walk.joint_end.data[a]-j0)*{4 * WALK_LINK},lane,stride);}}\n"
-        for r, _, _ in _walked(layout, classes)
-    )
-    return f"#if defined(__CUDA_ARCH__)\n{text}#endif\n"
-
-
 def _up_texts() -> dict[str, str]:
     """The walk up's :meth:`.tree_scan.WalkClass.walk` keywords: its joint, step, fetches and touches, leaf first."""
     from .tree_factor import WALK_COORDINATE, WALK_LINK  # noqa: PLC0415
@@ -2313,46 +2226,6 @@ def _up_texts() -> dict[str, str]:
         "touch_joint": f"WALK_TOUCH(link + {WALK_LINK} * ($b));",
         "touch_step": f"WALK_TOUCH(data + {WALK_COORDINATE} * ($c));",
     }
-
-
-def walk_up(cls, unroll: int = PREDICTOR_UNROLL, ahead: int | None = PREDICTOR_AHEAD) -> str:
-    """Native statements of the walk up of class ``cls`` (the emitter's leaf-first walk, straight-line up to
-    ``unroll`` coordinates, its records, links and ``x`` loaded ``ahead`` items ahead of the chain and asked of L1
-    before that, as the walk down's): ``u = L^-1 P x``, with ``x``, ``u``, ``data`` and ``link`` in scope."""
-    up = {**_up_texts(), "unroll": unroll, "ahead": ahead}
-    return (
-        "{\n#if defined(__CUDA_ARCH__)\n"
-        + cls.walk(**up, cuda=True)
-        + "\n#else\n"
-        + cls.walk(**up, cuda=False)
-        + "\n#endif\n}"
-    )
-
-
-def walk_tree(layout: TreeLayout, classes: tuple, *, up: bool, down: bool, guard: str = "") -> str:
-    """Native statements of lane 0 walking each walked root's tree (Z4.2): the walk up of the force words
-    ``s[$SIX_BODIES + i]`` into the response words ``s[$WHITE + i]`` (:func:`walk_up`), then the walk down in place
-    (``WALK_DOWN``, the one walk down of :func:`.tree_factor.walk_down_prelude`): ``P^T L^-T L^-1 P f`` on the all-``K``
-    walk, its states in registers, no word of the block read but the force and response words. A prescribed root
-    responds with zero. ``guard`` formats with a root's ``bit``."""
-    blocks = []
-    walked = {r: k for r, _, k in _walked(layout, classes)}
-    for r, offset, _family in _walk_roots(layout):
-        if r not in walked:
-            if up and down:
-                blocks.append(f"for(int k=0;k<{layout.root_coordinates[r]};++k)s[$WHITE+{offset}+k]=0.0f;")
-            continue
-        body = [_walk_head(layout, r), f"const float* x=s+$SIX_BODIES+{offset};", f"float* u=s+$WHITE+{offset};"]
-        if up:
-            body.append(walk_up(classes[r]))
-        if down:
-            body.append(
-                f"WALK_DOWN({walked[r]},data,link,[&](const int c){{return u[c];}},[](const int){{return 0.0f;}},"
-                "[&](const int c,const float q,const float){u[c]=q;},[](const int,const float*){});"
-            )
-        blocks.append(guard.format(bit=2 << r) + "{\n" + "\n".join(body) + "\n}")
-    text = "if(lane==0) {\n" + "\n".join(blocks) + "\n}\n#if defined(__CUDA_ARCH__)\nSYNC();\n#endif\n"
-    return substitute(text, layout.sizes())
 
 
 PREDICTOR_THREADS = 1152
@@ -2372,122 +2245,81 @@ def _predictor_bounds(layout: TreeLayout) -> tuple[int, int]:
 
 
 def border_solve(layout: TreeLayout, classes: tuple) -> str:
-    """Native statements of the decided step (FL3.9, W9). The block's lanes build each changed root's release (into
-    :class:`.tree_factor.WalkRelease`, from the marks :data:`SATURATE_DRIVES` left): on CUDA, for a tree whose walk a
-    lane holds in two words (:data:`_HELD`), the tree's segment holds the walk in registers and builds the release
-    coordinate-major, a lane a slip, every value a register (``HELD_BUILD``); otherwise lane 0 lists the slips and their
-    groups (``BORDER_SLIPS``), a lane a slip walks the columns (``BORDER_COLUMN``) and a lane a group runs its slips'
-    recurrences (``BORDER_GROUP``). Then each changed root takes its decided step from the force words into the response
-    words: the walk up (held: the segment in lockstep; else lane 0's, :func:`walk_tree`), ``R^T R`` by the release's
-    one primitive, a lane a group (``BORDER_APPLY``: ``WALK_SLIP``, ``WALK_SLIP_T``), the walk down. A root whose step
-    its trial already gives (bit ``1 + r`` of ``moved`` clear) keeps its trial's response. The releases are built for
-    every root first: the marks of one root lie in the states of another's walk. Nothing is added to the block (H8: g1's
-    predictor sits at the RTX PRO 6000's 64 KB carveout line): the serial build's work, the pivots and a dense column,
-    lies in the dead body-wrench words, else in the walk's scratch; the held build's is registers."""
+    """Native statements of the decided step (FL3.9, W9), one text for both devices (:data:`_HELD`). Each changed
+    root's segment holds its walk and builds its release (into :class:`.tree_factor.WalkRelease`, from the marks
+    :data:`SATURATE_DRIVES` left) coordinate-major, a slip a lane and slot, every value a register (``HELD_BUILD``);
+    then it takes its decided step from the force words into the response words: the class's walk up, ``R^T R`` with
+    every slip on its lane (``HELD_APPLY``), the walk down. A root whose step its trial already gives (bit ``1 + r`` of
+    ``moved`` clear) keeps its trial's response. The releases are built for every root first: the marks of one root
+    lie in the states of another's walk. Nothing is added to the block (H8: g1's predictor sits at the RTX PRO 6000's
+    64 KB carveout line): the walks' join states and twists lie in the dead body words."""
     from .tree_factor import WALK_COORDINATE, WALK_LINK  # noqa: PLC0415
 
     roots = [(r, offset) for r, offset, _ in _walked(layout, classes)]
     if not roots:
         return ""
-    head = (
+    tree = (
         "const int a={art};const int j0=walk.joint_start.data[a],d0=walk.dof_start.data[a],n=walk.dofs.data[a];"
-        "WALK_TREE(reinterpret_cast<const int*>(walk.path.data+j0),walk.joint_end.data[a]-j0,n);"
         "const float* const data=walk.data.data+(size_t)d0*$WALK_COORDINATE;"
         "const float* const link=walk.link.data+(size_t)j0*$WALK_LINK;"
     )
-    sync = "\n#if defined(__CUDA_ARCH__)\n            SYNC();\n#endif\n"
-
-    def each(form):
-        return "".join(
-            form.format(bit=2 << r, r=r, offset=offset, head=head.format(art=_root_articulation(layout, r)))
-            for r, offset in roots
-        )
-
-    # A tree the walk does not hold keeps its trial and flags bit 2. Its work needs 2n floats; a tree that has no room
-    # for them keeps its K and flags bit 0.
+    hold = (
+        "const int nb=walk.joint_end.data[a]-j0;"
+        "WalkHold h;HOLD_LOAD(h,data,link,reinterpret_cast<const int*>(walk.path.data+j0),n,nb);"
+    )
+    # A tree the walk does not hold keeps its trial and flags bit 2.
     frame = (
-        "        if(moved&{bit}) {{{head}\n"
+        "        if(moved&{bit}) {{{tree}\n"
         "        if(d0+n>walk.data.shape[0]) {{if(lane==0) {{FRAME_STATUS(4);moved&=~{bit};}}}}\n"
-        "        else {{\n"
-        "            const int room=$SIX_BODIES-$DOFS;\n"
-        "            float* const work=2*n<=room?s+$DOFS:reinterpret_cast<float*>(walk.scratch.data+j0);\n"
-        "            if(lane==0)BORDER_SLIPS(a,d0,n,s+$WHITE+{offset},2*n<=room||2*n<=6*(walk.joint_end.data[a]-j0));"
-        + sync
-        + "            slips{r}=walk.release.count.data[a];\n"
-        "            if(slips{r}>0) {{\n"
-        "            for(int c=lane;c<n;c+=stride) {{"
-        "const float inverse=WALK_LOAD_INVERSE(data+$WALK_COORDINATE*c);work[c]=1.0f/(inverse*inverse);work[n+c]=0.0f;}}\n"
-        "            for(int k=lane;k<slips{r};k+=stride)BORDER_COLUMN(a,d0,data,link,k);"
-        + sync
-        + "            for(int k=lane;k<slips{r};k+=stride)"
-        "BORDER_GROUP(a,d0,data,s+$WHITE+{offset},s+{offset},work,work+n,k,slips{r});" + sync + "        }}}}}}\n"
-    )
-    apply = (
-        "        if(moved&{bit}) {{const int a={art};"
-        "for(int k=lane;k<slips{r};k+=stride)BORDER_APPLY(a,s+$WHITE+{offset},k,slips{r});}}\n"
-    )
-    serial_apply = "".join(
-        apply.format(bit=2 << r, r=r, offset=offset, art=_root_articulation(layout, r)) for r, offset in roots
-    )
-    declarations = "".join(f"int slips{r}=0;" for r, _ in roots)
-    guard = "if(moved&{bit})"
-    up = walk_fetch(layout, classes, guard) + walk_tree(layout, classes, up=True, down=False, guard=guard)
-    down = walk_tree(layout, classes, up=False, down=True, guard=guard)
-    sync_all = "#if defined(__CUDA_ARCH__)\n        SYNC();\n#endif\n"
-    serial = f"        {declarations}\n{each(frame)}{sync_all}{up}{serial_apply}{sync_all}{down}"
-    words = _held_words(layout)
-    if not words:
-        text = "    {\n" + serial + "    }\n"
-        return substitute(text, {**layout.sizes(), "WALK_COORDINATE": WALK_COORDINATE, "WALK_LINK": WALK_LINK})
-    nb = "const int nb=walk.joint_end.data[a]-j0;"
-    hold = "WalkHold h;HOLD_LOAD(h,data,link,reinterpret_cast<const int*>(walk.path.data+j0),n,nb);"
-    held_frame = (
-        "        if(moved&{bit}) {{{head}\n"
-        "        if(d0+n>walk.data.shape[0]) {{if(lane==0) {{FRAME_STATUS(4);moved&=~{bit};}}}}\n"
-        "        else if(lane<WIDTH) {{" + nb + hold + "\n"
+        "        else if(lane<WIDTH) {{{hold}\n"
         "            slips{r}=HELD_BUILD(h,a,n,nb,data,s+$WHITE+{offset},s+{offset});\n"
         "        }}}}\n"
     )
 
-    def held_step(r, offset):
+    def step(r, offset):
         # The class's walk up of the force words into the response words, R^T R between the walks, every slip on its
         # lane at once (HELD_APPLY), the walk down in place; the join states and the twists in the dead body words.
-        walk_up, walk_down = classes[r].held(f"(s+$SIX_BODIES+{offset})", f"(s+$WHITE+{offset})", "s", words)
+        walk_up, walk_down = classes[r].held(f"(s+$SIX_BODIES+{offset})", f"(s+$WHITE+{offset})", "s")
         return (
-            f"        if((moved&{2 << r})&&lane<WIDTH) {{{head.format(art=_root_articulation(layout, r))}{nb}{hold}\n"
+            f"        if((moved&{2 << r})&&lane<WIDTH) {{{tree.format(art=_root_articulation(layout, r))}{hold}\n"
             f"{walk_up}\n            HELD_APPLY(a,s+$WHITE+{offset},slips{r});\n{walk_down}\n        }}\n"
         )
 
-    steps = "".join(held_step(r, offset) for r, offset in roots)
-    held = f"        {declarations}\n{each(held_frame)}        SYNC();\n{steps}        SYNC();\n"
-    text = f"    {{\n#if defined(__CUDA_ARCH__)\n{held}#else\n{serial}#endif\n    }}\n"
+    frames = "".join(
+        frame.format(bit=2 << r, r=r, offset=offset, tree=tree.format(art=_root_articulation(layout, r)), hold=hold)
+        for r, offset in roots
+    )
+    text = (
+        "    {\n        "
+        + "".join(f"int slips{r}=0;" for r, _ in roots)
+        + "\n"
+        + frames
+        + "        SYNC();\n"
+        + "".join(step(r, offset) for r, offset in roots)
+        + "        SYNC();\n    }\n"
+    )
     return substitute(text, {**layout.sizes(), "WALK_COORDINATE": WALK_COORDINATE, "WALK_LINK": WALK_LINK})
 
 
 def held_lambdas(layout: TreeLayout, slips: int, side: bool = True) -> str:
-    """The held walk's native lambdas (:data:`_HELD`) for the layout's words a lane, CUDA only, declared once ahead of the
-    trial; nothing for a tree past two words a lane (:func:`_held_words`). ``slips`` is the class's slip capacity
-    (:meth:`.tree_factor.TreeFactor.slip_capacity`): the build's lanes, one a slip, at most the segment's width."""
+    """The border's native lambdas (:data:`_HELD`), both devices, declared once ahead of the trial: the segment's words
+    a lane hold the layout's coordinates and bodies (and one past the last body). ``slips`` is the class's slip capacity
+    (:meth:`.tree_factor.TreeFactor.slip_capacity`): the build's slips, a lane and slot each."""
     from .tree_factor import WALK_COORDINATE, WALK_UNPACKED  # noqa: PLC0415
 
-    words = _held_words(layout)
-    if not words:
-        return ""
-    bound = max(1, min(slips, layout.lanes, 32))
-    lambdas = substitute(
+    return substitute(
         _HELD,
-        HOLD=words,
-        SLIPS=bound,
+        items=max(layout.dofs, layout.bodies + 1),
+        slips=max(1, slips),
         coordinate=WALK_COORDINATE,
         unpacked=WALK_UNPACKED,
         record=record_load(side),
-        held_step=ts.statements([*_HELD_COLUMN, "root = c;"], 20),
-        apply_r=ts.statements(ts.slip("R", "u[c]", "r", "b[t]", "ar[t]", "g[t]", "u[c] = {};"), 16),
-        apply_rt=ts.statements(ts.slip("RT", "u[c]", "r", "b[t]", "ar[t]", "g[t]", "u[c] = {};"), 16),
-        build_r=ts.statements(ts.slip("R", "z", "pair[k]", "bk", "ak", "gk", "z = {};"), 24),
-        edge_p=ts.statements(_EDGE_UP, 20),
+        held_step=ts.statements([*_HELD_COLUMN, "root = c;"], 24),
+        apply_r=ts.statements(ts.slip("R", "u[c]", "r", "b[t]", "ar[t]", "g[t]", "u[c] = {};"), 20),
+        apply_rt=ts.statements(ts.slip("RT", "u[c]", "r", "b[t]", "ar[t]", "g[t]", "u[c] = {};"), 20),
+        build_r=ts.statements(ts.slip("R", "z", "pair[k]", "bk", "ak", "gk", "z = {};"), 28),
+        edge_p=ts.statements(_EDGE_UP, 24),
     )
-    return f"#if defined(__CUDA_ARCH__)\n{lambdas}\n#endif\n"
 
 
 def clear_slips(layout: TreeLayout) -> str:
@@ -2708,16 +2540,9 @@ def get_predictor_kernel(
     # The decided step's response: the border's words, on the roots it changed.
     changed = f"if(!(moved&(2<<{_root(layout).replace('[i]', '[col]')})))continue;"
     second = {**response_ops, "TRANSPOSE_ACTION": changed + "float value=s[$WHITE+col];"}
-    from .tree_factor import walk_down_prelude  # noqa: PLC0415
-
-    walked = tuple(cls for cls in classes if cls is not None)
     source = layout.native(
         _RESPONSE_HALF,
-        preludes=(
-            *SPATIAL.preludes(),
-            walk_tree_prelude(side),
-            *((walk_down_prelude(walked, PREDICTOR_UNROLL, PREDICTOR_AHEAD),) if walked else ()),
-        ),
+        preludes=(*SPATIAL.preludes(), walk_loads_prelude(side)),
         PHYSICAL_TABLE=layout.physical_table(),
         SCRATCH=_placed_block(layout, "s", "$PRED_SCRATCH"),
         TRIAL=held_lambdas(layout, slips, side)

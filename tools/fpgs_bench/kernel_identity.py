@@ -440,7 +440,7 @@ def walk_calls():
     The step's leave of each class, with and without the slips' release (and the support placement's nodes on g1),
     and of allegro's hand with its cube; the audit's enter and the refresh; the walk's solve of each class (chain106
     in the loop form); the predictor's force and response halves on a tree of each held width: one word a lane
-    (franka), two (g1, with joins) and none (chain106, the serial border); the support writer on g1 and kuka; the
+    (franka), two (g1, with joins) and four (chain106); the support writer on g1 and kuka; the
     general writer with and without sides; the free-body headers; and the sweeps that walk rows (the matrix-free
     Gauss-Seidel's free bodies, the local owners' block, the parallel tiers' rows).
     """
