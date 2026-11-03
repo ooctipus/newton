@@ -1501,8 +1501,8 @@ one, the finish's columns at each body's frame, both halves (``WALK_READ_COLUMN`
 :attr:`WalkTrees.now_link`, take :data:`WALK_LINK`'s layout."""
 
 
-_WALK_TABLE = """    static $memory int WALK_PARENT[$bodies] = {$parent};
-    static $memory int WALK_FIRST[$ends] = {$first};
+_WALK_TABLE = """    static WALK_CONSTANT int WALK_PARENT[$bodies] = {$parent};
+    static WALK_CONSTANT int WALK_FIRST[$ends] = {$first};
     const int WALK_BODIES = $bodies;
     const auto WALK_PARENT_OF = [&](const int b) -> int { return WALK_PARENT[b]; };
     const auto WALK_FIRST_OF = [&](const int b) -> int { return WALK_FIRST[b]; };"""
@@ -1834,7 +1834,10 @@ _WALK_DEVICE = {
 #define WALK_BITS(x) __float_as_int(x)
 #define WALK_FLOAT(i) __int_as_float(i)
 #define WALK_ABS(x) fabsf(x)
-#define WALK_MUL(a, b) __fmul_rn((a), (b))""",
+#define WALK_MUL(a, b) __fmul_rn((a), (b))
+#define WALK_CONSTANT __constant__
+// WALK_TOUCH(p): ask L1 for the line of p, a hint ahead of the load that reads it (no register, no scoreboard).
+#define WALK_TOUCH(p) asm volatile("prefetch.global.L1 [%0];" ::"l"(p))""",
     False: """// The CPU's quad is Warp's (four named floats); its loads are plain. Its WALK_MUL is a function boundary, as CUDA's
 // __fmul_rn: a product inside the consumer's expression could be contracted into it.
 #define WALK_QUAD wp::quatf
@@ -1846,10 +1849,13 @@ _WALK_DEVICE = {
 #define WALK_BITS(x) __builtin_bit_cast(int, x)
 #define WALK_FLOAT(i) __builtin_bit_cast(float, i)
 #define WALK_ABS(x) __builtin_fabsf(x)
-#define WALK_MUL(a, b) ([](const float walk_a_, const float walk_b_) -> float { return walk_a_ * walk_b_; }((a), (b)))""",
+#define WALK_MUL(a, b) ([](const float walk_a_, const float walk_b_) -> float { return walk_a_ * walk_b_; }((a), (b)))
+#define WALK_CONSTANT const
+#define WALK_TOUCH(p) ((void)(p))""",
 }
 """The device's words of :data:`_WALK_LOADS`: its quad, its load kinds, the record's pivot, the bit and absolute
-value, the step's pin. Everything else of the access is one text."""
+value, the step's pin, the tables' constant memory and the L1 hint (none on the CPU). Everything else of the access is
+one text."""
 
 WALK_LINK_FRAME = 3
 """Where a body's link, as a walk reads it (``WALK_READ_LINK``'s registers, or a kernel's staged copy), holds its frame
@@ -1869,10 +1875,8 @@ def walk_loads_prelude() -> DevicePrelude:
     return DevicePrelude("walk_loads", _walk_loads_text(True), cpu=_walk_loads_text(False))
 
 
-def _walk_placement(
-    name: str, table: dict[bool, str], rows: int, coordinate: int, link: int, now: int, half: int
-) -> DevicePrelude:
-    """The walk of ``rows`` rows (:data:`_WALK`) placed on a path table (``table``, each device's text declaring
+def _walk_placement(name: str, table: str, rows: int, coordinate: int, link: int, now: int, half: int) -> DevicePrelude:
+    """The walk of ``rows`` rows (:data:`_WALK`) placed on a path table (``table``, a text declaring
     ``WALK_PARENT_OF``, ``WALK_FIRST_OF`` and ``WALK_BODIES``) and a layout, after the one access: :func:`walk_prelude`
     and :func:`walk_paths_prelude` are its two placements. The layout's reads (``_WALK``'s ``$record_*``, ``$link_*``,
     ``$column_c`` and ``$point_b``): the device layout by the one access (:data:`_WALK_LOADS`, the read-only load kind,
@@ -1912,7 +1916,7 @@ def _walk_placement(
             f"float f[4];\nWALK_READ_POINT(WALK_LDG, f, now_link + {WALK_LINK} * b + {WALK_FRAME});", 20
         ),
     )
-    text = {cuda: _walk_loads_text(cuda) + "\n" + table[cuda] + "\n" + walk for cuda in (True, False)}
+    text = {cuda: _walk_loads_text(cuda) + "\n" + table + "\n" + walk for cuda in (True, False)}
     return DevicePrelude(name, text[True], cpu=text[False])
 
 
@@ -1939,17 +1943,13 @@ def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int, hal
     """
     if len(first) != len(parent) + 1 or any(p >= b for b, p in enumerate(parent)):
         raise ValueError("a walk's path table needs every parent before its children and a first coordinate per body")
-    table = {
-        cuda: substitute(
-            _WALK_TABLE,
-            memory="__constant__" if cuda else "const",
-            bodies=len(parent),
-            ends=len(first),
-            parent=", ".join(str(b) for b in parent),
-            first=", ".join(str(c) for c in first),
-        )
-        for cuda in (True, False)
-    }
+    table = substitute(
+        _WALK_TABLE,
+        bodies=len(parent),
+        ends=len(first),
+        parent=", ".join(str(b) for b in parent),
+        first=", ".join(str(c) for c in first),
+    )
     name = f"walk_{rows}_{len(parent)}" + ("" if half == WALK_BOTH else f"_{half}")
     return _walk_placement(name, table, rows, WALK_COORDINATE, WALK_LINK, WALK_NOW, half)
 
@@ -1978,7 +1978,7 @@ def walk_paths_prelude(
     staged = (coordinate, link, now) != (WALK_COORDINATE, WALK_LINK, WALK_NOW)
     name = f"walk_paths_{rows}" + (f"_{coordinate}_{link}_{now}" if staged else "")
     name += "" if half == WALK_BOTH else f"_{half}"
-    return _walk_placement(name, dict.fromkeys((True, False), _WALK_PATHS), rows, coordinate, link, now, half)
+    return _walk_placement(name, _WALK_PATHS, rows, coordinate, link, now, half)
 
 
 _WALK_ROW = """    // WALK_WRENCH(q, sign, d, at, origin, o, torque): a row's seed at a body's frame (the native twin of
@@ -2058,22 +2058,13 @@ _WALK_ACCESS = """    // The class emitter's reads, ahead of its chain, by the o
         return in;
     };
     const auto WALK_LOAD = [&](const float* p) -> float { return *p; };
-$fetch"""
-
-_WALK_FETCH = {
-    True: """    // A lane group's fetch of a byte range into L1, one line a lane a trip.
+    // A lane group's fetch of a byte range into L1, one line a lane a trip (WALK_TOUCH: none on the CPU).
     const auto WALK_FETCH = [&](const void* start, const int bytes, const int lane, const int lanes) {
         const size_t end = reinterpret_cast<size_t>(start) + (size_t)bytes;
         for (size_t line = (reinterpret_cast<size_t>(start) & ~(size_t)127) + (size_t)128 * lane; line < end;
              line += (size_t)128 * lanes)
-            asm volatile("prefetch.global.L1 [%0];" ::"l"(line));
-    };
-    // WALK_TOUCH(p): ask L1 for the line of p, a hint ahead of the load that reads it (no register, no scoreboard).
-    const auto WALK_TOUCH = [&](const void* p) { asm volatile("prefetch.global.L1 [%0];" ::"l"(p)); };""",
-    False: """    const auto WALK_FETCH = [&](const void*, const int, const int, const int) {};
-    const auto WALK_TOUCH = [&](const void*) {};""",
-}
-"""The device's words of :data:`_WALK_ACCESS`: the L1 hints, which the CPU has none of."""
+            WALK_TOUCH(line);
+    };"""
 
 
 def _walk_down(classes: tuple[WalkClass, ...], cuda: bool, unroll: int, ahead: int | None) -> str:
@@ -2130,7 +2121,7 @@ def walk_down_prelude(
         cuda: "\n".join(
             (
                 _walk_loads_text(cuda),
-                substitute(_WALK_ACCESS, unpacked=WALK_UNPACKED, fetch=_WALK_FETCH[cuda]),
+                substitute(_WALK_ACCESS, unpacked=WALK_UNPACKED),
                 _walk_down(classes, cuda, unroll, ahead),
             )
         )
@@ -2207,13 +2198,7 @@ def _leave_class(k: int, walk: WalkClass, node: tuple[int, ...] | None, release:
     at = "c" if node is None else f"LEAVE_NODE_{k}[c]"
     table = ""
     if node is not None:
-        table = (
-            "#if defined(__CUDA_ARCH__)\n"
-            f"    static __constant__ int LEAVE_NODE_{k}[{max(n, 1)}] = {{{', '.join(map(str, node))}}};\n"
-            "#else\n"
-            f"    static const int LEAVE_NODE_{k}[{max(n, 1)}] = {{{', '.join(map(str, node))}}};\n"
-            "#endif\n"
-        )
+        table = f"    static WALK_CONSTANT int LEAVE_NODE_{k}[{max(n, 1)}] = {{{', '.join(map(str, node))}}};\n"
     span = "n * 4" if node is None else str(4 * (max(node, default=-1) + 1))
     if not release:
         head = substitute(_LEAVE_PLAIN, node=at)
@@ -2628,11 +2613,6 @@ _INWARD = """    // The refresh by the tree's lane group (walk_group): the lane 
     const float* Qb = reinterpret_cast<const float*>(body_q.data);
     const float* Mb = body_mass.data;
     const float* Ib = reinterpret_cast<const float*>(body_inertia.data);
-#if defined(__CUDA_ARCH__)
-    const auto PREFETCH = [](const void* p) { asm volatile("prefetch.global.L1 [%0];" ::"l"(p)); };
-#else
-    const auto PREFETCH = [](const void* p) {};
-#endif
     const auto SYM = [](int a, int b) -> int { return a <= b ? (a == 0 ? b : (a == 1 ? 2 + b : 5)) : (b == 0 ? a : (b == 1 ? 2 + a : 5)); };
     enum { M = 0, MC = 1, ROT = 4, OFFSET = 10, INERTIA = 13 };
     // A coordinate's column at the step's poses and what the factor adds to its diagonal, R and R + K.
@@ -2660,13 +2640,13 @@ _INWARD = """    // The refresh by the tree's lane group (walk_group): the lane 
     // Every line one body's inertia and link read.
     const auto AHEAD = [&](int j) {
         const int b = Ct[j];
-        PREFETCH(Qb + 7 * b + 3);
-        PREFETCH(Qb + 7 * b + 6);
-        PREFETCH(Mb + b);
-        PREFETCH(Ib + 9 * b);
-        PREFETCH(Ib + 9 * b + 8);
-        PREFETCH(Lk + $link * j);
-        PREFETCH(Lc + 3 * j);
+        WALK_TOUCH(Qb + 7 * b + 3);
+        WALK_TOUCH(Qb + 7 * b + 6);
+        WALK_TOUCH(Mb + b);
+        WALK_TOUCH(Ib + 9 * b);
+        WALK_TOUCH(Ib + 9 * b + 8);
+        WALK_TOUCH(Lk + $link * j);
+        WALK_TOUCH(Lc + 3 * j);
     };
     // WALK_OFFSET(p, f, d): a body's link offset d, its parent's frame point p (null at a root) less its own f: the
     // one place a walk forms it from the frame points the finish published.
@@ -2678,11 +2658,7 @@ _INWARD = """    // The refresh by the tree's lane group (walk_group): the lane 
         float offset[3];
         WALK_OFFSET(up >= 0 ? Lk + $link * up + $frame : nullptr, Lr + $frame, offset);
         for (int k = 0; k < 3; ++k) r[OFFSET + k] = offset[k];
-#if defined(__CUDA_ARCH__)
-        reinterpret_cast<float4*>(Lo + $link * j)[0] = reinterpret_cast<const float4*>(Lr)[0];
-#else
-        for (int k = 0; k < $link; ++k) Lo[$link * j + k] = Lr[k];
-#endif
+        *reinterpret_cast<WALK_QUAD*>(Lo + $link * j) = WALK_PLAIN(Lr);
         const int b = Ct[j];
         const float* q = Qb + 7 * b;
         const float* I = Ib + 9 * b;
@@ -2758,9 +2734,9 @@ $lift
     constexpr int HELD = $slots;
 #endif
     for (int c = dof0 + LANE; c < dof1; c += LANES) {
-        PREFETCH(Nw + $now * c);
-        PREFETCH(Ra + c);
-        PREFETCH(Dr + c);
+        WALK_TOUCH(Nw + $now * c);
+        WALK_TOUCH(Ra + c);
+        WALK_TOUCH(Dr + c);
     }
     float held[HELD][21];
     for (int s = 0; s < HELD; ++s)
@@ -2777,8 +2753,8 @@ $lift
     FEED(j0, j1 - 1, -1,
         [&](int j) {
             AHEAD(j);
-            PREFETCH(Pt + 2 * j);
-            PREFETCH(Jt + j);
+            WALK_TOUCH(Pt + 2 * j);
+            WALK_TOUCH(Jt + j);
         },
         [&](int mine, bool valid) -> Feed {
             Feed r;
@@ -2849,7 +2825,7 @@ def _walk_inward_snippet() -> str:
             frame=WALK_FRAME,
             slots=WALK_JOIN_SLOTS,
         ),
-        preludes=(lane_group("lanes"), CPU_MATH, LANE_FEED),
+        preludes=(walk_loads_prelude(), lane_group("lanes"), CPU_MATH, LANE_FEED),
     )
 
 
