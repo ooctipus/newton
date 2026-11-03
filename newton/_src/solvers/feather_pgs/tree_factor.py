@@ -2351,11 +2351,10 @@ class WalkClass:
         """
         bodies, coordinates = len(self.parent), self.coordinates
         zero = "{" + ", ".join(["0.0f"] * width) + "}"
-        bodies_order = range(bodies) if root_first else range(bodies - 1, -1, -1)
+        bodies_order = self.bodies_in(root_first)
 
         def coordinates_of(b):
-            span = range(self.first[b], self.first[b + 1])
-            return span if root_first else reversed(span)
+            return self.coordinates_in(b, root_first)
 
         if coordinates <= unroll:
             # The fetched items in the walk's order: a body's joint input where it has a parent (root first before its
@@ -2553,6 +2552,85 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
 {indent_text(copies, 4)}
 }}"""
         return "\n".join(tables) + "\n" + Template(loop).substitute(width=width)
+
+    def bodies_in(self, root_first: bool) -> range:
+        """The class's bodies in a walk's order: parents first (root first), or children first (leaf first)."""
+        bodies = len(self.parent)
+        return range(bodies) if root_first else range(bodies - 1, -1, -1)
+
+    def coordinates_in(self, b: int, root_first: bool):
+        """Body ``b``'s coordinates in a walk's order."""
+        span = range(self.first[b], self.first[b + 1])
+        return span if root_first else reversed(span)
+
+    def held(self, x: str, u: str, state: str, words: int) -> tuple[str, str]:
+        """The ``HELD`` schedule: native statements of the decided step's two held walks (CUDA, the border's held
+        ``h`` in scope, :data:`.tree_kinetic_state._HELD`): the walk up of ``x`` into ``u`` (``u = L^-1 P x``) and the
+        walk down of ``u`` in place (``P^T L^-T u``), on every lane of the segment in lockstep, straight-line in the
+        class's order, no loop and no pick of a parent or a first coordinate on the chain. Each coordinate's step runs
+        on every lane from the lane's own held word of the records (the coordinate's lane: its own record), and the
+        walk's six-float state is then read from the coordinate's lane (six shuffles, where reading the record took
+        thirteen); each body's link by shuffle from the lane that holds it (``HOLD_LINK`` at a constant). A body's
+        state passes to a parent that is not the body before it through ``state`` (six words a body, lane 0 writes),
+        the walk down's twists through the same words (every lane writes them, as each body's twist out); a body no
+        other child joins adds the zero state as ``+ 0.0f``, the walk up's addition of an untouched slot. Lane 0 writes
+        ``u`` (both walks). ``words``: the words a lane holds (:func:`.tree_kinetic_state._held_words`)."""
+        parent = self.parent
+        edge_up = "".join(ts.edge(ts.Direction.UP, ts.LOADED.lever, "p"))
+        edge_down = "".join(ts.edge(ts.Direction.DOWN, ts.LOADED.lever, "V"))
+        up, joined = [], set()
+        up.append("{\n    float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};")
+        for b in self.bodies_in(False):
+            if b in joined:
+                up.append(f"    for (int k = 0; k < 6; ++k) p[k] += {state}[{6 * b} + k];")
+            else:
+                up.append("    for (int k = 0; k < 6; ++k) p[k] += 0.0f;")
+            for c in self.coordinates_in(b, False):
+                output, update = ts.step(ts.Direction.UP, ts.LOADED, "p", source=f"{x}[{c}]", into="q")
+                up.append(
+                    f"    {{const float* d=h.r[{c}/WIDTH];{output}float q[6];{update}if(lane=={c}%WIDTH){u}[{c}]=z;"
+                    f"for(int k=0;k<6;++k)p[k]=READ(q[k],{c}%WIDTH);}}"
+                )
+            parent_b = parent[b]
+            if parent_b >= 0:
+                up.append(f"    {{float l[3];HOLD_LINK(h,{b},l);{edge_up}}}")
+            if parent_b != b - 1:
+                if parent_b >= 0:
+                    if parent_b in joined:
+                        up.append(f"    if(lane==0)for(int k=0;k<6;++k){state}[{6 * parent_b}+k]+=p[k];")
+                    else:
+                        up.append(f"    if(lane==0)for(int k=0;k<6;++k){state}[{6 * parent_b}+k]=0.0f+p[k];")
+                        joined.add(parent_b)
+                    up.append("    WARP_SYNC();")
+                if b > 0:
+                    up.append("    for (int k = 0; k < 6; ++k) p[k] = 0.0f;")
+        up.append("    WARP_SYNC();\n}")
+        down = [
+            f"{{\n    float uh[{words}];",
+            "    #pragma unroll",
+            f"    for (int k = 0; k < {words}; ++k) uh[k] = lane + k * WIDTH < {self.coordinates} ? {u}[lane + k * WIDTH] : 0.0f;",
+            "    WARP_SYNC();",
+            "    float V[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};",
+        ]
+        for b in self.bodies_in(True):
+            parent_b = parent[b]
+            if parent_b < 0:
+                down.append("    for (int k = 0; k < 6; ++k) V[k] = 0.0f;")
+            else:
+                if parent_b != b - 1:
+                    down.append(f"    for (int k = 0; k < 6; ++k) V[k] = {state}[{6 * parent_b} + k];")
+                down.append(f"    {{float l[3];HOLD_LINK(h,{b},l);{edge_down}}}")
+            for c in self.coordinates_in(b, True):
+                output, update = ts.step(
+                    ts.Direction.DOWN, ts.LOADED, "V", source=f"uh[{c}/WIDTH]", out="const float q", into="W"
+                )
+                down.append(
+                    f"    {{const float* d=h.r[{c}/WIDTH];{output}float W[6];{update}if(lane=={c}%WIDTH){u}[{c}]=q;"
+                    f"for(int k=0;k<6;++k)V[k]=READ(W[k],{c}%WIDTH);}}"
+                )
+            down.append(f"    for (int k = 0; k < 6; ++k) {state}[{6 * b} + k] = V[k];")
+        down.append("    WARP_SYNC();\n}")
+        return "\n".join(up), "\n".join(down)
 
     def touch(self, items: int) -> int:
         """How many items ahead of its chain a walk asks L1 for an item's lines: :data:`WALK_TOUCH`, at most the
