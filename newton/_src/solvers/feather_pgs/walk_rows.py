@@ -66,7 +66,6 @@ from .tree_factor import (
     WALK_COORDINATE,
     WALK_FRAME,
     WALK_LINK,
-    WALK_NOW,
     WalkRelease,
     WalkTrees,
     walk_into,
@@ -633,7 +632,7 @@ $start    for (int side = 0; side < 2; ++side) {
 $side
         const float* data = walk.data.data + (size_t)d0 * $coordinate;
         const float* link = walk.link.data + (size_t)j0 * $link;
-        const float* now = walk.now.data + (size_t)d0 * $now;
+        const float* now = reinterpret_cast<const float*>(walk.now.data + d0);
         const float* now_link = walk.now_link.data + (size_t)j0 * $link;
         const float* vh = sink.v_hat.data + d0;
         const auto rank = [&](int c) -> int { return $rank; };
@@ -867,7 +866,6 @@ def _support_snippet(parent: tuple, first: tuple, node: tuple, rows: int, record
         last=rows - 1,
         coordinate=WALK_COORDINATE,
         link=WALK_LINK,
-        now=WALK_NOW,
         frame=WALK_FRAME,
         record=record,
         start="",
@@ -1005,7 +1003,6 @@ def packed_walker(rows: int, spin: bool, side: bool, star: bool = False) -> wp.F
         last=rows - 1,
         coordinate=WALK_COORDINATE,
         link=WALK_LINK,
-        now=WALK_NOW,
         frame=WALK_FRAME,
         record="",
         start=_PACKED_START,

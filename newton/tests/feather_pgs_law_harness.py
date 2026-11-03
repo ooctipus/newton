@@ -29,7 +29,6 @@ from newton._src.solvers.feather_pgs.tree_factor import (
     WALK_LINK,
     WalkRelease,
     WalkTrees,
-    pack_walk_columns,
     pack_walk_records,
     unpack_walk_records,
     walk_leave_kernel,
@@ -932,7 +931,7 @@ def chain_walk(device, lowers) -> WalkTrees:
     walk.data = wp.array(pack_walk_records(s, ut, inverse, np.zeros(total)), dtype=wp.float32, device=device)
     walk.link = wp.zeros((total, WALK_LINK), dtype=wp.float32, device=device)
     walk.path = wp.array(path, dtype=wp.vec2i, device=device)
-    walk.now = wp.array(pack_walk_columns(now), dtype=wp.float32, device=device)
+    walk.now = wp.array(np.asarray(now, dtype=np.float32).reshape(-1, 6), dtype=wp.spatial_vector, device=device)
     walk.now_link = wp.zeros((total, WALK_LINK), dtype=wp.float32, device=device)
     walk.now_com = wp.zeros(total, dtype=wp.vec3, device=device)
     # One geometry's frames, at the world's origin: the factor's and the step's origins agree.

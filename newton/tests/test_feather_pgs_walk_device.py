@@ -51,7 +51,6 @@ from newton._src.solvers.feather_pgs.tree_factor import (
     WALK_NOW,
     TreeWalk,
     local_frames,
-    pack_walk_columns,
     unpack_walk_records,
 )
 from newton.solvers import SolverFeatherPGS
@@ -207,7 +206,9 @@ class DeviceWalk:
         self.step_frames = np.stack([frame_points(walk) for walk in step])
         now_link = np.stack([walk.device_data()[1] for walk in step])
         now_link[:, :, WALK_FRAME : WALK_FRAME + 3] = self.step_frames
-        self.now = wp.array(np.stack([pack_walk_columns(walk.s) for walk in step]), dtype=float, device=device)
+        self.now = wp.array(
+            np.stack([np.asarray(walk.s, dtype=np.float32) for walk in step]), dtype=float, device=device
+        )
         self.now_link = wp.array(now_link, dtype=float, device=device)
 
     def up(self, tree, body, top, seeded, wrench, covector, entries: bool = False):

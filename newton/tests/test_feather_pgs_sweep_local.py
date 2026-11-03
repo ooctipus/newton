@@ -24,7 +24,6 @@ from newton._src.solvers.feather_pgs.response_operator import (
     LocalBlock,
 )
 from newton._src.solvers.feather_pgs.solve_policy import DEFAULT_POLICY, SolvePolicy
-from newton._src.solvers.feather_pgs.tree_factor import WALK_NOW
 
 _LOCAL = sweep_routes_local.local_owned_kernel.__wrapped__
 _PAIRED = sweep_routes_local.paired_factor_kernel.__wrapped__
@@ -266,7 +265,7 @@ class TestResponseOperators(unittest.TestCase):
         self.assertNotIn("s_L", respond)
         # Read in place, the same walks take the device walk's data (a data-chosen layout).
         in_place = LocalBlock(15, 9, 11, seeds=True, wrenches=True, lanes=Lanes(32)).prologue()
-        self.assertIn(f"const float* walk_now = walk.now.data + (size_t)walk_d0 * {WALK_NOW};", in_place)
+        self.assertIn("const float* walk_now = reinterpret_cast<const float*>(walk.now.data + walk_d0);", in_place)
         self.assertNotIn("s_walk", in_place)
         # The one writer's stored rows: read, not whitened again; the walk read in place for the leave.
         stored_block = LocalBlock(15, 9, release=True, lanes=Lanes(32))

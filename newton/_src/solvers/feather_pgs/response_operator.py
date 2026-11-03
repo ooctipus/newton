@@ -733,7 +733,7 @@ class WalkedRows:
     def _walk(self) -> str:
         """``TIER_WALK``: one seed of row ``i`` on the world's tree ``side`` (:func:`.tree_factor.walk_into`'s walk), its
         footprints added at the tree's world coordinates and its ``J`` entries against ``s_v`` into ``incident``."""
-        from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_NOW  # noqa: PLC0415
+        from .tree_factor import WALK_COORDINATE, WALK_LINK  # noqa: PLC0415
 
         return f"""const auto TIER_WALK = [&](const int side, const int body, const int k, const float* seed) {{
     const int art = side == 0 ? art_a : art_b, offset = side == 0 ? {self.primary_offset} : {self.secondary_offset};
@@ -742,7 +742,7 @@ class WalkedRows:
     const float* data = walk.data.data + (size_t)d0 * {WALK_COORDINATE};
     const float* link = walk.link.data + (size_t)j0 * {WALK_LINK};
     // The step's geometry the finish published: its columns and links at the step's poses.
-    const float* now = walk.now.data + (size_t)d0 * {WALK_NOW};
+    const float* now = reinterpret_cast<const float*>(walk.now.data + d0);
     const float* now_link = walk.now_link.data + (size_t)j0 * {WALK_LINK};
     const auto sink = [&](int, int c, float z, float j) {{
         Zi[(offset + c) * ZS] += z;
@@ -1321,12 +1321,7 @@ class LocalBlock(ResidualBlock):
         the walk's functions; and with ``seeds`` the row seeds' walks a lane runs into ``s_Z`` (``walk_covector`` and,
         with ``wrenches``, ``walk_wrench``: each returns its incident velocity, the step's ``J`` entries against the
         staged velocity)."""
-        from .tree_factor import (  # noqa: PLC0415 (tree_factor imports this module)
-            WALK_COORDINATE,
-            WALK_LINK,
-            WALK_NOW,
-            WALK_UNPACKED,
-        )
+        from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_UNPACKED  # noqa: PLC0415 (tree_factor imports this module)
         from .tree_scan import WALK_BOTH, WALK_STAGED  # noqa: PLC0415
 
         P, S, L = self.primary, self.secondary, self.lanes.width
@@ -1349,7 +1344,7 @@ class LocalBlock(ResidualBlock):
                 lines.append("const int* walk_dof_body = walk.dof_body.data + walk_d0;")
             if self.wrenches and self.seeds:
                 lines += [
-                    f"const float* walk_now = walk.now.data + (size_t)walk_d0 * {WALK_NOW};",
+                    "const float* walk_now = reinterpret_cast<const float*>(walk.now.data + walk_d0);",
                     f"const float* walk_now_link = walk.now_link.data + (size_t)walk_j0 * {WALK_LINK};",
                     "float walk_shift[3];",
                     "WALK_SHIFT(walk, art, walk_shift);",
@@ -1362,7 +1357,7 @@ class LocalBlock(ResidualBlock):
                 ]
                 if self.wrenches and self.seeds:
                     lines += [
-                        f"const float* free_now = walk.now.data + (size_t)free_d0 * {WALK_NOW};",
+                        "const float* free_now = reinterpret_cast<const float*>(walk.now.data + free_d0);",
                         f"const float* free_now_link = walk.now_link.data + (size_t)free_j0 * {WALK_LINK};",
                         "float free_shift[3];",
                         "WALK_SHIFT(walk, secondary_art, free_shift);",
@@ -1373,7 +1368,8 @@ class LocalBlock(ResidualBlock):
             now = (
                 [
                     "    float S[6];",
-                    f"    WALK_READ_COLUMN(WALK_LDG, S, walk.now.data + (size_t)d * {WALK_NOW}, {WALK_BOTH});",
+                    "    WALK_READ_COLUMN(WALK_LDG, S, reinterpret_cast<const float*>(walk.now.data + d),",
+                    f"                     walk.data.data + (size_t)d * {WALK_COORDINATE}, {WALK_BOTH});",
                     f"    for (int k = 0; k < 6; ++k) s_walk[c * {C} + {WALK_STAGED} + k] = S[k];",
                 ]
                 if self.wrenches

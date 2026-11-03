@@ -1113,11 +1113,8 @@ def get_state_kernel(
     _store_origin, _load_origin, _store_axis = h._store_origin, h._load_origin, h._store_axis
     bodies, dofs, pack, free_root = layout.bodies, layout.dofs, layout.pack, layout.free_root
     roots, free_roots, forest, own_bias = len(layout.roots), layout.free_root_count, layout.forest, layout.own_bias
-    from .tree_factor import (  # noqa: PLC0415 (tree_factor imports this module)
-        WALK_FRAME,
-        store_walk_column,
-        store_walk_columns,
-    )
+    from .spatial_laws import store_columns  # noqa: PLC0415
+    from .tree_factor import WALK_FRAME  # noqa: PLC0415 (tree_factor imports this module)
 
     @wp.func
     def admit(
@@ -1368,26 +1365,22 @@ def get_state_kernel(
                 clock_m2 = _clock()
             start = data.joint_qd_start[joint]
             lin, ang = data.joint_dof_dim[joint, 0], data.joint_dof_dim[joint, 1]
-            walks = data.walk_now.shape[0] > 0
             # The walk's step geometry (tree_factor.WalkTrees.now): each coordinate's column at its joint's frame, so
             # a walk takes it there without S's lever about the origin, and the frame's world point (a free joint's
-            # child's centre of mass).
+            # child's centre of mass). A column of one half is that half of S at the frame, the same words (S carries
+            # the anchor's point only into a turn's linear half, which the frame drops): the walk reads S itself, its
+            # half the record's, and only a model with a column of two halves keeps the frame's columns (walk_now).
+            columns = data.walk_now.shape[0] > 0
             for k in range(lin + ang):
                 column = data.joint_S_s[start + k]
                 _store_axis(g.address, start - g.ds + k, column)
                 if wp.static(not two_half):
-                    if walks:
-                        # A column of one half (every joint but two_half's) is that half of S at the frame, the same
-                        # words: S carries the anchor's point only into a turn's linear half, which the frame drops.
+                    if columns:
                         if k < lin:
-                            store_walk_column(
-                                data.walk_now, start + k, 0, wp.spatial_vector(wp.spatial_top(column), wp.vec3())
-                            )
+                            data.walk_now[start + k] = wp.spatial_vector(wp.spatial_top(column), wp.vec3())
                         else:
-                            store_walk_column(
-                                data.walk_now, start + k, 0, wp.spatial_vector(wp.vec3(), wp.spatial_bottom(column))
-                            )
-            if walks:
+                            data.walk_now[start + k] = wp.spatial_vector(wp.vec3(), wp.spatial_bottom(column))
+            if data.walk_now_link.shape[0] > 0:
                 kind = data.joint_type[joint]
                 free = kind == JointType.FREE or kind == JointType.DISTANCE
                 if free:
@@ -1410,7 +1403,8 @@ def get_state_kernel(
                         a0 = wp.spatial_vector(wp.cross(wp.spatial_bottom(a0), point - origin), wp.spatial_bottom(a0))
                         a1 = wp.spatial_vector(wp.cross(wp.spatial_bottom(a1), point - origin), wp.spatial_bottom(a1))
                         a2 = wp.spatial_vector(wp.cross(wp.spatial_bottom(a2), point - origin), wp.spatial_bottom(a2))
-                    store_walk_columns(data.walk_now, data.joint_qd.shape[0], start, lin, ang, l0, l1, l2, a0, a1, a2)
+                    if columns:
+                        store_columns(data.walk_now, start, lin, ang, l0, l1, l2, a0, a1, a2)
                 # The frame point is the articulation's, relative to its origin (WalkTrees.now_origin, the
                 # articulation_origin poses() published), as the body's centre of mass the publication stores: their
                 # differences keep their digits wherever the articulation stands.
