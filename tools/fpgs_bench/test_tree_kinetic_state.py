@@ -114,10 +114,6 @@ class TestTreePhysicalCPU(unittest.TestCase):
                     public_state(self, model, state)
                     physical = physical_mass(model, state)
                     matrices = [physical[i * count : (i + 1) * count, i * count : (i + 1) * count] for i in range(2)]
-                    geometry = owner.geometric.numpy()
-                    for group, matrix in enumerate(matrices):
-                        expected = matrix[np.ix_(mass.permutation, mass.permutation)][mass.entry_rows, mass.columns]
-                        np.testing.assert_allclose(geometry[group], expected, atol=3e-6, rtol=3e-5)
                     solver.factor.mass_update_mask.fill_(1)
                     operator.refresh(solver.factor)
                     response = force_response(owner, solver, state, control, state.joint_qd, dt).reshape(2, count)

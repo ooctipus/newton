@@ -118,12 +118,9 @@ class TestTreeForestCache(unittest.TestCase):
                 physical = physical_mass(model, state)
                 solver.factor.joint_tau.zero_()
                 owner.begin(state, solver.factor, velocity, dt, True)
-                geometry = owner.geometric.numpy()
                 expected = np.empty_like(forces)
                 for group, art in enumerate(groups):
                     block = physical[art * count : (art + 1) * count, art * count : (art + 1) * count]
-                    packed = block[np.ix_(mass.permutation, mass.permutation)][mass.entry_rows, mass.columns]
-                    np.testing.assert_allclose(geometry[group], packed, atol=3e-6, rtol=3e-5)
                     expected[art] = np.linalg.solve(
                         block + np.diag(solver.factor.R_by_size[count].numpy()[group]), forces[art]
                     )

@@ -13,6 +13,7 @@ import newton
 from newton._src.sim.contacts import contact_capacity_blocks
 from newton._src.solvers.feather_pgs import keyed_rows as rows
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import walk_inverse
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
     assert_history_close,
@@ -106,7 +107,9 @@ class TestKeyedRowIntegration(unittest.TestCase):
             for _ in range(4):
                 _step(ordinary)
         self.compare(ordinary, keyed)
-        held = keyed[1].factor.L_by_size[9].numpy().copy()
+        # World 1's tree of nine coordinates: its walk (the factor) holds through world 0's reset.
+        art = int(keyed[1].forest.group_to_art_host[9][1])
+        held = walk_inverse(keyed[1], art)
         for model, solver, state, *_ in (ordinary, keyed):
             q = state.joint_q.numpy()
             q[2] += 0.01
@@ -115,7 +118,7 @@ class TestKeyedRowIntegration(unittest.TestCase):
             solver.reset(state, wp.array([True, False], dtype=bool, device=model.device))
         for case in (ordinary, keyed):
             _step(case)
-        np.testing.assert_array_equal(keyed[1].factor.L_by_size[9].numpy()[1], held[1])
+        np.testing.assert_array_equal(walk_inverse(keyed[1], art), held)
         self.compare(ordinary, keyed)
 
     def test_default_request_selects_keyed_inputs(self):
