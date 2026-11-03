@@ -2491,7 +2491,7 @@ class WalkRelease:
     as deep as the class's deepest root path. Slip ``j``'s ``R_j`` maps a footprint ``z`` along its path, leaf first,
     ``u = z_c - b s``, ``s += a u``, ``z_c = g u``; ``R = R_(s-1) ... R_0 = L_F^-1 L_K``, the decided factor's whitening on
     the all-``K`` walk, which keeps every row's support (``WALK_RELEASE``, ``WALK_RELEASE_T``, ``WALK_RELEASE_IT``; the
-    Warp twin :func:`release_path`). Two slips' paths meet if and only if their roots are equal (their ``R_j`` touch
+    rows' :func:`release_into`). Two slips' paths meet if and only if their roots are equal (their ``R_j`` touch
     disjoint coordinates otherwise, and commute), and a footprint whose support holds every ancestor of its coordinates
     (a row's) meets slip ``j``'s path if and only if it holds ``root[j]``."""
 
@@ -2717,18 +2717,23 @@ step): a tree past it keeps the rest's ``K`` and ``constraint_capacity_status()[
 release's memory until a data-sized arena holds it (DECISIONS 10-24); nothing else reads it."""
 
 
-@wp.func
-def release_path(release: WalkRelease, art: int, j: int, x: wp.array3d[float], line: int, slot: int, entry: int):
-    """``x[line, slot, entry + c] <- (R_j x)_c``: slip ``j``'s release along its path, leaf first (:class:`WalkRelease`;
-    the Warp twin of ``WALK_RELEASE``)."""
-    s = float(0.0)
-    for t in range(release.b.shape[2]):
-        c = release.coordinate[art, j, t]
-        if c < 0:
-            break
-        u = x[line, slot, entry + c] - release.b[art, j, t] * s
-        s += release.a[art, j, t] * u
-        x[line, slot, entry + c] = release.g[art, j, t] * u
+_RELEASE_INTO = """    WALK_RELEASE(walk.release, art, out.data + ((size_t)line * out.shape[1] + slot) * out.shape[2] + entry);
+"""
+
+
+@functools.cache
+def _release_into_snippet() -> str:
+    from .device_preludes import dual_native  # noqa: PLC0415
+
+    return dual_native(_RELEASE_INTO, preludes=(walk_paths_prelude(1),))
+
+
+@wp.func_native(_release_into_snippet())
+def release_into(walk: WalkTrees, art: int, out: wp.array3d[float], line: int, slot: int, entry: int):
+    """``out[line, slot, entry + c] <- (R out)_c``: tree ``art``'s slips' release on a row's side whose coordinate ``c``
+    sits at entry ``entry + c`` (``WALK_RELEASE``, the first slip first, each along its path leaf first,
+    :class:`WalkRelease`)."""
+    ...
 
 
 # ---------------------------------------------------------------------------------------------------------------------

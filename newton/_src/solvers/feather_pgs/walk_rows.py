@@ -82,7 +82,7 @@ from .tree_factor import (
     WALK_NOW,
     WalkRelease,
     WalkTrees,
-    release_path,
+    release_into,
     walk_into,
     walk_into_one_half,
     walk_prelude,
@@ -145,8 +145,7 @@ def release_side(
     if art < 0:
         return
     at = jacobian_row(support, group, art, sides)
-    for j in range(walk.release.count[art]):
-        release_path(walk.release, art, j, packed_Z, at[0], slot, at[1])
+    release_into(walk, art, packed_Z, at[0], slot, at[1])
 
 
 # Two blocks of 256 a multiprocessor (128 registers): the walk's one-row seeds with their held step sit at the bound.
