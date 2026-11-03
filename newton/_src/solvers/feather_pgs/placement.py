@@ -34,6 +34,7 @@ from ...sim.contacts import contact_capacity_blocks
 from ...sim.enums import JointType
 from . import host_index, packed_rows, response_builds_rows
 from .dense_rows import RowSupport
+from .dense_rows import bind as bind_dense_rows
 from .dense_rows import bind_mf as bind_mf_rows
 from .field_group import SolverArrays
 from .kernels import (
@@ -121,6 +122,8 @@ _BODY_RECORDS = (
     "row_eps",
     "diag",
     "row_sides",
+    "row_beta",
+    "row_cfm",
 )
 """The row store's records the free bodies' rows read in their region (:meth:`Placement.body_region`)."""
 
@@ -1080,7 +1083,7 @@ class Placement:
             self.diag.zero_()
 
     def whiten_free_bodies(self, v_hat: wp.array, dt: float):
-        """MF PGS setup: the free-body rows' diagonals and RHS, from the rows the one writer walked
+        """MF PGS setup: the free-body rows' diagonals and RHS by the rows' law, from the rows the one writer walked
         (:func:`.walk_rows.free_body_headers_kernel`)."""
         from .walk_rows import free_body_headers_kernel  # noqa: PLC0415
 
@@ -1090,13 +1093,11 @@ class Placement:
             dim=self.forest.world_count * self.mf_max_constraints,
             inputs=[
                 bind_mf_rows(self),
+                self.body_dense_rows(),
                 self.mf_constraint_count,
                 self.factor.walk_view(),
-                int(self.forest.has_prescribed_response),
                 v_hat,
-                self.laws.rigid_body_max_depenetration_velocity,
                 self.options.pgs_cfm,
-                self.options.pgs_beta,
                 self.laws.contact_w,
                 dt,
                 self.options.contact_speculative_scale,
@@ -1105,9 +1106,13 @@ class Placement:
                 int(self.laws.set.weighted),
                 int(self.options.contact_compliance),
             ],
-            outputs=[self.body_rows.row_w],
             device=model.device,
         )
+
+    def body_dense_rows(self):
+        """The free bodies' rows as :data:`.dense_rows.DenseRows`: the row store's records in their region
+        (:meth:`body_region`), which the rows' law reads and writes as a dense row's."""
+        return bind_dense_rows(SimpleNamespace(**vars(self.body_rows), dense_first=self.dense_first))
 
     def pack_free_body_meta(self) -> None:
         """Pack matrix-free row metadata for the GS kernels, or skip when no such row can exist."""

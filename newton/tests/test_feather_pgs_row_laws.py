@@ -13,7 +13,8 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import kernels, row_laws
+from newton._src.solvers.feather_pgs import field_group, kernels, row_laws
+from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.tree_factor import WalkTrees
 from newton._src.solvers.feather_pgs.walk_rows import free_body_headers_kernel
 from newton.tests.feather_pgs_law_harness import (
@@ -21,6 +22,7 @@ from newton.tests.feather_pgs_law_harness import (
     mismatches,
     prefix_warp_rows,
     register_device_tests,
+    row_lines,
     scalars,
     unified,
 )
@@ -253,12 +255,38 @@ def _law_mf_position_rhs(
                 value = bounce
                 w = 1.0
     elif kind == row_laws.ROW_FRICTION:
-        # Matrix-free friction rows carry beta * phi in phi.
+        # The scene's friction rows carry a unit beta: phi is the anchor's gain times its displacement.
         value, w = row_laws.row_rhs(kind, phi, 1.0, target, inv_dt, 1.0, 0.0, 0.0, 1.0)
     else:
-        value = phi - target  # a free body's speed row carries its limit in phi
+        value = -target  # a free body's speed row carries ``-limit`` in its target
     rhs[world, i] = value
     row_w[world, i] = w
+
+
+@wp.kernel
+def _law_row_beta(
+    mf_body_a: wp.array2d[int],
+    mf_body_b: wp.array2d[int],
+    mf_phi: wp.array2d[float],
+    mf_row_type: wp.array2d[int],
+    rigid_body_max_depenetration_velocity: wp.array[float],
+    pgs_beta: float,
+    dt: float,
+    row_beta: wp.array2d[float],
+):
+    """Each row's beta as its writer stores it: a contact's capped by its bodies' depenetration speed, a friction
+    row's unit gain (the scene's phi holds the gain's product), zero elsewhere."""
+    world, i = wp.tid()
+    kind = mf_row_type[world, i]
+    beta = float(0.0)
+    if kind == row_laws.ROW_CONTACT:
+        cap = row_laws.contact_depenetration_cap(
+            mf_body_a[world, i], mf_body_b[world, i], rigid_body_max_depenetration_velocity
+        )
+        beta = row_laws.contact_capped_beta(mf_phi[world, i], pgs_beta, cap, dt)
+    elif kind == row_laws.ROW_FRICTION:
+        beta = 1.0
+    row_beta[world, i] = beta
 
 
 def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
@@ -298,18 +326,29 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
         incident=np.zeros((worlds, rows), dtype=np.float32),
         **shared,
     )["incident"]
-    # Each body is its own one-node tree (articulation = body), its six coordinates from 6 body: the walk names a
-    # side's body by its first coordinate.
-    bodies = 2 * worlds
-    walk = WalkTrees()
-    walk.dof_start = wp.array(6 * np.arange(bodies, dtype=np.int32), dtype=wp.int32, device=device)
-    walk.dof_body = wp.array(np.repeat(np.arange(bodies, dtype=np.int32), 6), dtype=wp.int32, device=device)
+    # The records the writers store, the rows' law's beta among them, read by the rows' law (kernels.row_bias).
+    beta = call(_law_row_beta, (worlds, rows), device, row_beta=np.zeros((worlds, rows), dtype=np.float32), **shared)[
+        "row_beta"
+    ]
+    records = field_group.upload(
+        DenseRows,
+        device,
+        row_type=kind,
+        phi=phi,
+        row_beta=beta,
+        target=target,
+        restitution=restitution,
+        rhs=np.zeros((worlds, rows), dtype=np.float32),
+        row_w=np.ones((worlds, rows), dtype=np.float32),
+        first=row_lines(device),
+    )
     out = call(
         free_body_headers_kernel,
         worlds * rows,
         device,
+        rows=records,
         mf_constraint_count=np.full(worlds, rows, dtype=np.int32),
-        walk=walk,
+        walk=WalkTrees(),
         v_hat=layout["incident_velocity"],
         pgs_cfm=1.0e-6,
         mf_max_constraints=rows,
@@ -318,8 +357,6 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
         mf_sides=np.stack((layout["mf_body_a"], layout["mf_body_b"]), axis=-1).astype(np.int32),
         mf_diag=np.zeros((worlds, rows), dtype=np.float32),
         mf_row_incident=incident,
-        mf_rhs=np.zeros((worlds, rows), dtype=np.float32),
-        mf_row_w=np.ones((worlds, rows), dtype=np.float32),
         **shared,
     )
     law = call(
@@ -338,8 +375,8 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
         bodies, Z = layout[f"mf_body_{side}"], layout[f"mf_Z_{side}"].astype(np.float64)
         diagonal += np.where(bodies >= 0, (Z * Z).sum(axis=2), 0.0)
     np.testing.assert_allclose(out["mf_diag"].numpy(), diagonal, rtol=1e-5)
-    reference_rhs, law_rhs = out["mf_rhs"].numpy(), law["rhs"].numpy()
-    np.testing.assert_array_equal(out["mf_row_w"].numpy(), law["row_w"].numpy())
+    reference_rhs, law_rhs = records.rhs.numpy(), law["rhs"].numpy()
+    np.testing.assert_array_equal(records.row_w.numpy(), law["row_w"].numpy())
     magnitude = np.abs(phi) * 60.0 + np.abs(target)
     test.assertLessEqual(
         unified("mf rhs (free_body_headers_kernel)", reference_rhs.ravel(), law_rhs.ravel(), magnitude.ravel(), 2.0),

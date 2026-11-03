@@ -57,7 +57,7 @@ from .friction_patches import PatchRowLaw
 from .kernel_template import python_kernel
 from .kernels import PGS_CONSTRAINT_TYPE_SPEED, free_body_contact, free_body_contact_records, row_bias
 from .projection_laws import friction_pair_metric
-from .response_builds_rows import close_block, close_row, free_body_row_header
+from .response_builds_rows import close_block, close_row
 from .row_build import write_contact_row
 from .row_laws import LINK_ROWS
 from .solver_fields import Preelim
@@ -171,25 +171,14 @@ def write_free_body_rows(
             )
 
 
-@wp.func
-def side_body(walk: WalkTrees, art: int) -> int:
-    """A free-body row side's body: its articulation's (a one-node tree's) first coordinate's, -1 for no side."""
-    body = int(-1)
-    if art >= 0:
-        body = walk.dof_body[walk.dof_start[art]]
-    return body
-
-
 @wp.kernel(enable_backward=False)
 def free_body_headers_kernel(
     mf: MfRows,
+    rows: DenseRows,
     mf_constraint_count: wp.array[int],
     walk: WalkTrees,
-    has_target_velocity: int,
     v_hat: wp.array[float],
-    rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_cfm: float,
-    pgs_beta: float,
     contact_w: float,
     dt: float,
     contact_speculative_scale: float,
@@ -197,15 +186,13 @@ def free_body_headers_kernel(
     mf_max_constraints: int,
     weighted: int,
     material: int,
-    # outputs
-    mf_row_w: wp.array2d[float],
 ):
-    """The walked free-body rows' build, one thread per row slot: each row's header
-    (:func:`.response_builds_rows.free_body_row_header`) from the incident velocity its walks summed
-    (:func:`write_free_body_rows`) and its diagonal ``A_ii = cfm + |Z_a|^2 + |Z_b|^2``. A speed row keeps its axis
-    ``e_k`` unwhitened (its law reads the body's velocity, :meth:`.response_operator.FreeBodyZ.speed`): its diagonal
-    takes the walk of the covector ``e_k``, ``|L^-1 P e_k|^2``, and its incident is zero. A side is its responding
-    body's articulation, a one-node tree whose body is its first coordinate's."""
+    """The walked free-body rows' build, one thread per row slot: each row's incident velocity, which its walks summed
+    (:func:`write_free_body_rows`), its diagonal ``A_ii = cfm + |Z_a|^2 + |Z_b|^2`` and its rhs by the rows' law
+    (:func:`.kernels.row_bias`, on ``rows``: the row store's free-body region). A speed row keeps its axis ``e_k``
+    unwhitened (its law reads the body's velocity, :meth:`.response_operator.FreeBodyZ.speed`): its diagonal takes the
+    walk of the covector ``e_k``, ``|L^-1 P e_k|^2``, and its incident is zero. A side is its responding body's
+    articulation, a one-node tree."""
     tid = wp.tid()
     world = tid // mf_max_constraints
     i = tid % mf_max_constraints
@@ -253,24 +240,19 @@ def free_body_headers_kernel(
             for k in range(6):
                 squares += mf.Z_b[line, i, k] * mf.Z_b[line, i, k]
             diagonal += squares
-    free_body_row_header(
-        mf,
+    mf.incident[line, i] = incident
+    mf.diag[line, i] = diagonal
+    row_bias(
+        rows,
         line,
         i,
-        side_body(walk, sides[0]),
-        side_body(walk, sides[1]),
         incident,
-        diagonal,
-        has_target_velocity,
-        rigid_body_max_depenetration_velocity,
-        pgs_beta,
-        contact_w,
         dt,
         contact_speculative_scale,
+        contact_w,
         restitution_velocity_threshold,
         weighted,
         material,
-        mf_row_w,
     )
 
 

@@ -6,10 +6,9 @@
 The rows are the walk's (:mod:`.walk_rows`: the one writer walks every row's seeds into its whitened form ``Z``). This
 module holds what is built around them:
 
-- the free-body rows (:class:`.response_operator.FreeBodyZ`, rows over at most two free bodies): each row's header
-  (:func:`free_body_row_header`: ``A_ii``, ``rhs`` and the row's weight from its incident velocity) and the packed row
-  word (:func:`free_body_meta_kernel`, which :meth:`.FreeBodyZ.consume` decodes: its sides' coordinates, ``1 /
-  A_ii``);
+- the free-body rows (:class:`.response_operator.FreeBodyZ`, rows over at most two free bodies): the packed row word
+  (:func:`free_body_meta_kernel`, which :meth:`.FreeBodyZ.consume` decodes: its sides' coordinates, ``1 / A_ii``);
+  their headers' ``A_ii`` and rhs are the walk's (:func:`.walk_rows.free_body_headers_kernel`, the rows' law);
 - the bilateral closure (:func:`close_block`, :func:`close_row`, :func:`seed_blocks_kernel`), the Schur transform the
   one writer's block phase applies to fold a world's bilateral block into the responses of its other rows;
 - the paired factor rows' qualification (:func:`paired_components_kernel`).
@@ -25,12 +24,9 @@ from functools import cache
 import warp as wp
 
 from . import kernel_template
-from .dense_rows import MfRows
 from .device_preludes import CPU_MATH, dual_native, lane_group
 from .kernel_template import Dispatch, KernelTemplate
 from .kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_SPEED,
 )
 from .paired_components import FREE_BODY_DOFS, PAIRED_COMPONENT_THREADS, PairedComponentData
@@ -38,11 +34,6 @@ from .projection_laws import BILATERAL_PIVOT
 from .response_operator import FreeBodyZ
 from .row_laws import (
     LINK_ROWS,
-    contact_capped_beta,
-    contact_depenetration_cap,
-    contact_restitution_rhs,
-    contact_rhs,
-    row_rhs,
 )
 from .row_metadata import _validate_mf_metadata_encoding
 from .solver_fields import Preelim
@@ -57,106 +48,6 @@ from .solver_fields import Preelim
 # velocities in factor coordinates ``u = L^T dv``. A body's six velocity coordinates start at its articulation's first
 # coordinate, in the addressing the mapping reads: global (``articulation_dof_start``) or world
 # (``articulation_world_dof_offset``).
-
-
-@wp.func
-def free_body_row_rhs(
-    body_a: int,
-    body_b: int,
-    row_type: int,
-    phi: float,
-    target: float,
-    restitution: float,
-    incident: float,
-    max_depenetration_velocity: wp.array[float],
-    beta: float,
-    contact_w: float,
-    dt: float,
-    speculative_scale: float,
-    restitution_threshold: float,
-):
-    """A free-body row's position-pass ``rhs`` and regularization weight, by the row laws (:mod:`.row_laws`).
-
-    A contact takes :func:`.row_laws.contact_rhs` at its bodies' capped beta, and, when restitutive, the
-    rebound of :func:`.row_laws.contact_restitution_rhs` from its incident velocity ``J v_hat`` less its target
-    (weight 1); a friction row its anchor law (the row builder folded the anchor gain into ``phi``); a speed row
-    ``phi - target`` (its limit); any other row ``-target``. The sweeps recompute ``J v``: ``rhs`` holds the bias
-    only.
-    """
-    inv_dt = 1.0 / dt
-    rhs = -target
-    row_w = float(1.0)
-    if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-        cap = contact_depenetration_cap(body_a, body_b, max_depenetration_velocity)
-        rhs, row_w = contact_rhs(
-            phi, contact_capped_beta(phi, beta, cap, dt), target, inv_dt, 1.0, speculative_scale, contact_w
-        )
-        if restitution > 0.0:
-            fires, bounce = contact_restitution_rhs(
-                phi, incident - target, target, restitution, dt, restitution_threshold
-            )
-            if fires:
-                rhs = bounce
-                # An impact is impulsive, not a spring: keep the rebound exact.
-                row_w = 1.0
-    elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
-        rhs, _w = row_rhs(row_type, phi, 1.0, target, inv_dt, 1.0, 0.0, 0.0, 1.0)
-    elif row_type == PGS_CONSTRAINT_TYPE_SPEED:
-        rhs = phi - target
-    return rhs, row_w
-
-
-@wp.func
-def free_body_row_header(
-    mf: MfRows,
-    line: int,
-    i: int,
-    body_a: int,
-    body_b: int,
-    incident: float,
-    diagonal: float,
-    has_target_velocity: int,
-    rigid_body_max_depenetration_velocity: wp.array[float],
-    pgs_beta: float,
-    contact_w: float,
-    dt: float,
-    contact_speculative_scale: float,
-    restitution_velocity_threshold: float,
-    weighted: int,
-    material: int,
-    weights: wp.array2d[float],
-):
-    """Free-body row ``i``'s header (its responding bodies ``body_a``, ``body_b``) from its incident velocity ``J v_hat``
-    and its diagonal ``A_ii``: both stored, then its ``rhs`` (:func:`free_body_row_rhs`). ``weighted`` rows store their relative regularization
-    weight (in ``weights``: the row store's free-body region); a material contact (``material``: its writer stored its
-    rhs and compliance ``eps``) keeps its rhs."""
-    row_type = mf.row_type[line, i]
-    mf.incident[line, i] = incident
-    mf.diag[line, i] = diagonal
-    if material != 0 and row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-        if mf.eps[line, i] > 0.0:
-            return
-    target = float(0.0)
-    if has_target_velocity != 0:
-        target = mf.target[line, i]
-    rhs, row_w = free_body_row_rhs(
-        body_a,
-        body_b,
-        row_type,
-        mf.phi[line, i],
-        target,
-        mf.restitution[line, i],
-        incident,
-        rigid_body_max_depenetration_velocity,
-        pgs_beta,
-        contact_w,
-        dt,
-        contact_speculative_scale,
-        restitution_velocity_threshold,
-    )
-    mf.rhs[line, i] = rhs
-    if weighted != 0:
-        weights[line, i] = row_w
 
 
 @cache

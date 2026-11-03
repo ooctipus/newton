@@ -157,6 +157,7 @@ MF_RECORDS = (
             ("row_type", "row_type"),
             ("row_parent", "row_parent"),
             ("row_mu", "row_mu"),
+            ("row_beta", "row_beta"),
             ("phi", "phi"),
             ("restitution", "row_restitution"),
             ("incident", "row_incident"),
@@ -172,8 +173,9 @@ MF_RECORDS = (
 """Each free-body row's per-body blocks (the writers' ``J``, whitened in place to ``Z`` by the rows' build), by world
 line and free-body row; and its records, the row store's region of the free bodies
 (:meth:`.placement.Placement.body_region`, row ``i`` the store's ``body_base + i``): kind, friction parent,
-coefficient, gap, restitution, incident velocity (``J v_hat``, stored by the build), rhs, target, effective mass
-``A_ii``, material compliance and sides (the responding bodies' articulations in ``a``/``b`` order, -1 for none)."""
+coefficient, the row law's beta, gap, restitution, incident velocity (``J v_hat``, stored by the build), rhs, target,
+effective mass ``A_ii``, material compliance and sides (the responding bodies' articulations in ``a``/``b`` order, -1
+for none)."""
 
 MfRows = field_group.struct("MfRows", MF_RECORDS, __name__)
 

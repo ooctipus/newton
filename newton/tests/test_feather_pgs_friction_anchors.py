@@ -250,7 +250,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
             self.assertEqual(int(solver.laws.friction_patches.current.valid.numpy()[:n].sum()), 0)
 
     def test_row_builders_store_anchor_separation_per_route(self):
-        """Store raw separation in dense rows and gain-scaled separation in the other routes."""
+        """Store the raw separation and the anchor gain as the row law's beta on every route."""
         beta = 0.3
 
         def check(model, solver_kwargs, matching="latest", steps=120):
@@ -287,10 +287,13 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
                     np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], fa[c], rtol=1.0e-6, atol=1.0e-9)
                     np.testing.assert_allclose(rb[slot[c] + 1 : slot[c] + 3], beta)
                 else:
-                    ph, rt = solver.placement.body_rows.phi.numpy()[0], solver.placement.body_rows.row_type.numpy()[0]
+                    body = solver.placement.body_rows
+                    ph, rt, rb = body.phi.numpy()[0], body.row_type.numpy()[0], body.row_beta.numpy()[0]
                     if rt[slot[c] + 1] != PGS_CONSTRAINT_TYPE_FRICTION:
                         continue
-                    np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], beta * fa[c], rtol=1.0e-5, atol=1.0e-9)
+                    # One row law: the free bodies' rows store the raw separation and the law's beta too.
+                    np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], fa[c], rtol=1.0e-6, atol=1.0e-9)
+                    np.testing.assert_allclose(rb[slot[c] + 1 : slot[c] + 3], beta)
                 checked[int(path[c])] += 1
             return checked
 
@@ -332,19 +335,15 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         self.assertLess(abs(bq[box][2] - bq[jaws[0]][2]), 0.01)
 
 
-def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, device="cpu"):
-    """RHS of one world with rows [CONTACT, FRICTION, FRICTION] for one RHS kernel family.
-
-    ``phi`` holds what the row builders store: raw separation for dense rows (paired with
-    ``row_beta``), gain-premultiplied separation for matrix-free rows.
-    """
+def _rhs_for_family(family: str, *, phi, row_beta, dt, device="cpu"):
+    """RHS of one world with rows [CONTACT, FRICTION, FRICTION] for one RHS kernel family, from the records every row
+    builder stores: the raw separation ``phi`` and the row law's ``row_beta``."""
     contact, friction = PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
     count = wp.array([3], dtype=wp.int32, device=device)
     row_type = wp.array([[contact, friction, friction]], dtype=wp.int32, device=device)
     phi_arr = wp.array([list(phi)], dtype=wp.float32, device=device)
     zeros3 = lambda: wp.zeros((1, 3), dtype=wp.float32, device=device)  # noqa: E731
     zJ = lambda: wp.zeros((1, 3, 6), dtype=wp.float32, device=device)  # noqa: E731
-    inf = wp.array([float("inf")], dtype=wp.float32, device=device)
     rhs = zeros3()
     if family == "dense":
         rows = field_group.upload(
@@ -362,6 +361,19 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, device="cpu"):
         inputs = [rows, zeros3(), count, 3, 3, dt, 1.0, 1.0, 0.0, 0, 0]
         wp.launch(compute_world_contact_bias, dim=(1, 3), inputs=inputs, device=device)
     elif family == "mf_setup":
+        # The free bodies' headers take the rows' law on the same records (the row store's free-body region).
+        rows = field_group.upload(
+            DenseRows,
+            device,
+            phi=phi_arr,
+            row_beta=[list(row_beta)],
+            row_type=row_type,
+            target=zeros3(),
+            restitution=zeros3(),
+            rhs=rhs,
+            row_w=zeros3(),
+            first=row_lines(device),
+        )
         wp.launch(
             free_body_headers_kernel,
             dim=3,
@@ -373,21 +385,15 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, device="cpu"):
                     diag=zeros3(),
                     Z_a=zJ(),
                     Z_b=zJ(),
-                    phi=phi_arr,
                     row_type=row_type,
-                    target=zeros3(),
-                    restitution=zeros3(),
                     incident=zeros3(),
-                    rhs=rhs,
                     first=row_lines(device),
                 ),
+                rows,
                 count,
                 WalkTrees(),
-                0,
                 wp.zeros((1,), dtype=wp.float32, device=device),
-                inf,
                 1.0e-6,
-                pgs_beta,
                 1.0,
                 dt,
                 1.0,
@@ -396,7 +402,6 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, device="cpu"):
                 0,
                 0,
             ],
-            outputs=[zeros3()],
             device=device,
         )
     else:
@@ -422,13 +427,11 @@ class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
         pgs_beta, fa_beta, dt = 0.05, 0.3, 0.005
         phi_n, e0, e1 = -2.0e-3, 1.0e-4, -2.5e-4
         expect_pos = np.array([pgs_beta * phi_n / dt, fa_beta * e0 / dt, fa_beta * e1 / dt], dtype=np.float32)
-        dense = _rhs_for_family(
-            "dense", phi=[phi_n, e0, e1], row_beta=[pgs_beta, fa_beta, fa_beta], pgs_beta=pgs_beta, dt=dt
-        )
-        pre = [phi_n, fa_beta * e0, fa_beta * e1]
+        records = {"phi": [phi_n, e0, e1], "row_beta": [pgs_beta, fa_beta, fa_beta], "dt": dt}
+        dense = _rhs_for_family("dense", **records)
         np.testing.assert_allclose(dense, expect_pos, rtol=1.0e-5)
-        got = _rhs_for_family("mf_setup", phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt)
-        np.testing.assert_allclose(got, expect_pos, rtol=1.0e-5, err_msg="mf_setup")
+        # One law: the free bodies' headers give the dense rows' bits.
+        np.testing.assert_array_equal(_rhs_for_family("mf_setup", **records), dense, err_msg="mf_setup")
 
     def test_reset_clears_anchor_history_full_and_masked(self):
         """Drop carried anchors of selected worlds on reset, including without warm starting."""

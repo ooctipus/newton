@@ -244,8 +244,21 @@ def _dense_speculative_rhs(scale: float) -> float:
 
 
 def _mf_speculative_rhs(scale: float) -> float:
-    """Return the MF setup RHS for a requested speculative scale."""
+    """Return the MF setup RHS for a requested speculative scale: the free bodies' headers on the dense rows' records
+    (the writer stores the normal row's capped beta)."""
     rhs = wp.zeros((1, 1), dtype=wp.float32, device="cpu")
+    rows = field_group.upload(
+        DenseRows,
+        "cpu",
+        phi=[[1.0]],
+        row_beta=[[0.2]],
+        row_type=[[0]],
+        target=[[0.0]],
+        restitution=[[0.0]],
+        rhs=rhs,
+        row_w=[[0.0]],
+        first=row_lines("cpu"),
+    )
     wp.launch(
         free_body_headers_kernel,
         dim=1,
@@ -257,21 +270,15 @@ def _mf_speculative_rhs(scale: float) -> float:
                 diag=wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
                 Z_a=np.zeros((1, 1, 6), dtype=np.float32),
                 Z_b=np.zeros((1, 1, 6), dtype=np.float32),
-                phi=[[1.0]],
                 row_type=[[0]],
-                target=[[0.0]],
-                restitution=[[0.0]],
                 incident=[[0.0]],
-                rhs=rhs,
                 first=row_lines("cpu"),
             ),
+            rows,
             wp.array([1], dtype=wp.int32, device="cpu"),
             WalkTrees(),
-            0,
             wp.zeros((1,), dtype=wp.float32, device="cpu"),
-            wp.array([float("inf")], dtype=wp.float32, device="cpu"),
             1.0,
-            0.2,
             1.0,
             0.5,
             scale,
@@ -280,7 +287,6 @@ def _mf_speculative_rhs(scale: float) -> float:
             0,
             0,
         ],
-        outputs=[wp.zeros((1, 1), dtype=wp.float32, device="cpu")],
         device="cpu",
     )
     return float(rhs.numpy()[0, 0])

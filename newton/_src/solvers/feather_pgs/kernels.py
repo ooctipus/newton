@@ -66,7 +66,7 @@ from .projection_laws import (
     ball,
     disk,
 )
-from .row_build import contact_torsion_mu, write_contact_row
+from .row_build import contact_normal_beta, contact_torsion_mu, write_contact_row
 from .row_laws import (
     LINK_ROWS,
     contact_material_rhs,
@@ -1999,10 +1999,9 @@ def free_body_contact_records(
 ):
     """Row ``row`` of free-body contact ``c``'s records at slot ``slot + row`` (:func:`free_body_contact`): its sides
     (the responding bodies' articulations, -1 for none), kind, friction parent, coefficient and gap, restitution and
-    target, and a material contact's rhs and compliance
-    (:func:`.row_laws.contact_material_rhs`; its tangents take the contact's friction scale), as
-    :func:`.row_build.write_contact_row` writes a dense row's. A tangent row folds the row law's beta into its gap
-    (matrix-free rows keep no beta)."""
+    target, the row law's beta (a normal's capped, :func:`.row_build.contact_normal_beta`; a tangent's the patch law's)
+    and a material contact's rhs and compliance (:func:`.row_laws.contact_material_rhs`; its tangents take the
+    contact's friction scale), as :func:`.row_build.write_contact_row` writes a dense row's."""
     mf_line = mf.first[data.world[c]]
     row_idx = slot + row
     spin = row == CONTACT_SPIN_ROW
@@ -2019,12 +2018,14 @@ def free_body_contact_records(
         mf.row_type[mf_line, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT
         mf.row_parent[mf_line, row_idx] = -1
         mf.row_mu[mf_line, row_idx] = mu
+        mf.row_beta[mf_line, row_idx] = contact_normal_beta(data, c, body_a, body_b, phi)
         mf.phi[mf_line, row_idx] = phi
         mf.restitution[mf_line, row_idx] = restitution
     elif spin:
         mf.row_type[mf_line, row_idx] = PGS_CONSTRAINT_TYPE_TORSION
         mf.row_parent[mf_line, row_idx] = slot
         mf.row_mu[mf_line, row_idx] = contact_torsion_mu(data, c)
+        mf.row_beta[mf_line, row_idx] = 0.0
         mf.phi[mf_line, row_idx] = 0.0
         mf.restitution[mf_line, row_idx] = 0.0
     else:
@@ -2035,7 +2036,8 @@ def free_body_contact_records(
         mf.row_type[mf_line, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
         mf.row_parent[mf_line, row_idx] = slot
         mf.row_mu[mf_line, row_idx] = friction_mu
-        mf.phi[mf_line, row_idx] = beta * tangent_phi
+        mf.row_beta[mf_line, row_idx] = beta
+        mf.phi[mf_line, row_idx] = tangent_phi
         mf.restitution[mf_line, row_idx] = 0.0
     target = float(0.0)
     if has_target_velocity != 0:
@@ -2044,7 +2046,7 @@ def free_body_contact_records(
         )
         if spin:
             target = prescribed_spin_target(body_a, art_a, body_b, art_b, normal, data.prescribed, data.body_v)
-        mf.target[mf_line, row_idx] = target
+    mf.target[mf_line, row_idx] = target
     if data.material != 0:
         eps = float(0.0)
         if row == 0 and stiffness > 0.0:
@@ -2472,8 +2474,11 @@ def populate_rigid_velocity_limit_rows(
         mf.row_type[mf_line, slot] = PGS_CONSTRAINT_TYPE_SPEED
         mf.row_parent[mf_line, slot] = -1
         mf.row_mu[mf_line, slot] = 0.0
-        # A speed row's ``phi`` stores the speed limit; a contact row's its gap.
-        mf.phi[mf_line, slot] = limit
+        # The speed law's bias is its limit: the row's target is ``-limit``, as a joint velocity limit's, and its rhs
+        # ``-target`` (:func:`.row_laws.row_rhs`); it has no gap.
+        mf.row_beta[mf_line, slot] = 0.0
+        mf.phi[mf_line, slot] = 0.0
+        mf.target[mf_line, slot] = -limit
 
 
 @wp.kernel

@@ -654,8 +654,6 @@ class RowLaws:
         dense_rows = bind_dense_rows(solver.placement)
         joints = bind_joint_table(solver)
         mf_active = solver.forest.has_free_rigid_bodies
-        if solver.forest.has_prescribed_response and mf_active:
-            solver.placement.body_rows.target_velocity.zero_()
 
         solver.placement.begin(solver._plan.jacobian_clear_sizes)
 
