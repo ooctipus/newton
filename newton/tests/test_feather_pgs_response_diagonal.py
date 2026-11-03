@@ -127,6 +127,11 @@ def _build_mixed_response_model(
     return replicated.finalize(device=device)
 
 
+def _class_rows(parents, base):
+    """Row parents counted from a class's first row ``base`` of the line (-1 stays -1)."""
+    return np.where(parents >= 0, parents - base, parents)
+
+
 def _run_mixed_response(
     kernel,
     *,
@@ -192,6 +197,7 @@ def _run_mixed_response(
         solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
         constraint_count = int(solver.placement.constraint_count.numpy()[0])
         mf_count = int(solver.placement.mf_constraint_count.numpy()[0])
+        base = solver.placement.body_base
         samples.append(
             (
                 constraint_count,
@@ -204,9 +210,10 @@ def _run_mixed_response(
                 mf_count,
                 solver.placement.impulses.numpy()[:, solver.placement.body_base :][0, :mf_count].copy(),
                 solver.placement.row_type.numpy()[:, solver.placement.body_base :][0, :mf_count].copy(),
-                solver.placement.row_parent.numpy()[:, solver.placement.body_base :][0, :mf_count].copy(),
-                solver.placement.mf_Z_a.numpy()[0, :mf_count].copy(),
-                solver.placement.mf_Z_b.numpy()[0, :mf_count].copy(),
+                # The free bodies' parents by their own row (the store's count in the world's line).
+                _class_rows(solver.placement.row_parent.numpy()[0, base : base + mf_count], base),
+                solver.placement.mf_Z.numpy()[0, :mf_count, :6].copy(),
+                solver.placement.mf_Z.numpy()[0, :mf_count, 6:].copy(),
             )
         )
         state_in, state_out = state_out, state_in

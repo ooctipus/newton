@@ -54,8 +54,7 @@ def component_fixture(worlds=4, capacity=8, mf_capacity=6):
         "mf_mu": np.full((worlds, mf_capacity), 0.4, np.float32),
     }
     host["L"][:, np.arange(23), np.arange(23)] += 1.7
-    for name in ("mf_Z_a", "mf_Z_b"):
-        host[name] = floats((worlds, mf_capacity, 6))
+    host["mf_Z"] = floats((worlds, mf_capacity, 12))
     for world in range(worlds):
         offset, secondary = host["primary_offset"][world], host["secondary_offset"][world]
         factor = host["L"][host["primary_group"][world]].astype(np.float64)
@@ -77,9 +76,9 @@ def component_fixture(worlds=4, capacity=8, mf_capacity=6):
                 np.float32(0.1 * (row + 1)).view(np.int32),
                 pack_endpoints(parent, kind),
             ]
-            side = "a" if endpoint_a >= 0 else "b"
+            side = 0 if endpoint_a >= 0 else 6
             # Whitened by the body's factor L = I / sqrt(0.7) (the solve fixture's secondary factor): Z = sqrt(0.7) J.
-            host[f"mf_Z_{side}"][world, row] = rng.normal(0, 0.2, 6) * np.sqrt(0.7)
+            host["mf_Z"][world, row, side : side + 6] = rng.normal(0, 0.2, 6) * np.sqrt(0.7)
     return host
 
 
@@ -193,8 +192,7 @@ def solve_fixture(device):
         ("world_row_mu", "mu"),
         ("factor_rows", "Y"),
         ("mf_meta", "mf_meta"),
-        ("mf_Z_a", "mf_Z_a"),
-        ("mf_Z_b", "mf_Z_b"),
+        ("mf_Z", "mf_Z"),
     ):
         arrays[target] = getattr(data, field)
     # The sweeps add their velocity change in the walk's coordinates to the walk's du, from zero (the step's one leave

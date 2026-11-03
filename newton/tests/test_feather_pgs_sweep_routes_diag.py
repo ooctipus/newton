@@ -150,19 +150,21 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
         residual = op.residual("jv", "")
         # Each side's six products as one expression, added to the residual: a's, then b's.
         terms = " + ".join(
-            f"mf_Z_a.data[mf6_base + i * 6 + {k}] * s_vel[dof_a{f' + {k}' if k else ''}]" for k in range(6)
+            f"mf_Z.data[mf12_base + i * 12 + {k}] * s_vel[dof_a{f' + {k}' if k else ''}]" for k in range(6)
         )
         self.assertIn(f"jv += {terms};", residual)
         self.assertLess(residual.index("dof_a >= 0"), residual.index("dof_b >= 0"))
         # The sibling residual starts from its right-hand side; a and b alternate per coordinate.
         sibling = op.sibling_residual("sibling_residual", "sib", "", "rhs[sib]")
         self.assertIn("float sibling_residual = rhs[sib];", sibling)
-        a = sibling.index("if (dof_a >= 0) sibling_residual += mf_Z_a.data[mf6_base + sib * 6 + k] * s_vel[dof_a + k];")
-        b = sibling.index("if (dof_b >= 0) sibling_residual += mf_Z_b.data[mf6_base + sib * 6 + k] * s_vel[dof_b + k];")
+        a = sibling.index("if (dof_a >= 0) sibling_residual += mf_Z.data[mf12_base + sib * 12 + k] * s_vel[dof_a + k];")
+        b = sibling.index(
+            "if (dof_b >= 0) sibling_residual += mf_Z.data[mf12_base + sib * 12 + 6 + k] * s_vel[dof_b + k];"
+        )
         self.assertLess(a, b)
         coupling = op.coupling("cross", "i", "sib", "")
         self.assertIn("float cross = 0.0f;", coupling)
-        self.assertIn("cross += mf_Z_a.data[mf6_base + i * 6 + k] * mf_Z_a.data[mf6_base + sib * 6 + k];", coupling)
+        self.assertIn("cross += mf_Z.data[mf12_base + i * 12 + k] * mf_Z.data[mf12_base + sib * 12 + k];", coupling)
         # A speed row reads the body's physical velocity v = L^-T u by its walk, then pushes u by L^T dv the same way.
         speed = op.speed("speed", "f", "axis", "")
         self.assertIn("speed_v[k] = s_vel[f + k];", speed)

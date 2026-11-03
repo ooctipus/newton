@@ -150,9 +150,9 @@ class Capture:
         free = placement.whiten_free_bodies
 
         def whiten_free_bodies(*args, **kwargs):
-            J = (placement.mf_Z_a.numpy().copy(), placement.mf_Z_b.numpy().copy())
+            J = (placement.mf_Z.numpy()[..., :6].copy(), placement.mf_Z.numpy()[..., 6:].copy())
             result = free(*args, **kwargs)
-            Z = (placement.mf_Z_a.numpy().copy(), placement.mf_Z_b.numpy().copy())
+            Z = (placement.mf_Z.numpy()[..., :6].copy(), placement.mf_Z.numpy()[..., 6:].copy())
             self.mf = (J, Z)
             return result
 
@@ -173,8 +173,8 @@ class Capture:
             offsets = solver.forest.articulation_world_dof_offset.numpy()
             dofs = np.where(sides >= 0, offsets[np.maximum(sides, 0)], -1)
             self.mf_final = (
-                placement.mf_Z_a.numpy().astype(np.float64),
-                placement.mf_Z_b.numpy().astype(np.float64),
+                placement.mf_Z.numpy()[..., :6].astype(np.float64),
+                placement.mf_Z.numpy()[..., 6:].astype(np.float64),
                 placement.impulses.numpy()[:, placement.body_base :].astype(np.float64),
                 placement.mf_constraint_count.numpy().copy(),
                 sides[..., 0],

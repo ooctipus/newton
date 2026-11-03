@@ -43,8 +43,7 @@ PAIRED_COMPONENTS = (
     Field("row_type", wp.int32, ("world", "row"), owner="placement"),
     Field("row_parent", wp.int32, ("world", "row"), owner="placement"),
     Field("mf_meta", wp.int32, ("world", "mf_meta"), owner="step"),
-    Field("mf_Z_a", wp.float32, ("world", "mf_row", 6), owner="placement"),
-    Field("mf_Z_b", wp.float32, ("world", "mf_row", 6), owner="placement"),
+    Field("mf_Z", wp.float32, ("world", "mf_row", 12), owner="placement"),
     Field("body_base", wp.int32, owner="placement"),
 )
 """The component classifier's inputs: the row store's records (the dense rows from row 0, packed and whitened at their

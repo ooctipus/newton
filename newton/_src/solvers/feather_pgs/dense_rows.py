@@ -146,13 +146,7 @@ def clear_side(support: RowSupport, J: wp.array3d[float], at: wp.vec2i, row: int
 
 
 MF_RECORDS = (
-    *(
-        dataclasses.replace(MF_ROWS[attr], name=name, attr=attr)
-        for name, attr in (
-            ("Z_a", "mf_Z_a"),
-            ("Z_b", "mf_Z_b"),
-        )
-    ),
+    *(dataclasses.replace(MF_ROWS[attr], name=name, attr=attr) for name, attr in (("Z", "mf_Z"),)),
     *(
         dataclasses.replace(DENSE_ROWS[attr], name=name, attr=attr, owner="placement")
         for name, attr in (

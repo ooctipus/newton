@@ -277,19 +277,21 @@ def walked_side(
     Z: wp.array3d[float],
     line: int,
     row: int,
+    side: int,
     art: int,
     world: int,
     world_offset: wp.array[int],
     coordinates: wp.array2d[float],
 ) -> float:
-    """``Z_side^T u``: one side (articulation ``art``, -1 for none) of a walked free-body row over the walk's
-    coordinates of the published velocity (:func:`.tree_factor.walk_enter_kernel`)."""
+    """``Z_side^T u``: one side (its six entries from ``side`` of the row's twelve; articulation ``art``, -1 for none)
+    of a walked free-body row over the walk's coordinates of the published velocity
+    (:func:`.tree_factor.walk_enter_kernel`)."""
     if art < 0:
         return 0.0
     start = world_offset[art]
     out = float(0.0)
     for k in range(6):
-        out += Z[line, row, k] * coordinates[world, start + k]
+        out += Z[line, row, side + k] * coordinates[world, start + k]
     return out
 
 
@@ -317,12 +319,12 @@ def free_rows(
         sides = mf.sides[line, r]
         if kind == ROW_SPEED:
             start = walk.dof_start[sides[0]]
-            if mf.Z_a[line, i, 3] != 0.0:
+            if mf.Z[line, i, 3] != 0.0:
                 start += 3
             velocity[world, i] = -wp.length(wp.vec3(v[start], v[start + 1], v[start + 2]))
             continue
-        term = walked_side(mf.Z_a, line, i, sides[0], world, world_offset, coordinates)
-        term += walked_side(mf.Z_b, line, i, sides[1], world, world_offset, coordinates)
+        term = walked_side(mf.Z, line, i, 0, sides[0], world, world_offset, coordinates)
+        term += walked_side(mf.Z, line, i, 6, sides[1], world, world_offset, coordinates)
         diagonal = mf.diag[line, r]
         if diagonal > 0.0:
             weight = float(1.0)

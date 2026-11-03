@@ -25,7 +25,7 @@ the walk's frames, :attr:`.tree_factor.WalkTrees.now`), so a step between refres
 held factor. A slipping drive's ``K`` leaves the rows by its release along its path (``R``, the predictor's border,
 :func:`.tree_kinetic_state.border_solve`), which keeps every row inside its support.
 
-The free bodies' rows (``mf_Z_a``, ``mf_Z_b``) take the same seed walk (:func:`walk_body`,
+The free bodies' rows (``mf_Z``, each side's six of a row's twelve) take the same seed walk (:func:`walk_body`,
 :func:`.tree_factor.walk_into`) with their own records' law (:func:`write_free_body_rows`,
 :func:`free_body_headers_kernel`). No ``J`` is formed. The rows and the sweeps' leave share the walk's one frame
 (FL3_design §1.2); the sweeps' change goes to the step's one leave (:func:`.tree_factor.walk_leave_kernel`).
@@ -126,8 +126,8 @@ def write_free_body_rows(
     v_hat: wp.array[float],
 ):
     """The bodies sink: each free-body contact row (``path`` 1, grid-stride over the contacts) by its law, its records
-    (:func:`.kernels.free_body_contact_records`), each responding body's seed walked into its six entries (``mf_Z_a``,
-    ``mf_Z_b``; the second body's negated, a spin row a torque about the normal) and its incident velocity ``J v_hat``.
+    (:func:`.kernels.free_body_contact_records`), each responding body's seed walked into its six entries (``mf_Z``: side
+    ``a``'s from 0, side ``b``'s from 6; the second body's negated, a spin row a torque about the normal) and its incident velocity ``J v_hat``.
     The rows' build stores their diagonals and rhs (:func:`.response_builds_rows.free_body_rows_kernel`)."""
     for c in range(wp.tid(), data.count[0], total_threads):
         slot = data.slot[c]
@@ -146,10 +146,10 @@ def write_free_body_rows(
             incident = float(0.0)
             if response_a >= 0:
                 wrench = body_wrench(walk, response_a, direction, row_point, spin)
-                incident += walk_body(walk, art_a, response_a, wrench, v_hat, 0, mf.Z_a, mf_line, z_row + row, 0)[0]
+                incident += walk_body(walk, art_a, response_a, wrench, v_hat, 0, mf.Z, mf_line, z_row + row, 0)[0]
             if response_b >= 0:
                 wrench = body_wrench(walk, response_b, -direction, row_point, spin)
-                incident += walk_body(walk, art_b, response_b, wrench, v_hat, 0, mf.Z_b, mf_line, z_row + row, 0)[0]
+                incident += walk_body(walk, art_b, response_b, wrench, v_hat, 0, mf.Z, mf_line, z_row + row, 6)[0]
             mf.incident[mf_line, slot + row] = incident
             free_body_contact_records(
                 mf,
@@ -190,7 +190,7 @@ def free_body_headers_kernel(
     material: int,
 ):
     """The walked free-body rows' build, one thread per row slot: each row's incident velocity, which its walks summed
-    (:func:`write_free_body_rows`), its diagonal ``A_ii = cfm + |Z_a|^2 + |Z_b|^2`` and its rhs by the rows' law
+    (:func:`write_free_body_rows`), its diagonal ``A_ii = cfm + |Z_a|^2 + |Z_b|^2`` (each side's six of ``Z``) and its rhs by the rows' law
     (:func:`.kernels.row_bias`, on ``rows``: the row store's records). A speed row keeps its axis ``e_k``
     unwhitened (its law reads the body's velocity, :meth:`.response_operator.FreeBodyZ.speed`): its diagonal takes the
     walk of the covector ``e_k``, ``|L^-1 P e_k|^2``, and its incident is zero. A side is its responding body's
@@ -212,7 +212,7 @@ def free_body_headers_kernel(
             j0 = walk.joint_start[art]
             d0 = walk.dof_start[art]
             k = int(0)
-            if mf.Z_a[line, i, 3] != 0.0:
+            if mf.Z[line, i, 3] != 0.0:
                 k = 3
             seed = walk_into(
                 walk,
@@ -226,7 +226,7 @@ def free_body_headers_kernel(
                 wp.spatial_vector(1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
                 v_hat,
                 -1,
-                mf.Z_a,
+                mf.Z,
                 line,
                 i,
                 0,
@@ -237,12 +237,12 @@ def free_body_headers_kernel(
         if sides[0] >= 0:
             squares = float(0.0)
             for k in range(6):
-                squares += mf.Z_a[line, i, k] * mf.Z_a[line, i, k]
+                squares += mf.Z[line, i, k] * mf.Z[line, i, k]
             diagonal += squares
         if sides[1] >= 0:
             squares = float(0.0)
             for k in range(6):
-                squares += mf.Z_b[line, i, k] * mf.Z_b[line, i, k]
+                squares += mf.Z[line, i, 6 + k] * mf.Z[line, i, 6 + k]
             diagonal += squares
     mf.incident[line, row] = incident
     mf.diag[line, row] = diagonal

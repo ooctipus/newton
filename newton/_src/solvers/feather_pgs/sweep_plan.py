@@ -1623,8 +1623,7 @@ class Sweep:
             # The free bodies' placement: their Z and headers (their records are the row store's above).
             "mf_contact_rows_end": placement.mf_contact_rows_end,
             "mf_meta": placement.mf_meta_packed,
-            "mf_Z_a": placement.mf_Z_a,
-            "mf_Z_b": placement.mf_Z_b,
+            "mf_Z": placement.mf_Z,
             "regularize": int(self.laws.set.weighted),
             "iterations": self.options.pgs_iterations,
             "omega": self.options.pgs_omega,

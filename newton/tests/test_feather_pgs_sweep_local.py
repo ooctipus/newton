@@ -277,10 +277,10 @@ class TestResponseOperators(unittest.TestCase):
         assembled = block.assemble(lambda r: f"rhs[{r}]", "")
         self.assertIn("a += s_Z[hi * 15 + d] * s_Z[lo * 15 + d];", assembled)
         self.assertNotIn("s_v", assembled)
-        self.assertIn("side_term += mf_Z_a.data[row6 + d] * s_Z[lo * 15 + row_a + d];", assembled)
+        self.assertIn("side_term += mf_Z.data[row12 + d] * s_Z[lo * 15 + row_a + d];", assembled)
         commit = block.commit("")
         self.assertIn("u += s_Z[r * 15 + d] * s_app[r];", commit)
-        self.assertIn("u += mf_Z_a.data[row6 + d - row_a] * applied;", commit)
+        self.assertIn("u += mf_Z.data[row12 + d - row_a] * applied;", commit)
         # No leave in the block, for either row source: the change goes to the step's one leave.
         for source in (block, stored_block):
             self.assertFalse(hasattr(source, "leave"))

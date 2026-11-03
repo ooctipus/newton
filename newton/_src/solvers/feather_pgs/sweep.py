@@ -1184,7 +1184,7 @@ def speed_rows_pass(rows: WorldRows, op, laws: RowLaws, *, pad: str = "         
         "    float mf_diag = __int_as_float(meta.y);",
         "    if (mf_diag <= 0.0f || dof_a < 0) continue;",
         "",
-        f"    const int speed_axis = {op.Z_a}.data[{op.base} + i * 6 + 3] != 0.0f ? 3 : 0;",
+        f"    const int speed_axis = {op.Z}.data[{op.base} + i * 12 + 3] != 0.0f ? 3 : 0;",
         speed_row(
             op,
             laws,

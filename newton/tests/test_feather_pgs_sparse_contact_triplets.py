@@ -211,8 +211,7 @@ class DeviceSolve:
             zeros(self.worlds * self.dofs),
             zeros(self.worlds, int),
             zeros((self.worlds, 4), int),
-            zeros((self.worlds, 1, 6)),
-            zeros((self.worlds, 1, 6)),
+            zeros((self.worlds, 1, 12)),
             int(data["iterations"]),
             float(data["omega"]),
         ]

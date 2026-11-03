@@ -2457,10 +2457,9 @@ def populate_rigid_velocity_limit_rows(
             limit = bodies.max_angular_velocity[body]
 
         # The axis stays unwhitened: the speed law reads the body's velocity through its factor, not a row.
-        for k in range(6):
-            mf.Z_a[mf_line, slot, k] = 0.0
-            mf.Z_b[mf_line, slot, k] = 0.0
-        mf.Z_a[mf_line, slot, 3 * speed_axis] = 1.0
+        for k in range(12):
+            mf.Z[mf_line, slot, k] = 0.0
+        mf.Z[mf_line, slot, 3 * speed_axis] = 1.0
 
         row = mf.base + slot
         mf.sides[mf_line, row] = wp.vec2i(art, -1)

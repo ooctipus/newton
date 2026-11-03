@@ -31,8 +31,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         return [
             wp.zeros(world_count, dtype=wp.int32, device=device),
             wp.zeros((world_count, 4), dtype=wp.int32, device=device),
-            wp.zeros((world_count, 1, 6), dtype=wp.float32, device=device),
-            wp.zeros((world_count, 1, 6), dtype=wp.float32, device=device),
+            wp.zeros((world_count, 1, 12), dtype=wp.float32, device=device),
             0,
             wp.zeros((world_count, 1), dtype=wp.float32, device=device),
         ]
@@ -468,8 +467,8 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 wp.array(row_mu, device=device),
                 wp.array([mf_count], dtype=wp.int32, device=device),
                 wp.array(packed_meta, device=device),
-                wp.zeros_like(wp.array(mf_jacobian, device=device)),
-                wp.array(mf_jacobian, device=device),
+                # Each row's packed twelve: no side a, the free body on side b.
+                wp.array(np.concatenate([np.zeros_like(mf_jacobian), mf_jacobian], axis=-1), device=device),
                 0,
                 wp.zeros((1, 2 * max_constraints), dtype=wp.float32, device=device),
                 iterations,

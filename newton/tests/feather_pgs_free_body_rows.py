@@ -26,8 +26,10 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
     ``Z_a``, ``Z_b`` default to the solver's whitened rows; pass a snapshot of them (and the factors must be the
     ones that whitened it, the step's).
     """
-    Z_a = solver.placement.mf_Z_a.numpy() if Z_a is None else np.asarray(Z_a)
-    Z_b = solver.placement.mf_Z_b.numpy() if Z_b is None else np.asarray(Z_b)
+    # Each row's packed twelve: side a's six, then side b's.
+    Z = solver.placement.mf_Z.numpy()
+    Z_a = Z[..., :6] if Z_a is None else np.asarray(Z_a)
+    Z_b = Z[..., 6:] if Z_b is None else np.asarray(Z_b)
     sides = solver.placement.row_sides.numpy()[:, solver.placement.body_base :]
     row_type = solver.placement.row_type.numpy()[:, solver.placement.body_base :]
     records = solver.factor.walk_view().data.numpy()
@@ -99,8 +101,7 @@ def sweep_free_body_rows(
         "mf_contact_rows_end": wp.array((rows,), dtype=wp.int32, device=device),
         "mf_meta": wp.array(meta, device=device),
         "world_impulses": per_row(impulses),
-        "mf_Z_a": wp.array(padded, device=device),
-        "mf_Z_b": wp.zeros((1, capacity, 6), dtype=wp.float32, device=device),
+        "mf_Z": wp.array(np.concatenate([padded, np.zeros_like(padded)], axis=-1), device=device),
         "world_row_mu": per_row(mu),
         "world_row_w": per_row(np.ones(rows) if weights is None else weights),
         # The body's unit factor as a walk: the sweep adds its change into walk.du, which no row reads back.

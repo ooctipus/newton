@@ -376,8 +376,8 @@ _PAIRED_COMPONENTS = r"""
                 }
             }
             for (int d = 0; d < $SECONDARY; ++d) {
-                valid &= wp::isfinite(data.mf_Z_a.data[r * $SECONDARY + d])
-                    && wp::isfinite(data.mf_Z_b.data[r * $SECONDARY + d]);
+                valid &= wp::isfinite(data.mf_Z.data[r * 2 * $SECONDARY + d])
+                    && wp::isfinite(data.mf_Z.data[r * 2 * $SECONDARY + $SECONDARY + d]);
             }
         }
         if (ALL(valid != 0) && LANE == 0) data.selector.data[world] = -1;

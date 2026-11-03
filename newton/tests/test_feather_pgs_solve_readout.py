@@ -148,7 +148,7 @@ class _SparseCase:
             wp.zeros(worlds * dofs, device=device),
             wp.zeros(worlds, dtype=int, device=device),
             wp.zeros((worlds, 4), dtype=int, device=device),
-            *[wp.zeros((worlds, 1, 6), device=device) for _ in range(2)],
+            wp.zeros((worlds, 1, 12), device=device),
         ]
         self.omega = omega
         worlds_per_block = 64 // options.get("lanes_per_world", 32)
@@ -227,7 +227,7 @@ class _LocalCase:
             wp.zeros((2, rows), dtype=wp.float32, device=device),
             wp.zeros(2, dtype=wp.int32, device=device),
             wp.zeros((2, 4), dtype=wp.int32, device=device),
-            *[wp.zeros((2, 1, 6), dtype=wp.float32, device=device) for _ in range(2)],
+            wp.zeros((2, 1, 12), dtype=wp.float32, device=device),
             0,
             wp.zeros((2, rows), dtype=wp.float32, device=device),
         ]

@@ -548,8 +548,7 @@ def _patch_ring_rows(seed, *, worlds, dense_capacity, mf_capacity, dofs, velocit
         "mf_constraint_count": np.zeros(w_count, np.int32),
         "mf_meta": np.zeros((w_count, 4 * mf_capacity), np.int32),
         "mf_impulses": np.zeros((w_count, mf_capacity), np.float32),
-        "mf_Z_a": np.zeros((w_count, mf_capacity, 6), np.float32),
-        "mf_Z_b": np.zeros((w_count, mf_capacity, 6), np.float32),
+        "mf_Z": np.zeros((w_count, mf_capacity, 12), np.float32),
         "mf_row_mu": np.zeros((w_count, mf_capacity), np.float32),
         "mf_row_w": rng.uniform(0.6, 1.0, (w_count, mf_capacity)).astype(np.float32),
         "v_out": rng.normal(0.0, 0.3, w_count * dofs).astype(np.float32),
@@ -638,7 +637,7 @@ def _patch_ring_rows(seed, *, worlds, dense_capacity, mf_capacity, dofs, velocit
                 np.float32(rhs).view(np.int32),
                 pack_endpoints(parent, mf_types[r]),
             )
-            host["mf_Z_a"][w, r] = rng.normal(0.0, 0.3, 6) * rng.uniform(0.7, 1.2)
+            host["mf_Z"][w, r, :6] = rng.normal(0.0, 0.3, 6) * rng.uniform(0.7, 1.2)
         host["mf_impulses"][w, :row] = np.where(rng.random(row) < 0.3, rng.uniform(0.0, 0.1, row), 0.0)
         host["mf_constraint_count"][w] = row
     host["mf_contact_rows_end"] = host["mf_constraint_count"].copy()

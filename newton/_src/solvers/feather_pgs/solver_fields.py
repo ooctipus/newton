@@ -256,8 +256,7 @@ SPARSE_CONTACT_RECORDS = FieldGroup(
 # ---------------------------------------------------------------------------------------------------------------------
 
 MF_ROWS = FieldGroup(
-    Field("mf_Z_a", wp.float32, ("world", "mf_row", 6), owner="placement"),
-    Field("mf_Z_b", wp.float32, ("world", "mf_row", 6), owner="placement"),
+    Field("mf_Z", wp.float32, ("world", "mf_row", 12), owner="placement"),
     Field("mf_meta_packed", wp.int32, ("world", "mf_meta"), owner="placement"),
 )
 """The free bodies' placement: each side's six entries (the row's Jacobian ``J`` as the writers store it, its whitened

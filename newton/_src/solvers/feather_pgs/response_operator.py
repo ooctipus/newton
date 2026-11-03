@@ -305,15 +305,15 @@ class ResponseOperator:
 
 @dataclass(frozen=True)
 class FreeBodyZ(ResponseOperator):
-    """Rows over at most two free bodies, whitened: ``Z_a, Z_b = L^-1 J^T`` of 6 coordinates each.
+    """Rows over at most two free bodies, whitened: ``Z = L^-1 J^T``, six coordinates on each side.
 
     A free body is a one-node tree; ``L`` is its held factor (``H = L L^T``,
     armature included), and the sweep holds the change of the body's six
     velocity coordinates in factor coordinates, ``u = L^T dv``, until
     :meth:`leave`: a row's velocity term is ``Z^T u``, its update ``u += Z
-    delta``. Row ``i``'s entries are at ``[base + i * 6 + k]``; its bodies'
-    first velocity coordinates are ``dof_a``/``dof_b`` (negative for no body).
-    With lanes, lanes 0-5 own body ``a``'s coordinates and lanes 6-11 body
+    delta``. Row ``i``'s twelve entries are one packed row at ``[base + i * 12]``: side ``a``'s six, then side
+    ``b``'s; its bodies' first velocity coordinates are ``dof_a``/``dof_b`` (negative for no body).
+    With lanes, lane ``l < 12`` owns the row's entry ``l``: lanes 0-5 body ``a``'s coordinates and lanes 6-11 body
     ``b``'s, one product each, and the lanes reduce with ``SUM``; the other
     lanes add zero. With one thread (``Lanes(1)``) the visited row ``i``'s
     entries are read where they are used: the residual adds each body's six
@@ -322,22 +322,21 @@ class FreeBodyZ(ResponseOperator):
     sibling residual starts from its right-hand side and its coupling from
     zero, each adding body ``a``'s then ``b``'s product per coordinate, as does
     the row's own residual where the pair reduces it (``own``). The builder
-    stores ``1 / A_ii`` (``A_ii = cfm + |Z_a|^2 + |Z_b|^2``).
+    stores ``1 / A_ii`` (``A_ii = cfm + |Z|^2``).
 
     A body's speed row reads its velocity by its walk (``walk_leave``,
     ``walk_enter``).
     """
 
     lanes: Lanes = Lanes()
-    Z_a: str = "mf_Z_a"
-    Z_b: str = "mf_Z_b"
-    base: str = "mf6_base"
+    Z: str = "mf_Z"
+    base: str = "mf12_base"
     velocity: Velocity = Velocity()
     diagonal: Callable[[str], str] | None = None
     inverse: Callable[[str], str] | None = None
-    entry: Callable[[str, str, str], str] | None = None
-    """One thread: where entry ``k`` of a row's ``Z_a`` or ``Z_b`` (the array's name) is read, ``entry(array, row,
-    k)``, when a mapping stages the rows elsewhere (default: the array, by row)."""
+    entry: Callable[[int, str, str], str] | None = None
+    """One thread: where entry ``k`` of side ``side``'s six of a row is read, ``entry(side, row, k)``, when a mapping
+    stages the rows elsewhere (default: the packed row)."""
     walk_leave: Callable[[str, str], str] | None = None
     """The code mapping the six values ``values`` of the body whose first coordinate is ``first`` back in place,
     ``walk_leave(first, values)``, ``v = P^T L^-T u`` by the walk down (:mod:`.walk_rows`); a speed row needs it."""
@@ -345,6 +344,8 @@ class FreeBodyZ(ResponseOperator):
     """With ``walk_leave``: the code giving ``u = L^T P v`` of the six values ``velocity`` in ``out``,
     ``walk_enter(first, velocity, out)``."""
     name = "free_body_z"
+    SIDES = ((0, "dof_a"), (1, "dof_b"))
+    """Each side and its body's first coordinate, in the row's order."""
 
     def __post_init__(self):
         if self.entry is not None and self.lanes.parallel:
@@ -369,34 +370,33 @@ class FreeBodyZ(ResponseOperator):
     # -- software pipeline: the packed row word (bodies, inverse diagonal, rhs, type and parent) and the entries ---
 
     def pipeline_registers(self, indent: str = "        ") -> str:
-        return f"{indent}int4 pre_meta;\n{indent}float pre_Za = 0.0f, pre_Zb = 0.0f;"
+        return f"{indent}int4 pre_meta;\n{indent}float pre_z = 0.0f;"
 
-    def _load(self, row_meta: str, row6: str, indent: str) -> str:
+    def _load(self, row_meta: str, row12: str, indent: str) -> str:
         lane = self.lanes.lane
         return (
             f"{indent}pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[{row_meta}]);\n"
-            f"{indent}if ({lane} < 6) pre_Za = {self.Z_a}.data[{row6} + {lane}];\n"
-            f"{indent}if ({lane} >= 6 && {lane} < 12) pre_Zb = {self.Z_b}.data[{row6} + {lane} - 6];"
+            f"{indent}if ({lane} < 12) pre_z = {self.Z}.data[{row12} + {lane}];"
         )
 
     def prefetch_first(self, first: str, indent: str) -> str:
         """Load row ``first``'s packed word and entries into the pipeline registers."""
         if first == "0":
             return self._load("off_meta", self.base, indent)
-        return self._load(f"off_meta + {first} * 4", f"{self.base} + {first} * 6", indent)
+        return self._load(f"off_meta + {first} * 4", f"{self.base} + {first} * 12", indent)
 
     def consume(self, row: str, end: str, indent: str) -> str:
         """Take row ``row``'s word and entries from the pipeline, load row ``row + 1``'s, and decode the word.
 
-        Declares ``meta``, ``cur_*``, ``dof_a``, ``dof_b``, ``mf_diag`` (the stored inverse diagonal),
-        ``packed_tp`` and ``mf_rt`` (the row type).
+        Declares ``meta``, ``cur_z`` (the lane's entry), ``dof_a``, ``dof_b``, ``mf_diag`` (the stored inverse
+        diagonal), ``packed_tp`` and ``mf_rt`` (the row type).
         """
         return (
             f"{indent}int4 meta = pre_meta;\n"
-            f"{indent}float cur_Za = pre_Za;\n{indent}float cur_Zb = pre_Zb;\n"
+            f"{indent}float cur_z = pre_z;\n"
             f"{indent}if ({row} + 1 < {end}) {{\n"
-            f"{indent}    int next_mf6 = {self.base} + ({row} + 1) * 6;\n"
-            + self._load(f"off_meta + ({row} + 1) * 4", "next_mf6", indent + "    ")
+            f"{indent}    int next_z = {self.base} + ({row} + 1) * 12;\n"
+            + self._load(f"off_meta + ({row} + 1) * 4", "next_z", indent + "    ")
             + f"\n{indent}}}\n"
             f"{indent}int packed_dofs = meta.x;\n"
             f"{indent}int dof_a = packed_dofs >> 16;\n"
@@ -414,37 +414,37 @@ class FreeBodyZ(ResponseOperator):
         )
 
     def residual(self, out: str, indent: str) -> str:
-        """``float out = Z_i u`` from the pipelined entries ``cur_Za``/``cur_Zb`` (one thread: row ``i``'s)."""
+        """``float out = Z_i u`` from the pipelined entry ``cur_z`` (one thread: row ``i``'s)."""
         lane = self.lanes.lane
         if self.lanes.parallel:
             return (
                 f"{indent}float {out}_partial = 0.0f;\n"
                 + self._lane_terms(
                     f"{out}_partial",
-                    f"cur_Za * {self.velocity.at(f'dof_a + {lane}')}",
-                    f"cur_Zb * {self.velocity.at(f'dof_b + {lane} - 6')}",
+                    f"cur_z * {self.velocity.at(f'dof_a + {lane}')}",
+                    f"cur_z * {self.velocity.at(f'dof_b + {lane} - 6')}",
                     indent,
                 )
                 + f"\n{indent}{self.lanes.reduce(f'{out}_partial')}\n{indent}float {out} = {out}_partial;"
             )
         sides = "\n".join(
             f"{indent}if ({body} >= 0) {{\n{indent}    {out} += "
-            + " + ".join(f"{self._at(Z, 'i', k)} * {self._v(body, k)}" for k in range(6))
+            + " + ".join(f"{self._at(side, 'i', k)} * {self._v(body, k)}" for k in range(6))
             + f";\n{indent}}}"
-            for Z, body in ((self.Z_a, "dof_a"), (self.Z_b, "dof_b"))
+            for side, body in self.SIDES
         )
         return f"{indent}float {out} = 0.0f;\n{sides}"
 
     def apply(self, delta: str, indent: str) -> str:
-        """``u += Z_i delta`` from the pipelined entries ``cur_Za``/``cur_Zb`` (one thread: row ``i``'s)."""
+        """``u += Z_i delta`` from the pipelined entry ``cur_z`` (one thread: row ``i``'s)."""
         if not self.lanes.parallel:
             return self.apply_row("i", delta, indent)
         lane = self.lanes.lane
         return (
             f"\n{indent}if ({lane} < 6 && dof_a >= 0) {{\n"
-            f"{indent}    {self.velocity.at(f'dof_a + {lane}')} += cur_Za * {delta};\n{indent}}}\n"
+            f"{indent}    {self.velocity.at(f'dof_a + {lane}')} += cur_z * {delta};\n{indent}}}\n"
             f"{indent}if ({lane} >= 6 && {lane} < 12 && dof_b >= 0) {{\n"
-            f"{indent}    {self.velocity.at(f'dof_b + {lane} - 6')} += cur_Zb * {delta};\n{indent}}}"
+            f"{indent}    {self.velocity.at(f'dof_b + {lane} - 6')} += cur_z * {delta};\n{indent}}}"
         )
 
     def row_velocity(self, out: str, row: str, indent: str) -> str:
@@ -452,13 +452,13 @@ class FreeBodyZ(ResponseOperator):
         if not self.lanes.parallel:
             return self._per_coordinate(out, "0.0f", self._velocity_term(row), indent)
         lane = self.lanes.lane
-        entries = f"{self.base} + {row} * 6"
+        entry = f"{self.Z}.data[{self.base} + {row} * 12 + {lane}]"
         return (
             f"{indent}float {out} = 0.0f;\n"
             + self._lane_terms(
                 out,
-                f"{self.Z_a}.data[{entries} + {lane}] * {self.velocity.at(f'dof_a + {lane}')}",
-                f"{self.Z_b}.data[{entries} + {lane} - 6] * {self.velocity.at(f'dof_b + {lane} - 6')}",
+                f"{entry} * {self.velocity.at(f'dof_a + {lane}')}",
+                f"{entry} * {self.velocity.at(f'dof_b + {lane} - 6')}",
                 indent,
             )
             + f"\n{indent}{self.lanes.reduce(out)}"
@@ -474,16 +474,18 @@ class FreeBodyZ(ResponseOperator):
         """``float out = Z_i Z_s`` (lanes 0-11, reduced; one thread: from zero)."""
         if not self.lanes.parallel:
             return self._per_coordinate(
-                out, "0.0f", lambda Z, body: f"{self._at(Z, row, 'k')} * {self._at(Z, sibling, 'k')}", indent
+                out, "0.0f", lambda side, body: f"{self._at(side, row, 'k')} * {self._at(side, sibling, 'k')}", indent
             )
         lane = self.lanes.lane
-        i_row, s_row = f"{self.base} + {row} * 6", f"{self.base} + {sibling} * 6"
+        product = (
+            f"{self.Z}.data[{self.base} + {row} * 12 + {lane}] * {self.Z}.data[{self.base} + {sibling} * 12 + {lane}]"
+        )
         return (
             f"{indent}float {out} = 0.0f;\n"
             + self._lane_terms(
                 out,
-                f"{self.Z_a}.data[{i_row} + {lane}] * {self.Z_a}.data[{s_row} + {lane}]",
-                f"{self.Z_b}.data[{i_row} + {lane} - 6] * {self.Z_b}.data[{s_row} + {lane} - 6]",
+                product,
+                product,
                 indent,
             )
             + f"\n{indent}{self.lanes.reduce(out)}"
@@ -507,39 +509,36 @@ class FreeBodyZ(ResponseOperator):
         if not self.lanes.parallel:
             return "".join(
                 f"\n{indent}if ({body} >= 0) {{"
-                + "".join(f"\n{indent}    {self._v(body, k)} += {self._at(Z, row, k)} * {delta};" for k in range(6))
+                + "".join(f"\n{indent}    {self._v(body, k)} += {self._at(side, row, k)} * {delta};" for k in range(6))
                 + f"\n{indent}}}"
-                for Z, body in ((self.Z_a, "dof_a"), (self.Z_b, "dof_b"))
+                for side, body in self.SIDES
             )
         lane = self.lanes.lane
-        s_row = f"{self.base} + {row} * 6"
+        entry = f"{self.Z}.data[{self.base} + {row} * 12 + {lane}]"
         return (
             f"\n{indent}if ({lane} < 6 && dof_a >= 0)\n"
-            f"{indent}    {self.velocity.at(f'dof_a + {lane}')} += {self.Z_a}.data[{s_row} + {lane}] * {delta};\n"
+            f"{indent}    {self.velocity.at(f'dof_a + {lane}')} += {entry} * {delta};\n"
             f"{indent}if ({lane} >= 6 && {lane} < 12 && dof_b >= 0)\n"
-            f"{indent}    {self.velocity.at(f'dof_b + {lane} - 6')} += {self.Z_b}.data[{s_row} + {lane} - 6] * {delta};"
+            f"{indent}    {self.velocity.at(f'dof_b + {lane} - 6')} += {entry} * {delta};"
         )
 
     # -- one thread per row: entries read where they are used -------------------------------------------------------
 
-    def _at(self, array: str, row: str, k) -> str:
+    def _at(self, side: int, row: str, k) -> str:
         if self.entry is not None:
-            return self.entry(array, row, str(k))
-        return f"{array}.data[{self.base} + {row} * 6 + {k}]"
+            return self.entry(side, row, str(k))
+        return f"{self.Z}.data[{self.base} + {row} * 12 + {f'6 + {k}' if side else k}]"
 
     def _v(self, first: str, k) -> str:
         return self.velocity.at(f"{first} + {k}" if k != 0 else first)
 
     def _velocity_term(self, row: str):
-        return lambda Z, body: f"{self._at(Z, row, 'k')} * {self._v(body, 'k')}"
+        return lambda side, body: f"{self._at(side, row, 'k')} * {self._v(body, 'k')}"
 
     def _per_coordinate(self, out: str, start: str, term, indent: str) -> str:
-        """``float out = start``, then per coordinate ``k`` the term ``term(Z, body)`` of body ``a``, then of body
+        """``float out = start``, then per coordinate ``k`` the term ``term(side, body)`` of body ``a``, then of body
         ``b`` (each side when it has a body)."""
-        sides = "\n".join(
-            f"{indent}    if ({body} >= 0) {out} += {term(Z, body)};"
-            for Z, body in ((self.Z_a, "dof_a"), (self.Z_b, "dof_b"))
-        )
+        sides = "\n".join(f"{indent}    if ({body} >= 0) {out} += {term(side, body)};" for side, body in self.SIDES)
         return f"{indent}float {out} = {start};\n{indent}for (int k = 0; k < 6; ++k) {{\n{sides}\n{indent}}}"
 
     # -- free-body speed rows ---------------------------------------------------------------------------------------
@@ -1497,7 +1496,7 @@ class LocalBlock(ResidualBlock):
             f"{read}"
             f"{indent}const int {name}_a = {name}_dofs >> 16;\n"
             f"{indent}const int {name}_b = ({name}_dofs << 16) >> 16;\n"
-            f"{indent}const int {name}6 = {self.free.base} + ({free}) * 6;"
+            f"{indent}const int {name}12 = {self.free.base} + ({free}) * 12;"
         )
 
     def _free_terms(self, out: str, other: Callable[[str, str], str], indent: str) -> str:
@@ -1506,11 +1505,11 @@ class LocalBlock(ResidualBlock):
         body ``a``'s side, then ``b``'s, each from its own sum."""
         free = self.free
         lines = []
-        for Z, side in ((free.Z_a, "row_a"), (free.Z_b, "row_b")):
+        for offset, side in (("", "row_a"), ("6 + ", "row_b")):
             lines += [
                 f"if ({side} >= 0) {{",
                 "    float side_term = 0.0f;",
-                f"    for (int d = 0; d < 6; ++d) side_term += {Z}.data[row6 + d] * {other(side, 'd')};",
+                f"    for (int d = 0; d < 6; ++d) side_term += {free.Z}.data[row12 + {offset}d] * {other(side, 'd')};",
                 f"    {out} += side_term;",
                 "}",
             ]
@@ -1568,15 +1567,15 @@ class LocalBlock(ResidualBlock):
                 f"{q}for (int d = 0; d < 6; ++d) {{",
                 f"{q}    if (row_a >= 0) {{",
                 f"{q}        float response = 0.0f;",
-                f"{q}        if (column_a == row_a) response += {free.Z_a}.data[column6 + d];",
-                f"{q}        if (column_b == row_a) response += {free.Z_b}.data[column6 + d];",
-                f"{q}        a += {free.Z_a}.data[row6 + d] * response;",
+                f"{q}        if (column_a == row_a) response += {free.Z}.data[column12 + d];",
+                f"{q}        if (column_b == row_a) response += {free.Z}.data[column12 + 6 + d];",
+                f"{q}        a += {free.Z}.data[row12 + d] * response;",
                 f"{q}    }}",
                 f"{q}    if (row_b >= 0) {{",
                 f"{q}        float response = 0.0f;",
-                f"{q}        if (column_a == row_b) response += {free.Z_a}.data[column6 + d];",
-                f"{q}        if (column_b == row_b) response += {free.Z_b}.data[column6 + d];",
-                f"{q}        a += {free.Z_b}.data[row6 + d] * response;",
+                f"{q}        if (column_a == row_b) response += {free.Z}.data[column12 + d];",
+                f"{q}        if (column_b == row_b) response += {free.Z}.data[column12 + 6 + d];",
+                f"{q}        a += {free.Z}.data[row12 + 6 + d] * response;",
                 f"{q}    }}",
                 f"{q}}}",
                 f"{p}            }}",
@@ -1600,8 +1599,8 @@ class LocalBlock(ResidualBlock):
                 f"{p}    for (int f = 0; f < {self.free_count}; ++f) {{",
                 self._free_row("f", "row", p + "        "),
                 f"{p}        const float applied = s_app[{self.dense} + f];",
-                f"{p}        if (row_a >= 0 && d >= row_a && d < row_a + 6) u += {free.Z_a}.data[row6 + d - row_a] * applied;",
-                f"{p}        if (row_b >= 0 && d >= row_b && d < row_b + 6) u += {free.Z_b}.data[row6 + d - row_b] * applied;",
+                f"{p}        if (row_a >= 0 && d >= row_a && d < row_a + 6) u += {free.Z}.data[row12 + d - row_a] * applied;",
+                f"{p}        if (row_b >= 0 && d >= row_b && d < row_b + 6) u += {free.Z}.data[row12 + 6 + d - row_b] * applied;",
                 f"{p}    }}",
             ]
         lines += [f"{p}    s_v[d] = u;", f"{p}}}"]

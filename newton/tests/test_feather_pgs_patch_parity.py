@@ -88,7 +88,7 @@ def _ring_pool_dropped(solver):
 _MF_RECORDS = ("row_type", "row_parent", "row_mu", "rhs", "impulses", "phi", "row_sides")
 """The free-body rows' records a slot permutation moves: the row store's, by the line's row (the slots' and parents'
 index)."""
-_MF_Z = ("mf_Z_a", "mf_Z_b")
+_MF_Z = ("mf_Z",)
 """The free-body rows' placement a slot permutation moves, by the free bodies' own row."""
 
 

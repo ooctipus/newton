@@ -76,8 +76,7 @@ MF_GS_ABI = kernel_template.params(
     ("mf_constraint_count", wp.array[int]),
     ("mf_contact_rows_end", wp.array[int]),
     ("mf_meta", wp.array2d[int]),
-    ("mf_Z_a", wp.array3d[float]),
-    ("mf_Z_b", wp.array3d[float]),
+    ("mf_Z", wp.array3d[float]),
     ("walk", WalkTrees),
     ("iterations", int),
     ("omega", float),
@@ -321,7 +320,6 @@ def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str
     (:data:`.sweep_units.SLOT_FIELDS`, field by field across the color's ``units`` slots) and runs the free-body row
     law, unrolled over the unit's rows, on the world's staged velocity. No other unit of the color shares a body."""
     unit_rows = WorldRows(M_MF, staging="header", stream=free.stream, lanes=Lanes(1))
-    arrays = {"mf_Z_a": 0, "mf_Z_b": 1}
     torsion = laws.torsion
     layout = sweep_units.slot_layout(torsion)
 
@@ -334,7 +332,7 @@ def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str
     unit_op = (_GramSpinUnitBodyZ if torsion else _GramUnitBodyZ)(
         Lanes(1),
         velocity=Velocity("s_v"),
-        entry=lambda array, row, k: f"E[{unit_offset(row)} * 12 + {arrays[array] * 6} + {k}]",
+        entry=lambda side, row, k: f"E[{unit_offset(row)} * 12 + {side * 6} + {k}]",
         inverse=lambda row: "mf_diag" if row == "i" else f"__int_as_float(W[{unit_offset(row)} * 3])",
     )
     ring, members = layout.ring, sweep_units.RING_MEMBERS
@@ -484,11 +482,10 @@ def _colored_metrics(units: int, *, torsion: bool = False) -> str:
         rows = [*head, f"            float E[{fields}];", *stage]
         rows.append("            // The Gram couplings of the unit's rows: per coordinate, body a's then b's products.")
     else:
-        arrays = {"mf_Z_a": 0, "mf_Z_b": 1}
         op = FreeBodyZ(
             Lanes(1),
             velocity=Velocity("s_v"),
-            entry=lambda array, row, k: f"E[{ {'i': 'r', 'sib': '2'}[row] } * 12 + {arrays[array] * 6} + {k}]",
+            entry=lambda side, row, k: f"E[{ {'i': 'r', 'sib': '2'}[row] } * 12 + {side * 6} + {k}]",
             inverse=lambda row: "mf_diag" if row == "i" else "__int_as_float(W[2 * 3])",
         )
         rows = [
@@ -778,7 +775,7 @@ def mf_gs_source(
     int off_mf = off_dense + {M_D};
     int off_meta = line * {M_MF} * 4;{component}
     const size_t packed_base = (size_t)line * {M_D * int(max_row_dofs)};
-    int mf6_base = line * {M_MF} * 6;{offsets}
+    int mf12_base = line * {M_MF} * 12;{offsets}
 
 {staging.declarations("    ")}
 {free.declaration()}{trace_reduction}

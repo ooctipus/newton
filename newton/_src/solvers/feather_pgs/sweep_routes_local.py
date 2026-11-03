@@ -85,8 +85,7 @@ LOCAL_ABI = kernel_template.params(
     ("world_row_mu", wp.array2d[float]),
     ("mf_constraint_count", wp.array[int]),
     ("mf_meta", wp.array2d[int]),
-    ("mf_Z_a", wp.array3d[float]),
-    ("mf_Z_b", wp.array3d[float]),
+    ("mf_Z", wp.array3d[float]),
     ("regularize", int),
     ("world_row_w", wp.array2d[float]),
     ("iterations", int),
@@ -277,7 +276,7 @@ def local_owned_source(
     if (mf_count > {MFR}) mf_count = {MFR};
     const int off_mf = line * {pitch} + {M};
     const int off_meta = line * {MFS * 4};
-    const int mf6_base = line * {MFS * 6};"""
+    const int mf12_base = line * {MFS * 12};"""
         mf_load = (
             f"\n    for (int row = lane; row < mf_count; row += {L}) s_mf_lam[row] = world_impulses.data[off_mf + row];"
         )

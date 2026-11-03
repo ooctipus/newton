@@ -132,7 +132,7 @@ class SlotLayout(NamedTuple):
     """A color slot's fields per unit of at most ``rows`` rows: a contact's normal row and friction pair, and under
     contact torsion its spin row (:func:`slot_layout`).
 
-    ``fields`` floats: each row ``r``'s six ``Z_a`` and ``Z_b`` entries at ``r * 12 + side * 6 + k``, then the first
+    ``fields`` floats: each row ``r``'s twelve ``Z`` entries at ``r * 12 + side * 6 + k`` (its packed row), then the first
     tangent's friction coefficient (at ``mu``), the normal row's regularization weight (``weight``) and a spin row's
     torsional coefficient (``spin_mu``). ``words`` words: each row ``r``'s bits of its stored inverse diagonal, of its
     right-hand side, and its type and parent word (``mf_meta``'s ``y``, ``z``, ``w``) at ``r * 3``, then from
@@ -180,8 +180,7 @@ def stage_slots(
     unit_count: wp.array[wp.int32],
     color_slot: wp.array3d[wp.int32],
     mf_meta: wp.array2d[wp.int32],
-    mf_Z_a: wp.array3d[float],
-    mf_Z_b: wp.array3d[float],
+    mf_Z: wp.array3d[float],
     mf_row_mu: wp.array2d[float],
     mf_row_w: wp.array2d[float],
     body_base: int,
@@ -207,9 +206,8 @@ def stage_slots(
     rows = color_slot[slot, p, 1] & 7
     for r in range(4):
         if r < rows:
-            for k in range(6):
-                slot_data[slot, r * 12 + k, p] = mf_Z_a[mf_line, row + r, k]
-                slot_data[slot, r * 12 + 6 + k, p] = mf_Z_b[mf_line, row + r, k]
+            for k in range(12):
+                slot_data[slot, r * 12 + k, p] = mf_Z[mf_line, row + r, k]
             slot_words[slot, r * 3, p] = mf_meta[mf_line, (row + r) * 4 + 1]
             slot_words[slot, r * 3 + 1, p] = mf_meta[mf_line, (row + r) * 4 + 2]
             slot_words[slot, r * 3 + 2, p] = mf_meta[mf_line, (row + r) * 4 + 3]
@@ -663,8 +661,7 @@ class ColoredUnits:
         mf_first,
         mf_contact_rows_end,
         mf_meta,
-        mf_Z_a,
-        mf_Z_b,
+        mf_Z,
         mf_row_mu,
         mf_row_w,
         body_base: int,
@@ -691,8 +688,7 @@ class ColoredUnits:
                 units["unit_count"],
                 units["color_slot"],
                 mf_meta,
-                mf_Z_a,
-                mf_Z_b,
+                mf_Z,
                 mf_row_mu,
                 mf_row_w,
                 int(body_base),

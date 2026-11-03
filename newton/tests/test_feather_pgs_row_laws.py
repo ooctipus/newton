@@ -157,11 +157,15 @@ def _mf_layout(rng, worlds, rows):
     for w in range(worlds):
         body_a[w] = np.where(rng.uniform(size=rows) < 0.85, 2 * w, -1)
         body_b[w] = np.where(rng.uniform(size=rows) < 0.5, 2 * w + 1, -1)
+    Z_a = rng.normal(size=(worlds, rows, 6)).astype(np.float32)
+    Z_b = rng.normal(size=(worlds, rows, 6)).astype(np.float32)
     return {
         "mf_body_a": body_a,
         "mf_body_b": body_b,
-        "mf_Z_a": rng.normal(size=(worlds, rows, 6)).astype(np.float32),
-        "mf_Z_b": rng.normal(size=(worlds, rows, 6)).astype(np.float32),
+        "mf_Z_a": Z_a,
+        "mf_Z_b": Z_b,
+        # The free bodies' placement: each row's sides packed as one row of twelve.
+        "mf_Z": np.concatenate([Z_a, Z_b], axis=-1),
         "body_to_articulation": np.arange(bodies, dtype=np.int32),
         "articulation_dof_start": (6 * np.arange(bodies)).astype(np.int32),
         "incident_velocity": rng.normal(size=6 * bodies).astype(np.float32),

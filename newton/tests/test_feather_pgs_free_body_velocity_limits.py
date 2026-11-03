@@ -242,7 +242,7 @@ def _free_body_rows(run):
     count = solver.placement.mf_constraint_count.numpy()
     rows = int(count.max())
     # A speed row keeps its axis unwhitened.
-    jacobian = solver.placement.mf_Z_a.numpy()[:, :rows]
+    jacobian = solver.placement.mf_Z.numpy()[:, :rows, :6]
     axis = np.argmax(np.abs(jacobian), axis=2)
     return SimpleNamespace(
         count=count,

@@ -124,7 +124,7 @@ class TestPairedComponents(unittest.TestCase):
                 elif case == "mf_mu":
                     host["mf_mu"][0, 1] = -1
                 elif case == "mf_response":
-                    host["mf_Z_b"][0, 2, 5] = np.inf
+                    host["mf_Z"][0, 2, 11] = np.inf
                 elif case == "offset":
                     host["primary_offset"][0] = 1
                 elif case == "group":
