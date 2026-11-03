@@ -1059,7 +1059,7 @@ class RowLaws:
                 # (covers vel-limit rows, padding tail, and any contact that
                 # returns early in the gather); here we gather matched contacts'
                 # previous impulses into their current slots by identity. The
-                # carry itself is the row store's (ws_prev_dense_*), in its free-body region.
+                # carry itself is the row store's (ws_prev_dense_*), whose rows the free bodies' slots index.
                 if solver.options.pgs_warmstart:
                     match_index = getattr(contacts, "rigid_contact_match_index", None)
                     if match_index is None:
@@ -1077,9 +1077,9 @@ class RowLaws:
                             bind_mf_rows(solver.placement),
                             match_index,
                             solver.placement.ws_prev_slot_sorted,
-                            solver.placement.body_region(solver.placement.ws_prev_dense_impulses),
-                            solver.placement.body_region(solver.placement.ws_prev_dense_row_type),
-                            solver.placement.body_region(solver.placement.ws_prev_dense_row_parent),
+                            solver.placement.ws_prev_dense_impulses,
+                            solver.placement.ws_prev_dense_row_type,
+                            solver.placement.ws_prev_dense_row_parent,
                             solver.placement.mf_constraint_count,
                             solver.placement.ws_prev_contact_normal,
                             solver.options.pgs_warmstart_decay,
@@ -1088,7 +1088,7 @@ class RowLaws:
                             dt / solver.sweep.prev_dt if solver.sweep.prev_dt > 0.0 else 1.0,
                             solver.placement.mf_max_constraints,
                         ],
-                        outputs=[solver.placement.body_rows.impulses],
+                        outputs=[solver.placement.impulses],
                         extent=count,
                         max_blocks=solver.placement.contact_capacity_blocks,
                     )

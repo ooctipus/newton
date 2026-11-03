@@ -182,16 +182,18 @@ def _step_tripods(device, *, threads=None, steps=4, deterministic=True, launched
                 name: getattr(solver.placement, f"contact_{name}").numpy()[:live].copy()
                 for name in ("world", "path", "slot")
             }
+            # Each family's contact rows in the world's line: the free bodies' from the store's body base.
+            base = solver.placement.body_base
             record.update(
                 counts=(
                     solver.placement.constraint_count.numpy().copy(),
-                    solver.placement.mf_constraint_count.numpy().copy(),
+                    base + solver.placement.mf_constraint_count.numpy(),
                 ),
                 dense_overflow=solver.placement.dense_first_rejected_slot.numpy()
                 < solver.placement.slot_counter.numpy(),
                 starts=(
                     solver.placement.dense_phase_bounds.numpy()[:, 1].copy(),
-                    np.zeros(model.world_count, dtype=np.int32),
+                    np.full(model.world_count, base, dtype=np.int32),
                 ),
                 joint_q=state_out.joint_q.numpy().copy(),
                 joint_qd=state_out.joint_qd.numpy().copy(),

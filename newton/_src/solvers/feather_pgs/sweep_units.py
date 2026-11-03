@@ -184,6 +184,7 @@ def stage_slots(
     mf_Z_b: wp.array3d[float],
     mf_row_mu: wp.array2d[float],
     mf_row_w: wp.array2d[float],
+    body_base: int,
     regularize: int,
     layout_rows: int,
     slot_data: wp.array3d[float],
@@ -195,6 +196,7 @@ def stage_slots(
     A unit stages only what its rows hold: its pair's friction coefficient when it has a friction pair, its spin row's
     when it has one, and its normal row's weight from ``mf_row_w`` only when ``regularize`` is set (the sweeps'
     run-time switch); otherwise the solver binds a one-element stand-in for the weights, and the row's weight is 1.
+    The coefficients and weights are the row store's, the free bodies' row ``i`` at ``body_base + i`` of the line.
     """
     slot, p = wp.tid()
     world = slot_world[slot]
@@ -214,17 +216,17 @@ def stage_slots(
     entries = layout_rows * 12
     mu = float(0.0)
     if rows >= 3:
-        mu = mf_row_mu[mf_line, row + 1]
+        mu = mf_row_mu[mf_line, body_base + row + 1]
     slot_data[slot, entries, p] = mu
     weight = float(1.0)
     if regularize != 0:
-        weight = mf_row_w[mf_line, row]
+        weight = mf_row_w[mf_line, body_base + row]
     slot_data[slot, entries + 1, p] = weight
     if layout_rows > 3:
         # The spin row's torsional coefficient (contact torsion).
         spin_mu = float(0.0)
         if rows > 3:
-            spin_mu = mf_row_mu[mf_line, row + 3]
+            spin_mu = mf_row_mu[mf_line, body_base + row + 3]
         slot_data[slot, entries + 2, p] = spin_mu
     if rows >= 3:
         # The friction pair's patch ring: its normal's ring successors in ring order (the pooled load's walk).
@@ -665,6 +667,7 @@ class ColoredUnits:
         mf_Z_b,
         mf_row_mu,
         mf_row_w,
+        body_base: int,
         regularize: int,
     ) -> None:
         """Build every capable world's units and colors and stage the colored worlds' rows by color slot (the row
@@ -692,6 +695,7 @@ class ColoredUnits:
                 mf_Z_b,
                 mf_row_mu,
                 mf_row_w,
+                int(body_base),
                 int(regularize),
                 self.layout.rows,
             ],

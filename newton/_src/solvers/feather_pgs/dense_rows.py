@@ -154,7 +154,7 @@ MF_RECORDS = (
         )
     ),
     *(
-        dataclasses.replace(DENSE_ROWS[attr], name=name, attr=attr, owner="body")
+        dataclasses.replace(DENSE_ROWS[attr], name=name, attr=attr, owner="placement")
         for name, attr in (
             ("row_type", "row_type"),
             ("row_parent", "row_parent"),
@@ -169,22 +169,22 @@ MF_RECORDS = (
             ("sides", "row_sides"),
         )
     ),
-    Field("eps", wp.float32, ("world", "row"), attr="row_eps", owner="body"),
+    Field("eps", wp.float32, ("world", "row"), attr="row_eps", owner="placement"),
     Field("first", wp.int32, ("world",), attr="dense_first", owner="placement"),
+    Field("base", wp.int32, attr="body_base", owner="placement"),
 )
 """Each free-body row's per-body blocks (the writers' ``J``, whitened in place to ``Z`` by the rows' build), by world
-line and free-body row; and its records, the row store's region of the free bodies
-(:meth:`.placement.Placement.body_region`, row ``i`` the store's ``body_base + i``): kind, friction parent,
-coefficient, the row law's beta, gap, restitution, incident velocity (``J v_hat``, stored by the build), rhs, target,
-effective mass ``A_ii``, material compliance and sides (the responding bodies' articulations in ``a``/``b`` order, -1
-for none)."""
+line and free-body row ``i``; and its records, the row store's at row ``base + i`` of the world's line (one row index
+for both classes: a free-body contact's slot, its rows' parents): kind, friction parent, coefficient, the row law's
+beta, gap, restitution, incident velocity (``J v_hat``, stored by the build), rhs, target, effective mass ``A_ii``,
+material compliance and sides (the responding bodies' articulations in ``a``/``b`` order, -1 for none)."""
 
 MfRows = field_group.struct("MfRows", MF_RECORDS, __name__)
 
 
 def bind_mf(placement):
-    """Bind the placement's free-body rows into an :data:`MfRows`: their records in the row store's free-body region."""
-    return field_group.bind(MfRows, placement=placement, body=placement.body_rows)
+    """Bind the placement's free-body rows into an :data:`MfRows`: their placement and the row store's records."""
+    return field_group.bind(MfRows, placement=placement)
 
 
 def bind(placement, data=None, options=None):

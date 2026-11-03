@@ -311,8 +311,10 @@ def free_rows(
     world = wp.tid()
     line = mf.first[world]
     for i in range(a.mf_counts[world]):
-        kind = mf.row_type[line, i]
-        sides = mf.sides[line, i]
+        # Row ``i``'s ``Z`` there, its records at ``mf.base + i`` of the world's line.
+        r = mf.base + i
+        kind = mf.row_type[line, r]
+        sides = mf.sides[line, r]
         if kind == ROW_SPEED:
             start = walk.dof_start[sides[0]]
             if mf.Z_a[line, i, 3] != 0.0:
@@ -321,15 +323,15 @@ def free_rows(
             continue
         term = walked_side(mf.Z_a, line, i, sides[0], world, world_offset, coordinates)
         term += walked_side(mf.Z_b, line, i, sides[1], world, world_offset, coordinates)
-        diagonal = mf.diag[line, i]
+        diagonal = mf.diag[line, r]
         if diagonal > 0.0:
             weight = float(1.0)
             if a.weighted != 0:
-                weight = weights[line, i]
+                weight = weights[line, r]
             eps = float(0.0)
             if a.material != 0:
-                eps = mf.eps[line, i]
-            term += row_compliance(kind, weight, eps, diagonal) * impulses[line, i]
+                eps = mf.eps[line, r]
+            term += row_compliance(kind, weight, eps, diagonal) * impulses[line, r]
         velocity[world, i] = term
 
 
@@ -337,6 +339,7 @@ def free_rows(
 def audit_store(
     world: int,
     line: int,
+    base: int,
     count: int,
     kinds: wp.array2d[int],
     parents: wp.array2d[int],
@@ -345,30 +348,32 @@ def audit_store(
     rhs: wp.array2d[float],
     velocity: wp.array2d[float],
 ) -> wp.vec3:
-    """One store's ``(G, D, W)``. A contact's friction block is its pair after its normal, then its spin row if any:
-    its first tangent reads it whole, and its other rows add only their work."""
+    """One row class's ``(G, D, W)``: its ``count`` rows from ``base`` of the world's line, row ``i``'s velocity term
+    at ``velocity[world, i]``. A contact's friction block is its pair after its normal, then its spin row if any: its
+    first tangent reads it whole, and its other rows add only their work."""
     gap = float(0.0)
     violation = float(0.0)
     work = float(0.0)
     for i in range(count):
-        kind = kinds[line, i]
-        impulse = impulses[line, i]
-        bias = rhs[line, i]
+        r = base + i
+        kind = kinds[line, r]
+        impulse = impulses[line, r]
+        bias = rhs[line, r]
         residual = velocity[world, i] + bias
         work -= impulse * bias
         if kind == ROW_FRICTION or kind == ROW_TORSION:
-            if kind == ROW_FRICTION and parents[line, i] == i - 1:
-                second = velocity[world, i + 1] + rhs[line, i + 1]
+            if kind == ROW_FRICTION and parents[line, r] == r - 1:
+                second = velocity[world, i + 1] + rhs[line, r + 1]
                 spin = float(0.0)
                 spin_scale = float(0.0)
-                term = impulse * residual + impulses[line, i + 1] * second
+                term = impulse * residual + impulses[line, r + 1] * second
                 if i + 2 < count:
-                    if kinds[line, i + 2] == ROW_TORSION:
-                        spin = velocity[world, i + 2] + rhs[line, i + 2]
-                        spin_scale = mus[line, i + 2]
-                        term += impulses[line, i + 2] * spin
-                scaled = wp.vec3(mus[line, i] * residual, mus[line, i + 1] * second, spin_scale * spin)
-                term += patch_normal_load(parents, impulses, line, i - 1) * wp.length(scaled)
+                    if kinds[line, r + 2] == ROW_TORSION:
+                        spin = velocity[world, i + 2] + rhs[line, r + 2]
+                        spin_scale = mus[line, r + 2]
+                        term += impulses[line, r + 2] * spin
+                scaled = wp.vec3(mus[line, r] * residual, mus[line, r + 1] * second, spin_scale * spin)
+                term += patch_normal_load(parents, impulses, line, r - 1) * wp.length(scaled)
                 gap += wp.abs(term)
             continue
         gap += wp.abs(impulse * residual)
@@ -399,11 +404,12 @@ def audit_world(
     rows = a.rows
     count = wp.min(a.counts[world], a.capacity)
     dense = audit_store(
-        world, rows.first[world], count, rows.row_type, rows.row_parent, rows.row_mu, a.impulses, rows.rhs, velocity
+        world, rows.first[world], 0, count, rows.row_type, rows.row_parent, rows.row_mu, a.impulses, rows.rhs, velocity
     )
     free = audit_store(
         world,
         mf.first[world],
+        mf.base,
         a.mf_counts[world],
         mf.row_type,
         mf.row_parent,
@@ -557,14 +563,14 @@ class Audit:
                 a,
                 mf,
                 solver.factor.walk_view(),
-                solver.placement.body_rows.impulses,
-                solver.placement.body_rows.row_w,
+                solver.placement.impulses,
+                solver.placement.row_w,
                 v,
                 forest.articulation_world_dof_offset,
                 self.coordinates,
             ]
             wp.launch(free_rows, dim=worlds, inputs=inputs, outputs=[self.mf_velocity], device=device)
-        inputs = [a, mf, solver.placement.body_rows.impulses, self.velocity, self.mf_velocity, self.fused]
+        inputs = [a, mf, solver.placement.impulses, self.velocity, self.mf_velocity, self.fused]
         wp.launch(audit_world, dim=worlds, inputs=inputs, outputs=[self.readout], device=device)
 
     def read(self) -> dict:

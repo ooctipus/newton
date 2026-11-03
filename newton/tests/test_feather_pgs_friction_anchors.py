@@ -276,24 +276,16 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
             for c in range(n):
                 if slot[c] < 0 or path[c] < 0:
                     continue
-                if path[c] == 0:
-                    rt, ph, rb = (
-                        solver.placement.row_type.numpy()[0],
-                        solver.placement.phi.numpy()[0],
-                        solver.placement.row_beta.numpy()[0],
-                    )
-                    if rt[slot[c] + 1] != PGS_CONSTRAINT_TYPE_FRICTION:
-                        continue
-                    np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], fa[c], rtol=1.0e-6, atol=1.0e-9)
-                    np.testing.assert_allclose(rb[slot[c] + 1 : slot[c] + 3], beta)
-                else:
-                    body = solver.placement.body_rows
-                    ph, rt, rb = body.phi.numpy()[0], body.row_type.numpy()[0], body.row_beta.numpy()[0]
-                    if rt[slot[c] + 1] != PGS_CONSTRAINT_TYPE_FRICTION:
-                        continue
-                    # One row law: the free bodies' rows store the raw separation and the law's beta too.
-                    np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], fa[c], rtol=1.0e-6, atol=1.0e-9)
-                    np.testing.assert_allclose(rb[slot[c] + 1 : slot[c] + 3], beta)
+                # One row law and one store: either route's rows sit at the contact's slot of the world's line.
+                rt, ph, rb = (
+                    solver.placement.row_type.numpy()[0],
+                    solver.placement.phi.numpy()[0],
+                    solver.placement.row_beta.numpy()[0],
+                )
+                if rt[slot[c] + 1] != PGS_CONSTRAINT_TYPE_FRICTION:
+                    continue
+                np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], fa[c], rtol=1.0e-6, atol=1.0e-9)
+                np.testing.assert_allclose(rb[slot[c] + 1 : slot[c] + 3], beta)
                 checked[int(path[c])] += 1
             return checked
 

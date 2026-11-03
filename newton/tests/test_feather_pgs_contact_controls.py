@@ -649,7 +649,8 @@ class TestFeatherPGSContactControls(unittest.TestCase):
             with self.subTest(route=route):
                 allocated = _launch_contact_allocator(route=route, gap=0.002, gate=0.0)
                 self.assertEqual(allocated["path"], route)
-                self.assertEqual(allocated["slot"], 0)
+                # The slot is the contact's first row in the world's line: the free bodies' follow the dense capacity.
+                self.assertEqual(allocated["slot"], 0 if route == PATH_DENSE else 8)
                 self.assertEqual(allocated["world"], 0)
                 self.assertEqual(allocated["art_a"], 0)
                 self.assertEqual(allocated["art_b"], -1)

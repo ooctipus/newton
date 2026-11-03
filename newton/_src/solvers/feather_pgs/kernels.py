@@ -721,8 +721,8 @@ def _contact_linear_force(
     # outputs
     rigid_contact_force: wp.array[wp.vec3],
 ):
-    """Convert solved FeatherPGS contact impulses into world-frame forces: a free body's contact's rows (``path`` 1)
-    sit at ``body_base`` of its world's line."""
+    """Convert solved FeatherPGS contact impulses into world-frame forces: a contact's rows sit at its slot of its
+    world's line, a free body's contact's (``path`` 1) among the free bodies' rows from ``body_base``."""
     total_contacts = routes.count[0]
     if c >= total_contacts:
         return
@@ -739,36 +739,23 @@ def _contact_linear_force(
         # force on shape/body 0 from shape/body 1.
         normal = -routes.normal[c]
 
-        lam_n = 0.0
+        lam_n = world_impulses[line, slot]
         lam_t0 = 0.0
         lam_t1 = 0.0
-        if path == 0:
-            lam_n = world_impulses[line, slot]
-            count = world_constraint_count[world]
-            if (
-                enable_friction != 0
-                and slot + 2 < count
-                and world_row_type[line, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
-                and world_row_parent[line, slot + 1] == slot
-                and world_row_type[line, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
-                and world_row_parent[line, slot + 2] == slot
-            ):
-                lam_t0 = world_impulses[line, slot + 1]
-                lam_t1 = world_impulses[line, slot + 2]
-        elif path == 1:
-            row = body_base + slot
-            lam_n = world_impulses[line, row]
-            count = mf_constraint_count[world]
-            if (
-                enable_friction != 0
-                and slot + 2 < count
-                and world_row_type[line, row + 1] == PGS_CONSTRAINT_TYPE_FRICTION
-                and world_row_parent[line, row + 1] == slot
-                and world_row_type[line, row + 2] == PGS_CONSTRAINT_TYPE_FRICTION
-                and world_row_parent[line, row + 2] == slot
-            ):
-                lam_t0 = world_impulses[line, row + 1]
-                lam_t1 = world_impulses[line, row + 2]
+        # The end of the contact's class in the line.
+        end = world_constraint_count[world]
+        if path == 1:
+            end = body_base + mf_constraint_count[world]
+        if (
+            enable_friction != 0
+            and slot + 2 < end
+            and world_row_type[line, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+            and world_row_parent[line, slot + 1] == slot
+            and world_row_type[line, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
+            and world_row_parent[line, slot + 2] == slot
+        ):
+            lam_t0 = world_impulses[line, slot + 1]
+            lam_t1 = world_impulses[line, slot + 2]
 
         force = lam_n * normal
         if enable_friction != 0:
@@ -1160,7 +1147,8 @@ def allocate_world_contact_slots(
     A contact admitted by :func:`_admit_contact` reserves 1 slot for the normal row and, when enabled below the
     friction gap threshold (and, under persistent patches, for a loaded anchor), 2 adjacent slots for the friction
     rows, and with contact torsion (``data.torsion``) a third for its spin row. Contacts where both sides are free rigid bodies (or ground) take matrix-free rows, the others world-level
-    dense rows. A positive contact gap gate excludes wider speculative contacts before any route reserves slots;
+    dense rows. A contact's slot is its first row in its world's line, the free bodies' rows from the dense capacity
+    ``max_constraints``; the counters count each class's own rows. A positive contact gap gate excludes wider speculative contacts before any route reserves slots;
     zero disables the gate.
 
     A collision pass clamps :paramref:`contact_count` to the rows its writers
@@ -1255,6 +1243,9 @@ def allocate_world_contact_slots(
             data.slot[c] = -1
             data.path[c] = -1
             continue
+        if is_mf != 0:
+            # The free bodies' rows follow the dense class's in the world's line: one row index for both classes.
+            slot += max_constraints
         data.world[c] = world
         data.slot[c] = slot
         data.art0[c] = art_a
@@ -1415,6 +1406,7 @@ def place_world_contact_runs(
     dense_first_rejected_slot: wp.array[int],
     mf_slot_counter: wp.array[int],
     mf_first_rejected_slot: wp.array[int],
+    body_base: int,
     global_lead: int,
     global_trail_start: int,
     lanes: int,
@@ -1431,7 +1423,7 @@ def place_world_contact_runs(
 
     Launched over ``(world_count, lanes)``: one complete warp per world on CUDA (``lanes`` 32),
     one thread on CPU (``lanes`` 1). Each family's runs start at the slot where the allocator's
-    counter began, which the counter less the family's rows recovers; a family whose
+    counter began, which the counter less the family's rows recovers (the free bodies' from ``body_base``); a family whose
     reservations overflowed (a first rejected slot below its counter) keeps the allocator's
     slots, all of which lie below that slot.
     """
@@ -1443,7 +1435,7 @@ def place_world_contact_runs(
     place_dense = total[0] > 0 and dense_first_rejected_slot[world] >= dense_slot_counter[world]
     place_mf = total[1] > 0 and mf_first_rejected_slot[world] >= mf_slot_counter[world]
     next_dense = dense_slot_counter[world] - total[0]
-    next_mf = mf_slot_counter[world] - total[1]
+    next_mf = body_base + mf_slot_counter[world] - total[1]
     for block in range(blocks):
         last = run_last[world, block]
         if not (place_dense or place_mf):
@@ -2131,7 +2123,7 @@ def gather_mf_warmstart(
 
     Runs after ``allocate_world_contact_slots`` + ``walk_rows.write_free_body_rows`` (so
     ``contact_slot`` and the rows' types are populated for this step) and after
-    the warm-start branch has zeroed their impulses (the row store's free-body region). One thread per contact;
+    the warm-start branch has zeroed their impulses (the row store's free bodies' rows). One thread per contact;
     each writes only its own disjoint slot range, so unmatched / cold contacts
     keep the zero left by the memset and no stale slot survives.
 
@@ -2155,7 +2147,9 @@ def gather_mf_warmstart(
         return
 
     world = routes.world[c]
-    count = mf_constraint_count[world]
+    # The free bodies' rows in the world's line: from ``mf.base``, the slots' and parents' row index.
+    count = mf.base + mf_constraint_count[world]
+    capacity = mf.base + mf_max_c
     if new_slot >= count:
         return
     mf_line = mf.first[world]
@@ -2170,7 +2164,7 @@ def gather_mf_warmstart(
     if (
         matched
         and prev_slot >= 0
-        and prev_slot < mf_max_c
+        and prev_slot < capacity
         and mf.row_type[mf_line, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT
         and prev_mf_row_type[mf_line, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT
     ):
@@ -2181,7 +2175,7 @@ def gather_mf_warmstart(
     # they belong to this contact's block (parent == base slot).
     for r in range(1, 3):
         new_r = new_slot + r
-        if new_r < count and new_r < mf_max_c:
+        if new_r < count and new_r < capacity:
             if (
                 mf.row_type[mf_line, new_r] == PGS_CONSTRAINT_TYPE_FRICTION
                 and mf.row_parent[mf_line, new_r] == new_slot
@@ -2190,7 +2184,7 @@ def gather_mf_warmstart(
                 if (
                     matched
                     and prev_slot >= 0
-                    and prev_r < mf_max_c
+                    and prev_r < capacity
                     and prev_mf_row_type[mf_line, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
                     and prev_mf_row_parent[mf_line, prev_r] == prev_slot
                 ):
@@ -2203,8 +2197,8 @@ def gather_mf_warmstart(
         matched
         and prev_slot >= 0
         and new_r < count
-        and new_r < mf_max_c
-        and prev_r < mf_max_c
+        and new_r < capacity
+        and prev_r < capacity
         and mf.row_type[mf_line, new_r] == PGS_CONSTRAINT_TYPE_TORSION
         and mf.row_parent[mf_line, new_r] == new_slot
         and prev_mf_row_type[mf_line, prev_r] == PGS_CONSTRAINT_TYPE_TORSION
@@ -2212,7 +2206,7 @@ def gather_mf_warmstart(
     ):
         mf_impulses[mf_line, new_r] = decay * dt_scale * prev_mf_impulses[mf_line, prev_r]
 
-    if mi >= 0 and prev_slot >= 0 and prev_slot < mf_max_c:
+    if mi >= 0 and prev_slot >= 0 and prev_slot < capacity:
         _transport_warmstart_contact(
             routes.normal[c],
             previous_normal[mi],
@@ -2468,15 +2462,16 @@ def populate_rigid_velocity_limit_rows(
             mf.Z_b[mf_line, slot, k] = 0.0
         mf.Z_a[mf_line, slot, 3 * speed_axis] = 1.0
 
-        mf.sides[mf_line, slot] = wp.vec2i(art, -1)
-        mf.row_type[mf_line, slot] = PGS_CONSTRAINT_TYPE_SPEED
-        mf.row_parent[mf_line, slot] = -1
-        mf.row_mu[mf_line, slot] = 0.0
+        row = mf.base + slot
+        mf.sides[mf_line, row] = wp.vec2i(art, -1)
+        mf.row_type[mf_line, row] = PGS_CONSTRAINT_TYPE_SPEED
+        mf.row_parent[mf_line, row] = -1
+        mf.row_mu[mf_line, row] = 0.0
         # The speed law's bias is its limit: the row's target is ``-limit``, as a joint velocity limit's, and its rhs
         # ``-target`` (:func:`.row_laws.row_rhs`); it has no gap.
-        mf.row_beta[mf_line, slot] = 0.0
-        mf.phi[mf_line, slot] = 0.0
-        mf.target[mf_line, slot] = -limit
+        mf.row_beta[mf_line, row] = 0.0
+        mf.phi[mf_line, row] = 0.0
+        mf.target[mf_line, row] = -limit
 
 
 @wp.kernel
@@ -2536,14 +2531,14 @@ def classify_local_solve_worlds(
     local_mf = mf_count > 0 and mf_count <= owners.residual_mf_max_rows and residual_pair_articulation >= 0
     mf_row = int(0)
     while mf_row < mf_count and local_mf:
-        sides = mf.sides[mf_line, mf_row]
+        sides = mf.sides[mf_line, mf.base + mf_row]
         if sides[0] >= 0 and sides[0] != residual_pair_articulation:
             local_mf = False
         if sides[1] >= 0 and sides[1] != residual_pair_articulation:
             local_mf = False
         # The residual local loop does not implement the speed law (projection_laws.speed_row): keep worlds with speed
         # rows on the general owner.
-        if mf.row_type[mf_line, mf_row] == PGS_CONSTRAINT_TYPE_SPEED:
+        if mf.row_type[mf_line, mf.base + mf_row] == PGS_CONSTRAINT_TYPE_SPEED:
             local_mf = False
         mf_row += 1
 

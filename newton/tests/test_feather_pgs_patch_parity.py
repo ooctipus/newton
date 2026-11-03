@@ -4,7 +4,6 @@
 """Check the slot-order and carrier independent patch-friction comparisons on CPU."""
 
 import contextlib
-import operator
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -86,19 +85,11 @@ def _ring_pool_dropped(solver):
         yield
 
 
-_MF_ROWS = (
-    "body_rows.row_type",
-    "body_rows.row_parent",
-    "body_rows.row_mu",
-    "body_rows.rhs",
-    "body_rows.impulses",
-    "body_rows.phi",
-    "body_rows.row_sides",
-    "mf_Z_a",
-    "mf_Z_b",
-)
-"""The free-body rows' arrays a slot permutation moves: their records (the row store's free-body region) and their
-placement."""
+_MF_RECORDS = ("row_type", "row_parent", "row_mu", "rhs", "impulses", "phi", "row_sides")
+"""The free-body rows' records a slot permutation moves: the row store's, by the line's row (the slots' and parents'
+index)."""
+_MF_Z = ("mf_Z_a", "mf_Z_b")
+"""The free-body rows' placement a slot permutation moves, by the free bodies' own row."""
 
 
 def _permuted_slots(solver, contacts, shift):
@@ -106,34 +97,35 @@ def _permuted_slots(solver, contacts, shift):
     count = int(contacts.rigid_contact_count.numpy()[0])
     slot, path = solver.placement.contact_slot.numpy().copy(), solver.placement.contact_path.numpy()
     world, needed = solver.placement.contact_world.numpy(), solver.placement.contact_slots_needed.numpy()
+    base = solver.placement.body_base
     routed = [c for c in range(count) if path[c] == 1 and slot[c] >= 0 and needed[c] > 0]
-    rows = {name: operator.attrgetter(name)(solver.placement).numpy() for name in _MF_ROWS}
+    rows = {name: getattr(solver.placement, name).numpy() for name in (*_MF_RECORDS, *_MF_Z)}
     permuted = {name: values.copy() for name, values in rows.items()}
     moved = {}
     for w in np.unique(world[routed]):
         blocks = [c for c in routed if world[c] == w]
         # This fixture's matrix-free rows are contacts only, so the blocks tile the world's rows.
         assert sorted(int(slot[c]) + k for c in blocks for k in range(int(needed[c]))) == list(
-            range(int(solver.placement.mf_constraint_count.numpy()[w]))
+            range(base, base + int(solver.placement.mf_constraint_count.numpy()[w]))
         )
-        start = 0
+        start = base
         for c in blocks[shift:] + blocks[:shift]:
             for k in range(int(needed[c])):
                 moved[(w, int(slot[c]) + k)] = start + k
             slot[c] = start
             start += int(needed[c])
     for (w, old), new in moved.items():
-        for name in _MF_ROWS:
+        for name in _MF_RECORDS:
             permuted[name][w, new] = rows[name][w, old]
-        parent = int(rows["body_rows.row_parent"][w, old])
-        permuted["body_rows.row_parent"][w, new] = moved.get((w, parent), parent)
+        for name in _MF_Z:
+            permuted[name][w, new - base] = rows[name][w, old - base]
+        parent = int(rows["row_parent"][w, old])
+        permuted["row_parent"][w, new] = moved.get((w, parent), parent)
     arrays = {name: wp.array(values, device="cpu") for name, values in permuted.items()}
     stand_in = SimpleNamespace(
         placement=SimpleNamespace(
-            **{name: value for name, value in arrays.items() if "." not in name},
-            body_rows=SimpleNamespace(
-                **{name.split(".")[1]: value for name, value in arrays.items() if name.startswith("body_rows.")}
-            ),
+            **arrays,
+            body_base=base,
             mf_constraint_count=solver.placement.mf_constraint_count,
             contact_slot=wp.array(slot, device="cpu"),
             contact_path=solver.placement.contact_path,

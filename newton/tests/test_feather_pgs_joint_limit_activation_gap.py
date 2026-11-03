@@ -143,7 +143,7 @@ def _assert_dense_phase_layout(
 def _assert_mf_phase_layout(test_case: unittest.TestCase, solver: SolverFeatherPGS):
     """Assert MF contacts precede the populated rigid velocity-limit tail."""
     mf_count = int(solver.placement.mf_constraint_count.numpy()[0])
-    mf_types = solver.placement.body_rows.row_type.numpy()[0, :mf_count]
+    mf_types = solver.placement.row_type.numpy()[:, solver.placement.body_base :][0, :mf_count]
     mf_contact_end = int(solver.placement.mf_contact_rows_end.numpy()[0])
     contact_rows = np.flatnonzero(mf_types == PGS_CONSTRAINT_TYPE_CONTACT)
     friction_rows = np.flatnonzero(mf_types == PGS_CONSTRAINT_TYPE_FRICTION)

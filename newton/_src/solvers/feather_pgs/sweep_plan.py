@@ -1924,13 +1924,12 @@ class Sweep:
                 self.placement.dense_first,
             )
         if self.forest.has_free_rigid_bodies:
-            # The free bodies' rows: the row store's region from its body base, where their slots and parents count.
-            body = self.placement.body_region
+            # The free bodies' rows: the row store's, where their slots and parents count too.
             yield (
                 1,
-                body(self.placement.row_parent),
-                body(self.placement.row_mu),
-                body(self.placement.impulses),
+                self.placement.row_parent,
+                self.placement.row_mu,
+                self.placement.impulses,
                 self.options.pgs_warmstart_decay if self.options.pgs_warmstart else 0.0,
                 self.placement.dense_first,
             )

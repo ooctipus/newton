@@ -31,19 +31,10 @@ from newton.tests.feather_pgs_free_body_rows import free_body_jacobians
 from newton.tests.feather_pgs_law_harness import unpacked_rows
 
 # Per route: constraint count, row type, parent, mu, right-hand side, impulse, phi and
-# target arrays. Route 1 (matrix-free rows, the row store's free-body region) folds its target into the right-hand side.
+# target arrays. Route 1 (matrix-free rows, the row store's free bodies' rows) folds its target into the right-hand side.
 _ROUTE_ARRAYS = {
     0: ("constraint_count", "row_type", "row_parent", "row_mu", "rhs", "impulses", "phi", "target_velocity"),
-    1: (
-        "mf_constraint_count",
-        "body_rows.row_type",
-        "body_rows.row_parent",
-        "body_rows.row_mu",
-        "body_rows.rhs",
-        "body_rows.impulses",
-        "body_rows.phi",
-        None,
-    ),
+    1: ("mf_constraint_count", "row_type", "row_parent", "row_mu", "rhs", "impulses", "phi", None),
 }
 
 
@@ -63,12 +54,20 @@ def point_row_law(device, count):
 
 
 def route_arrays(solver, route=0):
-    """Return a route's row arrays as host copies, keyed by role."""
+    """Return a route's row arrays as host copies, keyed by role, by the route's own row (the free bodies' from the
+    store's body base, their parents too); ``offset`` is the route's first row in the world's line."""
     names = ("count", "type", "parent", "mu", "rhs", "impulse", "phi", "target")
-    return {
+    offset = solver.placement.body_base if route == 1 else 0
+    arrays = {
         role: None if attribute is None else operator.attrgetter(attribute)(solver.placement).numpy()
         for role, attribute in zip(names, _ROUTE_ARRAYS[route], strict=True)
     }
+    for role in names[1:]:
+        if arrays[role] is not None:
+            arrays[role] = arrays[role][:, offset:]
+    arrays["parent"] = np.where(arrays["parent"] >= 0, arrays["parent"] - offset, arrays["parent"])
+    arrays["offset"] = offset
+    return arrays
 
 
 def _jacobian(solver, route, world, count):
@@ -109,6 +108,8 @@ def contact_rows(solver, contacts, route=0, *, incident=False, jacobian=False, e
     patches = solver.laws.friction_patches
     view = patches.view if patches is not None and patches.view.weight.shape[0] else None
     routed = [c for c in range(count) if path[c] == route and slot[c] >= 0 and needed[c] > 0]
+    # The route's own rows: a slot less the route's first row in the line.
+    slot = slot - arrays["offset"]
     owner = {}
     for c in routed:
         for row in range(int(slot[c]), int(slot[c]) + int(needed[c])):

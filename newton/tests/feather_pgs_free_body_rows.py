@@ -28,8 +28,8 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
     """
     Z_a = solver.placement.mf_Z_a.numpy() if Z_a is None else np.asarray(Z_a)
     Z_b = solver.placement.mf_Z_b.numpy() if Z_b is None else np.asarray(Z_b)
-    sides = solver.placement.body_rows.row_sides.numpy()
-    row_type = solver.placement.body_rows.row_type.numpy()
+    sides = solver.placement.row_sides.numpy()[:, solver.placement.body_base :]
+    row_type = solver.placement.row_type.numpy()[:, solver.placement.body_base :]
     records = solver.factor.walk_view().data.numpy()
     data = unpack_walk_records(records, records.shape[0]).astype(np.float64)
     starts = solver.forest.articulation_dof_start.numpy()

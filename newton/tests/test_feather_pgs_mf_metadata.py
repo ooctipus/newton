@@ -432,7 +432,7 @@ class TestFeatherPGSMFMetadataPackCUDA(unittest.TestCase):
         # The legacy arm proves the call site ran on every step.
         self.assertEqual(len(legacy_packs), steps)
         for actual in legacy_packs:
-            self.assertIs(actual, legacy.placement.body_rows.rhs)
+            self.assertIs(actual, legacy.placement.rhs)
         self.assertTrue(np.all(skipped["contact_count"] > 0))
         self.assertTrue(np.any(skipped["impulse_peak"] > 0.0))
         np.testing.assert_array_equal(skipped["mf_constraint_count"], 0)

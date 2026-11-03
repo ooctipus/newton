@@ -143,7 +143,8 @@ DENSE_ROWS = FieldGroup(
     Field("row_sides", wp.vec2i, ("world", "row"), owner="placement"),
 )
 """The row store: every world line's rows, the dense class's (``[0, dense_max_constraints)``) then the free bodies'
-(from ``body_base``): the system and the row records (with each dense row's sides). ``row_incident`` is each row's
+(from ``body_base``): the system and the row records (with each row's sides). One row index for both classes: a
+contact's slot and its rows' parents count in the line. ``row_incident`` is each row's
 incident velocity ``J v_hat``, written where its walk sums it: the one writer (:mod:`.walk_rows`), the free bodies'
 writer (:func:`.walk_rows.write_free_body_rows`)."""
 

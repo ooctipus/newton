@@ -1128,11 +1128,7 @@ class TestPatchSolverRoutes(unittest.TestCase):
                 self.assertGreater(solver.laws.friction_anchor_beta, 0.0)
                 arrays = (
                     (solver.placement.row_parent, solver.placement.row_mu, solver.placement.impulses),
-                    (
-                        solver.placement.body_rows.row_parent,
-                        solver.placement.body_rows.row_mu,
-                        solver.placement.body_rows.impulses,
-                    ),
+                    (solver.placement.row_parent, solver.placement.row_mu, solver.placement.impulses),
                 )
                 pipeline = newton.CollisionPipeline(model, contact_matching="latest")
                 contacts = pipeline.contacts()

@@ -1222,8 +1222,9 @@ class SolverFeatherPGS(SolverBase):
                     self.placement.mf_meta_packed,
                     self.placement.mf_Z_a,
                     self.placement.mf_Z_b,
-                    self.placement.body_rows.row_mu,
-                    self.placement.body_rows.row_w,
+                    self.placement.row_mu,
+                    self.placement.row_w,
+                    self.placement.body_base,
                     int(self.laws.set.weighted),
                 )
 

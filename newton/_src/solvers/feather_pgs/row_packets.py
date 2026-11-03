@@ -119,8 +119,9 @@ QUEUE = (
     Field("residual_secondary", wp.int32, ("articulation",), owner="sweep", attr="local_residual_pair_articulation"),
     Field("mf_count", wp.int32, ("world",), attr="mf_constraint_count", owner="placement"),
     Field("mf_first", wp.int32, ("world",), attr="dense_first", owner="placement"),
-    Field("mf_sides", wp.vec2i, ("world", "mf_row"), attr="row_sides", owner="body"),
-    Field("mf_row_type", wp.int32, ("world", "mf_row"), attr="row_type", owner="body"),
+    Field("mf_sides", wp.vec2i, ("world", "row"), attr="row_sides", owner="placement"),
+    Field("mf_row_type", wp.int32, ("world", "row"), attr="row_type", owner="placement"),
+    Field("mf_base", wp.int32, attr="body_base", owner="placement"),
     Field("count", wp.int32, ("world",), attr="constraint_count", owner="placement"),
     Field("owner", wp.int32, ("world",), attr="local_solve_owner", owner="placement"),
     Field("status", wp.int32, (2,), attr="constraint_capacity_status", owner="placement"),
@@ -282,12 +283,12 @@ def finalize_and_queue(
     local_mf = mf_count > 0 and mf_count <= residual_mf_rows and residual_secondary >= 0
     mf_row = int(0)
     while mf_row < mf_count and local_mf:
-        sides = queue.mf_sides[mf_line, mf_row]
+        sides = queue.mf_sides[mf_line, queue.mf_base + mf_row]
         if sides[0] >= 0 and sides[0] != residual_secondary:
             local_mf = False
         if sides[1] >= 0 and sides[1] != residual_secondary:
             local_mf = False
-        if queue.mf_row_type[mf_line, mf_row] == PGS_CONSTRAINT_TYPE_SPEED:
+        if queue.mf_row_type[mf_line, queue.mf_base + mf_row] == PGS_CONSTRAINT_TYPE_SPEED:
             local_mf = False
         mf_row += 1
     owner = int(0)
@@ -513,7 +514,6 @@ class LocalRowPackets:
             QueueData,
             sweep=solver.sweep,
             placement=solver.placement,
-            body=solver.placement.body_rows,
             forest=solver.forest,
             size=size,
             status=None,

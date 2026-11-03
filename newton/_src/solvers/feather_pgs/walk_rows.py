@@ -134,6 +134,8 @@ def write_free_body_rows(
         if data.path[c] != 1 or slot < 0:
             continue
         mf_line = mf.first[data.world[c]]
+        # The contact's rows' ``Z``, by the free bodies' own row (its slot counts in the line).
+        z_row = slot - mf.base
         art_a = data.art0[c]
         art_b = data.art1[c]
         body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
@@ -144,10 +146,10 @@ def write_free_body_rows(
             incident = float(0.0)
             if response_a >= 0:
                 wrench = body_wrench(walk, response_a, direction, row_point, spin)
-                incident += walk_body(walk, art_a, response_a, wrench, v_hat, 0, mf.Z_a, mf_line, slot + row, 0)[0]
+                incident += walk_body(walk, art_a, response_a, wrench, v_hat, 0, mf.Z_a, mf_line, z_row + row, 0)[0]
             if response_b >= 0:
                 wrench = body_wrench(walk, response_b, -direction, row_point, spin)
-                incident += walk_body(walk, art_b, response_b, wrench, v_hat, 0, mf.Z_b, mf_line, slot + row, 0)[0]
+                incident += walk_body(walk, art_b, response_b, wrench, v_hat, 0, mf.Z_b, mf_line, z_row + row, 0)[0]
             mf.incident[mf_line, slot + row] = incident
             free_body_contact_records(
                 mf,
@@ -189,7 +191,7 @@ def free_body_headers_kernel(
 ):
     """The walked free-body rows' build, one thread per row slot: each row's incident velocity, which its walks summed
     (:func:`write_free_body_rows`), its diagonal ``A_ii = cfm + |Z_a|^2 + |Z_b|^2`` and its rhs by the rows' law
-    (:func:`.kernels.row_bias`, on ``rows``: the row store's free-body region). A speed row keeps its axis ``e_k``
+    (:func:`.kernels.row_bias`, on ``rows``: the row store's records). A speed row keeps its axis ``e_k``
     unwhitened (its law reads the body's velocity, :meth:`.response_operator.FreeBodyZ.speed`): its diagonal takes the
     walk of the covector ``e_k``, ``|L^-1 P e_k|^2``, and its incident is zero. A side is its responding body's
     articulation, a one-node tree."""
@@ -199,10 +201,12 @@ def free_body_headers_kernel(
     if i >= mf_constraint_count[world]:
         return
     line = mf.first[world]
-    sides = mf.sides[line, i]
+    # Row ``i`` of the free bodies: its ``Z`` there, its records at ``mf.base + i`` of the world's line.
+    row = mf.base + i
+    sides = mf.sides[line, row]
     diagonal = pgs_cfm
     incident = float(0.0)
-    if mf.row_type[line, i] == PGS_CONSTRAINT_TYPE_SPEED:
+    if mf.row_type[line, row] == PGS_CONSTRAINT_TYPE_SPEED:
         if sides[0] >= 0:
             art = sides[0]
             j0 = walk.joint_start[art]
@@ -229,7 +233,7 @@ def free_body_headers_kernel(
             )
             diagonal += seed[1]
     else:
-        incident = mf.incident[line, i]
+        incident = mf.incident[line, row]
         if sides[0] >= 0:
             squares = float(0.0)
             for k in range(6):
@@ -240,12 +244,12 @@ def free_body_headers_kernel(
             for k in range(6):
                 squares += mf.Z_b[line, i, k] * mf.Z_b[line, i, k]
             diagonal += squares
-    mf.incident[line, i] = incident
-    mf.diag[line, i] = diagonal
+    mf.incident[line, row] = incident
+    mf.diag[line, row] = diagonal
     row_bias(
         rows,
         line,
-        i,
+        row,
         incident,
         dt,
         contact_speculative_scale,

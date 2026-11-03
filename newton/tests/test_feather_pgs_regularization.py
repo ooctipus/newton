@@ -298,7 +298,6 @@ def test_zero_regularization_shares_one_weight_slot(test: unittest.TestCase, dev
         solver = newton.solvers.SolverFeatherPGS(model)
         test.assertFalse(solver.laws.regularization_enabled)
         test.assertIs(solver.placement.row_w, solver.placement.contact_row_w_dummy)
-        test.assertIs(solver.placement.body_rows.row_w, solver.placement.contact_row_w_dummy)
         test.assertEqual(solver.placement.row_w.shape, (1, 1))
 
 
@@ -309,8 +308,8 @@ def test_zero_regularization_split_runtime_uses_no_weights(test: unittest.TestCa
         body_q, _zs = _run(model, pipeline, solver, 1)
         test.assertGreater(int(solver.placement.mf_constraint_count.numpy().sum()), 1)
         test.assertTrue(np.isfinite(body_q).all())
-        test.assertIs(solver.placement.body_rows.row_w, solver.placement.contact_row_w_dummy)
-        test.assertEqual(float(solver.placement.body_rows.row_w.numpy()[0, 0]), 1.0)
+        test.assertIs(solver.placement.row_w, solver.placement.contact_row_w_dummy)
+        test.assertEqual(float(solver.placement.row_w.numpy()[0, 0]), 1.0)
 
 
 def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):

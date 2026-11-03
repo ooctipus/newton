@@ -58,7 +58,8 @@ def free_body_meta_kernel(mf_max_constraints: int, pitch: int, base: int, device
     word holds the rows' sides' first world coordinates (``world_dof_offset`` of their articulations), the inverse of
     their stored diagonal ``A_ii`` (the step's form of the law, cached in the header), right-hand side (the law's plus
     the row's incident velocity: its residual at ``du = 0``), type and parent. The records are the row store's
-    (``pitch`` rows a line, the free bodies' from ``base``). ``device_arch`` keys the variant.
+    (``pitch`` rows a line, the free bodies' from ``base``), whose parents count in the line; the word's count from the
+    free bodies' first row, as the sweeps stage their impulses. ``device_arch`` keys the variant.
     """
     _validate_mf_metadata_encoding(mf_max_constraints)
     word = FreeBodyZ().pack("packed", "da", "db", "inverse", "rhs_val", "rt", "par", "        ")
@@ -78,6 +79,7 @@ def free_body_meta_kernel(mf_max_constraints: int, pitch: int, base: int, device
         float rhs_val = rhs.data[off_body + i] + row_incident.data[off_body + i];
         int rt = row_type.data[off_body + i];
         int par = row_parent.data[off_body + i];
+        if (par >= 0) par -= {base};
 
 {word}
         *reinterpret_cast<int4*>(&mf_meta.data[off_meta + i * 4]) = packed;

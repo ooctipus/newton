@@ -1044,10 +1044,13 @@ def walked_rows(lower, jacobian) -> np.ndarray:
 def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
     """:func:`incident_gaps` of the free-body rows: each row's ``|mf_row_incident - Z^T u_hat|`` over its two bodies'
     six coordinates, ``u_hat`` the walk's enter of ``v_hat`` (:func:`_walked_coordinates`), and its terms' magnitude."""
-    incident = solver.placement.body_rows.row_incident.numpy().astype(np.float64)
+    incident = solver.placement.row_incident.numpy()[:, solver.placement.body_base :].astype(np.float64)
     Z_a, Z_b = solver.placement.mf_Z_a.numpy().astype(np.float64), solver.placement.mf_Z_b.numpy().astype(np.float64)
     # Each row's sides: its responding bodies' articulations (one-node trees), -1 for none.
-    sides, kinds = solver.placement.body_rows.row_sides.numpy(), solver.placement.body_rows.row_type.numpy()
+    sides, kinds = (
+        solver.placement.row_sides.numpy()[:, solver.placement.body_base :],
+        solver.placement.row_type.numpy()[:, solver.placement.body_base :],
+    )
     walked, offsets = _walked_coordinates(solver), solver.forest.articulation_world_dof_offset.numpy()
     gaps, terms = np.zeros(incident.shape), np.zeros(incident.shape)
     for world, count in enumerate(solver.placement.mf_constraint_count.numpy()):

@@ -44,8 +44,8 @@ def _stack(device, restitution=0.0, drop=False):
 
 
 def _normal_impulse_total(solver):
-    imp = solver.placement.body_rows.impulses.numpy()[0]
-    rt = solver.placement.body_rows.row_type.numpy()[0]
+    imp = solver.placement.impulses.numpy()[:, solver.placement.body_base :][0]
+    rt = solver.placement.row_type.numpy()[:, solver.placement.body_base :][0]
     return float(imp[rt == PGS_CONSTRAINT_TYPE_CONTACT].sum())
 
 

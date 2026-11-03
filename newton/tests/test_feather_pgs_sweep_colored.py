@@ -206,6 +206,7 @@ class TestStageSlots(unittest.TestCase):
                 wp.array(rng.standard_normal((self.WORLDS, self.ROWS, 6)), dtype=float, device=device),
                 wp.array(mu, dtype=float, device=device),
                 weights,
+                0,
                 regularize,
                 layout.rows,
             ],

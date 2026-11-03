@@ -689,9 +689,9 @@ class TestQ11Stack(unittest.TestCase):
         )
         mass = float(model.body_mass.numpy()[0])
         counts = int(solver.placement.mf_constraint_count.numpy()[0])
-        lam = solver.placement.body_rows.impulses.numpy()[0, :counts]
-        kinds = solver.placement.body_rows.row_type.numpy()[0, :counts]
-        sides = solver.placement.body_rows.row_sides.numpy()[0, :counts]
+        lam = solver.placement.impulses.numpy()[:, solver.placement.body_base :][0, :counts]
+        kinds = solver.placement.row_type.numpy()[:, solver.placement.body_base :][0, :counts]
+        sides = solver.placement.row_sides.numpy()[:, solver.placement.body_base :][0, :counts]
         ground = (kinds == 0) & ((sides[:, 0] < 0) | (sides[:, 1] < 0))
         return float(np.sum(lam[ground])) / (H * mass * G0 * count), float(state.body_q.numpy()[-1, 2]) - (
             half + 2.0 * half * (count - 1)
@@ -851,8 +851,8 @@ class TestQ13Indeterminate(unittest.TestCase):
         v = state.body_qd.numpy()[0]
         self.assertLess(float(np.abs(v).max()), 1.0e-3)
         count = int(solver.placement.mf_constraint_count.numpy()[0])
-        normal = solver.placement.body_rows.row_type.numpy()[0, :count] == 0
-        load = float(np.sum(solver.placement.body_rows.impulses.numpy()[0, :count][normal]))
+        normal = solver.placement.row_type.numpy()[:, solver.placement.body_base :][0, :count] == 0
+        load = float(np.sum(solver.placement.impulses.numpy()[:, solver.placement.body_base :][0, :count][normal]))
         weight = float(model.body_mass.numpy()[0]) * G0 * H
         self.assertAlmostEqual(load, weight, delta=1.0e-3 * weight)
 
@@ -1313,21 +1313,19 @@ class Manufactured:
     def held_offsets(self, solver):
         """Each loaded contact's held ``b`` less the stated one [m/s], and each unit's held tangent ``b`` (stated 0: a
         new anchor carries no displacement); 0 where a world's rows stay inside its sweep."""
-        stores = (
-            solver.placement.rhs.numpy().astype(np.float64),
-            solver.placement.body_rows.rhs.numpy().astype(np.float64),
-        )
+        # Both classes' rows in the one store, a contact's slot its first row in the world's line.
+        store = solver.placement.rhs.numpy().astype(np.float64)
         held = self._held(solver)
         offsets = np.zeros(self.count)
         for c in np.flatnonzero(self.status != self.SEPARATED):
             if held[c] is not None:
-                path, world, slot = held[c]
-                offsets[c] = stores[path][world, slot] + float(self.normal[c] @ self.relative[c] @ self.v_star)
+                _path, world, slot = held[c]
+                offsets[c] = store[world, slot] + float(self.normal[c] @ self.relative[c] @ self.v_star)
         tangent = 0.0
         for unit in self.units:
             if held[unit.carrier] is not None:
-                path, world, slot = held[unit.carrier]
-                tangent = max(tangent, float(np.abs(stores[path][world, slot + 1 : slot + 3]).max()))
+                _path, world, slot = held[unit.carrier]
+                tangent = max(tangent, float(np.abs(store[world, slot + 1 : slot + 3]).max()))
         return offsets, tangent
 
     def pattern(self):
@@ -1402,12 +1400,13 @@ class Manufactured:
         impulses, through the stated rows, move the contact points from where the step's ``v+`` put them. Never
         ``lambda`` against ``lambda*``: a pattern that leaves it open admits any split."""
         rows = solver.placement
-        stores = rows.impulses.numpy().astype(np.float64), rows.body_rows.impulses.numpy().astype(np.float64)
+        # Both classes' rows in the one store, a contact's slot its first row in the world's line.
+        store = rows.impulses.numpy().astype(np.float64)
         held = self._held(solver)
         if any(h is None for h in held):
             return None
         velocity = solver.v_out.numpy().astype(np.float64)
-        load = np.array([stores[h[0]][h[1], h[2]] for h in held])
+        load = np.array([store[h[1], h[2]] for h in held])
         impulse = np.zeros(self.dofs)
         normal = 0.0
         for c in range(self.count):
@@ -1419,8 +1418,8 @@ class Manufactured:
             impulse += load[c] * row
         friction = 0.0
         for k, (unit, unit_rows) in enumerate(zip(self.units, self.rows, strict=True)):
-            path, world, slot = held[unit.carrier]
-            force = stores[path][world, slot + 1 : slot + 1 + len(unit_rows)]
+            _path, world, slot = held[unit.carrier]
+            force = store[world, slot + 1 : slot + 1 + len(unit_rows)]
             impulse += unit_rows.T @ force
             scale = self._scale(k)
             capacity = unit.share * load[list(unit.members)].sum()

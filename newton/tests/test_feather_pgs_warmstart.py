@@ -336,7 +336,7 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 1)
         solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
         old_slot = int(solver.placement.ws_prev_slot_sorted.numpy()[0])
-        old_impulse = float(solver.placement.body_region(solver.placement.ws_prev_dense_impulses).numpy()[0, old_slot])
+        old_impulse = float(solver.placement.ws_prev_dense_impulses.numpy()[0, old_slot])
         self.assertGreater(old_impulse, 0.0)
 
         # Bring the lower shape-id sphere into contact. Sorting inserts it
@@ -368,7 +368,7 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         b_slot = int(slots[b_contact])
         a_slot = int(slots[a_contact])
         self.assertNotEqual(b_slot, old_slot, "test did not produce actual solver-slot churn")
-        impulses = solver.placement.body_rows.impulses.numpy()[0]
+        impulses = solver.placement.impulses.numpy()[0]
         self.assertAlmostEqual(float(impulses[b_slot]), old_impulse, delta=1.0e-6)
         self.assertEqual(float(impulses[a_slot]), 0.0)
 

@@ -94,16 +94,13 @@ def _store_sums(solver):
     """``(sum lambda r, sum lambda b)`` over both stores, ``r`` read back from the audit's velocity terms."""
     audit = solver._audit
     total, biased = 0.0, 0.0
-    for impulses, velocity, rhs, counts in (
-        (solver.placement.impulses, audit.velocity, solver.placement.rhs, solver.placement.constraint_count),
-        (
-            solver.placement.body_rows.impulses,
-            audit.mf_velocity,
-            solver.placement.body_rows.rhs,
-            solver.placement.mf_constraint_count,
-        ),
+    # Each class's rows from its first row in the world's line.
+    impulses, rhs = solver.placement.impulses.numpy(), solver.placement.rhs.numpy()
+    for base, velocity, counts in (
+        (0, audit.velocity, solver.placement.constraint_count),
+        (solver.placement.body_base, audit.mf_velocity, solver.placement.mf_constraint_count),
     ):
-        lam, jv, b = impulses.numpy(), velocity.numpy(), rhs.numpy()
+        lam, jv, b = impulses[:, base:], velocity.numpy(), rhs[:, base:]
         for world, count in enumerate(counts.numpy()):
             total += float(np.sum(lam[world, :count].astype(np.float64) * (jv[world, :count] + b[world, :count])))
             biased += float(np.sum(lam[world, :count].astype(np.float64) * b[world, :count]))
@@ -223,8 +220,8 @@ class TestAudit(unittest.TestCase):
         count = int(solver.placement.mf_constraint_count.numpy()[0])
         load = float(
             np.sum(
-                solver.placement.body_rows.impulses.numpy()[0, :count][
-                    solver.placement.body_rows.row_type.numpy()[0, :count] == 0
+                solver.placement.impulses.numpy()[:, solver.placement.body_base :][0, :count][
+                    solver.placement.row_type.numpy()[:, solver.placement.body_base :][0, :count] == 0
                 ]
             )
         )
@@ -282,9 +279,9 @@ class TestAudit(unittest.TestCase):
         )
         audit = solver.read_audit()
         count = int(solver.placement.mf_constraint_count.numpy()[0])
-        lam = solver.placement.body_rows.impulses.numpy()[0, :count]
-        normal = solver.placement.body_rows.row_type.numpy()[0, :count] == 0
-        diagonal = solver.placement.body_rows.diag.numpy()[0, :count]
+        lam = solver.placement.impulses.numpy()[:, solver.placement.body_base :][0, :count]
+        normal = solver.placement.row_type.numpy()[:, solver.placement.body_base :][0, :count] == 0
+        diagonal = solver.placement.diag.numpy()[:, solver.placement.body_base :][0, :count]
         compliance = np.sum(0.1 * diagonal[normal] * lam[normal] ** 2)
         self.assertGreater(compliance, 1.0e-6)
         self.assertLess(abs(float(audit["gap"][0])), 0.02 * compliance)

@@ -23,8 +23,6 @@ the local owners' per-world claim. The row pass and the sweeps read its fields.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import numpy as np
 import warp as wp
 
@@ -106,25 +104,6 @@ def _accumulate_row_capacity_telemetry(
     if excess > 0:
         wp.atomic_max(overflow_excess_watermark, 0, excess)
         wp.atomic_add(overflow_world_steps, 0, 1)
-
-
-_BODY_RECORDS = (
-    "row_type",
-    "row_parent",
-    "row_mu",
-    "phi",
-    "row_restitution",
-    "row_incident",
-    "rhs",
-    "target_velocity",
-    "impulses",
-    "row_w",
-    "row_eps",
-    "diag",
-    "row_sides",
-    "row_beta",
-)
-"""The row store's records the free bodies' rows read in their region (:meth:`Placement.body_region`)."""
 
 
 @wp.kernel
@@ -555,17 +534,6 @@ class Placement:
         worlds = self.forest.world_count
         rows = self.mf_max_constraints if self.forest.has_free_rigid_bodies else 1
         arrays.allocate(MF_ROWS, world=worlds, mf_row=rows, mf_meta=4 * rows)
-        # The free bodies' records: the row store's region from its body base (a feature's placeholder stays whole,
-        # and without free bodies no free-body row is read).
-        records = {name: getattr(self, name, self.contact_row_eps_dummy) for name in _BODY_RECORDS}
-        self.body_rows = SimpleNamespace(
-            **{
-                name: self.body_region(array)
-                if self.forest.has_free_rigid_bodies and array.shape[1] == self.row_pitch
-                else array
-                for name, array in records.items()
-            }
-        )
 
         if not self.forest.has_free_rigid_bodies:
             # Only the ``is not None`` checks observe this on the inactive
@@ -830,6 +798,7 @@ class Placement:
                 self.dense_first_rejected_slot,
                 mf_slot_counter,
                 mf_first_rejected_slot,
+                self.body_base,
                 *blocks,
                 lanes,
                 self.dense_first,
@@ -1060,11 +1029,6 @@ class Placement:
         )
         self.unit_source = wp.full((self.forest.world_count, rows), 0, dtype=wp.int32, device=self.model.device)
 
-    def body_region(self, records: wp.array) -> wp.array:
-        """The free bodies' region of a row store record: each world line's rows from ``body_base``, a view whose
-        row ``i`` is the free bodies' row ``i``, the frame their slots and parents count in."""
-        return records[:, self.body_base : self.row_pitch]
-
     def diagonals(self) -> None:
         """The dense rows' diagonals, by the placement that holds them (:attr:`.step_plan.StepPlan.response`): the packed
         rows' start from zero for the one writer's ``|Z|^2 + cfm`` (local row packets keep their worlds' private seeds);
@@ -1083,7 +1047,7 @@ class Placement:
             dim=self.forest.world_count * self.mf_max_constraints,
             inputs=[
                 bind_mf_rows(self),
-                self.body_dense_rows(),
+                bind_dense_rows(self),
                 self.mf_constraint_count,
                 self.factor.walk_view(),
                 v_hat,
@@ -1097,13 +1061,6 @@ class Placement:
                 int(self.options.contact_compliance),
             ],
             device=model.device,
-        )
-
-    def body_dense_rows(self):
-        """The free bodies' rows as :data:`.dense_rows.DenseRows`: the row store's records in their region
-        (:meth:`body_region`), which the rows' law reads and writes as a dense row's."""
-        return bind_dense_rows(
-            SimpleNamespace(**vars(self.body_rows), dense_first=self.dense_first), options=self.options
         )
 
     def pack_free_body_meta(self) -> None:

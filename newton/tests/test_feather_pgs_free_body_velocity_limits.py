@@ -246,13 +246,13 @@ def _free_body_rows(run):
     axis = np.argmax(np.abs(jacobian), axis=2)
     return SimpleNamespace(
         count=count,
-        type=solver.placement.body_rows.row_type.numpy()[:, :rows],
+        type=solver.placement.row_type.numpy()[:, solver.placement.body_base :][:, :rows],
         axis=axis,
         sign=np.sign(np.take_along_axis(jacobian, axis[..., None], axis=2)[..., 0]),
-        rhs=solver.placement.body_rows.rhs.numpy()[:, :rows],
+        rhs=solver.placement.rhs.numpy()[:, solver.placement.body_base :][:, :rows],
         # The step's inverse of each row's effective mass, as its header caches it.
-        eff_mass_inv=_inverse(solver.placement.body_rows.diag.numpy()[:, :rows]),
-        impulses=solver.placement.body_rows.impulses.numpy()[:, :rows],
+        eff_mass_inv=_inverse(solver.placement.diag.numpy()[:, solver.placement.body_base :][:, :rows]),
+        impulses=solver.placement.impulses.numpy()[:, solver.placement.body_base :][:, :rows],
     )
 
 

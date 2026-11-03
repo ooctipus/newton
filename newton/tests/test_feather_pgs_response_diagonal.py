@@ -202,9 +202,9 @@ def _run_mixed_response(
                 int(solver.placement.local_solve_owner.numpy()[0]),
                 solver.placement.row_type.numpy()[0, :constraint_count].copy(),
                 mf_count,
-                solver.placement.body_rows.impulses.numpy()[0, :mf_count].copy(),
-                solver.placement.body_rows.row_type.numpy()[0, :mf_count].copy(),
-                solver.placement.body_rows.row_parent.numpy()[0, :mf_count].copy(),
+                solver.placement.impulses.numpy()[:, solver.placement.body_base :][0, :mf_count].copy(),
+                solver.placement.row_type.numpy()[:, solver.placement.body_base :][0, :mf_count].copy(),
+                solver.placement.row_parent.numpy()[:, solver.placement.body_base :][0, :mf_count].copy(),
                 solver.placement.mf_Z_a.numpy()[0, :mf_count].copy(),
                 solver.placement.mf_Z_b.numpy()[0, :mf_count].copy(),
             )
