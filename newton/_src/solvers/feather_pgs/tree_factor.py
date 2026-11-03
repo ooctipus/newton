@@ -192,7 +192,6 @@ class TreeFactor:
         self.walk_slip_capacity = 0
         # The walk's step geometry, which the finish publishes where a walk is held (plan_walk sizes it): empty here.
         self.walk_now = wp.zeros(0, dtype=wp.spatial_vector, device=model.device)
-        self.walk_half = None
         self.walk_now_link = wp.zeros((0, WALK_LINK), dtype=wp.float32, device=model.device)
         # Each body's centre of mass relative to its articulation's origin, by its joint, as the held tree's finish
         # publishes it (its predictor's wrench shift and the walk's refresh read it).
@@ -907,8 +906,6 @@ class TreeFactor:
         # The step's geometry, which the held tree's finish publishes with its motion columns (every step, no launch
         # of the walk's): each coordinate's column at its body's frame and each body's link there. A seed enters as J
         # there, and a refresh takes it as the factor's frames.
-        # Each coordinate's column half by its joint's kind on the device (the refresh's pick of a column's half).
-        self.walk_half = wp.array(self.walk_half_host, dtype=wp.int32, device=device)
         # A model with a column of two halves keeps the finish's columns at each body's frame; else the step's columns
         # are S's own (WALK_NOW).
         self.walk_now = wp.zeros(dofs if both else 0, dtype=wp.spatial_vector, device=device)
@@ -1040,7 +1037,6 @@ class TreeFactor:
                 self.drive_row_by_dof,
                 self.aug_row_K if self.parallel_drives else self._arrays.placeholder(wp.float32),
                 self.walk_trees.now,
-                self.walk_half,
                 self.walk_now_link,
                 self.joint_com_offset,
                 self.articulation_origin,
@@ -2631,7 +2627,6 @@ _INWARD = """    // The refresh by the tree's lane group (walk_group): the lane 
     // doubled where a joint's column can have two halves: TreeFactor's walk_data).
     const int WALK_SIDE = data.shape[0] > armature.shape[0] ? $coordinate * armature.shape[0] : 0;
     const float* Nw = reinterpret_cast<const float*>(now.data);
-    const int* Hf = half.data;
     float* Lo = link.data;
     float* Dt = data.data;
     const float* Ra = armature.data;
@@ -2650,13 +2645,17 @@ _INWARD = """    // The refresh by the tree's lane group (walk_group): the lane 
     enum { M = 0, MC = 1, ROT = 4, OFFSET = 10, INERTIA = 13 };
     // A coordinate's column at the step's poses and what the factor adds to its diagonal, R and R + K.
     const auto COLUMN = [&](int c, float* x) {
-        // The step column (WALK_NOW): the half its joint's kind names (Hf: 0 linear, 1 angular, 2 both, the finish's
-        // column at the frame whole), the other zero.
+        // The step column (WALK_NOW) at its body's frame, its half its own words, the record's rule (STEP's): a column
+        // that turns keeps its angular half and its linear half only as a side (WALK_SIDE, non-zero), one that slides
+        // its linear half; the other zero. Its six words load together, ahead of any choice.
         const float* n = Nw + $now * c;
-        const int h = Hf[c];
+        float v[6];
+        for (int k = 0; k < 6; ++k) v[k] = n[k];
+        const bool turns = v[3] != 0.0f || v[4] != 0.0f || v[5] != 0.0f;
+        const bool slides = !turns || (WALK_SIDE != 0 && (v[0] != 0.0f || v[1] != 0.0f || v[2] != 0.0f));
         for (int k = 0; k < 3; ++k) {
-            x[k] = h != 1 ? n[k] : 0.0f;
-            x[3 + k] = h != 0 ? n[3 + k] : 0.0f;
+            x[k] = slides ? v[k] : 0.0f;
+            x[3 + k] = turns ? v[3 + k] : 0.0f;
         }
         float added = Ra[c];
         x[6] = added;
@@ -2768,7 +2767,6 @@ $lift
 #endif
     for (int c = dof0 + LANE; c < dof1; c += LANES) {
         PREFETCH(Nw + $now * c);
-        PREFETCH(Hf + c);
         PREFETCH(Ra + c);
         PREFETCH(Dr + c);
     }
@@ -2873,7 +2871,6 @@ def walk_inward(
     path: wp.array[wp.vec2i],
     joins: wp.array[int],
     now: wp.array[wp.spatial_vector],
-    half: wp.array[int],
     now_link: wp.array2d[float],
     now_com: wp.array[wp.vec3],
     armature: wp.array[float],
@@ -2910,7 +2907,6 @@ def walk_step_kernel(
     drive_row_by_dof: wp.array[int],
     row_K: wp.array[float],
     walk_now: wp.array[wp.spatial_vector],
-    walk_half: wp.array[int],
     walk_now_link: wp.array2d[float],
     walk_now_com: wp.array[wp.vec3],
     articulation_origin: wp.array[wp.vec3],
@@ -2939,7 +2935,6 @@ def walk_step_kernel(
         walk_path,
         walk_joins,
         walk_now,
-        walk_half,
         walk_now_link,
         walk_now_com,
         armature,
