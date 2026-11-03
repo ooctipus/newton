@@ -513,7 +513,7 @@ def _law_mimic_phi(
 
 
 def test_mimic_phi_matches_mimic_rows(test, device):
-    """Equal the violation ``populate_mimic_J_for_size`` writes for every mimic row."""
+    """Equal the violation the mimic warp (``rows.mimic_warp_kernel``) writes for every mimic row, in mimic order."""
     rng = np.random.default_rng(19)
     arts, per_art, dofs_per_art = 8, 3, 6
     count = arts * per_art
@@ -524,33 +524,27 @@ def test_mimic_phi_matches_mimic_rows(test, device):
     coef0 = scalars(rng, count, 0.2)
     coef1 = scalars(rng, count, 1.5)
     joint_q = scalars(rng, arts * dofs_per_art, 1.0)
-    out = call(
-        kernels.populate_mimic_J_for_size,
-        arts,
+    out = prefix_warp_rows(
         device,
-        articulation_dof_start=(dofs_per_art * np.arange(arts)).astype(np.int32),
-        art_to_world=np.arange(arts, dtype=np.int32),
-        group_to_art=np.arange(arts, dtype=np.int32),
-        mimic_slot=np.tile(np.arange(per_art, dtype=np.int32), arts),
-        mimic_art_start=(per_art * np.arange(arts + 1)).astype(np.int32),
-        mimic_art_list=np.arange(count, dtype=np.int32),
+        arts,
+        dofs_per_art,
+        per_art,
+        family="mimics",
+        mimics=per_art,
+        mimic_start=(per_art * np.arange(arts + 1)).astype(np.int32),
+        mimic_list=np.arange(count, dtype=np.int32),
+        mimic_valid=np.ones(count, dtype=np.int32),
+        mimic_enabled=np.ones(count, dtype=bool),
         mimic_dof0=dof0,
         mimic_dof1=dof1,
         mimic_q0=dof0,
         mimic_q1=dof1,
         mimic_coef0=coef0,
         mimic_coef1=coef1,
-        joint_q=joint_q,
-        pgs_beta=0.2,
-        pgs_cfm=0.0,
-        J_group=np.zeros((arts, per_art, dofs_per_art), dtype=np.float32),
-        world_row_type=np.zeros((arts, per_art), dtype=np.int32),
-        world_row_parent=np.zeros((arts, per_art), dtype=np.int32),
-        world_row_mu=np.zeros((arts, per_art), dtype=np.float32),
-        world_row_beta=np.zeros((arts, per_art), dtype=np.float32),
-        world_row_cfm=np.zeros((arts, per_art), dtype=np.float32),
-        world_phi=np.zeros((arts, per_art), dtype=np.float32),
-        world_target_velocity=np.zeros((arts, per_art), dtype=np.float32),
+        mimic_slot=np.full(count, -1, dtype=np.int32),
+        q=joint_q,
+        beta=0.2,
+        cfm=0.0,
     )
     law = call(
         _law_mimic_phi,
@@ -563,7 +557,9 @@ def test_mimic_phi_matches_mimic_rows(test, device):
         joint_q=joint_q,
         phi=np.zeros(count, dtype=np.float32),
     )
-    test.assertFalse(mismatches(out["world_phi"].numpy().reshape(-1), law["phi"].numpy()).any())
+    np.testing.assert_array_equal(out["count"], np.full(arts, per_art))
+    np.testing.assert_array_equal(out["mimic_slot"], np.tile(np.arange(per_art), arts))
+    test.assertFalse(mismatches(out["phi"].reshape(-1), law["phi"].numpy()).any())
 
 
 @wp.kernel
@@ -654,7 +650,7 @@ def test_velocity_limit_active_matches_velocity_limit_rows(test, device):
                 arts,
                 dofs,
                 2 * dofs,
-                velocity=True,
+                family="velocity",
                 velocity_limit=limit,
                 vhat=qd,
                 activation=fraction,

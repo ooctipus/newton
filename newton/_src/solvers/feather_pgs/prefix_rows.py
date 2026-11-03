@@ -51,6 +51,25 @@ VELOCITY_LAW = (
 PrefixVelocityLaw = field_group.struct("PrefixVelocityLaw", (*LAW, *VELOCITY_LAW), __name__)
 """The prefix law with the velocity-limit family's inputs (the joint velocity limits' warp producer)."""
 
+MIMIC_LAW = (
+    Field("mimic_start", wp.int32, ("articulation_bound",), owner="mimics", attr="_mimic_art_start"),
+    Field("mimic_list", wp.int32, ("mimic",), owner="mimics", attr="_mimic_art_list"),
+    Field("mimic_valid", wp.int32, ("mimic",), owner="mimics", attr="_mimic_valid"),
+    Field("mimic_enabled", wp.bool, ("mimic",), owner="mimic_model", attr="constraint_mimic_enabled"),
+    Field("mimic_dof0", wp.int32, ("mimic",), owner="mimics", attr="_mimic_dof0"),
+    Field("mimic_dof1", wp.int32, ("mimic",), owner="mimics", attr="_mimic_dof1"),
+    Field("mimic_q0", wp.int32, ("mimic",), owner="mimics", attr="_mimic_q0"),
+    Field("mimic_q1", wp.int32, ("mimic",), owner="mimics", attr="_mimic_q1"),
+    Field("mimic_coef0", wp.float32, ("mimic",), owner="mimic_model", attr="constraint_mimic_coef0"),
+    Field("mimic_coef1", wp.float32, ("mimic",), owner="mimic_model", attr="constraint_mimic_coef1"),
+    Field("mimic_slot", wp.int32, ("mimic",), owner="mimics"),
+)
+"""The mimic family's inputs: each articulation's valid mimics (``mimic_start``, ``mimic_list``), their coordinates,
+coefficients and enable flags, and each mimic's dense slot (-1 for none)."""
+
+PrefixMimicLaw = field_group.struct("PrefixMimicLaw", (*LAW, *MIMIC_LAW), __name__)
+"""The prefix law with the mimic family's inputs (the mimic rows' warp producer)."""
+
 
 def _family(coordinates, name: str, evaluation: str) -> tuple:
     """A coordinate family: both sides of each coordinate, ``coordinates`` a tuple or a native count from 0.
@@ -106,6 +125,31 @@ def velocity_limits(coordinates, dof: str, law: str) -> tuple:
             target = -limit;
             d0 = d;
             w0 = side == 0 ? 1.0f : -1.0f;""",
+    )
+
+
+def mimics(count: int, law: str) -> tuple:
+    """The mimic family: up to ``count`` mimics of the articulation (``mimic_first`` to ``mimic_end`` in scope, a
+    per-candidate ``int mimic = -1``), each enabled, valid mimic a row ``J = e_follower - coef1 e_leader`` at the
+    articulation's coordinates ``d0`` and ``d1`` (``first_dof`` in scope), its slot reset first (:data:`MIMIC_LAW`)."""
+    return (
+        count,
+        "",
+        f"""if (mimic_first + index < mimic_end) {{
+                mimic = {law}mimic_list.data[mimic_first + index];
+                {law}mimic_slot.data[mimic] = -1;
+                active = {law}mimic_valid.data[mimic] != 0 && {law}mimic_enabled.data[mimic];
+                if (active) {{
+                    type = 5;
+                    beta = {law}beta;
+                    d0 = {law}mimic_dof0.data[mimic] - first_dof;
+                    d1 = {law}mimic_dof1.data[mimic] - first_dof;
+                    w0 = 1.0f;
+                    w1 = -{law}mimic_coef1.data[mimic];
+                    phi = RowLaw::mimic_phi({law}q.data[{law}mimic_q0.data[mimic]], {law}q.data[{law}mimic_q1.data[mimic]],
+                                            {law}mimic_coef0.data[mimic], {law}mimic_coef1.data[mimic]);
+                }}
+            }}""",
     )
 
 

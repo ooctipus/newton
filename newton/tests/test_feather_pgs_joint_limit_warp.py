@@ -9,14 +9,15 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton.tests.feather_pgs_law_harness import prefix_warp_rows
+from newton.tests.feather_pgs_law_harness import PREFIX_RECORDS, prefix_warp_rows
 
 
 def _rows(device, resolved=None, warps_per_block=4, articulation_count=257, size=6):
-    """One D6 joint per articulation and world, with positions drawn around its [-1, 1] limits."""
+    """One D6 joint per articulation and world, with positions drawn around its [-1, 1] limits: each world's row count,
+    Jacobian rows and records."""
     dof_count = articulation_count * size
     rng = np.random.default_rng(42)
-    return prefix_warp_rows(
+    rows = prefix_warp_rows(
         device,
         articulation_count,
         size,
@@ -30,6 +31,7 @@ def _rows(device, resolved=None, warps_per_block=4, articulation_count=257, size
         beta=0.2,
         cfm=1.0e-6,
     )
+    return {name: rows[name] for name in ("count", "J", *PREFIX_RECORDS)}
 
 
 class TestFeatherPGSJointLimitWarp(unittest.TestCase):

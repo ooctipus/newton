@@ -18,7 +18,7 @@ def _joint_velocity_rows(qd: float, *, fraction: float, qdot_max: float = 1.0):
     """One revolute coordinate's joint velocity-limit rows (the general route's warp, on the CPU): their J signs,
     targets and count."""
     rows = prefix_warp_rows(
-        "cpu", 1, 1, 8, velocity=True, velocity_limit=[qdot_max], vhat=[qd], activation=fraction, cfm=0.0
+        "cpu", 1, 1, 8, family="velocity", velocity_limit=[qdot_max], vhat=[qd], activation=fraction, cfm=0.0
     )
     count = int(rows["count"][0])
     return rows["J"][0, :count, 0].tolist(), rows["target"][0, :count].tolist(), count

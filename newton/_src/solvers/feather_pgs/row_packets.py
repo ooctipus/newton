@@ -54,6 +54,7 @@ from .friction_patches import PatchRowLaw, patch_friction_location, patch_row_la
 from .kernel_template import KernelTemplate, substitute
 from .kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
 from .prefix_rows import LAW, limits, prefix_rows
+from .prefix_rows import mimics as mimic_rows
 from .row_build import write_contact_row
 from .row_inputs import SEED_NONE, SEED_SECONDARY, CompactLocalRows, RowArgument
 from .row_laws import ROW_LAW
@@ -151,23 +152,6 @@ _PREFIX_SOURCE = r"""
 $ROWS    }
 """
 
-_MIMIC = """if (mimic_first + index < mimic_end) {
-                mimic = data.mimic_list.data[mimic_first + index];
-                data.mimic_slot.data[mimic] = -1;
-                active = data.mimic_valid.data[mimic] != 0 && data.mimic_enabled.data[mimic];
-                if (active) {
-                    type = 5;
-                    beta = data.beta;
-                    d0 = data.mimic_dof0.data[mimic] - first_dof;
-                    d1 = data.mimic_dof1.data[mimic] - first_dof;
-                    w0 = 1.0f;
-                    w1 = -data.mimic_coef1.data[mimic];
-                    phi = RowLaw::mimic_phi(data.q.data[data.mimic_q0.data[mimic]], data.q.data[data.mimic_q1.data[mimic]],
-                                            data.mimic_coef0.data[mimic], data.mimic_coef1.data[mimic]);
-                }
-            }"""
-"""The mimic family: an enabled, valid mimic row of the primary (``J = e_follower - coef1 e_leader``)."""
-
 _SINK = """            const int sparse = (world * $PACKETS + slot) * 2;
             data.dofs.data[sparse] = d0;
             data.dofs.data[sparse + 1] = d1;
@@ -195,7 +179,7 @@ def get_prefix_kernel(primary: int, mimics: int, packets: int):
     """
     if primary <= 0 or mimics < 0 or mimics + 2 * primary > packets:
         raise ValueError("the prefix candidates must fit the packet capacity")
-    positions = ((mimics, "", _MIMIC),) if mimics else ()
+    positions = (mimic_rows(mimics, "data."),) if mimics else ()
     rows = prefix_rows(
         ((*positions, limits(tuple(range(primary)), "first_dof + d", "data.")), ()),
         law="data.",

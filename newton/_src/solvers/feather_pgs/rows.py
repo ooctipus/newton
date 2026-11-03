@@ -36,7 +36,7 @@ from .contact_input import ContactInput
 from .contact_input import bind as bind_contact_input
 from .contact_input import bind_routes as bind_contact_routes
 from .contact_row_plan import SHARED_METADATA_PRODUCERS, contact_row_plan
-from .dense_rows import UNIT_LIMIT, UNIT_SHIFT, UNIT_VELOCITY, RowSupport
+from .dense_rows import UNIT_LIMIT, UNIT_MIMIC, UNIT_SHIFT, UNIT_VELOCITY, RowSupport
 from .dense_rows import bind as bind_dense_rows
 from .dense_rows import bind_mf as bind_mf_rows
 from .device_preludes import block_groups, lane_group
@@ -49,14 +49,12 @@ from .joint_table import bind_free_bodies
 from .kernel_template import KernelTemplate, params
 from .kernels import (
     allocate_link_slots,
-    allocate_mimic_slots,
     allocate_rigid_velocity_limit_slots,
     allocate_world_contact_slots,
     build_mf_contact_rows,
     compute_world_contact_bias,
     finalize_constraint_counts_with_status,
     gather_mf_warmstart,
-    populate_mimic_J_for_size,
     populate_rigid_velocity_limit_rows,
     populate_world_J_for_compact_size,
     populate_world_J_for_size,
@@ -75,11 +73,16 @@ from .solver_fields import (
     MIMIC_SLOTS,
     VELOCITY_LIMIT_SLOTS,
     Links,
-    Mimics,
     Preelim,
 )
 
-__all__ = ["RowLaws", "joint_limit_warp_kernel", "velocity_limit_warp_kernel", "velocity_prescale_launch"]
+__all__ = [
+    "RowLaws",
+    "joint_limit_warp_kernel",
+    "mimic_warp_kernel",
+    "velocity_limit_warp_kernel",
+    "velocity_prescale_launch",
+]
 
 _CALLER = 4
 """Warnings raised in :meth:`RowLaws.build` name the solver constructor's caller: build runs in the constructor body,
@@ -127,9 +130,9 @@ def velocity_prescale_launch(articulation_start: np.ndarray, *, joint_count: int
 
 
 def _prefix_warp_params(law) -> tuple:
-    """The warp prefix producers' operands: the family's law (:data:`.prefix_rows.LAW`, with the velocity family's
-    inputs for the velocity limits), the rows' placement and Jacobian rows (:func:`.dense_rows.jacobian_row`: the packed
-    rows, by world, or the size group's)."""
+    """The warp prefix producers' operands: the family's law (:data:`.prefix_rows.LAW`, with the velocity or the mimic
+    family's inputs), the rows' placement and Jacobian rows (:func:`.dense_rows.jacobian_row`: the packed rows, by
+    world, or the size group's)."""
     return params(
         ("articulation_count", int),
         ("articulation_dof_start", wp.array[int]),
@@ -142,70 +145,106 @@ def _prefix_warp_params(law) -> tuple:
     )
 
 
+# The joint row families of the prefix warp: (kernel name, native name, law, unit kind).
+_PREFIX_FAMILIES = {
+    "limits": ("build_joint_limit_rows_warp", "joint_limit_warp_native", prefix_rows.PrefixLaw, UNIT_LIMIT),
+    "velocity": (
+        "build_joint_velocity_limit_rows_warp",
+        "velocity_limit_warp_native",
+        prefix_rows.PrefixVelocityLaw,
+        UNIT_VELOCITY,
+    ),
+    "mimics": ("build_mimic_rows_warp", "mimic_warp_native", prefix_rows.PrefixMimicLaw, UNIT_MIMIC),
+}
+
+
 @cache
-def _prefix_warp_kernel(size: int, warps_per_block: int, velocity: bool) -> wp.Kernel:
+def _prefix_warp_kernel(size: int, warps_per_block: int, family: str, mimics: int = 0) -> wp.Kernel:
     """A joint row family of the general route and the one writer, one warp per articulation of ``size`` coordinates
-    (:func:`.prefix_rows.prefix_rows`): its joint limits, or its joint velocity limits (``velocity``). The warp takes
-    each coordinate side's law, reserves the active rows on the world's counter, writes their records and publishes
-    each row's side: its unit source for the one writer, else its Jacobian row. The joint limits skip the resolved
-    worlds; every world takes its velocity limits."""
-    kind = int(UNIT_VELOCITY if velocity else UNIT_LIMIT)
-    # A row's side: its articulation's coordinates in the packed rows (cleared, then the coefficient), or the size
+    (:func:`.prefix_rows.prefix_rows`) on CUDA, a block's articulations in turn on the CPU: its joint limits, its joint
+    velocity limits, or its mimics (at most ``mimics`` an articulation). The warp takes each candidate's law, reserves
+    the active rows on the world's counter, writes their records and publishes each row's side: its unit source for
+    the one writer, else its Jacobian row (a mimic's two coordinates; its slot in ``mimic_slot`` too). The joint
+    limits skip the resolved worlds; every world takes its velocity limits and mimics."""
+    name, native, law, kind = _PREFIX_FAMILIES[family]
+    kind = int(kind)
+    if family == "mimics":
+        source, second = f"({kind} << {int(UNIT_SHIFT)}) | mimic", "\n                J_side[d1] = w1;"
+        extra = "            law.mimic_slot.data[mimic] = slot;\n"
+    else:
+        source, second, extra = f"({kind} << {int(UNIT_SHIFT)}) | (2 * (first_dof + d0) + (w0 < 0.0f ? 1 : 0))", "", ""
+    # A row's side: its articulation's coordinates in the packed rows (cleared, then the coefficients), or the size
     # group's row (cleared each step).
-    sink = f"""            if (support.walks != 0) {{
+    sink = f"""{extra}            if (support.walks != 0) {{
                 // The one writer walks the row (walk_rows): its unit source, the coordinate's side, in the units' own
                 // rows (the compact boundary keeps its limit prefix's alone).
                 if (slot < support.units.shape[1])
                     support.units.data[(size_t)prefix_line * support.units.shape[1] + slot] =
-                        ({kind} << {int(UNIT_SHIFT)}) | (2 * (first_dof + d0) + (w0 < 0.0f ? 1 : 0));
+                        {source};
             }} else {{
                 float* J_side = &J_group.data[((size_t)row_index * J_group.shape[1] + slot) * J_group.shape[2] + first];
                 if (support.packed != 0) {{
                     for (int e = 0; e < {size}; ++e) J_side[e] = 0.0f;
                 }}
-                J_side[d0] = w0;
+                J_side[d0] = w0;{second}
             }}"""
-    family = prefix_rows.velocity_limits if velocity else prefix_rows.limits
+    if family == "mimics":
+        candidates = prefix_rows.mimics(mimics, "law.")
+    elif family == "velocity":
+        candidates = prefix_rows.velocity_limits(tuple(range(size)), "first_dof + d", "law.")
+    else:
+        candidates = prefix_rows.limits(tuple(range(size)), "first_dof + d", "law.")
     rows = prefix_rows.prefix_rows(
-        ((family(tuple(range(size)), "first_dof + d", "law."),),),
+        ((candidates,),),
         law="law.",
         sink=sink,
         ordered=False,
         rhs=False,
+        locals_="int mimic = -1;" if family == "mimics" else "",
         side="art",
     )
-    resolved = (
-        ""
-        if velocity
-        else "    if (world >= 0 && world < resolved_worlds.shape[0] && resolved_worlds.data[world] != 0) return;\n"
+    head = (
+        "    if (world >= 0 && world < resolved_worlds.shape[0] && resolved_worlds.data[world] != 0) return;\n"
+        if family == "limits"
+        else ""
     )
+    first_dof = "    const int first_dof = articulation_dof_start.data[art];\n"
+    if family == "mimics":
+        first_dof += (
+            "    const int mimic_first = law.mimic_start.data[art], mimic_end = law.mimic_start.data[art + 1];\n"
+        )
     body = f"""    const int art = group_to_art.data[group];
     const int world = art_to_world.data[art];
-{resolved}    const int first_dof = articulation_dof_start.data[art];
-    // The rows' first index and the side's first entry (dense_rows.jacobian_row; one side).
+{head}{first_dof}    // The rows' first index and the side's first entry (dense_rows.jacobian_row; one side).
     const int row_index = support.packed != 0 ? support.first.data[world] : group;
     const int first = support.packed != 0 && support.dense != 0 ? support.offset.data[art] : 0;
 {rows}"""
-    name = "build_joint_velocity_limit_rows_warp" if velocity else "build_joint_limit_rows_warp"
+    suffix = f"_m{mimics}" if family == "mimics" else ""
     return KernelTemplate(
-        f"{name}_{size}_{warps_per_block}",
-        _prefix_warp_params(prefix_rows.PrefixVelocityLaw if velocity else prefix_rows.PrefixLaw),
+        f"{name}_{size}_{warps_per_block}{suffix}",
+        _prefix_warp_params(law),
         block_groups(warps_per_block, "articulation_count", body),
         preludes=(lane_group(32), *ROW_LAW.preludes()),
         dual=True,
-        native_name="velocity_limit_warp_native" if velocity else "joint_limit_warp_native",
+        native_name=native,
     ).kernel()
 
 
 def joint_limit_warp_kernel(size: int, warps_per_block: int) -> wp.Kernel:
     """The general route's and the one writer's joint-limit rows, one warp per articulation (:func:`_prefix_warp_kernel`)."""
-    return _prefix_warp_kernel(size, warps_per_block, False)
+    return _prefix_warp_kernel(size, warps_per_block, "limits")
 
 
 def velocity_limit_warp_kernel(size: int, warps_per_block: int) -> wp.Kernel:
     """The general route's and the one writer's joint velocity-limit rows, one warp per articulation
     (:func:`_prefix_warp_kernel`)."""
-    return _prefix_warp_kernel(size, warps_per_block, True)
+    return _prefix_warp_kernel(size, warps_per_block, "velocity")
+
+
+def mimic_warp_kernel(size: int, warps_per_block: int, mimics: int) -> wp.Kernel:
+    """The general route's and the one writer's mimic rows, at most ``mimics`` an articulation, one warp per
+    articulation (:func:`_prefix_warp_kernel`)."""
+    return _prefix_warp_kernel(size, warps_per_block, "mimics", mimics)
 
 
 class RowLaws:
@@ -400,6 +439,7 @@ class RowLaws:
         self._mimic_art_list = None
         self.mimic_sizes = frozenset()
         self.mimic_slot = None
+        self.mimic_warp_kernels = {}
         n = int(getattr(model, "constraint_mimic_count", 0) or 0)
         if n == 0 or not model.articulation_count or self.forest.art_to_world is None:
             return
@@ -474,6 +514,14 @@ class RowLaws:
         )
         self._arrays.allocate(MIMIC_SLOTS, mimic=n)
         self.mimic_count = n
+        # A warp per articulation produces a size's mimic rows, its candidates the most mimics an articulation of that
+        # size has.
+        per_art = np.diff(art_start)
+        sizes = self.forest.response_dof_count[: model.articulation_count]
+        self.mimic_warp_kernels = {
+            size: mimic_warp_kernel(size, JOINT_LIMIT_WARPS_PER_BLOCK, int(per_art[sizes == size].max()))
+            for size in self.mimic_sizes
+        }
 
     def _link_plan(self) -> None:
         """The links' rows (:mod:`.body_cut`): six bilateral rows per enabled link, whatever joint made them. Their
@@ -647,37 +695,24 @@ class RowLaws:
         # first, ahead of the (activation-gated, flickering) limit family, so
         # warm-started mimic lambdas keep a stable slot index across steps.
 
-        # Mimic (joint coupling) equality rows — static count per model.
-        if self.mimic_count > 0 and solver.placement.row_packets is None:
-            wp.launch(
-                allocate_mimic_slots,
-                dim=self.mimic_count,
-                inputs=[field_group.bind(Mimics, laws=self, model=model), max_constraints],
-                outputs=[
-                    solver.placement.slot_counter,
-                    solver.placement.dense_first_rejected_slot,
-                ],
-                device=model.device,
+        # Mimic (joint coupling) equality rows — static count per model. One warp per articulation reserves, writes
+        # and publishes them, as the joint limits (prefix_rows).
+        if self.mimic_warp_kernels and solver.placement.row_packets is None:
+            mimic_law = field_group.bind(
+                prefix_rows.PrefixMimicLaw,
+                solver=solver,
+                placement=solver.placement,
+                factor=solver.factor,
+                laws=self,
+                options=solver.options,
+                model=model,
+                state_in=state_in,
+                dt=dt,
+                mimics=self,
+                mimic_model=model,
             )
-            for size in solver.forest.size_groups:
-                if size not in self.mimic_sizes:
-                    continue
-                n_arts = solver.forest.n_arts_by_size[size]
-                wp.launch(
-                    populate_mimic_J_for_size,
-                    dim=n_arts,
-                    inputs=[
-                        field_group.bind(Mimics, laws=self, model=model),
-                        joints,
-                        solver.forest.group_to_art[size],
-                        state_in.joint_q,
-                        solver.options.pgs_beta,
-                        solver.options.pgs_cfm,
-                        support,
-                    ],
-                    outputs=[solver.placement.jacobian_rows(size), dense_rows],
-                    device=model.device,
-                )
+            for size, warp_kernel in self.mimic_warp_kernels.items():
+                self._launch_prefix_warp(solver, warp_kernel, size, mimic_law, support)
 
         # The links' rows: static per model, their sides the trees of the link's two pieces.
         if self.link_count > 0:

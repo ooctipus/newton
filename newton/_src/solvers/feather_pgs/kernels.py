@@ -38,7 +38,6 @@ from .contact_laws import (
 from .dense_rows import (
     UNIT_CONTACT,
     UNIT_LINK,
-    UNIT_MIMIC,
     DenseRows,
     MfRows,
     RowSupport,
@@ -76,11 +75,10 @@ from .row_laws import (
     contact_restitution_rhs,
     joint_limit_side,
     limit_rhs,
-    mimic_phi,
     row_rhs,
     velocity_limit_active,
 )
-from .solver_fields import Links, LocalOwners, Mimics
+from .solver_fields import Links, LocalOwners
 from .spatial_laws import free_root_transport
 
 PGS_CONSTRAINT_TYPE_CONTACT = 0
@@ -907,103 +905,6 @@ def build_mass_update_mask(
         flag = 1
     mass_update_mask[tid] = flag
     mass_update_requested[tid] = 0
-
-
-# =============================================================================
-# Mimic (Joint Coupling) Constraint Kernels
-# =============================================================================
-# Bilateral equality rows enforcing ``q_follower = coef0 + coef1 * q_leader``
-# between two 1-DoF joints of the same articulation, sourced from
-# ``Model.constraint_mimic_*``. This is the FeatherPGS analogue of PhysX's
-# ``PxArticulationMimicJoint`` (``qA + gearRatio*qB + offset = 0`` with
-# ``gearRatio = -coef1``, ``offset = -coef0``): a joint-space row with two
-# Jacobian entries, an unbounded multiplier, and standard Baumgarte drift
-# correction. See ``reports/vishal/fpgs_mimic_design.md`` in the parent repo.
-#
-# ``coef0``/``coef1``/``enabled`` are read from the model arrays at row-build
-# time, so runtime mutation (NotifyFlags.CONSTRAINT_PROPERTIES) takes effect
-# without solver re-initialization and stays CUDA-graph-safe. The static
-# validity mask (same articulation, 1-DoF joint types, distinct DOFs) is
-# precomputed on the host at solver init.
-
-
-@wp.kernel
-def allocate_mimic_slots(
-    mimics: Mimics,
-    max_constraints: int,
-    # outputs
-    world_slot_counter: wp.array[int],
-    first_rejected_slot: wp.array[int],
-):
-    """Allocate one dense constraint slot per enabled, valid mimic constraint.
-
-    Launched with ``dim = constraint_mimic_count``. Disabled or invalid mimics
-    get ``mimic_slot = -1`` and consume no slot.
-    """
-    k = wp.tid()
-    mimics.slot[k] = -1
-    if mimics.valid[k] == 0:
-        return
-    if not mimics.enabled[k]:
-        return
-    mimics.slot[k] = reserve(world_slot_counter, mimics.world[k], 1, max_constraints, first_rejected_slot)
-
-
-@wp.kernel
-def populate_mimic_J_for_size(
-    mimics: Mimics,
-    joints: JointTable,
-    group_to_art: wp.array[int],
-    joint_q: wp.array[float],
-    pgs_beta: float,
-    pgs_cfm: float,
-    support: RowSupport,
-    # outputs
-    J_group: wp.array3d[float],
-    rows: DenseRows,
-):
-    """Populate Jacobian and metadata for mimic constraint rows.
-
-    Launched once per size group with ``dim = n_arts_of_size``, matching the
-    joint-limit populate kernel. Each thread visits only its articulation's
-    range in the precomputed mimic table:
-
-    * Jacobian ``J = e_follower - coef1 * e_leader`` — two entries.
-    * ``phi = q_follower - coef1 * q_leader - coef0`` — the signed violation.
-    """
-    group_idx = wp.tid()
-    art = group_to_art[group_idx]
-    world = joints.art_to_world[art]
-    line = rows.first[world]
-    dof_start = joints.articulation_dof_start[art]
-
-    for m in range(mimics.art_start[art], mimics.art_start[art + 1]):
-        k = mimics.art_list[m]
-        slot = mimics.slot[k]
-        if slot < 0:
-            continue
-
-        c0 = mimics.coef0[k]
-        c1 = mimics.coef1[k]
-
-        # Jacobian: +1 on the follower DOF, -coef1 on the leader DOF. The two
-        # DOFs are guaranteed distinct by the host-side validity mask.
-        if support.walks != 0:
-            support.units[line, slot] = unit_source(UNIT_MIMIC, k)
-        else:
-            at = jacobian_row(support, group_idx, art, wp.vec2i(art, -1))
-            clear_side(support, J_group, at, slot, art)
-            J_group[at[0], slot, at[1] + mimics.dof0[k] - dof_start] = 1.0
-            J_group[at[0], slot, at[1] + mimics.dof1[k] - dof_start] = -c1
-
-        rows.row_type[line, slot] = PGS_CONSTRAINT_TYPE_MIMIC
-        rows.sides[line, slot] = wp.vec2i(art, -1)
-        rows.row_parent[line, slot] = -1
-        rows.row_mu[line, slot] = 0.0
-        rows.row_beta[line, slot] = pgs_beta
-        rows.row_cfm[line, slot] = pgs_cfm
-        rows.phi[line, slot] = mimic_phi(joint_q[mimics.q0[k]], joint_q[mimics.q1[k]], c0, c1)
-        rows.target[line, slot] = 0.0
 
 
 @wp.kernel

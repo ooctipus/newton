@@ -24,7 +24,6 @@ from newton._src.solvers.feather_pgs.dense_rows import DenseRows, MfRows, RowSup
 from newton._src.solvers.feather_pgs.device_preludes import cuda_native, dual_native
 from newton._src.solvers.feather_pgs.friction_patches import PatchRowLaw
 from newton._src.solvers.feather_pgs.joint_table import JointTable
-from newton._src.solvers.feather_pgs.solver_fields import Mimics
 from newton._src.solvers.feather_pgs.tree_factor import (
     WALK_FRAME,
     WALK_LINK,
@@ -613,15 +612,11 @@ JOINT_TABLE_ARGUMENTS = {field.name: field.name for field in field_group.fields_
 MF_ROW_ARGUMENTS = {field.name: field.attr for field in field_group.fields_of(MfRows)}
 """The scenes' names of the :data:`MfRows` fields: the solver's attributes."""
 
-MIMIC_ARGUMENTS = {field.name: f"mimic_{field.name}" for field in field_group.fields_of(Mimics)}
-"""The scenes' names of the :data:`Mimics` fields: ``mimic_`` and the field's name."""
-
 STRUCT_ARGUMENTS = {
     ContactInput: CONTACT_ARGUMENTS,
     DenseRows: DENSE_ROW_ARGUMENTS,
     JointTable: JOINT_TABLE_ARGUMENTS,
     MfRows: MF_ROW_ARGUMENTS,
-    Mimics: MIMIC_ARGUMENTS,
     PatchRowLaw: {"patches": "friction_patches", "beta": "friction_anchor_beta"},
 }
 """The scenes' field names of each struct a kernel takes in place of separate arguments."""
@@ -709,29 +704,38 @@ PREFIX_RECORDS = {
 
 
 def prefix_warp_rows(
-    device, arts: int, size: int, rows: int, *, velocity=False, resolved=None, warps_per_block=4, **law
+    device, arts: int, size: int, rows: int, *, family="limits", mimics=0, resolved=None, warps_per_block=4, **law
 ) -> dict:
-    """Launch the general route's joint-limit warp (:func:`.rows.joint_limit_warp_kernel`), or its joint
-    velocity-limit warp (``velocity``), as :meth:`.rows.RowLaws.write` launches it, on the size groups' rows.
+    """Launch a joint row family's warp of the general route (``family``: the joint limits'
+    :func:`.rows.joint_limit_warp_kernel`, the joint velocity limits' ``"velocity"`` or the mimics' ``"mimics"``, at most
+    ``mimics`` an articulation), as :meth:`.rows.RowLaws.write` launches it, on the size groups' rows.
 
     Articulation ``a`` is world ``a`` and group ``a``, its ``size`` coordinates from ``a * size``; its world holds
-    ``rows`` rows. ``law`` holds the law's inputs by :data:`.prefix_rows.LAW`'s (and :data:`.prefix_rows.VELOCITY_LAW`'s)
-    names; every coordinate is a limit coordinate and none is prescribed unless it says. ``resolved`` is the worlds'
-    resolved mask (``None``: none). Returns each world's row count (``count``), the Jacobian rows ``J`` and the
-    records by name, as numpy arrays.
+    ``rows`` rows. ``law`` holds the law's inputs by :data:`.prefix_rows.LAW`'s (and the family's) names; every
+    coordinate is a limit coordinate and none is prescribed unless it says. ``resolved`` is the worlds' resolved mask
+    (``None``: none). Returns each world's row count (``count``), the Jacobian rows ``J``, the records by name and every
+    array the law was given, as numpy arrays.
     """
-    from newton._src.solvers.feather_pgs.prefix_rows import PrefixLaw, PrefixVelocityLaw  # noqa: PLC0415
-    from newton._src.solvers.feather_pgs.rows import (  # noqa: PLC0415
-        joint_limit_warp_kernel,
-        velocity_limit_warp_kernel,
-    )
+    from newton._src.solvers.feather_pgs import prefix_rows  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import rows as producers  # noqa: PLC0415
+
+    struct_type, kernel = {
+        "limits": (prefix_rows.PrefixLaw, producers.joint_limit_warp_kernel(size, warps_per_block)),
+        "velocity": (prefix_rows.PrefixVelocityLaw, producers.velocity_limit_warp_kernel(size, warps_per_block)),
+        "mimics": (prefix_rows.PrefixMimicLaw, producers.mimic_warp_kernel(size, warps_per_block, mimics)),
+    }[family]
 
     dofs = arts * size
     law = {"limit_q_index": np.arange(dofs), "prescribed": np.zeros(dofs), **law}
     counter = wp.zeros(arts, dtype=wp.int32, device=device)
     records = {name: wp.zeros((arts, rows), dtype=dtype, device=device) for name, dtype in PREFIX_RECORDS.items()}
+    fields = {field.name: field for field in field_group.fields_of(struct_type)}
+    law = {
+        name: value if not fields[name].dims else wp.array(np.asarray(value), dtype=fields[name].dtype, device=device)
+        for name, value in law.items()
+    }
     struct = field_group.upload(
-        PrefixVelocityLaw if velocity else PrefixLaw,
+        struct_type,
         device,
         slot_counter=counter,
         first=row_lines(device),
@@ -740,7 +744,6 @@ def prefix_warp_rows(
     )
     J = wp.zeros((arts, rows, size), dtype=wp.float32, device=device)
     order = wp.array(np.arange(arts), dtype=wp.int32, device=device)
-    kernel = (velocity_limit_warp_kernel if velocity else joint_limit_warp_kernel)(size, warps_per_block)
     wp.launch_tiled(
         kernel,
         dim=[(arts + warps_per_block - 1) // warps_per_block],
@@ -757,7 +760,12 @@ def prefix_warp_rows(
         block_dim=32 * warps_per_block,
         device=device,
     )
-    return {"count": counter.numpy(), "J": J.numpy(), **{name: array.numpy() for name, array in records.items()}}
+    arrays = {name: value for name, value in law.items() if isinstance(value, wp.array)}
+    return {
+        "count": counter.numpy(),
+        "J": J.numpy(),
+        **{name: array.numpy() for name, array in {**arrays, **records}.items()},
+    }
 
 
 def local_packed_rows(device, art_world, rows_by_art, incident=None) -> list:
