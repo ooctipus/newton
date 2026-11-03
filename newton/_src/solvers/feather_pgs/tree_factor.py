@@ -59,7 +59,6 @@ from .solver_fields import (
     Preelim,
     hold_drive_row,
 )
-from .sparse_mass_matrix import factor_indices
 from .spatial_laws import drive_force, drive_stiffness, spring_damper_stiffness
 from .tree_plan import TreePlan
 
@@ -492,11 +491,11 @@ class TreeFactor:
 
         arrays.allocate(ARTICULATION_ORIGIN, articulation=model.articulation_count)
 
-    def allocate_sparse(self, plan, articulations: int) -> None:
-        """The sparse class's pattern ``plan`` and its device indices (the support writer's ancestor masks): the walk is
+    def allocate_sparse(self, plan) -> None:
+        """The sparse class's pattern ``plan`` and its coordinates' ancestor masks (the support writer's): the walk is
         its factor (Z4.3), so it holds no factor array."""
         self.sparse_mass_matrix_plan = plan
-        self.sparse_mass_matrix_indices = factor_indices(plan, self.model.device)
+        self.sparse_ancestor_mask = wp.array(plan.ancestor_mask, dtype=wp.uint64, device=self.model.device)
 
     def scatter_armature(self) -> None:
         """Copy the effective armature (DOF-ordered) to the coordinates' (:attr:`dof_armature`)."""

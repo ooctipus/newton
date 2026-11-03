@@ -83,7 +83,7 @@ def fixture(floating, device):
     count = model.joint_dof_count // 2
     mass = TreePlan.build(parents, np.diff(model.joint_qd_start.numpy())[: len(parents)]).factor
     solver.placement.sparse_mass_matrix_size = count
-    solver.factor.allocate_sparse(mass, 2)
+    solver.factor.allocate_sparse(mass)
     solver.factor.sparse_factor_warps_per_block = 4
     operator = TreeSparseOperator(solver)
     owner = TreeKineticState(operator)

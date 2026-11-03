@@ -57,7 +57,7 @@ def fixture(floating, device, *, permuted=True, motion=False):
     count = model.joint_dof_count // arts
     mass = TreePlan.build(parents, np.diff(model.joint_qd_start.numpy())[: len(parents)]).factor
     solver.placement.sparse_mass_matrix_size = count
-    solver.factor.allocate_sparse(mass, arts)
+    solver.factor.allocate_sparse(mass)
     solver.factor.sparse_factor_warps_per_block = 4
     groups = np.array([3, 0, 5, 1, 4, 2] if permuted else list(range(arts)), np.int32)
     solver.forest.group_to_art[count].assign(groups)

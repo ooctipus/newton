@@ -34,7 +34,7 @@ import warp as wp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from newton._src.solvers.feather_pgs import sparse_factor, tree_kinetic_state
+from newton._src.solvers.feather_pgs import tree_kinetic_state
 from newton._src.solvers.feather_pgs import tree_scan as ts
 from newton._src.solvers.feather_pgs.device_preludes import dual_native, lane_group
 from newton.tests import feather_pgs_tree_scan_fixture as fx
@@ -71,7 +71,7 @@ def staged_kernel(item, layout, plan, repeat):
         @wp.func_native(snippet)
         def run_staged(
             base: wp.uint64,
-            p: sparse_factor.SparsePlan,
+            p: tree_kinetic_state.GroupTrees,
             plan: ts.ScanPlan,
             f: tree_kinetic_state.ForceInput,
             flag: int,
@@ -83,7 +83,7 @@ def staged_kernel(item, layout, plan, repeat):
         @wp.func_native(snippet)
         def run_staged(
             base: wp.uint64,
-            p_unused: sparse_factor.SparsePlan,
+            p_unused: tree_kinetic_state.GroupTrees,
             p: ts.ScanPlan,
             f: tree_kinetic_state.ForceInput,
             flag: int,
@@ -95,7 +95,7 @@ def staged_kernel(item, layout, plan, repeat):
 
     def run(
         base: wp.uint64,
-        sparse: sparse_factor.SparsePlan,
+        sparse: tree_kinetic_state.GroupTrees,
         structure: ts.ScanPlan,
         f: tree_kinetic_state.ForceInput,
         flag: int,

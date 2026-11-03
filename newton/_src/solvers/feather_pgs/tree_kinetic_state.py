@@ -16,7 +16,6 @@ from . import (
     cached_force,
     field_group,
     kernels,
-    sparse_factor,
 )
 from . import tree_scan as ts
 from .device_preludes import CUDA_ONLY, DevicePrelude, device_branches, substitute
@@ -97,9 +96,24 @@ class StateBank:
     body_qd: wp.array[wp.spatial_vector]
 
 
+GROUP_TREES = (
+    Field("dof_joint", wp.int32, ("dof",), owner="host"),
+    Field("group_to_art", wp.int32, ("art",), owner="step"),
+    Field("art_to_world", wp.int32, ("articulation",), owner="forest"),
+    Field("art_dof_start", wp.int32, ("articulation",), owner="forest", attr="articulation_dof_start"),
+    Field("art_joint_start", wp.int32, ("articulation_bound",), owner="model", attr="articulation_start"),
+    Field("joint_child", wp.int32, ("joint",), owner="model"),
+)
+"""A held group's trees: each group's articulation and its world, the articulations' first coordinate and joint, the
+joints' bodies and the template tree's joint of each coordinate."""
+
+GroupTrees = field_group.struct("GroupTrees", GROUP_TREES, __name__)
+
+
 @wp.struct
 class HeldResponse:
-    inverse: wp.array[float]
+    """A held group's validity and its status by tree, which the predictor reads."""
+
     valid: wp.array[int]
     status: wp.array[int]
 
@@ -1016,7 +1030,7 @@ def get_helpers(
         address: wp.uint64,
         group: int,
         ds: int,
-        p: sparse_factor.SparsePlan,
+        p: GroupTrees,
         plan: HeldPlan,
         data: PublicationData,
         cache: KineticData,
@@ -1120,7 +1134,7 @@ def get_state_kernel(
     def admit(
         block: int,
         logical_lane: int,
-        p: sparse_factor.SparsePlan,
+        p: GroupTrees,
         plan: HeldPlan,
         data: PublicationData,
         cache: KineticData,
@@ -1457,7 +1471,7 @@ def get_state_kernel(
     @wp.func
     def close(
         g: TreeGroup,
-        p: sparse_factor.SparsePlan,
+        p: GroupTrees,
         plan: HeldPlan,
         data: PublicationData,
         cache: KineticData,
@@ -1482,7 +1496,7 @@ def get_state_kernel(
     # repair's block list, bank the bank a comparing repair reads. Every other
     # kernel leaves them unread.
     def kinetic_state(
-        p: sparse_factor.SparsePlan,
+        p: GroupTrees,
         plan: HeldPlan,
         data: PublicationData,
         cache: KineticData,
@@ -1605,7 +1619,7 @@ def get_bank_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, coordinates: int =
     pack, roots, forest = layout.pack, len(layout.roots), layout.forest
 
     def bank_pass(
-        p: sparse_factor.SparsePlan,
+        p: GroupTrees,
         plan: HeldPlan,
         data: PublicationData,
         cache: KineticData,
@@ -1694,7 +1708,7 @@ def get_classify_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT):
     pack, roots, forest = layout.pack, len(layout.roots), layout.forest
 
     def classify(
-        p: sparse_factor.SparsePlan,
+        p: GroupTrees,
         plan: HeldPlan,
         data: PublicationData,
         cache: KineticData,
@@ -2632,13 +2646,12 @@ def _predictor_name(prefix: str, layout: TreeLayout, schedules: HeldSchedules | 
     return name + "_w" + hashlib.sha256(repr(walked).encode()).hexdigest()[:8]
 
 
-def _predictor_params(response: str):
+def _predictor_params():
     from .tree_factor import WalkTrees  # noqa: PLC0415
 
-    data_type = sparse_factor.SparseData if response == "sparse" else HeldResponse
     return (
-        ("p", sparse_factor.SparsePlan),
-        ("d", data_type),
+        ("p", GroupTrees),
+        ("d", HeldResponse),
         ("plan", HeldPlan),
         ("cache", KineticData),
         ("f", ForceInput),
@@ -2687,7 +2700,7 @@ def get_force_kernel(schedules: HeldSchedules, *, layout: TreeLayout = REFERENCE
         **_predictor_operations(layout, schedules),
     )
     name = _predictor_name("tree_kinetic_force", layout, schedules, response, classes)
-    return _tiled(layout, name, _predictor_params(response), source)
+    return _tiled(layout, name, _predictor_params(), source)
 
 
 _WALK_SOLVE = r"""    const int group = tid / $ROOT_COUNT, r = tid - group * $ROOT_COUNT;
@@ -2756,7 +2769,7 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
         name,
         (
             ("groups", int),
-            ("p", sparse_factor.SparsePlan),
+            ("p", GroupTrees),
             ("plan", HeldPlan),
             ("walk", WalkTrees),
             ("trial", TrialWords),
@@ -2790,8 +2803,8 @@ def get_predictor_kernel(
     ``twists`` holds the twist publication (:func:`publishes_twists`), which only CUDA builds; ``classes`` holds each
     root's walking class (:class:`.tree_factor.WalkClass`, ``None`` for a prescribed root); ``slips`` the classes'
     slip capacity, the border's build lanes (:func:`held_lambdas`); ``side`` the factor's
-    :attr:`.tree_factor.TreeFactor.walk_side`. ``response`` names only the factor data still bound
-    as ``d``.
+    :attr:`.tree_factor.TreeFactor.walk_side`. ``response`` names the group's kind (the sparse
+    class's tree, a dense size group, a compact diagonal) in the kernel's name only.
     """
     if response not in ("sparse", "cholesky", "diagonal"):
         raise ValueError("Unknown held tree response representation")
@@ -2840,4 +2853,4 @@ def get_predictor_kernel(
         **{name: text for name, text in clocks.items() if name not in ("CLOCK2", "CLOCK3")},
     )
     name = _predictor_name("tree_kinetic_predict", layout, schedules, response, classes)
-    return _tiled(layout, name, _predictor_params(response), source)
+    return _tiled(layout, name, _predictor_params(), source)

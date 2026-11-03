@@ -19,13 +19,39 @@ from types import SimpleNamespace
 import numpy as np
 import warp as wp
 
-from . import host_index
+from . import field_group, host_index
 from .device_proof import DeviceProof
-from .sparse_factor import SparseData, bind_operator_plan, operator_metadata
 from .tree_kinetic_owner import TreeKineticState, launch_switches, proof_runs, stage_clocks_on
 from .tree_kinetic_plan import FREE_JOINTS, make_plan, tree_joints
-from .tree_kinetic_state import HeldResponse
+from .tree_kinetic_state import GroupTrees, HeldResponse
 from .tree_plan import TreePlan, local_parents
+
+
+def operator_metadata(mass) -> dict:
+    """What the held groups read on the host of a tree's mass pattern ``mass`` (:class:`.tree_plan.FactorPattern`):
+    its coordinate lookup (``index``), each coordinate's joint (``dof_joint``) and its inverse columns' rows
+    (``inverse_nodes``, whose width the layout records)."""
+    counts = np.diff(mass.column_offsets).astype(np.int32)
+    nodes = np.full((mass.dof_count, int(counts.max(initial=0))), -1, np.int32)
+    col, rank = host_index.expand(counts)
+    nodes[col, rank] = mass.entry_rows[mass.column_entries]
+    return {"index": mass.lookup, "dof_joint": mass.dof_joint, "inverse_nodes": nodes}
+
+
+def bind_group_trees(solver, host, group_to_art) -> GroupTrees:
+    """A held group's trees (:data:`.tree_kinetic_state.GROUP_TREES`): the articulations ``group_to_art`` and the
+    template tree's joint of each coordinate from ``host`` (:func:`operator_metadata`)."""
+    model = solver.model
+    return field_group.upload(
+        GroupTrees,
+        model.device,
+        dof_joint=host["dof_joint"],
+        group_to_art=group_to_art,
+        art_to_world=solver.forest.art_to_world,
+        art_dof_start=solver.forest.articulation_dof_start,
+        art_joint_start=model.articulation_start,
+        joint_child=model.joint_child,
+    )
 
 
 @wp.kernel(enable_backward=False)
@@ -233,8 +259,8 @@ class TreeSparseOperator:
         mass = solver.factor.sparse_mass_matrix_plan
         device = solver.model.device
         self.host = operator_metadata(mass)
-        self.plan = bind_operator_plan(solver, mass.dof_count, self.host)
-        self.data = SparseData()
+        self.plan = bind_group_trees(solver, self.host, solver.forest.group_to_art[mass.dof_count])
+        self.data = HeldResponse()
         # The walk has no factor status: a pivot that is not positive reaches the predictor as a non-finite response.
         self.data.valid = wp.ones(self.plan.group_to_art.size, dtype=int, device=device)
         self.data.status = wp.zeros(self.plan.group_to_art.size, dtype=int, device=device)
@@ -263,14 +289,11 @@ class TreeHeldOperator:
         self.diagonal_mass = self.diagonal
         self.free_root, mass, self.host, self.layout = _size_group(solver, size, span, diagonal=self.diagonal)
         self.mass = mass
-        self.plan = bind_operator_plan(
-            solver, size, self.host, group_to_art=solver.forest.group_to_art[size][span[0] : span[1]]
-        )
+        self.plan = bind_group_trees(solver, self.host, solver.forest.group_to_art[size][span[0] : span[1]])
         self.data = HeldResponse()
         self.data.valid = wp.ones(count, dtype=int, device=device)
         self.data.status = wp.zeros(count, dtype=int, device=device)
         if self.diagonal:
-            self.data.inverse = solver.factor.diagonal_inverse_mass
             self.geometry_group = wp.array(np.arange(count, dtype=np.int32), dtype=int, device=device)
         self.kinetic_state = None
 
@@ -301,16 +324,14 @@ class TreeHeldOperator:
         )
 
     def bind_response(self):
-        """Bind the compact diagonal's inverse before a new launch or capture; a walking group binds nothing."""
-        if self.diagonal:
-            self.data.inverse = self.solver.factor.diagonal_inverse_mass
+        """Nothing to bind: the predictor reads the walk, the compact diagonal's inverse is the solver's."""
 
 
 class PrescribedRootOperator:
     """Own prescribed free bodies as zero-response roots of the same tree law.
 
-    A kinematic free body has six prescribed coordinates and no factor. With a
-    diagonal response whose inverse is zero, the shared predictor yields zero
+    A kinematic free body has six prescribed coordinates and no factor. With no
+    walking class (its root's class is ``None``), the shared predictor yields zero
     acceleration and the prescribed velocity, the free-root transport is
     skipped on kinematic roots, and the shared finish integrates the pose and
     publishes the body exactly as it does for a dynamic free body. This is
@@ -331,12 +352,10 @@ class PrescribedRootOperator:
         self.diagonal_mass = False
         self.group_to_art = wp.array(arts, dtype=int, device=device)
         self.mass, self.host, self.layout = _prescribed_group(solver, self.group_to_art)
-        self.plan = bind_operator_plan(solver, 6, self.host, group_to_art=self.group_to_art)
+        self.plan = bind_group_trees(solver, self.host, self.group_to_art)
         self.data = HeldResponse()
         self.data.valid = wp.ones(len(arts), dtype=int, device=device)
         self.data.status = wp.zeros(len(arts), dtype=int, device=device)
-        # Zero inverse mass: the prescribed coordinates never respond.
-        self.data.inverse = solver._arrays.placeholder(wp.float32, (solver.model.joint_dof_count,))
         self.kinetic_state = None
 
     def refresh(self, state_aug):
@@ -369,11 +388,10 @@ class RestOperator:
         self.layout, _ = make_plan(
             model, _plan_view(self.group_to_art, solver.forest.art_to_world, self.host), complete=False
         )
-        self.plan = bind_operator_plan(solver, 0, self.host, group_to_art=self.group_to_art)
+        self.plan = bind_group_trees(solver, self.host, self.group_to_art)
         self.data = HeldResponse()
         self.data.valid = wp.ones(len(arts), dtype=int, device=device)
         self.data.status = wp.zeros(len(arts), dtype=int, device=device)
-        self.data.inverse = solver._arrays.placeholder(wp.float32, (model.joint_dof_count,))
         self.kinetic_state = None
 
     def refresh(self, state_aug):
@@ -481,17 +499,12 @@ class ForestHeldOperator:
         self.mass = mass = TreePlan.build(parents, joint_counts).factor
         self.host = operator_metadata(mass)
         self.group_to_art = wp.array(arts[:, 0].copy(), dtype=int, device=device)
-        self.plan = bind_operator_plan(solver, 0, self.host, group_to_art=self.group_to_art)
+        self.plan = bind_group_trees(solver, self.host, self.group_to_art)
         self.size = mass.dof_count
         self.layout, _ = make_plan(model, self, complete=False)
         self.data = HeldResponse()
         self.data.valid = wp.ones(worlds, dtype=int, device=device)
         self.data.status = wp.zeros(worlds, dtype=int, device=device)
-        self.data.inverse = (
-            solver.factor.diagonal_inverse_mass
-            if any(f < 0 for f in self.root_families)
-            else wp.zeros(model.joint_dof_count, dtype=float, device=device)
-        )
         # Each diagonal-mass root's refresh reads its coordinates' H_ii from the forest's collection (from the root's
         # offset); a walking root refreshes nothing of its own.
         self.diagonal_mass = any(f < 0 for f in self.root_families)

@@ -748,7 +748,7 @@ class Sweep:
         self.sparse_local_factors = local_factors
         self.placement.sparse_max_row_support = int(max_support)
         self.sparse_velocity_limits = velocity_candidate
-        self.factor.allocate_sparse(plan, self.forest.n_arts_by_size[size])
+        self.factor.allocate_sparse(plan)
         self.placement.sparse_body_dof_mask = wp.array(body_masks, dtype=wp.uint64, device=model.device)
         if use_support_table:
             self.placement.sparse_row_support = row_supports(
@@ -847,7 +847,7 @@ class Sweep:
             walk = factor.walk_view()
             sink.walk, sink.release, sink.support = walk, walk.release, placement.sparse_row_support
             sink.body_mask = placement.sparse_body_dof_mask
-            sink.dof_mask = factor.sparse_mass_matrix_indices.ancestor_mask
+            sink.dof_mask = factor.sparse_ancestor_mask
             sink.world_offset = forest.articulation_world_dof_offset
             sink.response_dofs = forest.articulation_response_dof_count
             sink.v_hat, sink.row_cfm, sink.diag = v_hat, placement.row_cfm, placement.diag

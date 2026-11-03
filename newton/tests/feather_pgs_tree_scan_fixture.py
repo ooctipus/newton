@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import sparse_factor, tree_kinetic_state
+from newton._src.solvers.feather_pgs import tree_kinetic_state
 from newton._src.solvers.feather_pgs import tree_scan as ts
 from newton._src.solvers.feather_pgs.device_preludes import CUDA_ONLY, device_branches
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
@@ -295,7 +295,7 @@ def pass_kernel(item: Pass, layout: TreeLayout, plan: TreePlan, repeat: int = 1,
         @wp.func_native(snippet)
         def run_pass(
             address: wp.uint64,
-            p: sparse_factor.SparsePlan,
+            p: tree_kinetic_state.GroupTrees,
             plan: ts.ScanPlan,
             f: tree_kinetic_state.ForceInput,
             flag: int,
@@ -307,7 +307,7 @@ def pass_kernel(item: Pass, layout: TreeLayout, plan: TreePlan, repeat: int = 1,
         @wp.func_native(snippet)
         def run_pass(
             address: wp.uint64,
-            p_unused: sparse_factor.SparsePlan,
+            p_unused: tree_kinetic_state.GroupTrees,
             p: ts.ScanPlan,
             f: tree_kinetic_state.ForceInput,
             flag: int,
@@ -320,7 +320,7 @@ def pass_kernel(item: Pass, layout: TreeLayout, plan: TreePlan, repeat: int = 1,
     def run(
         base: wp.uint64,
         total: int,
-        sparse: sparse_factor.SparsePlan,
+        sparse: tree_kinetic_state.GroupTrees,
         plan: ts.ScanPlan,
         f: tree_kinetic_state.ForceInput,
         flag: int,
@@ -360,7 +360,7 @@ class Inputs:
 
     scratch: wp.array
     total: int
-    sparse: sparse_factor.SparsePlan
+    sparse: tree_kinetic_state.GroupTrees
     scan: ts.ScanPlan
     force: tree_kinetic_state.ForceInput
     twists: wp.array
@@ -370,7 +370,7 @@ def inputs(plan: TreePlan, layout: TreeLayout, groups: int, seed: int, device) -
     total = layout.sizes()["TOTAL"]
     scratch = wp.array(random_scratch(layout, groups, seed).reshape(-1), dtype=float, device=device)
     rng = np.random.default_rng(seed + 1)
-    sparse = sparse_factor.SparsePlan()
+    sparse = tree_kinetic_state.GroupTrees()
     sparse.joint_child = wp.array(np.arange(groups * plan.count, dtype=np.int32), dtype=int, device=device)
     force = tree_kinetic_state.ForceInput()
     force.publish_twists = 1

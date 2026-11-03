@@ -20,12 +20,11 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import joint_table
-from newton._src.solvers.feather_pgs.held_tree import HeldTree
+from newton._src.solvers.feather_pgs.held_tree import HeldTree, operator_metadata
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
-from newton._src.solvers.feather_pgs.sparse_factor import operator_metadata
 from newton._src.solvers.feather_pgs.tree_kinetic_plan import make_plan
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
