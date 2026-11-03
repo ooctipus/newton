@@ -68,7 +68,7 @@ HeldPlan = field_group.struct("HeldPlan", HELD_PLAN, __name__)
 
 KINETIC_CACHE = field_group.FieldGroup(
     Field("bias", wp.float32, ("group", "dof"), fill=None, owner="cache"),
-    Field("com_offset", wp.vec3, ("group", "body"), fill=None, owner="cache"),
+    Field("com_offset", wp.vec3, ("joint",), owner="factor", attr="joint_com_offset"),
     Field("diagonal", wp.float32, ("group", "diagonal"), fill=None, owner="cache"),
     Field("current_valid", wp.int32, ("articulation",), owner="factor", attr="fk_id_cache_valid"),
     Field("geometry_valid", wp.int32, ("group",), owner="cache"),
@@ -979,7 +979,9 @@ def get_helpers(
         data.body_qd[body] = wp.spatial_vector(point_velocity(velocity, public_radius), wp.spatial_bottom(velocity))
         if wp.static(body_velocity):
             data.body_v_s[body] = velocity
-        cache.com_offset[g.group, local] = radius
+        # The body's centre of mass relative to its articulation's origin, by its joint: the predictor's external
+        # wrenches shift there, and the walk's refresh forms its inertia's lever from it (tree_factor.WalkTrees.now_com).
+        cache.com_offset[g.js + local] = radius
         if wp.static(clocked):
             clock_b2 = _clock()
         _store_terms(g.address, local, wrench, record, g.refresh)
@@ -1417,7 +1419,10 @@ def get_state_kernel(
                         a1 = wp.spatial_vector(wp.cross(wp.spatial_bottom(a1), point - origin), wp.spatial_bottom(a1))
                         a2 = wp.spatial_vector(wp.cross(wp.spatial_bottom(a2), point - origin), wp.spatial_bottom(a2))
                     store_walk_columns(data.walk_now, data.joint_qd.shape[0], start, lin, ang, l0, l1, l2, a0, a1, a2)
-                frame = point + shift
+                # The frame point is the articulation's, relative to its origin (WalkTrees.now_origin, the
+                # articulation_origin poses() published), as the body's centre of mass the publication stores: their
+                # differences keep their digits wherever the articulation stands.
+                frame = point - origin
                 for k in range(3):
                     data.walk_now_link[joint, wp.static(WALK_FRAME) + k] = frame[k]
             _store_motion(g.address, local, velocity)
@@ -2602,7 +2607,7 @@ def _predictor_operations(layout: TreeLayout, schedules: HeldSchedules) -> dict[
         "PHYSICAL_TABLE": layout.physical_table(),
         "KINEMATIC_FLAG": str(int(BodyFlags.KINEMATIC)),
         "SHIFT": cached_force.shift_wrench(
-            "input", "cache.com_offset.data[group*$BODIES+local]", "s[6*local+k]", "s[6*local+3+k]"
+            "input", "cache.com_offset.data[js+local]", "s[6*local+k]", "s[6*local+3+k]"
         ),
         "REDUCE": reduction,
     }

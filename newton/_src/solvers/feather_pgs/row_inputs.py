@@ -70,8 +70,8 @@ class CompactLocalRows:
                 free = f"""
         }} else if (code == {SEED_SECONDARY}) {{
             walk_free();
-            incident += walk_wrench(&s_Z[staged + {P}], s_v + {P}, free_data, free_link, free_now, free_now_link, 0,
-                                    wrench);"""
+            incident += walk_wrench(&s_Z[staged + {P}], s_v + {P}, free_data, free_link, free_now, free_now_link,
+                                    free_shift, 0, wrench);"""
             contact = f""" else {{
     // A contact row: a wrench seed on each side.
     for (int side = 0; side < 2; ++side) {{
@@ -79,7 +79,8 @@ class CompactLocalRows:
         const float* wrench = &packets.seed.data[(size_t)(packet * 2 + side) * 6];
         if (code >= 0) {{
             walk_primary();
-            incident += walk_wrench(&s_Z[staged], s_v, walk_data, walk_link, walk_now, walk_now_link, code, wrench);{free}
+            incident += walk_wrench(&s_Z[staged], s_v, walk_data, walk_link, walk_now, walk_now_link, walk_shift,
+                                    code, wrench);{free}
         }}
     }}
 }}"""

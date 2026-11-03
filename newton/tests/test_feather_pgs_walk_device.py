@@ -112,7 +112,9 @@ _UP = """    if (tid >= body.shape[0]) return;
         start -= 1;
         s = nullptr;
     }
-    WALK_UP(d, l, s, f, body.data[tid], start, p, w, sink);
+    // The fixture's frames are one geometry's: no origin shift between the factor's and the step's.
+    const float shift[3] = {0.0f, 0.0f, 0.0f};
+    WALK_UP(d, l, s, f, shift, body.data[tid], start, p, w, sink);
 """
 
 _TREE = """    if (tid >= u.shape[0]) return;

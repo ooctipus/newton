@@ -189,6 +189,9 @@ def _walk_fixture(device, rng):
     link[:, WALK_FRAME : WALK_FRAME + 3] = rng.normal(0.0, 0.5, (joints, 3))
     walk.link = wp.array(link, dtype=float, device=device)
     walk.body_joint = wp.array(np.arange(joints, dtype=np.int32), dtype=int, device=device)
+    # The frame points relative to an origin at the world's: the seeds' levers are the world points less them.
+    walk.joint_art = wp.zeros(joints, dtype=int, device=device)
+    walk.origin = wp.zeros(1, dtype=wp.vec3, device=device)
     walk.joint_start = wp.array(
         np.array([3 * w + 2 * a for w in range(WORLDS) for a in range(2)], dtype=np.int32), dtype=int, device=device
     )

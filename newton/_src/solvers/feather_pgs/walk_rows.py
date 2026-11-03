@@ -115,12 +115,13 @@ def body_wrench(walk: WalkTrees, body: int, direction: wp.vec3, point: wp.vec3, 
     """The seed of a row acting on ``body`` along ``direction`` at ``point`` (a pure ``torque`` about it), by the
     contact law (:func:`.contact_laws.contact_seed`, :func:`.contact_laws.spin_seed`): a wrench at the body's frame, the
     factor's (:attr:`.tree_factor.WalkTrees.link`), where the walk shifts the step's columns the finish published to
-    take the step's ``J``. The lever arm is the world points' difference here; the law takes it from wherever it is formed."""
+    take the step's ``J``. The lever arm is the world point less the frame point, which is the articulation's (relative to
+    its origin, :attr:`.tree_factor.WalkTrees.origin`); the law takes it from wherever it is formed."""
     if torque:
         return spin_seed(direction)
     j = walk.body_joint[body]
     frame = wp.vec3(walk.link[j, WALK_FRAME], walk.link[j, WALK_FRAME + 1], walk.link[j, WALK_FRAME + 2])
-    return contact_seed(direction, point - frame)
+    return contact_seed(direction, (point - walk.origin[walk.joint_art[j]]) - frame)
 
 
 @wp.func
@@ -826,7 +827,7 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                     for (int e = base; e < rank(c); ++e) ST(Z + e, 0.0f);
                 for (int i = 0; i < 6 * $rows; ++i) p[i] = w[i] = 0.0f;
                 WALK_SEED(data, c, x, p, store);
-                WALK_UP(data, link, nullptr, nullptr, RD(walk.dof_body.data + d0 + c), c - 1, p, w, store);
+                WALK_UP(data, link, nullptr, nullptr, nullptr, RD(walk.dof_body.data + d0 + c), c - 1, p, w, store);
                 incident[0] += x[0] * RD(vh + c);
             }
         } else {
@@ -836,14 +837,17 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                 const float sign = k == 0 ? 1.0f : -1.0f;
                 const int j = RD(walk.body_joint.data + body);
                 const int local = j - j0;
-                // The seeds' wrenches at the body's frame (the factor's), where the walk's shifted columns are J's.
+                // The seeds' wrenches at the body's frame (the factor's), where the walk's shifted columns are J's: the
+                // frame point is the articulation's, so the world point meets it through the articulation's origin.
                 const float* o = walk.link.data + (size_t)j * $link + $frame;
+                const float* origin = reinterpret_cast<const float*>(walk.origin.data + art);
                 for (int r = 0; r < $rows; ++r) {
                     float* q = p + 6 * r;
                     const float* d = unit.frame.data[r == 1 || r == 2 ? r : 0];
                     const auto& at = r == 0 ? unit.point : unit.friction_point;
                     const float f[3] = {sign * d[0], sign * d[1], sign * d[2]};
-                    const float l[3] = {at[0] - RD(o), at[1] - RD(o + 1), at[2] - RD(o + 2)};
+                    const float l[3] = {(at[0] - RD(origin)) - RD(o), (at[1] - RD(origin + 1)) - RD(o + 1),
+                                        (at[2] - RD(origin + 2)) - RD(o + 2)};
                     if (r >= rows) {
                         for (int i = 0; i < 6; ++i) q[i] = 0.0f;
                     } else if ($spin && r == 3) {
@@ -866,7 +870,9 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                     if (r < rows) incident[r] += j * RD(vh + c);
                     store(r, c, z, j);
                 };
-                WALK_UP(data, link, now, now_link, local, WALK_FIRST_OF(local + 1) - 1, p, w, sink);
+                float shift[3];
+                WALK_SHIFT(walk, art, shift);
+                WALK_UP(data, link, now, now_link, shift, local, WALK_FIRST_OF(local + 1) - 1, p, w, sink);
             }
         }
         // A slipping tree's release (the predictor's border), root-most slip first, on the side's entries along each
