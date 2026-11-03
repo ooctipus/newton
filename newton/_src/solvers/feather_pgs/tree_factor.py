@@ -2273,6 +2273,17 @@ class WalkClass:
         if self.half and len(self.half) != self.first[-1]:
             raise ValueError("a walk's class names a half for every coordinate or for none")
 
+    def root_path(self, c: int) -> list[int]:
+        """Coordinate ``c``'s root path, leaf first: ``c`` down to its body's first, then each ancestor's coordinates
+        last first (the release's path, :class:`WalkRelease`): :func:`.tree_scan.root_path` with the table compiled."""
+        body = max(b for b in range(len(self.parent)) if self.first[b] <= c < self.first[b + 1])
+        path = []
+        while body >= 0:
+            path += list(range(c, self.first[body] - 1, -1))
+            body = self.parent[body]
+            c = self.first[body + 1] - 1 if body >= 0 else -1
+        return path
+
     def half_of(self, c: int) -> int:
         """Coordinate ``c``'s column half as the class's walk compiles it (:data:`WALK_BOTH`: read from the record)."""
         return self.half[c] if self.half else WALK_BOTH
@@ -2854,18 +2865,6 @@ $paths
         }"""
 
 
-def _root_path(walk: WalkClass, c: int) -> list[int]:
-    """Coordinate ``c``'s root path in the class, leaf first: ``c`` down to its body's first, then each ancestor's
-    coordinates last first (the release's path, :class:`WalkRelease`)."""
-    body = max(b for b in range(len(walk.parent)) if walk.first[b] <= c < walk.first[b + 1])
-    path = []
-    while body >= 0:
-        path += list(range(c, walk.first[body] - 1, -1))
-        body = walk.parent[body]
-        c = walk.first[body + 1] - 1 if body >= 0 else -1
-    return path
-
-
 def _leave_class(k: int, walk: WalkClass, node: tuple[int, ...] | None, release: bool, unroll: int) -> str:
     """The leave of a tree of class ``k``: its read of the change, the release where the class can slip, the unit."""
     n = walk.coordinates
@@ -2887,7 +2886,7 @@ def _leave_class(k: int, walk: WalkClass, node: tuple[int, ...] | None, release:
         # coordinate), so the copy stays in registers.
         steps = []
         for c in range(n):
-            path = _root_path(walk, c)
+            path = walk.root_path(c)
             body = " ".join(
                 f"{{ const float x = g[{t}] * r[{d}] + a[{t}] * t; r[{d}] = x; t -= b[{t}] * x; }}"
                 for t, d in reversed(list(enumerate(path)))

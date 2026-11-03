@@ -1784,6 +1784,18 @@ _HELD_COLUMN = ts.step(ts.Direction.UP, ts.LOADED, "p", source="(c == i ? 1.0f :
 serial border's and the held border's."""
 _EDGE_DOWN = ts.edge(ts.Direction.DOWN, ts.LOADED.lever, "V")
 """A joint of the border's walks, on a held or loaded link ``l``: the wrench ``p`` up, the twist ``V`` down."""
+_SLIP_PATH = ("walk.dof_body.data[d0 + i]", "i")
+_COLUMN_PATH = ts.root_path(
+    *_SLIP_PATH, count="++t", joint=["float l[6];", "WALK_LOAD_LINK(l, link, body, up);", *_EDGE_UP]
+)
+_BORDER_PATHS = {
+    "slips_head": ts.statements([ts.root_path(*_SLIP_PATH, count="++length")[0]], 12),
+    "group_head": ts.statements([ts.root_path("body0", "i", count="++t")[0]], 12),
+    "path_tail": ts.statements([ts.root_path("body0", "i")[1]], 12),
+    "column_head": ts.statements([_COLUMN_PATH[0]], 8),
+    "column_tail": ts.statements([_COLUMN_PATH[1]], 8),
+}
+"""The border's root paths (:data:`_BORDER`): a slip's, its column's (the wrench up each joint), its group's."""
 
 _BORDER = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step on its all-K walk, with no factor array. The release
     // R = L_F^-1 L_K, built from the all-K walk's columns and the K-free pivot, is the decided factor's whitening; the
@@ -1824,15 +1836,9 @@ _BORDER = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step
             if (!(released[i] > 0.0f))
                 continue;
             int length = 0, root = i;
-            #pragma unroll 1
-            for (int body = walk.dof_body.data[d0 + i], c = i; body >= 0;) {
-                #pragma unroll 1
-                for (; c >= WALK_FIRST_OF(body); --c, ++length)
+            $slips_head
                     root = c;
-                body = WALK_PARENT_OF(body);
-                if (body >= 0)
-                    c = WALK_FIRST_OF(body + 1) - 1;
-            }
+            $path_tail
             if (!fits || s >= cap || length > depth) {
                 FRAME_STATUS(1);
                 continue;
@@ -1854,23 +1860,11 @@ _BORDER = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step
         float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         float x = 1.0f;
         int t = 0;
-        #pragma unroll 1
-        for (int body = walk.dof_body.data[d0 + i], c = i; body >= 0;) {
-            #pragma unroll 1
-            for (; c >= WALK_FIRST_OF(body); --c, ++t) {
+        $column_head
                 float d[$unpacked];
                 $record(d, data + $coordinate * c);
                 $column_step
-            }
-            const int up = WALK_PARENT_OF(body);
-            if (up >= 0) {
-                float l[6];
-                WALK_LOAD_LINK(l, link, body, up);
-                $edge_p
-                c = WALK_FIRST_OF(up + 1) - 1;
-            }
-            body = up;
-        }
+        $column_tail
     };
     // BORDER_GROUP(a, d0, data, released, kept, pivot, column, l, s), a lane a group: if slip l is its group's first,
     // the group's slips in order, each column into the dense column, the group's releases before it applied (b_j' =
@@ -1894,15 +1888,9 @@ _BORDER = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step
             const size_t at = ((size_t)a * cap + j) * depth;
             const int i = release.dof.data[a * cap + j], body0 = walk.dof_body.data[d0 + i];
             int t = 0;
-            #pragma unroll 1
-            for (int body = body0, c = i; body >= 0;) {
-                #pragma unroll 1
-                for (; c >= WALK_FIRST_OF(body); --c, ++t)
+            $group_head
                     column[c] = release.b.data[at + t];
-                body = WALK_PARENT_OF(body);
-                if (body >= 0)
-                    c = WALK_FIRST_OF(body + 1) - 1;
-            }
+            $path_tail
             #pragma unroll 1
             for (int k = l; k < j; ++k) {
                 if (group[k] != group[l])
@@ -1911,10 +1899,7 @@ _BORDER = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step
             }
             float alpha = -released[i];
             t = 0;
-            #pragma unroll 1
-            for (int body = body0, c = i; body >= 0;) {
-                #pragma unroll 1
-                for (; c >= WALK_FIRST_OF(body); --c, ++t) {
+            $group_head
                     const float d = pivot[c], scale = sqrtf(d), b = column[c];
                     float dbar = d + alpha * (b * scale) * (b * scale);
                     if (c == i)
@@ -1929,11 +1914,7 @@ _BORDER = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step
                     release.g.data[at + t] = scale / sqrtf(dbar);
                     pivot[c] = dbar;
                     column[c] = 0.0f;
-                }
-                body = WALK_PARENT_OF(body);
-                if (body >= 0)
-                    c = WALK_FIRST_OF(body + 1) - 1;
-            }
+            $path_tail
             #pragma unroll 1
             for (; t < depth; ++t)
                 release.coordinate.data[at + t] = -1;
@@ -1977,7 +1958,7 @@ def walk_tree_prelude(side: bool = True) -> DevicePrelude:
         unpacked=WALK_UNPACKED,
         record=record_load(side),
         column_step=ts.statements([_COLUMN[0], "x = 0.0f;", *_COLUMN[1:], "column[t] = z;"], 16),
-        edge_p=ts.statements(_EDGE_UP, 16),
+        **_BORDER_PATHS,
     )
     name = "walk_tree" if side else "walk_tree_one_half"
     return DevicePrelude(name, walk.source + "\n" + tree, cpu=walk.cpu + "\n" + tree)

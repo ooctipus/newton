@@ -99,6 +99,7 @@ __all__ = [
     "dot",
     "edge",
     "enter",
+    "root_path",
     "scan_arrays",
     "schedule_costs",
     "schedule_features",
@@ -1073,3 +1074,31 @@ def statements(lines, pad: int = 0) -> str:
 def braced(lines) -> str:
     """Native statements in a block of their own, indented by four."""
     return "{\n" + "\n".join("    " + line for line in "\n".join(lines).split("\n")) + "\n}"
+
+
+def root_path(body: str, c: str, *, count: str = "", joint=()) -> tuple[str, str]:
+    """The path table's walk of a root path (``WALK_PARENT_OF``, ``WALK_FIRST_OF``), leaf first: coordinate ``c`` of
+    ``body`` down to its body's first, then each ancestor's coordinates, last first. Returns the statements before and
+    after a coordinate's visit (``c`` and ``body`` in scope), both loops rolled: ``joint`` passes a body to its parent
+    ``up`` (the edge); ``count`` advances with ``c``."""
+    head = [
+        "#pragma unroll 1",
+        f"for (int body = {body}, c = {c}; body >= 0;) {{",
+        "    #pragma unroll 1",
+        f"    for (; c >= WALK_FIRST_OF(body); --c{', ' + count if count else ''}) {{",
+    ]
+    tail = [
+        "    }",
+        "    const int up = WALK_PARENT_OF(body);",
+        "    if (up >= 0) {",
+        *_indented(joint, 8),
+        "        c = WALK_FIRST_OF(up + 1) - 1;",
+        "    }",
+        "    body = up;",
+        "}",
+    ]
+    return "\n".join(head), "\n".join(tail)
+
+
+def _indented(lines, pad: int) -> list[str]:
+    return [" " * pad + line for line in "\n".join(lines).split("\n")] if lines else []
