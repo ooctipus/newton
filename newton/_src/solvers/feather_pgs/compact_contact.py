@@ -3,9 +3,10 @@
 
 """The compact boundary: the sparse diagonal's contact rows written whole where the contacts are read.
 
-A thread per contact row, in the contacts' collision order, writes the row by the one writer's row on the slots sink
-(:data:`.walk_rows.write_slot_row`: its records by the contact law, its seeds walked, its header): the row the sparse
-diagonal's writer (:func:`.walk_rows.write_slot_rows`) writes from a unit source, without the unit source's pass.
+A thread per contact row, in the contacts' collision order, writes the row by the one writer's unit walker on the slots
+sink (:func:`produce_contacts`: its records by the contact law, the row walked as its own unit, its slots and header):
+the rows the sparse diagonal's writer (:func:`.walk_rows.write_slot_rows`) writes from their unit sources, without
+the unit sources' pass.
 Allocation, admission, scheduling and the solve stay the original pipeline's. Persistent patch friction writes its
 tangent rows with the patch row law; the patch link, ``_FrictionPatchState.link``, runs after this producer and alone
 links the patch rings and divides the friction coefficient, in one ``link_patch_routes`` launch over every route.
@@ -14,10 +15,19 @@ links the patch rings and divides the friction coefficient, in one ``link_patch_
 import warp as wp
 
 from .contact_input import ContactInput
-from .dense_rows import UNIT_CONTACT, DenseRows, RowSupport
+from .dense_rows import UNIT_CONTACT, DenseRows, unit_source
 from .friction_patches import PatchRowLaw, patch_row_law
-from .tree_factor import WalkTrees
-from .walk_rows import JointSeeds, SlotRows, bind_slot_rows, write_slot_row
+from .row_build import write_contact_row
+from .walk_rows import (
+    JointSeeds,
+    PackedSink,
+    SlotRows,
+    bind_slot_rows,
+    read_slot_unit,
+    slot_header,
+    slot_sink,
+    walk_slot_row,
+)
 
 
 def supported(solver) -> bool:
@@ -43,9 +53,8 @@ def supported(solver) -> bool:
 def produce_contacts(
     data: ContactInput,
     rows: DenseRows,
-    support: RowSupport,
     slots: SlotRows,
-    walk: WalkTrees,
+    sink: PackedSink,
     law: PatchRowLaw,
     dt: float,
     contact_speculative_scale: float,
@@ -55,7 +64,9 @@ def produce_contacts(
     material: int,
 ):
     """Publish each contact's rows in their original collision order, one thread per row (3 per contact, 4 under
-    contact torsion), by the one writer's row on the slots sink (:data:`.walk_rows.write_slot_row`).
+    contact torsion): its records by the contact law (:func:`.row_build.write_contact_row`), then the row walked as
+    its own unit by the one writer's unit walker with the star (:func:`.walk_rows.packed_walker`), its slots and its
+    header (:func:`.walk_rows.slot_header`).
 
     Tangent rows act at the friction location and follow the patch row law (``patch_tangent_row``): under
     persistent patches at the patch friction location with the anchor's tangential phi, ``law.beta`` and the
@@ -69,10 +80,16 @@ def produce_contacts(
     if data.path[contact] != 0 or slot < 0 or row >= data.slots_needed[contact]:
         return
     world = data.world[contact]
-    write_slot_row(
-        rows, support, slots, data.first[world], slots.dense_group[world], slot + row, UNIT_CONTACT, 4 * contact + row,
-        data, law, walk, JointSeeds(), data.incident, dt, contact_speculative_scale, contact_w,
-        restitution_velocity_threshold, weighted, material, slots.Z, slots.incident,
+    body_a, body_b, direction, row_point = write_contact_row(data, law, contact, row, False)
+    unit = read_slot_unit(
+        rows, data, law, JointSeeds(), data.first[world], slot + row, unit_source(UNIT_CONTACT, 4 * contact + row),
+        body_a, body_b, direction, row_point,
+    )  # fmt: skip
+    unit.group = slots.dense_group[world]
+    walk_slot_row(sink, unit)
+    slot_header(
+        rows, slots, data, data.incident, unit, dt, contact_speculative_scale, contact_w,
+        restitution_velocity_threshold, weighted, material,
     )  # fmt: skip
 
 
@@ -85,16 +102,14 @@ def launch_contacts(solver, data: ContactInput, dt: float) -> None:
     # would overflow.
     pool = solver.placement.contact_pool
     laws = solver.laws
-    rows = 4 if laws.contact_torsion_enabled else 3
     pool.launch(
         produce_contacts,
-        (pool.launch_rows(), rows),
+        (pool.launch_rows(), 4 if laws.contact_torsion_enabled else 3),
         inputs=[
             data,
             bind_dense_rows(solver.placement),
-            solver.placement.row_support(),
             bind_slot_rows(solver),
-            solver.factor.walk_view(),
+            slot_sink(solver),
             patch_row_law(solver),
             dt,
             solver.options.contact_speculative_scale,

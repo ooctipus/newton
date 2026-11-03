@@ -2506,8 +2506,7 @@ class WalkRelease:
     released inverse and the recurrence's ``a`` (``beta d^1/2``) and ``g`` (``(d / dbar)^1/2``): ``[tree, slip, step]``,
     as deep as the class's deepest root path. Slip ``j``'s ``R_j`` maps a footprint ``z`` along its path, leaf first,
     ``u = z_c - b s``, ``s += a u``, ``z_c = g u``; ``R = R_(s-1) ... R_0 = L_F^-1 L_K``, the decided factor's whitening on
-    the all-``K`` walk, which keeps every row's support (``WALK_RELEASE``, ``WALK_RELEASE_T``, ``WALK_RELEASE_IT``; the
-    rows' :func:`release_into`). Two slips' paths meet if and only if their roots are equal (their ``R_j`` touch
+    the all-``K`` walk, which keeps every row's support (``WALK_RELEASE``, ``WALK_RELEASE_T``, ``WALK_RELEASE_IT``). Two slips' paths meet if and only if their roots are equal (their ``R_j`` touch
     disjoint coordinates otherwise, and commute), and a footprint whose support holds every ancestor of its coordinates
     (a row's) meets slip ``j``'s path if and only if it holds ``root[j]``."""
 
@@ -2677,16 +2676,16 @@ _WALK_INTO = """    WALK_TREE(reinterpret_cast<const int*>(walk.path.data + join
 
 
 @functools.cache
-def _walk_into_snippet(side: bool) -> str:
+def _walk_into_snippet() -> str:
     from .device_preludes import dual_native  # noqa: PLC0415
 
     return dual_native(
         substitute(_WALK_INTO, coordinate=WALK_COORDINATE, link=WALK_LINK, now=WALK_NOW),
-        preludes=(walk_paths_prelude(1, side=side), walk_row_prelude(1)),
+        preludes=(walk_paths_prelude(1), walk_row_prelude(1)),
     )
 
 
-@wp.func_native(_walk_into_snippet(True))
+@wp.func_native(_walk_into_snippet())
 def walk_into(
     walk: WalkTrees,
     joint0: int,
@@ -2714,51 +2713,10 @@ def walk_into(
     ...
 
 
-@wp.func_native(_walk_into_snippet(False))
-def walk_into_one_half(
-    walk: WalkTrees,
-    joint0: int,
-    dof0: int,
-    bodies: int,
-    coordinates: int,
-    body: int,
-    covector: int,
-    k: int,
-    seed: wp.spatial_vector,
-    qd: wp.array[float],
-    add: int,
-    out: wp.array3d[float],
-    line: int,
-    slot: int,
-    entry: int,
-) -> wp.vec2:
-    """:func:`walk_into` for a model whose records have no side (:attr:`TreeFactor.walk_side` false)."""
-    ...
-
-
 RELEASE_SLIPS = 16
 """The most slipping drives a tree's release holds (:class:`WalkRelease`, three floats and a coordinate a slip and path
 step): a tree past it keeps the rest's ``K`` and ``constraint_capacity_status()["slip_frames"]`` flags it. It bounds the
 release's memory until a data-sized arena holds it (DECISIONS 10-24); nothing else reads it."""
-
-
-_RELEASE_INTO = """    WALK_RELEASE(walk.release, art, out.data + ((size_t)line * out.shape[1] + slot) * out.shape[2] + entry);
-"""
-
-
-@functools.cache
-def _release_into_snippet() -> str:
-    from .device_preludes import dual_native  # noqa: PLC0415
-
-    return dual_native(_RELEASE_INTO, preludes=(walk_paths_prelude(1),))
-
-
-@wp.func_native(_release_into_snippet())
-def release_into(walk: WalkTrees, art: int, out: wp.array3d[float], line: int, slot: int, entry: int):
-    """``out[line, slot, entry + c] <- (R out)_c``: tree ``art``'s slips' release on a row's side whose coordinate ``c``
-    sits at entry ``entry + c`` (``WALK_RELEASE``, the first slip first, each along its path leaf first,
-    :class:`WalkRelease`)."""
-    ...
 
 
 # ---------------------------------------------------------------------------------------------------------------------
