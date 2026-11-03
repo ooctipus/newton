@@ -1931,7 +1931,7 @@ def _walk_loads(coordinate: int, link: int, now: int, half: int = WALK_BOTH) -> 
 
 
 @functools.cache
-def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int) -> DevicePrelude:
+def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int, half: int = WALK_BOTH) -> DevicePrelude:
     """The device walk of a class of trees (one tree, or a world's forest), for both devices: a prelude declaring
 
     - the class's path table in constant memory (``WALK_PARENT``, ``WALK_FIRST``): topology, one table per class, so a
@@ -1949,6 +1949,7 @@ def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int) -> 
         first: Each body's first coordinate, and the count after the last.
         rows: The rows a lane walks together: the seed's unit (1 a limit, 2 a velocity limit, 3 a point contact, 4
             with spin).
+        half: The class's records' half as its walk reads them (``WALK_READ``, :func:`.tree_scan.classes_half`).
     """
     if len(first) != len(parent) + 1 or any(p >= b for b, p in enumerate(parent)):
         raise ValueError("a walk's path table needs every parent before its children and a first coordinate per body")
@@ -1967,10 +1968,10 @@ def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int) -> 
         now=WALK_NOW,
         frame=WALK_LINK_FRAME,
         batch=WALK_SLIP_BATCH,
-        **_walk_loads(WALK_COORDINATE, WALK_LINK, WALK_NOW),
+        **_walk_loads(WALK_COORDINATE, WALK_LINK, WALK_NOW, half),
     )
     return DevicePrelude(
-        f"walk_{rows}_{len(parent)}",
+        f"walk_{rows}_{len(parent)}" + ("" if half == WALK_BOTH else f"_{half}"),
         _walk_loads_text(cuda=True) + "\n" + substitute(_WALK_TABLE, table) + "\n" + walk,
         cpu=_walk_loads_text(cuda=False) + "\n" + substitute(_WALK_TABLE_CPU, table) + "\n" + walk,
     )

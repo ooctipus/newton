@@ -108,6 +108,7 @@ __all__ = [
     "by_class",
     "channels",
     "choose_schedule",
+    "classes_half",
     "cross",
     "device_plan",
     "dot",
@@ -1257,6 +1258,14 @@ def record_half(side: bool) -> int:
     """The half a reader of any tree's records passes the one access: named by the record, with the side where a
     column can have two halves (``side``, :attr:`.tree_factor.TreeFactor.walk_side`)."""
     return WALK_BOTH if side else WALK_EITHER
+
+
+def classes_half(classes) -> int:
+    """The half a walk that reads the records of the walking classes ``classes`` by one text passes the one access
+    (``WALK_READ``): the half every coordinate of theirs shares, compiled; else named by the record
+    (:func:`record_half`)."""
+    halves = {half for walk in classes for half in (walk.half or (WALK_BOTH,))}
+    return halves.pop() if len(halves) == 1 else record_half(WALK_BOTH in halves)
 
 
 # ---------------------------------------------------------------------------------------------------------------------

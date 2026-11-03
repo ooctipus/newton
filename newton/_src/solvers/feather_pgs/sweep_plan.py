@@ -73,6 +73,7 @@ from .sweep_levels import (
 )
 from .sweep_routes_sparse import _SPARSE_LOCAL_WORKSPACE_BYTES
 from .tree_plan import TreePlan, local_parents
+from .tree_scan import classes_half
 
 __all__ = ["Sweep"]
 
@@ -820,7 +821,12 @@ class Sweep:
         self.support_lanes = walk_rows.SUPPORT_UNIT_LANES if wp.get_device(model.device).is_cuda else 1
         self.support_units_kernel = walk_rows.support_units_kernel(4 if torsion else 3, self.support_lanes)
         self.support_rows = walk_rows.support_rows_kernel(
-            parent, first, node, records=self.placement.sparse_contact_records is not None, torsion=torsion
+            parent,
+            first,
+            node,
+            records=self.placement.sparse_contact_records is not None,
+            torsion=torsion,
+            half=classes_half(walk for walk in factor.walk_classes if (walk.parent, walk.first) == (parent, first)),
         )
         # Where the step's one leave reads each coordinate's change (tree_factor.walk_leave_kernel): the sparse sweep
         # publishes it in factor coordinates (factor_velocity_delta), so a tree's changes start at its offset in its

@@ -73,7 +73,7 @@ from .tree_factor import (
     walk_prelude,
     walk_row_prelude,
 )
-from .tree_scan import held_fits, record_half
+from .tree_scan import WALK_BOTH, held_fits, record_half
 
 __all__ = [
     "SUPPORT_UNIT_LANES",
@@ -853,7 +853,7 @@ _SUPPORT_WRENCH = """                    const auto& at = r == 0 ? unit.point : 
                                 $spin && r == 3);"""
 
 
-def _support_snippet(parent: tuple, first: tuple, node: tuple, rows: int, records: bool, spin: bool) -> str:
+def _support_snippet(parent: tuple, first: tuple, node: tuple, rows: int, records: bool, spin: bool, half: int) -> str:
     record = ""
     if records:
         record = substitute(_SUPPORT_RECORD, rows=rows, tail=_SPIN_TAIL if spin else "")
@@ -879,7 +879,8 @@ def _support_snippet(parent: tuple, first: tuple, node: tuple, rows: int, record
         diag=_HEADER_DIAG,
         rd="__ldg(p)",
     )
-    return dual_native(body, preludes=(walk_prelude(parent, first, rows), walk_row_prelude(rows), _support_table(node)))
+    walk = walk_prelude(parent, first, rows, half)
+    return dual_native(body, preludes=(walk, walk_row_prelude(rows), _support_table(node)))
 
 
 @wp.struct
@@ -1156,7 +1157,13 @@ def support_units_kernel(unit_rows: int, lanes: int) -> wp.Kernel:
 
 @cache
 def support_rows_kernel(
-    parent: tuple[int, ...], first: tuple[int, ...], node: tuple[int, ...], *, records: bool, torsion: bool
+    parent: tuple[int, ...],
+    first: tuple[int, ...],
+    node: tuple[int, ...],
+    *,
+    records: bool,
+    torsion: bool,
+    half: int = WALK_BOTH,
 ) -> wp.Kernel:
     """The support placement's walkers (case K1, the writer's second launch): ``threads`` lanes, sized to the GPU,
     striding over the step's :class:`UnitList` (:func:`support_units_kernel`), its wide units first, so a warp runs one
@@ -1170,12 +1177,13 @@ def support_rows_kernel(
     contact rows' records are the first launch's; a joint row's records and unit source are its producer's (the limit,
     velocity-limit and mimic producers). The walker stores its footprints at their ranks in its support
     (``row_factor``, with the coordinates ``row_dof`` or the support class ``row_class``), its diagonal ``|z|^2 + cfm``,
-    its incident ``J v_hat`` and its rhs by the row law (:func:`.kernels.row_bias`).
+    its incident ``J v_hat`` and its rhs by the row law (:func:`.kernels.row_bias`). ``half`` is the class's records'
+    half (:func:`.tree_scan.classes_half`), compiled into its walks.
     """
     unit_rows = 4 if torsion else 3
 
     def walker(rows: int, with_records: bool):
-        snippet = _support_snippet(parent, first, node, rows, with_records, torsion and rows == 4)
+        snippet = _support_snippet(parent, first, node, rows, with_records, torsion and rows == 4, half)
         return unit_walker(f"support_walk_{rows}", snippet)
 
     walk_one = walker(1, False)
