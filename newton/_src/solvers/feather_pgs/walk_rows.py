@@ -86,6 +86,7 @@ from .tree_factor import (
     walk_into,
     walk_into_one_half,
     walk_prelude,
+    walk_row_prelude,
 )
 from .tree_scan import held_fits
 
@@ -755,7 +756,7 @@ _SUPPORT_TABLE = """    static __constant__ int SUPPORT_NODE[$n] = {$node};"""
 _SUPPORT_TABLE_CPU = """    static const int SUPPORT_NODE[$n] = {$node};"""
 
 _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_rows_kernel): its seeds walked through the class's
-    // path table (WALK_UP, WALK_SEED), each footprint stored at its rank in the row's support (SUPPORT_NODE: a
+    // path table (WALK_ROW), each footprint stored at its rank in the row's support (SUPPORT_NODE: a
     // coordinate's factor coordinate, the support mask's bit), the unit's Gram and incident from the same walk.
     const auto POPC = [](unsigned long long bits) -> int {
 #if defined(__CUDA_ARCH__)
@@ -878,7 +879,6 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
             }
             if (!add && rows == $rows) gram();
         };
-        float p[6 * $rows], w[6 * $rows];
         if (covector) {
             for (int k = 0; k < seeds; ++k) {
                 const int c = (k == 0 ? dof0 : dof1) - d0;
@@ -889,12 +889,11 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                 // the row's zeros.
                 if (!add)
                     for (int e = base; e < rank(c); ++e) ST(Z + e, 0.0f);
-                for (int i = 0; i < 6 * $rows; ++i) p[i] = w[i] = 0.0f;
-                WALK_SEED(data, c, x, p, store);
-                WALK_UP(data, link, nullptr, nullptr, nullptr, RD(walk.dof_body.data + d0 + c), c - 1, p, w, store);
+                WALK_ROW(data, link, nullptr, nullptr, nullptr, RD(walk.dof_body.data + d0 + c), c, x, store);
                 incident[0] += x[0] * RD(vh + c);
             }
         } else {
+            float seed[6 * $rows];
             for (int k = 0; k < 2; ++k) {
                 const int body = k == 0 ? body_a : body_b;
                 if (body < 0 || (k == 0 ? art_a : art_b) != art) continue;
@@ -906,7 +905,7 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                 const float* o = walk.link.data + (size_t)j * $link + $frame;
                 const float* origin = reinterpret_cast<const float*>(walk.origin.data + art);
                 for (int r = 0; r < $rows; ++r) {
-                    float* q = p + 6 * r;
+                    float* q = seed + 6 * r;
                     const float* d = unit.frame.data[r == 1 || r == 2 ? r : 0];
                     const auto& at = r == 0 ? unit.point : unit.friction_point;
                     const float f[3] = {sign * d[0], sign * d[1], sign * d[2]};
@@ -927,7 +926,6 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                         q[4] = l[2] * f[0] - l[0] * f[2];
                         q[5] = l[0] * f[1] - l[1] * f[0];
                     }
-                    for (int i = 0; i < 6; ++i) w[6 * r + i] = q[i];
                 }
                 // The step's J entry of each footprint against v_hat: the rows' incident velocity.
                 const auto sink = [&](int r, int c, float z, float j) {
@@ -936,7 +934,7 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
                 };
                 float shift[3];
                 WALK_SHIFT(walk, art, shift);
-                WALK_UP(data, link, now, now_link, shift, local, WALK_FIRST_OF(local + 1) - 1, p, w, sink);
+                WALK_ROW(data, link, now, now_link, shift, local, -1, seed, sink);
             }
         }
         // A slipping tree's release (the predictor's border), root-most slip first, on the side's entries along each
@@ -1065,7 +1063,7 @@ def _support_snippet(parent: tuple, first: tuple, node: tuple, rows: int, record
         spin=int(spin),
         record=record,
     )
-    return dual_native(body, preludes=(walk_prelude(parent, first, rows), _support_table(node)))
+    return dual_native(body, preludes=(walk_prelude(parent, first, rows), walk_row_prelude(rows), _support_table(node)))
 
 
 @wp.struct
