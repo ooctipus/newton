@@ -85,7 +85,6 @@ __all__ = [
     "prepare_augmented_drives",
     "walk_down_prelude",
     "walk_leave_kernel",
-    "walk_leave_prelude",
     "walk_paths_prelude",
     "walk_prelude",
     "walk_row_prelude",
@@ -2162,23 +2161,17 @@ _LEAVE = """    const int tree = tid / lanes, lane = tid - tree * lanes;
     const int art = arts.data[tree];
     const int cls = walk_class.data[art];
     if (cls < 0) return;
-    WALK_LEAVE(cls, art, du.data + du_base.data[art], v_out.data, lane, lanes);"""
-
-_WALK_LEAVE = """$tables    // WALK_LEAVE(cls, art, change, out, lane, lanes): the leave of tree art, of class cls (an index into the classes
-    // the prelude was emitted for), v += P^T L^-T R^T du onto its coordinates of out (a global coordinate's array):
-    // coordinate c's change is change[node(c)] (its class's node, or c). The lane group (lane of lanes; a lane alone is
-    // one of one) fetches it into L1 and lane 0 walks; walk is the kernel's WalkTrees.
-    const auto WALK_LEAVE = [&](const int cls, const int art, const float* const change, float* const out,
-                                const int lane, const int lanes) {
-        const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art], n = walk.dofs.data[art];
-        float* const v = out + d0;
-        const float* const data = walk.data.data + (size_t)d0 * $coordinate;
-        const float* const link = walk.link.data + (size_t)j0 * $link;
-        const auto prior = [&](const int c) -> float { return v[c]; };
-        const auto qd = [&](const int c, const float q, const float p) { v[c] = p + q; };
-        const auto twist = [](const int, const float*) {};
-$classes
-    };"""
+    const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art], n = walk.dofs.data[art];
+    // Coordinate c's change is change[node(c)]: the walk's du at the tree's coordinates (node(c) = c), or a sweep's
+    // own layout (the tree's base there, and its class's node of each coordinate).
+    const float* const change = du.data + du_base.data[art];
+    float* const v = v_out.data + d0;
+    const float* const data = walk.data.data + (size_t)d0 * $coordinate;
+    const float* const link = walk.link.data + (size_t)j0 * $link;
+    const auto prior = [&](const int c) -> float { return v[c]; };
+    const auto qd = [&](const int c, const float q, const float p) { v[c] = p + q; };
+    const auto twist = [](const int, const float*) {};
+$classes"""
 
 _LEAVE_CLASS = """    // The group's lanes fetch the tree's changes and velocity into L1; lane 0 prepares the change (ready) and walks the
     // tree down (WALK_DOWN: its records and links asked of L1 WALK_TOUCH items ahead, loaded WALK_AHEAD items ahead;
@@ -2220,9 +2213,8 @@ $paths
         }"""
 
 
-def _leave_class(k: int, walk: WalkClass, node: tuple[int, ...] | None, release: bool, unroll: int) -> tuple[str, str]:
-    """The leave of a tree of class ``k``: its node table (where the class reads a sweep's own layout), and its read of
-    the change, the release where the class can slip, the unit."""
+def _leave_class(k: int, walk: WalkClass, node: tuple[int, ...] | None, release: bool, unroll: int) -> str:
+    """The leave of a tree of class ``k``: its read of the change, the release where the class can slip, the unit."""
     n = walk.coordinates
     at = "c" if node is None else f"LEAVE_NODE_{k}[c]"
     table = ""
@@ -2277,59 +2269,23 @@ def _leave_class(k: int, walk: WalkClass, node: tuple[int, ...] | None, release:
         head = substitute(
             _LEAVE_RELEASE, how="A loop-form class: the copy on the stack.", coordinates=max(n, 1), node=at, copy=copy
         )
-    return table, substitute(_LEAVE_CLASS, span=span, release=head, cls=k)
-
-
-@functools.cache
-def walk_leave_prelude(
-    classes: tuple[WalkClass, ...], release: bool, nodes: tuple[tuple[int, ...], ...] | None = None
-) -> DevicePrelude:
-    """The one leave, ``v += P^T L^-T R^T du`` of one tree, for both devices: a prelude declaring
-    ``WALK_LEAVE(cls, art, change, out, lane, lanes)`` (``walk`` the kernel's :class:`WalkTrees`), which a sweep's
-    epilogue calls on each tree it finished and the step's leave kernel on each walking tree. Coordinate ``c``'s change
-    is ``change[node(c)]``: ``node`` its class's (``nodes``: the support placement's factor coordinates) or ``c``. The
-    lane group fetches the tree's changes and velocities into L1; lane 0 takes, where the class can slip (``release``),
-    the slips' release transposed on a copy of the changes (in registers for a straight-line class: each slip's root
-    path by a switch on its coordinate), and walks the tree down (``WALK_DOWN`` of :func:`walk_down_prelude`, which the
-    kernel declares before it, with a walk paths prelude where it releases: ``WALK_RELEASE_T``).
-
-    Args:
-        classes: The walking classes, indexed by ``cls``.
-        release: Whether a tree of the classes can slip (:attr:`TreeFactor.walk_slip_capacity`).
-        nodes: Each class's node of each coordinate, or ``None`` for the walk's own coordinates.
-    """
-    if not classes:
-        raise ValueError("a leave needs a class")
-    if nodes is not None and (
-        len(nodes) != len(classes) or any(len(k) != walk.coordinates for k, walk in zip(nodes, classes, strict=True))
-    ):
-        raise ValueError("the leave needs a node for each coordinate of each class")
-    parts = [
-        _leave_class(k, walk, None if nodes is None else nodes[k], release, WALK_UNROLL)
-        for k, walk in enumerate(classes)
-    ]
-    text = substitute(
-        _WALK_LEAVE,
-        tables="".join(table for table, _ in parts),
-        classes=indent_text(ts.by_class([body for _, body in parts]), 8),
-        coordinate=WALK_COORDINATE,
-        link=WALK_LINK,
-    )
-    tag = hashlib.sha256(repr((classes, release, nodes)).encode()).hexdigest()[:8]
-    return DevicePrelude(f"walk_leave_{tag}", text, cpu=text)
+    return table + substitute(_LEAVE_CLASS, span=span, release=head, cls=k)
 
 
 @functools.cache
 def walk_leave_kernel(
     classes: tuple[WalkClass, ...], release: bool, nodes: tuple[tuple[int, ...], ...] | None = None
 ) -> wp.Kernel:
-    """The step's one leave of every walking tree (``arts``), a lane group a tree (``lanes``: :data:`LEAVE_LANES` on
-    CUDA, one on the CPU; ``dim`` trees times lanes): :func:`walk_leave_prelude`'s ``WALK_LEAVE`` on the tree's class
-    at ``walk_class``, coordinate ``c``'s change ``du[du_base[art] + node(c)]``: every placement's sweep adds its change
-    in the walk's coordinates into :attr:`WalkTrees.du` (the base the tree's first coordinate, ``node(c) = c``), the
-    support placement's sparse sweep publishes it in its factor coordinates (the base the tree's offset in its world's,
-    ``node`` its class's factor coordinates, ``nodes``), onto ``v_out``, which holds the predictor and the changes of
-    the placements that do not walk.
+    """The step's one leave, ``v += P^T L^-T R^T du``, of every walking tree (``arts``), a lane group a tree (``lanes``:
+    :data:`LEAVE_LANES` on CUDA, one on the CPU; ``dim`` trees times lanes), by the walk down (``WALK_DOWN`` of
+    :func:`walk_down_prelude`, the tree's class at ``walk_class``). Coordinate ``c``'s change is
+    ``du[du_base[art] + node(c)]``: every placement's sweep adds its change in the walk's coordinates into
+    :attr:`WalkTrees.du` (the base the tree's first coordinate, ``node(c) = c``), the support placement's sparse sweep
+    publishes it in its factor coordinates (the base the tree's offset in its world's, ``node`` its class's factor
+    coordinates, ``nodes``). Where the class can slip (``release``) the leave takes the slips' release transposed on a
+    copy of the tree's changes, in registers for a straight-line class (each slip's root path by a switch on its
+    coordinate), and walks each tree down onto ``v_out``, which holds the predictor and the changes of the placements
+    that do not walk.
 
     Args:
         classes: The walking classes, indexed by ``walk_class``.
@@ -2338,6 +2294,15 @@ def walk_leave_kernel(
     """
     from .kernel_template import THREADS, KernelTemplate  # noqa: PLC0415
 
+    if nodes is not None and (
+        len(nodes) != len(classes) or any(len(k) != walk.coordinates for k, walk in zip(nodes, classes, strict=True))
+    ):
+        raise ValueError("the leave needs a node for each coordinate of each class")
+    bodies = [
+        _leave_class(k, walk, None if nodes is None else nodes[k], release, WALK_UNROLL)
+        for k, walk in enumerate(classes)
+    ]
+    body = substitute(_LEAVE, classes=indent_text(ts.by_class(bodies), 4), coordinate=WALK_COORDINATE, link=WALK_LINK)
     tag = hashlib.sha256(repr((classes, nodes)).encode()).hexdigest()[:8]
     return KernelTemplate(
         f"walk_leave_{len(classes)}_{tag}" + ("_release" if release else ""),
@@ -2350,10 +2315,9 @@ def walk_leave_kernel(
             ("du_base", wp.array[int]),
             ("v_out", wp.array[float]),
         ),
-        _LEAVE,
+        body,
         THREADS,
-        preludes=((walk_paths_prelude(1),) if release else ())
-        + (walk_down_prelude(classes, WALK_UNROLL), walk_leave_prelude(classes, release, nodes)),
+        preludes=((walk_paths_prelude(1),) if release else ()) + (walk_down_prelude(classes, WALK_UNROLL),),
         dual=True,
         native_name="walk_leave_native",
     ).kernel()
