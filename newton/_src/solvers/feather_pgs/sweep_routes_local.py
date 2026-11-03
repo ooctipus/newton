@@ -349,7 +349,7 @@ def local_owned_source(
         PACKED_SIDES,
         *law_preludes(PROJECTION_LAW, *((CONE_LAW,) if torsion else ())),
         *solve_policy.preludes,
-        op.walk_prelude(),
+        *op.walk_preludes(),
     )
     return cuda_native(body, preludes=preludes), staging
 

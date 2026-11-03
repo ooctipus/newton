@@ -43,7 +43,7 @@ from .sweep import (
     material_arguments,
 )
 from .sweep_routes import MF_GS_ABI
-from .tree_factor import WalkTrees, walk_paths_prelude
+from .tree_factor import WalkTrees, walk_paths_prelude, walk_row_prelude
 
 PARALLEL_ABI = kernel_template.params(
     *MF_GS_ABI[:-1],
@@ -263,7 +263,8 @@ def parallel_source(
         *law_preludes(PROJECTION_LAW, *((CONE_LAW,) if torsion else ())),
     )
     # The walk last, as the general sweep declares it (sweep_routes.mf_gs_source).
-    return cuda_native(body, preludes=(*preludes, *solve_policy.preludes, walk_paths_prelude(1))), staging
+    walk = (walk_paths_prelude(1), *((walk_row_prelude(1),) if operands is not None else ()))
+    return cuda_native(body, preludes=(*preludes, *solve_policy.preludes, *walk)), staging
 
 
 @cache

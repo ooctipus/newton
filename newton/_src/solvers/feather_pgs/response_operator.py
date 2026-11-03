@@ -748,16 +748,9 @@ class WalkedRows:
         Zi[(offset + c) * ZS] += z;
         incident += j * s_v[offset + c];
     }};
-    float p[6], w[6], shift[3];
+    float shift[3];
     WALK_SHIFT(walk, art, shift);
-    int top = WALK_FIRST_OF(body + 1) - 1;
-    for (int e = 0; e < 6; ++e) p[e] = w[e] = k < 0 ? seed[e] : 0.0f;
-    if (k >= 0) {{
-        WALK_SEED(data, k, seed, p, sink);
-        top = k - 1;
-        now = nullptr;
-    }}
-    WALK_UP(data, link, now, now_link, shift, body, top, p, w, sink);
+    WALK_ROW(data, link, now, now_link, shift, body, k, seed, sink);
 }};"""
 
     def _sides(self) -> tuple[tuple[int, int, str], ...]:
@@ -1308,16 +1301,18 @@ class LocalBlock(ResidualBlock):
         """Ints a lane group stages: the primary's path table, the free body's entry, each primary coordinate's body."""
         return 2 * self.bodies + 2 + self.primary if self.staged else 0
 
-    def walk_prelude(self):
-        """The walk's functions over this block's layout (:func:`.tree_factor.walk_paths_prelude`): the staged copy's
-        strides, or the device walk's."""
-        from .tree_factor import walk_paths_prelude  # noqa: PLC0415 (tree_factor imports this module)
+    def walk_preludes(self) -> tuple:
+        """The walk's functions over this block's layout (:func:`.tree_factor.walk_paths_prelude`: the staged copy's
+        strides, or the device walk's), and with ``seeds`` the seed walk its rows' walks bind
+        (:func:`.tree_factor.walk_row_prelude`)."""
+        from .tree_factor import walk_paths_prelude, walk_row_prelude  # noqa: PLC0415 (tree_factor imports this module)
 
+        walk = walk_paths_prelude(1)
         if self.staged:
-            return walk_paths_prelude(
+            walk = walk_paths_prelude(
                 1, coordinate=self.coordinate_floats, link=self.link_floats, now=self.coordinate_floats
             )
-        return walk_paths_prelude(1)
+        return (walk, walk_row_prelude(1)) if self.seeds else (walk,)
 
     def prologue(self) -> str:
         """Bind the world's trees on the walk (``walk``, :class:`.tree_factor.WalkTrees`; articulation ``art``, and
@@ -1447,14 +1442,13 @@ class LocalBlock(ResidualBlock):
             lines += [
                 "// A covector seed weight e_dof of the primary tree walked into the row's footprints z; its incident.",
                 "const auto walk_covector = [&](float* z, const int dof, const float weight) -> float {",
-                "    float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}, w[6], incident = 0.0f;",
+                "    float incident = 0.0f;",
                 "    const float x[1] = {weight};",
-                "    const auto sink = [&](int, int c, float y, float j) {",
+                "    WALK_ROW(walk_data, walk_link, nullptr, nullptr, nullptr, walk_dof_body[dof], dof, x,",
+                "             [&](int, int c, float y, float j) {",
                 "        z[c] += y;",
                 "        incident += j * s_v[c];",
-                "    };",
-                "    WALK_SEED(walk_data, dof, x, p, sink);",
-                "    WALK_UP(walk_data, walk_link, nullptr, nullptr, nullptr, walk_dof_body[dof], dof - 1, p, w, sink);",
+                "    });",
                 "    return incident;",
                 "};",
             ]
@@ -1466,10 +1460,8 @@ class LocalBlock(ResidualBlock):
                     "const auto walk_wrench = [&](float* z, const float* v, const float* data, const float* link,",
                     "                             const float* now, const float* now_link, const float* shift, const int b,",
                     "                             const float* wrench) -> float {",
-                    "    float p[6], w[6], incident = 0.0f;",
-                    "    for (int k = 0; k < 6; ++k) p[k] = w[k] = wrench[k];",
-                    "    WALK_UP(data, link, now, now_link, shift, b, WALK_FIRST_OF(b + 1) - 1, p, w,",
-                    "            [&](int, int c, float y, float j) {",
+                    "    float incident = 0.0f;",
+                    "    WALK_ROW(data, link, now, now_link, shift, b, -1, wrench, [&](int, int c, float y, float j) {",
                     "        z[c] += y;",
                     "        incident += j * v[c];",
                     "    });",
