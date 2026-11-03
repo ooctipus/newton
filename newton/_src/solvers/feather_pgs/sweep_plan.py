@@ -1434,6 +1434,7 @@ class Sweep:
                         velocity_limit_pass=self._parallel_velocity_limit_pass(),
                         weighted=self.laws.set.weighted,
                         frame=self._tier_frame(),
+                        walk_half=classes_half(self.factor.walk_classes),
                         **({"torsion": True} if self.laws.contact_torsion_enabled else {}),
                     )
                     self.tiers.append(dataclasses.replace(tier, tier=tier_index))

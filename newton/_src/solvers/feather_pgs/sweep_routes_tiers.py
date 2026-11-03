@@ -44,6 +44,7 @@ from .sweep import (
 )
 from .sweep_routes import MF_GS_ABI
 from .tree_factor import walk_paths_prelude, walk_row_prelude
+from .tree_scan import WALK_BOTH
 
 PARALLEL_ABI = kernel_template.params(
     *MF_GS_ABI[:-1],
@@ -159,6 +160,7 @@ def parallel_source(
     weighted: bool = False,
     material: bool = False,
     frame: tuple[int, int] = (0, 0),
+    walk_half: int = WALK_BOTH,
 ) -> tuple[str, Staging]:
     """The native body of a parallel tier: a world's dense rows (at most ``rows``, more than ``min_rows``) under the
     Jacobi law, a thread per row; under ``torsion`` a contact's spin row steps and projects with its pair.
@@ -262,7 +264,7 @@ def parallel_source(
         *law_preludes(PROJECTION_LAW, *((CONE_LAW,) if torsion else ())),
     )
     # The walk last, as the general sweep declares it (sweep_routes.mf_gs_source).
-    walk = (walk_paths_prelude(1), *((walk_row_prelude(1),) if operands is not None else ()))
+    walk = (walk_paths_prelude(1, half=walk_half), *((walk_row_prelude(1),) if operands is not None else ()))
     return cuda_native(body, preludes=(*preludes, *solve_policy.preludes, *walk)), staging
 
 
@@ -285,6 +287,7 @@ def parallel_kernel(
     weighted: bool = False,
     material: bool = False,
     frame: tuple[int, int] = (0, 0),
+    walk_half: int = WALK_BOTH,
 ) -> SweepTier:
     """A parallel tier: its kernel (:data:`PARALLEL_ABI`, the world queue) and its launch descriptor.
 
@@ -293,7 +296,8 @@ def parallel_kernel(
     carries the solver's free-body capacity ``mf_max_constraints``) and admits its velocity-limit rows as unilateral
     rows. Its worlds' stored rows (:mod:`.walk_rows`) lie at their coordinates, ``max_world_dofs`` entries a row.
     With ``weighted`` its contact rows step by their weights, ``material`` contacts' from their compliance; ``frame``
-    is each tree's slip capacity (:class:`.WalkedRows`).
+    is each tree's slip capacity (:class:`.WalkedRows`); ``walk_half`` the half its walks read the records by, the
+    model's (:func:`.tree_scan.classes_half`).
     """
     if material and not weighted:
         raise ValueError("material contacts step by their weights: their tiers are weighted")
@@ -315,6 +319,7 @@ def parallel_kernel(
         weighted=weighted,
         material=material,
         frame=frame,
+        walk_half=walk_half,
     )
     staging.check("the parallel tier", arch_budget(device_arch))
     (NA, NB, OA, OB), operands = _operands(max_constraints, max_world_dofs, **options)
@@ -324,6 +329,7 @@ def parallel_kernel(
         f"sweep_{'parallel' if row_inputs is None else 'keyed_parallel'}_{max_constraints}_{mf_max_constraints}"
         f"_{max_world_dofs}_rows{AM}_min{int(min_rows)}_sweeps{int(sweeps)}_nt{NT}_ink{NA}_{NB}_o{OA}_{OB}"
         + (f"_frame{int(frame[0])}_{int(frame[1])}" if any(frame) else "")
+        + ("" if walk_half == WALK_BOTH else f"_half{walk_half}")
         + ("_linked" if linked_rows else "")
         + ("_lw" if velocity_limit_pass else "")
         + ("_weighted" if weighted else "")
