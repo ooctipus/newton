@@ -30,14 +30,10 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
     def _empty_mf_inputs(world_count: int, device: str | wp.Device) -> list:
         return [
             wp.zeros(world_count, dtype=wp.int32, device=device),
-            row_lines(device),
             wp.zeros((world_count, 4), dtype=wp.int32, device=device),
-            wp.zeros((world_count, 1), dtype=wp.float32, device=device),
             wp.zeros((world_count, 1, 6), dtype=wp.float32, device=device),
             wp.zeros((world_count, 1, 6), dtype=wp.float32, device=device),
-            wp.zeros((world_count, 1), dtype=wp.float32, device=device),
             0,
-            wp.zeros((world_count, 1), dtype=wp.float32, device=device),
             wp.zeros((world_count, 1), dtype=wp.float32, device=device),
         ]
 
@@ -430,8 +426,10 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 int(mf_types[row]) | (0 << 16),
             ]
 
-        dense_impulses = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
-        mf_impulses = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
+        # One row store line: the dense rows, then the free bodies' from the dense capacity.
+        impulses = wp.zeros((1, 2 * max_constraints), dtype=wp.float32, device=device)
+        row_mu = np.zeros((1, 2 * max_constraints), dtype=np.float32)
+        row_mu[0, max_constraints : max_constraints + len(mf_mu)] = mf_mu
         # Both factors are the identity: the one writer's rows are J, their diagonals |J|^2 + cfm.
         dense_row = np.concatenate([primary_jacobian[0], secondary_jacobian[1]], axis=1)
         stored_diagonal = dense_cfm + np.sum(dense_row * dense_row, axis=1)[None]
@@ -467,21 +465,17 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 wp.array(dense_rhs, device=device),
                 wp.array([[PGS_CONSTRAINT_TYPE_MIMIC, 0, 0, 0]], dtype=wp.int32, device=device),
                 wp.full((1, max_constraints), -1, dtype=wp.int32, device=device),
-                wp.zeros((1, max_constraints), dtype=wp.float32, device=device),
+                wp.array(row_mu, device=device),
                 wp.array([mf_count], dtype=wp.int32, device=device),
-                row_lines(device),
                 wp.array(packed_meta, device=device),
-                mf_impulses,
                 wp.zeros_like(wp.array(mf_jacobian, device=device)),
                 wp.array(mf_jacobian, device=device),
-                wp.array([np.pad(mf_mu, (0, 1))], device=device),
                 0,
-                wp.zeros((1, max_constraints), dtype=wp.float32, device=device),
-                wp.zeros((1, max_constraints), dtype=wp.float32, device=device),
+                wp.zeros((1, 2 * max_constraints), dtype=wp.float32, device=device),
                 iterations,
                 1.0,
                 diagonal,
-                dense_impulses,
+                impulses,
                 velocity,
                 (walk := chain_walk(device, [np.eye(primary_dofs), np.eye(secondary_dofs)])),
             ],
@@ -525,8 +519,13 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 expected_velocity[primary_dofs + row] += new_impulse - old_impulse
 
         np.testing.assert_allclose(velocity.numpy(), expected_velocity, rtol=0.0, atol=3.0e-6)
-        np.testing.assert_allclose(dense_impulses.numpy()[0, 0], expected_dense_impulse, rtol=0.0, atol=3.0e-6)
-        np.testing.assert_allclose(mf_impulses.numpy()[0, :mf_count], expected_mf_impulses, rtol=0.0, atol=3.0e-6)
+        np.testing.assert_allclose(impulses.numpy()[0, 0], expected_dense_impulse, rtol=0.0, atol=3.0e-6)
+        np.testing.assert_allclose(
+            impulses.numpy()[0, max_constraints : max_constraints + mf_count],
+            expected_mf_impulses,
+            rtol=0.0,
+            atol=3.0e-6,
+        )
 
 
 def _patch_ring_solves(device, load):

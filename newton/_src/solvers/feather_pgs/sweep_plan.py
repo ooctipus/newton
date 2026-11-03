@@ -1620,16 +1620,11 @@ class Sweep:
             "world_row_parent": placement.row_parent,
             "world_row_mu": placement.row_mu,
             "mf_constraint_count": placement.mf_constraint_count,
-            # The free bodies' records are the row store's, from its body base on each world's line.
-            "mf_first": placement.dense_first,
+            # The free bodies' placement: their Z and headers (their records are the row store's above).
             "mf_contact_rows_end": placement.mf_contact_rows_end,
             "mf_meta": placement.mf_meta_packed,
-            "mf_impulses": placement.impulses,
             "mf_Z_a": placement.mf_Z_a,
             "mf_Z_b": placement.mf_Z_b,
-            "mf_row_mu": placement.row_mu,
-            "mf_row_w": placement.row_w,
-            "mf_row_eps": placement.row_eps,
             "regularize": int(self.laws.set.weighted),
             "iterations": self.options.pgs_iterations,
             "omega": self.options.pgs_omega,

@@ -84,15 +84,11 @@ LOCAL_ABI = kernel_template.params(
     ("world_row_parent", wp.array2d[int]),
     ("world_row_mu", wp.array2d[float]),
     ("mf_constraint_count", wp.array[int]),
-    ("mf_first", wp.array[int]),
     ("mf_meta", wp.array2d[int]),
-    ("mf_impulses", wp.array2d[float]),
     ("mf_Z_a", wp.array3d[float]),
     ("mf_Z_b", wp.array3d[float]),
-    ("mf_row_mu", wp.array2d[float]),
     ("regularize", int),
     ("world_row_w", wp.array2d[float]),
-    ("mf_row_w", wp.array2d[float]),
     ("iterations", int),
     ("omega", float),
     ("world_diag", wp.array2d[float]),
@@ -279,16 +275,14 @@ def local_owned_source(
         mf_setup = f"""
     int mf_count = mf_constraint_count.data[world];
     if (mf_count > {MFR}) mf_count = {MFR};
-    const int mf_line = mf_first.data[world];
-    __builtin_assume(mf_line >= 0);
-    const int off_mf = mf_line * {pitch} + {M};
-    const int off_meta = mf_line * {MFS * 4};
-    const int mf6_base = mf_line * {MFS * 6};"""
+    const int off_mf = line * {pitch} + {M};
+    const int off_meta = line * {MFS * 4};
+    const int mf6_base = line * {MFS * 6};"""
         mf_load = (
-            f"\n    for (int row = lane; row < mf_count; row += {L}) s_mf_lam[row] = mf_impulses.data[off_mf + row];"
+            f"\n    for (int row = lane; row < mf_count; row += {L}) s_mf_lam[row] = world_impulses.data[off_mf + row];"
         )
         mf_store = (
-            f"\n    for (int row = lane; row < mf_count; row += {L}) mf_impulses.data[off_mf + row] = s_mf_lam[row];"
+            f"\n    for (int row = lane; row < mf_count; row += {L}) world_impulses.data[off_mf + row] = s_mf_lam[row];"
         )
 
     sweeps = _local_sweeps(op, laws, lanes, R, MFS, MFR, contact_capable)
@@ -413,9 +407,9 @@ def _local_sweeps(op: LocalBlock, laws: RowLaws, lanes: Lanes, R: int, MFS: int,
             operator=free_op,
             load=lambda row: f"s_mf_lam[{row}]",
             store=lambda row, value: lanes.first(f"s_mf_lam[{row}] = {value};"),
-            mu=lambda row: f"mf_row_mu.data[off_mf + {row}]",
-            weight=lambda row: f"mf_row_w.data[off_mf + {row}]",
-            eps=lambda row: f"mf_row_eps.data[off_mf + {row}]",
+            mu=lambda row: f"world_row_mu.data[off_mf + {row}]",
+            weight=lambda row: f"world_row_w.data[off_mf + {row}]",
+            eps=lambda row: f"world_row_eps.data[off_mf + {row}]",
             ring_load=lambda parent: (
                 f"RING_LOAD(s_mf_lam[{parent}], {parent}, {MFR},\n"
                 f"    [&](int patch_row) {{ return {meta_parent}; }},\n"

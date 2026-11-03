@@ -192,7 +192,6 @@ def solve_fixture(device):
         ("world_row_parent", "row_parent"),
         ("world_row_mu", "mu"),
         ("factor_rows", "Y"),
-        ("mf_row_mu", "mu"),
         ("mf_meta", "mf_meta"),
         ("mf_Z_a", "mf_Z_a"),
         ("mf_Z_b", "mf_Z_b"),
@@ -205,8 +204,6 @@ def solve_fixture(device):
     walk.du = array(np.zeros(145, np.float32))
     arrays["walk"] = walk
     arrays["du"] = walk.du
-    # One row store: the free bodies' impulses and weights are the dense rows' arrays, from the dense capacity.
-    arrays["mf_impulses"], arrays["mf_row_w"] = arrays["world_impulses"], arrays["world_row_w"]
     _packed_rows(host, arrays, device)
     return data, arrays
 
@@ -265,7 +262,6 @@ def solve_pair_launches(data, arrays, *, enabled, arch, iterations=8):
     values = dict(arrays)
     values.update(
         dense_first=data.first,
-        mf_first=data.first,
         world_count=5,
         general_world_grid_stride=5,
         use_general_world_queue=0,

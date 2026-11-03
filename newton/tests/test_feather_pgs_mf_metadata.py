@@ -289,14 +289,13 @@ def _solve_parent_rows(device, parents):
     values.update(
         world_constraint_count=wp.zeros(worlds, dtype=int, device=device),
         dense_first=row_lines(device),
-        mf_first=row_lines(device),
         mf_constraint_count=wp.array(np.asarray(parents) + 3, dtype=int, device=device),
         mf_contact_rows_end=wp.array(np.asarray(parents) + 3, dtype=int, device=device),
         mf_meta=wp.array(metadata, dtype=int, device=device),
         # The row store's lines: 8 dense rows, then the free bodies'.
-        mf_impulses=wp.zeros((worlds, 8 + capacity), device=device),
-        mf_row_mu=wp.full((worlds, 8 + capacity), 0.4, device=device),
-        mf_row_w=wp.ones((worlds, 8 + capacity), device=device),
+        world_impulses=wp.zeros((worlds, 8 + capacity), device=device),
+        world_row_mu=wp.full((worlds, 8 + capacity), 0.4, device=device),
+        world_row_w=wp.ones((worlds, 8 + capacity), device=device),
         mf_Z_a=wp.array(jacobian, device=device),
         mf_Z_b=wp.zeros((worlds, capacity, 6), device=device),
         v_out=wp.array(velocity.reshape(-1), device=device),
@@ -323,7 +322,7 @@ def _solve_parent_rows(device, parents):
         device=device,
         inputs=[values[name] for name in inspect.signature(kernel.func).parameters],
     )
-    impulses = values["mf_impulses"].numpy()
+    impulses = values["world_impulses"].numpy()
     # The velocity change the sweep leaves in the walk's coordinates (the step's one leave walks it down).
     return values["du"].numpy(), np.asarray([impulses[w, 8 + p : 8 + p + 3] for w, p in enumerate(parents)])
 

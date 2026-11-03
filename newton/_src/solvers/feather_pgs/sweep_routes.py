@@ -76,21 +76,19 @@ MF_GS_ABI = kernel_template.params(
     ("world_row_parent", wp.array2d[int]),
     ("world_row_mu", wp.array2d[float]),
     ("mf_constraint_count", wp.array[int]),
-    ("mf_first", wp.array[int]),
     ("mf_contact_rows_end", wp.array[int]),
     ("mf_meta", wp.array2d[int]),
-    ("mf_impulses", wp.array2d[float]),
     ("mf_Z_a", wp.array3d[float]),
     ("mf_Z_b", wp.array3d[float]),
     ("walk", WalkTrees),
-    ("mf_row_mu", wp.array2d[float]),
-    ("mf_row_w", wp.array2d[float]),
     ("iterations", int),
     ("omega", float),
     ("regularize", int),
     ("v_out", wp.array[float]),
 )
-"""The matrix-free sweep's native ABI: one world per call (the world queue's dispatch)."""
+"""The matrix-free sweep's native ABI: one world per call (the world queue's dispatch). The free bodies' rows are the
+row store's (the ``world_*`` records, from the dense capacity of the world's line); their ``Z`` and headers the
+free bodies' placement (``mf_*``)."""
 
 
 class FreeBodyCoordinates:
@@ -777,13 +775,11 @@ def mf_gs_source(
     int dof_map_base = world * {D};
     const int line = dense_first.data[world];
     __builtin_assume(line >= 0);
-    const int mf_line = mf_first.data[world];
-    __builtin_assume(mf_line >= 0);
     int off_dense = line * {P};
-    int off_mf = mf_line * {P} + {M_D};
-    int off_meta = mf_line * {M_MF} * 4;{component}
+    int off_mf = off_dense + {M_D};
+    int off_meta = line * {M_MF} * 4;{component}
     const size_t packed_base = (size_t)line * {M_D * int(max_row_dofs)};
-    int mf6_base = mf_line * {M_MF} * 6;{offsets}
+    int mf6_base = line * {M_MF} * 6;{offsets}
 
 {staging.declarations("    ")}
 {free.declaration()}{trace_reduction}

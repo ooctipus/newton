@@ -263,7 +263,7 @@ class TestPairedComponentsCUDA(unittest.TestCase):
                 launch_solve_pair(candidate, new, enabled=True, device=device, iterations=iterations)
                 np.testing.assert_array_equal(candidate.selector.numpy(), [-1, -1, 3, 0, -1])
                 # The velocity change both sweeps leave in the walk's coordinates, and the impulses.
-                for name in ("du", "world_impulses", "mf_impulses"):
+                for name in ("du", "world_impulses"):
                     np.testing.assert_allclose(new[name].numpy(), old[name].numpy(), rtol=2e-5, atol=3e-6, err_msg=name)
                 for name, before in immutable.items():
                     np.testing.assert_array_equal(getattr(candidate, name).numpy(), before)

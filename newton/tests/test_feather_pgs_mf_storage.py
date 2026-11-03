@@ -477,7 +477,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                 source = max(_native_snippets(kernel), key=len)
                 self.assertIn("_glambda", kernel.key)
                 self.assertNotIn("SHARED float s_lam_mf", source)
-                self.assertNotIn("mf_impulses.data[off_mf + i] =", source)
+                self.assertNotIn("world_impulses.data[off_mf + i] =", source)
                 self.assertIn("READ(lane == 0 ? g_lam_mf[i] : 0.0f, 0)", source)
                 for line in source.splitlines():
                     if re.search(r"g_lam_mf\[[^]]+\]\s*=(?!=)", line):
@@ -661,18 +661,14 @@ _STORE = {
 
 
 def _store(host):
-    """The host's rows in one row store: each world's line holds the dense rows, then the free bodies' from the dense
-    capacity (:mod:`.dense_rows`). The free-body records the sweep reads (``mf_impulses``, ``mf_row_mu``, ``mf_row_w``)
-    are the store's."""
+    """The host's rows in one row store: each world's line holds the dense rows, then the free bodies' (the host's
+    ``mf_impulses``, ``mf_row_mu``, ``mf_row_w``) from the dense capacity (:mod:`.dense_rows`)."""
     stored = dict(host)
     body = host["mf_impulses"].shape[1]
     for name, free in _STORE.items():
         dense = host[name]
         region = np.zeros((dense.shape[0], body, *dense.shape[2:]), dense.dtype) if free is None else host[free]
         stored[name] = np.concatenate((dense, region), axis=1)
-    for name, free in _STORE.items():
-        if free is not None:
-            stored[free] = stored[name]
     return stored
 
 
@@ -698,7 +694,6 @@ def _bind_rows(host, device):
         general_worlds=array(np.random.default_rng(5).permutation(worlds).astype(np.int32)),
         local_solve_owner=array(np.zeros(worlds, np.int32)),
         dense_first=row_lines(device),
-        mf_first=row_lines(device),
         du=wp.zeros(host["world_dof_indices"].size, dtype=wp.float32, device=device),
     )
     values["walk"] = _walk(values["du"], _first_art(host, device))
@@ -751,7 +746,7 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             {"iterations": 6, "omega": 0.9, "regularize": 1},
         )
         # The velocity change the sweep leaves in the walk's coordinates (du), and the impulses.
-        outputs = ("du", "world_impulses", "mf_impulses")
+        outputs = ("du", "world_impulses")
         for name, (dense_capacity, mf_capacity, dofs), options, rings in cases:
             host = _patch_ring_rows(
                 dense_capacity + dofs,
@@ -876,7 +871,7 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
 
         guarded, finite = diagonal(np.nan), diagonal(1.0)
         # The velocity change the sweep leaves in the walk's coordinates (du), and the impulses.
-        outputs = ("du", "world_impulses", "mf_impulses")
+        outputs = ("du", "world_impulses")
         # Streamed and resident row metadata read the diagonal from global memory; staged metadata from shared memory.
         streamed = {"shared_metadata": False}
         for metadata in (streamed, {**streamed, "resident_row_metadata": True}, {"shared_metadata": True}):
@@ -1059,7 +1054,6 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         values = dict(arrays)
         values.update(
             dense_first=row_lines(device),
-            mf_first=row_lines(device),
             general_world_grid_stride=5,
             use_general_world_queue=0,
             iterations=8,
@@ -1067,7 +1061,7 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             regularize=0,
         )
         # The velocity change the sweep leaves in the walk's coordinates (du), and the impulses.
-        outputs = ("du", "world_impulses", "mf_impulses")
+        outputs = ("du", "world_impulses")
         for shared_metadata in (False, True):
             with self.subTest(shared_metadata=shared_metadata):
                 variants = []

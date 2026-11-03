@@ -140,7 +140,6 @@ DENSE_ROWS = FieldGroup(
     Field("row_beta", wp.float32, ("world", "row"), owner="placement"),
     Field("phi", wp.float32, ("world", "row"), owner="placement"),
     Field("target_velocity", wp.float32, ("world", "row"), owner="placement"),
-    Field("constraint_count", wp.int32, ("world",), owner="placement"),
     Field("row_sides", wp.vec2i, ("world", "row"), owner="placement"),
 )
 """The row store: every world line's rows, the dense class's (``[0, dense_max_constraints)``) then the free bodies'
@@ -172,9 +171,20 @@ FUSED_DIAGONAL_LIMITS = FieldGroup(
 )
 """Position limits fused into the diagonal-mass sweep, outside the dense row system."""
 
+ROW_CLASSES = 2
+"""The row store's classes: 0 the dense rows, 1 the free bodies' (from the store's body base)."""
+
+ROW_STATUS = FieldGroup(
+    Field("row_count", wp.int32, (ROW_CLASSES, "world"), owner="placement"),
+    Field("row_slot_counter", wp.int32, (ROW_CLASSES, "world"), owner="placement"),
+    Field("row_first_rejected", wp.int32, (ROW_CLASSES, "world"), fill=ROW_SLOT_UNBOUNDED, owner="placement"),
+)
+"""Each row class's status by class and world: its rows, its reservation counter and its first rejected slot (a
+reservation that does not fit rejects its contact and latches the world). A class's row is its own array: the dense
+rows' ``constraint_count``, ``slot_counter`` and ``dense_first_rejected_slot``, the free bodies' ``mf_*``
+(:meth:`.placement.Placement.allocate_world_rows`)."""
+
 WORLD_ROW_STATE = FieldGroup(
-    Field("slot_counter", wp.int32, ("world",), owner="placement"),
-    Field("dense_first_rejected_slot", wp.int32, ("world",), fill=ROW_SLOT_UNBOUNDED, owner="placement"),
     # Per-world dense row-family boundaries, snapshotted from slot_counter each step. The dense slot layout is
     # [mimic][joint-limit][joint-vel-limit][contact/friction], so [world, 0] ends the mimic and position-limit
     # prefix, [world, 1] the velocity-limit segment, and contacts/friction occupy [bounds[world, 1], m_dense).
@@ -182,7 +192,7 @@ WORLD_ROW_STATE = FieldGroup(
     # First matrix-free slot past the contact/friction rows (start of the velocity-limit tail).
     Field("mf_contact_rows_end", wp.int32, ("world",), owner="placement"),
 )
-"""Per-world dense row reservation: the slot counter, the first rejected slot and the row-family boundaries."""
+"""Per-world row-family boundaries: the dense rows' phases and the free bodies' contact rows' end."""
 
 CONTACT_RUNS = FieldGroup(
     Field("contact_run_first", wp.int32, ("world", "run_block"), fill=2**31 - 1, owner="placement"),
@@ -243,13 +253,6 @@ SPARSE_CONTACT_RECORDS = FieldGroup(
 # ---------------------------------------------------------------------------------------------------------------------
 # Matrix-free rows
 # ---------------------------------------------------------------------------------------------------------------------
-
-MF_COUNTERS = FieldGroup(
-    Field("mf_constraint_count", wp.int32, ("world",), owner="placement"),
-    Field("mf_slot_counter", wp.int32, ("world",), owner="placement"),
-    Field("mf_first_rejected_slot", wp.int32, ("world",), fill=ROW_SLOT_UNBOUNDED, owner="placement"),
-)
-"""Per-world matrix-free row counts, reservation counter and first rejected slot."""
 
 MF_ROWS = FieldGroup(
     Field("mf_Z_a", wp.float32, ("world", "mf_row", 6), owner="placement"),

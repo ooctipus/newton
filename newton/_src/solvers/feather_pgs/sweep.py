@@ -190,10 +190,11 @@ class WorldRows:
 
 @dataclasses.dataclass(frozen=True)
 class FreeBodyRows:
-    """A world's matrix-free (free-body) rows: one packed ``int4`` per row and the impulses.
+    """A world's free-body rows: one packed ``int4`` per row and their records in the row store (``world_*`` at
+    ``off_mf``, the world's line from the dense capacity).
 
-    ``mf_meta`` holds, per row, the bodies' first coordinates (``dof_a << 16 |
-    dof_b``), the stored inverse diagonal, the right-hand side and the type
+    ``mf_meta`` holds, per row, the sides' first coordinates (``dof_a << 16 |
+    dof_b``), the inverse diagonal, the right-hand side and the type
     and parent (``type | parent << 16``). Impulses are staged in ``s_lam_mf``
     or, with ``stream``, read and written in place by the first lane
     (``g_lam_mf``), whose reads every lane takes by broadcast.
@@ -231,27 +232,27 @@ class FreeBodyRows:
         return f"__int_as_float(mf_meta.data[off_meta + {row} * 4 + 1])"
 
     def mu(self, row: str) -> str:
-        return f"mf_row_mu.data[off_mf + {row}]"
+        return f"world_row_mu.data[off_mf + {row}]"
 
     def weight(self, row: str) -> str:
-        return f"mf_row_w.data[off_mf + {row}]"
+        return f"world_row_w.data[off_mf + {row}]"
 
     def eps(self, row: str) -> str:
-        return f"mf_row_eps.data[off_mf + {row}]"
+        return f"world_row_eps.data[off_mf + {row}]"
 
     def buffers(self) -> tuple[Buffer, ...]:
         return () if self.stream else (Buffer("s_lam_mf", "float", self.capacity),)
 
     def declaration(self) -> str:
         if self.stream:
-            return "    volatile float* g_lam_mf = (volatile float*)(&mf_impulses.data[off_mf]);"
+            return "    volatile float* g_lam_mf = (volatile float*)(&world_impulses.data[off_mf]);"
         return ""
 
     def load_line(self, row: str = "i") -> str:
-        return "" if self.stream else f"s_lam_mf[{row}] = mf_impulses.data[off_mf + {row}];"
+        return "" if self.stream else f"s_lam_mf[{row}] = world_impulses.data[off_mf + {row}];"
 
     def store_line(self, row: str = "i") -> str:
-        return "" if self.stream else f"mf_impulses.data[off_mf + {row}] = s_lam_mf[{row}];"
+        return "" if self.stream else f"world_impulses.data[off_mf + {row}] = s_lam_mf[{row}];"
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -297,11 +298,11 @@ def weight_arguments(weighted: bool) -> tuple[RowArgument, ...]:
 
 
 def material_arguments(material: bool) -> tuple[RowArgument, ...]:
-    """The operands of a sweep with material contacts: the dense and free-body rows' compliance, zero but on a
-    material contact's normal."""
+    """The operands of a sweep with material contacts: the rows' compliance (the row store's, both classes'), zero but
+    on a material contact's normal."""
     if not material:
         return ()
-    return (RowArgument("world_row_eps", wp.array2d[float]), RowArgument("mf_row_eps", wp.array2d[float]))
+    return (RowArgument("world_row_eps", wp.array2d[float]),)
 
 
 def change_vote(laws: RowLaws, changes: tuple[Change, ...], pad: str) -> str:

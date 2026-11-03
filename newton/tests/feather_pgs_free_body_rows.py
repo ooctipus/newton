@@ -98,11 +98,11 @@ def sweep_free_body_rows(
         "mf_constraint_count": wp.array((rows,), dtype=wp.int32, device=device),
         "mf_contact_rows_end": wp.array((rows,), dtype=wp.int32, device=device),
         "mf_meta": wp.array(meta, device=device),
-        "mf_impulses": per_row(impulses),
+        "world_impulses": per_row(impulses),
         "mf_Z_a": wp.array(padded, device=device),
         "mf_Z_b": wp.zeros((1, capacity, 6), dtype=wp.float32, device=device),
-        "mf_row_mu": per_row(mu),
-        "mf_row_w": per_row(np.ones(rows) if weights is None else weights),
+        "world_row_mu": per_row(mu),
+        "world_row_w": per_row(np.ones(rows) if weights is None else weights),
         # The body's unit factor as a walk: the sweep adds its change into walk.du, which no row reads back.
         "walk": chain_walk(device, [np.eye(6)]),
         "iterations": int(iterations),
@@ -131,4 +131,4 @@ def sweep_free_body_rows(
         else:
             inputs.append(arguments[name].type(0))
     wp.launch_tiled(kernel, dim=[1], inputs=inputs, block_dim=32, device=device)
-    return values["mf_impulses"].numpy()[0, dense : dense + rows].astype(np.float64)
+    return values["world_impulses"].numpy()[0, dense : dense + rows].astype(np.float64)

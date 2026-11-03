@@ -54,10 +54,10 @@ from .solver_fields import (
     DENSE_ROWS,
     DENSE_WARMSTART,
     FUSED_DIAGONAL_LIMITS,
-    MF_COUNTERS,
     MF_ROWS,
     OVERFLOW_WARNING,
     ROW_SLOT_UNBOUNDED,
+    ROW_STATUS,
     ROW_WATERMARKS,
     SIZE_JACOBIAN,
     SPARSE_CONTACT_GROUPS,
@@ -130,55 +130,47 @@ _BODY_RECORDS = (
 @wp.kernel
 def _clear_dense_row_state(
     first: wp.array[int],
-    slot_counter: wp.array[int],
+    slot_counter: wp.array2d[int],
+    first_rejected: wp.array2d[int],
+    count: wp.array2d[int],
     dropped: wp.array2d[int],
-    dense_first_rejected_slot: wp.array[int],
     has_free_rigid: int,
-    mf_slot_counter: wp.array[int],
-    mf_first_rejected_slot: wp.array[int],
-    mf_constraint_count: wp.array[int],
     body_base: int,
     impulses: wp.array2d[float],
 ):
-    """Clear allocation state, row-loss counters and the free-body rows' state (counters, and impulses from
-    ``body_base`` of each world's line) in one launch."""
+    """Clear each row class's allocation state and row-loss counters (by class and world), and the free bodies' rows
+    (their count, and impulses from ``body_base`` of each world's line), in one launch. The dense rows' count stands
+    until their producers' finalize: the last step's rows are cleared by it."""
     world, column = wp.tid()
     line = first[world]
     if column == 0:
-        slot_counter[world] = 0
-        for family in range(2):
-            dropped[family, world] = 0
-        dense_first_rejected_slot[world] = _ROW_SLOT_UNBOUNDED
-        if has_free_rigid != 0:
-            mf_slot_counter[world] = 0
-            mf_first_rejected_slot[world] = _ROW_SLOT_UNBOUNDED
-            mf_constraint_count[world] = 0
+        for row_class in range(2):
+            slot_counter[row_class, world] = 0
+            first_rejected[row_class, world] = _ROW_SLOT_UNBOUNDED
+            dropped[row_class, world] = 0
+        count[1, world] = 0
     if has_free_rigid != 0:
         impulses[line, body_base + column] = 0.0
 
 
 @wp.kernel
 def _finalize_constraint_status(
-    dense_count: wp.array[int],
-    mf_count: wp.array[int],
+    slot_counter: wp.array2d[int],
     dropped: wp.array2d[int],
     contact_count: wp.array[int],
     reduction_overflow: wp.array[int],
-    dense_capacity: int,
-    mf_capacity: int,
+    capacity: wp.vec2i,
     contact_capacity: int,
     overflow: wp.array[wp.bool],
 ):
-    """Latch invalid-world status until reset; counts come from the per-family finalize kernels."""
+    """Latch invalid-world status until reset: a row class (by class and world) that reserved past its ``capacity`` or
+    dropped rows, or the contacts' overflow; counts come from the per-class finalize kernels."""
     world = wp.tid()
-    if (
-        dense_count[world] > dense_capacity
-        or mf_count[world] > mf_capacity
-        or dropped[0, world] > 0
-        or dropped[1, world] > 0
-        or contact_count[0] > contact_capacity
-        or reduction_overflow[0] != 0
-    ):
+    invalid = contact_count[0] > contact_capacity or reduction_overflow[0] != 0
+    for row_class in range(2):
+        if slot_counter[row_class, world] > capacity[row_class] or dropped[row_class, world] > 0:
+            invalid = True
+    if invalid:
         overflow[world] = True
 
 
@@ -482,11 +474,18 @@ class Placement:
             ) from error
 
     def allocate_world_rows(self, model):
-        """Allocate world-level constraint system buffers for multi-articulation support."""
+        """Allocate the row store and each row class's status."""
+        arrays = self.arrays
+        # Each row class's status (its rows, reservation counter and first rejected slot), one array a class; a model
+        # without worlds keeps one world's (a class's row is a view, which an empty axis cannot give).
+        arrays.allocate(ROW_STATUS, world=max(self.forest.world_count, 1))
+        self.constraint_count, self.mf_constraint_count = self.row_count[0], self.row_count[1]
+        self.slot_counter, self.mf_slot_counter = self.row_slot_counter[0], self.row_slot_counter[1]
+        self.dense_first_rejected_slot = self.row_first_rejected[0]
+        self.mf_first_rejected_slot = self.row_first_rejected[1]
         if self.forest.world_count == 0:
             return
 
-        arrays = self.arrays
         # The widest world's DOFs exist where a world response mapping was built (the routes that read them).
         world_dof = self.forest.max_world_dofs
         sizes = {"world": self.forest.world_count, "row": self.row_pitch, "world_dof": world_dof}
@@ -555,7 +554,6 @@ class Placement:
         arrays = self.arrays
         worlds = self.forest.world_count
         rows = self.mf_max_constraints if self.forest.has_free_rigid_bodies else 1
-        arrays.allocate(MF_COUNTERS, world=worlds)
         arrays.allocate(MF_ROWS, world=worlds, mf_row=rows, mf_meta=4 * rows)
         # The free bodies' records: the row store's region from its body base (a feature's placeholder stays whole,
         # and without free bodies no free-body row is read).
@@ -725,13 +723,11 @@ class Placement:
 
     def allocate_placeholders(self):
         """The operands of the features that are off."""
-        # Operands of the features that are off (SolverArrays.placeholder). The matrix-free counters stand in at world
-        # width, and allocate_world_contact_slots writes none of them when has_free_rigid == 0.
+        # Operands of the features that are off (SolverArrays.placeholder).
         placeholder = self.arrays.placeholder
         self.dummy_contact_impulses = placeholder(wp.float32, (1, 1))
         self.dummy_world_J = placeholder(wp.float32, (1, 1, 1))
         self.dummy_is_free_rigid = placeholder(wp.int32, (1,))
-        self.dummy_mf_slot_counter = placeholder(wp.int32, (self.forest.world_count,))
         self.dummy_mf_impulses = placeholder(wp.float32, (1, 1))
         self.dummy_contact_count = placeholder(wp.int32, (1,))
 
@@ -769,13 +765,11 @@ class Placement:
             dim=(self.forest.world_count, self.mf_max_constraints if mf_active else 1),
             inputs=[
                 self.dense_first,
-                self.slot_counter,
+                self.row_slot_counter,
+                self.row_first_rejected,
+                self.row_count,
                 self.row_dropped_all,
-                self.dense_first_rejected_slot,
                 1 if mf_active else 0,
-                self.mf_slot_counter if mf_active else self.dummy_mf_slot_counter,
-                self.mf_first_rejected_slot if mf_active else self.dummy_mf_slot_counter,
-                self.mf_constraint_count if mf_active else self.dummy_mf_slot_counter,
                 self.body_base,
                 self.impulses if mf_active else self.dummy_mf_impulses,
             ],
@@ -846,29 +840,26 @@ class Placement:
 
     def latch_status(self, contacts: Contacts | None) -> None:
         """Latch current per-world capacity failures for every row owner."""
-        # The contact capacity (argument 8) follows the ready rows in a capture whose launches bind.
+        # The contact capacity (argument 6) follows the ready rows in a capture whose launches bind.
         self.contact_pool.launch(
             _finalize_constraint_status,
             self.forest.world_count,
             inputs=[
-                self.slot_counter,
-                self.mf_slot_counter if self.forest.has_free_rigid_bodies else self.dummy_mf_slot_counter,
+                self.row_slot_counter,
                 self.row_dropped_all,
                 contacts.rigid_contact_count if contacts is not None else self.dummy_contact_count,
                 contacts._reduction_overflow if contacts is not None else self.dummy_contact_count,
-                self.dense_max_constraints,
-                self.mf_max_constraints,
+                wp.vec2i(self.dense_max_constraints, self.mf_max_constraints),
                 contacts._rigid_contact_rows if contacts is not None else 0,
                 self.constraint_overflow,
             ],
-            row_args=(8,) if contacts is not None else (),
+            row_args=(6,) if contacts is not None else (),
         )
 
     def warn_overflow(self):
         """One device-side warning per overflowing row family."""
         mf_active = self.forest.has_free_rigid_bodies
         if self.options.warn_constraint_overflow:
-            mf_raw_counts = self.mf_slot_counter if mf_active else self.slot_counter
             wp.launch(
                 _warn_constraint_row_overflow,
                 dim=self.forest.world_count,
@@ -876,7 +867,7 @@ class Placement:
                     self.slot_counter,
                     self.row_dropped_dense,
                     self.dense_max_constraints,
-                    mf_raw_counts,
+                    self.mf_slot_counter,
                     self.row_dropped_mf,
                     self.mf_max_constraints,
                     1 if mf_active else 0,

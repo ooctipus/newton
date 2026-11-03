@@ -667,12 +667,10 @@ class RowLaws:
             if solver.forest.is_free_rigid is not None
             else solver.placement.dummy_is_free_rigid
         )
-        mf_slot_counter = solver.placement.mf_slot_counter if mf_active else solver.placement.dummy_mf_slot_counter
+        mf_slot_counter = solver.placement.mf_slot_counter
         dense_dropped_rows = solver.placement.row_dropped_dense
         mf_dropped_rows = solver.placement.row_dropped_mf
-        mf_first_rejected_slot = (
-            solver.placement.mf_first_rejected_slot if mf_active else solver.placement.dummy_mf_slot_counter
-        )
+        mf_first_rejected_slot = solver.placement.mf_first_rejected_slot
         support = solver.placement.row_support()
         if solver.placement.row_packets is not None:
             solver.placement.row_packets.prepare_prefix(state_in, dt)
