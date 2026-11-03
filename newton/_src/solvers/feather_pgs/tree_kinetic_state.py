@@ -1778,6 +1778,10 @@ def _solve_operations(layout: TreeLayout, classes: tuple) -> dict[str, str]:
 
 
 _EDGE_UP = ts.edge(ts.Direction.UP, ts.LOADED.lever, "p")
+_COLUMN = ts.step(ts.Direction.UP, ts.LOADED, "p", source="x", index="q")
+_HELD_COLUMN = ts.step(ts.Direction.UP, ts.LOADED, "p", source="(c == i ? 1.0f : 0.0f)", out="z", index="q")
+"""A slip's column step, a unit covector walked in the dense form (``x``: 1 at the slip's coordinate, then 0): the
+serial border's and the held border's."""
 _EDGE_DOWN = ts.edge(ts.Direction.DOWN, ts.LOADED.lever, "V")
 """A joint of the border's walks, on a held or loaded link ``l``: the wrench ``p`` up, the twist ``V`` down."""
 
@@ -1856,13 +1860,7 @@ _BORDER = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step
             for (; c >= WALK_FIRST_OF(body); --c, ++t) {
                 float d[$unpacked];
                 $record(d, data + $coordinate * c);
-                const float z = WALK_MUL(
-                    x + ((d[0] * p[0] + d[1] * p[1] + d[2] * p[2]) + (d[3] * p[3] + d[4] * p[4] + d[5] * p[5])),
-                    d[12]);
-                x = 0.0f;
-                for (int q = 0; q < 6; ++q)
-                    p[q] -= d[6 + q] * z;
-                column[t] = z;
+                $column_step
             }
             const int up = WALK_PARENT_OF(body);
             if (up >= 0) {
@@ -1978,6 +1976,7 @@ def walk_tree_prelude(side: bool = True) -> DevicePrelude:
         coordinate=WALK_COORDINATE,
         unpacked=WALK_UNPACKED,
         record=record_load(side),
+        column_step=ts.statements([_COLUMN[0], "x = 0.0f;", *_COLUMN[1:], "column[t] = z;"], 16),
         edge_p=ts.statements(_EDGE_UP, 16),
     )
     name = "walk_tree" if side else "walk_tree_one_half"
@@ -2182,11 +2181,7 @@ _HELD = """    // The border held by the tree's segment (CUDA, every tree whose 
                 float d[13];
                 HOLD_RECORD(h, c, d);
                 if (on) {
-                    z = WALK_MUL(
-                        (c == i ? 1.0f : 0.0f) + ((d[0] * p[0] + d[1] * p[1] + d[2] * p[2]) + (d[3] * p[3] + d[4] * p[4] + d[5] * p[5])),
-                        d[12]);
-                    for (int q = 0; q < 6; ++q) p[q] -= d[6 + q] * z;
-                    root = c;
+                    $held_step
                 }
                 // The coordinate's pivot and its square root (1/ell: the record's d[12] is 1/sqrt(P)), each slip's
                 // step taking one rsqrt of its new pivot for the rest.
@@ -2275,10 +2270,9 @@ def held_walks(cls, x: str, u: str, state: str, words: int) -> tuple[str, str]:
         else:
             up.append("    for (int k = 0; k < 6; ++k) p[k] += 0.0f;")
         for c in range(first[b + 1] - 1, first[b] - 1, -1):
+            output, update = ts.step(ts.Direction.UP, ts.LOADED, "p", source=f"{x}[{c}]", into="q")
             up.append(
-                f"    {{const float* d=h.r[{c}/WIDTH];const float z=WALK_MUL({x}[{c}]+((d[0]*p[0]+d[1]*p[1]+d[2]*p[2])"
-                "+(d[3]*p[3]+d[4]*p[4]+d[5]*p[5])),d[12]);"
-                f"float q[6];for(int k=0;k<6;++k)q[k]=p[k]-d[6+k]*z;if(lane=={c}%WIDTH){u}[{c}]=z;"
+                f"    {{const float* d=h.r[{c}/WIDTH];{output}float q[6];{update}if(lane=={c}%WIDTH){u}[{c}]=z;"
                 f"for(int k=0;k<6;++k)p[k]=READ(q[k],{c}%WIDTH);}}"
             )
         parent_b = parent[b]
@@ -2350,18 +2344,8 @@ loads spill there (g1 3,808 B of stack, offline sm_120); the loop form keeps a c
 on the path the group's lanes fetched into L1 (WALK_MAPPING §4: B3 against B4)."""
 
 
-_UP_STEP = """{
-    const float z = WALK_MUL(
-        $X.u + (($X.s.x * $V[0] + $X.s.y * $V[1] + $X.s.z * $V[2]) + ($X.s.w * $V[3] + $X.t.x * $V[4] + $X.t.y * $V[5])),
-        $X.e);
-    u[$c] = z;
-    $V[0] -= $X.t.z * z;
-    $V[1] -= $X.t.w * z;
-    $V[2] -= $X.w.x * z;
-    $V[3] -= $X.w.y * z;
-    $V[4] -= $X.w.z * z;
-    $V[5] -= $X.w.w * z;
-}"""
+_UP_OUTPUT, *_UP_UPDATE = ts.step(ts.Direction.UP, ts.FETCHED, "$V", source="$X.u")
+_UP_STEP = ts.braced([_UP_OUTPUT, "u[$c] = z;", *_UP_UPDATE])
 """A coordinate of the walk up (leaf first, ``u = L^-1 P x``): ``z_c = (x_c + s_c . p) / ell_c``, ``p -= ut_c z_c``, ``p``
 its body's state, ``z_c`` rounded on its own (``WALK_MUL``); its record and ``x_c`` fetched ahead of the chain
 (``$X``, :meth:`.tree_factor.WalkClass.walk`)."""
@@ -2591,6 +2575,7 @@ def held_lambdas(layout: TreeLayout, slips: int, side: bool = True) -> str:
         coordinate=WALK_COORDINATE,
         unpacked=WALK_UNPACKED,
         record=record_load(side),
+        held_step=ts.statements([*_HELD_COLUMN, "root = c;"], 20),
         edge_p=ts.statements(_EDGE_UP, 20),
     )
     return f"#if defined(__CUDA_ARCH__)\n{lambdas}\n#endif\n"

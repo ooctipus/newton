@@ -1711,16 +1711,14 @@ $point_b
                 }
                 for (int r = 0; r < $rows; ++r) {
                     float* q = p + 6 * r;
-                    float x = (d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) + (d[3] * q[3] + d[4] * q[4] + d[5] * q[5]);
+                    float x = $dot_q;
                     float j = 0.0f;
                     if (now != nullptr) {
                         const float* v = w + 6 * r;
-                        x += ((e0 - d[0]) * v[0] + (e1 - d[1]) * v[1] + (e2 - d[2]) * v[2])
-                             + ((S[3] - d[3]) * v[3] + (S[4] - d[4]) * v[4] + (S[5] - d[5]) * v[5]);
-                        j = (e0 * v[0] + e1 * v[1] + e2 * v[2]) + (S[3] * v[3] + S[4] * v[4] + S[5] * v[5]);
+                        x += $dot_pose;
+                        j = $dot_j;
                     }
-                    const float z = WALK_MUL(x, d[12]);
-                    for (int k = 0; k < 6; ++k) q[k] -= d[6 + k] * z;
+                    $step_q
                     sink(r, c, z, j);
                 }
             }
@@ -1745,10 +1743,7 @@ $point_b
 $record_seed
         for (int r = 0; r < $rows; ++r) {
             float* q = p + 6 * r;
-            const float z = WALK_MUL(
-                x[r] + ((d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) + (d[3] * q[3] + d[4] * q[4] + d[5] * q[5])),
-                d[12]);
-            for (int k = 0; k < 6; ++k) q[k] -= d[6 + k] * z;
+            $seed_q
             sink(r, c, z, x[r]);
         }
     };
@@ -1879,12 +1874,19 @@ $record_enter
     };"""
 
 
-_WALK_EDGES = {
+_POSE = ("(e0 - d[0])", "(e1 - d[1])", "(e2 - d[2])", "(S[3] - d[3])", "(S[4] - d[4])", "(S[5] - d[5])")
+_WALK_TEXTS = {
+    "dot_q": ts.dot(ts.LOADED.s, ts.channels("q")),
+    "dot_pose": ts.dot(_POSE, ts.channels("v")),
+    "dot_j": ts.dot(("e0", "e1", "e2", "S[3]", "S[4]", "S[5]"), ts.channels("v")),
+    "step_q": ts.statements(ts.step(ts.Direction.UP, ts.LOADED, "q", value="x"), 20),
+    "seed_q": ts.statements(ts.step(ts.Direction.UP, ts.LOADED, "q", source="x[r]"), 12),
     "edge_q": ts.statements(ts.edge(ts.Direction.UP, ts.LOADED.lever, "q"), 20),
     "edge_v": ts.statements(ts.edge(ts.Direction.UP, ts.LOADED.lever, "v"), 24),
     "edge_twist": ts.statements(ts.edge(ts.Direction.DOWN, ts.LOADED.lever, "W", into="V"), 8),
 }
-"""The path walk's joints (:data:`_WALK`): the rows' and the seed wrenches' up, a parent's twist down."""
+"""The path walk's arithmetic (:data:`_WALK`): the rows' steps up (the held pose a source of statements, ``x``), a
+covector seed's first step, the joints of the rows' and the seed wrenches' up and of a parent's twist down."""
 
 
 _WALK_LOADS = """#ifndef WALK_LOAD_RECORD
@@ -2119,7 +2121,7 @@ def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int) -> 
     walk = substitute(
         _WALK,
         rows=rows,
-        **_WALK_EDGES,
+        **_WALK_TEXTS,
         now=WALK_NOW,
         frame=WALK_LINK_FRAME,
         batch=WALK_SLIP_BATCH,
@@ -2160,7 +2162,7 @@ def walk_paths_prelude(
         + substitute(
             _WALK,
             rows=rows,
-            **_WALK_EDGES,
+            **_WALK_TEXTS,
             now=now,
             frame=WALK_LINK_FRAME,
             batch=WALK_SLIP_BATCH,

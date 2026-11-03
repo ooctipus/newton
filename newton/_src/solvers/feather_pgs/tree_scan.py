@@ -92,14 +92,17 @@ __all__ = [
     "Storage",
     "add",
     "braced",
+    "channels",
     "choose_schedule",
     "cross",
     "device_plan",
+    "dot",
     "edge",
     "scan_arrays",
     "schedule_costs",
     "schedule_features",
     "statements",
+    "step",
     "tree_scan",
 ]
 
@@ -943,6 +946,8 @@ class Record:
     ut: tuple[str, ...]
     inverse: str
     lever: tuple[str, str, str]
+    indexed: tuple[str, str] | None = None
+    """``s`` and ``ut`` at a loop's index ``{k}``, for a record a loop reads (a state's update is then that loop)."""
 
 
 LOADED = Record(
@@ -950,6 +955,7 @@ LOADED = Record(
     ut=tuple(f"d[{6 + k}]" for k in range(6)),
     inverse="d[12]",
     lever=("l[0]", "l[1]", "l[2]"),
+    indexed=("d[{k}]", "d[6 + {k}]"),
 )
 """A record loaded into registers (``WALK_LOAD_RECORD``'s ``d``, a held word's) and a link's lever ``l``."""
 
@@ -969,6 +975,56 @@ def cross(a, b, k: int) -> str:
     """Component ``k`` of ``a x b``, two names of three each."""
     i, j = _SKEW[k]
     return f"{a[i]} * {b[j]} - {a[j]} * {b[i]}"
+
+
+def dot(a, b) -> str:
+    """``a . b`` of six names each, summed as every walk sums it: the two halves, then their sum."""
+    terms = [f"{x} * {y}" for x, y in zip(a, b, strict=True)]
+    return f"(({' + '.join(terms[:3])}) + ({' + '.join(terms[3:])}))"
+
+
+def channels(state: str) -> tuple[str, ...]:
+    """A six-float state's names."""
+    return tuple(f"{state}[{k}]" for k in range(6))
+
+
+def step(
+    direction: Direction,
+    record: Record,
+    state: str,
+    *,
+    source: str = "",
+    value: str | None = None,
+    out: str = "const float z",
+    into: str | None = None,
+    index: str = "k",
+) -> list[str]:
+    """One coordinate's step on a six-float ``state``: its output statement, then its state's update.
+
+    ``UP`` (the whitening, leaf first): ``z = (x + s . p) / ell``, then ``p -= ut z``. ``DOWN`` (root first):
+    ``q = (u - ut . V) / ell``, then ``V += s q``. The output is rounded on its own (``WALK_MUL``), so its operations do
+    not depend on the block its consumer sits in. ``source`` is the step's input ``x`` or ``u`` (none: the state's
+    alone); ``value`` instead names a value that already holds ``source`` and the dot, for a source written as
+    statements. The output is assigned to ``out``; the update is in place, or into ``into`` (``into = state ...``), a
+    loop over ``index`` for a record a loop reads (:attr:`Record.indexed`), six statements for a named one. The
+    caller places its sink: after the output (before the update) or after the update.
+    """
+    up = direction is Direction.UP
+    if direction not in (Direction.UP, Direction.DOWN):
+        raise ValueError(f"a coordinate's step runs up or down, not {direction.value}")
+    name = out.rsplit(maxsplit=1)[-1]
+    if value is None:
+        head = dot(record.s if up else record.ut, channels(state))
+        value = f"{source} {'+' if up else '-'} {head}" if source else head
+    output = f"{out} = WALK_MUL(\n    {value},\n    {record.inverse});"
+    sign, terms = ("-", record.ut) if up else ("+", record.s)
+    if record.indexed is not None:
+        term = (record.indexed[1] if up else record.indexed[0]).format(k=index)
+        target = f"{into}[{index}] = {state}[{index}] {sign}" if into else f"{state}[{index}] {sign}="
+        return [output, f"for (int {index} = 0; {index} < 6; ++{index}) {target} {term} * {name};"]
+    if into:
+        return [output, *(f"{into}[{k}] = {state}[{k}] {sign} {terms[k]} * {name};" for k in range(6))]
+    return [output, *(f"{state}[{k}] {sign}= {terms[k]} * {name};" for k in range(6))]
 
 
 def _channels(state: str, start: int = 0) -> tuple[str, str, str]:
@@ -1003,9 +1059,9 @@ def edge(direction: Direction, lever, state: str, *, into: str | None = None) ->
 
 def statements(lines, pad: int = 0) -> str:
     """Native statements one a line, every line after the first indented by ``pad`` (the first takes its slot's)."""
-    return ("\n" + " " * pad).join(lines)
+    return ("\n" + " " * pad).join("\n".join(lines).split("\n"))
 
 
 def braced(lines) -> str:
     """Native statements in a block of their own, indented by four."""
-    return "{\n" + "\n".join("    " + line for line in lines) + "\n}"
+    return "{\n" + "\n".join("    " + line for line in "\n".join(lines).split("\n")) + "\n}"
