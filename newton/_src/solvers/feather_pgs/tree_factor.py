@@ -2854,7 +2854,13 @@ WALK_BLOCK = 64
 """Threads of a block of :func:`walk_step_kernel` on CUDA: whole groups, so a group never straddles a warp."""
 
 
-_REFRESH = """    // The refresh's arithmetic on one tree, float32 (TreeWalk's inward pass, on the factor's diagonal), at the step's
+_INWARD = """    // The refresh by the tree's lane group (walk_group): the lane feed (FEED, leaves to root) hands the chain one body
+    // at a time; a lane builds each body of a batch (BODY, its path entry, its join slots and its last coordinate's
+    // column), every lane runs the chain on it, read by shuffle. A body's lifted inertia is carried when its parent is
+    // the next joint inward, else added into the parent's join slot (joins[parent], lane k's registers on CUDA, the
+    // CPU's one thread every slot) until the chain reaches it. On the CPU one thread is the group.
+    SYNC();
+    // The refresh's arithmetic on one tree, float32 (TreeWalk's inward pass, on the factor's diagonal), at the step's
     // geometry the finish published, each coordinate's column in now and each body's link and frame point in
     // now_link: on a refresh they become the factor's frames. The lane feed's batches run it leaf first; the chain's
     // state is the articulated inertia h,
@@ -2866,9 +2872,9 @@ _REFRESH = """    // The refresh's arithmetic on one tree, float32 (TreeWalk's i
     //     (every walk forms d from the two points). Nothing here reads a world position: the frame points are the
     //     articulation's, relative to its origin.
     //   ADD(h, r): h += body r's inertia.
-    //   STEP(h, s, c): coordinate c of column s (s 6, R, R + K): Is = h s, own = s . Is, 1/ell = (own + R + K)^-1/2,
-    //     ut = Is / ell, P0 = own + R, h -= ut ut^T; its record (s by its half, ut, 1/ell, P0) leaves whole, once.
-    //   LIFT(h, d): h to the parent's frame, [A, A X + B; ., D - X (A X + B) + B^T X], X the skew of d.
+    //   STEP(h, s, c): coordinate c of column s (s 6, R, R + K) eliminated (tree_scan.inward_step); its record
+    //     (s by its half, ut, 1/ell, P0 = own + R) leaves whole, once.
+    //   LIFT(h, d): h to the parent's frame (tree_scan.inward_edge).
     const float* Lk = now_link.data;
     const float* Lc = reinterpret_cast<const float*>(now_com.data);
     // A column of two halves keeps its linear half WALK_SIDE floats past its record, in data's second half (its rows
@@ -2969,24 +2975,7 @@ _REFRESH = """    // The refresh's arithmetic on one tree, float32 (TreeWalk's i
         for (int k = 0; k < 21; ++k) h[k] = carrying ? body[k] + h[k] : body[k];
     };
     const auto STEP = [&](float* h, const float* s, int dof) {
-        const float* A = h;
-        const float* B = h + 6;
-        const float* D = h + 15;
-        float Is[6];
-        for (int a = 0; a < 3; ++a) {
-            Is[a] = (A[SYM(a, 0)] * s[0] + A[SYM(a, 1)] * s[1] + A[SYM(a, 2)] * s[2])
-                    + (B[3 * a] * s[3] + B[3 * a + 1] * s[4] + B[3 * a + 2] * s[5]);
-            Is[3 + a] = (B[a] * s[0] + B[3 + a] * s[1] + B[6 + a] * s[2])
-                        + (D[SYM(a, 0)] * s[3] + D[SYM(a, 1)] * s[4] + D[SYM(a, 2)] * s[5]);
-        }
-        const float own = (Is[0] * s[0] + Is[1] * s[1] + Is[2] * s[2]) + (Is[3] * s[3] + Is[4] * s[4] + Is[5] * s[5]);
-#if defined(__CUDA_ARCH__)
-        const float inv = rsqrtf(own + s[7]);
-#else
-        const float inv = 1.0f / sqrtf(own + s[7]);
-#endif
-        float ut[6];
-        for (int k = 0; k < 6; ++k) ut[k] = Is[k] * inv;
+$step_head
         if (LANE == 0) {
             // The record (WALK_COORDINATE): the column's non-zero half (the angular one where it turns, 1 / ell's
             // sign bit set), and a column of two halves its linear half in the side float4 (WALK_SIDE floats on).
@@ -3013,42 +3002,12 @@ _REFRESH = """    // The refresh's arithmetic on one tree, float32 (TreeWalk's i
             }
 #endif
         }
-        // h -= ut ut^T
-        for (int a = 0; a < 3; ++a)
-            for (int e = a; e < 3; ++e) {
-                h[SYM(a, e)] -= ut[a] * ut[e];
-                h[15 + SYM(a, e)] -= ut[3 + a] * ut[3 + e];
-            }
-        for (int a = 0; a < 3; ++a)
-            for (int e = 0; e < 3; ++e) h[6 + 3 * a + e] -= ut[a] * ut[3 + e];
+$step_update
     };
     const auto LIFT = [&](float* h, const float* bd) {
-        // B' = B + A X, D' = D - X B' + B^T X (its symmetric part).
-        const float X[3][3] = {{0.0f, -bd[2], bd[1]}, {bd[2], 0.0f, -bd[0]}, {-bd[1], bd[0], 0.0f}};
-        float Bn[9];
-        for (int a = 0; a < 3; ++a)
-            for (int e = 0; e < 3; ++e)
-                Bn[3 * a + e] = h[6 + 3 * a + e] + (h[SYM(a, 0)] * X[0][e] + h[SYM(a, 1)] * X[1][e] + h[SYM(a, 2)] * X[2][e]);
-        for (int a = 0; a < 3; ++a)
-            for (int e = a; e < 3; ++e) {
-                const float xb = X[a][0] * Bn[e] + X[a][1] * Bn[3 + e] + X[a][2] * Bn[6 + e];
-                const float bx = h[6 + a] * X[0][e] + h[9 + a] * X[1][e] + h[12 + a] * X[2][e];
-                h[15 + SYM(a, e)] = (h[15 + SYM(a, e)] - xb) + bx;
-            }
-        for (int k = 0; k < 9; ++k) h[6 + k] = Bn[k];
+$lift
     };
-"""
-
-_INWARD = (
-    """    // The refresh by the tree's lane group (walk_group): the lane feed (FEED, leaves to root) hands the chain one body
-    // at a time; a lane builds each body of a batch (BODY, its path entry, its join slots and its last coordinate's
-    // column), every lane runs the chain on it, read by shuffle. A body's lifted inertia is carried when its parent is
-    // the next joint inward, else added into the parent's join slot (joins[parent], lane k's registers on CUDA, the
-    // CPU's one thread every slot) until the chain reaches it. On the CPU one thread is the group.
-    SYNC();
-"""
-    + _REFRESH
-    + """    const int* Pt = reinterpret_cast<const int*>(path.data);
+    const int* Pt = reinterpret_cast<const int*>(path.data);
     const int* Jt = joins.data;
 #if defined(__CUDA_ARCH__)
     constexpr int HELD = 1;
@@ -3128,16 +3087,19 @@ _INWARD = (
             }
         });
 """
-)
 
 
 @functools.cache
 def _walk_inward_snippet() -> str:
     from .device_preludes import CPU_MATH, LANE_FEED, dual_native, lane_group  # noqa: PLC0415
 
+    step_head, step_update = ts.inward_step("h", "s")
     return dual_native(
         substitute(
             _INWARD,
+            step_head=ts.indent_text(step_head, 8),
+            step_update=ts.indent_text(step_update, 8),
+            lift=ts.indent_text(ts.inward_edge(("bd[0]", "bd[1]", "bd[2]"), "h"), 8),
             coordinate=WALK_COORDINATE,
             link=WALK_LINK,
             now=WALK_NOW,

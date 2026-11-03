@@ -113,6 +113,8 @@ __all__ = [
     "enter",
     "held_fits",
     "indent_text",
+    "inward_edge",
+    "inward_step",
     "root_path",
     "scan_arrays",
     "schedule_costs",
@@ -1132,6 +1134,72 @@ def slip(kind: str, value: str, carry: str, b: str, a: str, g: str, out: str) ->
     if kind == "RIT":
         return [f"const float x = ({value} - {a} * {carry}) / {g};", f"{carry} -= {b} * {value};", out.format("x")]
     raise ValueError(f"a slip's step is R, RT or RIT, not {kind}")
+
+
+# ``INWARD``, the refresh: the same walk leaf first on a body's articulated inertia ``h``, 21 floats, symmetric
+# (``A`` 00 01 02 11 12 22, ``B`` row-major 3x3, ``D`` 00 01 02 11 12 22; ``SYM(a, e)`` a symmetric block's index).
+
+_INWARD_STEP = Template("""const float* A = $h;
+const float* B = $h + 6;
+const float* D = $h + 15;
+float Is[6];
+for (int a = 0; a < 3; ++a) {
+    Is[a] = (A[SYM(a, 0)] * $s[0] + A[SYM(a, 1)] * $s[1] + A[SYM(a, 2)] * $s[2])
+            + (B[3 * a] * $s[3] + B[3 * a + 1] * $s[4] + B[3 * a + 2] * $s[5]);
+    Is[3 + a] = (B[a] * $s[0] + B[3 + a] * $s[1] + B[6 + a] * $s[2])
+                + (D[SYM(a, 0)] * $s[3] + D[SYM(a, 1)] * $s[4] + D[SYM(a, 2)] * $s[5]);
+}
+const float own = $own;
+#if defined(__CUDA_ARCH__)
+const float inv = rsqrtf(own + $s[7]);
+#else
+const float inv = 1.0f / sqrtf(own + $s[7]);
+#endif
+float ut[6];
+for (int k = 0; k < 6; ++k) ut[k] = Is[k] * inv;""")
+
+_INWARD_UPDATE = Template("""// $h -= ut ut^T
+for (int a = 0; a < 3; ++a)
+    for (int e = a; e < 3; ++e) {
+        $h[SYM(a, e)] -= ut[a] * ut[e];
+        $h[15 + SYM(a, e)] -= ut[3 + a] * ut[3 + e];
+    }
+for (int a = 0; a < 3; ++a)
+    for (int e = 0; e < 3; ++e) $h[6 + 3 * a + e] -= ut[a] * ut[3 + e];""")
+
+_INWARD_EDGE = Template("""// B' = B + A X, D' = D - X B' + B^T X (its symmetric part).
+const float X[3][3] = $skew;
+float Bn[9];
+for (int a = 0; a < 3; ++a)
+    for (int e = 0; e < 3; ++e)
+        Bn[3 * a + e] = $h[6 + 3 * a + e] + ($h[SYM(a, 0)] * X[0][e] + $h[SYM(a, 1)] * X[1][e] + $h[SYM(a, 2)] * X[2][e]);
+for (int a = 0; a < 3; ++a)
+    for (int e = a; e < 3; ++e) {
+        const float xb = X[a][0] * Bn[e] + X[a][1] * Bn[3 + e] + X[a][2] * Bn[6 + e];
+        const float bx = $h[6 + a] * X[0][e] + $h[9 + a] * X[1][e] + $h[12 + a] * X[2][e];
+        $h[15 + SYM(a, e)] = ($h[15 + SYM(a, e)] - xb) + bx;
+    }
+for (int k = 0; k < 9; ++k) $h[6 + k] = Bn[k];""")
+
+
+def inward_step(state: str, column: str) -> tuple[str, str]:
+    """``INWARD``'s step on one coordinate: the inertia ``state`` eliminates the coordinate's ``column`` (``s`` 6, then
+    ``R`` and ``R + K``): ``Is = h s``, ``own = s . Is`` (:func:`dot`), ``1 / ell = (own + R + K)^-1/2`` (``inv``),
+    ``ut = Is / ell``; then ``h -= ut ut^T``. Returns the statements before the caller's sink (the record, from
+    ``own``, ``inv`` and ``ut``) and the update after it."""
+    own = dot(tuple(f"Is[{k}]" for k in range(6)), channels(column))
+    return _INWARD_STEP.substitute(h=state, s=column, own=own), _INWARD_UPDATE.substitute(h=state)
+
+
+def inward_edge(lever, state: str) -> str:
+    """``INWARD``'s edge: the inertia ``state`` passes a joint of lever ``d`` (``lever``, three names) to the parent's
+    frame, ``[A, A X + B; ., D - X (A X + B) + B^T X]``, ``X`` the skew of ``d`` (:func:`cross`'s pattern), in place."""
+    rows = []
+    for i, j in _SKEW:
+        row = ["0.0f"] * 3
+        row[j], row[i] = lever[i], f"-{lever[j]}"
+        rows.append("{" + ", ".join(row) + "}")
+    return _INWARD_EDGE.substitute(h=state, skew="{" + ", ".join(rows) + "}")
 
 
 WALK_STAGED = 13
