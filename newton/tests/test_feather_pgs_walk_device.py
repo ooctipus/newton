@@ -629,20 +629,11 @@ def both_ways_kernel(table: tuple):
     the coordinates on its root path up to it (``path``); leaf first, each body's sum over its subtree (``subtree``)."""
     walk = tree_scan.WalkClass(*table)
 
-    def text(cuda: bool) -> str:
-        down = walk.walk(
-            "$V[0] = $P[0];", "$V[0] += x[$c];\ndown[$c] = $V[0];", begin="$V[0] += w[$b];", width=1, cuda=cuda
-        )
-        up = walk.walk(
-            "$P[0] += $V[0];",
-            "$V[0] += x[$c];",
-            begin="$V[0] += w[$b];",
-            end="up[$b] = $V[0];",
-            root_first=False,
-            width=1,
-            cuda=cuda,
-        )
-        return f"""    const auto WALK_BOTH = [&](const float* w, const float* x, float* down, float* up) {{
+    down = walk.walk("$V[0] = $P[0];", "$V[0] += x[$c];\ndown[$c] = $V[0];", begin="$V[0] += w[$b];", width=1)
+    up = walk.walk(
+        "$P[0] += $V[0];", "$V[0] += x[$c];", begin="$V[0] += w[$b];", end="up[$b] = $V[0];", root_first=False, width=1
+    )
+    text = f"""    const auto WALK_BOTH = [&](const float* w, const float* x, float* down, float* up) {{
         {{
 {tree_scan.indent_text(down, 12)}
         }}
@@ -651,8 +642,10 @@ def both_ways_kernel(table: tuple):
         }}
     }};"""
 
-    prelude = DevicePrelude(f"walk_both_{walk.tag}", text(True), cpu=text(False))
-    return KernelTemplate(f"walk_both_{walk.tag}", _BOTH_PARAMS, _BOTH, THREADS, (prelude,), dual=True).kernel()
+    # The loop form's tables take the one access's WALK_CONSTANT.
+    prelude = DevicePrelude(f"walk_both_{walk.tag}", text, cpu=text)
+    preludes = (tree_factor.walk_loads_prelude(), prelude)
+    return KernelTemplate(f"walk_both_{walk.tag}", _BOTH_PARAMS, _BOTH, THREADS, preludes, dual=True).kernel()
 
 
 def both_ways(table: tuple, device, rng) -> tuple:

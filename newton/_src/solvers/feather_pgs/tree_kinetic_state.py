@@ -2272,10 +2272,8 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
                 f"float u[{max(cls.coordinates, 1)}];\n"
                 "const auto qd = [&](const int c, const float q, const float) { out[c] = q; };\n"
                 "const auto twist = [](const int, const float*) {};\n"
-                + device_branches(
-                    cls.walk_twice(up, down, hand=hand, registers=WALK_REGISTERS, cuda=True) + "\n",
-                    cls.walk_twice(up, down, hand=hand, registers=WALK_REGISTERS, cuda=False) + "\n",
-                )
+                + cls.walk_twice(up, down, hand=hand, registers=WALK_REGISTERS)
+                + "\n"
             )
         cases.append(f"    case {r}: {{\n{body}\n        break;\n    }}")
     walked_classes = tuple(cls for cls in classes if cls is not None)

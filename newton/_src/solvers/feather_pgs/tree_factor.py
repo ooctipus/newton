@@ -2067,7 +2067,7 @@ _WALK_ACCESS = """    // The class emitter's reads, ahead of its chain, by the o
     };"""
 
 
-def _walk_down(classes: tuple[WalkClass, ...], cuda: bool, unroll: int, ahead: int | None) -> str:
+def _walk_down(classes: tuple[WalkClass, ...], unroll: int, ahead: int | None) -> str:
     texts = ts.walk_texts(
         ts.Direction.DOWN,
         source="$X.u",
@@ -2078,7 +2078,7 @@ def _walk_down(classes: tuple[WalkClass, ...], cuda: bool, unroll: int, ahead: i
         link=WALK_LINK,
         end="twist($b, $V);",
     )
-    walks = [walk.walk(**texts, cuda=cuda, unroll=unroll, ahead=ahead) for walk in classes]
+    walks = [walk.walk(**texts, unroll=unroll, ahead=ahead) for walk in classes]
     walk = indent_text(ts.by_class(walks), 8)
     return f"""    // WALK_DOWN(cls, data, link, u, prior, qd, twist): the chain of the leave P^T L^-T u of one tree of class cls (an
     // index into the classes the prelude was emitted for), on one lane, root first: each coordinate c takes
@@ -2117,16 +2117,8 @@ def walk_down_prelude(
         repr((classes, unroll, WALK_AHEAD if ahead is None else ahead, WALK_TOUCH)).encode()
     ).hexdigest()[:8]
     # The loads package carries the step's pin (WALK_MUL), under its one guard.
-    texts = {
-        cuda: "\n".join(
-            (
-                _walk_loads_text(cuda),
-                substitute(_WALK_ACCESS, unpacked=WALK_UNPACKED),
-                _walk_down(classes, cuda, unroll, ahead),
-            )
-        )
-        for cuda in (True, False)
-    }
+    walk = substitute(_WALK_ACCESS, unpacked=WALK_UNPACKED) + "\n" + _walk_down(classes, unroll, ahead)
+    texts = {cuda: _walk_loads_text(cuda) + "\n" + walk for cuda in (True, False)}
     return DevicePrelude(f"walk_down_{tag}", texts[True], cpu=texts[False])
 
 

@@ -1400,7 +1400,6 @@ class WalkClass:
         end: str = "",
         root_first: bool = True,
         width: int = 6,
-        cuda: bool = True,
         unroll: int = WALK_UNROLL,
         fetch_joint: str = "",
         fetch_step: str = "",
@@ -1432,7 +1431,6 @@ class WalkClass:
             end: Body ``$b``'s statements after its coordinates, on ``$V``.
             root_first: The walk's direction.
             width: Floats of a body's state.
-            cuda: The CUDA text (its tables in constant memory) or its CPU twin.
             unroll: Coordinates up to which the walk is straight-line code (:data:`WALK_UNROLL`).
             fetch_joint: Body ``$b``'s joint inputs (an expression; ``$up`` its parent), read by ``joint`` as ``$L``; none
                 if empty.
@@ -1530,12 +1528,11 @@ class WalkClass:
             sequence += [(b, c, k == 0, k == len(span) - 1) for k, c in enumerate(span)]
         steps = len(sequence)
         depth = self.ahead(steps, ahead) if fetch_joint or fetch_step else 0
-        memory = "__constant__" if cuda else "const"
         name = f"WALK_CLASS_{self.tag}"
         flags = [b | (int(first) << 16) | (int(last) << 17) for b, _, first, last in sequence]
 
         def table(suffix, values):
-            return f"static {memory} int {name}_{suffix}[{len(values)}] = {{{', '.join(map(str, values))}}};"
+            return f"static WALK_CONSTANT int {name}_{suffix}[{len(values)}] = {{{', '.join(map(str, values))}}};"
 
         tables = [
             table("PARENT", self.parent),
@@ -1740,7 +1737,7 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
         (:data:`WALK_STAGED` floats) and its value, a body's link where it has a parent (one ``float4``)."""
         return (WALK_STAGED + 1) * self.coordinates + 4 * sum(1 for up in self.parent if up >= 0)
 
-    def walk_twice(self, first: dict, second: dict, *, hand: str, registers: int, cuda: bool = True) -> str:
+    def walk_twice(self, first: dict, second: dict, *, hand: str, registers: int) -> str:
         """Native statements of two walks over one tree of the class (a solve's walk up, then its walk down), each
         :meth:`walk`'s keywords (``first``, ``second``), their records and links the same items.
 
@@ -1752,7 +1749,7 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
         fetches. Past that, each walk fetches its own items ahead of its chain and touches them (:meth:`walk`).
         """
         if self.coordinates > first.get("unroll", WALK_UNROLL) or not held_fits(self.held_words, registers):
-            return "{\n" + self.walk(**first, cuda=cuda) + "\n}\n{\n" + self.walk(**second, cuda=cuda) + "\n}"
+            return "{\n" + self.walk(**first) + "\n}\n{\n" + self.walk(**second) + "\n}"
         bare = {"fetch_joint": "", "fetch_step": "", "touch_joint": "", "touch_step": ""}
         # Every held item's line asked of L1 first, then the fetches: on the RTX PRO 6000 the bare fetches of a free
         # cube's records ran 9.2 -> 12.6 us; touched first, 8.3 (hold p2).
@@ -1774,8 +1771,8 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
         return (
             "\n".join(items)
             + "\n{\n"
-            + self.walk(**{**first, **bare}, cuda=cuda)
+            + self.walk(**{**first, **bare})
             + "\n}\n{\n"
-            + self.walk(**{**second, **bare, "step": handed}, cuda=cuda)
+            + self.walk(**{**second, **bare, "step": handed})
             + "\n}"
         )
