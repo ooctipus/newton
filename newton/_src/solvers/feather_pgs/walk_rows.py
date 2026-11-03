@@ -371,16 +371,20 @@ def writer_lanes(rows: int, capacity: int, device) -> int:
 
 
 WRITER_THREADS = 128
-"""Threads of a block of the one writer: whole world groups of up to 32 lanes. Blocks of 128, five a multiprocessor
-(96 registers), keep the general writer's resident warps near its old 80-register kernel's: at 256 threads two a
-multiprocessor (its 112-118 registers) it ran 38-43% slower on kuka, a latency-bound walk."""
+"""Threads of a block of the one writer: whole world groups of up to 32 lanes."""
+
+WRITER_BLOCKS = 6, 5
+"""The one writer's blocks a multiprocessor (its launch bound), without and with bilateral blocks: the register line
+its walk fits, for a latency-bound walk whose speed follows its resident warps. Without blocks (no link rows), six
+(80 registers, 24 warps); with blocks, whose link rows hold a second point across the walk and whose closure follows
+it, five (96 registers: 97 unbounded, and six spilled 88 B a thread, sm_120)."""
 
 
 @cache
 def unit_reader(links: bool) -> wp.Function:
     """The general placement's and the sparse diagonal's unit reader (:func:`row_unit`): a row a unit, so their
-    world-major writers keep a lane a row; with the link rows' seeds where the placement has links (the general
-    placement's; the sparse diagonal admits none). The support placement lists a contact's rows as one unit
+    world-major writers keep a lane a row; with the link rows' seeds where the writer closes bilateral blocks (the
+    general placement's block variants; the sparse diagonal admits none). The support placement lists a contact's rows as one unit
     (:func:`support_units_kernel`) and reads its units in its walkers."""
 
     def row_unit(
@@ -483,7 +487,9 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool = True) -> wp
     has_blocks = blocks > 0
     capacity = max(blocks, 1)
     mimics = int(mimic_blocks)
-    read_unit = unit_reader(True)
+    # A link row is a block row (block_row; links plan blocks, TreeFactor.plan_blocks): the writer reads link rows
+    # where it closes blocks. Elsewhere their seeds would hold a second point across every walk.
+    read_unit = unit_reader(has_blocks)
     walk = packed_walker(1, False, side)
 
     def kernel(
@@ -549,7 +555,7 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool = True) -> wp
 
     name = "write_walked_rows" + (f"_blocks{blocks}" if has_blocks else "")
     name += "_mimics" if mimic_blocks else ""
-    return python_kernel(kernel, name, launch_bounds=(WRITER_THREADS, 5))
+    return python_kernel(kernel, name, launch_bounds=(WRITER_THREADS, WRITER_BLOCKS[int(has_blocks)]))
 
 
 def writer_kernel(solver) -> wp.Kernel:
