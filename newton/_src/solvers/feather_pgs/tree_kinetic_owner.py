@@ -478,18 +478,6 @@ class TreeKineticState:
             classes.append(WalkClass(tuple(int(x) for x in table[:, 0]), (*(int(x) for x in table[:, 1]), count), half))
         return tuple(classes)
 
-    def _walk(self):
-        """The walk the predictor's border reads (:func:`.tree_kinetic_state.border_solve`): the factor's, or, where no
-        tree can slip and the walk is not held, a view with no tree whose ``slips`` the predictor clears."""
-        factor = self.solver.factor
-        if factor.walk_arts is not None:
-            return factor.walk_view()
-        if getattr(self, "_no_walk", None) is None:
-            from .tree_factor import empty_walk_view  # noqa: PLC0415
-
-            self._no_walk = empty_walk_view(self.solver.model, self.solver.forest)
-        return self._no_walk
-
     def _force_input(self, state_in, state_aug, control, predictor_qd, dt):
         """Bind the predictor's inputs (tree_kinetic_state.FORCE_INPUT) for one step."""
         from .tree_kinetic_state import ForceInput  # noqa: PLC0415
@@ -785,7 +773,7 @@ class TreeKineticState:
             raise RuntimeError("Tree kinetic predictor motion velocity differs from the current-cache binding")
         solver = self.solver
         force = self._force_input(state_in, state_aug, control, stage3_qd, dt)
-        walk = self._walk()
+        walk = solver.factor.walk_view()
         inputs = [self.sparse.plan, self.sparse.data, self.plan, self.data, force, walk, self.trial]
         device = solver.model.device
         # The force half, the walk's solve (a thread a tree root), the response half (Z4.2).

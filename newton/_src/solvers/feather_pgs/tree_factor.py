@@ -288,6 +288,34 @@ class TreeFactor:
         self.laws = laws
         self._setup_passive_joint_forces()
         self.setup_drives(forest.articulation_max_dofs > 0)
+        self.walk_trees = self._walk_without_trees()
+
+    def _walk_without_trees(self) -> WalkTrees:
+        """The walk's view until :meth:`plan_walk` holds a tree, and where it holds none: the predictor's border reads
+        it where no tree could slip at construction, and clears its slip counts. Its coordinate ranges are the forest's
+        and its data has no row, so a decided step there (a limit set after construction) finds no tree, keeps its trial
+        and flags the border's status (``constraint_capacity_status()["slip_frames"]``), never reading past an array."""
+        model, forest, device = self.model, self.forest, self.model.device
+        view = WalkTrees()
+        view.data = wp.zeros((0, WALK_COORDINATE), dtype=wp.float32, device=device)
+        view.link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
+        view.path = wp.zeros(1, dtype=wp.vec2i, device=device)
+        view.now = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+        view.now_link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
+        view.now_com = wp.zeros(1, dtype=wp.vec3, device=device)
+        view.origin = view.now_origin = wp.zeros(1, dtype=wp.vec3, device=device)
+        view.joint_art = wp.zeros(1, dtype=wp.int32, device=device)
+        view.scratch = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+        view.joint_start = model.articulation_start
+        view.joint_end = forest.articulation_joint_end
+        view.dof_start = forest.articulation_dof_start
+        view.dofs = forest.articulation_dof_count
+        view.dof_body = view.body_joint = wp.zeros(1, dtype=wp.int32, device=device)
+        view.du = wp.zeros(1, dtype=wp.float32, device=device)
+        view.release = release_view(max(int(model.articulation_count), 1), 0, 1, device)
+        view.body_art = forest.body_to_articulation
+        view.first_art = wp.full(1, -1, dtype=wp.int32, device=device)
+        return view
 
     def _setup_passive_joint_forces(self) -> None:
         """Select the passive spring/damping arrays applied in the inverse-dynamics pass.
@@ -2383,34 +2411,6 @@ class WalkTrees:
     du: wp.array[float]
     body_art: wp.array[int]
     first_art: wp.array[int]
-
-
-def empty_walk_view(model, forest) -> WalkTrees:
-    """A :class:`WalkTrees` that holds no tree: the predictor's border reads it where no tree could slip at construction
-    and the walk is not held (:meth:`TreeFactor.plan_walk`), and clears its slip counts. Its coordinate ranges are the
-    forest's and its data has no row, so a decided step there (a limit set after construction) finds no tree, keeps its
-    trial and flags the border's status (``constraint_capacity_status()["slip_frames"]``), never reading past an array."""
-    device = model.device
-    view = WalkTrees()
-    view.data = wp.zeros((0, WALK_COORDINATE), dtype=wp.float32, device=device)
-    view.link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
-    view.path = wp.zeros(1, dtype=wp.vec2i, device=device)
-    view.now = wp.zeros(1, dtype=wp.spatial_vector, device=device)
-    view.now_link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
-    view.now_com = wp.zeros(1, dtype=wp.vec3, device=device)
-    view.origin = view.now_origin = wp.zeros(1, dtype=wp.vec3, device=device)
-    view.joint_art = wp.zeros(1, dtype=wp.int32, device=device)
-    view.scratch = wp.zeros(1, dtype=wp.spatial_vector, device=device)
-    view.joint_start = model.articulation_start
-    view.joint_end = forest.articulation_joint_end
-    view.dof_start = forest.articulation_dof_start
-    view.dofs = forest.articulation_dof_count
-    view.dof_body = view.body_joint = wp.zeros(1, dtype=wp.int32, device=device)
-    view.du = wp.zeros(1, dtype=wp.float32, device=device)
-    view.release = release_view(max(int(model.articulation_count), 1), 0, 1, device)
-    view.body_art = forest.body_to_articulation
-    view.first_art = wp.full(1, -1, dtype=wp.int32, device=device)
-    return view
 
 
 _ENTER = """    if (tid >= arts.shape[0]) return;
