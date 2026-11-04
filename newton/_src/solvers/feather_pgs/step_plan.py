@@ -30,7 +30,7 @@ from typing import NamedTuple
 
 import warp as wp
 
-from ...core.execution import Device, device
+from ...core.memory import Device, device
 from ...sim import ModelFlags
 from .forest_plan import ForestPlan
 from .route_table import RouteRow

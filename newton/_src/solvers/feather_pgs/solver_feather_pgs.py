@@ -693,7 +693,7 @@ class SolverFeatherPGS(SolverBase):
                     ("nvtx", self.options.diagnostics.nvtx),
                     ("snapshots", self.options.diagnostics.snapshots),
                     ("audit", self._audit is not None),
-                    ("row_watermark", self.placement.row_watermark),
+                    ("row_watermark", self.options.diagnostics.row_watermark),
                     ("readout", bool(self.sweep.readout.kernels)),
                     ("sync_timings", self.options.diagnostics.sync_timings is not None),
                 )
