@@ -68,17 +68,12 @@ def launch_switches(pins=None):
     return pins.get("repair_skip", True), pins.get("repair_classify", True)
 
 
-# Blocks per SM of a listed repair's grid: the most a CUDA SM keeps resident, so a
-# long list keeps the one-pass launch's concurrency and a short one exits in about a
-# wave. A grid-stride loop covers every block of the list.
-_LISTED_BLOCKS_PER_SM = 32
-
-
-def listed_repair_blocks(device):
-    """Grid of a listed repair: :data:`_LISTED_BLOCKS_PER_SM` per SM, or 0 (every block) without grid-stride kernels."""
-    if not device.is_cuda or not getattr(wp.config, "default_grid_stride", True):
-        return 0
-    return _LISTED_BLOCKS_PER_SM * int(device.sm_count)
+def listed_repair_blocks(blocks: int, block: int, device) -> int:
+    """Grid of a listed repair over ``blocks`` blocks of ``block`` threads: one wave of the blocks a multiprocessor
+    keeps resident, so a long list keeps the one-pass launch's concurrency and a short one exits in about a wave. A
+    grid-stride loop covers every block of the list."""
+    work = Work(blocks, lanes=block, block=block, persistent=True)
+    return execution.shape(work, memory.device(device)).grid
 
 
 # Threads per block of a classification launch, one per repair block it lists.
@@ -323,7 +318,7 @@ class TreeKineticState:
         # The bank argument of the shared launch ABI where no kernel reads it: no
         # arrays, so a read would fault rather than compare stale words.
         self._no_bank = native.StateBank()
-        self._repair_grid = listed_repair_blocks(device)
+        self._repair_grid = listed_repair_blocks(self.group_count // self.layout.pack, self.layout.block, device)
         self._walk_solve = execution.shape(
             walk_solve_work(self.group_count * len(self.layout.roots)), memory.device(device)
         )
@@ -365,10 +360,7 @@ class TreeKineticState:
         # Only a launch of more blocks than _CLASSIFIED_GRIDS listed grids is classified, and
         # never a motion-velocity layout's, which repairs on every step (see the class docstring).
         self.classify_first = (
-            self._classify_switch
-            and not self.motion_velocity
-            and 0 < self._repair_grid
-            and self._classify_above < self.launch_count
+            self._classify_switch and not self.motion_velocity and self._classify_above < self.launch_count
         )
         self.repair_kernel = native.get_state_kernel(
             False,
