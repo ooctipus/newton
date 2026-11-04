@@ -142,7 +142,13 @@ def test_readouts_answer_only_when_asked(test, device):
     model = _scene(device)
     solver, _, _ = _rollout(model, Diagnostics(audit=True, row_watermark=True))
     audit = solver.read_audit()
-    test.assertEqual(int(audit["steps"][0]), STEPS)
+    record = solver.get_path_selection()["routes"]["diagnostics"]["audit"]
+    test.assertEqual(set(audit), set(record["slots"]))
+    # A world whose rows exist only inside its sweep (row packets, keyed rows) reads NaN, as the record says.
+    if record["reason"] == "Reads every row of every world.":
+        test.assertEqual(int(audit["steps"][0]), STEPS)
+    else:
+        test.assertTrue(np.isnan(audit["gap"][0]), record["reason"])
     test.assertGreater(solver.constraint_row_watermarks()["contact_high_water"], 0)
     solver, _, _ = _rollout(model, None, steps=1)
     with test.assertRaisesRegex(RuntimeError, "Diagnostics"):
