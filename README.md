@@ -1017,9 +1017,7 @@ acceleration; actual motion remains limited by the physical grasp and actuators.
 `--grasp-tilt` defaults to 30 degrees for hardware and zero otherwise; aligning
 the heavy bin's pull with its front handle reduces sideways yaw. These settings
 do not increase actuator efforts or change the contact materials.
-See the [stronger-motion measurements](reports/fpgs/FRANKA_CLUTTER_VIGOROUS_20260920.md).
-The old primitive-scene smoke results do not qualify the new CAD scenes; see
-the [versioned results and limitations](reports/fpgs/FRANKA_CLUTTER_SCENES_20260920.md).
+The old primitive-scene smoke results do not qualify the new CAD scenes.
 
 Nuts and bolts are downloaded from pinned NVIDIA Factory assets (BSD-3-Clause),
 repaired at export seams and decimated to at most 3,200 triangles **before** SDF
@@ -1064,8 +1062,7 @@ These load levels are diagnostic, not real-cube specifications. The default
 probe removes added joint inertia and damping; the scene's reference-stabilized
 settings are not physically calibrated. The probe's `--collision convex` option
 compares the same cubie geometry without SDF cooking; it also changes contact
-generation and is not an accepted mechanical fix. See the [mechanical audit and validation
-protocol](reports/fpgs/RUBIK_MECHANICAL_CHARACTERIZATION_20260920.md).
+generation and is not an accepted mechanical fix.
 
 ## Contributing and Development
 

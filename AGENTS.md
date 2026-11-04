@@ -68,9 +68,8 @@ uvx --with virtualenv asv run --launch-method spawn main^!
 
 ## FPGS large-gain workstream
 
-For the ongoing FPGS optimization study, follow
-`reports/fpgs/CROSS_TASK_20260911.md` before choosing an experiment. Preserve
-the inherited handoff and fixed per-task performance references.
+For the ongoing FPGS optimization study, preserve the inherited handoff and
+fixed per-task performance references.
 
 - Benchmark representative tasks before specializing the architecture. RTX PRO
   6000 is primary; run paired RTX/GB300 batches with one job per device.
