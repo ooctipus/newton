@@ -26,7 +26,6 @@ CONTRACT = (
     "test_feather_pgs_contract_loops",
     "test_feather_pgs_conformance",
     "test_feather_pgs_conformance_cpu",
-    "test_feather_pgs_notify_inertial",
 )
 """The contract modules, by name in ``newton/tests``."""
 
