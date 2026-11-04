@@ -2006,8 +2006,34 @@ OWNERSHIP = (
     (scenes.hand, "point", 16, PAIRED, ("paired_factor", "mf_gs"), ()),
     (scenes.keyboard, "point", 16, SPARSE_DIAGONAL, ("sparse_diagonal",), ("mf_gs",)),
     (scenes.keyboard, "patch", 16, COMPACT_BOUNDARY, ("sparse_diagonal",), ("mf_gs",)),
+    # Velocity-limit rows bind on the pushed arm: their last phase counts with the sweep's.
+    (
+        scenes.pushed_arm,
+        None,
+        16,
+        MF_HELD.but("mf_held_velocity_limits", options={"enable_joint_velocity_limits": True}),
+        ("mf_gs",),
+        (),
+    ),
 )
 """Routes whose owners claim worlds at run time, and the sweeps the solve readout must see serve them."""
+
+DIAGNOSED = SolverFeatherPGS.Diagnostics(snapshots=True, solve_readout="trace", audit=True)
+"""Every diagnostic that reads a step without changing which rows it builds: the ownership tests run each route under
+it and require the trajectory of the route without diagnostics (the row watermark keeps every world's rows, so it is
+left out)."""
+
+
+def _assert_same_trajectory(test, diagnosed: Run, plain: Run, control: Run) -> None:
+    """Require ``diagnosed`` to follow ``plain``: bitwise where a second plain run (``control``) repeats it bitwise,
+    else as closely as the control does (atomically ordered bookkeeping varies between runs on CUDA)."""
+    for name in STATE_FIELDS:
+        reference, repeated, actual = (getattr(run, name) for run in (plain, control, diagnosed))
+        if np.array_equal(repeated, reference):
+            np.testing.assert_array_equal(actual, reference, err_msg=name)
+        else:
+            spread = float(np.abs(repeated - reference).max())
+            np.testing.assert_allclose(actual, reference, rtol=0.0, atol=10.0 * spread, err_msg=name)
 
 
 def _add_ownership_tests() -> None:
@@ -2015,10 +2041,12 @@ def _add_ownership_tests() -> None:
         physics = _physics(factory(), law, iterations)
 
         def test(self, physics=physics, route=route, owners=owners, absent=absent):
-            counted = route.but(
-                f"{route.name}_readout", options={"diagnostics": SolverFeatherPGS.Diagnostics(solve_readout="sweeps")}
-            )
+            counted = route.but(f"{route.name}_diagnosed", options={"diagnostics": DIAGNOSED})
             run = run_physics(physics, counted, self.device)
+            plain = run_physics(physics, route, self.device)
+            _assert_same_trajectory(
+                self, run, plain, run_physics(physics, route.but(f"{route.name}_control"), self.device)
+            )
             failures = _failures(_record_checks(route, run.routes))
             self.assertFalse(failures, _message(failures))
             worlds = run.scene.params.get("worlds", len(run.scene.params.get("mu", [None])))
@@ -2033,8 +2061,18 @@ def _add_ownership_tests() -> None:
                 self.assertGreaterEqual(sum(served), worlds, f"{owners} solved {served} of {worlds} worlds: {solved}")
             for owner in absent:
                 self.assertEqual(solved.get(owner, 0), 0, f"{owner} solved worlds its route's owner claims: {solved}")
+            # Every step's world-solves count once: in the slot of an owner that solved it, or as skipped (a world
+            # without rows, which the matrix-free sweeps do not enter).
+            if owners:
+                summary = run.measurements["solve_readout"]
+                skipped = summary["skipped"]["solves"] if summary["skipped"] else 0
+                solves = sum(slot["solves"] for slot in slots)
+                self.assertEqual(solves + skipped, len(run.contacts) * worlds, f"{owners}: {solved}")
 
-        test.__doc__ = f"Check with the solve readout that {route.name}'s owner solves the worlds of {physics.name}."
+        test.__doc__ = (
+            f"Check, under every diagnostic, that {route.name} keeps its trajectory on {physics.name} and that its "
+            "owner solves the worlds, each world-solve counted once."
+        )
         setattr(TestFeatherPGSConformanceCUDA, f"test_{physics.name}_{route.name}_owns_its_worlds", test)
 
 
