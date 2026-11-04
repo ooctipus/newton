@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared machinery of the FeatherPGS law tests (``test_feather_pgs_*_laws``, ``test_feather_pgs_law_source``).
+"""Shared machinery of the FeatherPGS law tests (``test_feather_pgs_laws`` and the row-law tests).
 
 Generated kernels that evaluate a law through its Warp function and through its
 CUDA rendering, inputs that exercise each law's branches, bitwise and rounding
@@ -25,6 +25,7 @@ from newton._src.solvers.feather_pgs import (
     projection_laws,
     row_kernels,
     row_laws,
+    spatial_laws,
 )
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
 from newton._src.solvers.feather_pgs.device_preludes import cuda_native, dual_native
@@ -127,7 +128,7 @@ def twin_kernels(law):
             f"wp::index(out_{j}, i) = {f'result.v{j} ? 1 : 0' if _is_bool(annotation) else f'result.v{j}'};"
             for j, annotation in enumerate(sig.results)
         ]
-    family = next(f for f in FAMILIES if f.name == sig.family)
+    family = next(f for f in (*FAMILIES, spatial_laws.SPATIAL) if f.name == sig.family)
     body = (
         f"    const auto {value} = {sig.family}::{sig.name}({', '.join(native_args)});\n    "
         + "\n    ".join(native_stores)

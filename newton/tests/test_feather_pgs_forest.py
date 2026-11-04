@@ -1,7 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests of the body cut: the solver's own model is a pure forest, and a step crosses to it and back unchanged."""
+"""The forest primitive's contract: the model's topology read once into a pure forest of coordinate trees.
+
+The body cut turns every loop into trees and a step crosses into the forest and back unchanged; the plan's trees are
+the rows' graph's vertices; tree ownership and response supports follow the joints; the subtree intervals and the
+fill-free factor pattern follow the trees; the host index kit the plan is built with matches element-by-element
+references. Each section names the interface it reads.
+"""
 
 import unittest
 from unittest import mock
@@ -10,9 +16,493 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import body_cut
+from newton._src.solvers.feather_pgs import body_cut, host_index
 from newton._src.solvers.feather_pgs.body_cut import BodyCut
+from newton._src.solvers.feather_pgs.body_mapping import build_body_maps
+from newton._src.solvers.feather_pgs.tree_plan import TreePlan
+from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
+
+# ---------------------------------------------------------------------------------------------------------------------
+# host_index
+#
+# Tests of FeatherPGS's host index toolkit against element-by-element references.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+class TestFeatherPGSHostIndex(unittest.TestCase):
+    def setUp(self):
+        self.rng = np.random.default_rng(7)
+
+    def test_offsets_bound_each_segment(self):
+        counts = self.rng.integers(0, 5, 40)
+        bounds = host_index.offsets(counts)
+        self.assertEqual(bounds.dtype, np.int64)
+        self.assertEqual(bounds.tolist(), [0, *np.cumsum(counts).tolist()])
+        self.assertEqual(host_index.offsets(np.array([3, 4], dtype=np.int32), dtype=np.int32).dtype, np.int32)
+        self.assertEqual(host_index.offsets([]).tolist(), [0])
+
+    def test_expand_lists_each_element_with_its_rank(self):
+        counts = self.rng.integers(0, 5, 40)
+        segment, rank = host_index.expand(counts)
+        expected = [(s, k) for s, count in enumerate(counts) for k in range(count)]
+        self.assertEqual(list(zip(segment.tolist(), rank.tolist(), strict=True)), expected)
+
+    def test_segmented_rank_restarts_at_each_segment(self):
+        segment = np.sort(self.rng.integers(0, 8, 60))
+        weight = self.rng.integers(0, 4, 60)
+        for weights in (None, weight, weight > 1):
+            values = np.ones(60, dtype=np.int64) if weights is None else np.asarray(weights, dtype=np.int64)
+            expected = [int(values[:i][segment[:i] == segment[i]].sum()) for i in range(60)]
+            self.assertEqual(host_index.segmented_rank(segment, weights).tolist(), expected)
+        self.assertEqual(host_index.segmented_rank(np.zeros(0, dtype=np.int32)).size, 0)
+
+    def test_group_by_keeps_each_keys_elements_in_order(self):
+        keys = self.rng.integers(0, 6, 50)
+        bounds, order = host_index.group_by(keys, 8)
+        self.assertEqual(bounds.size, 9)
+        for key in range(8):
+            self.assertEqual(order[bounds[key] : bounds[key + 1]].tolist(), np.flatnonzero(keys == key).tolist())
+
+    def test_ordered_unique_keeps_first_occurrences(self):
+        values = self.rng.integers(0, 9, 50)
+        expected = list(dict.fromkeys(values.tolist()))
+        self.assertEqual(host_index.ordered_unique(values).tolist(), expected)
+
+    def test_lookup_finds_the_holding_segment(self):
+        bounds = np.array([2, 2, 5, 9, 9, 12])
+        items = np.arange(-1, 14)
+        expected = [next((s for s in range(5) if bounds[s] <= i < bounds[s + 1]), -1) for i in items]
+        self.assertEqual(host_index.lookup(bounds, items).tolist(), expected)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# forest_plan
+#
+# The forest plan's coordinate trees: the vertices of the rows' graph, read from the model's topology alone.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+_INERTIA = wp.mat33(np.eye(3, dtype=np.float32) * 0.01)
+
+
+_AXIS = (0.0, 0.0, 1.0)
+
+
+def _link(builder) -> int:
+    return builder.add_link(mass=1.0, inertia=_INERTIA)
+
+
+def _plan(model):
+    return SolverFeatherPGS(model).forest
+
+
+def _sizes(plan, world=0) -> list:
+    trees = plan.world_trees[plan.world_tree_start[world] : plan.world_tree_start[world + 1]]
+    return plan.tree_size[trees].tolist()
+
+
+class TestCoordinateTrees(unittest.TestCase):
+    def test_catalogue(self):
+        """Read a star as its keys, a loop on a fixed base as a tree per branch, and a floating hand as one."""
+        keyboard = _plan(scenes.keyboard(keys=8, worlds=2).build("cpu"))
+        for world in range(2):
+            self.assertEqual(sorted(_sizes(keyboard, world), reverse=True), [6] + [1] * 8)
+        self.assertEqual(keyboard.diagonal_mass_sizes, frozenset((8,)))
+        four_bar = _plan(scenes.four_bar().build("cpu"))
+        self.assertEqual(len(_sizes(four_bar)), 2)
+        self.assertEqual(min(_sizes(four_bar)), 1)
+        hand = _plan(scenes.hand(worlds=2).build("cpu"))
+        self.assertEqual(sorted(_sizes(hand, 1), reverse=True), [17, 6])
+        for plan in (keyboard, four_bar, hand):
+            per_articulation = np.bincount(plan.tree_articulation, plan.tree_size, plan.response_dof_count.size)
+            np.testing.assert_array_equal(per_articulation, plan.response_dof_count)
+
+    def test_root_without_coordinates_is_no_node(self):
+        """Contract welds at any depth: the base is in no tree, and a welded link is its parent's."""
+        builder = newton.ModelBuilder()
+        base, arm, weld, tip, side = (_link(builder) for _ in range(5))
+        builder.add_articulation(
+            [
+                builder.add_joint_fixed(-1, base),
+                builder.add_joint_revolute(base, arm, axis=_AXIS),
+                builder.add_joint_fixed(arm, weld),
+                builder.add_joint_revolute(weld, tip, axis=_AXIS),
+                builder.add_joint_revolute(base, side, axis=_AXIS),
+            ]
+        )
+        plan = _plan(builder.finalize(device="cpu"))
+        self.assertEqual(plan.tree_size.tolist(), [2, 1])
+        self.assertEqual(plan.tree_first.tolist(), [0, 2])
+        self.assertEqual(plan.tree_articulation.tolist(), [0, 0])
+        self.assertEqual(plan.body_tree.tolist(), [-1, 0, 0, 0, 1])
+
+    def test_a_free_root_is_a_coordinate(self):
+        """A free body is a one-node tree of six, and a free root holds its whole articulation."""
+        builder = newton.ModelBuilder()
+        box, trunk, leg = (_link(builder) for _ in range(3))
+        builder.add_articulation([builder.add_joint_free(box)])
+        builder.add_articulation([builder.add_joint_free(trunk), builder.add_joint_revolute(trunk, leg, axis=_AXIS)])
+        plan = _plan(builder.finalize(device="cpu"))
+        self.assertEqual(plan.tree_size.tolist(), [6, 7])
+        self.assertEqual(plan.body_tree.tolist(), [0, 1, 1])
+
+    def test_only_solved_coordinates_make_a_tree(self):
+        """A prescribed free body responds with nothing, so it is no vertex."""
+        builder = newton.ModelBuilder()
+        carried = builder.add_link(mass=1.0, inertia=_INERTIA, is_kinematic=True)
+        free = _link(builder)
+        builder.add_articulation([builder.add_joint_free(carried)])
+        builder.add_articulation([builder.add_joint_free(free)])
+        plan = _plan(builder.finalize(device="cpu"))
+        self.assertEqual(plan.prescribed_articulation_host.tolist(), [1, 0])
+        self.assertEqual(plan.tree_size.tolist(), [6])
+        self.assertEqual(plan.tree_articulation.tolist(), [1])
+        self.assertEqual(plan.body_tree.tolist(), [-1, 0])
+
+    def test_a_tree_stops_at_its_articulation(self):
+        """Each articulation is its own block of the mass matrix, even hung from another's body: a star on both sides."""
+        builder = newton.ModelBuilder()
+        upper, lower = _link(builder), _link(builder)
+        builder.add_articulation([builder.add_joint_revolute(-1, upper, axis=_AXIS)])
+        builder.add_articulation([builder.add_joint_revolute(upper, lower, axis=_AXIS)])
+        model = builder.finalize(device="cpu")
+        self.assertEqual(model.joint_ancestor.numpy().tolist(), [-1, 0])
+        plan = _plan(model)
+        self.assertEqual(plan.tree_size.tolist(), [1, 1])
+        self.assertEqual(plan.body_tree.tolist(), [0, 1])
+        self.assertEqual(plan.diagonal_mass_sizes, frozenset((1,)))
+
+    def test_breadth_first_joints_interleave_trees(self):
+        """Keep ``(tree_first, tree_size)`` honest: it counts a tree's coordinates, it does not bound them."""
+        builder = newton.ModelBuilder()
+        base, left, right, left_tip, right_tip = (_link(builder) for _ in range(5))
+        builder.add_articulation(
+            [
+                builder.add_joint_fixed(-1, base),
+                builder.add_joint_revolute(base, left, axis=_AXIS),
+                builder.add_joint_revolute(base, right, axis=_AXIS),
+                builder.add_joint_revolute(left, left_tip, axis=_AXIS),
+                builder.add_joint_revolute(right, right_tip, axis=_AXIS),
+            ]
+        )
+        plan = _plan(builder.finalize(device="cpu"))
+        self.assertEqual(plan.tree_first.tolist(), [0, 1])
+        self.assertEqual(plan.tree_size.tolist(), [2, 2])
+        self.assertEqual(plan.body_tree.tolist(), [-1, 0, 1, 0, 1])
+
+    def test_a_model_without_joints_has_no_trees(self):
+        builder = newton.ModelBuilder()
+        _link(builder)
+        plan = _plan(builder.finalize(device="cpu"))
+        self.assertEqual(plan.tree_size.size, 0)
+        self.assertEqual(plan.world_trees.size, 0)
+        self.assertEqual(plan.body_tree.tolist(), [-1])
+
+    def test_a_star_is_a_diagonal_factor_pattern(self):
+        """The star test agrees with the fill-free pattern on random welded trees of one root joint."""
+        rng = np.random.default_rng(7)
+        found = {True: 0, False: 0}
+        for _ in range(60):
+            builder = newton.ModelBuilder()
+            count = int(rng.integers(1, 9))
+            bodies = [_link(builder) for _ in range(count)]
+            parents = [-1 if k == 0 else int(rng.integers(0, k)) for k in range(count)]
+            welded = rng.random(count) < 0.6
+            joints = []
+            for k in range(count):
+                parent = -1 if parents[k] < 0 else bodies[parents[k]]
+                add = builder.add_joint_fixed if welded[k] else builder.add_joint_revolute
+                joints.append(add(parent, bodies[k]) if welded[k] else add(parent, bodies[k], axis=_AXIS))
+            builder.add_articulation(joints)
+            if welded.all():
+                continue
+            plan = _plan(builder.finalize(device="cpu"))
+            size = int((~welded).sum())
+            star = TreePlan.build(parents, (~welded).astype(np.int32)).nonzero_count == size
+            self.assertEqual(size in plan.diagonal_mass_sizes, star, parents)
+            self.assertEqual(bool(np.all(plan.tree_size == 1)), star, parents)
+            found[bool(star)] += 1
+        self.assertTrue(all(found.values()), found)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# body_maps
+#
+# Check tree ownership and response supports built during solver setup.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def maps(bodies, child, ancestor, qd, starts, ends, response_start, response_count):
+    child, qd, starts, ends, response_start, response_count = (
+        np.asarray(values, dtype=np.int32) for values in (child, qd, starts, ends, response_start, response_count)
+    )
+    forest = TreePlan.build(np.asarray(ancestor, dtype=np.int32))
+    return build_body_maps(bodies, child, forest, qd, starts, ends, response_start, response_count)
+
+
+class TestBodyMaps(unittest.TestCase):
+    def test_loop_tail_fixed_root_and_unowned_body(self):
+        actual = maps(
+            6, [0, 1, 2, 1, 3, 4], [-1, 0, 1, 2, -1, 4], [0, 0, 1, 3, 3, 38, 39], [0, 4, 6], [3, 6], [0, 3], [3, 36]
+        )
+        expected = (
+            [0, 1, 2, 4, 5, -1],
+            [0, 0, 0, 1, 1, -1],
+            [0, 1, 1, 1, 1, 0],
+            [0, 1, 7, 0xFFFFFFFF, 0xFFFFFFFF, 0],
+            [-1, 0, -1, -1, -1, -1],
+        )
+        for observed, reference in zip(actual, expected, strict=True):
+            np.testing.assert_array_equal(observed, reference)
+
+    def test_response_window_and_high_singleton(self):
+        actual = maps(3, [0, 1, 2], [-1, 0, 0], [0, 6, 7, 46], [0, 3], [3], [6], [40])
+        np.testing.assert_array_equal(actual[2], [0, 1, 1])
+        np.testing.assert_array_equal(actual[3], [0, 1, 0xFFFFFFFE])
+        np.testing.assert_array_equal(actual[4], [-1, 6, -1])
+        actual = maps(2, [0, 1], [-1, -1], [0, 39, 40], [0, 2], [2], [0], [40])
+        self.assertEqual(actual[2][1], 1)
+        self.assertEqual(actual[3][1], 0)
+        self.assertEqual(actual[4][1], 39)
+
+    def test_unsorted_acyclic_ancestry(self):
+        actual = maps(3, [0, 1, 2], [2, -1, 1], [0, 1, 2, 3], [0, 3], [3], [0], [3])
+        np.testing.assert_array_equal(actual[3], [7, 2, 6])
+        np.testing.assert_array_equal(actual[4], [-1, 1, -1])
+
+    def test_cyclic_ancestry_is_no_forest(self):
+        """A joint ancestry with a cycle anywhere, reachable from an owned body or not, is no joint forest."""
+        for ancestor in ([0, -1], [1, 0]):
+            with self.subTest(ancestor=ancestor), self.assertRaisesRegex(ValueError, "cycle|other nodes"):
+                TreePlan.build(np.asarray(ancestor, dtype=np.int32))
+
+    def test_last_tree_owner_and_empty_articulation(self):
+        actual = maps(1, [0, 0], [-1, 0], [0, 1, 2], [0, 0, 2], [0, 2], [0, 0], [0, 2])
+        self.assertEqual(actual[0][0], 1)
+        self.assertEqual(actual[1][0], 1)
+        self.assertEqual(actual[3][0], 3)
+        actual = maps(2, [], [], [0], [0, 0], [0], [0], [0])
+        np.testing.assert_array_equal(actual[4], [-1, -1])
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# subtree_reduce
+#
+# The prefix-scan subtree reduction of the tree finish kernel matches the depth-level loop.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+class TestDepthFirstIntervals(unittest.TestCase):
+    def test_breadth_first_input_is_reordered(self):
+        """Legs added breadth-first still get one contiguous interval per subtree."""
+        plan = TreePlan.build([-1, 0, 0, 1, 2, 3])
+        self.assertEqual(plan.dfs_order.tolist(), [0, 1, 3, 5, 2, 4])
+        self.assertEqual(plan.dfs_end.tolist(), [6, 4, 4, 4, 6, 6])
+
+    def test_forest_roots_are_separate_intervals(self):
+        plan = TreePlan.build([-1, 0, -1, 2, 2])
+        self.assertEqual(plan.dfs_order.tolist(), [0, 1, 2, 3, 4])
+        self.assertEqual(plan.dfs_end.tolist(), [2, 2, 5, 4, 5])
+
+    def test_cycle_is_rejected(self):
+        with self.assertRaises(ValueError):
+            TreePlan.build([-1, 2, 1])
+
+
+def _interleaved_legs(device, worlds=4):
+    """A free trunk whose two three-joint legs are added breadth-first: parent-first but not depth-first."""
+    scene = newton.ModelBuilder()
+    cfg = scene.default_shape_cfg.copy()
+    cfg.mu = 0.6
+    stance = wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity())
+    trunk = scene.add_link(xform=stance, mass=4.0, inertia=wp.mat33(np.eye(3) * 0.1), lock_inertia=True)
+    scene.add_shape_box(trunk, hx=0.2, hy=0.1, hz=0.05, cfg=cfg)
+    joints = [scene.add_joint_free(child=trunk, parent_xform=stance)]
+    parents = [trunk, trunk]
+    for segment in range(3):
+        for leg in range(2):
+            body = scene.add_link(mass=0.5, inertia=wp.mat33(np.eye(3) * 0.01), lock_inertia=True)
+            origin = wp.vec3(0.15 * (1 if leg else -1), 0.0, 0.0) if segment == 0 else wp.vec3(0.0, 0.0, -0.15)
+            joints.append(
+                scene.add_joint_revolute(
+                    parent=parents[leg],
+                    child=body,
+                    axis=newton.Axis.Y,
+                    parent_xform=wp.transform(origin, wp.quat_identity()),
+                    target_ke=30.0,
+                    target_kd=2.0,
+                    limit_lower=-1.5,
+                    limit_upper=1.5,
+                )
+            )
+            if segment == 2:
+                scene.add_shape_sphere(body, radius=0.03, cfg=cfg)
+            parents[leg] = body
+    scene.add_articulation(joints)
+    # A free box keeps the world on the dense route (the mixed owner's class).
+    box = scene.add_body(xform=wp.transform(wp.vec3(0.6, 0.0, 0.06), wp.quat_identity()), mass=0.5)
+    scene.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+    builder = newton.ModelBuilder()
+    builder.replicate(scene, worlds, spacing=(3.0, 3.0, 0.0))
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    model.rigid_contact_max = 512
+    return model
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# sparse_mass_matrix
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _skew(v):
+    return np.array(((0.0, -v[2], v[1]), (v[2], 0.0, -v[0]), (-v[1], v[0], 0.0)))
+
+
+def _random_inertia(rng):
+    """A random rigid body's inertia about the origin: its inertia record and its dense spatial matrix."""
+    mass = rng.uniform(0.5, 2.0)
+    com = rng.normal(scale=0.3, size=3)
+    q = rng.normal(size=(3, 3))
+    rotational = q @ q.T + 0.1 * np.eye(3) + mass * (com @ com * np.eye(3) - np.outer(com, com))
+    moment = mass * com
+    dense = np.block([[mass * np.eye(3), -_skew(moment)], [_skew(moment), rotational]])
+    return np.concatenate(([mass], moment, rotational.reshape(-1))), dense
+
+
+def _endpoint_support(plan, joint_a, joint_b=-1):
+    """Sparse coordinates supporting either endpoint joint; -1 denotes the world."""
+    mask = 0
+    for joint in (joint_a, joint_b):
+        if joint != -1:
+            mask |= int(plan.joint_ancestor_mask[joint])
+    return np.asarray([dof for dof in range(plan.dof_count) if mask & (1 << dof)], dtype=np.int32)
+
+
+def _branched_humanoid_topology():
+    """Return 43 DOFs with a free base, legs, spine, arms, and branching fingers."""
+    parents, counts = [-1], [6]
+
+    def chain(parent, length):
+        for _ in range(length):
+            parents.append(parent)
+            counts.append(1)
+            parent = len(parents) - 1
+        return parent
+
+    for _ in range(2):
+        chain(0, 6)
+    spine = chain(0, 3)
+    for _ in range(2):
+        hand = chain(spine, 7)
+        for _ in range(4):
+            chain(hand, 1)
+    return parents, counts
+
+
+class TestSparseMassMatrix(unittest.TestCase):
+    def test_row_support_catalogue(self):
+        """Preserve ordered endpoint unions and full multi-DOF limit support."""
+        for parents, counts in (([-1, 0, 0, 1], [3, 2, 1, 0]), ([-1], [64])):
+            tree = TreePlan.build(parents, counts)
+            plan = tree.factor
+            body_masks = np.concatenate((np.zeros(1, dtype=np.uint64), plan.joint_ancestor_mask))
+            support = tree.support_classes(body_masks, plan.dof_count)
+            self.assertIsNotNone(support)
+            self.assertEqual(support.body_class[0], 0)
+            for first, first_mask in enumerate(body_masks):
+                for second, second_mask in enumerate(body_masks):
+                    index = support.pair_class[support.body_class[first], support.body_class[second]]
+                    mask = int(first_mask | second_mask)
+                    expected = [dof for dof in range(plan.dof_count) if mask & (1 << dof)]
+                    expected += [-1] * (plan.dof_count - len(expected))
+                    np.testing.assert_array_equal(support.class_dof[index], expected)
+            for dof, mask in enumerate(plan.ancestor_mask):
+                expected = [i for i in range(plan.dof_count) if int(mask) & (1 << i)]
+                expected += [-1] * (plan.dof_count - len(expected))
+                np.testing.assert_array_equal(support.class_dof[support.limit_class[dof]], expected)
+        tree = TreePlan.build([-1, 0, 0, 1], [3, 2, 1, 0])
+        plan = tree.factor
+        support = tree.support_classes(plan.joint_ancestor_mask, 6)
+        np.testing.assert_array_equal(support.class_dof[support.limit_class[0]], [3, 4, 5, -1, -1, -1])
+        # Structurally zero coefficients inside a joint block must retain their slots.
+        np.testing.assert_array_equal(np.flatnonzero(plan.lookup[:, plan.inverse_permutation[0]] >= 0), [5])
+
+    def test_row_support_rejects_oversized_union(self):
+        """Decline a catalogue that would truncate a non-colliding body's union."""
+        tree = TreePlan.build([-1, 0, 0], [6, 3, 3])
+        self.assertIsNone(tree.support_classes(tree.factor.joint_ancestor_mask, 9))
+
+    def test_factor_schedules_follow_dependencies(self):
+        """Cover each packed factor entry once and schedule independent branch pivots together."""
+        for parents, counts in [([2, -1, 1, 2, -1, 4], [2, 3, 0, 1, 1, 2]), _branched_humanoid_topology()]:
+            plan = TreePlan.build(parents, counts).factor
+            levels = np.empty(plan.dof_count, dtype=int)
+            for level in range(plan.factor_level_count):
+                begin, end = plan.factor_level_offsets[level : level + 2]
+                levels[plan.factor_level_columns[begin:end]] = level
+            np.testing.assert_array_equal(np.sort(plan.factor_level_columns), np.arange(plan.dof_count))
+            np.testing.assert_array_equal(np.sort(plan.column_entries), np.arange(plan.nonzero_count))
+            np.testing.assert_array_equal(
+                np.sort(plan.factor_level_entries), np.flatnonzero(plan.entry_rows != plan.columns)
+            )
+            for row in range(plan.dof_count):
+                begin, end = plan.row_offsets[row : row + 2]
+                first = row - (end - begin) + 1
+                np.testing.assert_array_equal(plan.columns[begin:end], np.arange(first, row + 1))
+                self.assertTrue(np.all(levels[first:row] < levels[row]))
+                begin, end = plan.column_offsets[row : row + 2]
+                entries = plan.column_entries[begin:end]
+                np.testing.assert_array_equal(plan.columns[entries], row)
+                self.assertTrue(np.all(np.diff(plan.entry_rows[entries]) > 0))
+            if plan.dof_count == 43:
+                self.assertLess(plan.factor_level_count, plan.dof_count // 2)
+
+    def test_forest_fixed_multidof_order(self):
+        """Derive fill-free support for unordered forests and fixed joints."""
+        plan = TreePlan.build([2, -1, 1, 2, -1, 4], [2, 3, 0, 1, 1, 2]).factor
+        np.testing.assert_array_equal(np.sort(plan.permutation), np.arange(9))
+        np.testing.assert_array_equal(plan.inverse_permutation[plan.permutation], np.arange(9))
+        self.assertEqual(_endpoint_support(plan, 2).size, 3)
+        self.assertEqual(_endpoint_support(plan, 0, 5).size, 8)
+        rng = np.random.default_rng(54)
+        lower = np.zeros((9, 9))
+        lower[plan.entry_rows, plan.columns] = rng.normal(size=plan.nonzero_count)
+        lower[np.diag_indices(9)] = 2.0
+        inverse = np.linalg.inv(lower)
+        np.testing.assert_allclose(inverse[plan.lookup < 0], 0.0, atol=1.0e-14)
+        matrix = lower @ lower.T
+        structural = (plan.lookup >= 0) | (plan.lookup.T >= 0)
+        np.testing.assert_allclose(matrix[~structural], 0.0, atol=1.0e-14)
+
+    def test_invalid_topology(self):
+        """Reject cycles, invalid parents, counts, and unsupported mask widths."""
+        for parents, counts in [
+            ([1, 0], [1, 1]),
+            ([2], [1]),
+            ([-2], [1]),
+            ([-1], [-1]),
+            ([-1], [1.5]),
+            ([-1], []),
+            ([], []),
+        ]:
+            with self.subTest(parents=parents, counts=counts), self.assertRaises(ValueError):
+                _ = TreePlan.build(parents, counts).factor
+
+    def test_mask_bit_63_and_fixed_root(self):
+        """Preserve the highest mask bit and fixed-root endpoint support."""
+        plan = TreePlan.build([-1, 0], [0, 64]).factor
+        self.assertEqual(int(plan.joint_ancestor_mask[0]), 0)
+        self.assertEqual(int(plan.joint_ancestor_mask[1]), (1 << 64) - 1)
+        self.assertEqual(int(plan.ancestor_mask[0]), (1 << 64) - 1)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# body_cut
+#
+# Tests of the body cut: the solver's own model is a pure forest, and a step crosses to it and back unchanged.
+# ---------------------------------------------------------------------------------------------------------------------
 
 
 def _revolute_chain(builder, *, parent=-1, x=0.0):
@@ -82,6 +572,8 @@ _LOOP_MOTION = {
     "fixed": ([], []),
     "d6": ([0.03, 0.2], [0.3, 0.9]),
 }
+
+
 """The loop joint's coordinates and motions each joint type is seated back to."""
 
 
@@ -580,4 +1072,4 @@ class TestEveryLiveArrayIsListed(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)
