@@ -197,7 +197,7 @@ class TestKernelIdentity(unittest.TestCase):
     def test_census_crosses_resident_row_metadata(self):
         """Cross the matrix-free sweep with resident row metadata, which rewrites its row loads."""
         calls = [kwargs for name, _, _, kwargs in identity.census_calls() if name.endswith("sweep_routes.mf_gs_kernel")]
-        self.assertTrue(any(kwargs["resident_row_metadata"] and not kwargs["shared_metadata"] for kwargs in calls))
+        self.assertTrue(any(kwargs["places"].staging == "resident" for kwargs in calls))
 
     def test_scalar_branch_kernels_are_recorded_with_the_pins(self):
         """Record every kernel of the held-tree owner's scalar-branch group in the pins family.

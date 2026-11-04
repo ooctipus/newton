@@ -15,7 +15,7 @@ from functools import cache
 import warp as wp
 
 from ...core.execution import Work, device_lanes, shape
-from ...core.memory import REGISTERS_PER_THREAD, Buffer, Staging, arch_budget, built_for
+from ...core.memory import REGISTERS_PER_THREAD, Buffer, Place, Staging, arch_budget, built_for
 from . import kernel_template, sweep_units
 from .device_preludes import CPU_MATH, RING, SHARED_STORAGE, cuda_native, dual_native, lane_group
 from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude, walk_paths_prelude
@@ -98,9 +98,60 @@ row store's (the ``world_*`` records, from the dense capacity of the world's lin
 free bodies' placement (``mf_*``)."""
 
 
-def _dense_staging(shared_metadata: bool, resident_row_metadata: bool) -> str:
-    """The dense rows' staging policy (:class:`.sweep.WorldRows`) of a sweep's metadata options."""
-    return "shared" if shared_metadata else "resident" if resident_row_metadata else "streamed"
+@dataclasses.dataclass(frozen=True)
+class RowPlaces:
+    """Where the matrix-free sweep's row operands live, places of the memory toolkit chosen once in the plan
+    (:func:`.execution_plan._select_mfgs_storage`): each in the block's shared stage or read from global memory. Both
+    places hold identical values, so the sweep's results are the same.
+
+    Args:
+        metadata: The dense rows' right-hand sides, diagonals and friction coefficients.
+        kinds: The dense rows' kinds and parents (one packed word a row): shared wherever the metadata is.
+        impulses: The free bodies' impulses.
+    """
+
+    metadata: Place = Place.SHARED
+    kinds: Place = Place.SHARED
+    impulses: Place = Place.SHARED
+
+    def __post_init__(self):
+        if {self.metadata, self.kinds, self.impulses} - {Place.SHARED, Place.GLOBAL}:
+            raise ValueError(f"row operands live in shared or global memory: {self}")
+        if self.metadata is Place.SHARED and self.kinds is not Place.SHARED:
+            raise ValueError("staged metadata stages the rows' kinds with it")
+
+    def __repr__(self) -> str:
+        return f"RowPlaces({self.metadata.name}, {self.kinds.name}, {self.impulses.name})"
+
+    @property
+    def staging(self) -> str:
+        """The dense rows' staging policy (:class:`.sweep.WorldRows`)."""
+        if self.metadata is Place.SHARED:
+            return "shared"
+        return "resident" if self.kinds is Place.SHARED else "streamed"
+
+    @property
+    def suffix(self) -> str:
+        """The places' part of a kernel's name."""
+        return (
+            ("" if self.metadata is Place.SHARED else "_gmeta")
+            + ("_smeta" if self.staging == "resident" else "")
+            + ("" if self.impulses is Place.SHARED else "_glambda")
+        )
+
+
+STAGED_ROWS = RowPlaces()
+"""Every row operand in the block's shared stage, the default."""
+
+ROW_PLACES = (
+    STAGED_ROWS,
+    RowPlaces(impulses=Place.GLOBAL),
+    RowPlaces(Place.GLOBAL, Place.GLOBAL),
+    RowPlaces(Place.GLOBAL, Place.GLOBAL, Place.GLOBAL),
+    RowPlaces(Place.GLOBAL, Place.SHARED),
+    RowPlaces(Place.GLOBAL, Place.SHARED, Place.GLOBAL),
+)
+"""Every placement of the sweep's row operands (the census's axis)."""
 
 
 class FreeBodyCoordinates:
@@ -536,17 +587,15 @@ def mf_gs_staging(
     max_world_dofs: int,
     *,
     mapping: str = "warp",
-    shared_metadata: bool = True,
-    resident_row_metadata: bool = False,
-    stream_mf_impulses: bool = False,
+    places: RowPlaces = STAGED_ROWS,
     traces: bool = False,
     wide_rows: bool = False,
 ) -> Staging:
     """The shared working set of a world's matrix-free sweep block (:func:`mf_gs_source` declares it): the world's
     velocity, its dense rows' impulses and staged metadata, the free-body impulses unless they stream, and the colored
     mapping's color offsets (and its trace's warp maxima)."""
-    dense = WorldRows(max_constraints, staging=_dense_staging(shared_metadata, resident_row_metadata))
-    free = WorldRows(mf_max_constraints, staging="header", stream=stream_mf_impulses)
+    dense = WorldRows(max_constraints, staging=places.staging)
+    free = WorldRows(mf_max_constraints, staging="header", stream=places.impulses is Place.GLOBAL)
     colored = ()
     if mapping == "colored":
         warps = COLORED_THREADS // 32
@@ -573,9 +622,7 @@ def mf_gs_source(
     max_row_dofs: int | None = None,
     mapping: str = "warp",
     colored_worlds: bool = False,
-    shared_metadata: bool = True,
-    resident_row_metadata: bool = False,
-    stream_mf_impulses: bool = False,
+    places: RowPlaces = STAGED_ROWS,
     has_dense_velocity_limit_rows: bool = True,
     skip_local_internal_worlds: bool = False,
     contact_torsion: bool = False,
@@ -612,8 +659,6 @@ def mf_gs_source(
     if mapping not in MAPPINGS:
         raise ValueError(f"mapping must be one of {MAPPINGS}, got {mapping!r}")
     colored = mapping == "colored"
-    if resident_row_metadata and shared_metadata:
-        raise ValueError("resident_row_metadata applies to streamed metadata (shared_metadata=False)")
     if factor_coordinates and (has_dense_velocity_limit_rows or skip_local_internal_worlds):
         raise ValueError("factor coordinates require the paired contact solve")
     if independent_components and not factor_coordinates:
@@ -627,8 +672,8 @@ def mf_gs_source(
     max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
     row_lanes = Lanes(lanes)
     laws = RowLaws(regularize=True, material=material, torsion=contact_torsion, policy=solve_policy)
-    dense = WorldRows(M_D, staging=_dense_staging(shared_metadata, resident_row_metadata), lanes=row_lanes)
-    free = WorldRows(M_MF, staging="header", stream=stream_mf_impulses, lanes=row_lanes)
+    dense = WorldRows(M_D, staging=places.staging, lanes=row_lanes)
+    free = WorldRows(M_MF, staging="header", stream=places.impulses is Place.GLOBAL, lanes=row_lanes)
     dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows)
     bodies = FREE_BODY_COORDINATES
     # The free bodies' speed rows leave and enter by the walk, as their rows were written (walk_rows).
@@ -638,9 +683,7 @@ def mf_gs_source(
         M_MF,
         D,
         mapping=mapping,
-        shared_metadata=shared_metadata,
-        resident_row_metadata=resident_row_metadata,
-        stream_mf_impulses=stream_mf_impulses,
+        places=places,
         traces=solve_policy.traces,
         wide_rows=wide_rows,
     )
@@ -838,9 +881,7 @@ def mf_gs_kernel(
     max_row_dofs: int | None = None,
     mapping: str = "warp",
     colored_worlds: bool = False,
-    shared_metadata: bool = True,
-    resident_row_metadata: bool = False,
-    stream_mf_impulses: bool = False,
+    places: RowPlaces = STAGED_ROWS,
     has_dense_velocity_limit_rows: bool = True,
     skip_local_internal_worlds: bool = False,
     local_internal_max_constraints: int = 0,
@@ -866,9 +907,7 @@ def mf_gs_kernel(
         max_row_dofs=max_row_dofs,
         mapping=mapping,
         colored_worlds=colored_worlds,
-        shared_metadata=shared_metadata,
-        resident_row_metadata=resident_row_metadata,
-        stream_mf_impulses=stream_mf_impulses,
+        places=places,
         has_dense_velocity_limit_rows=has_dense_velocity_limit_rows,
         skip_local_internal_worlds=skip_local_internal_worlds,
         contact_torsion=contact_torsion,
@@ -888,9 +927,7 @@ def mf_gs_kernel(
         f"sweep_mf_{'colored' if colored else 'gs'}_{max_constraints}_{mf_max_constraints}_{max_world_dofs}"
         f"_s{max_row_dofs}"
         f"_densevlim{int(has_dense_velocity_limit_rows)}"
-        + ("" if shared_metadata else "_gmeta")
-        + ("_smeta" if resident_row_metadata else "")
-        + ("_glambda" if stream_mf_impulses else "")
+        + places.suffix
         + (f"_local_fallback{local_internal_max_constraints}" if skip_local_internal_worlds else "")
         + ("_torsion" if contact_torsion else "")
         + ("_factor" if factor_coordinates else "")

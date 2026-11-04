@@ -20,6 +20,7 @@ import math
 import numpy as np
 
 from ...core.live_sort import SLOT_BITS
+from ...core.memory import Place
 from ...sim.contacts import CAPACITY_BLOCKS_PER_SM
 from .contact_row_plan import contact_row_plan
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF
@@ -606,13 +607,14 @@ def _mf_gs_storage(solver) -> dict | None:
     if storage is None:
         return None
 
-    def storage_class(resident):
-        return "resident" if resident else "streamed"
+    def storage_class(place):
+        return "resident" if place is Place.SHARED else "streamed"
 
+    places = storage.places
     return {
-        "metadata": storage_class(storage.shared_metadata),
-        "row_types_and_parents": storage_class(storage.shared_metadata or storage.resident_row_metadata),
-        "mf_impulses": storage_class(not storage.stream_mf_impulses),
+        "metadata": storage_class(places.metadata),
+        "row_types_and_parents": storage_class(places.kinds),
+        "mf_impulses": storage_class(places.impulses),
         "reason": storage.reason,
     }
 

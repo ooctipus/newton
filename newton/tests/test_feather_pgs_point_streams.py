@@ -352,6 +352,7 @@ def _dense_build_calls():
 
 
 def _solver_factory_calls():
+    from newton._src.core.memory import Place  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
         sweep_levels,
         sweep_routes,
@@ -397,8 +398,7 @@ def _solver_factory_calls():
     # of large dense capacities select under either law; limits add the limit scans' global reads.
     for limits in (False, True):
         kwargs = {
-            "shared_metadata": False,
-            "resident_row_metadata": True,
+            "places": sweep_routes.RowPlaces(Place.GLOBAL, Place.SHARED),
             "has_dense_velocity_limit_rows": limits,
             "skip_tier_rows": 0 if limits else 32,
         }
@@ -697,7 +697,7 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
             with self.subTest(flag=flag):
                 self.assertTrue(any(flag in name for name in sparse))
         # The MF-GS kernels that keep row metadata resident are pinned.
-        self.assertTrue([name for name in self.current if "resident_row_metadata=True" in name])
+        self.assertTrue([name for name in self.current if "RowPlaces(GLOBAL, SHARED, SHARED)" in name])
         # The patch-only linked tiers are pinned beside the point tiers they extend.
         linked = [name for name in self.current if "linked_rows=True" in name]
         self.assertTrue(linked)

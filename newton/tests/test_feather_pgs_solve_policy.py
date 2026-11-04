@@ -191,14 +191,12 @@ def _vote_census():
             sweep_routes.mf_gs_kernel.__wrapped__,
             (64, 32, 12, "120"),
             (
-                _axis("shared_metadata"),
-                _axis("stream_mf_impulses"),
+                _axis("places", sweep_routes.ROW_PLACES),
                 _axis("has_dense_velocity_limit_rows"),
                 ({}, {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
                 _axis("factor_coordinates"),
                 _axis("skip_tier_rows", (0, 32)),
                 _axis("independent_components"),
-                _axis("resident_row_metadata"),
             ),
         ),
         (
@@ -450,7 +448,12 @@ class TestExitLaw(unittest.TestCase):
                 continue
             body = max(_native_snippets(plain), key=len)
             law_sites = len(_LAW_SITE.findall(body))
-            if kwargs.get("resident_row_metadata") and ("_smeta" not in plain.key or "s_meta_dense" not in body):
+            places = kwargs.get("places")
+            if (
+                places is not None
+                and places.staging == "resident"
+                and ("_smeta" not in plain.key or "s_meta_dense" not in body)
+            ):
                 self.fail(f"{plain.key} {kwargs}: resident row metadata is not resident")
             for policy in (DEFAULT_POLICY, SWEEPS, TRACE):
                 kernel = factory(*args, solve_policy=policy, **kwargs)

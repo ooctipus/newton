@@ -21,6 +21,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.core.memory import Place
 from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
@@ -49,13 +50,13 @@ _GENERATORS = {
     "mf_gs_streamed": (
         sweep_routes.mf_gs_kernel.__wrapped__,
         (64, 32, 12, "120"),
-        {"stream_mf_impulses": True},
+        {"places": sweep_routes.RowPlaces(impulses=Place.GLOBAL)},
         (_DENSE_PASS, _SPEED_PASS),
     ),
     "mf_gs_global_metadata": (
         sweep_routes.mf_gs_kernel.__wrapped__,
         (64, 32, 12, "120"),
-        {"shared_metadata": False},
+        {"places": sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL)},
         (_DENSE_PASS, _SPEED_PASS),
     ),
     "sparse_limits": (
@@ -99,7 +100,7 @@ class TestVelocityLimitLawSources(unittest.TestCase):
             32,
             12,
             "120",
-            stream_mf_impulses=True,
+            places=sweep_routes.RowPlaces(impulses=Place.GLOBAL),
         )
         text = "\n".join(sources)
         self.assertIn("const float old_mf_vlim = READ(lane == 0 ? g_lam_mf[i] : 0.0f, 0);", text)

@@ -27,7 +27,7 @@ import numpy as np
 import warp as wp
 
 from ...core.execution import Work, shape
-from ...core.memory import arch_budget, device
+from ...core.memory import Place, arch_budget, device
 from . import (
     field_group,
     host_index,
@@ -1350,8 +1350,10 @@ class Sweep:
             # A test pin streams the impulses (storage is part of the kernel specialization key); the selection
             # sizes the resident row metadata with its choice.
             force_stream_mf_impulses = self.pins.get("mf_storage") == "streamed"
+            on_cpu = Place.GLOBAL if force_stream_mf_impulses else Place.SHARED
             storage = _MFGSStorage(
-                False, force_stream_mf_impulses, False, "Without CUDA no shared-memory storage applies."
+                sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL, on_cpu),
+                "Without CUDA no shared-memory storage applies.",
             )
             if model.device.is_cuda:
                 storage = _select_mfgs_storage(
@@ -1386,9 +1388,7 @@ class Sweep:
             mf_gs_options = {
                 "pitch": self.placement.row_pitch,
                 "has_dense_velocity_limit_rows": self.options.enable_joint_velocity_limits,
-                "shared_metadata": storage.shared_metadata,
-                "resident_row_metadata": storage.resident_row_metadata,
-                "stream_mf_impulses": storage.stream_mf_impulses,
+                "places": storage.places,
                 "skip_local_internal_worlds": self.placement.local_internal_fast_path,
                 "local_internal_max_constraints": self.placement.dense_internal_max_rows,
                 "contact_torsion": self.laws.contact_torsion_enabled,

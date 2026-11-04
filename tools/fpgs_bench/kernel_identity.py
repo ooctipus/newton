@@ -147,6 +147,7 @@ def factory_calls():
     second keyed-row coordinate layout (one articulation, no secondary block)
     follow. Calls a factory rejects are recorded as rejected.
     """
+    from newton._src.core.memory import Place  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
         keyed_rows,
         sweep_routes,
@@ -157,8 +158,8 @@ def factory_calls():
     mf_gs = _unwrapped(sweep_routes.mf_gs_kernel)
     toggles = (
         {},
-        {"shared_metadata": False},
-        {"stream_mf_impulses": True},
+        {"places": sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL)},
+        {"places": sweep_routes.RowPlaces(impulses=Place.GLOBAL)},
         {"contact_torsion": True},
         {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19},
         {"skip_tier_rows": 32},
@@ -555,15 +556,13 @@ def census_calls():
     from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel  # noqa: PLC0415
 
     mf_gs = (
-        _axis("shared_metadata", (True, False)),
-        _axis("stream_mf_impulses"),
+        _axis("places", sweep_routes.ROW_PLACES),
         _axis("has_dense_velocity_limit_rows", (True, False)),
         ({}, {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
         _axis("contact_torsion"),
         _axis("factor_coordinates"),
         _axis("skip_tier_rows", (0, 32)),
         _axis("independent_components"),
-        _axis("resident_row_metadata"),
     )
     local = (
         _axis("paired_dof_count", (0, 6)),

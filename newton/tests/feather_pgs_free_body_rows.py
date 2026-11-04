@@ -14,6 +14,7 @@ import inspect
 import numpy as np
 import warp as wp
 
+from newton._src.core.memory import Place
 from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.factor.walk import unpack_walk_records
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
@@ -116,7 +117,7 @@ def sweep_free_body_rows(
         6,
         str(wp.get_device(device).arch),
         has_dense_velocity_limit_rows=False,
-        shared_metadata=False,
+        places=sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL),
         seeded=True,
     )
     arguments = {arg.label: arg for arg in kernel.adj.args}
