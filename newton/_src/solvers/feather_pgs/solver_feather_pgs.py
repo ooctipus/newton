@@ -52,7 +52,7 @@ from .path_selection import (
 from .placement import Placement
 from .route_table import RouteTable, capable
 from .rows import RowLaws
-from .step_plan import StepPlan, StepSpec
+from .step_plan import Step, StepPlan, StepSpec
 from .sweep_plan import Sweep
 from .tree_factor import TreeFactor
 
@@ -690,18 +690,18 @@ class SolverFeatherPGS(SolverBase):
             diagnostics=tuple(
                 name
                 for name, on in (
-                    ("nvtx", self._nvtx),
-                    ("snapshots", self._debug_stage3_snapshots),
+                    ("nvtx", self.options.diagnostics.nvtx),
+                    ("snapshots", self.options.diagnostics.snapshots),
                     ("audit", self._audit is not None),
                     ("row_watermark", self.placement.row_watermark),
                     ("readout", bool(self.sweep.readout.kernels)),
-                    ("sync_timings", _FPGS_SYNC_TIMINGS),
+                    ("sync_timings", self.options.diagnostics.sync_timings is not None),
                 )
                 if on
             ),
         )
-        # The step's per-stage dispatch tables, which step() and the route record read, and the kernels they launch.
-        self._plan = StepPlan.build(self.spec)
+        # The step: its stages bound to the owners above and its per-stage dispatch tables, which the route record reads.
+        self._plan = StepPlan.build(self.spec, self)
         # Record the applied options once; get_path_selection() returns detached copies.
         self._applied_options = applied_options(self, SolverFeatherPGS.__init__, requested_options)
 
@@ -1000,151 +1000,11 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         collide_done_event=None,
     ):
-        # The configuration's checks come first; then the states', before any of them is read.
+        # The call's checks come first, before any state is read; then the plan's stages (step_plan.StepPlan.stages).
         if state_in.requires_grad or state_out.requires_grad:
             raise ValueError("FeatherPGS has no gradients: step states built with requires_grad=False.")
-        forest_in, forest_out, forest_control = self.cut.enter(
-            state_in, state_out, control, self.factor.fk_id_cache_valid
-        )
-        self._step_forest(forest_in, forest_out, forest_control, contacts, dt, collide_done_event)
-        self.cut.leave(state_in, state_out)
+        self._plan.run(Step(state_in, state_out, control, contacts, dt, collide_done_event, self._step))
         return state_out
-
-    def _step_forest(self, state_in, state_out, control, contacts, dt, collide_done_event) -> None:
-        """One step of the forest (:mod:`.body_cut`)."""
-        self._bind_contact_material(contacts)
-        if contacts is not None:
-            self.placement.follow_contacts(contacts)
-        if self.options.pgs_warmstart:
-            # A reduced stream is valid when it carries retained identities.
-            # Preserve the reader lease for an unreduced captured stream: a
-            # later producer must not change its layout behind graph replay.
-            self._require_unreduced_contacts(
-                contacts,
-                supports_body_pair_reduced_contacts=bool(
-                    contacts is not None and contacts.rigid_contacts_body_pair_reduced
-                ),
-                configuration="pgs_warmstart=True",
-            )
-            if contacts is not None and getattr(contacts, "rigid_contact_match_index", None) is None:
-                raise NotImplementedError(
-                    "FeatherPGS contact warm start requires a Contacts buffer created with "
-                    "contact_matching enabled (rigid_contact_match_index is None). Build the "
-                    'CollisionPipeline / Contacts with contact_matching="latest" (or "sticky").'
-                )
-        self.factor.track_step_dt(dt)
-
-        model = self.model
-
-        if control is None:
-            control = model.control(clone_variables=False)
-        # The step's state-derived dynamics are the tree factor's (no state carries them: there are no gradients).
-        state_aug = self.factor
-
-        if collide_done_event is not None and state_in.particle_count > 0:
-            wp.get_stream(self.model.device).wait_event(collide_done_event)
-            collide_done_event = None  # consumed
-
-        self._eval_particle_forces(state_in, control, contacts)
-
-        if not model.articulation_count:
-            self.integrate_particles(model, state_in, state_out, dt)
-            self._step += 1
-            return
-
-        # Stages 1-3: the tree factor (FK/ID, drives, mass refresh, factor), then the predictor v_hat.
-        stage3_qd, inverse_dynamics_ready = self.factor.factor(
-            state_in, control, state_out, dt, self._step, self.qd_work, self.v_hat, self.v_out
-        )
-        self.factor.predict(state_in, control, stage3_qd, inverse_dynamics_ready, dt, self.v_hat)
-        if self.options.diagnostics.snapshots:
-            wp.copy(self._debug_stage3_qd_work, stage3_qd)
-            wp.copy(self._debug_stage3_joint_qdd, state_aug.joint_qdd)
-            wp.copy(self._debug_stage3_v_hat, self.v_hat)
-
-        # Wait for pipelined collide (if running on separate stream)
-        if collide_done_event is not None:
-            wp.get_stream(model.device).wait_event(collide_done_event)
-
-        # ══════════════════════════════════════════════════════════════
-        # STAGE 4: Build contact problem
-        # ══════════════════════════════════════════════════════════════
-        with wp.ScopedTimer("S4_ContactBuild", print=False, use_nvtx=self.options.diagnostics.nvtx, synchronize=False):
-            if self.sweep.resolved_worlds_owner is not None:
-                self.sweep.resolved_worlds_owner.classify(state_in, state_aug, contacts, dt)
-            self.laws.write(self, state_in, state_aug, contacts, dt)
-
-        # The diagonals (the packed rows' |Z|^2 + cfm, the sparse diagonal's) and the bias (the sweeps compute J v
-        # each iteration).
-        with wp.ScopedTimer(
-            "S4_HinvJt_Diag_RHS", print=False, use_nvtx=self.options.diagnostics.nvtx, synchronize=False
-        ):
-            self.placement.diagonals()
-            if self.placement.walks and self.routes.case != "K2":
-                # The one writer: seeds walked into the packed rows or the support sink, their headers (walk_rows). The
-                # sparse diagonal's rows are written whole in the row pass (RowLaws.write_slot_rows).
-                self.laws.write_walked(self, state_in, contacts, dt)
-            else:
-                self.laws.write_rhs(self, dt)
-
-        # The free bodies' rows' rhs: their writers stored their diagonals and incident velocities.
-        if self.forest.has_free_rigid_bodies:
-            with wp.ScopedTimer("S4_MF_Setup", print=False, use_nvtx=self.options.diagnostics.nvtx, synchronize=False):
-                with self._sync_timed("s4_mf_setup"):
-                    self.laws.write_free_body_rhs(self, dt)
-
-        # ══════════════════════════════════════════════════════════════
-        # STAGE 5+6: PGS solve
-        # ══════════════════════════════════════════════════════════════
-        with wp.ScopedTimer("S5_PGS_Prep", print=False, use_nvtx=self.options.diagnostics.nvtx, synchronize=False):
-            self.placement.prepare_impulses()
-            self.sweep.warm_start(contacts, dt)
-        self.sweep.seed_patches(state_in, contacts, dt)
-
-        with wp.ScopedTimer("S5_GatherJY", print=False, use_nvtx=self.options.diagnostics.nvtx, synchronize=False):
-            if self.factor.eliminates:
-                # The closure's seed: the one writer closed the bilateral blocks and corrected the other rows; the
-                # blocks' kept rows start at -r_Q, after the warm start's gather.
-                self.factor.seed_blocks(
-                    first=self.placement.dense_first, rhs=self.placement.rhs, impulses=self.placement.impulses
-                )
-
-            # The sweeps add their velocity change to the predictor; a world without rows keeps it.
-            wp.copy(self.v_out, self.v_hat)
-
-            # Pack MF metadata into int4 structs for coalesced 128-bit loads
-            self.placement.pack_free_body_meta()
-            if self.sweep.colored_units is not None:
-                # The colored worlds' units and colors follow the rows the pack just published.
-                self.sweep.colored_units.build(
-                    self.placement.mf_constraint_count,
-                    self.placement.dense_first,
-                    self.placement.mf_contact_rows_end,
-                    self.placement.mf_meta_packed,
-                    self.placement.mf_Z,
-                    self.placement.row_mu,
-                    self.placement.row_w,
-                    self.placement.body_base,
-                    int(self.laws.set.weighted),
-                )
-
-        with wp.ScopedTimer("S6_PGS_Solve", print=False, use_nvtx=self.options.diagnostics.nvtx, synchronize=False):
-            self.sweep.solve(self.v_hat, self.v_out)
-
-        if self._audit is not None:
-            self._audit.launch()
-
-        # ══════════════════════════════════════════════════════════════
-        # STAGE 7: Update qdd + integrate
-        # ══════════════════════════════════════════════════════════════
-        self.factor.finish(state_in, state_out, dt, self._step)
-        self.integrate_particles(model, state_in, state_out, dt)
-
-        self.sweep.carry(state_in, state_out, contacts, dt)
-
-        self.placement.record_watermarks(contacts)
-
-        self._step += 1
 
     def constraint_capacity_status(self, *, clear: bool = False) -> dict[str, bool]:
         """Return sticky capacity-overflow flags without enabling row telemetry.

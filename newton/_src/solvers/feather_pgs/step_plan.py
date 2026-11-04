@@ -8,11 +8,12 @@ route (the laws and the class, today the placement case), the capacities, the ma
 streams, and the diagnostics in force. :class:`StepPlan` and the route record (:mod:`.path_selection`) read it; nothing
 in it is computed a second time elsewhere.
 
-Every stage whose work depends on the articulation size (the factor and where stage 4
-whitens the rows) has one table: each size's route and the reason for it. The solve of stages 5 and 6 has one
-entry: the rows its sweep solves and what drives the sweep. ``step()`` launches through these tables,
-the route record (:mod:`.path_selection`) reports them, and construction builds
-exactly the kernels they name, so the three cannot disagree.
+The plan's :attr:`StepPlan.stages` are the step: each a closure bound once to its owners, chosen from the spec, so
+``step()`` is the stages run in order on a :class:`Step` with no construction constant re-tested. Every stage whose
+work depends on the articulation size (where stage 4 whitens the rows) has one table: each size's route and the
+reason for it. The solve of stages 5 and 6 has one entry: the rows its sweep solves and what drives the sweep. The
+route record (:mod:`.path_selection`) reports the tables and the stages' order, and construction builds exactly the
+kernels they name, so the three cannot disagree.
 
 The plan reads the solver's route (its row of the route table: the placement case
 and producer) and the mapping beside it (the
@@ -22,16 +23,30 @@ construction has not, and nothing in it changes after construction.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from types import MappingProxyType
+from typing import NamedTuple
+
+import warp as wp
 
 from ...core.execution import Device, device
 from ...sim import ModelFlags
 from .forest_plan import ForestPlan
 from .route_table import RouteRow
 
-__all__ = ["Capacities", "Route", "SolveRoute", "StepPlan", "StepSpec", "TopologyPin", "first_failed", "kernel_key"]
+__all__ = [
+    "Capacities",
+    "Route",
+    "SolveRoute",
+    "Stage",
+    "Step",
+    "StepPlan",
+    "StepSpec",
+    "TopologyPin",
+    "first_failed",
+    "kernel_key",
+]
 
 
 def kernel_key(kernel) -> str | None:
@@ -117,6 +132,9 @@ class StepSpec:
     """The model holds particles, whose forces and integration the step runs."""
     pure_forest: bool
     """The model is its own forest (:mod:`.body_cut`): the step reads and publishes the caller's states directly."""
+    walked: bool
+    """The one writer walks the dense rows after the row pass (every walking class but the sparse diagonal's, whose
+    rows the row pass writes whole); otherwise the rows' bias is written apart."""
     kernels: Mapping[str, str | None]
     """The sweep's kernel keys by route: ``sparse``, ``sparse_diagonal``, ``paired_factor``, ``mf_gs`` and
     ``mf_colored`` (``None`` where the class builds none)."""
@@ -150,6 +168,7 @@ class StepSpec:
             articulated=bool(model.articulation_count),
             particles=bool(model.particle_count),
             pure_forest=bool(solver.cut.pure),
+            walked=bool(placement.walks) and route.case != "K2",
             kernels=MappingProxyType(
                 {
                     "sparse": kernel_key(sweep.sparse_kernel) if route.case == "K1" else None,
@@ -177,6 +196,7 @@ class StepSpec:
             "articulated": self.articulated,
             "particles": self.particles,
             "pure_forest": self.pure_forest,
+            "walked": self.walked,
             "kernels": dict(self.kernels),
             "streams": list(self.streams),
             "diagnostics": list(self.diagnostics),
@@ -205,17 +225,28 @@ class SolveRoute:
 
 @dataclass(frozen=True)
 class StepPlan:
-    """The per-stage dispatch tables of one solver, built once by :meth:`build`."""
+    """The step of one solver: its stages and per-stage dispatch tables, built once by :meth:`build`."""
 
     response: Mapping[int, Route]
     """Stage 4, per size, where its rows are whitened: ``owner`` (a contact owner publishes the response),
     ``sparse_diagonal`` or ``packed`` (the packed rows' build)."""
     solve: SolveRoute
+    stages: tuple[Stage, ...]
+    """The step, in order (:func:`_stages`)."""
 
     @classmethod
-    def build(cls, spec: StepSpec) -> StepPlan:
-        """Read the plan from the step's ``spec``: its route and its forest."""
-        return cls(response=MappingProxyType(_response(spec.route, spec.forest)), solve=_solve(spec.route))
+    def build(cls, spec: StepSpec, solver) -> StepPlan:
+        """Read the plan from the step's ``spec`` and bind its stages to the ``solver``'s owners."""
+        return cls(
+            response=MappingProxyType(_response(spec.route, spec.forest)),
+            solve=_solve(spec.route),
+            stages=_stages(spec, solver),
+        )
+
+    def run(self, step: Step) -> None:
+        """Run the step's stages in order."""
+        for stage in self.stages:
+            stage.run(step)
 
     def sizes(self, stage: str, route: str) -> tuple[int, ...]:
         """The sizes a stage's table routes to ``route``."""
@@ -229,6 +260,7 @@ class StepPlan:
 
         return {
             "response": table(self.response),
+            "order": [stage.name for stage in self.stages],
         }
 
 
@@ -265,3 +297,271 @@ def _solve(row: RouteRow) -> SolveRoute:
             "matrix_free_gs", "Matrix-free Gauss-Seidel; local, paired and tiered owners claim their worlds first."
         )
     return SolveRoute(route=route)
+
+
+class Step:
+    """One step's operands: the caller's arguments, the forest's states and what one stage hands the next."""
+
+    __slots__ = (
+        "contacts",
+        "control",
+        "dt",
+        "event",
+        "index",
+        "qd",
+        "ready",
+        "source_in",
+        "source_out",
+        "state_in",
+        "state_out",
+    )
+
+    def __init__(self, state_in, state_out, control, contacts, dt: float, event, index: int):
+        # The caller's states, which the leave publishes; the forest's states and control (body_cut), the caller's
+        # on a pure forest, from the enter on.
+        self.source_in, self.source_out = state_in, state_out
+        self.state_in, self.state_out, self.control = state_in, state_out, control
+        self.contacts, self.dt, self.index = contacts, dt, index
+        # The collision pass's event, waited on once, before the first stage that reads what it produced.
+        self.event = event
+        # The tree factor's stage-3 velocity and its inverse-dynamics event, which the predictor reads.
+        self.qd = self.ready = None
+
+
+class Stage(NamedTuple):
+    """One stage of the step: its name and the closure, bound at plan time, that runs it on a :class:`Step`."""
+
+    name: str
+    run: Callable[[Step], None]
+
+
+def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
+    """The step's stages, each bound once to its owners.
+
+    Every construction constant the step reads is decided here, from the spec: which stages exist, the writer, the
+    optional claims and the diagnostics. A stage then runs without re-testing one; what it still tests is the call's
+    (the contacts and the collision event) or its owner's (``owners.tsv`` of the TG hand-back).
+    """
+    cut, factor, laws, placement, sweep, model = (
+        solver.cut,
+        solver.factor,
+        solver.laws,
+        solver.placement,
+        solver.sweep,
+        solver.model,
+    )
+    route, forest, diagnostics = spec.route, spec.forest, spec.diagnostics
+    stages: list[Stage] = []
+
+    def add(*runs, nvtx: str | None = None) -> None:
+        """Append ``runs`` as stages; under the NVTX diagnostic a named group runs as one stage inside its range."""
+        if nvtx is not None and "nvtx" in diagnostics:
+
+            def ranged(step, runs=runs, name=nvtx):
+                with wp.ScopedTimer(name, print=False, use_nvtx=True, synchronize=False):
+                    for run in runs:
+                        run(step)
+
+            stages.append(Stage(nvtx, ranged))
+        else:
+            stages.extend(Stage(run.__name__, run) for run in runs)
+
+    def enter(step):
+        if not spec.pure_forest:
+            step.state_in, step.state_out, step.control = cut.enter(
+                step.state_in, step.state_out, step.control, factor.fk_id_cache_valid
+            )
+        if step.control is None:
+            step.control = model.control(clone_variables=False)
+
+    def bind_material(step):
+        solver._bind_contact_material(step.contacts)
+
+    def follow_contacts(step):
+        if step.contacts is not None:
+            placement.follow_contacts(step.contacts)
+
+    def warm_start_contract(step):
+        contacts = step.contacts
+        # A reduced stream is valid when it carries retained identities. Preserve the reader lease for an unreduced
+        # captured stream: a later producer must not change its layout behind graph replay.
+        solver._require_unreduced_contacts(
+            contacts,
+            supports_body_pair_reduced_contacts=bool(
+                contacts is not None and contacts.rigid_contacts_body_pair_reduced
+            ),
+            configuration="pgs_warmstart=True",
+        )
+        if contacts is not None and getattr(contacts, "rigid_contact_match_index", None) is None:
+            raise NotImplementedError(
+                "FeatherPGS contact warm start requires a Contacts buffer created with "
+                "contact_matching enabled (rigid_contact_match_index is None). Build the "
+                'CollisionPipeline / Contacts with contact_matching="latest" (or "sticky").'
+            )
+
+    def clock(step):
+        factor.track_step_dt(step.dt)
+
+    def wait_for_collision(step):
+        if step.event is not None:
+            wp.get_stream(model.device).wait_event(step.event)
+            step.event = None
+
+    def particle_forces(step):
+        solver._eval_particle_forces(step.state_in, step.control, step.contacts)
+
+    def integrate_particles(step):
+        solver.integrate_particles(model, step.state_in, step.state_out, step.dt)
+
+    def leave(step):
+        solver._step += 1
+        if not spec.pure_forest:
+            cut.leave(step.source_in, step.source_out)
+
+    # The call's bind: the contacts' material, pool and identity contract.
+    add(enter)
+    if solver.options.contact_compliance:
+        add(bind_material)
+    add(follow_contacts)
+    if route.laws.warm_start:
+        add(warm_start_contract)
+    add(clock)
+    if spec.particles:
+        add(wait_for_collision, particle_forces)
+    if not spec.articulated:
+        if spec.particles:
+            add(integrate_particles)
+        add(leave)
+        return tuple(stages)
+
+    # Stages 1-3: the tree factor (FK/ID, drives, mass refresh, factor), then the predictor v_hat.
+    def factor_trees(step):
+        step.qd, step.ready = factor.factor(
+            step.state_in, step.control, step.state_out, step.dt, step.index, solver.qd_work, solver.v_hat, solver.v_out
+        )
+
+    def predict(step):
+        factor.predict(step.state_in, step.control, step.qd, step.ready, step.dt, solver.v_hat)
+
+    def snapshots(step):
+        wp.copy(solver._debug_stage3_qd_work, step.qd)
+        wp.copy(solver._debug_stage3_joint_qdd, factor.joint_qdd)
+        wp.copy(solver._debug_stage3_v_hat, solver.v_hat)
+
+    add(factor_trees, predict)
+    if "snapshots" in diagnostics:
+        add(snapshots)
+    if not spec.particles:
+        add(wait_for_collision)
+
+    # Stage 4: the rows. The resolved-world claim, the row pass, the diagonals and the writer (the one writer walks the
+    # rows into their placement's sink, or the rows' bias is written apart), then the free bodies' rows' rhs.
+    resolved = sweep.resolved_worlds_owner
+
+    def classify_resolved_worlds(step):
+        resolved.classify(step.state_in, factor, step.contacts, step.dt)
+
+    def write_rows(step):
+        laws.write(solver, step.state_in, factor, step.contacts, step.dt)
+
+    def diagonals(step):
+        placement.diagonals()
+
+    def write_walked(step):
+        laws.write_walked(solver, step.state_in, step.contacts, step.dt)
+
+    def write_rhs(step):
+        laws.write_rhs(solver, step.dt)
+
+    def write_free_body_rhs(step):
+        laws.write_free_body_rhs(solver, step.dt)
+
+    def write_free_body_rhs_timed(step):
+        with solver._sync_timed("s4_mf_setup"):
+            laws.write_free_body_rhs(solver, step.dt)
+
+    add(*((classify_resolved_worlds,) if resolved is not None else ()), write_rows, nvtx="S4_ContactBuild")
+    add(diagonals, write_walked if spec.walked else write_rhs, nvtx="S4_HinvJt_Diag_RHS")
+    if forest.has_free_rigid_bodies:
+        add(write_free_body_rhs_timed if "sync_timings" in diagnostics else write_free_body_rhs, nvtx="S4_MF_Setup")
+
+    # Stages 5 and 6: the impulses' start (warm start, the patches' seeds, the closures' seeds), the claims that
+    # follow the published rows, and the sweep.
+    def prepare_impulses(step):
+        placement.prepare_impulses()
+
+    def warm_start(step):
+        sweep.warm_start(step.contacts, step.dt)
+
+    def seed_patches(step):
+        sweep.seed_patches(step.state_in, step.contacts, step.dt)
+
+    def seed_blocks(step):
+        # The closure's seed: the one writer closed the bilateral blocks and corrected the other rows; the blocks'
+        # kept rows start at -r_Q, after the warm start's gather.
+        factor.seed_blocks(first=placement.dense_first, rhs=placement.rhs, impulses=placement.impulses)
+
+    def start_velocity(step):
+        # The sweeps add their velocity change to the predictor; a world without rows keeps it.
+        wp.copy(solver.v_out, solver.v_hat)
+
+    def pack_free_body_meta(step):
+        placement.pack_free_body_meta()
+
+    colored = sweep.colored_units
+    weighted = int(route.laws.weighted)
+
+    def build_colored_units(step):
+        # The colored worlds' units and colors follow the rows the pack just published.
+        colored.build(
+            placement.mf_constraint_count,
+            placement.dense_first,
+            placement.mf_contact_rows_end,
+            placement.mf_meta_packed,
+            placement.mf_Z,
+            placement.row_mu,
+            placement.row_w,
+            placement.body_base,
+            weighted,
+        )
+
+    def solve(step):
+        sweep.solve(solver.v_hat, solver.v_out)
+
+    add(prepare_impulses, *((warm_start,) if route.laws.warm_start else ()), nvtx="S5_PGS_Prep")
+    if route.laws.patch:
+        add(seed_patches)
+    add(
+        *((seed_blocks,) if route.laws.preelimination else ()),
+        start_velocity,
+        *((pack_free_body_meta,) if forest.has_free_rigid_bodies else ()),
+        *((build_colored_units,) if colored is not None else ()),
+        nvtx="S5_GatherJY",
+    )
+    add(solve, nvtx="S6_PGS_Solve")
+    if "audit" in diagnostics:
+        audit = solver._audit
+
+        def audit_step(step):
+            audit.launch()
+
+        add(audit_step)
+
+    # Stage 7: the finish (qdd, integration, publication), the carry the next step reads, the leave.
+    def finish(step):
+        factor.finish(step.state_in, step.state_out, step.dt, step.index)
+
+    def carry(step):
+        sweep.carry(step.state_in, step.state_out, step.contacts, step.dt)
+
+    def watermarks(step):
+        placement.record_watermarks(step.contacts)
+
+    add(finish)
+    if spec.particles:
+        add(integrate_particles)
+    add(carry)
+    if "row_watermark" in diagnostics:
+        add(watermarks)
+    add(leave)
+    return tuple(stages)
