@@ -728,7 +728,7 @@ class WalkedRows:
         return ["const int art_a = ink_meta.data[world * 4];", "const int art_b = ink_meta.data[world * 4 + 2];"]
 
     def _walk(self) -> str:
-        """``TIER_WALK``: one seed of row ``i`` on the world's tree ``side`` (:func:`.tree_factor.walk_into`'s walk), its
+        """``TIER_WALK``: one seed of row ``i`` on the world's tree ``side`` (``WALK_ROW``, :func:`.tree_factor.walk_row_prelude`), its
         footprints added at the tree's world coordinates and its ``J`` entries against ``s_v`` into ``incident``."""
         from .tree_factor import WALK_COORDINATE, WALK_LINK  # noqa: PLC0415
 
