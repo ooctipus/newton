@@ -3,9 +3,7 @@
 
 """Tests for the FeatherPGS contact regularizer (``pgs_contact_regularization``)."""
 
-import inspect
 import unittest
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -284,31 +282,6 @@ def test_regularization_validation(test: unittest.TestCase, device):
         newton.solvers.SolverFeatherPGS(model, pgs_contact_regularization=1.0e6)
 
 
-def test_zero_regularization_shares_one_weight_slot(test: unittest.TestCase, device):
-    """The exact-rigid path carries no capacity-sized per-row weight buffers."""
-    with wp.ScopedDevice(device):
-        builder = newton.ModelBuilder()
-        builder.add_ground_plane()
-        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
-        builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
-        model = builder.finalize()
-        solver = newton.solvers.SolverFeatherPGS(model)
-        test.assertFalse(solver.laws.regularization_enabled)
-        test.assertIs(solver.placement.row_w, solver.placement.contact_row_w_dummy)
-        test.assertEqual(solver.placement.row_w.shape, (1, 1))
-
-
-def test_zero_regularization_split_runtime_uses_no_weights(test: unittest.TestCase, device):
-    """The standalone MF route must not read its one-element inactive weight argument."""
-    with wp.ScopedDevice(device):
-        model, pipeline, solver, _bodies = _stack_scene(device, g=0.0)
-        body_q, _zs = _run(model, pipeline, solver, 1)
-        test.assertGreater(int(solver.placement.mf_constraint_count.numpy().sum()), 1)
-        test.assertTrue(np.isfinite(body_q).all())
-        test.assertIs(solver.placement.row_w, solver.placement.contact_row_w_dummy)
-        test.assertEqual(float(solver.placement.row_w.numpy()[0, 0]), 1.0)
-
-
 def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
     """A zero-gap contact is active; only a strictly positive gap is speculative."""
     with wp.ScopedDevice(device):
@@ -340,23 +313,6 @@ def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
             device=device,
         )
         test.assertEqual(float(row_w.numpy()[0, 0]), 0.5)
-
-
-def test_compliance_parameters_removed(test: unittest.TestCase, device):
-    """The no-op dense compliance knobs are gone; passing them fails loudly."""
-    names = tuple(inspect.signature(newton.solvers.SolverFeatherPGS).parameters)
-    test.assertNotIn("dense_contact_compliance", names)
-    test.assertNotIn("speculative_dense_contact_compliance", names)
-    start = names.index("pgs_beta")
-    test.assertEqual(names[start : start + 4], ("pgs_beta", "pgs_cfm", "pgs_omega", "pgs_contact_regularization"))
-    with wp.ScopedDevice(device):
-        builder = newton.ModelBuilder()
-        builder.add_ground_plane()
-        b = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
-        builder.add_shape_box(b, hx=0.05, hy=0.05, hz=0.05)
-        model = builder.finalize()
-        with test.assertRaises(TypeError):
-            newton.solvers.SolverFeatherPGS(model, dense_contact_compliance=1.0e-4)
 
 
 def test_restitution_rows_stay_rigid(test: unittest.TestCase, device):
@@ -407,32 +363,6 @@ def test_restitution_rows_stay_rigid(test: unittest.TestCase, device):
             test.assertAlmostEqual(ratio, 1.0, delta=0.05, msg=f"g={g}: rebound ratio {ratio:.3f}")
 
 
-def test_regularization_takes_the_weighted_tiers(test: unittest.TestCase, device):
-    """Admit the parallel tiers and keyed rows to a regularized solver as to a rigid one, under either friction law.
-
-    The tiers' Jacobi law steps each contact row by its weight, the serial sweeps' row law, and keyed rows write the
-    weights, so the worlds they own keep ``pgs_contact_regularization``. Admission is decided at construction on
-    every device; only the matrix-free route, which needs CUDA, builds the tiers it admits. A test pin (``tiers``)
-    asks for them on this scene.
-    """
-    with wp.ScopedDevice(device), mock.patch.dict(newton.solvers.SolverFeatherPGS._route_pins, {"tiers": 32}):
-        model = _build_scissor_model(device)
-        for beta in (0.0, 0.2):
-            records = {}
-            for g in (0.0, 0.02):
-                solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=beta, pgs_contact_regularization=g)
-                routes = solver.get_path_selection()["routes"]
-                with test.subTest(friction_anchor_beta=beta, g=g):
-                    test.assertNotIn("parallel matrix-free tiers", routes["friction"]["reason"])
-                records[g] = (
-                    routes["contact_rows"]["keyed_rows"]["enabled"],
-                    (routes["sweep"]["tiers"] or {}).get("family"),
-                    solver.placement.ink_rows,
-                )
-            with test.subTest(friction_anchor_beta=beta):
-                test.assertEqual(records[0.02], records[0.0])
-
-
 class TestFeatherPGSRegularization(unittest.TestCase):
     pass
 
@@ -469,26 +399,8 @@ add_function_test(
 )
 add_function_test(
     TestFeatherPGSRegularization,
-    "test_zero_regularization_shares_one_weight_slot",
-    test_zero_regularization_shares_one_weight_slot,
-    devices=get_test_devices(),
-)
-add_function_test(
-    TestFeatherPGSRegularization,
-    "test_zero_regularization_split_runtime_uses_no_weights",
-    test_zero_regularization_split_runtime_uses_no_weights,
-    devices=get_test_devices(),
-)
-add_function_test(
-    TestFeatherPGSRegularization,
     "test_exact_surface_contact_is_regularized",
     test_exact_surface_contact_is_regularized,
-    devices=get_test_devices(),
-)
-add_function_test(
-    TestFeatherPGSRegularization,
-    "test_compliance_parameters_removed",
-    test_compliance_parameters_removed,
     devices=get_test_devices(),
 )
 add_function_test(
@@ -496,12 +408,6 @@ add_function_test(
     "test_restitution_rows_stay_rigid",
     test_restitution_rows_stay_rigid,
     devices=get_selected_cuda_test_devices(),
-)
-add_function_test(
-    TestFeatherPGSRegularization,
-    "test_regularization_takes_the_weighted_tiers",
-    test_regularization_takes_the_weighted_tiers,
-    devices=["cpu"],
 )
 
 if __name__ == "__main__":

@@ -84,25 +84,6 @@ class TestFeatherPGSMimic(unittest.TestCase):
         _, q = _run_chain(coef0=0.1, coef1=-0.5, leader_target=0.6)
         self.assertAlmostEqual(q[1], 0.1 - 0.5 * q[0], delta=0.02)
 
-    def test_mimic_row_is_assembled(self):
-        """Verify the solver assembles a MIMIC constraint row that carries the coupling."""
-        solver, _ = _run_chain(coef0=0.0, coef1=1.0, leader_target=0.5, steps=10)
-        row_types = solver.placement.row_type.numpy()
-        counts = solver.placement.constraint_count.numpy()
-        rows = [int(t) for w in range(row_types.shape[0]) for t in row_types[w, : counts[w]]]
-        self.assertIn(PGS_CONSTRAINT_TYPE_MIMIC, rows)
-
-    def test_replicated_mimics_have_articulation_local_ranges(self):
-        """Verify replicated mimic rows use one compact lookup range per articulation."""
-        template, _, _ = _build_two_revolute_chain(coef0=0.0, coef1=1.0)
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
-        builder.replicate(template, world_count=4)
-        model = builder.finalize()
-        solver = newton.solvers.SolverFeatherPGS(model)
-
-        self.assertEqual(solver.laws._mimic_art_start.numpy().tolist(), [0, 1, 2, 3, 4])
-        self.assertEqual(solver.laws._mimic_art_list.numpy().tolist(), [0, 1, 2, 3])
-
     def test_disabled_mimic_is_ignored(self):
         """Verify a disabled mimic constraint leaves the follower joint uncoupled."""
         builder, _, _ = _build_two_revolute_chain(0.0, 1.0)

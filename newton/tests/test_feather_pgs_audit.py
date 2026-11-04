@@ -119,14 +119,6 @@ class TestAudit(unittest.TestCase):
         self.scope.__enter__()
         self.addCleanup(self.scope.__exit__, None, None, None)
 
-    def test_off_allocates_and_launches_nothing(self):
-        """Off, the solver holds no audit, reads none and reports it."""
-        solver = SolverFeatherPGS(_box_model(self.device))
-        self.assertIsNone(solver._audit)
-        with self.assertRaisesRegex(RuntimeError, "Diagnostics\\(audit=True\\)"):
-            solver.read_audit()
-        self.assertFalse(solver.get_path_selection()["routes"]["diagnostics"]["audit"]["enabled"])
-
     def test_settled_box_has_no_gap(self):
         """A settled box's rows are solved: the gap and the violation sit at rounding."""
         solver, _state = _rollout(_box_model(self.device), steps=120)

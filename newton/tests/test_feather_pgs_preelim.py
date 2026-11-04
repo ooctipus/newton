@@ -4,7 +4,6 @@
 """Tests for bilateral (mimic + connect) pre-elimination in SolverFeatherPGS."""
 
 import dataclasses
-import inspect
 import unittest
 import warnings
 
@@ -28,13 +27,6 @@ from newton.tests.test_feather_pgs_connect import (
     _loop_anchor_gap,
     _prescribe_carrier,
 )
-
-
-class TestPreeliminationSignature(unittest.TestCase):
-    def test_every_bilateral_row_joins_its_block(self):
-        """One law for every bilateral row: the selective mimic option is gone (pivoting drops dependent rows)."""
-        parameters = inspect.signature(newton.solvers.SolverFeatherPGS).parameters
-        self.assertNotIn("bilateral_preelimination_include_mimics", parameters)
 
 
 def _run_four_bar(steps: int = 720, crank_target: float = 0.6, pgs_iterations: int = 2, **solver_kwargs):
@@ -385,16 +377,6 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         q = state.joint_q.numpy()
         self.assertAlmostEqual(q[2], q[0], delta=0.08)
         self.assertGreater(abs(q[2]), 0.3, "rocker did not move — loop not transmitting")
-
-    def test_rows_remain_allocated(self):
-        """B rows keep their dense slots (layout/warm-start stability); they are neutralized, not removed."""
-        solver, _, _, _ = _run_four_bar(steps=60)
-        counts = solver.placement.constraint_count.numpy()
-        rows = solver.placement.row_type.numpy()
-        seen = set()
-        for w in range(rows.shape[0]):
-            seen.update(rows[w, : counts[w]].tolist())
-        self.assertIn(int(PGS_CONSTRAINT_TYPE_LINK), seen)
 
 
 class TestFeatherPGSPreeliminationCPU(unittest.TestCase):

@@ -337,8 +337,8 @@ class TestFeatherPGSTeardown(unittest.TestCase):
 # reset
 #
 # ``reset(state, world_mask)`` restarts the masked worlds: each steps from ``state`` as a solver built fresh would, with
-# no impulse, friction anchor or cached kinematics carried from before; every other world steps as if no reset
-# happened. A model change restarts every world's impulse history (the patch law's anchors are geometry and stay) and
+# no impulse, friction anchor, cached kinematics or held mass factor carried from before; every other world steps as if
+# no reset happened. A model change restarts every world's impulse history (the patch law's anchors are geometry and stay) and
 # keeps the capacity status.
 # ---------------------------------------------------------------------------------------------------------------------
 
@@ -349,6 +349,30 @@ def _resting_boxes(device, worlds=2):
     box = template.add_body(xform=wp.transform((0.0, 0.0, 0.0995), wp.quat_identity()))
     template.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
     template.add_ground_plane()
+    builder = newton.ModelBuilder()
+    builder.replicate(template, worlds)
+    return builder.finalize(device=device)
+
+
+def _swinging_arms(device, worlds=2):
+    """Two-link arms swinging under gravity from a bent pose: their mass matrix changes with every step."""
+    template = newton.ModelBuilder()
+    parent, joints = -1, []
+    for _ in range(2):
+        link = template.add_link()
+        template.add_shape_box(link, hx=0.2, hy=0.03, hz=0.03)
+        joints.append(
+            template.add_joint_revolute(
+                parent,
+                link,
+                axis=newton.Axis.Y,
+                parent_xform=wp.transform((0.4 if parent >= 0 else 0.0, 0.0, 0.0), wp.quat_identity()),
+                child_xform=wp.transform((-0.2, 0.0, 0.0), wp.quat_identity()),
+            )
+        )
+        parent = link
+    template.add_articulation(joints)
+    template.joint_q[:] = [0.8, -1.1]
     builder = newton.ModelBuilder()
     builder.replicate(template, worlds)
     return builder.finalize(device=device)
@@ -393,35 +417,43 @@ def _spun(model, state, world: int):
 
 def test_reset_restarts_only_the_masked_worlds(test, device):
     """Step a reset world as a fresh solver does and the other world as a solver that never reset (bitwise on the
-    CPU; on CUDA within the bound between solver instances)."""
-    model = _resting_boxes(device)
-    start = model.state()
-    newton.eval_fk(model, start.joint_q, start.joint_qd, start)
-    run, twin = _Run(model, start), _Run(model, start)
-    for _ in range(8):
-        run.step()
-        twin.step()
-    test.assertGreater(int(run.contacts.rigid_contact_count.numpy()[0]), 0)
-    restart = _spun(model, run.state, world=0)
-    run.state.assign(restart)
-    twin.state.assign(restart)
-    run.solver.reset(run.state, wp.array((True, False), dtype=wp.bool, device=model.device))
-    fresh = _Run(model, restart)
-    for step in range(3):
-        stepped, continued, restarted = run.step(), twin.step(), fresh.step()
-        if step == 0:
-            # The history the reset drops changes the step: the twin's world 0, which kept it, steps otherwise.
-            test.assertFalse(
-                np.array_equal(_world(continued, model, 0)["joint_qd"], _world(restarted, model, 0)["joint_qd"])
-            )
-        for world, expected in ((0, restarted), (1, continued)):
-            actual, reference = _world(stepped, model, world), _world(expected, model, world)
-            for name in STATE_FIELDS:
-                message = f"step {step} world {world} {name}"
-                if wp.get_device(device).is_cuda:
-                    np.testing.assert_allclose(actual[name], reference[name], rtol=0.0, atol=CUDA_INSTANCE_ATOL)
-                else:
-                    np.testing.assert_array_equal(actual[name], reference[name], err_msg=message)
+    CPU; on CUDA within the bound between solver instances): resting boxes drop their carried impulses, and swinging
+    arms whose mass factor is held for 100 steps refresh it in the reset world only."""
+    for scene, options in ((_resting_boxes, {}), (_swinging_arms, {"update_mass_matrix_interval": 100})):
+        with test.subTest(scene=scene.__name__):
+            model = scene(device)
+            start = model.state()
+            newton.eval_fk(model, start.joint_q, start.joint_qd, start)
+            run, twin = _Run(model, start, **options), _Run(model, start, **options)
+            for _ in range(8):
+                run.step()
+                twin.step()
+            restart = model.state()
+            restart.assign(run.state)
+            if scene is _resting_boxes:
+                test.assertGreater(int(run.contacts.rigid_contact_count.numpy()[0]), 0)
+                restart = _spun(model, run.state, world=0)
+            run.state.assign(restart)
+            twin.state.assign(restart)
+            run.solver.reset(run.state, wp.array((True, False), dtype=wp.bool, device=model.device))
+            fresh = _Run(model, restart, **options)
+            for step in range(3):
+                stepped, continued, restarted = run.step(), twin.step(), fresh.step()
+                if step == 0:
+                    # The history the reset drops changes the step: the twin's world 0, which kept it, steps otherwise.
+                    test.assertFalse(
+                        np.array_equal(_world(continued, model, 0)["joint_qd"], _world(restarted, model, 0)["joint_qd"])
+                    )
+                for world, expected in ((0, restarted), (1, continued)):
+                    actual, reference = _world(stepped, model, world), _world(expected, model, world)
+                    for name in STATE_FIELDS:
+                        message = f"step {step} world {world} {name}"
+                        if wp.get_device(device).is_cuda:
+                            np.testing.assert_allclose(
+                                actual[name], reference[name], rtol=0.0, atol=CUDA_INSTANCE_ATOL, err_msg=message
+                            )
+                        else:
+                            np.testing.assert_array_equal(actual[name], reference[name], err_msg=message)
 
 
 def test_reset_is_capturable(test, device):
@@ -436,7 +468,9 @@ def test_reset_is_capturable(test, device):
     for run in (eager, captured):
         for _ in range(4):
             run.step()
+    # The replay reads the mask it was captured with when it runs: here it restarts the other world.
     eager.solver.reset(eager.state, mask)
+    eager.solver.reset(eager.state, wp.array((False, True), dtype=wp.bool, device=model.device))
     expected = eager.step()
     captured.solver.reset(captured.state, mask)
     wp.synchronize_device(model.device)
@@ -444,6 +478,7 @@ def test_reset_is_capturable(test, device):
         captured.solver.reset(captured.state, mask)
         captured.pipeline.collide(captured.state, captured.contacts)
         captured.solver.step(captured.state, captured.out, model.control(), captured.contacts, DT)
+    mask.assign(np.array((False, True)))
     wp.capture_launch(capture.graph)
     for name in STATE_FIELDS:
         np.testing.assert_allclose(

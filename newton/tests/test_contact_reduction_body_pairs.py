@@ -1885,6 +1885,47 @@ class TestBodyPairReductionSafety(unittest.TestCase):
             "marker must clear when an ordinary pipeline refills",
         )
 
+    def test_unmatched_pipeline_clears_stale_contact_identity(self):
+        """Cold-start a matched buffer when its current producer disables matching."""
+        builder = newton.ModelBuilder()
+        _cylinder_foot(builder, wp.vec3(0.0, 0.0, 0.015))
+        builder.add_ground_plane()
+        model = builder.finalize(device="cpu")
+        config = newton.CollisionPipeline.ContactReductionConfig(body_pairs=True)
+        matched = newton.CollisionPipeline(model, contact_matching="latest")
+        unmatched = newton.CollisionPipeline(model, deterministic=True, reduce_contacts=config)
+        state, contacts = model.state(), matched.contacts()
+        matched.collide(state, contacts)
+        matched.collide(state, contacts)
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertTrue(np.any(contacts.rigid_contact_match_index.numpy()[:count] >= 0))
+        unmatched.collide(state, contacts)
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertGreater(count, 0)
+        self.assertTrue(np.all(contacts.rigid_contact_match_index.numpy()[:count] == -1))
+
+    def test_contact_reset_clears_reduction_without_matching(self):
+        """Clear selected patch history even when the matcher is disabled."""
+        template = newton.ModelBuilder()
+        _cylinder_foot(template, wp.vec3(0.0, 0.0, 0.015))
+        builder = newton.ModelBuilder()
+        builder.replicate(template, 2, spacing=(1.0, 0.0, 0.0))
+        builder.add_ground_plane()
+        model = builder.finalize(device="cpu")
+        pipeline = newton.CollisionPipeline(
+            model,
+            reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(
+                body_pairs=True, body_pair_hysteresis=0.001
+            ),
+        )
+        contacts = pipeline.contacts()
+        pipeline.collide(model.state(), contacts)
+        before = pipeline._body_pair_reducer.history_generation.numpy().copy()
+        pipeline.reset_contact_matching(wp.array([True, False, False], dtype=wp.bool, device=model.device))
+        after = pipeline._body_pair_reducer.history_generation.numpy()
+        self.assertGreater(after[0], before[0])
+        self.assertEqual(after[1], before[1])
+
 
 class TestBodyPairReductionRobustness(unittest.TestCase):
     """Remaining contract edges: matching, capacity, graph capture, grad, worlds."""

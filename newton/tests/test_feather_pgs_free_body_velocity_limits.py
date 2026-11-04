@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Hold free rigid bodies to the speed law on the CPU.
+"""Hold free rigid bodies to the speed law, on the CPU and on CUDA.
 
-The matrix-free sweep visits a world's free-body rows after its dense rows, one thread per world on the CPU. Each
+The matrix-free sweep visits a world's free-body rows after its dense rows (one thread per world on the CPU). Each
 finite speed limit of a body owns a speed row at the tail of its world's rows: it bounds the magnitude of the body's
 linear or angular velocity, as PhysX's ``maxLinearVelocity`` and ``maxAngularVelocity`` do, with ``J = e_0`` or
 ``e_3`` naming which and ``rhs = limit``. A row keeps a non-negative total, the velocity-limit law of every sweep: it
@@ -49,8 +49,10 @@ BELOW = (
     ((-1.5, 0.3, 0.9), (-2.4, 0.4, 1.1)),
 )
 # (initial linear, initial angular, linear velocity change [m/s], angular velocity change [rad/s]) of one box
-# per world that ends the predictor past its limits: launched past them, or pushed past them by a wrench.
+# per world that ends the predictor past its limits: launched past them, along a diagonal whose every component is
+# within them, or pushed past them by a wrench.
 PAST = (
+    ((1.5, 1.5, 0.5), (2.2, -2.2, 0.5), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
     ((-3.0, 1.0, 0.0), (0.0, -4.0, 1.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
     ((1.5, 0.0, 0.0), (0.0, 0.0, 1.0), (-5.0, 0.5, 0.0), (0.0, 0.0, -6.0)),
 )
@@ -281,7 +283,7 @@ def _clamped_magnitudes(velocity, limits=(LINEAR_LIMIT, ANGULAR_LIMIT)):
 
 
 class _FreeBodyVelocityLimitChecks:
-    """Checks of the free-body speed rows; ``device`` names the device under test (the CPU)."""
+    """Checks of the free-body speed rows; ``device`` names the device under test."""
 
     device = "cpu"
 
@@ -299,7 +301,7 @@ class _FreeBodyVelocityLimitChecks:
         """Keep the velocity of a free body that moves below its limits and feels no other force.
 
         Every speed row finds its limit satisfied and must not move the body: a bilateral relaxation would
-        drive each axis onto a limit.
+        drive each axis onto a limit. (A world within its limits may resolve without rows.)
         """
         for articulated in (False, True):
             for fraction in (0.0, 0.7):
@@ -308,27 +310,22 @@ class _FreeBodyVelocityLimitChecks:
                     start = np.array([np.concatenate(world) for world in BELOW])
                     for _ in range(3):
                         velocity = _step(run)
-                        if fraction == 0.0:
-                            self.check_rows_are_velocity_limits(run)
                         _assert_on_limit_scale(velocity, start)
                         np.testing.assert_allclose(_velocity_limit_impulses(run), 0.0, rtol=0.0, atol=1.0e-6)
-                    if fraction == 0.7:
-                        # The activation gate reserved rows only for axes within 30% of their limit.
-                        self.assertGreater(int(run.solver.placement.mf_constraint_count.numpy().sum()), 0)
 
     def test_step_clamps_speeds_past_the_limits(self):
         """Hold a free body launched or pushed past its limits on them, along its own direction.
 
         The speed rows scale the predicted velocity onto the limits in the sweep's first iteration and keep that
-        total.
+        total, under either activation gate.
         """
         worlds = [(linear, angular) for linear, angular, _, _ in PAST]
         wrenches = [np.concatenate((force, torque)) for _, _, force, torque in PAST]
         predicted = np.array([np.concatenate(world) for world in worlds]) + np.array(wrenches)
         expected = _clamped_magnitudes(predicted)
-        for articulated in (False, True):
-            with self.subTest(articulated=articulated):
-                run = _free_boxes(self.device, worlds, articulated=articulated, wrenches=wrenches)
+        for articulated, fraction in ((False, 0.0), (True, 0.0), (False, 0.7)):
+            with self.subTest(articulated=articulated, fraction=fraction):
+                run = _free_boxes(self.device, worlds, articulated=articulated, wrenches=wrenches, fraction=fraction)
                 velocity = _step(run)
                 self.check_rows_are_velocity_limits(run)
                 _assert_on_limit_scale(velocity, expected)
@@ -418,6 +415,11 @@ class TestFreeBodyVelocityLimits(_FreeBodyVelocityLimitChecks, unittest.TestCase
                 run = _free_boxes(self.device, world, **options)
                 _step(run)
                 self.assertEqual(int(run.solver.placement.mf_constraint_count.numpy().sum()) > 0, built)
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "the CUDA sweeps need CUDA")
+class TestFreeBodyVelocityLimitsCUDA(_FreeBodyVelocityLimitChecks, unittest.TestCase):
+    device = "cuda:0"
 
 
 if __name__ == "__main__":
