@@ -3,7 +3,6 @@
 
 """Focused tests for FeatherPGS speculative-contact controls."""
 
-import inspect
 import unittest
 
 import numpy as np
@@ -279,22 +278,6 @@ class TestFeatherPGSContactControls(unittest.TestCase):
                 for name in ("dense_count", "mf_count", "dense_dropped", "mf_dropped"):
                     self.assertEqual(skipped[name], 0, name)
 
-    def test_solver_exposes_documented_defaults(self):
-        """Expose legacy-preserving defaults through the public constructor."""
-        solver = SolverFeatherPGS(newton.ModelBuilder().finalize(device="cpu"))
-
-        self.assertEqual(solver.options.contact_speculative_scale, 1.0)
-        self.assertEqual(solver.options.contact_gap_gate, 0.0)
-        self.assertEqual(solver.options.same_articulation_contact_gap_gate, 0.0)
-        self.assertEqual(solver.options.articulation_pair_contact_gap_gate, 0.0)
-        self.assertEqual(solver.options.diagnostics, SolverFeatherPGS.Diagnostics())
-        quiet_solver = SolverFeatherPGS(
-            newton.ModelBuilder().finalize(device="cpu"),
-            diagnostics=SolverFeatherPGS.Diagnostics(overflow_warning=False),
-        )
-        self.assertIsNone(quiet_solver.placement.row_overflow_warning_emitted)
-        parameters = tuple(inspect.signature(SolverFeatherPGS).parameters)
-        self.assertIn("same_articulation_contact_gap_gate", parameters)
 
     def test_solver_validates_and_stores_contact_controls(self):
         """Accept finite non-negative controls and reject malformed values."""

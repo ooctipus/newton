@@ -23,6 +23,7 @@ CONTRACT = (
     "test_feather_pgs_contract_api",
     "test_feather_pgs_contract_bodies",
     "test_feather_pgs_contract_joints",
+    "test_feather_pgs_contract_loops",
     "test_feather_pgs_conformance",
     "test_feather_pgs_conformance_cpu",
     "test_feather_pgs_notify_inertial",

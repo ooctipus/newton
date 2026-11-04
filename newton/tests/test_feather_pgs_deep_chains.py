@@ -40,7 +40,7 @@ from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests.feather_pgs_law_harness import dense_factor32
 from newton.tests.feather_pgs_mass_reference import MassReference
-from newton.tests.test_feather_pgs_connect import _LOOP_FRAMES, _four_bar_bars, _loop_anchor_gap
+from newton.tests.test_feather_pgs_contract_loops import _LOOP_FRAMES, _four_bar_bars, _loop_anchor_gap
 from newton.tests.test_feather_pgs_regimes import LIMIT, known_failure
 from newton.tests.test_feather_pgs_walk import (
     contact_wrenches,

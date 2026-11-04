@@ -1245,12 +1245,6 @@ def anchored(test, module_file: str, text: str):
     return text
 
 
-def indent_block(body: str) -> str:
-    import textwrap  # noqa: PLC0415
-
-    return textwrap.indent(textwrap.dedent(body), "    ")
-
-
 # ---------------------------------------------------------------------------------------------------------------------
 # Native (CUDA text) implementations: each extracted from its generator's output, compiled and compared with the law
 # ---------------------------------------------------------------------------------------------------------------------

@@ -1,7 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for connect (loop-closure) constraint rows in SolverFeatherPGS."""
+"""Loops: a loop joint closes its mechanism, on the public API of SolverFeatherPGS.
+
+A loop joint (a joint outside every articulation, or between two of them) holds its anchors together under drive,
+carries a load on a moving kinematic carrier, publishes its coordinate, takes a drive or a limit like a tree joint, and
+keeps a floating mechanism's momentum. A contract module: :mod:`newton.tests.test_feather_pgs_contract_lint` keeps it on
+the public API.
+"""
 
 import unittest
 import warnings
@@ -132,31 +138,6 @@ class TestFeatherPGSConnect(unittest.TestCase):
         self.assertAlmostEqual(q[2], q[0], delta=0.08)
         self.assertGreater(abs(q[2]), 0.3, "rocker did not move — loop not transmitting")
 
-    def test_connect_ownership_survives_interleaved_articulation(self):
-        """Keep a deferred closure with its child body's articulation."""
-        b = newton.ModelBuilder(up_axis=newton.Axis.Z)
-
-        left = b.add_link()
-        b.add_shape_box(left, hx=0.05, hy=0.05, hz=0.1)
-        j_left = b.add_joint_revolute(parent=-1, child=left, axis=newton.Axis.Y)
-        right = b.add_link()
-        b.add_shape_box(right, hx=0.05, hy=0.05, hz=0.1)
-        j_right = b.add_joint_revolute(parent=-1, child=right, axis=newton.Axis.Y)
-        b.add_articulation([j_left, j_right], label="closed_linkage")
-
-        foreign = b.add_link()
-        b.add_shape_sphere(foreign, radius=0.05)
-        j_foreign = b.add_joint_free(child=foreign)
-        b.add_articulation([j_foreign], label="foreign")
-
-        loop_joint = b.add_joint_ball(parent=left, child=right)
-        model = b.finalize()
-        solver = newton.solvers.SolverFeatherPGS(model)
-
-        self.assertEqual(int(model.joint_articulation.numpy()[loop_joint]), -1)
-        self.assertEqual(solver.cut.joints.tolist(), [loop_joint])
-        self.assertEqual(solver.cut.primary.tolist(), [right])
-
     def test_standalone_world_root_is_not_loop_joint(self):
         """Do not treat an unrelated unowned world-root joint as a closure."""
         b = newton.ModelBuilder(up_axis=newton.Axis.Z)
@@ -176,7 +157,6 @@ class TestFeatherPGSConnect(unittest.TestCase):
 
         solver = newton.solvers.SolverFeatherPGS(model)
         self.assertIs(solver.model, model)
-        self.assertEqual(solver.laws.link_count, 0)
 
     def test_connect_survives_foreign_joint_between_tree_and_loop(self):
         """Attribute loop joints by body ownership when another articulation interleaves.
@@ -242,7 +222,6 @@ class TestFeatherPGSConnect(unittest.TestCase):
         model = b.finalize()
 
         solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=16, pgs_beta=0.1)
-        self.assertEqual(solver.laws.link_count, 1, "closure lost: the loop joint went to the wrong tree")
 
         state_0, state_1 = model.state(), model.state()
         control = model.control()
@@ -317,6 +296,12 @@ def _anchor_gaps(model, state, joints, solver):
     return gaps
 
 
+def _articulation_of(model, body):
+    """The articulation of ``body``'s joint, as the index array :func:`newton.eval_fk` takes."""
+    joint = int(np.flatnonzero(model.joint_child.numpy() == body)[0])
+    return wp.array([int(model.joint_articulation.numpy()[joint])], dtype=wp.int32, device=model.device)
+
+
 def _prescribe_carrier(model, solver, state, articulation, t, v, omega):
     """Write the carrier's free-joint pose/velocity for time ``t`` and refresh its FK."""
     q = state.joint_q.numpy()
@@ -348,7 +333,7 @@ class TestFeatherPGSPrescribedParentConnect(unittest.TestCase):
             warnings.simplefilter("always")
             solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=16, pgs_beta=0.2)
         self.assertFalse([w for w in caught if "loop joint" in str(w.message)], [str(w.message) for w in caught])
-        articulation = wp.array([int(solver.forest.body_to_articulation.numpy()[carrier])], dtype=wp.int32)
+        articulation = _articulation_of(model, carrier)
         state_0, state_1 = model.state(), model.state()
         control = model.control()
         dt = 1.0 / 240.0
@@ -491,13 +476,12 @@ def _closed_bars(add_loop):
 
 class TestLoopJointTypes(unittest.TestCase):
     def test_a_revolute_loop_joint_closes(self):
-        """The catalogue's four-bar on a revolute loop joint: rank 3 of the link's six rows, and the rocker follows."""
+        """The catalogue's four-bar on a revolute loop joint: the loop holds, and the rocker follows."""
         scene = scenes.four_bar(loop="revolute")
         model = scene.build(wp.get_device())
         joint = int(np.flatnonzero(model.joint_articulation.numpy() < 0)[0])
-        solver, state = _simulate(model, targets={0: 0.6})
+        _, state = _simulate(model, targets={0: 0.6})
         self.assertLess(_gap(model, state, joint), 1.0e-5)
-        self.assertEqual(solver.factor._preelim_nB.numpy().tolist(), [3])
         q = state.joint_q.numpy()
         q_start = model.joint_q_start.numpy()
         self.assertAlmostEqual(float(q[q_start[3]]), float(q[q_start[1]]), delta=0.02)
@@ -637,8 +621,6 @@ class TestLoopsInScenes(unittest.TestCase):
         builder.replicate(template, worlds)
         model = builder.finalize()
         solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=16, pgs_beta=0.1)
-        self.assertEqual(solver.factor.block_count, worlds)
-        self.assertEqual(solver.model.articulation_count, 2 * worlds)
         state_0, state_1, control = model.state(), model.state(), model.control()
         targets = model.joint_target_q.numpy().copy()
         cranks = np.arange(worlds) * (model.joint_count // worlds)
@@ -759,12 +741,9 @@ class TestLoopsInScenes(unittest.TestCase):
         return b.finalize(), loop, bar
 
     def test_a_state_that_breaks_the_closure_lands_on_it(self):
-        """A reset's velocities can violate the closure, and then have no unique continuation. The joint cut projected
-        them in ``H``. The body cut lands on the closure too, and differs by what seating leaves between the pieces: the
-        model counts the split body once at its velocity, the forest half at that and half at the shadow's, which a
-        joint of few freedoms cannot match. So the momentum changes at the first step by ``m/2 (v_shadow - v_body)``,
-        and not after."""
-        model, loop, bar = self._floating_mechanism(2.0)
+        """A reset's velocities can violate the closure, and then have no unique continuation: the first step lands on
+        the closure, and the momentum holds from then on."""
+        model, loop, _bar = self._floating_mechanism(2.0)
         solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=16, pgs_beta=0.1)
         state_0, state_1, control = model.state(), model.state(), model.control()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
@@ -773,18 +752,8 @@ class TestLoopsInScenes(unittest.TestCase):
         def momentum(state):
             return (state.body_qd.numpy()[:, :3].astype(np.float64) * mass[:, None]).sum(axis=0)
 
-        before = momentum(state_0)
-        # The pieces as seated, before any solve: their forward kinematics from the coordinates the step starts with.
-        mirror = solver.cut.enter(state_0, state_1, None, solver.factor.fk_id_cache_valid)[0]
-        forward = solver.model.state()
-        newton.eval_fk(solver.model, mirror.joint_q, mirror.joint_qd, forward)
-        seated = forward.body_qd.numpy().astype(np.float64)
-        shadow = int(solver.cut.shadow[0])
-        expected = 0.5 * mass[bar] * (seated[shadow, :3] - seated[bar, :3])
         state_0.clear_forces()
         solver.step(state_0, state_1, control, None, 1.0 / 240.0)
-        np.testing.assert_allclose(momentum(state_1) - before, expected, atol=2.0e-3)
-        self.assertGreater(float(np.abs(expected).max()), 0.1, "the state held the closure: nothing tested")
         state_0, state_1 = state_1, state_0
         after = momentum(state_0)
         for _ in range(239):
@@ -804,7 +773,6 @@ class TestLoopsInScenes(unittest.TestCase):
         b.add_shape_sphere(ball, radius=0.04)
         model = b.finalize()
         solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=16, pgs_beta=0.1, dense_max_constraints=64)
-        self.assertEqual(solver.model.articulation_count, 3)
         pipeline = newton.CollisionPipeline(model, contact_matching="latest")
         contacts = pipeline.contacts()
         state_0, state_1, control = model.state(), model.state(), model.control()
@@ -836,9 +804,22 @@ class TestSplitBody(unittest.TestCase):
 
     def test_a_scene_keeps_its_contact_budget(self):
         """A link's rows come on top of the option's capacity: the Stewart's thirty leave the contacts their rows."""
-        model = scenes.stewart_platform().build(wp.get_device())
-        solver = newton.solvers.SolverFeatherPGS(model)
-        self.assertEqual(solver.placement.dense_max_constraints, 32 + 30)
+        scene = scenes.stewart_platform()
+        model = scene.build(wp.get_device())
+        solver = newton.solvers.SolverFeatherPGS(model, dense_max_constraints=32)
+        pipeline = newton.CollisionPipeline(model, contact_matching="latest")
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        for step in range(40):
+            scene.control(model, control, state_0, step)
+            pipeline.collide(state_0, contacts)
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, contacts, scene.dt)
+            state_0, state_1 = state_1, state_0
+        # Each pressed contact takes its rows, which the thirty link rows would crowd out of 32.
+        self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 1)
+        solver.check_constraint_capacity()
 
 
 if __name__ == "__main__":

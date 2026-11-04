@@ -17,10 +17,11 @@ from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_MIMIC,
 )
 from newton.tests import feather_pgs_scenes as scenes
-from newton.tests.test_feather_pgs_connect import (
+from newton.tests.test_feather_pgs_contract_loops import (
     _LOOP_FRAMES,
     _REL_P,
     _anchor_gaps,
+    _articulation_of,
     _build_carried_load,
     _build_four_bar,
     _four_bar_bars,
@@ -143,7 +144,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             model, pgs_iterations=16, pgs_beta=0.2, enable_bilateral_preelimination=True
         )
         self.assertTrue(solver.factor.eliminates)
-        articulation = wp.array([int(solver.forest.body_to_articulation.numpy()[carrier])], dtype=wp.int32)
+        articulation = _articulation_of(model, carrier)
         state_0, state_1 = model.state(), model.state()
         control = model.control()
         dt = 1.0 / 240.0
