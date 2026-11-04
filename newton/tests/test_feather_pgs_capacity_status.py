@@ -118,7 +118,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
             self.skipTest("CUDA graph replay requires CUDA")
         device = devices[0]
         model = newton.ModelBuilder().finalize(device=device)
-        solver = SolverFeatherPGS(model, row_watermark=False)
+        solver = SolverFeatherPGS(model)
         arrays = _allocator_arrays(2, count=1, device=device)
         arrays["capacity_status"] = solver.placement.constraint_capacity_status
         arrays["contact_count"].assign(np.array([0], dtype=np.int32))
@@ -139,7 +139,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         Such a solver allocates no row buffers and no patch friction state, even
         under the default patch friction, so no patch frame can be left empty.
         """
-        solver = SolverFeatherPGS(newton.ModelBuilder().finalize(device="cpu"), row_watermark=False)
+        solver = SolverFeatherPGS(newton.ModelBuilder().finalize(device="cpu"))
         clear = dict.fromkeys(("dense", "matrix_free", "patch_frames", "contact_launches", "slip_frames"), False)
         self.assertEqual(solver.constraint_capacity_status(), clear)
         self.assertEqual(solver.constraint_capacity_status(clear=True), clear)
@@ -308,7 +308,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         joint = builder.add_joint_prismatic(parent=-1, child=body, axis=newton.Axis.Z)
         builder.add_articulation([joint])
         model = builder.finalize(device="cpu")
-        solver = SolverFeatherPGS(model, dense_max_constraints=192, row_watermark=False)
+        solver = SolverFeatherPGS(model, dense_max_constraints=192)
         self.assertFalse(any(solver.constraint_capacity_status().values()))
         solver.placement.constraint_capacity_status.assign(np.array([1, 0], dtype=np.int32))
         solver.placement.constraint_overflow.fill_(True)

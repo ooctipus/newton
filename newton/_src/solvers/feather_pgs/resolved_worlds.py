@@ -688,7 +688,7 @@ def decline(solver) -> str | None:
                 and solver.factor.block_count == 0
                 and all(getattr(solver.laws, name, object()) == value for name, value in laws_exact.items())
                 and solver.options.enable_bilateral_preelimination is False
-                and solver.placement.row_watermark is False
+                and not solver.options.diagnostics.row_watermark
                 and (solver.forest.max_world_dofs or 33) <= 32
                 and all(getattr(solver.forest, name) is not None for name in required)
                 and solver.laws.joint_limit_q_index is not None,

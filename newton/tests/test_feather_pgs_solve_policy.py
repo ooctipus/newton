@@ -266,11 +266,12 @@ class TestSolvePolicy(unittest.TestCase):
         self.assertIsNot(first, sparse_kernel(16, 6, 4))
 
     def test_policy_and_readout_options_are_keyword_only(self):
-        """Take the policy and the solver's readout option by keyword only; the exit law takes no option."""
+        """Take the policy and the solver's diagnostics (the readout's option) by keyword only; the exit law takes no
+        option."""
         parameters = inspect.signature(SolverFeatherPGS).parameters
         self.assertEqual(
-            (parameters["pgs_solve_readout"].kind, parameters["pgs_solve_readout"].default),
-            (inspect.Parameter.KEYWORD_ONLY, "off"),
+            (parameters["diagnostics"].kind, parameters["diagnostics"].default),
+            (inspect.Parameter.KEYWORD_ONLY, None),
         )
         for option in ("pgs_change_tolerance", "pgs_relative_change_tolerance", "pgs_velocity_change_tolerance"):
             self.assertNotIn(option, parameters)
@@ -708,8 +709,8 @@ class TestSolverReadoutOption(unittest.TestCase):
 
     def test_invalid_readout_raises(self):
         """Reject an unknown readout at construction, and the retired tolerance options."""
-        with self.assertRaisesRegex(ValueError, "pgs_solve_readout"):
-            SolverFeatherPGS(self._model(), pgs_solve_readout="every_sweep")
+        with self.assertRaisesRegex(ValueError, "solve_readout"):
+            SolverFeatherPGS(self._model(), diagnostics=SolverFeatherPGS.Diagnostics(solve_readout="every_sweep"))
         for option in ("pgs_change_tolerance", "pgs_relative_change_tolerance", "pgs_velocity_change_tolerance"):
             with self.subTest(option=option), self.assertRaises(TypeError):
                 SolverFeatherPGS(self._model(), **{option: 1.0e-3})
@@ -728,11 +729,14 @@ class TestSolverReadoutOption(unittest.TestCase):
         model = self._model()
         for requested in ("off", "sweeps", "trace"):
             with self.subTest(requested=requested):
-                solver = SolverFeatherPGS(model, pgs_solve_readout=requested, enable_joint_limits=True)
+                diagnostics = SolverFeatherPGS.Diagnostics(solve_readout=requested)
+                solver = SolverFeatherPGS(model, diagnostics=diagnostics, enable_joint_limits=True)
                 selection = solver.get_path_selection()
                 json.dumps(selection, allow_nan=False)
-                option = selection["options"]["pgs_solve_readout"]
-                self.assertEqual((option["requested"], option["applied"]), (requested, requested))
+                option = selection["options"]["diagnostics"]
+                self.assertEqual(
+                    (option["requested"]["solve_readout"], option["applied"]["solve_readout"]), (requested, requested)
+                )
                 readout = selection["routes"]["sweep"]["readout"]
                 self.assertEqual(readout["mode"], requested)
                 self.assertEqual(list(readout["counted"].values()), [] if requested == "off" else ["mf_gs"])
@@ -774,7 +778,7 @@ def _policy_solver(*, readout="sweeps", skipped=True, **attributes):
             readout=SimpleNamespace(kernels={"mf_gs_kernel": "mf_gs"}, counts_skipped=skipped),
         ),
         **attributes,
-        options=SimpleNamespace(pgs_solve_readout=readout),
+        options=SimpleNamespace(diagnostics=SolverFeatherPGS.Diagnostics(solve_readout=readout)),
     )
 
 

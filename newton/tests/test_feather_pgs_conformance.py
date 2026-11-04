@@ -230,7 +230,7 @@ class Run:
     contacts: list  # per step: dict of contact arrays (pre-step geometry, exported forces)
     capacity: dict
     measurements: dict | None = None  # get_path_selection()["measurements"] after the last step, with a readout
-    audit: dict | None = None  # read_audit() after the last step, under pgs_audit
+    audit: dict | None = None  # read_audit() after the last step, under Diagnostics.audit
 
 
 CONTACT_FIELDS = (
@@ -379,9 +379,10 @@ def simulate(
             )
         capacity = solver.constraint_capacity_status()
         measurements = None
-        if merged.get("pgs_solve_readout", "off") != "off":
+        diagnostics = merged.get("diagnostics") or SolverFeatherPGS.Diagnostics()
+        if diagnostics.solve_readout != "off":
             measurements = solver.get_path_selection()["measurements"]
-        audit = solver.read_audit() if merged.get("pgs_audit") else None
+        audit = solver.read_audit() if diagnostics.audit else None
     history = recorder.read(steps)
     counts = history["contact_count"].reshape(steps)
     contact_log = []
@@ -2029,7 +2030,9 @@ def _add_ownership_tests() -> None:
         physics = _physics(factory(), law, iterations)
 
         def test(self, physics=physics, route=route, owners=owners, absent=absent):
-            counted = route.but(f"{route.name}_readout", options={"pgs_solve_readout": "sweeps"})
+            counted = route.but(
+                f"{route.name}_readout", options={"diagnostics": SolverFeatherPGS.Diagnostics(solve_readout="sweeps")}
+            )
             run = run_physics(physics, counted, self.device)
             failures = _failures(_record_checks(route, run.routes))
             self.assertFalse(failures, _message(failures))

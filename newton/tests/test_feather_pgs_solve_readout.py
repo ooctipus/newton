@@ -3,7 +3,7 @@
 
 """Count the Gauss-Seidel sweeps every solve executes without changing a computed bit.
 
-Under ``pgs_solve_readout="sweeps"`` each sweep kernel records, per world, the
+Under ``Diagnostics(solve_readout="sweeps")`` each sweep kernel records, per world, the
 sweeps a solve executed and whether it stopped before its budget. A sweep
 stops a world after a sweep whose changes all lie within the exit law's
 rounding floor, so a world that stops after ``s`` sweeps has the same impulses
@@ -642,7 +642,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         summary and the model.
         """
         model = route["model"]
-        variants = [{"pgs_solve_readout": "off"}, {"pgs_solve_readout": "off"}, {"pgs_solve_readout": readout}]
+        variants = [{}, {}, {"diagnostics": SolverFeatherPGS.Diagnostics(solve_readout=readout)}]
         solvers = self._solvers(route, variants)
         counted = solvers[-1]
         self.assertTrue(set(counted.sweep.readout.kernels.values()) & route["labels"], counted.sweep.readout.kernels)
@@ -658,7 +658,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
                     spread = float(np.abs(control_run - reference).max())
                     np.testing.assert_allclose(actual, reference, rtol=0.0, atol=10.0 * spread, err_msg=name)
         record = counted.get_path_selection()
-        self.assertEqual(record["options"]["pgs_solve_readout"]["applied"], readout)
+        self.assertEqual(record["options"]["diagnostics"]["applied"]["solve_readout"], readout)
         counts = record["routes"]["sweep"]["readout"]
         self.assertEqual(counts["mode"], readout)
         self.assertEqual(counts["counted"], counted.sweep.readout.kernels)
@@ -754,7 +754,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         rows with positive totals; the readout changes no result and counts every world-solve once.
         """
         route = _velocity_limit_route()
-        (probe,) = self._solvers(route, [{"pgs_solve_readout": "sweeps"}])
+        (probe,) = self._solvers(route, [{"diagnostics": SolverFeatherPGS.Diagnostics(solve_readout="sweeps")}])
         self.assertTrue(probe.sweep.readout.kernels)
         for _ in self._steps(route, [probe], 1):
             counts = probe.placement.constraint_count.numpy()
@@ -791,7 +791,14 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             (solver,) = self._solvers(
-                route, [{"pgs_solve_readout": "trace", "contact_torsion": True, "dense_max_constraints": 256}]
+                route,
+                [
+                    {
+                        "diagnostics": SolverFeatherPGS.Diagnostics(solve_readout="trace"),
+                        "contact_torsion": True,
+                        "dense_max_constraints": 256,
+                    }
+                ],
             )
         key = solver.sweep.mf_gs_kernel.key
         self.assertIn("_torsion", key)

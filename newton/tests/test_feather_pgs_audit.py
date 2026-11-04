@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The audit (``pgs_audit``): the energy gap, the dual violation and the injected work against what they claim."""
+"""The audit (``Diagnostics.audit``): the energy gap, the dual violation and the injected work against what they claim."""
 
 from __future__ import annotations
 
@@ -61,7 +61,11 @@ def _hinge_model(device, *, limit=0.2):
 
 def _rollout(model, *, steps, dt=H, before=None, **options):
     """Step a model with the audit on; ``before(step, state)`` writes a step's initial state or forces."""
-    settings = {"pgs_iterations": 64, "enable_joint_limits": True, "pgs_audit": True}
+    settings = {
+        "pgs_iterations": 64,
+        "enable_joint_limits": True,
+        "diagnostics": SolverFeatherPGS.Diagnostics(audit=True),
+    }
     settings.update(options)
     solver = SolverFeatherPGS(model, **settings)
     state, out = model.state(), model.state()
@@ -119,7 +123,7 @@ class TestAudit(unittest.TestCase):
         """Off, the solver holds no audit, reads none and reports it."""
         solver = SolverFeatherPGS(_box_model(self.device))
         self.assertIsNone(solver._audit)
-        with self.assertRaisesRegex(RuntimeError, "pgs_audit=True"):
+        with self.assertRaisesRegex(RuntimeError, "Diagnostics\\(audit=True\\)"):
             solver.read_audit()
         self.assertFalse(solver.get_path_selection()["routes"]["diagnostics"]["audit"]["enabled"])
 
@@ -253,7 +257,7 @@ class TestAudit(unittest.TestCase):
                 pgs_beta=0.1,
                 dense_max_constraints=128,
                 enable_bilateral_preelimination=True,
-                pgs_audit=True,
+                diagnostics=SolverFeatherPGS.Diagnostics(audit=True),
             )
             pipeline = newton.CollisionPipeline(model, contact_matching=scene.contact_matching or "latest")
             contacts = pipeline.contacts()
@@ -311,7 +315,11 @@ class TestAuditCUDA(TestAudit):
 
     def _route(self, scene, route, sweeps):
         run = conformance.simulate(
-            scene, route, self.device, options={"pgs_iterations": sweeps, "pgs_audit": True}, steps=60
+            scene,
+            route,
+            self.device,
+            options={"pgs_iterations": sweeps, "diagnostics": SolverFeatherPGS.Diagnostics(audit=True)},
+            steps=60,
         )
         return run.audit, run.routes["diagnostics"]["audit"]
 

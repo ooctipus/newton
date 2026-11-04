@@ -960,7 +960,14 @@ class TestQ16Limits(unittest.TestCase):
         ]
         builder.add_articulation(joints)
         model = builder.finalize(device=DEVICE)
-        solver, state = _roll(model, 480, contacts=False, enable_joint_limits=True, pgs_iterations=128, pgs_audit=True)
+        solver, state = _roll(
+            model,
+            480,
+            contacts=False,
+            enable_joint_limits=True,
+            pgs_iterations=128,
+            diagnostics=SolverFeatherPGS.Diagnostics(audit=True),
+        )
         audit = solver.read_audit()
         self.assertLess(abs(float(audit["gap"][0])), 1.0e-5)
         self.assertLess(float(audit["violation"][0]), 1.0e-3)
@@ -973,7 +980,12 @@ class TestQ16Limits(unittest.TestCase):
         model = scene.build(DEVICE)
         peak = 0.0
         control = model.control()
-        options = {**BASE, **scene.solver_options, "enable_joint_velocity_limits": True, "pgs_audit": True}
+        options = {
+            **BASE,
+            **scene.solver_options,
+            "enable_joint_velocity_limits": True,
+            "diagnostics": SolverFeatherPGS.Diagnostics(audit=True),
+        }
         solver = SolverFeatherPGS(model, **options)
         state, out = model.state(), model.state()
         for step in range(scene.steps):
@@ -1490,7 +1502,7 @@ class ManufacturedScene:
                 "friction_anchor_beta": 0.2 if law == "patch" else 0.0,
                 "contact_torsion": spin,
                 "pgs_iterations": sweeps,
-                "pgs_audit": True,
+                "diagnostics": SolverFeatherPGS.Diagnostics(audit=True),
             }
         )
         self.options = options

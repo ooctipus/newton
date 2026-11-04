@@ -21,7 +21,7 @@ import warp as wp
 
 from . import field_group, host_index
 from .device_proof import DeviceProof
-from .tree_kinetic_owner import TreeKineticState, launch_switches, proof_runs, stage_clocks_on
+from .tree_kinetic_owner import TreeKineticState, launch_switches, proof_runs
 from .tree_kinetic_plan import make_plan, tree_joints
 from .tree_kinetic_state import GroupTrees, HeldResponse
 from .tree_plan import TreePlan, local_parents
@@ -486,7 +486,7 @@ class HeldTree:
     def __init__(self, solver, *, admission=None):
         self.solver = solver
         # One read of the kernel and launch switches for every group this owner composes.
-        self.clocked = stage_clocks_on()
+        self.clocked = solver.options.diagnostics.stage_clocks
         skip, classify = launch_switches(solver._route_pins)
         self.scalar = None
         if not (solver.model.joint_count and solver.model.articulation_count):

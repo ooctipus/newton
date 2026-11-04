@@ -96,7 +96,7 @@ def parse_args(argv=None):
         / "results",
     )
     p.add_argument("--no-save-samples", action="store_true", help="skip the .npz (compare cannot re-clip this arm)")
-    p.add_argument("--audit", action="store_true", help="pgs_audit: record each world's energy gap and dual violation")
+    p.add_argument("--audit", action="store_true", help="the audit: record each world's energy gap and dual violation")
     p.add_argument("--allow-busy-gpu", action="store_true")
     p.add_argument("--allow-env-flags", action="store_true")
     p.add_argument("--allow-live-tree", action="store_true", help="GPU: allow a --newton tree without SNAPSHOT_SHA")
@@ -639,7 +639,9 @@ def main(argv=None):
     # The row-type codes live in whichever solver module defines them; their owner moves as the solver is restructured.
     kernels = next(
         module
-        for module in (importlib.import_module(f"{fpgs.__name__}.{m.name}") for m in pkgutil.iter_modules(fpgs.__path__))
+        for module in (
+            importlib.import_module(f"{fpgs.__name__}.{m.name}") for m in pkgutil.iter_modules(fpgs.__path__)
+        )
         if hasattr(module, "PGS_CONSTRAINT_TYPE_CONTACT")
     )
 

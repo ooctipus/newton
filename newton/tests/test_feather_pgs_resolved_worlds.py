@@ -524,7 +524,7 @@ def _admissible_solver():
     """A stand-in solver whose policy the classifier admits; device checks see CUDA."""
     return SimpleNamespace(
         factor=SimpleNamespace(block_count=0),
-        placement=SimpleNamespace(keyed_rows=None, row_watermark=False),
+        placement=SimpleNamespace(keyed_rows=None),
         routes=SimpleNamespace(case="K6"),
         model=SimpleNamespace(device=SimpleNamespace(is_cuda=True)),
         _route_pins={},
@@ -536,7 +536,7 @@ def _admissible_solver():
             body_has_response_dofs=1,
         ),
         laws=SimpleNamespace(set=plain_laws(), mimic_count=0, link_count=0, joint_limit_q_index=1),
-        options=SimpleNamespace(enable_bilateral_preelimination=False),
+        options=SimpleNamespace(enable_bilateral_preelimination=False, diagnostics=SolverFeatherPGS.Diagnostics()),
     )
 
 

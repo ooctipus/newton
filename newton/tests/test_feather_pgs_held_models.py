@@ -159,13 +159,13 @@ class TestHeldModels(unittest.TestCase):
                 np.testing.assert_allclose(state.body_q.numpy(), expected.body_q.numpy(), atol=1e-6)
 
     def test_debug_rows_keep_the_route(self):
-        """Keep the held tree and the trajectory under ``pgs_debug``."""
+        """Keep the held tree and the trajectory under the stage-3 snapshots."""
         for device in _devices():
             with self.subTest(device=device):
                 arms = [newton.ModelBuilder(), newton.ModelBuilder()]
                 for builder in arms:
                     _chain(builder, 3, 0.0)
-                _solver, _, debug = _fall(arms[0], device, pgs_debug=True)
+                _solver, _, debug = _fall(arms[0], device, diagnostics=SolverFeatherPGS.Diagnostics(snapshots=True))
                 _, _, plain = _fall(arms[1], device)
                 np.testing.assert_array_equal(debug.joint_q.numpy(), plain.joint_q.numpy())
 

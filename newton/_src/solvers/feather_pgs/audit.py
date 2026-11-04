@@ -3,7 +3,7 @@
 
 """The audit: how far each world's solved step stands from the problem its rows state.
 
-A row states ``r_i = J_i v+ + b_i + eps_i lambda_i`` with ``v+`` the published velocity. The audit (``pgs_audit``, off
+A row states ``r_i = J_i v+ + b_i + eps_i lambda_i`` with ``v+`` the published velocity. The audit (``Diagnostics.audit``, off
 by default, reading what the step already holds: it steers no route and changes no computed value) reduces the rows
 to three numbers per world:
 
@@ -434,7 +434,7 @@ def audit_world(
 
 
 class Audit:
-    """The audit's arrays and its launches after the sweep (``solver._audit`` under ``pgs_audit``)."""
+    """The audit's arrays and its launches after the sweep (``solver._audit`` under ``Diagnostics.audit``)."""
 
     def __init__(self, solver):
         self.solver = solver

@@ -57,7 +57,7 @@ PUBLICATION = (
     Field("body_inertia_terms", inertia_record, ("body",), owner="factor"),
     Field("fk_id_cache_valid", wp.int32, ("articulation",), owner="factor"),
     Field("dt", wp.float32, owner="step"),
-    # Per-group stage cycle counts when FEATHER_PGS_STAGE_CLOCKS=1 (a 1x1 placeholder otherwise).
+    # Per-group stage cycle counts under Diagnostics.stage_clocks (a 1x1 placeholder otherwise).
     Field("stage_clocks", wp.int64, ("group", "stage"), owner="step"),
 )
 """The model, solver, state and cache arrays a cached-dynamics owner publishes through: the model's by name, the

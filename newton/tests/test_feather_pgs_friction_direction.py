@@ -166,7 +166,7 @@ def _slide(device, beta, mesh, angle, articulated=False, *, locked_tangent=False
         angular_damping=0.0,
         mf_max_constraints=128,
         dense_max_constraints=32,
-        row_watermark=True,
+        diagnostics=newton.solvers.SolverFeatherPGS.Diagnostics(row_watermark=True),
     )
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=128, deterministic=True)
     contacts = pipeline.contacts()

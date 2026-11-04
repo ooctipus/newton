@@ -335,7 +335,7 @@ class Example:
                 dense_max_constraints=args.dense_rows or (2304 if args.scene == "cube" else 256),
                 mf_max_constraints=self.mf_rows,
                 enable_joint_limits=True,
-                row_watermark=True,
+                diagnostics=newton.solvers.SolverFeatherPGS.Diagnostics(row_watermark=True),
             )
         else:
             self.solver = newton.solvers.SolverMuJoCo(

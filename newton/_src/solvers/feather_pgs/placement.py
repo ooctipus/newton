@@ -117,7 +117,7 @@ ROW_WATERMARKS = FieldGroup(
         )
     )
 )
-"""Whole-run row high-water telemetry for explicit readback (``row_watermark``)."""
+"""Whole-run row high-water telemetry for explicit readback (``Diagnostics.row_watermark``)."""
 
 SPARSE_DIAGONAL_ROWS = FieldGroup(
     Field("sparse_diagonal_row_dof", wp.int32, ("world", "row", 2), fill=-1, owner="placement"),
@@ -754,18 +754,16 @@ class Placement:
         self.row_dropped_mf = self.row_dropped_all[1]
         # Constraint-capacity diagnostics are allocated once before CUDA graph
         # capture. The warning path tracks only current-step dropped rows and a
-        # one-shot flag per row family; row_watermark additionally accumulates
-        # whole-run high-water telemetry for explicit readback.
-        self.track_row_capacity = self.row_watermark or self.options.warn_constraint_overflow
-        # Dropped-row accounting is unconditional (see row_dropped_all above);
-        # track_row_capacity now gates only the optional warning/watermark readbacks.
-        if self.options.warn_constraint_overflow:
+        # one-shot flag per row family; the row watermark additionally accumulates
+        # whole-run high-water telemetry for explicit readback. Dropped-row
+        # accounting is unconditional (see row_dropped_all above).
+        if self.options.diagnostics.overflow_warning:
             self.arrays.allocate(OVERFLOW_WARNING)
         else:
             self.arrays.release(OVERFLOW_WARNING)
         # The telemetry words share one array, which constraint_row_watermarks() reads back once.
         self.row_watermark_words = None
-        if self.row_watermark:
+        if self.options.diagnostics.row_watermark:
             self.row_watermark_words = self.arrays.allocate_words(ROW_WATERMARKS)
         else:
             self.arrays.release(ROW_WATERMARKS)
@@ -888,7 +886,7 @@ class Placement:
     def warn_overflow(self):
         """One device-side warning per overflowing row family."""
         mf_active = self.forest.has_free_rigid_bodies
-        if self.options.warn_constraint_overflow:
+        if self.options.diagnostics.overflow_warning:
             wp.launch(
                 _warn_constraint_row_overflow,
                 dim=self.forest.world_count,
@@ -917,7 +915,7 @@ class Placement:
     def record_watermarks(self, contacts):
         """Opt-in row high-water telemetry (behavior-neutral): at the end of the step, after the row pass has finalized
         the per-world counts, so the atomic-max runs inside the captured graph every step and catches mid-run peaks."""
-        if self.row_watermark:
+        if self.options.diagnostics.row_watermark:
             wp.launch(
                 _accumulate_row_watermark,
                 dim=self.constraint_count.shape[0],

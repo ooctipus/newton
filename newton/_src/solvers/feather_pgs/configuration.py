@@ -6,7 +6,7 @@
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from .solve_policy import SOLVE_READOUTS
 
@@ -42,29 +42,84 @@ _NUMBER_RULES = (
     # matrix-free sweeps, whatever this capacity: none selects a route.
     ("mf_max_constraints", int, lambda value: value >= 1, "must be positive", False),
 )
-# Each option with a fixed set of values.
-_CHOICE_RULES = (("pgs_solve_readout", SOLVE_READOUTS),)
 
 
 # The switches the solver applies as booleans.
 _BOOLEANS = (
     "enable_bilateral_preelimination",
     "enable_restitution",
-    "warn_constraint_overflow",
     "pgs_warmstart",
-    "row_watermark",
     "contact_torsion",
     "contact_compliance",
-    "pgs_audit",
 )
+
+
+@dataclass(frozen=True)
+class Diagnostics:
+    """What :class:`~newton.solvers.SolverFeatherPGS` reads out beside the step, as its ``diagnostics`` option.
+
+    No field changes a computed value: a step with any diagnostics on publishes the same state as one with all of
+    them off. One field changes a choice: ``row_watermark`` keeps the rows of every world, which the resolved-world
+    classifier would otherwise skip uncounted.
+
+    Attributes:
+        nvtx: Mark the step's stages as NVTX ranges.
+        snapshots: Copy the stage-3 joint velocity, joint acceleration and predicted velocity of every substep into
+            ``_debug_stage3_qd_work``, ``_debug_stage3_joint_qdd`` and ``_debug_stage3_v_hat``, which external NaN
+            dumpers read; three copies a substep.
+        row_watermark: Accumulate each row family's whole-run high-water mark, read back by
+            :meth:`~newton.solvers.SolverFeatherPGS.constraint_row_watermarks`.
+        overflow_warning: Emit a device-side warning the first time each dense or matrix-free row family exceeds its
+            per-world capacity: the world, requested rows, row limit and dropped contact and friction rows, without a
+            host synchronization, so it stays compatible with CUDA graph capture.
+        solve_readout: Counters of the Gauss-Seidel sweeps. ``"sweeps"`` counts, per sweep kernel and world, how
+            many sweeps each solve executed and whether it stopped before its budget; ``"trace"`` adds, per solve,
+            the sweep at which each absolute velocity tolerance from 1e-7 to 1e-1 [m/s or rad/s] would have stopped
+            it, its exit reason (no change, changes within the exit law's rounding floor, or the budget) and the
+            largest velocity-scaled change of its final sweep with that row's kind.
+            ``get_path_selection()["measurements"]["solve_readout"]`` summarizes them and synchronizes once. The
+            matrix-free sweeps enter no world without rows; the readout counts those solves as ``skipped``.
+        audit: Audit each step after its solve: per world, the energy gap ``G`` [J] the solve failed to account for,
+            the dual violation ``D`` [m/s] and the rows' injected work ``W`` [J], read by
+            :meth:`~newton.solvers.SolverFeatherPGS.read_audit`. A world whose rows exist only inside its sweep
+            reads NaN (``routes.diagnostics.audit`` says which).
+        stage_clocks: Compile per-stage cycle counters into the held tree's kernels (``_stage_clocks``). It changes the
+            emitted code, not what it computes.
+        sync_timings: ``(first_step, steps)``: synchronize around each stage of those steps and print its time.
+            The sweep's streams then run without overlap. ``None`` times nothing.
+    """
+
+    nvtx: bool = False
+    snapshots: bool = False
+    row_watermark: bool = False
+    overflow_warning: bool = True
+    solve_readout: Literal["off", "sweeps", "trace"] = "off"
+    audit: bool = False
+    stage_clocks: bool = False
+    sync_timings: tuple[int, int] | None = None
+
+    def __post_init__(self):
+        if self.solve_readout not in SOLVE_READOUTS:
+            raise ValueError(f"solve_readout must be one of {SOLVE_READOUTS}, got {self.solve_readout!r}")
+        if self.sync_timings is not None and (
+            len(self.sync_timings) != 2 or min(int(value) for value in self.sync_timings) < 0
+        ):
+            raise ValueError(f"sync_timings must be None or (first_step, steps) >= 0, got {self.sync_timings!r}")
+
+    def timed(self, step: int) -> bool:
+        """Whether ``step`` is one :attr:`sync_timings` times."""
+        if self.sync_timings is None:
+            return False
+        first, steps = self.sync_timings
+        return first <= step < first + steps
 
 
 @dataclass(frozen=True)
 class Options:
     """Every option of :class:`.SolverFeatherPGS`, as the solver applies it (:func:`check_options`).
 
-    Numbers are coerced and checked by the rule tables, choices checked and the switches of :data:`_BOOLEANS` made
-    booleans; every other option is as given.
+    Numbers are coerced and checked by the rule tables and the switches of :data:`_BOOLEANS` made booleans;
+    ``diagnostics`` is a :class:`Diagnostics` (``None`` gives the default); every other option is as given.
     ``friction_anchor_beta`` is the request (``None`` for the default): the row laws resolve it.
     """
 
@@ -85,9 +140,6 @@ class Options:
     dense_max_constraints: int
     pgs_warmstart: bool
     mf_max_constraints: int
-    nvtx: Any
-    pgs_debug: Any
-    row_watermark: bool
     restitution_velocity_threshold: float
     contact_speculative_scale: float
     contact_gap_gate: float
@@ -95,12 +147,10 @@ class Options:
     same_articulation_contact_gap_gate: float
     articulation_pair_contact_gap_gate: float
     pgs_warmstart_decay: float
-    warn_constraint_overflow: bool
     friction_anchor_beta: Any
-    pgs_solve_readout: str
-    pgs_audit: bool
     contact_torsion: bool
     contact_compliance: bool
+    diagnostics: Diagnostics
 
 
 def check_options(options: Mapping[str, Any]) -> Options:
@@ -110,8 +160,9 @@ def check_options(options: Mapping[str, Any]) -> Options:
         options: The constructor's options by keyword (more keys are ignored).
 
     Raises:
-        ValueError: naming the first option, numbers first and in table order, then the choices, that is not
-            admissible, or a regularization above :data:`MAX_CONTACT_REGULARIZATION`.
+        ValueError: naming the first option, in table order, that is not admissible, or a regularization above
+            :data:`MAX_CONTACT_REGULARIZATION`.
+        TypeError: for ``diagnostics`` that is neither ``None`` nor a :class:`Diagnostics`.
     """
     checked = {}
     for name, coerce, admits, requirement, given in _NUMBER_RULES:
@@ -123,13 +174,16 @@ def check_options(options: Mapping[str, Any]) -> Options:
             raise ValueError(message) from exc
         if not admits(checked[name]):
             raise ValueError(message)
-    for name, choices in _CHOICE_RULES:
-        if options[name] not in choices:
-            raise ValueError(f"{name} must be one of {choices}, got {options[name]!r}")
     if checked["pgs_contact_regularization"] > MAX_CONTACT_REGULARIZATION:
         raise ValueError(
             f"pgs_contact_regularization must be at most {MAX_CONTACT_REGULARIZATION:g}; "
             "larger values are not numerically useful in the float32 solve"
         )
     checked.update({name: bool(options[name]) for name in _BOOLEANS})
+    diagnostics = options["diagnostics"]
+    if diagnostics is None:
+        diagnostics = Diagnostics()
+    elif not isinstance(diagnostics, Diagnostics):
+        raise TypeError(f"diagnostics must be None or a SolverFeatherPGS.Diagnostics, got {type(diagnostics).__name__}")
+    checked["diagnostics"] = diagnostics
     return Options(**{name: checked.get(name, options[name]) for name in Options.__dataclass_fields__})

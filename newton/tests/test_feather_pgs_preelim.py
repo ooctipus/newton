@@ -356,7 +356,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             pgs_iterations=256,
             pgs_beta=0.1,
             dense_max_constraints=128,
-            pgs_solve_readout="sweeps",
+            diagnostics=newton.solvers.SolverFeatherPGS.Diagnostics(solve_readout="sweeps"),
             pgs_warmstart=warm,
         )
         pipeline = newton.CollisionPipeline(model, contact_matching="latest")
@@ -405,7 +405,10 @@ class TestFeatherPGSPreeliminationCPU(unittest.TestCase):
             with self.subTest(scene=scene.name), wp.ScopedDevice("cpu"):
                 model = scene.build(wp.get_device("cpu"))
                 solver = newton.solvers.SolverFeatherPGS(
-                    model, pgs_iterations=256, dense_max_constraints=128, pgs_solve_readout="sweeps"
+                    model,
+                    pgs_iterations=256,
+                    dense_max_constraints=128,
+                    diagnostics=newton.solvers.SolverFeatherPGS.Diagnostics(solve_readout="sweeps"),
                 )
                 pipeline = newton.CollisionPipeline(model, contact_matching=scene.contact_matching or "latest")
                 contacts = pipeline.contacts()

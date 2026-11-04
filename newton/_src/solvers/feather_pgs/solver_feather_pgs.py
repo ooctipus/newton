@@ -15,11 +15,10 @@
 
 import copy
 import functools
-import os
 import sys
 import time
 from contextlib import contextmanager
-from typing import ClassVar, Literal
+from typing import ClassVar
 
 import numpy as np
 import warp as wp
@@ -40,7 +39,7 @@ from ..solver import SolverBase
 from . import environment_flags as _environment_flags
 from .audit import Audit
 from .body_cut import BodyCut
-from .configuration import check_options
+from .configuration import Diagnostics, check_options
 from .contact_row_plan import contact_row_plan
 from .field_group import Field, FieldGroup, SolverArrays
 from .forest_plan import ForestPlan, joint_forest
@@ -70,11 +69,6 @@ STAGE3_SNAPSHOTS = FieldGroup(
     Field("_debug_stage3_v_hat", wp.float32, ("dof",)),
 )
 """Stage-3 snapshots for external NaN dumpers (opt-in)."""
-
-
-_FPGS_SYNC_TIMINGS = os.environ.get("FEATHER_PGS_SYNC_TIMINGS", "0").lower() in {"1", "true", "yes", "on"}
-_FPGS_SYNC_TIMINGS_START = int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_START", "20"))
-_FPGS_SYNC_TIMINGS_COUNT = max(int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_COUNT", "1")), 0)
 
 
 class SolverFeatherPGS(SolverBase):
@@ -153,6 +147,9 @@ class SolverFeatherPGS(SolverBase):
     those present at construction (``environment``).
 
     """
+
+    Diagnostics = Diagnostics
+    """The record of the ``diagnostics`` option: what the solver reads out beside the step (:class:`.Diagnostics`)."""
 
     # The default configuration is conformance-tested against body-pair-reduced
     # contact buffers (test_contact_reduction_body_pairs). Warm-start modes have
@@ -261,9 +258,6 @@ class SolverFeatherPGS(SolverBase):
         dense_max_constraints: int = 32,
         pgs_warmstart: bool = False,
         mf_max_constraints: int = 512,
-        nvtx: bool = False,
-        pgs_debug: bool = False,
-        row_watermark: bool = False,
         restitution_velocity_threshold: float = 0.5,
         contact_speculative_scale: float = 1.0,
         contact_gap_gate: float = 0.0,
@@ -271,12 +265,10 @@ class SolverFeatherPGS(SolverBase):
         same_articulation_contact_gap_gate: float = 0.0,
         articulation_pair_contact_gap_gate: float = 0.0,
         pgs_warmstart_decay: float = 1.0,
-        warn_constraint_overflow: bool = True,
         friction_anchor_beta: float | None = None,
-        pgs_solve_readout: Literal["off", "sweeps", "trace"] = "off",
-        pgs_audit: bool = False,
         contact_torsion: bool = False,
         contact_compliance: bool = False,
+        diagnostics: Diagnostics | None = None,
     ):
         """Create the solver for ``model``.
 
@@ -422,23 +414,6 @@ class SolverFeatherPGS(SolverBase):
                 mimic and loop-closing rows. Defaults to 0.2.
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
-            pgs_audit (bool, optional): Audit each step after its solve: per world, the energy gap ``G`` [J] the solve
-                failed to account for, the dual violation ``D`` [m/s] and the rows' injected work ``W`` [J]
-                (:mod:`.audit`), read with :meth:`read_audit`. It reads what the step holds, steers no route and
-                changes no computed value. A world whose rows exist only inside its sweep reads NaN
-                (``routes.diagnostics.audit`` says which). Defaults to ``False``.
-            pgs_solve_readout (str, optional): Opt-in counters of the native Gauss-Seidel sweeps.
-                ``"sweeps"`` counts, per sweep kernel and world, how many sweeps each solve executed
-                and whether it stopped before its budget; ``"trace"`` adds, per
-                solve, the sweep at which each absolute velocity tolerance from 1e-7 to 1e-1 [m/s or
-                rad/s] would have stopped it, its exit reason (no change, changes within the exit law's
-                rounding floor, or the budget), and the largest velocity-scaled change of its final sweep
-                with that row's kind. ``get_path_selection()`` summarizes them under
-                ``measurements["solve_readout"]``, which synchronizes the device once. Neither
-                readout changes a computed value. Every sweep counts (``routes.sweep.readout``). The
-                matrix-free sweeps enter no world without rows (such as one the resolved-world
-                classifier left without rows); the readout counts those solves as ``skipped``.
-                Defaults to ``"off"``.
             pgs_contact_regularization (float, optional): Dimensionless regularizer ``g`` of contact
                 rows on every route (matrix-free and dense). Each position iteration moves a
                 row's impulse toward the hard solution with weight ``1/(1+g)`` and toward zero with
@@ -465,10 +440,6 @@ class SolverFeatherPGS(SolverBase):
                 Defaults to False.
             pgs_warmstart_decay (float, optional): Finite non-negative scale applied to
                 contact impulses carried from the previous frame. Defaults to 1.0.
-            warn_constraint_overflow (bool, optional): Emit a device-side warning the first time each dense
-                or matrix-free row family exceeds its configured per-world capacity. The warning
-                reports the world, requested rows, row limit, and dropped contact/friction rows without a host
-                synchronization, so it remains compatible with CUDA graph capture. Defaults to True.
             mf_max_constraints (int, optional): Maximum number of matrix-free (free-body) rows per world, at
                 least 1. Packed metadata on CUDA supports at most 65535 rows. Defaults to 512.
             enable_restitution: Whether rigid contacts apply their authored restitution coefficients. Defaults to
@@ -481,6 +452,10 @@ class SolverFeatherPGS(SolverBase):
                 Restitution coefficients are averaged across the two shapes after clamping finite values to
                 ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
                 to every closing impact. Defaults to 0.5 m/s.
+            diagnostics: What the solver reads out beside the step (:class:`Diagnostics`): NVTX ranges, stage-3
+                snapshots, row watermarks, the overflow warning, the sweep readout, the audit and synchronized
+                timings. None changes a computed value. ``None`` takes the defaults (only the
+                overflow warning on).
 
         Raises:
             ValueError: For a model that records gradients (``requires_grad``): FeatherPGS has no gradients.
@@ -500,19 +475,13 @@ class SolverFeatherPGS(SolverBase):
         # Every scalar option coerced and checked once (configuration.OPTION_RULES).
         self.options = options = check_options(requested_options)
 
-        self._nvtx = nvtx
-        self._debug_buffers_enabled = bool(pgs_debug)
-        # External NaN dumpers read the stage-3 snapshots; nothing in the solver
-        # does. They cost three copies per substep, so they are opt-in.
-        self._debug_stage3_snapshot_flag = os.environ.get("FEATHER_PGS_DEBUG_SNAPSHOTS") == "1"
-        self._debug_stage3_snapshots = self._debug_stage3_snapshot_flag or self._debug_buffers_enabled
         # The solver's device fields (the primitives' field groups), on the model's device.
         self._arrays = SolverArrays(self, model.device)
 
         self._step = 0
         # The tree factor: the augmented state, the mass-update cadence and the FK/ID cache now; its masks, drives,
         # factors and evaluator as construction reaches them.
-        self.factor = TreeFactor(model, options, nvtx=nvtx)
+        self.factor = TreeFactor(model, options, nvtx=self.options.diagnostics.nvtx)
 
         self.forest: ForestPlan | None = None
         # The model's joint forest (Model.joint_ancestor): body maps, CRBA's ancestor test.
@@ -549,7 +518,7 @@ class SolverFeatherPGS(SolverBase):
             self.routes,
             self._route_pins,
             timed=self._sync_timed,
-            nvtx=nvtx,
+            nvtx=self.options.diagnostics.nvtx,
         )
 
         def diagonal_decline(size: int) -> str | None:
@@ -565,7 +534,6 @@ class SolverFeatherPGS(SolverBase):
         self._bind_contact_material(None)
         self._allocate_common_buffers(model)
         self._compact_diagonal_mass_size = self.placement.sparse_diagonal_response_size
-        self.placement.row_watermark = bool(row_watermark)
         self.sweep.admit_packed(model, functools.partial(held_tree.sparse_decline, self))
         # The matrix-free sweeps read the dense rows packed (packed_rows): every class but native sparse factors (case
         # K1) and the sparse diagonal (case K2). Decided before the buffers, since that placement allocates no size
@@ -679,10 +647,10 @@ class SolverFeatherPGS(SolverBase):
             if self.routes.case == "K1":
                 self.sweep.plan_support_walk()
         self.sweep.build()
-        self.sweep.open_streams(overlap=not _FPGS_SYNC_TIMINGS)
+        self.sweep.open_streams(overlap=self.options.diagnostics.sync_timings is None)
         self.placement.allocate_placeholders()
 
-        self._audit = Audit(self) if self.options.pgs_audit else None
+        self._audit = Audit(self) if self.options.diagnostics.audit else None
         self.placement.allocate_status()
 
         # The tree factor's evaluator: the held tree.
@@ -721,7 +689,7 @@ class SolverFeatherPGS(SolverBase):
         """Return the active plans and selection reasons.
 
         The record is read on the host without device synchronization, except
-        under ``pgs_solve_readout``: reading its counters synchronizes once.
+        under ``Diagnostics.solve_readout``: reading its counters synchronizes once.
 
         Automatic choices use topology and resource rules, never timing.
         Recreate the solver to change them. The ``reasons`` mapping explains construction-time admission and
@@ -750,7 +718,7 @@ class SolverFeatherPGS(SolverBase):
         rows follow ``free_rigid_bodies``.
         ``contact_consumers.max_blocks`` is the block cap of the launches over the
         contact capacity (0: uncapped). ``measurements`` holds, under
-        ``pgs_solve_readout``, the cumulative sweep counts
+        ``Diagnostics.solve_readout``, the cumulative sweep counts
         (``solve_readout``), kept out of ``routes`` so that two runs of one
         configuration compare equal. ``options`` records every constructor
         option's requested, declared-default and applied value, captured once at
@@ -765,7 +733,7 @@ class SolverFeatherPGS(SolverBase):
         (recorded, not rejected; removed switches among them), and ``retired`` and
         ``isaac_lab`` are empty for this family.
         ``routes.diagnostics.stage3_snapshots`` records whether
-        ``FEATHER_PGS_DEBUG_SNAPSHOTS=1`` or ``pgs_debug`` allocated the stage-3
+        ``Diagnostics.snapshots`` allocated the stage-3
         snapshots, which every substep then copies.
         Switches read at import keep the values present at import. The record is
         host-only, detached from solver state and JSON-compliant (non-finite
@@ -883,15 +851,9 @@ class SolverFeatherPGS(SolverBase):
         self.factor.reset_cache(self.cut.mirror(state), world_mask)
         self.sweep.clear_history(world_mask)
 
-    def _sync_timing_active(self) -> bool:
-        if not _FPGS_SYNC_TIMINGS or _FPGS_SYNC_TIMINGS_COUNT <= 0:
-            return False
-        step = getattr(self, "_step", -1)
-        return _FPGS_SYNC_TIMINGS_START <= step < _FPGS_SYNC_TIMINGS_START + _FPGS_SYNC_TIMINGS_COUNT
-
     @contextmanager
     def _sync_timed(self, label: str):
-        if not self._sync_timing_active():
+        if not self.options.diagnostics.timed(self._step):
             yield
             return
 
@@ -959,7 +921,7 @@ class SolverFeatherPGS(SolverBase):
             arrays.allocate(DOF_WORK, dof=model.joint_dof_count)
             # Stage-3 snapshots for external NaN dumpers, which read their values
             # by these names: None unless opted in.
-            if self._debug_stage3_snapshots:
+            if self.options.diagnostics.snapshots:
                 arrays.allocate(STAGE3_SNAPSHOTS, dof=model.joint_dof_count)
             else:
                 arrays.release(STAGE3_SNAPSHOTS)
@@ -983,14 +945,16 @@ class SolverFeatherPGS(SolverBase):
         self.placement.allocate_contact_rows(model)
 
     def read_audit(self) -> dict:
-        """Return the per-world audit of ``pgs_audit`` by name (:data:`.audit.AUDIT_SLOTS`), each a NumPy array.
+        """Return the per-world audit of ``Diagnostics.audit`` by name (:data:`.audit.AUDIT_SLOTS`), each a NumPy array.
 
         ``gap``, ``violation`` and ``work`` are the last step's ``G``, ``D`` and ``W``, NaN in a world without readable
         rows; ``gap_sum``, ``violation_max``, ``work_sum`` and ``steps`` cover the steps read since construction,
         captured graph replays included. This synchronizes with the device.
         """
         if self._audit is None:
-            raise RuntimeError("read_audit() needs a solver built with pgs_audit=True.")
+            raise RuntimeError(
+                "read_audit() needs a solver built with diagnostics=SolverFeatherPGS.Diagnostics(audit=True)."
+            )
         return self._audit.read()
 
     def _bind_contact_material(self, contacts: Contacts | None) -> None:
@@ -1073,7 +1037,7 @@ class SolverFeatherPGS(SolverBase):
             state_in, control, state_out, dt, self._step, self.qd_work, self.v_hat, self.v_out
         )
         self.factor.predict(state_in, control, stage3_qd, inverse_dynamics_ready, dt, self.v_hat)
-        if self._debug_stage3_snapshots:
+        if self.options.diagnostics.snapshots:
             wp.copy(self._debug_stage3_qd_work, stage3_qd)
             wp.copy(self._debug_stage3_joint_qdd, state_aug.joint_qdd)
             wp.copy(self._debug_stage3_v_hat, self.v_hat)
@@ -1085,14 +1049,16 @@ class SolverFeatherPGS(SolverBase):
         # ══════════════════════════════════════════════════════════════
         # STAGE 4: Build contact problem
         # ══════════════════════════════════════════════════════════════
-        with wp.ScopedTimer("S4_ContactBuild", print=False, use_nvtx=self._nvtx, synchronize=False):
+        with wp.ScopedTimer("S4_ContactBuild", print=False, use_nvtx=self.options.diagnostics.nvtx, synchronize=False):
             if self.sweep.resolved_worlds_owner is not None:
                 self.sweep.resolved_worlds_owner.classify(state_in, state_aug, contacts, dt)
             self.laws.write(self, state_in, state_aug, contacts, dt)
 
         # The diagonals (the packed rows' |Z|^2 + cfm, the sparse diagonal's) and the bias (the sweeps compute J v
         # each iteration).
-        with wp.ScopedTimer("S4_HinvJt_Diag_RHS", print=False, use_nvtx=self._nvtx, synchronize=False):
+        with wp.ScopedTimer(
+            "S4_HinvJt_Diag_RHS", print=False, use_nvtx=self.options.diagnostics.nvtx, synchronize=False
+        ):
             self.placement.diagonals()
             if self.placement.walks and self.routes.case != "K2":
                 # The one writer: seeds walked into the packed rows or the support sink, their headers (walk_rows). The
@@ -1103,19 +1069,19 @@ class SolverFeatherPGS(SolverBase):
 
         # The free bodies' rows' rhs: their writers stored their diagonals and incident velocities.
         if self.forest.has_free_rigid_bodies:
-            with wp.ScopedTimer("S4_MF_Setup", print=False, use_nvtx=self._nvtx, synchronize=False):
+            with wp.ScopedTimer("S4_MF_Setup", print=False, use_nvtx=self.options.diagnostics.nvtx, synchronize=False):
                 with self._sync_timed("s4_mf_setup"):
                     self.laws.write_free_body_rhs(self, dt)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 5+6: PGS solve
         # ══════════════════════════════════════════════════════════════
-        with wp.ScopedTimer("S5_PGS_Prep", print=False, use_nvtx=self._nvtx, synchronize=False):
+        with wp.ScopedTimer("S5_PGS_Prep", print=False, use_nvtx=self.options.diagnostics.nvtx, synchronize=False):
             self.placement.prepare_impulses()
             self.sweep.warm_start(contacts, dt)
         self.sweep.seed_patches(state_in, contacts, dt)
 
-        with wp.ScopedTimer("S5_GatherJY", print=False, use_nvtx=self._nvtx, synchronize=False):
+        with wp.ScopedTimer("S5_GatherJY", print=False, use_nvtx=self.options.diagnostics.nvtx, synchronize=False):
             if self.factor.eliminates:
                 # The closure's seed: the one writer closed the bilateral blocks and corrected the other rows; the
                 # blocks' kept rows start at -r_Q, after the warm start's gather.
@@ -1142,7 +1108,7 @@ class SolverFeatherPGS(SolverBase):
                     int(self.laws.set.weighted),
                 )
 
-        with wp.ScopedTimer("S6_PGS_Solve", print=False, use_nvtx=self._nvtx, synchronize=False):
+        with wp.ScopedTimer("S6_PGS_Solve", print=False, use_nvtx=self.options.diagnostics.nvtx, synchronize=False):
             self.sweep.solve(self.v_hat, self.v_out)
 
         if self._audit is not None:
@@ -1206,7 +1172,7 @@ class SolverFeatherPGS(SolverBase):
 
         Call at a host observation boundary, outside CUDA graph capture. The
         device-resident ``placement.constraint_overflow`` boolean array is always
-        maintained, including when ``row_watermark=False``; GPU consumers can
+        maintained, including without ``Diagnostics.row_watermark``; GPU consumers can
         inspect it without host synchronization. Status remains set until
         :meth:`reset` clears the affected worlds. Increasing capacity requires
         constructing a solver and recapturing graphs before restarting the
@@ -1223,7 +1189,7 @@ class SolverFeatherPGS(SolverBase):
         contact rows that allocators rolled back, peak over-capacity demand,
         and the number of overflowing world-steps. They are accumulated inside
         the captured :meth:`step` when
-        ``row_watermark`` is enabled. Reads the telemetry words back in one
+        ``Diagnostics.row_watermark`` is on. Reads the telemetry words back in one
         copy and so must be called OUTSIDE any captured/timed region (it
         forces a device sync).
 

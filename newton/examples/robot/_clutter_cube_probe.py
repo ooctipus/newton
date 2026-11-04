@@ -212,7 +212,7 @@ class Example:
             pgs_iterations=args.iterations,
             dense_max_constraints=args.rows,
             mf_max_constraints=256,
-            row_watermark=True,
+            diagnostics=newton.solvers.SolverFeatherPGS.Diagnostics(row_watermark=True),
         )
         self.current, self.next = self.model.state(), self.model.state()
         self.control = self.model.control()

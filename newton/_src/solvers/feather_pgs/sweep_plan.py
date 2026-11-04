@@ -191,7 +191,7 @@ class Sweep:
         self.timed = timed
         self.nvtx = nvtx
         # Every sweep compiles the exit law and the policy's readout.
-        self.policy = SolvePolicy(readout=options.pgs_solve_readout)
+        self.policy = SolvePolicy(readout=options.diagnostics.solve_readout)
         self.readout = SolveReadoutRecord(self.policy)
         self.prev_dt = 0.0
         self.paired_response_candidate_sizes = frozenset(

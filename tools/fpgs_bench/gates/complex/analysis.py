@@ -413,7 +413,7 @@ def scene_validity(ctx, times, Q, QD, *, after=None):
 
 
 def audit_section(raw):
-    """A run's own audit (``pgs_audit``): the mean energy gap per step and the largest dual violation, per world."""
+    """A run's own audit (``Diagnostics.audit``): the mean energy gap per step and the largest dual violation, per world."""
     gap = raw.get("audit_gap_sum")
     if gap is None:
         return None

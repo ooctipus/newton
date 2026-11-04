@@ -803,7 +803,6 @@ def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device
         restitution=0.6,
     )
     solver = _make_solver(positive_model)
-    test.assertFalse(solver._debug_buffers_enabled)
     test.assertEqual(solver.placement.row_restitution.shape, (solver.forest.world_count, solver.placement.row_pitch))
     test.assertEqual(solver.placement.row_pitch - solver.placement.body_base, solver.placement.mf_max_constraints)
     for invalid_threshold in (-1.0, float("nan"), float("inf")):

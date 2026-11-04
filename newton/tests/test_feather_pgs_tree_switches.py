@@ -4,7 +4,7 @@
 """The tree kernels' stage-clock switch is a factory argument, set once by the owner."""
 
 import ast
-import os
+import dataclasses
 import tempfile
 import unittest
 from pathlib import Path
@@ -36,8 +36,10 @@ _GENERATION_MODULES = (
 )
 
 
-def _switches(clocked):
-    return patch.dict(os.environ, {"FEATHER_PGS_STAGE_CLOCKS": str(int(clocked))})
+def _switches(solver, clocked):
+    """The solver's options with ``Diagnostics.stage_clocks`` set to ``clocked``, for the duration."""
+    diagnostics = SolverFeatherPGS.Diagnostics(stage_clocks=clocked)
+    return patch.object(solver, "options", dataclasses.replace(solver.options, diagnostics=diagnostics))
 
 
 def _kernels(clocked):
@@ -148,21 +150,6 @@ class TestTreeKernelSwitches(unittest.TestCase):
         for position in range(3):
             self.assertEqual(len({kernels[position].module.name for kernels in built}), 2)
 
-    def test_factories_never_read_the_environment(self):
-        """Rebuild identical kernels from the same arguments whatever the environment holds."""
-        expected = _kernels(False)
-        with _switches(True):
-            for factory in (
-                tree_kinetic_state.get_helpers,
-                tree_kinetic_state.get_state_kernel,
-                tree_kinetic_state.get_predictor_kernel,
-            ):
-                factory.cache_clear()
-            rebuilt = _kernels(False)
-        # Warp keeps one kernel object per emitted content, so equal code is the same object.
-        for kernel, again in zip(expected, rebuilt, strict=True):
-            self.assertIs(again, kernel)
-
     def test_kernel_generation_reads_no_environment(self):
         """Keep environment reads out of tree-kernel generation and out of every cached factory body."""
         package = Path(tree_kinetic_state.__file__).parent
@@ -206,7 +193,7 @@ class TestTreeKernelSwitches(unittest.TestCase):
         solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
         owners = {}
         for clocked in (False, True):
-            with _switches(clocked):
+            with _switches(solver, clocked):
                 owners[clocked] = HeldTree(solver)
             self.assertEqual(owners[clocked].clocked, clocked)
             for group in owners[clocked].groups:

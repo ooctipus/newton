@@ -22,6 +22,7 @@ are trials rather than replicas.
 """
 
 import contextlib
+import dataclasses
 import functools
 import inspect
 import math
@@ -102,7 +103,19 @@ def plain(value):
 
 
 AUDIT = False
-"""``run_complex.py --audit``: every solver takes ``pgs_audit=True`` (a Newton that has it), which steers no route."""
+"""``run_complex.py --audit``: every solver audits its steps (a Newton that has the audit), which steers no route."""
+
+# The diagnostics a tree took as separate options before the one ``diagnostics`` record.
+_SEPARATE_DIAGNOSTICS = {"audit": "pgs_audit", "row_watermark": "row_watermark"}
+
+
+def with_diagnostics(solver_class, kwargs: dict, **fields) -> dict:
+    """``kwargs`` with the diagnostics ``fields`` on: in the ``diagnostics`` record of a tree that has it (merged into
+    one the kwargs already carry), else as the separate options of the base trees the gate compares against."""
+    if not hasattr(solver_class, "Diagnostics"):
+        return {**kwargs, **{_SEPARATE_DIAGNOSTICS[name]: value for name, value in fields.items()}}
+    record = kwargs.get("diagnostics") or solver_class.Diagnostics()
+    return {**kwargs, "diagnostics": dataclasses.replace(record, **fields)}
 
 
 @contextlib.contextmanager
@@ -124,7 +137,7 @@ def inject_law(law: str, record: dict):
             if law == "point":
                 kwargs["friction_anchor_beta"] = 0.0
             if AUDIT:
-                kwargs["pgs_audit"] = True
+                kwargs = with_diagnostics(base, kwargs, audit=True)
             record["kwargs"] = {name: plain(value) for name, value in kwargs.items()}
             record["positional_args"] = len(args)
             with warnings.catch_warnings(record=True) as caught:
@@ -364,8 +377,8 @@ def build_pyramid(
     options = {
         "pgs_iterations": iterations,
         "mf_max_constraints": min(3 * contacts_per_world, 65535),
-        "row_watermark": True,
     }
+    options = with_diagnostics(newton.solvers.SolverFeatherPGS, options, row_watermark=True)
     # Trees before E5's C6 take the formulation as an option; later trees choose it from the device.
     if "pgs_mode" in inspect.signature(newton.solvers.SolverFeatherPGS.__init__).parameters:
         options["pgs_mode"] = "split" if cpu_smoke else "matrix_free"

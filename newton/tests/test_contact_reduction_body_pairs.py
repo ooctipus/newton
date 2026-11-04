@@ -921,7 +921,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
             dense_max_constraints=4,
             enable_joint_limits=True,
             joint_limit_activation_gap=float("inf"),
-            row_watermark=True,
+            diagnostics=newton.solvers.SolverFeatherPGS.Diagnostics(row_watermark=True),
         )
         solver.step(state_0, state_1, model.control(), contacts, DT)
         rows = solver.constraint_row_watermarks()
@@ -950,7 +950,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
             model,
             angular_damping=0.0,
             dense_max_constraints=4,
-            row_watermark=True,
+            diagnostics=newton.solvers.SolverFeatherPGS.Diagnostics(row_watermark=True),
         )
         solver.step(state_0, state_1, model.control(), contacts, DT)
         rows = solver.constraint_row_watermarks()
@@ -983,8 +983,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         )
         solver.step(state_0, state_1, model.control(), contacts, DT)
 
-        self.assertFalse(solver.placement.row_watermark)
-        self.assertTrue(solver.placement.track_row_capacity)
+        self.assertEqual(solver.constraint_row_watermarks()["dense_high_water"], 0)
         self.assertGreater(int(solver.placement.row_dropped_dense.numpy().max()), 0)
         self.assertEqual(int(solver.placement.row_overflow_warning_emitted.numpy()[0]), 1)
 
@@ -1089,7 +1088,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
                     solver = newton.solvers.SolverFeatherPGS(
                         model,
                         angular_damping=0.0,
-                        row_watermark=True,
+                        diagnostics=newton.solvers.SolverFeatherPGS.Diagnostics(row_watermark=True),
                         **kwargs,
                     )
                     if iters is None:

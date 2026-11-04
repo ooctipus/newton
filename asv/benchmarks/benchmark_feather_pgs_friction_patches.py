@@ -117,7 +117,6 @@ def run(
         **({"friction_anchor_beta": beta} if beta is not None else {}),
         dense_max_constraints=32,
         mf_max_constraints=max(256, 12 * tiles * tiles),
-        warn_constraint_overflow=True,
     )
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
     contacts = pipeline.contacts()

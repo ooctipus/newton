@@ -6,12 +6,13 @@
 Every function here reads host attributes only: no device array is read, no
 kernel is launched and nothing synchronizes. The one exception is
 :func:`measurement_selection` under an enabled solve readout
-(``pgs_solve_readout``), which reads the readout's device counters. Values are
+(``Diagnostics.solve_readout``), which reads the readout's device counters. Values are
 JSON-compliant: non-finite floats become ``"inf"``, ``"-inf"`` or ``"nan"`` and
 tuples become lists.
 """
 
 import copy
+import dataclasses
 import functools
 import inspect
 import math
@@ -23,26 +24,16 @@ from ...sim.contacts import CAPACITY_BLOCKS_PER_SM
 from .contact_row_plan import contact_row_plan
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF
 
-# Options whose applied value lives under another attribute of the solver after construction.
-_APPLIED_ATTRIBUTES = {
-    "nvtx": "_nvtx",
-}
-# Those it lives under on the placement.
-_APPLIED_PLACEMENT = {"row_watermark": "row_watermark"}
-
 
 def _applied(solver, name, requested):
-    """An option's applied value: the row laws' resolved friction beta, the solver's attribute where it keeps one
-    (:data:`_APPLIED_ATTRIBUTES`, capacities), else the options record's value."""
+    """An option's applied value: the row laws' resolved friction beta, the factor's preelimination, the solver's
+    attribute where it keeps one (capacities), else the options record's value."""
     if name == "friction_anchor_beta":
         return solver.laws.friction_anchor_beta
-    if name in _APPLIED_PLACEMENT:
-        return getattr(solver.placement, _APPLIED_PLACEMENT[name])
     if name == "enable_bilateral_preelimination":
         return solver.factor.eliminates
-    attribute = _APPLIED_ATTRIBUTES.get(name, name)
-    if hasattr(solver, attribute):
-        return getattr(solver, attribute)
+    if hasattr(solver, name):
+        return getattr(solver, name)
     return getattr(solver.options, name, requested)
 
 
@@ -69,6 +60,8 @@ def json_value(value):
         return {str(key): json_value(item) for key, item in value.items()}
     if isinstance(value, np.ndarray):
         return json_value(value.tolist())
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return json_value(dataclasses.asdict(value))
     # Never str(): a Warp array's str() copies device memory to the host.
     return f"<{type(value).__name__}>"
 
@@ -92,7 +85,10 @@ def _is_default(value, default) -> bool:
 # Options whose request can resolve to another value, or to no owner or tier at all.
 _EFFECTIVE = {
     # A readout applies only where a sweep kernel carries its counters.
-    "pgs_solve_readout": lambda solver: solver.options.pgs_solve_readout if solver.sweep.readout.kernels else "off",
+    "diagnostics": lambda solver: dataclasses.replace(
+        solver.options.diagnostics,
+        solve_readout=solver.options.diagnostics.solve_readout if solver.sweep.readout.kernels else "off",
+    ),
 }
 
 
@@ -182,7 +178,7 @@ def route_selection(solver) -> dict:
 def measurement_selection(solver) -> dict:
     """Measured values, kept out of the routes so that runs of one configuration compare equal.
 
-    With ``pgs_solve_readout`` on, ``solve_readout`` summarizes the sweep counters
+    With ``Diagnostics.solve_readout`` on, ``solve_readout`` summarizes the sweep counters
     (:meth:`SolveReadoutRecord.summary`); reading them synchronizes the device.
     The counters accumulate, so a window is the difference of two records.
     """
@@ -572,14 +568,16 @@ def _mf_colored(solver) -> dict | None:
 
 
 def _readout(solver, record) -> dict:
-    """Which sweep kernels of the route count their sweeps under ``pgs_solve_readout``, and how a solve counts."""
+    """Which sweep kernels of the route count their sweeps under ``Diagnostics.solve_readout``, and how a solve
+    counts."""
     counted = solver.sweep.readout.kernels
-    if solver.options.pgs_solve_readout == "off":
-        reason = "pgs_solve_readout is off."
+    readout = solver.options.diagnostics.solve_readout
+    if readout == "off":
+        reason = "The solve readout is off."
     else:
         reason = "Each launch of a counted kernel solves its worlds."
     return {
-        "mode": solver.options.pgs_solve_readout if counted else "off",
+        "mode": readout if counted else "off",
         "counted": dict(sorted(counted.items())),
         # Whether the solves of worlds without rows, which the matrix-free sweeps do not enter, count as skipped.
         "counts_skipped": bool(counted) and solver.sweep.readout.counts_skipped,
@@ -787,29 +785,20 @@ def _dynamics(solver) -> dict:
 
 def _diagnostics(solver) -> dict:
     """Opt-in per-step diagnostics recorded so far: the stage-3 snapshots, which the solver never reads."""
-    switches = " and ".join(
-        switch
-        for switch, on in (
-            ("FEATHER_PGS_DEBUG_SNAPSHOTS=1", solver._debug_stage3_snapshot_flag),
-            ("pgs_debug=True", solver._debug_buffers_enabled),
-        )
-        if on
-    )
+    requested = solver.options.diagnostics.snapshots
     # Mirrors _allocate_common_buffers: a model without joints has no stage 3 to snapshot.
     snapshots = solver._debug_stage3_qd_work is not None
     if snapshots:
         reason = (
-            f"{switches}: every substep copies the stage-3 joint velocity, acceleration and predicted velocity "
-            "into _debug_stage3_qd_work, _debug_stage3_joint_qdd and _debug_stage3_v_hat."
+            "Diagnostics.snapshots: every substep copies the stage-3 joint velocity, acceleration and predicted "
+            "velocity into _debug_stage3_qd_work, _debug_stage3_joint_qdd and _debug_stage3_v_hat."
         )
-    elif switches:
-        reason = f"{switches}, but the model has no joints to snapshot."
+    elif requested:
+        reason = "Diagnostics.snapshots, but the model has no joints to snapshot."
     else:
-        reason = (
-            "Off: FEATHER_PGS_DEBUG_SNAPSHOTS=1 or pgs_debug=True opts in to three stage-3 snapshot copies per substep."
-        )
+        reason = "Off: Diagnostics.snapshots opts in to three stage-3 snapshot copies per substep."
     audit = solver._audit
     return {
         "stage3_snapshots": {"enabled": snapshots, "reason": reason},
-        "audit": {"enabled": False, "reason": "Off: pgs_audit=True opts in."} if audit is None else audit.record(),
+        "audit": {"enabled": False, "reason": "Off: Diagnostics.audit opts in."} if audit is None else audit.record(),
     }

@@ -5,7 +5,6 @@
 
 import dataclasses
 import math
-import os
 
 import numpy as np
 import warp as wp
@@ -53,15 +52,6 @@ def proof_runs(flags) -> bool:
 def _bank_pointers(state):
     """The pointers a cache stamp records for a state bank: its coordinates and velocities."""
     return state.joint_q.ptr, state.joint_qd.ptr
-
-
-def stage_clocks_on() -> bool:
-    """Read the tree kernels' instrumentation switch, once per owner.
-
-    ``FEATHER_PGS_STAGE_CLOCKS=1`` adds per-stage cycle counters. It changes the emitted code, so an owner reads it
-    at construction and passes it to every kernel factory as an argument, which keeps it in the factories' cache keys.
-    """
-    return os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1"
 
 
 def launch_switches(pins=None):
@@ -203,7 +193,7 @@ class TreeKineticState:
         self._continuity = None
         self.group_count = sparse_owner.plan.group_to_art.size
         # A composite owner passes what it read for all of its groups; a direct construction reads it here.
-        self.clocked = stage_clocks_on() if clocked is None else bool(clocked)
+        self.clocked = solver.options.diagnostics.stage_clocks if clocked is None else bool(clocked)
         if self.clocked:
             solver._stage_clocks = wp.zeros((self.group_count, 28), dtype=wp.int64, device=solver.model.device)
         self._cache_to_art = sparse_owner.plan.group_to_art.reshape((self.group_count, 1))

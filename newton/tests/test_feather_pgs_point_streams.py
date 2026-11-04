@@ -189,7 +189,7 @@ def _keyed_last_word_calls():
 def _readout_calls():
     """Opt-in sweep readouts of the suite's counted sweeps: ``(name, factory, args, kwargs, patch_only)``.
 
-    ``pgs_solve_readout="sweeps"`` builds these variants of the sparse, sparse-diagonal,
+    ``Diagnostics(solve_readout="sweeps")`` builds these variants of the sparse, sparse-diagonal,
     matrix-free Gauss-Seidel, paired factor and local-packet sweeps.
     """
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
