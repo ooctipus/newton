@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import warp as wp
 
+from ...core import memory
 from ...core.execution import Device, Use, Work, shape
 from ...sim import BodyFlags, JointType
 from . import (
@@ -18,7 +19,16 @@ from . import (
     field_group,
 )
 from . import tree_scan as ts
-from .device_preludes import CUDA_ONLY, STATUS_CLOCK, device_branches, dual_native, substitute
+from .device_preludes import (
+    CUDA_ONLY,
+    HELD,
+    STATUS_CLOCK,
+    device_branches,
+    dual_native,
+    lane_group,
+    memory_words,
+    substitute,
+)
 from .factor import kernels
 from .factor.walk import (
     WALK_COORDINATE,
@@ -343,27 +353,12 @@ def _bank_binding(coordinates, layout):
     return matches
 
 
-# A launch block's vote, not a tree's (the prelude's ANY): a packed layout's
-# block is one warp of several trees, an unpacked block one tree.
-_BLOCK_VOTE = r"""
-#if defined(__CUDA_ARCH__)
-    if constexpr(LANES<32)return __any_sync(0xffffffffu,value);
-    else return __syncthreads_or(value);
-#else
-    return value;
-#endif
-"""
-
-
 @functools.cache
 def _block_vote(layout):
-    """Whether any thread of a launch block passes a nonzero value; every thread of the block must call it.
+    """Whether any thread of a launch block passes a nonzero value; every thread of the block must call it: the
+    ``ANY`` of the block's lane group, not the tree's (a packed layout's block is one warp of several trees)."""
 
-    A packed layout's block is one warp of several trees, so the vote spans the
-    warp; an unpacked block holds one tree and votes over the block.
-    """
-
-    @wp.func_native(layout.native(_BLOCK_VOTE))
+    @wp.func_native(dual_native("    return ANY(value);\n", preludes=(lane_group(layout.block),)))
     def block_any(value: int) -> int: ...
 
     return block_any
@@ -1736,27 +1731,8 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
         int parent[HOLD_WORDS], first[HOLD_WORDS];
         float l[HOLD_WORDS][3];
     };
-    // HOLD_PICK(v, x): item x of a held array (a word a lane) or a slotted one (a slip a lane), x the same on every
-    // lane: item x sits in lane x % WIDTH's word or slot x / WIDTH, read from that lane. HOLD_ROW(v, x, out): item x's
-    // row of a held array of rows (a record, a link).
-    const auto HOLD_PICK = [&](const auto& v, const int x) {
-        constexpr int words = sizeof(v) / sizeof(v[0]);
-        auto t = v[0];
-        #pragma unroll
-        for (int k = 1; k < words; ++k)
-            if (x >= k * WIDTH) t = v[k];
-        return READ(t, x & (WIDTH - 1));
-    };
-    const auto HOLD_ROW = [&](const auto& v, const int x, float* out) {
-        #pragma unroll
-        for (int m = 0; m < (int)(sizeof(v[0]) / sizeof(v[0][0])); ++m) {
-            float t = v[0][m];
-            #pragma unroll
-            for (int k = 1; k < HOLD_WORDS; ++k)
-                if (x >= k * WIDTH) t = v[k][m];
-            out[m] = READ(t, x & (WIDTH - 1));
-        }
-    };
+    // A held array (a word a lane) or a slotted one (a slip a lane) is the lane group's HELD: item x sits in lane
+    // x % WIDTH's word or slot x / WIDTH, read by HELD_PICK(v, x) and, a row of a record or a link, HELD_ROW(v, x, out).
     const auto HOLD_LOAD = [&](WalkHold& h, const float* data, const float* link, const int* path, const int n,
                                const int nb) {
         #pragma unroll
@@ -1772,13 +1748,8 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
                 for (int m = 0; m < 13; ++m) h.r[k][m] = 0.0f;
             }
             if (x < nb) {
-#if defined(__CUDA_ARCH__)
-                h.parent[k] = __ldg(path + 2 * x);
-                h.first[k] = __ldg(path + 2 * x + 1);
-#else
-                h.parent[k] = path[2 * x];
-                h.first[k] = path[2 * x + 1];
-#endif
+                h.parent[k] = LDG(path + 2 * x);
+                h.first[k] = LDG(path + 2 * x + 1);
                 float l[6];
                 WALK_READ_LINK(WALK_LDG, l, link, x, h.parent[k]);
                 h.l[k][0] = l[0];
@@ -1825,7 +1796,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
         int deepest = 0, widest = 0;
         #pragma unroll 1
         for (int k = 0; k < slips; ++k) {
-            const int gk = HOLD_PICK(group, k), lk = HOLD_PICK(len, k);
+            const int gk = HELD_PICK(group, k), lk = HELD_PICK(len, k);
             #pragma unroll
             for (int m = 0; m < HOLD_SLOTS; ++m)
                 if (mine[m] && gk == group[m]) {
@@ -1836,7 +1807,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
         }
         #pragma unroll 1
         for (int k = 0; k < slips; ++k) {
-            const int sk = HOLD_PICK(size, k);
+            const int sk = HELD_PICK(size, k);
             widest = sk > widest ? sk : widest;
         }
         const int turns = deepest + widest - 1;
@@ -1947,10 +1918,10 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
             ts[m] = 0;
             ats[m] = ((size_t)a * cap + (i >= 0 ? lane + m * WIDTH : 0)) * depth;
         }
-        const int deepest = slips > 0 ? HOLD_PICK(is, slips - 1) : -1;
+        const int deepest = slips > 0 ? HELD_PICK(is, slips - 1) : -1;
         #pragma unroll 1
         for (int b = nb - 1; b >= 0 && slips > 0; --b) {
-            const int f0 = HOLD_PICK(h.first, b), f1 = HOLD_PICK(h.first, b + 1);
+            const int f0 = HELD_PICK(h.first, b), f1 = HELD_PICK(h.first, b + 1);
             if (f0 > deepest) continue;
             bool in[HOLD_SLOTS], any = false;
             int start[HOLD_SLOTS];
@@ -1972,7 +1943,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
                 }
                 if (slipping == 0u) continue;
                 float d[13];
-                HOLD_ROW(h.r, c, d);
+                HELD_ROW(h.r, c, d);
                 #pragma unroll
                 for (int m = 0; m < HOLD_SLOTS; ++m)
                     if (on[m]) {
@@ -2029,10 +2000,10 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
                         }
                 }
             }
-            const int up = HOLD_PICK(h.parent, b);
-            const int last = HOLD_PICK(h.first, up + 1) - 1;
+            const int up = HELD_PICK(h.parent, b);
+            const int last = HELD_PICK(h.first, up + 1) - 1;
             float l[3];
-            HOLD_ROW(h.l, b, l);
+            HELD_ROW(h.l, b, l);
             #pragma unroll
             for (int m = 0; m < HOLD_SLOTS; ++m)
                 if (in[m]) {
@@ -2392,7 +2363,7 @@ def get_predictor_kernel(
         classes,
         "moved",
         _RESPONSE_HALF,
-        (walk_loads_prelude(),),
+        (walk_loads_prelude(), HELD, memory_words(memory.Place.READ_ONLY)),
         TRIAL=held_lambdas(layout, slips, ts.record_half(side))
         + stage("float value=s[$WHITE+col];", clocks["CLOCK2"] + clocks["CLOCK3"], QUIET_DRIVE),
         SATURATE=substitute(SATURATE_DRIVES, layout.sizes(), ROOT=_root(layout)),

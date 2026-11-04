@@ -562,10 +562,10 @@ class _Context:
             return f"for(int k=0;k<{group.channels};++k){self.slot(group, node, 'k')}=0.0f;"
         return ""
 
-    def shuffle(self, target: str, var: str, source: str, mask: str = "MASK", width: str = "WIDTH") -> str:
+    def shuffle(self, target: str, var: str, source: str) -> str:
         return "".join(
             f"for(int k=0;k<{group.channels};++k){self.combine.channel(target, 'k', group)}="
-            f"__shfl_sync({mask},{self.combine.channel(var, 'k', group)},{source},{width});"
+            f"READ({self.combine.channel(var, 'k', group)},{source});"
             for group in self.combine.groups
         )
 
@@ -694,7 +694,7 @@ def _jump_shfl(c: _Context) -> str:
         const int source=parent>=0?parent:LANE;
         {c.combine.declare(up)}
         {c.shuffle(up, value, "source")}
-        const int next=__shfl_sync(MASK,parent,source,WIDTH);
+        const int next=READ(parent,source);
         if(parent>=0){c.combine.compose(value, up)}
         parent=parent>=0?next:-1;
     }}
@@ -768,7 +768,7 @@ def _chain_up(c: _Context) -> str:
             const int source=combine?((thread+offset)&31):(thread&31);
             #pragma unroll
             for(int k=0;k<{count};++k) {{
-                const float next=__shfl_sync(MASK,values[k],source,WIDTH);
+                const float next=READ(values[k],source);
                 if(combine)values[k]+=next;
             }}
         }}
@@ -835,7 +835,7 @@ def _interval_up(c: _Context) -> str:
         int offset=LANE;
         #pragma unroll
         for(int b={c.windows}-1;b>=0;--b) {{
-            const float t=__shfl_sync(MASK,w[b],offset,WIDTH);
+            const float t=READ(w[b],offset);
             if((dfs_length>>b)&1){{sum+=t;offset+=1<<b;}}
         }}
         if(dfs_node>=0)*cell=sum;
@@ -1668,7 +1668,7 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
         class's order, no loop and no pick of a parent or a first coordinate on the chain. Each coordinate's step runs
         on every lane from the lane's own held word of the records (the coordinate's lane: its own record), and the
         walk's six-float state is then read from the coordinate's lane (six shuffles, where reading the record took
-        thirteen); each body's link by shuffle from the lane that holds it (``HOLD_ROW`` at a constant). A body's
+        thirteen); each body's link by shuffle from the lane that holds it (``HELD_ROW`` at a constant). A body's
         state passes to a parent that is not the body before it through ``state`` (six words a body, lane 0 writes),
         the walk down's twists through the same words (every lane writes them, as each body's twist out); a body's first
         joining child stores its state, the later ones add theirs. Lane 0 writes ``u`` (both walks). A lane holds ``HOLD_WORDS`` words of each held array (on the CPU's one lane, every item)."""
@@ -1688,7 +1688,7 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
                 )
             parent_b = parent[b]
             if parent_b >= 0:
-                up.append(f"    {{float l[3];HOLD_ROW(h.l,{b},l);{edge_up}}}")
+                up.append(f"    {{float l[3];HELD_ROW(h.l,{b},l);{edge_up}}}")
             if parent_b != b - 1:
                 if parent_b >= 0:
                     if parent_b in joined:
@@ -1714,7 +1714,7 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
             else:
                 if parent_b != b - 1:
                     down.append(f"    for (int k = 0; k < 6; ++k) V[k] = {state}[{6 * parent_b} + k];")
-                down.append(f"    {{float l[3];HOLD_ROW(h.l,{b},l);{edge_down}}}")
+                down.append(f"    {{float l[3];HELD_ROW(h.l,{b},l);{edge_down}}}")
             for c in self.coordinates_in(b, True):
                 output, update = step(
                     Direction.DOWN, LOADED, "V", source=f"uh[{c}/WIDTH]", out="const float q", into="W"

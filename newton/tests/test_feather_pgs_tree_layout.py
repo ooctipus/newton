@@ -153,18 +153,17 @@ class TestTreeLayoutRender(unittest.TestCase):
                         self.assertEqual(set(_MASKED.findall(native.native_snippet)) - {"MASK"}, set())
 
     def test_block_vote_spans_the_launch_block(self):
-        """Vote over a launch block from the prelude's lane count: a packed block's whole warp, else the block.
+        """Vote over a launch block: the ``ANY`` of a lane group of the block's threads, a packed block's whole warp.
 
-        A tree's vote (the prelude's ``ANY``) would leave the other trees of a
+        A tree's vote (its own lane group's ``ANY``) would leave the other trees of a
         packed block out of the vote that lists the block for a repair.
         """
         for layout in _LAYOUTS:
             with self.subTest(lanes=layout.lanes):
                 snippet = tree_kinetic_state._block_vote.__wrapped__(layout).native_snippet
                 self.assertNotIn("$", snippet)
-                self.assertIn(f"const int LANES = {layout.lanes},", snippet)
-                self.assertIn("if constexpr(LANES<32)return __any_sync(0xffffffffu,value);", snippet)
-                self.assertIn("else return __syncthreads_or(value);", snippet)
+                self.assertIn(f"const int LANES = {layout.block},", snippet)
+                self.assertIn("return ANY(value);", snippet)
 
 
 class TestStateBlockPlacement(unittest.TestCase):
