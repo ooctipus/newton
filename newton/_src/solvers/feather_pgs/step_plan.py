@@ -309,7 +309,6 @@ class Step:
         "event",
         "index",
         "qd",
-        "ready",
         "source_in",
         "source_out",
         "state_in",
@@ -324,8 +323,8 @@ class Step:
         self.contacts, self.dt, self.index = contacts, dt, index
         # The collision pass's event, waited on once, before the first stage that reads what it produced.
         self.event = event
-        # The tree factor's stage-3 velocity and its inverse-dynamics event, which the predictor reads.
-        self.qd = self.ready = None
+        # The predictor's velocity (prescaled where velocities are limited), from stage 1.
+        self.qd = None
 
 
 class Stage(NamedTuple):
@@ -367,10 +366,11 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
             stages.extend(Stage(run.__name__, run) for run in runs)
 
     def enter(step):
-        if not spec.pure_forest:
-            step.state_in, step.state_out, step.control = cut.enter(
-                step.state_in, step.state_out, step.control, factor.fk_id_cache_valid
-            )
+        step.state_in, step.state_out, step.control = cut.enter(
+            step.state_in, step.state_out, step.control, factor.fk_id_cache_valid
+        )
+
+    def default_control(step):
         if step.control is None:
             step.control = model.control(clone_variables=False)
 
@@ -413,13 +413,20 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     def integrate_particles(step):
         solver.integrate_particles(model, step.state_in, step.state_out, step.dt)
 
-    def leave(step):
+    def count(step):
         solver._step += 1
-        if not spec.pure_forest:
-            cut.leave(step.source_in, step.source_out)
+
+    def leave(step):
+        cut.leave(step.source_in, step.source_out)
+
+    def follow_shadows(step):
+        cut.follow_shadows(step.source_in, step.source_out)
+
+    # The forest's boundary: a pure forest is the caller's, so it enters and leaves nothing.
+    boundary = () if spec.pure_forest else (leave, follow_shadows) if cut.shadow.size else (leave,)
 
     # The call's bind: the contacts' material, pool and identity contract.
-    add(enter)
+    add(*(() if spec.pure_forest else (enter,)), default_control)
     if solver.options.contact_compliance:
         add(bind_material)
     add(follow_contacts)
@@ -431,24 +438,84 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     if not spec.articulated:
         if spec.particles:
             add(integrate_particles)
-        add(leave)
+        add(count, *boundary)
         return tuple(stages)
 
-    # Stages 1-3: the tree factor (FK/ID, drives, mass refresh, factor), then the predictor v_hat.
-    def factor_trees(step):
-        step.qd, step.ready = factor.factor(
-            step.state_in, step.control, step.state_out, step.dt, solver.qd_work, solver.v_hat, solver.v_out
-        )
+    # Stages 1-3: the tree factor (the drives, FK/ID, the mass refresh and the factor's, the walk's refresh with the
+    # clock), then the predictor v_hat and the free roots' corrections.
+    scalar = getattr(factor.held, "scalar", None)
+    stream = factor.dynamics_stream
+
+    def drives(step):
+        factor.prepare_drives(step.state_in, step.control, step.dt, solver.v_hat, solver.v_out)
+
+    def scalar_drives(step):
+        # Scalar branches evaluate their own drives in their predict.
+        scalar.launch_other_drives(step.state_in, factor, step.control, step.dt)
+
+    launch_drives = drives if scalar is None else scalar_drives
+
+    def drives_on_stream(step):
+        # The drives overlap FK/ID on the dynamics stream; the mask (refresh) joins them.
+        stream.wait_event(wp.get_stream(model.device).record_event())
+        with wp.ScopedStream(stream, sync_enter=False):
+            launch_drives(step)
+
+    def join_drives(step):
+        wp.get_stream(model.device).wait_event(stream.record_event())
+
+    def prescale(step):
+        factor.prescale_velocity(step.state_in.joint_qd, solver.qd_work)
+        step.qd = solver.qd_work
+
+    def velocity(step):
+        step.qd = step.state_in.joint_qd
+
+    def fk_id(step):
+        factor.fk_id(step.state_in, step.state_out, step.qd)
+
+    def refresh(step):
+        factor.refresh(step.dt)
+
+    def walk_step(step):
+        factor.walk_step(step.state_in, step.dt)
+
+    def advance_clock(step):
+        factor.advance_clock(step.dt)
 
     def predict(step):
-        factor.predict(step.state_in, step.control, step.qd, step.ready, step.dt, solver.v_hat)
+        factor.predict(step.state_in, step.control, step.qd, step.dt)
+
+    def correct_free_roots(step):
+        factor.correct_free_roots(step.state_in, step.qd, step.dt, solver.v_hat)
+
+    def damp_spin(step):
+        factor.damp_spin(step.dt, solver.v_hat)
+
+    drive_stages = ()
+    if factor.parallel_drives and (scalar is None or scalar.other_drive_dofs is not None):
+        drive_stages = (drives_on_stream,) if stream is not None else (launch_drives,)
+    add(
+        *drive_stages,
+        prescale if solver.options.enable_joint_velocity_limits else velocity,
+        fk_id,
+        *((join_drives,) if drive_stages and stream is not None else ()),
+        refresh,
+        advance_clock if factor.walk_arts is None else walk_step,
+        nvtx="S1_FK_ID_CRBA",
+    )
+    add(
+        predict,
+        *((correct_free_roots,) if forest.free_root_joint_count and forest.free_rigid_body_count else ()),
+        *((damp_spin,) if solver.options.angular_damping != 0.0 else ()),
+        nvtx="S3_Trisolve_Vhat",
+    )
 
     def snapshots(step):
         wp.copy(solver._debug_stage3_qd_work, step.qd)
         wp.copy(solver._debug_stage3_joint_qdd, factor.joint_qdd)
         wp.copy(solver._debug_stage3_v_hat, solver.v_hat)
 
-    add(factor_trees, predict)
     if "snapshots" in diagnostics:
         add(snapshots)
     if not spec.particles:
@@ -557,11 +624,11 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     def watermarks(step):
         placement.record_watermarks(step.contacts)
 
-    add(finish)
+    add(finish, nvtx="S7_Integrate")
     if spec.particles:
         add(integrate_particles)
     add(carry)
     if "row_watermark" in diagnostics:
         add(watermarks)
-    add(leave)
+    add(count, *boundary)
     return tuple(stages)

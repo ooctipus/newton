@@ -544,7 +544,8 @@ def check_owner_launches(test, device):
                     state, output = states[source], states[1 - source]
                     _set_clock(solver.factor, refresh)
                     owner.begin(state, solver.factor, state.joint_qd, DT)
-                    owner.scalar.launch_other_drives(state, solver.factor, control, DT)
+                    if owner.scalar.other_drive_dofs is not None:
+                        owner.scalar.launch_other_drives(state, solver.factor, control, DT)
                     solver.factor.mass_update_mask.fill_(1)
                     owner.refresh(solver.factor)
                     solver.factor.walk_step(state, DT)

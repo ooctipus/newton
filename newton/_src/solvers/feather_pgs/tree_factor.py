@@ -141,13 +141,11 @@ class TreeFactor:
     Args:
         model: The solver's model.
         options: The solver's physics options (:class:`.configuration.Options`).
-        nvtx: Whether the stages' timers emit NVTX ranges.
     """
 
-    def __init__(self, model, options, *, nvtx: bool):
+    def __init__(self, model, options):
         self.model = model
         self.options = options
-        self.nvtx = nvtx
         self.forest = None
         self.laws = None
         self._arrays = SolverArrays(self, model.device)
@@ -623,30 +621,14 @@ class TreeFactor:
     # The step
     # ---------------------------------------------------------------------------------------------------------------
 
-    def factor(self, state_in, control, state_out, dt: float, qd_work: wp.array, v_hat: wp.array, v_out: wp.array):
-        """FK/ID, the drives' K and u0, the mass-update mask, the factor refresh and the walk's, which advances the
-        step's clock.
-
-        Returns:
-            ``(qd, ready)``: the predictor's velocity (``qd_work`` prescaled when velocities are limited) and the event
-            the predictor waits for, if any.
-        """
-        model = self.model
-        with wp.ScopedTimer("S1_FK_ID_CRBA", print=False, use_nvtx=self.nvtx, synchronize=False):
-            drive_rows_ready = self.prepare_drives(state_in, control, dt, v_hat, v_out)
-            qd = self.fk_id(state_in, state_out, qd_work)
-            self.refresh(drive_rows_ready, dt)
-            self.walk_step(state_in, dt)
-        # joint_tau holds only u0: the predictor adds the current external, control and bias contributions after
-        # waiting for the drives.
-        return qd, drive_rows_ready if model.articulation_count else None
+    # Stages 1-3 (:func:`.step_plan._stages` chooses which run): the drives' K and u0 (on the dynamics stream where
+    # they overlap FK/ID), the prescaled velocity, FK/ID, the mass-update mask and the factor refresh, the walk's
+    # refresh, which advances the step's clock, then the predictor and the free roots' corrections. joint_tau holds
+    # only u0: the predictor adds the current external, control and bias contributions.
 
     def prescale_velocity(self, joint_qd: wp.array, prescaled_joint_qd: wp.array) -> None:
         """Write every DOF's PhysX-prescaled joint velocity in one launch, without a separate copy."""
         model = self.model
-        if not model.articulation_count:
-            wp.copy(prescaled_joint_qd, joint_qd)
-            return
         wp.launch(
             prescale_joint_velocity_limits,
             dim=self.laws.velocity_prescale_threads,
@@ -660,74 +642,53 @@ class TreeFactor:
             device=model.device,
         )
 
-    def fk_id(self, state_in, state_out, qd_work: wp.array) -> wp.array:
-        """Forward kinematics and inverse-dynamics terms; returns the predictor's velocity (prescaled when limited)."""
+    def fk_id(self, state_in, state_out, qd: wp.array) -> None:
+        """Forward kinematics and inverse-dynamics terms, at the predictor's velocity ``qd`` (prescaled when
+        limited)."""
         if not self.held.bank_compare:
             # Held trees that compare input banks validate a changed bank on the device.
             if self.fk_id_cache_source_state is not None and state_in is not self.fk_id_cache_source_state:
                 self.fk_id_cache_valid.zero_()
                 self.forget_repair_continuity()
         self.fk_id_cache_source_state = state_in
-        if self.options.enable_joint_velocity_limits:
-            self.prescale_velocity(state_in.joint_qd, qd_work)
-            qd = qd_work
-        else:
-            qd = state_in.joint_qd
-
         self.held.begin(state_in, self, qd, self.last_step_dt, state_out=state_out)
-        return qd
 
-    def prepare_drives(self, state_in, control, dt: float, v_hat: wp.array, v_out: wp.array) -> wp.Event | None:
-        """Launch the per-coordinate augmented-drive preparation independently of FK/ID; ``v_hat`` and ``v_out`` are last
-        step's."""
-        if not self.parallel_drives:
-            return None
-
+    def prepare_drives(self, state_in, control, dt: float, v_hat: wp.array, v_out: wp.array) -> None:
+        """Launch every coordinate's augmented drive (:func:`prepare_augmented_drives`), apart from FK/ID; ``v_hat``
+        and ``v_out`` are last step's. A model with scalar branches launches its other drives instead
+        (:meth:`.scalar_branches.ScalarBranches.launch_other_drives`)."""
         model = self.model
-        dynamics_stream = self.dynamics_stream
-        if dynamics_stream is not None:
-            dynamics_stream.wait_event(wp.get_stream(model.device).record_event())
-        with wp.ScopedStream(dynamics_stream, sync_enter=False):
-            scalar = getattr(self.held, "scalar", None)
-            if scalar is not None:
-                # Scalar branches evaluate their drives in their predict.
-                scalar.launch_other_drives(state_in, self, control, dt)
-            else:
-                wp.launch(
-                    prepare_augmented_drives,
-                    dim=model.joint_dof_count,
-                    inputs=[
-                        self.drive_row_by_dof,
-                        self.drive_q_index_by_dof,
-                        self.drive_target_index_by_dof,
-                        state_in.joint_q,
-                        state_in.joint_qd,
-                        model.joint_target_ke,
-                        model.joint_target_kd,
-                        control.joint_target_q,
-                        control.joint_target_qd,
-                        model.joint_effort_limit,
-                        self.passive_joint_damping,
-                        self.forest.articulation_max_dofs,
-                        dt,
-                    ],
-                    outputs=[self.drive_rows(v_hat, v_out), self.joint_tau],
-                    block_dim=256,
-                    device=model.device,
-                )
-        return None if dynamics_stream is None else dynamics_stream.record_event()
+        wp.launch(
+            prepare_augmented_drives,
+            dim=model.joint_dof_count,
+            inputs=[
+                self.drive_row_by_dof,
+                self.drive_q_index_by_dof,
+                self.drive_target_index_by_dof,
+                state_in.joint_q,
+                state_in.joint_qd,
+                model.joint_target_ke,
+                model.joint_target_kd,
+                control.joint_target_q,
+                control.joint_target_qd,
+                model.joint_effort_limit,
+                self.passive_joint_damping,
+                self.forest.articulation_max_dofs,
+                dt,
+            ],
+            outputs=[self.drive_rows(v_hat, v_out), self.joint_tau],
+            block_dim=256,
+            device=model.device,
+        )
 
     def drive_rows(self, v_hat: wp.array, v_out: wp.array) -> DriveRows:
         """What a step's drives write (:func:`.factor.fields.hold_drive_row`); ``v_hat`` and ``v_out`` are last step's."""
         return field_group.bind(DriveRows, factor=self, v_hat=v_hat, v_out=v_out)
 
-    def refresh(self, drive_rows_ready: wp.Event | None, dt: float) -> None:
-        """The mass-update mask, the clock's cadence with the requests (which it consumes), then the held tree's
-        factor refresh."""
+    def refresh(self, dt: float) -> None:
+        """The mass-update mask, the clock's cadence with the requests (which it consumes; the drives' have joined),
+        then the held tree's factor refresh."""
         model = self.model
-        # The mask kernel reads what the drives requested.
-        if drive_rows_ready is not None:
-            wp.get_stream(model.device).wait_event(drive_rows_ready)
         wp.launch(
             build_mass_update_mask,
             dim=model.articulation_count,
@@ -737,63 +698,60 @@ class TreeFactor:
         )
         self.held.refresh(self)
 
-    def predict(self, state_in, control, qd: wp.array, ready: wp.Event | None, dt: float, v_hat: wp.array) -> None:
-        """Stage 3: ``v_hat = qd + h H^-1 (tau - c)``, the free-root correction included. Each tree's launch holds the
-        drives' saturation decision and, where it moved a drive, the decided step by the border on the walk
-        (:data:`.tree_kinetic_state.SATURATE_DRIVES`, :func:`.tree_kinetic_state.border_solve`); the factor keeps every
-        ``K``, so no saturation ever asks the refresh for a factor."""
-        with wp.ScopedTimer("S3_Trisolve_Vhat", print=False, use_nvtx=self.nvtx, synchronize=False):
-            if ready is not None:
-                wp.get_stream(self.model.device).wait_event(ready)
-            self.held.predict(state_in, self, control, qd, dt)
-            self.correct_free_root_velocity(state_in, qd, dt, v_hat)
+    def predict(self, state_in, control, qd: wp.array, dt: float) -> None:
+        """Stage 3: ``v_hat = qd + h H^-1 (tau - c)``. Each tree's launch holds the drives' saturation decision and,
+        where it moved a drive, the decided step by the border on the walk (:data:`.tree_kinetic_state.SATURATE_DRIVES`,
+        :func:`.tree_kinetic_state.border_solve`); the factor keeps every ``K``, so no saturation ever asks the refresh
+        for a factor."""
+        self.held.predict(state_in, self, control, qd, dt)
 
-    def correct_free_root_velocity(self, state_in, qd: wp.array, dt: float, v_hat: wp.array) -> None:
-        """Apply canonical gyro physics and the free roots' spin damping after the held prediction."""
-        model = self.model
-        forest = self.forest
+    def correct_free_roots(self, state_in, qd: wp.array, dt: float, v_hat: wp.array) -> None:
+        """Apply canonical gyro physics to the free roots after the held prediction, where a free root and a free
+        rigid body exist."""
+        model, forest = self.model, self.forest
         # Keep v_hat on jcalc_integrate's free-root convention. The compact launch excludes every non-root joint; a
         # live device mask handles runtime kinematic changes without changing graph topology.
-        if forest.free_root_joint_count and forest.free_rigid_body_count:
-            wp.launch(
-                apply_free_root_velocity_corrections,
-                dim=forest.free_root_joint_count,
-                inputs=[
-                    forest.free_root_joint_indices,
-                    model.joint_qd_start,
-                    model.joint_child,
-                    forest.body_to_articulation,
-                    forest.is_free_rigid,
-                    self.kinematic_joint_mask,
-                    state_in.body_q,
-                    model.body_inertia,
-                    self.walk_data,
-                    qd,
-                    dt,
-                ],
-                outputs=[v_hat],
-                device=model.device,
-            )
-        if self.options.angular_damping != 0.0:
-            wp.launch(
-                damp_free_root_spin,
-                dim=forest.free_root_joint_count,
-                inputs=[
-                    forest.free_root_joint_indices,
-                    model.joint_qd_start,
-                    self.kinematic_joint_mask,
-                    1.0 - self.options.angular_damping * dt,
-                ],
-                outputs=[v_hat],
-                device=model.device,
-            )
+        wp.launch(
+            apply_free_root_velocity_corrections,
+            dim=forest.free_root_joint_count,
+            inputs=[
+                forest.free_root_joint_indices,
+                model.joint_qd_start,
+                model.joint_child,
+                forest.body_to_articulation,
+                forest.is_free_rigid,
+                self.kinematic_joint_mask,
+                state_in.body_q,
+                model.body_inertia,
+                self.walk_data,
+                qd,
+                dt,
+            ],
+            outputs=[v_hat],
+            device=model.device,
+        )
+
+    def damp_spin(self, dt: float, v_hat: wp.array) -> None:
+        """Damp the free roots' spin, where the options damp it."""
+        model, forest = self.model, self.forest
+        wp.launch(
+            damp_free_root_spin,
+            dim=forest.free_root_joint_count,
+            inputs=[
+                forest.free_root_joint_indices,
+                model.joint_qd_start,
+                self.kinematic_joint_mask,
+                1.0 - self.options.angular_damping * dt,
+            ],
+            outputs=[v_hat],
+            device=model.device,
+        )
 
     def finish(self, state_in, state_out, dt: float) -> None:
         """Stage 7: ``qdd`` from the solved velocity, integrate the coordinates and publish the output state (with the
         next step's geometry where the clock refreshes it)."""
-        with wp.ScopedTimer("S7_Integrate", print=False, use_nvtx=self.nvtx, synchronize=False):
-            self.held.finish(state_in, self, state_out, dt)
-            self.fk_id_cache_source_state = state_out
+        self.held.finish(state_in, self, state_out, dt)
+        self.fk_id_cache_source_state = state_out
 
     # ---------------------------------------------------------------------------------------------------------------
     # The walk on the device (FL3.3): the converted class's factor as the one writer and the leave read it
@@ -839,6 +797,8 @@ class TreeFactor:
                 dof_body[qd_start[j] : qd_start[j + 1]] = j - j0
         joints, dofs = max(int(model.joint_count), 1), max(int(model.joint_dof_count), 1)
         self.walk_arts = wp.array(arts, dtype=wp.int32, device=device)
+        # The drives' K the refresh adds where a coordinate has a drive row.
+        self.walk_drive_K = self.aug_row_K if self.parallel_drives else self._arrays.placeholder(wp.float32)
         # Each coordinate's column half at its body's frame, from its joint's kind (WALK_COORDINATE): a joint's
         # sliding coordinates the linear half, its turning ones the angular half, but a D6 joint's turns after its
         # slides and a free joint's turns below a root, which can have both (WALK_BOTH): their linear halves sit in the
@@ -1007,10 +967,7 @@ class TreeFactor:
         may set on any step): the step's geometry the finish published (:attr:`WalkTrees.now`) becomes the factor's
         frames and the group runs the inward pass. A free rigid body is a one-body tree: its walk is its six
         coordinates' factor. A tree that does not refresh takes nothing here. Its first thread advances the step's clock
-        past this step (``dt``); a model where no tree walks advances it in a launch of its own."""
-        if self.walk_arts is None:
-            wp.launch(advance_clock, dim=1, inputs=[self.clock, dt], device=self.model.device)
-            return
+        past this step (``dt``); a model where no tree walks advances it alone (:meth:`advance_clock`)."""
         model = self.model
         lanes = self.walk_shape.lanes
         wp.launch(
@@ -1031,7 +988,7 @@ class TreeFactor:
                 model.body_inertia,
                 self.dof_armature,
                 self.drive_row_by_dof,
-                self.aug_row_K if self.parallel_drives else self._arrays.placeholder(wp.float32),
+                self.walk_drive_K,
                 self.walk_trees.now,
                 self.walk_now_link,
                 self.joint_com_offset,
@@ -1043,6 +1000,10 @@ class TreeFactor:
             block_dim=self.walk_shape.block,
             device=model.device,
         )
+
+    def advance_clock(self, dt: float) -> None:
+        """Advance the step's clock past this step (``dt``) where no tree walks, so no refresh carries it."""
+        wp.launch(advance_clock, dim=1, inputs=[self.clock, dt], device=self.model.device)
 
     def two_halves(self, coordinates) -> bool:
         """Whether a coordinate of ``coordinates`` has a step column of two halves at its frame (:data:`.factor.walk.WALK_BOTH`, from

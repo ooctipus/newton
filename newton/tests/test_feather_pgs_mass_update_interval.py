@@ -430,7 +430,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
                     mass_update_requested=wp.array(requested, dtype=int, device="cpu"),
                     mass_update_mask=wp.zeros(3, dtype=int, device="cpu"),
                 )
-                TreeFactor.refresh(factor, None, DT)
+                TreeFactor.refresh(factor, DT)
                 self.assertEqual(calls, [factor])
                 np.testing.assert_array_equal(factor.mass_update_mask.numpy(), expected)
                 np.testing.assert_array_equal(factor.mass_update_requested.numpy(), [0, 0, 0])

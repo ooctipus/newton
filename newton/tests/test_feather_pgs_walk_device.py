@@ -711,7 +711,7 @@ def refresh_error(device, bodies: int, rng) -> float:
         factor.plan_walk(np.arange(model.articulation_count, dtype=np.int32))
     # The held tree's repair publishes the state's poses and the walk's step geometry, as a step's would.
     factor.last_step_dt = 1.0 / 240.0
-    factor.fk_id(state, model.state(), wp.zeros_like(state.joint_qd))
+    factor.fk_id(state, model.state(), state.joint_qd)
     factor.mass_update_mask.fill_(1)
     walk = factor.walk(q, 0)
     n = walk.s.shape[0]

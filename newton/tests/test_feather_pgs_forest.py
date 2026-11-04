@@ -579,7 +579,8 @@ _LOOP_MOTION = {
 
 class TestPureForest(unittest.TestCase):
     def test_a_pure_forest_is_its_own_model(self):
-        """Nothing is gathered or launched for a model without loops: the step's objects pass through."""
+        """Nothing is gathered or launched for a model without loops: the step's objects pass through, since its stage
+        list holds no enter and no leave."""
         builder = newton.ModelBuilder()
         body, joint = _revolute_chain(builder)
         builder.add_articulation([joint])
@@ -587,13 +588,12 @@ class TestPureForest(unittest.TestCase):
         cut = BodyCut.of(model)
         self.assertIs(cut.model, model)
         self.assertTrue(cut.pure)
-        state_in, state_out, control = model.state(), model.state(), model.control()
-        entered = cut.enter(state_in, state_out, control, None)
-        self.assertIs(entered[0], state_in)
-        self.assertIs(entered[1], state_out)
-        self.assertIs(entered[2], control)
-        cut.leave(state_in, state_out)
         self.assertEqual(body, 0)
+        state = model.state()
+        self.assertIs(cut.mirror(state), state)
+        order = [stage.name for stage in newton.solvers.SolverFeatherPGS(model)._plan.stages]
+        self.assertNotIn("enter", order)
+        self.assertNotIn("leave", order)
 
     def test_scenes_without_loops_are_pure(self):
         for scene in (scenes.mimic_pair(), scenes.compliant_stack(), scenes.compliant_pinch()):

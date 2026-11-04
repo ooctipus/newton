@@ -482,7 +482,7 @@ class SolverFeatherPGS(SolverBase):
         self._step = 0
         # The tree factor: the augmented state, the mass-update cadence and the FK/ID cache now; its masks, drives,
         # factors and evaluator as construction reaches them.
-        self.factor = TreeFactor(model, options, nvtx=self.options.diagnostics.nvtx)
+        self.factor = TreeFactor(model, options)
 
         self.forest: ForestPlan | None = None
         # The model's joint forest (Model.joint_ancestor): body maps, CRBA's ancestor test.

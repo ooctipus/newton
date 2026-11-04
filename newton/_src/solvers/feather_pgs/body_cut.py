@@ -583,8 +583,6 @@ class BodyCut:
             cache_valid: Each tree's kinematics cache bit; every tree of a component that holds a cleared one clears
                 its own, since seating moves it.
         """
-        if self.pure:
-            return state_in, state_out, control
         self._gather_model()
         forest_in, forest_out = self.mirror(state_in), self.mirror(state_out)
         device, count = self.model.device, self.source.body_count
@@ -632,8 +630,6 @@ class BodyCut:
     def leave(self, state_in: State, state_out: State) -> None:
         """Publish the step: the output's coordinates, and both states' bodies (the step's primary pieces, the model's
         bodies, whose indices the forest keeps)."""
-        if self.pure:
-            return
         device, count = self.model.device, self.source.body_count
         forest_in, forest_out = self.mirror(state_in), self.mirror(state_out)
         wp.launch(
@@ -653,13 +649,17 @@ class BodyCut:
         for state, mirror in ((state_in, forest_in), (state_out, forest_out)):
             wp.copy(state.body_q, mirror.body_q, count=count)
             wp.copy(state.body_qd, mirror.body_qd, count=count)
-        # A caller may copy its output over its input and step that: the shadows' poses then follow the bodies'.
-        if self.shadow.size:
-            for name in ("body_q", "body_qd"):
-                wp.copy(
-                    getattr(forest_in, name),
-                    getattr(forest_out, name),
-                    dest_offset=count,
-                    src_offset=count,
-                    count=self.shadow.size,
-                )
+
+    def follow_shadows(self, state_in: State, state_out: State) -> None:
+        """After :meth:`leave`, where links hold shadows: a caller may copy its output over its input and step that, so
+        the input mirror's shadows take the output's poses and twists."""
+        count = self.source.body_count
+        forest_in, forest_out = self.mirror(state_in), self.mirror(state_out)
+        for name in ("body_q", "body_qd"):
+            wp.copy(
+                getattr(forest_in, name),
+                getattr(forest_out, name),
+                dest_offset=count,
+                src_offset=count,
+                count=self.shadow.size,
+            )

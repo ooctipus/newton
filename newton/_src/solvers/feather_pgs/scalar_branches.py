@@ -728,10 +728,9 @@ class ScalarBranchState:
         """Prepare the augmented drives of the DOFs outside the branches, whose ``predict`` folds its own.
 
         Writes the drive rows' ``K`` and the drive forces into ``joint_tau`` as
-        :func:`.tree_factor.prepare_augmented_drives` does, for the listed DOFs only.
+        :func:`.tree_factor.prepare_augmented_drives` does, for the listed DOFs only. The step's stage list runs it
+        only where such DOFs exist (``other_drive_dofs`` is not ``None``).
         """
-        if self.other_drive_dofs is None:
-            return
         solver, model = self.solver, self.solver.model
         wp.launch(
             prepare_listed_augmented_drives,
