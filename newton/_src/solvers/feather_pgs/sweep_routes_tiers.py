@@ -21,7 +21,7 @@ from functools import cache
 
 import warp as wp
 
-from ...core.execution import arch_budget, resident_blocks
+from ...core.memory import Buffer, Staging, arch_budget, resident_blocks
 from . import kernel_template
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .factor.walk import walk_paths_prelude, walk_row_prelude
@@ -31,7 +31,6 @@ from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import Lanes, TransposedResponse, WalkedRows
 from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import DEFAULT_POLICY, SolvePolicy, block_argmax
-from .staging import Buffer, Staging
 from .sweep import (
     CONTACT,
     JOINT_LIMIT,

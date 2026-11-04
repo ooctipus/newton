@@ -14,15 +14,17 @@ from functools import cache
 import numpy as np
 import warp as wp
 
+from newton._src.core import memory as toolkit
+from newton._src.core.memory import Operand, Place
 from newton._src.solvers.feather_pgs.device_preludes import (
     HELD,
     LANE_WORDS,
-    MEMORY_WORDS,
     RING,
     SHARED_STORAGE,
     cuda_native,
     dual_native,
     lane_group,
+    memory_words,
     reserve,
     reserved_count,
 )
@@ -272,11 +274,14 @@ class TestLaneGroupsOnCuda(unittest.TestCase):
                         np.testing.assert_array_equal(group_slots, group_slots[0] + np.arange(len(group_slots)))
 
 
-# The further words on one thread a probe: lane words, held arrays and memory words, on a warp or block group.
+# The further words on one thread a probe: lane words, held arrays and the memory toolkit's words (every global place
+# and an operand's own load), on a warp or block group.
 _WORDS_SOURCE = """    SHARED float scratch_value[32];
     SHARED int scratch_index[32];
+    TOUCH(values.data + tid);
+    FETCH(values.data, 64, LANE, LANES);
     const float x = LDG(values.data + tid);
-    const int key = keys.data[tid];
+    const int key = LOAD_keys(keys.data + tid);
     float total = x, top = x, best = x;
     int at = tid;
     BLOCK_SUM(scratch_value, total);
@@ -301,6 +306,7 @@ _WORDS_SOURCE = """    SHARED float scratch_value[32];
     ST(out + 4, row[0]);
     ST(out + 5, row[1]);
     ST(out + 6, READ_DOWN(x, 1));
+    STCG(out + 7, LDCG(values.data + tid));
     int* const words_out = ints.data + 4 * tid;
     words_out[0] = at;
     words_out[1] = WARP_LANE;
@@ -311,7 +317,8 @@ _WORDS_SOURCE = """    SHARED float scratch_value[32];
 
 @cache
 def _words_kernel(lanes):
-    preludes = (lane_group(lanes), LANE_WORDS, HELD, MEMORY_WORDS, SHARED_STORAGE)
+    memory = memory_words(Place.GLOBAL, Place.STREAMED, Place.PERSISTING, Operand("keys", Place.READ_ONLY))
+    preludes = (lane_group(lanes), LANE_WORDS, HELD, memory, SHARED_STORAGE)
 
     @wp.func_native(dual_native(_WORDS_SOURCE, preludes=preludes))
     def words(
@@ -363,6 +370,7 @@ class TestLaneWords(unittest.TestCase):
         np.testing.assert_array_equal(floats[:, 2], values)
         np.testing.assert_array_equal(floats[:, 3:6], np.tile([12.0, 50.0, 51.0], (len(values), 1)))
         np.testing.assert_array_equal(floats[:, 6], values)
+        np.testing.assert_array_equal(floats[:, 7], values)
         np.testing.assert_array_equal(ints[:, 0], np.arange(len(values)))
         np.testing.assert_array_equal(ints[:, 1:3], np.tile([0, 1], (len(values), 1)))
         self.assertEqual(sorted(ints[:, 3]), list(range(len(values))))
@@ -385,6 +393,7 @@ class TestLaneWords(unittest.TestCase):
                 lane = np.arange(len(values)) % width
                 down = np.where(lane + 1 < width, np.roll(values, -1), values)
                 np.testing.assert_array_equal(floats[:, 6], down)
+                np.testing.assert_array_equal(floats[:, 7], values)
                 np.testing.assert_array_equal(ints[:, 1], np.arange(len(values)) % 32)
                 segment = (np.arange(len(values)) // width) * width
                 expected = [
@@ -393,6 +402,28 @@ class TestLaneWords(unittest.TestCase):
                 np.testing.assert_array_equal(ints[:, 2].astype(np.uint32), np.array(expected, dtype=np.uint32))
                 self.assertEqual(sorted(ints[:, 3]), list(range(len(values))))
                 self.assertEqual(total, len(values))
+
+
+class TestMemoryToolkit(unittest.TestCase):
+    def test_places_declare_their_words_once(self):
+        """Each place's words once, in one order; an operand's own words name its place's."""
+        cuda, cpu = toolkit.access(Place.GLOBAL, Place.STREAMED, Place.PERSISTING, Operand("rows", Place.READ_ONLY))
+        for name in ("LDG", "LD", "ST", "ADD", "TOUCH", "FETCH", "LDCG", "STCG"):
+            self.assertEqual(cuda.count(f"const auto {name} ="), 1, name)
+            self.assertEqual(cpu.count(f"const auto {name} ="), 1, name)
+        self.assertIn("const auto LOAD_rows = LDG;", cuda)
+        self.assertNotIn("STORE_rows", cpu)
+        self.assertIn("const auto STORE_cache = STCG;", toolkit.access(Operand("cache", Place.PERSISTING))[0])
+        self.assertEqual(toolkit.access(Place.REGISTERS, Place.SHARED), ("", ""))
+        with self.assertRaisesRegex(ValueError, "global memory"):
+            Operand("stage", Place.SHARED)
+
+    def test_constant_table_is_one_text(self):
+        """A constant table: CUDA's constant memory, the CPU's constant data."""
+        self.assertEqual(
+            toolkit.table("PARENT", (-1, 0, 1)),
+            ("    static __constant__ int PARENT[3] = {-1, 0, 1};", "    static const int PARENT[3] = {-1, 0, 1};"),
+        )
 
 
 if __name__ == "__main__":

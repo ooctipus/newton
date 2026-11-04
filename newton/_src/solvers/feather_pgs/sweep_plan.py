@@ -26,7 +26,7 @@ from collections.abc import Callable
 import numpy as np
 import warp as wp
 
-from ...core.execution import arch_budget
+from ...core.memory import arch_budget
 from . import (
     field_group,
     host_index,

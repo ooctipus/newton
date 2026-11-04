@@ -10,7 +10,7 @@ They do not change the numerical method, row capacity, or iteration budget.
 from collections.abc import Callable
 from typing import NamedTuple
 
-from .staging import Staging
+from ...core.memory import Staging
 
 _MFGS_RESIDENT_METADATA_MAX_BYTES = 4096
 """Row metadata a matrix-free sweep keeps resident at most [B]: larger working sets cost more occupancy than their

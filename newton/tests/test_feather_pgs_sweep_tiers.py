@@ -17,12 +17,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from newton._src.core.memory import Buffer, Staging
 from newton._src.solvers.feather_pgs import kernel_template, sweep_routes_tiers
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.keyed_rows import get_direct_parallel_inputs
 from newton._src.solvers.feather_pgs.response_operator import Lanes, TransposedResponse, WalkedRows
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy, bound
-from newton._src.solvers.feather_pgs.staging import Buffer, Staging
 from newton._src.solvers.feather_pgs.sweep import (
     JacobiRows,
     RowLaws,

@@ -14,7 +14,7 @@ from unittest import mock
 import numpy as np
 import warp as wp
 
-from newton._src.core.execution import arch_budget
+from newton._src.core.memory import arch_budget
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS

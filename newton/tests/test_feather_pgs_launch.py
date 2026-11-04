@@ -15,8 +15,9 @@ from unittest import mock
 import numpy as np
 import warp as wp
 
-from newton._src.core import execution
-from newton._src.core.execution import CPU, Device, Queue, Use, Work, carveout, shape
+from newton._src.core import execution, memory
+from newton._src.core.execution import Queue, Use, Work, shape
+from newton._src.core.memory import CPU, Device, carveout
 from newton._src.solvers.feather_pgs import tree_kinetic_state, walk_rows
 from newton._src.solvers.feather_pgs.factor import walk as factor_walk
 
@@ -35,25 +36,25 @@ class TestDevice(unittest.TestCase):
         self.assertEqual((PRO.threads_per_sm, PRO.blocks_per_sm, PRO.shared_per_block), (1536, 24, 100_352))
         self.assertEqual((GB300.threads_per_sm, GB300.blocks_per_sm, GB300.shared_per_block), (2048, 32, 231_424))
         # A multiprocessor's shared memory is the opt-in maximum a block and the driver's reservation.
-        self.assertEqual(PRO.shared_per_sm, 101_376 + execution.RESERVED_SHARED_BYTES)
-        self.assertEqual(GB300.shared_per_sm, 232_448 + execution.RESERVED_SHARED_BYTES)
+        self.assertEqual(PRO.shared_per_sm, 101_376 + memory.RESERVED_SHARED_BYTES)
+        self.assertEqual(GB300.shared_per_sm, 232_448 + memory.RESERVED_SHARED_BYTES)
 
     def test_unknown_architecture_is_refused(self):
         with self.assertRaises(ValueError):
             Device.of(1, 10, 49_152)
 
     def test_cpu_reads_as_the_cpu(self):
-        self.assertIs(execution.device("cpu"), CPU)
+        self.assertIs(memory.device("cpu"), CPU)
         self.assertFalse(CPU.cuda)
 
     def test_budgets_by_architecture(self):
-        self.assertEqual(execution.arch_budget(0), execution.CPU_STAGING_BYTES)
-        self.assertEqual(execution.arch_budget("offline"), execution.STATIC_SHARED_BYTES)
+        self.assertEqual(memory.arch_budget(0), memory.CPU_STAGING_BYTES)
+        self.assertEqual(memory.arch_budget("offline"), memory.STATIC_SHARED_BYTES)
         self.assertEqual(execution.device_lanes(0), 1)
         self.assertEqual(execution.device_lanes("sm_120", 16), 16)
         # Offline (no device of the architecture): the smallest suite GPU's multiprocessor.
         if not any(found.arch == 12345 for found in wp.get_cuda_devices()):
-            self.assertEqual(execution.resident_blocks(1664, 12345), execution.SM_SHARED_BYTES // 2688)
+            self.assertEqual(memory.resident_blocks(1664, 12345), memory.SM_SHARED_BYTES // 2688)
 
 
 class TestShapeAgainstTodaysRules(unittest.TestCase):

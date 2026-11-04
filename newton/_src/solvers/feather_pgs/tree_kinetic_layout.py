@@ -5,7 +5,7 @@
 
 from dataclasses import dataclass
 
-from ...core.execution import STATIC_SHARED_BYTES
+from ...core.memory import STATIC_SHARED_BYTES
 from .device_preludes import dual_native, lane_group, substitute
 
 

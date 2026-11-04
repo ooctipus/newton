@@ -5,7 +5,7 @@
 
 import numpy as np
 
-from ...core.execution import static_budget
+from ...core.memory import static_budget
 from ...sim import BodyFlags, JointType
 from .tree_kinetic_layout import TreeLayout
 from .tree_plan import TreePlan

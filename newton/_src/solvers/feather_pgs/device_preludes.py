@@ -50,8 +50,9 @@ from the same text:
     block group's ``BLOCK_SUM``, ``BLOCK_MAXIMUM``, ``BLOCK_ARGMAX``), ``HELD``
     (a distributed array over the lanes: ``HELD_PICK``, ``HELD_ROW``,
     ``HELD_LOAD``), ``LANE_FEED`` (``FEED``, a held batch feeding one chain)
-    and ``MEMORY_WORDS`` (``LDG``, ``ST``, ``ADD``). Warp functions over the
-    words take their snippet from :func:`lane_word`.
+    and the memory toolkit's words of the places a body declares, ``memory_words(...)`` (:mod:`.memory`'s
+    ``LDG``, ``ST``, ``ADD``, ``TOUCH``, ``FETCH``, ...). Warp functions over the words take their snippet from
+    :func:`lane_word`.
 
 ``ORDERED_TILES``
     Ordered reservation across a launch's blocks (:mod:`newton._src.core.ordered_reserve`):
@@ -77,6 +78,8 @@ from functools import cache
 from string import Template
 
 import warp as wp
+
+from ...core import memory
 
 # The ordered mode of the L0 reservation, shared with the collision pipeline's writers.
 from ...core.ordered_reserve import (  # noqa: F401
@@ -368,43 +371,12 @@ _LANE_FEED = """    // FEED(first, last, step, ahead, build, chain): a lane grou
         }
     };"""
 
-_HELD = """    // HELD: a distributed array over the group's lanes, item x on lane x % WIDTH in word x / WIDTH of the lane's
-    // array (ceil(n / WIDTH) words for n items; on the CPU the one lane holds every item). x is the same on every lane:
-    // HELD_PICK(v, x) returns item x of the held array v, HELD_ROW(v, x, out) writes item x's row of a held array of
-    // rows (v[word][m]) into out, and HELD_LOAD(v, n, load) calls load(word, x, x < n) for each word of the lane's
-    // array v and its item x, so the load fills each word (zeros past the n items).
-    const auto HELD_PICK = [&](const auto& v, const int x) {
-        constexpr int words = sizeof(v) / sizeof(v[0]);
-        auto t = v[0];
-        #pragma unroll
-        for (int k = 1; k < words; ++k)
-            if (x >= k * WIDTH) t = v[k];
-        return READ(t, x);
-    };
-    const auto HELD_ROW = [&](const auto& v, const int x, auto* out) {
-        constexpr int words = sizeof(v) / sizeof(v[0]), row = sizeof(v[0]) / sizeof(v[0][0]);
-        #pragma unroll
-        for (int m = 0; m < row; ++m) {
-            auto t = v[0][m];
-            #pragma unroll
-            for (int k = 1; k < words; ++k)
-                if (x >= k * WIDTH) t = v[k][m];
-            out[m] = READ(t, x);
-        }
-    };
-    const auto HELD_LOAD = [&](const auto& v, const int n, auto load) {
-        constexpr int words = sizeof(v) / sizeof(v[0]);
-        const int lane = LANE & (WIDTH - 1);
-        #pragma unroll
-        for (int k = 0; k < words; ++k) load(k, lane + k * WIDTH, lane + k * WIDTH < n);
-    };"""
-
-HELD = DevicePrelude("held", _HELD, _HELD)
+HELD = DevicePrelude("held", memory.HELD, memory.HELD)
 """``HELD_PICK(v, x)``, ``HELD_ROW(v, x, out)`` and ``HELD_LOAD(v, n, load)``: a distributed array over a lane group,
 item ``x`` on lane ``x % WIDTH`` in the lane's word ``x / WIDTH``, read on every lane by shuffle from the lane that
 holds it; on the CPU the one lane holds every item. After a lane-group prelude; :data:`LANE_FEED` carries it."""
 
-LANE_FEED = DevicePrelude("lane_feed", _HELD + "\n" + _LANE_FEED, _HELD + "\n" + _LANE_FEED)
+LANE_FEED = DevicePrelude("lane_feed", memory.HELD + "\n" + _LANE_FEED, memory.HELD + "\n" + _LANE_FEED)
 """``FEED(first, last, step, ahead, build, chain)``, a lane group feeding one serial chain (the walk's refresh leaves
 to root, its walk down root to leaves): its records' loads leave the chain, each lane builds one record of a batch, and
 every lane runs the chain on the batch's records in order, read from the batch held over the lanes. It carries
@@ -472,25 +444,13 @@ reductions ``BLOCK_SUM``, ``BLOCK_MAXIMUM`` and ``BLOCK_ARGMAX`` (each warp's, t
 the lane group's, as :data:`STATUS_CLOCK`'s. After a lane-group prelude."""
 
 
-MEMORY_WORDS = DevicePrelude(
-    "memory_words",
-    """    const auto LDG = [](const auto* p) { return __ldg(p); };
-    const auto ST = [](auto* p, const auto v) {
-        __builtin_assume(__isGlobal(p));
-        *p = v;
-    };
-    const auto ADD = [](auto& word, auto n) { return atomicAdd(&word, n); };""",
-    """    const auto LDG = [](const auto* p) { return *p; };
-    const auto ST = [](auto* p, const auto v) { *p = v; };
-    const auto ADD = [](auto& word, auto n) {
-        const auto old = word;
-        word += n;
-        return old;
-    };""",
-)
-"""``LDG(p)``, a read-only load through the non-coherent path, ``ST(p, v)``, a store to global memory (no generic
-store), and ``ADD(word, n)``, an add to a word that any thread may write at once (CUDA's ``atomicAdd``; the CPU's one
-thread adds), returning the word before. The CPU's are plain loads, stores and adds."""
+@cache
+def memory_words(*declared: memory.Place | memory.Operand) -> DevicePrelude:
+    """The memory toolkit's words of the places and operands a body declares (:func:`.memory.access`): ``LDG`` read
+    only, ``LD``/``ST``/``ADD`` global, ``LDG``/``TOUCH``/``FETCH`` streamed, ``LDCG``/``STCG`` persisting, and each
+    operand's ``LOAD_<name>`` (and ``STORE_<name>``). The CPU's are plain loads and stores, no hint."""
+    cuda, cpu = memory.access(*declared)
+    return DevicePrelude("memory_" + "_".join(d.name for d in declared), cuda, cpu)
 
 
 STATUS_CLOCK = DevicePrelude(
@@ -505,9 +465,8 @@ STATUS_CLOCK = DevicePrelude(
 group's: a body that declares words it does not call can still schedule differently."""
 
 
-SHARED_STORAGE = DevicePrelude("shared_storage", "    #define SHARED __shared__", "    #define SHARED")
-"""``SHARED``, the storage of a block's working set (:meth:`.staging.Staging.declarations`): CUDA's shared memory, or
-the stack of the CPU's one thread, which runs the block's lane groups."""
+SHARED_STORAGE = DevicePrelude("shared_storage", *memory.SHARED_STORAGE)
+"""``SHARED``, the shared stage's storage (:data:`.memory.SHARED_STORAGE`)."""
 
 
 CPU_MATH = DevicePrelude(

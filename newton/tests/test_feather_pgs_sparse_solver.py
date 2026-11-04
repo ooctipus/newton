@@ -10,7 +10,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.core.execution import arch_budget
+from newton._src.core.memory import arch_budget
 from newton._src.solvers.feather_pgs import sweep_routes_sparse
 from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,

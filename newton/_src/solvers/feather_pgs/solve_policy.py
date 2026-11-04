@@ -43,11 +43,11 @@ from dataclasses import dataclass, fields
 import numpy as np
 import warp as wp
 
+from ...core.memory import Buffer
 from . import field_group
 from .device_preludes import DevicePrelude
 from .field_group import Field, FieldGroup, SolverArrays
 from .row_inputs import RowArgument
-from .staging import Buffer
 
 SOLVE_READOUTS = ("off", "sweeps", "trace")
 """Accepted readouts: no counter, executed sweeps, or executed sweeps with the exit-law trace."""

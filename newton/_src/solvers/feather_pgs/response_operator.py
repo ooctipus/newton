@@ -23,9 +23,9 @@ never extracted from another owner's source. No runtime method is selected here.
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from ...core.memory import Buffer
 from .factor.walk import WALK_COORDINATE, WALK_LINK, WALK_UNPACKED, walk_paths_prelude, walk_row_prelude
 from .solve_policy import Change, bound, terms_bound
-from .staging import Buffer
 
 Vector = Callable[[str], str]
 """A vector operand: the native expression of its element at an index expression."""

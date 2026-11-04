@@ -34,7 +34,7 @@ from functools import cache
 
 import warp as wp
 
-from ...core.execution import arch_budget, resident_blocks
+from ...core.memory import Buffer, Staging, arch_budget, resident_blocks
 from . import kernel_template
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .kernel_template import KernelTemplate
@@ -45,7 +45,6 @@ from .row_inputs import RowArgument
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport
-from .staging import Buffer, Staging
 from .sweep import (
     CONTACT,
     FRICTION,

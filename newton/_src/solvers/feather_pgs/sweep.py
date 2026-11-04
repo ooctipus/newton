@@ -41,6 +41,7 @@ from typing import ClassVar
 
 import warp as wp
 
+from ...core.memory import Buffer
 from .response_operator import Lanes, ResponseOperator
 from .row_inputs import RowArgument
 from .row_kernels import (
@@ -53,7 +54,6 @@ from .row_kernels import (
 )
 from .row_metadata import _DENSE_META_ROW_TYPE_BITS, _DENSE_META_ROW_TYPE_MASK, _mf_parent_expression
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound, sweep_exit, terms_bound, vote
-from .staging import Buffer
 
 CONTACT = int(PGS_CONSTRAINT_TYPE_CONTACT)
 FRICTION = int(PGS_CONSTRAINT_TYPE_FRICTION)

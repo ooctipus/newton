@@ -19,7 +19,7 @@ from functools import cache
 
 import warp as wp
 
-from ...core.execution import arch_budget
+from ...core.memory import Buffer, Staging, arch_budget
 from . import kernel_template
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .factor.walk import WalkTrees
@@ -29,7 +29,6 @@ from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import Lanes, SparsePairZ
 from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound
-from .staging import Buffer, Staging
 from .sweep import (
     CONTACT,
     FRICTION,

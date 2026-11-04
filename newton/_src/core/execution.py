@@ -6,9 +6,9 @@
 A launch covers *items* (worlds, trees, units, contacts) with a lane group of one or more threads an item. What
 differs between launches is the work, not the arithmetic that sizes them, so the layer keeps that arithmetic once:
 
-- :class:`Device` is what the layer reads of a device, once (:func:`device`): its multiprocessors, its occupancy
-  limits (threads, blocks and registers a multiprocessor), its static shared-memory budget a block and the driver's
-  shared-memory carveout steps. The CPU is :data:`CPU`: one thread runs a lane group, and it is never tuned;
+- :class:`~.memory.Device` is what the layer reads of a device, once (:func:`~.memory.device`, the memory
+  toolkit's): its multiprocessors, its occupancy limits, its shared memory and carveout steps. The CPU is
+  :data:`~.memory.CPU`: one thread runs a lane group, and it is never tuned;
 - :class:`Work` is what a kernel declares: its items (a host count or a device :class:`Queue`), how an item's lanes
   share its work (:class:`Use`), its width, its register line, its shared memory and whether its grid strides;
 - :func:`shape` turns a work and a device into a :class:`Shape`: lanes an item, block, resident blocks a
@@ -23,219 +23,30 @@ The one rule (``SP/core/FL/HANDOFF_ZEX.md`` §3.2):
 - resident blocks are the fewest the block limit, the threads, the register line and the shared memory allow; a
   declared line is the launch bound ``(block, those blocks)``;
 - the grid covers the items, at most ``waves`` waves of resident blocks when the kernel strides over them;
-- the carveout is the driver's smallest step that holds the blocks the thread and block limits allow (H8).
-
-The shared-memory facts that kernel factories read by architecture (:func:`static_budget`, :func:`arch_budget`,
-:func:`resident_blocks`) live here too: offline (no device of the architecture at hand, as in an offline SASS build)
-they fall back to the offline compiler's budget and the smallest suite GPU's multiprocessor.
+- the carveout is the driver's smallest step that holds the blocks the thread and block limits allow (H8,
+  :func:`~.memory.carveout`).
 """
 
 from __future__ import annotations
 
 import dataclasses
 import enum
-import functools
 
 import warp as wp
 
+from .memory import REGISTERS_PER_THREAD, Device, carveout, granules
+
 __all__ = [
-    "CPU",
-    "CPU_STAGING_BYTES",
-    "RESERVED_SHARED_BYTES",
-    "SHARED_ALLOCATION_BYTES",
-    "SM_SHARED_BYTES",
-    "STATIC_SHARED_BUDGETS",
-    "STATIC_SHARED_BYTES",
-    "Device",
     "Order",
     "Queue",
     "Shape",
     "Use",
     "Work",
-    "arch_budget",
-    "carveout",
-    "device",
     "device_lanes",
     "fill_lanes",
     "launch",
-    "resident_blocks",
     "shape",
-    "static_budget",
 ]
-
-# ---------------------------------------------------------------------------------------------------------------------
-# Device facts
-# ---------------------------------------------------------------------------------------------------------------------
-
-STATIC_SHARED_BYTES = 48 * 1024
-"""Static shared memory a block may declare in an offline build [B]: ptxas 13.2 rejects more on every architecture
-(0xc000)."""
-
-CPU_STAGING_BYTES = 4 * 1024 * 1024
-"""The working set a CPU block may declare [B]: the CPU's one thread runs the block and keeps it on its stack (an
-automatic array), so no shared-memory budget applies; this bound keeps a block well inside a thread's stack."""
-
-RESERVED_SHARED_BYTES = 1024
-"""Shared memory the driver reserves in every block [B] (sm_80 and later), out of the opt-in maximum per block."""
-
-STATIC_SHARED_BUDGETS: dict[int, int] = {}
-"""Static shared memory budgets [B] by architecture (``Device.arch``) that a probe measured below the opt-in
-maximum less the driver's reservation; :func:`static_budget` reads them first. None is recorded: the RTX PRO 6000
-(sm_120, opt-in 101,376 B) loads a kernel declaring 100,352 B and refuses one declaring 101,376 B, the GB300 (sm_103)
-loads 231,424 B and refuses 232,448 B (measured 2026-10-27)."""
-
-SM_SHARED_BYTES = 100 * 1024
-"""Shared memory one SM gives its resident blocks [B] when no device of the architecture is at hand (an offline
-build, the CPU): the RTX PRO 6000's (sm_120), the smallest of the suite's GPUs."""
-
-SHARED_ALLOCATION_BYTES = 128
-"""Granule in which an SM allocates a block's shared memory [B] (``cuda_occupancy.h``, sm_80 and later)."""
-
-REGISTERS_PER_THREAD = 255
-"""The most registers a thread holds (every architecture since sm_35): the budget of a kernel without a bound."""
-
-_CARVEOUTS_128 = (0, 8, 16, 32, 64, 100)
-_CARVEOUTS_192 = (0, 8, 16, 32, 64, 100, 132, 164)
-_CARVEOUTS_256 = (0, 8, 16, 32, 64, 100, 132, 164, 196, 228)
-
-_ARCHITECTURES: dict[int, tuple[int, int, tuple[int, ...], int]] = {
-    75: (1024, 16, (0, 32, 64), 96),
-    80: (2048, 32, _CARVEOUTS_192, 192),
-    86: (1536, 16, _CARVEOUTS_128, 128),
-    87: (2048, 16, _CARVEOUTS_192, 192),
-    89: (1536, 24, _CARVEOUTS_128, 128),
-    90: (2048, 32, _CARVEOUTS_256, 256),
-    100: (2048, 32, _CARVEOUTS_256, 256),
-    103: (2048, 32, _CARVEOUTS_256, 256),
-    120: (1536, 24, _CARVEOUTS_128, 128),
-    121: (1536, 24, _CARVEOUTS_128, 128),
-}
-"""A multiprocessor's occupancy limits by architecture (CUDA's occupancy tables): resident threads, resident blocks,
-the driver's shared-memory carveout steps [KiB] and the unified L1/shared memory they divide [KiB]. Warp reports
-neither; every architecture keeps 65,536 registers a multiprocessor."""
-
-
-@dataclasses.dataclass(frozen=True)
-class Device:
-    """What the layer reads of a device, once (:func:`device`).
-
-    Args:
-        arch: The CUDA architecture (``120`` for sm_120), 0 for the CPU.
-        sms: Multiprocessors.
-        threads_per_sm: Threads a multiprocessor keeps resident.
-        blocks_per_sm: Blocks a multiprocessor keeps resident.
-        shared_per_block: Static shared memory a block may declare [B] (:func:`static_budget`).
-        carveouts_kb: The driver's shared-memory carveout steps [KiB], ascending; the last is a multiprocessor's
-            shared memory.
-        unified_kb: The unified L1 and shared memory a multiprocessor divides between them [KiB].
-        registers_per_sm: Registers a multiprocessor holds.
-    """
-
-    arch: int
-    sms: int
-    threads_per_sm: int
-    blocks_per_sm: int
-    shared_per_block: int = STATIC_SHARED_BYTES
-    carveouts_kb: tuple[int, ...] = (0,)
-    unified_kb: int = 0
-    registers_per_sm: int = 65536
-
-    @property
-    def cuda(self) -> bool:
-        """Whether the device is a GPU (the CPU runs a lane group on one thread)."""
-        return self.arch > 0
-
-    @property
-    def shared_per_sm(self) -> int:
-        """Shared memory a multiprocessor gives its resident blocks [B]: the largest carveout."""
-        return self.carveouts_kb[-1] * 1024
-
-    @classmethod
-    def of(cls, arch: int, sms: int, opt_in_shared: int) -> Device:
-        """The device of a CUDA architecture with ``sms`` multiprocessors and an opt-in maximum of ``opt_in_shared``
-        bytes of shared memory a block (Warp's ``max_shared_memory_per_block``), the rest from the architecture's
-        occupancy table."""
-        if arch not in _ARCHITECTURES:
-            raise ValueError(f"no occupancy table for sm_{arch}: add the architecture to execution._ARCHITECTURES")
-        threads, blocks, carveouts, unified = _ARCHITECTURES[arch]
-        budget = STATIC_SHARED_BUDGETS.get(arch, int(opt_in_shared) - RESERVED_SHARED_BYTES)
-        return cls(arch, int(sms), threads, blocks, budget, carveouts, unified)
-
-
-CPU = Device(0, 1, 1, 1, CPU_STAGING_BYTES)
-"""The CPU: one thread runs a lane group and a block, never timed or tuned."""
-
-
-@functools.cache
-def _read(alias: str) -> Device:
-    found = wp.get_device(alias)
-    if not found.is_cuda:
-        return CPU
-    return Device.of(int(found.arch), int(found.sm_count), int(found.max_shared_memory_per_block))
-
-
-def device(identifier=None) -> Device:
-    """The :class:`Device` of a Warp device (by default the current one), read once."""
-    return _read(wp.get_device(identifier).alias)
-
-
-def _architecture(device_arch) -> int:
-    """The architecture number of a kernel factory's ``device_arch`` (a number or an offline ``"sm_XX"``), or -1 for
-    one that names none (an offline build without an architecture)."""
-    try:
-        return int(str(device_arch).removeprefix("sm_"))
-    except (TypeError, ValueError):
-        return -1
-
-
-def _of_architecture(arch: int) -> Device | None:
-    """The first CUDA device of the architecture at hand, or ``None`` (an offline build, the CPU)."""
-    for found in wp.get_cuda_devices() if arch > 0 else ():
-        if found.arch == arch:
-            return device(found)
-    return None
-
-
-def static_budget(arch: int) -> int:
-    """Static shared memory a block of a kernel built for the CUDA architecture ``arch`` may declare [B].
-
-    The one place a device's static budget is read: a probe's measured budget of the architecture
-    (:data:`STATIC_SHARED_BUDGETS`), else the opt-in maximum per block that Warp reports for a CUDA device of the
-    architecture less the driver's reservation (:attr:`Device.shared_per_block`), else, with no such device (an
-    offline build, the CPU), :data:`STATIC_SHARED_BYTES`.
-    """
-    if arch in STATIC_SHARED_BUDGETS:
-        return int(STATIC_SHARED_BUDGETS[arch])
-    found = _of_architecture(arch)
-    return found.shared_per_block if found is not None else STATIC_SHARED_BYTES
-
-
-def arch_budget(device_arch) -> int:
-    """The working set a block of a kernel factory's ``device_arch`` may declare [B]: :func:`static_budget` of a CUDA
-    architecture number, :data:`CPU_STAGING_BYTES` for the CPU (architecture 0) and :data:`STATIC_SHARED_BYTES` for an
-    offline build that names none."""
-    arch = _architecture(device_arch)
-    if arch < 0:
-        return STATIC_SHARED_BYTES
-    return static_budget(arch) if arch > 0 else CPU_STAGING_BYTES
-
-
-def _granules(block_bytes: int) -> int:
-    """Shared memory a block takes of its multiprocessor [B]: its bytes and the driver's reservation, in granules."""
-    granules = -(-(int(block_bytes) + RESERVED_SHARED_BYTES) // SHARED_ALLOCATION_BYTES)
-    return granules * SHARED_ALLOCATION_BYTES
-
-
-def resident_blocks(block_bytes: int, device_arch=None) -> int:
-    """Blocks of ``block_bytes`` static shared memory each that one SM of ``device_arch`` keeps resident.
-
-    A block takes its bytes and the driver's reservation, in 128-byte granules, out of the SM's shared memory
-    (:attr:`Device.shared_per_sm` of a CUDA device of the architecture), else :data:`SM_SHARED_BYTES`.
-    """
-    found = _of_architecture(max(_architecture(device_arch), 0))
-    sm_bytes = found.shared_per_sm if found is not None else SM_SHARED_BYTES
-    return sm_bytes // _granules(block_bytes)
-
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Lanes of today's launch sites (until they declare their work)
@@ -337,7 +148,7 @@ class Work:
         lanes: A measured fixed lane count, in place of the rule.
         block: Threads a block (by default 256, or the lanes of a block group).
         registers: The register line a lane, which sets the launch bound (``None``: unbounded).
-        shared: Static shared memory a block [B] (a :class:`.staging.Staging`'s bytes).
+        shared: Static shared memory a block [B] (a :class:`~.memory.Staging`'s bytes).
         persistent: The kernel strides over its items, so its grid is capped at ``waves`` waves of resident blocks.
         waves: Waves of resident blocks of a persistent grid.
         grid_per_sm: A measured persistent grid in blocks a multiprocessor, in place of ``waves``.
@@ -417,21 +228,8 @@ def _resident(device: Device, block: int, registers: int | None, shared: int) ->
     if registers:
         limit = min(limit, device.registers_per_sm // (registers * block))
     if shared:
-        limit = min(limit, device.shared_per_sm // _granules(shared))
+        limit = min(limit, device.shared_per_sm // granules(shared))
     return max(limit, 1)
-
-
-def carveout(device: Device, block: int, shared: int) -> int:
-    """The driver's carveout step [KiB] for blocks of ``block`` threads and ``shared`` bytes: the smallest step that
-    holds the blocks the thread and block limits allow (H8: the PRO keeps 64 KiB for 32-thread blocks of 1,664 B,
-    takes 100 KiB at 2,200 B); 0 on the CPU."""
-    if not device.cuda:
-        return 0
-    need = min(device.blocks_per_sm, device.threads_per_sm // block) * _granules(shared)
-    for step in device.carveouts_kb:
-        if step * 1024 >= need:
-            return step
-    return device.carveouts_kb[-1]
 
 
 def _lanes(work: Work, device: Device, resident_threads: int) -> int:

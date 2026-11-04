@@ -22,7 +22,7 @@ from functools import cache
 
 import warp as wp
 
-from ...core.execution import arch_budget, resident_blocks
+from ...core.memory import Buffer, Staging, arch_budget, resident_blocks
 from . import field_group, kernel_template
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .factor.walk import WalkTrees
@@ -37,7 +37,6 @@ from .row_kernels import PGS_CONSTRAINT_TYPE_SPEED
 from .row_metadata import _mf_parent_expression
 from .row_records import MfRows
 from .solve_policy import DEFAULT_POLICY, SolvePolicy
-from .staging import Buffer, Staging
 from .sweep import (
     CONTACT,
     FRICTION,
