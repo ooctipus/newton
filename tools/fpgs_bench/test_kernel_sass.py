@@ -170,18 +170,15 @@ class TestKernelSass(unittest.TestCase):
 
     def test_walk_kernels_compile_at_their_launch_blocks(self):
         """Compile the walk family's predictor halves at their layout's block, its solve and refresh at the owner's."""
-        from newton._src.solvers.feather_pgs import tree_kinetic_owner  # noqa: PLC0415
-        from newton._src.solvers.feather_pgs.factor import walk as factor_walk  # noqa: PLC0415
-
         blocks = sass.launch_blocks(("walk",))
         for name, _, args, kwargs in sass.identity.walk_calls():
             block = blocks.get(sass.identity.label(name, args, kwargs))
             if name.endswith(("get_force_kernel", "get_predictor_kernel")):
                 self.assertEqual(block, kwargs["layout"].value.block)
             elif name.endswith("get_walk_solve_kernel"):
-                self.assertEqual(block, tree_kinetic_owner.WALK_SOLVE_THREADS)
+                self.assertEqual(block, 32)
             elif name.endswith("walk_step_kernel"):
-                self.assertEqual(block, factor_walk.WALK_BLOCK)
+                self.assertEqual(block, 64)
             else:
                 self.assertIsNone(block)
 

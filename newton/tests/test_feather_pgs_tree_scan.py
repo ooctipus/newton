@@ -447,7 +447,7 @@ class TestHeldTreeChains(unittest.TestCase):
                 self.assertLessEqual(plan_of(shape).count, 32)
                 model = _held_tree_model(shape, 8, device)
                 with (
-                    unittest.mock.patch.object(tree_kinetic_state, "held_lanes", lambda tree, groups, *, cuda: 64),
+                    unittest.mock.patch.object(tree_kinetic_state, "held_lanes", lambda tree, groups, device: 64),
                     unittest.mock.patch.object(
                         tree_kinetic_state, "held_schedules", lambda tree, lanes, *, chains: on_chains
                     ),

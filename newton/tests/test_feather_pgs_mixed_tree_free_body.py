@@ -10,6 +10,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.core import memory
 from newton._src.solvers.feather_pgs import tree_kinetic_state
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
@@ -635,7 +636,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                 for group in owner.groups:
                     self.assertEqual(
                         group.layout.lanes,
-                        tree_kinetic_state.held_lanes(group.tree, group.group_count, cuda=True),
+                        tree_kinetic_state.held_lanes(group.tree, group.group_count, memory.device(model.device)),
                     )
                     self.assertEqual(group.launch_count * group.layout.pack, group.group_count)
                 self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())

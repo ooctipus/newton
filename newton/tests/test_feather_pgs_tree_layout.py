@@ -13,6 +13,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.core import memory
 from newton._src.solvers.feather_pgs import tree_kinetic_plan, tree_kinetic_state
 from newton._src.solvers.feather_pgs import tree_scan as ts
 from newton._src.solvers.feather_pgs.factor.walk import RELEASE_SLIPS
@@ -70,7 +71,7 @@ class TestLargeTrees(unittest.TestCase):
 
     def test_a_tree_past_the_lanes_takes_the_depth_levels(self):
         """Hold a tree of more bodies than a block's lanes: 64 lanes, and the depth-level scans on CUDA."""
-        lanes = tree_kinetic_state.held_lanes(_LONG_CHAIN, 3)
+        lanes = tree_kinetic_state.held_lanes(_LONG_CHAIN, 3, memory.Device.of(120, 188, 101_376))
         self.assertEqual(lanes, 64)
         schedules = tree_kinetic_state.held_schedules(_LONG_CHAIN, lanes, chains=True)
         self.assertEqual(set(dataclasses.asdict(schedules).values()), {ts.Schedule.LEVEL})

@@ -331,8 +331,8 @@ def launch_blocks(families):
 
     A held-tree classification launches :func:`classify_block` threads per
     block; every other held-tree kernel launches ``TreeLayout.block``, as do the
-    walk family's predictor halves (:func:`.kernel_identity.walk_calls`); its walk solve launches
-    ``WALK_SOLVE_THREADS`` and its refresh ``WALK_BLOCK``. In the
+    walk family's predictor halves (:func:`.kernel_identity.walk_calls`); its walk solve and its refresh launch at
+    their declared work's block (``walk_solve_work``, ``walk_work``). In the
     pins family, the scalar-branch repair launches at
     :func:`scalar_branch_blocks`'s block.
     """
@@ -353,9 +353,9 @@ def launch_blocks(families):
             if name.endswith((".get_force_kernel", ".get_predictor_kernel")):
                 blocks[key] = identity._value(kwargs["layout"]).block
             elif name.endswith(".get_walk_solve_kernel"):
-                blocks[key] = tree_kinetic_owner.WALK_SOLVE_THREADS
+                blocks[key] = tree_kinetic_owner.walk_solve_work(1).block
             elif name.endswith(".walk_step_kernel"):
-                blocks[key] = factor_walk.WALK_BLOCK
+                blocks[key] = factor_walk.walk_work(1, 1, 0).block
     if "pins" in families:
         blocks.update(scalar_branch_blocks())
     return blocks

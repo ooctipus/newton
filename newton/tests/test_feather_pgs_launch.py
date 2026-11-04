@@ -61,21 +61,32 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
     """ZEX §3.2's table, each row on both devices."""
 
     def test_walk_group_is_a_feed_at_its_line(self):
+        # The walk's group as it was written before it declared its work (ZR's rule): the largest power of two keeping
+        # the trees in one wave of 512 threads an SM, within the tree and a warp, never fewer lanes than its joins.
+        def walk_group(bodies, joins, trees, sms):
+            fit, lanes = max(sms * 512 // max(trees, 1), 1), 1
+            while lanes * 2 <= fit and lanes < min(bodies, 32):
+                lanes *= 2
+            while lanes < joins:
+                lanes *= 2
+            return lanes
+
         for device in (PRO, GB300):
             for trees in (1024, 4096, 16384, 65536):
                 for bodies, joins in ((30, 2), (13, 1), (106, 1), (2, 1), (8, 4)):
                     with self.subTest(arch=device.arch, trees=trees, bodies=bodies, joins=joins):
-                        old = factor_walk.walk_group(bodies, joins, trees, device.sms)
-                        least = 1 << max(joins - 1, 0).bit_length()
-                        work = Work(trees, Use.FEED, width=bodies, least=least, registers=128)
-                        self.assertEqual(shape(work, device).lanes, old)
+                        got = shape(factor_walk.walk_work(trees, bodies, joins), device)
+                        self.assertEqual((got.lanes, got.block), (walk_group(bodies, joins, trees, device.sms), 64))
 
     def test_held_lanes_are_a_scan(self):
         for device in (PRO, GB300):
-            for bodies in (1, 3, 8, 13, 20, 30):
+            for bodies, groups, lanes in ((1, 16384, 8), (3, 16384, 8), (13, 16384, 16), (30, 16384, 32), (40, 3, 64)):
                 with self.subTest(arch=device.arch, bodies=bodies):
-                    old = tree_kinetic_state.held_lanes(types.SimpleNamespace(count=bodies), 16384)
-                    self.assertEqual(shape(Work(16384, Use.SCAN, width=bodies, least=8), device).lanes, old)
+                    tree = types.SimpleNamespace(count=bodies)
+                    self.assertEqual(tree_kinetic_state.held_lanes(tree, groups, device), lanes)
+            # Whole 32-thread blocks: three one-body trees take a warp each.
+            self.assertEqual(tree_kinetic_state.held_lanes(types.SimpleNamespace(count=1), 3, device), 32)
+        self.assertEqual(tree_kinetic_state.held_lanes(types.SimpleNamespace(count=1), 3, CPU), 32)
 
     def test_support_walkers_are_two_waves_of_their_line(self):
         for device in (PRO, GB300):

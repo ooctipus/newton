@@ -9,6 +9,8 @@ import math
 import numpy as np
 import warp as wp
 
+from ...core import execution, memory
+from ...core.execution import Work
 from ...sim import ModelFlags
 from . import cached_state_binding, capture_joins, field_group
 from . import tree_scan as ts
@@ -93,9 +95,10 @@ _CLASSIFY_BLOCK_DIM = 64
 _CLASSIFIED_GRIDS = 2
 
 
-WALK_SOLVE_THREADS = 32
-"""Threads a block of the walk's solve, a thread a tree root (WALK_MAPPING E5): one warp, so g1's 16,384 trees spread
-over every SM (512 blocks)."""
+def walk_solve_work(roots: int) -> Work:
+    """The walk's solve (:func:`.tree_kinetic_state.get_walk_solve_kernel`): a thread a tree root in blocks of one warp
+    (WALK_MAPPING E5), so g1's 16,384 trees spread over every SM (512 blocks)."""
+    return Work(roots, lanes=1, block=32)
 
 
 class TreeKineticState:
@@ -236,7 +239,7 @@ class TreeKineticState:
         # The launch: lanes per tree and the scans' schedules, from the tree's data (forests keep their trees in
         # lane groups: no chain schedules).
         self.chains = bool(chains) and not self.layout.forest
-        lanes = native.held_lanes(tree, self.group_count, cuda=device.is_cuda)
+        lanes = native.held_lanes(tree, self.group_count, memory.device(device))
         self.layout = dataclasses.replace(self.layout, lanes=lanes)
         self.schedules = native.held_schedules(tree, lanes, chains=self.chains)
         if self.group_count % self.layout.pack:
@@ -321,6 +324,9 @@ class TreeKineticState:
         # arrays, so a read would fault rather than compare stale words.
         self._no_bank = native.StateBank()
         self._repair_grid = listed_repair_blocks(device)
+        self._walk_solve = execution.shape(
+            walk_solve_work(self.group_count * len(self.layout.roots)), memory.device(device)
+        )
         # Blocks a repair launch must exceed to be classified.
         self._classify_above = _CLASSIFIED_GRIDS * self._repair_grid
         self.data.current_valid.zero_()
@@ -770,12 +776,11 @@ class TreeKineticState:
         wp.launch_tiled(
             self.force_kernel, dim=[self.launch_count], inputs=inputs, block_dim=self.block_dim, device=device
         )
-        roots = len(self.layout.roots)
         wp.launch(
             self.walk_solve_kernel,
-            dim=self.group_count * roots,
+            dim=self.group_count * len(self.layout.roots),
             inputs=[self.group_count, self.sparse.plan, self.plan, walk, self.trial],
-            block_dim=WALK_SOLVE_THREADS,
+            block_dim=self._walk_solve.block,
             device=device,
         )
         wp.launch_tiled(

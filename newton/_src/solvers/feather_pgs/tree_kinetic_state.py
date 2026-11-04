@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import warp as wp
 
+from ...core.execution import Device, Use, Work, shape
 from ...sim import BodyFlags, JointType
 from . import (
     cached_force,
@@ -403,23 +404,20 @@ class HeldSchedules:
         return "_" + "_".join(s.value for s in (self.pose, self.motion, self.reduce))
 
 
-def held_lanes(tree: TreePlan, groups: int, *, cuda: bool = True) -> int:
-    """Threads per tree of a held group of ``groups`` trees shaped like ``tree``, from the tree's data.
+def held_lanes(tree: TreePlan, groups: int, device: Device) -> int:
+    """Threads per tree of a held group of ``groups`` trees shaped like ``tree`` on ``device``, from the tree's data.
 
-    A tree of more than 32 bodies takes two warps. Any other takes the narrowest power of two of at least 8 lanes
-    covering its bodies, widened until the group fills whole 32-thread blocks. Measured on the RTX PRO 6000 (finish,
-    predict and repair of 4096 trees at each lane width, and the construction-time timings the replaced lane choice
-    recorded in the gate's tasks): this width ran within 3% of the fastest width of every tree of up to 32 bodies.
-    The coordinates do not set it: the 13-body, 21-coordinate Franka forest runs 27% slower at 32 lanes than at 16,
-    a one-body tree 8% slower at 4 lanes than at 8. On the CPU (``cuda`` false) each tree takes a block of its own:
-    one thread runs it serially.
+    The group's scans shorten with its lanes (a scan's work: as many lanes as bodies, from 8, two warps past 32
+    bodies), widened until the group fills whole 32-thread blocks. Measured on the RTX PRO 6000 (finish, predict and
+    repair of 4096 trees at each lane width, and the construction-time timings the replaced lane choice recorded in
+    the gate's tasks): this width ran within 3% of the fastest width of every tree of up to 32 bodies. The
+    coordinates do not set it: the 13-body, 21-coordinate Franka forest runs 27% slower at 32 lanes than at 16, a
+    one-body tree 8% slower at 4 lanes than at 8. On the CPU each tree takes a block of its own (32 lanes, two warps
+    past 32 bodies): one thread runs it serially.
     """
-    bodies = tree.count
-    if bodies > 32:
-        return 64
-    if not cuda:
-        return 32
-    lanes = max(8, 1 << (bodies - 1).bit_length())
+    if not device.cuda:
+        return 64 if tree.count > 32 else 32
+    lanes = shape(Work(groups, Use.SCAN, width=tree.count, least=8, most=64), device).lanes
     while lanes < 32 and groups % (32 // lanes):
         lanes *= 2
     return lanes

@@ -20,6 +20,7 @@ from string import Template
 import numpy as np
 import warp as wp
 
+from ....core.execution import Use, Work
 from ....sim import JointType
 from .. import tree_scan as ts
 from ..device_preludes import DevicePrelude, substitute
@@ -27,18 +28,19 @@ from ..tree_scan import WALK_AHEAD, WALK_BOTH, WALK_TOUCH, WALK_UNROLL, WalkClas
 
 __all__ = [
     "FREE_BODY_WALK",
-    "LEAVE_LANES",
     "WALK_COORDINATE",
     "WALK_FRAME",
     "WALK_LINK",
     "WALK_NOW",
     "WALK_PIVOT",
     "WALK_UNPACKED",
+    "leave_work",
     "walk_down_prelude",
     "walk_leave_kernel",
     "walk_paths_prelude",
     "walk_prelude",
     "walk_row_prelude",
+    "walk_work",
 ]
 
 
@@ -1083,10 +1085,12 @@ def walk_down_prelude(
     return DevicePrelude(f"walk_down_{tag}", texts[True], cpu=texts[False])
 
 
-LEAVE_LANES = 4
-"""Lanes of a tree's group in the step's leave (:func:`walk_leave_kernel`) on CUDA: they fetch the tree's changes and
-velocities into L1 in one parallel trip and one of them walks, its records and links asked of L1 :data:`WALK_TOUCH`
-items ahead (WALK_MAPPING §4, B5: 4 lanes ran at or under 8 on g1, franka and allegro)."""
+def leave_work(trees: int) -> Work:
+    """The step's leave (:func:`walk_leave_kernel`): a lane group a tree, of a measured 4 lanes on CUDA. They fetch the
+    tree's changes and velocities into L1 in one parallel trip and one of them walks, its records and links asked of
+    L1 :data:`WALK_TOUCH` items ahead (WALK_MAPPING §4, B5: 4 lanes ran at or under 8 on g1, franka and allegro)."""
+    return Work(trees, lanes=4)
+
 
 _LEAVE = """    const int tree = tid / lanes, lane = tid - tree * lanes;
     if (tree >= arts.shape[0]) return;
@@ -1203,7 +1207,7 @@ def walk_leave_kernel(
     classes: tuple[WalkClass, ...], release: bool, nodes: tuple[tuple[int, ...], ...] | None = None
 ) -> wp.Kernel:
     """The step's one leave, ``v += P^T L^-T R^T du``, of every walking tree (``arts``), a lane group a tree (``lanes``:
-    :data:`LEAVE_LANES` on CUDA, one on the CPU; ``dim`` trees times lanes), by the walk down (``WALK_DOWN`` of
+    :func:`leave_work`'s; ``dim`` trees times lanes), by the walk down (``WALK_DOWN`` of
     :func:`walk_down_prelude`, the tree's class at ``walk_class``). Coordinate ``c``'s change is
     ``du[du_base[art] + node(c)]``: every placement's sweep adds its change in the walk's coordinates into
     :attr:`WalkTrees.du` (the base the tree's first coordinate, ``node(c) = c``), the support placement's sparse sweep
@@ -1402,37 +1406,21 @@ holds slot ``k`` in registers, so a group has at least as many lanes as its tree
 thread holds them all."""
 
 
-def walk_group(bodies: int, joins: int, trees: int, sms: int) -> int:
-    """The lane group of a tree in :func:`walk_step_kernel` on CUDA, from the class's data: the bodies a batch of the
-    inward pass builds, one a lane, against the trees in flight. The group is the largest power of two with which the
-    class's walked trees still fit the device in one wave (:data:`WALK_RESIDENT` threads an SM), within the tree (no
-    more lanes than its bodies) and a warp, and never fewer lanes than the joins a tree holds at once (one a lane).
+def walk_work(trees: int, bodies: int, joins: int) -> Work:
+    """The refresh's work (:func:`walk_step_kernel`): a lane group a tree feeding the tree's inward chain (FEED), a
+    lane a body of a batch, never fewer lanes than the joins a tree holds at once (one a lane), in blocks of 64
+    threads (whole groups, so a group never straddles a warp). Its line is the kernel's 125-127 registers
+    (``kernel_sass``, sm_120 and sm_103), so 512 threads an SM and the group widens while the trees still fit one wave.
 
     Measured on both GPUs (``SP/core/FL/HANDOFF_ZR.md``): with more trees than the device holds a group of four
     wins (g1, kuka, franka-reach at 16,384 trees: 4 lanes), with fewer the batch widens (chain_106 at 4,096: 16).
 
     Args:
+        trees: The trees the launch walks.
         bodies: The most bodies of one of the class's walked trees.
         joins: The most joins one of its trees holds at once (:meth:`.tree_factor.TreeFactor.plan_walk`).
-        trees: The trees the launch walks.
-        sms: The device's multiprocessors.
     """
-    fit = max(sms * WALK_RESIDENT // max(trees, 1), 1)
-    top = min(bodies, 32)
-    lanes = 1
-    while lanes * 2 <= fit and lanes < top:
-        lanes *= 2
-    while lanes < joins:
-        lanes *= 2
-    return lanes
-
-
-WALK_RESIDENT = 512
-"""Threads of :func:`walk_step_kernel` one multiprocessor holds: its 125-127 registers (``kernel_sass``, sm_120 and
-sm_103) leave 16 warps an SM."""
-
-WALK_BLOCK = 64
-"""Threads of a block of :func:`walk_step_kernel` on CUDA: whole groups, so a group never straddles a warp."""
+    return Work(trees, Use.FEED, width=bodies, least=1 << max(joins - 1, 0).bit_length(), block=64, registers=128)
 
 
 _INWARD = """    // The refresh by the tree's lane group (walk_group): the lane feed (FEED, leaves to root) hands the chain one body

@@ -36,7 +36,7 @@ JOINT = newton.ModelFlags.JOINT_PROPERTIES
 def fixed_lanes(lanes):
     """Pin every held-tree group's lane width (``tree_kinetic_state.held_lanes``), for packed layouts on trees
     whose data would choose another width."""
-    return patch.object(tree_kinetic_state, "held_lanes", lambda tree, groups, *, cuda: lanes)
+    return patch.object(tree_kinetic_state, "held_lanes", lambda tree, groups, device: lanes)
 
 
 def _one_tree_per_block(build, *args, **kwargs):

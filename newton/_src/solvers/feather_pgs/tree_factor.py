@@ -27,6 +27,7 @@ import warnings
 import numpy as np
 import warp as wp
 
+from ...core import execution, memory
 from ...sim import BodyFlags, JointType, ModelFlags
 from . import field_group, host_index
 from .factor.closure import seed_blocks_kernel
@@ -52,19 +53,18 @@ from .factor.kernels import (
     prescale_joint_velocity_limits,
 )
 from .factor.walk import (
-    LEAVE_LANES,
     RELEASE_SLIPS,
-    WALK_BLOCK,
     WALK_COORDINATE,
     WALK_JOIN_SLOTS,
     WALK_LINK,
     TreeWalk,
     WalkTrees,
+    leave_work,
     local_frames,
     release_view,
-    walk_group,
     walk_leave_kernel,
     walk_step_kernel,
+    walk_work,
 )
 from .field_group import SolverArrays
 from .joint_table import JointTable
@@ -814,7 +814,7 @@ class TreeFactor:
         """Hold the walk's data for ``articulations`` (the converted class's, every responding tree): each coordinate's
         :data:`.factor.walk.WALK_COORDINATE` floats, each body's :data:`.factor.walk.WALK_LINK` floats and a twist of scratch, each body's path
         entry (its parent and first coordinate within its tree, :func:`.factor.walk.walk_paths_prelude`) and its class's join slot
-        (:attr:`.tree_scan.WalkClass.slots`), the trees' lane group (:func:`.factor.walk.walk_group`), and the step's geometry the
+        (:attr:`.tree_scan.WalkClass.slots`), the trees' lane group (:func:`.factor.walk.walk_work`), and the step's geometry the
         finish publishes (:attr:`WalkTrees.now`, :attr:`WalkTrees.now_link`): the rows' seeds enter there. One launch on the factor's own refreshes
         (:meth:`walk_step`) takes that geometry as the factor's frames and runs the inward pass, so the walk is the
         factor ``L`` refreshes, to rounding.
@@ -892,13 +892,12 @@ class TreeFactor:
         held = max((walk.slots[1] for walk in classes), default=0)
         if held > WALK_JOIN_SLOTS:
             raise ValueError(f"The walk holds at most {WALK_JOIN_SLOTS} joins of a tree at once, a tree needs {held}")
-        # A tree's group in the refresh (walk_group): on CUDA a lane a body of a batch and a join slot, the trees in
-        # flight those with a chain to walk (a free rigid body leaves its group after the batch's first body); one
-        # thread a tree on the CPU.
+        # The refresh's launch (walk_work): on CUDA a lane a body of a batch and a join slot, the trees in flight
+        # those with a chain to walk (a free rigid body leaves its group after the batch's first body).
         bodies = max([1, *(len(walk.parent) for walk in classes)])
         sizes = np.array([int(end[a]) - int(start[a]) for a in arts.tolist()], dtype=np.int64)
         walked = int(np.count_nonzero(sizes > 1)) or int(arts.size)
-        self.walk_lanes = walk_group(bodies, held, walked, device.sm_count) if device.is_cuda else 1
+        self.walk_shape = execution.shape(walk_work(walked, bodies, held), memory.device(device))
         self.walk_path = wp.array(path, dtype=wp.vec2i, device=device)
         self.walk_joins = wp.array(joins, dtype=wp.int32, device=device)
         self.walk_path_host = path
@@ -959,6 +958,8 @@ class TreeFactor:
         a sweep's own layout), or the walk's own coordinates."""
         classes = getattr(self, "walk_classes", ())
         self.walk_leave = walk_leave_kernel(classes, self.walk_slip_capacity > 0, nodes) if classes else None
+        if classes:
+            self.leave_shape = execution.shape(leave_work(self.walk_arts.shape[0]), memory.device(self.model.device))
 
     def leave(self, v_out: wp.array, du: wp.array | None = None, du_base: wp.array | None = None) -> None:
         """The step's one leave (:func:`.factor.walk.walk_leave_kernel`): every walking tree's velocity change walked down onto
@@ -967,7 +968,7 @@ class TreeFactor:
         step."""
         if self.walk_leave is None:
             return
-        lanes = LEAVE_LANES if self.model.device.is_cuda else 1
+        lanes = self.leave_shape.lanes
         wp.launch(
             self.walk_leave,
             dim=self.walk_arts.shape[0] * lanes,
@@ -980,6 +981,7 @@ class TreeFactor:
                 self.walk_trees.dof_start if du_base is None else du_base,
                 v_out,
             ],
+            block_dim=self.leave_shape.block,
             device=self.model.device,
         )
 
@@ -1019,7 +1021,7 @@ class TreeFactor:
         if self.walk_arts is None:
             return
         model = self.model
-        lanes = self.walk_lanes
+        lanes = self.walk_shape.lanes
         wp.launch(
             walk_step_kernel,
             dim=(self.walk_arts.shape[0], lanes),
@@ -1045,7 +1047,7 @@ class TreeFactor:
                 self.articulation_origin,
             ],
             outputs=[self.walk_data, self.walk_link, self.walk_origin],
-            block_dim=max(WALK_BLOCK, lanes),
+            block_dim=self.walk_shape.block,
             device=model.device,
         )
 
