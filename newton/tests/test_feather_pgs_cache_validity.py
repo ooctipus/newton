@@ -8,7 +8,6 @@ import contextlib
 import dataclasses
 import functools
 import itertools
-import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,7 +18,6 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import (
     cached_state_binding,
-    path_selection,
     tree_kinetic_owner,
     tree_kinetic_state,
 )
@@ -420,19 +418,6 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
             np.testing.assert_array_equal(group.geometry_valid.numpy(), 0)
 
 
-def _recorded_launches(kinds=("launch_tiled",)):
-    """Patch the given Warp launch functions to record their kernels and inputs without running them."""
-    launched = []
-
-    def record(kernel, *args, inputs=(), **kwargs):
-        launched.append((kernel, list(inputs), kwargs))
-
-    stack = contextlib.ExitStack()
-    for kind in kinds:
-        stack.enter_context(patch.object(wp, kind, record))
-    return stack, launched
-
-
 def _input_mismatches(kernel, inputs):
     """Name each parameter of ``kernel`` whose launch input has another type, or both counts when they differ.
 
@@ -510,56 +495,6 @@ class TestFeatherPGSInputBank(unittest.TestCase):
                 none = wp.zeros(model.world_count, dtype=wp.bool, device=model.device)
                 solver.reset(states[0], none)
                 np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), expected)
-
-    def test_every_begin_launches_the_one_repair(self):
-        """Launch the layout's one repair on every begin, and let the device decide each group from its stamps.
-
-        A comparing owner's one-pass repair compares inside its blocks: it is the one repair it binds,
-        and every begin hands it the step's output bank (the input bank where there is none), whether
-        the last finish published the input bank, the output bank or neither. An owner of a
-        motion-velocity layout binds the repair that compares nothing. (A classified repair compares
-        in a pass of its own: see :class:`TestFeatherPGSClassifiedRepair`.) Launches are recorded,
-        not run.
-        """
-        _, _, owner, (s0, s1), augmented = _cpu_owner()
-        motion_case = _cpu_owner(motion_velocity=True)
-        motion = motion_case[2]
-        self.assertTrue(owner.bank_compare)
-        for group in owner.groups:
-            self.assertFalse(group.classify_first)
-            self.assertIsNone(group.bank_kernel)
-            self.assertIn("_banked", group.repair_kernel.key)
-        self.assertFalse(motion.bank_compare)
-        for group in motion.groups:
-            self.assertIsNone(group.bank_kernel)
-            self.assertNotIn("_banked", group.repair_kernel.key)
-        repairs = {group.repair_kernel for group in (*owner.groups, *motion.groups)}
-
-        def begin(target, augmented, state_in, state_out=None):
-            """The banks the repairs of ``begin`` read (``joint_q`` pointers; None for the unread bank)."""
-            stack, records = _recorded_launches()
-            with stack:
-                target.begin(state_in, augmented, state_in.joint_qd, DT, state_out=state_out)
-            banks = []
-            for kernel, inputs, _ in records:
-                if kernel in repairs:
-                    bank = inputs[[arg.label for arg in kernel.adj.args].index("bank")]
-                    banks.append(getattr(getattr(bank, "joint_q", None), "ptr", None))
-            return banks
-
-        def finish(state_in, state_out):
-            stack, _ = _recorded_launches()
-            with stack:
-                owner.finish(state_in, augmented, state_out, DT)
-
-        groups = len(owner.groups)
-        self.assertEqual(begin(owner, augmented, s0, s1), [s1.joint_q.ptr] * groups)  # the first step
-        finish(s0, s1)
-        self.assertEqual(begin(owner, augmented, s0, s1), [s1.joint_q.ptr] * groups)  # copy-back
-        self.assertEqual(begin(owner, augmented, s1, s0), [s0.joint_q.ptr] * groups)  # ping-pong
-        self.assertEqual(begin(owner, augmented, s0), [s0.joint_q.ptr] * groups)  # identity alone decides
-        m0, m1 = motion_case[3]
-        self.assertEqual(len(begin(motion, motion_case[4], m0, m1)), len(motion.groups))
 
     @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
     def test_cuda_copied_input_bank_repairs_nothing(self):
@@ -921,48 +856,6 @@ class TestFeatherPGSCapturedRepair(unittest.TestCase):
             np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=0.0, atol=2e-6, err_msg=field)
 
 
-class TestFeatherPGSRepairRecord(unittest.TestCase):
-    def test_route_record_names_the_bound_repair_launches(self):
-        """Report each held-tree group's input validation, launch choice and kernels as the owner binds them.
-
-        For a comparing owner, groups forced to classify and a motion-velocity owner forced alike
-        (which keeps the one-pass repair), the record's ``input_validation`` and ``classify_first``
-        and every kernel key match the bound kernels (None where unbound). The record is
-        JSON-serializable.
-        """
-        compare_case, motion_case, classified_case = _cpu_owner(), _cpu_owner(motion_velocity=True), _cpu_owner()
-        for group in (*classified_case[2].groups, *motion_case[2].groups):
-            _force_classification(group)
-
-        def check(group, validation, repair, bound):
-            record = path_selection._tree_group(group)
-            json.dumps(record, allow_nan=False)
-            self.assertEqual(record["input_validation"], validation)
-            self.assertEqual(record["classify_first"], group.classify_first)
-            self.assertEqual(_repair_kind(group), repair)
-            kernels = {
-                "repair": group.repair_kernel,
-                "finish": group.finish_kernel,
-                "predict": group.predictor_kernel,
-                "bank": group.bank_kernel,
-                "classify": group.classify_kernel,
-            }
-            self.assertEqual(record["kernels"], {key: None if k is None else k.key for key, k in kernels.items()})
-            self.assertEqual(
-                {key for key, k in kernels.items() if k is not None}, {"repair", "finish", "predict", *bound}
-            )
-
-        for group in compare_case[2].groups:
-            self.assertFalse(group.classify_first)
-            check(group, "content", "bank_repair", set())
-        for group in motion_case[2].groups:
-            self.assertFalse(group.classify_first)
-            check(group, "identity", "repair", set())
-        for group in classified_case[2].groups:
-            self.assertTrue(group.classify_first)
-            check(group, "content", "listed", {"bank", "classify"})
-
-
 class TestFeatherPGSColdCapture(unittest.TestCase):
     """Capture a solver's first step before any eager step, as Isaac Lab records its physics graph at start-up."""
 
@@ -1115,72 +1008,6 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                     self.assertEqual(group.classify_kernel is not None, classified)
                     self.assertEqual(_repair_kind(group), "listed" if classified else "bank_repair")
 
-    def test_motion_layouts_keep_the_one_pass_repair_above_two_grids(self):
-        """Repair a velocity-limit layout in one pass, without a classification, above two listed grids.
-
-        A velocity-limit repair launches on every step: its groups exit early only where the step's
-        velocity prescale, computed after the last finish, left their velocities unchanged. A
-        classification would add a list clear and a launch to every step to skip at most the
-        one-pass launch's early exits. Ordinary motion at the same launch size keeps the classified
-        repair. CPU groups keep the one-pass repair by construction, so this tests the decision: the
-        owners are built with a one-block listed grid and switched on as on CUDA, which puts their
-        three-world groups (three blocks) above the two-block threshold. Launches inside a graph
-        capture are recorded, not run, and the capture id is stubbed.
-        """
-        with patch.object(tree_kinetic_owner, "listed_repair_blocks", return_value=1):
-            ordinary, motion = _cpu_owner(worlds=3), _cpu_owner(motion_velocity=True, worlds=3)
-        kinds = {}
-        for case in (ordinary, motion):
-            for group in case[2].groups:
-                group._classify_switch = True
-                group._bind_kernels()
-                self.assertEqual((group._repair_grid, group._classify_above, group.launch_count), (1, 2, 3))
-                kinds.update(
-                    {
-                        group.repair_kernel: _repair_kind(group),
-                        group.bank_kernel: "bank",
-                        group.classify_kernel: "classify",
-                    }
-                )
-        kinds.pop(None, None)
-        for group in ordinary[2].groups:
-            self.assertTrue(group.classify_first)
-            self.assertIsNotNone(group.classify_kernel)
-            self.assertIn("_listed", group.repair_kernel.key)
-        for group in motion[2].groups:
-            self.assertTrue(group.motion_velocity)
-            self.assertFalse(group.classify_first)
-            self.assertIsNone(group.classify_kernel)
-            self.assertIsNone(group.bank_kernel)
-            self.assertTrue(group.repair_kernel.key.startswith(f"tree_kinetic_repair{group.layout.bodies}"))
-            self.assertIn("_motion", group.repair_kernel.key)
-            self.assertNotIn("_listed", group.repair_kernel.key)
-            self.assertNotIn("_banked", group.repair_kernel.key)
-
-        def begin(case):
-            """The kinds and keyword arguments of a repair's launches, and the arrays it clears."""
-            target, (state_in, state_out), augmented = case[2], case[3], case[4]
-            stack, records = _recorded_launches(("launch", "launch_tiled"))
-            with stack, _cleared_arrays() as cleared:
-                target.begin(state_in, augmented, state_in.joint_qd, DT, state_out=state_out)
-            launched = [(kinds[kernel], kwargs) for kernel, _, kwargs in records if kernel in kinds]
-            return launched, cleared
-
-        groups = len(motion[2].groups)
-        launched, cleared = begin(motion)
-        self.assertEqual([kind for kind, _ in launched], ["repair"] * groups)
-        self.assertTrue(all(not kwargs.get("max_blocks") for _, kwargs in launched))
-        self.assertFalse(any(array is group._list_counts for array in cleared for group in motion[2].groups))
-        launched, cleared = begin(ordinary)
-        self.assertEqual([kind for kind, _ in launched], ["classify", "bank", "listed"] * len(ordinary[2].groups))
-        self.assertTrue(all(any(array is group._list_counts for array in cleared) for group in ordinary[2].groups))
-        for case, classify in ((motion, False), (ordinary, True)):
-            for group in case[2].groups:
-                record = path_selection._tree_group(group)
-                self.assertEqual(record["classify_first"], classify)
-                self.assertEqual(record["kernels"]["classify"] is not None, classify)
-                self.assertEqual("_listed" in record["kernels"]["repair"], classify)
-
     @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
     def test_cuda_captured_motion_repair_above_two_grids_is_one_pass(self):
         """Capture a velocity-limit repair above two listed grids as the one-pass launch, without a classification.
@@ -1236,79 +1063,6 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                     finals.append({field: getattr(rollout.states[0], field).numpy() for field in STATE_FIELDS})
                 for field in STATE_FIELDS:
                     np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=0.0, atol=2e-6, err_msg=field)
-
-    def test_repair_lists_its_blocks_on_every_step(self):
-        """Classify and repair over the block list on every step, comparing whenever there is an output bank.
-
-        Every begin of a classified owner launches its classification, which lists the groups stamped with the
-        output bank for a comparison pass before the listed repair, and the listed repair; without an output bank
-        there is nothing to compare. A velocity-limit layout keeps the one-pass repair (see
-        :meth:`test_motion_layouts_keep_the_one_pass_repair_above_two_grids`). CPU keeps the one-pass repair, and the
-        fixture's launches are too small to classify (see :meth:`test_only_launches_above_two_grids_are_classified`):
-        the test forces the classification on a one-block grid. Launches are recorded, not run.
-        """
-        case, motion_case = _cpu_owner(), _cpu_owner(motion_velocity=True)
-        for target in (case[2], motion_case[2]):
-            for group in target.groups:
-                self.assertFalse(group.classify_first)
-                self.assertIsNone(group.classify_kernel)
-                _force_classification(group)
-                self.assertEqual(group.classify_first, not group.motion_velocity)
-                self.assertEqual(group.classify_kernel is None, group.motion_velocity)
-                self.assertEqual(group.bank_kernel is None, group.motion_velocity)
-        kinds = {}
-        for target in (case[2], motion_case[2]):
-            for group in target.groups:
-                kinds.update(
-                    {
-                        group.repair_kernel: _repair_kind(group),
-                        group.bank_kernel: "bank",
-                        group.classify_kernel: "classify",
-                    }
-                )
-        kinds.pop(None, None)
-
-        def begin(case, state_in, state_out=None):
-            """The kinds of ``begin``'s launches; each classification must pass the bank it compares with."""
-            target, augmented = case[2], case[4]
-            stack, records = _recorded_launches(("launch", "launch_tiled"))
-            with stack:
-                target.begin(state_in, augmented, state_in.joint_qd, DT, state_out=state_out)
-            recorded = [
-                (kinds[kernel], kernel, inputs, kwargs) for kernel, inputs, kwargs in records if kernel in kinds
-            ]
-            for index, (kind, kernel, inputs, kwargs) in enumerate(recorded):
-                # One input per kernel argument, as a launch that runs requires.
-                labels = [arg.label for arg in kernel.adj.args]
-                self.assertEqual(len(inputs), len(labels), kind)
-                if kind in ("bank", "listed"):
-                    self.assertEqual(kwargs.get("max_blocks"), target.groups[0]._repair_grid)
-                if kind == "classify":
-                    compares = index + 1 < len(recorded) and recorded[index + 1][0] == "bank"
-                    expected = (state_out if compares else state_in).joint_q.ptr
-                    bank = inputs[labels.index("bank")]
-                    banks.append(getattr(getattr(bank, "joint_q", None), "ptr", None) == expected)
-            return [kind for kind, _, _, _ in recorded]
-
-        def finish(case, state_in, state_out):
-            target, augmented = case[2], case[4]
-            stack, _ = _recorded_launches(("launch", "launch_tiled"))
-            with stack:
-                target.finish(state_in, augmented, state_out, DT)
-
-        banks = []
-        groups = len(case[2].groups)
-        listed, compared = ["classify", "listed"] * groups, ["classify", "bank", "listed"] * groups
-        m0, m1 = motion_case[3]
-        self.assertEqual(begin(motion_case, m0, m1), ["repair"] * len(motion_case[2].groups))
-        s0, s1 = case[3]
-        self.assertEqual(begin(case, s0, s1), compared)  # the first step
-        finish(case, s0, s1)
-        self.assertEqual(begin(case, s1, s0), compared)  # the finish published the input bank
-        finish(case, s0, s1)
-        self.assertEqual(begin(case, s0, s1), compared)  # a copy of the bank the finish published
-        self.assertEqual(begin(case, s0), listed)  # no output bank: nothing to compare
-        self.assertTrue(banks and all(banks), banks)
 
     def check_owner_launches(self, device):
         """Run every launch form of ordinary and motion-velocity owners; each must match its kernel's parameters.

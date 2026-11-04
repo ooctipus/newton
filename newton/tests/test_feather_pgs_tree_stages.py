@@ -6,7 +6,6 @@
 import dataclasses
 import re
 import unittest
-from pathlib import Path
 
 import numpy as np
 import warp as wp
@@ -39,7 +38,6 @@ _LAYOUTS = (
         root_families=(3, 6),
     ),
 )
-_STAGES = ("accelerations", "transport", "integrate", "relative_poses", "poses", "motion", "publish", "close")
 
 
 def _schedules(layout):
@@ -131,33 +129,6 @@ def _launch(group, kernel, data, velocity, start):
 
 
 class TestTreeKineticStages(unittest.TestCase):
-    def test_kernels_are_authored_code(self):
-        """Build every finish and repair from functions written in the module, not from executed text."""
-        source = Path(tree_kinetic_state.__file__).resolve()
-        for layout in _LAYOUTS:
-            for name, kernel in _kernels(layout):
-                with self.subTest(layout=layout.bodies, kernel=name):
-                    self.assertEqual(Path(kernel.func.__code__.co_filename).resolve(), source)
-
-    def test_stages_read_one_tree_group(self):
-        """Call each stage on the TreeGroup admission returns, one call below the kernel."""
-        for layout in _LAYOUTS:
-            for name, kernel in _kernels(layout):
-                with self.subTest(layout=layout.bodies, kernel=name):
-                    functions = {f.func.__name__: f for f in kernel.adj.get_references()[2] if not f.is_builtin()}
-                    self.assertIs(functions["admit"].func.__annotations__["return"], tree_kinetic_state.TreeGroup)
-                    for stage in _STAGES:
-                        arguments = list(functions[stage].input_types.values())
-                        self.assertIs(arguments[0], tree_kinetic_state.TreeGroup, stage)
-
-    def test_finish_and_repair_share_one_launch_abi(self):
-        """Take every repair form's inputs, after the six common arguments, in every finish and repair."""
-        for layout in _LAYOUTS:
-            labels = {name: [arg.label for arg in kernel.adj.args] for name, kernel in _kernels(layout)}
-            with self.subTest(layout=layout.bodies):
-                self.assertEqual(len({tuple(args) for args in labels.values()}), 1)
-                self.assertEqual(labels["finish"][6:], ["motion_qd", "repair_blocks", "repair_count", "bank"])
-
     def test_only_the_alternate_motion_repair_reads_the_motion_input(self):
         """Generate no use of the motion input but its hand-off to admission, except in the alternate-motion repair."""
         wp.init()

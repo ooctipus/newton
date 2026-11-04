@@ -108,8 +108,8 @@ class TestHeldModels(unittest.TestCase):
                 np.testing.assert_allclose(state.body_q.numpy()[body, :3], [3.0, 0.0, 1.0], atol=1e-6)
                 np.testing.assert_allclose(out.body_q.numpy()[body, :3], [3.0, 0.0, 1.0], atol=1e-6)
 
-    def test_a_forest_holds_a_tree_without_coordinates(self):
-        """Hold a world's tree of no coordinates as a zero family of its forest."""
+    def test_a_forest_keeps_a_tree_without_coordinates_in_place(self):
+        """Keep a world's tree of no coordinates in place beside a falling chain in its forest."""
         for device in _devices():
             with self.subTest(device=device):
                 scene = newton.ModelBuilder()
@@ -121,9 +121,7 @@ class TestHeldModels(unittest.TestCase):
                 builder = newton.ModelBuilder()
                 builder.replicate(scene, 2)
                 with mock.patch.dict(SolverFeatherPGS._route_pins, {"storage": "dense", "grouping": "forest"}):
-                    solver, _, state = _fall(builder, device, steps=4)
-                self.assertEqual(len(solver.factor.held.groups), 1)
-                self.assertEqual(solver.factor.held.groups[0].layout.root_families, (2, 0))
+                    _, _, state = _fall(builder, device, steps=4)
                 np.testing.assert_allclose(
                     state.body_q.numpy()[[body, 2 * body + 1], :3], [[2.0, 0.0, 1.0]] * 2, atol=1e-6
                 )

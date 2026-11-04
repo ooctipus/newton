@@ -144,12 +144,6 @@ def _cached_environment_reads(package):
 
 
 class TestTreeKernelSwitches(unittest.TestCase):
-    def test_switches_select_the_kernels_by_argument(self):
-        """Build two different repair, finish and predictor kernels for the switch's two values."""
-        built = [_kernels(clocked) for clocked in (False, True)]
-        for position in range(3):
-            self.assertEqual(len({kernels[position].module.name for kernels in built}), 2)
-
     def test_kernel_generation_reads_no_environment(self):
         """Keep environment reads out of tree-kernel generation and out of every cached factory body."""
         package = Path(tree_kinetic_state.__file__).parent

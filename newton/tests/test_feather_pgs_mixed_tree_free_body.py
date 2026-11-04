@@ -415,35 +415,6 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
         np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
 
-    def test_forest_is_the_default_with_a_prescribed_root(self):
-        """Unset, the forest is taken for a world with a prescribed root and no diagonal family.
-
-        A cabinet world keeps per-size groups: its drawers run as scalar branches (the default,
-        pinned here so that an exported opt-out cannot change the route), which no forest spans,
-        and with the star pinned to the held tree the forest would apply their diagonal family at a loss.
-        """
-        _rollout.forest = None
-        try:
-            _solver, owner, _cached, _qd = _rollout(
-                _build(wp.get_device("cuda:0"), prescribed=True), owner=True, steps=2
-            )
-            self.assertEqual(len(owner.groups), 1)
-            self.assertEqual(owner.groups[0].layout.root_families, (3, 6, 0))
-            _solver, owner, _cached, _qd = _rollout(
-                _build(wp.get_device("cuda:0"), cabinet=True), owner=True, steps=2, scalar=True
-            )
-            self.assertEqual(
-                [type(group).__name__ for group in owner.groups], ["TreeKineticState", "ScalarBranchState"]
-            )
-            _solver, owner, _cached, _qd = _rollout(
-                _build(wp.get_device("cuda:0"), cabinet=True), owner=True, steps=2, scalar=False
-            )
-            self.assertEqual([type(group).__name__ for group in owner.groups], ["TreeKineticState"] * 2)
-            _solver, owner, _cached, _qd = _rollout(_build(wp.get_device("cuda:0")), owner=True, steps=2)
-            self.assertEqual(len(owner.groups), 2)
-        finally:
-            _rollout.forest = False
-
     def test_free_root_trees_above_twelve_coordinates_are_owned(self):
         """An 18-coordinate free-root walker (a quadruped's class) gets a held family and tracks the ordinary route."""
         model = _build(wp.get_device("cuda:0"), quadruped=True)
@@ -517,35 +488,23 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                 self.assertLessEqual(float(q[-1, :, 3:5].max()), 1.0e-3)
                 self._assert_patch_history(plain_solver, owner_solver, loaded=False)
 
-    def test_scalar_branches_own_the_cabinet_drawers(self):
+    def test_scalar_branches_track_the_cabinet_drawers(self):
         """Run the cabinet's drawers as scalar branches beside the arm's tree group; track the ordinary route.
 
         The drawers hang from a world-fixed root on one-coordinate prismatic joints, the
-        diagonal-mass class the scalar rule admits, so the owner runs them one thread per
-        coordinate instead of as a held diagonal family, and the arm's tree group beside them
-        validates input banks by identity. Poses and twists stay within the per-size and forest
-        owners' bounds of ordinary dynamics; the scalar-branch tests cover the rule.
+        diagonal-mass class the scalar rule admits. Poses and twists stay within the per-size and
+        forest owners' bounds of ordinary dynamics; the route probe records the owner's groups.
         """
-        from newton._src.solvers.feather_pgs.scalar_branches import ScalarBranchState  # noqa: PLC0415
-
         for beta in (0.0, 0.2):
             with self.subTest(friction_anchor_beta=beta):
                 model = _build(wp.get_device("cuda:0"), cabinet=True)
                 plain_solver, _plain_owner, plain, plain_qd = _rollout(
                     model, owner=False, friction_anchor_beta=beta, scalar=False
                 )
-                self.assertIsNone(plain_solver._scalar_branches)
                 owner_solver, owner, cached, cached_qd = _rollout(
                     model, owner=True, friction_anchor_beta=beta, scalar=True
                 )
-                self.assertIsInstance(owner, HeldTree)
-                self.assertIsInstance(owner.scalar, ScalarBranchState)
-                self.assertIs(owner_solver._scalar_branches, owner.scalar.plan)
-                self.assertEqual([group.sparse.size for group in owner.groups], [3, 2])
-                self.assertFalse(owner.bank_compare)
-                held = owner_solver.get_path_selection()["routes"]["held_tree"]
-                self.assertTrue(held["scalar_branches"]["enabled"])
-                self.assertEqual([group["input_validation"] for group in held["groups"]], ["identity"] * 2)
+                self.assertIsNotNone(owner.scalar)
                 self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
                 np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
                 np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)

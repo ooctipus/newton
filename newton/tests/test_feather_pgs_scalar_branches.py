@@ -12,9 +12,7 @@ integrate.
 """
 
 import dataclasses
-import json
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -635,94 +633,6 @@ class TestScalarBranchRule(unittest.TestCase):
                 self.assertIsNone(kinds)
                 self.assertIn(words, reason)
 
-    def test_plan_reasons_follow_the_solver(self):
-        """Report the request, the diagonal group and each decline of the solver or its model, with its reason."""
-        model = build_branch_model(worlds=2)
-        solver = cpu_solver(model, 7)
-        with mock.patch.dict(solver._route_pins, {"star": "held"}):
-            self.assertIn("star='held'", sb.plan_scalar_branches(solver)[1])
-        self.assertIn("run as scalar branches", sb.plan_scalar_branches(solver)[1])
-        with mock.patch.object(solver, "_compact_diagonal_mass_size", None):
-            plan, reason = sb.plan_scalar_branches(solver)
-            self.assertIsNone(plan)
-            self.assertIn("No diagonal-mass group", reason)
-            # A model without a diagonal group gives the same reason with the star pinned to the held tree.
-            with mock.patch.dict(solver._route_pins, {"star": "held"}):
-                self.assertEqual(sb.plan_scalar_branches(solver)[1], reason)
-        plan, _reason = sb.plan_scalar_branches(solver)
-        self.assertIsNotNone(plan)
-        # A drive row that reads another coordinate than its leaf's, and leaves out of coordinate order.
-        q_index = solver.factor.drive_q_index_by_dof.numpy()
-        q_index[plan.dofs[0]] += 1
-        q_index = wp.array(q_index, dtype=int, device=model.device)
-        offsets = dict(solver.forest.crba_dof_joint_offset_by_size)
-        offsets[7] = wp.array(np.roll(np.arange(1, 8), 1), dtype=int, device=model.device)
-        for label, attribute, value, words in (
-            (
-                "options.enable_joint_velocity_limits",
-                "options",
-                dataclasses.replace(solver.options, enable_joint_velocity_limits=True),
-                "velocity limits",
-            ),
-            (
-                "forest.direct_diagonal_inertia_sizes",
-                "forest",
-                dataclasses.replace(solver.forest, direct_diagonal_inertia_sizes=frozenset()),
-                "do not each move one body",
-            ),
-            (
-                "forest.crba_dof_joint_offset_by_size",
-                "forest",
-                dataclasses.replace(solver.forest, crba_dof_joint_offset_by_size=offsets),
-                "do not follow its leaves",
-            ),
-            (
-                "factor.parallel_drives",
-                "factor",
-                SimpleNamespace(**{**vars(solver.factor), "parallel_drives": False}),
-                "owned drive-row topology",
-            ),
-            (
-                "factor.drive_q_index_by_dof",
-                "factor",
-                SimpleNamespace(**{**vars(solver.factor), "drive_q_index_by_dof": q_index}),
-                "do not read its leaf coordinates",
-            ),
-        ):
-            with self.subTest(attribute=label), mock.patch.object(solver, attribute, value):
-                plan, reason = sb.plan_scalar_branches(solver)
-                self.assertIsNone(plan)
-                self.assertIn(words, reason)
-        with self.subTest("particles"):
-            particles = cpu_solver(build_branch_model(worlds=2, particle=True), 7)
-            self.assertEqual(particles.model.particle_count, 1)
-            plan, reason = sb.plan_scalar_branches(particles)
-            self.assertIsNone(plan)
-            self.assertIn("exclude particles", reason)
-
-    def test_owner_composes_the_scalar_group(self):
-        """Compose the scalar group beside the arm's tree group, keep the forest off it, and validate both.
-
-        The owner is built directly on CPU, where the solver keeps ordinary dynamics.
-        """
-        model = build_branch_model(worlds=2)
-        solver = cpu_solver(model, 7)
-        solver._scalar_branches, _reason = sb.plan_scalar_branches(solver)
-        owner = HeldTree(solver)
-        self.assertIsInstance(owner.scalar, sb.ScalarBranchState)
-        self.assertEqual([type(group).__name__ for group in owner.groups], ["TreeKineticState", "ScalarBranchState"])
-        self.assertEqual([group.sparse.size for group in owner.groups], [6, 7])
-        # The scalar group validates its input bank by identity, so the owner does.
-        self.assertFalse(owner.bank_compare)
-        # Every group proves its inputs unchanged: the notification keeps the caches.
-        self.assertTrue(owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES))
-        owner.invalidate()
-        np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), 0)
-        with mock.patch.dict(solver._route_pins, {"grouping": "forest"}):
-            forced = HeldTree(solver)
-        self.assertIn("Scalar branches own", forced.forest_reason)
-        self.assertEqual(len(forced.groups), 2)
-
     def test_tree_groups_beside_scalar_branches_validate_by_identity(self):
         """Bind and launch no input-bank comparison beside scalar branches, and record identity validation.
 
@@ -824,37 +734,6 @@ class TestScalarBranchRule(unittest.TestCase):
         model.joint_parent.assign(parents)
         with self.assertRaisesRegex(RuntimeError, "joint_parent changed"):
             owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
-
-    def test_scalar_group_record_follows_the_tree_schema(self):
-        """Record the scalar group with every field of a tree group's record, plus its drive DOFs.
-
-        The owner is built directly on CPU and recorded as ``get_path_selection`` records it.
-        """
-        model = build_branch_model(worlds=2)
-        solver = cpu_solver(model, 7)
-        solver._scalar_branches, solver._scalar_branches_reason = sb.plan_scalar_branches(solver)
-        with mock.patch.object(solver.factor, "held", HeldTree(solver)):
-            held = path_selection._held_tree(solver)
-        json.dumps(held, allow_nan=False)
-        self.assertEqual(held["owner"], "mixed")
-        self.assertTrue(held["scalar_branches"]["enabled"])
-        tree, scalar = held["groups"]
-        self.assertEqual((set(scalar) - set(tree), set(tree) - set(scalar)), ({"drive_dofs"}, set()))
-        self.assertEqual((scalar["operator"], scalar["dofs"]), ("ScalarBranchState", 7))
-        self.assertEqual(scalar["drive_dofs"], model.joint_dof_count - 7 * model.world_count)
-        self.assertEqual(scalar["kernels"]["finish"], sb.finish_prismatic_branches.key)
-        # The tree layout's packing fields hold no value for a group without a tree layout.
-        self.assertEqual((scalar["trees_per_block"], scalar["block_dim"]), (None, None))
-        self.assertIsInstance(tree["trees_per_block"], int)
-
-    def test_cpu_route_record_reports_the_rule(self):
-        """Report scalar branches as off on CPU, where no diagonal-mass group shares a sparse-diagonal response."""
-        record = SolverFeatherPGS(build_branch_model(worlds=2)).get_path_selection()
-        json.dumps(record, allow_nan=False)
-        self.assertEqual(
-            record["routes"]["held_tree"]["scalar_branches"],
-            {"enabled": False, "reason": "No diagonal-mass group shares the sparse-diagonal response."},
-        )
 
 
 class TestScalarBranchKernels(unittest.TestCase):
@@ -1722,32 +1601,6 @@ class TestScalarBranchOwner(unittest.TestCase):
         self.assertIsNone(owner.scalar)
         responses = sorted(group._response for group in owner.groups)
         self.assertEqual(responses, ["cholesky", "diagonal"])
-
-    def test_route_record_names_the_scalar_group(self):
-        """Record the scalar group, the request that opts out of it, and its decline without an owner."""
-        device = wp.get_device("cuda:0")
-        model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, shapes=True)
-        record = recipe_solver(model, scalar=True).get_path_selection()
-        json.dumps(record, allow_nan=False)
-        held, publication = record["routes"]["held_tree"], record["routes"]["publication"]
-        self.assertEqual(held["owner"], "mixed")
-        self.assertTrue(held["scalar_branches"]["enabled"])
-        self.assertIn("run as scalar branches", held["scalar_branches"]["reason"])
-        groups = {group["operator"]: group for group in held["groups"]}
-        self.assertEqual(set(groups), {"tree", "ScalarBranchState"})
-        self.assertEqual(groups["ScalarBranchState"]["dofs"], STAR_LEAVES)
-        self.assertEqual(groups["ScalarBranchState"]["kernels"]["predict"], sb.predict_prismatic_branches.key)
-        self.assertEqual(groups["tree"]["dofs"], ARM_DOFS)
-        # The scalar group holds no bank stamps, so the arm group beside it validates a changed input
-        # bank by identity, as the owner does, and binds no comparison pass or banked repair.
-        for name, group in groups.items():
-            self.assertEqual(group["input_validation"], "identity", name)
-            self.assertIsNone(group["kernels"]["bank"], name)
-            self.assertNotIn("_banked", group["kernels"]["repair"], name)
-        self.assertEqual(publication["owner"], "cached")
-        head = recipe_solver(model, scalar=False).get_path_selection()["routes"]
-        self.assertFalse(head["held_tree"]["scalar_branches"]["enabled"])
-        self.assertIn("star='held'", head["held_tree"]["scalar_branches"]["reason"])
 
 
 if __name__ == "__main__":

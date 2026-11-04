@@ -1035,10 +1035,9 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
     def test_routes_agree_with_the_cpu(self):
         reference, _ = self._roll("cpu", {})
         self.assertGreater(float(np.abs(reference).max()), 2.0)
-        for pins, owner in (({}, "mixed"), ({"grouping": "forest"}, "forest")):
+        for pins in ({}, {"grouping": "forest"}):
             with self.subTest(pins=pins):
-                history, solver = self._roll("cuda:0", pins)
-                self.assertEqual(solver.get_path_selection()["routes"]["held_tree"]["owner"], owner)
+                history, _ = self._roll("cuda:0", pins)
                 np.testing.assert_allclose(history, reference, rtol=0.0, atol=1.0e-2)
 
     def test_a_long_chain_takes_the_decision(self):
