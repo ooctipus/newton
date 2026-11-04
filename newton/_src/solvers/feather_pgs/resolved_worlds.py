@@ -21,6 +21,8 @@ from types import SimpleNamespace
 import numpy as np
 import warp as wp
 
+from ...core import memory
+from ...core.execution import Work, shape
 from . import field_group
 from .contact_laws import contact_points, contact_responds, contact_restitution, jacobian_entry
 from .field_group import Field, FieldGroup, SolverArrays
@@ -855,7 +857,10 @@ def launch(
     else:
         bodies = scratch.body_valid.shape[0]
         wp.launch(build_predicted_body_twists, dim=bodies, inputs=[data, scratch], device=device)
-    threads = max(1, min(int(contact_capacity), 65536))
+    # The contact checks stride over the contacts on one wave of the device's resident blocks (a thread a contact on
+    # the CPU): every verdict they write is an integer atomic or a minimum, so the grid changes no decision.
+    grid = shape(Work(max(int(contact_capacity), 1), persistent=True), memory.device(device))
+    threads = min(grid.grid * grid.block, max(int(contact_capacity), 1))
 
     def check(kernel, inputs):
         if pool is None:
