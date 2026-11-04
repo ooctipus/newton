@@ -106,6 +106,7 @@ ROW_WATERMARKS = FieldGroup(
             "row_watermark_dense",
             "row_watermark_mf",
             "row_watermark_contact",
+            "row_watermark_resolved",
             "row_watermark_dense_raw",
             "row_watermark_mf_raw",
             "row_dropped_dense_high_water",
@@ -1014,6 +1015,7 @@ class Placement:
             for field, name in fields.items()
         }
         result["contact_high_water"] = int(words.get("row_watermark_contact", 0))
+        result["resolved_high_water"] = int(words.get("row_watermark_resolved", 0))
         return result
 
     # ---------------------------------------------------------------------------------------------------------------

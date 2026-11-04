@@ -650,6 +650,15 @@ def finalize_resolved_worlds_bounded(
     scratch.resolved[world] = value
 
 
+@wp.kernel(enable_backward=False)
+def accumulate_resolved_rows(scratch: ResolvedWorldScratch, watermark: wp.array[wp.int32]):
+    """The most rows a resolved world skipped (``Diagnostics.row_watermark``): its checked limits and three rows a
+    checked contact, a normal and its tangent pair (the bound :func:`finalize_resolved_worlds_bounded` resolves under)."""
+    world = wp.tid()
+    if scratch.resolved[world] != 0:
+        wp.atomic_max(watermark, 0, scratch.checked_limits[world] + 3 * scratch.checked_normals[world])
+
+
 def decline(solver) -> str | None:
     """Why the solver's rows do not follow the law the classifier evaluates, or ``None`` when they do.
 
@@ -688,7 +697,6 @@ def decline(solver) -> str | None:
                 and solver.factor.block_count == 0
                 and all(getattr(solver.laws, name, object()) == value for name, value in laws_exact.items())
                 and solver.options.enable_bilateral_preelimination is False
-                and not solver.options.diagnostics.row_watermark
                 and (solver.forest.max_world_dofs or 33) <= 32
                 and all(getattr(solver.forest, name) is not None for name in required)
                 and solver.laws.joint_limit_q_index is not None,
@@ -803,6 +811,16 @@ class ResolvedWorlds:
             row_bound=self.row_bound,
             free_normals=self.free_normals,
             pool=pool,
+        )
+
+    def record_watermark(self, watermark: wp.array) -> None:
+        """Accumulate the rows the resolved worlds skipped into ``watermark`` (:func:`accumulate_resolved_rows`), so the
+        row watermark counts them while the diagnostic changes no route."""
+        wp.launch(
+            accumulate_resolved_rows,
+            dim=self.resolved.shape[0],
+            inputs=[self.scratch, watermark],
+            device=self.solver.model.device,
         )
 
 

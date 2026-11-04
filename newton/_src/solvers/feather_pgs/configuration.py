@@ -58,9 +58,8 @@ _BOOLEANS = (
 class Diagnostics:
     """What :class:`~newton.solvers.SolverFeatherPGS` reads out beside the step, as its ``diagnostics`` option.
 
-    No field changes a computed value: a step with any diagnostics on publishes the same state as one with all of
-    them off. One field changes a choice: ``row_watermark`` keeps the rows of every world, which the resolved-world
-    classifier would otherwise skip uncounted.
+    No field changes a computed value or a choice: a step with any diagnostics on publishes the same state, and builds
+    the same rows, as one with all of them off.
 
     Attributes:
         nvtx: Mark the step's stages as NVTX ranges.
@@ -68,7 +67,8 @@ class Diagnostics:
             ``_debug_stage3_qd_work``, ``_debug_stage3_joint_qdd`` and ``_debug_stage3_v_hat``, which external NaN
             dumpers read; three copies a substep.
         row_watermark: Accumulate each row family's whole-run high-water mark, read back by
-            :meth:`~newton.solvers.SolverFeatherPGS.constraint_row_watermarks`.
+            :meth:`~newton.solvers.SolverFeatherPGS.constraint_row_watermarks`, and the most rows a world the
+            resolved-world classifier resolved skipped (its checked limits and three rows a checked contact).
         overflow_warning: Emit a device-side warning the first time each dense or matrix-free row family exceeds its
             per-world capacity: the world, requested rows, row limit and dropped contact and friction rows, without a
             host synchronization, so it stays compatible with CUDA graph capture.

@@ -655,11 +655,15 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     def watermarks(step):
         placement.record_watermarks(step.contacts)
 
+    def resolved_watermark(step):
+        # The rows the resolved worlds skipped: the diagnostic counts them and leaves the classifier's choice alone.
+        resolved.record_watermark(placement.row_watermark_resolved)
+
     add(finish, nvtx="S7_Integrate")
     if spec.particles:
         add(integrate_particles)
     add(carry)
     if "row_watermark" in diagnostics:
-        add(watermarks)
+        add(watermarks, *((resolved_watermark,) if resolved is not None else ()))
     add(count, *boundary)
     return tuple(stages)

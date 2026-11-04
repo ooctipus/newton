@@ -910,6 +910,8 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         builder.add_articulation(joints)
         model = builder.finalize(device=wp.get_device())
         state_0, state_1 = model.state(), model.state()
+        # Past every upper limit: each limit needs its row (a world within its limits resolves with none).
+        state_0.joint_q.fill_(1.5)
         newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
         pipeline = _make_pipeline(model, False)
         contacts = pipeline.contacts()

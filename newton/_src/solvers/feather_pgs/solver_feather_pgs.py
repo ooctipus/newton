@@ -1067,7 +1067,9 @@ class SolverFeatherPGS(SolverBase):
         These are whole-run running maxima (warmup included) of retained and
         raw per-world dense / matrix-free / rigid-contact row counts, rejected
         contact rows that allocators rolled back, peak over-capacity demand,
-        and the number of overflowing world-steps. They are accumulated inside
+        the number of overflowing world-steps, and the most rows a resolved world
+        skipped (``resolved_high_water``: its checked limits and three rows a
+        checked contact; the classifier runs as with the telemetry off). They are accumulated inside
         the captured :meth:`step` when
         ``Diagnostics.row_watermark`` is on. Reads the telemetry words back in one
         copy and so must be called OUTSIDE any captured/timed region (it

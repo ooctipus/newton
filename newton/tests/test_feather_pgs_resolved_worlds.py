@@ -681,6 +681,18 @@ class TestResolvedWorldsCUDA(unittest.TestCase):
         np.testing.assert_allclose(poses[:, :, :3], plain[:, :, :3], atol=1.0e-5, rtol=0.0)
         np.testing.assert_allclose(poses[:, :, 3:], plain[:, :, 3:], atol=1.0e-5, rtol=0.0)
 
+    def test_row_watermark_counts_the_rows_it_does_not_choose(self):
+        """The row watermark (a diagnostic) resolves the same worlds and steps the same state as the telemetry off, and
+        counts the rows the resolved worlds skipped."""
+        model = _build(wp.get_device("cuda:0"), worlds=6)
+        _solver, poses, masks = _rollout(model, classifier=True, steps=30)
+        diagnostics = {"diagnostics": SolverFeatherPGS.Diagnostics(row_watermark=True)}
+        solver, watched_poses, watched_masks = _rollout(model, classifier=True, steps=30, solver_kwargs=diagnostics)
+        np.testing.assert_array_equal(watched_masks, masks)
+        np.testing.assert_array_equal(watched_poses, poses)
+        self.assertGreater(int(masks.sum()), 0)
+        self.assertGreater(solver.constraint_row_watermarks()["resolved_high_water"], 0)
+
     def test_patch_resolved_worlds_match_the_complete_path(self):
         """Persistent patch friction: resolved worlds step identically and release the same anchors.
 
