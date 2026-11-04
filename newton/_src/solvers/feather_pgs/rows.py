@@ -645,8 +645,9 @@ class RowLaws:
     # mimic, link, joint limit, velocity limit, contacts, then the free bodies' rows, and the phase-bound snapshots are
     # glued to that sequence. The stage list (:func:`.step_plan._stages`) runs the families a class holds, in this
     # order: :meth:`begin`, :meth:`write_mimics`, :meth:`write_links`, :meth:`prepare_fused_limits`,
-    # :meth:`write_limits`, :meth:`bound_phase` (0), :meth:`write_velocity_limits`, :meth:`bound_phase` (1), then
-    # :meth:`write_contacts`, which finalizes the counts with status.
+    # :meth:`write_limits`, :meth:`bound_phase` (0), :meth:`write_velocity_limits`, :meth:`bound_phase` (1),
+    # :meth:`write_contacts`, :meth:`bound_free_body_contacts`, :meth:`write_free_body_limits`, the local row packets'
+    # finish, :meth:`finalize_dense` and the keyed rows' finish.
     #
     # Dense row-family layout: slots are handed out in the order [mimic][joint-limit][joint-velocity-limit]
     # [contact/friction], so each family owns one contiguous dense row range:
@@ -782,8 +783,8 @@ class RowLaws:
             self._launch_prefix_warp(solver, warp_kernel, size, law, support)
 
     def write_contacts(self, solver, state_in: State, state_aug: State, contacts: Contacts, dt: float) -> None:
-        """The contact rows, the free bodies' rows and the sparse diagonal's, after the joint families; then every
-        class's counts finalized with status.
+        """The contact rows, the free bodies' contact rows (their counts finalized with status) and the sparse
+        diagonal's rows, after the joint families.
 
         Args:
             solver: The solver whose step this is: its model, options, plan and primitives.
@@ -920,18 +921,7 @@ class RowLaws:
                 )
 
             if mf_active:
-                wp.launch(
-                    finalize_constraint_counts_with_status,
-                    dim=solver.forest.world_count,
-                    inputs=[
-                        solver.placement.mf_slot_counter,
-                        solver.placement.mf_max_constraints,
-                        1,
-                        solver.placement.mf_first_rejected_slot,
-                    ],
-                    outputs=[solver.placement.mf_constraint_count, solver.placement.constraint_capacity_status],
-                    device=model.device,
-                )
+                self._finalize(solver, 1)
 
                 # ── MF warm-start seed ────────────────────────────────────
                 # contact_slot + mf_row_type are now populated for THIS step.
@@ -972,83 +962,72 @@ class RowLaws:
                         max_blocks=solver.placement.contact_capacity_blocks,
                     )
 
-        # Rigid-body velocity limits are matrix-free rows, not post-solve
-        # clamps, in the MF path. Allocate after contacts so they occupy the
-        # last MF slots; the fused PGS kernel also solves row_type=4 in a
-        # final phase so articulated and rigid velocity-limit rows are both
-        # visited after drive/contact/friction/position-limit rows.
-        if mf_active:
-            # Contact/friction rows all precede velocity-limit rows in the MF
-            # slot space (the classifier completes before the vlim allocation
-            # below). Record the partition boundary so the GS kernels can loop
-            # only the contact prefix in contact phases and only the vlim tail
-            # in velocity-limit phases instead of scanning all rows.
-            wp.copy(solver.placement.mf_contact_rows_end, solver.placement.mf_slot_counter)
-        if mf_active and solver.placement.rigid_velocity_limit_slot is not None:
-            # Dummy when no articulation metadata exists; the kernel only
-            # reads it for free-rigid roots, which then cannot occur.
-            root_dof_start = (
-                solver.forest.articulation_root_dof_start
-                if solver.forest.articulation_root_dof_start is not None
-                else wp.zeros((1,), dtype=wp.int32, device=model.device)
-            )
-            wp.launch(
-                allocate_rigid_velocity_limit_slots,
-                dim=solver.forest.free_rigid_body_count,
-                inputs=[
-                    bind_free_bodies(solver),
-                    model.body_flags,
-                    root_dof_start,
-                    solver.v_hat,
-                    solver.options.velocity_limit_activation_fraction,
-                    solver.placement.mf_max_constraints,
-                    solver.sweep.resolved_worlds,
-                ],
-                outputs=[
-                    solver.placement.rigid_velocity_limit_slot,
-                    solver.placement.mf_slot_counter,
-                    solver.placement.mf_first_rejected_slot,
-                ],
-                device=model.device,
-            )
-            wp.launch(
-                walk_rows.populate_rigid_velocity_limit_rows,
-                dim=solver.forest.free_rigid_body_count,
-                inputs=[
-                    bind_free_bodies(solver),
-                    bind_dense_rows(solver.placement),
-                    walk_rows.free_body_sink(solver),
-                    solver.placement.rigid_velocity_limit_slot,
-                ],
-                device=model.device,
-            )
-            wp.launch(
-                finalize_constraint_counts_with_status,
-                dim=solver.forest.world_count,
-                inputs=[
-                    solver.placement.mf_slot_counter,
-                    solver.placement.mf_max_constraints,
-                    1,
-                    solver.placement.mf_first_rejected_slot,
-                ],
-                outputs=[solver.placement.mf_constraint_count, solver.placement.constraint_capacity_status],
-                device=model.device,
-            )
-
         if slots and not slots_written:
             # Without contact rows the sparse diagonal's rows are its limits.
             self.write_slot_rows(solver, ContactInput(), patch_row_law(solver), dt)
-        if solver.placement.row_packets is not None:
-            solver.placement.row_packets.finish_rows()
+
+    def bound_free_body_contacts(self, solver) -> None:
+        """Record where the free bodies' contact rows end: every contact and friction row precedes the velocity-limit
+        rows in the matrix-free slots, so the sweeps loop the contact prefix in the contact phases and the limits' tail
+        in the velocity-limit phase (staged with free bodies)."""
+        wp.copy(solver.placement.mf_contact_rows_end, solver.placement.mf_slot_counter)
+
+    def write_free_body_limits(self, solver) -> None:
+        """The free bodies' speed limits as matrix-free rows, not post-solve clamps: allocated after the contacts so
+        they hold the last free-body slots, which the sweeps visit in a final phase with the joints' velocity limits;
+        then the free-body counts finalized again (staged with free bodies that carry speed-limit slots)."""
+        placement, model = solver.placement, solver.model
+        # Without articulation metadata no root is a free rigid body's, so the kernel reads no root's first DOF.
+        root_dof_start = solver.forest.articulation_root_dof_start
+        if root_dof_start is None:
+            root_dof_start = placement.dummy_is_free_rigid
+        wp.launch(
+            allocate_rigid_velocity_limit_slots,
+            dim=solver.forest.free_rigid_body_count,
+            inputs=[
+                bind_free_bodies(solver),
+                model.body_flags,
+                root_dof_start,
+                solver.v_hat,
+                solver.options.velocity_limit_activation_fraction,
+                placement.mf_max_constraints,
+                solver.sweep.resolved_worlds,
+            ],
+            outputs=[placement.rigid_velocity_limit_slot, placement.mf_slot_counter, placement.mf_first_rejected_slot],
+            device=model.device,
+        )
+        wp.launch(
+            walk_rows.populate_rigid_velocity_limit_rows,
+            dim=solver.forest.free_rigid_body_count,
+            inputs=[
+                bind_free_bodies(solver),
+                bind_dense_rows(placement),
+                walk_rows.free_body_sink(solver),
+                placement.rigid_velocity_limit_slot,
+            ],
+            device=model.device,
+        )
+        self._finalize(solver, 1)
+
+    def _finalize(self, solver, family: int) -> None:
+        """Finalize a row class's counts with status (0: the dense rows, 1: the free bodies')."""
+        placement = solver.placement
         wp.launch(
             finalize_constraint_counts_with_status,
             dim=solver.forest.world_count,
-            inputs=[solver.placement.slot_counter, max_constraints, 0, solver.placement.dense_first_rejected_slot],
-            outputs=[solver.placement.constraint_count, solver.placement.constraint_capacity_status],
-            device=model.device,
+            inputs=[
+                placement.row_slot_counter[family],
+                (placement.dense_max_constraints, placement.mf_max_constraints)[family],
+                family,
+                placement.row_first_rejected[family],
+            ],
+            outputs=[placement.row_count[family], placement.constraint_capacity_status],
+            device=solver.model.device,
         )
-        if solver.placement.keyed_rows is not None:
-            solver.placement.keyed_rows.finish_rows()
+
+    def finalize_dense(self, solver) -> None:
+        """Finalize the dense rows' counts with status, after every dense producer (the local row packets' included)."""
+        self._finalize(solver, 0)
 
     def write_rhs(self, solver, dt: float) -> None:
         """Each dense row's rhs: its bias, or a bouncing contact's rebound (``compute_world_contact_bias``), where no

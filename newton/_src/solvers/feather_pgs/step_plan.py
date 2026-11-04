@@ -568,6 +568,21 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     def write_contacts(step):
         laws.write_contacts(solver, step.state_in, factor, step.contacts, step.dt)
 
+    def bound_free_body_contacts(step):
+        laws.bound_free_body_contacts(solver)
+
+    def write_free_body_limits(step):
+        laws.write_free_body_limits(solver)
+
+    def finish_packets(step):
+        placement.row_packets.finish_rows()
+
+    def finalize_dense(step):
+        laws.finalize_dense(solver)
+
+    def finish_keyed(step):
+        placement.keyed_rows.finish_rows()
+
     # The dense rows' family bounds exist where the row pass holds the dense rows' order (no packets, no keyed rows).
     bounds = not (packets or keyed)
     write_rows = (
@@ -580,6 +595,15 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         *((write_velocity_limits,) if laws.velocity_limit_warp_kernels and not keyed else ()),
         *((bound_velocity_limits,) if bounds else ()),
         write_contacts,
+        *((bound_free_body_contacts,) if forest.has_free_rigid_bodies else ()),
+        *(
+            (write_free_body_limits,)
+            if forest.has_free_rigid_bodies and placement.rigid_velocity_limit_slot is not None
+            else ()
+        ),
+        *((finish_packets,) if packets else ()),
+        finalize_dense,
+        *((finish_keyed,) if keyed else ()),
     )
 
     def link_patches(step):

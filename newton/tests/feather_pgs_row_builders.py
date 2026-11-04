@@ -19,6 +19,7 @@ from unittest import mock
 import warp as wp
 
 from newton._src.solvers.feather_pgs import keyed_rows
+from newton._src.solvers.feather_pgs.step_plan import StepPlan
 
 # Every kernel a contact-row producer launches to write dense contact rows outside the sweep: the one writer, the
 # compact contact boundary, local row packets and keyed rows. The free-body matrix-free rows follow the allocation path, not a producer. Add every
@@ -85,6 +86,8 @@ def install_cpu_keyed_rows(solver):
         solver.spec, route=dataclasses.replace(solver.spec.route, case="K4", producer="keyed_rows")
     )
     solver.placement.keyed_rows = keyed_rows.KeyedRows(solver)
+    # The step's stages are chosen from the class at construction: the keyed class stages its own.
+    solver._plan = StepPlan.build(solver.spec, solver)
 
 
 def assert_row_builders_named(test, contact_rows, keys):
