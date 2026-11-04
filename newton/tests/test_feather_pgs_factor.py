@@ -57,7 +57,7 @@ from newton._src.solvers.feather_pgs.factor.walk import (
     local_frames,
     unpack_walk_records,
 )
-from newton._src.solvers.feather_pgs.kernel_template import THREADS, KernelTemplate, params
+from newton._src.solvers.feather_pgs.kernel_template import KernelTemplate, items, params
 from newton._src.solvers.feather_pgs.placement import Placement
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
 from newton._src.solvers.feather_pgs.sweep import PGS_LOCAL_SOLVE_OWNER_GENERAL
@@ -1493,13 +1493,13 @@ def walk_kernels(table: tuple, rows: int) -> tuple:
     tag = hashlib.sha256(repr(table).encode()).hexdigest()[:12]
     sizes = {"coordinate": WALK_COORDINATE, "link": WALK_LINK, "now": WALK_NOW}
     up = KernelTemplate(
-        f"walk_up_{rows}_{tag}", _UP_PARAMS, substitute(_UP, rows=rows, **sizes), THREADS, (prelude,), dual=True
+        f"walk_up_{rows}_{tag}", _UP_PARAMS, substitute(_UP, rows=rows, **sizes), items("tid", flat=True), (prelude,), dual=True
     )
     tree = KernelTemplate(
         f"walk_tree_{tag}",
         _TREE_PARAMS,
         substitute(_TREE, coordinate=WALK_COORDINATE, link=WALK_LINK),
-        THREADS,
+        items("tid", flat=True),
         (factor_walk.walk_down_prelude((ts.WalkClass(*table),)),),
         dual=True,
     )
@@ -2008,7 +2008,7 @@ def both_ways_kernel(table: tuple):
     # The loop form's tables take the one access's WALK_CONSTANT.
     prelude = DevicePrelude(f"walk_both_{walk.tag}", text, cpu=text)
     preludes = (factor_walk.walk_loads_prelude(), prelude)
-    return KernelTemplate(f"walk_both_{walk.tag}", _BOTH_PARAMS, _BOTH, THREADS, preludes, dual=True).kernel()
+    return KernelTemplate(f"walk_both_{walk.tag}", _BOTH_PARAMS, _BOTH, items("tid", flat=True), preludes, dual=True).kernel()
 
 
 def both_ways(table: tuple, device, rng) -> tuple:
