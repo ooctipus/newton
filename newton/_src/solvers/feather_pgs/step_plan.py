@@ -536,8 +536,50 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     def classify_resolved_worlds(step):
         resolved.classify(step.state_in, factor, step.contacts, step.dt)
 
-    def write_rows(step):
-        laws.write(solver, step.state_in, factor, step.contacts, step.dt)
+    # The row pass, its families in the launch order that is the slot order (rows.py): each family a class holds.
+    packets, keyed = placement.row_packets is not None, placement.keyed_rows is not None
+    limit_sizes = laws.limit_sizes(solver) if solver.options.enable_joint_limits and not (packets or keyed) else ()
+
+    def begin_rows(step):
+        laws.begin(solver, step.state_in, factor, step.dt)
+
+    def write_mimics(step):
+        laws.write_mimics(solver, step.state_in, step.dt)
+
+    def write_links(step):
+        laws.write_links(solver, step.state_in, factor)
+
+    def prepare_fused_limits(step):
+        laws.prepare_fused_limits(solver, step.state_in, step.dt)
+
+    def write_limits(step):
+        laws.write_limits(solver, step.state_in, step.dt, limit_sizes)
+
+    def bound_limits(step):
+        laws.bound_phase(solver, 0)
+
+    def write_velocity_limits(step):
+        laws.write_velocity_limits(solver, step.state_in, step.dt)
+
+    def bound_velocity_limits(step):
+        laws.bound_phase(solver, 1)
+
+    def write_contacts(step):
+        laws.write_contacts(solver, step.state_in, factor, step.contacts, step.dt)
+
+    # The dense rows' family bounds exist where the row pass holds the dense rows' order (no packets, no keyed rows).
+    bounds = not (packets or keyed)
+    write_rows = (
+        begin_rows,
+        *((write_mimics,) if laws.mimic_warp_kernels and not packets else ()),
+        *((write_links,) if laws.link_count > 0 else ()),
+        *((prepare_fused_limits,) if placement.fused_diagonal_joint_limits else ()),
+        *((write_limits,) if limit_sizes else ()),
+        *((bound_limits,) if bounds else ()),
+        *((write_velocity_limits,) if laws.velocity_limit_warp_kernels and not keyed else ()),
+        *((bound_velocity_limits,) if bounds else ()),
+        write_contacts,
+    )
 
     def link_patches(step):
         laws.link_patches(solver, step.contacts)
@@ -571,7 +613,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     link = (link_patches,) if laws.friction_anchors_enabled else ()
     add(
         *((classify_resolved_worlds,) if resolved is not None else ()),
-        write_rows,
+        *write_rows,
         *(link if spec.rhs != "walk" else ()),
         latch_status,
         claim,

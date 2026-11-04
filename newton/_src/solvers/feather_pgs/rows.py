@@ -14,8 +14,9 @@
 - :attr:`RowLaws.set`, the route table's laws axis (:class:`.route_table.Laws`), once the bilateral pre-elimination
   is decided.
 
-:meth:`RowLaws.write` is the step's one row pass: every row producer of every placement, in the launch order that
-fixes the slot order, and :meth:`RowLaws.write_rhs` the dense rows' right-hand sides once their diagonals are known.
+The step's row pass is the families' methods, from :meth:`RowLaws.begin` to :meth:`RowLaws.write_contacts`, in the
+launch order that fixes the slot order (the stage list runs those a class holds), and :meth:`RowLaws.write_rhs` the
+dense rows' right-hand sides once their diagonals are known.
 The device law functions stay in :mod:`.row_laws`, :mod:`.row_build` and :mod:`.prefix_rows`.
 """
 
@@ -640,13 +641,149 @@ class RowLaws:
             device=solver.model.device,
         )
 
-    def write(self, solver, state_in: State, state_aug: State, contacts: Contacts, dt: float) -> None:
-        """The step's row pass: every row of every placement, with its records, its slot and its phase bounds.
+    # The row pass, in the launch order that is the slot order: the allocators reserve slots with atomics, in the order
+    # mimic, link, joint limit, velocity limit, contacts, then the free bodies' rows, and the phase-bound snapshots are
+    # glued to that sequence. The stage list (:func:`.step_plan._stages`) runs the families a class holds, in this
+    # order: :meth:`begin`, :meth:`write_mimics`, :meth:`write_links`, :meth:`prepare_fused_limits`,
+    # :meth:`write_limits`, :meth:`bound_phase` (0), :meth:`write_velocity_limits`, :meth:`bound_phase` (1), then
+    # :meth:`write_contacts`, which finalizes the counts with status.
+    #
+    # Dense row-family layout: slots are handed out in the order [mimic][joint-limit][joint-velocity-limit]
+    # [contact/friction], so each family owns one contiguous dense row range:
+    #   mimic and position limits: [0, bounds[0])
+    #   velocity limits:           [bounds[0], bounds[1])
+    #   contacts and friction:     [bounds[1], m_dense)
+    # Mimic rows come first, ahead of the (activation-gated, flickering) limit family, so warm-started mimic lambdas
+    # keep a stable slot index across steps.
 
-        The launch order is the slot order: the allocators reserve slots with atomics, in the order mimic, link,
-        joint limit, velocity limit, contacts, then the free bodies' rows, and the phase-bound snapshots are glued
-        to that sequence. The pass then finalizes the counts with status; the stage list links the friction patches,
-        latches the status and claims the sweep's rows after it (:func:`.step_plan._stages`).
+    def begin(self, solver, state_in: State, state_aug: State, dt: float) -> None:
+        """Clear the rows' allocation state, and start the local row packets' and the keyed rows' step where the class
+        holds them."""
+        placement = solver.placement
+        placement.begin()
+        if placement.row_packets is not None:
+            placement.row_packets.prepare_prefix(state_in, dt)
+        if placement.keyed_rows is not None:
+            placement.keyed_rows.begin_rows(state_in, state_aug, dt)
+
+    def _prefix_law(self, solver, law, state_in: State, dt: float, **extra):
+        """A joint row family's law (:mod:`.prefix_rows`), bound for this step."""
+        return field_group.bind(
+            law,
+            solver=solver,
+            placement=solver.placement,
+            factor=solver.factor,
+            laws=self,
+            options=solver.options,
+            model=solver.model,
+            state_in=state_in,
+            dt=dt,
+            **extra,
+        )
+
+    def write_mimics(self, solver, state_in: State, dt: float) -> None:
+        """The mimic (joint coupling) equality rows, a static count per model: one warp per articulation reserves,
+        writes and publishes them, as the joint limits (:mod:`.prefix_rows`); staged where no local row packets hold
+        them."""
+        law = self._prefix_law(solver, prefix_rows.PrefixMimicLaw, state_in, dt, mimics=self, mimic_model=solver.model)
+        support = solver.placement.row_support()
+        for size, warp_kernel in self.mimic_warp_kernels.items():
+            self._launch_prefix_warp(solver, warp_kernel, size, law, support)
+
+    def write_links(self, solver, state_in: State, state_aug: State) -> None:
+        """The links' rows, static per model, their sides the trees of the link's two pieces (staged with links)."""
+        model = solver.model
+        links = field_group.bind(Links, laws=self)
+        wp.launch(
+            allocate_link_slots,
+            dim=self.link_count,
+            inputs=[links, solver.placement.dense_max_constraints],
+            outputs=[solver.placement.slot_counter, solver.placement.dense_first_rejected_slot],
+            device=model.device,
+        )
+        wp.launch(
+            write_link_rows,
+            dim=self.link_count,
+            inputs=[
+                bind_joint_table(solver),
+                links,
+                state_in.body_q,
+                model.body_com,
+                solver.forest.body_to_joint,
+                solver.forest.body_to_articulation,
+                model.joint_ancestor,
+                state_aug.joint_S_s,
+                solver.factor.articulation_origin,
+                solver.options.pgs_beta,
+                solver.placement.row_support(),
+            ],
+            outputs=[solver.placement.packed_Z, bind_dense_rows(solver.placement)],
+            device=model.device,
+        )
+
+    def prepare_fused_limits(self, solver, state_in: State, dt: float) -> None:
+        """The fused diagonal's joint limits: each limit coordinate's activity and its two sides' rhs (staged where the
+        placement fuses them)."""
+        placement = solver.placement
+        wp.launch(
+            prepare_fused_diagonal_joint_limits,
+            dim=solver.forest.world_count * solver.forest.max_world_dofs,
+            inputs=[
+                bind_joint_table(solver),
+                solver.forest.world_dof_indices,
+                solver.forest.max_world_dofs,
+                placement.fused_diagonal_limit_dof_mask,
+                self.joint_limit_q_index,
+                state_in.joint_q,
+                solver.options.joint_limit_activation_gap,
+                solver.options.pgs_beta,
+                dt,
+                solver.v_hat,
+            ],
+            outputs=[
+                placement.fused_diagonal_limit_active,
+                placement.fused_diagonal_limit_lower_rhs,
+                placement.fused_diagonal_limit_upper_rhs,
+            ],
+            device=solver.model.device,
+        )
+
+    def limit_sizes(self, solver) -> tuple[int, ...]:
+        """The size groups whose joint limits the warp producers write: the limited sizes the fused diagonal does not
+        hold, in the forest's order."""
+        fused = solver.placement.fused_diagonal_joint_limit_sizes
+        return tuple(size for size in solver.forest.size_groups if size in self.joint_limit_sizes and size not in fused)
+
+    def write_limits(self, solver, state_in: State, dt: float, sizes: tuple[int, ...]) -> None:
+        """The joint position-limit rows of ``sizes`` (:meth:`limit_sizes`), one warp per articulation."""
+        law = self._prefix_law(solver, prefix_rows.PrefixLaw, state_in, dt)
+        support = solver.placement.row_support()
+        for size in sizes:
+            self._launch_prefix_warp(solver, self.joint_limit_warp_kernels[size], size, law, support)
+
+    def bound_phase(self, solver, phase: int) -> None:
+        """Snapshot the dense rows' family boundary ``phase`` (0: after the position limits, 1: after the velocity
+        limits), where the row pass holds the dense rows' order; a family that is off leaves the current count."""
+        wp.launch(
+            snapshot_dense_phase_bound,
+            dim=solver.forest.world_count,
+            inputs=[solver.placement.slot_counter, phase],
+            outputs=[solver.placement.dense_phase_bounds],
+            device=solver.model.device,
+        )
+
+    def write_velocity_limits(self, solver, state_in: State, dt: float) -> None:
+        """The joint velocity-limit rows (a per-DOF clamp on ``|qdot_i|``), one warp per articulation; the contact rows
+        follow them, and the sweeps visit them in a final pass whatever their slots (staged where no keyed rows hold
+        them)."""
+        law = self._prefix_law(solver, prefix_rows.PrefixVelocityLaw, state_in, dt, vhat=solver.v_hat)
+        support = solver.placement.row_support()
+        for size, warp_kernel in self.velocity_limit_warp_kernels.items():
+            self._launch_prefix_warp(solver, warp_kernel, size, law, support)
+
+    def write_contacts(self, solver, state_in: State, state_aug: State, contacts: Contacts, dt: float) -> None:
+        """The contact rows, the free bodies' rows and the sparse diagonal's, after the joint families; then every
+        class's counts finalized with status.
 
         Args:
             solver: The solver whose step this is: its model, options, plan and primitives.
@@ -657,19 +794,10 @@ class RowLaws:
         """
         model = solver.model
         max_constraints = solver.placement.dense_max_constraints
-        # Every row producer writes the dense row records through one struct, and the joint row producers read
-        # the joint table through another, both bound for this step.
-        dense_rows = bind_dense_rows(solver.placement)
-        joints = bind_joint_table(solver)
         mf_active = solver.forest.has_free_rigid_bodies
-
-        solver.placement.begin()
-
         has_free_rigid_flag = 1 if mf_active else 0
-        # Dummy arrays when MF is not active (kernel still needs valid pointers).
-        # Preallocated in __init__: a per-step wp.zeros here would add an
-        # allocation + memset every step and, under CUDA graph capture, leave
-        # the graph holding a pointer to a freed temporary.
+        # Dummy arrays when MF is not active (kernel still needs valid pointers), preallocated: a per-step wp.zeros
+        # would add an allocation and a memset every step and leave a captured graph a freed temporary.
         is_free_rigid = (
             solver.forest.is_free_rigid
             if solver.forest.is_free_rigid is not None
@@ -679,163 +807,6 @@ class RowLaws:
         dense_dropped_rows = solver.placement.row_dropped_dense
         mf_dropped_rows = solver.placement.row_dropped_mf
         mf_first_rejected_slot = solver.placement.mf_first_rejected_slot
-        support = solver.placement.row_support()
-        if solver.placement.row_packets is not None:
-            solver.placement.row_packets.prepare_prefix(state_in, dt)
-        if solver.placement.keyed_rows is not None:
-            solver.placement.keyed_rows.begin_rows(state_in, state_aug, dt)
-
-        # ── Dense row-family layout ──────────────────────────────────────
-        # Slots are handed out in the order [mimic][joint-limit]
-        # [joint-velocity-limit][contact/friction], so each family owns one
-        # contiguous dense row range:
-        #   mimic and position limits: [0, bounds[0])
-        #   velocity limits:           [bounds[0], bounds[1])
-        #   contacts and friction:     [bounds[1], m_dense)
-        # The two snapshot_dense_phase_bound launches below record the family
-        # boundaries and must stay glued to this allocation sequence
-        # (slot_counter is zeroed at the top of this method). Mimic rows come
-        # first, ahead of the (activation-gated, flickering) limit family, so
-        # warm-started mimic lambdas keep a stable slot index across steps.
-
-        # Mimic (joint coupling) equality rows — static count per model. One warp per articulation reserves, writes
-        # and publishes them, as the joint limits (prefix_rows).
-        if self.mimic_warp_kernels and solver.placement.row_packets is None:
-            mimic_law = field_group.bind(
-                prefix_rows.PrefixMimicLaw,
-                solver=solver,
-                placement=solver.placement,
-                factor=solver.factor,
-                laws=self,
-                options=solver.options,
-                model=model,
-                state_in=state_in,
-                dt=dt,
-                mimics=self,
-                mimic_model=model,
-            )
-            for size, warp_kernel in self.mimic_warp_kernels.items():
-                self._launch_prefix_warp(solver, warp_kernel, size, mimic_law, support)
-
-        # The links' rows: static per model, their sides the trees of the link's two pieces.
-        if self.link_count > 0:
-            links = field_group.bind(Links, laws=self)
-            wp.launch(
-                allocate_link_slots,
-                dim=self.link_count,
-                inputs=[links, max_constraints],
-                outputs=[solver.placement.slot_counter, solver.placement.dense_first_rejected_slot],
-                device=model.device,
-            )
-            wp.launch(
-                write_link_rows,
-                dim=self.link_count,
-                inputs=[
-                    joints,
-                    links,
-                    state_in.body_q,
-                    model.body_com,
-                    solver.forest.body_to_joint,
-                    solver.forest.body_to_articulation,
-                    model.joint_ancestor,
-                    state_aug.joint_S_s,
-                    solver.factor.articulation_origin,
-                    solver.options.pgs_beta,
-                    support,
-                ],
-                outputs=[solver.placement.packed_Z, dense_rows],
-                device=model.device,
-            )
-
-        if solver.placement.fused_diagonal_joint_limits:
-            wp.launch(
-                prepare_fused_diagonal_joint_limits,
-                dim=solver.forest.world_count * solver.forest.max_world_dofs,
-                inputs=[
-                    joints,
-                    solver.forest.world_dof_indices,
-                    solver.forest.max_world_dofs,
-                    solver.placement.fused_diagonal_limit_dof_mask,
-                    self.joint_limit_q_index,
-                    state_in.joint_q,
-                    solver.options.joint_limit_activation_gap,
-                    solver.options.pgs_beta,
-                    dt,
-                    solver.v_hat,
-                ],
-                outputs=[
-                    solver.placement.fused_diagonal_limit_active,
-                    solver.placement.fused_diagonal_limit_lower_rhs,
-                    solver.placement.fused_diagonal_limit_upper_rhs,
-                ],
-                device=model.device,
-            )
-
-        # Allocate and populate joint-limit rows per response-size group.
-        if (
-            solver.options.enable_joint_limits
-            and self.joint_limit_sizes
-            and solver.placement.row_packets is None
-            and solver.placement.keyed_rows is None
-        ):
-            # The native limit rows (prefix_rows) read the law and write the records through one struct.
-            law = field_group.bind(
-                prefix_rows.PrefixLaw,
-                solver=solver,
-                placement=solver.placement,
-                factor=solver.factor,
-                laws=self,
-                options=solver.options,
-                model=model,
-                state_in=state_in,
-                dt=dt,
-            )
-            for size in solver.forest.size_groups:
-                if size not in self.joint_limit_sizes or size in solver.placement.fused_diagonal_joint_limit_sizes:
-                    continue
-                self._launch_prefix_warp(solver, self.joint_limit_warp_kernels[size], size, law, support)
-
-        # Unconditional: the first boundary must include position-limit
-        # rows and remain valid when that family is disabled (when it is just
-        # the current watermark at the start of the velocity-limit segment).
-        if solver.placement.row_packets is None and solver.placement.keyed_rows is None:
-            wp.launch(
-                snapshot_dense_phase_bound,
-                dim=solver.forest.world_count,
-                inputs=[solver.placement.slot_counter, 0],
-                outputs=[solver.placement.dense_phase_bounds],
-                device=model.device,
-            )
-
-        # The joint velocity-limit rows (per-DOF clamp on |qdot_i| against model.joint_velocity_limit). Dense contact
-        # rows are allocated after this block so contact/friction rows form the trailing per-world slot segment; the
-        # sweeps visit velocity-limit rows in a dedicated final pass regardless of slot order. One warp per
-        # articulation reserves, writes and publishes them, as the joint limits (prefix_rows).
-        if self.velocity_limit_warp_kernels and solver.placement.keyed_rows is None:
-            velocity_law = field_group.bind(
-                prefix_rows.PrefixVelocityLaw,
-                solver=solver,
-                placement=solver.placement,
-                factor=solver.factor,
-                laws=self,
-                options=solver.options,
-                model=model,
-                state_in=state_in,
-                dt=dt,
-                vhat=solver.v_hat,
-            )
-            for size, warp_kernel in self.velocity_limit_warp_kernels.items():
-                self._launch_prefix_warp(solver, warp_kernel, size, velocity_law, support)
-
-        # Unconditional velocity-limit boundary snapshot; dense contact rows start here.
-        if solver.placement.row_packets is None and solver.placement.keyed_rows is None:
-            wp.launch(
-                snapshot_dense_phase_bound,
-                dim=solver.forest.world_count,
-                inputs=[solver.placement.slot_counter, 1],
-                outputs=[solver.placement.dense_phase_bounds],
-                device=model.device,
-            )
 
         # The sparse diagonal on the walk (FL3.5): its rows read the slips' release (the predictor's border), its
         # contact producers among them.

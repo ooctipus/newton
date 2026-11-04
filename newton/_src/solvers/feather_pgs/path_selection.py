@@ -365,7 +365,7 @@ def _row_builder(solver, plan, size) -> dict:
 def _contact_rows(solver) -> dict:
     row = solver.spec.route
     point = bool(row.laws.point)
-    # The plan the row pass (RowLaws.write) dispatches on: the route's producer writes every contact row.
+    # The plan the row pass (RowLaws.write_contacts) dispatches on: the route's producer writes every contact row.
     plan = contact_row_plan(solver)
     packets = solver.placement.row_packets
     return {
@@ -677,7 +677,7 @@ def _velocity_limits(solver) -> dict:
         "prescale_lanes": int(solver.laws.velocity_prescale_lanes) if prescale else 0,
         "activation_fraction": json_value(solver.options.velocity_limit_activation_fraction),
         "rigid_body_limits": limits,
-        # Mirrors Placement.allocate_free_body_rows and the row allocation of RowLaws.write (both modes). At an
+        # Mirrors Placement.allocate_free_body_rows and the row allocation of RowLaws.write_contacts (both modes). At an
         # infinite activation fraction the allocator still launches but reserves no row.
         "free_body_rows": bool(limits and solver.forest.free_rigid_body_count > 0),
     }
