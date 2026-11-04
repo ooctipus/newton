@@ -152,7 +152,7 @@ class StepSpec:
         model, sweep, placement = solver.model, solver.sweep, solver.placement
         streams = (
             ("dynamics", solver.factor.dynamics_stream),
-            ("paired_general", sweep.paired_general_solve_stream),
+            *((f"claim{i}", stream) for i, stream in enumerate(sweep.claim_streams)),
         )
         return cls(
             device=device(model.device),

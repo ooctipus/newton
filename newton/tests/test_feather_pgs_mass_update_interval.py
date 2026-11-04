@@ -413,7 +413,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         solver = object.__new__(SolverFeatherPGS)
         paired = object()
         dynamics = object()
-        solver.sweep = SimpleNamespace(paired_general_solve_stream=paired)
+        solver.sweep = SimpleNamespace(claim_streams=(paired,))
         solver.factor = SimpleNamespace(dynamics_stream=dynamics)
         solver.model = mock.Mock(device=object())
         with (

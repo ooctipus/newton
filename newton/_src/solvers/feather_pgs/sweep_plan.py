@@ -1162,24 +1162,33 @@ class Sweep:
         self.leaves = self.factor.walk_arts is not None and bool(self.placement.walks or self.tiers)
 
     def open_streams(self, *, overlap: bool) -> None:
-        """Open the paired factor sweep's side stream, where it overlaps the matrix-free sweep.
+        """Open the claims' streams: the sweeps that own their worlds run on them beside the matrix-free sweep.
 
-        None of this solver's side streams (the paired sweep, inertia, dynamics, memset) reads contact rows or the
+        The claims touch nothing the matrix-free sweep touches, so they fork after the rows are published and join
+        before the leave:
+
+        - the paired factor sweep over independent components (admitted on CUDA, under the factor-coordinate sweep's
+          plain policy), whose coordinates of a split world are disjoint from the general sweep's;
+        - the Jacobi tiers, whose worlds hold no free-body row, the worlds the matrix-free sweep returns from. A tier's
+          worlds are those of its row count, so each tier is a claim of its own.
+
+        A stream a claim: the first takes the paired factor sweep where it forks, then the tiers' lists and the first
+        tier; every other tier its own, once the lists are written.
+
+        None of this solver's side streams (the claims, inertia, dynamics, memset) reads contact rows or the
         contact pool's ready count: they run factorizations, response and row sweeps over dense and matrix-free rows,
         and articulation data, while contact rows are read on the launch stream, which the pool registers. A trim
         therefore waits for none of them (:meth:`ContactPool.add_reader_stream`).
         """
         model = self.model
-        # With independent components the paired factor sweep and the general
-        # matrix-free sweep touch disjoint coordinates of a split world, so
-        # they fork after response preparation and join before publication.
-        # Components are admitted on CUDA, under the factor-coordinate sweep's plain policy.
-        paired_overlap = bool(
-            self.paired_components is not None and self.paired_factor_kernel is not None and not self.tiers and overlap
+        self.paired_forks = bool(
+            overlap and self.paired_components is not None and self.paired_factor_kernel is not None
         )
-        self.paired_general_solve_stream = wp.Stream(model.device) if paired_overlap else None
-        self.paired_general_ready = wp.Event(model.device) if paired_overlap else None
-        self.paired_general_done = wp.Event(model.device) if paired_overlap else None
+        claims = max(int(self.paired_forks), len(self.tiers)) if wp.get_device(model.device).is_cuda and overlap else 0
+        self.claim_streams = tuple(wp.Stream(model.device) for _ in range(claims))
+        self.claims_ready = wp.Event(model.device) if claims else None
+        self.claims_listed = wp.Event(model.device) if claims > 1 else None
+        self.claims_done = tuple(wp.Event(model.device) for _ in range(claims))
 
     def claim(self) -> None:
         """Publish the schedule of the rows the row pass wrote and each owner's worlds (run after every producer)."""
@@ -1376,8 +1385,8 @@ class Sweep:
         )
 
     def _solve_claims(self, operands: dict) -> None:
-        """The other cases: the paired factor sweep's worlds (on its stream where it overlaps), the Jacobi tiers', then
-        the matrix-free sweep of the rest."""
+        """The other cases: the claims that own their worlds (the paired factor sweep's, the Jacobi tiers'), on the
+        claims' stream where it is open (:meth:`open_streams`), beside the matrix-free sweep of the rest."""
         iterations = self.options.pgs_iterations
         mf_gs_kernel = self.mf_gs_kernel
         if mf_gs_kernel is None:
@@ -1389,10 +1398,8 @@ class Sweep:
         components = self.paired_components
         if components is not None:
             components.prepare(self, self.placement.rhs, self.placement.mf_meta_packed)
-        factor_stream = self.paired_general_solve_stream
-        if factor_stream is not None:
-            wp.get_stream(self.model.device).record_event(self.paired_general_ready)
-            factor_stream.wait_event(self.paired_general_ready)
+        streams = self.claim_streams
+        main = wp.get_stream(self.model.device) if streams else None
 
         walked = {}
         if factor_kernel is not None and self.placement.walks:
@@ -1405,7 +1412,6 @@ class Sweep:
                     operands,
                     (self.forest.world_count + 1) // 2,
                     64,
-                    stream=factor_stream,
                     world_count=self.forest.world_count,
                     # The factor rows: the packed rows at their world coordinates.
                     factor_rows=self.placement.packed_Z,
@@ -1417,14 +1423,14 @@ class Sweep:
                     **walked,
                 )
 
-        if factor_kernel is not None and factor_stream is None:
-            launch_factor_solve()
-        with self.timed(f"mfgs_iters{iterations}"):
-            # The sweeps leave by the walk (sweep_routes.leave_all) and find a free body's tree in it.
-            walk = {} if self.factor.walk_arts is None else {"walk": self.factor.walk_view()}
-            # The tiers own the worlds with only dense rows inside their row bound; the general sweep returns
-            # early for those and solves the rest.
-            tier_lists = self.tier_worlds is not None
+        # The sweeps leave by the walk (sweep_routes.leave_all) and find a free body's tree in it.
+        walk = {} if self.factor.walk_arts is None else {"walk": self.factor.walk_view()}
+
+        # The tiers own the worlds with only dense rows inside their row bound; the general sweep returns early for
+        # those and solves the rest.
+        tier_lists = self.tier_worlds is not None
+
+        def list_tiers():
             if tier_lists:
                 self.tier_counts.zero_()
                 wp.launch(
@@ -1440,23 +1446,39 @@ class Sweep:
                     outputs=[self.tier_worlds, self.tier_counts],
                     device=self.model.device,
                 )
+
+        def launch_tier(tier):
+            named = dict(walk)
+            dim = self.forest.world_count
+            if tier_lists:
+                # This tier grid-strides over its own compacted world list.
+                dim = tier.grid
+                named.update(
+                    general_world_count=self.tier_count_views[tier.tier],
+                    general_worlds=self.tier_world_views[tier.tier],
+                    general_world_grid_stride=tier.grid,
+                )
+            named.update(self.placement.inkernel_response_inputs())
+            if tier.kinetic_rows:
+                keyed = self.placement.keyed_rows.parallel_arguments()
+                named.update(zip(("kinetic_rows", "patch_law"), keyed, strict=False))
+            self._launch(tier.kernel, operands, dim, tier.work.block, **named)
+
+        # The claims in their order, the paired factor sweep's worlds then the tiers'. A paired factor sweep without
+        # independent components shares worlds with the general sweep, so it runs ahead of the fork.
+        fork_factor = bool(streams) and self.paired_forks
+        if factor_kernel is not None and not fork_factor:
+            launch_factor_solve()
+        if streams:
+            main.record_event(self.claims_ready)
+            for stream in streams:
+                stream.wait_event(self.claims_ready)
+        with self.timed(f"mfgs_iters{iterations}"):
+            if not streams:
+                list_tiers()
+                for tier in self.tiers:
+                    launch_tier(tier)
             colored_kernel = self.mf_colored_kernel
-            for tier in self.tiers:
-                named = dict(walk)
-                dim = self.forest.world_count
-                if tier_lists:
-                    # This tier grid-strides over its own compacted world list.
-                    dim = tier.grid
-                    named.update(
-                        general_world_count=self.tier_count_views[tier.tier],
-                        general_worlds=self.tier_world_views[tier.tier],
-                        general_world_grid_stride=tier.grid,
-                    )
-                named.update(self.placement.inkernel_response_inputs())
-                if tier.kinetic_rows:
-                    keyed = self.placement.keyed_rows.parallel_arguments()
-                    named.update(zip(("kinetic_rows", "patch_law"), keyed, strict=False))
-                self._launch(tier.kernel, operands, dim, tier.work.block, **named)
             colored = {} if colored_kernel is None else self.colored_units.operands()
             self._launch(mf_gs_kernel, operands, self.forest.world_count, 32, **walk, **colored)
             if colored_kernel is not None:
@@ -1464,12 +1486,23 @@ class Sweep:
                 self._launch(
                     colored_kernel, operands, self.forest.world_count, sweep_routes.COLORED_THREADS, **walk, **colored
                 )
-        if factor_stream is not None:
-            # Queue the scarce general tail first; the independent paired
-            # grid shares only the pre-solve ready dependency with it.
-            launch_factor_solve()
-            factor_stream.record_event(self.paired_general_done)
-            wp.get_stream(self.model.device).wait_event(self.paired_general_done)
+        if streams:
+            # The general tail is queued first; the claims share only the ready dependency with it.
+            with wp.ScopedStream(streams[0], sync_enter=False):
+                if fork_factor:
+                    launch_factor_solve()
+                list_tiers()
+            if self.claims_listed is not None:
+                streams[0].record_event(self.claims_listed)
+            for t, tier in enumerate(self.tiers):
+                stream = streams[t]
+                if t:
+                    stream.wait_event(self.claims_listed)
+                with wp.ScopedStream(stream, sync_enter=False):
+                    launch_tier(tier)
+            for stream, done in zip(streams, self.claims_done, strict=True):
+                stream.record_event(done)
+                main.wait_event(done)
 
     @staticmethod
     def patch_frame_built(contacts):

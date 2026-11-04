@@ -387,7 +387,7 @@ def _paired_response(solver) -> dict:
     if primary is None:
         return {"enabled": False, "reason": solver.sweep.paired_response_reason}
     factor = row.case == "K5"
-    overlap = solver.sweep.paired_general_solve_stream is not None
+    overlap = bool(solver.sweep.claim_streams) and solver.sweep.paired_forks
     return {
         "enabled": True,
         "primary_dofs": int(primary),
@@ -402,8 +402,7 @@ def _paired_response(solver) -> dict:
         "two_stream_overlap": overlap,
         "two_stream_reason": "The paired factor sweep and the general sweep fork onto two streams."
         if overlap
-        else "Overlap needs independent components on parallel CUDA streams without debug, warm start or "
-        "parallel tiers.",
+        else "Overlap needs independent components on parallel CUDA streams without debug.",
         "reason": "One articulation factor and one free body per world share one response"
         + (" in factor coordinates." if factor else " with a register inverse."),
     }
