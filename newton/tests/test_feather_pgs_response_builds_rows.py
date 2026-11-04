@@ -38,7 +38,7 @@ class TestFreeBodyZBuild(unittest.TestCase):
         self.assertIn("int dof_b = (packed_dofs << 16) >> 16;", consume)
         self.assertIn("float mf_diag = __int_as_float(meta.y);", consume)
         with self.assertRaises(ValueError):
-            response_builds_rows.free_body_meta_kernel(70000, 8 + 70000, 8, "sm_120")
+            response_builds_rows.free_body_meta_kernel(70000, 8 + 70000, 8, 32, "sm_120")
 
     def test_rows_see_the_dynamics_mass_matrix(self):
         """Whiten a free box's contact rows by the factor of its dynamics' mass matrix, armature included.
@@ -185,7 +185,7 @@ class TestNativeBuildsAssemble(unittest.TestCase):
 
     def test_native_builds_assemble_without_spills(self):
         builds = {
-            "free-body words": lambda: response_builds_rows.free_body_meta_kernel(64, 8 + 64, 8, "sm_120"),
+            "free-body words": lambda: response_builds_rows.free_body_meta_kernel(64, 8 + 64, 8, 32, "sm_120"),
             "paired components": lambda: response_builds_rows.paired_components_kernel(22),
         }
         for name, build in builds.items():

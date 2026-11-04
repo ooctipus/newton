@@ -90,6 +90,7 @@ def _pack_state(has_free_rigid_bodies):
     """Stand in for a solver with opaque metadata-pack operands."""
     state = SimpleNamespace(
         pack_mf_meta_kernel=object(),
+        mf_meta_lanes=32,
         model=SimpleNamespace(device="mock-device"),
         forest=SimpleNamespace(
             has_free_rigid_bodies=has_free_rigid_bodies, world_count=7, articulation_world_dof_offset=object()
@@ -135,7 +136,7 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
         """Preserve the existing word layout using defined unsigned shift arithmetic."""
         parents = np.array([-1, 0, 32767, 32768, 37247, 65534], np.int32)
         expected = (((parents.astype(np.int64) & 65535) << 16) | 2).astype(np.uint32).view(np.int32)
-        kernel = response_builds_rows.free_body_meta_kernel(65535, 8 + 65535, 8, "cpu")
+        kernel = response_builds_rows.free_body_meta_kernel(65535, 8 + 65535, 8, 32, "cpu")
         source = max(_native_snippets(kernel), key=len)
         result = wp.zeros(len(parents), dtype=int, device="cpu")
         wp.launch(
@@ -209,11 +210,11 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
     def test_capacity_guard_does_not_alias_the_parent_sentinel(self):
         """Reject unsupported packed capacity before allocating solver row buffers."""
         for capacity in (65535, 0):
-            response_builds_rows.free_body_meta_kernel(capacity, 8 + capacity, 8, "cpu")
+            response_builds_rows.free_body_meta_kernel(capacity, 8 + capacity, 8, 32, "cpu")
         for capacity in (65536, 100000):
             with self.subTest(capacity=capacity):
                 with self.assertRaisesRegex(ValueError, "mf_max_constraints.*65535"):
-                    response_builds_rows.free_body_meta_kernel(capacity, 8 + capacity, 8, "cpu")
+                    response_builds_rows.free_body_meta_kernel(capacity, 8 + capacity, 8, 32, "cpu")
                 # Only the CUDA sweeps pack the row metadata.
                 if wp.is_cuda_available():
                     with self.assertRaisesRegex(ValueError, "mf_max_constraints.*65535"):
@@ -366,6 +367,7 @@ def _launch_pack_unconditionally(solver):
         solver.placement.mf_max_constraints,
         solver.placement.row_pitch,
         solver.placement.body_base,
+        solver.placement.mf_meta_lanes,
         solver.model.device.arch,
     )
 

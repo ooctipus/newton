@@ -40,6 +40,7 @@ from .kernels import (
     prepare_world_impulses,
     record_world_contact_runs,
 )
+from .launch import fill_lanes
 from .row_metadata import _validate_mf_metadata_encoding
 from .solver_fields import (
     CAPACITY_STATUS,
@@ -526,10 +527,12 @@ class Placement:
         skips its launch. The rows then hold one slot per world and the per-world
         counts keep their real width.
         """
-        # Only free rigid bodies produce matrix-free rows, which the CUDA step packs each step.
+        # Only free rigid bodies produce matrix-free rows, which the CUDA step packs each step: a world's lanes a warp,
+        # or a block when few worlds would idle the device.
+        self.mf_meta_lanes = fill_lanes(self.forest.world_count, model.device)
         self.pack_mf_meta_kernel = (
             response_builds_rows.free_body_meta_kernel(
-                self.mf_max_constraints, self.row_pitch, self.body_base, model.device.arch
+                self.mf_max_constraints, self.row_pitch, self.body_base, self.mf_meta_lanes, model.device.arch
             )
             if self.forest.has_free_rigid_bodies and self.mf_max_constraints > 0
             else None
@@ -1064,7 +1067,7 @@ class Placement:
                 self.row_parent,
             ],
             outputs=[self.mf_meta_packed],
-            block_dim=32,
+            block_dim=self.mf_meta_lanes,
             device=self.model.device,
         )
 

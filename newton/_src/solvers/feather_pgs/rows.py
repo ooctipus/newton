@@ -62,6 +62,7 @@ from .kernels import (
     snapshot_dense_phase_bound,
     write_link_rows,
 )
+from .launch import fill_lanes
 from .route_table import Laws
 from .row_build import contact_row_prelude, populate_world_J_masked
 from .row_laws import LINK_ROWS, ROW_LAW
@@ -95,7 +96,8 @@ _ROWS_THREADS_X = 4
 _CONTACT_JACOBIAN_WORKER_CAP = 4096
 
 BIAS_LANES = 256
-"""The most threads a world's rows get in the bias launch (:func:`.kernels.compute_world_contact_bias`): a block."""
+"""The fewest threads a world's rows get in the bias launch (:func:`.kernels.compute_world_contact_bias`), a block:
+fewer worlds than fill the device take more (:func:`.launch.fill_lanes`), at most the rows' capacity."""
 
 
 def velocity_prescale_launch(articulation_start: np.ndarray, *, joint_count: int, cuda: bool) -> tuple[int, int]:
@@ -1021,12 +1023,15 @@ class RowLaws:
                         clamp=True,
                     )
 
-            # The free bodies' contact rows, by the walk (walk_rows): a class with free bodies always walks.
+            # The free bodies' contact rows, by the walk (walk_rows): a class with free bodies always walks, on the
+            # walkers' threads (its walker and launch bound are the support writer's): a contact's rows are its own,
+            # so the stride changes no row.
             if mf_active:
+                walker_threads = walk_rows.support_threads(rows, solver.model.device)
                 pool.launch(
                     walk_rows.write_free_body_rows,
-                    contact_build_threads,
-                    inputs=[walk_rows.free_body_sink(solver), contact_input, contact_build_threads, law],
+                    walker_threads,
+                    inputs=[walk_rows.free_body_sink(solver), contact_input, walker_threads, law],
                     extent=count,
                     clamp=True,
                 )
@@ -1198,8 +1203,8 @@ class RowLaws:
 
     def _bias(self, solver, dt: float, counts: wp.array, capacity: int, base: int) -> None:
         """The rows' bias launch over a class of rows: ``counts`` a world, at most ``capacity``, from row ``base``."""
-        # A world's lanes: its capacity, up to a block.
-        lanes = min(capacity, BIAS_LANES)
+        # A world's lanes: a block, or enough that the worlds fill the device, at most its capacity.
+        lanes = min(capacity, fill_lanes(solver.forest.world_count, solver.model.device, BIAS_LANES))
         wp.launch(
             compute_world_contact_bias,
             dim=(solver.forest.world_count, lanes),

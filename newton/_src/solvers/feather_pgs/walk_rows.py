@@ -1073,8 +1073,8 @@ def support_rows_kernel(
 
 
 def support_threads(units: int, device) -> int:
-    """The walkers' lanes (:func:`support_rows_kernel`): two waves of its two blocks of 256 a multiprocessor, at most
-    ``units`` (the list's bound); one thread on the CPU."""
+    """The walkers' lanes (:func:`support_rows_kernel`, :func:`write_free_body_rows`): two waves of their two blocks of
+    256 a multiprocessor, at most ``units`` (the list's or the contacts' bound); one thread on the CPU."""
     device = wp.get_device(device)
     if not device.is_cuda:
         return 1

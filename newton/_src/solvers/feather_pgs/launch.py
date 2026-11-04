@@ -23,7 +23,7 @@ import dataclasses
 
 import warp as wp
 
-__all__ = ["Mapping", "device_lanes", "grid", "launch"]
+__all__ = ["Mapping", "device_lanes", "fill_lanes", "grid", "launch"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -50,6 +50,24 @@ class Mapping:
     def block_dim(self) -> int:
         """Threads per block."""
         return self.lanes * self.items_per_block
+
+
+def fill_lanes(items: int, device, least: int = 32, most: int = 1024) -> int:
+    """Lanes an item of a launch whose items stride over their own work (a world's rows, no lane waiting on another):
+    the smallest power of two from ``least`` at which ``items`` items cover a block of ``most`` threads on each SM, at
+    most ``most``; ``least`` on the CPU.
+
+    A latency-bound map over a world's rows at a few worlds idles the device at a warp or a block a world (coins'
+    128 worlds of 9k free-body rows on 188 SMs); many worlds keep ``least``.
+    """
+    device = wp.get_device(device)
+    if not device.is_cuda:
+        return least
+    need = -(-int(device.sm_count) * most // max(int(items), 1))
+    lanes = least
+    while lanes < min(need, most):
+        lanes *= 2
+    return min(lanes, most)
 
 
 def device_lanes(device_arch, lanes: int = 32) -> int:

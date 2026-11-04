@@ -51,13 +51,14 @@ from .solver_fields import Preelim
 
 
 @cache
-def free_body_meta_kernel(mf_max_constraints: int, pitch: int, base: int, device_arch: str) -> wp.Kernel:
+def free_body_meta_kernel(mf_max_constraints: int, pitch: int, base: int, lanes: int, device_arch: str) -> wp.Kernel:
     """Pack each world's free-body rows into the 128-bit word the matrix-free sweeps load (:meth:`.FreeBodyZ.pack`).
 
-    A warp per world (``wp.launch_tiled`` over the worlds, 32 threads; one thread on the CPU), a lane per row; the
-    word holds the rows' sides' first world coordinates (``world_dof_offset`` of their articulations), the inverse of
-    their stored diagonal ``A_ii`` (the step's form of the law, cached in the header), right-hand side (the law's plus
-    the row's incident velocity: its residual at ``du = 0``), type and parent. The records are the row store's
+    A group of ``lanes`` lanes per world (``wp.launch_tiled`` over the worlds: a warp, or a block when few worlds
+    would idle the device, :func:`.launch.fill_lanes`; one thread on the CPU), a lane per row; the word holds the
+    rows' sides' first world coordinates (``world_dof_offset`` of their articulations), the inverse of their stored
+    diagonal ``A_ii`` (the step's form of the law, cached in the header), right-hand side (the law's plus the row's
+    incident velocity: its residual at ``du = 0``), type and parent. The records are the row store's
     (``pitch`` rows a line, the free bodies' from ``base``), whose parents count in the line; the word's count from the
     free bodies' first row, as the sweeps stage their impulses. ``device_arch`` keys the variant.
     """
@@ -86,7 +87,7 @@ def free_body_meta_kernel(mf_max_constraints: int, pitch: int, base: int, device
     }}
 """
     return KernelTemplate(
-        f"free_body_meta_{mf_max_constraints}_{pitch}",
+        f"free_body_meta_{mf_max_constraints}_{pitch}_{lanes}",
         kernel_template.params(
             ("mf_constraint_count", wp.array[int]),
             ("first", wp.array[int]),
@@ -99,7 +100,7 @@ def free_body_meta_kernel(mf_max_constraints: int, pitch: int, base: int, device
             ("row_parent", wp.array2d[int]),
             ("mf_meta", wp.array2d[int]),
         ),
-        dual_native(body, preludes=(lane_group(32), CPU_MATH)),
+        dual_native(body, preludes=(lane_group(lanes), CPU_MATH)),
         dispatch=kernel_template.WORLDS,
         composed=True,
         native_name="free_body_meta_native",
