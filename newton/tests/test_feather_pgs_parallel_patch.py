@@ -913,6 +913,7 @@ def _general_bias(solver, rows, dt):
             wp.zeros_like(rhs),
             count,
             rhs.shape[1],
+            0,
             rhs.shape[1],
             dt,
             solver.options.contact_speculative_scale,

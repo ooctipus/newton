@@ -8,7 +8,7 @@ module holds what is built around them:
 
 - the free-body rows (:class:`.response_operator.FreeBodyZ`, rows over at most two free bodies): the packed row word
   (:func:`free_body_meta_kernel`, which :meth:`.FreeBodyZ.consume` decodes: its sides' coordinates, ``1 / A_ii``);
-  their headers' ``A_ii`` and rhs are the walk's (:func:`.walk_rows.free_body_headers_kernel`, the rows' law);
+  their ``A_ii`` is the walk's (:func:`.walk_rows.write_free_body_rows`), their rhs the rows' law's;
 - the bilateral closure (:func:`close_block`, :func:`close_row`, :func:`seed_blocks_kernel`), the Schur transform the
   one writer's block phase applies to fold a world's bilateral block into the responses of its other rows;
 - the paired factor rows' qualification (:func:`paired_components_kernel`).

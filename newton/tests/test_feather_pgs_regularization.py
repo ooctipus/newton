@@ -336,6 +336,7 @@ def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
                 wp.zeros_like(row_w),
                 wp.array([1], dtype=wp.int32, device=device),
                 1,
+                0,
                 1,
                 DT,
                 1.0,

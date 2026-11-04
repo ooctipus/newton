@@ -12,7 +12,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.contact_input import ContactInput, ContactRoutes
-from newton._src.solvers.feather_pgs.dense_rows import DenseRows, MfRows
+from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.kernels import (
     allocate_world_contact_slots,
@@ -22,8 +22,6 @@ from newton._src.solvers.feather_pgs.kernels import (
     populate_world_J_for_size,
     prepare_world_contact_rows,
 )
-from newton._src.solvers.feather_pgs.tree_factor import WalkTrees
-from newton._src.solvers.feather_pgs.walk_rows import free_body_headers_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import group_rows, row_lines
 from newton.tests.feather_pgs_patch_parity import row_law
@@ -207,19 +205,20 @@ def _launch_articulation_pair_contact_allocator(
     return int(contact_slot.numpy()[0]), int(contact_path.numpy()[0]), slots_needed
 
 
-def _dense_speculative_rhs(scale: float) -> float:
-    """Return the dense positive-gap RHS for a requested speculative scale."""
-    rhs = wp.zeros((1, 1), dtype=wp.float32, device="cpu")
+def _speculative_rhs(scale: float, base: int = 0) -> float:
+    """Return the positive-gap RHS for a requested speculative scale of a row at ``base`` of its line: the dense rows
+    from 0, the free bodies' rows after them (their writers store the normal row's capped beta)."""
+    rhs = wp.zeros((1, base + 1), dtype=wp.float32, device="cpu")
     rows = field_group.upload(
         DenseRows,
         "cpu",
-        phi=[[1.0]],
-        row_beta=[[0.2]],
-        row_type=[[0]],
-        target=[[0.0]],
-        restitution=[[0.0]],
+        phi=[[1.0] * (base + 1)],
+        row_beta=[[0.2] * (base + 1)],
+        row_type=[[0] * (base + 1)],
+        target=wp.zeros_like(rhs),
+        restitution=wp.zeros_like(rhs),
         rhs=rhs,
-        row_w=[[0.0]],
+        row_w=wp.zeros_like(rhs),
         first=row_lines("cpu"),
     )
     wp.launch(
@@ -230,6 +229,7 @@ def _dense_speculative_rhs(scale: float) -> float:
             wp.zeros_like(rhs),
             wp.array([1], dtype=wp.int32, device="cpu"),
             1,
+            base,
             1,
             0.5,
             scale,
@@ -240,55 +240,7 @@ def _dense_speculative_rhs(scale: float) -> float:
         ],
         device="cpu",
     )
-    return float(rhs.numpy()[0, 0])
-
-
-def _mf_speculative_rhs(scale: float) -> float:
-    """Return the MF setup RHS for a requested speculative scale: the free bodies' headers on the dense rows' records
-    (the writer stores the normal row's capped beta)."""
-    rhs = wp.zeros((1, 1), dtype=wp.float32, device="cpu")
-    rows = field_group.upload(
-        DenseRows,
-        "cpu",
-        phi=[[1.0]],
-        row_beta=[[0.2]],
-        row_type=[[0]],
-        target=[[0.0]],
-        restitution=[[0.0]],
-        rhs=rhs,
-        row_w=[[0.0]],
-        first=row_lines("cpu"),
-    )
-    wp.launch(
-        free_body_headers_kernel,
-        dim=1,
-        inputs=[
-            field_group.upload(
-                MfRows,
-                "cpu",
-                sides=wp.full((1, 1), wp.vec2i(-1, -1), dtype=wp.vec2i, device="cpu"),
-                diag=wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
-                Z=np.zeros((1, 1, 12), dtype=np.float32),
-                row_type=[[0]],
-                incident=[[0.0]],
-                first=row_lines("cpu"),
-            ),
-            rows,
-            wp.array([1], dtype=wp.int32, device="cpu"),
-            WalkTrees(),
-            wp.zeros((1,), dtype=wp.float32, device="cpu"),
-            1.0,
-            1.0,
-            0.5,
-            scale,
-            0.5,
-            1,
-            0,
-            0,
-        ],
-        device="cpu",
-    )
-    return float(rhs.numpy()[0, 0])
+    return float(rhs.numpy()[0, base])
 
 
 def _contact_row_outputs(device: str) -> dict[str, wp.array]:
@@ -634,8 +586,8 @@ class TestFeatherPGSContactControls(unittest.TestCase):
     def test_speculative_scale_controls_every_position_rhs_family(self):
         """Scale positive-gap position bias on dense and MF rows."""
         rhs_families = {
-            "dense": _dense_speculative_rhs,
-            "matrix_free": _mf_speculative_rhs,
+            "dense": _speculative_rhs,
+            "matrix_free": lambda scale: _speculative_rhs(scale, base=1),
         }
         for name, compute_rhs in rhs_families.items():
             with self.subTest(family=name):

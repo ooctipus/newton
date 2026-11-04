@@ -23,7 +23,7 @@ from .walk_rows import (
     SlotRows,
     bind_slot_rows,
     packed_sink,
-    read_slot_unit,
+    read_row_unit,
     slot_header,
     walk_slot_row,
 )
@@ -80,7 +80,7 @@ def produce_contacts(
         return
     world = data.world[contact]
     source = unit_source(UNIT_CONTACT, 4 * contact + row)
-    unit = read_slot_unit(rows, data, law, JointSeeds(), data.first[world], slot + row, source)
+    unit = read_row_unit(rows, data, law, JointSeeds(), data.first[world], slot + row, source)
     unit.group = slots.dense_group[world]
     walk_slot_row(sink, unit)
     slot_header(

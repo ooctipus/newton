@@ -138,23 +138,20 @@ def catalogue() -> list:
 
 
 class Capture:
-    """The rows a step builds, around the free bodies' headers (:meth:`.Placement.whiten_free_bodies`): each call keeps
-    its last values."""
+    """The rows a step builds, around the free bodies' rhs (:meth:`.rows.RowLaws.write_free_body_rhs`): whether a step
+    had free bodies' rows, then the step's last values."""
 
     def __init__(self, solver):
         self.solver = solver
         self.mf = None
-        placement = solver.placement
-        free = placement.whiten_free_bodies
+        laws = solver.laws
+        free = laws.write_free_body_rhs
 
-        def whiten_free_bodies(*args, **kwargs):
-            J = (placement.mf_Z.numpy()[..., :6].copy(), placement.mf_Z.numpy()[..., 6:].copy())
-            result = free(*args, **kwargs)
-            Z = (placement.mf_Z.numpy()[..., :6].copy(), placement.mf_Z.numpy()[..., 6:].copy())
-            self.mf = (J, Z)
-            return result
+        def write_free_body_rhs(*args, **kwargs):
+            self.mf = True
+            return free(*args, **kwargs)
 
-        placement.whiten_free_bodies = whiten_free_bodies
+        laws.write_free_body_rhs = write_free_body_rhs
 
     def finish(self):
         """The step's end: its final rows and impulses (after any elimination), the predictor and the velocity."""

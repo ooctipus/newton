@@ -1173,11 +1173,11 @@ class SolverFeatherPGS(SolverBase):
             else:
                 self.laws.write_rhs(self, dt)
 
-        # The free bodies' rows' headers: their diagonals A_ii, rhs and incident velocities.
+        # The free bodies' rows' rhs: their writers stored their diagonals and incident velocities.
         if self.forest.has_free_rigid_bodies:
             with wp.ScopedTimer("S4_MF_Setup", print=False, use_nvtx=self._nvtx, synchronize=False):
                 with self._sync_timed("s4_mf_setup"):
-                    self.placement.whiten_free_bodies(self.v_hat, dt)
+                    self.laws.write_free_body_rhs(self, dt)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 5+6: PGS solve

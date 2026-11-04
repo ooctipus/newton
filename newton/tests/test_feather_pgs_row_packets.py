@@ -283,6 +283,7 @@ def _run_general(data, layout, beta):
                 incident,
                 layout.counts,
                 ROWS,
+                0,
                 ROWS,
                 data.dt,
                 data.speculative_scale,

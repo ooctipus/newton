@@ -16,7 +16,10 @@ rows walked together from its first (1, 3, or 4 under contact torsion), or a joi
   (:func:`packed_walker`), world-major with the bilateral blocks' closure (:func:`walked_rows_kernel`);
 - **the sparse diagonal** (case K2, FL3.5): the arm's side into the row's dense part, a key of the star one step to
   the row's slot (:func:`write_slot_rows`, :func:`slot_header`; the compact boundary's producer,
-  :func:`.compact_contact.contacts_kernel`).
+  :func:`.compact_contact.contacts_kernel`);
+- **the free bodies' rows** (``mf_Z``, each side's six of a row's twelve: a packed row by the free bodies' own row): a
+  contact row (:func:`write_free_body_rows`), or a speed row's axis, a covector, for its diagonal
+  (:func:`populate_rigid_velocity_limit_rows`), through the packed walker (:func:`packed_walker`).
 
 Each row's header is its diagonal ``|z|^2 + cfm`` (the walk's sums of squares, re-read where two seeds share a side or
 a side slips), its incident velocity ``J v_hat`` (the step's ``J`` entries each walk passes) and its rhs by the row law
@@ -25,10 +28,8 @@ the walk's frames, :attr:`.tree_factor.WalkTrees.now`), so a step between refres
 held factor. A slipping drive's ``K`` leaves the rows by its release along its path (``R``, the predictor's border,
 :func:`.tree_kinetic_state.border_solve`), which keeps every row inside its support.
 
-The free bodies' rows (``mf_Z``, each side's six of a row's twelve) take the same seed walk (:func:`walk_body`,
-:func:`.tree_factor.walk_into`) with their own records' law (:func:`write_free_body_rows`,
-:func:`free_body_headers_kernel`). No ``J`` is formed. The rows and the sweeps' leave share the walk's one frame
-(FL3_design §1.2); the sweeps' change goes to the step's one leave (:func:`.tree_factor.walk_leave_kernel`).
+No ``J`` is formed. The rows and the sweeps' leave share the walk's one frame (FL3_design §1.2); the sweeps' change
+goes to the step's one leave (:func:`.tree_factor.walk_leave_kernel`).
 """
 
 from __future__ import annotations
@@ -48,15 +49,15 @@ from .dense_rows import (
     UNIT_SHIFT,
     UNIT_VELOCITY,
     DenseRows,
-    MfRows,
     RowSupport,
-    row_side,
+    unit_source,
 )
 from .device_preludes import DevicePrelude, dual_native, lane_group, substitute
 from .field_group import Field
 from .friction_patches import PatchRowLaw
+from .joint_table import FreeBodies
 from .kernel_template import python_kernel
-from .kernels import PGS_CONSTRAINT_TYPE_SPEED, row_bias
+from .kernels import PGS_CONSTRAINT_TYPE_SPEED, RIGID_SPEED_ROWS, row_bias
 from .projection_laws import friction_pair_metric
 from .response_builds_rows import close_block, close_row
 from .row_build import write_contact_row
@@ -69,7 +70,6 @@ from .tree_factor import (
     WALK_LINK,
     WalkRelease,
     WalkTrees,
-    walk_into,
     walk_paths_prelude,
     walk_prelude,
     walk_row_prelude,
@@ -84,9 +84,10 @@ __all__ = [
     "SlotRows",
     "UnitList",
     "bind_slot_rows",
-    "free_body_headers_kernel",
+    "free_body_sink",
     "packed_sink",
     "packed_walker",
+    "populate_rigid_velocity_limit_rows",
     "row_sink",
     "support_rows_kernel",
     "support_threads",
@@ -114,136 +115,6 @@ def body_wrench(walk: WalkTrees, body: int, direction: wp.vec3, point: wp.vec3, 
     j = walk.body_joint[body]
     frame = wp.vec3(walk.link[j, WALK_FRAME], walk.link[j, WALK_FRAME + 1], walk.link[j, WALK_FRAME + 2])
     return contact_seed(direction, (point - walk.origin[walk.joint_art[j]]) - frame)
-
-
-@wp.kernel(enable_backward=False, launch_bounds=(256, 2))
-def write_free_body_rows(
-    mf: MfRows,
-    data: ContactInput,
-    total_threads: int,
-    law: PatchRowLaw,
-    walk: WalkTrees,
-    v_hat: wp.array[float],
-):
-    """The bodies sink: each free-body contact row (``path`` 1, grid-stride over the contacts) by the contact row writer
-    (:func:`.row_build.write_contact_row`: its records and sides, as every contact row's), each responding body's seed
-    walked into its side's six entries of ``mf_Z`` (the row's sides in order, from 0 and from 6; the second body's
-    negated, a spin row a torque about the normal) and its incident velocity ``J v_hat``, body ``a``'s then ``b``'s.
-    The rows' build stores their diagonals and rhs (:func:`free_body_headers_kernel`)."""
-    for c in range(wp.tid(), data.count[0], total_threads):
-        slot = data.slot[c]
-        if data.path[c] != 1 or slot < 0:
-            continue
-        line = mf.first[data.world[c]]
-        # The contact's rows' ``Z``, by the free bodies' own row (its slot counts in the line).
-        z_row = slot - mf.base
-        art_a = data.art0[c]
-        art_b = data.art1[c]
-        # The allocation's extent: recomputing eligibility can cross a floating-point threshold.
-        rows = int(1)
-        if data.slots_needed[c] >= 3:
-            rows = data.slots_needed[c]
-        for row in range(rows):
-            body_a, body_b, direction, row_point = write_contact_row(data, law, c, row, False)
-            spin = row == CONTACT_SPIN_ROW
-            first = data.sides[line, slot + row][0]
-            incident = float(0.0)
-            if body_a >= 0 and row_side(art_a, data.response_dofs) >= 0:
-                wrench = body_wrench(walk, body_a, direction, row_point, spin)
-                side = wp.where(art_a == first, 0, 6)
-                incident += walk_body(walk, art_a, body_a, wrench, v_hat, 0, mf.Z, line, z_row + row, side)[0]
-            if body_b >= 0 and row_side(art_b, data.response_dofs) >= 0:
-                wrench = body_wrench(walk, body_b, -direction, row_point, spin)
-                side = wp.where(art_b == first, 0, 6)
-                incident += walk_body(walk, art_b, body_b, wrench, v_hat, 0, mf.Z, line, z_row + row, side)[0]
-            mf.incident[line, slot + row] = incident
-
-
-@wp.kernel(enable_backward=False)
-def free_body_headers_kernel(
-    mf: MfRows,
-    rows: DenseRows,
-    mf_constraint_count: wp.array[int],
-    walk: WalkTrees,
-    v_hat: wp.array[float],
-    pgs_cfm: float,
-    contact_w: float,
-    dt: float,
-    contact_speculative_scale: float,
-    restitution_velocity_threshold: float,
-    mf_max_constraints: int,
-    weighted: int,
-    material: int,
-):
-    """The walked free-body rows' build, one thread per row slot: each row's incident velocity, which its walks summed
-    (:func:`write_free_body_rows`), its diagonal ``A_ii = cfm + |Z_a|^2 + |Z_b|^2`` (each side's six of ``Z``) and its rhs by the rows' law
-    (:func:`.kernels.row_bias`, on ``rows``: the row store's records). A speed row keeps its axis ``e_k``
-    unwhitened (its law reads the body's velocity, :meth:`.response_operator.FreeBodyZ.speed`): its diagonal takes the
-    walk of the covector ``e_k``, ``|L^-1 P e_k|^2``, and its incident is zero. A side is its responding body's
-    articulation, a one-node tree."""
-    tid = wp.tid()
-    world = tid // mf_max_constraints
-    i = tid % mf_max_constraints
-    if i >= mf_constraint_count[world]:
-        return
-    line = mf.first[world]
-    # Row ``i`` of the free bodies: its ``Z`` there, its records at ``mf.base + i`` of the world's line.
-    row = mf.base + i
-    sides = mf.sides[line, row]
-    diagonal = pgs_cfm
-    incident = float(0.0)
-    if mf.row_type[line, row] == PGS_CONSTRAINT_TYPE_SPEED:
-        if sides[0] >= 0:
-            art = sides[0]
-            j0 = walk.joint_start[art]
-            d0 = walk.dof_start[art]
-            k = int(0)
-            if mf.Z[line, i, 3] != 0.0:
-                k = 3
-            seed = walk_into(
-                walk,
-                j0,
-                d0,
-                walk.joint_end[art] - j0,
-                walk.dofs[art],
-                walk.dof_body[d0 + k],
-                1,
-                k,
-                wp.spatial_vector(1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-                v_hat,
-                -1,
-                mf.Z,
-                line,
-                i,
-                0,
-            )
-            diagonal += seed[1]
-    else:
-        incident = mf.incident[line, row]
-        if sides[0] >= 0:
-            squares = float(0.0)
-            for k in range(6):
-                squares += mf.Z[line, i, k] * mf.Z[line, i, k]
-            diagonal += squares
-        if sides[1] >= 0:
-            squares = float(0.0)
-            for k in range(6):
-                squares += mf.Z[line, i, 6 + k] * mf.Z[line, i, 6 + k]
-            diagonal += squares
-    mf.incident[line, row] = incident
-    mf.diag[line, row] = diagonal
-    row_bias(
-        rows,
-        line,
-        row,
-        incident,
-        dt,
-        contact_speculative_scale,
-        contact_w,
-        restitution_velocity_threshold,
-        weighted,
-        material,
-    )
 
 
 @wp.struct
@@ -277,41 +148,6 @@ def joint_seeds(seeds: JointSeeds, kind: int, index: int):
         dof1 = seeds.mimic_dof1[index]
         value1 = -seeds.mimic_coef1[index]
     return dof0, value0, dof1, value1
-
-
-@wp.func
-def walk_body(
-    walk: WalkTrees,
-    art: int,
-    body: int,
-    wrench: wp.spatial_vector,
-    v_hat: wp.array[float],
-    add: int,
-    sink: wp.array3d[float],
-    line: int,
-    slot: int,
-    entry: int,
-) -> wp.vec2:
-    """Walk ``wrench`` at ``body``'s frame up articulation ``art``'s tree into ``sink[line, slot, entry + c]``
-    (:func:`.tree_factor.walk_into`): the free bodies' six entries take their footprints from here."""
-    j0 = walk.joint_start[art]
-    return walk_into(
-        walk,
-        j0,
-        walk.dof_start[art],
-        walk.joint_end[art] - j0,
-        walk.dofs[art],
-        walk.body_joint[body] - j0,
-        0,
-        -1,
-        wrench,
-        v_hat,
-        add,
-        sink,
-        line,
-        slot,
-        entry,
-    )
 
 
 @wp.func
@@ -869,8 +705,9 @@ class RowSink:
     incident velocities and diagonals; the support placement's (case K1, :func:`support_rows_kernel`) support table,
     each body's and coordinate's support mask (factor coordinates), each articulation's first world coordinate, and the
     rows' coordinates and block records; the packed rows' layout, where each side's entries sit in a packed row
-    (:class:`.dense_rows.RowSupport`, :func:`packed_walker`), and the star's coordinates (the sparse diagonal's). A
-    placement binds what its writer reads."""
+    (:class:`.dense_rows.RowSupport`, :func:`packed_walker`), the star's coordinates (the sparse diagonal's), and the
+    free bodies' first row in the store's line (``base``: their entries index by their own row). A placement binds what
+    its writer reads."""
 
     walk: WalkTrees
     release: WalkRelease
@@ -888,6 +725,7 @@ class RowSink:
     records: wp.array3d[float]
     layout: RowSupport
     star: int
+    base: int
 
 
 @wp.struct
@@ -968,14 +806,16 @@ _PACKED_RELEASE = (
 
 
 @cache
-def packed_walker(rows: int, spin: bool, side: bool, star: bool = False) -> wp.Function:
+def packed_walker(rows: int, spin: bool, side: bool, star: bool = False, bodies: bool = False) -> wp.Function:
     """The general placement's unit walker (:data:`_SUPPORT`, the support writer's text with the packed rows as its
     sink): a unit's ``rows`` rows walked together through each tree's path table in global memory
     (:func:`.tree_factor.walk_paths_prelude`, a world holds any forest), each footprint stored at its coordinate's entry
     in the side's packed row, its diagonal ``|z|^2 + cfm`` and incident ``J v_hat`` from the same walk; ``spin``: the
     unit's fourth row is its spin row; ``side``: whether records can have a side. With ``star``, the sparse diagonal's:
     the arm's side into the row's dense part (its size group's row, ``unit.group``), a key's side left to the writer
-    (:func:`star_step`), and the diagonal stored without its slots' squares and ``cfm``, which the writer adds."""
+    (:func:`star_step`), and the diagonal stored without its slots' squares and ``cfm``, which the writer adds. With
+    ``bodies``, the free bodies': their packed rows by their own row, the row's less ``sink.base``
+    (:func:`write_free_body_rows`)."""
     body = substitute(
         _SUPPORT,
         rows=rows,
@@ -996,13 +836,14 @@ def packed_walker(rows: int, spin: bool, side: bool, star: bool = False) -> wp.F
         wrench=substitute(_PACKED_WRENCH, spin=int(spin)),
         close="",
         entries_end="S",
-        zrow="(unit.group * sink.entries.shape[1] + unit.slot)" if star else "row0",
+        zrow="(unit.group * sink.entries.shape[1] + unit.slot)" if star else "(row0 - sink.base)" if bodies else "row0",
         diag="norm[r]" if star else _HEADER_DIAG,
         # RD a plain load here, not the support writer's non-coherent __ldg: the K2 writer ran 1.4% faster on sm_120.
         rd="*p",
     )
     walk = walk_paths_prelude(rows, half=record_half(side))
     tag = ("_spin" if spin else "") + walk.name.removeprefix(f"walk_paths_{rows}") + ("_star" if star else "")
+    tag += "_bodies" if bodies else ""
     snippet = dual_native(body, preludes=(walk, walk_row_prelude(rows)))
     return unit_walker(f"packed_walk_{rows}{tag}", snippet)
 
@@ -1362,8 +1203,9 @@ def slot_header(
     )  # fmt: skip
 
 
-read_slot_unit = unit_reader(False)
-"""The sparse diagonal's unit reader (:func:`unit_reader`: a row a unit, no link rows)."""
+read_row_unit = unit_reader(False)
+"""The unit reader of a row a unit, without link rows (:func:`unit_reader`): the sparse diagonal's and the free
+bodies'."""
 
 walk_slot_row = packed_walker(1, False, True, True)
 """The one unit walker with the star (:func:`packed_walker`): a row of the sparse diagonal."""
@@ -1392,7 +1234,7 @@ def write_slot_rows(
     """The one writer on the sparse diagonal: a world's ``lanes`` threads stride over its rows (``dim = (worlds,
     lanes)``), every row (``counts``, the allocation's watermark) or its limit prefix alone (``prefix``:
     ``bounds[:, 1]``, where the compact boundary writes the contact rows in its producer), a row a lane: a contact row's
-    records by the contact law, then each row as its own unit (:data:`read_slot_unit`), walked by the one unit walker
+    records by the contact law, then each row as its own unit (:data:`read_row_unit`), walked by the one unit walker
     with the star (:data:`walk_slot_row`; the spin row a torque) and finished (:func:`slot_header`)."""
     world, lane = wp.tid()
     end = counts[world]
@@ -1401,7 +1243,7 @@ def write_slot_rows(
     end = wp.min(end, support.units.shape[1])
     line = rows.first[world]
     for slot in range(lane, end, lanes):
-        unit = read_slot_unit(rows, data, law, JointSeeds(), line, slot, support.units[line, slot])
+        unit = read_row_unit(rows, data, law, JointSeeds(), line, slot, support.units[line, slot])
         if unit.rows > 0:
             unit.group = slots.dense_group[world]
             walk_slot_row(sink, unit)
@@ -1435,4 +1277,100 @@ def packed_sink(solver) -> RowSink:
         sink.star = int(placement.sparse_diagonal_response_size)
     else:
         sink.entries = placement.packed_Z
+    return sink
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The free bodies' rows: each side's six of a row's twelve, a packed row by the free bodies' own row
+# ---------------------------------------------------------------------------------------------------------------------
+
+walk_body_row = packed_walker(1, False, True, bodies=True)
+"""The one unit walker into the free bodies' rows (:func:`packed_walker`): a row's sides from entry 0 and 6."""
+
+
+@wp.kernel(enable_backward=False, launch_bounds=(256, 2))
+def write_free_body_rows(sink: RowSink, data: ContactInput, total_threads: int, law: PatchRowLaw):
+    """The free bodies' contact rows (``path`` 1, grid-stride over the contacts): each row's records by the contact law
+    and the row as its own unit (:data:`read_row_unit`), walked by the one unit walker into the free bodies' rows
+    (:data:`walk_body_row`; the spin row a torque), with its diagonal ``|z|^2 + cfm`` and incident velocity."""
+    for c in range(wp.tid(), data.count[0], total_threads):
+        slot = data.slot[c]
+        if data.path[c] != 1 or slot < 0:
+            continue
+        line = sink.layout.first[data.world[c]]
+        # The allocation's extent: recomputing eligibility can cross a floating-point threshold.
+        rows = int(1)
+        if data.slots_needed[c] >= 3:
+            rows = data.slots_needed[c]
+        for row in range(rows):
+            source = unit_source(UNIT_CONTACT, 4 * c + row)
+            walk_body_row(sink, read_row_unit(DenseRows(), data, law, JointSeeds(), line, slot + row, source))
+
+
+@wp.kernel
+def populate_rigid_velocity_limit_rows(
+    bodies: FreeBodies,
+    rows: DenseRows,
+    sink: RowSink,
+    rigid_velocity_limit_slot: wp.array[int],
+):
+    """Populate the free rigid bodies' speed rows, their linear and angular velocity limits.
+
+    A speed row's Jacobian is the unit vector of the first DOF of the velocity it bounds (``e_0`` for the linear
+    velocity, ``e_3`` for the angular one); the sweeps read the row's three DOFs from there, and its effective mass
+    converts the speed correction into the impulse the row stores. Its diagonal is that axis walked as a velocity
+    limit's covector at its coordinate (:data:`read_row_unit`, :data:`walk_body_row`), ``|L^-1 P e_k|^2 + cfm``; its
+    ``Z`` then holds the axis unwhitened, and its incident velocity is zero: the speed law reads the body's velocity
+    through its factor, not a row. ``mf_phi`` holds the limit.
+    """
+    candidate = wp.tid()
+    body = bodies.free_rigid_body_indices[candidate]
+    art = bodies.body_to_articulation[body]
+    if art < 0:
+        return
+    if bodies.is_free_rigid[art] == 0:
+        return
+
+    world = bodies.art_to_world[art]
+    if world < 0:
+        return
+    line = rows.first[world]
+
+    base = RIGID_SPEED_ROWS * candidate
+    for speed_axis in range(RIGID_SPEED_ROWS):
+        slot = rigid_velocity_limit_slot[base + speed_axis]
+        if slot < 0:
+            continue
+        limit = bodies.max_linear_velocity[body]
+        if speed_axis == 1:
+            limit = bodies.max_angular_velocity[body]
+
+        row = sink.base + slot
+        rows.sides[line, row] = wp.vec2i(art, -1)
+        rows.row_type[line, row] = PGS_CONSTRAINT_TYPE_SPEED
+        rows.row_parent[line, row] = -1
+        rows.row_mu[line, row] = 0.0
+        # The speed law's bias is its limit: the row's target is ``-limit``, as a joint velocity limit's, and its rhs
+        # ``-target`` (:func:`.row_laws.row_rhs`); it has no gap.
+        rows.row_beta[line, row] = 0.0
+        rows.phi[line, row] = 0.0
+        rows.target[line, row] = -limit
+
+        k = 3 * speed_axis
+        source = unit_source(UNIT_VELOCITY, 2 * (sink.walk.dof_start[art] + k))
+        walk_body_row(sink, read_row_unit(rows, ContactInput(), PatchRowLaw(), JointSeeds(), line, row, source))
+        for e in range(12):
+            sink.entries[line, slot, e] = 0.0
+        sink.entries[line, slot, k] = 1.0
+        sink.row_incident[line, row] = 0.0
+
+
+def free_body_sink(solver) -> RowSink:
+    """The free bodies' sink (:class:`RowSink`, :data:`walk_body_row`): their rows ``mf_Z`` by their own row from the
+    store's ``body_base``, each side's entries after the row's first side (the packed rows' layout, not dense)."""
+    placement = solver.placement
+    sink = row_sink(solver.factor, solver.forest, placement, solver.v_hat)
+    layout = placement.row_support()
+    layout.dense = 0
+    sink.layout, sink.entries, sink.base = layout, placement.mf_Z, int(placement.body_base)
     return sink

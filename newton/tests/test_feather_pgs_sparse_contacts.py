@@ -186,6 +186,7 @@ class TestSparseContacts(unittest.TestCase):
                     incident,
                     count,
                     row_count,
+                    0,
                     row_count,
                     0.01,
                     1.0,

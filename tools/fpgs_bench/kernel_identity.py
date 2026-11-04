@@ -500,7 +500,6 @@ def walk_calls():
             yield "walk_rows.support_rows_kernel", support, args, {"records": records, "torsion": torsion}
     for side in (False, True):
         yield "walk_rows.walked_rows_kernel", _unwrapped(walk_rows.walked_rows_kernel), (8, True, side), {}
-    yield "walk_rows.free_body_headers_kernel", lambda: walk_rows.free_body_headers_kernel, (), {}
     mf_gs = _unwrapped(sweep_routes.mf_gs_kernel)
     free = {"factor_coordinates": True, "independent_components": True, "has_dense_velocity_limit_rows": False}
     yield "sweep_routes.mf_gs_kernel", mf_gs, (64, 32, 12, ARCH), free

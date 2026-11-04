@@ -15,8 +15,6 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs import field_group, kernels, row_laws
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows
-from newton._src.solvers.feather_pgs.tree_factor import WalkTrees
-from newton._src.solvers.feather_pgs.walk_rows import free_body_headers_kernel
 from newton.tests.feather_pgs_law_harness import (
     call,
     mismatches,
@@ -85,6 +83,7 @@ def test_row_rhs_matches_world_contact_bias(test, device):
                 device,
                 world_constraint_count=np.full(worlds, rows, dtype=np.int32),
                 max_constraints=rows,
+                base=0,
                 lanes=rows,
                 world_phi=phi,
                 world_row_beta=beta,
@@ -294,8 +293,8 @@ def _law_row_beta(
 
 
 def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
-    """Equal the free-body rows' headers (``walk_rows.free_body_headers_kernel``): the contact law with its bodies'
-    depenetration cap and weights, from the incident velocity the walk summed."""
+    """Equal the free-body rows' rhs (``kernels.compute_world_contact_bias`` on their records): the contact law with its
+    bodies' depenetration cap and weights, from the incident velocity the walk summed."""
     rng = np.random.default_rng(13)
     worlds, rows = 8, 48
     layout = _mf_layout(rng, worlds, rows)
@@ -346,21 +345,18 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
         row_w=np.ones((worlds, rows), dtype=np.float32),
         first=row_lines(device),
     )
-    out = call(
-        free_body_headers_kernel,
-        worlds * rows,
+    call(
+        kernels.compute_world_contact_bias,
+        (worlds, rows),
         device,
         rows=records,
-        mf_constraint_count=np.full(worlds, rows, dtype=np.int32),
-        walk=WalkTrees(),
-        v_hat=layout["incident_velocity"],
-        pgs_cfm=1.0e-6,
-        mf_max_constraints=rows,
+        row_incident=incident,
+        world_constraint_count=np.full(worlds, rows, dtype=np.int32),
+        max_constraints=rows,
+        base=0,
+        lanes=rows,
         weighted=1,
         material=0,
-        mf_sides=np.stack((layout["mf_body_a"], layout["mf_body_b"]), axis=-1).astype(np.int32),
-        mf_diag=np.zeros((worlds, rows), dtype=np.float32),
-        mf_row_incident=incident,
         **shared,
     )
     law = call(
@@ -373,17 +369,11 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
         mf_J_b=shared["mf_Z_b"],
         **shared,
     )
-    # The walked rows' diagonal: A_ii = cfm + |Z_a|^2 + |Z_b|^2 over the bodies a row names.
-    diagonal = np.full((worlds, rows), 1.0e-6)
-    for side in "ab":
-        bodies, Z = layout[f"mf_body_{side}"], layout[f"mf_Z_{side}"].astype(np.float64)
-        diagonal += np.where(bodies >= 0, (Z * Z).sum(axis=2), 0.0)
-    np.testing.assert_allclose(out["mf_diag"].numpy(), diagonal, rtol=1e-5)
     reference_rhs, law_rhs = records.rhs.numpy(), law["rhs"].numpy()
     np.testing.assert_array_equal(records.row_w.numpy(), law["row_w"].numpy())
     magnitude = np.abs(phi) * 60.0 + np.abs(target)
     test.assertLessEqual(
-        unified("mf rhs (free_body_headers_kernel)", reference_rhs.ravel(), law_rhs.ravel(), magnitude.ravel(), 2.0),
+        unified("mf rhs (compute_world_contact_bias)", reference_rhs.ravel(), law_rhs.ravel(), magnitude.ravel(), 2.0),
         2.0,
     )
     # Rows whose bias the variant does not touch (speed rows, restitution) stay bitwise.
@@ -441,6 +431,7 @@ def test_restitution_matches_matrix_free_restitution(test, device):
         device,
         world_constraint_count=np.full(worlds, rows, dtype=np.int32),
         max_constraints=rows,
+        base=0,
         lanes=rows,
         world_row_beta=beta,
         contact_speculative_scale=1.0,

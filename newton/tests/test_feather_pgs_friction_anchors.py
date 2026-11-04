@@ -7,14 +7,12 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import field_group
-from newton._src.solvers.feather_pgs.dense_rows import DenseRows, MfRows
+from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     compute_world_contact_bias,
 )
-from newton._src.solvers.feather_pgs.tree_factor import WalkTrees
-from newton._src.solvers.feather_pgs.walk_rows import free_body_headers_kernel
 from newton.tests.feather_pgs_law_harness import row_lines
 
 _MU_JAW, _MU_BOX = 5.0, 0.5
@@ -329,76 +327,32 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
 
 def _rhs_for_family(family: str, *, phi, row_beta, dt, device="cpu"):
     """RHS of one world with rows [CONTACT, FRICTION, FRICTION] for one RHS kernel family, from the records every row
-    builder stores: the raw separation ``phi`` and the row law's ``row_beta``."""
+    builder stores: the raw separation ``phi`` and the row law's ``row_beta``. The free bodies' rows (``mf_setup``) take
+    the same bias launch from their first row in the store's line (here 3, after three dense rows)."""
+    base = {"dense": 0, "mf_setup": 3}[family]
     contact, friction = PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
+
+    def line(values):
+        return [[0.0] * base + list(values)]
+
+    zeros = lambda: wp.zeros((1, base + 3), dtype=wp.float32, device=device)  # noqa: E731
+    rhs = zeros()
+    rows = field_group.upload(
+        DenseRows,
+        device,
+        phi=line(phi),
+        row_beta=line(row_beta),
+        row_type=wp.array([[contact] * base + [contact, friction, friction]], dtype=wp.int32, device=device),
+        target=zeros(),
+        restitution=zeros(),
+        rhs=rhs,
+        row_w=zeros(),
+        first=row_lines(device),
+    )
     count = wp.array([3], dtype=wp.int32, device=device)
-    row_type = wp.array([[contact, friction, friction]], dtype=wp.int32, device=device)
-    phi_arr = wp.array([list(phi)], dtype=wp.float32, device=device)
-    zeros3 = lambda: wp.zeros((1, 3), dtype=wp.float32, device=device)  # noqa: E731
-    zJ = lambda: wp.zeros((1, 3, 6), dtype=wp.float32, device=device)  # noqa: E731
-    rhs = zeros3()
-    if family == "dense":
-        rows = field_group.upload(
-            DenseRows,
-            device,
-            phi=phi_arr,
-            row_beta=[list(row_beta)],
-            row_type=row_type,
-            target=zeros3(),
-            restitution=zeros3(),
-            rhs=rhs,
-            row_w=zeros3(),
-            first=row_lines(device),
-        )
-        inputs = [rows, zeros3(), count, 3, 3, dt, 1.0, 1.0, 0.0, 0, 0]
-        wp.launch(compute_world_contact_bias, dim=(1, 3), inputs=inputs, device=device)
-    elif family == "mf_setup":
-        # The free bodies' headers take the rows' law on the same records (the row store's free-body region).
-        rows = field_group.upload(
-            DenseRows,
-            device,
-            phi=phi_arr,
-            row_beta=[list(row_beta)],
-            row_type=row_type,
-            target=zeros3(),
-            restitution=zeros3(),
-            rhs=rhs,
-            row_w=zeros3(),
-            first=row_lines(device),
-        )
-        wp.launch(
-            free_body_headers_kernel,
-            dim=3,
-            inputs=[
-                field_group.upload(
-                    MfRows,
-                    device,
-                    sides=wp.full((1, 3), wp.vec2i(-1, -1), dtype=wp.vec2i, device=device),
-                    diag=zeros3(),
-                    Z_a=zJ(),
-                    Z_b=zJ(),
-                    row_type=row_type,
-                    incident=zeros3(),
-                    first=row_lines(device),
-                ),
-                rows,
-                count,
-                WalkTrees(),
-                wp.zeros((1,), dtype=wp.float32, device=device),
-                1.0e-6,
-                1.0,
-                dt,
-                1.0,
-                0.5,
-                3,
-                0,
-                0,
-            ],
-            device=device,
-        )
-    else:
-        raise ValueError(family)
-    return rhs.numpy()[0]
+    inputs = [rows, zeros(), count, 3, base, 3, dt, 1.0, 1.0, 0.0, 0, 0]
+    wp.launch(compute_world_contact_bias, dim=(1, 3), inputs=inputs, device=device)
+    return rhs.numpy()[0, base:]
 
 
 def _build_two_world_free_model(device):

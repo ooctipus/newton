@@ -1802,6 +1802,7 @@ def compute_world_contact_bias(
     row_incident: wp.array2d[float],
     world_constraint_count: wp.array[int],
     max_constraints: int,
+    base: int,
     lanes: int,
     dt: float,
     contact_speculative_scale: float,
@@ -1822,14 +1823,15 @@ def compute_world_contact_bias(
 
     A world's ``lanes`` threads stride over its live rows (``dim = (world_count, lanes)``): the grid follows the
     worlds, and a world's slots past its rows cost no thread beyond its lanes. The previous one-thread-per-world loop
-    left the GPU idle (64-128 blocks) for 30-60 us per launch.
+    left the GPU idle (64-128 blocks) for 30-60 us per launch. A class's rows start at ``base`` of the store's line: 0
+    the dense rows, ``body_base`` the free bodies' (their writers stored their diagonals and incident velocities).
     """
     world, lane = wp.tid()
     count = wp.min(world_constraint_count[world], max_constraints)
     if lane >= count:
         return
     line = rows.first[world]
-    for i in range(lane, count, lanes):
+    for i in range(base + lane, base + count, lanes):
         row_bias(
             rows,
             line,
@@ -2261,7 +2263,7 @@ def allocate_rigid_velocity_limit_slots(
     mass velocity and the angular velocity: ``[v, omega]``. PhysX's
     ``maxLinearVelocity`` and ``maxAngularVelocity`` bound their magnitudes,
     ``|v| <= limit`` and ``|omega| <= limit``, so each finite limit owns one
-    speed row (:func:`populate_rigid_velocity_limit_rows`) that the sweeps
+    speed row (:func:`.walk_rows.populate_rigid_velocity_limit_rows`) that the sweeps
     project onto that ball, along the current velocity.
 
     ``velocity_limit_activation_fraction`` proximity-gates the allocation,
@@ -2307,59 +2309,6 @@ def allocate_rigid_velocity_limit_slots(
         rigid_velocity_limit_slot[base + speed_axis] = reserve(
             mf_slot_counter, world, 1, mf_max_constraints, mf_first_rejected_slot
         )
-
-
-@wp.kernel
-def populate_rigid_velocity_limit_rows(
-    bodies: FreeBodies,
-    mf: MfRows,
-    rigid_velocity_limit_slot: wp.array[int],
-):
-    """Populate the MF speed rows of free rigid bodies' linear and angular velocity limits.
-
-    A speed row's Jacobian is the unit vector of the first DOF of the
-    velocity it bounds (``e_0`` for the linear velocity, ``e_3`` for the
-    angular one); the sweeps read the row's three DOFs from there, and its
-    effective mass converts the speed correction into the impulse the row
-    stores. ``mf_phi`` holds the limit.
-    """
-    candidate = wp.tid()
-    body = bodies.free_rigid_body_indices[candidate]
-    art = bodies.body_to_articulation[body]
-    if art < 0:
-        return
-    if bodies.is_free_rigid[art] == 0:
-        return
-
-    world = bodies.art_to_world[art]
-    if world < 0:
-        return
-    mf_line = mf.first[world]
-
-    base = RIGID_SPEED_ROWS * candidate
-    for speed_axis in range(RIGID_SPEED_ROWS):
-        slot = rigid_velocity_limit_slot[base + speed_axis]
-        if slot < 0:
-            continue
-        limit = bodies.max_linear_velocity[body]
-        if speed_axis == 1:
-            limit = bodies.max_angular_velocity[body]
-
-        # The axis stays unwhitened: the speed law reads the body's velocity through its factor, not a row.
-        for k in range(12):
-            mf.Z[mf_line, slot, k] = 0.0
-        mf.Z[mf_line, slot, 3 * speed_axis] = 1.0
-
-        row = mf.base + slot
-        mf.sides[mf_line, row] = wp.vec2i(art, -1)
-        mf.row_type[mf_line, row] = PGS_CONSTRAINT_TYPE_SPEED
-        mf.row_parent[mf_line, row] = -1
-        mf.row_mu[mf_line, row] = 0.0
-        # The speed law's bias is its limit: the row's target is ``-limit``, as a joint velocity limit's, and its rhs
-        # ``-target`` (:func:`.row_laws.row_rhs`); it has no gap.
-        mf.row_beta[mf_line, row] = 0.0
-        mf.phi[mf_line, row] = 0.0
-        mf.target[mf_line, row] = -limit
 
 
 @wp.kernel

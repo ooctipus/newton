@@ -14,8 +14,7 @@
 
 A step calls :meth:`Placement.begin` (clear the allocation state), then the row pass writes into its slots
 (:meth:`Placement.place_sorted_contact_rows`, :meth:`Placement.latch_status`, :meth:`Placement.warn_overflow`),
-:meth:`Placement.diagonals`, :meth:`Placement.whiten_free_bodies` (the free-body rows' headers),
-:meth:`Placement.prepare_impulses` and :meth:`Placement.pack_free_body_meta`.
+:meth:`Placement.diagonals`, :meth:`Placement.prepare_impulses` and :meth:`Placement.pack_free_body_meta`.
 
 It also holds which placement the class takes: the native sparse size, the sparse-diagonal pair, the row producers and
 the local owners' per-world claim. The row pass and the sweeps read its fields.
@@ -32,8 +31,6 @@ from ...sim.contacts import contact_capacity_blocks
 from ...sim.enums import JointType
 from . import host_index, packed_rows, response_builds_rows
 from .dense_rows import RowSupport
-from .dense_rows import bind as bind_dense_rows
-from .dense_rows import bind_mf as bind_mf_rows
 from .field_group import SolverArrays
 from .kernels import (
     LINK_ROWS,
@@ -104,6 +101,13 @@ def _accumulate_row_capacity_telemetry(
     if excess > 0:
         wp.atomic_max(overflow_excess_watermark, 0, excess)
         wp.atomic_add(overflow_world_steps, 0, 1)
+
+
+@wp.kernel
+def _clear_dense_diagonals(diag: wp.array2d[float]):
+    """Zero the dense rows' diagonals, ``dim = (lines, body_base)``: the free bodies' after them stay their writers'."""
+    line, row = wp.tid()
+    diag[line, row] = 0.0
 
 
 @wp.kernel
@@ -1032,36 +1036,11 @@ class Placement:
     def diagonals(self) -> None:
         """The dense rows' diagonals, by the placement that holds them (:attr:`.step_plan.StepPlan.response`): the packed
         rows' start from zero for the one writer's ``|Z|^2 + cfm`` (local row packets keep their worlds' private seeds);
-        the sparse diagonal's and native sparse factors' writers store theirs with its CFM."""
+        the sparse diagonal's and native sparse factors' writers store theirs with its CFM. The free bodies' rows, from
+        ``body_base``, keep theirs: their writers stored them in the row pass (:mod:`.walk_rows`)."""
         if self.packed_response and self.row_packets is None:
-            self.diag.zero_()
-
-    def whiten_free_bodies(self, v_hat: wp.array, dt: float):
-        """MF PGS setup: the free-body rows' diagonals and RHS by the rows' law, from the rows the one writer walked
-        (:func:`.walk_rows.free_body_headers_kernel`)."""
-        from .walk_rows import free_body_headers_kernel  # noqa: PLC0415
-
-        model = self.model
-        wp.launch(
-            free_body_headers_kernel,
-            dim=self.forest.world_count * self.mf_max_constraints,
-            inputs=[
-                bind_mf_rows(self),
-                bind_dense_rows(self),
-                self.mf_constraint_count,
-                self.factor.walk_view(),
-                v_hat,
-                self.options.pgs_cfm,
-                self.laws.contact_w,
-                dt,
-                self.options.contact_speculative_scale,
-                self.laws.effective_restitution_velocity_threshold,
-                self.mf_max_constraints,
-                int(self.laws.set.weighted),
-                int(self.options.contact_compliance),
-            ],
-            device=model.device,
-        )
+            dim = (self.diag.shape[0], self.body_base)
+            wp.launch(_clear_dense_diagonals, dim=dim, outputs=[self.diag], device=self.model.device)
 
     def pack_free_body_meta(self) -> None:
         """Pack matrix-free row metadata for the GS kernels, or skip when no such row can exist."""

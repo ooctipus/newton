@@ -54,7 +54,6 @@ from .kernels import (
     compute_world_contact_bias,
     finalize_constraint_counts_with_status,
     gather_mf_warmstart,
-    populate_rigid_velocity_limit_rows,
     populate_world_J_for_compact_size,
     populate_world_J_for_size,
     prepare_fused_diagonal_joint_limits,
@@ -1026,14 +1025,7 @@ class RowLaws:
                 pool.launch(
                     walk_rows.write_free_body_rows,
                     contact_build_threads,
-                    inputs=[
-                        bind_mf_rows(solver.placement),
-                        contact_input,
-                        contact_build_threads,
-                        law,
-                        solver.factor.walk_view(),
-                        solver.v_hat,
-                    ],
+                    inputs=[walk_rows.free_body_sink(solver), contact_input, contact_build_threads, law],
                     extent=count,
                     clamp=True,
                 )
@@ -1132,11 +1124,12 @@ class RowLaws:
                 device=model.device,
             )
             wp.launch(
-                populate_rigid_velocity_limit_rows,
+                walk_rows.populate_rigid_velocity_limit_rows,
                 dim=solver.forest.free_rigid_body_count,
                 inputs=[
                     bind_free_bodies(solver),
-                    bind_mf_rows(solver.placement),
+                    bind_dense_rows(solver.placement),
+                    walk_rows.free_body_sink(solver),
                     solver.placement.rigid_velocity_limit_slot,
                 ],
                 device=model.device,
@@ -1184,16 +1177,29 @@ class RowLaws:
             or solver.placement.walks
         ):
             return  # These rows write their own right-hand sides.
+        placement = solver.placement
+        self._bias(solver, dt, placement.constraint_count, placement.dense_max_constraints, 0)
+
+    def write_free_body_rhs(self, solver, dt: float) -> None:
+        """The free bodies' rows' rhs by the rows' law (``compute_world_contact_bias`` from the store's ``body_base``):
+        their writers stored their diagonals and incident velocities (:func:`.walk_rows.write_free_body_rows`,
+        :func:`.walk_rows.populate_rigid_velocity_limit_rows`)."""
+        placement = solver.placement
+        self._bias(solver, dt, placement.mf_constraint_count, placement.mf_max_constraints, placement.body_base)
+
+    def _bias(self, solver, dt: float, counts: wp.array, capacity: int, base: int) -> None:
+        """The rows' bias launch over a class of rows: ``counts`` a world, at most ``capacity``, from row ``base``."""
         # A world's lanes: its capacity, up to a block.
-        lanes = min(solver.placement.dense_max_constraints, BIAS_LANES)
+        lanes = min(capacity, BIAS_LANES)
         wp.launch(
             compute_world_contact_bias,
             dim=(solver.forest.world_count, lanes),
             inputs=[
                 bind_dense_rows(solver.placement),
                 solver.placement.row_incident,
-                solver.placement.constraint_count,
-                solver.placement.dense_max_constraints,
+                counts,
+                capacity,
+                base,
                 lanes,
                 dt,
                 solver.options.contact_speculative_scale,
