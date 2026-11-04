@@ -17,7 +17,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from newton._src.core.memory import Buffer, Staging
+from newton._src.core.execution import Work, shape
+from newton._src.core.memory import Buffer, Staging, built_for
 from newton._src.solvers.feather_pgs import kernel_template, sweep_routes_tiers
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.keyed_rows import get_direct_parallel_inputs
@@ -266,11 +267,16 @@ class TestOfflineCompile(unittest.TestCase):
             with self.subTest(tier=label):
                 threads, blocks = _tier(_TIER, args, kwargs).kernel.launch_bounds
                 self.assertEqual(threads, 32 * ((kwargs["rows"] + 31) // 32))
-                self.assertLessEqual(blocks * threads // 32, sweep_routes_tiers.REGISTER_WARPS)
-        staged = Staging((Buffer("s_x", "float", 4400),), threads=128)
-        self.assertEqual(sweep_routes_tiers.launch_bounds(staged), (128, 5))
-        # 25 blocks of a warp: past sm_120's limit, where ptxas would drop the bound and take 120 registers.
-        self.assertIsNone(sweep_routes_tiers.launch_bounds(Staging((Buffer("s_x", "float", 736),), threads=32)))
+                self.assertLessEqual(blocks * threads // 32, 24)  # 24 warps at a line of 80 registers
+
+        def bounds(staging):
+            line = sweep_routes_tiers.REGISTER_LINE
+            work = Work(0, block=staging.threads, registers=line, cap=False, shared=staging.bytes)
+            return shape(work, built_for("sm_120")).bounds
+
+        self.assertEqual(bounds(Staging((Buffer("s_x", "float", 4400),), threads=128)), (128, 5))
+        # 25 blocks of a warp: more than the line keeps, where a bound could only take registers from the sweep.
+        self.assertIsNone(bounds(Staging((Buffer("s_x", "float", 736),), threads=32)))
 
     def test_tiers_compile(self):
         sass = _kernel_sass()

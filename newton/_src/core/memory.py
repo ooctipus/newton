@@ -35,11 +35,13 @@ __all__ = [
     "CPU_STAGING_BYTES",
     "HELD",
     "L1_LINE_BYTES",
+    "REFERENCE_ARCH",
     "REGISTERS_PER_THREAD",
+    "REGISTER_GRANULE",
+    "REGISTER_PARTITIONS",
     "RESERVED_SHARED_BYTES",
     "SHARED_ALLOCATION_BYTES",
     "SHARED_STORAGE",
-    "SM_SHARED_BYTES",
     "STATIC_SHARED_BUDGETS",
     "STATIC_SHARED_BYTES",
     "TILE_BYTES_PER_THREAD",
@@ -50,10 +52,10 @@ __all__ = [
     "Staging",
     "access",
     "arch_budget",
+    "built_for",
     "carveout",
     "device",
     "granules",
-    "resident_blocks",
     "static_budget",
     "table",
 ]
@@ -79,15 +81,22 @@ maximum less the driver's reservation; :func:`static_budget` reads them first. N
 (sm_120, opt-in 101,376 B) loads a kernel declaring 100,352 B and refuses one declaring 101,376 B, the GB300 (sm_103)
 loads 231,424 B and refuses 232,448 B (measured 2026-10-27)."""
 
-SM_SHARED_BYTES = 100 * 1024
-"""Shared memory one SM gives its resident blocks [B] when no device of the architecture is at hand (an offline
-build, the CPU): the RTX PRO 6000's (sm_120), the smallest of the suite's GPUs."""
+REFERENCE_ARCH = 120
+"""The architecture an offline build that names none is sized for (:func:`built_for`): the RTX PRO 6000's (sm_120),
+the smallest of the suite's GPUs."""
 
 SHARED_ALLOCATION_BYTES = 128
 """Granule in which an SM allocates a block's shared memory [B] (``cuda_occupancy.h``, sm_80 and later)."""
 
 REGISTERS_PER_THREAD = 255
 """The most registers a thread holds (every architecture since sm_35): the budget of a kernel without a bound."""
+
+REGISTER_PARTITIONS = 4
+"""Sub-partitions a multiprocessor's register file divides into (every architecture since sm_70): a warp takes its
+registers from one, so a register line keeps whole warps a partition (``cuda_occupancy.h``)."""
+
+REGISTER_GRANULE = 256
+"""Registers a warp is allocated in (``cuda_occupancy.h``, sm_70 and later)."""
 
 _CARVEOUTS_128 = (0, 8, 16, 32, 64, 100)
 _CARVEOUTS_192 = (0, 8, 16, 32, 64, 100, 132, 164)
@@ -191,6 +200,17 @@ def _of_architecture(arch: int) -> Device | None:
     return None
 
 
+def built_for(device_arch) -> Device:
+    """The device a kernel factory's ``device_arch`` (a number or an offline ``"sm_XX"``) builds for: a CUDA device of
+    the architecture at hand, else the architecture's occupancy table (an offline build; one that names no
+    architecture is sized for :data:`REFERENCE_ARCH`); :data:`CPU` for architecture 0."""
+    arch = _architecture(device_arch)
+    if arch == 0:
+        return CPU
+    arch = arch if arch > 0 else REFERENCE_ARCH
+    return _of_architecture(arch) or Device.of(arch, 1, STATIC_SHARED_BYTES + RESERVED_SHARED_BYTES)
+
+
 def static_budget(arch: int) -> int:
     """Static shared memory a block of a kernel built for the CUDA architecture ``arch`` may declare [B].
 
@@ -219,17 +239,6 @@ def granules(block_bytes: int) -> int:
     """Shared memory a block takes of its multiprocessor [B]: its bytes and the driver's reservation, in granules."""
     granules = -(-(int(block_bytes) + RESERVED_SHARED_BYTES) // SHARED_ALLOCATION_BYTES)
     return granules * SHARED_ALLOCATION_BYTES
-
-
-def resident_blocks(block_bytes: int, device_arch=None) -> int:
-    """Blocks of ``block_bytes`` static shared memory each that one SM of ``device_arch`` keeps resident.
-
-    A block takes its bytes and the driver's reservation, in 128-byte granules, out of the SM's shared memory
-    (:attr:`Device.shared_per_sm` of a CUDA device of the architecture), else :data:`SM_SHARED_BYTES`.
-    """
-    found = _of_architecture(max(_architecture(device_arch), 0))
-    sm_bytes = found.shared_per_sm if found is not None else SM_SHARED_BYTES
-    return sm_bytes // granules(block_bytes)
 
 
 def carveout(device: Device, block: int, shared: int) -> int:

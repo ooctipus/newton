@@ -21,7 +21,8 @@ from functools import cache
 
 import warp as wp
 
-from ...core.memory import Buffer, Staging, arch_budget, resident_blocks
+from ...core.execution import Work, shape
+from ...core.memory import Buffer, Staging, arch_budget, built_for
 from . import kernel_template
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .factor.walk import walk_paths_prelude, walk_row_prelude
@@ -75,10 +76,12 @@ TIER_SWEEPS_CAP = 128
 """The largest tier budget."""
 TIER_MAX_ROWS = 128
 """The most rows a tier holds: a lane per row in four warps, its staged block within the static budget."""
-REGISTER_WARPS = 24
-"""The most warps an SM keeps resident above the 72 registers a tier compiles to unbounded: 6 warps of 80 registers in
-each of the register file's 4 sub-partitions of 16K (``cuda_occupancy.h``). It is also the block limit of sm_120, above
-which ptxas drops a launch bound and takes all the registers it can."""
+REGISTER_LINE = 80
+"""The register line of a tier and a local owner (:mod:`.sweep_routes_local`): 24 warps a multiprocessor (6 in each of
+the register file's 4 sub-partitions). It caps a local owner. A tier's is no cap: its variants compile on both sides
+of it unbounded (72 registers plain, 100 to 108 keyed) and spill under it, so a tier is bound only where its shared
+memory keeps no more blocks than the line (the layer's ``Work.cap``), which leaves ptxas spare registers for the
+sweep's load schedule."""
 
 
 def tier_sweeps(rows: int, iterations: int) -> int:
@@ -94,16 +97,6 @@ def tier_sweeps(rows: int, iterations: int) -> int:
     square = -(-numerator // (32 * factor.denominator**2))
     raw = math.isqrt(square - 1) + 1 if square > 0 else 0
     return max(1, min(raw, TIER_SWEEPS_CAP))
-
-
-def launch_bounds(staging: Staging, device_arch=None) -> tuple[int, int] | None:
-    """A tier's launch bounds where the blocks shared memory keeps on ``device_arch``
-    (:func:`.staging.resident_blocks`) leave registers to spare: its threads and those blocks. ptxas then spends the
-    spare registers on the sweep's load schedule, and the SM keeps the blocks. ``None`` where they leave none, as the
-    register file limits the blocks there: a bound could only take registers from the sweep.
-    """
-    blocks = resident_blocks(staging.bytes, device_arch)
-    return (staging.threads, blocks) if blocks * (staging.threads // 32) <= REGISTER_WARPS else None
 
 
 def _operands(
@@ -353,7 +346,10 @@ def parallel_kernel(
         ),
         composed=True,
         native_name="sweep_parallel_native",
-        launch_bounds=launch_bounds(staging, device_arch),
+        launch_bounds=shape(
+            Work(0, block=staging.threads, registers=REGISTER_LINE, cap=False, shared=staging.bytes),
+            built_for(device_arch),
+        ).bounds,
     ).kernel()
     return SweepTier(
         kernel,

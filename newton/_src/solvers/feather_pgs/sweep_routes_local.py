@@ -22,7 +22,8 @@ from functools import cache
 
 import warp as wp
 
-from ...core.memory import Buffer, Staging, arch_budget, resident_blocks
+from ...core.execution import Work, shape
+from ...core.memory import Buffer, Staging, arch_budget, built_for
 from . import field_group, kernel_template
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .factor.walk import WalkTrees
@@ -64,7 +65,7 @@ from .sweep import (
     unit_held_loads,
     weight_arguments,
 )
-from .sweep_routes_tiers import REGISTER_WARPS
+from .sweep_routes_tiers import REGISTER_LINE
 
 LOCAL_OWNERS = (
     Field("primary_articulation", wp.int32, ("world",), owner="sweep", attr="local_primary_articulation"),
@@ -190,15 +191,6 @@ def local_staging(
         threads=32 * int(warps_per_block),
         name="LocalScratch",
     )
-
-
-def local_bounds(staging: Staging, device_arch) -> tuple[int, int]:
-    """A local owner's launch bounds: its threads, and the blocks its shared memory keeps resident on ``device_arch``
-    (:func:`.staging.resident_blocks`), at most :data:`.sweep_routes_tiers.REGISTER_WARPS` warps of them. ptxas fits the
-    registers of the kernel's longest phase, the walk of a row's seeds, to the occupancy shared memory admits, so the
-    walk costs the sweeps no resident block."""
-    blocks = resident_blocks(staging.bytes, device_arch)
-    return staging.threads, max(1, min(blocks, REGISTER_WARPS // (staging.threads // 32)))
 
 
 def local_owned_source(
@@ -556,7 +548,11 @@ def local_owned_kernel(
         extra=arguments + solve_policy.arguments,
         composed=True,
         native_name="sweep_local_native",
-        launch_bounds=local_bounds(staging, device_arch),
+        # ptxas fits the registers of the kernel's longest phase, the walk of a row's seeds, to the occupancy shared
+        # memory admits under the line, so the walk costs the sweeps no resident block.
+        launch_bounds=shape(
+            Work(0, block=staging.threads, registers=REGISTER_LINE, shared=staging.bytes), built_for(device_arch)
+        ).bounds,
     ).kernel()
 
 

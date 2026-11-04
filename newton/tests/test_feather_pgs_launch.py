@@ -52,9 +52,12 @@ class TestDevice(unittest.TestCase):
         self.assertEqual(memory.arch_budget("offline"), memory.STATIC_SHARED_BYTES)
         self.assertEqual(execution.device_lanes(0), 1)
         self.assertEqual(execution.device_lanes("sm_120", 16), 16)
-        # Offline (no device of the architecture): the smallest suite GPU's multiprocessor.
-        if not any(found.arch == 12345 for found in wp.get_cuda_devices()):
-            self.assertEqual(memory.resident_blocks(1664, 12345), memory.SM_SHARED_BYTES // 2688)
+        # A factory builds for the device of its architecture: its table offline, sm_120's when it names none.
+        self.assertIs(memory.built_for(0), CPU)
+        if not any(found.arch == 103 for found in wp.get_cuda_devices()):
+            self.assertEqual(memory.built_for("sm_103").shared_per_sm, 228 * 1024)
+        if not wp.get_cuda_devices():
+            self.assertEqual(memory.built_for(None).arch, memory.REFERENCE_ARCH)
 
 
 class TestShapeAgainstTodaysRules(unittest.TestCase):
@@ -105,6 +108,10 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
             ("colored", 256, 255, (256, 1)),
             ("predictor 32", 32, 56, (32, min(24, 1152 // 32))),
             ("predictor 64", 64, 56, (64, min(24, 1152 // 64))),
+            # The sweeps' lines: whole warps a register sub-partition (6 at 80 registers, 8 at 64).
+            ("tier of a warp", 32, 80, (32, 24)),
+            ("local owner of five warps", 160, 80, (160, 4)),
+            ("sparse", 64, 64, (64, 16)),
         )
         for device in (PRO, GB300):
             for name, block, registers, old in cases:

@@ -10,7 +10,7 @@ acts on is the factor-coordinate delta from ``v_hat``, staged per world and publ
 ``Sweep.support_du_base`` and the class's nodes). A configuration chooses:
 
 - the **mapping**: 32, 16 or 8 lanes per world, ``64 / lanes`` worlds per block of 64 threads, with launch bounds
-  from the data (:func:`launch_bounds`);
+  from the register line and the data (:data:`REGISTER_LINE`);
 - the **operator's layout**: packed rows read through explicit row indices (``row_dof``) or the shared support
   table, or (``local_factors``) packed rows expanded once per call into dense rows in shared memory;
 - the **schedule**: every row in slot order, or (``active_rows``) the rows selected at sweep entry, popped from
@@ -34,7 +34,8 @@ from functools import cache
 
 import warp as wp
 
-from ...core.memory import Buffer, Staging, arch_budget, resident_blocks
+from ...core.execution import Work, shape
+from ...core.memory import Buffer, Staging, arch_budget, built_for
 from . import kernel_template
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .kernel_template import KernelTemplate
@@ -70,9 +71,12 @@ from .sweep import (
 )
 
 _SPARSE_LOCAL_WORKSPACE_BYTES = 8 * 1024
-REGISTER_BLOCKS = 16
-"""Resident blocks per SM within the sparse sweeps' register budget: 64 registers a thread, the register file's 64K
-over 16 blocks of 64 threads. Every sparse configuration compiles within it without local memory."""
+REGISTER_LINE = 64
+"""The sparse sweeps' register line: 16 blocks of 64 threads a multiprocessor. Every sparse configuration compiles
+within it without local memory. Its launch bound is the layer's (:func:`~newton._src.core.execution.shape`): at
+most those blocks, as many as the working set's shared memory admits; ptxas fits the sweep's registers to that
+occupancy, so a configuration whose shared memory allows 16 blocks keeps them however many registers its laws hold
+live, and one that shared memory limits keeps its registers."""
 
 
 SPARSE_ABI = kernel_template.params(
@@ -103,16 +107,6 @@ the factory's free-body capacities are read by no configuration: the sweep holds
 
 THREADS = 64
 """Threads per block: ``64 / lanes`` worlds."""
-
-
-def launch_bounds(staging: Staging, device_arch=None) -> tuple[int, int]:
-    """The sparse sweep's launch bounds: 64 threads, and as many resident blocks per SM as its working set's shared
-    memory admits on ``device_arch`` (:func:`.staging.resident_blocks`), at most :data:`REGISTER_BLOCKS`.
-
-    ptxas fits the sweep's registers to that occupancy, so a configuration whose shared memory allows 16 blocks keeps
-    them however many registers its laws hold live, and one that shared memory limits keeps its registers.
-    """
-    return THREADS, min(REGISTER_BLOCKS, resident_blocks(staging.bytes, device_arch))
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -933,5 +927,7 @@ def sparse_kernel(
         extra=extra,
         composed=True,
         native_name="sweep_sparse_native",
-        launch_bounds=launch_bounds(staging, device_arch),
+        launch_bounds=shape(
+            Work(0, block=THREADS, registers=REGISTER_LINE, shared=staging.bytes), built_for(device_arch)
+        ).bounds,
     ).kernel()

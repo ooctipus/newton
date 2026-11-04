@@ -17,11 +17,13 @@ differs between launches is the work, not the arithmetic that sizes them, so the
 
 The one rule (``SP/core/FL/HANDOFF_ZEX.md`` §3.2):
 
-- resident threads a multiprocessor are the fewer of its thread limit and its register file over the line;
+- resident threads a multiprocessor are the fewer of its thread limit and the warps its register file keeps at the
+  line (whole warps a sub-partition);
 - lanes an item: a *scan* takes the item's width; a *split* fills at least one wave of resident threads (the
   ceiling), a *feed* at most one (the floor); each within ``[least, min(most, the power of two over the width)]``;
 - resident blocks are the fewest the block limit, the threads, the register line and the shared memory allow; a
-  declared line is the launch bound ``(block, those blocks)``;
+  declared line is the launch bound ``(block, those blocks)``, or, for a line that is no cap, only where the shared
+  memory keeps no more blocks than the line;
 - the grid covers the items, at most ``waves`` waves of resident blocks when the kernel strides over them;
 - the carveout is the driver's smallest step that holds the blocks the thread and block limits allow (H8,
   :func:`~.memory.carveout`).
@@ -31,10 +33,11 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import math
 
 import warp as wp
 
-from .memory import REGISTERS_PER_THREAD, Device, carveout, granules
+from .memory import REGISTER_GRANULE, REGISTER_PARTITIONS, REGISTERS_PER_THREAD, Device, carveout, granules
 
 __all__ = [
     "Order",
@@ -148,6 +151,9 @@ class Work:
         lanes: A measured fixed lane count, in place of the rule.
         block: Threads a block (by default 256, or the lanes of a block group).
         registers: The register line a lane, which sets the launch bound (``None``: unbounded).
+        cap: The line caps the kernel's registers. Without, it is the least a bound must leave: the kernel is bound
+            only where shared memory keeps no more blocks than the line would, so a bound gives registers and never
+            takes them (a kernel whose variants compile on both sides of its line, and spill under a cap).
         shared: Static shared memory a block [B] (a :class:`~.memory.Staging`'s bytes).
         persistent: The kernel strides over its items, so its grid is capped at ``waves`` waves of resident blocks.
         waves: Waves of resident blocks of a persistent grid.
@@ -162,6 +168,7 @@ class Work:
     lanes: int | None = None
     block: int | None = None
     registers: int | None = None
+    cap: bool = True
     shared: int = 0
     persistent: bool = False
     waves: float = 1.0
@@ -213,7 +220,7 @@ class Shape:
 
 
 def _pow2_ceil(x: float) -> int:
-    return 1 << max(int(x) - 1, 0).bit_length()
+    return 1 << max(math.ceil(x) - 1, 0).bit_length()
 
 
 def _pow2_floor(x: float) -> int:
@@ -221,12 +228,19 @@ def _pow2_floor(x: float) -> int:
     return 1 << (x.bit_length() - 1) if x >= 1 else 1
 
 
+def _line_warps(device: Device, line: int) -> int:
+    """Warps a multiprocessor's register file keeps at ``line`` registers a lane: a warp's registers, in granules,
+    from one sub-partition (24 at a line of 80, 16 at 128, 8 at 255)."""
+    warp = -(-line * 32 // REGISTER_GRANULE) * REGISTER_GRANULE
+    return REGISTER_PARTITIONS * (device.registers_per_sm // REGISTER_PARTITIONS // warp)
+
+
 def _resident(device: Device, block: int, registers: int | None, shared: int) -> int:
     """Blocks of ``block`` threads a multiprocessor keeps: the block limit, the threads, the register line, the
     shared memory; at least one."""
     limit = min(device.blocks_per_sm, device.threads_per_sm // block)
     if registers:
-        limit = min(limit, device.registers_per_sm // (registers * block))
+        limit = min(limit, _line_warps(device, registers) // -(-block // 32))
     if shared:
         limit = min(limit, device.shared_per_sm // granules(shared))
     return max(limit, 1)
@@ -250,10 +264,12 @@ def shape(work: Work, device: Device) -> Shape:
     if not device.cuda:
         return Shape(1, 1, 1, 1, None, REGISTERS_PER_THREAD, work.count, 0, 0)
     line = work.registers
-    resident_threads = min(device.threads_per_sm, device.registers_per_sm // line if line else device.threads_per_sm)
+    resident_threads = min(device.threads_per_sm, 32 * _line_warps(device, line) if line else device.threads_per_sm)
     lanes = _lanes(work, device, resident_threads)
     block = work.block or (256 if lanes <= 32 else lanes)
     per_sm = _resident(device, block, line, work.shared)
+    if line and not work.cap and (not work.shared or device.shared_per_sm // granules(work.shared) > per_sm):
+        line = None  # shared memory would keep more blocks than the line: the kernel takes the registers it needs
     registers = min(REGISTERS_PER_THREAD, device.registers_per_sm // (block * per_sm)) if line else REGISTERS_PER_THREAD
     groups = max(block // lanes, 1)
     grid = -(-work.count // groups)
