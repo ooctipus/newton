@@ -642,8 +642,8 @@ class RowLaws:
 
         The launch order is the slot order: the allocators reserve slots with atomics, in the order mimic, link,
         joint limit, velocity limit, contacts, then the free bodies' rows, and the phase-bound snapshots are glued
-        to that sequence. The pass then finalizes the counts with status, links the friction patches after every
-        producer and claims the sweep's rows.
+        to that sequence. The pass then finalizes the counts with status; the stage list links the friction patches,
+        latches the status and claims the sweep's rows after it (:func:`.step_plan._stages`).
 
         Args:
             solver: The solver whose step this is: its model, options, plan and primitives.
@@ -1075,22 +1075,10 @@ class RowLaws:
         )
         if solver.placement.keyed_rows is not None:
             solver.placement.keyed_rows.finish_rows()
-        # The patch link runs after every row's records are written: the keyed rows' general worlds take theirs last
-        # here; the one writer writes its contact rows' records after the row pass (write_walked), and links there.
-        if not self._writer_records(solver):
-            self._link_friction_patches(solver, contacts)
-        solver.placement.latch_status(contacts)
-        solver.sweep.claim()
-        solver.placement.warn_overflow()
 
     def write_rhs(self, solver, dt: float) -> None:
-        """Each dense row's rhs: its bias, or a bouncing contact's rebound (``compute_world_contact_bias``)."""
-        if (
-            solver.placement.row_packets is not None
-            or solver.placement.keyed_rows is not None
-            or solver.placement.walks
-        ):
-            return  # These rows write their own right-hand sides.
+        """Each dense row's rhs: its bias, or a bouncing contact's rebound (``compute_world_contact_bias``), where no
+        producer writes it (the stage list's ``rhs == "bias"``, :attr:`.step_plan.StepSpec.rhs`)."""
         placement = solver.placement
         self._bias(solver, dt, placement.constraint_count, placement.dense_max_constraints, 0)
 
@@ -1138,14 +1126,6 @@ class RowLaws:
             self.write_support(solver, state_in, contacts, dt)
         else:
             self.write_general(solver, state_in, contacts, dt)
-        if self._writer_records(solver):
-            self._link_friction_patches(solver, contacts)
-
-    @staticmethod
-    def _writer_records(solver) -> bool:
-        """Whether the one writer writes the contact rows' records after the row pass (the general placement's and the
-        support placement's: the patch link then runs after it)."""
-        return bool(solver.placement.walks) and solver.routes.case != "K2"
 
     def joint_seeds(self, solver, state_in) -> walk_rows.JointSeeds:
         """What the one writer's seeds read besides the contact input (:class:`.walk_rows.JointSeeds`): the mimics' and
@@ -1282,9 +1262,10 @@ class RowLaws:
                 friction_gap=solver.options.contact_friction_gap_threshold,
             )
 
-    def _link_friction_patches(self, solver, contacts):
-        """Link shared normal loads before any consumer packs row metadata."""
-        if self.friction_anchors_enabled and solver.sweep.patch_frame_built(contacts):
+    def link_patches(self, solver, contacts):
+        """Link the patches' shared normal loads once every contact row's records are written, before any consumer packs
+        row metadata: after the row pass, or after the one writer where it writes them (the stage list's order)."""
+        if solver.sweep.patch_frame_built(contacts):
             self.friction_patches.link(
                 solver.placement.contact_world,
                 solver.placement.contact_slot,

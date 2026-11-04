@@ -831,10 +831,10 @@ _ROW_ARRAYS = (
 
 def _linked_rows(solver, state, contacts, dt):
     """Step until the contact rows are built and linked, and return host copies of the rows: the row pass's (its
-    ``J``), with the records the one writer writes and links after it where the placement walks."""
+    ``J``), with the records the one writer writes after it where the placement walks, once the patches link them."""
     rows = {}
     finalize = Placement.latch_status
-    write_walked = RowLaws.write_walked
+    link_patches = RowLaws.link_patches
 
     def capture(self, step_contacts):
         finalize(self, step_contacts)
@@ -844,13 +844,13 @@ def _linked_rows(solver, state, contacts, dt):
             if not self.walks:
                 raise _RowsBuilt
 
-    def walked(self, step_solver, *args):
-        write_walked(self, step_solver, *args)
-        if step_solver is solver:
+    def linked(self, step_solver, *args):
+        link_patches(self, step_solver, *args)
+        if step_solver is solver and step_solver.spec.rhs == "walk":
             rows.update({name: getattr(solver.placement, name).numpy().copy() for name in _ROW_ARRAYS})
             raise _RowsBuilt
 
-    with patch.object(Placement, "latch_status", capture), patch.object(RowLaws, "write_walked", walked):
+    with patch.object(Placement, "latch_status", capture), patch.object(RowLaws, "link_patches", linked):
         try:
             solver.step(state, solver.model.state(), solver.model.control(), contacts, dt)
         except _RowsBuilt:

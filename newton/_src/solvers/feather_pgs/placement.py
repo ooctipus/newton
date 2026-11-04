@@ -884,24 +884,22 @@ class Placement:
         )
 
     def warn_overflow(self):
-        """One device-side warning per overflowing row family."""
-        mf_active = self.forest.has_free_rigid_bodies
-        if self.options.diagnostics.overflow_warning:
-            wp.launch(
-                _warn_constraint_row_overflow,
-                dim=self.forest.world_count,
-                inputs=[
-                    self.slot_counter,
-                    self.row_dropped_dense,
-                    self.dense_max_constraints,
-                    self.mf_slot_counter,
-                    self.row_dropped_mf,
-                    self.mf_max_constraints,
-                    1 if mf_active else 0,
-                    self.row_overflow_warning_emitted,
-                ],
-                device=self.model.device,
-            )
+        """One device-side warning per overflowing row family (staged under ``Diagnostics.overflow_warning``)."""
+        wp.launch(
+            _warn_constraint_row_overflow,
+            dim=self.forest.world_count,
+            inputs=[
+                self.slot_counter,
+                self.row_dropped_dense,
+                self.dense_max_constraints,
+                self.mf_slot_counter,
+                self.row_dropped_mf,
+                self.mf_max_constraints,
+                int(self.forest.has_free_rigid_bodies),
+                self.row_overflow_warning_emitted,
+            ],
+            device=self.model.device,
+        )
 
     def reset_status(self, world_mask):
         """Clear the selected worlds' overflow latch and request their factors."""
@@ -913,59 +911,41 @@ class Placement:
         )
 
     def record_watermarks(self, contacts):
-        """Opt-in row high-water telemetry (behavior-neutral): at the end of the step, after the row pass has finalized
-        the per-world counts, so the atomic-max runs inside the captured graph every step and catches mid-run peaks."""
-        if self.options.diagnostics.row_watermark:
+        """The row high-water telemetry (``Diagnostics.row_watermark``, staged only under it; behavior-neutral): at the
+        end of the step, after the row pass has finalized the per-world counts, so the atomic-max runs inside the
+        captured graph every step and catches mid-run peaks."""
+        device = self.model.device
+        # Each row class's rows (row_count), reservations (row_slot_counter) and dropped rows: the free bodies' exist
+        # only with free bodies.
+        for family, name in enumerate(("dense", "mf")[: 1 + int(self.forest.has_free_rigid_bodies)]):
             wp.launch(
                 _accumulate_row_watermark,
-                dim=self.constraint_count.shape[0],
-                inputs=[self.constraint_count, self.row_watermark_dense],
-                device=self.constraint_count.device,
+                dim=self.row_count.shape[1],
+                inputs=[self.row_count[family], getattr(self, f"row_watermark_{name}")],
+                device=device,
             )
             wp.launch(
                 _accumulate_row_capacity_telemetry,
-                dim=self.slot_counter.shape[0],
+                dim=self.row_slot_counter.shape[1],
                 inputs=[
-                    self.slot_counter,
-                    self.row_dropped_dense,
-                    self.dense_max_constraints,
-                    self.row_watermark_dense_raw,
-                    self.row_dropped_dense_high_water,
-                    self.row_overflow_dense_excess,
-                    self.row_overflow_dense_world_steps,
+                    self.row_slot_counter[family],
+                    self.row_dropped_all[family],
+                    (self.dense_max_constraints, self.mf_max_constraints)[family],
+                    getattr(self, f"row_watermark_{name}_raw"),
+                    getattr(self, f"row_dropped_{name}_high_water"),
+                    getattr(self, f"row_overflow_{name}_excess"),
+                    getattr(self, f"row_overflow_{name}_world_steps"),
                 ],
-                device=self.slot_counter.device,
+                device=device,
             )
-            mf_counts = getattr(self, "mf_constraint_count", None)
-            if mf_counts is not None and mf_counts.shape[0] > 0:
-                wp.launch(
-                    _accumulate_row_watermark,
-                    dim=mf_counts.shape[0],
-                    inputs=[mf_counts, self.row_watermark_mf],
-                    device=mf_counts.device,
-                )
-                wp.launch(
-                    _accumulate_row_capacity_telemetry,
-                    dim=self.mf_slot_counter.shape[0],
-                    inputs=[
-                        self.mf_slot_counter,
-                        self.row_dropped_mf,
-                        self.mf_max_constraints,
-                        self.row_watermark_mf_raw,
-                        self.row_dropped_mf_high_water,
-                        self.row_overflow_mf_excess,
-                        self.row_overflow_mf_world_steps,
-                    ],
-                    device=self.mf_slot_counter.device,
-                )
-            if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
-                contact_counts = contacts.rigid_contact_count
-                wp.launch(
-                    _accumulate_row_watermark,
-                    dim=contact_counts.shape[0],
-                    inputs=[contact_counts, self.row_watermark_contact],
-                    device=contact_counts.device,
-                )
+        if contacts is not None and getattr(contacts, "rigid_contact_count", None) is not None:
+            contact_counts = contacts.rigid_contact_count
+            wp.launch(
+                _accumulate_row_watermark,
+                dim=contact_counts.shape[0],
+                inputs=[contact_counts, self.row_watermark_contact],
+                device=device,
+            )
 
     def capacity_status(self, *, clear: bool = False) -> dict[str, bool]:
         """See :meth:`.SolverFeatherPGS.constraint_capacity_status`."""
@@ -1086,18 +1066,20 @@ class Placement:
         """The dense rows' diagonals, by the placement that holds them (:attr:`.step_plan.StepPlan.response`): the packed
         rows' start from zero for the one writer's ``|Z|^2 + cfm`` (local row packets keep their worlds' private seeds);
         the sparse diagonal's and native sparse factors' writers store theirs with its CFM. The free bodies' rows, from
-        ``body_base``, keep theirs: their writers stored them in the row pass (:mod:`.walk_rows`)."""
-        if self.packed_response and self.row_packets is None:
-            dim = (self.diag.shape[0], self.body_base)
-            wp.launch(_clear_dense_diagonals, dim=dim, outputs=[self.diag], device=self.model.device)
+        ``body_base``, keep theirs: their writers stored them in the row pass (:mod:`.walk_rows`). The stage list runs it
+        where the packed rows hold the response and no local row packets do (:attr:`clears_diagonals`)."""
+        dim = (self.diag.shape[0], self.body_base)
+        wp.launch(_clear_dense_diagonals, dim=dim, outputs=[self.diag], device=self.model.device)
+
+    @property
+    def clears_diagonals(self) -> bool:
+        """Whether the dense rows' diagonals start from zero each step (:meth:`diagonals`): the packed rows hold the
+        response and no local row packets keep their worlds' private seeds."""
+        return bool(self.packed_response and self.row_packets is None)
 
     def pack_free_body_meta(self) -> None:
-        """Pack matrix-free row metadata for the GS kernels, or skip when no such row can exist."""
-        if not self.forest.has_free_rigid_bodies:
-            # Only free rigid bodies produce matrix-free rows, and the model plan fixes
-            # them at construction: mf_constraint_count stays zero on the one-slot
-            # dummy buffers, so the pack would write nothing, and no pack kernel is built.
-            return
+        """Pack the free bodies' rows' metadata for the matrix-free sweeps (staged only with free bodies, the only
+        producers of matrix-free rows)."""
         wp.launch_tiled(
             self.pack_mf_meta_kernel,
             dim=[self.forest.world_count],

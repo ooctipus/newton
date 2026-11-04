@@ -133,9 +133,10 @@ class StepSpec:
     """The model holds particles, whose forces and integration the step runs."""
     pure_forest: bool
     """The model is its own forest (:mod:`.body_cut`): the step reads and publishes the caller's states directly."""
-    walked: bool
-    """The one writer walks the dense rows after the row pass (every walking class but the sparse diagonal's, whose
-    rows the row pass writes whole); otherwise the rows' bias is written apart."""
+    rhs: str
+    """Who writes the dense rows' right-hand sides: ``"walk"``, the one writer, which walks the rows after the row pass
+    (every walking class but the sparse diagonal's); ``"producers"``, the row pass's own producers (the sparse
+    diagonal's slot rows, the local owners' packets, the keyed rows); ``"bias"``, the rows' bias launch apart."""
     kernels: Mapping[str, str | None]
     """The sweep's kernel keys by route: ``sparse``, ``sparse_diagonal``, ``paired_factor``, ``mf_gs`` and
     ``mf_colored`` (``None`` where the class builds none)."""
@@ -169,7 +170,13 @@ class StepSpec:
             articulated=bool(model.articulation_count),
             particles=bool(model.particle_count),
             pure_forest=bool(solver.cut.pure),
-            walked=bool(placement.walks) and route.case != "K2",
+            rhs=(
+                "walk"
+                if placement.walks and route.case != "K2"
+                else "producers"
+                if placement.walks or placement.row_packets is not None or placement.keyed_rows is not None
+                else "bias"
+            ),
             kernels=MappingProxyType(
                 {
                     "sparse": kernel_key(sweep.sparse_kernel) if route.case == "K1" else None,
@@ -197,7 +204,7 @@ class StepSpec:
             "articulated": self.articulated,
             "particles": self.particles,
             "pure_forest": self.pure_forest,
-            "walked": self.walked,
+            "rhs": self.rhs,
             "kernels": dict(self.kernels),
             "streams": list(self.streams),
             "diagnostics": list(self.diagnostics),
@@ -520,8 +527,10 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     if not spec.particles:
         add(wait_for_collision)
 
-    # Stage 4: the rows. The resolved-world claim, the row pass, the diagonals and the writer (the one writer walks the
-    # rows into their placement's sink, or the rows' bias is written apart), then the free bodies' rows' rhs.
+    # Stage 4: the rows. The resolved-world claim, the row pass, the patches' link once every contact row's records are
+    # written, the status, the sweep's claims and the overflow warning; then the diagonals and the right-hand sides'
+    # writer (spec.rhs: the one writer walks the rows into their placement's sink, the producers wrote them, or the rows'
+    # bias is written apart), then the free bodies' rows' rhs.
     resolved = sweep.resolved_worlds_owner
 
     def classify_resolved_worlds(step):
@@ -529,6 +538,18 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
 
     def write_rows(step):
         laws.write(solver, step.state_in, factor, step.contacts, step.dt)
+
+    def link_patches(step):
+        laws.link_patches(solver, step.contacts)
+
+    def latch_status(step):
+        placement.latch_status(step.contacts)
+
+    def claim(step):
+        sweep.claim()
+
+    def warn_overflow(step):
+        placement.warn_overflow()
 
     def diagonals(step):
         placement.diagonals()
@@ -546,8 +567,19 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         with solver._sync_timed("s4_mf_setup"):
             laws.write_free_body_rhs(solver, step.dt)
 
-    add(*((classify_resolved_worlds,) if resolved is not None else ()), write_rows, nvtx="S4_ContactBuild")
-    add(diagonals, write_walked if spec.walked else write_rhs, nvtx="S4_HinvJt_Diag_RHS")
+    # The one writer writes its contact rows' records after the row pass, so the patches link after it there.
+    link = (link_patches,) if laws.friction_anchors_enabled else ()
+    add(
+        *((classify_resolved_worlds,) if resolved is not None else ()),
+        write_rows,
+        *(link if spec.rhs != "walk" else ()),
+        latch_status,
+        claim,
+        *((warn_overflow,) if solver.options.diagnostics.overflow_warning else ()),
+        nvtx="S4_ContactBuild",
+    )
+    rhs = {"walk": (write_walked, *link), "producers": (), "bias": (write_rhs,)}[spec.rhs]
+    add(*((diagonals,) if placement.clears_diagonals else ()), *rhs, nvtx="S4_HinvJt_Diag_RHS")
     if forest.has_free_rigid_bodies:
         add(write_free_body_rhs_timed if "sync_timings" in diagnostics else write_free_body_rhs, nvtx="S4_MF_Setup")
 
