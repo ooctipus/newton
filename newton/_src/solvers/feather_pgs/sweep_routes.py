@@ -14,8 +14,8 @@ from functools import cache
 
 import warp as wp
 
-from ...core.execution import device_lanes
-from ...core.memory import Buffer, Staging, arch_budget
+from ...core.execution import Work, device_lanes, shape
+from ...core.memory import REGISTERS_PER_THREAD, Buffer, Staging, arch_budget, built_for
 from . import kernel_template, sweep_units
 from .device_preludes import CPU_MATH, RING, SHARED_STORAGE, cuda_native, dual_native, lane_group
 from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude, walk_paths_prelude
@@ -172,6 +172,9 @@ visits their colors in order and each color's units at once (:mod:`.sweep_units`
 COLORED_THREADS = 256
 """Threads of a colored world's block: a color's units beyond them run in turns. The largest color measured holds
 237 units (coins) and 139 (hardware), and a unit's staged registers (up to 193) leave room for 256 threads."""
+
+COLORED_WORK = Work(0, lanes=COLORED_THREADS, registers=REGISTERS_PER_THREAD)
+"""What a colored launch declares: a block a world, every register a thread may hold (one block a multiprocessor)."""
 
 COLOR_CHUNK = 256
 """Color offsets a colored block stages at a time: a world's colors are bounded by its units, not by the block."""
@@ -912,5 +915,5 @@ def mf_gs_kernel(
         ),
         composed=True,
         native_name="sweep_mf_colored_native" if colored else "sweep_mf_gs_native",
-        launch_bounds=(COLORED_THREADS, 1) if colored else None,
+        launch_bounds=shape(COLORED_WORK, built_for(device_arch)).bounds if colored else None,
     ).kernel()

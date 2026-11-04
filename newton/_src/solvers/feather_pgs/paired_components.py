@@ -86,6 +86,9 @@ class PairedComponents:
         self.world_count = sweep.forest.world_count
         self.data = PairedComponentData()
         self.data.selector = wp.zeros(sweep.forest.world_count, dtype=wp.int32, device=sweep.model.device)
+        # Workers stride over the worlds. One wave of resident blocks (2,256 on the PRO) finishes the classifier
+        # sooner (165 -> 105 us a step on kuka) and lets the free-body sweep overlap the paired one: the step 4% faster,
+        # the two sweeps' summed kernel time 2-5% longer (three interleaved pairs, TS 11-04). Kept until that is weighed.
         self.workers = min(sweep.forest.world_count, 512)
         self.kernel = paired_components_kernel(self.primary_size, self.secondary_size)
 

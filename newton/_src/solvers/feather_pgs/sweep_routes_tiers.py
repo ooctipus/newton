@@ -323,6 +323,9 @@ def parallel_kernel(
     (NA, NB, OA, OB), operands = _operands(max_constraints, max_world_dofs, **options)
     AM = int(rows)
     NT = 32 * ((AM + 31) // 32)
+    # A block a world, a thread a row. Not persistent: an uncapped line does not fix the tier's residency, and a grid
+    # of one wave by the line is 1.2 waves at a keyed tier's 96 registers (allegro's 64-row tier 5% slower, PRO).
+    work = Work(0, lanes=NT, block=NT, registers=REGISTER_LINE, cap=False, shared=staging.bytes)
     name = (
         f"sweep_{'parallel' if row_inputs is None else 'keyed_parallel'}_{max_constraints}_{mf_max_constraints}"
         f"_{max_world_dofs}_rows{AM}_min{int(min_rows)}_sweeps{int(sweeps)}_nt{NT}_ink{NA}_{NB}_o{OA}_{OB}"
@@ -348,14 +351,11 @@ def parallel_kernel(
         ),
         composed=True,
         native_name="sweep_parallel_native",
-        launch_bounds=shape(
-            Work(0, block=staging.threads, registers=REGISTER_LINE, cap=False, shared=staging.bytes),
-            built_for(device_arch),
-        ).bounds,
+        launch_bounds=shape(work, built_for(device_arch)).bounds,
     ).kernel()
     return SweepTier(
         kernel,
-        block_dim=NT,
+        work,
         kinetic_rows=row_inputs is not None,
         linked_rows=bool(linked_rows),
         velocity_limit_pass=bool(velocity_limit_pass),

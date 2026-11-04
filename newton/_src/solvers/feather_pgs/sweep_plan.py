@@ -26,7 +26,8 @@ from collections.abc import Callable
 import numpy as np
 import warp as wp
 
-from ...core.memory import arch_budget
+from ...core.execution import Work, shape
+from ...core.memory import arch_budget, device
 from . import (
     field_group,
     host_index,
@@ -480,9 +481,13 @@ class Sweep:
         self.placement.local_solve_owner = wp.zeros(self.forest.world_count, dtype=wp.int32, device=model.device)
         self.local_general_world_count = wp.zeros(1, dtype=wp.int32, device=model.device)
         self.local_general_worlds = wp.empty(self.forest.world_count, dtype=wp.int32, device=model.device)
-        self.local_general_solver_blocks = min(
-            self.forest.world_count, max(1, int(model.device.sm_count) * _LOCAL_GENERAL_BLOCKS_PER_SM)
-        )
+        # The general owner's queue: a warp a world, at most its measured blocks a multiprocessor.
+        self.local_general_solver_blocks = shape(
+            Work(
+                self.forest.world_count, lanes=32, block=32, persistent=True, grid_per_sm=_LOCAL_GENERAL_BLOCKS_PER_SM
+            ),
+            device(model.device),
+        ).grid
 
         def arrays(lists):
             """Each size's non-empty articulation list as a device array."""
@@ -1372,7 +1377,8 @@ class Sweep:
                 self.forest.free_rigid_per_world, self.placement.mf_max_constraints, rule
             )
             if model.device.is_cuda and capable.size > 0:
-                rule = rule.at_scale(capable.size, model.device.sm_count)
+                found = device(model.device)
+                rule = rule.at_scale(capable.size, shape(sweep_routes.COLORED_WORK, found).blocks_per_sm * found.sms)
                 capable = sweep_units.capable_worlds(
                     self.forest.free_rigid_per_world, self.placement.mf_max_constraints, rule
                 )
@@ -1439,7 +1445,6 @@ class Sweep:
                     self.tier_worlds = wp.empty((len(tiers), self.forest.world_count), dtype=wp.int32, device=dev)
                     self.tier_count_views = [self.tier_counts[t : t + 1] for t in range(len(tiers))]
                     self.tier_world_views = [self.tier_worlds[t] for t in range(len(tiers))]
-                    self.tier_blocks = int(self.forest.world_count)
                 tier_sweeps, self.par_sweeps_rule, self.par_sweeps_reason = self._parallel_tier_sweeps(tiers)
                 for tier_index, ((rows_, min_rows_), sweeps_) in enumerate(zip(tiers, tier_sweeps, strict=True)):
                     tier = self.kernel(
@@ -1464,7 +1469,9 @@ class Sweep:
                         queued=self.tier_worlds is not None or self.placement.local_internal_fast_path,
                         **({"torsion": True} if self.laws.contact_torsion_enabled else {}),
                     )
-                    self.tiers.append(dataclasses.replace(tier, tier=tier_index))
+                    # On its own list, a tier takes a block a world of the list's capacity (its work's shape).
+                    grid = shape(dataclasses.replace(tier.work, items=self.forest.world_count), device(model.device))
+                    self.tiers.append(dataclasses.replace(tier, tier=tier_index, grid=grid.grid))
             # No matrix-free sweep enters a world without rows; the readout counts those solves as skipped.
             self.readout.register_skipped(world_count=int(self.forest.world_count), device=model.device)
         # The sweeps that walk their rows (and the Jacobi tiers, which always leave by the walk) add their change to the
@@ -1858,17 +1865,17 @@ class Sweep:
                 dim = self.mf_gs_block_count
                 if tier_lists:
                     # This tier grid-strides over its own compacted world list.
-                    dim = self.tier_blocks
+                    dim = tier.grid
                     named.update(
                         general_world_count=self.tier_count_views[tier.tier],
                         general_worlds=self.tier_world_views[tier.tier],
-                        general_world_grid_stride=self.tier_blocks,
+                        general_world_grid_stride=tier.grid,
                     )
                 named.update(self.placement.inkernel_response_inputs())
                 if tier.kinetic_rows:
                     keyed = self.placement.keyed_rows.parallel_arguments()
                     named.update(zip(("kinetic_rows", "patch_law"), keyed, strict=False))
-                self._launch(tier.kernel, operands, dim, tier.block_dim, **named)
+                self._launch(tier.kernel, operands, dim, tier.work.block, **named)
             colored = {} if colored_kernel is None else self.colored_units.operands()
             self._launch(mf_gs_kernel, operands, self.mf_gs_block_count, 32, **queue, **colored)
             if colored_kernel is not None:

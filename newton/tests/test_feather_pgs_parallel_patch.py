@@ -592,7 +592,7 @@ class TestParallelPatchReference(unittest.TestCase):
                 self.assertEqual(linked_source.count(RING.source), 1)
                 restored = linked_source.replace(RING.source + "\n", "").replace(pooled, projection)
                 self.assertEqual(restored, point_source)
-                self.assertEqual(linked.block_dim, point.block_dim)
+                self.assertEqual(linked.work, point.work)
 
     def test_reference_holds_pooled_cones_and_restores_point_rings(self):
         """Keep each pair inside its pooled ring disk, and reduce to point friction without ring links."""
@@ -1368,7 +1368,7 @@ def _launch_parallel(tier, case, *, device):
         values[name] if name in values else _dummy(arguments[name])
         for name in inspect.signature(kernel.func).parameters
     ]
-    wp.launch_tiled(kernel, dim=[1], inputs=inputs, block_dim=tier.block_dim, device=device)
+    wp.launch_tiled(kernel, dim=[1], inputs=inputs, block_dim=tier.work.block, device=device)
     leave_walk(values["walk"], values["v_out"], device)
     u = values["v_out"].numpy().astype(np.float64)
     return values["world_impulses"].numpy()[0, :count], np.linalg.solve(L.T, u[::-1])[::-1]

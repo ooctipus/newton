@@ -283,7 +283,7 @@ class TestOfflineCompile(unittest.TestCase):
         for label, args, kwargs in CALLS[:5]:
             with self.subTest(label):
                 tier = sweep_routes_tiers.parallel_kernel(*args, **kwargs)
-                new = sass.compile_kernel(tier.kernel, arch=120, block_dim=tier.block_dim)
+                new = sass.compile_kernel(tier.kernel, arch=120, block_dim=tier.work.block)
                 self.assertEqual(new["stack"], 0)
                 self.assertEqual(new["local"], 0)
 

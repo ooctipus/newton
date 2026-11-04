@@ -32,6 +32,7 @@ from typing import Any
 
 import warp as wp
 
+from ...core.execution import Work
 from . import field_group
 from .device_preludes import DevicePrelude, cuda_native, dual_native, substitute
 
@@ -324,8 +325,11 @@ class SweepTier:
 
     Args:
         kernel: The tier's Warp kernel.
-        block_dim: Threads per block of its tiled launches.
+        work: What its launches declare (:class:`~newton._src.core.execution.Work`, its items left to the plan): a
+            block a world, its register line and its shared memory. Its kernel's bound and its launches' grid are
+            the layer's shape of it.
         tier: Its index among the parallel tiers' world lists, or ``None`` for a tier on the general queue.
+        grid: Blocks of its launches on its own list (the layer's shape of :attr:`work` over the worlds).
         kinetic_rows: It reads the keyed rows' operands after those.
         linked_rows: It projects each friction pair on its patch ring's pooled normal load.
         velocity_limit_pass: It runs the last-word velocity-limit pass after its final sweep.
@@ -333,8 +337,9 @@ class SweepTier:
     """
 
     kernel: wp.Kernel
-    block_dim: int = 32
+    work: Work
     tier: int | None = None
+    grid: int = 0
     kinetic_rows: bool = False
     linked_rows: bool = False
     velocity_limit_pass: bool = False
