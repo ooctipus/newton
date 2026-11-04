@@ -3,7 +3,7 @@
 
 """The local owners' sweeps and the paired factor sweep as configurations of the sweep emitter (:mod:`.sweep`).
 
-Every kernel's working set fits the static budget of the device it is built for (:func:`.staging.arch_budget`).
+Every kernel's working set fits the static budget of the device it is built for (:func:`.memory.arch_budget`).
 
 - :func:`local_owned_kernel`: one lane group (8, 16 or 32 lanes) per candidate articulation, or articulation and
   free body, with several groups per block. The group stages its rows, walks each row's seeds on the tree's factor in
@@ -158,7 +158,7 @@ def local_staging(
     whitened entries, impulses and metadata, the velocity, the paired free body's impulses and the packed Gram block.
 
     The solver admits an owner, and sizes its blocks, from it (:meth:`.Staging.fits` against
-    :func:`.staging.arch_budget`).
+    :func:`.memory.arch_budget`).
     """
     R, P, S, MFR, L = (
         int(local_max_constraints),

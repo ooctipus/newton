@@ -39,7 +39,7 @@ def _select_mfgs_storage(
     """Place the sweep's row operands without changing row capacity or order.
 
     ``staging(places=)`` is the sweep block's own declaration (``sweep_routes.mf_gs_staging``) and ``budget`` the
-    device's static shared memory per block (:func:`.staging.static_budget`): every choice below is a fit of the
+    device's static shared memory per block (:func:`.memory.static_budget`): every choice below is a fit of the
     declared working set, not a mirrored count.
 
     The rows' metadata is shared when it takes at most :data:`_MFGS_RESIDENT_METADATA_MAX_BYTES` and the block fits.

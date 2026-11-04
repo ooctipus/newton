@@ -7,7 +7,7 @@ A sweep is a configuration ``Sweep(mapping, staging, blocks, update, laws, exit,
 
 - the **mapping** says which threads own a problem (a world, or a lane group per world) and how many lanes update
   one row together (:class:`.response_operator.Lanes`);
-- the **staging** declares the block's shared working set (:class:`.staging.Staging`);
+- the **staging** declares the block's shared working set (:class:`.memory.Staging`);
 - each **row block** pairs a row store (where a row's impulse, type, parent, friction coefficient, right-hand side
   and diagonal live: :class:`WorldRows`, one accessor for both row classes) with a response operator
   (:mod:`.response_operator`) and the row kinds it visits;

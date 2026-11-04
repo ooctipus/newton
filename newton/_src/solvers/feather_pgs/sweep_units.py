@@ -553,7 +553,7 @@ def build_units_kernel(
     :data:`WORLD_FIELDS` (each world's mapping by ``rule``; ``world_slot`` is read) and its slot's
     :data:`UNIT_FIELDS`. A world without a slot, or with fewer contact rows than the rule's units, takes no units, and
     a world of more units than its slot holds sets ``unit_status``: the one-warp sweep keeps both. Its shared working set (:func:`build_staging`) must fit ``static_bytes`` (a device's
-    :func:`.staging.static_budget`).
+    :func:`.memory.static_budget`).
     """
     staging = build_staging(dofs)
     staging.check("the unit builder", static_bytes)

@@ -288,7 +288,7 @@ def parallel_kernel(
     """A parallel tier: its kernel (:data:`PARALLEL_ABI`) and its launch descriptor.
 
     A thread per row: the block's threads cover ``rows`` in whole warps, and its working set fits the static budget
-    of ``device_arch`` (:func:`.staging.arch_budget`). The tier owns no world with free-body rows (its kernel's name
+    of ``device_arch`` (:func:`.memory.arch_budget`). The tier owns no world with free-body rows (its kernel's name
     carries the solver's free-body capacity ``mf_max_constraints``) and admits its velocity-limit rows as unilateral
     rows. Its worlds' stored rows (:mod:`.walk_rows`) lie at their coordinates, ``max_world_dofs`` entries a row.
     With ``weighted`` its contact rows step by their weights, ``material`` contacts' from their compliance; ``frame``

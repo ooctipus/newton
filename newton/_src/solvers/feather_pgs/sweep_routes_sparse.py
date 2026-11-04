@@ -893,7 +893,7 @@ def sparse_kernel(
 
     Launch ``ceil(world_count / (64 / lanes_per_world))`` tiles of 64 threads. Contact units take
     ``contact_records`` after ``omega``; a solve readout appends its operand after ``support``. The
-    working set must fit the static budget of ``device_arch`` (:func:`.staging.arch_budget`).
+    working set must fit the static budget of ``device_arch`` (:func:`.memory.arch_budget`).
     """
     sweep = _resolve(
         max_constraints,

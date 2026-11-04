@@ -4,7 +4,7 @@
 """FeatherPGS's sweep routes as configurations of the sweep emitter (:mod:`.sweep`).
 
 Each function here builds one route's kernel from the emitter's parts; every kernel's working set fits the static
-budget of the device it is built for (:func:`.staging.arch_budget`).
+budget of the device it is built for (:func:`.memory.arch_budget`).
 """
 
 from __future__ import annotations
@@ -651,8 +651,8 @@ def mf_gs_source(
     for the warp's worlds and, with ``colored_worlds`` (the solver builds both), the warp's kernel for the colored
     ones.
 
-    ``lanes`` is the warp mapping's lane group (:func:`.launch.device_lanes`): a warp on CUDA, or one thread, which runs
-    the world on either device (the CPU's mapping), so that body composes for both (:func:`.dual_native`).
+    ``lanes`` is the warp mapping's lane group (:func:`.execution.device_lanes`): a warp on CUDA, or one thread, which
+    runs the world on either device (the CPU's mapping), so that body composes for both (:func:`.dual_native`).
 
     Returns the body and its staging.
     """
@@ -896,7 +896,7 @@ def mf_gs_kernel(
     pitch: int | None = None,
 ) -> wp.Kernel:
     """The matrix-free Gauss-Seidel sweep kernel of a thread mapping (:func:`mf_gs_source`): the warp's launches a
-    warp per world item (one thread on the CPU, :func:`.launch.device_lanes`) and takes :data:`MF_GS_ABI`
+    warp per world item (one thread on the CPU, :func:`.execution.device_lanes`) and takes :data:`MF_GS_ABI`
     (:data:`COLORED_WORLDS_ABI` with ``colored_worlds``), the colored one :data:`COLORED_THREADS` and takes
     :data:`COLORED_ABI`."""
     max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)

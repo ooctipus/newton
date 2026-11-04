@@ -40,7 +40,7 @@ def free_body_meta_kernel(mf_max_constraints: int, pitch: int, base: int, lanes:
     """Pack each world's free-body rows into the 128-bit word the matrix-free sweeps load (:meth:`.FreeBodyZ.pack`).
 
     A group of ``lanes`` lanes per world (``wp.launch_tiled`` over the worlds: a warp, or a block when few worlds
-    would idle the device, :func:`.launch.fill_lanes`; one thread on the CPU), a lane per row; the word holds the
+    would idle the device, :func:`.execution.fill_lanes`; one thread on the CPU), a lane per row; the word holds the
     rows' sides' first world coordinates (``world_dof_offset`` of their articulations), the inverse of their stored
     diagonal ``A_ii`` (the step's form of the law, cached in the header), right-hand side (the law's plus the row's
     incident velocity: its residual at ``du = 0``), type and parent. The records are the row store's

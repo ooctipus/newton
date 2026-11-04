@@ -9,7 +9,7 @@
 in) and ``du = sqrt(m) dv`` on a diagonal coordinate, left once and added to the predictor. Each sweep runs its coordinates' fused joint limits, its independent scalar contacts one lane per chain, then its
 coupled rows in order (plain, contact triples or contact units, optionally with speculative batches), a loaded coupled
 contact unit by the unit law (:class:`_UnitPairZ`, :func:`.sweep.contact_unit`). Its working set fits the static
-budget of the device it is built for (:func:`.staging.arch_budget`).
+budget of the device it is built for (:func:`.memory.arch_budget`).
 """
 
 from __future__ import annotations
