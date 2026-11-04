@@ -31,11 +31,11 @@ from ...sim import Contacts
 from ...sim.contacts import contact_capacity_blocks
 from ...sim.enums import JointType
 from . import host_index, packed_rows, response_builds_rows
-from .dense_rows import DENSE_ROWS, MF_ROWS, RowSupport
 from .field_group import Field, FieldGroup, SolverArrays
 from .row_kernels import RIGID_SPEED_ROWS
 from .row_laws import LINK_ROWS
 from .row_metadata import _validate_mf_metadata_encoding
+from .row_records import DENSE_ROWS, MF_ROWS, RowSupport
 from .row_slots import place_world_contact_runs, record_world_contact_runs
 from .warm_start import prepare_world_impulses
 
@@ -662,7 +662,7 @@ class Placement:
         if self.mf_sweeps:
             sizes, worlds = self.forest.articulation_response_dof_count.numpy(), self.forest.art_to_world.numpy()
             offsets = self.forest.articulation_world_dof_offset.numpy()
-            # A row's sides follow articulation indices (dense_rows.row_sides); they follow the world's coordinates
+            # A row's sides follow articulation indices (row_records.row_sides); they follow the world's coordinates
             # too, so packed entries ascend with them.
             order = np.lexsort((np.arange(len(worlds)), worlds))
             responding = order[sizes[order] > 0]
@@ -1043,7 +1043,7 @@ class Placement:
     # ---------------------------------------------------------------------------------------------------------------
 
     def row_support(self) -> RowSupport:
-        """Where the dense rows' Jacobian entries sit (:class:`.dense_rows.RowSupport`): the matrix-free sweeps' packed
+        """Where the dense rows' Jacobian entries sit (:class:`.row_records.RowSupport`): the matrix-free sweeps' packed
         rows (their sides, the articulations' coordinates, first world coordinates and worlds, and the layout), or
         each size group's rows. Without the matrix-free sweeps there are no packed rows: the articulations' offsets and
         worlds are one-entry placeholders."""
@@ -1060,7 +1060,7 @@ class Placement:
         return support
 
     def jacobian_rows(self, size: int) -> wp.array:
-        """The Jacobian rows the producers of a size's rows write (:func:`.dense_rows.jacobian_row`): the packed rows
+        """The Jacobian rows the producers of a size's rows write (:func:`.row_records.jacobian_row`): the packed rows
         (:mod:`.packed_rows`) under the matrix-free sweeps, else the size group's rows."""
         return self.packed_Z if self.mf_sweeps else self.J_by_size[size]
 

@@ -17,6 +17,7 @@ import warp as wp
 from ...core.execution import arch_budget, device_lanes
 from . import kernel_template, sweep_units
 from .device_preludes import CPU_MATH, RING, SHARED_STORAGE, cuda_native, dual_native, lane_group
+from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude, walk_paths_prelude
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
 from .packed_rows import PACKED_SIDES
@@ -47,7 +48,6 @@ from .sweep import (
     speed_rows_pass,
     velocity_limit_pass,
 )
-from .tree_factor import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude, walk_paths_prelude
 
 # The row loops leave the velocity-limit and speed rows to the passes at the end of every sweep (the last word).
 _DENSE_ADMISSION = f"if (row_type == {VELOCITY_LIMIT}) continue;"
@@ -99,15 +99,15 @@ class FreeBodyCoordinates:
     A sweep runs on the velocity change from the predictor in walk coordinates, ``du`` (``s_v``, from zero): a row's
     residual is its right-hand side, which holds its incident velocity ``J v_hat``, plus ``Z^T du``, and its update
     ``du += Z delta``. The sweep adds its change to the walk's ``du`` and the step's one leave walks every tree down
-    (:func:`.tree_factor.walk_leave_kernel`). A free body's speed row reads the body's physical velocity mid-sweep: its
-    tree (found from its first global coordinate, :class:`.tree_factor.WalkTrees`' ``first_art``) is walked down and
+    (:func:`.factor.walk.walk_leave_kernel`). A free body's speed row reads the body's physical velocity mid-sweep: its
+    tree (found from its first global coordinate, :class:`.factor.walk.WalkTrees`' ``first_art``) is walked down and
     back in place (:meth:`walk_leave`, :meth:`walk_enter`).
     """
 
     op = FreeBodyZ()
 
     def _walked(self, first: str, call: str) -> str:
-        """``call`` (a walk of :func:`.tree_factor.walk_paths_prelude` on ``data``, ``link`` and ``twist``) on the tree
+        """``call`` (a walk of :func:`.factor.walk.walk_paths_prelude` on ``data``, ``link`` and ``twist``) on the tree
         whose first world coordinate is ``first``."""
         return f"""{{
     const int body_art = walk.first_art.data[world_dof_indices.data[dof_map_base + {first}]];
@@ -121,7 +121,7 @@ class FreeBodyCoordinates:
 }}"""
 
     def walk_leave(self, first: str, values: str) -> str:
-        """The walk down of the free body (a one-body tree, :data:`.tree_factor.FREE_BODY_WALK`) whose first world
+        """The walk down of the free body (a one-body tree, :data:`.factor.walk.FREE_BODY_WALK`) whose first world
         coordinate is ``first``, in place on its six ``values``: ``v = P^T L^-T u``."""
         return self._walked(
             first,
@@ -580,8 +580,8 @@ def mf_gs_source(
     whitened rows of ``max_row_dofs`` entries, by default as many as the world's coordinates) and its free-body rows
     (:class:`.FreeBodyZ`), then its end-of-sweep passes, on the world's velocity change from the predictor in walk
     coordinates (:class:`FreeBodyCoordinates`), from zero, or with ``seeded`` from the response of the impulses the
-    rows carry (:func:`.sweep.impulse_seed`). The launch adds it to the walk's ``du`` (:attr:`.tree_factor.WalkTrees.du`),
-    which the step's one leave walks down onto ``v_out`` (:func:`.tree_factor.walk_leave_kernel`); a free body's speed
+    rows carry (:func:`.sweep.impulse_seed`). The launch adds it to the walk's ``du`` (:attr:`.factor.walk.WalkTrees.du`),
+    which the step's one leave walks down onto ``v_out`` (:func:`.factor.walk.walk_leave_kernel`); a free body's speed
     row reads the body's velocity through its walk (:class:`FreeBodyCoordinates`).
 
     ``mapping`` places the free-body rows on threads (:data:`MAPPINGS`): ``"warp"``, the world's warp visits them in
@@ -609,7 +609,7 @@ def mf_gs_source(
         raise ValueError(f"the warp mapping runs 32 lanes or one thread, the colored mapping 32; got {lanes}")
     _validate_dense_metadata_encoding(max_constraints)
     M_D, M_MF, D = max_constraints, mf_max_constraints, max_world_dofs
-    # The row store's line: the dense rows, then the free bodies' from M_D (:mod:`.dense_rows`).
+    # The row store's line: the dense rows, then the free bodies' from M_D (:mod:`.row_records`).
     P = int(M_D + M_MF if pitch is None else pitch)
     max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
     row_lanes = Lanes(lanes)
@@ -744,7 +744,7 @@ def mf_gs_source(
         if ({"!__syncthreads_or(velocity_moved != 0)" if colored else "BALLOT(velocity_moved != 0) == 0u"}) iteration_changed = 0;
 """
     # The way back after the sweeps: the change in the walk's coordinates to the step's one leave (WalkTrees.du,
-    # tree_factor.walk_leave_kernel).
+    # factor.walk.walk_leave_kernel).
     body = f"""{head}
 
     {dense_count}

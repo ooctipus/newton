@@ -14,7 +14,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import field_group, row_kernels, row_laws
-from newton._src.solvers.feather_pgs.dense_rows import DenseRows
+from newton._src.solvers.feather_pgs.row_records import DenseRows
 from newton.tests.feather_pgs_law_harness import (
     call,
     mismatches,

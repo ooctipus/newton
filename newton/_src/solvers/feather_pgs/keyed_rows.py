@@ -23,7 +23,7 @@ from ...sim import ModelFlags
 from . import field_group
 from .contact_input import ContactInput
 from .contact_laws import CONTACT_LAW, CONTACT_SPIN_ROW, contact_friction
-from .dense_rows import UNIT_CONTACT, UNIT_LIMIT, unit_source
+from .factor.walk import WALK_FRAME, WALK_LINK
 from .field_group import Field, FieldGroup, SolverArrays
 from .friction_patches import PatchRowLaw, patch_row_law
 from .kernel_template import substitute
@@ -36,8 +36,8 @@ from .row_build import contact_torsion_mu
 from .row_inputs import ParallelRowInputs, RowArgument
 from .row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
 from .row_laws import ROW_LAW
+from .row_records import UNIT_CONTACT, UNIT_LIMIT, unit_source
 from .step_plan import JOINT_TOPOLOGY, TopologyPin
-from .tree_factor import WALK_FRAME, WALK_LINK
 
 ROW_MAPS = FieldGroup(
     Field("groups", wp.int32, ("world", "size"), owner="maps"),

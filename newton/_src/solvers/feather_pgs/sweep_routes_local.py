@@ -24,8 +24,8 @@ import warp as wp
 
 from ...core.execution import arch_budget, resident_blocks
 from . import field_group, kernel_template
-from .dense_rows import MfRows
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
+from .factor.walk import WalkTrees
 from .field_group import Field
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
@@ -35,6 +35,7 @@ from .response_operator import FactorComponent, FactorRows, FreeBodyZ, Lanes, Lo
 from .row_inputs import RowArgument, StoredLocalRows
 from .row_kernels import PGS_CONSTRAINT_TYPE_SPEED
 from .row_metadata import _mf_parent_expression
+from .row_records import MfRows
 from .solve_policy import DEFAULT_POLICY, SolvePolicy
 from .staging import Buffer, Staging
 from .sweep import (
@@ -65,7 +66,6 @@ from .sweep import (
     weight_arguments,
 )
 from .sweep_routes_tiers import REGISTER_WARPS
-from .tree_factor import WalkTrees
 
 LOCAL_OWNERS = (
     Field("primary_articulation", wp.int32, ("world",), owner="sweep", attr="local_primary_articulation"),
@@ -120,7 +120,7 @@ LOCAL_ABI = kernel_template.params(
     ("v_out", wp.array[float]),
 )
 """The local owners' native ABI: one candidate per lane group (``candidates`` or ``candidate_queue`` dispatch). Every
-local kernel also takes the walk (``walk``, :class:`.tree_factor.WalkTrees`), last of its row operands."""
+local kernel also takes the walk (``walk``, :class:`.factor.walk.WalkTrees`), last of its row operands."""
 
 WALK_ARGUMENT = RowArgument("walk", WalkTrees)
 """The tree factor's walk (:meth:`.tree_factor.TreeFactor.walk_view`), whose rows and leave the local kernels share."""
@@ -241,7 +241,7 @@ def local_owned_source(
     M, R, P, S = int(max_constraints), int(local_max_constraints), int(dof_count), int(paired_dof_count)
     T, MFS, MFR, L = P + S, int(mf_max_constraints), int(local_mf_max_constraints), int(lanes_per_world)
     _check_local_options(warps_per_block, L, contact_capable, T, S, MFS, MFR)
-    # The row store's line: the dense rows, then the free bodies' from M (:mod:`.dense_rows`).
+    # The row store's line: the dense rows, then the free bodies' from M (:mod:`.row_records`).
     pitch = M + MFS if pitch is None else int(pitch)
     lanes = Lanes(L)
     free = FreeBodyZ(lanes) if MFR else None
@@ -620,7 +620,7 @@ def paired_factor_source(
     coordinates (its free body's rows run in the matrix-free sweep).
 
     The rows are the walk's (:mod:`.walk_rows`): the velocity change in the walk's coordinates goes to the step's one
-    leave (:attr:`.tree_factor.WalkTrees.du`, :func:`.tree_factor.walk_leave_kernel`), which walks each component's
+    leave (:attr:`.factor.walk.WalkTrees.du`, :func:`.factor.walk.walk_leave_kernel`), which walks each component's
     tree down in the rows' frame.
 
     Returns the body and its staging.

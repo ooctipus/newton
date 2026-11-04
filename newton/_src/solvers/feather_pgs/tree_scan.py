@@ -1140,7 +1140,7 @@ def _indented(lines, pad: int) -> list[str]:
 
 def slip(kind: str, value: str, carry: str, b: str, a: str, g: str, out: str) -> list[str]:
     """One step of a slip's release along its root path (``R = L_F^-1 L_K``, a rank-one recurrence on the walk's
-    coordinates, :class:`.tree_factor.WalkRelease`): ``"R"`` leaf first, ``x = value - b s``, ``s += a x``, out
+    coordinates, :class:`.factor.walk.WalkRelease`): ``"R"`` leaf first, ``x = value - b s``, ``s += a x``, out
     ``g x``; ``"RT"`` its transpose root first, ``x = g value + a t``, ``t -= b x``, out ``x``; ``"RIT"`` the
     transpose's inverse, ``x = (value - a t) / g``, ``t -= b value``, out ``x``. ``carry`` is the recurrence's ``s``
     or ``t``; ``out`` a statement with ``{}`` for the step's output."""
@@ -1246,7 +1246,7 @@ def walk_texts(
 
 WALK_STAGED = 13
 """The floats of a coordinate's record the walk's functions read (``s``, ``ut``, ``1 / ell``), unpacked
-(:data:`.tree_factor._WALK_LOADS`): what a kernel stages of a record in shared memory (:class:`.response_operator.LocalBlock`)."""
+(:data:`.factor.walk._WALK_LOADS`): what a kernel stages of a record in shared memory (:class:`.response_operator.LocalBlock`)."""
 
 WALK_LINEAR, WALK_ANGULAR, WALK_BOTH, WALK_EITHER = 0, 1, 2, 3
 """A column's half at its body's frame as a reader of its record knows it (``WALK_READ``'s ``half``): the linear one,
@@ -1344,7 +1344,7 @@ def indent_text(text: str, spaces: int) -> str:
 @dataclass(frozen=True)
 class WalkClass:
     """A walking class: the topology its trees share, each body's parent (-1: the world, every parent before its
-    children) and first coordinate, with the count after the last (:func:`.tree_factor.walk_prelude`'s table).
+    children) and first coordinate, with the count after the last (:func:`.factor.walk.walk_prelude`'s table).
 
     :meth:`walk` is the class emitter: it turns the table into a walk's native statements, root first (the leave, a
     predictor's solve down) or leaf first (an inward pass, a solve up), so a kernel built for the class walks its tree
@@ -1364,7 +1364,7 @@ class WalkClass:
 
     def root_path(self, c: int) -> list[int]:
         """Coordinate ``c``'s root path, leaf first: ``c`` down to its body's first, then each ancestor's coordinates
-        last first (the release's path, :class:`.tree_factor.WalkRelease`): :func:`root_path` with the table compiled."""
+        last first (the release's path, :class:`.factor.walk.WalkRelease`): :func:`root_path` with the table compiled."""
         body = max(b for b in range(len(self.parent)) if self.first[b] <= c < self.first[b + 1])
         path = []
         while body >= 0:

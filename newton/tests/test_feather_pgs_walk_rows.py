@@ -29,8 +29,8 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.factor.walk import TreeWalk, local_frames
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
-from newton._src.solvers.feather_pgs.tree_factor import TreeWalk, local_frames
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_response_diagonal import _build_mixed_response_model
 from newton.tests.test_feather_pgs_walk import BOUND, ROUNDING, Capture, catalogue, run_route
@@ -249,7 +249,7 @@ def slipping_hinges(device="cpu"):
 
 
 def device_release(view, art: int, n: int) -> np.ndarray:
-    """The device release ``R`` of articulation ``art`` (:class:`.tree_factor.WalkRelease`) as an ``n x n`` float64
+    """The device release ``R`` of articulation ``art`` (:class:`.factor.walk.WalkRelease`) as an ``n x n`` float64
     matrix by coordinate: each slip's recurrence along its stored path, leaf first, the root-most slip first."""
     release = view.release
     count = int(release.count.numpy()[art])
@@ -428,7 +428,7 @@ def release_rows(release, art: int, n: int, path: np.ndarray, dof_body: np.ndarr
 
 
 def released(solver, joint_q: np.ndarray, art: int = 0):
-    """The solver's release of ``art``'s slipping drives this step (the factor's :attr:`.tree_factor.WalkTrees.release`)
+    """The solver's release of ``art``'s slipping drives this step (the factor's :attr:`.factor.walk.WalkTrees.release`)
     on its walk, and the float64 walk's columns ``B = L^-1`` (by coordinate), the all-``K`` operator ``A = (B^T B)^-1``
     and the released stiffness of each coordinate."""
     factor, forest = solver.factor, solver.forest
@@ -469,7 +469,7 @@ class TestSupportSlipRelease(unittest.TestCase):
         self.assertGreater(np.linalg.norm(B.T @ B - decided) / scale, 1.0e-1)
         # The release keeps each column inside its path: R L^-1 is the decided factor's L_F^-1, of L's pattern.
         self.assertTrue(np.all(B_F[np.abs(B) == 0.0] == 0.0))
-        # The step's one leave takes the release's transpose (tree_factor.walk_leave_kernel): dv = L^-T R^T du, the
+        # The step's one leave takes the release's transpose (factor.walk.walk_leave_kernel): dv = L^-T R^T du, the
         # decided factor's leave, against the float64 walk of R^T du.
         du = np.random.default_rng(5).normal(size=(1, n)).astype(np.float32)
         walk_view = solver.factor.walk_view()

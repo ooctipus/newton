@@ -36,7 +36,6 @@ from .contact_laws import (
     CONTACT_SPIN_ROW,
     contact_row_frame,
 )
-from .dense_rows import UNIT_CONTACT, UNIT_LIMIT, UNIT_MIMIC, UNIT_SHIFT, unit_source
 from .device_preludes import (
     lane_group,
     reserved_count,
@@ -45,6 +44,7 @@ from .device_preludes import (
     warp_sync,
 )
 from .execution_plan import retired_tiled_response_fits
+from .factor.walk import WalkTrees
 from .field_group import Field, FieldGroup, SolverArrays
 from .friction_patches import PatchRowLaw, patch_row_law
 from .kernel_template import KernelTemplate, substitute
@@ -54,8 +54,8 @@ from .row_build import write_contact_row
 from .row_inputs import SEED_NONE, SEED_SECONDARY, CompactLocalRows, RowArgument
 from .row_kernels import PGS_CONSTRAINT_TYPE_SPEED
 from .row_laws import ROW_LAW
+from .row_records import UNIT_CONTACT, UNIT_LIMIT, UNIT_MIMIC, UNIT_SHIFT, unit_source
 from .step_plan import JOINT_TOPOLOGY, TopologyPin, first_failed
-from .tree_factor import WalkTrees
 from .walk_rows import body_wrench
 
 WARPS_PER_BLOCK = 4
@@ -92,7 +92,7 @@ PREFIX = (
 )
 """The prefix kernel's inputs and outputs: the size group, the mimic tables (``mimics``: the solver's, or the
 placeholders of a model without mimics), the prefix law and the dense rows (:data:`.prefix_rows.LAW`), the
-private prefix packets, and each row's unit source (``units``, :func:`.dense_rows.unit_source`), which the one writer
+private prefix packets, and each row's unit source (``units``, :func:`.row_records.unit_source`), which the one writer
 reads for the general worlds' rows."""
 
 PrefixData = field_group.struct("PrefixData", PREFIX, __name__)
@@ -162,7 +162,7 @@ _SINK = """            const int sparse = (world * $PACKETS + slot) * 2;
             data.units.data[prefix_line * data.units.shape[1] + slot] =
                 mimic >= 0 ? ($MIMIC << $SHIFT) | mimic : ($LIMIT << $SHIFT) | (2 * dof + side);"""
 """The packets' sink: a row's sparse coefficients, its diagonal seed and impulse, its mimic's slot, and its unit source
-(:func:`.dense_rows.unit_source`: a mimic's, or a limit's coordinate and side), which the one writer walks where the
+(:func:`.row_records.unit_source`: a mimic's, or a limit's coordinate and side), which the one writer walks where the
 world is general."""
 
 

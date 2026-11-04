@@ -15,9 +15,9 @@ links the patch rings and divides the friction coefficient, in one ``link_patch_
 import warp as wp
 
 from .contact_input import ContactInput
-from .dense_rows import UNIT_CONTACT, DenseRows, unit_source
 from .friction_patches import PatchRowLaw, patch_row_law
 from .row_kernels import RowBias
+from .row_records import UNIT_CONTACT, DenseRows, unit_source
 from .walk_rows import (
     JointSeeds,
     RowSink,
@@ -84,7 +84,7 @@ def produce_contacts(
 
 def launch_contacts(solver, data: ContactInput, dt: float) -> None:
     """Produce the contact rows from the step's bound contact input; Warp capture retains these launch descriptors."""
-    from .dense_rows import bind as bind_dense_rows  # noqa: PLC0415
+    from .row_records import bind as bind_dense_rows  # noqa: PLC0415
 
     # A thread per (contact, row); in a capture whose launches bind, each replay runs the live count. The rows
     # take their own axis: the contact axis is captured at the pool's bound, which a scalar thread index times 3

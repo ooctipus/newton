@@ -13,10 +13,10 @@ import inspect
 import numpy as np
 import warp as wp
 
+from newton._src.solvers.feather_pgs import paired_components, sweep_routes, sweep_routes_local
 from newton._src.solvers.feather_pgs import paired_components as components
-from newton._src.solvers.feather_pgs import response_builds_rows, sweep_routes, sweep_routes_local
+from newton._src.solvers.feather_pgs.factor.walk import WalkTrees
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
-from newton._src.solvers.feather_pgs.tree_factor import WalkTrees
 from newton.tests.feather_pgs_law_harness import row_lines
 
 
@@ -120,7 +120,7 @@ def launch_components(data, device="cpu"):
     """Run the production worker-stride qualification launch (native CPU branch on CPU)."""
     workers = min(data.world_count, 512)
     wp.launch_tiled(
-        response_builds_rows.paired_components_kernel(23, 6),
+        paired_components.paired_components_kernel(23, 6),
         dim=[workers],
         inputs=[workers, data],
         block_dim=128,

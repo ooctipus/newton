@@ -17,10 +17,10 @@ row keys) own their worlds' counters.
 import warp as wp
 
 from . import field_group
-from .dense_rows import RECORDS
 from .device_preludes import substitute
 from .field_group import Field, FieldGroup
 from .joint_table import JOINTS
+from .row_records import RECORDS
 
 LAW = (
     Field("limit_q_index", wp.int32, ("dof",), owner="laws", attr="joint_limit_q_index"),
@@ -206,7 +206,7 @@ def prefix_rows(
         sink: Native code that publishes an active row's coefficients at ``slot`` (record ``at``).
         after: Native code the whole lane group runs after each chunk of candidates (a cooperative sink).
         locals_: Native declarations of the families' and the sinks' own per-candidate variables.
-        side: The native articulation the rows touch, recorded as each row's sides (:func:`.dense_rows.row_sides`)
+        side: The native articulation the rows touch, recorded as each row's sides (:func:`.row_records.row_sides`)
             for the packed placement (:mod:`.packed_rows`); empty: a sink that keeps its rows elsewhere.
     """
     slot = (

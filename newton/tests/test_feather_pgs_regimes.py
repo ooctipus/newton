@@ -25,7 +25,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.tree_factor import TreeWalk, local_frames
+from newton._src.solvers.feather_pgs.factor.walk import TreeWalk, local_frames
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_references as refs
 from newton.tests import feather_pgs_scenes as scenes

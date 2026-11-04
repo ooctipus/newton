@@ -42,14 +42,14 @@ from . import (
 )
 from .contact_forces import compute_contact_linear_force_from_impulses, pack_contact_linear_force_as_spatial
 from .contact_input import bind_routes as bind_contact_routes
-from .dense_rows import bind as bind_dense_rows
-from .dense_rows import bind_mf as bind_mf_rows
 from .execution_plan import _MFGSStorage, _select_mfgs_storage
 from .field_group import Field, FieldGroup
 from .forest_plan import row_support
 from .friction_patches import patch_routes
 from .kernel_template import SweepTier
 from .route_table import capable
+from .row_records import bind as bind_dense_rows
+from .row_records import bind_mf as bind_mf_rows
 from .solve_policy import SolvePolicy, SolveReadoutRecord
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport, row_supports
@@ -814,11 +814,11 @@ class Sweep:
 
         The class's tree (every articulation of the factored size shares it) and each coordinate's factor coordinate,
         the support masks' bit, are baked into the writer's walkers (:func:`.walk_rows.support_rows_kernel`) and the
-        leave (the step's one leave, :func:`.tree_factor.walk_leave_kernel`, reading the sparse sweep's change at
+        leave (the step's one leave, :func:`.factor.walk.walk_leave_kernel`, reading the sparse sweep's change at
         ``support_du_base`` and the class's nodes). The writer's first launch (:func:`.walk_rows.support_units_kernel`)
         lists the step's units, a world's lane group of :data:`.walk_rows.SUPPORT_UNIT_LANES` over its rows; its walkers
         stride over the list on lanes sized to the GPU (:func:`.walk_rows.support_threads`). The release is the factor's
-        (:attr:`.tree_factor.WalkTrees.release`), built by :func:`.walk_rows.walk_release_kernel`.
+        (:attr:`.factor.walk.WalkTrees.release`), built by :func:`.walk_rows.walk_release_kernel`.
 
         Raises:
             ValueError: For a factored size whose articulations do not share one tree.
@@ -846,7 +846,7 @@ class Sweep:
             torsion=torsion,
             half=classes_half(walk for walk in factor.walk_classes if (walk.parent, walk.first) == (parent, first)),
         )
-        # Where the step's one leave reads each coordinate's change (tree_factor.walk_leave_kernel): the sparse sweep
+        # Where the step's one leave reads each coordinate's change (factor.walk.walk_leave_kernel): the sparse sweep
         # publishes it in factor coordinates (factor_velocity_delta), so a tree's changes start at its offset in its
         # world's and a coordinate reads its factor coordinate, the support masks' bit.
         width = int(forest.max_world_dofs)
@@ -1466,7 +1466,7 @@ class Sweep:
             # No matrix-free sweep enters a world without rows; the readout counts those solves as skipped.
             self.readout.register_skipped(world_count=int(self.forest.world_count), device=model.device)
         # The sweeps that walk their rows (and the Jacobi tiers, which always leave by the walk) add their change to the
-        # walk's du in its coordinates; the step's one leave walks every tree down (tree_factor.walk_leave_kernel).
+        # walk's du in its coordinates; the step's one leave walks every tree down (factor.walk.walk_leave_kernel).
         self.leaves = self.factor.walk_arts is not None and bool(self.placement.walks or self.tiers)
 
     def open_streams(self, *, overlap: bool) -> None:

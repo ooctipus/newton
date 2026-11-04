@@ -22,6 +22,7 @@ import warp as wp
 from ...core.execution import arch_budget
 from . import kernel_template
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
+from .factor.walk import WalkTrees
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
 from .projection_laws import CONE_LAW, PROJECTION_LAW
@@ -47,7 +48,6 @@ from .sweep import (
     row_visit,
     weight_arguments,
 )
-from .tree_factor import WalkTrees
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Sparse diagonal: a dense group plus two scalar coordinates per row
@@ -247,7 +247,7 @@ def sparse_diagonal_source(
     (one per segment of the warp) is tested first: a batch whose normals stay zero without load is skipped whole,
     otherwise the sweep enters the batch at its first active contact. Under contact ``torsion`` a friction contact's
     spin row follows its pair (four rows: a triple's stride is four), solved with it. The dense articulation's change
-    goes to the step's one leave in the walk's coordinates (:func:`.tree_factor.walk_leave_kernel`).
+    goes to the step's one leave in the walk's coordinates (:func:`.factor.walk.walk_leave_kernel`).
 
     Returns the body and its staging.
     """

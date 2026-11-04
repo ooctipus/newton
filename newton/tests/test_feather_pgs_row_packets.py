@@ -15,10 +15,10 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import compact_contact, contact_laws, friction_patches, row_kernels
 from newton._src.solvers.feather_pgs import row_packets as rp
+from newton._src.solvers.feather_pgs.factor.walk import WALK_FRAME, WALK_LINK, WalkTrees
 from newton._src.solvers.feather_pgs.field_group import SolverArrays
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
-from newton._src.solvers.feather_pgs.tree_factor import WALK_FRAME, WALK_LINK, WalkTrees
 from newton.tests.feather_pgs_law_harness import group_rows, row_lines
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
@@ -212,7 +212,7 @@ def _law(view, beta=0.35):
 
 
 def _units(device):
-    """The one writer's unit sources, by world line and row (:attr:`.dense_rows.RowSupport.units`)."""
+    """The one writer's unit sources, by world line and row (:attr:`.row_records.RowSupport.units`)."""
     return wp.full((WORLDS, ROWS), -1, dtype=int, device=device)
 
 
@@ -353,7 +353,7 @@ def _owner_solver(device, *, anchors, beta=0.0):
     # The packets' seeds enter at the walk's step geometry.
     walk = WalkTrees()
     solver.factor = SimpleNamespace(walk_view=lambda: walk)
-    # The producers write the size groups' rows (dense_rows.jacobian_row).
+    # The producers write the size groups' rows (row_records.jacobian_row).
     solver.placement.row_support = lambda: group_rows(device)
     solver.placement.jacobian_rows = lambda size: solver.placement.J_by_size[size]
     return solver

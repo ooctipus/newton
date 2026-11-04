@@ -7,12 +7,12 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import field_group
-from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     compute_world_contact_bias,
 )
+from newton._src.solvers.feather_pgs.row_records import DenseRows
 from newton.tests.feather_pgs_law_harness import row_bias, row_lines
 
 _MU_JAW, _MU_BOX = 5.0, 0.5

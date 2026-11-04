@@ -11,8 +11,8 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.contact_input import ContactRoutes
-from newton._src.solvers.feather_pgs.dense_rows import MfRows
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
+from newton._src.solvers.feather_pgs.row_records import MfRows
 from newton._src.solvers.feather_pgs.warm_start import gather_mf_warmstart
 from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices

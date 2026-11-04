@@ -3,11 +3,11 @@
 
 """Dense rows stored packed by support: the matrix-free sweeps' placement of whitened rows.
 
-A dense row touches at most two articulations, its sides (:func:`.dense_rows.row_sides`): the first by index, then
+A dense row touches at most two articulations, its sides (:func:`.row_records.row_sides`): the first by index, then
 the second or none. Packed, a row holds its sides' coordinates in order, the first side's, then the second's: entry
 ``e`` of a side of ``n`` coordinates is the side's coordinate ``e``, world coordinate ``offset + e``, so a row's
 entries ascend with the world's coordinates. An entry's world coordinate is not stored: it follows from the row's
-sides (``row_sides``, :class:`.dense_rows.RowSupport`, :data:`PACKED_SIDES`). A row holds one array of entries,
+sides (``row_sides``, :class:`.row_records.RowSupport`, :data:`PACKED_SIDES`). A row holds one array of entries,
 ``packed_Z``: the one writer stores each row's whitened form ``Z = L^-1 P J^T``, walked from its seeds at the row's
 sides (:mod:`.walk_rows`), with its incident velocity ``J v_hat`` (``row_incident``).
 
@@ -15,7 +15,7 @@ Whitening keeps a side's support: ``J`` vanishes off the ancestors of the row's 
 so ``Z`` does too. A row's diagonal is ``A_ii = |Z|^2``, its entries' squares summed in entry order (the row law adds
 ``cfm``), and its velocity term at ``v = v_hat + P^T L^-T du`` is ``J_i v_hat + Z_i^T du``: the sweeps hold the velocity
 change ``du`` on every articulation they touch, which the step's one leave walks down
-(:func:`.tree_factor.walk_leave_kernel`).
+(:func:`.factor.walk.walk_leave_kernel`).
 
 The rows' width ``S`` (``support``) comes from the data: the most coordinates two articulations of one world hold
 (:func:`support_width`). Where that is every coordinate of the widest world (worlds of one or two articulations), the
@@ -24,7 +24,7 @@ zero (coordinate -1), so a row is also its dense row over the world, the form th
 coordinates on lanes read. Bilateral elimination widens them (:data:`WIDE`): a corrected row reaches every tree of its
 block, past its two sides, so the layout is dense and the sides no longer bound a row's coordinates. The writer
 writes each row's sides whole, zeros included, and records its sides: the rows are never cleared (the keyed tiers walk
-their worlds' rows in the kernel). Bilateral pre-elimination corrects them (:func:`.response_builds_rows.elimination`).
+their worlds' rows in the kernel). Bilateral pre-elimination corrects them (:mod:`.factor.closure`).
 """
 
 from __future__ import annotations

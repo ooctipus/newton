@@ -679,7 +679,7 @@ class TestDriveSaturation(unittest.TestCase):
 
     def test_slips_past_a_trees_frame_flag_its_capacity(self):
         """The border holds a tree's slips in its frame, as many as the tree has limited drives up to
-        ``tree_factor.RELEASE_SLIPS``: a chain of 40 drives all at their limits passes it and flags ``slip_frames``, two
+        ``factor.walk.RELEASE_SLIPS``: a chain of 40 drives all at their limits passes it and flags ``slip_frames``, two
         hinges never do."""
         for scene, flagged in ((_driven_chain, True), (_driven_forest, False)):
             with self.subTest(scene=scene.__name__):

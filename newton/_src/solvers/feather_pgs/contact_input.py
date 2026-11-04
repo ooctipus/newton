@@ -14,7 +14,7 @@ point form is the patch law with beta 0 and a disabled view). Its rows' records 
 
 import warp as wp
 
-from . import dense_rows, field_group
+from . import field_group, row_records
 from .contact_laws import contact_geometry, contact_tangent_basis
 from .field_group import Field, FieldGroup
 from .friction_patches import PatchRowLaw, patch_friction_location
@@ -70,7 +70,7 @@ CONTACT_INPUT = (
     # Contact torsion: 1 gives every friction contact its spin row (a fourth row), 0 none.
     Field("torsion", wp.int32, owner="laws", attr="torsion_rows"),
     # The dense row records the producers write.
-    *dense_rows.RECORDS,
+    *row_records.RECORDS,
 )
 
 ContactInput = field_group.struct("ContactInput", CONTACT_INPUT, __name__)

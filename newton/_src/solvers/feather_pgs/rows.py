@@ -37,9 +37,6 @@ from .contact_input import ContactInput
 from .contact_input import bind as bind_contact_input
 from .contact_input import bind_routes as bind_contact_routes
 from .contact_row_plan import contact_row_plan
-from .dense_rows import UNIT_LIMIT, UNIT_MIMIC, UNIT_SHIFT, UNIT_VELOCITY, RowSupport
-from .dense_rows import bind as bind_dense_rows
-from .dense_rows import bind_mf as bind_mf_rows
 from .device_preludes import block_groups, lane_group
 from .factor.fields import Preelim
 from .field_group import Field, FieldGroup, SolverArrays
@@ -62,6 +59,9 @@ from .row_kernels import (
     write_link_rows,
 )
 from .row_laws import LINK_ROWS, ROW_LAW
+from .row_records import UNIT_LIMIT, UNIT_MIMIC, UNIT_SHIFT, UNIT_VELOCITY, RowSupport
+from .row_records import bind as bind_dense_rows
+from .row_records import bind_mf as bind_mf_rows
 from .row_slots import allocate_world_contact_slots, finalize_constraint_counts_with_status, snapshot_dense_phase_bound
 from .warm_start import gather_mf_warmstart
 
@@ -135,7 +135,7 @@ def velocity_prescale_launch(articulation_start: np.ndarray, *, joint_count: int
 
 def _prefix_warp_params(law) -> tuple:
     """The warp prefix producers' operands: the family's law (:data:`.prefix_rows.LAW`, with the velocity or the mimic
-    family's inputs), the rows' placement and Jacobian rows (:func:`.dense_rows.jacobian_row`: the packed rows, by
+    family's inputs), the rows' placement and Jacobian rows (:func:`.row_records.jacobian_row`: the packed rows, by
     world, or the size group's)."""
     return params(
         ("articulation_count", int),

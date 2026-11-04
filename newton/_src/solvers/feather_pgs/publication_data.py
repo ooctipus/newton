@@ -40,9 +40,9 @@ PUBLICATION = (
     Field("body_q_com", wp.transform, ("body",), owner="state_aug"),
     Field("joint_S_s", wp.spatial_vector, ("dof",), owner="state_aug"),
     Field("articulation_origin", wp.vec3, ("articulation",), owner="factor"),
-    # The walk's step geometry (tree_factor.WalkTrees.now, .now_link; empty where nothing walks): each coordinate's
+    # The walk's step geometry (factor.walk.WalkTrees.now, .now_link; empty where nothing walks): each coordinate's
     # column at its joint's frame where a column has two halves (else the walk reads joint_S_s), each joint's frame
-    # point relative to its articulation's origin (tree_factor.WALK_LINK floats).
+    # point relative to its articulation's origin (factor.walk.WALK_LINK floats).
     Field("walk_now", wp.spatial_vector, ("dof",), owner="factor"),
     Field("walk_now_link", wp.float32, ("joint", "link"), owner="factor"),
     # The drives' K-free mass, ``H_ii + R_ii`` (tree_kinetic_state.SATURATE_DRIVES), which the collection writes where it

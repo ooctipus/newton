@@ -16,13 +16,17 @@ zero for no matrix-free rows, positive for the mixed fallback, negative for
 independent components.
 """
 
+from functools import cache
 from types import SimpleNamespace
 
 import warp as wp
 
-from . import field_group
+from . import field_group, kernel_template
+from .device_preludes import lane_group
 from .field_group import Field
+from .kernel_template import Dispatch, KernelTemplate
 from .route_table import capable
+from .row_kernels import PGS_CONSTRAINT_TYPE_SPEED
 from .step_plan import first_failed
 
 PAIRED_COMPONENTS = (
@@ -83,8 +87,6 @@ class PairedComponents:
         self.data = PairedComponentData()
         self.data.selector = wp.zeros(sweep.forest.world_count, dtype=wp.int32, device=sweep.model.device)
         self.workers = min(sweep.forest.world_count, 512)
-        from .response_builds_rows import paired_components_kernel  # noqa: PLC0415 - the build reads this module
-
         self.kernel = paired_components_kernel(self.primary_size, self.secondary_size)
 
     @property
@@ -110,3 +112,128 @@ class PairedComponents:
             block_dim=PAIRED_COMPONENT_THREADS,
             device=sweep.model.device,
         )
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Paired factor rows (FactorRows)
+# ---------------------------------------------------------------------------------------------------------------------
+#
+# A paired world holds one articulation (``P`` coordinates, its primary group) and one free body (``S = 6``, its
+# secondary group), each a diagonal block of the leaf-first ``P H P^T = L L^T``. Its rows' factor rows
+# ``z = L^-1 P j`` are its packed rows at their world coordinates (:mod:`.packed_rows`, ``A_ii = |z|^2 + cfm``).
+#
+# A paired world's qualification as independent components: every current row of the world is valid and touches
+# only its own component (dense rows the articulation's coordinates, free-body rows the body's), its pair structure
+# intact; a qualified world's selector turns negative (zero: no free-body rows, positive: the mixed fallback).
+_PAIRED_COMPONENTS = r"""
+#if !defined(__CUDA_ARCH__)
+    if (logical_lane != 0) return;
+#endif
+    const int M = data.Y.shape[1];
+    const int F = data.mf_meta.shape[1] / 4;
+    const int pitch = data.row_type.shape[1];
+    for (int world = worker; world < data.world_count; world += workers) {
+        const int m = data.counts.data[world];
+        const int mf = data.mf_counts.data[world];
+        if (LANE == 0) data.selector.data[world] = mf == 0 ? 0 : wp::max(mf, 1);
+        if (mf == 0) continue;
+        if (m < 0 || m > M || mf < 1 || mf > F) continue;
+        const int po = data.primary_offset.data[world];
+        const int so = data.secondary_offset.data[world];
+        const int art = data.primary_art.data[world];
+        if (!((po == 0 && so == $PRIMARY) || (po == $SECONDARY && so == 0)) || art < 0
+            || art >= data.dof_start.shape[0]) continue;
+        // The articulation's factor is its walk: every record of its coordinates finite and bounded.
+        int valid = 1;
+        const int records = data.walk.shape[1];
+        const float* walk = data.walk.data + (size_t)data.dof_start.data[art] * records;
+        for (int k = LANE; k < $PRIMARY * records; k += STRIDE) {
+            const float x = walk[k];
+            valid &= wp::isfinite(x) && wp::abs(x) <= 1.0e15f;
+        }
+        for (int row = LANE; row < m; row += STRIDE) {
+            const int r = data.first.data[world] * M + row;
+            const int at = data.first.data[world] * pitch + row;
+            const int type = data.row_type.data[at];
+            const float diag = data.diag.data[at];
+            const float mu = data.mu.data[at];
+            valid &= (type == 0 || type == 2 || type == 3)
+                && wp::isfinite(diag) && diag > 0.0f
+                && wp::isfinite(mu) && mu >= 0.0f && wp::isfinite(data.rhs.data[at]);
+            if (type == 2) {
+                const int p = data.row_parent.data[at];
+                if (p < 0 || p + 2 >= m || (row != p + 1 && row != p + 2)) valid = 0;
+                else {
+                    const int base = data.first.data[world] * pitch + p;
+                    valid &= data.row_type.data[base] == 0
+                        && data.row_type.data[base + 1] == 2 && data.row_type.data[base + 2] == 2
+                        && data.row_parent.data[base + 1] == p && data.row_parent.data[base + 2] == p;
+                }
+            }
+            for (int d = 0; d < $WORLD; ++d) {
+                const float y = data.Y.data[r * $WORLD + d];
+                valid &= wp::isfinite(y) && wp::abs(y) <= 1.0e15f;
+                if (d >= so && d < so + $SECONDARY) valid &= y == 0.0f;
+            }
+        }
+        for (int row = LANE; row < mf; row += STRIDE) {
+            const int r = data.first.data[world] * F + row;
+            const int packed = data.mf_meta.data[r * 4];
+            const int a = packed >> 16, b = static_cast<int>(static_cast<short>(packed & 65535));
+            const int tp = data.mf_meta.data[r * 4 + 3], type = tp & 65535;
+            union { int bits; float value; } diag, rhs;
+            diag.bits = data.mf_meta.data[r * 4 + 1];
+            rhs.bits = data.mf_meta.data[r * 4 + 2];
+            const float mu = data.mu.data[data.first.data[world] * pitch + data.body_base + row];
+            valid &= (a == -1 || a == so) && (b == -1 || b == so) && (a == so || b == so)
+                && (type == 0 || type == 2 || type == $SPEED)
+                && wp::isfinite(diag.value) && diag.value > 0.0f && wp::isfinite(rhs.value)
+                && wp::isfinite(mu) && mu >= 0.0f;
+            if (type == 2) {
+                const int encoded_parent = static_cast<unsigned int>(tp) >> 16;
+                const int p = encoded_parent == 65535 ? -1 : encoded_parent;
+                if (p < 0 || p + 2 >= mf || (row != p + 1 && row != p + 2)) valid = 0;
+                else {
+                    const int base = (data.first.data[world] * F + p) * 4 + 3;
+                    const int t1 = data.mf_meta.data[base + 4], t2 = data.mf_meta.data[base + 8];
+                    valid &= (data.mf_meta.data[base] & 65535) == 0
+                        && (t1 & 65535) == 2 && (t2 & 65535) == 2
+                        && static_cast<int>(static_cast<unsigned int>(t1) >> 16) == p
+                        && static_cast<int>(static_cast<unsigned int>(t2) >> 16) == p;
+                }
+            }
+            for (int d = 0; d < $SECONDARY; ++d) {
+                valid &= wp::isfinite(data.mf_Z.data[r * 2 * $SECONDARY + d])
+                    && wp::isfinite(data.mf_Z.data[r * 2 * $SECONDARY + $SECONDARY + d]);
+            }
+        }
+        if (ALL(valid != 0) && LANE == 0) data.selector.data[world] = -1;
+    }
+"""
+
+
+@cache
+def paired_components_kernel(primary_size: int, secondary_size: int = FREE_BODY_DOFS) -> wp.Kernel:
+    """Qualify each paired world's rows as independent components. A block of
+    :data:`.paired_components.PAIRED_COMPONENT_THREADS` threads per worker strides over the worlds; the signed selector
+    is the dispatch's private metadata."""
+    if not 1 <= primary_size <= 32 or secondary_size != FREE_BODY_DOFS:
+        raise ValueError("Paired components take an articulation of at most 32 coordinates and one free rigid body")
+    P = int(primary_size)
+    source = kernel_template.substitute(
+        _PAIRED_COMPONENTS,
+        PRIMARY=P,
+        SECONDARY=secondary_size,
+        WORLD=P + secondary_size,
+        SPEED=int(PGS_CONSTRAINT_TYPE_SPEED),
+    )
+    return KernelTemplate(
+        f"paired_components_{P}_{secondary_size}",
+        (("workers", int), ("data", PairedComponentData)),
+        source,
+        # A lane group per worker: its worker index and the thread's lane in it.
+        Dispatch("worker, lane = wp.tid()\n$CALL", ("worker", "lane"), (("worker", int), ("logical_lane", int))),
+        preludes=(lane_group(PAIRED_COMPONENT_THREADS),),
+        dual=True,
+        native_name="paired_components_native",
+    ).kernel()

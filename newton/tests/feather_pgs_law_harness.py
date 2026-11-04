@@ -27,11 +27,8 @@ from newton._src.solvers.feather_pgs import (
     row_laws,
 )
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
-from newton._src.solvers.feather_pgs.dense_rows import DenseRows, MfRows, RowSupport
 from newton._src.solvers.feather_pgs.device_preludes import cuda_native, dual_native
-from newton._src.solvers.feather_pgs.friction_patches import PatchRowLaw
-from newton._src.solvers.feather_pgs.joint_table import JointTable
-from newton._src.solvers.feather_pgs.tree_factor import (
+from newton._src.solvers.feather_pgs.factor.walk import (
     WALK_FRAME,
     WALK_LINK,
     WalkRelease,
@@ -41,6 +38,9 @@ from newton._src.solvers.feather_pgs.tree_factor import (
     unpack_walk_records,
     walk_leave_kernel,
 )
+from newton._src.solvers.feather_pgs.friction_patches import PatchRowLaw
+from newton._src.solvers.feather_pgs.joint_table import JointTable
+from newton._src.solvers.feather_pgs.row_records import DenseRows, MfRows, RowSupport
 from newton._src.solvers.feather_pgs.tree_scan import WalkClass
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -696,7 +696,7 @@ def contact_input(values, device):
 
 
 def row_support(sides, dofs, offsets, dense, device, worlds=None) -> RowSupport:
-    """A packed :class:`.dense_rows.RowSupport` of test rows: ``sides`` ``[world, row, 2]`` articulation indices (-1
+    """A packed :class:`.row_records.RowSupport` of test rows: ``sides`` ``[world, row, 2]`` articulation indices (-1
     for none), each articulation's coordinates, first world coordinate and world (``worlds``, default 0), and the
     layout (``dense``: entry ``e`` is coordinate ``e``)."""
     support = RowSupport()
@@ -712,7 +712,7 @@ def row_support(sides, dofs, offsets, dense, device, worlds=None) -> RowSupport:
 
 
 def group_rows(device) -> RowSupport:
-    """The size groups' rows as the producers' placement (:class:`.dense_rows.RowSupport`, not packed): a producer
+    """The size groups' rows as the producers' placement (:class:`.row_records.RowSupport`, not packed): a producer
     writes an articulation's side of a row at its group, from entry 0."""
     support = row_support(np.full((1, 1, 2), -1, dtype=np.int32), [0], [0], 0, device)
     support.packed = 0
@@ -831,11 +831,11 @@ def local_packed_rows(device, art_world, rows_by_art, incident=None) -> list:
 
 def _walked_coordinates(solver):
     """Where the placement walks (:mod:`.walk_rows`), ``u_hat`` in the walk's frame, ``[world, world coordinate]``: the
-    walk's enter of ``v_hat`` (:func:`.tree_factor.walk_enter_kernel`, the audit's), the coordinates its rows are
+    walk's enter of ``v_hat`` (:func:`.factor.walk.walk_enter_kernel`, the audit's), the coordinates its rows are
     whitened against; ``None`` where nothing walks (no coordinate responds, so no row has a side)."""
     if not getattr(solver.placement, "walks", False):
         return None
-    from newton._src.solvers.feather_pgs.tree_factor import walk_enter_kernel  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.factor.walk import walk_enter_kernel  # noqa: PLC0415
 
     forest, factor = solver.forest, solver.factor
     coordinates = wp.zeros(
@@ -927,7 +927,7 @@ def walk_factor(lower) -> np.ndarray:
 
 
 def chain_walk(device, lowers) -> WalkTrees:
-    """The walk (:class:`.tree_factor.WalkTrees`) of chains whose factors are the given leaf-first ``L`` (one an
+    """The walk (:class:`.factor.walk.WalkTrees`) of chains whose factors are the given leaf-first ``L`` (one an
     articulation, their coordinates one after another): body ``c`` holds coordinate ``c`` (a chain of at most six),
     ``s_c = e_c``, ``ut_c[k] = A[c, k]`` below the diagonal and ``1 / ell_c = 1 / A[c, c]`` (:func:`walk_factor`), its
     links and frames zero, and the step's columns the factor's, so a wrench seed's ``J`` is its first coordinates' components and
@@ -987,10 +987,10 @@ def chain_walk(device, lowers) -> WalkTrees:
 
 def diagonal_walk(inverse, device, dofs=None, offsets=None):
     """The walk of each world's dense articulation whose mass matrix is diagonal, ``H = diag(1 / inverse[w])``, as the
-    step's one leave walks it (:func:`.tree_factor.walk_leave_kernel`, :func:`leave_walk`): world ``w``'s articulation
+    step's one leave walks it (:func:`.factor.walk.walk_leave_kernel`, :func:`leave_walk`): world ``w``'s articulation
     ``w`` at its world's ``offsets[w]`` of ``dofs`` coordinates (global coordinate ``w dofs + d``), a chain of one
     coordinate a body whose columns and lifts are zero, so ``WALK_DOWN`` leaves ``u_c / ell_c = u_c sqrt(m_c^-1)``.
-    Returns its :class:`.tree_factor.WalkTrees`."""
+    Returns its :class:`.factor.walk.WalkTrees`."""
     inverse = np.asarray(inverse, np.float32)
     worlds, n = inverse.shape
     dofs = n if dofs is None else int(dofs)
@@ -1021,7 +1021,7 @@ def diagonal_walk(inverse, device, dofs=None, offsets=None):
 
 
 def leave_walk(walk: WalkTrees, velocity, device) -> None:
-    """The step's one leave of a hand-built walk (:func:`.tree_factor.walk_leave_kernel`), after a sweep launched by
+    """The step's one leave of a hand-built walk (:func:`.factor.walk.walk_leave_kernel`), after a sweep launched by
     hand: each tree's change, which the sweep added into ``walk.du``, walked down onto ``velocity``; ``du`` cleared for
     the next launch."""
     joint_start, joint_end = walk.joint_start.numpy(), walk.joint_end.numpy()
@@ -1128,7 +1128,7 @@ def whitened_rows(jacobian, L) -> np.ndarray:
 def packed_coordinates(solver) -> np.ndarray:
     """The world coordinate of every packed row entry ``[world, row, entry]`` (-1 past the row's sides), from the
     rows' sides (:mod:`.packed_rows`: dense rows at their coordinates, else side by side). Every side holds response
-    coordinates (:func:`.dense_rows.row_sides`)."""
+    coordinates (:func:`.row_records.row_sides`)."""
     sides, sizes = solver.placement.row_sides.numpy(), solver.forest.articulation_response_dof_count.numpy()
     offsets = solver.forest.articulation_world_dof_offset.numpy()
     dof = np.full((*sides.shape[:2], solver.placement.packed_Z.shape[2]), -1, dtype=np.int32)

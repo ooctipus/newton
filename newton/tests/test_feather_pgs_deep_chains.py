@@ -5,7 +5,7 @@
 
 Main added armature where its float32 dense Cholesky would fail: every coordinate near the head of a path of 32 joints
 or more (the deep-chain rule), and a floor on thin axes of every tree (the assembly floor). The walk, the leaf-first
-factor in local frames (:class:`.tree_factor.TreeWalk`), keeps its float32 pivots positive without either, so the
+factor in local frames (:class:`.factor.walk.TreeWalk`), keeps its float32 pivots positive without either, so the
 solver adds neither (Z4.L). These tests hold both sides to float64 references that share nothing with the solver:
 
 - **the deep-chain regime:** a tip wrench on ``long_chain(N)`` without armature, N = 32, 106, 300 and 1,000, its
@@ -35,7 +35,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.body_cut import BodyCut
-from newton._src.solvers.feather_pgs.tree_factor import TreeWalk, local_frames
+from newton._src.solvers.feather_pgs.factor.walk import TreeWalk, local_frames
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests.feather_pgs_law_harness import dense_factor32

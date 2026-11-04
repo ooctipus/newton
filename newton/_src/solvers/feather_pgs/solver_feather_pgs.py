@@ -385,7 +385,7 @@ class SolverFeatherPGS(SolverBase):
             enable_joint_limits (bool, optional): Enforce joint position limits as unilateral PGS
                 constraints. Each active limit side adds one constraint row. Defaults to False.
             enable_bilateral_preelimination (bool, optional): Eliminate mimic rows exactly, as a loop joint's rows
-                always are (:func:`.response_builds_rows.close_block`): every other row (contacts especially) takes
+                always are (:func:`.factor.closure.close_block`): every other row (contacts especially) takes
                 the closed-loop response, ``Z' = (I - Q Q^T) Z``, and the predictor velocity is projected onto the
                 closures once per step. Blocks are sized from the model; a row that depends on the others leaves
                 its block. Defaults to False.
@@ -1178,7 +1178,7 @@ class SolverFeatherPGS(SolverBase):
         device graph updater failed closed after the capture emitted it, or its
         count passed the captured bound. ``slip_frames`` identifies a step in which a
         tree's saturated drives outnumbered its release's capacity (its first
-        ``tree_factor.RELEASE_SLIPS`` slipping, the rest keeping their ``K``), or
+        ``factor.walk.RELEASE_SLIPS`` slipping, the rest keeping their ``K``), or
         in which a drive saturated on a tree that held no limited drive when
         the solver was built (its step keeps every ``K``).
         Flags remain set across later successful

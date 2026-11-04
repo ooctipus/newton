@@ -3,7 +3,7 @@
 
 """The walk is the tree factor (Z_UNION §1.2): its falsification tests on the CPU (Z_UNION §5, Z0).
 
-:class:`.tree_factor.TreeWalk` walks a six-number state up the tree, one coordinate at a time, in local frames. Its
+:class:`.factor.walk.TreeWalk` walks a six-number state up the tree, one coordinate at a time, in local frames. Its
 data ``(s, ut, ell)`` is the leaf-first factor; its footprints are the whitened rows, the walk run down is the leave,
 and two walks meeting at their lowest common ancestor give the Gram. No step calls it; these tests hold it to the
 factor and to the claims built on it:
@@ -30,9 +30,9 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.factor.walk import TreeWalk, local_frames
 from newton._src.solvers.feather_pgs.placement import Placement
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
-from newton._src.solvers.feather_pgs.tree_factor import TreeWalk, local_frames
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conformance

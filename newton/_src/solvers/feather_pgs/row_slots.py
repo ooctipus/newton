@@ -9,9 +9,9 @@ import warp as wp
 from .contact_filters import contact_normal_gap_limit
 from .contact_input import ContactInput
 from .contact_laws import contact_endpoints, contact_points, contact_responds
-from .dense_rows import UNIT_CONTACT, unit_source
 from .device_preludes import dual_native, lane_group, reserve, reserved_count, warp_scan, warp_sum, warp_sync
 from .friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches
+from .row_records import UNIT_CONTACT, unit_source
 
 # =============================================================================
 # Multi-Articulation Contact Building Kernels

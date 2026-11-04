@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import dense_rows, field_group
+from newton._src.solvers.feather_pgs import field_group, row_records
 from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -40,7 +40,7 @@ class TestSparseContacts(unittest.TestCase):
                 dim=(1, row_count),
                 inputs=[
                     field_group.upload(
-                        dense_rows.DenseRows,
+                        row_records.DenseRows,
                         "cpu",
                         row_type=kinds,
                         phi=phi,

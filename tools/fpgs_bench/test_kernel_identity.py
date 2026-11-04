@@ -166,7 +166,7 @@ class TestKernelIdentity(unittest.TestCase):
         self.assertEqual(words, {1, 2, 4})
         names = {name for name, _, _, _ in calls}
         for name in ("walk_leave_kernel", "walk_enter_kernel", "walk_step_kernel", "get_walk_solve_kernel"):
-            self.assertIn(f"tree_factor.{name}" if name.startswith("walk") else f"tree_kinetic_state.{name}", names)
+            self.assertIn(f"factor.walk.{name}" if name.startswith("walk") else f"tree_kinetic_state.{name}", names)
         self.assertIn("walk_rows.support_rows_kernel", names)
         self.assertIn("walk_rows.walked_rows_kernel", names)
         labels = [identity.label(name, args, kwargs) for name, _, args, kwargs in calls]

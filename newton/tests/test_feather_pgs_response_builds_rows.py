@@ -16,10 +16,10 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import field_group, response_builds_rows
+from newton._src.solvers.feather_pgs import field_group, paired_components, response_builds_rows
+from newton._src.solvers.feather_pgs.factor.walk import WALK_COORDINATE
 from newton._src.solvers.feather_pgs.paired_components import PairedComponentData
 from newton._src.solvers.feather_pgs.response_operator import FreeBodyZ
-from newton._src.solvers.feather_pgs.tree_factor import WALK_COORDINATE
 from newton.tests.feather_pgs_law_harness import row_lines, walk_inverse
 
 DEVICE = "cpu"
@@ -92,7 +92,7 @@ class TestFreeBodyZBuild(unittest.TestCase):
 
 
 def _walk_records(rng, trees, size):
-    """The walk's records (:data:`.tree_factor.WALK_COORDINATE` floats a coordinate) of ``trees`` trees of ``size``
+    """The walk's records (:data:`.factor.walk.WALK_COORDINATE` floats a coordinate) of ``trees`` trees of ``size``
     coordinates, one after another: finite and bounded, the qualification's read of each primary tree's factor."""
     return (rng.normal(size=(trees * size, WALK_COORDINATE)) * 0.3).astype(np.float32)
 
@@ -152,7 +152,7 @@ class TestFactorRowsBuild(unittest.TestCase):
                 with self.subTest(primary=P, qualified=qualified):
                     data = _components_data(P, np.random.default_rng(37), qualified=qualified)
                     wp.launch(
-                        response_builds_rows.paired_components_kernel(P), dim=(2, 128), inputs=[2, data], device=DEVICE
+                        paired_components.paired_components_kernel(P), dim=(2, 128), inputs=[2, data], device=DEVICE
                     )
                     self.assertEqual(list(data.selector.numpy()), [-1 if qualified else 3, 3])
 
@@ -186,7 +186,7 @@ class TestNativeBuildsAssemble(unittest.TestCase):
     def test_native_builds_assemble_without_spills(self):
         builds = {
             "free-body words": lambda: response_builds_rows.free_body_meta_kernel(64, 8 + 64, 8, 32, "sm_120"),
-            "paired components": lambda: response_builds_rows.paired_components_kernel(22),
+            "paired components": lambda: paired_components.paired_components_kernel(22),
         }
         for name, build in builds.items():
             with self.subTest(build=name):

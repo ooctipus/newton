@@ -325,7 +325,7 @@ def _linked_sweep_calls():
 
 def _support_writer_calls():
     """The support placement's writer (case K1, walk_rows.py) on a branched tree of a free root and three limbs, under
-    each record and torsion law, and the step's one leave of that tree's class (tree_factor.py)."""
+    each record and torsion law, and the step's one leave of that tree's class (factor/walk.py)."""
     from newton._src.solvers.feather_pgs import walk_rows  # noqa: PLC0415
 
     tree = ((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11), tuple(range(10, -1, -1)))
@@ -334,11 +334,12 @@ def _support_writer_calls():
         yield "walk_rows.support_rows_kernel", walk_rows.support_rows_kernel.__wrapped__, tree, kwargs
     for unit_rows in (3, 4):
         yield "walk_rows.support_units_kernel", walk_rows.support_units_kernel.__wrapped__, (unit_rows, 16), {}
-    from newton._src.solvers.feather_pgs import tree_factor, tree_scan  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import tree_scan  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.factor import walk as factor_walk  # noqa: PLC0415
 
     walk = (tree_scan.WalkClass(*tree[:2]),)
     for release in (False, True):
-        yield "tree_factor.walk_leave_kernel", tree_factor.walk_leave_kernel.__wrapped__, (walk, release), {}
+        yield "factor.walk.walk_leave_kernel", factor_walk.walk_leave_kernel.__wrapped__, (walk, release), {}
 
 
 def _dense_build_calls():
@@ -455,7 +456,7 @@ def _suite_shape_calls():
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
         keyed_row_layout,
         keyed_rows,
-        response_builds_rows,
+        paired_components,
         row_packets,
         sweep_routes,
         sweep_routes_diag,
@@ -500,8 +501,8 @@ def _suite_shape_calls():
             yield "keyed_rows.get_parallel_factory", parallel, (layout, *shape), kwargs
     yield "keyed_row_layout.prefix_kernel", limit_prefix, (limited,), {}
     yield "row_packets.get_prefix_kernel", row_packets.get_prefix_kernel.__wrapped__, (9, 1, 40), {}
-    components = response_builds_rows.paired_components_kernel.__wrapped__
-    yield "response_builds_rows.paired_components_kernel", components, (23, 6), {}
+    components = paired_components.paired_components_kernel.__wrapped__
+    yield "paired_components.paired_components_kernel", components, (23, 6), {}
 
 
 def _keyed_row_calls():

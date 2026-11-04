@@ -19,6 +19,16 @@ from . import (
 from . import tree_scan as ts
 from .device_preludes import CUDA_ONLY, STATUS_CLOCK, device_branches, dual_native, substitute
 from .factor import kernels
+from .factor.walk import (
+    WALK_COORDINATE,
+    WALK_FRAME,
+    WALK_LINK,
+    WALK_NOW,
+    WALK_UNPACKED,
+    WalkTrees,
+    walk_down_prelude,
+    walk_loads_prelude,
+)
 from .field_group import Field
 from .kernel_template import Dispatch, KernelTemplate, python_kernel
 from .publication_data import PublicationData
@@ -604,7 +614,7 @@ _EXTERNAL_FRAME = r"""float P[4];WALK_READ_POINT(WALK_LDG,P,walk.now_link.data+$
             input=Spatial::wrench_shift(input,wp::vec3(c[0]-P[0],c[1]-P[1],c[2]-P[2]));"""
 """A body's external wrench at its frame: the force keeps, the moment gains the centre of mass less the frame point
 (:func:`.spatial_laws.wrench_shift`), both the step's, the articulation's own (relative to its origin), as the walk's
-refresh forms its inertia's lever (``tree_factor.WalkTrees.now_com``, ``now_link``)."""
+refresh forms its inertia's lever (``factor.walk.WalkTrees.now_com``, ``now_link``)."""
 
 _EXTERNAL_CARRY = r"""    if(nonzero) {
         if(lane==0) {
@@ -1068,7 +1078,6 @@ def get_state_kernel(
     bodies, dofs, pack, free_root = layout.bodies, layout.dofs, layout.pack, layout.free_root
     roots, free_roots, forest, own_bias = len(layout.roots), layout.free_root_count, layout.forest, layout.own_bias
     from .spatial_laws import store_columns  # noqa: PLC0415
-    from .tree_factor import WALK_FRAME  # noqa: PLC0415 (tree_factor imports this module)
 
     @wp.func
     def admit(
@@ -2061,7 +2070,7 @@ def _walk_roots(layout: TreeLayout) -> list[tuple[int, int, int]]:
 
 def _walked(layout: TreeLayout, classes: tuple) -> list[tuple[int, int, int]]:
     """``(root, coordinate offset, class index)`` of each root the walk solves, its index into the walked classes
-    (:func:`.tree_factor.walk_down_prelude`'s ``cls``)."""
+    (:func:`.factor.walk.walk_down_prelude`'s ``cls``)."""
     walked, k = [], 0
     for (r, offset, _), cls in zip(_walk_roots(layout), classes, strict=True):
         if cls is not None:
@@ -2072,14 +2081,13 @@ def _walked(layout: TreeLayout, classes: tuple) -> list[tuple[int, int, int]]:
 
 def border_solve(layout: TreeLayout, classes: tuple) -> str:
     """Native statements of the decided step (FL3.9, W9), one text for both devices (:data:`_HELD`). Each changed
-    root's segment holds its walk and builds its release (into :class:`.tree_factor.WalkRelease`, from the marks
+    root's segment holds its walk and builds its release (into :class:`.factor.walk.WalkRelease`, from the marks
     :data:`SATURATE_DRIVES` left) coordinate-major, a slip a lane and slot, every value a register (``HELD_BUILD``);
     then it takes its decided step from the force words into the response words: the class's walk up, ``R^T R`` with
     every slip on its lane (``HELD_APPLY``), the walk down. A root whose step its trial already gives (bit ``1 + r`` of
     ``moved`` clear) keeps its trial's response. The releases are built for every root first: the marks of one root
     lie in the states of another's walk. Nothing is added to the block (H8: g1's predictor sits at the RTX PRO 6000's
     64 KB carveout line): the walks' join states and twists lie in the dead body words."""
-    from .tree_factor import WALK_COORDINATE, WALK_LINK  # noqa: PLC0415
 
     roots = [(r, offset) for r, offset, _ in _walked(layout, classes)]
     if not roots:
@@ -2132,7 +2140,6 @@ def held_lambdas(layout: TreeLayout, slips: int, half: int = ts.WALK_BOTH) -> st
     a lane hold the layout's coordinates and bodies (and one past the last body). ``slips`` is the class's slip capacity
     (:meth:`.tree_factor.TreeFactor.slip_capacity`): the build's slips, a lane and slot each. ``half``: the records'
     half as the border reads any tree's (``WALK_READ``, :func:`.tree_scan.record_half`)."""
-    from .tree_factor import WALK_COORDINATE, WALK_UNPACKED  # noqa: PLC0415
 
     return substitute(
         _HELD,
@@ -2194,7 +2201,6 @@ def _predictor_name(prefix: str, layout: TreeLayout, schedules: HeldSchedules | 
 def _half_kernel(prefix, schedules, layout, response, classes, flag, body, preludes=(), **fragments):
     """A half of the predictor (:data:`_HALF` and its ``body``, a packed group of trees a block, its launch bound at
     :data:`PREDICTOR_THREADS`): the force half or the response half."""
-    from .tree_factor import WalkTrees  # noqa: PLC0415
 
     source = layout.native(
         _HALF + body,
@@ -2236,7 +2242,6 @@ def get_force_kernel(schedules: HeldSchedules, *, layout: TreeLayout = REFERENCE
     clears each root's slip count for the response half's border. The columns' half is the walked classes'
     (:func:`.tree_scan.classes_half`). A group none of whose roots is walked holds no walk to read: its force takes no
     external wrench, which no coordinate of it answers."""
-    from .tree_factor import WALK_COORDINATE, WALK_FRAME, WALK_LINK, WALK_NOW, walk_loads_prelude  # noqa: PLC0415
 
     walked = tuple(cls for cls in classes if cls is not None)
     external = dict.fromkeys(("FRAME", "CARRY", "PROJECT"), "")
@@ -2294,7 +2299,6 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
     walk up of ``trial.force`` into registers and the walk down into ``trial.response``, ``P^T L^-T L^-1 P f`` on the
     all-``K`` walk (:func:`.tree_scan.walk_texts`). A prescribed root responds with zero."""
     from .kernel_template import THREADS  # noqa: PLC0415
-    from .tree_factor import WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude  # noqa: PLC0415
     from .tree_scan import WALK_REGISTERS, WALK_UNROLL  # noqa: PLC0415
 
     sizes = {"coordinate": WALK_COORDINATE, "link": WALK_LINK}
@@ -2369,7 +2373,6 @@ def get_predictor_kernel(
     slip capacity, the border's build lanes (:func:`held_lambdas`); ``side`` the factor's
     :attr:`.tree_factor.TreeFactor.walk_side`. ``response`` names the group's kind in the kernel's name only.
     """
-    from .tree_factor import walk_loads_prelude  # noqa: PLC0415 (tree_factor imports this module)
 
     if len(classes) != len(_walk_roots(layout)):
         raise ValueError("The predictor needs a walking class (or None) for each root")

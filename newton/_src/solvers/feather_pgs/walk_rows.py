@@ -24,12 +24,12 @@ rows walked together from its first (1, 3, or 4 under contact torsion), or a joi
 Each row's header is its diagonal ``|z|^2 + cfm`` (the walk's sums of squares, re-read where two seeds share a side or
 a side slips), its incident velocity ``J v_hat`` (the step's ``J`` entries each walk passes) and its rhs by the row law
 (:func:`.row_kernels.row_bias`). A wrench enters as the step's ``J`` (the step's columns the finish published, shifted to
-the walk's frames, :attr:`.tree_factor.WalkTrees.now`), so a step between refreshes whitens the step's ``J`` by the
+the walk's frames, :attr:`.factor.walk.WalkTrees.now`), so a step between refreshes whitens the step's ``J`` by the
 held factor. A slipping drive's ``K`` leaves the rows by its release along its path (``R``, the predictor's border,
 :func:`.tree_kinetic_state.border_solve`), which keeps every row inside its support.
 
 No ``J`` is formed. The rows and the sweeps' leave share the walk's one frame (FL3_design §1.2); the sweeps' change
-goes to the step's one leave (:func:`.tree_factor.walk_leave_kernel`).
+goes to the step's one leave (:func:`.factor.walk.walk_leave_kernel`).
 """
 
 from __future__ import annotations
@@ -41,7 +41,28 @@ import warp as wp
 from . import field_group
 from .contact_input import ContactFrame, ContactInput, contact_frame
 from .contact_laws import CONTACT_SPIN_ROW, contact_row_entry, contact_seed, spin_seed
-from .dense_rows import (
+from .device_preludes import DevicePrelude, dual_native, lane_group, substitute
+from .factor.closure import close_block, close_row
+from .factor.fields import Preelim
+from .factor.walk import (
+    WALK_COORDINATE,
+    WALK_FRAME,
+    WALK_LINK,
+    WalkRelease,
+    WalkTrees,
+    walk_paths_prelude,
+    walk_prelude,
+    walk_row_prelude,
+)
+from .field_group import Field
+from .friction_patches import PatchRowLaw
+from .joint_table import FreeBodies
+from .kernel_template import python_kernel
+from .projection_laws import friction_pair_metric
+from .row_build import write_contact_row
+from .row_kernels import PGS_CONSTRAINT_TYPE_SPEED, RIGID_SPEED_ROWS, RowBias, row_bias
+from .row_laws import LINK_ROWS
+from .row_records import (
     UNIT_CONTACT,
     UNIT_LIMIT,
     UNIT_LINK,
@@ -52,28 +73,7 @@ from .dense_rows import (
     RowSupport,
     unit_source,
 )
-from .device_preludes import DevicePrelude, dual_native, lane_group, substitute
-from .factor.fields import Preelim
-from .field_group import Field
-from .friction_patches import PatchRowLaw
-from .joint_table import FreeBodies
-from .kernel_template import python_kernel
-from .projection_laws import friction_pair_metric
-from .response_builds_rows import close_block, close_row
-from .row_build import write_contact_row
-from .row_kernels import PGS_CONSTRAINT_TYPE_SPEED, RIGID_SPEED_ROWS, RowBias, row_bias
-from .row_laws import LINK_ROWS
 from .sparse_mass_matrix import _SparseRowSupport
-from .tree_factor import (
-    WALK_COORDINATE,
-    WALK_FRAME,
-    WALK_LINK,
-    WalkRelease,
-    WalkTrees,
-    walk_paths_prelude,
-    walk_prelude,
-    walk_row_prelude,
-)
 from .tree_scan import WALK_BOTH, held_fits, record_half
 
 __all__ = [
@@ -285,9 +285,9 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool = True) -> wp
        (:func:`.row_kernels.row_bias`). A row a lane, not a contact a lane: the world's lanes stay busy (the support
        placement's unit list spreads a contact's unit over the GPU instead, :func:`support_rows_kernel`);
     2. *closure* (``blocks``, the largest bilateral block's rows; 0 for none): the lanes close each of the world's
-       blocks (:func:`.response_builds_rows.close_block`; its rows are the links', and the mimics' with
+       blocks (:func:`.factor.closure.close_block`; its rows are the links', and the mimics' with
        ``mimic_blocks``), then correct every other row on the blocks its sides touch
-       (:func:`.response_builds_rows.close_row`).
+       (:func:`.factor.closure.close_row`).
 
     The closure's seed stays a launch after the warm start's gather (:meth:`.tree_factor.TreeFactor.seed_blocks`).
     One launch with group barriers, not a second launch for the block phase: FL33D's measurement (``fl33d/``).
@@ -825,7 +825,7 @@ _PACKED_RELEASE = (
 def packed_walker(rows: int, spin: bool, side: bool, star: bool = False, bodies: bool = False) -> wp.Function:
     """The general placement's unit walker (:data:`_SUPPORT`, the support writer's text with the packed rows as its
     sink): a unit's ``rows`` rows walked together through each tree's path table in global memory
-    (:func:`.tree_factor.walk_paths_prelude`, a world holds any forest), each footprint stored at its coordinate's entry
+    (:func:`.factor.walk.walk_paths_prelude`, a world holds any forest), each footprint stored at its coordinate's entry
     in the side's packed row, its diagonal ``|z|^2 + cfm`` and incident ``J v_hat`` from the same walk; ``spin``: the
     unit's fourth row is its spin row; ``side``: whether records can have a side. With ``star``, the sparse diagonal's:
     the arm's side into the row's dense part (its size group's row, ``unit.group``), a key's side left to the writer
@@ -1006,7 +1006,7 @@ def support_rows_kernel(
     walker. A lane walks a unit: a contact's rows from its first, a joint row alone. The generator form (Gamma per body,
     ``z = Gamma w``) measured slower on g1 than this direct walk, so the writer walks each unit.
 
-    The class's tree (``parent``, ``first``: :func:`.tree_factor.walk_prelude`'s table) and each coordinate's factor
+    The class's tree (``parent``, ``first``: :func:`.factor.walk.walk_prelude`'s table) and each coordinate's factor
     coordinate ``node`` (the support masks' bit) are baked into constant memory. A contact unit of three rows (four
     under contact ``torsion``) is walked together and its Gram writes its block record where ``records`` (the
     triplet sweeps'); a unit of one row (a normal alone, a limit, a velocity limit, a mimic) by the one-row walker. The
@@ -1089,7 +1089,7 @@ def support_threads(units: int, device) -> int:
 # A row's seed on the arm walks into the row's dense part, the arm's coordinates in the walk's order; a seed on a key is
 # one step to the world, z = (s . w) / ell, the key's step J entry over the root of its pivot (the J / sqrt(m) slot,
 # 1 / ell = sqrt(m^-1) of the factor's diagonal), into the row's two slots. The sweep reads the dense part and the slots
-# (:class:`.response_operator.SparsePairZ`) and leaves the arm by the walk (:func:`.tree_factor.walk_leave_kernel`), the
+# (:class:`.response_operator.SparsePairZ`) and leaves the arm by the walk (:func:`.factor.walk.walk_leave_kernel`), the
 # release its rows carry.
 
 SLOT_ROWS = (
@@ -1259,7 +1259,7 @@ def row_sink(factor, forest, placement, v_hat: wp.array) -> RowSink:
 
 def packed_sink(solver) -> RowSink:
     """The packed placements' sink (:class:`RowSink`, :func:`packed_walker`): where each side's entries sit in a packed
-    row (:class:`.dense_rows.RowSupport`) and the entries, the general placement's packed rows, or the sparse diagonal's
+    row (:class:`.row_records.RowSupport`) and the entries, the general placement's packed rows, or the sparse diagonal's
     dense parts by size group (:data:`SLOT_ROWS`' ``Z``) with its star's coordinates."""
     placement = solver.placement
     sink = row_sink(solver.factor, solver.forest, placement, solver.v_hat)

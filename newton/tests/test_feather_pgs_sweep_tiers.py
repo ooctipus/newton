@@ -230,7 +230,7 @@ class TestResponseOperators(unittest.TestCase):
     def test_the_release_compiles_where_a_tree_can_slip(self):
         """A slipping drive's release ``R`` (the walk's ``WALK_RELEASE``) on the keyed rows, only on the trees of the
         capacity the tier names; the stored rows carry ``R`` from their writer. Its transpose is the step's one leave's
-        (``tree_factor.walk_leave_kernel``), never the tier's."""
+        (``factor.walk.walk_leave_kernel``), never the tier's."""
         for label, args, kwargs in (CALLS[0], CALLS[2]):
             with self.subTest(label):
                 self.assertNotIn("WALK_RELEASE(walk.release", _source(args, kwargs))

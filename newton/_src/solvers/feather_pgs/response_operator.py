@@ -6,7 +6,7 @@
 Vector operands are functions from an index expression to the native expression
 of the element at that index. The caller binds storage offsets in them. The rows
 are whitened by the walk (:mod:`.walk_rows`), and the velocity change in factor
-coordinates leaves by the walk (:func:`.tree_factor.walk_leave_kernel`).
+coordinates leaves by the walk (:func:`.factor.walk.walk_leave_kernel`).
 
 A tree's factor is leaf-first: ``L`` of ``P H P^T`` with ``P`` the reversal of an
 articulation's coordinates (factor coordinate ``i`` is physical coordinate
@@ -23,6 +23,7 @@ never extracted from another owner's source. No runtime method is selected here.
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from .factor.walk import WALK_COORDINATE, WALK_LINK, WALK_UNPACKED, walk_paths_prelude, walk_row_prelude
 from .solve_policy import Change, bound, terms_bound
 from .staging import Buffer
 
@@ -694,7 +695,7 @@ def _push_apply(delta: str, column: Callable[[str], str], lanes: Lanes, dofs: in
 @dataclass(frozen=True)
 class WalkedRows:
     """A world's rows in the walk's coordinates, built in the kernel: each row's seeds walked up its trees' root paths
-    (:func:`.tree_factor.walk_paths_prelude`), ``Z_i`` at the row's world coordinates.
+    (:func:`.factor.walk.walk_paths_prelude`), ``Z_i`` at the row's world coordinates.
 
     A world holds the ``primary`` tree of ``primary`` coordinates from world coordinate ``primary_offset`` and at most
     one ``secondary`` tree from ``secondary_offset``: its articulations ``art_a`` and ``art_b`` (``ink_meta``, ``-1``
@@ -704,7 +705,7 @@ class WalkedRows:
     kernel calls ``TIER_WALK(side, body, k, seed)``: the wrench ``seed[0:6]`` at local ``body`` of the world's tree
     ``side`` (``k < 0``), or the covector ``seed[0] e_k`` at its local coordinate ``k`` (``body`` its body), walked into
     the row and its ``J`` entries against ``v_hat`` into ``incident``; with ``walked`` each slipping tree's release ``R``
-    (``walk.release``, :class:`.tree_factor.WalkRelease`) then takes the decided factor's row, as the rows the one
+    (``walk.release``, :class:`.factor.walk.WalkRelease`) then takes the decided factor's row, as the rows the one
     writer stored hold it already. ``frame`` is each tree's slip capacity, 0 where none of the class's trees of that
     size can slip: its release compiles out. ``A = Z^T Z``, so ``Z`` serves as both ``J^T`` and ``Y``; the lane keeps
     ``Z_i`` in its registers (``Jr``). The velocity change of the applied impulses, ``u = Z^T delta``, leaves by the
@@ -728,9 +729,8 @@ class WalkedRows:
         return ["const int art_a = ink_meta.data[world * 4];", "const int art_b = ink_meta.data[world * 4 + 2];"]
 
     def _walk(self) -> str:
-        """``TIER_WALK``: one seed of row ``i`` on the world's tree ``side`` (``WALK_ROW``, :func:`.tree_factor.walk_row_prelude`), its
+        """``TIER_WALK``: one seed of row ``i`` on the world's tree ``side`` (``WALK_ROW``, :func:`.factor.walk.walk_row_prelude`), its
         footprints added at the tree's world coordinates and its ``J`` entries against ``s_v`` into ``incident``."""
-        from .tree_factor import WALK_COORDINATE, WALK_LINK  # noqa: PLC0415
 
         return f"""const auto TIER_WALK = [&](const int side, const int body, const int k, const float* seed) {{
     const int art = side == 0 ? art_a : art_b, offset = side == 0 ? {self.primary_offset} : {self.secondary_offset};
@@ -794,7 +794,7 @@ class WalkedRows:
 
     def publish(self, z: Callable[[str], str], applied: Callable[[str], str], indent: str) -> str:
         """``u = sum_i Z_i applied_i`` (``z(i)``: ``Z_i`` at coordinate ``d``), in row order, in the walk's coordinates
-        to the step's one leave (:attr:`.tree_factor.WalkTrees.du`, :func:`.tree_factor.walk_leave_kernel`), which
+        to the step's one leave (:attr:`.factor.walk.WalkTrees.du`, :func:`.factor.walk.walk_leave_kernel`), which
         walks each tree down: ``v = v_in + P^T L^-T R^T u``."""
         lane, width, D = self.lanes.lane, self.lanes.width, self.dofs
         lines = [
@@ -1225,7 +1225,7 @@ class LocalBlock(ResidualBlock):
     :meth:`walk_floats`, :meth:`walk_ints`; with ``wrenches`` the step's columns and links too, for wrench seeds);
     without, it is read in place. With ``release`` the class's drives can slip: a walked row takes the release ``R`` of
     its tree's slips along their paths (``WALK_RELEASE``, the one writer's rows carry it already; the step's one leave
-    takes ``R^T``, :func:`.tree_factor.walk_leave_kernel`).
+    takes ``R^T``, :func:`.factor.walk.walk_leave_kernel`).
     With ``free``, the world's free-body rows (``free_count``, :class:`FreeBodyZ` entries read in place, their
     ``mf_meta`` words from ``off_meta``) follow the dense rows in the block: they act on the paired free body, whose
     coordinates are the last block's, so a free row's terms are its ``Z`` against the body's ``u`` and the dense rows'
@@ -1238,7 +1238,7 @@ class LocalBlock(ResidualBlock):
     start at the rows' right-hand sides, their incident velocities included.
     The velocity change is committed once after the sweeps, ``u = sum_r Z_r
     applied_r`` over every row of the block in row order (:meth:`commit`), and goes to
-    the step's one leave in the walk's coordinates (:attr:`.tree_factor.WalkTrees.du`). A view of the free-body rows
+    the step's one leave in the walk's coordinates (:attr:`.factor.walk.WalkTrees.du`). A view of the free-body rows
     addresses them from block row ``first``.
     """
 
@@ -1277,7 +1277,7 @@ class LocalBlock(ResidualBlock):
     @property
     def coordinate_floats(self) -> int:
         """Staged floats a coordinate: ``s``, ``ut``, ``1 / ell`` (its record unpacked, :data:`.tree_scan.WALK_STAGED`),
-        then with ``wrenches`` the step's column the finish published, unpacked (six floats, :data:`.tree_factor.WALK_NOW`)."""
+        then with ``wrenches`` the step's column the finish published, unpacked (six floats, :data:`.factor.walk.WALK_NOW`)."""
         from .tree_scan import WALK_STAGED  # noqa: PLC0415 (tree_factor imports this module)
 
         return WALK_STAGED + (6 if self.wrenches else 0)
@@ -1299,10 +1299,9 @@ class LocalBlock(ResidualBlock):
         return 2 * self.bodies + 2 + self.primary if self.staged else 0
 
     def walk_preludes(self) -> tuple:
-        """The walk's functions over this block's layout (:func:`.tree_factor.walk_paths_prelude`: the staged copy's
+        """The walk's functions over this block's layout (:func:`.factor.walk.walk_paths_prelude`: the staged copy's
         strides, or the device walk's), and with ``seeds`` the seed walk its rows' walks bind
-        (:func:`.tree_factor.walk_row_prelude`)."""
-        from .tree_factor import walk_paths_prelude, walk_row_prelude  # noqa: PLC0415 (tree_factor imports this module)
+        (:func:`.factor.walk.walk_row_prelude`)."""
 
         walk = walk_paths_prelude(1)
         if self.staged:
@@ -1312,13 +1311,12 @@ class LocalBlock(ResidualBlock):
         return (walk, walk_row_prelude(1)) if self.seeds else (walk,)
 
     def prologue(self) -> str:
-        """Bind the world's trees on the walk (``walk``, :class:`.tree_factor.WalkTrees`; articulation ``art``, and
+        """Bind the world's trees on the walk (``walk``, :class:`.factor.walk.WalkTrees`; articulation ``art``, and
         ``secondary_art`` with a free body): their data, links and path tables, staged here once (``staged``, the
         primary tree of at most ``bodies`` bodies) or in place; ``walk_primary()`` and ``walk_free()`` select a tree for
         the walk's functions; and with ``seeds`` the row seeds' walks a lane runs into ``s_Z`` (``walk_covector`` and,
         with ``wrenches``, ``walk_wrench``: each returns its incident velocity, the step's ``J`` entries against the
         staged velocity)."""
-        from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_UNPACKED  # noqa: PLC0415 (tree_factor imports this module)
         from .tree_scan import WALK_BOTH, WALK_STAGED  # noqa: PLC0415
 
         P, S, L = self.primary, self.secondary, self.lanes.width

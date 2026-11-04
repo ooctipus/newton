@@ -343,7 +343,8 @@ def launch_blocks(families):
             block = classify if name.endswith(".get_classify_kernel") else identity._value(kwargs["layout"]).block
             blocks[identity.label(name, args, kwargs)] = block
     if "walk" in families:
-        from newton._src.solvers.feather_pgs import tree_factor, tree_kinetic_owner  # noqa: PLC0415
+        from newton._src.solvers.feather_pgs import tree_kinetic_owner  # noqa: PLC0415
+        from newton._src.solvers.feather_pgs.factor import walk as factor_walk  # noqa: PLC0415
 
         # The predictor's halves launch at their layout's block, the walk's solve at the owner's, the refresh at the
         # factor's (its lane groups fit in it).
@@ -354,7 +355,7 @@ def launch_blocks(families):
             elif name.endswith(".get_walk_solve_kernel"):
                 blocks[key] = tree_kinetic_owner.WALK_SOLVE_THREADS
             elif name.endswith(".walk_step_kernel"):
-                blocks[key] = tree_factor.WALK_BLOCK
+                blocks[key] = factor_walk.WALK_BLOCK
     if "pins" in families:
         blocks.update(scalar_branch_blocks())
     return blocks

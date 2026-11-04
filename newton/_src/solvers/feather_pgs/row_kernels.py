@@ -14,11 +14,11 @@ import warp as wp
 from ...sim import BodyFlags
 from . import field_group
 from .contact_laws import jacobian_entry, spin_entry
-from .dense_rows import UNIT_LINK, DenseRows, RowSupport, clear_side, jacobian_row, row_sides, unit_source
 from .device_preludes import reserve
 from .field_group import Field, FieldGroup
 from .joint_table import FreeBodies, JointTable
 from .row_laws import LINK_ROWS, contact_restitution_rhs, joint_limit_side, limit_rhs, row_rhs, velocity_limit_active
+from .row_records import UNIT_LINK, DenseRows, RowSupport, clear_side, jacobian_row, row_sides, unit_source
 
 LINK_PLAN = FieldGroup(
     Field("_link_primary", wp.int32, ("link",), owner="laws"),

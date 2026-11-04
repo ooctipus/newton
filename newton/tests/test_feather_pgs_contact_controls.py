@@ -13,9 +13,9 @@ import newton
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.contact_forces import compute_contact_linear_force_from_impulses
 from newton._src.solvers.feather_pgs.contact_input import ContactInput, ContactRoutes
-from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.row_kernels import compute_world_contact_bias
+from newton._src.solvers.feather_pgs.row_records import DenseRows
 from newton._src.solvers.feather_pgs.row_slots import allocate_world_contact_slots
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import row_bias, row_lines

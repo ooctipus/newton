@@ -3,11 +3,11 @@
 
 """The walk on the device (FL3.1): the tree factor's walk as the native functions FL3's one writer will call.
 
-:func:`.tree_factor.walk_prelude` declares the walk for both devices: the class's path table in constant memory, a lane
+:func:`.factor.walk.walk_prelude` declares the walk for both devices: the class's path table in constant memory, a lane
 per seed walking its rows up (``WALK_UP``, ``WALK_SEED``) into the caller's sink, with the step's ``J`` entry each
-footprint whitens; :func:`.tree_factor.walk_down_prelude` emits a class's walk down (the leave, ``WALK_DOWN``), a
+footprint whitens; :func:`.factor.walk.walk_down_prelude` emits a class's walk down (the leave, ``WALK_DOWN``), a
 lane per tree, straight-line up to ``WALK_UNROLL`` coordinates and the loop form past it. These tests run them on
-the CPU and, where there is one, on a CUDA device, against the float64 walk (:class:`.tree_factor.TreeWalk`, which
+the CPU and, where there is one, on a CUDA device, against the float64 walk (:class:`.factor.walk.TreeWalk`, which
 :mod:`.test_feather_pgs_walk` holds to the factor), and hold every placement to one frame:
 
 - **F1, the device walk**, on every catalogue model: rows of every unit (1 to 4 rows a lane) from wrench and covector
@@ -37,12 +37,10 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import tree_factor, tree_scan
+from newton._src.solvers.feather_pgs import tree_scan
 from newton._src.solvers.feather_pgs.device_preludes import DevicePrelude, substitute
-from newton._src.solvers.feather_pgs.kernel_template import THREADS, KernelTemplate, params
-from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
-from newton._src.solvers.feather_pgs.sweep import PGS_LOCAL_SOLVE_OWNER_GENERAL
-from newton._src.solvers.feather_pgs.tree_factor import (
+from newton._src.solvers.feather_pgs.factor import walk as factor_walk
+from newton._src.solvers.feather_pgs.factor.walk import (
     WALK_COORDINATE,
     WALK_FRAME,
     WALK_LINK,
@@ -51,6 +49,9 @@ from newton._src.solvers.feather_pgs.tree_factor import (
     local_frames,
     unpack_walk_records,
 )
+from newton._src.solvers.feather_pgs.kernel_template import THREADS, KernelTemplate, params
+from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
+from newton._src.solvers.feather_pgs.sweep import PGS_LOCAL_SOLVE_OWNER_GENERAL
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conformance
@@ -157,7 +158,7 @@ _TREE_PARAMS = params(
 def walk_kernels(table: tuple, rows: int) -> tuple:
     """The rows kernel (a thread per seed) and the tree kernel (a thread per tree, the class's emitted walk down) of
     one path table."""
-    prelude = tree_factor.walk_prelude(*table, rows)
+    prelude = factor_walk.walk_prelude(*table, rows)
     tag = hashlib.sha256(repr(table).encode()).hexdigest()[:12]
     sizes = {"coordinate": WALK_COORDINATE, "link": WALK_LINK, "now": WALK_NOW}
     up = KernelTemplate(
@@ -168,7 +169,7 @@ def walk_kernels(table: tuple, rows: int) -> tuple:
         _TREE_PARAMS,
         substitute(_TREE, coordinate=WALK_COORDINATE, link=WALK_LINK),
         THREADS,
-        (tree_factor.walk_down_prelude((tree_scan.WalkClass(*table),)),),
+        (factor_walk.walk_down_prelude((tree_scan.WalkClass(*table),)),),
         dual=True,
     )
     return up.kernel(), tree.kernel()
@@ -643,7 +644,7 @@ def both_ways_kernel(table: tuple):
 
     # The loop form's tables take the one access's WALK_CONSTANT.
     prelude = DevicePrelude(f"walk_both_{walk.tag}", text, cpu=text)
-    preludes = (tree_factor.walk_loads_prelude(), prelude)
+    preludes = (factor_walk.walk_loads_prelude(), prelude)
     return KernelTemplate(f"walk_both_{walk.tag}", _BOTH_PARAMS, _BOTH, THREADS, preludes, dual=True).kernel()
 
 

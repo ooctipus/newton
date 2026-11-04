@@ -23,7 +23,6 @@ from .contact_laws import (
     prescribed_spin_target,
     prescribed_target,
 )
-from .dense_rows import row_sides
 from .friction_patches import PatchRowLaw, patch_tangent_row
 from .row_laws import (
     ROW_CONTACT,
@@ -36,6 +35,7 @@ from .row_laws import (
     contact_rhs,
     row_rhs,
 )
+from .row_records import row_sides
 
 
 @wp.func

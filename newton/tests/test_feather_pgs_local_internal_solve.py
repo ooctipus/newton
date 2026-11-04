@@ -7,13 +7,13 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import field_group, row_packets
-from newton._src.solvers.feather_pgs.dense_rows import MfRows
 from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_MIMIC,
 )
+from newton._src.solvers.feather_pgs.row_records import MfRows
 from newton._src.solvers.feather_pgs.sweep import (
     PGS_LOCAL_SOLVE_OWNER_GENERAL,
     PGS_LOCAL_SOLVE_OWNER_PAIR,

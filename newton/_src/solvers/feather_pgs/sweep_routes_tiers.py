@@ -24,6 +24,7 @@ import warp as wp
 from ...core.execution import arch_budget, resident_blocks
 from . import kernel_template
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
+from .factor.walk import walk_paths_prelude, walk_row_prelude
 from .kernel_template import KernelTemplate, SweepTier
 from .law_source import law_preludes
 from .projection_laws import CONE_LAW, PROJECTION_LAW
@@ -44,7 +45,6 @@ from .sweep import (
     material_arguments,
 )
 from .sweep_routes import MF_GS_ABI
-from .tree_factor import walk_paths_prelude, walk_row_prelude
 from .tree_scan import WALK_BOTH
 
 PARALLEL_ABI = kernel_template.params(

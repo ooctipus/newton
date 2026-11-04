@@ -8,9 +8,9 @@ import warp as wp
 
 from .contact_input import ContactRoutes
 from .contact_laws import CONTACT_SPIN_ROW, contact_tangent_basis
-from .dense_rows import DenseRows, MfRows
 from .projection_laws import ball, disk
 from .row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
+from .row_records import DenseRows, MfRows
 
 
 @wp.kernel
@@ -86,7 +86,7 @@ def reset_world_warmstart_buffers(
 # velocity term is ``Z^T u`` (``J dv``), its update ``u += Z dlambda``, and the walk down leaves ``dv``. Walk
 # coordinate ``i`` of ``Z`` and ``u`` sits at position ``5 - i``, the physical coordinate it reverses
 # (:func:`.response_operator.leaf_first`). The walk whitens the rows and leaves them (:mod:`.walk_rows`,
-# :func:`.tree_factor.walk_leave_kernel`).
+# :func:`.factor.walk.walk_leave_kernel`).
 
 
 @wp.func

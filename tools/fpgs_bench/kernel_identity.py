@@ -347,7 +347,7 @@ def held_tree_calls():
     ``scalar_branches``, which the pins family records.
     """
     from newton._src.solvers.feather_pgs import tree_kinetic_state as native  # noqa: PLC0415
-    from newton._src.solvers.feather_pgs.tree_factor import RELEASE_SLIPS  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.factor.walk import RELEASE_SLIPS  # noqa: PLC0415
 
     state = _unwrapped(native.get_state_kernel)
     predictor = _unwrapped(native.get_predictor_kernel)
@@ -448,24 +448,24 @@ def walk_calls():
         sweep_routes,
         sweep_routes_local,
         sweep_routes_tiers,
-        tree_factor,
         walk_rows,
     )
     from newton._src.solvers.feather_pgs import tree_kinetic_state as native  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.factor import walk as factor_walk  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout  # noqa: PLC0415
 
     classes = walk_classes_of_the_suite()
     named = {name: Named(f"({name},)", (cls,)) for name, cls in classes.items()}
-    leave = _unwrapped(tree_factor.walk_leave_kernel)
+    leave = _unwrapped(factor_walk.walk_leave_kernel)
     for name in classes:
         for release in (False, True):
-            yield "tree_factor.walk_leave_kernel", leave, (named[name], release), {}
+            yield "factor.walk.walk_leave_kernel", leave, (named[name], release), {}
     pair = Named("(allegro, cube)", (classes["allegro"], classes["cube"]))
-    yield "tree_factor.walk_leave_kernel", leave, (pair, True), {}
+    yield "factor.walk.walk_leave_kernel", leave, (pair, True), {}
     nodes = Named("g1 nodes", (tuple(range(classes["g1"].coordinates - 1, -1, -1)),))
-    yield "tree_factor.walk_leave_kernel", leave, (named["g1"], True, nodes), {}
-    yield "tree_factor.walk_enter_kernel", _unwrapped(tree_factor.walk_enter_kernel), (), {}
-    yield "tree_factor.walk_step_kernel", lambda: tree_factor.walk_step_kernel, (), {}
+    yield "factor.walk.walk_leave_kernel", leave, (named["g1"], True, nodes), {}
+    yield "factor.walk.walk_enter_kernel", _unwrapped(factor_walk.walk_enter_kernel), (), {}
+    yield "factor.walk.walk_step_kernel", lambda: factor_walk.walk_step_kernel, (), {}
 
     def layout(name, root):
         cls = classes[name]
@@ -487,7 +487,7 @@ def walk_calls():
         kwargs = {"layout": tree, "response": "sparse", "classes": named[name]}
         yield "tree_kinetic_state.get_force_kernel", force, (schedules,), kwargs
         twists = native.publishes_twists(tree.value, schedules.value, cuda=True)
-        kwargs = {**kwargs, "twists": twists, "slips": tree_factor.RELEASE_SLIPS}
+        kwargs = {**kwargs, "twists": twists, "slips": factor_walk.RELEASE_SLIPS}
         yield "tree_kinetic_state.get_predictor_kernel", predictor, (schedules,), kwargs
         if name == "g1":
             yield "tree_kinetic_state.get_predictor_kernel", predictor, (schedules,), {**kwargs, "side": False}

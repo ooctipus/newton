@@ -17,7 +17,8 @@ import warp as wp
 
 from newton._src.core import execution
 from newton._src.core.execution import CPU, Device, Queue, Use, Work, carveout, shape
-from newton._src.solvers.feather_pgs import tree_factor, tree_kinetic_state, walk_rows
+from newton._src.solvers.feather_pgs import tree_kinetic_state, walk_rows
+from newton._src.solvers.feather_pgs.factor import walk as factor_walk
 
 PRO = Device.of(120, 188, 101_376)
 GB300 = Device.of(103, 152, 232_448)
@@ -63,7 +64,7 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
             for trees in (1024, 4096, 16384, 65536):
                 for bodies, joins in ((30, 2), (13, 1), (106, 1), (2, 1), (8, 4)):
                     with self.subTest(arch=device.arch, trees=trees, bodies=bodies, joins=joins):
-                        old = tree_factor.walk_group(bodies, joins, trees, device.sms)
+                        old = factor_walk.walk_group(bodies, joins, trees, device.sms)
                         least = 1 << max(joins - 1, 0).bit_length()
                         work = Work(trees, Use.FEED, width=bodies, least=least, registers=128)
                         self.assertEqual(shape(work, device).lanes, old)

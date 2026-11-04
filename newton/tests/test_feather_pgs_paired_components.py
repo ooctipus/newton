@@ -13,7 +13,7 @@ import numpy as np
 import warp as wp
 from warp._src.context import pack_arg
 
-from newton._src.solvers.feather_pgs import response_builds_rows, sweep_routes, sweep_routes_local
+from newton._src.solvers.feather_pgs import paired_components, sweep_routes, sweep_routes_local
 from newton.tests.feather_pgs_paired_fixture import (
     bind_components,
     component_fixture,
@@ -160,7 +160,7 @@ class TestPairedComponents(unittest.TestCase):
     def test_sizes_come_from_the_pair(self):
         """Any articulation of at most 32 coordinates with one free body; nothing else."""
         for primary in (7, 9, 17, 23, 32):
-            kernel = response_builds_rows.paired_components_kernel(primary)
+            kernel = paired_components.paired_components_kernel(primary)
             native = inspect.getclosurevars(kernel.func)
             source = (
                 native.nonlocals.get("paired_components_native") or native.globals["paired_components_native"]
@@ -168,7 +168,7 @@ class TestPairedComponents(unittest.TestCase):
             self.assertIn(f"r * {primary + 6} + d", source)
         for primary, secondary in ((0, 6), (33, 6), (23, 3), (23, 7)):
             with self.subTest(primary=primary, secondary=secondary), self.assertRaises(ValueError):
-                response_builds_rows.paired_components_kernel(primary, secondary)
+                paired_components.paired_components_kernel(primary, secondary)
 
     def test_split_sources_keep_the_complete_sweep(self):
         """The component variants add only the selector gate around each unchanged sweep."""

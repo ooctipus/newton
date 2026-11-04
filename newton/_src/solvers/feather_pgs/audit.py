@@ -22,7 +22,7 @@ solved, not that they are right.
 
 Each row store fills the rows' ``J_i v+ + eps_i lambda_i`` (:func:`packed_rows`, :func:`sparse_rows`,
 :func:`diagonal_rows`, :func:`free_rows`), and one kernel applies the law to the stores (:func:`audit_world`). Packed
-rows are read as ``Z_i^T u+`` with ``u+`` the walk's coordinates of ``v+`` (:func:`.tree_factor.walk_enter_kernel`) and
+rows are read as ``Z_i^T u+`` with ``u+`` the walk's coordinates of ``v+`` (:func:`.factor.walk.walk_enter_kernel`) and
 the sparse diagonal's likewise, so a defect in leaving factor coordinates shows too, and corrected rows and targets agree
 on a closure. Native sparse rows hold no dense factor and
 read their own ``J_i v_hat + Z_i^T du``. A world whose rows exist only inside its sweep (keyed rows, row packets) has
@@ -33,9 +33,7 @@ from __future__ import annotations
 
 import warp as wp
 
-from .dense_rows import DenseRows, MfRows, RowSupport
-from .dense_rows import bind as bind_dense_rows
-from .dense_rows import bind_mf as bind_mf_rows
+from .factor.walk import WalkTrees, walk_enter_kernel
 from .field_group import Field, FieldGroup, SolverArrays
 from .friction_patches import patch_normal_load
 from .packed_rows import WIDE
@@ -47,9 +45,11 @@ from .row_laws import (
     ROW_SPEED,
     ROW_TORSION,
 )
+from .row_records import DenseRows, MfRows, RowSupport
+from .row_records import bind as bind_dense_rows
+from .row_records import bind_mf as bind_mf_rows
 from .sparse_mass_matrix import _SparseRowSupport
 from .sweep import PGS_LOCAL_SOLVE_OWNER_GENERAL
-from .tree_factor import WalkTrees, walk_enter_kernel
 
 __all__ = ["AUDIT_FIELDS", "AUDIT_SLOTS", "Audit"]
 
@@ -484,7 +484,7 @@ class Audit:
 
     def _walk_coordinates(self, velocity: wp.array, coordinates: wp.array) -> None:
         """The walked trees' coordinates of ``velocity`` in the walk's frame, at their world coordinates
-        (:func:`.tree_factor.walk_enter_kernel`)."""
+        (:func:`.factor.walk.walk_enter_kernel`)."""
         solver = self.solver
         factor, forest = solver.factor, solver.forest
         wp.launch(

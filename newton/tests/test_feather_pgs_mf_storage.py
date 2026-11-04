@@ -16,6 +16,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import execution_plan, sweep_routes
 from newton._src.solvers.feather_pgs import solver_feather_pgs as fpgs
+from newton._src.solvers.feather_pgs.factor.walk import WalkTrees
 from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_COUNT,
@@ -24,7 +25,6 @@ from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
 from newton._src.solvers.feather_pgs.row_metadata import _DENSE_META_MAX_PARENT
-from newton._src.solvers.feather_pgs.tree_factor import WalkTrees
 from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.feather_pgs_paired_fixture import pack_endpoints, solve_fixture
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
@@ -658,7 +658,7 @@ _STORE = {
 
 def _store(host):
     """The host's rows in one row store: each world's line holds the dense rows, then the free bodies' (the host's
-    ``mf_impulses``, ``mf_row_mu``, ``mf_row_w``) from the dense capacity (:mod:`.dense_rows`)."""
+    ``mf_impulses``, ``mf_row_mu``, ``mf_row_w``) from the dense capacity (:mod:`.row_records`)."""
     stored = dict(host)
     body = host["mf_impulses"].shape[1]
     for name, free in _STORE.items():
@@ -698,7 +698,7 @@ def _bind_rows(host, device):
 
 def _first_art(host, device):
     """Every world's two articulations (packed_rows' sides), its articulated block and then its free body, found from
-    their first global coordinates (:attr:`.tree_factor.WalkTrees.first_art`)."""
+    their first global coordinates (:attr:`.factor.walk.WalkTrees.first_art`)."""
     indices = host["world_dof_indices"]
     worlds, dofs = indices.shape
     first_art = np.full(indices.size, -1, np.int32)

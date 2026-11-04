@@ -257,7 +257,7 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
 
 
 def _unit_first_art(worlds, dofs, device):
-    """The walk's tree lookup (:attr:`.tree_factor.WalkTrees.first_art`) the sweeps read for each world's free body at
+    """The walk's tree lookup (:attr:`.factor.walk.WalkTrees.first_art`) the sweeps read for each world's free body at
     its first coordinate (body ``w`` at global coordinate ``w * dofs``, six coordinates, at world coordinate 0)."""
     first_art = np.full(worlds * dofs, -1, np.int32)
     first_art[np.arange(worlds) * dofs] = np.arange(worlds)
