@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The device idioms of FeatherPGS: lane groups, patch rings and the slot reservation contract.
+"""The device idioms of FeatherPGS: lane groups and their further words, patch rings and the slot reservation contract.
 
 The lane group's reductions replace shuffle-down ladders whose lane 0 the
 sweeps read; a butterfly from the widest offset down gives every lane that
@@ -15,7 +15,11 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs.device_preludes import (
+    HELD,
+    LANE_WORDS,
+    MEMORY_WORDS,
     RING,
+    SHARED_STORAGE,
     cuda_native,
     dual_native,
     lane_group,
@@ -266,6 +270,129 @@ class TestLaneGroupsOnCuda(unittest.TestCase):
                     group_slots = taken[g * lanes : (g + 1) * lanes][v]
                     if len(group_slots):
                         np.testing.assert_array_equal(group_slots, group_slots[0] + np.arange(len(group_slots)))
+
+
+# The further words on one thread a probe: lane words, held arrays and memory words, on a warp or block group.
+_WORDS_SOURCE = """    SHARED float scratch_value[32];
+    SHARED int scratch_index[32];
+    const float x = LDG(values.data + tid);
+    const int key = keys.data[tid];
+    float total = x, top = x, best = x;
+    int at = tid;
+    BLOCK_SUM(scratch_value, total);
+    BLOCK_MAXIMUM(scratch_value, top);
+    BLOCK_ARGMAX(scratch_value, scratch_index, best, at);
+    // Seven items held over the group's lanes: item i is 2 i, its row (10 i, 10 i + 1).
+    constexpr int words = (7 + WIDTH - 1) / WIDTH;
+    float held[words];
+    float rows[words][2];
+    HELD_LOAD(held, 7, [&](int k, int item, bool valid) {
+        held[k] = valid ? 2.0f * item : 0.0f;
+        rows[k][0] = valid ? 10.0f * item : 0.0f;
+        rows[k][1] = valid ? 10.0f * item + 1.0f : 0.0f;
+    });
+    float row[2];
+    HELD_ROW(rows, 5, row);
+    float* const out = floats.data + 8 * tid;
+    ST(out + 0, total);
+    ST(out + 1, top);
+    ST(out + 2, best);
+    ST(out + 3, HELD_PICK(held, 6));
+    ST(out + 4, row[0]);
+    ST(out + 5, row[1]);
+    ST(out + 6, READ_DOWN(x, 1));
+    int* const words_out = ints.data + 4 * tid;
+    words_out[0] = at;
+    words_out[1] = WARP_LANE;
+    words_out[2] = (int)MATCH(key);
+    words_out[3] = ADD(counter.data[0], 1);
+"""
+
+
+@cache
+def _words_kernel(lanes):
+    preludes = (lane_group(lanes), LANE_WORDS, HELD, MEMORY_WORDS, SHARED_STORAGE)
+
+    @wp.func_native(dual_native(_WORDS_SOURCE, preludes=preludes))
+    def words(
+        tid: int,
+        values: wp.array[float],
+        keys: wp.array[int],
+        floats: wp.array[float],
+        ints: wp.array[int],
+        counter: wp.array[int],
+    ): ...
+
+    def kernel(
+        values: wp.array[float],
+        keys: wp.array[int],
+        floats: wp.array[float],
+        ints: wp.array[int],
+        counter: wp.array[int],
+    ):
+        words(wp.tid(), values, keys, floats, ints, counter)
+
+    kernel.__name__ = kernel.__qualname__ = f"lane_words_probe_{lanes}"
+    return wp.kernel(enable_backward=False, module="unique")(kernel)
+
+
+def _run_words(lanes, device, count=256):
+    rng = np.random.default_rng(11)
+    values = rng.normal(size=count).astype(np.float32)
+    keys = (np.arange(count) % 3).astype(np.int32)
+    floats = wp.zeros(count * 8, dtype=wp.float32, device=device)
+    ints = wp.zeros(count * 4, dtype=wp.int32, device=device)
+    counter = wp.zeros(1, dtype=wp.int32, device=device)
+    wp.launch(
+        _words_kernel(lanes),
+        dim=count,
+        inputs=[wp.array(values, device=device), wp.array(keys, device=device)],
+        outputs=[floats, ints, counter],
+        block_dim=max(lanes, 64),
+        device=device,
+    )
+    return values, keys, floats.numpy().reshape(count, 8), ints.numpy().reshape(count, 4), int(counter.numpy()[0])
+
+
+class TestLaneWords(unittest.TestCase):
+    def test_words_on_the_cpu_are_the_one_thread_s(self):
+        """On the CPU one thread is the group: reductions and reads are its own value, held arrays all its own."""
+        values, _, floats, ints, total = _run_words(8, "cpu")
+        np.testing.assert_array_equal(floats[:, 0], values)
+        np.testing.assert_array_equal(floats[:, 1], values)
+        np.testing.assert_array_equal(floats[:, 2], values)
+        np.testing.assert_array_equal(floats[:, 3:6], np.tile([12.0, 50.0, 51.0], (len(values), 1)))
+        np.testing.assert_array_equal(floats[:, 6], values)
+        np.testing.assert_array_equal(ints[:, 0], np.arange(len(values)))
+        np.testing.assert_array_equal(ints[:, 1:3], np.tile([0, 1], (len(values), 1)))
+        self.assertEqual(sorted(ints[:, 3]), list(range(len(values))))
+        self.assertEqual(total, len(values))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "lane words exchange values on CUDA warps")
+    def test_words_on_cuda(self):
+        """Warp groups of 8 and 32 lanes and block groups of 64 and 128 against host references."""
+        for lanes in (8, 32, 64, 128):
+            with self.subTest(lanes=lanes):
+                values, keys, floats, ints, total = _run_words(lanes, wp.get_cuda_device())
+                groups = values.reshape(-1, lanes)
+                width = min(lanes, 32)
+                np.testing.assert_allclose(floats[:, 0], np.repeat(groups.sum(axis=1), lanes), rtol=1e-5, atol=1e-5)
+                np.testing.assert_array_equal(floats[:, 1], np.repeat(groups.max(axis=1), lanes))
+                np.testing.assert_array_equal(floats[:, 2], np.repeat(groups.max(axis=1), lanes))
+                base = (np.arange(len(values)) // lanes) * lanes
+                np.testing.assert_array_equal(ints[:, 0], base + np.repeat(groups.argmax(axis=1), lanes))
+                np.testing.assert_array_equal(floats[:, 3:6], np.tile([12.0, 50.0, 51.0], (len(values), 1)))
+                lane = np.arange(len(values)) % width
+                down = np.where(lane + 1 < width, np.roll(values, -1), values)
+                np.testing.assert_array_equal(floats[:, 6], down)
+                np.testing.assert_array_equal(ints[:, 1], np.arange(len(values)) % 32)
+                segment = (np.arange(len(values)) // width) * width
+                expected = [
+                    sum(1 << j for j in range(width) if keys[segment[i] + j] == keys[i]) for i in range(len(values))
+                ]
+                np.testing.assert_array_equal(ints[:, 2].astype(np.uint32), np.array(expected, dtype=np.uint32))
+                self.assertEqual(sorted(ints[:, 3]), list(range(len(values))))
+                self.assertEqual(total, len(values))
 
 
 if __name__ == "__main__":

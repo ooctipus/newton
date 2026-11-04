@@ -45,6 +45,14 @@ from the same text:
     ``SUM`` reduces several channels in one ladder. On the CPU one thread runs
     the group: one lane, and every operation is that lane's own value.
 
+    Its further words are preludes of their own, declared by the bodies that
+    call them: ``LANE_WORDS`` (``WARP_LANE``, ``MATCH``, ``READ_DOWN`` and the
+    block group's ``BLOCK_SUM``, ``BLOCK_MAXIMUM``, ``BLOCK_ARGMAX``), ``HELD``
+    (a distributed array over the lanes: ``HELD_PICK``, ``HELD_ROW``,
+    ``HELD_LOAD``), ``LANE_FEED`` (``FEED``, a held batch feeding one chain)
+    and ``MEMORY_WORDS`` (``LDG``, ``ST``, ``ADD``). Warp functions over the
+    words take their snippet from :func:`lane_word`.
+
 ``ORDERED_TILES``
     Ordered reservation across a launch's blocks (:mod:`newton._src.core.ordered_reserve`):
     ``ORDERED_TILE(tile)`` (one block per tile) and ``ORDERED_NEXT(site, block, live_tiles, blocks)`` (a grid
@@ -337,8 +345,8 @@ _LANE_FEED = """    // FEED(first, last, step, ahead, build, chain): a lane grou
     // order, lane k calls build(index, valid) for the batch's k-th record (valid false past the tree: return zeros);
     // build loads and forms what the chain needs of that record and returns it as a struct whose one member is
     // float w[N] (ints as their bits). Every lane then calls chain(index, record) for each record of the batch in
-    // order, the record read from its lane by N shuffles, so every lane runs the same chain and its state stays in
-    // registers. On the CPU one thread is the group: batches of one record.
+    // order, the record read from its lane (a batch is a held array of one record a lane, HELD_ROW), so every lane
+    // runs the same chain and its state stays in registers. On the CPU one thread is the group: batches of one record.
     const auto FEED = [&](int first, int last, int step, auto ahead, auto build, auto chain) {
         const int total = last - first + 1;
         const int start = step < 0 ? last : first;
@@ -346,20 +354,139 @@ _LANE_FEED = """    // FEED(first, last, step, ahead, build, chain): a lane grou
         for (int done = 0; done < total; done += LANES) {
             const int base = start + step * done;
             const auto mine = build(base + step * LANE, LANE < total - done);
-            constexpr int words = sizeof(mine.w) / sizeof(float);
+            using Words = decltype(mine.w);
             const int count = total - done < LANES ? total - done : LANES;
             for (int i = 0; i < count; ++i) {
                 auto record = mine;
-                for (int k = 0; k < words; ++k) record.w[k] = READ(mine.w[k], i);
+                HELD_ROW(reinterpret_cast<const Words (&)[1]>(mine.w), i, record.w);
                 chain(base + step * i, record);
             }
         }
     };"""
 
-LANE_FEED = DevicePrelude("lane_feed", _LANE_FEED, _LANE_FEED)
+_HELD = """    // HELD: a distributed array over the group's lanes, item x on lane x % WIDTH in word x / WIDTH of the lane's
+    // array (ceil(n / WIDTH) words for n items; on the CPU the one lane holds every item). x is the same on every lane:
+    // HELD_PICK(v, x) returns item x of the held array v, HELD_ROW(v, x, out) writes item x's row of a held array of
+    // rows (v[word][m]) into out, and HELD_LOAD(v, n, load) calls load(word, x, x < n) for each word of the lane's
+    // array v and its item x, so the load fills each word (zeros past the n items).
+    const auto HELD_PICK = [&](const auto& v, const int x) {
+        constexpr int words = sizeof(v) / sizeof(v[0]);
+        auto t = v[0];
+        #pragma unroll
+        for (int k = 1; k < words; ++k)
+            if (x >= k * WIDTH) t = v[k];
+        return READ(t, x);
+    };
+    const auto HELD_ROW = [&](const auto& v, const int x, auto* out) {
+        constexpr int words = sizeof(v) / sizeof(v[0]), row = sizeof(v[0]) / sizeof(v[0][0]);
+        #pragma unroll
+        for (int m = 0; m < row; ++m) {
+            auto t = v[0][m];
+            #pragma unroll
+            for (int k = 1; k < words; ++k)
+                if (x >= k * WIDTH) t = v[k][m];
+            out[m] = READ(t, x);
+        }
+    };
+    const auto HELD_LOAD = [&](const auto& v, const int n, auto load) {
+        constexpr int words = sizeof(v) / sizeof(v[0]);
+        const int lane = LANE & (WIDTH - 1);
+        #pragma unroll
+        for (int k = 0; k < words; ++k) load(k, lane + k * WIDTH, lane + k * WIDTH < n);
+    };"""
+
+HELD = DevicePrelude("held", _HELD, _HELD)
+"""``HELD_PICK(v, x)``, ``HELD_ROW(v, x, out)`` and ``HELD_LOAD(v, n, load)``: a distributed array over a lane group,
+item ``x`` on lane ``x % WIDTH`` in the lane's word ``x / WIDTH``, read on every lane by shuffle from the lane that
+holds it; on the CPU the one lane holds every item. After a lane-group prelude; :data:`LANE_FEED` carries it."""
+
+LANE_FEED = DevicePrelude("lane_feed", _HELD + "\n" + _LANE_FEED, _HELD + "\n" + _LANE_FEED)
 """``FEED(first, last, step, ahead, build, chain)``, a lane group feeding one serial chain (the walk's refresh leaves
 to root, its walk down root to leaves): its records' loads leave the chain, each lane builds one record of a batch, and
-every lane runs the chain on the batch's records in order, read by shuffle. After a lane-group prelude."""
+every lane runs the chain on the batch's records in order, read from the batch held over the lanes. It carries
+:data:`HELD` (a body declares one of them). After a lane-group prelude."""
+
+
+_LANE_WORDS = """    // WARP_LANE: this thread's lane in its warp. MATCH(key): the bits of the group's lanes holding the same key,
+    // lane 0 first. READ_DOWN(value, delta): the value of the lane delta above (its own past the group's top).
+    // BLOCK_SUM(scratch, value), BLOCK_MAXIMUM(scratch, value), BLOCK_ARGMAX(scratch, indices, value, index): the
+    // group's reduction on every lane, for a block group through the block's per-warp scratch (WARPS entries, the
+    // body's Staging) and two barriers.
+    const int WARP_LANE = (int)(threadIdx.x & 31);
+    const auto MATCH = [&](auto key) -> unsigned {
+        return __match_any_sync(MASK, key) >> (threadIdx.x & (31 & ~(WIDTH - 1)));
+    };
+    const auto READ_DOWN = [&](auto value, int delta) { return __shfl_down_sync(MASK, value, delta, WIDTH); };
+    const auto BLOCK_SUM = [&](auto* scratch, auto& value) {
+        SUM(value);
+        if (LANES > 32) {
+            if (WARP_LANE == 0) scratch[WARP] = value;
+            __syncthreads();
+            value = 0;
+            if (WARP_LANE < WARPS) value = scratch[WARP_LANE];
+            SUM(value);
+            __syncthreads();
+        }
+    };
+    const auto BLOCK_MAXIMUM = [&](auto* scratch, auto& value) {
+        MAXIMUM(value);
+        if (LANES > 32) {
+            if (WARP_LANE == 0) scratch[WARP] = value;
+            __syncthreads();
+            value = scratch[WARP_LANE < WARPS ? WARP_LANE : 0];
+            MAXIMUM(value);
+            __syncthreads();
+        }
+    };
+    const auto BLOCK_ARGMAX = [&](auto* scratch, int* indices, auto& value, int& index) {
+        ARGMAX(value, index);
+        if (LANES > 32) {
+            if (WARP_LANE == 0) {
+                scratch[WARP] = value;
+                indices[WARP] = index;
+            }
+            __syncthreads();
+            const int from = WARP_LANE < WARPS ? WARP_LANE : 0;
+            value = scratch[from];
+            index = indices[from];
+            ARGMAX(value, index);
+            __syncthreads();
+        }
+    };"""
+
+_LANE_WORDS_CPU = """    const int WARP_LANE = 0;
+    const auto MATCH = [](auto key) -> unsigned { return 1u; };
+    const auto READ_DOWN = [](auto value, int delta) { return value; };
+    const auto BLOCK_SUM = [](auto* scratch, auto& value) {};
+    const auto BLOCK_MAXIMUM = [](auto* scratch, auto& value) {};
+    const auto BLOCK_ARGMAX = [](auto* scratch, int* indices, auto& value, int& index) {};"""
+
+LANE_WORDS = DevicePrelude("lane_words", _LANE_WORDS, _LANE_WORDS_CPU)
+"""The lane group's further words: ``WARP_LANE``, ``MATCH(key)``, ``READ_DOWN(value, delta)`` and the block group's
+reductions ``BLOCK_SUM``, ``BLOCK_MAXIMUM`` and ``BLOCK_ARGMAX`` (each warp's, then every warp's through a scratch of
+``WARPS`` entries the body declares). On the CPU the one thread holds the group's every value. Their own prelude, not
+the lane group's, as :data:`STATUS_CLOCK`'s. After a lane-group prelude."""
+
+
+MEMORY_WORDS = DevicePrelude(
+    "memory_words",
+    """    const auto LDG = [](const auto* p) { return __ldg(p); };
+    const auto ST = [](auto* p, const auto v) {
+        __builtin_assume(__isGlobal(p));
+        *p = v;
+    };
+    const auto ADD = [](auto& word, auto n) { return atomicAdd(&word, n); };""",
+    """    const auto LDG = [](const auto* p) { return *p; };
+    const auto ST = [](auto* p, const auto v) { *p = v; };
+    const auto ADD = [](auto& word, auto n) {
+        const auto old = word;
+        word += n;
+        return old;
+    };""",
+)
+"""``LDG(p)``, a read-only load through the non-coherent path, ``ST(p, v)``, a store to global memory (no generic
+store), and ``ADD(word, n)``, an add to a word that any thread may write at once (CUDA's ``atomicAdd``; the CPU's one
+thread adds), returning the word before. The CPU's are plain loads, stores and adds."""
 
 
 STATUS_CLOCK = DevicePrelude(
@@ -489,7 +616,19 @@ def reserved_count(
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-@wp.func_native(dual_native("    MINIMUM(value);\n    return value;\n", preludes=(lane_group("lanes"),)))
+def lane_word(body: str, lanes: int | str = 32, preludes: tuple[DevicePrelude, ...] = ()) -> str:
+    """The ``func_native`` snippet of a Warp function over a lane group's words: ``body`` after the group of ``lanes``
+    lanes (:func:`lane_group`) and ``preludes``, on both devices (:func:`dual_native`).
+
+    Args:
+        body: The function's native statements.
+        lanes: The group's lanes: a count, or the name of the function's argument that holds it.
+        preludes: Further preludes the body reads, after the lane group.
+    """
+    return dual_native(body, preludes=(lane_group(lanes), *preludes))
+
+
+@wp.func_native(lane_word("    MINIMUM(value);\n    return value;\n", "lanes"))
 def lane_minimum(value: float, lanes: int) -> float:
     """Return the least ``value`` of this thread's group of ``lanes`` lanes (``value`` on the CPU).
 
@@ -497,7 +636,7 @@ def lane_minimum(value: float, lanes: int) -> float:
     """
 
 
-@wp.func_native(dual_native("    SUM(value);\n    return value;\n", preludes=(lane_group(32),)))
+@wp.func_native(lane_word("    SUM(value);\n    return value;\n"))
 def warp_sum(value: int) -> int:
     """Return the sum of ``value`` over this thread's warp (``value`` on the CPU, where a thread is alone).
 
@@ -505,7 +644,7 @@ def warp_sum(value: int) -> int:
     """
 
 
-@wp.func_native(dual_native("    return SCAN(value);\n", preludes=(lane_group(32),)))
+@wp.func_native(lane_word("    return SCAN(value);\n"))
 def warp_scan(value: int) -> int:
     """Return the sum of ``value`` over the lower lanes of this thread's warp (0 on the CPU).
 
@@ -513,26 +652,22 @@ def warp_scan(value: int) -> int:
     """
 
 
-@wp.func_native(dual_native("    SYNC();\n", preludes=(lane_group(32),)))
+@wp.func_native(lane_word("    SYNC();\n"))
 def warp_sync():
     """Synchronize this thread's warp (nothing on the CPU)."""
 
 
-@wp.func_native(dual_native("    return LANE;\n", preludes=(lane_group(32),)))
+@wp.func_native(lane_word("    return LANE;\n"))
 def warp_lane() -> int:
     """Return this thread's lane in its warp (0 on the CPU)."""
 
 
-@wp.func_native(dual_native("    return STRIDE;\n", preludes=(lane_group(32),)))
+@wp.func_native(lane_word("    return STRIDE;\n"))
 def warp_stride() -> int:
     """Return the stride of a warp-strided loop: 32, or 1 on the CPU, where one thread runs the warp's lanes."""
 
 
-@wp.func_native(
-    dual_native(
-        "    return wp::vec3(READ(value[0], 0), READ(value[1], 0), READ(value[2], 0));\n", preludes=(lane_group(32),)
-    )
-)
+@wp.func_native(lane_word("    return wp::vec3(READ(value[0], 0), READ(value[1], 0), READ(value[2], 0));\n"))
 def warp_broadcast(value: wp.vec3) -> wp.vec3:
     """Return lane 0's ``value`` on every lane of this thread's warp (``value`` on the CPU).
 
