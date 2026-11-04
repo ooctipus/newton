@@ -770,9 +770,6 @@ def _dynamics(solver) -> dict:
         "diagonal_mass_dofs": sorted(int(size) for size in solver.forest.diagonal_mass_sizes),
         # The rows' graph's vertices: how many coordinate trees hold each number of coordinates.
         "tree_sizes": {str(size): int(n) for size, n in enumerate(np.bincount(solver.forest.tree_size)) if n},
-        # Response layout: whether J/Y are gathered per world or already world-indexed.
-        "jy_world_aliased": bool(solver.placement.jy_world_aliased),
-        "hinv_jt_writes_world": bool(solver.placement.hinv_jt_writes_world),
         # The matrix-free sweeps' dense rows packed by support (packed_rows), and whether they serve the step alone.
         "packed_rows": {
             "support": int(solver.placement.packed_support) if solver.placement.mf_sweeps else None,

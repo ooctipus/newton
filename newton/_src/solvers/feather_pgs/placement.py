@@ -616,8 +616,6 @@ class Placement:
             return
         if paired_coordinates and not self.packed_dense:
             raise RuntimeError("The paired factor-coordinate sweep reads packed rows at their world coordinates")
-        self.hinv_jt_writes_world = False
-        self.jy_world_aliased = False
 
     def inkernel_response_meta(self) -> tuple[tuple[int, int, int, int] | None, str]:
         """Return the in-kernel response's group sizes and offsets ``(NA, NB, OA, OB)``, or ``None``, and why.

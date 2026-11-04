@@ -85,12 +85,23 @@ _CONTACT_JACOBIAN_MAX_DOF = 10
 # every mostly local world. Eight blocks per SM preserves general-only latency.
 _LOCAL_GENERAL_BLOCKS_PER_SM = 8
 _LOCAL_PAIR_BLOCKS_PER_SM = 8
-# The local solver performs a serial O(dof_count**2) triangular solve per row.
+# The local solver performs a serial O(dof_count**2) triangular solve per row: a local primary is a tree of at most
+# _LOCAL_TREE_MAX_DOF coordinates on CUDA, or a star (one coordinate a tree, ForestPlan.diagonal_mass_sizes) of at most
+# _LOCAL_INTERNAL_MAX_DOF. The 12 is the threshold above which the retired tiled H^-1 J^T kernel took a size on CUDA
+# (execution_plan, _SMALL_DOF_THRESHOLD_DEFAULT before 0.4): its footprint at 16 coordinates and one row,
+# 16 * 16 * 4 + 3 * 16 * 4 + 64 * 4 = 1,472 B, fits every CUDA device, so the size alone decided.
 _LOCAL_INTERNAL_MAX_DOF = 16
+_LOCAL_TREE_MAX_DOF = 12
 _LOCAL_SOLVE_MAX_ROWS = 20
 _LOCAL_RESIDUAL_MAX_ROWS = 40
 _LOCAL_RESIDUAL_MF_MAX_ROWS = 12
-_PERSISTENT_HINV_JT_MIN_DOF = 17
+# The paired response pairs a tree of _PAIRED_MIN_DOF to (32 - 6) coordinates, no star, with one free body, in a class
+# of more than _PAIRED_MIN_ROWS rows a world. The rows bound is the retired tiled H^-1 J^T plan's (execution_plan
+# before 0.4): it admitted a size whose 32-row chunk was below dense_max_constraints. Its footprint at 26 coordinates
+# and 32 rows, 26 * 26 * 4 + 3 * 26 * 32 * 4 + 64 * 4 = 12,944 B, fits every CUDA device (at least 48 KiB a block), so
+# the chunk was min(32, dense_max_constraints) and the test was dense_max_constraints > 32.
+_PAIRED_MIN_DOF = 17
+_PAIRED_MIN_ROWS = 32
 _MFGSStorage = _execution_plan._MFGSStorage
 
 
@@ -154,13 +165,12 @@ class Sweep:
         placement: The placement.
         factor: The tree factor.
         routes: The route table the owners claim the class from.
-        execution_plan: The size groups' resource choices.
         pins: The test-only route pins.
         timed: The solver's synchronized timing scope.
         nvtx: Whether the step's scopes mark NVTX ranges.
     """
 
-    def __init__(self, model, options, forest, laws, placement, factor, routes, execution_plan, pins, *, timed, nvtx):
+    def __init__(self, model, options, forest, laws, placement, factor, routes, pins, *, timed, nvtx):
         self.model = model
         self.options = options
         self.forest = forest
@@ -168,7 +178,6 @@ class Sweep:
         self.placement = placement
         self.factor = factor
         self.routes = routes
-        self.execution_plan = execution_plan
         self.pins = pins
         self.timed = timed
         self.nvtx = nvtx
@@ -181,10 +190,10 @@ class Sweep:
             for size in self.forest.size_groups
             if model.device.is_cuda
             and not self.factor.eliminates
-            and size >= _PERSISTENT_HINV_JT_MIN_DOF
+            and size >= _PAIRED_MIN_DOF
             and size + 6 <= 32
-            and self.execution_plan.use_tiled_hinv_jt(size)
-            and self.execution_plan.hinv_jt_chunk_size(size) < self.placement.dense_max_constraints
+            and size not in self.forest.diagonal_mass_sizes
+            and self.placement.dense_max_constraints > _PAIRED_MIN_ROWS
         )
 
     def admit_diagonal(self, held_decline: Callable) -> None:
@@ -414,7 +423,11 @@ class Sweep:
                 if (
                     primary_dofs <= 0
                     or primary_dofs > _LOCAL_INTERNAL_MAX_DOF
-                    or self.execution_plan.use_tiled_hinv_jt(primary_dofs)
+                    or (
+                        model.device.is_cuda
+                        and primary_dofs > _LOCAL_TREE_MAX_DOF
+                        and primary_dofs not in self.forest.diagonal_mass_sizes
+                    )
                     or not local_fits(
                         primary_dofs, max_rows=min(self.local_solve_max_rows, primary_dofs), bodies=bodies
                     )
@@ -428,11 +441,7 @@ class Sweep:
                     continue
                 secondary_art = free_arts[0]
                 secondary_dofs = int(self.forest.response_dof_count[secondary_art])
-                if (
-                    secondary_dofs != 6
-                    or self.execution_plan.use_tiled_hinv_jt(secondary_dofs)
-                    or not local_fits(primary_dofs, secondary_dofs, bodies=bodies)
-                ):
+                if secondary_dofs != 6 or not local_fits(primary_dofs, secondary_dofs, bodies=bodies):
                     continue
                 local_pair_articulation[world] = secondary_art
                 local_pair_candidates[primary_dofs].append(primary_art)
@@ -871,7 +880,9 @@ class Sweep:
         self.paired_response_reason = self.routes.taken("K5")
         response_pair = None if self.paired_response_reason else self._select_paired_response()
         if response_pair is None and self.paired_response_reason is None:
-            self.paired_response_reason = "No world pairs one tiled-response articulation with exactly one free body."
+            self.paired_response_reason = (
+                f"No world pairs one tree of {_PAIRED_MIN_DOF} to 26 coordinates with exactly one free body."
+            )
         self.paired_response_primary_size = response_pair[0] if response_pair is not None else None
         self.paired_response_secondary_size = response_pair[1] if response_pair is not None else None
         self.routes.reasons["K5"] = ("No paired response." if response_pair is None else None) or capable(
@@ -1120,12 +1131,11 @@ class Sweep:
     def _select_paired_response(self) -> tuple[int, int, np.ndarray] | None:
         """Select one complete robot/free-body response pair per world."""
         if (
-            not self.placement.hinv_jt_writes_world
-            or self.placement.hinv_jt_tiled_writes_group
+            self.routes.case in ("K1", "K2")
+            or self.factor.eliminates
+            or self.options.pgs_warmstart
             or 6 not in self.forest.size_groups
         ):
-            return None
-        if self.execution_plan.use_tiled_hinv_jt(6):
             return None
 
         response_dofs = self.forest.response_dof_count

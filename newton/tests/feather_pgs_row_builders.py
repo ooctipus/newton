@@ -40,6 +40,8 @@ _GENERATED_PREFIXES = (
     "mark_independent_sparse_contact_candidates",
     "write_walked_rows_",
 )
+
+
 def is_row_builder(key) -> bool:
     """Whether a launched kernel key is a contact-row builder."""
     return key is not None and (key in ROW_BUILDER_KERNELS or key.startswith(_GENERATED_PREFIXES))

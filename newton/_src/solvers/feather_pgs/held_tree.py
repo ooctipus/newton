@@ -419,7 +419,9 @@ def forest_families(solver):
         if size == solver._compact_diagonal_mass_size:
             if solver.factor.diagonal_inverse_mass is None:
                 return None
-        elif not 1 <= size <= 32 or solver._execution_plan.use_diagonal_mass(size):
+        elif not 1 <= size <= 32 or (solver.model.device.is_cuda and size in solver.forest.diagonal_mass_sizes):
+            # A star's group other than the compact diagonal's: on CUDA the retired dense response plan kept it out of
+            # the held family (its diagonal generalized inertia); the CPU's held family takes it.
             return None
         group = solver.forest.group_to_art[size].numpy()
         if len(group) != worlds or not np.array_equal(art_world[group], np.arange(worlds)):

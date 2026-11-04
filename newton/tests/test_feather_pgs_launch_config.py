@@ -15,9 +15,6 @@ from newton._src.solvers.feather_pgs.contact_row_plan import contact_row_plan
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _DENSE_META_MAX_PARENT,
     _DENSE_META_ROW_TYPE_MASK,
-    _estimate_hinv_jt_shared_memory,
-    _FeatherPGSExecutionPlan,
-    _select_hinv_jt_chunk_size,
     _validate_dense_metadata_encoding,
 )
 from newton.solvers import SolverFeatherPGS
@@ -224,102 +221,16 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 self.assertEqual(plan.producer, "walk")
                 self.assertEqual(plan.methods, {12: "walk"})
 
-    def test_defaults_preserved(self):
-        model = newton.ModelBuilder().finalize()
-        solver = SolverFeatherPGS(model)
-        self.assertEqual(solver.tile_threads, 64)
-
-    def test_hinv_chunk_selection_accounts_for_tile_threads(self):
-        """Include tile scratch space when selecting response chunks."""
-        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 30000, 64), 32)
-        self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 30000, 256), 16)
-
-    def test_hinv_chunk_selection_caps_response_tiles(self):
-        """Cap response chunks at 32 rows across articulation sizes."""
-        self.assertEqual(_select_hinv_jt_chunk_size(20, 384, 101376, 64), 32)
-        self.assertEqual(_select_hinv_jt_chunk_size(21, 384, 101376, 64), 32)
-
     def test_dense_metadata_encoding_bounds(self):
         _validate_dense_metadata_encoding(32)
         self.assertGreaterEqual(_DENSE_META_ROW_TYPE_MASK + 1, 5)
         with self.assertRaisesRegex(ValueError, "packed parent capacity"):
             _validate_dense_metadata_encoding(_DENSE_META_MAX_PARENT + 2)
 
-    def test_hinv_execution_plan_falls_back_or_rejects_safely(self):
-        fallback = _FeatherPGSExecutionPlan.build(
-            [160],
-            max_constraints=384,
-            max_shared_memory=101376,
-            hinv_jt_kernel="auto",
-            small_dof_threshold=12,
-            tile_threads=64,
-        )
-        self.assertFalse(fallback.use_tiled_hinv_jt(160))
-        self.assertIn("shared memory", fallback.selection_reasons(160)["hinv_jt_kernel"])
-
-        zero_capacity = _FeatherPGSExecutionPlan.build(
-            [23],
-            max_constraints=0,
-            max_shared_memory=101376,
-            hinv_jt_kernel="tiled",
-            small_dof_threshold=12,
-            tile_threads=64,
-        )
-        self.assertFalse(zero_capacity.use_tiled_hinv_jt(23))
-        self.assertIn("zero row capacity", zero_capacity.selection_reasons(23)["hinv_jt_kernel"])
-
-        with self.assertRaisesRegex(ValueError, "hinv_jt_kernel='tiled'"):
-            _FeatherPGSExecutionPlan.build(
-                [160],
-                max_constraints=384,
-                max_shared_memory=101376,
-                hinv_jt_kernel="tiled",
-                small_dof_threshold=12,
-                tile_threads=64,
-            )
-
-    def test_hinv_estimate_counts_three_response_tiles(self):
-        """Count the factor, three response tiles and the Warp scratch of the tiled response."""
-        self.assertEqual(_estimate_hinv_jt_shared_memory(27, 32, tile_threads=64), 13552)
-
     def test_fixed_base_sibling_branches_detect_diagonal_mass_topology(self):
         """Detect independent fixed-base branches on every supported device."""
         solver = SolverFeatherPGS(_build_fixed_base_star_model(), enable_joint_limits=False, dense_max_constraints=16)
         self.assertEqual(solver.forest.diagonal_mass_sizes, frozenset((16,)))
-
-    @unittest.skipUnless(wp.is_cuda_available(), "diagonal mass execution-path parity requires CUDA")
-    def test_fixed_base_sibling_branches_use_diagonal_mass_path(self):
-        """Match the dense reference while selecting independent branch solves."""
-        model = _build_fixed_base_star_model()
-        optimized = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
-        self.assertEqual(optimized.forest.diagonal_mass_sizes, frozenset((16,)))
-        self.assertTrue(optimized._execution_plan.use_diagonal_mass(16))
-
-        forced = {"hinv_jt_kernel": "par_row"}
-        with mock.patch.object(SolverFeatherPGS, "_route_pins", forced):
-            reference = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
-        self.assertFalse(reference._execution_plan.use_diagonal_mass(16))
-
-        q = np.tile(np.linspace(-0.04, 0.04, 16, dtype=np.float32), 2)
-        qd = np.tile(np.linspace(0.1, -0.1, 16, dtype=np.float32), 2)
-        trajectories = []
-        for solver in (optimized, reference):
-            state_0, state_1 = model.state(), model.state()
-            state_0.joint_q.assign(q)
-            state_0.joint_qd.assign(qd)
-            newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-            control = model.control()
-            history = []
-            for _ in range(5):
-                state_0.clear_forces()
-                solver.step(state_0, state_1, control, None, 1.0 / 120.0)
-                state_0, state_1 = state_1, state_0
-                history.append((state_0.joint_q.numpy().copy(), state_0.joint_qd.numpy().copy()))
-            trajectories.append(history)
-
-        for diagonal, dense in zip(*trajectories, strict=True):
-            np.testing.assert_allclose(diagonal[0], dense[0], rtol=0.0, atol=2.0e-6)
-            np.testing.assert_allclose(diagonal[1], dense[1], rtol=0.0, atol=2.0e-6)
 
     @unittest.skipUnless(wp.is_cuda_available(), "sparse diagonal response requires CUDA")
     def test_sparse_diagonal_response_matches_dense_joint_limits(self):
@@ -588,7 +499,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "the matrix-free sweeps require CUDA")
     def test_matrix_free_rows_are_packed_alone(self):
         """Serve a chain's rows, with or without a free body beside it, from the packed rows alone: their build forms
-        every diagonal, and no response is written in world layout or aliased to it."""
+        every diagonal."""
         for with_free_body in (False, True):
             with self.subTest(with_free_body=with_free_body):
                 solver = SolverFeatherPGS(
@@ -596,8 +507,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                     dense_max_constraints=192,
                 )
                 self.assertTrue(solver.placement.packed_response)
-                self.assertFalse(solver.placement.jy_world_aliased)
-                self.assertFalse(solver.placement.hinv_jt_writes_world)
 
     def test_mfgs_metadata_storage_respects_resource_budget(self):
         """Keep resident metadata only when its complete working set fits."""

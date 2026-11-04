@@ -22,7 +22,6 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
 )
 from newton._src.solvers.feather_pgs.projection_laws import friction_pair
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _FeatherPGSExecutionPlan
 from newton._src.solvers.feather_pgs.sweep_levels import (
     _get_build_independent_sparse_contact_groups_kernel,
     _get_mark_independent_sparse_contact_candidates_kernel,
@@ -133,11 +132,11 @@ def _class_rows(parents, base):
 
 
 def _run_mixed_response(
-    kernel,
+    route,
     *,
     warmstart,
     preelimination,
-    dof_count=13,
+    dof_count=12,
     dense_max_constraints=32,
     inactive_joint_limit_capacity=False,
     friction=0.0,
@@ -148,7 +147,8 @@ def _run_mixed_response(
     friction_anchor_beta=None,
     model_kwargs=None,
 ):
-    """Run a short mixed-contact trajectory with one H-inverse implementation."""
+    """Run a short mixed-contact trajectory on one route: ``"general"`` pins the general placement (case K6), ``"auto"``
+    lets the owners claim the class. A tree of at most 12 coordinates beside its free body takes the local owners."""
     model = _build_mixed_response_model(
         "cuda:0",
         dof_count=dof_count,
@@ -159,7 +159,8 @@ def _run_mixed_response(
     )
     # The arms compare serial owners: the pin keeps the Jacobi tiers (case K4, a tree beside a free body) off the
     # worlds no other owner claims.
-    with mock.patch.object(SolverFeatherPGS, "_route_pins", {"hinv_jt_kernel": kernel, "tiers": 0}):
+    pins = {"tiers": 0, **({"placement": "general"} if route == "general" else {})}
+    with mock.patch.object(SolverFeatherPGS, "_route_pins", pins):
         solver = SolverFeatherPGS(
             model,
             pgs_warmstart=warmstart,
@@ -1379,7 +1380,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                             np.testing.assert_allclose(results[label][name], reference[name], rtol=1.0e-4, atol=2.0e-5)
 
     def test_mixed_world_diagonal_map_includes_free_rigid_response(self):
-        """Include free rigid articulations in every forced-tiled diagonal group."""
+        """Include free rigid articulations in every world response group."""
         solver = SolverFeatherPGS(_build_mixed_response_model("cpu", world_count=2), dense_max_constraints=32)
         self.assertEqual(set(solver.forest.size_groups), {6, 13})
 
@@ -1403,37 +1404,27 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         )
         np.testing.assert_array_equal(solver.forest.world_response_group_to_art[6].numpy(), free_articulations)
 
-        forced_tiled = _FeatherPGSExecutionPlan.build(
-            solver.forest.size_groups,
-            max_constraints=solver.placement.dense_max_constraints,
-            max_shared_memory=101376,
-            hinv_jt_kernel="tiled",
-            small_dof_threshold=12,
-            tile_threads=64,
-        )
-        self.assertEqual(forced_tiled.hinv_jt_tiled_sizes, frozenset((6, 13)))
-
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free response diagonal parity requires CUDA")
-    def test_forced_tiled_mixed_world_matches_par_row_trajectory(self):
-        """Match diagonal, impulses, and state when every response group is tiled."""
+    def test_general_mixed_world_matches_owned_trajectory(self):
+        """Match diagonal, impulses, and state between the general placement and the owners that claim the class."""
         for warmstart in (False, True):
             for preelimination in (False, True):
                 with self.subTest(warmstart=warmstart, preelimination=preelimination):
                     reference_solver, reference = _run_mixed_response(
-                        "par_row", warmstart=warmstart, preelimination=preelimination
+                        "auto", warmstart=warmstart, preelimination=preelimination
                     )
-                    tiled_solver, tiled = _run_mixed_response(
-                        "tiled", warmstart=warmstart, preelimination=preelimination
+                    general_solver, general = _run_mixed_response(
+                        "general", warmstart=warmstart, preelimination=preelimination
                     )
 
                     self.assertEqual(reference_solver.factor.eliminates, preelimination)
-                    self.assertEqual(tiled_solver.factor.eliminates, preelimination)
-                    self.assertEqual(len(reference), len(tiled))
+                    self.assertEqual(general_solver.factor.eliminates, preelimination)
+                    self.assertEqual(len(reference), len(general))
                     self.assertGreater(reference[0][0], 0, "mixed scene generated no dense constraint rows")
-                    # Without warm start or pre-elimination the par_row arm's world takes the local owners, which
-                    # solve the free body in their held rows, against the tiled arm's packed rows (factor
+                    # Without warm start or pre-elimination the owned arm's world takes the local owners, which
+                    # solve the free body in their held rows, against the general arm's packed rows (factor
                     # coordinates): a slow coordinate differs by up to 4e-6 where the arms' velocities reach 3.
-                    for step, (expected, actual) in enumerate(zip(reference, tiled, strict=True)):
+                    for step, (expected, actual) in enumerate(zip(reference, general, strict=True)):
                         self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
                         for label, expected_value, actual_value in zip(
                             ("diagonal", "impulses", "joint_q", "joint_qd"),
@@ -1467,7 +1458,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         for label, friction_anchor_beta, triples in (("patch", None, False), ("point", 0.0, True)):
             with self.subTest(friction=label):
                 reference_solver, reference = _run_mixed_response(
-                    "par_row", friction_anchor_beta=friction_anchor_beta, **run_kwargs
+                    "general", friction_anchor_beta=friction_anchor_beta, **run_kwargs
                 )
                 paired_solver, paired = _run_mixed_response(
                     "auto", friction_anchor_beta=friction_anchor_beta, **run_kwargs
@@ -1514,7 +1505,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             "tangential_velocity": 2.0,
             "static_plane": True,
         }
-        reference_solver, reference = _run_mixed_response("par_row", **run_kwargs)
+        reference_solver, reference = _run_mixed_response("general", **run_kwargs)
         paired_solver, paired = _run_mixed_response("auto", **run_kwargs)
 
         self.assertIsNone(reference_solver.sweep.paired_response_primary_size)
@@ -1540,7 +1531,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         hold the spin rows."""
         model = _build_mixed_response_model("cuda:0", dof_count=23, friction=0.7)
         solvers = {}
-        with mock.patch.object(SolverFeatherPGS, "_route_pins", {"hinv_jt_kernel": "auto"}):
+        with mock.patch.object(SolverFeatherPGS, "_route_pins", {}):
             for torsion in (False, True):
                 solvers[torsion] = SolverFeatherPGS(
                     model,
@@ -1582,10 +1573,10 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
     def test_local_internal_mixed_world_matches_general_response(self):
         """Match the general response when an articulation contacts a free body."""
         general_solver, general = _run_mixed_response(
-            "tiled", warmstart=False, preelimination=False, inactive_joint_limit_capacity=True
+            "general", warmstart=False, preelimination=False, inactive_joint_limit_capacity=True
         )
         local_solver, local = _run_mixed_response(
-            "par_row", warmstart=False, preelimination=False, inactive_joint_limit_capacity=True
+            "auto", warmstart=False, preelimination=False, inactive_joint_limit_capacity=True
         )
 
         self.assertFalse(general_solver.placement.local_internal_fast_path)
@@ -1629,8 +1620,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             "restitution": 0.3,
             "tangential_velocity": 2.0,
         }
-        general_solver, general = _run_mixed_response("tiled", **run_kwargs)
-        local_solver, local = _run_mixed_response("par_row", **run_kwargs)
+        general_solver, general = _run_mixed_response("general", **run_kwargs)
+        local_solver, local = _run_mixed_response("auto", **run_kwargs)
 
         self.assertFalse(general_solver.placement.local_internal_fast_path)
         self.assertTrue(local_solver.placement.local_internal_fast_path)
@@ -1670,8 +1661,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             "contact_regularization": 1.0,
             "model_kwargs": {"static_support": True},
         }
-        general_solver, general = _run_mixed_response("tiled", **run_kwargs)
-        local_solver, local = _run_mixed_response("par_row", **run_kwargs)
+        general_solver, general = _run_mixed_response("general", **run_kwargs)
+        local_solver, local = _run_mixed_response("auto", **run_kwargs)
 
         self.assertTrue(general_solver.laws.regularization_enabled)
         self.assertFalse(general_solver.placement.local_internal_fast_path)
@@ -1698,8 +1689,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             "tangential_velocity": 2.0,
             "model_kwargs": {"static_support": True},
         }
-        general_solver, general = _run_mixed_response("tiled", **run_kwargs)
-        local_solver, local = _run_mixed_response("par_row", **run_kwargs)
+        general_solver, general = _run_mixed_response("general", **run_kwargs)
+        local_solver, local = _run_mixed_response("auto", **run_kwargs)
 
         self.assertTrue(general_solver.laws.friction_anchors_enabled)
         self.assertTrue(local_solver.laws.friction_anchors_enabled)
@@ -1747,8 +1738,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             "inactive_joint_limit_capacity": True,
             "model_kwargs": {"free_body_velocity_limit": 5.0},
         }
-        general_solver, general = _run_mixed_response("tiled", **run_kwargs)
-        local_solver, local = _run_mixed_response("par_row", **run_kwargs)
+        general_solver, general = _run_mixed_response("general", **run_kwargs)
+        local_solver, local = _run_mixed_response("auto", **run_kwargs)
 
         self.assertFalse(general_solver.placement.local_internal_fast_path)
         self.assertTrue(local_solver.placement.local_internal_fast_path)
@@ -1774,8 +1765,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             "tangential_velocity": 2.0,
             "model_kwargs": {"static_support": True, "free_body_first": True},
         }
-        general_solver, general = _run_mixed_response("tiled", **run_kwargs)
-        local_solver, local = _run_mixed_response("par_row", **run_kwargs)
+        general_solver, general = _run_mixed_response("general", **run_kwargs)
+        local_solver, local = _run_mixed_response("auto", **run_kwargs)
 
         free_articulation = int(np.flatnonzero(local_solver.forest.is_free_rigid_host)[0])
         self.assertEqual(int(local_solver.forest.articulation_dof_start_host[free_articulation]), 0)
@@ -1792,9 +1783,9 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "articulation-local mixed-world parity requires CUDA")
     def test_local_owners_take_contact_torsion(self):
         """Keep the local owners for a model with contact torsion: their sweeps solve its spin rows."""
-        model = _build_mixed_response_model("cuda:0", friction=0.7)
+        model = _build_mixed_response_model("cuda:0", dof_count=12, friction=0.7)
         solvers = {}
-        with mock.patch.object(SolverFeatherPGS, "_route_pins", {"hinv_jt_kernel": "par_row"}):
+        with mock.patch.object(SolverFeatherPGS, "_route_pins", {}):
             for torsion in (False, True):
                 solvers[torsion] = SolverFeatherPGS(
                     model,

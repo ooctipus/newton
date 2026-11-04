@@ -1505,22 +1505,6 @@ def snapshot_dense_phase_bound(
     dense_phase_bounds[world, bound_index] = world_slot_counter[world]
 
 
-# --- Tile configuration for contact system build ---
-# Kernel naming: {op}_{parallelism}
-# parallelism: tiled | loop | par_row | par_row_col | par_dof
-
-# Max generalized dofs per articulation we support in the tiled path.
-# joint_dof_count per articulation must be <= TILE_DOF or we use fall back
-TILE_DOF = wp.constant(49)
-
-# Max constraints per articulation we support in the tiled path.
-# dense_max_constraints must be <= TILE_CONSTRAINTS or we use fall back
-TILE_CONSTRAINTS = wp.constant(128)
-
-# Threads per tile/block for tile kernels
-TILE_THREADS = 64
-
-
 # =============================================================================
 # World-Level PGS and Velocity Kernels for Multi-Articulation
 # =============================================================================

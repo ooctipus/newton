@@ -44,6 +44,7 @@ from .device_preludes import (
     warp_stride,
     warp_sync,
 )
+from .execution_plan import retired_tiled_response_fits
 from .field_group import Field, FieldGroup, SolverArrays
 from .friction_patches import PatchRowLaw, patch_row_law
 from .kernel_template import KernelTemplate, substitute
@@ -58,6 +59,10 @@ from .tree_factor import WalkTrees
 from .walk_rows import body_wrench
 
 WARPS_PER_BLOCK = 4
+# The local packets serve a class (case K3, CUDA only: the local owners' staging fits no CPU budget) whose sizes are no
+# star and hold at most this many coordinates, or more than a retired tiled H^-1 J^T kernel's footprint fits
+# (:func:`.execution_plan.retired_tiled_response_fits`): the threshold above which that kernel's plan took a size.
+_PACKET_TREE_MAX_DOF = 12
 PREFIX_WIDTH = 2  # a limit row has one coefficient, a mimic row two
 
 
@@ -602,10 +607,11 @@ def decline(solver) -> str | None:
     owners' admission carries CUDA, the matrix-free plain sweep and no velocity limits. It produces the rows of the
     local owners' class (case K3); the rest is its fit.
     """
+    max_shared = int(getattr(solver.model.device, "max_shared_memory_per_block", 0))
     return first_failed(
         (
             (solver.routes.case == "K3", "Local packets produce the rows of the local owners' class (case K3)."),
-            (solver.placement.hinv_jt_writes_world, "Local packets need the response written in world layout."),
+            (not solver.factor.eliminates, "Local packets close no bilateral block (enable_bilateral_preelimination)."),
             (
                 solver.placement.packed_dense,
                 "Local packets write their general worlds' rows at their coordinates: the packed rows are not dense.",
@@ -616,11 +622,12 @@ def decline(solver) -> str | None:
             ),
             (
                 all(
-                    not solver._execution_plan.use_tiled_hinv_jt(size)
-                    and not solver._execution_plan.use_diagonal_mass(size)
+                    size not in solver.forest.diagonal_mass_sizes
+                    and (size <= _PACKET_TREE_MAX_DOF or not retired_tiled_response_fits(size, max_shared))
                     for size in solver.forest.size_groups
                 ),
-                "A size takes the tiled or diagonal response, which local packets do not write.",
+                f"A size is a star or a tree of more than {_PACKET_TREE_MAX_DOF} coordinates, which local packets do "
+                "not write.",
             ),
         )
     )

@@ -8,7 +8,6 @@ They do not change the numerical method, row capacity, or iteration budget.
 """
 
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import NamedTuple
 
 from .staging import Staging
@@ -107,144 +106,14 @@ def _select_mfgs_storage(
     return _MFGSStorage(shared_metadata, stream_mf_impulses, resident_row_metadata, reason)
 
 
-_HINV_JT_MAX_CHUNK_SIZE = 32
-
-
 def _align_shared_memory(size: int) -> int:
     """Align a shared-memory allocation to Warp's 16-byte tile boundary."""
     return (size + 15) // 16 * 16
 
 
-def _estimate_hinv_jt_shared_memory(n_dofs: int, constraint_count: int, *, tile_threads: int) -> int:
-    """Estimate the complete tiled H-inverse shared-memory footprint [B]: the factor and three row tiles."""
-    footprint = _align_shared_memory(4 * n_dofs * n_dofs)
-    footprint += 3 * _align_shared_memory(4 * n_dofs * constraint_count)
-    return footprint + 4 * tile_threads
-
-
-def _select_hinv_jt_chunk_size(
-    n_dofs: int, max_constraints: int, max_shared_memory: int, tile_threads: int
-) -> int | None:
-    """Select a validated H-inverse chunk from articulation and device resources.
-
-    Keep response tiles at 32 rows or fewer. Larger tiles waste triangular-solve
-    work on the partially occupied tail common to per-world constraint systems;
-    inactive follow-on chunks return before loading the factor.
-    """
-    if n_dofs <= 0 or max_constraints <= 0:
-        return None
-    candidates = (_HINV_JT_MAX_CHUNK_SIZE, 16, 8, 4, 2, 1)
-    tried: set[int] = set()
-    for candidate in candidates:
-        chunk_size = min(candidate, max_constraints)
-        if chunk_size in tried:
-            continue
-        tried.add(chunk_size)
-        if _estimate_hinv_jt_shared_memory(n_dofs, chunk_size, tile_threads=tile_threads) <= max_shared_memory:
-            return chunk_size
-    return None
-
-
-@dataclass(frozen=True)
-class _FeatherPGSExecutionPlan:
-    """Immutable device-resource choices for one solver shape."""
-
-    diagonal_mass_sizes: frozenset[int]
-    hinv_jt_tiled_sizes: frozenset[int]
-    hinv_jt_chunk_sizes: tuple[tuple[int, int], ...]
-    reasons: tuple[tuple[int, str, str], ...] = ()
-
-    @classmethod
-    def build(
-        cls,
-        size_groups: list[int],
-        *,
-        max_constraints: int,
-        max_shared_memory: int,
-        hinv_jt_kernel: str,
-        small_dof_threshold: int,
-        tile_threads: int,
-        diagonal_mass_sizes: frozenset[int] = frozenset(),
-    ) -> "_FeatherPGSExecutionPlan":
-        """Resolve H-inverse implementations from solver shape and device limits."""
-        planned_diagonal_sizes = (
-            frozenset(size for size in size_groups if size in diagonal_mass_sizes)
-            if hinv_jt_kernel == "auto"
-            else frozenset()
-        )
-        tiled_sizes: set[int] = set()
-        chunk_sizes: list[tuple[int, int]] = []
-        reasons: list[tuple[int, str, str]] = []
-        for size in size_groups:
-            if size in planned_diagonal_sizes:
-                reasons.append(
-                    (size, "hinv_jt_kernel", "Independent-coordinate topology uses diagonal generalized inertia.")
-                )
-                continue
-
-            if max_constraints <= 0:
-                reasons.append((size, "hinv_jt_kernel", "No tiled response with zero row capacity."))
-                continue
-            requested = hinv_jt_kernel == "tiled" or (hinv_jt_kernel == "auto" and size > small_dof_threshold)
-            if not requested:
-                reasons.append(
-                    (
-                        size,
-                        "hinv_jt_kernel",
-                        "Parallel-row response explicitly selected."
-                        if hinv_jt_kernel == "par_row"
-                        else f"Parallel-row response: {size} DOFs do not exceed threshold {small_dof_threshold}.",
-                    )
-                )
-                continue
-            chunk_size = _select_hinv_jt_chunk_size(size, max_constraints, max_shared_memory, tile_threads)
-            if chunk_size is None:
-                if hinv_jt_kernel == "tiled":
-                    required = _estimate_hinv_jt_shared_memory(size, 1, tile_threads=tile_threads)
-                    raise ValueError(
-                        f"hinv_jt_kernel='tiled' requires at least {required} "
-                        f"bytes of shared memory for DOF size {size}, but the device exposes "
-                        f"{max_shared_memory} bytes; use hinv_jt_kernel='auto' or 'par_row'."
-                    )
-                required = _estimate_hinv_jt_shared_memory(size, 1, tile_threads=tile_threads)
-                reasons.append(
-                    (
-                        size,
-                        "hinv_jt_kernel",
-                        f"Parallel-row fallback: one tiled row needs {required} bytes of shared memory; "
-                        f"device limit is {max_shared_memory}.",
-                    )
-                )
-                continue
-
-            tiled_sizes.add(size)
-            chunk_sizes.append((size, chunk_size))
-            reasons.append(
-                (size, "hinv_jt_kernel", f"Tiled response uses {chunk_size}-row chunks within shared-memory limits.")
-            )
-
-        return cls(
-            planned_diagonal_sizes,
-            frozenset(tiled_sizes),
-            tuple(chunk_sizes),
-            tuple(reasons),
-        )
-
-    def selection_reasons(self, size: int) -> dict[str, str]:
-        """Return detached construction-time reasons for one articulation size."""
-        return {name: reason for planned_size, name, reason in self.reasons if planned_size == size}
-
-    def use_diagonal_mass(self, size: int) -> bool:
-        """Return whether an articulation group has diagonal generalized inertia."""
-        return size in self.diagonal_mass_sizes
-
-    def hinv_jt_chunk_size(self, size: int) -> int | None:
-        """Return the tiled H-inverse chunk size for a response group."""
-        for planned_size, chunk_size in self.hinv_jt_chunk_sizes:
-            if planned_size == size:
-                return chunk_size
-        return None
-
-    def use_tiled_hinv_jt(self, size: int) -> bool:
-        """Return whether a response group uses tiled H-inverse application."""
-        return size in self.hinv_jt_tiled_sizes
+def retired_tiled_response_fits(n_dofs: int, max_shared_memory: int) -> bool:
+    """Whether the retired tiled H^-1 J^T kernel's one-row footprint fits ``max_shared_memory`` [B]: the factor, three
+    row tiles and 64 threads' tile storage. Only the local packets' admission reads it (:func:`.row_packets.decline`):
+    on CUDA it declines a class with a size above 12 coordinates whose footprint fits, as that kernel's plan did."""
+    footprint = _align_shared_memory(4 * n_dofs * n_dofs) + 3 * _align_shared_memory(4 * n_dofs) + 4 * 64
+    return footprint <= max_shared_memory

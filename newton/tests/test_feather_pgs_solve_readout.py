@@ -377,8 +377,8 @@ def _diagonal_route():
     }
 
 
-def _mixed_route(hinv_jt_kernel, dofs, labels, *, owners, solving):
-    """An arm struck by a sliding free box: local owners under ``par_row``, the paired factor sweep for 23 DOFs.
+def _mixed_route(dofs, labels, *, owners, solving):
+    """An arm struck by a sliding free box: local owners for 12 DOFs, the paired factor sweep for 23 DOFs.
 
     Its one world always holds the arm's mimic row, so one owner solves it at every solve.
     """
@@ -399,7 +399,6 @@ def _mixed_route(hinv_jt_kernel, dofs, labels, *, owners, solving):
             "dense_max_constraints": 96,
             "mf_max_constraints": 32,
         },
-        "overrides": {"hinv_jt_kernel": hinv_jt_kernel},
         "labels": labels,
         "owners": owners,
         "solving": solving,
@@ -512,10 +511,9 @@ _LOCAL = {"local_internal", "local_pair", "local_residual"}
 
 
 def _local_route():
-    """The mixed arm under ``par_row``: local owners claim the world, the paired owner while the box touches it."""
+    """The mixed arm of 12 DOFs: local owners claim the world, the paired owner while the box touches it."""
     return _mixed_route(
-        "par_row",
-        13,
+        12,
         {*_LOCAL, "mf_gs"},
         owners=({*_LOCAL, "mf_gs"},),
         solving={"local_pair"},
@@ -524,7 +522,7 @@ def _local_route():
 
 def _paired_route():
     """The mixed arm with 23 DOFs: the paired factor sweep owns the world, which has no matrix-free rows."""
-    return _mixed_route("auto", 23, {"paired_factor"}, owners=({"paired_factor", "mf_gs"},), solving={"paired_factor"})
+    return _mixed_route(23, {"paired_factor"}, owners=({"paired_factor", "mf_gs"},), solving={"paired_factor"})
 
 
 def _policy_routes():

@@ -39,11 +39,10 @@ from ..semi_implicit.kernels_particle import (
 )
 from ..solver import SolverBase
 from . import environment_flags as _environment_flags
-from . import execution_plan as _execution_plan
 from . import row_metadata as _row_metadata
 from .audit import Audit
 from .body_cut import BodyCut
-from .configuration import check_options, kernel_choices
+from .configuration import check_options
 from .contact_row_plan import contact_row_plan
 from .field_group import SolverArrays
 from .forest_plan import ForestPlan, joint_forest
@@ -67,9 +66,6 @@ from .tree_factor import TreeFactor
 _FPGS_SYNC_TIMINGS = os.environ.get("FEATHER_PGS_SYNC_TIMINGS", "0").lower() in {"1", "true", "yes", "on"}
 _FPGS_SYNC_TIMINGS_START = int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_START", "20"))
 _FPGS_SYNC_TIMINGS_COUNT = max(int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_COUNT", "1")), 0)
-_SMALL_DOF_THRESHOLD_DEFAULT = 12
-# Threads per block of the tiled factor, triangular-solve and response kernels.
-_TILE_THREADS = 64
 
 
 # Retain the internal metadata API while sharing its implementation.
@@ -80,16 +76,6 @@ _MF_META_MAX_CAPACITY = _row_metadata._MF_META_MAX_CAPACITY
 _validate_dense_metadata_encoding = _row_metadata._validate_dense_metadata_encoding
 _validate_mf_metadata_encoding = _row_metadata._validate_mf_metadata_encoding
 _mf_parent_expression = _row_metadata._mf_parent_expression
-
-
-# Retain internal imports while launch-resource policy has one implementation.
-_MFGS_RESIDENT_METADATA_MAX_BYTES = _execution_plan._MFGS_RESIDENT_METADATA_MAX_BYTES
-_HINV_JT_MAX_CHUNK_SIZE = _execution_plan._HINV_JT_MAX_CHUNK_SIZE
-_MFGSStorage = _execution_plan._MFGSStorage
-_align_shared_memory = _execution_plan._align_shared_memory
-_estimate_hinv_jt_shared_memory = _execution_plan._estimate_hinv_jt_shared_memory
-_select_hinv_jt_chunk_size = _execution_plan._select_hinv_jt_chunk_size
-_FeatherPGSExecutionPlan = _execution_plan._FeatherPGSExecutionPlan
 
 
 class SolverFeatherPGS(SolverBase):
@@ -202,7 +188,6 @@ class SolverFeatherPGS(SolverBase):
     #   row_support False: sparse rows on explicit indices.     placement "general": case K6 (route_table.RouteTable).
     #   tiers: the Jacobi tiers' row bound, on any class whose response they form (0: no tiers).
     #   tier_sweeps: every Jacobi tier's sweep budget, in place of the equal-accuracy rule.
-    #   hinv_jt_kernel: a dense response kernel (CUDA).
     _route_pins: ClassVar[dict[str, object]] = {}
 
     @classmethod
@@ -522,9 +507,6 @@ class SolverFeatherPGS(SolverBase):
         # Every scalar option coerced and checked once (configuration.OPTION_RULES).
         self.options = options = check_options(requested_options)
 
-        # The dense kernels from the device (configuration.kernel_choices).
-        choices, self._kernel_choice_reasons = kernel_choices(self._route_pins, is_cpu=model.device.is_cpu)
-
         self._nvtx = nvtx
         self._debug_buffers_enabled = bool(pgs_debug)
         # External NaN dumpers read the stage-3 snapshots; nothing in the solver
@@ -533,13 +515,6 @@ class SolverFeatherPGS(SolverBase):
         self._debug_stage3_snapshots = self._debug_stage3_snapshot_flag or self._debug_buffers_enabled
         # The solver's device fields (solver_fields), on the model's device.
         self._arrays = SolverArrays(self, model.device)
-
-        small_dof_threshold = _SMALL_DOF_THRESHOLD_DEFAULT
-
-        self.tile_threads = _TILE_THREADS
-
-        self.hinv_jt_kernel = choices["hinv_jt_kernel"]
-        self.small_dof_threshold = small_dof_threshold
 
         self._step = 0
         # The tree factor: the augmented state, the mass-update cadence and the FK/ID cache now; its masks, drives,
@@ -570,15 +545,6 @@ class SolverFeatherPGS(SolverBase):
         # Axis 3 of the route table, the placement case: the owners below, in precedence order (route_table.CASES),
         # each test their own fit once no earlier case holds the class, and the first that fits claims it.
         self.routes = RouteTable(self._route_pins)
-        self._execution_plan = _FeatherPGSExecutionPlan.build(
-            self.forest.size_groups,
-            max_constraints=self.placement.dense_max_constraints,
-            max_shared_memory=int(getattr(model.device, "max_shared_memory_per_block", 0)),
-            hinv_jt_kernel=self.hinv_jt_kernel,
-            small_dof_threshold=self.small_dof_threshold,
-            tile_threads=self.tile_threads,
-            diagonal_mass_sizes=self.forest.diagonal_mass_sizes,
-        )
         # The sweep: its owners claim the class below, in the route table's order.
         self.sweep = Sweep(
             model,
@@ -588,7 +554,6 @@ class SolverFeatherPGS(SolverBase):
             self.placement,
             self.factor,
             self.routes,
-            self._execution_plan,
             self._route_pins,
             timed=self._sync_timed,
             nvtx=nvtx,
@@ -605,7 +570,6 @@ class SolverFeatherPGS(SolverBase):
         self.sweep.admit_local()
         self._contact_material_placeholder = self._arrays.placeholder(wp.float32, (1,))
         self._bind_contact_material(None)
-        self.placement.jy_world_aliased = self._detect_jy_world_identity()
         self._allocate_common_buffers(model)
         self._compact_diagonal_mass_size = self.placement.sparse_diagonal_response_size
         self.placement.row_watermark = bool(row_watermark)
@@ -616,8 +580,6 @@ class SolverFeatherPGS(SolverBase):
         self.placement.mf_sweeps = bool(
             self.routes.case not in ("K1", "K2") and self.forest.world_count > 0 and self.forest.max_world_dofs > 0
         )
-        if self.placement.mf_sweeps:
-            self.placement.jy_world_aliased = False
         # The compact boundary owns the rows and response of every world the sparse-diagonal owner pairs with a
         # six-coordinate dense articulation (decided before the buffers: it clears its own rows, so their Jacobian
         # needs no second buffer). It writes every contact row law: point and patch friction, contact torsion's spin
@@ -635,14 +597,6 @@ class SolverFeatherPGS(SolverBase):
         )
         self._allocate_buffers(model)
         self.placement.allocate_world_rows(model)
-        # Bilateral pre-elimination corrects the grouped response after H^-1 J^T,
-        # so that path must retain the existing post-correction world gather.
-        self.placement.hinv_jt_writes_world = (
-            not self.placement.jy_world_aliased and not self.factor.eliminates and self.routes.case not in ("K1", "K2")
-        )
-        self.placement.hinv_jt_tiled_writes_group = (
-            not self.placement.hinv_jt_writes_world or self.options.pgs_warmstart
-        )
         self.sweep.admit_paired()
         self.placement.allocate_sparse_diagonal_rows()
         self.placement.allocate_free_body_rows(model)
@@ -1005,18 +959,6 @@ class SolverFeatherPGS(SolverBase):
                 state changed. ``None`` invalidates every articulation.
         """
         self.factor.notify_state_changed(self.cut.trees(articulations))
-
-    def _detect_jy_world_identity(self) -> bool:
-        """Return whether host-side group and compact world J/Y layouts are identical."""
-        if len(self.forest.size_groups) != 1 or self.forest.art_to_world is None:
-            return False
-        size = self.forest.size_groups[0]
-        if self.forest.n_arts_by_size[size] != self.forest.world_count:
-            return False
-        articulation_world = self.forest.articulation_world
-        group_to_art = self.forest.group_to_art_host[size]
-        expected_world = np.arange(len(group_to_art), dtype=articulation_world.dtype)
-        return np.array_equal(articulation_world[group_to_art], expected_world)
 
     def _allocate_common_buffers(self, model):
         arrays = self._arrays

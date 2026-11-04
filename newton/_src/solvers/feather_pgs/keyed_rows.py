@@ -507,11 +507,7 @@ class KeyedRows:
 def create_owner(solver):
     """Admit one bounded complete numerical law for the rows of the in-kernel parallel tiers' class (case K4): the
     laws keyed rows implement (``route_table.CAPABILITIES``), then their fit."""
-    supported = (
-        solver.routes.case == "K4"
-        and capable("keyed_rows", solver.laws.set) is None
-        and (solver.placement.hinv_jt_writes_world or solver.placement.jy_world_aliased)
-    )
+    supported = solver.routes.case == "K4" and capable("keyed_rows", solver.laws.set) is None
     if not supported:
         return None
     try:

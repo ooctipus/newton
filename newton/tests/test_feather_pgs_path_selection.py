@@ -812,20 +812,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             resident_rows, 1, "A streamed-metadata route must keep its row types and parents resident"
         )
 
-    def test_kernel_pins_are_validated_on_the_cpu(self):
-        """Run the CPU's row-parallel response, accept its pin, and reject an invalid or a CUDA-only pin."""
-        model = _cpu_model()
-        self.assertEqual(SolverFeatherPGS(model).hinv_jt_kernel, "par_row")
-        with patch.dict(SolverFeatherPGS._route_pins, {"hinv_jt_kernel": "par_row"}):
-            self.assertEqual(SolverFeatherPGS(model).hinv_jt_kernel, "par_row")
-        for name, value in (("hinv_jt_kernel", "invalid"), ("hinv_jt_kernel", "tiled")):
-            with (
-                self.subTest(name=name, value=value),
-                patch.dict(SolverFeatherPGS._route_pins, {name: value}),
-                self.assertRaisesRegex(ValueError, name),
-            ):
-                SolverFeatherPGS(model)
-
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
     def test_sparse_selection_reasons_distinguish_policy_capacity_and_override(self):
         """Explain the actual sparse rejection while retaining the dense fallback."""
