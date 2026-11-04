@@ -373,8 +373,7 @@ def writer_kernel(solver) -> wp.Kernel:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-_SUPPORT_TABLE = """    static __constant__ int SUPPORT_NODE[$n] = {$node};"""
-_SUPPORT_TABLE_CPU = """    static const int SUPPORT_NODE[$n] = {$node};"""
+_SUPPORT_TABLE = """    static WALK_CONSTANT int SUPPORT_NODE[$n] = {$node};"""
 
 _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_rows_kernel): its seeds walked through the class's
     // path table (WALK_ROW), each footprint stored at its rank in the row's support (SUPPORT_NODE: a
@@ -591,11 +590,10 @@ _SPIN_TAIL = """        ST(record + 4, cross[3]);
 
 @cache
 def _support_table(node: tuple[int, ...]) -> DevicePrelude:
-    """The class's factor coordinate of each tree coordinate, in constant memory: the support mask's bit."""
-    values = {"n": len(node), "node": ", ".join(str(int(k)) for k in node)}
-    return DevicePrelude(
-        f"support_table_{len(node)}", substitute(_SUPPORT_TABLE, values), cpu=substitute(_SUPPORT_TABLE_CPU, values)
-    )
+    """The class's factor coordinate of each tree coordinate, in constant memory (``WALK_CONSTANT``, after the walk's
+    prelude): the support mask's bit."""
+    text = substitute(_SUPPORT_TABLE, n=len(node), node=", ".join(str(int(k)) for k in node))
+    return DevicePrelude(f"support_table_{len(node)}", text, cpu=text)
 
 
 _RELEASE_HELD = """            // The side's entries held in the thread's own array while every slip's steps run over them: one load and
