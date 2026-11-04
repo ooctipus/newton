@@ -131,9 +131,9 @@ def contact_frame(data: ContactInput, law: PatchRowLaw, c: int) -> ContactFrame:
     return frame
 
 
-def bind_routes(solver, contacts):
+def bind_routes(placement, contacts):
     """Bind the contacts' :data:`ContactRoutes` (the allocator's records of the last step)."""
-    return field_group.bind(ContactRoutes, placement=solver.placement, contacts=contacts)
+    return field_group.bind(ContactRoutes, placement=placement, contacts=contacts)
 
 
 def bind(solver, state_in, state_aug, contacts, dt, bias_scale, data=None):

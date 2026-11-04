@@ -979,7 +979,7 @@ class RowLaws:
                         gather_mf_warmstart,
                         rows,
                         inputs=[
-                            bind_contact_routes(solver, contacts),
+                            bind_contact_routes(solver.placement, contacts),
                             bind_mf_rows(solver.placement),
                             match_index,
                             solver.placement.ws_prev_slot_sorted,
@@ -1102,12 +1102,12 @@ class RowLaws:
         placement = solver.placement
         self._bias(solver, dt, placement.mf_constraint_count, placement.mf_max_constraints, placement.body_base)
 
-    def bias(self, solver, dt: float) -> RowBias:
+    def bias(self, options, dt: float) -> RowBias:
         """The rows' law's step parameters (:class:`.row_kernels.RowBias`) of a step of ``dt``."""
         bias = RowBias()
-        bias.dt, bias.speculative_scale = dt, solver.options.contact_speculative_scale
+        bias.dt, bias.speculative_scale = dt, options.contact_speculative_scale
         bias.contact_w, bias.restitution_threshold = self.contact_w, self.effective_restitution_velocity_threshold
-        bias.weighted, bias.material = int(self.set.weighted), int(solver.options.contact_compliance)
+        bias.weighted, bias.material = int(self.set.weighted), int(options.contact_compliance)
         return bias
 
     def _bias(self, solver, dt: float, counts: wp.array, capacity: int, base: int) -> None:
@@ -1124,7 +1124,7 @@ class RowLaws:
                 capacity,
                 base,
                 lanes,
-                self.bias(solver, dt),
+                self.bias(solver.options, dt),
             ],
             device=solver.model.device,
         )
@@ -1192,7 +1192,7 @@ class RowLaws:
             self.mimic_slot if blocks and self.mimic_slot is not None else dummy_int,
             self.link_slot if blocks and self.link_slot is not None else dummy_int,
             self.joint_seeds(solver, state_in),
-            self.bias(solver, dt),
+            self.bias(solver.options, dt),
         ]
         wp.launch(
             walk_rows.writer_kernel(solver),
@@ -1234,7 +1234,7 @@ class RowLaws:
                 law,
                 sink,
                 self.joint_seeds(solver, state_in),
-                self.bias(solver, dt),
+                self.bias(solver.options, dt),
             ],
             device=model.device,
         )
@@ -1261,7 +1261,7 @@ class RowLaws:
                 contact_input,
                 law,
                 solver.v_hat,
-                self.bias(solver, dt),
+                self.bias(solver.options, dt),
             ],
             device=solver.model.device,
         )

@@ -118,9 +118,9 @@ def admitted(solver) -> bool:
     return decline(solver) is None
 
 
-def _prescribed_articulations(solver):
+def _prescribed_articulations(forest):
     """Articulations whose response the solver prescribes (kinematic free bodies)."""
-    return np.flatnonzero(solver.forest.prescribed_articulation.numpy() != 0).astype(np.int32)
+    return np.flatnonzero(forest.prescribed_articulation.numpy() != 0).astype(np.int32)
 
 
 def _coverage(solver, compact):
@@ -128,7 +128,7 @@ def _coverage(solver, compact):
     groups carry. An articulation no size group holds has no coordinates (a ``"rest"`` group), and a body outside
     the articulations stays outside the solver."""
     model = solver.model
-    prescribed = _prescribed_articulations(solver)
+    prescribed = _prescribed_articulations(solver.forest)
     owned, _ = tree_joints(model)
     arts = np.concatenate(
         [solver.forest.group_to_art[size].numpy() for size in solver.forest.size_groups] + [prescribed]
@@ -182,9 +182,9 @@ def _fit(solver, group_to_art, mass, *, prescribed=False, complete=False):
     return host
 
 
-def _topologies(solver, size) -> list:
+def _topologies(forest, size) -> list:
     """The ranges of size group ``size`` that hold one topology each (:attr:`.forest_plan.ForestPlan.size_topologies`)."""
-    bounds = solver.forest.size_topologies[size]
+    bounds = forest.size_topologies[size]
     return [(int(first), int(last)) for first, last in itertools.pairwise(bounds)]
 
 
@@ -202,7 +202,7 @@ def _size_trees(solver, size, span, *, diagonal):
 
 def _prescribed_trees(solver):
     """The prescribed free bodies: their articulations and the metadata of their one-body six-coordinate pattern."""
-    group_to_art = wp.array(_prescribed_articulations(solver), dtype=int, device=solver.model.device)
+    group_to_art = wp.array(_prescribed_articulations(solver.forest), dtype=int, device=solver.model.device)
     return group_to_art, _fit(solver, group_to_art, TreePlan.build([-1], [6]).factor, prescribed=True)
 
 
@@ -236,9 +236,9 @@ def compact_decline(solver, size, *, scalar) -> str | None:
         _coverage(solver, size)
         for group_size in solver.forest.size_groups:
             if group_size != size or not scalar:
-                for span in _topologies(solver, group_size):
+                for span in _topologies(solver.forest, group_size):
                     _size_trees(solver, group_size, span, diagonal=group_size == size)
-        if _prescribed_articulations(solver).size:
+        if _prescribed_articulations(solver.forest).size:
             _prescribed_trees(solver)
     except ValueError as error:
         return f"The topology does not fit the held groups: {error}"
@@ -414,7 +414,7 @@ def forest_families(solver):
     signature = [(int(counts[a]), int(prescribed[a])) for a in per_world[0]]
     families = [0 if pres else size for size, pres in signature]
     for size in sorted({f for f in families if f}):
-        if len(_topologies(solver, size)) > 1:
+        if len(_topologies(solver.forest, size)) > 1:
             return None
         if size == solver._compact_diagonal_mass_size:
             if solver.factor.diagonal_inverse_mass is None:
@@ -560,7 +560,7 @@ class HeldTree:
             _tree_group(solver, size, span)
             for size in solver.forest.size_groups
             if scalar is None or size != scalar.size
-            for span in _topologies(solver, size)
+            for span in _topologies(solver.forest, size)
         ]
         if self.coverage[-1]:
             groups.append(_prescribed_group(solver))

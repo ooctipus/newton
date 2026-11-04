@@ -100,7 +100,7 @@ def launch_contacts(solver, data: ContactInput, dt: float) -> None:
             bind_slot_rows(solver),
             packed_sink(solver),
             patch_row_law(solver),
-            laws.bias(solver, dt),
+            laws.bias(solver.options, dt),
         ],
         extent=data.count,
     )

@@ -100,7 +100,7 @@ class StepPlan:
         """Read the plan from the solver's route ``row`` and its mapping (sizes, resource rules, kernel choices)."""
         solve = _solve(row)
         return cls(
-            response=MappingProxyType(_response(row, solver)),
+            response=MappingProxyType(_response(row, solver.forest)),
             solve=solve,
         )
 
@@ -119,12 +119,12 @@ class StepPlan:
         }
 
 
-def _response(row: RouteRow, solver) -> dict[int, Route]:
+def _response(row: RouteRow, forest) -> dict[int, Route]:
     """Where each size's rows are whitened: by a contact owner (native sparse factors, case K1, or the compact
     boundary), in place by the sparse diagonal (case K2's pair) or in the packed rows' build (every other class)."""
     owner = row.producer == "compact_contact_boundary" or row.case == "K1"
     routes = {}
-    for size in solver.forest.size_groups:
+    for size in forest.size_groups:
         if owner:
             routes[size] = Route(
                 "owner", "The contact owner and the bounded limit prefix publish the complete response."

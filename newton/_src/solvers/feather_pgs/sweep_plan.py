@@ -1577,7 +1577,7 @@ class Sweep:
                 gather_dense_warmstart,
                 pool.launch_rows(),
                 inputs=[
-                    bind_contact_routes(self, contacts),
+                    bind_contact_routes(self.placement, contacts),
                     bind_dense_rows(self.placement),
                     match_index,
                     self.placement.ws_prev_dense_slot_sorted,
@@ -1976,7 +1976,7 @@ class Sweep:
                 pool.launch(
                     snapshot_contact_warmstart,
                     pool.launch_rows(),
-                    inputs=[bind_contact_routes(self, contacts)],
+                    inputs=[bind_contact_routes(self.placement, contacts)],
                     outputs=[
                         self.placement.ws_prev_dense_slot_sorted,
                         self.placement.ws_prev_slot_sorted,
@@ -2023,7 +2023,7 @@ class Sweep:
             inputs=[
                 self.placement.dense_first,
                 self.placement.body_base,
-                bind_contact_routes(self, contacts),
+                bind_contact_routes(self.placement, contacts),
                 self.placement.impulses,
                 self.placement.constraint_count,
                 self.placement.mf_constraint_count,
