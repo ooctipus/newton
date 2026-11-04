@@ -119,7 +119,7 @@ LOCAL_ABI = kernel_template.params(
     ("world_impulses", wp.array2d[float]),
     ("v_out", wp.array[float]),
 )
-"""The local owners' native ABI: one candidate per lane group (``candidates`` or ``candidate_queue`` dispatch). Every
+"""The local owners' native ABI: one candidate per lane group (a block's groups, or a queue of them). Every
 local kernel also takes the walk (``walk``, :class:`.factor.walk.WalkTrees`), last of its row operands."""
 
 WALK_ARGUMENT = RowArgument("walk", WalkTrees)
@@ -534,7 +534,8 @@ def local_owned_kernel(
         + ("" if pitch is None or pitch == max_constraints + mf_max_constraints else f"_p{int(pitch)}")
         + solve_policy.suffix
     )
-    queue = kernel_template.candidate_queue if persistent_queue else kernel_template.candidates
+    # The candidates a launch covers: each block's lane groups, or a device list walked with the grid's stride.
+    queue = ("active_candidate_count", "candidate_grid_stride") if persistent_queue else None
     arguments = (
         *(() if row_inputs is None else row_inputs.arguments),
         WALK_ARGUMENT,
@@ -544,7 +545,7 @@ def local_owned_kernel(
         name,
         LOCAL_ABI,
         snippet,
-        queue(staging.groups, lanes_per_world),
+        kernel_template.items("candidate", groups=staging.groups, lanes=lanes_per_world, queue=queue),
         extra=arguments + solve_policy.arguments,
         composed=True,
         native_name="sweep_local_native",
@@ -581,7 +582,7 @@ PAIRED_FACTOR_ABI = kernel_template.params(
     ("omega", float),
     ("v_out", wp.array[float]),
 )
-"""The paired factor sweep's native ABI: one world per warp, two per block (``tiles(2, 32)``)."""
+"""The paired factor sweep's native ABI: one world per warp, two per block (a tail-guarded tiled dispatch)."""
 
 _PAIRED_WORLDS_PER_BLOCK = 2
 
@@ -1018,7 +1019,7 @@ def paired_factor_kernel(
         name,
         PAIRED_FACTOR_ABI,
         snippet,
-        kernel_template.tiles(_PAIRED_WORLDS_PER_BLOCK, 32),
+        kernel_template.items("world", groups=_PAIRED_WORLDS_PER_BLOCK, lanes=32, guard="world_count"),
         extra=(*weight_arguments(weighted), *material_arguments(material), *solve_policy.arguments, *walked),
         composed=True,
         native_name="sweep_paired_factor_native",

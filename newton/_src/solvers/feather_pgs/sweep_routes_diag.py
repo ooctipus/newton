@@ -652,7 +652,7 @@ def sparse_diagonal_kernel(
         name,
         kernel_template.operands(SPARSE_DIAGONAL_ABI, extra),
         snippet,
-        kernel_template.WORLDS,
+        kernel_template.items("world"),
         composed=True,
         native_name="sweep_sparse_diagonal_native",
     ).kernel()

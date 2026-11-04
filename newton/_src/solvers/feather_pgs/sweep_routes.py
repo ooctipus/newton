@@ -53,6 +53,16 @@ from .sweep import (
 _DENSE_ADMISSION = f"if (row_type == {VELOCITY_LIMIT}) continue;"
 _MF_ADMISSION = f"if (mf_rt == {SPEED}) continue;"
 
+
+def worlds(queued: bool) -> kernel_template.Dispatch:
+    """The worlds a sweep launch covers, chosen once in the plan: a block a world, or (``queued``) a device list of
+    them (``general_worlds``, its count first) walked with the grid's stride, such as the worlds the claims left to
+    the general owner."""
+    return kernel_template.items(
+        "world", queue=("general_world_count", "general_world_grid_stride", "general_worlds") if queued else None
+    )
+
+
 MF_GS_ABI = kernel_template.params(
     ("world", int),
     ("world_constraint_count", wp.array[int]),
@@ -895,7 +905,7 @@ def mf_gs_kernel(
         name,
         COLORED_ABI if colored else COLORED_WORLDS_ABI if colored_worlds else MF_GS_ABI,
         snippet,
-        kernel_template.WORLD_QUEUE,
+        worlds(skip_local_internal_worlds),
         extra=(
             *material_arguments(material),
             *solve_policy.arguments,

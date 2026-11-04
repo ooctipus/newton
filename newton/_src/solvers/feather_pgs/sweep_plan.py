@@ -1460,6 +1460,8 @@ class Sweep:
                         frame=self._tier_frame(),
                         walk_half=classes_half(self.factor.walk_classes),
                         pitch=self.placement.row_pitch,
+                        # A tier walks its own list of worlds, else the general owner's when the claims took some.
+                        queued=self.tier_worlds is not None or self.placement.local_internal_fast_path,
                         **({"torsion": True} if self.laws.contact_torsion_enabled else {}),
                     )
                     self.tiers.append(dataclasses.replace(tier, tier=tier_index))
@@ -1821,12 +1823,11 @@ class Sweep:
         if factor_kernel is not None and factor_stream is None:
             launch_factor_solve()
         with self.timed(f"mfgs_iters{iterations}"):
-            # The worlds a sweep walks and which of them each row claims: the world queue, or every world.
+            # The worlds a queued sweep walks (sweep_routes.worlds): those the claims left to the general owner.
             queue = {
                 "general_world_count": self.local_general_world_count,
                 "general_worlds": self.local_general_worlds,
                 "general_world_grid_stride": self.mf_gs_block_count,
-                "use_general_world_queue": int(self.placement.local_internal_fast_path),
             }
             if self.factor.walk_arts is not None:
                 # The sweeps leave by the walk (sweep_routes.leave_all) and find a free body's tree in it.
@@ -1862,7 +1863,6 @@ class Sweep:
                         general_world_count=self.tier_count_views[tier.tier],
                         general_worlds=self.tier_world_views[tier.tier],
                         general_world_grid_stride=self.tier_blocks,
-                        use_general_world_queue=1,
                     )
                 named.update(self.placement.inkernel_response_inputs())
                 if tier.kinetic_rows:

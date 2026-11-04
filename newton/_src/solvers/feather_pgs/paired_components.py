@@ -24,7 +24,7 @@ import warp as wp
 from . import field_group, kernel_template
 from .device_preludes import lane_group
 from .field_group import Field
-from .kernel_template import Dispatch, KernelTemplate
+from .kernel_template import KernelTemplate, items
 from .route_table import capable
 from .row_kernels import PGS_CONSTRAINT_TYPE_SPEED
 from .step_plan import first_failed
@@ -127,7 +127,7 @@ class PairedComponents:
 # intact; a qualified world's selector turns negative (zero: no free-body rows, positive: the mixed fallback).
 _PAIRED_COMPONENTS = r"""
 #if !defined(__CUDA_ARCH__)
-    if (logical_lane != 0) return;
+    if (lane != 0) return;
 #endif
     const int M = data.Y.shape[1];
     const int F = data.mf_meta.shape[1] / 4;
@@ -232,7 +232,7 @@ def paired_components_kernel(primary_size: int, secondary_size: int = FREE_BODY_
         (("workers", int), ("data", PairedComponentData)),
         source,
         # A lane group per worker: its worker index and the thread's lane in it.
-        Dispatch("worker, lane = wp.tid()\n$CALL", ("worker", "lane"), (("worker", int), ("logical_lane", int))),
+        items("worker", lane=True),
         preludes=(lane_group(PAIRED_COMPONENT_THREADS),),
         dual=True,
         native_name="paired_components_native",

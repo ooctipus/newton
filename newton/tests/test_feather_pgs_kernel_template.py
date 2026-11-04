@@ -70,12 +70,12 @@ class TestKernelTemplate(unittest.TestCase):
             "queued",
             (("candidate", int), ("first", int), ("second", wp.array[float]), ("third", float)),
             "",
-            kernel_template.candidate_queue(2, 16),
+            items("candidate", groups=2, lanes=16, queue=("active_candidate_count", "candidate_grid_stride")),
         )
-        # The queue's operands follow the kernel's first two parameters; the native function takes the candidate.
+        # The queue's operands lead the kernel's parameters; the native function takes the candidate.
         self.assertEqual(
             [name for name, _ in queued.signature],
-            ["first", "second", "active_candidate_count", "candidate_grid_stride", "third"],
+            ["active_candidate_count", "candidate_grid_stride", "first", "second", "third"],
         )
         self.assertEqual([name for name, _ in queued.native_params], ["candidate", "first", "second", "third"])
         guarded = KernelTemplate("guarded", (("count", int), ("out", wp.array[float])), "", _GUARDED)
@@ -83,7 +83,7 @@ class TestKernelTemplate(unittest.TestCase):
         self.assertEqual([name for name, _ in guarded.native_params], ["tid", "out"])
         self.assertIn("native(tid, out)", guarded.declaration())
         with self.assertRaisesRegex(ValueError, "world"):
-            KernelTemplate.from_abi("unqueued", (("candidate", int),), "", kernel_template.WORLD_QUEUE)
+            KernelTemplate.from_abi("unqueued", (("candidate", int),), "", items("world", queue=("count", "stride")))
 
     def test_snippet_composes_preludes_once(self):
         """Compose the preludes ahead of the body, or take a composed snippet as it is."""
@@ -139,7 +139,7 @@ class TestItems(unittest.TestCase):
         self.assertEqual(kernel_template.BLOCKS.body, "block, _lane = wp.tid()\n$CALL")
         self.assertEqual(kernel_template.THREADS.arguments, ("wp.tid()",))
         self.assertEqual(
-            kernel_template.tiles(2, 16).body,
+            items("world", groups=2, lanes=16, guard="world_count").body,
             "block, lane = wp.tid()\nworld = block * 2 + lane // 16\nif world < world_count:\n    $CALL",
         )
         self.assertEqual(items("world", lanes=32, flat=True).body, "world = wp.tid() // 32\n$CALL")

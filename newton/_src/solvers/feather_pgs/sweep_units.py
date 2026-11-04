@@ -589,7 +589,7 @@ def build_units_kernel(
         f"sweep_units_{mf_rows}_{dofs}_{int(units)}_{rule.name}_w{BUILD_WARPS}" + ("_torsion" if torsion else ""),
         params,
         cuda_native(source, preludes=(lane_group(32), SHARED_STORAGE)),
-        dispatch=kernel_template.WORLDS,
+        dispatch=kernel_template.items("world"),
         composed=True,
         native_name="sweep_units_native",
         launch_bounds=(32 * BUILD_WARPS, 1),

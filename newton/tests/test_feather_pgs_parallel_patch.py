@@ -1338,7 +1338,6 @@ def _launch_parallel(tier, case, *, device):
         "general_world_count": wp.array([1], dtype=wp.int32, device=device),
         "general_worlds": wp.zeros(1, dtype=wp.int32, device=device),
         "general_world_grid_stride": 1,
-        "use_general_world_queue": 0,
         "world_constraint_count": wp.array([count], dtype=wp.int32, device=device),
         "mf_constraint_count": wp.zeros(1, dtype=wp.int32, device=device),
         "dense_phase_bounds": wp.zeros((1, 2), dtype=wp.int32, device=device),

@@ -923,7 +923,7 @@ def sparse_kernel(
         sweep.name,
         SPARSE_ABI,
         snippet,
-        kernel_template.tiles(sweep.groups, sweep.lanes),
+        kernel_template.items("world", groups=sweep.groups, lanes=sweep.lanes, guard="world_count"),
         extra=extra,
         composed=True,
         native_name="sweep_sparse_native",

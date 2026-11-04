@@ -262,7 +262,6 @@ def solve_pair_launches(data, arrays, *, enabled, arch, iterations=8):
         dense_first=data.first,
         world_count=5,
         general_world_grid_stride=5,
-        use_general_world_queue=0,
         iterations=iterations,
         omega=1.0,
         regularize=0,

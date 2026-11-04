@@ -39,18 +39,14 @@ __all__ = [
     "BLOCKS",
     "THREADS",
     "WORLDS",
-    "WORLD_QUEUE",
     "Dispatch",
     "KernelTemplate",
     "SweepTier",
-    "candidate_queue",
-    "candidates",
     "items",
     "operands",
     "params",
     "python_kernel",
     "substitute",
-    "tiles",
 ]
 
 
@@ -103,8 +99,6 @@ class Dispatch:
     """Values of the names ``body`` reads besides its parameters (compile-time constants of the variant)."""
     private: tuple[str, ...] = ()
     """Kernel parameters only the wrapper reads (for example a bound check); the native function does not take them."""
-    extra_at: int = 0
-    """Where :attr:`extra` goes among the kernel's parameters (an index into them)."""
 
 
 def items(
@@ -187,49 +181,8 @@ def _indented(text: str) -> str:
 # The old dispatch names, each one declaration of :func:`items`. They stay only while a call site names them: the
 # tracks convert their call sites to ``items(...)`` in their first commits (the one exception to "no shims", ZXB A3).
 BLOCKS = items()  # the default dispatch: R rows.py, row_packets.py
-WORLDS = items("world")  # R response_builds_rows.py, keyed_row_layout.py; S sweep_units.py, sweep_routes_diag.py
+WORLDS = items("world")  # R keyed_row_layout.py
 THREADS = items("tid", flat=True)  # W factor/walk.py (2), tree_kinetic_state.py (the walk solve)
-
-
-def tiles(groups: int, lanes: int) -> Dispatch:  # S sweep_routes_sparse.py, sweep_routes_local.py (paired factor)
-    return items("world", groups=groups, lanes=lanes, guard="world_count")
-
-
-def candidates(groups: int, lanes: int) -> Dispatch:  # S sweep_routes_local.py
-    return items("candidate", groups=groups, lanes=lanes)
-
-
-def candidate_queue(groups: int, lanes: int) -> Dispatch:  # S sweep_routes_local.py (operands after two parameters)
-    queue = ("active_candidate_count", "candidate_grid_stride")
-    return dataclasses.replace(items("candidate", groups=groups, lanes=lanes, queue=queue), extra_at=2)
-
-
-# Matrix-free sweeps on the world queue, or on every world, picked at run time by ``use_general_world_queue``
-# (sweep_plan: ``placement.local_internal_fast_path``, a plan fact). Not a declaration of :func:`items`: the plan's
-# choice is two kernels, ``items("world")`` and ``items("world", queue=("general_world_count",
-# "general_world_grid_stride", "general_worlds"))``, which track S builds at its call sites (sweep_routes.py,
-# sweep_routes_tiers.py; D sweep_plan.py passes the switch), and this run-time branch goes with them.
-WORLD_QUEUE = Dispatch(
-    "candidate, _lane = wp.tid()\n"
-    "general_index = candidate\n"
-    "general_count = general_world_count[0]\n"
-    "if use_general_world_queue == 0:\n"
-    "    general_count = candidate + 1\n"
-    "while general_index < general_count:\n"
-    "    world = candidate\n"
-    "    if use_general_world_queue != 0:\n"
-    "        world = general_worlds[general_index]\n"
-    "    $CALL\n"
-    "    general_index += general_world_grid_stride",
-    ("world",),
-    (("world", int),),
-    (
-        ("general_world_count", wp.array[int]),
-        ("general_worlds", wp.array[int]),
-        ("general_world_grid_stride", int),
-        ("use_general_world_queue", int),
-    ),
-)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -307,9 +260,8 @@ class KernelTemplate:
 
     @property
     def signature(self) -> tuple[tuple[str, Any], ...]:
-        """The Warp kernel's signature: the kernel's parameters with the dispatch's own at its place."""
-        at = self.dispatch.extra_at
-        return (*self.params[:at], *self.dispatch.extra, *self.params[at:])
+        """The Warp kernel's signature: the dispatch's own parameters, then the kernel's."""
+        return (*self.dispatch.extra, *self.params)
 
     def declaration(self) -> str:
         """The Python source of the native function and its Warp wrapper (annotations by ``type_<name>`` alias)."""

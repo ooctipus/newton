@@ -86,7 +86,7 @@ def free_body_meta_kernel(mf_max_constraints: int, pitch: int, base: int, lanes:
             ("mf_meta", wp.array2d[int]),
         ),
         dual_native(body, preludes=(lane_group(lanes), CPU_MATH)),
-        dispatch=kernel_template.WORLDS,
+        dispatch=kernel_template.items("world"),
         composed=True,
         native_name="free_body_meta_native",
     ).kernel()

@@ -176,7 +176,6 @@ def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MAS
         "general_world_count": array([1], wp.int32),
         "general_worlds": zero_int,
         "general_world_grid_stride": 1,
-        "use_general_world_queue": 0,
         "world_constraint_count": array([count], wp.int32),
         "dense_first": row_lines(device),
         "mf_first": row_lines(device),

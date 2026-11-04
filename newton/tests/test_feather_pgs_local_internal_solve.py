@@ -233,9 +233,9 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 lanes_per_world=lanes_per_world,
                 contact_capable=contact_capable,
             )
-            inputs = [candidate_articulations, candidate_articulations]
-            if persistent_queue:
-                inputs.extend([wp.array([active_count], dtype=wp.int32, device=device), 2])
+            # A queue's operands (its count and the grid's stride) lead the kernel's.
+            inputs = [wp.array([active_count], dtype=wp.int32, device=device), 2] if persistent_queue else []
+            inputs.extend([candidate_articulations, candidate_articulations])
             inputs.extend(
                 [
                     PGS_LOCAL_SOLVE_OWNER_SINGLE,
@@ -454,10 +454,10 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
             kernel,
             dim=[1],
             inputs=[
-                wp.array([0], dtype=wp.int32, device=device),
-                wp.array([1], dtype=wp.int32, device=device),
                 wp.array([1], dtype=wp.int32, device=device),
                 2,
+                wp.array([0], dtype=wp.int32, device=device),
+                wp.array([1], dtype=wp.int32, device=device),
                 PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
                 wp.array([0, 0], dtype=wp.int32, device=device),
                 wp.array([0, primary_dofs], dtype=wp.int32, device=device),

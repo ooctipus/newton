@@ -44,7 +44,7 @@ from .sweep import (
     jacobi_sweeps,
     material_arguments,
 )
-from .sweep_routes import MF_GS_ABI
+from .sweep_routes import MF_GS_ABI, worlds
 from .tree_scan import WALK_BOTH
 
 PARALLEL_ABI = kernel_template.params(
@@ -283,8 +283,9 @@ def parallel_kernel(
     frame: tuple[int, int] = (0, 0),
     walk_half: int = WALK_BOTH,
     pitch: int | None = None,
+    queued: bool = False,
 ) -> SweepTier:
-    """A parallel tier: its kernel (:data:`PARALLEL_ABI`, the world queue) and its launch descriptor.
+    """A parallel tier: its kernel (:data:`PARALLEL_ABI`) and its launch descriptor.
 
     A thread per row: the block's threads cover ``rows`` in whole warps, and its working set fits the static budget
     of ``device_arch`` (:func:`.staging.arch_budget`). The tier owns no world with free-body rows (its kernel's name
@@ -292,7 +293,8 @@ def parallel_kernel(
     rows. Its worlds' stored rows (:mod:`.walk_rows`) lie at their coordinates, ``max_world_dofs`` entries a row.
     With ``weighted`` its contact rows step by their weights, ``material`` contacts' from their compliance; ``frame``
     is each tree's slip capacity (:class:`.WalkedRows`); ``walk_half`` the half its walks read the records by, the
-    model's (:func:`.tree_scan.classes_half`).
+    model's (:func:`.tree_scan.classes_half`); ``queued`` takes its worlds from a device list
+    (:func:`.sweep_routes.worlds`).
     """
     if material and not weighted:
         raise ValueError("material contacts step by their weights: their tiers are weighted")
@@ -338,7 +340,7 @@ def parallel_kernel(
         name,
         PARALLEL_ABI,
         snippet,
-        kernel_template.WORLD_QUEUE,
+        worlds(queued),
         extra=(
             *(operands.arguments if operands is not None else ()),
             *material_arguments(material),

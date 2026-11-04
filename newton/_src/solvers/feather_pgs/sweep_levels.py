@@ -14,7 +14,7 @@ import warp as wp
 from . import kernel_template
 from .contact_input import ContactInput
 from .device_preludes import lane_group
-from .kernel_template import Dispatch, KernelTemplate, python_kernel
+from .kernel_template import KernelTemplate, items, python_kernel
 from .row_kernels import PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
 
 
@@ -217,11 +217,7 @@ def _get_build_independent_sparse_contact_groups_kernel(
             ("serial_normals", wp.array2d[int]),
         ),
         snippet,
-        dispatch=Dispatch(
-            "world = wp.tid() // 32\n$CALL",
-            ("world",),
-            (("world", int),),
-        ),
+        dispatch=items("world", lanes=32, flat=True),
         preludes=(lane_group(32),),
         native_name="build_independent_sparse_contact_groups_native",
     ).kernel()
@@ -505,11 +501,7 @@ def _build_independent_sparse_contact_units_kernel(
             ("serial_normals", wp.array2d[int]),
         ),
         snippet,
-        dispatch=Dispatch(
-            "world = wp.tid() // 32\n$CALL",
-            ("world",),
-            (("world", int),),
-        ),
+        dispatch=items("world", lanes=32, flat=True),
         preludes=(lane_group(32),),
         native_name="build_independent_sparse_contact_units_native",
     ).kernel()
