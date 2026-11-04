@@ -32,8 +32,8 @@ import newton
 from newton._src.solvers.feather_pgs.factor.walk import TreeWalk, local_frames
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
 from newton.solvers import SolverFeatherPGS
+from newton.tests.test_feather_pgs_factor import BOUND, ROUNDING, Capture, catalogue, random_tree, run_route
 from newton.tests.test_feather_pgs_response_diagonal import _build_mixed_response_model
-from newton.tests.test_feather_pgs_walk import BOUND, ROUNDING, Capture, catalogue, run_route
 
 F32 = np.float32
 
@@ -41,38 +41,6 @@ F32 = np.float32
 # ---------------------------------------------------------------------------------------------------------------------
 # The block primitive in numpy: frame (slips), then closure (links, mimics)
 # ---------------------------------------------------------------------------------------------------------------------
-
-
-def random_tree(rng, bodies: int, device="cpu"):
-    """A random tree of ``bodies`` links (revolute, prismatic and ball joints) with a drive on every scalar coordinate,
-    no gravity: its model, built on ``device``."""
-    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    links, joints = [], []
-    for b in range(bodies):
-        parent = -1 if b == 0 else links[int(rng.integers(0, b))]
-        inertia = np.diag(rng.uniform(0.02, 0.2, 3))
-        link = builder.add_link(mass=float(rng.uniform(0.5, 2.0)), inertia=wp.mat33(inertia))
-        offset = wp.transform(wp.vec3(*rng.normal(size=3) * 0.2), wp.quat_identity())
-        axis = tuple(np.eye(3)[int(rng.integers(0, 3))])
-        kind = int(rng.integers(0, 3)) if b > 0 else 0
-        if kind == 0:
-            joint = builder.add_joint_revolute(parent=parent, child=link, axis=axis, parent_xform=offset)
-        elif kind == 1:
-            joint = builder.add_joint_prismatic(parent=parent, child=link, axis=axis, parent_xform=offset)
-        else:
-            joint = builder.add_joint_ball(parent=parent, child=link, parent_xform=offset)
-        links.append(link)
-        joints.append(joint)
-    builder.add_articulation(joints)
-    model = builder.finalize(device=device)
-    q = model.joint_q.numpy()
-    q[:] = rng.normal(size=q.shape) * 0.3
-    # Ball joints hold unit quaternions.
-    types, q_start = model.joint_type.numpy(), model.joint_q_start.numpy()
-    for j in np.flatnonzero(types == int(newton.JointType.BALL)):
-        quat = rng.normal(size=4)
-        q[q_start[j] : q_start[j] + 4] = quat / np.linalg.norm(quat)
-    return model, q
 
 
 def orth(M: np.ndarray, tol: float = 1.0e-5) -> np.ndarray:
@@ -550,7 +518,7 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
     step leaves ``R^T du`` (its rows carry the release and are checked by :class:`TestSlipRelease`); the closure's
     corrected rows (``test_feather_pgs_preelim``), a world whose speed ball acted (its ``du`` is a law's, not
     ``sum Z lambda``) and a world the local owners' packets hold (its rows are walked in the kernel, no store holds
-    them: ``test_feather_pgs_walk_device.placement_frames``) are left to their own checks."""
+    them: ``test_feather_pgs_factor.placement_frames``) are left to their own checks."""
     forest, placement, factor = solver.forest, solver.placement, solver.factor
     owned = np.zeros(int(forest.world_count), dtype=bool)
     if placement.row_packets is not None:

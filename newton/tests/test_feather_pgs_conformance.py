@@ -1375,7 +1375,7 @@ REFERENCE_CUDA = Route(
     "cuda",
     # The plain matrix-free Gauss-Seidel sweep over the held tree and rows: the general placement declines the local,
     # paired and sparse-diagonal owners, and every world is solved (no resolved-world claim). The tree factor itself
-    # answers to the float64 mass matrix (test_feather_pgs_tree_invariants).
+    # answers to the float64 mass matrix (test_feather_pgs_factor).
     options=_MF,
     pins={**_DENSE, "placement": "general", "claims": ()},
     expect={

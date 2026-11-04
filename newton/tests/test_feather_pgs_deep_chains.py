@@ -41,15 +41,16 @@ from newton.tests import feather_pgs_scenes as scenes
 from newton.tests.feather_pgs_law_harness import dense_factor32
 from newton.tests.feather_pgs_mass_reference import MassReference
 from newton.tests.test_feather_pgs_contract_loops import _LOOP_FRAMES, _four_bar_bars, _loop_anchor_gap
-from newton.tests.test_feather_pgs_regimes import LIMIT, known_failure
-from newton.tests.test_feather_pgs_walk import (
+from newton.tests.test_feather_pgs_factor import (
+    DeviceWalk,
     contact_wrenches,
+    devices,
     jacobian,
     newton_state_body_q,
     relative,
     transform_point,
 )
-from newton.tests.test_feather_pgs_walk_device import DeviceWalk, devices
+from newton.tests.test_feather_pgs_regimes import LIMIT, known_failure
 
 DEEP = (32, 106, 300, 1000)
 """The deep-chain regime's lengths (Z4.A): the deep-chain rule's threshold, the bench's chain, the ZB chains."""
@@ -190,7 +191,7 @@ def family_response(model, devices_to_run=(), *, float32_poses: bool = False) ->
 def main_on_chain(model) -> dict:
     """A chain's tip contact (three rows) through main's float32 dense factor (:func:`dense_factor32` of the float32 ``H``
     about the origin, no armature added), applied in float32, and through the float32 walk without armature, both
-    against the float64 walk without armature (F2's comparison, :func:`.test_feather_pgs_walk.chain_precision`)."""
+    against the float64 walk without armature (F2's comparison, :func:`.test_feather_pgs_factor.chain_precision`)."""
     from scipy.linalg import solve_triangular
 
     joint_q = model.joint_q.numpy().astype(np.float64)

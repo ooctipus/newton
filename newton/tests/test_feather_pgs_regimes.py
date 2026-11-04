@@ -31,7 +31,7 @@ from newton.tests import feather_pgs_references as refs
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conformance
 from newton.tests.feather_pgs_law_harness import walk_inverse
-from newton.tests.test_feather_pgs_walk import newton_state_body_q, relative, transform_point
+from newton.tests.test_feather_pgs_factor import newton_state_body_q, relative, transform_point
 
 H = 1.0 / 240.0
 G0 = refs.GRAVITY
