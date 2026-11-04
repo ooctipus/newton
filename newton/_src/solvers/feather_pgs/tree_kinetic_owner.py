@@ -4,7 +4,6 @@
 """Admission and live bindings for complete tree current/next kinetic state."""
 
 import dataclasses
-import math
 
 import numpy as np
 import warp as wp
@@ -125,7 +124,6 @@ class TreeKineticState:
         self,
         sparse_owner,
         *,
-        admission=None,
         chains=True,
         complete=True,
         response="sparse",
@@ -138,11 +136,7 @@ class TreeKineticState:
         self.sparse = sparse_owner
         self.solver = solver = sparse_owner.solver
         self.motion_velocity = bool(solver.options.enable_joint_velocity_limits)
-        self._motion_binding = None
         model, device = solver.model, solver.model.device
-        # Direct construction is also used by CPU physical representation tests.
-        # Production admission remains CUDA-only through supported().
-        self.admission = admission
         self.complete = complete
         host = sparse_owner.host
         self.layout, parent = make_plan(model, sparse_owner, complete=complete)
@@ -339,6 +333,13 @@ class TreeKineticState:
         self.bank_kernel = None
         if self.bank_compare and self.classify_first:
             self.bank_kernel = native.get_bank_kernel(layout=layout, coordinates=self.bank_coordinates)
+        # The repair's launches, bound once: the classification (with the list clear) and the comparison pass of a
+        # classified repair, then the repair.
+        self._repair_launches = (
+            *((self._classify,) if self.classify_first else ()),
+            *((self._compare,) if self.bank_kernel is not None else ()),
+            self._repair,
+        )
         self.finish_kernel = native.get_state_kernel(
             True,
             self.schedules,
@@ -495,32 +496,22 @@ class TreeKineticState:
             self.data.geometry_valid,
         )
 
-    def _validate_call(self, state, state_aug, dt):
-        if self.admission is not None and not self.admission(self.solver):
-            raise RuntimeError("Tree kinetic configuration changed; reconstruct and recapture")
-        if bool(self.solver.options.enable_joint_velocity_limits) != self.motion_velocity:
-            raise RuntimeError("Tree kinetic motion-velocity contract changed; reconstruct and recapture")
-        if dt is None or not math.isfinite(dt) or dt <= 0:
-            raise ValueError("Tree kinetic state requires a positive finite step duration")
-        for name in ("joint_q", "joint_qd", "body_q", "body_qd", "body_f"):
-            value = getattr(state, name)
-            if value.device != self.solver.model.device or not value.is_contiguous:
-                raise RuntimeError("Tree kinetic state requires contiguous same-device state arrays")
-
     def _publication(self, state_in, state_aug, state_out, dt):
         """Bind live current and next-state publication descriptors."""
         return cached_state_binding.publication(self.solver, state_in, state_aug, state_out, dt)
 
-    def _bank(self, state, state_in):
-        """Bind the bank a repair compares ``state_in`` with: same device, contiguous, same shapes."""
+    @staticmethod
+    def _bank(state):
+        """Bind the bank a repair compares the input bank with."""
         from .tree_kinetic_state import StateBank  # noqa: PLC0415
 
         bank = StateBank()
-        for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
-            value, reference = getattr(state, name), getattr(state_in, name)
-            if value.device != reference.device or not value.is_contiguous or value.shape != reference.shape:
-                raise RuntimeError("Tree kinetic bank comparison requires a contiguous state of the same model")
-            setattr(bank, name, value)
+        bank.joint_q, bank.joint_qd, bank.body_q, bank.body_qd = (
+            state.joint_q,
+            state.joint_qd,
+            state.body_q,
+            state.body_qd,
+        )
         return bank
 
     def begin(self, state_in, state_aug, stage3_qd, dt, *, state_out=None, continues=False):
@@ -542,18 +533,14 @@ class TreeKineticState:
                 motion-velocity layout's repair also compares the prescaled velocity,
                 which the step recomputes after the finish: it launches.
         """
-        self._validate_call(state_in, state_aug, dt)
-        self._motion_binding = self._validate_motion(state_in, state_aug, stage3_qd)
         if continues and not self.motion_velocity:
             return
-        device = self.solver.model.device
         data = self._publication(state_in, state_aug, state_in, dt)
-        # Every repair takes the launch ABI of the finish (get_state_kernel): only an
-        # alternate-motion repair reads stage3_qd, otherwise the state's own velocity
-        # (_validate_motion); only a listed repair reads the block list, and only a
-        # comparing repair a bank: the output bank, or the input bank itself where there
-        # is none to compare (every group stamped with it exits before comparing).
-        arguments = [
+        # Every repair takes the launch ABI of the finish (get_state_kernel): only an alternate-motion repair reads
+        # stage3_qd, otherwise the state's own velocity; only a listed repair reads the block list, and only a
+        # comparing repair a bank: the output bank, or the input bank itself where there is none to compare (every
+        # group stamped with it exits before comparing).
+        arguments = (
             self.sparse.plan,
             self.plan,
             data,
@@ -561,69 +548,47 @@ class TreeKineticState:
             self.solver.factor.mass_update_requested,
             self.solver.factor.clock,
             stage3_qd,
-        ]
-        lists = [self._repair_blocks, self._list_counts]
-        compare = self.bank_compare and state_out is not None
-        bank = self._bank(state_out if compare else state_in, state_in)
-        if self.classify_first:
-            # List the blocks that repair (and, when comparing, those that compare
-            # first) and run the repair over the list on the capped grid. The
-            # classification is a contract of ordinary motion: it takes the six common
-            # arguments, not the motion input of the repair ABI.
-            self._list_counts.zero_()
-            wp.launch(
-                self.classify_kernel,
-                dim=self.launch_count,
-                inputs=[*arguments[:6], bank, self._repair_blocks, self._compare_blocks, self._list_counts],
-                block_dim=_CLASSIFY_BLOCK_DIM,
-                device=device,
-            )
-            if compare:
-                wp.launch_tiled(
-                    self.bank_kernel,
-                    dim=[self.launch_count],
-                    inputs=[*arguments[:6], bank, self._compare_blocks, self._repair_blocks, self._list_counts],
-                    block_dim=self.block_dim,
-                    max_blocks=self._repair_grid,
-                    device=device,
-                )
+        )
+        bank = self._bank(state_out if self.bank_compare and state_out is not None else state_in)
+        for launch in self._repair_launches:
+            launch(arguments, bank)
+
+    def _classify(self, arguments, bank):
+        """List the blocks that repair (and, when comparing, those that compare first). The classification is a
+        contract of ordinary motion: it takes the six common arguments, not the motion input of the repair ABI."""
+        self._list_counts.zero_()
+        wp.launch(
+            self.classify_kernel,
+            dim=self.launch_count,
+            inputs=[*arguments[:6], bank, self._repair_blocks, self._compare_blocks, self._list_counts],
+            block_dim=_CLASSIFY_BLOCK_DIM,
+            device=self.solver.model.device,
+        )
+
+    def _compare(self, arguments, bank):
+        """Compare the banks of the blocks the classification listed for comparison."""
+        wp.launch_tiled(
+            self.bank_kernel,
+            dim=[self.launch_count],
+            inputs=[*arguments[:6], bank, self._compare_blocks, self._repair_blocks, self._list_counts],
+            block_dim=self.block_dim,
+            max_blocks=self._repair_grid,
+            device=self.solver.model.device,
+        )
+
+    def _repair(self, arguments, bank):
+        """The repair: over the classification's list on the capped grid, or a block per group."""
         wp.launch_tiled(
             self.repair_kernel,
             dim=[self.launch_count],
-            inputs=[*arguments, *lists, bank],
+            inputs=[*arguments, self._repair_blocks, self._list_counts, bank],
             block_dim=self.block_dim,
             max_blocks=self._repair_grid if self.classify_first else 0,
-            device=device,
+            device=self.solver.model.device,
         )
-
-    def _validate_motion(self, state, state_aug, velocity):
-        """Reject invalid working descriptors before changing current-cache validity."""
-        raw = state.joint_qd
-        if (
-            not isinstance(velocity, wp.array)
-            or velocity.device != raw.device
-            or velocity.dtype != raw.dtype
-            or velocity.shape != raw.shape
-            or not velocity.is_contiguous
-        ):
-            raise RuntimeError("Tree kinetic motion velocity requires a matching contiguous state-vector descriptor")
-        if not self.motion_velocity and velocity.ptr != raw.ptr:
-            raise RuntimeError("Tree kinetic state excludes alternate prescaled predictor velocity")
-
-        if (velocity.ptr != raw.ptr and cached_state_binding.overlap(velocity, raw)) or any(
-            cached_state_binding.overlap(velocity, array)
-            for array in (state.joint_q, state_aug.joint_qdd, self.solver.v_hat, self.solver.v_out)
-        ):
-            raise RuntimeError("Tree kinetic motion velocity overlaps state coordinates or response outputs")
-        return state.joint_q.ptr, raw.ptr, velocity.ptr
 
     def predict(self, state_in, state_aug, control, stage3_qd, dt):
         """Apply live force buckets through held W with original root transport."""
-
-        self._validate_call(state_in, state_aug, dt)
-        binding = self._validate_motion(state_in, state_aug, stage3_qd)
-        if self.motion_velocity and binding != self._motion_binding:
-            raise RuntimeError("Tree kinetic predictor motion velocity differs from the current-cache binding")
         solver = self.solver
         force = self._force_input(state_in, state_aug, control, stage3_qd, dt)
         walk = solver.factor.walk_view()
@@ -646,10 +611,6 @@ class TreeKineticState:
 
     def finish(self, state_in, state_aug, state_out, dt):
         """Integrate once, publish complete public state and construct next bias."""
-        self._validate_call(state_in, state_aug, dt)
-        self._validate_call(state_out, state_aug, dt)
-        if not cached_state_binding.disjoint_states(state_in, state_out):
-            raise RuntimeError("Tree kinetic integration requires non-overlapping generalized state banks")
         data = self._publication(state_in, state_aug, state_out, dt)
         wp.launch_tiled(
             self.finish_kernel,

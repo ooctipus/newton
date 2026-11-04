@@ -176,25 +176,6 @@ class TestTreeKineticStages(unittest.TestCase):
                         else:
                             self.assertEqual(uses, [])
 
-    def test_owners_without_alternate_motion_reject_another_velocity(self):
-        """Refuse a velocity other than the state's in begin and predict, before any cache changes."""
-        model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-        owner = HeldTree(solver)
-        state, control = model.state(), model.control()
-        other = wp.clone(state.joint_qd)
-        self.assertTrue(owner.groups)
-        for group in owner.groups:
-            with self.subTest(layout=group.layout.root_families):
-                self.assertFalse(group.motion_velocity)
-                before = {name: array.numpy().copy() for name, array in _state_arrays(group).items()}
-                with self.assertRaisesRegex(RuntimeError, "excludes alternate prescaled predictor velocity"):
-                    group.begin(state, solver.factor, other, DT)
-                with self.assertRaisesRegex(RuntimeError, "excludes alternate prescaled predictor velocity"):
-                    group.predict(state, solver.factor, control, other, DT)
-                for name, array in _state_arrays(group).items():
-                    np.testing.assert_array_equal(array.numpy(), before[name], err_msg=name)
-
     def check_motion_input_ignored(self, device):
         """Launch each finish and ordinary repair with the state's velocity and with NaN as the motion input.
 

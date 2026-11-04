@@ -32,6 +32,7 @@ import warp as wp
 
 from ...core.memory import Device, device
 from ...sim import ModelFlags
+from . import cached_state_binding
 from .forest_plan import ForestPlan
 from .route_table import RouteRow
 
@@ -446,6 +447,9 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     # Scalar branches evaluate their own drives in their predict: the drives' stage takes the other coordinates.
     drive_dofs = None if scalar is None else scalar.other_drive_dofs
 
+    def check_call(step):
+        cached_state_binding.check_call(model.device, step.state_in, step.state_out, step.dt)
+
     def drives(step):
         factor.prepare_drives(step.state_in, step.control, step.dt, solver.v_hat, solver.v_out, drive_dofs)
 
@@ -490,6 +494,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     if factor.parallel_drives and (scalar is None or scalar.other_drive_dofs is not None):
         drive_stages = (drives_on_stream,) if stream is not None else (drives,)
     add(
+        check_call,
         *drive_stages,
         prescale if solver.options.enable_joint_velocity_limits else velocity,
         fk_id,

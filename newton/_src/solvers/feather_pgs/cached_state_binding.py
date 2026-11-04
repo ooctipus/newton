@@ -4,6 +4,7 @@
 """Bind complete cached publication and reset ownership to live solver arrays."""
 
 import functools
+import math
 
 import warp as wp
 
@@ -36,16 +37,26 @@ def publication(solver, state_in, state_aug, state_out, dt):
     )
 
 
-def overlap(a, b) -> bool:
+def _overlap(a, b) -> bool:
     """Whether two arrays share bytes; an empty array shares none."""
     return bool(a.capacity and b.capacity and a.ptr < b.ptr + b.capacity and b.ptr < a.ptr + a.capacity)
 
 
-def disjoint_states(state_in, state_out):
-    """Check all generalized input/output byte ranges before any integration write."""
-    return not any(
-        overlap(a, b) for a in (state_in.joint_q, state_in.joint_qd) for b in (state_out.joint_q, state_out.joint_qd)
-    )
+def check_call(device, state_in, state_out, dt) -> None:
+    """The held tree's call contract, once a step before any state is read: a positive finite duration, every state
+    array the held groups bind contiguous on the solver's ``device``, and the generalized input and output banks
+    disjoint (the finish integrates one into the other)."""
+    if dt is None or not math.isfinite(dt) or dt <= 0:
+        raise ValueError("FeatherPGS steps a positive finite duration")
+    for state in (state_in, state_out):
+        for name in ("joint_q", "joint_qd", "body_q", "body_qd", "body_f"):
+            value = getattr(state, name)
+            if value.device != device or not value.is_contiguous:
+                raise RuntimeError("FeatherPGS steps contiguous state arrays on its device")
+    if any(
+        _overlap(a, b) for a in (state_in.joint_q, state_in.joint_qd) for b in (state_out.joint_q, state_out.joint_qd)
+    ):
+        raise RuntimeError("FeatherPGS integrates between non-overlapping generalized state banks")
 
 
 @functools.cache

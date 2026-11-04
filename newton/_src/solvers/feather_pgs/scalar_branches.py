@@ -42,7 +42,6 @@ keyboard-sized worlds, against 500 us with a refresh on every substep.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -531,12 +530,11 @@ class ScalarBranchState:
     bank_compare = False
     motion_velocity = False
 
-    def __init__(self, solver, plan: ScalarBranchPlan, *, admission=None):
+    def __init__(self, solver, plan: ScalarBranchPlan):
         """Bind the group's kernels; the owner's tree groups hold the topology proof."""
         self.solver = solver
         self.plan = plan
         self.size = plan.size
-        self.admission = admission
         self.sparse = self
         model, device = solver.model, solver.model.device
         self.group_count = plan.group_count
@@ -599,19 +597,6 @@ class ScalarBranchState:
             self._geometry_valid,
         )
 
-    def _validate_call(self, state, state_aug, dt):
-        solver = self.solver
-        if self.admission is not None and not self.admission(solver):
-            raise RuntimeError("Scalar branch configuration changed; reconstruct and recapture")
-        if solver.options.enable_joint_velocity_limits:
-            raise RuntimeError("Scalar branches exclude joint velocity limits; reconstruct and recapture")
-        if dt is None or not math.isfinite(dt) or dt <= 0:
-            raise ValueError("Scalar branches require a positive finite step duration")
-        for name in ("joint_q", "joint_qd", "body_q", "body_qd", "body_f"):
-            value = getattr(state, name)
-            if value.device != solver.model.device or not value.is_contiguous:
-                raise RuntimeError("Scalar branches require contiguous same-device state arrays")
-
     def begin(self, state_in, state_aug, stage3_qd, dt, *, state_out=None, continues=False):
         """Publish the input state of articulations whose cache is invalid.
 
@@ -620,7 +605,6 @@ class ScalarBranchState:
         and launches on every step, ``continues`` or not.
         """
         del stage3_qd, state_out, continues
-        self._validate_call(state_in, state_aug, dt)
         solver, model = self.solver, self.solver.model
         wp.launch(
             self.repair_kernel,
@@ -652,7 +636,6 @@ class ScalarBranchState:
 
     def predict(self, state_in, state_aug, control, stage3_qd, dt):
         """Form each leaf's force and refresh, solve and predict its coordinate, deciding its drive's saturation."""
-        self._validate_call(state_in, state_aug, dt)
         solver, model = self.solver, self.solver.model
         inputs = [
             self.size,
@@ -701,10 +684,6 @@ class ScalarBranchState:
 
     def finish(self, state_in, state_aug, state_out, dt):
         """Convert the solved velocity, integrate once and publish the next state."""
-        self._validate_call(state_in, state_aug, dt)
-        self._validate_call(state_out, state_aug, dt)
-        if not cached_state_binding.disjoint_states(state_in, state_out):
-            raise RuntimeError("Scalar branch integration requires non-overlapping generalized state banks")
         solver, model = self.solver, self.solver.model
         inputs = [
             self.size,

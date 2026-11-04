@@ -124,12 +124,6 @@ def decline(solver, *, sparse: bool | None = None) -> str | None:
     return None
 
 
-def admitted(solver) -> bool:
-    """Whether the held tree evaluates the solver's dynamics (:func:`decline`); its groups re-check it on every
-    call."""
-    return decline(solver) is None
-
-
 def _prescribed_articulations(forest):
     """Articulations whose response the solver prescribes (kinematic free bodies)."""
     return np.flatnonzero(forest.prescribed_articulation.numpy() != 0).astype(np.int32)
@@ -397,7 +391,7 @@ def forest_default(solver):
 
 def forest_families(solver):
     """The per-root family sizes of the forest (0 for a prescribed root), or ``None``."""
-    if not admitted(solver):
+    if decline(solver) is not None:
         return None
     if getattr(solver, "_scalar_branches", None) is not None:
         # Scalar branches own their size group outside any tree plan.
@@ -490,12 +484,9 @@ def _forest_group(solver) -> HeldGroup:
 
 
 class HeldTree:
-    """Evaluate every articulation's dynamics in held groups chosen from the topology (see the module docstring).
+    """Evaluate every articulation's dynamics in held groups chosen from the topology (see the module docstring)."""
 
-    ``admission`` (:func:`admitted` when installed) is re-checked by every group on every call.
-    """
-
-    def __init__(self, solver, *, admission=None):
+    def __init__(self, solver):
         self.solver = solver
         # One read of the kernel switches for every group this owner composes: the stage clocks, and the test pin
         # repair_classify=False (SolverFeatherPGS._route_pins), which keeps the one-pass repair over every block.
@@ -528,7 +519,6 @@ class HeldTree:
             complete = operator.kind == "sparse"
             group = TreeKineticState(
                 operator,
-                admission=admission,
                 chains=complete,
                 complete=complete,
                 response=operator.response,
@@ -548,7 +538,7 @@ class HeldTree:
             # art_to_world and watches the joint frames, and the coverage proof every
             # size's group map, so the scalar group needs no proof of its own: the
             # sparse-diagonal pair always leaves a tree group beside it.
-            self.scalar = ScalarBranchState(solver, scalar, admission=admission)
+            self.scalar = ScalarBranchState(solver, scalar)
             self.groups.append(self.scalar)
         # Every tree group compares input banks (fixed and free roots alike) unless the
         # solver prescales velocities; see TreeKineticState. Beside scalar branches, which
@@ -679,6 +669,6 @@ def install(solver) -> HeldTree:
     if reason is not None:
         raise ValueError(f"FeatherPGS cannot hold this model: {reason}")
     try:
-        return HeldTree(solver, admission=admitted)
+        return HeldTree(solver)
     except ValueError as error:
         raise ValueError(f"FeatherPGS cannot hold this model: {error}") from error
