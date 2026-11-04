@@ -26,6 +26,7 @@ from ....sim import JointType
 from .. import tree_scan as ts
 from ..device_preludes import DevicePrelude, memory_words, substitute
 from ..tree_scan import WALK_AHEAD, WALK_BOTH, WALK_TOUCH, WALK_UNROLL, WalkClass, indent_text
+from .kernels import Clock, clock_advance
 
 __all__ = [
     "FREE_BODY_WALK",
@@ -1719,6 +1720,8 @@ def walk_step_kernel(
     walk_now_link: wp.array2d[float],
     walk_now_com: wp.array[wp.vec3],
     articulation_origin: wp.array[wp.vec3],
+    clock: wp.array[Clock],
+    dt: float,
     # outputs
     walk_data: wp.array2d[float],
     walk_link: wp.array2d[float],
@@ -1728,8 +1731,12 @@ def walk_step_kernel(
     ``body_q`` holds, on the trees the refresh just factored (``mass_update_mask``; every other tree returns): the
     step's geometry the finish published (``walk_now``, ``walk_now_link``, ``walk_now_com``) becomes the factor's frames,
     with the articulation's origin they are relative to, and the group runs the refresh (:func:`walk_inward`, the lane
-    feed's batches), so the walk and ``L`` are one factor."""
+    feed's batches), so the walk and ``L`` are one factor. Its first thread advances the step's ``clock`` past this
+    step (``dt``): the kernel reads no clock, the step's repair and mask read it before, its finish and warm start
+    after (:class:`.factor.kernels.Clock`)."""
     tree, lane = wp.tid()
+    if tree == 0 and lane == 0:
+        clock_advance(clock, dt)
     art = arts[tree]
     if mass_update_mask[art] == 0:
         return

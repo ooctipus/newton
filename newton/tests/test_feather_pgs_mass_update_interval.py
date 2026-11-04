@@ -9,7 +9,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.factor.kernels import Clock, advance_clock
+from newton._src.solvers.feather_pgs.factor.kernels import Clock
 from newton._src.solvers.feather_pgs.tree_factor import TreeFactor
 from newton.solvers import SolverFeatherPGS
 
@@ -417,7 +417,12 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
             with self.subTest(changed=changed, step=step, requested=requested):
                 calls = []
                 clock = Clock()
-                clock.step, clock.dt, clock.interval = step - 1, 2.0 * DT if changed else DT, 2
+                clock.step, clock.dt, clock.interval, clock.cadence = (
+                    step,
+                    2.0 * DT if changed else DT,
+                    2,
+                    int(step % 2 == 0),
+                )
                 factor = SimpleNamespace(
                     model=SimpleNamespace(articulation_count=3, device=wp.get_device("cpu")),
                     clock=wp.array([clock], dtype=Clock, device="cpu"),
@@ -425,8 +430,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
                     mass_update_requested=wp.array(requested, dtype=int, device="cpu"),
                     mass_update_mask=wp.zeros(3, dtype=int, device="cpu"),
                 )
-                wp.launch(advance_clock, dim=1, inputs=[factor.clock, DT], device="cpu")
-                TreeFactor.refresh(factor, None)
+                TreeFactor.refresh(factor, None, DT)
                 self.assertEqual(calls, [factor])
                 np.testing.assert_array_equal(factor.mass_update_mask.numpy(), expected)
                 np.testing.assert_array_equal(factor.mass_update_requested.numpy(), [0, 0, 0])

@@ -50,11 +50,7 @@ def _set_clock(factor, refresh, ahead=0):
     """Set the factor's device clock so the step ``ahead`` steps on (0: a repair's, 1: a finish's next) refreshes
     the mass, or not, at an unchanged step duration (:class:`.factor.kernels.Clock`)."""
     clock = Clock()
-    clock.dt, clock.prev_dt, clock.interval = DT, DT, 2
-    if ahead:
-        clock.next_refresh = int(refresh)
-    else:
-        clock.refresh = int(refresh)
+    clock.step, clock.dt, clock.prev_dt, clock.interval, clock.cadence = 1 + ahead, DT, DT, 2, int(refresh)
     factor.clock.assign([clock])
 
 

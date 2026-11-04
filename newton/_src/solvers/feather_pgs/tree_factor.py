@@ -153,9 +153,9 @@ class TreeFactor:
         self._arrays = SolverArrays(self, model.device)
         self.mass_update_requested = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
         # The step's clock on the device (factor.kernels.Clock): the refresh cadence and the duration's change replay
-        # with the device's own step index in a captured graph.
+        # with the device's own step index in a captured graph. The first step refreshes.
         clock = Clock()
-        clock.step, clock.interval = -1, int(options.update_mass_matrix_interval)
+        clock.step, clock.interval, clock.cadence = 0, int(options.update_mass_matrix_interval), 1
         self.clock = wp.array([clock], dtype=Clock, device=model.device)
         self.last_step_dt = None
         # The held tree's cache of next-step dynamics.
@@ -535,7 +535,7 @@ class TreeFactor:
 
     def track_step_dt(self, dt: float) -> None:
         """Record the step duration. A change refreshes mass and repairs every cache on the device (the clock,
-        :func:`.factor.kernels.advance_clock`); here it only launches the held tree's next repair."""
+        :func:`.factor.kernels.clock_changed`); here it only launches the held tree's next repair."""
         if self.last_step_dt is not None and abs(self.last_step_dt - dt) > 1.0e-8:
             self.forget_repair_continuity()
         self.last_step_dt = dt
@@ -624,7 +624,8 @@ class TreeFactor:
     # ---------------------------------------------------------------------------------------------------------------
 
     def factor(self, state_in, control, state_out, dt: float, qd_work: wp.array, v_hat: wp.array, v_out: wp.array):
-        """The clock's step, FK/ID, the drives' K and u0, the mass-update mask and the factor refresh.
+        """FK/ID, the drives' K and u0, the mass-update mask, the factor refresh and the walk's, which advances the
+        step's clock.
 
         Returns:
             ``(qd, ready)``: the predictor's velocity (``qd_work`` prescaled when velocities are limited) and the event
@@ -632,11 +633,10 @@ class TreeFactor:
         """
         model = self.model
         with wp.ScopedTimer("S1_FK_ID_CRBA", print=False, use_nvtx=self.nvtx, synchronize=False):
-            wp.launch(advance_clock, dim=1, inputs=[self.clock, dt], device=model.device)
             drive_rows_ready = self.prepare_drives(state_in, control, dt, v_hat, v_out)
             qd = self.fk_id(state_in, state_out, qd_work)
-            self.refresh(drive_rows_ready)
-            self.walk_step(state_in)
+            self.refresh(drive_rows_ready, dt)
+            self.walk_step(state_in, dt)
         # joint_tau holds only u0: the predictor adds the current external, control and bias contributions after
         # waiting for the drives.
         return qd, drive_rows_ready if model.articulation_count else None
@@ -721,7 +721,7 @@ class TreeFactor:
         """What a step's drives write (:func:`.factor.fields.hold_drive_row`); ``v_hat`` and ``v_out`` are last step's."""
         return field_group.bind(DriveRows, factor=self, v_hat=v_hat, v_out=v_out)
 
-    def refresh(self, drive_rows_ready: wp.Event | None) -> None:
+    def refresh(self, drive_rows_ready: wp.Event | None, dt: float) -> None:
         """The mass-update mask, the clock's cadence with the requests (which it consumes), then the held tree's
         factor refresh."""
         model = self.model
@@ -731,7 +731,7 @@ class TreeFactor:
         wp.launch(
             build_mass_update_mask,
             dim=model.articulation_count,
-            inputs=[self.clock],
+            inputs=[self.clock, dt],
             outputs=[self.mass_update_requested, self.mass_update_mask],
             device=model.device,
         )
@@ -1001,13 +1001,15 @@ class TreeFactor:
         """The walk's view (:class:`.factor.walk.WalkTrees`) the one writer, the leave and the audit read."""
         return self.walk_trees
 
-    def walk_step(self, state) -> None:
+    def walk_step(self, state, dt: float) -> None:
         """The walk's refresh (:func:`.factor.walk.walk_step_kernel`, a lane group per held tree), at the poses the held tree
         published in ``state.body_q``, on the trees the refresh just factored (``mass_update_mask``, which the device
         may set on any step): the step's geometry the finish published (:attr:`WalkTrees.now`) becomes the factor's
         frames and the group runs the inward pass. A free rigid body is a one-body tree: its walk is its six
-        coordinates' factor. A tree that does not refresh takes nothing here."""
+        coordinates' factor. A tree that does not refresh takes nothing here. Its first thread advances the step's clock
+        past this step (``dt``); a model where no tree walks advances it in a launch of its own."""
         if self.walk_arts is None:
+            wp.launch(advance_clock, dim=1, inputs=[self.clock, dt], device=self.model.device)
             return
         model = self.model
         lanes = self.walk_shape.lanes
@@ -1034,6 +1036,8 @@ class TreeFactor:
                 self.walk_now_link,
                 self.joint_com_offset,
                 self.articulation_origin,
+                self.clock,
+                dt,
             ],
             outputs=[self.walk_data, self.walk_link, self.walk_origin],
             block_dim=self.walk_shape.block,

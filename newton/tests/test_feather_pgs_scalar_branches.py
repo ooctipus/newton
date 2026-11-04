@@ -435,7 +435,7 @@ class _Pair:
         head.prepare_drives(head_in, self.controls["head"], DT, self.head.v_hat, self.head.v_out)
         held.refresh(head)
         # The held predictor solves by the walk (Z4.2): the walk's refresh, as the step's factor stage runs it.
-        head.walk_step(head_in)
+        head.walk_step(head_in, DT)
         held.predict(head_in, head, self.controls["head"], head_in.joint_qd, DT)
         self.state.predict(mine_in, self.mine.factor, self.controls["mine"], mine_in.joint_qd, DT)
         self.check_inverse_mass(test, mine_in.joint_q.numpy(), tag)
@@ -547,7 +547,7 @@ def check_owner_launches(test, device):
                     owner.scalar.launch_other_drives(state, solver.factor, control, DT)
                     solver.factor.mass_update_mask.fill_(1)
                     owner.refresh(solver.factor)
-                    solver.factor.walk_step(state)
+                    solver.factor.walk_step(state, DT)
                     owner.predict(state, solver.factor, control, state.joint_qd, DT)
                     solver.v_out.assign(solver.v_hat)
                     _set_clock(solver.factor, refresh, ahead=1)

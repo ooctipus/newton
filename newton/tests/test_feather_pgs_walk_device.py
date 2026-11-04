@@ -716,7 +716,7 @@ def refresh_error(device, bodies: int, rng) -> float:
     walk = factor.walk(q, 0)
     n = walk.s.shape[0]
     pivots = walk.own_pivots + factor.armature[:n]
-    factor.walk_step(state)
+    factor.walk_step(state, 1.0 / 240.0)
     d = unpack_walk_records(factor.walk_data.numpy(), n).astype(np.float64)
     return max(
         np.abs(d[:, 0:6] - walk.s).max(),

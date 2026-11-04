@@ -51,7 +51,7 @@ import warp as wp
 from ...sim import BodyFlags, JointType
 from . import cached_state_binding
 from .factor.fields import DriveRows, hold_drive_row
-from .factor.kernels import Clock
+from .factor.kernels import Clock, clock_changed
 from .spatial_laws import (
     axis_transform,
     coordinate_force,
@@ -184,6 +184,7 @@ def repair_scalar_branches(
     articulation_dof_start: wp.array[int],
     current_valid: wp.array[int],
     clock: wp.array[Clock],
+    dt: float,
     joint_child: wp.array[int],
     joint_q_start: wp.array[int],
     joint_X_p: wp.array[wp.transform],
@@ -197,7 +198,7 @@ def repair_scalar_branches(
     articulation_origin: wp.array[wp.vec3],
 ):
     """Publish the input state of articulations with an invalid cache, one warp per articulation; a changed step
-    duration (the clock's ``changed``) invalidates every cache.
+    duration ``dt`` (:func:`.factor.kernels.clock_changed`) invalidates every cache.
 
     Validity is read only: ``finish`` publishes the next state and marks it valid.
     """
@@ -205,7 +206,7 @@ def repair_scalar_branches(
     group = tid // _REPAIR_LANES
     lane = tid - group * _REPAIR_LANES
     art = group_to_art[group]
-    if current_valid[art] != 0 and clock[0].changed == 0:
+    if current_valid[art] != 0 and clock_changed(clock[0], dt) == 0:
         return
     root_joint = articulation_start[art]
     root = joint_child[root_joint]
@@ -709,6 +710,7 @@ class ScalarBranchState:
                 solver.forest.articulation_dof_start,
                 solver.factor.fk_id_cache_valid,
                 solver.factor.clock,
+                dt,
                 model.joint_child,
                 model.joint_q_start,
                 model.joint_X_p,

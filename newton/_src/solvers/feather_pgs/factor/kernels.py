@@ -556,38 +556,59 @@ def _light_update_qdd_from_velocity(
 
 @wp.struct
 class Clock:
-    """The step's clock on the device, so a captured graph's replays keep their own cadence: the step's index (from
-    0), its duration and the last step's (0 before the first step), the mass refresh's interval, and what the step's
-    first kernel derives from them once for every reader: whether the duration changed, and whether this step and the
-    next refresh every mass matrix."""
+    """The step's clock on the device, so a captured graph's replays keep their own cadence: the step's index, the
+    duration of the step it last advanced and of the one before (0 before any), the mass refresh's interval, and
+    whether the indexed step refreshes every mass matrix on the cadence.
+
+    The walk's refresh advances it (:func:`clock_advance`), after the step's repair and mass-update mask and before
+    its finish and warm start, in a kernel that reads it nowhere else: the readers before the refresh see the step's
+    own index with the last step's duration (:func:`clock_refresh`, :func:`clock_changed`, with the step's duration
+    they hold); the readers after it see the next step's index with this step's duration (the finish's next-step
+    geometry: ``cadence``; the warm start's ratio: :func:`clock_dt_ratio`)."""
 
     step: int
     dt: float
     prev_dt: float
     interval: int
-    changed: int
-    refresh: int
-    next_refresh: int
+    cadence: int
 
 
-@wp.kernel
-def advance_clock(clock: wp.array[Clock], dt: float):
-    """The step's first kernel: the next step index and the step's duration, the last one's kept; a changed duration
-    refreshes the mass and repairs every cache this step."""
+@wp.func
+def clock_advance(clock: wp.array[Clock], dt: float):
+    """Advance the clock past a step of duration ``dt``: the next index and its cadence, this step's duration kept."""
     c = clock[0]
     c.step = c.step + 1
     c.prev_dt = c.dt
     c.dt = dt
-    c.changed = int(c.prev_dt > 0.0 and wp.abs(c.dt - c.prev_dt) > 1.0e-8)
-    c.refresh = int(c.step % c.interval == 0 or c.changed != 0)
-    c.next_refresh = int((c.step + 1) % c.interval == 0)
+    c.cadence = int(c.step % c.interval == 0)
     clock[0] = c
+
+
+@wp.kernel
+def advance_clock(clock: wp.array[Clock], dt: float):
+    """The clock's own launch, where no tree walks (a model of stars alone, :mod:`.scalar_branches`): the walk's
+    refresh advances it everywhere else."""
+    clock_advance(clock, dt)
+
+
+@wp.func
+def clock_changed(c: Clock, dt: float) -> int:
+    """Whether a step of duration ``dt`` differs from the last step's (read before the advance): the mass refreshes and
+    every cache repairs."""
+    return int(c.dt > 0.0 and wp.abs(dt - c.dt) > 1.0e-8)
+
+
+@wp.func
+def clock_refresh(c: Clock, dt: float) -> int:
+    """Whether a step of duration ``dt`` refreshes every mass matrix (read before the advance): its cadence, or its
+    changed duration."""
+    return int(c.cadence != 0 or clock_changed(c, dt) != 0)
 
 
 @wp.func
 def clock_dt_ratio(c: Clock) -> float:
-    """The step's duration over the last step's (1 on the first step): a carried impulse, proportional to the step for
-    a quasi-static load, is rescaled by it."""
+    """The step's duration over the last step's (1 on the first step), read after the advance: a carried impulse,
+    proportional to the step for a quasi-static load, is rescaled by it."""
     ratio = 1.0
     if c.prev_dt > 0.0:
         ratio = c.dt / c.prev_dt
@@ -597,6 +618,7 @@ def clock_dt_ratio(c: Clock) -> float:
 @wp.kernel
 def build_mass_update_mask(
     clock: wp.array[Clock],
+    dt: float,
     # in/out
     mass_update_requested: wp.array[int],
     # outputs
@@ -604,7 +626,7 @@ def build_mass_update_mask(
 ):
     """Consume the requests into a step's mask, with the clock's refresh."""
     tid = wp.tid()
-    flag = clock[0].refresh
+    flag = clock_refresh(clock[0], dt)
     if mass_update_requested[tid] != 0:
         flag = 1
     mass_update_mask[tid] = flag
