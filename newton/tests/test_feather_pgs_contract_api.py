@@ -327,5 +327,169 @@ class TestFeatherPGSTeardown(unittest.TestCase):
                 SolverFeatherPGS.__del__(SimpleNamespace(model=SimpleNamespace(device=sentinel.device)))
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# reset
+#
+# ``reset(state, world_mask)`` restarts the masked worlds: each steps from ``state`` as a solver built fresh would, with
+# no impulse, friction anchor or cached kinematics carried from before; every other world steps as if no reset
+# happened. A model change restarts every world's impulse history (the patch law's anchors are geometry and stay) and
+# keeps the capacity status.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _resting_boxes(device, worlds=2):
+    """Boxes resting on the ground, one per world, whose warm-started contacts carry impulses step to step."""
+    template = newton.ModelBuilder()
+    box = template.add_body(xform=wp.transform((0.0, 0.0, 0.0995), wp.quat_identity()))
+    template.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
+    template.add_ground_plane()
+    builder = newton.ModelBuilder()
+    builder.replicate(template, worlds)
+    return builder.finalize(device=device)
+
+
+class _Run:
+    """A solver with its own deterministic, matching collision pipeline, stepping its own state pair."""
+
+    def __init__(self, model, state, **options):
+        self.model = model
+        self.solver = SolverFeatherPGS(model, pgs_warmstart=True, pgs_iterations=16, **options)
+        self.pipeline = newton.CollisionPipeline(model, contact_matching="latest", deterministic=True)
+        self.contacts = self.pipeline.contacts()
+        self.state, self.out = model.state(), model.state()
+        self.state.assign(state)
+
+    def step(self):
+        self.pipeline.collide(self.state, self.contacts)
+        self.state.clear_forces()
+        self.solver.step(self.state, self.out, self.model.control(), self.contacts, DT)
+        self.state, self.out = self.out, self.state
+        return {name: getattr(self.state, name).numpy().copy() for name in STATE_FIELDS}
+
+
+def _world(values: dict, model, world: int) -> dict:
+    """The coordinates and bodies of ``world`` (the replicated worlds hold equal, contiguous blocks)."""
+    worlds = model.world_count
+    return {name: np.split(array, worlds)[world] for name, array in values.items()}
+
+
+def _spun(model, state, world: int):
+    """``state`` with ``world``'s resting box spinning about the normal: a state no step of the run produced, still in
+    contact, so carried impulses would change its step."""
+    spun = model.state()
+    spun.assign(state)
+    joint_qd = spun.joint_qd.numpy()
+    np.split(joint_qd, model.world_count)[world][5] = 3.0
+    spun.joint_qd.assign(joint_qd)
+    newton.eval_fk(model, spun.joint_q, spun.joint_qd, spun)
+    return spun
+
+
+def test_reset_restarts_only_the_masked_worlds(test, device):
+    """Step a reset world as a fresh solver does and the other world as a solver that never reset (bitwise on the
+    CPU; on CUDA within the bound between solver instances)."""
+    model = _resting_boxes(device)
+    start = model.state()
+    newton.eval_fk(model, start.joint_q, start.joint_qd, start)
+    run, twin = _Run(model, start), _Run(model, start)
+    for _ in range(8):
+        run.step()
+        twin.step()
+    test.assertGreater(int(run.contacts.rigid_contact_count.numpy()[0]), 0)
+    restart = _spun(model, run.state, world=0)
+    run.state.assign(restart)
+    twin.state.assign(restart)
+    run.solver.reset(run.state, wp.array((True, False), dtype=wp.bool, device=model.device))
+    fresh = _Run(model, restart)
+    for step in range(3):
+        stepped, continued, restarted = run.step(), twin.step(), fresh.step()
+        if step == 0:
+            # The history the reset drops changes the step: the twin's world 0, which kept it, steps otherwise.
+            test.assertFalse(
+                np.array_equal(_world(continued, model, 0)["joint_qd"], _world(restarted, model, 0)["joint_qd"])
+            )
+        for world, expected in ((0, restarted), (1, continued)):
+            actual, reference = _world(stepped, model, world), _world(expected, model, world)
+            for name in STATE_FIELDS:
+                message = f"step {step} world {world} {name}"
+                if wp.get_device(device).is_cuda:
+                    np.testing.assert_allclose(actual[name], reference[name], rtol=0.0, atol=CUDA_INSTANCE_ATOL)
+                else:
+                    np.testing.assert_array_equal(actual[name], reference[name], err_msg=message)
+
+
+def test_reset_is_capturable(test, device):
+    """Replay a captured reset and step as the eager calls run them."""
+    if not wp.get_device(device).is_cuda:
+        test.skipTest("CUDA graphs need CUDA")
+    model = _resting_boxes(device)
+    start = model.state()
+    newton.eval_fk(model, start.joint_q, start.joint_qd, start)
+    eager, captured = _Run(model, start), _Run(model, start)
+    mask = wp.array((True, False), dtype=wp.bool, device=model.device)
+    for run in (eager, captured):
+        for _ in range(4):
+            run.step()
+    eager.solver.reset(eager.state, mask)
+    expected = eager.step()
+    captured.solver.reset(captured.state, mask)
+    wp.synchronize_device(model.device)
+    with wp.ScopedCapture(device=model.device) as capture:
+        captured.solver.reset(captured.state, mask)
+        captured.pipeline.collide(captured.state, captured.contacts)
+        captured.solver.step(captured.state, captured.out, model.control(), captured.contacts, DT)
+    wp.capture_launch(capture.graph)
+    for name in STATE_FIELDS:
+        np.testing.assert_allclose(
+            getattr(captured.out, name).numpy(), expected[name], rtol=0.0, atol=CUDA_INSTANCE_ATOL, err_msg=name
+        )
+
+
+class TestFeatherPGSReset(unittest.TestCase):
+    def test_reset_refuses_a_mask_of_another_world_count(self):
+        """Refuse a mask whose length is not the world count, whatever the solver carries."""
+        model = _resting_boxes("cpu")
+        for warm in (False, True):
+            with self.subTest(warm_start=warm):
+                solver = SolverFeatherPGS(model, pgs_warmstart=warm)
+                with self.assertRaisesRegex(ValueError, "expected 2"):
+                    solver.reset(model.state(), wp.ones(3, dtype=wp.bool, device="cpu"))
+                solver.reset(model.state(), wp.array((True, False), dtype=wp.bool, device="cpu"))
+
+    def test_model_change_restarts_every_world_and_keeps_the_status(self):
+        """Step every world as a fresh solver does after a model change, and keep a capacity failure latched."""
+        model = _resting_boxes("cpu")
+        start = model.state()
+        newton.eval_fk(model, start.joint_q, start.joint_qd, start)
+        for flags in (
+            newton.ModelFlags.BODY_INERTIAL_PROPERTIES,
+            newton.ModelFlags.JOINT_DOF_PROPERTIES,
+            newton.ModelFlags.SHAPE_PROPERTIES,
+        ):
+            with self.subTest(flags=flags):
+                run = _Run(model, start, friction_anchor_beta=0.0)
+                for _ in range(8):
+                    run.step()
+                run.solver.notify_model_changed(flags)
+                fresh = _Run(model, run.state, friction_anchor_beta=0.0)
+                stepped, expected = run.step(), fresh.step()
+                for name in STATE_FIELDS:
+                    np.testing.assert_array_equal(stepped[name], expected[name], err_msg=name)
+        # One matrix-free row a world cannot hold a box's contacts: the failure stays latched through a model change.
+        solver = SolverFeatherPGS(model, mf_max_constraints=1)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        pipeline.collide(start, contacts)
+        solver.step(start, model.state(), model.control(), contacts, DT)
+        with self.assertRaisesRegex(RuntimeError, "capacity"):
+            solver.check_constraint_capacity()
+        solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
+        with self.assertRaisesRegex(RuntimeError, "capacity"):
+            solver.check_constraint_capacity()
+
+
+for _test in (test_reset_restarts_only_the_masked_worlds, test_reset_is_capturable):
+    add_function_test(TestFeatherPGSReset, _test.__name__, _test, devices=devices)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

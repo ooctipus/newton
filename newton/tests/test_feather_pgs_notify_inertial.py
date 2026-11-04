@@ -15,7 +15,7 @@ INITIAL_JOINT_Q = 0.3
 NEW_COM = (0.15, 0.0, 0.05)
 
 
-def _build_model(device, com=None):
+def _build_model(device, com=None, mass_scale=1.0):
     """Single-link pendulum on a Y-axis revolute joint, box COM at the origin.
 
     With the COM at the body origin (the pivot) gravity exerts no torque, so
@@ -36,10 +36,21 @@ def _build_model(device, com=None):
     builder.joint_q[0] = INITIAL_JOINT_Q
     model = builder.finalize(device=device)
     if com is not None:
-        body_com = model.body_com.numpy()
-        body_com[0] = com
-        model.body_com.assign(body_com)
+        _move_mass(model, com, mass_scale)
     return model
+
+
+def _move_mass(model, com, mass_scale):
+    """Move the link's centre of mass to ``com`` and scale its mass (inertia as given), as a randomization does."""
+    body_com = model.body_com.numpy()
+    body_com[0] = com
+    model.body_com.assign(body_com)
+    body_mass = model.body_mass.numpy()
+    body_mass[0] *= mass_scale
+    model.body_mass.assign(body_mass)
+    body_inv_mass = model.body_inv_mass.numpy()
+    body_inv_mass[0] = 1.0 / body_mass[0]
+    model.body_inv_mass.assign(body_inv_mass)
 
 
 def _run_trajectory(model, solver, num_steps):
@@ -100,35 +111,8 @@ class TestFeatherPGSNotifyInertial(unittest.TestCase):
         np.testing.assert_allclose(outputs[False]["joint_q"], outputs[True]["joint_q"], rtol=0.0, atol=1.0e-6)
         np.testing.assert_allclose(outputs[False]["joint_qd"], outputs[True]["joint_qd"], rtol=0.0, atol=1.0e-6)
 
-    def test_notify_refreshes_baked_com_and_inertia_buffers(self):
-        """Verify BODY_INERTIAL_PROPERTIES re-derives body_X_com and requests a mass update.
-
-        The COM frames are baked from the model at construction time; writing
-        model.body_com alone must not change them until the solver is notified.
-        Mass and inertia are read live by the inertia records.
-        """
-        device = wp.get_device()
-        model = _build_model(device)
-        solver = SolverFeatherPGS(model)
-        stale_X_com = solver.factor.body_X_com.numpy().copy()
-
-        body_com = model.body_com.numpy()
-        body_com[0] = NEW_COM
-        model.body_com.assign(body_com)
-        body_mass = model.body_mass.numpy()
-        body_mass[0] *= 2.0
-        model.body_mass.assign(body_mass)
-
-        np.testing.assert_array_equal(solver.factor.body_X_com.numpy(), stale_X_com)
-        solver.notify_model_changed(ModelFlags.BODY_INERTIAL_PROPERTIES)
-
-        np.testing.assert_allclose(
-            solver.factor.body_X_com.numpy()[0][:3], np.asarray(NEW_COM, dtype=np.float32), rtol=0.0, atol=0.0
-        )
-        self.assertEqual(solver.factor.mass_update_requested.numpy()[0], 1)
-
     def test_com_change_with_notify_matches_freshly_built_solver(self):
-        """Verify a mid-run COM change plus notify reproduces baked-COM dynamics.
+        """Verify a mid-run COM and mass change plus notify reproduces baked dynamics.
 
         The trajectory after the change must match a solver constructed with
         the new COM already in the model and stepped from the same state; a
@@ -140,7 +124,7 @@ class TestFeatherPGSNotifyInertial(unittest.TestCase):
 
         # Reference: solver built with the new COM, run from the pre-change
         # state (which is static: zero torque while the COM sits at the pivot).
-        reference_model = _build_model(device, com=NEW_COM)
+        reference_model = _build_model(device, com=NEW_COM, mass_scale=2.0)
         reference_solver = SolverFeatherPGS(reference_model)
         reference = _run_trajectory(reference_model, reference_solver, post_steps)
 
@@ -149,9 +133,7 @@ class TestFeatherPGSNotifyInertial(unittest.TestCase):
             model = _build_model(device)
             solver = SolverFeatherPGS(model)
             _run_trajectory(model, solver, pre_steps)
-            body_com = model.body_com.numpy()
-            body_com[0] = NEW_COM
-            model.body_com.assign(body_com)
+            _move_mass(model, NEW_COM, 2.0)
             if notify:
                 solver.notify_model_changed(ModelFlags.BODY_INERTIAL_PROPERTIES)
             histories[notify] = _run_trajectory(model, solver, post_steps)
