@@ -1,19 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The ``diagnostics`` option of SolverFeatherPGS: what it reads out, never what it computes.
+"""The public API of SolverFeatherPGS: diagnostics, construction, capacity and teardown.
 
-Every check reads the public API: the constructor, :meth:`~newton.solvers.SolverFeatherPGS.step`, the options record
-of :meth:`~newton.solvers.SolverFeatherPGS.get_path_selection` and the readouts
-(:meth:`~newton.solvers.SolverFeatherPGS.read_audit`,
-:meth:`~newton.solvers.SolverFeatherPGS.constraint_row_watermarks`). The stage-3 snapshots are read by the names
-external NaN dumpers use.
+A contract module: :mod:`newton.tests.test_feather_pgs_contract_lint` keeps it on the public API.
 """
+
+from __future__ import annotations
 
 import contextlib
 import dataclasses
 import io
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch, sentinel
 
 import numpy as np
 import warp as wp
@@ -22,8 +22,19 @@ import newton
 from newton.solvers import SolverFeatherPGS
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
-Diagnostics = SolverFeatherPGS.Diagnostics
+# ---------------------------------------------------------------------------------------------------------------------
+# diagnostics
+#
+# The ``diagnostics`` option of SolverFeatherPGS: what it reads out, never what it computes.
+#
+# Every check reads the public API: the constructor, :meth:`~newton.solvers.SolverFeatherPGS.step`, the options record
+# of :meth:`~newton.solvers.SolverFeatherPGS.get_path_selection` and the readouts
+# (:meth:`~newton.solvers.SolverFeatherPGS.read_audit`,
+# :meth:`~newton.solvers.SolverFeatherPGS.constraint_row_watermarks`). The stage-3 snapshots are read by the names
+# external NaN dumpers use.
+# ---------------------------------------------------------------------------------------------------------------------
 
+Diagnostics = SolverFeatherPGS.Diagnostics
 STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
 SNAPSHOTS = ("_debug_stage3_qd_work", "_debug_stage3_joint_qdd", "_debug_stage3_v_hat")
 DT = 1.0 / 240.0
@@ -186,6 +197,134 @@ for _test in (
     test_sync_timings_print_their_steps,
 ):
     add_function_test(TestFeatherPGSDiagnostics, _test.__name__, _test, devices=devices)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# hetero guard
+#
+# Construction of SolverFeatherPGS on heterogeneous multi-world models.
+#
+# Heterogeneous multi-world models (worlds whose per-world DOF counts differ)
+# construct on the matrix-free and split paths, as homogeneous models do.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _make_chain_world(n_links: int) -> newton.ModelBuilder:
+    """A fixed-base serial chain of ``n_links`` revolute links (n_links DOFs)."""
+    builder = newton.ModelBuilder()
+    joints = []
+    prev = -1
+    for i in range(n_links):
+        link = builder.add_link()
+        builder.add_shape_box(link, hx=0.15, hy=0.03, hz=0.03)
+        if prev == -1:
+            parent_xform = wp.transform(p=wp.vec3(0.0, 0.0, 1.0), q=wp.quat_identity())
+        else:
+            parent_xform = wp.transform(p=wp.vec3(0.15, 0.0, 0.0), q=wp.quat_identity())
+        joints.append(
+            builder.add_joint_revolute(
+                parent=prev,
+                child=link,
+                axis=wp.vec3(0.0, 1.0, 0.0),
+                parent_xform=parent_xform,
+                child_xform=wp.transform(p=wp.vec3(-0.15, 0.0, 0.0), q=wp.quat_identity()),
+                label=f"chain_joint_{i}",
+            )
+        )
+        prev = link
+    builder.add_articulation(joints, label="chain")
+    return builder
+
+
+def _build_model(world_link_counts: list[int], device: str) -> newton.Model:
+    """One chain world per entry in ``world_link_counts``, plus a ground plane."""
+    scene = newton.ModelBuilder()
+    for n_links in world_link_counts:
+        scene.add_world(_make_chain_world(n_links))
+    scene.add_ground_plane()
+    return scene.finalize(device=device)
+
+
+class TestFeatherPGSHeteroGuard(unittest.TestCase):
+    """Heterogeneous and homogeneous models construct."""
+
+    @classmethod
+    def setUpClass(cls):
+        if wp.get_cuda_device_count() == 0:
+            raise unittest.SkipTest("SolverFeatherPGS construction tests require cuda:0")
+        cls.device = "cuda:0"
+        # Worlds alternate a 1-link pendulum and a 3-link chain: per-world DOF
+        # counts [1, 3, 1, 3] -> heterogeneous.
+        cls.hetero_model = _build_model([1, 3, 1, 3], cls.device)
+        # All 3-link chains: per-world DOF counts uniform -> homogeneous.
+        cls.homogeneous_model = _build_model([3, 3, 3, 3], cls.device)
+
+    def test_hetero_constructs(self):
+        solver = SolverFeatherPGS(self.hetero_model)
+        self.assertEqual(solver.get_path_selection()["routes"]["sweep"]["route"], "matrix_free_gs")
+
+    def test_homogeneous_constructs(self):
+        solver = SolverFeatherPGS(self.homogeneous_model)
+        self.assertEqual(solver.get_path_selection()["routes"]["sweep"]["route"], "matrix_free_gs")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# safety
+#
+# Verify physical invariants needed by persistent FeatherPGS contacts.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+class TestFeatherPGSCapacityStatus(unittest.TestCase):
+    def test_capacity_failure_is_observable_without_watermarks(self):
+        """Expose dropped contacts even when optional detailed telemetry is off."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        model = builder.finalize(device="cpu")
+        solver = SolverFeatherPGS(model, mf_max_constraints=1)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        state_in, state_out = model.state(), model.state()
+        pipeline.collide(state_in, contacts)
+        solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
+        with self.assertRaisesRegex(RuntimeError, "capacity"):
+            solver.check_constraint_capacity()
+        self.assertTrue(solver.placement.constraint_overflow.numpy()[0])
+        solver.reset(state_out)
+        solver.check_constraint_capacity()
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# teardown
+#
+# Keep solver teardown independent of cyclically finalized stream objects.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+class TestFeatherPGSTeardown(unittest.TestCase):
+    def test_drain_context_without_dereferencing_finalized_streams(self):
+        """Drain queued work without trusting a stream's surviving Python wrapper."""
+        owner = SimpleNamespace(
+            model=SimpleNamespace(device=sentinel.device),
+            sweep=SimpleNamespace(local_pair_stream=sentinel.finalized_stream),
+        )
+        with (
+            patch.object(wp, "synchronize_device") as drain,
+            patch.object(wp, "synchronize_stream", side_effect=AssertionError("finalized stream handle")),
+        ):
+            SolverFeatherPGS.__del__(owner)
+        drain.assert_called_once_with(sentinel.device)
+
+    def test_partial_construction_and_interpreter_shutdown(self):
+        """Allow missing construction state and already unavailable CUDA runtime."""
+        with patch.object(wp, "synchronize_device") as drain:
+            SolverFeatherPGS.__del__(SimpleNamespace())
+        drain.assert_not_called()
+        for error in (AttributeError, RuntimeError, TypeError):
+            with self.subTest(error=error), patch.object(wp, "synchronize_device", side_effect=error):
+                SolverFeatherPGS.__del__(SimpleNamespace(model=SimpleNamespace(device=sentinel.device)))
 
 
 if __name__ == "__main__":

@@ -21,9 +21,8 @@ from newton._src.solvers.feather_pgs import resolved_worlds as rw
 from newton._src.solvers.feather_pgs import row_slots
 from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import contact_input, row_lines
+from newton.tests.feather_pgs_law_harness import contact_input, plain_laws, row_lines
 from newton.tests.feather_pgs_patch_parity import assert_history_close
-from newton.tests.feather_pgs_scenes import plain_laws
 from newton.tests.test_feather_pgs_friction_patches import _patch_fixture
 from newton.tests.test_feather_pgs_mixed_tree_free_body import DT, _add_quadruped, _build
 

@@ -4,7 +4,7 @@
 """Predictor/integrator agreement for a spinning, translating free base.
 
 ``jcalc_integrate`` adds the ``omega x v`` transport term to the free root's
-linear coordinate (see :mod:`newton.tests.test_feather_pgs_free_base_momentum`
+linear coordinate (see :mod:`newton.tests.test_feather_pgs_contract_bodies`
 for why that term must exist).  Every other place that converts between the
 root's velocity coordinate and its acceleration must use the same convention:
 

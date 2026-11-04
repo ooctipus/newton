@@ -10,9 +10,8 @@ reference trajectory, whichever kernels serve it. A change may rewrite or merge
 kernels freely as long as the physics holds.
 
 Routes
-    A route is a set of constructor options, test-only axis pins
-    (``SolverFeatherPGS._route_pins``) and import-time switches, patched for
-    the whole run. Every run reads
+    A route is a set of constructor options and test-only axis pins
+    (``SolverFeatherPGS._route_pins``), set for the whole run. Every run reads
     ``get_path_selection()["routes"]`` before its first step and asserts the
     record the route expects, so a test cannot silently run another route.
     Owners that claim worlds at run time (sparse factors, the parallel tiers,
@@ -124,7 +123,6 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import importlib
 import math
 import os
 import time
@@ -135,7 +133,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_references as refs
 from newton.tests import feather_pgs_scenes as scenes
@@ -161,9 +158,6 @@ class Route:
     """Constructor options that select the route."""
     pins: dict = dataclasses.field(default_factory=dict)
     """Axis values the route fixes where the rules would choose others (``SolverFeatherPGS._route_pins``)."""
-    module: dict = dataclasses.field(default_factory=dict)
-    """Attributes patched for the whole run: the solver module's import-time switches, or ``"module.attribute"`` of
-    another FeatherPGS module."""
     expect: dict = dataclasses.field(default_factory=dict)
     """Route-record values the run must report: ``"key.path": value`` into ``get_path_selection()["routes"]``."""
 
@@ -195,17 +189,13 @@ def route_value(routes: dict, path: str):
 
 @contextlib.contextmanager
 def route_context(route: Route):
-    """Set the route's pins and module switches, clearing every solver variable of the environment."""
+    """Set the route's pins, clearing every solver variable of the environment."""
     names = [name for name in os.environ if name.startswith(("FEATHER_PGS_", "IL_NEWTON_FPGS_"))]
     with contextlib.ExitStack() as stack:
         stack.enter_context(mock.patch.dict(os.environ))
         for name in names:
             del os.environ[name]
         stack.enter_context(mock.patch.object(SolverFeatherPGS, "_route_pins", dict(route.pins)))
-        for name, value in route.module.items():
-            owner, _, attribute = name.rpartition(".")
-            target = importlib.import_module(f"newton._src.solvers.feather_pgs.{owner}") if owner else solver_module
-            stack.enter_context(mock.patch.object(target, attribute, value))
         yield
 
 
@@ -1537,18 +1527,14 @@ REFERENCE_CPU = Route(
 CPU = Route("cpu", "cpu", options=_MF, expect={"sweep.route": "matrix_free_gs"})
 
 
-def _unsupported(solver) -> bool:
-    return False
-
-
 # The sparse diagonal's one writer walks the rows of a dense articulation other than six coordinates (franka-cabinet's
 # nine); on the keyboard the compact boundary would own them, so these routes withhold its admission.
-_SPARSE_DIAGONAL_ROWS = {"compact_contact.supported": _unsupported}
+_SPARSE_DIAGONAL_ROWS = {"compact_contact": False}
 SPARSE_DIAGONAL = Route(
     "sparse_diagonal_scalar",
     "cuda",
     options=_MF,
-    module=_SPARSE_DIAGONAL_ROWS,
+    pins=_SPARSE_DIAGONAL_ROWS,
     expect={
         "sweep.route": "sparse_diagonal",
         "contact_rows.producer": "walk",
@@ -1560,8 +1546,7 @@ SPARSE_DIAGONAL_TREE = Route(
     "cuda",
     # The franka-cabinet route: sparse-diagonal rows with the diagonal-mass group in a held tree.
     options=_MF,
-    pins={"star": "held"},
-    module=_SPARSE_DIAGONAL_ROWS,
+    pins={"star": "held", **_SPARSE_DIAGONAL_ROWS},
     expect={
         "sweep.route": "sparse_diagonal",
         "contact_rows.producer": "walk",

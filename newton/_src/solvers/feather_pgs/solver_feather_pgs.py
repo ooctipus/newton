@@ -184,6 +184,7 @@ class SolverFeatherPGS(SolverBase):
     #   row_support False: sparse rows on explicit indices.     placement "general": case K6 (route_table.RouteTable).
     #   tiers: the Jacobi tiers' row bound, on any class whose response they form (0: no tiers).
     #   tier_sweeps: every Jacobi tier's sweep budget, in place of the equal-accuracy rule.
+    #   compact_contact False: no compact contact boundary (the sparse diagonal's one writer writes the rows).
     _route_pins: ClassVar[dict[str, object]] = {}
 
     @classmethod
@@ -548,7 +549,9 @@ class SolverFeatherPGS(SolverBase):
         from .compact_contact import supported  # noqa: PLC0415
 
         declined = (
-            None
+            "A test pin withholds the compact contact boundary."
+            if self._route_pins.get("compact_contact") is False
+            else None
             if supported(self)
             else "Declined: requires the six-coordinate sparse-diagonal triple or unit contract and no row checks."
         )

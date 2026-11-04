@@ -48,7 +48,7 @@ from newton._src.solvers.feather_pgs.row_records import DenseRows
 from newton._src.solvers.feather_pgs.rows import RowLaws, velocity_prescale_launch
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import leave_walk, row_bias, row_lines, unpacked_rows
+from newton.tests.feather_pgs_law_harness import leave_walk, plain_laws, row_bias, row_lines, unpacked_rows
 from newton.tests.feather_pgs_mass_reference import MassReference
 from newton.tests.feather_pgs_patch_parity import (
     SLIDING_FEET,
@@ -61,7 +61,6 @@ from newton.tests.feather_pgs_row_builders import (
     install_cpu_keyed_rows,
     launched_kernels,
 )
-from newton.tests.feather_pgs_scenes import plain_laws
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
 from newton.tests.test_feather_pgs_velocity_limit_law import _HAND_LIMIT, _limited_hand
 

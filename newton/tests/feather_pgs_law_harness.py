@@ -40,6 +40,7 @@ from newton._src.solvers.feather_pgs.factor.walk import (
 )
 from newton._src.solvers.feather_pgs.friction_patches import PatchRowLaw
 from newton._src.solvers.feather_pgs.joint_table import JointTable
+from newton._src.solvers.feather_pgs.route_table import Laws
 from newton._src.solvers.feather_pgs.row_records import DenseRows, MfRows, RowSupport
 from newton._src.solvers.feather_pgs.tree_scan import WalkClass
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -1300,3 +1301,22 @@ def register_device_tests(cls, namespace: dict):
     for name, function in list(namespace.items()):
         if name.startswith("test_") and inspect.isfunction(function):
             add_function_test(cls, name, function, devices=devices)
+
+
+def plain_laws(**changes) -> Laws:
+    """The row laws of a CUDA matrix-free solver with joint limits and point friction (the plain sweep), with
+    ``changes``: the laws a stand-in solver of the admission tests carries."""
+    laws = {
+        "contact": "point",
+        "regularized": False,
+        "torsion": False,
+        "compliance": False,
+        "limits": True,
+        "velocity_limits": False,
+        "warm_start": False,
+        "preelimination": False,
+        "mimic": False,
+        "iterations": True,
+        "cuda": True,
+    }
+    return Laws(**{**laws, **changes})

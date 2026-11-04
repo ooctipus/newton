@@ -35,7 +35,7 @@ changes the branch rules:
   create *new* branches and leave the referenced ones intact.
 - **Validation gates before a tip may become a parent pointer**: the FPGS test modules
   pass (`uv run --extra dev python -m unittest newton.tests.test_feather_pgs_mimic
-  newton.tests.test_feather_pgs_connect newton.tests.test_feather_pgs_springs
+  newton.tests.test_feather_pgs_connect newton.tests.test_feather_pgs_contract_joints
   newton.tests.test_feather_pgs_preelim`), regression-first discipline holds (tests
   verified failing without the change), and solver changes that affect grasp behavior
   pass the parent repo's P25 sustained-squeeze gate
