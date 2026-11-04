@@ -19,6 +19,7 @@ from newton._src.solvers.feather_pgs.field_group import Field
 from newton._src.solvers.feather_pgs.kernel_template import (
     Dispatch,
     KernelTemplate,
+    items,
     operands,
     params,
     python_kernel,
@@ -123,6 +124,66 @@ class TestKernelTemplate(unittest.TestCase):
         values = wp.array([1.0, 2.0], dtype=float, device="cpu")
         wp.launch(kernel, dim=2, inputs=[values], device="cpu")
         np.testing.assert_array_equal(values.numpy(), [2.0, 4.0])
+
+
+@wp.func
+def _add_row(world: int, sub: int, rows: wp.array2d[float], out: wp.array[float]):
+    wp.atomic_add(out, world, rows[world, sub])
+
+
+class TestItems(unittest.TestCase):
+    """The one dispatch: a thread's item directly, behind a tail guard, or from a queue, over a native or Warp body."""
+
+    def test_old_names_are_declarations(self):
+        """The dispatch names the call sites still use are declarations of items()."""
+        self.assertEqual(kernel_template.BLOCKS.body, "block, _lane = wp.tid()\n$CALL")
+        self.assertEqual(kernel_template.THREADS.arguments, ("wp.tid()",))
+        self.assertEqual(
+            kernel_template.tiles(2, 16).body,
+            "block, lane = wp.tid()\nworld = block * 2 + lane // 16\nif world < world_count:\n    $CALL",
+        )
+        self.assertEqual(items("world", lanes=32, flat=True).body, "world = wp.tid() // 32\n$CALL")
+        with self.assertRaisesRegex(ValueError, "their lanes"):
+            items("world", groups=2)
+
+    def test_guard_and_listed_queue_run_on_the_cpu(self):
+        """A guarded flat launch stops at its count; a listed queue strides over its items."""
+        out = wp.zeros(8, dtype=float, device="cpu")
+        guarded = KernelTemplate(
+            "items_guarded",
+            (("out", wp.array[float]),),
+            "    out.data[tid] = 1.0f;\n",
+            items("tid", flat=True, guard="n"),
+            dual=True,
+        ).kernel()
+        wp.launch(guarded, dim=8, inputs=[5, out], device="cpu")
+        np.testing.assert_array_equal(out.numpy(), [1, 1, 1, 1, 1, 0, 0, 0])
+        listed = items("world", queue=("count", "stride", "worlds"))
+        self.assertEqual([name for name, _ in listed.extra], ["count", "stride", "worlds"])
+        queued = KernelTemplate(
+            "items_listed", (("out", wp.array[float]),), "    out.data[world] += 2.0f;\n", listed, dual=True
+        ).kernel()
+        worlds = wp.array([6, 1, 3, 7, 0], dtype=int, device="cpu")
+        count = wp.array([4], dtype=int, device="cpu")
+        # Two blocks stride over the list's first four items: worlds 6, 1, 3, 7.
+        wp.launch(queued, dim=(2, 1), inputs=[count, 2, worlds, out], device="cpu")
+        np.testing.assert_array_equal(out.numpy(), [1, 3, 1, 3, 1, 0, 2, 2])
+
+    def test_python_body_loops_its_sub_items(self):
+        """A Warp function body under the dispatch: each world's lanes share its rows."""
+        dispatch = items("world", sub="rows.shape[1]", lanes=4)
+        self.assertEqual(dispatch.body, "world, lane = wp.tid()\nfor sub in range(lane, rows.shape[1], 4):\n    $CALL")
+        kernel = KernelTemplate(
+            "items_rows",
+            (("rows", wp.array2d[float]), ("out", wp.array[float])),
+            "",
+            dispatch,
+            function=_add_row,
+        ).kernel()
+        rows = wp.array(np.arange(12, dtype=np.float32).reshape(2, 6), dtype=float, device="cpu")
+        out = wp.zeros(2, dtype=float, device="cpu")
+        wp.launch(kernel, dim=(2, 4), inputs=[rows, out], device="cpu")
+        np.testing.assert_array_equal(out.numpy(), [15.0, 51.0])
 
 
 if __name__ == "__main__":

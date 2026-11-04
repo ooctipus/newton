@@ -11,13 +11,15 @@ Every generated kernel is a :class:`KernelTemplate`:
   ``dual_native`` for a body that also compiles for the CPU);
 - its parameters are declared once, as ``(name, type)`` pairs, :class:`~.field_group.Field` declarations or a
   generated struct's fields (:func:`params`). The native function's ABI and the Warp kernel's signature are both
-  derived from them, with the :class:`Dispatch` that maps the launch's threads to native calls;
+  derived from them, with the :class:`Dispatch` that maps the launch's threads to native calls, one declaration of
+  the one dispatch :func:`items` (a thread's item directly, behind a tail guard, or from a device queue);
 - :meth:`KernelTemplate.kernel` builds the Warp kernel. What a launch site needs to know about a kernel travels
   with it in a typed descriptor (:class:`SweepTier` for the matrix-free tiers: block size, the operands it takes
   besides its signature's, its velocity-limit law), and a solve readout is registered with the kernel by
   :meth:`.solve_policy.SolveReadoutRecord.register`, in place of attributes set on the kernel.
 
-A Python kernel (no native body) is a function renamed per variant: :func:`python_kernel`.
+A Python body is a ``wp.func`` under the same dispatch (:attr:`KernelTemplate.function`); a Python kernel not yet
+split into one is a function renamed per variant: :func:`python_kernel`.
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ __all__ = [
     "SweepTier",
     "candidate_queue",
     "candidates",
+    "items",
     "operands",
     "params",
     "python_kernel",
@@ -104,52 +107,108 @@ class Dispatch:
     """Where :attr:`extra` goes among the kernel's parameters (an index into them)."""
 
 
-BLOCKS = Dispatch("block, _lane = wp.tid()\n$CALL", ("block",), (("block", int),))
-"""One native call per thread of a 2D ``(blocks, lanes)`` launch, with the block index."""
+def items(
+    item: str = "block",
+    *,
+    groups: int | None = None,
+    lanes: int | None = None,
+    flat: bool = False,
+    guard: str | None = None,
+    queue: tuple[str, ...] | None = None,
+    lane: bool = False,
+    sub: str | None = None,
+) -> Dispatch:
+    """The one dispatch: how a launch's threads reach their items, and how each item calls the body.
 
-WORLDS = Dispatch("world, _lane = wp.tid()\n$CALL", ("world",), (("world", int),))
-"""One native call per thread of a 2D ``(worlds, lanes)`` launch, with the world index."""
+    A thread reads its *position* from the launch, then its item:
 
-THREADS = Dispatch("$CALL", ("wp.tid()",), (("tid", int),))
-"""One native call per thread of a 1D launch, with the thread index."""
+    - a tiled or 2D launch ``(blocks, lanes)`` gives the block; with ``groups`` lane groups of ``lanes`` lanes a
+      block (an :class:`~newton._src.core.execution.Shape`'s ``groups`` and ``lanes``), the position is
+      ``block * groups + lane // lanes``, else the block itself;
+    - a flat launch (``flat``) gives the thread, ``wp.tid()``, or its lane group, ``wp.tid() // lanes``;
+    - a ``guard`` (the name of a host count, a wrapper operand) stops the tail past the items: a
+      :class:`~newton._src.core.execution.Work` over a host count whose groups do not divide it;
+    - a ``queue`` ``(count, stride[, items])`` (wrapper operands: the device count array, the grid's stride, and the
+      list's items if the position indexes a list) walks a device list with the grid's stride: a
+      :class:`~newton._src.core.execution.Work` over a :class:`~newton._src.core.execution.Queue`;
+    - the body takes the item, then the thread's ``lane`` if asked, then each ``sub``-item ``sub`` the lanes share:
+      ``for sub in range(lane, sub, lanes)`` (``sub`` names the item's width, as an expression of the operands).
 
+    A body is a native function (:class:`KernelTemplate`'s source) or a Warp function (its ``function``), so a
+    Python kernel's item loop is this dispatch over a ``wp.func`` too.
 
-def tiles(groups: int, lanes: int) -> Dispatch:
-    """World tiles: ``groups`` worlds of ``lanes`` lanes per block, guarded by a leading ``world_count``."""
-    return Dispatch(
-        f"block, lane = wp.tid()\nworld = block * {groups} + lane // {lanes}\nif world < world_count:\n    $CALL",
-        ("world",),
-        (("world", int),),
-        (("world_count", int),),
-    )
-
-
-def candidates(groups: int, lanes: int) -> Dispatch:
-    """One local candidate per lane group: ``groups`` candidates of ``lanes`` lanes per block."""
-    return Dispatch(
-        f"candidate, lane = wp.tid()\ncandidate = candidate * {groups} + lane // {lanes}\n$CALL",
-        ("candidate",),
-        (("candidate", int),),
-    )
-
-
-def candidate_queue(groups: int, lanes: int) -> Dispatch:
-    """Lane groups that walk the active candidates (``active_candidate_count``) with a grid stride.
-
-    The queue's operands follow the kernel's first two parameters.
+    Args:
+        item: The item's name, the body's first argument.
+        groups: Items (lane groups) a block of a tiled launch.
+        lanes: Lanes an item.
+        flat: The launch is one-dimensional.
+        guard: The host count that guards the tail.
+        queue: The device list's count array, its grid stride and, for an indexed list, its items.
+        lane: Pass the thread's lane in its launch dimension to the body.
+        sub: The item's width: the body runs for each sub-item its lanes share.
     """
-    return Dispatch(
-        "candidate, lane = wp.tid()\ncandidate_count = active_candidate_count[0]\n"
-        f"candidate = candidate * {groups} + lane // {lanes}\n"
-        "while candidate < candidate_count:\n    $CALL\n    candidate += candidate_grid_stride",
-        ("candidate",),
-        (("candidate", int),),
-        (("active_candidate_count", wp.array[int]), ("candidate_grid_stride", int)),
-        extra_at=2,
-    )
+    if flat and (groups is not None or lane or sub is not None):
+        raise ValueError("a flat launch reads no block or lane")
+    if (groups is not None or sub is not None) and lanes is None:
+        raise ValueError("lane groups and sub-items need their lanes")
+    count, stride, *listed = queue or (None, None)
+    at = f"{item}_at" if listed else item  # the position: the item itself, or its place in a listed queue
+    if flat:
+        # The thread itself, read once by the call, needs no name.
+        head = [f"{at} = wp.tid()" + ("" if lanes is None else f" // {lanes}")]
+        if lanes is None and guard is None and queue is None:
+            head, at = [], "wp.tid()"
+    elif groups is not None:
+        head = ["block, lane = wp.tid()", f"{at} = block * {groups} + lane // {lanes}"]
+    else:
+        head = [f"{at}, {'lane' if lane or sub else '_lane'} = wp.tid()"]
+    call = "$CALL"
+    if sub is not None:
+        call = f"for sub in range({'lane' if groups is None else f'lane % {lanes}'}, {sub}, {lanes}):\n    {call}"
+    if listed:
+        call = f"{item} = {listed[0]}[{at}]\n{call}"
+    extra = ()
+    if guard is not None:
+        call = f"if {at} < {guard}:\n{_indented(call)}"
+        extra = ((guard, int),)
+    if queue is not None:
+        head.insert(1, f"{item}_end = {count}[0]")
+        call = f"while {at} < {item}_end:\n{_indented(call)}\n    {at} += {stride}"
+        extra = ((count, wp.array[int]), (stride, int), *((name, wp.array[int]) for name in listed))
+    names = (item, *(("lane",) if lane else ()), *(("sub",) if sub is not None else ()))
+    arguments = (at if at == "wp.tid()" else item, *names[1:])
+    return Dispatch("\n".join((*head, call)), arguments, tuple((name, int) for name in names), extra)
 
 
-# Matrix-free sweeps that serve the world queue: every launch item walks the general worlds it owns.
+def _indented(text: str) -> str:
+    return "\n".join(f"    {line}" for line in text.splitlines())
+
+
+# The old dispatch names, each one declaration of :func:`items`. They stay only while a call site names them: the
+# tracks convert their call sites to ``items(...)`` in their first commits (the one exception to "no shims", ZXB A3).
+BLOCKS = items()  # the default dispatch: R rows.py, row_packets.py
+WORLDS = items("world")  # R response_builds_rows.py, keyed_row_layout.py; S sweep_units.py, sweep_routes_diag.py
+THREADS = items("tid", flat=True)  # W factor/walk.py (2), tree_kinetic_state.py (the walk solve)
+
+
+def tiles(groups: int, lanes: int) -> Dispatch:  # S sweep_routes_sparse.py, sweep_routes_local.py (paired factor)
+    return items("world", groups=groups, lanes=lanes, guard="world_count")
+
+
+def candidates(groups: int, lanes: int) -> Dispatch:  # S sweep_routes_local.py
+    return items("candidate", groups=groups, lanes=lanes)
+
+
+def candidate_queue(groups: int, lanes: int) -> Dispatch:  # S sweep_routes_local.py (operands after two parameters)
+    queue = ("active_candidate_count", "candidate_grid_stride")
+    return dataclasses.replace(items("candidate", groups=groups, lanes=lanes, queue=queue), extra_at=2)
+
+
+# Matrix-free sweeps on the world queue, or on every world, picked at run time by ``use_general_world_queue``
+# (sweep_plan: ``placement.local_internal_fast_path``, a plan fact). Not a declaration of :func:`items`: the plan's
+# choice is two kernels, ``items("world")`` and ``items("world", queue=("general_world_count",
+# "general_world_grid_stride", "general_worlds"))``, which track S builds at its call sites (sweep_routes.py,
+# sweep_routes_tiers.py; D sweep_plan.py passes the switch), and this run-time branch goes with them.
 WORLD_QUEUE = Dispatch(
     "candidate, _lane = wp.tid()\n"
     "general_index = candidate\n"
@@ -193,6 +252,8 @@ class KernelTemplate:
         composed: ``source`` is a complete snippet whose preludes are already composed.
         module: The Python module whose Warp module holds the kernel (``__name__`` of a module-level kernel), or
             ``"unique"`` for a variant in a module of its own.
+        function: A Warp function (``wp.func``) body in place of a native one (``source`` empty): the dispatch calls
+            it as it calls a native function, so a Python kernel is the same dispatch over a ``wp.func``.
     """
 
     name: str
@@ -206,6 +267,7 @@ class KernelTemplate:
     cluster_dim: int = 1
     composed: bool = False
     module: str = "unique"
+    function: Any = None
 
     @classmethod
     def from_abi(cls, name: str, abi, source: str, dispatch: Dispatch, extra=(), **options) -> KernelTemplate:
@@ -254,18 +316,23 @@ class KernelTemplate:
         operands = (name for name, _ in self.params if name not in self.dispatch.private)
         call = f"{self.native_name}({', '.join((*self.dispatch.arguments, *operands))})"
         body = substitute(self.dispatch.body, CALL=call)
+        native = f"@wp.func_native(snippet)\ndef {self.native_name}({_annotated(self.native_params)}): ...\n\n"
         return (
-            f"@wp.func_native(snippet)\ndef {self.native_name}({_annotated(self.native_params)}): ...\n\n"
-            f"def kernel_template({_annotated(self.signature)}):\n"
+            ("" if self.function is not None else native)
+            + f"def kernel_template({_annotated(self.signature)}):\n"
             + "".join(f"    {line}\n" for line in body.splitlines())
         )
 
     def kernel(self) -> wp.Kernel:
         """Build the Warp kernel (backward disabled)."""
-        source, snippet = self.declaration(), self.snippet
+        source, snippet = self.declaration(), "" if self.function is not None else self.snippet
         # The functions belong to the kernel's Python module, or to this one for a variant in a module of its own.
         owner = __name__ if self.module == "unique" else self.module
         namespace = {"__name__": owner, "wp": wp, "snippet": snippet, **dict(self.dispatch.constants)}
+        if self.function is not None:
+            if self.source:
+                raise ValueError(f"{self.name}: a Warp function body takes no native source")
+            namespace[self.native_name] = self.function
         namespace.update({f"type_{name}": annotation for name, annotation in (*self.native_params, *self.signature)})
         digest = hashlib.sha256((source + snippet).encode()).hexdigest()
         filename = f"<fpgs-kernel-{digest}>"

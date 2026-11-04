@@ -320,6 +320,10 @@ def lane_group(lanes: int | str) -> DevicePrelude:
 def block_groups(per_block: int, count: str, body: str) -> str:
     """Return native statements that run ``body`` for this block's lane groups below ``count``, ``per_block`` a block.
 
+    An old dispatch name, kept while track R's ``rows.py`` calls it (ZXB A3): its form is the one dispatch,
+    ``kernel_template.items("group", groups=per_block, lanes=lanes, guard=count)``, of a kernel built for its device,
+    whose CPU shape has one group a block (:func:`~newton._src.core.execution.shape`), so no CPU loop is left.
+
     On CUDA each lane group runs its own group, ``block * per_block + SUB``, and the body's ``return`` ends the thread;
     on the CPU one thread runs the block's groups in order, each body in a lambda whose ``return`` ends that group.
     The body reads its group as ``group``. After a lane-group prelude, in a body whose dispatch passes ``block``
