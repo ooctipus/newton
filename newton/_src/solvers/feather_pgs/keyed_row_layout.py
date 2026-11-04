@@ -10,7 +10,7 @@ import numpy as np
 
 from ...sim import JointType
 from .device_preludes import lane_group
-from .kernel_template import WORLDS, KernelTemplate
+from .kernel_template import KernelTemplate, items
 from .prefix_rows import limits, prefix_rows, velocity_limits
 from .row_laws import ROW_LAW
 
@@ -160,7 +160,7 @@ def prefix_kernel(layout, prefix_type, rows_type):
         "keyed_limit_prefix",
         (("p", prefix_type), ("z", rows_type)),
         source,
-        WORLDS,
+        items("world"),
         preludes=(lane_group(32), *ROW_LAW.preludes()),
         dual=True,
     ).kernel()

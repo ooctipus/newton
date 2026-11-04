@@ -330,7 +330,7 @@ def block_groups(per_block: int, count: str, body: str) -> str:
     On CUDA each lane group runs its own group, ``block * per_block + SUB``, and the body's ``return`` ends the thread;
     on the CPU one thread runs the block's groups in order, each body in a lambda whose ``return`` ends that group.
     The body reads its group as ``group``. After a lane-group prelude, in a body whose dispatch passes ``block``
-    (:data:`.kernel_template.BLOCKS`).
+    (``kernel_template.items()``, the default).
 
     Args:
         per_block: Lane groups a block.

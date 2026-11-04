@@ -13,7 +13,7 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import field_group, kernel_template
+from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.device_preludes import CUDA_ONLY, RING
 from newton._src.solvers.feather_pgs.field_group import Field
 from newton._src.solvers.feather_pgs.kernel_template import (
@@ -134,10 +134,10 @@ def _add_row(world: int, sub: int, rows: wp.array2d[float], out: wp.array[float]
 class TestItems(unittest.TestCase):
     """The one dispatch: a thread's item directly, behind a tail guard, or from a queue, over a native or Warp body."""
 
-    def test_old_names_are_declarations(self):
-        """The dispatch names the call sites still use are declarations of items()."""
-        self.assertEqual(kernel_template.BLOCKS.body, "block, _lane = wp.tid()\n$CALL")
-        self.assertEqual(kernel_template.THREADS.arguments, ("wp.tid()",))
+    def test_dispatch_forms(self):
+        """The default dispatch (a block's item), a flat thread's, a block's lane groups and a flat lane group's."""
+        self.assertEqual(KernelTemplate("k", (), "").dispatch.body, "block, _lane = wp.tid()\n$CALL")
+        self.assertEqual(items("tid", flat=True).arguments, ("wp.tid()",))
         self.assertEqual(
             items("world", groups=2, lanes=16, guard="world_count").body,
             "block, lane = wp.tid()\nworld = block * 2 + lane // 16\nif world < world_count:\n    $CALL",

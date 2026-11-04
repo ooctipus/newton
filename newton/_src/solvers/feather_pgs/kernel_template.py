@@ -37,9 +37,6 @@ from . import field_group
 from .device_preludes import DevicePrelude, cuda_native, dual_native, substitute
 
 __all__ = [
-    "BLOCKS",
-    "THREADS",
-    "WORLDS",
     "Dispatch",
     "KernelTemplate",
     "SweepTier",
@@ -179,13 +176,6 @@ def _indented(text: str) -> str:
     return "\n".join(f"    {line}" for line in text.splitlines())
 
 
-# The old dispatch names, each one declaration of :func:`items`. They stay only while a call site names them: the
-# tracks convert their call sites to ``items(...)`` in their first commits (the one exception to "no shims", ZXB A3).
-BLOCKS = items()  # the default dispatch: R rows.py, row_packets.py
-WORLDS = items("world")  # R keyed_row_layout.py
-THREADS = items("tid", flat=True)  # W factor/walk.py (2), tree_kinetic_state.py (the walk solve)
-
-
 @dataclasses.dataclass(frozen=True)
 class KernelTemplate:
     """A generated native kernel, declared once.
@@ -213,7 +203,7 @@ class KernelTemplate:
     name: str
     params: tuple[tuple[str, Any], ...]
     source: str
-    dispatch: Dispatch = BLOCKS
+    dispatch: Dispatch = dataclasses.field(default_factory=items)
     preludes: tuple[DevicePrelude, ...] = ()
     dual: bool = False
     native_name: str = "native"
