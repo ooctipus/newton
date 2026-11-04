@@ -106,17 +106,6 @@ class FreeBodyCoordinates:
 
     op = FreeBodyZ()
 
-    @staticmethod
-    def words(dofs: int) -> int:
-        return (int(dofs) + 31) // 32
-
-    @classmethod
-    def buffers(cls, dofs: int) -> tuple[Buffer, ...]:
-        """The bitmap the sweeps marked the articulations they left in place in, a bit a world coordinate
-        (``s_factor_marks``). No sweep marks or reads it now that every sweep walks; its words stay in the working set
-        with the factors' arrays, so the storage admission and the kernels' text hold until those go."""
-        return (Buffer("s_factor_marks", "unsigned", cls.words(dofs)),)
-
     def _walked(self, first: str, call: str) -> str:
         """``call`` (a walk of :func:`.tree_factor.walk_paths_prelude` on ``data``, ``link`` and ``twist``) on the tree
         whose first world coordinate is ``first``."""
@@ -555,7 +544,6 @@ def mf_gs_staging(
         (
             Buffer("s_v", "float", max_world_dofs),
             *((Buffer("s_sweep_v", "float", max_world_dofs),) if wide_rows else ()),
-            *FREE_BODY_COORDINATES.buffers(max_world_dofs),
             *dense.buffers(),
             *free.buffers(),
             *colored,
