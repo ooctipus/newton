@@ -28,7 +28,8 @@ from functools import cache
 import numpy as np
 import warp as wp
 
-from ...core.execution import fill_lanes
+from ...core import memory
+from ...core.execution import Shape, Work, fill_lanes, launch, shape
 from ...sim import Contacts, Model, State
 from ...sim.enums import JointType
 from . import field_group, host_index, prefix_rows, walk_rows
@@ -37,7 +38,7 @@ from .contact_input import ContactInput
 from .contact_input import bind as bind_contact_input
 from .contact_input import bind_routes as bind_contact_routes
 from .contact_row_plan import contact_row_plan
-from .device_preludes import block_groups, lane_group
+from .device_preludes import lane_group
 from .factor.fields import Preelim
 from .field_group import Field, FieldGroup, SolverArrays
 from .forest_plan import ForestPlan
@@ -45,7 +46,7 @@ from .friction_patches import _FrictionPatchState as FrictionPatchState
 from .friction_patches import patch_row_law
 from .joint_table import bind as bind_joint_table
 from .joint_table import bind_free_bodies
-from .kernel_template import KernelTemplate, params
+from .kernel_template import KernelTemplate, items, params
 from .route_table import Laws
 from .row_kernels import (
     LINK_PLAN,
@@ -90,11 +91,13 @@ __all__ = [
     "RowLaws",
     "joint_limit_warp_kernel",
     "mimic_warp_kernel",
+    "prefix_shape",
     "velocity_limit_warp_kernel",
     "velocity_prescale_launch",
 ]
 
-JOINT_LIMIT_WARPS_PER_BLOCK = 4
+JOINT_ROW_WARPS = 4
+"""Articulations (warps) a block of the joint row families' producers on CUDA (:func:`prefix_shape`)."""
 
 _CONTACT_BUILD_THREAD_CAP = 65536
 
@@ -133,12 +136,17 @@ def velocity_prescale_launch(articulation_start: np.ndarray, *, joint_count: int
     return lanes, (count * lanes + 31) // 32 * 32
 
 
+def prefix_shape(articulations: int, device) -> Shape:
+    """The joint row families' launch over ``articulations`` (:func:`_prefix_warp_kernel`): a warp an articulation,
+    :data:`JOINT_ROW_WARPS` a block, on CUDA; an articulation a thread on the CPU (:func:`.execution.shape`)."""
+    return shape(Work(articulations, lanes=32, block=32 * JOINT_ROW_WARPS), memory.device(device))
+
+
 def _prefix_warp_params(law) -> tuple:
-    """The warp prefix producers' operands: the family's law (:data:`.prefix_rows.LAW`, with the velocity or the mimic
-    family's inputs), the rows' placement and Jacobian rows (:func:`.row_records.jacobian_row`: the packed rows, by
-    world, or the size group's)."""
+    """The warp prefix producers' operands after the articulations' count (the dispatch's guard): the family's law
+    (:data:`.prefix_rows.LAW`, with the velocity or the mimic family's inputs), the rows' placement and Jacobian rows
+    (:func:`.row_records.jacobian_row`: the packed rows, by world, or the size group's)."""
     return params(
-        ("articulation_count", int),
         ("articulation_dof_start", wp.array[int]),
         ("art_to_world", wp.array[int]),
         ("group_to_art", wp.array[int]),
@@ -163,9 +171,9 @@ _PREFIX_FAMILIES = {
 
 
 @cache
-def _prefix_warp_kernel(size: int, warps_per_block: int, family: str, mimics: int = 0) -> wp.Kernel:
+def _prefix_warp_kernel(size: int, groups: int, family: str, mimics: int = 0) -> wp.Kernel:
     """A joint row family of the general route and the one writer, one warp per articulation of ``size`` coordinates
-    (:func:`.prefix_rows.prefix_rows`) on CUDA, a block's articulations in turn on the CPU: its joint limits, its joint
+    (:func:`.prefix_rows.prefix_rows`), ``groups`` a block (:func:`prefix_shape`'s, one on the CPU): its joint limits, its joint
     velocity limits, or its mimics (at most ``mimics`` an articulation). The warp takes each candidate's law, reserves
     the active rows on the world's counter, writes their records and publishes each row's side: its unit source for
     the one writer, else its Jacobian row (a mimic's two coordinates; its slot in ``mimic_slot`` too). The joint
@@ -225,30 +233,31 @@ def _prefix_warp_kernel(size: int, warps_per_block: int, family: str, mimics: in
 {rows}"""
     suffix = f"_m{mimics}" if family == "mimics" else ""
     return KernelTemplate(
-        f"{name}_{size}_{warps_per_block}{suffix}",
+        f"{name}_{size}_{groups}{suffix}",
         _prefix_warp_params(law),
-        block_groups(warps_per_block, "articulation_count", body),
+        body,
+        items("group", groups=groups, lanes=32, guard="articulation_count"),
         preludes=(lane_group(32), *ROW_LAW.preludes()),
         dual=True,
         native_name=native,
     ).kernel()
 
 
-def joint_limit_warp_kernel(size: int, warps_per_block: int) -> wp.Kernel:
+def joint_limit_warp_kernel(size: int, groups: int) -> wp.Kernel:
     """The general route's and the one writer's joint-limit rows, one warp per articulation (:func:`_prefix_warp_kernel`)."""
-    return _prefix_warp_kernel(size, warps_per_block, "limits")
+    return _prefix_warp_kernel(size, groups, "limits")
 
 
-def velocity_limit_warp_kernel(size: int, warps_per_block: int) -> wp.Kernel:
+def velocity_limit_warp_kernel(size: int, groups: int) -> wp.Kernel:
     """The general route's and the one writer's joint velocity-limit rows, one warp per articulation
     (:func:`_prefix_warp_kernel`)."""
-    return _prefix_warp_kernel(size, warps_per_block, "velocity")
+    return _prefix_warp_kernel(size, groups, "velocity")
 
 
-def mimic_warp_kernel(size: int, warps_per_block: int, mimics: int) -> wp.Kernel:
+def mimic_warp_kernel(size: int, groups: int, mimics: int) -> wp.Kernel:
     """The general route's and the one writer's mimic rows, at most ``mimics`` an articulation, one warp per
     articulation (:func:`_prefix_warp_kernel`)."""
-    return _prefix_warp_kernel(size, warps_per_block, "mimics", mimics)
+    return _prefix_warp_kernel(size, groups, "mimics", mimics)
 
 
 class RowLaws:
@@ -409,16 +418,11 @@ class RowLaws:
         )
         self.joint_limit_q_index = wp.array(limit_q_index, dtype=wp.int32, device=model.device)
         self.joint_limit_q_index_host = limit_q_index
-        self.joint_limit_warp_kernels = {
-            size: joint_limit_warp_kernel(size, warps_per_block=JOINT_LIMIT_WARPS_PER_BLOCK)
-            for size in self.joint_limit_sizes
-        }
+        groups = prefix_shape(1, model.device).groups
+        self.joint_limit_warp_kernels = {size: joint_limit_warp_kernel(size, groups) for size in self.joint_limit_sizes}
         # The velocity limits sit on the same coordinates (limit_q_index >= 0), so on the same sizes.
         self.velocity_limit_warp_kernels = (
-            {
-                size: velocity_limit_warp_kernel(size, warps_per_block=JOINT_LIMIT_WARPS_PER_BLOCK)
-                for size in self.joint_limit_sizes
-            }
+            {size: velocity_limit_warp_kernel(size, groups) for size in self.joint_limit_sizes}
             if self.options.enable_joint_velocity_limits
             else {}
         )
@@ -523,7 +527,7 @@ class RowLaws:
         per_art = np.diff(art_start)
         sizes = self.forest.response_dof_count[: model.articulation_count]
         self.mimic_warp_kernels = {
-            size: mimic_warp_kernel(size, JOINT_LIMIT_WARPS_PER_BLOCK, int(per_art[sizes == size].max()))
+            size: mimic_warp_kernel(size, prefix_shape(1, model.device).groups, int(per_art[sizes == size].max()))
             for size in self.mimic_sizes
         }
 
@@ -617,12 +621,12 @@ class RowLaws:
     # --- the row pass ---------------------------------------------------------------------------------------------------
     @staticmethod
     def _launch_prefix_warp(solver, kernel, size: int, law, support) -> None:
-        """Launch a prefix-rows warp producer (:func:`_prefix_warp_kernel`) over size group ``size``: a warp per
-        articulation on CUDA, one thread per block's articulations on the CPU."""
+        """Launch a prefix-rows warp producer (:func:`_prefix_warp_kernel`) over size group ``size`` at
+        :func:`prefix_shape`."""
         n_arts = solver.forest.n_arts_by_size[size]
-        wp.launch_tiled(
+        launch(
             kernel,
-            dim=[(n_arts + JOINT_LIMIT_WARPS_PER_BLOCK - 1) // JOINT_LIMIT_WARPS_PER_BLOCK],
+            prefix_shape(n_arts, solver.model.device),
             inputs=[
                 n_arts,
                 solver.forest.articulation_dof_start,
@@ -633,7 +637,6 @@ class RowLaws:
                 support,
             ],
             outputs=[solver.placement.jacobian_rows(size)],
-            block_dim=32 * JOINT_LIMIT_WARPS_PER_BLOCK,
             device=solver.model.device,
         )
 

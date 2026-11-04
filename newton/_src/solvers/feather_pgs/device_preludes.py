@@ -320,31 +320,6 @@ def lane_group(lanes: int | str) -> DevicePrelude:
     return DevicePrelude(f"lane_group_{lanes}", substitute(_LANE_GROUP, lanes=lanes), _LANE_GROUP_CPU)
 
 
-def block_groups(per_block: int, count: str, body: str) -> str:
-    """Return native statements that run ``body`` for this block's lane groups below ``count``, ``per_block`` a block.
-
-    An old dispatch name, kept while track R's ``rows.py`` calls it (ZXB A3): its form is the one dispatch,
-    ``kernel_template.items("group", groups=per_block, lanes=lanes, guard=count)``, of a kernel built for its device,
-    whose CPU shape has one group a block (:func:`~newton._src.core.execution.shape`), so no CPU loop is left.
-
-    On CUDA each lane group runs its own group, ``block * per_block + SUB``, and the body's ``return`` ends the thread;
-    on the CPU one thread runs the block's groups in order, each body in a lambda whose ``return`` ends that group.
-    The body reads its group as ``group``. After a lane-group prelude, in a body whose dispatch passes ``block``
-    (``kernel_template.items()``, the default).
-
-    Args:
-        per_block: Lane groups a block.
-        count: The native count of groups.
-        body: The group's statements, each line newline-terminated.
-    """
-    cuda = f"    const int group = block * {per_block} + SUB;\n    if (group >= {count}) return;\n"
-    cpu = (
-        "    // One CPU thread runs the block's groups in order.\n"
-        f"    for (int group = block * {per_block}; group < (block + 1) * {per_block} && group < {count}; ++group) [&] {{\n"
-    )
-    return device_branches(cuda, cpu) + body + device_branches("", "    }();\n")
-
-
 _LANE_FEED = """    // FEED(first, last, step, ahead, build, chain): a lane group feeding one serial chain over the records
     // [first, last] of a tree, with no global scratch. step -1 walks from last down to first (leaves to root), +1 from
     // first up to last (root to leaves). First the group strides over every record calling ahead(index) (its lines'

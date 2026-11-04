@@ -734,11 +734,12 @@ PREFIX_RECORDS = {
 
 
 def prefix_warp_rows(
-    device, arts: int, size: int, rows: int, *, family="limits", mimics=0, resolved=None, warps_per_block=4, **law
+    device, arts: int, size: int, rows: int, *, family="limits", mimics=0, resolved=None, **law
 ) -> dict:
     """Launch a joint row family's warp of the general route (``family``: the joint limits'
     :func:`.rows.joint_limit_warp_kernel`, the joint velocity limits' ``"velocity"`` or the mimics' ``"mimics"``, at most
-    ``mimics`` an articulation), as :meth:`.rows.RowLaws.write` launches it, on the size groups' rows.
+    ``mimics`` an articulation), as :meth:`.rows.RowLaws.write` launches it (:func:`.rows.prefix_shape`), on the size
+    groups' rows.
 
     Articulation ``a`` is world ``a`` and group ``a``, its ``size`` coordinates from ``a * size``; its world holds
     ``rows`` rows. ``law`` holds the law's inputs by :data:`.prefix_rows.LAW`'s (and the family's) names; every
@@ -746,13 +747,15 @@ def prefix_warp_rows(
     (``None``: none). Returns each world's row count (``count``), the Jacobian rows ``J``, the records by name and every
     array the law was given, as numpy arrays.
     """
+    from newton._src.core import execution  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import prefix_rows  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import rows as producers  # noqa: PLC0415
 
+    shape = producers.prefix_shape(arts, device)
     struct_type, kernel = {
-        "limits": (prefix_rows.PrefixLaw, producers.joint_limit_warp_kernel(size, warps_per_block)),
-        "velocity": (prefix_rows.PrefixVelocityLaw, producers.velocity_limit_warp_kernel(size, warps_per_block)),
-        "mimics": (prefix_rows.PrefixMimicLaw, producers.mimic_warp_kernel(size, warps_per_block, mimics)),
+        "limits": (prefix_rows.PrefixLaw, producers.joint_limit_warp_kernel(size, shape.groups)),
+        "velocity": (prefix_rows.PrefixVelocityLaw, producers.velocity_limit_warp_kernel(size, shape.groups)),
+        "mimics": (prefix_rows.PrefixMimicLaw, producers.mimic_warp_kernel(size, shape.groups, mimics)),
     }[family]
 
     dofs = arts * size
@@ -775,9 +778,9 @@ def prefix_warp_rows(
     )
     J = wp.zeros((arts, rows, size), dtype=wp.float32, device=device)
     order = wp.array(np.arange(arts), dtype=wp.int32, device=device)
-    wp.launch_tiled(
+    execution.launch(
         kernel,
-        dim=[(arts + warps_per_block - 1) // warps_per_block],
+        shape,
         inputs=[
             arts,
             wp.array(size * np.arange(arts), dtype=wp.int32, device=device),
@@ -788,7 +791,6 @@ def prefix_warp_rows(
             group_rows(device),
         ],
         outputs=[J],
-        block_dim=32 * warps_per_block,
         device=device,
     )
     arrays = {name: value for name, value in law.items() if isinstance(value, wp.array)}

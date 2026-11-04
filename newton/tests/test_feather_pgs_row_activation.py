@@ -205,11 +205,11 @@ class TestFeatherPGSJointLimitActivationGap(unittest.TestCase):
 # joint_limit_warp
 #
 # The general route's joint-limit warp (:func:`.rows.joint_limit_warp_kernel`): one text on both devices, a warp per
-# articulation on CUDA and one thread running a block's articulations in turn on the CPU.
+# articulation on CUDA and a thread per articulation on the CPU (:func:`.rows.prefix_shape`).
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _rows(device, resolved=None, warps_per_block=4, articulation_count=257, size=6):
+def _rows(device, resolved=None, articulation_count=257, size=6):
     """One D6 joint per articulation and world, with positions drawn around its [-1, 1] limits: each world's row count,
     Jacobian rows and records."""
     dof_count = articulation_count * size
@@ -220,7 +220,6 @@ def _rows(device, resolved=None, warps_per_block=4, articulation_count=257, size
         size,
         2 * size,
         resolved=resolved,
-        warps_per_block=warps_per_block,
         lower=np.full(dof_count, -1.0),
         upper=np.full(dof_count, 1.0),
         q=rng.uniform(-1.2, 1.2, dof_count),
