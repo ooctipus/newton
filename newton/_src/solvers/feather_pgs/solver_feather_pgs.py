@@ -42,7 +42,7 @@ from .audit import Audit
 from .body_cut import BodyCut
 from .configuration import check_options
 from .contact_row_plan import contact_row_plan
-from .field_group import SolverArrays
+from .field_group import Field, FieldGroup, SolverArrays
 from .forest_plan import ForestPlan, joint_forest
 from .path_selection import (
     applied_options,
@@ -53,13 +53,24 @@ from .path_selection import (
 from .placement import Placement
 from .route_table import RouteTable, capable
 from .rows import RowLaws
-from .solver_fields import (
-    DOF_WORK,
-    STAGE3_SNAPSHOTS,
-)
 from .step_plan import StepPlan
 from .sweep_plan import Sweep
 from .tree_factor import TreeFactor
+
+DOF_WORK = FieldGroup(
+    Field("v_hat", wp.float32, ("dof",)),
+    Field("v_out", wp.float32, ("dof",)),
+    Field("qd_work", wp.float32, ("dof",)),
+)
+"""Per-DOF velocity work vectors."""
+
+STAGE3_SNAPSHOTS = FieldGroup(
+    Field("_debug_stage3_qd_work", wp.float32, ("dof",)),
+    Field("_debug_stage3_joint_qdd", wp.float32, ("dof",)),
+    Field("_debug_stage3_v_hat", wp.float32, ("dof",)),
+)
+"""Stage-3 snapshots for external NaN dumpers (opt-in)."""
+
 
 _FPGS_SYNC_TIMINGS = os.environ.get("FEATHER_PGS_SYNC_TIMINGS", "0").lower() in {"1", "true", "yes", "on"}
 _FPGS_SYNC_TIMINGS_START = int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_START", "20"))
@@ -495,7 +506,7 @@ class SolverFeatherPGS(SolverBase):
         # does. They cost three copies per substep, so they are opt-in.
         self._debug_stage3_snapshot_flag = os.environ.get("FEATHER_PGS_DEBUG_SNAPSHOTS") == "1"
         self._debug_stage3_snapshots = self._debug_stage3_snapshot_flag or self._debug_buffers_enabled
-        # The solver's device fields (solver_fields), on the model's device.
+        # The solver's device fields (the primitives' field groups), on the model's device.
         self._arrays = SolverArrays(self, model.device)
 
         self._step = 0

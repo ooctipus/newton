@@ -14,7 +14,6 @@ from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_MIMIC,
 )
-from newton._src.solvers.feather_pgs.solver_fields import LocalOwners
 from newton._src.solvers.feather_pgs.sweep import (
     PGS_LOCAL_SOLVE_OWNER_GENERAL,
     PGS_LOCAL_SOLVE_OWNER_PAIR,
@@ -22,6 +21,7 @@ from newton._src.solvers.feather_pgs.sweep import (
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
 )
 from newton._src.solvers.feather_pgs.sweep_routes_local import (
+    LocalOwners,
     classify_local_solve_worlds,
     compact_local_pair_candidates,
     local_owned_kernel,

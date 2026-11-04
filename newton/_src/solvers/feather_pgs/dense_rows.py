@@ -3,7 +3,7 @@
 
 """The row records every row producer writes, declared once as fields (:mod:`.field_group`).
 
-One store holds every world line's rows (:data:`.solver_fields.DENSE_ROWS`): the dense class's from row 0, then the
+One store holds every world line's rows (:data:`DENSE_ROWS`): the dense class's from row 0, then the
 free bodies' from the store's ``body_base``. :data:`DenseRows` is the Warp struct of the dense class's records; the
 contact producers' input (:data:`.contact_input.ContactInput`) carries the same fields. :data:`MfRows` reads the free
 bodies' rows: the same records at ``base``, and their placement (bodies, coordinates, ``Z``).
@@ -14,8 +14,39 @@ import dataclasses
 import warp as wp
 
 from . import field_group
-from .field_group import Field
-from .solver_fields import DENSE_ROWS, MF_ROWS
+from .field_group import Field, FieldGroup
+
+DENSE_ROWS = FieldGroup(
+    Field("rhs", wp.float32, ("world", "row"), owner="placement"),
+    Field("row_incident", wp.float32, ("world", "row"), owner="placement"),
+    Field("impulses", wp.float32, ("world", "row"), owner="placement"),
+    Field("diag", wp.float32, ("world", "row"), owner="placement"),
+    Field("row_type", wp.int32, ("world", "row"), owner="placement"),
+    Field("row_parent", wp.int32, ("world", "row"), fill=-1, owner="placement"),
+    Field("row_mu", wp.float32, ("world", "row"), owner="placement"),
+    Field("row_restitution", wp.float32, ("world", "row"), owner="placement"),
+    Field("row_beta", wp.float32, ("world", "row"), owner="placement"),
+    Field("phi", wp.float32, ("world", "row"), owner="placement"),
+    Field("target_velocity", wp.float32, ("world", "row"), owner="placement"),
+    Field("row_sides", wp.vec2i, ("world", "row"), owner="placement"),
+)
+"""The row store: every world line's rows, the dense class's (``[0, dense_max_constraints)``) then the free bodies'
+(from ``body_base``): the system and the row records (with each row's sides). One row index for both classes: a
+contact's slot and its rows' parents count in the line. ``row_incident`` is each row's
+incident velocity ``J v_hat``, written where its walk sums it: the one writer (:mod:`.walk_rows`), the free bodies'
+writer (:func:`.walk_rows.write_free_body_rows`)."""
+
+MF_ROWS = FieldGroup(
+    Field("mf_Z", wp.float32, ("world", "mf_row", 12), owner="placement"),
+    Field("mf_meta_packed", wp.int32, ("world", "mf_meta"), owner="placement"),
+)
+"""The free bodies' placement: each side's six entries (the row's Jacobian ``J`` as the writers store it, its whitened
+form ``Z = L^-1 J^T`` once the rows' build has run, ``L`` the body's held factor; two one-node trees of six), and the
+packed header the sweeps read, which the placement stages each step from the records: four ints per row (dof pair,
+inverse effective mass ``1 / A_ii``, the residual at zero velocity change, type and parent). The rows' records are the
+row store's (:data:`DENSE_ROWS`, from ``body_base``): their sides are their responding bodies' articulations in the
+rows' ``a``/``b`` order (-1 for none) and their ``diag`` the effective mass ``A_ii``."""
+
 
 RECORDS = (
     Field("row_type", wp.int32, ("world", "row"), owner="placement"),

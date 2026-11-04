@@ -50,7 +50,7 @@ import warp as wp
 
 from ...sim import BodyFlags, JointType
 from . import cached_state_binding
-from .solver_fields import DriveRows, hold_drive_row
+from .factor.fields import DriveRows, hold_drive_row
 from .spatial_laws import (
     axis_transform,
     coordinate_force,

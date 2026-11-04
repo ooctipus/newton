@@ -25,6 +25,7 @@ import warp as wp
 
 from . import kernel_template
 from .device_preludes import CPU_MATH, dual_native, lane_group
+from .factor.fields import Preelim
 from .kernel_template import Dispatch, KernelTemplate
 from .paired_components import FREE_BODY_DOFS, PAIRED_COMPONENT_THREADS, PairedComponentData
 from .projection_laws import BILATERAL_PIVOT
@@ -34,7 +35,6 @@ from .row_laws import (
     LINK_ROWS,
 )
 from .row_metadata import _validate_mf_metadata_encoding
-from .solver_fields import Preelim
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Free-body rows (FreeBodyZ)

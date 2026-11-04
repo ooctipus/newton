@@ -41,7 +41,8 @@ from .dense_rows import UNIT_LIMIT, UNIT_MIMIC, UNIT_SHIFT, UNIT_VELOCITY, RowSu
 from .dense_rows import bind as bind_dense_rows
 from .dense_rows import bind_mf as bind_mf_rows
 from .device_preludes import block_groups, lane_group
-from .field_group import SolverArrays
+from .factor.fields import Preelim
+from .field_group import Field, FieldGroup, SolverArrays
 from .forest_plan import ForestPlan
 from .friction_patches import _FrictionPatchState as FrictionPatchState
 from .friction_patches import patch_row_law
@@ -50,6 +51,9 @@ from .joint_table import bind_free_bodies
 from .kernel_template import KernelTemplate, params
 from .route_table import Laws
 from .row_kernels import (
+    LINK_PLAN,
+    LINK_SLOTS,
+    Links,
     RowBias,
     allocate_link_slots,
     allocate_rigid_velocity_limit_slots,
@@ -59,16 +63,28 @@ from .row_kernels import (
 )
 from .row_laws import LINK_ROWS, ROW_LAW
 from .row_slots import allocate_world_contact_slots, finalize_constraint_counts_with_status, snapshot_dense_phase_bound
-from .solver_fields import (
-    LINK_PLAN,
-    LINK_SLOTS,
-    MIMIC_PLAN,
-    MIMIC_SLOTS,
-    VELOCITY_LIMIT_SLOTS,
-    Links,
-    Preelim,
-)
 from .warm_start import gather_mf_warmstart
+
+VELOCITY_LIMIT_SLOTS = FieldGroup(
+    Field("velocity_limit_slot", wp.int32, ("limit_row",), fill=-1, owner="laws"),
+    Field("velocity_limit_sign", wp.float32, ("limit_row",), owner="laws"),
+)
+"""Two unilateral joint velocity-limit rows per DOF (lower ``+e_i``, upper ``-e_i``): their slots and signs."""
+
+MIMIC_PLAN = FieldGroup(
+    Field("_mimic_art_start", wp.int32, ("articulation_bound",), owner="laws"),
+    Field("_mimic_art_list", wp.int32, ("mimic",), owner="laws"),
+    Field("_mimic_valid", wp.int32, ("mimic",), owner="laws"),
+    Field("_mimic_world", wp.int32, ("mimic",), owner="laws"),
+    Field("_mimic_dof0", wp.int32, ("mimic",), owner="laws"),
+    Field("_mimic_dof1", wp.int32, ("mimic",), owner="laws"),
+    Field("_mimic_q0", wp.int32, ("mimic",), owner="laws"),
+    Field("_mimic_q1", wp.int32, ("mimic",), owner="laws"),
+)
+"""The static per-mimic lookup tables: each articulation's valid mimics (CSR) and each mimic's DOFs and coordinates."""
+
+MIMIC_SLOTS = FieldGroup(Field("mimic_slot", wp.int32, ("mimic",), fill=-1, owner="laws"))
+
 
 __all__ = [
     "RowLaws",
@@ -239,7 +255,7 @@ class RowLaws:
     """The row laws' tables of one model and its options (:meth:`build`).
 
     The tables keep the names they had on the solver, without the leading underscore, except the tables uploaded by
-    field groups (:data:`.solver_fields.MIMIC_PLAN`, :data:`.solver_fields.LINK_PLAN`), which keep their fields'
+    field groups (:data:`MIMIC_PLAN`, :data:`.row_kernels.LINK_PLAN`), which keep their fields'
     names.
     """
 

@@ -31,32 +31,122 @@ from ...sim import Contacts
 from ...sim.contacts import contact_capacity_blocks
 from ...sim.enums import JointType
 from . import host_index, packed_rows, response_builds_rows
-from .dense_rows import RowSupport
-from .field_group import SolverArrays
+from .dense_rows import DENSE_ROWS, MF_ROWS, RowSupport
+from .field_group import Field, FieldGroup, SolverArrays
 from .row_kernels import RIGID_SPEED_ROWS
 from .row_laws import LINK_ROWS
 from .row_metadata import _validate_mf_metadata_encoding
 from .row_slots import place_world_contact_runs, record_world_contact_runs
-from .solver_fields import (
-    CAPACITY_STATUS,
-    CONTACT_RUNS,
-    DENSE_ROW_EPS,
-    DENSE_ROW_WEIGHTS,
-    DENSE_ROWS,
-    DENSE_WARMSTART,
-    FUSED_DIAGONAL_LIMITS,
-    MF_ROWS,
-    OVERFLOW_WARNING,
-    ROW_SLOT_UNBOUNDED,
-    ROW_STATUS,
-    ROW_WATERMARKS,
-    SIZE_JACOBIAN,
-    SPARSE_CONTACT_GROUPS,
-    SPARSE_CONTACT_SERIAL,
-    SPARSE_DIAGONAL_ROWS,
-    WORLD_ROW_STATE,
-)
 from .warm_start import prepare_world_impulses
+
+ROW_SLOT_UNBOUNDED = 2**31 - 1
+"""First rejected slot of a row family that rejected none this step."""
+
+SIZE_JACOBIAN = FieldGroup(Field("J", wp.float32, ("response_art", "response_row", "response_size")))
+"""One size group's Jacobian. The matrix-free sweeps' producers write the packed rows instead (:mod:`.packed_rows`):
+their Jacobian is a (1, 1, 1) placeholder."""
+
+DENSE_ROW_WEIGHTS = FieldGroup(Field("row_w", wp.float32, ("world", "row"), fill=1.0, owner="placement"))
+"""Per-row weights of the regularized row law: the relative option's (speculative and restitution rows keep the rigid
+law) or a material contact's ``d / (d + eps)``."""
+
+DENSE_ROW_EPS = FieldGroup(Field("row_eps", wp.float32, ("world", "row"), owner="placement"))
+"""Per-row compliance of material contact normals (``contact_compliance``); zero elsewhere."""
+
+DENSE_WARMSTART = FieldGroup(
+    Field("ws_prev_dense_impulses", wp.float32, ("world", "row"), owner="placement"),
+    Field("ws_prev_dense_row_type", wp.int32, ("world", "row"), fill=-1, owner="placement"),
+    Field("ws_prev_dense_row_parent", wp.int32, ("world", "row"), fill=-1, owner="placement"),
+)
+"""Identity-matched warm-start carry of the row store: last step's converged impulses and their row types."""
+
+FUSED_DIAGONAL_LIMITS = FieldGroup(
+    Field("fused_diagonal_limit_active", wp.int32, ("world", "world_dof"), owner="placement"),
+    Field("fused_diagonal_limit_lower_rhs", wp.float32, ("world", "world_dof"), owner="placement"),
+    Field("fused_diagonal_limit_upper_rhs", wp.float32, ("world", "world_dof"), owner="placement"),
+    Field("fused_diagonal_limit_lower_lambda", wp.float32, ("world", "world_dof"), owner="placement"),
+    Field("fused_diagonal_limit_upper_lambda", wp.float32, ("world", "world_dof"), owner="placement"),
+)
+"""Position limits fused into the diagonal-mass sweep, outside the dense row system."""
+
+ROW_CLASSES = 2
+"""The row store's classes: 0 the dense rows, 1 the free bodies' (from the store's body base)."""
+
+ROW_STATUS = FieldGroup(
+    Field("row_count", wp.int32, (ROW_CLASSES, "world"), owner="placement"),
+    Field("row_slot_counter", wp.int32, (ROW_CLASSES, "world"), owner="placement"),
+    Field("row_first_rejected", wp.int32, (ROW_CLASSES, "world"), fill=ROW_SLOT_UNBOUNDED, owner="placement"),
+)
+"""Each row class's status by class and world: its rows, its reservation counter and its first rejected slot (a
+reservation that does not fit rejects its contact and latches the world). A class's row is its own array: the dense
+rows' ``constraint_count``, ``slot_counter`` and ``dense_first_rejected_slot``, the free bodies' ``mf_*``
+(:meth:`.placement.Placement.allocate_world_rows`)."""
+
+WORLD_ROW_STATE = FieldGroup(
+    # Per-world dense row-family boundaries, snapshotted from slot_counter each step. The dense slot layout is
+    # [mimic][joint-limit][joint-vel-limit][contact/friction], so [world, 0] ends the mimic and position-limit
+    # prefix, [world, 1] the velocity-limit segment, and contacts/friction occupy [bounds[world, 1], m_dense).
+    Field("dense_phase_bounds", wp.int32, ("world", 2), owner="placement"),
+    # First matrix-free slot past the contact/friction rows (start of the velocity-limit tail).
+    Field("mf_contact_rows_end", wp.int32, ("world",), owner="placement"),
+)
+"""Per-world row-family boundaries: the dense rows' phases and the free bodies' contact rows' end."""
+
+CONTACT_RUNS = FieldGroup(
+    Field("contact_run_first", wp.int32, ("world", "run_block"), fill=2**31 - 1, owner="placement"),
+    Field("contact_run_last", wp.int32, ("world", "run_block"), fill=-1, owner="placement"),
+    Field("contact_run_rows", wp.vec2i, ("world", "run_block"), owner="placement"),
+)
+"""Contact runs of each world and shape block under sorted contacts (``record_world_contact_runs``)."""
+
+ROW_WATERMARKS = FieldGroup(
+    *(
+        Field(name, wp.int32, (1,), owner="placement")
+        for name in (
+            "row_watermark_dense",
+            "row_watermark_mf",
+            "row_watermark_contact",
+            "row_watermark_dense_raw",
+            "row_watermark_mf_raw",
+            "row_dropped_dense_high_water",
+            "row_dropped_mf_high_water",
+            "row_overflow_dense_excess",
+            "row_overflow_mf_excess",
+            "row_overflow_dense_world_steps",
+            "row_overflow_mf_world_steps",
+        )
+    )
+)
+"""Whole-run row high-water telemetry for explicit readback (``row_watermark``)."""
+
+SPARSE_DIAGONAL_ROWS = FieldGroup(
+    Field("sparse_diagonal_row_dof", wp.int32, ("world", "row", 2), fill=-1, owner="placement"),
+    Field("sparse_diagonal_row_z", wp.float32, ("world", "row", 2), owner="placement"),
+)
+"""Each sparse-diagonal row's two response coordinates and their whitened entries ``J / sqrt(m)``."""
+
+SPARSE_CONTACT_GROUPS = FieldGroup(
+    Field("sparse_contact_group_count", wp.int32, ("world",), owner="placement"),
+    Field("sparse_contact_group_heads", wp.int32, ("world", "world_dof"), fill=None, owner="placement"),
+)
+"""Independent contact groups per world (triples or units), by head row."""
+
+SPARSE_CONTACT_SERIAL = FieldGroup(
+    Field("sparse_contact_serial_count", wp.int32, ("world",), owner="placement"),
+    Field("sparse_contact_serial_normals", wp.int32, ("world", "serial"), fill=None, owner="placement"),
+)
+"""Contacts solved serially after the speculative batches, by normal row."""
+
+CAPACITY_STATUS = FieldGroup(
+    Field("constraint_capacity_status", wp.int32, (2,), owner="placement"),
+    Field("constraint_overflow", wp.bool, ("world",), owner="placement"),
+    Field("row_dropped_all", wp.int32, (2, "status_world"), owner="placement"),
+)
+"""Sticky capacity flags of the dense and matrix-free rows, the per-world overflow latch and dropped rows."""
+
+OVERFLOW_WARNING = FieldGroup(Field("row_overflow_warning_emitted", wp.int32, (2,), owner="placement"))
+"""The one-shot overflow warning latch of each row family."""
+
 
 __all__ = ["Placement"]
 

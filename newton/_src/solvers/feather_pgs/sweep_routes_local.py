@@ -23,9 +23,10 @@ from functools import cache
 import warp as wp
 
 from ...core.execution import arch_budget, resident_blocks
-from . import kernel_template
+from . import field_group, kernel_template
 from .dense_rows import MfRows
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
+from .field_group import Field
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
 from .packed_rows import PACKED_SIDES
@@ -35,7 +36,6 @@ from .row_inputs import RowArgument, StoredLocalRows
 from .row_kernels import PGS_CONSTRAINT_TYPE_SPEED
 from .row_metadata import _mf_parent_expression
 from .solve_policy import DEFAULT_POLICY, SolvePolicy
-from .solver_fields import LocalOwners
 from .staging import Buffer, Staging
 from .sweep import (
     CONTACT,
@@ -66,6 +66,23 @@ from .sweep import (
 )
 from .sweep_routes_tiers import REGISTER_WARPS
 from .tree_factor import WalkTrees
+
+LOCAL_OWNERS = (
+    Field("primary_articulation", wp.int32, ("world",), owner="sweep", attr="local_primary_articulation"),
+    Field("pair_articulation", wp.int32, ("world",), owner="sweep", attr="local_pair_articulation"),
+    Field("residual_pair_articulation", wp.int32, ("world",), owner="sweep", attr="local_residual_pair_articulation"),
+    Field("max_rows", wp.int32, owner="sweep", attr="local_solve_max_rows"),
+    Field("residual_max_rows", wp.int32, owner="sweep", attr="local_residual_max_rows"),
+    Field("residual_mf_max_rows", wp.int32, owner="sweep", attr="local_residual_mf_max_rows"),
+    Field("owner", wp.int32, ("world",), attr="local_solve_owner", owner="placement"),
+    Field("general_world_count", wp.int32, (1,), owner="sweep", attr="local_general_world_count"),
+    Field("general_worlds", wp.int32, ("world",), owner="sweep", attr="local_general_worlds"),
+)
+"""Each world's local-solve candidates (its primary articulation and paired articulations), the local row limits,
+and the per-step owner of each world with the compact list of the general solver's worlds."""
+
+LocalOwners = field_group.struct("LocalOwners", LOCAL_OWNERS, __name__)
+
 
 # ---------------------------------------------------------------------------------------------------------------------
 # The local owners: a lane group per articulation (and its free body), the response block built in the kernel

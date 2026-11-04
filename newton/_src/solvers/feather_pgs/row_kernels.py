@@ -7,15 +7,39 @@ The row types, the rows' rhs by their law (:func:`row_bias`), the link rows of a
 bodies' speed rows' slots, and the star's fused diagonal joint limits.
 """
 
+import dataclasses
+
 import warp as wp
 
 from ...sim import BodyFlags
+from . import field_group
 from .contact_laws import jacobian_entry, spin_entry
 from .dense_rows import UNIT_LINK, DenseRows, RowSupport, clear_side, jacobian_row, row_sides, unit_source
 from .device_preludes import reserve
+from .field_group import Field, FieldGroup
 from .joint_table import FreeBodies, JointTable
 from .row_laws import LINK_ROWS, contact_restitution_rhs, joint_limit_side, limit_rhs, row_rhs, velocity_limit_active
-from .solver_fields import Links
+
+LINK_PLAN = FieldGroup(
+    Field("_link_primary", wp.int32, ("link",), owner="laws"),
+    Field("_link_shadow", wp.int32, ("link",), owner="laws"),
+    Field("_link_world", wp.int32, ("link",), owner="laws"),
+    Field("_link_enabled", wp.int32, ("link",), owner="laws"),
+)
+"""Each link's two pieces (:mod:`.body_cut`), world and enable bit."""
+
+LINK_SLOTS = FieldGroup(Field("link_slot", wp.int32, ("link",), fill=-1, owner="laws"))
+
+Links = field_group.struct(
+    "Links",
+    (
+        dataclasses.replace(LINK_SLOTS["link_slot"], name="slot", attr="link_slot"),
+        *(dataclasses.replace(field, name=field.name.removeprefix("_link_"), attr=field.name) for field in LINK_PLAN),
+    ),
+    __name__,
+)
+"""The links' tables (:data:`LINK_PLAN`) and their dense slots."""
+
 
 PGS_CONSTRAINT_TYPE_CONTACT = 0
 # A free rigid body's speed row: it bounds the magnitude of the body's linear or angular velocity (type 1 was the

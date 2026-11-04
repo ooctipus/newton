@@ -32,9 +32,18 @@ from ...sim.enums import JointType
 from . import host_index
 from .body_cut import BodyCut
 from .body_mapping import build_body_maps
-from .field_group import SolverArrays
-from .solver_fields import BODY_MAPS
+from .field_group import Field, FieldGroup, SolverArrays
 from .tree_plan import TreePlan
+
+BODY_MAPS = FieldGroup(
+    Field("body_to_joint", wp.int32, ("body",), owner="forest"),
+    Field("body_to_articulation", wp.int32, ("body",), owner="forest"),
+    Field("body_has_response_dofs", wp.int32, ("body",), owner="forest"),
+    Field("body_response_dof_mask", wp.uint32, ("body",), owner="forest"),
+    Field("body_single_response_dof", wp.int32, ("body",), owner="forest"),
+)
+"""Each body's tree joint, articulation, response presence, low-32 response support and single response DOF."""
+
 
 __all__ = ["ForestPlan", "joint_forest", "row_support"]
 

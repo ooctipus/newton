@@ -19,6 +19,13 @@ Everything else derives from it:
 Shapes are tuples of dimension names (``("world", "row")``) or fixed lengths,
 resolved by the sizes an allocation passes; a feature that is off allocates its
 group at the sizes of its placeholder (for example one row per world).
+
+Each primitive declares its own groups. The solver's dimension names: ``dof``
+(joint DOFs), ``articulation``, ``body``, ``world``, ``row`` (the row store's
+rows per world line: the dense class's, then the free bodies'), ``mf_row``
+(free-body rows per world), ``mf_body`` (matrix-free bodies per world),
+``world_dof`` (DOFs of the widest world), ``art``/``size`` (articulations and
+DOFs of one size group).
 """
 
 from __future__ import annotations

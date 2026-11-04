@@ -53,6 +53,7 @@ from .dense_rows import (
     unit_source,
 )
 from .device_preludes import DevicePrelude, dual_native, lane_group, substitute
+from .factor.fields import Preelim
 from .field_group import Field
 from .friction_patches import PatchRowLaw
 from .joint_table import FreeBodies
@@ -62,7 +63,6 @@ from .response_builds_rows import close_block, close_row
 from .row_build import write_contact_row
 from .row_kernels import PGS_CONSTRAINT_TYPE_SPEED, RIGID_SPEED_ROWS, RowBias, row_bias
 from .row_laws import LINK_ROWS
-from .solver_fields import Preelim
 from .sparse_mass_matrix import _SparseRowSupport
 from .tree_factor import (
     WALK_COORDINATE,

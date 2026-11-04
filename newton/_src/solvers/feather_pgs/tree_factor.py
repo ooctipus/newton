@@ -34,6 +34,18 @@ from ...sim import BodyFlags, JointType, ModelFlags
 from . import field_group, host_index, response_builds_rows
 from . import tree_scan as ts
 from .device_preludes import DevicePrelude, substitute
+from .factor.fields import (
+    ARTICULATION_ORIGIN,
+    ARTICULATION_WORK,
+    AUGMENTED_DRIVE_ROWS,
+    BODY_INERTIA,
+    PREELIMINATION,
+    PREELIMINATION_PLAN,
+    STATE_AUX,
+    DriveRows,
+    Preelim,
+    hold_drive_row,
+)
 from .factor.kernels import (
     apply_free_root_velocity_corrections,
     build_mass_update_mask,
@@ -46,18 +58,6 @@ from .factor.kernels import (
 from .field_group import SolverArrays
 from .joint_table import JointTable
 from .row_laws import LINK_ROWS
-from .solver_fields import (
-    ARTICULATION_ORIGIN,
-    ARTICULATION_WORK,
-    AUGMENTED_DRIVE_ROWS,
-    BODY_INERTIA,
-    PREELIMINATION,
-    PREELIMINATION_PLAN,
-    STATE_AUX,
-    DriveRows,
-    Preelim,
-    hold_drive_row,
-)
 from .spatial_laws import drive_force, drive_stiffness, spring_damper_stiffness
 from .tree_scan import (
     WALK_AHEAD,
@@ -395,7 +395,7 @@ class TreeFactor:
         )
 
     def blocks(self):
-        """The bilateral blocks (:data:`.solver_fields.Preelim`) the one writer's block phase closes."""
+        """The bilateral blocks (:data:`.factor.fields.Preelim`) the one writer's block phase closes."""
         return field_group.bind(Preelim, factor=self)
 
     def seed_blocks(self, *, first, rhs, impulses) -> None:
@@ -723,7 +723,7 @@ class TreeFactor:
         return None if dynamics_stream is None else dynamics_stream.record_event()
 
     def drive_rows(self, v_hat: wp.array, v_out: wp.array) -> DriveRows:
-        """What a step's drives write (:func:`.solver_fields.hold_drive_row`); ``v_hat`` and ``v_out`` are last step's."""
+        """What a step's drives write (:func:`.factor.fields.hold_drive_row`); ``v_hat`` and ``v_out`` are last step's."""
         return field_group.bind(DriveRows, factor=self, v_hat=v_hat, v_out=v_out)
 
     def refresh(self, drive_rows_ready: wp.Event | None, step: int) -> None:

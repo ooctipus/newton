@@ -10,7 +10,7 @@ import warp as wp
 import newton
 from newton._src.sim.enums import JointType
 from newton._src.solvers.feather_pgs import field_group
-from newton._src.solvers.feather_pgs.solver_fields import DriveRows
+from newton._src.solvers.feather_pgs.factor.fields import DriveRows
 from newton._src.solvers.feather_pgs.tree_factor import prepare_augmented_drives
 
 
