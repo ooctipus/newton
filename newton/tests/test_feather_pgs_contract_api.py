@@ -144,9 +144,13 @@ def test_readouts_answer_only_when_asked(test, device):
     audit = solver.read_audit()
     record = solver.get_path_selection()["routes"]["diagnostics"]["audit"]
     test.assertEqual(set(audit), set(record["slots"]))
-    # A world whose rows exist only inside its sweep (row packets, keyed rows) reads NaN, as the record says.
+    # A world whose rows exist only inside its sweep (row packets, keyed rows) reads NaN, as the record says; a world
+    # the classifier resolved holds no row anywhere, so its audit reads a value.
+    resolved = solver.sweep.resolved_worlds.numpy()
     if record["reason"] == "Reads every row of every world.":
         test.assertEqual(int(audit["steps"][0]), STEPS)
+    elif resolved.shape[0] and resolved[0]:
+        test.assertTrue(np.isfinite(audit["gap"][0]), record["reason"])
     else:
         test.assertTrue(np.isnan(audit["gap"][0]), record["reason"])
     test.assertGreater(solver.constraint_row_watermarks()["contact_high_water"], 0)
