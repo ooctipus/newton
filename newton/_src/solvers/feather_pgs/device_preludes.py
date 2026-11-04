@@ -591,48 +591,94 @@ def lane_word(body: str, lanes: int | str = 32, preludes: tuple[DevicePrelude, .
     return dual_native(body, preludes=(lane_group(lanes), *preludes))
 
 
-@wp.func_native(lane_word("    MINIMUM(value);\n    return value;\n", "lanes"))
+# The lane group as Warp functions: each word a ``wp.func`` whose native body carries the group's one text, so any Warp
+# kernel, a megakernel included, calls it with no module option. ``lanes`` is an operand (a power of two up to 32, the
+# same on every lane of the group); a literal folds once the function is inlined. On the CPU one thread is the group.
+_RETURN = "    return {};\n"
+_REDUCE = "    {}(value);\n    return value;\n"
+
+
+@wp.func_native(lane_word(_RETURN.format("LANE"), "lanes"))
+def lane_index(lanes: int) -> int:
+    """This thread's lane in its group (0 on the CPU)."""
+
+
+@wp.func_native(lane_word(_RETURN.format("STRIDE"), "lanes"))
+def lane_stride(lanes: int) -> int:
+    """The stride of a group-strided loop: ``lanes``, or 1 on the CPU, where one thread runs the group."""
+
+
+@wp.func_native(lane_word("    SYNC();\n", "lanes"))
+def lane_sync(lanes: int):
+    """Synchronize this thread's group."""
+
+
+@wp.func_native(lane_word(_RETURN.format("ANY(p)"), "lanes"))
+def lane_any(p: bool, lanes: int) -> bool:
+    """Whether ``p`` holds on a lane of the group."""
+
+
+@wp.func_native(lane_word(_RETURN.format("ALL(p)"), "lanes"))
+def lane_all(p: bool, lanes: int) -> bool:
+    """Whether ``p`` holds on every lane of the group."""
+
+
+@wp.func_native(lane_word(_RETURN.format("READ(value, source)"), "lanes"))
+def lane_read(value: float, source: int, lanes: int) -> float:
+    """Lane ``source``'s ``value``, on every lane of the group."""
+
+
+@wp.func_native(lane_word(_RETURN.format("READ(value, source)"), "lanes"))
+def lane_read(value: int, source: int, lanes: int) -> int:
+    """Lane ``source``'s ``value``, on every lane of the group."""
+
+
+@wp.func_native(lane_word(_REDUCE.format("SUM"), "lanes"))
+def lane_sum(value: float, lanes: int) -> float:
+    """The group's sum of ``value``, on every lane (a butterfly, the same bits on every lane)."""
+
+
+@wp.func_native(lane_word(_REDUCE.format("SUM"), "lanes"))
+def lane_sum(value: int, lanes: int) -> int:
+    """The group's sum of ``value``, on every lane."""
+
+
+@wp.func_native(lane_word(_REDUCE.format("MINIMUM"), "lanes"))
 def lane_minimum(value: float, lanes: int) -> float:
-    """Return the least ``value`` of this thread's group of ``lanes`` lanes (``value`` on the CPU).
-
-    Every lane of the group must call it with the same power-of-two ``lanes`` of at most 32.
-    """
+    """The group's least ``value``, on every lane."""
 
 
-@wp.func_native(lane_word("    SUM(value);\n    return value;\n"))
+@wp.func_native(lane_word(_REDUCE.format("MAXIMUM"), "lanes"))
+def lane_maximum(value: float, lanes: int) -> float:
+    """The group's greatest ``value``, on every lane."""
+
+
+@wp.func_native(lane_word(_RETURN.format("SCAN(value)"), "lanes"))
+def lane_scan(value: int, lanes: int) -> int:
+    """The sum of ``value`` over the group's lower lanes (0 on the CPU)."""
+
+
+# The old names, kept while track R's row_slots.py and row_packets.py call them (ZXB): a warp's group of the above.
+@wp.func
 def warp_sum(value: int) -> int:
-    """Return the sum of ``value`` over this thread's warp (``value`` on the CPU, where a thread is alone).
-
-    Every lane of the warp must call it.
-    """
+    return lane_sum(value, 32)
 
 
-@wp.func_native(lane_word("    return SCAN(value);\n"))
+@wp.func
 def warp_scan(value: int) -> int:
-    """Return the sum of ``value`` over the lower lanes of this thread's warp (0 on the CPU).
-
-    Every lane of the warp must call it.
-    """
+    return lane_scan(value, 32)
 
 
-@wp.func_native(lane_word("    SYNC();\n"))
+@wp.func
 def warp_sync():
-    """Synchronize this thread's warp (nothing on the CPU)."""
+    lane_sync(32)
 
 
-@wp.func_native(lane_word("    return LANE;\n"))
+@wp.func
 def warp_lane() -> int:
-    """Return this thread's lane in its warp (0 on the CPU)."""
+    return lane_index(32)
 
 
-@wp.func_native(lane_word("    return STRIDE;\n"))
+@wp.func
 def warp_stride() -> int:
-    """Return the stride of a warp-strided loop: 32, or 1 on the CPU, where one thread runs the warp's lanes."""
-
-
-@wp.func_native(lane_word("    return wp::vec3(READ(value[0], 0), READ(value[1], 0), READ(value[2], 0));\n"))
-def warp_broadcast(value: wp.vec3) -> wp.vec3:
-    """Return lane 0's ``value`` on every lane of this thread's warp (``value`` on the CPU).
-
-    Every lane of the warp must call it.
-    """
+    return lane_stride(32)

@@ -23,7 +23,17 @@ from newton._src.solvers.feather_pgs.device_preludes import (
     SHARED_STORAGE,
     cuda_native,
     dual_native,
+    lane_all,
+    lane_any,
     lane_group,
+    lane_index,
+    lane_maximum,
+    lane_minimum,
+    lane_read,
+    lane_scan,
+    lane_stride,
+    lane_sum,
+    lane_sync,
     memory_words,
     reserve,
     reserved_count,
@@ -424,6 +434,74 @@ class TestMemoryToolkit(unittest.TestCase):
             toolkit.table("PARENT", (-1, 0, 1)),
             ("    static __constant__ int PARENT[3] = {-1, 0, 1};", "    static const int PARENT[3] = {-1, 0, 1};"),
         )
+
+
+@cache
+def _lane_functions_kernel(lanes):
+    """A Python kernel over the lane group's Warp functions: what a megakernel composes."""
+
+    def kernel(values: wp.array[float], floats: wp.array2d[float], ints: wp.array2d[int]):
+        tid = wp.tid()
+        x = values[tid]
+        lane_sync(lanes)
+        floats[tid, 0] = lane_sum(x, lanes)
+        floats[tid, 1] = lane_minimum(x, lanes)
+        floats[tid, 2] = lane_maximum(x, lanes)
+        floats[tid, 3] = lane_read(x, 1, lanes)
+        ints[tid, 0] = lane_sum(tid, lanes)
+        ints[tid, 1] = lane_scan(1, lanes)
+        ints[tid, 2] = lane_read(tid, 0, lanes)
+        ints[tid, 3] = lane_index(lanes) + 100 * lane_stride(lanes)
+        ints[tid, 4] = wp.where(lane_any(x > 0.0, lanes), 1, 0) + 2 * wp.where(lane_all(x > -10.0, lanes), 1, 0)
+
+    kernel.__name__ = kernel.__qualname__ = f"lane_functions_probe_{lanes}"
+    return wp.kernel(enable_backward=False, module="unique")(kernel)
+
+
+def _run_lane_functions(lanes, device, count=64):
+    values = np.random.default_rng(5).normal(size=count).astype(np.float32)
+    floats = wp.zeros((count, 4), dtype=float, device=device)
+    ints = wp.zeros((count, 5), dtype=int, device=device)
+    wp.launch(
+        _lane_functions_kernel(lanes),
+        dim=count,
+        inputs=[wp.array(values, device=device)],
+        outputs=[floats, ints],
+        block_dim=64,
+        device=device,
+    )
+    return values, floats.numpy(), ints.numpy()
+
+
+class TestLaneFunctions(unittest.TestCase):
+    def test_on_the_cpu_one_thread_is_the_group(self):
+        values, floats, ints = _run_lane_functions(8, "cpu")
+        for column in range(4):
+            np.testing.assert_array_equal(floats[:, column], values)
+        tid = np.arange(len(values))
+        np.testing.assert_array_equal(ints[:, 0], tid)
+        np.testing.assert_array_equal(ints[:, 1], 0)
+        np.testing.assert_array_equal(ints[:, 2], tid)
+        np.testing.assert_array_equal(ints[:, 3], 100)
+        np.testing.assert_array_equal(ints[:, 4], (values > 0) + 2)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "lane functions exchange values on CUDA warps")
+    def test_on_cuda_against_host_references(self):
+        for lanes in (8, 32):
+            with self.subTest(lanes=lanes):
+                values, floats, ints = _run_lane_functions(lanes, wp.get_cuda_device())
+                groups = values.reshape(-1, lanes)
+                tid = np.arange(len(values))
+                np.testing.assert_allclose(floats[:, 0], np.repeat(groups.sum(axis=1), lanes), rtol=1e-5, atol=1e-5)
+                np.testing.assert_array_equal(floats[:, 1], np.repeat(groups.min(axis=1), lanes))
+                np.testing.assert_array_equal(floats[:, 2], np.repeat(groups.max(axis=1), lanes))
+                np.testing.assert_array_equal(floats[:, 3], np.repeat(groups[:, 1], lanes))
+                np.testing.assert_array_equal(ints[:, 0], np.repeat(tid.reshape(-1, lanes).sum(axis=1), lanes))
+                np.testing.assert_array_equal(ints[:, 1], tid % lanes)
+                np.testing.assert_array_equal(ints[:, 2], tid - tid % lanes)
+                np.testing.assert_array_equal(ints[:, 3], tid % lanes + 100 * lanes)
+                any_ = np.repeat((groups > 0).any(axis=1), lanes)
+                np.testing.assert_array_equal(ints[:, 4], any_ + 2)
 
 
 if __name__ == "__main__":
