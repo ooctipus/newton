@@ -31,26 +31,21 @@ import warp as wp
 
 from ...sim import ModelFlags
 from . import field_group, sweep_routes_local
-from .contact_input import ContactInput
+from .contact_input import ContactInput, contact_frame
 from .contact_laws import (
     CONTACT_SPIN_ROW,
-    contact_bodies,
-    contact_point,
-    contact_points,
     contact_row_frame,
-    contact_tangent_basis,
 )
 from .dense_rows import UNIT_CONTACT, UNIT_LIMIT, UNIT_MIMIC, UNIT_SHIFT, unit_source
 from .device_preludes import (
     lane_group,
     reserved_count,
-    warp_broadcast,
     warp_lane,
     warp_stride,
     warp_sync,
 )
 from .field_group import Field, FieldGroup, SolverArrays
-from .friction_patches import PatchRowLaw, patch_friction_location, patch_row_law
+from .friction_patches import PatchRowLaw, patch_row_law
 from .kernel_template import KernelTemplate, substitute
 from .kernels import PGS_CONSTRAINT_TYPE_SPEED
 from .prefix_rows import LAW, limits, prefix_rows
@@ -379,34 +374,15 @@ def produce_contacts(
         rows = data.slots_needed[contact]
         art0 = data.art0[contact]
         art1 = data.art1[contact]
-        body0, body1 = contact_bodies(data.shape0[contact], data.shape1[contact], data.shape_body)
-        normal = wp.vec3()
-        point = wp.vec3()
-        tangent0 = wp.vec3()
-        tangent1 = wp.vec3()
-        if lane == 0:
-            normal, translation_a, offset_a, _translation_b, _offset_b, separation, _phi = contact_points(
-                data.normal[contact],
-                data.point0[contact],
-                data.point1[contact],
-                data.margin0[contact],
-                data.margin1[contact],
-                body0,
-                body1,
-                data.body_q,
-            )
-            point = contact_point(translation_a, offset_a, separation)
-            tangent0, tangent1 = contact_tangent_basis(normal)
-        normal = warp_broadcast(normal)
-        point = warp_broadcast(point)
-        tangent0 = warp_broadcast(tangent0)
-        tangent1 = warp_broadcast(tangent1)
-        friction_point = point
-        if law.patches.enabled != 0:
-            friction_point = patch_friction_location(law.patches, contact)
+        # The contact's front end, formed once for the lane's rows: each lane forms the same frame.
+        frame = contact_frame(data, law, contact)
+        body0 = frame.body_a
+        body1 = frame.body_b
         for row in range(lane, rows, stride):
             if slot + row < capacity:
-                direction, row_point = contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
+                direction, row_point = contact_row_frame(
+                    row, frame.normal, frame.tangent0, frame.tangent1, frame.point, frame.friction_point
+                )
                 spin = row == CONTACT_SPIN_ROW
                 code_a, w_a = packet_seed(walk, data, body0, art0, primary, secondary, 1.0, direction, row_point, spin)
                 code_b, w_b = packet_seed(walk, data, body1, art1, primary, secondary, -1.0, direction, row_point, spin)
@@ -415,7 +391,7 @@ def produce_contacts(
                     packet.seed[world, slot + row, 6 + k] = w_b[k]
                 packet.seed_body[world, slot + row, 0] = code_a
                 packet.seed_body[world, slot + row, 1] = code_b
-            write_contact_row(data, law, contact, row, True)
+            write_contact_row(data, law, frame, contact, row, True)
             units[data.first[world], slot + row] = unit_source(UNIT_CONTACT, 4 * contact + row)
             if slot + row < capacity:
                 packet.row_contact[world, slot + row] = contact * 3 + row

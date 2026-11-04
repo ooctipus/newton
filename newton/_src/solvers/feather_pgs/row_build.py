@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import warp as wp
 
-from .contact_input import ContactInput, contact_frame
+from .contact_input import ContactFrame, ContactInput, contact_frame
 from .contact_laws import (
     CONTACT_SPIN_ROW,
     contact_friction,
@@ -122,9 +122,10 @@ def _contact_row_prelude_one(
         if data.slots_needed[c] > CONTACT_SPIN_ROW:
             flags |= 16
         pre_flags[c] = flags
-    write_contact_row(data, law, c, r, False)
+    frame = contact_frame(data, law, c)
+    write_contact_row(data, law, frame, c, r, False)
     if r == 2 and data.slots_needed[c] > CONTACT_SPIN_ROW:
-        write_contact_row(data, law, c, CONTACT_SPIN_ROW, False)
+        write_contact_row(data, law, frame, c, CONTACT_SPIN_ROW, False)
 
 
 @wp.kernel(enable_backward=False)
@@ -171,20 +172,20 @@ def populate_contact_J(
     """Write coordinate ``lane`` of contact ``c``'s rows when its flags mark it active (:func:`contact_row_prelude`)."""
     if (flags & 1) == 0:
         return
-    body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
+    frame = contact_frame(data, law, c)
     _write_contact_jacobian_lane(
         lane,
         flags,
         data.slot[c],
         data.art0[c],
         data.art1[c],
-        body_a,
-        body_b,
-        normal,
-        tangent0,
-        tangent1,
-        point,
-        friction_point,
+        frame.body_a,
+        frame.body_b,
+        frame.normal,
+        frame.tangent0,
+        frame.tangent1,
+        frame.point,
+        frame.friction_point,
         data,
         size_a,
         art_group_idx,
@@ -346,11 +347,11 @@ def contact_normal_beta(data: ContactInput, c: int, body_a: int, body_b: int, ph
 
 
 @wp.func
-def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, with_rhs: bool):
+def write_contact_row(data: ContactInput, law: PatchRowLaw, frame: ContactFrame, c: int, row: int, with_rhs: bool):
     """Write contact ``c``'s row ``row`` (0 the normal, 1 and 2 the tangents, 3 the spin row under contact torsion)
-    at ``slot + row`` from its front end
-    (:func:`.contact_input.contact_frame`): its dense records and, ``with_rhs``, its position-pass ``rhs`` and the CFM
-    seed of its diagonal; return its bodies and frame ``(body_a, body_b, direction, row_point)``.
+    at ``slot + row`` from its front end ``frame`` (:func:`.contact_input.contact_frame`, formed once for the
+    contact's rows): its dense records and, ``with_rhs``, its position-pass ``rhs`` and the CFM seed of its diagonal;
+    return its bodies and frame ``(body_a, body_b, direction, row_point)``.
 
     Every contact row producer writes its records here; the general route forms its rhs later. A tangent row follows
     the friction row law (:func:`.friction_patches.patch_tangent_row`): the anchor's tangential displacement as its
@@ -365,7 +366,11 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
     whether or not ``with_rhs``, it takes no restitution, and its tangents' coefficient takes the contact's friction
     scale (zero meaning one).
     """
-    body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
+    body_a = frame.body_a
+    body_b = frame.body_b
+    normal = frame.normal
+    point = frame.point
+    phi = frame.phi
     art_a = data.art0[c]
     art_b = data.art1[c]
     world = data.world[c]
@@ -377,7 +382,7 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
         stiffness = data.stiffness[c]
     if stiffness > 0.0:
         restitution = 0.0
-    direction, row_point = contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
+    direction, row_point = contact_row_frame(row, normal, frame.tangent0, frame.tangent1, point, frame.friction_point)
     target = prescribed_target(
         body_a, art_a, body_b, art_b, row_point, direction, data.prescribed, data.origin, data.body_v
     )

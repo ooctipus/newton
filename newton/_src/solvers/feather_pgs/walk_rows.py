@@ -39,7 +39,7 @@ from functools import cache
 import warp as wp
 
 from . import field_group
-from .contact_input import ContactInput, contact_frame
+from .contact_input import ContactFrame, ContactInput, contact_frame
 from .contact_laws import CONTACT_SPIN_ROW, contact_row_entry, contact_seed, spin_seed
 from .dense_rows import (
     UNIT_CONTACT,
@@ -222,24 +222,22 @@ def unit_reader(links: bool, unit_rows: int = 1) -> wp.Function:
         unit.dof1 = -1
         if kind == UNIT_CONTACT:
             c = index // 4
-            unit.row = index - 4 * c
+            frame = contact_frame(data, law, c)
             if wp.static(unit_rows > 1):
+                unit.row = index - 4 * c
                 unit.rows = wp.min(data.slots_needed[c], wp.static(unit_rows))
-                body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
-                unit.frame = wp.matrix_from_rows(normal, tangent0, tangent1)
-                unit.friction_point = friction_point
+                unit.frame = wp.matrix_from_rows(frame.normal, frame.tangent0, frame.tangent1)
+                unit.friction_point = frame.friction_point
+                unit.art_a = data.art0[c]
+                unit.body_a = frame.body_a
+                unit.art_b = data.art1[c]
+                unit.body_b = frame.body_b
+                unit.point = frame.point
+                unit.point_b = frame.point
+                if unit.row == CONTACT_SPIN_ROW:
+                    unit.torque = 1
             else:
-                body_a, body_b, direction, point = write_contact_row(data, law, c, unit.row, False)
-                unit.frame = wp.matrix_from_rows(direction, direction, direction)
-                unit.friction_point = point
-            unit.art_a = data.art0[c]
-            unit.body_a = body_a
-            unit.art_b = data.art1[c]
-            unit.body_b = body_b
-            unit.point = point
-            unit.point_b = point
-            if unit.row == CONTACT_SPIN_ROW:
-                unit.torque = 1
+                unit = contact_row_unit(data, law, frame, c, index - 4 * c, line, slot)
         elif wp.static(links) and kind == UNIT_LINK:
             k = index // LINK_ROWS
             row = index - LINK_ROWS * k
@@ -746,6 +744,34 @@ class RowUnit:
     value1: float
 
 
+@wp.func
+def contact_row_unit(
+    data: ContactInput, law: PatchRowLaw, frame: ContactFrame, c: int, row: int, line: int, slot: int
+) -> RowUnit:
+    """Contact ``c``'s row ``row`` as its own unit at row ``slot``, from the contact's front end ``frame``: its records
+    by the contact law (:func:`.row_build.write_contact_row`), its bodies, direction and point (the spin row a torque
+    about the normal)."""
+    body_a, body_b, direction, point = write_contact_row(data, law, frame, c, row, False)
+    unit = RowUnit()
+    unit.line = line
+    unit.slot = slot
+    unit.rows = 1
+    unit.row = row
+    unit.frame = wp.matrix_from_rows(direction, direction, direction)
+    unit.art_a = data.art0[c]
+    unit.body_a = body_a
+    unit.art_b = data.art1[c]
+    unit.body_b = body_b
+    unit.point = point
+    unit.point_b = point
+    unit.friction_point = point
+    unit.dof0 = -1
+    unit.dof1 = -1
+    if row == CONTACT_SPIN_ROW:
+        unit.torque = 1
+    return unit
+
+
 def unit_walker(name: str, snippet: str) -> wp.Function:
     """The one unit walker's native function of name ``name`` over a placement's sink and a unit (:class:`RowSink`,
     :class:`RowUnit`): ``snippet`` is :data:`_SUPPORT` with the placement's slots filled."""
@@ -952,7 +978,7 @@ def support_units_kernel(unit_rows: int, lanes: int) -> wp.Kernel:
                 if kind == UNIT_CONTACT:
                     c = index // 4
                     row = index - 4 * c
-                    write_contact_row(data, law, c, row, False)
+                    write_contact_row(data, law, contact_frame(data, law, c), c, row, False)
                     if row == 0:
                         if wp.min(data.slots_needed[c], wp.static(unit_rows)) > 1:
                             wide = 1
@@ -1256,9 +1282,10 @@ walk_body_row = packed_walker(1, False, True, bodies=True)
 
 @wp.kernel(enable_backward=False, launch_bounds=(256, 2))
 def write_free_body_rows(sink: RowSink, data: ContactInput, total_threads: int, law: PatchRowLaw):
-    """The free bodies' contact rows (``path`` 1, grid-stride over the contacts): each row's records by the contact law
-    and the row as its own unit (:data:`read_row_unit`), walked by the one unit walker into the free bodies' rows
-    (:data:`walk_body_row`; the spin row a torque), with its diagonal ``|z|^2 + cfm`` and incident velocity."""
+    """The free bodies' contact rows (``path`` 1, grid-stride over the contacts): the contact's front end formed once
+    (:func:`.contact_input.contact_frame`), then each row's records by the contact law and the row as its own unit
+    (:func:`contact_row_unit`), walked by the one unit walker into the free bodies' rows (:data:`walk_body_row`; the
+    spin row a torque), with its diagonal ``|z|^2 + cfm`` and incident velocity."""
     for c in range(wp.tid(), data.count[0], total_threads):
         slot = data.slot[c]
         if data.path[c] != 1 or slot < 0:
@@ -1268,9 +1295,9 @@ def write_free_body_rows(sink: RowSink, data: ContactInput, total_threads: int, 
         rows = int(1)
         if data.slots_needed[c] >= 3:
             rows = data.slots_needed[c]
+        frame = contact_frame(data, law, c)
         for row in range(rows):
-            source = unit_source(UNIT_CONTACT, 4 * c + row)
-            walk_body_row(sink, read_row_unit(DenseRows(), data, law, JointSeeds(), line, slot + row, source))
+            walk_body_row(sink, contact_row_unit(data, law, frame, c, row, line, slot + row))
 
 
 @wp.kernel

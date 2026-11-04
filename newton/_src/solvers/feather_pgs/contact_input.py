@@ -6,9 +6,10 @@
 Declared once as fields (:mod:`.field_group`); :data:`ContactInput` is their
 Warp struct and :func:`bind` fills it from the solver's live storage.
 
-Every producer reads a contact through the same front end, :func:`contact_frame`: a contact's geometry, tangent basis
-and friction location under the friction row law (:data:`.friction_patches.PatchRowLaw`, whose point form is the patch
-law with beta 0 and a disabled view). Its rows' records come from :func:`.row_build.write_contact_row`.
+Every producer reads a contact through the same front end, :func:`contact_frame`, once a contact: a contact's
+geometry, tangent basis and friction location under the friction row law (:data:`.friction_patches.PatchRowLaw`, whose
+point form is the patch law with beta 0 and a disabled view). Its rows' records come from
+:func:`.row_build.write_contact_row`, given that frame.
 """
 
 import warp as wp
@@ -80,9 +81,24 @@ ContactRoutes = field_group.struct(
 """The contacts' count and normals with each contact's world, row slot and path (0 dense, 1 matrix-free, -1 none)."""
 
 
+@wp.struct
+class ContactFrame:
+    """A contact's front end (:func:`contact_frame`), formed once for all its rows: its bodies, normal, the one point
+    its rows act at and its gap, its tangent basis and its friction location."""
+
+    body_a: int
+    body_b: int
+    normal: wp.vec3
+    point: wp.vec3
+    phi: float
+    tangent0: wp.vec3
+    tangent1: wp.vec3
+    friction_point: wp.vec3
+
+
 @wp.func
-def contact_frame(data: ContactInput, law: PatchRowLaw, c: int):
-    """Return contact ``c``'s front end: ``(body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point)``.
+def contact_frame(data: ContactInput, law: PatchRowLaw, c: int) -> ContactFrame:
+    """Return contact ``c``'s front end (:class:`ContactFrame`).
 
     The bodies, normal, the one point the contact's rows act at and the gap of
     :func:`.contact_laws.contact_geometry`, the tangent basis and the friction location: the patch's under persistent
@@ -101,10 +117,18 @@ def contact_frame(data: ContactInput, law: PatchRowLaw, c: int):
         data.body_q,
     )
     tangent0, tangent1 = contact_tangent_basis(normal)
-    friction_point = point
+    frame = ContactFrame()
+    frame.body_a = body_a
+    frame.body_b = body_b
+    frame.normal = normal
+    frame.point = point
+    frame.phi = phi
+    frame.tangent0 = tangent0
+    frame.tangent1 = tangent1
+    frame.friction_point = point
     if law.patches.enabled != 0:
-        friction_point = patch_friction_location(law.patches, c)
-    return body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point
+        frame.friction_point = patch_friction_location(law.patches, c)
+    return frame
 
 
 def bind_routes(solver, contacts):

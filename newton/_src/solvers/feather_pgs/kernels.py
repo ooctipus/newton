@@ -18,7 +18,7 @@ import warp as wp
 
 from ...sim import BodyFlags, JointType
 from .contact_filters import contact_normal_gap_limit
-from .contact_input import ContactInput, ContactRoutes
+from .contact_input import ContactInput, ContactRoutes, contact_frame
 from .contact_laws import (
     CONTACT_SPIN_ROW,
     contact_endpoints,
@@ -1518,8 +1518,9 @@ def prepare_world_contact_rows(data: ContactInput, total_num_threads: int, law: 
         rows = 1
         if data.slots_needed[c] >= 3:
             rows = data.slots_needed[c]
+        frame = contact_frame(data, law, c)
         for row in range(rows):
-            write_contact_row(data, law, c, row, False)
+            write_contact_row(data, law, frame, c, row, False)
 
 
 @wp.kernel
@@ -1655,8 +1656,11 @@ def populate_world_J_for_size(
         if b_matches:
             at_b = jacobian_row(support, art_group_idx[art_b], art_b, sides)
         for row in range(rows):
-            # The row metadata, from the size group of either endpoint, and the row's frame.
-            body_a, body_b, direction, row_point = write_contact_row(data, law, c, row, False)
+            # The row metadata, from the size group of either endpoint, and the row's frame. The contact's front end
+            # is formed a row here: held across the loop beside the sides' entries it took 80 registers, not 64, and a
+            # block a multiprocessor (4 -> 3, sm_120 and sm_103).
+            frame = contact_frame(data, law, c)
+            body_a, body_b, direction, row_point = write_contact_row(data, law, frame, c, row, False)
             if a_matches:
                 clear_side(support, J_group, at_a, slot + row, art_a)
             if b_matches and not (a_matches and art_b == art_a):
