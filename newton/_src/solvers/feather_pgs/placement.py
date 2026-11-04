@@ -517,10 +517,9 @@ class Placement:
         rows.publish(self)
 
     def follow_contacts(self, contacts: Contacts) -> None:
-        """Hold at least ``contacts``' rigid rows, and grow with the pool of a pipeline's buffer from now on."""
-        pool = getattr(self, "contact_pool", None)
-        if pool is None:
-            return
+        """Hold at least ``contacts``' rigid rows, and grow with the pool of a pipeline's buffer from now on (staged where
+        the model holds articulations, whose rows own a contact pool)."""
+        pool = self.contact_pool
         rows = contacts._rigid_contact_rows
         try:
             source = getattr(contacts, "_rigid_contact_pool", None)

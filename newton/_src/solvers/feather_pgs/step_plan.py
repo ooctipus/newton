@@ -435,7 +435,8 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     add(*(() if spec.pure_forest else (enter,)), default_control)
     if solver.options.contact_compliance:
         add(bind_material)
-    add(follow_contacts)
+    if spec.articulated:
+        add(follow_contacts)
     if route.laws.warm_start:
         add(warm_start_contract)
     if spec.particles:
