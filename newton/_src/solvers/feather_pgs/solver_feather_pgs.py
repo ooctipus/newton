@@ -1045,7 +1045,6 @@ class SolverFeatherPGS(SolverBase):
             control = model.control(clone_variables=False)
         # The step's state-derived dynamics are the tree factor's (no state carries them: there are no gradients).
         state_aug = self.factor
-        self._last_debug_state_aug = state_aug
 
         if collide_done_event is not None and state_in.particle_count > 0:
             wp.get_stream(self.model.device).wait_event(collide_done_event)

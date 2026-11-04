@@ -687,8 +687,6 @@ class Placement:
         """The operands of the features that are off."""
         # Operands of the features that are off (SolverArrays.placeholder).
         placeholder = self.arrays.placeholder
-        self.dummy_contact_impulses = placeholder(wp.float32, (1, 1))
-        self.dummy_world_J = placeholder(wp.float32, (1, 1, 1))
         self.dummy_is_free_rigid = placeholder(wp.int32, (1,))
         self.dummy_mf_impulses = placeholder(wp.float32, (1, 1))
         self.dummy_contact_count = placeholder(wp.int32, (1,))
@@ -978,11 +976,6 @@ class Placement:
         """The Jacobian rows the producers of a size's rows write (:func:`.dense_rows.jacobian_row`): the packed rows
         (:mod:`.packed_rows`) under the matrix-free sweeps, else the size group's rows."""
         return self.packed_Z if self.mf_sweeps else self.J_by_size[size]
-
-    def mf_count_or_dummy(self):
-        """Matrix-free row counts, or a one-element dummy when the model has no contact rows (never indexed then)."""
-        arr = getattr(self, "mf_constraint_count", None)
-        return arr if arr is not None else self.dummy_is_free_rigid
 
     def ink_skip_rows(self) -> int:
         """The dense rows of the worlds the tiers own, whose response they form in-kernel (0 without tiers)."""
