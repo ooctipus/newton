@@ -464,8 +464,8 @@ one, the finish's columns at each body's frame, both halves (``WALK_READ_COLUMN`
 :attr:`WalkTrees.now_link`, take :data:`WALK_LINK`'s layout."""
 
 
-_WALK_TABLE = """    static WALK_CONSTANT int WALK_PARENT[$bodies] = {$parent};
-    static WALK_CONSTANT int WALK_FIRST[$ends] = {$first};
+_WALK_TABLE = """    $parent_table
+    $first_table
     const int WALK_BODIES = $bodies;
     const auto WALK_PARENT_OF = [&](const int b) -> int { return WALK_PARENT[b]; };
     const auto WALK_FIRST_OF = [&](const int b) -> int { return WALK_FIRST[b]; };"""
@@ -909,9 +909,8 @@ def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int, hal
     table = substitute(
         _WALK_TABLE,
         bodies=len(parent),
-        ends=len(first),
-        parent=", ".join(str(b) for b in parent),
-        first=", ".join(str(c) for c in first),
+        parent_table=ts.constant_table("WALK_PARENT", parent),
+        first_table=ts.constant_table("WALK_FIRST", first),
     )
     name = f"walk_{rows}_{len(parent)}" + ("" if half == WALK_BOTH else f"_{half}")
     return _walk_placement(name, table, rows, WALK_COORDINATE, WALK_LINK, WALK_NOW, half)
@@ -1153,9 +1152,7 @@ def _leave_class(k: int, walk: WalkClass, node: tuple[int, ...] | None, release:
     """The leave of a tree of class ``k``: its read of the change, the release where the class can slip, the unit."""
     n = walk.coordinates
     at = "c" if node is None else f"LEAVE_NODE_{k}[c]"
-    table = ""
-    if node is not None:
-        table = f"    static WALK_CONSTANT int LEAVE_NODE_{k}[{max(n, 1)}] = {{{', '.join(map(str, node))}}};\n"
+    table = "" if node is None else f"    {ts.constant_table(f'LEAVE_NODE_{k}', node)}\n"
     span = "n * 4" if node is None else str(4 * (max(node, default=-1) + 1))
     if not release:
         head = substitute(_LEAVE_PLAIN, node=at)

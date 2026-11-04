@@ -2282,7 +2282,7 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
     walk up of ``trial.force`` into registers and the walk down into ``trial.response``, ``P^T L^-T L^-1 P f`` on the
     all-``K`` walk (:func:`.tree_scan.walk_texts`). A prescribed root responds with zero."""
     from .kernel_template import THREADS  # noqa: PLC0415
-    from .tree_scan import WALK_REGISTERS, WALK_UNROLL  # noqa: PLC0415
+    from .tree_scan import WALK_UNROLL  # noqa: PLC0415
 
     sizes = {"coordinate": WALK_COORDINATE, "link": WALK_LINK}
     # The walk up of the force x into u, then the walk down of u into the trial's response (no prior).
@@ -2317,7 +2317,7 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
                 f"float u[{max(cls.coordinates, 1)}];\n"
                 "const auto qd = [&](const int c, const float q, const float) { out[c] = q; };\n"
                 "const auto twist = [](const int, const float*) {};\n"
-                + cls.walk_twice(up, down, hand=hand, registers=WALK_REGISTERS)
+                + cls.walk_twice(up, down, hand=hand, registers=memory.REGISTERS_PER_THREAD)
                 + "\n"
             )
         cases.append(f"    case {r}: {{\n{body}\n        break;\n    }}")

@@ -70,6 +70,7 @@ from string import Template
 import numpy as np
 import warp as wp
 
+from ...core.memory import REGISTERS_PER_THREAD
 from . import field_group
 from .device_preludes import DevicePrelude, device_branches
 from .field_group import Field
@@ -89,7 +90,6 @@ __all__ = [
     "WALK_BOTH",
     "WALK_EITHER",
     "WALK_LINEAR",
-    "WALK_REGISTERS",
     "WALK_STAGED",
     "WALK_TOUCH",
     "WALK_UNROLL",
@@ -109,6 +109,7 @@ __all__ = [
     "channels",
     "choose_schedule",
     "classes_half",
+    "constant_table",
     "cross",
     "device_plan",
     "dot",
@@ -1276,15 +1277,12 @@ WALK_TOUCH = 16
 """Items a walk asks L1 for ahead of its chain (:meth:`WalkClass.touch`): a hint without a register or a scoreboard,
 so the loads :data:`WALK_AHEAD` items ahead find their lines in L1."""
 
-WALK_REGISTERS = 255
-"""Registers a thread holds at most (the ISA's line): what a kernel without a launch bound may spend holding a walk's
-items for its two passes (:meth:`WalkClass.walk_twice`)."""
-
-WALK_UNROLL = WALK_REGISTERS // 4
+WALK_UNROLL = REGISTERS_PER_THREAD // 4
 """Coordinates of a class up to which :meth:`WalkClass.walk` emits its walk as straight-line code; a larger class takes
 the loop form. From the registers: a straight-line walk holds a class's states and values as named registers, about
 three a coordinate with its loads ahead (g1's 43-coordinate walk solve 141 registers, no stack), so up to a quarter of
-:data:`WALK_REGISTERS` coordinates fit with room for the chain; past it (chain_106's 112) the loop form's ring keeps
+:data:`~newton._src.core.memory.REGISTERS_PER_THREAD` (a lane's registers without a launch bound) coordinates
+fit with room for the chain; past it (chain_106's 112) the loop form's ring keeps
 :data:`WALK_AHEAD` items in flight. The loop form indexes its states on the stack (g1's walk solve: 272 B, 41 local
 loads and 43 stores): straight-line, g1's walk solve runs 78.0 -> 58.1 us a launch and its leave 47.1 -> 40.0 (RTX PRO
 6000, 16,384 worlds; ZP5, ZV). An earlier bench (ZE: the loop form faster on g1, 41.6 against 51.9 us) predates the
@@ -1293,7 +1291,8 @@ record's vector loads and the touches."""
 
 def held_fits(words: int, registers: int) -> bool:
     """Whether a thread may hold ``words`` floats of a walk's data across the walk: they fit ``registers``, the kernel's
-    budget a thread (:data:`WALK_REGISTERS` without a launch bound). The one rule by which a walk solve holds its
+    budget a thread (the shape's ``registers``: :data:`~newton._src.core.memory.REGISTERS_PER_THREAD` without a
+    launch bound). The one rule by which a walk solve holds its
     class's items for both walks (:meth:`WalkClass.walk_twice`) and the support writer holds a unit's side for the
     slips' release (:data:`.walk_rows._RELEASE_HELD`)."""
     return words <= registers
@@ -1327,6 +1326,13 @@ def _walk_slots(parent: tuple[int, ...]) -> tuple[tuple[int, ...], int]:
                 slot[body], count = count, count + 1
             held[body] = last[body]
     return tuple(slot), count
+
+
+def constant_table(name: str, values) -> str:
+    """A native table of ints in the walk's constant memory (``WALK_CONSTANT``: CUDA's ``__constant__``, the CPU's
+    ``const``), at least one entry long: a class's path, its emitter's steps, a placement's nodes."""
+    values = [str(int(v)) for v in values]
+    return f"static WALK_CONSTANT int {name}[{max(len(values), 1)}] = {{{', '.join(values)}}};"
 
 
 def _fill(text: str, **values) -> str:
@@ -1537,21 +1543,18 @@ class WalkClass:
         name = f"WALK_CLASS_{self.tag}"
         flags = [b | (int(first) << 16) | (int(last) << 17) for b, _, first, last in sequence]
 
-        def table(suffix, values):
-            return f"static WALK_CONSTANT int {name}_{suffix}[{len(values)}] = {{{', '.join(map(str, values))}}};"
-
         tables = [
-            table("PARENT", self.parent),
-            table("STEP", flags),
-            table("COORDINATE", [c for _, c, _, _ in sequence]),
+            constant_table(f"{name}_PARENT", self.parent),
+            constant_table(f"{name}_STEP", flags),
+            constant_table(f"{name}_COORDINATE", [c for _, c, _, _ in sequence]),
         ]
         # The class's column halves (half_of): a table where none has both, so the walk's fetch takes no side; else
         # each record's own.
         one_half = bool(self.half) and max(self.half) < WALK_BOTH
         if one_half:
-            tables.append(table("HALF", list(self.half)))
+            tables.append(constant_table(f"{name}_HALF", self.half))
         if count:
-            tables.append(table("SLOT", slots))
+            tables.append(constant_table(f"{name}_SLOT", slots))
         each = "for (int k = 0; k < $width; ++k)"
         slot = f"S[{name}_SLOT[$at]]"
 
@@ -1748,7 +1751,7 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
         :meth:`walk`'s keywords (``first``, ``second``), their records and links the same items.
 
         **Each item fetched once, when the class's items fit the kernel's registers.** A straight-line class whose
-        :attr:`held_words` fit ``registers`` (the kernel's budget, :data:`WALK_REGISTERS` without a launch bound) fetches
+        :attr:`held_words` fit ``registers`` (the kernel's budget, its shape's ``registers``) fetches
         every item once, with the first walk's inputs (``first``'s ``fetch_joint``, ``fetch_step``), before either walk,
         and hands each to both: the second walk's step input is ``hand``, built from the held item ``$X`` of
         coordinate ``$c`` (its own values in place of the first walk's); each item's line is touched before the
