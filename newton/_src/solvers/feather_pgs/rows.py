@@ -28,6 +28,7 @@ from functools import cache
 import numpy as np
 import warp as wp
 
+from ...core.execution import fill_lanes
 from ...sim import Contacts, Model, State
 from ...sim.enums import JointType
 from . import field_group, host_index, prefix_rows, walk_rows
@@ -62,7 +63,6 @@ from .kernels import (
     snapshot_dense_phase_bound,
     write_link_rows,
 )
-from .launch import fill_lanes
 from .route_table import Laws
 from .row_build import contact_row_prelude, populate_world_J_masked
 from .row_laws import LINK_ROWS, ROW_LAW

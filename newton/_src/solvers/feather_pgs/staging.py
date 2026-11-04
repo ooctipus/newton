@@ -17,8 +17,9 @@ declaration instead of being mirrored by hand:
   every group, laid out with their alignment, plus the tile storage Warp's
   tiled launches add (four bytes per thread, :data:`TILE_BYTES_PER_THREAD`);
 - :meth:`Staging.fits` and :meth:`Staging.check` compare it with a static
-  budget: by default :data:`STATIC_SHARED_BYTES`, what an offline build
-  accepts, or a device's (:func:`static_budget`).
+  budget: by default :data:`~newton._src.core.execution.STATIC_SHARED_BYTES`,
+  what an offline build accepts, or a device's
+  (:func:`~newton._src.core.execution.static_budget`).
 
 Static shared memory at run time is not the offline limit. Offline, ptxas 13.2
 rejects a block that declares more than 48 KiB of static shared memory on every
@@ -27,10 +28,10 @@ driver) loads up to the opt-in maximum per block less the driver's 1 KiB
 reservation (measured 2026-10-27: the RTX PRO 6000, sm_120, loads 100,352 B and
 refuses 101,376 B; the GB300, sm_103, loads 231,424 B and refuses 232,448 B).
 The budget of a kernel built for a device is therefore a property of the
-device, read in one place, :func:`static_budget`: that opt-in maximum less the
-reservation unless a probe records less (:data:`STATIC_SHARED_BUDGETS`). A
-kernel sized to a budget above 48 KiB compiles only through that runtime path,
-not offline.
+device, read in one place, the execution layer's
+:func:`~newton._src.core.execution.static_budget`: that opt-in maximum less the
+reservation unless a probe records less. A kernel sized to a budget above
+48 KiB compiles only through that runtime path, not offline.
 
 A choice between stagings (a resident working set or one that streams part of
 it from global memory) is a choice between two declarations: the caller builds
@@ -42,46 +43,12 @@ from __future__ import annotations
 
 import dataclasses
 
-import warp as wp
+from ...core.execution import STATIC_SHARED_BYTES
 
-__all__ = [
-    "RESERVED_SHARED_BYTES",
-    "SM_SHARED_BYTES",
-    "STATIC_SHARED_BUDGETS",
-    "STATIC_SHARED_BYTES",
-    "TILE_BYTES_PER_THREAD",
-    "Buffer",
-    "Staging",
-    "arch_budget",
-    "resident_blocks",
-    "static_budget",
-]
-
-STATIC_SHARED_BYTES = 48 * 1024
-"""Static shared memory a block may declare in an offline build [B]: ptxas 13.2 rejects more on every architecture
-(0xc000)."""
-
-CPU_STAGING_BYTES = 4 * 1024 * 1024
-"""The working set a CPU block may declare [B]: the CPU's one thread runs the block and keeps it on its stack (an
-automatic array), so no shared-memory budget applies; this bound keeps a block well inside a thread's stack."""
-
-RESERVED_SHARED_BYTES = 1024
-"""Shared memory the driver reserves in every block [B] (sm_80 and later), out of the opt-in maximum per block."""
-
-STATIC_SHARED_BUDGETS: dict[int, int] = {}
-"""Static shared memory budgets [B] by architecture (``Device.arch``) that a probe measured below the opt-in
-maximum less the driver's reservation; :func:`static_budget` reads them first. None is recorded: the RTX PRO 6000
-(sm_120, opt-in 101,376 B) loads a kernel declaring 100,352 B and refuses one declaring 101,376 B."""
+__all__ = ["TILE_BYTES_PER_THREAD", "Buffer", "Staging"]
 
 TILE_BYTES_PER_THREAD = 4
 """Shared memory Warp's tiled launches declare per block thread [B] (``tile_shared_storage_t``'s offsets)."""
-
-SM_SHARED_BYTES = 100 * 1024
-"""Shared memory one SM gives its resident blocks [B] when no device of the architecture is at hand (an offline
-build, the CPU): the RTX PRO 6000's (sm_120), the smallest of the suite's GPUs."""
-
-SHARED_ALLOCATION_BYTES = 128
-"""Granule in which an SM allocates a block's shared memory [B] (``cuda_occupancy.h``, sm_80 and later)."""
 
 _SIZES = {
     "float": 4,
@@ -141,54 +108,6 @@ class Buffer:
         """The array's C declaration, without storage class."""
         align = f"__align__({self.align}) " if self.align else ""
         return f"{align}{self.ctype} {self.name}[{self.count}];"
-
-
-def static_budget(arch: int) -> int:
-    """Static shared memory a block of a kernel built for the CUDA architecture ``arch`` may declare [B].
-
-    The one place a device's static budget is read: a probe's measured budget of the architecture
-    (:data:`STATIC_SHARED_BUDGETS`), else the opt-in maximum per block that Warp reports for a CUDA device of the
-    architecture (``Device.max_shared_memory_per_block``) less the driver's reservation
-    (:data:`RESERVED_SHARED_BYTES`), else, with no such device (an offline build, the CPU),
-    :data:`STATIC_SHARED_BYTES`.
-    """
-    if arch in STATIC_SHARED_BUDGETS:
-        return int(STATIC_SHARED_BUDGETS[arch])
-    for device in wp.get_cuda_devices():
-        if device.arch == arch:
-            return int(device.max_shared_memory_per_block) - RESERVED_SHARED_BYTES
-    return STATIC_SHARED_BYTES
-
-
-def arch_budget(device_arch) -> int:
-    """The working set a block of a kernel factory's ``device_arch`` may declare [B]: :func:`static_budget` of a CUDA
-    architecture number, :data:`CPU_STAGING_BYTES` for the CPU (architecture 0) and :data:`STATIC_SHARED_BYTES` for an
-    offline build that names none."""
-    try:
-        arch = int(str(device_arch).removeprefix("sm_"))
-    except (TypeError, ValueError):
-        return STATIC_SHARED_BYTES
-    return static_budget(arch) if arch > 0 else CPU_STAGING_BYTES
-
-
-def resident_blocks(block_bytes: int, device_arch=None) -> int:
-    """Blocks of ``block_bytes`` static shared memory each that one SM of ``device_arch`` keeps resident.
-
-    A block takes its bytes and the driver's reservation, in 128-byte granules, out of the SM's shared memory: the
-    opt-in maximum per block plus that reservation (every architecture since sm_80), read from a CUDA device of the
-    architecture as :func:`static_budget` reads it, else :data:`SM_SHARED_BYTES`.
-    """
-    sm_bytes = SM_SHARED_BYTES
-    try:
-        arch = int(str(device_arch).removeprefix("sm_"))
-    except (TypeError, ValueError):
-        arch = 0
-    for device in wp.get_cuda_devices() if arch > 0 else ():
-        if device.arch == arch:
-            sm_bytes = int(device.max_shared_memory_per_block) + RESERVED_SHARED_BYTES
-            break
-    granules = -(-(int(block_bytes) + RESERVED_SHARED_BYTES) // SHARED_ALLOCATION_BYTES)
-    return sm_bytes // (granules * SHARED_ALLOCATION_BYTES)
 
 
 def _layout(buffers) -> int:
@@ -262,7 +181,7 @@ class Staging:
 
     def fits(self, limit: int = STATIC_SHARED_BYTES) -> bool:
         """Whether the block's static shared memory fits the budget ``limit`` [B] (by default an offline build's;
-        a device's is :func:`static_budget`)."""
+        a device's is :func:`~newton._src.core.execution.static_budget`)."""
         return self.bytes <= int(limit)
 
     def check(self, what: str, limit: int = STATIC_SHARED_BYTES) -> None:

@@ -5,7 +5,7 @@
 
 import unittest
 
-from newton._src.solvers.feather_pgs.staging import STATIC_SHARED_BUDGETS, STATIC_SHARED_BYTES, static_budget
+from newton._src.core.execution import STATIC_SHARED_BUDGETS, STATIC_SHARED_BYTES, static_budget
 
 
 class TestStaticBudget(unittest.TestCase):

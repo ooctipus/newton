@@ -22,6 +22,7 @@ from functools import cache
 
 import warp as wp
 
+from ...core.execution import arch_budget, resident_blocks
 from . import kernel_template
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .kernel_template import KernelTemplate
@@ -32,7 +33,7 @@ from .response_operator import FactorComponent, FactorRows, FreeBodyZ, Lanes, Lo
 from .row_inputs import RowArgument, StoredLocalRows
 from .row_metadata import _mf_parent_expression
 from .solve_policy import DEFAULT_POLICY, SolvePolicy
-from .staging import Buffer, Staging, arch_budget, resident_blocks
+from .staging import Buffer, Staging
 from .sweep import (
     CONTACT,
     FRICTION,

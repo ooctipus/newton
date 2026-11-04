@@ -41,13 +41,14 @@ from typing import NamedTuple
 import numpy as np
 import warp as wp
 
+from ...core.execution import STATIC_SHARED_BYTES, static_budget
 from . import kernel_template
 from .device_preludes import SHARED_STORAGE, cuda_native, lane_group
 from .field_group import Field, FieldGroup
 from .kernel_template import KernelTemplate
 from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
 from .row_metadata import _mf_parent_expression
-from .staging import STATIC_SHARED_BYTES, Buffer, Staging, static_budget
+from .staging import Buffer, Staging
 
 BUILD_WARPS = 8
 """Warps of a world's unit builder block: they share the parallel passes; the first levels the units."""

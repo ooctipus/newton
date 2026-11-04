@@ -26,6 +26,7 @@ import numpy as np
 import warp as wp
 
 from ...core.contact_pool import ContactField, model_contact_pool
+from ...core.execution import fill_lanes
 from ...sim import Contacts
 from ...sim.contacts import contact_capacity_blocks
 from ...sim.enums import JointType
@@ -40,7 +41,6 @@ from .kernels import (
     prepare_world_impulses,
     record_world_contact_runs,
 )
-from .launch import fill_lanes
 from .row_metadata import _validate_mf_metadata_encoding
 from .solver_fields import (
     CAPACITY_STATUS,

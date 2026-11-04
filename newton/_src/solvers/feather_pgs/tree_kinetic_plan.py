@@ -5,8 +5,8 @@
 
 import numpy as np
 
+from ...core.execution import static_budget
 from ...sim import BodyFlags, JointType
-from .staging import static_budget
 from .tree_kinetic_layout import TreeLayout
 from .tree_plan import TreePlan
 

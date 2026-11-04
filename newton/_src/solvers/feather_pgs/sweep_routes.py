@@ -14,18 +14,18 @@ from functools import cache
 
 import warp as wp
 
+from ...core.execution import arch_budget, device_lanes
 from . import kernel_template, sweep_units
 from .device_preludes import CPU_MATH, RING, SHARED_STORAGE, cuda_native, dual_native, lane_group
 from .kernel_template import KernelTemplate
 from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL
-from .launch import device_lanes
 from .law_source import law_preludes
 from .packed_rows import PACKED_SIDES
 from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import FreeBodyZ, Lanes, SparseFactor, Velocity
 from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import DEFAULT_POLICY, QUIET_LITERAL, SolvePolicy, block_argmax, sweep_exit
-from .staging import Buffer, Staging, arch_budget
+from .staging import Buffer, Staging
 from .sweep import (
     CONTACT,
     FRICTION,

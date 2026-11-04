@@ -14,6 +14,7 @@ from unittest import mock
 import numpy as np
 import warp as wp
 
+from newton._src.core.execution import arch_budget
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT as CONTACT,
 )
@@ -22,7 +23,6 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton._src.solvers.feather_pgs.sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
-from newton._src.solvers.feather_pgs.staging import arch_budget
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel, sparse_staging
 from newton.solvers import SolverFeatherPGS

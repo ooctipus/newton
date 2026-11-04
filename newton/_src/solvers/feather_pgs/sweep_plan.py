@@ -26,6 +26,7 @@ from collections.abc import Callable
 import numpy as np
 import warp as wp
 
+from ...core.execution import arch_budget
 from . import execution_plan as _execution_plan
 from . import (
     field_group,
@@ -65,7 +66,6 @@ from .solve_policy import SolvePolicy, SolveReadoutRecord
 from .solver_fields import SPARSE_CONTACT_RECORDS, SPARSE_ROWS, LocalOwners
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport, row_supports
-from .staging import arch_budget
 from .step_plan import first_failed
 from .sweep_levels import (
     _get_build_independent_sparse_contact_groups_kernel,
