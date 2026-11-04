@@ -55,7 +55,8 @@ class TestFreeBodyZBuild(unittest.TestCase):
         rotation = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.3)
         principal = 2.0 * mass * half * half / 3.0
         body = builder.add_body(
-            xform=wp.transform(wp.vec3(0.0, 0.0, 0.14), rotation),
+            # Its lowest edge 5 mm into the ground: the rows exist (a world whose contacts separate needs none).
+            xform=wp.transform(wp.vec3(0.0, 0.0, 0.12), rotation),
             mass=mass,
             inertia=wp.mat33(principal, 0.0, 0.0, 0.0, principal, 0.0, 0.0, 0.0, principal),
         )

@@ -1049,7 +1049,8 @@ class TestGripperContactBound(unittest.TestCase):
                 values = getattr(model, name).numpy()
                 values[layout.key_dofs] = 0.0
                 getattr(model, name).assign(values)
-        solver = recipe_solver(model, scalar=False, pgs_iterations=iterations)
+        # The bound reads every step's rows: the complete path builds them in a world whose contacts separate too.
+        solver = recipe_solver(model, scalar=False, pgs_iterations=iterations, pins={"claims": ()})
         return solver, _press_key_with_tip(self, model, layout, solver, shift=shift)
 
     def _head_and_reference(self):

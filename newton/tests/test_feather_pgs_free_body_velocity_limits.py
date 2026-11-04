@@ -404,7 +404,8 @@ class TestFreeBodyVelocityLimits(_FreeBodyVelocityLimitChecks, unittest.TestCase
         The selection follows the builder's structure, not the limits: registered but infinite limits
         select it although no row is built, and an infinite activation fraction declines it.
         """
-        world = [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))]
+        # The box flies past its speed limit, so its world needs the row (a world within its limits needs none).
+        world = [((2.0 * LINEAR_LIMIT, 0.0, 0.0), (0.0, 0.0, 0.0))]
         for name, options, built in (
             ("limits", {}, True),
             ("infinite_limits", {"limits": INFINITE_LIMITS}, False),

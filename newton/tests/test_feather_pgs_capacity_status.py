@@ -205,7 +205,10 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 self.assertTrue(np.isfinite(state_out.joint_q.numpy()).all())
                 if capacity >= 640:
                     solver.check_constraint_capacity()
-                    self.assertEqual(int(solver.placement.constraint_count.numpy()[0]), count * 3)
+                    # Every contact's three rows, or none once every contact separates at the predictor (a resolved
+                    # world: zero impulse solves its step).
+                    resolved = bool(solver.sweep.resolved_worlds.numpy()[0])
+                    self.assertEqual(int(solver.placement.constraint_count.numpy()[0]), 0 if resolved else count * 3)
                     residual = velocity + solver.options.pgs_beta * (old_position - depths.astype(np.float64)) / dt
                     self.assertGreaterEqual(float(residual.min()), -2.0e-6)
                     self.assertGreaterEqual(float(forces[:, 2].min()), -1.0e-7)
