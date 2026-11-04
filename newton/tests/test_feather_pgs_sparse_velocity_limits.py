@@ -30,13 +30,13 @@ from newton.tests.feather_pgs_patch_parity import (
     assert_rows_close,
     contact_rows,
 )
-from newton.tests.test_feather_pgs_sparse_pgs import _sweep
-from newton.tests.test_feather_pgs_sparse_research_admission import (
-    _change,
-    _eligible_solver,
-    _ForestProbe,
-    _TopologyReached,
+from newton.tests.feather_pgs_sparse_scene import (
+    ForestProbe,
+    TopologyReached,
+    change_probe,
+    eligible_solver,
 )
+from newton.tests.test_feather_pgs_sparse_pgs import _sweep
 
 
 class TestSparseVelocityLimitAdmission(unittest.TestCase):
@@ -50,15 +50,15 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         recipes = ({}, {"pgs_warmstart": True}, {"contact_compliance": True})
         for patches, recipe in itertools.product((False, True), recipes):
-            solver = _eligible_solver()
+            solver = eligible_solver()
             solver.options.enable_joint_velocity_limits = True
             solver.laws.friction_anchors_enabled = patches
             for key, value in recipe.items():
-                _change(solver, key, value)
+                change_probe(solver, key, value)
             with (
                 self.subTest(patches=patches, recipe=recipe),
                 mock.patch.dict(os.environ, {}, clear=True),
-                self.assertRaises(_TopologyReached),
+                self.assertRaises(TopologyReached),
             ):
                 Sweep.admit_packed(solver, model, None)
 
@@ -67,14 +67,14 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         for changes in (
             {"pins": {"storage": "dense"}},
-            {"pgs_warmstart": True, "forest": _ForestProbe(has_free_rigid_bodies=True)},
-            {"forest": _ForestProbe(has_free_rigid_bodies=True)},
+            {"pgs_warmstart": True, "forest": ForestProbe(has_free_rigid_bodies=True)},
+            {"forest": ForestProbe(has_free_rigid_bodies=True)},
         ):
             with self.subTest(changes=changes), mock.patch.dict(os.environ, {}, clear=True):
-                solver = _eligible_solver()
+                solver = eligible_solver()
                 solver.options.enable_joint_velocity_limits = True
                 for key, value in changes.items():
-                    _change(solver, key, value)
+                    change_probe(solver, key, value)
                 Sweep.admit_packed(solver, model, None)
                 self.assertFalse(solver.sparse_velocity_limits)
                 self.assertIsNone(solver.placement.sparse_mass_matrix_size)

@@ -18,7 +18,7 @@ from newton._src.solvers.feather_pgs import sweep_routes_sparse
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import standing_model
-from newton.tests.test_feather_pgs_sparse_research_admission import _branched_model
+from newton.tests.feather_pgs_sparse_scene import equal_dof_trees
 from newton.tests.test_feather_pgs_sparse_solver import _build_model, _make_solver
 
 DT = 1.0 / 400.0
@@ -173,7 +173,7 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         At the largest row capacity whose 18-DOF full sweep fits the device's static budget, the active
         scan's bitsets do not: the solver admits the route by the sweep it launches, the full ordered one.
         """
-        model = _branched_model(4, 3, "cuda:0")
+        model = equal_dof_trees(4, 3, "cuda:0")
         budget = arch_budget(wp.get_device("cuda:0").arch)
         staging = functools.partial(sweep_routes_sparse.sparse_staging, max_world_dofs=18, max_row_dofs=18)
         low, high = 3, 3 * 4096

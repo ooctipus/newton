@@ -31,17 +31,6 @@ from newton.tests.test_feather_pgs_connect import (
 
 
 class TestPreeliminationSignature(unittest.TestCase):
-    def test_legacy_joint_gap_position_is_preserved(self):
-        """Bind a deprecated positional gap to the gap option without silently coercing it to a boolean."""
-        parameters = list(inspect.signature(newton.solvers.SolverFeatherPGS).parameters.values())
-        self.assertEqual(parameters[7].name, "joint_limit_activation_gap")
-        arguments = [parameter.default for parameter in parameters[1:7]] + [0.123]
-        model = newton.ModelBuilder().finalize(device="cpu")
-        with self.assertWarnsRegex(DeprecationWarning, "'joint_limit_activation_gap' positionally"):
-            solver = newton.solvers.SolverFeatherPGS(model, *arguments)
-        self.assertEqual(solver.options.joint_limit_activation_gap, 0.123)
-        self.assertIs(solver.options.enable_bilateral_preelimination, False)
-
     def test_every_bilateral_row_joins_its_block(self):
         """One law for every bilateral row: the selective mimic option is gone (pivoting drops dependent rows)."""
         parameters = inspect.signature(newton.solvers.SolverFeatherPGS).parameters

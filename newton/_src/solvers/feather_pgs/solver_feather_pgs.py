@@ -26,7 +26,6 @@ import warp as wp
 
 from ...core.types import override
 from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
-from ...utils.deprecation import deprecate_nonkeyword_arguments
 from ..semi_implicit.kernels_contact import (
     eval_particle_body_contact_forces,
     eval_particle_contact_forces,
@@ -39,7 +38,6 @@ from ..semi_implicit.kernels_particle import (
 )
 from ..solver import SolverBase
 from . import environment_flags as _environment_flags
-from . import row_metadata as _row_metadata
 from .audit import Audit
 from .body_cut import BodyCut
 from .configuration import check_options
@@ -66,16 +64,6 @@ from .tree_factor import TreeFactor
 _FPGS_SYNC_TIMINGS = os.environ.get("FEATHER_PGS_SYNC_TIMINGS", "0").lower() in {"1", "true", "yes", "on"}
 _FPGS_SYNC_TIMINGS_START = int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_START", "20"))
 _FPGS_SYNC_TIMINGS_COUNT = max(int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_COUNT", "1")), 0)
-
-
-# Retain the internal metadata API while sharing its implementation.
-_DENSE_META_ROW_TYPE_BITS = _row_metadata._DENSE_META_ROW_TYPE_BITS
-_DENSE_META_ROW_TYPE_MASK = _row_metadata._DENSE_META_ROW_TYPE_MASK
-_DENSE_META_MAX_PARENT = _row_metadata._DENSE_META_MAX_PARENT
-_MF_META_MAX_CAPACITY = _row_metadata._MF_META_MAX_CAPACITY
-_validate_dense_metadata_encoding = _row_metadata._validate_dense_metadata_encoding
-_validate_mf_metadata_encoding = _row_metadata._validate_mf_metadata_encoding
-_mf_parent_expression = _row_metadata._mf_parent_expression
 
 
 class SolverFeatherPGS(SolverBase):
@@ -241,7 +229,6 @@ class SolverFeatherPGS(SolverBase):
             )
         )
 
-    @deprecate_nonkeyword_arguments(last_positional="friction_anchor_beta")
     def __init__(
         self,
         model: Model,
@@ -282,12 +269,7 @@ class SolverFeatherPGS(SolverBase):
     ):
         """Create the solver for ``model``.
 
-        Every option after ``model`` is keyword-only. Passing the options from
-        ``angular_damping`` through ``friction_anchor_beta`` positionally, as earlier
-        releases allowed, is deprecated: they still bind in declaration order, with a
-        :class:`DeprecationWarning` that names the keywords to use. The later options
-        were always keyword-only and still raise :class:`TypeError` when passed
-        positionally.
+        Every option after ``model`` is keyword-only.
 
         Args:
             model (Model): the model to be simulated.

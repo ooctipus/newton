@@ -27,8 +27,8 @@ from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel, sparse_staging
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import row_lines
+from newton.tests.feather_pgs_sparse_scene import equal_dof_trees
 from newton.tests.test_feather_pgs_sparse_pgs import _problem, _sweep
-from newton.tests.test_feather_pgs_sparse_research_admission import _branched_model
 from newton.tests.test_feather_pgs_sparse_solver import _build_model, _make_solver
 
 CANDIDATE_OPTIONS = {"contact_triplets": True}
@@ -403,7 +403,7 @@ class TestSparseContactTriplets(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse construction requires CUDA")
     def test_host_admission_and_shared_memory_fallback_cuda(self):
         """Admit compatible triplets and preserve sparse fallback at resource limits."""
-        model = _branched_model(4, 3, "cuda:0")
+        model = equal_dof_trees(4, 3, "cuda:0")
         # The largest capacity whose point contact units fit the device's static budget, and one more row.
         budget = arch_budget(wp.get_device("cuda:0").arch)
         staging = functools.partial(
@@ -758,7 +758,7 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse construction requires CUDA")
     def test_patch_host_admission_cuda(self):
         """Build the linked triplet sweep the patch policy selects, and keep a small world's packed sweep."""
-        model = _branched_model(4, 3, "cuda:0")
+        model = equal_dof_trees(4, 3, "cuda:0")
         for pins, suffix in (
             ({}, "_active_support_table_contact_triplets_linked"),
             ({"active_rows": False}, "_18_12_support_table_contact_triplets_linked"),

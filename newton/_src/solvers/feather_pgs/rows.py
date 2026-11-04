@@ -80,10 +80,6 @@ __all__ = [
     "velocity_prescale_launch",
 ]
 
-_CALLER = 4
-"""Warnings raised in :meth:`RowLaws.build` name the solver constructor's caller: build runs in the constructor body,
-which runs inside the keyword-only shim (deprecate_nonkeyword_arguments)."""
-
 JOINT_LIMIT_WARPS_PER_BLOCK = 4
 
 _CONTACT_BUILD_THREAD_CAP = 65536

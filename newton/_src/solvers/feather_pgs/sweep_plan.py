@@ -27,7 +27,6 @@ import numpy as np
 import warp as wp
 
 from ...core.execution import arch_budget
-from . import execution_plan as _execution_plan
 from . import (
     field_group,
     host_index,
@@ -44,6 +43,7 @@ from . import (
 from .contact_input import bind_routes as bind_contact_routes
 from .dense_rows import bind as bind_dense_rows
 from .dense_rows import bind_mf as bind_mf_rows
+from .execution_plan import _MFGSStorage, _select_mfgs_storage
 from .forest_plan import row_support
 from .friction_patches import patch_routes
 from .kernel_template import SweepTier
@@ -102,7 +102,6 @@ _LOCAL_RESIDUAL_MF_MAX_ROWS = 12
 # the chunk was min(32, dense_max_constraints) and the test was dense_max_constraints > 32.
 _PAIRED_MIN_DOF = 17
 _PAIRED_MIN_ROWS = 32
-_MFGSStorage = _execution_plan._MFGSStorage
 
 
 def _world_diagonal_pairs(
@@ -1340,7 +1339,7 @@ class Sweep:
                 False, force_stream_mf_impulses, False, "Without CUDA no shared-memory storage applies."
             )
             if model.device.is_cuda:
-                storage = _execution_plan._select_mfgs_storage(
+                storage = _select_mfgs_storage(
                     functools.partial(
                         sweep_routes.mf_gs_staging,
                         self.placement.dense_max_constraints,

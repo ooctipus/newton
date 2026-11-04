@@ -20,19 +20,19 @@ from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_sparse_scene as sparse_scene
 from newton.tests import test_feather_pgs_sparse_velocity_limits as velocity_tests
-from newton.tests.test_feather_pgs_sparse_research_admission import _eligible_solver, _TopologyReached
+from newton.tests.feather_pgs_sparse_scene import TopologyReached, eligible_solver
 
 
 class TestSparseVelocityMimicAdmission(unittest.TestCase):
     def test_mimic_velocity_owner_reaches_topology(self):
         """Admit a same-articulation mimic under the explicit velocity owner."""
-        solver = _eligible_solver()
+        solver = eligible_solver()
         solver.options.enable_joint_velocity_limits = True
         solver.laws.mimic_count = 1
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         with (
             mock.patch.dict(os.environ, {}, clear=True),
-            self.assertRaises(_TopologyReached),
+            self.assertRaises(TopologyReached),
         ):
             Sweep.admit_packed(solver, model, None)
 

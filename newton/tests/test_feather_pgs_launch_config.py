@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-import inspect
 import unittest
 from unittest import mock
 
@@ -12,7 +11,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import execution_plan, sweep_routes
 from newton._src.solvers.feather_pgs.contact_row_plan import contact_row_plan
-from newton._src.solvers.feather_pgs.solver_feather_pgs import (
+from newton._src.solvers.feather_pgs.row_metadata import (
     _DENSE_META_MAX_PARENT,
     _DENSE_META_ROW_TYPE_MASK,
     _validate_dense_metadata_encoding,
@@ -181,33 +180,7 @@ def _build_sparse_contact_friction_model(num_branches=16, num_worlds=2, *, devic
     return replicated.finalize(device=device)
 
 
-def _build_heterogeneous_world_model():
-    free_template = newton.ModelBuilder()
-    free_body = free_template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
-    free_joint = free_template.add_joint_free(parent=-1, child=free_body)
-    free_template.add_articulation([free_joint])
-
-    slider_template = newton.ModelBuilder()
-    slider_body = slider_template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
-    slider_joint = slider_template.add_joint_prismatic(parent=-1, child=slider_body, axis=newton.Axis.X)
-    slider_template.add_articulation([slider_joint])
-
-    builder = newton.ModelBuilder()
-    builder.add_world(free_template)
-    builder.add_world(slider_template)
-    return builder.finalize()
-
-
 class TestFeatherPGSLaunchConfig(unittest.TestCase):
-    def test_research_options_preserve_positional_solver_budget(self):
-        """Preserve main's positional budget while adding keyword-only research options."""
-        parameters = inspect.signature(SolverFeatherPGS).parameters
-        names = list(parameters)
-        self.assertEqual(names[names.index("velocity_limit_activation_fraction") + 1], "pgs_iterations")
-        for name in ("pgs_solve_readout", "contact_compliance"):
-            with self.subTest(name=name):
-                self.assertEqual(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
-
     def test_point_and_patch_friction_take_the_one_writer(self):
         """The general placement's contact rows, under explicit point friction and patch friction, are the one writer's
         (:mod:`.walk_rows`): the row build dispatches on contact_row_plan, which names it for every size."""
