@@ -1175,10 +1175,10 @@ class Sweep:
         A stream a claim: the first takes the paired factor sweep where it forks, then the tiers' lists and the first
         tier; every other tier its own, once the lists are written.
 
-        None of this solver's side streams (the claims, inertia, dynamics, memset) reads contact rows or the
-        contact pool's ready count: they run factorizations, response and row sweeps over dense and matrix-free rows,
-        and articulation data, while contact rows are read on the launch stream, which the pool registers. A trim
-        therefore waits for none of them (:meth:`ContactPool.add_reader_stream`).
+        The other side streams (inertia, dynamics, memset) read no contact rows nor the contact pool's ready count:
+        they run factorizations and articulation data. The claims do (the keyed tiers), between the fork and the join
+        only, and the launch stream, which the pool registers, waits for the join before it goes on. A trim that waits
+        for the launch stream therefore waits for them too (:meth:`ContactPool.add_reader_stream`).
         """
         model = self.model
         self.paired_forks = bool(
@@ -1386,7 +1386,7 @@ class Sweep:
 
     def _solve_claims(self, operands: dict) -> None:
         """The other cases: the claims that own their worlds (the paired factor sweep's, the Jacobi tiers'), on the
-        claims' stream where it is open (:meth:`open_streams`), beside the matrix-free sweep of the rest."""
+        claims' streams where they are open (:meth:`open_streams`), beside the matrix-free sweep of the rest."""
         iterations = self.options.pgs_iterations
         mf_gs_kernel = self.mf_gs_kernel
         if mf_gs_kernel is None:
