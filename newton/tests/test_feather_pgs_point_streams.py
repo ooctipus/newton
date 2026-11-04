@@ -680,7 +680,7 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
             "kernels.allocate_world_contact_slots",
             "row_packets.produce_contacts",
             "compact_contact.produce_contacts",
-            "row_build.populate_world_J_masked",
+            "walk_rows.walked_rows_kernel",
             "resolved_worlds.finalize_resolved_worlds",
         ):
             with self.subTest(family=family):

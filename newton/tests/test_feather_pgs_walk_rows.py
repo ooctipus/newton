@@ -361,7 +361,7 @@ class TestLocalSlipFrame(unittest.TestCase):
         steps = {}
         # The packets' seeds walked in the kernel; the one writer's rows the kernel reads (no packets); the general
         # placement.
-        routes = (("packets", {}), ("stored", {"producer": "compact_jacobian"}), ("general", {"placement": "general"}))
+        routes = (("packets", {}), ("stored", {"producer": "walk"}), ("general", {"placement": "general"}))
         for name, pins in routes:
             with mock.patch.object(SolverFeatherPGS, "_route_pins", pins), warnings.catch_warnings():
                 warnings.simplefilter("ignore")
@@ -511,7 +511,7 @@ class TestTierSlipFrame(unittest.TestCase):
         self.assertFalse(general.sweep.tiers)
         self.assertEqual(int(general.factor.walk_view().release.count.numpy()[0]), 3)
         scale = float(np.linalg.norm(reference))
-        for producer in (None, "general"):
+        for producer in (None, "walk"):
             # The conformance routes' pins: the tiers on any class whose rows they hold (keyed_parallel, mf_parallel).
             pins = {"tiers": 32, **({"producer": producer} if producer else {})}
             with self.subTest(producer=producer or "keyed"):

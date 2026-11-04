@@ -18,22 +18,12 @@ from newton._src.solvers.feather_pgs.kernels import (
     allocate_world_contact_slots,
     compute_contact_linear_force_from_impulses,
     compute_world_contact_bias,
-    populate_world_J_for_compact_size,
-    populate_world_J_for_size,
-    prepare_world_contact_rows,
 )
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import group_rows, row_bias, row_lines
-from newton.tests.feather_pgs_patch_parity import row_law
+from newton.tests.feather_pgs_law_harness import row_bias, row_lines
 
 PATH_DENSE = 0
 PATH_MATRIX_FREE = 1
-
-
-def _disabled_patches(device):
-    patches = FrictionPatches()
-    patches.phi = wp.zeros(1, dtype=wp.vec2, device=device)
-    return patches
 
 
 def _launch_contact_allocator(
@@ -238,149 +228,6 @@ def _speculative_rhs(scale: float, base: int = 0) -> float:
     return float(rhs.numpy()[0, base])
 
 
-def _contact_row_outputs(device: str) -> dict[str, wp.array]:
-    """Allocate dense-contact Jacobian and metadata outputs."""
-    return {
-        "J": wp.zeros((1, 8, 3), dtype=wp.float32, device=device),
-        "row_type": wp.full((1, 8), -9, dtype=wp.int32, device=device),
-        "row_parent": wp.full((1, 8), -9, dtype=wp.int32, device=device),
-        "row_mu": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
-        "row_beta": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
-        "phi": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
-        "target_velocity": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
-        "row_restitution": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
-        "sides": wp.zeros((1, 8), dtype=wp.vec2i, device=device),
-    }
-
-
-def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.array], dict[str, wp.array]]:
-    """Build one same-articulation contact through serial and compact paths."""
-    contact_count = wp.array([1], dtype=wp.int32, device=device)
-    point0 = wp.array([wp.vec3(0.2, 0.1, -0.05)], dtype=wp.vec3, device=device)
-    point1 = wp.array([wp.vec3(-0.1, 0.05, 0.2)], dtype=wp.vec3, device=device)
-    normal = wp.array([wp.vec3(0.0, 0.0, -1.0)], dtype=wp.vec3, device=device)
-    shape0 = wp.array([0], dtype=wp.int32, device=device)
-    shape1 = wp.array([1], dtype=wp.int32, device=device)
-    thickness0 = wp.array([0.01], dtype=wp.float32, device=device)
-    thickness1 = wp.array([0.02], dtype=wp.float32, device=device)
-    contact_world = wp.array([0], dtype=wp.int32, device=device)
-    contact_slot = wp.array([0], dtype=wp.int32, device=device)
-    contact_art_a = wp.array([0], dtype=wp.int32, device=device)
-    contact_art_b = wp.array([0], dtype=wp.int32, device=device)
-    contact_path = wp.array([PATH_DENSE], dtype=wp.int32, device=device)
-    contact_slots_needed = wp.array([3], dtype=wp.int32, device=device)
-    response_dof_count = wp.array([3], dtype=wp.int32, device=device)
-    art_group_idx = wp.array([0], dtype=wp.int32, device=device)
-    art_dof_start = wp.array([0], dtype=wp.int32, device=device)
-    articulation_origin = wp.array([wp.vec3(0.1, -0.2, 0.3)], dtype=wp.vec3, device=device)
-    body_to_joint = wp.array([0, 1, 2], dtype=wp.int32, device=device)
-    joint_ancestor = wp.array([-1, 0, 1], dtype=wp.int32, device=device)
-    joint_qd_start = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
-    joint_s = wp.array(
-        [
-            wp.spatial_vector(1.0, 0.0, 0.0, 0.0, 0.0, 0.5),
-            wp.spatial_vector(0.0, 1.0, 0.0, 0.25, 0.0, 0.0),
-            wp.spatial_vector(0.0, 0.0, 1.0, 0.0, -0.5, 0.0),
-        ],
-        dtype=wp.spatial_vector,
-        device=device,
-    )
-    shape_body = wp.array([2, 1], dtype=wp.int32, device=device)
-    body_q = wp.array(
-        [
-            wp.transform(wp.vec3(0.0), wp.quat_identity()),
-            wp.transform(wp.vec3(-0.2, 0.3, 0.1), wp.quat_identity()),
-            wp.transform(wp.vec3(0.4, -0.1, 0.2), wp.quat_identity()),
-        ],
-        dtype=wp.transform,
-        device=device,
-    )
-    body_v = wp.zeros((3,), dtype=wp.spatial_vector, device=device)
-    prescribed = wp.zeros((1,), dtype=wp.int32, device=device)
-    material_mu = wp.array([0.6, 0.8], dtype=wp.float32, device=device)
-    material_restitution = wp.array([0.2, 0.4], dtype=wp.float32, device=device)
-
-    def contact_input(rows):
-        return field_group.upload(
-            ContactInput,
-            device,
-            count=contact_count,
-            point0=point0,
-            point1=point1,
-            normal=normal,
-            shape0=shape0,
-            shape1=shape1,
-            margin0=thickness0,
-            margin1=thickness1,
-            world=contact_world,
-            slot=contact_slot,
-            art0=contact_art_a,
-            art1=contact_art_b,
-            path=contact_path,
-            slots_needed=contact_slots_needed,
-            response_dofs=response_dof_count,
-            dof_start=art_dof_start,
-            origin=articulation_origin,
-            body_mask=wp.array([1, 3, 7], dtype=wp.uint32, device=device),
-            motion=joint_s,
-            shape_body=shape_body,
-            body_q=body_q,
-            body_v=body_v,
-            prescribed=prescribed,
-            material_mu=material_mu,
-            material_restitution=material_restitution,
-            max_depenetration_velocity=wp.full(body_q.shape[0], np.inf, dtype=float, device=device),
-            beta=0.05,
-            cfm=1.0e-6,
-            row_type=rows["row_type"],
-            row_parent=rows["row_parent"],
-            row_mu=rows["row_mu"],
-            row_beta=rows["row_beta"],
-            phi=rows["phi"],
-            target=rows["target_velocity"],
-            restitution=rows["row_restitution"],
-            sides=rows["sides"],
-            first=row_lines(device),
-        )
-
-    serial = _contact_row_outputs(device)
-    wp.launch(
-        populate_world_J_for_size,
-        dim=1,
-        inputs=[
-            contact_input(serial),
-            1,
-            3,
-            art_group_idx,
-            body_to_joint,
-            joint_ancestor,
-            joint_qd_start,
-            row_law(_disabled_patches(device)),  # point friction
-            group_rows(device),
-        ],
-        outputs=[serial["J"]],
-        device=device,
-    )
-
-    compact = _contact_row_outputs(device)
-    compact_input = contact_input(compact)
-    wp.launch(
-        prepare_world_contact_rows,
-        dim=1,
-        inputs=[compact_input, 1, row_law(_disabled_patches(device))],  # point friction
-        device=device,
-    )
-    wp.launch(
-        populate_world_J_for_compact_size,
-        dim=(1, 32),
-        inputs=[compact_input, 1, 3, art_group_idx, row_law(_disabled_patches(device)), group_rows(device)],
-        outputs=[compact["J"]],
-        device=device,
-    )
-    wp.synchronize_device(device)
-    return serial, compact
-
-
 class TestFeatherPGSContactControls(unittest.TestCase):
     def test_skipped_contact_publishes_zero_without_reading_stale_rows(self):
         """An invalidated mapping must clear a previous force even with poisoned rows."""
@@ -433,14 +280,6 @@ class TestFeatherPGSContactControls(unittest.TestCase):
                 self.assertEqual(skipped["slots_needed"], 0)
                 for name in ("dense_count", "mf_count", "dense_dropped", "mf_dropped"):
                     self.assertEqual(skipped[name], 0, name)
-
-    def test_compact_contact_builder_matches_tree_walk(self):
-        """Match dense Jacobians and metadata for a same-articulation contact."""
-        serial, compact = _launch_dense_contact_builders()
-
-        for name in serial:
-            with self.subTest(output=name):
-                np.testing.assert_allclose(compact[name].numpy(), serial[name].numpy(), rtol=0.0, atol=1.0e-6)
 
     def test_solver_exposes_documented_defaults(self):
         """Expose legacy-preserving defaults through the public constructor."""

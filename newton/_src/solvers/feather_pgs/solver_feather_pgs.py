@@ -61,7 +61,7 @@ from .solver_fields import (
     STAGE3_SNAPSHOTS,
 )
 from .step_plan import StepPlan
-from .sweep_plan import _CONTACT_JACOBIAN_MAX_DOF, Sweep
+from .sweep_plan import Sweep
 from .tree_factor import TreeFactor
 
 _FPGS_SYNC_TIMINGS = os.environ.get("FEATHER_PGS_SYNC_TIMINGS", "0").lower() in {"1", "true", "yes", "on"}
@@ -194,7 +194,7 @@ class SolverFeatherPGS(SolverBase):
     # (routes.pins). Keys:
     #   storage "dense": no packed (native sparse) factor.
     #   grouping "forest" or "per_size": the held families.   star "held": a star's diagonal family in the held tree.
-    #   producer "compact_jacobian" or "general": no local packets or keyed rows.
+    #   producer "walk": no local packets or keyed rows.
     #   claims: the runtime claims kept, of ("resolved_worlds",).
     #   active_rows False: full-order sparse sweeps.           contact_units None: unfused sparse contact triplets.
     #   transaction "single" or "staged": fused triplets'.     mf_storage "streamed": streamed matrix-free impulses.
@@ -553,12 +553,6 @@ class SolverFeatherPGS(SolverBase):
         # The forest plan: topology, groups, root kinds, world mapping, body maps. The matrix-free formulation
         # elides fully-kinematic free bases from the compact response mapping of its rows.
         self.forest = ForestPlan.build(self.cut, forest, self.factor.kinematic_dof_mask_host)
-        self._compact_contact_jacobian = bool(
-            model.device.is_cuda
-            and self.forest.body_response_dof_mask is not None
-            and self.forest.size_groups
-            and max(self.forest.size_groups) <= _CONTACT_JACOBIAN_MAX_DOF
-        )
         # The row laws' tables: the contact law, speed limits, the joint-limit tables, the mimic and link plans,
         # contact torsion and the materials.
         self.laws = RowLaws.build(model, self.forest, options)

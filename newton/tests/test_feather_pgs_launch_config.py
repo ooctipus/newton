@@ -11,7 +11,6 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import execution_plan, sweep_routes
-from newton._src.solvers.feather_pgs import kernels as feather_pgs_kernels
 from newton._src.solvers.feather_pgs.contact_row_plan import contact_row_plan
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _DENSE_META_MAX_PARENT,
@@ -224,7 +223,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 plan = contact_row_plan(solver)
                 self.assertEqual(plan.producer, "walk")
                 self.assertEqual(plan.methods, {12: "walk"})
-                self.assertEqual(plan.combined, ())
 
     def test_defaults_preserved(self):
         model = newton.ModelBuilder().finalize()
@@ -361,21 +359,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         q = np.tile(np.concatenate((np.full(16, -0.105), np.full(3, 0.205))).astype(np.float32), 2)
         qd = np.tile(np.concatenate((np.full(16, -0.2), np.full(3, 0.1))).astype(np.float32), 2)
         trajectories = []
-        original_launch = wp.launch
-        cleared_shapes = {id(optimized): [], id(reference): []}
-
-        def checked_launch(kernel, *args, **kwargs):
-            if kernel is feather_pgs_kernels.clear_grouped_jacobian_active_rows:
-                jacobian = kwargs["outputs"][0]
-                group_to_art, _, _, dofs, rows = kwargs["inputs"]
-                self.assertEqual(
-                    jacobian.shape,
-                    (group_to_art.shape[0], rows, dofs),
-                    "Dense maintenance must not write the sparse response placeholder",
-                )
-                cleared_shapes[id(solver)].append(jacobian.shape)
-            return original_launch(kernel, *args, **kwargs)
-
         for solver in (optimized, reference):
             state_in, state_out = model.state(), model.state()
             state_in.joint_q.assign(q)
@@ -385,10 +368,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             history = []
             for _ in range(3):
                 state_in.clear_forces()
-                # Fail before dispatching an invalid write, so this regression
-                # can safely diagnose the old four-byte placeholder bug.
-                with mock.patch.object(wp, "launch", side_effect=checked_launch):
-                    solver.step(state_in, state_out, control, None, 1.0 / 120.0)
+                solver.step(state_in, state_out, control, None, 1.0 / 120.0)
                 state_in, state_out = state_out, state_in
                 history.append((state_in.joint_q.numpy().copy(), state_in.joint_qd.numpy().copy()))
                 if solver is optimized:
@@ -396,11 +376,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                         solver.placement.J_by_size[16].numpy(), np.zeros((1, 1, 1), dtype=np.float32)
                     )
             trajectories.append(history)
-
-        # The sparse diagonal's writers store every row's dense part whole (walk_rows), and the reference's matrix-free
-        # sweeps read the packed rows, which their producers write whole: no group rows are cleared.
-        self.assertEqual(cleared_shapes[id(optimized)], [])
-        self.assertEqual(cleared_shapes[id(reference)], [])
 
         first_q, first_qd = trajectories[0][0]
         np.testing.assert_allclose(first_q.reshape(2, 19)[:, :16], -0.104, rtol=0.0, atol=2.0e-6)

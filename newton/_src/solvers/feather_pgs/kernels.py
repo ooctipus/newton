@@ -18,14 +18,12 @@ import warp as wp
 
 from ...sim import BodyFlags, JointType
 from .contact_filters import contact_normal_gap_limit
-from .contact_input import ContactInput, ContactRoutes, contact_frame
+from .contact_input import ContactInput, ContactRoutes
 from .contact_laws import (
     CONTACT_SPIN_ROW,
     contact_endpoints,
-    contact_geometry,
     contact_points,
     contact_responds,
-    contact_row_frame,
     contact_tangent_basis,
     jacobian_entry,
     spin_entry,
@@ -54,15 +52,12 @@ from .device_preludes import (
 from .friction_patches import (
     CONTACT_PATH_RESOLVED,
     FrictionPatches,
-    PatchRowLaw,
-    patch_friction_location,
 )
 from .joint_table import FreeBodies, JointTable
 from .projection_laws import (
     ball,
     disk,
 )
-from .row_build import write_contact_row
 from .row_laws import (
     LINK_ROWS,
     contact_restitution_rhs,
@@ -826,38 +821,6 @@ def pack_contact_linear_force_as_spatial(
 
 
 @wp.kernel
-def clear_grouped_jacobian_active_rows(
-    group_to_art: wp.array[int],
-    art_to_world: wp.array[int],
-    world_constraint_count: wp.array[int],
-    dof_count: int,
-    max_constraints: int,
-    # outputs
-    J_group: wp.array3d[float],
-):
-    """Clear only Jacobian rows that were active in the completed solve.
-
-    The launch assigns one warp to each articulation. Packing those warps in
-    ordinary CUDA blocks avoids the one-block-per-world scheduling overhead,
-    while lanes clear the compact active prefix cooperatively.
-    """
-    tid = wp.tid()
-    group_idx = tid // 32
-    lane = tid % 32
-    if group_idx >= group_to_art.shape[0]:
-        return
-
-    art = group_to_art[group_idx]
-    world = art_to_world[art]
-    row_count = wp.min(world_constraint_count[world], max_constraints)
-    element_count = row_count * dof_count
-    for element in range(lane, element_count, 32):
-        row = element // dof_count
-        dof = element - row * dof_count
-        J_group[group_idx, row, dof] = 0.0
-
-
-@wp.kernel
 def build_mass_update_mask(
     global_flag: int,
     # in/out
@@ -1504,203 +1467,6 @@ def accumulate_jacobian_row_world(
                     entry = jacobian_entry(joint_S_s[global_dof], direction, point_world, origin)
                 J_group[at[0], row, at[1] + local_dof] += sign * entry
         curr_joint = joint_ancestor[curr_joint]
-
-
-@wp.kernel
-def prepare_world_contact_rows(data: ContactInput, total_num_threads: int, law: PatchRowLaw):
-    """Build current metadata inside each allocator-recorded contact row reservation (:func:`.row_build.write_contact_row`)."""
-    total_contacts = data.count[0]
-    for c in range(wp.tid(), total_contacts, total_num_threads):
-        if data.path[c] != 0 or data.slot[c] < 0:
-            continue
-        # Allocation owns the row extent; recomputing eligibility can cross a
-        # floating-point threshold and overwrite the following contact.
-        rows = 1
-        if data.slots_needed[c] >= 3:
-            rows = data.slots_needed[c]
-        frame = contact_frame(data, law, c)
-        for row in range(rows):
-            write_contact_row(data, law, frame, c, row, False)
-
-
-@wp.kernel
-def populate_world_J_for_compact_size(
-    data: ContactInput,
-    total_num_workers: int,
-    target_size: int,
-    art_group_idx: wp.array[int],
-    law: PatchRowLaw,
-    support: RowSupport,
-    # output
-    J_group: wp.array3d[float],
-):
-    """Project one dense contact row/DOF per lane for compact articulations: every coordinate of each side of the
-    size, zeros included. A normal's lanes also write its spin row (contact torsion), which shares its direction."""
-    worker, lane = wp.tid()
-    total_contacts = data.count[0]
-    row = lane // target_size
-    local_dof = lane - row * target_size
-    if row >= 3 or local_dof >= target_size:
-        return
-
-    for c in range(worker, total_contacts, total_num_workers):
-        if data.path[c] != 0 or data.slot[c] < 0 or row >= data.slots_needed[c]:
-            continue
-        body_a, body_b, normal, point, _phi = contact_geometry(
-            c,
-            data.shape0,
-            data.shape1,
-            data.point0,
-            data.point1,
-            data.normal,
-            data.margin0,
-            data.margin1,
-            data.shape_body,
-            data.body_q,
-        )
-        # A normal-row lane needs no tangent basis (contact_frame computes it for every row).
-        tangent0 = wp.vec3(0.0)
-        tangent1 = wp.vec3(0.0)
-        if row > 0:
-            tangent0, tangent1 = contact_tangent_basis(normal)
-        friction_point = point
-        if law.patches.enabled != 0:
-            friction_point = patch_friction_location(law.patches, c)
-        direction, row_point = contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
-
-        art_a = data.art0[c]
-        art_b = data.art1[c]
-        group_a = -1
-        group_b = -1
-        value_a = float(0.0)
-        value_b = float(0.0)
-        spin_a = float(0.0)
-        spin_b = float(0.0)
-        spin = row == 0 and data.slots_needed[c] > CONTACT_SPIN_ROW
-        bit = wp.uint32(1) << wp.uint32(local_dof)
-        if art_a >= 0 and data.response_dofs[art_a] == target_size:
-            group_a = art_group_idx[art_a]
-            if body_a >= 0 and (data.body_mask[body_a] & bit) != wp.uint32(0):
-                motion_a = data.motion[data.dof_start[art_a] + local_dof]
-                value_a = jacobian_entry(motion_a, direction, row_point, data.origin[art_a])
-                if spin:
-                    spin_a = spin_entry(motion_a, normal)
-        if art_b >= 0 and data.response_dofs[art_b] == target_size:
-            group_b = art_group_idx[art_b]
-            if body_b >= 0 and (data.body_mask[body_b] & bit) != wp.uint32(0):
-                motion_b = data.motion[data.dof_start[art_b] + local_dof]
-                value_b = -jacobian_entry(motion_b, direction, row_point, data.origin[art_b])
-                if spin:
-                    spin_b = -spin_entry(motion_b, normal)
-
-        slot = data.slot[c] + row
-        sides = row_sides(art_a, art_b, data.response_dofs)
-        if group_a >= 0:
-            at = jacobian_row(support, group_a, art_a, sides)
-            if group_b == group_a:
-                J_group[at[0], slot, at[1] + local_dof] = value_a + value_b
-                if spin:
-                    J_group[at[0], slot + CONTACT_SPIN_ROW, at[1] + local_dof] = spin_a + spin_b
-            else:
-                J_group[at[0], slot, at[1] + local_dof] = value_a
-                if spin:
-                    J_group[at[0], slot + CONTACT_SPIN_ROW, at[1] + local_dof] = spin_a
-        if group_b >= 0 and group_b != group_a:
-            at = jacobian_row(support, group_b, art_b, sides)
-            J_group[at[0], slot, at[1] + local_dof] = value_b
-            if spin:
-                J_group[at[0], slot + CONTACT_SPIN_ROW, at[1] + local_dof] = spin_b
-
-
-@wp.kernel
-def populate_world_J_for_size(
-    data: ContactInput,
-    total_num_threads: int,
-    target_size: int,
-    art_group_idx: wp.array[int],
-    body_to_joint: wp.array[int],
-    joint_ancestor: wp.array[int],
-    joint_qd_start: wp.array[int],
-    law: PatchRowLaw,
-    support: RowSupport,
-    # outputs
-    J_group: wp.array3d[float],
-):
-    """Populate active dense contacts for one articulation-size group with a capacity-independent launch.
-
-    Each contact may contribute to multiple articulations' Jacobian matrices: each endpoint of the size walks its
-    kinematic chain into its side of the row, cleared first (:func:`.dense_rows.clear_side`; a size group's rows are
-    pre-cleared). Contacts routed to the matrix-free path (contact_path==1) are skipped.
-    """
-    total_contacts = data.count[0]
-    for c in range(wp.tid(), total_contacts, total_num_threads):
-        slot = data.slot[c]
-        if data.path[c] != 0 or slot < 0:
-            continue
-        art_a = data.art0[c]
-        art_b = data.art1[c]
-        a_matches = art_a >= 0 and data.response_dofs[art_a] == target_size
-        b_matches = art_b >= 0 and data.response_dofs[art_b] == target_size
-        if not a_matches and not b_matches:
-            continue
-        # Allocation owns the row extent; recomputing eligibility can cross a
-        # floating-point threshold and overwrite the following contact.
-        rows = 1
-        if data.slots_needed[c] >= 3:
-            rows = data.slots_needed[c]
-        sides = row_sides(art_a, art_b, data.response_dofs)
-        at_a = wp.vec2i(0, 0)
-        at_b = wp.vec2i(0, 0)
-        if a_matches:
-            at_a = jacobian_row(support, art_group_idx[art_a], art_a, sides)
-        if b_matches:
-            at_b = jacobian_row(support, art_group_idx[art_b], art_b, sides)
-        for row in range(rows):
-            # The row metadata, from the size group of either endpoint, and the row's frame. The contact's front end
-            # is formed a row here: held across the loop beside the sides' entries it took 80 registers, not 64, and a
-            # block a multiprocessor (4 -> 3, sm_120 and sm_103).
-            frame = contact_frame(data, law, c)
-            body_a, body_b, direction, row_point = write_contact_row(data, law, frame, c, row, False)
-            if a_matches:
-                clear_side(support, J_group, at_a, slot + row, art_a)
-            if b_matches and not (a_matches and art_b == art_a):
-                clear_side(support, J_group, at_b, slot + row, art_b)
-            if a_matches:
-                accumulate_jacobian_row_world(
-                    body_a,
-                    1.0,
-                    row_point,
-                    data.origin[art_a],
-                    direction,
-                    row == CONTACT_SPIN_ROW,
-                    body_to_joint,
-                    joint_ancestor,
-                    joint_qd_start,
-                    data.motion,
-                    data.dof_start[art_a],
-                    target_size,
-                    at_a,
-                    slot + row,
-                    J_group,
-                )
-            if b_matches:
-                accumulate_jacobian_row_world(
-                    body_b,
-                    -1.0,
-                    row_point,
-                    data.origin[art_b],
-                    direction,
-                    row == CONTACT_SPIN_ROW,
-                    body_to_joint,
-                    joint_ancestor,
-                    joint_qd_start,
-                    data.motion,
-                    data.dof_start[art_b],
-                    target_size,
-                    at_b,
-                    slot + row,
-                    J_group,
-                )
 
 
 @wp.kernel

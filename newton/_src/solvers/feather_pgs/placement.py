@@ -36,7 +36,6 @@ from .field_group import SolverArrays
 from .kernels import (
     LINK_ROWS,
     RIGID_SPEED_ROWS,
-    clear_grouped_jacobian_active_rows,
     place_world_contact_runs,
     prepare_world_impulses,
     record_world_contact_runs,
@@ -373,9 +372,6 @@ class Placement:
                 "contact_path",
             )
         ]
-        # The masked row builders' per-contact flags; every entry below the live
-        # contact count is written by the prelude before it is read.
-        contact_fields.append(ContactField("rows_prelude_flags", wp.int32))
         # Row builders always receive a zero phi view when patch friction is off.
         contact_fields.append(ContactField("friction_patch_phi", wp.vec2))
         if self.options.pgs_warmstart:
@@ -420,13 +416,6 @@ class Placement:
                 "response_size": response or size,
             }
             self.J_by_size[size] = arrays.allocate(SIZE_JACOBIAN, owner={}, **sizes)["J"]
-
-    def clears_jacobian(self, size: int) -> bool:
-        """Whether a size group's rows of the last step are cleared before the producers write the next: not under the
-        matrix-free sweeps (their producers write the packed rows' sides whole), native sparse factors (no dense
-        Jacobian) or the sparse diagonal (its writers store every row's dense part whole, :mod:`.walk_rows`);
-        :attr:`.step_plan.StepPlan.jacobian_clear_sizes` adds the owners of a private Jacobian."""
-        return not (self.mf_sweeps or self.sparse_mass_matrix_size is not None or self.sparse_diagonal_contact_solve)
 
     def _on_contact_rows(self, rows) -> None:
         """Assign the per-contact buffers at the contact pool's ready rows, on creation and after each growth."""
@@ -710,27 +699,8 @@ class Placement:
     # Step: the rows' slots, counts and status
     # ---------------------------------------------------------------------------------------------------------------
 
-    def begin(self, jacobian_sizes):
-        """Clear the last step's Jacobian rows of ``jacobian_sizes`` and the rows' allocation state before the row pass
-        writes them."""
-        # The last step's rows, while its counts stand: every inactive row is clean by induction, and each step's rows
-        # stay readable until the next.
-        for size in jacobian_sizes:
-            wp.launch(
-                clear_grouped_jacobian_active_rows,
-                dim=self.forest.n_arts_by_size[size] * 32,
-                inputs=[
-                    self.forest.group_to_art[size],
-                    self.forest.art_to_world,
-                    self.constraint_count,
-                    size,
-                    self.dense_max_constraints,
-                ],
-                outputs=[self.J_by_size[size]],
-                block_dim=256,
-                device=self.model.device,
-            )
-
+    def begin(self):
+        """Clear the rows' allocation state before the row pass writes them."""
         # One launch clears the world-level allocation state and, with free rigid bodies, the free bodies'
         # counters and impulses (PGS reads their impulses before its first write; the warm-start seed pass
         # re-gathers after the free bodies' writer). Other row buffers are fully overwritten by their producers.

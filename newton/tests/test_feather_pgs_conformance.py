@@ -23,9 +23,8 @@ Routes
     and the sparse-diagonal sweep (sparse-diagonal rows and the compact contact
     boundary); on CPU, the general row of the matrix-free sweep, one thread per
     world. Dynamics owners: the held groups (sparse, tree and forest), scalar
-    branches and ordinary dynamics. Contact-row producers: sparse response, compact Jacobian, general
-    (per contact and masked), keyed rows, local packets, sparse diagonal and
-    compact contact boundary. Friction: point (``friction_anchor_beta=0``) and
+    branches and ordinary dynamics. Contact-row producers: the one writer (into the general, the support and the
+    sparse diagonal's sinks), keyed rows, local packets and the compact contact boundary. Friction: point (``friction_anchor_beta=0``) and
     persistent patch friction (0.2).
 
 Scenes and features
@@ -1418,7 +1417,7 @@ MF_PARALLEL = Route(
     "cuda",
     # The Jacobi tiers that a test pin builds on any class whose response they form, over the group rows.
     options=_MF,
-    pins={"tiers": 32, "producer": "general"},
+    pins={"tiers": 32, "producer": "walk"},
     expect={"sweep.route": "matrix_free_gs", "sweep.tiers.family": "parallel"},
 )
 # The allegro recipe: the tiers take keyed rows on a model they fit (the legged scene).
@@ -1496,7 +1495,7 @@ LOCAL_OWNED = Route(
     "cuda",
     # Without the packets the local owners' class walks through the one writer (FL3.6): the kernel reads its rows.
     options=_MF,
-    pins={"producer": "compact_jacobian"},
+    pins={"producer": "walk"},
     expect={
         "local_solve.enabled": True,
         "sweep.local.factory": "local_owned",

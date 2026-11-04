@@ -13,14 +13,13 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import compact_contact, contact_laws, field_group, friction_patches, kernels
+from newton._src.solvers.feather_pgs import compact_contact, contact_laws, friction_patches, kernels
 from newton._src.solvers.feather_pgs import row_packets as rp
-from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.field_group import SolverArrays
-from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, link_patch_routes, patch_routes
+from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton._src.solvers.feather_pgs.tree_factor import WALK_FRAME, WALK_LINK, WalkTrees
-from newton.tests.feather_pgs_law_harness import group_rows, row_bias, row_lines, row_velocity
+from newton.tests.feather_pgs_law_harness import group_rows, row_lines
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
     assert_history_close,
@@ -197,36 +196,6 @@ def _walk_fixture(device, rng):
     return walk
 
 
-def _seed_jacobian(packet, data, walk) -> np.ndarray:
-    """The packets' seeds as rows of the pair's coordinates: a seed ``(f, t)`` at its body's walk frame ``o`` is the
-    row ``S_lin . f + S_ang . (t + (o - origin) x f)`` on each coordinate that moves the body (its mask), with the
-    fixture's motion columns about each articulation's origin; NaN where no seed was written."""
-    seeds, codes = packet.seed.numpy().astype(np.float64), packet.seed_body.numpy()
-    motion, origin = data.motion.numpy().astype(np.float64), data.origin.numpy().astype(np.float64)
-    mask, start = data.body_mask.numpy(), data.dof_start.numpy()
-    frames = walk.link.numpy()[:, WALK_FRAME : WALK_FRAME + 3].astype(np.float64)
-    out = np.full((WORLDS, PACKETS, PRIMARY + SECONDARY), np.nan)
-    for w in range(WORLDS):
-        for row in range(PACKETS):
-            if np.any(codes[w, row] == -777):
-                continue
-            out[w, row] = 0.0
-            for side in range(2):
-                code = codes[w, row, side]
-                if code == rp.SEED_NONE:
-                    continue
-                art, local = (2 * w, code) if code >= 0 else (2 * w + 1, 2)
-                body = 3 * w + local
-                f, t = seeds[w, row, 6 * side : 6 * side + 3], seeds[w, row, 6 * side + 3 : 6 * side + 6]
-                moment = t + np.cross(frames[body] - origin[art], f)
-                size, first = (PRIMARY, 0) if code >= 0 else (SECONDARY, PRIMARY)
-                for c in range(size):
-                    if mask[body] & (1 << c):
-                        column = motion[start[art] + c]
-                        out[w, row, first + c] += column[:3] @ f + column[3:] @ moment
-    return out
-
-
 def _packet(device):
     packet = rp.ContactPacketData()
     packet.seed = wp.full((WORLDS, PACKETS, 12), float("nan"), dtype=float, device=device)
@@ -240,61 +209,6 @@ def _law(view, beta=0.35):
     law.patches = view
     law.beta = beta
     return law
-
-
-def _run_general(data, layout, beta):
-    """Run the general patch route's row chain on the fixture's inputs, into fresh outputs.
-
-    As Franka's compact-Jacobian route: prepare_world_contact_rows writes the metadata,
-    populate_world_J_for_compact_size each size's Jacobian, compute_world_contact_bias the bias and the
-    bounces. Returns the rows, the Jacobians by size and the right-hand sides before the bounces.
-    """
-    device, rows = layout.device, SimpleNamespace(**_poisoned_rows(layout.device))
-    # The general route records each row's sides (the packed placement's).
-    sides = wp.zeros((WORLDS, ROWS), dtype=wp.vec2i, device=device)
-    general = field_group.replace(data, **vars(rows), sides=sides)
-    law = _law(layout.view, beta)
-    wp.launch(kernels.prepare_world_contact_rows, dim=16, inputs=[general, 16, law], device=device)
-    jacobians = {}
-    for size in (PRIMARY, SECONDARY):
-        jacobians[size] = wp.zeros((WORLDS, ROWS, size), dtype=float, device=device)
-        wp.launch(
-            kernels.populate_world_J_for_compact_size,
-            dim=(4, 32),
-            inputs=[general, 4, size, layout.groups, law, group_rows(device)],
-            outputs=[jacobians[size]],
-            device=device,
-        )
-    # The world Jacobian the general response gathers, which only the bounce reads.
-    groups = layout.groups.numpy()
-    world_jacobian = np.zeros((WORLDS, ROWS, PRIMARY + SECONDARY), dtype=np.float32)
-    for w in range(WORLDS):
-        world_jacobian[w, :, :PRIMARY] = jacobians[PRIMARY].numpy()[groups[2 * w]]
-        world_jacobian[w, :, PRIMARY:] = jacobians[SECONDARY].numpy()[groups[2 * w + 1]]
-    records = field_group.upload(DenseRows, device, **vars(rows), sides=sides, first=row_lines(device))
-    incident = wp.array(row_velocity(world_jacobian, data.incident.numpy()), dtype=float, device=device)
-
-    def right_hand_sides(threshold):
-        wp.launch(
-            kernels.compute_world_contact_bias,
-            dim=(WORLDS, ROWS),
-            inputs=[
-                records,
-                incident,
-                layout.counts,
-                ROWS,
-                0,
-                ROWS,
-                row_bias(data.dt, data.speculative_scale, data.contact_w, threshold, data.contact_w < 1.0, 0),
-            ],
-            device=device,
-        )
-
-    # No contact closes faster than the largest threshold: the bias alone.
-    right_hand_sides(float(np.finfo(np.float32).max))
-    bias = rows.rhs.numpy().copy()
-    right_hand_sides(data.restitution_threshold)
-    return rows, jacobians, bias
 
 
 def _units(device):
@@ -315,14 +229,6 @@ def _contact_rows(data):
             yield c, int(w), int(slots[c]), int(rows)
 
 
-def _owned_rows(data):
-    """Return the mask of the rows that allocated dense-route contacts own, by world."""
-    owned = np.zeros((WORLDS, ROWS), dtype=bool)
-    for _c, w, first, count in _contact_rows(data):
-        owned[w, first : first + count] = True
-    return owned
-
-
 def _called_functions(kernel):
     """Return the user functions a kernel calls, directly or through the functions it calls."""
     called, pending = set(), [kernel.adj]
@@ -334,21 +240,6 @@ def _called_functions(kernel):
                 overloads = {**function.user_overloads, **function.user_templates}.values()
                 pending.extend(overload.adj for overload in overloads if overload.generic_parent is None)
     return called
-
-
-def _link(data, layout, rows):
-    """Link the rows' patch rings and divide their coefficients, as the patch link does after the producer."""
-    contacts = data.point0.shape[0]
-    live = min(int(data.count.numpy()[0]), contacts)
-    routing = (data.world, data.slot, data.path, data.slots_needed)
-    # The dense route's rows; linking reads no impulses.
-    routes = patch_routes(((0, rows.row_parent, rows.row_mu, None, 0.0, row_lines(rows.row_parent.device)),))
-    wp.launch(
-        link_patch_routes,
-        dim=contacts,
-        inputs=[wp.array([live, live], dtype=int, device=layout.device), layout.view, *routing, routes, contacts],
-        device=layout.device,
-    )
 
 
 class TestRowPacketPlan(unittest.TestCase):
@@ -483,69 +374,6 @@ class _PatchRowTwins:
         else:
             np.testing.assert_allclose(actual, expected, rtol=1.0e-5, atol=1.0e-5, err_msg=err_msg)
 
-    def test_patch_rows_match_the_general_route(self):
-        """Write every patch row field and Jacobian of the general route, then link the same rings.
-
-        Rows equal the general route's bitwise, except a bouncing normal row's right-hand side: its
-        incident velocity sums per body instead of per world coordinate, which agrees to rounding
-        because every incident velocity here lies far from the bounce thresholds. Whole buffers are
-        compared, so a row written past a contact's allocation shows even where a later contact
-        rewrites it.
-        """
-        beta = 0.35
-        data, layout = _patch_fixture(self.device)
-        general, jacobians, bias = _run_general(data, layout, beta)
-        packet, units = _packet(layout.device), _units(layout.device)
-        _launch(
-            rp.produce_contacts, data, layout, _law(layout.view, beta), layout.walk, packet, PRIMARY, SECONDARY, units
-        )
-        owned = _owned_rows(data)
-        # The general route writes the metadata of allocated rows alone; the producer also seeds their
-        # diagonals with cfm and, with contact_w 1, leaves row_w alone. Other rows keep their poison.
-        expected = {name: getattr(general, name).numpy().copy() for name in _ROW_OUTPUTS}
-        for name, (_, poison) in _ROW_OUTPUTS.items():
-            expected[name][~owned] = poison
-        expected["diag"][owned] = data.cfm
-        # A bouncing normal row agrees to rounding; compare it apart from the bitwise rest.
-        rhs, reference = data.rhs.numpy(), expected["rhs"]
-        bounced = owned & (reference != bias)
-        np.testing.assert_allclose(rhs[bounced], reference[bounced], rtol=1.0e-5, atol=1.0e-5)
-        self.assertTrue(np.all(rhs[bounced] != bias[bounced]), "Bouncing rows must leave the bias")
-        reference[bounced] = rhs[bounced]
-        for name in _ROW_OUTPUTS:
-            self.assert_same(getattr(data, name).numpy(), expected[name], err_msg=name)
-        groups = layout.groups.numpy()
-        jacobian = np.full((WORLDS, PACKETS, PRIMARY + SECONDARY), np.nan, dtype=np.float32)
-        row_contact = np.full((WORLDS, PACKETS), -1, dtype=np.int32)
-        for c, w, first, count in _contact_rows(data):
-            for row in range(first, min(first + count, PACKETS)):
-                row_contact[w, row] = 3 * c + row - first
-                jacobian[w, row, :PRIMARY] = jacobians[PRIMARY].numpy()[groups[2 * w], row]
-                jacobian[w, row, PRIMARY:] = jacobians[SECONDARY].numpy()[groups[2 * w + 1], row]
-        self.assert_same(packet.row_contact.numpy(), row_contact)
-        # Every row's unit source, from which the one writer walks the general worlds' rows (FL3.6).
-        lines, sources = data.first.numpy(), units.numpy()
-        for c, w, first, count in _contact_rows(data):
-            for r in range(count):
-                self.assertEqual(sources[lines[w], first + r], (1 << 28) | (4 * c + r), f"contact {c} row {r}")
-        # The seeds write the general route's rows (FL3.6: the local kernel walks them), to rounding.
-        np.testing.assert_allclose(_seed_jacobian(packet, data, layout.walk), jacobian, rtol=1.0e-4, atol=2.0e-5)
-        # The fixture bounces, holds anchors with and without tangent rows and overflows the packets.
-        weight = layout.view.weight.numpy()
-        contacts = list(_contact_rows(data))
-        self.assertTrue(bounced.any())
-        self.assertTrue(any(count == 3 for *_, count in contacts))
-        self.assertTrue(any(weight[c] > 0.0 and count == 1 for c, *_, count in contacts))
-        self.assertTrue(owned[:, PACKETS:].any())
-        # The patch link runs after the producer and writes the same ring parents and coefficients.
-        _link(data, layout, data)
-        _link(data, layout, general)
-        for name in ("row_parent", "row_mu"):
-            self.assert_same(getattr(data, name).numpy(), getattr(general, name).numpy(), name)
-        parents = data.row_parent.numpy()
-        linked = [parents[w, first] for c, w, first, count in contacts if count == 1]
-        self.assertTrue(any(parent >= 0 for parent in linked), "A normal-only unit must join a ring")
-
     def test_patch_tangent_rows_replace_the_point_law(self):
         """Keep the point law's normal rows and move only the tangent rows to the patch law.
 
@@ -676,7 +504,7 @@ def _arm(model, *, packets, swing_stride=3, friction_anchor_beta=0.0, swing=1.5,
     """
     pins = {"storage": "dense", "claims": ()}
     if not packets:
-        pins["producer"] = "compact_jacobian"
+        pins["producer"] = "walk"
     with patch.object(SolverFeatherPGS, "_route_pins", pins):
         solver = SolverFeatherPGS(
             model,

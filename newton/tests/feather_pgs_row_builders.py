@@ -7,7 +7,7 @@
 size, the kernels that build the dense contact rows outside the sweep, in launch
 order. :func:`assert_row_builders_named` requires those names to be exactly the
 contact-row builders among the kernels one recorded step launched, in that order
-and with one launch per step or per size. The module also holds the keyed-row CPU
+and with one launch per step. The module also holds the keyed-row CPU
 stand-in the record tests share. It defines no tests.
 """
 
@@ -20,19 +20,13 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs import keyed_rows
 
-# Every kernel a contact-row producer launches to write dense contact rows outside the sweep: the general
-# builder's methods, the shared-metadata producers, the compact contact boundary, local row packets and keyed
-# rows. The free-body matrix-free rows follow the allocation path, not a producer. Add every
+# Every kernel a contact-row producer launches to write dense contact rows outside the sweep: the one writer, the
+# compact contact boundary, local row packets and keyed rows. The free-body matrix-free rows follow the allocation path, not a producer. Add every
 # new producer kernel here: a launched builder missing from this list is invisible to the check below.
 ROW_BUILDER_KERNELS = frozenset(
     (
         "write_walked_rows",
         "write_slot_rows",
-        "populate_world_J_for_size",
-        "contact_row_prelude",
-        "populate_world_J_masked",
-        "prepare_world_contact_rows",
-        "populate_world_J_for_compact_size",
         "produce_contacts",
         "scatter_contact_keys",
         "keyed_general_units",
@@ -46,12 +40,6 @@ _GENERATED_PREFIXES = (
     "mark_independent_sparse_contact_candidates",
     "write_walked_rows_",
 )
-# Builders that launch once for every DOF size whose entry names them. Every other named builder serves all
-# the sizes that name it in one launch per step (the row metadata, a producer's contact kernels and fallback, a
-# combined masked launch), except the masked builder's per-size method, "masked".
-PER_SIZE_KERNELS = frozenset(("populate_world_J_for_size", "populate_world_J_for_compact_size"))
-
-
 def is_row_builder(key) -> bool:
     """Whether a launched kernel key is a contact-row builder."""
     return key is not None and (key in ROW_BUILDER_KERNELS or key.startswith(_GENERATED_PREFIXES))
@@ -95,21 +83,11 @@ def install_cpu_keyed_rows(solver):
     solver.placement.keyed_rows = keyed_rows.KeyedRows(solver)
 
 
-def _launches_per_step(builders) -> collections.Counter:
-    """How many times one step launches each kernel the entries name."""
-    counts = collections.Counter()
-    for entry in builders.values():
-        for kernel in entry["kernels"]:
-            counts[kernel] += kernel in PER_SIZE_KERNELS or entry["method"] == "masked"
-    return collections.Counter({kernel: count or 1 for kernel, count in counts.items()})
-
-
 def assert_row_builders_named(test, contact_rows, keys):
     """Require the record to name exactly the contact-row builders among ``keys``, in order and count.
 
     ``builder_by_dof`` names every launched builder and only those; each entry's kernels launch in the order the entry lists them
-    (their launches, with repeats removed, start with the list); a per-size builder launches once for
-    each size that names it and every other builder once.
+    (their launches, with repeats removed, start with the list); each builder launches once a step.
 
     Args:
         test: The running test case.
@@ -123,7 +101,7 @@ def assert_row_builders_named(test, contact_rows, keys):
     named = {kernel for _, entry in entries for kernel in entry["kernels"]}
     test.assertTrue(named, groups)
     test.assertEqual(set(launched), named, groups)
-    test.assertEqual(collections.Counter(launched), sum(map(_launches_per_step, groups), collections.Counter()), groups)
+    test.assertEqual(collections.Counter(launched), collections.Counter(named), groups)
     for size, entry in entries:
         own = [key for key in launched if key in entry["kernels"]]
         own = [key for index, key in enumerate(own) if index == 0 or own[index - 1] != key]

@@ -1089,7 +1089,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 placement=SimpleNamespace(ink_rows=64, ink_sizes=(_DOFS, 0, 0, 0)),
                 routes=SimpleNamespace(
                     row=SimpleNamespace(
-                        producer="general",
+                        producer="walk",
                         reasons={"K4": "The parallel tiers form the response of sizes [12] in-kernel."},
                     )
                 ),

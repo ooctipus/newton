@@ -149,8 +149,6 @@ def route_selection(solver) -> dict:
     The owners' records take whether they hold the class, their sizes and their reasons from the solver's route
     (``routes.row``, :class:`.route_table.RouteRow`); the rest of each record is the owner's own structure.
     """
-    from . import rows as source  # noqa: PLC0415 - the row pass's kernels, as it launches them
-
     row = solver.routes.row
 
     return {
@@ -164,7 +162,7 @@ def route_selection(solver) -> dict:
         # The per-stage dispatch tables step() launches through (step_plan.StepPlan).
         "stages": solver._plan.record(),
         "held_tree": _held_tree(solver),
-        "contact_rows": _contact_rows(solver, source),
+        "contact_rows": _contact_rows(solver),
         "contact_consumers": _contact_consumers(solver),
         "local_solve": _local_solve(solver),
         "paired_response": _paired_response(solver),
@@ -326,30 +324,18 @@ def _kernel_names(kernels) -> list:
     return [kernel if isinstance(kernel, str) else _key(kernel) for kernel in kernels]
 
 
-def _general_kernels(method, source) -> tuple:
-    """The general builder's kernels for one method, in launch order (:meth:`.rows.RowLaws.write`)."""
-    if method in ("masked", "masked_combined"):
-        return (source.contact_row_prelude, source.populate_world_J_masked)
-    if method == "per_contact":
-        return (source.populate_world_J_for_size,)
-    raise ValueError(f"No contact-row builder kernels are known for the method {method!r}.")
-
-
-def _row_builder(solver, plan, size, source) -> dict:
+def _row_builder(solver, plan, size) -> dict:
     """Name the kernels that build one DOF size's dense contact rows outside the sweep, and their law.
 
-    Mirrors the producers' launches, in launch order: RowLaws.write for the shared-metadata
-    and general builders, compact_contact.launch_contacts, LocalRowPackets.produce_contacts and
-    finish_rows, and KeyedRows.produce_contacts and finish_rows. A launch shared by several sizes
-    (the row metadata, a combined masked launch, a producer's contact kernel) is named under each
-    of them. Rows built elsewhere are not named: keyed rows' direct rows, which the parallel tiers
+    Mirrors the producers' launches, in launch order: the one writer, compact_contact.launch_contacts,
+    LocalRowPackets.produce_contacts and finish_rows, and KeyedRows.produce_contacts and finish_rows.
+    A launch shared by several sizes (a producer's contact kernel) is named under each of them. Rows built elsewhere are not named: keyed rows' direct rows, which the parallel tiers
     build in the sweep (``direct_rows`` points to routes.sweep.tiers), and the free-body matrix-free
     rows, which walk_rows.write_free_body_rows writes for the contacts the allocation routes to them
     (routes.free_rigid_bodies).
     """
     method, law = plan.methods[size], plan.law
     patch = law == "patch"
-    prepare = (source.prepare_world_contact_rows,) if plan.metadata_launch else ()
     marker = ()
     if solver.routes.case == "K2" and size == solver.placement.sparse_diagonal_response_size:
         # The sparse diagonal's marker encodes schedule links into the slots its writer just wrote.
@@ -384,32 +370,26 @@ def _row_builder(solver, plan, size, source) -> dict:
 
         # The boundary writes the contact rows whole; the one writer walks the limit prefix (walk_rows).
         kernels = (compact_contact.produce_contacts, walk_rows.write_slot_rows, *marker)
-    elif method == "compact_jacobian":
-        kernels = (*prepare, source.populate_world_J_for_compact_size)
     else:
-        kernels = _general_kernels(method, source)
+        raise ValueError(f"No contact-row builder kernels are known for the method {method!r}.")
     entry = {"method": method, "kernels": _kernel_names(kernels), "law": "patch" if patch else "point"}
     if method == "keyed_rows":
         entry["direct_rows"] = "routes.sweep.tiers"
     return entry
 
 
-def _contact_rows(solver, source) -> dict:
+def _contact_rows(solver) -> dict:
     row = solver.routes.row
     point = bool(row.laws.point)
     # The plan the row pass (RowLaws.write) dispatches on: the route's producer writes every contact row.
     plan = contact_row_plan(solver)
-    methods = None
-    if plan.producer == "general":
-        methods = {str(int(size)): method for size, method in plan.methods.items()}
     packets = solver.placement.row_packets
     return {
         "producer": row.producer,
         "law": plan.law,
         # Every producer, every size: the builder method, its kernels in launch order and the law they write,
         # for the dense contact rows built outside the sweep (_row_builder names the rows built elsewhere).
-        "builder_by_dof": {str(int(size)): _row_builder(solver, plan, size, source) for size in plan.methods},
-        "general_method_by_dof": methods,
+        "builder_by_dof": {str(int(size)): _row_builder(solver, plan, size) for size in plan.methods},
         "point_contact_paths": point,
         "row_packets": {
             "enabled": row.producer == "local_packets",
@@ -424,7 +404,6 @@ def _contact_rows(solver, source) -> dict:
             "boundary": row.producer == "compact_contact_boundary",
             "reason": solver.placement.compact_contact_reason,
         },
-        "compact_jacobian": bool(solver._compact_contact_jacobian),
     }
 
 

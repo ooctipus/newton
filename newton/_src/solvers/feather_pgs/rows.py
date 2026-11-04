@@ -36,7 +36,7 @@ from .configuration import Options
 from .contact_input import ContactInput
 from .contact_input import bind as bind_contact_input
 from .contact_input import bind_routes as bind_contact_routes
-from .contact_row_plan import SHARED_METADATA_PRODUCERS, contact_row_plan
+from .contact_row_plan import contact_row_plan
 from .dense_rows import UNIT_LIMIT, UNIT_MIMIC, UNIT_SHIFT, UNIT_VELOCITY, RowSupport
 from .dense_rows import bind as bind_dense_rows
 from .dense_rows import bind_mf as bind_mf_rows
@@ -56,15 +56,11 @@ from .kernels import (
     compute_world_contact_bias,
     finalize_constraint_counts_with_status,
     gather_mf_warmstart,
-    populate_world_J_for_compact_size,
-    populate_world_J_for_size,
     prepare_fused_diagonal_joint_limits,
-    prepare_world_contact_rows,
     snapshot_dense_phase_bound,
     write_link_rows,
 )
 from .route_table import Laws
-from .row_build import contact_row_prelude, populate_world_J_masked
 from .row_laws import LINK_ROWS, ROW_LAW
 from .solver_fields import (
     LINK_PLAN,
@@ -91,9 +87,6 @@ which runs inside the keyword-only shim (deprecate_nonkeyword_arguments)."""
 JOINT_LIMIT_WARPS_PER_BLOCK = 4
 
 _CONTACT_BUILD_THREAD_CAP = 65536
-# The masked row builder's thread budget, in multiples of the contact-build cap.
-_ROWS_THREADS_X = 4
-_CONTACT_JACOBIAN_WORKER_CAP = 4096
 
 BIAS_LANES = 256
 """The fewest threads a world's rows get in the bias launch (:func:`.kernels.compute_world_contact_bias`), a block:
@@ -657,7 +650,7 @@ class RowLaws:
         joints = bind_joint_table(solver)
         mf_active = solver.forest.has_free_rigid_bodies
 
-        solver.placement.begin(solver._plan.jacobian_clear_sizes)
+        solver.placement.begin()
 
         has_free_rigid_flag = 1 if mf_active else 0
         # Dummy arrays when MF is not active (kernel still needs valid pointers).
@@ -914,100 +907,6 @@ class RowLaws:
                 from .compact_contact import launch_contacts  # noqa: PLC0415
 
                 launch_contacts(solver, contact_input, dt)
-            elif plan.producer in SHARED_METADATA_PRODUCERS:
-                if plan.metadata_launch:
-                    pool.launch(
-                        prepare_world_contact_rows,
-                        contact_build_threads,
-                        inputs=[contact_input, contact_build_threads, law],
-                        extent=count,
-                        clamp=True,
-                    )
-                contact_jacobian_workers = min(rows, _CONTACT_JACOBIAN_WORKER_CAP)
-                for size in solver.forest.size_groups:
-                    method = plan.methods[size]
-                    pool.launch(
-                        populate_world_J_for_compact_size,
-                        (contact_jacobian_workers, 32),
-                        inputs=[
-                            contact_input,
-                            contact_jacobian_workers,
-                            size,
-                            solver.forest.art_group_idx,
-                            law,
-                            support,
-                        ],
-                        outputs=[solver.placement.jacobian_rows(size)],
-                        extent=count,
-                        clamp=True,
-                    )
-            elif plan.producer != "walk":
-                # The masked builder: a prelude writes the row records and per-contact flags, then one
-                # thread per (contact, DOF) writes the Jacobian; one launch pair serves the combined sizes.
-                flags = solver.placement.rows_prelude_flags
-                rows_threads = min(rows, _ROWS_THREADS_X * _CONTACT_BUILD_THREAD_CAP)
-                combined_done = False
-                for size in solver.forest.size_groups:
-                    method = plan.methods[size]
-                    if method in ("masked_combined", "masked"):
-                        if method == "masked_combined":
-                            if combined_done:
-                                continue
-                            combined_done = True
-                            size_a = plan.combined[0]
-                            size_b = plan.combined[1] if len(plan.combined) > 1 else -1
-                            lanes = max(size_a, size_b)
-                            jacobian_threads = rows_threads * lanes
-                        else:
-                            size_a, size_b, lanes, jacobian_threads = size, -1, size, rows_threads * 32
-                        J_a = solver.placement.jacobian_rows(size_a)
-                        J_b = solver.placement.jacobian_rows(size_b) if size_b > 0 else J_a
-                        pool.launch(
-                            contact_row_prelude,
-                            rows_threads * 3,
-                            inputs=[contact_input, rows_threads * 3, size_a, size_b, law],
-                            outputs=[flags],
-                            extent=count,
-                            scale=3,
-                            clamp=True,
-                        )
-                        pool.launch(
-                            populate_world_J_masked,
-                            jacobian_threads,
-                            inputs=[
-                                contact_input,
-                                jacobian_threads,
-                                size_a,
-                                size_b,
-                                solver.forest.art_group_idx,
-                                law,
-                                flags,
-                                support,
-                            ],
-                            outputs=[J_a, J_b],
-                            extent=count,
-                            scale=lanes,
-                            clamp=True,
-                        )
-                        continue
-                    pool.launch(
-                        populate_world_J_for_size,
-                        contact_build_threads,
-                        inputs=[
-                            contact_input,
-                            contact_build_threads,
-                            size,
-                            solver.forest.art_group_idx,
-                            solver.forest.body_to_joint,
-                            model.joint_ancestor,
-                            model.joint_qd_start,
-                            law,
-                            support,
-                        ],
-                        outputs=[solver.placement.jacobian_rows(size)],
-                        extent=count,
-                        clamp=True,
-                    )
             if slots:
                 # The sparse diagonal's rows, every one or the compact boundary's limit prefix, then the independent
                 # chains' marks in the slots they hold.

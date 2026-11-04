@@ -94,11 +94,6 @@ class StepPlan:
     """Stage 4, per size, where its rows are whitened: ``owner`` (a contact owner publishes the response),
     ``sparse_diagonal`` or ``packed`` (the packed rows' build)."""
     solve: SolveRoute
-    jacobian_clear_sizes: tuple[int, ...]
-    """The sizes whose rows of the last step are cleared before the producers write the next: none under the
-    matrix-free sweeps (their producers write the packed rows' sides whole), native sparse factors or owners that keep
-    a private Jacobian (local row packets, keyed rows), and never the sparse-diagonal response size (no dense J) or
-    the compact producer's six-coordinate size (complete stores)."""
 
     @classmethod
     def build(cls, row: RouteRow, solver) -> StepPlan:
@@ -107,9 +102,6 @@ class StepPlan:
         return cls(
             response=MappingProxyType(_response(row, solver)),
             solve=solve,
-            jacobian_clear_sizes=()
-            if row.producer in ("local_packets", "keyed_rows")
-            else tuple(size for size in solver.forest.size_groups if solver.placement.clears_jacobian(size)),
         )
 
     def sizes(self, stage: str, route: str) -> tuple[int, ...]:
@@ -124,7 +116,6 @@ class StepPlan:
 
         return {
             "response": table(self.response),
-            "jacobian_clear_dofs": [int(size) for size in self.jacobian_clear_sizes],
         }
 
 
