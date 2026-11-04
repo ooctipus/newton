@@ -30,6 +30,7 @@ from .device_preludes import (
     substitute,
 )
 from .factor import kernels
+from .factor.kernels import Clock
 from .factor.walk import (
     WALK_COORDINATE,
     WALK_FRAME,
@@ -351,6 +352,33 @@ def _bank_binding(coordinates, layout):
     ) -> int: ...
 
     return matches
+
+
+@functools.cache
+def _current_group(layout):
+    """Whether a group's cache stands for this step: valid for each of its roots' articulations at an unchanged step
+    duration, and, where the step refreshes its geometry (the clock's cadence, or a request), its geometry current.
+    The repair's early exit, as the classification and the bank comparison read it."""
+    roots, forest = len(layout.roots), layout.forest
+
+    @wp.func
+    def current_group(
+        plan: HeldPlan, cache: KineticData, requests: wp.array[int], clock: Clock, group: int, art: int
+    ) -> int:
+        valid = cache.current_valid[art]
+        refresh = int(clock.refresh != 0 or (requests[art] & GEOMETRY_REQUEST) != 0)
+        if wp.static(forest):
+            for root in range(1, wp.static(roots)):
+                valid = wp.min(valid, cache.current_valid[plan.arts[group, root]])
+                refresh = int(refresh != 0 or (requests[plan.arts[group, root]] & GEOMETRY_REQUEST) != 0)
+        current = int(valid != 0 and clock.changed == 0)
+        if current != 0 and refresh != 0:
+            current = int(
+                cache.geometry_valid[group] != 0 and cache.geometry_generation[group] == cache.generation[group]
+            )
+        return current
+
+    return current_group
 
 
 @functools.cache
@@ -1081,7 +1109,7 @@ def get_state_kernel(
         data: PublicationData,
         cache: KineticData,
         requests: wp.array[int],
-        global_refresh: int,
+        clock: wp.array[Clock],
         motion_qd: wp.array[float],
         repair_blocks: wp.array[int],
         repair_count: wp.array[int],
@@ -1109,12 +1137,17 @@ def get_state_kernel(
         g.js = p.art_joint_start[g.art]
         if wp.static(motion_velocity):
             g.motion_changed = _different_motion(data.joint_qd, motion_qd, g.ds, dofs)
-        refresh = int(global_refresh != 0)
+        # The finish computes the next step's geometry where the clock refreshes it, a repair this step's.
+        refresh = clock[0].refresh
+        if wp.static(finish):
+            refresh = clock[0].next_refresh
         valid = cache.current_valid[g.art]
         if wp.static(forest):
             for root in range(1, wp.static(roots)):
                 valid = wp.min(valid, cache.current_valid[plan.arts[g.group, root]])
         if not wp.static(finish):
+            if clock[0].changed != 0:
+                valid = 0
             refresh = int(refresh != 0 or (requests[g.art] & GEOMETRY_REQUEST) != 0)
             if wp.static(forest):
                 for root in range(1, wp.static(roots)):
@@ -1440,7 +1473,7 @@ def get_state_kernel(
         data: PublicationData,
         cache: KineticData,
         requests: wp.array[int],
-        global_refresh: int,
+        clock: wp.array[Clock],
         motion_qd: wp.array[float],
         repair_blocks: wp.array[int],
         repair_count: wp.array[int],
@@ -1455,7 +1488,7 @@ def get_state_kernel(
             data,
             cache,
             requests,
-            global_refresh,
+            clock,
             motion_qd,
             repair_blocks,
             repair_count,
@@ -1555,6 +1588,7 @@ def get_bank_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, coordinates: int =
     _lanes, _, _, _ = _thread_helpers(layout)
     matches = _bank_binding(coordinates, layout)
     block_any = _block_vote(layout)
+    current_group = _current_group(layout)
     pack, roots, forest = layout.pack, len(layout.roots), layout.forest
 
     def bank_pass(
@@ -1563,7 +1597,7 @@ def get_bank_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, coordinates: int =
         data: PublicationData,
         cache: KineticData,
         requests: wp.array[int],
-        global_refresh: int,
+        clock: wp.array[Clock],
         bank: StateBank,
         compare_blocks: wp.array[int],
         repair_blocks: wp.array[int],
@@ -1579,17 +1613,7 @@ def get_bank_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, coordinates: int =
         block = compare_blocks[item]
         group = block * wp.static(pack) + lanes[2]
         art = p.group_to_art[group]
-        valid = cache.current_valid[art]
-        refresh = int(global_refresh != 0 or (requests[art] & GEOMETRY_REQUEST) != 0)
-        if wp.static(forest):
-            for root in range(1, wp.static(roots)):
-                valid = wp.min(valid, cache.current_valid[plan.arts[group, root]])
-                refresh = int(refresh != 0 or (requests[plan.arts[group, root]] & GEOMETRY_REQUEST) != 0)
-        current = int(valid != 0)
-        if current != 0 and refresh != 0:
-            current = int(
-                cache.geometry_valid[group] != 0 and cache.geometry_generation[group] == cache.generation[group]
-            )
+        current = current_group(plan, cache, requests, clock[0], group, art)
         exits = int(0)
         if current != 0:
             exits = _same_source(cache, group, data.joint_q, data.joint_qd)
@@ -1645,6 +1669,7 @@ def get_classify_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT):
     :class:`~.tree_kinetic_owner.TreeKineticState`).
     """
     pack, roots, forest = layout.pack, len(layout.roots), layout.forest
+    current_group = _current_group(layout)
 
     def classify(
         p: GroupTrees,
@@ -1652,7 +1677,7 @@ def get_classify_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT):
         data: PublicationData,
         cache: KineticData,
         requests: wp.array[int],
-        global_refresh: int,
+        clock: wp.array[Clock],
         bank: StateBank,
         repair_blocks: wp.array[int],
         compare_blocks: wp.array[int],
@@ -1663,18 +1688,7 @@ def get_classify_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT):
         compared = int(0)
         for sub in range(wp.static(pack)):
             group = block * wp.static(pack) + sub
-            art = p.group_to_art[group]
-            valid = cache.current_valid[art]
-            refresh = int(global_refresh != 0 or (requests[art] & GEOMETRY_REQUEST) != 0)
-            if wp.static(forest):
-                for root in range(1, wp.static(roots)):
-                    valid = wp.min(valid, cache.current_valid[plan.arts[group, root]])
-                    refresh = int(refresh != 0 or (requests[plan.arts[group, root]] & GEOMETRY_REQUEST) != 0)
-            current = int(valid != 0)
-            if current != 0 and refresh != 0:
-                current = int(
-                    cache.geometry_valid[group] != 0 and cache.geometry_generation[group] == cache.generation[group]
-                )
+            current = current_group(plan, cache, requests, clock[0], group, p.group_to_art[group])
             own = int(0)
             if current != 0:
                 own = _same_source(cache, group, data.joint_q, data.joint_qd)

@@ -15,6 +15,7 @@ from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONT
 from newton._src.solvers.feather_pgs.row_records import MfRows
 from newton._src.solvers.feather_pgs.warm_start import gather_mf_warmstart
 from newton.tests.feather_pgs_law_harness import row_lines
+from newton.tests.test_feather_pgs_warmstart import step_clock
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices
 
 
@@ -96,7 +97,7 @@ def test_warm_carry_kernel_scales_rows_exactly(test: unittest.TestCase, device):
                 wp.array([5], dtype=wp.int32),
                 wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3),
                 0.75,
-                4.0,
+                step_clock(4.0, device),
                 max_c,
             ],
             outputs=[impulses],

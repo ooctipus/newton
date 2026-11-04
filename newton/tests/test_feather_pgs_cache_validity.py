@@ -24,6 +24,7 @@ from newton._src.solvers.feather_pgs import (
     tree_kinetic_owner,
     tree_kinetic_state,
 )
+from newton._src.solvers.feather_pgs.factor.kernels import Clock
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.test_feather_pgs_mixed_tree_free_body import _build
@@ -43,6 +44,18 @@ def _one_tree_per_block(build, *args, **kwargs):
     """``build(*args, **kwargs)`` with every held-tree group at 32 lanes: one tree per block, chain scans."""
     with fixed_lanes(32):
         return build(*args, **kwargs)
+
+
+def _set_clock(factor, refresh, ahead=0):
+    """Set the factor's device clock so the step ``ahead`` steps on (0: a repair's, 1: a finish's next) refreshes
+    the mass, or not, at an unchanged step duration (:class:`.factor.kernels.Clock`)."""
+    clock = Clock()
+    clock.dt, clock.prev_dt, clock.interval = DT, DT, 2
+    if ahead:
+        clock.next_refresh = int(refresh)
+    else:
+        clock.refresh = int(refresh)
+    factor.clock.assign([clock])
 
 
 def _groups(owner):
@@ -496,7 +509,7 @@ class TestFeatherPGSInputBank(unittest.TestCase):
                 expected = int(bank_compare)
                 solver.factor.fk_id_cache_valid.fill_(1)
                 solver.factor.fk_id_cache_source_state = states[1]
-                solver.factor.fk_id(states[0], states[1], solver._step, solver.qd_work)
+                solver.factor.fk_id(states[0], states[1], solver.qd_work)
                 np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), expected)
                 self.assertIs(calls[-1].get("state_out"), states[1])
                 solver.factor.fk_id_cache_valid.fill_(1)
@@ -542,13 +555,11 @@ class TestFeatherPGSInputBank(unittest.TestCase):
             return [kinds[kernel] for kernel, _, _ in records if kernel in kinds]
 
         def begin(target, augmented, state_in, state_out=None, capture=0):
-            call = functools.partial(
-                target.begin, state_in, augmented, state_in.joint_qd, DT, False, state_out=state_out
-            )
+            call = functools.partial(target.begin, state_in, augmented, state_in.joint_qd, DT, state_out=state_out)
             return launches(call, capture)
 
         def finish(target, augmented, state_in, state_out, capture=0):
-            launches(functools.partial(target.finish, state_in, augmented, state_out, DT, False), capture)
+            launches(functools.partial(target.finish, state_in, augmented, state_out, DT), capture)
 
         repair, compared = ["repair"] * len(owner.groups), ["compare"] * len(owner.groups)
         self.assertEqual(begin(owner, augmented, s0, s1), repair)  # the first eager step: nothing published yet
@@ -822,25 +833,23 @@ class TestFeatherPGSCapturedRepair(unittest.TestCase):
                 call()
             return sum(kernel in kernels for kernel, _, _ in records)
 
-        def step(case=case, *, input_bank=1, next_refresh=False, refresh=False, finish_capture=7, capture=7):
+        def step(case=case, *, input_bank=1, finish_capture=7, capture=7):
             """Finish from bank 0 into bank 1 in ``finish_capture``, then count the repairs of a step from ``input_bank``."""
             _, _, target, banks, augmented = case
-            finish = functools.partial(target.finish, banks[0], augmented, banks[1], DT, next_refresh)
+            finish = functools.partial(target.finish, banks[0], augmented, banks[1], DT)
             repairs(target, finish, finish_capture)
-            return begin(case, input_bank=input_bank, refresh=refresh, capture=capture)
+            return begin(case, input_bank=input_bank, capture=capture)
 
-        def begin(case=case, *, input_bank=1, refresh=False, capture=7):
+        def begin(case=case, *, input_bank=1, capture=7):
             _, _, target, banks, augmented = case
             state_in, state_out = banks[input_bank], banks[1 - input_bank]
-            call = functools.partial(
-                target.begin, state_in, augmented, state_in.joint_qd, DT, refresh, state_out=state_out
-            )
+            call = functools.partial(target.begin, state_in, augmented, state_in.joint_qd, DT, state_out=state_out)
             return repairs(target, call, capture)
 
+        # The finish computes the next step's geometry exactly where the device clock's next step refreshes it, so
+        # whether the step refreshes does not decide the skip.
         self.assertEqual(step(), 0)  # the next step of the same capture
         self.assertEqual(begin(), everyone)  # a begin consumes the record
-        self.assertEqual(step(refresh=True), everyone)  # the step needs geometry the finish did not compute
-        self.assertEqual(step(next_refresh=True, refresh=True), 0)  # the finish computed it
         self.assertEqual(step(capture=8), everyone)  # another capture
         self.assertEqual(step(capture=0), everyone)  # the capture ended
         self.assertEqual(step(finish_capture=0, capture=0), everyone)  # eager steps
@@ -856,7 +865,7 @@ class TestFeatherPGSCapturedRepair(unittest.TestCase):
             with self.subTest(host_call=name):
                 solver.factor.last_step_dt = DT
                 self.assertEqual(step(), 0)
-                repairs(owner, functools.partial(owner.finish, banks[0], case[4], banks[1], DT, False), 7)
+                repairs(owner, functools.partial(owner.finish, banks[0], case[4], banks[1], DT), 7)
                 call()
                 self.assertEqual(begin(), everyone)
         switched = _cpu_owner(pins={"repair_skip": False})
@@ -1063,12 +1072,10 @@ class TestFeatherPGSRepairRecord(unittest.TestCase):
                 call(case[2], case[4])
 
         def begin(state_in, state_out):
-            return lambda owner, augmented: owner.begin(
-                state_in, augmented, state_in.joint_qd, DT, False, state_out=state_out
-            )
+            return lambda owner, augmented: owner.begin(state_in, augmented, state_in.joint_qd, DT, state_out=state_out)
 
         def finish(state_in, state_out):
-            return lambda owner, augmented: owner.finish(state_in, augmented, state_out, DT, False)
+            return lambda owner, augmented: owner.finish(state_in, augmented, state_out, DT)
 
         def records(case):
             return [path_selection._tree_group(group)["captured_repairs"] for group in case[2].groups]
@@ -1306,7 +1313,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
             target, (state_in, state_out), augmented = case[2], case[3], case[4]
             stack, records = _recorded_launches(("launch", "launch_tiled"))
             with stack, _cleared_arrays() as cleared, patch.object(capture_joins, "capture_id", return_value=capture):
-                target.begin(state_in, augmented, state_in.joint_qd, DT, False, state_out=state_out)
+                target.begin(state_in, augmented, state_in.joint_qd, DT, state_out=state_out)
             launched = [(kinds[kernel], kwargs) for kernel, _, kwargs in records if kernel in kinds]
             return launched, cleared
 
@@ -1430,7 +1437,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
             target, augmented = case[2], case[4]
             stack, records = _recorded_launches(("launch", "launch_tiled"))
             with stack, patch.object(capture_joins, "capture_id", return_value=capture):
-                target.begin(state_in, augmented, state_in.joint_qd, DT, False, state_out=state_out)
+                target.begin(state_in, augmented, state_in.joint_qd, DT, state_out=state_out)
             recorded = [
                 (kinds[kernel], kernel, inputs, kwargs) for kernel, inputs, kwargs in records if kernel in kinds
             ]
@@ -1451,7 +1458,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
             target, augmented = case[2], case[4]
             stack, _ = _recorded_launches(("launch", "launch_tiled"))
             with stack, patch.object(capture_joins, "capture_id", return_value=capture):
-                target.finish(state_in, augmented, state_out, DT, False)
+                target.finish(state_in, augmented, state_out, DT)
 
         banks = []
         groups = len(case[2].groups)
@@ -1543,18 +1550,21 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                     velocities = [wp.clone(state.joint_qd) if motion else state.joint_qd for state in states]
                     for source, refresh in ((0, True), (1, False)):
                         state, output, velocity = states[source], states[1 - source], velocities[source]
-                        owner.begin(state, solver.factor, velocity, DT, refresh)
+                        _set_clock(solver.factor, refresh)
+                        owner.begin(state, solver.factor, velocity, DT)
                         solver.factor.mass_update_mask.fill_(1)
                         owner.refresh(solver.factor)
                         owner.predict(state, solver.factor, control, velocity, DT)
                         solver.v_out.assign(solver.v_hat)
-                        owner.finish(state, solver.factor, output, DT, refresh)
+                        _set_clock(solver.factor, refresh, ahead=1)
+                        owner.finish(state, solver.factor, output, DT)
                     # A copy of the bank the last finish published, one coordinate changed.
                     states[1].assign(states[0])
                     coordinates = states[1].joint_q.numpy()
                     coordinates[0] += np.float32(0.01)
                     states[1].joint_q.assign(coordinates)
-                    owner.begin(states[1], solver.factor, velocities[1], DT, False, state_out=states[0])
+                    _set_clock(solver.factor, False)
+                    owner.begin(states[1], solver.factor, velocities[1], DT, state_out=states[0])
                     # Checked per group, by the cache each held-tree launch passes: the owner holds two groups (a
                     # free body and an arm), and every kind would still run with one group's classified forms skipped.
                     for group, kernels in groups:
@@ -1626,7 +1636,8 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                             # Eagerly, after a finish that published this bank.
                             group._published, group._published_capture = (state.joint_q.ptr, state.joint_qd.ptr), 0
                             group._continuity = None
-                        owner.begin(state, solver.factor, state.joint_qd, DT, bool(seed % 2))
+                        _set_clock(solver.factor, bool(seed % 2))
+                        owner.begin(state, solver.factor, state.joint_qd, DT)
                         results.append({key: value.numpy().copy() for key, value in arrays.items()})
                         if classify:
                             listed = [
@@ -1697,7 +1708,8 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                             # Eagerly, after a finish that published the output bank.
                             group._published, group._published_capture = (output.joint_q.ptr, output.joint_qd.ptr), 0
                             group._continuity = None
-                        owner.begin(state, solver.factor, state.joint_qd, DT, bool(seed % 2), state_out=output)
+                        _set_clock(solver.factor, bool(seed % 2))
+                        owner.begin(state, solver.factor, state.joint_qd, DT, state_out=output)
                         results.append({key: value.numpy().copy() for key, value in arrays.items()})
                         if classify:
                             listed = [

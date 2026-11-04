@@ -28,6 +28,7 @@ from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLV
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_mass_reference import MassReference
+from newton.tests.test_feather_pgs_cache_validity import _set_clock
 from newton.tests.test_feather_pgs_compact_contact import compact_boundary
 
 DT = 1.0 / 240.0
@@ -426,8 +427,8 @@ class _Pair:
         mine_in, mine_out = self.states["mine"]
         head, held = self.head.factor, self.head.factor.held
         tag = f"step {self.step_index}"
-        held.begin(head_in, head, head_in.joint_qd, DT, True)
-        self.state.begin(mine_in, self.mine.factor, mine_in.joint_qd, DT, True)
+        held.begin(head_in, head, head_in.joint_qd, DT)
+        self.state.begin(mine_in, self.mine.factor, mine_in.joint_qd, DT)
         same(test, head_in.body_q, mine_in.body_q, self.bodies, f"{tag} input body_q")
         same(test, head.joint_S_s, self.mine.factor.joint_S_s, self.dofs, f"{tag} input joint_S_s")
         same(test, head.articulation_origin, self.mine.factor.articulation_origin, self.arts, f"{tag} input origin")
@@ -442,8 +443,8 @@ class _Pair:
         solved = self.head.v_hat.numpy() + self.rng.uniform(-0.03, 0.03, self.model.joint_dof_count).astype(np.float32)
         for solver in (self.head, self.mine):
             solver.v_out.assign(solved)
-        held.finish(head_in, head, head_out, DT, False)
-        self.state.finish(mine_in, self.mine.factor, mine_out, DT, False)
+        held.finish(head_in, head, head_out, DT)
+        self.state.finish(mine_in, self.mine.factor, mine_out, DT)
         for name, index in (("joint_q", self.coordinates), ("joint_qd", self.dofs)):
             same(test, getattr(head_out, name), getattr(mine_out, name), index, f"{tag} {name}")
         for name in ("body_q", "body_qd"):
@@ -541,21 +542,24 @@ def check_owner_launches(test, device):
                 solver.factor.last_step_dt = DT
                 for source, refresh in ((0, True), (1, False)):
                     state, output = states[source], states[1 - source]
-                    owner.begin(state, solver.factor, state.joint_qd, DT, refresh)
+                    _set_clock(solver.factor, refresh)
+                    owner.begin(state, solver.factor, state.joint_qd, DT)
                     owner.scalar.launch_other_drives(state, solver.factor, control, DT)
                     solver.factor.mass_update_mask.fill_(1)
                     owner.refresh(solver.factor)
                     solver.factor.walk_step(state)
                     owner.predict(state, solver.factor, control, state.joint_qd, DT)
                     solver.v_out.assign(solver.v_hat)
-                    owner.finish(state, solver.factor, output, DT, refresh)
+                    _set_clock(solver.factor, refresh, ahead=1)
+                    owner.finish(state, solver.factor, output, DT)
                 # A copy of the bank the last finish published, one coordinate changed: identity validation
                 # launches the one-pass repair, which compares nothing.
                 states[1].assign(states[0])
                 coordinates = states[1].joint_q.numpy()
                 coordinates[0] += np.float32(0.01)
                 states[1].joint_q.assign(coordinates)
-                owner.begin(states[1], solver.factor, states[1].joint_qd, DT, False, state_out=states[0])
+                _set_clock(solver.factor, False)
+                owner.begin(states[1], solver.factor, states[1].joint_qd, DT, state_out=states[0])
             for group, kernels in groups:
                 if group is owner.scalar:
                     ran = {kernel for kernel, _ in launched}
@@ -772,9 +776,9 @@ class TestScalarBranchRule(unittest.TestCase):
                     # Nothing that compares is bound where nothing may compare.
                     bound = {key for key in ("bank", "bank_repair") if record["kernels"][key] is not None}
                     self.assertEqual(bound, {"bank_repair"} if compare else set())
-                launches(lambda owner=owner: owner.finish(s0, solver.factor, s1, DT, False))
+                launches(lambda owner=owner: owner.finish(s0, solver.factor, s1, DT))
                 self.assertEqual(
-                    launches(lambda owner=owner: owner.begin(s0, solver.factor, s0.joint_qd, DT, False, state_out=s1)),
+                    launches(lambda owner=owner: owner.begin(s0, solver.factor, s0.joint_qd, DT, state_out=s1)),
                     copy_back,
                 )
 

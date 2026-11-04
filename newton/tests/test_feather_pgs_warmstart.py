@@ -13,6 +13,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.contact_input import ContactRoutes
+from newton._src.solvers.feather_pgs.factor.kernels import Clock
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 from newton._src.solvers.feather_pgs.row_records import DenseRows, MfRows
 from newton._src.solvers.feather_pgs.warm_start import (
@@ -21,6 +22,13 @@ from newton._src.solvers.feather_pgs.warm_start import (
     prepare_world_impulses,
 )
 from newton.tests.feather_pgs_law_harness import row_lines
+
+
+def step_clock(ratio, device):
+    """A step clock whose duration is ``ratio`` times the last step's (:func:`.factor.kernels.clock_dt_ratio`)."""
+    clock = Clock()
+    clock.step, clock.dt, clock.prev_dt, clock.interval = 1, float(ratio), 1.0, 1
+    return wp.array([clock], dtype=Clock, device=device)
 
 
 def _build_press():
@@ -135,7 +143,7 @@ def _gather_dense_rows(
             wp.array([count], dtype=wp.int32, device="cpu"),
             wp.array([[0.0, 0.0, 1.0]] * n, dtype=wp.vec3, device="cpu"),
             decay,
-            dt_scale,
+            step_clock(dt_scale, "cpu"),
             max_c,
         ],
         outputs=[impulses],
@@ -259,7 +267,7 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
                 constraint_count,
                 wp.array([[0.0, 0.0, 1.0]] * 2, dtype=wp.vec3, device="cpu"),
                 1.0,
-                1.0,
+                step_clock(1.0, "cpu"),
                 4,
             ],
             outputs=[mf_impulses],

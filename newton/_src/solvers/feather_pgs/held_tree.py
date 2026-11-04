@@ -629,10 +629,10 @@ class HeldTree:
         for group in self.groups:
             group.forget_continuity()
 
-    def begin(self, state, augmented, velocity, dt, refresh, *, state_out=None):
+    def begin(self, state, augmented, velocity, dt, *, state_out=None):
         """Repair every current component before any factor or force consumer (see :meth:`TreeKineticState.begin`)."""
         for group in self.groups:
-            group.begin(state, augmented, velocity, dt, refresh, state_out=state_out)
+            group.begin(state, augmented, velocity, dt, state_out=state_out)
 
     def refresh(self, augmented):
         """Preserve independent factor masks and numerical representations."""
@@ -644,10 +644,10 @@ class HeldTree:
         for group in self.groups:
             group.predict(state, augmented, control, velocity, dt)
 
-    def finish(self, state, augmented, output, dt, refresh):
+    def finish(self, state, augmented, output, dt):
         """Integrate and publish each physical coordinate and body once."""
         for group in self.groups:
-            group.finish(state, augmented, output, dt, refresh)
+            group.finish(state, augmented, output, dt)
 
 
 def install(solver) -> HeldTree:

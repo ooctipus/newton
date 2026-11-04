@@ -989,9 +989,8 @@ class RowLaws:
                             solver.placement.mf_constraint_count,
                             solver.placement.ws_prev_contact_normal,
                             solver.options.pgs_warmstart_decay,
-                            # Carried support impulses are proportional to dt, so
-                            # rescale by the exact step-size ratio (1 at fixed dt).
-                            dt / solver.sweep.prev_dt if solver.sweep.prev_dt > 0.0 else 1.0,
+                            # Carried support impulses are proportional to dt: the step clock rescales them.
+                            solver.factor.clock,
                             solver.placement.mf_max_constraints,
                         ],
                         outputs=[solver.placement.impulses],

@@ -44,6 +44,8 @@ from .factor.fields import (
     hold_drive_row,
 )
 from .factor.kernels import (
+    Clock,
+    advance_clock,
     apply_free_root_velocity_corrections,
     build_mass_update_mask,
     compute_com_transforms,
@@ -149,10 +151,12 @@ class TreeFactor:
         self.forest = None
         self.laws = None
         self._arrays = SolverArrays(self, model.device)
-        self.force_mass_update = False
         self.mass_update_requested = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
-        # Host mirror of the global mass-update flag the last factor() evaluated; it gates the per-step H memsets.
-        self.mass_update_global_flag = True
+        # The step's clock on the device (factor.kernels.Clock): the refresh cadence and the duration's change replay
+        # with the device's own step index in a captured graph.
+        clock = Clock()
+        clock.step, clock.interval = -1, int(options.update_mass_matrix_interval)
+        self.clock = wp.array([clock], dtype=Clock, device=model.device)
         self.last_step_dt = None
         # The held tree's cache of next-step dynamics.
         self.fk_id_cache_source_state = None
@@ -530,10 +534,9 @@ class TreeFactor:
         self.held.forget_continuity()
 
     def track_step_dt(self, dt: float) -> None:
-        """Record the step duration; a change refreshes mass and invalidates the FK/ID cache of every articulation."""
+        """Record the step duration. A change refreshes mass and repairs every cache on the device (the clock,
+        :func:`.factor.kernels.advance_clock`); here it only launches the held tree's next repair."""
         if self.last_step_dt is not None and abs(self.last_step_dt - dt) > 1.0e-8:
-            self.force_mass_update = True
-            self.fk_id_cache_valid.zero_()
             self.forget_repair_continuity()
         self.last_step_dt = dt
 
@@ -620,10 +623,8 @@ class TreeFactor:
     # The step
     # ---------------------------------------------------------------------------------------------------------------
 
-    def factor(
-        self, state_in, control, state_out, dt: float, step: int, qd_work: wp.array, v_hat: wp.array, v_out: wp.array
-    ):
-        """FK/ID, the drives' K and u0, the mass-update mask and the factor refresh.
+    def factor(self, state_in, control, state_out, dt: float, qd_work: wp.array, v_hat: wp.array, v_out: wp.array):
+        """The clock's step, FK/ID, the drives' K and u0, the mass-update mask and the factor refresh.
 
         Returns:
             ``(qd, ready)``: the predictor's velocity (``qd_work`` prescaled when velocities are limited) and the event
@@ -631,9 +632,10 @@ class TreeFactor:
         """
         model = self.model
         with wp.ScopedTimer("S1_FK_ID_CRBA", print=False, use_nvtx=self.nvtx, synchronize=False):
+            wp.launch(advance_clock, dim=1, inputs=[self.clock, dt], device=model.device)
             drive_rows_ready = self.prepare_drives(state_in, control, dt, v_hat, v_out)
-            qd = self.fk_id(state_in, state_out, step, qd_work)
-            self.refresh(drive_rows_ready, step)
+            qd = self.fk_id(state_in, state_out, qd_work)
+            self.refresh(drive_rows_ready)
             self.walk_step(state_in)
         # joint_tau holds only u0: the predictor adds the current external, control and bias contributions after
         # waiting for the drives.
@@ -658,7 +660,7 @@ class TreeFactor:
             device=model.device,
         )
 
-    def fk_id(self, state_in, state_out, step: int, qd_work: wp.array) -> wp.array:
+    def fk_id(self, state_in, state_out, qd_work: wp.array) -> wp.array:
         """Forward kinematics and inverse-dynamics terms; returns the predictor's velocity (prescaled when limited)."""
         if not self.held.bank_compare:
             # Held trees that compare input banks validate a changed bank on the device.
@@ -672,8 +674,7 @@ class TreeFactor:
         else:
             qd = state_in.joint_qd
 
-        refresh_composite = (step % self.options.update_mass_matrix_interval) == 0 or self.force_mass_update
-        self.held.begin(state_in, self, qd, self.last_step_dt, refresh_composite, state_out=state_out)
+        self.held.begin(state_in, self, qd, self.last_step_dt, state_out=state_out)
         return qd
 
     def prepare_drives(self, state_in, control, dt: float, v_hat: wp.array, v_out: wp.array) -> wp.Event | None:
@@ -720,33 +721,21 @@ class TreeFactor:
         """What a step's drives write (:func:`.factor.fields.hold_drive_row`); ``v_hat`` and ``v_out`` are last step's."""
         return field_group.bind(DriveRows, factor=self, v_hat=v_hat, v_out=v_out)
 
-    def refresh(self, drive_rows_ready: wp.Event | None, step: int) -> None:
-        """The mass-update mask, which consumes the requests, then the held tree's factor refresh."""
+    def refresh(self, drive_rows_ready: wp.Event | None) -> None:
+        """The mass-update mask, the clock's cadence with the requests (which it consumes), then the held tree's
+        factor refresh."""
         model = self.model
-        global_flag = 1 if ((step % self.options.update_mass_matrix_interval) == 0 or self.force_mass_update) else 0
-        # NOTE: this host-evaluated flag is BAKED into CUDA graphs at capture
-        # time. With K physics steps captured per graph, replays repeat the
-        # K-step flag pattern captured starting at the capture-time step, so
-        # only intervals that divide the captured pattern behave as requested
-        # (e.g. a 2-step graph captured at step 0 bakes [1, 0]: interval=2 is
-        # exact, interval>=3 silently degrades to an effective interval of 2).
-        # The same flag gates the H memsets at the end of the step so the
-        # baked memset cadence always matches the baked update cadence.
-        self.mass_update_global_flag = bool(global_flag)
-
         # The mask kernel reads what the drives requested.
         if drive_rows_ready is not None:
             wp.get_stream(model.device).wait_event(drive_rows_ready)
         wp.launch(
             build_mass_update_mask,
             dim=model.articulation_count,
-            inputs=[global_flag],
+            inputs=[self.clock],
             outputs=[self.mass_update_requested, self.mass_update_mask],
             device=model.device,
         )
-
         self.held.refresh(self)
-        self.force_mass_update = False
 
     def predict(self, state_in, control, qd: wp.array, ready: wp.Event | None, dt: float, v_hat: wp.array) -> None:
         """Stage 3: ``v_hat = qd + h H^-1 (tau - c)``, the free-root correction included. Each tree's launch holds the
@@ -799,11 +788,11 @@ class TreeFactor:
                 device=model.device,
             )
 
-    def finish(self, state_in, state_out, dt: float, step: int) -> None:
-        """Stage 7: ``qdd`` from the solved velocity, integrate the coordinates and publish the output state."""
+    def finish(self, state_in, state_out, dt: float) -> None:
+        """Stage 7: ``qdd`` from the solved velocity, integrate the coordinates and publish the output state (with the
+        next step's geometry where the clock refreshes it)."""
         with wp.ScopedTimer("S7_Integrate", print=False, use_nvtx=self.nvtx, synchronize=False):
-            next_refresh = ((step + 1) % self.options.update_mass_matrix_interval) == 0
-            self.held.finish(state_in, self, state_out, dt, next_refresh)
+            self.held.finish(state_in, self, state_out, dt)
             self.fk_id_cache_source_state = state_out
 
     # ---------------------------------------------------------------------------------------------------------------

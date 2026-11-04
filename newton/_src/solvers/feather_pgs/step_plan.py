@@ -437,7 +437,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     # Stages 1-3: the tree factor (FK/ID, drives, mass refresh, factor), then the predictor v_hat.
     def factor_trees(step):
         step.qd, step.ready = factor.factor(
-            step.state_in, step.control, step.state_out, step.dt, step.index, solver.qd_work, solver.v_hat, solver.v_out
+            step.state_in, step.control, step.state_out, step.dt, solver.qd_work, solver.v_hat, solver.v_out
         )
 
     def predict(step):
@@ -549,7 +549,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
 
     # Stage 7: the finish (qdd, integration, publication), the carry the next step reads, the leave.
     def finish(step):
-        factor.finish(step.state_in, step.state_out, step.dt, step.index)
+        factor.finish(step.state_in, step.state_out, step.dt)
 
     def carry(step):
         sweep.carry(step.state_in, step.state_out, step.contacts, step.dt)

@@ -554,18 +554,57 @@ def _light_update_qdd_from_velocity(
         joint_qdd[tid] = (v_new[tid] - joint_qd[tid]) * inv_dt
 
 
+@wp.struct
+class Clock:
+    """The step's clock on the device, so a captured graph's replays keep their own cadence: the step's index (from
+    0), its duration and the last step's (0 before the first step), the mass refresh's interval, and what the step's
+    first kernel derives from them once for every reader: whether the duration changed, and whether this step and the
+    next refresh every mass matrix."""
+
+    step: int
+    dt: float
+    prev_dt: float
+    interval: int
+    changed: int
+    refresh: int
+    next_refresh: int
+
+
+@wp.kernel
+def advance_clock(clock: wp.array[Clock], dt: float):
+    """The step's first kernel: the next step index and the step's duration, the last one's kept; a changed duration
+    refreshes the mass and repairs every cache this step."""
+    c = clock[0]
+    c.step = c.step + 1
+    c.prev_dt = c.dt
+    c.dt = dt
+    c.changed = int(c.prev_dt > 0.0 and wp.abs(c.dt - c.prev_dt) > 1.0e-8)
+    c.refresh = int(c.step % c.interval == 0 or c.changed != 0)
+    c.next_refresh = int((c.step + 1) % c.interval == 0)
+    clock[0] = c
+
+
+@wp.func
+def clock_dt_ratio(c: Clock) -> float:
+    """The step's duration over the last step's (1 on the first step): a carried impulse, proportional to the step for
+    a quasi-static load, is rescaled by it."""
+    ratio = 1.0
+    if c.prev_dt > 0.0:
+        ratio = c.dt / c.prev_dt
+    return ratio
+
+
 @wp.kernel
 def build_mass_update_mask(
-    global_flag: int,
+    clock: wp.array[Clock],
     # in/out
     mass_update_requested: wp.array[int],
     # outputs
     mass_update_mask: wp.array[int],
 ):
-    """Consume the requests into a step's mask: a request left set changes the factor cadence on subsequent captured
-    steps."""
+    """Consume the requests into a step's mask, with the clock's refresh."""
     tid = wp.tid()
-    flag = 1 if global_flag != 0 else 0
+    flag = clock[0].refresh
     if mass_update_requested[tid] != 0:
         flag = 1
     mass_update_mask[tid] = flag

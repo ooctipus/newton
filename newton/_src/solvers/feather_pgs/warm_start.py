@@ -8,6 +8,7 @@ import warp as wp
 
 from .contact_input import ContactRoutes
 from .contact_laws import CONTACT_SPIN_ROW, contact_tangent_basis
+from .factor.kernels import Clock, clock_dt_ratio
 from .projection_laws import ball, disk
 from .row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
 from .row_records import DenseRows, MfRows
@@ -157,7 +158,7 @@ def gather_mf_warmstart(
     mf_constraint_count: wp.array[int],
     previous_normal: wp.array[wp.vec3],
     decay: float,
-    dt_scale: float,
+    clock: wp.array[Clock],
     mf_max_c: int,
     # in-out
     mf_impulses: wp.array2d[float],
@@ -171,8 +172,8 @@ def gather_mf_warmstart(
     each writes only its own disjoint slot range, so unmatched / cold contacts
     keep the zero left by the memset and no stale slot survives.
 
-    ``dt_scale`` = dt_now / dt_prev rescales carried impulses across step-size
-    changes (impulse is proportional to dt for quasi-static loads); 1.0 at fixed dt.
+    The step clock's ratio (:func:`.factor.kernels.clock_dt_ratio`, dt_now / dt_prev) rescales carried impulses
+    across step-size changes (impulse is proportional to dt for quasi-static loads); 1.0 at fixed dt.
 
     ``match_index[c] >= 0`` is the previous frame's *sorted* contact index;
     ``prev_slot_sorted`` is keyed the same way (see solver writeback), so
@@ -182,6 +183,7 @@ def gather_mf_warmstart(
     offset (guards the variable 1-vs-3 stride).
     """
     c = wp.tid()
+    dt_scale = clock_dt_ratio(clock[0])
     if c >= routes.count[0]:
         return
     if routes.path[c] != 1:  # MF path only
@@ -299,7 +301,7 @@ def gather_dense_warmstart(
     world_constraint_count: wp.array[int],
     previous_normal: wp.array[wp.vec3],
     decay: float,
-    dt_scale: float,
+    clock: wp.array[Clock],
     max_constraints: int,
     # in-out
     world_impulses: wp.array2d[float],
@@ -318,6 +320,7 @@ def gather_dense_warmstart(
     starting point near the converged solution.
     """
     c = wp.tid()
+    dt_scale = clock_dt_ratio(clock[0])
     if c >= routes.count[0]:
         return
     if routes.path[c] != 0:  # dense path only

@@ -594,7 +594,7 @@ class TreeKineticState:
             setattr(bank, name, value)
         return bank
 
-    def begin(self, state_in, state_aug, stage3_qd, dt, global_refresh, *, state_out=None):
+    def begin(self, state_in, state_aug, stage3_qd, dt, *, state_out=None):
         """Repair current caches or late-request geometry before any factor read.
 
         Args:
@@ -602,7 +602,6 @@ class TreeKineticState:
             state_aug: The solver's augmented state.
             stage3_qd: The predictor velocity (the prescaled velocity of a motion-velocity layout).
             dt: The step duration [s].
-            global_refresh: Whether this step refreshes every group's geometry.
             state_out: The step's output bank. A group whose cache the last finish
                 published into it keeps that cache when ``state_in`` holds the same
                 words (see :func:`~.tree_kinetic_state.get_bank_kernel`). ``None``
@@ -614,19 +613,14 @@ class TreeKineticState:
         source = _bank_pointers(state_in)
         capture = capture_joins.capture_id(device)
         continuity, self._continuity = self._continuity, None
-        if (
-            continuity is not None
-            and source == self._published
-            and continuity[0] == capture
-            and (not global_refresh or continuity[1])
-        ):
+        if continuity is not None and source == self._published and continuity == capture:
             # This capture's last finish published into this bank and no host call
-            # has touched validity or requests since. Every group with a finite cache
-            # is valid, stamped with this bank, unrequested and, unless this step
-            # needs geometry the finish did not compute, geometrically current: its
-            # block would take the early exit. (A non-finite cache stays invalid, and
-            # the predictor then makes its articulations' next state NaN with or
-            # without a repair.)
+            # has touched validity, requests or the step duration since. Every group
+            # with a finite cache is valid, stamped with this bank, unrequested and
+            # geometrically current (the finish computed the geometry exactly where
+            # the clock's next step refreshes it): its block would take the early
+            # exit. (A non-finite cache stays invalid, and the predictor then makes
+            # its articulations' next state NaN with or without a repair.)
             self._record_capture(capture, "skipped")
             self._motion_binding = binding
             return
@@ -642,7 +636,7 @@ class TreeKineticState:
             data,
             self.data,
             self.solver.factor.mass_update_requested,
-            int(global_refresh),
+            self.solver.factor.clock,
             stage3_qd,
         ]
         lists = [self._repair_blocks, self._list_counts]
@@ -779,7 +773,7 @@ class TreeKineticState:
             self.predictor_kernel, dim=[self.launch_count], inputs=inputs, block_dim=self.block_dim, device=device
         )
 
-    def finish(self, state_in, state_aug, state_out, dt, next_refresh):
+    def finish(self, state_in, state_aug, state_out, dt):
         """Integrate once, publish complete public state and construct next bias."""
         self._validate_call(state_in, state_aug, dt)
         self._validate_call(state_out, state_aug, dt)
@@ -795,7 +789,7 @@ class TreeKineticState:
                 data,
                 self.data,
                 self.solver.factor.mass_update_requested,
-                int(next_refresh),
+                self.solver.factor.clock,
                 # The repair inputs of the shared launch ABI, unread by a finish.
                 state_in.joint_qd,
                 self._repair_blocks,
@@ -807,4 +801,4 @@ class TreeKineticState:
         )
         capture = capture_joins.capture_id(self.solver.model.device)
         self._published, self._published_capture = _bank_pointers(state_out), capture
-        self._continuity = (capture, bool(next_refresh)) if capture and self.skip_captured_repairs else None
+        self._continuity = capture if capture and self.skip_captured_repairs else None

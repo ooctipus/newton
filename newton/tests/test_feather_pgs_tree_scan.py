@@ -468,7 +468,7 @@ class TestHeldTreeChains(unittest.TestCase):
                 state.joint_qd.assign(rng.uniform(-0.5, 0.5, model.joint_dof_count).astype(np.float32))
                 expected = model.state()
                 newton.eval_fk(model, state.joint_q, state.joint_qd, expected)
-                owner.begin(state, solver.factor, state.joint_qd, 1.0 / 240.0, True)
+                owner.begin(state, solver.factor, state.joint_qd, 1.0 / 240.0)
                 np.testing.assert_allclose(state.body_q.numpy(), expected.body_q.numpy(), atol=2e-6)
                 np.testing.assert_allclose(state.body_qd.numpy(), expected.body_qd.numpy(), atol=2e-5)
                 np.testing.assert_array_equal(owner.status.numpy(), 0)

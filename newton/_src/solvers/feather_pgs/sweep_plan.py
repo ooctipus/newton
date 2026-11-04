@@ -1587,7 +1587,7 @@ class Sweep:
                     self.placement.constraint_count,
                     self.placement.ws_prev_contact_normal,
                     self.options.pgs_warmstart_decay,
-                    dt / self.prev_dt if self.prev_dt > 0.0 else 1.0,
+                    self.factor.clock,
                     self.placement.dense_max_constraints,
                 ],
                 outputs=[self.placement.impulses],

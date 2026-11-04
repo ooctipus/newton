@@ -117,7 +117,7 @@ def _launch(group, kernel, data, velocity, start):
             data,
             group.data,
             group.solver.factor.mass_update_requested,
-            1,
+            group.solver.factor.clock,
             velocity,
             group._repair_blocks,
             group._list_counts,
@@ -218,7 +218,7 @@ class TestTreeKineticStages(unittest.TestCase):
                 self.assertFalse(group.motion_velocity)
                 before = {name: array.numpy().copy() for name, array in _state_arrays(group).items()}
                 with self.assertRaisesRegex(RuntimeError, "excludes alternate prescaled predictor velocity"):
-                    group.begin(state, solver.factor, other, DT, True)
+                    group.begin(state, solver.factor, other, DT)
                 with self.assertRaisesRegex(RuntimeError, "excludes alternate prescaled predictor velocity"):
                     group.predict(state, solver.factor, control, other, DT)
                 for name, array in _state_arrays(group).items():

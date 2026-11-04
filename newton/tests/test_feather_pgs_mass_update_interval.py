@@ -9,6 +9,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.factor.kernels import Clock, advance_clock
 from newton._src.solvers.feather_pgs.tree_factor import TreeFactor
 from newton.solvers import SolverFeatherPGS
 
@@ -405,29 +406,53 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         self.assertEqual(solver.factor.mass_update_requested.numpy().tolist(), [0, 0])
 
     def test_held_tree_route_consumes_mass_requests(self):
-        """Refresh the held tree once and consume every request."""
-        for force, step, requested, expected in (
+        """Refresh the held tree once and consume every request, at the clock's cadence or its changed duration."""
+        for changed, step, requested, expected in (
             (True, 1, [0, 0, 0], [1, 1, 1]),
             (False, 0, [0, 0, 0], [1, 1, 1]),
             (False, 1, [1, 1, 1], [1, 1, 1]),
             (False, 1, [0, 0, 0], [0, 0, 0]),
             (False, 1, [0, 1, 0], [0, 1, 0]),
         ):
-            with self.subTest(force=force, step=step, requested=requested):
+            with self.subTest(changed=changed, step=step, requested=requested):
                 calls = []
+                clock = Clock()
+                clock.step, clock.dt, clock.interval = step - 1, 2.0 * DT if changed else DT, 2
                 factor = SimpleNamespace(
                     model=SimpleNamespace(articulation_count=3, device=wp.get_device("cpu")),
-                    force_mass_update=force,
+                    clock=wp.array([clock], dtype=Clock, device="cpu"),
                     held=SimpleNamespace(refresh=calls.append),
                     mass_update_requested=wp.array(requested, dtype=int, device="cpu"),
                     mass_update_mask=wp.zeros(3, dtype=int, device="cpu"),
-                    options=SimpleNamespace(update_mass_matrix_interval=2),
                 )
-                TreeFactor.refresh(factor, None, step)
+                wp.launch(advance_clock, dim=1, inputs=[factor.clock, DT], device="cpu")
+                TreeFactor.refresh(factor, None)
                 self.assertEqual(calls, [factor])
                 np.testing.assert_array_equal(factor.mass_update_mask.numpy(), expected)
                 np.testing.assert_array_equal(factor.mass_update_requested.numpy(), [0, 0, 0])
-                self.assertFalse(factor.force_mass_update)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph capture requires CUDA")
+    def test_captured_cadence_follows_the_device_clock(self):
+        """Refresh every third step across replays of a two-step graph: the clock counts the replayed steps, where a
+        host step index baked into the capture repeated its own two-step pattern (refresh, reuse)."""
+        model = _build_model("cuda:0", ground=False)
+        solver = SolverFeatherPGS(model, update_mass_matrix_interval=3)
+        state_in, state_out, control = _make_initial_state(model), model.state(), model.control()
+
+        def two_steps():
+            for _ in range(2):
+                solver.step(state_in, state_out, control, None, DT)
+                for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+                    wp.copy(getattr(state_in, name), getattr(state_out, name))
+
+        with wp.ScopedCapture("cuda:0") as capture:
+            two_steps()
+        masks = []
+        for _ in range(3):
+            wp.capture_launch(capture.graph)
+            masks.append(solver.factor.mass_update_mask.numpy().tolist())
+        # The second step of each replay: steps 1, 3 and 5; only step 3 refreshes.
+        self.assertEqual(masks, [[0, 0], [1, 1], [0, 0]])
 
     def test_teardown_drains_device_without_accessing_finalized_streams(self):
         """Drain all owned streams without dereferencing finalized handles."""
