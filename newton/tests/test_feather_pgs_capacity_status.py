@@ -286,6 +286,16 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
             np.testing.assert_array_equal(counts.numpy(), [3, 4])
         np.testing.assert_array_equal(status.numpy(), [1, 1])
 
+    def test_free_body_rows_fit_the_packed_parent(self):
+        """Refuse a free-body row capacity past the packed metadata's 16-bit parent (65,535 rows, 0xffff for none): rows
+        past a world's capacity are then the allocator's rejections with status (above), never a wrapped parent."""
+        builder = newton.ModelBuilder()
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()), mass=1.0)
+        builder.add_shape_sphere(body, radius=0.1)
+        model = builder.finalize(device="cpu")
+        with self.assertRaisesRegex(ValueError, "mf_max_constraints"):
+            SolverFeatherPGS(model, mf_max_constraints=65_536)
+
     def test_finalizer_truncates_rejected_contact_reservations(self):
         """Exclude a rejected triple even when its first row fits the capacity."""
         device = "cpu"
