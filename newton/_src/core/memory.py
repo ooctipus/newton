@@ -58,6 +58,7 @@ __all__ = [
     "granules",
     "static_budget",
     "table",
+    "words",
 ]
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -368,6 +369,15 @@ class Operand:
     def __post_init__(self):
         if self.place not in _LOAD:
             raise ValueError(f"operand {self.name}: {self.place} is not a place in global memory")
+
+
+def words(*names: str) -> tuple[str, str]:
+    """The named words alone, in one order, as ``(cuda, cpu)`` native statements: a body that calls a few words
+    declares only those (a declared word it does not call can still move its schedule)."""
+    unknown = set(names) - set(_WORDS)
+    if unknown:
+        raise ValueError(f"no memory words {sorted(unknown)}")
+    return tuple("\n".join(f"    {_WORDS[name][cpu]}" for name in _WORDS if name in names) for cpu in (0, 1))
 
 
 def access(*declared: Place | Operand) -> tuple[str, str]:

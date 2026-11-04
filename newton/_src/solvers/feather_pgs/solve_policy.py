@@ -37,12 +37,12 @@ worlds without dense or matrix-free rows as skipped, in a launch of its own. Nei
 value.
 """
 
-import re
 from dataclasses import dataclass, fields
 
 import numpy as np
 import warp as wp
 
+from ...core import memory
 from ...core.memory import Buffer
 from . import field_group
 from .device_preludes import DevicePrelude
@@ -106,20 +106,17 @@ def count_skipped_solves(
         skipped[world] = skipped[world] + 1
 
 
-def _serial(source: str) -> str:
-    """The CPU twin of a readout prelude: one thread counts, so its atomic increments are plain ones."""
-    source = re.sub(r"atomicAdd\(reinterpret_cast<unsigned long long\*>\(&([^;]*?\])\), 1ull\)", r"\1 += 1", source)
-    return re.sub(r"atomicAdd\(&([^;]*?\]), 1\)", r"\1 += 1", source)
-
-
 _SWEEP_READOUT = """    const auto solve_readout_sweeps = [&](int readout_world, int executed, bool stopped) {
         const int rows = readout.sweeps.shape[0];
         const int row = executed < rows ? executed : rows - 1;
-        atomicAdd(&readout.sweeps.data[row * readout.sweeps.shape[1] + readout_world], 1);
-        if (!stopped) atomicAdd(&readout.exhausted.data[readout_world], 1);
+        ADD(readout.sweeps.data[row * readout.sweeps.shape[1] + readout_world], 1);
+        if (!stopped) ADD(readout.exhausted.data[readout_world], 1);
     };"""
 
-SWEEP_READOUT = DevicePrelude("sweep_readout", _SWEEP_READOUT, _serial(_SWEEP_READOUT))
+_ADD = memory.words("ADD")
+"""The readouts' counts: the memory toolkit's ``ADD`` (an atomic add; the CPU's one thread adds)."""
+
+SWEEP_READOUT = DevicePrelude("sweep_readout", *(f"{add}\n{_SWEEP_READOUT}" for add in _ADD))
 """Device helper that records one solve; ``readout`` is the kernel's :class:`SolveReadout` operand."""
 
 _GRID_LITERALS = ", ".join(f"{value:.9e}f" for value in TRACE_GRID)
@@ -140,15 +137,15 @@ _SWEEP_TRACE = f"""    float solve_trace_max = 0.0f;
         const int column = executed < columns - 1 ? executed : columns - 2;
         for (int point = 0; point < {len(TRACE_GRID)}; ++point) {{
             if (((solve_trace_open >> point) & 1u) != 0u && change <= grid[point]) {{
-                atomicAdd(reinterpret_cast<unsigned long long*>(&readout.stops.data[point * columns + column]), 1ull);
+                ADD(*reinterpret_cast<unsigned long long*>(&readout.stops.data[point * columns + column]), 1ull);
                 solve_trace_open &= ~(1u << point);
             }}
         }}
         if (!final) return;
         const int rows = readout.sweeps.shape[0];
-        atomicAdd(&readout.sweeps.data[(executed < rows ? executed : rows - 1) * readout.sweeps.shape[1] + trace_world], 1);
-        if (!stopped) atomicAdd(&readout.exhausted.data[trace_world], 1);
-        atomicAdd(reinterpret_cast<unsigned long long*>(&readout.reasons.data[stopped ? (change > 0.0f ? 1 : 0) : 2]), 1ull);
+        ADD(readout.sweeps.data[(executed < rows ? executed : rows - 1) * readout.sweeps.shape[1] + trace_world], 1);
+        if (!stopped) ADD(readout.exhausted.data[trace_world], 1);
+        ADD(*reinterpret_cast<unsigned long long*>(&readout.reasons.data[stopped ? (change > 0.0f ? 1 : 0) : 2]), 1ull);
         const int kinds = readout.limits.shape[0], bins = readout.limits.shape[1];
         const int kind_row = kind >= 0 && kind < kinds - 1 ? kind : kinds - 1;
         int bin = 0;
@@ -156,13 +153,13 @@ _SWEEP_TRACE = f"""    float solve_trace_max = 0.0f;
             bin = isfinite(change) ? static_cast<int>(floorf(2.0f * log10f(change))) + 19 : bins - 1;
             bin = bin < 1 ? 1 : (bin > bins - 1 ? bins - 1 : bin);
         }}
-        atomicAdd(reinterpret_cast<unsigned long long*>(&readout.limits.data[kind_row * bins + bin]), 1ull);
+        ADD(*reinterpret_cast<unsigned long long*>(&readout.limits.data[kind_row * bins + bin]), 1ull);
         for (int point = 0; point < {len(TRACE_GRID)}; ++point)
             if (((solve_trace_open >> point) & 1u) != 0u)
-                atomicAdd(reinterpret_cast<unsigned long long*>(&readout.stops.data[point * columns + columns - 1]), 1ull);
+                ADD(*reinterpret_cast<unsigned long long*>(&readout.stops.data[point * columns + columns - 1]), 1ull);
     }};"""
 
-SWEEP_TRACE = DevicePrelude("sweep_trace", _SWEEP_TRACE, _serial(_SWEEP_TRACE))
+SWEEP_TRACE = DevicePrelude("sweep_trace", *(f"{add}\n{_SWEEP_TRACE}" for add in _ADD))
 """Device state and helpers of the trace; ``readout`` is the kernel's :class:`SolveTrace` operand."""
 
 
