@@ -520,12 +520,12 @@ class TestResolvedWorlds(unittest.TestCase):
 
 
 def _admissible_solver():
-    """A stand-in solver whose policy the classifier admits; device checks see CUDA."""
+    """A stand-in solver whose policy the classifier admits, on any device."""
     return SimpleNamespace(
         factor=SimpleNamespace(block_count=0),
         placement=SimpleNamespace(keyed_rows=None),
         routes=SimpleNamespace(case="K6"),
-        model=SimpleNamespace(device=SimpleNamespace(is_cuda=True)),
+        model=SimpleNamespace(device=SimpleNamespace(is_cuda=False)),
         _route_pins={},
         forest=SimpleNamespace(
             max_world_dofs=29,
@@ -660,11 +660,12 @@ def _tossed_spheres(device, worlds=4):
     return model
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "The classifier is a CUDA path")
-class TestResolvedWorldsCUDA(unittest.TestCase):
+class TestResolvedWorldsDevice(unittest.TestCase):
+    """The classifier on the default device: one rule decides which rows exist on the CPU and on CUDA."""
+
     def test_resolved_worlds_match_the_complete_path(self):
         """Fixed-base arms over free boxes: resolved worlds step identically with no rows built."""
-        model = _build(wp.get_device("cuda:0"), worlds=6)
+        model = _build(wp.get_device(), worlds=6)
         plain_solver, plain, plain_masks = _rollout(model, classifier=False)
         self.assertIsNone(plain_solver.sweep.resolved_worlds_owner)
         self.assertEqual(plain_masks.shape[1], 0)
@@ -684,7 +685,7 @@ class TestResolvedWorldsCUDA(unittest.TestCase):
     def test_row_watermark_counts_the_rows_it_does_not_choose(self):
         """The row watermark (a diagnostic) resolves the same worlds and steps the same state as the telemetry off, and
         counts the rows the resolved worlds skipped."""
-        model = _build(wp.get_device("cuda:0"), worlds=6)
+        model = _build(wp.get_device(), worlds=6)
         _solver, poses, masks = _rollout(model, classifier=True, steps=30)
         diagnostics = {"diagnostics": SolverFeatherPGS.Diagnostics(row_watermark=True)}
         solver, watched_poses, watched_masks = _rollout(model, classifier=True, steps=30, solver_kwargs=diagnostics)
@@ -702,7 +703,7 @@ class TestResolvedWorldsCUDA(unittest.TestCase):
         # The seventeen-link arm has 34 position limits: keep its rows within capacity as Kuka's recipe does.
         for links, solver_kwargs in ((3, {}), (17, {"dense_max_constraints": 128, "joint_limit_activation_gap": 0.1})):
             with self.subTest(links=links):
-                model = _build(wp.get_device("cuda:0"), worlds=6, links=links)
+                model = _build(wp.get_device(), worlds=6, links=links)
                 complete_history, history = [], []
                 plain_solver, plain, plain_masks = _rollout(
                     model,
@@ -744,7 +745,7 @@ class TestResolvedWorldsCUDA(unittest.TestCase):
         release the anchor; the complete path rejects the contact's three rows for capacity instead and
         keeps the anchor. The capacity bound (three rows per checked contact) must hold the world.
         """
-        model = _tossed_spheres(wp.get_device("cuda:0"))
+        model = _tossed_spheres(wp.get_device())
         # Thirty steps: each sphere rises about 5 cm and starts falling, inside the 10 cm contact gap.
         options = {"steps": 30, "friction_anchor_beta": None, "solver_kwargs": {"mf_max_constraints": 2}}
         complete_history, history = [], []
@@ -763,10 +764,15 @@ class TestResolvedWorldsCUDA(unittest.TestCase):
 
     def test_published_twists_match_the_body_pass(self):
         """The predictor's published twists decide the same worlds as the classifier's own body pass."""
-        model = _build(wp.get_device("cuda:0"), worlds=6)
+        model = _build(wp.get_device(), worlds=6)
         own_solver, own_poses, own_masks = _rollout(model, classifier=True, published=False)
         solver, poses, masks = _rollout(model, classifier=True)
         self.assertFalse(own_solver.sweep.resolved_worlds_owner.published)
+        if not model.device.is_cuda:
+            # The predictor publishes its twists from a CUDA register scan (tree_kinetic_owner): the CPU's classifier
+            # builds them itself in both runs.
+            self.assertFalse(solver.sweep.resolved_worlds_owner.published)
+            return
         self.assertTrue(solver.sweep.resolved_worlds_owner.published)
         self.assertGreater(int(masks.sum()), 0)
         # The published twist sums the same axis terms in tree order; a residual within

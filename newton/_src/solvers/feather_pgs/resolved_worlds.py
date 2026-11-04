@@ -681,10 +681,6 @@ def decline(solver) -> str | None:
                 "resolved_worlds" in solver._route_pins.get("claims", ("resolved_worlds",)),
                 "A test pin drops the resolved-world claim.",
             ),
-            (
-                solver.model.device.is_cuda,
-                "The classifier evaluates the CUDA matrix-free route only.",
-            ),
             # A separating contact carries no load, so its friction and spin rows (contact torsion) carry nothing either:
             # the classifier's normal law decides a world with spin rows as one without.
             (not laws.compliance, "Material contacts are outside the rigid contact law it classifies."),
@@ -701,7 +697,7 @@ def decline(solver) -> str | None:
                 and all(getattr(solver.forest, name) is not None for name in required)
                 and solver.laws.joint_limit_q_index is not None,
                 "The rows are outside the classified law (route, bilateral or velocity rows, warm start, "
-                "regularization, device or world width).",
+                "regularization or world width).",
             ),
         )
     )
