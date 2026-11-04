@@ -23,13 +23,20 @@ from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplets
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
-from newton.tests.test_feather_pgs_path_selection import _cpu_model
 from newton.tests.test_feather_pgs_sparse_pgs import _sweep
 
 TRIPLETS = {"active_rows": True, "use_support_table": True, "contact_triplets": True}
 # Row capacities of the suite's two launch-bound families: shared memory admits 12 blocks of 256 rows on the
 # RTX PRO 6000, and the register budget's 16 of 96.
 CAPACITIES = (256, 96)
+
+
+def _cpu_model():
+    """One revolute link on the CPU."""
+    builder = newton.ModelBuilder()
+    body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    builder.add_articulation([builder.add_joint_revolute(-1, body)])
+    return builder.finalize(device="cpu")
 
 
 def _snippet(kernel):

@@ -62,7 +62,6 @@ test_feather_pgs_hetero_guard
 test_feather_pgs_joint_limit_activation_gap
 test_feather_pgs_launch
 test_feather_pgs_mass_update_interval
-test_feather_pgs_mf_metadata
 test_feather_pgs_mixed_tree_free_body
 test_feather_pgs_notify_inertial
 test_feather_pgs_paired_components
@@ -84,7 +83,6 @@ test_feather_pgs_sweep_tiers
 test_feather_pgs_teardown
 test_feather_pgs_tree_scan
 test_feather_pgs_tree_switches
-test_feather_pgs_velocity_prescale
 test_feather_pgs_warmstart_dt
 test_gjk
 test_gjk_near_contact

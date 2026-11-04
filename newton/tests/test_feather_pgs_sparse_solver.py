@@ -511,7 +511,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         """Reject full-support chains and oversized dense rows, and take contact torsion's spin rows.
 
         Joint velocity limits are not among them: they compose with sparse
-        factors under either friction law (test_feather_pgs_path_selection).
+        factors under either friction law (the route probe records it).
         """
         chain = _build_chain("cuda:0", base_z=1.2, contact_sphere="deep", ground=False)
         self.assertIsNone(_make_solver(chain, True).placement.sparse_mass_matrix_size)

@@ -68,6 +68,38 @@ def _build_arm_and_box_model(device) -> newton.Model:
     return builder.finalize(device=device)
 
 
+def _cartesian_pair(builder: newton.ModelBuilder) -> None:
+    """Append an articulation of two prismatic joints along x and then y: a diagonal mass matrix and no bias force."""
+    slider = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    carriage = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    builder.add_articulation(
+        [
+            builder.add_joint_prismatic(parent=-1, child=slider, axis=newton.Axis.X),
+            builder.add_joint_prismatic(parent=slider, child=carriage, axis=newton.Axis.Y),
+        ]
+    )
+
+
+class TestFeatherPGSVelocityPrescale(unittest.TestCase):
+    """The pre-solve prescale: an articulation past a joint's velocity limit scales all its joint velocities by one
+    ratio, ``min_i(limit_i / |qd_i|)``, as PhysX does, so its motion keeps its direction; one within its limits is
+    untouched. A per-coordinate clamp would end the first pair below at ``(1, 1)``."""
+
+    @unittest.skipUnless(wp.is_cuda_available(), "joint velocity limits require CUDA")
+    def test_one_ratio_scales_the_articulation(self):
+        builder = newton.ModelBuilder(gravity=0.0)
+        for _ in range(2):
+            _cartesian_pair(builder)
+        model = builder.finalize(device="cuda:0")
+        model.joint_velocity_limit.assign(np.ones(model.joint_dof_count, dtype=np.float32))
+        solver = SolverFeatherPGS(model, enable_joint_velocity_limits=True, angular_damping=0.0)
+        state_0, state_1 = model.state(), model.state()
+        state_0.joint_qd.assign(np.array([3.0, 1.0, 0.5, -0.2], dtype=np.float32))
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        solver.step(state_0, state_1, model.control(), None, 1.0 / 240.0)
+        np.testing.assert_allclose(state_1.joint_qd.numpy(), [1.0, 1.0 / 3.0, 0.5, -0.2], rtol=1.0e-5, atol=1.0e-6)
+
+
 class TestFeatherPGSVelocityLimitOrdering(unittest.TestCase):
     def _max_arm_speed_over_impact(self, velocity_limits: bool = True) -> float:
         model = _build_arm_and_box_model(device="cuda:0")

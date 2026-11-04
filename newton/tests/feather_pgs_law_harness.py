@@ -1243,21 +1243,6 @@ def anchored(test, module_file: str, text: str):
     return text
 
 
-def reference_kernel(name: str, signature: str, body: str, namespace: dict, module_options=None):
-    """A Warp kernel whose body is the replaced code, with its data accesses renamed to kernel arguments."""
-    source = f"def {name}({signature}):\n{indent_block(body)}"
-    kernel = exec_kernel(name, source, {"wp": wp, **namespace})
-    if module_options:
-        kernel.module.options.update(module_options)
-    return kernel
-
-
-def dedent_block(body: str) -> str:
-    import textwrap  # noqa: PLC0415
-
-    return textwrap.dedent(body).lstrip("\n")
-
-
 def indent_block(body: str) -> str:
     import textwrap  # noqa: PLC0415
 
@@ -1296,32 +1281,12 @@ def native_kernel(name: str, inputs: dict, outputs: dict, body: str, preludes=()
     return exec_kernel(name, source, namespace)
 
 
-def run_native(kernel, inputs: dict, outputs: dict, values: dict, n: int, device):
-    args = {f"{var}_in": values[var] for var in inputs}
-    args.update(
-        {
-            f"{var}_out": np.zeros(
-                (n, 2) if dtype is wp.vec2 else ((n, 3) if dtype is wp.vec3 else n),
-                np.float32 if dtype is not int else np.int32,
-            )
-            for var, dtype in outputs.items()
-        }
-    )
-    out = call(kernel, n, device, **args)
-    return {var: out[f"{var}_out"].numpy() for var in outputs}
-
-
 def between(text: str, start: str, end: str, occurrence: int = 0) -> str:
     """The text from ``start`` (included) to ``end`` (excluded), at its ``occurrence``-th start."""
     position = -1
     for _ in range(occurrence + 1):
         position = text.index(start, position + 1)
     return text[position : text.index(end, position)]
-
-
-def require_cuda(test, device):
-    if not wp.get_device(device).is_cuda:
-        test.skipTest("native implementations compile for CUDA only")
 
 
 def joint_type(name: str) -> int:
