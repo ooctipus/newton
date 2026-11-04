@@ -443,20 +443,17 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     scalar = getattr(factor.held, "scalar", None)
     stream = factor.dynamics_stream
 
+    # Scalar branches evaluate their own drives in their predict: the drives' stage takes the other coordinates.
+    drive_dofs = None if scalar is None else scalar.other_drive_dofs
+
     def drives(step):
-        factor.prepare_drives(step.state_in, step.control, step.dt, solver.v_hat, solver.v_out)
-
-    def scalar_drives(step):
-        # Scalar branches evaluate their own drives in their predict.
-        scalar.launch_other_drives(step.state_in, factor, step.control, step.dt)
-
-    launch_drives = drives if scalar is None else scalar_drives
+        factor.prepare_drives(step.state_in, step.control, step.dt, solver.v_hat, solver.v_out, drive_dofs)
 
     def drives_on_stream(step):
         # The drives overlap FK/ID on the dynamics stream; the mask (refresh) joins them.
         stream.wait_event(wp.get_stream(model.device).record_event())
         with wp.ScopedStream(stream, sync_enter=False):
-            launch_drives(step)
+            drives(step)
 
     def join_drives(step):
         wp.get_stream(model.device).wait_event(stream.record_event())
@@ -491,7 +488,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
 
     drive_stages = ()
     if factor.parallel_drives and (scalar is None or scalar.other_drive_dofs is not None):
-        drive_stages = (drives_on_stream,) if stream is not None else (launch_drives,)
+        drive_stages = (drives_on_stream,) if stream is not None else (drives,)
     add(
         *drive_stages,
         prescale if solver.options.enable_joint_velocity_limits else velocity,

@@ -213,7 +213,6 @@ class TestKernelIdentity(unittest.TestCase):
         names = (
             "finish_prismatic_branches",
             "predict_prismatic_branches",
-            "prepare_listed_augmented_drives",
             "repair_scalar_branches",
         )
         self.assertEqual(sorted(kernels), [f"scalar_branches.{name}" for name in names])

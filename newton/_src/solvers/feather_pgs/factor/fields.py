@@ -11,7 +11,7 @@ import warp as wp
 
 from .. import field_group
 from ..field_group import Field, FieldGroup
-from ..spatial_laws import FACTOR_REQUEST, inertia_record, limited_drive_force
+from ..spatial_laws import FACTOR_REQUEST, drive_force, drive_stiffness, inertia_record, limited_drive_force
 
 ARTICULATION_WORK = FieldGroup(
     Field("mass_update_mask", wp.int32, ("articulation",), owner="factor"),
@@ -72,6 +72,36 @@ def hold_drive_row(
     if limited != u0:
         rows.row_dv[row] = rows.v_out[dof] - rows.v_hat[dof]
     return limited
+
+
+@wp.func
+def drive_terms(
+    dof: int,
+    q: float,
+    qd: float,
+    dt: float,
+    drive_row_by_dof: wp.array[int],
+    drive_target_index_by_dof: wp.array[int],
+    joint_target_ke: wp.array[float],
+    joint_target_kd: wp.array[float],
+    joint_target_pos: wp.array[float],
+    joint_target_vel: wp.array[float],
+    damping: wp.array[float],
+):
+    """Explicit force ``u0`` and implicit stiffness ``K`` of a coordinate's augmented drive
+    (:func:`.spatial_laws.drive_stiffness`, :func:`.spatial_laws.drive_force`): a coordinate without a row or with a
+    nonpositive ``K`` holds no drive, ``(0, 0)``: one law for every drive (the factor's preparation,
+    :func:`.tree_factor.prepare_augmented_drives`, and the scalar branches' predict)."""
+    u0 = float(0.0)
+    stiffness = float(0.0)
+    if drive_row_by_dof[dof] >= 0:
+        ke = joint_target_ke[dof]
+        kd = joint_target_kd[dof]
+        K = drive_stiffness(ke, kd, damping[dof], dt)
+        if K > 0.0:
+            u0 = drive_force(ke, kd, q, qd, joint_target_pos[drive_target_index_by_dof[dof]], joint_target_vel[dof], dt)
+            stiffness = K
+    return u0, stiffness
 
 
 STATE_AUX = FieldGroup(

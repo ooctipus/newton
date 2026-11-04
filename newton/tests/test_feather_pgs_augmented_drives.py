@@ -114,6 +114,7 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                     prepare_augmented_drives,
                     dim=model.joint_dof_count,
                     inputs=[
+                        wp.array(np.arange(model.joint_dof_count, dtype=np.int32), dtype=int, device=device),
                         wp.array(rows, dtype=int, device=device),
                         wp.array(q_indices, dtype=int, device=device),
                         wp.array(target_indices, dtype=int, device=device),
@@ -134,7 +135,8 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                 np.testing.assert_allclose(tau.numpy(), expected, rtol=0, atol=2e-6)
 
     def test_per_coordinate_drives(self):
-        """Write each coordinate's K and clamped force from its row, and clear both without gains."""
+        """Write each coordinate's K and clamped force from its row, clear both without gains, and request a factor
+        refresh wherever a drive's K changed, to zero included (one law for every drive)."""
         device = wp.get_device()
         joint_q = wp.array([0.25, -0.35], dtype=wp.float32, device=device)
         joint_qd = wp.array([0.1, -0.2], dtype=wp.float32, device=device)
@@ -146,11 +148,13 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
         damping = wp.array([0.2, 0.3], dtype=wp.float32, device=device)
         rows = wp.array([0, 1], dtype=wp.int32, device=device)
 
-        def prepare_by_dof(ke, kd, stiffness, tau):
+        def prepare_by_dof(ke, kd, stiffness, tau, passive=damping):
+            drive_rows = _drive_rows(stiffness, 1, 2, device)
             wp.launch(
                 prepare_augmented_drives,
                 dim=2,
                 inputs=[
+                    rows,
                     rows,
                     rows,
                     rows,
@@ -161,13 +165,14 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                     target_q,
                     target_qd,
                     effort_limit,
-                    damping,
+                    passive,
                     2,
                     0.1,
                 ],
-                outputs=[_drive_rows(stiffness, 1, 2, device), tau],
+                outputs=[drive_rows, tau],
                 device=device,
             )
+            return drive_rows.mass_update_requested.numpy()
 
         stiffness = wp.zeros(2, dtype=wp.float32, device=device)
         tau = wp.zeros(2, dtype=wp.float32, device=device)
@@ -184,6 +189,15 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
         prepare_by_dof(zero_gain, zero_gain, passive_stiffness, passive_tau)
         np.testing.assert_allclose(passive_stiffness.numpy(), [0.02, 0.03], rtol=0.0, atol=1.0e-7)
         np.testing.assert_array_equal(passive_tau.numpy(), [0.0, 0.0])
+
+        # A drive whose K falls to zero (no gains, no damper) holds no K and asks for a factor refresh, as every
+        # changed K does; an unchanged zero asks for none.
+        held = wp.array([0.22, 0.43], dtype=wp.float32, device=device)
+        requested = prepare_by_dof(zero_gain, zero_gain, held, wp.zeros(2, dtype=wp.float32, device=device), zero_gain)
+        np.testing.assert_array_equal(held.numpy(), [0.0, 0.0])
+        self.assertNotEqual(int(requested[0]), 0)
+        requested = prepare_by_dof(zero_gain, zero_gain, held, wp.zeros(2, dtype=wp.float32, device=device), zero_gain)
+        self.assertEqual(int(requested[0]), 0)
 
 
 if __name__ == "__main__":

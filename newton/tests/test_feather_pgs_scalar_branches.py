@@ -477,7 +477,7 @@ def check_owner_launches(test, device):
         sb.repair_scalar_branches: "repair",
         sb.predict_prismatic_branches: "predict",
         sb.finish_prismatic_branches: "finish",
-        sb.prepare_listed_augmented_drives: "drives",
+        tree_factor.prepare_augmented_drives: "drives",
     }
     launched = []
 
@@ -515,7 +515,7 @@ def check_owner_launches(test, device):
                             group.repair_kernel: "repair",
                             group.predictor_kernel: "predict",
                             group.finish_kernel: "finish",
-                            sb.prepare_listed_augmented_drives: "drives",
+                            tree_factor.prepare_augmented_drives: "drives",
                         }
                     else:
                         if forced:
@@ -540,7 +540,9 @@ def check_owner_launches(test, device):
                     _set_clock(solver.factor, refresh)
                     owner.begin(state, solver.factor, state.joint_qd, DT)
                     if owner.scalar.other_drive_dofs is not None:
-                        owner.scalar.launch_other_drives(state, solver.factor, control, DT)
+                        solver.factor.prepare_drives(
+                            state, control, DT, solver.v_hat, solver.v_out, owner.scalar.other_drive_dofs
+                        )
                     solver.factor.mass_update_mask.fill_(1)
                     owner.refresh(solver.factor)
                     solver.factor.walk_step(state, DT)
@@ -821,6 +823,7 @@ class TestScalarBranchKernels(unittest.TestCase):
             tree_factor.prepare_augmented_drives,
             dim=model.joint_dof_count,
             inputs=[
+                head.factor.drive_dofs,
                 head.factor.drive_row_by_dof,
                 head.factor.drive_q_index_by_dof,
                 head.factor.drive_target_index_by_dof,
@@ -840,7 +843,8 @@ class TestScalarBranchKernels(unittest.TestCase):
         )
         pair.mine.factor.aug_row_K.fill_(-7.0)
         pair.mine.factor.joint_tau.fill_(-7.0)
-        pair.state.launch_other_drives(state, pair.mine.factor, control, DT)
+        mine = pair.mine
+        mine.factor.prepare_drives(state, control, DT, mine.v_hat, mine.v_out, pair.state.other_drive_dofs)
         others = pair.state.other_drive_dofs.numpy()
         np.testing.assert_array_equal(np.sort(np.concatenate([others, pair.dofs])), np.arange(model.joint_dof_count))
         self.assertEqual(path_selection._tree_group(pair.state)["drive_dofs"], len(others))
@@ -1368,9 +1372,7 @@ class TestScalarBranchOwner(unittest.TestCase):
 
         with mock.patch.object(wp, "launch", record):
             solver.step(states[0], states[1], control, contacts, DT)
-        kernels = [kernel for kernel, _dim in launched]
-        self.assertNotIn(tree_factor.prepare_augmented_drives, kernels)
-        dims = [dim for kernel, dim in launched if kernel is sb.prepare_listed_augmented_drives]
+        dims = [dim for kernel, dim in launched if kernel is tree_factor.prepare_augmented_drives]
         self.assertEqual(dims, [model.joint_dof_count - STAR_LEAVES * model.world_count])
         self.assertTrue(np.isfinite(states[1].joint_q.numpy()).all())
 

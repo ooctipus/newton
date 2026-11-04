@@ -41,6 +41,7 @@ from .factor.fields import (
     STATE_AUX,
     DriveRows,
     Preelim,
+    drive_terms,
     hold_drive_row,
 )
 from .factor.kernels import (
@@ -71,7 +72,7 @@ from .factor.walk import (
 from .field_group import SolverArrays
 from .joint_table import JointTable
 from .row_laws import LINK_ROWS
-from .spatial_laws import drive_force, drive_stiffness, spring_damper_stiffness
+from .spatial_laws import spring_damper_stiffness
 from .tree_scan import (
     WALK_ANGULAR,
     WALK_BOTH,
@@ -87,6 +88,7 @@ __all__ = [
 
 @wp.kernel
 def prepare_augmented_drives(
+    dofs: wp.array[int],
     drive_row_by_dof: wp.array[int],
     drive_q_index_by_dof: wp.array[int],
     drive_target_index_by_dof: wp.array[int],
@@ -103,29 +105,27 @@ def prepare_augmented_drives(
     rows: DriveRows,
     drive_tau: wp.array[float],
 ):
-    """Each coordinate's augmented drive, ``K`` (:func:`.spatial_laws.drive_stiffness`, its passive damper's with it) and
-    ``u0`` (:func:`.spatial_laws.drive_force`), from the immutable DOF-to-row topology, held on its row
-    (:func:`.solver_fields.hold_drive_row`)."""
-    dof = wp.tid()
+    """The augmented drive of each coordinate of ``dofs`` (every coordinate, or those no scalar branch's predict folds),
+    from the immutable DOF-to-row topology: ``u0`` and ``K`` (:func:`.factor.fields.drive_terms`, its passive damper's
+    with it) held on its row (:func:`.factor.fields.hold_drive_row`), which requests the articulation's factor refresh
+    wherever ``K`` changed, a drive whose ``K`` fell to zero included."""
+    dof = dofs[wp.tid()]
     drive_tau[dof] = 0.0
     row = drive_row_by_dof[dof]
     if row < 0:
         return
-    ke = joint_target_ke[dof]
-    kd = joint_target_kd[dof]
-    K = drive_stiffness(ke, kd, passive_damping[dof], dt)
-    if K <= 0.0:
-        rows.row_K[row] = 0.0
-        rows.drive[dof] = wp.vec4()
-        return
-    u0 = drive_force(
-        ke,
-        kd,
+    u0, K = drive_terms(
+        dof,
         joint_q[drive_q_index_by_dof[dof]],
         joint_qd[dof],
-        joint_target_pos[drive_target_index_by_dof[dof]],
-        joint_target_vel[dof],
         dt,
+        drive_row_by_dof,
+        drive_target_index_by_dof,
+        joint_target_ke,
+        joint_target_kd,
+        joint_target_pos,
+        joint_target_vel,
+        passive_damping,
     )
     passive = spring_damper_stiffness(0.0, passive_damping[dof], 0.0, dt)
     drive_tau[dof] = hold_drive_row(rows, row, row // max_dofs, dof, u0, K, passive, joint_effort_limit[dof])
@@ -421,6 +421,7 @@ class TreeFactor:
         else:
             self._arrays.release(AUGMENTED_DRIVE_ROWS)
         self.parallel_drives = False
+        self.drive_dofs = None
         self.drive_row_by_dof = wp.full((max(1, int(model.joint_dof_count)),), -1, dtype=wp.int32, device=model.device)
         self.drive_q_index_by_dof = None
         self.drive_target_index_by_dof = None
@@ -469,6 +470,7 @@ class TreeFactor:
         row_counts = np.minimum(axis_count, max_dofs).astype(np.int32)
 
         self.drive_row_by_dof = wp.array(drive_row_by_dof, dtype=wp.int32, device=model.device)
+        self.drive_dofs = wp.array(np.arange(dof_count, dtype=np.int32), dtype=wp.int32, device=model.device)
         self.drive_q_index_by_dof = wp.array(drive_q_index_by_dof, dtype=wp.int32, device=model.device)
         self.drive_target_index_by_dof = wp.array(drive_target_index_by_dof, dtype=wp.int32, device=model.device)
         self.aug_row_counts.assign(row_counts)
@@ -640,15 +642,19 @@ class TreeFactor:
         self.fk_id_cache_source_state = state_in
         self.held.begin(state_in, self, qd, dt, state_out=state_out)
 
-    def prepare_drives(self, state_in, control, dt: float, v_hat: wp.array, v_out: wp.array) -> None:
-        """Launch every coordinate's augmented drive (:func:`prepare_augmented_drives`), apart from FK/ID; ``v_hat``
-        and ``v_out`` are last step's. A model with scalar branches launches its other drives instead
-        (:meth:`.scalar_branches.ScalarBranches.launch_other_drives`)."""
+    def prepare_drives(
+        self, state_in, control, dt: float, v_hat: wp.array, v_out: wp.array, dofs: wp.array | None = None
+    ) -> None:
+        """Launch the augmented drives of ``dofs`` (:func:`prepare_augmented_drives`; by default every coordinate's),
+        apart from FK/ID; ``v_hat`` and ``v_out`` are last step's. Beside scalar branches, whose predict folds their
+        own, ``dofs`` are the others (:attr:`.scalar_branches.ScalarBranchState.other_drive_dofs`)."""
         model = self.model
+        dofs = self.drive_dofs if dofs is None else dofs
         wp.launch(
             prepare_augmented_drives,
-            dim=model.joint_dof_count,
+            dim=dofs.shape[0],
             inputs=[
+                dofs,
                 self.drive_row_by_dof,
                 self.drive_q_index_by_dof,
                 self.drive_target_index_by_dof,

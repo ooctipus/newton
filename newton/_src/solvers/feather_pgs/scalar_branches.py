@@ -50,14 +50,12 @@ import warp as wp
 
 from ...sim import BodyFlags, JointType
 from . import cached_state_binding
-from .factor.fields import DriveRows, hold_drive_row
+from .factor.fields import drive_terms
 from .factor.kernels import Clock, clock_changed
 from .spatial_laws import (
     axis_transform,
     coordinate_force,
-    drive_force,
     drive_step_force,
-    drive_stiffness,
     free_drive_force,
     joint_frame_pose,
     limited_drive_force,
@@ -107,35 +105,6 @@ def _external_at_origin(
     if (body_flags[body] & BodyFlags.KINEMATIC) == 0:
         external = body_f[body]
     return wrench_shift(external, com_relative)
-
-
-@wp.func
-def _drive_terms(
-    dof: int,
-    q: float,
-    qd: float,
-    dt: float,
-    drive_row_by_dof: wp.array[int],
-    drive_target_index_by_dof: wp.array[int],
-    joint_target_ke: wp.array[float],
-    joint_target_kd: wp.array[float],
-    joint_target_pos: wp.array[float],
-    joint_target_vel: wp.array[float],
-    damping: wp.array[float],
-):
-    """Explicit force ``u0`` and implicit stiffness ``K`` of a coordinate's augmented drive
-    (:func:`.spatial_laws.drive_stiffness`, :func:`.spatial_laws.drive_force`): a coordinate without a row or with a
-    nonpositive ``K`` contributes neither."""
-    u0 = float(0.0)
-    stiffness = float(0.0)
-    if drive_row_by_dof[dof] >= 0:
-        ke = joint_target_ke[dof]
-        kd = joint_target_kd[dof]
-        K = drive_stiffness(ke, kd, damping[dof], dt)
-        if K > 0.0:
-            u0 = drive_force(ke, kd, q, qd, joint_target_pos[drive_target_index_by_dof[dof]], joint_target_vel[dof], dt)
-            stiffness = K
-    return u0, stiffness
 
 
 @wp.func
@@ -290,7 +259,7 @@ def predict_prismatic_branches(
     qd = joint_qd[dof]
     linear = wp.spatial_top(motion)
     leaf_inertia = mass * wp.dot(linear, linear) + armature[dof]
-    u0, stiffness = _drive_terms(
+    u0, stiffness = drive_terms(
         dof,
         q,
         qd,
@@ -407,49 +376,6 @@ def finish_prismatic_branches(
         _publish_root(
             art, root_joint, X_root, joint_child, body_com, body_q, body_qd, articulation_origin, current_valid
         )
-
-
-@wp.kernel(enable_backward=False)
-def prepare_listed_augmented_drives(
-    dofs: wp.array[int],
-    drive_row_by_dof: wp.array[int],
-    drive_q_index_by_dof: wp.array[int],
-    drive_target_index_by_dof: wp.array[int],
-    joint_q: wp.array[float],
-    joint_qd: wp.array[float],
-    joint_target_ke: wp.array[float],
-    joint_target_kd: wp.array[float],
-    joint_target_pos: wp.array[float],
-    joint_target_vel: wp.array[float],
-    joint_effort_limit: wp.array[float],
-    damping: wp.array[float],
-    max_dofs: int,
-    dt: float,
-    # outputs
-    rows: DriveRows,
-    drive_tau: wp.array[float],
-):
-    """``tree_factor.prepare_augmented_drives`` over listed DOFs: those whose drives no branch predict folds."""
-    dof = dofs[wp.tid()]
-    drive_tau[dof] = 0.0
-    row = drive_row_by_dof[dof]
-    if row < 0:
-        return
-    u0, stiffness = _drive_terms(
-        dof,
-        joint_q[drive_q_index_by_dof[dof]],
-        joint_qd[dof],
-        dt,
-        drive_row_by_dof,
-        drive_target_index_by_dof,
-        joint_target_ke,
-        joint_target_kd,
-        joint_target_pos,
-        joint_target_vel,
-        damping,
-    )
-    passive = spring_damper_stiffness(0.0, damping[dof], 0.0, dt)
-    drive_tau[dof] = hold_drive_row(rows, row, row // max_dofs, dof, u0, stiffness, passive, joint_effort_limit[dof])
 
 
 def branch_topology(model, articulations: np.ndarray, articulation_joint_end: np.ndarray) -> tuple:
@@ -716,38 +642,6 @@ class ScalarBranchState:
             ],
             outputs=[state_in.body_q, state_aug.joint_S_s, solver.factor.articulation_origin],
             block_dim=_REPAIR_BLOCK_DIM,
-            device=model.device,
-        )
-
-    def launch_other_drives(self, state_in, state_aug, control, dt):
-        """Prepare the augmented drives of the DOFs outside the branches, whose ``predict`` folds its own.
-
-        Writes the drive rows' ``K`` and the drive forces into ``joint_tau`` as
-        :func:`.tree_factor.prepare_augmented_drives` does, for the listed DOFs only. The step's stage list runs it
-        only where such DOFs exist (``other_drive_dofs`` is not ``None``).
-        """
-        solver, model = self.solver, self.solver.model
-        wp.launch(
-            prepare_listed_augmented_drives,
-            dim=self.other_drive_dofs.shape[0],
-            inputs=[
-                self.other_drive_dofs,
-                solver.factor.drive_row_by_dof,
-                solver.factor.drive_q_index_by_dof,
-                solver.factor.drive_target_index_by_dof,
-                state_in.joint_q,
-                state_in.joint_qd,
-                model.joint_target_ke,
-                model.joint_target_kd,
-                control.joint_target_q,
-                control.joint_target_qd,
-                model.joint_effort_limit,
-                solver.factor.passive_joint_damping,
-                solver.forest.articulation_max_dofs,
-                dt,
-            ],
-            outputs=[solver.factor.drive_rows(solver.v_hat, solver.v_out), state_aug.joint_tau],
-            block_dim=256,
             device=model.device,
         )
 
