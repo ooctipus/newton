@@ -530,16 +530,13 @@ def check_owner_launches(test, device):
                             group.predictor_kernel: "predict",
                             group.classify_kernel: "classify",
                             group.bank_kernel: "bank",
-                            group.listed_repair_kernel: "listed",
-                            group.bank_repair_kernel: "bank_repair",
                         }
                         kernels.pop(None, None)
-                        bound = {"classify", "listed"} if forced else set()
+                        bound = {"classify"} if forced else set()
                         test.assertEqual(sorted(kernels.values()), sorted({"repair", "finish", "predict", *bound}))
                     groups.append((group, kernels))
                 test.assertEqual(sum(group is owner.scalar for group, _ in groups), 1)
                 states, control = [model.state(), model.state()], model.control()
-                solver.factor.last_step_dt = DT
                 for source, refresh in ((0, True), (1, False)):
                     state, output = states[source], states[1 - source]
                     _set_clock(solver.factor, refresh)
@@ -745,12 +742,10 @@ class TestScalarBranchRule(unittest.TestCase):
         with mock.patch.object(solver, "_scalar_branches", None):
             owners["plain"] = HeldTree(solver)
         s0, s1 = model.state(), model.state()
-        solver.factor.last_step_dt = DT
         kinds = {}
         for owner in owners.values():
             for group in owner.groups:
-                kinds.update({group.repair_kernel: "repair", getattr(group, "bank_repair_kernel", None): "compare"})
-        kinds.pop(None, None)
+                kinds[group.repair_kernel] = "compare" if group.bank_compare else "repair"
 
         def launches(call):
             launched = []
@@ -774,9 +769,10 @@ class TestScalarBranchRule(unittest.TestCase):
                     record = path_selection._tree_group(group)
                     self.assertEqual(record["input_validation"], validation)
                     self.assertEqual(group.bank_compare, compare)
-                    # Nothing that compares is bound where nothing may compare.
-                    bound = {key for key in ("bank", "bank_repair") if record["kernels"][key] is not None}
-                    self.assertEqual(bound, {"bank_repair"} if compare else set())
+                    # Nothing that compares is bound where nothing may compare: the one-pass repair compares inside
+                    # its blocks exactly where the group compares.
+                    self.assertIsNone(record["kernels"]["bank"])
+                    self.assertEqual("_banked" in record["kernels"]["repair"], compare)
                 launches(lambda owner=owner: owner.finish(s0, solver.factor, s1, DT))
                 self.assertEqual(
                     launches(lambda owner=owner: owner.begin(s0, solver.factor, s0.joint_qd, DT, state_out=s1)),
@@ -1746,7 +1742,8 @@ class TestScalarBranchOwner(unittest.TestCase):
         # bank by identity, as the owner does, and binds no comparison pass or banked repair.
         for name, group in groups.items():
             self.assertEqual(group["input_validation"], "identity", name)
-            self.assertEqual((group["kernels"]["bank"], group["kernels"]["bank_repair"]), (None, None), name)
+            self.assertIsNone(group["kernels"]["bank"], name)
+            self.assertNotIn("_banked", group["kernels"]["repair"], name)
         self.assertEqual(publication["owner"], "cached")
         head = recipe_solver(model, scalar=False).get_path_selection()["routes"]
         self.assertFalse(head["held_tree"]["scalar_branches"]["enabled"])

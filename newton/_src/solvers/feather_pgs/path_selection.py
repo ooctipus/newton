@@ -241,30 +241,21 @@ def _tree_group(group) -> dict:
         # "content": a repair whose input bank is not the bank the cache was published into
         # compares the two banks word for word; "identity": the bank's pointers alone.
         "input_validation": "content" if group.bank_compare else "identity",
-        # Within one graph capture, a repair after this group's finish on the bank it published
-        # launches nothing (motion-velocity layouts always launch).
-        "captured_repair_skip": bool(group.skip_captured_repairs),
         # On CUDA, a repair of more blocks than two listed grids lists the blocks that repair (and
-        # compare) and repairs over the list: always inside a capture, eagerly when the groups should
-        # be stamped with the input bank or compared (motion-velocity layouts keep one launch per
+        # compare) and repairs over the list, every step (motion-velocity layouts keep one launch per
         # block).
         "classify_first": bool(group.classify_first),
-        # How each repair of the latest graph capture was recorded, in order: "skipped", "one_pass" or
-        # "classified", with "_compared" when it compares input banks; empty before any capture.
-        "captured_repairs": list(group._captured_repairs[1]) if group._captured_repairs else [],
         "motion_velocity": bool(group.motion_velocity),
         "publishes_twists": bool(group.publishes_twists),
         "kernels": {
             "repair": _key(group.repair_kernel),
             "finish": _key(group.finish_kernel),
             "predict": _key(group.predictor_kernel),
-            # The input-bank comparison: a pass over the blocks a classified repair's classification lists
-            # for comparison ("bank") or inside a second one-pass repair ("bank_repair"); None where the
-            # group does not compare or classify.
+            # A classified repair's classification and its input-bank comparison, a pass over the blocks the
+            # classification lists for comparison; None where the group does not classify (a one-pass
+            # repair compares inside its blocks).
             "bank": _key(group.bank_kernel),
-            "bank_repair": _key(group.bank_repair_kernel),
             "classify": _key(group.classify_kernel),
-            "listed_repair": _key(group.listed_repair_kernel),
         },
     }
 
@@ -299,9 +290,7 @@ def _scalar_group(group) -> dict:
         "schedules": None,
         "response": "diagonal",
         "input_validation": "content" if group.bank_compare else "identity",
-        "captured_repair_skip": bool(group.skip_captured_repairs),
         "classify_first": False,
-        "captured_repairs": [],
         "motion_velocity": bool(group.motion_velocity),
         "publishes_twists": False,
         "drive_dofs": 0 if others is None else int(others.shape[0]),
@@ -310,9 +299,7 @@ def _scalar_group(group) -> dict:
             "finish": _key(group.finish_kernel),
             "predict": _key(group.predictor_kernel),
             "bank": None,
-            "bank_repair": None,
             "classify": None,
-            "listed_repair": None,
         },
     }
 

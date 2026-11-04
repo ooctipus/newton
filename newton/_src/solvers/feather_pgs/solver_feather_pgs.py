@@ -180,7 +180,7 @@ class SolverFeatherPGS(SolverBase):
     #   claims: the runtime claims kept, of ("resolved_worlds",).
     #   active_rows False: full-order sparse sweeps.           contact_units None: unfused sparse contact triplets.
     #   transaction "single" or "staged": fused triplets'.     mf_storage "streamed": streamed matrix-free impulses.
-    #   repair_skip, repair_classify, predicted_twists False: the held tree's launch mapping without that step.
+    #   repair_classify, predicted_twists False: the held tree's launch mapping without that step.
     #   row_support False: sparse rows on explicit indices.     placement "general": case K6 (route_table.RouteTable).
     #   tiers: the Jacobi tiers' row bound, on any class whose response they form (0: no tiers).
     #   tier_sweeps: every Jacobi tier's sweep budget, in place of the equal-accuracy rule.

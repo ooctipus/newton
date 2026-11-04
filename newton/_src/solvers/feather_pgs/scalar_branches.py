@@ -603,8 +603,6 @@ class ScalarBranchState:
     # (the input validation by identity of TreeKineticState.bank_compare).
     bank_compare = False
     motion_velocity = False
-    # Every repair launches: one warp per articulation exits on a valid cache.
-    skip_captured_repairs = False
 
     def __init__(self, solver, plan: ScalarBranchPlan, *, admission=None):
         """Bind the group's kernels; the owner's tree groups hold the topology proof."""
@@ -662,9 +660,6 @@ class ScalarBranchState:
         if self._dimensions() != self._plan_dimensions:
             raise RuntimeError("Scalar branch dimensions changed; reconstruct and recapture")
         return True
-
-    def forget_continuity(self):
-        """Nothing to forget: every repair launches (``skip_captured_repairs`` is ``False``)."""
 
     def invalidate(self, world_mask=None):
         """Invalidate the cached state of every owned articulation in selected worlds."""

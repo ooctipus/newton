@@ -12,7 +12,7 @@ import warp as wp
 from ...core import execution, memory
 from ...core.execution import Work
 from ...sim import ModelFlags
-from . import cached_state_binding, capture_joins, field_group
+from . import cached_state_binding, field_group
 from . import tree_scan as ts
 from .device_proof import DeviceProof, fingerprint
 from .host_index import expand
@@ -49,23 +49,6 @@ def proof_runs(flags) -> bool:
     notification, and one without flags, runs it.
     """
     return flags is None or int(flags) == 0 or int(flags) & ~_NUMERIC_FLAGS != 0
-
-
-def _bank_pointers(state):
-    """The pointers a cache stamp records for a state bank: its coordinates and velocities."""
-    return state.joint_q.ptr, state.joint_qd.ptr
-
-
-def launch_switches(pins=None):
-    """Return the held-tree repair launch mapping, once per owner: ``(skip, classify)``.
-
-    A captured step's repair is skipped where every block would take the early exit, and the repair lists the blocks
-    to repair before repairing them. Test pins (``SolverFeatherPGS._route_pins``) ``repair_skip=False`` launch the
-    repair of every captured step and ``repair_classify=False`` keep the one-pass repair launch over every block. Both
-    choose launches, not emitted code.
-    """
-    pins = pins or {}
-    return pins.get("repair_skip", True), pins.get("repair_classify", True)
 
 
 def listed_repair_blocks(blocks: int, block: int, device) -> int:
@@ -107,35 +90,25 @@ class TreeKineticState:
     hold the same words is restamped with the input bank and keeps its cache.
     A classified repair compares in a pass of its own over the blocks its
     classification lists for comparison; a one-pass repair compares inside
-    its blocks (a second repair kernel, launched only by repairs that compare).
+    its blocks.
     An owner that composes a group validated by identity alone passes
     ``compare_banks=False``: the solver then invalidates every cache of the
     owner on a changed input bank, so no comparison could keep one, and none
     is bound or launched.
 
-    The host chooses the launch from the bank it expects the stamps to name.
-    It knows that bank eagerly once a repair or finish ran, and inside a graph
-    capture once a repair or finish of the same capture ran. The first repair
-    of a capture runs on every replay after whatever the host does not see
-    (eager steps, resets, copies, other graphs), so it lets the device decide:
-    it compares whenever the output bank is another bank and is classified
-    whenever the layout classifies.
-
-    Within one graph capture, a repair that follows this owner's finish and
-    reads the bank that finish published launches nothing outside
-    motion-velocity layouts (:attr:`skip_captured_repairs`): every block
-    would take the early exit. The solver calls :meth:`forget_continuity`
-    from every host call that changes validity, requests or the step.
+    Every step launches the one repair form its layout takes, and the device
+    decides it, group by group, from the stamps: the host never guesses which
+    bank the stamps name. A comparing owner always offers the step's output
+    bank for comparison (a group stamped with the input bank exits before
+    comparing).
 
     On CUDA (:attr:`classify_first`), a repair of more blocks than two capped
     grids of :func:`listed_repair_blocks` lists the blocks that need it, one
     thread per block, and repairs over that list on the capped grid, instead
-    of launching a block per group that mostly confirms its cache: inside a
-    capture, and eagerly when the groups are expected to be stamped with the
-    input bank or compared with the output bank.
+    of launching a block per group that mostly confirms its cache.
 
     Motion-velocity layouts keep the one-pass repair, a measured trade-off.
-    Their repair launches on every step, and a group exits early only when,
+    A group of theirs exits early only when,
     besides the conditions above, each of its velocities compares equal to
     the step's prescaled velocity (computed after the last finish): as when
     the articulation's prescale ratio stayed 1 and no velocity is NaN (a NaN
@@ -157,8 +130,7 @@ class TreeKineticState:
         complete=True,
         response="sparse",
         clocked=None,
-        skip=None,
-        classify=None,
+        classify=True,
         compare_banks=True,
     ):
         from . import tree_kinetic_state as native  # noqa: PLC0415
@@ -177,18 +149,10 @@ class TreeKineticState:
         # Motion-velocity layouts keep identity validation: their repair reads the
         # prescaled velocity, and the solver keeps its host identity check for them.
         self.bank_compare = bool(compare_banks) and not self.motion_velocity
-        switches = launch_switches(solver._route_pins)
-        skip = switches[0] if skip is None else skip
-        classify = switches[1] if classify is None else classify
-        # A motion-velocity repair also compares the prescaled velocity, which the
-        # step recomputes after the finish; its launches always run.
-        self.skip_captured_repairs = bool(skip) and not self.motion_velocity
         # The CPU twin keeps the one-pass repair; _bind_kernels sets classify_first
-        # from this, the motion contract and the launch size of the bound layout.
+        # from this (False: the one-pass repair over every block), the motion contract
+        # and the launch size of the bound layout.
         self._classify_switch = bool(classify) and device.is_cuda
-        # (capture id, whether the finish computed the next geometry) of the last
-        # finish inside a capture; the next begin consumes it.
-        self._continuity = None
         self.group_count = sparse_owner.plan.group_to_art.size
         # A composite owner passes what it read for all of its groups; a direct construction reads it here.
         self.clocked = solver.options.diagnostics.stage_clocks if clocked is None else bool(clocked)
@@ -331,15 +295,6 @@ class TreeKineticState:
         self.status = self.data.status
         self._body_velocity = getattr(sparse_owner, "requires_body_velocity", False)
         self._response = response
-        # Pointers of the bank every current group is stamped with after the last
-        # finish (its output bank) or repair (its input bank), as the host knows it,
-        # and the capture that launch was recorded in (0 eagerly). It only chooses
-        # launches; the kernels check each group's own stamp.
-        self._published = None
-        self._published_capture = 0
-        # (capture id, launch form of each repair recorded in it) of the latest capture,
-        # for the route record.
-        self._captured_repairs = None
         self._bind_kernels()
         self._plan_dimensions = self._dimensions()
         # Everything make_plan and the kernels bake in, proven on the device, and the
@@ -362,49 +317,28 @@ class TreeKineticState:
         self.classify_first = (
             self._classify_switch and not self.motion_velocity and self._classify_above < self.launch_count
         )
+        # The one repair a step launches. A classified repair runs over its classification's
+        # list and compares in a pass of its own (bank_kernel) over the blocks the classification
+        # lists for comparison. A one-pass repair of a comparing owner compares inside its blocks
+        # (comparing inside raises a chain-scan repair's registers, 80 to 151 on a 13-body chain
+        # on sm_120, but not a packed one's, 72 either way).
         self.repair_kernel = native.get_state_kernel(
             False,
             self.schedules,
             layout=layout,
             body_velocity=self._body_velocity,
             motion_velocity=self.motion_velocity,
+            listed=self.classify_first,
+            bank_coordinates=self.bank_coordinates if self.bank_compare and not self.classify_first else 0,
             clocked=self.clocked,
             diagonal=self.diagonal_mass,
             two_half=self.two_half,
         )
-        # A classified repair compares in a pass of its own over the blocks its classification
-        # lists for comparison. Otherwise a second one-pass repair kernel compares inside its
-        # blocks, and only repairs that compare launch it: no extra launch, and every other
-        # repair keeps its kernel (comparing inside raises a chain-scan repair's registers, 80
-        # to 151 on a 13-body chain on sm_120, but not a packed one's, 72 either way).
-        self.bank_kernel = self.bank_repair_kernel = None
+        # Ordinary motion only: classify_first excludes motion-velocity layouts.
+        self.classify_kernel = native.get_classify_kernel(layout=layout) if self.classify_first else None
+        self.bank_kernel = None
         if self.bank_compare and self.classify_first:
             self.bank_kernel = native.get_bank_kernel(layout=layout, coordinates=self.bank_coordinates)
-        elif self.bank_compare:
-            self.bank_repair_kernel = native.get_state_kernel(
-                False,
-                self.schedules,
-                layout=layout,
-                body_velocity=self._body_velocity,
-                bank_coordinates=self.bank_coordinates,
-                clocked=self.clocked,
-                diagonal=self.diagonal_mass,
-                two_half=self.two_half,
-            )
-        self.classify_kernel = self.listed_repair_kernel = None
-        if self.classify_first:
-            # Ordinary motion only: classify_first excludes motion-velocity layouts.
-            self.classify_kernel = native.get_classify_kernel(layout=layout)
-            self.listed_repair_kernel = native.get_state_kernel(
-                False,
-                self.schedules,
-                layout=layout,
-                body_velocity=self._body_velocity,
-                listed=True,
-                clocked=self.clocked,
-                diagonal=self.diagonal_mass,
-                two_half=self.two_half,
-            )
         self.finish_kernel = native.get_state_kernel(
             True,
             self.schedules,
@@ -550,13 +484,8 @@ class TreeKineticState:
         # A moved frame invalidates instead of raising; any other change raises.
         return not self._proof.validate(current, "Tree kinetic static")
 
-    def forget_continuity(self):
-        """Launch the next repair: a host call changed what the last finish left on the device."""
-        self._continuity = None
-
     def invalidate(self, world_mask=None):
         """Invalidate current state for every owned articulation in selected worlds."""
-        self.forget_continuity()
         cached_state_binding.invalidate(
             self.solver.forest.world_count,
             world_mask,
@@ -608,28 +537,14 @@ class TreeKineticState:
                 validates by identity alone.
         """
         self._validate_call(state_in, state_aug, dt)
-        binding = self._validate_motion(state_in, state_aug, stage3_qd)
+        self._motion_binding = self._validate_motion(state_in, state_aug, stage3_qd)
         device = self.solver.model.device
-        source = _bank_pointers(state_in)
-        capture = capture_joins.capture_id(device)
-        continuity, self._continuity = self._continuity, None
-        if continuity is not None and source == self._published and continuity == capture:
-            # This capture's last finish published into this bank and no host call
-            # has touched validity, requests or the step duration since. Every group
-            # with a finite cache is valid, stamped with this bank, unrequested and
-            # geometrically current (the finish computed the geometry exactly where
-            # the clock's next step refreshes it): its block would take the early
-            # exit. (A non-finite cache stays invalid, and the predictor then makes
-            # its articulations' next state NaN with or without a repair.)
-            self._record_capture(capture, "skipped")
-            self._motion_binding = binding
-            return
         data = self._publication(state_in, state_aug, state_in, dt)
-        compare, classify = self._repair_form(source, state_out, capture, device)
         # Every repair takes the launch ABI of the finish (get_state_kernel): only an
         # alternate-motion repair reads stage3_qd, otherwise the state's own velocity
         # (_validate_motion); only a listed repair reads the block list, and only a
-        # comparing repair a bank.
+        # comparing repair a bank: the output bank, or the input bank itself where there
+        # is none to compare (every group stamped with it exits before comparing).
         arguments = [
             self.sparse.plan,
             self.plan,
@@ -640,14 +555,14 @@ class TreeKineticState:
             stage3_qd,
         ]
         lists = [self._repair_blocks, self._list_counts]
-        if classify:
+        compare = self.bank_compare and state_out is not None
+        bank = self._bank(state_out if compare else state_in, state_in)
+        if self.classify_first:
             # List the blocks that repair (and, when comparing, those that compare
-            # first) and run the repair over the list on the capped grid. Passing the
-            # input bank as the comparison bank lists nothing for comparison.
-            bank = self._bank(state_out if compare else state_in, state_in)
-            self._list_counts.zero_()
-            # The classification is a contract of ordinary motion: it takes the six common
+            # first) and run the repair over the list on the capped grid. The
+            # classification is a contract of ordinary motion: it takes the six common
             # arguments, not the motion input of the repair ABI.
+            self._list_counts.zero_()
             wp.launch(
                 self.classify_kernel,
                 dim=self.launch_count,
@@ -664,66 +579,14 @@ class TreeKineticState:
                     max_blocks=self._repair_grid,
                     device=device,
                 )
-            wp.launch_tiled(
-                self.listed_repair_kernel,
-                dim=[self.launch_count],
-                inputs=[*arguments, *lists, self._no_bank],
-                block_dim=self.block_dim,
-                max_blocks=self._repair_grid,
-                device=device,
-            )
-        elif compare:
-            wp.launch_tiled(
-                self.bank_repair_kernel,
-                dim=[self.launch_count],
-                inputs=[*arguments, *lists, self._bank(state_out, state_in)],
-                block_dim=self.block_dim,
-                device=device,
-            )
-        else:
-            wp.launch_tiled(
-                self.repair_kernel,
-                dim=[self.launch_count],
-                inputs=[*arguments, *lists, self._no_bank],
-                block_dim=self.block_dim,
-                device=device,
-            )
-        self._published, self._published_capture = source, capture
-        form = ("classified" if classify else "one_pass") + ("_compared" if compare else "")
-        self._record_capture(capture, form)
-        self._motion_binding = binding
-
-    def _repair_form(self, source, state_out, capture, device):
-        """Choose whether a repair compares input banks and whether it is classified.
-
-        Returns:
-            ``(compare, classify)``.
-        """
-        output = None if state_out is None else _bank_pointers(state_out)
-        distinct = output is not None and output != source
-        if (capture != 0 or device.is_capturing) and (capture == 0 or self._published_capture != capture):
-            # The first repair of a capture (or of one whose id is unknown) runs on every
-            # replay after whatever the host does not see, such as a copy of the output
-            # bank back into the input bank or an eager reset: the device decides.
-            return self.bank_compare and distinct, self.classify_first
-        if self._published is None:
-            # The first eager step: every cache is invalid, and every group repairs in
-            # the one-pass launch.
-            return False, False
-        # The last repair or finish ran right before this one: eagerly, or earlier in this
-        # capture. The stamps name its bank. The output bank, as after an odd substep
-        # count copied it back into the input bank, is compared; any other bank but the
-        # input bank repairs every group, which the one-pass launch does more cheaply.
-        compare = self.bank_compare and distinct and self._published == output
-        return compare, self.classify_first and (compare or source == self._published)
-
-    def _record_capture(self, capture, form):
-        """Remember how each repair of the latest capture was recorded, for the route record."""
-        if capture == 0:
-            return
-        if self._captured_repairs is None or self._captured_repairs[0] != capture:
-            self._captured_repairs = (capture, [])
-        self._captured_repairs[1].append(form)
+        wp.launch_tiled(
+            self.repair_kernel,
+            dim=[self.launch_count],
+            inputs=[*arguments, *lists, bank],
+            block_dim=self.block_dim,
+            max_blocks=self._repair_grid if self.classify_first else 0,
+            device=device,
+        )
 
     def _validate_motion(self, state, state_aug, velocity):
         """Reject invalid working descriptors before changing current-cache validity."""
@@ -799,6 +662,3 @@ class TreeKineticState:
             block_dim=self.block_dim,
             device=self.solver.model.device,
         )
-        capture = capture_joins.capture_id(self.solver.model.device)
-        self._published, self._published_capture = _bank_pointers(state_out), capture
-        self._continuity = capture if capture and self.skip_captured_repairs else None

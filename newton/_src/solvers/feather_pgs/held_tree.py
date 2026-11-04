@@ -21,7 +21,7 @@ import warp as wp
 
 from . import field_group, host_index
 from .device_proof import DeviceProof
-from .tree_kinetic_owner import TreeKineticState, launch_switches, proof_runs
+from .tree_kinetic_owner import TreeKineticState, proof_runs
 from .tree_kinetic_plan import make_plan, tree_joints
 from .tree_kinetic_state import GroupTrees, HeldResponse
 from .tree_plan import TreePlan, local_parents
@@ -485,15 +485,16 @@ class HeldTree:
 
     def __init__(self, solver, *, admission=None):
         self.solver = solver
-        # One read of the kernel and launch switches for every group this owner composes.
+        # One read of the kernel switches for every group this owner composes: the stage clocks, and the test pin
+        # repair_classify=False (SolverFeatherPGS._route_pins), which keeps the one-pass repair over every block.
         self.clocked = solver.options.diagnostics.stage_clocks
-        skip, classify = launch_switches(solver._route_pins)
+        classify = solver._route_pins.get("repair_classify", True)
         self.scalar = None
         if not (solver.model.joint_count and solver.model.articulation_count):
             # Nothing to evaluate: the step reads no group.
             self.coverage = self.forest_reason = None
             self.groups = []
-            self.bank_compare = self.skip_captured_repairs = True
+            self.bank_compare = True
             return
         if solver.placement.sparse_mass_matrix_size is not None:
             # The sparse class: one complete group, which proves its own coverage (make_plan).
@@ -518,7 +519,6 @@ class HeldTree:
                 complete=complete,
                 response=operator.response,
                 clocked=self.clocked,
-                skip=skip,
                 classify=classify,
                 # Scalar branches hold no bank stamps, so beside them a changed input bank
                 # invalidates every cache of the owner (bank_compare below), and a tree group
@@ -536,12 +536,11 @@ class HeldTree:
             # sparse-diagonal pair always leaves a tree group beside it.
             self.scalar = ScalarBranchState(solver, scalar, admission=admission)
             self.groups.append(self.scalar)
-        # Every tree group compares input banks (fixed and free roots alike) and skips
-        # captured repairs unless the solver prescales velocities; see TreeKineticState.
-        # Beside scalar branches, which do neither, every group validates a changed
-        # input bank by identity, and the solver invalidates the whole owner.
+        # Every tree group compares input banks (fixed and free roots alike) unless the
+        # solver prescales velocities; see TreeKineticState. Beside scalar branches, which
+        # do not, every group validates a changed input bank by identity, and the solver
+        # invalidates the whole owner.
         self.bank_compare = all(group.bank_compare for group in self.groups)
-        self.skip_captured_repairs = all(group.skip_captured_repairs for group in self.groups)
 
     def _dense_groups(self, solver, scalar) -> list:
         """The held groups of dense or compact coordinates: one per world (a forest) where the default or a test pin
@@ -623,11 +622,6 @@ class HeldTree:
         """Invalidate all component caches for selected worlds."""
         for group in self.groups:
             group.invalidate(world_mask)
-
-    def forget_continuity(self):
-        """Launch every component's next repair (see :meth:`TreeKineticState.forget_continuity`)."""
-        for group in self.groups:
-            group.forget_continuity()
 
     def begin(self, state, augmented, velocity, dt, *, state_out=None):
         """Repair every current component before any factor or force consumer (see :meth:`TreeKineticState.begin`)."""

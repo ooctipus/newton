@@ -399,9 +399,6 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
                 'CollisionPipeline / Contacts with contact_matching="latest" (or "sticky").'
             )
 
-    def clock(step):
-        factor.track_step_dt(step.dt)
-
     def wait_for_collision(step):
         if step.event is not None:
             wp.get_stream(model.device).wait_event(step.event)
@@ -415,6 +412,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
 
     def count(step):
         solver._step += 1
+        factor.last_step_dt = step.dt
 
     def leave(step):
         cut.leave(step.source_in, step.source_out)
@@ -432,7 +430,6 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     add(follow_contacts)
     if route.laws.warm_start:
         add(warm_start_contract)
-    add(clock)
     if spec.particles:
         add(wait_for_collision, particle_forces)
     if not spec.articulated:
@@ -472,7 +469,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         step.qd = step.state_in.joint_qd
 
     def fk_id(step):
-        factor.fk_id(step.state_in, step.state_out, step.qd)
+        factor.fk_id(step.state_in, step.state_out, step.qd, step.dt)
 
     def refresh(step):
         factor.refresh(step.dt)

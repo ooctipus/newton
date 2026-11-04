@@ -155,6 +155,7 @@ class TreeFactor:
         clock = Clock()
         clock.step, clock.interval, clock.cadence = 0, int(options.update_mass_matrix_interval), 1
         self.clock = wp.array([clock], dtype=Clock, device=model.device)
+        # The last step's duration on the host, which the contact forces' export reads (sweep_plan.forces).
         self.last_step_dt = None
         # The held tree's cache of next-step dynamics.
         self.fk_id_cache_source_state = None
@@ -527,20 +528,8 @@ class TreeFactor:
     # Notifications
     # ---------------------------------------------------------------------------------------------------------------
 
-    def forget_repair_continuity(self) -> None:
-        """Launch the held tree's next repair after a host call that changes its validity or inputs."""
-        self.held.forget_continuity()
-
-    def track_step_dt(self, dt: float) -> None:
-        """Record the step duration. A change refreshes mass and repairs every cache on the device (the clock,
-        :func:`.factor.kernels.clock_changed`); here it only launches the held tree's next repair."""
-        if self.last_step_dt is not None and abs(self.last_step_dt - dt) > 1.0e-8:
-            self.forget_repair_continuity()
-        self.last_step_dt = dt
-
     def notify_state_changed(self, articulations: wp.array | None = None) -> None:
         """Invalidate the cached kinematics of ``articulations`` (``None``: every articulation)."""
-        self.forget_repair_continuity()
         if articulations is None:
             self.fk_id_cache_valid.zero_()
             return
@@ -560,7 +549,6 @@ class TreeFactor:
         # can still refuse the notification.
         held = self.held
         frames_proven = held.validate_model(flags)
-        self.forget_repair_continuity()
         cache_inputs = int(flags) & int(
             ModelFlags.JOINT_PROPERTIES
             | ModelFlags.JOINT_DOF_PROPERTIES
@@ -642,16 +630,15 @@ class TreeFactor:
             device=model.device,
         )
 
-    def fk_id(self, state_in, state_out, qd: wp.array) -> None:
+    def fk_id(self, state_in, state_out, qd: wp.array, dt: float) -> None:
         """Forward kinematics and inverse-dynamics terms, at the predictor's velocity ``qd`` (prescaled when
         limited)."""
         if not self.held.bank_compare:
             # Held trees that compare input banks validate a changed bank on the device.
             if self.fk_id_cache_source_state is not None and state_in is not self.fk_id_cache_source_state:
                 self.fk_id_cache_valid.zero_()
-                self.forget_repair_continuity()
         self.fk_id_cache_source_state = state_in
-        self.held.begin(state_in, self, qd, self.last_step_dt, state_out=state_out)
+        self.held.begin(state_in, self, qd, dt, state_out=state_out)
 
     def prepare_drives(self, state_in, control, dt: float, v_hat: wp.array, v_out: wp.array) -> None:
         """Launch every coordinate's augmented drive (:func:`prepare_augmented_drives`), apart from FK/ID; ``v_hat``
