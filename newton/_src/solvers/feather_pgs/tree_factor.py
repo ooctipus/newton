@@ -105,21 +105,24 @@ def prepare_augmented_drives(
     rows: DriveRows,
     drive_tau: wp.array[float],
 ):
-    """The augmented drive of each coordinate of ``dofs`` (every coordinate, or those no scalar branch's predict folds),
-    from the immutable DOF-to-row topology: ``u0`` and ``K`` (:func:`.factor.fields.drive_terms`, its passive damper's
-    with it) held on its row (:func:`.factor.fields.hold_drive_row`), which requests the articulation's factor refresh
-    wherever ``K`` changed, a drive whose ``K`` fell to zero included."""
-    dof = dofs[wp.tid()]
+    """The augmented drive of each coordinate of ``dofs`` (those no scalar branch's predict folds; without a list, the
+    thread's own), from the immutable DOF-to-row topology: ``u0`` and ``K`` (:func:`.factor.fields.drive_terms`, its
+    passive damper's with it) held on its row (:func:`.factor.fields.hold_drive_row`), which requests the
+    articulation's factor refresh wherever ``K`` changed, a drive whose ``K`` fell to zero included."""
+    dof = wp.tid()
+    if dofs.shape[0] > 0:
+        dof = dofs[dof]
     drive_tau[dof] = 0.0
     row = drive_row_by_dof[dof]
     if row < 0:
         return
     u0, K = drive_terms(
+        row,
         dof,
-        joint_q[drive_q_index_by_dof[dof]],
-        joint_qd[dof],
+        drive_q_index_by_dof[dof],
+        joint_q,
+        joint_qd,
         dt,
-        drive_row_by_dof,
         drive_target_index_by_dof,
         joint_target_ke,
         joint_target_kd,
@@ -421,7 +424,6 @@ class TreeFactor:
         else:
             self._arrays.release(AUGMENTED_DRIVE_ROWS)
         self.parallel_drives = False
-        self.drive_dofs = None
         self.drive_row_by_dof = wp.full((max(1, int(model.joint_dof_count)),), -1, dtype=wp.int32, device=model.device)
         self.drive_q_index_by_dof = None
         self.drive_target_index_by_dof = None
@@ -470,7 +472,6 @@ class TreeFactor:
         row_counts = np.minimum(axis_count, max_dofs).astype(np.int32)
 
         self.drive_row_by_dof = wp.array(drive_row_by_dof, dtype=wp.int32, device=model.device)
-        self.drive_dofs = wp.array(np.arange(dof_count, dtype=np.int32), dtype=wp.int32, device=model.device)
         self.drive_q_index_by_dof = wp.array(drive_q_index_by_dof, dtype=wp.int32, device=model.device)
         self.drive_target_index_by_dof = wp.array(drive_target_index_by_dof, dtype=wp.int32, device=model.device)
         self.aug_row_counts.assign(row_counts)
@@ -645,14 +646,14 @@ class TreeFactor:
     def prepare_drives(
         self, state_in, control, dt: float, v_hat: wp.array, v_out: wp.array, dofs: wp.array | None = None
     ) -> None:
-        """Launch the augmented drives of ``dofs`` (:func:`prepare_augmented_drives`; by default every coordinate's),
-        apart from FK/ID; ``v_hat`` and ``v_out`` are last step's. Beside scalar branches, whose predict folds their
-        own, ``dofs`` are the others (:attr:`.scalar_branches.ScalarBranchState.other_drive_dofs`)."""
+        """Launch the augmented drives of ``dofs`` (:func:`prepare_augmented_drives`; ``None``, every coordinate's
+        without a list), apart from FK/ID; ``v_hat`` and ``v_out`` are last step's. Beside scalar branches, whose
+        predict folds their own, ``dofs`` are the others
+        (:attr:`.scalar_branches.ScalarBranchState.other_drive_dofs`)."""
         model = self.model
-        dofs = self.drive_dofs if dofs is None else dofs
         wp.launch(
             prepare_augmented_drives,
-            dim=dofs.shape[0],
+            dim=model.joint_dof_count if dofs is None else dofs.shape[0],
             inputs=[
                 dofs,
                 self.drive_row_by_dof,

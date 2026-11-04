@@ -819,28 +819,7 @@ class TestScalarBranchKernels(unittest.TestCase):
         control.joint_target_q.assign(rng.uniform(-0.2, 0.2, control.joint_target_q.shape[0]).astype(np.float32))
         control.joint_target_qd.assign(rng.uniform(-0.1, 0.1, control.joint_target_qd.shape[0]).astype(np.float32))
         head = pair.head
-        wp.launch(
-            tree_factor.prepare_augmented_drives,
-            dim=model.joint_dof_count,
-            inputs=[
-                head.factor.drive_dofs,
-                head.factor.drive_row_by_dof,
-                head.factor.drive_q_index_by_dof,
-                head.factor.drive_target_index_by_dof,
-                state.joint_q,
-                state.joint_qd,
-                model.joint_target_ke,
-                model.joint_target_kd,
-                control.joint_target_q,
-                control.joint_target_qd,
-                model.joint_effort_limit,
-                head.factor.passive_joint_damping,
-                head.forest.articulation_max_dofs,
-                DT,
-            ],
-            outputs=[head.factor.drive_rows(head.v_hat, head.v_out), head.factor.joint_tau],
-            device=model.device,
-        )
+        head.factor.prepare_drives(state, control, DT, head.v_hat, head.v_out)
         pair.mine.factor.aug_row_K.fill_(-7.0)
         pair.mine.factor.joint_tau.fill_(-7.0)
         mine = pair.mine

@@ -76,11 +76,12 @@ def hold_drive_row(
 
 @wp.func
 def drive_terms(
+    row: int,
     dof: int,
-    q: float,
-    qd: float,
+    q_index: int,
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
     dt: float,
-    drive_row_by_dof: wp.array[int],
     drive_target_index_by_dof: wp.array[int],
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
@@ -88,18 +89,27 @@ def drive_terms(
     joint_target_vel: wp.array[float],
     damping: wp.array[float],
 ):
-    """Explicit force ``u0`` and implicit stiffness ``K`` of a coordinate's augmented drive
+    """Explicit force ``u0`` and implicit stiffness ``K`` of a coordinate's augmented drive on ``row``
     (:func:`.spatial_laws.drive_stiffness`, :func:`.spatial_laws.drive_force`): a coordinate without a row or with a
-    nonpositive ``K`` holds no drive, ``(0, 0)``: one law for every drive (the factor's preparation,
-    :func:`.tree_factor.prepare_augmented_drives`, and the scalar branches' predict)."""
+    nonpositive ``K`` holds no drive, ``(0, 0)``, and reads neither its coordinate ``joint_q[q_index]`` nor its target:
+    one law for every drive (the factor's preparation, :func:`.tree_factor.prepare_augmented_drives`, and the scalar
+    branches' predict)."""
     u0 = float(0.0)
     stiffness = float(0.0)
-    if drive_row_by_dof[dof] >= 0:
+    if row >= 0:
         ke = joint_target_ke[dof]
         kd = joint_target_kd[dof]
         K = drive_stiffness(ke, kd, damping[dof], dt)
         if K > 0.0:
-            u0 = drive_force(ke, kd, q, qd, joint_target_pos[drive_target_index_by_dof[dof]], joint_target_vel[dof], dt)
+            u0 = drive_force(
+                ke,
+                kd,
+                joint_q[q_index],
+                joint_qd[dof],
+                joint_target_pos[drive_target_index_by_dof[dof]],
+                joint_target_vel[dof],
+                dt,
+            )
             stiffness = K
     return u0, stiffness
 

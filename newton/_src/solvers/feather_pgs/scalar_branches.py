@@ -259,12 +259,14 @@ def predict_prismatic_branches(
     qd = joint_qd[dof]
     linear = wp.spatial_top(motion)
     leaf_inertia = mass * wp.dot(linear, linear) + armature[dof]
+    row = drive_row_by_dof[dof]
     u0, stiffness = drive_terms(
+        row,
         dof,
-        q,
-        qd,
+        joint_q_start[root_joint] + local,
+        joint_q,
+        joint_qd,
         dt,
-        drive_row_by_dof,
         drive_target_index_by_dof,
         joint_target_ke,
         joint_target_kd,
@@ -274,7 +276,6 @@ def predict_prismatic_branches(
     )
     value = _leaf_force(motion, body_force, dof, q, qd, joint_f, spring_stiffness, spring_ref, damping)
     refresh = mass_update_mask[art] != 0
-    row = drive_row_by_dof[dof]
     if row >= 0:
         if row_K[row] != stiffness:
             refresh = True
