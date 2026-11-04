@@ -163,8 +163,8 @@ class RouteTable:
     Construction asks the owners in that order. Each tests only its own fit (topology, sizes, capability, the device's
     budget) after :meth:`taken`, which says why an earlier case holds the class, :meth:`claim` gives the class to
     the first that fits, and each writes its case's reason. The producers and the runtime claims read :attr:`case`;
-    once they have decided, :meth:`finish` sets :attr:`row`, the route the step plan and the record read. The test
-    pin ``placement="general"`` keeps every class general.
+    once they have decided, :meth:`finish` returns the route, which the step's spec holds (:class:`.step_plan.StepSpec`).
+    The test pin ``placement="general"`` keeps every class general.
     """
 
     def __init__(self, pins):
@@ -172,8 +172,6 @@ class RouteTable:
         """The case holding the class: a key of :data:`CASES`, or ``"K6"`` (general) while none claims it."""
         self.reasons: dict[str, str | None] = {}
         """Why each asked case holds the class or does not, written by its owner."""
-        self.row: RouteRow | None = None
-        """The route of the class, once :meth:`finish` has set it."""
         self._general = pins.get("placement") == "general"
         self._asked = -1
 
@@ -199,17 +197,17 @@ class RouteTable:
         return fits
 
     def finish(self, laws: Laws, **axes) -> RouteRow:
-        """Set the route of the solver's class (:attr:`row`) from the laws, the decided case and its reasons, and
-        the other ``axes`` (:class:`RouteRow`'s fields), and return it."""
-        self.row = RouteRow(laws=laws, case=self.case, reasons=dict(self.reasons), **axes)
-        return self.row
+        """The route of the solver's class from the laws, the decided case and its reasons, and the other ``axes``
+        (:class:`RouteRow`'s fields)."""
+        return RouteRow(laws=laws, case=self.case, reasons=dict(self.reasons), **axes)
 
 
 @dataclass(frozen=True)
 class RouteRow:
     """The solver's route: the row of the route table its class takes, fixed once every owner has decided.
 
-    The step plan (:meth:`.step_plan.StepPlan.build`) and the route record read the row, not the owners' state.
+    The step's spec holds it (:attr:`.step_plan.StepSpec.route`); the step plan and the route record read it there,
+    not the owners' state.
     """
 
     laws: Laws

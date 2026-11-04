@@ -23,6 +23,7 @@ from ...core.live_sort import SLOT_BITS
 from ...sim.contacts import CAPACITY_BLOCKS_PER_SM
 from .contact_row_plan import contact_row_plan
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF
+from .step_plan import kernel_key as _key
 
 
 def _applied(solver, name, requested):
@@ -127,10 +128,6 @@ def options_selection(solver) -> dict:
     return copy.deepcopy(solver._applied_options)
 
 
-def _key(kernel):
-    return None if kernel is None else getattr(kernel, "key", type(kernel).__name__)
-
-
 def _keys_by_size(kernels) -> dict:
     return {str(int(size)): _key(kernel) for size, kernel in kernels.items() if kernel is not None}
 
@@ -143,14 +140,17 @@ def route_selection(solver) -> dict:
     """Describe every construction-time owner and variant that decides which kernels run.
 
     The owners' records take whether they hold the class, their sizes and their reasons from the solver's route
-    (``routes.row``, :class:`.route_table.RouteRow`); the rest of each record is the owner's own structure.
+    (``routes.row``, :class:`.route_table.RouteRow`, held by the step's spec); the rest of each record is the owner's
+    own structure. ``routes.spec`` is the spec's own fields (:meth:`.step_plan.StepSpec.record`).
     """
-    row = solver.routes.row
+    row = solver.spec.route
 
     return {
         "articulations_by_dof": {str(int(size)): int(count) for size, count in solver.forest.n_arts_by_size.items()},
         # The test-only axis pins in force (SolverFeatherPGS._route_pins); empty in production.
         "pins": json_value(dict(solver._route_pins)),
+        # The step's spec: the device, capacities, cadence, sweep kernels, streams and diagnostics (step_plan.StepSpec).
+        "spec": json_value(solver.spec.record()),
         # The route: the row of the route table the class takes, its axes and each placement case's reason.
         "row": json_value(row.record()),
         # The row laws every owner's admission reads (route_table.Laws).
@@ -194,7 +194,7 @@ def _held_tree_groups(solver) -> tuple:
     # Scalar branch groups hold no tree layout.
     if any(getattr(getattr(group, "layout", None), "forest", False) for group in groups):
         return "forest", groups
-    return ("tree" if solver.routes.row.case == "K1" else "mixed"), groups
+    return ("tree" if solver.spec.route.case == "K1" else "mixed"), groups
 
 
 def _held_tree(solver) -> dict:
@@ -333,7 +333,7 @@ def _row_builder(solver, plan, size) -> dict:
     method, law = plan.methods[size], plan.law
     patch = law == "patch"
     marker = ()
-    if solver.routes.case == "K2" and size == solver.placement.sparse_diagonal_response_size:
+    if solver.spec.case == "K2" and size == solver.placement.sparse_diagonal_response_size:
         # The sparse diagonal's marker encodes schedule links into the slots its writer just wrote.
         marker = () if solver.sweep.sparse_contact_marker is None else (solver.sweep.sparse_contact_marker,)
     if method == "walk":
@@ -342,9 +342,9 @@ def _row_builder(solver, plan, size) -> dict:
         # The allocator writes the contact rows' unit sources; the one writer writes every contact row's records and
         # walks every row (walk_rows): the general placement's into its packed rows, the support placement's (K1)
         # into its support sink, the sparse diagonal's (K2) into its slots sink.
-        if solver.routes.case == "K1":
+        if solver.spec.case == "K1":
             writers = (solver.sweep.support_units_kernel, solver.sweep.support_rows)
-        elif solver.routes.case == "K2":
+        elif solver.spec.case == "K2":
             writers = (walk_rows.write_slot_rows,)
         else:
             writers = (walk_rows.writer_kernel(solver),)
@@ -375,7 +375,7 @@ def _row_builder(solver, plan, size) -> dict:
 
 
 def _contact_rows(solver) -> dict:
-    row = solver.routes.row
+    row = solver.spec.route
     point = bool(row.laws.point)
     # The plan the row pass (RowLaws.write) dispatches on: the route's producer writes every contact row.
     plan = contact_row_plan(solver)
@@ -417,7 +417,7 @@ def _contact_consumers(solver) -> dict:
 
 
 def _local_solve(solver) -> dict:
-    row = solver.routes.row
+    row = solver.spec.route
     enabled = row.case == "K3"
     return {
         "enabled": enabled,
@@ -429,7 +429,7 @@ def _local_solve(solver) -> dict:
 
 
 def _paired_response(solver) -> dict:
-    row = solver.routes.row
+    row = solver.spec.route
     primary = solver.sweep.paired_response_primary_size
     if primary is None:
         return {"enabled": False, "reason": solver.sweep.paired_response_reason}
@@ -457,7 +457,7 @@ def _paired_response(solver) -> dict:
 
 
 def _sparse_diagonal(solver) -> dict:
-    row = solver.routes.row
+    row = solver.spec.route
     return {
         "enabled": row.case == "K2",
         "response_dofs": json_value(row.sizes["diagonal"]),
@@ -471,7 +471,7 @@ def _sparse_diagonal(solver) -> dict:
 
 
 def _sparse_mass_matrix(solver) -> dict:
-    row = solver.routes.row
+    row = solver.spec.route
     size = row.sizes["packed"]
     record = {
         "size": json_value(size),
@@ -501,7 +501,7 @@ def _sparse_mass_matrix(solver) -> dict:
 
 
 def _sweep(solver) -> dict:
-    row = solver.routes.row
+    row = solver.spec.route
     solve = solver._plan.solve
     route = solve.route.name
     # Only free rigid bodies produce matrix-free rows: the pack kernel is built where it launches.
@@ -521,15 +521,16 @@ def _sweep(solver) -> dict:
             "pair": _keys_by_size(solver.sweep.local_pair.kernels),
             "residual": _keys_by_size(solver.sweep.local_residual.kernels),
         }
+    kernels = solver.spec.kernels
     record = {
         "route": route,
         "reason": solve.route.reason,
         "iterations": int(solver.options.pgs_iterations),
         "mf_meta_pack": mf_meta_pack,
-        "sparse": _key(solver.sweep.sparse_kernel) if route == "sparse_pgs" else None,
-        "sparse_diagonal": _key(solver.sweep.sparse_diagonal_kernel),
-        "paired_factor": _key(solver.sweep.paired_factor_kernel),
-        "mf_gs": _key(solver.sweep.mf_gs_kernel),
+        "sparse": kernels["sparse"],
+        "sparse_diagonal": kernels["sparse_diagonal"],
+        "paired_factor": kernels["paired_factor"],
+        "mf_gs": kernels["mf_gs"],
         "mf_gs_storage": _mf_gs_storage(solver),
         "mf_colored": _mf_colored(solver),
         "tiers": _tiers(solver),
@@ -548,7 +549,7 @@ def _mf_colored(solver) -> dict | None:
     units = solver.sweep.colored_units
     rule = units.rule
     return {
-        "kernel": _key(kernel),
+        "kernel": solver.spec.kernels["mf_colored"],
         "min_units": int(rule.min_units),
         "parallelism": json_value(rule.parallelism),
         # The waves the capable worlds take on the device's SMs, which multiply the units per color a world needs.
@@ -617,7 +618,7 @@ def _mf_gs_storage(solver) -> dict | None:
 
 
 def _tiers(solver) -> dict | None:
-    row = solver.routes.row
+    row = solver.spec.route
     tiers = list(solver.sweep.tiers)
     if not tiers:
         return None
@@ -694,7 +695,7 @@ def _velocity_limits(solver) -> dict:
 
 
 def _free_rigid_bodies(solver) -> dict:
-    row = solver.routes.row
+    row = solver.spec.route
     count = int(solver.forest.free_rigid_body_count)
     owners = []
     if count:

@@ -52,7 +52,7 @@ from .path_selection import (
 from .placement import Placement
 from .route_table import RouteTable, capable
 from .rows import RowLaws
-from .step_plan import StepPlan
+from .step_plan import StepPlan, StepSpec
 from .sweep_plan import Sweep
 from .tree_factor import TreeFactor
 
@@ -683,8 +683,25 @@ class SolverFeatherPGS(SolverBase):
                 "dense": self.placement.sparse_diagonal_dense_size if diagonal else None,
             },
         )
+        # The step's spec: every unknown that decides its path, gathered once; the plan and the route record read it.
+        self.spec = StepSpec.build(
+            self,
+            route,
+            diagnostics=tuple(
+                name
+                for name, on in (
+                    ("nvtx", self._nvtx),
+                    ("snapshots", self._debug_stage3_snapshots),
+                    ("audit", self._audit is not None),
+                    ("row_watermark", self.placement.row_watermark),
+                    ("readout", bool(self.sweep.readout.kernels)),
+                    ("sync_timings", _FPGS_SYNC_TIMINGS),
+                )
+                if on
+            ),
+        )
         # The step's per-stage dispatch tables, which step() and the route record read, and the kernels they launch.
-        self._plan = StepPlan.build(route, self)
+        self._plan = StepPlan.build(self.spec)
         # Record the applied options once; get_path_selection() returns detached copies.
         self._applied_options = applied_options(self, SolverFeatherPGS.__init__, requested_options)
 
@@ -743,12 +760,12 @@ class SolverFeatherPGS(SolverBase):
         floats are strings).
         """
         selection = {
-            "sparse_mass_matrix": "on" if self.routes.row.case == "K1" else "off",
+            "sparse_mass_matrix": "on" if self.spec.case == "K1" else "off",
             "cached_dynamics": "on",
             "publication": "cached",
             "cached_prediction": "tree",
             "reasons": {
-                "sparse_mass_matrix": self.routes.row.reasons["K1"],
+                "sparse_mass_matrix": self.spec.route.reasons["K1"],
                 "publication": "Paired cache owns next-state publication.",
             },
         }

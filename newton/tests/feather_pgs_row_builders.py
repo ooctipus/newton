@@ -81,7 +81,9 @@ def install_cpu_keyed_rows(solver):
     # Case K4's class walks: the tiers walk their keyed rows in the kernel, the one writer the general worlds' rows.
     solver.placement.walks = True
     solver.routes.case = "K4"
-    solver.routes.row = dataclasses.replace(solver.routes.row, case="K4", producer="keyed_rows")
+    solver.spec = dataclasses.replace(
+        solver.spec, route=dataclasses.replace(solver.spec.route, case="K4", producer="keyed_rows")
+    )
     solver.placement.keyed_rows = keyed_rows.KeyedRows(solver)
 
 

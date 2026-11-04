@@ -1,7 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The step's plan: what each stage launches, decided once at construction.
+"""The step's spec and plan: every unknown that decides the step's path, gathered once, and what each stage launches.
+
+:class:`StepSpec` is the frozen record of the unknowns, built at the end of construction: the device, the forest, the
+route (the laws and the class, today the placement case), the capacities, the mass cadence, the sweep's kernels and
+streams, and the diagnostics in force. :class:`StepPlan` and the route record (:mod:`.path_selection`) read it; nothing
+in it is computed a second time elsewhere.
 
 Every stage whose work depends on the articulation size (the factor and where stage 4
 whitens the rows) has one table: each size's route and the reason for it. The solve of stages 5 and 6 has one
@@ -18,13 +23,20 @@ construction has not, and nothing in it changes after construction.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from types import MappingProxyType
 
+from ...core.execution import Device, device
 from ...sim import ModelFlags
+from .forest_plan import ForestPlan
 from .route_table import RouteRow
 
-__all__ = ["Route", "SolveRoute", "StepPlan", "TopologyPin", "first_failed"]
+__all__ = ["Capacities", "Route", "SolveRoute", "StepPlan", "StepSpec", "TopologyPin", "first_failed", "kernel_key"]
+
+
+def kernel_key(kernel) -> str | None:
+    """A kernel's key (a factory's product without one: its type's name), or ``None`` for no kernel."""
+    return None if kernel is None else getattr(kernel, "key", type(kernel).__name__)
 
 
 def first_failed(checks) -> str | None:
@@ -67,6 +79,111 @@ class TopologyPin:
 
 
 @dataclass(frozen=True)
+class Capacities:
+    """The row capacities a world holds, fixed at construction; each class's status word records an overflow."""
+
+    dense_rows: int
+    """Dense (articulation) rows a world, its link rows included (``dense_max_constraints`` plus the links)."""
+    free_body_rows: int
+    """Matrix-free (free-body) rows a world (``mf_max_constraints``)."""
+    row_pitch: int
+    """A world's rows in the row store: the dense rows, then the free-body rows where free bodies exist."""
+
+    def record(self) -> dict:
+        """The capacities as a JSON-compliant record."""
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class StepSpec:
+    """Every unknown that decides the step's path, gathered once at the end of construction (frozen).
+
+    The step plan builds its tables and stages from it, and the route record reports it (``routes.spec``, with the
+    route under ``routes.row`` and ``routes.laws``). A change of any field is a new solver.
+    """
+
+    device: Device
+    """The device the step runs on (:func:`.core.execution.device`)."""
+    forest: ForestPlan
+    """The forest after the body cut: topology, groups, world mapping (frozen)."""
+    route: RouteRow
+    """The route: the row laws and the class (today the placement case), its producer and its sizes."""
+    capacities: Capacities
+    mass_interval: int
+    """Steps between mass refreshes (``update_mass_matrix_interval``)."""
+    articulated: bool
+    """The forest holds articulations: without them the step only integrates particles."""
+    particles: bool
+    """The model holds particles, whose forces and integration the step runs."""
+    pure_forest: bool
+    """The model is its own forest (:mod:`.body_cut`): the step reads and publishes the caller's states directly."""
+    kernels: Mapping[str, str | None]
+    """The sweep's kernel keys by route: ``sparse``, ``sparse_diagonal``, ``paired_factor``, ``mf_gs`` and
+    ``mf_colored`` (``None`` where the class builds none)."""
+    streams: tuple[str, ...]
+    """The side streams the step forks onto, by owner."""
+    diagnostics: tuple[str, ...]
+    """The diagnostics in force, each an optional stage or readout: ``nvtx``, ``snapshots``, ``audit``,
+    ``row_watermark``, ``readout``, ``sync_timings``."""
+
+    @classmethod
+    def build(cls, solver, route: RouteRow, diagnostics: tuple[str, ...]) -> StepSpec:
+        """Gather the spec from the constructed ``solver``, its ``route`` and the ``diagnostics`` in force."""
+        model, sweep, placement = solver.model, solver.sweep, solver.placement
+        streams = (
+            ("dynamics", solver.factor.dynamics_stream),
+            ("local_internal", sweep.local_internal_stream),
+            ("local_residual", sweep.local_residual_stream),
+            ("local_pair", sweep.local_pair_stream),
+            ("paired_general", sweep.paired_general_solve_stream),
+        )
+        return cls(
+            device=device(model.device),
+            forest=solver.forest,
+            route=route,
+            capacities=Capacities(
+                dense_rows=int(placement.dense_max_constraints),
+                free_body_rows=int(placement.mf_max_constraints),
+                row_pitch=int(placement.row_pitch),
+            ),
+            mass_interval=int(solver.options.update_mass_matrix_interval),
+            articulated=bool(model.articulation_count),
+            particles=bool(model.particle_count),
+            pure_forest=bool(solver.cut.pure),
+            kernels=MappingProxyType(
+                {
+                    "sparse": kernel_key(sweep.sparse_kernel) if route.case == "K1" else None,
+                    "sparse_diagonal": kernel_key(sweep.sparse_diagonal_kernel),
+                    "paired_factor": kernel_key(sweep.paired_factor_kernel),
+                    "mf_gs": kernel_key(sweep.mf_gs_kernel),
+                    "mf_colored": kernel_key(sweep.mf_colored_kernel),
+                }
+            ),
+            streams=tuple(name for name, stream in streams if stream is not None),
+            diagnostics=diagnostics,
+        )
+
+    @property
+    def case(self) -> str:
+        """The class's placement case (:data:`.route_table.CASES`, or ``"K6"``)."""
+        return self.route.case
+
+    def record(self) -> dict:
+        """The spec's own fields as a JSON-compliant record (``routes.spec``; the route is ``routes.row``)."""
+        return {
+            "device": {"arch": self.device.arch, "sms": self.device.sms},
+            "capacities": self.capacities.record(),
+            "mass_interval": self.mass_interval,
+            "articulated": self.articulated,
+            "particles": self.particles,
+            "pure_forest": self.pure_forest,
+            "kernels": dict(self.kernels),
+            "streams": list(self.streams),
+            "diagnostics": list(self.diagnostics),
+        }
+
+
+@dataclass(frozen=True)
 class Route:
     """One stage's route and why it was chosen."""
 
@@ -96,13 +213,9 @@ class StepPlan:
     solve: SolveRoute
 
     @classmethod
-    def build(cls, row: RouteRow, solver) -> StepPlan:
-        """Read the plan from the solver's route ``row`` and its mapping (sizes, resource rules, kernel choices)."""
-        solve = _solve(row)
-        return cls(
-            response=MappingProxyType(_response(row, solver.forest)),
-            solve=solve,
-        )
+    def build(cls, spec: StepSpec) -> StepPlan:
+        """Read the plan from the step's ``spec``: its route and its forest."""
+        return cls(response=MappingProxyType(_response(spec.route, spec.forest)), solve=_solve(spec.route))
 
     def sizes(self, stage: str, route: str) -> tuple[int, ...]:
         """The sizes a stage's table routes to ``route``."""

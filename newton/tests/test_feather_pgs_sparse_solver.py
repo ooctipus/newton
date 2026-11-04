@@ -276,7 +276,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         _, solver, *_ = _case(True, prescribed=True)
         self.assertTrue(solver.forest.has_prescribed_response)
         self.assertIsNone(solver.placement.sparse_mass_matrix_size)
-        self.assertIn("holds no prescribed articulations", solver.routes.row.reasons["K1"])
+        self.assertIn("holds no prescribed articulations", solver.spec.route.reasons["K1"])
 
     def assert_states_close(self, first, second):
         """Allow float32 factor-order roundoff, not a changed physics recipe."""
