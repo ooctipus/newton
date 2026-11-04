@@ -13,10 +13,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows
-from newton._src.solvers.feather_pgs.kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    compute_world_contact_bias,
-)
+from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, compute_world_contact_bias
 from newton.tests.feather_pgs_free_body_rows import sweep_free_body_rows
 from newton.tests.feather_pgs_law_harness import row_bias, row_lines
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, get_test_devices

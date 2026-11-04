@@ -30,7 +30,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.kernels import _light_integrate_generalized_joints
+from newton._src.solvers.feather_pgs.factor.kernels import _light_integrate_generalized_joints
 from newton.solvers import SolverFeatherPGS
 
 DT = 1.0 / 200.0

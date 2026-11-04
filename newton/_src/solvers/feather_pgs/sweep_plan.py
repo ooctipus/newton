@@ -40,6 +40,7 @@ from . import (
     sweep_units,
     walk_rows,
 )
+from .contact_forces import compute_contact_linear_force_from_impulses, pack_contact_linear_force_as_spatial
 from .contact_input import bind_routes as bind_contact_routes
 from .dense_rows import bind as bind_dense_rows
 from .dense_rows import bind_mf as bind_mf_rows
@@ -47,33 +48,23 @@ from .execution_plan import _MFGSStorage, _select_mfgs_storage
 from .forest_plan import row_support
 from .friction_patches import patch_routes
 from .kernel_template import SweepTier
-from .kernels import (
-    PGS_LOCAL_SOLVE_OWNER_PAIR,
-    PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
-    PGS_LOCAL_SOLVE_OWNER_SINGLE,
-    classify_local_solve_worlds,
-    classify_parallel_sweep_tiers,
-    compact_local_pair_candidates,
-    compute_contact_linear_force_from_impulses,
-    gather_dense_warmstart,
-    local_solve_launch_gate,
-    pack_contact_linear_force_as_spatial,
-    reset_world_warmstart_buffers,
-    snapshot_contact_warmstart,
-)
 from .route_table import capable
 from .solve_policy import SolvePolicy, SolveReadoutRecord
 from .solver_fields import SPARSE_CONTACT_RECORDS, SPARSE_ROWS, LocalOwners
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport, row_supports
 from .step_plan import first_failed
+from .sweep import PGS_LOCAL_SOLVE_OWNER_PAIR, PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL, PGS_LOCAL_SOLVE_OWNER_SINGLE
 from .sweep_levels import (
     _get_build_independent_sparse_contact_groups_kernel,
     _get_mark_independent_sparse_contact_candidates_kernel,
 )
+from .sweep_routes_local import classify_local_solve_worlds, compact_local_pair_candidates, local_solve_launch_gate
 from .sweep_routes_sparse import _SPARSE_LOCAL_WORKSPACE_BYTES
+from .sweep_routes_tiers import classify_parallel_sweep_tiers
 from .tree_plan import TreePlan, local_parents
 from .tree_scan import classes_half
+from .warm_start import gather_dense_warmstart, reset_world_warmstart_buffers, snapshot_contact_warmstart
 
 __all__ = ["Sweep"]
 

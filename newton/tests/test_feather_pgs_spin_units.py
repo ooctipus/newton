@@ -18,7 +18,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import sweep_routes_local
-from newton._src.solvers.feather_pgs.kernels import (
+from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,

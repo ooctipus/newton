@@ -24,6 +24,7 @@ import warp as wp
 
 from ...core.execution import arch_budget, resident_blocks
 from . import kernel_template
+from .dense_rows import MfRows
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
@@ -31,13 +32,19 @@ from .packed_rows import PACKED_SIDES
 from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import FactorComponent, FactorRows, FreeBodyZ, Lanes, LocalBlock
 from .row_inputs import RowArgument, StoredLocalRows
+from .row_kernels import PGS_CONSTRAINT_TYPE_SPEED
 from .row_metadata import _mf_parent_expression
 from .solve_policy import DEFAULT_POLICY, SolvePolicy
+from .solver_fields import LocalOwners
 from .staging import Buffer, Staging
 from .sweep import (
     CONTACT,
     FRICTION,
     JOINT_LIMIT,
+    PGS_LOCAL_SOLVE_OWNER_GENERAL,
+    PGS_LOCAL_SOLVE_OWNER_PAIR,
+    PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
+    PGS_LOCAL_SOLVE_OWNER_SINGLE,
     TORSION,
     UNIT_HELD,
     ReducedPairCoupling,
@@ -1004,3 +1011,87 @@ def paired_factor_kernel(
         composed=True,
         native_name="sweep_paired_factor_native",
     ).kernel()
+
+
+@wp.kernel
+def local_solve_launch_gate():
+    """Create a minimal graph dependency ahead of the bulk local solves."""
+
+    pass
+
+
+@wp.kernel
+def classify_local_solve_worlds(
+    mf: MfRows,
+    owners: LocalOwners,
+    world_constraint_count: wp.array[int],
+    dense_phase_bounds: wp.array2d[int],
+    mf_constraint_count: wp.array[int],
+    articulation_dof_count: wp.array[int],
+):
+    """Assign exact solver ownership and compact active general worlds."""
+    world = wp.tid()
+    mf_line = mf.first[world]
+    row_count = world_constraint_count[world]
+    mf_count = mf_constraint_count[world]
+    primary_articulation = owners.primary_articulation[world]
+    pair_articulation = owners.pair_articulation[world]
+    residual_pair_articulation = owners.residual_pair_articulation[world]
+    single_phase = dense_phase_bounds[world, 1] == row_count
+
+    local_mf = mf_count > 0 and mf_count <= owners.residual_mf_max_rows and residual_pair_articulation >= 0
+    mf_row = int(0)
+    while mf_row < mf_count and local_mf:
+        sides = mf.sides[mf_line, mf.base + mf_row]
+        if sides[0] >= 0 and sides[0] != residual_pair_articulation:
+            local_mf = False
+        if sides[1] >= 0 and sides[1] != residual_pair_articulation:
+            local_mf = False
+        # The residual local loop does not implement the speed law (projection_laws.speed_row): keep worlds with speed
+        # rows on the general owner.
+        if mf.row_type[mf_line, mf.base + mf_row] == PGS_CONSTRAINT_TYPE_SPEED:
+            local_mf = False
+        mf_row += 1
+
+    owner = PGS_LOCAL_SOLVE_OWNER_GENERAL
+    single_row_capacity = int(0)
+    if primary_articulation >= 0:
+        single_row_capacity = wp.min(owners.max_rows, articulation_dof_count[primary_articulation])
+    if row_count > 0 and mf_count == 0:
+        if single_phase and row_count <= single_row_capacity:
+            owner = PGS_LOCAL_SOLVE_OWNER_SINGLE
+        elif not single_phase and row_count <= owners.max_rows and pair_articulation >= 0:
+            owner = PGS_LOCAL_SOLVE_OWNER_PAIR
+    if owner == PGS_LOCAL_SOLVE_OWNER_GENERAL and (
+        row_count > 0
+        and row_count <= owners.residual_max_rows
+        and residual_pair_articulation >= 0
+        and ((mf_count == 0 and not single_phase) or local_mf)
+    ):
+        owner = PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL
+    owners.owner[world] = owner
+    if owner == PGS_LOCAL_SOLVE_OWNER_GENERAL and (row_count > 0 or mf_count > 0):
+        general_index = wp.atomic_add(owners.general_world_count, 0, 1)
+        owners.general_worlds[general_index] = world
+
+
+@wp.kernel
+def compact_local_pair_candidates(
+    candidate_articulations: wp.array[int],
+    candidate_secondary_articulations: wp.array[int],
+    articulation_world: wp.array[int],
+    local_solve_owner: wp.array[int],
+    expected_owner: int,
+    # outputs
+    active_count: wp.array[int],
+    active_articulations: wp.array[int],
+    active_secondary_articulations: wp.array[int],
+):
+    """Compact topology candidates that selected paired local ownership."""
+    candidate = wp.tid()
+    articulation = candidate_articulations[candidate]
+    world = articulation_world[articulation]
+    if local_solve_owner[world] == expected_owner:
+        active_index = wp.atomic_add(active_count, 0, 1)
+        active_articulations[active_index] = articulation
+        active_secondary_articulations[active_index] = candidate_secondary_articulations[candidate]

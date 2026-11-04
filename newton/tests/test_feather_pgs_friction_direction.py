@@ -10,7 +10,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import sweep_routes_tiers
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
+from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 from newton._src.solvers.feather_pgs.solve_policy import QUIET
 from newton.tests.feather_pgs_free_body_rows import sweep_free_body_rows
 from newton.tests.test_feather_pgs_parallel_patch import _launch_parallel

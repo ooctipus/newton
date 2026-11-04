@@ -18,7 +18,14 @@ import numpy as np
 import warp as wp
 
 from newton._src.sim import JointType
-from newton._src.solvers.feather_pgs import contact_laws, field_group, kernels, law_source, projection_laws, row_laws
+from newton._src.solvers.feather_pgs import (
+    contact_laws,
+    field_group,
+    law_source,
+    projection_laws,
+    row_kernels,
+    row_laws,
+)
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows, MfRows, RowSupport
 from newton._src.solvers.feather_pgs.device_preludes import cuda_native, dual_native
@@ -38,7 +45,7 @@ from newton._src.solvers.feather_pgs.tree_scan import WalkClass
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 FAMILIES = (contact_laws.CONTACT_LAW, row_laws.ROW_LAW, projection_laws.PROJECTION_LAW, projection_laws.CONE_LAW)
-PACKAGE = Path(kernels.__file__).parent
+PACKAGE = Path(row_laws.__file__).parent
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -639,9 +646,9 @@ STRUCT_ARGUMENTS = {
 _ROW_LINES = {}
 
 
-def row_bias(dt, speculative_scale, contact_w, restitution_threshold, weighted, material) -> kernels.RowBias:
-    """The rows' law's step parameters (:class:`.kernels.RowBias`)."""
-    bias = kernels.RowBias()
+def row_bias(dt, speculative_scale, contact_w, restitution_threshold, weighted, material) -> row_kernels.RowBias:
+    """The rows' law's step parameters (:class:`.row_kernels.RowBias`)."""
+    bias = row_kernels.RowBias()
     bias.dt, bias.speculative_scale, bias.contact_w = dt, speculative_scale, contact_w
     bias.restitution_threshold, bias.weighted, bias.material = restitution_threshold, int(weighted), int(material)
     return bias
@@ -1064,7 +1071,7 @@ def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
     gaps, terms = np.zeros(incident.shape), np.zeros(incident.shape)
     for world, count in enumerate(solver.placement.mf_constraint_count.numpy()):
         for row in range(int(count)):
-            if kinds[world, row] == kernels.PGS_CONSTRAINT_TYPE_SPEED:
+            if kinds[world, row] == row_kernels.PGS_CONSTRAINT_TYPE_SPEED:
                 continue  # A speed row carries no Z.
             term = np.zeros(0)
             for art, Z in ((sides[world, row, 0], Z_a), (sides[world, row, 1], Z_b)):

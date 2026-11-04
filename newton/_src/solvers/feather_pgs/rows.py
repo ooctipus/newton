@@ -48,20 +48,17 @@ from .friction_patches import patch_row_law
 from .joint_table import bind as bind_joint_table
 from .joint_table import bind_free_bodies
 from .kernel_template import KernelTemplate, params
-from .kernels import (
+from .route_table import Laws
+from .row_kernels import (
     RowBias,
     allocate_link_slots,
     allocate_rigid_velocity_limit_slots,
-    allocate_world_contact_slots,
     compute_world_contact_bias,
-    finalize_constraint_counts_with_status,
-    gather_mf_warmstart,
     prepare_fused_diagonal_joint_limits,
-    snapshot_dense_phase_bound,
     write_link_rows,
 )
-from .route_table import Laws
 from .row_laws import LINK_ROWS, ROW_LAW
+from .row_slots import allocate_world_contact_slots, finalize_constraint_counts_with_status, snapshot_dense_phase_bound
 from .solver_fields import (
     LINK_PLAN,
     LINK_SLOTS,
@@ -71,6 +68,7 @@ from .solver_fields import (
     Links,
     Preelim,
 )
+from .warm_start import gather_mf_warmstart
 
 __all__ = [
     "RowLaws",
@@ -85,7 +83,7 @@ JOINT_LIMIT_WARPS_PER_BLOCK = 4
 _CONTACT_BUILD_THREAD_CAP = 65536
 
 BIAS_LANES = 256
-"""The fewest threads a world's rows get in the bias launch (:func:`.kernels.compute_world_contact_bias`), a block:
+"""The fewest threads a world's rows get in the bias launch (:func:`.row_kernels.compute_world_contact_bias`), a block:
 fewer worlds than fill the device take more (:func:`.launch.fill_lanes`), at most the rows' capacity."""
 
 
@@ -853,7 +851,7 @@ class RowLaws:
             plan = contact_row_plan(solver)
             units = solver.placement.unit_source if plan.producer == "walk" else solver.placement.no_units
             # Under persistent patch friction, contacts of resolved worlds that the complete path would
-            # give rows are marked so the patch finish releases their anchors (kernels.py).
+            # give rows are marked so the patch finish releases their anchors (row_slots.py).
             pool.launch(
                 allocate_world_contact_slots,
                 contact_build_threads,
@@ -1089,7 +1087,7 @@ class RowLaws:
         self._bias(solver, dt, placement.mf_constraint_count, placement.mf_max_constraints, placement.body_base)
 
     def bias(self, solver, dt: float) -> RowBias:
-        """The rows' law's step parameters (:class:`.kernels.RowBias`) of a step of ``dt``."""
+        """The rows' law's step parameters (:class:`.row_kernels.RowBias`) of a step of ``dt``."""
         bias = RowBias()
         bias.dt, bias.speculative_scale = dt, solver.options.contact_speculative_scale
         bias.contact_w, bias.restitution_threshold = self.contact_w, self.effective_restitution_velocity_threshold

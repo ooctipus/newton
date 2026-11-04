@@ -27,11 +27,10 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import sweep_routes_local
-from newton._src.solvers.feather_pgs.kernels import (
+from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_MIMIC,
-    PGS_LOCAL_SOLVE_OWNER_SINGLE,
 )
 from newton._src.solvers.feather_pgs.row_metadata import _DENSE_META_ROW_TYPE_MASK
 from newton._src.solvers.feather_pgs.solve_policy import (
@@ -43,6 +42,7 @@ from newton._src.solvers.feather_pgs.solve_policy import (
     SolveTrace,
 )
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
+from newton._src.solvers.feather_pgs.sweep import PGS_LOCAL_SOLVE_OWNER_SINGLE
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import chain_walk, leave_walk, local_packed_rows, row_lines, walked_rows

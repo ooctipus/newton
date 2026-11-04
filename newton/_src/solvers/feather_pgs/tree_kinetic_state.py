@@ -15,10 +15,10 @@ from ...sim import BodyFlags, JointType
 from . import (
     cached_force,
     field_group,
-    kernels,
 )
 from . import tree_scan as ts
 from .device_preludes import CUDA_ONLY, STATUS_CLOCK, device_branches, dual_native, substitute
+from .factor import kernels
 from .field_group import Field
 from .kernel_template import Dispatch, KernelTemplate, python_kernel
 from .publication_data import PublicationData

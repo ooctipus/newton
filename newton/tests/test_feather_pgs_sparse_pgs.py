@@ -9,12 +9,12 @@ from itertools import product
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs.kernels import (
+from newton._src.solvers.feather_pgs.projection_laws import friction_pair
+from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
 )
-from newton._src.solvers.feather_pgs.projection_laws import friction_pair
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.tests.feather_pgs_law_harness import row_lines

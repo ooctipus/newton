@@ -12,7 +12,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import kernels
+from newton._src.solvers.feather_pgs import row_slots
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import contact_input
@@ -79,7 +79,7 @@ def _allocate(arrays):
 
     Reservations record the first rejected slot; the families' count finalizers raise the status.
     """
-    kernel = kernels.allocate_world_contact_slots
+    kernel = row_slots.allocate_world_contact_slots
     device = arrays["contact_count"].device
     data, _arrays = contact_input(arrays, device)
     values = {**arrays, "data": data}
@@ -94,7 +94,7 @@ def _allocate(arrays):
         (1, "mf_slot_counter", "mf_max_constraints", "mf_first_rejected_slot"),
     ):
         wp.launch(
-            kernels.finalize_constraint_counts_with_status,
+            row_slots.finalize_constraint_counts_with_status,
             dim=1,
             inputs=[arrays[counter], arrays[capacity], family, arrays[first_rejected]],
             outputs=[wp.empty(1, dtype=wp.int32, device=device), arrays["capacity_status"]],
@@ -266,7 +266,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         """Report unclamped internal demand even without contact reservations."""
         status = wp.zeros(2, dtype=wp.int32, device="cpu")
         counts = wp.zeros(2, dtype=wp.int32, device="cpu")
-        kernel = kernels.finalize_constraint_counts_with_status
+        kernel = row_slots.finalize_constraint_counts_with_status
         for family in range(2):
             wp.launch(
                 kernel,
@@ -292,7 +292,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         status = wp.zeros(2, dtype=wp.int32, device=device)
         for family in range(2):
             wp.launch(
-                kernels.finalize_constraint_counts_with_status,
+                row_slots.finalize_constraint_counts_with_status,
                 dim=2,
                 inputs=[counter, 4, family, first_rejected],
                 outputs=[count, status],

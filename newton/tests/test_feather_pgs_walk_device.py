@@ -40,10 +40,8 @@ import newton
 from newton._src.solvers.feather_pgs import tree_factor, tree_scan
 from newton._src.solvers.feather_pgs.device_preludes import DevicePrelude, substitute
 from newton._src.solvers.feather_pgs.kernel_template import THREADS, KernelTemplate, params
-from newton._src.solvers.feather_pgs.kernels import (
-    PGS_CONSTRAINT_TYPE_SPEED,
-    PGS_LOCAL_SOLVE_OWNER_GENERAL,
-)
+from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
+from newton._src.solvers.feather_pgs.sweep import PGS_LOCAL_SOLVE_OWNER_GENERAL
 from newton._src.solvers.feather_pgs.tree_factor import (
     WALK_COORDINATE,
     WALK_FRAME,

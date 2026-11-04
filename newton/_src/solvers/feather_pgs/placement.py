@@ -33,14 +33,10 @@ from ...sim.enums import JointType
 from . import host_index, packed_rows, response_builds_rows
 from .dense_rows import RowSupport
 from .field_group import SolverArrays
-from .kernels import (
-    LINK_ROWS,
-    RIGID_SPEED_ROWS,
-    place_world_contact_runs,
-    prepare_world_impulses,
-    record_world_contact_runs,
-)
+from .row_kernels import RIGID_SPEED_ROWS
+from .row_laws import LINK_ROWS
 from .row_metadata import _validate_mf_metadata_encoding
+from .row_slots import place_world_contact_runs, record_world_contact_runs
 from .solver_fields import (
     CAPACITY_STATUS,
     CONTACT_RUNS,
@@ -60,6 +56,7 @@ from .solver_fields import (
     SPARSE_DIAGONAL_ROWS,
     WORLD_ROW_STATE,
 )
+from .warm_start import prepare_world_impulses
 
 __all__ = ["Placement"]
 

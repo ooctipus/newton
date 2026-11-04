@@ -364,3 +364,31 @@ def parallel_kernel(
         velocity_limit_pass=bool(velocity_limit_pass),
         sweeps=int(sweeps),
     )
+
+
+@wp.kernel
+def classify_parallel_sweep_tiers(
+    world_constraint_count: wp.array[int],
+    mf_constraint_count: wp.array[int],
+    tier_lo: wp.array[int],
+    tier_hi: wp.array[int],
+    n_tiers: int,
+    # outputs
+    tier_worlds: wp.array2d[int],
+    tier_counts: wp.array[int],
+):
+    """Append each dense-only world to the list of the parallel sweep tier that owns it.
+
+    Tier ``t`` owns worlds with ``tier_lo[t] < rows <= tier_hi[t]`` and no matrix-free rows. Each tier kernel then
+    grid-strides over its own list instead of launching every world and exiting (an exiting block still paid four
+    dependent global loads: ~55 us per launch at 16k worlds).
+    """
+    world = wp.tid()
+    m = world_constraint_count[world]
+    if m <= 0 or mf_constraint_count[world] != 0:
+        return
+    for t in range(n_tiers):
+        if m > tier_lo[t] and m <= tier_hi[t]:
+            idx = wp.atomic_add(tier_counts, t, 1)
+            tier_worlds[t, idx] = world
+            return

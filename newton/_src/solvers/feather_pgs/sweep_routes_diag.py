@@ -94,7 +94,7 @@ def _diagonal_limits(dofs: int, dense_dofs: int, laws: RowLaws) -> tuple[str, st
 
     Coordinate ``d`` has a lower and an upper unilateral row (``J = +1``, ``-1``), unstored whitened rows on the
     coordinate: ``Z = +-s`` with ``s = m^-1/2`` (``limit_scale``), their right-hand sides holding their incident
-    velocities ``+-v_hat`` (:func:`.kernels.prepare_fused_diagonal_joint_limits`), so ``J dv = +-s u``, ``A = s^2 + cfm`` (the step
+    velocities ``+-v_hat`` (:func:`.row_kernels.prepare_fused_diagonal_joint_limits`), so ``J dv = +-s u``, ``A = s^2 + cfm`` (the step
     divides by it) and ``u += +-s delta``. The lane that owns ``d = lane + 32 k`` keeps both impulses in registers for
     the launch; they start at zero and are written back at the end. The dense articulation's ``dense_dofs``
     coordinates (from ``dense_offset``) hold no fused limit.

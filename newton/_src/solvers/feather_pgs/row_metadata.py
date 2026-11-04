@@ -3,7 +3,7 @@
 
 """Shared packed dense and matrix-free row metadata contracts."""
 
-from .kernels import PGS_CONSTRAINT_TYPE_COUNT
+from .row_kernels import PGS_CONSTRAINT_TYPE_COUNT
 
 _DENSE_META_ROW_TYPE_BITS = 3
 _DENSE_META_ROW_TYPE_MASK = (1 << _DENSE_META_ROW_TYPE_BITS) - 1

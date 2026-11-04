@@ -15,7 +15,14 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import contact_laws, kernels, law_source, projection_laws, row_laws, spatial_laws
+from newton._src.solvers.feather_pgs import (
+    contact_laws,
+    law_source,
+    projection_laws,
+    row_kernels,
+    row_laws,
+    spatial_laws,
+)
 from newton._src.solvers.feather_pgs.device_preludes import cuda_native
 from newton.tests.feather_pgs_law_harness import (
     FAMILIES,
@@ -89,7 +96,7 @@ class TestLawSource(unittest.TestCase):
     def test_constants_are_the_replaced_codes(self):
         """Keep the row kinds of the kernels' row types."""
         for name in ("CONTACT", "FRICTION", "JOINT_LIMIT", "JOINT_VELOCITY_LIMIT", "MIMIC", "LINK", "TORSION"):
-            self.assertEqual(getattr(row_laws, f"ROW_{name}"), getattr(kernels, f"PGS_CONSTRAINT_TYPE_{name}"))
+            self.assertEqual(getattr(row_laws, f"ROW_{name}"), getattr(row_kernels, f"PGS_CONSTRAINT_TYPE_{name}"))
 
     def test_cuda_renderings_compile(self):
         """Compile the families' CUDA renderings through NVRTC, without a device (sm_80)."""

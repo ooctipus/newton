@@ -13,7 +13,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import compact_contact, contact_laws, friction_patches, kernels
+from newton._src.solvers.feather_pgs import compact_contact, contact_laws, friction_patches, row_kernels
 from newton._src.solvers.feather_pgs import row_packets as rp
 from newton._src.solvers.feather_pgs.field_group import SolverArrays
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
@@ -409,7 +409,7 @@ class _PatchRowTwins:
             if count != 3:
                 continue
             tangents = slice(first + 1, first + 3)
-            np.testing.assert_array_equal(data.row_type.numpy()[w, tangents], kernels.PGS_CONSTRAINT_TYPE_FRICTION)
+            np.testing.assert_array_equal(data.row_type.numpy()[w, tangents], row_kernels.PGS_CONSTRAINT_TYPE_FRICTION)
             np.testing.assert_array_equal(data.row_parent.numpy()[w, tangents], first)
             np.testing.assert_array_equal(data.phi.numpy()[w, tangents], phi[c])
             np.testing.assert_array_equal(data.row_beta.numpy()[w, tangents], np.float32(beta))

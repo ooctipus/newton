@@ -14,7 +14,7 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import contact_filters, contact_laws, kernels
+from newton._src.solvers.feather_pgs import contact_filters, contact_laws, friction_patches, row_kernels, row_slots
 from newton.tests.feather_pgs_law_harness import (
     assert_reproduces,
     call,
@@ -69,7 +69,7 @@ def _contact_scene(rng, contacts, *, worlds=4, shapes=12, bodies=8, arts=4, fric
 
 
 def _patches(rng, contacts, device, enabled):
-    patches = kernels.FrictionPatches()
+    patches = friction_patches.FrictionPatches()
     patches.enabled = int(enabled)
     patches.weight = wp.array(rng.uniform(0.0, 1.0, contacts).astype(np.float32), device=device)
     patches.next_contact = wp.full(contacts, -1, dtype=int, device=device)
@@ -167,7 +167,7 @@ def test_contact_endpoints_match_row_allocation(test, device):
     }
     big = 1 << 20
     out = call(
-        kernels.allocate_world_contact_slots,
+        row_slots.allocate_world_contact_slots,
         contacts,
         device,
         contact_count=np.array([contacts], dtype=np.int32),
@@ -236,7 +236,7 @@ def _kernel_ancestor_rows(
     J_group: wp.array3d[float],
 ):
     row = wp.tid()
-    kernels.accumulate_jacobian_row_world(
+    row_kernels.accumulate_jacobian_row_world(
         body[row],
         sign[row],
         point[row],

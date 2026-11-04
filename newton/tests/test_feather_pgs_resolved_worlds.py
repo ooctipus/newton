@@ -17,8 +17,8 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import kernels
 from newton._src.solvers.feather_pgs import resolved_worlds as rw
+from newton._src.solvers.feather_pgs import row_slots
 from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import contact_input, row_lines
@@ -391,9 +391,9 @@ class TestResolvedWorlds(unittest.TestCase):
 
     def test_patch_allocator_marks_the_contacts_the_complete_path_reserves(self):
         """In a resolved world, mark exactly the contacts the allocator would give rows; leave other worlds alone."""
-        complete = _allocate(kernels.allocate_world_contact_slots, [])
-        point = _allocate(kernels.allocate_world_contact_slots, [1, 0])
-        patch_friction = _allocate(kernels.allocate_world_contact_slots, [1, 0], patch_friction=True)
+        complete = _allocate(row_slots.allocate_world_contact_slots, [])
+        point = _allocate(row_slots.allocate_world_contact_slots, [1, 0])
+        patch_friction = _allocate(row_slots.allocate_world_contact_slots, [1, 0], patch_friction=True)
         np.testing.assert_array_equal(complete["contact_slot"] >= 0, [True, False, False, True, False, True])
         np.testing.assert_array_equal(complete["contact_path"], [0, -1, -1, 0, -1, 1])
         world_zero = np.array([True, True, True, False, False, True])
@@ -413,7 +413,7 @@ class TestResolvedWorlds(unittest.TestCase):
 
     def test_patch_release_repeats_the_allocator_admission(self):
         """Mark a resolved contact by the allocator's own admission: the kernel admits every contact once."""
-        allocator = _definition(kernels.allocate_world_contact_slots)
+        allocator = _definition(row_slots.allocate_world_contact_slots)
         admissions = [
             node
             for node in ast.walk(allocator)

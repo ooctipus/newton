@@ -18,7 +18,6 @@ from ...core.execution import arch_budget, device_lanes
 from . import kernel_template, sweep_units
 from .device_preludes import CPU_MATH, RING, SHARED_STORAGE, cuda_native, dual_native, lane_group
 from .kernel_template import KernelTemplate
-from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL
 from .law_source import law_preludes
 from .packed_rows import PACKED_SIDES
 from .projection_laws import CONE_LAW, PROJECTION_LAW
@@ -29,6 +28,7 @@ from .staging import Buffer, Staging
 from .sweep import (
     CONTACT,
     FRICTION,
+    PGS_LOCAL_SOLVE_OWNER_GENERAL,
     SPEED,
     VELOCITY_LIMIT,
     CachedPairMetric,

@@ -15,7 +15,7 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs import paired_components as components
 from newton._src.solvers.feather_pgs import response_builds_rows, sweep_routes, sweep_routes_local
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_SPEED
+from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
 from newton._src.solvers.feather_pgs.tree_factor import WalkTrees
 from newton.tests.feather_pgs_law_harness import row_lines
 

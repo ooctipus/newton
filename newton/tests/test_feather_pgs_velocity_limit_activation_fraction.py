@@ -9,7 +9,7 @@ import newton
 from newton._src.sim.enums import BodyFlags
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.joint_table import FreeBodies
-from newton._src.solvers.feather_pgs.kernels import allocate_rigid_velocity_limit_slots
+from newton._src.solvers.feather_pgs.row_kernels import allocate_rigid_velocity_limit_slots
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import prefix_warp_rows
 

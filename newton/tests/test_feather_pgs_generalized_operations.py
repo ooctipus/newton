@@ -9,7 +9,7 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import kernels
+from newton._src.solvers.feather_pgs.factor import kernels as factor_kernels
 
 
 class TestGeneralizedOperations(unittest.TestCase):
@@ -22,7 +22,7 @@ class TestGeneralizedOperations(unittest.TestCase):
             "update_qdd_from_velocity",
         ):
             with self.subTest(name=name):
-                self.assertIsInstance(getattr(kernels, "_light_" + name), wp.Function)
+                self.assertIsInstance(getattr(factor_kernels, "_light_" + name), wp.Function)
 
     def test_permuted_physical_indices_and_prescribed_dofs(self):
         """Update each physical DOF once under an unseen nonidentity permutation."""
@@ -35,7 +35,7 @@ class TestGeneralizedOperations(unittest.TestCase):
             velocity: wp.array[float],
             acceleration: wp.array[float],
         ):
-            kernels._light_update_qdd_from_velocity(indices[wp.tid()], qd, mask, 2.0, velocity, acceleration)
+            factor_kernels._light_update_qdd_from_velocity(indices[wp.tid()], qd, mask, 2.0, velocity, acceleration)
 
         device = os.environ.get("FPGS_TEST_DEVICE", "cpu")
         n = 37

@@ -21,10 +21,10 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import field_group, kernels, rows
+from newton._src.solvers.feather_pgs import field_group, row_slots, rows
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
-from newton._src.solvers.feather_pgs.kernels import (
+from newton._src.solvers.feather_pgs.row_slots import (
     allocate_world_contact_slots,
     finalize_constraint_counts_with_status,
 )
@@ -267,7 +267,7 @@ class TestFeatherPGSContactRowOrder(unittest.TestCase):
         threads = 4
         launched = set()
         records = _step_tripods(wp.get_device("cpu"), threads=threads, deterministic=False, launched=launched)
-        self.assertFalse({kernels.record_world_contact_runs, kernels.place_world_contact_runs} & launched)
+        self.assertFalse({row_slots.record_world_contact_runs, row_slots.place_world_contact_runs} & launched)
         out_of_order = False
         for record in records:
             for path in _ROW_PATHS:
@@ -278,7 +278,7 @@ class TestFeatherPGSContactRowOrder(unittest.TestCase):
         self.assertTrue(out_of_order, "four threads left every world's rows in contact order")
         launched.clear()
         _step_tripods(wp.get_device("cpu"), steps=1, launched=launched)
-        self.assertLessEqual({kernels.record_world_contact_runs, kernels.place_world_contact_runs}, launched)
+        self.assertLessEqual({row_slots.record_world_contact_runs, row_slots.place_world_contact_runs}, launched)
 
     def test_overflowing_family_keeps_the_allocator_layout_cpu(self):
         """Keep the allocator's slots for an overflowing row family and place the other one in contact order.

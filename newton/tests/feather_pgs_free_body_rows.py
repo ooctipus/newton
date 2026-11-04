@@ -15,7 +15,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import sweep_routes
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_SPEED
+from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
 from newton._src.solvers.feather_pgs.tree_factor import unpack_walk_records
 from newton.tests.feather_pgs_law_harness import chain_walk
 

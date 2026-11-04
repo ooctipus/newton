@@ -8,20 +8,24 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs import field_group, row_packets
 from newton._src.solvers.feather_pgs.dense_rows import MfRows
-from newton._src.solvers.feather_pgs.kernels import (
+from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_MIMIC,
+)
+from newton._src.solvers.feather_pgs.solver_fields import LocalOwners
+from newton._src.solvers.feather_pgs.sweep import (
     PGS_LOCAL_SOLVE_OWNER_GENERAL,
     PGS_LOCAL_SOLVE_OWNER_PAIR,
     PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
+)
+from newton._src.solvers.feather_pgs.sweep_routes_local import (
     classify_local_solve_worlds,
     compact_local_pair_candidates,
+    local_owned_kernel,
 )
-from newton._src.solvers.feather_pgs.solver_fields import LocalOwners
-from newton._src.solvers.feather_pgs.sweep_routes_local import local_owned_kernel
 from newton.tests.feather_pgs_law_harness import chain_walk, leave_walk, local_packed_rows, row_lines, walked_rows
 
 

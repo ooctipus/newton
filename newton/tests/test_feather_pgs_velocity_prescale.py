@@ -3,7 +3,7 @@
 
 """Prescale joint velocities in parallel lanes, bit for bit like the serial PhysX prescale.
 
-``_serial_prescale`` is ``kernels.prescale_joint_velocity_limits`` as it was
+``_serial_prescale`` is ``factor.kernels.prescale_joint_velocity_limits`` as it was
 before it ran in lanes (main b7932853): one thread per articulation scaled a
 copy of the joint velocities in place. It stays here as the reference.
 ``_emulate_lanes`` replays the threads of a CUDA lane launch in NumPy, warp
@@ -20,8 +20,8 @@ import warp as wp
 import newton
 from newton._src.sim import BodyFlags, JointType
 from newton._src.solvers.feather_pgs import field_group
+from newton._src.solvers.feather_pgs.factor.kernels import prescale_joint_velocity_limits
 from newton._src.solvers.feather_pgs.joint_table import JointTable
-from newton._src.solvers.feather_pgs.kernels import prescale_joint_velocity_limits
 from newton._src.solvers.feather_pgs.rows import velocity_prescale_launch
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_mixed_tree_free_body as mixed_tree

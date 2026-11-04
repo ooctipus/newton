@@ -34,9 +34,7 @@ from ...sim import BodyFlags, JointType, ModelFlags
 from . import field_group, host_index, response_builds_rows
 from . import tree_scan as ts
 from .device_preludes import DevicePrelude, substitute
-from .field_group import SolverArrays
-from .joint_table import JointTable
-from .kernels import (
+from .factor.kernels import (
     apply_free_root_velocity_corrections,
     build_mass_update_mask,
     compute_com_transforms,
@@ -45,6 +43,8 @@ from .kernels import (
     invalidate_fk_id_cache_for_articulations,
     prescale_joint_velocity_limits,
 )
+from .field_group import SolverArrays
+from .joint_table import JointTable
 from .row_laws import LINK_ROWS
 from .solver_fields import (
     ARTICULATION_ORIGIN,

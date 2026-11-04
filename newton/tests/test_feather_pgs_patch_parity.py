@@ -13,10 +13,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.friction_patches import link_patch_routes, seed_patch_routes
-from newton._src.solvers.feather_pgs.kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_FRICTION,
-)
+from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_sparse_scene as sparse_scene
 from newton.tests.feather_pgs_patch_parity import (

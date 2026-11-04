@@ -27,7 +27,6 @@ from .dense_rows import UNIT_CONTACT, UNIT_LIMIT, unit_source
 from .field_group import Field, FieldGroup, SolverArrays
 from .friction_patches import PatchRowLaw, patch_row_law
 from .kernel_template import substitute
-from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
 from .keyed_row_layout import prefix_kernel
 from .keyed_row_layout import topology_plan as direct_topology_plan
 from .law_source import law_preludes
@@ -35,6 +34,7 @@ from .prefix_rows import LAW, VELOCITY_LAW
 from .route_table import capable
 from .row_build import contact_torsion_mu
 from .row_inputs import ParallelRowInputs, RowArgument
+from .row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
 from .row_laws import ROW_LAW
 from .step_plan import JOINT_TOPOLOGY, TopologyPin
 from .tree_factor import WALK_FRAME, WALK_LINK

@@ -23,7 +23,7 @@ rows walked together from its first (1, 3, or 4 under contact torsion), or a joi
 
 Each row's header is its diagonal ``|z|^2 + cfm`` (the walk's sums of squares, re-read where two seeds share a side or
 a side slips), its incident velocity ``J v_hat`` (the step's ``J`` entries each walk passes) and its rhs by the row law
-(:func:`.kernels.row_bias`). A wrench enters as the step's ``J`` (the step's columns the finish published, shifted to
+(:func:`.row_kernels.row_bias`). A wrench enters as the step's ``J`` (the step's columns the finish published, shifted to
 the walk's frames, :attr:`.tree_factor.WalkTrees.now`), so a step between refreshes whitens the step's ``J`` by the
 held factor. A slipping drive's ``K`` leaves the rows by its release along its path (``R``, the predictor's border,
 :func:`.tree_kinetic_state.border_solve`), which keeps every row inside its support.
@@ -57,10 +57,10 @@ from .field_group import Field
 from .friction_patches import PatchRowLaw
 from .joint_table import FreeBodies
 from .kernel_template import python_kernel
-from .kernels import PGS_CONSTRAINT_TYPE_SPEED, RIGID_SPEED_ROWS, RowBias, row_bias
 from .projection_laws import friction_pair_metric
 from .response_builds_rows import close_block, close_row
 from .row_build import write_contact_row
+from .row_kernels import PGS_CONSTRAINT_TYPE_SPEED, RIGID_SPEED_ROWS, RowBias, row_bias
 from .row_laws import LINK_ROWS
 from .solver_fields import Preelim
 from .sparse_mass_matrix import _SparseRowSupport
@@ -282,7 +282,7 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool = True) -> wp
        (:func:`unit_reader`), walked by the one unit walker with the packed rows as its sink
        (:func:`packed_walker`; the spin row a torque), each side's slips released by the
        predictor's border's ``R`` (:func:`.tree_kinetic_state.border_solve`), then its rhs by the row law
-       (:func:`.kernels.row_bias`). A row a lane, not a contact a lane: the world's lanes stay busy (the support
+       (:func:`.row_kernels.row_bias`). A row a lane, not a contact a lane: the world's lanes stay busy (the support
        placement's unit list spreads a contact's unit over the GPU instead, :func:`support_rows_kernel`);
     2. *closure* (``blocks``, the largest bilateral block's rows; 0 for none): the lanes close each of the world's
        blocks (:func:`.response_builds_rows.close_block`; its rows are the links', and the mimics' with
@@ -951,7 +951,7 @@ def support_units_kernel(unit_rows: int, lanes: int) -> wp.Kernel:
     """The support placement's units (case K1, the writer's first launch): ``dim = (worlds, lanes)``, a world's lane
     group of ``lanes`` striding over its rows, a lane a row: each contact row's records by the contact law
     (:func:`.row_build.write_contact_row`, its unit source written where its slot is reserved,
-    :func:`.kernels.allocate_world_contact_slots`), and each unit's first row appended to the step's
+    :func:`.row_slots.allocate_world_contact_slots`), and each unit's first row appended to the step's
     :class:`UnitList`: a contact's ``min(slots_needed, unit_rows)`` rows as one unit, a joint row (a limit, a velocity
     limit, a mimic) alone. The walkers (:func:`support_rows_kernel`) read the records after this launch."""
 
@@ -1013,7 +1013,7 @@ def support_rows_kernel(
     contact rows' records are the first launch's; a joint row's records and unit source are its producer's (the limit,
     velocity-limit and mimic producers). The walker stores its footprints at their ranks in its support
     (``row_factor``, with the coordinates ``row_dof`` or the support class ``row_class``), its diagonal ``|z|^2 + cfm``,
-    its incident ``J v_hat`` and its rhs by the row law (:func:`.kernels.row_bias`). ``half`` is the class's records'
+    its incident ``J v_hat`` and its rhs by the row law (:func:`.row_kernels.row_bias`). ``half`` is the class's records'
     half (:func:`.tree_scan.classes_half`), compiled into its walks.
     """
     unit_rows = 4 if torsion else 3

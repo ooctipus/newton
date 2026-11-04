@@ -238,7 +238,7 @@ class TestKernelIdentity(unittest.TestCase):
             self.skipTest(f"Import-time switches select other generated kernels: {', '.join(identity._switches())}")
         stored = record["kernels"]
         wp.init()
-        kernels, rejected = identity.inventory(("pins",), ("kernels.allocate_world_contact_slots",))
+        kernels, rejected = identity.inventory(("pins",), ("row_slots.allocate_world_contact_slots",))
         self.assertEqual(rejected, {})
         self.assertEqual(len(kernels), 1)
         for name, (family, kernel) in kernels.items():

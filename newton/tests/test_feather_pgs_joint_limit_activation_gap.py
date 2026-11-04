@@ -9,7 +9,7 @@ import warp as wp
 import newton
 from newton._src.core.types import MAXVAL
 from newton._src.sim.enums import JointType
-from newton._src.solvers.feather_pgs.kernels import (
+from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,

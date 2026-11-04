@@ -14,9 +14,8 @@ import newton
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.contact_input import ContactRoutes
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows, MfRows
-from newton._src.solvers.feather_pgs.kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_FRICTION,
+from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
+from newton._src.solvers.feather_pgs.warm_start import (
     gather_dense_warmstart,
     gather_mf_warmstart,
     prepare_world_impulses,

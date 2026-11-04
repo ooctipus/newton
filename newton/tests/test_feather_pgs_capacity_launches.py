@@ -12,7 +12,7 @@ import warp as wp
 
 import newton
 from newton._src.sim.contacts import CAPACITY_BLOCKS_PER_SM, contact_capacity_blocks
-from newton._src.solvers.feather_pgs import field_group, kernels, keyed_rows
+from newton._src.solvers.feather_pgs import contact_forces, field_group, keyed_rows, row_kernels, warm_start
 from newton._src.solvers.feather_pgs.contact_input import ContactInput, ContactRoutes
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import row_lines
@@ -20,11 +20,11 @@ from newton.tests.feather_pgs_patch_parity import point_row_law
 
 # Every launch over the contact capacity that grid-strides over the capped grid.
 _CONSUMERS = (
-    kernels.compute_contact_linear_force_from_impulses,
-    kernels.pack_contact_linear_force_as_spatial,
-    kernels.snapshot_contact_warmstart,
-    kernels.gather_dense_warmstart,
-    kernels.gather_mf_warmstart,
+    contact_forces.compute_contact_linear_force_from_impulses,
+    contact_forces.pack_contact_linear_force_as_spatial,
+    warm_start.snapshot_contact_warmstart,
+    warm_start.gather_dense_warmstart,
+    warm_start.gather_mf_warmstart,
 )
 
 
@@ -58,10 +58,10 @@ def _export_inputs(device, capacity, count, rng):
     slot = rng.integers(0, rows - 3, capacity).astype(np.int32)
     world = rng.integers(0, worlds, capacity).astype(np.int32)
     path = rng.integers(-1, 2, capacity).astype(np.int32)
-    row_type = np.full((worlds, rows), kernels.PGS_CONSTRAINT_TYPE_CONTACT, np.int32)
+    row_type = np.full((worlds, rows), row_kernels.PGS_CONSTRAINT_TYPE_CONTACT, np.int32)
     row_parent = np.full((worlds, rows), -1, np.int32)
     for c in np.flatnonzero(rng.random(capacity) < 0.35):
-        row_type[world[c], slot[c] + 1 : slot[c] + 3] = kernels.PGS_CONSTRAINT_TYPE_FRICTION
+        row_type[world[c], slot[c] + 1 : slot[c] + 3] = row_kernels.PGS_CONSTRAINT_TYPE_FRICTION
         row_parent[world[c], slot[c] + 1 : slot[c] + 3] = slot[c]
     normal = rng.normal(size=(capacity, 3))
     normal /= np.linalg.norm(normal, axis=1, keepdims=True)
@@ -149,7 +149,7 @@ class TestFeatherPGSCapacityLaunches(unittest.TestCase):
                     force = wp.full(capacity, wp.vec3(7.0), dtype=wp.vec3, device=device)
                     spatial = wp.full(capacity, wp.spatial_vector(7.0), dtype=wp.spatial_vector, device=device)
                     wp.launch(
-                        kernels.compute_contact_linear_force_from_impulses,
+                        contact_forces.compute_contact_linear_force_from_impulses,
                         dim=capacity,
                         inputs=inputs,
                         outputs=[force],
@@ -157,7 +157,7 @@ class TestFeatherPGSCapacityLaunches(unittest.TestCase):
                         max_blocks=max_blocks,
                     )
                     wp.launch(
-                        kernels.pack_contact_linear_force_as_spatial,
+                        contact_forces.pack_contact_linear_force_as_spatial,
                         dim=capacity,
                         inputs=[inputs[2].count, force],
                         outputs=[spatial],
@@ -234,9 +234,9 @@ class TestFeatherPGSCapacityLaunches(unittest.TestCase):
                     self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
                     keys = {key for key, _ in launched}
                     for required in (
-                        kernels.compute_contact_linear_force_from_impulses,
-                        kernels.pack_contact_linear_force_as_spatial,
-                        kernels.snapshot_contact_warmstart,
+                        contact_forces.compute_contact_linear_force_from_impulses,
+                        contact_forces.pack_contact_linear_force_as_spatial,
+                        warm_start.snapshot_contact_warmstart,
                     ):
                         self.assertIn(required.key, keys)
                     self.assertTrue(keys & {kernel.key for kernel in _CONSUMERS[3:]}, "a warm-start gather must run")

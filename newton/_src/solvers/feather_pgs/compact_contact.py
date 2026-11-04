@@ -17,7 +17,7 @@ import warp as wp
 from .contact_input import ContactInput
 from .dense_rows import UNIT_CONTACT, DenseRows, unit_source
 from .friction_patches import PatchRowLaw, patch_row_law
-from .kernels import RowBias
+from .row_kernels import RowBias
 from .walk_rows import (
     JointSeeds,
     RowSink,

@@ -13,7 +13,7 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import field_group, kernels, row_laws
+from newton._src.solvers.feather_pgs import field_group, row_kernels, row_laws
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton.tests.feather_pgs_law_harness import (
     call,
@@ -72,14 +72,14 @@ def _rows(rng, worlds, rows):
 
 
 def test_row_rhs_matches_world_contact_bias(test, device):
-    """Equal ``kernels.compute_world_contact_bias`` bitwise for every row kind and setting."""
+    """Equal ``row_kernels.compute_world_contact_bias`` bitwise for every row kind and setting."""
     rng = np.random.default_rng(11)
     worlds, rows = 16, 64
     phi, kind, beta, target = _rows(rng, worlds, rows)
     for dt, contact_spec, contact_w in ((1.0 / 60.0, 1.0, 1.0), (1.0 / 120.0, 0.0, 0.5), (7.0e-3, 0.3, 0.98)):
         with test.subTest(dt=dt, contact_spec=contact_spec, contact_w=contact_w):
             out = call(
-                kernels.compute_world_contact_bias,
+                row_kernels.compute_world_contact_bias,
                 (worlds, rows),
                 device,
                 world_constraint_count=np.full(worlds, rows, dtype=np.int32),
@@ -289,7 +289,7 @@ def _law_row_beta(
 
 
 def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
-    """Equal the free-body rows' rhs (``kernels.compute_world_contact_bias`` on their records): the contact law with its
+    """Equal the free-body rows' rhs (``row_kernels.compute_world_contact_bias`` on their records): the contact law with its
     bodies' depenetration cap and weights, from the incident velocity the walk summed."""
     rng = np.random.default_rng(13)
     worlds, rows = 8, 48
@@ -325,7 +325,7 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
         incident=np.zeros((worlds, rows), dtype=np.float32),
         **shared,
     )["incident"]
-    # The records the writers store, the rows' law's beta among them, read by the rows' law (kernels.row_bias).
+    # The records the writers store, the rows' law's beta among them, read by the rows' law (row_kernels.row_bias).
     beta = call(_law_row_beta, (worlds, rows), device, row_beta=np.zeros((worlds, rows), dtype=np.float32), **shared)[
         "row_beta"
     ]
@@ -342,7 +342,7 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
         first=row_lines(device),
     )
     call(
-        kernels.compute_world_contact_bias,
+        row_kernels.compute_world_contact_bias,
         (worlds, rows),
         device,
         rows=records,
@@ -428,7 +428,7 @@ def test_restitution_matches_matrix_free_restitution(test, device):
         "restitution_velocity_threshold": 0.2,
     }
     out = call(
-        kernels.compute_world_contact_bias,
+        row_kernels.compute_world_contact_bias,
         (worlds, rows),
         device,
         world_constraint_count=np.full(worlds, rows, dtype=np.int32),
@@ -531,7 +531,7 @@ def test_limit_laws_match_fused_diagonal_limits(test, device):
         "lower_rhs": np.zeros((worlds, dofs), dtype=np.float32),
         "upper_rhs": np.zeros((worlds, dofs), dtype=np.float32),
     }
-    out = call(kernels.prepare_fused_diagonal_joint_limits, count, device, **values)
+    out = call(row_kernels.prepare_fused_diagonal_joint_limits, count, device, **values)
     law = call(_law_fused_limits, count, device, **values)
     for name in ("active_sides", "lower_rhs", "upper_rhs"):
         test.assertFalse(mismatches(out[name].numpy(), law[name].numpy()).any(), name)

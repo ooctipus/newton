@@ -48,11 +48,11 @@ from .execution_plan import retired_tiled_response_fits
 from .field_group import Field, FieldGroup, SolverArrays
 from .friction_patches import PatchRowLaw, patch_row_law
 from .kernel_template import KernelTemplate, substitute
-from .kernels import PGS_CONSTRAINT_TYPE_SPEED
 from .prefix_rows import LAW, limits, prefix_rows
 from .prefix_rows import mimics as mimic_rows
 from .row_build import write_contact_row
 from .row_inputs import SEED_NONE, SEED_SECONDARY, CompactLocalRows, RowArgument
+from .row_kernels import PGS_CONSTRAINT_TYPE_SPEED
 from .row_laws import ROW_LAW
 from .step_plan import JOINT_TOPOLOGY, TopologyPin, first_failed
 from .tree_factor import WalkTrees

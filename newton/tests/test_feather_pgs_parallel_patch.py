@@ -32,18 +32,18 @@ from newton._src.solvers.feather_pgs import field_group, keyed_rows, path_select
 from newton._src.solvers.feather_pgs import sweep as emitter
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.device_preludes import RING
+from newton._src.solvers.feather_pgs.factor.kernels import prescale_joint_velocity_limits
 from newton._src.solvers.feather_pgs.joint_table import JointTable
-from newton._src.solvers.feather_pgs.kernels import (
+from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
+from newton._src.solvers.feather_pgs.placement import Placement
+from newton._src.solvers.feather_pgs.route_table import RouteTable
+from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     compute_world_contact_bias,
-    prescale_joint_velocity_limits,
 )
-from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
-from newton._src.solvers.feather_pgs.placement import Placement
-from newton._src.solvers.feather_pgs.route_table import RouteTable
 from newton._src.solvers.feather_pgs.rows import RowLaws, velocity_prescale_launch
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton._src.solvers.feather_pgs.tree_factor import WALK_LINK, WalkTrees, pack_walk_records, release_view

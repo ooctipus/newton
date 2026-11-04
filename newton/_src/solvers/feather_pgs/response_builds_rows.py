@@ -26,12 +26,10 @@ import warp as wp
 from . import kernel_template
 from .device_preludes import CPU_MATH, dual_native, lane_group
 from .kernel_template import Dispatch, KernelTemplate
-from .kernels import (
-    PGS_CONSTRAINT_TYPE_SPEED,
-)
 from .paired_components import FREE_BODY_DOFS, PAIRED_COMPONENT_THREADS, PairedComponentData
 from .projection_laws import BILATERAL_PIVOT
 from .response_operator import FreeBodyZ
+from .row_kernels import PGS_CONSTRAINT_TYPE_SPEED
 from .row_laws import (
     LINK_ROWS,
 )

@@ -38,7 +38,6 @@ from .dense_rows import bind as bind_dense_rows
 from .dense_rows import bind_mf as bind_mf_rows
 from .field_group import Field, FieldGroup, SolverArrays
 from .friction_patches import patch_normal_load
-from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL
 from .packed_rows import WIDE
 from .row_laws import (
     ROW_CONTACT,
@@ -49,6 +48,7 @@ from .row_laws import (
     ROW_TORSION,
 )
 from .sparse_mass_matrix import _SparseRowSupport
+from .sweep import PGS_LOCAL_SOLVE_OWNER_GENERAL
 from .tree_factor import WalkTrees, walk_enter_kernel
 
 __all__ = ["AUDIT_FIELDS", "AUDIT_SLOTS", "Audit"]

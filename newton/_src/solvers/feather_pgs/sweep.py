@@ -41,7 +41,9 @@ from typing import ClassVar
 
 import warp as wp
 
-from .kernels import (
+from .response_operator import Lanes, ResponseOperator
+from .row_inputs import RowArgument
+from .row_kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
@@ -49,8 +51,6 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_SPEED,
     PGS_CONSTRAINT_TYPE_TORSION,
 )
-from .response_operator import Lanes, ResponseOperator
-from .row_inputs import RowArgument
 from .row_metadata import _DENSE_META_ROW_TYPE_BITS, _DENSE_META_ROW_TYPE_MASK, _mf_parent_expression
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound, sweep_exit, terms_bound, vote
 from .staging import Buffer
@@ -61,6 +61,13 @@ JOINT_LIMIT = int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
 VELOCITY_LIMIT = int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
 SPEED = int(PGS_CONSTRAINT_TYPE_SPEED)
 TORSION = int(PGS_CONSTRAINT_TYPE_TORSION)
+
+# A world's local-solve owner, as the local sweeps' classification assigns it
+# (:func:`.sweep_routes_local.classify_local_solve_worlds`); the general sweeps skip the worlds of the others.
+PGS_LOCAL_SOLVE_OWNER_GENERAL = 0
+PGS_LOCAL_SOLVE_OWNER_SINGLE = 1
+PGS_LOCAL_SOLVE_OWNER_PAIR = 2
+PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL = 3
 
 
 def indent(text: str, prefix: str) -> str:

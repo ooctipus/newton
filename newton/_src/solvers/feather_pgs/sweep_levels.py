@@ -15,7 +15,7 @@ from . import kernel_template
 from .contact_input import ContactInput
 from .device_preludes import lane_group
 from .kernel_template import Dispatch, KernelTemplate, python_kernel
-from .kernels import PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
+from .row_kernels import PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
 
 
 @cache

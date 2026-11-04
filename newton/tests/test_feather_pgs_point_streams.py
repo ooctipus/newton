@@ -265,16 +265,16 @@ _PATCH_ONLY |= frozenset(_patch_only_factory_labels())
 
 
 def _module_kernels():
-    """Every non-generic kernel defined at module level in the FeatherPGS package."""
+    """Every non-generic kernel defined at module level in the FeatherPGS package and its subpackages."""
     package = importlib.import_module(_PACKAGE)
     kernels = {}
-    for info in pkgutil.iter_modules(package.__path__):
-        module = importlib.import_module(f"{_PACKAGE}.{info.name}")
+    for info in pkgutil.walk_packages(package.__path__, f"{_PACKAGE}."):
+        module = importlib.import_module(info.name)
         for name, value in vars(module).items():
             # A re-exported kernel is pinned where it is defined. Generic kernels
             # are hashed per instantiation; none serves a point-friction route.
             if isinstance(value, wp.Kernel) and value.func.__module__ == module.__name__ and not value.is_generic:
-                kernels[f"{info.name}.{name}"] = value
+                kernels[f"{info.name.removeprefix(_PACKAGE + '.')}.{name}"] = value
     return kernels
 
 
@@ -677,7 +677,7 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
             "sweep_routes_tiers.parallel_kernel",
             "sweep_routes_local.paired_factor_kernel",
             "keyed_rows.get_parallel_factory",
-            "kernels.allocate_world_contact_slots",
+            "row_slots.allocate_world_contact_slots",
             "row_packets.produce_contacts",
             "compact_contact.produce_contacts",
             "walk_rows.walked_rows_kernel",
