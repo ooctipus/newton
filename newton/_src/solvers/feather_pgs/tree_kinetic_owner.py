@@ -523,7 +523,7 @@ class TreeKineticState:
             setattr(bank, name, value)
         return bank
 
-    def begin(self, state_in, state_aug, stage3_qd, dt, *, state_out=None):
+    def begin(self, state_in, state_aug, stage3_qd, dt, *, state_out=None, continues=False):
         """Repair current caches or late-request geometry before any factor read.
 
         Args:
@@ -535,9 +535,17 @@ class TreeKineticState:
                 published into it keeps that cache when ``state_in`` holds the same
                 words (see :func:`~.tree_kinetic_state.get_bank_kernel`). ``None``
                 validates by identity alone.
+            continues: The step continues the last finish into ``state_in``
+                (:meth:`.tree_factor.TreeFactor.fk_id`): every group's cache is valid,
+                stamped with ``state_in``, unrequested and geometrically current, so
+                every group would take its early exit and nothing launches. A
+                motion-velocity layout's repair also compares the prescaled velocity,
+                which the step recomputes after the finish: it launches.
         """
         self._validate_call(state_in, state_aug, dt)
         self._motion_binding = self._validate_motion(state_in, state_aug, stage3_qd)
+        if continues and not self.motion_velocity:
+            return
         device = self.solver.model.device
         data = self._publication(state_in, state_aug, state_in, dt)
         # Every repair takes the launch ABI of the finish (get_state_kernel): only an

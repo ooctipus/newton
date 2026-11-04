@@ -612,13 +612,14 @@ class ScalarBranchState:
             if value.device != solver.model.device or not value.is_contiguous:
                 raise RuntimeError("Scalar branches require contiguous same-device state arrays")
 
-    def begin(self, state_in, state_aug, stage3_qd, dt, *, state_out=None):
+    def begin(self, state_in, state_aug, stage3_qd, dt, *, state_out=None, continues=False):
         """Publish the input state of articulations whose cache is invalid.
 
         ``state_out`` (the step's output bank) is not compared: the group
-        validates its input bank by identity (``bank_compare`` is ``False``).
+        validates its input bank by identity (``bank_compare`` is ``False``),
+        and launches on every step, ``continues`` or not.
         """
-        del stage3_qd, state_out
+        del stage3_qd, state_out, continues
         self._validate_call(state_in, state_aug, dt)
         solver, model = self.solver, self.solver.model
         wp.launch(

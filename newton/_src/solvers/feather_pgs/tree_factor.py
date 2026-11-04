@@ -533,6 +533,7 @@ class TreeFactor:
 
     def notify_state_changed(self, articulations: wp.array | None = None) -> None:
         """Invalidate the cached kinematics of ``articulations`` (``None``: every articulation)."""
+        self.held.continuation = None
         if articulations is None:
             self.fk_id_cache_valid.zero_()
             return
@@ -550,6 +551,7 @@ class TreeFactor:
         the COM frames on an inertial change."""
         # The held tree's proof stores a moved joint frame as its new reference, so it runs after every check that
         # can still refuse the notification.
+        self.held.continuation = None
         held = self.held
         frames_proven = held.validate_model(flags)
         cache_inputs = int(flags) & int(
@@ -593,6 +595,7 @@ class TreeFactor:
     def reset_cache(self, state, world_mask: wp.array | None) -> None:
         """Invalidate the FK/ID cache of the worlds ``world_mask`` selects, and of every world when ``state`` is not
         the state the cache was derived from (unless the held tree compares input banks)."""
+        self.held.continuation = None
         wp.launch(
             invalidate_articulation_fk_id_cache,
             dim=self.model.articulation_count,

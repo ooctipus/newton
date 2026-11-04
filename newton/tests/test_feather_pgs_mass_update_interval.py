@@ -129,7 +129,7 @@ def _run_floating_trajectory(model, solver, num_steps, *, invalidate_fk_each_ste
     for _ in range(num_steps):
         if invalidate_fk_each_step:
             # A reset also refreshes mass factors; isolate FK/ID reuse instead.
-            solver.factor.fk_id_cache_valid.zero_()
+            solver.notify_state_changed()
         solver.step(state_0, state_1, control, contacts, DT)
         mass_masks.append(solver.factor.mass_update_mask.numpy().copy())
         state_0, state_1 = state_1, state_0
@@ -171,7 +171,7 @@ def _run_state_trajectory(model, solver, num_steps, *, invalidate_fk_each_step):
     for _ in range(num_steps):
         if invalidate_fk_each_step:
             # A reset also refreshes mass factors; isolate FK/ID reuse instead.
-            solver.factor.fk_id_cache_valid.zero_()
+            solver.notify_state_changed()
         model.collide(state_0, contacts)
         solver.step(state_0, state_1, control, contacts, DT)
         mass_masks.append(solver.factor.mass_update_mask.numpy().copy())
