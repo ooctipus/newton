@@ -23,7 +23,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     prepare_world_contact_rows,
 )
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import group_rows, row_lines
+from newton.tests.feather_pgs_law_harness import group_rows, row_bias, row_lines
 from newton.tests.feather_pgs_patch_parity import row_law
 
 PATH_DENSE = 0
@@ -231,12 +231,7 @@ def _speculative_rhs(scale: float, base: int = 0) -> float:
             1,
             base,
             1,
-            0.5,
-            scale,
-            1.0,
-            0.0,
-            0,
-            0,
+            row_bias(0.5, scale, 1.0, 0.0, 0, 0),
         ],
         device="cpu",
     )

@@ -639,6 +639,14 @@ STRUCT_ARGUMENTS = {
 _ROW_LINES = {}
 
 
+def row_bias(dt, speculative_scale, contact_w, restitution_threshold, weighted, material) -> kernels.RowBias:
+    """The rows' law's step parameters (:class:`.kernels.RowBias`)."""
+    bias = kernels.RowBias()
+    bias.dt, bias.speculative_scale, bias.contact_w = dt, speculative_scale, contact_w
+    bias.restitution_threshold, bias.weighted, bias.material = restitution_threshold, int(weighted), int(material)
+    return bias
+
+
 def row_lines(device) -> wp.array:
     """The row table of a hand-built scene, read by world: its worlds keep their rows on their own lines."""
     key = str(device)

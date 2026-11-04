@@ -48,7 +48,7 @@ from newton._src.solvers.feather_pgs.rows import RowLaws, velocity_prescale_laun
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton._src.solvers.feather_pgs.tree_factor import WALK_LINK, WalkTrees, pack_walk_records, release_view
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import leave_walk, row_lines, unpacked_rows
+from newton.tests.feather_pgs_law_harness import leave_walk, row_bias, row_lines, unpacked_rows
 from newton.tests.feather_pgs_mass_reference import MassReference
 from newton.tests.feather_pgs_patch_parity import (
     SLIDING_FEET,
@@ -915,12 +915,7 @@ def _general_bias(solver, rows, dt):
             rhs.shape[1],
             0,
             rhs.shape[1],
-            dt,
-            solver.options.contact_speculative_scale,
-            1.0,
-            0.0,
-            0,
-            0,
+            row_bias(dt, solver.options.contact_speculative_scale, 1.0, 0.0, 0, 0),
         ],
         device=device,
     )

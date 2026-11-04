@@ -16,7 +16,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     prepare_world_contact_rows,
 )
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
-from newton.tests.feather_pgs_law_harness import row_lines
+from newton.tests.feather_pgs_law_harness import row_bias, row_lines
 from newton.tests.feather_pgs_patch_parity import row_law
 from newton.tests.test_feather_pgs_sparse_mass_matrix import _endpoint_support
 
@@ -188,12 +188,7 @@ class TestSparseContacts(unittest.TestCase):
                     row_count,
                     0,
                     row_count,
-                    0.01,
-                    1.0,
-                    1.0,
-                    0.1,
-                    0,
-                    0,
+                    row_bias(0.01, 1.0, 1.0, 0.1, 0, 0),
                 ],
                 device="cpu",
             )

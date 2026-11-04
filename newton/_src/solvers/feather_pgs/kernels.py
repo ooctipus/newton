@@ -1756,43 +1756,48 @@ TILE_THREADS = 64
 # =============================================================================
 
 
+@wp.struct
+class RowBias:
+    """The rows' law's step parameters (:func:`row_bias`): the step ``dt``, a positive gap's speculative scale, the
+    contacts' weight ``contact_w``, the restitution threshold, whether rows store their regularization weight
+    (``weighted``), and whether contacts carry a material (``material``: their writer stored their rhs and compliance).
+    """
+
+    dt: float
+    speculative_scale: float
+    contact_w: float
+    restitution_threshold: float
+    weighted: int
+    material: int
+
+
 @wp.func
-def row_bias(
-    rows: DenseRows,
-    line: int,
-    i: int,
-    incident: float,
-    dt: float,
-    contact_speculative_scale: float,
-    contact_w: float,
-    restitution_velocity_threshold: float,
-    weighted: int,
-    material: int,
-):
-    """Row ``i``'s rhs by its row law (:func:`.row_laws.row_rhs`) from its records, and a bouncing contact's rebound
-    from its incident velocity ``J v_hat`` (:func:`.row_laws.contact_restitution_rhs`, weight 1); a material contact
-    (its writer stored its rhs and compliance) keeps its rhs. ``weighted`` rows store their regularization weight."""
+def row_bias(rows: DenseRows, bias: RowBias, line: int, i: int, incident: float):
+    """Row ``i``'s rhs by its row law (:func:`.row_laws.row_rhs`, its parameters ``bias``) from its records, and a
+    bouncing contact's rebound from its incident velocity ``J v_hat`` (:func:`.row_laws.contact_restitution_rhs`,
+    weight 1); a material contact (its writer stored its rhs and compliance) keeps its rhs. ``weighted`` rows store
+    their regularization weight."""
     kind = rows.row_type[line, i]
-    if material != 0 and kind == PGS_CONSTRAINT_TYPE_CONTACT:
+    if bias.material != 0 and kind == PGS_CONSTRAINT_TYPE_CONTACT:
         if rows.row_eps[line, i] > 0.0:
             return
-    inv_dt = 1.0 / dt
+    inv_dt = 1.0 / bias.dt
     phi = rows.phi[line, i]
     target = rows.target[line, i]
     rhs, row_w = row_rhs(
-        kind, phi, rows.row_beta[line, i], target, inv_dt, 1.0, contact_speculative_scale, 1.0, contact_w
+        kind, phi, rows.row_beta[line, i], target, inv_dt, 1.0, bias.speculative_scale, 1.0, bias.contact_w
     )
     if kind == PGS_CONSTRAINT_TYPE_CONTACT:
         restitution = rows.restitution[line, i]
         if restitution > 0.0:
             fires, bounce = contact_restitution_rhs(
-                phi, incident - target, target, restitution, dt, restitution_velocity_threshold
+                phi, incident - target, target, restitution, bias.dt, bias.restitution_threshold
             )
             if fires:
                 rhs = bounce
                 row_w = 1.0
     rows.rhs[line, i] = rhs
-    if weighted != 0:
+    if bias.weighted != 0:
         rows.row_w[line, i] = row_w
 
 
@@ -1804,12 +1809,7 @@ def compute_world_contact_bias(
     max_constraints: int,
     base: int,
     lanes: int,
-    dt: float,
-    contact_speculative_scale: float,
-    contact_w: float,
-    restitution_velocity_threshold: float,
-    weighted: int,
-    material: int,
+    bias: RowBias,
 ):
     """Compute each world row's RHS bias by its row law (:func:`.row_laws.row_rhs`); ``J*v`` is added later.
 
@@ -1832,18 +1832,7 @@ def compute_world_contact_bias(
         return
     line = rows.first[world]
     for i in range(base + lane, base + count, lanes):
-        row_bias(
-            rows,
-            line,
-            i,
-            row_incident[line, i],
-            dt,
-            contact_speculative_scale,
-            contact_w,
-            restitution_velocity_threshold,
-            weighted,
-            material,
-        )
+        row_bias(rows, bias, line, i, row_incident[line, i])
 
 
 @wp.kernel

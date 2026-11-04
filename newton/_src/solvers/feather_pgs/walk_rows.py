@@ -57,7 +57,7 @@ from .field_group import Field
 from .friction_patches import PatchRowLaw
 from .joint_table import FreeBodies
 from .kernel_template import python_kernel
-from .kernels import PGS_CONSTRAINT_TYPE_SPEED, RIGID_SPEED_ROWS, row_bias
+from .kernels import PGS_CONSTRAINT_TYPE_SPEED, RIGID_SPEED_ROWS, RowBias, row_bias
 from .projection_laws import friction_pair_metric
 from .response_builds_rows import close_block, close_row
 from .row_build import write_contact_row
@@ -316,12 +316,7 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool = True) -> wp
         mimic_slot: wp.array[int],
         link_slot: wp.array[int],
         seeds: JointSeeds,
-        dt: float,
-        contact_speculative_scale: float,
-        contact_w: float,
-        restitution_velocity_threshold: float,
-        weighted: int,
-        material: int,
+        bias: RowBias,
     ):
         world, lane = wp.tid()
         count = wp.min(counts[world], sink.entries.shape[1])
@@ -334,10 +329,7 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool = True) -> wp
             unit = read_unit(rows, data, law, seeds, line, slot, support.units[line, slot])
             if unit.rows > 0:
                 walk(sink, unit)
-                row_bias(
-                    rows, line, slot, sink.row_incident[line, slot], dt, contact_speculative_scale, contact_w,
-                    restitution_velocity_threshold, weighted, material,
-                )  # fmt: skip
+                row_bias(rows, bias, line, slot, sink.row_incident[line, slot])
         if wp.static(has_blocks):
             world_sync(lanes)
             for pe in range(preelim.world_start[world] + lane, preelim.world_start[world + 1], lanes):
@@ -1017,12 +1009,7 @@ def support_rows_kernel(
         law: PatchRowLaw,
         sink: RowSink,
         seeds: JointSeeds,
-        dt: float,
-        contact_speculative_scale: float,
-        contact_w: float,
-        restitution_velocity_threshold: float,
-        weighted: int,
-        material: int,
+        bias: RowBias,
     ):
         # The list's counts are read again at each unit (L1 hits): nothing but the item lives across a walk.
         item = wp.tid()
@@ -1049,10 +1036,7 @@ def support_rows_kernel(
                         sink.records[line, k, 7] = axis[1]
             for r in range(unit.rows):
                 incident = sink.row_incident[line, slot + r]
-                row_bias(
-                    rows, line, slot + r, incident, dt, contact_speculative_scale, contact_w,
-                    restitution_velocity_threshold, weighted, material,
-                )  # fmt: skip
+                row_bias(rows, bias, line, slot + r, incident)
             item += threads
 
     name = f"support_rows_{len(node)}_{abs(hash((parent, first, node))) % (1 << 32):08x}"
@@ -1150,12 +1134,7 @@ def slot_header(
     data: ContactInput,
     v_hat: wp.array[float],
     unit: RowUnit,
-    dt: float,
-    contact_speculative_scale: float,
-    contact_w: float,
-    restitution_velocity_threshold: float,
-    weighted: int,
-    material: int,
+    bias: RowBias,
 ):
     """Finish the sparse diagonal's row ``unit.slot`` once the walk wrote its arm's footprints, norm and incident
     (:func:`packed_walker` with the star): each endpoint on a key of the star, one step to the world into the row's two
@@ -1195,10 +1174,7 @@ def slot_header(
         sparse += z_b * z_b
     rows.diag[line, slot] = (rows.diag[line, slot] + sparse) + rows.cfm
     slots.incident[line, slot] = incident
-    row_bias(
-        rows, line, slot, incident, dt, contact_speculative_scale, contact_w, restitution_velocity_threshold, weighted,
-        material,
-    )  # fmt: skip
+    row_bias(rows, bias, line, slot, incident)
 
 
 read_row_unit = unit_reader(False)
@@ -1222,12 +1198,7 @@ def write_slot_rows(
     data: ContactInput,
     law: PatchRowLaw,
     v_hat: wp.array[float],
-    dt: float,
-    contact_speculative_scale: float,
-    contact_w: float,
-    restitution_velocity_threshold: float,
-    weighted: int,
-    material: int,
+    bias: RowBias,
 ):
     """The one writer on the sparse diagonal: a world's ``lanes`` threads stride over its rows (``dim = (worlds,
     lanes)``), every row (``counts``, the allocation's watermark) or its limit prefix alone (``prefix``:
@@ -1245,10 +1216,7 @@ def write_slot_rows(
         if unit.rows > 0:
             unit.group = slots.dense_group[world]
             walk_slot_row(sink, unit)
-            slot_header(
-                rows, slots, data, v_hat, unit, dt, contact_speculative_scale, contact_w,
-                restitution_velocity_threshold, weighted, material,
-            )  # fmt: skip
+            slot_header(rows, slots, data, v_hat, unit, bias)
 
 
 def row_sink(factor, forest, placement, v_hat: wp.array) -> RowSink:

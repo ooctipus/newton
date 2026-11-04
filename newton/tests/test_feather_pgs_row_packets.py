@@ -20,7 +20,7 @@ from newton._src.solvers.feather_pgs.field_group import SolverArrays
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, link_patch_routes, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton._src.solvers.feather_pgs.tree_factor import WALK_FRAME, WALK_LINK, WalkTrees
-from newton.tests.feather_pgs_law_harness import group_rows, row_lines, row_velocity
+from newton.tests.feather_pgs_law_harness import group_rows, row_bias, row_lines, row_velocity
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
     assert_history_close,
@@ -285,12 +285,7 @@ def _run_general(data, layout, beta):
                 ROWS,
                 0,
                 ROWS,
-                data.dt,
-                data.speculative_scale,
-                data.contact_w,
-                threshold,
-                int(data.contact_w < 1.0),
-                0,
+                row_bias(data.dt, data.speculative_scale, data.contact_w, threshold, data.contact_w < 1.0, 0),
             ],
             device=device,
         )

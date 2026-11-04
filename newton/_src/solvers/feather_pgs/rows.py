@@ -48,6 +48,7 @@ from .joint_table import bind as bind_joint_table
 from .joint_table import bind_free_bodies
 from .kernel_template import KernelTemplate, params
 from .kernels import (
+    RowBias,
     allocate_link_slots,
     allocate_rigid_velocity_limit_slots,
     allocate_world_contact_slots,
@@ -1187,6 +1188,14 @@ class RowLaws:
         placement = solver.placement
         self._bias(solver, dt, placement.mf_constraint_count, placement.mf_max_constraints, placement.body_base)
 
+    def bias(self, solver, dt: float) -> RowBias:
+        """The rows' law's step parameters (:class:`.kernels.RowBias`) of a step of ``dt``."""
+        bias = RowBias()
+        bias.dt, bias.speculative_scale = dt, solver.options.contact_speculative_scale
+        bias.contact_w, bias.restitution_threshold = self.contact_w, self.effective_restitution_velocity_threshold
+        bias.weighted, bias.material = int(self.set.weighted), int(solver.options.contact_compliance)
+        return bias
+
     def _bias(self, solver, dt: float, counts: wp.array, capacity: int, base: int) -> None:
         """The rows' bias launch over a class of rows: ``counts`` a world, at most ``capacity``, from row ``base``."""
         # A world's lanes: its capacity, up to a block.
@@ -1201,12 +1210,7 @@ class RowLaws:
                 capacity,
                 base,
                 lanes,
-                dt,
-                solver.options.contact_speculative_scale,
-                self.contact_w,
-                self.effective_restitution_velocity_threshold,
-                int(self.set.weighted),
-                int(solver.options.contact_compliance),
+                self.bias(solver, dt),
             ],
             device=solver.model.device,
         )
@@ -1274,12 +1278,7 @@ class RowLaws:
             self.mimic_slot if blocks and self.mimic_slot is not None else dummy_int,
             self.link_slot if blocks and self.link_slot is not None else dummy_int,
             self.joint_seeds(solver, state_in),
-            dt,
-            solver.options.contact_speculative_scale,
-            self.contact_w,
-            self.effective_restitution_velocity_threshold,
-            int(self.set.weighted),
-            int(solver.options.contact_compliance),
+            self.bias(solver, dt),
         ]
         wp.launch(
             walk_rows.writer_kernel(solver),
@@ -1321,12 +1320,7 @@ class RowLaws:
                 law,
                 sink,
                 self.joint_seeds(solver, state_in),
-                dt,
-                solver.options.contact_speculative_scale,
-                self.contact_w,
-                self.effective_restitution_velocity_threshold,
-                int(self.set.weighted),
-                int(solver.options.contact_compliance),
+                self.bias(solver, dt),
             ],
             device=model.device,
         )
@@ -1353,12 +1347,7 @@ class RowLaws:
                 contact_input,
                 law,
                 solver.v_hat,
-                dt,
-                solver.options.contact_speculative_scale,
-                self.contact_w,
-                self.effective_restitution_velocity_threshold,
-                int(self.set.weighted),
-                int(solver.options.contact_compliance),
+                self.bias(solver, dt),
             ],
             device=solver.model.device,
         )

@@ -13,7 +13,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     compute_world_contact_bias,
 )
-from newton.tests.feather_pgs_law_harness import row_lines
+from newton.tests.feather_pgs_law_harness import row_bias, row_lines
 
 _MU_JAW, _MU_BOX = 5.0, 0.5
 _BOX_HALF, _JAW_HALF_T, _GAP0 = 0.02, 0.005, 0.001
@@ -350,7 +350,7 @@ def _rhs_for_family(family: str, *, phi, row_beta, dt, device="cpu"):
         first=row_lines(device),
     )
     count = wp.array([3], dtype=wp.int32, device=device)
-    inputs = [rows, zeros(), count, 3, base, 3, dt, 1.0, 1.0, 0.0, 0, 0]
+    inputs = [rows, zeros(), count, 3, base, 3, row_bias(dt, 1.0, 1.0, 0.0, 0, 0)]
     wp.launch(compute_world_contact_bias, dim=(1, 3), inputs=inputs, device=device)
     return rhs.numpy()[0, base:]
 

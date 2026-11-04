@@ -17,6 +17,7 @@ import warp as wp
 from .contact_input import ContactInput
 from .dense_rows import UNIT_CONTACT, DenseRows, unit_source
 from .friction_patches import PatchRowLaw, patch_row_law
+from .kernels import RowBias
 from .walk_rows import (
     JointSeeds,
     RowSink,
@@ -55,12 +56,7 @@ def produce_contacts(
     slots: SlotRows,
     sink: RowSink,
     law: PatchRowLaw,
-    dt: float,
-    contact_speculative_scale: float,
-    contact_w: float,
-    restitution_velocity_threshold: float,
-    weighted: int,
-    material: int,
+    bias: RowBias,
 ):
     """Publish each contact's rows in their original collision order, one thread per row (3 per contact, 4 under
     contact torsion): its records by the contact law (:func:`.row_build.write_contact_row`), then the row walked as
@@ -83,10 +79,7 @@ def produce_contacts(
     unit = read_row_unit(rows, data, law, JointSeeds(), data.first[world], slot + row, source)
     unit.group = slots.dense_group[world]
     walk_slot_row(sink, unit)
-    slot_header(
-        rows, slots, data, data.incident, unit, dt, contact_speculative_scale, contact_w,
-        restitution_velocity_threshold, weighted, material,
-    )  # fmt: skip
+    slot_header(rows, slots, data, data.incident, unit, bias)
 
 
 def launch_contacts(solver, data: ContactInput, dt: float) -> None:
@@ -107,12 +100,7 @@ def launch_contacts(solver, data: ContactInput, dt: float) -> None:
             bind_slot_rows(solver),
             packed_sink(solver),
             patch_row_law(solver),
-            dt,
-            solver.options.contact_speculative_scale,
-            laws.contact_w,
-            laws.effective_restitution_velocity_threshold,
-            int(laws.set.weighted),
-            int(solver.options.contact_compliance),
+            laws.bias(solver, dt),
         ],
         extent=data.count,
     )
