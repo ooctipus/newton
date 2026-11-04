@@ -1487,8 +1487,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
         motion-velocity owner forced alike (its one-pass motion repair every time). Every held-tree
         launch, those at construction included, is checked before it runs, and every kernel each
         group bound must have run in a launch of that group's cache. These groups are per-size trees
-        on kinetic plans; ``tools/fpgs_bench/test_held_tree_ab.py`` checks the launches of sparse
-        single trees, on kinetic and chain-scan plans, and of forest groups.
+        on kinetic plans.
         """
         device = wp.get_device(device)
         launched = []

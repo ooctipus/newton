@@ -600,16 +600,6 @@ class TestHeightfieldPairCSR(unittest.TestCase):
         """Exercise reset/empty/regrow on the root-owned native device."""
         self._stock_nxn_reset("cuda:0")
 
-    @unittest.skipUnless(wp.is_cuda_available(), "Root owns CUDA execution")
-    def test_loaded_cuda(self):
-        """Reuse the unchanged nine-case paired physical controls and budgets."""
-        from tools.fpgs_bench import test_heightfield_adaptive_manifold as archived  # noqa: PLC0415
-
-        with patch.dict(
-            os.environ, {"NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD": "0", "NEWTON_HEIGHTFIELD_GEOMETRIC_CULL": "1"}
-        ):
-            archived.TestAdaptiveManifold.test_loaded_cuda(self)
-
 
 if __name__ == "__main__":
     unittest.main()

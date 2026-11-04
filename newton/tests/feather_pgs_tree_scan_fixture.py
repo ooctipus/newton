@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared machinery of the tree-scan and tree-pass tests and ``tools/fpgs_bench/tree_scan_bench.py``.
+"""Shared machinery of the tree-scan and tree-pass tests.
 
 Tree shapes, every held-tree scan configuration compiled as a stand-alone
 native on a held tree's scratch layout (to compare with a float64 reference or

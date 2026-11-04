@@ -3,9 +3,11 @@
 
 """Exercise current geometric triangle rejection and its complete fallback."""
 
+import hashlib
 import json
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -18,6 +20,103 @@ from newton._src.geometry.narrow_phase import NarrowPhase, write_contact_simple
 from newton._src.utils.heightfield import HeightfieldData
 from newton.tests.test_heightfield_cell_reject import make_model
 from newton.tests.test_heightfield_packed_pairs import logical
+
+# Recorded G1 terrain geometry (96 stratified pairs per GPU arm); the saved-current check skips without it.
+CAPTURE = Path(os.environ.get("NEWTON_TEST_HEIGHTFIELD_CAPTURE", "/tmp/fpgs-g1-geometry-paired16k-20260913-01"))
+PINS = (
+    "09a540b0e88f3411cb26e8cbf6288ea89f521fa552ec939870795b4debd0952d",
+    "4751dd0fc1d1dddaccc66087df73c36b8f356173be1a79516ad17395fba60eb0",
+)
+
+
+def quat_matrix(q):
+    """Independent normalized rigid rotation, with xyzw input."""
+    q = np.asarray(q, dtype=float)
+    q = q / np.linalg.norm(q)
+    v = np.eye(3)
+    return (v + 2 * np.cross(q[:3], np.cross(q[:3], v) + q[3] * v)).T
+
+
+def current_fixture(gpu, device):
+    """Reproduce the exact existing stratified 96-pair selection and materials."""
+    path = CAPTURE / f"gpu{gpu}/audit.geometry.npz"
+    if not path.is_file():
+        raise unittest.SkipTest("Recorded G1 geometry unavailable; set NEWTON_TEST_HEIGHTFIELD_CAPTURE to replay it")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != PINS[gpu]:
+        raise RuntimeError("Changed saved current geometry")
+    z = dict(np.load(path, allow_pickle=False))
+    pairs = z["mesh_pairs"][np.argsort(z["mesh_pairs"][:, 1])]
+    selected = pairs[np.linspace(0, len(pairs) - 1, 96, dtype=np.int64)]
+    terrain = int(selected[0, 0])
+    hfd = z["heightfield_data"][z["shape_heightfield_index"][terrain]]
+    heightfield = newton.Heightfield(
+        z["heightfield_elevations"].reshape(int(hfd["nrow"]), int(hfd["ncol"])),
+        nrow=int(hfd["nrow"]),
+        ncol=int(hfd["ncol"]),
+        hx=float(hfd["hx"]),
+        hy=float(hfd["hy"]),
+        min_z=float(hfd["min_z"]),
+        max_z=float(hfd["max_z"]),
+    )
+    mesh = newton.Mesh(z["hull_0_vertices"], z["hull_0_indices"])
+    builder = newton.ModelBuilder()
+
+    def cfg(i):
+        return builder.ShapeConfig(
+            margin=float(z["shape_margin"][i]),
+            gap=float(z["shape_gap"][i]),
+            mu=float(z["shape_material_mu"][i]),
+            restitution=float(z["shape_material_restitution"][i]),
+        )
+
+    pose = z["geom_transform"][terrain]
+    builder.add_shape_heightfield(heightfield=heightfield, xform=wp.transform(pose[:3], pose[3:]), cfg=cfg(terrain))
+    for _, shape in selected:
+        pose = z["geom_transform"][shape]
+        body = builder.add_body(xform=wp.transform(pose[:3], pose[3:]))
+        builder.add_shape_convex_hull(body=body, mesh=mesh, scale=z["shape_scale"][shape], cfg=cfg(shape))
+    model = builder.finalize(device=device)
+    np.testing.assert_array_equal(model.heightfield_elevations.numpy(), z["heightfield_elevations"])
+    filtered = wp.array([[0, i + 1] for i in range(96)], dtype=wp.vec2i, device=device)
+    return model, model.state(), filtered
+
+
+def current_snapshot(pipeline, state, contacts):
+    """Read and own current output bytes only at an untimed test boundary."""
+    pipeline.narrow_phase.check_buffer_capacity()
+    n = int(contacts.rigid_contact_count.numpy()[0])
+    nt = int(pipeline.narrow_phase.triangle_pairs_count.numpy()[0])
+    if not 0 <= n <= contacts.rigid_contact_max or not 0 <= nt <= pipeline.narrow_phase.triangle_pairs.shape[0]:
+        raise AssertionError("Truncated diagnostic buffer")
+    triples = pipeline.narrow_phase.triangle_pairs.numpy()[:nt].copy()
+    marked = triples[:, 2] < 0
+    triples[marked, 2] = ~triples[marked, 2]
+    p0, p1 = (getattr(contacts, "rigid_contact_point" + side).numpy()[:n].copy() for side in ("0", "1"))
+    shape0 = contacts.rigid_contact_shape0.numpy()[:n]
+    shapes = contacts.rigid_contact_shape1.numpy()[:n].copy()
+    poses = state.body_q.numpy()
+    if np.any(shape0 != 0) or np.any(shapes < 1) or np.any(shapes > len(poses)):
+        raise AssertionError("Invalid public contact shape routing")
+    world1 = np.array(
+        [poses[s - 1, :3] + quat_matrix(poses[s - 1, 3:]) @ v for s, v in zip(shapes, p1, strict=True)]
+    ).reshape((-1, 3))
+    normal = contacts.rigid_contact_normal.numpy()[:n].copy()
+    distance = np.einsum("ij,ij->i", world1 - p0, normal)
+    if not all(np.isfinite(v).all() for v in (p0, world1, normal, distance)):
+        raise AssertionError("Nonfinite public contacts")
+    if n and np.max(np.abs(np.linalg.norm(normal, axis=1) - 1.0)) > 2e-4:
+        raise AssertionError("Invalid public contact normals")
+    return {
+        "triples": triples,
+        "marked_triples": triples[marked].copy(),
+        "marked": int(marked.sum()),
+        "shape": shapes,
+        "point": p0,
+        "normal": normal,
+        "distance": distance,
+        "count": n,
+    }
+
 
 FLAGS = {
     "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
@@ -289,9 +388,6 @@ class TestHeightfieldGeometricCull(unittest.TestCase):
 
     def check_saved_current(self, device):
         """Check actual saved current pairs and every omitted original callback."""
-        from tools.fpgs_bench.test_heightfield_finite_geometry import current_fixture  # noqa: PLC0415
-        from tools.fpgs_bench.test_heightfield_finite_geometry import snapshot as current_snapshot  # noqa: PLC0415
-
         reports = []
         for gpu in (0, 1):
             model, state, pairs = current_fixture(gpu, device)

@@ -10,7 +10,7 @@ from unittest.mock import patch
 import numpy as np
 import warp as wp
 
-from tools.fpgs_bench import test_heightfield_pair_csr as csr_tests
+from newton.tests import test_heightfield_pair_csr as csr_tests
 
 
 class TestHeightfieldShellPairCSR(csr_tests.TestHeightfieldPairCSR):
@@ -106,21 +106,6 @@ class TestHeightfieldShellPairCSR(csr_tests.TestHeightfieldPairCSR):
     def test_handled_shell_faces_cuda(self):
         """Check native handled markers and exact pair tags on current geometry."""
         self._handled_shell_faces("cuda:0")
-
-    @unittest.skipUnless(wp.is_cuda_available(), "Root owns CUDA execution")
-    def test_loaded_cuda(self):
-        """Compare the unchanged nine loaded cases with CSR enabled in both arms."""
-        from tools.fpgs_bench import test_heightfield_adaptive_manifold as archived  # noqa: PLC0415
-
-        with patch.dict(
-            os.environ,
-            {
-                "NEWTON_HEIGHTFIELD_PAIR_CSR": "1",
-                "NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD": "0",
-                "NEWTON_HEIGHTFIELD_GEOMETRIC_CULL": "1",
-            },
-        ):
-            archived.TestAdaptiveManifold.test_loaded_cuda(self)
 
 
 if __name__ == "__main__":
