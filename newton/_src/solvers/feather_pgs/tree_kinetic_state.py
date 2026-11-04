@@ -42,7 +42,7 @@ from .factor.walk import (
     walk_loads_prelude,
 )
 from .field_group import Field
-from .kernel_template import Dispatch, KernelTemplate, python_kernel
+from .kernel_template import KernelTemplate, items, python_kernel
 from .publication_data import PublicationData
 from .spatial_laws import (
     GEOMETRY_REQUEST,
@@ -2193,7 +2193,6 @@ def _half_kernel(prefix, schedules, layout, response, classes, flag, body, prelu
         FLAG=flag,
         **fragments,
     )
-    _, _, _sub, _ = _thread_helpers(layout)
     params = (
         ("p", GroupTrees),
         ("d", HeldResponse),
@@ -2208,12 +2207,7 @@ def _half_kernel(prefix, schedules, layout, response, classes, flag, body, prelu
         params,
         source,
         # A packed group of trees per block: the block's group and this thread's tree in it.
-        Dispatch(
-            "block, _ = wp.tid()\ngroup = block * wp.static(pack) + _sub()\n$CALL",
-            ("group",),
-            (("group", int),),
-            constants=(("pack", layout.pack), ("_sub", _sub)),
-        ),
+        items("group", groups=layout.pack, lanes=layout.lanes),
         composed=True,
         launch_bounds=(layout.block, min(24, PREDICTOR_THREADS // layout.block)),
     ).kernel()
@@ -2281,7 +2275,6 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
     straight-line code (:meth:`.tree_scan.WalkClass.walk` up to :data:`.tree_scan.WALK_UNROLL` coordinates), the
     walk up of ``trial.force`` into registers and the walk down into ``trial.response``, ``P^T L^-T L^-1 P f`` on the
     all-``K`` walk (:func:`.tree_scan.walk_texts`). A prescribed root responds with zero."""
-    from .kernel_template import THREADS  # noqa: PLC0415
     from .tree_scan import WALK_UNROLL  # noqa: PLC0415
 
     sizes = {"coordinate": WALK_COORDINATE, "link": WALK_LINK}
@@ -2326,7 +2319,7 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
         _predictor_name("tree_kinetic_walk", layout, None, "sparse", classes),
         (("groups", int), ("p", GroupTrees), ("plan", HeldPlan), ("walk", WalkTrees), ("trial", TrialWords)),
         substitute(_WALK_SOLVE, ROOT_COUNT=len(_walk_roots(layout)), ROOTS="\n".join(cases)),
-        THREADS,
+        items("tid", flat=True),
         preludes=(walk_down_prelude(walked_classes, WALK_UNROLL),) if walked_classes else (),
         dual=True,
         native_name="tree_kinetic_walk_native",

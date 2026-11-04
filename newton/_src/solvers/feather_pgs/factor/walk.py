@@ -20,10 +20,11 @@ from string import Template
 import numpy as np
 import warp as wp
 
+from ....core import memory
 from ....core.execution import Use, Work
 from ....sim import JointType
 from .. import tree_scan as ts
-from ..device_preludes import DevicePrelude, substitute
+from ..device_preludes import DevicePrelude, memory_words, substitute
 from ..tree_scan import WALK_AHEAD, WALK_BOTH, WALK_TOUCH, WALK_UNROLL, WalkClass, indent_text
 
 __all__ = [
@@ -1019,14 +1020,7 @@ _WALK_ACCESS = """    // The class emitter's reads, ahead of its chain, by the o
         WALK_READ_LINK(WALK_PLAIN, in.l, link, b, up);
         return in;
     };
-    const auto WALK_LOAD = [&](const float* p) -> float { return *p; };
-    // A lane group's fetch of a byte range into L1, one line a lane a trip (WALK_TOUCH: none on the CPU).
-    const auto WALK_FETCH = [&](const void* start, const int bytes, const int lane, const int lanes) {
-        const size_t end = reinterpret_cast<size_t>(start) + (size_t)bytes;
-        for (size_t line = (reinterpret_cast<size_t>(start) & ~(size_t)127) + (size_t)128 * lane; line < end;
-             line += (size_t)128 * lanes)
-            WALK_TOUCH(line);
-    };"""
+    const auto WALK_LOAD = [&](const float* p) -> float { return *p; };"""
 
 
 def _walk_down(classes: tuple[WalkClass, ...], unroll: int, ahead: int | None) -> str:
@@ -1111,8 +1105,8 @@ $classes"""
 _LEAVE_CLASS = """    // The group's lanes fetch the tree's changes and velocity into L1; lane 0 prepares the change (ready) and walks the
     // tree down (WALK_DOWN: its records and links asked of L1 WALK_TOUCH items ahead, loaded WALK_AHEAD items ahead;
     // a whole tree fetched at the start overflows L1, chain_106's 22 trees an SM hold 230 KB).
-    WALK_FETCH(change, $span, lane, lanes);
-    WALK_FETCH(v, n * 4, lane, lanes);
+    FETCH(change, $span, lane, lanes);
+    FETCH(v, n * 4, lane, lanes);
 $release    if (lane == 0) {
         ready();
         WALK_DOWN($cls, data, link, read, prior, qd, twist);
@@ -1219,7 +1213,7 @@ def walk_leave_kernel(
         release: Whether a tree of the classes can slip (:attr:`.tree_factor.TreeFactor.walk_slip_capacity`).
         nodes: Each class's node of each coordinate, or ``None`` for the walk's own coordinates.
     """
-    from ..kernel_template import THREADS, KernelTemplate  # noqa: PLC0415
+    from ..kernel_template import KernelTemplate, items  # noqa: PLC0415
 
     if nodes is not None and (
         len(nodes) != len(classes) or any(len(k) != walk.coordinates for k, walk in zip(nodes, classes, strict=True))
@@ -1243,8 +1237,12 @@ def walk_leave_kernel(
             ("v_out", wp.array[float]),
         ),
         body,
-        THREADS,
-        preludes=((walk_paths_prelude(1),) if release else ()) + (walk_down_prelude(classes, WALK_UNROLL),),
+        items("tid", flat=True),
+        preludes=(
+            memory_words(memory.Place.STREAMED),
+            *((walk_paths_prelude(1),) if release else ()),
+            walk_down_prelude(classes, WALK_UNROLL),
+        ),
         dual=True,
         native_name="walk_leave_native",
     ).kernel()
@@ -1365,7 +1363,7 @@ _ENTER = """    if (tid >= arts.shape[0]) return;
 def walk_enter_kernel() -> wp.Kernel:
     """Each held tree's coordinates of a velocity in the walk's frame, ``u = L^T P v`` (``WALK_ENTER``), a thread per
     tree, at its world coordinates: what the audit reads the walked rows against (:mod:`.audit`)."""
-    from ..kernel_template import THREADS, KernelTemplate  # noqa: PLC0415
+    from ..kernel_template import KernelTemplate, items  # noqa: PLC0415
 
     return KernelTemplate(
         "walk_enter",
@@ -1378,7 +1376,7 @@ def walk_enter_kernel() -> wp.Kernel:
             ("coordinates", wp.array2d[float]),
         ),
         substitute(_ENTER, coordinate=WALK_COORDINATE, link=WALK_LINK),
-        THREADS,
+        items("tid", flat=True),
         preludes=(walk_paths_prelude(1),),
         dual=True,
         native_name="walk_enter_native",
