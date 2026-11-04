@@ -16,8 +16,8 @@ A step calls :meth:`Placement.begin` (clear the allocation state), then the row 
 (:meth:`Placement.place_sorted_contact_rows`, :meth:`Placement.latch_status`, :meth:`Placement.warn_overflow`),
 :meth:`Placement.diagonals`, :meth:`Placement.prepare_impulses` and :meth:`Placement.pack_free_body_meta`.
 
-It also holds which placement the class takes: the native sparse size, the sparse-diagonal pair, the row producers and
-the local owners' per-world claim. The row pass and the sweeps read its fields.
+It also holds which placement the class takes: the native sparse size, the sparse-diagonal pair and the row producers.
+The row pass and the sweeps read its fields.
 """
 
 from __future__ import annotations
@@ -811,11 +811,11 @@ class Placement:
         (``Contacts.rigid_contacts_pair_sorted``), whose determinism Newton promises when the
         solver is deterministic as well; the default pipeline keeps the allocator's atomic
         reservation, whose order on CUDA follows the warps. A captured step keeps the order of
-        its capture. Dense rows are placed unless the local row packets or keyed rows place
-        their own; matrix-free rows are placed with free rigid bodies. ``units``: the one writer's unit sources, which
-        follow the placed slots (empty where the writer does not take the contact rows).
+        its capture. Dense rows are placed unless the keyed rows place their own; matrix-free rows are placed with free
+        rigid bodies. ``units``: the one writer's unit sources, which follow the placed slots (empty where the writer
+        does not take the contact rows).
         """
-        order_dense = int(self.row_packets is None and self.keyed_rows is None)
+        order_dense = int(self.keyed_rows is None)
         order_mf = int(self.forest.has_free_rigid_bodies)
         if not (order_dense or order_mf):
             return
@@ -1065,18 +1065,18 @@ class Placement:
 
     def diagonals(self) -> None:
         """The dense rows' diagonals, by the placement that holds them (:attr:`.step_plan.StepPlan.response`): the packed
-        rows' start from zero for the one writer's ``|Z|^2 + cfm`` (local row packets keep their worlds' private seeds);
-        the sparse diagonal's and native sparse factors' writers store theirs with its CFM. The free bodies' rows, from
-        ``body_base``, keep theirs: their writers stored them in the row pass (:mod:`.walk_rows`). The stage list runs it
-        where the packed rows hold the response and no local row packets do (:attr:`clears_diagonals`)."""
+        rows' start from zero for the one writer's ``|Z|^2 + cfm``; the sparse diagonal's and native sparse factors'
+        writers store theirs with its CFM. The free bodies' rows, from ``body_base``, keep theirs: their writers stored
+        them in the row pass (:mod:`.walk_rows`). The stage list runs it where the packed rows hold the response
+        (:attr:`clears_diagonals`)."""
         dim = (self.diag.shape[0], self.body_base)
         wp.launch(_clear_dense_diagonals, dim=dim, outputs=[self.diag], device=self.model.device)
 
     @property
     def clears_diagonals(self) -> bool:
         """Whether the dense rows' diagonals start from zero each step (:meth:`diagonals`): the packed rows hold the
-        response and no local row packets keep their worlds' private seeds."""
-        return bool(self.packed_response and self.row_packets is None)
+        response."""
+        return bool(self.packed_response)
 
     def pack_free_body_meta(self) -> None:
         """Pack the free bodies' rows' metadata for the matrix-free sweeps (staged only with free bodies, the only

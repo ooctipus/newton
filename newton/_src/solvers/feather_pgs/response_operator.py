@@ -24,7 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from ...core.memory import Buffer
-from .factor.walk import WALK_COORDINATE, WALK_LINK, WALK_UNPACKED, walk_paths_prelude, walk_row_prelude
+from .factor.walk import WALK_COORDINATE, WALK_LINK
 from .solve_policy import Change, bound, terms_bound
 
 Vector = Callable[[str], str]
@@ -120,8 +120,6 @@ class ResponseOperator:
     """
 
     name = "response"
-    residual_includes_rhs = False
-    """Whether :meth:`residual` gives the whole residual ``J v + rhs`` (a maintained residual) or ``J v``."""
     applies = True
     """Whether :meth:`apply` writes state the row's lanes share (the velocity, a maintained residual), so the lanes
     synchronize after it. An impulse-space operator without apply leaves every lane its own copy of the impulses."""
@@ -161,10 +159,6 @@ class ResponseOperator:
             return f"{residual} * {self.inverse(row)}"
         return f"{residual} / {self.diagonal(row)}"
 
-    def velocity_term(self, residual: str, rhs: str, jv: str) -> str:
-        """``J v`` of the row: the reduced ``jv``, or the maintained residual less its right-hand side."""
-        return f"{residual} - {rhs}" if self.residual_includes_rhs else jv
-
     def terms(self, out: str, rhs: str, *, whole: bool) -> str:
         """``S_i`` of a sum this operator reduced into ``out``, the magnitude of the terms its velocity sum adds, or a
         lower bound of it, which the exit law scales a row's floor by (:class:`.solve_policy.Change`).
@@ -180,8 +174,7 @@ class ResponseOperator:
         return NotImplementedError(f"{type(self).__name__} has no {action}")
 
     def residual(self, out: str, indent: str) -> str:
-        """``float out = J_i v`` of the visited row (every lane holds it), or its whole maintained residual
-        (:attr:`residual_includes_rhs`)."""
+        """``float out = J_i v`` of the visited row (every lane holds it)."""
         raise self._lacks("residual")
 
     def row_velocity(self, out: str, row: str, indent: str) -> str:
@@ -190,7 +183,7 @@ class ResponseOperator:
 
     def sibling_residual(self, out: str, sibling: str, indent: str, rhs: str) -> str:
         """``float out = J_s v + rhs`` of the friction sibling ``sibling``: its row velocity, then its right-hand
-        side ``rhs``. An operator that maintains residuals reads the sibling's whole."""
+        side ``rhs``."""
         return f"{self.row_velocity(out, sibling, indent)}\n{indent}{out} += {rhs};"
 
     def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
@@ -212,7 +205,7 @@ class ResponseOperator:
         lines = []
         if own:
             lines.append(self.residual("residual", indent))
-            lines.append("" if self.residual_includes_rhs else f"{indent}residual += {rhs(row)};")
+            lines.append(f"{indent}residual += {rhs(row)};")
         lines += [
             self.sibling_residual("sibling_residual", sibling, indent, rhs(sibling)),
             self.coupling("cross", row, sibling, indent),
@@ -582,63 +575,6 @@ class FreeBodyZ(ResponseOperator):
         if self.lanes.parallel:
             text = f"if ({self.lanes.lane} == 0) {{\n{text}\n}}"
         return "\n".join(indent + line for line in text.split("\n"))
-
-
-class ResidualBlock(ResponseOperator):
-    """The arithmetic of a staged response block ``A`` (``s_A``) whose rows keep their whole residual (``s_res``).
-
-    Row ``r``'s residual ``rhs + J_r v`` is maintained in ``s_res[r]``: a
-    change ``delta`` of row ``i`` adds ``A[i][r] delta`` to every row ``r`` of
-    the block (``rows``), lane-strided, and the pair coupling ``J_i Y_s`` is the
-    entry ``A[s][i]``. A layout places entry ``A[i][r]`` (:meth:`entry`); a view
-    of a later range of the block's rows maps its row indices to block rows
-    (:meth:`block_row`).
-    """
-
-    residual_includes_rhs = True
-
-    def block_row(self, row: str) -> str:
-        """The block row of the view's row ``row``."""
-        return row
-
-    def entry(self, source: str, target: str) -> tuple[str, str]:
-        """``(statements, index)`` of ``A[source][target]``, the response of row ``target`` to row ``source``."""
-        raise NotImplementedError
-
-    def residual(self, out: str, indent: str) -> str:
-        return f"{indent}float {out} = s_res[{self.block_row('i')}];"
-
-    def sibling_residual(self, out: str, sibling: str, indent: str, rhs: str) -> str:
-        """The sibling's maintained residual, which holds its right-hand side ``rhs`` already."""
-        return f"{indent}float {out} = s_res[{self.block_row(sibling)}];"
-
-    def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
-        """``J_i Y_s``, the pair's off-diagonal entry, as the block stores it (``A[s][i]``)."""
-        setup, index = self.entry(self.block_row(sibling), self.block_row(row))
-        lead = f"{indent}{setup}\n" if setup else ""
-        return f"{lead}{indent}float {out} = s_A[{index}];"
-
-    def spin_terms(self, row: str, sibling: str, spin: str, rhs: Callable[[str], str], indent: str) -> str:
-        """The spin row's maintained residual and its couplings with the tangents (``A[p][i]``, ``A[p][s]``), each
-        entry read in a scope of its own: a layout's setup declares its indices."""
-        lines = [self.sibling_residual("spin_residual", spin, indent, rhs(spin))]
-        for out, source in (("spin_cross", row), ("spin_cross_sibling", sibling)):
-            setup, index = self.entry(self.block_row(spin), self.block_row(source))
-            read = f"{out} = s_A[{index}];"
-            lines.append(f"{indent}float {out};\n{indent}{{ {setup} {read} }}" if setup else f"{indent}float {read}")
-        return "\n".join(lines)
-
-    def apply_row(self, row: str, delta: str, indent: str) -> str:
-        lane, width = self.lanes.lane, self.lanes.width
-        setup, index = self.entry(self.block_row(row), "r")
-        head = f"{indent}for (int r = {lane}; r < {self.rows}; r += {width})"
-        update = f"s_res[r] += s_A[{index}] * {delta};"
-        if not setup:
-            return f"{head} {update}"
-        return f"{head} {{\n{indent}    {setup}\n{indent}    {update}\n{indent}}}"
-
-    def apply(self, delta: str, indent: str) -> str:
-        return self.apply_row("i", delta, indent)
 
 
 def _applied_sum(out: str, start: str, response: Callable[[str], str], applied: Callable[[str], str], rows: str):
@@ -1210,399 +1146,6 @@ class SparsePairZ(ResponseOperator):
             f"if (apply_coord >= 0) {self.velocity.at('apply_coord')} += apply_z * {delta};",
         ]
         return "".join(f"\n{indent}{line}" for line in "\n".join(lines).split("\n"))
-
-
-@dataclass(frozen=True)
-class LocalBlock(ResidualBlock):
-    """The response block of a local owner's rows, whitened by the walk and stored as a packed lower triangle (FL3.6).
-
-    The owner's ``dense`` rows act on its ``dofs`` coordinates: its tree's ``primary`` coordinates, in the tree's
-    coordinate order, then a paired free body's ``secondary`` six, a one-body tree of the same walk. The block holds
-    each row's footprints ``z``, staged in ``s_Z`` (row ``r`` from ``r * dofs``, :meth:`respond`): the walk of the
-    row's seeds in the kernel (:class:`.row_inputs.CompactLocalRows`), or the one writer's stored rows
-    (:class:`.row_inputs.StoredLocalRows`). With ``bodies`` (at most the primary tree's bodies) the kernel walks
-    seeds, and the walk's data of the world's trees is staged in shared memory once (``s_walk``, ``s_walk_path``:
-    :meth:`walk_floats`, :meth:`walk_ints`; with ``wrenches`` the step's columns and links too, for wrench seeds);
-    without, it is read in place. With ``release`` the class's drives can slip: a walked row takes the release ``R`` of
-    its tree's slips along their paths (``WALK_RELEASE``, the one writer's rows carry it already; the step's one leave
-    takes ``R^T``, :func:`.factor.walk.walk_leave_kernel`).
-    With ``free``, the world's free-body rows (``free_count``, :class:`FreeBodyZ` entries read in place, their
-    ``mf_meta`` words from ``off_meta``) follow the dense rows in the block: they act on the paired free body, whose
-    coordinates are the last block's, so a free row's terms are its ``Z`` against the body's ``u`` and the dense rows'
-    ``Z`` there.
-
-    ``s_A`` holds the lower triangle of the Gram matrix ``A = Z^T Z``:
-    ``A[hi][lo] = Z_hi Z_lo`` (``hi >= lo``) at ``hi (hi + 1) / 2 + lo``, built
-    lane-strided over the packed entries, each a sum in coordinate order from
-    zero (:meth:`assemble`); either row of an entry reads it. The residuals
-    start at the rows' right-hand sides, their incident velocities included.
-    The velocity change is committed once after the sweeps, ``u = sum_r Z_r
-    applied_r`` over every row of the block in row order (:meth:`commit`), and goes to
-    the step's one leave in the walk's coordinates (:attr:`.factor.walk.WalkTrees.du`). A view of the free-body rows
-    addresses them from block row ``first``.
-    """
-
-    dofs: int
-    primary: int = 0
-    bodies: int = 0
-    seeds: bool = False
-    staged: bool = False
-    wrenches: bool = False
-    release: bool = False
-    lanes: Lanes = Lanes()
-    dense: str = "row_count"
-    free: FreeBodyZ | None = None
-    free_count: str = "mf_count"
-    first: str = ""
-    diagonal: Callable[[str], str] | None = None
-    inverse: Callable[[str], str] | None = None
-    name = "local_block"
-
-    @property
-    def rows(self) -> str:
-        """The block's rows: the dense rows, then the free-body rows."""
-        return self.dense if self.free is None else f"{self.dense} + {self.free_count}"
-
-    def block_row(self, row: str) -> str:
-        return f"{self.first} + {row}" if self.first else row
-
-    def entry(self, source: str, target: str) -> tuple[str, str]:
-        a, b = _operand(source), _operand(target)
-        return f"const int hi = {a} > {b} ? {a} : {b}, lo = {a} > {b} ? {b} : {a};", "hi * (hi + 1) / 2 + lo"
-
-    @property
-    def secondary(self) -> int:
-        return self.dofs - self.primary
-
-    @property
-    def coordinate_floats(self) -> int:
-        """Staged floats a coordinate: ``s``, ``ut``, ``1 / ell`` (its record unpacked, :data:`.tree_scan.WALK_STAGED`),
-        then with ``wrenches`` the step's column the finish published, unpacked (six floats, :data:`.factor.walk.WALK_NOW`)."""
-        from .tree_scan import WALK_STAGED  # noqa: PLC0415 (tree_factor imports this module)
-
-        return WALK_STAGED + (6 if self.wrenches else 0)
-
-    @property
-    def link_floats(self) -> int:
-        """Staged floats a body: its offset to its parent's frame, then with ``wrenches`` its frame point (the factor's,
-        where the step's columns are shifted)."""
-        return 6 if self.wrenches else 3
-
-    def walk_floats(self) -> int:
-        """Floats a lane group stages of the walk: every coordinate's, then every primary body's (and with
-        ``wrenches`` the free body's)."""
-        free = 1 if self.wrenches and self.secondary else 0
-        return self.dofs * self.coordinate_floats + (self.bodies + free) * self.link_floats if self.staged else 0
-
-    def walk_ints(self) -> int:
-        """Ints a lane group stages: the primary's path table, the free body's entry, each primary coordinate's body."""
-        return 2 * self.bodies + 2 + self.primary if self.staged else 0
-
-    def walk_preludes(self) -> tuple:
-        """The walk's functions over this block's layout (:func:`.factor.walk.walk_paths_prelude`: the staged copy's
-        strides, or the device walk's), and with ``seeds`` the seed walk its rows' walks bind
-        (:func:`.factor.walk.walk_row_prelude`)."""
-
-        walk = walk_paths_prelude(1)
-        if self.staged:
-            walk = walk_paths_prelude(
-                1, coordinate=self.coordinate_floats, link=self.link_floats, now=self.coordinate_floats
-            )
-        return (walk, walk_row_prelude(1)) if self.seeds else (walk,)
-
-    def prologue(self) -> str:
-        """Bind the world's trees on the walk (``walk``, :class:`.factor.walk.WalkTrees`; articulation ``art``, and
-        ``secondary_art`` with a free body): their data, links and path tables, staged here once (``staged``, the
-        primary tree of at most ``bodies`` bodies) or in place; ``walk_primary()`` and ``walk_free()`` select a tree for
-        the walk's functions; and with ``seeds`` the row seeds' walks a lane runs into ``s_Z`` (``walk_covector`` and,
-        with ``wrenches``, ``walk_wrench``: each returns its incident velocity, the step's ``J`` entries against the
-        staged velocity)."""
-        from .tree_scan import WALK_BOTH, WALK_STAGED  # noqa: PLC0415
-
-        P, S, L = self.primary, self.secondary, self.lanes.width
-        lane = self.lanes.lane
-        lines = [
-            "const int walk_j0 = walk.joint_start.data[art], walk_d0 = walk.dof_start.data[art];",
-            "const int walk_bodies = walk.joint_end.data[art] - walk_j0;",
-        ]
-        if S:
-            lines.append(
-                "const int free_j0 = walk.joint_start.data[secondary_art], free_d0 = walk.dof_start.data[secondary_art];"
-            )
-        if not self.staged:
-            lines += [
-                f"const float* walk_data = walk.data.data + (size_t)walk_d0 * {WALK_COORDINATE};",
-                f"const float* walk_link = walk.link.data + (size_t)walk_j0 * {WALK_LINK};",
-                "const int* walk_path = reinterpret_cast<const int*>(walk.path.data + walk_j0);",
-            ]
-            if self.seeds:
-                lines.append("const int* walk_dof_body = walk.dof_body.data + walk_d0;")
-            if self.wrenches and self.seeds:
-                lines += [
-                    "const float* walk_now = reinterpret_cast<const float*>(walk.now.data + walk_d0);",
-                    f"const float* walk_now_link = walk.now_link.data + (size_t)walk_j0 * {WALK_LINK};",
-                    "float walk_shift[3];",
-                    "WALK_SHIFT(walk, art, walk_shift);",
-                ]
-            if S:
-                lines += [
-                    f"const float* free_data = walk.data.data + (size_t)free_d0 * {WALK_COORDINATE};",
-                    f"const float* free_link = walk.link.data + (size_t)free_j0 * {WALK_LINK};",
-                    "const int* free_path = reinterpret_cast<const int*>(walk.path.data + free_j0);",
-                ]
-                if self.wrenches and self.seeds:
-                    lines += [
-                        "const float* free_now = reinterpret_cast<const float*>(walk.now.data + free_d0);",
-                        f"const float* free_now_link = walk.now_link.data + (size_t)free_j0 * {WALK_LINK};",
-                        "float free_shift[3];",
-                        "WALK_SHIFT(walk, secondary_art, free_shift);",
-                    ]
-        else:
-            C, K, B = self.coordinate_floats, self.link_floats, self.bodies
-            coordinate = "walk_d0 + c" if not S else f"c < {P} ? walk_d0 + c : free_d0 + c - {P}"
-            now = (
-                [
-                    "    float S[6];",
-                    "    WALK_READ_COLUMN(WALK_LDG, S, reinterpret_cast<const float*>(walk.now.data + d),",
-                    f"                     walk.data.data + (size_t)d * {WALK_COORDINATE}, {WALK_BOTH});",
-                    f"    for (int k = 0; k < 6; ++k) s_walk[c * {C} + {WALK_STAGED} + k] = S[k];",
-                ]
-                if self.wrenches
-                else []
-            )
-            lines += [
-                "// The walk's data of the world's trees staged once (FL3_design section 4), every load in flight together:",
-                "// each coordinate's s, ut and 1 / ell unpacked (and the step's column the finish published), each body's link offset",
-                "// (and its frame point), the path tables and each primary coordinate's body.",
-                f"for (int c = {lane}; c < {self.dofs}; c += {L}) {{",
-                f"    const int d = {coordinate};",
-                f"    float r[{WALK_UNPACKED}];",
-                f"    WALK_READ(WALK_LDG, r, walk.data.data + (size_t)d * {WALK_COORDINATE}, {WALK_BOTH});",
-                f"    for (int k = 0; k < {WALK_STAGED}; ++k) s_walk[c * {C} + k] = r[k];",
-                *now,
-                "}",
-                f"for (int b = {lane}; b < walk_bodies; b += {L}) {{",
-                "    float l[6];",
-                f"    WALK_READ_LINK(WALK_LDG, l, walk.link.data + (size_t)walk_j0 * {WALK_LINK}, b,",
-                "                   reinterpret_cast<const int*>(walk.path.data + walk_j0)[2 * b]);",
-                f"    for (int k = 0; k < {K}; ++k) s_walk[{self.dofs * C} + b * {K} + k] = l[k];",
-                "}",
-                f"for (int i = {lane}; i < 2 * walk_bodies; i += {L})",
-                "    s_walk_path[i] = reinterpret_cast<const int*>(walk.path.data + walk_j0)[i];",
-                f"for (int i = {lane}; i < {P}; i += {L}) s_walk_path[{2 * B + 2} + i] = walk.dof_body.data[walk_d0 + i];",
-                f"if ({lane} == 0) {{",
-                f"    s_walk_path[{2 * B}] = -1;",
-                f"    s_walk_path[{2 * B + 1}] = 0;",
-                "}",
-                "const float* walk_data = s_walk;",
-                f"const float* walk_link = s_walk + {self.dofs * C};",
-                "const int* walk_path = s_walk_path;",
-                f"const int* walk_dof_body = s_walk_path + {2 * B + 2};",
-            ]
-            if self.wrenches:
-                lines += [
-                    f"const float* walk_now = s_walk + {WALK_STAGED};",
-                    f"const float* walk_now_link = walk.now_link.data + (size_t)walk_j0 * {WALK_LINK};",
-                    "float walk_shift[3];",
-                    "WALK_SHIFT(walk, art, walk_shift);",
-                ]
-            if S:
-                lines += [
-                    f"const float* free_data = s_walk + {P * C};",
-                    "const float* free_link = walk_link;",
-                    f"const int* free_path = s_walk_path + {2 * B};",
-                ]
-                if self.wrenches:
-                    # The free body's own link: its frame point, where its step columns are shifted.
-                    lines += [
-                        f"if ({lane} == 0) {{",
-                        "    float l[6];",
-                        f"    WALK_READ_LINK(WALK_LDG, l, walk.link.data + (size_t)free_j0 * {WALK_LINK}, 0, -1);",
-                        f"    for (int k = 0; k < {K}; ++k) s_walk[{self.dofs * C + B * K} + k] = l[k];",
-                        "}",
-                        f"const float* free_now = free_data + {WALK_STAGED};",
-                        f"free_link = s_walk + {self.dofs * C + B * K};",
-                        f"const float* free_now_link = walk.now_link.data + (size_t)free_j0 * {WALK_LINK};",
-                        "float free_shift[3];",
-                        "WALK_SHIFT(walk, secondary_art, free_shift);",
-                    ]
-        lines.append(f"const auto walk_primary = [&]() {{ WALK_TREE(walk_path, walk_bodies, {P}); }};")
-        if S:
-            lines.append(f"const auto walk_free = [&]() {{ WALK_TREE(free_path, 1, {S}); }};")
-        if self.seeds:
-            lines += [
-                "// A covector seed weight e_dof of the primary tree walked into the row's footprints z; its incident.",
-                "const auto walk_covector = [&](float* z, const int dof, const float weight) -> float {",
-                "    float incident = 0.0f;",
-                "    const float x[1] = {weight};",
-                "    WALK_ROW(walk_data, walk_link, nullptr, nullptr, nullptr, walk_dof_body[dof], dof, x,",
-                "             [&](int, int c, float y, float j) {",
-                "        z[c] += y;",
-                "        incident += j * s_v[c];",
-                "    });",
-                "    return incident;",
-                "};",
-            ]
-            if self.wrenches:
-                lines += [
-                    "// A wrench seed at body b's walk frame (the factor's), walked into the footprints z of a tree (data,",
-                    "// link, now, now_link, shift: its walk, the step's geometry the finish published and its origins'",
-                    "// difference; v its staged velocity); its incident.",
-                    "const auto walk_wrench = [&](float* z, const float* v, const float* data, const float* link,",
-                    "                             const float* now, const float* now_link, const float* shift, const int b,",
-                    "                             const float* wrench) -> float {",
-                    "    float incident = 0.0f;",
-                    "    WALK_ROW(data, link, now, now_link, shift, b, -1, wrench, [&](int, int c, float y, float j) {",
-                    "        z[c] += y;",
-                    "        incident += j * v[c];",
-                    "    });",
-                    "    return incident;",
-                    "};",
-                ]
-        return "\n".join(lines)
-
-    def respond(self, source, indent: str) -> str:
-        """Stage row ``row``'s footprints ``z`` in ``s_Z``, in the caller's loop over ``row``: the row source's
-        (``source.stage``: the walk of its seeds, or the one writer's stored rows) and declare ``active`` (some entry is
-        nonzero), ``incident`` (its ``J v_hat``) and ``row_diagonal`` (``|z|^2``, in coordinate order)."""
-        lines = [
-            f"const int staged = row * {self.dofs};",
-            source.stage(self),
-            "int active = 0;",
-            "float row_diagonal = 0.0f;",
-            f"for (int c = 0; c < {self.dofs}; ++c) {{",
-            "    const float z = s_Z[staged + c];",
-            "    row_diagonal += z * z;",
-            "    if (z != 0.0f) active = 1;",
-            "}",
-        ]
-        return "\n".join(indent + line if line.strip() else line for line in "\n".join(lines).split("\n"))
-
-    def _free_row(self, free: str, name: str, indent: str, *, word: bool = False) -> str:
-        """Decode free-body row ``free``'s bodies (``{name}_a``, ``{name}_b``) and entry base (``{name}6``).
-
-        With ``word`` the row's whole packed word is read (``{name}_meta``: bodies, inverse diagonal, rhs, type).
-        """
-        packed = f"mf_meta.data[off_meta + ({free}) * 4]"
-        read = (
-            f"{indent}const int4 {name}_meta = *reinterpret_cast<const int4*>(&{packed});\n"
-            f"{indent}const int {name}_dofs = {name}_meta.x;\n"
-            if word
-            else f"{indent}const int {name}_dofs = {packed};\n"
-        )
-        return (
-            f"{read}"
-            f"{indent}const int {name}_a = {name}_dofs >> 16;\n"
-            f"{indent}const int {name}_b = ({name}_dofs << 16) >> 16;\n"
-            f"{indent}const int {name}12 = {self.free.base} + ({free}) * 12;"
-        )
-
-    def _free_terms(self, out: str, other: Callable[[str, str], str], indent: str) -> str:
-        """Add free-body row ``row``'s products with a vector in the block's factor coordinates to ``out``: each side's
-        ``Z`` against the vector on that side's body (``other(side, d)``: coordinate ``d`` of the body at ``side``),
-        body ``a``'s side, then ``b``'s, each from its own sum."""
-        free = self.free
-        lines = []
-        for offset, side in (("", "row_a"), ("6 + ", "row_b")):
-            lines += [
-                f"if ({side} >= 0) {{",
-                "    float side_term = 0.0f;",
-                f"    for (int d = 0; d < 6; ++d) side_term += {free.Z}.data[row12 + {offset}d] * {other(side, 'd')};",
-                f"    {out} += side_term;",
-                "}",
-            ]
-        return "\n".join(indent + line for line in "\n".join(lines).split("\n"))
-
-    def assemble(self, rhs: Vector, indent: str) -> str:
-        """Start every row's residual at its right-hand side (``s_res``, ``s_app`` cleared) and build ``A = Z^T Z``'s
-        lower triangle.
-
-        A dense row's products run over the block's coordinates, a free-body row's over its bodies' six
-        (:meth:`_free_terms`), body ``a``'s side and then ``b``'s; a free-body row's response to a free-body column sums
-        the column's bodies acting on the row's body, ``Z`` against ``Z``.
-        """
-        lane, width, T, free = self.lanes.lane, self.lanes.width, self.dofs, self.free
-        p = indent
-        dense_residual = _at(rhs, "r")
-        lines = [f"{p}{{", f"{p}    const int block_rows = {self.rows};"]
-        lines.append(f"{p}    for (int r = {lane}; r < block_rows; r += {width}) {{")
-        if free is None:
-            lines.append(f"{p}        const float residual = {dense_residual};")
-        else:
-            free_word = f"mf_meta.data[off_meta + (r - {self.dense}) * 4 + 2]"
-            lines.append(
-                f"{p}        const float residual = r < {self.dense} ? {dense_residual} : __int_as_float({free_word});"
-            )
-        lines += [
-            f"{p}        s_res[r] = residual;",
-            f"{p}        s_app[r] = 0.0f;",
-            f"{p}    }}",
-            f"{p}    const int entries = block_rows * (block_rows + 1) / 2;",
-            f"{p}    int hi = 0, start = 0, next = 1;",
-            f"{p}    for (int e = {lane}; e < entries; e += {width}) {{",
-            f"{p}        while (e >= next) {{",
-            f"{p}            start = next;",
-            f"{p}            ++hi;",
-            f"{p}            next += hi + 1;",
-            f"{p}        }}",
-            f"{p}        const int lo = e - start;",
-            f"{p}        float a = 0.0f;",
-        ]
-        dense_entry = f"for (int d = 0; d < {T}; ++d) a += s_Z[hi * {T} + d] * s_Z[lo * {T} + d];"
-        if free is None:
-            lines.append(f"{p}        {dense_entry}")
-        else:
-            q = p + "                "
-            lines += [
-                f"{p}        if (hi < {self.dense}) {{",
-                f"{p}            {dense_entry}",
-                f"{p}        }} else {{",
-                self._free_row(f"hi - {self.dense}", "row", p + "            ", word=True),
-                f"{p}            if (lo < {self.dense}) {{",
-                self._free_terms("a", lambda side, d: f"s_Z[lo * {T} + {side} + {d}]", q),
-                f"{p}            }} else {{",
-                self._free_row(f"lo - {self.dense}", "column", q, word=True),
-                f"{q}for (int d = 0; d < 6; ++d) {{",
-                f"{q}    if (row_a >= 0) {{",
-                f"{q}        float response = 0.0f;",
-                f"{q}        if (column_a == row_a) response += {free.Z}.data[column12 + d];",
-                f"{q}        if (column_b == row_a) response += {free.Z}.data[column12 + 6 + d];",
-                f"{q}        a += {free.Z}.data[row12 + d] * response;",
-                f"{q}    }}",
-                f"{q}    if (row_b >= 0) {{",
-                f"{q}        float response = 0.0f;",
-                f"{q}        if (column_a == row_b) response += {free.Z}.data[column12 + d];",
-                f"{q}        if (column_b == row_b) response += {free.Z}.data[column12 + 6 + d];",
-                f"{q}        a += {free.Z}.data[row12 + 6 + d] * response;",
-                f"{q}    }}",
-                f"{q}}}",
-                f"{p}            }}",
-                f"{p}        }}",
-            ]
-        lines += [f"{p}        s_A[e] = a;", f"{p}    }}", f"{p}}}"]
-        return "\n".join(lines)
-
-    def commit(self, indent: str) -> str:
-        """``u = sum_r Z_r applied_r`` over every row of the block, in row order (zero terms included), the free rows'
-        on their body after the dense rows'; the caller then leaves factor coordinates (:meth:`leave`)."""
-        lane, width, T, free = self.lanes.lane, self.lanes.width, self.dofs, self.free
-        p = indent
-        lines = [
-            f"{p}for (int d = {lane}; d < {T}; d += {width}) {{",
-            f"{p}    float u = 0.0f;",
-            f"{p}    for (int r = 0; r < {self.dense}; ++r) u += s_Z[r * {T} + d] * s_app[r];",
-        ]
-        if free is not None:
-            lines += [
-                f"{p}    for (int f = 0; f < {self.free_count}; ++f) {{",
-                self._free_row("f", "row", p + "        "),
-                f"{p}        const float applied = s_app[{self.dense} + f];",
-                f"{p}        if (row_a >= 0 && d >= row_a && d < row_a + 6) u += {free.Z}.data[row12 + d - row_a] * applied;",
-                f"{p}        if (row_b >= 0 && d >= row_b && d < row_b + 6) u += {free.Z}.data[row12 + 6 + d - row_b] * applied;",
-                f"{p}    }}",
-            ]
-        lines += [f"{p}    s_v[d] = u;", f"{p}}}"]
-        return "\n".join(lines)
 
 
 @dataclass(frozen=True)

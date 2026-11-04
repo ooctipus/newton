@@ -60,7 +60,6 @@ from newton._src.solvers.feather_pgs.factor.walk import (
 from newton._src.solvers.feather_pgs.kernel_template import KernelTemplate, items, params
 from newton._src.solvers.feather_pgs.placement import Placement
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
-from newton._src.solvers.feather_pgs.sweep import PGS_LOCAL_SOLVE_OWNER_GENERAL
 from newton._src.solvers.feather_pgs.tree_factor import prepare_augmented_drives
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_plan import UP_FIRST, UP_SUMS, TreePlan, local_parents
@@ -1407,8 +1406,7 @@ UNITS = (1, 2, 3, 4)
 """Rows a lane walks: a limit, a velocity limit's pair, a point contact, a contact with spin."""
 UNSTORED = ("sparse", "sparse_triplets", "keyed_parallel")
 """The CUDA catalogue's routes whose rows no store holds as ``J``, packed ``Z`` or the walk's slots: native sparse
-factors (rows in factor coordinates, whitened from a ``J`` in shared scratch) and the keyed rows;
-:func:`placement_frames` also counts the row packets' worlds as unstored."""
+factors (rows in factor coordinates, whitened from a ``J`` in shared scratch) and the keyed rows."""
 
 
 def devices() -> list:
@@ -1852,15 +1850,12 @@ def placement_frames(solver, joint_q: np.ndarray, capture) -> dict:
     diagonal's, FL3.5), so no store keeps a row's ``J``:
 
     - ``rows`` and ``leave``: the one writer's worlds, their rows against their physical ``J v_hat`` and their leave
-      against the float64 walk's (:func:`.test_feather_pgs_walk_rows.walked_frames`, ``slot_frames``; Z0's F1);
-    - ``kernel``: the row packets' worlds (FL3.6), whose kernel walks each row's seeds and leaves by the walk: their
-      published ``dv`` against the float64 walk's response of their impulses to the same seeds.
+      against the float64 walk's (:func:`.test_feather_pgs_walk_rows.walked_frames`, ``slot_frames``; Z0's F1).
 
-    The worlds a speed ball acted in are left out (their ``du`` is a law's, not ``sum Z lambda``), and so are the
-    worlds whose rows no store holds (``unstored``: the keyed rows'; and every world of the support placement, case K1,
-    whose rows are :class:`TestSupportPlacement`'s)."""
+    The worlds a speed ball acted in are left out (their ``du`` is a law's, not ``sum Z lambda``), and so is every
+    world of the support placement, case K1 (``unstored``: its rows are :class:`TestSupportPlacement`'s)."""
     forest, placement = solver.forest, solver.placement
-    out = {"rows": 0.0, "leave": 0.0, "kernel": 0.0, "general": 0, "in_kernel": 0, "unstored": 0}
+    out = {"rows": 0.0, "leave": 0.0, "general": 0, "unstored": 0}
     if not getattr(placement, "walks", False) or solver.routes.case == "K1":
         out["unstored"] = int(forest.world_count)
         return out
@@ -1872,88 +1867,6 @@ def placement_frames(solver, joint_q: np.ndarray, capture) -> dict:
     frames = slot_frames if placement.sparse_diagonal_contact_solve else walked_frames
     walked = frames(solver, joint_q, capture)
     out.update(rows=walked["rows"], leave=walked["leave"], general=walked["worlds"])
-    packets = placement.row_packets
-    if packets is None:
-        return out
-    sizes = forest.articulation_response_dof_count.numpy()
-    offsets = forest.articulation_world_dof_offset.numpy()
-    starts = forest.articulation_dof_start.numpy()
-    art_world = forest.art_to_world.numpy()
-    owner = placement.local_solve_owner.numpy()
-    mf_counts = placement.mf_constraint_count.numpy()
-    skip_rows = int(placement.ink_skip_rows())
-    joint_q = np.asarray(joint_q, dtype=np.float64)
-    worlds, D = int(forest.world_count), max(int(forest.max_world_dofs), 1)
-    trees = {}
-
-    def walk_of(art):
-        if art not in trees:
-            walk = solver.factor.walk(joint_q, art)
-            trees[art] = (walk, float(np.linalg.cond(factor_matrix(walk))))
-        return trees[art]
-
-    # The step's published dv in world coordinates; the speed balls' worlds.
-    v_out, v_hat = (np.zeros((worlds, D)) for _ in range(2))
-    for art in range(sizes.size):
-        world, n = int(art_world[art]), int(sizes[art])
-        if world >= 0 and n > 0:
-            dofs = int(starts[art]) + np.arange(n)
-            at = slice(int(offsets[art]), int(offsets[art]) + n)
-            v_out[world, at], v_hat[world, at] = capture.v_out[dofs], capture.v_hat[dofs]
-    dv = v_out - v_hat
-    ball = np.zeros(worlds, dtype=bool)
-    if capture.mf_final is not None:
-        _, _, lam, counts, _, _, _, _, kinds = capture.mf_final
-        for world, live in enumerate(counts):
-            line = int(capture.mf_first[world])
-            for row in range(int(live)):
-                if kinds[line, row] == PGS_CONSTRAINT_TYPE_SPEED:
-                    ball[world] |= lam[line, row] != 0.0
-
-    primaries = solver.sweep.local_primary_articulation.numpy()
-    slips = solver.factor.walk_view().release.count.numpy()
-    seeds, codes = packets.packet.seed.numpy().astype(np.float64), packets.packet.seed_body.numpy()
-    contacts = packets.packet.row_contact.numpy()
-    prefix_dofs, prefix_weights = packets._packets.dofs.numpy(), packets._packets.weights.numpy()
-    for world, live in enumerate(capture.counts):
-        count = int(live)
-        if count == 0 or ball[world] or owner[world] == PGS_LOCAL_SOLVE_OWNER_GENERAL:
-            continue  # The one writer's worlds: walked_frames above.
-        if skip_rows > 0 and count <= skip_rows and mf_counts[world] == 0 and placement.keyed_rows is not None:
-            out["unstored"] += 1  # The keyed rows keep their worlds' rows out of the store.
-            continue
-        # The row packets (FL3.6): the kernel walks each row's seeds and leaves by the walk. Their published dv
-        # against the float64 walk's response of the impulses to the same seeds: a covector at a coordinate, a
-        # wrench at a body's frame. A tree that slips this step carries its release (TestLocalSlipFrame).
-        art = int(primaries[world])
-        line = int(capture.dense_first[world])
-        if art < 0 or slips[art]:
-            continue
-        walk, kappa = walk_of(art)
-        n = int(sizes[art])
-        response = np.zeros(n)
-        for row in range(count):
-            lam = float(capture.impulses[line, row])
-            if lam == 0.0:
-                continue
-            if contacts[world, row] < 0:
-                for dof, weight in zip(prefix_dofs[world, row], prefix_weights[world, row], strict=True):
-                    if dof >= 0 and weight != 0.0:
-                        x = np.zeros(n)
-                        x[dof] = weight
-                        response += walk.up(covector=x)[0] * lam
-                continue
-            for side in range(2):
-                if codes[world, row, side] >= 0:
-                    response += (
-                        walk.up(int(codes[world, row, side]), seeds[world, row, 6 * side : 6 * side + 6])[0] * lam
-                    )
-        at = slice(int(offsets[art]), int(offsets[art]) + n)
-        if np.any(dv[world, at]):
-            published = 2.0 * ROUNDING * (np.linalg.norm(v_out[world, at]) + np.linalg.norm(v_hat[world, at]))
-            scale = n * ROUNDING * kappa + published / np.linalg.norm(dv[world, at])
-            out["kernel"] = max(out["kernel"], relative(dv[world, at], walk.down(response)[0]) / scale)
-        out["in_kernel"] += 1
     return out
 
 
@@ -2055,9 +1968,8 @@ def emitter_tables(rng) -> list:
 
 
 def checked(result: dict) -> bool:
-    """Whether a run held rows the check could read: worlds the general sweep solves from the store, or worlds
-    whitened in a kernel."""
-    return result["general"] + result["in_kernel"] > 0
+    """Whether a run held rows the check could read: worlds the general sweep solves from the store."""
+    return result["general"] > 0
 
 
 def refresh_error(device, bodies: int, rng) -> float:
@@ -2143,7 +2055,7 @@ class TestWalkDevice(unittest.TestCase):
             with self.subTest(problem=physics.name, route=route.name):
                 solver, joint_q, capture = run_route(physics, route)
                 result = placement_frames(solver, joint_q, capture)
-                for name in ("rows", "leave", "kernel"):
+                for name in ("rows", "leave"):
                     self.assertLessEqual(result[name], BOUND, f"{name}: {result}")
 
     def test_the_refresh_meets_the_float64_walk(self):
@@ -2170,24 +2082,21 @@ class TestWalkDevice(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA placements")
     def test_f1_on_the_cuda_placements(self):
-        """Z0's F1 on the CUDA placements: the one writer's worlds' rows and leave, and the row packets' worlds, whose
-        kernel walks their seeds, through the walk's response of their impulses."""
-        covered, done = {"general": 0, "in_kernel": 0}, set()
+        """Z0's F1 on the CUDA placements: the one writer's worlds' rows and leave."""
+        covered, done = 0, set()
         for physics, route in cuda_placements():
             if route.name in done:
                 continue
             with self.subTest(problem=physics.name, route=route.name):
                 solver, joint_q, capture = run_route(physics, route, device="cuda:0")
                 result = placement_frames(solver, joint_q, capture)
-                for name in ("rows", "leave", "kernel"):
+                for name in ("rows", "leave"):
                     self.assertLessEqual(result[name], BOUND, f"{name}: {result}")
                 if checked(result):
                     done.add(route.name)
-                for name in covered:
-                    covered[name] += result[name]
-        # Both forms were checked: the one writer's worlds, and worlds whose kernel walks their rows' seeds.
-        self.assertGreater(covered["general"], 0)
-        self.assertGreater(covered["in_kernel"], 0)
+                covered += result["general"]
+        # The one writer's worlds were checked.
+        self.assertGreater(covered, 0)
 
 
 def report_device() -> None:

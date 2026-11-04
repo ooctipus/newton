@@ -110,7 +110,7 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
             ("predictor 64", 64, 56, (64, min(24, 1152 // 64))),
             # The sweeps' lines: whole warps a register sub-partition (6 at 80 registers, 8 at 64).
             ("tier of a warp", 32, 80, (32, 24)),
-            ("local owner of five warps", 160, 80, (160, 4)),
+            ("five warps at the line", 160, 80, (160, 4)),
             ("sparse", 64, 64, (64, 16)),
         )
         for device in (PRO, GB300):

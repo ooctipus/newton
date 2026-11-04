@@ -190,10 +190,9 @@ def _readout_calls():
     """Opt-in sweep readouts of the suite's counted sweeps: ``(name, factory, args, kwargs, patch_only)``.
 
     ``Diagnostics(solve_readout="sweeps")`` builds these variants of the sparse, sparse-diagonal,
-    matrix-free Gauss-Seidel, paired factor and local-packet sweeps.
+    matrix-free Gauss-Seidel and paired factor sweeps.
     """
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
-        row_packets,
         sweep_routes,
         sweep_routes_diag,
         sweep_routes_local,
@@ -222,24 +221,12 @@ def _readout_calls():
     for args, kwargs in (
         ((192, 64, 22, _ARCH), {}),
         ((192, 64, 29, _ARCH), {**no_limits, "factor_coordinates": True, "independent_components": True}),
-        ((192, 64, 15, _ARCH), {**no_limits, "skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
     ):
         yield "sweep_routes.mf_gs_kernel", factory, args, {**kwargs, **readout}, False
     factory = sweep_routes_local.paired_factor_kernel.__wrapped__
     for units in (False, True):
         kwargs = {"contact_units": True, **readout} if units else readout
         yield "sweep_routes_local.paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, False, True), kwargs, units
-    packets = row_packets.get_local_factory.__wrapped__(9, 6, 40, 11)
-    pair = {"paired_dof_count": 6, "persistent_queue": True, "warps_per_block": 2}
-    for args, kwargs in (
-        (
-            (192, 9, 9, _ARCH),
-            {"lanes_per_world": 8, "contact_capable": False, "warps_per_block": 2},
-        ),
-        ((192, 20, 9, _ARCH), pair),
-        ((192, 40, 9, _ARCH), {**pair, "mf_max_constraints": 64, "local_mf_max_constraints": 12}),
-    ):
-        yield "row_packets.get_local_factory(9, 6, 40, 11)", packets, args, {**kwargs, **readout}, False
 
 
 def _patch_only_factory_labels():
@@ -421,28 +408,6 @@ def _solver_factory_calls():
         yield label, sweep_routes_tiers.parallel_kernel, args, kwargs
 
 
-def _spliced_sweep_calls():
-    """Sweeps that splice the friction law or vote a sweep exit, beyond the factories above.
-
-    Local owners, plain and over packet rows: a contactless subwarp articulation,
-    an articulation pair and the pair's residual with matrix-free rows. Then the
-    tiled-row sweep with and without row budgets and the legacy matrix-free sweep.
-    """
-    from newton._src.solvers.feather_pgs import row_packets, sweep_routes_local  # noqa: PLC0415
-
-    local = sweep_routes_local.local_owned_kernel.__wrapped__
-    packets = row_packets.get_local_factory.__wrapped__(9, 6, 40, 11)
-    pair = {"paired_dof_count": 6, "persistent_queue": True}
-    for args, options in (
-        ((192, 9, 9, _ARCH), {"lanes_per_world": 8, "contact_capable": False}),
-        ((192, 20, 9, _ARCH), pair),
-        ((192, 40, 9, _ARCH), {**pair, "mf_max_constraints": 64, "local_mf_max_constraints": 12}),
-    ):
-        kwargs = {**options, "warps_per_block": 2}
-        yield "sweep_routes_local.local_owned_kernel", local, args, kwargs
-        yield "row_packets.get_local_factory(9, 6, 40, 11)", packets, args, kwargs
-
-
 def _suite_shape_calls():
     """Factory kernels at the shapes the benchmark suite's routes build, beyond those pinned above.
 
@@ -450,14 +415,13 @@ def _suite_shape_calls():
     profile ran the route, the profile's kernel suffix: the matrix-free
     Gauss-Seidel, sparse, sparse-diagonal and keyed parallel sweeps, the keyed
     limit rows, the sparse mass factors, the sparse contact responses, the
-    packet prefix and the paired-component preparation. A byte-identical
+    paired-component preparation. A byte-identical
     rewrite of their generators then keeps the binaries the suite runs.
     """
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
         keyed_row_layout,
         keyed_rows,
         paired_components,
-        row_packets,
         sweep_routes,
         sweep_routes_diag,
         sweep_routes_sparse,
@@ -470,7 +434,6 @@ def _suite_shape_calls():
     for args, kwargs in (
         ((192, 64, 22, _ARCH), {}),
         ((192, 64, 22, _ARCH), {"skip_tier_rows": 128}),
-        ((192, 64, 15, _ARCH), {**no_limits, "skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
         ((192, 64, 29, _ARCH), {**no_limits, "factor_coordinates": True, "independent_components": True}),
         ((72, 32, 18, _ARCH), {**no_limits, "skip_tier_rows": 48}),
     ):
@@ -500,7 +463,6 @@ def _suite_shape_calls():
             kwargs = {"rows": rows, "min_rows": min_rows, "sweeps": 24, "inkernel_response": blocks}
             yield "keyed_rows.get_parallel_factory", parallel, (layout, *shape), kwargs
     yield "keyed_row_layout.prefix_kernel", limit_prefix, (limited,), {}
-    yield "row_packets.get_prefix_kernel", row_packets.get_prefix_kernel.__wrapped__, (9, 1, 40), {}
     components = paired_components.paired_components_kernel.__wrapped__
     yield "paired_components.paired_components_kernel", components, (23, 6), {}
 
@@ -531,7 +493,6 @@ def _factory_kernels():
         _support_writer_calls(),
         _dense_build_calls(),
         _solver_factory_calls(),
-        _spliced_sweep_calls(),
         _suite_shape_calls(),
         _keyed_row_calls(),
         ((name, factory, args, kwargs) for name, factory, args, kwargs, _ in _readout_calls()),
@@ -679,7 +640,6 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
             "sweep_routes_local.paired_factor_kernel",
             "keyed_rows.get_parallel_factory",
             "row_slots.allocate_world_contact_slots",
-            "row_packets.produce_contacts",
             "compact_contact.produce_contacts",
             "walk_rows.walked_rows_kernel",
             "resolved_worlds.finalize_resolved_worlds",
@@ -705,18 +665,6 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
         # Their last-word velocity-limit pass, in the plain and the keyed-row tiers.
         last_word = {name.split("(", 1)[0] for name in linked if "velocity_limit_pass=True" in name}
         self.assertEqual(last_word, {"sweep_routes_tiers.parallel_kernel", "keyed_rows.get_parallel_factory"})
-
-    def test_inventory_covers_the_spliced_sweeps(self):
-        """Reach the sweeps that splice the friction law or vote an exit, beyond the patch-varied factories."""
-        families = {name.split("(", 1)[0] for name in self.current}
-        for family in (
-            "sweep_routes_local.local_owned_kernel",
-            "row_packets.get_local_factory",
-        ):
-            with self.subTest(family=family):
-                self.assertIn(family, families)
-                # Every friction law launches these sweeps, so their pins are point pins.
-                self.assertFalse({name for name in self.current if name.startswith(family + "(")} & _PATCH_ONLY)
 
     def test_inventory_builds_the_suite_shapes(self):
         """Build every factory call at the suite's shapes; the suite's routes build them, so none may be rejected."""

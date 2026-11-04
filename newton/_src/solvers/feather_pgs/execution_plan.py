@@ -100,16 +100,3 @@ def _select_mfgs_storage(
                 f"({sm_count} SMs) and the block declares {candidate.bytes} <= {limit} bytes of static shared memory."
             )
     return _MFGSStorage(RowPlaces(metadata, kinds, impulses), reason)
-
-
-def _align_shared_memory(size: int) -> int:
-    """Align a shared-memory allocation to Warp's 16-byte tile boundary."""
-    return (size + 15) // 16 * 16
-
-
-def retired_tiled_response_fits(n_dofs: int, max_shared_memory: int) -> bool:
-    """Whether the retired tiled H^-1 J^T kernel's one-row footprint fits ``max_shared_memory`` [B]: the factor, three
-    row tiles and 64 threads' tile storage. Only the local packets' admission reads it (:func:`.row_packets.decline`):
-    on CUDA it declines a class with a size above 12 coordinates whose footprint fits, as that kernel's plan did."""
-    footprint = _align_shared_memory(4 * n_dofs * n_dofs) + 3 * _align_shared_memory(4 * n_dofs) + 4 * 64
-    return footprint <= max_shared_memory

@@ -284,20 +284,18 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         frames = model.joint_X_p.numpy().copy()
         moved = frames.copy()
         moved[_fixed_root(model, 1), 2] += 0.25
-        # Move the root, then move it back: each write is a move the refused notification must not store.
-        for row_owner, written in (("row_packets", moved), ("keyed_rows", frames)):
-            with self.subTest(row_owner=row_owner):
-                for array in validity_arrays:
-                    array.fill_(1)
-                model.joint_X_p.assign(written)
-                with (
-                    patch.object(solver.placement, row_owner, refusal),
-                    self.assertRaisesRegex(RuntimeError, "Row topology"),
-                ):
-                    solver.notify_model_changed(JOINT)
-                self.assertEqual([int(array.numpy().min()) for array in validity_arrays], [1] * len(validity_arrays))
-                solver.notify_model_changed(JOINT)
-                self.assertEqual([int(array.numpy().max()) for array in validity_arrays], [0] * len(validity_arrays))
+        # Move the root: a move the refused notification must not store.
+        for array in validity_arrays:
+            array.fill_(1)
+        model.joint_X_p.assign(moved)
+        with (
+            patch.object(solver.placement, "keyed_rows", refusal),
+            self.assertRaisesRegex(RuntimeError, "Row topology"),
+        ):
+            solver.notify_model_changed(JOINT)
+        self.assertEqual([int(array.numpy().min()) for array in validity_arrays], [1] * len(validity_arrays))
+        solver.notify_model_changed(JOINT)
+        self.assertEqual([int(array.numpy().max()) for array in validity_arrays], [0] * len(validity_arrays))
 
     @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
     def test_cuda_joint_notification_every_step_repairs_nothing(self):

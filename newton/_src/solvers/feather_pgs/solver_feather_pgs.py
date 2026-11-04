@@ -176,7 +176,7 @@ class SolverFeatherPGS(SolverBase):
     # (routes.pins). Keys:
     #   storage "dense": no packed (native sparse) factor.
     #   grouping "forest" or "per_size": the held families.   star "held": a star's diagonal family in the held tree.
-    #   producer "walk": no local packets or keyed rows.
+    #   producer "walk": no keyed rows.
     #   claims: the runtime claims kept, of ("resolved_worlds",).
     #   active_rows False: full-order sparse sweeps.           contact_units None: unfused sparse contact triplets.
     #   transaction "single" or "staged": fused triplets'.     mf_storage "streamed": streamed matrix-free impulses.
@@ -530,7 +530,6 @@ class SolverFeatherPGS(SolverBase):
 
         self.sweep.admit_diagonal(diagonal_decline)
         self.placement.dense_internal_max_rows = self.placement.internal_rows_per_world(model)
-        self.sweep.admit_local()
         self._contact_material_placeholder = self._arrays.placeholder(wp.float32, (1,))
         self._bind_contact_material(None)
         self._allocate_common_buffers(model)
@@ -567,29 +566,8 @@ class SolverFeatherPGS(SolverBase):
         self.factor.scatter_armature()
         self.sweep.plan_tier_rows()
         self.placement.allocate_packed_rows()
-        # The producers of the local owners' rows (case K3) and of the tiers' rows (case K4), each admitted by its
-        # own fit: limit prefix and contact packets built in place for worlds of one limited articulation and at
-        # most one other (row_packets.py), and keyed rows (keyed_rows.create_owner). Both write the point and the
-        # patch row law.
-        from . import row_packets  # noqa: PLC0415
-
-        self.placement.row_packets = None
-        self.placement.row_packets_reason = (
-            (
-                None
-                if self._route_pins.get("producer") in (None, "local_packets")
-                else "A test pin selects another contact-row producer."
-            )
-            or capable("row_packets", laws)
-            or row_packets.decline(self)
-        )
-        if self.placement.row_packets_reason is None:
-            self.placement.row_packets = row_packets.create_owner(self)
-            self.placement.row_packets_reason = (
-                "Admitted: worlds of one limited articulation and at most one other build packets in place."
-                if self.placement.row_packets is not None
-                else "The local packet law does not admit this topology."
-            )
+        # The producer of the tiers' rows (case K4), admitted by its own fit: keyed rows (keyed_rows.create_owner),
+        # which write the point and the patch row law.
         self.placement.keyed_rows = None
         if (declined := capable("keyed_rows", self.laws.set)) is not None:
             self.placement.keyed_rows_reason = declined
@@ -604,16 +582,14 @@ class SolverFeatherPGS(SolverBase):
                 if self.placement.keyed_rows is not None
                 else "Keyed rows need the Jacobi tiers (routes.sweep.tiers) and a plain matrix-free policy."
             )
-        # The general placement (case K6), the paired factor coordinates (case K5, a tree beside one free body) and the
-        # local owners (case K3, FL3.6) whiten and leave their rows by the walk (FL3.3): the factor holds the walk's data
-        # for every responding tree, a free rigid body's six coordinates included, and the one writer, the free bodies'
-        # writer and the sweeps' leaves read it. The local owners' packets walk their seeds in their kernel and the one
-        # writer their general worlds' rows; every local kernel leaves by the walk. The Jacobi tiers (case K4, FL3.7)
-        # read the one writer's rows, or walk their keyed rows in the kernel, and leave by the walk; the keyed rows'
-        # general worlds are the one writer's (keyed_rows.keyed_general_units). The support placement (case K1, FL3.4) whitens and leaves its
-        # rows by the walk too, into its support sink.
+        # The general placement (case K6) and the paired factor coordinates (case K5, a tree beside one free body)
+        # whiten and leave their rows by the walk (FL3.3): the factor holds the walk's data for every responding tree, a
+        # free rigid body's six coordinates included, and the one writer, the free bodies' writer and the sweeps' leaves
+        # read it. The Jacobi tiers (case K4, FL3.7) read the one writer's rows, or walk their keyed rows in the kernel,
+        # and leave by the walk; the keyed rows' general worlds are the one writer's (keyed_rows.keyed_general_units).
+        # The support placement (case K1, FL3.4) whitens and leaves its rows by the walk too, into its support sink.
         general = self.routes.case == "K1" or bool(
-            self.routes.case in ("K6", "K5", "K3", "K4")
+            self.routes.case in ("K6", "K5", "K4")
             and self.placement.mf_sweeps
             and np.any(self.forest.response_dof_count > 0)
         )
@@ -622,7 +598,7 @@ class SolverFeatherPGS(SolverBase):
         diagonal = bool(self.routes.case == "K2" and self.placement.sparse_diagonal_contact_solve)
         self.placement.walks = general or diagonal
         # Free bodies' rows are written by the walk only (walk_rows.write_free_body_rows). A responding free body gives
-        # every case a walking class: K1 and K2 never hold free bodies, and K3-K6 sweep matrix-free (a world with the
+        # every case a walking class: K1 and K2 never hold free bodies, and K4-K6 sweep matrix-free (a world with the
         # body's six coordinates).
         if self.forest.has_free_rigid_bodies and not self.placement.walks:
             raise RuntimeError(f"Free bodies' rows are written by the walk: case {self.routes.case} must walk.")
@@ -631,8 +607,6 @@ class SolverFeatherPGS(SolverBase):
                 "Bilateral blocks are closed in the one writer's block phase (walk_rows): their class must walk "
                 f"(case K6 with the matrix-free sweeps), not case {self.routes.case}."
             )
-        if self.placement.local_internal_fast_path and not self.placement.walks:
-            raise ValueError("The local owners walk their rows and leave (FL3.6): their class must walk.")
         # Scalar branches take a diagonal-mass group of world-fixed roots over one-coordinate leaves (scalar_branches.py),
         # which the held-tree owner then publishes: the compact diagonal's admission planned them.
         self._scalar_branches, self._scalar_branches_reason = plan_scalar_branches(self)
@@ -724,7 +698,7 @@ class SolverFeatherPGS(SolverBase):
         each with its reason (the kernel choice, the size's resource rule), the
         held-tree owner and its lane layouts, the contact-row
         producer with each DOF size's row-builder kernels and friction law (from
-        the plan the row build dispatches on), local, paired and sparse responses,
+        the plan the row build dispatches on), paired and sparse responses,
         the sweep kernels per route and tier, what drives them and the matrix-free
         sweep's shared-memory storage (``sweep.mf_gs_storage``), resolved worlds,
         publication, velocity limits and the lane width of their prescale, free
@@ -821,8 +795,6 @@ class SolverFeatherPGS(SolverBase):
             # Geometry edits retire affected material points; unrelated shape
             # properties keep their history and live materials are checked per step.
             self.laws.friction_patches.update_geometry(self.model)
-        if self.placement.row_packets is not None:
-            self.placement.row_packets.validate_notification(flags)
         if self.placement.keyed_rows is not None:
             self.placement.keyed_rows.validate_notification(flags)
         self.factor.notify_model_changed(flags, kinematic)

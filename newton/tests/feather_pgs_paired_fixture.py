@@ -168,10 +168,8 @@ def solve_fixture(device):
 
     rng = np.random.default_rng(784)
     arrays = {
-        "general_world_count": array(np.array([5], np.int32)),
-        "general_worlds": array(np.arange(5, dtype=np.int32)),
         "dense_phase_bounds": array(np.array([[1, 1]] * 4 + [[0, 0]], np.int32)),
-        "local_solve_owner": array(np.zeros(5, np.int32)),
+        "component_selector": array(np.zeros(5, np.int32)),
         "world_dof_indices": array(np.arange(145, dtype=np.int32).reshape(5, 29)),
         "row_incident": array(store(rng.normal(0, 0.2, (5, 8)).astype(np.float32), np.zeros((5, 6), np.float32))),
         "world_impulses": array(store(np.full((5, 8), 0.01, np.float32), np.full((5, 6), 0.02, np.float32))),
@@ -261,13 +259,12 @@ def solve_pair_launches(data, arrays, *, enabled, arch, iterations=8):
     values.update(
         dense_first=data.first,
         world_count=5,
-        general_world_grid_stride=5,
         iterations=iterations,
         omega=1.0,
         regularize=0,
     )
     if enabled:
-        values["local_solve_owner"] = values["world_mf_constraint_count"] = data.selector
+        values["component_selector"] = values["world_mf_constraint_count"] = data.selector
     return [
         (kernel, grid, block, [values[name] for name in inspect.signature(kernel.func).parameters])
         for kernel, grid, block in zip(

@@ -136,7 +136,7 @@ class StepSpec:
     rhs: str
     """Who writes the dense rows' right-hand sides: ``"walk"``, the one writer, which walks the rows after the row pass
     (every walking class but the sparse diagonal's); ``"producers"``, the row pass's own producers (the sparse
-    diagonal's slot rows, the local owners' packets, the keyed rows); ``"bias"``, the rows' bias launch apart."""
+    diagonal's slot rows, the keyed rows); ``"bias"``, the rows' bias launch apart."""
     kernels: Mapping[str, str | None]
     """The sweep's kernel keys by route: ``sparse``, ``sparse_diagonal``, ``paired_factor``, ``mf_gs`` and
     ``mf_colored`` (``None`` where the class builds none)."""
@@ -152,9 +152,6 @@ class StepSpec:
         model, sweep, placement = solver.model, solver.sweep, solver.placement
         streams = (
             ("dynamics", solver.factor.dynamics_stream),
-            ("local_internal", sweep.local_internal_stream),
-            ("local_residual", sweep.local_residual_stream),
-            ("local_pair", sweep.local_pair_stream),
             ("paired_general", sweep.paired_general_solve_stream),
         )
         return cls(
@@ -174,7 +171,7 @@ class StepSpec:
                 "walk"
                 if placement.walks and route.case != "K2"
                 else "producers"
-                if placement.walks or placement.row_packets is not None or placement.keyed_rows is not None
+                if placement.walks or placement.keyed_rows is not None
                 else "bias"
             ),
             kernels=MappingProxyType(
@@ -301,9 +298,7 @@ def _solve(row: RouteRow) -> SolveRoute:
     elif row.case == "K2":
         route = Route("sparse_diagonal", "The diagonal-mass contact owner owns the sweep.")
     else:
-        route = Route(
-            "matrix_free_gs", "Matrix-free Gauss-Seidel; local, paired and tiered owners claim their worlds first."
-        )
+        route = Route("matrix_free_gs", "Matrix-free Gauss-Seidel; paired and tiered owners claim their worlds first.")
     return SolveRoute(route=route)
 
 
@@ -538,8 +533,8 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         resolved.classify(step.state_in, factor, step.contacts, step.dt)
 
     # The row pass, its families in the launch order that is the slot order (rows.py): each family a class holds.
-    packets, keyed = placement.row_packets is not None, placement.keyed_rows is not None
-    limit_sizes = laws.limit_sizes(solver) if solver.options.enable_joint_limits and not (packets or keyed) else ()
+    keyed = placement.keyed_rows is not None
+    limit_sizes = laws.limit_sizes(solver) if solver.options.enable_joint_limits and not keyed else ()
 
     def begin_rows(step):
         laws.begin(solver, step.state_in, factor, step.dt)
@@ -574,20 +569,17 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     def write_free_body_limits(step):
         laws.write_free_body_limits(solver)
 
-    def finish_packets(step):
-        placement.row_packets.finish_rows()
-
     def finalize_dense(step):
         laws.finalize_dense(solver)
 
     def finish_keyed(step):
         placement.keyed_rows.finish_rows()
 
-    # The dense rows' family bounds exist where the row pass holds the dense rows' order (no packets, no keyed rows).
-    bounds = not (packets or keyed)
+    # The dense rows' family bounds exist where the row pass holds the dense rows' order (no keyed rows).
+    bounds = not keyed
     write_rows = (
         begin_rows,
-        *((write_mimics,) if laws.mimic_warp_kernels and not packets else ()),
+        *((write_mimics,) if laws.mimic_warp_kernels else ()),
         *((write_links,) if laws.link_count > 0 else ()),
         *((prepare_fused_limits,) if placement.fused_diagonal_joint_limits else ()),
         *((write_limits,) if limit_sizes else ()),
@@ -601,7 +593,6 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
             if forest.has_free_rigid_bodies and placement.rigid_velocity_limit_slot is not None
             else ()
         ),
-        *((finish_packets,) if packets else ()),
         finalize_dense,
         *((finish_keyed,) if keyed else ()),
     )

@@ -20,11 +20,6 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import sweep_routes_local
-from newton._src.solvers.feather_pgs.row_kernels import (
-    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
-    PGS_CONSTRAINT_TYPE_MIMIC,
-)
 from newton._src.solvers.feather_pgs.solve_policy import (
     TRACE_GRID,
     TRACE_KINDS,
@@ -34,9 +29,8 @@ from newton._src.solvers.feather_pgs.solve_policy import (
     SolveTrace,
 )
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
-from newton._src.solvers.feather_pgs.sweep import PGS_LOCAL_SOLVE_OWNER_SINGLE
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
-from newton.tests.feather_pgs_law_harness import chain_walk, leave_walk, local_packed_rows, row_lines, walked_rows
+from newton.tests.feather_pgs_law_harness import row_lines
 
 SWEEPS = SolvePolicy(readout="sweeps")
 STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
@@ -167,85 +161,6 @@ class _SparseCase:
         return list(zip(self.delta.numpy(), self.impulses.numpy(), strict=True))
 
 
-class _LocalCase:
-    """A local owner's three-coordinate problem: world 0 owns a mimic and a joint-limit row, world 1 is not owned."""
-
-    def __init__(self, device):
-        dofs, rows, local_rows = 3, 4, 2
-        self.shape, self.device, self.worlds = (rows, local_rows, dofs), device, 2
-        lower = np.array([[2.0, 0.0, 0.0], [0.25, 1.5, 0.0], [-0.1, 0.2, 1.25]], dtype=np.float32)
-        jacobian = np.zeros((2, rows, dofs), dtype=np.float32)
-        jacobian[0, 0] = [1.0, 0.5, -0.25]
-        jacobian[0, 1] = [-0.4, 0.3, 0.8]
-        jacobian[1, 0] = [0.2, -0.1, 0.7]
-        rhs = np.zeros((2, rows), dtype=np.float32)
-        rhs[0, :2] = [-0.2, 0.15]
-        cfm = np.zeros((2, rows), dtype=np.float32)
-        cfm[0, :2] = [0.01, 0.02]
-        row_type = np.zeros((2, rows), dtype=np.int32)
-        row_type[0, :2] = [PGS_CONSTRAINT_TYPE_MIMIC, PGS_CONSTRAINT_TYPE_JOINT_LIMIT]
-        row_type[1, 0] = PGS_CONSTRAINT_TYPE_MIMIC
-        candidates = wp.array([0, 1], dtype=wp.int32, device=device)
-        velocity = np.array([0.3, -0.5, 0.1, 9.0, 8.0, 7.0], dtype=np.float32)
-        # The one writer's rows on the walk of each world's factor (z = A^-T J^T), their incident velocities and
-        # diagonals |z|^2 + cfm (FL3.6: the local kernel reads them and leaves by the walk).
-        stored = [walked_rows(lower, jacobian[0]), jacobian[1]]
-        incident = np.stack([jacobian[0] @ velocity[:dofs], jacobian[1] @ velocity[dofs:]])
-        diagonal = cfm.copy()
-        diagonal[0] += np.sum(stored[0] * stored[0], axis=1)
-        self.walk = chain_walk(device, [lower, np.eye(dofs)])
-        # Outputs: the diagonal (initially the one writer's), the impulses and the articulations' velocities.
-        self.initial = (
-            wp.array(diagonal, dtype=wp.float32, device=device),
-            wp.zeros((2, rows), dtype=wp.float32, device=device),
-            wp.array(velocity, dtype=wp.float32, device=device),
-        )
-        self.outputs = tuple(wp.clone(array) for array in self.initial)
-        self.inputs = [
-            candidates,
-            candidates,
-            PGS_LOCAL_SOLVE_OWNER_SINGLE,
-            wp.array([0, 1], dtype=wp.int32, device=device),
-            wp.array([0, 3], dtype=wp.int32, device=device),
-            # World 1 belongs to another owner: its solve returns before any sweep.
-            wp.array([PGS_LOCAL_SOLVE_OWNER_SINGLE, 0], dtype=wp.int32, device=device),
-            wp.array([2, 1], dtype=wp.int32, device=device),
-            row_lines(device),
-            *local_packed_rows(device, [0, 1], stored, incident),
-            wp.array(rhs, dtype=wp.float32, device=device),
-            wp.array(row_type, dtype=wp.int32, device=device),
-            wp.full((2, rows), -1, dtype=wp.int32, device=device),
-            wp.zeros((2, rows), dtype=wp.float32, device=device),
-            wp.zeros(2, dtype=wp.int32, device=device),
-            wp.zeros((2, 4), dtype=wp.int32, device=device),
-            wp.zeros((2, 1, 12), dtype=wp.float32, device=device),
-            0,
-            wp.zeros((2, rows), dtype=wp.float32, device=device),
-        ]
-
-    def kernel(self, policy=None):
-        options = {} if policy is None else {"solve_policy": policy}
-        return sweep_routes_local.local_owned_kernel(*self.shape, self.device.arch, **options)
-
-    def run(self, kernel, iterations, *extra):
-        """Restore the initial diagonal, impulses and velocities and solve."""
-        for output, initial in zip(self.outputs, self.initial, strict=True):
-            wp.copy(output, initial)
-        wp.launch_tiled(
-            kernel,
-            dim=[self.worlds],
-            inputs=[*self.inputs, iterations, 1.0, *self.outputs, self.walk, *extra],
-            block_dim=32,
-            device=self.device,
-        )
-        leave_walk(self.walk, self.outputs[2], self.device)
-
-    def read(self):
-        """Per-world outputs: the impulses, the articulation's velocities and the diagonal."""
-        diagonal, impulses, velocities = (array.numpy() for array in self.outputs)
-        return [(impulses[world], velocities[3 * world : 3 * world + 3], diagonal[world]) for world in range(2)]
-
-
 def _assert_bitwise(actual, expected):
     """Check per-world outputs bitwise equal."""
     for actual_world, expected_world in zip(actual, expected, strict=True):
@@ -294,20 +209,6 @@ class TestSolveReadoutKernels(unittest.TestCase):
                     for actual_array, expected_array in zip(actual, expected, strict=True):
                         np.testing.assert_array_equal(actual_array, expected_array)
                 _assert_counts(self, operand, allowed, solved=range(case.worlds), repeats=2)
-
-    def test_local_counts_sweeps_to_the_stationary_exit(self):
-        """Count only the owned world's sweeps to its first stationary sweep, with bitwise outputs."""
-        case = _LocalCase(wp.get_cuda_device())
-        exact, counted = case.kernel(), case.kernel(SWEEPS)
-        outputs = []
-        for budget in range(BUDGET + 1):
-            case.run(exact, budget)
-            outputs.append(case.read())
-        allowed = _expected_counts(outputs)
-        operand = _readout(case.device, case.worlds)
-        case.run(counted, BUDGET, operand)
-        _assert_bitwise(case.read(), outputs[BUDGET])
-        _assert_counts(self, operand, allowed, solved=(0,))
 
 
 if __name__ == "__main__":

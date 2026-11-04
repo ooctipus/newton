@@ -26,10 +26,9 @@ from collections.abc import Callable
 import numpy as np
 import warp as wp
 
-from ...core.execution import Work, shape
+from ...core.execution import shape
 from ...core.memory import Place, arch_budget, device
 from . import (
-    field_group,
     host_index,
     packed_rows,
     route_table,
@@ -50,21 +49,13 @@ from .friction_patches import patch_routes
 from .kernel_template import SweepTier
 from .route_table import capable
 from .row_records import bind as bind_dense_rows
-from .row_records import bind_mf as bind_mf_rows
 from .solve_policy import SolvePolicy, SolveReadoutRecord
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport, row_supports
 from .step_plan import first_failed
-from .sweep import PGS_LOCAL_SOLVE_OWNER_PAIR, PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL, PGS_LOCAL_SOLVE_OWNER_SINGLE
 from .sweep_levels import (
     _get_build_independent_sparse_contact_groups_kernel,
     _get_mark_independent_sparse_contact_candidates_kernel,
-)
-from .sweep_routes_local import (
-    LocalOwners,
-    classify_local_solve_worlds,
-    compact_local_pair_candidates,
-    local_solve_launch_gate,
 )
 from .sweep_routes_sparse import _SPARSE_LOCAL_WORKSPACE_BYTES
 from .sweep_routes_tiers import classify_parallel_sweep_tiers
@@ -92,20 +83,6 @@ __all__ = ["Sweep"]
 # (tiers - 1) x worlds idle block entries.
 _TIER_LIST_MIN_TIERS = 3
 _CONTACT_JACOBIAN_MAX_DOF = 10
-# A persistent queue avoids launching one expensive general-solver block for
-# every mostly local world. Eight blocks per SM preserves general-only latency.
-_LOCAL_GENERAL_BLOCKS_PER_SM = 8
-_LOCAL_PAIR_BLOCKS_PER_SM = 8
-# The local solver performs a serial O(dof_count**2) triangular solve per row: a local primary is a tree of at most
-# _LOCAL_TREE_MAX_DOF coordinates on CUDA, or a star (one coordinate a tree, ForestPlan.diagonal_mass_sizes) of at most
-# _LOCAL_INTERNAL_MAX_DOF. The 12 is the threshold above which the retired tiled H^-1 J^T kernel took a size on CUDA
-# (execution_plan, _SMALL_DOF_THRESHOLD_DEFAULT before 0.4): its footprint at 16 coordinates and one row,
-# 16 * 16 * 4 + 3 * 16 * 4 + 64 * 4 = 1,472 B, fits every CUDA device, so the size alone decided.
-_LOCAL_INTERNAL_MAX_DOF = 16
-_LOCAL_TREE_MAX_DOF = 12
-_LOCAL_SOLVE_MAX_ROWS = 20
-_LOCAL_RESIDUAL_MAX_ROWS = 40
-_LOCAL_RESIDUAL_MF_MAX_ROWS = 12
 # The paired response pairs a tree of _PAIRED_MIN_DOF to (32 - 6) coordinates, no star, with one free body, in a class
 # of more than _PAIRED_MIN_ROWS rows a world. The rows bound is the retired tiled H^-1 J^T plan's (execution_plan
 # before 0.4): it admitted a size whose 32-row chunk was below dense_max_constraints. Its footprint at 26 coordinates
@@ -135,33 +112,6 @@ def _world_diagonal_pairs(
         return None
     first_diagonal = diagonal[:, 0]
     return np.where(first_diagonal, pairs[:, 0], pairs[:, 1]), np.where(first_diagonal, pairs[:, 1], pairs[:, 0])
-
-
-@dataclasses.dataclass
-class LocalTier:
-    """The local owners of one kind, by primary size: a tree alone (``single``), beside a free body (``pair``), or
-    beside one with free-body rows in the sweep (``residual``)."""
-
-    owner: int
-    """The owner the claim writes (``PGS_LOCAL_SOLVE_OWNER_*``)."""
-    secondary_size: int
-    """The partner's coordinates, 0 for none."""
-    candidates: dict[int, wp.array]
-    """Each size's articulations that may claim their worlds."""
-    secondaries: dict[int, wp.array]
-    """Their partners, aligned with :attr:`candidates`."""
-    counts: dict[int, int]
-    """How many candidates each size has."""
-    launch_items: dict[int, int]
-    """Each size's launch items: its candidates, or the blocks that walk its active queue."""
-    active_counts: dict[int, wp.array] = dataclasses.field(default_factory=dict)
-    """The queue a step's claim fills, for a kind that launches over one."""
-    active_candidates: dict[int, wp.array] = dataclasses.field(default_factory=dict)
-    active_secondaries: dict[int, wp.array] = dataclasses.field(default_factory=dict)
-    kernels: dict[int, wp.Kernel] = dataclasses.field(default_factory=dict)
-    warps_per_block: dict[int, int] = dataclasses.field(default_factory=dict)
-    worlds_per_block: dict[int, int] = dataclasses.field(default_factory=dict)
-    """Worlds a block holds, where lanes pack more than a world per warp; else its warps."""
 
 
 class Sweep:
@@ -364,197 +314,6 @@ class Sweep:
             return None
         return int(diagonal_size[0]), int(dense_size[0]), dense_offsets, dense_groups, dense_arts.astype(np.int32)
 
-    def admit_local(self) -> None:
-        """Case K3, a small tree beside a body: the local owners, claimed per world at run time."""
-        model = self.model
-        laws = self.laws.set
-        self.local_solve_max_rows = min(_LOCAL_SOLVE_MAX_ROWS, self.placement.dense_max_constraints)
-        self.local_residual_max_rows = min(_LOCAL_RESIDUAL_MAX_ROWS, self.placement.dense_max_constraints)
-        self.local_residual_mf_max_rows = min(_LOCAL_RESIDUAL_MF_MAX_ROWS, self.placement.mf_max_constraints)
-        local_budget = arch_budget(model.device.arch) if model.device.is_cuda else 0
-        local_decline = (
-            self.routes.taken("K3")
-            or capable("local", laws)
-            or first_failed(
-                (
-                    (
-                        self.forest.has_free_rigid_bodies,
-                        "Local owners serve worlds with free rigid bodies; there are none.",
-                    ),
-                    (self.local_solve_max_rows > 0, "dense_max_constraints leaves the local owners no row."),
-                )
-            )
-        )
-        local_base_supported = local_decline is None
-        local_primary_articulation = np.full(self.forest.world_count, -1, dtype=np.int32)
-        local_pair_articulation = np.full(self.forest.world_count, -1, dtype=np.int32)
-        local_residual_pair_articulation = np.full(self.forest.world_count, -1, dtype=np.int32)
-        local_candidates: dict[int, list[int]] = {size: [] for size in self.forest.size_groups}
-        local_pair_candidates: dict[int, list[int]] = {size: [] for size in self.forest.size_groups}
-        local_pair_secondaries: dict[int, list[int]] = {size: [] for size in self.forest.size_groups}
-        local_residual_candidates: dict[int, list[int]] = {size: [] for size in self.forest.size_groups}
-        local_residual_secondaries: dict[int, list[int]] = {size: [] for size in self.forest.size_groups}
-        response_by_world: list[list[int]] = [[] for _ in range(self.forest.world_count)]
-        for art in np.flatnonzero(self.forest.response_dof_count > 0):
-            response_by_world[int(self.forest.articulation_world[art])].append(int(art))
-
-        def local_fits(
-            primary_dofs: int,
-            secondary_dofs: int = 0,
-            max_rows: int | None = None,
-            mf_rows: int = 0,
-            *,
-            warps_per_block: int = 1,
-            bodies: int = 0,
-        ) -> bool:
-            """Whether a local owner's block staging (its kernel's own declaration, the walk of a tree of ``bodies``
-            staged as where it walks seeds) fits the device's budget."""
-            staging = sweep_routes_local.local_staging(
-                self.local_solve_max_rows if max_rows is None else max_rows,
-                primary_dofs,
-                secondary_dofs,
-                warps_per_block=warps_per_block,
-                contact_capable=secondary_dofs > 0,
-                local_mf_max_constraints=mf_rows,
-                walk_bodies=bodies,
-            )
-            return staging.fits(local_budget)
-
-        if local_base_supported:
-            articulation_dof_start = self.forest.articulation_dof_start_host
-            articulation_start = model.articulation_start.numpy()
-            for world, response_arts in enumerate(response_by_world):
-                nonfree_arts = [art for art in response_arts if self.forest.is_free_rigid_host[art] == 0]
-                if len(nonfree_arts) != 1:
-                    continue
-                primary_art = nonfree_arts[0]
-                primary_dofs = int(self.forest.response_dof_count[primary_art])
-                bodies = int(self.forest.articulation_joint_end_host[primary_art] - articulation_start[primary_art])
-                if (
-                    primary_dofs <= 0
-                    or primary_dofs > _LOCAL_INTERNAL_MAX_DOF
-                    or (
-                        model.device.is_cuda
-                        and primary_dofs > _LOCAL_TREE_MAX_DOF
-                        and primary_dofs not in self.forest.diagonal_mass_sizes
-                    )
-                    or not local_fits(
-                        primary_dofs, max_rows=min(self.local_solve_max_rows, primary_dofs), bodies=bodies
-                    )
-                ):
-                    continue
-                local_primary_articulation[world] = primary_art
-                local_candidates[primary_dofs].append(primary_art)
-
-                free_arts = [art for art in response_arts if self.forest.is_free_rigid_host[art] != 0]
-                if len(response_arts) != 2 or len(free_arts) != 1:
-                    continue
-                secondary_art = free_arts[0]
-                secondary_dofs = int(self.forest.response_dof_count[secondary_art])
-                if secondary_dofs != 6 or not local_fits(primary_dofs, secondary_dofs, bodies=bodies):
-                    continue
-                local_pair_articulation[world] = secondary_art
-                local_pair_candidates[primary_dofs].append(primary_art)
-                local_pair_secondaries[primary_dofs].append(secondary_art)
-                # The residual loop reads matrix-free metadata in world-packed DOF offsets while its scratch is
-                # laid out primary-first; the world packing sorts articulations by DOF start, so only worlds where
-                # the primary articulation precedes the free body qualify.
-                primary_first_layout = int(articulation_dof_start[primary_art]) < int(
-                    articulation_dof_start[secondary_art]
-                )
-                if primary_first_layout and local_fits(
-                    primary_dofs,
-                    secondary_dofs,
-                    self.local_residual_max_rows,
-                    self.local_residual_mf_max_rows,
-                    bodies=bodies,
-                ):
-                    local_residual_pair_articulation[world] = secondary_art
-                    local_residual_candidates[primary_dofs].append(primary_art)
-                    local_residual_secondaries[primary_dofs].append(secondary_art)
-
-        self.local_primary_articulation = wp.array(local_primary_articulation, dtype=wp.int32, device=model.device)
-        self.local_pair_articulation = wp.array(local_pair_articulation, dtype=wp.int32, device=model.device)
-        self.local_residual_pair_articulation = wp.array(
-            local_residual_pair_articulation, dtype=wp.int32, device=model.device
-        )
-        self.placement.local_solve_owner = wp.zeros(self.forest.world_count, dtype=wp.int32, device=model.device)
-        self.local_general_world_count = wp.zeros(1, dtype=wp.int32, device=model.device)
-        self.local_general_worlds = wp.empty(self.forest.world_count, dtype=wp.int32, device=model.device)
-        # The general owner's queue: a warp a world, at most its measured blocks a multiprocessor.
-        self.local_general_solver_blocks = shape(
-            Work(
-                self.forest.world_count, lanes=32, block=32, persistent=True, grid_per_sm=_LOCAL_GENERAL_BLOCKS_PER_SM
-            ),
-            device(model.device),
-        ).grid
-
-        def arrays(lists):
-            """Each size's non-empty articulation list as a device array."""
-            return {size: wp.array(arts, dtype=wp.int32, device=model.device) for size, arts in lists.items() if arts}
-
-        def per_size(counts, make):
-            """One buffer per size with candidates, made from its candidate count."""
-            return {size: make(count) for size, count in counts.items() if count > 0}
-
-        def counter(count):
-            return wp.zeros(1, dtype=wp.int32, device=model.device)
-
-        def slots(count):
-            return wp.empty(count, dtype=wp.int32, device=model.device)
-
-        def queued(owner, candidates, secondaries, blocks):
-            """The kind whose candidates a step compacts into a queue, walked by ``blocks(count)`` launch items."""
-            counts = {size: len(arts) for size, arts in candidates.items()}
-            return LocalTier(
-                owner,
-                6,
-                arrays(candidates),
-                arrays(secondaries),
-                counts,
-                per_size(counts, blocks),
-                per_size(counts, counter),
-                per_size(counts, slots),
-                per_size(counts, slots),
-            )
-
-        sm_count = int(model.device.sm_count)
-        counts = {size: len(arts) for size, arts in local_candidates.items()}
-        candidates = arrays(local_candidates)
-        self.local_internal = LocalTier(PGS_LOCAL_SOLVE_OWNER_SINGLE, 0, candidates, candidates, counts, counts)
-        self.local_pair = queued(
-            PGS_LOCAL_SOLVE_OWNER_PAIR,
-            local_pair_candidates,
-            local_pair_secondaries,
-            lambda count: min(count, max(1, sm_count * _LOCAL_PAIR_BLOCKS_PER_SM)),
-        )
-        self.local_residual = queued(
-            PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
-            local_residual_candidates,
-            local_residual_secondaries,
-            lambda count: min(count, max(1, sm_count)),
-        )
-        self.local_residual.warps_per_block = {
-            size: (
-                2
-                if solver_warps % 2 == 0
-                and local_fits(
-                    size, 6, self.local_residual_max_rows, self.local_residual_mf_max_rows, warps_per_block=2
-                )
-                else 1
-            )
-            for size, solver_warps in self.local_residual.launch_items.items()
-        }
-        self.placement.local_internal_fast_path = self.routes.claim(
-            "K3", local_base_supported and any(count > 0 for count in counts.values())
-        )
-        self.routes.reasons["K3"] = local_decline or (
-            "Worlds with one small non-free articulation (and at most one free body) solve in local shared memory."
-            if self.placement.local_internal_fast_path
-            else "No world holds one non-free articulation of at most "
-            f"{_LOCAL_INTERNAL_MAX_DOF} DOFs whose local staging fits the device."
-        )
-
     def admit_packed(self, model, held_decline: Callable) -> None:
         """Select sparse articulation factors with independent rigid-body response blocks."""
         self.placement.sparse_mass_matrix_size = None
@@ -723,8 +482,8 @@ class Sweep:
                     support_classes = classes
         # Unsupported mixed worlds retain explicit row indices and their existing kernels.
         use_support_table = support_classes is not None
-        # Reuse the local solver's small-world packing without changing this
-        # owner's row representation, sweep policy or velocity-limit phase.
+        # A small world packs a lane group of 8 or 16 (_sparse_small_world_lanes) without changing this owner's row
+        # representation, sweep policy or velocity-limit phase.
         lanes = small_world_lanes if small_world_lanes and not active_rows else 32
         triplet_capacity = self.placement.dense_max_constraints // 3
         contact_triplets, contact_triplets_reason = self._admit_sparse_contact_triplets(
@@ -957,7 +716,7 @@ class Sweep:
         33-48-row worlds). Their row bound is the dense row capacity, at most
         :data:`.sweep_routes_tiers.TIER_MAX_ROWS`, in whole quads; a test pin (``tiers``) sets it on any class whose
         response they form. ``ink_rows`` is 0 without tiers and the route table's K4 reason says why or why not
-        (``routes.row.reasons``). The local packets and the keyed rows read this before the tiers are built.
+        (``routes.row.reasons``). The keyed rows read this before the tiers are built.
         """
         pinned = self.pins.get("tiers")
         self.placement.ink_rows, self.placement.ink_sizes = 0, None
@@ -1219,75 +978,6 @@ class Sweep:
             else None
         )
 
-        local_factory = sweep_routes_local.local_owned_kernel
-        if self.placement.row_packets is not None:
-            local_factory = self.placement.row_packets.local_factory()
-        # The contact owners solve contact torsion's spin rows with their pairs.
-        local_torsion = {"torsion": True} if self.laws.contact_torsion_enabled else {}
-        # The local owners' walked rows take their trees' release, and their leave its transpose, where a drive can
-        # slip.
-        walk_release = self.factor.walk_arts is not None and self.factor.walk_slip_capacity > 0
-        if self.placement.local_internal_fast_path:
-            for size, count in self.local_internal.counts.items():
-                if count > 0:
-                    lanes_per_world = 32
-                    if size <= 16:
-                        for candidate_lanes in (8, 16):
-                            if count % (32 // candidate_lanes) == 0:
-                                lanes_per_world = candidate_lanes
-                                break
-                    worlds_per_warp = 32 // lanes_per_world
-                    warps_per_block = 2 if count % (2 * worlds_per_warp) == 0 else 1
-                    self.local_internal.warps_per_block[size] = warps_per_block
-                    self.local_internal.worlds_per_block[size] = warps_per_block * 32 // lanes_per_world
-                    self.local_internal.kernels[size] = self.kernel(
-                        "local_internal",
-                        local_factory,
-                        self.placement.dense_max_constraints,
-                        min(self.local_solve_max_rows, size),
-                        size,
-                        device_arch,
-                        warps_per_block=warps_per_block,
-                        lanes_per_world=lanes_per_world,
-                        contact_capable=False,
-                        walk_release=walk_release,
-                        pitch=self.placement.row_pitch,
-                    )
-            for size, solver_blocks in self.local_pair.launch_items.items():
-                warps_per_block = 2 if solver_blocks % 2 == 0 else 1
-                self.local_pair.warps_per_block[size] = warps_per_block
-                self.local_pair.kernels[size] = self.kernel(
-                    "local_pair",
-                    local_factory,
-                    self.placement.dense_max_constraints,
-                    self.local_solve_max_rows,
-                    size,
-                    device_arch,
-                    paired_dof_count=6,
-                    persistent_queue=True,
-                    warps_per_block=warps_per_block,
-                    walk_release=walk_release,
-                    pitch=self.placement.row_pitch,
-                    **local_torsion,
-                )
-            for size, warps_per_block in self.local_residual.warps_per_block.items():
-                self.local_residual.kernels[size] = self.kernel(
-                    "local_residual",
-                    local_factory,
-                    self.placement.dense_max_constraints,
-                    self.local_residual_max_rows,
-                    size,
-                    device_arch,
-                    paired_dof_count=6,
-                    persistent_queue=True,
-                    warps_per_block=warps_per_block,
-                    walk_release=walk_release,
-                    mf_max_constraints=self.placement.mf_max_constraints,
-                    local_mf_max_constraints=self.local_residual_mf_max_rows,
-                    pitch=self.placement.row_pitch,
-                    **local_torsion,
-                )
-
         sparse_contact_schedule = (
             self.placement.sparse_diagonal_contact_triples or self.placement.sparse_diagonal_contact_units
         )
@@ -1336,11 +1026,6 @@ class Sweep:
         self.colored_units = None
         # Storage classes of the MF-GS kernel (_MFGSStorage); recorded by get_path_selection().
         self.mf_gs_storage = None
-        # Blocks of every MF-GS sweep launch: one per world, or the general-world queue's grid. The
-        # storage selection keeps row metadata resident for this grid, so launches must use it too.
-        self.mf_gs_block_count = int(
-            self.local_general_solver_blocks if self.placement.local_internal_fast_path else self.forest.world_count
-        )
         # The Jacobi tiers ahead of the matrix-free sweep (SweepTier), and their keyed rows' release.
         self.tiers = []
         self.tier_worlds = None
@@ -1364,7 +1049,7 @@ class Sweep:
                         self.forest.max_world_dofs,
                     ),
                     arch_budget(device_arch),
-                    block_count=self.mf_gs_block_count,
+                    block_count=self.forest.world_count,
                     sm_count=int(model.device.sm_count),
                     force_stream_mf_impulses=force_stream_mf_impulses,
                 )
@@ -1389,8 +1074,6 @@ class Sweep:
                 "pitch": self.placement.row_pitch,
                 "has_dense_velocity_limit_rows": self.options.enable_joint_velocity_limits,
                 "places": storage.places,
-                "skip_local_internal_worlds": self.placement.local_internal_fast_path,
-                "local_internal_max_constraints": self.placement.dense_internal_max_rows,
                 "contact_torsion": self.laws.contact_torsion_enabled,
                 "factor_coordinates": self.paired_factor_coordinates,
                 "skip_tier_rows": parallel_rows,
@@ -1465,8 +1148,8 @@ class Sweep:
                         frame=self._tier_frame(),
                         walk_half=classes_half(self.factor.walk_classes),
                         pitch=self.placement.row_pitch,
-                        # A tier walks its own list of worlds, else the general owner's when the claims took some.
-                        queued=self.tier_worlds is not None or self.placement.local_internal_fast_path,
+                        # A tier walks its own list of worlds where the plan keeps one.
+                        queued=self.tier_worlds is not None,
                         **({"torsion": True} if self.laws.contact_torsion_enabled else {}),
                     )
                     # On its own list, a tier takes a block a world of the list's capacity (its work's shape).
@@ -1479,33 +1162,14 @@ class Sweep:
         self.leaves = self.factor.walk_arts is not None and bool(self.placement.walks or self.tiers)
 
     def open_streams(self, *, overlap: bool) -> None:
-        """Initialize CUDA streams for parallel kernel launches across size groups.
+        """Open the paired factor sweep's side stream, where it overlaps the matrix-free sweep.
 
-        When multiple DOF sizes exist (heterogeneous articulations), we can launch
-        tiled kernels for different sizes in parallel using separate CUDA streams.
-
-        None of this solver's side streams (size groups, local-owner forks, the
-        paired sweep, inertia, dynamics, memset) reads contact rows or the contact
-        pool's ready count: they run factorizations, response and row sweeps over
-        dense and matrix-free rows, and articulation data, while contact rows are
-        read on the launch stream, which the pool registers. A trim therefore
-        waits for none of them (:meth:`ContactPool.add_reader_stream`).
+        None of this solver's side streams (the paired sweep, inertia, dynamics, memset) reads contact rows or the
+        contact pool's ready count: they run factorizations, response and row sweeps over dense and matrix-free rows,
+        and articulation data, while contact rows are read on the launch stream, which the pool registers. A trim
+        therefore waits for none of them (:meth:`ContactPool.add_reader_stream`).
         """
         model = self.model
-        internal, pair, residual = self.local_internal, self.local_pair, self.local_residual
-        fork = model.device.is_cuda and bool(internal.kernels or pair.kernels or residual.kernels)
-        self.local_internal_stream = wp.Stream(model.device) if fork else None
-        self.local_residual_stream = wp.Stream(model.device, priority=-1) if fork and residual.kernels else None
-        self.local_pair_stream = wp.Stream(model.device) if fork and internal.kernels and pair.kernels else None
-        # Each stream's kinds, in the order the solve launches and joins them.
-        self.local_launches = []
-        if self.local_residual_stream is not None:
-            self.local_launches.append((self.local_residual_stream, (residual,)))
-        if self.local_pair_stream is not None:
-            self.local_launches.append((self.local_pair_stream, (pair,)))
-        if fork:
-            kinds = (internal,) if self.local_pair_stream is not None else (internal, pair)
-            self.local_launches.append((self.local_internal_stream, kinds))
         # With independent components the paired factor sweep and the general
         # matrix-free sweep touch disjoint coordinates of a split world, so
         # they fork after response preparation and join before publication.
@@ -1545,37 +1209,6 @@ class Sweep:
                 ],
                 device=model.device,
             )
-        if self.placement.local_internal_fast_path and self.placement.row_packets is None:
-            self.local_general_world_count.zero_()
-            wp.launch(
-                classify_local_solve_worlds,
-                dim=self.forest.world_count,
-                inputs=[
-                    bind_mf_rows(self.placement),
-                    field_group.bind(LocalOwners, sweep=self, placement=self.placement),
-                    self.placement.constraint_count,
-                    self.placement.dense_phase_bounds,
-                    self.placement.mf_constraint_count,
-                    self.forest.articulation_dof_count,
-                ],
-                device=model.device,
-            )
-            for tier in (self.local_pair, self.local_residual):
-                for size, active_count in tier.active_counts.items():
-                    active_count.zero_()
-                    wp.launch(
-                        compact_local_pair_candidates,
-                        dim=tier.counts[size],
-                        inputs=[
-                            tier.candidates[size],
-                            tier.secondaries[size],
-                            self.forest.art_to_world,
-                            self.placement.local_solve_owner,
-                            tier.owner,
-                        ],
-                        outputs=[active_count, tier.active_candidates[size], tier.active_secondaries[size]],
-                        device=model.device,
-                    )
 
     def warm_start(self, contacts, dt: float) -> None:
         """Gather the dense rows' impulses of the previous step by contact identity."""
@@ -1631,7 +1264,10 @@ class Sweep:
             "world_constraint_count": placement.constraint_count,
             "dense_first": placement.dense_first,
             "dense_phase_bounds": placement.dense_phase_bounds,
-            "local_solve_owner": placement.local_solve_owner,
+            # The paired components' signed selector (sweep_routes.mf_gs_source), where they split worlds.
+            "component_selector": self.placement.dummy_is_free_rigid
+            if self.paired_components is None
+            else self.paired_components.selector,
             "world_dof_indices": forest.world_dof_indices,
             "rhs_bias": placement.rhs,
             "row_incident": placement.row_incident,
@@ -1670,29 +1306,6 @@ class Sweep:
             device=self.model.device,
             stream=stream,
         )
-
-    def _launch_local(self, tier: LocalTier, operands: dict) -> None:
-        """Solve a kind's articulation-local dense rows, without world response buffers, on the current stream."""
-        packets = self.placement.row_packets
-        rows = {} if packets is None else {"prefix": packets.prefix, "packets": packets.packet}
-        for size, kernel in tier.kernels.items():
-            warps_per_block = tier.warps_per_block[size]
-            count = tier.launch_items[size]
-            self._launch(
-                kernel,
-                operands,
-                count // tier.worlds_per_block.get(size, warps_per_block),
-                32 * warps_per_block,
-                candidate_articulations=tier.active_candidates.get(size, tier.candidates[size]),
-                candidate_secondary_articulations=tier.active_secondaries.get(size, tier.secondaries[size]),
-                active_candidate_count=tier.active_counts.get(size),
-                candidate_grid_stride=count,
-                expected_owner=tier.owner,
-                articulation_world=self.forest.art_to_world,
-                articulation_dof_start=self.forest.articulation_dof_start,
-                walk=self.factor.walk_view(),
-                **rows,
-            )
 
     def solve(self, v_hat: wp.array, v_out: wp.array) -> None:
         """Launch the step's sweeps from the predictor ``v_hat`` into ``v_out``: the claims in order, then the rest."""
@@ -1763,7 +1376,8 @@ class Sweep:
         )
 
     def _solve_claims(self, operands: dict) -> None:
-        """The other cases: each owner's worlds on its streams, then the matrix-free sweep of the rest."""
+        """The other cases: the paired factor sweep's worlds (on its stream where it overlaps), the Jacobi tiers', then
+        the matrix-free sweep of the rest."""
         iterations = self.options.pgs_iterations
         mf_gs_kernel = self.mf_gs_kernel
         if mf_gs_kernel is None:
@@ -1771,30 +1385,6 @@ class Sweep:
 
         # Under a readout, count the worlds without rows of any family, which no sweep enters.
         self.readout.count_skipped(self.placement.constraint_count, self.placement.mf_constraint_count)
-        local_stream, pair_stream, residual_stream = (
-            self.local_internal_stream,
-            self.local_pair_stream,
-            self.local_residual_stream,
-        )
-        if local_stream is not None:
-            local_ready_event = wp.get_stream(self.model.device).record_event()
-            local_stream.wait_event(local_ready_event)
-            if pair_stream is not None:
-                pair_stream.wait_event(local_ready_event)
-            if residual_stream is not None:
-                residual_stream.wait_event(local_ready_event)
-            # Admit scarce residual and paired worlds before the bulk single-world grid can occupy the GPU.
-            if residual_stream is not None:
-                wp.launch(local_solve_launch_gate, dim=1, device=self.model.device)
-                pair_ready_event = wp.get_stream(self.model.device).record_event()
-                if pair_stream is not None:
-                    pair_stream.wait_event(pair_ready_event)
-                else:
-                    local_stream.wait_event(pair_ready_event)
-            if pair_stream is not None:
-                wp.launch(local_solve_launch_gate, dim=1, device=self.model.device)
-                single_ready_event = wp.get_stream(self.model.device).record_event()
-                local_stream.wait_event(single_ready_event)
         factor_kernel = self.paired_factor_kernel
         components = self.paired_components
         if components is not None:
@@ -1830,17 +1420,8 @@ class Sweep:
         if factor_kernel is not None and factor_stream is None:
             launch_factor_solve()
         with self.timed(f"mfgs_iters{iterations}"):
-            # The worlds a queued sweep walks (sweep_routes.worlds): those the claims left to the general owner.
-            queue = {
-                "general_world_count": self.local_general_world_count,
-                "general_worlds": self.local_general_worlds,
-                "general_world_grid_stride": self.mf_gs_block_count,
-            }
-            if self.factor.walk_arts is not None:
-                # The sweeps leave by the walk (sweep_routes.leave_all) and find a free body's tree in it.
-                queue["walk"] = self.factor.walk_view()
-            if components is not None:
-                queue["local_solve_owner"] = components.selector
+            # The sweeps leave by the walk (sweep_routes.leave_all) and find a free body's tree in it.
+            walk = {} if self.factor.walk_arts is None else {"walk": self.factor.walk_view()}
             # The tiers own the worlds with only dense rows inside their row bound; the general sweep returns
             # early for those and solves the rest.
             tier_lists = self.tier_worlds is not None
@@ -1861,8 +1442,8 @@ class Sweep:
                 )
             colored_kernel = self.mf_colored_kernel
             for tier in self.tiers:
-                named = dict(queue)
-                dim = self.mf_gs_block_count
+                named = dict(walk)
+                dim = self.forest.world_count
                 if tier_lists:
                     # This tier grid-strides over its own compacted world list.
                     dim = tier.grid
@@ -1877,11 +1458,11 @@ class Sweep:
                     named.update(zip(("kinetic_rows", "patch_law"), keyed, strict=False))
                 self._launch(tier.kernel, operands, dim, tier.work.block, **named)
             colored = {} if colored_kernel is None else self.colored_units.operands()
-            self._launch(mf_gs_kernel, operands, self.mf_gs_block_count, 32, **queue, **colored)
+            self._launch(mf_gs_kernel, operands, self.forest.world_count, 32, **walk, **colored)
             if colored_kernel is not None:
                 # The worlds the unit builder's rule picked: a block each, a color's units at once.
                 self._launch(
-                    colored_kernel, operands, self.mf_gs_block_count, sweep_routes.COLORED_THREADS, **queue, **colored
+                    colored_kernel, operands, self.forest.world_count, sweep_routes.COLORED_THREADS, **walk, **colored
                 )
         if factor_stream is not None:
             # Queue the scarce general tail first; the independent paired
@@ -1889,14 +1470,6 @@ class Sweep:
             launch_factor_solve()
             factor_stream.record_event(self.paired_general_done)
             wp.get_stream(self.model.device).wait_event(self.paired_general_done)
-        local_done_events = []
-        for stream, tiers in self.local_launches:
-            with wp.ScopedStream(stream, sync_enter=False):
-                for tier in tiers:
-                    self._launch_local(tier, operands)
-            local_done_events.append(stream.record_event())
-        for local_done_event in local_done_events:
-            wp.get_stream(self.model.device).wait_event(local_done_event)
 
     @staticmethod
     def patch_frame_built(contacts):

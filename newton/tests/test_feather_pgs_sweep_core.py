@@ -10,7 +10,7 @@ import dataclasses
 import re
 import unittest
 
-from newton._src.solvers.feather_pgs.response_operator import Lanes, ResidualBlock, ResponseOperator, SparseFactor
+from newton._src.solvers.feather_pgs.response_operator import Lanes, ResponseOperator, SparseFactor
 from newton._src.solvers.feather_pgs.solve_policy import Change, SolvePolicy, bound
 from newton._src.solvers.feather_pgs.sweep import (
     FRICTION,
@@ -49,21 +49,6 @@ class _Rows(ResponseOperator):
 
     def apply_row(self, row, delta, indent):
         return f"\n{indent}v += Y({row}) * {delta};"
-
-
-@dataclasses.dataclass(frozen=True)
-class _Block(ResidualBlock):
-    """A staged block whose rows keep their whole residual, in column layout: the least a maintained block adds."""
-
-    capacity: int
-    lanes: Lanes
-    rows: str = "n_rows"
-    diagonal: object = None
-    inverse: object = None
-    name = "block"
-
-    def entry(self, source, target):
-        return "", f"{source} * {self.capacity} + {target}"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -118,12 +103,6 @@ class TestResponseOperatorInterface(unittest.TestCase):
         own = rows.pair_terms("i", "sib", _rhs, "", own=True)
         self.assertTrue(own.startswith("float residual = J_i_v;\nresidual += rhs[i];\n"))
 
-    def test_maintained_residuals_hold_their_rhs(self):
-        block = _Block(8, Lanes(32))
-        terms = block.pair_terms("i", "sib", _rhs, "", own=True)
-        self.assertNotIn("rhs", terms)
-        self.assertIn("float sibling_residual = s_res[sib];", terms)
-
     def test_end_passes_apply_a_row_through_apply_row(self):
         self.assertEqual(_Rows().apply_strided("r", "d", ""), _Rows().apply_row("r", "d", ""))
         # Packed rows apply the entries their row velocity kept.
@@ -133,8 +112,6 @@ class TestResponseOperatorInterface(unittest.TestCase):
     def test_an_operator_names_the_action_it_lacks(self):
         with self.assertRaisesRegex(NotImplementedError, "_Rows has no pair apply"):
             _Rows().apply_pair("a", "b", "")
-        with self.assertRaisesRegex(NotImplementedError, "_Block has no row velocity"):
-            _Block(8, Lanes(32)).row_velocity("v", "r", "")
 
 
 class TestRowVisit(unittest.TestCase):

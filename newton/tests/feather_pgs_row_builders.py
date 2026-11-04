@@ -22,8 +22,8 @@ from newton._src.solvers.feather_pgs import keyed_rows
 from newton._src.solvers.feather_pgs.step_plan import StepPlan
 
 # Every kernel a contact-row producer launches to write dense contact rows outside the sweep: the one writer, the
-# compact contact boundary, local row packets and keyed rows. The free-body matrix-free rows follow the allocation path, not a producer. Add every
-# new producer kernel here: a launched builder missing from this list is invisible to the check below.
+# compact contact boundary and keyed rows. The free-body matrix-free rows follow the allocation path, not a producer.
+# Add every new producer kernel here: a launched builder missing from this list is invisible to the check below.
 ROW_BUILDER_KERNELS = frozenset(
     (
         "write_walked_rows",

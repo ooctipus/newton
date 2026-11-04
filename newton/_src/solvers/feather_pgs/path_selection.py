@@ -129,14 +129,6 @@ def options_selection(solver) -> dict:
     return copy.deepcopy(solver._applied_options)
 
 
-def _keys_by_size(kernels) -> dict:
-    return {str(int(size)): _key(kernel) for size, kernel in kernels.items() if kernel is not None}
-
-
-def _counts(counts) -> dict:
-    return {str(int(size)): int(count) for size, count in counts.items() if count}
-
-
 def route_selection(solver) -> dict:
     """Describe every construction-time owner and variant that decides which kernels run.
 
@@ -161,7 +153,6 @@ def route_selection(solver) -> dict:
         "held_tree": _held_tree(solver),
         "contact_rows": _contact_rows(solver),
         "contact_consumers": _contact_consumers(solver),
-        "local_solve": _local_solve(solver),
         "paired_response": _paired_response(solver),
         "sparse_diagonal": _sparse_diagonal(solver),
         "sparse_mass_matrix": _sparse_mass_matrix(solver),
@@ -337,11 +328,6 @@ def _row_builder(solver, plan, size) -> dict:
         else:
             writers = (walk_rows.writer_kernel(solver),)
         kernels = (*writers, *marker)
-    elif method == "local_packets":
-        from . import row_packets, walk_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
-
-        # The packets' producer records every row and its unit source; the one writer walks the general worlds' rows.
-        kernels = (row_packets.produce_contacts, walk_rows.writer_kernel(solver))
     elif method == "keyed_rows":
         from . import keyed_rows, walk_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
 
@@ -367,7 +353,6 @@ def _contact_rows(solver) -> dict:
     point = bool(row.laws.point)
     # The plan the row pass (RowLaws.write_contacts) dispatches on: the route's producer writes every contact row.
     plan = contact_row_plan(solver)
-    packets = solver.placement.row_packets
     return {
         "producer": row.producer,
         "law": plan.law,
@@ -375,14 +360,6 @@ def _contact_rows(solver) -> dict:
         # for the dense contact rows built outside the sweep (_row_builder names the rows built elsewhere).
         "builder_by_dof": {str(int(size)): _row_builder(solver, plan, size) for size in plan.methods},
         "point_contact_paths": point,
-        "row_packets": {
-            "enabled": row.producer == "local_packets",
-            "reason": solver.placement.row_packets_reason,
-            "primary_dofs": None if packets is None else int(packets.primary),
-            "secondary_dofs": None if packets is None else int(packets.secondary),
-            "mimic_rows": None if packets is None else int(packets.mimics),
-            "packets": None if packets is None else int(packets.packets),
-        },
         "keyed_rows": {"enabled": row.producer == "keyed_rows", "reason": solver.placement.keyed_rows_reason},
         "compact_contact": {
             "boundary": row.producer == "compact_contact_boundary",
@@ -401,18 +378,6 @@ def _contact_consumers(solver) -> dict:
             if blocks
             else "Uncapped: a CPU launch, or a kernel compiled without the grid-stride loop, covers every slot."
         ),
-    }
-
-
-def _local_solve(solver) -> dict:
-    row = solver.spec.route
-    enabled = row.case == "K3"
-    return {
-        "enabled": enabled,
-        "internal_articulations_by_dof": _counts(solver.sweep.local_internal.counts) if enabled else {},
-        "pair_articulations_by_dof": _counts(solver.sweep.local_pair.counts) if enabled else {},
-        "residual_articulations_by_dof": _counts(solver.sweep.local_residual.counts) if enabled else {},
-        "reason": row.reasons["K3"],
     }
 
 
@@ -489,7 +454,6 @@ def _sparse_mass_matrix(solver) -> dict:
 
 
 def _sweep(solver) -> dict:
-    row = solver.spec.route
     solve = solver._plan.solve
     route = solve.route.name
     # Only free rigid bodies produce matrix-free rows: the pack kernel is built where it launches.
@@ -501,14 +465,6 @@ def _sweep(solver) -> dict:
         if packed
         else "Skipped: without free rigid bodies no matrix-free row exists.",
     }
-    local = None
-    if row.case == "K3":
-        local = {
-            "factory": "row_packets" if row.producer == "local_packets" else "local_owned",
-            "internal": _keys_by_size(solver.sweep.local_internal.kernels),
-            "pair": _keys_by_size(solver.sweep.local_pair.kernels),
-            "residual": _keys_by_size(solver.sweep.local_residual.kernels),
-        }
     kernels = solver.spec.kernels
     record = {
         "route": route,
@@ -522,7 +478,6 @@ def _sweep(solver) -> dict:
         "mf_gs_storage": _mf_gs_storage(solver),
         "mf_colored": _mf_colored(solver),
         "tiers": _tiers(solver),
-        "local": local,
     }
     record["readout"] = _readout(solver, record)
     record["exit_law"] = _exit_law(solver, record)
@@ -692,11 +647,6 @@ def _free_rigid_bodies(solver) -> dict:
             owners.append("sparse_free_rows")
         if solver.sweep.paired_response_primary_size is not None:
             owners.append("paired_factor" if row.case == "K5" else "paired_response")
-        # Built local kernels only.
-        if solver.sweep.local_pair.kernels:
-            owners.append("local_pair")
-        if solver.sweep.local_residual.kernels:
-            owners.append("local_residual")
         owners.append("matrix_free_rows")
     return {
         "count": count,

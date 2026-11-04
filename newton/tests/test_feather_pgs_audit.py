@@ -320,7 +320,7 @@ class TestAuditCUDA(TestAudit):
         for build, routes in (
             (scenes.box_stack, (conformance.MF_HELD,)),
             (scenes.legged, (conformance.MF_HELD, conformance.SPARSE, conformance.MF_PARALLEL)),
-            (scenes.gripper, (conformance.LOCAL_OWNED,)),
+            (scenes.gripper, (conformance.MF_PARALLEL,)),
             (scenes.hand, (conformance.PAIRED,)),
             (scenes.keyboard, (conformance.SPARSE_DIAGONAL, conformance.COMPACT_BOUNDARY)),
         ):
@@ -337,14 +337,9 @@ class TestAuditCUDA(TestAudit):
 
     def test_worlds_without_stored_rows_read_nan(self):
         """A world whose rows exist only inside its sweep reads NaN and is named, not skipped in silence."""
-        for build, route, phrase in (
-            (scenes.legged, conformance.KEYED_PARALLEL, "keyed rows"),
-            (scenes.gripper, conformance.LOCAL_PACKETS, "row packets"),
-        ):
-            with self.subTest(route=route.name):
-                audit, record = self._route(build(), route, 16)
-                self.assertTrue(np.all(np.isnan(audit["gap"])))
-                self.assertIn(phrase, record["reason"])
+        audit, record = self._route(scenes.legged(), conformance.KEYED_PARALLEL, 16)
+        self.assertTrue(np.all(np.isnan(audit["gap"])))
+        self.assertIn("keyed rows", record["reason"])
 
 
 if __name__ == "__main__":

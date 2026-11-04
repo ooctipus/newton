@@ -174,15 +174,12 @@ def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MAS
     zero_int, zero_float = array([0], wp.int32), array([[0.0]])
     zero_rows = wp.zeros((1, 1, 12), dtype=wp.float32, device=device)
     values = {
-        "general_world_count": array([1], wp.int32),
-        "general_worlds": zero_int,
-        "general_world_grid_stride": 1,
         "world_constraint_count": array([count], wp.int32),
         "dense_first": row_lines(device),
         "mf_first": row_lines(device),
         # Every row is in the velocity-limit segment.
         "dense_phase_bounds": array([[0, count]], wp.int32),
-        "local_solve_owner": zero_int,
+        "component_selector": zero_int,
         "world_dof_indices": array([[0, 1]], wp.int32),
         "rhs_bias": array(bias),
         "row_incident": array(incident),

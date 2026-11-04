@@ -161,7 +161,6 @@ def factory_calls():
         {"places": sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL)},
         {"places": sweep_routes.RowPlaces(impulses=Place.GLOBAL)},
         {"contact_torsion": True},
-        {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19},
         {"skip_tier_rows": 32},
         {"factor_coordinates": True},
         {"factor_coordinates": True, "independent_components": True},
@@ -443,14 +442,9 @@ def walk_calls():
     in the loop form); the predictor's force and response halves on a tree of each held width: one word a lane
     (franka), two (g1, with joins) and four (chain106); the support writer on g1 and kuka; the
     general writer with and without sides; the free-body headers; and the sweeps that walk rows (the matrix-free
-    Gauss-Seidel's free bodies, the local owners' block, the parallel tiers' rows).
+    Gauss-Seidel's free bodies, the parallel tiers' rows).
     """
-    from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
-        sweep_routes,
-        sweep_routes_local,
-        sweep_routes_tiers,
-        walk_rows,
-    )
+    from newton._src.solvers.feather_pgs import sweep_routes, sweep_routes_tiers, walk_rows  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import tree_kinetic_state as native  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.factor import walk as factor_walk  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout  # noqa: PLC0415
@@ -504,8 +498,6 @@ def walk_calls():
     mf_gs = _unwrapped(sweep_routes.mf_gs_kernel)
     free = {"factor_coordinates": True, "independent_components": True, "has_dense_velocity_limit_rows": False}
     yield "sweep_routes.mf_gs_kernel", mf_gs, (64, 32, 12, ARCH), free
-    local = _unwrapped(sweep_routes_local.local_owned_kernel)
-    yield "sweep_routes_local.local_owned_kernel", local, (192, 20, 9, ARCH), {"warps_per_block": 2}
     tiers = {"rows": 32, "min_rows": 0, "sweeps": 24, "inkernel_response": (18, 0, 0, 0)}
     yield "sweep_routes_tiers.parallel_kernel", sweep_routes_tiers.parallel_kernel, (64, 32, 18, ARCH), tiers
 
@@ -540,13 +532,11 @@ def census_calls():
     the product of each factory's flags at fixed shapes: matrix-free
     Gauss-Seidel (one shape within a warp's width of coordinates, one beyond
     it), sparse (one shape small enough for subwarp sweeps), paired factor,
-    local owners plain and over packet rows, sparse diagonal, parallel and
-    keyed parallel tiers. The matrix-free Gauss-Seidel sweep is crossed with
+    sparse diagonal, parallel and keyed parallel tiers. The matrix-free Gauss-Seidel sweep is crossed with
     resident row metadata.
     """
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
         keyed_rows,
-        row_packets,
         sweep_routes,
         sweep_routes_diag,
         sweep_routes_local,
@@ -558,19 +548,10 @@ def census_calls():
     mf_gs = (
         _axis("places", sweep_routes.ROW_PLACES),
         _axis("has_dense_velocity_limit_rows", (True, False)),
-        ({}, {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
         _axis("contact_torsion"),
         _axis("factor_coordinates"),
         _axis("skip_tier_rows", (0, 32)),
         _axis("independent_components"),
-    )
-    local = (
-        _axis("paired_dof_count", (0, 6)),
-        _axis("persistent_queue"),
-        _axis("warps_per_block", (1, 2)),
-        _axis("lanes_per_world", (32, 16, 8)),
-        _axis("contact_capable", (True, False)),
-        ({}, {"mf_max_constraints": 64, "local_mf_max_constraints": 12}),
     )
     keyed = KeyedLayout(16, 6, 0, 16, 128, False, 0)
     specs = (
@@ -600,18 +581,6 @@ def census_calls():
             sweep_routes_local.paired_factor_kernel,
             ((192, 29, 23, 6, ARCH),),
             (_axis("contact_triples"), _axis("independent_components"), _axis("contact_units")),
-        ),
-        (
-            "sweep_routes_local.local_owned_kernel",
-            sweep_routes_local.local_owned_kernel,
-            ((192, 20, 9, ARCH),),
-            local,
-        ),
-        (
-            "row_packets.get_local_factory(9, 6, 40, 11)",
-            row_packets.get_local_factory.__wrapped__(9, 6, 40, 11),
-            ((192, 20, 9, ARCH),),
-            local,
         ),
         (
             "sweep_routes_diag.sparse_diagonal_kernel",

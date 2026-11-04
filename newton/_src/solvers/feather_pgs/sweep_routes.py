@@ -29,7 +29,6 @@ from .solve_policy import DEFAULT_POLICY, QUIET_LITERAL, SolvePolicy, block_argm
 from .sweep import (
     CONTACT,
     FRICTION,
-    PGS_LOCAL_SOLVE_OWNER_GENERAL,
     SPEED,
     VELOCITY_LIMIT,
     CachedPairMetric,
@@ -56,8 +55,7 @@ _MF_ADMISSION = f"if (mf_rt == {SPEED}) continue;"
 
 def worlds(queued: bool) -> kernel_template.Dispatch:
     """The worlds a sweep launch covers, chosen once in the plan: a block a world, or (``queued``) a device list of
-    them (``general_worlds``, its count first) walked with the grid's stride, such as the worlds the claims left to
-    the general owner."""
+    them (``general_worlds``, its count first) walked with the grid's stride, such as a Jacobi tier's own list."""
     return kernel_template.items(
         "world", queue=("general_world_count", "general_world_grid_stride", "general_worlds") if queued else None
     )
@@ -68,7 +66,7 @@ MF_GS_ABI = kernel_template.params(
     ("world_constraint_count", wp.array[int]),
     ("dense_first", wp.array[int]),
     ("dense_phase_bounds", wp.array2d[int]),
-    ("local_solve_owner", wp.array[int]),
+    ("component_selector", wp.array[int]),
     ("world_dof_indices", wp.array2d[int]),
     ("rhs_bias", wp.array2d[float]),
     ("row_incident", wp.array2d[float]),
@@ -624,7 +622,6 @@ def mf_gs_source(
     colored_worlds: bool = False,
     places: RowPlaces = STAGED_ROWS,
     has_dense_velocity_limit_rows: bool = True,
-    skip_local_internal_worlds: bool = False,
     contact_torsion: bool = False,
     factor_coordinates: bool = False,
     skip_tier_rows: int = 0,
@@ -659,7 +656,7 @@ def mf_gs_source(
     if mapping not in MAPPINGS:
         raise ValueError(f"mapping must be one of {MAPPINGS}, got {mapping!r}")
     colored = mapping == "colored"
-    if factor_coordinates and (has_dense_velocity_limit_rows or skip_local_internal_worlds):
+    if factor_coordinates and has_dense_velocity_limit_rows:
         raise ValueError("factor coordinates require the paired contact solve")
     if independent_components and not factor_coordinates:
         raise ValueError("Independent components require the paired factor-coordinate solve")
@@ -688,12 +685,12 @@ def mf_gs_source(
         wide_rows=wide_rows,
     )
 
-    # Ownership: the paired owner's signed selector arrives in local_solve_owner under independent components.
+    # Ownership: the paired owner's signed selector arrives in component_selector under independent components.
     dense_count = "int m_dense = world_constraint_count.data[world];"
     component = owned = ""
     if independent_components:
         dense_count = (
-            "const bool split_component = local_solve_owner.data[world] < 0;\n"
+            "const bool split_component = component_selector.data[world] < 0;\n"
             "    int m_dense = split_component ? 0 : world_constraint_count.data[world];"
         )
         component = (
@@ -705,8 +702,6 @@ def mf_gs_source(
     skips = []
     if factor_coordinates:
         skips.append("    if (m_mf == 0) return;")
-    if skip_local_internal_worlds:
-        skips.append(f"    if (local_solve_owner.data[world] != {PGS_LOCAL_SOLVE_OWNER_GENERAL}) return;")
     if skip_tier_rows > 0:
         skips.append(f"    if (m_mf == 0 && m_dense <= {int(skip_tier_rows)}) return;")
     mapped = ""
@@ -883,8 +878,6 @@ def mf_gs_kernel(
     colored_worlds: bool = False,
     places: RowPlaces = STAGED_ROWS,
     has_dense_velocity_limit_rows: bool = True,
-    skip_local_internal_worlds: bool = False,
-    local_internal_max_constraints: int = 0,
     contact_torsion: bool = False,
     factor_coordinates: bool = False,
     skip_tier_rows: int = 0,
@@ -909,7 +902,6 @@ def mf_gs_kernel(
         colored_worlds=colored_worlds,
         places=places,
         has_dense_velocity_limit_rows=has_dense_velocity_limit_rows,
-        skip_local_internal_worlds=skip_local_internal_worlds,
         contact_torsion=contact_torsion,
         factor_coordinates=factor_coordinates,
         skip_tier_rows=skip_tier_rows,
@@ -928,7 +920,6 @@ def mf_gs_kernel(
         f"_s{max_row_dofs}"
         f"_densevlim{int(has_dense_velocity_limit_rows)}"
         + places.suffix
-        + (f"_local_fallback{local_internal_max_constraints}" if skip_local_internal_worlds else "")
         + ("_torsion" if contact_torsion else "")
         + ("_factor" if factor_coordinates else "")
         + (f"_skiptier{int(skip_tier_rows)}" if skip_tier_rows > 0 else "")
@@ -945,7 +936,7 @@ def mf_gs_kernel(
         name,
         COLORED_ABI if colored else COLORED_WORLDS_ABI if colored_worlds else MF_GS_ABI,
         snippet,
-        worlds(skip_local_internal_worlds),
+        worlds(False),
         extra=(
             *material_arguments(material),
             *solve_policy.arguments,

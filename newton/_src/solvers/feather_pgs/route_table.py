@@ -108,10 +108,6 @@ CAPABILITIES = {
         "iterations",
         "no_preelimination",
     ),
-    # On-chip blocks of a world's rows (local owners), claimed per world at run time.
-    "local": ("cuda", "plain", "no_velocity_limits"),
-    # The local owners' row producer: limit prefix and contact packets built in place.
-    "row_packets": ("limits",),
     # The paired factor's sweep in factor coordinates (one articulation and one free body per world).
     "paired_factor": ("cuda", "plain", "iterations", "no_velocity_limits"),
     # Its runtime claim: independent articulation and free-body components per world.
@@ -127,8 +123,6 @@ CAPABILITIES = {
 
 _LABELS = {
     "packed": "Native sparse factors need",
-    "local": "Local owners need",
-    "row_packets": "Local packets need",
     "paired_factor": "The factor-coordinate sweep needs",
     "components": "Components need",
     "tiers": "The Jacobi tiers need",
@@ -148,7 +142,6 @@ def capable(owner: str, laws: Laws) -> str | None:
 
 CASES = {
     "K2": "the sparse diagonal of a tree beside a star",
-    "K3": "the local owners of a small tree beside a body",
     "K1": "native sparse factors of a single tree",
     "K5": "factor coordinates of a tree beside one free body",
     "K4": "the Jacobi tiers of dense trees beside a free body",

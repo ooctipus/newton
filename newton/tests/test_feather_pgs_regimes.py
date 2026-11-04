@@ -1749,7 +1749,7 @@ class TestQ18ManufacturedCUDA(unittest.TestCase):
     PLACEMENTS = (
         (scenes.box_stack, 60, 2.0 / 3.0, ("MF_HELD", "MF_DEFAULT")),
         (scenes.legged, 30, 2.0 / 3.0, ("MF_HELD", "SPARSE", "SPARSE_TRIPLETS")),
-        (scenes.gripper, 60, SPARSE, ("LOCAL_PACKETS", "LOCAL_FOREST", "LOCAL_OWNED")),
+        (scenes.gripper, 60, SPARSE, ("MF_DEFAULT", "MF_FOREST")),
         (scenes.keyboard, 30, 2.0 / 3.0, ("SPARSE_DIAGONAL", "SPARSE_DIAGONAL_TREE", "COMPACT_BOUNDARY")),
         (scenes.hand, 30, 2.0 / 3.0, ("PAIRED", "PAIRED_FOREST")),
     )

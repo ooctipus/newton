@@ -557,7 +557,9 @@ def _rollout(
     anchor when the patch finish began, which releases it (``released``), and, with the classifier,
     the worlds whose rows all separate (``separating``) and those it resolved (``resolved``).
     """
-    pins = {"storage": "dense", "predicted_twists": bool(published)}
+    # The classifier evaluates the serial matrix-free sweep's law: the pin keeps the Jacobi tiers (case K4, an arm
+    # beside a free body, whose keyed rows own the contact rows) off these worlds.
+    pins = {"storage": "dense", "predicted_twists": bool(published), "tiers": 0}
     if not classifier:
         pins["claims"] = ()
     with patch.object(SolverFeatherPGS, "_route_pins", pins):

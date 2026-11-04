@@ -15,15 +15,15 @@ Routes
     ``get_path_selection()["routes"]`` before its first step and asserts the
     record the route expects, so a test cannot silently run another route.
     Owners that claim worlds at run time (sparse factors, the parallel tiers,
-    local owners, the paired and sparse-diagonal sweeps) also get an ownership
+    the paired and sparse-diagonal sweeps) also get an ownership
     test that reads the solve readout. Covered on CUDA: native sparse factors
     (with contact triplets), the matrix-free Gauss-Seidel sweep with its
-    parallel and keyed-parallel tiers, local owners (row packets and owned rows), the paired factor sweep
+    parallel and keyed-parallel tiers, the paired factor sweep
     and the sparse-diagonal sweep (sparse-diagonal rows and the compact contact
     boundary); on CPU, the general row of the matrix-free sweep, one thread per
     world. Dynamics owners: the held groups (sparse, tree and forest), scalar
     branches and ordinary dynamics. Contact-row producers: the one writer (into the general, the support and the
-    sparse diagonal's sinks), keyed rows, local packets and the compact contact boundary. Friction: point (``friction_anchor_beta=0``) and
+    sparse diagonal's sinks), keyed rows and the compact contact boundary. Friction: point (``friction_anchor_beta=0``) and
     persistent patch friction (0.2).
 
 Scenes and features
@@ -1373,7 +1373,7 @@ _DENSE = {"storage": "dense"}
 REFERENCE_CUDA = Route(
     "reference",
     "cuda",
-    # The plain matrix-free Gauss-Seidel sweep over the held tree and rows: the general placement declines the local,
+    # The plain matrix-free Gauss-Seidel sweep over the held tree and rows: the general placement declines the
     # paired and sparse-diagonal owners, and every world is solved (no resolved-world claim). The tree factor itself
     # answers to the float64 mass matrix (test_feather_pgs_factor).
     options=_MF,
@@ -1381,7 +1381,6 @@ REFERENCE_CUDA = Route(
     expect={
         "sweep.route": "matrix_free_gs",
         "sweep.tiers": None,
-        "local_solve.enabled": False,
         "paired_response.enabled": False,
         "sparse_diagonal.enabled": False,
         "held_tree.owner": "mixed",
@@ -1445,54 +1444,20 @@ SPARSE_TRIPLETS = Route(
     options=_MF,
     expect={"sweep.route": "sparse_pgs", "sparse_mass_matrix.contact_triplets": True},
 )
-LOCAL_PACKETS = Route(
-    "local_packets",
+MF_FOREST = Route(
+    "mf_forest",
     "cuda",
-    options=_MF,
-    expect={
-        "local_solve.enabled": True,
-        "sweep.local.factory": "row_packets",
-        "contact_rows.producer": "local_packets",
-        "held_tree.owner": "mixed",
-    },
-)
-LOCAL_FOREST = Route(
-    "local_packets_forest",
-    "cuda",
-    # The franka recipe's route: local packets over one held forest per world.
+    # The franka recipe's grouping: one held forest per world under the default rules.
     options=_MF,
     pins={"grouping": "forest"},
-    expect={
-        "local_solve.enabled": True,
-        "contact_rows.producer": "local_packets",
-        "held_tree.owner": "forest",
-        "held_tree.groups.0.operator": "forest",
-    },
+    expect={"sweep.route": "matrix_free_gs", "held_tree.owner": "forest", "held_tree.groups.0.operator": "forest"},
 )
-LOCAL_KINEMATIC = Route(
-    "local_packets_kinematic_table",
+MF_KINEMATIC = Route(
+    "mf_kinematic_table",
     "cuda",
     # A kinematic table (a prescribed root) makes one held forest per world the default, as on the franka task.
     options=_MF,
-    expect={
-        "local_solve.enabled": True,
-        "contact_rows.producer": "local_packets",
-        "held_tree.owner": "forest",
-        "held_tree.groups.0.operator": "forest",
-    },
-)
-LOCAL_OWNED = Route(
-    "local_owned",
-    "cuda",
-    # Without the packets the local owners' class walks through the one writer (FL3.6): the kernel reads its rows.
-    options=_MF,
-    pins={"producer": "walk"},
-    expect={
-        "local_solve.enabled": True,
-        "sweep.local.factory": "local_owned",
-        "contact_rows.producer": "walk",
-        "held_tree.owner": "mixed",
-    },
+    expect={"sweep.route": "matrix_free_gs", "held_tree.owner": "forest", "held_tree.groups.0.operator": "forest"},
 )
 PAIRED = Route(
     "paired",
@@ -1643,21 +1608,10 @@ def cuda_groups() -> list:
                 ),
             ),
             # A grasp drifts with the row order at a small budget: the scene sorts its contacts and runs 32 iterations.
-            Group(
-                _physics(scenes.gripper(), law, 32),
-                ref,
-                (LOCAL_PACKETS, LOCAL_FOREST, LOCAL_OWNED),
-            ),
-            Group(_physics(scenes.gripper(table=True), law, 32), ref, (LOCAL_KINEMATIC,)),
-            # The local owners' rows with spin rows (the grasp: soft fingers), against the general route's.
-            Group(
-                _physics(scenes.gripper(), law, 32, "torsion", contact_torsion=True),
-                ref,
-                tuple(
-                    route.but(f"{route.name}_torsion", expect={"friction.torsion": True})
-                    for route in (LOCAL_PACKETS, LOCAL_OWNED)
-                ),
-            ),
+            Group(_physics(scenes.gripper(), law, 32), ref, (MF_DEFAULT, MF_FOREST)),
+            Group(_physics(scenes.gripper(table=True), law, 32), ref, (MF_KINEMATIC,)),
+            # The grasp's spin rows (soft fingers) under the default rules, against the general route's.
+            Group(_physics(scenes.gripper(), law, 32, "torsion", contact_torsion=True), ref, (MF_TORSION,)),
             Group(
                 _physics(scenes.keyboard(), law, 16),
                 ref,
@@ -1750,7 +1704,7 @@ def cuda_groups() -> list:
     # specialized placements' row laws against the reference's).
     for scene, iterations, routes in (
         (scenes.legged(), 32, (SPARSE, SPARSE_TRIPLETS, MF_HELD, MF_PARALLEL, KEYED_PARALLEL)),
-        (scenes.gripper(), 32, (LOCAL_PACKETS, LOCAL_FOREST, LOCAL_OWNED)),
+        (scenes.gripper(), 32, (MF_DEFAULT, MF_FOREST)),
         (scenes.keyboard(), 16, (SPARSE_DIAGONAL, SPARSE_DIAGONAL_TREE, COMPACT_BOUNDARY)),
         (scenes.hand(), 16, (PAIRED, PAIRED_FOREST)),
     ):
@@ -2000,8 +1954,6 @@ OWNERSHIP = (
     (scenes.legged, "point", 32, SPARSE, ("sparse_pgs",), ("mf_gs",)),
     (scenes.legged, "point", 32, MF_PARALLEL, (), ("mf_gs",)),
     (scenes.legged, "patch", 32, KEYED_PARALLEL, (), ("mf_gs",)),
-    (scenes.gripper, "point", 32, LOCAL_PACKETS, ("local_pair|local_residual|local_internal",), ()),
-    (scenes.gripper, "patch", 32, LOCAL_OWNED, ("local_pair|local_residual|local_internal",), ()),
     # The paired factor sweep solves worlds of independent components; coupled worlds take the mixed fallback.
     (scenes.hand, "point", 16, PAIRED, ("paired_factor", "mf_gs"), ()),
     (scenes.keyboard, "point", 16, SPARSE_DIAGONAL, ("sparse_diagonal",), ("mf_gs",)),

@@ -62,13 +62,6 @@ VELOCITY_LIMIT = int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
 SPEED = int(PGS_CONSTRAINT_TYPE_SPEED)
 TORSION = int(PGS_CONSTRAINT_TYPE_TORSION)
 
-# A world's local-solve owner, as the local sweeps' classification assigns it
-# (:func:`.sweep_routes_local.classify_local_solve_worlds`); the general sweeps skip the worlds of the others.
-PGS_LOCAL_SOLVE_OWNER_GENERAL = 0
-PGS_LOCAL_SOLVE_OWNER_SINGLE = 1
-PGS_LOCAL_SOLVE_OWNER_PAIR = 2
-PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL = 3
-
 
 def indent(text: str, prefix: str) -> str:
     """Prefix every non-empty line of ``text``."""
@@ -395,11 +388,10 @@ def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> st
     and applied, the second tangent's before the row's own.
     """
     op, row, kind = ctx.operator, ctx.row, ctx.kind
-    full = residual if op.residual_includes_rhs else f"{residual} + {ctx.rhs(row)}"
     lines = [
         f"float old_impulse = {ctx.load(row)};",
-        f"float residual = {full};",
-        f"float row_bound = {_row_bound(ctx, op.terms(residual, ctx.rhs(row), whole=op.residual_includes_rhs))};",
+        f"float residual = {residual} + {ctx.rhs(row)};",
+        f"float row_bound = {_row_bound(ctx, op.terms(residual, ctx.rhs(row), whole=False))};",
     ]
     step = op.step("residual", row)
     if laws.regularize:

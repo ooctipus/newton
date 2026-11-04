@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Source checks of the local owners' and the paired factor sweeps as configurations of the sweep emitter.
+"""Source checks of the paired factor sweep as a configuration of the sweep emitter.
 
-No GPU is needed: each kernel rejects the options it does not admit, declares its staging and, with the CUDA toolkit
-on ``PATH``, compiles offline without local memory.
+No GPU is needed: the kernel rejects the options it does not admit and, with the CUDA toolkit on ``PATH``, compiles
+offline without local memory.
 """
 
 import importlib.util
@@ -15,53 +15,13 @@ import sys
 import unittest
 from pathlib import Path
 
-from newton._src.solvers.feather_pgs import row_packets, sweep_routes_local
-from newton._src.solvers.feather_pgs.response_operator import (
-    FactorComponent,
-    FactorRows,
-    FreeBodyZ,
-    Lanes,
-    LocalBlock,
-)
+from newton._src.solvers.feather_pgs import sweep_routes_local
+from newton._src.solvers.feather_pgs.response_operator import FactorComponent, FactorRows, Lanes
 from newton._src.solvers.feather_pgs.solve_policy import DEFAULT_POLICY, SolvePolicy
 
-_LOCAL = sweep_routes_local.local_owned_kernel.__wrapped__
 _PAIRED = sweep_routes_local.paired_factor_kernel.__wrapped__
 
-_PAIR = {"paired_dof_count": 6, "persistent_queue": True, "warps_per_block": 2}
-
-LOCAL_CALLS = (
-    # The single, pair and residual owners as the solver builds them (the gripper scenes' sizes), and the other lane
-    # layouts of the single owner.
-    ("single", (64, 3, 3, "120"), {"lanes_per_world": 16, "contact_capable": False}),
-    (
-        "single_l8_w2",
-        (192, 9, 9, "120"),
-        {"lanes_per_world": 8, "contact_capable": False, "warps_per_block": 2},
-    ),
-    ("single_l32", (64, 16, 16, "120"), {"contact_capable": False}),
-    ("pair", (64, 20, 3, "120"), _PAIR),
-    ("pair_w1", (64, 20, 3, "120"), {"paired_dof_count": 6}),
-    ("residual", (64, 40, 3, "120"), {**_PAIR, "mf_max_constraints": 512, "local_mf_max_constraints": 12}),
-)
-"""``(label, arguments, options)`` of the local owners' live configurations."""
-
 PAIRED_SCHEDULES = ({}, {"contact_triples": True}, {"contact_units": True})
-
-
-def _row_inputs(primary: int):
-    """The row packets' row inputs for a primary articulation of ``primary`` coordinates and a free body."""
-    return row_packets.get_local_factory.__wrapped__(primary, 6, 40, primary + 2).keywords["row_inputs"]
-
-
-def _local_variants():
-    for (label, args, options), packets, policy in itertools.product(
-        LOCAL_CALLS, (False, True), (DEFAULT_POLICY, SolvePolicy(readout="sweeps"))
-    ):
-        kwargs = {**options, "solve_policy": policy}
-        if packets:
-            kwargs["row_inputs"] = _row_inputs(args[2])
-        yield f"{label}{'_packets' if packets else ''}{policy.suffix}", args, kwargs
 
 
 def _paired_variants():
@@ -81,71 +41,6 @@ def _block(body: str, head: str) -> str:
         if depth == 0 and body[index] == "}":
             return body[start : index + 1]
     raise ValueError(f"unbalanced block {head!r}")
-
-
-class TestLocalOwnedRoute(unittest.TestCase):
-    """The local owners' sweeps (``sweep_routes_local.local_owned_kernel``)."""
-
-    def test_variants_build(self):
-        """Every live configuration builds, over packet rows too and with a counted readout."""
-        for label, args, kwargs in _local_variants():
-            with self.subTest(label):
-                self.assertTrue(_LOCAL(*args, **kwargs).key.startswith("sweep_local"))
-
-    def test_invalid_options_raise(self):
-        invalid = (
-            {"warps_per_block": 3},
-            {"lanes_per_world": 4},
-            {"contact_capable": False, "paired_dof_count": 6},
-            {"local_mf_max_constraints": 12, "mf_max_constraints": 64},
-            {"paired_dof_count": 6, "local_mf_max_constraints": 12},
-            {"lanes_per_world": 8},
-            {"lanes_per_world": 16, "contact_capable": False, "paired_dof_count": 0, "warps_per_block": 1},
-        )
-        for options in invalid:
-            args = (64, 20, 3 if options.get("lanes_per_world") != 16 else 17, "120")
-            with self.subTest(options), self.assertRaises(ValueError):
-                _LOCAL(*args, **options)
-
-    def test_every_row_ends_with_a_barrier(self):
-        """Lanes read residuals other lanes updated: every row's update ends with the group's barrier."""
-        for label, args, kwargs in LOCAL_CALLS:
-            with self.subTest(label):
-                options = {key: value for key, value in kwargs.items() if key != "persistent_queue"}
-                body, _ = sweep_routes_local.local_owned_source(*args[:3], **options)
-                loops = ["for (int i = 0; i < row_count; ++i) {"]
-                if options.get("local_mf_max_constraints"):
-                    loops.append("for (int i = 0; i < mf_count; ++i) {")
-                for head in loops:
-                    rows = _block(body, head)
-                    self.assertTrue(rows[: rows.rindex("}")].rstrip().endswith("SYNC();"), head)
-
-    def test_staging_declares_one_struct_per_group(self):
-        _, staging = sweep_routes_local.local_owned_source(
-            192, 9, 9, lanes_per_world=8, contact_capable=False, warps_per_block=2
-        )
-        self.assertEqual(staging.groups, 8)
-        body, _ = sweep_routes_local.local_owned_source(
-            192, 9, 9, lanes_per_world=8, contact_capable=False, warps_per_block=2
-        )
-        self.assertIn("SHARED LocalScratch localscratch[8];", body)
-        self.assertIn("#define s_A localscratch[SUB].s_A", body)
-        self.assertIn("#undef s_A", body)
-        # The trees' factor is the walk's (FL3.6): no staged factor; the rows are the walk's, contactless owners
-        # included, and the change goes to the step's one leave in the walk's coordinates.
-        self.assertNotIn("s_L", body)
-        self.assertIn("WALK_TREE(", body)
-        self.assertIn("walk.du.data[dof] += s_v[d];", body)
-        self.assertNotIn("WALK_DOWN", body)
-        self.assertNotIn("value/diagonal", body)
-        # A paired owner's free body goes the same way; the packets' owner stages the walk in shared memory.
-        paired, _ = sweep_routes_local.local_owned_source(192, 20, 9, 6, warps_per_block=2)
-        self.assertNotIn("s_L", paired)
-        self.assertIn("walk.du.data[dof] += s_v[d];", paired)
-        _, staged = sweep_routes_local.local_owned_source(192, 20, 9, 6, warps_per_block=2, row_inputs=_row_inputs(9))
-        self.assertGreater(
-            staged.bytes, sweep_routes_local.local_owned_source(192, 20, 9, 6, warps_per_block=2)[1].bytes
-        )
 
 
 class TestPairedFactorRoute(unittest.TestCase):
@@ -220,70 +115,7 @@ class TestPairedFactorRoute(unittest.TestCase):
 
 
 class TestResponseOperators(unittest.TestCase):
-    """The operators the two routes add: the local response block and the factor-coordinate rows."""
-
-    def test_local_block_views_and_packed_entries(self):
-        block = LocalBlock(
-            15,
-            9,
-            11,
-            seeds=True,
-            staged=True,
-            wrenches=True,
-            release=True,
-            lanes=Lanes(32),
-            free=FreeBodyZ(Lanes(32)),
-        )
-        self.assertEqual(block.rows, "row_count + mf_count")
-        self.assertEqual(block.residual("jv", ""), "float jv = s_res[i];")
-        free = LocalBlock(15, 9, lanes=Lanes(32), free=FreeBodyZ(Lanes(32)), first="row_count")
-        self.assertEqual(free.residual("jv", ""), "float jv = s_res[row_count + i];")
-        coupling = free.coupling("cross", "i", "sib", "")
-        self.assertIn("(row_count + sib) > (row_count + i)", coupling)
-        self.assertIn("s_A[hi * (hi + 1) / 2 + lo]", coupling)
-        packets = row_packets.get_local_factory(9, 6, 20, 11).keywords["row_inputs"]
-        with self.assertRaises(ValueError):
-            LocalBlock(16, 9, 11, seeds=True, wrenches=True, lanes=Lanes(32)).respond(packets, "")
-        # The packets' seeds walked in the kernel (FL3.6) on the world's staged walk: the tree's and the paired free
-        # body's (a one-body tree), the release of the tree's slips along their paths, then |z|^2 in coordinate order.
-        prologue = block.prologue()
-        self.assertIn("WALK_READ(WALK_LDG, r, walk.data.data + (size_t)d * ", prologue)
-        self.assertIn("const auto walk_free = [&]() { WALK_TREE(free_path, 1, 6); };", prologue)
-        self.assertNotIn("walk.data.data + (size_t)walk_d0", prologue)
-        respond = block.respond(packets, "")
-        self.assertIn(
-            "walk_wrench(&s_Z[staged], s_v, walk_data, walk_link, walk_now, walk_now_link, walk_shift,", respond
-        )
-        self.assertIn(
-            "walk_wrench(&s_Z[staged + 9], s_v + 9, free_data, free_link, free_now, free_now_link,\n"
-            "                                    free_shift, 0, wrench);",
-            respond,
-        )
-        self.assertIn("incident += walk_covector(&s_Z[staged], dof, weight);", respond)
-        self.assertIn("WALK_RELEASE(walk.release, art, &s_Z[staged]);", respond)
-        self.assertIn("row_diagonal += z * z;", respond)
-        self.assertNotIn("s_L", respond)
-        # Read in place, the same walks take the device walk's data (a data-chosen layout).
-        in_place = LocalBlock(15, 9, 11, seeds=True, wrenches=True, lanes=Lanes(32)).prologue()
-        self.assertIn("const float* walk_now = reinterpret_cast<const float*>(walk.now.data + walk_d0);", in_place)
-        self.assertNotIn("s_walk", in_place)
-        # The one writer's stored rows: read, not whitened again; the walk read in place for the leave.
-        stored_block = LocalBlock(15, 9, release=True, lanes=Lanes(32))
-        stored = stored_block.respond(sweep_routes_local.StoredLocalRows(), "")
-        self.assertIn("Z_row[first_p + c]", stored)
-        self.assertIn("const float incident = row_incident.data[world_row_base + row];", stored)
-        self.assertNotIn("WALK_", stored)
-        self.assertNotIn("s_walk", stored_block.prologue())
-        assembled = block.assemble(lambda r: f"rhs[{r}]", "")
-        self.assertIn("a += s_Z[hi * 15 + d] * s_Z[lo * 15 + d];", assembled)
-        self.assertNotIn("s_v", assembled)
-        self.assertIn("side_term += mf_Z.data[row12 + d] * s_Z[lo * 15 + row_a + d];", assembled)
-        commit = block.commit("")
-        self.assertIn("u += s_Z[r * 15 + d] * s_app[r];", commit)
-        self.assertIn("u += mf_Z.data[row12 + d - row_a] * applied;", commit)
-        # No leave in the block, for either row source: the change goes to the step's one leave.
-        for source in (block, stored_block):
-            self.assertFalse(hasattr(source, "leave"))
+    """The operator the paired route adds: the factor-coordinate rows."""
 
     def test_factor_rows_fuse_a_pair_ladder(self):
         rows = FactorRows(23, (FactorComponent(17, "o", "l"),), Lanes(32), diagonal=lambda r: f"s_diag[{r}]")
@@ -323,11 +155,6 @@ class TestOfflineCompile(unittest.TestCase):
 
     def _compile(self, kernel, block):
         self.assertEqual(_kernel_sass().compile_kernel(kernel, arch=120, block_dim=block)["local"], 0)
-
-    def test_local_owners_compile(self):
-        for label, args, kwargs in LOCAL_CALLS[3:]:
-            with self.subTest(label):
-                self._compile(_LOCAL(*args, **kwargs), 32 * kwargs.get("warps_per_block", 1))
 
     def test_paired_schedules_compile(self):
         for schedule in PAIRED_SCHEDULES:

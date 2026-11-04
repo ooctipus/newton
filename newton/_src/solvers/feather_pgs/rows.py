@@ -646,8 +646,8 @@ class RowLaws:
     # glued to that sequence. The stage list (:func:`.step_plan._stages`) runs the families a class holds, in this
     # order: :meth:`begin`, :meth:`write_mimics`, :meth:`write_links`, :meth:`prepare_fused_limits`,
     # :meth:`write_limits`, :meth:`bound_phase` (0), :meth:`write_velocity_limits`, :meth:`bound_phase` (1),
-    # :meth:`write_contacts`, :meth:`bound_free_body_contacts`, :meth:`write_free_body_limits`, the local row packets'
-    # finish, :meth:`finalize_dense` and the keyed rows' finish.
+    # :meth:`write_contacts`, :meth:`bound_free_body_contacts`, :meth:`write_free_body_limits`, :meth:`finalize_dense`
+    # and the keyed rows' finish.
     #
     # Dense row-family layout: slots are handed out in the order [mimic][joint-limit][joint-velocity-limit]
     # [contact/friction], so each family owns one contiguous dense row range:
@@ -658,12 +658,9 @@ class RowLaws:
     # keep a stable slot index across steps.
 
     def begin(self, solver, state_in: State, state_aug: State, dt: float) -> None:
-        """Clear the rows' allocation state, and start the local row packets' and the keyed rows' step where the class
-        holds them."""
+        """Clear the rows' allocation state, and start the keyed rows' step where the class holds them."""
         placement = solver.placement
         placement.begin()
-        if placement.row_packets is not None:
-            placement.row_packets.prepare_prefix(state_in, dt)
         if placement.keyed_rows is not None:
             placement.keyed_rows.begin_rows(state_in, state_aug, dt)
 
@@ -684,8 +681,7 @@ class RowLaws:
 
     def write_mimics(self, solver, state_in: State, dt: float) -> None:
         """The mimic (joint coupling) equality rows, a static count per model: one warp per articulation reserves,
-        writes and publishes them, as the joint limits (:mod:`.prefix_rows`); staged where no local row packets hold
-        them."""
+        writes and publishes them, as the joint limits (:mod:`.prefix_rows`)."""
         law = self._prefix_law(solver, prefix_rows.PrefixMimicLaw, state_in, dt, mimics=self, mimic_model=solver.model)
         support = solver.placement.row_support()
         for size, warp_kernel in self.mimic_warp_kernels.items():
@@ -884,9 +880,7 @@ class RowLaws:
                 )
 
             # The one writer's contact rows ("walk") take their records in the writer (walk_rows).
-            if plan.producer == "local_packets":
-                solver.placement.row_packets.produce_contacts(contact_input)
-            elif plan.producer == "keyed_rows":
+            if plan.producer == "keyed_rows":
                 solver.placement.keyed_rows.produce_contacts(contact_input)
             elif plan.producer == "compact_contact_boundary":
                 from .compact_contact import launch_contacts  # noqa: PLC0415
@@ -1026,7 +1020,7 @@ class RowLaws:
         )
 
     def finalize_dense(self, solver) -> None:
-        """Finalize the dense rows' counts with status, after every dense producer (the local row packets' included)."""
+        """Finalize the dense rows' counts with status, after every dense producer."""
         self._finalize(solver, 0)
 
     def write_rhs(self, solver, dt: float) -> None:
@@ -1112,10 +1106,9 @@ class RowLaws:
             bind_dense_rows(placement),
             placement.row_support(),
             placement.constraint_count,
-            # The local owners' packets and the keyed tiers keep their worlds' seeds: the writer walks the general
-            # worlds' rows.
-            placement.keyed_rows.owner if placement.keyed_rows is not None else placement.local_solve_owner,
-            int(placement.row_packets is not None or placement.keyed_rows is not None),
+            # The keyed tiers keep their worlds' seeds: the writer walks the general worlds' rows.
+            placement.keyed_rows.owner if placement.keyed_rows is not None else placement.dummy_is_free_rigid,
+            int(placement.keyed_rows is not None),
             lanes,
             contact_input,
             patch_row_law(solver),

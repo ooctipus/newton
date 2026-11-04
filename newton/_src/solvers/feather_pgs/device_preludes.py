@@ -633,7 +633,7 @@ def lane_scan(value: int, lanes: int) -> int:
     """The sum of ``value`` over the group's lower lanes (0 on the CPU)."""
 
 
-# The old names, kept while track R's row_slots.py and row_packets.py call them (ZXB): a warp's group of the above.
+# The old names, kept while track R's row_slots.py calls them (ZXB): a warp's group of the above.
 @wp.func
 def warp_sum(value: int) -> int:
     return lane_sum(value, 32)
@@ -647,13 +647,3 @@ def warp_scan(value: int) -> int:
 @wp.func
 def warp_sync():
     lane_sync(32)
-
-
-@wp.func
-def warp_lane() -> int:
-    return lane_index(32)
-
-
-@wp.func
-def warp_stride() -> int:
-    return lane_stride(32)

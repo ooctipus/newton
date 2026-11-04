@@ -9,9 +9,7 @@ prefix producer: a lane group walks an articulation's candidates in order, takes
 :data:`.row_laws.ROW_LAW`, places the active rows in candidate order and writes their records. The producers differ
 in their families, in who owns the world's row counter and in the sink their consumer reads: the general route's
 joint limits and joint velocity limits (the per-size Jacobian, or the one writer's unit sources) reserve on the
-shared counter;
-local row packets (mimic and limit rows into sparse coefficients) and keyed rows (limit and velocity-limit rows into
-row keys) own their worlds' counters.
+shared counter; keyed rows (limit and velocity-limit rows into row keys) own their worlds' counters.
 """
 
 import warp as wp

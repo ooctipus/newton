@@ -25,7 +25,7 @@ Each row store fills the rows' ``J_i v+ + eps_i lambda_i`` (:func:`packed_rows`,
 rows are read as ``Z_i^T u+`` with ``u+`` the walk's coordinates of ``v+`` (:func:`.factor.walk.walk_enter_kernel`) and
 the sparse diagonal's likewise, so a defect in leaving factor coordinates shows too, and corrected rows and targets agree
 on a closure. Native sparse rows hold no dense factor and
-read their own ``J_i v_hat + Z_i^T du``. A world whose rows exist only inside its sweep (keyed rows, row packets) has
+read their own ``J_i v_hat + Z_i^T du``. A world whose rows exist only inside its sweep (keyed rows) has
 none to read: it reports NaN and is not summed.
 """
 
@@ -49,7 +49,6 @@ from .row_records import DenseRows, MfRows, RowSupport
 from .row_records import bind as bind_dense_rows
 from .row_records import bind_mf as bind_mf_rows
 from .sparse_mass_matrix import _SparseRowSupport
-from .sweep import PGS_LOCAL_SOLVE_OWNER_GENERAL
 
 __all__ = ["AUDIT_FIELDS", "AUDIT_SLOTS", "Audit"]
 
@@ -77,9 +76,7 @@ class AuditRows:
     impulses: wp.array2d[float]
     counts: wp.array[int]
     mf_counts: wp.array[int]
-    owner: wp.array[int]
     skip_rows_le: int
-    skip_local: int
     keyed: int
     weighted: int
     material: int
@@ -114,12 +111,6 @@ def with_compliance(a: AuditRows, world: int, i: int, term: float) -> float:
 def tier_world(a: AuditRows, world: int) -> bool:
     """Whether the parallel tiers form ``world``'s rows in their kernel."""
     return a.skip_rows_le > 0 and a.counts[world] <= a.skip_rows_le and a.mf_counts[world] == 0
-
-
-@wp.func
-def local_world(a: AuditRows, world: int) -> bool:
-    """Whether the row packets hold ``world``'s rows."""
-    return a.skip_local != 0 and a.owner[world] != PGS_LOCAL_SOLVE_OWNER_GENERAL
 
 
 @wp.func
@@ -161,7 +152,7 @@ def packed_rows(
 ):
     """One thread per world: each packed row's ``J_i v+ + eps_i lambda_i``."""
     world = wp.tid()
-    keeps = tier_world(a, world) or a.owner[world] != PGS_LOCAL_SOLVE_OWNER_GENERAL
+    keeps = tier_world(a, world)
     for i in range(wp.min(a.counts[world], a.capacity)):
         term = float(0.0)
         if keeps:
@@ -398,7 +389,7 @@ def audit_world(
 ):
     """One thread per world: the row laws of both stores over the rows' velocity terms, into :data:`AUDIT_SLOTS`."""
     world = wp.tid()
-    if (tier_world(a, world) and a.keyed != 0) or local_world(a, world):
+    if tier_world(a, world) and a.keyed != 0:
         readout[world, 0] = wp.nan
         readout[world, 1] = wp.nan
         readout[world, 2] = wp.nan
@@ -447,21 +438,12 @@ class Audit:
             mf_row=solver.placement.mf_max_constraints,
         )
         self.coordinates_hat = wp.zeros_like(self.coordinates)
-        # A class whose local owners read the one writer's rows (FL3.6, no packets) has every world's rows stored: the
-        # audit reads every world as the general placement's.
-        self.general_owners = wp.zeros(max(forest.world_count, 1), dtype=wp.int32, device=solver.model.device)
 
     def record(self) -> dict:
         """Which rows the audit reads, for ``routes.diagnostics.audit``."""
-        solver = self.solver
-        unread = []
-        if solver.placement.row_packets is not None:
-            unread.append("row packets' worlds")
-        if solver.placement.keyed_rows is not None:
-            unread.append("keyed rows' worlds")
         reason = "Reads every row of every world."
-        if unread:
-            reason = "Reads NaN in " + " and ".join(unread) + ": no store holds their rows after the sweep."
+        if self.solver.placement.keyed_rows is not None:
+            reason = "Reads NaN in keyed rows' worlds: no store holds their rows after the sweep."
         return {"enabled": True, "slots": list(AUDIT_SLOTS), "reason": reason}
 
     def _operands(self) -> AuditRows:
@@ -471,11 +453,7 @@ class Audit:
         a.impulses = solver.placement.impulses
         a.counts = solver.placement.constraint_count
         a.mf_counts = solver.placement.mf_constraint_count
-        # The local owners' packets keep their worlds' seeds (no stored row): the audit reads only the general worlds.
-        stored = solver.placement.walks and solver.placement.row_packets is None
-        a.owner = self.general_owners if stored else solver.placement.local_solve_owner
         a.skip_rows_le = int(solver.placement.ink_skip_rows())
-        a.skip_local = int(solver.placement.row_packets is not None)
         a.keyed = int(solver.placement.keyed_rows is not None)
         a.weighted = int(solver.laws.set.weighted)
         a.material = int(solver.options.contact_compliance)

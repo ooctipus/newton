@@ -1252,7 +1252,6 @@ class TestTierRule(unittest.TestCase):
             # Packed factors (a single tree) or the sparse diagonal (a star) leave no matrix-free sweep.
             ({"mf_sweeps": False}, "No matrix-free sweep"),
             ({"factor": SimpleNamespace(eliminates=True)}, "pre-elimination"),
-            ({"routes": _routes("K3")}, "case K3"),
             ({"routes": _routes("K5")}, "case K5"),
             ({"forest": SimpleNamespace(has_free_rigid_bodies=False, has_non_free_articulations=True)}, "case K4"),
             ({"forest": SimpleNamespace(has_free_rigid_bodies=True, has_non_free_articulations=False)}, "case K4"),
@@ -1649,13 +1648,11 @@ def _pushed_sphere(device, *, limit=0.5, dt=1.0 / 240.0):
 def _assert_tier_owned(test, solver, budget):
     """Require the parallel tiers to have solved every world with rows in the last step.
 
-    A tier takes a world with at most ``budget`` dense rows and no matrix-free rows,
-    unless a local owner holds it; the serial sweep returns early for exactly those
-    worlds, so a world in that domain is the tier's (``skip_tier_rows``).
+    A tier takes a world with at most ``budget`` dense rows and no matrix-free rows; the serial sweep returns early
+    for exactly those worlds, so a world in that domain is the tier's (``skip_tier_rows``).
     """
     test.assertEqual(solver.placement.ink_rows, budget)
     test.assertTrue(solver.sweep.tiers)
-    test.assertFalse(solver.placement.local_internal_fast_path)
     counts, free_rows = solver.placement.constraint_count.numpy(), solver.placement.mf_constraint_count.numpy()
     test.assertGreater(int(counts.max()), 0)
     for world, (rows, mf_rows) in enumerate(zip(counts, free_rows, strict=True)):

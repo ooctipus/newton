@@ -77,11 +77,10 @@ TIER_SWEEPS_CAP = 128
 TIER_MAX_ROWS = 128
 """The most rows a tier holds: a lane per row in four warps, its staged block within the static budget."""
 REGISTER_LINE = 80
-"""The register line of a tier and a local owner (:mod:`.sweep_routes_local`): 24 warps a multiprocessor (6 in each of
-the register file's 4 sub-partitions). It caps a local owner. A tier's is no cap: its variants compile on both sides
-of it unbounded (72 registers plain, 100 to 108 keyed) and spill under it, so a tier is bound only where its shared
-memory keeps no more blocks than the line (the layer's ``Work.cap``), which leaves ptxas spare registers for the
-sweep's load schedule."""
+"""The register line of a tier: 24 warps a multiprocessor (6 in each of the register file's 4 sub-partitions). It is
+no cap: a tier's variants compile on both sides of it unbounded (72 registers plain, 100 to 108 keyed) and spill under
+it, so a tier is bound only where its shared memory keeps no more blocks than the line (the layer's ``Work.cap``),
+which leaves ptxas spare registers for the sweep's load schedule."""
 
 
 def tier_sweeps(rows: int, iterations: int) -> int:

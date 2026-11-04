@@ -801,38 +801,6 @@ def prefix_warp_rows(
     }
 
 
-def local_packed_rows(device, art_world, rows_by_art, incident=None) -> list:
-    """The local owners' row operands (:data:`.sweep_routes_local.LOCAL_ABI`): ``packed_Z``, ``row_sides``,
-    ``row_incident``, ``response_dofs``, ``articulation_world_dof_offset`` and ``packed_dense`` (1). ``rows_by_art[a]``
-    is articulation ``a``'s rows ``[rows, n]`` as the one writer stores them (whitened, :func:`chain_walk`'s ``Z``);
-    each world's rows hold its articulations' coordinates in articulation order (dense), every row on every
-    articulation of its world. ``incident`` is each world's rows' ``J v_hat`` ``[worlds, rows]`` (zero by default)."""
-    art_world = np.asarray(art_world, dtype=np.int32)
-    rows_by_art = [np.asarray(rows, dtype=np.float32) for rows in rows_by_art]
-    dofs = np.array([rows.shape[1] for rows in rows_by_art], dtype=np.int32)
-    worlds, capacity = int(art_world.max()) + 1, rows_by_art[0].shape[0]
-    offsets = np.zeros(len(dofs), dtype=np.int32)
-    width = np.zeros(worlds, dtype=np.int32)
-    for art, world in enumerate(art_world):
-        offsets[art], width[world] = width[world], width[world] + dofs[art]
-    packed = np.zeros((worlds, capacity, int(width.max())), dtype=np.float32)
-    sides = np.full((worlds, capacity, 2), -1, dtype=np.int32)
-    for art, world in enumerate(art_world):
-        packed[world, :, offsets[art] : offsets[art] + dofs[art]] = rows_by_art[art]
-        side = 0 if sides[world, 0, 0] < 0 else 1
-        sides[world, :, side] = art
-    if incident is None:
-        incident = np.zeros((worlds, capacity), dtype=np.float32)
-    return [
-        wp.array(packed, dtype=wp.float32, device=device),
-        wp.array(sides, dtype=wp.vec2i, device=device),
-        wp.array(np.asarray(incident, dtype=np.float32), dtype=wp.float32, device=device),
-        wp.array(dofs, dtype=wp.int32, device=device),
-        wp.array(offsets, dtype=wp.int32, device=device),
-        1,
-    ]
-
-
 def _walked_coordinates(solver):
     """Where the placement walks (:mod:`.walk_rows`), ``u_hat`` in the walk's frame, ``[world, world coordinate]``: the
     walk's enter of ``v_hat`` (:func:`.factor.walk.walk_enter_kernel`, the audit's), the coordinates its rows are
@@ -1052,12 +1020,6 @@ def leave_walk(walk: WalkTrees, velocity, device) -> None:
         device=device,
     )
     walk.du.zero_()
-
-
-def walked_rows(lower, jacobian) -> np.ndarray:
-    """The one writer's rows ``z = A^-T J^T`` of Jacobian rows ``[rows, n]`` on :func:`chain_walk`'s factor."""
-    A = walk_factor(lower)
-    return np.linalg.solve(A.T, np.asarray(jacobian, dtype=np.float64).T).T.astype(np.float32)
 
 
 def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:

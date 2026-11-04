@@ -1247,7 +1247,7 @@ def walk_texts(
 
 WALK_STAGED = 13
 """The floats of a coordinate's record the walk's functions read (``s``, ``ut``, ``1 / ell``), unpacked
-(:data:`.factor.walk._WALK_LOADS`): what a kernel stages of a record in shared memory (:class:`.response_operator.LocalBlock`)."""
+(:data:`.factor.walk._WALK_LOADS`): what a kernel stages of a record in shared memory."""
 
 WALK_LINEAR, WALK_ANGULAR, WALK_BOTH, WALK_EITHER = 0, 1, 2, 3
 """A column's half at its body's frame as a reader of its record knows it (``WALK_READ``'s ``half``): the linear one,

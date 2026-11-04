@@ -411,12 +411,9 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
     def test_teardown_drains_device_without_accessing_finalized_streams(self):
         """Drain all owned streams without dereferencing finalized handles."""
         solver = object.__new__(SolverFeatherPGS)
-        local = object()
-        residual = object()
+        paired = object()
         dynamics = object()
-        solver.sweep = SimpleNamespace(
-            local_internal_stream=local, local_residual_stream=residual, local_pair_stream=local
-        )
+        solver.sweep = SimpleNamespace(paired_general_solve_stream=paired)
         solver.factor = SimpleNamespace(dynamics_stream=dynamics)
         solver.model = mock.Mock(device=object())
         with (

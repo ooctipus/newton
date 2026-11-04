@@ -26,7 +26,6 @@ from newton._src.solvers.feather_pgs import (
     kernel_template,
     path_selection,
     row_kernels,
-    row_packets,
     sweep_routes,
     sweep_routes_diag,
     sweep_routes_local,
@@ -78,11 +77,6 @@ _SCALED_VOTES = {
         "fabsf(sib_delta) * (unit_diag2)",
         "fabsf(sib_delta) * (s_diag[sib])",
     ),
-    "local": ("fabsf(delta_impulse) * (inverse_diagonal > 0.0f ? 1.0f / inverse_diagonal : 0.0f)",),
-    "packets": (
-        "fabsf(delta_impulse) * (inverse_diagonal > 0.0f ? 1.0f / inverse_diagonal : 0.0f)",
-        "fabsf(sib_delta) * (s_inv_diag[sib] > 0.0f ? 1.0f / s_inv_diag[sib] : 0.0f)",
-    ),
     "sparse_diagonal": (
         "fabsf(delta_impulse) * (denom)",
         "fabsf(sib_delta) * (s_diag_dense[sib])",
@@ -93,7 +87,6 @@ _SCALED_VOTES = {
 
 def _factory_calls():
     """One call of every sweep factory that takes a policy: ``(name, factory, args, kwargs)``."""
-    packets = row_packets.get_local_factory.__wrapped__(9, 6, 40, 11)
     return (
         (
             "sparse",
@@ -113,18 +106,6 @@ def _factory_calls():
             sweep_routes_local.paired_factor_kernel.__wrapped__,
             (192, 29, 23, 6, "120", False, True),
             {"contact_units": True},
-        ),
-        (
-            "local",
-            sweep_routes_local.local_owned_kernel.__wrapped__,
-            (192, 9, 9, "120"),
-            {"lanes_per_world": 8, "contact_capable": False, "warps_per_block": 2},
-        ),
-        (
-            "packets",
-            packets,
-            (192, 20, 9, "120"),
-            {"paired_dof_count": 6, "persistent_queue": True},
         ),
         (
             "sparse_diagonal",
@@ -152,14 +133,6 @@ def _vote_census():
     sweep's resident row metadata. The matrix-free sweep keeps the current friction law without torsion; the
     census pins the others' text unchanged.
     """
-    local = (
-        _axis("paired_dof_count", (0, 6)),
-        _axis("persistent_queue"),
-        _axis("warps_per_block", (1, 2)),
-        _axis("lanes_per_world", (32, 16, 8)),
-        _axis("contact_capable"),
-        ({}, {"mf_max_constraints": 64, "local_mf_max_constraints": 12}),
-    )
     specs = (
         (
             "sparse",
@@ -193,7 +166,6 @@ def _vote_census():
             (
                 _axis("places", sweep_routes.ROW_PLACES),
                 _axis("has_dense_velocity_limit_rows"),
-                ({}, {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
                 _axis("factor_coordinates"),
                 _axis("skip_tier_rows", (0, 32)),
                 _axis("independent_components"),
@@ -205,8 +177,6 @@ def _vote_census():
             (192, 29, 23, 6, "120"),
             (_axis("contact_triples"), _axis("independent_components"), _axis("contact_units")),
         ),
-        ("local", sweep_routes_local.local_owned_kernel.__wrapped__, (192, 20, 9, "120"), local),
-        ("packets", row_packets.get_local_factory.__wrapped__(9, 6, 40, 11), (192, 20, 9, "120"), local),
         (
             "sparse_diagonal",
             sweep_routes_diag.sparse_diagonal_kernel.__wrapped__,
@@ -433,7 +403,7 @@ class TestExitLaw(unittest.TestCase):
         A combination is valid when the factory builds it without a readout; under a readout it must
         then build as well, with every change vote bounded by its floor and, traced, one exit record.
         Vote sites that only some flags emit (velocity-limit lanes, free-body rows, fused drive clamps,
-        streamed impulses, local matrix-free rows) would otherwise escape the law unnoticed.
+        streamed impulses) would otherwise escape the law unnoticed.
 
         Every policy, the plain readout included, must also compose with the factory's other options:
         its kernel is the policy-less kernel's name plus the policy's suffix, it appends one readout
@@ -488,10 +458,8 @@ class TestExitLaw(unittest.TestCase):
             {
                 "sparse": 40,
                 "sparse_lanes": 16,
-                "mf_gs": 72,
+                "mf_gs": 48,
                 "paired": 6,
-                "local": 24,
-                "packets": 24,
                 "sparse_diagonal": 5,
             },
         )
@@ -770,7 +738,6 @@ def _sweep_record(**fields):
             "paired_factor",
             "mf_colored",
             "tiers",
-            "local",
         )
     )
     record.update(route="matrix_free_gs", mf_gs="mf_gs_kernel")

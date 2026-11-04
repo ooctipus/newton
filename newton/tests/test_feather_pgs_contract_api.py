@@ -144,15 +144,19 @@ def test_readouts_answer_only_when_asked(test, device):
     audit = solver.read_audit()
     record = solver.get_path_selection()["routes"]["diagnostics"]["audit"]
     test.assertEqual(set(audit), set(record["slots"]))
-    # A world whose rows exist only inside its sweep (row packets, keyed rows) reads NaN, as the record says; a world
-    # the classifier resolved holds no row anywhere, so its audit reads a value.
+    # A world whose rows exist only inside its sweep (the keyed rows' worlds: the tiers hold them, no free-body row and
+    # at most their row bound) reads NaN, as the record says; a world the classifier resolved holds no row anywhere, so
+    # its audit reads a value, as does every other world.
     resolved = solver.sweep.resolved_worlds.numpy()
     if record["reason"] == "Reads every row of every world.":
         test.assertEqual(int(audit["steps"][0]), STEPS)
-    elif resolved.shape[0] and resolved[0]:
-        test.assertTrue(np.isfinite(audit["gap"][0]), record["reason"])
     else:
-        test.assertTrue(np.isnan(audit["gap"][0]), record["reason"])
+        placement = solver.placement
+        counts, free = placement.constraint_count.numpy(), placement.mf_constraint_count.numpy()
+        keyed = (free == 0) & (counts <= int(placement.ink_skip_rows()))
+        if resolved.shape[0]:
+            keyed &= resolved == 0
+        np.testing.assert_array_equal(np.isnan(audit["gap"]), keyed, err_msg=record["reason"])
     test.assertGreater(solver.constraint_row_watermarks()["contact_high_water"], 0)
     solver, _, _ = _rollout(model, None, steps=1)
     with test.assertRaisesRegex(RuntimeError, "Diagnostics"):
@@ -318,7 +322,7 @@ class TestFeatherPGSTeardown(unittest.TestCase):
         """Drain queued work without trusting a stream's surviving Python wrapper."""
         owner = SimpleNamespace(
             model=SimpleNamespace(device=sentinel.device),
-            sweep=SimpleNamespace(local_pair_stream=sentinel.finalized_stream),
+            sweep=SimpleNamespace(paired_general_solve_stream=sentinel.finalized_stream),
         )
         with (
             patch.object(wp, "synchronize_device") as drain,
