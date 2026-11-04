@@ -631,7 +631,17 @@ def main(argv=None):
     wp.config.log_level = wp.LOG_WARNING
     wp.init()
     import newton  # noqa: PLC0415
-    import newton._src.solvers.feather_pgs.kernels as kernels  # noqa: PLC0415
+    import importlib  # noqa: PLC0415
+    import pkgutil  # noqa: PLC0415
+
+    import newton._src.solvers.feather_pgs as fpgs  # noqa: PLC0415
+
+    # The row-type codes live in whichever solver module defines them; their owner moves as the solver is restructured.
+    kernels = next(
+        module
+        for module in (importlib.import_module(f"{fpgs.__name__}.{m.name}") for m in pkgutil.iter_modules(fpgs.__path__))
+        if hasattr(module, "PGS_CONSTRAINT_TYPE_CONTACT")
+    )
 
     newton_file = Path(newton.__file__).resolve()
     if args.newton.resolve() not in newton_file.parents:
