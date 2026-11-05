@@ -21,11 +21,17 @@ record picks it on the device, :attr:`ContactPool.forecast_on`), inside the
 launches that pass already makes: the bounding-box pass states each shape's
 reach over the service's lag (its speed and, on a floating body, gravity's
 fall) and the broad phase sums, over the pairs that can meet within it, the
-contacts such a pair can make
-(:func:`~newton._src.geometry.broad_phase_common.forecast_pair`). The forecast is a bound, so
-while the demand is in transit (no contact yet, or a high-water mark that rose
-past :data:`TRIM_BAND` within the last :data:`TRIM_AFTER_PASSES` passes) the
-service holds as many rows as it, up to the model's shape-pair estimate
+most contacts such a pair can make
+(:func:`~newton._src.geometry.broad_phase_common.forecast_pair`), and the same
+sum over the pairs whose boxes overlap now, where the pass finds its contacts.
+The record measures the share of that worst case the pass's contacts make,
+keeps the largest share any pass measured (:attr:`ContactPool.forecast_share`)
+and forecasts the first sum times it: the pairs that can meet make contacts as
+the pairs that meet do. Until a pass with contacts measured a share, the
+forecast is the worst case itself. While the demand is in transit (no contact
+yet, or a high-water mark that rose past :data:`TRIM_BAND` within the last
+:data:`TRIM_AFTER_PASSES` passes) the service holds as many rows as the
+forecast, up to the model's shape-pair estimate
 (:attr:`ContactPool.forecast_limit`). Once the mark holds still the demand's
 :data:`HEADROOM` sizes the rows and a trim returns what the forecast held: on
 a hand around a cube most pairs are within reach of each other at every pass,
@@ -137,9 +143,9 @@ broad phase's own pass on the largest suite task (keyboard-so101, 59M pairs). On
 of its step. The horizon counts the passes between (:meth:`ContactPool.horizon`)."""
 
 FORECAST_SLOTS = 16
-"""Counters the broad phase adds a forecast into, by warp: every broad phase adds once a warp (a thread sums the pairs
-it tests, a warp sums its threads), the record sums the counters in one unrolled loop, and no counter sees every warp's
-atomic."""
+"""Counters the broad phase adds each of a forecast's two sums into, by warp: every broad phase adds once a warp (a
+thread sums the pairs it tests, a warp sums its threads), the record sums the counters in one unrolled loop, and no
+counter sees every warp's atomic."""
 
 FILL_SCALE = 10000
 """Units of the record's fill: the largest demand of a pass over its ready rows, times this."""
@@ -342,6 +348,7 @@ def _record_demand(
     passes: wp.array[wp.int32],
     forecast_slots: wp.array[wp.int64],
     forecast_on: wp.array[wp.int32],
+    forecast_share: wp.array[wp.float32],
     tally: wp.array[wp.int32],
     mirror: wp.array[wp.int32],
     rows_used: wp.array[wp.int32],
@@ -357,12 +364,23 @@ def _record_demand(
         passed = wp.atomic_add(passes, 0, 1) + 1
         mirror[2] = passed
         if forecast_on[0] != 0:
-            # This pass forecast: publish its sum, and start the next one from nothing.
-            total = wp.int64(0)
+            # This pass forecast: the worst case of the pairs within reach, and of those that meet now, where this
+            # pass's contacts are. Their share of it, the largest any pass measured, scales the first; the next
+            # forecast starts from nothing.
+            reach = wp.int64(0)
+            near = wp.int64(0)
             for slot in range(FORECAST_SLOTS):
-                total += forecast_slots[slot]
-            for slot in range(FORECAST_SLOTS):
+                reach += forecast_slots[slot]
+                near += forecast_slots[FORECAST_SLOTS + slot]
+            for slot in range(2 * FORECAST_SLOTS):
                 forecast_slots[slot] = wp.int64(0)
+            share = forecast_share[0]
+            if demand > 0 and near > 0:
+                share = wp.max(share, wp.min(float(demand) / float(near), 1.0))
+                forecast_share[0] = share
+            total = reach
+            if share >= 0.0:
+                total = wp.int64(wp.ceil(float(reach) * share))
             mirror[3] = wp.int32(wp.min(total, wp.int64(INDEX_LIMIT)))
         # In a graph the pass after each FORECAST_PASSES-th forecasts; outside one, the pass a host asks for.
         if beat != 0 and passed % FORECAST_PASSES == 0:
@@ -864,8 +882,12 @@ class ContactPool:
         self._tally = None
         self._high_water_host = None
         self.forecast_slots = None
-        """Contacts the model's pairs may make within the horizon, summed by the broad phase of a forecast pass
-        (int64, shape :data:`FORECAST_SLOTS`, on the device; the record publishes and clears them)."""
+        """The most contacts the model's pairs may make within the horizon, then the same for the pairs whose boxes
+        overlap now, summed by the broad phase of a forecast pass (int64, shape ``2 *`` :data:`FORECAST_SLOTS`, on the
+        device; the record publishes and clears them)."""
+        self.forecast_share = None
+        """The largest share of the pairs' worst case a forecasting pass found in its contacts (float32, shape 1, on
+        the device), which scales the forecast; negative until a pass with contacts measures it."""
         self.forecast_reach = None
         """The forecast's horizon [s] and the fall gravity adds over it [m] (vec2, shape 1, on the device)."""
         self.forecast_on = None
@@ -907,7 +929,9 @@ class ContactPool:
             self._passes = wp.zeros(1, dtype=wp.int32, device=self.device)
             # The record's running fill and drop counts, which it copies into the pinned record.
             self._tally = wp.zeros(3, dtype=wp.int32, device=self.device)
-            self.forecast_slots = wp.zeros(FORECAST_SLOTS, dtype=wp.int64, device=self.device)
+            self.forecast_slots = wp.zeros(2 * FORECAST_SLOTS, dtype=wp.int64, device=self.device)
+            # No share measured yet: the forecast is the pairs' worst case.
+            self.forecast_share = wp.full(1, -1.0, dtype=wp.float32, device=self.device)
             self.forecast_reach = wp.zeros(1, dtype=wp.vec2, device=self.device)
             # A pass forecasts once a host asks or the record's beat picks it.
             self.forecast_on = wp.zeros(1, dtype=wp.int32, device=self.device)
@@ -1242,7 +1266,8 @@ class ContactPool:
                 (:attr:`peak_fill`); a pass outside capture that grows its rows and runs again (:meth:`fit`) drops none.
             beat: Whether the pass replays in a graph, where the record picks the next forecasting pass
                 (:data:`FORECAST_PASSES`); outside one the next pass forecasts only when a host asks for it. A pass
-                that forecast (:attr:`forecast_on`) publishes the sum the broad phase left in :attr:`forecast_slots`.
+                that forecast (:attr:`forecast_on`) measures its share (:attr:`forecast_share`) from its count and the
+                sums the broad phase left in :attr:`forecast_slots`, and publishes the forecast.
         """
         self._note_reader()
         owner = _capture_owner(self.device)
@@ -1259,6 +1284,7 @@ class ContactPool:
                 empty if self._high_water is None else self._passes,
                 wp.empty(0, dtype=wp.int64, device=self.device) if self._high_water is None else self.forecast_slots,
                 empty if self._high_water is None else self.forecast_on,
+                wp.empty(0, dtype=wp.float32, device=self.device) if self._high_water is None else self.forecast_share,
                 empty if self._high_water is None else self._tally,
                 empty if self._high_water is None else self._high_water_mirror,
                 empty if self.rows_used is None else self.rows_used,
@@ -1333,7 +1359,8 @@ class ContactPool:
     @property
     def forecast(self) -> int:
         """The contacts the last forecasting pass found within the horizon, as last copied to the host (no
-        synchronization), at most :attr:`forecast_limit`."""
+        synchronization), at most :attr:`forecast_limit`: the worst case of the pairs within reach times the largest
+        share of it a pass measured in its contacts (:attr:`forecast_share`), the worst case itself before any did."""
         if self._high_water_host is None:
             return 0
         return min(int(self._high_water_host.numpy()[3]), self.forecast_limit)

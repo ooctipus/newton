@@ -129,16 +129,23 @@ class TestContactPoolPolicy(unittest.TestCase):
         self.assertEqual(pipeline.contacts().rigid_contact_max, contact_pool.MIN_READY_ROWS)
 
     def test_forecast_reads_the_pairs_within_reach(self):
-        """Count a pair's worst case when the reaches of its shapes close the gap of their boxes and capsules."""
+        """Count a pair's worst case when the reaches of its shapes close the gap of their boxes and capsules, and again
+        when its boxes overlap now."""
 
-        def forecast(gap=0.0, speed=0.0, spin=0.0, horizon=0.1, floats=1, half=(0.5, 0.5, 0.5), turn=0.0, offset=0.0):
+        def forecast(
+            gap=0.0, speed=0.0, spin=0.0, horizon=0.1, floats=1, half=(0.5, 0.5, 0.5), turn=0.0, offset=0.0, both=0
+        ):
             # Shape 0, a box on a body, ``gap`` above shape 1, a box on the ground (both turned about z by ``turn``,
             # shape 1 shifted by ``offset`` across it).
             data = ShapeForecast()
             data.on = wp.ones(1, dtype=wp.int32, device="cpu")
             data.slots = wp.zeros(4, dtype=wp.int64, device="cpu")
             data.horizon = wp.array([wp.vec2(horizon, 0.5 * 9.81 * horizon**2)], dtype=wp.vec2, device="cpu")
-            data.word = wp.array([int(FORECAST_FLOATS) if floats else 0, 0], dtype=wp.int32, device="cpu")
+            data.word = wp.array(
+                [int(FORECAST_FLOATS) if floats else 0, int(FORECAST_FLOATS) if both else 0],
+                dtype=wp.int32,
+                device="cpu",
+            )
             data.body_com = wp.zeros(1, dtype=wp.vec3, device="cpu")
             data.reach = wp.zeros(2, dtype=wp.float32, device="cpu")
             # A box's capsule runs along its longest side (the first of equal ones).
@@ -165,7 +172,7 @@ class TestContactPoolPolicy(unittest.TestCase):
             data.pose = poses
             body_q = wp.array([poses.numpy()[0]], dtype=wp.transform, device="cpu")
             body_qd = wp.array([[0.0, 0.0, -speed, 0.0, spin, 0.0]], dtype=wp.spatial_vector, device="cpu")
-            out = wp.zeros(1, dtype=wp.int32, device="cpu")
+            out = wp.zeros(1, dtype=wp.vec2i, device="cpu")
 
             @wp.kernel
             def pair(
@@ -175,24 +182,28 @@ class TestContactPoolPolicy(unittest.TestCase):
                 poses: wp.array[wp.transform],
                 body_q: wp.array[wp.transform],
                 body_qd: wp.array[wp.spatial_vector],
-                out: wp.array[wp.int32],
+                out: wp.array[wp.vec2i],
             ):
                 forecast_shape(data, 0, 0, poses[0], body_q, body_qd, lower[0], upper[0])
                 forecast_shape(data, 1, -1, poses[1], body_q, body_qd, lower[1], upper[1])
                 out[0] = forecast_pair(0, 1, lower, upper, data)
 
             wp.launch(pair, dim=1, inputs=[data, lower, upper, poses, body_q, body_qd, out], device="cpu")
-            return int(out.numpy()[0])
+            return tuple(int(x) for x in out.numpy()[0])
 
-        self.assertEqual(forecast(0.0, 0.0), 5, "boxes that touch")
-        self.assertEqual(forecast(1.0, 0.0), 0, "nothing closes the gap")
-        self.assertEqual(forecast(1.0, 9.0), 0, "the speed falls short")
-        self.assertEqual(forecast(1.0, 9.8), 5, "speed and gravity close it")
-        self.assertEqual(forecast(1.0, 0.0, spin=12.0), 5, "spin at the farthest point closes it")
-        self.assertEqual(forecast(1.0, 9.8, floats=0), 0, "no gravity for a body nothing lets fall")
+        self.assertEqual(forecast(0.0, 0.0), (5, 5), "boxes that touch: within reach, and met now")
+        self.assertEqual(forecast(1.0, 0.0), (0, 0), "nothing closes the gap")
+        self.assertEqual(forecast(1.0, 9.0), (0, 0), "the speed falls short")
+        self.assertEqual(forecast(1.0, 9.8), (5, 0), "speed and gravity close it; not met now")
+        self.assertEqual(forecast(1.0, 0.0, spin=12.0), (5, 0), "spin at the farthest point closes it")
+        self.assertEqual(forecast(1.0, 9.8, floats=0), (0, 0), "no gravity for a body nothing lets fall")
+        self.assertEqual(forecast(1.0, 9.8, both=1), (5, 0), "two floating shapes")
+        self.assertEqual(forecast(1.0, 9.3, both=1), (0, 0), "gravity closes a pair's gap by one fall, not two")
         rod = (1.0, 0.05, 0.05)
-        self.assertEqual(forecast(half=rod, turn=0.785, offset=0.7), 0, "the boxes meet, the capsules do not")
-        self.assertEqual(forecast(half=rod, turn=0.785, offset=0.7, speed=7.0), 5, "the capsules meet within reach")
+        self.assertEqual(forecast(half=rod, turn=0.785, offset=0.7), (0, 0), "the boxes meet, the capsules do not")
+        self.assertEqual(
+            forecast(half=rod, turn=0.785, offset=0.7, speed=7.0), (5, 5), "the capsules meet within reach"
+        )
 
     def test_forecast_reads_the_terrain_under_a_shape(self):
         """Read a heightfield's tile under a shape, not its bounding box, and bound its pairs by the law's walk slots."""
@@ -289,6 +300,27 @@ class TestContactPoolPolicy(unittest.TestCase):
         beats = [1 if passed % contact_pool.FORECAST_PASSES == 1 else 0 for passed in range(2, len(flags) + 2)]
         self.assertEqual(flags, beats)
         self.assertEqual(int(pool.forecast_slots.numpy().sum()), 0, "the next forecast starts from nothing")
+
+    def test_forecast_scales_the_pairs_within_reach_by_the_share_measured(self):
+        """Forecast the worst case of the pairs within reach until a pass with contacts measures the share of it the
+        pairs that meet now make; then that share of it, the largest any pass measured."""
+        pool = ContactPool(device="cpu")
+        pool.rows((ContactField("value", wp.int32, -1),))
+        half = contact_pool.FORECAST_SLOTS
+
+        def forecast(demand, reach, near):
+            pool.request_forecast()
+            slots = np.zeros(2 * half, dtype=np.int64)
+            slots[0], slots[half] = reach, near
+            pool.forecast_slots.assign(slots)
+            pool.record_demand(wp.array([demand], dtype=wp.int32, device="cpu"), pool.ready_rows, beat=False)
+            return pool.forecast
+
+        self.assertEqual(forecast(0, 4_000, 1_000), 4_000, "no contact yet: the worst case")
+        self.assertEqual(forecast(250, 4_000, 1_000), 1_000, "a quarter of the worst case meets")
+        self.assertEqual(forecast(100, 8_000, 1_000), 2_000, "the largest share measured holds")
+        self.assertEqual(forecast(900, 2_000, 600), 2_000, "never past the worst case")
+        self.assertEqual(float(pool.forecast_share.numpy()[0]), 1.0)
 
     def test_dropped_contacts_are_counted_and_latch_their_world(self):
         """Count the contacts a pass that cannot grow drops, and the passes; a pass that runs again drops none."""

@@ -292,13 +292,13 @@ def _process_single_sap_pair(
     body_flags: wp.array[int],
     include_static_kinematic_pairs: bool,
     forecast: ShapeForecast,
-) -> wp.int64:
+) -> wp.vec2l:
     shape1 = pair[0]
     shape2 = pair[1]
 
     # Skip explicitly excluded pairs (e.g. shape_collision_filter_pairs)
     if num_filter_pairs > 0 and is_pair_excluded(pair, filter_pairs, num_filter_pairs):
-        return wp.int64(0)
+        return wp.vec2l()
 
     # The forecast sees the pairs the sweep visits: those whose projections overlap on its axis.
     forecast_contacts = forecast_count(
@@ -359,7 +359,7 @@ def _process_sap_work_package(
     candidate_pair_count: wp.array[int],
     max_candidate_pair: int,
     forecast: ShapeForecast,
-) -> wp.int64:
+) -> wp.vec2l:
     """Process one mapped SAP work package; return its pair's forecast contacts."""
     j = flat_id + workid + 1
     if flat_id > 0:
@@ -376,21 +376,21 @@ def _process_sap_work_package(
     num_shapes_in_world = world_slice_end - world_slice_start
 
     if i >= num_shapes_in_world or j >= num_shapes_in_world:
-        return wp.int64(0)
+        return wp.vec2l()
     if i >= j:
-        return wp.int64(0)
+        return wp.vec2l()
 
     idx_i = world_id * max_shapes_per_world + i
     idx_j = world_id * max_shapes_per_world + j
     local_shape1 = sap_sort_index_in[idx_i]
     local_shape2 = sap_sort_index_in[idx_j]
     if local_shape1 < 0 or local_shape2 < 0:
-        return wp.int64(0)
+        return wp.vec2l()
 
     shape1_tmp = world_index_map[world_slice_start + local_shape1]
     shape2_tmp = world_index_map[world_slice_start + local_shape2]
     if shape1_tmp == shape2_tmp:
-        return wp.int64(0)
+        return wp.vec2l()
 
     shape1 = wp.min(shape1_tmp, shape2_tmp)
     shape2 = wp.max(shape1_tmp, shape2_tmp)
@@ -402,7 +402,7 @@ def _process_sap_work_package(
 
     is_dedicated_minus_one_segment = world_id >= num_regular_worlds
     if world1 == -1 and world2 == -1 and not is_dedicated_minus_one_segment:
-        return wp.int64(0)
+        return wp.vec2l()
 
     if test_world_and_group_pair(world1, world2, col_group1, col_group2):
         return _process_single_sap_pair(
@@ -421,7 +421,7 @@ def _process_sap_work_package(
             include_static_kinematic_pairs,
             forecast,
         )
-    return wp.int64(0)
+    return wp.vec2l()
 
 
 @wp.func
@@ -461,7 +461,7 @@ def _sap_broadphase_kernel(
     forecast: ShapeForecast,
 ):
     tid = wp.tid()
-    forecast_contacts = wp.int64(0)
+    forecast_contacts = wp.vec2l()
 
     total_work_packages = sap_cumulative_sum_in[world_count * max_shapes_per_world - 1]
 

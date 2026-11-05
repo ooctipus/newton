@@ -222,8 +222,10 @@ def write_pair(
 # needs a bound on the demand within that lag (``ContactPool.horizon``). On a forecasting pass (the pool's flag, which
 # its record sets on the device: one pass in ``FORECAST_PASSES``) the bounding-box pass states each shape's reach over
 # the horizon (forecast_shape), and the broad phase adds, over the pairs it tests, the most contacts a pair can make
-# when its shapes' boxes and bounding capsules can meet within their reaches (forecast_pair). It is a predicate of the
-# pair test the broad phase runs anyway: no launch of its own.
+# when its shapes' boxes and bounding capsules can meet within their reaches (forecast_pair), and apart the same sum
+# over the pairs whose boxes overlap now: the pairs this pass's narrow phase finds its contacts in. The pool's record
+# measures from the two how much of a pair's worst case the scene makes (``ContactPool.forecast``). It is a predicate
+# of the pair test the broad phase runs anyway: no launch of its own.
 
 FORECAST_REDUCED = wp.constant(1)
 """A shape's forecast bit: a mesh or a heightfield, whose pairs contact reduction bounds."""
@@ -248,7 +250,8 @@ class ShapeForecast:
     on: wp.array[wp.int32]
     """Whether this pass forecasts (the contact pool's flag, shape 1)."""
     slots: wp.array[wp.int64]
-    """Counters the broad phase adds the forecast into (the contact pool's)."""
+    """Counters the broad phase adds the forecast into (the contact pool's): the first half sums the pairs within
+    reach, the second half those of them whose boxes overlap now."""
     horizon: wp.array[wp.vec2]
     """The horizon [s] and the fall gravity adds over it [m] (the contact pool's, shape 1)."""
     word: wp.array[wp.int32]
@@ -312,22 +315,20 @@ def forecast_shape(
 ):
     """State a shape's reach over the horizon on a forecasting pass, and the highest terrain under its box.
 
-    The reach bounds how far any point of the shape travels: its body's center-of-mass speed plus its spin times
-    the lever from the center of mass to the shape's farthest point, over the horizon, plus gravity's fall if the
-    body floats. The highest terrain under the shape's box (``lower``, ``upper``) gives a heightfield pair its gap.
+    The reach bounds how far any point of the shape travels at its present velocity: its body's center-of-mass speed
+    plus its spin times the lever from the center of mass to the shape's farthest point, over the horizon. Gravity's
+    fall is the pair's (:func:`forecast_pair`). The highest terrain under the shape's box (``lower``, ``upper``) gives
+    a heightfield pair its gap.
     """
     horizon = forecast.horizon[0]
     speed = float(0.0)
-    fall = float(0.0)
     word = forecast.word[shape]
     if body >= 0:
         twist = body_qd[body]
         com = wp.transform_point(body_q[body], forecast.body_com[body])
         lever = wp.length(wp.transform_get_translation(pose) - com) + forecast.middle[shape][3]
         speed = wp.length(wp.spatial_top(twist)) + wp.length(wp.spatial_bottom(twist)) * lever
-        if word & FORECAST_FLOATS != 0:
-            fall = horizon[1]
-    forecast.reach[shape] = speed * horizon[0] + fall
+    forecast.reach[shape] = speed * horizon[0]
     if forecast.top.shape[0] > 0:
         top = float(-1.0e30)
         if word & FORECAST_TERRAIN == 0:
@@ -359,31 +360,38 @@ def forecast_pair(
     box_lower: wp.array[wp.vec3],
     box_upper: wp.array[wp.vec3],
     forecast: ShapeForecast,
-) -> int:
-    """Return the most contacts a pair can make within the horizon, or 0 when its shapes cannot meet in it.
+) -> wp.vec2i:
+    """Return the most contacts a pair can make within the horizon, and the same when its boxes overlap now.
 
     The pair's gap is the larger of its bounding boxes' and its bounding capsules' (a long link's box overlaps much
     that the link does not reach); a heightfield's is the partner box's height over the highest terrain under it.
-    A gap within the two shapes' reaches counts the pair's worst case: the terrain law's walk rows for a heightfield
-    pair, contact reduction's bound for a mesh pair, the convex bound otherwise.
+    The pair's reach is its shapes' reaches plus one fall of gravity over the horizon when either floats: gravity
+    moves two floating bodies alike, so it closes their gap only by as far as one falls while the other is held.
+    A gap within the pair's reach counts the pair's worst case: the terrain law's walk rows for a heightfield
+    pair, contact reduction's bound for a mesh pair, the convex bound otherwise. The second component counts it again
+    for a pair that the narrow phase tests now: its boxes overlap (a heightfield's partner box reaches the terrain).
+    Both are zero for a pair whose shapes cannot meet in the horizon.
     """
-    reach = forecast.reach[shape_a] + forecast.reach[shape_b]
     word_a = forecast.word[shape_a]
     word_b = forecast.word[shape_b]
+    reach = forecast.reach[shape_a] + forecast.reach[shape_b]
+    if (word_a | word_b) & FORECAST_FLOATS != 0:
+        reach += forecast.horizon[0][1]
     if (word_a | word_b) & FORECAST_TERRAIN != 0:
         partner = shape_b
         rows = word_b >> FORECAST_SLOTS_SHIFT
         if word_b & FORECAST_TERRAIN != 0:
             partner = shape_a
             rows = word_a >> FORECAST_SLOTS_SHIFT
-        if box_lower[partner][2] - forecast.top[partner] > reach:
-            return 0
-        return rows
+        height = box_lower[partner][2] - forecast.top[partner]
+        if height > reach:
+            return wp.vec2i(0, 0)
+        return wp.vec2i(rows, wp.where(height <= 0.0, rows, 0))
     apart_a = box_lower[shape_a] - box_upper[shape_b]
     apart_b = box_lower[shape_b] - box_upper[shape_a]
     gap = wp.max(wp.max(wp.max(apart_a[0], apart_b[0]), wp.max(apart_a[1], apart_b[1])), wp.max(apart_a[2], apart_b[2]))
     if gap > reach:
-        return 0
+        return wp.vec2i(0, 0)
     capsule_a = forecast.capsule[shape_a]
     capsule_b = forecast.capsule[shape_b]
     radius_a = capsule_a[3]
@@ -401,12 +409,13 @@ def forecast_pair(
             middle_a - half_a, middle_a + half_a, middle_b - half_b, middle_b + half_b, 1.0e-9
         )
         if closest[2] - radius_a - radius_b > reach:
-            return 0
+            return wp.vec2i(0, 0)
+    contacts = forecast.bound_convex
     if word_a & word_b & FORECAST_HYDROELASTIC != 0:
-        return forecast.bound_hydroelastic
-    if (word_a | word_b) & FORECAST_REDUCED != 0:
-        return forecast.bound_reduced
-    return forecast.bound_convex
+        contacts = forecast.bound_hydroelastic
+    elif (word_a | word_b) & FORECAST_REDUCED != 0:
+        contacts = forecast.bound_reduced
+    return wp.vec2i(contacts, wp.where(gap <= 0.0, contacts, 0))
 
 
 @wp.func
@@ -419,21 +428,24 @@ def forecast_count(
     shape_body: wp.array[int],
     body_flags: wp.array[int],
     include_static_kinematic_pairs: bool,
-) -> wp.int64:
+) -> wp.vec2l:
     """A pair's forecast contacts (:func:`forecast_pair`) on a forecasting pass, zero otherwise, under the
     immovable-pair rule its broad phase applies to an overlapping pair. A thread sums the pairs it tests and adds the
     sum once (:func:`forecast_flush`)."""
     if not forecasting(forecast):
-        return wp.int64(0)
+        return wp.vec2l()
     contacts = forecast_pair(shape_a, shape_b, box_lower, box_upper, forecast)
-    if contacts == 0:
-        return wp.int64(0)
+    if contacts[0] == 0:
+        return wp.vec2l()
     if is_shape_pair_immovable_filtered(shape_a, shape_b, shape_body, body_flags, include_static_kinematic_pairs):
-        return wp.int64(0)
-    return wp.int64(contacts)
+        return wp.vec2l()
+    return wp.vec2l(wp.int64(contacts[0]), wp.int64(contacts[1]))
 
 
 _FORECAST_FLUSH = r"""
+    // The half of the counters this sum goes to (forecast_flush), and its warp's counter in it.
+    const int counters = slots.shape[0] / 2;
+    const int counter = half * counters + (thread >> 5) % counters;
 #if defined(__CUDA_ARCH__)
     // A full warp whose lanes each hold under 2^26 contacts sums them in one 32-bit reduction and lane 0 adds the
     // sum; any other warp (a grid's tail, a lane with more) adds lane by lane.
@@ -450,24 +462,26 @@ _FORECAST_FLUSH = r"""
         value = (threadIdx.x & 31) == 0 ? (long long)sum : 0ll;
     }
     if (value != 0)
-        atomicAdd((unsigned long long*)&slots.data[(thread >> 5) % slots.shape[0]], (unsigned long long)value);
+        atomicAdd((unsigned long long*)&slots.data[counter], (unsigned long long)value);
 #else
     if (contacts != 0)
-        slots.data[(thread >> 5) % slots.shape[0]] += contacts;
+        slots.data[counter] += contacts;
 #endif
 """
 
 
 @wp.func_native(_FORECAST_FLUSH)
-def _forecast_flush(slots: wp.array[wp.int64], thread: int, contacts: wp.int64): ...
+def _forecast_flush(slots: wp.array[wp.int64], thread: int, contacts: wp.int64, half: int): ...
 
 
 @wp.func
-def forecast_flush(forecast: ShapeForecast, thread: int, contacts: wp.int64):
-    """On a forecasting pass, add the forecast contacts ``thread`` summed (:func:`forecast_count`) to its warp's counter,
-    once a warp. Every thread of the launch calls it at one point of its kernel, before any return."""
+def forecast_flush(forecast: ShapeForecast, thread: int, contacts: wp.vec2l):
+    """On a forecasting pass, add the forecast contacts ``thread`` summed (:func:`forecast_count`) to its warp's
+    counters, once a warp: the pairs within reach to the first half, those whose boxes overlap now to the second.
+    Every thread of the launch calls it at one point of its kernel, before any return."""
     if forecasting(forecast):
-        _forecast_flush(forecast.slots, thread, contacts)
+        _forecast_flush(forecast.slots, thread, contacts[0], 0)
+        _forecast_flush(forecast.slots, thread, contacts[1], 1)
 
 
 # Collision filtering

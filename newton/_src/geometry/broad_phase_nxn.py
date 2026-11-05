@@ -23,6 +23,7 @@ import warp as wp
 from ..core.types import Devicelike
 from .broad_phase_common import (
     BODY_FLAG_KINEMATIC,
+    FORECAST_FLOATS,
     FORECAST_HYDROELASTIC,
     FORECAST_REDUCED,
     FORECAST_SLOTS_SHIFT,
@@ -300,16 +301,24 @@ _TEMPLATE_APPEND_CPU = """
 # when the pool's flag says the pass forecasts; the plain kernel is the one without them. The forecast
 # (broad_phase_common.forecast_pair) runs the same tests in the same order: the boxes, each shape's forecast word and
 # reach from the world's stage (or memory, for a global pair), the capsules (placed by the shapes' poses) and the
-# terrain's top, which only a pair within reach of its boxes reads, from memory.
+# terrain's top, which only a pair within reach of its boxes reads, from memory; the pair's fall, once. fc_pair returns the pair's worst
+# case, negated when the pair's boxes overlap now (forecast_pair's second component); fc_add sums both.
 _FORECAST_PAIR = f"""
     const bool fc_on = forecast.on.shape[0] > 0 && forecast.on.data[0] != 0;
     long long fc_total = 0;
+    long long fc_near = 0;
+    auto fc_add = [&](int contacts) {{
+        fc_total += contacts < 0 ? -contacts : contacts;
+        fc_near += contacts < 0 ? -contacts : 0;
+    }};
     auto fc_pair = [&](int a, int b, int wa, int wb, float reach, float alx, float aly, float alz, float aux, float auy,
                        float auz, float blx, float bly, float blz, float bux, float buy, float buz) -> int {{
+        if (((wa | wb) & {int(FORECAST_FLOATS)}) != 0) reach += forecast.horizon.data[0][1];
         if (((wa | wb) & {int(FORECAST_TERRAIN)}) != 0) {{
-            if ((wb & {int(FORECAST_TERRAIN)}) != 0)
-                return alz - forecast.top.data[a] > reach ? 0 : (wa >> {int(FORECAST_SLOTS_SHIFT)});
-            return blz - forecast.top.data[b] > reach ? 0 : (wb >> {int(FORECAST_SLOTS_SHIFT)});
+            const bool partner_a = (wb & {int(FORECAST_TERRAIN)}) != 0;
+            const float height = partner_a ? alz - forecast.top.data[a] : blz - forecast.top.data[b];
+            const int rows = (partner_a ? wa : wb) >> {int(FORECAST_SLOTS_SHIFT)};
+            return height > reach ? 0 : (height <= 0.0f ? -rows : rows);
         }}
         const float gap = wp::max(
             wp::max(wp::max(alx - bux, blx - aux), wp::max(aly - buy, bly - auy)), wp::max(alz - buz, blz - auz));
@@ -331,9 +340,10 @@ _FORECAST_PAIR = f"""
                 wp::sub(ma, ha), wp::add(ma, ha), wp::sub(mb, hb), wp::add(mb, hb), 1.0e-9f);
             if (closest[2] - ra - rb > reach) return 0;
         }}
-        if ((wa & wb & {int(FORECAST_HYDROELASTIC)}) != 0) return forecast.bound_hydroelastic;
-        if (((wa | wb) & {int(FORECAST_REDUCED)}) != 0) return forecast.bound_reduced;
-        return forecast.bound_convex;
+        int contacts = forecast.bound_convex;
+        if ((wa & wb & {int(FORECAST_HYDROELASTIC)}) != 0) contacts = forecast.bound_hydroelastic;
+        else if (((wa | wb) & {int(FORECAST_REDUCED)}) != 0) contacts = forecast.bound_reduced;
+        return gap <= 0.0f ? -contacts : contacts;
     }};
 """
 
@@ -342,8 +352,8 @@ _FORECAST_GLOBAL = f"""
                     int contacts = fc_pair(a, b, forecast.word.data[a], forecast.word.data[b],
                         forecast.reach.data[a] + forecast.reach.data[b], la[0], la[1], la[2], ua[0], ua[1], ua[2],
                         lb[0], lb[1], lb[2], ub[0], ub[1], ub[2]);
-                    if (contacts > 0 && immovable_filter && {_immovable("a")} && {_immovable("b")}) contacts = 0;
-                    fc_total += contacts;
+                    if (contacts != 0 && immovable_filter && {_immovable("a")} && {_immovable("b")}) contacts = 0;
+                    fc_add(contacts);
                 }}"""
 
 _FORECAST_STAGE = """
@@ -357,22 +367,30 @@ _FORECAST_TEST = """
                     int contacts = fc_pair(s_shape[ia], s_shape[ib], s_fw[ia], s_fw[ib], s_fv[ia] + s_fv[ib], s_lx[ia],
                         s_ly[ia], s_lz[ia], s_ux[ia], s_uy[ia], s_uz[ia], s_lx[ib], s_ly[ib], s_lz[ib], s_ux[ib],
                         s_uy[ib], s_uz[ib]);
-                    if (contacts > 0 && immovable_filter && s_fixed[ia] && s_fixed[ib]) contacts = 0;
-                    fc_total += contacts;
+                    if (contacts != 0 && immovable_filter && s_fixed[ia] && s_fixed[ib]) contacts = 0;
+                    fc_add(contacts);
                 }"""
 
-# A warp adds its lanes' forecast in one atomic, into the counter of its warp; on CPU the block adds its own.
+# A warp adds each of its lanes' two forecast sums in one atomic, into its counter in that sum's half (the pairs within
+# reach in the first, those whose boxes overlap now in the second); on CPU the block adds its own.
 _FORECAST_FLUSH_CUDA = """
         if (fc_on) {
-            for (int offset = 16; offset > 0; offset >>= 1) fc_total += __shfl_down_sync(0xffffffffu, fc_total, offset);
-            if ((thread & 31) == 0 && fc_total != 0) {
-                const int counter = (block * 32 + (thread >> 5)) % forecast.slots.shape[0];
-                atomicAdd((unsigned long long*)(forecast.slots.data + counter), (unsigned long long)fc_total);
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                fc_total += __shfl_down_sync(0xffffffffu, fc_total, offset);
+                fc_near += __shfl_down_sync(0xffffffffu, fc_near, offset);
             }
+            const int counters = forecast.slots.shape[0] / 2;
+            const int counter = (block * 32 + (thread >> 5)) % counters;
+            if ((thread & 31) == 0 && fc_total != 0)
+                atomicAdd((unsigned long long*)(forecast.slots.data + counter), (unsigned long long)fc_total);
+            if ((thread & 31) == 0 && fc_near != 0)
+                atomicAdd((unsigned long long*)(forecast.slots.data + counters + counter), (unsigned long long)fc_near);
         }"""
 
 _FORECAST_FLUSH_CPU = """
-        if (fc_total != 0) forecast.slots.data[block % forecast.slots.shape[0]] += fc_total;"""
+        if (fc_total != 0) forecast.slots.data[block % (forecast.slots.shape[0] / 2)] += fc_total;
+        if (fc_near != 0)
+            forecast.slots.data[forecast.slots.shape[0] / 2 + block % (forecast.slots.shape[0] / 2)] += fc_near;"""
 
 
 def _pair_template_source(slots: int, threads: int, worlds: int, forecast: bool = False) -> str:
@@ -709,7 +727,7 @@ def _nxn_broadphase_kernel(
 
     # A forecasting pass adds its pairs' forecast once a warp: every thread gets here before returning.
     if forecasting(forecast):
-        contacts = wp.int64(0)
+        contacts = wp.vec2l()
         if tested and (
             num_filter_pairs == 0 or not is_pair_excluded(wp.vec2i(shape1, shape2), filter_pairs, num_filter_pairs)
         ):

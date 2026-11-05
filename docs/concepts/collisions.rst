@@ -2541,9 +2541,13 @@ therefore forecasts the demand, inside the launches it already makes: the boundi
 pass states each shape's reach over the service's lag (its speed, the spin at its
 farthest point and, on a floating body, gravity's fall), and the broad phase sums the
 worst case of the pairs it tests whose shapes and bounding capsules can meet within
-their reaches; the world-template broad phase runs a forecasting variant of its kernel
-on that pass, which a conditional node picks. A sweep and prune broad phase sees only
-the pairs whose projections overlap on its axis. While the demand is in transit (from
+their reaches, and apart the worst case of those whose boxes overlap now; the
+world-template broad phase runs a forecasting variant of its kernel on that pass, which
+a conditional node picks. A sweep and prune broad phase sees only the pairs whose
+projections overlap on its axis. The pass's contacts over the second sum are the share
+of a pair's worst case the scene makes; the forecast is the first sum times the
+largest share any pass measured, and the worst case itself until a pass with contacts
+measured one. While the demand is in transit (from
 the start, a state measured before a graph or a pass that dropped contacts, until the
 high-water mark holds within 10% for 200 passes) the service maps rows ahead of the
 forecast, up to the model's shape-pair estimate; once it settled, 2.5 rows per contact
