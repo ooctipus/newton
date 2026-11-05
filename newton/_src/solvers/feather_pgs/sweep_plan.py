@@ -586,14 +586,14 @@ class Sweep:
         model, forest, factor = self.model, self.forest, self.factor
         size = self.placement.sparse_mass_matrix_size
         arts = forest.group_to_art_host[size]
-        start, end = model.articulation_start.numpy(), forest.articulation_joint_end_host
-        path = factor.walk_path_host
-        tables = {tuple(map(tuple, path[start[art] : end[art]])) for art in arts.tolist()}
-        if len(tables) != 1:
+        # The group's tree: its articulations' walking classes' one path table.
+        classes = factor.walk_classes
+        tables = {
+            (classes[cls].parent, classes[cls].first) if cls >= 0 else None for cls in factor.walk_class_host[arts]
+        }
+        if len(tables) != 1 or None in tables:
             raise ValueError("The native sparse factor's articulations must share one tree")
-        table = next(iter(tables))
-        parent = tuple(int(p) for p, _ in table)
-        first = (*(int(f) for _, f in table), int(size))
+        parent, first = next(iter(tables))
         node = tuple(int(k) for k in factor.sparse_pattern.inverse_permutation)
         torsion = bool(self.laws.spin_rows)
         self.support_lanes = walk_rows.SUPPORT_UNIT_LANES if wp.get_device(model.device).is_cuda else 1
