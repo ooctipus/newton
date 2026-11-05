@@ -25,7 +25,7 @@ from ...core.execution import Work, shape
 from ...core.memory import Buffer, Staging, arch_budget, built_for
 from . import kernel_template
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
-from .factor.walk import walk_paths_prelude, walk_row_prelude
+from .factor.walk import walk_prelude, walk_row_prelude, walk_tables
 from .kernel_template import KernelTemplate, SweepTier
 from .law_source import law_preludes
 from .projection_laws import CONE_LAW, PROJECTION_LAW
@@ -45,7 +45,7 @@ from .sweep import (
     material_arguments,
 )
 from .sweep_routes import MF_GS_ABI, worlds
-from .tree_scan import WALK_BOTH
+from .tree_scan import WALK_BOTH, WalkClass, classes_half
 
 PARALLEL_ABI = kernel_template.params(
     *MF_GS_ABI[:-1],
@@ -152,7 +152,7 @@ def parallel_source(
     weighted: bool = False,
     material: bool = False,
     frame: tuple[int, int] = (0, 0),
-    walk_half: int = WALK_BOTH,
+    classes: tuple[WalkClass, ...] = (),
     pitch: int | None = None,
 ) -> tuple[str, Staging]:
     """The native body of a parallel tier: a world's dense rows (at most ``rows``, more than ``min_rows``) under the
@@ -168,7 +168,8 @@ def parallel_source(
     ``linked_rows``, a world stopped under ``solve_policy``), with ``velocity_limit_pass`` the velocity limits' last
     word, then publishes the velocity by the walk down and the impulses. With ``weighted`` contact rows step by their
     weights (the relative regularization's; ``material``: a material contact's ``d / (d + eps)`` from the diagonal the
-    tier forms).
+    tier forms). Keyed rows walk their trees by the walking ``classes``' path tables in constant memory
+    (:func:`.factor.walk.walk_prelude`, the half their records share, :func:`.tree_scan.classes_half`).
 
     Returns the body and its staging.
     """
@@ -199,6 +200,7 @@ def parallel_source(
         read=operands.read if operands is not None else _stored_row(M_D, D),
         walked=operands is not None,
         frame=tuple(int(cap) for cap in frame),
+        classes=len(classes),
     )
     op = TransposedResponse(D, AM, walked, lanes)
     dot = (Buffer("s_dot", "float", NT // 32),) if NT > 32 else ()
@@ -249,6 +251,12 @@ def parallel_source(
 #endif
 """
     row_preludes = operands.preludes if operands is not None else ()
+    walk = ()
+    if operands is not None:
+        if not classes:
+            raise ValueError("a tier that walks its rows walks the classes of their trees")
+        # The walk last, as the general sweep declares it (sweep_routes.mf_gs_source).
+        walk = (walk_prelude(walk_tables(classes), 1, classes_half(classes)), walk_row_prelude(1))
     preludes = (
         lane_group(NT),
         SHARED_STORAGE,
@@ -256,8 +264,6 @@ def parallel_source(
         *row_preludes,
         *law_preludes(PROJECTION_LAW, *((CONE_LAW,) if torsion else ())),
     )
-    # The walk last, as the general sweep declares it (sweep_routes.mf_gs_source).
-    walk = (walk_paths_prelude(1, half=walk_half), *((walk_row_prelude(1),) if operands is not None else ()))
     return cuda_native(body, preludes=(*preludes, *solve_policy.preludes, *walk)), staging
 
 
@@ -280,7 +286,7 @@ def parallel_kernel(
     weighted: bool = False,
     material: bool = False,
     frame: tuple[int, int] = (0, 0),
-    walk_half: int = WALK_BOTH,
+    classes: tuple[WalkClass, ...] = (),
     pitch: int | None = None,
     queued: bool = False,
 ) -> SweepTier:
@@ -291,8 +297,8 @@ def parallel_kernel(
     carries the solver's free-body capacity ``mf_max_constraints``) and admits its velocity-limit rows as unilateral
     rows. Its worlds' stored rows (:mod:`.walk_rows`) lie at their coordinates, ``max_world_dofs`` entries a row.
     With ``weighted`` its contact rows step by their weights, ``material`` contacts' from their compliance; ``frame``
-    is each tree's slip capacity (:class:`.WalkedRows`); ``walk_half`` the half its walks read the records by, the
-    model's (:func:`.tree_scan.classes_half`); ``queued`` takes its worlds from a device list
+    is each tree's slip capacity (:class:`.WalkedRows`); ``classes`` the walking classes whose trees its keyed rows
+    walk (:attr:`.tree_factor.TreeFactor.walk_classes`); ``queued`` takes its worlds from a device list
     (:func:`.sweep_routes.worlds`).
     """
     if material and not weighted:
@@ -315,13 +321,14 @@ def parallel_kernel(
         weighted=weighted,
         material=material,
         frame=frame,
-        walk_half=walk_half,
+        classes=classes,
         pitch=pitch,
     )
     staging.check("the parallel tier", arch_budget(device_arch))
     (NA, NB, OA, OB), operands = _operands(max_constraints, max_world_dofs, **options)
     AM = int(rows)
     NT = 32 * ((AM + 31) // 32)
+    walk_half = classes_half(classes) if classes else WALK_BOTH
     # A block a world, a thread a row. Not persistent: an uncapped line does not fix the tier's residency, and a grid
     # of one wave by the line is 1.2 waves at a keyed tier's 96 registers (allegro's 64-row tier 5% slower, PRO).
     work = Work(0, lanes=NT, block=NT, registers=REGISTER_LINE, cap=False, shared=staging.bytes)

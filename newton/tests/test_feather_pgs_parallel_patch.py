@@ -49,7 +49,14 @@ from newton._src.solvers.feather_pgs.row_records import DenseRows
 from newton._src.solvers.feather_pgs.rows import RowLaws, velocity_prescale_launch
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import leave_walk, plain_laws, row_bias, row_lines, unpacked_rows
+from newton.tests.feather_pgs_law_harness import (
+    keyed_classes,
+    leave_walk,
+    plain_laws,
+    row_bias,
+    row_lines,
+    unpacked_rows,
+)
 from newton.tests.feather_pgs_mass_reference import MassReference
 from newton.tests.feather_pgs_patch_parity import (
     SLIDING_FEET,
@@ -711,7 +718,7 @@ class TestParallelPatchReference(unittest.TestCase):
                 (_CAPACITY, 32, _DOFS, "120"),
                 {"inkernel_response": (_DOFS, 0, 0, 0)},
             ),
-            (keyed, (128, 32, 22, "120"), {"inkernel_response": (16, 6, 0, 16)}),
+            (keyed, (128, 32, 22, "120"), {"inkernel_response": (16, 6, 0, 16), "classes": keyed_classes(layout)}),
         ):
             for linked in (False, True):
                 with self.subTest(shape=shape, linked=linked, **extra):
@@ -759,15 +766,14 @@ class TestParallelPatchReference(unittest.TestCase):
         limits, as a solver with ``enable_joint_velocity_limits`` builds them.
         """
         plain_tiers = (sweep_routes_tiers.parallel_kernel, (_CAPACITY, 32, _DOFS, "120"))
+        layout = KeyedLayout(16, 6, 0, 16, 128, True, (1 << 16) - 1)
         keyed_tiers = (
-            keyed_rows.get_parallel_factory(
-                sweep_routes_tiers.parallel_kernel, KeyedLayout(16, 6, 0, 16, 128, True, (1 << 16) - 1)
-            ),
+            keyed_rows.get_parallel_factory(sweep_routes_tiers.parallel_kernel, layout),
             (128, 32, 22, "120"),
         )
         variants = {
             "group rows": (plain_tiers, {"inkernel_response": (6, 0, 0, 0)}),
-            "keyed rows": (keyed_tiers, {"inkernel_response": (16, 6, 0, 16)}),
+            "keyed rows": (keyed_tiers, {"inkernel_response": (16, 6, 0, 16), "classes": keyed_classes(layout)}),
         }
         for name, ((factory, args), options) in variants.items():
             with self.subTest(variant=name):
@@ -1062,7 +1068,7 @@ class TestKeyedPatchRows(unittest.TestCase):
         """Read every row's parent and coefficient in the keyed patch tiers instead of building them."""
         layout = KeyedLayout(16, 6, 0, 16, 128, False, 0)
         factory = keyed_rows.get_parallel_factory(sweep_routes_tiers.parallel_kernel, layout)
-        options = {"rows": 32, "sweeps": 24, "inkernel_response": (16, 6, 0, 16)}
+        options = {"rows": 32, "sweeps": 24, "inkernel_response": (16, 6, 0, 16), "classes": keyed_classes(layout)}
         linked = factory(128, 32, 22, "120", linked_rows=True, **options)
         self.assertTrue(linked.kernel.key.startswith("sweep_keyed_parallel_"))
         self.assertTrue(linked.kernel.key.endswith("_linked"))

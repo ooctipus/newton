@@ -919,6 +919,17 @@ def walk_factor(lower) -> np.ndarray:
     return lower.T[::-1, ::-1].copy()
 
 
+def chain_class(n: int) -> WalkClass:
+    """The walking class of a chain of ``n`` bodies of one coordinate each."""
+    return WalkClass(tuple(range(-1, n - 1)), tuple(range(n + 1)))
+
+
+def keyed_classes(layout) -> tuple[WalkClass, ...]:
+    """The walking classes of a keyed layout's trees (:class:`.keyed_row_layout.KeyedLayout`), chains of its primary
+    and secondary sizes: what a keyed tier's walks read (:func:`.sweep_routes_tiers.parallel_kernel`'s ``classes``)."""
+    return tuple(chain_class(n) for n in (layout.primary, layout.secondary) if n)
+
+
 def chain_walk(device, lowers) -> WalkTrees:
     """The walk (:class:`.factor.walk.WalkTrees`) of chains whose factors are the given leaf-first ``L`` (one an
     articulation, their coordinates one after another): body ``c`` holds coordinate ``c`` (a chain of at most six),

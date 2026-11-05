@@ -51,6 +51,7 @@ of the parent commit, so one copy of this script records both sides.
 
 import argparse
 import collections
+import functools
 import hashlib
 import inspect
 import itertools
@@ -154,6 +155,7 @@ def factory_calls():
         sweep_routes_tiers,
     )
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
+    from newton.tests.feather_pgs_law_harness import keyed_classes  # noqa: PLC0415
 
     mf_gs = _unwrapped(sweep_routes.mf_gs_kernel)
     toggles = (
@@ -171,7 +173,7 @@ def factory_calls():
 
     def parallel(layout, *args, **kwargs):
         factory = keyed_rows.get_parallel_factory.__wrapped__(sweep_routes_tiers.parallel_kernel, layout)
-        return factory(*args, **kwargs)
+        return factory(*args, classes=keyed_classes(layout), **kwargs)
 
     layout = Named("KeyedLayout(18, 0, 0, 0, 48, False, 0)", KeyedLayout(18, 0, 0, 0, 48, False, 0))
     for rows, min_rows in ((32, 0), (48, 32)):
@@ -542,6 +544,7 @@ def census_calls():
     )
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel  # noqa: PLC0415
+    from newton.tests.feather_pgs_law_harness import keyed_classes  # noqa: PLC0415
 
     mf_gs = (
         _axis("places", sweep_routes.ROW_PLACES),
@@ -601,7 +604,9 @@ def census_calls():
         ),
         (
             f"keyed_rows.get_parallel_factory({keyed!r})",
-            keyed_rows.get_parallel_factory.__wrapped__(sweep_routes_tiers.parallel_kernel, keyed),
+            keyed_rows.get_parallel_factory.__wrapped__(
+                functools.partial(sweep_routes_tiers.parallel_kernel, classes=keyed_classes(keyed)), keyed
+            ),
             ((128, 32, 22, ARCH),),
             (
                 tuple(

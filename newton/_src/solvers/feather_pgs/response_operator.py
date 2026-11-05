@@ -632,7 +632,8 @@ def _push_apply(delta: str, column: Callable[[str], str], lanes: Lanes, dofs: in
 @dataclass(frozen=True)
 class WalkedRows:
     """A world's rows in the walk's coordinates, built in the kernel: each row's seeds walked up its trees' root paths
-    (:func:`.factor.walk.walk_paths_prelude`), ``Z_i`` at the row's world coordinates.
+    (:func:`.factor.walk.walk_prelude`: each tree's path its class's, in constant memory), ``Z_i`` at the row's world
+    coordinates.
 
     A world holds the ``primary`` tree of ``primary`` coordinates from world coordinate ``primary_offset`` and at most
     one ``secondary`` tree from ``secondary_offset``: its articulations ``art_a`` and ``art_b`` (``ink_meta``, ``-1``
@@ -644,7 +645,8 @@ class WalkedRows:
     the row and its ``J`` entries against ``v_hat`` into ``incident``; with ``walked`` each slipping tree's release ``R``
     (``walk.release``, :class:`.factor.walk.WalkRelease`) then takes the decided factor's row, as the rows the one
     writer stored hold it already. ``frame`` is each tree's slip capacity, 0 where none of the class's trees of that
-    size can slip: its release compiles out. ``A = Z^T Z``, so ``Z`` serves as both ``J^T`` and ``Y``; the lane keeps
+    size can slip: its release compiles out. ``classes`` is the number of walking classes the tables hold: past one, a
+    tree names its class (:attr:`.factor.walk.WalkTrees.cls`). ``A = Z^T Z``, so ``Z`` serves as both ``J^T`` and ``Y``; the lane keeps
     ``Z_i`` in its registers (``Jr``). The velocity change of the applied impulses, ``u = Z^T delta``, leaves by the
     walk down in the rows' square root, ``P^T L^-T R^T u``, a tree per lane (:meth:`publish`).
     """
@@ -659,6 +661,7 @@ class WalkedRows:
     read: str
     walked: bool = False
     frame: tuple[int, int] = (0, 0)
+    classes: int = 1
     rows: str = "n_rows"
 
     def _tree(self) -> list[str]:
@@ -668,11 +671,10 @@ class WalkedRows:
     def _walk(self) -> str:
         """``TIER_WALK``: one seed of row ``i`` on the world's tree ``side`` (``WALK_ROW``, :func:`.factor.walk.walk_row_prelude`), its
         footprints added at the tree's world coordinates and its ``J`` entries against ``s_v`` into ``incident``."""
-
+        tree = "\n    WALK_TREE(walk.cls.data[art]);" if self.classes > 1 else ""
         return f"""const auto TIER_WALK = [&](const int side, const int body, const int k, const float* seed) {{
     const int art = side == 0 ? art_a : art_b, offset = side == 0 ? {self.primary_offset} : {self.secondary_offset};
-    const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
-    WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), walk.joint_end.data[art] - j0, walk.dofs.data[art]);
+    const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];{tree}
     const float* data = walk.data.data + (size_t)d0 * {WALK_COORDINATE};
     const float* link = walk.link.data + (size_t)j0 * {WALK_LINK};
     // The step's geometry the finish published: its columns and links at the step's poses.

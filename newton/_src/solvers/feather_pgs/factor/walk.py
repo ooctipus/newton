@@ -42,6 +42,7 @@ __all__ = [
     "walk_paths_prelude",
     "walk_prelude",
     "walk_row_prelude",
+    "walk_tables",
     "walk_work",
 ]
 
@@ -1785,7 +1786,7 @@ def _walk_inward_snippet(classes: tuple[WalkClass, ...]) -> str:
     from ..device_preludes import CPU_MATH, LANE_FEED, dual_native, lane_group  # noqa: PLC0415
 
     step_head, step_update = ts.inward_step("h", "s")
-    table = walk_table(_tables(classes), joins=True)
+    table = walk_table(walk_tables(classes), joins=True)
     tables = DevicePrelude("walk_tables", table, cpu=table)
     return dual_native(
         substitute(
@@ -1803,8 +1804,9 @@ def _walk_inward_snippet(classes: tuple[WalkClass, ...]) -> str:
     )
 
 
-def _tables(classes: tuple[WalkClass, ...]) -> tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]:
-    """The classes' path tables (:func:`walk_table`'s), each class's parent and first coordinate."""
+def walk_tables(classes) -> tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]:
+    """The walking classes' path tables (:func:`walk_table`'s, :func:`walk_prelude`'s), each class's parent and first
+    coordinate."""
     return tuple((walk.parent, walk.first) for walk in classes)
 
 
@@ -1905,5 +1907,5 @@ def walk_step_kernel(classes: tuple[WalkClass, ...]) -> wp.Kernel:
         if lane == 0:
             walk_origin[art] = articulation_origin[art]
 
-    tag = hashlib.sha256(repr(_tables(classes)).encode()).hexdigest()[:8]
+    tag = hashlib.sha256(repr(walk_tables(classes)).encode()).hexdigest()[:8]
     return python_kernel(walk_step, f"walk_step_{tag}")

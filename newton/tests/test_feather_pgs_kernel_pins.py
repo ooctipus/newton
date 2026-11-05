@@ -36,6 +36,7 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs import environment_flags
 from newton._src.solvers.feather_pgs.kernel_template import SweepTier
+from newton.tests.feather_pgs_law_harness import keyed_classes
 
 _PINS = os.path.join(os.path.dirname(__file__), "golden_data", "test_feather_pgs_kernel_pins", "pins.json")
 _PACKAGE = "newton._src.solvers.feather_pgs"
@@ -368,7 +369,8 @@ def _suite_shape_calls():
         yield "sweep_routes_diag.sparse_diagonal_kernel", factory, args, kwargs
 
     def parallel(layout, *args, **kwargs):
-        return keyed_rows.get_parallel_factory.__wrapped__(sweep_routes_tiers.parallel_kernel, layout)(*args, **kwargs)
+        factory = keyed_rows.get_parallel_factory.__wrapped__(sweep_routes_tiers.parallel_kernel, layout)
+        return factory(*args, classes=keyed_classes(layout), **kwargs)
 
     def limit_prefix(layout):
         return keyed_row_layout.prefix_kernel.__wrapped__(layout, keyed_rows.PrefixInput, keyed_rows.KineticRows)
@@ -394,7 +396,8 @@ def _keyed_row_calls():
     from newton._src.solvers.feather_pgs import keyed_rows, sweep_routes_tiers  # noqa: PLC0415
 
     def parallel(layout, *args, **kwargs):
-        return keyed_rows.get_parallel_factory.__wrapped__(sweep_routes_tiers.parallel_kernel, layout)(*args, **kwargs)
+        factory = keyed_rows.get_parallel_factory.__wrapped__(sweep_routes_tiers.parallel_kernel, layout)
+        return factory(*args, classes=keyed_classes(layout), **kwargs)
 
     layout = _keyed_layout()
     for kwargs in _keyed_tier_kwargs(linked=False):

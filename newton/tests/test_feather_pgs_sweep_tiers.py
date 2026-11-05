@@ -31,6 +31,7 @@ from newton._src.solvers.feather_pgs.sweep import (
     jacobi_scale,
     jacobi_sweeps,
 )
+from newton.tests.feather_pgs_law_harness import keyed_classes
 
 _TIER = sweep_routes_tiers.parallel_kernel.__wrapped__
 
@@ -46,6 +47,7 @@ _BLOCK_EXIT = "const bool sweep_stop = !ANY(iteration_changed != 0);"
 _EXIT_TEXT = f"        {{\n            {_EXIT}\n            if (sweep_stop) break;\n        }}\n"
 
 _LAYOUT = KeyedLayout(12, 6, 0, 12, 32, False, 0, None)
+_CLASSES = keyed_classes(_LAYOUT)
 
 
 def _keyed(linked: bool):
@@ -59,11 +61,15 @@ CALLS = (
     # The conformance routes' configurations (32 rows, one warp), then the wider tiers and the other variants.
     ("whitened", (64, 32, 18, "120"), {"rows": 32, "sweeps": 112, **_INK}),
     ("whitened_linked", (64, 32, 18, "120"), {"rows": 32, "sweeps": 112, **_INK, "linked_rows": True}),
-    ("keyed", (64, 32, 18, "120"), {"rows": 32, "sweeps": 112, **_INK, "row_inputs": _keyed(False)}),
+    (
+        "keyed",
+        (64, 32, 18, "120"),
+        {"rows": 32, "sweeps": 112, **_INK, "row_inputs": _keyed(False), "classes": _CLASSES},
+    ),
     (
         "keyed_linked",
         (64, 32, 18, "120"),
-        {"rows": 32, "sweeps": 112, **_INK, "row_inputs": _keyed(True), "linked_rows": True},
+        {"rows": 32, "sweeps": 112, **_INK, "row_inputs": _keyed(True), "classes": _CLASSES, "linked_rows": True},
     ),
     ("one_group", (64, 32, 18, "120"), {"rows": 32, "sweeps": 42, "inkernel_response": (18, 0, 0, 0)}),
     ("rows_64", (96, 32, 18, "120"), {"rows": 64, "min_rows": 32, "sweeps": 60, **_INK}),

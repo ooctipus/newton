@@ -1129,7 +1129,7 @@ class Sweep:
                         velocity_limit_pass=self._parallel_velocity_limit_pass(),
                         weighted=self.laws.set.weighted,
                         frame=self._tier_frame(),
-                        walk_half=classes_half(self.factor.walk_classes),
+                        classes=self.factor.walk_classes,
                         pitch=self.placement.row_pitch,
                         # A tier walks its own list of worlds where the plan keeps one.
                         queued=self.tier_worlds is not None,
