@@ -11,7 +11,10 @@
 - the prescribed free bodies the matrix-free formulation elides, and so each articulation's response coordinates;
 - the size groups (articulations by response coordinate count) and the world mapping;
 - the body maps (each body's tree joint, articulation and response support);
-- the coordinate trees, the vertices of the rows' graph, each body's among them and each world's;
+- the root cut: the joint forest with the joints above every coordinate cut away, whose trees are the coordinate
+  trees, the vertices of the rows' graph (a fixed-base star is as many one-coordinate trees as it has keys), each
+  body's among them and each world's, and each tree's shape;
+- the world classes: worlds of equal tree shapes and equal row laws present, which one plan can serve;
 - per size group, the mass matrix's coordinate-to-joint map and whether every tree has one coordinate (a star);
 - with the matrix-free formulation, the compact per-world response mapping.
 
@@ -21,12 +24,14 @@ change the model's topology need a new solver.
 
 from __future__ import annotations
 
+import enum
 from dataclasses import dataclass
 from types import SimpleNamespace
 
 import numpy as np
 import warp as wp
 
+from ...geometry.flags import ShapeFlags
 from ...sim import Model
 from ...sim.enums import JointType
 from . import host_index
@@ -45,7 +50,38 @@ BODY_MAPS = FieldGroup(
 """Each body's tree joint, articulation, response presence, low-32 response support and single response DOF."""
 
 
-__all__ = ["ForestPlan", "joint_forest", "row_support"]
+__all__ = ["ForestPlan", "RowLaw", "WorldClass", "joint_forest", "row_support"]
+
+
+class RowLaw(enum.IntFlag):
+    """The row laws a world's data gives rows, from the model at construction (the options decide which of them run)."""
+
+    CONTACT = 1
+    """A colliding shape on a body a tree moves."""
+    LIMIT = 2
+    """A joint axis with a finite position limit."""
+    VELOCITY_LIMIT = 4
+    """A joint axis with a positive velocity limit."""
+    MIMIC = 8
+    """A mimic constraint on a tree's joint."""
+    LINK = 16
+    """A link of the body cut."""
+
+
+_LIMITED_JOINTS = (int(JointType.PRISMATIC), int(JointType.REVOLUTE), int(JointType.D6))
+"""The joints whose axes take limit rows."""
+
+
+@dataclass(frozen=True, eq=False)
+class WorldClass:
+    """Worlds of equal tree shapes and equal row laws present: what one plan of their trees and rows serves."""
+
+    shapes: tuple[int, ...]
+    """The shape of each of a member world's trees (:attr:`ForestPlan.tree_shape`), ascending."""
+    laws: RowLaw
+    """The row laws present in each member world."""
+    worlds: np.ndarray
+    """The member worlds, ascending."""
 
 
 def joint_forest(model: Model) -> TreePlan:
@@ -123,6 +159,14 @@ class ForestPlan:
     """Responding free rigid bodies per world (at least one entry)."""
 
     # Coordinate trees (host), ascending by root joint.
+    coordinate_forest: TreePlan
+    """The root cut: the joint forest with every joint above all coordinates cut from its children, so each of them
+    roots a tree. A tree is a root with coordinates and its subtree, which keeps the welds below its root; a joint
+    above every coordinate is a root of its own without any."""
+    tree_root: np.ndarray
+    """Each tree's root joint."""
+    tree_shape: np.ndarray
+    """Each tree's shape: equal for trees of equal parents, joint types and axes in depth-first order."""
     tree_first: np.ndarray
     """Each tree's first coordinate. A tree's coordinates need not be a range: breadth-first joints interleave trees."""
     tree_size: np.ndarray
@@ -134,6 +178,14 @@ class ForestPlan:
     """Each world's trees: ``world_trees[world_tree_start[w] : world_tree_start[w + 1]]``."""
     body_tree: np.ndarray
     """Each body's tree, ``-1`` where no solved coordinate moves it."""
+
+    # World classes (host).
+    world_laws: np.ndarray
+    """The row laws present in each world (:class:`RowLaw` bits)."""
+    world_class: np.ndarray
+    """Each world's class among :attr:`world_classes`."""
+    world_classes: tuple[WorldClass, ...]
+    """The world classes, by their first world."""
 
     # Size groups.
     size_groups: list
@@ -206,6 +258,7 @@ class ForestPlan:
         _body_maps(plan, model)
         _free_bodies(plan, model)
         _coordinate_trees(plan, model)
+        _world_classes(plan, model)
         _mass_schedules(plan, model)
         _world_size_groups(plan, model)
         _world_response_mapping(plan, model)
@@ -344,23 +397,43 @@ def _roots(plan, model, free_root):
     plan.has_root_free = bool(np.any(root_is_free != 0))
 
 
+def _equal_ids(lengths: np.ndarray, rows) -> np.ndarray:
+    """Equal ids for equal items whose keys are rows of varying length: ``rows(members, length)`` gives the key rows of
+    the items ``members`` of one ``length``. Ids count up by length, then by key."""
+    ids = np.zeros(lengths.size, dtype=np.int64)
+    found = 0
+    for length in np.unique(lengths):
+        members = np.flatnonzero(lengths == length)
+        _, inverse = np.unique(rows(members, int(length)), axis=0, return_inverse=True)
+        ids[members] = found + inverse.reshape(-1)
+        found += int(inverse.max()) + 1
+    return ids
+
+
+def _shapes(model, parent: np.ndarray, first, lengths: np.ndarray, order=None) -> np.ndarray:
+    """Equal ids for equal trees: tree ``t`` is the joints ``order[first[t] : first[t] + lengths[t]]`` (``order`` the
+    identity by default), parents first; its key is each joint's parent as a position in the tree (``-1`` for a parent
+    outside it: a tree stops at its articulation), type and axes."""
+    kinds, dimensions = model.joint_type.numpy(), model.joint_dof_dim.numpy()
+    order = np.arange(parent.size) if order is None else order
+    position = np.full(parent.size, -1, dtype=np.int64)
+    tree = np.full(parent.size, -1, dtype=np.int64)
+
+    def rows(members, length):
+        table = order[first[members, None] + np.arange(length)]
+        position[table], tree[table] = np.arange(length), members[:, None]
+        above = np.maximum(parent[table], 0)
+        local = np.where((parent[table] >= 0) & (tree[above] == members[:, None]), position[above], -1)
+        return np.concatenate((local, kinds[table], dimensions[table].reshape(members.size, -1)), axis=1)
+
+    return _equal_ids(lengths, rows)
+
+
 def _by_topology(plan, model, arts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """The articulations ``arts`` of a size group, ascending, with equal trees side by side (ascending among them),
     and the bounds of each run of equal trees. A group of one topology keeps its order."""
     first = model.articulation_start.numpy()[arts]
-    joints = plan.articulation_joint_end_host[arts] - first
-    ancestor, kinds = model.joint_ancestor.numpy(), model.joint_type.numpy()
-    dimensions = model.joint_dof_dim.numpy()
-    topology = np.zeros(arts.size, dtype=np.int64)
-    found = 0
-    for count in np.unique(joints):
-        members = np.flatnonzero(joints == count)
-        table = first[members, None] + np.arange(count)
-        parents = np.where(ancestor[table] >= 0, ancestor[table] - first[members, None], -1)
-        rows = np.concatenate((parents, kinds[table], dimensions[table].reshape(members.size, -1)), axis=1)
-        _, inverse = np.unique(rows, axis=0, return_inverse=True)
-        topology[members] = found + inverse.reshape(-1)
-        found += int(inverse.max()) + 1
+    topology = _shapes(model, model.joint_ancestor.numpy(), first, plan.articulation_joint_end_host[arts] - first)
     return arts[np.argsort(topology, kind="stable")], host_index.offsets(np.bincount(topology), np.int64)
 
 
@@ -500,10 +573,11 @@ def _free_bodies(plan, model):
 
 
 def _coordinate_trees(plan, model):
-    """The coordinate trees: each articulation's joints once a joint without coordinates is contracted, so a root without
-    coordinates is no node and each joint below it roots a tree. Only a common tree couples two coordinates in the mass
-    matrix, so a tree is a vertex of the rows' graph (rows are its edges). The mass matrix stops at an articulation, and
-    so does a tree, whatever the ancestry says. A prescribed articulation responds with nothing and holds none."""
+    """The root cut and its coordinate trees: each articulation's joints once the joints above every coordinate are cut
+    away, so a root without coordinates is no node and each joint below it roots a tree (a fixed-base star becomes one
+    tree a key). Only a common tree couples two coordinates in the mass matrix, so a tree is a vertex of the rows' graph
+    (rows are its edges). The mass matrix stops at an articulation, and so does a tree, whatever the ancestry says. A
+    prescribed articulation responds with nothing and holds none."""
     forest = plan.joint_forest
     joint_articulation = model.joint_articulation.numpy()
     joint_qd_start = model.joint_qd_start.numpy()
@@ -514,19 +588,24 @@ def _coordinate_trees(plan, model):
     def rooted_above(above, joint):
         return np.where((dofs[above] > 0) & (joint_articulation[above] == joint_articulation[joint]), above, joint)
 
-    # Each joint's topmost ancestor with coordinates, or itself: a tree's root, or a joint above every coordinate.
+    # Each joint's topmost ancestor with coordinates, or itself: its tree's root, or a joint above every coordinate,
+    # whose children the cut makes roots.
     joints = np.arange(forest.count)
     root = forest.scan_down(joints, rooted_above)
-    roots = np.flatnonzero((root == joints) & (dofs > 0))
-    joint_tree = np.where(dofs[root] > 0, np.searchsorted(roots, root), -1)
+    cut = TreePlan.build(np.where(root == joints, -1, forest.parent), dofs)
+    roots = cut.roots[dofs[cut.roots] > 0]
     solved = dofs > 0
     tree_articulation = joint_articulation[roots].astype(np.int32)
     world_tree_start, world_trees = host_index.group_by(plan.articulation_world[tree_articulation], plan.world_count)
     joint_child = model.joint_child.numpy()
+    plan.coordinate_forest, plan.tree_root = cut, roots
+    joint_tree = _joint_tree(plan)
     body_tree = np.full(model.body_count, -1, dtype=np.int32)
     owned = member & (joint_child >= 0)
     body_tree[joint_child[owned]] = joint_tree[owned]
     arrays = {
+        "tree_root": roots.astype(np.int32),
+        "tree_shape": _shapes(model, cut.parent, cut.dfs_position[roots], cut.subtree_size[roots], cut.dfs_order),
         "tree_first": joint_qd_start[roots].astype(np.int32),
         "tree_size": np.bincount(joint_tree[solved], dofs[solved], roots.size).astype(np.int32),
         "tree_articulation": tree_articulation,
@@ -537,6 +616,67 @@ def _coordinate_trees(plan, model):
     for name, array in arrays.items():
         array.setflags(write=False)
         setattr(plan, name, array)
+
+
+def _joint_tree(plan) -> np.ndarray:
+    """Each joint's tree, ``-1`` for a joint above every coordinate or outside every tree."""
+    cut = plan.coordinate_forest
+    tree = np.full(cut.count, -1, dtype=np.int64)
+    tree[plan.tree_root] = np.arange(plan.tree_root.size)
+    return tree[cut.root_of]
+
+
+def _world_classes(plan, model):
+    """The row laws present in each world, and the world classes: worlds of equal tree shapes and equal laws."""
+    laws = np.zeros(plan.world_count, dtype=np.int32)
+    tree_world = plan.articulation_world[plan.tree_articulation]
+
+    def present(law, trees):
+        np.bitwise_or.at(laws, tree_world[trees[trees >= 0]], int(law))
+
+    if model.shape_count:
+        colliding = (model.shape_flags.numpy() & int(ShapeFlags.COLLIDE_SHAPES)) != 0
+        shape_body = model.shape_body.numpy()[colliding]
+        present(RowLaw.CONTACT, plan.body_tree[shape_body[shape_body >= 0]])
+    if model.joint_count:
+        joint_tree = _joint_tree(plan)
+        limited = np.flatnonzero(np.isin(model.joint_type.numpy(), _LIMITED_JOINTS) & (joint_tree >= 0))
+        joint, axis = host_index.expand(model.joint_dof_dim.numpy()[limited].sum(axis=1))
+        dof = model.joint_qd_start.numpy()[limited[joint]] + axis
+        trees = joint_tree[limited[joint]]
+        finite = np.isfinite(model.joint_limit_lower.numpy()[dof]) | np.isfinite(model.joint_limit_upper.numpy()[dof])
+        present(RowLaw.LIMIT, trees[finite])
+        present(RowLaw.VELOCITY_LIMIT, trees[model.joint_velocity_limit.numpy()[dof] > 0.0])
+        if model.constraint_mimic_count:
+            for joints in (model.constraint_mimic_joint0.numpy(), model.constraint_mimic_joint1.numpy()):
+                present(RowLaw.MIMIC, joint_tree[joints[joints >= 0]])
+    if plan.cut.tree_primary.size:
+        np.bitwise_or.at(laws, plan.articulation_world[plan.cut.tree_primary], int(RowLaw.LINK))
+
+    # A world's key: its trees' shapes, ascending, then its laws.
+    counts = np.diff(plan.world_tree_start)
+    by_world = plan.tree_shape[plan.world_trees]
+    order = np.lexsort((by_world, np.repeat(np.arange(plan.world_count), counts)))
+    ordered = by_world[order]
+
+    def rows(members, length):
+        table = ordered[plan.world_tree_start[members, None] + np.arange(length)]
+        return np.concatenate((table, laws[members, None]), axis=1)
+
+    # Classes by their first world.
+    _, first, inverse = np.unique(_equal_ids(counts, rows), return_index=True, return_inverse=True)
+    world_class = np.argsort(np.argsort(first))[inverse.reshape(-1)].astype(np.int32)
+    bounds, worlds = host_index.group_by(world_class, first.size)
+    classes = []
+    for c in range(first.size):
+        members = worlds[bounds[c] : bounds[c + 1]].astype(np.int32)
+        head = members[0]
+        shape = ordered[plan.world_tree_start[head] : plan.world_tree_start[head + 1]]
+        members.setflags(write=False)
+        classes.append(WorldClass(tuple(int(k) for k in shape), RowLaw(int(laws[head])), members))
+    laws.setflags(write=False)
+    world_class.setflags(write=False)
+    plan.world_laws, plan.world_class, plan.world_classes = laws, world_class, tuple(classes)
 
 
 def _mass_schedules(plan, model):

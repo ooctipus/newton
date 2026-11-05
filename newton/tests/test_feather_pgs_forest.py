@@ -19,6 +19,7 @@ import newton
 from newton._src.solvers.feather_pgs import body_cut, host_index
 from newton._src.solvers.feather_pgs.body_cut import BodyCut
 from newton._src.solvers.feather_pgs.body_mapping import build_body_maps
+from newton._src.solvers.feather_pgs.forest_plan import RowLaw
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
@@ -136,6 +137,9 @@ class TestCoordinateTrees(unittest.TestCase):
         self.assertEqual(plan.tree_first.tolist(), [0, 2])
         self.assertEqual(plan.tree_articulation.tolist(), [0, 0])
         self.assertEqual(plan.body_tree.tolist(), [-1, 0, 0, 0, 1])
+        # The root cut: the base is a root of its own, each joint below it roots a tree, the weld stays in its tree.
+        self.assertEqual(plan.coordinate_forest.parent.tolist(), [-1, -1, 1, 2, -1])
+        self.assertEqual(plan.tree_root.tolist(), [1, 4])
 
     def test_a_free_root_is_a_coordinate(self):
         """A free body is a one-node tree of six, and a free root holds its whole articulation."""
@@ -199,6 +203,40 @@ class TestCoordinateTrees(unittest.TestCase):
         self.assertEqual(plan.world_trees.size, 0)
         self.assertEqual(plan.body_tree.tolist(), [-1])
 
+    def test_the_root_cut_makes_a_fixed_star_one_tree_a_key(self):
+        """A fixed-base star is as many one-coordinate trees as it has keys, all of one shape."""
+        builder = newton.ModelBuilder()
+        base = _link(builder)
+        keys = [_link(builder) for _ in range(4)]
+        builder.add_articulation(
+            [builder.add_joint_fixed(-1, base)] + [builder.add_joint_revolute(base, key, axis=_AXIS) for key in keys]
+        )
+        plan = _plan(builder.finalize(device="cpu"))
+        self.assertEqual(plan.tree_size.tolist(), [1] * 4)
+        self.assertEqual(plan.tree_root.tolist(), [1, 2, 3, 4])
+        self.assertEqual(plan.coordinate_forest.roots.tolist(), [0, 1, 2, 3, 4])
+        self.assertEqual(plan.coordinate_forest.dofs.tolist(), [0, 1, 1, 1, 1])
+        self.assertEqual(plan.tree_shape.tolist(), [0] * 4)
+
+    def test_tree_shapes_follow_parents_types_and_axes(self):
+        """Equal trees share a shape: a chain differs from a fork of as many joints, a slide from a hinge."""
+        builder = newton.ModelBuilder()
+        for kind in ("chain", "fork", "chain", "slide"):
+            root, middle, tip = (_link(builder) for _ in range(3))
+            joint = builder.add_joint_prismatic if kind == "slide" else builder.add_joint_revolute
+            builder.add_articulation(
+                [
+                    builder.add_joint_revolute(-1, root, axis=_AXIS),
+                    builder.add_joint_revolute(root, middle, axis=_AXIS),
+                    joint(middle if kind != "fork" else root, tip, axis=_AXIS),
+                ]
+            )
+        plan = _plan(builder.finalize(device="cpu"))
+        shapes = plan.tree_shape.tolist()
+        self.assertEqual(len(shapes), 4)
+        self.assertEqual(shapes[0], shapes[2])
+        self.assertEqual(len(set(shapes)), 3)
+
     def test_a_star_is_a_diagonal_factor_pattern(self):
         """The star test agrees with the fill-free pattern on random welded trees of one root joint."""
         rng = np.random.default_rng(7)
@@ -224,6 +262,66 @@ class TestCoordinateTrees(unittest.TestCase):
             self.assertEqual(bool(np.all(plan.tree_size == 1)), star, parents)
             found[bool(star)] += 1
         self.assertTrue(all(found.values()), found)
+
+
+class TestWorldClasses(unittest.TestCase):
+    """Worlds of equal tree shapes and equal row laws present are one class, numbered by their first world."""
+
+    @staticmethod
+    def _worlds(arms):
+        """One world an arm of ``links`` revolute links; ``limited`` gives its first joint a position limit; ``touch``
+        a colliding box on its tip."""
+        builder = newton.ModelBuilder()
+        for links, limited, touch in arms:
+            builder.begin_world()
+            parent, joints = -1, []
+            for k in range(links):
+                body = _link(builder)
+                limits = {"limit_lower": -1.0, "limit_upper": 1.0} if limited and k == 0 else {}
+                joints.append(builder.add_joint_revolute(parent, body, axis=_AXIS, **limits))
+                parent = body
+            if touch:
+                builder.add_shape_box(parent, hx=0.1, hy=0.1, hz=0.1)
+            builder.add_articulation(joints)
+            builder.end_world()
+        model = builder.finalize(device="cpu")
+        model.joint_limit_lower.fill_(-np.inf)
+        model.joint_limit_upper.fill_(np.inf)
+        model.joint_velocity_limit.fill_(0.0)
+        lower, upper = model.joint_limit_lower.numpy(), model.joint_limit_upper.numpy()
+        dof = 0
+        for links, limited, _ in arms:
+            if limited:
+                lower[dof], upper[dof] = -1.0, 1.0
+            dof += links
+        model.joint_limit_lower.assign(lower)
+        model.joint_limit_upper.assign(upper)
+        return _plan(model)
+
+    def test_classes_key_on_shapes_and_laws(self):
+        plan = self._worlds(
+            [(2, False, False), (3, False, False), (2, False, False), (2, True, False), (2, False, True)]
+        )
+        self.assertEqual(plan.world_class.tolist(), [0, 1, 0, 2, 3])
+        self.assertEqual(plan.world_laws.tolist(), [0, 0, 0, int(RowLaw.LIMIT), int(RowLaw.CONTACT)])
+        self.assertEqual([c.worlds.tolist() for c in plan.world_classes], [[0, 2], [1], [3], [4]])
+        self.assertEqual(plan.world_classes[2].laws, RowLaw.LIMIT)
+        self.assertEqual(plan.world_classes[0].shapes, plan.world_classes[2].shapes)
+        self.assertNotEqual(plan.world_classes[0].shapes, plan.world_classes[1].shapes)
+
+    def test_a_class_ignores_its_trees_order(self):
+        """A world's key holds its trees' shapes ascending, so the catalogue's replicated worlds are one class each."""
+        for scene in (scenes.keyboard(keys=8, worlds=3), scenes.hand(worlds=2)):
+            plan = _plan(scene.build("cpu"))
+            self.assertEqual(len(plan.world_classes), 1)
+            (only,) = plan.world_classes
+            self.assertEqual(only.worlds.tolist(), list(range(plan.world_count)))
+            sizes = sorted(plan.tree_size[plan.tree_shape == shape][0] for shape in only.shapes)
+            self.assertEqual(sizes, sorted(_sizes(plan)))
+
+    def test_a_link_is_a_law_of_its_world(self):
+        plan = _plan(scenes.four_bar().build("cpu"))
+        self.assertTrue(plan.world_laws[0] & RowLaw.LINK)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
