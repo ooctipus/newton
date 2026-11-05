@@ -679,8 +679,15 @@ _RELEASE_IN_PLACE = """            WALK_RELEASE_ON(release, art, Z, rows, S, [&]
                 return ((mask >> SUPPORT_NODE[c]) & 1ull) != 0ull ? rank(c) : -1;
             });"""
 
-SUPPORT_BLOCK, SUPPORT_BLOCKS = 256, 2
-"""The support writer's block and its blocks a multiprocessor (its launch bound): 128 registers a thread."""
+SUPPORT_BLOCK, SUPPORT_BLOCKS = 128, 3
+"""The support writer's block and its blocks a multiprocessor (its launch bound): 170 registers a thread, the line at
+which its walkers need no spill. Its four-row walker and the friction triple's metric hold 164 (sm_120, ur10-reach's
+class); at 128 registers (two blocks of 256) they spilled 144 B a lane and loaded 412 B back, every unit's walk paid
+the spills' local-memory traffic, and the kinetic finish two launches later paid its L2 lines. Measured
+(``SP/core/FL/zwr8``, L5): franka-reach 4.3%, ant 1.3%, anymald 1.1% and ur10-reach 0.4% faster on the PRO."""
+
+FREE_ROWS_LINE = (256, 2)
+"""The free bodies' row writer's block and its blocks a multiprocessor (:func:`write_free_body_rows`)."""
 
 SUPPORT_REGISTERS = 65536 // (SUPPORT_BLOCK * SUPPORT_BLOCKS)
 """The support writer's register budget a thread, from its launch bound: what a unit's held side must fit
@@ -1348,18 +1355,19 @@ def support_rows_kernel(
 
     name = f"support_rows_{len(node)}_{abs(hash((parent, first, node))) % (1 << 32):08x}"
     name += ("_records" if records else "") + ("_torsion" if torsion else "")
-    # Two blocks of 256 a multiprocessor within the register file (128 registers): the four-row walker holds 166
-    # unbounded, and the bound costs it 16 B of stack (sm_120, ptxas).
+    # The writer's line, at which no walker spills (SUPPORT_BLOCK).
     return python_kernel(kernel, name, launch_bounds=(SUPPORT_BLOCK, SUPPORT_BLOCKS))
 
 
-def support_threads(units: int, device) -> int:
-    """The walkers' lanes (:func:`support_rows_kernel`, :func:`write_free_body_rows`): two waves of their two blocks of
-    256 a multiprocessor, at most ``units`` (the list's or the contacts' bound); one thread on the CPU."""
+def support_threads(units: int, device, line: tuple[int, int] = (SUPPORT_BLOCK, SUPPORT_BLOCKS)) -> int:
+    """The walkers' lanes (:func:`support_rows_kernel`; :func:`write_free_body_rows` at its own ``line``): two waves of
+    their ``line``'s blocks a multiprocessor, at most ``units`` (the list's or the contacts' bound); one thread on the
+    CPU."""
     device = wp.get_device(device)
     if not device.is_cuda:
         return 1
-    return max(min(2 * SUPPORT_BLOCKS * SUPPORT_BLOCK * int(device.sm_count), int(units)), 1)
+    block, blocks = line
+    return max(min(2 * blocks * block * int(device.sm_count), int(units)), 1)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1561,7 +1569,7 @@ walk_body_row = packed_walker(1, False, True, bodies=True, tables=((FREE_BODY_WA
 """The one unit walker into the free bodies' rows (:func:`packed_walker`): a row's sides from entry 0 and 6."""
 
 
-@wp.kernel(enable_backward=False, launch_bounds=(256, 2))
+@wp.kernel(enable_backward=False, launch_bounds=FREE_ROWS_LINE)
 def write_free_body_rows(sink: RowSink, data: ContactInput, total_threads: int, law: PatchRowLaw):
     """The free bodies' contact rows (``path`` 1, grid-stride over the contacts): the contact's front end formed once
     (:func:`.contact_input.contact_frame`), then each row's records by the contact law and the row as its own unit

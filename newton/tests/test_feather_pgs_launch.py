@@ -94,7 +94,8 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
     def test_support_walkers_are_two_waves_of_their_line(self):
         for device in (PRO, GB300):
             with self.subTest(arch=device.arch), mock.patch.object(wp, "get_device", return_value=_warp_device(device)):
-                work = Work(10**7, lanes=1, block=256, registers=128, persistent=True, waves=2)
+                # The line its four-row walker holds without a spill (164, in whole granules of 8).
+                work = Work(10**7, lanes=1, block=128, registers=168, persistent=True, waves=2)
                 got = shape(work, device)
                 self.assertEqual(got.grid * got.block, walk_rows.support_threads(10**7, None))
                 self.assertEqual(got.bounds, (walk_rows.SUPPORT_BLOCK, walk_rows.SUPPORT_BLOCKS))

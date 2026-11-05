@@ -907,10 +907,10 @@ class RowLaws:
                     )
 
             # The free bodies' contact rows, by the walk (walk_rows): a class with free bodies always walks, on the
-            # walkers' threads (its walker and launch bound are the support writer's): a contact's rows are its own,
-            # so the stride changes no row.
+            # walkers' threads at its own line (walk_rows.FREE_ROWS_LINE): a contact's rows are its own, so the stride
+            # changes no row.
             if mf_active:
-                walker_threads = walk_rows.support_threads(rows, solver.model.device)
+                walker_threads = walk_rows.support_threads(rows, solver.model.device, walk_rows.FREE_ROWS_LINE)
                 pool.launch(
                     walk_rows.write_free_body_rows,
                     walker_threads,
@@ -1165,6 +1165,7 @@ class RowLaws:
         wp.launch(
             sweep.support_rows,
             dim=sweep.support_threads,
+            block_dim=walk_rows.SUPPORT_BLOCK,
             inputs=[
                 dense_rows,
                 placement.unit_source,
