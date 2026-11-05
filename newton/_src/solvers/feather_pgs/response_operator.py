@@ -113,7 +113,8 @@ class ResponseOperator:
     (``A_ii``) and, when its builder stores or stages it, :attr:`inverse`
     (``1 / A_ii``): callables from a row index to the native expression. The
     step multiplies by the inverse when there is one and divides by the
-    diagonal otherwise, as the builders of the sweeps it replaces left them.
+    diagonal otherwise; the exit law reads the diagonal when there is one
+    (velocity units) and the inverse otherwise (impulse units).
 
     The row actions are native statements at the indentation ``indent``; an
     operator implements the ones its sweeps take. The visited row is ``i``.
@@ -138,14 +139,14 @@ class ResponseOperator:
 
     def bound(self, rhs: str, terms: str, impulse: str, row: str) -> str:
         """The exit law's bound of row ``row`` at ``impulse`` (:func:`.solve_policy.bound`), in the form its storage
-        gives without a division: impulse units from a stored inverse, velocity units from a stored diagonal."""
-        if self.inverse is not None:
-            return bound(rhs, terms, impulse, step=self.inverse(row))
-        return bound(rhs, terms, impulse, diagonal=self.diagonal(row))
+        gives without a division: velocity units from a stored diagonal, impulse units from a stored inverse."""
+        if self.diagonal is not None:
+            return bound(rhs, terms, impulse, diagonal=self.diagonal(row))
+        return bound(rhs, terms, impulse, step=self.inverse(row))
 
     def change(self, delta: str, bound: str, kind: str, row: str) -> Change:
         """Row ``row``'s change ``delta`` against its :meth:`bound`, as the exit law votes it."""
-        return Change(delta, bound, kind, self.value(row), scaled=self.inverse is None)
+        return Change(delta, bound, kind, self.value(row), scaled=self.diagonal is not None)
 
     def step(self, residual: str, row: str) -> str:
         """The Gauss-Seidel step ``-r / A_ii``."""
@@ -1291,7 +1292,7 @@ class SparseFactor(ResponseOperator):
     second tangent shares its first tangent's support: the first tangent's residual reduces the second's velocity
     term (``sibling_jv``) and the pair's coupling ``Z_t . Z_s`` (``pair_coupling``) in the same ``SUM``, and the
     apply adds the second tangent's change, then the first's, to each entry, written back once. The builder stores
-    ``A_ii = |Z_i|^2 + cfm`` as a value: the step divides.
+    ``A_ii = |Z_i|^2 + cfm`` as a value: the step divides, unless the sweep stages its reciprocal (``inverse``).
     """
 
     support: int

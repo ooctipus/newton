@@ -232,9 +232,10 @@ def _resolve(
 class SparseRows:
     """A world's rows in the sparse sweep.
 
-    Impulses, right-hand sides (``rhs_bias + row_incident``), diagonals and types are staged per world
-    (``s_impulse``, ``s_rhs``, ``s_diag``, ``s_type``); every lane reads them and the first lane stores the
-    impulses. Parents and friction coefficients stream from global memory; a patch ring walks at most ``count``
+    Impulses, right-hand sides (``rhs_bias + row_incident``), diagonals, their reciprocals and types are staged per
+    world (``s_impulse``, ``s_rhs``, ``s_diag``, ``s_inverse``, ``s_type``); every lane reads them and the first lane
+    stores the impulses. A row's diagonal is fixed for the solve: its reciprocal is formed once, at staging, and a
+    row's step multiplies by it (the exit law reads the diagonal itself). Parents and friction coefficients stream from global memory; a patch ring walks at most ``count``
     rows. Under contact ``torsion`` a friction triple's pair (a contact with a spin row, :func:`.sweep.spin_row`) is
     staged as the spin row's kind: the row loop and the active scan skip the triple's three rows, and the triple
     phase finds its normal by the staged kinds and solves them (:func:`triple_phase`).
@@ -255,6 +256,9 @@ class SparseRows:
 
     def diag(self, row: str) -> str:
         return f"s_diag[{row}]"
+
+    def inverse(self, row: str) -> str:
+        return f"s_inverse[{row}]"
 
     def kind(self, row: str, *, scan: bool = False) -> str:
         return f"s_type[{row}]"
@@ -282,6 +286,7 @@ class SparseRows:
             Buffer("s_impulse", "float", rows),
             Buffer("s_rhs", "float", rows),
             Buffer("s_diag", "float", rows),
+            Buffer("s_inverse", "float", rows),
             Buffer("s_type", "unsigned char", rows),
         )
 
@@ -303,7 +308,9 @@ class SparseRows:
             f"{pad}for (int i = {lane}; i < count; i += {width}) {{\n"
             f"{pad}    s_impulse[i] = world_impulses.data[offset + i];\n"
             f"{pad}    s_rhs[i] = rhs_bias.data[offset + i] + row_incident.data[offset + i];\n"
-            f"{pad}    s_diag[i] = world_diag.data[offset + i];\n"
+            f"{pad}    const float diagonal = world_diag.data[offset + i];\n"
+            f"{pad}    s_diag[i] = diagonal;\n"
+            f"{pad}    s_inverse[i] = 1.0f / diagonal;\n"
             f"{triple}{pad}    s_type[i] = {kind};\n"
             f"{pad}}}"
         )
@@ -469,7 +476,7 @@ def ordinary_rows(rows: SparseRows, op: SparseFactor, laws: RowLaws, *, skip_vel
     first lane stores the impulses after every lane has read them.
     """
     lanes = rows.lanes
-    op = dataclasses.replace(op, diagonal=lambda row: "denom" if row == "i" else rows.diag(row))
+    op = dataclasses.replace(op, diagonal=lambda row: "denom" if row == "i" else rows.diag(row), inverse=rows.inverse)
     # The row's and its pair's impulses are read once, at admission, before the reduction.
     held = {"i": "row_impulse", "sib": "pair_impulse"}
     ctx = RowContext(
