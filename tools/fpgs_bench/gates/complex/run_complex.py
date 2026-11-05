@@ -25,8 +25,8 @@ Example (CPU smoke, no CUDA context):
 """
 
 import argparse
+import functools
 import hashlib
-import inspect
 import json
 import os
 import platform
@@ -442,31 +442,15 @@ def snapshot(scene, metric_worlds, sim_time, model_np, metrics, kernels, metric_
 
 
 def size_contacts(scene):
-    """Size a growable rigid contact pool before the capture; return its service, or None.
+    """Size the growable rigid contact pool before the capture; return its service.
 
-    Newton's growable pools start below their bound and grow only in
-    ``CollisionPipeline.service_capacity``, outside graph capture. Without this, a replayed graph
-    keeps the initial rows however many contacts the scene makes, and drops the rest. A pipeline
-    that measures a state (``service_capacity(state)``) sizes the pool from the initial state's
-    demand, as Isaac Lab does. The first pools (``ccedc861``) cannot measure without a collision
-    pass that overflows and flags the run, so they hold the bound from the start, as the buffers
-    did before them.
+    Newton's pool grows only in ``CollisionPipeline.service_capacity``, outside graph capture: it
+    measures the state the graph starts from and forecasts the demand of the replays its service
+    lags behind, as Isaac Lab does. The service states the collision passes' time step (one a
+    substep), which the forecast's horizon follows.
     """
-    service = getattr(scene.pipeline, "service_capacity", None)
-    if service is None:
-        return None
-    if "state" in inspect.signature(service).parameters:
-        service(scene.states()[0])
-        return service
-    # Those pools join a solver's buffers to the pipeline's at its first step, inside the capture,
-    # where they cannot grow: join them now, so the reservation reaches the solver too.
-    follow = getattr(scene.solver, "_follow_contacts", None)
-    if hasattr(scene.solver, "placement"):
-        follow = scene.solver.placement.follow_contacts
-    if follow is not None:
-        follow(scene.contacts)
-    scene.contacts.reserve_rigid_contacts(int(scene.contacts.rigid_contact_bound))
-    service()  # reports the reservation's growth, which no graph captured yet
+    service = functools.partial(scene.pipeline.service_capacity, dt=1.0 / (scene.fps * scene.substeps))
+    service(scene.states()[0])
     return service
 
 
@@ -531,7 +515,7 @@ def run_frames(
             frame_ms[frame] = (time.perf_counter() - start) * 1e3
         done = frame + 1
         rec.after_frame(k, done * frame_dt, sample=done % args.sample_every == 0 or done == frames)
-        if service is not None and service():
+        if service():
             # The pool grew, synchronizing the device; later frames replay a graph captured at the new rows.
             recapture_s = frame_graph.capture() if timed_by_events else None
             growths.append({"frame": frame, "rows": contact_rows(scene), "recapture_s": recapture_s})
@@ -841,7 +825,6 @@ def main(argv=None):
         "built": rows_built,
         "captured": rows_captured,
         "end": contact_rows(scene),
-        "serviced": service is not None,
         "growths": loop["contact_growths"],
     }
     overflow = (
