@@ -313,7 +313,8 @@ def _row_builder(solver, plan, size) -> dict:
         elif solver.spec.case == "K2":
             writers = (walk_rows.write_slot_rows,)
         else:
-            writers = (walk_rows.writer_kernel(solver),)
+            # The general placement's rows in two parts: the topology's, walked in blocks, and the rest.
+            writers = (walk_rows.writer_kernel(solver, walk_rows.WRITE_TOPOLOGY), walk_rows.writer_kernel(solver))
         kernels = (*writers, *marker)
     elif method == "keyed_rows":
         from . import keyed_rows, walk_rows  # noqa: PLC0415 - the owner's module; loaded with the owner

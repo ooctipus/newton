@@ -559,6 +559,60 @@ $record_seed
             sink(r, c, z, x[r]);
         }
     };
+    // WALK_SWEEP(data, link, at, body, seed, sink): the walk with entry points, up to $rows covector walks of one tree
+    // in one sweep of the union of their root paths, leaf to root: walk r enters at coordinate at[r] of body[r] (-1:
+    // none) with seed[r] (WALK_SEED's step), then passes up its root path as WALK_UP does without the step's geometry.
+    // The deepest body still to visit goes first: its link and each of its coordinates' records are loaded once for
+    // every walk that passes them, and the walks' steps are independent, so their chains run side by side. A walk's
+    // operations are WALK_SEED's and WALK_UP's, in its own order: the same footprints. sink(r, c, z); body is spent.
+    const auto WALK_SWEEP = [&](const float* data, const float* link, const int* at, int* body, const float* seed,
+                                auto&& sink) {
+        float p[6 * $rows];
+        int top[$rows];
+WALK_UNROLLED
+        for (int r = 0; r < $rows; ++r) {
+            top[r] = at[r];
+            for (int k = 0; k < 6; ++k) p[6 * r + k] = 0.0f;
+        }
+#pragma unroll 1
+        for (;;) {
+            int b = -1, c = -1;
+WALK_UNROLLED
+            for (int r = 0; r < $rows; ++r) b = body[r] > b ? body[r] : b;
+            if (b < 0) break;
+WALK_UNROLLED
+            for (int r = 0; r < $rows; ++r) c = body[r] == b && top[r] > c ? top[r] : c;
+            $link_b
+#pragma unroll 1
+            for (; c >= WALK_FIRST_OF(b); --c) {
+$record_c
+WALK_UNROLLED
+                for (int r = 0; r < $rows; ++r) {
+                    if (body[r] != b || c > top[r]) continue;
+                    float* q = p + 6 * r;
+                    if (c == at[r]) {
+                        $sweep_seed
+                        sink(r, c, z);
+                    } else {
+                        float x = $dot_q;
+                        $sweep_step
+                        sink(r, c, z);
+                    }
+                }
+            }
+            const int up = WALK_PARENT_OF(b);
+WALK_UNROLLED
+            for (int r = 0; r < $rows; ++r) {
+                if (body[r] != b) continue;
+                if (up >= 0) {
+                    float* q = p + 6 * r;
+                    $sweep_edge
+                }
+                body[r] = up;
+                top[r] = up >= 0 ? WALK_FIRST_OF(up + 1) - 1 : -1;
+            }
+        }
+    };
     // WALK_PARENT_TWIST(link, twist, b, V): body b's parent's twist (v, w) at b's frame, v + d x w (zero at a root).
     const auto WALK_PARENT_TWIST = [&](const float* link, const float* twist, int b, float* V) {
         const int up = WALK_PARENT_OF(b);
@@ -700,6 +754,9 @@ _WALK_TEXTS = {
     "dot_j": ts.dot(("e0", "e1", "e2", "S[3]", "S[4]", "S[5]"), ts.channels("v")),
     "step_q": ts.statements(ts.step(ts.Direction.UP, ts.LOADED, "q", value="x"), 20),
     "seed_q": ts.statements(ts.step(ts.Direction.UP, ts.LOADED, "q", source="x[r]"), 12),
+    "sweep_seed": ts.statements(ts.step(ts.Direction.UP, ts.LOADED, "q", source="seed[r]"), 24),
+    "sweep_step": ts.statements(ts.step(ts.Direction.UP, ts.LOADED, "q", value="x"), 24),
+    "sweep_edge": ts.statements(ts.edge(ts.Direction.UP, ts.LOADED.lever, "q"), 20),
     "edge_q": ts.statements(ts.edge(ts.Direction.UP, ts.LOADED.lever, "q"), 20),
     "edge_v": ts.statements(ts.edge(ts.Direction.UP, ts.LOADED.lever, "v"), 24),
     "edge_twist": ts.statements(ts.edge(ts.Direction.DOWN, ts.LOADED.lever, "W", into="V"), 8),
@@ -810,6 +867,8 @@ _WALK_DEVICE = {
 #define WALK_ABS(x) fabsf(x)
 #define WALK_MUL(a, b) __fmul_rn((a), (b))
 #define WALK_CONSTANT __constant__
+// WALK_UNROLLED: a loop over a walk's rows unrolled, so their states stay registers (none on the CPU).
+#define WALK_UNROLLED _Pragma("unroll")
 // WALK_TOUCH(p): ask L1 for the line of p, a hint ahead of the load that reads it (no register, no scoreboard).
 #define WALK_TOUCH(p) asm volatile("prefetch.global.L1 [%0];" ::"l"(p))""",
     False: """// The CPU's quad is Warp's (four named floats); its loads are plain. Its WALK_MUL is a function boundary, as CUDA's
@@ -825,6 +884,7 @@ _WALK_DEVICE = {
 #define WALK_ABS(x) __builtin_fabsf(x)
 #define WALK_MUL(a, b) ([](const float walk_a_, const float walk_b_) -> float { return walk_a_ * walk_b_; }((a), (b)))
 #define WALK_CONSTANT const
+#define WALK_UNROLLED
 #define WALK_TOUCH(p) ((void)(p))""",
 }
 """The device's words of :data:`_WALK_LOADS`: its quad, its load kinds, the record's pivot, the bit and absolute

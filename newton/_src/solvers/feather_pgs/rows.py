@@ -1103,10 +1103,12 @@ class RowLaws:
         )
         dummy_int = placement.dummy_is_free_rigid
         blocks = factor.block_capacity if factor.eliminates else 0
-        # The topology part's lanes from the rows a world's topology holds at once (its warps walk covectors alone);
-        # the rest's, whose contact rows make its warps uneven, from every row the topology can fix.
-        at_once = part == walk_rows.WRITE_TOPOLOGY
-        rows = placement.dense_internal_rows_at_once if at_once else placement.dense_internal_max_rows
+        # The topology part's lanes from the rows a world's topology holds at once, a block of them a lane; the
+        # rest's, whose contact rows make its warps uneven, from every row the topology can fix, a row a lane.
+        if part == walk_rows.WRITE_TOPOLOGY:
+            rows = -(-placement.dense_internal_rows_at_once // walk_rows.WRITER_BLOCK_ROWS)
+        else:
+            rows = placement.dense_internal_max_rows
         lanes = walk_rows.writer_lanes(rows, placement.dense_max_constraints, model.device)
         inputs = [
             bind_dense_rows(placement),
@@ -1128,7 +1130,7 @@ class RowLaws:
             int(part),
         ]
         wp.launch(
-            walk_rows.writer_kernel(solver),
+            walk_rows.writer_kernel(solver, part),
             dim=(solver.forest.world_count, lanes),
             inputs=inputs,
             block_dim=walk_rows.WRITER_THREADS,

@@ -190,6 +190,11 @@ WRITE_ROWS, WRITE_TOPOLOGY, WRITE_REST = wp.constant(0), wp.constant(1), wp.cons
 """The one writer's parts (:func:`walked_rows_kernel`'s ``part``): every row, the rows a world's topology fixes, and the
 rest with the closure."""
 
+WRITER_BLOCK_ROWS = 1
+"""The rows a lane of the topology part walks as one block (:func:`block_walker`): one, its seeds in one sweep. A lane
+already walks beside its warp's others for free; more rows a lane serialize them into its instruction stream, and the
+writer turns issue-bound (ZK7, franka at 16,384 worlds: the part 39 us at one row a lane, 55 at two, 58 at four)."""
+
 WRITER_THREADS = 128
 """Threads of a block of the one writer: whole world groups of up to 32 lanes."""
 
@@ -201,13 +206,14 @@ it, five (96 registers: 97 unbounded, and six spilled 88 B a thread, sm_120)."""
 
 
 @cache
-def unit_reader(links: bool, unit_rows: int = 1) -> wp.Function:
+def unit_reader(links: bool, unit_rows: int = 1, contacts: bool = True) -> wp.Function:
     """Every placement's unit reader (:func:`row_unit`). A contact's unit is its rows from its first, at most
     ``unit_rows``, from the contact's frame: the support placement's, whose unit list holds a contact's rows as one unit
     and whose first launch wrote their records (:func:`support_units_kernel`). With ``unit_rows`` 1 it is the row
     alone, its records written here by the contact law: the world-major writers', a lane a row (the producer's, folded
     into the writer). ``links``: with the link rows' seeds, where the writer closes bilateral blocks (the general
-    placement's block variants; the sparse diagonal and the support placement admit none)."""
+    placement's block variants; the sparse diagonal and the support placement admit none); ``contacts``: with the
+    contact rows' (not the topology part's, :data:`WRITE_TOPOLOGY`)."""
 
     def row_unit(
         rows: DenseRows, data: ContactInput, law: PatchRowLaw, seeds: JointSeeds, line: int, slot: int, source: int
@@ -228,7 +234,7 @@ def unit_reader(links: bool, unit_rows: int = 1) -> wp.Function:
         unit.body_b = -1
         unit.dof0 = -1
         unit.dof1 = -1
-        if kind == UNIT_CONTACT:
+        if wp.static(contacts) and kind == UNIT_CONTACT:
             c = index // 4
             frame = contact_frame(data, law, c)
             if wp.static(unit_rows > 1):
@@ -276,12 +282,13 @@ def unit_reader(links: bool, unit_rows: int = 1) -> wp.Function:
         return unit
 
     name = "row_unit" + ("_links" if links else "") + (f"_{unit_rows}" if unit_rows > 1 else "")
+    name += "" if contacts else "_topology"
     row_unit.__name__ = row_unit.__qualname__ = name
     return wp.func(row_unit)
 
 
 @cache
-def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tuple) -> wp.Kernel:
+def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tuple, block: int = 0) -> wp.Kernel:
     """The one writer of the general placement, world-major: a world's group of ``lanes`` lanes (:func:`writer_lanes`)
     writes its rows in the block primitive's phases (FL3_design §1.4, W9), the group synchronized between them:
 
@@ -308,14 +315,21 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tupl
 
     ``side``: whether the model's records can have a side (:attr:`.tree_factor.TreeFactor.walk_side`); ``tables``: the
     walking classes' path tables (:func:`.factor.walk.walk_prelude`), each tree's path read from constant memory by its
-    class."""
+    class.
+
+    ``block`` (the topology part's kernel, :data:`WRITE_TOPOLOGY`; 0 for the others): a lane takes ``block``
+    consecutive rows and walks its covector rows (limits, velocity limits, mimics) as one block, each tree's in one
+    sweep (:func:`block_walker`), a link row by the unit walker."""
     has_blocks = blocks > 0
     capacity = max(blocks, 1)
     mimics = int(mimic_blocks)
     # A link row is a block row (block_row; links plan blocks, TreeFactor.plan_blocks): the writer reads link rows
     # where it closes blocks. Elsewhere their seeds would hold a second point across every walk.
-    read_unit = unit_reader(has_blocks)
+    read_unit = unit_reader(has_blocks, contacts=not block)
     walk = packed_walker(1, False, side, tables=tables)
+    if block:
+        walk_block = block_walker(block, side, tables)
+        ints, floats = wp.types.vector(block, int), wp.types.vector(block, float)
 
     def kernel(
         rows: DenseRows,
@@ -350,6 +364,27 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tupl
             end = wp.min(bounds[world, 1], sink.entries.shape[1])
         elif part == WRITE_REST:
             first = wp.min(bounds[world, 1], count)
+        if wp.static(block > 0):
+            for start in range(first + lane * wp.static(block), end, lanes * wp.static(block)):
+                arts, dof0, dof1 = ints(), ints(), ints()
+                value0, value1 = floats(), floats()
+                for r in range(wp.static(block)):
+                    dof0[r] = -1
+                    if start + r < end:
+                        unit = read_unit(rows, data, law, seeds, line, start + r, support.units[line, start + r])
+                        if unit.dof0 >= 0:
+                            arts[r] = unit.art_a
+                            dof0[r] = unit.dof0
+                            value0[r] = unit.value0
+                            dof1[r] = unit.dof1
+                            value1[r] = unit.value1
+                        elif wp.static(has_blocks):
+                            walk(sink, unit)
+                rows_here = wp.min(end - start, wp.static(block))
+                walk_block(sink, line, start, rows_here, arts, dof0, value0, dof1, value1)
+                for slot in range(start, start + rows_here):
+                    row_bias(rows, bias, line, slot, sink.row_incident[line, slot])
+            return
         for slot in range(first + lane, end, lanes):
             unit = read_unit(rows, data, law, seeds, line, slot, support.units[line, slot])
             if unit.rows > 0:
@@ -374,19 +409,22 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tupl
 
     name = "write_walked_rows" + (f"_blocks{blocks}" if has_blocks else "")
     name += "_mimics" if mimic_blocks else ""
+    name += f"_topology{block}" if block else ""
     return python_kernel(kernel, name, launch_bounds=(WRITER_THREADS, WRITER_BLOCKS[int(has_blocks)]))
 
 
-def writer_kernel(solver) -> wp.Kernel:
+def writer_kernel(solver, part: int = WRITE_ROWS) -> wp.Kernel:
     """The one writer's variant for the solver's class (:func:`walked_rows_kernel`), from its topology: the block phase
     where bilateral blocks exist (mimics among them under ``enable_bilateral_preelimination``), the records' side
     where a walked joint can have two halves (:attr:`.tree_factor.TreeFactor.walk_side`), and the walking classes'
-    paths (:attr:`.tree_factor.TreeFactor.walk_classes`)."""
+    paths (:attr:`.tree_factor.TreeFactor.walk_classes`); the topology ``part``'s, its rows walked in blocks of
+    :data:`WRITER_BLOCK_ROWS`."""
     factor = solver.factor
     blocks = factor.block_capacity if factor.eliminates else 0
     mimics = bool(blocks and solver.options.enable_bilateral_preelimination)
     tables = tuple((walk.parent, walk.first) for walk in factor.walk_classes)
-    return walked_rows_kernel(blocks, mimics, factor.walk_side, tables)
+    block = WRITER_BLOCK_ROWS if part == WRITE_TOPOLOGY else 0
+    return walked_rows_kernel(blocks, mimics, factor.walk_side, tables, block)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -911,6 +949,146 @@ def packed_walker(
     return unit_walker(f"packed_walk_{rows}{tag}", snippet)
 
 
+_BLOCK = """    // A block of up to $rows covector rows of the packed sink from row slot (walk_rows.block_walker): each row's entries
+    // cleared, then each tree's rows walked together (WALK_SWEEP), a walk a seed (a mimic's second its own, adding
+    // where the two meet), then each row's slips released, its diagonal |z|^2 + cfm and its incident J v_hat. A row's
+    // arithmetic is the unit walker's (_SUPPORT) on the row alone.
+#if defined(__CUDA_ARCH__)
+    const auto ST = [](auto* p, const auto v) {
+        __builtin_assume(__isGlobal(p));
+        *p = v;
+    };
+    const auto RW = [](const float* p) -> float {
+        __builtin_assume(__isGlobal(p));
+        return *p;
+    };
+#else
+    const auto ST = [](auto* p, const auto v) { *p = v; };
+    const auto RW = [](const float* p) -> float { return *p; };
+#endif
+    const auto& walk = sink.walk;
+    const auto& release = sink.release;
+    const int S = sink.entries.shape[2];
+    float* const Z = sink.entries.data + ((size_t)line * sink.entries.shape[1] + slot) * S;
+    const int rec0 = line * sink.diag.shape[1] + slot;
+    float norm[$rows], incident[$rows];
+    int pending = 0, reread = 0;
+WALK_UNROLLED
+    for (int r = 0; r < $rows; ++r) {
+        norm[r] = incident[r] = 0.0f;
+        if (r >= count || dof0[r] < 0) continue;
+        pending |= 1 << r;
+        for (int e = 0; e < S; ++e) ST(Z + r * S + e, 0.0f);
+    }
+    // The block's trees in turn: the first row still pending names the next.
+#pragma unroll 1
+    while (pending != 0) {
+        int art = -1, mine = 0;
+WALK_UNROLLED
+        for (int r = 0; r < $rows; ++r)
+            if (art < 0 && ((pending >> r) & 1) != 0) art = arts[r];
+WALK_UNROLLED
+        for (int r = 0; r < $rows; ++r)
+            if (((pending >> r) & 1) != 0 && arts[r] == art) mine |= 1 << r;
+        pending &= ~mine;
+        if (*(sink.response_dofs.data + art) <= 0) continue;
+        const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
+$tree
+        // A covector row's one side: its tree's first world coordinate (dense) or entry 0.
+        const int base = sink.layout.dense != 0 ? sink.layout.offset.data[art] : 0;
+        const float* data = walk.data.data + (size_t)d0 * $coordinate;
+        const float* link = walk.link.data + (size_t)j0 * $link;
+        const float* vh = sink.v_hat.data + d0;
+        // Walk 2 r a row's first seed, 2 r + 1 its second (a mimic's); a row of two adds where they meet.
+        int at[2 * $rows], body[2 * $rows], adds = 0;
+        float seed[2 * $rows];
+WALK_UNROLLED
+        for (int r = 0; r < $rows; ++r) {
+            const bool on = ((mine >> r) & 1) != 0;
+            at[2 * r] = on ? dof0[r] - d0 : -1;
+            at[2 * r + 1] = on && dof1[r] >= 0 ? dof1[r] - d0 : -1;
+            seed[2 * r] = value0[r];
+            seed[2 * r + 1] = value1[r];
+            if (at[2 * r + 1] >= 0) adds |= 1 << r;
+            body[2 * r] = at[2 * r] >= 0 ? walk.dof_body.data[d0 + at[2 * r]] : -1;
+            body[2 * r + 1] = at[2 * r + 1] >= 0 ? walk.dof_body.data[d0 + at[2 * r + 1]] : -1;
+        }
+        reread |= adds;
+        WALK_SWEEP(data, link, at, body, seed, [&](const int w, const int c, const float z) {
+            const int r = w >> 1;
+            float* const entry = Z + r * S + base + c;
+            if (((adds >> r) & 1) != 0) {
+                ST(entry, RW(entry) + z);
+            } else {
+                ST(entry, z);
+                norm[r] += z * z;
+            }
+        });
+WALK_UNROLLED
+        for (int k = 0; k < 2 * $rows; ++k)
+            if (at[k] >= 0) incident[k >> 1] += seed[k] * vh[at[k]];
+        // A slipping tree's release (the predictor's border) on each of its rows (WALK_RELEASE_ON).
+        if (release.count.data[art] > 0) {
+            reread |= mine;
+WALK_UNROLLED
+            for (int r = 0; r < $rows; ++r)
+                if (((mine >> r) & 1) != 0)
+                    WALK_RELEASE_ON(release, art, Z + r * S, 1, S, [&](const int c) -> int { return base + c; });
+        }
+    }
+WALK_UNROLLED
+    for (int r = 0; r < $rows; ++r) {
+        if (r >= count || dof0[r] < 0) continue;
+        if (((reread >> r) & 1) != 0) {
+            norm[r] = 0.0f;
+            for (int e = 0; e < S; ++e) {
+                const float zc = RW(Z + r * S + e);
+                norm[r] += zc * zc;
+            }
+        }
+        ST(sink.diag.data + rec0 + r, norm[r] + sink.cfm);
+        ST(sink.row_incident.data + rec0 + r, incident[r]);
+    }"""
+
+
+@cache
+def block_walker(rows: int, side: bool, tables: tuple) -> wp.Function:
+    """The general placement's walker of a block of up to ``rows`` covector rows (:data:`_BLOCK`): a world's rows at
+    consecutive slots from ``slot`` (``count`` of them; a row of ``dof0`` -1 is not the block's), each row's seeds its
+    ``value0 e_dof0`` and, a mimic's, ``value1 e_dof1`` on articulation ``arts``. Each tree's rows walk one sweep of its
+    bodies (``WALK_SWEEP``, the walk with entry points: each seed enters at its coordinate), so a world's rows run as
+    independent chains of one sweep, not one chain a lane; each row's footprints, diagonal and incident are the unit
+    walker's (:func:`packed_walker`). ``side`` and ``tables`` as :func:`packed_walker`'s."""
+    walk = walk_prelude(tables, 2 * rows, record_half(side))
+    body = substitute(
+        _BLOCK,
+        rows=rows,
+        coordinate=WALK_COORDINATE,
+        link=WALK_LINK,
+        tree="        WALK_TREE(walk.cls.data[art]);" if len(tables) > 1 else "",
+    )
+    ints, floats = wp.types.vector(rows, int), wp.types.vector(rows, float)
+
+    def native(sink, line, slot, count, arts, dof0, value0, dof1, value1): ...
+
+    # The block's vectors are sized at build: the signature's types are set here, not evaluated from its text.
+    native.__annotations__ = {
+        "sink": RowSink,
+        "line": int,
+        "slot": int,
+        "count": int,
+        "arts": ints,
+        "dof0": ints,
+        "value0": floats,
+        "dof1": ints,
+        "value1": floats,
+    }
+    name = f"block_walk_{rows}" + walk.name.removeprefix(f"walk_{2 * rows}")
+    native.__name__ = native.__qualname__ = name
+    return wp.func_native(dual_native(body, preludes=(walk,)))(native)
+
+
+SUPPORT_UNIT_LANES = 16
 SUPPORT_UNIT_LANES = 16
 """A world's lane group in the support writer's first launch (:func:`support_units_kernel`): its rows' records and
 units, a lane a row; the walkers' lanes (:func:`support_threads`) do not depend on it."""
