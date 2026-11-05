@@ -365,8 +365,10 @@ class Placement:
     # Construction
     # ---------------------------------------------------------------------------------------------------------------
 
-    def internal_rows_per_world(self, model) -> int:
-        """The most mimic, link and limit rows any world can hold, from the topology."""
+    def internal_rows_per_world(self, model, at_once: bool = False) -> int:
+        """The most mimic, link and limit rows any world can hold, from the topology; ``at_once``: the most it can hold
+        in one step, where a coordinate's two position limits are one row unless both sides lie within the activation
+        gap at once (``upper - lower <= 2 gap``, :func:`.row_laws.joint_limit_side`)."""
         if not model.articulation_count or not model.joint_count or self.forest.art_to_world is None:
             return 0
 
@@ -431,8 +433,13 @@ class Placement:
             fuse_position_limits = np.isin(
                 self.forest.response_dof_count[art], list(self.fused_diagonal_joint_limit_sizes)
             )
-            rows += ~fuse_position_limits & np.isfinite(joint_limit_lower[dof])
-            rows += ~fuse_position_limits & np.isfinite(joint_limit_upper[dof])
+            lower, upper = joint_limit_lower[dof], joint_limit_upper[dof]
+            rows += ~fuse_position_limits & np.isfinite(lower)
+            rows += ~fuse_position_limits & np.isfinite(upper)
+            if at_once:
+                both = ~fuse_position_limits & np.isfinite(lower) & np.isfinite(upper)
+                gap = 2.0 * self.options.joint_limit_activation_gap
+                rows -= both & (np.where(both, upper - lower, 0.0) > gap)
         if has_velocity_limit_rows:
             rows += 2 * (joint_velocity_limit[dof] > 0.0)
         world = art_to_world[art]

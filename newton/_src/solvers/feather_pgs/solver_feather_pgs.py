@@ -530,6 +530,7 @@ class SolverFeatherPGS(SolverBase):
 
         self.sweep.admit_diagonal(diagonal_decline)
         self.placement.dense_internal_max_rows = self.placement.internal_rows_per_world(model)
+        self.placement.dense_internal_rows_at_once = self.placement.internal_rows_per_world(model, at_once=True)
         self._contact_material_placeholder = self._arrays.placeholder(wp.float32, (1,))
         self._bind_contact_material(None)
         self._allocate_common_buffers(model)
