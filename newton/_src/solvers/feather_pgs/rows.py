@@ -42,7 +42,7 @@ from .contact_row_plan import contact_row_plan
 from .device_preludes import lane_group
 from .factor.fields import Preelim
 from .field_group import Field, FieldGroup, SolverArrays
-from .forest_plan import ForestPlan
+from .forest_plan import ForestPlan, RowLaw
 from .friction_patches import _FrictionPatchState as FrictionPatchState
 from .friction_patches import patch_row_law
 from .joint_table import bind as bind_joint_table
@@ -366,8 +366,14 @@ class RowLaws:
         self.torsion_rows = int(self.contact_torsion_enabled)
         # Spin rows appear on a contact whose region has a footprint (patch friction is one wrench a region,
         # core-docs/WRENCH/VERDICT.md) or under contact torsion on every friction contact: the sweeps then read each
-        # contact's rows from the data (a pair, or a pair and a spin row).
-        self.spin_rows = self.contact_torsion_enabled or bool(options.enable_contact_friction)
+        # contact's rows from the data (a pair, or a pair and a spin row). The model bounds both (RowLaw.SPIN: a body
+        # pair that can touch at two points; RowLaw.CONTACT: one that can touch at all); where no world holds one, no
+        # contact carries a spin row and every sweep, writer and lister runs its plain variant.
+        present = RowLaw(int(np.bitwise_or.reduce(self.forest.world_laws, initial=0)))
+        footprint = RowLaw.CONTACT if self.contact_torsion_enabled else RowLaw.SPIN
+        self.spin_rows = bool(options.enable_contact_friction) and bool(present & footprint)
+        # The producers read the same fact (ContactInput.spin): a contact the model cannot make carries no spin row.
+        self.spin_rows_where = (2 if self.contact_torsion_enabled else 1) if self.spin_rows else 0
         if self.contact_torsion_enabled:
             if not options.enable_contact_friction:
                 raise ValueError(

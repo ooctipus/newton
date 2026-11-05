@@ -67,8 +67,11 @@ CONTACT_INPUT = (
     Field("stiffness", wp.float32, ("contact",), attr="contact_stiffness"),
     Field("damping", wp.float32, ("contact",), attr="contact_damping"),
     Field("friction_weight", wp.float32, ("contact",), attr="contact_friction_weight"),
-    # Contact torsion: 1 gives every friction contact its spin row (a fourth row), 0 none.
+    # Contact torsion: 1 gives every friction contact the authored torsional coefficient, 0 none.
     Field("torsion", wp.int32, owner="laws", attr="torsion_rows"),
+    # Which friction contacts carry a spin row (a fourth row), the plan's one fact (RowLaws.spin_rows): 0 none, 1 those
+    # whose region has a footprint, 2 every one (contact torsion).
+    Field("spin", wp.int32, owner="laws", attr="spin_rows_where"),
     # The dense row records the producers write.
     *row_records.RECORDS,
 )

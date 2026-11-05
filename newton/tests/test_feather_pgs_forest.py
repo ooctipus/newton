@@ -270,8 +270,9 @@ class TestWorldClasses(unittest.TestCase):
     @staticmethod
     def _worlds(arms):
         """One world an arm of ``links`` revolute links; ``limited`` gives its first joint a position limit; ``touch``
-        a colliding box on its tip."""
+        a colliding box on its tip, above the ground."""
         builder = newton.ModelBuilder()
+        builder.add_ground_plane()
         for links, limited, touch in arms:
             builder.begin_world()
             parent, joints = -1, []
@@ -303,7 +304,7 @@ class TestWorldClasses(unittest.TestCase):
             [(2, False, False), (3, False, False), (2, False, False), (2, True, False), (2, False, True)]
         )
         self.assertEqual(plan.world_class.tolist(), [0, 1, 0, 2, 3])
-        self.assertEqual(plan.world_laws.tolist(), [0, 0, 0, int(RowLaw.LIMIT), int(RowLaw.CONTACT)])
+        self.assertEqual(plan.world_laws.tolist(), [0, 0, 0, int(RowLaw.LIMIT), int(RowLaw.CONTACT | RowLaw.SPIN)])
         self.assertEqual([c.worlds.tolist() for c in plan.world_classes], [[0, 2], [1], [3], [4]])
         self.assertEqual(plan.world_classes[2].laws, RowLaw.LIMIT)
         self.assertEqual(plan.world_classes[0].shapes, plan.world_classes[2].shapes)
@@ -318,6 +319,31 @@ class TestWorldClasses(unittest.TestCase):
             self.assertEqual(only.worlds.tolist(), list(range(plan.world_count)))
             sizes = sorted(plan.tree_size[plan.tree_shape == shape][0] for shape in only.shapes)
             self.assertEqual(sizes, sorted(_sizes(plan)))
+
+    def test_contacts_are_the_admitted_pairs(self):
+        """A world touches through the shape pairs the collision filter admits, and holds a footprint where a body
+        pair can touch at two points: two shape pairs, or one pair of shapes not limited to a single point."""
+
+        def laws(*shapes, ground=True):
+            builder = newton.ModelBuilder()
+            if ground:
+                builder.add_ground_plane()
+            body = _link(builder)
+            builder.add_articulation([builder.add_joint_revolute(-1, body, axis=_AXIS)])
+            for add in shapes:
+                add(builder, body)
+            return RowLaw(int(_plan(builder.finalize(device="cpu")).world_laws[0])) & (RowLaw.CONTACT | RowLaw.SPIN)
+
+        def sphere(x):
+            return lambda b, body: b.add_shape_sphere(body, radius=0.1, xform=wp.transform((x, 0.0, 0.0)))
+
+        def box(b, body):
+            b.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+
+        self.assertEqual(laws(box, ground=False), RowLaw(0))
+        self.assertEqual(laws(sphere(0.0)), RowLaw.CONTACT)
+        self.assertEqual(laws(sphere(0.0), sphere(0.3)), RowLaw.CONTACT | RowLaw.SPIN)
+        self.assertEqual(laws(box), RowLaw.CONTACT | RowLaw.SPIN)
 
     def test_a_link_is_a_law_of_its_world(self):
         plan = _plan(scenes.four_bar().build("cpu"))

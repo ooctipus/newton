@@ -144,13 +144,15 @@ def patch_tangent_row(law: PatchRowLaw, c: int, row: int):
 
 
 @wp.func
-def patch_spin_rows(patches: FrictionPatches, c: int, torsion: int):
-    """Return the spin rows (0 or 1) of contact ``c``'s friction: one where its region has a footprint (a positive spin
-    arm) or contact ``torsion`` gives every friction contact one, none on a one-contact region otherwise."""
-    spin = torsion
-    if patches.spin_arm[c] > 0.0:
-        spin = 1
-    return spin
+def patch_spin_rows(patches: FrictionPatches, c: int, spin: int):
+    """Return the spin rows (0 or 1) of contact ``c``'s friction where the plan lets ``spin`` contacts carry one (0
+    none, 1 those whose region has a footprint, 2 every one: :attr:`.rows.RowLaws.spin_rows_where`): one where its
+    region has a footprint (a positive spin arm) or contact torsion gives every friction contact one, none on a
+    one-contact region otherwise, and none where the model admits no footprint (contacts it cannot make carry none)."""
+    rows = int(0)
+    if spin == 2 or (spin == 1 and patches.spin_arm[c] > 0.0):
+        rows = 1
+    return rows
 
 
 @wp.func

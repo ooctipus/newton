@@ -107,8 +107,8 @@ def allocate_world_contact_slots(
 
     A contact admitted by :func:`_admit_contact` reserves 1 slot for the normal row and, when enabled below the
     friction gap threshold (and, under persistent patches, for a loaded anchor), 2 adjacent slots for the friction
-    rows, and a third for its spin row where its region has a footprint or contact torsion (``data.torsion``) gives
-    every friction contact one (:func:`.friction_patches.patch_spin_rows`). Contacts where both sides are free rigid bodies (or ground) take matrix-free rows, the others world-level
+    rows, and a third for its spin row where the plan lets it carry one (``data.spin``: its region has a footprint, or
+    contact torsion gives every friction contact one) (:func:`.friction_patches.patch_spin_rows`). Contacts where both sides are free rigid bodies (or ground) take matrix-free rows, the others world-level
     dense rows. A contact's slot is its first row in its world's line, the free bodies' rows from the dense capacity
     ``max_constraints``; the counters count each class's own rows. A positive contact gap gate excludes wider speculative contacts before any route reserves slots;
     zero disables the gate.
@@ -186,7 +186,7 @@ def allocate_world_contact_slots(
             enable_friction != 0 and phi <= contact_friction_gap_threshold and friction_patches.weight[c] > 0.0
         )
         if add_friction:
-            slots_needed = 3 + patch_spin_rows(friction_patches, c, data.torsion)
+            slots_needed = 3 + patch_spin_rows(friction_patches, c, data.spin)
         data.slots_needed[c] = slots_needed
 
         # The matrix-free or the dense family's counter.

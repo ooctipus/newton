@@ -32,6 +32,7 @@ import numpy as np
 import warp as wp
 
 from ...geometry.flags import ShapeFlags
+from ...geometry.types import GeoType
 from ...sim import Model
 from ...sim.enums import JointType
 from . import host_index
@@ -57,7 +58,7 @@ class RowLaw(enum.IntFlag):
     """The row laws a world's data gives rows, from the model at construction (the options decide which of them run)."""
 
     CONTACT = 1
-    """A colliding shape on a body a tree moves."""
+    """A shape pair the collision filter admits (``Model.shape_contact_pairs``) on a body a tree moves."""
     LIMIT = 2
     """A joint axis with a finite position limit."""
     VELOCITY_LIMIT = 4
@@ -66,10 +67,17 @@ class RowLaw(enum.IntFlag):
     """A mimic constraint on a tree's joint."""
     LINK = 16
     """A link of the body cut."""
+    SPIN = 32
+    """A body pair the collision filter admits that can touch at two points or more, on a body a tree moves: a friction
+    region with a footprint, whose wrench carries a spin row (:func:`.friction_patches.patch_spin_rows`)."""
 
 
 _LIMITED_JOINTS = (int(JointType.PRISMATIC), int(JointType.REVOLUTE), int(JointType.D6))
 """The joints whose axes take limit rows."""
+_ONE_POINT_SHAPES = (int(GeoType.SPHERE), int(GeoType.ELLIPSOID))
+"""The shapes that touch a convex shape at one point."""
+_MANIFOLD_SHAPES = (int(GeoType.MESH), int(GeoType.HFIELD), int(GeoType.GAUSSIAN))
+"""The shapes outside the convex narrow phase: a pair with one can touch at several points whatever the other is."""
 
 
 @dataclass(frozen=True, eq=False)
@@ -634,10 +642,19 @@ def _world_classes(plan, model):
     def present(law, trees):
         np.bitwise_or.at(laws, tree_world[trees[trees >= 0]], int(law))
 
-    if model.shape_count:
-        colliding = (model.shape_flags.numpy() & int(ShapeFlags.COLLIDE_SHAPES)) != 0
-        shape_body = model.shape_body.numpy()[colliding]
-        present(RowLaw.CONTACT, plan.body_tree[shape_body[shape_body >= 0]])
+    if model.shape_contact_pair_count:
+        pairs = model.shape_contact_pairs.numpy().reshape(-1, 2)
+        bodies = np.sort(model.shape_body.numpy()[pairs], axis=1)
+        trees = np.where(bodies >= 0, plan.body_tree[bodies], -1).max(axis=1)
+        present(RowLaw.CONTACT, trees)
+        # A sphere or an ellipsoid touches a convex shape at one point (the narrow phase skips its multi-contact
+        # manifold); a body pair of one such shape pair has no footprint, every other one can.
+        kinds = model.shape_type.numpy()[pairs]
+        soft = (model.shape_flags.numpy()[pairs] & int(ShapeFlags.HYDROELASTIC)) != 0
+        round_ = np.isin(kinds, _ONE_POINT_SHAPES).any(axis=1)
+        convex = ~np.isin(kinds, _MANIFOLD_SHAPES).any(axis=1) & ~soft.any(axis=1)
+        _, pair_body, shared = np.unique(bodies, axis=0, return_inverse=True, return_counts=True)
+        present(RowLaw.SPIN, trees[(shared[pair_body.reshape(-1)] > 1) | ~(round_ & convex)])
     if model.joint_count:
         joint_tree = _joint_tree(plan)
         limited = np.flatnonzero(np.isin(model.joint_type.numpy(), _LIMITED_JOINTS) & (joint_tree >= 0))
