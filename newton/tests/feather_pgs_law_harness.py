@@ -452,6 +452,14 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
             "axis": axis.astype(np.float32),
             **pair,
         }
+    if name in ("reciprocal", "quotient"):
+        # Their CUDA form is the exact division's fast path without its range check: equal to the exact division for
+        # normal operands of a normal quotient, which is the range the laws take them in (zero gives NaN there).
+        def normal(scale_lo, scale_hi):
+            sign = rng.choice([-1.0, 1.0], n)
+            return (sign * 10.0 ** rng.uniform(scale_lo, scale_hi, n)).astype(np.float32)
+
+        return {"x": normal(-12, 12)} if name == "reciprocal" else {"a": normal(-12, 12), "b": normal(-12, 12)}
     if name == "ball":
         # The cone's projection: zero coefficients and loads among them (a zero mu_t is the disk's branch).
         mu, mu_t, load = (rng.uniform(0.0, 1.5, n).astype(np.float32) for _ in range(3))

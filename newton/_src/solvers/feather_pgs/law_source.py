@@ -187,6 +187,7 @@ class _Law:
     signature: inspect.Signature
     result_annotations: tuple  # one result type, or one per tuple member
     results: tuple[str, ...]  # their C++ types
+    native: tuple[str, ...] = ()  # the CUDA function's statements, where the subset cannot write them
 
     @property
     def name(self) -> str:
@@ -219,7 +220,14 @@ class LawFamily:
     _laws: list[_Law] = field(default_factory=list, repr=False)
     _prelude: DevicePrelude | None = field(default=None, repr=False)
 
-    def law(self, definition: Callable | None = None, *, inline: str = "force", cuda: bool = True):
+    def law(
+        self,
+        definition: Callable | None = None,
+        *,
+        inline: str = "force",
+        cuda: bool = True,
+        native: tuple[str, ...] = (),
+    ):
         """Register ``definition`` as a law of this family and return its Warp function.
 
         Args:
@@ -228,9 +236,12 @@ class LawFamily:
                 (the compiler's choice) or ``"never"`` (``__noinline__``, for large rarely taken laws).
             cuda: Render a CUDA function. A law whose arithmetic contract needs its Warp callers'
                 module options (``fuse_fp`` off, say) has no CUDA form.
+            native: The CUDA function's statements, for a law whose CUDA form is a device instruction sequence the
+                subset cannot write. The definition stays the law: Warp kernels, the CPU twin and Python callers run
+                it, and the statements must compute its value (the law's docstring says where they do).
         """
         if definition is None:
-            return lambda fn: self.law(fn, inline=inline, cuda=cuda)
+            return lambda fn: self.law(fn, inline=inline, cuda=cuda, native=native)
         if inline not in _INLINE:
             raise ValueError(f"inline must be one of {tuple(_INLINE)}, got {inline!r}")
         if self._prelude is not None:
@@ -245,7 +256,7 @@ class LawFamily:
             if parameter.annotation is inspect.Parameter.empty:
                 raise TypeError(f"law {definition.__name__} must annotate argument {parameter.name}")
         function = wp.func(definition)
-        entry = _Law(definition, function, self, inline, cuda, signature, annotations, results)
+        entry = _Law(definition, function, self, inline, cuda, signature, annotations, results, tuple(native))
         self._laws.append(entry)
         _LAWS[id(function)] = entry
         _LAWS[id(definition)] = entry
@@ -493,7 +504,10 @@ class _Renderer:
         body = self.node.body
         if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
             body = body[1:]  # docstring
-        self.block(body, indent + "    ")
+        if entry.native and not cpu:
+            self.lines += [f"{indent}    {statement}" for statement in entry.native]
+        else:
+            self.block(body, indent + "    ")
         self.lines.append(f"{indent}}}")
         return "\n".join(self.lines)
 

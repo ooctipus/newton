@@ -43,6 +43,43 @@ CONE_LAW = LawFamily("ConeLaw", requires=(PROJECTION_LAW,))
 native code calls ``ConeLaw::ball(...)``."""
 
 
+@PROJECTION_LAW.law(
+    native=(
+        "const float r = wp::approx_div(1.0f, x);",
+        "return r + r * (1.0f - x * r);",
+    )
+)
+def reciprocal(x: float) -> float:
+    """``1 / x``, whose CUDA form is the exact division's fast path without its range check and slow path: the
+    device's approximate reciprocal refined by one fused Newton step, ``r + r (1 - x r)``.
+
+    For a normal ``x`` of a normal reciprocal (``2^-126 <= |x| <= 2^126``) the CUDA form is the correctly rounded
+    reciprocal, bit for bit: the same three instructions, which the exact division guards with a test of ``x``'s exponent
+    and a branch to its slow path. Outside that range it is no reciprocal (zero and infinity give NaN), so a law takes it
+    only where a guard selects another value there or a NaN fails the test that reads it. Warp kernels, the CPU and
+    Python callers divide exactly.
+    """
+    return 1.0 / x
+
+
+@PROJECTION_LAW.law(
+    native=(
+        "const float r = ProjectionLaw::reciprocal(b);",
+        "const float q = a * r;",
+        "return q + r * (a - b * q);",
+    )
+)
+def quotient(a: float, b: float) -> float:
+    """``a / b``, whose CUDA form is the exact division's fast path without its range check and slow path: ``b``'s
+    :func:`reciprocal`, then one fused correction of the quotient by its residual, ``q + r (a - b q)``.
+
+    The CUDA form is the correctly rounded quotient, bit for bit, where ``b`` and the quotient are normal (or ``a`` is
+    zero); elsewhere as :func:`reciprocal` (an overflowing quotient gives NaN). Warp kernels, the CPU and Python
+    callers divide exactly.
+    """
+    return a / b
+
+
 @PROJECTION_LAW.law
 def relaxed_step(old: float, delta: float, omega: float) -> float:
     """Return a row's relaxed update, ``old + omega delta``, for its step ``delta`` (``-r / d``, or regularized)."""
@@ -110,8 +147,9 @@ def ball(triple: wp.vec3, mu: float, mu_t: float, load: float) -> wp.vec3:
     if mu_t <= 0.0:
         pair = disk(wp.vec2(triple[0], triple[1]), mu * load)
         return wp.vec3(pair[0], pair[1], 0.0)
-    reciprocal = wp.where(mu > 0.0, 1.0 / mu, 0.0)
-    scaled = wp.cw_mul(triple, wp.vec3(reciprocal, reciprocal, 1.0 / mu_t))
+    # A coefficient is zero (pinned, the guard's) or normal: its reciprocal takes no range check.
+    inverse = wp.where(mu > 0.0, reciprocal(mu), 0.0)
+    scaled = wp.cw_mul(triple, wp.vec3(inverse, inverse, reciprocal(mu_t)))
     magnitude_sq = wp.dot(scaled, scaled)
     pinned = wp.where(mu > 0.0, 1.0, 0.0)
     kept = wp.cw_mul(triple, wp.vec3(pinned, pinned, 1.0))
@@ -176,9 +214,11 @@ def friction_pair_from_metric(
     result = old
     sticking = bool(False)
     if largest > 0.0 and (smallest > 0.0 or residual_rotated[1] == 0.0):
-        correction = (residual_rotated[0] / largest) * axis
+        # The sticking candidate's quotients take no range check: one out of range is NaN, which fails the sticking
+        # test, and the sliding solve replaces the candidate.
+        correction = quotient(residual_rotated[0], largest) * axis
         if smallest > 0.0:
-            correction += (residual_rotated[1] / smallest) * perpendicular
+            correction += quotient(residual_rotated[1], smallest) * perpendicular
         # Incremental sticking preserves a feasible zero-residual impulse exactly.
         result = old - correction
         sticking = wp.dot(result, result) <= radius_sq
@@ -211,10 +251,12 @@ def friction_pair_from_metric(
             alpha = lo
             converged = bool(False)
             for _ in range(8):
-                inv0 = 1.0 / (largest + alpha)
+                # The Newton steps' reciprocals and quotient take no range check: a NaN fails the stopping test, and
+                # the step bisects (the candidate's) or the bisection below solves (the norm's).
+                inv0 = reciprocal(largest + alpha)
                 inv1 = float(0.0)
                 if smallest + alpha > 0.0:
-                    inv1 = 1.0 / (smallest + alpha)
+                    inv1 = reciprocal(smallest + alpha)
                 trial = old_rotated - wp.vec2(
                     (residual_rotated[0] + alpha * old_rotated[0]) * inv0,
                     (residual_rotated[1] + alpha * old_rotated[1]) * inv1,
@@ -233,7 +275,7 @@ def friction_pair_from_metric(
                 slope = trial[0] * trial[0] * inv0 + trial[1] * trial[1] * inv1
                 candidate = alpha
                 if slope > 0.0:
-                    candidate = alpha + (norm - radius) * inverse_radius * norm * norm / slope
+                    candidate = alpha + quotient((norm - radius) * inverse_radius * norm * norm, slope)
                 alpha = 0.5 * (lo + hi)
                 if candidate > lo and candidate < hi:
                     alpha = candidate
@@ -345,8 +387,9 @@ def friction_ball_from_metric(
     if load <= 0.0:
         return wp.vec3(0.0)
     # A zero coefficient pins its component: its scaled impulse, gradient and change are zero.
-    reciprocal = wp.where(mu > 0.0, 1.0 / mu, 0.0)
-    old_scaled = wp.cw_mul(old, wp.vec3(reciprocal, reciprocal, wp.where(mu_t > 0.0, 1.0 / mu_t, 0.0)))
+    # A coefficient is zero (pinned, the guard's) or normal: its reciprocal takes no range check.
+    inverse = wp.where(mu > 0.0, reciprocal(mu), 0.0)
+    old_scaled = wp.cw_mul(old, wp.vec3(inverse, inverse, wp.where(mu_t > 0.0, reciprocal(mu_t), 0.0)))
     coefficients = wp.vec3(mu, mu, mu_t)
     gradient = wp.cw_mul(residual, coefficients)
     old_rotated = wp.transpose(vectors) * old_scaled
@@ -357,10 +400,12 @@ def friction_ball_from_metric(
     sticking = bool(False)
     invertible = (values[0] > 0.0 or residual_rotated[0] == 0.0) and (values[1] > 0.0 or residual_rotated[1] == 0.0)
     if largest > 0.0 and invertible and (values[2] > 0.0 or residual_rotated[2] == 0.0):
+        # The sticking candidate's quotients take no range check: one out of range is NaN, which fails the sticking
+        # test, and the sliding solve replaces the candidate.
         step = wp.vec3(
-            wp.where(values[0] > 0.0, residual_rotated[0] / values[0], 0.0),
-            wp.where(values[1] > 0.0, residual_rotated[1] / values[1], 0.0),
-            wp.where(values[2] > 0.0, residual_rotated[2] / values[2], 0.0),
+            wp.where(values[0] > 0.0, quotient(residual_rotated[0], values[0]), 0.0),
+            wp.where(values[1] > 0.0, quotient(residual_rotated[1], values[1]), 0.0),
+            wp.where(values[2] > 0.0, quotient(residual_rotated[2], values[2]), 0.0),
         )
         # Incremental sticking preserves a feasible zero-residual impulse exactly.
         change = -(vectors * step)
@@ -392,10 +437,11 @@ def friction_ball_from_metric(
             alpha = lo
             converged = bool(False)
             for _ in range(8):
+                # As the pair's Newton steps: no range check, a NaN bisects or leaves the solve to the bisection.
                 inv = wp.vec3(
-                    wp.where(values[0] + alpha > 0.0, 1.0 / (values[0] + alpha), 0.0),
-                    wp.where(values[1] + alpha > 0.0, 1.0 / (values[1] + alpha), 0.0),
-                    wp.where(values[2] + alpha > 0.0, 1.0 / (values[2] + alpha), 0.0),
+                    wp.where(values[0] + alpha > 0.0, reciprocal(values[0] + alpha), 0.0),
+                    wp.where(values[1] + alpha > 0.0, reciprocal(values[1] + alpha), 0.0),
+                    wp.where(values[2] + alpha > 0.0, reciprocal(values[2] + alpha), 0.0),
                 )
                 trial = old_rotated - wp.cw_mul(residual_rotated + alpha * old_rotated, inv)
                 norm = wp.length(trial)
@@ -410,7 +456,7 @@ def friction_ball_from_metric(
                 slope = wp.dot(wp.cw_mul(trial, trial), inv)
                 candidate = alpha
                 if slope > 0.0:
-                    candidate = alpha + (norm - load) * inverse_load * norm * norm / slope
+                    candidate = alpha + quotient((norm - load) * inverse_load * norm * norm, slope)
                 alpha = 0.5 * (lo + hi)
                 if candidate > lo and candidate < hi:
                     alpha = candidate
