@@ -1131,6 +1131,7 @@ _WALK_ACCESS = """    // The class emitter's reads, ahead of its chain, by the o
 
 
 def _walk_down(classes: tuple[WalkClass, ...], unroll: int, ahead: int | None, inverted: bool) -> str:
+    """The class emitter's walk down of ``classes``: ``WALK_DOWN``, the leave, or ``inverted`` ``WALK_ENTER``."""
     if inverted:
         texts = ts.walk_texts(
             ts.Direction.DOWN,
@@ -1178,34 +1179,46 @@ def _walk_down(classes: tuple[WalkClass, ...], unroll: int, ahead: int | None, i
 
 @functools.cache
 def walk_down_prelude(
-    classes: tuple[WalkClass, ...], unroll: int = WALK_UNROLL, ahead: int | None = None, inverted: bool = False
+    classes: tuple[WalkClass, ...],
+    unroll: int = WALK_UNROLL,
+    ahead: int | None = None,
+    *,
+    down: bool = True,
+    enter: bool = False,
 ) -> DevicePrelude:
-    """The one walk down (the leave ``P^T L^-T u``) of the walking classes ``classes``, for both devices: a prelude
-    declaring ``WALK_DOWN(cls, data, link, u, prior, qd, twist)``, the chain on one lane: each class's walk emitted by
-    :meth:`WalkClass.walk` (straight-line code up to ``unroll`` coordinates), its links, records, ``u`` and prior
-    outputs read :data:`WALK_AHEAD` items ahead of the chain (``WALK_IN``), every twist a register, handed to
-    ``twist(b, V)`` after its body.
+    """The one walk down of the walking classes ``classes``, for both devices: with ``down`` a prelude declaring
+    ``WALK_DOWN(cls, data, link, u, prior, qd, twist)``, the leave ``P^T L^-T u``, the chain on one lane: each class's
+    walk emitted by :meth:`WalkClass.walk` (straight-line code up to ``unroll`` coordinates), its links, records, ``u``
+    and prior outputs read :data:`WALK_AHEAD` items ahead of the chain (``WALK_IN``), every twist a register, handed to
+    ``twist(b, V)`` after its body; with ``enter`` the same walk inverted, ``WALK_ENTER(cls, data, link, qd, u)``, the
+    walk's coordinates of known velocities (``u = L^T P qd``, :func:`.tree_scan.enter`), the same walk with another
+    combine.
 
-    No shared memory and no scratch. The step's one leave takes it (:func:`walk_leave_kernel`), and the general sweep's
-    free bodies' speed rows on their one-body class (:data:`FREE_BODY_WALK`). ``inverted``, the same walk declares
-    ``WALK_ENTER(cls, data, link, qd, u)``, the leave inverted (``u = L^T P qd``, :func:`.tree_scan.enter`): the
-    audit's (:func:`walk_enter_kernel`).
+    No shared memory and no scratch. The step's one leave takes the leave (:func:`walk_leave_kernel`), the audit the
+    enter (:func:`walk_enter_kernel`), and the general sweep's free bodies both, on their one-body class
+    (:data:`FREE_BODY_WALK`): a speed row reads its body's velocity by the leave and pushes its change back by the
+    enter.
 
     Args:
         classes: The walking classes, indexed by ``cls``.
         unroll: Coordinates up to which a class's walk is straight-line code (:data:`WALK_UNROLL`).
         ahead: Items whose inputs the chain's lane holds in registers ahead of it (:meth:`WalkClass.walk`).
-        inverted: Declare the enter in place of the leave.
+        down: Declare the leave, ``WALK_DOWN``.
+        enter: Declare the enter, ``WALK_ENTER``.
     """
     if not classes:
         raise ValueError("a walk down needs a class")
+    if not (down or enter):
+        raise ValueError("a walk down declares the leave, the enter or both")
     tag = hashlib.sha256(
         repr((classes, unroll, WALK_AHEAD if ahead is None else ahead, WALK_TOUCH)).encode()
     ).hexdigest()[:8]
+    walks = [_walk_down(classes, unroll, ahead, inverted) for inverted, on in ((False, down), (True, enter)) if on]
     # The loads package carries the step's pin (WALK_MUL), under its one guard.
-    walk = substitute(_WALK_ACCESS, unpacked=WALK_UNPACKED) + "\n" + _walk_down(classes, unroll, ahead, inverted)
+    walk = "\n".join((substitute(_WALK_ACCESS, unpacked=WALK_UNPACKED), *walks))
     texts = {cuda: _walk_loads_text(cuda) + "\n" + walk for cuda in (True, False)}
-    return DevicePrelude(f"walk_{'enter' if inverted else 'down'}_{tag}", texts[True], cpu=texts[False])
+    kind = "_".join(name for name, on in (("down", down), ("enter", enter)) if on)
+    return DevicePrelude(f"walk_{kind}_{tag}", texts[True], cpu=texts[False])
 
 
 def leave_work(trees: int) -> Work:
@@ -1513,7 +1526,7 @@ def walk_enter_kernel(classes: tuple[WalkClass, ...]) -> wp.Kernel:
         ),
         substitute(_ENTER, coordinate=WALK_COORDINATE, link=WALK_LINK),
         items("tid", flat=True),
-        preludes=(walk_release_prelude(), walk_down_prelude(classes, WALK_UNROLL, inverted=True)),
+        preludes=(walk_release_prelude(), walk_down_prelude(classes, WALK_UNROLL, down=False, enter=True)),
         dual=True,
         native_name="walk_enter_native",
     ).kernel()

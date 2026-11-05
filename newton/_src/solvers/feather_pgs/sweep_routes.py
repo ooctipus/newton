@@ -18,7 +18,7 @@ from ...core.execution import Work, device_lanes, shape
 from ...core.memory import REGISTERS_PER_THREAD, Buffer, Place, Staging, arch_budget, built_for
 from . import kernel_template, sweep_units
 from .device_preludes import CPU_MATH, RING, SHARED_STORAGE, cuda_native, dual_native, lane_group
-from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude, walk_paths_prelude
+from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
 from .packed_rows import PACKED_SIDES
@@ -164,22 +164,20 @@ class FreeBodyCoordinates:
     ``du += Z delta``. The sweep adds its change to the walk's ``du`` and the step's one leave walks every tree down
     (:func:`.factor.walk.walk_leave_kernel`). A free body's speed row reads the body's physical velocity mid-sweep: its
     tree (found from its first global coordinate, :class:`.factor.walk.WalkTrees`' ``first_art``) is walked down and
-    back in place (:meth:`walk_leave`, :meth:`walk_enter`).
+    back in place (:meth:`walk_leave`, :meth:`walk_enter`): the leave and the enter of its one-body class
+    (:data:`.factor.walk.FREE_BODY_WALK`, :func:`.factor.walk.walk_down_prelude`), compiled.
     """
 
     op = FreeBodyZ()
 
     def _walked(self, first: str, call: str) -> str:
-        """``call`` (a walk of :func:`.factor.walk.walk_paths_prelude` on ``data``, ``link`` and ``twist``) on the tree
-        whose first world coordinate is ``first``."""
+        """``call`` (a walk of :func:`.factor.walk.walk_down_prelude` on ``data`` and ``link``) on the tree whose first
+        world coordinate is ``first``."""
         return f"""{{
     const int body_art = walk.first_art.data[world_dof_indices.data[dof_map_base + {first}]];
     const int j0 = walk.joint_start.data[body_art], d0 = walk.dof_start.data[body_art];
     const float* data = walk.data.data + (size_t)d0 * {WALK_COORDINATE};
     const float* link = walk.link.data + (size_t)j0 * {WALK_LINK};
-    float twist[6];
-    WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), walk.joint_end.data[body_art] - j0,
-              walk.dofs.data[body_art]);
     {call};
 }}"""
 
@@ -195,7 +193,7 @@ class FreeBodyCoordinates:
 
     def walk_enter(self, first: str, velocity: str, out: str) -> str:
         """The walk in of that free body: ``out = L^T P velocity``."""
-        return self._walked(first, f"WALK_ENTER(data, link, {velocity}, {out}, twist)")
+        return self._walked(first, f"WALK_ENTER(0, data, link, {velocity}, {out})")
 
 
 FREE_BODY_COORDINATES = FreeBodyCoordinates()
@@ -925,8 +923,7 @@ def mf_gs_source(
         PACKED_SIDES,
         *law_preludes(PROJECTION_LAW, *((CONE_LAW,) if contact_torsion else ())),
         *solve_policy.preludes,
-        walk_paths_prelude(1),
-        walk_down_prelude((FREE_BODY_WALK,)),
+        walk_down_prelude((FREE_BODY_WALK,), enter=True),
     )
     if lanes == 1:
         return dual_native(body, preludes=(*preludes, CPU_MATH)), staging
