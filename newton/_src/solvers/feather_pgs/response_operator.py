@@ -1303,9 +1303,6 @@ class SparseFactor(ResponseOperator):
     velocity: Velocity = Velocity("s_delta")
     diagonal: Callable[[str], str] | None = None
     inverse: Callable[[str], str] | None = None
-    triple_couplings: bool = True
-    """A friction triple's spin couplings are reduced at the visit (:meth:`spin_terms`); ``False`` where the triple's
-    metric is its contact's record's (K1): the visit reduces its residual only."""
     name = "sparse_factor"
     fused_pair_apply = True
 
@@ -1404,22 +1401,14 @@ class SparseFactor(ResponseOperator):
         return f"{indent}float {out} = pair_coupling;"
 
     def spin_terms(self, row: str, sibling: str, spin: str, rhs: Callable[[str], str], indent: str) -> str:
-        """The spin row's residual and, with :attr:`triple_couplings`, its couplings with the pair, reduced in one
-        ladder over the entries :meth:`residual` kept (a contact's rows share its support): only a contact with a spin
-        row pays them."""
-        if self.triple_couplings:
-            sums = ("spin_residual", "spin_cross", "spin_cross_sibling")
-            terms = (
-                "    spin_cross += responses[q] * spin_value;",
-                "    spin_cross_sibling += sibling_responses[q] * spin_value;",
-            )
-            declare = f"{indent}float spin_residual = 0.0f, spin_cross = 0.0f, spin_cross_sibling = 0.0f;\n"
-        else:
-            sums, terms = ("spin_residual",), ()
-            declare = (
-                f"{indent}const float spin_cross = 0.0f, spin_cross_sibling = 0.0f;  // the cached metric replaces them\n"
-                f"{indent}float spin_residual = 0.0f;\n"
-            )
+        """The spin row's residual and its couplings with the pair, reduced in one ladder over the entries
+        :meth:`residual` kept (a contact's rows share its support): only a contact with a spin row pays them."""
+        sums = ("spin_residual", "spin_cross", "spin_cross_sibling")
+        terms = (
+            "    spin_cross += responses[q] * spin_value;",
+            "    spin_cross_sibling += sibling_responses[q] * spin_value;",
+        )
+        declare = f"{indent}float spin_residual = 0.0f, spin_cross = 0.0f, spin_cross_sibling = 0.0f;\n"
         body = "\n".join(
             (
                 "if (indices[q] >= 0) {",
@@ -1436,6 +1425,40 @@ class SparseFactor(ResponseOperator):
             + "".join(f"\n{indent}{line}" for line in reduce.split("\n") if line)
             + f"\n{indent}spin_residual += {rhs(spin)};"
         )
+
+    def unit_terms(self, rows: tuple[tuple[str, str], ...], indent: str) -> str:
+        """``float {name}_jv = Z_row . delta`` of each ``(row, name)`` of a contact's rows, which share the first row's
+        support, reduced in one ladder; the shared coordinates (``indices``), the velocity they read (``velocities``)
+        and each row's entries (``{name}_responses``) are kept for :meth:`unit_apply`."""
+        count = self.entries
+        lines = [
+            f"int indices[{count}];",
+            f"float velocities[{count}];",
+            *(f"float {name}_responses[{count}];" for _, name in rows),
+            "float " + ", ".join(f"{name}_jv = 0.0f" for _, name in rows) + ";",
+        ]
+        body = [
+            f"const int index = {self.guarded_coordinate(rows[0][0])};",
+            "indices[q] = index;",
+            f"velocities[q] = index >= 0 ? {self.velocity.at('index')} : 0.0f;",
+            *(f"{name}_responses[q] = index >= 0 ? {self.element(row)} : 0.0f;" for row, name in rows),
+            *(f"{name}_jv += {name}_responses[q] * velocities[q];" for _, name in rows),
+        ]
+        reduce = self.lanes.reduce(*(f"{name}_jv" for _, name in rows))
+        text = "\n".join(indent + line for line in lines) + "\n" + self.entries_loop("\n".join(body), indent)
+        return text + "".join(f"\n{indent}{line}" for line in reduce.split("\n") if line)
+
+    def unit_apply(self, changes: tuple[tuple[str, str], ...], indent: str) -> str:
+        """``delta_v += sum Z_row d`` over the ``(name, d)`` of :meth:`unit_terms`' rows, per entry in the order given,
+        each when nonzero, from the velocity :meth:`unit_terms` read, written back once."""
+        body = [
+            "if (indices[q] >= 0) {",
+            "    float value = velocities[q];",
+            *(f"    if ({delta} != 0.0f) value += {name}_responses[q] * {delta};" for name, delta in changes),
+            f"    {self.velocity.at('indices[q]')} = value;",
+            "}",
+        ]
+        return self.entries_loop("\n".join(body), indent, entry=False)
 
     def apply(self, delta: str, indent: str) -> str:
         """``delta_v += Z_row delta`` from the entries :meth:`residual` (or :meth:`row_velocity`) kept."""

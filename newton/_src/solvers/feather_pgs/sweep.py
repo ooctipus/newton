@@ -1286,6 +1286,57 @@ def rows_block(
     )
 
 
+def friction_triple_visit(
+    ctx: RowContext, laws: RowLaws, *, head: str, metric: str, pool: str, load: str, law: str, pad: str
+) -> str:
+    """Visit the friction triple of the contact whose normal is row ``head``: its pair and its spin row
+    (:func:`spin_row`), solved together on their elliptic cone (:func:`.projection_laws.friction_triple`) apart from
+    the row loop, in a phase of their own after it.
+
+    ``metric`` loads what the law and the pool read, first and off the chain; ``pool`` forms the pooled normal ``load``
+    (an expression, its patch ring's), and a zero cone with no carried impulse is skipped (``continue``) before one
+    reduction of the three rows' velocity terms on the contact's shared support (:meth:`.SparseFactor.unit_terms`).
+    The triple's law projects the residuals: ``law`` is the call up to its residual argument, ``(residual, old, mu,
+    mu_t, load, omega)`` after it (:func:`.projection_laws.friction_triple_from_metric` of the contact's metric). The
+    first lane stores the impulses, the three changes vote together and one apply writes each coordinate once
+    (:meth:`.SparseFactor.unit_apply`): the spin row's change, then the pair's second and first tangents', the order
+    the row loop applied them in.
+    """
+    op = ctx.operator
+    names = (("tangent", "first"), ("sibling", "second"), ("spin", "spin"))
+    rhs = {name: ctx.rhs(row) for row, name in names}
+    changes = tuple(
+        op.change(f"{name}_delta", f"{name}_bound", str(TORSION if name == "spin" else FRICTION), row)
+        for row, name in names
+    )
+    lines = [
+        f"const int tangent = {head} + 1, sibling = {head} + 2, spin = {head} + 3;",
+        metric,
+        pool,
+        f"const float load = fmaxf({load}, 0.0f);",
+        *(f"const float {name}_old = {ctx.load(row)};" for row, name in names),
+        "// Zero load gives a zero cone: a triple without impulse moves nothing.",
+        "if (load == 0.0f && first_old == 0.0f && second_old == 0.0f && spin_old == 0.0f) continue;",
+        op.unit_terms(names, ""),
+        *(f"const float {name}_residual = {name}_jv + {rhs[name]};" for _, name in names),
+        *(
+            f"const float {name}_bound = {op.bound(rhs[name], op.terms(f'{name}_jv', rhs[name], whole=False), f'{name}_old', row)};"
+            for row, name in names
+        ),
+        f"const wp::vec3 triple = {law}wp::vec3(first_residual, second_residual, spin_residual),",
+        f"    wp::vec3(first_old, second_old, spin_old), {ctx.mu('tangent')}, {ctx.mu('spin')}, load, omega);",
+        *(f"const float {name}_delta = triple[{k}] - {name}_old;" for k, (_, name) in enumerate(names)),
+        ctx.store_barrier(),
+        *(ctx.store(row, f"triple[{k}]") for k, (row, _) in enumerate(names)),
+        "if (first_delta != 0.0f || second_delta != 0.0f || spin_delta != 0.0f) {",
+        change_vote(laws, changes, "    "),
+        op.unit_apply((("spin", "spin_delta"), ("second", "second_delta"), ("first", "first_delta")), "    "),
+        "}",
+        ctx.sync(),
+    ]
+    return indent("\n".join(line for line in lines if line), pad)
+
+
 def friction_metric_law(name: str, record: Callable[[str], str], pad: str) -> str:
     """Declare ``name``, the friction triple's law of a class's rows, its metric cached for the launch at
     ``record(row)`` (``row``: the contact's normal; :func:`friction_metric_stage`)."""

@@ -14,7 +14,9 @@ acts on is the factor-coordinate delta from ``v_hat``, staged per world and publ
 - the **operator's layout**: packed rows read through explicit row indices (``row_dof``) or the shared support
   table, or (``local_factors``) packed rows expanded once per call into dense rows in shared memory;
 - the **schedule**: every row in slot order, or (``active_rows``) the rows selected at sweep entry, popped from
-  a bitset (:func:`active_scan`); patch rings (``linked_rows``) select their friction pairs through the ring;
+  a bitset (:func:`active_scan`); patch rings (``linked_rows``) select their friction pairs through the ring; under
+  contact ``torsion`` the friction triples (a contact's pair and its spin row) in a phase of their own after each
+  sweep's rows (:func:`triple_phase`), so the row loop carries none of their code;
 - the **contact unit** (``contact_triplets``): a contact normal and its friction pair in one visit on their Gram
   block (:func:`contact_units`): one load group with the triplet's block record, one reduction of the three
   residuals, the normal step, the pair's residuals moved by the normal change through the record's couplings, the
@@ -58,9 +60,9 @@ from .sweep import (
     RowLaws,
     UnitOperator,
     cached_pair_law,
-    cached_triple_law,
     contact_unit,
     end_sweep,
+    friction_triple_visit,
     impulse_seed,
     indent,
     material_arguments,
@@ -120,8 +122,8 @@ class SparseSweep:
     """A sparse sweep's configuration, as the factory's options resolve.
 
     Contact triplets need the support table, three rows, and the active-row scan or linked rows; linked rows
-    take part only in an active-row scan or a contact unit. Under contact ``torsion`` a contact unit is a quad: its
-    spin row follows its pair.
+    take part only in an active-row scan or a contact unit. Under contact ``torsion`` a contact's spin row follows its
+    pair, and the three are a friction triple, solved in the triple phase (:func:`triple_phase`).
     """
 
     rows: int
@@ -233,11 +235,14 @@ class SparseRows:
     Impulses, right-hand sides (``rhs_bias + row_incident``), diagonals and types are staged per world
     (``s_impulse``, ``s_rhs``, ``s_diag``, ``s_type``); every lane reads them and the first lane stores the
     impulses. Parents and friction coefficients stream from global memory; a patch ring walks at most ``count``
-    rows.
+    rows. Under contact ``torsion`` a friction triple's pair (a contact with a spin row, :func:`.sweep.spin_row`) is
+    staged as the spin row's kind: the row loop and the active scan skip the triple's three rows, and the triple
+    phase finds its normal by the staged kinds and solves them (:func:`triple_phase`).
     """
 
     capacity: int
     lanes: Lanes
+    torsion: bool = False
 
     def load(self, row: str) -> str:
         return f"s_impulse[{row}]"
@@ -266,10 +271,6 @@ class SparseRows:
     def eps(self, row: str) -> str:
         return f"world_row_eps.data[offset + {row}]"
 
-    def spin_of(self, parent: str) -> str:
-        """The spin row of the contact whose normal is row ``parent`` (:func:`.sweep.spin_row`)."""
-        return spin_row(parent, "count", self.kind)
-
     def ring_load(self, parent: str, load: str | None = None) -> str:
         """The pooled normal load of the patch ring of normal row ``parent``, from ``load`` (its impulse)."""
         return f"RING_LOAD({load or self.load(parent)}, {parent}, count, ring_parent, ring_impulse)"
@@ -286,12 +287,24 @@ class SparseRows:
 
     def loads(self, pad: str) -> str:
         lane, width = self.lanes.lane, self.lanes.width
+        kind = "static_cast<unsigned char>(world_row_type.data[offset + i])"
+        triple = ""
+        if self.torsion:
+            kind = "static_cast<unsigned char>(kind)"
+            spin = spin_row("parent", "count", lambda row: f"world_row_type.data[offset + {row}]")
+            triple = (
+                f"{pad}    int kind = world_row_type.data[offset + i];\n"
+                f"{pad}    if (kind == {FRICTION}) {{\n"
+                f"{pad}        const int parent = world_row_parent.data[offset + i];\n"
+                f"{pad}        if ({spin} >= 0) kind = {TORSION};\n"
+                f"{pad}    }}\n"
+            )
         return (
             f"{pad}for (int i = {lane}; i < count; i += {width}) {{\n"
             f"{pad}    s_impulse[i] = world_impulses.data[offset + i];\n"
             f"{pad}    s_rhs[i] = rhs_bias.data[offset + i] + row_incident.data[offset + i];\n"
             f"{pad}    s_diag[i] = world_diag.data[offset + i];\n"
-            f"{pad}    s_type[i] = static_cast<unsigned char>(world_row_type.data[offset + i]);\n"
+            f"{triple}{pad}    s_type[i] = {kind};\n"
             f"{pad}}}"
         )
 
@@ -344,16 +357,12 @@ def active_scan(sweep: SparseSweep, op: SparseFactor, pad: str) -> str:
     """Select the rows a sweep visits, one lane per row, into the bitsets ``s_normal_words`` and ``s_selected_words``.
 
     A contact normal or joint limit is selected when it holds impulse or its residual at sweep entry is
-    negative (or not finite), every other non-friction row always but a spin row, which its pair's visit solves (a
-    selected spin row only cost a pop and the guards: anymald's sweep 1% faster without them). A first
-    tangent is selected while its normal is selected or its pair (or, under contact torsion, its spin row) holds
-    impulse, a patch pair while any normal of its ring is. A row a sweep's earlier updates violate waits for the next
-    sweep.
+    negative (or not finite), every other non-friction row always. A first tangent is selected while its normal is
+    selected or its pair holds impulse, a patch pair while any normal of its ring is. A row a sweep's earlier updates
+    violate waits for the next sweep. Under contact torsion the rows of a friction triple, staged as spin rows
+    (:class:`SparseRows`), are never selected: the triple phase solves them.
     """
-    spin = spin_row("parent", "count", lambda row: f"s_type[{row}]")
-    held = "s_impulse[parent + 2] != 0.0f" + (
-        f" || ({spin} >= 0 && s_impulse[parent + 3] != 0.0f)" if sweep.torsion else ""
-    )
+    held = "s_impulse[parent + 2] != 0.0f"
     serial = dataclasses.replace(op, lanes=Lanes(1, "0"))
     # The delta is zero at the first sweep unless warm starting seeded it.
     dot = serial.accumulate("dot", "row", "")
@@ -373,16 +382,15 @@ def active_scan(sweep: SparseSweep, op: SparseFactor, pad: str) -> str:
             f"    || s_impulse[row] != 0.0f || {held});"
         )
     lane_zero = op.lanes.first
-    # A spin row's visit is its pair's: never selected on its own.
     select = f"!select_active || (kind != {CONTACT} && kind != {JOINT_LIMIT}) || s_impulse[row] != 0.0f"
-    if sweep.torsion:
-        select = f"kind != {TORSION} && ({select})"
+    # A triple's rows are the triple phase's: never selected.
+    rowed = f"kind != {FRICTION} && kind != {TORSION}" if sweep.torsion else f"kind != {FRICTION}"
     text = f"""for (int first = 0; first < count; first += 32) {{
     const int row = first + lane;
     bool selected = false;
     if (row < count) {{
         const int kind = s_type[row];
-        if (kind != {FRICTION}) {{
+        if ({rowed}) {{
             selected = {select};
             if (!selected && s_diag[row] > 0.0f) {{
                 float dot = 0.0f;
@@ -455,15 +463,13 @@ def ordinary_rows(rows: SparseRows, op: SparseFactor, laws: RowLaws, *, skip_vel
     """Row ``i``'s visit and update under the shared row law (:func:`.sweep.row_visit`).
 
     The friction gate, then the first tangent of a pair on its ring's disk; the residual reduces the pair's
-    second-tangent term and coupling with it (:meth:`.SparseFactor.residual`), and under contact torsion its spin
-    row's, which the pair's visit solves. Velocity-limit rows wait for the last-word pass (``skip_velocity_limits``).
-    The first lane stores the impulses after every lane has read them.
+    second-tangent term and coupling with it (:meth:`.SparseFactor.residual`). Velocity-limit rows wait for the
+    last-word pass (``skip_velocity_limits``). Under contact torsion the rows staged as spin rows, a friction triple's
+    (:class:`SparseRows`), are the triple phase's: the loop skips them and carries none of the triple's code. The
+    first lane stores the impulses after every lane has read them.
     """
     lanes = rows.lanes
-    # Where spin rows may appear a friction triple's metric is its record's, formed once per solve by the writer
-    # (:func:`.walk_rows.support_rows_kernel`): its visit reduces no spin coupling.
-    cached = {"triple_couplings": False} if laws.torsion else {}
-    op = dataclasses.replace(op, diagonal=lambda row: "denom" if row == "i" else rows.diag(row), **cached)
+    op = dataclasses.replace(op, diagonal=lambda row: "denom" if row == "i" else rows.diag(row))
     # The row's and its pair's impulses are read once, at admission, before the reduction.
     held = {"i": "row_impulse", "sib": "pair_impulse"}
     ctx = RowContext(
@@ -480,20 +486,17 @@ def ordinary_rows(rows: SparseRows, op: SparseFactor, laws: RowLaws, *, skip_vel
         ring_load=rows.ring_load,
         lanes=lanes,
         fenced=False,
-        spin_row=rows.spin_of,
-        # A friction triple's metric is its contact's record's (ROW_TRIPLE), formed once per solve by the writer.
-        triple_law="ROW_TRIPLE(parent, ",
     )
     head = [
         f"int row_type = {rows.kind('i')};",
         f"if (row_type == {VELOCITY_LIMIT}) continue;" if skip_velocity_limits else "",
-        # A spin row is solved with its friction pair (contact torsion).
+        # A friction triple's rows are the triple phase's (contact torsion).
         f"if (row_type == {TORSION}) continue;" if laws.torsion else "",
     ]
     residual = op.residual("jv", pad, sibling="parent + 2", paired=f"row_type == {FRICTION}")
     visit = row_visit(
         ctx,
-        laws,
+        dataclasses.replace(laws, torsion=False),
         parent=rows.parent("i"),
         check="denom",
         declare=f"float denom = {rows.diag('i')};",
@@ -541,20 +544,24 @@ def contact_units(sweep: SparseSweep, rows: SparseRows, op: SparseFactor, laws: 
     its record in the order the pair update pools them (-1: a longer ring, which keeps the walk). A row the guards
     decline keeps the ordinary update.
 
-    Where spin rows may appear (``laws.torsion``) a contact with a spin row (:func:`.sweep.spin_row`) declines the unit
-    and takes the ordinary rows, whose triple reads its metric from the record (:func:`.sweep.cached_triple_law`): a
-    fused unit of four measured slower than its rows taken one by one, on rare and on common spin rows alike (anymald
-    and g1), because every world's sweep carried its body.
+    Under contact torsion a contact with a spin row is a friction triple, its pair staged as spin rows
+    (:class:`SparseRows`): the guards decline it, its normal takes the ordinary update and the triple phase its pair
+    and spin row (:func:`triple_phase`). With ``linked`` the entry pass stores a triple's ring members too, which its
+    visit pools.
     """
     S = sweep.support
     width = CONTACT_RECORD_FLOATS + (CONTACT_RING_FLOATS if sweep.linked else 0)
     count = op.entries
+    pair_rows = f"s_type[normal + 1] != {FRICTION} || s_type[normal + 2] != {FRICTION}"
+    if laws.torsion:
+        # A triple's pair is staged as spin rows (SparseRows).
+        pair_rows = f"s_type[normal + 1] != s_type[normal + 2] || (s_type[normal + 1] != {FRICTION} && s_type[normal + 1] != {TORSION})"
     setup = ""
     if sweep.linked:
         setup = f"""// Each anchor's other ring members, at most three, in the order the pair update pools them; -1 marks a
 // longer ring, which keeps the walk. Visits read them with the record.
 for (int normal = lane; normal + 2 < count; normal += 32) {{
-    if (s_type[normal] != {CONTACT} || s_type[normal + 1] != {FRICTION} || s_type[normal + 2] != {FRICTION}) continue;
+    if (s_type[normal] != {CONTACT} || {pair_rows}) continue;
     const int first = world_row_parent.data[offset + normal];
     int second = -1, third = -1, others = 0;
     if (first >= 0 && first != normal) {{
@@ -700,17 +707,12 @@ const int row_type = r == 0 ? {CONTACT} : {FRICTION};"""
         }}"""
 
     units = body()
-    rows_of = ""
-    if laws.torsion:
-        # A contact with a spin row declines the unit: its rows take the ordinary update, the triple from its record.
-        rows_of = f", spin = {rows.spin_of('i')}"
-    check = " && spin < 0" if laws.torsion else ""
     update = f"""if (i == consumed_tangent) continue;
 // The staged metadata first, read together: a contact normal with its two tangents.
 if ({entry_guard}i + 2 < count
     && ((s_type[i] == {CONTACT}) & (s_type[i + 1] == {FRICTION}) & (s_type[i + 2] == {FRICTION})
         & (isfinite(s_diag[i]) != 0) & (s_diag[i] > 0.0f){selected})) {{
-    const int head = i, tangent = i + 1, sibling = i + 2{rows_of};
+    const int head = i, tangent = i + 1, sibling = i + 2;
     // The guards load together; the rows, the record and the coordinates then load together.
     const int row_class = support.row_class.data[offset + i];
     const int tangent_class = support.row_class.data[offset + tangent];
@@ -718,7 +720,7 @@ if ({entry_guard}i + 2 < count
     const int tangent_parent = world_row_parent.data[offset + tangent];
     const int sibling_parent = world_row_parent.data[offset + sibling];{normal_parent}
     if (tangent_parent == i && sibling_parent == i && tangent_class == sibling_class
-        && row_class == tangent_class{check}{point_guard}) {{
+        && row_class == tangent_class{point_guard}) {{
 {units}
         consumed_tangent = tangent;
         SYNC();
@@ -726,6 +728,75 @@ if ({entry_guard}i + 2 < count
     }}
 }}"""
     return indent(setup, "    ") if setup else "", indent(update, pad)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Friction triples: a contact's pair and its spin row, in a phase of their own after each sweep's rows
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def triple_phase(sweep: SparseSweep, rows: SparseRows, op: SparseFactor, laws: RowLaws, pad: str) -> str:
+    """The friction triples after a sweep's rows (contact torsion), in row order, each visited by
+    :func:`.sweep.friction_triple_visit`: one reduction and one apply of its pair and spin row together, on the pooled
+    normal load of its contact's patch ring. A triple's normal is a contact whose next row is staged as a spin row (its
+    pair, :class:`SparseRows`): the lanes find them together, a lane a row.
+
+    A triple's metric is its contact's record's (a scale, three eigenvalues and the eigenbasis as a quaternion), formed
+    once per solve by the writer (:func:`.walk_rows.support_rows_kernel`), and loads with the ring ahead of the
+    reduction. A linked sweep's contact units store each normal's ring members behind its record at entry
+    (:func:`contact_units`), a triple's too: the visit pools them from the record, and a longer ring (or a sweep
+    without them) walks the ring.
+    """
+    record = _record("contact_records.shape[2]", "head")
+    ring = rows.ring_load("head", "pooled")
+    metric = [
+        f"const float* const record = {record};",
+        "const float4 triple_metric = *reinterpret_cast<const float4*>(record);",
+        "const float4 triple_basis = *reinterpret_cast<const float4*>(record + 4);",
+    ]
+    pool = [f"float pooled = {rows.load('head')};"]
+    if sweep.linked and sweep.triplets:
+        metric.append(f"const int4 ring = *reinterpret_cast<const int4*>(record + {CONTACT_RECORD_FLOATS});")
+        pool += [
+            f"if (ring.w < 0) pooled = {ring};",
+            "if (ring.w > 0) pooled += s_impulse[ring.x];",
+            "if (ring.w > 1) pooled += s_impulse[ring.y];",
+            "if (ring.w > 2) pooled += s_impulse[ring.z];",
+        ]
+    else:
+        pool.append(f"pooled = {ring};")
+    law = (
+        "ConeLaw::friction_triple_from_metric(triple_metric.x, wp::vec3(triple_metric.y, triple_metric.z,\n"
+        "    triple_metric.w), wp::quat_to_matrix(wp::quat(triple_basis.x, triple_basis.y, triple_basis.z,\n"
+        "    triple_basis.w)), "
+    )
+    ctx = RowContext(
+        row="tangent",
+        kind=str(FRICTION),
+        operator=dataclasses.replace(op, diagonal=rows.diag),
+        load=rows.load,
+        store=rows.store,
+        rhs=rows.rhs_of,
+        mu=rows.mu,
+        weight=rows.weight,
+        parent="head",
+        ring_load=rows.ring_load,
+        lanes=rows.lanes,
+        fenced=False,
+    )
+    visit = friction_triple_visit(
+        ctx, laws, head="head", metric="\n".join(metric), pool="\n".join(pool), load="pooled", law=law, pad="        "
+    )
+    text = f"""for (int first = 0; first < count; first += {sweep.lanes}) {{
+    const int row = first + lane;
+    unsigned heads = BALLOT(row + 1 < count && s_type[row] == {CONTACT} && s_type[row + 1] == {TORSION});
+    while (heads != 0u) {{
+        const int head = first + FIRST(heads);
+        heads &= heads - 1u;
+{visit}
+    }}
+}}"""
+    return indent(text, pad)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -748,15 +819,16 @@ def _staging(sweep: SparseSweep, rows: SparseRows, op: SparseFactor) -> Staging:
 def sparse_staging(max_constraints: int, max_world_dofs: int, max_row_dofs: int, **options) -> Staging:
     """The shared working set of the sweep :func:`sparse_kernel` builds from the same arguments, without its body."""
     sweep = _resolve(max_constraints, max_world_dofs, max_row_dofs, **options)
-    return _staging(sweep, SparseRows(sweep.rows, Lanes(sweep.lanes)), factor_operator(sweep))
+    return _staging(sweep, SparseRows(sweep.rows, Lanes(sweep.lanes), sweep.torsion), factor_operator(sweep))
 
 
 def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     """The sweep's native body: staging and setup, then per sweep the active scan, the row loop (contact unit, then
-    the ordinary update), the last-word velocity-limit pass and the exit; then the publication."""
+    the ordinary update), the friction triples (contact torsion), the last-word velocity-limit pass and the exit;
+    then the publication."""
     M, D, S, L = sweep.rows, sweep.dofs, sweep.support, sweep.lanes
     lanes = Lanes(L)
-    rows = SparseRows(M, lanes)
+    rows = SparseRows(M, lanes, sweep.torsion)
     op = factor_operator(sweep)
     laws = RowLaws(regularize=sweep.weighted, material=sweep.material, policy=sweep.policy, torsion=sweep.torsion)
     staging = _staging(sweep, rows, op)
@@ -797,17 +869,11 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
 {unit}
 {update}
         }}"""
+    triples = triple_phase(sweep, rows, op, laws, "        ") + "\n" if sweep.torsion else ""
     passes = ""
     if sweep.velocity_limits:
         passes = velocity_limit_pass(rows, op, laws, end="count", pad="        ")
     exit_ = end_sweep(sweep.policy, iteration="iter", violation=active_violation(sweep, op) if sweep.active else None)
-    triple_law = ""
-    if sweep.torsion:
-        # Where spin rows may appear, a friction triple's law reads its metric from its contact's record (formed once
-        # per solve by the writer, :func:`.walk_rows.support_rows_kernel`): every visit only projects.
-        # The records' own stride: the plan gives them a ring wherever anchors are, linked sweep or not.
-        record = _record("contact_records.shape[2]", "row")
-        triple_law = cached_triple_law("ROW_TRIPLE", "    ", record=record) + "\n"
     body = f"""    const int lane = LANE;
     const int line = dense_first.data[world];
     __builtin_assume(line >= 0);
@@ -818,7 +884,7 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     // A contact normal's patch ring links the region's next normal (-1 ends a point contact).
     const auto ring_parent = [&](int r) {{ return world_row_parent.data[offset + r]; }};
     const auto ring_impulse = [&](int r) {{ return s_impulse[r]; }};
-{triple_law}
+
     for (int d = lane; d < {D}; d += {L}) s_delta[d] = 0.0f;
 {rows.loads("    ")}
 {chr(10).join(setup)}
@@ -827,7 +893,7 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
         int iteration_changed = 0;
 {chr(10).join(scan)}
 {row_loop}
-{passes}
+{triples}{passes}
 {exit_}    }}
 
     for (int d = lane; d < {D}; d += {L}) factor_velocity_delta.data[world * {D} + d] = s_delta[d];
