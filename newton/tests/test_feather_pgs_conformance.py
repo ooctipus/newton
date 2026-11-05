@@ -23,8 +23,8 @@ Routes
     boundary); on CPU, the general row of the matrix-free sweep, one thread per
     world. Dynamics owners: the held groups (sparse, tree and forest), scalar
     branches and ordinary dynamics. Contact-row producers: the one writer (into the general, the support and the
-    sparse diagonal's sinks), keyed rows and the compact contact boundary. Friction: point (``friction_anchor_beta=0``) and
-    persistent patch friction (0.2).
+    sparse diagonal's sinks), keyed rows and the compact contact boundary. Friction: the one-wrench patch friction
+    (``friction_anchor_beta`` 0.2).
 
 Scenes and features
     Dropped and stacked boxes, a box sticking and one sliding on an incline, a
@@ -51,9 +51,8 @@ Metrics
     laws use the step's post-solve velocities at its pre-step pose, the pose its
     rows linearize:
 
-    - normal force ``f_n >= 0``; Coulomb cone ``|f_t| <= mu f_n`` per contact
-      under point friction, per body pair under patch friction (whose friction
-      rows act at patch anchors);
+    - normal force ``f_n >= 0``; Coulomb cone ``|f_t| <= mu f_n`` per body pair
+      (the law's friction rows act at its anchors);
     - natural residuals of the normal law ``|min(f_n dt / m, v_n + b)|`` (``b``
       the Baumgarte or speculative bias) and of Coulomb friction with maximum
       dissipation ``|x - Proj_cone(x - v_t)|``, ``x = f_t dt / m``: a sticking
@@ -605,11 +604,12 @@ class Laws:
     normal_force_min: float | None = None
     """Smallest contact normal force [N] (negative: the export or the solve pulls)."""
     cone_excess: float | None = None
-    """Largest ``|f_t| - mu f_n`` [N]: per contact under point friction, per body pair under patch friction."""
+    """Largest ``|f_t| - mu f_n`` [N]: per body pair under friction, per contact in a frictionless scene."""
     normal_residual: float | None = None
     """Largest natural residual ``|min(f_n dt / m, v_n + b)|`` of the normal contact law [m/s]."""
     friction_residual: float | None = None
-    """Largest natural residual of the Coulomb law with maximum dissipation [m/s] (point friction only)."""
+    """Largest natural residual of the Coulomb law with maximum dissipation [m/s] (frictionless scenes only: the
+    law's friction acts at its anchors)."""
     penetration: float | None = None
     """Largest penetration ``-phi`` found by a collision pass after a step [m]."""
     energy_gain: float | None = None
@@ -617,7 +617,7 @@ class Laws:
     momentum_residual: float | None = None
     """Largest ``|m dv - dt (m g + sum F)|`` of a free body over its weight impulse ``m g dt`` (the force export)."""
     torque_residual: float | None = None
-    """Largest ``|I dw - dt sum r x F|`` of a free body over ``m g dt`` times its size [m] (point friction only)."""
+    """Largest ``|I dw - dt sum r x F|`` of a free body over ``m g dt`` times its size [m] (frictionless scenes only)."""
     limit_violation: float | None = None
     """Largest joint position-limit violation [m or rad]."""
 
@@ -682,8 +682,8 @@ def momentum_balance(run: Run, data: ModelData, *, torque: bool, skip: int = 0) 
     (``"free"``) and up to ``O(dt^2)`` for a jointed tree (``"articulated"``),
     whose momentum also moves with its pose. The angular balance about the
     centre of mass (``"angular"``) is checked for free rigid bodies when
-    ``torque`` is set, against the point the rows act at (point friction; patch
-    friction acts at its anchors). Residuals are relative to the
+    ``torque`` is set, against the contact points (frictionless contact: the
+    law's friction acts at its anchors). Residuals are relative to the
     weight impulse ``m g dt`` (and to ``m g dt`` times the body's radius of
     gyration for the angular one); ``None`` where no such body exists.
     """
@@ -885,11 +885,11 @@ def incline_steady_slide_laws(run: Run) -> list:
     """The sliding box accelerates at ``g (sin(angle) - mu cos(angle))`` at every step, to the sweep's noise.
 
     Per step after the first third, the downhill speed's change over ``dt`` against the analytic acceleration: the
-    worst step within 3e-4 and the window's mean within 2e-5. Under both laws, a friction pair kept only where its
+    worst step within 3e-4 and the window's mean within 2e-5. A friction pair kept only where its
     root solve would stop at once stays within 1e-4 and 9e-6 at every budget of :data:`INCLINE_BUDGETS` on the CPU
     split route (re-solving every pair: 2e-4 and 7e-6); keeping pairs to ``2^-20``, looser than the root solve's own
-    stop, left contact rows cycling against the held pairs: single steps 5e-4 to 1.4e-3 off under point friction and
-    means up to 2.3e-5 (2026-10-30).
+    stop, left contact rows cycling against the held pairs: single steps 5e-4 to 1.4e-3 off and means up to 2.3e-5
+    (2026-10-30, measured under the deleted point friction).
     """
     params, dt = run.scene.params, run.scene.dt
     angle, downhill = params["angle"], np.asarray(params["downhill"])
@@ -1242,7 +1242,7 @@ class Physics:
 
     scene: scenes.Scene
     law: str | None
-    """``"point"``, ``"patch"`` or ``None`` for a scene without contact."""
+    """``"patch"`` or ``None`` for a scene without contact."""
     iterations: int
     """Gate budget N of every route."""
     variant: tuple = ()
@@ -1259,7 +1259,7 @@ class Physics:
     def options(self, iterations: int) -> dict:
         options = dict(self.variant)
         if self.law is not None:
-            options["friction_anchor_beta"] = 0.0 if self.law == "point" else 0.2
+            options["friction_anchor_beta"] = 0.2
         options["pgs_iterations"] = iterations
         return options
 
@@ -1298,14 +1298,6 @@ class Reference:
     limit: float | None
     loop: float | None
     mimic: float | None
-
-
-def _torque_balance(physics: Physics) -> bool:
-    """Whether the free bodies' angular balance applies: under point friction, whose rows act at the exported
-    witness points, and without torsion (a torsion scene, or contact torsion on any scene), whose spin torque the
-    export does not carry."""
-    torsion = "torsion" in physics.scene.tags or dict(physics.variant).get("contact_torsion", False)
-    return physics.law == "point" and not torsion
 
 
 def reference(physics: Physics, route: Route, device) -> Reference:
@@ -1354,7 +1346,7 @@ def reference(physics: Physics, route: Route, device) -> Reference:
         spread=spread,
         tolerance=tolerance,
         laws=contact_laws(budget, data, patch=physics.law == "patch"),
-        momentum=momentum_balance(budget, data, torque=_torque_balance(physics)),
+        momentum=momentum_balance(budget, data, torque=False),
         limit=limit_violation(budget, data),
         loop=loop_gap(budget, joints),
         mimic=mimic_error(budget, joints),
@@ -1436,13 +1428,6 @@ SPARSE = Route(
         "held_tree.groups.0.operator": "sparse",
         "sparse_mass_matrix.contact_triplets": False,
     },
-)
-SPARSE_TRIPLETS = Route(
-    "sparse_triplets",
-    "cuda",
-    # The default sparse route of a single tree with the row support table: fused contact triplets.
-    options=_MF,
-    expect={"sweep.route": "sparse_pgs", "sparse_mass_matrix.contact_triplets": True},
 )
 MF_FOREST = Route(
     "mf_forest",
@@ -1563,7 +1548,7 @@ def _physics(scene, law, iterations, label="", **variant):
 
 
 def _laws(*laws):
-    return laws or ("point", "patch")
+    return laws or ("patch",)
 
 
 _WARM = {"pgs_warmstart": True}
@@ -1585,10 +1570,8 @@ def cuda_groups() -> list:
     vlimits = {"enable_joint_velocity_limits": True}
     groups = []
     for law in _laws():
-        # Patch friction keeps the packed full sweep of the legged scene's small worlds: only point friction fuses
-        # its contact triplets.
-        triplets = [SPARSE_TRIPLETS] if law == "point" else []
-        legged = [SPARSE, *triplets, MF_HELD]
+        # Patch friction keeps the packed full sweep of the legged scene's small worlds.
+        legged = [SPARSE, MF_HELD]
         legged += [MF_PARALLEL, KEYED_PARALLEL]
         groups += [
             Group(_physics(scenes.box_drop(), law, 32), ref, (MF_HELD,)),
@@ -1604,7 +1587,7 @@ def cuda_groups() -> list:
                 ref,
                 tuple(
                     route.but(f"{route.name}_torsion", expect={"friction.torsion": True})
-                    for route in (SPARSE, *triplets, MF_PARALLEL, KEYED_PARALLEL)
+                    for route in (SPARSE, MF_PARALLEL, KEYED_PARALLEL)
                 ),
             ),
             # A grasp drifts with the row order at a small budget: the scene sorts its contacts and runs 32 iterations.
@@ -1646,17 +1629,17 @@ def cuda_groups() -> list:
     groups += [
         # Warm start solves the cold problem from another first iterate: compare it with the cold reference.
         Group(
-            _physics(scenes.box_stack(contact_matching="latest"), "point", 32),
+            _physics(scenes.box_stack(contact_matching="latest"), "patch", 32),
             ref,
             (MF_HELD.but("mf_held_warm_start", options=_WARM),),
         ),
         Group(
-            _physics(scenes.legged(contact_matching="latest"), "point", 32),
+            _physics(scenes.legged(contact_matching="latest"), "patch", 32),
             ref,
             (SPARSE.but("sparse_warm_start", options=_WARM),),
         ),
-        Group(_physics(scenes.ball_drop(), "point", 16), ref, (MF_HELD,)),
-        Group(_physics(scenes.box_push(), "point", 16), ref, (MF_HELD,)),
+        Group(_physics(scenes.ball_drop(), "patch", 16), ref, (MF_HELD,)),
+        Group(_physics(scenes.box_push(), "patch", 16), ref, (MF_HELD,)),
         Group(_physics(scenes.chain(), None, 16), ref, (MF_HELD, MF_PARALLEL)),
         Group(_physics(scenes.four_bar(), None, 16), ref, (MF_DEFAULT,)),
         Group(_physics(scenes.four_bar(loop="revolute"), None, 16), ref, (MF_DEFAULT,)),
@@ -1681,9 +1664,9 @@ def cuda_groups() -> list:
     # The CT benchmark's torsion checks: T1 articulated and free, T3 at every offset (7 mm, where the elliptic cone
     # holds and a pair-first law slips, included) and T4 against the patch's limit surface.
     for scene in _torsion_scenes():
-        groups.append(Group(_physics(scene, "point", 32, "torsion", contact_torsion=True), ref, (MF_TORSION,)))
+        groups.append(Group(_physics(scene, "patch", 32, "torsion", contact_torsion=True), ref, (MF_TORSION,)))
     for scene in COMPLIANT_SCENES():
-        groups.append(Group(_physics(scene, "point", 32, "compliance", contact_compliance=True), ref, (MF_COMPLIANCE,)))
+        groups.append(Group(_physics(scene, "patch", 32, "compliance", contact_compliance=True), ref, (MF_COMPLIANCE,)))
     # Material contacts compose with warm start (the cold reference) and patch friction. The stack's corner split
     # converges at 64 sweeps.
     for scene, iterations in (
@@ -1691,29 +1674,22 @@ def cuda_groups() -> list:
         (scenes.compliant_stack(contact_matching="latest"), 64),
     ):
         warm = MF_COMPLIANCE.but("mf_compliance_warm_start", options=_WARM)
-        groups.append(Group(_physics(scene, "point", iterations, "compliance", contact_compliance=True), ref, (warm,)))
-    groups.append(
-        Group(
-            _physics(scenes.compliant_stack(), "patch", 32, "compliance", contact_compliance=True),
-            ref,
-            (MF_COMPLIANCE,),
-        )
-    )
+        groups.append(Group(_physics(scene, "patch", iterations, "compliance", contact_compliance=True), ref, (warm,)))
     # Every placement takes a contact row by its weight: the articulated scenes on stiff material contacts, and on
     # rigid contacts under the relative regularization, through the routes that serve their topologies (the
     # specialized placements' row laws against the reference's).
     for scene, iterations, routes in (
-        (scenes.legged(), 32, (SPARSE, SPARSE_TRIPLETS, MF_HELD, MF_PARALLEL, KEYED_PARALLEL)),
+        (scenes.legged(), 32, (SPARSE, MF_HELD, MF_PARALLEL, KEYED_PARALLEL)),
         (scenes.gripper(), 32, (MF_DEFAULT, MF_FOREST)),
         (scenes.keyboard(), 16, (SPARSE_DIAGONAL, SPARSE_DIAGONAL_TREE, COMPACT_BOUNDARY)),
         (scenes.hand(), 16, (PAIRED, PAIRED_FOREST)),
     ):
         material = _material(scene)
         groups.append(
-            Group(_physics(material, "point", iterations, "compliance", contact_compliance=True), ref, routes)
+            Group(_physics(material, "patch", iterations, "compliance", contact_compliance=True), ref, routes)
         )
         groups.append(
-            Group(_physics(scene, "point", iterations, "regularized", pgs_contact_regularization=0.1), ref, routes)
+            Group(_physics(scene, "patch", iterations, "regularized", pgs_contact_regularization=0.1), ref, routes)
         )
     return groups
 
@@ -1826,7 +1802,7 @@ def run_checks(group: Group, route: Route, device) -> list:
         )
     # A rigid-body speed clamp removes momentum outside the contact rows, which the export does not report.
     if "rigid_body_velocity_limits" not in physics.scene.tags:
-        balance = momentum_balance(run, data, torque=_torque_balance(physics))
+        balance = momentum_balance(run, data, torque=False)
         for kind, value in balance.items():
             if value is not None:
                 relative = LAW_FACTOR * (ref.momentum[kind] or 0.0) if kind == "articulated" else 0.0
@@ -1950,13 +1926,13 @@ _add_group_tests(TestFeatherPGSConformanceCUDA, cuda_groups())
 OWNERSHIP = (
     # (scene, law, iterations, route, owners that together solve every world and each solve one, counted owners that
     # must solve none). A sweep without counters (the parallel tiers) owns a world when no counted sweep solves it.
-    (scenes.legged, "point", 32, MF_HELD, ("mf_gs",), ()),
-    (scenes.legged, "point", 32, SPARSE, ("sparse_pgs",), ("mf_gs",)),
-    (scenes.legged, "point", 32, MF_PARALLEL, (), ("mf_gs",)),
+    (scenes.legged, "patch", 32, MF_HELD, ("mf_gs",), ()),
+    (scenes.legged, "patch", 32, SPARSE, ("sparse_pgs",), ("mf_gs",)),
+    (scenes.legged, "patch", 32, MF_PARALLEL, (), ("mf_gs",)),
     (scenes.legged, "patch", 32, KEYED_PARALLEL, (), ("mf_gs",)),
     # The paired factor sweep solves worlds of independent components; coupled worlds take the mixed fallback.
-    (scenes.hand, "point", 16, PAIRED, ("paired_factor", "mf_gs"), ()),
-    (scenes.keyboard, "point", 16, SPARSE_DIAGONAL, ("sparse_diagonal",), ("mf_gs",)),
+    (scenes.hand, "patch", 16, PAIRED, ("paired_factor", "mf_gs"), ()),
+    (scenes.keyboard, "patch", 16, SPARSE_DIAGONAL, ("sparse_diagonal",), ("mf_gs",)),
     (scenes.keyboard, "patch", 16, COMPACT_BOUNDARY, ("sparse_diagonal",), ("mf_gs",)),
     # Velocity-limit rows bind on the pushed arm: their last phase counts with the sweep's.
     (

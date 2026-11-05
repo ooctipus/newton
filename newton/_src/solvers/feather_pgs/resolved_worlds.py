@@ -510,28 +510,6 @@ def _check_normal(c: int, raw: RawContacts, data: ResolvedWorldInput, scratch: R
         wp.atomic_max(scratch.rejected, world, 1)
 
 
-@wp.kernel(enable_backward=False)
-def check_raw_contact_normals(threads: int, raw: RawContacts, data: ResolvedWorldInput, scratch: ResolvedWorldScratch):
-    """Check the complete active raw prefix; invalid ownership rejects the call."""
-    tid = wp.tid()
-    count = raw.count[0]
-    capacity = raw.shape0.shape[0]
-    if (
-        count < 0
-        or raw.shape1.shape[0] != capacity
-        or raw.point0.shape[0] != capacity
-        or raw.point1.shape[0] != capacity
-        or raw.normal.shape[0] != capacity
-        or raw.margin0.shape[0] != capacity
-        or raw.margin1.shape[0] != capacity
-    ):
-        if tid == 0:
-            wp.atomic_max(scratch.global_invalid, 0, 1)
-        return
-    for c in range(tid, count, threads):
-        _check_normal(c, raw, data, scratch)
-
-
 @wp.func
 def _free_route_world(c: int, raw: RawContacts, data: ResolvedWorldInput, worlds: int):
     """Return the world of a responding contact the row allocator routes to matrix-free rows, else -1.
@@ -589,14 +567,15 @@ def _free_route_world(c: int, raw: RawContacts, data: ResolvedWorldInput, worlds
 
 
 @wp.kernel(enable_backward=False)
-def check_raw_contact_normals_by_route(
+def check_raw_contact_normals(
     threads: int,
     raw: RawContacts,
     data: ResolvedWorldInput,
     scratch: ResolvedWorldScratch,
     free_normals: wp.array[int],
 ):
-    """Run :func:`check_raw_contact_normals`, also counting each world's contacts on matrix-free rows."""
+    """Check the complete active raw prefix, counting each world's contacts on matrix-free rows; invalid ownership
+    rejects the call."""
     tid = wp.tid()
     count = raw.count[0]
     capacity = raw.shape0.shape[0]
@@ -620,22 +599,13 @@ def check_raw_contact_normals_by_route(
 
 
 @wp.kernel(enable_backward=False)
-def finalize_resolved_worlds(scratch: ResolvedWorldScratch):
-    """Publish only after the limit, body and contact launches finish on one stream."""
-    world = wp.tid()
-    value = int(0)
-    if scratch.rejected[world] == 0 and scratch.global_invalid[0] == 0:
-        value = 1
-    scratch.resolved[world] = value
-
-
-@wp.kernel(enable_backward=False)
-def finalize_resolved_worlds_bounded(
+def finalize_resolved_worlds(
     scratch: ResolvedWorldScratch, free_normals: wp.array[int], dense_rows: int, free_rows: int
 ):
-    """Publish as :func:`finalize_resolved_worlds`, resolving only worlds whose worst-case rows fit each route.
+    """Publish once the limit, body and contact launches finish on one stream, resolving only worlds whose worst-case
+    rows fit each route.
 
-    Persistent patch friction releases the anchor of every contact the row
+    The friction law releases the anchor of every contact the row
     allocator would reserve rows for, where a capacity rejection would keep it.
     Counting every checked limit as one dense row and every checked contact as
     three rows on its route (``free_normals`` on matrix-free rows, the rest on
@@ -655,7 +625,7 @@ def finalize_resolved_worlds_bounded(
 @wp.kernel(enable_backward=False)
 def accumulate_resolved_rows(scratch: ResolvedWorldScratch, watermark: wp.array[wp.int32]):
     """The most rows a resolved world skipped (``Diagnostics.row_watermark``): its checked limits and three rows a
-    checked contact, a normal and its tangent pair (the bound :func:`finalize_resolved_worlds_bounded` resolves under)."""
+    checked contact, a normal and its tangent pair (the bound :func:`finalize_resolved_worlds` resolves under)."""
     world = wp.tid()
     if scratch.resolved[world] != 0:
         wp.atomic_max(watermark, 0, scratch.checked_limits[world] + 3 * scratch.checked_normals[world])
@@ -721,35 +691,30 @@ class ResolvedWorlds:
         self.solver = solver
         declined = decline(solver)
         self.enabled = declined is None
-        if self.enabled and solver.laws.set.contact == "patch":
+        if self.enabled:
             self.reason = (
                 "Admitted: interleaved matrix-free patch-friction rows whose kinds are all unilateral; a world "
                 "resolves only if its checked rows fit every contact route."
             )
-        elif self.enabled:
-            self.reason = "Admitted: interleaved matrix-free point-contact rows whose kinds are all unilateral."
         else:
             self.reason = declined
         self.absolute_margin = float(absolute_margin)
         self.relative_margin = float(relative_margin)
         if not all(math.isfinite(v) and v >= 0.0 for v in (self.absolute_margin, self.relative_margin)):
             raise ValueError("Resolved-world rejection margins must be finite and nonnegative")
-        # Patch friction resolves a world only if its checked rows fit the dense and
-        # matrix-free capacities (finalize_resolved_worlds_bounded); point friction
-        # keeps no such bound.
-        self.row_bound = None
-        if self.enabled and solver.laws.set.contact == "patch":
-            self.row_bound = (int(solver.placement.dense_max_constraints), int(solver.placement.mf_max_constraints))
         device = solver.model.device
         worlds = solver.forest.world_count if self.enabled else 0
         self.scratch = ResolvedWorldScratch()
         if not self.enabled:
             self.resolved = wp.zeros(0, dtype=wp.int32, device=device)
             return
+        # A world resolves only if its checked rows fit the dense and matrix-free capacities
+        # (finalize_resolved_worlds).
+        self.row_bound = (int(solver.placement.dense_max_constraints), int(solver.placement.mf_max_constraints))
         SolverArrays(self.scratch, device).allocate(RESOLVED_WORLD_SCRATCH, world=worlds, body=solver.model.body_count)
         self.resolved = self.scratch.resolved
         # Per-world count of checked contacts on matrix-free rows, for the patch bound.
-        self.free_normals = wp.zeros(worlds if self.row_bound is not None else 0, dtype=wp.int32, device=device)
+        self.free_normals = wp.zeros(worlds, dtype=wp.int32, device=device)
         # A model without rigid velocity or depenetration limits bounds nothing.
         self.unbounded = wp.full(solver.model.body_count, float("inf"), dtype=wp.float32, device=device)
         # Predicted body twists: published by the held-tree predictor when every
@@ -831,19 +796,18 @@ def launch(
     *,
     enabled=1,
     published=False,
-    row_bound=None,
-    free_normals=None,
+    row_bound,
+    free_normals,
     pool=None,
 ):
     """Run the decision launches in stream order on ``device``.
 
     With published twists the body pass is replaced by the free bodies'
     velocity-cap check, and the contact check rejects an endpoint whose twist
-    is not published; otherwise the body pass builds the twists itself. A
+    is not published; otherwise the body pass builds the twists itself. The
     ``row_bound`` of (dense, matrix-free) row capacities resolves only worlds
-    whose worst-case rows fit both (:func:`finalize_resolved_worlds_bounded`),
-    counting matrix-free contacts in ``free_normals``. Both contact checks
-    run :func:`_check_normal`, so either law rejects the same contacts. With
+    whose worst-case rows fit both (:func:`finalize_resolved_worlds`),
+    counting matrix-free contacts in ``free_normals``. With
     the contacts' ``pool`` the contact checks follow the live count in a
     capture whose launches bind (:meth:`ContactPool.launch`); size
     ``contact_capacity`` with its ``launch_rows()`` then.
@@ -868,14 +832,10 @@ def launch(
         else:
             pool.launch(kernel, threads, inputs=inputs, extent=raw.count, clamp=True)
 
-    if row_bound is None:
-        check(check_raw_contact_normals, [threads, raw, data, scratch])
-        wp.launch(finalize_resolved_worlds, dim=worlds, inputs=[scratch], device=device)
-        return
     free_normals.zero_()
-    check(check_raw_contact_normals_by_route, [threads, raw, data, scratch, free_normals])
+    check(check_raw_contact_normals, [threads, raw, data, scratch, free_normals])
     wp.launch(
-        finalize_resolved_worlds_bounded,
+        finalize_resolved_worlds,
         dim=worlds,
         inputs=[scratch, free_normals, int(row_bound[0]), int(row_bound[1])],
         device=device,

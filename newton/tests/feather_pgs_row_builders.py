@@ -113,5 +113,3 @@ def assert_row_builders_named(test, contact_rows, keys):
         own = [key for key in launched if key in entry["kernels"]]
         own = [key for index, key in enumerate(own) if index == 0 or own[index - 1] != key]
         test.assertEqual(own[: len(entry["kernels"])], entry["kernels"], (size, entry, launched))
-    # Every producer writes the solver's friction law for every size.
-    test.assertEqual({entry["law"] for _, entry in entries}, {contact_rows["law"]}, groups)

@@ -7,7 +7,7 @@ A native body declares the device helpers it calls, such as a law family's
 struct, a lane group or the patch ring, and ``device_preludes.cuda_native``
 places them after the body's one architecture guard; ``dual_native`` places
 their CPU twins after an ``#else`` for a body that also runs on the CPU. These
-tests check that layout on every native snippet of the point-stream inventory
+tests check that layout on every native snippet of the kernel-pin inventory
 and scan the package for text splices of preludes or guards elsewhere. No
 snippet compiles to nothing on the CPU: it runs there, or a CPU build of it
 fails (``device_preludes.CUDA_ONLY``).
@@ -270,11 +270,11 @@ class TestDevicePreludeComposition(unittest.TestCase):
 
 
 class TestNativeSweepLayout(unittest.TestCase):
-    """Every native snippet of the point-stream inventory that declares a prelude keeps the composed layout."""
+    """Every native snippet of the kernel-pin inventory that declares a prelude keeps the composed layout."""
 
     @classmethod
     def setUpClass(cls):
-        from newton.tests import test_feather_pgs_point_streams as pins  # noqa: PLC0415
+        from newton.tests import test_feather_pgs_kernel_pins as pins  # noqa: PLC0415
 
         cls.preludes, _ = _preludes(_modules())
         cls.preludes += list(_LANE_GROUPS)
@@ -314,7 +314,7 @@ class TestNativeSweepLayout(unittest.TestCase):
     def test_no_snippet_compiles_to_nothing_on_the_cpu(self):
         """Give every native snippet of the inventory and of the package's modules a CPU build: CPU statements, or
         the ``#error`` of a CUDA-only body (BACKBONE rule 6)."""
-        from newton.tests import test_feather_pgs_point_streams as pins  # noqa: PLC0415
+        from newton.tests import test_feather_pgs_kernel_pins as pins  # noqa: PLC0415
 
         snippets = {}
         for name, kernel in pins._inventory().items():

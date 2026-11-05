@@ -23,13 +23,12 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import field_group, row_slots, rows
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
-from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.row_slots import (
     allocate_world_contact_slots,
     finalize_constraint_counts_with_status,
 )
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import row_lines
+from newton.tests.feather_pgs_law_harness import anchored_patches, row_lines
 from newton.tests.test_feather_pgs_sparse_solver import _build_model
 
 _UNBOUNDED = 2**31 - 1
@@ -38,7 +37,6 @@ _UNBOUNDED = 2**31 - 1
 # contacting tripods beside two free spheres, one sphere deep in a foot, whose dense and
 # matrix-free contact rows an 8-sweep Gauss-Seidel solve visits in slot order.
 _ROUTE_OPTIONS = {
-    "friction_anchor_beta": 0.0,
     "enable_joint_limits": True,
     "dense_max_constraints": 96,
     "mf_max_constraints": 64,
@@ -112,7 +110,7 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
             1,
             0.0,
             1,
-            FrictionPatches(),
+            anchored_patches(contact_count, device),
             wp.empty(0, dtype=wp.int32, device=device),
         ],
         outputs=[

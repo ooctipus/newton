@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Preserve explicit material-law opt-ins alongside default patch friction."""
+"""The material laws (contact compliance, contact torsion) run under the friction law's stick."""
 
 import unittest
 import warnings
@@ -22,7 +22,6 @@ class TestPatchMaterialCompatibility(unittest.TestCase):
         model = builder.finalize(device="cpu")
         solver = SolverFeatherPGS(model, contact_compliance=False, contact_torsion=False)
         self.assertEqual(solver.laws.friction_anchor_beta, 0.2)
-        self.assertTrue(solver.laws.friction_anchors_enabled)
 
     def test_torsion_opt_in_keeps_default_patches(self):
         """Resolve omitted patch gain to default patch friction alongside torsion, without a warning."""
@@ -35,7 +34,6 @@ class TestPatchMaterialCompatibility(unittest.TestCase):
             solver = SolverFeatherPGS(model, contact_torsion=True)
         self.assertEqual([str(w.message) for w in caught if "friction" in str(w.message)], [])
         self.assertTrue(solver.laws.contact_torsion_enabled)
-        self.assertTrue(solver.laws.friction_anchors_enabled)
         self.assertAlmostEqual(solver.laws.friction_anchor_beta, 0.2)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
@@ -45,9 +43,8 @@ class TestPatchMaterialCompatibility(unittest.TestCase):
         for articulated in (False, True):
             with self.subTest(articulated=articulated), warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
-                trace, _, solver, mass = run_fixture(
+                trace, _, _, mass = run_fixture(
                     articulated=articulated, enabled=True, solver_options={"friction_anchor_beta": None}
                 )
                 self.assertEqual([str(w.message) for w in caught if "friction" in str(w.message)], [])
-                self.assertTrue(solver.laws.friction_anchors_enabled)
                 self.assertLess(abs(trace[-1, 2] - (0.05 - mass * 9.81 / 3000)), 2e-6)

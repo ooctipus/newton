@@ -5,7 +5,7 @@
 
 :meth:`RowLaws.build` resolves the laws from the options (:class:`.configuration.Options`) and the model:
 
-- the contact law: the friction law (patch friction with ``friction_anchor_beta > 0``, else point friction), the
+- the contact law: the friction law (one wrench a friction region, its stick's gain ``friction_anchor_beta > 0``), the
   regularization weight, the restitution threshold, the shape materials and contact torsion;
 - the rigid bodies' speed limits;
 - the joint-limit tables (limited sizes, each coordinate's limit coordinate) and the warp joint-limit row builders;
@@ -288,8 +288,8 @@ class RowLaws:
             options: The solver's options.
 
         Raises:
-            ValueError: For a negative or non-finite ``friction_anchor_beta`` or contact torsion with an option it does
-                not compose with.
+            ValueError: For a ``friction_anchor_beta`` that is not finite and positive, or contact torsion with an option
+                it does not compose with.
         """
         laws = cls()
         laws.model = model
@@ -301,14 +301,12 @@ class RowLaws:
         friction_anchor_beta = options.friction_anchor_beta
         laws.friction_anchor_beta_source = "argument"
         if friction_anchor_beta is None:
-            # An explicit point algorithm remains a valid way to select point
-            # friction. The ordinary constructor enables persistent patches.
             friction_anchor_beta = 0.2
             laws.friction_anchor_beta_source = "default"
         laws.friction_anchor_beta = float(friction_anchor_beta)
-        if not np.isfinite(laws.friction_anchor_beta) or laws.friction_anchor_beta < 0.0:
-            raise ValueError("friction_anchor_beta must be finite and non-negative")
-        laws.friction_anchors_enabled = laws.friction_anchor_beta > 0.0
+        # The stick's gain: every friction region carries its position-level stick (DECISIONS 11-04 23:18).
+        if not np.isfinite(laws.friction_anchor_beta) or laws.friction_anchor_beta <= 0.0:
+            raise ValueError("friction_anchor_beta, the stick's gain, must be finite and positive")
         # Kernels consume the float32 weight w = 1/(1+g). Values too small to
         # change w are the exact hard update and stay on the zero-cost path.
         laws.contact_w = float(np.float32(1.0 / (1.0 + options.pgs_contact_regularization)))
@@ -369,9 +367,7 @@ class RowLaws:
         # Spin rows appear on a contact whose region has a footprint (patch friction is one wrench a region,
         # core-docs/WRENCH/VERDICT.md) or under contact torsion on every friction contact: the sweeps then read each
         # contact's rows from the data (a pair, or a pair and a spin row).
-        self.spin_rows = self.contact_torsion_enabled or (
-            bool(self.friction_anchors_enabled) and bool(options.enable_contact_friction)
-        )
+        self.spin_rows = self.contact_torsion_enabled or bool(options.enable_contact_friction)
         if self.contact_torsion_enabled:
             if not options.enable_contact_friction:
                 raise ValueError(
@@ -579,7 +575,6 @@ class RowLaws:
         self.friction_patches = FrictionPatchState(
             model,
             pool.ready,
-            self.friction_anchors_enabled,
             phi,
             reuse_frames=self.patch_frame_reuse,
             pool=pool,
@@ -602,8 +597,6 @@ class RowLaws:
         On by default;
         ``FEATHER_PGS_PATCH_FRAME_REUSE=0`` sorts every build.
         """
-        if not self.friction_anchors_enabled:
-            return False, "Point friction sorts no patch pairs."
         if os.environ.get("FEATHER_PGS_PATCH_FRAME_REUSE", "1") == "0":
             return False, "FEATHER_PGS_PATCH_FRAME_REUSE=0 sorts the patch pairs of every build."
         return True, (
@@ -1209,7 +1202,7 @@ class RowLaws:
 
     def _build_friction_patches(self, solver, state_in, contacts):
         """Construct the shared contact law independently of the dynamics owner."""
-        if self.friction_anchors_enabled and contacts is not None:
+        if contacts is not None:
             self.friction_patches.build(
                 solver.model,
                 state_in,

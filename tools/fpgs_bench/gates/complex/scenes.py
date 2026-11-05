@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Scene adapters for the FeatherPGS patch-vs-point friction study.
+"""Scene adapters for the FeatherPGS big-scene runs.
 
 ``build(case, law, world_count, ...)`` constructs one scene at N worlds with the friction law
-injected into the FeatherPGS constructor and nothing else changed. The returned :class:`Scene`
+(the solver's default: one wrench a region, its stick's gain 0.2) and nothing else changed. The returned :class:`Scene`
 gives the runner a capturable ``simulate()`` (one frame, all substeps), a host-side
 ``before_frame(t)`` (that frame's control, launched outside the timed region) and the bodies and
 time windows the physics metrics use. ``perturb_initial_poses`` then shifts the metric objects'
@@ -14,8 +14,7 @@ are trials rather than replicas.
 * ``hardware``, ``coins``, ``dishes``, ``cube``: the stock
   ``newton.examples.robot.example_robot_clutter.Example`` with its own defaults. Only
   ``newton.solvers.SolverFeatherPGS`` is swapped, while the example constructs its solver, for a
-  subclass that sets ``friction_anchor_beta=0.0`` (point) or leaves it out (patch: Newton's
-  default 0.2).
+  subclass that leaves ``friction_anchor_beta`` out (Newton's default 0.2) and records the call.
 * ``pyramid``: ``example_pyramid``'s box stacks rebuilt from its constants (that example hard-codes
   XPBD), driven by FeatherPGS with the clutter example's solver settings, centred on the origin.
   Optional tilted gravity turns it into an incline creep test.
@@ -35,12 +34,9 @@ from unittest import mock
 
 import numpy as np
 
-LAWS = ("patch", "point")
-# What a correctly constructed arm reports (point: explicit 0.0; patch: argument omitted).
-EXPECTED_LAW = {
-    "patch": {"friction_anchor_beta": 0.2, "anchors_enabled": True, "beta_source": "default", "requested": None},
-    "point": {"friction_anchor_beta": 0.0, "anchors_enabled": False, "beta_source": "argument", "requested": 0.0},
-}
+LAWS = ("patch",)
+# What a correctly constructed arm reports: the argument omitted, the default gain.
+EXPECTED_LAW = {"patch": {"friction_anchor_beta": 0.2, "beta_source": "default", "requested": None}}
 CLUTTER = ("hardware", "coins", "dishes", "cube")
 SCENES = (*CLUTTER, "pyramid")
 # Container interiors in the container body frame (half extents [m]; the body origin is the floor's bottom plane).
@@ -120,9 +116,8 @@ def with_diagnostics(solver_class, kwargs: dict, **fields) -> dict:
 
 @contextlib.contextmanager
 def inject_law(law: str, record: dict):
-    """Swap ``newton.solvers.SolverFeatherPGS`` for a subclass that changes only ``friction_anchor_beta``.
-
-    point passes ``friction_anchor_beta=0.0``; patch omits the argument so Newton's default applies.
+    """Swap ``newton.solvers.SolverFeatherPGS`` for a subclass that omits ``friction_anchor_beta``, so Newton's
+    default applies.
     Records the constructor kwargs, its wall time and every warning it raised.
     """
     if law not in LAWS:
@@ -134,8 +129,6 @@ def inject_law(law: str, record: dict):
     class LawSolver(base):
         def __init__(self, model, *args, **kwargs):
             record["caller_friction_anchor_beta"] = plain(kwargs.pop("friction_anchor_beta", "omitted"))
-            if law == "point":
-                kwargs["friction_anchor_beta"] = 0.0
             if AUDIT:
                 kwargs = with_diagnostics(base, kwargs, audit=True)
             record["kwargs"] = {name: plain(value) for name, value in kwargs.items()}

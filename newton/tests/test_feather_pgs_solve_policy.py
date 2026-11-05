@@ -5,7 +5,7 @@
 
 These host tests build kernels and records without a GPU. Every vote of every
 factory reads the law's rounding floor, under every policy; the default policy
-builds exactly the kernels of a policy-less call, and the point-stream pins
+builds exactly the kernels of a policy-less call, and the kernel pins
 check the whole inventory.
 """
 
@@ -51,8 +51,8 @@ from newton._src.solvers.feather_pgs.solve_policy import (
 )
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
+from newton.tests.test_feather_pgs_kernel_pins import _kernel_hash
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
-from newton.tests.test_feather_pgs_point_streams import _kernel_hash
 
 SWEEPS = SolvePolicy(readout="sweeps")
 TRACE = SolvePolicy(readout="trace")
@@ -104,7 +104,7 @@ def _factory_calls():
         (
             "paired",
             sweep_routes_local.paired_factor_kernel.__wrapped__,
-            (192, 29, 23, 6, "120", False, True),
+            (192, 29, 23, 6, "120", True),
             {"contact_units": True},
         ),
         (
@@ -175,13 +175,13 @@ def _vote_census():
             "paired",
             sweep_routes_local.paired_factor_kernel.__wrapped__,
             (192, 29, 23, 6, "120"),
-            (_axis("contact_triples"), _axis("independent_components"), _axis("contact_units")),
+            (_axis("independent_components"), _axis("contact_units")),
         ),
         (
             "sparse_diagonal",
             sweep_routes_diag.sparse_diagonal_kernel.__wrapped__,
             (64, 10, 9, "120"),
-            (_axis("contact_triples"), _axis("speculative_contact_batches"), _axis("contact_units")),
+            (_axis("speculative_contact_batches"), _axis("contact_units")),
         ),
     )
     for name, factory, args, axes in specs:
@@ -459,8 +459,8 @@ class TestExitLaw(unittest.TestCase):
                 "sparse": 40,
                 "sparse_lanes": 16,
                 "mf_gs": 48,
-                "paired": 6,
-                "sparse_diagonal": 5,
+                "paired": 4,
+                "sparse_diagonal": 3,
             },
         )
 

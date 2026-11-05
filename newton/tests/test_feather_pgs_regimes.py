@@ -263,7 +263,7 @@ class TestQ03GapLaw(unittest.TestCase):
 
     def _push(self, depth, *, cap=None, prismatic=False):
         model = _free_box(z=0.1 - depth, gravity=(0.0, 0.0, 0.0), cap=cap, prismatic=prismatic)
-        _solver, state = _roll(model, 1, pgs_iterations=24, friction_anchor_beta=0.0)
+        _solver, state = _roll(model, 1, pgs_iterations=24)
         return float(state.joint_qd.numpy()[2 if not prismatic else 0])
 
     def test_uncapped_on_both_stores(self):
@@ -307,7 +307,7 @@ class TestQ04Restitution(unittest.TestCase):
         def each(state, solver, contacts, step):
             history.append(float(state.joint_qd.numpy()[2]))
 
-        _roll(model, 120, each=each, friction_anchor_beta=0.0, **options)
+        _roll(model, 120, each=each, **options)
         v = np.asarray(history)
         turn = int(np.argmax(v > -1.0e-4)) if np.any(v > -1.0e-4) else None
         self.assertIsNotNone(turn)
@@ -340,7 +340,7 @@ class TestQ04Restitution(unittest.TestCase):
         def setup(state):
             _set_qd(state, {0: 1.0})
 
-        _solver, state = _roll(model, 60, setup=setup, friction_anchor_beta=0.0, restitution_velocity_threshold=0.01)
+        _solver, state = _roll(model, 60, setup=setup, restitution_velocity_threshold=0.01)
         speeds = state.joint_qd.numpy()[[0, 6, 12]]
         np.testing.assert_allclose(speeds, [0.0, 0.0, 1.0], atol=0.02)
 
@@ -430,7 +430,7 @@ class TestQ07Rolling(unittest.TestCase):
         model = _sphere_world(
             radius, spheres=[(0.0, 0.0, radius)], restitution=0.0, gravity=(0.0, 0.0, -G0), mu=0.3, gap=0.005
         )
-        _solver, state = _roll(model, 240, setup=lambda state: _set_qd(state, {0: v0}), friction_anchor_beta=0.0)
+        _solver, state = _roll(model, 240, setup=lambda state: _set_qd(state, {0: v0}))
         self.assertAlmostEqual(float(state.joint_qd.numpy()[0]), refs.rolling_speed(v0, 0.4), delta=0.02 * v0)
 
     def _disc(self, density=7800.0):
@@ -446,22 +446,15 @@ class TestQ07Rolling(unittest.TestCase):
     def test_disc_slides_to_two_thirds(self):
         model, _radius = self._disc()
         v0 = 0.3
-        _solver, state = _roll(model, 240, setup=lambda state: _set_qd(state, {0: v0}), friction_anchor_beta=0.0)
+        _solver, state = _roll(model, 240, setup=lambda state: _set_qd(state, {0: v0}))
         self.assertAlmostEqual(float(state.body_qd.numpy()[0, 0]), refs.rolling_speed(v0, 0.5), delta=0.03 * v0)
 
     def test_rolling_keeps_its_speed(self):
-        """A rolling disc has no drag, under either friction law."""
-        for beta in (0.0, 0.2):
-            with self.subTest(beta=beta):
-                model, radius = self._disc()
-                v0 = 0.1
-                _solver, state = _roll(
-                    model,
-                    480,
-                    setup=lambda state, v0=v0, radius=radius: _set_qd(state, {0: v0, 4: v0 / radius}),
-                    friction_anchor_beta=beta,
-                )
-                self.assertAlmostEqual(float(np.linalg.norm(state.body_qd.numpy()[0, :2])), v0, delta=0.02 * v0)
+        """A rolling disc has no drag: the stick holds the contact point, not the rolling."""
+        model, radius = self._disc()
+        v0 = 0.1
+        _solver, state = _roll(model, 480, setup=lambda state: _set_qd(state, {0: v0, 4: v0 / radius}))
+        self.assertAlmostEqual(float(np.linalg.norm(state.body_qd.numpy()[0, :2])), v0, delta=0.02 * v0)
 
 
 class TestQ08Tipping(unittest.TestCase):
@@ -469,7 +462,7 @@ class TestQ08Tipping(unittest.TestCase):
 
     WIDTH, HEIGHT, TALL = 0.2, 0.4, 0.2
 
-    def _tilt(self, fraction, beta):
+    def _tilt(self, fraction):
         half = (self.WIDTH / 2.0, self.WIDTH / 2.0, self.TALL)
         model = _free_box(half=half, mu=2.0, gap=0.005, density=1000.0)
         mass = float(model.body_mass.numpy()[0])
@@ -479,16 +472,14 @@ class TestQ08Tipping(unittest.TestCase):
         def before(state, step):
             state.body_f.assign([[force, 0.0, 0.0, 0.0, torque, 0.0]])
 
-        _solver, state = _roll(model, 120, before=before, friction_anchor_beta=beta)
+        _solver, state = _roll(model, 120, before=before)
         quat = state.body_q.numpy()[0, 3:]
         return 2.0 * math.atan2(float(quat[1]), float(quat[3]))
 
     def test_threshold(self):
-        """It holds at 95% of the force and goes over at 105%, under either friction law."""
-        for beta in (0.0, 0.2):
-            with self.subTest(beta=beta):
-                self.assertLess(abs(self._tilt(0.95, beta)), 2.0e-3)
-                self.assertGreater(self._tilt(1.05, beta), 2.0e-2)
+        """It holds at 95% of the force and goes over at 105%."""
+        self.assertLess(abs(self._tilt(0.95)), 2.0e-3)
+        self.assertGreater(self._tilt(1.05), 2.0e-2)
 
 
 class TestQ09Gyroscopic(unittest.TestCase):
@@ -620,7 +611,7 @@ class TestQ10MassRatio(unittest.TestCase):
             q = state.body_q.numpy()
             worst[0] = min(worst[0], float(q[1, 2] - q[0, 2]) - 0.1)
 
-        _roll(model, 240, each=each, pgs_iterations=sweeps, friction_anchor_beta=0.0)
+        _roll(model, 240, each=each, pgs_iterations=sweeps)
         return -worst[0]
 
     @staticmethod
@@ -649,7 +640,7 @@ class TestQ10MassRatio(unittest.TestCase):
             if tilt < 5.0:
                 worst["overlap"] = max(worst["overlap"], 0.1 - (q[-1, 2] - q[-2, 2]))
 
-        _roll(model, 240, each=each, pgs_iterations=sweeps, friction_anchor_beta=0.0)
+        _roll(model, 240, each=each, pgs_iterations=sweeps)
         return worst["sink"], worst["overlap"], worst["tilt"]
 
     def test_ratio_within_the_budget(self):
@@ -657,13 +648,19 @@ class TestQ10MassRatio(unittest.TestCase):
         self.assertLess(self._overlap(12.0, 24), 1.0e-3)
 
     def test_overlap_scale(self):
-        """Inside the limit the overlap follows ``(ratio / N)^2``, about 0.1 mm at ``ratio = N``."""
+        """Inside the limit the overlap follows ``5e-5 (ratio / N)^1.4`` [m], about 0.05 mm at ``ratio = N``, and stays
+        under the rigid bound ``3e-4 (ratio / N)^2``.
+
+        The scale is the friction law's, measured over mass ratios 3 to 100 at 12 to 96 sweeps (each point within a
+        factor 2.2 of it inside the budget): the stick holds the light box, so the overlap grows more slowly with
+        ``ratio / N`` than the bound.
+        """
         for ratio, sweeps in ((10.0, 24), (30.0, 24), (100.0, 24), (30.0, 96), (100.0, 96)):
             with self.subTest(ratio=ratio, sweeps=sweeps):
-                scale = 1.0e-4 * (ratio / sweeps) ** 2
+                scale = 5.0e-5 * (ratio / sweeps) ** 1.4
                 overlap = self._overlap(ratio, sweeps)
                 self.assertGreater(overlap, 0.3 * scale)
-                self.assertLess(overlap, 3.0 * scale)
+                self.assertLess(overlap, 3.0e-4 * (ratio / sweeps) ** 2)
 
     @known_failure(
         "H: heavy on light, the load-path rows",
@@ -698,9 +695,7 @@ class TestQ11Stack(unittest.TestCase):
             builder.add_shape_box(body, hx=half, hy=half, hz=half, cfg=cfg)
         builder.add_ground_plane(cfg=cfg)
         model = builder.finalize(device=DEVICE)
-        solver, state = _roll(
-            model, 120, pgs_iterations=sweeps, friction_anchor_beta=0.0, mf_max_constraints=12 * count + 12
-        )
+        solver, state = _roll(model, 120, pgs_iterations=sweeps, mf_max_constraints=12 * count + 12)
         mass = float(model.body_mass.numpy()[0])
         counts = int(solver.placement.mf_constraint_count.numpy()[0])
         lam = solver.placement.impulses.numpy()[:, solver.placement.body_base :][0, :counts]
@@ -787,16 +782,6 @@ class TestQ19Wall(unittest.TestCase):
         self.assertLess(creep, 1.0e-3)
         self.assertEqual(crossed, 0)
 
-    @known_failure(
-        "F: friction, decided with the one-wrench verdict",
-        "velocity-level point friction creeps at any budget, until coins pass through each other",
-    )
-    def test_point_friction_holds_the_wall(self):
-        """Point friction holds it too: nothing about the law of a contact at rest permits creep."""
-        creep, crossed = self._wall(0.0)
-        self.assertLess(creep, 1.0e-3, (creep, crossed))
-        self.assertEqual(crossed, 0, (creep, crossed))
-
 
 class TestQ12Chain(unittest.TestCase):
     """Q12: a chain's factor in every configuration, not only the one it was built at. The walk's pivots stay positive
@@ -882,7 +867,7 @@ class TestQ13Indeterminate(unittest.TestCase):
 
     def test_rest_and_total_force(self):
         model = _free_box(half=(0.2, 0.1, 0.02), gap=0.005)
-        solver, state = _roll(model, 240, friction_anchor_beta=0.0)
+        solver, state = _roll(model, 240)
         v = state.body_qd.numpy()[0]
         self.assertLess(float(np.abs(v).max()), 1.0e-3)
         count = int(solver.placement.mf_constraint_count.numpy()[0])
@@ -934,9 +919,7 @@ class TestQ15Speculative(unittest.TestCase):
                 )
                 model = builder.finalize(device=DEVICE)
                 steps = round(0.4 / speed / H) + 4
-                _solver, state = _roll(
-                    model, steps, setup=lambda state, speed=speed: _set_qd(state, {0: speed}), friction_anchor_beta=0.0
-                )
+                _solver, state = _roll(model, steps, setup=lambda state, speed=speed: _set_qd(state, {0: speed}))
                 surface = -thickness / 2.0 - radius
                 x = float(state.body_q.numpy()[0, 0])
                 self.assertAlmostEqual(x, surface, delta=1.0e-3)
@@ -1074,7 +1057,7 @@ def _tangent_basis(n):
 
 @dataclasses.dataclass(frozen=True)
 class FrictionUnit:
-    """The friction rows one law writes: a contact's under point friction, a region's anchor under patch friction.
+    """The friction rows the law writes: a region's anchor.
 
     ``carrier`` is the contact that holds the rows (its normal gives the tangent pair), ``members`` the contacts whose
     normal impulses pool into the unit's capacity, ``share`` its part of that pool, ``point`` [m] where its tangent
@@ -1088,13 +1071,8 @@ class FrictionUnit:
     arm: float = 0.0
 
 
-def point_units(count):
-    """Point friction: every contact is a unit at its own point, on its own load."""
-    return [FrictionUnit(c, (c,)) for c in range(count)]
-
-
 def patch_units(solver, count):
-    """Patch friction's units on the step ``solver`` took (its patch view): each region's anchor at its friction
+    """The law's units on the step ``solver`` took (its patch view): each region's anchor at its friction
     location, on its region's pooled normal impulse, with its region's spin arm."""
     view = solver.laws.friction_patches.view
     weight, ring = view.weight.numpy()[:count], view.next_contact.numpy()[:count]
@@ -1128,9 +1106,8 @@ class Manufactured:
     mu, s / mu_t)| <= share load``, and slides with maximal dissipation, ``f = -share load D^2 u / |D u|`` for ``D =
     diag(mu, mu, mu_t)``:
 
-    - point friction: one unit per contact, at its contact point, on its own load (:func:`point_units`);
-    - patch friction: one unit per region, at its friction location, on its region's pooled load, with ``mu_t = mu
-      arm`` (:func:`patch_units`). Regions and locations are the law's geometry and are read from the step; the rows on
+    one unit per region, at its friction location, on its region's pooled load, with ``mu_t = mu arm``
+    (:func:`patch_units`). Regions and locations are the law's geometry and are read from the step; the rows on
       them, the pooled cone and the solution are the reference's own.
 
     ``J`` and ``M`` come from Newton's public :func:`newton.eval_jacobian` and :func:`newton.eval_mass_matrix`, ``b``
@@ -1150,7 +1127,7 @@ class Manufactured:
 
     SEPARATED, STICKING, SLIDING = 0, 1, 2
 
-    def __init__(self, model, state, contacts, dt, rng, *, beta=0.2, units=None, spin=False, loaded=2.0 / 3.0):
+    def __init__(self, model, state, contacts, dt, rng, *, units, beta=0.2, spin=False, loaded=2.0 / 3.0):
         self.model, self.state, self.contacts, self.dt, self.beta, self.spin = model, state, contacts, dt, beta, spin
         self.count = int(contacts.rigid_contact_count.numpy()[0])
         self._read_model()
@@ -1163,7 +1140,7 @@ class Manufactured:
         self.draw_gap = rng.uniform(0.01, 0.05, self.count)
         # A unit whose carrier is separated still holds its region's pooled load: it slides or sticks by this draw.
         self.draw_slides = rng.uniform(size=self.count) < 0.5
-        self.units = point_units(self.count) if units is None else list(units)
+        self.units = list(units)
         # The second pass reads the gaps the first pass's margins hold.
         for _ in range(2):
             self._solve()
@@ -1506,20 +1483,18 @@ class Manufactured:
 class ManufacturedScene:
     """A scene settled through a route, where Q18 states its problems: one settle serves every seed.
 
-    ``law`` is ``"point"`` or ``"patch"`` friction (``friction_anchor_beta`` 0 or 0.2), ``spin`` contact torsion at
-    :data:`TORSION`, ``loaded`` the probability that a contact is loaded. A step at the settled pose says whether the
+    ``spin`` is contact torsion at :data:`TORSION`, ``loaded`` the probability that a contact is loaded. A step at the settled pose says whether the
     placement keeps its rows (``held``) and gives the patch units: the problem's margins keep every contact point, so
     the solve's step must hold the same locations."""
 
-    def __init__(self, scene, route, device, *, settle, law="point", spin=False, loaded=2.0 / 3.0, sweeps=1024):
-        self.scene, self.route, self.device, self.law, self.spin, self.loaded = scene, route, device, law, spin, loaded
+    def __init__(self, scene, route, device, *, settle, spin=False, loaded=2.0 / 3.0, sweeps=1024):
+        self.scene, self.route, self.device, self.spin, self.loaded = scene, route, device, spin, loaded
         self.model = scene.build(device)
         if spin:
             self.model.shape_material_mu_torsional.fill_(TORSION)
         options = {**conformance.BASE_OPTIONS, **scene.solver_options, **route.options}
         options.update(
             {
-                "friction_anchor_beta": 0.2 if law == "patch" else 0.0,
                 "contact_torsion": spin,
                 "pgs_iterations": sweeps,
                 "diagnostics": SolverFeatherPGS.Diagnostics(audit=True),
@@ -1551,7 +1526,7 @@ class ManufacturedScene:
             probe = self._step(np.zeros(self.model.joint_dof_count))
             self.held = bool(np.isfinite(probe.read_audit()["gap"]).all())
             count = int(self.contacts.rigid_contact_count.numpy()[0])
-            self.units = patch_units(probe, count) if law == "patch" else None
+            self.units = patch_units(probe, count)
 
     def _step(self, qd):
         """A fresh solver's step from the settled pose at ``qd``, over the current contacts."""
@@ -1602,7 +1577,6 @@ class ManufacturedScene:
         qd = np.zeros(problem.dofs)
         # v_hat moves with qd by M^-1 (M - K): a drive's force reads qd. Newton on that map reaches v_hat in a few steps.
         response = problem.M - np.diag(problem.stiffness)
-        problem.drift = 0.0
         with conformance.route_context(self.route), wp.ScopedDevice(self.device):
             for _ in range(4):
                 problem.apply()
@@ -1610,19 +1584,15 @@ class ManufacturedScene:
                 miss = problem.v_hat - final.v_hat.numpy().astype(np.float64)
                 qd += np.linalg.solve(response, problem.M @ miss)
             problem.predictor_miss = float(np.abs(miss).max())
-            if self.law == "patch":
-                units = patch_units(final, problem.count)
-                if [(u.carrier, u.members, u.share) for u in units] != [
-                    (u.carrier, u.members, u.share) for u in problem.units
-                ]:
-                    raise RuntimeError("the patch regions changed with the margins")
-                problem.drift = max(
-                    (
-                        float(np.abs(np.subtract(u.point, v.point)).max())
-                        for u, v in zip(units, problem.units, strict=True)
-                    ),
-                    default=0.0,
-                )
+            units = patch_units(final, problem.count)
+            if [(u.carrier, u.members, u.share) for u in units] != [
+                (u.carrier, u.members, u.share) for u in problem.units
+            ]:
+                raise RuntimeError("the patch regions changed with the margins")
+            problem.drift = max(
+                (float(np.abs(np.subtract(u.point, v.point)).max()) for u, v in zip(units, problem.units, strict=True)),
+                default=0.0,
+            )
         problem.offsets, problem.tangent_offset = problem.held_offsets(final)
         return problem, final
 
@@ -1664,7 +1634,7 @@ def check_regular(case, prepared, seed, *, audit=True):
         case.assertLess(float(np.nanmax(reading["violation"])), 1.0e-4)
 
 
-def check_regular_scenes(case, entries, route, device, *, law="point", spin=False, count=3):
+def check_regular_scenes(case, entries, route, device, *, spin=False, count=3):
     """Choose ``count`` regular seeds on each scene's own settled pose and check each (:func:`check_regular`).
 
     An entry is ``(build, settle)`` or ``(build, settle, loaded)``."""
@@ -1672,13 +1642,13 @@ def check_regular_scenes(case, entries, route, device, *, law="point", spin=Fals
         scene = build()
         with wp.ScopedDevice(device):
             prepared = ManufacturedScene(
-                scene, route, device, settle=settle, law=law, spin=spin, loaded=loaded[0] if loaded else 2.0 / 3.0
+                scene, route, device, settle=settle, spin=spin, loaded=loaded[0] if loaded else 2.0 / 3.0
             )
             seeds = prepared.seeds(count)
-        with case.subTest(scene=scene.name, route=route.name, law=law, spin=spin):
+        with case.subTest(scene=scene.name, route=route.name, spin=spin):
             case.assertEqual(len(seeds), count, f"{len(seeds)} regular seeds of {SCAN}")
         for seed in seeds:
-            with case.subTest(scene=scene.name, route=route.name, law=law, spin=spin, seed=seed):
+            with case.subTest(scene=scene.name, route=route.name, spin=spin, seed=seed):
                 with wp.ScopedDevice(device):
                     check_regular(case, prepared, seed, audit=device == "cpu")
 
@@ -1700,8 +1670,6 @@ class TestQ18Manufactured(unittest.TestCase):
     )
     """``(build, settle[, loaded])``: the gripper's twelve contacts a world act on nine coordinates, so it needs fewer
     loaded contacts for a regular pattern (:data:`SPARSE`)."""
-    PATCH_SCENES = ((scenes.box_drop, 60), (scenes.box_stack, 60), (scenes.gripper, 60, SPARSE), (scenes.hand, 30))
-    """Scenes whose regions hold several contacts, where patch rows differ from point rows."""
     SPIN_SCENES = (
         (scenes.box_drop, 60, SPARSE),
         (scenes.legged, 30, SPARSE),
@@ -1710,15 +1678,17 @@ class TestQ18Manufactured(unittest.TestCase):
     )
     """Scenes with sphere feet, fingertips and flat faces, where spin rows carry load; a spin row per unit needs fewer
     loaded contacts for a regular pattern."""
-    PATCH_SPIN_SCENES = ((scenes.box_drop, 60, SPARSER), (scenes.box_stack, 60, SPARSER))
+    BOX_SPIN_SCENES = ((scenes.box_drop, 60, SPARSER), (scenes.box_stack, 60, SPARSER))
+    """Boxes, whose faces hold a region's footprint: spin rows on every unit need the sparsest loading."""
     IRREGULAR_SCENES = (
-        (scenes.box_drop, 60, (("point", False), ("patch", True))),
-        (scenes.box_stack, 60, (("point", False), ("patch", False))),
-        (scenes.legged, 30, (("point", True),)),
-        (scenes.gripper, 60, (("point", False), ("patch", False))),
-        (scenes.hand, 30, (("point", False), ("patch", False))),
+        (scenes.box_drop, 60, (True,)),
+        (scenes.box_stack, 60, (False,)),
+        (scenes.legged, 30, (True,)),
+        (scenes.gripper, 60, (False,)),
+        (scenes.hand, 30, (False,)),
     )
-    """Irregular patterns under each law: a second solution where the step finds one (legged, the hand, the stack)."""
+    """Irregular patterns, with spin rows or without: a second solution where the step finds one (legged, the hand, the
+    stack)."""
     TOLERANCE = 1.0e-4
     """A contact point's speed error [m/s]: float32 on velocities of order 0.1 m/s, at a budget that converges."""
     HELD_B = 2.0**-21
@@ -1727,33 +1697,29 @@ class TestQ18Manufactured(unittest.TestCase):
     """How far a patch location may still move over the last solve [m]: the reference states the rows the step held."""
 
     def test_the_core_returns_the_solution(self):
-        """Separated, sticking and sliding contacts on free bodies, trees and forests, under point friction."""
+        """Separated, sticking and sliding contacts on free bodies, trees and forests: anchors at their regions'
+        friction locations, on shares of pooled loads."""
         check_regular_scenes(self, self.SCENES, conformance.CPU, DEVICE)
 
-    def test_patch_rows_return_the_solution(self):
-        """Patch friction: anchors at their regions' friction locations, on shares of pooled loads."""
-        check_regular_scenes(self, self.PATCH_SCENES, conformance.CPU, DEVICE, law="patch")
-
     def test_spin_rows_return_the_solution(self):
-        """Contact torsion: each unit's pair and spin row on their elliptic cone, under point and patch friction."""
-        check_regular_scenes(self, self.SPIN_SCENES, conformance.CPU, DEVICE, spin=True)
-        check_regular_scenes(self, self.PATCH_SPIN_SCENES, conformance.CPU, DEVICE, law="patch", spin=True)
+        """Contact torsion: each unit's pair and spin row on their elliptic cone."""
+        check_regular_scenes(self, self.SPIN_SCENES + self.BOX_SPIN_SCENES, conformance.CPU, DEVICE, spin=True)
 
     def test_irregular_patterns_solve_the_stated_problem(self):
         """A pattern that is not regular leaves the impulses open (coplanar loaded normals, redundant sticks) and can
         admit a second solution: sliding friction on an open split, or another status. It is judged on what any solution
         must hold, never on ``lambda``: the step's ``v+`` with its stored impulses solves the stated rows, and those
         impulses through the stated rows are the total force that moved it (:meth:`Manufactured.residual`)."""
-        for build, settle, laws in self.IRREGULAR_SCENES:
+        for build, settle, spins in self.IRREGULAR_SCENES:
             scene = build()
-            for law, spin in laws:
+            for spin in spins:
                 with wp.ScopedDevice(DEVICE):
-                    prepared = ManufacturedScene(scene, conformance.CPU, DEVICE, settle=settle, law=law, spin=spin)
+                    prepared = ManufacturedScene(scene, conformance.CPU, DEVICE, settle=settle, spin=spin)
                     seeds = prepared.seeds(2, regular=False)
-                with self.subTest(scene=scene.name, law=law, spin=spin):
+                with self.subTest(scene=scene.name, spin=spin):
                     self.assertEqual(len(seeds), 2, f"{len(seeds)} irregular seeds of {SCAN}")
                 for seed in seeds:
-                    with self.subTest(scene=scene.name, law=law, spin=spin, seed=seed), wp.ScopedDevice(DEVICE):
+                    with self.subTest(scene=scene.name, spin=spin, seed=seed), wp.ScopedDevice(DEVICE):
                         problem, solver = prepared.solve(seed)
                         self.assertLess(np.abs(problem.offsets).max(), self.HELD_B / scene.dt)
                         self.assertLess(problem.tangent_offset, self.HELD_B / scene.dt)
@@ -1768,7 +1734,7 @@ class TestQ18ManufacturedCUDA(unittest.TestCase):
 
     PLACEMENTS = (
         (scenes.box_stack, 60, 2.0 / 3.0, ("MF_HELD", "MF_DEFAULT")),
-        (scenes.legged, 30, 2.0 / 3.0, ("MF_HELD", "SPARSE", "SPARSE_TRIPLETS")),
+        (scenes.legged, 30, 2.0 / 3.0, ("MF_HELD", "SPARSE")),
         (scenes.gripper, 60, SPARSE, ("MF_DEFAULT", "MF_FOREST")),
         (scenes.keyboard, 30, 2.0 / 3.0, ("SPARSE_DIAGONAL", "SPARSE_DIAGONAL_TREE", "COMPACT_BOUNDARY")),
         (scenes.hand, 30, 2.0 / 3.0, ("PAIRED", "PAIRED_FOREST")),
@@ -1777,22 +1743,17 @@ class TestQ18ManufacturedCUDA(unittest.TestCase):
     TIERS = ("MF_PARALLEL", "KEYED_PARALLEL")
     """The Jacobi tiers (K4), on legged."""
 
-    def _placements(self, law, spin, count):
+    def _placements(self, spin, count):
         for build, settle, loaded, names in self.PLACEMENTS:
             entry = (build, settle, min(loaded, SPARSE) if spin else loaded)
             for name in names:
-                check_regular_scenes(
-                    self, (entry,), getattr(conformance, name), "cuda:0", law=law, spin=spin, count=count
-                )
+                check_regular_scenes(self, (entry,), getattr(conformance, name), "cuda:0", spin=spin, count=count)
 
     def test_every_placement_returns_the_solution(self):
-        self._placements("point", False, 3)
-
-    def test_every_placement_holds_patch_rows(self):
-        self._placements("patch", False, 1)
+        self._placements(False, 3)
 
     def test_every_placement_holds_spin_rows(self):
-        self._placements("point", True, 1)
+        self._placements(True, 1)
 
     @known_failure(
         "E2: the Jacobi tiers' momentum on a sliding Coulomb face (K4)",

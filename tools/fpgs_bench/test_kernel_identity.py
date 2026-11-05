@@ -189,7 +189,7 @@ class TestKernelIdentity(unittest.TestCase):
         """Record every kernel of the held-tree owner's scalar-branch group in the pins family.
 
         They are module-level kernels without a tree layout, so the held-tree
-        layout grid builds none of them; the point-stream pin inventory holds
+        layout grid builds none of them; the kernel-pin inventory holds
         them, and an identity diff compares their generated code there.
         """
         from newton._src.solvers.feather_pgs import scalar_branches  # noqa: PLC0415
@@ -211,12 +211,12 @@ class TestKernelIdentity(unittest.TestCase):
         self.assertEqual(identity.label("f", (1, "120"), {"b": True, "a": layout}), "f(1, '120', a=chain9, b=True)")
 
     def test_hash_column_is_the_pinned_content_hash(self):
-        """Record a kernel's point-stream pin as its hash, beside its CUDA and CPU code digests."""
+        """Record a kernel's kernel pin as its hash, beside its CUDA and CPU code digests."""
         import warp as wp  # noqa: PLC0415
 
-        pins = Path(__file__).resolve().parents[2] / "newton/tests/golden_data/test_feather_pgs_point_streams/pins.json"
+        pins = Path(__file__).resolve().parents[2] / "newton/tests/golden_data/test_feather_pgs_kernel_pins/pins.json"
         record = json.loads(pins.read_text(encoding="utf-8"))
-        # As the point-stream test: the pins use Warp's private hasher of one version and no switches.
+        # As the kernel-pin test: the pins use Warp's private hasher of one version and no switches.
         if record["warp"] != wp.config.version:
             self.skipTest(f"Pins use Warp's private ModuleHasher of {record['warp']}; running Warp {wp.config.version}")
         if identity._switches():

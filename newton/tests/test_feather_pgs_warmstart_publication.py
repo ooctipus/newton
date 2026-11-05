@@ -68,7 +68,7 @@ class TestWarmStartPublication(unittest.TestCase):
 
     def _balance(self, route: conf.Route, device, *, warm: bool, context=contextlib.nullcontext) -> float:
         scene = resting_boxes()
-        options = {"pgs_iterations": 16, "friction_anchor_beta": 0.0}
+        options = {"pgs_iterations": 16}
         if warm:
             options["pgs_warmstart"] = True
         with context():

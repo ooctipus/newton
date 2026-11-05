@@ -13,9 +13,8 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import row_slots
-from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import contact_input
+from newton.tests.feather_pgs_law_harness import anchored_patches, contact_input
 
 
 def _allocator_arrays(capacity, *, route=0, count=205, device="cpu"):
@@ -55,7 +54,7 @@ def _allocator_arrays(capacity, *, route=0, count=205, device="cpu"):
         "enable_friction": 1,
         "contact_friction_gap_threshold": float("inf"),
         "row_capacity_telemetry": 0,
-        "friction_patches": FrictionPatches(),
+        "friction_patches": anchored_patches(length, device),
         "resolved_worlds": wp.empty(0, dtype=wp.int32, device=device),
         "contact_world": zeros(length),
         "contact_slot": integers([-9] * length),
@@ -180,7 +179,6 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 dense_max_constraints=capacity,
                 pgs_iterations=8,
                 angular_damping=0.0,
-                friction_anchor_beta=0.0,
             )
             state_in, state_out = model.state(), model.state()
             newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)

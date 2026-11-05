@@ -85,7 +85,6 @@ def _mixed_solver(model, *, forest=False, lanes=None, **options):
         "pgs_iterations": 8,
         "enable_joint_limits": True,
         "update_mass_matrix_interval": 2,
-        "friction_anchor_beta": 0.0,
         **options,
     }
     with (
@@ -109,7 +108,7 @@ def _owned_case(name, device, **options):
         model = _build(device, worlds=4, prescribed=True)
         return model, _mixed_solver(model, forest=True, **options)
     model = _build_model()
-    return model, _make_solver(model, True, **{"friction_anchor_beta": 0.0, **options})
+    return model, _make_solver(model, True, **{**options})
 
 
 class _Rollout:
@@ -183,7 +182,7 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         frames, so the FK/ID cache is invalidated.
         """
         model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
+        solver = SolverFeatherPGS(model)
         owner = solver.factor.held
         self.assertIsInstance(owner, HeldTree)
         validity_arrays = [solver.factor.fk_id_cache_valid, *(group.geometry_valid for group in owner.groups)]
@@ -265,7 +264,7 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         old frame.
         """
         model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
+        solver = SolverFeatherPGS(model)
         owner = solver.factor.held
         self.assertIsInstance(owner, HeldTree)
         validity_arrays = [solver.factor.fk_id_cache_valid, *(group.geometry_valid for group in owner.groups)]
@@ -447,7 +446,7 @@ def _cpu_owner(*, motion_velocity=False, worlds=2, pins=None):
     lacks): its groups read prescaled velocities. Each group holds one tree per world.
     """
     model = _build(wp.get_device("cpu"), worlds=worlds)
-    solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
+    solver = SolverFeatherPGS(model)
     solver.options = solver.laws.options = solver.factor.options = solver.placement.options = solver.sweep.options = (
         dataclasses.replace(solver.options, enable_joint_velocity_limits=motion_velocity)
     )
@@ -916,7 +915,7 @@ class TestFeatherPGSRepairLaunches(unittest.TestCase):
                 with self.subTest(owner=name):
                     launched.clear()
                     model = _build(device, worlds=2, speed_limit=0.8 if motion else None)
-                    solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
+                    solver = SolverFeatherPGS(model)
                     solver.options = solver.laws.options = solver.factor.options = solver.placement.options = (
                         solver.sweep.options
                     ) = dataclasses.replace(solver.options, enable_joint_velocity_limits=motion)

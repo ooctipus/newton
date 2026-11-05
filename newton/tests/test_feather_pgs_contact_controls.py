@@ -12,12 +12,12 @@ import newton
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.contact_forces import compute_contact_linear_force_from_impulses
 from newton._src.solvers.feather_pgs.contact_input import ContactInput, ContactRoutes
-from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
+from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED
 from newton._src.solvers.feather_pgs.row_kernels import compute_world_contact_bias
 from newton._src.solvers.feather_pgs.row_records import DenseRows
 from newton._src.solvers.feather_pgs.row_slots import allocate_world_contact_slots
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import row_bias, row_lines
+from newton.tests.feather_pgs_law_harness import anchored_patches, row_bias, row_lines
 
 PATH_DENSE = 0
 PATH_MATRIX_FREE = 1
@@ -95,7 +95,7 @@ def _launch_contact_allocator(
             int(enable_friction),
             friction_gap,
             0,
-            FrictionPatches(),
+            anchored_patches(1, device),
             wp.array([int(resolved)], dtype=wp.int32, device=device),
         ],
         outputs=[
@@ -173,7 +173,7 @@ def _launch_articulation_pair_contact_allocator(
             int(enable_friction),
             friction_gap,
             0,
-            FrictionPatches(),
+            anchored_patches(2, device),
             wp.empty(0, dtype=wp.int32, device=device),
         ],
         outputs=[
@@ -273,11 +273,12 @@ class TestFeatherPGSContactControls(unittest.TestCase):
                 self.assertEqual(skipped["art_a"], 0)
                 self.assertEqual(skipped["art_b"], -1)
                 self.assertEqual(skipped["slot"], -1)
-                self.assertEqual(skipped["path"], -1)
+                # The contact the allocator would give rows takes the resolved path, so the patch finish releases
+                # its anchor.
+                self.assertEqual(skipped["path"], CONTACT_PATH_RESOLVED)
                 self.assertEqual(skipped["slots_needed"], 0)
                 for name in ("dense_count", "mf_count", "dense_dropped", "mf_dropped"):
                     self.assertEqual(skipped[name], 0, name)
-
 
     def test_solver_validates_and_stores_contact_controls(self):
         """Accept finite non-negative controls and reject malformed values."""

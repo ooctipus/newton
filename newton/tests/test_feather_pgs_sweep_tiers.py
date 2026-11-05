@@ -50,7 +50,7 @@ _LAYOUT = KeyedLayout(12, 6, 0, 12, 32, False, 0, None)
 
 def _keyed(linked: bool):
     """The keyed rows' operands as the solver's keyed parallel factory binds them."""
-    return functools.partial(get_direct_parallel_inputs, _LAYOUT, patch=linked)
+    return functools.partial(get_direct_parallel_inputs, _LAYOUT)
 
 
 _INK = {"inkernel_response": (12, 6, 0, 12)}

@@ -175,7 +175,7 @@ class TestTreeKineticStages(unittest.TestCase):
         device = wp.get_device(device)
         for alternate in (False, True):
             model = _build(device, worlds=2, speed_limit=0.8 if alternate else None)
-            solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
+            solver = SolverFeatherPGS(model)
             solver.options = solver.laws.options = solver.factor.options = solver.placement.options = (
                 solver.sweep.options
             ) = dataclasses.replace(solver.options, enable_joint_velocity_limits=alternate)

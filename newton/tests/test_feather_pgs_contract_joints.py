@@ -164,7 +164,7 @@ class TestFeatherPGSD6Law(unittest.TestCase):
                 builder.add_shape_sphere(body, radius=0.05, cfg=newton.ModelBuilder.ShapeConfig(mu=0.5, density=0.0))
                 builder.add_articulation([joint])
                 model = builder.finalize(device=device)
-                solver = SolverFeatherPGS(model, pgs_iterations=32, friction_anchor_beta=0.0, angular_damping=0.0)
+                solver = SolverFeatherPGS(model, pgs_iterations=32, angular_damping=0.0)
                 pipeline = newton.CollisionPipeline(model)
                 contacts = pipeline.contacts()
                 state, other, control = model.state(), model.state(), model.control()

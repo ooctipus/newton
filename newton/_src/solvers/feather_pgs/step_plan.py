@@ -646,7 +646,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
             laws.write_free_body_rhs(solver, step.dt)
 
     # The one writer writes its contact rows' records after the row pass, so the patches link after it there.
-    link = (link_patches,) if laws.friction_anchors_enabled else ()
+    link = (link_patches,)
     add(
         *((classify_resolved_worlds,) if resolved is not None else ()),
         *write_rows,
@@ -705,8 +705,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         sweep.solve(solver.v_hat, solver.v_out)
 
     add(prepare_impulses, *((warm_start,) if route.laws.warm_start else ()), nvtx="S5_PGS_Prep")
-    if route.laws.patch:
-        add(seed_patches)
+    add(seed_patches)
     add(
         *((seed_blocks,) if route.laws.preelimination else ()),
         start_velocity,

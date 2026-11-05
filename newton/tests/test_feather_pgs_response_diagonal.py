@@ -140,7 +140,6 @@ def _run_mixed_response(
     tangential_velocity=0.0,
     static_plane=False,
     contact_regularization=0.0,
-    friction_anchor_beta=None,
     model_kwargs=None,
 ):
     """Run a short mixed-contact trajectory on one route: ``"general"`` pins the general placement (case K6), ``"auto"``
@@ -166,7 +165,6 @@ def _run_mixed_response(
             joint_limit_activation_gap=0.0,
             pgs_iterations=8,
             pgs_contact_regularization=contact_regularization,
-            friction_anchor_beta=friction_anchor_beta,
             dense_max_constraints=dense_max_constraints,
             mf_max_constraints=32,
         )
@@ -428,7 +426,7 @@ def _mark_patch_units(rows, device):
     contacts = rows["contacts"]
     count = len(contacts["slot"])
     sparse_dof = wp.array(rows["sparse_dof"], dtype=wp.int32, device=device)
-    marker = _get_mark_independent_sparse_contact_candidates_kernel(rows["diagonal"], str(device.arch), units=True)
+    marker = _get_mark_independent_sparse_contact_candidates_kernel(rows["diagonal"], str(device.arch))
     if count:
         wp.launch(
             marker,
@@ -729,10 +727,9 @@ def _launch_paired_factor_solve(kernel, rows, device, *, primary, components, it
 
 class TestPairedFactorUnitSource(unittest.TestCase):
     def test_unit_walk_replaces_the_runtime_layout_test(self):
-        """Walk units from each row's type and parent; the triple schedule tests its layout, the general none."""
+        """Walk units from each row's type and parent; neither schedule tests a layout."""
         units = paired_factor_source(192, 29, 23, 6, contact_units=True, independent_components=True)[0]
         general = paired_factor_source(192, 29, 23, 6, independent_components=True)[0]
-        triples = paired_factor_source(192, 29, 23, 6, contact_triples=True, independent_components=True)[0]
         # A unit owns tangent rows only when the next row is a tangent naming it as parent; three
         # normal-only units must not read as one triple, so the walk needs no stride-3 layout test.
         self.assertIn("world_row_parent.data[off + tangent1] == i", units)
@@ -740,16 +737,10 @@ class TestPairedFactorUnitSource(unittest.TestCase):
         for text in ("triple_layout", "s_contact_mu", "% 3"):
             self.assertNotIn(text, units)
         self.assertNotIn("triple_layout", general)
-        self.assertIn("const bool triple_layout = dense_phase_bounds.data[world * 2] == contact_start", triples)
-        with self.assertRaises(ValueError):
-            paired_factor_source(192, 29, 23, 6, contact_triples=True, contact_units=True)[0]
         factory = paired_factor_kernel.__wrapped__
         self.assertEqual(
-            factory(192, 29, 23, 6, "120", False, True, contact_units=True).key,
+            factory(192, 29, 23, 6, "120", True, contact_units=True).key,
             "sweep_paired_factor_192_29_23_6_units_components_walk",
-        )
-        self.assertEqual(
-            factory(192, 29, 23, 6, "120", True, True).key, "sweep_paired_factor_192_29_23_6_contact3_components_walk"
         )
 
 
@@ -892,7 +883,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         lower_lambda = wp.zeros((1, world_dofs), dtype=wp.float32, device=device)
         upper_lambda = wp.zeros_like(lower_lambda)
         velocity = wp.array(initial_velocity, dtype=wp.float32, device=device)
-        kernel = sparse_diagonal_kernel(max_constraints, world_dofs, dense_dofs, str(device.arch), contact_triples=True)
+        kernel = sparse_diagonal_kernel(max_constraints, world_dofs, dense_dofs, str(device.arch), contact_units=True)
         walk = diagonal_walk(inverse_mass[None, :dense_dofs], device, world_dofs)
         wp.launch_tiled(
             kernel,
@@ -912,7 +903,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 wp.zeros(1, dtype=wp.int32, device=device),
                 wp.empty((1, world_dofs), dtype=wp.int32, device=device),
                 wp.zeros(1, dtype=wp.int32, device=device),
-                wp.empty((1, (max_constraints + 2) // 3), dtype=wp.int32, device=device),
+                wp.empty((1, max_constraints), dtype=wp.int32, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
                 walk,
@@ -996,7 +987,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             world_dofs,
             dense_dofs,
             str(device.arch),
-            contact_triples=True,
+            contact_units=True,
             speculative_contact_batches=True,
         )
         walk = diagonal_walk(inverse_mass[None, :dense_dofs], device, world_dofs)
@@ -1054,7 +1045,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "independent contact groups require CUDA")
     def test_independent_sparse_contact_groups_exclude_coupled_coordinates(self):
-        """Keep scalar contacts serial when a coupled contact shares their coordinate."""
+        """Keep scalar contact units serial when a coupled unit shares their coordinate."""
         device = wp.get_device("cuda:0")
         max_constraints, max_world_dofs, contact_count = 12, 4, 4
         sparse_response_dofs = 108
@@ -1067,7 +1058,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         group_count = wp.zeros(1, dtype=wp.int32, device=device)
         group_heads = wp.empty((1, max_world_dofs), dtype=wp.int32, device=device)
         serial_count = wp.zeros(1, dtype=wp.int32, device=device)
-        serial_normals = wp.empty((1, (max_constraints + 2) // 3), dtype=wp.int32, device=device)
+        serial_normals = wp.empty((1, max_constraints), dtype=wp.int32, device=device)
 
         marker = _get_mark_independent_sparse_contact_candidates_kernel(sparse_response_dofs, str(device.arch))
         wp.launch(
@@ -1096,6 +1087,12 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         schedule = _get_build_independent_sparse_contact_groups_kernel(
             max_constraints, max_world_dofs, str(device.arch), build_serial_contacts=True
         )
+        # Four three-row contact units: a normal heading its tangent pair, which names it as parent.
+        heads = np.arange(0, max_constraints, 3)
+        row_type = np.full((1, max_constraints), PGS_CONSTRAINT_TYPE_FRICTION, dtype=np.int32)
+        row_type[0, heads] = PGS_CONSTRAINT_TYPE_CONTACT
+        row_parent = np.repeat(heads, 3)[None, :].astype(np.int32)
+        row_parent[0, heads] = -1
         wp.launch(
             schedule,
             dim=32,
@@ -1103,6 +1100,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 wp.array((max_constraints,), dtype=wp.int32, device=device),
                 row_lines(device),
                 wp.zeros((1, 2), dtype=wp.int32, device=device),
+                wp.array(row_type, device=device),
+                wp.array(row_parent, device=device),
             ],
             outputs=[sparse_row_dof, group_count, group_heads, serial_count, serial_normals],
             device=device,
@@ -1129,9 +1128,9 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         sparse_dof[0, 6, 1] = 4
         sparse_dof[0, 7] = (2, 3)
         launches = {}
-        for units in (False, True):
+        for units in (True,):
             marked = wp.array(sparse_dof, device=device)
-            marker = _get_mark_independent_sparse_contact_candidates_kernel(108, "cpu", units=units)
+            marker = _get_mark_independent_sparse_contact_candidates_kernel(108, "cpu")
             wp.launch(
                 marker,
                 dim=3,
@@ -1159,8 +1158,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             self.assertEqual(marker.key.endswith("_units"), units)
         expected = sparse_dof[0].copy()
         expected[0, 1] = -2
-        # Triples skip the 1-row unit; units mark it in its empty slot.
-        np.testing.assert_array_equal(launches[False], expected)
+        # Units mark the 1-row unit in its empty slot.
         expected[3, 0] = -2
         np.testing.assert_array_equal(launches[True], expected)
 
@@ -1168,16 +1166,11 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         """Name the unit variants and keep speculative batches within sixteen response lanes."""
         solve = sparse_diagonal_kernel(24, 12, 9, "120", contact_units=True)
         batched = sparse_diagonal_kernel(24, 12, 9, "120", contact_units=True, speculative_contact_batches=True)
-        builder = _get_build_independent_sparse_contact_groups_kernel(
-            24, 12, "120", build_serial_contacts=True, units=True
-        )
+        builder = _get_build_independent_sparse_contact_groups_kernel(24, 12, "120", build_serial_contacts=True)
         self.assertEqual(solve.key, "sweep_sparse_diagonal_24_12_9_units")
         self.assertEqual(batched.key, "sweep_sparse_diagonal_24_12_9_speculative_batches_units")
         self.assertEqual(builder.key, "build_independent_sparse_contact_groups_24_12_serial_contacts_units")
-        for kwargs in (
-            {"contact_triples": True, "contact_units": True},
-            {"contact_units": True, "speculative_contact_batches": True, "dense_dofs": 15},
-        ):
+        for kwargs in ({"contact_units": True, "speculative_contact_batches": True, "dense_dofs": 15},):
             dense_dofs = kwargs.pop("dense_dofs", 9)
             with self.subTest(**kwargs), self.assertRaises(ValueError):
                 sparse_diagonal_kernel(24, dense_dofs + 3, dense_dofs, "120", **kwargs)
@@ -1232,7 +1225,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     serial_count = wp.full(worlds, -7, dtype=wp.int32, device=device)
                     serial_heads = wp.full((worlds, capacity), -7, dtype=wp.int32, device=device)
                     schedule = _get_build_independent_sparse_contact_groups_kernel(
-                        capacity, dofs, str(device.arch), build_serial_contacts=serial_contacts, units=True
+                        capacity, dofs, str(device.arch), build_serial_contacts=serial_contacts
                     )
                     wp.launch(
                         schedule,
@@ -1377,7 +1370,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "paired response ownership requires CUDA")
     def test_paired_response_matches_general_23_dof_trajectory(self):
-        """Match the general response when one warp owns a robot/free-body pair, with patch and point friction."""
+        """Match the general response when one warp owns a robot/free-body pair."""
         run_kwargs = {
             "warmstart": False,
             "preelimination": False,
@@ -1388,44 +1381,35 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             "restitution": 0.3,
             "tangential_velocity": 2.0,
         }
-        # Patch friction rows are not uniform triples: the factor sweep walks patch contact units, pooling
-        # the patch load as the generic path does; point friction keeps the contact-triple layout.
-        for label, friction_anchor_beta, triples in (("patch", None, False), ("point", 0.0, True)):
-            with self.subTest(friction=label):
-                reference_solver, reference = _run_mixed_response(
-                    "general", friction_anchor_beta=friction_anchor_beta, **run_kwargs
-                )
-                paired_solver, paired = _run_mixed_response(
-                    "auto", friction_anchor_beta=friction_anchor_beta, **run_kwargs
-                )
+        # The factor sweep walks the contact units, pooling each region's load as the generic path does.
+        reference_solver, reference = _run_mixed_response("general", **run_kwargs)
+        paired_solver, paired = _run_mixed_response("auto", **run_kwargs)
 
-                self.assertIsNone(reference_solver.sweep.paired_response_primary_size)
-                self.assertEqual(paired_solver.laws.friction_anchors_enabled, label == "patch")
-                self.assertEqual(paired_solver.sweep.paired_response_primary_size, 23)
-                self.assertEqual(paired_solver.sweep.paired_response_secondary_size, 6)
-                self.assertIsNotNone(paired_solver.sweep.paired_factor_kernel)
-                self.assertTrue(paired_solver.sweep.paired_factor_coordinates)
-                self.assertEqual(paired_solver.sweep.factor_coordinate_contact_triples, triples)
-                self.assertEqual(paired_solver.sweep.factor_coordinate_contact_units, label == "patch")
-                self.assertEqual("_units" in paired_solver.sweep.paired_factor_kernel.key, label == "patch")
-                self.assertGreater(reference[0][0], 0, "mixed scene generated no dense constraint rows")
-                self.assertTrue(
-                    any(np.any(sample[5] == PGS_CONSTRAINT_TYPE_FRICTION) for sample in paired),
-                    "mixed scene generated no friction rows",
+        self.assertIsNone(reference_solver.sweep.paired_response_primary_size)
+        self.assertEqual(paired_solver.sweep.paired_response_primary_size, 23)
+        self.assertEqual(paired_solver.sweep.paired_response_secondary_size, 6)
+        self.assertIsNotNone(paired_solver.sweep.paired_factor_kernel)
+        self.assertTrue(paired_solver.sweep.paired_factor_coordinates)
+        self.assertTrue(paired_solver.sweep.factor_coordinate_contact_units)
+        self.assertIn("_units", paired_solver.sweep.paired_factor_kernel.key)
+        self.assertGreater(reference[0][0], 0, "mixed scene generated no dense constraint rows")
+        self.assertTrue(
+            any(np.any(sample[5] == PGS_CONSTRAINT_TYPE_FRICTION) for sample in paired),
+            "mixed scene generated no friction rows",
+        )
+        for step, (expected, actual) in enumerate(zip(reference, paired, strict=True)):
+            self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
+            np.testing.assert_array_equal(actual[5], expected[5], err_msg=f"row types differed at step {step}")
+            for label_value, expected_value, actual_value in zip(
+                ("diagonal", "impulses", "joint_q", "joint_qd"), expected[1:5], actual[1:5], strict=True
+            ):
+                np.testing.assert_allclose(
+                    actual_value,
+                    expected_value,
+                    rtol=5.0e-4,
+                    atol=1.0e-5,
+                    err_msg=f"{label_value} differed at step {step}",
                 )
-                for step, (expected, actual) in enumerate(zip(reference, paired, strict=True)):
-                    self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
-                    np.testing.assert_array_equal(actual[5], expected[5], err_msg=f"row types differed at step {step}")
-                    for label_value, expected_value, actual_value in zip(
-                        ("diagonal", "impulses", "joint_q", "joint_qd"), expected[1:5], actual[1:5], strict=True
-                    ):
-                        np.testing.assert_allclose(
-                            actual_value,
-                            expected_value,
-                            rtol=5.0e-4,
-                            atol=1.0e-5,
-                            err_msg=f"{label_value} differed at step {step}",
-                        )
 
     @unittest.skipUnless(wp.is_cuda_available(), "paired response fallback requires CUDA")
     def test_paired_response_falls_back_for_matrix_free_rows(self):
@@ -1477,30 +1461,14 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     mf_max_constraints=32,
                     contact_torsion=torsion,
                 )
-            point = SolverFeatherPGS(
-                model,
-                enable_joint_limits=True,
-                joint_limit_activation_gap=0.0,
-                pgs_iterations=8,
-                dense_max_constraints=96,
-                mf_max_constraints=32,
-                friction_anchor_beta=0.0,
-            )
-        self.assertTrue(solvers[False].laws.friction_anchors_enabled)
         self.assertTrue(solvers[False].sweep.paired_factor_coordinates)
         # Patch rows are not uniform triples; the factor sweep walks patch contact units instead.
-        self.assertFalse(solvers[False].sweep.factor_coordinate_contact_triples)
         self.assertTrue(solvers[False].sweep.factor_coordinate_contact_units)
         self.assertIn("_units", solvers[False].sweep.paired_factor_kernel.key)
         self.assertTrue(solvers[False].get_path_selection()["routes"]["paired_response"]["contact_units"])
-        self.assertFalse(point.laws.friction_anchors_enabled)
-        self.assertTrue(point.sweep.paired_factor_coordinates)
-        self.assertTrue(point.sweep.factor_coordinate_contact_triples)
-        self.assertFalse(point.sweep.factor_coordinate_contact_units)
         self.assertTrue(solvers[True].laws.contact_torsion_enabled)
         self.assertIsNotNone(solvers[True].sweep.paired_response_primary_size)
         self.assertTrue(solvers[True].sweep.paired_factor_coordinates)
-        self.assertFalse(solvers[True].sweep.factor_coordinate_contact_triples)
         self.assertTrue(solvers[True].sweep.factor_coordinate_contact_units)
         self.assertIn("_torsion", solvers[True].sweep.paired_factor_kernel.key)
 

@@ -79,7 +79,7 @@ class TestDepenetrationCap(unittest.TestCase):
     overlap = 0.02
     uncapped = 0.2 * overlap / H
 
-    def _speed(self, store: str, cap: float, *, beta: float = 0.0) -> float:
+    def _speed(self, store: str, cap: float, *, beta: float = 0.2) -> float:
         model = _overlapping_box(store, self.overlap)
         _caps(model, cap)
         state = _roll(model, 1, friction_anchor_beta=beta)
@@ -87,7 +87,7 @@ class TestDepenetrationCap(unittest.TestCase):
 
     def test_cap_holds_on_every_cpu_store(self):
         for store in ("free", "prismatic", "tree"):
-            for beta in (0.0, 0.2):
+            for beta in (0.2,):
                 with self.subTest(store=store, friction_anchor_beta=beta):
                     self.assertAlmostEqual(self._speed(store, 0.5, beta=beta), 0.5, delta=2.0e-4)
 
@@ -146,7 +146,7 @@ class TestOneContactPoint(unittest.TestCase):
 
     def _change(self, store: str, overlap: float) -> tuple[float, float]:
         model = _pressed_pair(store, overlap)
-        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0, angular_damping=0.0, pgs_iterations=64)
+        solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_iterations=64)
         state, out = model.state(), model.state()
         velocity = state.joint_qd.numpy()
         half = model.joint_dof_count // 2
@@ -316,7 +316,7 @@ class TestAngularDampingInThePredictor(unittest.TestCase):
     def test_rolling_contact_holds_at_the_step_end(self):
         for store in ("free", "tree"):
             with self.subTest(store=store):
-                self.assertLess(abs(self._slip(store, 0.0)), 1.0e-3)
+                self.assertLess(abs(self._slip(store, 0.2)), 1.0e-3)
 
     def test_free_spin_keeps_its_decay(self):
         """Decay a free spin by ``1 - a h`` per step, on a body and a tree root."""
@@ -1175,7 +1175,7 @@ class TestDepenetrationCapOnRoutes(unittest.TestCase):
             return model
 
         capped = dataclasses.replace(scene, build=build)
-        options = {"friction_anchor_beta": 0.0 if law == "point" else 0.2, "pgs_iterations": iterations}
+        options = {"friction_anchor_beta": 0.2, "pgs_iterations": iterations}
         run = conformance.simulate(capped, route, "cuda", options=options)
         for path, value in route.expect.items():
             self.assertEqual(conformance.route_value(run.routes, path), value, path)
@@ -1204,7 +1204,7 @@ class TestDepenetrationCapOnRoutes(unittest.TestCase):
             (scenes.hand(), conformance.PAIRED, 16),
         )
         for scene, route, iterations in cases:
-            for law in ("point", "patch"):
+            for law in ("patch",):
                 with self.subTest(scene=scene.name, route=route.name, law=law):
                     worst, deepest = self._residual(scene, law, route, iterations)
                     self.assertGreater(deepest, 2.0 * self.cap, "the scene never reached the cap")

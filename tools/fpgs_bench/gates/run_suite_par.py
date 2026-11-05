@@ -149,7 +149,7 @@ unknown = set(args.task) - scenes.keys()
 if unknown:
     parser.error(f"Unknown scenes: {sorted(unknown)}")
 token = args.gpu_token == "on" or (args.gpu_token == "auto" and args.mode == "perf" and args.jobs > 1)
-law = "patch" if "friction_anchor_beta" in args.unset_solver_attr else "point"
+law = "patch"  # The memory table's key: the one friction law.
 protocol = dict(check_suite.PRESETS[args.mode], **(json.loads(args.protocol) if args.protocol else {}))
 uuid = subprocess.check_output(
     ["nvidia-smi", "-i", args.gpu, "--query-gpu=uuid", "--format=csv,noheader"], text=True

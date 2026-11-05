@@ -203,25 +203,14 @@ class Sweep:
             sparse_diagonal_pair[0] if sparse_diagonal_pair is not None else None
         )
         self.placement.sparse_diagonal_dense_size = sparse_diagonal_pair[1] if sparse_diagonal_pair is not None else 0
-        # Persistent patches allocate one tangent pair per surviving anchor, so their contact rows are not
-        # uniform normal/tangent/tangent triples; keep the triple schedule for point friction only.
-        self.placement.sparse_diagonal_contact_triples = bool(
-            self.placement.sparse_diagonal_contact_solve
-            and self.options.enable_contact_friction
-            and self.options.contact_friction_gap_threshold == math.inf
-            and not self.laws.friction_anchors_enabled
-        )
-        # Patch contacts are units instead: a normal row, followed by its two tangent rows only when the contact
-        # owns an anchor. The unit schedule replaces every stride-3 assumption of the triple schedule.
+        # A contact is a unit: a normal row, followed by its friction rows only when its region holds an anchor.
         self.placement.sparse_diagonal_contact_units = bool(
             self.placement.sparse_diagonal_contact_solve
             and self.options.enable_contact_friction
             and self.options.contact_friction_gap_threshold == math.inf
-            and self.laws.friction_anchors_enabled
         )
         self.placement.sparse_diagonal_speculative_contact_batches = bool(
-            (self.placement.sparse_diagonal_contact_triples or self.placement.sparse_diagonal_contact_units)
-            and self.placement.sparse_diagonal_dense_size + 2 <= 16
+            self.placement.sparse_diagonal_contact_units and self.placement.sparse_diagonal_dense_size + 2 <= 16
         )
         self.placement.sparse_diagonal_dense_offsets = wp.array(
             sparse_diagonal_pair[2] if sparse_diagonal_pair is not None else np.zeros(1, dtype=np.int32),
@@ -452,7 +441,7 @@ class Sweep:
             self.forest.max_world_dofs,
             int(max_support),
             velocity_limits=velocity_candidate,
-            linked_rows=self.laws.friction_anchors_enabled,
+            linked_rows=True,
             torsion=self.laws.spin_rows,
         )
         # Patch friction keeps the packed lanes of small worlds, so size them from the
@@ -548,7 +537,7 @@ class Sweep:
             # Static storage for graph capture: the builder writes the block records of each step's
             # contact units, every friction triple's metric among them where spin rows may appear; linked sweeps add
             # each anchor's ring members once per call.
-            width = CONTACT_RECORD_FLOATS + (CONTACT_RING_FLOATS if self.laws.friction_anchors_enabled else 0)
+            width = CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS
             self.placement.arrays.allocate(
                 SPARSE_CONTACT_RECORDS, world=self.forest.world_count, triplet=triplet_capacity, record=width
             )
@@ -574,7 +563,7 @@ class Sweep:
             **sweep,
             velocity_limits=self.sparse_velocity_limits,
             warm_start=self.options.pgs_warmstart,
-            linked_rows=self.laws.friction_anchors_enabled,
+            linked_rows=True,
             device_arch=model.device.arch,
             weighted=self.laws.set.weighted,
             **torsion,
@@ -672,21 +661,10 @@ class Sweep:
             "paired_factor", laws
         )
         self.paired_factor_coordinates = self.routes.claim("K5", self.routes.reasons["K5"] is None)
-        # Persistent patches allocate one tangent pair per surviving anchor, so their contact rows are not
-        # uniform normal/tangent/tangent triples; the generic row path pools the patch load through the linked
-        # normal rows instead.
-        self.factor_coordinate_contact_triples = bool(
-            self.paired_factor_coordinates
-            and self.options.enable_contact_friction
-            and self.options.contact_friction_gap_threshold == math.inf
-            and not self.laws.friction_anchors_enabled
-        )
         # Patch contacts are units of one row, or three (four with a spin row) when they own an anchor;
         # the factor sweep walks them with the generic path's row order and
         # arithmetic, solving each tangent pair once.
-        self.factor_coordinate_contact_units = bool(
-            self.paired_factor_coordinates and laws.contact == "patch" and not laws.compliance
-        )
+        self.factor_coordinate_contact_units = bool(self.paired_factor_coordinates and not laws.compliance)
         self.paired_factor_primary_offsets_by_world = None
         self.paired_factor_secondary_offsets_by_world = None
         self.paired_factor_primary_arts_by_world = None
@@ -774,7 +752,7 @@ class Sweep:
         limit, in row order. It changes nothing once a tier converges and bounds the limit overshoot of a tier its
         sweep budget stops early; it has rows to push only with joint velocity limits.
         """
-        return bool(self.laws.friction_anchors_enabled and self.options.enable_joint_velocity_limits)
+        return bool(self.options.enable_joint_velocity_limits)
 
     def _parallel_tier_sweeps(self, tiers) -> tuple[list[int], str, str]:
         """Return each parallel tier's sweep budget, the rule that set it, and why (``routes.sweep.tiers``).
@@ -853,15 +831,13 @@ class Sweep:
             return False, "A test pin keeps the full ordered sweep (active_rows=False)."
         if velocity_candidate:
             return False, "Velocity-limit rows keep full ordered sweeps."
-        if self.laws.friction_anchors_enabled and small_world_lanes:
+        if small_world_lanes:
             return False, (
                 f"Patch friction (friction_anchor_beta > 0) keeps the packed {small_world_lanes}-lane full sweep "
                 "of small worlds."
             )
         if not fits():
             return False, "The full ordered sweep: the active-row scan's row bitsets exceed shared memory."
-        if not self.laws.friction_anchors_enabled:
-            return True, "Point-contact normal and limit rows are selected at sweep entry."
         return True, (
             "Normal and limit rows are selected at sweep entry; a patch friction pair (friction_anchor_beta > 0) "
             "while any normal of its ring is selected or the pair holds impulse."
@@ -894,8 +870,6 @@ class Sweep:
         """
         if "contact_units" in self.pins and self.pins["contact_units"] != "triplets":
             return False, "A test pin keeps unfused contact rows (contact_units=None)."
-        if not active_rows and not self.laws.friction_anchors_enabled:
-            return False, "Triplets need the active-row scan."
         if not active_rows and (velocity_candidate or self.forest.has_free_rigid_bodies):
             return False, "Velocity-limit and free-body sweeps keep ordinary updates."
         if lanes < 32:
@@ -904,12 +878,8 @@ class Sweep:
             return False, "Triplets need the row support table."
         if not fits():
             return False, "Row capacity or shared memory leaves no room for contact units."
-        if self.laws.friction_anchors_enabled:
-            sweep = "active-row scan" if active_rows else "full ordered sweep"
-            where = f"patch anchor units pool their ring loads in the {sweep}"
-        else:
-            where = "point contacts fuse in the active-row scan"
-        return True, f"Fused wherever the rows admit them: {where}."
+        sweep = "active-row scan" if active_rows else "full ordered sweep"
+        return True, f"Fused wherever the rows admit them: patch anchor units pool their ring loads in the {sweep}."
 
     def _select_paired_response(self) -> tuple[int, int, np.ndarray] | None:
         """Select one complete robot/free-body response pair per world."""
@@ -977,7 +947,6 @@ class Sweep:
                 self.paired_response_primary_size,
                 self.paired_response_secondary_size,
                 device_arch,
-                contact_triples=self.factor_coordinate_contact_triples,
                 independent_components=self.paired_components is not None,
                 contact_units=self.factor_coordinate_contact_units,
                 weighted=self.laws.set.weighted,
@@ -988,14 +957,11 @@ class Sweep:
             else None
         )
 
-        sparse_contact_schedule = (
-            self.placement.sparse_diagonal_contact_triples or self.placement.sparse_diagonal_contact_units
-        )
+        sparse_contact_schedule = self.placement.sparse_diagonal_contact_units
         self.sparse_contact_marker = (
             _get_mark_independent_sparse_contact_candidates_kernel(
                 self.placement.sparse_diagonal_response_size,
                 device_arch,
-                units=self.placement.sparse_diagonal_contact_units,
                 torsion=self.laws.spin_rows,
             )
             if sparse_contact_schedule
@@ -1007,7 +973,6 @@ class Sweep:
                 self.forest.max_world_dofs,
                 device_arch,
                 build_serial_contacts=self.placement.sparse_diagonal_speculative_contact_batches,
-                units=self.placement.sparse_diagonal_contact_units,
                 torsion=self.laws.spin_rows,
             )
             if sparse_contact_schedule
@@ -1021,7 +986,6 @@ class Sweep:
                 self.forest.max_world_dofs,
                 self.placement.sparse_diagonal_dense_size,
                 device_arch,
-                contact_triples=self.placement.sparse_diagonal_contact_triples,
                 speculative_contact_batches=self.placement.sparse_diagonal_speculative_contact_batches,
                 contact_units=self.placement.sparse_diagonal_contact_units,
                 weighted=self.laws.set.weighted,
@@ -1162,7 +1126,7 @@ class Sweep:
                         sweeps=sweeps_,
                         min_rows=min_rows_,
                         inkernel_response=self.placement.ink_sizes,
-                        linked_rows=self.laws.friction_anchors_enabled,
+                        linked_rows=True,
                         velocity_limit_pass=self._parallel_velocity_limit_pass(),
                         weighted=self.laws.set.weighted,
                         frame=self._tier_frame(),
@@ -1213,13 +1177,9 @@ class Sweep:
     def claim(self) -> None:
         """Publish the schedule of the rows the row pass wrote and each owner's worlds (run after every producer)."""
         model = self.model
-        if self.placement.sparse_diagonal_contact_triples or self.placement.sparse_diagonal_contact_units:
+        if self.placement.sparse_diagonal_contact_units:
             # Unit heads come from the row types and the tangent rows' parents.
-            unit_rows = (
-                [self.placement.row_type, self.placement.row_parent]
-                if self.placement.sparse_diagonal_contact_units
-                else []
-            )
+            unit_rows = [self.placement.row_type, self.placement.row_parent]
             wp.launch(
                 self.sparse_contact_schedule,
                 dim=self.forest.world_count * 32,
@@ -1268,7 +1228,7 @@ class Sweep:
 
     def seed_patches(self, state_in, contacts, dt: float) -> None:
         """Seed the persistent patches' impulses into this step's rows."""
-        if self.laws.friction_anchors_enabled and self.patch_frame_built(contacts):
+        if self.patch_frame_built(contacts):
             ratio = dt / self.prev_dt if self.prev_dt > 0.0 else 1.0
             seeded = [
                 (route, parents, mu, impulses, decay * ratio, first)
@@ -1536,8 +1496,6 @@ class Sweep:
 
     def finish_patches(self, state_in, state_out, contacts, dt):
         """Publish persistent patch history from the integrated public state."""
-        if not self.laws.friction_anchors_enabled:
-            return
         if contacts is None:
             # A memset of today's rows: a capture of it is recaptured after growth.
             self.placement.contact_pool.note_unbound()
@@ -1588,9 +1546,8 @@ class Sweep:
 
     def carry(self, state_in, state_out, contacts, dt: float) -> None:
         """Store what the next step reads: the patches' history, the impulses and their row tables by contact identity."""
-        if self.laws.friction_anchors_enabled:
-            with wp.ScopedTimer("S7_Friction_Patch_Carry", print=False, use_nvtx=self.nvtx, synchronize=False):
-                self.finish_patches(state_in, state_out, contacts, dt)
+        with wp.ScopedTimer("S7_Friction_Patch_Carry", print=False, use_nvtx=self.nvtx, synchronize=False):
+            self.finish_patches(state_in, state_out, contacts, dt)
 
         if self.options.pgs_warmstart and self.placement.ws_prev_dense_impulses is not None:
             # The row store's carry, both classes' rows.

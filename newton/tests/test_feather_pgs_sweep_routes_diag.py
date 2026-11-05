@@ -25,8 +25,6 @@ from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
 _POLICIES = (SolvePolicy(), SolvePolicy(readout="sweeps"), SolvePolicy(readout="trace"))
 _SCHEDULES = (
     {},
-    {"contact_triples": True},
-    {"contact_triples": True, "speculative_contact_batches": True},
     {"contact_units": True},
     {"contact_units": True, "speculative_contact_batches": True},
 )
@@ -43,12 +41,11 @@ class TestSweepRoutesDiagOptions(unittest.TestCase):
 
     def test_invalid_options_raise(self):
         cases = [
-            (routes.sparse_diagonal_kernel, (32, 14, 6, "sm_120"), {"contact_triples": True, "contact_units": True}),
             (routes.sparse_diagonal_kernel, (32, 14, 6, "sm_120"), {"speculative_contact_batches": True}),
             (
                 routes.sparse_diagonal_kernel,
                 (32, 30, 15, "sm_120"),
-                {"contact_triples": True, "speculative_contact_batches": True},
+                {"contact_units": True, "speculative_contact_batches": True},
             ),
         ]
         for factory, args, kwargs in cases:
@@ -74,31 +71,28 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
                 self.assertIn(f"for (int d = lane; d < {dofs}; d += 32) s_v[d] = 0.0f;", text)
 
     def test_sparse_diagonal_schedules(self):
-        triples, _ = routes.sparse_diagonal_source(32, 14, 6, contact_triples=True, speculative_contact_batches=True)
         units, _ = routes.sparse_diagonal_source(32, 14, 6, contact_units=True, speculative_contact_batches=True)
         plain, _ = routes.sparse_diagonal_source(32, 14, 6)
         # A batch tests one contact per segment of eight lanes (P + 2 = 8 response entries).
-        self.assertIn("SEGMENT_SUM(8, candidate_velocity);", triples)
-        self.assertIn("sparse_contact_serial_normals.data[world * 11 + candidate_index]", triples)
+        self.assertIn("SEGMENT_SUM(8, candidate_velocity);", units)
         self.assertIn("sparse_contact_serial_normals.data[world * 32 + candidate_index]", units)
         # The phase bound is clamped to the world's rows; the plain schedule has no contact segment.
-        self.assertIn("const int contact_start = min(dense_phase_bounds.data[world * 2 + 1], row_count);", triples)
+        self.assertIn("const int contact_start = min(dense_phase_bounds.data[world * 2 + 1], row_count);", units)
         self.assertIn("const int contact_start = row_count;", plain)
         self.assertNotIn("independent_group_count", plain)
         # Independent contacts: one product rounded alone, as the warp's sum of it rounds.
-        self.assertIn("float jv = __fmul_rn(z, s_v[scalar_coord]);", triples)
+        self.assertIn("float jv = __fmul_rn(z, s_v[scalar_coord]);", units)
         # A chain visits a contact's normal and its pair's first tangent with their kinds (and the pair's parent) known,
         # so no visit reads row metadata; the second tangent is only zeroed while friction waits. A unit has a pair
         # only when it owns an anchor.
-        for text in (triples, units):
+        for text in (units,):
             self.assertRegex(text, r"const int i = head;\s+const int row_type = 0;")
             self.assertRegex(text, r"const int i = head \+ 1;\s+const int row_type = 2;")
             self.assertIn("parent = head;", text)
             self.assertNotIn("pair_visits", text)
         self.assertIn("if (head + 2 < row_count", units)
-        self.assertNotIn("if (head + 2 < row_count", triples)
         # A pair loads its sibling's entries once and reduces its two terms in one ladder; its apply reuses them.
-        for text in (triples, units):
+        for text in (units,):
             self.assertEqual(text.count("SUM(sibling_residual, cross);"), 1)
             self.assertEqual(text.count("const float sib_z = sparse_row_z.data[sib_entry];"), 1)
             self.assertIn("s_v[scalar_coord] += sib_z * sib_delta;", text)
@@ -108,7 +102,7 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
         # pair's couplings in one ladder, the rows by the row law, one apply, the loop past the unit. A chain's contacts
         # keep their row visits (one lane per contact: a unit branch there would split the warp's lanes).
         loaded = "if (s_lam_dense[i] != 0.0f || s_lam_dense[i + 1] != 0.0f || s_lam_dense[i + 2] != 0.0f) {"
-        for text in (plain, triples, units):
+        for text in (plain, units):
             self.assertEqual(text.count("SUM(unit_jv0, unit_jv1, unit_jv2, gram_n1, gram_n2, unit_cross);"), 1)
             self.assertEqual(text.count(loaded), 1)
             self.assertIn("float jv = r == 0 ? unit_jv0 : unit_jv1 + gram_n1 * unit_dn;", text)
@@ -116,7 +110,7 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
                 "s_v[unit_coord] = unit_u + ((unit_z0 * unit_dn + unit_z1 * unit_dt1) + unit_z2 * unit_dt2);", text
             )
             self.assertLess(text.index(loaded), text.rindex("const int row_type = s_meta_dense[i]"))
-        for text in (triples, units):
+        for text in (units,):
             start = text.index("const int independent_group_count")
             chains = text[start : text.index("SYNC();", start)]
             self.assertNotIn("unit_jv", chains)
@@ -128,7 +122,7 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
         # The rows act in factor coordinates on the velocity change: the dense articulation's goes to the step's one
         # leave in the walk's coordinates (the walk down in its rows' frame), a diagonal coordinate scaled by its m^-1/2
         # onto the predictor.
-        for text in (plain, triples, units):
+        for text in (plain, units):
             self.assertIn("rhs_bias.data[off_dense + (i)] + row_incident.data[off_dense + (i)]", text)
             self.assertIn("v_out.data[global_dof] += diagonal_scale > 0.0f ? s_v[d] * diagonal_scale : s_v[d];", text)
             self.assertIn("sqrtf(diagonal_inverse_mass.data[global_dof])", text)
@@ -243,7 +237,7 @@ class TestSweepRoutesDiagAssembly(unittest.TestCase):
             (
                 routes.sparse_diagonal_kernel,
                 (32, 14, 6, "sm_120"),
-                {"contact_triples": True, "speculative_contact_batches": True},
+                {"contact_units": True, "speculative_contact_batches": True},
             ),
         ]
         for factory, args, kwargs in cases:

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Select persistent patch-friction rows at sparse sweep entry, as point friction does."""
+"""Select the friction law's rows at sparse sweep entry."""
 
 import functools
 import os
@@ -32,7 +32,7 @@ def _admission_probe(**changes):
         pins={},
         placement=SimpleNamespace(dense_max_constraints=256),
         forest=SimpleNamespace(max_world_dofs=18),
-        laws=SimpleNamespace(friction_anchors_enabled=False),
+        laws=SimpleNamespace(),
     )
     for name, value in changes.items():
         setattr(probe, name, value)
@@ -46,25 +46,6 @@ def _admit(probe, *, velocity=False, lanes=0, fits=True):
 
 
 class TestFeatherPGSSparsePatchRows(unittest.TestCase):
-    def test_point_admission(self):
-        """Admit point rows at sweep entry unless velocity limits, a pin or the scan's size keep the full sweep."""
-        for pins, velocity, lanes, fits in (
-            ({}, False, 0, True),
-            ({}, False, 16, True),
-            ({"active_rows": False}, False, 0, True),
-            ({}, True, 0, True),
-            ({}, False, 0, False),
-        ):
-            expected = not pins and not velocity and fits
-            with self.subTest(pins=pins, velocity=velocity, fits=fits):
-                probe = _admission_probe(pins=pins)
-                active, reason = _admit(probe, velocity=velocity, lanes=lanes, fits=fits)
-                self.assertEqual(active, expected)
-                if active:
-                    self.assertEqual(reason, "Point-contact normal and limit rows are selected at sweep entry.")
-                elif not pins and not velocity:
-                    self.assertIn("bitsets exceed shared memory", reason)
-
     def test_patch_admission_follows_small_worlds(self):
         """Select patch rows at sweep entry unless small worlds, a pin or the scan's working set keep the full sweep."""
         for pins, lanes, fits, expected, phrase in (
@@ -75,7 +56,7 @@ class TestFeatherPGSSparsePatchRows(unittest.TestCase):
             ({}, 0, False, False, "bitsets exceed shared memory"),
         ):
             with self.subTest(pins=pins, lanes=lanes, fits=fits):
-                probe = _admission_probe(laws=SimpleNamespace(friction_anchors_enabled=True), pins=pins)
+                probe = _admission_probe(pins=pins)
                 active, reason = _admit(probe, lanes=lanes, fits=fits)
                 self.assertEqual(active, expected)
                 self.assertIn(phrase, reason)
@@ -140,18 +121,17 @@ def _rollout(solver, model, *, steps, slide_world=None, speed=0.0):
 @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
 class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
     def test_route_record_reports_linked_active_rows(self):
-        """Run patch friction on the linked active-row kernel, and the full sweep when the policy is off."""
+        """Run the law on the linked active-row kernel, and the full sweep when the policy is off."""
         model = _build_model()
         with mock.patch.dict(SolverFeatherPGS._route_pins, _UNFUSED):
-            point = _make_solver(model, True, friction_anchor_beta=0.0, dense_max_constraints=96)
             patch_friction = _make_solver(model, True, dense_max_constraints=96)
         with mock.patch.dict(SolverFeatherPGS._route_pins, {**_UNFUSED, "active_rows": False}):
             switched_off = _make_solver(model, True, dense_max_constraints=96)
         records = {
             name: solver.get_path_selection()["routes"]["sparse_mass_matrix"]
-            for name, solver in (("point", point), ("patch", patch_friction), ("off", switched_off))
+            for name, solver in (("patch", patch_friction), ("off", switched_off))
         }
-        for name, active, linked in (("point", True, False), ("patch", True, True), ("off", False, False)):
+        for name, active, linked in (("patch", True, True), ("off", False, False)):
             with self.subTest(name=name):
                 record = records[name]
                 self.assertEqual(record["size"], 9)
@@ -187,7 +167,7 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
             "dense_max_constraints": low,
         }
         full = staging(low)
-        for name, law in (("patch", {}), ("point", {"friction_anchor_beta": 0.0})):
+        for name, law in (("patch", {}),):
             with self.subTest(law=name):
                 solver = SolverFeatherPGS(model, **law, **options)
                 self.assertEqual(solver.placement.sparse_mass_matrix_size, 18)

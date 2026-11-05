@@ -19,7 +19,7 @@ STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
 
 def _tier_solver(model):
     """The point tiers of 32 rows (a test pin), forming the response in-kernel, which the standing model fits."""
-    return _matrix_free_solver(model, beta=0.0, parallel_rows=32)
+    return _matrix_free_solver(model, beta=0.2, parallel_rows=32)
 
 
 class _Scene:

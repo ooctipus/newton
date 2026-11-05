@@ -128,10 +128,10 @@ def launch_components(data, device="cpu"):
     )
 
 
-def solve_kernels(enabled, arch="120", *, contact_triples=False):
+def solve_kernels(enabled, arch="120", *, contact_units=False):
     """Construct the two production sweep kernels, plain or with independent components."""
     paired = sweep_routes_local.paired_factor_kernel(
-        8, 29, 23, 6, arch, contact_triples=contact_triples, independent_components=enabled, pitch=14
+        8, 29, 23, 6, arch, contact_units=contact_units, independent_components=enabled, pitch=14
     )
     mixed = sweep_routes.mf_gs_kernel(
         8,
@@ -268,7 +268,7 @@ def solve_pair_launches(data, arrays, *, enabled, arch, iterations=8):
     return [
         (kernel, grid, block, [values[name] for name in inspect.signature(kernel.func).parameters])
         for kernel, grid, block in zip(
-            solve_kernels(enabled, str(arch), contact_triples=True), (3, 5), (64, 32), strict=True
+            solve_kernels(enabled, str(arch), contact_units=True), (3, 5), (64, 32), strict=True
         )
     ]
 

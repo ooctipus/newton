@@ -419,7 +419,6 @@ class ReferencePatches:
 
     def __init__(self, model, capacity, phi):
         self.view = FrictionPatches()
-        self.view.enabled = 1
         self.view.phi = phi
         self.capacity = capacity
         device = model.device

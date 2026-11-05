@@ -307,11 +307,9 @@ class SolverFeatherPGS(SolverBase):
                 ``phi <= contact_friction_gap_threshold``. This mirrors PhysX's separate friction-anchor
                 distance threshold while leaving speculative normal rows intact. Defaults to ``inf`` to
                 preserve legacy FeatherPGS behavior.
-            friction_anchor_beta (float | None, optional): Set the positional correction strength
-                for persistent patch friction. ``None`` enables it at 0.2 for the default solver;
-                the experimental contact material law instead retains velocity-only point friction and warns.
-                Zero explicitly selects velocity-only point friction. Positive values
-                group compatible contacts on a body pair into regions,
+            friction_anchor_beta (float | None, optional): The stick's gain: the positional correction strength of
+                the friction law, finite and positive; ``None`` takes 0.2. The law
+                groups compatible contacts on a body pair into regions,
                 select up to two friction locations per region, and share the total
                 normal impulse equally between those anchors. Normal contacts are preserved.
                 Twisting resistance comes only from the separation between the anchors;
@@ -334,7 +332,7 @@ class SolverFeatherPGS(SolverBase):
                 regions discard history. Regions with no friction rows for a step (gap filters or
                 row capacity) retain supported history. Patch reduction approximates the friction
                 wrench with two locations; faceted wheels still experience facet-impact losses.
-                Explicit positive gains with an incompatible point algorithm raise an error.
+                A gain that is zero, negative or not finite raises ``ValueError``.
                 Each step sorts its patch contact pairs, except a step captured in a CUDA graph
                 right after another captured step of the same graph over the same contact stream
                 (the same ``contact_generation`` array, which every object wrapping the arrays of
@@ -788,11 +786,10 @@ class SolverFeatherPGS(SolverBase):
             if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES)
             else None
         )
-        if self.laws.friction_anchors_enabled:
-            # The next captured build sorts its pairs again rather than reusing the
-            # sorted contact frame across a model change.
-            self.laws.friction_patches.forget_frame()
-        if self.laws.friction_anchors_enabled and flags & ModelFlags.SHAPE_PROPERTIES:
+        # The next captured build sorts its pairs again rather than reusing the
+        # sorted contact frame across a model change.
+        self.laws.friction_patches.forget_frame()
+        if flags & ModelFlags.SHAPE_PROPERTIES:
             # Geometry edits retire affected material points; unrelated shape
             # properties keep their history and live materials are checked per step.
             self.laws.friction_patches.update_geometry(self.model)
@@ -838,9 +835,8 @@ class SolverFeatherPGS(SolverBase):
         self.factor.held.invalidate(world_mask)
 
         self.placement.reset_status(world_mask)
-        if self.laws.friction_anchors_enabled:
-            # Use the world associated with each stored patch anchor.
-            self.laws.friction_patches.reset(world_mask)
+        # Use the world associated with each stored patch anchor.
+        self.laws.friction_patches.reset(world_mask)
         self.factor.reset_cache(world_mask)
         self.sweep.clear_history(world_mask)
 

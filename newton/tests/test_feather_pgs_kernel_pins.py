@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Pin the generated code of every kernel point friction can launch.
+"""Pin the generated code of every FeatherPGS kernel.
 
 Warp's per-kernel content hash covers the kernel source, every ``@wp.func`` it
 calls (``func_native`` snippets included), struct layouts and ``wp.static``
@@ -9,13 +9,17 @@ values. A function passed by name to a builtin, such as the operator of
 ``wp.tile_map``, is compiled but not hashed, so kernels pass such functions
 through ``wp.static``. The hash does not depend on line numbers or on other
 kernels of the same module, and it is computed on the host without compiling
-anything. Changes that admit persistent patch friction
-(``friction_anchor_beta > 0``) on a route must leave these pins unchanged: point
-friction keeps its kernels, and patch work lands as new variants.
+anything.
 
-Run ``python -m newton.tests.test_feather_pgs_point_streams --record`` to add
-pins for new kernels. Recording refreshes patch-only pins but refuses to change
-a point pin, unless the pins were taken with another Warp version.
+Every kernel keeps its pin until the pin is recorded on purpose: a change that
+moves a kernel's generated code, or retires a kernel, fails here until its own
+commit re-records the pins, so each move is a decision that commit states, never
+a side effect.
+
+Run ``python -m newton.tests.test_feather_pgs_kernel_pins --record`` to add pins
+for new kernels; ``--record --rebaseline`` also refreshes the changed pins and
+drops the retired ones, and lists each. Pins taken with another Warp version are
+recorded anew.
 """
 
 import argparse
@@ -33,60 +37,10 @@ import warp as wp
 from newton._src.solvers.feather_pgs import environment_flags
 from newton._src.solvers.feather_pgs.kernel_template import SweepTier
 
-_PINS = os.path.join(os.path.dirname(__file__), "golden_data", "test_feather_pgs_point_streams", "pins.json")
+_PINS = os.path.join(os.path.dirname(__file__), "golden_data", "test_feather_pgs_kernel_pins", "pins.json")
 _PACKAGE = "newton._src.solvers.feather_pgs"
 # CUDA architecture of the factory sweeps; only measured opt-in layouts depend on it.
 _ARCH = "120"
-
-# Kernels that only persistent patch friction launches. Their pins are recorded but
-# may change; a change that adds a patch-only kernel lists it here.
-_PATCH_ONLY = frozenset(
-    (
-        "friction_patches._build",
-        "friction_patches._finish_and_store",
-        "friction_patches._invalidate_geometry_history",
-        "friction_patches._prepare",
-        "friction_patches._prepare_frame",
-        "friction_patches._reset_history",
-        "friction_patches.link_patch_routes",
-        "friction_patches.seed_patch_routes",
-        # The resolved-world classifier under persistent patch friction.
-        "resolved_worlds.check_raw_contact_normals_by_route",
-        "resolved_worlds.finalize_resolved_worlds_bounded",
-        # Sparse-diagonal schedules over patch contact units.
-        "sweep_routes_diag.sparse_diagonal_kernel(64, 10, 9, '120', contact_units=True, "
-        "speculative_contact_batches=False)",
-        "sweep_routes_diag.sparse_diagonal_kernel(64, 10, 9, '120', contact_units=True, "
-        "speculative_contact_batches=True)",
-        "sweep_levels._get_build_independent_sparse_contact_groups_kernel(64, 10, '120', "
-        "build_serial_contacts=False, units=True)",
-        "sweep_levels._get_build_independent_sparse_contact_groups_kernel(64, 10, '120', "
-        "build_serial_contacts=True, units=True)",
-        "sweep_levels._get_mark_independent_sparse_contact_candidates_kernel(1, '120', units=True)",
-        "sweep_levels._get_mark_independent_sparse_contact_candidates_kernel(2, '120', units=True)",
-        # Native sparse sweeps that select patch rings at sweep entry.
-        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
-        "use_support_table=False, warm_start=False)",
-        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
-        "use_support_table=False, warm_start=True)",
-        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
-        "use_support_table=True, warm_start=False)",
-        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
-        "use_support_table=True, warm_start=True)",
-        # Their ring-pooled contact triplets, in the active and the full sweep.
-        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=False, contact_triplets=True, "
-        "linked_rows=True, use_support_table=True, warm_start=False)",
-        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=False, contact_triplets=True, "
-        "linked_rows=True, use_support_table=True, warm_start=True)",
-        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, contact_triplets=True, "
-        "linked_rows=True, use_support_table=True, warm_start=False)",
-        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, contact_triplets=True, "
-        "linked_rows=True, use_support_table=True, warm_start=True)",
-        # Paired factor sweeps over patch contact units.
-        "sweep_routes_local.paired_factor_kernel(192, 29, 23, 6, '120', False, False, contact_units=True)",
-        "sweep_routes_local.paired_factor_kernel(192, 29, 23, 6, '120', False, True, contact_units=True)",
-    )
-)
 
 
 def _label(name, args, kwargs):
@@ -95,7 +49,7 @@ def _label(name, args, kwargs):
 
 
 def _linked_tier_calls():
-    """Patch-only parallel tiers, whose friction pairs pool their patch ring's normal impulses.
+    """Linked parallel tiers, whose friction pairs pool their patch ring's normal impulses.
 
     Each also with the last-word velocity-limit pass, which the solver builds for linked tiers with joint velocity
     limits.
@@ -136,7 +90,7 @@ def _keyed_tier_kwargs(*, linked):
 
 
 def _suite_sparse_sweeps():
-    """Native sparse sweeps at the shapes the benchmark suite builds: ``(size, kwargs, patch_only)``."""
+    """Native sparse sweeps at the shapes the benchmark suite builds: ``(size, kwargs)``."""
     active = {"active_rows": True}
     triplets = {"active_rows": True, "use_support_table": True, "contact_triplets": True}
     for size, kwargs in (
@@ -153,8 +107,8 @@ def _suite_sparse_sweeps():
         ((64, 9, 9), {"velocity_limits": True, "lanes_per_world": 16}),
         ((80, 18, 18), triplets),
     ):
-        yield size, kwargs, False
-    # Persistent patch friction links the patch rings of the active sweeps.
+        yield size, kwargs
+    # The friction law links the patch rings of the active sweeps.
     for size, kwargs in (
         ((100, 43, 18), active),
         ((112, 18, 12), triplets),
@@ -166,18 +120,17 @@ def _suite_sparse_sweeps():
         ((72, 18, 12), triplets),
         ((80, 18, 18), triplets),
     ):
-        yield size, {**kwargs, "linked_rows": True}, True
+        yield size, {**kwargs, "linked_rows": True}
 
 
 def _suite_diagonal_sweeps():
-    """Sparse-diagonal sweeps at the suite's shapes: ``(args, kwargs, patch_only)``; contact units are patch-only."""
+    """Sparse-diagonal sweeps at the suite's shapes: ``(args, kwargs)``, over contact units."""
     for shape in ((1024, 114, 6, _ARCH), (256, 13, 9, _ARCH)):
-        yield shape, {"contact_triples": True, "speculative_contact_batches": True}, False
-        yield shape, {"speculative_contact_batches": True, "contact_units": True}, True
+        yield shape, {"speculative_contact_batches": True, "contact_units": True}
 
 
 def _keyed_last_word_calls():
-    """Linked keyed tiers of a velocity-limited layout with the last-word pass (patch-only).
+    """Linked keyed tiers of a velocity-limited layout with the last-word pass.
 
     The solver builds the pass for linked tiers only with joint velocity limits, so these
     tiers read a layout that plans velocity-limit rows.
@@ -187,7 +140,7 @@ def _keyed_last_word_calls():
 
 
 def _readout_calls():
-    """Opt-in sweep readouts of the suite's counted sweeps: ``(name, factory, args, kwargs, patch_only)``.
+    """Opt-in sweep readouts of the suite's counted sweeps: ``(name, factory, args, kwargs)``.
 
     ``Diagnostics(solve_readout="sweeps")`` builds these variants of the sparse, sparse-diagonal,
     matrix-free Gauss-Seidel and paired factor sweeps.
@@ -204,51 +157,22 @@ def _readout_calls():
     triplets = {"active_rows": True, "use_support_table": True, "contact_triplets": True}
     factory = sweep_routes_sparse.sparse_kernel.__wrapped__
     for size in ((112, 18, 12), (128, 25, 16), (256, 18, 12)):
-        yield "sweep_routes_sparse.sparse_kernel", factory, size, {**triplets, **readout}, False
-        yield (
-            "sweep_routes_sparse.sparse_kernel",
-            factory,
-            size,
-            {**triplets, "linked_rows": True, **readout},
-            True,
-        )
+        yield "sweep_routes_sparse.sparse_kernel", factory, size, {**triplets, **readout}
+        yield "sweep_routes_sparse.sparse_kernel", factory, size, {**triplets, "linked_rows": True, **readout}
     factory = sweep_routes_diag.sparse_diagonal_kernel.__wrapped__
-    for schedule, patch_only in (("contact_triples", False), ("contact_units", True)):
-        kwargs = {schedule: True, "speculative_contact_batches": True, **readout}
-        yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (1024, 114, 6, _ARCH), kwargs, patch_only
+    kwargs = {"contact_units": True, "speculative_contact_batches": True, **readout}
+    yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (1024, 114, 6, _ARCH), kwargs
     factory = sweep_routes.mf_gs_kernel.__wrapped__
     no_limits = {"has_dense_velocity_limit_rows": False}
     for args, kwargs in (
         ((192, 64, 22, _ARCH), {}),
         ((192, 64, 29, _ARCH), {**no_limits, "factor_coordinates": True, "independent_components": True}),
     ):
-        yield "sweep_routes.mf_gs_kernel", factory, args, {**kwargs, **readout}, False
+        yield "sweep_routes.mf_gs_kernel", factory, args, {**kwargs, **readout}
     factory = sweep_routes_local.paired_factor_kernel.__wrapped__
     for units in (False, True):
         kwargs = {"contact_units": True, **readout} if units else readout
-        yield "sweep_routes_local.paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, False, True), kwargs, units
-
-
-def _patch_only_factory_labels():
-    """Labels of the factory-built kernels only patch friction launches."""
-    for name, args, kwargs in _linked_tier_calls():
-        yield _label(name, args, kwargs)
-    for kwargs in _keyed_tier_kwargs(linked=True):
-        yield _label("keyed_rows.get_parallel_factory", (_keyed_layout(), 128, 32, 22, _ARCH), kwargs)
-    for size, kwargs, patch_only in _suite_sparse_sweeps():
-        if patch_only:
-            yield _label("sweep_routes_sparse.sparse_kernel", size, kwargs)
-    for args, kwargs, patch_only in _suite_diagonal_sweeps():
-        if patch_only:
-            yield _label("sweep_routes_diag.sparse_diagonal_kernel", args, kwargs)
-    for args, kwargs in _keyed_last_word_calls():
-        yield _label("keyed_rows.get_parallel_factory", args, kwargs)
-    for name, _, args, kwargs, patch_only in _readout_calls():
-        if patch_only:
-            yield _label(name, args, kwargs)
-
-
-_PATCH_ONLY |= frozenset(_patch_only_factory_labels())
+        yield "sweep_routes_local.paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, True), kwargs
 
 
 def _module_kernels():
@@ -259,14 +183,15 @@ def _module_kernels():
         module = importlib.import_module(info.name)
         for name, value in vars(module).items():
             # A re-exported kernel is pinned where it is defined. Generic kernels
-            # are hashed per instantiation; none serves a point-friction route.
+            # are hashed per instantiation.
             if isinstance(value, wp.Kernel) and value.func.__module__ == module.__name__ and not value.is_generic:
                 kernels[f"{info.name.removeprefix(_PACKAGE + '.')}.{name}"] = value
     return kernels
 
 
 def _sparse_sweep_calls():
-    """Native sparse sweeps over the flags point friction selects (sweep_routes_sparse.py)."""
+    """Native sparse sweeps over every flag combination without linked rows (sweep_routes_sparse.py); the law's routes
+    build the linked ones (:func:`_linked_sweep_calls`)."""
     from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel  # noqa: PLC0415
 
     factory = sparse_kernel.__wrapped__
@@ -292,7 +217,7 @@ def _sparse_sweep_calls():
 
 
 def _linked_sweep_calls():
-    """Patch-only native sparse sweeps over linked rows (sweep_routes_sparse.py)."""
+    """Native sparse sweeps over linked rows (sweep_routes_sparse.py)."""
     from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel  # noqa: PLC0415
 
     factory = sparse_kernel.__wrapped__
@@ -355,10 +280,8 @@ def _solver_factory_calls():
     )
 
     name = "sweep_levels."
-    for triples, batches in itertools.product((False, True), repeat=2):
-        kwargs = {"contact_triples": triples, "speculative_contact_batches": batches}
-        factory = sweep_routes_diag.sparse_diagonal_kernel.__wrapped__
-        yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (64, 10, 9, _ARCH), kwargs
+    factory = sweep_routes_diag.sparse_diagonal_kernel.__wrapped__
+    yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (64, 10, 9, _ARCH), {}
     for serial in (False, True):
         factory = sweep_levels._get_build_independent_sparse_contact_groups_kernel.__wrapped__
         kwargs = {"build_serial_contacts": serial}
@@ -366,18 +289,11 @@ def _solver_factory_calls():
     for dofs in (1, 2):
         factory = sweep_levels._get_mark_independent_sparse_contact_candidates_kernel.__wrapped__
         yield name + "_get_mark_independent_sparse_contact_candidates_kernel", factory, (dofs, _ARCH), {}
-    # Patch-only unit schedules of the same factories.
+    # The unit schedules of the sparse diagonal.
     for batches in (False, True):
         kwargs = {"contact_units": True, "speculative_contact_batches": batches}
         factory = sweep_routes_diag.sparse_diagonal_kernel.__wrapped__
         yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (64, 10, 9, _ARCH), kwargs
-    for serial in (False, True):
-        factory = sweep_levels._get_build_independent_sparse_contact_groups_kernel.__wrapped__
-        kwargs = {"build_serial_contacts": serial, "units": True}
-        yield name + "_get_build_independent_sparse_contact_groups_kernel", factory, (64, 10, _ARCH), kwargs
-    for dofs in (1, 2):
-        factory = sweep_levels._get_mark_independent_sparse_contact_candidates_kernel.__wrapped__
-        yield name + "_get_mark_independent_sparse_contact_candidates_kernel", factory, (dofs, _ARCH), {"units": True}
     for skip_rows, limits, coordinates, components in itertools.product((0, 32), *([(False, True)] * 3)):
         kwargs = {
             "skip_tier_rows": skip_rows,
@@ -388,7 +304,7 @@ def _solver_factory_calls():
         factory = sweep_routes.mf_gs_kernel.__wrapped__
         yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
     # Streamed metadata with the packed row types and parents resident, which single-wave launches
-    # of large dense capacities select under either law; limits add the limit scans' global reads.
+    # of large dense capacities select; limits add the limit scans' global reads.
     for limits in (False, True):
         kwargs = {
             "places": sweep_routes.RowPlaces(Place.GLOBAL, Place.SHARED),
@@ -397,13 +313,13 @@ def _solver_factory_calls():
         }
         factory = sweep_routes.mf_gs_kernel.__wrapped__
         yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
-    for triples, components in itertools.product((False, True), repeat=2):
-        factory = sweep_routes_local.paired_factor_kernel.__wrapped__
-        yield "sweep_routes_local.paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, triples, components), {}
-    # Patch-only unit walks of the same factory.
     for components in (False, True):
         factory = sweep_routes_local.paired_factor_kernel.__wrapped__
-        args = (192, 29, 23, 6, _ARCH, False, components)
+        yield "sweep_routes_local.paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, components), {}
+    # The unit walks of the same factory.
+    for components in (False, True):
+        factory = sweep_routes_local.paired_factor_kernel.__wrapped__
+        args = (192, 29, 23, 6, _ARCH, components)
         yield "sweep_routes_local.paired_factor_kernel", factory, args, {"contact_units": True}
 
     # Parallel tiers: one articulation per world, its response formed in-kernel.
@@ -445,10 +361,10 @@ def _suite_shape_calls():
     ):
         yield "sweep_routes.mf_gs_kernel", factory, args, kwargs
     factory = sweep_routes_sparse.sparse_kernel.__wrapped__
-    for size, kwargs, _ in _suite_sparse_sweeps():
+    for size, kwargs in _suite_sparse_sweeps():
         yield "sweep_routes_sparse.sparse_kernel", factory, size, kwargs
     factory = sweep_routes_diag.sparse_diagonal_kernel.__wrapped__
-    for args, kwargs, _ in _suite_diagonal_sweeps():
+    for args, kwargs in _suite_diagonal_sweeps():
         yield "sweep_routes_diag.sparse_diagonal_kernel", factory, args, kwargs
 
     def parallel(layout, *args, **kwargs):
@@ -483,7 +399,7 @@ def _keyed_row_calls():
     layout = _keyed_layout()
     for kwargs in _keyed_tier_kwargs(linked=False):
         yield "keyed_rows.get_parallel_factory", parallel, (layout, 128, 32, 22, _ARCH), kwargs
-    # The persistent patch row law of the same rows.
+    # The same rows linked into their patch rings.
     for kwargs in _keyed_tier_kwargs(linked=True):
         yield "keyed_rows.get_parallel_factory", parallel, (layout, 128, 32, 22, _ARCH), kwargs
     for args, kwargs in _keyed_last_word_calls():
@@ -491,7 +407,7 @@ def _keyed_row_calls():
 
 
 def _factory_kernels():
-    """Kernels of the factories patch integration varies, built with point arguments."""
+    """Kernels of the factories, built at each call's arguments."""
     kernels = {}
     for name, factory, args, kwargs in itertools.chain(
         _sparse_sweep_calls(),
@@ -501,12 +417,12 @@ def _factory_kernels():
         _solver_factory_calls(),
         _suite_shape_calls(),
         _keyed_row_calls(),
-        ((name, factory, args, kwargs) for name, factory, args, kwargs, _ in _readout_calls()),
+        _readout_calls(),
     ):
         try:
             kernel = factory(*args, **kwargs)
         except ValueError:
-            continue  # The factory rejects this combination for every friction law.
+            continue  # The factory rejects this combination.
         # A tier factory returns the tier's launch descriptor.
         kernels[_label(name, args, kwargs)] = kernel.kernel if isinstance(kernel, SweepTier) else kernel
     return kernels
@@ -580,16 +496,14 @@ def _environment_switches():
 
 
 def compare(stored, current):
-    """Split differences into changed and missing point pins, and unpinned kernels."""
-    changed = sorted(
-        name for name, pin in stored.items() if name in current and current[name] != pin and name not in _PATCH_ONLY
-    )
-    missing = sorted(name for name in stored if name not in current and name not in _PATCH_ONLY)
+    """Split differences into changed and retired pins, and unpinned kernels."""
+    changed = sorted(name for name, pin in stored.items() if name in current and current[name] != pin)
+    missing = sorted(name for name in stored if name not in current)
     unpinned = sorted(name for name in current if name not in stored)
     return changed, missing, unpinned
 
 
-class TestFeatherPGSPointStreams(unittest.TestCase):
+class TestFeatherPGSKernelPins(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.stored = _stored()
@@ -607,22 +521,19 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
         if switches:
             self.skipTest(f"Import-time switches select other generated kernels: {', '.join(switches)}")
 
-    def test_point_kernels_keep_their_pins(self):
-        """Keep the generated code of every pinned point-friction kernel unchanged."""
+    def test_every_kernel_keeps_its_pin(self):
+        """Keep every pinned kernel's generated code until its pin is recorded on purpose."""
         changed, missing, _ = compare(self.stored["kernels"], self.current)
-        self.assertEqual(changed, [], "Point-friction kernels changed their generated code")
-        self.assertEqual(missing, [], "Point-friction kernels disappeared from the inventory")
+        rebaseline = (
+            "Re-record on purpose with: python -m newton.tests.test_feather_pgs_kernel_pins --record --rebaseline"
+        )
+        self.assertEqual(changed, [], f"Kernels changed their generated code. {rebaseline}")
+        self.assertEqual(missing, [], f"Pinned kernels disappeared from the inventory. {rebaseline}")
 
     def test_every_kernel_is_pinned(self):
-        """Pin each new kernel, or list it as patch-only, before point friction can launch it."""
+        """Pin each new kernel before a route can launch it."""
         _, _, unpinned = compare(self.stored["kernels"], self.current)
-        self.assertEqual(
-            unpinned, [], "Record pins with: python -m newton.tests.test_feather_pgs_point_streams --record"
-        )
-
-    def test_patch_only_kernels_exist(self):
-        """List only kernels that still exist as patch-only."""
-        self.assertTrue(_PATCH_ONLY <= set(self.current), sorted(_PATCH_ONLY - set(self.current)))
+        self.assertEqual(unpinned, [], "Record pins with: python -m newton.tests.test_feather_pgs_kernel_pins --record")
 
     def test_hashes_cover_function_arguments(self):
         """Hash every function a kernel passes to a builtin, so pins and the kernel cache follow its edits."""
@@ -634,7 +545,7 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
         )
 
     def test_inventory_covers_the_varied_factories(self):
-        """Reach every factory and variant family that patch integration extends."""
+        """Reach every factory and variant family the routes build."""
         families = {name.split("(", 1)[0] for name in self.current}
         for family in (
             "sweep_routes_sparse.sparse_kernel",
@@ -664,10 +575,9 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
                 self.assertTrue(any(flag in name for name in sparse))
         # The MF-GS kernels that keep row metadata resident are pinned.
         self.assertTrue([name for name in self.current if "RowPlaces(GLOBAL, SHARED, SHARED)" in name])
-        # The patch-only linked tiers are pinned beside the point tiers they extend.
+        # The linked tiers are pinned.
         linked = [name for name in self.current if "linked_rows=True" in name]
         self.assertTrue(linked)
-        self.assertTrue(set(linked) <= _PATCH_ONLY)
         # Their last-word velocity-limit pass, in the plain and the keyed-row tiers.
         last_word = {name.split("(", 1)[0] for name in linked if "velocity_limit_pass=True" in name}
         self.assertEqual(last_word, {"sweep_routes_tiers.parallel_kernel", "keyed_rows.get_parallel_factory"})
@@ -678,8 +588,9 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
         self.assertEqual(sorted(labels - set(self.current)), [])
 
 
-def record():
-    """Write pins for new kernels and refresh patch-only ones; refuse to change a point pin."""
+def record(rebaseline=False):
+    """Write pins for new kernels; with ``rebaseline`` also refresh changed pins and drop retired ones, listing each.
+    Without it, refuse to change or drop a pin."""
     try:
         stored = _stored()
     except FileNotFoundError:
@@ -690,8 +601,12 @@ def record():
     current = collect()
     if stored["warp"] == wp.config.version:
         changed, missing, _ = compare(stored["kernels"], current)
-        if changed or missing:
-            raise SystemExit(f"Point pins changed or disappeared; not recording: {changed + missing}")
+        if (changed or missing) and not rebaseline:
+            raise SystemExit(f"Pins changed or disappeared; not recording without --rebaseline: {changed + missing}")
+        for name in changed:
+            print(f"changed: {name}")
+        for name in missing:
+            print(f"retired: {name}")
     os.makedirs(os.path.dirname(_PINS), exist_ok=True)
     with open(_PINS, "w", encoding="utf-8") as stream:
         json.dump({"warp": wp.config.version, "kernels": current}, stream, indent=1, sort_keys=True)
@@ -701,9 +616,12 @@ def record():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--record", action="store_true", help="add pins for new kernels and refresh patch-only pins")
+    parser.add_argument("--record", action="store_true", help="add pins for new kernels")
+    parser.add_argument(
+        "--rebaseline", action="store_true", help="with --record, also refresh changed and drop retired pins"
+    )
     arguments, remaining = parser.parse_known_args()
     if arguments.record:
-        record()
+        record(rebaseline=arguments.rebaseline)
     else:
         unittest.main(argv=[sys.argv[0], *remaining])

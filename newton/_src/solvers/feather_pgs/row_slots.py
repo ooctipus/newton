@@ -125,7 +125,7 @@ def allocate_world_contact_slots(
     raced with concurrent reservations and left accepted rows past the count,
     which the friction patch links then chained into.
 
-    In a world the resolved-world classifier skips, no contact gets rows. Under persistent patch friction, a
+    In a world the resolved-world classifier skips, no contact gets rows. A
     contact the allocator would give rows there takes CONTACT_PATH_RESOLVED and no slot, so the patch finish
     releases its anchor, as the complete path releases an anchor whose rows solve zero load; every other contact
     keeps path -1, and its anchor history.
@@ -149,8 +149,6 @@ def allocate_world_contact_slots(
                 data.slot[c] = -1
                 data.path[c] = -1
                 data.slots_needed[c] = 0
-                if friction_patches.enabled == 0:
-                    continue
                 resolved = True
         admitted, art_a, art_b, world, phi = _admit_contact(
             c,
@@ -184,9 +182,9 @@ def allocate_world_contact_slots(
 
         # Every normal survives; only the selected patch anchors receive tangent rows.
         slots_needed = 1
-        add_friction = enable_friction != 0 and phi <= contact_friction_gap_threshold
-        if friction_patches.enabled != 0:
-            add_friction = add_friction and friction_patches.weight[c] > 0.0
+        add_friction = (
+            enable_friction != 0 and phi <= contact_friction_gap_threshold and friction_patches.weight[c] > 0.0
+        )
         if add_friction:
             slots_needed = 3 + patch_spin_rows(friction_patches, c, data.torsion)
         data.slots_needed[c] = slots_needed

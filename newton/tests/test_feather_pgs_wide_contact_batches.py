@@ -19,11 +19,11 @@ class TestWideContactBatches(unittest.TestCase):
                 self._check_width(width)
 
     def test_reject_unsupported_batch_layouts(self):
-        """Reject response widths beyond sixteen lanes and nontriple row schedules."""
-        for width, triples in ((15, True), (9, False)):
-            with self.subTest(dense_dofs=width, contact_triples=triples), self.assertRaises(ValueError):
+        """Reject response widths beyond sixteen lanes and schedules without contact units."""
+        for width, units in ((15, True), (9, False)):
+            with self.subTest(dense_dofs=width, contact_units=units), self.assertRaises(ValueError):
                 sparse_diagonal_kernel(
-                    24, width + 2, width, "120", contact_triples=triples, speculative_contact_batches=True
+                    24, width + 2, width, "120", contact_units=units, speculative_contact_batches=True
                 )
 
     def _check_width(self, width):
@@ -60,7 +60,8 @@ class TestWideContactBatches(unittest.TestCase):
         row_counts = np.full(worlds, prefix + 3 * contacts, dtype=np.int32)
         row_counts[-1] = prefix + 9
         serial_counts = np.array((5, 5, 5, 3), dtype=np.int32)
-        serial = np.full((worlds, (capacity + 2) // 3), -1, dtype=np.int32)
+        # A world lists at most a unit a row (the placement's capacity).
+        serial = np.full((worlds, capacity), -1, dtype=np.int32)
         serial[:, :contacts] = normal_rows
         sparse_dof = np.broadcast_to(np.array((width, width + 1), np.int32), (worlds, capacity, 2)).copy()
         sparse_dof[:, :prefix] = -1
@@ -121,7 +122,7 @@ class TestWideContactBatches(unittest.TestCase):
                 else:
                     arrays.append(value)
             kernel = sparse_diagonal_kernel(
-                capacity, dofs, width, str(device.arch), contact_triples=True, speculative_contact_batches=batch
+                capacity, dofs, width, str(device.arch), contact_units=True, speculative_contact_batches=batch
             )
             wp.launch_tiled(kernel, dim=[worlds], inputs=arrays[:28], outputs=arrays[28:], block_dim=32, device=device)
             leave_walk(walk, arrays[30], device)

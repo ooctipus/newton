@@ -101,7 +101,6 @@ _FRAME_KEEP = wp.constant(2)
 class FrictionPatches:
     """Per-contact view consumed by the existing contact row builders."""
 
-    enabled: int
     weight: wp.array[float]
     next_contact: wp.array[int]
     point: wp.array[wp.vec3]
@@ -118,10 +117,8 @@ PATCH_ROW_LAW = (
 PatchRowLaw = field_group.struct("PatchRowLaw", PATCH_ROW_LAW, __name__)
 """The friction row law, for producers that write their own friction rows.
 
-Under persistent patches a tangent row acts at its patch's friction location, carries the
-anchor's tangential displacement as phi and corrects it with ``beta`` (``friction_anchor_beta``).
-Point friction is the same law with beta 0 and a disabled view (a zero phi): its tangent rows act
-at the contact's point. Producers write the undivided friction coefficient; the patch
+A tangent row acts at its region's friction location, carries the anchor's tangential displacement as phi and
+corrects it with ``beta`` (``friction_anchor_beta``, the stick's gain, positive). Producers write the undivided friction coefficient; the patch
 link (``_FrictionPatchState.link``, which launches ``link_patch_routes``) divides it and links the
 ring. The Warp producers apply the law through :func:`.contact_input.contact_frame` and
 :func:`patch_tangent_row`; keyed rows write it in their native row source (``keyed_rows._row_source``).
@@ -129,12 +126,7 @@ ring. The Warp producers apply the law through :func:`.contact_input.contact_fra
 
 
 def patch_row_law(solver) -> "PatchRowLaw":
-    """The solver's patch row law for this step.
-
-    Point friction is the patch law with beta 0: its view is disabled, with a zero phi, and the producers take
-    the contact's point instead of a patch friction location. Bound every step: contact-pool growth
-    replaces the patch view.
-    """
+    """The solver's patch row law for this step. Bound every step: contact-pool growth replaces the patch view."""
     return field_group.bind(PatchRowLaw, laws=solver.laws, friction_patches=solver.laws.friction_patches)
 
 
@@ -156,7 +148,7 @@ def patch_spin_rows(patches: FrictionPatches, c: int, torsion: int):
     """Return the spin rows (0 or 1) of contact ``c``'s friction: one where its region has a footprint (a positive spin
     arm) or contact ``torsion`` gives every friction contact one, none on a one-contact region otherwise."""
     spin = torsion
-    if patches.enabled != 0 and patches.spin_arm[c] > 0.0:
+    if patches.spin_arm[c] > 0.0:
         spin = 1
     return spin
 
@@ -166,12 +158,7 @@ def patch_spin_row(law: PatchRowLaw, c: int, mu: float, authored: float):
     """Return contact ``c``'s spin row law: its phi (the region's twist displacement), beta and coefficient ``mu_t``,
     the friction coefficient ``mu`` times the region's spin arm, or the ``authored`` torsional coefficient where that
     is larger (contact torsion; 0 without it)."""
-    phi = float(0.0)
-    arm = float(0.0)
-    if law.patches.enabled != 0:
-        phi = law.patches.spin_phi[c]
-        arm = law.patches.spin_arm[c]
-    return phi, law.beta, wp.max(authored, mu * arm)
+    return law.patches.spin_phi[c], law.beta, wp.max(authored, mu * law.patches.spin_arm[c])
 
 
 @wp.struct
@@ -1132,9 +1119,8 @@ class _FrictionPatchState:
     sort.
     """
 
-    def __init__(self, model, capacity, enabled, phi, *, reuse_frames=False, pool=None):
+    def __init__(self, model, capacity, phi, *, reuse_frames=False, pool=None):
         self.view = FrictionPatches()
-        self.view.enabled = int(enabled)
         self.view.phi = phi
         device = model.device
         if pool is None:
@@ -1142,17 +1128,10 @@ class _FrictionPatchState:
         self.pool = pool
         self._rows_used = None
         self.capacity = pool.ready
-        self.reuse_frames = bool(reuse_frames and enabled)
+        self.reuse_frames = bool(reuse_frames)
         # (capture scope, weak generation array, frame-write tick) of the previous
         # captured build, which a build in the same scope may keep the pairs of.
         self._last_build = None
-        if not enabled:
-            self.view.weight = wp.zeros(0, dtype=float, device=device)
-            self.view.next_contact = wp.zeros(0, dtype=int, device=device)
-            self.view.point = wp.zeros(0, dtype=wp.vec3, device=device)
-            self.view.spin_arm = wp.zeros(0, dtype=float, device=device)
-            self.view.spin_phi = wp.zeros(0, dtype=float, device=device)
-            return
         self.device = device
         # The pair sort skips the key bits no pair key can set.
         self.key_stride, self.key_bits = _pair_key_layout(model.body_count, model.shape_body.shape[0])

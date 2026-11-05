@@ -584,17 +584,17 @@ class Placement:
             self.arrays.allocate(SPARSE_DIAGONAL_ROWS, world=self.forest.world_count, row=self.dense_max_constraints)
         else:
             self.arrays.allocate(SPARSE_DIAGONAL_ROWS, world=1, row=1)
-        if self.sparse_diagonal_contact_triples or self.sparse_diagonal_contact_units:
+        if self.sparse_diagonal_contact_units:
             self.arrays.allocate(
                 SPARSE_CONTACT_GROUPS, world=self.forest.world_count, world_dof=self.forest.max_world_dofs
             )
         else:
             self.arrays.allocate(SPARSE_CONTACT_GROUPS, world=1, world_dof=1)
         if self.sparse_diagonal_speculative_contact_batches:
-            # A triple spans three rows, while a unit may be a single normal row.
-            rows = self.dense_max_constraints
-            serial = rows if self.sparse_diagonal_contact_units else (rows + 2) // 3
-            self.arrays.allocate(SPARSE_CONTACT_SERIAL, world=self.forest.world_count, serial=serial)
+            # A unit may be a single normal row: a world lists at most a unit a row.
+            self.arrays.allocate(
+                SPARSE_CONTACT_SERIAL, world=self.forest.world_count, serial=self.dense_max_constraints
+            )
         else:
             self.arrays.allocate(SPARSE_CONTACT_SERIAL, world=1, serial=1)
 

@@ -6,7 +6,6 @@
 import ast
 import dataclasses
 import inspect
-import itertools
 import os
 import textwrap
 import unittest
@@ -81,15 +80,15 @@ def make_case(*, free=False):
     return data, raw, scratch
 
 
-def evaluate(data, raw, scratch, *, enabled=1, published=False, row_bound=None):
+def evaluate(data, raw, scratch, *, enabled=1, published=False, row_bound=(100, 100)):
     """Execute the decision kernels on CPU, without initializing CUDA.
 
     ``published`` reads the predictor twists in ``data.predicted_twist``, as
     on the held-tree owner, instead of running the classifier's body pass.
-    ``row_bound`` (dense, matrix-free) runs persistent patch friction's capacity-bounded decision.
+    ``row_bound`` (dense, matrix-free) bounds the worlds' rows; the default leaves every case room.
     """
     data.use_published = int(published)
-    free_normals = wp.zeros(1, dtype=wp.int32, device="cpu") if row_bound is not None else None
+    free_normals = wp.zeros(scratch.resolved.shape[0], dtype=wp.int32, device="cpu")
     rw.launch(
         data,
         raw,
@@ -114,11 +113,10 @@ _ALLOCATION_SHAPES = ((0, 4), (1, 4), (0, 4), (2, 4), (0, 2), (3, 4))
 _ALLOCATION_LIFT = (0.0, 0.0, 0.5, 0.0, 0.0, 0.0)
 
 
-def _allocate(kernel, resolved, patch_friction=False):
+def _allocate(kernel, resolved):
     """Run one allocator serially over the synthetic contacts; return its per-contact outputs and counters."""
     count = len(_ALLOCATION_SHAPES)
     patches = FrictionPatches()
-    patches.enabled = int(patch_friction)
     # Every anchor carries load, and a one-contact region no spin row, so patch friction reserves the rows point
     # friction does.
     patches.weight = wp.ones(count, dtype=float, device="cpu")
@@ -274,17 +272,14 @@ class TestResolvedWorlds(unittest.TestCase):
         data.prescribed_articulation = a([0, 0], wp.int32)
         data.body_has_response_dofs = a([1, 1], wp.int32)
         data.body_response_dof_mask = a([1, 1], wp.uint32)
-        # Point friction decides without a row bound; patch friction's bound fits the contact's three rows.
-        laws = (("point", None), ("patch", (100, 100)))
         # (flag of body 1, its speed along the contact normal, resolved); positive speed closes the gap.
         for flag, speed, resolved in ((1, 2.0, 0), (1, -2.0, 1), (2, 2.0, 0), (2, -2.0, 0)):
             data.body_flags.assign([1, flag])
             data.v_hat.assign([0.0, speed])
             data.predicted_twist.assign([[0.0] * 6, [speed, 0.0, 0.0, 0.0, 0.0, 0.0]])
-            for (law, row_bound), published in itertools.product(laws, (False, True)):
-                with self.subTest(law=law, kinematic=flag == 2, speed=speed, published=published):
-                    decision = evaluate(data, raw, scratch, published=published, row_bound=row_bound)
-                    self.assertEqual(decision, resolved)
+            for published in (False, True):
+                with self.subTest(kinematic=flag == 2, speed=speed, published=published):
+                    self.assertEqual(evaluate(data, raw, scratch, published=published), resolved)
                     self.assertEqual(int(scratch.checked_normals.numpy()[0]), 1)
 
     def test_zero_friction_radius_allows_slip(self):
@@ -393,21 +388,15 @@ class TestResolvedWorlds(unittest.TestCase):
     def test_patch_allocator_marks_the_contacts_the_complete_path_reserves(self):
         """In a resolved world, mark exactly the contacts the allocator would give rows; leave other worlds alone."""
         complete = _allocate(row_slots.allocate_world_contact_slots, [])
-        point = _allocate(row_slots.allocate_world_contact_slots, [1, 0])
-        patch_friction = _allocate(row_slots.allocate_world_contact_slots, [1, 0], patch_friction=True)
+        patch_friction = _allocate(row_slots.allocate_world_contact_slots, [1, 0])
         np.testing.assert_array_equal(complete["contact_slot"] >= 0, [True, False, False, True, False, True])
         np.testing.assert_array_equal(complete["contact_path"], [0, -1, -1, 0, -1, 1])
         world_zero = np.array([True, True, True, False, False, True])
-        # Point friction keeps no anchors: resolved contacts carry no route at all.
-        np.testing.assert_array_equal(point["contact_path"][world_zero], -1)
         expected = np.where(complete["contact_slot"] >= 0, int(CONTACT_PATH_RESOLVED), -1)
         np.testing.assert_array_equal(patch_friction["contact_path"][world_zero], expected[world_zero])
-        for name in ("contact_slot", "contact_slots_needed", "contact_world", "contact_art_a", "contact_art_b"):
-            np.testing.assert_array_equal(patch_friction[name][world_zero], point[name][world_zero], err_msg=name)
         np.testing.assert_array_equal(patch_friction["contact_slot"][world_zero], -1)
+        np.testing.assert_array_equal(patch_friction["contact_slots_needed"][world_zero], 0)
         # The resolved world reserves no rows; world 1 and the cross-world pair allocate as before.
-        for name in ("world_slot_counter", "mf_slot_counter"):
-            np.testing.assert_array_equal(patch_friction[name], point[name], err_msg=name)
         self.assertEqual(int(patch_friction["world_slot_counter"][0]) + int(patch_friction["mf_slot_counter"][0]), 0)
         for name in ("contact_slot", "contact_path", "contact_slots_needed"):
             np.testing.assert_array_equal(patch_friction[name][~world_zero], complete[name][~world_zero], err_msg=name)
@@ -475,13 +464,11 @@ class TestResolvedWorlds(unittest.TestCase):
         self.assertTrue(rw.supported(solver))
         solver.laws.set = plain_laws(compliance=True)
         self.assertFalse(rw.supported(solver))
-        solver.laws.set = plain_laws(contact="patch")
-        self.assertTrue(rw.supported(solver))
         solver.routes.case = "K1"
         self.assertFalse(rw.supported(solver))
 
-    def test_classify_bounds_patch_worlds_by_the_solver_capacities(self):
-        """Under patch friction the decision gets the solver's dense and matrix-free row capacities; point gets none."""
+    def test_classify_bounds_worlds_by_the_solver_capacities(self):
+        """The decision gets the solver's dense and matrix-free row capacities."""
         model = _build("cpu", worlds=2)
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
@@ -492,27 +479,23 @@ class TestResolvedWorlds(unittest.TestCase):
             body_v_s=wp.zeros(model.body_count, dtype=wp.spatial_vector, device="cpu"),
             joint_S_s=wp.zeros(model.joint_dof_count, dtype=wp.spatial_vector, device="cpu"),
         )
-        for law, beta, bound in (("patch", None, (48, 24)), ("point", 0.0, None)):
-            with self.subTest(law=law):
-                solver = SolverFeatherPGS(
-                    model, dense_max_constraints=48, mf_max_constraints=24, friction_anchor_beta=beta
-                )
-                # The classifier owns only the CUDA matrix-free route; split mode keeps no world DOF map,
-                # which the mocked decision launch never reads.
-                solver.forest = dataclasses.replace(
-                    solver.forest,
-                    world_dof_indices=wp.zeros((model.world_count, 1), dtype=int, device="cpu"),
-                    world_dof_count=wp.zeros(model.world_count, dtype=int, device="cpu"),
-                )
-                with patch.object(rw, "decline", return_value=None):
-                    owner = rw.ResolvedWorlds(solver)
-                with patch.object(rw, "launch") as launch:
-                    owner.classify(state, augmented, contacts, DT)
-                launch.assert_called_once()
-                options = launch.call_args.kwargs
-                self.assertEqual(options["row_bound"], bound)
-                self.assertIs(options["free_normals"], owner.free_normals)
-                self.assertEqual(owner.free_normals.shape, (model.world_count if bound else 0,))
+        solver = SolverFeatherPGS(model, dense_max_constraints=48, mf_max_constraints=24)
+        # The classifier owns only the CUDA matrix-free route; split mode keeps no world DOF map,
+        # which the mocked decision launch never reads.
+        solver.forest = dataclasses.replace(
+            solver.forest,
+            world_dof_indices=wp.zeros((model.world_count, 1), dtype=int, device="cpu"),
+            world_dof_count=wp.zeros(model.world_count, dtype=int, device="cpu"),
+        )
+        with patch.object(rw, "decline", return_value=None):
+            owner = rw.ResolvedWorlds(solver)
+        with patch.object(rw, "launch") as launch:
+            owner.classify(state, augmented, contacts, DT)
+        launch.assert_called_once()
+        options = launch.call_args.kwargs
+        self.assertEqual(options["row_bound"], (48, 24))
+        self.assertIs(options["free_normals"], owner.free_normals)
+        self.assertEqual(owner.free_normals.shape, (model.world_count,))
 
     def test_policy_names_no_robot(self):
         """The admission reads row kinds and sizes, never a robot."""
@@ -547,10 +530,10 @@ def _rollout(
     classifier,
     steps=90,
     published=True,
-    friction_anchor_beta=0.0,
     history=None,
     solver_kwargs=None,
     toss_every=2,
+    friction_anchor_beta=0.2,
 ):
     """Swing the arms and toss every ``toss_every``-th free body; return the solver, poses and resolved masks.
 
@@ -721,7 +704,6 @@ class TestResolvedWorldsDevice(unittest.TestCase):
                 solver, poses, masks = _rollout(
                     model, classifier=True, friction_anchor_beta=None, history=history, solver_kwargs=solver_kwargs
                 )
-                self.assertTrue(solver.laws.friction_anchors_enabled)
                 self.assertIsNotNone(solver.sweep.resolved_worlds_owner)
                 self.assertEqual(
                     solver.sweep.resolved_worlds_owner.row_bound,
@@ -817,7 +799,6 @@ class TestResolvedWorldsSparseRoute(unittest.TestCase):
                 pgs_iterations=8,
                 enable_joint_limits=True,
                 dense_max_constraints=56,
-                friction_anchor_beta=0.0,
             )
         self.assertLessEqual(set(env), set(solver.get_path_selection()["environment"]["unknown"]))
         self.assertIsNotNone(solver.placement.sparse_mass_matrix_size)

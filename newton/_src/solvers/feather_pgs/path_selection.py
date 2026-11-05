@@ -287,7 +287,7 @@ def _kernel_names(kernels) -> list:
 
 
 def _row_builder(solver, plan, size) -> dict:
-    """Name the kernels that build one DOF size's dense contact rows outside the sweep, and their law.
+    """Name the kernels that build one DOF size's dense contact rows outside the sweep.
 
     Mirrors the producers' launches, in launch order: the one writer, compact_contact.launch_contacts,
     LocalRowPackets.produce_contacts and finish_rows, and KeyedRows.produce_contacts and finish_rows.
@@ -296,8 +296,7 @@ def _row_builder(solver, plan, size) -> dict:
     rows, which walk_rows.write_free_body_rows writes for the contacts the allocation routes to them
     (routes.free_rigid_bodies).
     """
-    method, law = plan.methods[size], plan.law
-    patch = law == "patch"
+    method = plan.methods[size]
     marker = ()
     if solver.spec.case == "K2" and size == solver.placement.sparse_diagonal_response_size:
         # The sparse diagonal's marker encodes schedule links into the slots its writer just wrote.
@@ -319,7 +318,6 @@ def _row_builder(solver, plan, size) -> dict:
     elif method == "keyed_rows":
         from . import keyed_rows, walk_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
 
-        patch = bool(solver.placement.keyed_rows.patch)
         # The parallel tiers (routes.sweep.tiers) build the direct rows in the sweep; the one writer walks the rows
         # of every other world (keyed_general_units hands them over).
         kernels = (keyed_rows.scatter_contact_keys, keyed_rows.keyed_general_units, walk_rows.writer_kernel(solver))
@@ -330,7 +328,7 @@ def _row_builder(solver, plan, size) -> dict:
         kernels = (compact_contact.produce_contacts, walk_rows.write_slot_rows, *marker)
     else:
         raise ValueError(f"No contact-row builder kernels are known for the method {method!r}.")
-    entry = {"method": method, "kernels": _kernel_names(kernels), "law": "patch" if patch else "point"}
+    entry = {"method": method, "kernels": _kernel_names(kernels)}
     if method == "keyed_rows":
         entry["direct_rows"] = "routes.sweep.tiers"
     return entry
@@ -338,16 +336,13 @@ def _row_builder(solver, plan, size) -> dict:
 
 def _contact_rows(solver) -> dict:
     row = solver.spec.route
-    point = bool(row.laws.point)
     # The plan the row pass (RowLaws.write_contacts) dispatches on: the route's producer writes every contact row.
     plan = contact_row_plan(solver)
     return {
         "producer": row.producer,
-        "law": plan.law,
         # Every producer, every size: the builder method, its kernels in launch order and the law they write,
         # for the dense contact rows built outside the sweep (_row_builder names the rows built elsewhere).
         "builder_by_dof": {str(int(size)): _row_builder(solver, plan, size) for size in plan.methods},
-        "point_contact_paths": point,
         "keyed_rows": {"enabled": row.producer == "keyed_rows", "reason": solver.placement.keyed_rows_reason},
         "compact_contact": {
             "boundary": row.producer == "compact_contact_boundary",
@@ -383,7 +378,6 @@ def _paired_response(solver) -> dict:
         "factor_coordinates": factor,
         # Why the paired response keeps its register inverse instead of factor coordinates (None when admitted).
         "factor_coordinates_reason": row.reasons["K5"],
-        "contact_triples": bool(solver.sweep.factor_coordinate_contact_triples),
         "contact_units": bool(solver.sweep.factor_coordinate_contact_units),
         "components": solver.sweep.paired_components is not None,
         "components_reason": solver.sweep.paired_components_reason,
@@ -402,7 +396,6 @@ def _sparse_diagonal(solver) -> dict:
         "enabled": row.case == "K2",
         "response_dofs": json_value(row.sizes["diagonal"]),
         "dense_dofs": int(row.sizes["dense"] or 0),
-        "contact_triples": bool(solver.placement.sparse_diagonal_contact_triples),
         "contact_units": bool(solver.placement.sparse_diagonal_contact_units),
         "speculative_contact_batches": bool(solver.placement.sparse_diagonal_speculative_contact_batches),
         "fused_joint_limits": bool(solver.placement.fused_diagonal_joint_limits),
@@ -668,24 +661,17 @@ def _pair_sort(patches) -> dict:
 
 
 def _friction(solver) -> dict:
-    patch = bool(solver.laws.friction_anchors_enabled)
-    reason = _BETA_REASONS[solver.laws.friction_anchor_beta_source]
-    if patch:
-        # Patch friction reaches the resolved-world classifier on the dense paths only, not under compliance.
-        if solver.laws.set.compliance:
-            reason += " Point-contact owners (the resolved-world classifier) need point friction."
     return {
-        "law": "patch" if patch else "point",
         "friction_anchor_beta": json_value(solver.laws.friction_anchor_beta),
         "anchor_beta_source": solver.laws.friction_anchor_beta_source,
         "torsion": bool(solver.laws.spin_rows),
         "compliance": bool(solver.options.contact_compliance),
-        "reason": reason,
+        "reason": _BETA_REASONS[solver.laws.friction_anchor_beta_source],
         "frame_reuse": {
             "enabled": solver.laws.friction_patches.reuse_frames,
             "reason": solver.laws.patch_frame_reuse_reason,
         },
-        "pair_sort": _pair_sort(solver.laws.friction_patches) if patch else None,
+        "pair_sort": _pair_sort(solver.laws.friction_patches),
     }
 
 

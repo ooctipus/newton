@@ -21,8 +21,6 @@ __all__ = ["CAPABILITIES", "CASES", "Laws", "RouteRow", "RouteTable", "capable"]
 class Laws:
     """Axis 2: the row laws, from the physics options and the model (never from a route)."""
 
-    contact: str
-    """``"patch"`` (persistent friction patches, ``friction_anchor_beta > 0``) or ``"point"`` friction."""
     regularized: bool
     """Contact rows step toward the hard law with a float32 weight below one (``pgs_contact_regularization``)."""
     torsion: bool
@@ -58,22 +56,11 @@ class Laws:
         compliance (every placement's sweep reads them)."""
         return self.regularized or self.compliance
 
-    @property
-    def point(self) -> bool:
-        """Point-friction rows of the point row law."""
-        return self.contact == "point"
-
-    @property
-    def patch(self) -> bool:
-        """Patch-friction rows of the patch row law."""
-        return self.contact == "patch"
-
     @classmethod
     def build(cls, laws, options, model, *, preelimination: bool) -> Laws:
         """Read the laws from the row laws' tables (:class:`.rows.RowLaws`: friction, regularization, torsion, mimic
         and link plans), the options and the model, with the bilateral pre-elimination decision."""
         return cls(
-            contact="patch" if laws.friction_anchors_enabled else "point",
             regularized=bool(laws.regularization_enabled),
             torsion=bool(laws.spin_rows),
             compliance=bool(options.contact_compliance),

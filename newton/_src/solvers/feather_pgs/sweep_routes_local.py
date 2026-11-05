@@ -5,7 +5,7 @@
 
 :func:`paired_factor_kernel`: one warp per world of an articulation and a free body, rows in factor coordinates
 (:class:`.response_operator.FactorRows`) on the velocity change from the predictor, which leaves per component, under
-one of three schedules: row by row, contact triples after a prefix, or contact units. Its working set fits the static
+one of two schedules: row by row, or contact units. Its working set fits the static
 budget of the device it is built for (:func:`.memory.arch_budget`).
 """
 
@@ -27,7 +27,6 @@ from .response_operator import FactorComponent, FactorRows, Lanes
 from .row_inputs import RowArgument
 from .solve_policy import DEFAULT_POLICY, SolvePolicy
 from .sweep import (
-    CONTACT,
     FRICTION,
     TORSION,
     UNIT_HELD,
@@ -86,7 +85,6 @@ def paired_factor_source(
     max_world_dofs: int,
     primary_dofs: int,
     secondary_dofs: int,
-    contact_triples: bool = False,
     independent_components: bool = False,
     *,
     contact_units: bool = False,
@@ -103,9 +101,7 @@ def paired_factor_source(
     contact is four rows, its normal and its friction triple visited one by one, the triple from its metric cached
     for the launch (:func:`.sweep.friction_metric_law`).
 
-    The schedule visits the rows in slot order: row by row; with ``contact_triples``, when the world's rows are a
-    prefix and then normal/tangent/tangent triples, the prefix row by row and each triple as a contact unit; with
-    ``contact_units``, each row, and a row with the tangent pair it owns (patch contacts own one when they hold an
+    The schedule visits the rows in slot order: row by row; with ``contact_units``, each row, and a row with the tangent pair it owns (patch contacts own one when they hold an
     anchor) as a contact unit (:func:`_contact_unit`: a loaded unit on its Gram block, one ladder and one apply). With
     ``independent_components`` a world whose signed free-body row count is negative solves only its articulation's
     coordinates (its free body's rows run in the matrix-free sweep).
@@ -123,11 +119,8 @@ def paired_factor_source(
         raise ValueError("max_constraints must be positive")
     if P <= 0 or S <= 0 or P + S != D or D > 32:
         raise ValueError("paired factor PGS requires two positive components spanning at most 32 world DOFs")
-    if contact_triples and contact_units:
-        raise ValueError("contact triples and contact units are exclusive paired factor schedules")
     lanes = Lanes(32)
     laws = RowLaws(regularize=weighted, material=material, torsion=torsion, policy=solve_policy)
-    stride = 3 + int(torsion)
     op = FactorRows(
         D,
         (
@@ -143,7 +136,6 @@ def paired_factor_source(
             Buffer("s_rhs", "float", M),
             Buffer("s_diag", "float", M),
             Buffer("s_type", "unsigned char", M),
-            *((Buffer("s_contact_mu", "float", (M + stride - 1) // stride),) if contact_triples else ()),
         ),
         groups=_PAIRED_WORLDS_PER_BLOCK,
         threads=32 * _PAIRED_WORLDS_PER_BLOCK,
@@ -166,15 +158,10 @@ def paired_factor_source(
         lanes=lanes,
         inline_velocity_limit=True,
         spin_row=lambda parent: spin_row(parent, "m", lambda row: f"static_cast<int>(s_type[{row}])"),
+        # A friction triple reads its metric cached for the launch (sweep.friction_metric_law).
+        **({"triple_law": "ROW_TRIPLE(parent, "} if torsion else {}),
     )
-    general = _paired_rows(ctx, laws, "m")
-    if contact_triples:
-        triples = _paired_rows(ctx, laws, "contact_start", friction=False) + "\n" + _paired_triples(ctx, laws, stride)
-        schedule = f"if (triple_layout) {{\n{indent(triples, '    ')}\n}} else {{\n{indent(general, '    ')}\n}}"
-    elif contact_units:
-        schedule = _paired_units(ctx, laws)
-    else:
-        schedule = general
+    schedule = _paired_units(ctx, laws) if contact_units else _paired_rows(ctx, laws, "m")
 
     world_rows = "if (m == 0 || world_mf_constraint_count.data[world] != 0) return;"
     write = "global_dof >= 0"
@@ -184,19 +171,6 @@ def paired_factor_source(
             "    const bool split_component = world_mf_constraint_count.data[world] < 0;"
         )
         write += f" && (!split_component || (primary_lane >= 0 && primary_lane < {P}))"
-    layout = mu_load = ""
-    if contact_triples:
-        rows = "normal/tangent/tangent/spin quads" if torsion else "normal/tangent/tangent triples"
-        layout = f"""
-    int contact_start = dense_phase_bounds.data[world * 2 + 1];
-    if (contact_start < 0) contact_start = 0;
-    if (contact_start > m) contact_start = m;
-    // A prefix, then contacts that own exact {rows}.
-    const bool triple_layout = dense_phase_bounds.data[world * 2] == contact_start && (m - contact_start) % {stride} == 0;
-    const int contact_count = (m - contact_start) / {stride};"""
-        mu_load = f"""
-    for (int contact = lane; contact < contact_count; contact += 32)
-        s_contact_mu[contact] = world_row_mu.data[off + contact_start + contact * {stride} + 1];"""
     # Where spin rows may appear, every friction triple's metric is formed once per launch, at its first loaded visit
     # (sweep.friction_metric_stage), and its later visits only project.
     metric = ""
@@ -233,14 +207,14 @@ def paired_factor_source(
     const int secondary_offset = secondary_offset_by_world.data[world];
     // A contact normal's patch ring links the region's next normal (-1 ends a point contact).
     const auto ring_parent = [&](int r) {{ return world_row_parent.data[off + r]; }};
-    const auto ring_impulse = [&](int r) {{ return s_lam[r]; }};{layout}
+    const auto ring_impulse = [&](int r) {{ return s_lam[r]; }};
 
     for (int i = lane; i < m; i += 32) {{
         s_lam[i] = world_impulses.data[off + i];
         s_rhs[i] = rhs_bias.data[off + i] + row_incident.data[off + i];
         s_diag[i] = world_diag.data[off + i];
         s_type[i] = static_cast<unsigned char>(world_row_type.data[off + i]);
-    }}{mu_load}
+    }}
     // The velocity change in factor coordinates per component, coordinate LANE in this lane's register.
     const int global_dof = lane < {D} ? world_dof_indices.data[dof_map_base + lane] : -1;
 {chr(10).join(op.lanes_of("    "))}
@@ -267,10 +241,9 @@ def paired_factor_source(
     return cuda_native(body, preludes=preludes), staging
 
 
-def _paired_rows(ctx: RowContext, laws: RowLaws, end: str, *, friction: bool = True) -> str:
+def _paired_rows(ctx: RowContext, laws: RowLaws, end: str) -> str:
     """Rows ``[0, end)`` one at a time in slot order, each row's factor row pipelined; a friction pair at its first
-    tangent, its sibling's factor row loaded with the pair. Without ``friction`` the rows hold no friction pairs (a
-    triple layout's prefix)."""
+    tangent, its sibling's factor row loaded with the pair."""
     op = ctx.operator
     sibling = f"const float {op.sibling} = row_type == {FRICTION} ? ({op.load('parent + 2')}) : 0.0f;\n"
     if laws.torsion:
@@ -281,13 +254,13 @@ def _paired_rows(ctx: RowContext, laws: RowLaws, end: str, *, friction: bool = T
         f"for (int i = 0; i < {end}; ++i) {{",
         op.consume("i", end, "    "),
         "    const int row_type = static_cast<int>(s_type[i]);",
-        f"    if (row_type == {TORSION}) continue;" if laws.torsion and friction else "",
+        f"    if (row_type == {TORSION}) continue;" if laws.torsion else "",
         row_visit(
-            dataclasses.replace(ctx, friction=friction),
+            ctx,
             laws,
             parent="world_row_parent.data[off + i]",
             check="denom",
-            declare=(sibling if friction else "") + "const float denom = s_diag[i];",
+            declare=sibling + "const float denom = s_diag[i];",
             pad="    ",
         ),
         "}",
@@ -430,18 +403,6 @@ def _unit_row(ctx: RowContext, laws: RowLaws, kind: str, *, load: bool = True) -
     return "\n".join(line for line in lines if line)
 
 
-def _paired_triples(ctx: RowContext, laws: RowLaws, stride: int) -> str:
-    """The contact triples (quads under torsion: ``stride`` rows) after the prefix, each a contact unit
-    (:func:`_contact_unit`)."""
-    lines = [
-        "for (int contact = 0; contact < contact_count; ++contact) {",
-        f"    const int head = contact_start + contact * {stride};",
-        indent(_contact_unit(ctx, laws, str(CONTACT), "s_contact_mu[contact]"), "    "),
-        "}",
-    ]
-    return "\n".join(lines)
-
-
 def _paired_units(ctx: RowContext, laws: RowLaws) -> str:
     """Contact units in slot order: a row by the row law, or, with the tangent pair it owns, a contact unit.
 
@@ -476,7 +437,6 @@ def paired_factor_kernel(
     primary_dofs: int,
     secondary_dofs: int,
     device_arch: str,
-    contact_triples: bool = False,
     independent_components: bool = False,
     *,
     contact_units: bool = False,
@@ -493,7 +453,6 @@ def paired_factor_kernel(
         max_world_dofs,
         primary_dofs,
         secondary_dofs,
-        contact_triples,
         independent_components,
         contact_units=contact_units,
         torsion=torsion,
@@ -505,7 +464,6 @@ def paired_factor_kernel(
     staging.check("the paired factor sweep", arch_budget(device_arch))
     name = (
         f"sweep_paired_factor_{max_constraints}_{max_world_dofs}_{primary_dofs}_{secondary_dofs}"
-        + ("_contact3" if contact_triples else "")
         + ("_units" if contact_units else "")
         + ("_components" if independent_components else "")
         + ("_weighted" if weighted else "")

@@ -32,7 +32,7 @@ from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices
 WORLDS, CONTACTS, PRIMARY, SECONDARY = 8, 3, 7, 6
 DOFS = PRIMARY + SECONDARY
 CAPACITY = 1 + 4 * CONTACTS
-SCHEDULES = ({}, {"contact_triples": True}, {"contact_units": True})
+SCHEDULES = ({}, {"contact_units": True})
 
 
 def _fixture(rng):

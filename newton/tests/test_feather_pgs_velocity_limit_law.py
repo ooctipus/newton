@@ -254,7 +254,6 @@ def _pushed_arm(device, limit):
 def _matrix_free_solver(model, *, pins=None, **options):
     settings = {
         "enable_joint_velocity_limits": True,
-        "friction_anchor_beta": 0.0,
         "pgs_iterations": 8,
         "dense_max_constraints": 32,
         "mf_max_constraints": 32,

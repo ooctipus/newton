@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run one (scene, friction law, world count) cell of the FeatherPGS patch-vs-point study.
+"""Run one (scene, world count) cell of the FeatherPGS big-scene runs, under the one friction law.
 
 The solver is constructed exactly as the scene's own code constructs it, except
-``friction_anchor_beta`` (point: 0.0; patch: omitted, so Newton's default 0.2 applies). The metric
+``friction_anchor_beta`` (omitted, so Newton's default 0.2 applies). The metric
 objects' initial poses get a small seeded per-world perturbation (identical in both arms; world 0
 keeps the example's poses), so the worlds are trials, not replicas. The run verifies the law that
 was actually built, captures one frame (all substeps) in a CUDA graph and times every graph launch
@@ -61,7 +61,7 @@ GPU_FIELDS = (
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--scene", required=True, choices=("hardware", "coins", "dishes", "cube", "pyramid"))
-    p.add_argument("--law", required=True, choices=("patch", "point"))
+    p.add_argument("--law", default="patch", choices=("patch",), help="the friction law (one: the solver's default)")
     p.add_argument("--world-count", type=int, required=True)
     p.add_argument("--label", required=True, help="results/<label>/ subdirectory")
     p.add_argument("--tag", default="", help="optional file-name suffix, e.g. r2 for a repeat")
@@ -272,29 +272,19 @@ def verify_law(scene, law, scenes) -> dict:
     warnings_text = scene.law_record.get("warnings", [])
     checks = {
         "solver.laws.friction_anchor_beta": (solver.laws.friction_anchor_beta, expected["friction_anchor_beta"]),
-        "solver.laws.friction_anchors_enabled": (
-            bool(solver.laws.friction_anchors_enabled),
-            expected["anchors_enabled"],
-        ),
         "solver.laws.friction_anchor_beta_source": (solver.laws.friction_anchor_beta_source, expected["beta_source"]),
-        "routes.friction.law": (friction.get("law"), law),
         "routes.friction.anchor_beta_source": (friction.get("anchor_beta_source"), expected["beta_source"]),
         "options.friction_anchor_beta.requested": (option.get("requested"), expected["requested"]),
-        "friction_patches.view.enabled": (
-            int(solver.laws.friction_patches.view.enabled),
-            int(expected["anchors_enabled"]),
-        ),
         "constructor_friction_warnings": ([w for w in warnings_text if "friction" in w.lower()], []),
         "environment_flags": (
             {key: environment.get(key) for key in ("applied", "unknown", "retired")},
             {"applied": {}, "unknown": [], "retired": []},
         ),
     }
-    if law == "patch":
-        checks["patch_capacity_equals_rigid_contact_max"] = (
-            int(solver.laws.friction_patches.capacity),
-            int(scene.contacts.rigid_contact_max),
-        )
+    checks["patch_capacity_equals_rigid_contact_max"] = (
+        int(solver.laws.friction_patches.capacity),
+        int(scene.contacts.rigid_contact_max),
+    )
     detail = {name: {"actual": a, "expected": e, "ok": same(a, e)} for name, (a, e) in checks.items()}
     return {"ok": all(d["ok"] for d in detail.values()), "checks": detail}, selection
 
@@ -431,7 +421,7 @@ def snapshot(scene, metric_worlds, sim_time, model_np, metrics, kernels, metric_
         census[name] = {"rows": int(c.sum()), "normal": normal, "friction": friction}
     out["census"] = census
     patches = solver.laws.friction_patches
-    if solver.laws.friction_anchors_enabled and n:
+    if n:
         weight = patches.view.weight.numpy()[:n]
         source = patches.current.source.numpy()[:n]
         out["anchors"] = {

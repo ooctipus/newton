@@ -291,7 +291,7 @@ class _Scene:
 def _pair(scene, capacity):
     """Return the patch state under test and its reference, both built from ``scene``."""
     phi = [wp.zeros(capacity, dtype=wp.vec2, device=scene.device) for _ in range(2)]
-    return _FrictionPatchState(scene.model, capacity, True, phi[0]), ReferencePatches(scene.model, capacity, phi[1])
+    return _FrictionPatchState(scene.model, capacity, phi[0]), ReferencePatches(scene.model, capacity, phi[1])
 
 
 def _set_threads(patches, threads):
@@ -313,7 +313,6 @@ def _twin(patches, scene):
     twin = _FrictionPatchState(
         scene.model,
         patches.capacity,
-        True,
         wp.zeros_like(patches.view.phi),
         reuse_frames=patches.reuse_frames,
     )
@@ -912,7 +911,7 @@ class TestPatchSortKeys(unittest.TestCase):
     def test_build_rejects_another_model(self):
         """Refuse body poses or shapes of another model than the one the pair keys were sized for."""
         scene = _Scene("cpu", 0)
-        patches = _FrictionPatchState(scene.model, 96, True, wp.zeros(96, dtype=wp.vec2, device="cpu"))
+        patches = _FrictionPatchState(scene.model, 96, wp.zeros(96, dtype=wp.vec2, device="cpu"))
         scene.frame()
         fewer_bodies = SimpleNamespace(body_q=wp.array(scene.poses[:-1], dtype=wp.transform, device="cpu"))
         more_shapes = SimpleNamespace(
@@ -1214,7 +1213,7 @@ def run_live_sort_cases(test, device, capacities, extra_counts=()):
     codes = np.minimum(first, second).astype(np.int64) * stride + np.maximum(first, second)
     test.assertLess(int(codes.max()), 1 << 51)
     for capacity in capacities:
-        patches = _FrictionPatchState(scene.model, capacity, True, wp.zeros(capacity, dtype=wp.vec2, device=device))
+        patches = _FrictionPatchState(scene.model, capacity, wp.zeros(capacity, dtype=wp.vec2, device=device))
         counts = {0, 1, 2047, 2048, 2049, capacity // 2, capacity - 1, capacity, *extra_counts}
         for live in sorted(count for count in counts if 0 <= count <= capacity):
             with test.subTest(capacity=capacity, live=live):
@@ -1246,8 +1245,8 @@ class TestPatchLiveSort(unittest.TestCase):
         """Sort only the live prefix at every capacity while the pair keys leave room for the slot bits."""
         scene = _Scene("cpu", 0)
         phi = wp.zeros(96, dtype=wp.vec2, device="cpu")
-        self.assertTrue(_FrictionPatchState(scene.model, 96, True, phi).live_sort)
-        self.assertTrue(_FrictionPatchState(scene.model, 64, True, phi[:64]).live_sort)
+        self.assertTrue(_FrictionPatchState(scene.model, 96, phi).live_sort)
+        self.assertTrue(_FrictionPatchState(scene.model, 64, phi[:64]).live_sort)
         self.assertTrue(friction_patches._uses_live_sort(51))
         # Pair keys of 52 bits and more fall back to the radix sort: their 11-bit
         # slot would reach the chunk keys' pad bit.
@@ -1504,7 +1503,7 @@ def run_launch_shapes(
     states = []
     for shape in shapes:
         phi = wp.zeros(capacity, dtype=wp.vec2, device=device)
-        state = _FrictionPatchState(scene.model, capacity, True, phi, reuse_frames=reuse)
+        state = _FrictionPatchState(scene.model, capacity, phi, reuse_frames=reuse)
         for name, value in (shape or {}).items():
             setattr(state, name, value)
         if live_sort is not None:
@@ -1618,7 +1617,7 @@ class TestPatchLaunchShapes(unittest.TestCase):
         for capacity in (96, 3000, 4600, 10000):
             with self.subTest(capacity=capacity):
                 phi = wp.zeros(capacity, dtype=wp.vec2, device="cpu")
-                state = _FrictionPatchState(scene.model, capacity, True, phi)
+                state = _FrictionPatchState(scene.model, capacity, phi)
                 # The CPU counts as one SM.
                 expected = _shape(capacity, 1, **_SHAPE)
                 self.assertEqual({name: getattr(state, name) for name in expected}, expected)
@@ -1690,9 +1689,7 @@ class TestPatchLaunchShapes(unittest.TestCase):
                     )
                     self.assertGreater(coverage["live"], 2048, "the live sort must merge chunks")
                     self.assertGreater(coverage["carried"], 0, "the frames must carry anchor history")
-        state = _FrictionPatchState(
-            _Scene(device, 0).model, capacity, True, wp.zeros(capacity, dtype=wp.vec2, device=device)
-        )
+        state = _FrictionPatchState(_Scene(device, 0).model, capacity, wp.zeros(capacity, dtype=wp.vec2, device=device))
         self.assertEqual({name: getattr(state, name) for name in default}, default)
 
     @unittest.skipUnless(wp.is_cuda_available(), "launch shapes need CUDA")
@@ -1794,7 +1791,6 @@ def _ring_case(device, seed, *, contacts=600, worlds=3):
     parents = rng.integers(-1, rows, size=(3, worlds, rows)).astype(np.int32)
     mu = rng.uniform(0.2, 1.0, size=(3, worlds, rows)).astype(np.float32)
     view = FrictionPatches()
-    view.enabled = 1
     view.weight = wp.array(weight, dtype=float, device=device)
     view.next_contact = wp.array(next_contact, dtype=int, device=device)
     view.point = wp.zeros(contacts, dtype=wp.vec3, device=device)
@@ -1964,13 +1960,12 @@ class TestPatchFrameReuse(unittest.TestCase):
         phi = wp.zeros(128, dtype=wp.vec2, device="cpu")
         for reuse, contacts in ((False, scene.contacts), (True, anonymous)):
             with self.subTest(reuse=reuse):
-                patches = _FrictionPatchState(scene.model, 128, True, phi, reuse_frames=reuse)
+                patches = _FrictionPatchState(scene.model, 128, phi, reuse_frames=reuse)
                 launched.clear()
                 with mock.patch.object(wp, "launch", record):
                     patches.build(scene.model, scene.state, contacts)
                 self.assertEqual(launched, ["_prepare", "_build"])
                 np.testing.assert_array_equal(patches.sorted_frame.numpy(), -1)
-        self.assertFalse(_FrictionPatchState(scene.model, 128, False, phi, reuse_frames=True).reuse_frames)
 
 
 def _reused_build(patches, scene, contacts, mode=friction_patches._FRAME_KEEP):
@@ -2018,8 +2013,8 @@ def _counted_sorts(patches):
 def _recording_pair(scene, capacity):
     """Return a patch state without frame reuse and a frame-reusing one that builds as captured."""
     phi = [wp.zeros(capacity, dtype=wp.vec2, device=scene.device) for _ in range(2)]
-    plain = _FrictionPatchState(scene.model, capacity, True, phi[0])
-    recording = _captured(_FrictionPatchState(scene.model, capacity, True, phi[1], reuse_frames=True))
+    plain = _FrictionPatchState(scene.model, capacity, phi[0])
+    recording = _captured(_FrictionPatchState(scene.model, capacity, phi[1], reuse_frames=True))
     return plain, recording
 
 
@@ -2196,7 +2191,7 @@ class TestPatchFrameModes(unittest.TestCase):
                     "load",
                     side_effect=lambda device, key=kernel.key, loaded=loaded: loaded.append((key, device)),
                 ):
-                    patches = _FrictionPatchState(scene.model, 128, True, phi, reuse_frames=reuse)
+                    patches = _FrictionPatchState(scene.model, 128, phi, reuse_frames=reuse)
                     self.assertEqual(loaded, [], "a CPU state loads no module")
                     patches.device = cuda
                     patches._load_capture_modules()
@@ -2222,7 +2217,7 @@ class TestPatchFrameModes(unittest.TestCase):
         scene = _Scene("cpu", 47)
         scene.frame()
         phi = wp.zeros(128, dtype=wp.vec2, device="cpu")
-        patches = _FrictionPatchState(scene.model, 128, True, phi, reuse_frames=True)
+        patches = _FrictionPatchState(scene.model, 128, phi, reuse_frames=True)
         _captured(patches)
         patches.build(scene.model, scene.state, scene.contacts)
         identity = _frame_identity(patches, scene.contacts)
@@ -2655,7 +2650,6 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
                 ({}, "0", False),
                 ({}, "1", True),
                 ({}, "", True),
-                ({"friction_anchor_beta": 0.0}, None, False),
             )
             for options, reuse, reused in cases:
                 with self.subTest(device=device, options=options, reuse=reuse):
@@ -2664,10 +2658,6 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
                     friction = solver.get_path_selection()["routes"]["friction"]
                     self.assertEqual(friction["frame_reuse"]["enabled"], reused)
                     self.assertEqual(solver.laws.friction_patches.reuse_frames, reused)
-                    if options:
-                        self.assertIn("Point friction", friction["frame_reuse"]["reason"])
-                        self.assertIsNone(friction["pair_sort"])
-                        continue
                     if reuse == "0":
                         self.assertIn("FEATHER_PGS_PATCH_FRAME_REUSE=0", friction["frame_reuse"]["reason"])
                     else:
@@ -3383,8 +3373,8 @@ def run_captured_entry_filter(test, device, replays):
     poses[:, 2] = 0.019
     state.body_q.assign(poses)
     phi = [wp.zeros(128, dtype=wp.vec2, device=device) for _ in range(2)]
-    plain = _FrictionPatchState(model, 128, True, phi[0], reuse_frames=True)
-    patches = _FrictionPatchState(model, 128, True, phi[1], reuse_frames=True)
+    plain = _FrictionPatchState(model, 128, phi[0], reuse_frames=True)
+    patches = _FrictionPatchState(model, 128, phi[1], reuse_frames=True)
 
     def entry_passes(states, passes=2):
         """Collide, filter and build twice per pass; the poses move up in a pass and back in the next."""

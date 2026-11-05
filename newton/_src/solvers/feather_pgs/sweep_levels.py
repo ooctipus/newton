@@ -23,15 +23,11 @@ def _get_mark_independent_sparse_contact_candidates_kernel(
     sparse_response_dofs: int,
     device_arch: str,
     *,
-    units: bool = False,
     torsion: bool = False,
 ) -> "wp.Kernel":
-    """Mark contact triples whose response is confined to one sparse coordinate.
-
-    ``units`` marks patch contact units instead: a normal row, followed by its two
-    tangent rows only when the contact owns a friction anchor, and its spin row where
-    it has one (four rows: :func:`.sweep.spin_row`). Under contact ``torsion`` a point
-    triple's spin row follows its tangents (four rows).
+    """Mark contact units whose response is confined to one sparse coordinate: a normal row, followed by its two
+    tangent rows only when the contact owns a friction anchor, and its spin row where it has one (four rows:
+    :func:`.sweep.spin_row`).
     """
     del device_arch
     full = 3 + int(torsion)
@@ -75,46 +71,8 @@ def _get_mark_independent_sparse_contact_candidates_kernel(
                 sparse_row_dof[line, slot, 0] = -2
 
     suffix = "_torsion" if torsion else ""
-    if units:
-        name = f"mark_independent_sparse_contact_candidates_{sparse_size}_units{suffix}"
-        return python_kernel(mark_independent_sparse_contact_units_template, name)
-
-    def mark_independent_sparse_contact_candidates_template(
-        dense_first: wp.array[int],
-        data: ContactInput,
-        total_num_workers: int,
-        sparse_row_dof: wp.array3d[int],
-    ):
-        worker = wp.tid()
-        total_contacts = data.count[0]
-        for contact in range(worker, total_contacts, total_num_workers):
-            slot = data.slot[contact]
-            if data.path[contact] != 0 or slot < 0 or data.slots_needed[contact] != full:
-                continue
-
-            art_a = data.art0[contact]
-            art_b = data.art1[contact]
-            has_other_response = False
-            if art_a >= 0:
-                response_dofs = data.response_dofs[art_a]
-                has_other_response = response_dofs > 0 and response_dofs != sparse_size
-            if art_b >= 0:
-                response_dofs = data.response_dofs[art_b]
-                has_other_response = has_other_response or (response_dofs > 0 and response_dofs != sparse_size)
-            if has_other_response:
-                continue
-
-            world = data.world[contact]
-            line = dense_first[world]
-            coord_0 = sparse_row_dof[line, slot, 0]
-            coord_1 = sparse_row_dof[line, slot, 1]
-            if coord_0 >= 0 and coord_1 < 0:
-                sparse_row_dof[line, slot, 1] = -2
-            elif coord_1 >= 0 and coord_0 < 0:
-                sparse_row_dof[line, slot, 0] = -2
-
-    name = f"mark_independent_sparse_contact_candidates_{sparse_size}{suffix}"
-    return python_kernel(mark_independent_sparse_contact_candidates_template, name)
+    name = f"mark_independent_sparse_contact_candidates_{sparse_size}_units{suffix}"
+    return python_kernel(mark_independent_sparse_contact_units_template, name)
 
 
 @cache
@@ -124,104 +82,14 @@ def _get_build_independent_sparse_contact_groups_kernel(
     device_arch: str,
     *,
     build_serial_contacts: bool = False,
-    units: bool = False,
     torsion: bool = False,
 ) -> "wp.Kernel":
-    """Build exact independent and serial contact schedules for sparse diagonal response.
-
-    ``units`` schedules patch contact units instead of contact triples (see
-    :func:`_build_independent_sparse_contact_units_kernel`). Each world's warp
-    links the scalar triples and lists the remaining ones in parallel; the
-    schedules equal those of serial walks over the segment's whole triples. Under
-    contact ``torsion`` a contact's spin row follows its tangents: four rows apart.
-    """
+    """Build exact independent and serial contact schedules for sparse diagonal response, over the contact units
+    (:func:`_build_independent_sparse_contact_units_kernel`)."""
     del device_arch
-    M = int(max_constraints)
-    D = int(max_world_dofs)
-    if units:
-        return _build_independent_sparse_contact_units_kernel(M, D, build_serial_contacts, torsion)
-    # The serial list's capacity, a triple's (four-row contacts need less).
-    S = (M + 2) // 3
-    R = 4 if torsion else 3
-    serial_schedule = (
-        f"""
-    // Compact the remaining contacts in original row order. The solve may
-    // inspect up to four normals concurrently, but any active batch is still
-    // applied through this serial list in exact GS order.
-{_list_serial_contacts_source(count="triple_count", stride=R, head="true", serial_capacity=S)}
-    SYNC();
-"""
-        if build_serial_contacts
-        else ""
+    return _build_independent_sparse_contact_units_kernel(
+        int(max_constraints), int(max_world_dofs), build_serial_contacts, torsion
     )
-
-    snippet = f"""    const int lane = LANE;
-    const int contact_start = dense_phase_bounds.data[world * 2 + 1];
-    const int contact_end = world_constraint_count.data[world];
-    const int head_base = world * {D};
-    const int line = dense_first.data[world];
-    __builtin_assume(line >= 0);
-    const int sparse_world_base = line * {M} * 2;
-    const unsigned earlier_lanes = (1u << lane) - 1u;
-    // The contact segment's whole triples.
-    const int triple_count = contact_end > contact_start ? (contact_end - contact_start) / {R} : 0;
-    for (int coordinate = lane; coordinate < {D}; coordinate += 32)
-        group_heads.data[head_base + coordinate] = -1;
-    SYNC();
-
-    // Reserve every diagonal coordinate used by a coupled contact. A scalar
-    // row sharing one must remain in the serial chain to preserve GS order.
-    for (int normal = contact_start + lane * {R}; normal + {R - 1} < contact_end; normal += {32 * R}) {{
-        const int sparse_row = sparse_world_base + normal * 2;
-        const int coord_0 = sparse_row_dof.data[sparse_row];
-        const int coord_1 = sparse_row_dof.data[sparse_row + 1];
-        const bool scalar_candidate = coord_0 < -1 || coord_1 < -1;
-        if (!scalar_candidate) {{
-            if (coord_0 >= 0) atomicExch(&group_heads.data[head_base + coord_0], -2);
-            if (coord_1 >= 0) atomicExch(&group_heads.data[head_base + coord_1], -2);
-        }}
-    }}
-    SYNC();
-
-    // Link each coordinate's scalar triples in ascending row order, so that
-    // every negative link reproduces the original GS order.
-{_link_scalar_contacts_source(count="triple_count", stride=R, head="true", dofs=D)}
-{serial_schedule}
-
-    int count = 0;
-    for (int coordinate_base = 0; coordinate_base < {D}; coordinate_base += 32) {{
-        const int coordinate = coordinate_base + lane;
-        const int head = coordinate < {D} ? group_heads.data[head_base + coordinate] : -1;
-        const int output = ORDERED(count, head >= 0);
-        if (head >= 0) group_heads.data[head_base + output] = head;
-        SYNC();
-    }}
-    if (lane == 0) group_count.data[world] = count;
-#endif
-"""
-
-    name = f"build_independent_sparse_contact_groups_{M}_{D}"
-    if build_serial_contacts:
-        name += "_serial_contacts"
-    if torsion:
-        name += "_torsion"
-    return KernelTemplate(
-        name,
-        kernel_template.params(
-            ("world_constraint_count", wp.array[int]),
-            ("dense_first", wp.array[int]),
-            ("dense_phase_bounds", wp.array2d[int]),
-            ("sparse_row_dof", wp.array3d[int]),
-            ("group_count", wp.array[int]),
-            ("group_heads", wp.array2d[int]),
-            ("serial_count_out", wp.array[int]),
-            ("serial_normals", wp.array2d[int]),
-        ),
-        snippet,
-        dispatch=items("world", lanes=32, flat=True),
-        preludes=(lane_group(32),),
-        native_name="build_independent_sparse_contact_groups_native",
-    ).kernel()
 
 
 def _link_scalar_contacts_source(*, count: str, stride: int, head: str, dofs: int) -> str:
@@ -324,8 +192,7 @@ def _build_independent_sparse_contact_units_kernel(
     Under patch friction a contact's rows form a unit: its normal row, followed by
     its two tangent rows only when it owns an anchor. Every row of the contact
     segment other than a tangent row heads a unit, and a tangent row names its
-    unit's head as parent. The schedules are those of the triple builder, with
-    links and the serial list holding unit heads. Members of a patch ring share
+    unit's head as parent. The links and the serial list hold unit heads. Members of a patch ring share
     their body pair, hence their coordinate and independence class.
 
     Two serial walks over the rows define the schedules. When the rows form units

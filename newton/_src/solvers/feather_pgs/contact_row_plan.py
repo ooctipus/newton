@@ -27,8 +27,6 @@ class ContactRowPlan:
     """The producer the class's placement case names: ``walk`` (the one writer: the general placement's, the support
     placement's, case K1, and the sparse diagonal's, case K2), ``keyed_rows`` or
     ``compact_contact_boundary``; ``none`` where the class walks no rows."""
-    law: str
-    """The friction law of the contact rows: ``"point"`` or ``"patch"``."""
     methods: dict[int, str]
     """Builder method by DOF size, in ``size_groups`` order."""
 
@@ -43,7 +41,6 @@ def contact_row_plan(solver) -> ContactRowPlan:
     and no producer runs (``none``). Owners decided at construction admit the producers, so the plan stays fixed for a
     solver; it is evaluated from the solver's current attributes.
     """
-    law = "patch" if solver.laws.friction_anchors_enabled else "point"
     sizes = solver.forest.size_groups
     case = solver.routes.case
     owned = {
@@ -52,10 +49,10 @@ def contact_row_plan(solver) -> ContactRowPlan:
     }.get(case)
     if owned is not None:
         # An in-kernel owner's producer.
-        return ContactRowPlan(owned, law, dict.fromkeys(sizes, owned))
+        return ContactRowPlan(owned, dict.fromkeys(sizes, owned))
     if getattr(solver.placement, "walks", False):
         # The one writer (walk_rows): the row pass writes each contact row's records and unit source, and the writer
         # walks its seed into the class's sink (the general placement's packed rows, the support placement's support,
         # the sparse diagonal's slots).
-        return ContactRowPlan("walk", law, dict.fromkeys(sizes, "walk"))
-    return ContactRowPlan("none", law, {})
+        return ContactRowPlan("walk", dict.fromkeys(sizes, "walk"))
+    return ContactRowPlan("none", {})

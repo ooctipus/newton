@@ -39,7 +39,7 @@ from newton._src.solvers.feather_pgs.factor.walk import (
     unpack_walk_records,
     walk_leave_kernel,
 )
-from newton._src.solvers.feather_pgs.friction_patches import PatchRowLaw
+from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, PatchRowLaw
 from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.route_table import Laws
 from newton._src.solvers.feather_pgs.row_records import DenseRows, MfRows, RowSupport
@@ -666,6 +666,19 @@ def row_lines(device) -> wp.array:
     return _ROW_LINES[key]
 
 
+def anchored_patches(contacts: int, device) -> FrictionPatches:
+    """A patch view of ``contacts`` one-contact regions, each anchored at its contact: weight one, no spin arm, no
+    displacement (what the row allocators read of a region)."""
+    patches = FrictionPatches()
+    patches.weight = wp.ones(contacts, dtype=float, device=device)
+    patches.next_contact = wp.full(contacts, -1, dtype=int, device=device)
+    patches.point = wp.zeros(contacts, dtype=wp.vec3, device=device)
+    patches.phi = wp.zeros(contacts, dtype=wp.vec2, device=device)
+    patches.spin_arm = wp.zeros(contacts, dtype=float, device=device)
+    patches.spin_phi = wp.zeros(contacts, dtype=float, device=device)
+    return patches
+
+
 def bind_struct(struct_type, values, device):
     """An instance of ``struct_type`` from a scene's values by the scenes' names (host values go to ``device``).
 
@@ -1265,10 +1278,9 @@ def register_device_tests(cls, namespace: dict):
 
 
 def plain_laws(**changes) -> Laws:
-    """The row laws of a CUDA matrix-free solver with joint limits and point friction (the plain sweep), with
+    """The row laws of a CUDA matrix-free solver with joint limits (the plain sweep), with
     ``changes``: the laws a stand-in solver of the admission tests carries."""
     laws = {
-        "contact": "point",
         "regularized": False,
         "torsion": False,
         "compliance": False,

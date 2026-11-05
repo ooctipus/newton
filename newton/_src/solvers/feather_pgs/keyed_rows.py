@@ -6,7 +6,7 @@
 The layout (primary tree, secondary free body, parallel row count) comes from
 ``keyed_row_layout.topology_plan``; nothing here names a robot or a size.
 
-Under persistent patch friction the contact keys are scattered with each row's
+The contact keys are scattered with each row's
 type, parent and undivided friction coefficient before the patch link
 (``_FrictionPatchState.link``) links the normal rows into their patch rings and
 divides the tangent coefficients. The row sources then write the patch row law
@@ -78,7 +78,7 @@ def scatter_contact_keys(data: ContactInput, z: KineticRows, law: PatchRowLaw):
     """Emit each allocated contact row's key (raw contact ID and row direction: the normal, the tangents and, under
     contact torsion, the spin row).
 
-    Under persistent patch friction also the type, parent and coefficient of each row (a spin row's from its region's
+    Also the type, parent and coefficient of each row (a spin row's from its region's
     footprint, :func:`.friction_patches.patch_spin_row`): the patch link runs after this launch and before any row is
     read, and links each normal row into its patch ring. A material contact's tangents take its
     friction scale (:func:`.row_build.write_contact_row`).
@@ -91,34 +91,33 @@ def scatter_contact_keys(data: ContactInput, z: KineticRows, law: PatchRowLaw):
             slot = data.slot[contact]
             for direction in range(data.slots_needed[contact]):
                 z.rowkeys[line, slot + direction] = contact * 4 + direction
-            if law.patches.enabled != 0:
-                mu = contact_friction(data.shape0[contact], data.shape1[contact], data.material_mu)
-                friction = mu
-                if data.material != 0:
-                    if data.stiffness[contact] > 0.0 and data.friction_weight[contact] > 0.0:
-                        friction *= data.friction_weight[contact]
-                for direction in range(data.slots_needed[contact]):
-                    row = slot + direction
-                    if direction == 0:
-                        data.row_type[line, row] = PGS_CONSTRAINT_TYPE_CONTACT
-                        data.row_parent[line, row] = -1
-                        data.row_mu[line, row] = mu
-                    elif direction == CONTACT_SPIN_ROW:
-                        _phi, _beta, spin_mu = patch_spin_row(law, contact, friction, contact_torsion_mu(data, contact))
-                        data.row_type[line, row] = PGS_CONSTRAINT_TYPE_TORSION
-                        data.row_parent[line, row] = slot
-                        data.row_mu[line, row] = spin_mu
-                    else:
-                        data.row_type[line, row] = PGS_CONSTRAINT_TYPE_FRICTION
-                        data.row_parent[line, row] = slot
-                        data.row_mu[line, row] = friction
+            mu = contact_friction(data.shape0[contact], data.shape1[contact], data.material_mu)
+            friction = mu
+            if data.material != 0:
+                if data.stiffness[contact] > 0.0 and data.friction_weight[contact] > 0.0:
+                    friction *= data.friction_weight[contact]
+            for direction in range(data.slots_needed[contact]):
+                row = slot + direction
+                if direction == 0:
+                    data.row_type[line, row] = PGS_CONSTRAINT_TYPE_CONTACT
+                    data.row_parent[line, row] = -1
+                    data.row_mu[line, row] = mu
+                elif direction == CONTACT_SPIN_ROW:
+                    _phi, _beta, spin_mu = patch_spin_row(law, contact, friction, contact_torsion_mu(data, contact))
+                    data.row_type[line, row] = PGS_CONSTRAINT_TYPE_TORSION
+                    data.row_parent[line, row] = slot
+                    data.row_mu[line, row] = spin_mu
+                else:
+                    data.row_type[line, row] = PGS_CONSTRAINT_TYPE_FRICTION
+                    data.row_parent[line, row] = slot
+                    data.row_mu[line, row] = friction
 
 
 ROW_PRELUDES = law_preludes(CONTACT_LAW, ROW_LAW)
 """Device preludes of the row source: the contact and row laws it calls (``ContactLaw::...``, ``RowLaw::...``)."""
 
 
-def _row_source(*, layout, patch=False, weighted=False, torsion=False):
+def _row_source(*, layout, weighted=False, torsion=False):
     """Decode a dense row from its key and walk its seeds into the parallel tiers' row ``Zi`` (``TIER_WALK``,
     :class:`.response_operator.WalkedRows`), its incident velocity and its records.
 
@@ -127,9 +126,9 @@ def _row_source(*, layout, patch=False, weighted=False, torsion=False):
     laws (:data:`ROW_PRELUDES`); its seed on each body of a tree of the world is the wrench of its direction at its row
     point, ``(d, (p - o) x d)`` at the body's frame ``o`` (the factor's; the spin row's ``(0, n)``), the second
     body's negated. No Jacobian is formed.
-    ``patch`` writes the persistent patch row law: tangent rows act at the patch friction location for both the
-    seed and the prescribed target, carry the anchor's tangential phi and correct it with ``patch_law.beta``;
-    every row's type, parent and coefficient stay as :func:`scatter_contact_keys` and the patch link left them.
+    It writes the patch row law: tangent rows act at the region's friction location for both the seed and the
+    prescribed target, carry the anchor's tangential phi and correct it with ``patch_law.beta``; every row's type,
+    parent and coefficient stay as :func:`scatter_contact_keys` and the patch link left them.
     ``weighted`` writes each row's weight (the relative regularization's, 1 for a firing rebound) and, under
     ``contact_compliance``, a material contact's law as :func:`.row_build.write_contact_row` does: its normal's rhs
     and compliance (:func:`.row_laws.contact_material_rhs`, zero on every other row), no restitution and its
@@ -164,23 +163,12 @@ def _row_source(*, layout, patch=False, weighted=False, torsion=False):
             TIER_WALK(side, joint - walk.joint_start.data[art], -1, seed);
         }}
 """
-    if patch:
-        friction_location = "const wp::vec3 friction_point = patch_law.patches.point.data[contact];"
-        tangent_phi = "patch_law.patches.phi.data[contact][r - 1]"
-        if torsion:
-            tangent_phi = f"(r == 3 ? patch_law.patches.spin_phi.data[contact] : {tangent_phi})"
-        tangent_beta = "patch_law.beta"
-        row_law = "        c.row_beta.data[at] = r == 0 ? normal_beta : patch_law.beta;\n"
-    else:
-        friction_location = "const wp::vec3 friction_point = point;"
-        tangent_phi = "0.0f"
-        tangent_beta = "0.0f"
-        row_law = (
-            f"        c.row_type.data[at] = {kind};\n"
-            "        c.row_parent.data[at] = r == 0 ? -1 : c.slot.data[contact];\n"
-            "        c.row_mu.data[at] = r == 0 ? mu : friction;\n"
-            "        c.row_beta.data[at] = r == 0 ? normal_beta : 0.0f;\n"
-        )
+    friction_location = "const wp::vec3 friction_point = patch_law.patches.point.data[contact];"
+    tangent_phi = "patch_law.patches.phi.data[contact][r - 1]"
+    if torsion:
+        tangent_phi = f"(r == 3 ? patch_law.patches.spin_phi.data[contact] : {tangent_phi})"
+    tangent_beta = "patch_law.beta"
+    row_law = "        c.row_beta.data[at] = r == 0 ? normal_beta : patch_law.beta;\n"
     materials = """        const auto [mu, restitution] = ContactLaw::contact_materials(sa, sb, c.material_mu, c.material_restitution);
         const float friction = mu;"""
     rhs = """        float rhs = RowLaw::row_rhs(r == 0 ? 0 : 2, phi, r == 0 ? normal_beta : ${TANGENT_BETA}, target, 1.0f / c.dt,
@@ -213,12 +201,7 @@ def _row_source(*, layout, patch=False, weighted=False, torsion=False):
         # The spin row's coefficient is the shapes' torsional friction.
         spin_mu = "r == 3 ? ContactLaw::contact_friction(sa, sb, c.material_mu_torsional) : "
         materials = materials.replace("const float friction = ", f"const float friction = {spin_mu}")
-    if patch:
-        metadata = "built_rhs = rhs;"
-    else:
-        metadata = (
-            "built_rhs = rhs; built_mu = r == 0 ? mu : friction; built_parent = r == 0 ? -1 : c.slot.data[contact];"
-        )
+    metadata = "built_rhs = rhs;"
     return substitute(
         r"""
     const int at = z.first.data[world] * z.rowkeys.shape[1] + row;
@@ -330,12 +313,11 @@ def _key_kind(key: str, torsion: bool) -> str:
     return f"({key} & 3) == 0 ? 0 : 2"
 
 
-def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=False, weighted=False, torsion=False):
+def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, weighted=False, torsion=False):
     """Decode each row from its key and walk its seeds in the tier's row stage (:func:`_row_source`).
 
-    ``patch`` writes the persistent patch row law and reads every row's parent and
-    coefficient as the scatter and the patch link left them; point friction builds
-    them with the row. ``weighted`` writes the rows' weights and material contacts' law, ``torsion`` decodes the spin
+    It writes the patch row law and reads every row's parent and coefficient as the scatter and the patch link left
+    them. ``weighted`` writes the rows' weights and material contacts' law, ``torsion`` decodes the spin
     rows (:func:`_row_source`).
     """
     if (na, nb, oa, ob, dofs) != (
@@ -347,22 +329,19 @@ def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=
     ):
         raise ValueError("physical row layout and parallel operator disagree")
     key = "kinetic_rows.rowkeys.data[off_dense + i]"
-    built = "float built_rhs = 0.0f, built_mu = 0.0f;\n            int built_parent = -1;"
-    publish = "{\n                s_rhs[i] = built_rhs; s_parent[i] = built_parent; s_mu[i] = built_mu;\n            }"
-    arguments = (RowArgument("kinetic_rows", KineticRows, after="cfm"),)
-    parent = f"{key} < 0 ? world_row_parent.data[off_dense + i] : 0"
-    mu = f"{key} < 0 ? world_row_mu.data[off_dense + i] : 0"
-    if patch:
-        built, publish = "float built_rhs = 0.0f;", "s_rhs[i] = built_rhs;"
-        arguments += (RowArgument("patch_law", PatchRowLaw, after="kinetic_rows"),)
-        parent, mu = "world_row_parent.data[off_dense + i]", "world_row_mu.data[off_dense + i]"
+    built, publish = "float built_rhs = 0.0f;", "s_rhs[i] = built_rhs;"
+    arguments = (
+        RowArgument("kinetic_rows", KineticRows, after="cfm"),
+        RowArgument("patch_law", PatchRowLaw, after="kinetic_rows"),
+    )
+    parent, mu = "world_row_parent.data[off_dense + i]", "world_row_mu.data[off_dense + i]"
     reader = (
         f"""
             const int row = i;
             const auto& z = kinetic_rows;
             {built}
     """
-        + _row_source(layout=layout, patch=patch, weighted=weighted, torsion=torsion)
+        + _row_source(layout=layout, weighted=weighted, torsion=torsion)
         + f"""
             if ({key} >= 0) {publish}
     """
@@ -382,14 +361,13 @@ def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=
 def get_parallel_factory(original, layout):
     """Use the shared parallel policy with the layout's physical row operands.
 
-    ``linked_rows`` selects the persistent patch row law and the policy's
-    ring-pooled friction projection together.
+    The rows carry the patch row law, and the policy projects each friction pair on its ring's pooled load.
     """
 
-    def factory(*args, linked_rows=False, weighted=False, **kwargs):
+    def factory(*args, weighted=False, **kwargs):
         torsion = kwargs.get("torsion", False)
-        inputs = partial(get_direct_parallel_inputs, layout, patch=linked_rows, weighted=weighted, torsion=torsion)
-        return original(*args, row_inputs=inputs, linked_rows=linked_rows, weighted=weighted, **kwargs)
+        inputs = partial(get_direct_parallel_inputs, layout, weighted=weighted, torsion=torsion)
+        return original(*args, row_inputs=inputs, weighted=weighted, **kwargs)
 
     return factory
 
@@ -419,8 +397,7 @@ class KeyedRows:
         solver._arrays.placeholder(wp.int32)
         solver._arrays.placeholder(wp.float32)
         self._topology = TopologyPin.read(solver.model, TOPOLOGY)
-        # Persistent patch friction: the rows carry the patch law, and the patch link owns parents and coefficients.
-        self.patch = bool(solver.laws.friction_anchors_enabled)
+        # The rows carry the patch law, and the patch link owns parents and coefficients.
         self.law = patch_row_law(solver)
 
     def validate_notification(self, flags=ModelFlags.ALL):
@@ -502,7 +479,7 @@ class KeyedRows:
 
     def parallel_arguments(self):
         """Return the row operands the keyed fallback and parallel tiers take: the rows and the patch law."""
-        return [self.data, self.law] if self.patch else [self.data]
+        return [self.data, self.law]
 
 
 def create_owner(solver):

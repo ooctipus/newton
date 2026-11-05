@@ -3,7 +3,7 @@
 
 """Build FeatherPGS's generated kernels through one template.
 
-The point-stream pins hold every production kernel's content; these tests hold
+The kernel pins hold every production kernel's content; these tests hold
 the mechanism: strict source slots, one parameter declaration for the native
 ABI and the Warp signature, the dispatches, and kernels that run.
 """

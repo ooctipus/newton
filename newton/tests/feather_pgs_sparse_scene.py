@@ -85,7 +85,6 @@ def branched_model(*, floating=True, branches=3, depth=1, foot="sphere", device=
 def make_solver(model, enabled, pins=None, **overrides):
     """Change only representation admission between the paired solvers; ``pins`` are more test-only route pins."""
     options = {
-        "friction_anchor_beta": 0.0,
         "pgs_iterations": 8,
         "pgs_warmstart": False,
         "enable_joint_limits": True,
@@ -147,7 +146,6 @@ class LawsProbe(SimpleNamespace):
     def set(self):
         options = self.options
         return Laws(
-            contact="patch" if self.friction_anchors_enabled else "point",
             regularized=self.regularization_enabled,
             torsion=self.contact_torsion_enabled,
             compliance=options.contact_compliance,
@@ -182,7 +180,6 @@ def eligible_solver():
             forest=forest,
             regularization_enabled=False,
             contact_torsion_enabled=False,
-            friction_anchors_enabled=False,
             mimic_count=0,
         ),
     )

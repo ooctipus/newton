@@ -33,11 +33,12 @@ for pair in "$H:$hsha" "$T:$tsha"; do
 done
 TASKS=$(for t in $GATE_TASKS; do printf -- '--task %s ' "$t"; done)
 t0=$(date +%s)
-for arm in patch point; do
-  l=$label; [ $arm = point ] && l=$label-pt
+# One friction law: the recipes' friction_anchor_beta is left at the solver's default (the stick's gain).
+for arm in patch; do
+  l=$label
   python3 -c "import json, sys; json.dump({t: [0.97, 1.03] for t in sys.argv[2:]}, open(sys.argv[1], 'w'), indent=1)" \
     "$OUT/bands_${l}_${arm}.json" $GATE_TASKS
-  ARM=""; [ $arm = patch ] && ARM="--unset-solver-attr friction_anchor_beta"
+  ARM="--unset-solver-attr friction_anchor_beta"
   rm -rf "${OUT:?}/ab-${l:?}-head-1" "${OUT:?}/ab-${l:?}-track-1"
   (cd "$LAB" && FPGS_LAB=$LAB $LOCK uv run --no-sync python "$HERE/run_suite_par.py" --gpu "$UUID" \
     --arm "head,$H,$OUT/ab-$l-head-1,,${HEAD_PATH:-}" --arm "track,$T,$OUT/ab-$l-track-1,,${TRACK_PATH:-}" $TASKS $ARM \

@@ -7,7 +7,7 @@
 (:class:`.SparsePairZ`), one warp per world, on the velocity change from the predictor in factor coordinates, from zero:
 ``du = R^-T L^T P dv`` on the dense articulation (the walk's factor and its slips' release, the frame its rows were whitened
 in) and ``du = sqrt(m) dv`` on a diagonal coordinate, left once and added to the predictor. Each sweep runs its coordinates' fused joint limits, its independent scalar contacts one lane per chain, then its
-coupled rows in order (plain, contact triples or contact units, optionally with speculative batches), a loaded coupled
+coupled rows in order (plain or contact units, optionally with speculative batches), a loaded coupled
 contact unit by the unit law (:class:`_UnitPairZ`, :func:`.sweep.contact_unit`). Its working set fits the static
 budget of the device it is built for (:func:`.memory.arch_budget`).
 """
@@ -208,7 +208,6 @@ def sparse_diagonal_source(
     max_world_dofs: int,
     dense_dofs: int,
     *,
-    contact_triples: bool = False,
     speculative_contact_batches: bool = False,
     contact_units: bool = False,
     torsion: bool = False,
@@ -222,9 +221,8 @@ def sparse_diagonal_source(
     contacts (one lane per chain: a contact whose coordinate no coupled row touches commutes with the coupled rows,
     and its one-product residual rounds as the warp's sum of it does), then the coupled rows in row order with
     :class:`.SparsePairZ`'s warp layout, all on the velocity change in factor coordinates, from zero (left once before
-    it is added to the predictor). ``contact_triples`` schedules point contacts (a normal and two tangent
-    rows each), ``contact_units`` patch contacts (a normal, and its tangent pair only when it owns an anchor); both
-    skip an independent contact in the serial order and a pair whose patch carries no load. Every schedule, the plain
+    it is added to the predictor). ``contact_units`` schedules the contacts (a normal, and its
+    tangent pair only when it owns an anchor): it skips an independent contact in the serial order and a pair whose patch carries no load. Every schedule, the plain
     one at a normal row that owns the tangent pair after it, solves a loaded coupled contact unit by the unit law
     (:func:`.sweep.contact_unit`) and visits an unloaded one, and a chain's contacts, row by row: a chain runs one lane
     per contact, whose row visits reduce nothing, and a unit branch there splits the warp's lanes. With
@@ -239,21 +237,13 @@ def sparse_diagonal_source(
     Returns the body and its staging.
     """
     M, D, P = int(max_constraints), int(max_world_dofs), int(dense_dofs)
-    if contact_triples and contact_units:
-        raise ValueError("contact triples and contact units are exclusive schedules")
-    if speculative_contact_batches and (not (contact_triples or contact_units) or P + 2 > 16):
-        raise ValueError(
-            "speculative contact batches require contact triples or units with at most 16 response entries"
-        )
+    if speculative_contact_batches and (not contact_units or P + 2 > 16):
+        raise ValueError("speculative contact batches require contact units with at most 16 response entries")
     _validate_dense_metadata_encoding(M)
     batch_lanes = 8 if P + 2 <= 8 else 16
     batch_shift = batch_lanes.bit_length() - 1
     batch_contacts = 32 // batch_lanes
-    serial_stride = M if contact_units else (M + 2) // 3
-    scheduled = contact_triples or contact_units
-    # A point contact's rows in the triple schedules (point friction only, whose contacts all have or all lack a spin
-    # row): its normal, its pair and, under contact torsion, its spin row. Patch contact units read theirs (contact_rows).
-    R = 4 if torsion else 3
+    scheduled = contact_units
 
     warp = Lanes(32)
     laws = RowLaws(regularize=weighted, material=material, policy=solve_policy, torsion=torsion)
@@ -388,8 +378,7 @@ def sparse_diagonal_source(
 {pad}    const int i = head + 1;
 {visit(Lanes(1), pad + "    ", kind=FRICTION, parent="head")}
 {pad}}} while (false);"""
-        if contact_units:
-            tangents = f"{pad}if ({owns_tangents('head', pad + '    ')}) {{\n{indent(tangents, '    ')}\n{pad}}}"
+        tangents = f"{pad}if ({owns_tangents('head', pad + '    ')}) {{\n{indent(tangents, '    ')}\n{pad}}}"
         independent_phase = f"""
         const int independent_group_count = sparse_contact_group_count.data[world];
         for (int group = lane; group < independent_group_count; group += 32) {{
@@ -425,22 +414,18 @@ def sparse_diagonal_source(
         if torsion:
             spin = rows.spin_of("candidate_normal", "row_count")
             tangents_zero += f" && ({spin} < 0 || {rows.peek('candidate_normal + 3')} == 0.0f)"
-        if contact_units:
-            noop = f"""candidate_noop = old_impulse == 0.0f && new_impulse == 0.0f;
+        noop = f"""candidate_noop = old_impulse == 0.0f && new_impulse == 0.0f;
     // Only a unit with tangent rows reads them and its ring's load.
     if (candidate_noop && {owns_tangents("candidate_normal", "        ")}) {{
         candidate_noop = {tangents_zero};
         if (candidate_noop) candidate_noop = !{indent(ring_any, "            ").lstrip()};
     }}"""
-        else:
-            noop = f"""candidate_noop = old_impulse == 0.0f && new_impulse == 0.0f && {tangents_zero};
-    if (candidate_noop) candidate_noop = !{indent(ring_any, "        ").lstrip()};"""
         return f"""const int batch_group = lane >> {batch_shift};
 const int batch_lane = lane & {batch_lanes - 1};
 const int candidate_index = {index} + batch_group;
 const bool candidate_valid = candidate_index < {count};
 const int candidate_normal = candidate_valid
-    ? sparse_contact_serial_normals.data[world * {serial_stride} + candidate_index] : -1;
+    ? sparse_contact_serial_normals.data[world * {M} + candidate_index] : -1;
 {segment.row_velocity("candidate_velocity", "candidate_normal", "", active="candidate_valid")}
 bool candidate_noop = !candidate_valid;
 if (candidate_valid) {{
@@ -460,44 +445,6 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
         serial = f"""        for (int i = 0; i < row_count; ++i) {{
 {coupled(head)}
 {row}
-        }}"""
-    elif contact_triples and not speculative_contact_batches:
-        serial = f"""        for (int i = 0; i < row_count; ++i) {{
-            if (i >= contact_start) {{
-                const int normal = contact_start + ((i - contact_start) / {R}) * {R};
-                if ({independent("normal")}) {{
-                    i = normal + {R - 1};
-                    continue;
-                }}
-            }}
-{coupled(f"i >= contact_start && (i - contact_start) % {R} == 0")}
-{row}
-{inactive_pair(f"i >= contact_start && (i - contact_start) % {R} == 0", "i")}
-        }}"""
-    elif contact_triples:
-        serial = f"""        const int serial_contact_count = sparse_contact_serial_count.data[world];
-        const int serial_row_end = contact_start + serial_contact_count * {R};
-        for (int serial_row = 0; serial_row < serial_row_end; ++serial_row) {{
-            int i = serial_row;
-            int contact_component = -1;
-            if (serial_row >= contact_start) {{
-                const int contact_index = (serial_row - contact_start) / {R};
-                if (serial_row - contact_start == contact_index * {R} && (contact_index & {batch_contacts - 1}) == 0) {{
-{indent(batch("contact_index", "serial_contact_count"), "                    ")}
-                    if (noop_lanes == MASK) {{
-                        const int remaining_contacts = serial_contact_count - contact_index;
-                        serial_row += (remaining_contacts < {batch_contacts} ? remaining_contacts : {batch_contacts}) * {R} - 1;
-                        continue;
-                    }}
-                    serial_row += (FIRST(~noop_lanes) >> {batch_shift}) * {R};
-                }}
-                contact_component = (serial_row - contact_start) % {R};
-                i = sparse_contact_serial_normals.data[world * {serial_stride} + (serial_row - contact_start) / {R}]
-                    + contact_component;
-            }}
-{coupled("contact_component == 0", "serial_row")}
-{row}
-{inactive_pair("contact_component == 0", "serial_row")}
         }}"""
     elif not speculative_contact_batches:
         serial = f"""        for (int i = 0; i < row_count; ++i) {{
@@ -529,7 +476,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
                         }}
                         serial_unit += FIRST(~noop_lanes) >> {batch_shift};
                     }}
-                    unit_head = sparse_contact_serial_normals.data[world * {serial_stride} + serial_unit];
+                    unit_head = sparse_contact_serial_normals.data[world * {M} + serial_unit];
                     ++serial_unit;
                     break;
                 }}
@@ -641,7 +588,6 @@ def sparse_diagonal_kernel(
     dense_dofs: int,
     device_arch: str,
     *,
-    contact_triples: bool = False,
     speculative_contact_batches: bool = False,
     contact_units: bool = False,
     torsion: bool = False,
@@ -655,7 +601,6 @@ def sparse_diagonal_kernel(
         max_constraints,
         max_world_dofs,
         dense_dofs,
-        contact_triples=contact_triples,
         speculative_contact_batches=speculative_contact_batches,
         contact_units=contact_units,
         torsion=torsion,
@@ -666,7 +611,6 @@ def sparse_diagonal_kernel(
     staging.check("the sparse-diagonal sweep", arch_budget(device_arch))
     name = (
         f"sweep_sparse_diagonal_{int(max_constraints)}_{int(max_world_dofs)}_{int(dense_dofs)}"
-        + ("_contact_groups" if contact_triples else "")
         + ("_speculative_batches" if speculative_contact_batches else "")
         + ("_units" if contact_units else "")
         + ("_weighted" if weighted else "")

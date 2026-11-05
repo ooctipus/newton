@@ -1491,7 +1491,12 @@ def walk_kernels(table: tuple, rows: int) -> tuple:
     tag = hashlib.sha256(repr(table).encode()).hexdigest()[:12]
     sizes = {"coordinate": WALK_COORDINATE, "link": WALK_LINK, "now": WALK_NOW}
     up = KernelTemplate(
-        f"walk_up_{rows}_{tag}", _UP_PARAMS, substitute(_UP, rows=rows, **sizes), items("tid", flat=True), (prelude,), dual=True
+        f"walk_up_{rows}_{tag}",
+        _UP_PARAMS,
+        substitute(_UP, rows=rows, **sizes),
+        items("tid", flat=True),
+        (prelude,),
+        dual=True,
     )
     tree = KernelTemplate(
         f"walk_tree_{tag}",
@@ -1871,12 +1876,11 @@ def placement_frames(solver, joint_q: np.ndarray, capture) -> dict:
 
 
 def cuda_placements() -> list:
-    """The CUDA catalogue's problems under point friction on the routes whose rows a store holds, ``(physics,
-    route)`` in catalogue order: a route is checked on its first problem with articulated rows (:func:`checked`)."""
+    """The CUDA catalogue's problems on the routes whose rows a store holds, ``(physics, route)`` in catalogue order: a
+    route is checked on its first problem with articulated rows (:func:`checked`)."""
     return [
         (group.physics, route)
         for group in conformance.cuda_groups()
-        if group.physics.law != "patch"
         for route in (group.reference, *group.routes)
         if route.name not in UNSTORED
     ]
@@ -1921,7 +1925,9 @@ def both_ways_kernel(table: tuple):
     # The loop form's tables take the one access's WALK_CONSTANT.
     prelude = DevicePrelude(f"walk_both_{walk.tag}", text, cpu=text)
     preludes = (factor_walk.walk_loads_prelude(), prelude)
-    return KernelTemplate(f"walk_both_{walk.tag}", _BOTH_PARAMS, _BOTH, items("tid", flat=True), preludes, dual=True).kernel()
+    return KernelTemplate(
+        f"walk_both_{walk.tag}", _BOTH_PARAMS, _BOTH, items("tid", flat=True), preludes, dual=True
+    ).kernel()
 
 
 def both_ways(table: tuple, device, rng) -> tuple:
@@ -2618,7 +2624,6 @@ class TestFeatherPGSFkCachePublication(unittest.TestCase):
             model,
             dense_max_constraints=16,
             pgs_iterations=6,
-            friction_anchor_beta=0.0,
         )
         states = [model.state() for _ in range(2)]
         newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])

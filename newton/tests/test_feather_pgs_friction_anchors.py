@@ -165,28 +165,12 @@ def _run_incline(steps: int, dt: float, **solver_kwargs):
 
 @unittest.skipUnless(wp.get_device().is_cuda, "SolverFeatherPGS matrix-free mode requires CUDA")
 class TestFeatherPGSFrictionAnchors(unittest.TestCase):
-    def test_explicit_opt_out_keeps_friction_rows_velocity_only(self):
-        """Preserve velocity-only rows and omit anchor state with ``friction_anchor_beta=0``."""
+    def test_stick_gain_is_positive(self):
+        """Reject a stick gain that is zero, negative or not finite: every friction region carries its stick."""
         model, _jaws, _box = _build_v_jaws(5.0)
-        solver = newton.solvers.SolverFeatherPGS(model, **_SQUEEZE_SOLVER, friction_anchor_beta=0.0)
-        self.assertFalse(solver.laws.friction_anchors_enabled)
-        self.assertFalse(hasattr(solver.laws.friction_patches, "current"))
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=256, broad_phase="nxn")  # no matching needed
-        contacts = pipeline.contacts()
-        s0, s1 = model.state(), model.state()
-        control = model.control()
-        newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
-        for _ in range(40):
-            pipeline.collide(s0, contacts)
-            s0.clear_forces()
-            solver.step(s0, s1, control, contacts, 0.005)
-            s0, s1 = s1, s0
-        self.assertEqual(float(np.abs(solver.laws.friction_patches.view.phi.numpy()).max()), 0.0)
-        row_type = solver.placement.row_type.numpy()
-        friction = row_type == PGS_CONSTRAINT_TYPE_FRICTION
-        self.assertGreater(int(friction.sum()), 0)
-        self.assertEqual(float(np.abs(solver.placement.phi.numpy()[friction]).max()), 0.0)
-        self.assertEqual(float(np.abs(solver.placement.row_beta.numpy()[friction]).max()), 0.0)
+        for beta in (0.0, -0.1, float("inf"), float("nan")):
+            with self.subTest(beta=beta), self.assertRaises(ValueError):
+                newton.solvers.SolverFeatherPGS(model, **_SQUEEZE_SOLVER, friction_anchor_beta=beta)
 
     def test_anchors_do_not_require_contact_matching(self):
         """Keep patch history owned by the solver, independently of collision matching."""
@@ -202,17 +186,13 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
     def test_anchors_stop_tangential_drift_of_a_held_box(self):
         """Bound tangential drift in a tilted pinch while leaving flat-jaw behavior unaffected."""
         steps = int(3.0 / 0.005)
-        drift_off, _, _ = _run_squeeze(5.0, steps, friction_anchor_beta=0.0)
         drift_on, solver_on, _ = _run_squeeze(5.0, steps, friction_anchor_beta=0.05)
         drift_on_02, _, _ = _run_squeeze(5.0, steps, friction_anchor_beta=0.2)
-        # Friction in every sweep holds the pinch without anchors too.
-        self.assertLess(abs(drift_off), 5.0e-5, f"unanchored pinch drifted {drift_off:.2e} m")
         self.assertLess(abs(drift_on), 5.0e-5, f"anchored pinch (beta 0.05) drifted {drift_on:.2e} m")
         self.assertLess(abs(drift_on_02), 5.0e-5, f"anchored pinch (beta 0.2) drifted {drift_on_02:.2e} m")
         # the held contacts are anchored (not sliding) at the end of the hold
         valid = solver_on.laws.friction_patches.current.valid.numpy()
         self.assertGreater(int(valid.sum()), 0)
-        flat_off, _, _ = _run_squeeze(0.0, steps, friction_anchor_beta=0.0)
         # sticky matching replays body-local witness points; anchors must still hold
         drift_sticky, _, _ = _run_squeeze(5.0, steps, matching="sticky", friction_anchor_beta=0.2)
         self.assertLess(abs(drift_sticky), 1.0e-4, f"anchored pinch (sticky matching) drifted {drift_sticky:.2e} m")
@@ -222,7 +202,6 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         self.assertLess(abs(drift_sub), 1.0e-4, f"anchored pinch with 2 substeps per collide drifted {drift_sub:.2e} m")
         flat_on, _, _ = _run_squeeze(0.0, steps, friction_anchor_beta=0.05)
         self.assertLess(abs(flat_on), 1.0e-4)
-        self.assertLess(abs(flat_off), 1.0e-4)
 
     def test_anchors_hold_a_pinched_box_at_a_coarse_timestep(self):
         """Hold the tilted pinch at 60 Hz without re-anchoring below the Baumgarte equilibrium separation."""
@@ -235,12 +214,11 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
     def test_anchors_do_not_oppose_genuine_sliding(self):
         """Release saturated anchors on a 30-degree incline and preserve sliding acceleration."""
         dt, steps = 0.005, 200
-        v_off, _lat_off, _, _ = _run_incline(steps, dt, friction_anchor_beta=0.0)
         v_on, lat_on, solver, contacts = _run_incline(steps, dt, friction_anchor_beta=0.2)
         g, th, mu = 9.81, np.radians(30.0), 0.3
+        # Coulomb sliding: the box accelerates at g (sin - mu cos) whatever the stick's gain.
         v_ref = g * (np.sin(th) - mu * np.cos(th)) * steps * dt
-        self.assertGreater(v_off, 0.5 * v_ref)
-        self.assertAlmostEqual(v_on, v_off, delta=0.05 * v_ref)
+        self.assertGreater(v_on, 0.5 * v_ref)
         self.assertLess(lat_on, 1.0e-3)
         # every loaded contact slid this step, so its anchor was dropped
         n = int(contacts.rigid_contact_count.numpy()[0])

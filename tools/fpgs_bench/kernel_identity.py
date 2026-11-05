@@ -6,7 +6,7 @@
 For every kernel of a fixed inventory, ``record`` stores Warp's content hash and
 digests of the CUDA and CPU code Warp generates for it; ``diff`` compares two
 records. The content hash is the kernel's cache key and the value that
-``newton/tests/test_feather_pgs_point_streams.py`` pins. The code digests ignore
+``newton/tests/test_feather_pgs_kernel_pins.py`` pins. The code digests ignore
 comments (generated code quotes every Python line with its line number),
 ``#line`` directives, whitespace outside string literals and the hash suffix of
 kernel names. A refactor is then exact:
@@ -28,7 +28,7 @@ record removes all three: it renames functions by build order within the
 kernel, builds each kernel as a fresh process would, and runs with
 ``PYTHONHASHSEED=0``.
 
-The inventory is the point-stream pin inventory (every module-level kernel of
+The inventory is the kernel-pin inventory (every module-level kernel of
 the FeatherPGS package, the held-tree owner's scalar-branch group included, and
 the pinned factory calls), the factory variants those pins do not reach
 (:func:`factory_calls`), a held-tree layout grid of the factory-built tree
@@ -124,7 +124,7 @@ class Named:
 
 
 def label(name, args=(), kwargs=None):
-    """Name a factory call as ``test_feather_pgs_point_streams`` names its pins."""
+    """Name a factory call as ``test_feather_pgs_kernel_pins`` names its pins."""
     kwargs = kwargs or {}
     parts = [repr(arg) for arg in args] + [f"{key}={kwargs[key]!r}" for key in sorted(kwargs)]
     return f"{name}({', '.join(parts)})"
@@ -140,7 +140,7 @@ def _unwrapped(factory):
 
 
 def factory_calls():
-    """Yield ``(name, factory, args, kwargs)`` for factory variants the point-stream pins do not reach.
+    """Yield ``(name, factory, args, kwargs)`` for factory variants the kernel pins do not reach.
 
     Each matrix-free Gauss-Seidel flag is toggled alone on two bases (the pins
     hold the suite's shapes); the fallback and linked parallel tiers of a
@@ -578,13 +578,13 @@ def census_calls():
             "sweep_routes_local.paired_factor_kernel",
             sweep_routes_local.paired_factor_kernel,
             ((192, 29, 23, 6, ARCH),),
-            (_axis("contact_triples"), _axis("independent_components"), _axis("contact_units")),
+            (_axis("independent_components"), _axis("contact_units")),
         ),
         (
             "sweep_routes_diag.sparse_diagonal_kernel",
             sweep_routes_diag.sparse_diagonal_kernel,
             ((64, 10, 9, ARCH),),
-            (_axis("contact_triples"), _axis("speculative_contact_batches"), _axis("contact_units")),
+            (_axis("speculative_contact_batches"), _axis("contact_units")),
         ),
         (
             "sweep_routes_tiers.parallel_kernel",
@@ -686,7 +686,7 @@ def inventory(families, select=()):
 
     kernels, rejected = {}, {}
     if "pins" in families:
-        from newton.tests import test_feather_pgs_point_streams as pins  # noqa: PLC0415
+        from newton.tests import test_feather_pgs_kernel_pins as pins  # noqa: PLC0415
 
         kernels.update((name, ("pins", kernel)) for name, kernel in pins._inventory().items())
     for family, calls in (("factories", factory_calls), ("held_tree", held_tree_calls), ("walk", walk_calls)):

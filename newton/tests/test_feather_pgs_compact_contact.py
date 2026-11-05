@@ -209,8 +209,8 @@ def assert_patch_tangent_law(solver, contacts):
 _ARMS = ("walk", "compact")
 
 
-def check_compact_records(test, solvers, law):
-    """Check and return the contact-row records of the two arms of ``build_solver_fixture`` under ``law``.
+def check_compact_records(test, solvers):
+    """Check and return the contact-row records of the two arms of ``build_solver_fixture``.
 
     Each names the builders of the diagonal-mass size (108) and the dense six with the friction law's
     variants. The marker encodes schedule links into the sparse rows: of point friction's triples, or of
@@ -229,7 +229,6 @@ def check_compact_records(test, solvers, law):
             "6": (producer, [*first, "write_slot_rows"]),
         }
         test.assertEqual(record["producer"], producer)
-        test.assertEqual(record["law"], law)
         test.assertEqual(
             {size: (entry["method"], entry["kernels"]) for size, entry in record["builder_by_dof"].items()}, expected
         )
@@ -263,8 +262,7 @@ class TestCompactContact(unittest.TestCase):
             "_compact_diagonal_mass_size": 108,
             "sparse_diagonal_dense_size": 6,
             "sparse_diagonal_response_size": 108,
-            "sparse_diagonal_contact_triples": True,
-            "sparse_diagonal_contact_units": False,
+            "sparse_diagonal_contact_units": True,
             "dense_max_constraints": 40,
             "dense_internal_max_rows": 12,
         }
@@ -276,13 +274,10 @@ class TestCompactContact(unittest.TestCase):
             return SimpleNamespace(placement=SimpleNamespace(**placement), **{name: fields[name] for name in owners})
 
         self.assertTrue(compact.supported(probe(valid)))
-        # Patch friction schedules units instead of triples.
-        units = {**valid, "sparse_diagonal_contact_triples": False, "sparse_diagonal_contact_units": True}
-        self.assertTrue(compact.supported(probe(units)))
         for name, value in (
             ("routes", SimpleNamespace(case="K6")),
             ("sparse_diagonal_dense_size", 7),
-            ("sparse_diagonal_contact_triples", False),
+            ("sparse_diagonal_contact_units", False),
             ("dense_max_constraints", 11),
             ("dense_internal_max_rows", 13),
             ("_compact_diagonal_mass_size", None),
@@ -305,7 +300,7 @@ class TestCompactContact(unittest.TestCase):
     def test_cuda_actual_solver_step_reset_notify_and_graphs(self):
         """Use the actual allocator, scheduler, RHS and eight-sweep solve with loaded contacts.
 
-        Point friction runs the triple schedule; each arm's route record names exactly the row
+        The contacts run the unit schedule; each arm's route record names exactly the row
         builders its first step launches.
         """
         devices = wp.get_cuda_devices()
@@ -322,7 +317,6 @@ class TestCompactContact(unittest.TestCase):
                         newton.solvers.SolverFeatherPGS(
                             model,
                             pgs_iterations=8,
-                            friction_anchor_beta=0.0,
                             update_mass_matrix_interval=2,
                             enable_joint_limits=True,
                             dense_max_constraints=64,
@@ -333,8 +327,8 @@ class TestCompactContact(unittest.TestCase):
             self.assertTrue(solvers[1].placement.compact_contact_boundary)
             self.assertLessEqual(solvers[1].placement.dense_internal_max_rows, 12)
             for solver in solvers:
-                self.assertTrue(solver.placement.sparse_diagonal_contact_triples)
-            records = check_compact_records(self, solvers, "point")
+                self.assertTrue(solver.placement.sparse_diagonal_contact_units)
+            records = check_compact_records(self, solvers)
             states = [[model.state(), model.state()] for _ in solvers]
             controls = [model.control() for _ in solvers]
             contacts = [newton.Contacts(8, 0, device=device) for _ in solvers]
@@ -411,10 +405,9 @@ class TestCompactContact(unittest.TestCase):
                         )
                     )
             for solver, enabled in zip(solvers, (False, True), strict=True):
-                self.assertTrue(solver.laws.friction_anchors_enabled)
                 self.assertTrue(solver.placement.sparse_diagonal_contact_units)
                 self.assertEqual(solver.placement.compact_contact_boundary, enabled)
-            records = check_compact_records(self, solvers, "patch")
+            records = check_compact_records(self, solvers)
             states = [[model.state(), model.state()] for _ in solvers]
             controls = [model.control() for _ in solvers]
             contacts = [newton.Contacts(24, 0, device=device) for _ in solvers]

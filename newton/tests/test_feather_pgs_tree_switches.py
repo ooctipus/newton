@@ -184,7 +184,7 @@ class TestTreeKernelSwitches(unittest.TestCase):
     def test_owners_in_one_process_build_their_own_kernels(self):
         """Bind each owner's own kernels when owners are built one after another under each switch value."""
         model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
+        solver = SolverFeatherPGS(model)
         owners = {}
         for clocked in (False, True):
             with _switches(solver, clocked):
@@ -203,7 +203,7 @@ class TestTreeKernelSwitches(unittest.TestCase):
     def test_cpu_owner_publishes_forward_kinematics(self):
         """Repair and finish a CPU owner's trees and publish the poses and twists forward kinematics gives."""
         model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
+        solver = SolverFeatherPGS(model)
         owner = HeldTree(solver)
         self.assertTrue(owner.groups)
         dt = 1.0 / 240.0

@@ -787,13 +787,10 @@ class TestParallelPatchReference(unittest.TestCase):
     def test_solver_builds_the_pass_for_limited_linked_tiers(self):
         """Build the last-word pass exactly for linked tiers with joint velocity limits."""
         decide = Sweep._parallel_velocity_limit_pass
-        for anchors, limits in itertools.product((False, True), repeat=2):
-            probe = SimpleNamespace(
-                laws=SimpleNamespace(friction_anchors_enabled=anchors),
-                options=SimpleNamespace(enable_joint_velocity_limits=limits),
-            )
-            with self.subTest(anchors=anchors, limits=limits):
-                self.assertEqual(decide(probe), anchors and limits)
+        for limits in (False, True):
+            probe = SimpleNamespace(options=SimpleNamespace(enable_joint_velocity_limits=limits))
+            with self.subTest(limits=limits):
+                self.assertEqual(decide(probe), limits)
 
     def test_last_word_holds_a_truncated_limit(self):
         """Hold the limit after two sweeps with the last word, and leave a converged tier unchanged."""
@@ -1066,12 +1063,10 @@ class TestKeyedPatchRows(unittest.TestCase):
         layout = KeyedLayout(16, 6, 0, 16, 128, False, 0)
         factory = keyed_rows.get_parallel_factory(sweep_routes_tiers.parallel_kernel, layout)
         options = {"rows": 32, "sweeps": 24, "inkernel_response": (16, 6, 0, 16)}
-        point = factory(128, 32, 22, "120", **options)
         linked = factory(128, 32, 22, "120", linked_rows=True, **options)
-        self.assertEqual(linked.kernel.key, point.kernel.key + "_linked")
         self.assertTrue(linked.kernel.key.startswith("sweep_keyed_parallel_"))
+        self.assertTrue(linked.kernel.key.endswith("_linked"))
         self.assertIn("patch_law", inspect.signature(linked.kernel.func).parameters)
-        self.assertNotIn("patch_law", inspect.signature(point.kernel.func).parameters)
         text = _source(linked)
         self.assertIn("s_parent[i] = world_row_parent.data[off_dense + i];", text)
         self.assertIn("s_mu[i] = world_row_mu.data[off_dense + i];", text)
@@ -1093,24 +1088,22 @@ def _cpu_arm():
 
 class TestPatchParallelAdmission(unittest.TestCase):
     def test_both_laws_are_admitted_and_the_record_says_why(self):
-        """Admit point and patch friction to the parallel rows, record why, and admit contact torsion (the tiers solve
+        """Admit patch friction to the parallel rows, record why, and admit contact torsion (the tiers solve
         the friction triple) and weighted contact rows."""
         model = _cpu_arm()
-        for beta in (0.0, 0.2):
+        for beta in (0.2,):
             with self.subTest(beta=beta):
                 solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
                 selected = solver.get_path_selection()
                 friction = selected["routes"]["friction"]
                 keyed = selected["routes"]["contact_rows"]["keyed_rows"]
-                if beta == 0.0:
-                    continue
                 self.assertNotIn("keyed rows", friction["reason"])
                 self.assertNotIn("need point friction", friction["reason"])
                 self.assertNotIn("point contacts", keyed["reason"])
 
     def test_route_record_reads_the_built_tiers(self):
         """Record the tiers' ring-pooled projection and sweep budgets from the kernels built, not the law."""
-        for anchors, linked in itertools.product((False, True), repeat=2):
+        for linked in (False, True):
             options = {"inkernel_response": (_DOFS, 0, 0, 0), "linked_rows": linked}
             kernels = [
                 sweep_routes_tiers.parallel_kernel(
@@ -1132,9 +1125,8 @@ class TestPatchParallelAdmission(unittest.TestCase):
                         reasons={"K4": "The parallel tiers form the response of sizes [12] in-kernel."},
                     )
                 ),
-                laws=SimpleNamespace(friction_anchors_enabled=anchors),
             )
-            with self.subTest(anchors=anchors, linked=linked):
+            with self.subTest(linked=linked):
                 tiers = path_selection._tiers(probe)
                 self.assertEqual(tiers["linked_rows"], linked)
                 self.assertEqual(_law_key(tiers["tiers"][0]["kernel"]).endswith("_linked"), linked)
@@ -1191,13 +1183,9 @@ class TestTierSweeps(unittest.TestCase):
     def test_solver_budgets_every_tier(self):
         """Budget point and linked tiers by one rule."""
         tiers = [(32, 0), (64, 32), (96, 64), (128, 96)]
-        for anchors in (False, True):
-            probe = SimpleNamespace(
-                pins={},
-                laws=SimpleNamespace(friction_anchors_enabled=anchors),
-                options=SimpleNamespace(pgs_iterations=12),
-            )
-            with self.subTest(anchors=anchors):
+        for _ in range(1):
+            probe = SimpleNamespace(pins={}, options=SimpleNamespace(pgs_iterations=12))
+            with self.subTest():
                 budgets, rule, reason = Sweep._parallel_tier_sweeps(probe, tiers)
                 self.assertEqual((budgets, rule), ([42, 60, 73, 84], "auto"))
                 self.assertIn("ceil(7/2 * pgs_iterations * sqrt(R / 32))", reason)
@@ -1206,7 +1194,6 @@ class TestTierSweeps(unittest.TestCase):
         # A test pin sets every tier's budget.
         probe = SimpleNamespace(
             pins={"tier_sweeps": 160},
-            laws=SimpleNamespace(friction_anchors_enabled=False),
             options=SimpleNamespace(pgs_iterations=12),
         )
         budgets, rule, reason = Sweep._parallel_tier_sweeps(probe, tiers)
@@ -1720,15 +1707,14 @@ def _friction_pairs(solver, world):
 @unittest.skipUnless(wp.is_cuda_available(), "Parallel matrix-free tiers require CUDA")
 class TestPatchParallelRoutes(unittest.TestCase):
     def test_patch_runs_linked_tiers(self):
-        """Build linked tiers for patch friction and point tiers for point friction.
+        """Build linked tiers for patch friction.
 
-        Every tier, point or linked, sweeps the equal-accuracy budget of 32 rows at eight iterations.
+        Every tier sweeps the equal-accuracy budget of 32 rows at eight iterations.
         """
         model = standing_model()
         options = {"pins": {}}
         patch_tiers = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **options)
-        point_tiers = _matrix_free_solver(model, beta=0.0, parallel_rows=32, **options)
-        for solver, linked in ((patch_tiers, True), (point_tiers, False)):
+        for solver, linked in ((patch_tiers, True),):
             self.assertEqual(solver.placement.ink_rows, 32)
             # The tier owns the ordinary buffers for either law.
             self.assertIsNone(solver.placement.sparse_mass_matrix_size)
@@ -1744,26 +1730,24 @@ class TestPatchParallelRoutes(unittest.TestCase):
             self.assertEqual((tiers["sweeps"], tiers["sweeps_rule"]), (sweeps, "auto"))
 
     def test_keyed_rows_record_names_the_launched_builders(self):
-        """Name in the route record the keyed-row builders one step launches, under both laws.
+        """Name in the route record the keyed-row builders one step launches.
 
-        Matrix-free parallel tiers that form the response in-kernel admit keyed rows on CUDA, for point and
-        patch friction. The keyed parallel tiers build the direct rows in the sweep, which every entry
+        Matrix-free parallel tiers that form the response in-kernel admit keyed rows on CUDA. The keyed parallel tiers build the direct rows in the sweep, which every entry
         points to; the scatter and the fallback are the row builders a step launches outside it.
         """
         model = standing_model()
         with patch.dict(os.environ):
-            for law, beta in (("point", 0.0), ("patch", 0.2)):
+            for law, beta in (("patch", 0.2),):
                 with self.subTest(law=law):
                     solver = _matrix_free_solver(model, beta=beta, parallel_rows=32, enable_joint_limits=True)
                     routes = solver.get_path_selection()["routes"]
                     record = routes["contact_rows"]
                     self.assertTrue(record["keyed_rows"]["enabled"], record["keyed_rows"]["reason"])
                     self.assertEqual(routes["sweep"]["tiers"]["family"], "keyed_parallel")
-                    self.assertEqual((record["producer"], record["law"]), ("keyed_rows", law))
+                    self.assertEqual(record["producer"], "keyed_rows")
                     builder = {
                         "method": "keyed_rows",
                         "kernels": ["scatter_contact_keys", "keyed_general_units", "write_walked_rows"],
-                        "law": law,
                         "direct_rows": "routes.sweep.tiers",
                     }
                     self.assertEqual(record["builder_by_dof"], dict.fromkeys(record["builder_by_dof"], builder))
@@ -1857,12 +1841,11 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 limits: _matrix_free_solver(model, beta=0.2, parallel_rows=32, enable_joint_velocity_limits=limits)
                 for limits in (False, True)
             }
-            # The same tiers without the pass: point friction builds the unlinked tiers, which take no last word.
             budgets = {
-                (sweeps, beta > 0.0): _matrix_free_solver(
-                    model, beta=beta, parallel_rows=32, sweeps=sweeps, enable_joint_velocity_limits=True
+                (sweeps, True): _matrix_free_solver(
+                    model, beta=0.2, parallel_rows=32, sweeps=sweeps, enable_joint_velocity_limits=True
                 )
-                for sweeps, beta in itertools.product((2, 2000), (0.0, 0.2))
+                for sweeps in (2, 2000)
             }
         for limits, solver in built.items():
             with self.subTest(limits=limits):
@@ -1891,17 +1874,16 @@ class TestPatchParallelRoutes(unittest.TestCase):
             _assert_tier_owned(self, solver, 32)
             velocities[sweeps, last_word] = state.joint_qd.numpy().astype(np.float64)
         speeds = {budget: float(np.max(np.abs(velocity[:2]))) for budget, velocity in velocities.items()}
-        self.assertGreater(speeds[2, False], 1.05 * limit, f"two sweeps already hold the limit: {speeds}")
-        for budget in ((2, True), (2000, False), (2000, True)):
+        for budget in ((2, True), (2000, True)):
             self.assertLessEqual(speeds[budget], limit * (1.0 + 1.0e-5), (budget, speeds))
 
     def test_every_tier_takes_the_automatic_budget(self):
-        """Build point and linked tiers with the equal-accuracy budget, or a pinned one, and record it."""
+        """Build linked tiers with the equal-accuracy budget, or a pinned one, and record it."""
         model = standing_model()
         options = {"dense_max_constraints": 64, "pgs_iterations": 8}
         with patch.dict(os.environ):
             built = {}
-            for beta, sweeps in itertools.product((0.0, 0.2), (None, 64)):
+            for beta, sweeps in itertools.product((0.2,), (None, 64)):
                 built[beta, sweeps] = _matrix_free_solver(model, beta=beta, parallel_rows=64, sweeps=sweeps, **options)
         for (beta, sweeps), solver in built.items():
             with self.subTest(beta=beta, sweeps=sweeps):
@@ -1921,23 +1903,31 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     self.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), name)
 
 
+# 3 x the point tiers' gap plus the floor (_STATE_FLOOR), measured on cd41551f2 (2026-11-05): the point gaps were
+# 1.23e-4, 1.48e-3, 6.13e-5 and 1.48e-3; the law's tiers measure 1.27e-4, 1.14e-3, 6.44e-5 and 1.15e-3.
+_FEET_BOUND = {"joint_q": 5.7e-4, "joint_qd": 6.4e-3, "body_q": 3.8e-4, "body_qd": 6.4e-3}
+# The point tiers stopped the box where their serial sweep did (gap 0), so the bound was its floor, 1% of the analytic
+# stopping distance; the law's tiers measure a gap of 0 too.
+_SLIDE_BOUND = 0.01
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "Parallel matrix-free tiers require CUDA")
 class TestPatchParallelPhysics(unittest.TestCase):
-    """Compare each law's parallel tiers with its serial sweep, the patch gap bounded by the point gap.
+    """Compare the parallel tiers with the serial sweep, their gap within a stated bound.
 
     Parallel tiers are Jacobi sweeps, not float reorderings of the serial sweep.
-    Every tier steps each friction pair isotropically, so under either law the
-    tiers share the serial sweep's fixed point (a sliding pair converges to maximal
-    dissipation) and the rollouts differ by the convergence gap. The point tiers'
-    measured gap on the same fixture, with a floor at the float-order tolerance of
-    an exact route change, bounds the patch tiers' gap. Both laws' tiers sweep their
-    default budget, which is the same for both, so the bound compares the laws at one
-    budget. Every parallel step must leave each world in the tiers' domain, so the
-    comparison is never serial against serial.
+    Every tier steps each friction pair isotropically, so the tiers share the serial
+    sweep's fixed point (a sliding pair converges to maximal dissipation) and the
+    rollouts differ by the convergence gap. The bounds are the ones the deleted
+    no-stick point friction's tiers set on the same fixtures at the same default
+    budget (three times their measured gap, with a floor at the float-order
+    tolerance of an exact route change), held as numbers. Every parallel step must
+    leave each world in the tiers' domain, so the comparison is never serial against
+    serial.
     """
 
-    # (friction_anchor_beta, tier rows): each law's serial sweep and tiers at their default budget.
-    _ARMS = ((0.0, 0), (0.0, 32), (0.2, 0), (0.2, 32))
+    # Tier rows: the serial sweep and the tiers at their default budget.
+    _ARMS = (0, 32)
 
     def _assert_budget(self, solver, parallel_rows):
         """Require the tiers to sweep the automatic budget of 32 rows at eight iterations."""
@@ -1947,55 +1937,49 @@ class TestPatchParallelPhysics(unittest.TestCase):
         self.assertTrue(all(f"_sweeps{budget}_" in key for key in keys), keys)
 
     def test_standing_feet_match_the_serial_patch_sweep(self):
-        """Keep loaded, ring-linked anchors and the serial sweep's motion on two box feet.
-
-        The patch tiers' gap to the serial patch sweep stays within the point tiers'
-        gap bound.
-        """
+        """Keep loaded, ring-linked anchors and the serial sweep's motion on two box feet, the tiers' gap to the
+        serial sweep within :data:`_FEET_BOUND`."""
         model = standing_model()
         velocity = model.joint_qd.numpy()
         velocity[0::10] = 0.05  # the torsos drift sideways, loading the feet's friction without slipping
         model.joint_qd.assign(velocity)
         with patch.dict(os.environ):
             states = {}
-            for beta, parallel_rows in self._ARMS:
+            for parallel_rows in self._ARMS:
 
-                def check(step, solver, contacts, state, beta=beta, parallel_rows=parallel_rows):
+                def check(step, solver, contacts, state, parallel_rows=parallel_rows):
                     for name in _STATE_FIELDS:
                         self.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), name)
                     self.assertFalse(solver.placement.constraint_overflow.numpy().any())
                     if parallel_rows:
                         _assert_tier_owned(self, solver, parallel_rows)
-                    if beta and parallel_rows:
+                    if parallel_rows:
                         # Every stored parallel iterate lies in its pooled cone; a serial sweep's last
                         # pair update can precede a ring normal's, so only the tiers hold it exactly.
                         assert_ring_coulomb(solver)
                         assert_loaded_anchors(solver, contacts, carried=step > 0)
 
-                solver = _matrix_free_solver(model, beta=beta, parallel_rows=parallel_rows)
+                solver = _matrix_free_solver(model, beta=0.2, parallel_rows=parallel_rows)
                 self._assert_budget(solver, parallel_rows)
-                states[beta, parallel_rows] = _rollout(model, solver, 24, after_step=check)[0]
-        point_gap = _state_differences(states[0.0, 32], states[0.0, 0])
-        patch_gap = _state_differences(states[0.2, 32], states[0.2, 0])
-        measured = {"point_gap": point_gap, "patch_gap": patch_gap}
+                states[parallel_rows] = _rollout(model, solver, 24, after_step=check)[0]
+        gap = _state_differences(states[32], states[0])
         for name in _STATE_FIELDS:
-            bound = 3.0 * point_gap[name] + _STATE_FLOOR[name]
-            self.assertLessEqual(patch_gap[name], bound, (name, measured))
+            self.assertLessEqual(gap[name], _FEET_BOUND[name], (name, gap))
 
     def test_box_rests_and_slides_like_the_serial_patch_sweep(self):
         """Hold a resting box, and stop a sliding one where the serial patch sweep stops it.
 
         A sliding box saturates its patch's pooled cone: each anchor pair carries
         mu / 2 of the four normals' load. Pooling each pair on its own normal would
-        halve the friction and double the stopping distance. The patch tiers stop the
-        box within the point tiers' gap bound of the serial patch sweep.
+        halve the friction and double the stopping distance. The tiers stop the box
+        within :data:`_SLIDE_BOUND` of the analytic distance of the serial sweep.
         """
         speed, mu, gravity = 1.0, 0.5, 9.81
         expected = speed * speed / (2.0 * mu * gravity)
         model = _sliding_boxes("cuda:0", (0.0, speed), mu=mu)
         distances = {}
         with patch.dict(os.environ):
-            for beta, parallel_rows in self._ARMS:
+            for parallel_rows in self._ARMS:
                 ratios = []
 
                 def check(step, solver, contacts, state, ratios=ratios, parallel_rows=parallel_rows):
@@ -2005,11 +1989,11 @@ class TestPatchParallelPhysics(unittest.TestCase):
                         pairs = _friction_pairs(solver, world=1)
                         ratios.extend(magnitude / budget for magnitude, budget in pairs if budget > 0.0)
 
-                solver = _matrix_free_solver(model, beta=beta, parallel_rows=parallel_rows)
+                solver = _matrix_free_solver(model, beta=0.2, parallel_rows=parallel_rows)
                 self._assert_budget(solver, parallel_rows)
                 state, _ = _rollout(model, solver, 96, after_step=check)
                 q, qd = state.joint_q.numpy(), state.joint_qd.numpy()
-                with self.subTest(beta=beta, parallel_rows=parallel_rows):
+                with self.subTest(parallel_rows=parallel_rows):
                     self.assertLess(np.max(np.abs(q[0:2])), 2.0e-4, "the resting box must not creep")
                     self.assertLess(abs(qd[3]), 1.0e-3, "the sliding box must stop")
                     self.assertLess(abs(q[3] - expected), 0.2 * expected, "friction must act at the full coefficient")
@@ -2018,10 +2002,8 @@ class TestPatchParallelPhysics(unittest.TestCase):
                     # A parallel iterate is projected onto its pooled cone; a serial sweep may update
                     # a ring normal after the pair, leaving the pair marginally outside.
                     self.assertLess(max(ratios), 1.0 + (1.0e-4 if parallel_rows else 5.0e-3))
-                distances[beta, parallel_rows] = float(q[3])
-        point_gap = abs(distances[0.0, 32] - distances[0.0, 0])
-        patch_gap = abs(distances[0.2, 32] - distances[0.2, 0])
-        self.assertLessEqual(patch_gap, max(3.0 * point_gap, 0.01 * expected), distances)
+                distances[parallel_rows] = float(q[3])
+        self.assertLessEqual(abs(distances[32] - distances[0]), _SLIDE_BOUND * expected, distances)
 
     def test_sliding_contact_reaches_the_serial_fixed_point(self):
         """Slide one contact of fourfold unequal tangent masses to the serial patch sweep's converged velocity.
@@ -2129,8 +2111,8 @@ class TestPatchParallelPhysics(unittest.TestCase):
         """
         model = _spinning_sphere("cuda:0", speed=1.0, spin=20.0)
         with patch.dict(os.environ):
-            serial = _matrix_free_solver(model, beta=0.0, parallel_rows=0, pgs_iterations=2000, contact_torsion=True)
-            tier = _matrix_free_solver(model, beta=0.0, parallel_rows=32, sweeps=2000, contact_torsion=True)
+            serial = _matrix_free_solver(model, beta=0.2, parallel_rows=0, pgs_iterations=2000, contact_torsion=True)
+            tier = _matrix_free_solver(model, beta=0.2, parallel_rows=32, sweeps=2000, contact_torsion=True)
         velocities = {}
         for name, solver in (("serial", serial), ("tier", tier)):
             state, _ = _rollout(model, solver, 24)

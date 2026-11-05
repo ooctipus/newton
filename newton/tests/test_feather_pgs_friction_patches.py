@@ -100,7 +100,7 @@ def _patch_fixture(
         rigid_contact_margin0=wp.zeros(n, dtype=float, device=device),
         rigid_contact_margin1=wp.zeros(n, dtype=float, device=device),
     )
-    patches = _FrictionPatchState(model, max(n, 8), True, wp.zeros(max(n, 8), dtype=wp.vec2, device=device))
+    patches = _FrictionPatchState(model, max(n, 8), wp.zeros(max(n, 8), dtype=wp.vec2, device=device))
     patches.build(model, state, contacts)
     return model, state, contacts, patches
 
@@ -673,15 +673,14 @@ def _families_meet(test, actuals, references, index, delta):
 
 class TestFeatherPGSFrictionPatches(unittest.TestCase):
     def test_default_friction_preserves_free_rolling(self):
-        """Match velocity-only free rolling without adding a persistent rearward friction force."""
+        """Roll at the default gain as at the gain's limit: the stick adds no persistent rearward friction force.
+
+        The reference is the law at a negligible gain: the same patch rows with effectively no positional correction.
+        """
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         for geometry in ("sphere", "capsule", "cylinder", "mesh", "convex_hull"):
-            # Isolate displacement persistence from row reduction on faceted
-            # wheels: a negligible positive gain keeps the same patch rows with
-            # effectively no positional correction. The separate tessellation
-            # matrix compares default patches against full point friction.
             faceted = geometry in ("mesh", "convex_hull")
-            reference_beta = 1.0e-8 if faceted else 0.0
+            reference_beta = 1.0e-8
             # A faceted wheel's travel is bimodal under its facet impacts (about 0.827 and 0.838-0.840 on the mesh):
             # one rounding unit of the launch moves a run between the modes, more than the bound (main 64e61f3a,
             # mesh reference: 0.83045, +1 ulp 0.83977, -1 ulp 0.82722). Both runs are taken as their launch's
@@ -719,7 +718,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 for hz in (120, 240):
                     for direction in (-1, 1):
                         case = {"segments": segments, "hz": hz, "direction": direction}
-                        reference = _run_rolling(geometry, device, friction_anchor_beta=0.0, **case)
+                        reference = _run_rolling(geometry, device, **case)
                         actual = _run_rolling(geometry, device, **case)
                         with self.subTest(geometry=geometry, **case):
                             self.assertTrue(all(np.isfinite(value).all() for value in actual))
@@ -747,50 +746,42 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         with wp.ScopedDevice(device):
             for geometry in ("sphere", "capsule"):
-                for enabled in (False, True):
-                    model, jaws, obj = _build_v_jaws(5.0, geometry)
-                    kwargs = dict(_SQUEEZE_SOLVER)
-                    if not model.device.is_cuda:
-                        kwargs.update(enable_bilateral_preelimination=False)
-                    if not enabled:
-                        kwargs["friction_anchor_beta"] = 0.0
-                    solver = newton.solvers.SolverFeatherPGS(model, **kwargs)
-                    pipeline = newton.CollisionPipeline(model, rigid_contact_max=256, broad_phase="nxn")
-                    contacts = pipeline.contacts()
-                    s0, s1 = model.state(), model.state()
-                    control = model.control()
-                    newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
-                    relative_height = []
-                    retained = []
-                    for step in range(600):
-                        if step >= 100:
-                            # External pose disturbances exercise history through
-                            # normal changes, even when stiction resists the torque.
-                            q = s0.joint_q.numpy()
-                            angle = 2.0e-4 * (np.sin(step * 0.07) - np.sin((step - 1) * 0.07))
-                            q[-4:] = np.asarray(
-                                wp.quat_from_axis_angle(wp.vec3(0, 1, 0), float(angle)) * wp.quat(*q[-4:])
-                            )
-                            s0.joint_q.assign(q)
-                            newton.eval_fk(model, s0.joint_q, s0.joint_qd, s0)
-                        pipeline.collide(s0, contacts)
-                        s0.clear_forces()
-                        force = s0.body_f.numpy()
-                        force[obj, 4] = 2.0e-4 * np.sin(step * 0.07)
-                        s0.body_f.assign(force)
-                        solver.step(s0, s1, control, contacts, 0.005)
-                        s0, s1 = s1, s0
-                        pose = s0.body_q.numpy()
-                        self.assertTrue(np.isfinite(pose).all())
-                        relative_height.append(pose[obj, 2] - pose[jaws[0], 2])
-                        if enabled and step >= 100:
-                            retained.append(
-                                np.count_nonzero(solver.laws.friction_patches.current.source.numpy() >= 0) >= 2
-                            )
-                    if enabled:
-                        with self.subTest(geometry=geometry):
-                            self.assertGreater(np.mean(retained), 0.8)
-                            self.assertLess(float(np.ptp(relative_height[100:])), 1.0e-4)
+                model, jaws, obj = _build_v_jaws(5.0, geometry)
+                kwargs = dict(_SQUEEZE_SOLVER)
+                if not model.device.is_cuda:
+                    kwargs.update(enable_bilateral_preelimination=False)
+                solver = newton.solvers.SolverFeatherPGS(model, **kwargs)
+                pipeline = newton.CollisionPipeline(model, rigid_contact_max=256, broad_phase="nxn")
+                contacts = pipeline.contacts()
+                s0, s1 = model.state(), model.state()
+                control = model.control()
+                newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
+                relative_height = []
+                retained = []
+                for step in range(600):
+                    if step >= 100:
+                        # External pose disturbances exercise history through
+                        # normal changes, even when stiction resists the torque.
+                        q = s0.joint_q.numpy()
+                        angle = 2.0e-4 * (np.sin(step * 0.07) - np.sin((step - 1) * 0.07))
+                        q[-4:] = np.asarray(wp.quat_from_axis_angle(wp.vec3(0, 1, 0), float(angle)) * wp.quat(*q[-4:]))
+                        s0.joint_q.assign(q)
+                        newton.eval_fk(model, s0.joint_q, s0.joint_qd, s0)
+                    pipeline.collide(s0, contacts)
+                    s0.clear_forces()
+                    force = s0.body_f.numpy()
+                    force[obj, 4] = 2.0e-4 * np.sin(step * 0.07)
+                    s0.body_f.assign(force)
+                    solver.step(s0, s1, control, contacts, 0.005)
+                    s0, s1 = s1, s0
+                    pose = s0.body_q.numpy()
+                    self.assertTrue(np.isfinite(pose).all())
+                    relative_height.append(pose[obj, 2] - pose[jaws[0], 2])
+                    if step >= 100:
+                        retained.append(np.count_nonzero(solver.laws.friction_patches.current.source.numpy() >= 0) >= 2)
+                with self.subTest(geometry=geometry):
+                    self.assertGreater(np.mean(retained), 0.8)
+                    self.assertLess(float(np.ptp(relative_height[100:])), 1.0e-4)
 
     def test_default_friction_keeps_a_box_stack_at_rest(self):
         """Settle an ordinary stack without grasp-specific settings or anchor opt-in."""
@@ -856,7 +847,6 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         builder.add_ground_plane(cfg=cfg)
         model = builder.finalize(device=device)
         solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8)
-        self.assertTrue(solver.laws.friction_anchors_enabled)
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
         s0, s1 = model.state(), model.state()
@@ -924,7 +914,6 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         builder.add_ground_plane(cfg=cfg)
         model = builder.finalize(device=device)
         solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8)
-        self.assertTrue(solver.laws.friction_anchors_enabled)
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
         states = [model.state(), model.state()]
@@ -974,20 +963,14 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         yaw_rate = float(np.abs(yaw_rates[speeds > 1.0e-3]).max())
         return yaw_rate, np.array(deceleration), weights, float(np.mean(ordered))
 
-    def test_default_patch_friction_and_explicit_opt_out(self):
-        """Build persistent patches by default while retaining an explicit velocity-only opt-out."""
+    def test_default_patch_friction(self):
+        """Build persistent patches by default, at the stick's default gain."""
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
-        for kwargs, enabled in (({}, True), ({"friction_anchor_beta": 0.0}, False)):
-            with self.subTest(enabled=enabled):
-                _, solver, _, step = _ground_box(device, **kwargs)
-                for _ in range(3):
-                    step()
-                self.assertEqual(solver.laws.friction_anchors_enabled, enabled)
-                if enabled:
-                    self.assertAlmostEqual(solver.laws.friction_anchor_beta, 0.2)
-                    self.assertEqual(np.count_nonzero(solver.laws.friction_patches.current.source.numpy() >= 0), 1)
-                else:
-                    self.assertFalse(hasattr(solver.laws.friction_patches, "current"))
+        _, solver, _, step = _ground_box(device)
+        for _ in range(3):
+            step()
+        self.assertAlmostEqual(solver.laws.friction_anchor_beta, 0.2)
+        self.assertEqual(np.count_nonzero(solver.laws.friction_patches.current.source.numpy() >= 0), 1)
 
     def test_rocking_cube_assigns_friction_only_to_supported_edge(self):
         """Retire the lifted face anchor before building rows for a cube resting on one edge."""

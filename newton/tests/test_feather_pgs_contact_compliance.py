@@ -68,8 +68,7 @@ def run_fixture(
             setattr(contacts, name, wp.zeros(32, dtype=float))
         extra = {} if stock else {"contact_compliance": enabled}
         options = dict(
-            # Isolate the normal material law from positional patch friction.
-            friction_anchor_beta=0.0,
+            # The normal material law under the friction law's stick (its default gain).
             enable_restitution=False,
             pgs_iterations=iterations,
             dense_max_constraints=32,
@@ -155,7 +154,6 @@ def run_native_hydro_fixture(*, articulated=True):
             solver = SolverFeatherPGS(
                 model,
                 contact_compliance=enabled,
-                friction_anchor_beta=0.0,
                 enable_restitution=False,
                 pgs_iterations=128,
                 pgs_contact_regularization=0.0,

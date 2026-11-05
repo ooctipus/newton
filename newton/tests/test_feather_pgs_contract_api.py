@@ -405,6 +405,16 @@ class _Run:
         return {name: getattr(self.state, name).numpy().copy() for name in STATE_FIELDS}
 
 
+def _carry_friction_history(source, target):
+    """Give ``target`` the friction history ``source`` stores: its stored anchors (the previous patch frame, their
+    worlds and count) and the poses they were stored at."""
+    stored, kept = source.laws.friction_patches, target.laws.friction_patches
+    for name, view in stored._previous_rows.views.items():
+        kept._previous_rows.views[name].assign(view)
+    kept.stored.assign(stored.stored)
+    kept.previous_q.assign(stored.previous_q)
+
+
 def _world(values: dict, model, world: int) -> dict:
     """The coordinates and bodies of ``world`` (the replicated worlds hold equal, contiguous blocks)."""
     worlds = model.world_count
@@ -506,7 +516,13 @@ class TestFeatherPGSReset(unittest.TestCase):
                 solver.reset(model.state(), wp.array((True, False), dtype=wp.bool, device="cpu"))
 
     def test_model_change_restarts_every_world_and_keeps_the_status(self):
-        """Step every world as a fresh solver does after a model change, and keep a capacity failure latched."""
+        """After a model change, step every world as a fresh solver that starts from the same friction history does,
+        and keep a capacity failure latched.
+
+        A model change restarts the solver's caches. The friction anchors are physical state, not a cache: a stick's
+        displacement is where a contact held, so the notified solver keeps them (geometry edits retire them, and
+        ``reset`` discards them), and the fresh solver is handed the same history.
+        """
         model = _resting_boxes("cpu")
         start = model.state()
         newton.eval_fk(model, start.joint_q, start.joint_qd, start)
@@ -516,11 +532,12 @@ class TestFeatherPGSReset(unittest.TestCase):
             newton.ModelFlags.SHAPE_PROPERTIES,
         ):
             with self.subTest(flags=flags):
-                run = _Run(model, start, friction_anchor_beta=0.0)
+                run = _Run(model, start)
                 for _ in range(8):
                     run.step()
                 run.solver.notify_model_changed(flags)
-                fresh = _Run(model, run.state, friction_anchor_beta=0.0)
+                fresh = _Run(model, run.state)
+                _carry_friction_history(run.solver, fresh.solver)
                 stepped, expected = run.step(), fresh.step()
                 for name in STATE_FIELDS:
                     np.testing.assert_array_equal(stepped[name], expected[name], err_msg=name)

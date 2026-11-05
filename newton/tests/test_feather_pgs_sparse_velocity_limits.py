@@ -3,7 +3,6 @@
 
 """Preserve articulated velocity clamps in factor-coordinate response."""
 
-import itertools
 import os
 import unittest
 from types import SimpleNamespace
@@ -41,7 +40,7 @@ from newton.tests.test_feather_pgs_sparse_pgs import _sweep
 
 class TestSparseVelocityLimitAdmission(unittest.TestCase):
     def test_auto_and_enabled_velocity_owner_reach_topology(self):
-        """Admit the unchanged augmented matrix-free recipe under either friction law before planning its factor.
+        """Admit the unchanged augmented matrix-free recipe before planning its factor.
 
         Warm starting is admitted without free rigid bodies: the sparse sweep
         seeds its factor delta with the carried impulses' response. Material
@@ -49,14 +48,13 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
         """
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         recipes = ({}, {"pgs_warmstart": True}, {"contact_compliance": True})
-        for patches, recipe in itertools.product((False, True), recipes):
+        for recipe in recipes:
             solver = eligible_solver()
             solver.options.enable_joint_velocity_limits = True
-            solver.laws.friction_anchors_enabled = patches
             for key, value in recipe.items():
                 change_probe(solver, key, value)
             with (
-                self.subTest(patches=patches, recipe=recipe),
+                self.subTest(recipe=recipe),
                 mock.patch.dict(os.environ, {}, clear=True),
                 self.assertRaises(TopologyReached),
             ):
@@ -173,7 +171,6 @@ def _case(
     branches=3,
     depth=1,
     activation_fraction=0.0,
-    friction_anchor_beta=0.0,
 ):
     model = sparse_scene.branched_model(floating=floating, branches=branches, depth=depth)
     limits = np.full(model.joint_dof_count, 0.25, np.float32)
@@ -183,7 +180,6 @@ def _case(
     with mock.patch.dict(SolverFeatherPGS._route_pins, pins):
         solver = SolverFeatherPGS(
             model,
-            friction_anchor_beta=friction_anchor_beta,
             enable_joint_limits=True,
             enable_joint_velocity_limits=True,
             velocity_limit_activation_fraction=activation_fraction,
@@ -221,13 +217,11 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
             self.assertFalse(case[1].placement.constraint_overflow.numpy().any())
             for name in sparse_scene.STATE_FIELDS:
                 self.assertTrue(np.isfinite(getattr(case[2], name).numpy()).all(), name)
-        if candidate[1].laws.friction_anchors_enabled:
-            # Called unbound so that suites reusing this check (mimic rows) inherit it.
-            TestSparseVelocityLimitPhysics._assert_patch(self, reference, candidate)
+        # Called unbound so that suites reusing this check (mimic rows) inherit it.
+        TestSparseVelocityLimitPhysics._assert_patch(self, reference, candidate)
 
     def _assert_patch(self, reference, candidate):
         """Match patch rows and contact impulses, the pooled Coulomb bound and the anchor lifecycle."""
-        self.assertTrue(reference[1].laws.friction_anchors_enabled)
         # Keyed by contact: ring parents and patch rows are slots of per-world atomic reservations.
         rows = contact_rows(reference[1], reference[-1])
         candidate_rows = contact_rows(candidate[1], candidate[-1])
@@ -249,7 +243,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
             np.testing.assert_allclose(jacobian, old_j[world, :count], atol=3e-5, rtol=3e-4)
             np.testing.assert_allclose(z @ z.T, old_j[world, :count] @ old_y[world, :count].T, atol=3e-5, rtol=3e-4)
             # Patch ring parents name other contacts' slots; _assert_patch compares them by contact.
-            for name in ("row_type",) if old.laws.friction_anchors_enabled else ("row_type", "row_parent"):
+            for name in ("row_type",):
                 np.testing.assert_array_equal(
                     getattr(new.placement, name).numpy()[world, :count],
                     getattr(old.placement, name).numpy()[world, :count],
@@ -308,13 +302,11 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                     np.testing.assert_array_equal(delta[1], 0.0)
 
     def test_serial_and_branched_dense_reference(self):
-        """Keep signed clamps, contacts and momentum response on independent tree shapes under either friction law."""
-        for beta, shape in itertools.product(
-            (0.0, 0.2), ({"floating": False, "branches": 1, "depth": 3}, {"floating": True, "branches": 3, "depth": 1})
-        ):
-            with self.subTest(friction_anchor_beta=beta, shape=shape):
-                reference = _case(False, friction_anchor_beta=beta, **shape)
-                candidate = _case(True, friction_anchor_beta=beta, **shape)
+        """Keep signed clamps, contacts and momentum response on independent tree shapes."""
+        for shape in ({"floating": False, "branches": 1, "depth": 3}, {"floating": True, "branches": 3, "depth": 1}):
+            with self.subTest(shape=shape):
+                reference = _case(False, **shape)
+                candidate = _case(True, **shape)
                 self.assertFalse(reference[1].sweep.sparse_velocity_limits)
                 self.assertTrue(candidate[1].sweep.sparse_velocity_limits)
                 self.assertEqual(candidate[1].options.pgs_iterations, 8)
@@ -331,16 +323,10 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                         self.assertIn(CONTACT, live)
 
     def test_held_factor_reset_and_limit_mutation_graph(self):
-        """Retain factor cadence while finite, unlimited and disabled speed rows regrow."""
-        self._check_held_factor_graph(0.0)
-
-    def test_patch_held_factor_reset_and_limit_mutation_graph(self):
-        """Retain the factor cadence and the patch anchor lifecycle through resets and captured limit changes."""
-        self._check_held_factor_graph(0.2)
-
-    def _check_held_factor_graph(self, friction_anchor_beta):
-        reference = _case(False, friction_anchor_beta=friction_anchor_beta)
-        candidate = _case(True, friction_anchor_beta=friction_anchor_beta)
+        """Retain the factor cadence and the anchor lifecycle while finite, unlimited and disabled speed rows regrow
+        through resets and captured limit changes."""
+        reference = _case(False)
+        candidate = _case(True)
         self.assertTrue(candidate[1].sweep.sparse_velocity_limits)
         for case in (reference, candidate):
             sparse_scene.step(case)

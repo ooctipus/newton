@@ -70,7 +70,6 @@ def _contact_scene(rng, contacts, *, worlds=4, shapes=12, bodies=8, arts=4, fric
 
 def _patches(rng, contacts, device, enabled):
     patches = friction_patches.FrictionPatches()
-    patches.enabled = int(enabled)
     patches.weight = wp.array(rng.uniform(0.0, 1.0, contacts).astype(np.float32), device=device)
     patches.next_contact = wp.full(contacts, -1, dtype=int, device=device)
     patches.point = wp.array(rng.normal(size=(contacts, 3)).astype(np.float32), dtype=wp.vec3, device=device)

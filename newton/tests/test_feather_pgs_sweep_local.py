@@ -21,7 +21,7 @@ from newton._src.solvers.feather_pgs.solve_policy import DEFAULT_POLICY, SolvePo
 
 _PAIRED = sweep_routes_local.paired_factor_kernel.__wrapped__
 
-PAIRED_SCHEDULES = ({}, {"contact_triples": True}, {"contact_units": True})
+PAIRED_SCHEDULES = ({}, {"contact_units": True})
 
 
 def _paired_variants():
@@ -58,7 +58,6 @@ class TestPairedFactorRoute(unittest.TestCase):
             ((64, 24, 17, 6, "120"), {}),
             ((64, 36, 30, 6, "120"), {}),
             ((64, 23, 23, 0, "120"), {}),
-            ((64, 23, 17, 6, "120"), {"contact_triples": True, "contact_units": True}),
         )
         for args, kwargs in invalid:
             with self.subTest(args=args, kwargs=kwargs), self.assertRaises(ValueError):
@@ -107,11 +106,6 @@ class TestPairedFactorRoute(unittest.TestCase):
         body, _ = sweep_routes_local.paired_factor_source(64, 23, 17, 6)
         self.assertIn("SUM(sibling_residual, sibling_residual_terms, cross);", body)
         self.assertNotIn(unit, body)
-
-    def test_triple_prefix_holds_no_friction_pairs(self):
-        body, _ = sweep_routes_local.paired_factor_source(64, 23, 17, 6, contact_triples=True)
-        prefix = _block(body, "for (int i = 0; i < contact_start; ++i) {")
-        self.assertNotIn("RING_LOAD", prefix)
 
 
 class TestResponseOperators(unittest.TestCase):

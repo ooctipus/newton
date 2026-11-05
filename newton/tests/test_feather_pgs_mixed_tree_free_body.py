@@ -18,7 +18,7 @@ from newton.tests.feather_pgs_law_harness import recomputing
 from newton.tests.feather_pgs_patch_parity import assert_history_close
 
 DT = 1.0 / 240.0
-# PGS iterations of the patch-friction (friction_anchor_beta > 0) parity subtests; point subtests run 8.
+# PGS iterations of the parity subtests.
 # At 8 iterations a resting box's patch anchors switch diagonals on steps that float32 rounding of its
 # world position decides, each switch kicking the box by about 5e-3 rad/s, so the ordinary route fails
 # these parity checks against its own replicated worlds (TestFeatherPGSMixedTreePatchFixture).
@@ -251,20 +251,18 @@ def _rollout(
     rows=None,
     attrs=None,
     swing_stride=3,
-    friction_anchor_beta=0.0,
     pgs_iterations=None,
     observe=None,
     scalar=None,
 ):
     """Roll out a scene and return the solver, its owner, the body pose trajectory and the final twists.
 
-    ``pgs_iterations`` defaults to :data:`PATCH_PARITY_ITERATIONS` under patch friction and to 8
-    otherwise. ``observe`` is called after every step with the solver and its contacts. ``scalar=False``
-    pins the star to the held tree (``star='held'``); otherwise the cabinet's drawers run as scalar branches of
+    ``pgs_iterations`` defaults to :data:`PATCH_PARITY_ITERATIONS`. ``observe`` is called after every step with the
+    solver and its contacts. ``scalar=False`` pins the star to the held tree (``star='held'``); otherwise the cabinet's drawers run as scalar branches of
     the held-tree owner.
     """
     if pgs_iterations is None:
-        pgs_iterations = PATCH_PARITY_ITERATIONS if friction_anchor_beta > 0.0 else 8
+        pgs_iterations = PATCH_PARITY_ITERATIONS
     pins = {"storage": "dense"}
     # ``_rollout.forest``: False/True pins the group form; None takes the owner's default rule.
     forest = getattr(_rollout, "forest", False)
@@ -278,7 +276,6 @@ def _rollout(
             pgs_iterations=pgs_iterations,
             enable_joint_limits=True,
             update_mass_matrix_interval=2,
-            friction_anchor_beta=friction_anchor_beta,
             **({} if rows is None else {"dense_max_constraints": rows}),
             **(attrs or {}),
         )
@@ -350,9 +347,6 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         (TestFeatherPGSMixedTreePatchFixture), but a box yaw of 1e-6 rad moves
         it on CPU, changing validity bits while the twists still agree.
         """
-        self.assertEqual(owner_solver.laws.friction_anchors_enabled, plain_solver.laws.friction_anchors_enabled)
-        if not plain_solver.laws.friction_anchors_enabled:
-            return
         if loaded:
             self.assertTrue(
                 plain_solver.laws.friction_patches.previous.valid.numpy().any(), "Resting boxes hold anchors"
@@ -361,27 +355,25 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
 
     def test_free_body_group_matches_the_ordinary_route(self):
         """A fixed-base arm plus a free box is owned by the generic mixed cache and tracks the ordinary route."""
-        for beta in (0.0, 0.2):
-            with self.subTest(friction_anchor_beta=beta):
-                model = _build(wp.get_device("cuda:0"))
-                plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False, friction_anchor_beta=beta)
-                self.assertTrue(plain_solver.forest.has_free_rigid_bodies)
-                owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, friction_anchor_beta=beta)
-                self.assertIsInstance(owner, HeldTree)
-                self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [3, 6])
-                self.assertEqual(sorted(group.layout.bodies for group in owner.groups), [1, 4])
-                self.assertTrue(any(group.layout.root_dofs == 6 for group in owner.groups))
-                self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
-                # Same physics through both routes: poses within a tenth of a millimetre after 120 steps.
-                np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
-                np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
-                np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
-                # The boxes stay on the ground and the arms stay up.
-                final = cached[-1].reshape(model.world_count, -1, 7)
-                self.assertTrue(np.all(final[:, 4, 2] > 0.04))
-                self.assertTrue(np.all(final[:, 1, 2] > 0.2))
-                self.assertEqual(int(owner.groups[0].status.numpy().sum()), 0)
-                self._assert_patch_history(plain_solver, owner_solver)
+        model = _build(wp.get_device("cuda:0"))
+        plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False)
+        self.assertTrue(plain_solver.forest.has_free_rigid_bodies)
+        owner_solver, owner, cached, cached_qd = _rollout(model, owner=True)
+        self.assertIsInstance(owner, HeldTree)
+        self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [3, 6])
+        self.assertEqual(sorted(group.layout.bodies for group in owner.groups), [1, 4])
+        self.assertTrue(any(group.layout.root_dofs == 6 for group in owner.groups))
+        self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
+        # Same physics through both routes: poses within a tenth of a millimetre after 120 steps.
+        np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
+        # The boxes stay on the ground and the arms stay up.
+        final = cached[-1].reshape(model.world_count, -1, 7)
+        self.assertTrue(np.all(final[:, 4, 2] > 0.04))
+        self.assertTrue(np.all(final[:, 1, 2] > 0.2))
+        self.assertEqual(int(owner.groups[0].status.numpy().sum()), 0)
+        self._assert_patch_history(plain_solver, owner_solver)
 
     def test_multi_coordinate_descendant_joints_are_owned(self):
         """An arm with a two-coordinate D6 shoulder (Humanoid's joint class) is owned and tracks the ordinary route."""
@@ -458,35 +450,29 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         :meth:`test_scalar_branches_own_the_cabinet_drawers`), which no forest spans, so the forest
         takes them with the star pinned to the held tree.
         """
-        for beta in (0.0, 0.2):
-            with self.subTest(friction_anchor_beta=beta):
-                model = _build(wp.get_device("cuda:0"), cabinet=True)
-                plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False, friction_anchor_beta=beta)
-                _rollout.forest = True
-                try:
-                    owner_solver, owner, cached, cached_qd = _rollout(
-                        model, owner=True, friction_anchor_beta=beta, scalar=False
-                    )
-                finally:
-                    _rollout.forest = False
-                self.assertIsInstance(owner, HeldTree)
-                self.assertEqual(len(owner.groups), 1)
-                layout = owner.groups[0].layout
-                self.assertEqual(layout.roots, (0, 4))
-                self.assertEqual(layout.root_families, (3, -2))
-                # The diagonal family's refresh reads H_ii from its root's offset in the layout.
-                self.assertEqual(
-                    [family[:2] for family in owner.groups[0].sparse.families], [(2, layout.root_offsets[1])]
-                )
-                self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
-                np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
-                np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
-                np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
-                # The drawers slid out before their drives pulled them back to the closed limit.
-                q = owner_solver.joint_q_trajectory.reshape(len(cached), model.world_count, -1)
-                self.assertLess(float(q[:, :, 3:5].min()), -0.02)
-                self.assertLessEqual(float(q[-1, :, 3:5].max()), 1.0e-3)
-                self._assert_patch_history(plain_solver, owner_solver, loaded=False)
+        model = _build(wp.get_device("cuda:0"), cabinet=True)
+        plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False)
+        _rollout.forest = True
+        try:
+            owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, scalar=False)
+        finally:
+            _rollout.forest = False
+        self.assertIsInstance(owner, HeldTree)
+        self.assertEqual(len(owner.groups), 1)
+        layout = owner.groups[0].layout
+        self.assertEqual(layout.roots, (0, 4))
+        self.assertEqual(layout.root_families, (3, -2))
+        # The diagonal family's refresh reads H_ii from its root's offset in the layout.
+        self.assertEqual([family[:2] for family in owner.groups[0].sparse.families], [(2, layout.root_offsets[1])])
+        self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
+        np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
+        # The drawers slid out before their drives pulled them back to the closed limit.
+        q = owner_solver.joint_q_trajectory.reshape(len(cached), model.world_count, -1)
+        self.assertLess(float(q[:, :, 3:5].min()), -0.02)
+        self.assertLessEqual(float(q[-1, :, 3:5].max()), 1.0e-3)
+        self._assert_patch_history(plain_solver, owner_solver, loaded=False)
 
     def test_scalar_branches_track_the_cabinet_drawers(self):
         """Run the cabinet's drawers as scalar branches beside the arm's tree group; track the ordinary route.
@@ -495,50 +481,38 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         diagonal-mass class the scalar rule admits. Poses and twists stay within the per-size and
         forest owners' bounds of ordinary dynamics; the route probe records the owner's groups.
         """
-        for beta in (0.0, 0.2):
-            with self.subTest(friction_anchor_beta=beta):
-                model = _build(wp.get_device("cuda:0"), cabinet=True)
-                plain_solver, _plain_owner, plain, plain_qd = _rollout(
-                    model, owner=False, friction_anchor_beta=beta, scalar=False
-                )
-                owner_solver, owner, cached, cached_qd = _rollout(
-                    model, owner=True, friction_anchor_beta=beta, scalar=True
-                )
-                self.assertIsNotNone(owner.scalar)
-                self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
-                np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
-                np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
-                np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
-                # The drawers slid out before their drives pulled them back to the closed limit.
-                q = owner_solver.joint_q_trajectory.reshape(len(cached), model.world_count, -1)
-                self.assertLess(float(q[:, :, 3:5].min()), -0.02)
-                self.assertLessEqual(float(q[-1, :, 3:5].max()), 1.0e-3)
-                self.assertEqual(int(owner.groups[0].status.numpy().sum()), 0)
-                self._assert_patch_history(plain_solver, owner_solver, loaded=False)
+        model = _build(wp.get_device("cuda:0"), cabinet=True)
+        plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False, scalar=False)
+        owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, scalar=True)
+        self.assertIsNotNone(owner.scalar)
+        self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
+        np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
+        # The drawers slid out before their drives pulled them back to the closed limit.
+        q = owner_solver.joint_q_trajectory.reshape(len(cached), model.world_count, -1)
+        self.assertLess(float(q[:, :, 3:5].min()), -0.02)
+        self.assertLessEqual(float(q[-1, :, 3:5].max()), 1.0e-3)
+        self.assertEqual(int(owner.groups[0].status.numpy().sum()), 0)
+        self._assert_patch_history(plain_solver, owner_solver, loaded=False)
 
     def test_joint_velocity_limits_are_owned(self):
         """Joint velocity limits (the hand recipes) are ordinary rows over the owner's motion velocities."""
-        for beta in (0.0, 0.2):
-            with self.subTest(friction_anchor_beta=beta):
-                model = _build(wp.get_device("cuda:0"), speed_limit=0.8)
-                recipe = {"enable_joint_velocity_limits": True}
-                plain_solver, _plain_owner, plain, plain_qd = _rollout(
-                    model, owner=False, friction_anchor_beta=beta, attrs=recipe
-                )
-                self.assertTrue(plain_solver.options.enable_joint_velocity_limits)
-                owner_solver, owner, cached, cached_qd = _rollout(
-                    model, owner=True, friction_anchor_beta=beta, attrs=recipe
-                )
-                self.assertIsInstance(owner, HeldTree)
-                self.assertFalse(any(group.bank_compare for group in owner.groups))
-                self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
-                np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
-                np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
-                np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
-                # The swung joint started at 1.5 rad/s and was held under its 0.8 rad/s limit.
-                q = owner_solver.joint_q_trajectory.reshape(len(cached), model.world_count, -1)
-                self.assertLess(float(np.abs(np.diff(q[:, :, 0], axis=0)).max()) / DT, 1.0)
-                self._assert_patch_history(plain_solver, owner_solver)
+        model = _build(wp.get_device("cuda:0"), speed_limit=0.8)
+        recipe = {"enable_joint_velocity_limits": True}
+        plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False, attrs=recipe)
+        self.assertTrue(plain_solver.options.enable_joint_velocity_limits)
+        owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, attrs=recipe)
+        self.assertIsInstance(owner, HeldTree)
+        self.assertFalse(any(group.bank_compare for group in owner.groups))
+        self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
+        np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
+        # The swung joint started at 1.5 rad/s and was held under its 0.8 rad/s limit.
+        q = owner_solver.joint_q_trajectory.reshape(len(cached), model.world_count, -1)
+        self.assertLess(float(np.abs(np.diff(q[:, :, 0], axis=0)).max()) / DT, 1.0)
+        self._assert_patch_history(plain_solver, owner_solver)
 
     def test_paired_response_scenes_are_owned(self):
         """A 17-joint arm with a free box per world (the Kuka scenes' class) selects the paired response and is owned."""
@@ -559,62 +533,54 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
 
     def test_mimic_rows_compose_with_the_mixed_owner(self):
         """Mimic rows are ordinary matrix-free rows over the held factors: the owner admits them and tracks the plain route."""
-        for beta in (0.0, 0.2):
-            with self.subTest(friction_anchor_beta=beta):
-                model = _build(wp.get_device("cuda:0"), mimic=True)
-                plain_solver, _plain_owner, plain, plain_qd = _rollout(
-                    model, owner=False, friction_anchor_beta=beta, swing_joint=1
-                )
-                self.assertEqual(int(plain_solver.laws.mimic_count), model.world_count)
-                owner_solver, owner, cached, cached_qd = _rollout(
-                    model, owner=True, friction_anchor_beta=beta, swing_joint=1
-                )
-                self.assertIsInstance(owner, HeldTree)
-                self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
-                np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
-                np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
-                np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
-                # The follower joint tracks its leader under the cached route.
-                q = owner_solver.joint_q_trajectory.reshape(len(cached), model.world_count, -1)
-                self.assertGreater(float(np.abs(q[:, :, 1]).max()), 0.02)
-                self.assertLess(float(np.abs(q[:, :, 2] - q[:, :, 1]).max()), 0.02)
-                self._assert_patch_history(plain_solver, owner_solver)
+        model = _build(wp.get_device("cuda:0"), mimic=True)
+        plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False, swing_joint=1)
+        self.assertEqual(int(plain_solver.laws.mimic_count), model.world_count)
+        owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, swing_joint=1)
+        self.assertIsInstance(owner, HeldTree)
+        self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
+        np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
+        # The follower joint tracks its leader under the cached route.
+        q = owner_solver.joint_q_trajectory.reshape(len(cached), model.world_count, -1)
+        self.assertGreater(float(np.abs(q[:, :, 1]).max()), 0.02)
+        self.assertLess(float(np.abs(q[:, :, 2] - q[:, :, 1]).max()), 0.02)
+        self._assert_patch_history(plain_solver, owner_solver)
 
     def test_prescribed_free_roots_are_owned(self):
         """A kinematic free body per world is owned as a zero-response root and glides at its prescribed speed."""
-        for beta in (0.0, 0.2):
-            with self.subTest(friction_anchor_beta=beta):
-                model = _build(wp.get_device("cuda:0"), prescribed=True)
-                plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False, friction_anchor_beta=beta)
-                self.assertTrue(plain_solver.forest.has_prescribed_response)
-                owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, friction_anchor_beta=beta)
-                self.assertIsInstance(owner, HeldTree)
-                self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [3, 6, 6])
-                self.assertTrue(any(getattr(group.sparse, "prescribed", False) for group in owner.groups))
-                # Lane widths follow from each group's tree (tree_kinetic_state.held_lanes); every block is whole.
-                for group in owner.groups:
-                    self.assertEqual(
-                        group.layout.lanes,
-                        tree_kinetic_state.held_lanes(group.tree, group.group_count, memory.device(model.device)),
-                    )
-                    self.assertEqual(group.launch_count * group.layout.pack, group.group_count)
-                self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
-                np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
-                np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
-                np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
-                # The tray is the last body of every world: the published pose follows
-                # the externally advanced coordinates (v*t over the rollout) and stays level.
-                first = cached[0].reshape(model.world_count, -1, 7)
-                final = cached[-1].reshape(model.world_count, -1, 7)
-                self.assertEqual(final.shape[1], 6)
-                np.testing.assert_allclose(
-                    final[:, 5, 0] - first[:, 5, 0], TRAY_VELOCITY * (len(cached) - 1) * DT, atol=2.0e-3, rtol=0.0
-                )
-                np.testing.assert_allclose(final[:, 5, 2], 0.03, atol=1.0e-4, rtol=0.0)
-                tray_qd = cached_qd.reshape(model.world_count, -1, 6)[:, 5]
-                self.assertGreater(float(np.abs(tray_qd).max()), 0.9 * TRAY_VELOCITY)
-                self.assertEqual(int(sum(int(group.status.numpy().sum()) for group in owner.groups)), 0)
-                self._assert_patch_history(plain_solver, owner_solver)
+        model = _build(wp.get_device("cuda:0"), prescribed=True)
+        plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False)
+        self.assertTrue(plain_solver.forest.has_prescribed_response)
+        owner_solver, owner, cached, cached_qd = _rollout(model, owner=True)
+        self.assertIsInstance(owner, HeldTree)
+        self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [3, 6, 6])
+        self.assertTrue(any(getattr(group.sparse, "prescribed", False) for group in owner.groups))
+        # Lane widths follow from each group's tree (tree_kinetic_state.held_lanes); every block is whole.
+        for group in owner.groups:
+            self.assertEqual(
+                group.layout.lanes,
+                tree_kinetic_state.held_lanes(group.tree, group.group_count, memory.device(model.device)),
+            )
+            self.assertEqual(group.launch_count * group.layout.pack, group.group_count)
+        self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
+        np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
+        # The tray is the last body of every world: the published pose follows
+        # the externally advanced coordinates (v*t over the rollout) and stays level.
+        first = cached[0].reshape(model.world_count, -1, 7)
+        final = cached[-1].reshape(model.world_count, -1, 7)
+        self.assertEqual(final.shape[1], 6)
+        np.testing.assert_allclose(
+            final[:, 5, 0] - first[:, 5, 0], TRAY_VELOCITY * (len(cached) - 1) * DT, atol=2.0e-3, rtol=0.0
+        )
+        np.testing.assert_allclose(final[:, 5, 2], 0.03, atol=1.0e-4, rtol=0.0)
+        tray_qd = cached_qd.reshape(model.world_count, -1, 6)[:, 5]
+        self.assertGreater(float(np.abs(tray_qd).max()), 0.9 * TRAY_VELOCITY)
+        self.assertEqual(int(sum(int(group.status.numpy().sum()) for group in owner.groups)), 0)
+        self._assert_patch_history(plain_solver, owner_solver)
 
     def test_fixed_root_repose_keeps_the_owner(self):
         """Re-pose fixed roots mid-rollout through joint_X_p and JOINT_PROPERTIES and keep tracking the ordinary route.
@@ -711,9 +677,7 @@ class TestFeatherPGSMixedTreePatchFixture(unittest.TestCase):
                 corners.append(_box_anchor_corners(model, solver, contacts))
                 valid.append(solver.laws.friction_patches.previous.valid.numpy().copy())
 
-            solver, _owner, _trajectory, final_qd = _rollout(
-                model, owner=False, friction_anchor_beta=0.2, observe=observe
-            )
+            solver, _owner, _trajectory, final_qd = _rollout(model, owner=False, observe=observe)
             self.assertEqual(solver.options.pgs_iterations, PATCH_PARITY_ITERATIONS)
             histories.append(valid)
             if mass_scale != 1.0:
@@ -743,7 +707,7 @@ class TestFeatherPGSMixedTreeFrames(unittest.TestCase):
         """
         joint = newton.ModelFlags.JOINT_PROPERTIES
         model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
+        solver = SolverFeatherPGS(model)
         owner = HeldTree(solver)
         self.assertTrue(owner.groups)
         roots = _fixed_root_joints(model)

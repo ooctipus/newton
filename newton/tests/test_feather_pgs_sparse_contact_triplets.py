@@ -398,17 +398,21 @@ def linked_fixture(layout, *, pad=0, seeded=False, omega=1.0, active=True):
 class TestSparseContactTriplets(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse construction requires CUDA")
     def test_host_admission_and_shared_memory_fallback_cuda(self):
-        """Admit compatible triplets and preserve sparse fallback at resource limits."""
+        """Admit compatible triplets, and past the shared memory that holds them keep the sparse route with ordinary
+        rows where its full sweep still fits, or leave the class to other owners where it does not."""
         model = equal_dof_trees(4, 3, "cuda:0")
-        # The largest capacity whose point contact units fit the device's static budget, and one more row.
+        # The largest capacity whose linked contact units fit the device's static budget, and one more row. At such
+        # capacities the active-row scan's bitsets no longer fit, and the law's units pool their rings in the full sweep.
         budget = arch_budget(wp.get_device("cuda:0").arch)
         staging = functools.partial(
             sparse_staging,
             max_world_dofs=18,
             max_row_dofs=12,
-            active_rows=True,
+            active_rows=False,
             use_support_table=True,
             contact_triplets=True,
+            linked_rows=True,
+            torsion=True,  # The law gives a friction region with a footprint its spin row.
         )
         low, high = 192, 1 << 16
         while high - low > 1:
@@ -418,7 +422,6 @@ class TestSparseContactTriplets(unittest.TestCase):
         # explicit indices (a coordinate an entry), the admission's rule, from this tree's classes.
         probe = SolverFeatherPGS(
             model,
-            friction_anchor_beta=0.0,
             enable_joint_velocity_limits=False,
             pgs_warmstart=False,
             dense_max_constraints=192,
@@ -432,11 +435,13 @@ class TestSparseContactTriplets(unittest.TestCase):
             (192, {"contact_units": None}, False),
             (192, {}, True),
             (tiny, {}, False),  # The tiny batch's support table costs more than explicit indices.
-            (192, {"active_rows": False}, False),
+            (192, {"active_rows": False}, True),  # The law's units pool their rings in the full sweep too.
             (192, {"row_support": False}, False),
             (low, {}, True),
             (high, {}, False),
         )
+        # Past the units' capacity the sparse route keeps ordinary rows only if its plain full sweep fits.
+        plain = staging(high, contact_triplets=False).fits(budget)
         for capacity, pins, selected in cases:
             with (
                 self.subTest(capacity=capacity, pins=pins),
@@ -445,11 +450,13 @@ class TestSparseContactTriplets(unittest.TestCase):
             ):
                 solver = SolverFeatherPGS(
                     model,
-                    friction_anchor_beta=0.0,
                     enable_joint_velocity_limits=False,
                     pgs_warmstart=False,
                     dense_max_constraints=capacity,
                 )
+                if capacity == high and not plain:
+                    self.assertIsNone(solver.placement.sparse_mass_matrix_size)
+                    continue
                 self.assertEqual(solver.placement.sparse_mass_matrix_size, 18)
                 self.assertEqual("contact_triplets" in solver.sweep.sparse_kernel.key, selected)
 
@@ -672,33 +679,12 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
             ({}, True, False, False, 32, True, False, "support table"),
             ({}, True, False, True, 32, False, False, "room for contact units"),
             ({"pins": {"contact_units": None}}, True, False, True, 32, True, False, "contact_units=None"),
-            # Point friction keeps its rule: triplets need the active-row scan.
-            (
-                {"laws": SimpleNamespace(friction_anchors_enabled=False)},
-                False,
-                False,
-                True,
-                32,
-                True,
-                False,
-                "active-row scan",
-            ),
-            (
-                {"laws": SimpleNamespace(friction_anchors_enabled=False)},
-                True,
-                False,
-                True,
-                32,
-                True,
-                True,
-                "point contacts fuse",
-            ),
         )
         for changes, active, velocity, table, lanes, fits, admitted, phrase in cases:
             probe = SimpleNamespace(
                 pins={},
                 forest=SimpleNamespace(has_free_rigid_bodies=False),
-                laws=SimpleNamespace(friction_anchors_enabled=True),
+                laws=SimpleNamespace(),
             )
             for name, value in changes.items():
                 setattr(probe, name, value)

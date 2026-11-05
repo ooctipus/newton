@@ -101,8 +101,7 @@ def contact_frame(data: ContactInput, law: PatchRowLaw, c: int) -> ContactFrame:
     """Return contact ``c``'s front end (:class:`ContactFrame`).
 
     The bodies, normal, the one point the contact's rows act at and the gap of
-    :func:`.contact_laws.contact_geometry`, the tangent basis and the friction location: the patch's under persistent
-    patches, else that point.
+    :func:`.contact_laws.contact_geometry`, the tangent basis and the friction location, its region's.
     """
     body_a, body_b, normal, point, phi = contact_geometry(
         c,
@@ -125,9 +124,7 @@ def contact_frame(data: ContactInput, law: PatchRowLaw, c: int) -> ContactFrame:
     frame.phi = phi
     frame.tangent0 = tangent0
     frame.tangent1 = tangent1
-    frame.friction_point = point
-    if law.patches.enabled != 0:
-        frame.friction_point = patch_friction_location(law.patches, c)
+    frame.friction_point = patch_friction_location(law.patches, c)
     return frame
 
 

@@ -42,7 +42,7 @@ def supported(solver) -> bool:
         and solver.routes.case == "K2"
         and solver.placement.sparse_diagonal_dense_size == 6
         and solver.placement.sparse_diagonal_response_size > 6
-        and (solver.placement.sparse_diagonal_contact_triples or solver.placement.sparse_diagonal_contact_units)
+        and solver.placement.sparse_diagonal_contact_units
         and solver.placement.dense_max_constraints >= 12
         and 0 <= solver.placement.dense_internal_max_rows <= 12
         and solver._compact_diagonal_mass_size == solver.placement.sparse_diagonal_response_size
@@ -63,10 +63,8 @@ def produce_contacts(
     its own unit by the one writer's unit walker with the star (:func:`.walk_rows.packed_walker`), its slots and its
     header (:func:`.walk_rows.slot_header`).
 
-    Tangent rows act at the friction location and follow the patch row law (``patch_tangent_row``): under
-    persistent patches at the patch friction location with the anchor's tangential phi, ``law.beta`` and the
-    undivided coefficient; under point friction (``law.patches.enabled`` 0, beta 0, a zero phi view) at the
-    contact's friction points.
+    Tangent rows act at the friction location and follow the patch row law (``patch_tangent_row``): at the region's
+    friction location with the anchor's tangential phi, ``law.beta`` and the undivided coefficient.
     """
     contact, row = wp.tid()
     if contact >= data.count[0]:

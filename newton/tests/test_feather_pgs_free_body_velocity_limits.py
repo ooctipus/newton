@@ -347,7 +347,7 @@ class _FreeBodyVelocityLimitChecks:
         """
         scene = scenes.box_push()
         model = scene.build(self.device)
-        solver = SolverFeatherPGS(model, angular_damping=0.0, friction_anchor_beta=0.0)
+        solver = SolverFeatherPGS(model, angular_damping=0.0)
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
         state_0, state_1 = model.state(), model.state()

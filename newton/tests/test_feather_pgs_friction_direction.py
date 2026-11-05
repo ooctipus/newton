@@ -131,7 +131,7 @@ def tiers_case(case):
     }
 
 
-def _slide(device, beta, mesh, angle, articulated=False, *, locked_tangent=False):
+def _slide(device, mesh, angle, articulated=False, *, locked_tangent=False):
     """Slide a symmetric, explicitly massed box under a force above the friction limit.
 
     ``articulated`` builds the box as a D6-jointed articulation instead of a free body.
@@ -160,7 +160,6 @@ def _slide(device, beta, mesh, angle, articulated=False, *, locked_tangent=False
     model = builder.finalize(device=device)
     solver = newton.solvers.SolverFeatherPGS(
         model,
-        friction_anchor_beta=beta,
         pgs_iterations=64,
         pgs_cfm=0.0 if locked_tangent else 1.0e-6,
         angular_damping=0.0,
@@ -191,21 +190,17 @@ class TestFeatherPGSFrictionDirection(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_articulated_sliding_direction(self):
         """Preserve sliding direction through the dense articulated route."""
-        velocity, direction, _ = _slide("cuda:0", 0.2, False, np.pi / 4, articulated=True)
+        velocity, direction, _ = _slide("cuda:0", False, np.pi / 4, articulated=True)
         np.testing.assert_allclose(velocity, direction * (0.2 * 0.3 * 9.81) * 0.5, atol=0.015, rtol=0.03)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_locked_tangent_preserves_other_friction_direction(self):
         """Retain friction along a slider when its first tangent has zero response."""
-        for beta in (0.0, 0.2):
-            with self.subTest(beta=beta):
-                velocity, direction, watermarks = _slide(
-                    "cuda:0", beta, False, 0.0, articulated=True, locked_tangent=True
-                )
-                np.testing.assert_allclose(velocity, direction * (0.2 * 0.3 * 9.81) * 0.5, atol=0.015, rtol=0.03)
-                for key, value in watermarks.items():
-                    if "overflow" in key or "dropped" in key:
-                        self.assertEqual(value, 0, key)
+        velocity, direction, watermarks = _slide("cuda:0", False, 0.0, articulated=True, locked_tangent=True)
+        np.testing.assert_allclose(velocity, direction * (0.2 * 0.3 * 9.81) * 0.5, atol=0.015, rtol=0.03)
+        for key, value in watermarks.items():
+            if "overflow" in key or "dropped" in key:
+                self.assertEqual(value, 0, key)
 
     def test_unequal_tangent_masses(self):
         """Solve sticking and sliding pairs with rotated, unequal tangent masses in one sweep of the general sweep."""
@@ -251,19 +246,18 @@ class TestFeatherPGSFrictionDirection(unittest.TestCase):
         self._solve_on_the_tiers([case for case in unequal_tangent_cases() if case["name"] in TIERS_OPEN])
 
     def test_sliding_direction(self):
-        """Oppose sliding in every direction for analytic and mesh boxes, with and without patches."""
+        """Oppose sliding in every direction for analytic and mesh boxes."""
         devices = ("cpu", "cuda:0") if wp.is_cuda_available() else ("cpu",)
         for device in devices:
-            for beta in (0.0, 0.2):
-                for mesh in (False, True):
-                    for angle in (0.0, np.pi / 6, np.pi / 4, 2 * np.pi / 3):
-                        with self.subTest(device=device, beta=beta, mesh=mesh, angle=angle):
-                            velocity, direction, watermarks = _slide(device, beta, mesh, angle)
-                            expected = direction * (0.2 * 0.3 * 9.81) * 0.5
-                            np.testing.assert_allclose(velocity, expected, atol=0.015, rtol=0.03)
-                            for key, value in watermarks.items():
-                                if "overflow" in key or "dropped" in key:
-                                    self.assertEqual(value, 0, key)
+            for mesh in (False, True):
+                for angle in (0.0, np.pi / 6, np.pi / 4, 2 * np.pi / 3):
+                    with self.subTest(device=device, mesh=mesh, angle=angle):
+                        velocity, direction, watermarks = _slide(device, mesh, angle)
+                        expected = direction * (0.2 * 0.3 * 9.81) * 0.5
+                        np.testing.assert_allclose(velocity, expected, atol=0.015, rtol=0.03)
+                        for key, value in watermarks.items():
+                            if "overflow" in key or "dropped" in key:
+                                self.assertEqual(value, 0, key)
 
 
 if __name__ == "__main__":
