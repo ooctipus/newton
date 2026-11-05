@@ -79,6 +79,9 @@ from .tree_scan import WALK_BOTH, held_fits, record_half
 
 __all__ = [
     "SUPPORT_UNIT_LANES",
+    "WRITE_REST",
+    "WRITE_ROWS",
+    "WRITE_TOPOLOGY",
     "JointSeeds",
     "RowSink",
     "RowUnit",
@@ -182,6 +185,10 @@ def writer_lanes(rows: int, capacity: int, device) -> int:
     lanes = max(min(int(rows), int(capacity), 32), 1)
     return 1 << (lanes - 1).bit_length()
 
+
+WRITE_ROWS, WRITE_TOPOLOGY, WRITE_REST = wp.constant(0), wp.constant(1), wp.constant(2)
+"""The one writer's parts (:func:`walked_rows_kernel`'s ``part``): every row, the rows a world's topology fixes, and the
+rest with the closure."""
 
 WRITER_THREADS = 128
 """Threads of a block of the one writer: whole world groups of up to 32 lanes."""
@@ -292,6 +299,13 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tupl
 
     The closure's seed stays a launch after the warm start's gather (:meth:`.tree_factor.TreeFactor.seed_blocks`).
     One launch with group barriers, not a second launch for the block phase: FL33D's measurement (``fl33d/``).
+
+    ``part`` (:data:`WRITE_ROWS`, :data:`WRITE_TOPOLOGY`, :data:`WRITE_REST`): the rows a world's topology fixes (its
+    links, mimics, limits and velocity limits, the slots below its family bound ``bounds[world, 1]``,
+    :meth:`.rows.RowLaws.bound_phase`) are known before the contacts, so a launch can write them alone, beside the
+    contact pass, and a second the rest and the closure; one launch writes every row where the rows' order holds no
+    family bound (keyed rows).
+
     ``side``: whether the model's records can have a side (:attr:`.tree_factor.TreeFactor.walk_side`); ``tables``: the
     walking classes' path tables (:func:`.factor.walk.walk_prelude`), each tree's path read from constant memory by its
     class."""
@@ -318,6 +332,8 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tupl
         link_slot: wp.array[int],
         seeds: JointSeeds,
         bias: RowBias,
+        bounds: wp.array2d[int],
+        part: int,
     ):
         world, lane = wp.tid()
         count = wp.min(counts[world], sink.entries.shape[1])
@@ -326,25 +342,35 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tupl
         # walk their seeds) is not the writer's: its whole group returns before any barrier.
         if owned != 0 and owner[world] != 0:
             return
-        for slot in range(lane, count, lanes):
+        # The part's rows: the topology's below the family bound (the count is not final before the contact pass),
+        # the rest above it.
+        first = int(0)
+        end = count
+        if part == WRITE_TOPOLOGY:
+            end = wp.min(bounds[world, 1], sink.entries.shape[1])
+        elif part == WRITE_REST:
+            first = wp.min(bounds[world, 1], count)
+        for slot in range(first + lane, end, lanes):
             unit = read_unit(rows, data, law, seeds, line, slot, support.units[line, slot])
             if unit.rows > 0:
                 walk(sink, unit)
                 row_bias(rows, bias, line, slot, sink.row_incident[line, slot])
         if wp.static(has_blocks):
-            world_sync(lanes)
-            for pe in range(preelim.world_start[world] + lane, preelim.world_start[world + 1], lanes):
-                close_block(
-                    pe, wp.static(capacity), line, preelim, mimic_slot, link_slot, rows.cfm, sink.entries,
-                    rows.rhs, sink.row_incident, rows.diag,
-                )  # fmt: skip
-            world_sync(lanes)
-            for slot in range(lane, count, lanes):
-                if block_row(support.units[line, slot], wp.static(mimics)) == 0:
-                    close_row(
-                        line, slot, rows.sides[line, slot], wp.static(capacity), preelim, rows.cfm, sink.entries,
-                        rows.rhs, rows.diag,
+            # The closure reads every row of the world: the launch that writes the last of them closes.
+            if part != WRITE_TOPOLOGY:
+                world_sync(lanes)
+                for pe in range(preelim.world_start[world] + lane, preelim.world_start[world + 1], lanes):
+                    close_block(
+                        pe, wp.static(capacity), line, preelim, mimic_slot, link_slot, rows.cfm, sink.entries,
+                        rows.rhs, sink.row_incident, rows.diag,
                     )  # fmt: skip
+                world_sync(lanes)
+                for slot in range(lane, count, lanes):
+                    if block_row(support.units[line, slot], wp.static(mimics)) == 0:
+                        close_row(
+                            line, slot, rows.sides[line, slot], wp.static(capacity), preelim, rows.cfm, sink.entries,
+                            rows.rhs, rows.diag,
+                        )  # fmt: skip
 
     name = "write_walked_rows" + (f"_blocks{blocks}" if has_blocks else "")
     name += "_mimics" if mimic_blocks else ""

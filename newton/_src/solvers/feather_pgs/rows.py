@@ -1063,16 +1063,18 @@ class RowLaws:
             device=solver.model.device,
         )
 
-    def write_walked(self, solver, state_in, contacts: Contacts | None, dt: float) -> None:
+    def write_walked(
+        self, solver, state_in, contacts: Contacts | None, dt: float, part: int = walk_rows.WRITE_ROWS
+    ) -> None:
         """The one writer: every dense row's seed walked into its placement's sink, its diagonal, incident velocity and
         rhs, once the predictor's ``v_hat`` and its decided set are known. The general placement's
         (:func:`.walk_rows.walked_rows_kernel`): a world's lanes release its trees' slips, write and close its bilateral
-        blocks, then walk every other row into the packed rows, corrected on the blocks it touches. The support
-        placement's (case K1, :meth:`write_support`)."""
+        blocks, then walk every other row into the packed rows, corrected on the blocks it touches; ``part`` its rows
+        (every row, the topology's, or the rest). The support placement's (case K1, :meth:`write_support`)."""
         if solver.routes.case == "K1":
             self.write_support(solver, state_in, contacts, dt)
         else:
-            self.write_general(solver, state_in, contacts, dt)
+            self.write_general(solver, state_in, contacts, dt, part)
 
     def joint_seeds(self, solver, state_in) -> walk_rows.JointSeeds:
         """What the one writer's seeds read besides the contact input (:class:`.walk_rows.JointSeeds`): the mimics' and
@@ -1092,8 +1094,8 @@ class RowLaws:
         seeds.body_com = model.body_com
         return seeds
 
-    def write_general(self, solver, state_in, contacts: Contacts | None, dt: float) -> None:
-        """The general placement's one writer (:func:`.walk_rows.walked_rows_kernel`)."""
+    def write_general(self, solver, state_in, contacts: Contacts | None, dt: float, part: int) -> None:
+        """The general placement's one writer (:func:`.walk_rows.walked_rows_kernel`), the rows of ``part``."""
         placement, factor, model = solver.placement, solver.factor, solver.model
         # Without contacts no row is a contact's: the writer reads no contact input.
         contact_input = (
@@ -1118,6 +1120,8 @@ class RowLaws:
             self.link_slot if blocks and self.link_slot is not None else dummy_int,
             self.joint_seeds(solver, state_in),
             self.bias(solver.options, dt),
+            placement.dense_phase_bounds,
+            int(part),
         ]
         wp.launch(
             walk_rows.writer_kernel(solver),

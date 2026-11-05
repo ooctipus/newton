@@ -30,11 +30,13 @@ from typing import NamedTuple
 
 import warp as wp
 
+from ...core.execution import Beside
 from ...core.memory import Device, device
 from ...sim import ModelFlags
 from . import cached_state_binding
 from .forest_plan import ForestPlan
 from .route_table import RouteRow
+from .walk_rows import WRITE_REST, WRITE_TOPOLOGY
 
 __all__ = [
     "Capacities",
@@ -577,6 +579,19 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
 
     # The dense rows' family bounds exist where the row pass holds the dense rows' order (no keyed rows).
     bounds = not keyed
+
+    # The rows a world's topology fixes (links, mimics, limits) are known once their families are written, before the
+    # contacts: where the family bound holds them and the one writer walks the general placement's rows, it walks them
+    # beside the contact pass (Beside) and the rest after it, the two parts joined before the rest. Their diagonals
+    # start from zero before them.
+    walk = spec.rhs == "walk"
+    topology = Beside(model.device) if walk and bounds and route.case != "K1" else None
+
+    def write_topology_rows(step):
+        if placement.clears_diagonals:
+            placement.diagonals()
+        topology.start(lambda: laws.write_walked(solver, step.state_in, step.contacts, step.dt, WRITE_TOPOLOGY))
+
     write_rows = (
         begin_rows,
         *((write_mimics,) if laws.mimic_warp_kernels else ()),
@@ -586,6 +601,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         *((bound_limits,) if bounds else ()),
         *((write_velocity_limits,) if laws.velocity_limit_warp_kernels and not keyed else ()),
         *((bound_velocity_limits,) if bounds else ()),
+        *((write_topology_rows,) if topology is not None else ()),
         write_contacts,
         *((bound_free_body_contacts,) if forest.has_free_rigid_bodies else ()),
         *(
@@ -613,7 +629,11 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         placement.diagonals()
 
     def write_walked(step):
-        laws.write_walked(solver, step.state_in, step.contacts, step.dt)
+        if topology is None:
+            laws.write_walked(solver, step.state_in, step.contacts, step.dt)
+            return
+        topology.join()
+        laws.write_walked(solver, step.state_in, step.contacts, step.dt, WRITE_REST)
 
     def write_rhs(step):
         laws.write_rhs(solver, step.dt)
@@ -637,7 +657,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         nvtx="S4_ContactBuild",
     )
     rhs = {"walk": (write_walked, *link), "producers": (), "bias": (write_rhs,)}[spec.rhs]
-    add(*((diagonals,) if placement.clears_diagonals else ()), *rhs, nvtx="S4_HinvJt_Diag_RHS")
+    add(*((diagonals,) if placement.clears_diagonals and topology is None else ()), *rhs, nvtx="S4_HinvJt_Diag_RHS")
     if forest.has_free_rigid_bodies:
         add(write_free_body_rhs_timed if "sync_timings" in diagnostics else write_free_body_rhs, nvtx="S4_MF_Setup")
 

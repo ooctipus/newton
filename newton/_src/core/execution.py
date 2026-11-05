@@ -40,6 +40,7 @@ import warp as wp
 from .memory import REGISTER_GRANULE, REGISTER_PARTITIONS, REGISTERS_PER_THREAD, Device, carveout, granules
 
 __all__ = [
+    "Beside",
     "Order",
     "Queue",
     "Shape",
@@ -330,3 +331,44 @@ def launch(
         wp.launch_tiled(kernel, dim=[shape.grid], stream=stream, **common)
     else:
         wp.launch(kernel, dim=shape.grid * shape.block, stream=stream, **common)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Work beside the step's stream
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+class Beside:
+    """Work that runs on a stream of its own, from where the step starts it to where the step joins it.
+
+    Work whose inputs are ready early and whose outputs are read late need not wait in the step's one stream: it runs
+    beside the work in between, which leaves the device's multiprocessors part idle. :meth:`start` forks it from the
+    current stream (an event, so a graph capture records the edge), :meth:`join` makes the current stream wait for it.
+    On the CPU it runs in line.
+
+    Args:
+        device: The device of the work.
+    """
+
+    def __init__(self, device=None):
+        cuda = wp.get_device(device).is_cuda
+        self.device = device
+        self.stream = wp.Stream(device) if cuda else None
+        self.started = wp.Event(device) if cuda else None
+        self.done = wp.Event(device) if cuda else None
+
+    def start(self, work) -> None:
+        """Run ``work()`` (its launches) beside the current stream, after what the current stream queued so far."""
+        if self.stream is None:
+            work()
+            return
+        wp.get_stream(self.device).record_event(self.started)
+        self.stream.wait_event(self.started)
+        with wp.ScopedStream(self.stream, sync_enter=False):
+            work()
+        self.stream.record_event(self.done)
+
+    def join(self) -> None:
+        """Make the current stream wait for the work :meth:`start` ran."""
+        if self.stream is not None:
+            wp.get_stream(self.device).wait_event(self.done)
