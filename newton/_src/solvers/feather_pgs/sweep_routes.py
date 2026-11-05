@@ -699,9 +699,7 @@ def mf_gs_source(
     dense = WorldRows(M_D, staging=places.staging, lanes=row_lanes)
     free = WorldRows(M_MF, staging="header", stream=places.impulses is Place.GLOBAL, lanes=row_lanes)
     dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows)
-    bodies = FREE_BODY_COORDINATES
-    # The free bodies' speed rows leave and enter by the walk, as their rows were written (walk_rows).
-    free_op = FreeBodyZ(row_lanes, walk_leave=bodies.walk_leave, walk_enter=bodies.walk_enter)
+    free_op = FreeBodyZ(row_lanes)
     staging = mf_gs_staging(
         M_D,
         M_MF,
@@ -742,7 +740,8 @@ def mf_gs_source(
     passes = []
     if has_dense_velocity_limit_rows:
         passes.append(velocity_limit_pass(dense, dense_op, laws, pad="        "))
-    passes.append(speed_rows_pass(free, free_op, laws, pad="        "))
+    # The free bodies' speed rows leave and enter by the walk, as their rows were written (walk_rows).
+    passes.append(speed_rows_pass(free, free_op, laws, walk=FREE_BODY_COORDINATES, pad="        "))
 
     # Where spin rows may appear, every friction triple's metric is formed once per launch, at its first loaded visit
     # (sweep.friction_metric_stage), and its later visits only project: the dense rows' in either mapping, the free

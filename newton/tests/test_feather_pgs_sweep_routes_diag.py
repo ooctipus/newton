@@ -21,6 +21,7 @@ import warp as wp
 from newton._src.solvers.feather_pgs import sweep_routes_diag as routes
 from newton._src.solvers.feather_pgs.response_operator import FreeBodyZ, Lanes, SparsePairZ, Velocity
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
+from newton._src.solvers.feather_pgs.sweep import RowLaws, speed_row
 
 _POLICIES = (SolvePolicy(), SolvePolicy(readout="sweeps"), SolvePolicy(readout="trace"))
 _SCHEDULES = (
@@ -130,16 +131,39 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
             self.assertNotIn("WALK_DOWN", text)
 
 
+class _Walk:
+    """A free body's walk as named native calls."""
+
+    @staticmethod
+    def walk_leave(first, values):
+        return f"WALK_LEAVE_OF({first}, {values});"
+
+    @staticmethod
+    def walk_enter(first, velocity, out):
+        return f"WALK_ENTER_OF({first}, {velocity}, {out});"
+
+
+def _speed_row(lanes, velocity):
+    return speed_row(
+        _Walk,
+        RowLaws(),
+        velocity=velocity,
+        load="lam",
+        store="",
+        lanes=lanes,
+        rhs="b",
+        inverse="inv",
+        body="f",
+        axis="axis",
+        pad="",
+    )
+
+
 class TestSweepRoutesDiagOperators(unittest.TestCase):
     """The operators' layouts emit the order of the sweeps they replace."""
 
     def test_free_body_one_thread(self):
-        op = FreeBodyZ(
-            Lanes(1),
-            velocity=Velocity("s_vel"),
-            walk_leave=lambda first, values: f"WALK_LEAVE_OF({first}, {values});",
-            walk_enter=lambda first, velocity, out: f"WALK_ENTER_OF({first}, {velocity}, {out});",
-        )
+        op = FreeBodyZ(Lanes(1), velocity=Velocity("s_vel"))
         residual = op.residual("jv", "")
         # Each side's six products as one expression, added to the residual: a's, then b's.
         terms = " + ".join(
@@ -159,27 +183,20 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
         self.assertIn("float cross = 0.0f;", coupling)
         self.assertIn("cross += mf_Z.data[mf12_base + i * 12 + k] * mf_Z.data[mf12_base + sib * 12 + k];", coupling)
         # A speed row reads the body's physical velocity v = L^-T u by its walk, then pushes u by L^T dv the same way.
-        speed = op.speed("speed", "f", "axis", "")
+        speed = _speed_row(Lanes(1), Velocity("s_vel"))
         self.assertIn("speed_v[k] = s_vel[f + k];", speed)
         self.assertIn("WALK_LEAVE_OF(f, speed_v);", speed)
         self.assertIn("sqrtf((speed_v[axis] * speed_v[axis] + speed_v[axis + 1] * speed_v[axis + 1])", speed)
-        scaled = op.scale_speed("s", "f", "axis", "")
-        self.assertIn("WALK_ENTER_OF(f, speed_dv, speed_du);", scaled)
-        self.assertIn("s_vel[f + k] += speed_du[k];", scaled)
-        # Without its walk a body has no velocity for a speed row to read.
-        with self.assertRaises(ValueError):
-            FreeBodyZ(Lanes(1)).speed("speed", "f", "axis", "")
+        self.assertIn("WALK_ENTER_OF(f, speed_dv, speed_du);", speed)
+        self.assertIn("s_vel[f + k] += speed_du[k];", speed)
 
     def test_free_body_lanes_keep_their_text(self):
-        op = FreeBodyZ(
-            Lanes(32),
-            walk_leave=lambda first, values: f"WALK_LEAVE_OF({first}, {values});",
-            walk_enter=lambda first, velocity, out: f"WALK_ENTER_OF({first}, {velocity}, {out});",
-        )
+        op = FreeBodyZ(Lanes(32))
         self.assertIn(
             "SUM(sibling_residual);\nsibling_residual += rhs;", op.sibling_residual("sibling_residual", "s", "", "rhs")
         )
-        self.assertIn("if (lane == 0) {", op.scale_speed("s", "speed_dof", "axis", ""))
+        # The lanes push the speed row's change from their first lane.
+        self.assertIn("if (lane == 0) {", _speed_row(Lanes(32), Velocity("s_v")))
 
     def test_sparse_pair_layouts(self):
         warp = SparsePairZ(6, 32, Lanes(32))

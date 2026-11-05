@@ -42,7 +42,7 @@ from typing import ClassVar
 import warp as wp
 
 from ...core.memory import Buffer
-from .response_operator import Lanes, ResponseOperator
+from .response_operator import Lanes, ResponseOperator, Velocity
 from .row_inputs import RowArgument
 from .row_kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -1458,9 +1458,10 @@ def velocity_limit_pass(rows: WorldRows, op, laws: RowLaws, *, end: str = "m_den
     return indent("\n".join(lines), pad)
 
 
-def speed_rows_pass(rows: WorldRows, op, laws: RowLaws, *, pad: str = "            ") -> str:
+def speed_rows_pass(rows: WorldRows, op, laws: RowLaws, *, walk, pad: str = "            ") -> str:
     """Free-body speed rows (``[mf_contact_end, m_mf)``) after every other row: each bounds the magnitude of its
-    body's linear (axis ``e_0``) or angular (axis ``e_3``) velocity, along that velocity (:func:`speed_row`)."""
+    body's linear (axis ``e_0``) or angular (axis ``e_3``) velocity, along that velocity (:func:`speed_row`), which
+    the body's ``walk`` reads and pushes; ``op`` holds the rows' entries and the velocity."""
     lanes = rows.lanes
     lines = [
         "for (int i = mf_contact_end; i < m_mf; i++) {",
@@ -1476,8 +1477,9 @@ def speed_rows_pass(rows: WorldRows, op, laws: RowLaws, *, pad: str = "         
         "",
         f"    const int speed_axis = {op.Z}.data[{op.base} + i * 12 + 3] != 0.0f ? 3 : 0;",
         speed_row(
-            op,
+            walk,
             laws,
+            velocity=op.velocity,
             load=rows.load("i"),
             store=lanes.first(rows.store("i", "speed_row[0]")) if not rows.stream else rows.store("i", "speed_row[0]"),
             lanes=lanes,
@@ -1491,9 +1493,10 @@ def speed_rows_pass(rows: WorldRows, op, laws: RowLaws, *, pad: str = "         
 
 
 def speed_row(
-    op,
+    walk,
     laws: RowLaws,
     *,
+    velocity: Velocity,
     load: str,
     store: str,
     lanes: Lanes,
@@ -1505,14 +1508,38 @@ def speed_row(
 ) -> str:
     """The update of a free-body speed row on its body's velocity coordinates ``[axis, axis + 3)``.
 
-    The body's coordinates from ``body`` hold its factor coordinates; the speed is the magnitude of its physical
-    velocity there (:meth:`.FreeBodyZ.speed`). The row's law (:func:`.projection_laws.speed_row`) gives its stored
-    value (``store`` stores ``speed_row[0]``, the total of the row's impulse ``load``) and the scale that
-    pushes the velocity back along itself (:meth:`.FreeBodyZ.scale_speed`). ``inverse`` is the row's stored inverse
-    diagonal.
+    The body's coordinates from ``body`` hold ``u``, its factor coordinates (``velocity``); the speed is the magnitude
+    of its physical velocity there: every lane forms ``speed_v = L^-T u`` by the body's walk down
+    (``walk.walk_leave(first, values)``) on the predictor, which ``v_out`` holds through the sweep, and the magnitude,
+    the squares added in coordinate order; the lanes then synchronize. The row's law (:func:`.projection_laws.speed_row`)
+    gives its stored value (``store`` stores ``speed_row[0]``, the total of the row's impulse ``load``) and the scale
+    that pushes the velocity back along itself, ``u += L^T dv`` by the walk in (``walk.walk_enter(first, velocity,
+    out)``), one thread or the first lane. ``inverse`` is the row's stored inverse diagonal.
     """
+    v = velocity.at(f"{body} + k")
+    speed = [
+        "float speed_v[6];",
+        f"for (int k = 0; k < 6; ++k) speed_v[k] = {v};",
+        walk.walk_leave(body, "speed_v"),
+        f"for (int k = 0; k < 6; ++k) speed_v[k] += v_out.data[world_dof_indices.data[dof_map_base + {body} + k]];",
+        f"const float speed_mf_vlim = sqrtf((speed_v[{axis}] * speed_v[{axis}] + speed_v[{axis} + 1] * speed_v[{axis} + 1])"
+        f" + speed_v[{axis} + 2] * speed_v[{axis} + 2]);",
+    ]
+    if lanes.parallel:
+        speed.append(lanes.sync())
+    push = "\n".join(
+        [
+            "float speed_dv[6];",
+            f"for (int k = 0; k < 6; ++k) speed_dv[k] = k >= {axis} && k < {axis} + 3 ? speed_row[2] * speed_v[k] : 0.0f;",
+            "float speed_du[6];",
+            walk.walk_enter(body, "speed_dv", "speed_du"),
+            f"for (int k = 0; k < 6; ++k) {v} += speed_du[k];",
+        ]
+    )
+    if lanes.parallel:
+        push = f"if ({lanes.lane} == 0) {{\n{push}\n}}"
     lines = [
-        op.speed("speed_mf_vlim", body, axis, pad),
+        "\n".join(pad + line for line in "\n".join(speed).split("\n")),
         f"{pad}const float old_mf_vlim = {load};",
         f"{pad}const float bound_speed = {bound(rhs, 'speed_mf_vlim', 'old_mf_vlim', step=inverse)};",
         f"{pad}const wp::vec3 speed_row = ProjectionLaw::speed_row(speed_mf_vlim, {rhs}, {inverse}, old_mf_vlim);",
@@ -1528,7 +1555,7 @@ def speed_row(
             (Change("speed_row[1]", "bound_speed", str(SPEED), f"1.0f / {inverse}"),),
             pad + "    ",
         ),
-        op.scale_speed("speed_row[2]", body, axis, pad + "    "),
+        "\n".join(pad + "    " + line for line in push.split("\n")),
         f"{pad}}}",
     ]
     if lanes.sync():
@@ -1809,7 +1836,7 @@ def _jacobi_join(rows: JacobiRows, op, scale, pad: str) -> str:
     """Rows that left idleness join the steps' bound, between two epochs of sweeps: an idle row whose residual turned
     negative kept its zero impulse in its sweep, voted loud and raised ``s_joined`` (:func:`_jacobi_step`), which ended
     the epoch after that sweep's vote; every admitted row's step is set again on the rows that can now move
-    (:meth:`~.ResponseOperator.jacobi_steps`, then the friction blocks' isotropy), the extrapolation is dropped and the
+    (:meth:`~.TransposedResponse.jacobi_steps`, then the friction blocks' isotropy), the extrapolation is dropped and the
     momentum restarts in the new metric, so the row moves from the next sweep under a bound that counts it: no row ever
     moves outside the bound. Out of the sweep loop, the join costs the sweeps nothing until it runs."""
     lines = [
@@ -2035,8 +2062,8 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
 
     The rows of each friction block first take one step, isotropic in the block's scaled coordinates
     (:func:`isotropic_friction_step`). Each sweep, every admitted row steps at once from the extrapolated impulses
-    ``y``: its residual ``r = b' + (A y)_i`` (:meth:`~.ResponseOperator.jacobi_residual`, after the operator's
-    :meth:`~.ResponseOperator.gather`); then ``y_i - s_step_i r`` clamped at zero for a unilateral or idle row (an idle
+    ``y``: its residual ``r = b' + (A y)_i`` (:meth:`~.TransposedResponse.jacobi_residual`, after the operator's
+    :meth:`~.TransposedResponse.gather`); then ``y_i - s_step_i r`` clamped at zero for a unilateral or idle row (an idle
     row whose residual turned negative stays at zero, votes loud and joins the steps' bound after the sweep's vote,
     :func:`_jacobi_join`, the steps set again by ``scale`` as the staging set them). Each friction block is then
     projected radially onto its disk, or under torsion its ball (``pooled``: on its patch ring's pooled normal load), the
@@ -2124,7 +2151,7 @@ def jacobi_limit_pass(rows: JacobiRows, op, *, pad: str = "    ") -> str:
     :func:`.projection_laws.velocity_limit_update`, added to the row's total). The pass only pushes: it changes
     nothing at the sweeps' fixed point, where no row is violated, and gives the limits the last word of a world
     stopped early, as the Gauss-Seidel sweeps' end pass does. The operator forms ``(A x)_i``
-    (:meth:`~.ResponseOperator.push_velocity`, on ``w = Y^T x`` where it keeps one, following each push).
+    (:meth:`~.TransposedResponse.push_velocity`, on ``w = Y^T x`` where it keeps one, following each push).
     """
     if not rows.limits:
         raise ValueError("the last word pushes the velocity-limit rows the rows stage")

@@ -213,62 +213,6 @@ class ResponseOperator:
         :meth:`apply_row`; an operator may reuse what the row velocity kept."""
         return self.apply_row(row, delta, indent)
 
-    # -- Jacobi actions: every row of a block at once, one lane a row (row ``i = lane``) -------------------------------
-    #
-    # A Jacobi sweep (:func:`.sweep.jacobi_sweeps`) keeps each row's residual at zero impulse, ``b'_i = rhs_i + J_i
-    # (v - Y^T lambda_0)``, in ``s_rhs`` and forms ``r_i(y) = b'_i + (A y)_i`` at the extrapolated impulses ``y``
-    # (``s_y``) each sweep. The velocity is published once, from the impulses the sweeps applied; the last word of
-    # the velocity-limit rows pushes them on ``A x``, maintained as ``w = Y^T x`` where the operator keeps one.
-
-    def registers(self, indent: str) -> str:
-        """Declare the lanes' row registers (nothing by default)."""
-        return ""
-
-    def jacobi_stage(
-        self,
-        padding: str,
-        scale: Callable[[str, str, str], str],
-        indent: str,
-        *,
-        idle: str,
-        counted: Callable[[str], str],
-    ) -> str:
-        """Stage the operator, set each row's ``s_rhs`` to ``b'_i``, run ``idle`` (statements that read ``s_rhs``:
-        the row store's marks of the rows that cannot move) and set each admitted row's step (:meth:`jacobi_steps`);
-        ``padding`` zeroes the rows' padded impulses ahead of the last barrier."""
-        raise self._lacks("Jacobi staging")
-
-    def jacobi_steps(self, scale: Callable[[str, str, str], str], indent: str, *, counted: Callable[[str], str]) -> str:
-        """Set each admitted row's step, ``scale(aii, bound, indent)``: from ``A_ii`` and a bound of its absolute sum
-        ``sum_j |A_ij|`` over the rows ``counted(j)`` names (those that can move); synchronized. Run at staging and
-        whenever a row joins the counted rows."""
-        raise self._lacks("Jacobi steps")
-
-    def gather(self, indent: str) -> str:
-        """Per sweep, before the rows update: the products every row's residual reads (nothing by default)."""
-        return ""
-
-    def jacobi_residual(self, out: str, indent: str) -> str:
-        """``float out = b'_i + (A y)_i`` of row ``i = lane``."""
-        raise self._lacks("Jacobi residual")
-
-    def push_prologue(self, indent: str) -> str:
-        """Before the last word's pushes: ``w = Y^T x`` where the operator keeps it (nothing by default)."""
-        return ""
-
-    def push_velocity(self, out: str, lanes: Lanes, indent: str) -> str:
-        """``float out = (A x)_i`` of the pushed row ``i`` over ``lanes``: the residual's impulse term."""
-        raise self._lacks("push velocity")
-
-    def push_apply(self, delta: str, lanes: Lanes, indent: str) -> str:
-        """After a push ``delta`` of row ``i``: ``w += Y_i delta`` where the operator keeps ``w`` (nothing by
-        default)."""
-        return ""
-
-    def push_diagonal(self) -> str:
-        """``A_ii`` of the pushed row ``i``."""
-        raise self._lacks("push diagonal")
-
 
 @dataclass(frozen=True)
 class FreeBodyZ(ResponseOperator):
@@ -290,9 +234,6 @@ class FreeBodyZ(ResponseOperator):
     zero, each adding body ``a``'s then ``b``'s product per coordinate, as does
     the row's own residual where the pair reduces it (``own``). The builder
     stores ``1 / A_ii`` (``A_ii = cfm + |Z|^2``).
-
-    A body's speed row reads its velocity by its walk (``walk_leave``,
-    ``walk_enter``).
     """
 
     lanes: Lanes = Lanes()
@@ -302,12 +243,6 @@ class FreeBodyZ(ResponseOperator):
     entry: Callable[[int, str, str], str] | None = None
     """One thread: where entry ``k`` of side ``side``'s six of a row is read, ``entry(side, row, k)``, when a mapping
     stages the rows elsewhere (default: the packed row)."""
-    walk_leave: Callable[[str, str], str] | None = None
-    """The code mapping the six values ``values`` of the body whose first coordinate is ``first`` back in place,
-    ``walk_leave(first, values)``, ``v = P^T L^-T u`` by the walk down (:mod:`.walk_rows`); a speed row needs it."""
-    walk_enter: Callable[[str, str, str], str] | None = None
-    """With ``walk_leave``: the code giving ``u = L^T P v`` of the six values ``velocity`` in ``out``,
-    ``walk_enter(first, velocity, out)``."""
     name = "free_body_z"
     SIDES = ((0, "dof_a"), (1, "dof_b"))
     """Each side and its body's first coordinate, in the row's order."""
@@ -506,47 +441,6 @@ class FreeBodyZ(ResponseOperator):
         sides = "\n".join(f"{indent}    if ({body} >= 0) {out} += {term(side, body)};" for side, body in self.SIDES)
         return f"{indent}float {out} = {start};\n{indent}for (int k = 0; k < 6; ++k) {{\n{sides}\n{indent}}}"
 
-    # -- free-body speed rows ---------------------------------------------------------------------------------------
-
-    def speed(self, out: str, body: str, axis: str, indent: str) -> str:
-        """``const float out``: the magnitude of the body's physical velocity coordinates ``[axis, axis + 3)``.
-
-        The body's coordinates from ``body`` hold ``u``; every lane forms its physical velocity ``speed_v = L^-T u``
-        (``walk_leave``) on the predictor, which ``v_out`` holds through the sweep, and the magnitude, the squares added
-        in coordinate order. The lanes then synchronize, so :meth:`scale_speed` may write ``u``.
-        """
-        if self.walk_leave is None:
-            raise ValueError("a free body's speed row reads its velocity by its walk (walk_leave)")
-        lines = [
-            "float speed_v[6];",
-            "for (int k = 0; k < 6; ++k) speed_v[k] = " + self._v(body, "k") + ";",
-            self.walk_leave(body, "speed_v"),
-            f"for (int k = 0; k < 6; ++k) speed_v[k] += v_out.data[world_dof_indices.data[dof_map_base + {body} + k]];",
-            f"const float {out} = sqrtf((speed_v[{axis}] * speed_v[{axis}] + speed_v[{axis} + 1] * speed_v[{axis} + 1])"
-            f" + speed_v[{axis} + 2] * speed_v[{axis} + 2]);",
-        ]
-        if self.lanes.parallel:
-            lines.append(self.lanes.sync())
-        return "\n".join(indent + line for line in "\n".join(lines).split("\n"))
-
-    def scale_speed(self, scale: str, body: str, axis: str, indent: str) -> str:
-        """``v += scale v`` on the coordinates :meth:`speed` read, as ``u += L^T dv`` (one thread, or the first lane)."""
-        lines = [
-            "float speed_dv[6];",
-            f"for (int k = 0; k < 6; ++k) speed_dv[k] = k >= {axis} && k < {axis} + 3 ? {scale} * speed_v[k] : 0.0f;",
-        ]
-        if self.walk_enter is None:
-            raise ValueError("a free body's speed row pushes its velocity by its walk (walk_enter)")
-        lines += [
-            "float speed_du[6];",
-            self.walk_enter(body, "speed_dv", "speed_du"),
-            "for (int k = 0; k < 6; ++k) " + self._v(body, "k") + " += speed_du[k];",
-        ]
-        text = "\n".join(lines)
-        if self.lanes.parallel:
-            text = f"if ({self.lanes.lane} == 0) {{\n{text}\n}}"
-        return "\n".join(indent + line for line in text.split("\n"))
-
 
 def _applied_sum(out: str, start: str, response: Callable[[str], str], applied: Callable[[str], str], rows: str):
     """Lines of ``float out = start + sum_i response(i) applied(i)`` over rows ``[0, rows)`` in row order, a zero
@@ -726,7 +620,13 @@ class WalkedRows:
 
 @dataclass(frozen=True)
 class TransposedResponse(ResponseOperator):
-    """Walked rows ``Z`` in registers and staged transposed: ``A y = Z^T (Z y)``, one lane a row.
+    """Walked rows ``Z`` in registers and staged transposed: ``A y = Z^T (Z y)``, one lane a row: the simultaneous
+    form of the response, every row of a Jacobi level at once (row ``i = lane``).
+
+    A Jacobi sweep (:func:`.sweep.jacobi_sweeps`) keeps each row's residual at zero impulse, ``b'_i = rhs_i + J_i (v -
+    Y^T lambda_0)``, in ``s_rhs`` and forms ``r_i(y) = b'_i + (A y)_i`` at the extrapolated impulses ``y`` (``s_y``)
+    each sweep. The velocity is published once, from the impulses the sweeps applied; the last word of the
+    velocity-limit rows pushes them on ``A x``, maintained as ``w = Y^T x``.
 
     The rows are walked in the kernel or read from the one writer's store (:class:`WalkedRows`), so ``Z``
     serves as both ``J^T`` and ``Y``. Each lane holds its row in registers
