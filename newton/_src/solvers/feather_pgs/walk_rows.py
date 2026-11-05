@@ -204,6 +204,11 @@ its walk fits, for a latency-bound walk whose speed follows its resident warps. 
 (80 registers, 24 warps); with blocks, whose link rows hold a second point across the walk and whose closure follows
 it, five (96 registers: 97 unbounded, and six spilled 88 B a thread, sm_120)."""
 
+STAR_LINE = 256, 3
+"""The star's walkers' launch bound (:func:`slot_rows_kernel`, :func:`.compact_contact.contacts_kernel`): a block of
+Warp's 256 threads, three a multiprocessor, the one writer's line of 80 registers (24 warps). Unbound, the class
+tables' walk takes 84-86 registers, past the granule: 16 warps (franka-cabinet 7% slower, gate_fast)."""
+
 
 @cache
 def unit_reader(links: bool, unit_rows: int = 1, contacts: bool = True) -> wp.Function:
@@ -1526,7 +1531,7 @@ def slot_rows_kernel(side: bool, tables: tuple) -> wp.Kernel:
                 walk(sink, unit)
                 slot_header(rows, slots, data, v_hat, unit, bias)
 
-    return python_kernel(write_slot_rows, "write_slot_rows")
+    return python_kernel(write_slot_rows, "write_slot_rows", launch_bounds=STAR_LINE)
 
 
 def slot_writer(solver) -> wp.Kernel:

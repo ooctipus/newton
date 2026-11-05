@@ -23,6 +23,7 @@ from .kernel_template import python_kernel
 from .row_kernels import RowBias
 from .row_records import UNIT_CONTACT, DenseRows, unit_source
 from .walk_rows import (
+    STAR_LINE,
     JointSeeds,
     RowSink,
     SlotRows,
@@ -86,7 +87,7 @@ def contacts_kernel(side: bool, tables: tuple) -> wp.Kernel:
         walk(sink, unit)
         slot_header(rows, slots, data, data.incident, unit, bias)
 
-    return python_kernel(produce_contacts, "produce_contacts")
+    return python_kernel(produce_contacts, "produce_contacts", launch_bounds=STAR_LINE)
 
 
 def contact_producer(solver) -> wp.Kernel:
