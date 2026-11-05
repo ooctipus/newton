@@ -1940,12 +1940,18 @@ def _transport_block(layout: TreeLayout) -> str:
     )
 
 
-PREDICTOR_THREADS = 1152
-"""Threads an SM keeps of a predictor's half: main's g1 predictor before the saturation law, 18 blocks of 64 at 56
-registers (H8), at most 24 blocks (an sm_120 SM's resident limit; ptxas drops a launch bound that asks for more). The
-trial and the decision fit those registers (g1's 52); the border, which about one tree in eighteen runs, keeps its
-working values in its stack rather than taking a resident block from every world (W7 Q5.5: the rare branch stays out
-of every block)."""
+PREDICTOR_REGISTERS = 56
+"""The register line of a predictor's half: main's g1 predictor before the saturation law, 18 blocks of 64 at 56
+registers (H8). The trial and the decision fit it (g1's 52); the border, which about one tree in eighteen runs, keeps
+its working values in its stack rather than taking a resident block from every world (W7 Q5.5: the rare branch stays
+out of every block)."""
+
+
+def predictor_work(layout: TreeLayout) -> Work:
+    """A predictor half's work: a packed group of trees a block of :attr:`.TreeLayout.block` threads at
+    :data:`PREDICTOR_REGISTERS`. Its launch bound is sized for :data:`~.memory.REFERENCE_ARCH` on every device (24
+    blocks of 32 threads, 18 of 64 on sm_120), as the kernel's builder takes no device."""
+    return Work(0, block=layout.block, registers=PREDICTOR_REGISTERS)
 
 
 def _predictor_name(prefix: str, layout: TreeLayout, schedules: HeldSchedules | None, response: str, classes) -> str:
@@ -1967,8 +1973,8 @@ def _predictor_name(prefix: str, layout: TreeLayout, schedules: HeldSchedules | 
 
 
 def _half_kernel(prefix, schedules, layout, response, classes, flag, body, preludes=(), **fragments):
-    """A half of the predictor (:data:`_HALF` and its ``body``, a packed group of trees a block, its launch bound at
-    :data:`PREDICTOR_THREADS`): the force half or the response half."""
+    """A half of the predictor (:data:`_HALF` and its ``body``, a packed group of trees a block, its launch bound
+    :func:`predictor_work`'s): the force half or the response half."""
 
     source = layout.native(
         _HALF + body,
@@ -1994,7 +2000,7 @@ def _half_kernel(prefix, schedules, layout, response, classes, flag, body, prelu
         # A packed group of trees per block: the block's group and this thread's tree in it.
         items("group", groups=layout.pack, lanes=layout.lanes),
         composed=True,
-        launch_bounds=(layout.block, min(24, PREDICTOR_THREADS // layout.block)),
+        launch_bounds=shape(predictor_work(layout), memory.built_for(None)).bounds,
     ).kernel()
 
 
