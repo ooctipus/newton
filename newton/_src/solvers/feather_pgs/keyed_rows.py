@@ -25,7 +25,7 @@ from .contact_input import ContactInput
 from .contact_laws import CONTACT_LAW, CONTACT_SPIN_ROW, contact_friction
 from .factor.walk import WALK_FRAME, WALK_LINK
 from .field_group import Field, FieldGroup, SolverArrays
-from .friction_patches import PatchRowLaw, patch_row_law
+from .friction_patches import PatchRowLaw, patch_row_law, patch_spin_row
 from .kernel_template import substitute
 from .keyed_row_layout import prefix_kernel
 from .keyed_row_layout import topology_plan as direct_topology_plan
@@ -78,9 +78,9 @@ def scatter_contact_keys(data: ContactInput, z: KineticRows, law: PatchRowLaw):
     """Emit each allocated contact row's key (raw contact ID and row direction: the normal, the tangents and, under
     contact torsion, the spin row).
 
-    Under persistent patch friction also the type, parent and undivided coefficient of each row: the patch
-    link runs after this launch and before any row is read, links each normal row into its patch ring and
-    divides the tangent coefficient among the anchors that received rows. A material contact's tangents take its
+    Under persistent patch friction also the type, parent and coefficient of each row (a spin row's from its region's
+    footprint, :func:`.friction_patches.patch_spin_row`): the patch link runs after this launch and before any row is
+    read, and links each normal row into its patch ring. A material contact's tangents take its
     friction scale (:func:`.row_build.write_contact_row`).
     """
     contact = wp.tid()
@@ -104,9 +104,10 @@ def scatter_contact_keys(data: ContactInput, z: KineticRows, law: PatchRowLaw):
                         data.row_parent[line, row] = -1
                         data.row_mu[line, row] = mu
                     elif direction == CONTACT_SPIN_ROW:
+                        _phi, _beta, spin_mu = patch_spin_row(law, contact, friction, contact_torsion_mu(data, contact))
                         data.row_type[line, row] = PGS_CONSTRAINT_TYPE_TORSION
                         data.row_parent[line, row] = slot
-                        data.row_mu[line, row] = contact_torsion_mu(data, contact)
+                        data.row_mu[line, row] = spin_mu
                     else:
                         data.row_type[line, row] = PGS_CONSTRAINT_TYPE_FRICTION
                         data.row_parent[line, row] = slot
@@ -167,7 +168,7 @@ def _row_source(*, layout, patch=False, weighted=False, torsion=False):
         friction_location = "const wp::vec3 friction_point = patch_law.patches.point.data[contact];"
         tangent_phi = "patch_law.patches.phi.data[contact][r - 1]"
         if torsion:
-            tangent_phi = f"(r == 3 ? 0.0f : {tangent_phi})"
+            tangent_phi = f"(r == 3 ? patch_law.patches.spin_phi.data[contact] : {tangent_phi})"
         tangent_beta = "patch_law.beta"
         row_law = "        c.row_beta.data[at] = r == 0 ? normal_beta : patch_law.beta;\n"
     else:

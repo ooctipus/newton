@@ -93,7 +93,7 @@ def launch_contacts(solver, data: ContactInput, dt: float) -> None:
     laws = solver.laws
     pool.launch(
         produce_contacts,
-        (pool.launch_rows(), 4 if laws.contact_torsion_enabled else 3),
+        (pool.launch_rows(), 4 if laws.spin_rows else 3),
         inputs=[
             data,
             bind_dense_rows(solver.placement),

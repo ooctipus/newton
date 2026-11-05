@@ -42,6 +42,7 @@ from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    PGS_CONSTRAINT_TYPE_TORSION,
     compute_world_contact_bias,
 )
 from newton._src.solvers.feather_pgs.row_records import DenseRows
@@ -88,8 +89,31 @@ def ring_load(parents, impulses, normal, *, linked=True):
     return load
 
 
-def _sibling(row, parent):
-    return parent + 2 if row == parent + 1 else parent + 1
+def _law_key(key):
+    """A tier kernel's name without its spin-row suffix: patch friction's tiers read spin rows (``_torsion``)."""
+    return key.removesuffix("_torsion")
+
+
+def _spin(kinds, parents, parent):
+    """The spin row of the contact whose normal is ``parent``: the friction-kind row of the same normal after its pair,
+    or -1 (a contact's rows read from the data, as the sweeps read them)."""
+    row = parent + 3
+    return row if row < len(kinds) and kinds[row] == 1 and parents[row] == parent else -1
+
+
+def _ball(triple, mu, mu_t, load):
+    """Project a friction triple onto its cone ``|(t1 / mu, t2 / mu, s / mu_t)| <= load``; without spin (``mu_t = 0``)
+    the pair onto its disk (``ConeLaw::ball``)."""
+    triple = np.asarray(triple, dtype=np.float64)
+    if mu_t <= 0.0:
+        radius = mu * load
+        magnitude = math.hypot(triple[0], triple[1])
+        pair = triple[:2] * (radius / magnitude) if magnitude > radius else triple[:2]
+        return np.array([pair[0], pair[1], 0.0])
+    scale = np.array([1.0 / mu if mu > 0.0 else 0.0, 1.0 / mu if mu > 0.0 else 0.0, 1.0 / mu_t])
+    magnitude = float(np.linalg.norm(triple * scale))
+    pinned = np.array([1.0 if mu > 0.0 else 0.0, 1.0 if mu > 0.0 else 0.0, 1.0])
+    return triple * pinned * (load / magnitude if magnitude > load else 1.0)
 
 
 def parallel_sweep_reference(
@@ -124,8 +148,10 @@ def parallel_sweep_reference(
     its residual at the extrapolated impulses turns negative; it then keeps its impulse for
     that sweep and joins after it: every step is set again, the extrapolation dropped and
     the momentum restarted, and it moves from the next sweep. Every sweep steps all rows from the extrapolated
-    impulses, clamps normal and limit rows, scales each tangent pair into its disk (the
-    ring's pooled normal load when ``linked``), restarts momentum against the last step
+    impulses, clamps normal and limit rows, scales each tangent pair, and its contact's spin
+    row where it has one, into their cone (the ring's pooled normal load when ``linked``;
+    a spin row steps isotropically with its pair in the cone's scaled coordinates, its step
+    the pair's times ``(mu_t / mu)^2``), restarts momentum against the last step
     and stops once no row changes. ``velocity_limit_pass`` then pushes every violated
     velocity-limit row onto its limit, in row order.
     """
@@ -157,8 +183,17 @@ def parallel_sweep_reference(
                 if row != parent + 1 or sibling >= len(kinds) or kinds[sibling] != 1 or parents[sibling] != parent:
                     continue
                 positive = [value for value in (step[row], step[sibling]) if value > 0.0]
-                if positive:
-                    step[row] = step[sibling] = min(positive)
+                block = min(positive) if positive else 0.0
+                spin = _spin(kinds, parents, parent)
+                if spin >= 0 and mu[row] > 0.0:
+                    spin_scale = (mu[spin] / mu[row]) ** 2
+                    if spin_scale > 0.0 and step[spin] > 0.0:
+                        spin_block = step[spin] / spin_scale
+                        block = min(block, spin_block) if block > 0.0 else spin_block
+                    if block > 0.0 and spin_scale > 0.0:
+                        step[spin] = block * spin_scale
+                if block > 0.0:
+                    step[row] = step[sibling] = block
         return step
 
     step = steps(admitted & ~idle)
@@ -175,12 +210,10 @@ def parallel_sweep_reference(
         projected = stepped.copy()
         for row in np.flatnonzero(kinds == 1):
             parent = parents[row]
-            radius = max(mu[row] * ring_load(parents, stepped, parent, linked=linked), 0.0)
-            magnitude = math.hypot(stepped[row], stepped[_sibling(row, parent)])
-            if radius <= 0.0:
-                projected[row] = 0.0
-            elif magnitude > radius:
-                projected[row] = stepped[row] * radius / magnitude
+            spin = _spin(kinds, parents, parent)
+            load = max(ring_load(parents, stepped, parent, linked=linked), 0.0)
+            triple = (stepped[parent + 1], stepped[parent + 2], stepped[spin] if spin >= 0 else 0.0)
+            projected[row] = _ball(triple, mu[parent + 1], mu[spin] if spin >= 0 else 0.0, load)[row - parent - 1]
         changed = joins.any() or np.any(np.abs(projected - x) > tol * (np.abs(projected) + tol))
         if np.dot(y - projected, projected - x) > 0.0:
             t = 1.0
@@ -423,10 +456,11 @@ def world_case(solver, world=0):
             PGS_CONSTRAINT_TYPE_FRICTION,
             PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
             PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+            PGS_CONSTRAINT_TYPE_TORSION,
         }
     )
     if unmodelled:
-        raise ValueError(f"world_case models contact, friction and limit rows only, not row types {unmodelled}")
+        raise ValueError(f"world_case models contact, friction, spin and limit rows only, not row types {unmodelled}")
     jacobian, response = unpacked_rows(solver)
     J, Y = jacobian[world, :count], response[world, :count]
     forest = solver.forest
@@ -444,7 +478,9 @@ def world_case(solver, world=0):
         "L": None,
         "cfm": cfm,
         "diag": np.einsum("ij,ij->i", J, Y) + cfm,
-        "kinds": np.where(types == PGS_CONSTRAINT_TYPE_FRICTION, 1, 0).astype(np.int32),
+        "kinds": np.where(np.isin(types, (PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION)), 1, 0).astype(
+            np.int32
+        ),
         "types": types,
         "parents": solver.placement.row_parent.numpy()[world, :count].astype(np.int32),
         "mu": solver.placement.row_mu.numpy()[world, :count].astype(np.float64),
@@ -976,15 +1012,17 @@ class TestKeyedPatchRows(unittest.TestCase):
             state, out = out, state
         pipeline.collide(state, contacts)
         joint_q = state.joint_q.numpy().astype(np.float64)
+        size = keyed.placement.keyed_rows.layout.primary
+        # The keyed rows first: a whole step's finish moves the shared history (each region's anchor is the centre of
+        # pressure its solve leaves), and both writers must build from the same history.
+        actual = _linked_rows(keyed, state, contacts, dt)
+        # The keyed class's general worlds are the one writer's walked rows too (keyed_rows.keyed_general_units).
+        actual["J"] = {size: _walked_jacobian(keyed, joint_q, actual)}
         expected = _linked_rows(general, state, contacts, dt)
         # The general placement's one writer walks its rows after the row pass (FL3.3): its J, from the step's
         # walked rows, is the reference of the keyed rows' J.
         general.step(state, out, model.control(), contacts, dt)
-        size = keyed.placement.keyed_rows.layout.primary
         expected["J"] = {size: _walked_jacobian(general, joint_q, expected)}
-        actual = _linked_rows(keyed, state, contacts, dt)
-        # The keyed class's general worlds are the one writer's walked rows too (keyed_rows.keyed_general_units).
-        actual["J"] = {size: _walked_jacobian(keyed, joint_q, actual)}
         live = int(contacts.rigid_contact_count.numpy()[0])
         owner = _contact_rows_by_id(expected, live)
         self.assertEqual(owner, _contact_rows_by_id(actual, live))
@@ -1013,11 +1051,13 @@ class TestKeyedPatchRows(unittest.TestCase):
                 )
                 np.testing.assert_allclose(actual["rhs"][world, rows], bias[world, rows], rtol=1.0e-5, atol=1.0e-7)
                 linked += expected["linked"][c][0] not in (-1, c)
-                tangent_phi += needed == 3 and bool(np.any(expected["phi"][world, first + 1 : first + 3] != 0.0))
-                if needed == 3:
-                    # The anchors carry the coefficient in force at this step.
+                tangent_phi += needed >= 3 and bool(np.any(expected["phi"][world, first + 1 : first + 3] != 0.0))
+                if needed >= 3:
+                    # The anchors carry the coefficient in force at this step, on their spin rows too.
                     beta = options["friction_anchor_beta"] if late_beta is None else late_beta
-                    np.testing.assert_array_equal(expected["row_beta"][world, first + 1 : first + 3], np.float32(beta))
+                    np.testing.assert_array_equal(
+                        expected["row_beta"][world, first + 1 : first + needed], np.float32(beta)
+                    )
         self.assertGreater(linked, 0, "A box foot must link several normals in one ring")
         self.assertGreater(tangent_phi, 0, "Anchors must carry tangential phi")
 
@@ -1097,7 +1137,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
             with self.subTest(anchors=anchors, linked=linked):
                 tiers = path_selection._tiers(probe)
                 self.assertEqual(tiers["linked_rows"], linked)
-                self.assertEqual(tiers["tiers"][0]["kernel"].endswith("_linked"), linked)
+                self.assertEqual(_law_key(tiers["tiers"][0]["kernel"]).endswith("_linked"), linked)
                 self.assertEqual("_linked" in tiers["tiers"][0]["kernel"], linked)
                 self.assertNotIn("pair_step", tiers)
                 self.assertEqual([tier["sweeps"] for tier in tiers["tiers"]], [24, 34])
@@ -1188,14 +1228,15 @@ class TestTierSweeps(unittest.TestCase):
             solver = SolverFeatherPGS(model, friction_anchor_beta=0.2, pgs_iterations=2000)
         _rollout(model, solver, 1)
         case, serial = world_case(solver)
-        # Sixteen contact rows: two patch rings of four normals, each ring with two anchors.
+        # Fourteen contact rows: two patch rings of four normals, each ring with one anchor (a pair and a spin row).
         rings = {
             tuple(sorted(ring_rows(case["parents"], int(normal))))
             for normal in np.flatnonzero(case["types"] == PGS_CONSTRAINT_TYPE_CONTACT)
         }
         self.assertEqual(sorted(len(ring) for ring in rings), [4, 4])
-        self.assertEqual(int(np.count_nonzero(case["types"] == PGS_CONSTRAINT_TYPE_FRICTION)), 8)
-        self.assertEqual(len(case["types"]), 16)
+        self.assertEqual(int(np.count_nonzero(case["types"] == PGS_CONSTRAINT_TYPE_FRICTION)), 4)
+        self.assertEqual(int(np.count_nonzero(case["types"] == PGS_CONSTRAINT_TYPE_TORSION)), 2)
+        self.assertEqual(len(case["types"]), 14)
         options = {"matrix_free": True, "inkernel": False, "exact": False, "nesterov": True, "tol": 0.0, "linked": True}
         gaps = {}
         for sweeps in (2, 2000):
@@ -1693,7 +1734,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
             self.assertIsNone(solver.placement.sparse_mass_matrix_size)
             keys = [tier.kernel.key for tier in solver.sweep.tiers]
             self.assertTrue(keys)
-            self.assertTrue(all(key.endswith("_linked") == linked for key in keys), keys)
+            self.assertTrue(all(_law_key(key).endswith("_linked") == linked for key in keys), keys)
             self.assertTrue(all(("_linked" in key) == linked for key in keys), keys)
             sweeps = sweep_routes_tiers.tier_sweeps(32, 8)
             self.assertTrue(all(f"_sweeps{sweeps}_" in key for key in keys), keys)
@@ -1827,7 +1868,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
             with self.subTest(limits=limits):
                 keys = [tier.kernel.key for tier in solver.sweep.tiers]
                 self.assertTrue(keys)
-                self.assertTrue(all(key.endswith("_linked_lw" if limits else "_linked") for key in keys))
+                self.assertTrue(all(_law_key(key).endswith("_linked_lw" if limits else "_linked") for key in keys))
                 selected = solver.get_path_selection()
                 self.assertEqual(selected["routes"]["sweep"]["tiers"]["velocity_limit_pass"], limits)
                 state, _ = _rollout(model, solver, 2)
@@ -1843,7 +1884,8 @@ class TestPatchParallelRoutes(unittest.TestCase):
         for (sweeps, last_word), solver in budgets.items():
             keys = [tier.kernel.key for tier in solver.sweep.tiers]
             self.assertTrue(
-                keys and all(f"_sweeps{sweeps}_" in key and key.endswith("_lw") == last_word for key in keys), keys
+                keys and all(f"_sweeps{sweeps}_" in key and _law_key(key).endswith("_lw") == last_word for key in keys),
+                keys,
             )
             state, _ = _rollout(model, solver, 1)
             _assert_tier_owned(self, solver, 32)
@@ -1869,7 +1911,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 self.assertEqual(len(keys), 2, keys)
                 for key, budget in zip(keys, expected, strict=True):
                     self.assertIn(f"_sweeps{budget}_", key)
-                    self.assertEqual(key.endswith("_linked"), bool(beta), key)
+                    self.assertEqual(_law_key(key).endswith("_linked"), bool(beta), key)
                 selected = solver.get_path_selection()
                 tiers = selected["routes"]["sweep"]["tiers"]
                 self.assertEqual([tier["sweeps"] for tier in tiers["tiers"]], expected)
@@ -2125,7 +2167,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
             keys = [tier.kernel.key for tier in arms[name].sweep.tiers]
             self.assertEqual(bool(keys), bool(rows), name)
             # Linked tiers with joint velocity limits take the last word.
-            self.assertTrue(all(key.endswith("_linked_lw") for key in keys), keys)
+            self.assertTrue(all(_law_key(key).endswith("_linked_lw") for key in keys), keys)
         velocities = {}
         for name, solver in arms.items():
             state, out, control = model.state(), model.state(), model.control()

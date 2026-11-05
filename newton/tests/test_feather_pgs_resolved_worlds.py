@@ -119,8 +119,10 @@ def _allocate(kernel, resolved, patch_friction=False):
     count = len(_ALLOCATION_SHAPES)
     patches = FrictionPatches()
     patches.enabled = int(patch_friction)
-    # Every anchor carries load, so patch friction reserves the rows point friction does.
+    # Every anchor carries load, and a one-contact region no spin row, so patch friction reserves the rows point
+    # friction does.
     patches.weight = wp.ones(count, dtype=float, device="cpu")
+    patches.spin_arm = wp.zeros(count, dtype=float, device="cpu")
 
     def integers(values):
         return wp.array(values, dtype=wp.int32, device="cpu")

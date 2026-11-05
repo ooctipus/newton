@@ -431,6 +431,39 @@ def friction_ball(
     return friction_ball_from_metric(scale, values, vectors, residual, old, mu, mu_t, load, omega)
 
 
+@CONE_LAW.law
+def friction_triple(
+    block: wp.mat33, residual: wp.vec3, old: wp.vec3, mu: float, mu_t: float, load: float, omega: float
+) -> wp.vec3:
+    """A friction triple's update: :func:`friction_ball` at a positive ``load`` (a zero load gives a zero cone), then
+    :func:`ball`'s projection of the relaxed result. Every sweep solves a contact's spin row with its pair here, or,
+    where its block stays fixed across the solve, by :func:`friction_triple_from_metric`."""
+    triple = wp.vec3(0.0)
+    if load > 0.0:
+        triple = friction_ball(block, residual, old, mu, mu_t, load, omega)
+    return ball(triple, mu, mu_t, load)
+
+
+@CONE_LAW.law
+def friction_triple_from_metric(
+    scale: float,
+    values: wp.vec3,
+    vectors: wp.mat33,
+    residual: wp.vec3,
+    old: wp.vec3,
+    mu: float,
+    mu_t: float,
+    load: float,
+    omega: float,
+) -> wp.vec3:
+    """:func:`friction_triple` from its block's metric (:func:`friction_ball_metric`), formed once per solve where the
+    block stays fixed across its sweeps, as a contact unit's pair keeps its metric: each visit only projects."""
+    triple = wp.vec3(0.0)
+    if load > 0.0:
+        triple = friction_ball_from_metric(scale, values, vectors, residual, old, mu, mu_t, load, omega)
+    return ball(triple, mu, mu_t, load)
+
+
 @PROJECTION_LAW.law
 def velocity_limit_update(old: float, step: float) -> tuple[float, float]:
     """Return a velocity-limit row's new impulse and the impulse change to apply: ``(new, delta)``.

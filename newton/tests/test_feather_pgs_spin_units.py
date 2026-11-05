@@ -5,9 +5,10 @@
 
 The paired factor sweep (:func:`.sweep_routes_local.paired_factor_kernel`) solves a world's contacts row by row
 (the serial row loop: each friction pair at its first tangent, with its contact's spin row as the friction triple),
-as normal/tangent/tangent/spin quads after a prefix (``contact_triples``), or as contact units in slot order
-(``contact_units``: a loaded unit on its Gram block, one reduction and one apply). The three are the same
-Gauss-Seidel sweep in exact arithmetic. On random fixtures, solved to convergence, they reach the same impulses and
+as normal/tangent/tangent/spin quads after a prefix (``contact_triples``), or in slot order (``contact_units``: a
+loaded unit of a normal and its pair on its Gram block, one reduction and one apply; a contact with a spin row takes
+its rows' visits, the triple from its metric cached for the launch). The three are the same Gauss-Seidel sweep in
+exact arithmetic. On random fixtures, solved to convergence, they reach the same impulses and
 velocity to the rounding of their reductions, and every friction triple ends on or inside its elliptic cone.
 """
 
@@ -24,6 +25,7 @@ from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_TORSION,
 )
+from newton._src.solvers.feather_pgs.sweep import FRICTION_METRIC_FLOATS
 from newton.tests.feather_pgs_law_harness import diagonal_walk, leave_walk, row_lines
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices
 
@@ -101,6 +103,8 @@ def _solve(fixture, schedule, device, iterations):
         "omega": 1.0,
         "v_out": array(fixture["velocity"].copy()),
         "walk": diagonal_walk(np.ones((WORLDS, DOFS), np.float32), device),
+        # Each friction triple's metric, formed at its first loaded visit of the launch (sweep.friction_metric_stage).
+        "friction_metric": wp.zeros((WORLDS, (CAPACITY + 3) // 4, FRICTION_METRIC_FLOATS), dtype=float, device=device),
     }
     arguments = [values[name] for name in inspect.signature(kernel.func).parameters]
     blocks = (WORLDS + 1) // 2

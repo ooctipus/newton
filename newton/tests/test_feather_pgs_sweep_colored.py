@@ -105,9 +105,11 @@ def reference_units(meta, count: int, end: int) -> dict:
         if kind[row] != PGS_CONSTRAINT_TYPE_CONTACT:
             continue
         rows = 1
-        while row + rows < end and rows < 3:
+        # Its friction pair, then its spin row where it has one.
+        while row + rows < end and rows < 4:
             r = row + rows
-            if kind[r] != PGS_CONSTRAINT_TYPE_FRICTION or parent[r] != row:
+            want = PGS_CONSTRAINT_TYPE_FRICTION if rows < 3 else PGS_CONSTRAINT_TYPE_TORSION
+            if kind[r] != want or parent[r] != row:
                 break
             rows += 1
         word = int(meta[row, 0])

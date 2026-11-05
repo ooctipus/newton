@@ -129,8 +129,9 @@ RING_MEMBERS = 8
 
 
 class SlotLayout(NamedTuple):
-    """A color slot's fields per unit of at most ``rows`` rows: a contact's normal row and friction pair, and under
-    contact torsion its spin row (:func:`slot_layout`).
+    """A color slot's fields per unit of at most ``rows`` rows: a contact's normal row and friction pair, and in a layout
+    with spin rows its spin row where it has one (:func:`slot_layout`, :func:`.sweep.spin_row`; a friction unit without
+    one stages a zero fourth row).
 
     ``fields`` floats: each row ``r``'s twelve ``Z`` entries at ``r * 12 + side * 6 + k`` (its packed row), then the first
     tangent's friction coefficient (at ``mu``), the normal row's regularization weight (``weight``) and a spin row's
@@ -151,11 +152,12 @@ class SlotLayout(NamedTuple):
 
 
 def slot_layout(torsion: bool) -> SlotLayout:
-    """The slot layout of units with spin rows (contact ``torsion``) or without."""
+    """The slot layout of units that may have spin rows (``torsion``: :func:`.sweep.spin_row`) or have none."""
     rows = 4 if torsion else 3
     entries, ring = 12 * rows, 3 * rows
     words = ring + RING_MEMBERS // 2 + 1
-    return SlotLayout(rows, entries + 2 + torsion, words, 6 if torsion else 7, entries, entries + 1, entries + 2, ring)
+    # The friction metric and the normal's couplings: the pair's metric (5) and two, or under torsion eight and three.
+    return SlotLayout(rows, entries + 2 + torsion, words, 11 if torsion else 7, entries, entries + 1, entries + 2, ring)
 
 
 _RING_MEMBERS = wp.constant(RING_MEMBERS)
@@ -211,6 +213,11 @@ def stage_slots(
             slot_words[slot, r * 3, p] = mf_meta[mf_line, (row + r) * 4 + 1]
             slot_words[slot, r * 3 + 1, p] = mf_meta[mf_line, (row + r) * 4 + 2]
             slot_words[slot, r * 3 + 2, p] = mf_meta[mf_line, (row + r) * 4 + 3]
+        elif r == 3 and rows == 3 and layout_rows > 3:
+            # A friction contact without a spin row in a layout with spin rows: a zero row, whose terms and
+            # couplings are zero (:func:`.sweep.spin_row`).
+            for k in range(12):
+                slot_data[slot, r * 12 + k, p] = 0.0
     entries = layout_rows * 12
     mu = float(0.0)
     if rows >= 3:

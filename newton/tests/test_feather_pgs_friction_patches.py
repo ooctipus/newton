@@ -118,14 +118,13 @@ class TestFrictionPatchHistory(unittest.TestCase):
         points = np.array(
             [[x, y, 0.0] for x in np.linspace(-0.001, 0.001, 128) for y in (-0.05, 0.05)], dtype=np.float32
         )
-        expected = np.array([[0.0, -0.05, 0.0], [0.0, 0.05, 0.0]], dtype=np.float32)
+        expected = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
         for seed in (0, 1, 2):
             with self.subTest(seed=seed):
                 order = np.random.default_rng(seed).permutation(len(points))
                 _, _, _, patches = _patch_fixture(points[order], device=device)
                 locations = patches.view.point.numpy()[patches.view.weight.numpy() > 0.0]
-                locations = locations[np.argsort(locations[:, 1])]
-                np.testing.assert_array_equal(locations, expected)
+                np.testing.assert_allclose(locations, expected, atol=1.0e-6)
 
     def test_narrow_patch_preserves_footprint_reflection_symmetry(self):
         """Avoid a diagonal friction couple on a symmetric narrow contact footprint."""
@@ -138,77 +137,50 @@ class TestFrictionPatchHistory(unittest.TestCase):
                 _, _, _, patches = _patch_fixture(points, device=device)
                 active = patches.view.weight.numpy() > 0.0
                 locations = patches.view.point.numpy()[active]
-                self.assertEqual(len(locations), 2)
+                self.assertEqual(len(locations), 1)
                 np.testing.assert_allclose(locations @ across, 0.0, atol=1.0e-7)
-                np.testing.assert_allclose(np.sort(locations @ axis), [-0.025, 0.025], atol=1.0e-7)
+                np.testing.assert_allclose(locations @ axis, 0.0, atol=1.0e-6)
 
-    def test_isotropic_footprint_pair_ignores_roundoff_and_placement(self):
-        """Keep a square's and a tripod's anchor pair when a corner moves one float32 ulp, at any yaw, near or far from the origin.
+    def test_region_anchor_ignores_roundoff_and_placement(self):
+        """Keep a region's one anchor on its footprint's hull centroid and its rows on its last contact, with the spin
+        arm 0.94 times the hull's polar radius of gyration, when corners move one float32 ulp, at any yaw, near or far
+        from the origin.
 
-        The pair starts at the lowest contact index and spans the footprint;
-        equally distant members go to the lower index. Neither the order of world
-        coordinates nor a roundoff-sized anisotropy may choose it; it is
-        canonical relative to contact order, so reordering the contacts may.
+        The carrier follows contact order, so roundoff cannot move the rows; the location and the arm move by the
+        roundoff only. A square, a tripod, a 2:1 rectangle and a near square (3% longer than wide), each a uniform
+        convex patch whose gyration radius is closed form.
         """
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         angles = (0.0, 2.0 * np.pi / 3.0, 4.0 * np.pi / 3.0)
+        rectangle = lambda hx, hy: [[x, y, 0.0] for y in (-hy, hy) for x in (-hx, hx)]  # noqa: E731
+        # Each footprint's polar radius of gyration: a rectangle's sqrt((a^2 + b^2) / 3) of its half sides, an
+        # equilateral triangle's of side s, sqrt(s^2 / 12), R / 2 of its circumradius.
         footprints = {
-            "square": ([[x, y, 0.0] for y in (-0.05, 0.05) for x in (-0.05, 0.05)], (0, 3)),
-            "tripod": ([[0.05 * np.cos(a), 0.05 * np.sin(a), 0.0] for a in angles], (0, 1)),
+            "square": (rectangle(0.05, 0.05), np.sqrt(2.0 * 0.05**2 / 3.0)),
+            "tripod": ([[0.05 * np.cos(a), 0.05 * np.sin(a), 0.0] for a in angles], 0.05 / 2.0),
+            "rectangle": (rectangle(0.06, 0.03), np.sqrt((0.06**2 + 0.03**2) / 3.0)),
+            "near square": (rectangle(0.0515, 0.05), np.sqrt((0.0515**2 + 0.05**2) / 3.0)),
         }
-        for name, (footprint, expected) in footprints.items():
+        for name, (footprint, gyration) in footprints.items():
             for yaw, offset in itertools.product((0.0, 0.3, 0.25 * np.pi), (0.0, 1.5, 80.0)):
                 points = (_yaw(footprint, yaw) + np.array([offset, offset, 0.0])).astype(np.float32)
-                pairs = set()
-                for corner in range(len(points)):
-                    for step in (-1, 0, 1):
-                        moved = points.copy()
-                        if step != 0:
-                            moved[corner, 0] = np.nextafter(moved[corner, 0], np.float32(step * np.inf))
-                        _, _, _, patches = _patch_fixture(moved, device=device)
-                        held = np.flatnonzero(patches.view.weight.numpy()[: len(points)] > 0.0)
-                        pairs.add(tuple(held))
-                        with self.subTest(footprint=name, yaw=yaw, offset=offset, corner=corner, step=step):
-                            # Isotropic anchors sit on their carriers' contact centres.
-                            np.testing.assert_array_equal(patches.view.point.numpy()[held], moved[held])
-                with self.subTest(footprint=name, yaw=yaw, offset=offset):
-                    self.assertEqual(pairs, {expected})
-
-    def test_support_edge_carriers_ignore_roundoff(self):
-        """Keep each support edge whole and its rows on its last contact when corners move one float32 ulp, at any yaw and placement.
-
-        The anchor locations stay the edge midpoints. Tied corners differ along
-        the axis by the quantization of world coordinates, and a near square's
-        also by the axis tilt that quantization causes; beyond about 50 m that
-        tilt can exceed the edge tolerance, so the near square stays within
-        10 m. Carriers follow contact order, so a collision pipeline that
-        reorders contacts can still move the rows, though not the locations.
-        """
-        device = "cuda:0" if wp.is_cuda_available() else "cpu"
-        edges = ((0, 2), (1, 3))
-        moves = [None, *itertools.product(range(4), (0, 1), (-1, 1))]
-        # Bottom faces of 0.1 m tall boxes, long along x: 2:1 and 3% longer than wide.
-        for (hx, hy), offsets in (((0.06, 0.03), (0.0, 1.5, 10.0, 80.0)), ((0.0515, 0.05), (0.0, 1.5, 10.0))):
-            corners = np.array([[x, y, 0.0] for y in (-hy, hy) for x in (-hx, hx)])
-            radius = float(np.linalg.norm([hx, hy, 0.05]))
-            for yaw, offset in itertools.product((0.0, 0.3, 0.25 * np.pi), offsets):
-                points = (_yaw(corners, yaw) + np.array([offset, offset, 0.0])).astype(np.float32)
-                carriers = set()
-                for move in moves:
+                centroid = (_yaw(footprint, yaw) + np.array([offset, offset, 0.0])).mean(axis=0)
+                # The quantization of the world coordinates the contact centres carry, and the walk's own rounding.
+                tolerance = 8.0 * float(np.spacing(np.float32(offset + 0.1))) + 1.0e-7
+                for corner, axis, step in itertools.product(range(len(points)), (0, 1), (-1, 0, 1)):
                     moved = points.copy()
-                    if move is not None:
-                        corner, axis, step = move
+                    if step != 0:
                         moved[corner, axis] = np.nextafter(moved[corner, axis], np.float32(step * np.inf))
-                    _, _, _, patches = _patch_fixture(moved, radius=radius, device=device)
+                    _, _, _, patches = _patch_fixture(moved, device=device)
                     held = np.flatnonzero(patches.view.weight.numpy()[: len(points)] > 0.0)
-                    carriers.add(tuple(held))
-                    for carrier in held:
-                        edge = next(edge for edge in edges if carrier in edge)
-                        midpoint = moved[list(edge)].astype(np.float64).mean(axis=0).astype(np.float32)
-                        with self.subTest(hx=hx, yaw=yaw, offset=offset, move=move, carrier=carrier):
-                            np.testing.assert_array_equal(patches.view.point.numpy()[carrier], midpoint)
-                with self.subTest(hx=hx, yaw=yaw, offset=offset):
-                    self.assertEqual(carriers, {(2, 3)})
+                    with self.subTest(footprint=name, yaw=yaw, offset=offset, corner=corner, axis=axis, step=step):
+                        np.testing.assert_array_equal(held, [len(points) - 1])
+                        np.testing.assert_allclose(patches.view.point.numpy()[held[0]], centroid, atol=tolerance)
+                        self.assertAlmostEqual(
+                            float(patches.view.spin_arm.numpy()[held[0]]),
+                            0.94 * gyration,
+                            delta=1.0e-5 * gyration + tolerance,
+                        )
 
     def test_pose_increment_preserves_fixed_pivots_and_no_slip_rolling(self):
         """Distinguish rigid rotation from slip without querying the collision shape."""
@@ -295,7 +267,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
             patches.update_geometry(model)
             patches.build(model, state, contacts)
             self.assertEqual(len(np.unique(patches.current.owner.numpy()[:2])), 1)
-            np.testing.assert_allclose(patches.view.weight.numpy()[:2], [0.5, 0.5])
+            self.assertAlmostEqual(float(patches.view.weight.numpy()[:2].sum()), 1.0)
             store_frame(patches, state)
         model.shape_material_mu.assign([0.2, 0.5, 0.8])
         patches.build(model, state, contacts)
@@ -316,8 +288,9 @@ class TestFrictionPatchHistory(unittest.TestCase):
         self.assertGreaterEqual(int(patches.current.source.numpy()[0]), 0)
         self.assertAlmostEqual(float(np.linalg.norm(patches.view.phi.numpy()[0])), 0.001, delta=1.0e-7)
 
-    def test_rocking_face_retires_the_lifted_anchor(self):
-        """Keep the supported edge's history and replace the opposite anchor after rocking."""
+    def test_rocking_face_moves_the_anchor_to_the_supported_edge(self):
+        """Move the region's one anchor to the supported edge after rocking. Its history carries where a solve placed
+        the centre of pressure there; this fixture has no solve, so the build alone keeps one anchor on the edge."""
         points = [[-0.1, -0.1, 0], [0.1, -0.1, 0], [-0.1, 0.1, 0], [0.1, 0.1, 0]]
         model, state, contacts, patches = _patch_fixture(points)
         store_frame(patches, state)
@@ -330,9 +303,8 @@ class TestFrictionPatchHistory(unittest.TestCase):
         contacts.rigid_contact_point1.assign(edge)
         patches.build(model, state, contacts)
         active = patches.current.valid.numpy() != 0
-        self.assertEqual(np.count_nonzero(active), 2)
-        np.testing.assert_allclose(patches.current.anchor_a.numpy()[active, 0], -0.1, atol=1.0e-7)
-        self.assertEqual(np.count_nonzero(patches.current.source.numpy()[active] >= 0), 1)
+        self.assertEqual(np.count_nonzero(active), 1)
+        np.testing.assert_allclose(patches.current.anchor_a.numpy()[active, 0], -0.1, atol=1.0e-5)
 
     def test_unloading_penetration_keeps_supported_anchors(self):
         """Retain history while decompression leaves the actual surfaces in contact."""
@@ -342,7 +314,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         store_frame(patches, state)
         state.body_q.assign([wp.transform(wp.vec3(0, 0, 0.003), wp.quat_identity()), wp.transform_identity()])
         patches.build(model, state, contacts)
-        self.assertEqual(np.count_nonzero(patches.current.source.numpy() >= 0), 2)
+        self.assertEqual(np.count_nonzero(patches.current.source.numpy() >= 0), 1)
 
     def test_support_witnesses_use_existing_contact_gap_limits(self):
         """Keep supported history within the contact envelope and respect tighter solver gates."""
@@ -354,7 +326,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
                 state.body_q.assign([wp.transform(wp.vec3(0, 0, 0.0002), wp.quat_identity()), wp.transform_identity()])
                 contacts.rigid_contact_point0.assign([[-0.1, 0, -0.0004], [0.1, 0, -0.0004]])
                 patches.build(model, state, contacts, **limits)
-                self.assertEqual(np.count_nonzero(patches.current.source.numpy() >= 0), 2 if carried else 0)
+                self.assertEqual(np.count_nonzero(patches.current.source.numpy() >= 0), 1 if carried else 0)
                 # A fresh sample on the supported region cannot retain history
                 # whose old footprint has lifted beyond the shape gap envelope.
                 state.body_q.assign([wp.transform(wp.vec3(0, 0, 0.0012), wp.quat_identity()), wp.transform_identity()])
@@ -437,7 +409,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         patches.update_geometry(model)
         patches.build(model, state, contacts)
         self.assertEqual(len(np.unique(patches.current.owner.numpy()[:4])), 1)
-        np.testing.assert_allclose(patches.view.weight.numpy()[:4], [0.5, 0.5, 0, 0])
+        self.assertAlmostEqual(float(patches.view.weight.numpy()[:4].sum()), 1.0)
 
     def test_disconnected_convex_shapes_form_separate_regions(self):
         """Keep two separated pads on one body from pooling friction through empty space."""
@@ -463,7 +435,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         contacts.rigid_contact_normal.assign([[0, 0, -1], [0, 0, 1]])
         patches.build(model, state, contacts)
         self.assertEqual(len(np.unique(patches.current.owner.numpy()[:2])), 1)
-        np.testing.assert_allclose(patches.view.weight.numpy()[:2], [0.5, 0.5])
+        self.assertAlmostEqual(float(patches.view.weight.numpy()[:2].sum()), 1.0)
 
     def test_saturation_only_releases_an_anchor_with_sliding_motion(self):
         """Keep history under impending slip, and release it under motion against saturated friction."""
@@ -497,7 +469,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         _, _, _, patches = _patch_fixture(
             [[-0.1, -0.1, 0], [0.1, -0.1, 0], [-0.1, 0.1, 0], [0.1, 0.1, 0]], shape0=[0, 2, 0, 2]
         )
-        self.assertEqual(np.count_nonzero(patches.view.weight.numpy()), 2)
+        self.assertEqual(np.count_nonzero(patches.view.weight.numpy()), 1)
         self.assertEqual(len(np.unique(patches.current.owner.numpy()[:4])), 1)
         self.assertAlmostEqual(float(patches.view.weight.numpy().sum()), 1.0)
 
@@ -526,12 +498,12 @@ class TestFrictionPatchHistory(unittest.TestCase):
         state.body_q.assign([wp.transform(wp.vec3(0.001, 0, 0), wp.quat_identity()), wp.transform_identity()])
         patches.build(model, state, contacts)
         active = patches.current.valid.numpy() != 0
-        np.testing.assert_allclose(patches.view.point.numpy()[active], patches.current.center.numpy()[active])
         np.testing.assert_allclose(np.linalg.norm(patches.view.phi.numpy()[active], axis=1), 0.001, atol=1.0e-7)
         self.assertTrue(np.all(patches.current.source.numpy()[active] >= 0))
 
-    def test_contact_migration_transports_twist_to_new_lever_arms(self):
-        """Preserve a region's twist rather than copying error from old lever arms."""
+    def test_contact_migration_carries_the_region_twist(self):
+        """Carry a region's twist as its spin row's displacement, not as error at old lever arms, through contacts that
+        move: the anchor at the footprint's centre has no translation, and the twist stays the turned angle."""
         points = np.array([[-0.1, 0, 0], [0.1, 0, 0]], dtype=np.float32)
         model, state, contacts, patches = _patch_fixture(points)
         store_frame(patches, state)
@@ -539,15 +511,19 @@ class TestFrictionPatchHistory(unittest.TestCase):
         state.body_q.assign([wp.transform(wp.vec3(0), rotation), wp.transform_identity()])
         contacts.rigid_contact_point0.assign([wp.quat_rotate(wp.quat_inverse(rotation), wp.vec3(*p)) for p in points])
         patches.build(model, state, contacts)
-        before = patches.view.phi.numpy()[:2].copy()
-        self.assertGreater(np.linalg.norm(before), 0.001)
+        carrier = np.flatnonzero(patches.view.weight.numpy()[:2] > 0.0)
+        np.testing.assert_array_equal(carrier, [1])
+        twist = float(patches.view.spin_phi.numpy()[1])
+        self.assertAlmostEqual(abs(twist), 0.01, delta=1.0e-5)
+        np.testing.assert_allclose(patches.view.phi.numpy()[1], 0.0, atol=1.0e-7)
         store_frame(patches, state)
         points *= 0.8
         contacts.rigid_contact_point0.assign([wp.quat_rotate(wp.quat_inverse(rotation), wp.vec3(*p)) for p in points])
         contacts.rigid_contact_point1.assign(points)
         patches.build(model, state, contacts)
-        np.testing.assert_allclose(patches.view.phi.numpy()[:2], 0.8 * before, atol=1.0e-7)
-        self.assertTrue((patches.current.source.numpy()[:2] >= 0).all())
+        self.assertAlmostEqual(float(patches.view.spin_phi.numpy()[1]), twist, delta=1.0e-7)
+        np.testing.assert_allclose(patches.view.phi.numpy()[1], 0.0, atol=1.0e-7)
+        self.assertGreaterEqual(int(patches.current.source.numpy()[1]), 0)
 
     def test_coincident_contacts_use_one_anchor(self):
         """Reject duplicate witnesses that would create two coincident friction constraints."""
@@ -558,22 +534,22 @@ class TestFrictionPatchHistory(unittest.TestCase):
     def test_warmstart_uses_patch_load_when_anchor_normal_is_unloaded(self):
         """Keep a cached tangent supported when other normals carry the load."""
         model, state, contacts, patches = _patch_fixture([[-0.1, 0, 0], [0, 0, 0], [0.1, 0, 0]])
-        patches.current.tangent_impulse.assign([[0.8, 0, 0], [0, 0, 0], [0.8, 0, 0]] + [[0, 0, 0]] * 5)
+        patches.current.tangent_impulse.assign([[0, 0, 0], [0, 0, 0], [0.8, 0, 0]] + [[0, 0, 0]] * 5)
         store_frame(patches, state)
         patches.build(model, state, contacts)
-        slots = wp.array([0, 3, 4], dtype=int, device="cpu")
+        # The region's last contact carries its anchor: a normal, the pair and the spin row of the line's footprint.
+        slots = wp.array([0, 1, 2], dtype=int, device="cpu")
         worlds = wp.zeros(3, dtype=int, device="cpu")
         paths = wp.zeros(3, dtype=int, device="cpu")
-        lengths = wp.array([3, 1, 3], dtype=int, device="cpu")
-        parents = wp.array([[-1, 0, 0, -1, -1, 4, 4]], dtype=int, device="cpu")
-        mu = wp.array([[0.5] * 7], dtype=float, device="cpu")
-        impulses = wp.array([[0, 0, 0, 4, 0, 0, 0]], dtype=float, device="cpu")
+        lengths = wp.array([1, 1, 4], dtype=int, device="cpu")
+        parents = wp.array([[-1, -1, -1, 2, 2, 2]], dtype=int, device="cpu")
+        mu = wp.array([[0.5] * 6], dtype=float, device="cpu")
+        impulses = wp.array([[0, 4, 0, 0, 0, 0]], dtype=float, device="cpu")
         routes = patch_routes([(0, parents, mu, impulses, 1.0, row_lines(parents.device))])
         patches.link(worlds, slots, paths, lengths, routes)
         patches.seed(state, worlds, slots, paths, lengths, routes)
         result = impulses.numpy()[0]
-        self.assertAlmostEqual(float(np.linalg.norm(result[1:3])), 0.8)
-        self.assertAlmostEqual(float(np.linalg.norm(result[5:7])), 0.8)
+        self.assertAlmostEqual(float(np.linalg.norm(result[3:5])), 0.8)
 
     def test_seed_keeps_matched_warmstart_without_patch_history(self):
         """Keep the contact-matched friction warm start on an anchor that has no patch history yet."""
@@ -636,8 +612,8 @@ class TestFrictionPatchHistory(unittest.TestCase):
         model, state, contacts, patches = _patch_fixture([[-0.05, 0, 0], [0.05, 0, 0]])
         store_frame(patches, state)
         patches.build(model, state, contacts, friction_gap=-1.0)
-        self.assertEqual(int(patches.current.valid.numpy().sum()), 2)
-        self.assertTrue((patches.current.source.numpy()[:2] >= 0).all())
+        self.assertEqual(int(patches.current.valid.numpy().sum()), 1)
+        self.assertTrue((patches.current.source.numpy()[:2] >= 0).any())
         self.assertEqual(float(patches.view.weight.numpy().max()), 0.0)
         patches.previous.valid.zero_()
         patches.build(model, state, contacts, friction_gap=-1.0)
@@ -842,26 +818,16 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         self.assertLess(float(np.max(np.linalg.norm(velocities[:, :3], axis=1))), 0.05)
         self.assertGreater(np.count_nonzero(solver.laws.friction_patches.previous.valid.numpy()), 0)
 
-    def test_resting_cubes_keep_their_anchor_corners(self):
-        """Keep each resting cube's friction anchors on the same corners, so roundoff cannot kick it.
+    def test_resting_boxes_keep_their_anchor_carrier(self):
+        """Keep each resting cube's and box's region anchor on the same carrier, so roundoff cannot kick it.
 
-        The worlds sit 1.5 m to 80 m from the origin, where float32 contact
-        centres carry 1e-7 m to 8e-6 m of quantization, with the cubes square
-        to the world axes or yawed. At 8 iterations every swap of a cube's
-        anchor diagonal kicks it by milliradians per second.
+        The worlds sit 1.5 m to 80 m from the origin, where float32 contact centres carry 1e-7 m to 8e-6 m of
+        quantization, with the boxes square to the world axes or yawed. At 8 iterations a carrier that moves between
+        steps kicks a box by milliradians per second.
         """
-        self._check_resting_anchor_corners(0.05)
-
-    def test_resting_boxes_keep_their_edge_carriers(self):
-        """Carry each resting box's support-edge rows on the same corners, so roundoff cannot kick it.
-
-        The two corners of each short edge tie along the principal axis up to
-        roundoff, which grows with the distance from the origin. The edge
-        midpoints stay the anchor locations; at 8 iterations moving the rows
-        between the tied corners, or the anchor between the midpoint and a
-        corner, kicks the box by milliradians per second.
-        """
-        self._check_resting_anchor_corners(0.075)
+        for half_width in (0.05, 0.075):
+            with self.subTest(half_width=half_width):
+                self._check_resting_anchor_corners(half_width)
 
     def _check_resting_anchor_corners(self, half_width):
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
@@ -872,8 +838,8 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 for world, held in enumerate(zip(*corners[30:], strict=True)):
                     with self.subTest(world=world):
                         pairs = set(held)
-                        self.assertEqual(len(pairs), 1, f"anchor corners changed between steps: {sorted(pairs)}")
-                        self.assertEqual(len(next(iter(pairs))), 2)
+                        self.assertEqual(len(pairs), 1, f"anchor carriers changed between steps: {sorted(pairs)}")
+                        self.assertEqual(len(next(iter(pairs))), 1)
                 self.assertLess(float(np.abs(np.array(spin[60:])).max()), 1.0e-3)
 
     def _rest_box(self, half_width, spacing, yaw, device):
@@ -937,7 +903,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             with self.subTest(spacing=spacing, heading=heading):
                 yaw_rate, deceleration, weights, ordered = self._slide_box(heading, spacing, device)
                 # Each sliding box keeps its two edge anchors, so patch friction carries the load.
-                self.assertEqual(weights, {(0.5, 0.5)})
+                self.assertEqual(weights, {(1.0,)})
                 self.assertLess(yaw_rate, 5.0e-3, f"row slots kept contact order in {ordered:.0%} of world steps")
                 np.testing.assert_allclose(deceleration, 0.5 * 9.81, rtol=1.0e-3)
 
@@ -1019,7 +985,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 self.assertEqual(solver.laws.friction_anchors_enabled, enabled)
                 if enabled:
                     self.assertAlmostEqual(solver.laws.friction_anchor_beta, 0.2)
-                    self.assertEqual(np.count_nonzero(solver.laws.friction_patches.current.source.numpy() >= 0), 2)
+                    self.assertEqual(np.count_nonzero(solver.laws.friction_patches.current.source.numpy() >= 0), 1)
                 else:
                     self.assertFalse(hasattr(solver.laws.friction_patches, "current"))
 
@@ -1038,7 +1004,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         s0, s1 = model.state(), model.state()
         pipeline.collide(s0, contacts)
         solver.step(s0, s1, model.control(), contacts, 0.005)
-        self.assertEqual(np.count_nonzero(solver.laws.friction_patches.previous.valid.numpy()), 2)
+        self.assertEqual(np.count_nonzero(solver.laws.friction_patches.previous.valid.numpy()), 1)
         rotation = wp.quat_from_axis_angle(wp.vec3(0, 1, 0), -np.pi / 60.0)
         translation = wp.vec3(-0.1, 0, 0) - wp.quat_rotate(rotation, wp.vec3(-0.1, 0, -0.1))
         transform = np.array([*translation, *rotation], dtype=np.float32)
@@ -1048,8 +1014,8 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         solver.step(s1, s0, model.control(), contacts, 0.005)
         patches = solver.laws.friction_patches
         active = patches.view.weight.numpy() > 0
-        self.assertEqual(np.count_nonzero(active), 2)
-        np.testing.assert_allclose(patches.current.anchor_a.numpy()[active, 0], -0.1, atol=1.0e-6)
+        self.assertEqual(np.count_nonzero(active), 1)
+        np.testing.assert_allclose(patches.current.anchor_a.numpy()[active, 0], -0.1, atol=1.0e-5)
 
     def test_contact_churn_reports_linear_force_but_not_a_wrench(self):
         """Compare the linear export with solved rows under an off-centre load after churn."""
@@ -1119,8 +1085,8 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         pipeline.collide(s1, contacts)
         patches.build(model, s1, contacts)
         active = patches.current.valid.numpy() != 0
-        self.assertEqual(np.count_nonzero(active), 2)
-        np.testing.assert_array_equal(patches.current.source.numpy()[active], [-1, -1])
+        self.assertEqual(np.count_nonzero(active), 1)
+        np.testing.assert_array_equal(patches.current.source.numpy()[active], [-1])
         local_x = patches.current.anchor_a.numpy()[active, 0]
         self.assertTrue(np.all(local_x >= 0.89), "friction still acts on the removed x=-0.1..0.1 footprint")
 
@@ -1368,7 +1334,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             normals = int(np.count_nonzero(rows == PGS_CONSTRAINT_TYPE_CONTACT))
             friction = int(np.count_nonzero(rows == PGS_CONSTRAINT_TYPE_FRICTION))
             self.assertEqual(normals, 4)
-            self.assertEqual(friction, 4)
+            self.assertEqual(friction, 2)
 
     def test_contact_forces_report_per_row_normal_load(self):
         """Report each contact's own normal force so a resting box's contact forces sum to its weight."""

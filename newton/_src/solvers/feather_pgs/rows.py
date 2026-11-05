@@ -366,6 +366,12 @@ class RowLaws:
         a length), combined per contact as the friction coefficient is (:func:`.contact_laws.contact_friction`)."""
         self.contact_torsion_enabled = bool(options.contact_torsion)
         self.torsion_rows = int(self.contact_torsion_enabled)
+        # Spin rows appear on a contact whose region has a footprint (patch friction is one wrench a region,
+        # core-docs/WRENCH/VERDICT.md) or under contact torsion on every friction contact: the sweeps then read each
+        # contact's rows from the data (a pair, or a pair and a spin row).
+        self.spin_rows = self.contact_torsion_enabled or (
+            bool(self.friction_anchors_enabled) and bool(options.enable_contact_friction)
+        )
         if self.contact_torsion_enabled:
             if not options.enable_contact_friction:
                 raise ValueError(

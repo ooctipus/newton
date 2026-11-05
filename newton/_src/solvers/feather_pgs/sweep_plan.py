@@ -53,6 +53,7 @@ from .solve_policy import SolvePolicy, SolveReadoutRecord
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport, row_supports
 from .step_plan import first_failed
+from .sweep import FRICTION_METRIC_FLOATS
 from .sweep_levels import (
     _get_build_independent_sparse_contact_groups_kernel,
     _get_mark_independent_sparse_contact_candidates_kernel,
@@ -75,6 +76,11 @@ SPARSE_CONTACT_RECORDS = FieldGroup(
     Field("sparse_contact_records", wp.float32, ("world", "triplet", "record"), owner="placement")
 )
 """The single-stage transaction's per-triplet block records (``sparse_contact.CONTACT_RECORD_FLOATS``)."""
+
+FRICTION_METRIC = FieldGroup(Field("friction_metric", wp.float32, ("world", "contact", "metric"), owner="placement"))
+"""Where spin rows may appear, each friction triple's metric, formed once per launch by the sweeps that visit a triple's
+rows one by one, the matrix-free, the sparse-diagonal and the paired factor sweeps (:func:`.sweep.friction_metric_stage`):
+a slot per four rows of the row store's line, a triple's rows."""
 
 
 __all__ = ["Sweep"]
@@ -330,6 +336,7 @@ class Sweep:
         self.sparse_contact_triplets_reason = "Native sparse factors are not selected."
         # The admitted contact units' block records.
         self.placement.sparse_contact_records = None
+        self.placement.friction_metric = None
         self.placement.sparse_max_row_support = None
         # Case K1, a single tree.
         velocity_candidate = self.options.enable_joint_velocity_limits and not self.forest.has_free_rigid_bodies
@@ -446,7 +453,7 @@ class Sweep:
             int(max_support),
             velocity_limits=velocity_candidate,
             linked_rows=self.laws.friction_anchors_enabled,
-            torsion=self.laws.contact_torsion_enabled,
+            torsion=self.laws.spin_rows,
         )
         # Patch friction keeps the packed lanes of small worlds, so size them from the
         # full sweep before the active-row scan claims whole warps.
@@ -537,9 +544,10 @@ class Sweep:
             self.placement.sparse_row_support = row_supports(
                 support_classes, self.forest.world_count, self.placement.dense_max_constraints, model.device
             )
-        if contact_triplets:
+        if contact_triplets or self.laws.spin_rows:
             # Static storage for graph capture: the builder writes the block records of each step's
-            # contact units; linked sweeps add each anchor's ring members once per call.
+            # contact units, every friction triple's metric among them where spin rows may appear; linked sweeps add
+            # each anchor's ring members once per call.
             width = CONTACT_RECORD_FLOATS + (CONTACT_RING_FLOATS if self.laws.friction_anchors_enabled else 0)
             self.placement.arrays.allocate(
                 SPARSE_CONTACT_RECORDS, world=self.forest.world_count, triplet=triplet_capacity, record=width
@@ -556,7 +564,7 @@ class Sweep:
             world_dof=self.forest.max_world_dofs,
         )
         # Contact torsion: each friction contact's spin row is the fourth of its unit.
-        torsion = {"torsion": True} if self.laws.contact_torsion_enabled else {}
+        torsion = {"torsion": True} if self.laws.spin_rows else {}
         self.sparse_kernel = self.kernel(
             "sparse_pgs",
             sweep_routes_sparse.sparse_kernel,
@@ -599,7 +607,7 @@ class Sweep:
         parent = tuple(int(p) for p, _ in table)
         first = (*(int(f) for _, f in table), int(size))
         node = tuple(int(k) for k in factor.sparse_pattern.inverse_permutation)
-        torsion = bool(self.laws.contact_torsion_enabled)
+        torsion = bool(self.laws.spin_rows)
         self.support_lanes = walk_rows.SUPPORT_UNIT_LANES if wp.get_device(model.device).is_cuda else 1
         self.support_units_kernel = walk_rows.support_units_kernel(4 if torsion else 3, self.support_lanes)
         self.support_rows = walk_rows.support_rows_kernel(
@@ -642,7 +650,9 @@ class Sweep:
             sink.records = records if records is not None else placement.sparse_row_factor
             self._support_sink = sink
             worlds, capacity = sink.entries.shape[0], sink.entries.shape[1]
-            self.support_units = walk_rows.unit_list(worlds, capacity, self.model.device)
+            self.support_units = walk_rows.unit_list(
+                worlds, capacity, self.model.device, spin_rows=bool(self.laws.spin_rows)
+            )
             self.support_threads = walk_rows.support_threads(worlds * capacity, self.model.device)
         return self._support_sink
 
@@ -971,7 +981,7 @@ class Sweep:
                 independent_components=self.paired_components is not None,
                 contact_units=self.factor_coordinate_contact_units,
                 weighted=self.laws.set.weighted,
-                torsion=self.laws.contact_torsion_enabled,
+                torsion=self.laws.spin_rows,
                 pitch=self.placement.row_pitch,
             )
             if self.paired_factor_coordinates
@@ -986,7 +996,7 @@ class Sweep:
                 self.placement.sparse_diagonal_response_size,
                 device_arch,
                 units=self.placement.sparse_diagonal_contact_units,
-                torsion=self.laws.contact_torsion_enabled,
+                torsion=self.laws.spin_rows,
             )
             if sparse_contact_schedule
             else None
@@ -998,7 +1008,7 @@ class Sweep:
                 device_arch,
                 build_serial_contacts=self.placement.sparse_diagonal_speculative_contact_batches,
                 units=self.placement.sparse_diagonal_contact_units,
-                torsion=self.laws.contact_torsion_enabled,
+                torsion=self.laws.spin_rows,
             )
             if sparse_contact_schedule
             else None
@@ -1015,11 +1025,21 @@ class Sweep:
                 speculative_contact_batches=self.placement.sparse_diagonal_speculative_contact_batches,
                 contact_units=self.placement.sparse_diagonal_contact_units,
                 weighted=self.laws.set.weighted,
-                torsion=self.laws.contact_torsion_enabled,
+                torsion=self.laws.spin_rows,
             )
             if self.placement.sparse_diagonal_contact_solve
             else None
         )
+        row_by_row = self.sparse_diagonal_kernel is not None or self.paired_factor_kernel is not None
+        if self.laws.spin_rows and (self.placement.mf_sweeps or row_by_row):
+            # Static storage for graph capture: the friction triples' metrics, formed per launch by the sweeps that
+            # visit a triple's rows one by one (sweep.friction_metric_stage).
+            self.placement.arrays.allocate(
+                FRICTION_METRIC,
+                world=self.forest.world_count,
+                contact=(self.placement.row_pitch + 3) // 4,
+                metric=FRICTION_METRIC_FLOATS,
+            )
         self.mf_gs_kernel = None
         # The colored mapping of the matrix-free sweep and its units, when a world can take it.
         self.mf_colored_kernel = None
@@ -1074,7 +1094,7 @@ class Sweep:
                 "pitch": self.placement.row_pitch,
                 "has_dense_velocity_limit_rows": self.options.enable_joint_velocity_limits,
                 "places": storage.places,
-                "contact_torsion": self.laws.contact_torsion_enabled,
+                "contact_torsion": self.laws.spin_rows,
                 "factor_coordinates": self.paired_factor_coordinates,
                 "skip_tier_rows": parallel_rows,
                 "independent_components": self.paired_components is not None,
@@ -1103,7 +1123,7 @@ class Sweep:
                     model.device,
                     worlds=capable,
                     rule=rule,
-                    torsion=self.laws.contact_torsion_enabled,
+                    torsion=self.laws.spin_rows,
                 )
                 self.mf_colored_kernel = self.kernel(
                     "mf_colored",
@@ -1150,7 +1170,7 @@ class Sweep:
                         pitch=self.placement.row_pitch,
                         # A tier walks its own list of worlds where the plan keeps one.
                         queued=self.tier_worlds is not None,
-                        **({"torsion": True} if self.laws.contact_torsion_enabled else {}),
+                        **({"torsion": True} if self.laws.spin_rows else {}),
                     )
                     # On its own list, a tier takes a block a world of the list's capacity (its work's shape).
                     grid = shape(dataclasses.replace(tier.work, items=self.forest.world_count), device(model.device))
@@ -1300,6 +1320,7 @@ class Sweep:
             "regularize": int(self.laws.set.weighted),
             "iterations": self.options.pgs_iterations,
             "omega": self.options.pgs_omega,
+            "friction_metric": placement.friction_metric,
             "v_hat": v_hat,
             "v_out": v_out,
         }

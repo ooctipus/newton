@@ -397,17 +397,29 @@ class TestQ06RegionWrench(unittest.TestCase):
                 expected, _theta, _stop = refs.patch_slide_spin(half_x, half_y, 1.0, 0.0, 0.5)
                 self.assertAlmostEqual(x, expected, delta=0.03 * expected)
 
-    @known_failure("PH4", "two anchors at the footprint's extremes hold 1.85x a flat patch's spin capacity")
-    def test_spin_capacity(self):
-        """A spinning patch sweeps the yaw quadrature gives."""
+    def _yaw_errors(self, cases, tolerance):
         wrong = {}
         for half_x, half_y in ((0.05, 0.05), (0.15, 0.05)):
-            for speed, spin in ((0.0, 30.0), (0.3, 30.0), (1.0, 10.0)):
+            for speed, spin in cases:
                 _x, yaw = self._spin_slide(half_x, half_y, speed, spin)
                 _distance, expected, _stop = refs.patch_slide_spin(half_x, half_y, speed, spin, 0.5)
-                if abs(yaw - expected) > 0.05 * abs(expected):
+                if abs(yaw - expected) > tolerance * abs(expected):
                     wrong[half_x, speed] = (math.degrees(yaw), math.degrees(expected))
-        self.assertEqual(wrong, {})
+        return wrong
+
+    def test_spin_capacity(self):
+        """A spinning patch sweeps the yaw quadrature gives: the region's one wrench holds its spin on the footprint's
+        arm (``mu_t = 0.94 mu`` times the hull's radius of gyration), within 5%."""
+        self.assertEqual(self._yaw_errors(((0.0, 30.0), (0.3, 30.0)), 0.05), {})
+
+    @known_failure(
+        LIMIT,
+        "the region's ball over-holds mixed slide and spin: the exact limit surface lies 7-11% inside it between 30 "
+        "and 60 degrees (core-docs/WRENCH/VERDICT.md L2), so a fast slide sheds its spin early (8-18% less yaw)",
+    )
+    def test_mixed_slide_spin(self):
+        """A patch sliding fast while it spins sweeps the yaw quadrature gives, within 5%."""
+        self.assertEqual(self._yaw_errors(((1.0, 10.0),), 0.05), {})
 
 
 class TestQ07Rolling(unittest.TestCase):
@@ -1062,16 +1074,18 @@ def _tangent_basis(n):
 
 @dataclasses.dataclass(frozen=True)
 class FrictionUnit:
-    """The friction rows one law writes: a contact's under point friction, a patch anchor's under patch friction.
+    """The friction rows one law writes: a contact's under point friction, a region's anchor under patch friction.
 
     ``carrier`` is the contact that holds the rows (its normal gives the tangent pair), ``members`` the contacts whose
-    normal impulses pool into the unit's capacity, ``share`` its part of that pool, and ``point`` [m] where its tangent
-    rows act, ``None`` for the carrier's own contact point."""
+    normal impulses pool into the unit's capacity, ``share`` its part of that pool, ``point`` [m] where its tangent
+    rows act, ``None`` for the carrier's own contact point, and ``arm`` [m] its region's spin arm: a region with a
+    footprint (a positive arm) holds a spin row of coefficient ``mu arm``."""
 
     carrier: int
     members: tuple
     share: float = 1.0
     point: tuple | None = None
+    arm: float = 0.0
 
 
 def point_units(count):
@@ -1080,18 +1094,19 @@ def point_units(count):
 
 
 def patch_units(solver, count):
-    """Patch friction's units on the step ``solver`` took (its patch view): each anchor at its friction location, on its
-    weight's share of its region's pooled normal impulse."""
+    """Patch friction's units on the step ``solver`` took (its patch view): each region's anchor at its friction
+    location, on its region's pooled normal impulse, with its region's spin arm."""
     view = solver.laws.friction_patches.view
     weight, ring = view.weight.numpy()[:count], view.next_contact.numpy()[:count]
     location = view.point.numpy()[:count].astype(np.float64)
+    arm = view.spin_arm.numpy()[:count].astype(np.float64)
     units = []
     for c in np.flatnonzero(weight > 0.0):
         members, m = [int(c)], ring[c]
         while m >= 0 and m != c:
             members.append(int(m))
             m = ring[m]
-        units.append(FrictionUnit(int(c), tuple(members), float(weight[c]), tuple(location[c])))
+        units.append(FrictionUnit(int(c), tuple(members), float(weight[c]), tuple(location[c]), float(arm[c])))
     return units
 
 
@@ -1109,12 +1124,13 @@ class Manufactured:
 
     The rows are the law's (:mod:`newton._src.solvers.feather_pgs.contact_laws`). A contact's normal row acts at its one
     contact point, the midpoint of its surface points. A friction unit (:class:`FrictionUnit`) is a tangent pair, with
-    contact torsion also a spin row ``n . (w_a - w_b)``, on the elliptic cone ``|(t1 / mu, t2 / mu, s / mu_t)| <= share
-    load``, and slides with maximal dissipation, ``f = -share load D^2 u / |D u|`` for ``D = diag(mu, mu, mu_t)``:
+    contact torsion or a region's footprint also a spin row ``n . (w_a - w_b)``, on the elliptic cone ``|(t1 / mu, t2 /
+    mu, s / mu_t)| <= share load``, and slides with maximal dissipation, ``f = -share load D^2 u / |D u|`` for ``D =
+    diag(mu, mu, mu_t)``:
 
     - point friction: one unit per contact, at its contact point, on its own load (:func:`point_units`);
-    - patch friction: one unit per anchor, at its region's friction location, on an equal share of the region's pooled
-      load (:func:`patch_units`). Regions and locations are the law's geometry and are read from the step; the rows on
+    - patch friction: one unit per region, at its friction location, on its region's pooled load, with ``mu_t = mu
+      arm`` (:func:`patch_units`). Regions and locations are the law's geometry and are read from the step; the rows on
       them, the pooled cone and the solution are the reference's own.
 
     ``J`` and ``M`` come from Newton's public :func:`newton.eval_jacobian` and :func:`newton.eval_mass_matrix`, ``b``
@@ -1244,21 +1260,25 @@ class Manufactured:
         return relative, phi
 
     def _unit_rows(self, unit):
-        """A unit's rows: its tangent pair at its point, and its spin row under contact torsion."""
+        """A unit's rows: its tangent pair at its point, and its spin row where its region has a footprint or under
+        contact torsion."""
         c = unit.carrier
         n = self.normal[c]
         t0, t1 = _tangent_basis(n)
         point = self.points[c] if unit.point is None else np.asarray(unit.point, dtype=np.float64)
         relative = self._point_rows(self.body_a[c], point) - self._point_rows(self.body_b[c], point)
         rows = [t0 @ relative, t1 @ relative]
-        if self.spin:
+        if self.spin or unit.arm > 0.0:
             rows.append(n @ (self._spin_rows(self.body_a[c]) - self._spin_rows(self.body_b[c])))
         return np.stack(rows)
 
     def _scale(self, k):
-        """Unit ``k``'s cone scale ``D``: ``mu`` on the tangent pair, ``mu_t`` on the spin row."""
-        c = self.units[k].carrier
-        return np.array([self.mu[c], self.mu[c], self.mu_t[c]][: len(self.rows[k])])
+        """Unit ``k``'s cone scale ``D``: ``mu`` on the tangent pair, ``mu_t`` on the spin row: the larger of the
+        region's ``mu arm`` and, under contact torsion, the authored torsional coefficient."""
+        unit = self.units[k]
+        c = unit.carrier
+        mu_t = max(self.mu_t[c] if self.spin else 0.0, self.mu[c] * unit.arm)
+        return np.array([self.mu[c], self.mu[c], mu_t][: len(self.rows[k])])
 
     def _slides(self, k):
         """Whether unit ``k`` slides: its carrier's status, or its own draw where the carrier is separated."""

@@ -3,25 +3,21 @@
 
 """Solver-owned friction regions, independent of collision contact identities.
 
-Normal contacts are never reduced here. Each compatible region selects up to two
-friction locations, with an equal share of the region's total normal impulse.
-Locations average the support edges along the footprint's principal extent,
-avoiding a diagonal friction couple on symmetric narrow footprints; each edge's
-last member in contact order carries its friction rows. Isotropic footprints
-retain a canonical farthest pair because they have no unique axis; member spans
-and contact order choose it, so float32 roundoff in world coordinates cannot
-swap it between steps. Both choices are canonical relative to contact order: a
-collision pipeline that reorders a pair's contacts between steps moves an edge's
-rows to another member, and can swap an isotropic pair, whose locations are its
-members' contact centres.
+Normal contacts are never reduced here. A region is one friction wrench (core-docs/WRENCH/VERDICT.md): one anchor, a
+tangent pair and a spin row on the ball ``|(t1 / mu, t2 / mu, s / mu_t)| <= lambda_n`` of the region's pooled normal
+impulse, with ``mu_t = mu rho`` and ``rho`` 0.94 times the polar radius of gyration of the members' convex hull (a
+uniform patch's mean radius). The anchor sits at the region's centre of pressure, carried from the last solve, or at
+the hull's centroid; the region's last eligible member in contact order carries its rows, so a Gauss-Seidel sweep
+reaches them after every normal of the region. A one-contact region has no footprint: its friction is a pair, and a
+spin row only under contact torsion, with the authored torsional coefficient (:func:`patch_spin_rows`).
 Regions require matching friction materials, nearly aligned normals, nearby
 contact planes, and connected shape bounding spheres on each body. The latter
 is a conservative test across convex seams, not an exact surface-connectivity
 query. Length tolerances scale with the smaller body's bounding radius; angular
 tolerance is about six degrees. Normals remain individual unilateral rows.
 
-Tangential displacement and impulses persist across frames; friction locations
-follow the current contact region. Displacement accumulates incremental rigid
+Tangential and twist displacement and impulses persist across frames; friction
+locations follow the current contact region. Displacement accumulates incremental rigid
 motion at those locations, using the pose increment's SE(3) logarithm rather
 than a rotating material point's chord. Saved poses also capture externally
 imposed motion and position-only solver passes. Pair identity and geometric
@@ -83,22 +79,14 @@ _BUILD_BLOCK_DIM = 32
 _BUILD_BLOCKS_PER_SM = 8
 # The patch extent: the slots to visit, then the live sort's extent (live_sort.publish_sort_extent).
 _SORT_EXTENT = wp.constant(1)
-# Contact centres carry the narrow phase's float32 world-space quantization. On
-# a resting 0.1 m cube it reads as a relative anisotropy of the footprint's
-# second moments of up to 1.2e-6 at 1.5 m from the origin, 9.5e-6 at 10 m and
-# 5.4e-5 at 80 m. Second moments and squared member spans that differ by less
-# than this fraction count as equal, and members within this fraction of the
-# footprint's extent of a support edge belong to it, so roundoff neither gives
-# an isotropic footprint an axis, chooses between equally distant members, nor
-# splits an edge. The anisotropy grows as the footprint shrinks: one-ulp moves
-# of every corner of a square of half-width h reach 2 ulp(|x|) / h, so the
-# fraction covers squares wider than about 3 cm at 80 m from the origin and
-# 6 cm at 190 m, and narrower ones nearer to it.
-_FOOTPRINT_TOLERANCE = wp.constant(1.0e-3)
 # Contact paths 0 and 1 hold dense and matrix-free rows, and -1 holds none.
 # CONTACT_PATH_RESOLVED marks a contact without rows in a world the resolved-world classifier
 # skipped, where the complete path would have reserved them: its patch anchor releases.
 CONTACT_PATH_RESOLVED = wp.constant(-2)
+# A region's spin arm over the polar radius of gyration of its contacts' hull: the mean radius of a convex patch under
+# uniform pressure over its gyration radius is 0.937 on a square, 0.943 on a disc and 0.866 on a line, and 0.94 holds
+# every convex footprint within 4% of quadrature (core-docs/WRENCH/VERDICT.md section 6).
+_SPIN_ARM = wp.constant(0.94)
 # The contact generation no frame has: a recorded frame with it never matches.
 _FRAME_SENTINEL = wp.constant(wp.int64(GENERATION_SENTINEL))
 # Modes of _prepare_frame, the host's admission of a frame-reusing build: the
@@ -118,6 +106,8 @@ class FrictionPatches:
     next_contact: wp.array[int]
     point: wp.array[wp.vec3]
     phi: wp.array[wp.vec2]
+    spin_arm: wp.array[float]
+    spin_phi: wp.array[float]
 
 
 PATCH_ROW_LAW = (
@@ -156,9 +146,32 @@ def patch_friction_location(patches: FrictionPatches, c: int):
 
 @wp.func
 def patch_tangent_row(law: PatchRowLaw, c: int, row: int):
-    """Return contact ``c``'s tangent row ``row`` (1 or 2): its phi and beta. Its coefficient stays the undivided
-    ``mu``; the patch link divides it among the ring's anchors."""
+    """Return contact ``c``'s tangent row ``row`` (1 or 2): its phi and beta. Its coefficient is the contact's ``mu``,
+    whole: a region has one anchor."""
     return law.patches.phi[c][row - 1], law.beta
+
+
+@wp.func
+def patch_spin_rows(patches: FrictionPatches, c: int, torsion: int):
+    """Return the spin rows (0 or 1) of contact ``c``'s friction: one where its region has a footprint (a positive spin
+    arm) or contact ``torsion`` gives every friction contact one, none on a one-contact region otherwise."""
+    spin = torsion
+    if patches.enabled != 0 and patches.spin_arm[c] > 0.0:
+        spin = 1
+    return spin
+
+
+@wp.func
+def patch_spin_row(law: PatchRowLaw, c: int, mu: float, authored: float):
+    """Return contact ``c``'s spin row law: its phi (the region's twist displacement), beta and coefficient ``mu_t``,
+    the friction coefficient ``mu`` times the region's spin arm, or the ``authored`` torsional coefficient where that
+    is larger (contact torsion; 0 without it)."""
+    phi = float(0.0)
+    arm = float(0.0)
+    if law.patches.enabled != 0:
+        phi = law.patches.spin_phi[c]
+        arm = law.patches.spin_arm[c]
+    return phi, law.beta, wp.max(authored, mu * arm)
 
 
 @wp.struct
@@ -188,6 +201,9 @@ class _PatchFrame:
     members: wp.array[int]
     support_gap_limit: wp.array[float]
     tangent_impulse: wp.array[wp.vec3]
+    pressure: wp.array[wp.vec3]
+    pressured: wp.array[int]
+    twist: wp.array[float]
 
 
 @wp.func
@@ -273,9 +289,11 @@ def _prepare_contact_fields(c: int, live: int, inputs: _PatchContacts, frame: _P
     frame.source[c] = -1
     frame.eligible[c] = 0
     frame.tangent_impulse[c] = wp.vec3(0.0)
+    frame.pressured[c] = 0
     patches.weight[c] = 0.0
     patches.next_contact[c] = -1
     patches.phi[c] = wp.vec2(0.0)
+    patches.spin_phi[c] = 0.0
     if c >= live:
         return wp.int64(0x7FFFFFFFFFFFFFFF)
     sa = inputs.shape0[c]
@@ -543,6 +561,19 @@ def _pose_motion(q: wp.array[wp.transform], previous_q: wp.array[wp.transform], 
 
 
 @wp.func
+def _pose_twist(q: wp.array[wp.transform], previous_q: wp.array[wp.transform], body: int, normal: wp.vec3):
+    """The pose increment's rotation about ``normal``: a body's twist since the stored pose, as the carried spin
+    displacement reads it."""
+    twist = float(0.0)
+    if body >= 0:
+        rotation = wp.transform_get_rotation(q[body]) * wp.quat_inverse(wp.transform_get_rotation(previous_q[body]))
+        if rotation[3] < 0.0:
+            rotation = -rotation
+        twist = 2.0 * wp.dot(wp.vec3(rotation[0], rotation[1], rotation[2]), normal)
+    return twist
+
+
+@wp.func
 def _carried_displacement(q: wp.array[wp.transform], prev: _PatchFrame, p: int, normal: wp.vec3):
     """Rotate stored spring displacement into the current tangent plane."""
     a = prev.body_a[p]
@@ -559,6 +590,113 @@ def _carried_displacement(q: wp.array[wp.transform], prev: _PatchFrame, p: int, 
         cross_error = wp.cross(axis, error)
         error += cross_error + wp.cross(axis, cross_error) / (1.0 + cosine)
     return error
+
+
+@wp.func
+def _footprint_point(frame: _PatchFrame, c: int, origin: wp.vec3, t0: wp.vec3, t1: wp.vec3):
+    """Member ``c``'s contact centre in the region's tangent plane, relative to ``origin``."""
+    d = frame.center[c] - origin
+    return wp.dot(d, t0), wp.dot(d, t1)
+
+
+@wp.func
+def _region_footprint(
+    frame: _PatchFrame,
+    member_start: int,
+    member_stop: int,
+    carry_only: int,
+    origin: wp.vec3,
+    t0: wp.vec3,
+    t1: wp.vec3,
+):
+    """The region's footprint in its tangent plane: the centroid of its members' convex hull relative to ``origin``,
+    and its spin arm, :data:`_SPIN_ARM` times the hull's polar radius of gyration (core-docs/WRENCH/VERDICT.md U6).
+
+    The hull is gift-wrapped over the members, and its moments accumulate over a triangle fan from the first hull
+    vertex, so nothing is stored. A hull of no area is a line: its arm is a uniform segment's. Returns ``(x, y, arm)``;
+    a region of one point has arm 0.
+    """
+    count = int(0)
+    sum_x = float(0.0)
+    sum_y = float(0.0)
+    sum_rr = float(0.0)
+    start_x = float(1.0e30)
+    start_y = float(1.0e30)
+    for j in range(member_start, member_stop):
+        c = frame.members[j]
+        if carry_only != 0 or frame.eligible[c] != 0:
+            x, y = _footprint_point(frame, c, origin, t0, t1)
+            count += 1
+            sum_x += x
+            sum_y += y
+            sum_rr += x * x + y * y
+            if x < start_x or (x == start_x and y < start_y):
+                start_x = x
+                start_y = y
+    mean_x = sum_x / float(wp.max(count, 1))
+    mean_y = sum_y / float(wp.max(count, 1))
+    spread = wp.max(sum_rr / float(wp.max(count, 1)) - mean_x * mean_x - mean_y * mean_y, 0.0)
+    if count < 2 or spread <= 0.0:
+        return mean_x, mean_y, 0.0
+    tolerance = 1.0e-10 * spread
+    x_now = start_x
+    y_now = start_y
+    area = float(0.0)
+    moment_x = float(0.0)
+    moment_y = float(0.0)
+    polar = float(0.0)
+    perimeter = float(0.0)
+    far_x = float(0.0)
+    far_y = float(0.0)
+    far = float(0.0)
+    for _step in range(count + 1):
+        # The next hull vertex: the member every other lies left of (the farther one on a tie).
+        best_x = float(0.0)
+        best_y = float(0.0)
+        found = int(0)
+        for j in range(member_start, member_stop):
+            c = frame.members[j]
+            if carry_only != 0 or frame.eligible[c] != 0:
+                x, y = _footprint_point(frame, c, origin, t0, t1)
+                x -= x_now
+                y -= y_now
+                length = x * x + y * y
+                if length > tolerance:
+                    cross = best_x * y - best_y * x
+                    if found == 0 or cross < 0.0 or (cross == 0.0 and length > best_x * best_x + best_y * best_y):
+                        best_x = x
+                        best_y = y
+                        found = 1
+        if found == 0:
+            break
+        next_x = x_now + best_x
+        next_y = y_now + best_y
+        perimeter += wp.sqrt(best_x * best_x + best_y * best_y)
+        ax = x_now - start_x
+        ay = y_now - start_y
+        bx = next_x - start_x
+        by = next_y - start_y
+        triangle = 0.5 * (ax * by - ay * bx)
+        area += triangle
+        moment_x += triangle * (ax + bx) / 3.0
+        moment_y += triangle * (ay + by) / 3.0
+        polar += triangle * (ax * ax + ay * ay + bx * bx + by * by + ax * bx + ay * by) / 6.0
+        if bx * bx + by * by > far:
+            far = bx * bx + by * by
+            far_x = bx
+            far_y = by
+        x_now = next_x
+        y_now = next_y
+        if bx * bx + by * by <= tolerance:
+            break
+    span = 0.5 * perimeter
+    if wp.abs(area) <= 1.0e-6 * span * span:
+        # A line: the walk goes out and back.
+        return start_x + 0.5 * far_x, start_y + 0.5 * far_y, _SPIN_ARM * span / wp.sqrt(12.0)
+    centre_x = moment_x / area
+    centre_y = moment_y / area
+    gyration = wp.max(polar / area - centre_x * centre_x - centre_y * centre_y, 0.0)
+    return start_x + centre_x, start_y + centre_y, _SPIN_ARM * wp.sqrt(gyration)
 
 
 @wp.func
@@ -653,17 +791,10 @@ def _build_pair(
             # filtered step does not forget the accumulated positional correction.
             carry_only = int(1)
             first = seed
-        # The canonical farthest pair: the member farthest from the first
-        # eligible one, then the member farthest from that. Member spans and
-        # contact order define it, so neither roundoff in world coordinates nor
-        # the footprint's pose can swap its diagonal; reordering the contacts
-        # can. A choice independent of contact order kicked resting boxes whose
-        # contacts were reordered every step harder (measured).
-        reference = first
-        separation = float(0.0)
+        # One anchor per region, at its footprint's hull centroid at the members' mean height, whose rows the last
+        # eligible member in contact order carries: a Gauss-Seidel sweep reaches them after every normal row of the
+        # region, and contact order alone picks the member.
         member_start = member_stop
-        # Preserve sorted contact order for footprint sums and tie breaking.
-        # The collision list follows flood order and must remain unchanged.
         for j in range(index, stop):
             c = frame.indices[j]
             if frame.owner[c] != seed:
@@ -671,264 +802,171 @@ def _build_pair(
             frame.members[member_stop] = c
             member_stop += 1
             if carry_only != 0 or frame.eligible[c] != 0:
-                distance = wp.length_sq(frame.center[c] - frame.center[reference])
-                if distance > separation * (1.0 + _FOOTPRINT_TOLERANCE):
-                    separation = distance
-                    first = c
-        anchors = int(1)
-        if separation > 1.0e-8 * frame.radius[seed] * frame.radius[seed]:
-            anchors = 2
-        else:
-            first = reference
-        second = first
-        location0 = frame.center[first]
-        location1 = location0
-        if anchors == 2:
-            # Use the footprint's principal extent, averaging its support edges.
-            # Picking opposite corners of a narrow rectangle introduces an
-            # artificial diagonal friction couple even when the footprint is symmetric.
-            origin = location0
-            t0, t1 = contact_tangent_basis(frame.normal[seed])
-            # Accumulate moments in double precision: contact-order roundoff
-            # must not give an isotropic footprint a spurious principal axis.
-            # Raw moments also avoid a separate pass to compute the centroid.
-            sum_x = wp.float64(0.0)
-            sum_y = wp.float64(0.0)
-            sum_xx = wp.float64(0.0)
-            sum_xy = wp.float64(0.0)
-            sum_yy = wp.float64(0.0)
-            members = int(0)
-            reach = float(0.0)
-            for j in range(member_start, member_stop):
-                c = frame.members[j]
-                if carry_only != 0 or frame.eligible[c] != 0:
-                    offset = frame.center[c] - origin
-                    distance = wp.length_sq(offset)
-                    if distance > reach * (1.0 + _FOOTPRINT_TOLERANCE):
-                        reach = distance
-                        second = c
-                    x = wp.float64(wp.dot(offset, t0))
-                    y = wp.float64(wp.dot(offset, t1))
-                    sum_x += x
-                    sum_y += y
-                    sum_xx += x * x
-                    sum_xy += x * y
-                    sum_yy += y * y
-                    members += 1
-            location1 = frame.center[second]
-            member_count = wp.float64(members)
-            xx = float(sum_xx - sum_x * sum_x / member_count)
-            xy = float(sum_xy - sum_x * sum_y / member_count)
-            yy = float(sum_yy - sum_y * sum_y / member_count)
-            spread = wp.sqrt((xx - yy) * (xx - yy) + 4.0 * xy * xy)
-            # An isotropic footprint has no distinguished axis; retain its
-            # canonical farthest pair instead of amplifying roundoff. Carry-only
-            # regions keep that pair too.
-            if carry_only == 0 and spread > _FOOTPRINT_TOLERANCE * (xx + yy):
-                largest = 0.5 * (xx + yy + spread)
-                axis2 = wp.vec2(xy, largest - xx)
-                if xx >= yy:
-                    axis2 = wp.vec2(largest - yy, xy)
-                axis2 = wp.normalize(axis2)
-                axis = axis2[0] * t0 + axis2[1] * t1
-                low = float(1.0e30)
-                high = float(-1.0e30)
-                for j in range(member_start, member_stop):
-                    c = frame.members[j]
-                    if frame.eligible[c] != 0:
-                        projection = wp.dot(frame.center[c] - origin, axis)
-                        low = wp.min(low, projection)
-                        high = wp.max(high, projection)
-                sum0 = wp.vec3d(0.0)
-                sum1 = wp.vec3d(0.0)
-                count0 = int(0)
-                count1 = int(0)
-                # Tied corners differ along the axis by the quantization of
-                # world coordinates and by the axis tilt it causes, which
-                # outgrow a fixed fraction of the body radius a few meters
-                # from the origin.
-                edge_tolerance = wp.max(1.0e-5 * frame.radius[seed], _FOOTPRINT_TOLERANCE * (high - low))
-                for j in range(member_start, member_stop):
-                    c = frame.members[j]
-                    if frame.eligible[c] != 0:
-                        point = frame.center[c]
-                        offset = point - origin
-                        projection = wp.dot(offset, axis)
-                        precise_point = wp.vec3d(wp.float64(point[0]), wp.float64(point[1]), wp.float64(point[2]))
-                        # Each edge's last member in contact order carries its
-                        # rows, not the strict extreme, which roundoff picks
-                        # among tied corners. Where rows follow contact order, a
-                        # Gauss-Seidel sweep reaches the anchor's friction rows
-                        # after every normal row of its edge; the first member
-                        # splits them, and the fixed lag in the anchors' pooled
-                        # budgets yaws sliding boxes at low iteration counts.
-                        if projection <= low + edge_tolerance:
-                            first = c
-                            sum0 += precise_point
-                            count0 += 1
-                        if projection >= high - edge_tolerance:
-                            second = c
-                            sum1 += precise_point
-                            count1 += 1
-                # Preserve constant coordinates and single-point edges exactly;
-                # avoid subtracting and adding the origin around their average.
-                mean0 = sum0 / wp.float64(count0)
-                mean1 = sum1 / wp.float64(count1)
-                location0 = wp.vec3(float(mean0[0]), float(mean0[1]), float(mean0[2]))
-                location1 = wp.vec3(float(mean1[0]), float(mean1[1]), float(mean1[2]))
-        for aidx in range(anchors):
-            c = first
-            if aidx == 1:
-                c = second
-            location = location0
-            if aidx == 1:
-                location = location1
-            a = frame.body_a[c]
-            b = frame.body_b[c]
-            n = frame.normal[c]
-            r = frame.radius[c]
-            surface_a = frame.surface_a[c]
-            surface_b = frame.surface_b[c]
-            current_gap = _surface_gap(q, a, surface_a, b, surface_b, n)
-            chosen = int(-1)
-            nearest = float(1.0e30)
-            motion = wp.vec3(0.0)
-            if prev_start < prev_stop:
-                motion = _pose_motion(q, previous_q, a, location) - _pose_motion(q, previous_q, b, location)
-            for j in range(prev_start, prev_anchor_stop):
-                p = prev.members[j]
-                if (
-                    prev.valid[p] == 0
-                    or prev.used[p] != 0
-                    or prev.mu[p][0] != frame.mu[c][0]
-                    or prev.mu[p][1] != frame.mu[c][1]
-                ):
-                    continue
-                old_n = prev.normal[p]
-                if a >= 0:
-                    old_n = wp.transform_vector(q[a], old_n)
-                # Reject incompatible normals and positions before transporting
-                # the spring or evaluating support witnesses. These are the same
-                # gates as below, ordered to avoid work for rejected history.
-                if not (wp.dot(old_n, n) >= 0.995):
-                    continue
-                pa = _world_point(q, a, prev.anchor_a[p])
-                pb = _world_point(q, b, prev.anchor_b[p])
-                offset = 0.5 * (pa + pb) - location
-                distance = wp.length_sq(offset)
-                if not (
-                    distance < nearest
-                    and distance <= 4.0 * r * r
-                    and wp.abs(_surface_gap(q, a, prev.anchor_a[p], b, prev.anchor_b[p], n)) <= 0.1 * r
-                    and wp.abs(wp.dot(offset, n)) <= 0.05 * r
-                ):
-                    continue
-                # Honor the existing contact envelope: a zero-gap test drops
-                # valid speculative contacts during a squeeze. Surface
-                # witnesses retain penetration during decompression and
-                # reject rocking beyond the same envelope as fresh contacts.
-                support_gap = _surface_gap(q, a, prev.surface_a[p], b, prev.surface_b[p], n)
-                if not (support_gap <= wp.max(current_gap, frame.support_gap_limit[c]) + 1.0e-5 * r):
-                    continue
-                error = _carried_displacement(q, prev, p, n)
-                error += motion
-                tangent_delta = error - n * wp.dot(error, n)
-                # The tangential gate bounds uncorrected slip of a carried pair at a
-                # tenth of the smaller body's radius, about three times the measured
-                # Baumgarte equilibrium separation of a held box at 60 Hz. Tighter
-                # gates re-anchor below that equilibrium and turn the correction
-                # into creep; genuine sliding is released by ``finish_patch_impulses``.
-                if not (wp.length_sq(tangent_delta) <= 0.01 * r * r):
-                    continue
-                connected = _geometry_adjacent(
-                    prev.shape_a[p], prev.shape_b[p], frame.shape_a[c], frame.shape_b[c], shape_transform, shape_radius
-                )
-                if not connected:
-                    for k in range(member_start, member_stop):
-                        member = frame.members[k]
-                        if _geometry_adjacent(
-                            prev.shape_a[p],
-                            prev.shape_b[p],
-                            frame.shape_a[member],
-                            frame.shape_b[member],
-                            shape_transform,
-                            shape_radius,
-                        ):
-                            connected = True
-                            break
-                if connected:
-                    chosen = p
-                    nearest = distance
-            pa = location
-            anchor_a = _local_point(q, a, pa)
-            anchor_b = _local_point(q, b, pa)
-            carried_impulse = wp.vec3(0.0)
-            error = wp.vec3(0.0)
-            if chosen >= 0:
-                prev.used[chosen] = 1
-                error = _carried_displacement(q, prev, chosen, n)
-                old_center = 0.5 * (
-                    _world_point(q, a, prev.anchor_a[chosen]) + _world_point(q, b, prev.anchor_b[chosen])
-                )
-                # The two spring samples describe a planar rigid displacement:
-                # translation plus twist. Evaluate that field at the new points
-                # instead of transferring old lever-arm errors independently.
-                # A one-point region carries translation only.
-                for j in range(prev_start, prev_anchor_stop):
-                    partner = prev.members[j]
-                    if partner != chosen and prev.valid[partner] != 0 and prev.owner[partner] == prev.owner[chosen]:
-                        other_normal = prev.normal[partner]
-                        if a >= 0:
-                            other_normal = wp.transform_vector(q[a], other_normal)
-                        other_gap = _surface_gap(q, a, prev.surface_a[partner], b, prev.surface_b[partner], n)
-                        if (
-                            wp.dot(other_normal, n) < 0.995
-                            or other_gap > wp.max(current_gap, frame.support_gap_limit[c]) + 1.0e-5 * r
-                        ):
-                            break
-                        other_center = 0.5 * (
-                            _world_point(q, a, prev.anchor_a[partner]) + _world_point(q, b, prev.anchor_b[partner])
-                        )
-                        span = other_center - old_center
-                        span -= n * wp.dot(span, n)
-                        span_sq = wp.length_sq(span)
-                        if span_sq > 1.0e-8 * r * r:
-                            other_error = _carried_displacement(q, prev, partner, n)
-                            spin = wp.dot(other_error - error, wp.cross(n, span)) / span_sq
-                            error = 0.5 * (error + other_error) + spin * wp.cross(
-                                n, pa - 0.5 * (old_center + other_center)
-                            )
-                        break
-                error += motion
-                error -= n * wp.dot(error, n)
-                carried_impulse = prev.tangent_impulse[chosen]
-            stored_error = error
-            if a >= 0:
-                stored_error = wp.transform_vector(wp.transform_inverse(q[a]), error)
-            frame.displacement[c] = stored_error
-            frame.source[c] = chosen
-            if carry_only != 0 and chosen < 0:
-                # Filtered members only carry existing history; they never start
-                # it, because no friction row held the pair during this step.
+                first = c
+        normal = frame.normal[seed]
+        plane_t0, plane_t1 = contact_tangent_basis(normal)
+        origin = frame.center[first]
+        foot_x, foot_y, spin_arm = _region_footprint(
+            frame, member_start, member_stop, carry_only, origin, plane_t0, plane_t1
+        )
+        height = float(0.0)
+        height_count = int(0)
+        for j in range(member_start, member_stop):
+            c = frame.members[j]
+            if carry_only != 0 or frame.eligible[c] != 0:
+                height += wp.dot(frame.center[c] - origin, normal)
+                height_count += 1
+        location = origin + foot_x * plane_t0 + foot_y * plane_t1 + normal * (height / float(wp.max(height_count, 1)))
+        c = first
+        a = frame.body_a[c]
+        b = frame.body_b[c]
+        n = frame.normal[c]
+        r = frame.radius[c]
+        surface_a = frame.surface_a[c]
+        surface_b = frame.surface_b[c]
+        current_gap = _surface_gap(q, a, surface_a, b, surface_b, n)
+        chosen = int(-1)
+        nearest = float(1.0e30)
+        motion = wp.vec3(0.0)
+        if prev_start < prev_stop:
+            motion = _pose_motion(q, previous_q, a, location) - _pose_motion(q, previous_q, b, location)
+        for j in range(prev_start, prev_anchor_stop):
+            p = prev.members[j]
+            if (
+                prev.valid[p] == 0
+                or prev.used[p] != 0
+                or prev.mu[p][0] != frame.mu[c][0]
+                or prev.mu[p][1] != frame.mu[c][1]
+            ):
                 continue
-            frame.anchor_a[c] = anchor_a
-            frame.anchor_b[c] = anchor_b
-            frame.surface_a[c] = surface_a
-            frame.surface_b[c] = surface_b
-            # Default for anchors without friction rows this step; solved rows
-            # overwrite it in ``finish_patch_impulses``.
-            frame.tangent_impulse[c] = carried_impulse
-            frame.valid[c] = 1
-            patches.weight[c] = 1.0 / float(anchors)
-            if carry_only != 0:
-                patches.weight[c] = 0.0
-            if frame.flipped[c] != 0:
-                n = -n
-            patches.point[c] = pa
-            t0, t1 = contact_tangent_basis(n)
-            if frame.flipped[c] != 0:
-                error = -error
-            patches.phi[c] = wp.vec2(wp.dot(t0, error), wp.dot(t1, error))
+            old_n = prev.normal[p]
+            if a >= 0:
+                old_n = wp.transform_vector(q[a], old_n)
+            # Reject incompatible normals and positions before transporting
+            # the spring or evaluating support witnesses. These are the same
+            # gates as below, ordered to avoid work for rejected history.
+            if not (wp.dot(old_n, n) >= 0.995):
+                continue
+            pa = _world_point(q, a, prev.anchor_a[p])
+            pb = _world_point(q, b, prev.anchor_b[p])
+            offset = 0.5 * (pa + pb) - location
+            distance = wp.length_sq(offset)
+            if not (
+                distance < nearest
+                and distance <= 4.0 * r * r
+                and wp.abs(_surface_gap(q, a, prev.anchor_a[p], b, prev.anchor_b[p], n)) <= 0.1 * r
+                and wp.abs(wp.dot(offset, n)) <= 0.05 * r
+            ):
+                continue
+            # Honor the existing contact envelope: a zero-gap test drops
+            # valid speculative contacts during a squeeze. Surface
+            # witnesses retain penetration during decompression and
+            # reject rocking beyond the same envelope as fresh contacts.
+            support_gap = _surface_gap(q, a, prev.surface_a[p], b, prev.surface_b[p], n)
+            if not (support_gap <= wp.max(current_gap, frame.support_gap_limit[c]) + 1.0e-5 * r):
+                continue
+            error = _carried_displacement(q, prev, p, n)
+            error += motion
+            tangent_delta = error - n * wp.dot(error, n)
+            # The tangential gate bounds uncorrected slip of a carried pair at a
+            # tenth of the smaller body's radius, about three times the measured
+            # Baumgarte equilibrium separation of a held box at 60 Hz. Tighter
+            # gates re-anchor below that equilibrium and turn the correction
+            # into creep; genuine sliding is released by ``finish_patch_impulses``.
+            if not (wp.length_sq(tangent_delta) <= 0.01 * r * r):
+                continue
+            connected = _geometry_adjacent(
+                prev.shape_a[p], prev.shape_b[p], frame.shape_a[c], frame.shape_b[c], shape_transform, shape_radius
+            )
+            if not connected:
+                for k in range(member_start, member_stop):
+                    member = frame.members[k]
+                    if _geometry_adjacent(
+                        prev.shape_a[p],
+                        prev.shape_b[p],
+                        frame.shape_a[member],
+                        frame.shape_b[member],
+                        shape_transform,
+                        shape_radius,
+                    ):
+                        connected = True
+                        break
+            if connected:
+                chosen = p
+                nearest = distance
+        pa = location
+        # The anchor sits at the region's centre of pressure, carried from the last solve: the nearest stored one of
+        # this pair, sliding or stuck, since the anchor may have released.
+        nearest_pressure = float(1.0e30)
+        shift = wp.vec3(0.0)
+        for j in range(prev_start, prev_stop):
+            p = prev.indices[j]
+            if prev.pressured[p] != 0:
+                candidate = _world_point(q, a, prev.pressure[p]) - location
+                candidate -= n * wp.dot(candidate, n)
+                if wp.length_sq(candidate) < nearest_pressure:
+                    nearest_pressure = wp.length_sq(candidate)
+                    shift = candidate
+        if nearest_pressure < 1.0e29:
+            # A stale centre stays on the footprint: no further along its direction than the footprint's support.
+            shift_length = wp.length(shift)
+            if shift_length > 0.0:
+                direction = shift / shift_length
+                support = float(0.0)
+                for j in range(member_start, member_stop):
+                    member = frame.members[j]
+                    if carry_only != 0 or frame.eligible[member] != 0:
+                        support = wp.max(support, wp.dot(frame.center[member] - location, direction))
+                if shift_length > support:
+                    shift = direction * support
+            pa = location + shift
+            if chosen >= 0:
+                motion = _pose_motion(q, previous_q, a, pa) - _pose_motion(q, previous_q, b, pa)
+        anchor_a = _local_point(q, a, pa)
+        anchor_b = _local_point(q, b, pa)
+        carried_impulse = wp.vec3(0.0)
+        error = wp.vec3(0.0)
+        if chosen >= 0:
+            prev.used[chosen] = 1
+            error = _carried_displacement(q, prev, chosen, n)
+            error += motion
+            error -= n * wp.dot(error, n)
+            carried_impulse = prev.tangent_impulse[chosen]
+        stored_error = error
+        if a >= 0:
+            stored_error = wp.transform_vector(wp.transform_inverse(q[a]), error)
+        frame.displacement[c] = stored_error
+        # The twist displacement: the spin the anchor has turned through since it stuck, its spin row's phi.
+        twist = float(0.0)
+        if chosen >= 0:
+            twist = prev.twist[chosen] + _pose_twist(q, previous_q, a, n) - _pose_twist(q, previous_q, b, n)
+        frame.twist[c] = twist
+        frame.source[c] = chosen
+        if carry_only != 0 and chosen < 0:
+            # Filtered members only carry existing history; they never start
+            # it, because no friction row held the pair during this step.
+            continue
+        frame.anchor_a[c] = anchor_a
+        frame.anchor_b[c] = anchor_b
+        frame.pressure[c] = anchor_a
+        frame.surface_a[c] = surface_a
+        frame.surface_b[c] = surface_b
+        # Default for anchors without friction rows this step; solved rows
+        # overwrite it in ``finish_patch_impulses``.
+        frame.tangent_impulse[c] = carried_impulse
+        frame.valid[c] = 1
+        patches.weight[c] = 1.0
+        patches.spin_arm[c] = spin_arm
+        if carry_only != 0:
+            patches.weight[c] = 0.0
+        if frame.flipped[c] != 0:
+            n = -n
+        patches.point[c] = pa
+        t0, t1 = contact_tangent_basis(n)
+        if frame.flipped[c] != 0:
+            error = -error
+        patches.phi[c] = wp.vec2(wp.dot(t0, error), wp.dot(t1, error))
+        patches.spin_phi[c] = twist
 
 
 @wp.kernel(enable_backward=False)
@@ -976,6 +1014,10 @@ def _store_contact(
     prev.indices[c] = frame.indices[c]
     prev.valid[c] = frame.valid[c]
     previous_world[c] = -1
+    # The centre of pressure of the last solve, in body a's frame, sliding or stuck: the next build's anchor.
+    prev.pressured[c] = frame.pressured[c]
+    if frame.pressured[c] != 0:
+        prev.pressure[c] = frame.pressure[c]
     if frame.valid[c] == 0:
         return
     normal = frame.normal[c]
@@ -994,6 +1036,7 @@ def _store_contact(
     prev.surface_a[c] = frame.surface_a[c]
     prev.surface_b[c] = frame.surface_b[c]
     prev.tangent_impulse[c] = frame.tangent_impulse[c]
+    prev.twist[c] = frame.twist[c]
     world = int(-1)
     if frame.body_a[c] >= 0:
         world = body_world[frame.body_a[c]]
@@ -1014,6 +1057,7 @@ def _store_contact(
 def _invalidate_geometry_history(prev: _PatchFrame, bodies: wp.array[int], shapes: wp.array[int]):
     """Discard material points whose supporting geometry changed."""
     c = wp.tid()
+    prev.pressured[c] = 0
     if prev.valid[c] == 0:
         return
     changed = bool(False)
@@ -1106,6 +1150,8 @@ class _FrictionPatchState:
             self.view.weight = wp.zeros(0, dtype=float, device=device)
             self.view.next_contact = wp.zeros(0, dtype=int, device=device)
             self.view.point = wp.zeros(0, dtype=wp.vec3, device=device)
+            self.view.spin_arm = wp.zeros(0, dtype=float, device=device)
+            self.view.spin_phi = wp.zeros(0, dtype=float, device=device)
             return
         self.device = device
         # The pair sort skips the key bits no pair key can set.
@@ -1132,6 +1178,8 @@ class _FrictionPatchState:
                 ContactField("weight", wp.float32),
                 ContactField("next_contact", wp.int32, -1),
                 ContactField("point", wp.vec3),
+                ContactField("spin_arm", wp.float32),
+                ContactField("spin_phi", wp.float32),
             ),
             on_rows=self._on_view_rows,
         )
@@ -1292,6 +1340,7 @@ class _FrictionPatchState:
             ContactField("mu", wp.vec2),
             ContactField("radius", wp.float32),
             ContactField("support_gap_limit", wp.float32),
+            ContactField("twist", wp.float32),
         ]
         fields += [
             ContactField(name, wp.vec3)
@@ -1304,6 +1353,7 @@ class _FrictionPatchState:
                 "surface_a",
                 "surface_b",
                 "tangent_impulse",
+                "pressure",
             )
         ]
         fields += [
@@ -1320,6 +1370,7 @@ class _FrictionPatchState:
                 "source",
                 "eligible",
                 "members",
+                "pressured",
             )
         ]
         if stored:
@@ -1605,6 +1656,7 @@ class _FrictionPatchState:
                 path,
                 slots_needed,
                 routes,
+                self.view,
                 dt,
                 self.threads,
                 self.current,
@@ -1623,7 +1675,14 @@ class _FrictionPatchState:
         self.pool.launch(
             _reset_history,
             self.threads,
-            inputs=[world_mask, self.stored, self.threads, self.previous_world, self.previous.valid],
+            inputs=[
+                world_mask,
+                self.stored,
+                self.threads,
+                self.previous_world,
+                self.previous.valid,
+                self.previous.pressured,
+            ],
             extent=self.stored,
             clamp=True,
         )
@@ -1745,42 +1804,25 @@ def _link_contact(
     world: wp.array[int],
     slot: wp.array[int],
     path: wp.array[int],
-    slots_needed: wp.array[int],
     route: int,
     parents: wp.array2d[int],
-    mu: wp.array2d[float],
     first: wp.array[int],
 ):
-    """Link only allocated rows and divide the Coulomb budget among surviving anchors.
+    """Link contact ``c``'s normal row into its region's ring: its parent is the next member's row on the route.
 
-    Row builders write the unscaled friction coefficient; linking divides it by
-    the number of anchors that actually received rows, so the pooled normal load
-    is shared exactly once.
+    A region has one anchor, so its friction rows' coefficients are whole: the pooled normal load of the ring bounds
+    them once.
     """
     row = patches.next_contact[c]
     if row < 0:
         return
-    if row == c:
-        # A one-contact region's normal row closes its own ring, and its budget
-        # stays whole: the general path divides it by one anchor or not at all.
-        parents[first[world[c]], slot[c]] = slot[c]
-        return
     next_slot = slot[c]
-    anchors = int(patches.weight[c] > 0.0 and slots_needed[c] >= 3)
     while row != c:
         if slot[row] >= 0 and path[row] == route and world[row] == world[c]:
-            if next_slot == slot[c]:
-                next_slot = slot[row]
-            if patches.weight[row] > 0.0 and slots_needed[row] >= 3:
-                anchors += 1
-            if patches.weight[c] == 0.0:
-                break
+            next_slot = slot[row]
+            break
         row = patches.next_contact[row]
     parents[first[world[c]], slot[c]] = next_slot
-    if patches.weight[c] > 0.0 and slots_needed[c] >= 3 and anchors > 0:
-        # The pair's and, with contact torsion, the spin row's coefficients: the region's capacity is shared once.
-        for t in range(1, slots_needed[c]):
-            mu[first[world[c]], slot[c] + t] /= float(anchors)
 
 
 @wp.kernel(enable_backward=False)
@@ -1804,9 +1846,8 @@ def link_patch_routes(
         route = _contact_route(routes, slot, path, c)
         if route >= 0:
             parents = _route_parents(routes, route)
-            mu = _route_mu(routes, route)
             first = _route_first(routes, route)
-            _link_contact(c, patches, world, slot, path, slots_needed, route, parents, mu, first)
+            _link_contact(c, patches, world, slot, path, route, parents, first)
 
 
 @wp.func
@@ -1891,12 +1932,14 @@ def _point_velocity(
 def _finish_contact(
     c: int,
     frame: _PatchFrame,
+    patches: FrictionPatches,
     q: wp.array[wp.transform],
     q_out: wp.array[wp.transform],
     qd_out: wp.array[wp.spatial_vector],
     com: wp.array[wp.vec3],
     world: wp.array[int],
     slot: wp.array[int],
+    path: wp.array[int],
     slots_needed: wp.array[int],
     parents: wp.array2d[int],
     mu: wp.array2d[float],
@@ -1930,6 +1973,24 @@ def _finish_contact(
     stored = tangent
     a = frame.body_a[c]
     b = frame.body_b[c]
+    # The moment of the normal impulses is determinate even where they are not: the ring's centre of pressure, where
+    # the next build places the anchor.
+    moment = wp.vec3(0.0)
+    moment_load = float(0.0)
+    member = c
+    hop = int(0)
+    while hop < parents.shape[1]:
+        if slot[member] >= 0 and path[member] == path[c] and world[member] == world[c]:
+            weight = wp.max(impulses[w, slot[member]], 0.0)
+            moment += weight * frame.center[member]
+            moment_load += weight
+        member = patches.next_contact[member]
+        hop += 1
+        if member == c or member < 0:
+            break
+    if moment_load > 0.0:
+        frame.pressure[c] = _local_point(q, a, moment / moment_load)
+        frame.pressured[c] = 1
     if a >= 0:
         stored = wp.transform_vector(wp.transform_inverse(q[a]), tangent)
     frame.tangent_impulse[c] = stored
@@ -1937,10 +1998,28 @@ def _finish_contact(
     speed = _point_velocity(q_out, qd_out, com, a, frame.anchor_a[c]) - _point_velocity(
         q_out, qd_out, com, b, frame.anchor_b[c]
     )
-    # Check opposing tangential motion to distinguish slipping from impending slip.
-    if radius > 0.0 and wp.length(tangent) >= (1.0 - 1.0e-5) * radius:
-        if wp.dot(speed, tangent) < -radius * (1.0e-5 * frame.radius[c] / dt):
+    # Check opposing motion to distinguish slipping from impending slip. The anchor saturates on the ball of the pair
+    # and the spin row, not on the pair's disk; tangential slip releases it, and opposing spin its twist alone.
+    spin = float(0.0)
+    if slots_needed[c] > 3 and mu[w, s + 3] > 0.0:
+        spin = impulses[w, s + 3] / mu[w, s + 3]
+    tangent_load = float(0.0)
+    if mu[w, s + 1] > 0.0:
+        tangent_load = wp.length(tangent) / mu[w, s + 1]
+    used = wp.sqrt(tangent_load * tangent_load + spin * spin)
+    if radius > 0.0 and used >= (1.0 - 1.0e-5) * load:
+        if wp.dot(speed, tangent) < -wp.length(tangent) * (1.0e-5 * frame.radius[c] / dt):
             frame.valid[c] = 0
+        if spin != 0.0:
+            rate = float(0.0)
+            if a >= 0:
+                rate += wp.dot(wp.spatial_bottom(qd_out[a]), frame.normal[c])
+            if b >= 0:
+                rate -= wp.dot(wp.spatial_bottom(qd_out[b]), frame.normal[c])
+            if rate * spin < 0.0:
+                # The spin slips: the twist at the step's end is zero. The next build adds this step's turn from the
+                # stored pose, so the stored twist cancels it, as a released anchor carries no slip.
+                frame.twist[c] = _pose_twist(q_out, q, b, frame.normal[c]) - _pose_twist(q_out, q, a, frame.normal[c])
 
 
 @wp.kernel(enable_backward=False)
@@ -1956,6 +2035,7 @@ def _finish_and_store(
     path: wp.array[int],
     slots_needed: wp.array[int],
     routes: _PatchRoutes,
+    patches: FrictionPatches,
     dt: float,
     threads: int,
     frame: _PatchFrame,
@@ -1992,12 +2072,14 @@ def _finish_and_store(
                     _finish_contact(
                         c,
                         frame,
+                        patches,
                         q,
                         q_out,
                         qd_out,
                         com,
                         world,
                         slot,
+                        path,
                         slots_needed,
                         parents,
                         mu,
@@ -2015,6 +2097,7 @@ def _reset_history(
     threads: int,
     prev_world: wp.array[int],
     prev_valid: wp.array[int],
+    prev_pressured: wp.array[int],
 ):
     """Drop the stored anchors of reset worlds (all worlds for an empty mask).
 
@@ -2027,3 +2110,4 @@ def _reset_history(
             if w >= 0 and w < world_mask.shape[0] and not world_mask[w]:
                 continue
         prev_valid[c] = 0
+        prev_pressured[c] = 0

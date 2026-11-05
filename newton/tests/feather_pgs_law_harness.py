@@ -271,6 +271,8 @@ TWIN_TOLERANCES = {
     "friction_pair_from_metric": ("radius", 1.0e-5),
     "friction_ball": ("load", 1.0e-5),
     "friction_ball_from_metric": ("load", 1.0e-5),
+    "friction_triple": ("load", 1.0e-5),
+    "friction_triple_from_metric": ("load", 1.0e-5),
 }
 """Laws whose two renderings agree to their solve's tolerance rather than bitwise: ``(input that scales the
 results, or None for the largest result, bound)``. They test convergence and sticking against tolerances, and the
@@ -456,7 +458,7 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
         mu, mu_t, load = (rng.uniform(0.0, 1.5, n).astype(np.float32) for _ in range(3))
         mu[::7], mu_t[::5], load[::11] = 0.0, 0.0, 0.0
         return {"triple": rng.normal(size=(n, 3)).astype(np.float32), "mu": mu, "mu_t": mu_t, "load": load}
-    if name.startswith(("friction_ball", "jacobi_rotation")):
+    if name.startswith(("friction_ball", "friction_triple", "jacobi_rotation")):
         block = spd3(rng, n).astype(np.float64)
         mu = rng.uniform(0.0, 2.0, n)
         mu[::19] = 0.0
@@ -479,7 +481,7 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
             return {"matrix": block.astype(np.float32), "vectors": vectors.astype(np.float32), "p": p, "q": q}
         if name == "friction_ball_metric":
             return {"block": block.astype(np.float32), **{k: triple[k] for k in ("mu", "mu_t")}}
-        if name == "friction_ball":
+        if name in ("friction_ball", "friction_triple"):
             return {"block": block.astype(np.float32), **triple}
         # The block's metric (friction_ball_metric's decomposition, in float64).
         scaled = block * coefficients[:, :, None] * coefficients[:, None, :]

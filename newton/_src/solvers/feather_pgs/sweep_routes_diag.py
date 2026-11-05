@@ -27,6 +27,7 @@ from .kernel_template import KernelTemplate
 from .law_source import law_preludes
 from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import Lanes, SparsePairZ
+from .row_inputs import RowArgument
 from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound
 from .sweep import (
@@ -42,6 +43,9 @@ from .sweep import (
     change_vote,
     contact_unit,
     end_sweep,
+    friction_metric,
+    friction_metric_law,
+    friction_metric_stage,
     indent,
     material_arguments,
     row_visit,
@@ -163,26 +167,12 @@ class _UnitPairZ(UnitOperator, ReducedPairCoupling, SparsePairZ):
     (:func:`.walk_rows.slot_header`), so the lane that owns a coordinate holds all three rows' entries
     there: the unit reads the velocity there once (:meth:`unit_terms`) and writes it once (:meth:`unit_apply`). Its
     ladder reduces the pair's coupling too, and its rows vote on their reduced terms, as the rows' own visits do.
-    Under contact torsion (``spin``) the unit's fourth row is its spin row (``head + 3``), on the same coordinates.
     """
 
-    spin: bool = False
-
     def unit_terms(self, head: str, indent: str) -> str:
-        """Declare this lane's entries of the unit's rows (``unit_z0``..``unit_z2``, ``unit_z3`` of a spin row) and
-        the velocity on their coordinate (``unit_u``), then reduce the rows' velocity terms and the rows' couplings in
-        one ladder."""
-        lane, P, rows = self.lanes.lane, self.dofs, range(4 if self.spin else 3)
-        spin = (
-            (
-                "float unit_jv3 = unit_z3 * unit_u;",
-                "float gram_n3 = unit_z0 * unit_z3, unit_cross13 = unit_z1 * unit_z3, "
-                "unit_cross23 = unit_z2 * unit_z3;",
-            )
-            if self.spin
-            else ()
-        )
-        sums = ("unit_jv3", "gram_n3", "unit_cross13", "unit_cross23") if self.spin else ()
+        """Declare this lane's entries of the unit's rows (``unit_z0``..``unit_z2``) and the velocity on their
+        coordinate (``unit_u``), then reduce the rows' velocity terms and the pair's couplings in one ladder."""
+        lane, P, rows = self.lanes.lane, self.dofs, range(3)
         lines = [
             "int unit_coord = -1;",
             f"float {', '.join(f'unit_z{k} = 0.0f' for k in rows)};",
@@ -198,19 +188,15 @@ class _UnitPairZ(UnitOperator, ReducedPairCoupling, SparsePairZ):
             f"const float unit_u = unit_coord >= 0 ? {self.velocity.at('unit_coord')} : 0.0f;",
             "float unit_jv0 = unit_z0 * unit_u, unit_jv1 = unit_z1 * unit_u, unit_jv2 = unit_z2 * unit_u;",
             "float gram_n1 = unit_z0 * unit_z1, gram_n2 = unit_z0 * unit_z2, unit_cross = unit_z1 * unit_z2;",
-            *spin,
-            self.lanes.reduce("unit_jv0", "unit_jv1", "unit_jv2", "gram_n1", "gram_n2", "unit_cross", *sums),
+            self.lanes.reduce("unit_jv0", "unit_jv1", "unit_jv2", "gram_n1", "gram_n2", "unit_cross"),
         ]
         return "\n".join(indent + line for line in lines)
 
     def unit_apply(self, indent: str) -> str:
         """The unit's changes in one pass on this lane's coordinate; the lanes synchronize after it."""
         change = "(unit_z0 * unit_dn + unit_z1 * unit_dt1) + unit_z2 * unit_dt2"
-        moved = "unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f"
-        if self.spin:
-            change, moved = f"({change}) + unit_z3 * unit_ds", f"{moved} || unit_ds != 0.0f"
         lines = [
-            f"if (({moved}) && unit_coord >= 0)",
+            "if ((unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f) && unit_coord >= 0)",
             f"    {self.velocity.at('unit_coord')} = unit_u + ({change});",
             self.lanes.sync(),
         ]
@@ -245,8 +231,10 @@ def sparse_diagonal_source(
     ``speculative_contact_batches`` the coupled contacts come from the world's serial list, and a batch of them
     (one per segment of the warp) is tested first: a batch whose normals stay zero without load is skipped whole,
     otherwise the sweep enters the batch at its first active contact. Under contact ``torsion`` a friction contact's
-    spin row follows its pair (four rows: a triple's stride is four), solved with it. The dense articulation's change
-    goes to the step's one leave in the walk's coordinates (:func:`.factor.walk.walk_leave_kernel`).
+    spin row follows its pair (four rows: a triple's stride is four); such a contact declines the unit, and its pair's
+    visit solves the triple from its metric cached for the launch (:func:`.sweep.friction_metric_law`). The dense
+    articulation's change goes to the step's one leave in the walk's coordinates
+    (:func:`.factor.walk.walk_leave_kernel`).
 
     Returns the body and its staging.
     """
@@ -263,7 +251,8 @@ def sparse_diagonal_source(
     batch_contacts = 32 // batch_lanes
     serial_stride = M if contact_units else (M + 2) // 3
     scheduled = contact_triples or contact_units
-    # A friction contact's rows: its normal, its pair and, under torsion, its spin row.
+    # A point contact's rows in the triple schedules (point friction only, whose contacts all have or all lack a spin
+    # row): its normal, its pair and, under contact torsion, its spin row. Patch contact units read theirs (contact_rows).
     R = 4 if torsion else 3
 
     warp = Lanes(32)
@@ -293,6 +282,9 @@ def sparse_diagonal_source(
             # on the entries it kept (SparsePairZ.pair_entries).
             owned=False,
             friction=friction,
+            spin_row=lambda parent: rows.spin_of(parent, "row_count"),
+            # A friction triple reads its metric cached for the launch (sweep.friction_metric_law).
+            **({"triple_law": "ROW_TRIPLE(parent, "} if torsion else {}),
         )
 
     def visit(lanes: Lanes, pad: str, *, kind: int | None = None, parent: str | None = None) -> str:
@@ -316,30 +308,41 @@ def sparse_diagonal_source(
             )
         )
 
-    unit_op = _UnitPairZ(P, M, warp, diagonal=lambda row: "denom" if row == "i" else rows.diag(row), spin=torsion)
+    unit_op = _UnitPairZ(P, M, warp, diagonal=lambda row: "denom" if row == "i" else rows.diag(row))
+
+    def contact_rows(head: str) -> str:
+        """The rows of the friction contact headed by row ``head``: three, or four with a spin row (the data's,
+        :func:`.sweep.spin_row`)."""
+        return f"({rows.spin_of(head, 'row_count')} >= 0 ? 4 : 3)" if torsion else "3"
+
+    # A contact unit is a normal and its pair: a contact with a spin row declines it, and its rows take their visits,
+    # the triple from its cached metric.
     unit_rows = contact_unit(
         dataclasses.replace(context(warp), operator=unit_op),
-        laws,
-        rows="3",
+        dataclasses.replace(laws, torsion=False),
+        rows="unit_rows",
         declare=f"const int i = head + r;\nconst int row_type = r == 0 ? {CONTACT} : {FRICTION};\n"
         f"const float denom = {rows.diag('i')};",
         parent="head",
         check="denom",
         pad="    ",
     )
-    loaded = " || ".join(f"{rows.peek(row)} != 0.0f" for row in ("i", *(f"i + {r}" for r in range(1, R))))
+    loaded = " || ".join(f"{rows.peek(row)} != 0.0f" for row in ("i", "i + 1", "i + 2"))
 
     def coupled(condition: str, advance: str = "i") -> str:
-        """At row ``i``, when ``condition`` holds (``i`` heads a coupled contact unit with a pair) and the unit is
-        loaded, the unit on its Gram block in the warp's layout (:class:`_UnitPairZ`); the loop then moves ``advance``
-        past its rows. An unloaded unit falls through to the loop's row visits."""
-        text = f"""if ({condition}) {{
+        """At row ``i``, when ``condition`` holds (``i`` heads a coupled contact unit with a pair, and no spin row) and
+        the unit is loaded, the unit on its Gram block in the warp's layout (:class:`_UnitPairZ`); the loop then moves
+        ``advance`` past its rows. An unloaded unit, or a contact with a spin row, falls through to the loop's row
+        visits."""
+        spinless = f" && {rows.spin_of('i', 'row_count')} < 0" if torsion else ""
+        text = f"""if ({condition}{spinless}) {{
+    const int unit_rows = 3;
     if ({loaded}) {{
         const int head = i;
 {unit_op.unit_terms("head", "        ")}
 {indent(unit_rows, "    ")}
 {unit_op.unit_apply("        ")}
-        {advance} += {R - 1};
+        {advance} += unit_rows - 1;
         continue;
     }}
 }}"""
@@ -359,11 +362,16 @@ def sparse_diagonal_source(
 
     def inactive_pair(condition: str, advance: str) -> str:
         """Skip a contact's tangent rows (and spin row) when they hold nothing and its patch carries no load."""
-        empty = "".join(f"\n                && {rows.peek(f'i + {r}')} == 0.0f" for r in range(1, R))
+        empty = "".join(f"\n                && {rows.peek(f'i + {r}')} == 0.0f" for r in range(1, 3))
+        if torsion:
+            empty += f"\n                && (unit_rows < 4 || {rows.peek('i + 3')} == 0.0f)"
         return (
-            f"            if ({condition}{empty}) {{\n"
-            f"                const float patch_load = {indent(rows.ring_load('i'), '                ').lstrip()};\n"
-            f"                if (patch_load <= 0.0f) {advance} += {R - 1};\n"
+            f"            if ({condition}) {{\n"
+            f"                const int unit_rows = {contact_rows('i')};\n"
+            f"                if (true{empty}) {{\n"
+            f"                    const float patch_load = {indent(rows.ring_load('i'), '                    ').lstrip()};\n"
+            f"                    if (patch_load <= 0.0f) {advance} += unit_rows - 1;\n"
+            "                }\n"
             "            }"
         )
 
@@ -413,7 +421,10 @@ def sparse_diagonal_source(
             f"    [&](int patch_row) {{ return {rows.parent('patch_row', enclosed=True)}; }},\n"
             f"    [&](int r) {{ return {rows.peek('r')} > 0.0f; }})"
         )
-        tangents_zero = " && ".join(f"{rows.peek(f'candidate_normal + {r}')} == 0.0f" for r in range(1, R))
+        tangents_zero = " && ".join(f"{rows.peek(f'candidate_normal + {r}')} == 0.0f" for r in range(1, 3))
+        if torsion:
+            spin = rows.spin_of("candidate_normal", "row_count")
+            tangents_zero += f" && ({spin} < 0 || {rows.peek('candidate_normal + 3')} == 0.0f)"
         if contact_units:
             noop = f"""candidate_noop = old_impulse == 0.0f && new_impulse == 0.0f;
     // Only a unit with tangent rows reads them and its ring's load.
@@ -527,7 +538,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
                 unit_end = i + 1;
                 tangent_unit = -1;
                 if ({owns_tangents("i", " " * 20)}) {{
-                    unit_end = i + {R};
+                    unit_end = i + {contact_rows("i")};
                     tangent_unit = i;
                 }}
             }}
@@ -545,6 +556,22 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
         "    ? sqrtf(diagonal_inverse_mass.data[global_dof]) : 0.0f;"
     )
     sweep_end = end_sweep(solve_policy, iteration="iteration")
+    # Where spin rows may appear, every friction triple's metric is formed once per launch, at its first loaded visit
+    # (sweep.friction_metric_stage), and its later visits only project.
+    metric = ""
+    if torsion:
+        metric = (
+            friction_metric_stage(
+                *rows.scan(),
+                lambda row: rows.spin_of(row, "row_count"),
+                end="row_count",
+                record=friction_metric,
+                pad="    ",
+            )
+            + "\n"
+            + friction_metric_law("ROW_TRIPLE", friction_metric, "    ")
+            + "\n"
+        )
     # The phase bound is the raw slot watermark: consumers clamp it to the world's rows.
     contact_start = "min(dense_phase_bounds.data[world * 2 + 1], row_count)" if scheduled else "row_count"
     body = f"""    const int line = dense_first.data[world];
@@ -569,7 +596,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     for (int d = lane; d < {D}; d += 32) s_v[d] = 0.0f;
 {limit_loads}
     SYNC();
-
+{metric}
     for (int iteration = 0; iteration < iterations; ++iteration) {{
         int iteration_changed = 0;
 
@@ -647,7 +674,13 @@ def sparse_diagonal_kernel(
         + ("_torsion" if torsion else "")
         + solve_policy.suffix
     )
-    extra = (*weight_arguments(weighted), *material_arguments(material), *solve_policy.arguments)
+    extra = (
+        # Where spin rows may appear, every friction triple's metric (sweep.friction_metric_stage).
+        *((RowArgument("friction_metric", wp.array3d[float], after="omega"),) if torsion else ()),
+        *weight_arguments(weighted),
+        *material_arguments(material),
+        *solve_policy.arguments,
+    )
     return KernelTemplate(
         name,
         kernel_template.operands(SPARSE_DIAGONAL_ABI, extra),

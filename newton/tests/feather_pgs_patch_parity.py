@@ -50,6 +50,8 @@ def point_row_law(device, count):
     """Point friction's row law: the patch law with beta 0, a disabled view and a zero phi for ``count`` contacts."""
     patches = FrictionPatches()
     patches.phi = wp.zeros(count, dtype=wp.vec2, device=device)
+    patches.spin_phi = wp.zeros(count, dtype=float, device=device)
+    patches.spin_arm = wp.zeros(count, dtype=float, device=device)
     return row_law(patches)
 
 
@@ -267,7 +269,7 @@ def assert_loaded_anchors(solver, contacts, *, carried=True, reset_worlds=()):
     patches = solver.laws.friction_patches
     valid, source = patches.previous.valid.numpy(), patches.current.source.numpy()
     worlds = solver.placement.contact_world.numpy()
-    anchors = [c for c, record in rows.items() if len(record["types"]) == 3 and record["parents"][0] not in (-1, c)]
+    anchors = [c for c, record in rows.items() if len(record["types"]) >= 3 and record["parents"][0] not in (-1, c)]
     if not anchors:
         raise AssertionError("No ring-linked contact holds an anchor")
     for c in anchors:
@@ -341,7 +343,7 @@ def patch_rows(solver, contacts, dt, *, jacobian=False):
         anchors, friction = [], np.zeros(3)
         for c in region:
             row = rows[c]
-            if len(row["types"]) != 3:
+            if len(row["types"]) < 3:
                 continue
             first, second = _tangent_basis(normal[c])
             vector = float(row["impulses"][1]) * first + float(row["impulses"][2]) * second
@@ -416,12 +418,12 @@ def assert_patch_rows_close(a, b, *, atol=3e-5, rtol=3e-4, lifecycle=True):
         for first, second in _match_anchors(*anchors):
             label = f"region {key} anchor at {np.round(first['location'], 4).tolist()}"
             np.testing.assert_allclose(
-                first["location"], second["location"], atol=atol, rtol=rtol, err_msg=f"{label} location"
+                first["location"], second["location"], atol=ANCHOR_ATOL, rtol=rtol, err_msg=f"{label} location"
             )
             np.testing.assert_array_equal(first["types"], second["types"], err_msg=f"{label} types")
             if first["jacobian"] is not None and second["jacobian"] is not None:
                 np.testing.assert_allclose(
-                    first["jacobian"], second["jacobian"], atol=atol, rtol=rtol, err_msg=f"{label} jacobian"
+                    first["jacobian"], second["jacobian"], atol=ANCHOR_ATOL, rtol=rtol, err_msg=f"{label} jacobian"
                 )
             if not (first["own"] and second["own"]):
                 raise AssertionError(f"{label}: friction rows must link to the anchor's own normal row")
@@ -520,7 +522,7 @@ def anchor_sites(solver, contacts):
     ]
 
 
-def assert_anchor_sites_close(a, b, *, atol=3e-5, rtol=3e-4, history=(2e-5, 7e-4), tangent=True):
+def assert_anchor_sites_close(a, b, *, atol=None, rtol=3e-4, history=(2e-5, 7e-4), tangent=True):
     """Require the same stored anchors on two routes and close carried history.
 
     ``a`` and ``b`` are :func:`anchor_sites` lists, paired by body and nearest
@@ -531,6 +533,7 @@ def assert_anchor_sites_close(a, b, *, atol=3e-5, rtol=3e-4, history=(2e-5, 7e-4
     anchors; :func:`assert_history_matches_rows` still ties each route's stored
     impulses to its solved rows.
     """
+    atol = ANCHOR_ATOL if atol is None else atol
     if len(a) != len(b):
         raise AssertionError(f"Stored anchors differ in number: {len(a)} and {len(b)}")
     remaining = list(range(len(b)))
@@ -570,7 +573,7 @@ def assert_history_matches_rows(solver, contacts, *, atol=1e-6, rtol=1e-6):
     impulses = solver.placement.impulses.numpy()
     checked = 0
     for c in np.flatnonzero(valid):
-        if path[c] != 0 or slot[c] < 0 or needed[c] != 3:
+        if path[c] != 0 or slot[c] < 0 or needed[c] < 3:
             continue
         w, s = int(world[c]), int(slot[c])
         solved = float(np.hypot(impulses[w, s + 1], impulses[w, s + 2]))
@@ -601,7 +604,7 @@ def _seed_record(inputs):
     world, slot, path, needed = (array.numpy()[:live] for array in (world, slot, path, needed))
     stored, poses = previous.tangent_impulse.numpy().astype(np.float64), body_q.numpy().astype(np.float64)
     parents, mu, impulses = routes.parents0.numpy(), routes.mu0.numpy(), routes.impulses0.numpy()
-    for c in np.flatnonzero((source >= 0) & (slot >= 0) & (path == 0) & (needed == 3)):
+    for c in np.flatnonzero((source >= 0) & (slot >= 0) & (path == 0) & (needed >= 3)):
         tangent = stored[source[c]] * record["scale"]
         if body[c] >= 0:
             tangent = _rotate(poses[body[c], 3:], tangent)
@@ -795,6 +798,11 @@ def assert_states_close(first, second, *, velocity_atol=2.0e-3):
 # warp do: dealing one arm's rows in a random per-world order alone moves standing joint velocity by up to
 # 1.2e-2 and region load by 5.9e-3 on CPU.
 # Twists and momentum of the standing and sliding feet.
+ANCHOR_ATOL = 2.0e-3
+"""How far two arms' anchors of one region may sit apart [m] (and their rows' Jacobians differ): a region's anchor is its
+centre of pressure from the last solve, which a statically indeterminate stance leaves to the solve's float order, so a
+one-ulp twin's moves it (measured on the feet: 0.09 mm standing, 1.4 mm sliding)."""
+
 STANDING_VELOCITY_ATOL = 7.5e-3
 # The stance's contact rows outnumber its degrees of freedom, so float order shifts friction between its
 # feet by more than any region carries (3.5e-3 at most): stance regions compare normal load only, and the

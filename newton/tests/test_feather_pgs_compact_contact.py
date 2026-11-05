@@ -181,7 +181,8 @@ def install_patch_contacts(model, state, contacts):
 def assert_patch_tangent_law(solver, contacts):
     """Require each anchor's tangent rows to carry its patch phi and ``friction_anchor_beta``.
 
-    Returns the number of anchors checked. ``contact_rows`` keeps phi for the normal row only.
+    Returns the number of anchors checked (with or without a spin row). ``contact_rows`` keeps phi for the normal row
+    only.
     """
     count = min(int(contacts.rigid_contact_count.numpy()[0]), solver.placement.contact_slot.shape[0])
     world, slot = solver.placement.contact_world.numpy()[:count], solver.placement.contact_slot.numpy()[:count]
@@ -193,7 +194,7 @@ def assert_patch_tangent_law(solver, contacts):
     )
     anchors = 0
     for c in range(count):
-        if path[c] != 0 or slot[c] < 0 or needed[c] != 3:
+        if path[c] != 0 or slot[c] < 0 or needed[c] < 3:
             continue
         tangents = slice(int(slot[c]) + 1, int(slot[c]) + 3)
         np.testing.assert_array_equal(phi[world[c], tangents], view[c], err_msg=f"contact {c} phi")
@@ -241,7 +242,7 @@ def ring_carries_friction(records, first):
     contact = first
     for _ in range(len(records)):
         record = records[contact]
-        if len(record["types"]) == 3 and np.any(record["impulses"][1:] != 0.0):
+        if len(record["types"]) >= 3 and np.any(record["impulses"][1:] != 0.0):
             return True
         contact = int(record["parents"][0])
         if contact < 0 or contact == first:

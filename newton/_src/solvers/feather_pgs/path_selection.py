@@ -678,7 +678,7 @@ def _friction(solver) -> dict:
         "law": "patch" if patch else "point",
         "friction_anchor_beta": json_value(solver.laws.friction_anchor_beta),
         "anchor_beta_source": solver.laws.friction_anchor_beta_source,
-        "torsion": bool(solver.laws.contact_torsion_enabled),
+        "torsion": bool(solver.laws.spin_rows),
         "compliance": bool(solver.options.contact_compliance),
         "reason": reason,
         "frame_reuse": {

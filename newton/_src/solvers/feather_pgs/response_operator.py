@@ -1303,6 +1303,9 @@ class SparseFactor(ResponseOperator):
     velocity: Velocity = Velocity("s_delta")
     diagonal: Callable[[str], str] | None = None
     inverse: Callable[[str], str] | None = None
+    triple_couplings: bool = True
+    """A friction triple's spin couplings are reduced at the visit (:meth:`spin_terms`); ``False`` where the triple's
+    metric is its contact's record's (K1): the visit reduces its residual only."""
     name = "sparse_factor"
     fused_pair_apply = True
 
@@ -1351,14 +1354,12 @@ class SparseFactor(ResponseOperator):
         row: str = "i",
         sibling: str | None = None,
         paired: str = "false",
-        spin: str | None = None,
     ) -> str:
         """``float out = Z_row . delta`` (every lane holds it), the row's entries kept for :meth:`apply`.
 
         With ``sibling``, a ``paired`` row (a first tangent) also reduces ``sibling_jv = Z_sibling . delta`` and
         ``pair_coupling = Z_row . Z_sibling`` in the same ``SUM`` and keeps the sibling's entries for
-        :meth:`apply_pair`; with its contact's ``spin`` row (contact torsion, on the same support) also ``spin_jv``,
-        ``spin_coupling = Z_row . Z_spin`` and ``spin_coupling_sibling = Z_sibling . Z_spin`` (:meth:`spin_terms`).
+        :meth:`apply_pair`; a contact's spin row, where it has one, reduces its own terms (:meth:`spin_terms`).
         """
         count = self.entries
         lines = [f"int indices[{count}];", f"float responses[{count}];"]
@@ -1377,16 +1378,9 @@ class SparseFactor(ResponseOperator):
         else:
             lines += [f"float sibling_responses[{count}];", f"float {out} = 0.0f;"]
             lines += ["float sibling_jv = 0.0f;", "float pair_coupling = 0.0f;"]
-            if spin is not None:
-                lines.append("float spin_jv = 0.0f, spin_coupling = 0.0f, spin_coupling_sibling = 0.0f;")
             body += [
                 f"const float sibling_value = {paired} && index >= 0",
                 f"    ? {self.element(sibling)} : 0.0f;",
-                *(
-                    (f"const float spin_value = {paired} && index >= 0", f"    ? {self.element(spin)} : 0.0f;")
-                    if spin is not None
-                    else ()
-                ),
                 "indices[q] = index;",
                 "responses[q] = value;",
                 "sibling_responses[q] = sibling_value;",
@@ -1395,19 +1389,9 @@ class SparseFactor(ResponseOperator):
                 f"    {out} += value * velocity;",
                 "    sibling_jv += sibling_value * velocity;",
                 "    pair_coupling += value * sibling_value;",
-                *(
-                    (
-                        "    spin_jv += spin_value * velocity;",
-                        "    spin_coupling += value * spin_value;",
-                        "    spin_coupling_sibling += sibling_value * spin_value;",
-                    )
-                    if spin is not None
-                    else ()
-                ),
                 "}",
             ]
-            sums = ("spin_jv", "spin_coupling", "spin_coupling_sibling") if spin is not None else ()
-            reduce = self.lanes.reduce(out, "sibling_jv", "pair_coupling", *sums)
+            reduce = self.lanes.reduce(out, "sibling_jv", "pair_coupling")
         text = "\n".join(indent + line for line in lines) + "\n" + self.entries_loop("\n".join(body), indent)
         return text + "".join(f"\n{indent}{line}" for line in reduce.split("\n") if line)
 
@@ -1420,10 +1404,37 @@ class SparseFactor(ResponseOperator):
         return f"{indent}float {out} = pair_coupling;"
 
     def spin_terms(self, row: str, sibling: str, spin: str, rhs: Callable[[str], str], indent: str) -> str:
-        """The spin row's residual and couplings, which :meth:`residual` reduced with the pair's."""
+        """The spin row's residual and, with :attr:`triple_couplings`, its couplings with the pair, reduced in one
+        ladder over the entries :meth:`residual` kept (a contact's rows share its support): only a contact with a spin
+        row pays them."""
+        if self.triple_couplings:
+            sums = ("spin_residual", "spin_cross", "spin_cross_sibling")
+            terms = (
+                "    spin_cross += responses[q] * spin_value;",
+                "    spin_cross_sibling += sibling_responses[q] * spin_value;",
+            )
+            declare = f"{indent}float spin_residual = 0.0f, spin_cross = 0.0f, spin_cross_sibling = 0.0f;\n"
+        else:
+            sums, terms = ("spin_residual",), ()
+            declare = (
+                f"{indent}const float spin_cross = 0.0f, spin_cross_sibling = 0.0f;  // the cached metric replaces them\n"
+                f"{indent}float spin_residual = 0.0f;\n"
+            )
+        body = "\n".join(
+            (
+                "if (indices[q] >= 0) {",
+                f"    const float spin_value = {self.element(spin)};",
+                f"    spin_residual += spin_value * {self.velocity.at('indices[q]')};",
+                *terms,
+                "}",
+            )
+        )
+        reduce = self.lanes.reduce(*sums)
         return (
-            f"{indent}float spin_residual = spin_jv;\n{indent}spin_residual += {rhs(spin)};\n"
-            f"{indent}float spin_cross = spin_coupling;\n{indent}float spin_cross_sibling = spin_coupling_sibling;"
+            declare
+            + self.entries_loop(body, indent)
+            + "".join(f"\n{indent}{line}" for line in reduce.split("\n") if line)
+            + f"\n{indent}spin_residual += {rhs(spin)};"
         )
 
     def apply(self, delta: str, indent: str) -> str:

@@ -774,7 +774,8 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
                 )
                 self.assertEqual(solver.placement.sparse_mass_matrix_size, 18)
                 key = solver.sweep.sparse_kernel.key
-                self.assertTrue(key.endswith(suffix), key)
+                # Patch friction's sweep reads spin rows (a region with a footprint has one).
+                self.assertTrue(key.endswith(suffix + "_torsion"), key)
                 self.assertEqual(solver.sweep.sparse_contact_triplets, "contact_triplets" in suffix)
         with mock.patch.dict(os.environ, {}, clear=True):
             packed = _make_solver(_build_model(), True)

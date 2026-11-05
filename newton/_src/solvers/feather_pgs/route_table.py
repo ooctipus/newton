@@ -26,7 +26,8 @@ class Laws:
     regularized: bool
     """Contact rows step toward the hard law with a float32 weight below one (``pgs_contact_regularization``)."""
     torsion: bool
-    """Contact torsion gives every friction contact a spin row after its pair (``contact_torsion``)."""
+    """Spin rows may follow friction pairs: on a patch region with a footprint (one wrench a region), or on every
+    friction contact under ``contact_torsion``; the sweeps read each contact's rows from the data."""
     compliance: bool
     """Material contacts take the row law's compliance (``contact_compliance``)."""
     limits: bool
@@ -74,7 +75,7 @@ class Laws:
         return cls(
             contact="patch" if laws.friction_anchors_enabled else "point",
             regularized=bool(laws.regularization_enabled),
-            torsion=bool(laws.contact_torsion_enabled),
+            torsion=bool(laws.spin_rows),
             compliance=bool(options.contact_compliance),
             limits=bool(options.enable_joint_limits),
             velocity_limits=bool(options.enable_joint_velocity_limits),

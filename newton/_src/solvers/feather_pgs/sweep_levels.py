@@ -29,8 +29,9 @@ def _get_mark_independent_sparse_contact_candidates_kernel(
     """Mark contact triples whose response is confined to one sparse coordinate.
 
     ``units`` marks patch contact units instead: a normal row, followed by its two
-    tangent rows only when the contact owns a friction anchor. Under contact
-    ``torsion`` a friction contact's spin row follows its tangents (four rows).
+    tangent rows only when the contact owns a friction anchor, and its spin row where
+    it has one (four rows: :func:`.sweep.spin_row`). Under contact ``torsion`` a point
+    triple's spin row follows its tangents (four rows).
     """
     del device_arch
     full = 3 + int(torsion)
@@ -49,7 +50,7 @@ def _get_mark_independent_sparse_contact_candidates_kernel(
         for contact in range(worker, total_contacts, total_num_workers):
             slot = data.slot[contact]
             rows = data.slots_needed[contact]
-            if data.path[contact] != 0 or slot < 0 or (rows != 1 and rows != full):
+            if data.path[contact] != 0 or slot < 0 or (rows != 1 and rows != 3 and rows != full):
                 continue
 
             art_a = data.art0[contact]
@@ -330,11 +331,10 @@ def _build_independent_sparse_contact_units_kernel(
     Two serial walks over the rows define the schedules. When the rows form units
     as the producers write them, both walks visit exactly the non-friction rows,
     and the warp builds the same links, heads and serial list in parallel; lane 0
-    runs the walks for any other row layout. Under contact ``torsion`` a unit's
-    spin row follows its tangents and names its head too.
+    runs the walks for any other row layout. Where spin rows may appear (``torsion``)
+    a unit's spin row, where it has one, follows its tangents and names its head too.
     """
     friction, spin = int(PGS_CONSTRAINT_TYPE_FRICTION), int(PGS_CONSTRAINT_TYPE_TORSION)
-    R = 4 if torsion else 3
 
     def member(row: str) -> str:
         """Whether row ``row`` belongs to the unit of an earlier head (a tangent, or a spin row)."""
@@ -394,10 +394,14 @@ def _build_independent_sparse_contact_units_kernel(
                 || sparse_row_dof.data[sparse_row + 1] < -1;
             if (!scheduled_independently)
                 serial_normals.data[world * {M} + serial_count++] = normal;
-            const bool owns_tangents = normal + {R - 1} < contact_end
+            const bool owns_tangents = normal + 2 < contact_end
                 && world_row_type.data[row_base + normal + 1] == {friction}
                 && world_row_parent.data[row_base + normal + 1] == normal;
-            normal += owns_tangents ? {R} : 1;
+            // A unit's spin row, where it has one, names its head after its tangents (sweep.spin_row).
+            const bool owns_spin = {"true" if torsion else "false"} && owns_tangents && normal + 3 < contact_end
+                && world_row_type.data[row_base + normal + 3] == {spin}
+                && world_row_parent.data[row_base + normal + 3] == normal;
+            normal += owns_tangents ? (owns_spin ? 4 : 3) : 1;
         }}
         serial_count_out.data[world] = serial_count;
     }}
@@ -418,7 +422,9 @@ def _build_independent_sparse_contact_units_kernel(
         layout = f"""const bool spin_3 = normal + 3 < contact_end && world_row_type.data[row_base + normal + 3] == {spin};
         const bool named_3 = normal + 3 < contact_end && world_row_parent.data[row_base + normal + 3] == normal;
         const bool member_4 = normal + 4 < contact_end && {member("normal + 4")};
-        if (tangent_1 && !(named_1 && tangent_2 && named_2 && spin_3 && named_3 && !member_4)) rows_form_units = false;"""
+        const bool member_3 = normal + 3 < contact_end && {member("normal + 3")};
+        const bool whole = spin_3 && named_3 ? !member_4 : !member_3;
+        if (tangent_1 && !(named_1 && tangent_2 && named_2 && whole)) rows_form_units = false;"""
 
     snippet = f"""    const int lane = LANE;
     const int contact_start = dense_phase_bounds.data[world * 2 + 1];

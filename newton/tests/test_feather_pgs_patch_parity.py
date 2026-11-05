@@ -150,16 +150,16 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
                 step()
             rows = contact_rows(solver, contacts, route=1, jacobian=True)
         normals = [c for c, record in rows.items() if record["types"][0] == PGS_CONSTRAINT_TYPE_CONTACT]
-        anchors = [c for c, record in rows.items() if len(record["types"]) == 3]
-        # A resting box face: four ring-linked normals, friction rows only on its two anchors.
+        anchors = [c for c, record in rows.items() if len(record["types"]) >= 3]
+        # A resting box face: four ring-linked normals, friction rows only on its one anchor, a pair and a spin row.
         self.assertEqual(len(normals), 4)
-        self.assertEqual(len(anchors), 2)
+        self.assertEqual(len(anchors), 1)
         self.assertTrue(all(rows[c]["parents"][0] not in (-1, c) for c in normals))
         for c in anchors:
-            np.testing.assert_array_equal(rows[c]["types"][1:], [PGS_CONSTRAINT_TYPE_FRICTION] * 2)
-            np.testing.assert_array_equal(rows[c]["parents"][1:], [c, c])
+            np.testing.assert_array_equal(rows[c]["types"][1:3], [PGS_CONSTRAINT_TYPE_FRICTION] * 2)
+            np.testing.assert_array_equal(rows[c]["parents"][1:3], [c, c])
             self.assertGreater(rows[c]["patch"][0], 0.0)
-        self.assertEqual(assert_ring_coulomb(solver, route=1), 2)
+        self.assertEqual(assert_ring_coulomb(solver, route=1), 1)
         for shift in (1, 2, 3):
             with self.subTest(shift=shift):
                 stand_in = _permuted_slots(solver, contacts, shift)
@@ -241,9 +241,9 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
                 pipeline.collide(state, contacts)
                 solver.step(state, output, control, contacts, 1.0 / 400.0)
                 state.assign(output)
-                # Two feet per world, each a ring of four normals with two anchors.
+                # Two feet per world, each a ring of four normals with one anchor.
                 count = assert_loaded_anchors(solver, contacts, carried=step > 0, reset_worlds=(0,) if reset else ())
-                self.assertEqual(count, 8)
+                self.assertEqual(count, 4)
             with self.assertRaisesRegex(AssertionError, "carried history"):
                 assert_loaded_anchors(solver, contacts, carried=False)
             # The feet hold the torso at its standing height.
@@ -300,7 +300,7 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
             assert_region_impulses_close(*rows, **STANDING_REGION_BOUNDS)
             assert_anchor_sites_close(*(anchor_sites(case[1], case[-1]) for case in cases), tangent=False)
             for case in cases:
-                self.assertEqual(assert_history_matches_rows(case[1], case[-1]), 8)
+                self.assertEqual(assert_history_matches_rows(case[1], case[-1]), 4)
             carriers = [
                 {anchor["contact"] for region in record["regions"].values() for anchor in region["anchors"]}
                 for record in rows
@@ -378,7 +378,7 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
             source = patches.current.source.numpy()[:count]
             slot, world = solver.placement.contact_slot.numpy()[:count], solver.placement.contact_world.numpy()[:count]
             needed, impulses = solver.placement.contact_slots_needed.numpy()[:count], solver.placement.impulses.numpy()
-            for c in np.flatnonzero((source >= 0) & (slot >= 0) & (needed == 3)):
+            for c in np.flatnonzero((source >= 0) & (slot >= 0) & (needed >= 3)):
                 impulses[world[c], slot[c] + 1 : slot[c] + 3] *= factor
             solver.placement.impulses.assign(impulses)
 

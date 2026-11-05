@@ -1384,7 +1384,7 @@ def long_chain(*, links: int = 100, mu: float = 0.6, pull: float = 0.0, armature
         dt=1.0 / 240.0,
         steps=40,
         params={"mu": [mu], "pull": pull},
-        solver_options={"dense_max_constraints": 384},
+        solver_options={"dense_max_constraints": 512},
         rigid_contact_max=512,
         control=control,
         deterministic_contacts=True,

@@ -219,7 +219,8 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         """Step the switched-off full patch sweep with fused anchor units as it steps without them, to rounding.
 
         Pinned off the active-row scan, the full ordered sweep solves its anchors as contact units on their Gram
-        blocks (in exact arithmetic the ordinary updates); pinned unfused it runs the ordinary updates. A resting and
+        blocks (in exact arithmetic the ordinary updates), but an anchor with a spin row (every anchor here) takes the
+        ordinary updates; pinned unfused it runs the ordinary updates. A resting and
         a sliding biped world follow each other within the bounds of
         :meth:`test_patch_history_follows_the_full_sweep`, whose two sweeps also differ by their arithmetic order
         only.
@@ -233,9 +234,10 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
                 pins["contact_units"] = None
             with mock.patch.dict(SolverFeatherPGS._route_pins, pins):
                 solvers[triplets] = _make_solver(model, True, **options)
-        # The full ordered sweep: no "_active" between the support width and the table.
-        self.assertRegex(solvers["1"].sweep.sparse_kernel.key, r"_\d+_support_table_contact_triplets_linked$")
-        self.assertRegex(solvers["0"].sweep.sparse_kernel.key, r"_\d+_support_table$")
+        # The full ordered sweep: no "_active" between the support width and the table; patch friction's sweeps read
+        # spin rows (``_torsion``).
+        self.assertRegex(solvers["1"].sweep.sparse_kernel.key, r"_\d+_support_table_contact_triplets_linked_torsion$")
+        self.assertRegex(solvers["0"].sweep.sparse_kernel.key, r"_\d+_support_table_torsion$")
         self.assertFalse(solvers["1"].sweep.sparse_active_rows)
         runs = {name: _rollout(solver, model, steps=120, slide_world=1, speed=0.6) for name, solver in solvers.items()}
         anchors, ordinary_anchors = runs["1"][0], runs["0"][0]
@@ -245,8 +247,9 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         self.assertLessEqual(int(mismatched.sum()), 18, f"steps with different anchors: {np.flatnonzero(mismatched)}")
         self.assertLessEqual(np.abs(anchors[:, 1] - ordinary_anchors[:, 1]).max(), 2)
         states = list(zip(runs["1"][2], runs["0"][2], strict=True))
-        # The units must act on this fixture, or the comparison would prove nothing.
-        self.assertFalse(all(np.array_equal(unit[1], ordinary[1]) for unit, ordinary in states))
+        # Every anchor of this fixture's box feet has a spin row, which declines the unit for the ordinary rows: the
+        # fused sweep steps bitwise as the unfused one.
+        self.assertTrue(all(np.array_equal(unit[1], ordinary[1]) for unit, ordinary in states))
         bodies = model.body_count // model.world_count
         for world, pose_bound, velocity_bound in ((0, 5.0e-5, 1.0e-2), (1, 5.0e-5, 3.0e-2)):
             with self.subTest(world=world):
@@ -285,9 +288,9 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         anchors, full_anchors = runs["active"][0], runs["full"][0]
         np.testing.assert_array_equal(runs["active"][1], runs["full"][1])
         for history in (anchors, full_anchors):
-            # Two box feet, four ring-linked corners each, hold two anchors per foot at rest.
-            np.testing.assert_array_equal(history[-40:], 4)
-            self.assertTrue(np.any(history[:, 1] < 4), "The sliding world must release anchors")
+            # Two box feet, four ring-linked corners each, hold one anchor per foot at rest.
+            np.testing.assert_array_equal(history[-40:], 2)
+            self.assertTrue(np.any(history[:, 1] < 2), "The sliding world must release anchors")
         np.testing.assert_array_equal(anchors[:, 0], full_anchors[:, 0])
         mismatched = anchors[:, 1] != full_anchors[:, 1]
         self.assertLessEqual(

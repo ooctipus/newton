@@ -1799,6 +1799,8 @@ def _ring_case(device, seed, *, contacts=600, worlds=3):
     view.next_contact = wp.array(next_contact, dtype=int, device=device)
     view.point = wp.zeros(contacts, dtype=wp.vec3, device=device)
     view.phi = wp.zeros(contacts, dtype=wp.vec2, device=device)
+    view.spin_phi = wp.zeros(contacts, dtype=float, device=device)
+    view.spin_arm = wp.zeros(contacts, dtype=float, device=device)
     maps = [wp.array(values.astype(np.int32), dtype=int, device=device) for values in (world, slot, path, needed)]
     single = (next_contact == np.arange(contacts)) & (slot >= 0)
     singles = {

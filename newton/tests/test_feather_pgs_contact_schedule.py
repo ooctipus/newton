@@ -26,6 +26,7 @@ from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_COUNT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+    PGS_CONSTRAINT_TYPE_TORSION,
 )
 from newton._src.solvers.feather_pgs.sweep_levels import (
     _get_build_independent_sparse_contact_groups_kernel,
@@ -40,6 +41,7 @@ from newton.tests.test_feather_pgs_compact_contact import (
 from newton.tests.test_feather_pgs_response_diagonal import _mark_patch_units, _patch_unit_cases, _unit_schedule_oracle
 
 _FRICTION = PGS_CONSTRAINT_TYPE_FRICTION
+_TORSION = PGS_CONSTRAINT_TYPE_TORSION
 # Initial content of every output, so that entries a builder must not write are checked too.
 _UNWRITTEN = -7
 _OUTPUTS = ("sparse_row_dof", "group_count", "group_heads", "serial_count", "serial")
@@ -111,13 +113,13 @@ def _serial_unit_walks(rows, *, serial_contacts):
     for w in range(rows["row_count"].shape[0]):
         start, end = int(rows["bounds"][w, 1]), int(rows["row_count"][w])
         row_type, parent = rows["row_type"][w], rows["row_parent"][w]
-        heads = _reserve(
-            links, w, [row for row in range(start, end) if row_type[row] != _FRICTION], len(out["group_heads"][w])
-        )
+        # A unit's members name its head: its tangents and, where it has one, its spin row.
+        member = [int(kind) in (_FRICTION, _TORSION) for kind in row_type]
+        heads = _reserve(links, w, [row for row in range(start, end) if not member[row]], len(out["group_heads"][w]))
         row = end - 1
         while row >= start:
             head = row
-            if row_type[row] == _FRICTION and start <= parent[row] < row:
+            if member[row] and start <= parent[row] < row:
                 head = int(parent[row])
             _prepend(links, heads, w, head)
             row = head - 1
@@ -128,7 +130,10 @@ def _serial_unit_walks(rows, *, serial_contacts):
                 if not np.any(links[w, head] < -1):
                     serial.append(head)
                 owns_tangents = head + 2 < end and row_type[head + 1] == _FRICTION and parent[head + 1] == head
-                head += 3 if owns_tangents else 1
+                owns_spin = (
+                    owns_tangents and head + 3 < end and row_type[head + 3] == _TORSION and parent[head + 3] == head
+                )
+                head += (4 if owns_spin else 3) if owns_tangents else 1
         _finish(out, w, heads, serial)
     return out
 

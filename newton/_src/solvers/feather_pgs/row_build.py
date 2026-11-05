@@ -23,7 +23,7 @@ from .contact_laws import (
     prescribed_spin_target,
     prescribed_target,
 )
-from .friction_patches import PatchRowLaw, patch_tangent_row
+from .friction_patches import PatchRowLaw, patch_spin_row, patch_tangent_row
 from .row_laws import (
     ROW_CONTACT,
     ROW_FRICTION,
@@ -67,10 +67,13 @@ def incident_projection(data: ContactInput, body: int, art: int, point: wp.vec3,
 
 @wp.func
 def contact_torsion_mu(data: ContactInput, c: int) -> float:
-    """Contact ``c``'s torsional coefficient ``mu_t`` [m], its spin row's: its shapes' torsional friction combined as
-    the friction coefficient is (:func:`.contact_laws.contact_friction`). The patch link divides an anchor's among
-    the region's anchors, as the pair's (:mod:`.friction_patches`)."""
-    return contact_friction(data.shape0[c], data.shape1[c], data.material_mu_torsional)
+    """Contact ``c``'s authored torsional coefficient ``mu_t`` [m]: under contact torsion its shapes' torsional
+    friction combined as the friction coefficient is (:func:`.contact_laws.contact_friction`), else 0. A region's
+    footprint may raise it (:func:`.friction_patches.patch_spin_row`)."""
+    authored = float(0.0)
+    if data.torsion != 0:
+        authored = contact_friction(data.shape0[c], data.shape1[c], data.material_mu_torsional)
+    return authored
 
 
 @wp.func
@@ -131,12 +134,16 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, frame: ContactFrame,
         target = prescribed_spin_target(body_a, art_a, body_b, art_b, normal, data.prescribed, data.body_v)
     r = slot + row
     normal_beta = float(0.0)
+    friction_mu = mu
+    if stiffness > 0.0 and data.friction_weight[c] > 0.0:
+        friction_mu *= data.friction_weight[c]
     if row == CONTACT_SPIN_ROW:
+        spin_phi, spin_beta, spin_mu = patch_spin_row(law, c, friction_mu, contact_torsion_mu(data, c))
         data.row_type[line, r] = ROW_TORSION
         data.row_parent[line, r] = slot
-        data.row_mu[line, r] = contact_torsion_mu(data, c)
-        data.row_beta[line, r] = 0.0
-        data.phi[line, r] = 0.0
+        data.row_mu[line, r] = spin_mu
+        data.row_beta[line, r] = spin_beta
+        data.phi[line, r] = spin_phi
         data.restitution[line, r] = 0.0
     elif row == 0:
         normal_beta = contact_normal_beta(data, c, body_a, body_b, phi)
@@ -148,9 +155,6 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, frame: ContactFrame,
         data.restitution[line, r] = restitution
     else:
         tangent_phi, beta = patch_tangent_row(law, c, row)
-        friction_mu = mu
-        if stiffness > 0.0 and data.friction_weight[c] > 0.0:
-            friction_mu *= data.friction_weight[c]
         data.row_type[line, r] = ROW_FRICTION
         data.row_parent[line, r] = slot
         data.row_mu[line, r] = friction_mu
@@ -186,7 +190,9 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, frame: ContactFrame,
                     rhs = bounce
                     weight = 1.0
         elif row == CONTACT_SPIN_ROW:
-            rhs, _w = row_rhs(ROW_TORSION, 0.0, 0.0, target, inv_dt, data.bias_scale, 0.0, 0.0, 1.0)
+            rhs, _w = row_rhs(
+                ROW_TORSION, data.phi[line, r], data.row_beta[line, r], target, inv_dt, data.bias_scale, 0.0, 0.0, 1.0
+            )
         else:
             tangent_phi, beta = patch_tangent_row(law, c, row)
             rhs, _w = row_rhs(ROW_FRICTION, tangent_phi, beta, target, inv_dt, data.bias_scale, 0.0, 0.0, 1.0)

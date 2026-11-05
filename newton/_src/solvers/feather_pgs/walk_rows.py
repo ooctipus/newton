@@ -59,7 +59,7 @@ from .field_group import Field
 from .friction_patches import PatchRowLaw
 from .joint_table import FreeBodies
 from .kernel_template import python_kernel
-from .projection_laws import friction_pair_metric
+from .projection_laws import friction_ball_metric, friction_pair_metric
 from .row_build import write_contact_row
 from .row_kernels import PGS_CONSTRAINT_TYPE_SPEED, RIGID_SPEED_ROWS, RowBias, row_bias
 from .row_laws import LINK_ROWS
@@ -482,6 +482,8 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
     float incident[$rows], norm[$rows], zc[$rows], cross[6];
     for (int r = 0; r < $rows; ++r) incident[r] = norm[r] = zc[r] = 0.0f;
     for (int k = 0; k < 6; ++k) cross[k] = 0.0f;
+    // A friction unit's Gram couplings: its pair's with its normal and each other, and its spin row's where it has one
+    // (a unit of three rows leaves its fourth zero, whose couplings stay zero).
     const auto gram = [&]() {
         if ($rows >= 3) {
             cross[0] += zc[0] * zc[1];
@@ -528,7 +530,7 @@ $side
                 else
                     ST(entry + k * S, footprint[k]);
             }
-            if (!add && rows == $rows) gram();
+            if (!add && rows >= 3) gram();
         };
         if (covector) {
             for (int k = 0; k < seeds; ++k) {
@@ -588,7 +590,7 @@ $close    if (reread) {
                 zc[r] = RW(Z + r * S + e);
                 norm[r] += zc[r] * zc[r];
             }
-            if (rows == $rows) gram();
+            if (rows >= 3) gram();
         }
     }
     for (int r = 0; r < rows; ++r) {
@@ -629,22 +631,29 @@ _SUPPORT_CLOSE = """    // The pad past the support; the rows' coordinates (expl
     }
 """
 
-_SUPPORT_RECORD = """    // A full unit's block record from its Gram (sparse_contact.CONTACT_RECORD_FLOATS): its couplings W_nt1, W_nt2,
-    // W_t1t2 and 1 / W_nn, then the spin row's couplings W_ns, W_t1s, W_t2s (contact torsion) or, written by the
-    // kernel from these, the tangent pair's metric (projection_laws.friction_pair_metric).
-    if (rows == $rows) {
+_SUPPORT_RECORD = """    // A friction unit's block record from its Gram (sparse_contact.CONTACT_RECORD_FLOATS): its couplings W_nt1,
+    // W_nt2, W_t1t2 and 1 / W_nn, then the spin row's couplings W_ns, W_t1s, W_t2s where it has a spin row or,
+    // written by the kernel from these, the tangent pair's metric (projection_laws.friction_pair_metric).
+    if (rows >= 3) {
         float* record = sink.records.data + ((size_t)unit.line * sink.records.shape[1] + unit.slot / 3)
                         * sink.records.shape[2];
         ST(record + 0, cross[0]);
         ST(record + 1, cross[1]);
         ST(record + 2, cross[2]);
         ST(record + 3, 1.0f / (norm[0] + sink.cfm));
-$tail
+
     }
 """
-_SPIN_TAIL = """        ST(record + 4, cross[3]);
-        ST(record + 5, cross[4]);
-        ST(record + 6, cross[5]);"""
+_SPIN_RECORD = """    // A contact with a spin row: its friction rows' couplings W_t1t2, W_t1s and W_t2s, which the kernel replaces by
+    // the friction triple's metric (sparse_contact.CONTACT_RECORD_FLOATS, projection_laws.friction_ball_metric).
+    if (rows == 4) {
+        float* record = sink.records.data + ((size_t)unit.line * sink.records.shape[1] + unit.slot / 3)
+                        * sink.records.shape[2];
+        ST(record + 0, cross[2]);
+        ST(record + 1, cross[4]);
+        ST(record + 2, cross[5]);
+    }
+"""
 
 
 @cache
@@ -728,7 +737,7 @@ _SUPPORT_WRENCH = """                    const auto& at = r == 0 ? unit.point : 
 def _support_snippet(parent: tuple, first: tuple, node: tuple, rows: int, records: bool, spin: bool, half: int) -> str:
     record = ""
     if records:
-        record = substitute(_SUPPORT_RECORD, rows=rows, tail=_SPIN_TAIL if spin else "")
+        record = _SPIN_RECORD if spin else _SUPPORT_RECORD
     held = held_fits(4 * first[-1], SUPPORT_REGISTERS)
     release = substitute(_RELEASE_HELD, rows=rows, coordinates=first[-1]) if held else _RELEASE_IN_PLACE
     body = substitute(
@@ -1101,41 +1110,52 @@ groups' reservations spread over that many counters of each kind."""
 @wp.struct
 class UnitList:
     """The step's units, one fixed slot each (:func:`support_units_kernel` appends, :func:`support_rows_kernel`
-    walks). A unit is a row's seed and the rows it walks together, at least one row, so a world's units fit its rows'
-    ``capacity``: the list holds every world's at that bound and cannot overflow. Bucket ``b`` holds its worlds' units
-    in ``span`` slots, the wide units (two rows or more: a contact's) from the front and the one-row units from the
-    back, each as ``line * capacity + slot`` of its first row; ``count[2 b]`` and ``count[2 b + 1]`` are its wide and
-    one-row counts, zeroed before the step's append. The order within a bucket is the lane groups' arrival, on which
-    no unit's rows depend."""
+    walks), listed by kind so a warp of walkers runs one walker: units of four rows (a contact with its spin row),
+    units of three (a contact's normal and pair) and units of one row. A unit is a row's seed and the rows it walks
+    together, at least one row, so a world's units fit its rows' ``capacity`` and its units of four a quarter of it:
+    the list holds every world's at those bounds and cannot overflow. Bucket ``b`` holds its worlds' units in
+    ``span`` slots, the units of three from the front and the one-row units from the back, then ``quad`` slots of
+    units of four (none where no spin rows appear), each as ``line * capacity + slot`` of its first row;
+    ``count[3 b]``, ``count[3 b + 1]`` and ``count[3 b + 2]`` are its counts of three, one and four rows, zeroed
+    before the step's append. The order within a kind is the lane groups' arrival, on which no unit's rows depend."""
 
     entry: wp.array[int]
     count: wp.array[int]
     span: int
+    quad: int
     capacity: int
 
 
-def unit_list(worlds: int, capacity: int, device) -> UnitList:
-    """An empty :class:`UnitList` for ``worlds`` worlds of ``capacity`` rows each."""
+def unit_list(worlds: int, capacity: int, device, *, spin_rows: bool) -> UnitList:
+    """An empty :class:`UnitList` for ``worlds`` worlds of ``capacity`` rows each; with ``spin_rows`` (the laws let
+    contacts carry spin rows) its region of units of four."""
     units = UnitList()
     units.capacity = int(capacity)
-    units.span = -(-int(worlds) // UNIT_BUCKETS) * int(capacity)
-    units.entry = wp.empty(max(UNIT_BUCKETS * units.span, 1), dtype=int, device=device)
-    units.count = wp.zeros(2 * UNIT_BUCKETS, dtype=int, device=device)
+    per_bucket = -(-int(worlds) // UNIT_BUCKETS)
+    units.span = per_bucket * int(capacity)
+    units.quad = per_bucket * (int(capacity) // 4) if spin_rows else 0
+    units.entry = wp.empty(max(UNIT_BUCKETS * (units.span + units.quad), 1), dtype=int, device=device)
+    units.count = wp.zeros(3 * UNIT_BUCKETS, dtype=int, device=device)
     return units
 
 
 _UNIT_APPEND = """    // This round's units of the world's lane group into its bucket: one reservation a kind for the group.
-    const unsigned wide_votes = BALLOT(wide != 0), one_votes = BALLOT(one != 0);
-    const int wide_first = RESERVE(units.count.data + 2 * bucket, COUNT(wide_votes));
-    const int one_first = RESERVE(units.count.data + 2 * bucket + 1, COUNT(one_votes));
-    int* const region = units.entry.data + (size_t)bucket * units.span;
-    if (wide != 0) region[wide_first + BELOW(wide_votes)] = entry;
-    if (one != 0) region[units.span - 1 - (one_first + BELOW(one_votes))] = entry;"""
+    const bool wide = rows > 1 && rows < 4;
+    const unsigned wide_votes = BALLOT(wide), one_votes = BALLOT(rows == 1), quad_votes = BALLOT(rows == 4);
+    const int wide_first = RESERVE(units.count.data + 3 * bucket, COUNT(wide_votes));
+    const int one_first = RESERVE(units.count.data + 3 * bucket + 1, COUNT(one_votes));
+    int* const region = units.entry.data + (size_t)bucket * (units.span + units.quad);
+    if (wide) region[wide_first + BELOW(wide_votes)] = entry;
+    if (rows == 1) region[units.span - 1 - (one_first + BELOW(one_votes))] = entry;
+    if (quad_votes != 0) {
+        const int quad_first = RESERVE(units.count.data + 3 * bucket + 2, COUNT(quad_votes));
+        if (rows == 4) region[units.span + quad_first + BELOW(quad_votes)] = entry;
+    }"""
 
 
 @wp.func_native(dual_native(_UNIT_APPEND, preludes=(lane_group("lanes"),)))
-def unit_append(lanes: int, units: UnitList, bucket: int, wide: int, one: int, entry: int):
-    """Append this lane's unit, ``wide`` (two rows or more) or ``one`` (one row), to bucket ``bucket`` of ``units``
+def unit_append(lanes: int, units: UnitList, bucket: int, rows: int, entry: int):
+    """Append this lane's unit of ``rows`` rows (0 for none) to bucket ``bucket`` of ``units``
     (:class:`UnitList`); every lane of the world's group of ``lanes`` calls it together."""
 
 
@@ -1143,41 +1163,49 @@ def unit_append(lanes: int, units: UnitList, bucket: int, wide: int, one: int, e
 def unit_total(units: UnitList) -> int:
     """The list's units over its buckets."""
     total = int(0)
-    for k in range(2 * UNIT_BUCKETS):
+    for k in range(3 * UNIT_BUCKETS):
         total += units.count[k]
     return total
 
 
 @wp.func
 def unit_entry(units: UnitList, item: int) -> int:
-    """The list's ``item``-th unit: its wide units first, bucket by bucket, then its one-row units."""
+    """The list's ``item``-th unit: its units of four first, then of three, bucket by bucket, then its one-row
+    units."""
+    quads = int(0)
     wide = int(0)
     for b in range(UNIT_BUCKETS):
-        wide += units.count[2 * b]
-    kind = int(0)
+        quads += units.count[3 * b + 2]
+        wide += units.count[3 * b]
+    kind = int(2)
     rank = item
-    if item >= wide:
-        kind = 1
-        rank = item - wide
+    if item >= quads:
+        kind = 0
+        rank = item - quads
+        if rank >= wide:
+            kind = 1
+            rank -= wide
     b = int(0)
     n = units.count[kind]
     while rank >= n:
         rank -= n
         b += 1
-        n = units.count[2 * b + kind]
+        n = units.count[3 * b + kind]
     at = rank
     if kind == 1:
         at = units.span - 1 - rank
-    return units.entry[b * units.span + at]
+    elif kind == 2:
+        at = units.span + rank
+    return units.entry[b * (units.span + units.quad) + at]
 
 
 @cache
-def support_units_kernel(unit_rows: int, lanes: int) -> wp.Kernel:
+def support_units_kernel(max_rows: int, lanes: int) -> wp.Kernel:
     """The support placement's units (case K1, the writer's first launch): ``dim = (worlds, lanes)``, a world's lane
     group of ``lanes`` striding over its rows, a lane a row: each contact row's records by the contact law
     (:func:`.row_build.write_contact_row`, its unit source written where its slot is reserved,
     :func:`.row_slots.allocate_world_contact_slots`), and each unit's first row appended to the step's
-    :class:`UnitList`: a contact's ``min(slots_needed, unit_rows)`` rows as one unit, a joint row (a limit, a velocity
+    :class:`UnitList`: a contact's ``min(slots_needed, max_rows)`` rows as one unit, a joint row (a limit, a velocity
     limit, a mimic) alone. The walkers (:func:`support_rows_kernel`) read the records after this launch."""
 
     def kernel(
@@ -1194,8 +1222,7 @@ def support_units_kernel(unit_rows: int, lanes: int) -> wp.Kernel:
         bucket = world % UNIT_BUCKETS
         for base in range(0, count, wp.static(lanes)):
             slot = base + lane
-            wide = int(0)
-            one = int(0)
+            unit_rows = int(0)
             if slot < count:
                 source = sources[line, slot]
                 kind = source >> UNIT_SHIFT
@@ -1205,15 +1232,14 @@ def support_units_kernel(unit_rows: int, lanes: int) -> wp.Kernel:
                     row = index - 4 * c
                     write_contact_row(data, law, contact_frame(data, law, c), c, row, False)
                     if row == 0:
-                        if wp.min(data.slots_needed[c], wp.static(unit_rows)) > 1:
-                            wide = 1
-                        else:
-                            one = 1
+                        unit_rows = wp.min(data.slots_needed[c], wp.static(max_rows))
                 elif kind == UNIT_LIMIT or kind == UNIT_VELOCITY or kind == UNIT_MIMIC:
-                    one = 1
-            unit_append(wp.static(lanes), units, bucket, wide, one, line * units.capacity + slot)
+                    unit_rows = 1
+            unit_append(wp.static(lanes), units, bucket, unit_rows, line * units.capacity + slot)
 
-    return python_kernel(kernel, f"support_units_{unit_rows}_{lanes}")
+    # Four blocks of 256 a multiprocessor (64 registers): the third kind's reservation lifts the lister to 66 unbounded
+    # (sm_120, ptxas), a granule that would cost it a block.
+    return python_kernel(kernel, f"support_units_{max_rows}_{lanes}", launch_bounds=(256, 4))
 
 
 @cache
@@ -1227,13 +1253,13 @@ def support_rows_kernel(
     half: int = WALK_BOTH,
 ) -> wp.Kernel:
     """The support placement's walkers (case K1, the writer's second launch): ``threads`` lanes, sized to the GPU,
-    striding over the step's :class:`UnitList` (:func:`support_units_kernel`), its wide units first, so a warp runs one
-    walker. A lane walks a unit: a contact's rows from its first, a joint row alone. The generator form (Gamma per body,
+    striding over the step's :class:`UnitList` (:func:`support_units_kernel`) kind by kind, units of four rows, of
+    three, then of one, so a warp runs one walker. A lane walks a unit: a contact's rows from its first, a joint row alone. The generator form (Gamma per body,
     ``z = Gamma w``) measured slower on g1 than this direct walk, so the writer walks each unit.
 
     The class's tree (``parent``, ``first``: :func:`.factor.walk.walk_prelude`'s table) and each coordinate's factor
     coordinate ``node`` (the support masks' bit) are baked into constant memory. A contact unit of three rows (four
-    under contact ``torsion``) is walked together and its Gram writes its block record where ``records`` (the
+    with its spin row, where ``torsion`` lets spin rows appear; each count its own walker) is walked together and its Gram writes its block record where ``records`` (the
     triplet sweeps'); a unit of one row (a normal alone, a limit, a velocity limit, a mimic) by the one-row walker. The
     contact rows' records are the first launch's; a joint row's records and unit source are its producer's (the limit,
     velocity-limit and mimic producers). The walker stores its footprints at their ranks in its support
@@ -1249,6 +1275,8 @@ def support_rows_kernel(
 
     walk_one = walker(1, False)
     walk_unit = walker(unit_rows, records)
+    # Where spin rows may appear, a contact without one walks three rows, not the spin layout's four.
+    walk_three = walker(3, records) if torsion else walk_unit
     read_unit = unit_reader(False, unit_rows)
 
     def kernel(
@@ -1271,20 +1299,48 @@ def support_rows_kernel(
             unit = read_unit(rows, data, law, seeds, line, slot, sources[line, slot])
             if unit.rows == 1:
                 walk_one(sink, unit)
+            elif wp.static(torsion) and unit.rows == 3:
+                walk_three(sink, unit)
             else:
                 walk_unit(sink, unit)
-                if wp.static(records and not torsion):
-                    if unit.rows == 3:
-                        # The friction pair's metric of the diagonals as written, which the triplet sweeps reuse.
-                        k = slot // 3
-                        coupling = sink.records[line, k, 2]
-                        _scale, largest, smallest, axis = friction_pair_metric(
-                            sink.diag[line, slot + 1], coupling, sink.diag[line, slot + 2]
-                        )
-                        sink.records[line, k, 4] = largest
-                        sink.records[line, k, 5] = smallest
-                        sink.records[line, k, 6] = axis[0]
-                        sink.records[line, k, 7] = axis[1]
+            if wp.static(records):
+                if unit.rows == 3:
+                    # The friction pair's metric of the diagonals as written, which the triplet sweeps reuse (a spin
+                    # row's couplings take its place in a unit of four).
+                    k = slot // 3
+                    coupling = sink.records[line, k, 2]
+                    _scale, largest, smallest, axis = friction_pair_metric(
+                        sink.diag[line, slot + 1], coupling, sink.diag[line, slot + 2]
+                    )
+                    sink.records[line, k, 4] = largest
+                    sink.records[line, k, 5] = smallest
+                    sink.records[line, k, 6] = axis[0]
+                    sink.records[line, k, 7] = axis[1]
+                elif wp.static(torsion) and unit.rows == 4:
+                    # The friction triple's metric of the block as written, formed once per solve: the sweeps'
+                    # visits only project (projection_laws.friction_triple_from_metric). Its scale and eigenvalues,
+                    # then its eigenbasis as a rotation, take the triple's couplings' place.
+                    k = slot // 3
+                    t12 = sink.records[line, k, 0]
+                    t1s = sink.records[line, k, 1]
+                    t2s = sink.records[line, k, 2]
+                    block = wp.mat33(
+                        sink.diag[line, slot + 1], t12, t1s,
+                        t12, sink.diag[line, slot + 2], t2s,
+                        t1s, t2s, sink.diag[line, slot + 3],
+                    )  # fmt: skip
+                    scale, values, vectors = friction_ball_metric(
+                        block, rows.row_mu[line, slot + 1], rows.row_mu[line, slot + 3]
+                    )
+                    basis = wp.quat_from_matrix(vectors)
+                    sink.records[line, k, 0] = scale
+                    sink.records[line, k, 1] = values[0]
+                    sink.records[line, k, 2] = values[1]
+                    sink.records[line, k, 3] = values[2]
+                    sink.records[line, k, 4] = basis[0]
+                    sink.records[line, k, 5] = basis[1]
+                    sink.records[line, k, 6] = basis[2]
+                    sink.records[line, k, 7] = basis[3]
             for r in range(unit.rows):
                 incident = sink.row_incident[line, slot + r]
                 row_bias(rows, bias, line, slot + r, incident)

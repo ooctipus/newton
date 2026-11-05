@@ -30,7 +30,8 @@ class TestPatchHistoryWork(unittest.TestCase):
                 patches.stored.fill_(patches.capacity)
                 patches.build(model, state, contacts)
                 valid = patches.current.valid.numpy().astype(bool)
-                self.assertEqual(valid.sum(), 2)
+                # The two contacts are one region: one anchor.
+                self.assertEqual(valid.sum(), 1)
                 patches.previous.valid.fill_(1)
                 patches.previous_world.fill_(42)
                 patches.previous.displacement.fill_(wp.vec3(17.0))
@@ -71,7 +72,8 @@ class TestPatchHistoryWork(unittest.TestCase):
                 else:
                     replay = step
                 # A collision pass clamps its count to the rows it wrote, so no count exceeds them.
-                for count, anchors in ((2, 2), (1, 1), (0, 0), (2, 2), (2, 2)):
+                # The two contacts are one region with one anchor, and either alone is one too.
+                for count, anchors in ((2, 1), (1, 1), (0, 0), (2, 1), (2, 1)):
                     contacts.rigid_contact_count.assign([count])
                     replay()
                     self.assertEqual(np.count_nonzero(patches.previous.valid.numpy()), anchors)
