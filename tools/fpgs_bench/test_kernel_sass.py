@@ -143,30 +143,12 @@ class TestKernelSass(unittest.TestCase):
         self.assertNotIn("REGRESSION", output.getvalue())
 
     def test_launch_blocks_follow_the_owner_launches(self):
-        """Compile classifications at the owner's classification block and every other held-tree kernel at its layout's.
-
-        Owners classify only layouts of ordinary motion, so those layouts alone record a classification.
-        """
-        from newton._src.solvers.feather_pgs import tree_kinetic_owner  # noqa: PLC0415
-
+        """Compile every held-tree kernel at its layout's block, as the owner launches it."""
         calls = list(sass.identity.held_tree_calls())
         blocks = sass.launch_blocks(("held_tree",))
         self.assertEqual(len(blocks), len(calls))
-        self.assertEqual(sass.classify_block(), tree_kinetic_owner._CLASSIFY_BLOCK_DIM)
-        classified = []
         for name, _, args, kwargs in calls:
-            block = blocks[sass.identity.label(name, args, kwargs)]
-            if name == "tree_kinetic_state.get_classify_kernel":
-                classified.append(kwargs["layout"].name)
-                self.assertEqual(block, 64)
-            else:
-                self.assertEqual(block, kwargs["layout"].value.block)
-        ordinary = [
-            name
-            for name, (_, _, _, options) in sass.identity.held_tree_layouts().items()
-            if not options.get("motion_velocity", False)
-        ]
-        self.assertEqual(sorted(classified), sorted(ordinary))
+            self.assertEqual(blocks[sass.identity.label(name, args, kwargs)], kwargs["layout"].value.block)
 
     def test_walk_kernels_compile_at_their_launch_blocks(self):
         """Compile the walk family's predictor halves at their layout's block, its solve and refresh at the owner's."""

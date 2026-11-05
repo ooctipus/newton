@@ -336,12 +336,8 @@ def held_tree_calls():
     Every held-tree operator requires body velocity, so the state kernels are
     recorded with it. Each layout yields its repair, finish and predictor and,
     outside motion-velocity layouts, whose stamps a copied bank may name, the
-    one-pass repair that compares input banks (the first repair of a captured
-    step) and the kernels of a launch large enough to classify: the
-    classification, the listed repair and the comparison pass. Owners classify
-    only layouts of ordinary motion; a motion-velocity layout keeps its
-    one-pass repair at any size. The switched layouts add the comparison
-    forms, the stage clocks and the repair and finish without body velocity.
+    repair that compares input banks. The switched layouts add the stage clocks
+    and the repair and finish without body velocity.
     A scalar-branch group of the held-tree owner has no layout: its repair,
     predict, finish and listed drive kernels are module-level kernels of
     ``scalar_branches``, which the pins family records.
@@ -351,8 +347,6 @@ def held_tree_calls():
 
     state = _unwrapped(native.get_state_kernel)
     predictor = _unwrapped(native.get_predictor_kernel)
-    classify = _unwrapped(native.get_classify_kernel)
-    bank = _unwrapped(native.get_bank_kernel)
     switched = ("chain_free13", "kinetic_fixed11_l16", "forest13_l16", "forest32")
     for layout_name, (tree, chain, response, repair_options) in held_tree_layouts().items():
         layout = {"layout": Named(layout_name, tree)}
@@ -386,11 +380,6 @@ def held_tree_calls():
         if "motion_velocity" not in repair_options:
             kwargs = {**layout, "body_velocity": True, "bank_coordinates": coordinates}
             yield "tree_kinetic_state.get_state_kernel", state, (False, schedules), kwargs
-            classify_options = {key: value for key, value in repair_options.items() if key != "motion_velocity"}
-            yield "tree_kinetic_state.get_classify_kernel", classify, (), {**layout, **classify_options}
-            kwargs = {**layout, **repair_options, "body_velocity": True, "listed": True}
-            yield "tree_kinetic_state.get_state_kernel", state, (False, schedules), kwargs
-            yield "tree_kinetic_state.get_bank_kernel", bank, (), {**layout, "coordinates": coordinates}
 
 
 def _walk_class(parent, first, half):

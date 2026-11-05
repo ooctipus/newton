@@ -232,21 +232,12 @@ def _tree_group(group) -> dict:
         # "content": a repair whose input bank is not the bank the cache was published into
         # compares the two banks word for word; "identity": the bank's pointers alone.
         "input_validation": "content" if group.bank_compare else "identity",
-        # On CUDA, a repair of more blocks than two listed grids lists the blocks that repair (and
-        # compare) and repairs over the list, every step (motion-velocity layouts keep one launch per
-        # block).
-        "classify_first": bool(group.classify_first),
         "motion_velocity": bool(group.motion_velocity),
         "publishes_twists": bool(group.publishes_twists),
         "kernels": {
             "repair": _key(group.repair_kernel),
             "finish": _key(group.finish_kernel),
             "predict": _key(group.predictor_kernel),
-            # A classified repair's classification and its input-bank comparison, a pass over the blocks the
-            # classification lists for comparison; None where the group does not classify (a one-pass
-            # repair compares inside its blocks).
-            "bank": _key(group.bank_kernel),
-            "classify": _key(group.classify_kernel),
         },
     }
 
@@ -256,10 +247,9 @@ def _scalar_group(group) -> dict:
 
     Its predict and finish run one thread per coordinate (``lanes``) and its
     repair one warp per articulation, so the tree layout's packing fields
-    (``trees_per_block``, ``block_dim``) are ``None``. Every repair launches,
-    and none is classified or compares input banks (``input_validation`` is
-    the group's, "identity"), so the comparison and classification kernels are
-    ``None``. ``drive_dofs`` counts the DOFs whose drives the drive kernel
+    (``trees_per_block``, ``block_dim``) are ``None``. Its repair compares no
+    input banks (``input_validation`` is the group's, "identity": the stamp
+    alone). ``drive_dofs`` counts the DOFs whose drives the drive kernel
     still prepares, since the group's predict evaluates its own.
     """
     size = int(group.size)
@@ -281,7 +271,6 @@ def _scalar_group(group) -> dict:
         "schedules": None,
         "response": "diagonal",
         "input_validation": "content" if group.bank_compare else "identity",
-        "classify_first": False,
         "motion_velocity": bool(group.motion_velocity),
         "publishes_twists": False,
         "drive_dofs": 0 if others is None else int(others.shape[0]),
@@ -289,8 +278,6 @@ def _scalar_group(group) -> dict:
             "repair": _key(group.repair_kernel),
             "finish": _key(group.finish_kernel),
             "predict": _key(group.predictor_kernel),
-            "bank": None,
-            "classify": None,
         },
     }
 

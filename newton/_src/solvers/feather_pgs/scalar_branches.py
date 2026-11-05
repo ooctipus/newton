@@ -136,6 +136,7 @@ def _publish_root(
     articulation_origin: wp.array[wp.vec3],
     current_valid: wp.array[int],
 ):
+    """Publish an articulation's root and mark its cache valid."""
     root = joint_child[root_joint]
     body_q[root] = X_root
     body_qd[root] = wp.spatial_vector()
@@ -151,6 +152,8 @@ def repair_scalar_branches(
     articulation_start: wp.array[int],
     articulation_dof_start: wp.array[int],
     current_valid: wp.array[int],
+    source: wp.array[wp.uint64],
+    bank: wp.uint64,
     clock: wp.array[Clock],
     dt: float,
     joint_child: wp.array[int],
@@ -165,16 +168,17 @@ def repair_scalar_branches(
     joint_S_s: wp.array[wp.spatial_vector],
     articulation_origin: wp.array[wp.vec3],
 ):
-    """Publish the input state of articulations with an invalid cache, one warp per articulation; a changed step
-    duration ``dt`` (:func:`.factor.kernels.clock_changed`) invalidates every cache.
+    """Publish the input state of articulations whose cache does not stand for the input bank ``bank`` (its
+    coordinates' address), one warp per articulation: an invalid cache, one stamped with another bank (``source``), or
+    a changed step duration ``dt`` (:func:`.factor.kernels.clock_changed`).
 
-    Validity is read only: ``finish`` publishes the next state and marks it valid.
+    Validity is read only: ``finish`` publishes the next state, stamps it and marks it valid.
     """
     tid = wp.tid()
     group = tid // _REPAIR_LANES
     lane = tid - group * _REPAIR_LANES
     art = group_to_art[group]
-    if current_valid[art] != 0 and clock_changed(clock[0], dt) == 0:
+    if current_valid[art] != 0 and source[group] == bank and clock_changed(clock[0], dt) == 0:
         return
     root_joint = articulation_start[art]
     root = joint_child[root_joint]
@@ -339,8 +343,11 @@ def finish_prismatic_branches(
     joint_S_s: wp.array[wp.spatial_vector],
     articulation_origin: wp.array[wp.vec3],
     current_valid: wp.array[int],
+    source: wp.array[wp.uint64],
+    bank: wp.uint64,
 ):
-    """Convert the solved velocity, integrate and publish prismatic leaves and their root."""
+    """Convert the solved velocity, integrate and publish prismatic leaves and their root, stamped with the output bank
+    ``bank`` (its coordinates' address)."""
     element = wp.tid()
     group = element // n
     local = element - group * n
@@ -376,6 +383,7 @@ def finish_prismatic_branches(
         _publish_root(
             art, root_joint, X_root, joint_child, body_com, body_q, body_qd, articulation_origin, current_valid
         )
+        source[group] = bank
 
 
 def branch_topology(model, articulations: np.ndarray, articulation_joint_end: np.ndarray) -> tuple:
@@ -524,9 +532,7 @@ class ScalarBranchState:
     drive stiffness and the motion axes of this substep are all at hand.
     """
 
-    # Comparing input banks needs device source tags; repairs here are cheap, so a
-    # changed state bank invalidates the cache instead, as ordinary dynamics does
-    # (the input validation by identity of TreeKineticState.bank_compare).
+    # The cache is stamped with the bank the finish published into; a repair compares the stamp, never the words.
     bank_compare = False
     motion_velocity = False
 
@@ -543,6 +549,8 @@ class ScalarBranchState:
         self._cache_to_art = self.group_to_art.reshape((self.group_count, 1))
         # The family holds no geometry cache; invalidation clears this flag only.
         self._geometry_valid = wp.zeros(self.group_count, dtype=int, device=device)
+        # Each articulation's stamp: the address of the coordinates its cache was published into (0: none).
+        self._source = wp.zeros(self.group_count, dtype=wp.uint64, device=device)
         self.repair_kernel = repair_scalar_branches
         self.predictor_kernel = predict_prismatic_branches
         self.finish_kernel = finish_prismatic_branches
@@ -597,14 +605,13 @@ class ScalarBranchState:
             self._geometry_valid,
         )
 
-    def begin(self, state_in, state_aug, stage3_qd, dt, *, state_out=None, continues=False):
-        """Publish the input state of articulations whose cache is invalid.
+    def begin(self, state_in, state_aug, stage3_qd, dt, *, state_out=None):
+        """Publish the input state of articulations whose cache does not stand for ``state_in``.
 
         ``state_out`` (the step's output bank) is not compared: the group
-        validates its input bank by identity (``bank_compare`` is ``False``),
-        and launches on every step, ``continues`` or not.
+        validates its input bank by its stamp alone (``bank_compare`` is ``False``).
         """
-        del stage3_qd, state_out, continues
+        del stage3_qd, state_out
         solver, model = self.solver, self.solver.model
         wp.launch(
             self.repair_kernel,
@@ -616,6 +623,8 @@ class ScalarBranchState:
                 model.articulation_start,
                 solver.forest.articulation_dof_start,
                 solver.factor.fk_id_cache_valid,
+                self._source,
+                wp.uint64(state_in.joint_q.ptr),
                 solver.factor.clock,
                 dt,
                 model.joint_child,
@@ -720,6 +729,8 @@ class ScalarBranchState:
                 state_aug.joint_S_s,
                 solver.factor.articulation_origin,
                 solver.factor.fk_id_cache_valid,
+                self._source,
+                wp.uint64(state_out.joint_q.ptr),
             ],
             device=model.device,
         )

@@ -109,12 +109,8 @@ class TestKernelIdentity(unittest.TestCase):
         """Record every layout's state kernels with body velocity, which every held-tree operator requires.
 
         Every layout records its finish and its repair. Layouts of ordinary
-        motion, at every lane width, also record the one-pass repair that
-        compares input banks and the kernels of a launch large enough to
-        classify: the classification, the listed repair and the comparison
-        pass. Owners classify no motion-velocity layout, so the grid records no
-        classification or listed repair of an alternate motion. The state
-        kernels without body velocity stay recorded as a switch of four
+        motion, at every lane width, also record the repair that compares input
+        banks. The state kernels without body velocity stay recorded as a switch of four
         layouts, both forests among them.
         """
         calls = [
@@ -122,7 +118,6 @@ class TestKernelIdentity(unittest.TestCase):
             for name, _, args, kwargs in identity.held_tree_calls()
         ]
         state = "tree_kinetic_state.get_state_kernel"
-        classify = "tree_kinetic_state.get_classify_kernel"
         for name, (tree, chain, _, options) in identity.held_tree_layouts().items():
             schedules = identity._schedules(tree, chain)
             with self.subTest(layout=name):
@@ -133,17 +128,8 @@ class TestKernelIdentity(unittest.TestCase):
                     self.assertIn((state, (finish, schedules), name, {**running, "body_velocity": True}), calls)
                 ordinary = not options.get("motion_velocity", False)
                 coordinates = tree.dofs + tree.free_root_count
-                for call in (
-                    (state, (False, schedules), name, {"body_velocity": True, "bank_coordinates": coordinates}),
-                    (classify, (), name, {}),
-                    (state, (False, schedules), name, {"body_velocity": True, "listed": True}),
-                    ("tree_kinetic_state.get_bank_kernel", (), name, {"coordinates": coordinates}),
-                ):
-                    self.assertEqual(call in calls, ordinary, call)
-        motion_classified = [
-            call for call in calls if call[3].get("motion_velocity") and (call[0] == classify or call[3].get("listed"))
-        ]
-        self.assertEqual(motion_classified, [])
+                call = (state, (False, schedules), name, {"body_velocity": True, "bank_coordinates": coordinates})
+                self.assertEqual(call in calls, ordinary, call)
         without = {layout for _, _, layout, options in calls if options.get("body_velocity") is False}
         self.assertEqual(without, {"chain_free13", "kinetic_fixed11_l16", "forest13_l16", "forest32"})
         layouts = identity.held_tree_layouts().values()

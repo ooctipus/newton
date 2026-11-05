@@ -161,7 +161,6 @@ class TreeFactor:
         # The last step's duration on the host, which the contact forces' export reads (sweep_plan.forces).
         self.last_step_dt = None
         # The held tree's cache of next-step dynamics.
-        self.fk_id_cache_source_state = None
         self.fk_id_cache_valid = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
         # The augmented state is allocated here rather than on the first step: a wp.zeros() issued inside a CUDA
         # graph capture becomes a memset node that replays every launch and wiped the cached bias forces (body_f_s)
@@ -534,7 +533,6 @@ class TreeFactor:
 
     def notify_state_changed(self, articulations: wp.array | None = None) -> None:
         """Invalidate the cached kinematics of ``articulations`` (``None``: every articulation)."""
-        self.held.continuation = None
         if articulations is None:
             self.fk_id_cache_valid.zero_()
             return
@@ -552,7 +550,6 @@ class TreeFactor:
         the COM frames on an inertial change."""
         # The held tree's proof stores a moved joint frame as its new reference, so it runs after every check that
         # can still refuse the notification.
-        self.held.continuation = None
         held = self.held
         frames_proven = held.validate_model(flags)
         cache_inputs = int(flags) & int(
@@ -593,10 +590,9 @@ class TreeFactor:
             )
             self.mass_update_requested.fill_(1)
 
-    def reset_cache(self, state, world_mask: wp.array | None) -> None:
-        """Invalidate the FK/ID cache of the worlds ``world_mask`` selects, and of every world when ``state`` is not
-        the state the cache was derived from (unless the held tree compares input banks)."""
-        self.held.continuation = None
+    def reset_cache(self, world_mask: wp.array | None) -> None:
+        """Invalidate the FK/ID cache of the worlds ``world_mask`` selects. A step from another state than the one the
+        cache was derived from needs nothing here: the repair's stamps name the bank each tree's cache holds."""
         wp.launch(
             invalidate_articulation_fk_id_cache,
             dim=self.model.articulation_count,
@@ -604,13 +600,6 @@ class TreeFactor:
             outputs=[self.fk_id_cache_valid],
             device=self.model.device,
         )
-        if (
-            self.fk_id_cache_source_state is not None
-            and state is not self.fk_id_cache_source_state
-            and not self.held.bank_compare
-        ):
-            self.fk_id_cache_valid.zero_()
-            self.fk_id_cache_source_state = state
 
     # ---------------------------------------------------------------------------------------------------------------
     # The step
@@ -640,11 +629,6 @@ class TreeFactor:
     def fk_id(self, state_in, state_out, qd: wp.array, dt: float) -> None:
         """Forward kinematics and inverse-dynamics terms, at the predictor's velocity ``qd`` (prescaled when
         limited)."""
-        if not self.held.bank_compare:
-            # Held trees that compare input banks validate a changed bank on the device.
-            if self.fk_id_cache_source_state is not None and state_in is not self.fk_id_cache_source_state:
-                self.fk_id_cache_valid.zero_()
-        self.fk_id_cache_source_state = state_in
         self.held.begin(state_in, self, qd, dt, state_out=state_out)
 
     def prepare_drives(
@@ -749,7 +733,6 @@ class TreeFactor:
         """Stage 7: ``qdd`` from the solved velocity, integrate the coordinates and publish the output state (with the
         next step's geometry where the clock refreshes it)."""
         self.held.finish(state_in, self, state_out, dt)
-        self.fk_id_cache_source_state = state_out
 
     # ---------------------------------------------------------------------------------------------------------------
     # The walk on the device (FL3.3): the converted class's factor as the one writer and the leave read it

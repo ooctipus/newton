@@ -18,7 +18,6 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import (
     cached_state_binding,
-    tree_kinetic_owner,
     tree_kinetic_state,
 )
 from newton._src.solvers.feather_pgs.factor.kernels import Clock
@@ -35,12 +34,6 @@ def fixed_lanes(lanes):
     """Pin every held-tree group's lane width (``tree_kinetic_state.held_lanes``), for packed layouts on trees
     whose data would choose another width."""
     return patch.object(tree_kinetic_state, "held_lanes", lambda tree, groups, device: lanes)
-
-
-def _one_tree_per_block(build, *args, **kwargs):
-    """``build(*args, **kwargs)`` with every held-tree group at 32 lanes: one tree per block, chain scans."""
-    with fixed_lanes(32):
-        return build(*args, **kwargs)
 
 
 def _set_clock(factor, refresh, ahead=0):
@@ -466,53 +459,42 @@ def _cpu_owner(*, motion_velocity=False, worlds=2, pins=None):
 
 
 class TestFeatherPGSInputBank(unittest.TestCase):
-    def test_bank_comparing_owner_keeps_validity_on_the_host(self):
-        """Skip the host's input-identity invalidation for an owner that compares input banks.
+    def test_host_keeps_no_input_identity(self):
+        """Leave validity to the device on a step or a reset from another bank than the last output.
 
-        The step and an episode reset leave current validity to the owner's device comparison
-        and the step hands the owner its output bank. An owner that validates by identity alone
-        (a motion-velocity layout) is still invalidated when the input is not the last output.
+        The repair's stamps name the bank each cache holds, so the host invalidates nothing when the input is not
+        the last output, and the step hands the owner its output bank.
         """
         model, solver, _, states, _augmented = _cpu_owner()
         calls = []
-        for bank_compare in (True, False):
-            with self.subTest(bank_compare=bank_compare):
-                solver.factor.held = SimpleNamespace(
-                    bank_compare=bank_compare,
-                    begin=lambda *args, **kwargs: calls.append(kwargs),
-                    invalidate=lambda world_mask=None: None,
-                )
-                expected = int(bank_compare)
-                solver.factor.fk_id_cache_valid.fill_(1)
-                solver.factor.fk_id_cache_source_state = states[1]
-                solver.factor.fk_id(states[0], states[1], states[0].joint_qd, DT)
-                np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), expected)
-                self.assertIs(calls[-1].get("state_out"), states[1])
-                solver.factor.fk_id_cache_valid.fill_(1)
-                solver.factor.fk_id_cache_source_state = states[1]
-                none = wp.zeros(model.world_count, dtype=wp.bool, device=model.device)
-                solver.reset(states[0], none)
-                np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), expected)
+        solver.factor.held = SimpleNamespace(
+            begin=lambda *args, **kwargs: calls.append(kwargs),
+            invalidate=lambda world_mask=None: None,
+        )
+        solver.factor.fk_id_cache_valid.fill_(1)
+        solver.factor.fk_id(states[0], states[1], states[0].joint_qd, DT)
+        solver.factor.fk_id(states[1], states[0], states[1].joint_qd, DT)
+        np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), 1)
+        self.assertIs(calls[-1].get("state_out"), states[0])
+        none = wp.zeros(model.world_count, dtype=wp.bool, device=model.device)
+        solver.reset(states[0], none)
+        np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), 1)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
     def test_cuda_copied_input_bank_repairs_nothing(self):
         """Keep every group's cache when each step copies its output bank back into its input bank.
 
         After the first step a steady copy-back rollout adds one generation per step (the finish),
-        for every owner kind, whether the repair compares inside its blocks (unclassified, the
-        fixtures' size) or in a pass before a classified repair: the comparison finds the copied
-        words and the repair exits. A second rollout invalidates every group before each step and
+        for every owner kind: the repair compares inside its blocks, finds the copied words and exits. A second rollout invalidates every group before each step and
         repairs twice as often. The trajectories agree with each other and with a ping-pong rollout.
         """
         device = wp.get_device("cuda:0")
         steps = 6
-        for name, classified in itertools.product(("mixed", "forest", "sparse"), (False, True)):
-            with self.subTest(owner=name, classified=classified):
+        for name in ("mixed", "forest", "sparse"):
+            with self.subTest(owner=name):
                 finals = {}
                 for mode, per_step in (("copy_back", 1), ("forced", 2), ("ping_pong", 1)):
                     model, solver, owner = self._owned(name, device)
-                    if classified:
-                        _classify_every_launch(owner)
                     rollout = _Rollout(model, solver, copy_back=mode != "ping_pong")
                     rollout.step()
                     before = _generations(owner)
@@ -537,18 +519,15 @@ class TestFeatherPGSInputBank(unittest.TestCase):
     def test_cuda_written_copy_repairs_its_world(self):
         """Repair exactly the world whose copied input coordinates were written in place without a notification.
 
-        The comparison (inside the one-pass repair or before a classified one) finds the changed
-        words, so that world recomputes from the written state, as a forced repair of every world
+        The comparison inside the repair finds the changed words, so that world recomputes from the written state, as a forced repair of every world
         does; the other worlds keep their caches.
         """
         device = wp.get_device("cuda:0")
-        for name, classified in itertools.product(("mixed", "sparse"), (False, True)):
-            with self.subTest(owner=name, classified=classified):
+        for name in ("mixed", "sparse"):
+            with self.subTest(owner=name):
                 finals = []
                 for forced in (False, True):
                     model, solver, owner = self._owned(name, device)
-                    if classified:
-                        _classify_every_launch(owner)
                     rollout = _Rollout(model, solver, copy_back=True)
                     rollout.block()
                     # The first revolute joint of world 1: one group owns its articulation.
@@ -577,34 +556,29 @@ class TestFeatherPGSInputBank(unittest.TestCase):
     def test_cuda_captured_copy_back_matches_eager(self):
         """Replay a captured copy-back step (collide, step, copy) and match eager stepping, repairing nothing.
 
-        The comparison is part of the graph, so each replay compares the copied bank again, inside
-        the one-pass repair or in a pass before a classified repair.
+        The comparison is part of the graph, so each replay compares the copied bank again inside the repair.
         """
         device = wp.get_device("cuda:0")
-        for classified in (False, True):
-            with self.subTest(classified=classified):
-                finals = []
-                for captured in (False, True):
-                    # One step per graph: refresh every step, as every replay does.
-                    model, solver, owner = self._owned("sparse", device, update_mass_matrix_interval=1)
-                    if classified:
-                        _classify_every_launch(owner)
-                    rollout = _Rollout(model, solver, copy_back=True)
+        finals = []
+        for captured in (False, True):
+            # One step per graph: refresh every step, as every replay does.
+            model, solver, owner = self._owned("sparse", device, update_mass_matrix_interval=1)
+            rollout = _Rollout(model, solver, copy_back=True)
+            rollout.step()
+            advance = rollout.step
+            if captured:
+                # Capture records the step without running it.
+                with wp.ScopedCapture(device=device) as capture:
                     rollout.step()
-                    advance = rollout.step
-                    if captured:
-                        # Capture records the step without running it.
-                        with wp.ScopedCapture(device=device) as capture:
-                            rollout.step()
-                        advance = functools.partial(wp.capture_launch, capture.graph)
-                    before = _generations(owner)
-                    for _ in range(5):
-                        advance()
-                    for start, end in zip(before, _generations(owner), strict=True):
-                        np.testing.assert_array_equal(end - start, 5, err_msg=f"{captured=}")
-                    finals.append({field: getattr(rollout.states[0], field).numpy() for field in STATE_FIELDS})
-                for field in STATE_FIELDS:
-                    np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=0.0, atol=2e-6, err_msg=field)
+                advance = functools.partial(wp.capture_launch, capture.graph)
+            before = _generations(owner)
+            for _ in range(5):
+                advance()
+            for start, end in zip(before, _generations(owner), strict=True):
+                np.testing.assert_array_equal(end - start, 5, err_msg=f"{captured=}")
+            finals.append({field: getattr(rollout.states[0], field).numpy() for field in STATE_FIELDS})
+        for field in STATE_FIELDS:
+            np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=0.0, atol=2e-6, err_msg=field)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
     def test_cuda_velocity_limit_layouts_validate_by_identity(self):
@@ -613,7 +587,7 @@ class TestFeatherPGSInputBank(unittest.TestCase):
         solver = _mixed_solver(model, enable_joint_velocity_limits=True)
         owner = solver.factor.held
         self.assertIsNotNone(owner)
-        self.assertFalse(owner.bank_compare)
+        self.assertFalse(any(group.bank_compare for group in _groups(owner)))
         rollout = _Rollout(model, solver, copy_back=True)
         rollout.step()
         before = _generations(owner)
@@ -634,19 +608,6 @@ class TestFeatherPGSInputBank(unittest.TestCase):
 
 
 @contextlib.contextmanager
-def _cleared_arrays():
-    """Run every ``wp.array.zero_`` and record, in the yielded list, the arrays it cleared."""
-    cleared, zero = [], wp.array.zero_
-
-    def record(array):
-        cleared.append(array)
-        return zero(array)
-
-    with patch.object(wp.array, "zero_", record):
-        yield cleared
-
-
-@contextlib.contextmanager
 def _counted_launches(kernels):
     """Run every tiled launch and count, in the yielded list, those of ``kernels``."""
     counted, launch = [0], wp.launch_tiled
@@ -660,27 +621,20 @@ def _counted_launches(kernels):
 
 
 def _repair_kernels(owner):
-    """Every group's one repair: one-pass (with or without a bank comparison) or over a block list."""
+    """Every group's one repair, with or without a bank comparison."""
     return {group.repair_kernel for group in _groups(owner)}
 
 
 def _repair_kind(group):
-    """The group's repair as :func:`_launch_kinds` counts it: ``listed`` (classified), ``bank_repair`` (one-pass,
-    comparing inside its blocks) or ``repair``."""
-    if group.classify_first:
-        return "listed"
+    """The group's repair as :func:`_launch_kinds` counts it: ``bank_repair`` (comparing banks inside its blocks) or
+    ``repair``."""
     return "bank_repair" if "_banked" in group.repair_kernel.key else "repair"
 
 
 @contextlib.contextmanager
 def _launch_kinds(owner):
-    """Run every launch and count, in the yielded counter, the owner's repair-family launches by kind."""
-    kinds = {}
-    for group in _groups(owner):
-        kinds.update(
-            {group.repair_kernel: _repair_kind(group), group.bank_kernel: "bank", group.classify_kernel: "classify"}
-        )
-    kinds.pop(None, None)
+    """Run every launch and count, in the yielded counter, the owner's repair launches by kind."""
+    kinds = {group.repair_kernel: _repair_kind(group) for group in _groups(owner)}
     counted = collections.Counter()
 
     def counting(launch):
@@ -695,48 +649,23 @@ def _launch_kinds(owner):
         yield counted
 
 
-def _force_classification(group, classify=True):
-    """Classify (or not) a group's repair launches on a one-block grid, whatever their size and device.
-
-    A fixture's launches have fewer blocks than the classification threshold, and CPU groups keep
-    the one-pass repair; a one-block grid also makes that block stride over every listed block.
-    """
-    group._classify_switch = True
-    group._repair_grid = 1
-    group._classify_above = 0 if classify else group.launch_count
-    group._bind_kernels()
-
-
-def _classify_every_launch(owner):
-    """Classify every repair launch of a small fixture on a one-block grid."""
-    for group in _groups(owner):
-        _force_classification(group)
-        if not group.classify_first:
-            raise AssertionError("The fixture's repair must be classified on CUDA")
-
-
 class TestFeatherPGSCapturedRepair(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
     def test_cuda_captured_steps_repair_on_the_device(self):
-        """Launch each group's repair on the first step of a captured block of 2 or 8 steps and replay it as eager
+        """Launch each group's repair on every step of a captured block of 2 or 8 steps and replay it as eager
         stepping does.
 
-        The device decides every group of the first step, which follows whatever ran between replays; the later
-        steps continue a finish of the same capture on the bank it published, whose groups would all take the early
-        exit, so they launch no repair. Worlds reset between replays repair, one-pass or classified; every cache
-        generation, geometry generation and state matches eager stepping, including the interval-2 geometry refresh
-        cadence.
+        The device decides every group of every step: the first follows whatever ran between replays, and the later
+        steps' groups, which continue a finish of the same capture on the bank it published, take the early exit.
+        Worlds reset between replays repair; every cache generation, geometry generation and state matches eager
+        stepping, including the interval-2 geometry refresh cadence.
         """
         device = wp.get_device("cuda:0")
-        for name, steps, classified in itertools.product(("mixed", "forest", "sparse"), (2, 8), (False, True)):
-            if classified and steps == 8:
-                continue
-            with self.subTest(owner=name, steps=steps, classified=classified):
+        for name, steps in itertools.product(("mixed", "forest", "sparse"), (2, 8)):
+            with self.subTest(owner=name, steps=steps):
                 finals = []
                 for captured in (False, True):
                     model, solver, owner = TestFeatherPGSInputBank._owned(name, device, update_mass_matrix_interval=2)
-                    if classified:
-                        _classify_every_launch(owner)
                     rollout = _Rollout(model, solver)
                     rollout.block()
 
@@ -751,7 +680,7 @@ class TestFeatherPGSCapturedRepair(unittest.TestCase):
                             wp.ScopedCapture(device=device) as capture,
                         ):
                             block()
-                        self.assertEqual(counted[0], len(_groups(owner)))
+                        self.assertEqual(counted[0], steps * len(_groups(owner)))
                         advance = functools.partial(wp.capture_launch, capture.graph)
                     for _ in range(3):
                         rollout.reset_worlds((1,))
@@ -866,8 +795,8 @@ class TestFeatherPGSColdCapture(unittest.TestCase):
         graph before any eager step, so the host cannot know at capture time which bank the
         replays' stamps will name. The captured repair compares on the device: after the first
         replay, which builds every cache, each replay adds one generation per group (its finish),
-        one-pass or classified, for the per-size groups (one tree per block, and four), the forest
-        and the free-root sparse tree. The same graph replayed with every group invalidated first
+        for the per-size groups (one tree per block, and four), the forest and the free-root sparse
+        tree. The same graph replayed with every group invalidated first
         repairs each time, and the two trajectories agree within 2e-6.
         """
         device = wp.get_device("cuda:0")
@@ -882,21 +811,15 @@ class TestFeatherPGSColdCapture(unittest.TestCase):
             self.assertEqual([group.layout.pack for group in _groups(solver.factor.held)], [4, 4])
             return model, solver, solver.factor.held
 
-        for name, classified in itertools.product(("mixed", "packed", "forest", "sparse"), (False, True)):
-            with self.subTest(owner=name, classified=classified):
+        for name in ("mixed", "packed", "forest", "sparse"):
+            with self.subTest(owner=name):
                 finals = []
                 for forced in (False, True):
                     model, solver, owner = build(name)
-                    if classified:
-                        _classify_every_launch(owner)
                     rollout = _Rollout(model, solver, copy_back=True)
                     with _launch_kinds(owner) as kinds, wp.ScopedCapture(device=device) as capture:
                         rollout.step()
-                    groups = len(_groups(owner))
-                    if classified:
-                        self.assertEqual(kinds, {"classify": groups, "bank": groups, "listed": groups})
-                    else:
-                        self.assertEqual(kinds, {"bank_repair": groups})
+                    self.assertEqual(kinds, {"bank_repair": len(_groups(owner))})
                     wp.capture_launch(capture.graph)  # builds every cache
                     before = _generations(owner)
                     for _ in range(replays - 1):
@@ -910,16 +833,15 @@ class TestFeatherPGSColdCapture(unittest.TestCase):
                     np.testing.assert_allclose(finals[0][field], finals[1][field], rtol=0.0, atol=2e-6, err_msg=field)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
-    def test_cuda_cold_captured_block_classifies_its_repairs(self):
-        """Classify the first repair of a two-step block captured before the solver stepped.
+    def test_cuda_cold_captured_block_repairs_on_the_device(self):
+        """Repair on the device on both steps of a two-step block captured before the solver stepped.
 
         In a ping-pong block (an even substep count) the first repair's replays follow resets the host
-        does not see at capture time, so it lists its blocks (and those to compare) on the device; the
-        second step continues the first's finish and launches none. A velocity-limit layout keeps the
-        one-pass repair on both steps, also when forced to classify. Replays with a
-        world reset before each match the same block captured with one-pass repairs: states within
-        2e-6 and, outside the velocity-limit layout (whose repairs follow clamped velocities that
-        separate instances may round apart), equal cache and geometry generations.
+        does not see at capture time; each step launches its group's one repair (comparing banks
+        outside the velocity-limit layout), and the device decides each group. Replays with a world
+        reset before each match eager stepping: states within 2e-6 and, outside the velocity-limit
+        layout (whose repairs follow clamped velocities that separate instances may round apart), equal
+        cache and geometry generations.
         """
         device = wp.get_device("cuda:0")
 
@@ -936,31 +858,21 @@ class TestFeatherPGSColdCapture(unittest.TestCase):
         for name, build in cases.items():
             with self.subTest(owner=name):
                 finals = []
-                for classified in (False, True):
+                for captured in (False, True):
                     model, solver = build()
                     owner = solver.factor.held
                     self.assertIsNotNone(owner)
-                    groups = len(_groups(owner))
-                    motion = name == "motion"
-                    if classified and motion:
-                        for group in _groups(owner):
-                            _force_classification(group)
-                            self.assertFalse(group.classify_first)
-                    elif classified:
-                        _classify_every_launch(owner)
                     rollout = _Rollout(model, solver)
-                    with _launch_kinds(owner) as kinds, wp.ScopedCapture(device=device) as capture:
-                        rollout.block()
-                    if motion:
-                        expected = {"repair": 2 * groups}
-                    elif classified:
-                        expected = {"classify": groups, "bank": groups, "listed": groups}
-                    else:
-                        expected = {"bank_repair": groups}
-                    self.assertEqual(kinds, expected)
+                    advance = rollout.block
+                    if captured:
+                        with _launch_kinds(owner) as kinds, wp.ScopedCapture(device=device) as capture:
+                            rollout.block()
+                        kind = "repair" if name == "motion" else "bank_repair"
+                        self.assertEqual(kinds, {kind: 2 * len(_groups(owner))})
+                        advance = functools.partial(wp.capture_launch, capture.graph)
                     for _ in range(4):
                         rollout.reset_worlds((1,))
-                        wp.capture_launch(capture.graph)
+                        advance()
                     finals.append(
                         {
                             **{field: getattr(rollout.states[0], field).numpy() for field in STATE_FIELDS},
@@ -969,110 +881,18 @@ class TestFeatherPGSColdCapture(unittest.TestCase):
                         }
                     )
                 for key in ("generation", "geometry_generation") if name != "motion" else ():
-                    for one_pass, listed in zip(finals[0][key], finals[1][key], strict=True):
-                        np.testing.assert_array_equal(listed, one_pass, err_msg=key)
+                    for eager, replayed in zip(finals[0][key], finals[1][key], strict=True):
+                        np.testing.assert_array_equal(replayed, eager, err_msg=key)
                 for field in STATE_FIELDS:
                     np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=0.0, atol=2e-6, err_msg=field)
 
 
-def _repair_arrays(group, data):
-    """Every array a group's repair reads or writes: its publication operands and its cache, by name."""
-    arrays = {}
-    for prefix, struct in (("data", data), ("cache", group.data)):
-        for name in struct._cls.vars:
-            value = getattr(struct, name)
-            if isinstance(value, wp.array) and name != "stage_clocks":
-                arrays[f"{prefix}.{name}"] = value
-    return arrays
-
-
-class TestFeatherPGSClassifiedRepair(unittest.TestCase):
-    def test_only_launches_above_two_grids_are_classified(self):
-        """Classify a repair only when its launch has more blocks than two listed grids.
-
-        Up to two grids the one-pass launch's early exits cost about what the classified repair's
-        launches do, and a copied bank is compared inside the one-pass repair. CPU has no listed
-        grid and keeps the one-pass repair: the owners are built with a one-block grid and switched
-        on as on CUDA, so two-world groups (two blocks) keep the one-pass repair, with the in-kernel
-        comparison, and three-world groups classify.
-        """
-        with patch.object(tree_kinetic_owner, "listed_repair_blocks", return_value=1):
-            small, large = _cpu_owner(worlds=2)[2], _cpu_owner(worlds=3)[2]
-        for owner, blocks, classified in ((small, 2, False), (large, 3, True)):
-            for group in owner.groups:
-                with self.subTest(blocks=blocks, bodies=group.layout.bodies):
-                    group._classify_switch = True
-                    group._bind_kernels()
-                    self.assertEqual((group._repair_grid, group.launch_count), (1, blocks))
-                    self.assertEqual(group.classify_first, classified)
-                    self.assertEqual(group.classify_kernel is not None, classified)
-                    self.assertEqual(_repair_kind(group), "listed" if classified else "bank_repair")
-
-    @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
-    def test_cuda_captured_motion_repair_above_two_grids_is_one_pass(self):
-        """Capture a velocity-limit repair above two listed grids as the one-pass launch, without a classification.
-
-        Built with a one-block listed grid and one tree per block (32 lanes), the owners' four-world
-        groups lie above the two-block threshold, as a 16384-world scene's groups do on the device's
-        own grid, and the owner decides on CUDA unforced. In a captured block of two steps each velocity-limit group
-        launches its one-pass repair twice, launches no classification and clears no block list; an
-        ordinary-motion owner of the same size classifies the first, and its second step, which continues the
-        first's finish, launches none. Replays with a world reset before each match eager
-        stepping of the same configuration within 2e-6.
-        """
-        device = wp.get_device("cuda:0")
-
-        def velocity_limits():
-            model = _build(device, worlds=4, speed_limit=0.8)
-            return model, _mixed_solver(model, enable_joint_velocity_limits=True, lanes=32)
-
-        for name, build in (("motion", velocity_limits), ("mixed", lambda: _owned_case("mixed", device, lanes=32))):
-            with self.subTest(owner=name):
-                motion = name == "motion"
-                finals = []
-                for captured in (False, True):
-                    with patch.object(tree_kinetic_owner, "listed_repair_blocks", return_value=1):
-                        model, solver = build()
-                    owner = solver.factor.held
-                    self.assertIsNotNone(owner)
-                    groups = _groups(owner)
-                    for group in groups:
-                        self.assertEqual(group.motion_velocity, motion)
-                        self.assertEqual((group._repair_grid, group._classify_above), (1, 2))
-                        self.assertGreater(group.launch_count, group._classify_above)
-                        self.assertEqual(group.classify_first, not motion)
-                    rollout = _Rollout(model, solver)
-                    advance = rollout.block
-                    if captured:
-                        with (
-                            _launch_kinds(owner) as kinds,
-                            _cleared_arrays() as cleared,
-                            wp.ScopedCapture(device=device) as capture,
-                        ):
-                            rollout.block()
-                        cleared_lists = [any(array is group._list_counts for array in cleared) for group in groups]
-                        count = len(groups)
-                        if motion:
-                            self.assertEqual(kinds, {"repair": 2 * count})
-                        else:
-                            self.assertEqual(kinds, {"classify": count, "bank": count, "listed": count})
-                        self.assertEqual(cleared_lists, [not motion] * len(groups))
-                        advance = functools.partial(wp.capture_launch, capture.graph)
-                    for _ in range(4):
-                        rollout.reset_worlds((1,))
-                        advance()
-                    finals.append({field: getattr(rollout.states[0], field).numpy() for field in STATE_FIELDS})
-                for field in STATE_FIELDS:
-                    np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=0.0, atol=2e-6, err_msg=field)
-
+class TestFeatherPGSRepairLaunches(unittest.TestCase):
     def check_owner_launches(self, device):
         """Run every launch form of ordinary and motion-velocity owners; each must match its kernel's parameters.
 
-        Three owners of two-world scenes take two steps and a copy-back begin: an ordinary owner
-        forced to classify on a one-block grid (classification and listed repair, then
-        classification, comparison pass and listed repair), an ordinary owner left unforced (the
-        one-pass repair that compares banks) and a motion-velocity owner forced alike (its one-pass
-        motion repair every time). Every held-tree
+        Two owners of two-world scenes take two steps and a copy-back begin: an ordinary owner (the
+        repair that compares banks) and a motion-velocity owner (its motion repair). Every held-tree
         launch, those at construction included, is checked before it runs, and every kernel each
         group bound must have run in a launch of that group's cache. These groups are per-size trees
         on kinetic plans.
@@ -1091,15 +911,8 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
 
             return launch_checked
 
-        # Each owner's (alternate motion, forced classification) and the kernels it binds besides its
-        # repair, finish and predictor.
-        owners = {
-            "classified": (False, True, {"classify", "bank"}),
-            "one_pass": (False, False, set()),
-            "motion": (True, True, set()),
-        }
         with patch.multiple(wp, launch=checked(wp.launch), launch_tiled=checked(wp.launch_tiled)):
-            for name, (motion, forced, bound) in owners.items():
+            for name, motion in (("compare", False), ("motion", True)):
                 with self.subTest(owner=name):
                     launched.clear()
                     model = _build(device, worlds=2, speed_limit=0.8 if motion else None)
@@ -1110,18 +923,12 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                     owner = HeldTree(solver)
                     groups = []
                     for group in owner.groups:
-                        if forced:
-                            _force_classification(group)
-                        self.assertEqual(group.classify_first, forced and not motion)
+                        self.assertEqual(group.bank_compare, not motion)
                         kernels = {
                             group.repair_kernel: "repair",
                             group.finish_kernel: "finish",
                             group.predictor_kernel: "predict",
-                            group.classify_kernel: "classify",
-                            group.bank_kernel: "bank",
                         }
-                        kernels.pop(None, None)
-                        self.assertEqual(sorted(kernels.values()), sorted({"repair", "finish", "predict", *bound}))
                         groups.append((group, kernels))
                     states, control = [model.state(), model.state()], model.control()
                     # A motion-velocity owner reads a prescaled velocity bank of its own.
@@ -1144,7 +951,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                     _set_clock(solver.factor, False)
                     owner.begin(states[1], solver.factor, velocities[1], DT, state_out=states[0])
                     # Checked per group, by the cache each held-tree launch passes: the owner holds two groups (a
-                    # free body and an arm), and every kind would still run with one group's classified forms skipped.
+                    # free body and an arm).
                     for group, kernels in groups:
                         ran = {kernel for kernel, inputs in launched if any(value is group.data for value in inputs)}
                         unlaunched = sorted(kind for kernel, kind in kernels.items() if kernel not in ran)
@@ -1153,166 +960,14 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                         self.assertTrue(all("_motion" in group.repair_kernel.key for group in owner.groups))
 
     def test_owner_launches_match_their_kernels(self):
-        """Launch every held-tree kernel an owner binds with one input of each parameter's type, on CPU.
-
-        The classification takes the six common arguments, not the motion input of the launch ABI
-        that every finish and repair shares; the classified forms are ordinary motion's. CPU owners
-        keep the one-pass repair, so classification is forced; see :meth:`check_owner_launches`.
-        """
+        """Launch every held-tree kernel an owner binds with one input of each parameter's type, on CPU; see
+        :meth:`check_owner_launches`."""
         self.check_owner_launches("cpu")
 
     @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
     def test_cuda_owner_launches_match_their_kernels(self):
         """Launch every held-tree kernel a CUDA owner binds, construction's lane timing included, with matching inputs."""
         self.check_owner_launches("cuda:0")
-
-    @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
-    def test_cuda_classified_repair_matches_the_one_pass_repair(self):
-        """Compute bitwise the same caches and publication with the classified repair as with one block per group.
-
-        From one device state with random invalid, requested, geometrically stale and
-        foreign-stamped groups, the one-pass repair and the classified repair write identical words
-        to every array the repair reaches, for packed per-size groups, a packed forest and sparse trees
-        of one tree per block. The blocks the classification lists are exactly those with a group the
-        one-pass repair recomputed. (Velocity-limit layouts keep the one-pass repair.)
-        """
-        device = wp.get_device("cuda:0")
-        rng = np.random.default_rng(20261019)
-        # Eight lanes per tree: four trees share each block of the per-size groups and of the forest.
-        cases = {
-            "mixed": lambda: _mixed_solver(_build(device, worlds=8), lanes=8),
-            "forest": lambda: _mixed_solver(_build(device, worlds=8, prescribed=True), forest=True, lanes=8),
-            "sparse": lambda: _one_tree_per_block(_owned_case, "sparse", device)[1],
-        }
-        for name, build in cases.items():
-            with self.subTest(owner=name):
-                solver = build()
-                owner = solver.factor.held
-                self.assertIsNotNone(owner)
-                # On a one-block grid, which also makes that block stride over every listed block.
-                _classify_every_launch(owner)
-                packs = [group.layout.pack for group in _groups(owner)]
-                self.assertTrue(all(pack == 4 for pack in packs) if name != "sparse" else packs == [1], packs)
-                self.assertEqual(name == "sparse", _groups(owner)[0].chains)
-                rollout = _Rollout(solver.model, solver)
-                rollout.block()
-                state = rollout.states[0]
-                for seed in range(4):
-                    data = _groups(owner)[0]._publication(state, solver.factor, state, DT)
-                    arrays = {}
-                    for index, group in enumerate(_groups(owner)):
-                        arrays.update({f"{index}.{key}": value for key, value in _repair_arrays(group, data).items()})
-                    arrays["requests"] = solver.factor.mass_update_requested
-                    self._scramble(rng, owner, solver)
-                    start = {key: value.numpy().copy() for key, value in arrays.items()}
-                    results = []
-                    for classify in (False, True):
-                        for key, value in arrays.items():
-                            value.assign(start[key])
-                        for group in _groups(owner):
-                            _force_classification(group, classify)
-                        _set_clock(solver.factor, bool(seed % 2))
-                        # Each group's repair: the scramble wrote behind the solver, which the owner's record of the
-                        # last finish (HeldTree.begin) does not see.
-                        for group in _groups(owner):
-                            group.begin(state, solver.factor, state.joint_qd, DT)
-                        results.append({key: value.numpy().copy() for key, value in arrays.items()})
-                        if classify:
-                            listed = [
-                                np.sort(group._repair_blocks.numpy()[: int(group._list_counts.numpy()[0])])
-                                for group in _groups(owner)
-                            ]
-                    for key in arrays:
-                        np.testing.assert_array_equal(results[1][key], results[0][key], err_msg=f"{name} {seed} {key}")
-                    for index, (group, blocks) in enumerate(zip(_groups(owner), listed, strict=True)):
-                        generation = f"{index}.cache.generation"
-                        repaired = results[0][generation] != start[generation]
-                        expected = np.flatnonzero(repaired.reshape(-1, group.layout.pack).any(axis=1))
-                        np.testing.assert_array_equal(blocks, expected, err_msg=f"{name} {seed} group {index}")
-
-    @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
-    def test_cuda_classified_comparison_matches_the_one_pass_comparison(self):
-        """Compare copied banks bitwise alike in the classified repair and in the one-pass repair.
-
-        After copy-back steps every group is stamped with the output bank and the input bank holds
-        its words. From random invalid, requested, geometrically stale and foreign-stamped groups
-        and random words written into the input bank, the classified repair (the classification
-        lists the copied groups' blocks, a pass compares them and lists the blocks that still need
-        a repair) and the one-pass repair that compares inside its blocks write identical words to
-        every array the repair reaches, for packed per-size groups and a packed forest (four trees
-        per block, so a block can hold equal, unequal and repairing groups at once) and chain-scan
-        sparse trees. The repair list holds exactly the blocks with a recomputed group, once each.
-        """
-        device = wp.get_device("cuda:0")
-        rng = np.random.default_rng(20261020)
-        cases = {
-            "mixed": lambda: _mixed_solver(_build(device, worlds=8), lanes=8),
-            "forest": lambda: _mixed_solver(_build(device, worlds=8, prescribed=True), forest=True, lanes=8),
-            "sparse": lambda: _one_tree_per_block(_owned_case, "sparse", device)[1],
-        }
-        for name, build in cases.items():
-            with self.subTest(owner=name):
-                solver = build()
-                owner = solver.factor.held
-                self.assertIsNotNone(owner)
-                self.assertTrue(owner.bank_compare)
-                packs = [group.layout.pack for group in _groups(owner)]
-                self.assertTrue(all(pack == 4 for pack in packs) if name != "sparse" else packs == [1], packs)
-                rollout = _Rollout(solver.model, solver, copy_back=True)
-                rollout.block()
-                state, output = rollout.states
-                data = _groups(owner)[0]._publication(state, solver.factor, state, DT)
-                arrays = {}
-                for index, group in enumerate(_groups(owner)):
-                    arrays.update({f"{index}.{key}": value for key, value in _repair_arrays(group, data).items()})
-                arrays["requests"] = solver.factor.mass_update_requested
-                for group in _groups(owner):
-                    np.testing.assert_array_equal(group.data.source_q.numpy(), output.joint_q.ptr)
-                for seed in range(4):
-                    self._scramble(rng, owner, solver)
-                    q = state.joint_q.numpy()
-                    q[rng.random(q.size) < 0.05] += np.float32(0.01)
-                    state.joint_q.assign(q)
-                    start = {key: value.numpy().copy() for key, value in arrays.items()}
-                    results = []
-                    for classify in (False, True):
-                        for key, value in arrays.items():
-                            value.assign(start[key])
-                        for group in _groups(owner):
-                            _force_classification(group, classify)
-                            self.assertEqual(group.classify_first, classify)
-                        _set_clock(solver.factor, bool(seed % 2))
-                        owner.begin(state, solver.factor, state.joint_qd, DT, state_out=output)
-                        results.append({key: value.numpy().copy() for key, value in arrays.items()})
-                        if classify:
-                            listed = [
-                                group._repair_blocks.numpy()[: int(group._list_counts.numpy()[0])]
-                                for group in _groups(owner)
-                            ]
-                    for key in arrays:
-                        np.testing.assert_array_equal(results[1][key], results[0][key], err_msg=f"{name} {seed} {key}")
-                    for index, (group, blocks) in enumerate(zip(_groups(owner), listed, strict=True)):
-                        generation = f"{index}.cache.generation"
-                        repaired = results[0][generation] != start[generation]
-                        expected = np.flatnonzero(repaired.reshape(-1, group.layout.pack).any(axis=1))
-                        np.testing.assert_array_equal(np.sort(blocks), expected, err_msg=f"{name} {seed} group {index}")
-
-    @staticmethod
-    def _scramble(rng, owner, solver):
-        """Invalidate, request, stale and foreign-stamp random groups."""
-        arts = solver.model.articulation_count
-        valid = solver.factor.fk_id_cache_valid.numpy()
-        valid[rng.random(arts) < 0.3] = 0
-        solver.factor.fk_id_cache_valid.assign(valid)
-        solver.factor.mass_update_requested.assign((rng.random(arts) < 0.2).astype(np.int32))
-        for group in _groups(owner):
-            count = group.group_count
-            geometry = group.geometry_valid.numpy()
-            geometry[rng.random(count) < 0.2] = 0
-            group.geometry_valid.assign(geometry)
-            stamps = group.data.source_q.numpy()
-            stamps[rng.random(count) < 0.2] = 12345
-            group.data.source_q.assign(stamps)
 
 
 if __name__ == "__main__":

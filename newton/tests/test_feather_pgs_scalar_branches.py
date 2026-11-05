@@ -458,19 +458,14 @@ def check_owner_launches(test, device):
     """Launch every kernel of an owner beside scalar branches; each launch must match its kernel's parameters.
 
     The owner composition of the held-tree launch check (``check_owner_launches`` of the cache-validity
-    tests) that the keyboard class takes: a scalar group beside an arm's tree group. The scalar group
-    holds no bank stamps, so the tree group binds no comparison: forced to classify on a one-block grid
-    it binds the classification and the listed repair, otherwise its one-pass repair alone. Each owner
-    takes two steps, the other DOFs' drive preparation included, and a copy-back begin. Every held-tree
-    and scalar launch is checked before it runs, the scalar kernels' outputs included, and every kernel
+    tests) that the keyboard class takes: a scalar group beside an arm's tree group, whose repair compares
+    input banks. The owner takes two steps, the other DOFs' drive preparation included, and a copy-back begin.
+    Every held-tree and scalar launch is checked before it runs, the scalar kernels' outputs included, and every kernel
     each group bound must have run: a tree group's by the cache its launches pass, the scalar group's by
     kernel. On CPU the owner is built directly, as ``cached_dynamics`` builds it on CUDA, where the
     recipe's solver installs it (construction's lane timing included).
     """
-    from newton.tests.test_feather_pgs_cache_validity import (  # noqa: PLC0415
-        _force_classification,
-        _input_mismatches,
-    )
+    from newton.tests.test_feather_pgs_cache_validity import _input_mismatches  # noqa: PLC0415
 
     device = wp.get_device(device)
     scalar_kernels = {
@@ -492,80 +487,68 @@ def check_owner_launches(test, device):
 
         return launch_checked
 
-    for forced in (True, False):
-        with test.subTest(classified=forced):
-            launched.clear()
-            with mock.patch.multiple(wp, launch=checked(wp.launch), launch_tiled=checked(wp.launch_tiled)):
-                if device.is_cpu:
-                    model = build_branch_model(device, worlds=2)
-                    solver = cpu_solver(model, branch_size(model))
-                    solver._scalar_branches, _reason = sb.plan_scalar_branches(solver)
-                    owner = HeldTree(solver)
-                else:
-                    model = build_branch_model(device, worlds=2, leaves=PRESS_LEAVES, shapes=True)
-                    solver = recipe_solver(model, scalar=True)
-                    owner = solver.factor.held
-                test.assertIsInstance(owner, HeldTree)
-                test.assertIsInstance(owner.scalar, sb.ScalarBranchState)
-                test.assertFalse(owner.bank_compare)
-                groups = []
-                for group in owner.groups:
-                    if group is owner.scalar:
-                        kernels = {
-                            group.repair_kernel: "repair",
-                            group.predictor_kernel: "predict",
-                            group.finish_kernel: "finish",
-                            tree_factor.prepare_augmented_drives: "drives",
-                        }
-                    else:
-                        if forced:
-                            _force_classification(group)
-                        test.assertEqual(group.classify_first, forced)
-                        test.assertFalse(group.bank_compare)
-                        kernels = {
-                            group.repair_kernel: "repair",
-                            group.finish_kernel: "finish",
-                            group.predictor_kernel: "predict",
-                            group.classify_kernel: "classify",
-                            group.bank_kernel: "bank",
-                        }
-                        kernels.pop(None, None)
-                        bound = {"classify"} if forced else set()
-                        test.assertEqual(sorted(kernels.values()), sorted({"repair", "finish", "predict", *bound}))
-                    groups.append((group, kernels))
-                test.assertEqual(sum(group is owner.scalar for group, _ in groups), 1)
-                states, control = [model.state(), model.state()], model.control()
-                for source, refresh in ((0, True), (1, False)):
-                    state, output = states[source], states[1 - source]
-                    _set_clock(solver.factor, refresh)
-                    owner.begin(state, solver.factor, state.joint_qd, DT)
-                    if owner.scalar.other_drive_dofs is not None:
-                        solver.factor.prepare_drives(
-                            state, control, DT, solver.v_hat, solver.v_out, owner.scalar.other_drive_dofs
-                        )
-                    solver.factor.mass_update_mask.fill_(1)
-                    owner.refresh(solver.factor)
-                    solver.factor.walk_step(state, DT)
-                    owner.predict(state, solver.factor, control, state.joint_qd, DT)
-                    solver.v_out.assign(solver.v_hat)
-                    _set_clock(solver.factor, refresh, ahead=1)
-                    owner.finish(state, solver.factor, output, DT)
-                # A copy of the bank the last finish published, one coordinate changed: identity validation
-                # launches the one-pass repair, which compares nothing.
-                states[1].assign(states[0])
-                coordinates = states[1].joint_q.numpy()
-                coordinates[0] += np.float32(0.01)
-                states[1].joint_q.assign(coordinates)
-                _set_clock(solver.factor, False)
-                owner.begin(states[1], solver.factor, states[1].joint_qd, DT, state_out=states[0])
-            for group, kernels in groups:
-                if group is owner.scalar:
-                    ran = {kernel for kernel, _ in launched}
-                else:
-                    ran = {kernel for kernel, inputs in launched if any(value is group.data for value in inputs)}
-                unlaunched = sorted(kind for kernel, kind in kernels.items() if kernel not in ran)
-                test.assertEqual(unlaunched, [], type(group).__name__)
-            test.assertTrue(np.isfinite(states[0].joint_q.numpy()).all())
+    with mock.patch.multiple(wp, launch=checked(wp.launch), launch_tiled=checked(wp.launch_tiled)):
+        if device.is_cpu:
+            model = build_branch_model(device, worlds=2)
+            solver = cpu_solver(model, branch_size(model))
+            solver._scalar_branches, _reason = sb.plan_scalar_branches(solver)
+            owner = HeldTree(solver)
+        else:
+            model = build_branch_model(device, worlds=2, leaves=PRESS_LEAVES, shapes=True)
+            solver = recipe_solver(model, scalar=True)
+            owner = solver.factor.held
+        test.assertIsInstance(owner, HeldTree)
+        test.assertIsInstance(owner.scalar, sb.ScalarBranchState)
+        groups = []
+        for group in owner.groups:
+            if group is owner.scalar:
+                kernels = {
+                    group.repair_kernel: "repair",
+                    group.predictor_kernel: "predict",
+                    group.finish_kernel: "finish",
+                    tree_factor.prepare_augmented_drives: "drives",
+                }
+            else:
+                test.assertTrue(group.bank_compare)
+                kernels = {
+                    group.repair_kernel: "repair",
+                    group.finish_kernel: "finish",
+                    group.predictor_kernel: "predict",
+                }
+            groups.append((group, kernels))
+        test.assertEqual(sum(group is owner.scalar for group, _ in groups), 1)
+        states, control = [model.state(), model.state()], model.control()
+        for source, refresh in ((0, True), (1, False)):
+            state, output = states[source], states[1 - source]
+            _set_clock(solver.factor, refresh)
+            owner.begin(state, solver.factor, state.joint_qd, DT)
+            if owner.scalar.other_drive_dofs is not None:
+                solver.factor.prepare_drives(
+                    state, control, DT, solver.v_hat, solver.v_out, owner.scalar.other_drive_dofs
+                )
+            solver.factor.mass_update_mask.fill_(1)
+            owner.refresh(solver.factor)
+            solver.factor.walk_step(state, DT)
+            owner.predict(state, solver.factor, control, state.joint_qd, DT)
+            solver.v_out.assign(solver.v_hat)
+            _set_clock(solver.factor, refresh, ahead=1)
+            owner.finish(state, solver.factor, output, DT)
+        # A copy of the bank the last finish published, one coordinate changed: the tree group's repair compares
+        # the banks and repairs, the scalar group's stamp names the other bank.
+        states[1].assign(states[0])
+        coordinates = states[1].joint_q.numpy()
+        coordinates[0] += np.float32(0.01)
+        states[1].joint_q.assign(coordinates)
+        _set_clock(solver.factor, False)
+        owner.begin(states[1], solver.factor, states[1].joint_qd, DT, state_out=states[0])
+    for group, kernels in groups:
+        if group is owner.scalar:
+            ran = {kernel for kernel, _ in launched}
+        else:
+            ran = {kernel for kernel, inputs in launched if any(value is group.data for value in inputs)}
+        unlaunched = sorted(kind for kernel, kind in kernels.items() if kernel not in ran)
+        test.assertEqual(unlaunched, [], type(group).__name__)
+    test.assertTrue(np.isfinite(states[0].joint_q.numpy()).all())
 
 
 class TestScalarBranchRule(unittest.TestCase):
@@ -635,17 +618,15 @@ class TestScalarBranchRule(unittest.TestCase):
                 self.assertIsNone(kinds)
                 self.assertIn(words, reason)
 
-    def test_tree_groups_beside_scalar_branches_validate_by_identity(self):
-        """Bind and launch no input-bank comparison beside scalar branches, and record identity validation.
+    def test_tree_groups_beside_scalar_branches_compare_banks(self):
+        """Compare input banks in the tree groups beside scalar branches, as without them, and record it.
 
-        The scalar group holds no bank stamps, so its owner validates a changed
-        input bank by identity: the solver invalidates every cache of the owner,
-        and the arm's tree group could only compare words whose cache was
-        discarded. After a finish into ``s1`` a step that reads ``s0`` (a copy
-        of ``s1`` after an odd substep count) launches the arm's ordinary repair
-        and the scalar repair. Without scalar branches the same solver's tree
-        groups compare that bank and record content validation. Launches are
-        recorded, not run.
+        The scalar group's cache is stamped with the bank its finish published
+        into, and its repair compares the stamp alone ("identity"). After a
+        finish into ``s1`` a step that reads ``s0`` (a copy of ``s1`` after an
+        odd substep count) launches the arm's comparing repair and the scalar
+        repair. Without scalar branches the same solver's tree groups compare
+        that bank too. Launches are recorded, not run.
         """
         model = build_branch_model(worlds=2)
         solver = cpu_solver(model, 7)
@@ -669,22 +650,18 @@ class TestScalarBranchRule(unittest.TestCase):
                 call()
             return [kinds[kernel] for kernel in launched if kernel in kinds]
 
-        expected = {
-            "scalar": (False, "identity", ["repair", "repair"]),
-            "plain": (True, "content", ["compare", "compare"]),
-        }
+        expected = {"scalar": ["compare", "repair"], "plain": ["compare", "compare"]}
         for name, owner in owners.items():
-            compare, validation, copy_back = expected[name]
+            copy_back = expected[name]
             with self.subTest(owner=name):
-                self.assertEqual(owner.bank_compare, compare)
                 for group in owner.groups:
+                    if group is owner.scalar:
+                        self.assertEqual(path_selection._scalar_group(group)["input_validation"], "identity")
+                        continue
                     record = path_selection._tree_group(group)
-                    self.assertEqual(record["input_validation"], validation)
-                    self.assertEqual(group.bank_compare, compare)
-                    # Nothing that compares is bound where nothing may compare: the one-pass repair compares inside
-                    # its blocks exactly where the group compares.
-                    self.assertIsNone(record["kernels"]["bank"])
-                    self.assertEqual("_banked" in record["kernels"]["repair"], compare)
+                    self.assertEqual(record["input_validation"], "content")
+                    self.assertTrue(group.bank_compare)
+                    self.assertIn("_banked", record["kernels"]["repair"])
                 launches(lambda owner=owner: owner.finish(s0, solver.factor, s1, DT))
                 self.assertEqual(
                     launches(lambda owner=owner: owner.begin(s0, solver.factor, s0.joint_qd, DT, state_out=s1)),
@@ -694,8 +671,7 @@ class TestScalarBranchRule(unittest.TestCase):
     def test_owner_launches_match_their_kernels(self):
         """Launch every kernel of an owner beside scalar branches with one input of each parameter's type, on CPU.
 
-        CPU owners keep the one-pass repair, so the arm group's classification is forced; see
-        :func:`check_owner_launches`.
+        See :func:`check_owner_launches`.
         """
         check_owner_launches(self, "cpu")
 

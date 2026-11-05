@@ -19,24 +19,12 @@ from types import SimpleNamespace
 import numpy as np
 import warp as wp
 
-from ...sim.contacts import capture_scope
 from . import field_group, host_index
 from .device_proof import DeviceProof
 from .tree_kinetic_owner import TreeKineticState, proof_runs
 from .tree_kinetic_plan import make_plan, tree_joints
 from .tree_kinetic_state import GroupTrees, HeldResponse
 from .tree_plan import TreePlan, local_parents
-
-
-def _continuation(state, dt: float) -> tuple | None:
-    """What a finish publishing into ``state`` leaves the next step's repair: the bank (its coordinates and velocities),
-    the capture scope that records it (``None`` eagerly) and the step's duration; ``None`` inside a capture Warp does
-    not know, whose steps nothing can tell apart from another capture's."""
-    device = state.joint_q.device
-    scope = capture_scope(device)
-    if scope is None and device.is_capturing:
-        return None
-    return scope, state.joint_q.ptr, state.joint_qd.ptr, dt
 
 
 def operator_metadata(mass) -> dict:
@@ -488,18 +476,13 @@ class HeldTree:
 
     def __init__(self, solver):
         self.solver = solver
-        # One read of the kernel switches for every group this owner composes: the stage clocks, and the test pin
-        # repair_classify=False (SolverFeatherPGS._route_pins), which keeps the one-pass repair over every block.
+        # One read of the stage clocks for every group this owner composes.
         self.clocked = solver.options.diagnostics.stage_clocks
-        classify = solver._route_pins.get("repair_classify", True)
-        # What the last finish left the next step (_continuation); an invalidation or a notification forgets it.
-        self.continuation = None
         self.scalar = None
         if not (solver.model.joint_count and solver.model.articulation_count):
             # Nothing to evaluate: the step reads no group.
             self.coverage = self.forest_reason = None
             self.groups = []
-            self.bank_compare = True
             return
         if solver.placement.sparse_mass_matrix_size is not None:
             # The sparse class: one complete group, which proves its own coverage (make_plan).
@@ -523,11 +506,6 @@ class HeldTree:
                 complete=complete,
                 response=operator.response,
                 clocked=self.clocked,
-                classify=classify,
-                # Scalar branches hold no bank stamps, so beside them a changed input bank
-                # invalidates every cache of the owner (bank_compare below), and a tree group
-                # that compared would compare words whose cache was already discarded.
-                compare_banks=scalar is None,
             )
             operator.kinetic_state = group
             self.groups.append(group)
@@ -540,11 +518,6 @@ class HeldTree:
             # sparse-diagonal pair always leaves a tree group beside it.
             self.scalar = ScalarBranchState(solver, scalar)
             self.groups.append(self.scalar)
-        # Every tree group compares input banks (fixed and free roots alike) unless the
-        # solver prescales velocities; see TreeKineticState. Beside scalar branches, which
-        # do not, every group validates a changed input bank by identity, and the solver
-        # invalidates the whole owner.
-        self.bank_compare = all(group.bank_compare for group in self.groups)
 
     def _dense_groups(self, solver, scalar) -> list:
         """The held groups of dense or compact coordinates: one per world (a forest) where the default or a test pin
@@ -624,23 +597,14 @@ class HeldTree:
 
     def invalidate(self, world_mask=None):
         """Invalidate all component caches for selected worlds."""
-        self.continuation = None
         for group in self.groups:
             group.invalidate(world_mask)
 
     def begin(self, state, augmented, velocity, dt, *, state_out=None):
-        """Repair every current component before any factor or force consumer (see :meth:`TreeKineticState.begin`).
-
-        A step that continues the last finish (:func:`_continuation`: its input the bank that finish published into,
-        in the same capture scope, at the same duration, no invalidation or notification between) finds every cache
-        that finish published current, so the groups whose repair would only confirm it launch none: in a graph, the
-        second step of a captured pair.
-        """
-        key = _continuation(state, dt)
-        continues = key is not None and key == self.continuation
-        self.continuation = None
+        """Repair every current component before any factor or force consumer (see :meth:`TreeKineticState.begin`):
+        each group's device decides which of its trees recompute."""
         for group in self.groups:
-            group.begin(state, augmented, velocity, dt, state_out=state_out, continues=continues)
+            group.begin(state, augmented, velocity, dt, state_out=state_out)
 
     def refresh(self, augmented):
         """Preserve independent factor masks and numerical representations."""
@@ -656,7 +620,6 @@ class HeldTree:
         """Integrate and publish each physical coordinate and body once."""
         for group in self.groups:
             group.finish(state, augmented, output, dt)
-        self.continuation = _continuation(output, dt)
 
 
 def install(solver) -> HeldTree:
