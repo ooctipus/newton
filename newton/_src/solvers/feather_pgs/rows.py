@@ -1181,14 +1181,14 @@ class RowLaws:
         )
 
     def write_slot_rows(self, solver, contact_input: ContactInput, law, dt: float) -> None:
-        """The sparse diagonal's one writer (:func:`.walk_rows.write_slot_rows`): every dense row, or under the compact
+        """The sparse diagonal's one writer (:func:`.walk_rows.slot_writer`): every dense row, or under the compact
         boundary its limit prefix, walked into the slots sink with its diagonal, incident velocity and rhs."""
         placement = solver.placement
         prefix = bool(placement.compact_contact_boundary)
         rows = max(int(placement.dense_internal_max_rows), 1) if prefix else placement.dense_max_constraints
         lanes = min(rows, BIAS_LANES)
         wp.launch(
-            walk_rows.write_slot_rows,
+            walk_rows.slot_writer(solver),
             dim=(solver.forest.world_count, lanes),
             inputs=[
                 bind_dense_rows(placement),

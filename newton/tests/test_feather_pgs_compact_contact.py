@@ -4,8 +4,8 @@
 """The compact boundary against the sparse diagonal's one writer (FL3.5): one row law and walk, two mappings.
 
 The compact boundary writes the sparse diagonal's contact rows where it reads the contacts
-(:func:`.compact_contact.produce_contacts`); without it the one writer walks them from their unit sources
-(:func:`.walk_rows.write_slot_rows`). Both call the same row functions, so on a real two-world model (a 108-key star
+(:func:`.compact_contact.contacts_kernel`); without it the one writer walks them from their unit sources
+(:func:`.walk_rows.slot_rows_kernel`). Both call the same row functions, so on a real two-world model (a 108-key star
 beside a six-coordinate chain) their steps, rows, impulses and anchor history agree. The rows' arithmetic is held to
 the walk's invariants in ``test_feather_pgs_walk_rows`` (:class:`TestSlotFrame`).
 """

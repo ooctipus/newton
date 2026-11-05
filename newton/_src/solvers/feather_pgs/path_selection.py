@@ -310,7 +310,7 @@ def _row_builder(solver, plan, size) -> dict:
         if solver.spec.case == "K1":
             writers = (solver.sweep.support_units_kernel, solver.sweep.support_rows)
         elif solver.spec.case == "K2":
-            writers = (walk_rows.write_slot_rows,)
+            writers = (walk_rows.slot_writer(solver),)
         else:
             # The general placement's rows in two parts: the topology's, walked in blocks, and the rest.
             writers = (walk_rows.writer_kernel(solver, walk_rows.WRITE_TOPOLOGY), walk_rows.writer_kernel(solver))
@@ -325,7 +325,7 @@ def _row_builder(solver, plan, size) -> dict:
         from . import compact_contact, walk_rows  # noqa: PLC0415 - the owner's modules; loaded with the owner
 
         # The boundary writes the contact rows whole; the one writer walks the limit prefix (walk_rows).
-        kernels = (compact_contact.produce_contacts, walk_rows.write_slot_rows, *marker)
+        kernels = (compact_contact.contact_producer(solver), walk_rows.slot_writer(solver), *marker)
     else:
         raise ValueError(f"No contact-row builder kernels are known for the method {method!r}.")
     entry = {"method": method, "kernels": _kernel_names(kernels)}

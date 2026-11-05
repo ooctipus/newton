@@ -268,6 +268,11 @@ def _dense_build_calls():
     for args in ((0, False), (8, True)):
         block = (*args, True, tables, walk_rows.WRITER_BLOCK_ROWS)
         yield "walk_rows.walked_rows_kernel", walk_rows.walked_rows_kernel.__wrapped__, block, {}
+    # The sparse diagonal's one writer and the compact boundary's producer, the star's walkers on the same classes.
+    from newton._src.solvers.feather_pgs import compact_contact  # noqa: PLC0415
+
+    yield "walk_rows.slot_rows_kernel", walk_rows.slot_rows_kernel.__wrapped__, (True, tables), {}
+    yield "compact_contact.contacts_kernel", compact_contact.contacts_kernel.__wrapped__, (True, tables), {}
 
 
 def _solver_factory_calls():
@@ -560,7 +565,8 @@ class TestFeatherPGSKernelPins(unittest.TestCase):
             "sweep_routes_local.paired_factor_kernel",
             "keyed_rows.get_parallel_factory",
             "row_slots.allocate_world_contact_slots",
-            "compact_contact.produce_contacts",
+            "compact_contact.contacts_kernel",
+            "walk_rows.slot_rows_kernel",
             "walk_rows.walked_rows_kernel",
             "resolved_worlds.finalize_resolved_worlds",
         ):

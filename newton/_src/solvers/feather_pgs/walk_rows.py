@@ -12,10 +12,10 @@ rows walked together from its first (1, 3, or 4 under contact torsion), or a joi
   and the unit's Gram for its block record, through the class's path table in constant memory; the step's units are
   listed first (:func:`support_units_kernel`, :class:`UnitList`) and the walkers stride over the list
   (:func:`support_rows_kernel`), the work sized by the step's units, not by the rows' capacity;
-- **the general placement** (case K6, FL3.3): each side's entries in the packed rows, through each tree's path table
-  (:func:`packed_walker`), world-major with the bilateral blocks' closure (:func:`walked_rows_kernel`);
+- **the general placement** (case K6, FL3.3): each side's entries in the packed rows, through each tree's class's path
+  table (:func:`packed_walker`), world-major with the bilateral blocks' closure (:func:`walked_rows_kernel`);
 - **the sparse diagonal** (case K2, FL3.5): the arm's side into the row's dense part, a key of the star one step to
-  the row's slot (:func:`write_slot_rows`, :func:`slot_header`; the compact boundary's producer,
+  the row's slot (:func:`slot_rows_kernel`, :func:`slot_header`; the compact boundary's producer,
   :func:`.compact_contact.contacts_kernel`);
 - **the free bodies' rows** (``mf_Z``, each side's six of a row's twelve: a packed row by the free bodies' own row): a
   contact row (:func:`write_free_body_rows`), or a speed row's axis, a covector, for its diagonal
@@ -51,9 +51,9 @@ from .factor.walk import (
     WALK_LINK,
     WalkRelease,
     WalkTrees,
-    walk_paths_prelude,
     walk_prelude,
     walk_row_prelude,
+    walk_tables,
 )
 from .field_group import Field
 from .friction_patches import PatchRowLaw
@@ -93,15 +93,15 @@ __all__ = [
     "packed_walker",
     "populate_rigid_velocity_limit_rows",
     "row_sink",
+    "slot_rows_kernel",
+    "slot_writer",
     "support_rows_kernel",
     "support_threads",
     "support_units_kernel",
     "unit_list",
     "unit_reader",
-    "walk_slot_row",
     "walked_rows_kernel",
     "write_free_body_rows",
-    "write_slot_rows",
     "writer_kernel",
     "writer_lanes",
 ]
@@ -326,7 +326,7 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tupl
     # A link row is a block row (block_row; links plan blocks, TreeFactor.plan_blocks): the writer reads link rows
     # where it closes blocks. Elsewhere their seeds would hold a second point across every walk.
     read_unit = unit_reader(has_blocks, contacts=not block)
-    walk = packed_walker(1, False, side, tables=tables)
+    walk = packed_walker(1, False, side, tables)
     if block:
         walk_block = block_walker(block, side, tables)
         ints, floats = wp.types.vector(block, int), wp.types.vector(block, float)
@@ -422,9 +422,8 @@ def writer_kernel(solver, part: int = WRITE_ROWS) -> wp.Kernel:
     factor = solver.factor
     blocks = factor.block_capacity if factor.eliminates else 0
     mimics = bool(blocks and solver.options.enable_bilateral_preelimination)
-    tables = tuple((walk.parent, walk.first) for walk in factor.walk_classes)
     block = WRITER_BLOCK_ROWS if part == WRITE_TOPOLOGY else 0
-    return walked_rows_kernel(blocks, mimics, factor.walk_side, tables, block)
+    return walked_rows_kernel(blocks, mimics, factor.walk_side, walk_tables(factor.walk_classes), block)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -905,15 +904,13 @@ _PACKED_RELEASE = (
 )
 
 
-_PATH_TREE = """        WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), RD(walk.joint_end.data + art) - j0,
-                  RD(walk.dofs.data + art));"""
 _CLASS_TREE = """        // The tree's class: its path from the classes' tables in constant memory.
         WALK_TREE(RD(walk.cls.data + art));"""
 
 
 @cache
 def packed_walker(
-    rows: int, spin: bool, side: bool, star: bool = False, bodies: bool = False, tables: tuple | None = None
+    rows: int, spin: bool, side: bool, tables: tuple, star: bool = False, bodies: bool = False
 ) -> wp.Function:
     """The general placement's unit walker (:data:`_SUPPORT`, the support writer's text with the packed rows as its
     sink): a unit's ``rows`` rows walked together through its tree's path, each footprint stored at its coordinate's entry
@@ -923,13 +920,8 @@ def packed_walker(
     (:func:`star_step`), and the diagonal stored without its slots' squares and ``cfm``, which the writer adds. With
     ``bodies``, the free bodies': their packed rows by their own row, the row's less ``sink.base``
     (:func:`write_free_body_rows`). ``tables``: the walking classes' path tables (:func:`.factor.walk.walk_prelude`),
-    fixed at build, each tree's path read from constant memory by its class (one table: every tree's); without them,
-    each tree's path table in global memory (:func:`.factor.walk.walk_paths_prelude`; the star's walkers, built before a
-    solver names its classes)."""
-    if tables is None:
-        tree = _PATH_TREE
-    else:
-        tree = _CLASS_TREE if len(tables) > 1 else ""
+    fixed at build, each tree's path read from constant memory by its class (one table: every tree's)."""
+    tree = _CLASS_TREE if len(tables) > 1 else ""
     body = substitute(
         _SUPPORT,
         rows=rows,
@@ -957,8 +949,8 @@ def packed_walker(
         rd="*p",
     )
     half = record_half(side)
-    walk = walk_paths_prelude(rows, half=half) if tables is None else walk_prelude(tables, rows, half)
-    tag = ("_spin" if spin else "") + walk.name.removeprefix(f"walk_paths_{rows}").removeprefix(f"walk_{rows}")
+    walk = walk_prelude(tables, rows, half)
+    tag = ("_spin" if spin else "") + walk.name.removeprefix(f"walk_{rows}")
     tag += "_star" if star else ""
     tag += "_bodies" if bodies else ""
     snippet = dual_native(body, preludes=(walk, walk_row_prelude(rows)))
@@ -1496,42 +1488,53 @@ read_row_unit = unit_reader(False)
 """The unit reader of a row a unit, without link rows (:func:`unit_reader`): the sparse diagonal's and the free
 bodies'."""
 
-walk_slot_row = packed_walker(1, False, True, True)
-"""The one unit walker with the star (:func:`packed_walker`): a row of the sparse diagonal."""
 
-
-@wp.kernel(enable_backward=False)
-def write_slot_rows(
-    rows: DenseRows,
-    support: RowSupport,
-    slots: SlotRows,
-    sink: RowSink,
-    counts: wp.array[int],
-    bounds: wp.array2d[int],
-    prefix: int,
-    lanes: int,
-    data: ContactInput,
-    law: PatchRowLaw,
-    v_hat: wp.array[float],
-    bias: RowBias,
-):
+@cache
+def slot_rows_kernel(side: bool, tables: tuple) -> wp.Kernel:
     """The one writer on the sparse diagonal: a world's ``lanes`` threads stride over its rows (``dim = (worlds,
     lanes)``), every row (``counts``, the allocation's watermark) or its limit prefix alone (``prefix``:
     ``bounds[:, 1]``, where the compact boundary writes the contact rows in its producer), a row a lane: a contact row's
     records by the contact law, then each row as its own unit (:data:`read_row_unit`), walked by the one unit walker
-    with the star (:data:`walk_slot_row`; the spin row a torque) and finished (:func:`slot_header`)."""
-    world, lane = wp.tid()
-    end = counts[world]
-    if prefix != 0:
-        end = bounds[world, 1]
-    end = wp.min(end, support.units.shape[1])
-    line = rows.first[world]
-    for slot in range(lane, end, lanes):
-        unit = read_row_unit(rows, data, law, JointSeeds(), line, slot, support.units[line, slot])
-        if unit.rows > 0:
-            unit.group = slots.dense_group[world]
-            walk_slot_row(sink, unit)
-            slot_header(rows, slots, data, v_hat, unit, bias)
+    with the star (:func:`packed_walker`; the spin row a torque) and finished (:func:`slot_header`). ``side`` and
+    ``tables`` as :func:`packed_walker`'s: the walk of the solver's classes (:func:`slot_writer`)."""
+    walk = packed_walker(1, False, side, tables, star=True)
+
+    def write_slot_rows(
+        rows: DenseRows,
+        support: RowSupport,
+        slots: SlotRows,
+        sink: RowSink,
+        counts: wp.array[int],
+        bounds: wp.array2d[int],
+        prefix: int,
+        lanes: int,
+        data: ContactInput,
+        law: PatchRowLaw,
+        v_hat: wp.array[float],
+        bias: RowBias,
+    ):
+        world, lane = wp.tid()
+        end = counts[world]
+        if prefix != 0:
+            end = bounds[world, 1]
+        end = wp.min(end, support.units.shape[1])
+        line = rows.first[world]
+        for slot in range(lane, end, lanes):
+            unit = read_row_unit(rows, data, law, JointSeeds(), line, slot, support.units[line, slot])
+            if unit.rows > 0:
+                unit.group = slots.dense_group[world]
+                walk(sink, unit)
+                slot_header(rows, slots, data, v_hat, unit, bias)
+
+    return python_kernel(write_slot_rows, "write_slot_rows")
+
+
+def slot_writer(solver) -> wp.Kernel:
+    """The sparse diagonal's one writer for the solver's walk (:func:`slot_rows_kernel`): the records' side where a
+    walked joint can have two halves (:attr:`.tree_factor.TreeFactor.walk_side`) and the walking classes' paths
+    (:attr:`.tree_factor.TreeFactor.walk_classes`)."""
+    factor = solver.factor
+    return slot_rows_kernel(factor.walk_side, walk_tables(factor.walk_classes))
 
 
 def row_sink(factor, forest, placement, v_hat: wp.array) -> RowSink:
@@ -1565,7 +1568,7 @@ def packed_sink(solver) -> RowSink:
 # The free bodies' rows: each side's six of a row's twelve, a packed row by the free bodies' own row
 # ---------------------------------------------------------------------------------------------------------------------
 
-walk_body_row = packed_walker(1, False, True, bodies=True, tables=((FREE_BODY_WALK.parent, FREE_BODY_WALK.first),))
+walk_body_row = packed_walker(1, False, True, walk_tables((FREE_BODY_WALK,)), bodies=True)
 """The one unit walker into the free bodies' rows (:func:`packed_walker`): a row's sides from entry 0 and 6."""
 
 

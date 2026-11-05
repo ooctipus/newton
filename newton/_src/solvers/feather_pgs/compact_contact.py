@@ -4,18 +4,22 @@
 """The compact boundary: the sparse diagonal's contact rows written whole where the contacts are read.
 
 A thread per contact row, in the contacts' collision order, writes the row by the one writer's unit walker on the slots
-sink (:func:`produce_contacts`: its records by the contact law, the row walked as its own unit, its slots and header):
-the rows the sparse diagonal's writer (:func:`.walk_rows.write_slot_rows`) writes from their unit sources, without
+sink (:func:`contacts_kernel`: its records by the contact law, the row walked as its own unit, its slots and header):
+the rows the sparse diagonal's writer (:func:`.walk_rows.slot_rows_kernel`) writes from their unit sources, without
 the unit sources' pass.
 Allocation, admission, scheduling and the solve stay the original pipeline's. Persistent patch friction writes its
 tangent rows with the patch row law; the patch link, ``_FrictionPatchState.link``, runs after this producer and alone
 links the patch rings and divides the friction coefficient, in one ``link_patch_routes`` launch over every route.
 """
 
+from functools import cache
+
 import warp as wp
 
 from .contact_input import ContactInput
+from .factor.walk import walk_tables
 from .friction_patches import PatchRowLaw, patch_row_law
+from .kernel_template import python_kernel
 from .row_kernels import RowBias
 from .row_records import UNIT_CONTACT, DenseRows, unit_source
 from .walk_rows import (
@@ -24,9 +28,9 @@ from .walk_rows import (
     SlotRows,
     bind_slot_rows,
     packed_sink,
+    packed_walker,
     read_row_unit,
     slot_header,
-    walk_slot_row,
 )
 
 
@@ -49,35 +53,47 @@ def supported(solver) -> bool:
     )
 
 
-@wp.kernel(enable_backward=False)
-def produce_contacts(
-    data: ContactInput,
-    rows: DenseRows,
-    slots: SlotRows,
-    sink: RowSink,
-    law: PatchRowLaw,
-    bias: RowBias,
-):
+@cache
+def contacts_kernel(side: bool, tables: tuple) -> wp.Kernel:
     """Publish each contact's rows in their original collision order, one thread per row (3 per contact, 4 under
     contact torsion): its records by the contact law (:func:`.row_build.write_contact_row`), then the row walked as
-    its own unit by the one writer's unit walker with the star (:func:`.walk_rows.packed_walker`), its slots and its
-    header (:func:`.walk_rows.slot_header`).
+    its own unit by the one writer's unit walker with the star (:func:`.walk_rows.packed_walker` of the solver's
+    walking classes, ``side`` and ``tables``), its slots and its header (:func:`.walk_rows.slot_header`).
 
     Tangent rows act at the friction location and follow the patch row law (``patch_tangent_row``): at the region's
     friction location with the anchor's tangential phi, ``law.beta`` and the undivided coefficient.
     """
-    contact, row = wp.tid()
-    if contact >= data.count[0]:
-        return
-    slot = data.slot[contact]
-    if data.path[contact] != 0 or slot < 0 or row >= data.slots_needed[contact]:
-        return
-    world = data.world[contact]
-    source = unit_source(UNIT_CONTACT, 4 * contact + row)
-    unit = read_row_unit(rows, data, law, JointSeeds(), data.first[world], slot + row, source)
-    unit.group = slots.dense_group[world]
-    walk_slot_row(sink, unit)
-    slot_header(rows, slots, data, data.incident, unit, bias)
+    walk = packed_walker(1, False, side, tables, star=True)
+
+    def produce_contacts(
+        data: ContactInput,
+        rows: DenseRows,
+        slots: SlotRows,
+        sink: RowSink,
+        law: PatchRowLaw,
+        bias: RowBias,
+    ):
+        contact, row = wp.tid()
+        if contact >= data.count[0]:
+            return
+        slot = data.slot[contact]
+        if data.path[contact] != 0 or slot < 0 or row >= data.slots_needed[contact]:
+            return
+        world = data.world[contact]
+        source = unit_source(UNIT_CONTACT, 4 * contact + row)
+        unit = read_row_unit(rows, data, law, JointSeeds(), data.first[world], slot + row, source)
+        unit.group = slots.dense_group[world]
+        walk(sink, unit)
+        slot_header(rows, slots, data, data.incident, unit, bias)
+
+    return python_kernel(produce_contacts, "produce_contacts")
+
+
+def contact_producer(solver) -> wp.Kernel:
+    """The compact boundary's producer for the solver's walk (:func:`contacts_kernel`): the records' side and the
+    walking classes' paths (:attr:`.tree_factor.TreeFactor.walk_side`, :attr:`.tree_factor.TreeFactor.walk_classes`)."""
+    factor = solver.factor
+    return contacts_kernel(factor.walk_side, walk_tables(factor.walk_classes))
 
 
 def launch_contacts(solver, data: ContactInput, dt: float) -> None:
@@ -90,7 +106,7 @@ def launch_contacts(solver, data: ContactInput, dt: float) -> None:
     pool = solver.placement.contact_pool
     laws = solver.laws
     pool.launch(
-        produce_contacts,
+        contact_producer(solver),
         (pool.launch_rows(), 4 if laws.spin_rows else 3),
         inputs=[
             data,
