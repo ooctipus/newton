@@ -1325,12 +1325,10 @@ def identity_walk(dofs: int, device) -> WalkTrees:
     zero = np.zeros((dofs, 6), np.float32)
     walk.data = wp.array(pack_walk_records(zero, zero, np.ones(dofs), np.zeros(dofs)), dtype=wp.float32, device=device)
     walk.link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
-    walk.path = wp.array([(-1, 0)], dtype=wp.vec2i, device=device)
     walk.now = wp.zeros(dofs, dtype=wp.spatial_vector, device=device)
     walk.now_link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
     walk.now_com = wp.zeros(1, dtype=wp.vec3, device=device)
     walk.origin = walk.now_origin = wp.zeros(1, dtype=wp.vec3, device=device)
-    walk.scratch = wp.zeros(1, dtype=wp.spatial_vector, device=device)
     for name, values in (
         ("joint_start", [0]),
         ("joint_end", [1]),

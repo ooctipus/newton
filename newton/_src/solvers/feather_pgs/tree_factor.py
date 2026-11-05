@@ -279,13 +279,11 @@ class TreeFactor:
         view = WalkTrees()
         view.data = wp.zeros((0, WALK_COORDINATE), dtype=wp.float32, device=device)
         view.link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
-        view.path = wp.zeros(1, dtype=wp.vec2i, device=device)
         view.now = wp.zeros(1, dtype=wp.spatial_vector, device=device)
         view.now_link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
         view.now_com = wp.zeros(1, dtype=wp.vec3, device=device)
         view.origin = view.now_origin = wp.zeros(1, dtype=wp.vec3, device=device)
         view.joint_art = wp.zeros(1, dtype=wp.int32, device=device)
-        view.scratch = wp.zeros(1, dtype=wp.spatial_vector, device=device)
         view.joint_start = model.articulation_start
         view.joint_end = forest.articulation_joint_end
         view.dof_start = forest.articulation_dof_start
@@ -740,15 +738,13 @@ class TreeFactor:
 
     def plan_walk(self, articulations: np.ndarray) -> None:
         """Hold the walk's data for ``articulations`` (the converted class's, every responding tree): each coordinate's
-        :data:`.factor.walk.WALK_COORDINATE` floats, each body's :data:`.factor.walk.WALK_LINK` floats and a twist of scratch, each tree's
-        walking class (:attr:`walk_classes`, :attr:`walk_class`: its path and join slots, :class:`.tree_scan.WalkClass`), the
-        trees' lane group (:func:`.factor.walk.walk_work`), and the step's geometry the finish publishes
-        (:attr:`WalkTrees.now`, :attr:`WalkTrees.now_link`): the rows' seeds enter there. One launch on the factor's own
-        refreshes (:meth:`walk_step`, the classes' refresh) takes that geometry as the factor's frames and runs the inward
-        pass, so the walk is the factor ``L`` refreshes, to rounding. Each body's path entry in global memory
-        (:attr:`walk_path`, :func:`.factor.walk.walk_paths_prelude`) remains for the readers that do not yet read their
-        class's: the parallel tiers' rows, the matrix-free sweep's free bodies, the sparse diagonal's star walker and the
-        support placement's admission.
+        :data:`.factor.walk.WALK_COORDINATE` floats, each body's :data:`.factor.walk.WALK_LINK` floats, each tree's
+        walking class (:attr:`walk_classes`, :attr:`walk_class`: its path and join slots, :class:`.tree_scan.WalkClass`,
+        which every walk reads from its classes' tables in constant memory), the trees' lane group
+        (:func:`.factor.walk.walk_work`), and the step's geometry the finish publishes (:attr:`WalkTrees.now`,
+        :attr:`WalkTrees.now_link`): the rows' seeds enter there. One launch on the factor's own refreshes
+        (:meth:`walk_step`, the classes' refresh) takes that geometry as the factor's frames and runs the inward pass, so
+        the walk is the factor ``L`` refreshes, to rounding.
 
         Raises:
             ValueError: For a tree whose bodies do not come after their parents, or that holds more than
@@ -828,8 +824,6 @@ class TreeFactor:
         sizes = np.array([int(end[a]) - int(start[a]) for a in arts.tolist()], dtype=np.int64)
         walked = int(np.count_nonzero(sizes > 1)) or int(arts.size)
         self.walk_shape = execution.shape(walk_work(walked, bodies, held), memory.device(device))
-        self.walk_path = wp.array(path, dtype=wp.vec2i, device=device)
-        self.walk_path_host = path
         self.walk_refresh = walk_step_kernel(self.walk_classes)
         # The one flag every walk reader's text is chosen by: whether a record (and a step column) can have a side.
         self.walk_side = both
@@ -846,12 +840,11 @@ class TreeFactor:
         # are the articulation's own, relative to its origin, so a world point meets them through it.
         self.walk_origin = wp.zeros(max(int(model.articulation_count), 1), dtype=wp.vec3, device=device)
         view = WalkTrees()
-        view.data, view.link, view.path = self.walk_data, self.walk_link, self.walk_path
+        view.data, view.link = self.walk_data, self.walk_link
         view.now = self.walk_now if both else self.joint_S_s
         view.now_link, view.now_com = self.walk_now_link, self.joint_com_offset
         view.origin, view.now_origin = self.walk_origin, self.articulation_origin
         view.joint_art = model.joint_articulation
-        view.scratch = wp.zeros(joints, dtype=wp.spatial_vector, device=device)
         view.joint_start = model.articulation_start
         view.joint_end = forest.articulation_joint_end
         view.dof_start = forest.articulation_dof_start

@@ -32,6 +32,7 @@ import newton
 from newton._src.solvers.feather_pgs.factor.walk import TreeWalk, local_frames
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import walk_class_of
 from newton.tests.test_feather_pgs_factor import BOUND, ROUNDING, Capture, catalogue, random_tree, run_route
 from newton.tests.test_feather_pgs_response_diagonal import _build_mixed_response_model
 
@@ -289,28 +290,15 @@ class TestSlipRelease(unittest.TestCase):
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def release_path(path: np.ndarray, n: int, dof_body: np.ndarray, i: int) -> list:
-    """Coordinate ``i``'s path in its tree, leaf first: its body's coordinates from ``i`` down, then each ancestor's
-    from its last (``path``: each body's parent and first coordinate)."""
-    out, body, c = [], int(dof_body[i]), i
-    while body >= 0:
-        while c >= int(path[body][1]):
-            out.append(c)
-            c -= 1
-        body = int(path[body][0])
-        if body >= 0:
-            c = (int(path[body + 1][1]) if body + 1 < path.shape[0] else n) - 1
-    return out
-
-
-def release_rows(release, art: int, n: int, path: np.ndarray, dof_body: np.ndarray, Z: np.ndarray) -> np.ndarray:
+def release_rows(release, art: int, walk_class, Z: np.ndarray) -> np.ndarray:
     """The release of :func:`.walk_rows.walk_release_kernel` (its device data, by path step) applied to the columns of
-    ``Z`` (by tree coordinate), slip by slip as the writer applies it: ``u = z - b s``, ``s += a u``, ``z = g u``."""
+    ``Z`` (by tree coordinate), slip by slip as the writer applies it along each slip's root path in the tree's walking
+    class (:meth:`.tree_scan.WalkClass.root_path`): ``u = z - b s``, ``s += a u``, ``z = g u``."""
     Z = Z.astype(np.float64).copy()
     records = release.step.numpy()[art]
     b, a, g = (records[..., k].astype(np.float64) for k in (1, 2, 3))
     for j in range(int(release.count.numpy()[art])):
-        steps = release_path(path, n, dof_body, int(release.dof.numpy()[art, j]))
+        steps = walk_class.root_path(int(release.dof.numpy()[art, j]))
         s = np.zeros(Z.shape[1])
         for t, c in enumerate(steps):
             u = Z[c] - b[j, t] * s
@@ -331,11 +319,7 @@ def released(solver, joint_q: np.ndarray, art: int = 0):
     B = np.stack([walk.up(covector=np.eye(n)[i])[0] for i in range(n)], axis=1)
     K = factor.aug_row_K.numpy()[:n].astype(np.float64)
     Kd = factor.aug_row_Kd.numpy()[:n].astype(np.float64)
-    j0 = int(solver.model.articulation_start.numpy()[art])
-    path = factor.walk_path_host[j0 : j0 + int(forest.articulation_joint_end_host[art]) - j0]
-    d0 = int(forest.articulation_dof_start_host[art])
-    dof_body = factor.walk_view().dof_body.numpy()[d0 : d0 + n]
-    return release, status, B, np.linalg.inv(B.T @ B), K - Kd, path, dof_body
+    return release, status, B, np.linalg.inv(B.T @ B), K - Kd, walk_class_of(factor, art)
 
 
 class TestSupportSlipRelease(unittest.TestCase):
@@ -350,11 +334,11 @@ class TestSupportSlipRelease(unittest.TestCase):
         state, out = model.state(), model.state()
         joint_q = state.joint_q.numpy().astype(np.float64)
         solver.step(state, out, control, None, 1.0 / 60.0)
-        release, status, B, A, slip_K, path, dof_body = released(solver, joint_q)
+        release, status, B, A, slip_K, walk_class = released(solver, joint_q)
         self.assertEqual(status, 0)
         self.assertEqual(int(release.count.numpy()[0]), 3)
         n = B.shape[0]
-        B_F = release_rows(release, 0, n, path, dof_body, B)
+        B_F = release_rows(release, 0, walk_class, B)
         decided = np.linalg.inv(A - np.diag(slip_K))
         scale = np.linalg.norm(decided)
         self.assertLess(np.linalg.norm(B_F.T @ B_F - decided) / scale, 1.0e-5)
@@ -372,7 +356,7 @@ class TestSupportSlipRelease(unittest.TestCase):
         v_out = wp.zeros(walk_view.du.shape[0], dtype=float, device="cpu")
         solver.factor.leave(v_out)
         v_out = v_out.numpy()[d0 : d0 + n]
-        R = release_rows(release, 0, n, path, dof_body, np.eye(n))
+        R = release_rows(release, 0, walk_class, np.eye(n))
         walk = solver.factor.walk(joint_q, 0)
         expected = walk.down(R.T @ du[0].astype(np.float64))[0]
         self.assertLess(np.linalg.norm(v_out - expected) / np.linalg.norm(expected), 1.0e-5)
@@ -891,12 +875,10 @@ def support_frames(solver, joint_q: np.ndarray) -> dict:
     forest, placement, factor = solver.forest, solver.placement, solver.factor
     size = int(placement.sparse_mass_matrix_size)
     starts = forest.articulation_dof_start.numpy()
-    joint_start = solver.model.articulation_start.numpy()
     release = solver.factor.walk_view().release
     incident = placement.row_incident.numpy().astype(np.float64)
     impulses = placement.impulses.numpy().astype(np.float64)
     first = placement.dense_first.numpy()
-    dof_body = factor.walk_view().dof_body.numpy()
     v_hat, v_out = solver.v_hat.numpy().astype(np.float64), solver.v_out.numpy().astype(np.float64)
     trees, out = {}, {"rows": 0.0, "leave": 0.0, "rows_checked": 0, "trees": 0, "rows_seen": 0, "slipping": 0}
     du = {}
@@ -907,9 +889,7 @@ def support_frames(solver, joint_q: np.ndarray) -> dict:
             walk = factor.walk(joint_q, art)
             inverse, _ = walk.up(covector=np.eye(size))
             u_hat = np.linalg.solve(inverse.T, v_hat[int(starts[art]) : int(starts[art]) + size])
-            j0, d0 = int(joint_start[art]), int(starts[art])
-            path = factor.walk_path_host[j0 : j0 + int(forest.articulation_joint_end_host[art]) - j0]
-            R = release_rows(release, art, size, path, dof_body[d0 : d0 + size], np.eye(size))
+            R = release_rows(release, art, walk_class_of(factor, art), np.eye(size))
             trees[art] = (walk, u_hat, R)
             out["slipping"] += int(release.count.numpy()[art] > 0)
         return trees[art]
@@ -999,9 +979,7 @@ class TestSupportPlacement(unittest.TestCase):
         B = np.stack([walk.up(covector=np.eye(n)[i])[0] for i in range(n)], axis=1)
         K = solver.factor.aug_row_K.numpy()[:n].astype(np.float64)
         Kd = solver.factor.aug_row_Kd.numpy()[:n].astype(np.float64)
-        path = solver.factor.walk_path_host[:3]
-        dof_body = solver.factor.walk_view().dof_body.numpy()[:n]
-        R = release_rows(release, 0, n, path, dof_body, np.eye(n))
+        R = release_rows(release, 0, walk_class_of(solver.factor, 0), np.eye(n))
         sides = [z for (_, _), z in sorted(support_rows(solver).items())]
         Z = np.array([z[0] for z in sides if 0 in z])
         self.assertGreater(Z.shape[0], 0)

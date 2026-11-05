@@ -858,26 +858,26 @@ def walk_inverse(solver, art: int) -> np.ndarray:
     factor = solver.factor
     d0 = int(solver.forest.articulation_dof_start.numpy()[art])
     j0, j1 = int(solver.model.articulation_start.numpy()[art]), int(solver.forest.articulation_joint_end_host[art])
-    path = factor.walk_path_host[j0:j1]
-    n = int(solver.forest.articulation_dof_count.numpy()[art])
+    walk_class = walk_class_of(factor, art)
+    parent, first = walk_class.parent, walk_class.first
+    n = walk_class.coordinates
     data = unpack_walk_records(factor.walk_data.numpy(), d0 + n)[d0:].astype(np.float64)
     # Each body's offset to its parent's frame, as the walk forms it: the float32 difference of the two frame points.
     frames = factor.walk_link.numpy()[j0:j1, WALK_FRAME : WALK_FRAME + 3]
-    link = np.array([frames[p] - frames[b] if p >= 0 else np.zeros(3, np.float32) for b, p in enumerate(path[:, 0])])
+    link = np.array([frames[p] - frames[b] if p >= 0 else np.zeros(3, np.float32) for b, p in enumerate(parent)])
     link = link.astype(np.float64)
-    first = [int(f) for f in path[:, 1]] + [n]
     inverse = np.zeros((n, n))
     for i in range(n):
         x = np.zeros(n)
         x[i] = 1.0
-        state, p = np.zeros((len(path), 6)), np.zeros(6)
-        for b in range(len(path) - 1, -1, -1):
+        state, p = np.zeros((len(parent), 6)), np.zeros(6)
+        for b in range(len(parent) - 1, -1, -1):
             p += state[b]
             for c in range(first[b + 1] - 1, first[b] - 1, -1):
                 z = (x[c] + data[c, :6] @ p) * data[c, 12]
                 p -= data[c, 6:12] * z
                 inverse[c, i] = z
-            up = int(path[b, 0])
+            up = parent[b]
             if up >= 0:
                 p[3:] -= np.cross(link[b, :3], p[:3])
             if up != b - 1:
@@ -919,9 +919,18 @@ def walk_factor(lower) -> np.ndarray:
     return lower.T[::-1, ::-1].copy()
 
 
-def chain_class(n: int) -> WalkClass:
-    """The walking class of a chain of ``n`` bodies of one coordinate each."""
-    return WalkClass(tuple(range(-1, n - 1)), tuple(range(n + 1)))
+def walk_class_of(factor, art: int) -> WalkClass:
+    """Articulation ``art``'s walking class in the factor (:attr:`.tree_factor.TreeFactor.walk_classes`): its tree's
+    path, each body's parent and first coordinate."""
+    return factor.walk_classes[int(factor.walk_class_host[art])]
+
+
+def chain_class(bodies: int, coordinates: int | None = None) -> WalkClass:
+    """The walking class of a chain of ``bodies`` bodies of one coordinate each, the last holding the rest of
+    ``coordinates`` (by default one): every hand-built walk's (:func:`chain_walk`, :func:`diagonal_walk`, one body of
+    every coordinate)."""
+    coordinates = bodies if coordinates is None else coordinates
+    return WalkClass(tuple(range(-1, bodies - 1)), (*range(bodies), coordinates))
 
 
 def keyed_classes(layout) -> tuple[WalkClass, ...]:
@@ -946,7 +955,6 @@ def chain_walk(device, lowers) -> WalkTrees:
     ut = np.zeros((total, 6), dtype=np.float32)
     inverse = np.zeros(total, dtype=np.float32)
     now = np.zeros((total, 6), dtype=np.float32)
-    path = np.zeros((total, 2), dtype=np.int32)
     dof_body = np.zeros(total, dtype=np.int32)
     for art, A in enumerate(factors):
         for c in range(A.shape[0]):
@@ -954,7 +962,6 @@ def chain_walk(device, lowers) -> WalkTrees:
             s[d, c] = now[d, c] = 1.0
             ut[d, :c] = A[c, :c]
             inverse[d] = 1.0 / A[c, c]
-            path[d] = (c - 1, c)
             dof_body[d] = c
     arts = len(factors)
 
@@ -964,14 +971,12 @@ def chain_walk(device, lowers) -> WalkTrees:
     walk = WalkTrees()
     walk.data = wp.array(pack_walk_records(s, ut, inverse, np.zeros(total)), dtype=wp.float32, device=device)
     walk.link = wp.zeros((total, WALK_LINK), dtype=wp.float32, device=device)
-    walk.path = wp.array(path, dtype=wp.vec2i, device=device)
     walk.now = wp.array(np.asarray(now, dtype=np.float32).reshape(-1, 6), dtype=wp.spatial_vector, device=device)
     walk.now_link = wp.zeros((total, WALK_LINK), dtype=wp.float32, device=device)
     walk.now_com = wp.zeros(total, dtype=wp.vec3, device=device)
     # One geometry's frames, at the world's origin: the factor's and the step's origins agree.
     walk.origin = walk.now_origin = wp.zeros(arts, dtype=wp.vec3, device=device)
     walk.joint_art = ints(np.repeat(np.arange(arts), sizes))
-    walk.scratch = wp.zeros(total, dtype=wp.spatial_vector, device=device)
     walk.joint_start, walk.joint_end = ints(start[:-1]), ints(start[1:])
     walk.dof_start, walk.dofs = ints(start[:-1]), ints(sizes)
     walk.dof_body, walk.body_joint = ints(dof_body), ints(np.arange(total))
@@ -1007,9 +1012,6 @@ def diagonal_walk(inverse, device, dofs=None, offsets=None):
     zero = np.zeros((worlds * dofs, 6), np.float32)
     walk.data = wp.array(pack_walk_records(zero, zero, root, np.zeros(worlds * dofs)), device=device)
     walk.link = wp.zeros((worlds * n, WALK_LINK), dtype=wp.float32, device=device)
-    path = np.stack([np.arange(n) - 1, np.arange(n)], axis=1).astype(np.int32)
-    walk.path = wp.array(np.tile(path, (worlds, 1)), dtype=wp.vec2i, device=device)
-    walk.scratch = wp.zeros(worlds * n, dtype=wp.spatial_vector, device=device)
     starts = (np.arange(worlds) * n).astype(np.int32)
     walk.joint_start = wp.array(starts, device=device)
     walk.joint_end = wp.array(starts + n, device=device)
@@ -1028,13 +1030,11 @@ def leave_walk(walk: WalkTrees, velocity, device) -> None:
     """The step's one leave of a hand-built walk (:func:`.factor.walk.walk_leave_kernel`), after a sweep launched by
     hand: each tree's change, which the sweep added into ``walk.du``, walked down onto ``velocity``; ``du`` cleared for
     the next launch."""
-    joint_start, joint_end = walk.joint_start.numpy(), walk.joint_end.numpy()
-    dofs, path = walk.dofs.numpy(), walk.path.numpy()
+    joint_start, joint_end, dofs = walk.joint_start.numpy(), walk.joint_end.numpy(), walk.dofs.numpy()
     classes: dict = {}
     index = []
     for art in range(joint_start.shape[0]):
-        rows = path[joint_start[art] : joint_end[art]]
-        table = WalkClass(tuple(int(p) for p in rows[:, 0]), (*(int(f) for f in rows[:, 1]), int(dofs[art])))
+        table = chain_class(int(joint_end[art] - joint_start[art]), int(dofs[art]))
         index.append(classes.setdefault(table, len(classes)))
     lanes = 4 if wp.get_device(device).is_cuda else 1
     wp.launch(

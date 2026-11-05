@@ -5,8 +5,7 @@
 
 :class:`TreeWalk` is the walk's reference on the host: ``up`` (a row's footprints ``Z = L^-1 P J^T``), ``down`` (the
 leave ``P^T L^-T u``) and ``meet``. On the device (FL3.1) a lane walks a seed up and a lane group a tree down, the path
-table in constant memory: the walk's preludes (:func:`walk_prelude`, :func:`walk_paths_prelude`,
-:func:`walk_row_prelude`, :func:`walk_down_prelude`, :func:`walk_loads_prelude`), the leave
+table in constant memory: the walk's preludes (:func:`walk_prelude`, :func:`walk_row_prelude`, :func:`walk_down_prelude`, :func:`walk_loads_prelude`), the leave
 (:func:`walk_leave_kernel`), the walk's device struct (:class:`WalkTrees`) and its refresh, the inward pass
 (:func:`walk_step_kernel`). The factor (:class:`.tree_factor.TreeFactor`) holds the walk's data.
 """
@@ -39,7 +38,6 @@ __all__ = [
     "leave_work",
     "walk_down_prelude",
     "walk_leave_kernel",
-    "walk_paths_prelude",
     "walk_prelude",
     "walk_row_prelude",
     "walk_tables",
@@ -514,21 +512,7 @@ def walk_table(tables: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...], join
     )
 
 
-_WALK_PATHS = """    // The tree a lane walks (WALK_TREE): its path table, each body's parent and first coordinate as int pairs
-    // (TreeFactor.walk_path), and its bodies and coordinates. Set before each tree's walk.
-    const int* WALK_PATH = nullptr;
-    int WALK_BODIES = 0, WALK_COORDINATES = 0;
-    const auto WALK_TREE = [&](const int* path, const int bodies, const int coordinates) {
-        WALK_PATH = path;
-        WALK_BODIES = bodies;
-        WALK_COORDINATES = coordinates;
-    };
-    const auto WALK_PARENT_OF = [&](const int b) -> int { return WALK_PATH[2 * b]; };
-    const auto WALK_FIRST_OF = [&](const int b) -> int {
-        return b < WALK_BODIES ? WALK_PATH[2 * b + 1] : WALK_COORDINATES;
-    };"""
-
-_WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.TreeWalk) over the trees of a path table above
+_WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.TreeWalk) over the classes' path tables above
     // (WALK_PARENT_OF, WALK_FIRST_OF, WALK_BODIES): each body's parent (-1: the world, every parent before its
     // children) and first coordinate. data holds each coordinate's s, ut ((v, w), six each) and 1 / ell
     // (WALK_COORDINATE floats), link each body's offset to its parent's frame (WALK_LINK floats), as
@@ -644,30 +628,6 @@ WALK_UNROLLED
                 body[r] = up;
                 top[r] = up >= 0 ? WALK_FIRST_OF(up + 1) - 1 : -1;
             }
-        }
-    };
-    // WALK_PARENT_TWIST(link, twist, b, V): body b's parent's twist (v, w) at b's frame, v + d x w (zero at a root).
-    const auto WALK_PARENT_TWIST = [&](const float* link, const float* twist, int b, float* V) {
-        const int up = WALK_PARENT_OF(b);
-        if (up < 0) {
-            for (int k = 0; k < 6; ++k) V[k] = 0.0f;
-            return;
-        }
-        const float* W = twist + 6 * up;
-$link_twist
-        $edge_twist
-    };
-    // WALK_ENTER(data, link, qd, u, twist): the walk's coordinates of known velocities qd, u = L^T P qd (the leave
-    // inverted), root first: u_c = ell_c qd_c + ut_c . V, then V += s_c qd_c, V its body's twist (the audit's).
-    const auto WALK_ENTER = [&](const float* data, const float* link, const float* qd, float* u, float* twist) {
-        for (int b = 0; b < WALK_BODIES; ++b) {
-            float V[6];
-            WALK_PARENT_TWIST(link, twist, b, V);
-            for (int c = WALK_FIRST_OF(b); c < WALK_FIRST_OF(b + 1); ++c) {
-$record_c
-                $enter_V
-            }
-            for (int k = 0; k < 6; ++k) twist[6 * b + k] = V[k];
         }
     };"""
 
@@ -793,12 +753,9 @@ _WALK_TEXTS = {
     "sweep_edge": ts.statements(ts.edge(ts.Direction.UP, ts.LOADED.lever, "q"), 20),
     "edge_q": ts.statements(ts.edge(ts.Direction.UP, ts.LOADED.lever, "q"), 20),
     "edge_v": ts.statements(ts.edge(ts.Direction.UP, ts.LOADED.lever, "v"), 24),
-    "edge_twist": ts.statements(ts.edge(ts.Direction.DOWN, ts.LOADED.lever, "W", into="V"), 8),
-    "enter_V": ts.statements(ts.enter(ts.LOADED, "V", "qd[c]", "u[c]"), 16),
 }
 """The path walk's arithmetic (:data:`_WALK`): the rows' steps up (the held pose a source of statements, ``x``), a
-covector seed's first step, the joints of the rows' and the seed wrenches' up and of a parent's twist down, and the
-audit's step in (``ENTER``)."""
+covector seed's first step, and the joints of the rows' and the seed wrenches' up."""
 
 
 def _release_text(rows: int) -> str:
@@ -829,7 +786,7 @@ _WALK_LOADS = """#ifndef WALK_READ
 // a step column, six floats (WALK_NOW, S's layout); a step link's frame point, one quad. Each read
 // takes its load kind, the reader's data: WALK_LDG the read-only path (no walk writes them while a reader runs; ptxas
 // may move it down to its use), WALK_PLAIN a coherent load issued where the text places it (the class emitter's, a
-// store of the chain after it keeps it there). A kernel's staged copy is read by pointer (tree_factor._walk_placement).
+// store of the chain after it keeps it there).
 // WALK_READ(load, d, p, half): record p as the walk's WALK_UNPACKED floats d: s, ut, 1 / ell, P0. half is the
 // column's half as the reader knows it, its class's data: 0 linear, 1 angular (compiled: no flag, no side load),
 // else named by the record (1 / ell's sign bit set: the angular half), 3 (WALK_EITHER) in a model without a column
@@ -961,44 +918,6 @@ def walk_loads_prelude() -> DevicePrelude:
     return DevicePrelude("walk_loads", _walk_loads_text(True), cpu=_walk_loads_text(False))
 
 
-def _walk_placement(name: str, table: str, rows: int, half: int) -> DevicePrelude:
-    """The walk of ``rows`` rows (:data:`_WALK`) placed on a path table (``table``, a text declaring
-    ``WALK_PARENT_OF``, ``WALK_FIRST_OF`` and ``WALK_BODIES``), after the one access: :func:`walk_prelude` and
-    :func:`walk_paths_prelude` are its two placements. Its reads (``_WALK``'s ``$record_*``, ``$link_*``, ``$column_c``
-    and ``$point_b``) are the one access's (:data:`_WALK_LOADS`, the read-only load kind, its records and columns of
-    ``half``)."""
-    if rows < 1:
-        raise ValueError(f"a lane walks at least one row, got {rows}")
-    record = f"float d[{WALK_UNPACKED}];\nWALK_READ(WALK_LDG, d, data + {WALK_COORDINATE} * c, {half});"
-    column = (
-        "float S[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};\nif (now != nullptr)\n"
-        f"    WALK_READ_COLUMN(WALK_LDG, S, now + {WALK_NOW} * c, data + {WALK_COORDINATE} * c, {half});"
-    )
-
-    def body_link(up):
-        return f"float l[6];\nWALK_READ_LINK(WALK_LDG, l, link, b, {up});"
-
-    walk = substitute(
-        _WALK,
-        rows=rows,
-        **_WALK_TEXTS,
-        now=WALK_NOW,
-        frame=WALK_LINK_FRAME,
-        record_c=ts.indent_text(record, 16),
-        record_seed=ts.indent_text(record, 8),
-        # A body's link where the root path opens it (ts.root_path's begin: one line, the path's indent).
-        link_b=body_link("WALK_PARENT_OF(b)").replace("\n", " "),
-        link_twist=ts.indent_text(body_link("up"), 8),
-        column_c=ts.indent_text(column, 16),
-        point_b=ts.indent_text(
-            f"float f[4];\nWALK_READ_POINT(WALK_LDG, f, now_link + {WALK_LINK} * b + {WALK_FRAME});", 20
-        ),
-    )
-    walk += "\n" + _release_text(rows)
-    text = {cuda: _walk_loads_text(cuda) + "\n" + table + "\n" + walk for cuda in (True, False)}
-    return DevicePrelude(name, text[True], cpu=text[False])
-
-
 @functools.cache
 def walk_prelude(
     tables: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...], rows: int, half: int = WALK_BOTH
@@ -1009,46 +928,53 @@ def walk_prelude(
       build, so a lane walks a root path without a global load in front of its steps (GPU_WALK §8, variant C); a lane
       names its tree's class (``WALK_TREE(cls)``, the factor's :attr:`WalkTrees.cls`) where the tables hold more than
       one;
-    - ``WALK_UP`` and ``WALK_SEED``, the rows: a lane per seed walks its ``rows`` rows up the seed's root path, every
-      load shared (Z_UNION Theorem B), and gives each footprint, with the step's ``J`` entry it whitens, to the
-      caller's sink, the placement's store;
-    - ``WALK_ENTER``, the leave's inverse: a lane per tree, root first (the leave is the class's emitted walk down,
-      :func:`walk_down_prelude`, in the step's one leave, :func:`walk_leave_kernel`).
+    - ``WALK_UP``, ``WALK_SEED`` and ``WALK_SWEEP``, the rows: a lane per seed walks its ``rows`` rows up the seed's
+      root path, every load shared (Z_UNION Theorem B), and gives each footprint, with the step's ``J`` entry it
+      whitens, to the caller's sink, the placement's store;
+    - the slips' release (:func:`_release_text`).
 
-    No step launches it (FL3.1). The data is :meth:`TreeWalk.device_data`'s.
+    Its reads (``_WALK``'s ``$record_*``, ``$link_b``, ``$column_c`` and ``$point_b``) are the one access's
+    (:data:`_WALK_LOADS`, the read-only load kind, its records and columns of ``half``). No step launches it (FL3.1).
+    The data is :meth:`TreeWalk.device_data`'s.
 
     Args:
-        tables: Each class's path table (a :class:`.tree_scan.WalkClass`'s ``parent`` and ``first``): each body's parent
-            (-1: the world, every parent before its children), and each body's first coordinate with the count after
-            the last.
+        tables: Each class's path table (a :class:`.tree_scan.WalkClass`'s ``parent`` and ``first``, :func:`walk_tables`):
+            each body's parent (-1: the world, every parent before its children), and each body's first coordinate with
+            the count after the last.
         rows: The rows a lane walks together: the seed's unit (1 a limit, 2 a velocity limit, 3 a point contact, 4
             with spin).
         half: The classes' records' half as their walk reads them (``WALK_READ``, :func:`.tree_scan.classes_half`).
     """
+    if rows < 1:
+        raise ValueError(f"a lane walks at least one row, got {rows}")
     table = walk_table(tables)
     # No walking tree: one class of no body.
     tables = tables or (((), (0,)),)
     tag = hashlib.sha256(repr(tables).encode()).hexdigest()[:8] if len(tables) > 1 else str(len(tables[0][0]))
     name = f"walk_{rows}_{tag}" + ("" if half == WALK_BOTH else f"_{half}")
-    return _walk_placement(name, table, rows, half)
-
-
-@functools.cache
-def walk_paths_prelude(rows: int, *, half: int = WALK_BOTH) -> DevicePrelude:
-    """The device walk of any tree, for both devices: :func:`walk_prelude`'s functions over a path table in global
-    memory, one tree at a time (``WALK_TREE(path, bodies, coordinates)`` before its walks), the table
-    :attr:`.tree_factor.TreeFactor.walk_path` holds for every articulation. Its last readers are the parallel tiers' rows,
-    the matrix-free sweep's free bodies and the sparse diagonal's star walker; every other reader takes its classes'
-    tables (:func:`walk_prelude`).
-
-    Args:
-        rows: The rows a lane walks together (:func:`walk_prelude`).
-        half: The records' and step columns' half as the reader knows it (``WALK_READ``): :data:`.tree_scan.WALK_BOTH`,
-            or :data:`.tree_scan.WALK_EITHER` where no column has two halves (:attr:`.tree_factor.TreeFactor.walk_side` false,
-            :func:`.tree_scan.record_half`).
-    """
-    name = f"walk_paths_{rows}" + ("" if half == WALK_BOTH else f"_{half}")
-    return _walk_placement(name, _WALK_PATHS, rows, half)
+    record = f"float d[{WALK_UNPACKED}];\nWALK_READ(WALK_LDG, d, data + {WALK_COORDINATE} * c, {half});"
+    column = (
+        "float S[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};\nif (now != nullptr)\n"
+        f"    WALK_READ_COLUMN(WALK_LDG, S, now + {WALK_NOW} * c, data + {WALK_COORDINATE} * c, {half});"
+    )
+    walk = substitute(
+        _WALK,
+        rows=rows,
+        **_WALK_TEXTS,
+        now=WALK_NOW,
+        frame=WALK_LINK_FRAME,
+        record_c=ts.indent_text(record, 16),
+        record_seed=ts.indent_text(record, 8),
+        # A body's link where the root path opens it (ts.root_path's begin: one line, the path's indent).
+        link_b="float l[6]; WALK_READ_LINK(WALK_LDG, l, link, b, WALK_PARENT_OF(b));",
+        column_c=ts.indent_text(column, 16),
+        point_b=ts.indent_text(
+            f"float f[4];\nWALK_READ_POINT(WALK_LDG, f, now_link + {WALK_LINK} * b + {WALK_FRAME});", 20
+        ),
+    )
+    walk += "\n" + _release_text(rows)
+    text = {cuda: _walk_loads_text(cuda) + "\n" + table + "\n" + walk for cuda in (True, False)}
+    return DevicePrelude(name, text[True], cpu=text[False])
 
 
 _WALK_ROW = """    // WALK_WRENCH(q, sign, d, at, origin, o, torque): a row's seed at a body's frame (the native twin of
@@ -1066,8 +992,8 @@ _WALK_ROW = """    // WALK_WRENCH(q, sign, d, at, origin, o, torque): a row's se
         q[4] = torque ? f[1] : l[2] * f[0] - l[0] * f[2];
         q[5] = torque ? f[2] : l[0] * f[1] - l[1] * f[0];
     };
-    // WALK_ROW(data, link, now, now_link, shift, body, k, seed, sink): every reader's seed walk, after a walk
-    // prelude (walk_prelude, walk_paths_prelude). Rows seeded at body walked up its root path into sink: the wrench
+    // WALK_ROW(data, link, now, now_link, shift, body, k, seed, sink): every reader's seed walk, after the walk
+    // prelude (walk_prelude). Rows seeded at body walked up its root path into sink: the wrench
     // seed[6 r + i] at body's frame (k < 0; now, now_link and shift its step's geometry, as WALK_UP takes them), or the
     // covector seed[r] e_k at body's coordinate k (WALK_SEED, then WALK_UP from k - 1, without the step's geometry).
     const auto WALK_ROW = [&](const float* data, const float* link, const float* now, const float* now_link,
@@ -1439,8 +1365,8 @@ class WalkTrees:
     """The walk of every held tree of the converted class (:meth:`TreeFactor.plan_walk`), by global coordinate, body
     (its joint) and articulation:
 
-    - ``data``, ``link``, ``path``: :data:`WALK_COORDINATE` floats a coordinate, :data:`WALK_LINK` floats a body and
-      each body's parent and first coordinate within its tree (:func:`walk_paths_prelude`'s table);
+    - ``data``, ``link``: :data:`WALK_COORDINATE` floats a coordinate and :data:`WALK_LINK` floats a body (each tree's
+      path is its class's, ``cls``);
     - ``now``, ``now_link``, ``now_com``: each coordinate's column at its body's frame, each body's link
       (:data:`WALK_LINK`'s layout: its frame point) and its centre of mass (a ``vec3`` a joint), at the step's poses,
       which the held tree's finish publishes with its motion columns: a seed enters the walk as ``J`` there (each column
@@ -1452,8 +1378,6 @@ class WalkTrees:
       precision does not depend on where the articulation stands; a world point meets one through the origin, and a
       factor's frame meets the step's through the two origins' difference (``WALK_UP``'s ``shift``, zero on a refresh
       step); ``joint_art``: each joint's articulation;
-    - ``scratch``: a twist a joint, which no walk reads since the audit's enter keeps its twists in registers (it goes
-      with ``path``, whose last readers are the sweeps');
     - each articulation's first joint, joint end, first coordinate and coordinates (a free rigid body is a one-body
       tree of six coordinates);
     - ``dof_body``: each coordinate's body within its tree; ``body_joint``: each body's joint;
@@ -1471,14 +1395,12 @@ class WalkTrees:
 
     data: wp.array2d[float]
     link: wp.array2d[float]
-    path: wp.array[wp.vec2i]
     now: wp.array[wp.spatial_vector]
     now_link: wp.array2d[float]
     now_com: wp.array[wp.vec3]
     origin: wp.array[wp.vec3]
     now_origin: wp.array[wp.vec3]
     joint_art: wp.array[int]
-    scratch: wp.array[wp.spatial_vector]
     joint_start: wp.array[int]
     joint_end: wp.array[int]
     dof_start: wp.array[int]
