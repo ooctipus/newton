@@ -303,16 +303,20 @@ class SparseRows:
                 f"{pad}        const int parent = world_row_parent.data[offset + i];\n"
                 f"{pad}        if ({spin} >= 0) kind = {TORSION};\n"
                 f"{pad}    }}\n"
+                f"{pad}    if (kind == {TORSION}) staged_triples = true;\n"
             )
+        # Whether the world holds a friction triple (a spin row): the triple phase runs only where one does.
+        present = f"\n{pad}const bool world_triples = ANY(staged_triples);\n" if self.torsion else ""
         return (
-            f"{pad}for (int i = {lane}; i < count; i += {width}) {{\n"
+            (f"{pad}bool staged_triples = false;\n" if self.torsion else "")
+            + f"{pad}for (int i = {lane}; i < count; i += {width}) {{\n"
             f"{pad}    s_impulse[i] = world_impulses.data[offset + i];\n"
             f"{pad}    s_rhs[i] = rhs_bias.data[offset + i] + row_incident.data[offset + i];\n"
             f"{pad}    const float diagonal = world_diag.data[offset + i];\n"
             f"{pad}    s_diag[i] = diagonal;\n"
             f"{pad}    s_inverse[i] = 1.0f / diagonal;\n"
             f"{triple}{pad}    s_type[i] = {kind};\n"
-            f"{pad}}}"
+            f"{pad}}}{present}"
         )
 
 
@@ -790,7 +794,8 @@ def triple_phase(sweep: SparseSweep, rows: SparseRows, op: SparseFactor, laws: R
     visit = friction_triple_visit(
         ctx, laws, head="head", metric="\n".join(metric), pool="\n".join(pool), load="pooled", law=law, pad="        "
     )
-    text = f"""for (int first = 0; first < count; first += {sweep.lanes}) {{
+    # Only a world whose staging found a triple (world_triples, uniform over its lanes) scans for them.
+    text = f"""if (world_triples) for (int first = 0; first < count; first += {sweep.lanes}) {{
     const int row = first + lane;
     unsigned heads = BALLOT(row + 1 < count && s_type[row] == {CONTACT} && s_type[row + 1] == {TORSION});
     while (heads != 0u) {{
