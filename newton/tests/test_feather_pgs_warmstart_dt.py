@@ -48,8 +48,8 @@ def _normal_impulse_total(solver):
 
 
 def test_warm_carry_kernel_scales_rows_exactly(test: unittest.TestCase, device):
-    """The gather kernel scales matched normal and friction rows before any
-    solver iteration can conceal a missing or incorrect carry scale."""
+    """The gather kernel scales a matched normal row before any solver iteration can conceal a missing or incorrect
+    carry scale; the contact's friction rows start cold."""
     with wp.ScopedDevice(device):
         max_c = 8
         prev_impulses = np.zeros((1, max_c), dtype=np.float32)
@@ -58,8 +58,6 @@ def test_warm_carry_kernel_scales_rows_exactly(test: unittest.TestCase, device):
         prev_types = np.full((1, max_c), -1, dtype=np.int32)
         prev_types[0, 4] = PGS_CONSTRAINT_TYPE_CONTACT
         prev_types[0, 5:7] = PGS_CONSTRAINT_TYPE_FRICTION
-        prev_parents = np.full((1, max_c), -1, dtype=np.int32)
-        prev_parents[0, 5:7] = 4
 
         current_types = np.full((1, max_c), -1, dtype=np.int32)
         current_types[0, 2] = PGS_CONSTRAINT_TYPE_CONTACT
@@ -93,7 +91,6 @@ def test_warm_carry_kernel_scales_rows_exactly(test: unittest.TestCase, device):
                 wp.array([4], dtype=wp.int32),  # previous base slot
                 wp.array(prev_impulses, dtype=wp.float32),
                 wp.array(prev_types, dtype=wp.int32),
-                wp.array(prev_parents, dtype=wp.int32),
                 wp.array([5], dtype=wp.int32),
                 wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3),
                 0.75,
@@ -105,8 +102,8 @@ def test_warm_carry_kernel_scales_rows_exactly(test: unittest.TestCase, device):
         )
 
         carried = impulses.numpy()[0]
-        np.testing.assert_allclose(carried[2:5], 3.0 * prev_impulses[0, 4:7], rtol=0.0, atol=1.0e-6)
-        np.testing.assert_array_equal(carried[[0, 1, 5, 6, 7]], np.zeros(5, dtype=np.float32))
+        np.testing.assert_allclose(carried[2], 3.0 * prev_impulses[0, 4], rtol=0.0, atol=1.0e-6)
+        np.testing.assert_array_equal(carried[[0, 1, 3, 4, 5, 6, 7]], np.zeros(7, dtype=np.float32))
 
 
 def test_warm_carry_fixed_dt_identity(test: unittest.TestCase, device):

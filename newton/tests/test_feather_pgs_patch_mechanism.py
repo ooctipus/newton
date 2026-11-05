@@ -388,7 +388,6 @@ _CURRENT_COMPUTED = (
     ("surface_a", "world"),
     ("surface_b", "world"),
     ("displacement", "field"),
-    ("tangent_impulse", "own"),
 )
 # Current anchors compare at the "world" scale on valid contacts, the only ones
 # whose anchors _build writes and later kernels read.
@@ -401,7 +400,6 @@ _PREVIOUS_COMPUTED = (
     ("anchor_b", "world"),
     ("surface_a", "world"),
     ("surface_b", "world"),
-    ("tangent_impulse", "own"),
 )
 
 
@@ -613,24 +611,9 @@ class _Rows:
         self.values = (parents, mu, impulses)
         self.routes = routes
         self.live = live
-        self.decay = np.where(rng.random(3) < 0.3, 0.0, rng.uniform(0.3, 1.0, size=3))
-
-    def impulse_scale(self, route, impulses):
-        """Return the magnitude each row impulse is computed from: its friction pair's largest, else its own.
-
-        Seeding writes both friction rows of a contact from one tangent impulse.
-        """
-        world, slot, path, needed = (values[: self.live] for values in self.maps)
-        scale = np.abs(np.asarray(impulses, dtype=np.float64))
-        friction = (path == route) & (slot >= 0) & (needed == 3)
-        w, s = world[friction], slot[friction]
-        pair = np.maximum(scale[w, s + 1], scale[w, s + 2])
-        scale[w, s + 1] = pair
-        scale[w, s + 2] = pair
-        return scale
 
     def arrays(self):
-        """Return device copies: contact maps and ``(route, parents, mu, impulses, decay, first)`` rows."""
+        """Return device copies: contact maps and ``(route, parents, mu, impulses, first)`` rows."""
         device = self.scene.device
         maps = [wp.array(values.astype(np.int32), dtype=int, device=device) for values in self.maps]
         parents, mu, impulses = self.values
@@ -640,7 +623,6 @@ class _Rows:
                 wp.array(parents[r].astype(np.int32), dtype=int, device=device),
                 wp.array(mu[r].astype(np.float32), dtype=float, device=device),
                 wp.array(impulses[r].astype(np.float32), dtype=float, device=device),
-                float(self.decay[r]),
                 row_lines(device),
             )
             for r in self.routes
@@ -648,24 +630,15 @@ class _Rows:
         return maps, routes
 
 
-def _assert_same_rows(mine, theirs, rows, context="", exact=False):
-    """Require the reference's row arrays: parents and friction budgets bitwise, impulses as computed payload.
+def _assert_same_rows(mine, theirs, context=""):
+    """Require the reference's row arrays bitwise: parents, friction budgets and impulses.
 
     Linking divides copied budgets by an anchor count, which matches bitwise on
-    every device; seeding computes impulses (:func:`_assert_payload_equal`, at
-    the scale of ``rows``). ``exact`` compares impulses bitwise too, as twins do.
+    every device; no patch launch writes an impulse.
     """
     for (route, *arrays), (_, *expected) in zip(mine, theirs, strict=True):
-        for name, array, reference in zip(("parents", "mu"), arrays[:2], expected[:2], strict=True):
+        for name, array, reference in zip(("parents", "mu", "impulses"), arrays[:3], expected[:3], strict=True):
             np.testing.assert_array_equal(array.numpy(), reference.numpy(), f"{context} route {route} {name}")
-        impulses = expected[2].numpy()
-        _assert_payload_equal(
-            arrays[2].numpy(),
-            impulses,
-            f"{context} route {route} impulses",
-            arrays[2].device.is_cuda and not exact,
-            rows.impulse_scale(route, impulses),
-        )
 
 
 def _solved_state(scene, rng):
@@ -826,13 +799,7 @@ def run_reference_differential(
         for state, (maps, routes) in zip(live_states, mine, strict=True):
             state.link(*maps, patch_routes(routes))
         reference.link(scene.contacts, *their_maps, their_routes)
-        _assert_live_rows(mine, their_routes, rows, f"{context} link")
-        for state, (maps, routes) in zip(live_states, mine, strict=True):
-            seeded = [row for row in routes if row[4] > 0.0]
-            if seeded:
-                state.seed(scene.state, *maps, patch_routes(seeded))
-        reference.seed(scene.contacts, scene.state, *their_maps, their_routes)
-        _assert_live_rows(mine, their_routes, rows, f"{context} seed")
+        _assert_live_rows(mine, their_routes, f"{context} link")
         out, com = _solved_state(scene, rng)
         before = int(np.count_nonzero(reference.current.valid.numpy()[:live]))
         for state, (maps, routes) in zip(live_states, mine, strict=True):
@@ -852,11 +819,11 @@ def run_reference_differential(
     return coverage
 
 
-def _assert_live_rows(mine, theirs, rows, context):
+def _assert_live_rows(mine, theirs, context):
     """Compare the state under test's rows, ``mine[0]``, with the reference's, and a twin's with them bitwise."""
-    _assert_same_rows(mine[0][1], theirs, rows, context)
+    _assert_same_rows(mine[0][1], theirs, context)
     for _, routes in mine[1:]:
-        _assert_same_rows(routes, mine[0][1], rows, f"{context} twin", exact=True)
+        _assert_same_rows(routes, mine[0][1], f"{context} twin")
 
 
 class TestPatchSortKeys(unittest.TestCase):
@@ -1026,14 +993,12 @@ def run_graph_replay(device, *, worlds=32, contacts=1536, capacity=2048, live_so
     twin = _twin(patches, scene)
     rows = _Rows(scene, capacity, rng)
     dt = 1.0 / 240.0
-    decay = np.array([0.8, 0.0, 0.6])
 
     def prepare(mode):
         scene.move()
         live = scene.frame(mode)
         reference.build(scene.model, scene.state, scene.contacts)
         rows.generate(reference, live)
-        rows.decay = decay
         return live
 
     def assign(fixed, out, com):
@@ -1052,18 +1017,16 @@ def run_graph_replay(device, *, worlds=32, contacts=1536, capacity=2048, live_so
     fixed = rows.arrays()
     out, com = _solved_state(scene, rng)
     maps, routes = fixed
-    linked, seeded = patch_routes(routes), patch_routes(row for row in routes if row[4] > 0.0)
+    linked = patch_routes(routes)
 
     def step():
         patches.build(scene.model, scene.state, scene.contacts)
         patches.link(*maps, linked)
-        patches.seed(scene.state, *maps, seeded)
         patches.finish(scene.state, out, com, *maps, linked, dt)
 
     def reference_step():
         their_maps, their_routes = rows.arrays()
         reference.link(scene.contacts, *their_maps, their_routes)
-        reference.seed(scene.contacts, scene.state, *their_maps, their_routes)
         reference.finish(scene.contacts, scene.state, out, com, *their_maps, their_routes, dt)
         return their_routes
 
@@ -1074,9 +1037,8 @@ def run_graph_replay(device, *, worlds=32, contacts=1536, capacity=2048, live_so
         twin_maps, twin_routes = rows.arrays()
         twin.build(scene.model, scene.state, scene.contacts)
         twin.link(*twin_maps, patch_routes(twin_routes))
-        twin.seed(scene.state, *twin_maps, patch_routes(row for row in twin_routes if row[4] > 0.0))
         twin.finish(scene.state, out, com, *twin_maps, patch_routes(twin_routes), dt)
-        _assert_same_rows(twin_routes, routes, rows, f"{context} twin", exact=True)
+        _assert_same_rows(twin_routes, routes, f"{context} twin")
 
     step()
     twin_step("eager")
@@ -1093,15 +1055,15 @@ def run_graph_replay(device, *, worlds=32, contacts=1536, capacity=2048, live_so
         their_routes = reference_step()
         assert_same_patches(patches, reference, live, f"replay {index} {mode}", twin)
         assert_empty_tail(patches, f"replay {index} {mode}")
-        _assert_same_rows(routes, their_routes, rows, f"replay {index} {mode}")
+        _assert_same_rows(routes, their_routes, f"replay {index} {mode}")
 
 
 @contextlib.contextmanager
 def _record_patch_routes(patches):
-    """Record ``(method, routes)`` for every link, seed and finish call the solver makes on ``patches``."""
+    """Record ``(method, routes)`` for every link and finish call the solver makes on ``patches``."""
     calls = []
     with contextlib.ExitStack() as stack:
-        for name in ("link", "seed", "finish"):
+        for name in ("link", "finish"):
             method = getattr(patches, name)
 
             def record(*args, _name=name, _method=method, **kwargs):
@@ -1114,7 +1076,7 @@ def _record_patch_routes(patches):
 
 class TestPatchSolverRoutes(unittest.TestCase):
     def test_solver_passes_every_patch_route(self):
-        """Link, seed and finish every route that holds patch rows; seed with its decay times dt over the last dt."""
+        """Link and finish every route that holds patch rows, warm-started or not: no step seeds friction."""
         # Both modes route the fixed-base arm's contacts through dense rows and the
         # free box's through matrix-free rows; no route builds the third family.
         configs = [("cpu", {}, (1, 1, 0))]
@@ -1148,17 +1110,12 @@ class TestPatchSolverRoutes(unittest.TestCase):
                         state, out = out, state
                         count = int(contacts.rigid_contact_count.numpy()[0])
                         paths.update(solver.placement.contact_path.numpy()[:count].tolist())
-                        expected = ["link", "seed", "finish"] if warmstart else ["link", "finish"]
-                        self.assertEqual([name for name, _ in calls], expected, f"step {step}")
+                        self.assertEqual([name for name, _ in calls], ["link", "finish"], f"step {step}")
                         for name, routes in calls:
                             self.assertEqual(tuple(routes.enabled), enabled, f"step {step} {name}")
                             for route in np.flatnonzero(enabled):
                                 for field, array in zip(("parents", "mu", "impulses"), arrays[route], strict=True):
                                     self.assertEqual(getattr(routes, f"{field}{route}").ptr, array.ptr, field)
-                        if warmstart:
-                            ratio = dt / dts[step - 1] if step else 1.0
-                            seeded = dict(calls)["seed"]
-                            np.testing.assert_allclose(seeded.scale, 0.8 * ratio * np.asarray(enabled), rtol=1.0e-6)
                         calls.clear()
                     # A step without a frame finishes no route; a step without contacts
                     # drops the stored anchors without calling the patch state.
@@ -1473,7 +1430,6 @@ class _WideRows(_Rows):
         self.values = (parents, mu, impulses)
         self.routes = routes
         self.live = live
-        self.decay = np.where(rng.random(3) < 0.3, 0.0, rng.uniform(0.3, 1.0, size=3))
 
 
 def run_launch_shapes(
@@ -1487,7 +1443,7 @@ def run_launch_shapes(
     After each launch group every array of every state, sort halves and scratch
     included, and every row array must equal the first state's (frames follow
     ``_SHAPE_PLAN``); ``stages`` limits the comparisons to the named launch
-    groups ("build", "link", "seed", "finish", "store" and "reset"). With
+    groups ("build", "link", "finish", "store" and "reset"). With
     ``copies`` above one the scene is that many copies of a scene of
     ``worlds`` and ``contacts`` (:class:`_TiledScene`), and ``capacity`` counts
     slots per copy. Returns the largest live count and the carried anchors.
@@ -1520,7 +1476,7 @@ def run_launch_shapes(
         for index, state in enumerate(states[1:], start=1):
             assert_same_state(state, first, f"{context} shape {index}")
             if routes is not None:
-                _assert_same_rows(routes[index], routes[0], rows, f"{context} shape {index}", exact=True)
+                _assert_same_rows(routes[index], routes[0], f"{context} shape {index}")
 
     def each(method, *args):
         for state in states:
@@ -1558,11 +1514,6 @@ def run_launch_shapes(
             for state, (maps, row) in zip(states, arrays, strict=True):
                 state.link(*maps, patch_routes(row))
             check("link", f"{stage} link", routes)
-            for state, (maps, row) in zip(states, arrays, strict=True):
-                seeded = [entry for entry in row if entry[4] > 0.0]
-                if seeded:
-                    state.seed(scene.state, *maps, patch_routes(seeded))
-            check("seed", f"{stage} seed", routes)
             out, com = _solved_state(scene, rng)
             for state, (maps, row) in zip(states, arrays, strict=True):
                 state.finish(scene.state, out, com, *maps, patch_routes(row), dt)
@@ -1827,7 +1778,6 @@ def run_ring_links(test, device, seed):
                 wp.array(parents[route], dtype=int, device=device),
                 wp.array(mu[route], dtype=float, device=device),
                 wp.zeros(mu[route].shape, dtype=float, device=device),
-                0.0,
                 row_lines(device),
             )
             for route in range(3)
@@ -1841,7 +1791,7 @@ def run_ring_links(test, device, seed):
                 )
 
     expected = rows()
-    for route, route_parents, route_mu, _, _, _ in expected:
+    for route, route_parents, route_mu, _, _ in expected:
         wp.launch(
             reference_link_patch_rows,
             dim=contacts,
@@ -3033,7 +2983,7 @@ def _assert_same_twins(graph, eager, context):
         np.testing.assert_array_equal(
             getattr(graph.states[0], name).numpy(), getattr(eager.states[0], name).numpy(), f"{context} {name}"
         )
-    for name in ("valid", "tangent_impulse", "displacement"):
+    for name in ("valid", "displacement"):
         np.testing.assert_array_equal(
             getattr(graph.patches.previous, name).numpy(),
             getattr(eager.patches.previous, name).numpy(),

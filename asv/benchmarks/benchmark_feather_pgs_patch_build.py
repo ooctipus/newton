@@ -110,10 +110,7 @@ def run(data, device, iterations, history):
         name: getattr(patches.view, name).numpy() for name in ("weight", "next_contact", "point_a", "point_b", "phi")
     }
     outputs.update(
-        {
-            name: getattr(patches.current, name).numpy()
-            for name in ("owner", "valid", "source", "displacement", "tangent_impulse")
-        }
+        {name: getattr(patches.current, name).numpy() for name in ("owner", "valid", "source", "displacement")}
     )
     result = {
         "contacts": int(data["contacts_rigid_contact_count"][0]),

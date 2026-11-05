@@ -428,15 +428,14 @@ class SolverFeatherPGS(SolverBase):
             dense_max_constraints (int, optional): Maximum number of dense (articulation) contact constraint
                 rows stored per world. Free rigid body contacts are stored separately, bounded by
                 mf_max_constraints. Defaults to 32.
-            pgs_warmstart (bool, optional): Re-use dense and matrix-free contact
-                impulses from the previous frame. Contact and friction rows always carry by
-                contact identity through the collision pipeline's ``rigid_contact_match_index``;
-                non-contact dense rows cold-start because their runtime allocation does not
-                provide an identity contract. A non-``None`` Contacts buffer therefore requires
-                contact matching. Body-pair reduction is supported with
-                ``contact_matching="latest"``. Carried friction is transported into
-                the current tangent frame and clamped to the current friction cone.
-                Defaults to False.
+            pgs_warmstart (bool, optional): Re-use dense and matrix-free contact normal
+                impulses from the previous frame. Contact normal rows carry by contact identity
+                through the collision pipeline's ``rigid_contact_match_index``; a non-``None``
+                Contacts buffer therefore requires contact matching. Body-pair reduction is
+                supported with ``contact_matching="latest"``. Friction rows start cold: the
+                friction anchors' displacement is their history. Non-contact dense rows
+                cold-start because their runtime allocation does not provide an identity
+                contract. Defaults to False.
             pgs_warmstart_decay (float, optional): Finite non-negative scale applied to
                 contact impulses carried from the previous frame. Defaults to 1.0.
             mf_max_constraints (int, optional): Maximum number of matrix-free (free-body) rows per world, at

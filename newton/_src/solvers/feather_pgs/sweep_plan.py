@@ -8,7 +8,7 @@
 - the admission of the owners that sweep their own worlds (the route table's cases, in its order), with their kernels
   and streams (:meth:`Sweep.build`, :meth:`Sweep.open_streams`);
 - the claims: the worlds the row pass left to each owner (:meth:`Sweep.claim`), and the resolved worlds;
-- the warm start: the impulses gathered by contact identity (:meth:`Sweep.warm_start`), the patch seed, and what a step
+- the warm start: the normal impulses gathered by contact identity (:meth:`Sweep.warm_start`), and what a step
   carries to the next (:meth:`Sweep.carry`);
 - the launches, the claims in order and then the overflow row (:meth:`Sweep.solve`);
 - the contact forces the impulses export (:meth:`Sweep.forces`).
@@ -150,7 +150,6 @@ class Sweep:
         # Every sweep compiles the exit law and the policy's readout.
         self.policy = SolvePolicy(readout=options.diagnostics.solve_readout)
         self.readout = SolveReadoutRecord(self.policy)
-        self.prev_dt = 0.0
         self.paired_response_candidate_sizes = frozenset(
             size
             for size in self.forest.size_groups
@@ -1200,7 +1199,7 @@ class Sweep:
             )
 
     def warm_start(self, contacts, dt: float) -> None:
-        """Gather the dense rows' impulses of the previous step by contact identity."""
+        """Gather the dense rows' normal impulses of the previous step by contact identity (:mod:`.warm_start`)."""
         if self.options.pgs_warmstart and self.placement.ws_prev_dense_impulses is not None and contacts is not None:
             match_index = contacts.rigid_contact_match_index
             pool = self.placement.contact_pool
@@ -1214,7 +1213,6 @@ class Sweep:
                     self.placement.ws_prev_dense_slot_sorted,
                     self.placement.ws_prev_dense_impulses,
                     self.placement.ws_prev_dense_row_type,
-                    self.placement.ws_prev_dense_row_parent,
                     self.placement.constraint_count,
                     self.placement.ws_prev_contact_normal,
                     self.options.pgs_warmstart_decay,
@@ -1225,25 +1223,6 @@ class Sweep:
                 extent=contacts.rigid_contact_count,
                 max_blocks=self.placement.contact_capacity_blocks,
             )
-
-    def seed_patches(self, state_in, contacts, dt: float) -> None:
-        """Seed the persistent patches' impulses into this step's rows."""
-        if self.patch_frame_built(contacts):
-            ratio = dt / self.prev_dt if self.prev_dt > 0.0 else 1.0
-            seeded = [
-                (route, parents, mu, impulses, decay * ratio, first)
-                for route, parents, mu, impulses, decay, first in self.patch_row_arrays()
-                if decay > 0.0
-            ]
-            if seeded:
-                self.laws.friction_patches.seed(
-                    state_in,
-                    self.placement.contact_world,
-                    self.placement.contact_slot,
-                    self.placement.contact_path,
-                    self.placement.contact_slots_needed,
-                    patch_routes(seeded),
-                )
 
     def _operands(self, v_hat: wp.array, v_out: wp.array) -> dict:
         """The step's sweep operands by parameter name, which every sweep kernel takes from (:meth:`_launch`). A row
@@ -1520,7 +1499,7 @@ class Sweep:
         return patch_routes(row for row in self.patch_row_arrays() if row[1] is not None)
 
     def patch_row_arrays(self):
-        """Yield possible contact routes and their configured warm-start decay."""
+        """Yield the contact routes that can hold patch rows: ``(route, parents, mu, impulses, first)``."""
         # With only free response bodies, the allocator routes every responsive
         # contact through matrix-free rows. Dense bilateral rows can still exist,
         # but have no patch links or impulses.
@@ -1530,7 +1509,6 @@ class Sweep:
                 self.placement.row_parent,
                 self.placement.row_mu,
                 self.placement.impulses,
-                self.options.pgs_warmstart_decay if self.options.pgs_warmstart else 0.0,
                 self.placement.dense_first,
             )
         if self.forest.has_free_rigid_bodies:
@@ -1540,7 +1518,6 @@ class Sweep:
                 self.placement.row_parent,
                 self.placement.row_mu,
                 self.placement.impulses,
-                self.options.pgs_warmstart_decay if self.options.pgs_warmstart else 0.0,
                 self.placement.dense_first,
             )
 
@@ -1554,29 +1531,25 @@ class Sweep:
             with wp.ScopedTimer("S7_Warmstart_Carry", print=False, use_nvtx=self.nvtx, synchronize=self.nvtx):
                 wp.copy(self.placement.ws_prev_dense_impulses, self.placement.impulses)
                 wp.copy(self.placement.ws_prev_dense_row_type, self.placement.row_type)
-                wp.copy(self.placement.ws_prev_dense_row_parent, self.placement.row_parent)
                 if contacts is None:
                     self.placement.ws_prev_dense_row_type.fill_(-1)
-                    self.placement.ws_prev_dense_row_parent.fill_(-1)
 
-        if self.options.pgs_warmstart:
-            if contacts is not None:
-                # One thread per row the contact stream ever used: the slot tables of every such row are rewritten.
-                pool = self.placement.contact_pool
-                used = pool.rows_used if contacts._rigid_contact_pool is pool else None
-                pool.launch(
-                    snapshot_contact_warmstart,
-                    pool.launch_rows(),
-                    inputs=[bind_contact_routes(self.placement, contacts)],
-                    outputs=[
-                        self.placement.ws_prev_dense_slot_sorted,
-                        self.placement.ws_prev_slot_sorted,
-                        self.placement.ws_prev_contact_normal,
-                    ],
-                    extent=pool.ready_rows if used is None else used,
-                    max_blocks=self.placement.contact_capacity_blocks,
-                )
-            self.prev_dt = float(dt)
+        if self.options.pgs_warmstart and contacts is not None:
+            # One thread per row the contact stream ever used: the slot tables of every such row are rewritten.
+            pool = self.placement.contact_pool
+            used = pool.rows_used if contacts._rigid_contact_pool is pool else None
+            pool.launch(
+                snapshot_contact_warmstart,
+                pool.launch_rows(),
+                inputs=[bind_contact_routes(self.placement, contacts)],
+                outputs=[
+                    self.placement.ws_prev_dense_slot_sorted,
+                    self.placement.ws_prev_slot_sorted,
+                    self.placement.ws_prev_contact_normal,
+                ],
+                extent=pool.ready_rows if used is None else used,
+                max_blocks=self.placement.contact_capacity_blocks,
+            )
 
     def clear_history(self, world_mask: wp.array | None) -> None:
         """Discard solver impulses independently of latched capacity status."""
@@ -1594,7 +1567,6 @@ class Sweep:
                 self.placement.impulses,
                 self.placement.ws_prev_dense_impulses,
                 self.placement.ws_prev_dense_row_type,
-                self.placement.ws_prev_dense_row_parent,
             ],
             device=self.model.device,
         )

@@ -12,8 +12,12 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.friction_patches import link_patch_routes, seed_patch_routes
-from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
+from newton._src.solvers.feather_pgs.friction_patches import link_patch_routes
+from newton._src.solvers.feather_pgs.row_kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_TORSION,
+)
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_sparse_scene as sparse_scene
 from newton.tests.feather_pgs_patch_parity import (
@@ -27,17 +31,14 @@ from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
     assert_factor_rows_consistent,
     assert_history_close,
-    assert_history_matches_rows,
     assert_loaded_anchors,
     assert_patch_rows_close,
-    assert_patch_seeds,
     assert_region_impulses_close,
     assert_ring_coulomb,
     assert_rows_close,
     assert_states_close,
     contact_rows,
     patch_rows,
-    recorded_patch_seeds,
     ring_budget_ratios,
     ring_load,
     standing_model,
@@ -298,9 +299,7 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
             rows = [patch_rows(case[1], case[-1], sparse_scene.DT) for case in cases]
             assert_patch_rows_close(*rows)
             assert_region_impulses_close(*rows, **STANDING_REGION_BOUNDS)
-            assert_anchor_sites_close(*(anchor_sites(case[1], case[-1]) for case in cases), tangent=False)
-            for case in cases:
-                self.assertEqual(assert_history_matches_rows(case[1], case[-1]), 4)
+            assert_anchor_sites_close(*(anchor_sites(case[1], case[-1]) for case in cases))
             carriers = [
                 {anchor["contact"] for region in record["regions"].values() for anchor in region["anchors"]}
                 for record in rows
@@ -349,13 +348,11 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "hold 8 and 16 contact slots"):
             assert_history_close(small, large)
 
-    def test_patch_seeds_follow_the_seeding_law(self):
-        """Record each step's patch seed and reject a skipped, rescaled, altered or overwritten one.
+    def test_warm_start_seeds_no_friction(self):
+        """Start every warm-started sweep from the carried normals and cold friction rows.
 
-        The warm-started dense split stance carries every loaded anchor's
-        friction into the next step's seed. A step whose seed launch is
-        skipped, runs at half the decay, writes other values than the seeding
-        law, or whose seeded rows are overwritten before the sweep fails.
+        Under the friction law the anchors' displacement is the friction's history: the warm-started dense split
+        stance seeds its matched normals, and every friction and spin row starts the sweep at zero.
         """
         case = sparse_scene.make_case(
             False,
@@ -365,52 +362,24 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
             standing=True,
             device="cpu",
         )
-        solver, patches = case[1], case[1].laws.friction_patches
-        decay = solver.options.pgs_warmstart_decay
+        solver = case[1]
+        starts, dispatch = [], solver.sweep.solve
 
-        def seeded_step():
-            with recorded_patch_seeds() as seeds:
-                sparse_scene.step(case)
-            return seeds
-
-        def scale_carried_friction(factor):
-            count = int(case[-1].rigid_contact_count.numpy()[0])
-            source = patches.current.source.numpy()[:count]
-            slot, world = solver.placement.contact_slot.numpy()[:count], solver.placement.contact_world.numpy()[:count]
-            needed, impulses = solver.placement.contact_slots_needed.numpy()[:count], solver.placement.impulses.numpy()
-            for c in np.flatnonzero((source >= 0) & (slot >= 0) & (needed >= 3)):
-                impulses[world[c], slot[c] + 1 : slot[c] + 3] *= factor
-            solver.placement.impulses.assign(impulses)
-
-        seed, dispatch, launch = patches.seed, solver.sweep.solve, wp.launch
-
-        def rescaled(state, world, slot, path, slots_needed, routes):
-            routes.scale = wp.vec3(0.5 * routes.scale[0], routes.scale[1], routes.scale[2])
-            seed(state, world, slot, path, slots_needed, routes)
-
-        def altered(kernel, *args, **kwargs):
-            # The seed launch itself writes half the law's values.
-            result = launch(kernel, *args, **kwargs)
-            if kernel is seed_patch_routes:
-                scale_carried_friction(0.5)
-            return result
-
-        def overwritten(*args, **kwargs):
-            scale_carried_friction(0.0)
+        def recorded(*args, **kwargs):
+            starts.append((solver.placement.impulses.numpy().copy(), solver.placement.row_type.numpy().copy()))
             return dispatch(*args, **kwargs)
 
-        self.assertEqual(assert_patch_seeds(seeded_step(), scale=decay, carried=False), 0.0)
-        largest = max(assert_patch_seeds(seeded_step(), scale=decay) for _ in range(3))
-        self.assertGreater(largest, 1.0e-4, "Carried anchors must seed friction")
-        defects = {
-            "not 0 times": mock.patch.object(patches, "seed", lambda *args: None),
-            "warm-start scale": mock.patch.object(patches, "seed", rescaled),
-            "seeded friction rows": mock.patch.object(wp, "launch", altered),
-            "the sweep starts from": mock.patch.object(solver.sweep, "solve", overwritten),
-        }
-        for message, defect in defects.items():
-            with self.subTest(defect=message), defect, self.assertRaisesRegex(AssertionError, message):
-                assert_patch_seeds(seeded_step(), scale=decay)
+        with mock.patch.object(solver.sweep, "solve", recorded):
+            for _ in range(4):
+                sparse_scene.step(case)
+        self.assertEqual(len(starts), 4)
+        for impulses, types in starts:
+            friction = (types == PGS_CONSTRAINT_TYPE_FRICTION) | (types == PGS_CONSTRAINT_TYPE_TORSION)
+            self.assertTrue(np.any(friction))
+            np.testing.assert_array_equal(impulses[friction], 0.0)
+        # The stance's normals carry from the second step on.
+        for impulses, types in starts[1:]:
+            self.assertGreater(float(impulses[types == PGS_CONSTRAINT_TYPE_CONTACT].sum()), 0.0)
 
     def test_sparse_rows_must_carry_their_impulses(self):
         """Reject a factor delta without a seeded row's response, a stale incident and an undecoded velocity.

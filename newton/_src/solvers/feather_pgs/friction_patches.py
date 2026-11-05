@@ -16,15 +16,16 @@ is a conservative test across convex seams, not an exact surface-connectivity
 query. Length tolerances scale with the smaller body's bounding radius; angular
 tolerance is about six degrees. Normals remain individual unilateral rows.
 
-Tangential and twist displacement and impulses persist across frames; friction
-locations follow the current contact region. Displacement accumulates incremental rigid
-motion at those locations, using the pose increment's SE(3) logarithm rather
-than a rotating material point's chord. Saved poses also capture externally
-imposed motion and position-only solver passes. Pair identity and geometric
-compatibility correlate history without a collision matcher or shape-type rules.
-Unloaded regions and saturated friction with opposing slip release history;
-saturation alone does not. All matching tolerances are internal so correction
-strength is the only new user control.
+Tangential and twist displacement persist across frames: they are the friction's
+history, and a warm-started solve carries no friction impulse beside them
+(:mod:`.warm_start`). Friction locations follow the current contact region.
+Displacement accumulates incremental rigid motion at those locations, using the
+pose increment's SE(3) logarithm rather than a rotating material point's chord.
+Saved poses also capture externally imposed motion and position-only solver
+passes. Pair identity and geometric compatibility correlate history without a
+collision matcher or shape-type rules. Unloaded regions and saturated friction
+with opposing slip release history; saturation alone does not. All matching
+tolerances are internal so correction strength is the only new user control.
 
 Sorting body pairs makes construction local to a pair and preserves CUDA graph
 capture: all buffers and the radix-sort workspace have a fixed capacity, the
@@ -53,14 +54,13 @@ from . import field_group
 from .contact_filters import contact_normal_gap_limit
 from .contact_laws import contact_bodies, contact_point, contact_points, contact_tangent_basis
 from .field_group import Field
-from .projection_laws import disk
 from .spatial_laws import point_velocity
 
 # Grids are fixed at construction so CUDA graphs replay them. Their sizes count
 # _BLOCK_THREADS threads per SM (one SM on the CPU); launches stride over the
 # live slots, so no grid changes any output.
 _BLOCK_THREADS = 256
-# The light launches (prepare, link, seed, finish and store, reset) handle one
+# The light launches (prepare, link, finish and store, reset) handle one
 # slot per loop iteration at 40 to 48 registers, which fit five or six blocks
 # per SM, and their reads through slots and rings wait on memory; blocks past
 # the live slots only read the counts. Measured on a 188-SM GPU against two
@@ -187,7 +187,6 @@ class _PatchFrame:
     # Scratch indices: patch members in the current frame, valid anchors in the previous frame.
     members: wp.array[int]
     support_gap_limit: wp.array[float]
-    tangent_impulse: wp.array[wp.vec3]
     pressure: wp.array[wp.vec3]
     pressured: wp.array[int]
     twist: wp.array[float]
@@ -275,7 +274,6 @@ def _prepare_contact_fields(c: int, live: int, inputs: _PatchContacts, frame: _P
     frame.used[c] = 0
     frame.source[c] = -1
     frame.eligible[c] = 0
-    frame.tangent_impulse[c] = wp.vec3(0.0)
     frame.pressured[c] = 0
     patches.weight[c] = 0.0
     patches.next_contact[c] = -1
@@ -911,14 +909,12 @@ def _build_pair(
                 motion = _pose_motion(q, previous_q, a, pa) - _pose_motion(q, previous_q, b, pa)
         anchor_a = _local_point(q, a, pa)
         anchor_b = _local_point(q, b, pa)
-        carried_impulse = wp.vec3(0.0)
         error = wp.vec3(0.0)
         if chosen >= 0:
             prev.used[chosen] = 1
             error = _carried_displacement(q, prev, chosen, n)
             error += motion
             error -= n * wp.dot(error, n)
-            carried_impulse = prev.tangent_impulse[chosen]
         stored_error = error
         if a >= 0:
             stored_error = wp.transform_vector(wp.transform_inverse(q[a]), error)
@@ -938,9 +934,6 @@ def _build_pair(
         frame.pressure[c] = anchor_a
         frame.surface_a[c] = surface_a
         frame.surface_b[c] = surface_b
-        # Default for anchors without friction rows this step; solved rows
-        # overwrite it in ``finish_patch_impulses``.
-        frame.tangent_impulse[c] = carried_impulse
         frame.valid[c] = 1
         patches.weight[c] = 1.0
         patches.spin_arm[c] = spin_arm
@@ -1022,7 +1015,6 @@ def _store_contact(
     prev.anchor_b[c] = frame.anchor_b[c]
     prev.surface_a[c] = frame.surface_a[c]
     prev.surface_b[c] = frame.surface_b[c]
-    prev.tangent_impulse[c] = frame.tangent_impulse[c]
     prev.twist[c] = frame.twist[c]
     world = int(-1)
     if frame.body_a[c] >= 0:
@@ -1331,7 +1323,6 @@ class _FrictionPatchState:
                 "anchor_b",
                 "surface_a",
                 "surface_b",
-                "tangent_impulse",
                 "pressure",
             )
         ]
@@ -1590,30 +1581,9 @@ class _FrictionPatchState:
             clamp=True,
         )
 
-    def seed(self, state, world, slot, path, slots_needed, routes):
-        """Transport cached patch impulses on the enabled routes, scaled by each route's decay."""
-        self._grids(self.pool.launch_rows())
-        self.pool.launch(
-            seed_patch_routes,
-            self.threads,
-            inputs=[
-                self.extent,
-                self.current,
-                self.previous,
-                state.body_q,
-                world,
-                slot,
-                path,
-                slots_needed,
-                routes,
-                self.threads,
-            ],
-            extent=self.extent[1:2],
-            clamp=True,
-        )
-
     def finish(self, state_in, state_out, com, world, slot, path, slots_needed, routes, dt):
-        """Cache solved friction and release anchors on the enabled routes, then store the frame."""
+        """Place the next anchors at the solved centres of pressure and release sliding anchors on the enabled routes,
+        then store the frame."""
         self._finish(
             state_in.body_q, state_out.body_q, state_out.body_qd, com, world, slot, path, slots_needed, routes, dt
         )
@@ -1688,13 +1658,9 @@ def patch_normal_load(parents: wp.array2d[int], impulses: wp.array2d[float], wor
 
 @wp.struct
 class _PatchRoutes:
-    """Row arrays of the contact routes that hold patch rows; ``enabled`` gates each route.
-
-    ``scale`` holds each route's warm-start decay, which only seeding reads.
-    """
+    """Row arrays of the contact routes that hold patch rows; ``enabled`` gates each route."""
 
     enabled: wp.vec3i
-    scale: wp.vec3
     parents0: wp.array2d[int]
     parents1: wp.array2d[int]
     parents2: wp.array2d[int]
@@ -1710,22 +1676,19 @@ class _PatchRoutes:
 
 
 def patch_routes(rows):
-    """Pack ``(route, parents, mu, impulses, scale, first)`` rows into one launch argument.
+    """Pack ``(route, parents, mu, impulses, first)`` rows into one launch argument.
 
     Routes absent from ``rows`` stay disabled, and no launch reads their arrays.
     """
     routes = _PatchRoutes()
     enabled = [0, 0, 0]
-    scale = [0.0, 0.0, 0.0]
-    for route, parents, mu, impulses, decay, first in rows:
+    for route, parents, mu, impulses, first in rows:
         enabled[route] = 1
-        scale[route] = decay
         setattr(routes, f"parents{route}", parents)
         setattr(routes, f"mu{route}", mu)
         setattr(routes, f"impulses{route}", impulses)
         setattr(routes, f"first{route}", first)
     routes.enabled = wp.vec3i(*enabled)
-    routes.scale = wp.vec3(*scale)
     return routes
 
 
@@ -1830,74 +1793,6 @@ def link_patch_routes(
 
 
 @wp.func
-def _seed_contact(
-    c: int,
-    frame: _PatchFrame,
-    prev: _PatchFrame,
-    q: wp.array[wp.transform],
-    world: wp.array[int],
-    slot: wp.array[int],
-    parents: wp.array2d[int],
-    mu: wp.array2d[float],
-    impulses: wp.array2d[float],
-    scale: float,
-    first: wp.array[int],
-):
-    """Transport cached patch impulses after all contact normals have been seeded.
-
-    Anchors without patch history keep whatever the contact-matched warm start
-    seeded; only carried anchors overwrite their friction rows.
-    """
-    source = frame.source[c]
-    if source < 0:
-        return
-    tangent = prev.tangent_impulse[source] * scale
-    if frame.body_a[c] >= 0:
-        tangent = wp.transform_vector(q[frame.body_a[c]], tangent)
-    n = frame.normal[c]
-    if frame.flipped[c] != 0:
-        n = -n
-        tangent = -tangent
-    t0, t1 = contact_tangent_basis(n)
-    value = wp.vec2(wp.dot(tangent, t0), wp.dot(tangent, t1))
-    w = first[world[c]]
-    s = slot[c]
-    radius = wp.max(mu[w, s + 1] * patch_normal_load(parents, impulses, w, s), 0.0)
-    value = disk(value, radius)
-    impulses[w, s + 1] = value[0]
-    impulses[w, s + 2] = value[1]
-
-
-@wp.kernel(enable_backward=False)
-def seed_patch_routes(
-    extent: wp.array[int],
-    frame: _PatchFrame,
-    prev: _PatchFrame,
-    q: wp.array[wp.transform],
-    world: wp.array[int],
-    slot: wp.array[int],
-    path: wp.array[int],
-    slots_needed: wp.array[int],
-    routes: _PatchRoutes,
-    threads: int,
-):
-    """Seed every enabled route in one launch over the live contacts, scaled by its decay.
-
-    A contact writes only its own friction rows and reads normal rows, which
-    seeding never writes, so this matches one launch per route.
-    """
-    thread = wp.tid()
-    for c in range(thread, extent[1], threads):
-        route = _contact_route(routes, slot, path, c)
-        if route >= 0 and slots_needed[c] >= 3:
-            parents = _route_parents(routes, route)
-            mu = _route_mu(routes, route)
-            impulses = _route_impulses(routes, route)
-            first = _route_first(routes, route)
-            _seed_contact(c, frame, prev, q, world, slot, parents, mu, impulses, routes.scale[route], first)
-
-
-@wp.func
 def _point_velocity(
     q: wp.array[wp.transform], qd: wp.array[wp.spatial_vector], com: wp.array[wp.vec3], body: int, anchor: wp.vec3
 ):
@@ -1926,7 +1821,7 @@ def _finish_contact(
     dt: float,
     first: wp.array[int],
 ):
-    """Cache solved friction and release saturated anchors with tangential motion.
+    """Record the region's centre of pressure and release saturated anchors with tangential motion.
 
     The tolerance is relative to geometry and timestep. Merely resting at the
     Coulomb limit does not prove sliding, so it must not erase static history.
@@ -1949,7 +1844,6 @@ def _finish_contact(
     tangent = impulses[w, s + 1] * t0 + impulses[w, s + 2] * t1
     if frame.flipped[c] != 0:
         tangent = -tangent
-    stored = tangent
     a = frame.body_a[c]
     b = frame.body_b[c]
     # The moment of the normal impulses is determinate even where they are not: the ring's centre of pressure, where
@@ -1970,9 +1864,6 @@ def _finish_contact(
     if moment_load > 0.0:
         frame.pressure[c] = _local_point(q, a, moment / moment_load)
         frame.pressured[c] = 1
-    if a >= 0:
-        stored = wp.transform_vector(wp.transform_inverse(q[a]), tangent)
-    frame.tangent_impulse[c] = stored
     radius = wp.max(mu[w, s + 1] * load, 0.0)
     speed = _point_velocity(q_out, qd_out, com, a, frame.anchor_a[c]) - _point_velocity(
         q_out, qd_out, com, b, frame.anchor_b[c]

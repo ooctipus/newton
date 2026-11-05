@@ -56,9 +56,9 @@ DENSE_ROW_EPS = FieldGroup(Field("row_eps", wp.float32, ("world", "row"), owner=
 DENSE_WARMSTART = FieldGroup(
     Field("ws_prev_dense_impulses", wp.float32, ("world", "row"), owner="placement"),
     Field("ws_prev_dense_row_type", wp.int32, ("world", "row"), fill=-1, owner="placement"),
-    Field("ws_prev_dense_row_parent", wp.int32, ("world", "row"), fill=-1, owner="placement"),
 )
-"""Identity-matched warm-start carry of the row store: last step's converged impulses and their row types."""
+"""Identity-matched warm-start carry of the row store: last step's converged impulses and their row types (its
+normals are what the next step gathers, :mod:`.warm_start`)."""
 
 FUSED_DIAGONAL_LIMITS = FieldGroup(
     Field("fused_diagonal_limit_active", wp.int32, ("world", "world_dof"), owner="placement"),
@@ -345,7 +345,6 @@ class Placement:
         # The carry's tables, allocated with their rows only when enabled.
         self.ws_prev_dense_impulses = None
         self.ws_prev_dense_row_type = None
-        self.ws_prev_dense_row_parent = None
         self.ws_prev_dense_slot_sorted = None
         self.ws_prev_slot_sorted = None
         # All inactive weight arguments alias this one element. Their producer kernels skip stores and their consumer

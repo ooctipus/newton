@@ -425,7 +425,7 @@ class TestResolvedWorlds(unittest.TestCase):
         parents = wp.array([[-1, 0, 0, -1, 3, 3, -1, -1]], dtype=int, device="cpu")
         mu = wp.full((1, 8), 0.5, dtype=float, device="cpu")
         impulses = wp.array([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=float, device="cpu")
-        routes = patch_routes(((0, parents, mu, impulses, 0.0, row_lines(parents.device)),))
+        routes = patch_routes(((0, parents, mu, impulses, row_lines(parents.device)),))
         for label, finish_routes, expected in (
             ("finish", routes, [0, 1, 1, 0]),
             ("store only", patch_routes(()), [1, 1, 1, 1]),

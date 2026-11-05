@@ -25,14 +25,13 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs.contact_filters import contact_normal_gap_limit
-from newton._src.solvers.feather_pgs.contact_laws import contact_point, contact_points, contact_tangent_basis
+from newton._src.solvers.feather_pgs.contact_laws import contact_point, contact_points
 from newton._src.solvers.feather_pgs.friction_patches import (
     FrictionPatches,
     _build_pair,
     _finish_contact,
     _local_surface,
     _PatchFrame,
-    patch_normal_load,
     patch_routes,
 )
 
@@ -99,7 +98,6 @@ def _prepare(
     frame.used[c] = 0
     frame.source[c] = -1
     frame.eligible[c] = 0
-    frame.tangent_impulse[c] = wp.vec3(0.0)
     frame.pressured[c] = 0
     patches.weight[c] = 0.0
     patches.next_contact[c] = -1
@@ -251,7 +249,6 @@ def _store_history(
     prev.anchor_b[c] = frame.anchor_b[c]
     prev.surface_a[c] = frame.surface_a[c]
     prev.surface_b[c] = frame.surface_b[c]
-    prev.tangent_impulse[c] = frame.tangent_impulse[c]
     prev.twist[c] = frame.twist[c]
     world = int(-1)
     if frame.body_a[c] >= 0:
@@ -313,52 +310,6 @@ def link_patch_rows(
 
 
 @wp.kernel(enable_backward=False)
-def seed_patch_impulses(
-    count: wp.array[int],
-    frame: _PatchFrame,
-    prev: _PatchFrame,
-    q: wp.array[wp.transform],
-    world: wp.array[int],
-    slot: wp.array[int],
-    path: wp.array[int],
-    slots_needed: wp.array[int],
-    route: int,
-    parents: wp.array2d[int],
-    mu: wp.array2d[float],
-    impulses: wp.array2d[float],
-    scale: float,
-):
-    """Transport cached patch impulses after all contact normals have been seeded.
-
-    Anchors without patch history keep whatever the contact-matched warm start
-    seeded; only carried anchors overwrite their friction rows.
-    """
-    c = wp.tid()
-    if c >= count[0] or path[c] != route or slot[c] < 0 or slots_needed[c] < 3:
-        return
-    source = frame.source[c]
-    if source < 0:
-        return
-    tangent = prev.tangent_impulse[source] * scale
-    if frame.body_a[c] >= 0:
-        tangent = wp.transform_vector(q[frame.body_a[c]], tangent)
-    n = frame.normal[c]
-    if frame.flipped[c] != 0:
-        n = -n
-        tangent = -tangent
-    t0, t1 = contact_tangent_basis(n)
-    value = wp.vec2(wp.dot(tangent, t0), wp.dot(tangent, t1))
-    w = world[c]
-    s = slot[c]
-    radius = wp.max(mu[w, s + 1] * patch_normal_load(parents, impulses, w, s), 0.0)
-    magnitude = wp.length(value)
-    if magnitude > radius and magnitude > 0.0:
-        value *= radius / magnitude
-    impulses[w, s + 1] = value[0]
-    impulses[w, s + 2] = value[1]
-
-
-@wp.kernel(enable_backward=False)
 def finish_patch_impulses(
     count: wp.array[int],
     frame: _PatchFrame,
@@ -411,10 +362,9 @@ class ReferencePatches:
     sequence.
 
     Construction, geometry updates, :meth:`build` and :meth:`store` copy
-    ``_FrictionPatchState`` with patches enabled. :meth:`link`, :meth:`seed`,
-    :meth:`finish` and :meth:`reset` launch the per-route kernels and the history
-    reset as the solver did. ``routes`` holds ``(route, parents, mu, impulses, first,
-    scale)`` tuples; only :meth:`seed` reads ``scale``, its warm-start decay.
+    ``_FrictionPatchState`` with patches enabled. :meth:`link`, :meth:`finish` and
+    :meth:`reset` launch the per-route kernels and the history reset as the solver
+    did. ``routes`` holds ``(route, parents, mu, impulses, first)`` tuples.
     """
 
     def __init__(self, model, capacity, phi):
@@ -493,7 +443,6 @@ class ReferencePatches:
             "anchor_b",
             "surface_a",
             "surface_b",
-            "tangent_impulse",
             "pressure",
         ):
             setattr(frame, field, wp.zeros(n, dtype=wp.vec3, device=device))
@@ -593,7 +542,7 @@ class ReferencePatches:
 
     def link(self, contacts, world, slot, path, slots_needed, routes):
         """Link each route's normal rows, one launch per route."""
-        for route, parents, mu, _impulses, _scale, _first in routes:
+        for route, parents, mu, _impulses, _first in routes:
             wp.launch(
                 link_patch_rows,
                 dim=contacts.rigid_contact_max,
@@ -601,37 +550,12 @@ class ReferencePatches:
                 device=world.device,
             )
 
-    def seed(self, contacts, state, world, slot, path, slots_needed, routes):
-        """Seed carried tangent impulses on the routes with a warm-start decay."""
-        for route, parents, mu, impulses, scale, _first in routes:
-            if scale > 0.0:
-                wp.launch(
-                    seed_patch_impulses,
-                    dim=contacts.rigid_contact_max,
-                    inputs=[
-                        contacts.rigid_contact_count,
-                        self.current,
-                        self.previous,
-                        state.body_q,
-                        world,
-                        slot,
-                        path,
-                        slots_needed,
-                        route,
-                        parents,
-                        mu,
-                        impulses,
-                        scale,
-                    ],
-                    device=world.device,
-                )
-
     def finish(self, contacts, state_in, state_out, com, world, slot, path, slots_needed, routes, dt):
         """Release or cache solved anchors per route, then store the frame; ``None`` contacts drop history."""
         if contacts is None:
             self.previous.valid.zero_()
             return
-        for route, parents, mu, impulses, _scale, first in routes:
+        for route, parents, mu, impulses, first in routes:
             wp.launch(
                 finish_patch_impulses,
                 dim=contacts.rigid_contact_max,

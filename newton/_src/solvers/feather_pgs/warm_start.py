@@ -1,16 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The sweep's warm start: the impulses' initialization, and the previous step's impulses gathered by contact
-identity, their tangent frame transported and projected onto the current cone."""
+"""The sweep's warm start: the impulses' initialization, and the previous step's normal impulses gathered by contact
+identity.
+
+The warm start carries the contact normals only. A contact's friction (its tangent pair and spin row) starts every step
+cold: under the friction law its history is the anchor, whose displacement the rows' targets already carry
+(:mod:`.friction_patches`). A carried friction impulse would be a second history of the same stick, and on a stance
+with more anchors than the bodies' motions (two feet of one rigid shin, four feet of one torso) part of what the stick
+asks is out of every motion's reach: a cold step answers that part with a bounded impulse, a carried one adds it up
+step after step along the stance's indeterminate force modes until the feet reach their Coulomb cones and slip.
+"""
 
 import warp as wp
 
 from .contact_input import ContactRoutes
-from .contact_laws import CONTACT_SPIN_ROW, contact_tangent_basis
 from .factor.kernels import Clock, clock_dt_ratio
-from .projection_laws import ball, disk
-from .row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
+from .row_kernels import PGS_CONSTRAINT_TYPE_CONTACT
 from .row_records import DenseRows, MfRows
 
 
@@ -54,7 +60,6 @@ def reset_world_warmstart_buffers(
     impulses: wp.array2d[float],
     prev_impulses: wp.array2d[float],
     prev_row_type: wp.array2d[int],
-    prev_row_parent: wp.array2d[int],
 ):
     """Clear persistent warm-start state for selected worlds: their lines of the row store, both classes' rows."""
     world = wp.tid()
@@ -67,8 +72,6 @@ def reset_world_warmstart_buffers(
         prev_impulses[line, row] = 0.0
     for row in range(prev_row_type.shape[1]):
         prev_row_type[line, row] = -1
-    for row in range(prev_row_parent.shape[1]):
-        prev_row_parent[line, row] = -1
 
 
 # =============================================================================
@@ -91,59 +94,12 @@ def reset_world_warmstart_buffers(
 
 
 @wp.func
-def _transport_warmstart_contact(
-    normal: wp.vec3,
-    previous_normal: wp.vec3,
-    world: int,
-    slot: int,
-    count: int,
-    row_type: wp.array2d[int],
-    row_parent: wp.array2d[int],
-    row_mu: wp.array2d[float],
-    impulses: wp.array2d[float],
-):
-    """Transport the cached tangent frame and enforce the current contact cone: the disk, or with the contact's spin
-    row (contact torsion) the elliptic cone of the pair and the spin (:func:`.projection_laws.ball`)."""
-    normal_impulse = impulses[world, slot]
-    if not wp.isfinite(normal_impulse) or wp.dot(normal, previous_normal) <= 0.0:
-        normal_impulse = 0.0
-    normal_impulse = wp.max(normal_impulse, 0.0)
-    impulses[world, slot] = normal_impulse
-    if slot + 2 >= count:
-        return
-    if (
-        row_type[world, slot + 1] != PGS_CONSTRAINT_TYPE_FRICTION
-        or row_type[world, slot + 2] != PGS_CONSTRAINT_TYPE_FRICTION
-        or row_parent[world, slot + 1] != slot
-        or row_parent[world, slot + 2] != slot
-    ):
-        return
-
-    # Collision normals are A-to-B; every contact Jacobian uses B-to-A.
-    old_t0, old_t1 = contact_tangent_basis(-previous_normal)
-    new_t0, new_t1 = contact_tangent_basis(-normal)
-    tangent_world = impulses[world, slot + 1] * old_t0 + impulses[world, slot + 2] * old_t1
-    tangent = wp.vec2(wp.dot(tangent_world, new_t0), wp.dot(tangent_world, new_t1))
-    magnitude = wp.length(tangent)
-    radius = wp.max(row_mu[world, slot + 1] * normal_impulse, 0.0)
-    spin = slot + CONTACT_SPIN_ROW
-    if spin < count and row_type[world, spin] == PGS_CONSTRAINT_TYPE_TORSION and row_parent[world, spin] == slot:
-        # The spin about the normal needs no frame transport: the pair and the spin project onto their cone.
-        triple = wp.vec3(tangent[0], tangent[1], impulses[world, spin])
-        if not wp.isfinite(magnitude) or not wp.isfinite(triple[2]) or normal_impulse <= 0.0:
-            triple = wp.vec3(0.0)
-        else:
-            triple = ball(triple, row_mu[world, slot + 1], row_mu[world, spin], normal_impulse)
-        impulses[world, slot + 1] = triple[0]
-        impulses[world, slot + 2] = triple[1]
-        impulses[world, spin] = triple[2]
-        return
-    if not wp.isfinite(magnitude) or radius <= 0.0:
-        tangent = wp.vec2(0.0)
-    else:
-        tangent = disk(tangent, radius)
-    impulses[world, slot + 1] = tangent[0]
-    impulses[world, slot + 2] = tangent[1]
+def carried_normal(impulse: float, normal: wp.vec3, previous_normal: wp.vec3):
+    """A carried normal impulse on the current contact: zero where it is not finite or the normal turned over, never
+    negative."""
+    if not wp.isfinite(impulse) or wp.dot(normal, previous_normal) <= 0.0:
+        return 0.0
+    return wp.max(impulse, 0.0)
 
 
 @wp.kernel
@@ -154,7 +110,6 @@ def gather_mf_warmstart(
     prev_slot_sorted: wp.array[int],  # prev-sorted contact idx -> prev base MF slot (or -1)
     prev_mf_impulses: wp.array2d[float],
     prev_mf_row_type: wp.array2d[int],
-    prev_mf_row_parent: wp.array2d[int],
     mf_constraint_count: wp.array[int],
     previous_normal: wp.array[wp.vec3],
     decay: float,
@@ -163,107 +118,43 @@ def gather_mf_warmstart(
     # in-out
     mf_impulses: wp.array2d[float],
 ):
-    """Seed this step's MF impulse buffer from the previous step's converged
-    impulses, matched by contact identity.
+    """Seed this step's MF normal rows from the previous step's converged normal impulses, matched by contact
+    identity.
 
-    Runs after ``allocate_world_contact_slots`` + ``walk_rows.write_free_body_rows`` (so
-    ``contact_slot`` and the rows' types are populated for this step) and after
-    the warm-start branch has zeroed their impulses (the row store's free bodies' rows). One thread per contact;
-    each writes only its own disjoint slot range, so unmatched / cold contacts
-    keep the zero left by the memset and no stale slot survives.
+    Runs after ``allocate_world_contact_slots`` + ``walk_rows.write_free_body_rows`` (so ``contact_slot`` and the
+    rows' types are populated for this step) and after the warm-start branch has zeroed their impulses (the row store's
+    free bodies' rows). One thread per contact; each writes only its own normal row, so unmatched contacts and every
+    friction row keep the zero left by the memset.
 
     The step clock's ratio (:func:`.factor.kernels.clock_dt_ratio`, dt_now / dt_prev) rescales carried impulses
     across step-size changes (impulse is proportional to dt for quasi-static loads); 1.0 at fixed dt.
 
-    ``match_index[c] >= 0`` is the previous frame's *sorted* contact index;
-    ``prev_slot_sorted`` is keyed the same way (see solver writeback), so
-    ``prev_slot = prev_slot_sorted[match_index[c]]`` is the base slot that
-    contact occupied last step. Friction rows are only seeded when BOTH this
-    step and the previous step allocated a friction row at the corresponding
-    offset (guards the variable 1-vs-3 stride).
+    ``match_index[c] >= 0`` is the previous frame's *sorted* contact index; ``prev_slot_sorted`` is keyed the same way
+    (see solver writeback), so ``prev_slot = prev_slot_sorted[match_index[c]]`` is the base slot that contact occupied
+    last step.
     """
     c = wp.tid()
-    dt_scale = clock_dt_ratio(clock[0])
     if c >= routes.count[0]:
         return
     if routes.path[c] != 1:  # MF path only
         return
     new_slot = routes.slot[c]
-    if new_slot < 0:
+    mi = match_index[c]
+    if new_slot < 0 or mi < 0:
         return
-
     world = routes.world[c]
     # The free bodies' rows in the world's line: from ``mf.base``, the slots' and parents' row index.
-    count = mf.base + mf_constraint_count[world]
     capacity = mf.base + mf_max_c
-    if new_slot >= count:
+    prev_slot = prev_slot_sorted[mi]
+    if new_slot >= mf.base + mf_constraint_count[world] or prev_slot < 0 or prev_slot >= capacity:
         return
     mf_line = mf.first[world]
-
-    mi = match_index[c]
-    matched = mi >= 0
-    prev_slot = int(-1)
-    if matched:
-        prev_slot = prev_slot_sorted[mi]
-
-    # Normal row (offset 0): always present for an MF contact.
     if (
-        matched
-        and prev_slot >= 0
-        and prev_slot < capacity
-        and mf.row_type[mf_line, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT
+        mf.row_type[mf_line, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT
         and prev_mf_row_type[mf_line, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT
     ):
-        mf_impulses[mf_line, new_slot] = decay * dt_scale * prev_mf_impulses[mf_line, prev_slot]
-    # else: leave 0 (already memset)
-
-    # Friction rows (offsets 1..2): only if THIS step allocated them here and
-    # they belong to this contact's block (parent == base slot).
-    for r in range(1, 3):
-        new_r = new_slot + r
-        if new_r < count and new_r < capacity:
-            if (
-                mf.row_type[mf_line, new_r] == PGS_CONSTRAINT_TYPE_FRICTION
-                and mf.row_parent[mf_line, new_r] == new_slot
-            ):
-                prev_r = prev_slot + r
-                if (
-                    matched
-                    and prev_slot >= 0
-                    and prev_r < capacity
-                    and prev_mf_row_type[mf_line, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
-                    and prev_mf_row_parent[mf_line, prev_r] == prev_slot
-                ):
-                    mf_impulses[mf_line, new_r] = decay * dt_scale * prev_mf_impulses[mf_line, prev_r]
-                # else: leave 0
-    # The spin row (contact torsion): carried as the friction rows are.
-    new_r = new_slot + CONTACT_SPIN_ROW
-    prev_r = prev_slot + CONTACT_SPIN_ROW
-    if (
-        matched
-        and prev_slot >= 0
-        and new_r < count
-        and new_r < capacity
-        and prev_r < capacity
-        and mf.row_type[mf_line, new_r] == PGS_CONSTRAINT_TYPE_TORSION
-        and mf.row_parent[mf_line, new_r] == new_slot
-        and prev_mf_row_type[mf_line, prev_r] == PGS_CONSTRAINT_TYPE_TORSION
-        and prev_mf_row_parent[mf_line, prev_r] == prev_slot
-    ):
-        mf_impulses[mf_line, new_r] = decay * dt_scale * prev_mf_impulses[mf_line, prev_r]
-
-    if mi >= 0 and prev_slot >= 0 and prev_slot < capacity:
-        _transport_warmstart_contact(
-            routes.normal[c],
-            previous_normal[mi],
-            mf_line,
-            new_slot,
-            count,
-            mf.row_type,
-            mf.row_parent,
-            mf.row_mu,
-            mf_impulses,
-        )
+        impulse = decay * clock_dt_ratio(clock[0]) * prev_mf_impulses[mf_line, prev_slot]
+        mf_impulses[mf_line, new_slot] = carried_normal(impulse, routes.normal[c], previous_normal[mi])
 
 
 @wp.kernel
@@ -297,7 +188,6 @@ def gather_dense_warmstart(
     prev_slot_sorted: wp.array[int],  # prev-sorted contact idx -> prev dense normal row (or -1)
     prev_dense_impulses: wp.array2d[float],
     prev_dense_row_type: wp.array2d[int],
-    prev_dense_row_parent: wp.array2d[int],
     world_constraint_count: wp.array[int],
     previous_normal: wp.array[wp.vec3],
     decay: float,
@@ -306,90 +196,31 @@ def gather_dense_warmstart(
     # in-out
     world_impulses: wp.array2d[float],
 ):
-    """Seed this step's DENSE impulse buffer from the previous step's converged
-    impulses, matched by contact identity — the dense mirror of
-    :func:`gather_mf_warmstart`.
+    """Seed this step's dense normal rows from the previous step's converged normal impulses, matched by contact
+    identity: the dense mirror of :func:`gather_mf_warmstart`.
 
-    Runs after ``prepare_world_impulses`` has cold-zeroed every dense row, so
-    unmatched or fresh contacts stay cold and no stale impulse survives a
-    slot-layout shift. Friction rows
-    (offsets 1, 2 after the normal row) are seeded only when BOTH this step and
-    the previous step allocated a friction row at the corresponding offset.
-    ``decay`` scales every seeded impulse: at persistent quasi-static contacts
-    it damps the accumulate-on-impact overshoot while keeping the sweep's
-    starting point near the converged solution.
+    Runs after ``prepare_world_impulses`` has cold-zeroed every dense row, so unmatched or fresh contacts and every
+    friction row stay cold and no stale impulse survives a slot-layout shift. ``decay`` scales every seeded impulse:
+    at persistent quasi-static contacts it damps the accumulate-on-impact overshoot while keeping the sweep's starting
+    point near the converged solution.
     """
     c = wp.tid()
-    dt_scale = clock_dt_ratio(clock[0])
     if c >= routes.count[0]:
         return
     if routes.path[c] != 0:  # dense path only
         return
     new_slot = routes.slot[c]
-    if new_slot < 0:
+    mi = match_index[c]
+    if new_slot < 0 or mi < 0:
         return
-
     world = routes.world[c]
-    count = world_constraint_count[world]
-    if new_slot >= count:
+    prev_slot = prev_slot_sorted[mi]
+    if new_slot >= world_constraint_count[world] or prev_slot < 0 or prev_slot >= max_constraints:
         return
     line = rows.first[world]
-
-    mi = match_index[c]
-    matched = mi >= 0
-    prev_slot = int(-1)
-    if matched:
-        prev_slot = prev_slot_sorted[mi]
-
-    # Normal row (offset 0).
     if (
-        matched
-        and prev_slot >= 0
-        and prev_slot < max_constraints
+        rows.row_type[line, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT
         and prev_dense_row_type[line, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT
     ):
-        if rows.row_type[line, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT:
-            world_impulses[line, new_slot] = decay * dt_scale * prev_dense_impulses[line, prev_slot]
-
-    # Friction rows (offsets 1, 2): only if THIS step allocated them here.
-    for r in range(1, 3):
-        new_r = new_slot + r
-        if new_r < count and new_r < max_constraints:
-            if rows.row_type[line, new_r] == PGS_CONSTRAINT_TYPE_FRICTION and rows.row_parent[line, new_r] == new_slot:
-                prev_r = prev_slot + r
-                if (
-                    matched
-                    and prev_slot >= 0
-                    and prev_r < max_constraints
-                    and prev_dense_row_type[line, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
-                    and prev_dense_row_parent[line, prev_r] == prev_slot
-                ):
-                    world_impulses[line, new_r] = decay * dt_scale * prev_dense_impulses[line, prev_r]
-    # The spin row (contact torsion): carried as the friction rows are.
-    new_r = new_slot + CONTACT_SPIN_ROW
-    prev_r = prev_slot + CONTACT_SPIN_ROW
-    if (
-        matched
-        and prev_slot >= 0
-        and new_r < count
-        and new_r < max_constraints
-        and prev_r < max_constraints
-        and rows.row_type[line, new_r] == PGS_CONSTRAINT_TYPE_TORSION
-        and rows.row_parent[line, new_r] == new_slot
-        and prev_dense_row_type[line, prev_r] == PGS_CONSTRAINT_TYPE_TORSION
-        and prev_dense_row_parent[line, prev_r] == prev_slot
-    ):
-        world_impulses[line, new_r] = decay * dt_scale * prev_dense_impulses[line, prev_r]
-
-    if mi >= 0 and prev_slot >= 0 and prev_slot < max_constraints:
-        _transport_warmstart_contact(
-            routes.normal[c],
-            previous_normal[mi],
-            line,
-            new_slot,
-            count,
-            rows.row_type,
-            rows.row_parent,
-            rows.row_mu,
-            world_impulses,
-        )
+        impulse = decay * clock_dt_ratio(clock[0]) * prev_dense_impulses[line, prev_slot]
+        world_impulses[line, new_slot] = carried_normal(impulse, routes.normal[c], previous_normal[mi])

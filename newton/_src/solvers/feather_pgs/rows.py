@@ -919,10 +919,11 @@ class RowLaws:
                 # ── MF warm-start seed ────────────────────────────────────
                 # contact_slot + mf_row_type are now populated for THIS step.
                 # mf_impulses was already memset at the top of this method
-                # (covers vel-limit rows, padding tail, and any contact that
-                # returns early in the gather); here we gather matched contacts'
-                # previous impulses into their current slots by identity. The
-                # carry itself is the row store's (ws_prev_dense_*), whose rows the free bodies' slots index.
+                # (covers vel-limit rows, padding tail, friction rows, and any
+                # contact that returns early in the gather); here we gather matched
+                # contacts' previous normal impulses into their current slots by
+                # identity. The carry itself is the row store's (ws_prev_dense_*),
+                # whose rows the free bodies' slots index.
                 if solver.options.pgs_warmstart:
                     match_index = getattr(contacts, "rigid_contact_match_index", None)
                     if match_index is None:
@@ -942,7 +943,6 @@ class RowLaws:
                             solver.placement.ws_prev_slot_sorted,
                             solver.placement.ws_prev_dense_impulses,
                             solver.placement.ws_prev_dense_row_type,
-                            solver.placement.ws_prev_dense_row_parent,
                             solver.placement.mf_constraint_count,
                             solver.placement.ws_prev_contact_normal,
                             solver.options.pgs_warmstart_decay,

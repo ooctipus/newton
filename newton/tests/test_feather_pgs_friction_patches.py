@@ -448,7 +448,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         velocity = wp.zeros(2, dtype=wp.spatial_vector, device="cpu")
         solved = SimpleNamespace(body_q=state.body_q, body_qd=velocity)
         com = wp.zeros(2, dtype=wp.vec3, device="cpu")
-        routes = patch_routes([(0, parents, mu, impulses, 1.0, row_lines(parents.device))])
+        routes = patch_routes([(0, parents, mu, impulses, row_lines(parents.device))])
 
         def finish():
             patches.finish(state, solved, com, zeros, zeros, zeros, lengths, routes, 0.005)
@@ -531,69 +531,24 @@ class TestFrictionPatchHistory(unittest.TestCase):
         self.assertEqual(np.count_nonzero(patches.view.weight.numpy()), 1)
         self.assertEqual(float(patches.view.weight.numpy().sum()), 1.0)
 
-    def test_warmstart_uses_patch_load_when_anchor_normal_is_unloaded(self):
-        """Keep a cached tangent supported when other normals carry the load."""
-        model, state, contacts, patches = _patch_fixture([[-0.1, 0, 0], [0, 0, 0], [0.1, 0, 0]])
-        patches.current.tangent_impulse.assign([[0, 0, 0], [0, 0, 0], [0.8, 0, 0]] + [[0, 0, 0]] * 5)
-        store_frame(patches, state)
-        patches.build(model, state, contacts)
-        # The region's last contact carries its anchor: a normal, the pair and the spin row of the line's footprint.
-        slots = wp.array([0, 1, 2], dtype=int, device="cpu")
-        worlds = wp.zeros(3, dtype=int, device="cpu")
-        paths = wp.zeros(3, dtype=int, device="cpu")
-        lengths = wp.array([1, 1, 4], dtype=int, device="cpu")
-        parents = wp.array([[-1, -1, -1, 2, 2, 2]], dtype=int, device="cpu")
-        mu = wp.array([[0.5] * 6], dtype=float, device="cpu")
-        impulses = wp.array([[0, 4, 0, 0, 0, 0]], dtype=float, device="cpu")
-        routes = patch_routes([(0, parents, mu, impulses, 1.0, row_lines(parents.device))])
-        patches.link(worlds, slots, paths, lengths, routes)
-        patches.seed(state, worlds, slots, paths, lengths, routes)
-        result = impulses.numpy()[0]
-        self.assertAlmostEqual(float(np.linalg.norm(result[3:5])), 0.8)
-
-    def test_seed_keeps_matched_warmstart_without_patch_history(self):
-        """Keep the contact-matched friction warm start on an anchor that has no patch history yet."""
-        _model, state, _contacts, patches = _patch_fixture([[0, 0, 0]])
-        self.assertEqual(int(patches.current.source.numpy()[0]), -1)
-        slots = wp.zeros(1, dtype=int, device="cpu")
-        lengths = wp.array([3], dtype=int, device="cpu")
-        parents = wp.array([[-1] * 8], dtype=int, device="cpu")
-        mu = wp.array([[0.5, 0.25, 0.25] + [0.0] * 5], dtype=float, device="cpu")
-        seeded = [1.0, 0.3, -0.2] + [0.0] * 5
-        impulses = wp.array([seeded], dtype=float, device="cpu")
-        patches.seed(
-            state,
-            slots,
-            slots,
-            slots,
-            lengths,
-            patch_routes([(0, parents, mu, impulses, 1.0, row_lines(parents.device))]),
-        )
-        np.testing.assert_array_equal(impulses.numpy()[0], np.array(seeded, dtype=np.float32))
-
     def test_anchors_without_rows_keep_history(self):
-        """Keep a valid anchor and its cached impulse when its region gets no friction rows this step."""
+        """Keep a valid anchor when its region gets no friction rows this step."""
         _model, state, _contacts, patches = _patch_fixture([[0, 0, 0]])
-        cached = [[0.1, 0.2, 0.0]] + [[0.0, 0.0, 0.0]] * 7
         zeros = wp.zeros(1, dtype=int, device="cpu")
         parents = wp.array([[-1] * 8], dtype=int, device="cpu")
         mu = wp.zeros((1, 8), dtype=float, device="cpu")
         impulses = wp.zeros((1, 8), dtype=float, device="cpu")
         solved = SimpleNamespace(body_q=state.body_q, body_qd=wp.zeros(2, dtype=wp.spatial_vector, device="cpu"))
         com = wp.zeros(2, dtype=wp.vec3, device="cpu")
-        routes = patch_routes([(0, parents, mu, impulses, 1.0, row_lines(parents.device))])
+        routes = patch_routes([(0, parents, mu, impulses, row_lines(parents.device))])
         for slot, length, load, retained in ((-1, 3, 0.0, 1), (0, 1, 2.0, 1), (0, 1, 0.0, 0)):
             with self.subTest(slot=slot, slots_needed=length):
                 impulses.assign([[load] + [0.0] * 7])
                 patches.current.valid.assign([1] + [0] * 7)
-                patches.current.tangent_impulse.assign(cached)
                 slots = wp.array([slot], dtype=int, device="cpu")
                 lengths = wp.array([length], dtype=int, device="cpu")
                 patches.finish(state, solved, com, zeros, slots, zeros, lengths, routes, 0.005)
                 self.assertEqual(int(patches.current.valid.numpy()[0]), retained)
-                np.testing.assert_array_equal(
-                    patches.current.tangent_impulse.numpy()[0], np.asarray(cached[0], dtype=np.float32)
-                )
 
     def test_stationary_history_does_not_accumulate_roundoff(self):
         """Avoid accumulating world round-trip error while a transformed contact remains stationary."""

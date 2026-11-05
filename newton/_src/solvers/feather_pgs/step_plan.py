@@ -661,16 +661,13 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     if forest.has_free_rigid_bodies:
         add(write_free_body_rhs_timed if "sync_timings" in diagnostics else write_free_body_rhs, nvtx="S4_MF_Setup")
 
-    # Stages 5 and 6: the impulses' start (warm start, the patches' seeds, the closures' seeds), the claims that
+    # Stages 5 and 6: the impulses' start (the warm start's normals, the closures' seeds), the claims that
     # follow the published rows, and the sweep.
     def prepare_impulses(step):
         placement.prepare_impulses()
 
     def warm_start(step):
         sweep.warm_start(step.contacts, step.dt)
-
-    def seed_patches(step):
-        sweep.seed_patches(step.state_in, step.contacts, step.dt)
 
     def seed_blocks(step):
         # The closure's seed: the one writer closed the bilateral blocks and corrected the other rows; the blocks'
@@ -705,7 +702,6 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         sweep.solve(solver.v_hat, solver.v_out)
 
     add(prepare_impulses, *((warm_start,) if route.laws.warm_start else ()), nvtx="S5_PGS_Prep")
-    add(seed_patches)
     add(
         *((seed_blocks,) if route.laws.preelimination else ()),
         start_velocity,

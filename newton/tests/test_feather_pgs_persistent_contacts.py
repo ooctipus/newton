@@ -9,9 +9,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.contact_laws import contact_tangent_basis
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_free_body_rows import free_body_jacobians
 from newton.tests.test_contact_reduction_body_pairs import _cylinder_foot
 
 
@@ -65,8 +63,9 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
             self.assertTrue(np.all(matches[worlds == selected] < 0))
             self.assertTrue(np.all(matches[worlds == 1 - selected] >= 0))
 
-    def _seed_rotating_contact(self, friction, *, oblique=False, rotated=False, device="cpu"):
-        """Prepare a cached friction impulse and move its normal across a basis seam."""
+    def _carry_contact(self, *, rotated=False, device="cpu"):
+        """Step a resting box contact once, give its rows a carried normal and tangent pair, turn its normal, and step
+        it again without a sweep: the rows hold what the warm start seeded."""
         builder = newton.ModelBuilder(up_axis=newton.Axis.X, gravity=wp.vec3(0.0))
         builder.add_ground_plane()
         body = builder.add_body(xform=wp.transform(wp.vec3(0.1, 0.0, 0.0), wp.quat_identity()))
@@ -83,9 +82,6 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         contacts.rigid_contact_count.fill_(1)
         old_normal = wp.normalize(wp.vec3(-1.0, 0.001, 0.0))
         new_normal = wp.normalize(wp.vec3(-1.0, -0.001, 0.0))
-        if oblique:
-            old_normal = wp.normalize(wp.vec3(0.2, 0.3, 0.93))
-            new_normal = wp.normalize(wp.vec3(0.3, 0.2, 0.93))
         if rotated:
             old_normal = wp.vec3(0.0, 0.0, 1.0)
             new_normal = wp.vec3(0.5 / np.sqrt(2.0), 0.5 / np.sqrt(2.0), np.sqrt(3.0) / 2.0)
@@ -95,74 +91,30 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
         slot = int(solver.placement.contact_slot.numpy()[0])
         self.assertGreaterEqual(slot, 0)
-        # The slot counts in the world's line; the free bodies' ``Z`` from their own first row.
-        z_row = slot - solver.placement.body_base
-        side = 0 if int(solver.placement.row_sides.numpy()[0, slot][0]) >= 0 else 1
-        old_direction = free_body_jacobians(solver)[side][0, z_row + 1, :3].copy()
         previous = solver.placement.ws_prev_dense_impulses.numpy()
-        previous[0, slot : slot + 3] = (1.0, 0.5, 0.0)
+        previous[0, slot : slot + 3] = (1.0, 0.5, 0.25)
         solver.placement.ws_prev_dense_impulses.assign(previous)
-        # Seed both owners of the previous solve's tangent impulse. Persistent
-        # anchors take precedence over the contact-matched cache when carried.
-        patches = solver.laws.friction_patches
-        tangent, _ = contact_tangent_basis(-old_normal)
-        tangent *= 0.5
-        if patches.current.flipped.numpy()[0]:
-            tangent = -tangent
-        anchor_body = int(patches.current.body_a.numpy()[0])
-        if anchor_body >= 0:
-            pose = state_in.body_q.numpy()[anchor_body]
-            transform = wp.transform(wp.vec3(*pose[:3]), wp.quat(*pose[3:]))
-            tangent = wp.transform_vector(wp.transform_inverse(transform), tangent)
-        cached = patches.previous.tangent_impulse.numpy()
-        cached[0] = tangent
-        patches.previous.tangent_impulse.assign(cached)
         normals[0] = new_normal
         contacts.rigid_contact_normal.assign(normals)
         contacts.rigid_contact_match_index.fill_(-1)
         indices = contacts.rigid_contact_match_index.numpy()
         indices[0] = 0
         contacts.rigid_contact_match_index.assign(indices)
-        model.shape_material_mu.fill_(friction)
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
         slot = int(solver.placement.contact_slot.numpy()[0])
-        impulses = solver.placement.impulses.numpy()[0, slot : slot + 3]
-        z_row = slot - solver.placement.body_base
-        tangent_rows = free_body_jacobians(solver)[side][0, z_row + 1 : z_row + 3, :3]
-        world_tangent = impulses[1:] @ tangent_rows
-        # Independent world-space projection; solver rows use B-to-A normals.
-        n = np.asarray(new_normal)
-        projected_direction = old_direction - n * np.dot(n, old_direction)
-        return impulses, world_tangent, projected_direction
+        return solver.placement.impulses.numpy()[0, slot : slot + 3]
 
-    def test_cached_friction_preserves_world_direction(self):
-        """Transport a cached tangent impulse through a discontinuous tangent basis."""
-        _, world_tangent, old_direction = self._seed_rotating_contact(1.0)
-        np.testing.assert_allclose(world_tangent, 0.5 * old_direction, atol=1.0e-6)
-
-    def test_cached_friction_uses_solver_normal_convention(self):
-        """Project friction in the frame used by the actual contact Jacobians."""
+    def test_carried_contact_seeds_only_its_normal(self):
+        """A matched contact starts from its carried normal impulse, across a basis seam and a 30-degree turn of its
+        normal; its friction pair starts cold, whatever the cache held: the anchor's displacement is the friction's
+        history."""
         devices = ["cpu", wp.get_cuda_device()] if wp.is_cuda_available() else ["cpu"]
         for device in devices:
-            with self.subTest(device=str(device)):
-                _, world_tangent, projected_direction = self._seed_rotating_contact(1.0, oblique=True, device=device)
-                np.testing.assert_allclose(world_tangent, 0.5 * projected_direction, atol=1.0e-6)
-
-    def test_cached_friction_obeys_changed_material(self):
-        """Clamp carried friction to the current material before applying velocity."""
-        impulses, world_tangent, old_direction = self._seed_rotating_contact(0.1)
-        self.assertLessEqual(float(np.linalg.norm(impulses[1:])), 0.1 * impulses[0] + 1.0e-6)
-        np.testing.assert_allclose(world_tangent, 0.1 * old_direction, atol=1.0e-6)
-
-    def test_rotating_contact_clamps_the_projected_friction_cone(self):
-        """Project through a 30-degree normal change and saturate the current cone."""
-        devices = ["cpu", wp.get_cuda_device()] if wp.is_cuda_available() else ["cpu"]
-        for device in devices:
-            with self.subTest(device=str(device)):
-                impulses, tangent, projected = self._seed_rotating_contact(0.1, rotated=True, device=device)
-                expected = 0.1 * projected / np.linalg.norm(projected)
-                np.testing.assert_allclose(tangent, expected, atol=1.0e-6)
-                self.assertAlmostEqual(float(np.linalg.norm(impulses[1:])), 0.1 * impulses[0], delta=1.0e-6)
+            for rotated in (False, True):
+                with self.subTest(device=str(device), rotated=rotated):
+                    impulses = self._carry_contact(rotated=rotated, device=device)
+                    self.assertEqual(float(impulses[0]), 1.0)
+                    np.testing.assert_array_equal(impulses[1:], np.zeros(2, dtype=np.float32))
 
     def test_matching_retains_world_distance_policy(self):
         """Moving beyond the existing world-distance threshold must cold-start."""

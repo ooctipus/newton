@@ -100,7 +100,6 @@ def _gather_dense_rows(
     *,
     prev_impulses,
     prev_types,
-    prev_parents,
     prev_slots,
     current_types,
     current_parents,
@@ -139,7 +138,6 @@ def _gather_dense_rows(
             wp.array(prev_slots, dtype=wp.int32, device="cpu"),
             wp.array([prev_impulses], dtype=wp.float32, device="cpu"),
             wp.array([prev_types], dtype=wp.int32, device="cpu"),
-            wp.array([prev_parents], dtype=wp.int32, device="cpu"),
             wp.array([count], dtype=wp.int32, device="cpu"),
             wp.array([[0.0, 0.0, 1.0]] * n, dtype=wp.vec3, device="cpu"),
             decay,
@@ -170,16 +168,29 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
         )
         np.testing.assert_array_equal(impulses.numpy()[0], np.zeros(4, dtype=np.float32))
 
-    def test_two_contact_friction_span_transitions_do_not_cross_seed(self):
-        """A neighboring contact never owns the source or destination tangent row."""
+    def test_only_normals_carry(self):
+        """The gather seeds each matched contact's normal row; every friction row starts cold, also where the contact
+        held the same pair last step, and no neighbour's tangent lands in another contact's span."""
         c, f, dead = PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, -1
+
+        # Both contacts keep their spans (3 rows each): the normals carry, the pairs do not.
+        got = _gather_dense_rows(
+            prev_impulses=[11.0, 22.0, 33.0, 55.0, 66.0, 77.0],
+            prev_types=[c, f, f, c, f, f],
+            prev_slots=[0, 3],
+            current_types=[c, f, f, c, f, f],
+            current_parents=[dead, 0, 0, dead, 3, 3],
+            current_slots=[0, 3],
+            match_indices=[0, 1],
+            count=6,
+        )
+        np.testing.assert_array_equal(got, np.array([11.0, 0.0, 0.0, 55.0, 0.0, 0.0], dtype=np.float32))
 
         # A: 3 -> 1 rows, B: 1 -> 3 rows. A's previous second tangent lands at
         # B's current first tangent by raw offset and must not be written there.
         got = _gather_dense_rows(
             prev_impulses=[11.0, 22.0, 33.0, 55.0],
             prev_types=[c, f, f, c],
-            prev_parents=[dead, 0, 0, dead],
             prev_slots=[0, 3],
             current_types=[c, c, f, f],
             current_parents=[dead, dead, 1, 1],
@@ -194,7 +205,6 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
         got = _gather_dense_rows(
             prev_impulses=[11.0, 55.0, 66.0, 77.0],
             prev_types=[c, c, f, f],
-            prev_parents=[dead, dead, 1, 1],
             prev_slots=[0, 1],
             current_types=[c, f, f, c],
             current_parents=[dead, 0, 0, dead],
@@ -210,7 +220,6 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
         got = _gather_dense_rows(
             prev_impulses=[55.0, 0.0, 0.0, 0.0, 11.0],
             prev_types=[c, dead, dead, dead, c],
-            prev_parents=[dead] * 5,
             prev_slots=[4, 0],  # previous sorted contacts A, B
             current_types=[dead, c, dead, dead, c],
             current_parents=[dead] * 5,
@@ -222,12 +231,11 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
         )
         np.testing.assert_array_equal(got, np.array([0.0, 110.0, 0.0, 0.0, 22.0], dtype=np.float32))
 
-    def test_mf_friction_ownership_rule(self):
-        """The matrix-free family rejects A's old tangent from B's new span."""
+    def test_mf_gather_carries_only_normals(self):
+        """The matrix-free mirror: the normals carry, and A's old tangent never reaches B's new span."""
         c, f, dead = PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, -1
         prev_impulses = wp.array([[11.0, 22.0, 33.0, 55.0]], dtype=wp.float32, device="cpu")
         prev_types = wp.array([[c, f, f, c]], dtype=wp.int32, device="cpu")
-        prev_parents = wp.array([[dead, 0, 0, dead]], dtype=wp.int32, device="cpu")
         current_types = wp.array([[c, c, f, f]], dtype=wp.int32, device="cpu")
         current_parents = wp.array([[dead, dead, 1, 1]], dtype=wp.int32, device="cpu")
         contact_count = wp.array([2], dtype=wp.int32, device="cpu")
@@ -263,7 +271,6 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
                 prev_slots,
                 prev_impulses,
                 prev_types,
-                prev_parents,
                 constraint_count,
                 wp.array([[0.0, 0.0, 1.0]] * 2, dtype=wp.vec3, device="cpu"),
                 1.0,
@@ -279,7 +286,6 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
         got = _gather_dense_rows(
             prev_impulses=[9.0, 0.0, 0.0, 0.0, 0.0],
             prev_types=[PGS_CONSTRAINT_TYPE_CONTACT, -1, -1, -1, -1],
-            prev_parents=[-1] * 5,
             prev_slots=[0],
             current_types=[-1, -1, -1, -1, PGS_CONSTRAINT_TYPE_CONTACT],
             current_parents=[-1] * 5,
