@@ -341,17 +341,62 @@ def change_vote(laws: RowLaws, changes: tuple[Change, ...], pad: str) -> str:
 
 
 @dataclasses.dataclass(frozen=True)
+class Diagonal:
+    """A row's diagonal ``A_ii`` as its row store keeps it, which the row law reads: the value (``diagonal``) and,
+    where the store keeps or the sweep stages it, its reciprocal (``inverse``), each a callable from a row index to the
+    native expression.
+
+    The Gauss-Seidel step multiplies by the reciprocal when there is one and divides by the value otherwise; the exit
+    law reads the value when there is one (velocity units) and the reciprocal otherwise (impulse units).
+    """
+
+    diagonal: Callable[[str], str] | None = None
+    inverse: Callable[[str], str] | None = None
+
+    def value(self, row: str) -> str:
+        """``A_ii`` of row ``row`` (zero for a zero reciprocal)."""
+        if self.diagonal is not None:
+            return self.diagonal(row)
+        inverse = self.inverse(row)
+        return f"{inverse} > 0.0f ? 1.0f / {inverse} : 0.0f"
+
+    def bound(self, rhs: str, terms: str, impulse: str, row: str) -> str:
+        """The exit law's bound of row ``row`` at ``impulse`` (:func:`.solve_policy.bound`), in the form the store
+        gives without a division: velocity units from a value, impulse units from a reciprocal."""
+        if self.diagonal is not None:
+            return bound(rhs, terms, impulse, diagonal=self.diagonal(row))
+        return bound(rhs, terms, impulse, step=self.inverse(row))
+
+    def change(self, delta: str, bound: str, kind: str, row: str) -> Change:
+        """Row ``row``'s change ``delta`` against its :meth:`bound`, as the exit law votes it."""
+        return Change(delta, bound, kind, self.value(row), scaled=self.diagonal is not None)
+
+    def step(self, residual: str, row: str) -> str:
+        """The Gauss-Seidel step ``-r / A_ii``."""
+        if self.inverse is not None:
+            return f"-{residual} * {self.inverse(row)}"
+        return f"-{residual} / {self.diagonal(row)}"
+
+    def scale(self, residual: str, row: str) -> str:
+        """``r / A_ii`` (the step's magnitude, as the velocity-limit law takes it)."""
+        if self.inverse is not None:
+            return f"{residual} * {self.inverse(row)}"
+        return f"{residual} / {self.diagonal(row)}"
+
+
+@dataclasses.dataclass(frozen=True)
 class RowContext:
-    """What :func:`row_update` reads of a row: its kind, impulse, metadata and response operator.
+    """What :func:`row_update` reads of a row: its kind, impulse, metadata, diagonal and response operator.
 
     The expressions are native code at the row index ``row``; ``kind`` is a
-    local the block has already declared, and the operator reads the row's
-    diagonal (:class:`.response_operator.ResponseOperator`).
+    local the block has already declared.
     """
 
     row: str
     kind: str
     operator: ResponseOperator
+    diagonal: Diagonal
+    """The rows' diagonals as the row store keeps them."""
     load: Callable[[str], str]
     store: Callable[[str, str], str]
     rhs: Callable[[str], str]
@@ -421,17 +466,17 @@ def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> st
     impulse-space operator records what it applied, and the changes are voted
     and applied, the second tangent's before the row's own.
     """
-    op, row, kind = ctx.operator, ctx.row, ctx.kind
+    op, diag, row, kind = ctx.operator, ctx.diagonal, ctx.row, ctx.kind
     lines = [
         f"float old_impulse = {ctx.load(row)};",
         f"float residual = {residual} + {ctx.rhs(row)};",
         f"float row_bound = {_row_bound(ctx, op.terms(residual, ctx.rhs(row), whole=False))};",
     ]
-    step = op.step("residual", row)
+    step = diag.step("residual", row)
     if laws.regularize:
         weight = ctx.weight(row)
         if laws.material:
-            weight = row_weight(weight, ctx.eps(row), op.value(row))
+            weight = row_weight(weight, ctx.eps(row), diag.value(row))
         lines += [
             f"float delta = {step};",
             f"if ({kind} == {CONTACT} && regularize)",
@@ -451,7 +496,7 @@ def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> st
         branches.append(
             (
                 f"{kind} == {VELOCITY_LIMIT}",
-                f"const auto vlim = ProjectionLaw::velocity_limit_update(old_impulse, {op.scale('residual', row)});\n"
+                f"const auto vlim = ProjectionLaw::velocity_limit_update(old_impulse, {diag.scale('residual', row)});\n"
                 "new_impulse = vlim.v0;\n"
                 "delta_impulse = vlim.v1;",
             )
@@ -504,17 +549,17 @@ def _sibling_in_pair(ctx: RowContext) -> bool:
 
 def _row_bound(ctx: RowContext, terms: str) -> str:
     """The visited row's bound (:func:`.solve_policy.bound`) from its residual's ``terms``, at its old impulse."""
-    return ctx.operator.bound(ctx.rhs(ctx.row), terms, "old_impulse", ctx.row)
+    return ctx.diagonal.bound(ctx.rhs(ctx.row), terms, "old_impulse", ctx.row)
 
 
 def _sibling_change(ctx: RowContext) -> Change:
     """The friction pair's second-tangent change as the exit law reads it (``sib_bound``: :func:`friction_pair`)."""
-    return ctx.operator.change("sib_delta", "sib_bound", str(FRICTION), "sib")
+    return ctx.diagonal.change("sib_delta", "sib_bound", str(FRICTION), "sib")
 
 
 def _spin_change(ctx: RowContext) -> Change:
     """The spin row's change as the exit law reads it (``spin_bound``: :func:`friction_pair` under torsion)."""
-    return ctx.operator.change("spin_delta", "spin_bound", str(TORSION), "spin")
+    return ctx.diagonal.change("spin_delta", "spin_bound", str(TORSION), "spin")
 
 
 def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
@@ -548,7 +593,7 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
             indent(op.apply_row("spin", "spin_delta", "").lstrip("\n"), "    "),
             "}",
         ]
-    row_change = op.change("delta_impulse", "row_bound", kind, row)
+    row_change = ctx.diagonal.change("delta_impulse", "row_bound", kind, row)
     sib_change = _sibling_change(ctx)
     if ctx.friction and op.fused_pair_apply:
         # Both changes vote together, the sibling's only where the row has a pair (sib < 0: no sibling row to read).
@@ -610,13 +655,13 @@ def pair_update(ctx: RowContext, laws: RowLaws, *, pad: str) -> str:
 def _sibling_bound(ctx: RowContext) -> str:
     """The friction sibling's bound from its residual (``sibling_residual``), at its old impulse."""
     op, rhs = ctx.operator, ctx.rhs("sib")
-    return op.bound(rhs, op.terms("sibling_residual", rhs, whole=True), "sibling_impulse", "sib")
+    return ctx.diagonal.bound(rhs, op.terms("sibling_residual", rhs, whole=True), "sibling_impulse", "sib")
 
 
 def _spin_bound(ctx: RowContext) -> str:
     """The spin row's bound from its residual (``spin_residual``), at its old impulse."""
     op, rhs = ctx.operator, ctx.rhs("spin")
-    return op.bound(rhs, op.terms("spin_residual", rhs, whole=True), "spin_impulse", "spin")
+    return ctx.diagonal.bound(rhs, op.terms("spin_residual", rhs, whole=True), "spin_impulse", "spin")
 
 
 def friction_pair(ctx: RowContext, laws: RowLaws, *, own: bool = False) -> str:
@@ -642,7 +687,7 @@ def friction_pair(ctx: RowContext, laws: RowLaws, *, own: bool = False) -> str:
         op.pair_terms(ctx.row, "sib", ctx.rhs, "    ", own=own),
         f"    row_bound = {_row_bound(ctx, op.terms('residual', ctx.rhs(ctx.row), whole=True))};" if own else "",
         f"    sib_bound = {_sibling_bound(ctx)};",
-        f"    pair = {ctx.pair_law}{op.value(ctx.row)}, cross, {op.value('sib')},",
+        f"    pair = {ctx.pair_law}{ctx.diagonal.value(ctx.row)}, cross, {ctx.diagonal.value('sib')},",
         "        wp::vec2(residual, sibling_residual), wp::vec2(old_impulse, sibling_impulse), radius, omega);",
         "}",
         "pair = ProjectionLaw::disk(pair, radius);",
@@ -660,11 +705,11 @@ def friction_pair(ctx: RowContext, laws: RowLaws, *, own: bool = False) -> str:
 def _friction_triple(ctx: RowContext, *, own: bool) -> str:
     """:func:`friction_pair` of a contact with a spin row (``spin``): the pair and the spin row on their elliptic
     cone."""
-    op = ctx.operator
+    op, diag = ctx.operator, ctx.diagonal
     mu, spin_mu = ctx.mu(ctx.row), "spin_mu"
     block = (
-        f"wp::mat33({op.value(ctx.row)}, cross, spin_cross, cross, {op.value('sib')}, spin_cross_sibling,\n"
-        f"              spin_cross, spin_cross_sibling, {op.value('spin')})"
+        f"wp::mat33({diag.value(ctx.row)}, cross, spin_cross, cross, {diag.value('sib')}, spin_cross_sibling,\n"
+        f"              spin_cross, spin_cross_sibling, {diag.value('spin')})"
     )
     lines = [
         f"const float spin_impulse = {ctx.load('spin')};",
@@ -1011,7 +1056,7 @@ def unit_held_loads(
     """Declare the held registers ``name`` (one of :data:`UNIT_HELD`) of the contact unit headed by row ``head``, read
     from the row store of ``ctx``: a placement's loads with the unit's rows, ahead of its reduction; under ``torsion``
     the spin row's fourth, read where the unit's ``rows`` hold one (:func:`spin_row`) and 0 otherwise."""
-    read = dict(zip(UNIT_HELD, (ctx.load, ctx.rhs, ctx.operator.diagonal), strict=True))[name]
+    read = dict(zip(UNIT_HELD, (ctx.load, ctx.rhs, ctx.diagonal.diagonal), strict=True))[name]
     values = [read(row) for row in (head, f"{head} + 1", f"{head} + 2")]
     if torsion:
         if rows is None:
@@ -1068,7 +1113,7 @@ def contact_unit(
     spin = ", unit_ds = 0.0f" if laws.torsion else ""
     declarations = [f"{pad}float unit_dn = 0.0f, unit_dt1 = 0.0f, unit_dt2 = 0.0f{spin};"]
     if held:
-        if ctx.operator.diagonal is None:
+        if ctx.diagonal.diagonal is None:
             raise ValueError("a held contact unit reads its rows' diagonals")
         impulse, rhs, diagonal = UNIT_HELD
 
@@ -1089,8 +1134,8 @@ def contact_unit(
 
         unit = dataclasses.replace(
             unit,
-            operator=dataclasses.replace(
-                ctx.operator, diagonal=lambda row: held_row(diagonal, row) or ctx.operator.diagonal(row)
+            diagonal=dataclasses.replace(
+                ctx.diagonal, diagonal=lambda row: held_row(diagonal, row) or ctx.diagonal.diagonal(row)
             ),
             load=lambda row: held_row(impulse, row) or ctx.load(row),
             rhs=lambda row: held_row(rhs, row) or ctx.rhs(row),
@@ -1240,7 +1285,7 @@ def rows_block(
     if end is None:
         end = "mf_contact_end" if header else "m_dense"
     if header:
-        op = dataclasses.replace(op, inverse=lambda row: "mf_diag" if row == "i" else rows.inverse(row))
+        diagonal = Diagonal(inverse=lambda row: "mf_diag" if row == "i" else rows.inverse(row))
         kind, check, declare, residual = "mf_rt", "mf_diag", "", None
         head = op.consume("i", end, inner)
         parent = rows.parent_of("packed_tp")
@@ -1249,7 +1294,7 @@ def rows_block(
             f"{op.pipeline_registers(pad)}\n{pad}if ({end} > 0) {{\n{op.prefetch_first('0', pad + '    ')}\n{pad}}}\n"
         )
     else:
-        op = dataclasses.replace(op, diagonal=lambda row: "denom" if row == "i" else rows.diag(row))
+        diagonal = Diagonal(lambda row: "denom" if row == "i" else rows.diag(row))
         kind, check, declare = "row_type", "denom", f"float denom = {rows.diag('i')};"
         head = f"{inner}int row_type = {rows.kind('i')};"
         parent = rows.parent("i")
@@ -1260,6 +1305,7 @@ def rows_block(
         row="i",
         kind=kind,
         operator=op,
+        diagonal=diagonal,
         load=rows.load,
         store=rows.store,
         rhs=rhs,
@@ -1301,11 +1347,11 @@ def friction_triple_visit(
     (:meth:`.SparseFactor.unit_apply`): the spin row's change, then the pair's second and first tangents', the order
     the row loop applied them in.
     """
-    op = ctx.operator
+    op, diag = ctx.operator, ctx.diagonal
     names = (("tangent", "first"), ("sibling", "second"), ("spin", "spin"))
     rhs = {name: ctx.rhs(row) for row, name in names}
     changes = tuple(
-        op.change(f"{name}_delta", f"{name}_bound", str(TORSION if name == "spin" else FRICTION), row)
+        diag.change(f"{name}_delta", f"{name}_bound", str(TORSION if name == "spin" else FRICTION), row)
         for row, name in names
     )
     lines = [
@@ -1319,7 +1365,7 @@ def friction_triple_visit(
         op.unit_terms(names, ""),
         *(f"const float {name}_residual = {name}_jv + {rhs[name]};" for _, name in names),
         *(
-            f"const float {name}_bound = {op.bound(rhs[name], op.terms(f'{name}_jv', rhs[name], whole=False), f'{name}_old', row)};"
+            f"const float {name}_bound = {diag.bound(rhs[name], op.terms(f'{name}_jv', rhs[name], whole=False), f'{name}_old', row)};"
             for row, name in names
         ),
         f"const wp::vec3 triple = {law}wp::vec3(first_residual, second_residual, spin_residual),",

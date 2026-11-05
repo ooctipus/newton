@@ -112,14 +112,13 @@ class TestResponseOperators(unittest.TestCase):
     """The operator the paired route adds: the factor-coordinate rows."""
 
     def test_factor_rows_fuse_a_pair_ladder(self):
-        rows = FactorRows(23, (FactorComponent(17, "o", "l"),), Lanes(32), diagonal=lambda r: f"s_diag[{r}]")
+        rows = FactorRows(23, (FactorComponent(17, "o", "l"),), Lanes(32))
         rhs = lambda r: f"s_rhs[{r}]"  # noqa: E731
         fused = rows.pair_terms("i", "sib", rhs, "", own=True)
         self.assertIn("SUM(residual, residual_terms, sibling_residual, sibling_residual_terms, cross);", fused)
         self.assertIn("float residual_terms = fabsf(residual);", fused)
         self.assertEqual(rows.terms("residual", "s_rhs[i]", whole=True), "residual_terms")
         self.assertIn("residual += s_rhs[i];", fused)
-        self.assertEqual(rows.step("r", "i"), "-r / s_diag[i]")
         self.assertIn("factor_velocity += row_z * d;", rows.apply("d", ""))
         self.assertIn("factor_velocity += sibling_z * d;", rows.apply_row("sib", "d", ""))
         self.assertIn("const int l = lane - o;", rows.lanes_of("")[0])

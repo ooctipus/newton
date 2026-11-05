@@ -35,6 +35,7 @@ from .sweep import (
     FRICTION,
     JOINT_LIMIT,
     TORSION,
+    Diagonal,
     ReducedPairCoupling,
     RowContext,
     RowLaws,
@@ -253,11 +254,11 @@ def sparse_diagonal_source(
     def context(lanes: Lanes, *, friction: bool = True) -> RowContext:
         """The rows' context in a layout at row ``i``: the warp's (every lane stores, the warp synchronizes after the
         apply) or one thread's (an independent scalar contact on ``scalar_coord``)."""
-        diagonal = lambda row: "denom" if row == "i" else rows.diag(row)  # noqa: E731
         return RowContext(
             row="i",
             kind="row_type",
-            operator=SparsePairZ(P, M, lanes, diagonal=diagonal),
+            operator=SparsePairZ(P, M, lanes),
+            diagonal=Diagonal(lambda row: "denom" if row == "i" else rows.diag(row)),
             load=rows.peek,
             store=lambda row, value: f"{rows.peek(row)} = {value};",
             rhs=rows.rhs_of,
@@ -298,7 +299,7 @@ def sparse_diagonal_source(
             )
         )
 
-    unit_op = _UnitPairZ(P, M, warp, diagonal=lambda row: "denom" if row == "i" else rows.diag(row))
+    unit_op = _UnitPairZ(P, M, warp)
 
     def contact_rows(head: str) -> str:
         """The rows of the friction contact headed by row ``head``: three, or four with a spin row (the data's,
@@ -403,8 +404,10 @@ def sparse_diagonal_source(
     def batch(index: str, count: str) -> str:
         """Test the batch of serial contacts from ``index``: one contact per segment of ``batch_lanes`` lanes, its
         normal's prospective update; declares ``noop_lanes``, the lanes whose contact would change nothing."""
-        segment = SparsePairZ(P, M, Lanes(batch_lanes, "batch_lane", segment=True), diagonal=rows.diag)
-        step = segment.step("(candidate_velocity + " + rows.rhs_of("candidate_normal") + ")", "candidate_normal")
+        segment = SparsePairZ(P, M, Lanes(batch_lanes, "batch_lane", segment=True))
+        step = Diagonal(rows.diag).step(
+            "(candidate_velocity + " + rows.rhs_of("candidate_normal") + ")", "candidate_normal"
+        )
         ring_any = (
             f"RING_ANY(candidate_normal, {M},\n"
             f"    [&](int patch_row) {{ return {rows.parent('patch_row', enclosed=True)}; }},\n"

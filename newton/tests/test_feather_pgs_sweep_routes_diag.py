@@ -137,7 +137,6 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
         op = FreeBodyZ(
             Lanes(1),
             velocity=Velocity("s_vel"),
-            inverse=lambda row: f"inv[{row}]",
             walk_leave=lambda first, values: f"WALK_LEAVE_OF({first}, {values});",
             walk_enter=lambda first, velocity, out: f"WALK_ENTER_OF({first}, {velocity}, {out});",
         )
@@ -170,7 +169,6 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
         # Without its walk a body has no velocity for a speed row to read.
         with self.assertRaises(ValueError):
             FreeBodyZ(Lanes(1)).speed("speed", "f", "axis", "")
-        self.assertEqual(op.step("r", "i"), "-r * inv[i]")
 
     def test_free_body_lanes_keep_their_text(self):
         op = FreeBodyZ(
@@ -184,7 +182,7 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
         self.assertIn("if (lane == 0) {", op.scale_speed("s", "speed_dof", "axis", ""))
 
     def test_sparse_pair_layouts(self):
-        warp = SparsePairZ(6, 32, Lanes(32), diagonal=lambda row: f"d[{row}]")
+        warp = SparsePairZ(6, 32, Lanes(32))
         self.assertIn(
             "float jv_partial = coord >= 0 ? z * s_v[coord] : 0.0f;\nSUM(jv_partial);", warp.residual("jv", "")
         )
@@ -202,7 +200,6 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
         self.assertIn("if (valid && batch_lane < 6)", segment.row_velocity("v", "c", "", active="valid"))
         scalar = SparsePairZ(6, 32, Lanes(1))
         self.assertIn("__fmul_rn(z, s_v[scalar_coord])", scalar.residual("jv", ""))
-        self.assertEqual(warp.step("r", "i"), "-r / d[i]")
 
 
 def _assemble(kernel, arch: int = 120) -> dict:

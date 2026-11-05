@@ -30,6 +30,7 @@ from .sweep import (
     FRICTION,
     TORSION,
     UNIT_HELD,
+    Diagonal,
     ReducedPairCoupling,
     RowContext,
     RowLaws,
@@ -128,7 +129,6 @@ def paired_factor_source(
             FactorComponent(S, "secondary_offset", "secondary_lane"),
         ),
         lanes,
-        diagonal=lambda row: f"s_diag[{row}]",
     )
     staging = Staging(
         (
@@ -144,7 +144,8 @@ def paired_factor_source(
     ctx = RowContext(
         row="i",
         kind="row_type",
-        operator=dataclasses.replace(op, diagonal=lambda row: "denom" if row == "i" else f"s_diag[{row}]"),
+        operator=op,
+        diagonal=Diagonal(lambda row: "denom" if row == "i" else f"s_diag[{row}]"),
         load=lambda row: f"s_lam[{row}]",
         store=lambda row, value: lanes.first(f"s_lam[{row}] = {value};"),
         rhs=lambda row: f"s_rhs[{row}]",
@@ -310,8 +311,7 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
     )
     # The unit is a normal and its pair: its rows' laws see no spin row.
     pair_laws = dataclasses.replace(laws, torsion=False)
-    diagonal = lambda row: "denom" if row == "i" else f"s_diag[{row}]"  # noqa: E731
-    unit_ctx = dataclasses.replace(rows, operator=dataclasses.replace(unit, diagonal=diagonal))
+    unit_ctx = dataclasses.replace(rows, operator=unit)
     unit_rows = contact_unit(
         unit_ctx, pair_laws, rows="3", declare=declare, parent="head", check="denom", held=True, pad="    "
     )
@@ -366,9 +366,8 @@ def _pair_unit(ctx: RowContext, laws: RowLaws, mu: str, *, spin: str | None = No
         ctx,
         row="tangent1",
         kind=str(FRICTION),
-        operator=dataclasses.replace(
-            op, diagonal=lambda row: f"s_diag[{row}]", current="tangent1_z", sibling="tangent2_z"
-        ),
+        operator=dataclasses.replace(op, current="tangent1_z", sibling="tangent2_z"),
+        diagonal=Diagonal(lambda row: f"s_diag[{row}]"),
         mu=lambda row: ctx.mu(row) if row == "spin" else mu,
         parent="i",
         inline_velocity_limit=False,
@@ -389,7 +388,7 @@ def _unit_row(ctx: RowContext, laws: RowLaws, kind: str, *, load: bool = True) -
     row = dataclasses.replace(
         ctx,
         kind=kind,
-        operator=dataclasses.replace(op, diagonal=lambda row: f"s_diag[{row}]"),
+        diagonal=Diagonal(lambda row: f"s_diag[{row}]"),
         friction=False,
         inline_velocity_limit=kind == "row_type",
     )

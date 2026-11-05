@@ -56,6 +56,7 @@ from .sweep import (
     UNIT_HELD,
     VELOCITY_LIMIT,
     CachedFrictionMetric,
+    Diagonal,
     RowContext,
     RowLaws,
     UnitOperator,
@@ -480,13 +481,13 @@ def ordinary_rows(rows: SparseRows, op: SparseFactor, laws: RowLaws, *, skip_vel
     first lane stores the impulses after every lane has read them.
     """
     lanes = rows.lanes
-    op = dataclasses.replace(op, diagonal=lambda row: "denom" if row == "i" else rows.diag(row), inverse=rows.inverse)
     # The row's and its pair's impulses are read once, at admission, before the reduction.
     held = {"i": "row_impulse", "sib": "pair_impulse"}
     ctx = RowContext(
         row="i",
         kind="row_type",
         operator=op,
+        diagonal=Diagonal(lambda row: "denom" if row == "i" else rows.diag(row), rows.inverse),
         load=lambda row: held.get(row) or rows.load(row),
         store=rows.store,
         rhs=rows.rhs_of,
@@ -527,9 +528,14 @@ def ordinary_rows(rows: SparseRows, op: SparseFactor, laws: RowLaws, *, skip_vel
 @dataclasses.dataclass(frozen=True)
 class _UnitFactor(UnitOperator, CachedFrictionMetric, SparseFactor):
     """A triplet's rows in a contact unit (:class:`.sweep.UnitOperator`): the unit's one reduction gathers the three
-    rows' entries, its Gram couplings and the pair's metric are the triplet's block record, and the normal steps by the
-    record's ``1/W_nn``. Every sparse row keeps its diagonal ``A_ii`` (``s_diag``), so the
-    unit's rows vote in the velocity form, as the sparse rows' storage gives it (the storage question, option 1)."""
+    rows' entries, and its Gram couplings and the pair's metric are the triplet's block record."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _UnitDiagonal(Diagonal):
+    """A triplet unit's diagonals: the normal steps by its record's ``1/W_nn``. Every sparse row keeps its diagonal
+    ``A_ii`` (``s_diag``), so the unit's rows vote in the velocity form, as the sparse rows' storage gives it (the
+    storage question, option 1)."""
 
     def step(self, residual: str, row: str) -> str:
         return f"(r == 0 ? -{residual} * unit_inverse : -{residual} / {self.diagonal(row)})"
@@ -663,7 +669,8 @@ SYNC();"""
         ctx = RowContext(
             row="i",
             kind="row_type",
-            operator=dataclasses.replace(unit_op, diagonal=rows.diag),
+            operator=unit_op,
+            diagonal=_UnitDiagonal(rows.diag),
             load=rows.load,
             store=rows.store,
             rhs=rows.rhs_of,
@@ -780,7 +787,8 @@ def triple_phase(sweep: SparseSweep, rows: SparseRows, op: SparseFactor, laws: R
     ctx = RowContext(
         row="tangent",
         kind=str(FRICTION),
-        operator=dataclasses.replace(op, diagonal=rows.diag),
+        operator=op,
+        diagonal=Diagonal(rows.diag),
         load=rows.load,
         store=rows.store,
         rhs=rows.rhs_of,

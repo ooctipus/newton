@@ -25,7 +25,7 @@ from dataclasses import dataclass
 
 from ...core.memory import Buffer
 from .factor.walk import WALK_COORDINATE, WALK_LINK
-from .solve_policy import Change, bound, terms_bound
+from .solve_policy import terms_bound
 
 Vector = Callable[[str], str]
 """A vector operand: the native expression of its element at an index expression."""
@@ -107,17 +107,12 @@ class Velocity:
 
 
 class ResponseOperator:
-    """A row response representation: residual, diagonal, coupling and apply, emitted per row.
-
-    A concrete operator reads a row's diagonal through :attr:`diagonal`
-    (``A_ii``) and, when its builder stores or stages it, :attr:`inverse`
-    (``1 / A_ii``): callables from a row index to the native expression. The
-    step multiplies by the inverse when there is one and divides by the
-    diagonal otherwise; the exit law reads the diagonal when there is one
-    (velocity units) and the inverse otherwise (impulse units).
+    """A row response representation: residual, coupling and apply, emitted per row.
 
     The row actions are native statements at the indentation ``indent``; an
     operator implements the ones its sweeps take. The visited row is ``i``.
+    A row's diagonal ``A_ii`` is its row store's, which the row law reads
+    (:class:`.sweep.Diagonal`), not the operator's.
     """
 
     name = "response"
@@ -127,38 +122,6 @@ class ResponseOperator:
     fused_pair_apply = False
     """Whether a row's apply takes its friction pair's second tangent too (``apply_pair``: the sibling's change, then
     the row's, per entry, written back once) instead of ``apply_row`` of the sibling then ``apply`` of the row."""
-    diagonal: Callable[[str], str] | None = None
-    inverse: Callable[[str], str] | None = None
-
-    def value(self, row: str) -> str:
-        """``A_ii`` of row ``row`` (zero for a zero inverse)."""
-        if self.diagonal is not None:
-            return self.diagonal(row)
-        inverse = self.inverse(row)
-        return f"{inverse} > 0.0f ? 1.0f / {inverse} : 0.0f"
-
-    def bound(self, rhs: str, terms: str, impulse: str, row: str) -> str:
-        """The exit law's bound of row ``row`` at ``impulse`` (:func:`.solve_policy.bound`), in the form its storage
-        gives without a division: velocity units from a stored diagonal, impulse units from a stored inverse."""
-        if self.diagonal is not None:
-            return bound(rhs, terms, impulse, diagonal=self.diagonal(row))
-        return bound(rhs, terms, impulse, step=self.inverse(row))
-
-    def change(self, delta: str, bound: str, kind: str, row: str) -> Change:
-        """Row ``row``'s change ``delta`` against its :meth:`bound`, as the exit law votes it."""
-        return Change(delta, bound, kind, self.value(row), scaled=self.diagonal is not None)
-
-    def step(self, residual: str, row: str) -> str:
-        """The Gauss-Seidel step ``-r / A_ii``."""
-        if self.inverse is not None:
-            return f"-{residual} * {self.inverse(row)}"
-        return f"-{residual} / {self.diagonal(row)}"
-
-    def scale(self, residual: str, row: str) -> str:
-        """``r / A_ii`` (the step's magnitude, as the velocity-limit law takes it)."""
-        if self.inverse is not None:
-            return f"{residual} * {self.inverse(row)}"
-        return f"{residual} / {self.diagonal(row)}"
 
     def terms(self, out: str, rhs: str, *, whole: bool) -> str:
         """``S_i`` of a sum this operator reduced into ``out``, the magnitude of the terms its velocity sum adds, or a
@@ -327,8 +290,6 @@ class FreeBodyZ(ResponseOperator):
     Z: str = "mf_Z"
     base: str = "mf12_base"
     velocity: Velocity = Velocity()
-    diagonal: Callable[[str], str] | None = None
-    inverse: Callable[[str], str] | None = None
     entry: Callable[[int, str, str], str] | None = None
     """One thread: where entry ``k`` of side ``side``'s six of a row is read, ``entry(side, row, k)``, when a mapping
     stages the rows elsewhere (default: the packed row)."""
@@ -783,8 +744,6 @@ class TransposedResponse(ResponseOperator):
         if self.walked is None:
             raise ValueError("the transposed response holds walked rows")
 
-    diagonal: Callable[[str], str] | None = None
-    inverse: Callable[[str], str] | None = None
     name = "transposed_response"
 
     @property
@@ -963,8 +922,7 @@ class SparsePairZ(ResponseOperator):
     whose dense part is empty), through the slot that holds it: its product is rounded on its own (``__fmul_rn``,
     no contraction into the right-hand side's add), as the lanes' sum of one product rounds it.
 
-    Written with the rows (:func:`.walk_rows.write_slot_rows`, :func:`.compact_contact.produce_contacts`), ``A_ii =
-    |Z|^2 + cfm`` is stored as a value; the step divides by it.
+    Written with the rows (:func:`.walk_rows.write_slot_rows`, :func:`.compact_contact.produce_contacts`).
     """
 
     dofs: int
@@ -978,8 +936,6 @@ class SparsePairZ(ResponseOperator):
     base: str = "row_base"
     coordinate: str = "scalar_coord"
     velocity: Velocity = Velocity()
-    diagonal: Callable[[str], str] | None = None
-    inverse: Callable[[str], str] | None = None
     name = "sparse_pair_z"
 
     def _entries(self, row: str, coord: str, value: str, indent: str, active=None) -> str:
@@ -1177,9 +1133,8 @@ class FactorRows(ResponseOperator):
     row's (``spin``), which the schedule loads (:meth:`load`, or the pipeline
     :meth:`prefetch` and :meth:`consume`). A sum is one product per
     lane (zero past ``dofs``) reduced with ``SUM``; a pair's sums reduce in one
-    ladder (:meth:`pair_terms`). The builder stores ``A_ii``; the step divides
-    by it. ``components``, the diagonal blocks of ``L``, map the velocity
-    change back out of factor coordinates (:meth:`leave`).
+    ladder (:meth:`pair_terms`). ``components``, the diagonal blocks of ``L``,
+    map the velocity change back out of factor coordinates (:meth:`leave`).
     """
 
     dofs: int
@@ -1191,8 +1146,6 @@ class FactorRows(ResponseOperator):
     current: str = "row_z"
     sibling: str = "sibling_z"
     spin: str = "spin_z"
-    diagonal: Callable[[str], str] | None = None
-    inverse: Callable[[str], str] | None = None
     name = "factor_rows"
 
     def load(self, row: str) -> str:
@@ -1293,8 +1246,7 @@ class SparseFactor(ResponseOperator):
     the lanes reduce with ``SUM``. One thread (``Lanes(1, "0")``) sums a row's entries in order. A friction pair's
     second tangent shares its first tangent's support: the first tangent's residual reduces the second's velocity
     term (``sibling_jv``) and the pair's coupling ``Z_t . Z_s`` (``pair_coupling``) in the same ``SUM``, and the
-    apply adds the second tangent's change, then the first's, to each entry, written back once. The builder stores
-    ``A_ii = |Z_i|^2 + cfm`` as a value: the step divides, unless the sweep stages its reciprocal (``inverse``).
+    apply adds the second tangent's change, then the first's, to each entry, written back once.
     """
 
     support: int
@@ -1304,8 +1256,6 @@ class SparseFactor(ResponseOperator):
     dense: int = 0
     local: str = "s_local_factor"
     velocity: Velocity = Velocity("s_delta")
-    diagonal: Callable[[str], str] | None = None
-    inverse: Callable[[str], str] | None = None
     name = "sparse_factor"
     fused_pair_apply = True
 

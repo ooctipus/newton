@@ -33,6 +33,7 @@ from .sweep import (
     SPEED,
     VELOCITY_LIMIT,
     CachedFrictionMetric,
+    Diagonal,
     RowContext,
     RowLaws,
     UnitOperator,
@@ -356,7 +357,7 @@ def _unit_apply(pad: str, *, torsion: bool = False) -> str:
     return indent("\n".join(lines), pad)
 
 
-def _colored_pair_metric(op: FreeBodyZ, pad: str) -> str:
+def _colored_pair_metric(op: FreeBodyZ, diagonal: Diagonal, pad: str) -> str:
     """Native statements, after a unit's ``E`` and ``W`` and ``dof_a``, ``dof_b`` are declared: its friction pair's
     metric (``ProjectionLaw::friction_pair_metric`` of the first tangent's diagonal, the pair's coupling and the
     second tangent's diagonal), formed exactly as the visit's pair law forms it."""
@@ -364,7 +365,7 @@ def _colored_pair_metric(op: FreeBodyZ, pad: str) -> str:
         "const int r = 1;",
         "const float mf_diag = __int_as_float(W[3]);",
         op.coupling("cross", "i", "sib", ""),
-        f"const auto metric = ProjectionLaw::friction_pair_metric({op.value('i')}, cross, {op.value('sib')});",
+        f"const auto metric = ProjectionLaw::friction_pair_metric({diagonal.value('i')}, cross, {diagonal.value('sib')});",
     ]
     return indent("\n".join(lines), pad)
 
@@ -387,7 +388,6 @@ def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str
         Lanes(1),
         velocity=Velocity("s_v"),
         entry=lambda side, row, k: f"E[{unit_offset(row)} * 12 + {side * 6} + {k}]",
-        inverse=lambda row: "mf_diag" if row == "i" else f"__int_as_float(W[{unit_offset(row)} * 3])",
     )
     ring, members = layout.ring, sweep_units.RING_MEMBERS
 
@@ -401,6 +401,9 @@ def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str
         row="i",
         kind="mf_rt",
         operator=unit_op,
+        diagonal=Diagonal(
+            inverse=lambda row: "mf_diag" if row == "i" else f"__int_as_float(W[{unit_offset(row)} * 3])"
+        ),
         load=unit_rows.load,
         store=unit_rows.store,
         rhs=lambda row: "__int_as_float(meta.z)" if row == "i" else f"__int_as_float(W[{unit_offset(row)} * 3 + 1])",
@@ -570,8 +573,8 @@ def _colored_metrics(units: int, *, torsion: bool = False) -> str:
             Lanes(1),
             velocity=Velocity("s_v"),
             entry=lambda side, row, k: f"E[{ {'i': 'r', 'sib': '2'}[row] } * 12 + {side * 6} + {k}]",
-            inverse=lambda row: "mf_diag" if row == "i" else "__int_as_float(W[2 * 3])",
         )
+        diagonal = Diagonal(inverse=lambda row: "mf_diag" if row == "i" else "__int_as_float(W[2 * 3])")
         rows = [
             *head,
             f"            const int word_base = unit_slot * {words * units} + p;",
@@ -580,7 +583,7 @@ def _colored_metrics(units: int, *, torsion: bool = False) -> str:
             *stage,
             "#pragma unroll",
             f"            for (int f = 0; f < 9; ++f) W[f] = slot_words.data[word_base + f * {units}];",
-            _colored_pair_metric(op, " " * 12),
+            _colored_pair_metric(op, diagonal, " " * 12),
             "            // The Gram couplings of the pair's tangents with the normal, Z_n . Z_t1 and Z_n . Z_t2: per coordinate,",
             "            // body a's then b's products.",
         ]

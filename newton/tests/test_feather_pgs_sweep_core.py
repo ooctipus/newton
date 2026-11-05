@@ -15,6 +15,7 @@ from newton._src.solvers.feather_pgs.solve_policy import Change, SolvePolicy, bo
 from newton._src.solvers.feather_pgs.sweep import (
     FRICTION,
     UNIT_HELD,
+    Diagonal,
     RowContext,
     RowLaws,
     UnitOperator,
@@ -31,8 +32,6 @@ from newton._src.solvers.feather_pgs.sweep import (
 class _Rows(ResponseOperator):
     """An operator of named sums: the least an operator implements for a friction pair."""
 
-    diagonal: object = None
-    inverse: object = None
     name = "rows"
 
     def residual(self, out, indent):
@@ -76,6 +75,7 @@ def _context(operator, lanes=None, **options):
         row="i",
         kind="row_type",
         operator=operator,
+        diagonal=Diagonal(lambda row: f"A[{row}]"),
         load=lambda row: f"lam[{row}]",
         store=lambda row, value: lanes.first(f"lam[{row}] = {value};"),
         rhs=_rhs,
@@ -95,7 +95,7 @@ class TestResponseOperatorInterface(unittest.TestCase):
         self.assertEqual(_Rows().sibling_residual("s", "sib", "", "rhs[sib]"), "float s = J_v(sib);\ns += rhs[sib];")
 
     def test_pair_terms_compose_the_sibling_residual_and_the_coupling(self):
-        rows = _Rows(diagonal=lambda row: f"A[{row}]")
+        rows = _Rows()
         self.assertEqual(
             rows.pair_terms("i", "sib", _rhs, ""),
             "float sibling_residual = J_v(sib);\nsibling_residual += rhs[sib];\nfloat cross = J_Y(i, sib);",
@@ -114,18 +114,36 @@ class TestResponseOperatorInterface(unittest.TestCase):
             _Rows().apply_pair("a", "b", "")
 
 
+class TestDiagonal(unittest.TestCase):
+    """The row law reads a row's diagonal in the form its store keeps: a value, or a reciprocal it multiplies by."""
+
+    def test_the_step_divides_by_a_value_and_multiplies_by_a_reciprocal(self):
+        value = Diagonal(lambda row: f"d[{row}]")
+        self.assertEqual(value.step("r", "i"), "-r / d[i]")
+        self.assertEqual(value.scale("r", "i"), "r / d[i]")
+        self.assertEqual(value.value("i"), "d[i]")
+        reciprocal = Diagonal(inverse=lambda row: f"inv[{row}]")
+        self.assertEqual(reciprocal.step("r", "i"), "-r * inv[i]")
+        self.assertEqual(reciprocal.value("i"), "inv[i] > 0.0f ? 1.0f / inv[i] : 0.0f")
+        # A stored value with a staged reciprocal: the step multiplies, the vote reads the value (velocity units).
+        both = Diagonal(lambda row: f"d[{row}]", lambda row: f"inv[{row}]")
+        self.assertEqual(both.step("r", "i"), "-r * inv[i]")
+        self.assertTrue(both.change("x", "b", "k", "i").scaled)
+        self.assertFalse(reciprocal.change("x", "b", "k", "i").scaled)
+
+
 class TestRowVisit(unittest.TestCase):
     """The admission of a row of a row loop before the row law."""
 
     def test_rows_without_friction_pairs_have_no_gate_admission_or_disk(self):
-        ctx = _context(_Rows(diagonal=lambda row: f"A[{row}]"), friction=False)
+        ctx = _context(_Rows(), friction=False)
         visit = row_visit(ctx, RowLaws(regularize=False), parent="p[i]", check="denom", pad="")
         self.assertNotIn("parent", visit)
         self.assertNotIn("sib", visit)
         self.assertIn("if (denom <= 0.0f) continue;", visit)
 
     def test_admitted_rows_set_the_disk_at_admission(self):
-        ctx = _context(_Rows(diagonal=lambda row: f"A[{row}]"))
+        ctx = _context(_Rows())
         visit = row_visit(ctx, RowLaws(regularize=False), parent="p[i]", check=None, pad="")
         admission = visit[visit.index(f"if (row_type == {FRICTION}) {{") : visit.index("float jv")]
         self.assertIn("if (i != parent + 1) continue;\n    const float lambda_n = RING_LOAD(lam[parent]);", admission)
@@ -133,7 +151,7 @@ class TestRowVisit(unittest.TestCase):
         self.assertNotIn("<= 0.0f && row_type", visit)
 
     def test_a_held_second_tangent_impulse_is_kept_by_the_disk(self):
-        ctx = _context(_Rows(diagonal=lambda row: f"A[{row}]"))
+        ctx = _context(_Rows())
         visit = row_visit(
             ctx,
             RowLaws(regularize=False),
@@ -159,7 +177,7 @@ class TestContactUnit(unittest.TestCase):
 
     def _context(self, lanes=None, **options):
         return dataclasses.replace(
-            _context(_UnitRows(diagonal=lambda row: f"A[{row}]"), lanes, **options),
+            _context(_UnitRows(), lanes, **options),
             ring_load=lambda parent, load=None: f"RING_LOAD({load or f'lam[{parent}]'})",
         )
 
@@ -235,12 +253,12 @@ class TestRowTail(unittest.TestCase):
         return row_update(ctx, laws or RowLaws(regularize=False), residual="jv", pad="")
 
     def test_the_sibling_applies_before_the_row(self):
-        update = self._update(_Rows(diagonal=lambda row: f"A[{row}]"))
+        update = self._update(_Rows())
         self.assertLess(update.index("v += Y(sib) * sib_delta;"), update.index("v += Y_i * delta_impulse;"))
         self.assertEqual(update.count("SYNC();"), 3)
 
     def test_a_fused_pair_apply_votes_and_applies_both_changes_at_once(self):
-        update = self._update(_FusedRows(diagonal=lambda row: f"A[{row}]"))
+        update = self._update(_FusedRows())
         self.assertIn("if (delta_impulse != 0.0f || sib_delta != 0.0f) {", update)
         self.assertIn("apply_pair(sib_delta, delta_impulse);", update)
         self.assertNotIn("Y(sib)", update)
@@ -248,16 +266,16 @@ class TestRowTail(unittest.TestCase):
     def test_a_fused_vote_reads_the_sibling_only_where_the_row_has_one(self):
         """A row without a pair (``sib < 0``) has no sibling whose diagonal the vote could read: its zero change is
         quiet without reading ``A[-1]`` (another row's or buffer's slot, possibly not a finite number)."""
-        update = self._update(_FusedRows(diagonal=lambda row: f"A[{row}]"))
+        update = self._update(_FusedRows())
         self.assertIn("(sib >= 0 && !(fabsf(sib_delta) * (A[sib]) <= sib_bound))", update)
 
     def test_rows_without_friction_pairs_store_and_apply_the_row_only(self):
-        update = self._update(_FusedRows(diagonal=lambda row: f"A[{row}]"), friction=False)
+        update = self._update(_FusedRows(), friction=False)
         self.assertNotIn("sib", update)
         self.assertIn("v += Y_i * delta_impulse;", update)
 
     def test_an_unfenced_row_synchronizes_before_its_stores_and_after_its_apply(self):
-        update = self._update(_Rows(diagonal=lambda row: f"A[{row}]"), fenced=False)
+        update = self._update(_Rows(), fenced=False)
         self.assertEqual(update.count("SYNC();"), 2)
 
     def test_the_exit_law_quiets_changes_at_the_rounding_floor(self):
@@ -266,7 +284,7 @@ class TestRowTail(unittest.TestCase):
         vote = change_vote(RowLaws(regularize=False), (Change("d", "tau", "0", "A"),), "  ")
         self.assertEqual(vote, "  if ((!(fabsf(d) <= tau))) iteration_changed = 1;")
         self.assertEqual(bound("b", "S", "l", step="s"), "9.5367431640625e-07f * ((fabsf(b) + (S)) * (s) + fabsf(l))")
-        update = self._update(_Rows(diagonal=lambda row: f"A[{row}]"))
+        update = self._update(_Rows())
         self.assertIn(f"float row_bound = {bound('rhs[i]', 'fabsf(jv)', 'old_impulse', diagonal='A[i]')};", update)
         self.assertIn("(!(fabsf(delta_impulse) * (A[i]) <= row_bound))", update)
         traced = change_vote(RowLaws(policy=SolvePolicy(readout="trace")), (Change("d", "tau", "0", "A"),), "")
