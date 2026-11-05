@@ -917,14 +917,14 @@ class CachedFrictionMetric:
         return f"{indent}const float spin_cross = 0.0f, spin_cross_sibling = 0.0f;  // the cached metric replaces them"
 
 
-def cached_pair_law(name: str, scale: str, low: str, high: str, axis: tuple[str, str], pad: str) -> str:
+def cached_pair_law(name: str, low: str, high: str, axis: tuple[str, str], pad: str) -> str:
     """Declare ``name``, the friction pair's law (:attr:`RowContext.pair_law`'s arguments after one leading ``int``)
-    from a metric cached for the unit: its tangent ``scale``, the two eigenvalues ``low`` and ``high`` and the larger's
-    ``axis`` (:func:`.projection_laws.friction_pair_from_metric`); the visit's diagonals and coupling go unread."""
+    from a metric cached for the unit: the two eigenvalues ``low`` and ``high`` and the larger's ``axis``
+    (:func:`.projection_laws.friction_pair_from_metric`); the visit's diagonals and coupling go unread."""
     lines = [
         f"const auto {name} = [&](int, float, float, float, wp::vec2 residual, wp::vec2 old,",
         f"{' ' * (len(name) + 18)}float radius, float relaxation) -> wp::vec2 {{",
-        f"    return ProjectionLaw::friction_pair_from_metric({scale}, {low}, {high},",
+        f"    return ProjectionLaw::friction_pair_from_metric({low}, {high},",
         f"        wp::vec2({axis[0]}, {axis[1]}), residual, old, radius, relaxation);",
         "};",
     ]
@@ -936,13 +936,13 @@ def cached_triple_law(
 ) -> str:
     """Declare ``name``, the friction triple's law (:attr:`RowContext.triple_law`'s arguments after one leading
     ``int``, the contact's normal row ``row``) from a metric cached for the unit, eight values
-    (:func:`.projection_laws.friction_ball_metric`): its scale, its three eigenvalues, then its eigenbasis as a rotation
-    quaternion ``(x, y, z, w)`` (:func:`.projection_laws.friction_triple_from_metric`); the visit's block goes unread.
-    The values are ``metric``'s expressions, or two ``float4`` loads from ``record`` (an address expression of
-    ``row``). With ``basis`` the record holds the eigenbasis itself (:data:`FRICTION_METRIC_FLOATS`), four ``float4``,
-    marked unformed before the sweeps (:func:`friction_metric_stage`): the launch's first loaded visit forms it from
-    its block and stores it, and a zero spin coefficient takes the pair's law from the block, so the law is the
-    visit's own arithmetic (:func:`.projection_laws.friction_triple`)."""
+    (:func:`.projection_laws.friction_ball_metric`): its three eigenvalues and an unused value, then its eigenbasis as
+    a rotation quaternion ``(x, y, z, w)`` (:func:`.projection_laws.friction_triple_from_metric`); the visit's block
+    goes unread. The values are ``metric``'s expressions, or two ``float4`` loads from ``record`` (an address
+    expression of ``row``). With ``basis`` the record holds the eigenbasis itself (:data:`FRICTION_METRIC_FLOATS`), four
+    ``float4``, marked unformed before the sweeps (a negative first eigenvalue, :func:`friction_metric_stage`): the
+    launch's first loaded visit forms it from its block and stores it, and a zero spin coefficient takes the pair's
+    law from the block, so the law is the visit's own arithmetic (:func:`.projection_laws.friction_triple`)."""
     loads = []
     block = ""
     if record and basis:
@@ -965,10 +965,9 @@ def cached_triple_law(
             "    if (metric.x < 0.0f && load > 0.0f) {",
             "        // The launch's first loaded visit forms the metric; every lane stores the same values.",
             "        const auto formed = ProjectionLaw::friction_ball_metric(block, mu, mu_t);",
-            "        vectors = formed.v2;",
+            "        vectors = formed.v1;",
             "        float* const stored = reinterpret_cast<float*>(record);",
-            "        stored[0] = formed.v0;",
-            "        for (int f = 0; f < 3; ++f) stored[1 + f] = formed.v1[f];",
+            "        for (int f = 0; f < 3; ++f) stored[f] = formed.v0[f];",
             "        for (int f = 0; f < 9; ++f) stored[4 + f] = vectors.data[f / 3][f % 3];",
             "        metric = record[0];",
             "    } else {",
@@ -988,12 +987,12 @@ def cached_triple_law(
             metric = (*(f"metric.{c}" for c in "xyzw"), *(f"basis.{c}" for c in "xyzw"))
         x, y, z, w = metric[4:]
         vectors = f"wp::quat_to_matrix(wp::quat({x}, {y}, {z}, {w}))"
-    scale, v0, v1, v2 = metric[:4]
+    v0, v1, v2 = metric[:3]
     lines = [
         f"const auto {name} = [&](int row, const wp::mat33&{block}, wp::vec3 residual, wp::vec3 old, float mu, float mu_t,",
         f"{' ' * (len(name) + 18)}float load, float relaxation) -> wp::vec3 {{",
         *loads,
-        f"    return ConeLaw::friction_triple_from_metric({scale}, wp::vec3({v0}, {v1}, {v2}),",
+        f"    return ConeLaw::friction_triple_from_metric(wp::vec3({v0}, {v1}, {v2}),",
         f"        {vectors}, residual, old, mu, mu_t, load, relaxation);",
         "};",
     ]
@@ -1159,8 +1158,8 @@ def end_sweep(
 
 
 FRICTION_METRIC_FLOATS = 16
-"""A friction triple's metric, cached for a launch (:func:`friction_metric_stage`): its block's scale and three
-eigenvalues, then its eigenbasis's nine entries row by row (:func:`.projection_laws.friction_ball_metric`), three
+"""A friction triple's metric, cached for a launch (:func:`friction_metric_stage`): its block's three eigenvalues and
+an unused value, then its eigenbasis's nine entries row by row (:func:`.projection_laws.friction_ball_metric`), three
 floats of padding: four ``float4`` (:func:`cached_triple_law` with ``basis``). The basis itself, not the quaternion the
 support placement's records and the colored units' slots round it through, so the cached law is the visit's own
 arithmetic."""
@@ -1187,9 +1186,9 @@ def friction_metric_stage(
     pad: str,
 ) -> str:
     """Before the sweeps, mark the metric of every friction triple (a contact with a spin row ``spin(normal)``,
-    :func:`spin_row`) of a class's rows ``[0, end)`` unformed (a negative scale at ``record(parent)``), each row's
-    ``kind`` and ``parent`` as the row store reads them: the lanes find the triples together, a lane a row. A triple's
-    first loaded visit of the launch forms its metric and stores it, and every later visit only projects
+    :func:`spin_row`) of a class's rows ``[0, end)`` unformed (a negative first eigenvalue at ``record(parent)``), each
+    row's ``kind`` and ``parent`` as the row store reads them: the lanes find the triples together, a lane a row. A
+    triple's first loaded visit of the launch forms its metric and stores it, and every later visit only projects
     (:func:`cached_triple_law` with ``basis``): its block is fixed across the launch's sweeps.
 
     Formed at the first visit, not here: a triple the sweeps never load forms none. Every triple formed here, before

@@ -1309,7 +1309,7 @@ def support_rows_kernel(
                     # row's couplings take its place in a unit of four).
                     k = slot // 3
                     coupling = sink.records[line, k, 2]
-                    _scale, largest, smallest, axis = friction_pair_metric(
+                    largest, smallest, axis = friction_pair_metric(
                         sink.diag[line, slot + 1], coupling, sink.diag[line, slot + 2]
                     )
                     sink.records[line, k, 4] = largest
@@ -1318,8 +1318,8 @@ def support_rows_kernel(
                     sink.records[line, k, 7] = axis[1]
                 elif wp.static(torsion) and unit.rows == 4:
                     # The friction triple's metric of the block as written, formed once per solve: the sweeps'
-                    # visits only project (projection_laws.friction_triple_from_metric). Its scale and eigenvalues,
-                    # then its eigenbasis as a rotation, take the triple's couplings' place.
+                    # visits only project (projection_laws.friction_triple_from_metric). Its eigenvalues, then its
+                    # eigenbasis as a rotation, take the triple's couplings' place.
                     k = slot // 3
                     t12 = sink.records[line, k, 0]
                     t1s = sink.records[line, k, 1]
@@ -1329,14 +1329,14 @@ def support_rows_kernel(
                         t12, sink.diag[line, slot + 2], t2s,
                         t1s, t2s, sink.diag[line, slot + 3],
                     )  # fmt: skip
-                    scale, values, vectors = friction_ball_metric(
+                    values, vectors = friction_ball_metric(
                         block, rows.row_mu[line, slot + 1], rows.row_mu[line, slot + 3]
                     )
                     basis = wp.quat_from_matrix(vectors)
-                    sink.records[line, k, 0] = scale
-                    sink.records[line, k, 1] = values[0]
-                    sink.records[line, k, 2] = values[1]
-                    sink.records[line, k, 3] = values[2]
+                    sink.records[line, k, 0] = values[0]
+                    sink.records[line, k, 1] = values[1]
+                    sink.records[line, k, 2] = values[2]
+                    sink.records[line, k, 3] = 0.0
                     sink.records[line, k, 4] = basis[0]
                     sink.records[line, k, 5] = basis[1]
                     sink.records[line, k, 6] = basis[2]

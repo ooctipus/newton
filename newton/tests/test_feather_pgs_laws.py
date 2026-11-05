@@ -607,7 +607,6 @@ def test_friction_pair_solves_the_disk_problem(test, device):
 
 @wp.kernel
 def _pair_from_metric(
-    scale: wp.array[float],
     largest: wp.array[float],
     smallest: wp.array[float],
     axis: wp.array[wp.vec2],
@@ -618,9 +617,7 @@ def _pair_from_metric(
     out: wp.array[wp.vec2],
 ):
     i = wp.tid()
-    out[i] = laws.friction_pair_from_metric(
-        scale[i], largest[i], smallest[i], axis[i], residual[i], old[i], radius[i], omega[i]
-    )
+    out[i] = laws.friction_pair_from_metric(largest[i], smallest[i], axis[i], residual[i], old[i], radius[i], omega[i])
 
 
 def test_friction_pair_keeps_a_sliding_pair_at_its_solution(test, device):
@@ -654,7 +651,7 @@ def test_friction_pair_keeps_a_sliding_pair_at_its_solution(test, device):
                 _pair_from_metric,
                 n,
                 device,
-                **{k: values[k] for k in ("scale", "largest", "smallest", "axis", "omega")},
+                **{k: values[k] for k in ("largest", "smallest", "axis", "omega")},
                 residual=residual,
                 old=old,
                 radius=radius.astype(np.float32),
@@ -895,9 +892,9 @@ def _disk(pair: wp.array[wp.vec2], radius: wp.array[float], out: wp.array[wp.vec
 
 
 def test_disk_keeps_a_pair_inside_it(test, device):
-    """Keep a pair inside its disk bit for bit and scale one outside onto it; the CUDA rendering divides only outside,
-    so a sticking pair's visit takes no division. (A pair on the boundary goes either way with the device's rounding
-    of its magnitude, as before.)"""
+    """Keep a pair inside its disk bit for bit and scale one outside onto it; the CUDA rendering screens squared
+    norms and takes its root and division only outside, so a sticking pair's visit takes neither. (A pair on the
+    boundary goes either way with the device's rounding of its squared magnitude, as before.)"""
     rng = np.random.default_rng(29)
     n = 4096
     pair = rng.normal(size=(n, 2)).astype(np.float32)
@@ -915,7 +912,10 @@ def test_disk_keeps_a_pair_inside_it(test, device):
     source = laws.PROJECTION_LAW.prelude().source
     body = source[source.index(" disk(wp::vec2 pair, float radius) {") :]
     body = body[: body.index("\n        }\n")]
-    test.assertIn("if (magnitude > radius) {\n                return wp::mul(pair, radius / magnitude);", body)
+    test.assertIn(
+        "if (magnitude_sq > radius * radius) {\n                return wp::mul(pair, radius / wp::sqrt(magnitude_sq));",
+        body,
+    )
 
 
 def test_scalar_laws(test, device):

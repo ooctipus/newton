@@ -136,7 +136,7 @@ class TestContactUnits(unittest.TestCase):
                 self.assertEqual(unit.count("SUM("), 1)
                 self.assertIn("SUM(unit_jv0, unit_jv1, unit_jv2);", unit)
                 self.assertNotIn("__shfl", unit)
-                self.assertIn("ProjectionLaw::friction_pair_from_metric(tangent_scale, basis.x, basis.y,", unit)
+                self.assertIn("ProjectionLaw::friction_pair_from_metric(basis.x, basis.y,", unit)
                 self.assertIn(
                     "const float gram_n1 = coupling.x, gram_n2 = coupling.y, unit_inverse = coupling.w;", unit
                 )

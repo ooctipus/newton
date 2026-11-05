@@ -156,8 +156,8 @@ def slot_layout(torsion: bool) -> SlotLayout:
     rows = 4 if torsion else 3
     entries, ring = 12 * rows, 3 * rows
     words = ring + RING_MEMBERS // 2 + 1
-    # The friction metric and the normal's couplings: the pair's metric (5) and two, or under torsion eight and three.
-    return SlotLayout(rows, entries + 2 + torsion, words, 11 if torsion else 7, entries, entries + 1, entries + 2, ring)
+    # The friction metric and the normal's couplings: the pair's metric (4) and two, or under torsion eight and three.
+    return SlotLayout(rows, entries + 2 + torsion, words, 11 if torsion else 6, entries, entries + 1, entries + 2, ring)
 
 
 _RING_MEMBERS = wp.constant(RING_MEMBERS)

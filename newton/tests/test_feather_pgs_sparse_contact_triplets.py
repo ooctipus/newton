@@ -45,13 +45,15 @@ def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False)
 
 
 def pair_metric(a, c, d):
-    """Return the paired law's tangent eigenbasis ``(largest, smallest, vx, vy)``, relative to ``max(a, d)``."""
+    """Return the paired law's tangent eigenbasis ``(largest, smallest, vx, vy)``: the block's eigenvalues, formed on
+    the block scaled by ``max(a, d)`` and scaled back."""
     scale = max(a, d, 1.0e-20)
     a, c, d = a / scale, c / scale, d / scale
     largest = 0.5 * (a + d + np.sqrt((a - d) ** 2 + 4.0 * c * c))
     smallest = max((a * d - c * c) / largest, 0.0) if largest > 0.0 else 0.0
     vx, vy = (largest - d, c) if a >= d else (c, largest - a)
     norm = np.hypot(vx, vy)
+    largest, smallest = largest * scale, smallest * scale
     return (largest, smallest, vx / norm, vy / norm) if norm > 0.0 else (largest, smallest, 1.0, 0.0)
 
 

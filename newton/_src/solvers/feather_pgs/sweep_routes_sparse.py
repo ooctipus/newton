@@ -542,8 +542,8 @@ def contact_units(sweep: SparseSweep, rows: SparseRows, op: SparseFactor, laws: 
 
     A contact normal followed by its two tangents in the staged metadata loads in one group: the three rows'
     entries (every stored entry, then masked by its coordinate), the triplet's block record (``contact_records``:
-    the Gram couplings ``W_nt1, W_nt2, W_t1t2``, ``1/W_nn`` and the pair's eigenbasis relative to its larger tangent
-    diagonal) and its friction coefficient; one reduction gives the three rows' velocity terms. The rows then run the
+    the Gram couplings ``W_nt1, W_nt2, W_t1t2``, ``1/W_nn`` and the pair's eigenvalues and eigenbasis) and its
+    friction coefficient; one reduction gives the three rows' velocity terms. The rows then run the
     row law (:class:`_UnitFactor`): the normal steps with the record's ``1/W_nn``, the pair solves at the new load from
     the record's metric, its residuals moved by the normal change through ``W_nt`` (in exact arithmetic the sequential
     sweep); each coordinate takes the normal's, then the second tangent's, then the first tangent's change and is
@@ -688,12 +688,9 @@ const int row_type = r == 0 ? {CONTACT} : {FRICTION};"""
             pad="        ",
         )
         held = "\n".join(unit_held_loads(ctx, name, "head", "        ") for name in UNIT_HELD)
-        # The record's second half holds the pair's metric, relative to its larger tangent diagonal.
+        # The record's second half holds the pair's metric: its eigenvalues and the larger's axis.
         tail = "\n        const float4 basis = *reinterpret_cast<const float4*>(record + 4);"
-        metric = cached_pair_law("UNIT_PAIR", "tangent_scale", "basis.x", "basis.y", ("basis.z", "basis.w"), "        ")
-        scale = """
-        // The pair's metric is relative to its larger tangent diagonal, as the pair law scales it.
-        const float tangent_scale = fmaxf(fmaxf(unit_diag1, unit_diag2), 1.0e-20f);"""
+        metric = cached_pair_law("UNIT_PAIR", "basis.x", "basis.y", ("basis.z", "basis.w"), "        ")
         return f"""        const float* record = {_record(width, "i")};
         const float4 coupling = *reinterpret_cast<const float4*>(record);{tail}{ring_read}
         const float mu = world_row_mu.data[offset + tangent];
@@ -703,7 +700,7 @@ const int row_type = r == 0 ? {CONTACT} : {FRICTION};"""
         float unit_jv0 = 0.0f, unit_jv1 = 0.0f, unit_jv2 = 0.0f;
 {gather}
         // The unit's staged values load with its rows, off the reduction's chain; the rows' law reads them.
-{held}{scale}
+{held}
         SUM(unit_jv0, unit_jv1, unit_jv2);
         // W_nt moves the tangent residuals by the normal change; the record's 1/W_nn steps the normal.
         const float gram_n1 = coupling.x, gram_n2 = coupling.y, unit_inverse = coupling.w;
@@ -748,7 +745,7 @@ def triple_phase(sweep: SparseSweep, rows: SparseRows, op: SparseFactor, laws: R
     normal load of its contact's patch ring. A triple's normal is a contact whose next row is staged as a spin row (its
     pair, :class:`SparseRows`): the lanes find them together, a lane a row.
 
-    A triple's metric is its contact's record's (a scale, three eigenvalues and the eigenbasis as a quaternion), formed
+    A triple's metric is its contact's record's (three eigenvalues and the eigenbasis as a quaternion), formed
     once per solve by the writer (:func:`.walk_rows.support_rows_kernel`), and loads with the ring ahead of the
     reduction. A linked sweep's contact units store each normal's ring members behind its record at entry
     (:func:`contact_units`), a triple's too: the visit pools them from the record, and a longer ring (or a sweep
@@ -773,9 +770,8 @@ def triple_phase(sweep: SparseSweep, rows: SparseRows, op: SparseFactor, laws: R
     else:
         pool.append(f"pooled = {ring};")
     law = (
-        "ConeLaw::friction_triple_from_metric(triple_metric.x, wp::vec3(triple_metric.y, triple_metric.z,\n"
-        "    triple_metric.w), wp::quat_to_matrix(wp::quat(triple_basis.x, triple_basis.y, triple_basis.z,\n"
-        "    triple_basis.w)), "
+        "ConeLaw::friction_triple_from_metric(wp::vec3(triple_metric.x, triple_metric.y, triple_metric.z),\n"
+        "    wp::quat_to_matrix(wp::quat(triple_basis.x, triple_basis.y, triple_basis.z, triple_basis.w)), "
     )
     ctx = RowContext(
         row="tangent",

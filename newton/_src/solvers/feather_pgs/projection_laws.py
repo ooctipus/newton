@@ -91,11 +91,12 @@ def box(impulse: float, lower: float, upper: float) -> float:
 def disk(pair: wp.vec2, radius: float) -> wp.vec2:
     """Scale a tangent impulse pair back onto the disk of ``radius`` when it lies outside.
 
-    A pair inside keeps its impulses: the scale's division is taken only outside, off the path of a pair that sticks.
+    A pair inside keeps its impulses: its squared norm is screened against the squared radius, so the root and the
+    scale's division are taken only outside, off the path of a pair that sticks.
     """
-    magnitude = wp.sqrt(pair[0] * pair[0] + pair[1] * pair[1])
-    if magnitude > radius:
-        return pair * (radius / magnitude)
+    magnitude_sq = pair[0] * pair[0] + pair[1] * pair[1]
+    if magnitude_sq > radius * radius:
+        return pair * (radius / wp.sqrt(magnitude_sq))
     return pair
 
 
@@ -104,24 +105,29 @@ def ball(triple: wp.vec3, mu: float, mu_t: float, load: float) -> wp.vec3:
     """Scale a friction triple ``(t1, t2, s)`` back onto its elliptic cone ``|(t1 / mu, t2 / mu, s / mu_t)| <= load``
     when it lies outside, as :func:`disk` does a pair; a zero coefficient pins its component. Without spin
     (``mu_t = 0``) the pair is projected by :func:`disk` on ``mu load`` bit for bit, as :func:`friction_ball` solves
-    it by :func:`friction_pair`."""
+    it by :func:`friction_pair`. As :func:`disk`, the squared norm is screened against the squared load, so the root
+    and the scale's division are taken only outside."""
     if mu_t <= 0.0:
         pair = disk(wp.vec2(triple[0], triple[1]), mu * load)
         return wp.vec3(pair[0], pair[1], 0.0)
     reciprocal = wp.where(mu > 0.0, 1.0 / mu, 0.0)
     scaled = wp.cw_mul(triple, wp.vec3(reciprocal, reciprocal, 1.0 / mu_t))
-    magnitude = wp.length(scaled)
+    magnitude_sq = wp.dot(scaled, scaled)
     pinned = wp.where(mu > 0.0, 1.0, 0.0)
-    return wp.cw_mul(triple, wp.vec3(pinned, pinned, 1.0)) * wp.where(magnitude > load, load / magnitude, 1.0)
+    kept = wp.cw_mul(triple, wp.vec3(pinned, pinned, 1.0))
+    if magnitude_sq > load * load:
+        return kept * (load / wp.sqrt(magnitude_sq))
+    return kept
 
 
 @PROJECTION_LAW.law
-def friction_pair_metric(a: float, c: float, d: float) -> tuple[float, float, float, wp.vec2]:
-    """Return the eigen-decomposition :func:`friction_pair` solves in: ``(scale, largest, smallest, axis)``.
+def friction_pair_metric(a: float, c: float, d: float) -> tuple[float, float, wp.vec2]:
+    """Return the eigen-decomposition :func:`friction_pair` solves in: ``(largest, smallest, axis)``.
 
-    ``[[a, c], [c, d]]`` is the pair's Delassus block, scaled by its largest
-    diagonal; ``axis`` is the unit eigenvector of the larger eigenvalue. A sweep
-    whose block stays fixed computes it once and calls :func:`friction_pair_from_metric`.
+    ``[[a, c], [c, d]]`` is the pair's Delassus block; ``largest`` and ``smallest`` are its eigenvalues and ``axis``
+    the unit eigenvector of the larger. They are formed on the block scaled by its largest diagonal, which keeps the
+    products in range, and scaled back, so the law reads the block's own and divides by no scale. A sweep whose block
+    stays fixed computes it once and calls :func:`friction_pair_from_metric`.
     """
     scale = wp.max(wp.max(a, d), 1.0e-20)
     a /= scale
@@ -134,16 +140,16 @@ def friction_pair_metric(a: float, c: float, d: float) -> tuple[float, float, fl
     axis = wp.vec2(c, largest - a)
     if a >= d:
         axis = wp.vec2(largest - d, c)
-    if wp.length(axis) > 0.0:
-        axis = wp.normalize(axis)
+    norm = wp.length(axis)
+    if norm > 0.0:
+        axis = axis * (1.0 / norm)
     else:
         axis = wp.vec2(1.0, 0.0)
-    return scale, largest, smallest, axis
+    return largest * scale, smallest * scale, axis
 
 
 @PROJECTION_LAW.law(inline="default")
 def friction_pair_from_metric(
-    scale: float,
     largest: float,
     smallest: float,
     axis: wp.vec2,
@@ -152,11 +158,15 @@ def friction_pair_from_metric(
     radius: float,
     omega: float,
 ) -> wp.vec2:
-    """Solve the tangent pair of :func:`friction_pair` from its block's :func:`friction_pair_metric`."""
+    """Solve the tangent pair of :func:`friction_pair` from its block's :func:`friction_pair_metric`.
+
+    Every divisor fixed for the visit is inverted once: the sticking test compares squared norms, and the sliding
+    solve's bounds and Newton steps multiply by the radius's reciprocal.
+    """
     if radius <= 0.0:
         return wp.vec2(0.0)
     perpendicular = wp.vec2(-axis[1], axis[0])
-    residual_rotated = wp.vec2(wp.dot(axis, residual), wp.dot(perpendicular, residual)) / scale
+    residual_rotated = wp.vec2(wp.dot(axis, residual), wp.dot(perpendicular, residual))
     # The hold test below reads |old|. Squared norms screen it without a root, beside the sticking test: a pair the
     # test keeps has |old|^2 within three floors of radius^2 (squaring doubles the floor; rounding adds under one), so
     # ten floors pass every pair it keeps. A radius under 1e-15 skips the screen, which keeps its operands normal.
@@ -171,7 +181,7 @@ def friction_pair_from_metric(
             correction += (residual_rotated[1] / smallest) * perpendicular
         # Incremental sticking preserves a feasible zero-residual impulse exactly.
         result = old - correction
-        sticking = wp.length(result) <= radius
+        sticking = wp.dot(result, result) <= radius_sq
     if not sticking:
         # A sliding pair already at its disk problem's solution to the rounding floor keeps its impulse: on its circle
         # within the floor of the radius, and its residual anti-parallel to it within the floor (the KKT conditions, at
@@ -191,12 +201,13 @@ def friction_pair_from_metric(
         b = wp.vec2(largest * old_rotated[0], smallest * old_rotated[1]) - residual_rotated
         solution = wp.vec2(0.0)
         lo = float(0.0)
-        hi = wp.length(b) / radius
+        inverse_radius = 1.0 / radius
+        hi = wp.length(b) * inverse_radius
         if hi > 0.0:
             # Both bounds are <= the multiplier root; together they also bound
             # the starting norm by sqrt(2) * radius. The reciprocal norm is
             # increasing and concave, giving Newton a useful step near singularity.
-            lo = wp.max(wp.max(hi - largest, wp.abs(b[1]) / radius - smallest), 0.0)
+            lo = wp.max(wp.max(hi - largest, wp.abs(b[1]) * inverse_radius - smallest), 0.0)
             alpha = lo
             converged = bool(False)
             for _ in range(8):
@@ -222,7 +233,7 @@ def friction_pair_from_metric(
                 slope = trial[0] * trial[0] * inv0 + trial[1] * trial[1] * inv1
                 candidate = alpha
                 if slope > 0.0:
-                    candidate = alpha + (norm / radius - 1.0) * norm * norm / slope
+                    candidate = alpha + (norm - radius) * inverse_radius * norm * norm / slope
                 alpha = 0.5 * (lo + hi)
                 if candidate > lo and candidate < hi:
                     alpha = candidate
@@ -254,8 +265,8 @@ def friction_pair(
     fallback. A sliding impulse that already meets the disk problem's KKT
     conditions at the rounding floor (:data:`PAIR_FLOOR`) is kept.
     """
-    scale, largest, smallest, axis = friction_pair_metric(a, c, d)
-    return friction_pair_from_metric(scale, largest, smallest, axis, residual, old, radius, omega)
+    largest, smallest, axis = friction_pair_metric(a, c, d)
+    return friction_pair_from_metric(largest, smallest, axis, residual, old, radius, omega)
 
 
 BALL_POLISH = 1
@@ -288,13 +299,14 @@ def jacobi_rotation(matrix: wp.mat33, vectors: wp.mat33, p: int, q: int) -> tupl
 
 
 @PROJECTION_LAW.law
-def friction_ball_metric(block: wp.mat33, mu: float, mu_t: float) -> tuple[float, wp.vec3, wp.mat33]:
-    """Return the eigen-decomposition :func:`friction_ball` solves in: ``(scale, values, vectors)``.
+def friction_ball_metric(block: wp.mat33, mu: float, mu_t: float) -> tuple[wp.vec3, wp.mat33]:
+    """Return the eigen-decomposition :func:`friction_ball` solves in: ``(values, vectors)``.
 
     ``block`` is the Delassus block of the rows ``(t1, t2, s)``. In the scaled impulse
-    ``y = (t1 / mu, t2 / mu, s / mu_t)`` it is ``C block C``, ``C = diag(mu, mu, mu_t)``, here divided by its largest
-    diagonal ``scale``. ``vectors`` holds its unit eigenvectors in columns and ``values`` their eigenvalues, clamped
-    at zero: ``wp.eig3``'s, polished by :data:`BALL_POLISH` exact Jacobi sweeps. A sweep whose block stays fixed
+    ``y = (t1 / mu, t2 / mu, s / mu_t)`` it is ``C block C``, ``C = diag(mu, mu, mu_t)``. ``vectors`` holds its unit
+    eigenvectors in columns and ``values`` their eigenvalues, clamped at zero: ``wp.eig3``'s, polished by
+    :data:`BALL_POLISH` exact Jacobi sweeps, on the block divided by its largest diagonal (which keeps the products in
+    range), then scaled back, so the law reads the block's own and divides by no scale. A sweep whose block stays fixed
     computes it once and calls :func:`friction_ball_from_metric`.
     """
     coefficients = wp.vec3(mu, mu, mu_t)
@@ -308,12 +320,11 @@ def friction_ball_metric(block: wp.mat33, mu: float, mu_t: float) -> tuple[float
         diagonal, vectors = jacobi_rotation(diagonal, vectors, 0, 2)
         diagonal, vectors = jacobi_rotation(diagonal, vectors, 1, 2)
     values = wp.vec3(wp.max(diagonal[0, 0], 0.0), wp.max(diagonal[1, 1], 0.0), wp.max(diagonal[2, 2], 0.0))
-    return scale, values, vectors
+    return values * scale, vectors
 
 
 @PROJECTION_LAW.law(inline="default")
 def friction_ball_from_metric(
-    scale: float,
     values: wp.vec3,
     vectors: wp.mat33,
     residual: wp.vec3,
@@ -327,7 +338,9 @@ def friction_ball_from_metric(
 
     The pair law's scheme in the scaled impulse ``y``, on the ball ``|y| <= load``: incremental sticking by the
     block inverse, the hold of a sliding impulse at the KKT conditions' rounding floor (:data:`PAIR_FLOOR`), and
-    Newton on the reciprocal norm of ``y(alpha) = (Y + alpha I)^-1 b`` in the eigenbasis, bisection its guard.
+    Newton on the reciprocal norm of ``y(alpha) = (Y + alpha I)^-1 b`` in the eigenbasis, bisection its guard. Every
+    divisor fixed for the visit is inverted once: the sticking test compares squared norms, and the sliding solve's
+    bounds and Newton steps multiply by the load's reciprocal.
     """
     if load <= 0.0:
         return wp.vec3(0.0)
@@ -337,8 +350,9 @@ def friction_ball_from_metric(
     coefficients = wp.vec3(mu, mu, mu_t)
     gradient = wp.cw_mul(residual, coefficients)
     old_rotated = wp.transpose(vectors) * old_scaled
-    residual_rotated = (wp.transpose(vectors) * gradient) / scale
+    residual_rotated = wp.transpose(vectors) * gradient
     largest = wp.max(wp.max(values[0], values[1]), values[2])
+    load_sq = load * load
     change = wp.vec3(0.0)
     sticking = bool(False)
     invertible = (values[0] > 0.0 or residual_rotated[0] == 0.0) and (values[1] > 0.0 or residual_rotated[1] == 0.0)
@@ -350,11 +364,11 @@ def friction_ball_from_metric(
         )
         # Incremental sticking preserves a feasible zero-residual impulse exactly.
         change = -(vectors * step)
-        sticking = wp.length(old_scaled + change) <= load
+        moved = old_scaled + change
+        sticking = wp.dot(moved, moved) <= load_sq
     if not sticking:
         # A sliding impulse already at its ball problem's solution to the rounding floor keeps its impulse: on the
         # sphere within the floor of the load, its gradient anti-parallel to it within the floor.
-        load_sq = load * load
         if load < 1.0e-15 or wp.abs(wp.dot(old_scaled, old_scaled) - load_sq) <= 10.0 * PAIR_FLOOR * load_sq:
             old_norm = wp.length(old_scaled)
             if (
@@ -367,13 +381,14 @@ def friction_ball_from_metric(
                 return old
         b = wp.cw_mul(values, old_rotated) - residual_rotated
         solution = wp.vec3(0.0)
-        hi = wp.length(b) / load
+        inverse_load = 1.0 / load
+        hi = wp.length(b) * inverse_load
         if hi > 0.0:
             # Both bounds are <= the multiplier root (|y| >= |b_k| / (values_k + alpha), |b| / (largest + alpha)).
             # The reciprocal norm is increasing and concave, giving Newton a useful step near singularity.
             lo = wp.max(hi - largest, 0.0)
-            lo = wp.max(wp.max(lo, wp.abs(b[0]) / load - values[0]), wp.abs(b[1]) / load - values[1])
-            lo = wp.max(lo, wp.abs(b[2]) / load - values[2])
+            lo = wp.max(wp.max(lo, wp.abs(b[0]) * inverse_load - values[0]), wp.abs(b[1]) * inverse_load - values[1])
+            lo = wp.max(lo, wp.abs(b[2]) * inverse_load - values[2])
             alpha = lo
             converged = bool(False)
             for _ in range(8):
@@ -395,7 +410,7 @@ def friction_ball_from_metric(
                 slope = wp.dot(wp.cw_mul(trial, trial), inv)
                 candidate = alpha
                 if slope > 0.0:
-                    candidate = alpha + (norm / load - 1.0) * norm * norm / slope
+                    candidate = alpha + (norm - load) * inverse_load * norm * norm / slope
                 alpha = 0.5 * (lo + hi)
                 if candidate > lo and candidate < hi:
                     alpha = candidate
@@ -427,8 +442,8 @@ def friction_ball(
         tangents = wp.vec2(residual[0], residual[1])
         pair = friction_pair(block[0, 0], block[0, 1], block[1, 1], tangents, wp.vec2(old[0], old[1]), mu * load, omega)
         return wp.vec3(pair[0], pair[1], 0.0)
-    scale, values, vectors = friction_ball_metric(block, mu, mu_t)
-    return friction_ball_from_metric(scale, values, vectors, residual, old, mu, mu_t, load, omega)
+    values, vectors = friction_ball_metric(block, mu, mu_t)
+    return friction_ball_from_metric(values, vectors, residual, old, mu, mu_t, load, omega)
 
 
 @CONE_LAW.law
@@ -446,7 +461,6 @@ def friction_triple(
 
 @CONE_LAW.law
 def friction_triple_from_metric(
-    scale: float,
     values: wp.vec3,
     vectors: wp.mat33,
     residual: wp.vec3,
@@ -460,7 +474,7 @@ def friction_triple_from_metric(
     block stays fixed across its sweeps, as a contact unit's pair keeps its metric: each visit only projects."""
     triple = wp.vec3(0.0)
     if load > 0.0:
-        triple = friction_ball_from_metric(scale, values, vectors, residual, old, mu, mu_t, load, omega)
+        triple = friction_ball_from_metric(values, vectors, residual, old, mu, mu_t, load, omega)
     return ball(triple, mu, mu_t, load)
 
 

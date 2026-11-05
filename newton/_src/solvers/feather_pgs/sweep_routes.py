@@ -271,13 +271,13 @@ def _unit_rows(torsion: bool) -> tuple:
     return (*_UNIT_ROWS, _SPIN_ROW) if torsion else _UNIT_ROWS
 
 
-_PAIR_METRIC = ("metric.v0", "metric.v1", "metric.v2", "metric.v3[0]", "metric.v3[1]")
-"""A colored friction unit's cached pair metric (``ProjectionLaw::friction_pair_metric``): scale, the two eigenvalues,
-the larger's axis."""
+_PAIR_METRIC = ("metric.v0", "metric.v1", "metric.v2[0]", "metric.v2[1]")
+"""A colored friction unit's cached pair metric (``ProjectionLaw::friction_pair_metric``): the two eigenvalues, the
+larger's axis."""
 TRIPLE_METRIC = 8
 """Under contact torsion a friction unit's cached metric takes eight floats: the friction triple's
-(``ProjectionLaw::friction_ball_metric``: scale, three eigenvalues, the eigenbasis as a rotation quaternion), or a
-unit without a spin row the pair's (:data:`_PAIR_METRIC`) and three unused."""
+(``ProjectionLaw::friction_ball_metric``: three eigenvalues and an unused value, the eigenbasis as a rotation
+quaternion), or a unit without a spin row the pair's (:data:`_PAIR_METRIC`) and four unused."""
 _PAIR_COUPLINGS = (("gram_n1", 0, 1), ("gram_n2", 0, 2))
 """The Gram couplings a colored friction unit caches after its pair's metric: each one's name and rows (``E``'s
 ``12 r``), the pair's tangents with the normal."""
@@ -438,9 +438,7 @@ def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str
             "            // the unit loads with its fields"
             + ("; under contact torsion the triple's law likewise, with a spin row." if torsion else "."),
             f"            float metric[{layout.metric}];",
-            cached_pair_law(
-                "FRICTION_PAIR_CACHED", "metric[0]", "metric[1]", "metric[2]", ("metric[3]", "metric[4]"), " " * 12
-            ),
+            cached_pair_law("FRICTION_PAIR_CACHED", "metric[0]", "metric[1]", ("metric[2]", "metric[3]"), " " * 12),
             *(
                 (cached_triple_law("FRICTION_TRIPLE_CACHED", " " * 12, metric=tuple(f"metric[{f}]" for f in range(8))),)
                 if torsion
@@ -517,9 +515,8 @@ def _colored_friction_metric(layout: sweep_units.SlotLayout, pad: str) -> list[s
         f"                  unit_cross, {diagonal(2)}, unit_cross23,",
         f"                  unit_cross13, unit_cross23, {diagonal(3)}),",
         f"        E[{layout.mu}], E[{layout.spin_mu}]);",
-        "    const wp::quat basis = wp::quat_from_matrix(triple.v2);",
-        "    friction_metric[0] = triple.v0;",
-        "    for (int f = 0; f < 3; ++f) friction_metric[1 + f] = triple.v1[f];",
+        "    const wp::quat basis = wp::quat_from_matrix(triple.v1);",
+        "    for (int f = 0; f < 3; ++f) friction_metric[f] = triple.v0[f];",
         "    for (int f = 0; f < 4; ++f) friction_metric[4 + f] = basis[f];",
         "} else {",
         f"    const auto metric = ProjectionLaw::friction_pair_metric({diagonal(1)}, unit_cross, {diagonal(2)});",
@@ -532,7 +529,7 @@ def _colored_friction_metric(layout: sweep_units.SlotLayout, pad: str) -> list[s
 def _colored_metrics(units: int, *, torsion: bool = False) -> str:
     """Before the sweeps, every thread forms the cached metric of the world's staged friction units at block stride
     and stores it in its slot's metric cache (``slot_metric``, field by field across the units), which the unit's law
-    and terms read at every visit: a friction pair's metric (scale, the two eigenvalues and the larger's axis), or
+    and terms read at every visit: a friction pair's metric (the two eigenvalues and the larger's axis), or
     under contact ``torsion`` the friction metric of :func:`_colored_friction_metric`, then its Gram couplings
     (:func:`_unit_couplings`)."""
     layout = sweep_units.slot_layout(torsion)

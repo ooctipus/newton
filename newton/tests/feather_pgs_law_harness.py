@@ -447,9 +447,8 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
         length = np.linalg.norm(axis, axis=1, keepdims=True)
         axis = np.where(length > 0.0, axis / np.maximum(length, 1.0e-300), np.array([1.0, 0.0]))
         return {
-            "scale": scale.astype(np.float32),
-            "largest": largest.astype(np.float32),
-            "smallest": np.maximum((a * d - c * c) / largest, 0.0).astype(np.float32),
+            "largest": (largest * scale).astype(np.float32),
+            "smallest": (np.maximum((a * d - c * c) / largest, 0.0) * scale).astype(np.float32),
             "axis": axis.astype(np.float32),
             **pair,
         }
@@ -488,8 +487,7 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
         scale = np.maximum(np.einsum("nii->ni", scaled).max(axis=1), 1.0e-20)
         values, vectors = np.linalg.eigh(scaled / scale[:, None, None])
         return {
-            "scale": scale.astype(np.float32),
-            "values": np.maximum(values, 0.0).astype(np.float32),
+            "values": (np.maximum(values, 0.0) * scale[:, None]).astype(np.float32),
             "vectors": vectors.astype(np.float32),
             **triple,
         }
