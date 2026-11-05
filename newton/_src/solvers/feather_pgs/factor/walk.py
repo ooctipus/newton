@@ -466,11 +466,20 @@ one, the finish's columns at each body's frame, both halves (``WALK_READ_COLUMN`
 :attr:`WalkTrees.now_link`, take :data:`WALK_LINK`'s layout."""
 
 
-_WALK_TABLE = """    $parent_table
+_WALK_TABLE = """    // The classes' path tables in constant memory, class after class: each body's parent (WALK_PARENT), its first
+    // coordinate and the count after the last (WALK_FIRST, a class's rows one more), each class's first body
+    // (WALK_CLASS). WALK_TREE(cls): the class of the tree a lane walks next (class 0 until set).
+    $parent_table
     $first_table
-    const int WALK_BODIES = $bodies;
-    const auto WALK_PARENT_OF = [&](const int b) -> int { return WALK_PARENT[b]; };
-    const auto WALK_FIRST_OF = [&](const int b) -> int { return WALK_FIRST[b]; };"""
+    $class_table
+    int WALK_AT = 0, WALK_AT_FIRST = 0, WALK_BODIES = WALK_CLASS[1];
+    const auto WALK_TREE = [&](const int cls) {
+        WALK_AT = WALK_CLASS[cls];
+        WALK_AT_FIRST = WALK_AT + cls;
+        WALK_BODIES = WALK_CLASS[cls + 1] - WALK_AT;
+    };
+    const auto WALK_PARENT_OF = [&](const int b) -> int { return WALK_PARENT[WALK_AT + b]; };
+    const auto WALK_FIRST_OF = [&](const int b) -> int { return WALK_FIRST[WALK_AT_FIRST + b]; };"""
 
 _WALK_PATHS = """    // The tree a lane walks (WALK_TREE): its path table, each body's parent and first coordinate as int pairs
     // (TreeFactor.walk_path), and its bodies and coordinates. Set before each tree's walk.
@@ -886,11 +895,15 @@ def _walk_placement(name: str, table: str, rows: int, coordinate: int, link: int
 
 
 @functools.cache
-def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int, half: int = WALK_BOTH) -> DevicePrelude:
-    """The device walk of a class of trees (one tree, or a world's forest), for both devices: a prelude declaring
+def walk_prelude(
+    tables: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...], rows: int, half: int = WALK_BOTH
+) -> DevicePrelude:
+    """The device walk of the walking classes, for both devices: a prelude declaring
 
-    - the class's path table in constant memory (``WALK_PARENT``, ``WALK_FIRST``): topology, one table per class, so a
-      lane walks a root path without a global load in front of its steps (GPU_WALK §8, variant C);
+    - the classes' path tables in constant memory (``WALK_PARENT``, ``WALK_FIRST``, ``WALK_CLASS``): topology fixed at
+      build, so a lane walks a root path without a global load in front of its steps (GPU_WALK §8, variant C); a lane
+      names its tree's class (``WALK_TREE(cls)``, the factor's :attr:`WalkTrees.cls`) where the tables hold more than
+      one;
     - ``WALK_UP`` and ``WALK_SEED``, the rows: a lane per seed walks its ``rows`` rows up the seed's root path, every
       load shared (Z_UNION Theorem B), and gives each footprint, with the step's ``J`` entry it whitens, to the
       caller's sink, the placement's store;
@@ -900,21 +913,28 @@ def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int, hal
     No step launches it (FL3.1). The data is :meth:`TreeWalk.device_data`'s.
 
     Args:
-        parent: Each body's parent (-1: the world), every parent before its children.
-        first: Each body's first coordinate, and the count after the last.
+        tables: Each class's path table (a :class:`.tree_scan.WalkClass`'s ``parent`` and ``first``): each body's parent
+            (-1: the world, every parent before its children), and each body's first coordinate with the count after
+            the last.
         rows: The rows a lane walks together: the seed's unit (1 a limit, 2 a velocity limit, 3 a point contact, 4
             with spin).
-        half: The class's records' half as its walk reads them (``WALK_READ``, :func:`.tree_scan.classes_half`).
+        half: The classes' records' half as their walk reads them (``WALK_READ``, :func:`.tree_scan.classes_half`).
     """
-    if len(first) != len(parent) + 1 or any(p >= b for b, p in enumerate(parent)):
+    # No walking tree: one class of no body.
+    tables = tables or (((), (0,)),)
+    if any(len(first) != len(parent) + 1 or any(p >= b for b, p in enumerate(parent)) for parent, first in tables):
         raise ValueError("a walk's path table needs every parent before its children and a first coordinate per body")
+    starts = [0]
+    for parent, _ in tables:
+        starts.append(starts[-1] + len(parent))
     table = substitute(
         _WALK_TABLE,
-        bodies=len(parent),
-        parent_table=ts.constant_table("WALK_PARENT", parent),
-        first_table=ts.constant_table("WALK_FIRST", first),
+        parent_table=ts.constant_table("WALK_PARENT", [p for parent, _ in tables for p in parent]),
+        first_table=ts.constant_table("WALK_FIRST", [f for _, first in tables for f in first]),
+        class_table=ts.constant_table("WALK_CLASS", starts),
     )
-    name = f"walk_{rows}_{len(parent)}" + ("" if half == WALK_BOTH else f"_{half}")
+    tag = hashlib.sha256(repr(tables).encode()).hexdigest()[:8] if len(tables) > 1 else str(len(tables[0][0]))
+    name = f"walk_{rows}_{tag}" + ("" if half == WALK_BOTH else f"_{half}")
     return _walk_placement(name, table, rows, WALK_COORDINATE, WALK_LINK, WALK_NOW, half)
 
 
@@ -1321,7 +1341,9 @@ class WalkTrees:
       ``R^T`` and the audit's coordinates ``R^-T``;
     - ``body_art``: each body's articulation; ``first_art``: the responding articulation whose coordinates start at
       each global coordinate (-1 elsewhere), by which a matrix-free sweep finds a free body's tree
-      (:class:`.sweep_routes.FreeBodyCoordinates`).
+      (:class:`.sweep_routes.FreeBodyCoordinates`);
+    - ``cls``: each walking articulation's class (:attr:`.tree_factor.TreeFactor.walk_classes`), by which a lane reads
+      its tree's path from the classes' tables in constant memory (``WALK_TREE``, :func:`walk_prelude`).
     """
 
     data: wp.array2d[float]
@@ -1344,6 +1366,7 @@ class WalkTrees:
     du: wp.array[float]
     body_art: wp.array[int]
     first_art: wp.array[int]
+    cls: wp.array[int]
 
 
 _ENTER = """    if (tid >= arts.shape[0]) return;

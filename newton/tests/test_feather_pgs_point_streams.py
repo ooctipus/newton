@@ -334,8 +334,10 @@ def _dense_build_calls():
     # The general placement's one writer: plain, and with blocks of up to eight rows (the closure), mimics among them.
     from newton._src.solvers.feather_pgs import walk_rows  # noqa: PLC0415
 
+    # Its trees' classes: a branched tree of a free root and three limbs, and a free body.
+    tables = (((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11)), ((-1,), (0, 6)))
     for args in ((0, False), (8, False), (8, True)):
-        yield "walk_rows.walked_rows_kernel", walk_rows.walked_rows_kernel.__wrapped__, args, {}
+        yield "walk_rows.walked_rows_kernel", walk_rows.walked_rows_kernel.__wrapped__, (*args, True, tables), {}
 
 
 def _solver_factory_calls():

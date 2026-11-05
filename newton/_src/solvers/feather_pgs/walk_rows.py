@@ -45,6 +45,7 @@ from .device_preludes import DevicePrelude, dual_native, lane_group, substitute
 from .factor.closure import close_block, close_row
 from .factor.fields import Preelim
 from .factor.walk import (
+    FREE_BODY_WALK,
     WALK_COORDINATE,
     WALK_FRAME,
     WALK_LINK,
@@ -273,7 +274,7 @@ def unit_reader(links: bool, unit_rows: int = 1) -> wp.Function:
 
 
 @cache
-def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool = True) -> wp.Kernel:
+def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tuple) -> wp.Kernel:
     """The one writer of the general placement, world-major: a world's group of ``lanes`` lanes (:func:`writer_lanes`)
     writes its rows in the block primitive's phases (FL3_design §1.4, W9), the group synchronized between them:
 
@@ -291,14 +292,16 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool = True) -> wp
 
     The closure's seed stays a launch after the warm start's gather (:meth:`.tree_factor.TreeFactor.seed_blocks`).
     One launch with group barriers, not a second launch for the block phase: FL33D's measurement (``fl33d/``).
-    ``side``: whether the model's records can have a side (:attr:`.tree_factor.TreeFactor.walk_side`)."""
+    ``side``: whether the model's records can have a side (:attr:`.tree_factor.TreeFactor.walk_side`); ``tables``: the
+    walking classes' path tables (:func:`.factor.walk.walk_prelude`), each tree's path read from constant memory by its
+    class."""
     has_blocks = blocks > 0
     capacity = max(blocks, 1)
     mimics = int(mimic_blocks)
     # A link row is a block row (block_row; links plan blocks, TreeFactor.plan_blocks): the writer reads link rows
     # where it closes blocks. Elsewhere their seeds would hold a second point across every walk.
     read_unit = unit_reader(has_blocks)
-    walk = packed_walker(1, False, side)
+    walk = packed_walker(1, False, side, tables=tables)
 
     def kernel(
         rows: DenseRows,
@@ -350,12 +353,14 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool = True) -> wp
 
 def writer_kernel(solver) -> wp.Kernel:
     """The one writer's variant for the solver's class (:func:`walked_rows_kernel`), from its topology: the block phase
-    where bilateral blocks exist (mimics among them under ``enable_bilateral_preelimination``), and the records' side
-    where a walked joint can have two halves (:attr:`.tree_factor.TreeFactor.walk_side`)."""
+    where bilateral blocks exist (mimics among them under ``enable_bilateral_preelimination``), the records' side
+    where a walked joint can have two halves (:attr:`.tree_factor.TreeFactor.walk_side`), and the walking classes'
+    paths (:attr:`.tree_factor.TreeFactor.walk_classes`)."""
     factor = solver.factor
     blocks = factor.block_capacity if factor.eliminates else 0
     mimics = bool(blocks and solver.options.enable_bilateral_preelimination)
-    return walked_rows_kernel(blocks, mimics, factor.walk_side)
+    tables = tuple((walk.parent, walk.first) for walk in factor.walk_classes)
+    return walked_rows_kernel(blocks, mimics, factor.walk_side, tables)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -682,7 +687,7 @@ def _support_snippet(parent: tuple, first: tuple, node: tuple, rows: int, record
         diag=_HEADER_DIAG,
         rd="__ldg(p)",
     )
-    walk = walk_prelude(parent, first, rows, half)
+    walk = walk_prelude(((parent, first),), rows, half)
     return dual_native(body, preludes=(walk, walk_row_prelude(rows), _support_table(node)))
 
 
@@ -789,8 +794,7 @@ _PACKED_START = """    // The unit's packed rows cleared: each side's walk store
     const int first = RD(sink.layout.sides.data + ((size_t)unit.line * sink.layout.sides.shape[1] + unit.slot)).c[0];
 """
 
-_PACKED_SIDE = """$skip        WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), RD(walk.joint_end.data + art) - j0,
-                  RD(walk.dofs.data + art));
+_PACKED_SIDE = """$skip$tree
         int seeds = 0;
         if (covector) {
             seeds = dof1 >= 0 ? 2 : 1;
@@ -821,17 +825,31 @@ _PACKED_RELEASE = (
 )
 
 
+_PATH_TREE = """        WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), RD(walk.joint_end.data + art) - j0,
+                  RD(walk.dofs.data + art));"""
+_CLASS_TREE = """        // The tree's class: its path from the classes' tables in constant memory.
+        WALK_TREE(RD(walk.cls.data + art));"""
+
+
 @cache
-def packed_walker(rows: int, spin: bool, side: bool, star: bool = False, bodies: bool = False) -> wp.Function:
+def packed_walker(
+    rows: int, spin: bool, side: bool, star: bool = False, bodies: bool = False, tables: tuple | None = None
+) -> wp.Function:
     """The general placement's unit walker (:data:`_SUPPORT`, the support writer's text with the packed rows as its
-    sink): a unit's ``rows`` rows walked together through each tree's path table in global memory
-    (:func:`.factor.walk.walk_paths_prelude`, a world holds any forest), each footprint stored at its coordinate's entry
+    sink): a unit's ``rows`` rows walked together through its tree's path, each footprint stored at its coordinate's entry
     in the side's packed row, its diagonal ``|z|^2 + cfm`` and incident ``J v_hat`` from the same walk; ``spin``: the
     unit's fourth row is its spin row; ``side``: whether records can have a side. With ``star``, the sparse diagonal's:
     the arm's side into the row's dense part (its size group's row, ``unit.group``), a key's side left to the writer
     (:func:`star_step`), and the diagonal stored without its slots' squares and ``cfm``, which the writer adds. With
     ``bodies``, the free bodies': their packed rows by their own row, the row's less ``sink.base``
-    (:func:`write_free_body_rows`)."""
+    (:func:`write_free_body_rows`). ``tables``: the walking classes' path tables (:func:`.factor.walk.walk_prelude`),
+    fixed at build, each tree's path read from constant memory by its class (one table: every tree's); without them,
+    each tree's path table in global memory (:func:`.factor.walk.walk_paths_prelude`; the star's walkers, built before a
+    solver names its classes)."""
+    if tables is None:
+        tree = _PATH_TREE
+    else:
+        tree = _CLASS_TREE if len(tables) > 1 else ""
     body = substitute(
         _SUPPORT,
         rows=rows,
@@ -845,6 +863,7 @@ def packed_walker(rows: int, spin: bool, side: bool, star: bool = False, bodies:
         side=substitute(
             _PACKED_SIDE,
             skip=_STAR_SKIP if star else "",
+            tree=tree,
             base="0" if star else _PACKED_BASE,
         ),
         rank="base + c",
@@ -857,8 +876,10 @@ def packed_walker(rows: int, spin: bool, side: bool, star: bool = False, bodies:
         # RD a plain load here, not the support writer's non-coherent __ldg: the K2 writer ran 1.4% faster on sm_120.
         rd="*p",
     )
-    walk = walk_paths_prelude(rows, half=record_half(side))
-    tag = ("_spin" if spin else "") + walk.name.removeprefix(f"walk_paths_{rows}") + ("_star" if star else "")
+    half = record_half(side)
+    walk = walk_paths_prelude(rows, half=half) if tables is None else walk_prelude(tables, rows, half)
+    tag = ("_spin" if spin else "") + walk.name.removeprefix(f"walk_paths_{rows}").removeprefix(f"walk_{rows}")
+    tag += "_star" if star else ""
     tag += "_bodies" if bodies else ""
     snippet = dual_native(body, preludes=(walk, walk_row_prelude(rows)))
     return unit_walker(f"packed_walk_{rows}{tag}", snippet)
@@ -1276,7 +1297,7 @@ def packed_sink(solver) -> RowSink:
 # The free bodies' rows: each side's six of a row's twelve, a packed row by the free bodies' own row
 # ---------------------------------------------------------------------------------------------------------------------
 
-walk_body_row = packed_walker(1, False, True, bodies=True)
+walk_body_row = packed_walker(1, False, True, bodies=True, tables=((FREE_BODY_WALK.parent, FREE_BODY_WALK.first),))
 """The one unit walker into the free bodies' rows (:func:`packed_walker`): a row's sides from entry 0 and 6."""
 
 

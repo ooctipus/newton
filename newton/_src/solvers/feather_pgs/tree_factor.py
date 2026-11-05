@@ -296,6 +296,7 @@ class TreeFactor:
         view.release = release_view(max(int(model.articulation_count), 1), 0, 1, device)
         view.body_art = forest.body_to_articulation
         view.first_art = wp.full(1, -1, dtype=wp.int32, device=device)
+        view.cls = wp.zeros(1, dtype=wp.int32, device=device)
         return view
 
     def _setup_passive_joint_forces(self) -> None:
@@ -895,6 +896,7 @@ class TreeFactor:
         responding = np.flatnonzero(forest.articulation_response_dof_count.numpy() > 0)
         first_art[starts[responding]] = responding
         view.first_art = wp.array(first_art, dtype=wp.int32, device=device)
+        view.cls = self.walk_class
         self.walk_trees = view
         self.plan_leave()
 

@@ -493,8 +493,16 @@ def walk_calls():
         for records, torsion in ((False, False), (True, True)):
             args = (Named(f"{name} parent", cls.parent), Named(f"{name} first", cls.first), Named(f"{name} node", node))
             yield "walk_rows.support_rows_kernel", support, args, {"records": records, "torsion": torsion}
+    tables = {
+        "g1": (classes["g1"].parent, classes["g1"].first),
+        "franka": (classes["franka"].parent, classes["franka"].first),
+        "cube": (classes["cube"].parent, classes["cube"].first),
+    }
     for side in (False, True):
-        yield "walk_rows.walked_rows_kernel", _unwrapped(walk_rows.walked_rows_kernel), (8, True, side), {}
+        table = Named("(g1,)", (tables["g1"],))
+        yield "walk_rows.walked_rows_kernel", _unwrapped(walk_rows.walked_rows_kernel), (8, True, side, table), {}
+    pair = Named("(franka, cube)", (tables["franka"], tables["cube"]))
+    yield "walk_rows.walked_rows_kernel", _unwrapped(walk_rows.walked_rows_kernel), (0, False, False, pair), {}
     mf_gs = _unwrapped(sweep_routes.mf_gs_kernel)
     free = {"factor_coordinates": True, "independent_components": True, "has_dense_velocity_limit_rows": False}
     yield "sweep_routes.mf_gs_kernel", mf_gs, (64, 32, 12, ARCH), free

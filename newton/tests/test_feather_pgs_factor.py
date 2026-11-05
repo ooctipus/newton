@@ -1487,7 +1487,7 @@ _TREE_PARAMS = params(
 def walk_kernels(table: tuple, rows: int) -> tuple:
     """The rows kernel (a thread per seed) and the tree kernel (a thread per tree, the class's emitted walk down) of
     one path table."""
-    prelude = factor_walk.walk_prelude(*table, rows)
+    prelude = factor_walk.walk_prelude((table,), rows)
     tag = hashlib.sha256(repr(table).encode()).hexdigest()[:12]
     sizes = {"coordinate": WALK_COORDINATE, "link": WALK_LINK, "now": WALK_NOW}
     up = KernelTemplate(
