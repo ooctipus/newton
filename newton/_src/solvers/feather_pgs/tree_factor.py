@@ -747,7 +747,8 @@ class TreeFactor:
         refreshes (:meth:`walk_step`, the classes' refresh) takes that geometry as the factor's frames and runs the inward
         pass, so the walk is the factor ``L`` refreshes, to rounding. Each body's path entry in global memory
         (:attr:`walk_path`, :func:`.factor.walk.walk_paths_prelude`) remains for the readers that do not yet read their
-        class's: the parallel tiers' rows, the matrix-free sweep's free bodies and the support placement's admission.
+        class's: the parallel tiers' rows, the matrix-free sweep's free bodies, the sparse diagonal's star walker and the
+        support placement's admission.
 
         Raises:
             ValueError: For a tree whose bodies do not come after their parents, or that holds more than

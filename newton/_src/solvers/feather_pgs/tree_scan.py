@@ -1221,20 +1221,36 @@ def inward_edge(lever, state: str) -> str:
 
 
 def walk_texts(
-    direction: Direction, *, source: str, sink: str, value: str, prior: str, coordinate: int, link: int, end: str = ""
+    direction: Direction,
+    *,
+    source: str,
+    sink: str,
+    value: str,
+    prior: str,
+    coordinate: int,
+    link: int,
+    end: str = "",
+    inverted: bool = False,
 ) -> dict[str, str]:
     """A whole-tree walk on fetched items (:data:`FETCHED`), as :meth:`WalkClass.walk`'s keywords: ``UP`` leaf first
-    (the whitening, ``u = L^-1 P x``), ``DOWN`` root first (``P^T L^-T u``). Its joint is the edge (into the parent leaf
-    first, from it root first); its step the coordinate's :func:`step` on ``$V`` from ``source``, the caller's ``sink``
-    after the output and before the state's update; ``end`` a body's statements after its coordinates. Each step's
-    record and input (``value``, and ``prior``, its output's prior value) and each joint's link are fetched ahead of
-    the chain (``WALK_IN``, ``WALK_LINK_IN``) and asked of L1 before that (``WALK_TOUCH``); ``coordinate`` and ``link``
-    are the floats of a record and a link."""
+    (the whitening, ``u = L^-1 P x``), ``DOWN`` root first (``P^T L^-T u``, or ``inverted`` the enter ``u = L^T P qd``,
+    :func:`enter`). Its joint is the edge (into the parent leaf first, from it root first); its step the
+    coordinate's :func:`step` on ``$V`` from ``source`` (the enter's: ``sink`` its output's name, the coordinate's known
+    velocity ``source``), the caller's ``sink`` after the output and before the state's update; ``end`` a body's
+    statements after its coordinates. Each step's record and input (``value``, and ``prior``, its output's prior value)
+    and each joint's link are fetched ahead of the chain (``WALK_IN``, ``WALK_LINK_IN``) and asked of L1 before that
+    (``WALK_TOUCH``); ``coordinate`` and ``link`` are the floats of a record and a link."""
     up = direction is Direction.UP
-    output, *update = step(direction, FETCHED, "$V", source=source, out="const float z" if up else "const float q")
+    if inverted:
+        if up:
+            raise ValueError("the enter walks down")
+        output, *update = enter(FETCHED, "$V", source, sink)
+        sink = ""
+    else:
+        output, *update = step(direction, FETCHED, "$V", source=source, out="const float z" if up else "const float q")
     texts = {
         "joint": braced(edge(direction, FETCHED.lever, "$V" if up else "$P", into="$P" if up else "$V")),
-        "step": braced([output, sink, *update]),
+        "step": braced([output, *([sink] if sink else []), *update]),
         "end": end,
         "root_first": not up,
         "fetch_joint": "WALK_LINK_IN(link, $b, $up)",

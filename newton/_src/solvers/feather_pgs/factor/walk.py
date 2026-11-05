@@ -668,8 +668,9 @@ $record_c
             }
             for (int k = 0; k < 6; ++k) twist[6 * b + k] = V[k];
         }
-    };
-    // The slips' release of tree art (WalkRelease, written by the predictor's border; W9's verdict: R = L_F^-1 L_K,
+    };"""
+
+_WALK_RELEASE = """    // The slips' release of tree art (WalkRelease, written by the predictor's border; W9's verdict: R = L_F^-1 L_K,
     // tree-lower, so every row keeps its support). Slip j's steps along its root path, leaf first, start at
     // at = (art * cap + j) * steps of release.step (WALK_STEP's records); a coordinate of -1 ends the path.
     // WALK_SLIP_ON(release, at, z, rows, stride, place): z <- R_j z on rows rows (at most $rows) of a footprint whose
@@ -793,13 +794,31 @@ _WALK_TEXTS = {
     "edge_v": ts.statements(ts.edge(ts.Direction.UP, ts.LOADED.lever, "v"), 24),
     "edge_twist": ts.statements(ts.edge(ts.Direction.DOWN, ts.LOADED.lever, "W", into="V"), 8),
     "enter_V": ts.statements(ts.enter(ts.LOADED, "V", "qd[c]", "u[c]"), 16),
-    "slip_on": ts.statements(ts.slip("R", "z[e + r * stride]", "s[r]", "b", "a", "g", "z[e + r * stride] = {};"), 16),
-    "slip_t": ts.statements(ts.slip("RT", "v", "t", "b", "a", "g", "return {};"), 12),
-    "slip_it": ts.statements(ts.slip("RIT", "v", "t", "b", "a", "g", "return {};"), 12),
 }
 """The path walk's arithmetic (:data:`_WALK`): the rows' steps up (the held pose a source of statements, ``x``), a
 covector seed's first step, the joints of the rows' and the seed wrenches' up and of a parent's twist down, and the
 audit's step in (``ENTER``)."""
+
+
+def _release_text(rows: int) -> str:
+    """The slips' release (:data:`_WALK_RELEASE`) on up to ``rows`` rows a footprint: R, R^T and R^-T along each
+    slip's root path, read from :class:`WalkRelease`'s records alone (no tree's path table)."""
+    return substitute(
+        _WALK_RELEASE,
+        rows=rows,
+        batch=WALK_SLIP_BATCH,
+        slip_on=ts.statements(ts.slip("R", "z[e + r * stride]", "s[r]", "b", "a", "g", "z[e + r * stride] = {};"), 16),
+        slip_t=ts.statements(ts.slip("RT", "v", "t", "b", "a", "g", "return {};"), 12),
+        slip_it=ts.statements(ts.slip("RIT", "v", "t", "b", "a", "g", "return {};"), 12),
+    )
+
+
+@functools.cache
+def walk_release_prelude() -> DevicePrelude:
+    """The slips' release alone (:func:`_release_text`, ``WALK_RELEASE_T`` and the rest), after the walk's one access,
+    for both devices: a reader that releases without walking a path (the leave)."""
+    text = {cuda: _walk_loads_text(cuda) + "\n" + _release_text(1) for cuda in (True, False)}
+    return DevicePrelude("walk_release", text[True], cpu=text[False])
 
 
 _WALK_LOADS = """#ifndef WALK_READ
@@ -971,7 +990,6 @@ def _walk_placement(name: str, table: str, rows: int, coordinate: int, link: int
         **_WALK_TEXTS,
         now=now,
         frame=WALK_LINK_FRAME,
-        batch=WALK_SLIP_BATCH,
         record_c=ts.indent_text(record, 16),
         record_seed=ts.indent_text(record, 8),
         # A body's link where the root path opens it (ts.root_path's begin: one line, the path's indent).
@@ -982,6 +1000,7 @@ def _walk_placement(name: str, table: str, rows: int, coordinate: int, link: int
             f"float f[4];\nWALK_READ_POINT(WALK_LDG, f, now_link + {WALK_LINK} * b + {WALK_FRAME});", 20
         ),
     )
+    walk += "\n" + _release_text(rows)
     text = {cuda: _walk_loads_text(cuda) + "\n" + table + "\n" + walk for cuda in (True, False)}
     return DevicePrelude(name, text[True], cpu=text[False])
 
@@ -1127,7 +1146,27 @@ _WALK_ACCESS = """    // The class emitter's reads, ahead of its chain, by the o
     const auto WALK_LOAD = [&](const float* p) -> float { return *p; };"""
 
 
-def _walk_down(classes: tuple[WalkClass, ...], unroll: int, ahead: int | None) -> str:
+def _walk_down(classes: tuple[WalkClass, ...], unroll: int, ahead: int | None, inverted: bool) -> str:
+    if inverted:
+        texts = ts.walk_texts(
+            ts.Direction.DOWN,
+            source="$X.u",
+            sink="u[$c]",
+            value="qd[$c]",
+            prior="0.0f",
+            coordinate=WALK_COORDINATE,
+            link=WALK_LINK,
+            inverted=True,
+        )
+        walks = [walk.walk(**texts, unroll=unroll, ahead=ahead) for walk in classes]
+        walk = indent_text(ts.by_class(walks), 8)
+        return f"""    // WALK_ENTER(cls, data, link, qd, u): the walk down inverted, u = L^T P qd, of one tree of class cls on one lane,
+    // root first: each coordinate c of known velocity qd_c takes u_c = ell_c qd_c + ut_c . V, then V += s_c qd_c, V its
+    // body's twist at its frame, a register (the audit's coordinates, :func:`walk_enter_kernel`).
+    const auto WALK_ENTER = [&](const int cls, const float* data, const float* link, const float* qd, float* u) {{
+        (void)cls;
+{walk}
+    }};"""
     texts = ts.walk_texts(
         ts.Direction.DOWN,
         source="$X.u",
@@ -1155,7 +1194,7 @@ def _walk_down(classes: tuple[WalkClass, ...], unroll: int, ahead: int | None) -
 
 @functools.cache
 def walk_down_prelude(
-    classes: tuple[WalkClass, ...], unroll: int = WALK_UNROLL, ahead: int | None = None
+    classes: tuple[WalkClass, ...], unroll: int = WALK_UNROLL, ahead: int | None = None, inverted: bool = False
 ) -> DevicePrelude:
     """The one walk down (the leave ``P^T L^-T u``) of the walking classes ``classes``, for both devices: a prelude
     declaring ``WALK_DOWN(cls, data, link, u, prior, qd, twist)``, the chain on one lane: each class's walk emitted by
@@ -1164,12 +1203,15 @@ def walk_down_prelude(
     ``twist(b, V)`` after its body.
 
     No shared memory and no scratch. The step's one leave takes it (:func:`walk_leave_kernel`), and the general sweep's
-    free bodies' speed rows on their one-body class (:data:`FREE_BODY_WALK`).
+    free bodies' speed rows on their one-body class (:data:`FREE_BODY_WALK`). ``inverted``, the same walk declares
+    ``WALK_ENTER(cls, data, link, qd, u)``, the leave inverted (``u = L^T P qd``, :func:`.tree_scan.enter`): the
+    audit's (:func:`walk_enter_kernel`).
 
     Args:
         classes: The walking classes, indexed by ``cls``.
         unroll: Coordinates up to which a class's walk is straight-line code (:data:`WALK_UNROLL`).
         ahead: Items whose inputs the chain's lane holds in registers ahead of it (:meth:`WalkClass.walk`).
+        inverted: Declare the enter in place of the leave.
     """
     if not classes:
         raise ValueError("a walk down needs a class")
@@ -1177,9 +1219,9 @@ def walk_down_prelude(
         repr((classes, unroll, WALK_AHEAD if ahead is None else ahead, WALK_TOUCH)).encode()
     ).hexdigest()[:8]
     # The loads package carries the step's pin (WALK_MUL), under its one guard.
-    walk = substitute(_WALK_ACCESS, unpacked=WALK_UNPACKED) + "\n" + _walk_down(classes, unroll, ahead)
+    walk = substitute(_WALK_ACCESS, unpacked=WALK_UNPACKED) + "\n" + _walk_down(classes, unroll, ahead, inverted)
     texts = {cuda: _walk_loads_text(cuda) + "\n" + walk for cuda in (True, False)}
-    return DevicePrelude(f"walk_down_{tag}", texts[True], cpu=texts[False])
+    return DevicePrelude(f"walk_{'enter' if inverted else 'down'}_{tag}", texts[True], cpu=texts[False])
 
 
 def leave_work(trees: int) -> Work:
@@ -1344,7 +1386,7 @@ def walk_leave_kernel(
         items("tid", flat=True),
         preludes=(
             memory_words(memory.Place.STREAMED),
-            *((walk_prelude(_tables(classes), 1),) if release else ()),
+            *((walk_release_prelude(),) if release else ()),
             walk_down_prelude(classes, WALK_UNROLL),
         ),
         dual=True,
@@ -1413,7 +1455,8 @@ class WalkTrees:
       precision does not depend on where the articulation stands; a world point meets one through the origin, and a
       factor's frame meets the step's through the two origins' difference (``WALK_UP``'s ``shift``, zero on a refresh
       step); ``joint_art``: each joint's articulation;
-    - ``scratch``: a twist a joint, the audit's (``WALK_ENTER``) and the predictor's border's work;
+    - ``scratch``: a twist a joint, which no walk reads since the audit's enter keeps its twists in registers (it goes
+      with ``path``, whose last readers are the sweeps');
     - each articulation's first joint, joint end, first coordinate and coordinates (a free rigid body is a one-body
       tree of six coordinates);
     - ``dof_body``: each coordinate's body within its tree; ``body_joint``: each body's joint;
@@ -1457,11 +1500,10 @@ _ENTER = """    if (tid >= arts.shape[0]) return;
     const int world = art_to_world.data[art], offset = world_offset.data[art];
     if (world < 0 || offset < 0) return;
     const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
-    // The tree's path: its class's table in constant memory.
-    WALK_TREE(walk.cls.data[art]);
     float* u = coordinates.data + (size_t)world * coordinates.shape[1] + offset;
-    WALK_ENTER(walk.data.data + (size_t)d0 * $coordinate, walk.link.data + (size_t)j0 * $link, velocity.data + d0, u,
-               reinterpret_cast<float*>(walk.scratch.data + j0));
+    // The class's walk down inverted (its path compiled), from the tree's velocity.
+    WALK_ENTER(walk.cls.data[art], walk.data.data + (size_t)d0 * $coordinate, walk.link.data + (size_t)j0 * $link,
+               velocity.data + d0, u);
     // The rows' release: u <- R^-T u (the predictor's border's R).
     WALK_RELEASE_IT(walk.release, art, u);
 """
@@ -1469,12 +1511,12 @@ _ENTER = """    if (tid >= arts.shape[0]) return;
 
 @functools.cache
 def walk_enter_kernel(classes: tuple[WalkClass, ...]) -> wp.Kernel:
-    """Each held tree's coordinates of a velocity in the walk's frame, ``u = L^T P v`` (``WALK_ENTER``), a thread per
-    tree, each tree's path its class's (``classes``, :attr:`WalkTrees.cls`) in constant memory, at its world
-    coordinates: what the audit reads the walked rows against (:mod:`.audit`)."""
+    """Each held tree's coordinates of a velocity in the walk's frame, ``u = L^T P v``, a thread per tree: its class's
+    walk down inverted (``WALK_ENTER`` of :func:`walk_down_prelude`, the class at :attr:`WalkTrees.cls`), then the
+    slips' ``R^-T``, at its world coordinates: what the audit reads the walked rows against (:mod:`.audit`)."""
     from ..kernel_template import KernelTemplate, items  # noqa: PLC0415
 
-    tag = hashlib.sha256(repr(_tables(classes)).encode()).hexdigest()[:8]
+    tag = hashlib.sha256(repr(classes).encode()).hexdigest()[:8]
     return KernelTemplate(
         f"walk_enter_{tag}",
         (
@@ -1487,7 +1529,7 @@ def walk_enter_kernel(classes: tuple[WalkClass, ...]) -> wp.Kernel:
         ),
         substitute(_ENTER, coordinate=WALK_COORDINATE, link=WALK_LINK),
         items("tid", flat=True),
-        preludes=(walk_prelude(_tables(classes), 1),),
+        preludes=(walk_release_prelude(), walk_down_prelude(classes, WALK_UNROLL, inverted=True)),
         dual=True,
         native_name="walk_enter_native",
     ).kernel()
