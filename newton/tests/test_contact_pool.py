@@ -4,12 +4,14 @@
 """Tests for the growable rigid contact pool: policy, growth, overflow, capture, and its consumers."""
 
 import contextlib
+import gc
 import math
 import os
 import sys
 import time
 import unittest
 import warnings
+import weakref
 from unittest import mock
 
 import numpy as np
@@ -475,10 +477,13 @@ def test_pool_rows_keep_contents_and_fill_new_rows(test, device):
         # Virtual memory keeps addresses: the old view is a valid prefix of the new one.
         test.assertEqual(old_index.ptr, target.index.ptr)
     else:
-        # Ordinary arrays are reallocated; the superseded ones stay alive for stale graph replays.
         test.assertNotEqual(old_index.ptr, target.index.ptr)
-        test.assertTrue(any(array is old_index for array in rows._superseded))
+    # A reallocated array no graph captured lives as long as something references it, and no longer.
     np.testing.assert_array_equal(old_index.numpy(), np.arange(first))
+    superseded = weakref.ref(old_index)
+    del old_index
+    gc.collect()
+    test.assertIsNone(superseded())
     with test.assertRaisesRegex(MemoryError, "cannot back"):
         pool.grow(pool.bound + 1)
     test.assertEqual(pool.ready, held)
@@ -547,6 +552,58 @@ def test_reservation_holds_the_device_bound(test, device):
     test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 0)
     pipeline.collide(model.state(), contacts)
     test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), CONTACTS)
+
+
+def test_reallocation_releases_what_nothing_references(test, device):
+    """Grow ordinary-array rows on CUDA that nothing else references and no graph captured: the old arrays go back to
+    the allocator, so the memory a growth leaves allocated is the new rows', not both sets'."""
+    device = wp.get_device(device)
+    if not device.is_cuda or not device.is_mempool_enabled:
+        test.skipTest("the stream-ordered allocator's usage is read on CUDA")
+    with _without_gpu_components():
+        pool = ContactPool(device=device, rows=1 << 20)
+        rows = pool.rows(
+            (
+                ContactField("point", wp.vec3),
+                ContactField("key", wp.int64, 0, per_contact=2),
+                ContactField("slot", wp.int32, -1),
+            )
+        )
+        test.assertEqual(rows._mode, "realloc")
+        wp.synchronize_device(device)
+        used, held = wp.get_mempool_used_mem_current(device), rows.mapped_bytes()
+        pool.grow(4 << 20)
+        wp.synchronize_device(device)
+        grown = rows.mapped_bytes()
+        test.assertEqual(grown, 4 * held)
+        test.assertAlmostEqual(
+            wp.get_mempool_used_mem_current(device) - used, grown - held, delta=8 << 20, msg="the old arrays went"
+        )
+
+
+def test_superseded_rows_live_while_a_graph_captured_before_lives(test, device):
+    """Keep the arrays a reallocating growth replaced while a graph captured before it lives, whose stale replay (the
+    example runner replays its first graph once) still addresses them; let go of them once that graph is gone."""
+    with _without_gpu_components():
+        pool = ContactPool(device=device, rows=64)
+        rows = pool.rows((ContactField("value", wp.int32, -1),))
+        test.assertEqual(rows._mode, "realloc")
+        count = wp.zeros(1, dtype=wp.int32, device=device)
+        pool.record_demand(count, pool.ready_rows)  # load the module outside capture
+        with wp.ScopedCapture(device=device) as capture:
+            pool.record_demand(count, pool.ready_rows)
+        graph = capture.graph
+        del capture
+        replaced = weakref.ref(rows.views["value"])
+        test.assertTrue(pool.grow(4096))
+        gc.collect()
+        test.assertIsNotNone(replaced(), "a graph captured before the growth may replay the old array")
+        wp.capture_launch(graph)
+        wp.synchronize_device(device)
+        del graph
+        gc.collect()
+        pool.service()
+        test.assertIsNone(replaced(), "its graph is gone")
 
 
 def test_rows_fall_back_without_gpu_components(test, device):
@@ -2025,6 +2082,20 @@ add_function_test(
     TestContactPool,
     "test_rows_fall_back_without_gpu_components",
     test_rows_fall_back_without_gpu_components,
+    devices=cuda_devices,
+    check_output=False,
+)
+add_function_test(
+    TestContactPool,
+    "test_reallocation_releases_what_nothing_references",
+    test_reallocation_releases_what_nothing_references,
+    devices=cuda_devices,
+    check_output=False,
+)
+add_function_test(
+    TestContactPool,
+    "test_superseded_rows_live_while_a_graph_captured_before_lives",
+    test_superseded_rows_live_while_a_graph_captured_before_lives,
     devices=cuda_devices,
     check_output=False,
 )

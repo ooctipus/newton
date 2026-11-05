@@ -67,9 +67,12 @@ Storage:
   stream.
 * On the CPU, on CUDA without ``gpu_components`` (logged once), for fields with
   gradients and for rows created during a graph capture, rows are ordinary
-  arrays of the ready rows that growth reallocates, copying their prefix. The
-  superseded arrays stay alive, so a stale graph replay still addresses
-  allocated memory; graphs that captured them must be recaptured.
+  arrays of the ready rows that growth reallocates, copying their prefix. A
+  superseded array stays alive while a graph captured before the growth
+  lives, so a stale replay of it (the example runner replays its first graph
+  once before recapturing) still addresses allocated memory; once those graphs
+  are gone it goes with its last reference. Graphs that captured superseded
+  arrays must be recaptured.
 
 Counts: the collision pipeline's writers count every contact they find and
 drop the rows past :attr:`ContactPool.ready_rows`, which they read on the
@@ -602,8 +605,9 @@ class ContactRows:
         self.reserved: dict[str, wp.array] = {}
         self._on_rows = weakref.WeakMethod(on_rows) if hasattr(on_rows, "__self__") else on_rows
         self._storages = []
-        # Arrays a reallocating growth replaced; a stale graph replay may still address them.
-        self._superseded: list[wp.array] = []
+        # Arrays a reallocating growth replaced, with the graphs alive then (weakly): a stale replay of one of them
+        # may still address the arrays, which live until every such graph is gone (_prune_superseded).
+        self._superseded: list[tuple[tuple[weakref.ReferenceType, ...], list[wp.array]]] = []
         self._vm = _virtual_rows(self.device, self.fields)
         if self._vm is not None:
             self._mode = "virtual"
@@ -766,16 +770,26 @@ class ContactRows:
             field = members[0]
             fields_ops.resize_backing(storage, max(storage.ready_rows, field.per_contact * rows + field.extra))
 
-    def _publish_rows(self, rows):
+    def _prune_superseded(self) -> None:
+        """Let go of the superseded arrays whose graphs are all gone."""
+        self._superseded = [
+            (graphs, arrays) for graphs, arrays in self._superseded if any(graph() is not None for graph in graphs)
+        ]
+
+    def _publish_rows(self, rows, graphs=()):
         """Rebuild the views at ``rows`` rows after the storage holds them, then notify the owner.
 
-        Rows past the kept contact rows (new rows, second halves, extra rows) take their fill.
+        Rows past the kept contact rows (new rows, second halves, extra rows) take their fill. Reallocated rows keep
+        the arrays they replace while one of ``graphs`` (weak references to the live graphs that may address them)
+        lives.
         """
         previous = self.rows
         self.rows = rows
         if self._mode == "virtual":
             self._bind_virtual_views(min(previous, rows))
         else:
+            self._prune_superseded()
+            replaced = []
             for field in self.fields:
                 old = self.views[field.name]
                 array = wp.empty(
@@ -785,13 +799,17 @@ class ContactRows:
                     wp.copy(array, old, count=previous)
                 self._initialize(array, field, previous, array.shape[0])
                 self.views[field.name] = array
-                self._superseded.append(old)
+                replaced.append(old)
+            if graphs:
+                self._superseded.append((tuple(graphs), replaced))
             self.reserved = self.views
         _call(self._on_rows, self)
 
 
-def _grow_rows(members: list[ContactRows], rows: int) -> int:
+def _grow_rows(members: list[ContactRows], rows: int, graphs=()) -> int:
     """Bring every member's rows to at least ``rows`` and return the rows they all hold.
+
+    Reallocated rows keep what they replace while one of ``graphs`` (weak references to live graphs) lives.
 
     Virtual storage appends pages behind its fixed addresses without joining the
     GPU and holds every row its pages cover; the views are then published at the
@@ -809,7 +827,7 @@ def _grow_rows(members: list[ContactRows], rows: int) -> int:
         rows = min(member.covered_rows() for member in members)
         for member in members:
             if member.rows < rows:
-                member._publish_rows(rows)
+                member._publish_rows(rows, graphs)
         return rows
     members_to_publish, members = members, held
     device = members[0].device
@@ -847,7 +865,7 @@ def _grow_rows(members: list[ContactRows], rows: int) -> int:
     rows = max(rows, min(member.covered_rows() for member in members_to_publish))
     for member in members_to_publish:
         if member.rows < rows:
-            member._publish_rows(rows)
+            member._publish_rows(rows, graphs)
     return rows
 
 
@@ -1111,6 +1129,7 @@ class ContactPool:
         pools = self._closure()
         if all(pool.ready >= rows for pool in pools):
             return False
+        graphs = self._live_graphs()
         for pool in pools:
             if rows > pool.bound and pool.ready < rows:
                 raise MemoryError(
@@ -1124,7 +1143,7 @@ class ContactPool:
             # A trim not yet unmapped is dropped: growth publishes the withdrawn rows again.
             pool._trim = None
             # Virtual rows hold every row their pages cover, often more than asked for.
-            pool._publish_ready(_grow_rows(members, rows))
+            pool._publish_ready(_grow_rows(members, rows, graphs))
             pool.growth_count += 1
             pool._stale_on_growth |= any(not member.virtual for member in members)
         return self.needs_recapture
@@ -1146,6 +1165,15 @@ class ContactPool:
             pool._stale_on_growth or any(rows < pool.ready for rows in pool._unbound_captures.values())
             for pool in self._closure()
         )
+
+    def _live_graphs(self) -> tuple[weakref.ReferenceType, ...]:
+        """Return weak references to the live graphs that captured this pool's or its followers' rows: those that
+        recorded a collision pass or sized a launch by the host's rows."""
+        graphs = {}
+        for pool in self._closure():
+            for graph in (*pool._captured_passes.keys(), *pool._unbound_captures.keys()):
+                graphs[id(graph)] = weakref.ref(graph)
+        return tuple(graphs.values())
 
     def reserve(self, rows: int) -> bool:
         """Hold at least ``rows`` ready rows from now on, for a writer that produces its own contacts.
@@ -1479,6 +1507,8 @@ class ContactPool:
             offset, count = self._stale_status.pop()
             self._update_status[offset : offset + count].zero_()
         _release_retired(self.device)
+        for member in self._live_members():
+            member._prune_superseded()
         self._finish_trim()
         self.settle()
         self._hold_the_queue()
