@@ -58,6 +58,7 @@ from newton._src.sim.contacts import note_contact_frame_write
 from newton._src.solvers.feather_pgs import environment_flags as fpgs_flags
 from newton._src.solvers.feather_pgs import friction_patches, path_selection
 from newton._src.solvers.feather_pgs.friction_patches import (
+    _BUILD_FIELDS,
     FrictionPatches,
     _FrictionPatchState,
     _PatchFrame,
@@ -541,6 +542,8 @@ def assert_same_state(twin, patches, context="", records=True):
     """
     for frame in ("current", "previous"):
         for name in _PatchFrame.vars:
+            if frame == "previous" and name in _BUILD_FIELDS:
+                continue  # the stored frame holds no field only a build reads
             np.testing.assert_array_equal(
                 getattr(getattr(twin, frame), name).numpy(),
                 getattr(getattr(patches, frame), name).numpy(),

@@ -1059,6 +1059,10 @@ def _uses_live_sort(key_bits):
     return slot_keys_fit(key_bits)
 
 
+_BUILD_FIELDS = frozenset(("center", "radius", "support_gap_limit", "flipped", "source", "eligible"))
+"""Patch frame fields only a build reads: the stored frame (:attr:`_FrictionPatchState.previous`) holds none."""
+
+
 class _FrictionPatchState:
     """Own preallocated patch frames; never read device counters on the host.
 
@@ -1133,7 +1137,8 @@ class _FrictionPatchState:
         )
         self._current_rows = pool.rows(self._frame_fields(), on_rows=self._on_current_rows)
         self._previous_rows = pool.rows(
-            (*self._frame_fields(), ContactField("previous_world", wp.int32, -1)), on_rows=self._on_previous_rows
+            (*self._frame_fields(stored=True), ContactField("previous_world", wp.int32, -1)),
+            on_rows=self._on_previous_rows,
         )
         self.update_geometry(model)
         self.previous_q = wp.zeros(model.body_count, dtype=wp.transform, device=device)
@@ -1267,18 +1272,23 @@ class _FrictionPatchState:
         return token
 
     @staticmethod
-    def _frame_fields():
-        """Return the per-slot fields of a patch frame.
+    def _frame_fields(stored=False):
+        """Return the per-slot fields of a patch frame, or of the stored frame with ``stored``.
 
         Every slot starts as the empty record _prepare writes: the sentinel key,
         its own index, and no owner or source. Bounded launches never revisit
-        slots that still hold it. Keys and indices hold a second, scratch half
-        for the radix sort.
+        slots that still hold it. A built frame's keys and indices hold a second,
+        scratch half for the radix sort. The stored frame keeps what the next
+        build reads (_build_pair, _seed_contact; _store_contact writes it): one
+        key and index a slot, which no sort visits, and none of the fields only
+        a build reads (:data:`_BUILD_FIELDS`).
         """
+        halves = 1 if stored else 2
+        slack = 0 if stored else int(SORT_CHUNK)
         fields = [
             # One chunk of slack past the scratch half takes the live sort's padded tile stores.
-            ContactField("keys", wp.int64, 0x7FFFFFFFFFFFFFFF, per_contact=2, extra=int(SORT_CHUNK)),
-            ContactField("indices", wp.int32, None, per_contact=2, extra=int(SORT_CHUNK)),
+            ContactField("keys", wp.int64, 0x7FFFFFFFFFFFFFFF, per_contact=halves, extra=slack),
+            ContactField("indices", wp.int32, None, per_contact=halves, extra=slack),
             ContactField("mu", wp.vec2),
             ContactField("radius", wp.float32),
             ContactField("support_gap_limit", wp.float32),
@@ -1312,6 +1322,8 @@ class _FrictionPatchState:
                 "members",
             )
         ]
+        if stored:
+            fields = [field for field in fields if field.name not in _BUILD_FIELDS]
         return fields
 
     def build(
