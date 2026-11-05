@@ -318,11 +318,53 @@ class TestContactPoolPolicy(unittest.TestCase):
             pool.record_demand(wp.array([demand], dtype=wp.int32, device="cpu"), pool.ready_rows, beat=False)
             return pool.forecast
 
+        def rose():
+            return int(pool._high_water_host.numpy()[8])
+
         self.assertEqual(forecast(0, 4_000, 1_000), 4_000, "no contact yet: the worst case")
+        self.assertEqual(rose(), 0, "no share measured")
         self.assertEqual(forecast(250, 4_000, 1_000), 1_000, "a quarter of the worst case meets")
+        self.assertEqual(rose(), 2, "the first share measured is a rise")
         self.assertEqual(forecast(100, 8_000, 1_000), 2_000, "the largest share measured holds")
+        self.assertEqual(rose(), 2, "a smaller share is no rise")
+        self.assertEqual(forecast(275, 4_000, 1_000), 1_100, "a share within the band")
+        self.assertEqual(rose(), 2, "a rise within the band is no rise")
         self.assertEqual(forecast(900, 2_000, 600), 2_000, "never past the worst case")
+        self.assertEqual(rose(), 5, "a rise past the band")
         self.assertEqual(float(pool.forecast_share.numpy()[0]), 1.0)
+
+    def test_forecast_trims_the_rows_in_transit_once_its_share_holds(self):
+        """While the demand is in transit, trim to the measured forecast once its share held for a horizon of passes
+        and it asks for at most GROW_THRESHOLD of the rows; hold the rows before any share, and while it rises."""
+        pool = ContactPool(device="cpu")
+        pool.rows((ContactField("value", wp.int32, -1),))
+        pool.grow(100_000)
+        held = pool.ready
+        horizon = pool._horizon_passes()
+        trims = []
+        with (
+            mock.patch.object(ContactPool, "_trimmable", return_value=True),
+            mock.patch.object(ContactPool, "_trim_rows", lambda self, rows: rows),
+            mock.patch.object(ContactPool, "_begin_trim", lambda self, rows, kept: trims.append((rows, kept))),
+        ):
+
+            def consider(forecast, rose, passes=1_000, high_water=1_000):
+                pool._high_water_host.assign([high_water, high_water, passes, forecast, 0, 0, 0, 0, rose])
+                trims.clear()
+                pool._consider_trim()
+                return trims[:]
+
+            self.assertFalse(pool._settled)
+            self.assertEqual(consider(20_000, 0), [], "no share measured: the worst case holds")
+            self.assertEqual(consider(20_000, 1_000 - horizon + 1), [], "the share rose within the horizon")
+            kept = contact_pool.reserved_rows(20_000, pool.bound)
+            self.assertEqual(consider(20_000, 1_000 - horizon), [(kept, kept)], "the share held: trim to the forecast")
+            self.assertEqual(
+                consider(1_000, 1_000 - horizon, high_water=30_000),
+                [],
+                "the demand's headroom asks for more than the band",
+            )
+            self.assertEqual(consider(int(0.7 * held), 1_000 - horizon), [], "the forecast asks for more than the band")
 
     def test_dropped_contacts_are_counted_and_latch_their_world(self):
         """Count the contacts a pass that cannot grow drops, and the passes; a pass that runs again drops none."""

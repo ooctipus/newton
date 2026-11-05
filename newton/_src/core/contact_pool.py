@@ -32,8 +32,10 @@ forecast is the worst case itself. While the demand is in transit (no contact
 yet, or a high-water mark that rose past :data:`TRIM_BAND` within the last
 :data:`TRIM_AFTER_PASSES` passes) the service holds as many rows as the
 forecast, up to the model's shape-pair estimate
-(:attr:`ContactPool.forecast_limit`). Once the mark holds still the demand's
-:data:`HEADROOM` sizes the rows and a trim returns what the forecast held: on
+(:attr:`ContactPool.forecast_limit`), and trims to the forecast once its
+measured share held for a horizon (:meth:`ContactPool.service`). Once the mark
+holds still the demand's :data:`HEADROOM` sizes the rows and a trim returns
+what the forecast held: on
 a hand around a cube most pairs are within reach of each other at every pass,
 so a forecast held there would keep ten times the rows the demand needs. A state
 measured before a graph starts covers the first replay
@@ -338,9 +340,10 @@ def _fill_index(start: int, out: wp.array[wp.int32]):
     out[i] = wp.int32(i)
 
 
-RECORD_WORDS = 8
+RECORD_WORDS = 9
 """Words of a pool's pinned record: the high-water mark, the last pass's demand, the passes recorded, the forecast
-published last, the contacts dropped, the passes that dropped some, the last pass that dropped one, and the fill."""
+published last, the contacts dropped, the passes that dropped some, the last pass that dropped one, the fill, and the
+last pass whose measured share of the forecast's worst case rose past :data:`TRIM_BAND` (0 before any measured one)."""
 
 
 @wp.kernel(enable_backward=False)
@@ -381,6 +384,10 @@ def _record_demand(
             if demand > 0 and near > 0:
                 share = wp.max(share, wp.min(float(demand) / float(near), 1.0))
                 forecast_share[0] = share
+                # The share the last rise past the band started from: the forecast settles once it holds.
+                if share > (1.0 + TRIM_BAND) * forecast_share[1]:
+                    forecast_share[1] = share
+                    mirror[8] = passed
             total = reach
             if share >= 0.0:
                 total = wp.int64(wp.ceil(float(reach) * share))
@@ -904,8 +911,9 @@ class ContactPool:
         overlap now, summed by the broad phase of a forecast pass (int64, shape ``2 *`` :data:`FORECAST_SLOTS`, on the
         device; the record publishes and clears them)."""
         self.forecast_share = None
-        """The largest share of the pairs' worst case a forecasting pass found in its contacts (float32, shape 1, on
-        the device), which scales the forecast; negative until a pass with contacts measures it."""
+        """The largest share of the pairs' worst case a forecasting pass found in its contacts, which scales the
+        forecast, and the share its last rise past :data:`TRIM_BAND` started from (float32, shape 2, on the device);
+        negative until a pass with contacts measures it."""
         self.forecast_reach = None
         """The forecast's horizon [s] and the fall gravity adds over it [m] (vec2, shape 1, on the device)."""
         self.forecast_on = None
@@ -948,8 +956,9 @@ class ContactPool:
             # The record's running fill and drop counts, which it copies into the pinned record.
             self._tally = wp.zeros(3, dtype=wp.int32, device=self.device)
             self.forecast_slots = wp.zeros(2 * FORECAST_SLOTS, dtype=wp.int64, device=self.device)
-            # No share measured yet: the forecast is the pairs' worst case.
-            self.forecast_share = wp.full(1, -1.0, dtype=wp.float32, device=self.device)
+            # No share measured yet: the forecast is the pairs' worst case. Then the share, and where its last rise
+            # past TRIM_BAND started.
+            self.forecast_share = wp.full(2, -1.0, dtype=wp.float32, device=self.device)
             self.forecast_reach = wp.zeros(1, dtype=wp.vec2, device=self.device)
             # A pass forecasts once a host asks or the record's beat picks it.
             self.forecast_on = wp.zeros(1, dtype=wp.int32, device=self.device)
@@ -1454,8 +1463,11 @@ class ContactPool:
         The replays the host may run ahead, the replay read from and the one launched next, plus the passes from
         one forecast to the next, and the forecasting pass itself.
         """
-        replays = FORECAST_QUEUE + 2
-        return (replays * max(self._captured_passes.values(), default=1) + FORECAST_PASSES + 1) * self._pass_dt
+        return self._horizon_passes() * self._pass_dt
+
+    def _horizon_passes(self) -> int:
+        """Return the collision passes the forecast must look ahead (:meth:`horizon`)."""
+        return (FORECAST_QUEUE + 2) * max(self._captured_passes.values(), default=1) + FORECAST_PASSES + 1
 
     def publish_reach(self, gravity: float | None = None) -> None:
         """Publish the forecast's horizon and the fall gravity adds over it, outside capture, when they changed.
@@ -1492,7 +1504,12 @@ class ContactPool:
         Whenever the mark holds still, without a growth, the service trims the rows to :data:`HEADROOM`
         rows per contact of the mark, at least :data:`MIN_READY_ROWS`, a
         reservation and the rows of any graph that sized work by the host's
-        rows, in whole granules: it lowers the ready rows in stream order on every
+        rows, in whole granules. While the demand is in transit it trims to the
+        forecast as well, once the share of the worst case the forecast measures
+        has held within :data:`TRIM_BAND` for a horizon of passes and the rows it
+        asks for are at most :data:`GROW_THRESHOLD` of those held: a state
+        measured before any contact holds the worst case only until the
+        contacts tell the share. A trim lowers the ready rows in stream order on every
         reader stream (:meth:`add_reader_stream`) and unmaps the pages past them in
         a later call, once the work each of those streams submitted before has
         completed. Graphs keep replaying meanwhile, and need no recapture. Only
@@ -1594,12 +1611,30 @@ class ContactPool:
         granule = int(owner.granularity_bytes)
         return min(self.ready, *(member.covered_at(rows, granule) for member in members))
 
+    def _forecast_held(self) -> bool:
+        """Whether the forecast's measured share held within :data:`TRIM_BAND` for a horizon of recorded passes: the
+        forecast then bounds the replays the service lags behind with the share their contacts make."""
+        if self._high_water_host is None:
+            return False
+        rose = int(self._high_water_host.numpy()[8])
+        return rose > 0 and self.recorded_passes - rose >= self._horizon_passes()
+
     def _consider_trim(self) -> None:
         """Trim to the demand's headroom once the high-water mark held still and the demand settled
-        (:meth:`_watch`)."""
-        if not (self._held and self._settled) or not self._trimmable():
+        (:meth:`_watch`); while it is in transit, to the measured forecast once its share held for a horizon and it
+        asks for no more than :data:`GROW_THRESHOLD` of the rows (the band growth leaves the demand)."""
+        if not self._trimmable():
             return
         kept = self._kept_rows(self.high_water)
+        if self._settled:
+            if not self._held:
+                return
+        else:
+            if not self._forecast_held():
+                return
+            kept = max(kept, reserved_rows(self.forecast, self.bound))
+            if kept > GROW_THRESHOLD * self.ready:
+                return
         rows = self._trim_rows(kept)
         if rows < self.ready:
             self._begin_trim(rows, kept)
