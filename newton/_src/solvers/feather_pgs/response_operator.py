@@ -106,6 +106,15 @@ class Velocity:
         return f"{self.array}[{index}]"
 
 
+@dataclass(frozen=True)
+class LaneVelocity(Velocity):
+    """The velocity in a register a lane: lane ``l`` holds coordinate ``l`` (dense rows, whose entry ``l`` is at
+    coordinate ``l``), so a lane reads and updates its own entry's coordinate in its register ``array``."""
+
+    def at(self, index: str) -> str:
+        return self.array
+
+
 class ResponseOperator:
     """A row response representation: residual, coupling and apply, emitted per row.
 
@@ -1146,131 +1155,6 @@ class SparsePairZ(ResponseOperator):
 
 
 @dataclass(frozen=True)
-class FactorComponent:
-    """One diagonal block of a block-diagonal factor: ``size`` coordinates from lane ``offset``.
-
-    ``lane`` is this lane's coordinate in the block (``LANE - offset``, out of range on other lanes). A lane's coordinate
-    is a physical position: factor coordinate ``i`` sits on lane ``size - 1 - i`` (:func:`leaf_first`).
-    """
-
-    size: int
-    offset: str
-    lane: str
-
-
-@dataclass(frozen=True)
-class FactorRows(ResponseOperator):
-    """Rows in factor coordinates: ``Z = L^-1 J^T`` over ``dofs`` coordinates (at most a warp), one lane each.
-
-    With ``H = L L^T`` and the velocity change ``u = L^T dv``, a row's velocity
-    term is ``J_i dv = Z_i u`` and its response ``u += Z_i delta``: one row array
-    (``rows``, row ``i`` from ``base + i * dofs``) is both. Lane ``l`` holds
-    coordinate ``l`` of ``u`` in the register ``velocity``, and of the rows it
-    acts on in registers: the current row's (``current``), its friction
-    sibling's (``sibling``) and, under contact torsion, its contact's spin
-    row's (``spin``), which the schedule loads (:meth:`load`, or the pipeline
-    :meth:`prefetch` and :meth:`consume`). A sum is one product per
-    lane (zero past ``dofs``) reduced with ``SUM``; a pair's sums reduce in one
-    ladder (:meth:`pair_terms`). ``components``, the diagonal blocks of ``L``,
-    map the velocity change back out of factor coordinates (:meth:`leave`).
-    """
-
-    dofs: int
-    components: tuple[FactorComponent, ...] = ()
-    lanes: Lanes = Lanes()
-    rows: str = "factor_rows"
-    base: str = "row_base"
-    velocity: str = "factor_velocity"
-    current: str = "row_z"
-    sibling: str = "sibling_z"
-    spin: str = "spin_z"
-    name = "factor_rows"
-
-    def load(self, row: str) -> str:
-        """This lane's coordinate of row ``row`` (zero past ``dofs``)."""
-        lane = self.lanes.lane
-        return f"{lane} < {self.dofs} ? {self.rows}.data[{self.base} + ({row}) * {self.dofs} + {lane}] : 0.0f"
-
-    def prefetch(self, first: str, indent: str) -> str:
-        """Declare the pipeline register ``pre_z`` holding row ``first``."""
-        return f"{indent}float pre_z = {self.load(first)};"
-
-    def consume(self, row: str, end: str, indent: str) -> str:
-        """Take row ``row`` from the pipeline (``current``) and load row ``row + 1``'s (before ``end``)."""
-        lane = self.lanes.lane
-        return (
-            f"{indent}const float {self.current} = pre_z;\n"
-            f"{indent}if ({row} + 1 < {end} && {lane} < {self.dofs})\n"
-            f"{indent}    pre_z = {self.rows}.data[{self.base} + ({row} + 1) * {self.dofs} + {lane}];"
-        )
-
-    def _product(self, out: str, a: str, b: str) -> str:
-        return f"float {out} = {self.lanes.lane} < {self.dofs} ? {a} * {b} : 0.0f;"
-
-    def _sums(self, channels, indent: str, *, magnitudes: tuple[str, ...] = ()) -> str:
-        """Reduce each channel ``(out, a, b)``'s products in one ladder; a velocity sum (``b`` the velocity), and each
-        channel named in ``magnitudes``, reduces its terms' magnitude beside it, ``{out}_terms`` (:meth:`terms`)."""
-        lines, names = [], []
-        for out, a, b in channels:
-            lines.append(f"{indent}{self._product(out, a, b)}")
-            names.append(out)
-            if b == self.velocity or out in magnitudes:
-                lines.append(f"{indent}float {out}_terms = fabsf({out});")
-                names.append(f"{out}_terms")
-        return "\n".join([*lines, f"{indent}{self.lanes.reduce(*names)}"])
-
-    def terms(self, out: str, rhs: str, *, whole: bool) -> str:
-        """``sum_k |Z_ik u_k|`` of a velocity sum reduced into ``out``, reduced beside it."""
-        return f"{out}_terms"
-
-    def residual(self, out: str, indent: str) -> str:
-        """``float out = Z_i u`` of the current row, and ``{out}_terms``."""
-        return self._sums(((out, self.current, self.velocity),), indent)
-
-    def sibling_residual(self, out: str, sibling: str, indent: str, rhs: str) -> str:
-        """``float out = Z_s u + rhs`` of the friction sibling (its entries in the ``sibling`` register)."""
-        return f"{self._sums(((out, self.sibling, self.velocity),), indent)}\n{indent}{out} += {rhs};"
-
-    def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
-        """``float out = Z_i Z_s``, the pair's off-diagonal entry."""
-        return self._sums(((out, self.current, self.sibling),), indent)
-
-    def pair_terms(self, row: str, sibling: str, rhs: Callable[[str], str], indent: str, *, own: bool = False) -> str:
-        """The pair's sums in one ladder: the row's residual (with ``own``), the sibling's, then the coupling."""
-        channels = [("residual", self.current, self.velocity)] if own else []
-        channels += [("sibling_residual", self.sibling, self.velocity), ("cross", self.current, self.sibling)]
-        lines = [self._sums(channels, indent)]
-        if own:
-            lines.append(f"{indent}residual += {rhs(row)};")
-        lines.append(f"{indent}sibling_residual += {rhs(sibling)};")
-        return "\n".join(lines)
-
-    def spin_terms(self, row: str, sibling: str, spin: str, rhs: Callable[[str], str], indent: str) -> str:
-        """The spin row's sums in one ladder (its entries in the ``spin`` register): its residual, then its couplings
-        with the current row and the sibling."""
-        channels = (
-            ("spin_residual", self.spin, self.velocity),
-            ("spin_cross", self.current, self.spin),
-            ("spin_cross_sibling", self.sibling, self.spin),
-        )
-        return f"{self._sums(channels, indent)}\n{indent}spin_residual += {rhs(spin)};"
-
-    def apply(self, delta: str, indent: str) -> str:
-        """``u += Z_i delta`` of the current row (lanes past ``dofs`` add zero)."""
-        return f"\n{indent}{self.velocity} += {self.current} * {delta};"
-
-    def apply_row(self, row: str, delta: str, indent: str) -> str:
-        """``u += Z_s delta`` of the friction sibling ``row`` (its entries in the ``sibling`` register), or of the spin
-        row (``spin``, in the ``spin`` register)."""
-        register = self.spin if row == "spin" else self.sibling
-        return f"\n{indent}{self.velocity} += {register} * {delta};"
-
-    def lanes_of(self, indent: str) -> list[str]:
-        """Lines declaring each component's lane (``LANE - offset``)."""
-        return [f"{indent}const int {c.lane} = {self.lanes.lane} - {c.offset};" for c in self.components]
-
-
-@dataclass(frozen=True)
 class SparseFactor(ResponseOperator):
     """Rows of ``Z = L^-1 P J^T`` as packed factor rows, acting on the factor-coordinate velocity delta.
 
@@ -1296,6 +1180,11 @@ class SparseFactor(ResponseOperator):
     dense: int = 0
     local: str = "s_local_factor"
     velocity: Velocity = Velocity("s_delta")
+    registers: bool = False
+    """``Z``'s place: each row the visit acts on is in a register the schedule loaded, ``factor(name, entry)`` of its
+    name in the visit (``row``, ``sib``, ``spin``, a unit's rows), instead of in memory at its index."""
+    magnitudes: bool = False
+    """Each velocity sum also reduces its terms' magnitude, which the exit law's vote reads (:meth:`terms`)."""
     name = "sparse_factor"
     fused_pair_apply = True
 
@@ -1336,6 +1225,11 @@ class SparseFactor(ResponseOperator):
 
     # -- the two actions ----------------------------------------------------------------------------------------------
 
+    def _entry(self, name: str, rows: dict[str, str]) -> str:
+        """Row ``name``'s value at this lane's entry ``q``: its register (``registers``, by its name), or what a
+        :meth:`dot` kept (``z_{name}``)."""
+        return self.factor(name, "entry") if self.registers else f"z_{name}[q]"
+
     def dot(
         self,
         sums: tuple[tuple[str, str, str | None], ...],
@@ -1345,33 +1239,45 @@ class SparseFactor(ResponseOperator):
         exists: dict[str, str] | None = None,
         kept: tuple[str, ...] = (),
         keep_velocity: bool = False,
+        magnitudes: tuple[str, ...] = (),
         reduce: bool = True,
     ) -> str:
         """``float out = Z_row . other`` for each ``(out, row, other)`` of ``sums`` (``other`` ``None`` for the velocity,
         else a row: a Gram entry), over the rows' shared support, reduced in one ladder (every lane holds them).
 
         ``rows`` names each row (its index expression, the first the support's); a row of ``exists`` is zero where its
-        condition fails. The support stays in ``indices`` and each row's entries in ``{name}_z`` (with
-        ``keep_velocity`` the velocity there in ``velocities``, at the support's entries) for :meth:`axpy`. The rows of ``kept`` were kept by
-        an earlier ``dot`` on the same support: their entries and the support are read again, not loaded. Without
-        ``reduce`` the sums accumulate this lane's entries into ``out``, declared before, in order.
+        condition fails. The support stays in ``indices`` and each row's entries in ``z_{name}`` (with
+        ``keep_velocity`` the velocity there in ``velocities``, at the support's entries) for :meth:`axpy`; rows held
+        in ``registers`` are read there. The rows of ``kept`` were kept by an earlier ``dot`` on the same support:
+        their entries and the support are read again, not loaded. Each velocity sum of an operator with
+        ``magnitudes``, and each sum ``magnitudes`` names, also reduces its terms' magnitude ``{out}_terms`` beside
+        it (:meth:`terms`). Without ``reduce`` the sums accumulate this lane's entries into ``out``, declared before,
+        in order.
         """
         exists = exists or {}
         count, names = self.entries, list(rows)
-        loaded = [name for name in names if name not in kept]
+        kept = () if self.registers else kept
+        loaded = [] if self.registers else [name for name in names if name not in kept]
         reads = any(other is None for _, _, other in sums)
-        lines = [] if kept else [f"int indices[{count}];"]
-        lines += [f"float {name}_z[{count}];" for name in loaded]
+        outs = []
+        for out, _, other in sums:
+            outs.append(out)
+            if (other is None and self.magnitudes) or out in magnitudes:
+                outs.append(f"{out}_terms")
+        keep_support = not (kept or self.registers)
+        lines = [f"int indices[{count}];"] if keep_support else []
+        lines += [f"float z_{name}[{count}];" for name in loaded]
         if keep_velocity:
             lines.append(f"float velocities[{count}];")
         if reduce:
-            lines.append(f"float {', '.join(f'{out} = 0.0f' for out, _, _ in sums)};")
+            lines.append(f"float {', '.join(f'{out} = 0.0f' for out in outs)};")
         if kept:
             body = ["const int index = indices[q];"]
         else:
-            body = [f"const int index = {self.guarded_coordinate(rows[names[0]])};", "indices[q] = index;"]
+            body = [f"const int index = {self.guarded_coordinate(rows[names[0]])};"]
+            body += ["indices[q] = index;"] if keep_support else []
         body += [
-            f"{name}_z[q] = {f'{exists[name]} && ' if name in exists else ''}index >= 0 ? "
+            f"z_{name}[q] = {f'{exists[name]} && ' if name in exists else ''}index >= 0 ? "
             f"{self.element(rows[name])} : 0.0f;"
             for name in loaded
         ]
@@ -1379,39 +1285,46 @@ class SparseFactor(ResponseOperator):
         guarded = [f"const float velocity = {self.velocity.at('index')};"] if reads else []
         if keep_velocity:
             guarded.append("velocities[q] = velocity;")
-        guarded += [
-            f"{out} += {row}_z[q] * {'velocity' if other is None else f'{other}_z[q]'};" for out, row, other in sums
-        ]
+        for out, row, other in sums:
+            product = f"{self._entry(row, rows)} * {'velocity' if other is None else self._entry(other, rows)}"
+            guarded.append(f"{out} += {product};")
+            if f"{out}_terms" in outs:
+                guarded.append(f"{out}_terms += fabsf({product});")
         body += ["if (index >= 0) {", *("    " + line for line in guarded), "}"]
         text = "\n".join(indent + line for line in lines) + "\n" + self.entries_loop("\n".join(body), indent)
-        reduced = self.lanes.reduce(*(out for out, _, _ in sums)) if reduce else ""
+        reduced = self.lanes.reduce(*outs) if reduce else ""
         return text + "".join(f"\n{indent}{line}" for line in reduced.split("\n") if line)
 
     def axpy(
         self, changes: tuple[tuple[str, str], ...], indent: str, *, row: str | None = None, kept: bool = False
     ) -> str:
-        """``delta_v += sum_k Z_k d_k`` over the ``(name, d)`` of ``changes``, from the entries a :meth:`dot` kept: one
-        change adds in place; several read the velocity once (the one a ``dot`` kept with ``kept``), add each nonzero
-        change in the order given and write it back once. With ``row`` (one change) the row's entries are read here."""
-        target = self.velocity.at("indices[q]")
-        if row is not None:
-            ((_, delta),) = changes
-            body = (
-                f"const int index = {self.guarded_coordinate(row)};\n"
-                f"if (index >= 0) {self.velocity.at('index')} += {self.element(row)} * {delta};"
-            )
-            return self.entries_loop(body, indent)
+        """``delta_v += sum_k Z_k d_k`` over the ``(name, d)`` of ``changes``, from the entries a :meth:`dot` kept, or
+        their registers: one change adds in place; several read the velocity once (the one a ``dot`` kept with
+        ``kept``), add each nonzero change in the order given and write it back once. With ``row`` (one change) the
+        row's entries are read here."""
+        if row is not None or self.registers:
+            first = row if row is not None else changes[0][0]
+            entries = {
+                name: self.element(row) if row is not None else self.factor(name, "entry") for name, _ in changes
+            }
+            head, guard = [f"const int index = {self.guarded_coordinate(first)};"], "index"
+        else:
+            entries = {name: f"z_{name}[q]" for name, _ in changes}
+            head, guard = [], "indices[q]"
+        target = self.velocity.at(guard)
         if len(changes) == 1:
             ((name, delta),) = changes
-            return self.entries_loop(f"if (indices[q] >= 0) {target} += {name}_z[q] * {delta};", indent, entry=False)
-        body = [
-            "if (indices[q] >= 0) {",
-            f"    float value = {'velocities[q]' if kept else target};",
-            *(f"    if ({delta} != 0.0f) value += {name}_z[q] * {delta};" for name, delta in changes),
-            f"    {target} = value;",
-            "}",
-        ]
-        return self.entries_loop("\n".join(body), indent, entry=False)
+            body = [*head, f"if ({guard} >= 0) {target} += {entries[name]} * {delta};"]
+        else:
+            body = [
+                *head,
+                f"if ({guard} >= 0) {{",
+                f"    float value = {'velocities[q]' if kept else target};",
+                *(f"    if ({delta} != 0.0f) value += {entries[name]} * {delta};" for name, delta in changes),
+                f"    {target} = value;",
+                "}",
+            ]
+        return self.entries_loop("\n".join(body), indent, entry=bool(head))
 
     # -- the row law's actions, as the two ------------------------------------------------------------------------
 
@@ -1435,13 +1348,39 @@ class SparseFactor(ResponseOperator):
         sums = ((out, "row", None), ("sibling_jv", "sib", None), ("pair_coupling", "row", "sib"))
         return self.dot(sums, {"row": row, "sib": sibling}, indent, exists={"sib": paired})
 
+    def terms(self, out: str, rhs: str, *, whole: bool) -> str:
+        """``sum_k |Z_k u_k|`` of a velocity sum reduced into ``out``, reduced beside it (``magnitudes``)."""
+        return f"{out}_terms" if self.magnitudes else super().terms(out, rhs, whole=whole)
+
     def sibling_residual(self, out: str, sibling: str, indent: str, rhs: str) -> str:
-        """``float out = Z_s . delta + rhs`` of the pair's second tangent, whose sum :meth:`residual` reduced."""
+        """``float out = Z_s . delta + rhs`` of the pair's second tangent, whose sum :meth:`residual` reduced (rows in
+        memory), or its own (rows in registers)."""
+        if self.registers:
+            return f"{self.dot(((out, 'sib', None),), {'sib': sibling}, indent)}\n{indent}{out} += {rhs};"
         return f"{indent}float {out} = sibling_jv;\n{indent}{out} += {rhs};"
 
     def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
-        """``float out = Z_t . Z_s``: the pair's off-diagonal entry, which :meth:`residual` reduced."""
+        """``float out = Z_t . Z_s``: the pair's off-diagonal entry, which :meth:`residual` reduced (rows in memory),
+        or its own (rows in registers)."""
+        if self.registers:
+            return self.dot(((out, "row", "sib"),), {"row": row, "sib": sibling}, indent)
         return f"{indent}float {out} = pair_coupling;"
+
+    def pair_terms(self, row: str, sibling: str, rhs: Callable[[str], str], indent: str, *, own: bool = False) -> str:
+        """The pair's terms. Rows in memory: the visit's residual reduced them with its own, on the support's one load
+        (:meth:`residual`). Rows in registers: the pair's sums in one ladder of their own, the row's residual first
+        with ``own``."""
+        if not self.registers:
+            return super().pair_terms(row, sibling, rhs, indent, own=own)
+        sums = ((("residual", "row", None),) if own else ()) + (
+            ("sibling_residual", "sib", None),
+            ("cross", "row", "sib"),
+        )
+        lines = [self.dot(sums, {"row": row, "sib": sibling}, indent)]
+        if own:
+            lines.append(f"{indent}residual += {rhs(row)};")
+        lines.append(f"{indent}sibling_residual += {rhs(sibling)};")
+        return "\n".join(lines)
 
     def spin_terms(self, row: str, sibling: str, spin: str, rhs: Callable[[str], str], indent: str) -> str:
         """The spin row's residual and its couplings with the pair, reduced in one ladder on the support and entries

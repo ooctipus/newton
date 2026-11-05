@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 
 from newton._src.solvers.feather_pgs import sweep_routes_local
-from newton._src.solvers.feather_pgs.response_operator import FactorComponent, FactorRows, Lanes
+from newton._src.solvers.feather_pgs.response_operator import Lanes
 from newton._src.solvers.feather_pgs.solve_policy import DEFAULT_POLICY, SolvePolicy
 
 _PAIRED = sweep_routes_local.paired_factor_kernel.__wrapped__
@@ -109,21 +109,22 @@ class TestPairedFactorRoute(unittest.TestCase):
 
 
 class TestResponseOperators(unittest.TestCase):
-    """The operator the paired route adds: the factor-coordinate rows."""
+    """The paired route's rows: dense packed rows (``SparseFactor``) held in registers, ``u`` in a register a lane."""
 
-    def test_factor_rows_fuse_a_pair_ladder(self):
-        rows = FactorRows(23, (FactorComponent(17, "o", "l"),), Lanes(32))
+    def test_register_rows_fuse_a_pair_ladder(self):
+        rows = sweep_routes_local._rows(23, Lanes(32))
         rhs = lambda r: f"s_rhs[{r}]"  # noqa: E731
         fused = rows.pair_terms("i", "sib", rhs, "", own=True)
         self.assertIn("SUM(residual, residual_terms, sibling_residual, sibling_residual_terms, cross);", fused)
-        self.assertIn("float residual_terms = fabsf(residual);", fused)
+        self.assertIn("residual_terms += fabsf(row_z * velocity);", fused)
+        self.assertIn("const float velocity = factor_velocity;", fused)
+        self.assertNotIn("indices", fused)
         self.assertEqual(rows.terms("residual", "s_rhs[i]", whole=True), "residual_terms")
         self.assertIn("residual += s_rhs[i];", fused)
-        self.assertIn("factor_velocity += row_z * d;", rows.apply("d", ""))
-        self.assertIn("factor_velocity += sibling_z * d;", rows.apply_row("sib", "d", ""))
-        self.assertIn("const int l = lane - o;", rows.lanes_of("")[0])
-        # No leave on the lanes: the change goes to the step's one leave.
-        self.assertFalse(hasattr(rows, "leave"))
+        self.assertIn("if (index >= 0) factor_velocity += row_z * d;", rows.apply("d", ""))
+        self.assertIn("if (index >= 0) factor_velocity += spin_z * d;", rows.apply_row("spin", "d", ""))
+        pair = rows.apply_pair("sd", "d", "")
+        self.assertLess(pair.index("value += sibling_z * sd;"), pair.index("value += row_z * d;"))
 
 
 def _kernel_sass():

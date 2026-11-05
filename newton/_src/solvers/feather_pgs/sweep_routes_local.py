@@ -4,7 +4,8 @@
 """The paired factor sweep (case K5) as a configuration of the sweep emitter (:mod:`.sweep`).
 
 :func:`paired_factor_kernel`: one warp per world of an articulation and a free body, rows in factor coordinates
-(:class:`.response_operator.FactorRows`) on the velocity change from the predictor, which leaves per component, under
+(:class:`.response_operator.SparseFactor`, dense, in registers) on the velocity change from the predictor, which leaves
+per component, under
 one of two schedules: row by row, or contact units. Its working set fits the static
 budget of the device it is built for (:func:`.memory.arch_budget`).
 """
@@ -23,7 +24,7 @@ from .factor.walk import WalkTrees
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
 from .projection_laws import CONE_LAW, PROJECTION_LAW
-from .response_operator import FactorComponent, FactorRows, Lanes
+from .response_operator import Lanes, LaneVelocity, SparseFactor
 from .row_inputs import RowArgument
 from .solve_policy import DEFAULT_POLICY, SolvePolicy
 from .sweep import (
@@ -79,6 +80,47 @@ PAIRED_FACTOR_ABI = kernel_template.params(
 
 _PAIRED_WORLDS_PER_BLOCK = 2
 
+_ROWS = "factor_rows"
+"""The world's rows in factor coordinates: row ``i``'s ``D`` entries from ``row_base + i * D``."""
+
+
+def _registers(**rows: str):
+    """The rows' entries a visit acts on, by name, in the registers the schedule loaded them into (``SparseFactor``'s
+    ``factor`` with ``registers``)."""
+    return lambda name, entry: rows[name]
+
+
+def _rows(dofs: int, lanes: Lanes) -> SparseFactor:
+    """The paired rows: dense (entry ``l`` at coordinate ``l``, at most a warp), the visited row in ``row_z``, its
+    friction sibling in ``sibling_z`` and its contact's spin row in ``spin_z``, ``u`` in ``factor_velocity``; each
+    velocity sum reduces its terms' magnitude beside it."""
+    return SparseFactor(
+        dofs,
+        lambda row, entry: entry,
+        _registers(row="row_z", sib="sibling_z", spin="spin_z"),
+        lanes,
+        velocity=LaneVelocity("factor_velocity"),
+        registers=True,
+        magnitudes=True,
+    )
+
+
+def _load(op: SparseFactor, row: str) -> str:
+    """This lane's entry of row ``row`` (zero past the rows' coordinates)."""
+    lane, D = op.lanes.lane, op.support
+    return f"{lane} < {D} ? {_ROWS}.data[row_base + ({row}) * {D} + {lane}] : 0.0f"
+
+
+def _consume(op: SparseFactor, row: str, end: str, indent: str) -> str:
+    """Take row ``row``'s entry from the pipeline register ``pre_z`` (``row_z``) and load row ``row + 1``'s (before
+    ``end``)."""
+    lane, D = op.lanes.lane, op.support
+    return (
+        f"{indent}const float row_z = pre_z;\n"
+        f"{indent}if ({row} + 1 < {end} && {lane} < {D})\n"
+        f"{indent}    pre_z = {_ROWS}.data[row_base + ({row} + 1) * {D} + {lane}];"
+    )
+
 
 def paired_factor_source(
     max_constraints: int,
@@ -95,8 +137,10 @@ def paired_factor_source(
     pitch: int | None = None,
 ) -> tuple[str, Staging]:
     """The native body of the paired factor sweep: a world's rows in the factor coordinates of its articulation and
-    free body (:class:`.FactorRows`), a warp per world, the velocity change from the predictor, ``u = L^T dv``, from
-    zero in a register per lane.
+    free body, a warp per world, the velocity change from the predictor, ``u = L^T dv``, from zero in a register per
+    lane: dense rows of ``Z = L^-1 J^T`` (:class:`.SparseFactor`, entry ``l`` at coordinate ``l``), lane ``l`` holding
+    coordinate ``l`` of ``u`` and of the rows it acts on, which the schedule loads into registers (:func:`_load`, or
+    the pipeline of :func:`_consume`).
     Under ``torsion`` a friction pair may have its contact's spin row after it (:func:`.sweep.spin_row`): such a
     contact is four rows, its normal and its friction triple visited one by one, the triple from its metric cached
     for the launch (:func:`.sweep.friction_metric_law`).
@@ -121,14 +165,7 @@ def paired_factor_source(
         raise ValueError("paired factor PGS requires two positive components spanning at most 32 world DOFs")
     lanes = Lanes(32)
     laws = RowLaws(regularize=weighted, material=material, torsion=torsion, policy=solve_policy)
-    op = FactorRows(
-        D,
-        (
-            FactorComponent(P, "primary_offset", "primary_lane"),
-            FactorComponent(S, "secondary_offset", "secondary_lane"),
-        ),
-        lanes,
-    )
+    op = _rows(D, lanes)
     staging = Staging(
         (
             Buffer("s_lam", "float", M),
@@ -191,7 +228,7 @@ def paired_factor_source(
     leave = f"""    for (int i = lane; i < m; i += 32) world_impulses.data[off + i] = s_lam[i];
     // The velocity change in the walk's coordinates, each lane's coordinate, to the step's one leave
     // (tree_factor.walk_leave_kernel), which walks each component's tree down in the rows' frame.
-    if ({write}) walk.du.data[global_dof] += {op.velocity};"""
+    if ({write}) walk.du.data[global_dof] += {op.velocity.array};"""
     body = f"""{staging.declarations("    ")}
     const int lane = LANE;
     int m = world_constraint_count.data[world];
@@ -217,8 +254,10 @@ def paired_factor_source(
     }}
     // The velocity change in factor coordinates per component, coordinate LANE in this lane's register.
     const int global_dof = lane < {D} ? world_dof_indices.data[dof_map_base + lane] : -1;
-{chr(10).join(op.lanes_of("    "))}
-    float {op.velocity} = 0.0f;
+    // Each component's lane: this lane's coordinate in it (out of range on other lanes).
+    const int primary_lane = lane - primary_offset;
+    const int secondary_lane = lane - secondary_offset;
+    float {op.velocity.array} = 0.0f;
     SYNC();
 {metric}
     for (int iter = 0; iter < iterations; ++iter) {{
@@ -245,14 +284,14 @@ def _paired_rows(ctx: RowContext, laws: RowLaws, end: str) -> str:
     """Rows ``[0, end)`` one at a time in slot order, each row's factor row pipelined; a friction pair at its first
     tangent, its sibling's factor row loaded with the pair."""
     op = ctx.operator
-    sibling = f"const float {op.sibling} = row_type == {FRICTION} ? ({op.load('parent + 2')}) : 0.0f;\n"
+    sibling = f"const float sibling_z = row_type == {FRICTION} ? ({_load(op, 'parent + 2')}) : 0.0f;\n"
     if laws.torsion:
         # The pair's contact's spin row if it has one (the visit's ``spin``), solved with it (the friction triple).
-        sibling += f"const float {op.spin} = row_type == {FRICTION} && spin >= 0 ? ({op.load('spin')}) : 0.0f;\n"
+        sibling += f"const float spin_z = row_type == {FRICTION} && spin >= 0 ? ({_load(op, 'spin')}) : 0.0f;\n"
     lines = [
-        op.prefetch("0", ""),
+        f"float pre_z = {_load(op, '0')};",
         f"for (int i = 0; i < {end}; ++i) {{",
-        op.consume("i", end, "    "),
+        _consume(op, "i", end, "    "),
         "    const int row_type = static_cast<int>(s_type[i]);",
         f"    if (row_type == {TORSION}) continue;" if laws.torsion else "",
         row_visit(
@@ -285,14 +324,18 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
     (:func:`.sweep.friction_metric_law`), as on every sweep that solves a contact's rows one by one.
     """
     op = ctx.operator
-    velocity = op.velocity
-    channels = (
-        ("unit_jv0", "row_z", velocity),
-        ("unit_jv1", "tangent1_z", velocity),
-        ("unit_jv2", "tangent2_z", velocity),
-        ("gram_n1", "row_z", "tangent1_z"),
-        ("gram_n2", "row_z", "tangent2_z"),
-        ("unit_cross", "tangent1_z", "tangent2_z"),
+    velocity = op.velocity.array
+    sums = (
+        ("unit_jv0", "row", None),
+        ("unit_jv1", "tangent1", None),
+        ("unit_jv2", "tangent2", None),
+        ("gram_n1", "row", "tangent1"),
+        ("gram_n2", "row", "tangent2"),
+        ("unit_cross", "tangent1", "tangent2"),
+    )
+    unit_op = dataclasses.replace(op, factor=_registers(row="row_z", tangent1="tangent1_z", tangent2="tangent2_z"))
+    unit_ladder = unit_op.dot(
+        sums, {"row": "head", "tangent1": "head + 1", "tangent2": "head + 2"}, "    ", magnitudes=("gram_n1", "gram_n2")
     )
     rows = dataclasses.replace(ctx, kind="unit_type", mu=lambda row: mu, inline_velocity_limit=False)
     declare = (
@@ -309,15 +352,15 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
 
     impulses, *staged = UNIT_HELD
     lines = [
-        f"const float row_z = {op.load('head')};",
-        f"const float tangent1_z = {op.load('head + 1')};",
-        f"const float tangent2_z = {op.load('head + 2')};",
+        f"const float row_z = {_load(op, 'head')};",
+        f"const float tangent1_z = {_load(op, 'head + 1')};",
+        f"const float tangent2_z = {_load(op, 'head + 2')};",
         unit_held_loads(unit_ctx, impulses, "head", ""),
         "if (unit_lam0 != 0.0f || unit_lam1 != 0.0f || unit_lam2 != 0.0f) {",
         *(unit_held_loads(unit_ctx, name, "head", "    ") for name in staged),
         "    // The unit's velocity terms, the pair's Gram couplings with the normal and their magnitudes, in one "
         "ladder.",
-        op._sums(channels, "    ", magnitudes=("gram_n1", "gram_n2")),
+        unit_ladder,
         unit_rows,
         "    // The unit's changes in one pass: u += Z_n dn + Z_t1 dt1 + Z_t2 dt2; then its stores are every lane's.",
         "    if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f)",
@@ -337,9 +380,9 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
     spun = [
         "const int i = head, tangent1 = head + 1;",
         _unit_row(ctx, laws, kind),
-        f"const float tangent1_z = {op.load('head + 1')};",
-        f"const float tangent2_z = {op.load('head + 2')};",
-        f"const float {op.spin} = {op.load('head + 3')};",
+        f"const float tangent1_z = {_load(op, 'head + 1')};",
+        f"const float tangent2_z = {_load(op, 'head + 2')};",
+        f"const float spin_z = {_load(op, 'head + 3')};",
         _pair_unit(triple, laws, mu, spin="s_lam[tangent1 + 2]"),
     ]
     return (
@@ -357,7 +400,7 @@ def _pair_unit(ctx: RowContext, laws: RowLaws, mu: str, *, spin: str | None = No
         ctx,
         row="tangent1",
         kind=str(FRICTION),
-        operator=dataclasses.replace(op, current="tangent1_z", sibling="tangent2_z"),
+        operator=dataclasses.replace(op, factor=_registers(row="tangent1_z", sib="tangent2_z", spin="spin_z")),
         diagonal=Diagonal(lambda row: f"s_diag[{row}]"),
         mu=lambda row: ctx.mu(row) if row == "spin" else mu,
         parent="i",
@@ -384,7 +427,7 @@ def _unit_row(ctx: RowContext, laws: RowLaws, kind: str, *, load: bool = True) -
         inline_velocity_limit=kind == "row_type",
     )
     lines = [
-        f"const float {op.current} = {op.load('i')};" if load else "",
+        f"const float row_z = {_load(op, 'i')};" if load else "",
         "if (s_diag[i] > 0.0f) {",
         op.residual("jv", "    "),
         row_update(row, laws, residual="jv", pad="    "),

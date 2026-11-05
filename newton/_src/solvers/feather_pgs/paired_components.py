@@ -118,7 +118,7 @@ class PairedComponents:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Paired factor rows (FactorRows)
+# Paired factor rows (the paired route's dense rows in registers, sweep_routes_local)
 # ---------------------------------------------------------------------------------------------------------------------
 #
 # A paired world holds one articulation (``P`` coordinates, its primary group) and one free body (``S = 6``, its
