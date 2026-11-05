@@ -1967,8 +1967,13 @@ def _jacobi_triple_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> st
 def _jacobi_momentum(rows: JacobiRows, *, pad: str) -> str:
     """Nesterov's extrapolation factor ``beta`` with adaptive restart: the momentum restarts (``t_k = 1``) when the
     last step points against it, ``(y - x_new) . (x_new - x_old) > 0`` summed over the rows (per warp, then over the
-    warps in order)."""
+    warps in order).
+
+    The sequence's next term and factor depend on ``t_k`` alone, so they are formed ahead of the reduction, off its
+    chain, and the restart selects its own (``beta = 0`` and the term after ``t = 1``, which the compiler folds)."""
     lines = [
+        "const float t_next = 0.5f * (1.0f + sqrtf(1.0f + 4.0f * t_k * t_k));",
+        "const float beta_next = (t_k - 1.0f) / t_next;",
         "float dot_local = 0.0f;",
         f"if (lane < {rows.rows}) dot_local = (s_y[lane] - x_new) * (x_new - x_old);",
         "float dot = dot_local;",
@@ -1983,10 +1988,9 @@ def _jacobi_momentum(rows: JacobiRows, *, pad: str) -> str:
             f"for (int wv = 0; wv < {rows.threads // 32}; ++wv) dot += s_dot[wv];",
         ]
     lines += [
-        "if (dot > 0.0f) t_k = 1.0f;",
-        "const float t_next = 0.5f * (1.0f + sqrtf(1.0f + 4.0f * t_k * t_k));",
-        "const float beta = (t_k - 1.0f) / t_next;",
-        "t_k = t_next;",
+        "const bool restart = dot > 0.0f;",
+        "const float beta = restart ? 0.0f : beta_next;",
+        "t_k = restart ? 0.5f * (1.0f + sqrtf(5.0f)) : t_next;",
     ]
     if rows.threads > 32:
         lines.append("SYNC();")
