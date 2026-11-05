@@ -31,10 +31,9 @@ from .sweep import (
     TORSION,
     UNIT_HELD,
     Diagonal,
-    ReducedPairCoupling,
     RowContext,
     RowLaws,
-    UnitOperator,
+    UnitZ,
     contact_unit,
     end_sweep,
     friction_metric,
@@ -269,15 +268,6 @@ def _paired_rows(ctx: RowContext, laws: RowLaws, end: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
-@dataclasses.dataclass(frozen=True)
-class _UnitFactorRows(UnitOperator, ReducedPairCoupling, FactorRows):
-    """A contact unit's factor rows (:class:`.sweep.UnitOperator`): the unit's ladder (:func:`_contact_unit`) also
-    reduces the pair's coupling and the rows' terms' magnitudes, so a moved tangent votes on a lower bound of its terms
-    that is the row-by-row sweep's own when the normal did not move."""
-
-    magnitudes = True
-
-
 def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
     """The contact unit headed by row ``head`` (of kind ``kind``, never friction) with its tangent pair ``(head + 1,
     head + 2)`` (friction coefficient ``mu`` at the visited row ``i``), its three factor rows in registers, by the unit
@@ -285,7 +275,7 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
 
     The unit's impulses choose its reductions, not its law. A loaded unit (a nonzero impulse among its rows) reduces its
     rows' velocity terms, the pair's couplings with the normal and their terms' magnitudes in one ladder, runs its rows
-    on :class:`_UnitFactorRows` on the impulses its test loaded and applies their changes in one pass, after which the
+    on :class:`.sweep.UnitZ` on the impulses its test loaded and applies their changes in one pass, after which the
     lanes synchronize once (:func:`.sweep.contact_unit`). An unloaded one visits its rows as the row-by-row
     sweep does: the normal on its own ladder (:func:`_unit_row`), then its pair on the pair's own (:func:`_pair_unit`),
     only on a nonzero disk, so a unit that stays inactive reduces the normal's terms alone.
@@ -296,7 +286,6 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
     """
     op = ctx.operator
     velocity = op.velocity
-    unit = _UnitFactorRows(**{field.name: getattr(op, field.name) for field in dataclasses.fields(op)})
     channels = (
         ("unit_jv0", "row_z", velocity),
         ("unit_jv1", "tangent1_z", velocity),
@@ -311,7 +300,9 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
     )
     # The unit is a normal and its pair: its rows' laws see no spin row.
     pair_laws = dataclasses.replace(laws, torsion=False)
-    unit_ctx = dataclasses.replace(rows, operator=unit)
+    # The unit's ladder also reduces the pair's coupling and the rows' terms' magnitudes, so a moved tangent votes on a
+    # lower bound of its terms that is the row-by-row sweep's own when the normal did not move.
+    unit_ctx = dataclasses.replace(rows, operator=UnitZ(magnitudes=True))
     unit_rows = contact_unit(
         unit_ctx, pair_laws, rows="3", declare=declare, parent="head", check="denom", held=True, pad="    "
     )
@@ -326,7 +317,7 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
         *(unit_held_loads(unit_ctx, name, "head", "    ") for name in staged),
         "    // The unit's velocity terms, the pair's Gram couplings with the normal and their magnitudes, in one "
         "ladder.",
-        unit._sums(channels, "    ", magnitudes=("gram_n1", "gram_n2")),
+        op._sums(channels, "    ", magnitudes=("gram_n1", "gram_n2")),
         unit_rows,
         "    // The unit's changes in one pass: u += Z_n dn + Z_t1 dt1 + Z_t2 dt2; then its stores are every lane's.",
         "    if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f)",

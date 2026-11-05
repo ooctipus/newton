@@ -1106,6 +1106,44 @@ class SparsePairZ(ResponseOperator):
         ]
         return "".join(f"\n{indent}{line}" for line in "\n".join(lines).split("\n"))
 
+    def unit_terms(self, head: str, indent: str) -> str:
+        """A contact unit's terms (:class:`.sweep.UnitZ`), the normal ``head`` and its tangents ``head + 1``, ``head +
+        2``: declare this lane's entries of the unit's rows (``unit_z0``..``unit_z2``) and the velocity on their
+        coordinate (``unit_u``), then reduce the rows' velocity terms and the pair's couplings in one ladder.
+
+        A contact's rows act on its two bodies' coordinates, which the build puts in the same slot of each row
+        (:func:`.walk_rows.slot_header`), so the lane that owns a coordinate holds all three rows' entries there: the
+        unit reads the velocity there once and writes it once (:meth:`unit_apply`)."""
+        lane, P, rows = self.lanes.lane, self.dofs, range(3)
+        lines = [
+            "int unit_coord = -1;",
+            f"float {', '.join(f'unit_z{k} = 0.0f' for k in rows)};",
+            f"if ({lane} < {P}) {{",
+            f"    unit_coord = {self.offset} + {lane};",
+            f"    const int unit_dense = ({self.group} * {self.rows} + {head}) * {P} + {lane};",
+            *(f"    unit_z{k} = {self.Z}.data[unit_dense + {k * P}];" for k in rows),
+            f"}} else if ({lane} <= {P + 1}) {{",
+            f"    const int unit_sparse = ({self.base} + {head}) * 2 + {lane} - {P};",
+            f"    unit_coord = {self.sparse_dof}.data[unit_sparse];",
+            *(f"    unit_z{k} = {self.sparse_z}.data[unit_sparse + {2 * k}];" for k in rows),
+            "}",
+            f"const float unit_u = unit_coord >= 0 ? {self.velocity.at('unit_coord')} : 0.0f;",
+            "float unit_jv0 = unit_z0 * unit_u, unit_jv1 = unit_z1 * unit_u, unit_jv2 = unit_z2 * unit_u;",
+            "float gram_n1 = unit_z0 * unit_z1, gram_n2 = unit_z0 * unit_z2, unit_cross = unit_z1 * unit_z2;",
+            self.lanes.reduce("unit_jv0", "unit_jv1", "unit_jv2", "gram_n1", "gram_n2", "unit_cross"),
+        ]
+        return "\n".join(indent + line for line in lines)
+
+    def unit_apply(self, indent: str) -> str:
+        """The unit's changes in one pass on this lane's coordinate; the lanes synchronize after it."""
+        change = "(unit_z0 * unit_dn + unit_z1 * unit_dt1) + unit_z2 * unit_dt2"
+        lines = [
+            "if ((unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f) && unit_coord >= 0)",
+            f"    {self.velocity.at('unit_coord')} = unit_u + ({change});",
+            self.lanes.sync(),
+        ]
+        return "\n".join(indent + line for line in lines)
+
 
 @dataclass(frozen=True)
 class FactorComponent:

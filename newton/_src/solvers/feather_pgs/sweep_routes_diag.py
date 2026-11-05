@@ -8,7 +8,7 @@
 ``du = R^-T L^T P dv`` on the dense articulation (the walk's factor and its slips' release, the frame its rows were whitened
 in) and ``du = sqrt(m) dv`` on a diagonal coordinate, left once and added to the predictor. Each sweep runs its coordinates' fused joint limits, its independent scalar contacts one lane per chain, then its
 coupled rows in order (plain or contact units, optionally with speculative batches), a loaded coupled
-contact unit by the unit law (:class:`_UnitPairZ`, :func:`.sweep.contact_unit`). Its working set fits the static
+contact unit by the unit law (:meth:`.SparsePairZ.unit_terms`, :func:`.sweep.contact_unit`). Its working set fits the static
 budget of the device it is built for (:func:`.memory.arch_budget`).
 """
 
@@ -36,10 +36,9 @@ from .sweep import (
     JOINT_LIMIT,
     TORSION,
     Diagonal,
-    ReducedPairCoupling,
     RowContext,
     RowLaws,
-    UnitOperator,
+    UnitZ,
     WorldRows,
     change_vote,
     contact_unit,
@@ -159,51 +158,6 @@ def _diagonal_limits(dofs: int, dense_dofs: int, laws: RowLaws) -> tuple[str, st
     return "\n".join(declarations), "\n".join(loads), "\n".join(rows), "\n".join(stores)
 
 
-@dataclasses.dataclass(frozen=True)
-class _UnitPairZ(UnitOperator, ReducedPairCoupling, SparsePairZ):
-    """A coupled contact unit's rows (normal ``head``, tangents ``head + 1``, ``head + 2``) in the warp's layout
-    (:class:`.sweep.UnitOperator`).
-
-    A contact's rows act on its two bodies' coordinates, which the build puts in the same slot of each row
-    (:func:`.walk_rows.slot_header`), so the lane that owns a coordinate holds all three rows' entries
-    there: the unit reads the velocity there once (:meth:`unit_terms`) and writes it once (:meth:`unit_apply`). Its
-    ladder reduces the pair's coupling too, and its rows vote on their reduced terms, as the rows' own visits do.
-    """
-
-    def unit_terms(self, head: str, indent: str) -> str:
-        """Declare this lane's entries of the unit's rows (``unit_z0``..``unit_z2``) and the velocity on their
-        coordinate (``unit_u``), then reduce the rows' velocity terms and the pair's couplings in one ladder."""
-        lane, P, rows = self.lanes.lane, self.dofs, range(3)
-        lines = [
-            "int unit_coord = -1;",
-            f"float {', '.join(f'unit_z{k} = 0.0f' for k in rows)};",
-            f"if ({lane} < {P}) {{",
-            f"    unit_coord = {self.offset} + {lane};",
-            f"    const int unit_dense = ({self.group} * {self.rows} + {head}) * {P} + {lane};",
-            *(f"    unit_z{k} = {self.Z}.data[unit_dense + {k * P}];" for k in rows),
-            f"}} else if ({lane} <= {P + 1}) {{",
-            f"    const int unit_sparse = ({self.base} + {head}) * 2 + {lane} - {P};",
-            f"    unit_coord = {self.sparse_dof}.data[unit_sparse];",
-            *(f"    unit_z{k} = {self.sparse_z}.data[unit_sparse + {2 * k}];" for k in rows),
-            "}",
-            f"const float unit_u = unit_coord >= 0 ? {self.velocity.at('unit_coord')} : 0.0f;",
-            "float unit_jv0 = unit_z0 * unit_u, unit_jv1 = unit_z1 * unit_u, unit_jv2 = unit_z2 * unit_u;",
-            "float gram_n1 = unit_z0 * unit_z1, gram_n2 = unit_z0 * unit_z2, unit_cross = unit_z1 * unit_z2;",
-            self.lanes.reduce("unit_jv0", "unit_jv1", "unit_jv2", "gram_n1", "gram_n2", "unit_cross"),
-        ]
-        return "\n".join(indent + line for line in lines)
-
-    def unit_apply(self, indent: str) -> str:
-        """The unit's changes in one pass on this lane's coordinate; the lanes synchronize after it."""
-        change = "(unit_z0 * unit_dn + unit_z1 * unit_dt1) + unit_z2 * unit_dt2"
-        lines = [
-            "if ((unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f) && unit_coord >= 0)",
-            f"    {self.velocity.at('unit_coord')} = unit_u + ({change});",
-            self.lanes.sync(),
-        ]
-        return "\n".join(indent + line for line in lines)
-
-
 def sparse_diagonal_source(
     max_constraints: int,
     max_world_dofs: int,
@@ -299,7 +253,7 @@ def sparse_diagonal_source(
             )
         )
 
-    unit_op = _UnitPairZ(P, M, warp)
+    pair_op = SparsePairZ(P, M, warp)
 
     def contact_rows(head: str) -> str:
         """The rows of the friction contact headed by row ``head``: three, or four with a spin row (the data's,
@@ -309,7 +263,7 @@ def sparse_diagonal_source(
     # A contact unit is a normal and its pair: a contact with a spin row declines it, and its rows take their visits,
     # the triple from its cached metric.
     unit_rows = contact_unit(
-        dataclasses.replace(context(warp), operator=unit_op),
+        dataclasses.replace(context(warp), operator=UnitZ()),
         dataclasses.replace(laws, torsion=False),
         rows="unit_rows",
         declare=f"const int i = head + r;\nconst int row_type = r == 0 ? {CONTACT} : {FRICTION};\n"
@@ -322,7 +276,7 @@ def sparse_diagonal_source(
 
     def coupled(condition: str, advance: str = "i") -> str:
         """At row ``i``, when ``condition`` holds (``i`` heads a coupled contact unit with a pair, and no spin row) and
-        the unit is loaded, the unit on its Gram block in the warp's layout (:class:`_UnitPairZ`); the loop then moves
+        the unit is loaded, the unit on its Gram block in the warp's layout (:meth:`.SparsePairZ.unit_terms`); the loop then moves
         ``advance`` past its rows. An unloaded unit, or a contact with a spin row, falls through to the loop's row
         visits."""
         spinless = f" && {rows.spin_of('i', 'row_count')} < 0" if torsion else ""
@@ -330,9 +284,9 @@ def sparse_diagonal_source(
     const int unit_rows = 3;
     if ({loaded}) {{
         const int head = i;
-{unit_op.unit_terms("head", "        ")}
+{pair_op.unit_terms("head", "        ")}
 {indent(unit_rows, "    ")}
-{unit_op.unit_apply("        ")}
+{pair_op.unit_apply("        ")}
         {advance} += unit_rows - 1;
         continue;
     }}

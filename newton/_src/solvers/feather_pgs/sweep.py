@@ -18,7 +18,7 @@ A sweep is a configuration ``Sweep(mapping, staging, blocks, update, laws, exit,
   apply. Every block of every sweep runs it; a friction pair solved as one unit runs its pair law and tail
   (:func:`pair_update`);
 - the **contact unit** is a contact normal and its friction pair visited by the row law on the unit's Gram block
-  (:func:`contact_unit`, :class:`UnitOperator`): the placement reduces the unit's terms once and applies its changes
+  (:func:`contact_unit`, :class:`UnitZ`): the placement reduces the unit's terms once and applies its changes
   once, the pair's terms moved by the normal's change;
 - the **Jacobi law** steps every row of a world at once instead, a lane each (:class:`JacobiRows`,
   :func:`jacobi_sweeps`): the scaled step from the extrapolated impulses, bounded over the rows that can move (an idle
@@ -872,27 +872,31 @@ def row_visit(
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-class UnitOperator:
-    """A placement operator's rows in a contact unit (:func:`contact_unit`): a mixin ahead of the operator.
+@dataclasses.dataclass(frozen=True)
+class UnitZ(ResponseOperator):
+    """A contact unit's rows (:func:`contact_unit`) on the unit's Gram block: every placement's one operator for them.
 
     A contact unit is a contact normal (the unit's row ``r == 0``) and its friction pair (``r == 1``: the first tangent,
     the second its sibling), visited by the row law (:func:`row_visit`) one after the other on the unit's Gram block
-    ``G = Z^T Z``. The placement reduces the unit's three velocity terms once, before its rows (``unit_jv0``,
-    ``unit_jv1``, ``unit_jv2``), and gives the pair's Gram couplings with the normal (``gram_n1``, ``gram_n2``): a cache
-    formed once per launch, the builder's record, or the same reduction. The rows read the pair's terms moved by the
-    normal's change, ``Z_t^T (u + Z_n dn) = Z_t^T u + G_tn dn``, and defer their applies into ``unit_dn``, ``unit_dt1``
-    and ``unit_dt2``, which the placement applies once after the unit: in exact arithmetic the row-by-row sweep. The
-    friction rows' couplings (``Z_t1 . Z_t2``, and the spin row's with the pair) are the placement's
-    (:class:`ReducedPairCoupling`), or none where the friction law reads a metric cached for the unit
-    (:class:`CachedFrictionMetric`).
+    ``G = Z^T Z``. The placement reduces the unit's velocity terms once, before its rows (``unit_jv0``, ``unit_jv1``,
+    ``unit_jv2``), and gives the pair's Gram couplings with the normal (``gram_n1``, ``gram_n2``): a cache formed once
+    per launch, the builder's record, or the same reduction. The rows read the pair's terms moved by the normal's
+    change, ``Z_t^T (u + Z_n dn) = Z_t^T u + G_tn dn``, and defer their applies into ``unit_dn``, ``unit_dt1`` and
+    ``unit_dt2``, which the placement applies once after the unit: in exact arithmetic the row-by-row sweep.
 
-    A row's vote reads its terms' magnitude through a lower bound (:meth:`terms`): the reduced term's own, or, where
-    the placement's ladder also reduced the magnitudes (:attr:`magnitudes`: ``unit_jv{k}_terms``, and ``C_t = sum_k
-    |Z_tk Z_nk|`` in ``gram_n{t}_terms``), the normal's ``S_n`` and a moved tangent's ``max(|Z_t^T u'|, S_t - |dn|
-    C_t)``, the row-by-row sweep's ``S_t`` itself when the normal did not move.
+    The friction rows' couplings (``Z_t1 . Z_t2``, and the spin row's with the pair) are the placement's reduction's
+    (``unit_cross``, ``unit_cross13``, ``unit_cross23``: ``cached`` false), or none where the friction law reads a
+    metric cached for the unit (``cached``). A row's vote reads its terms' magnitude through a lower bound
+    (:meth:`terms`): the reduced term's own, or, where the placement's ladder also reduced the magnitudes
+    (``magnitudes``: ``unit_jv{k}_terms``, and ``C_t = sum_k |Z_tk Z_nk|`` in ``gram_n{t}_terms``), the normal's
+    ``S_n`` and a moved tangent's ``max(|Z_t^T u'|, S_t - |dn| C_t)``, the row-by-row sweep's ``S_t`` itself when the
+    normal did not move. ``fused_pair_apply`` is the placement's tail (:func:`_row_tail`).
     """
 
-    magnitudes = False
+    cached: bool = False
+    magnitudes: bool = False
+    fused_pair_apply: bool = False
+    name = "unit"
 
     def terms(self, out: str, rhs: str, *, whole: bool) -> str:
         if not self.magnitudes:
@@ -910,8 +914,10 @@ class UnitOperator:
     def sibling_residual(self, out: str, sibling: str, indent: str, rhs: str) -> str:
         return f"{indent}float {out} = (unit_jv2 + gram_n2 * unit_dn) + {rhs};"
 
-    def pair_entries(self, sibling: str, indent: str) -> str:
-        return ""
+    def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
+        if self.cached:
+            return f"{indent}const float {out} = 0.0f;  // the cached metric replaces the coupling"
+        return f"{indent}const float {out} = unit_cross;"
 
     def pair_terms(self, row: str, sibling: str, rhs: Callable[[str], str], indent: str, *, own: bool = False) -> str:
         if own:
@@ -923,11 +929,15 @@ class UnitOperator:
         return "\n".join(line for line in lines if line != "")
 
     def spin_terms(self, row: str, sibling: str, spin: str, rhs: Callable[[str], str], indent: str) -> str:
-        """The spin row's moved residual ``Z_s^T u + G_sn dn`` and its couplings with the pair (:meth:`spin_coupling`),
-        under contact torsion."""
-        return f"{indent}float spin_residual = (unit_jv3 + gram_n3 * unit_dn) + {rhs(spin)};\n" + self.spin_coupling(
-            indent
-        )
+        """The spin row's moved residual ``Z_s^T u + G_sn dn`` and its couplings with the pair, under contact
+        torsion."""
+        if self.cached:
+            coupling = (
+                f"{indent}const float spin_cross = 0.0f, spin_cross_sibling = 0.0f;  // the cached metric replaces them"
+            )
+        else:
+            coupling = f"{indent}const float spin_cross = unit_cross13;\n{indent}const float spin_cross_sibling = unit_cross23;"
+        return f"{indent}float spin_residual = (unit_jv3 + gram_n3 * unit_dn) + {rhs(spin)};\n" + coupling
 
     def apply(self, delta: str, indent: str) -> str:
         return f"\n{indent}if (r == 0) unit_dn += {delta}; else unit_dt1 += {delta};"
@@ -937,29 +947,6 @@ class UnitOperator:
 
     def apply_pair(self, sibling_delta: str, delta: str, indent: str) -> str:
         return f"\n{indent}unit_dt2 += {sibling_delta};" + self.apply(delta, indent)
-
-
-class ReducedPairCoupling:
-    """A unit operator mixin whose placement reduces the pair's coupling ``Z_t1 . Z_t2`` with the unit's terms
-    (``unit_cross``), or caches it with them."""
-
-    def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
-        return f"{indent}const float {out} = unit_cross;"
-
-    def spin_coupling(self, indent: str) -> str:
-        """The spin row's couplings with the pair (``unit_cross13``, ``unit_cross23``), the placement's likewise."""
-        return f"{indent}const float spin_cross = unit_cross13;\n{indent}const float spin_cross_sibling = unit_cross23;"
-
-
-class CachedFrictionMetric:
-    """A unit operator mixin whose friction law reads its metric cached for the unit, the pair's
-    (:func:`cached_pair_law`) or the triple's (:func:`cached_triple_law`): the visit forms no coupling."""
-
-    def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
-        return f"{indent}const float {out} = 0.0f;  // the cached metric replaces the coupling"
-
-    def spin_coupling(self, indent: str) -> str:
-        return f"{indent}const float spin_cross = 0.0f, spin_cross_sibling = 0.0f;  // the cached metric replaces them"
 
 
 def cached_pair_law(name: str, low: str, high: str, axis: tuple[str, str], pad: str) -> str:
@@ -1082,7 +1069,7 @@ def contact_unit(
     Row ``r`` of the unit (the normal, then its pair at the first tangent; ``rows`` is the unit's row count, one for a
     normal without a pair, else three) declares its index ``i``, kind and response (``declare``, which ``check`` reads:
     the row law runs when it is positive; ``None`` where the placement admitted the unit's normal) and runs
-    :func:`row_visit` with the unit's operator (:class:`UnitOperator`), the pair at the normal ``parent``. A visit that
+    :func:`row_visit` with the unit's operator (:class:`UnitZ`), the pair at the normal ``parent``. A visit that
     skips its row leaves it (a one-pass loop), not the unit.
 
     The rows defer their applies, so none synchronizes the lanes after it: the placement does once, after the unit's
@@ -1100,7 +1087,7 @@ def contact_unit(
     the pair's visit solves with it (the friction triple, :func:`friction_pair`); a unit of three solves its pair as
     the triple of a zero spin coefficient (:func:`spin_row`). ``held`` holds the spin row's staged values fourth, its
     change defers into ``unit_ds``, and the placement reduces its terms (``unit_jv3``, ``gram_n3``, ``unit_cross13``,
-    ``unit_cross23``: :meth:`UnitOperator.spin_terms`, zero for a unit of three) and applies it with the unit's.
+    ``unit_cross23``: :meth:`UnitZ.spin_terms`, zero for a unit of three) and applies it with the unit's.
     """
     if (ctx.owned and ctx.lanes.parallel) != held:
         raise ValueError(

@@ -18,7 +18,7 @@ from newton._src.solvers.feather_pgs.sweep import (
     Diagonal,
     RowContext,
     RowLaws,
-    UnitOperator,
+    UnitZ,
     change_vote,
     contact_unit,
     friction_radius,
@@ -58,11 +58,6 @@ class _FusedRows(_Rows):
 
     def apply_pair(self, sibling_delta, delta, indent):
         return f"\n{indent}apply_pair({sibling_delta}, {delta});"
-
-
-@dataclasses.dataclass(frozen=True)
-class _UnitRows(UnitOperator, _Rows):
-    """The same operator's rows in a contact unit."""
 
 
 def _rhs(row):
@@ -177,7 +172,7 @@ class TestContactUnit(unittest.TestCase):
 
     def _context(self, lanes=None, **options):
         return dataclasses.replace(
-            _context(_UnitRows(), lanes, **options),
+            _context(UnitZ(), lanes, **options),
             ring_load=lambda parent, load=None: f"RING_LOAD({load or f'lam[{parent}]'})",
         )
 

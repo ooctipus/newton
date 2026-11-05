@@ -55,11 +55,10 @@ from .sweep import (
     TORSION,
     UNIT_HELD,
     VELOCITY_LIMIT,
-    CachedFrictionMetric,
     Diagonal,
     RowContext,
     RowLaws,
-    UnitOperator,
+    UnitZ,
     cached_pair_law,
     contact_unit,
     end_sweep,
@@ -526,12 +525,6 @@ def ordinary_rows(rows: SparseRows, op: SparseFactor, laws: RowLaws, *, skip_vel
 
 
 @dataclasses.dataclass(frozen=True)
-class _UnitFactor(UnitOperator, CachedFrictionMetric, SparseFactor):
-    """A triplet's rows in a contact unit (:class:`.sweep.UnitOperator`): the unit's one reduction gathers the three
-    rows' entries, and its Gram couplings and the pair's metric are the triplet's block record."""
-
-
-@dataclasses.dataclass(frozen=True)
 class _UnitDiagonal(Diagonal):
     """A triplet unit's diagonals: the normal steps by its record's ``1/W_nn``. Every sparse row keeps its diagonal
     ``A_ii`` (``s_diag``), so the unit's rows vote in the velocity form, as the sparse rows' storage gives it (the
@@ -554,7 +547,7 @@ def contact_units(sweep: SparseSweep, rows: SparseRows, op: SparseFactor, laws: 
     entries (every stored entry, then masked by its coordinate), the triplet's block record (``contact_records``:
     the Gram couplings ``W_nt1, W_nt2, W_t1t2``, ``1/W_nn`` and the pair's eigenvalues and eigenbasis) and its
     friction coefficient; one reduction gives the three rows' velocity terms. The rows then run the
-    row law (:class:`_UnitFactor`): the normal steps with the record's ``1/W_nn``, the pair solves at the new load from
+    row law (:class:`.sweep.UnitZ`): the normal steps with the record's ``1/W_nn``, the pair solves at the new load from
     the record's metric, its residuals moved by the normal change through ``W_nt`` (in exact arithmetic the sequential
     sweep); each coordinate takes the normal's, then the second tangent's, then the first tangent's change and is
     written back once. With ``linked`` a pass at entry stores each anchor's other ring members, at most three, behind
@@ -665,11 +658,12 @@ SYNC();"""
             "            ",
             entry=False,
         )
-        unit_op = _UnitFactor(**{field.name: getattr(op, field.name) for field in dataclasses.fields(op)})
         ctx = RowContext(
             row="i",
             kind="row_type",
-            operator=unit_op,
+            # The unit's one reduction gathers the three rows' entries; its Gram couplings and the pair's metric are
+            # the triplet's block record.
+            operator=UnitZ(cached=True, fused_pair_apply=op.fused_pair_apply),
             diagonal=_UnitDiagonal(rows.diag),
             load=rows.load,
             store=rows.store,

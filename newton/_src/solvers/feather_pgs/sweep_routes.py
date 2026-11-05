@@ -32,11 +32,10 @@ from .sweep import (
     FRICTION,
     SPEED,
     VELOCITY_LIMIT,
-    CachedFrictionMetric,
     Diagonal,
     RowContext,
     RowLaws,
-    UnitOperator,
+    UnitZ,
     WorldRows,
     cached_pair_law,
     cached_triple_law,
@@ -252,14 +251,6 @@ color counts, their slots' colors and staged units (:data:`.sweep_units.WORLD_FI
 :data:`.sweep_units.SLOT_FIELDS`) before ``v_out``."""
 
 
-@dataclasses.dataclass(frozen=True)
-class _GramUnitBodyZ(UnitOperator, CachedFrictionMetric, FreeBodyZ):
-    """The colored unit's rows (:class:`.sweep.UnitOperator`): one thread per unit, every row's velocity term reduced
-    from the unit's velocity ``u`` before the unit's first row (:func:`_unit_terms`), the normal's Gram couplings and
-    the friction metric (the pair's, or the triple's with a spin row) from the unit's cache formed once per launch
-    (:func:`_colored_metrics`), one pass over the unit's coordinates after its rows (:func:`_unit_apply`)."""
-
-
 _UNIT_ROWS = (("n", "unit_jv0", "unit_dn"), ("t1", "unit_jv1", "unit_dt1"), ("t2", "unit_jv2", "unit_dt2"))
 """A colored unit's rows: each one's partial sum, velocity term and deferred change, at ``E``'s ``12 r``."""
 _SPIN_ROW = ("spin", "unit_jv3", "unit_ds")
@@ -384,11 +375,6 @@ def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str
             raise ValueError(f"the colored unit reads rows {sorted(offsets)}, not {row!r}")
         return offsets[row]
 
-    unit_op = _GramUnitBodyZ(
-        Lanes(1),
-        velocity=Velocity("s_v"),
-        entry=lambda side, row, k: f"E[{unit_offset(row)} * 12 + {side * 6} + {k}]",
-    )
     ring, members = layout.ring, sweep_units.RING_MEMBERS
 
     def ring_load(parent: str) -> str:
@@ -400,7 +386,11 @@ def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str
     unit_ctx = RowContext(
         row="i",
         kind="mf_rt",
-        operator=unit_op,
+        # One thread per unit, every row's velocity term reduced from the unit's velocity ``u`` before the unit's first
+        # row (_unit_terms), the normal's Gram couplings and the friction metric (the pair's, or the triple's with a
+        # spin row) from the unit's cache formed once per launch (_colored_metrics), one pass over the unit's
+        # coordinates after its rows (_unit_apply).
+        operator=UnitZ(cached=True),
         diagonal=Diagonal(
             inverse=lambda row: "mf_diag" if row == "i" else f"__int_as_float(W[{unit_offset(row)} * 3])"
         ),
