@@ -1171,16 +1171,19 @@ class SparseFactor(ResponseOperator):
             lines.append(f"float velocities[{count}];")
         if reduce:
             lines.append(f"float {', '.join(f'{out} = 0.0f' for out in outs)};")
+        # Each row's entry loads beside its coordinate, off the coordinate's chain, and is masked once it is known.
+        stored = f"entry < {self.width}" if self.lanes.parallel else ""
+        body = []
+        for name in loaded:
+            condition = " && ".join(c for c in (exists.get(name, ""), stored) if c)
+            value = self.element(rows[name])
+            body.append(f"const float {name}_value = {f'{condition} ? {value} : 0.0f' if condition else value};")
         if kept:
-            body = ["const int index = indices[q];"]
+            body.append("const int index = indices[q];")
         else:
-            body = [f"const int index = {self.guarded_coordinate(rows[names[0]])};"]
+            body.append(f"const int index = {self.guarded_coordinate(rows[names[0]])};")
             body += ["indices[q] = index;"] if keep_support else []
-        body += [
-            f"z_{name}[q] = {f'{exists[name]} && ' if name in exists else ''}index >= 0 ? "
-            f"{self.element(rows[name])} : 0.0f;"
-            for name in loaded
-        ]
+        body += [f"z_{name}[q] = index >= 0 ? {name}_value : 0.0f;" for name in loaded]
         # The sums take this lane's entries where the support has one; padding adds nothing.
         guarded = [f"const float velocity = {self.velocity.at('index')};"] if reads else []
         if keep_velocity:

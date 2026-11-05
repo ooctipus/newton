@@ -559,9 +559,7 @@ def contact_units(sweep: SparseSweep, rows: SparseRows, op: SparseFactor, laws: 
     and spin row (:func:`triple_phase`). With ``linked`` the entry pass stores a triple's ring members too, which its
     visit pools.
     """
-    S = sweep.support
     width = CONTACT_RECORD_FLOATS + (CONTACT_RING_FLOATS if sweep.linked else 0)
-    count = op.entries
     pair_rows = f"s_type[normal + 1] != {FRICTION} || s_type[normal + 2] != {FRICTION}"
     if laws.torsion:
         # A triple's pair is staged as spin rows (SparseRows).
@@ -621,42 +619,14 @@ SYNC();"""
 
     def body() -> str:
         """The unit's rows, loads, reduction and apply."""
-        unit_rows = [
-            ("i", "normal", "unit_jv0"),
-            ("tangent", "tangent", "unit_jv1"),
-            ("sibling", "sibling", "unit_jv2"),
-        ]
-        gather = op.entries_loop(
-            "\n".join(
-                [
-                    f"const bool stored = entry < {S};",
-                    *(f"const float {name}_entry = stored ? {op.element(row)} : 0.0f;" for row, name, _ in unit_rows),
-                    f"const int index = stored ? {_class_coordinate('row_class', S)} : -1;",
-                    "indices[q] = index;",
-                    *(f"{name}_responses[q] = index >= 0 ? {name}_entry : 0.0f;" for _, name, _ in unit_rows),
-                    "velocities[q] = index >= 0 ? s_delta[index] : 0.0f;",
-                    "if (index >= 0) {",
-                    *(f"    {term} += {name}_responses[q] * velocities[q];" for _, name, term in unit_rows),
-                    "}",
-                ]
-            ),
-            "        ",
-        )
+        # The unit's three rows share the normal's support: one reduction of their velocity terms, the support, the
+        # velocity there and their entries kept for the apply.
+        unit_rows = {"normal": "i", "tangent": "tangent", "sibling": "sibling"}
+        sums = (("unit_jv0", "normal", None), ("unit_jv1", "tangent", None), ("unit_jv2", "sibling", None))
+        gather = op.dot(sums, unit_rows, "        ", keep_velocity=True, reduce=False)
         # Per coordinate the normal's change, then the pair's: the row loop's order.
-        changes = [("normal", "unit_dn"), ("sibling", "unit_dt2")]
-        apply = op.entries_loop(
-            "\n".join(
-                [
-                    "if (indices[q] >= 0) {",
-                    "    float value = velocities[q];",
-                    *(f"    if ({d} != 0.0f) value += {name}_responses[q] * {d};" for name, d in changes),
-                    "    if (unit_dt1 != 0.0f) value += tangent_responses[q] * unit_dt1;",
-                    "    s_delta[indices[q]] = value;",
-                    "}",
-                ]
-            ),
-            "            ",
-            entry=False,
+        apply = op.axpy(
+            (("normal", "unit_dn"), ("sibling", "unit_dt2"), ("tangent", "unit_dt1")), "            ", kept=True
         )
         ctx = RowContext(
             row="i",
@@ -699,9 +669,6 @@ const int row_type = r == 0 ? {CONTACT} : {FRICTION};"""
         return f"""        const float* record = {_record(width, "i")};
         const float4 coupling = *reinterpret_cast<const float4*>(record);{tail}{ring_read}
         const float mu = world_row_mu.data[offset + tangent];
-        int indices[{count}];
-        float velocities[{count}], normal_responses[{count}];
-        float tangent_responses[{count}], sibling_responses[{count}];
         float unit_jv0 = 0.0f, unit_jv1 = 0.0f, unit_jv2 = 0.0f;
 {gather}
         // The unit's staged values load with its rows, off the reduction's chain; the rows' law reads them.
