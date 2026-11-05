@@ -41,6 +41,7 @@ which is then the whole body again, and the shadow's coordinates, under the kine
 from __future__ import annotations
 
 import copy
+import dataclasses
 import weakref
 from types import SimpleNamespace
 from typing import Any
@@ -48,6 +49,8 @@ from typing import Any
 import numpy as np
 import warp as wp
 
+from ...core import memory
+from ...core.execution import Shape, Work, launch, shape
 from ...sim import BodyFlags, Control, Model, State
 from ...sim.articulation import eval_fk, eval_ik
 from . import host_index
@@ -101,99 +104,111 @@ _DYNAMIC = wp.constant(int(BodyFlags.DYNAMIC))
 _KINEMATIC = wp.constant(int(BodyFlags.KINEMATIC))
 
 
+@wp.struct
+class _Items:
+    """A map's data, one launch operand: ``count`` items, item ``i`` reading ``outof[i]`` and writing ``into[i]``
+    where ``active[i]``."""
+
+    count: int
+    active: wp.array[wp.bool]
+    outof: wp.array[int]
+    into: wp.array[int]
+
+
 @wp.kernel(enable_backward=False)
-def _gather(source: wp.array(dtype=Any), order: wp.array[int], target: wp.array(dtype=Any)):
-    """``target[i] = source[order[i]]``: from the caller's layout to the forest's."""
+def _move(items: _Items, source: wp.array(dtype=Any), target: wp.array(dtype=Any)):
+    """The cut's one map (:class:`_Map`): ``target[into[i]] = source[outof[i]]``. A gather reads by its order into the
+    identity, a scatter the identity into its order."""
     i = wp.tid()
-    target[i] = source[order[i]]
+    if i < items.count:
+        if items.active[i]:
+            target[items.into[i]] = source[items.outof[i]]
 
 
 @wp.kernel(enable_backward=False)
 def _gather_frames(
+    items: _Items,
     source: wp.array[wp.transform],
-    order: wp.array[int],
     anchor: wp.array[int],
     body_q: wp.array[wp.transform],
     target: wp.array[wp.transform],
 ):
-    """The joints' parent frames. A loop joint on a body no tree holds stands on the world, where that body stands."""
+    """The joints' parent frames, by the joints' map. A loop joint on a body no tree holds stands on the world, where
+    that body stands."""
     i = wp.tid()
-    target[i] = source[order[i]]
-    if anchor[i] >= 0:
-        target[i] = wp.transform_multiply(body_q[anchor[i]], source[order[i]])
+    if i < items.count:
+        j = items.outof[i]
+        target[i] = source[j]
+        if anchor[i] >= 0:
+            target[i] = wp.transform_multiply(body_q[anchor[i]], source[j])
 
 
 @wp.kernel(enable_backward=False)
 def _gather_bodies(
+    items: _Items,
     mass: wp.array[float],
     inertia: wp.array[wp.mat33],
     flags: wp.array[int],
-    order: wp.array[int],
     share: wp.array[float],
     primaries: int,
     forest_mass: wp.array[float],
     forest_inertia: wp.array[wp.mat33],
     forest_flags: wp.array[int],
 ):
-    """Each piece's share of its body. A shadow is dynamic whatever its body is, as a joint's child must be to move,
-    and kinematic where its link is disabled (no share)."""
+    """Each piece's share of its body, by the bodies' map. A shadow is dynamic whatever its body is, as a joint's child
+    must be to move, and kinematic where its link is disabled (no share)."""
     i = wp.tid()
-    j = order[i]
-    forest_mass[i] = mass[j] * share[i]
-    forest_inertia[i] = inertia[j] * share[i]
-    if i < primaries:
-        forest_flags[i] = flags[j]
-    elif share[i] > 0.0:
-        forest_flags[i] = _DYNAMIC
-    else:
-        forest_flags[i] = _KINEMATIC
+    if i < items.count:
+        j = items.outof[i]
+        forest_mass[i] = mass[j] * share[i]
+        forest_inertia[i] = inertia[j] * share[i]
+        if i < primaries:
+            forest_flags[i] = flags[j]
+        elif share[i] > 0.0:
+            forest_flags[i] = _DYNAMIC
+        else:
+            forest_flags[i] = _KINEMATIC
 
 
 @wp.kernel(enable_backward=False)
-def _scatter(source: wp.array[float], order: wp.array[int], target: wp.array[float]):
-    """``target[order[i]] = source[i]``: from the forest's layout to the caller's."""
-    i = wp.tid()
-    target[order[i]] = source[i]
-
-
-@wp.kernel(enable_backward=False)
-def _note_unseated(valid: wp.array[int], component: wp.array[int], unseated: wp.array[int]):
-    """Mark the components of the trees whose kinematics the step re-derives."""
-    tree = wp.tid()
-    if valid[tree] == 0:
-        unseated[component[tree]] = 1
-
-
-@wp.kernel(enable_backward=False)
-def _spread_unseated(
-    component: wp.array[int],
-    unseated: wp.array[int],
+def _seat(
+    count: int,
+    tree_start: wp.array[int],
+    trees: wp.array[int],
+    link_start: wp.array[int],
+    links: wp.array[int],
     valid: wp.array[int],
-    trees: wp.array[wp.bool],
+    seated_trees: wp.array[wp.bool],
+    seated_links: wp.array[wp.bool],
 ):
-    """Every tree of a marked component is seated, so every one re-derives its kinematics."""
-    tree = wp.tid()
-    trees[tree] = unseated[component[tree]] != 0
-    if trees[tree]:
-        valid[tree] = 0
+    """Seat each of ``count`` linked components whose trees' kinematics the step re-derives: every tree of it
+    re-derives them, so each clears its cache bit, and each of its links seats its shadow."""
+    component = wp.tid()
+    if component < count:
+        cleared = int(0)
+        for k in range(tree_start[component], tree_start[component + 1]):
+            if valid[trees[k]] == 0:
+                cleared = 1
+        seat = cleared != 0
+        for k in range(tree_start[component], tree_start[component + 1]):
+            seated_trees[trees[k]] = seat
+            if seat:
+                valid[trees[k]] = 0
+        for k in range(link_start[component], link_start[component + 1]):
+            seated_links[links[k]] = seat
 
 
-@wp.kernel(enable_backward=False)
-def _seat_shadows(
-    primary: wp.array[int],
-    shadow: wp.array[int],
-    tree: wp.array[int],
-    trees: wp.array[wp.bool],
-    body_q: wp.array[wp.transform],
-    body_qd: wp.array[wp.spatial_vector],
-    links: wp.array[wp.bool],
-):
-    """Put each shadow of a seated tree on its primary piece, the pose its joint's coordinates are read from."""
-    k = wp.tid()
-    links[k] = trees[tree[k]]
-    if links[k]:
-        body_q[shadow[k]] = body_q[primary[k]]
-        body_qd[shadow[k]] = body_qd[primary[k]]
+@dataclasses.dataclass(frozen=True)
+class _Map:
+    """One map of the cut: its items (:class:`_Items`, one operand, so a launch packs what it did before the map was
+    data) and the launch its work declares."""
+
+    items: _Items
+    shape: Shape
+
+    def move(self, source: wp.array, target: wp.array) -> None:
+        """Move ``source`` into ``target`` by the map (:func:`_move`)."""
+        launch(_move, self.shape, inputs=[self.items, source], outputs=[target], device=target.device, tiled=False)
 
 
 def _components(count: int, first: np.ndarray, second: np.ndarray) -> np.ndarray:
@@ -392,17 +407,6 @@ class BodyCut:
         self.model = forest
         self._topology = {name: getattr(source, name).numpy().copy() for name in _TOPOLOGY}
 
-        # The gathers, and how much of them the step publishes: a joint outside every tree stands after the trees, and
-        # the step leaves its coordinates alone.
-        self._coords, self._dofs = indices(coords), indices(dofs)
-        self._joints, self._bodies = indices(order), indices(bodies)
-        anchor = np.full(order.size, -1, dtype=np.int32)
-        anchor[position[self._anchored]] = source.joint_parent.numpy()[self._anchored]
-        self._anchor = indices(anchor)
-        self._share = wp.zeros(bodies.size, dtype=wp.float32, device=device)
-        self._targets = self._coords if source.use_coord_layout_targets else self._dofs
-        self._published_coords, self._published_dofs = int(q_start[bounds[-1]]), int(qd_start[bounds[-1]])
-
         # The links' trees and components.
         body_tree = np.full(bodies.size, -1, dtype=np.int64)
         body_tree[topology.child[in_tree]] = topology.tree[in_tree]
@@ -410,7 +414,40 @@ class BodyCut:
         self.tree_shadow = body_tree[self.shadow].astype(np.int32)
         self.component = _components(topology.trees, self.tree_primary, self.tree_shadow).astype(np.int32)
 
-        # The mirrors of the caller's states and controls, and the seat's device data: a loop joint is a one-joint
+        # The maps: the gathers from the caller's layout, the scatters that publish the step (a joint outside every
+        # tree stands after the trees, and the step leaves its coordinates alone) and the seat's moves.
+        coords, dofs = indices(coords), indices(dofs)
+        items = max(order.size, bodies.size, dofs.shape[0], coords.shape[0], loops.size)
+        identity, every = indices(np.arange(items)), wp.array(np.ones(items, dtype=bool), dtype=wp.bool, device=device)
+        self._seated_trees = wp.zeros(topology.trees, dtype=wp.bool, device=device)
+        self._seated_links = wp.zeros(loops.size, dtype=wp.bool, device=device)
+
+        def mapped(count, outof, into, active=every):
+            items = _Items()
+            items.count, items.active, items.outof, items.into = int(count), active, outof, into
+            return _Map(items, shape(Work(int(count)), memory.device(device)))
+
+        self._joint_map = mapped(order.size, indices(order), identity)
+        self._body_map = mapped(bodies.size, indices(bodies), identity)
+        self._dof_map = mapped(dofs.shape[0], dofs, identity)
+        self._coord_map = mapped(coords.shape[0], coords, identity)
+        self._target_map = self._coord_map if source.use_coord_layout_targets else self._dof_map
+        self._publish_q = mapped(q_start[bounds[-1]], identity, coords)
+        self._publish_qd = mapped(qd_start[bounds[-1]], identity, dofs)
+        self._seat_map = mapped(loops.size, indices(self.primary), indices(self.shadow), self._seated_links)
+        anchor = np.full(order.size, -1, dtype=np.int32)
+        anchor[position[self._anchored]] = source.joint_parent.numpy()[self._anchored]
+        self._anchor = indices(anchor)
+        self._share = wp.zeros(bodies.size, dtype=wp.float32, device=device)
+
+        # The seat: each linked component's trees and links.
+        labels, of_tree = np.unique(self.component, return_inverse=True)
+        tree_start, trees = host_index.group_by(of_tree, labels.size)
+        link_start, links = host_index.group_by(of_tree[self.tree_shadow], labels.size)
+        self._components = (labels.size, *(indices(values) for values in (tree_start, trees, link_start, links)))
+        self._seat_shape = shape(Work(labels.size), memory.device(device))
+
+        # The mirrors of the caller's states and controls, and the seat's model: a loop joint is a one-joint
         # articulation to inverse kinematics.
         self._states: weakref.WeakKeyDictionary[State, State] = weakref.WeakKeyDictionary()
         self._controls: weakref.WeakKeyDictionary[Control, Control] = weakref.WeakKeyDictionary()
@@ -419,12 +456,6 @@ class BodyCut:
         self._seats.articulation_end = indices(position[loops] + 1)
         self._seats.articulation_count = int(loops.size)
         self._seats.max_joints_per_articulation = 1
-        self._component = indices(self.component)
-        self._unseated = wp.zeros(topology.trees, dtype=wp.int32, device=device)
-        self._seated_trees = wp.zeros(topology.trees, dtype=wp.bool, device=device)
-        self._seated_links = wp.zeros(loops.size, dtype=wp.bool, device=device)
-        self._primary, self._shadow = indices(self.primary), indices(self.shadow)
-        self._shadow_tree = indices(self.tree_shadow)
         self._shares()
         self._gather_model()
 
@@ -440,35 +471,35 @@ class BodyCut:
     def _gather_model(self) -> None:
         """The arrays a step reads and the layout moves, from the caller's model as it stands now."""
         source, forest, device = self.source, self.model, self.model.device
-        for order, names in ((self._joints, ("joint_X_c",)), (self._dofs, _LIVE_DOFS), (self._bodies, ("body_com",))):
+        for map_, names in (
+            (self._joint_map, ("joint_X_c",)),
+            (self._dof_map, _LIVE_DOFS),
+            (self._body_map, ("body_com",)),
+        ):
             for name in names:
-                wp.launch(
-                    _gather,
-                    dim=order.shape[0],
-                    inputs=[getattr(source, name), order],
-                    outputs=[getattr(forest, name)],
-                    device=device,
-                )
-        wp.launch(
+                map_.move(getattr(source, name), getattr(forest, name))
+        launch(
             _gather_frames,
-            dim=forest.joint_count,
-            inputs=[source.joint_X_p, self._joints, self._anchor, source.body_q],
+            self._joint_map.shape,
+            inputs=[self._joint_map.items, source.joint_X_p, self._anchor, source.body_q],
             outputs=[forest.joint_X_p],
             device=device,
+            tiled=False,
         )
-        wp.launch(
+        launch(
             _gather_bodies,
-            dim=forest.body_count,
+            self._body_map.shape,
             inputs=[
+                self._body_map.items,
                 source.body_mass,
                 source.body_inertia,
                 source.body_flags,
-                self._bodies,
                 self._share,
                 source.body_count,
             ],
             outputs=[forest.body_mass, forest.body_inertia, forest.body_flags],
             device=device,
+            tiled=False,
         )
 
     def refresh(self) -> None:
@@ -557,18 +588,15 @@ class BodyCut:
                 value = getattr(control, name)
                 setattr(mirror, name, None if value is None else wp.empty_like(value))
             self._controls[control] = mirror
-        device = self.model.device
-        for name, order in (
-            ("joint_f", self._dofs),
-            ("joint_target_q", self._targets),
-            ("joint_target_qd", self._dofs),
-            ("joint_act", self._dofs),
+        for name, map_ in (
+            ("joint_f", self._dof_map),
+            ("joint_target_q", self._target_map),
+            ("joint_target_qd", self._dof_map),
+            ("joint_act", self._dof_map),
         ):
             value = getattr(control, name)
             if value is not None:
-                wp.launch(
-                    _gather, dim=order.shape[0], inputs=[value, order], outputs=[getattr(mirror, name)], device=device
-                )
+                map_.move(value, getattr(mirror, name))
         return mirror
 
     def enter(
@@ -586,66 +614,33 @@ class BodyCut:
         self._gather_model()
         forest_in, forest_out = self.mirror(state_in), self.mirror(state_out)
         device, count = self.model.device, self.source.body_count
-        wp.launch(
-            _gather,
-            dim=self._coords.shape[0],
-            inputs=[state_in.joint_q, self._coords],
-            outputs=[forest_in.joint_q],
-            device=device,
-        )
-        wp.launch(
-            _gather,
-            dim=self._dofs.shape[0],
-            inputs=[state_in.joint_qd, self._dofs],
-            outputs=[forest_in.joint_qd],
-            device=device,
-        )
+        self._coord_map.move(state_in.joint_q, forest_in.joint_q)
+        self._dof_map.move(state_in.joint_qd, forest_in.joint_qd)
         wp.copy(forest_in.body_q, state_in.body_q, count=count)
         wp.copy(forest_in.body_qd, state_in.body_qd, count=count)
         wp.copy(forest_in.body_f, state_in.body_f, count=count)
 
-        trees = self.model.articulation_count
-        self._unseated.zero_()
-        wp.launch(
-            _note_unseated, dim=trees, inputs=[cache_valid, self._component], outputs=[self._unseated], device=device
-        )
-        wp.launch(
-            _spread_unseated,
-            dim=trees,
-            inputs=[self._component, self._unseated],
-            outputs=[cache_valid, self._seated_trees],
+        launch(
+            _seat,
+            self._seat_shape,
+            inputs=list(self._components),
+            outputs=[cache_valid, self._seated_trees, self._seated_links],
             device=device,
+            tiled=False,
         )
         eval_fk(self.model, forest_in.joint_q, forest_in.joint_qd, forest_in, mask=self._seated_trees)
-        wp.launch(
-            _seat_shadows,
-            dim=self.joints.size,
-            inputs=[self._primary, self._shadow, self._shadow_tree, self._seated_trees],
-            outputs=[forest_in.body_q, forest_in.body_qd, self._seated_links],
-            device=device,
-        )
+        self._seat_map.move(forest_in.body_q, forest_in.body_q)
+        self._seat_map.move(forest_in.body_qd, forest_in.body_qd)
         eval_ik(self._seats, forest_in, forest_in.joint_q, forest_in.joint_qd, mask=self._seated_links)
         return forest_in, forest_out, self._control(control)
 
     def leave(self, state_in: State, state_out: State) -> None:
         """Publish the step: the output's coordinates, and both states' bodies (the step's primary pieces, the model's
         bodies, whose indices the forest keeps)."""
-        device, count = self.model.device, self.source.body_count
+        count = self.source.body_count
         forest_in, forest_out = self.mirror(state_in), self.mirror(state_out)
-        wp.launch(
-            _scatter,
-            dim=self._published_coords,
-            inputs=[forest_out.joint_q, self._coords],
-            outputs=[state_out.joint_q],
-            device=device,
-        )
-        wp.launch(
-            _scatter,
-            dim=self._published_dofs,
-            inputs=[forest_out.joint_qd, self._dofs],
-            outputs=[state_out.joint_qd],
-            device=device,
-        )
+        self._publish_q.move(forest_out.joint_q, state_out.joint_q)
+        self._publish_qd.move(forest_out.joint_qd, state_out.joint_qd)
         for state, mirror in ((state_in, forest_in), (state_out, forest_out)):
             wp.copy(state.body_q, mirror.body_q, count=count)
             wp.copy(state.body_qd, mirror.body_qd, count=count)
