@@ -1279,12 +1279,14 @@ class SparseFactor(ResponseOperator):
     ``dense`` coordinates the packed rows are expanded once per call (:meth:`expand`) into rows of every coordinate
     in private shared storage (``local``): entry ``e`` at coordinate ``e``.
 
-    With lanes, lane ``l`` owns entries ``l + q L`` (``q`` ascending): it keeps their coordinates and values in
-    registers (``indices[q]``, ``responses[q]``) for the row's apply, its partial sums accumulate them from zero, and
-    the lanes reduce with ``SUM``. One thread (``Lanes(1, "0")``) sums a row's entries in order. A friction pair's
-    second tangent shares its first tangent's support: the first tangent's residual reduces the second's velocity
-    term (``sibling_jv``) and the pair's coupling ``Z_t . Z_s`` (``pair_coupling``) in the same ``SUM``, and the
-    apply adds the second tangent's change, then the first's, to each entry, written back once.
+    Two actions: :meth:`dot` reduces sums ``Z_r . u`` and Gram entries ``Z_r . Z_s`` of rows that share a support in
+    one ladder, and :meth:`axpy` adds rows' changes ``u += sum_k Z_k d_k``; the row law's actions are these two. With
+    lanes, lane ``l`` owns entries ``l + q L`` (``q`` ascending): it keeps their coordinates and values in registers
+    (``indices[q]``, ``{name}_z[q]``) for the rows' apply, its partial sums accumulate them from zero, and the lanes
+    reduce with ``SUM``. One thread (``Lanes(1, "0")``) sums a row's entries in order. A friction pair's second tangent
+    shares its first tangent's support: the first tangent's residual reduces the second's velocity term
+    (``sibling_jv``) and the pair's coupling ``Z_t . Z_s`` (``pair_coupling``) in the same ``SUM``, and the apply adds
+    the second tangent's change, then the first's, to each entry, written back once.
     """
 
     support: int
@@ -1332,7 +1334,86 @@ class SparseFactor(ResponseOperator):
             return self.coordinate(row)
         return f"entry < {self.width} ? {self.coordinate(row)} : -1"
 
-    # -- row actions ---------------------------------------------------------------------------------------------------
+    # -- the two actions ----------------------------------------------------------------------------------------------
+
+    def dot(
+        self,
+        sums: tuple[tuple[str, str, str | None], ...],
+        rows: dict[str, str],
+        indent: str,
+        *,
+        exists: dict[str, str] | None = None,
+        kept: tuple[str, ...] = (),
+        keep_velocity: bool = False,
+        reduce: bool = True,
+    ) -> str:
+        """``float out = Z_row . other`` for each ``(out, row, other)`` of ``sums`` (``other`` ``None`` for the velocity,
+        else a row: a Gram entry), over the rows' shared support, reduced in one ladder (every lane holds them).
+
+        ``rows`` names each row (its index expression, the first the support's); a row of ``exists`` is zero where its
+        condition fails. The support stays in ``indices`` and each row's entries in ``{name}_z`` (with
+        ``keep_velocity`` the velocity there in ``velocities``, at the support's entries) for :meth:`axpy`. The rows of ``kept`` were kept by
+        an earlier ``dot`` on the same support: their entries and the support are read again, not loaded. Without
+        ``reduce`` the sums accumulate this lane's entries into ``out``, declared before, in order.
+        """
+        exists = exists or {}
+        count, names = self.entries, list(rows)
+        loaded = [name for name in names if name not in kept]
+        reads = any(other is None for _, _, other in sums)
+        lines = [] if kept else [f"int indices[{count}];"]
+        lines += [f"float {name}_z[{count}];" for name in loaded]
+        if keep_velocity:
+            lines.append(f"float velocities[{count}];")
+        if reduce:
+            lines.append(f"float {', '.join(f'{out} = 0.0f' for out, _, _ in sums)};")
+        if kept:
+            body = ["const int index = indices[q];"]
+        else:
+            body = [f"const int index = {self.guarded_coordinate(rows[names[0]])};", "indices[q] = index;"]
+        body += [
+            f"{name}_z[q] = {f'{exists[name]} && ' if name in exists else ''}index >= 0 ? "
+            f"{self.element(rows[name])} : 0.0f;"
+            for name in loaded
+        ]
+        # The sums take this lane's entries where the support has one; padding adds nothing.
+        guarded = [f"const float velocity = {self.velocity.at('index')};"] if reads else []
+        if keep_velocity:
+            guarded.append("velocities[q] = velocity;")
+        guarded += [
+            f"{out} += {row}_z[q] * {'velocity' if other is None else f'{other}_z[q]'};" for out, row, other in sums
+        ]
+        body += ["if (index >= 0) {", *("    " + line for line in guarded), "}"]
+        text = "\n".join(indent + line for line in lines) + "\n" + self.entries_loop("\n".join(body), indent)
+        reduced = self.lanes.reduce(*(out for out, _, _ in sums)) if reduce else ""
+        return text + "".join(f"\n{indent}{line}" for line in reduced.split("\n") if line)
+
+    def axpy(
+        self, changes: tuple[tuple[str, str], ...], indent: str, *, row: str | None = None, kept: bool = False
+    ) -> str:
+        """``delta_v += sum_k Z_k d_k`` over the ``(name, d)`` of ``changes``, from the entries a :meth:`dot` kept: one
+        change adds in place; several read the velocity once (the one a ``dot`` kept with ``kept``), add each nonzero
+        change in the order given and write it back once. With ``row`` (one change) the row's entries are read here."""
+        target = self.velocity.at("indices[q]")
+        if row is not None:
+            ((_, delta),) = changes
+            body = (
+                f"const int index = {self.guarded_coordinate(row)};\n"
+                f"if (index >= 0) {self.velocity.at('index')} += {self.element(row)} * {delta};"
+            )
+            return self.entries_loop(body, indent)
+        if len(changes) == 1:
+            ((name, delta),) = changes
+            return self.entries_loop(f"if (indices[q] >= 0) {target} += {name}_z[q] * {delta};", indent, entry=False)
+        body = [
+            "if (indices[q] >= 0) {",
+            f"    float value = {'velocities[q]' if kept else target};",
+            *(f"    if ({delta} != 0.0f) value += {name}_z[q] * {delta};" for name, delta in changes),
+            f"    {target} = value;",
+            "}",
+        ]
+        return self.entries_loop("\n".join(body), indent, entry=False)
+
+    # -- the row law's actions, as the two ------------------------------------------------------------------------
 
     def residual(
         self,
@@ -1349,39 +1430,10 @@ class SparseFactor(ResponseOperator):
         ``pair_coupling = Z_row . Z_sibling`` in the same ``SUM`` and keeps the sibling's entries for
         :meth:`apply_pair`; a contact's spin row, where it has one, reduces its own terms (:meth:`spin_terms`).
         """
-        count = self.entries
-        lines = [f"int indices[{count}];", f"float responses[{count}];"]
-        body = [
-            f"const int index = {self.guarded_coordinate(row)};",
-            f"const float value = index >= 0 ? {self.element(row)} : 0.0f;",
-        ]
         if sibling is None:
-            lines.append(f"float {out} = 0.0f;")
-            body += [
-                "indices[q] = index;",
-                "responses[q] = value;",
-                f"if (index >= 0) {out} += value * {self.velocity.at('index')};",
-            ]
-            reduce = self.lanes.reduce(out)
-        else:
-            lines += [f"float sibling_responses[{count}];", f"float {out} = 0.0f;"]
-            lines += ["float sibling_jv = 0.0f;", "float pair_coupling = 0.0f;"]
-            body += [
-                f"const float sibling_value = {paired} && index >= 0",
-                f"    ? {self.element(sibling)} : 0.0f;",
-                "indices[q] = index;",
-                "responses[q] = value;",
-                "sibling_responses[q] = sibling_value;",
-                "if (index >= 0) {",
-                f"    const float velocity = {self.velocity.at('index')};",
-                f"    {out} += value * velocity;",
-                "    sibling_jv += sibling_value * velocity;",
-                "    pair_coupling += value * sibling_value;",
-                "}",
-            ]
-            reduce = self.lanes.reduce(out, "sibling_jv", "pair_coupling")
-        text = "\n".join(indent + line for line in lines) + "\n" + self.entries_loop("\n".join(body), indent)
-        return text + "".join(f"\n{indent}{line}" for line in reduce.split("\n") if line)
+            return self.dot(((out, "row", None),), {"row": row}, indent)
+        sums = ((out, "row", None), ("sibling_jv", "sib", None), ("pair_coupling", "row", "sib"))
+        return self.dot(sums, {"row": row, "sib": sibling}, indent, exists={"sib": paired})
 
     def sibling_residual(self, out: str, sibling: str, indent: str, rhs: str) -> str:
         """``float out = Z_s . delta + rhs`` of the pair's second tangent, whose sum :meth:`residual` reduced."""
@@ -1392,108 +1444,40 @@ class SparseFactor(ResponseOperator):
         return f"{indent}float {out} = pair_coupling;"
 
     def spin_terms(self, row: str, sibling: str, spin: str, rhs: Callable[[str], str], indent: str) -> str:
-        """The spin row's residual and its couplings with the pair, reduced in one ladder over the entries
+        """The spin row's residual and its couplings with the pair, reduced in one ladder on the support and entries
         :meth:`residual` kept (a contact's rows share its support): only a contact with a spin row pays them."""
-        sums = ("spin_residual", "spin_cross", "spin_cross_sibling")
-        terms = (
-            "    spin_cross += responses[q] * spin_value;",
-            "    spin_cross_sibling += sibling_responses[q] * spin_value;",
-        )
-        declare = f"{indent}float spin_residual = 0.0f, spin_cross = 0.0f, spin_cross_sibling = 0.0f;\n"
-        body = "\n".join(
-            (
-                "if (indices[q] >= 0) {",
-                f"    const float spin_value = {self.element(spin)};",
-                f"    spin_residual += spin_value * {self.velocity.at('indices[q]')};",
-                *terms,
-                "}",
-            )
-        )
-        reduce = self.lanes.reduce(*sums)
-        return (
-            declare
-            + self.entries_loop(body, indent)
-            + "".join(f"\n{indent}{line}" for line in reduce.split("\n") if line)
-            + f"\n{indent}spin_residual += {rhs(spin)};"
-        )
+        sums = (("spin_residual", "spin", None), ("spin_cross", "row", "spin"), ("spin_cross_sibling", "sib", "spin"))
+        terms = self.dot(sums, {"row": row, "sib": sibling, "spin": spin}, indent, kept=("row", "sib"))
+        return f"{terms}\n{indent}spin_residual += {rhs(spin)};"
 
     def unit_terms(self, rows: tuple[tuple[str, str], ...], indent: str) -> str:
         """``float {name}_jv = Z_row . delta`` of each ``(row, name)`` of a contact's rows, which share the first row's
-        support, reduced in one ladder; the shared coordinates (``indices``), the velocity they read (``velocities``)
-        and each row's entries (``{name}_responses``) are kept for :meth:`unit_apply`."""
-        count = self.entries
-        lines = [
-            f"int indices[{count}];",
-            f"float velocities[{count}];",
-            *(f"float {name}_responses[{count}];" for _, name in rows),
-            "float " + ", ".join(f"{name}_jv = 0.0f" for _, name in rows) + ";",
-        ]
-        body = [
-            f"const int index = {self.guarded_coordinate(rows[0][0])};",
-            "indices[q] = index;",
-            f"velocities[q] = index >= 0 ? {self.velocity.at('index')} : 0.0f;",
-            *(f"{name}_responses[q] = index >= 0 ? {self.element(row)} : 0.0f;" for row, name in rows),
-            *(f"{name}_jv += {name}_responses[q] * velocities[q];" for _, name in rows),
-        ]
-        reduce = self.lanes.reduce(*(f"{name}_jv" for _, name in rows))
-        text = "\n".join(indent + line for line in lines) + "\n" + self.entries_loop("\n".join(body), indent)
-        return text + "".join(f"\n{indent}{line}" for line in reduce.split("\n") if line)
+        support, reduced in one ladder; the support, the velocity there and each row's entries are kept for
+        :meth:`unit_apply`."""
+        sums = tuple((f"{name}_jv", name, None) for _, name in rows)
+        return self.dot(sums, {name: row for row, name in rows}, indent, keep_velocity=True)
 
     def unit_apply(self, changes: tuple[tuple[str, str], ...], indent: str) -> str:
         """``delta_v += sum Z_row d`` over the ``(name, d)`` of :meth:`unit_terms`' rows, per entry in the order given,
         each when nonzero, from the velocity :meth:`unit_terms` read, written back once."""
-        body = [
-            "if (indices[q] >= 0) {",
-            "    float value = velocities[q];",
-            *(f"    if ({delta} != 0.0f) value += {name}_responses[q] * {delta};" for name, delta in changes),
-            f"    {self.velocity.at('indices[q]')} = value;",
-            "}",
-        ]
-        return self.entries_loop("\n".join(body), indent, entry=False)
+        return self.axpy(changes, indent, kept=True)
 
     def apply(self, delta: str, indent: str) -> str:
         """``delta_v += Z_row delta`` from the entries :meth:`residual` (or :meth:`row_velocity`) kept."""
-        target = self.velocity.at("indices[q]")
-        return self.entries_loop(f"if (indices[q] >= 0) {target} += responses[q] * {delta};", indent, entry=False)
+        return self.axpy((("row", delta),), indent)
 
     def apply_pair(self, sibling_delta: str, delta: str, indent: str) -> str:
         """``delta_v += Z_s sibling_delta + Z_row delta`` from :meth:`residual`'s entries: per entry the sibling's
         change, then the row's, each when nonzero, written back once."""
-        target = self.velocity.at("indices[q]")
-        body = (
-            "if (indices[q] >= 0) {\n"
-            f"    float value = {target};\n"
-            f"    if ({sibling_delta} != 0.0f) value += sibling_responses[q] * {sibling_delta};\n"
-            f"    if ({delta} != 0.0f) value += responses[q] * {delta};\n"
-            f"    {target} = value;\n"
-            "}"
-        )
-        return self.entries_loop(body, indent, entry=False)
+        return self.axpy((("sib", sibling_delta), ("row", delta)), indent)
 
     def accumulate(self, out: str, row: str, indent: str) -> str:
         """``out += Z_row . delta`` over this lane's entries, in order, unreduced."""
-        body = (
-            f"const int index = {self.guarded_coordinate(row)};\n"
-            f"if (index >= 0) {out} += {self.element(row)} * {self.velocity.at('index')};"
-        )
-        return self.entries_loop(body, indent)
+        return self.dot(((out, "row", None),), {"row": row}, indent, reduce=False)
 
     def row_velocity(self, out: str, row: str, indent: str) -> str:
         """``float out = Z_row . delta`` (every lane holds it), the row's entries kept for :meth:`apply_strided`."""
-        count = self.entries
-        body = (
-            f"const int index = {self.guarded_coordinate(row)};\n"
-            f"const float response = index >= 0 ? {self.element(row)} : 0.0f;\n"
-            "indices[q] = index;\n"
-            "responses[q] = response;\n"
-            f"if (index >= 0) {out} += response * {self.velocity.at('index')};"
-        )
-        reduce = self.lanes.reduce(out)
-        return (
-            f"{indent}int indices[{count}];\n{indent}float responses[{count}];\n{indent}float {out} = 0.0f;\n"
-            + self.entries_loop(body, indent)
-            + (f"\n{indent}{reduce}" if reduce else "")
-        )
+        return self.dot(((out, "row", None),), {"row": row}, indent)
 
     def apply_strided(self, row: str, delta: str, indent: str) -> str:
         """``delta_v += Z_row delta`` from the entries :meth:`row_velocity` kept."""
@@ -1501,14 +1485,7 @@ class SparseFactor(ResponseOperator):
 
     def apply_row(self, row: str, delta: str, indent: str) -> str:
         """``delta_v += Z_row delta``, the row's entries read here."""
-        body = (
-            f"const int index = {self.guarded_coordinate(row)};\n"
-            "if (index >= 0) {\n"
-            f"    const float response = {self.element(row)};\n"
-            f"    {self.velocity.at('index')} += response * {delta};\n"
-            "}"
-        )
-        return self.entries_loop(body, indent)
+        return self.axpy((("row", delta),), indent, row=row)
 
     def expand(self, rows: str, indent: str) -> str:
         """Expand the packed rows ``[0, rows)`` into the dense rows (``local``), zero elsewhere; ends unsynchronized."""
