@@ -1375,7 +1375,7 @@ def support_threads(units: int, device, line: tuple[int, int] = (SUPPORT_BLOCK, 
 # A row's seed on the arm walks into the row's dense part, the arm's coordinates in the walk's order; a seed on a key is
 # one step to the world, z = (s . w) / ell, the key's step J entry over the root of its pivot (the J / sqrt(m) slot,
 # 1 / ell = sqrt(m^-1) of the factor's diagonal), into the row's two slots. The sweep reads the dense part and the slots
-# (:class:`.response_operator.SparsePairZ`) and leaves the arm by the walk (:func:`.factor.walk.walk_leave_kernel`), the
+# (:func:`.sweep_routes_diag.slot_rows`) and leaves the arm by the walk (:func:`.factor.walk.walk_leave_kernel`), the
 # release its rows carry.
 
 SLOT_ROWS = (

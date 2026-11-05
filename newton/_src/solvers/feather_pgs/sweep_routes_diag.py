@@ -4,11 +4,11 @@
 """The sparse-diagonal sweep as a configuration of the sweep emitter (:mod:`.sweep`).
 
 :func:`sparse_diagonal_kernel`: a world's dense group plus diagonal-mass coordinates as whitened rows
-(:class:`.SparsePairZ`), one warp per world, on the velocity change from the predictor in factor coordinates, from zero:
+(:func:`slot_rows`, a :class:`.SparseFactor`), one warp per world, on the velocity change from the predictor in factor coordinates, from zero:
 ``du = R^-T L^T P dv`` on the dense articulation (the walk's factor and its slips' release, the frame its rows were whitened
 in) and ``du = sqrt(m) dv`` on a diagonal coordinate, left once and added to the predictor. Each sweep runs its coordinates' fused joint limits, its independent scalar contacts one lane per chain, then its
 coupled rows in order (plain or contact units, optionally with speculative batches), a loaded coupled
-contact unit by the unit law (:meth:`.SparsePairZ.unit_terms`, :func:`.sweep.contact_unit`). Its working set fits the static
+contact unit by the unit law (:func:`.sweep.contact_unit`). Its working set fits the static
 budget of the device it is built for (:func:`.memory.arch_budget`).
 """
 
@@ -26,7 +26,7 @@ from .factor.walk import WalkTrees
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
 from .projection_laws import CONE_LAW, PROJECTION_LAW
-from .response_operator import Lanes, SparsePairZ
+from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound
@@ -158,6 +158,46 @@ def _diagonal_limits(dofs: int, dense_dofs: int, laws: RowLaws) -> tuple[str, st
     return "\n".join(declarations), "\n".join(loads), "\n".join(rows), "\n".join(stores)
 
 
+def slot_rows(dense: int, rows: int, lanes: Lanes) -> SparseFactor:
+    """The sparse diagonal's rows over a world's dense group of ``dense`` coordinates plus two slots, a lane an entry.
+
+    The sweep holds the velocity change in factor coordinates: ``u = R^-T L^T P dv`` on the dense articulation (the
+    walk's factor and its slips' release) and ``u = sqrt(m) dv`` on a diagonal coordinate (a star's factor is
+    diagonal). Row ``i``'s entry ``e < dense`` is its walk's footprint at ``dense_Z[(dense_group * rows + i) * dense +
+    e]`` on coordinate ``dense_offset + e``; entries ``dense`` and ``dense + 1`` are its two slots, coordinate
+    ``sparse_row_dof[(row_base + i) * 2 + s]`` (``-1`` for none, below ``-1`` an independent chain's link) and ``Z_s =
+    J_s / sqrt(m_s)``, a key's one step, at ``sparse_row_z``. A contact's rows act on its two bodies' coordinates,
+    which the build puts in the same slot of each row (:func:`.walk_rows.slot_header`): its rows share a support.
+    """
+
+    def index(row, entry):
+        return (
+            f"({entry} < {dense} ? dense_offset + {entry} : sparse_row_dof.data[(row_base + {row}) * 2 + {entry} - "
+            f"{dense}])"
+        )
+
+    def factor(row, entry):
+        return (
+            f"({entry} < {dense} ? dense_Z.data[(dense_group * {rows} + {row}) * {dense} + {entry}] : "
+            f"sparse_row_z.data[(row_base + {row}) * 2 + {entry} - {dense}])"
+        )
+
+    return SparseFactor(dense + 2, index, factor, lanes, velocity=Velocity("s_v"))
+
+
+SCALAR_ROWS = SparseFactor(
+    1,
+    lambda row, entry: "scalar_coord",
+    lambda row, entry: (
+        f"sparse_row_z.data[(row_base + {row}) * 2 + (sparse_row_dof.data[(row_base + {row}) * 2] >= 0 ? 0 : 1)]"
+    ),
+    Lanes(1),
+    velocity=Velocity("s_v"),
+)
+"""An independent scalar contact's rows, one thread: one entry, on the chain's coordinate ``scalar_coord``, through the
+slot that holds it (the other is the chain's link); its dense part is empty."""
+
+
 def sparse_diagonal_source(
     max_constraints: int,
     max_world_dofs: int,
@@ -175,7 +215,7 @@ def sparse_diagonal_source(
     Every sweep runs the world's fused diagonal joint limits (one lane per coordinate), then its independent scalar
     contacts (one lane per chain: a contact whose coordinate no coupled row touches commutes with the coupled rows,
     and its one-product residual rounds as the warp's sum of it does), then the coupled rows in row order with
-    :class:`.SparsePairZ`'s warp layout, all on the velocity change in factor coordinates, from zero (left once before
+    :func:`slot_rows`' warp layout, all on the velocity change in factor coordinates, from zero (left once before
     it is added to the predictor). ``contact_units`` schedules the contacts (a normal, and its
     tangent pair only when it owns an anchor): it skips an independent contact in the serial order and a pair whose patch carries no load. Every schedule, the plain
     one at a normal row that owns the tangent pair after it, solves a loaded coupled contact unit by the unit law
@@ -211,7 +251,7 @@ def sparse_diagonal_source(
         return RowContext(
             row="i",
             kind="row_type",
-            operator=SparsePairZ(P, M, lanes),
+            operator=slot_rows(P, M, lanes) if lanes.parallel else SCALAR_ROWS,
             diagonal=Diagonal(lambda row: "denom" if row == "i" else rows.diag(row)),
             load=rows.peek,
             store=lambda row, value: f"{rows.peek(row)} = {value};",
@@ -223,8 +263,7 @@ def sparse_diagonal_source(
             ring_load=rows.ring_load,
             lanes=lanes,
             inline_velocity_limit=False,
-            # Every lane (or the one thread) stores what it computed; a pair finishes its second tangent in its branch,
-            # on the entries it kept (SparsePairZ.pair_entries).
+            # Every lane (or the one thread) stores what it computed.
             owned=False,
             friction=friction,
             spin_row=lambda parent: rows.spin_of(parent, "row_count"),
@@ -237,6 +276,8 @@ def sparse_diagonal_source(
         visit is emitted replaces the row's metadata, so the visit compiles to that kind's law; a known kind other than
         friction admits no pair."""
         ctx = context(lanes, friction=kind in (None, FRICTION))
+        # A first tangent's residual reduces its pair's terms with its own, on the support's one load.
+        pair = {"sibling": "parent + 2", "paired": f"row_type == {FRICTION}"} if ctx.friction else {}
         # A spin row is solved with its friction pair.
         skip = f"{pad}if (row_type == {TORSION}) continue;\n" if torsion and kind is None else ""
         return (
@@ -248,12 +289,36 @@ def sparse_diagonal_source(
                 parent=rows.parent("i") if parent is None else parent,
                 check="denom",
                 declare=f"const float denom = {rows.diag('i')};",
-                entries=ctx.operator.consume("i", ""),
+                residual=ctx.operator.residual("jv", pad, **pair),
                 pad=pad,
             )
         )
 
-    pair_op = SparsePairZ(P, M, warp)
+    pair_op = slot_rows(P, M, warp)
+    # A unit's three rows on their shared support: their velocity terms, the pair's couplings with the normal and with
+    # each other, in one ladder; the support, the velocity there and the rows' entries kept for the unit's apply.
+    unit_sums = (
+        ("unit_jv0", "normal", None),
+        ("unit_jv1", "tangent1", None),
+        ("unit_jv2", "tangent2", None),
+        ("gram_n1", "normal", "tangent1"),
+        ("gram_n2", "normal", "tangent2"),
+        ("unit_cross", "tangent1", "tangent2"),
+    )
+    unit_terms = pair_op.dot(
+        unit_sums, {"normal": "head", "tangent1": "head + 1", "tangent2": "head + 2"}, "        ", keep_velocity=True
+    )
+    # The unit's changes in one pass on each lane's coordinate, summed before they are added; the lanes synchronize.
+    unit_change = "(z_normal[q] * unit_dn + z_tangent1[q] * unit_dt1) + z_tangent2[q] * unit_dt2"
+    unit_apply = (
+        pair_op.entries_loop(
+            "if ((unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f) && indices[q] >= 0)\n"
+            f"    s_v[indices[q]] = velocities[q] + ({unit_change});",
+            "        ",
+            entry=False,
+        )
+        + f"\n        {warp.sync()}"
+    )
 
     def contact_rows(head: str) -> str:
         """The rows of the friction contact headed by row ``head``: three, or four with a spin row (the data's,
@@ -276,7 +341,7 @@ def sparse_diagonal_source(
 
     def coupled(condition: str, advance: str = "i") -> str:
         """At row ``i``, when ``condition`` holds (``i`` heads a coupled contact unit with a pair, and no spin row) and
-        the unit is loaded, the unit on its Gram block in the warp's layout (:meth:`.SparsePairZ.unit_terms`); the loop then moves
+        the unit is loaded, the unit on its Gram block in the warp's layout; the loop then moves
         ``advance`` past its rows. An unloaded unit, or a contact with a spin row, falls through to the loop's row
         visits."""
         spinless = f" && {rows.spin_of('i', 'row_count')} < 0" if torsion else ""
@@ -284,9 +349,9 @@ def sparse_diagonal_source(
     const int unit_rows = 3;
     if ({loaded}) {{
         const int head = i;
-{pair_op.unit_terms("head", "        ")}
+{unit_terms}
 {indent(unit_rows, "    ")}
-{pair_op.unit_apply("        ")}
+{unit_apply}
         {advance} += unit_rows - 1;
         continue;
     }}
@@ -358,7 +423,7 @@ def sparse_diagonal_source(
     def batch(index: str, count: str) -> str:
         """Test the batch of serial contacts from ``index``: one contact per segment of ``batch_lanes`` lanes, its
         normal's prospective update; declares ``noop_lanes``, the lanes whose contact would change nothing."""
-        segment = SparsePairZ(P, M, Lanes(batch_lanes, "batch_lane", segment=True))
+        segment = slot_rows(P, M, Lanes(batch_lanes, "batch_lane", segment=True))
         step = Diagonal(rows.diag).step(
             "(candidate_velocity + " + rows.rhs_of("candidate_normal") + ")", "candidate_normal"
         )

@@ -809,252 +809,6 @@ class TransposedResponse(ResponseOperator):
 
 
 @dataclass(frozen=True)
-class SparsePairZ(ResponseOperator):
-    """Whitened rows over a world's dense group of ``dofs`` coordinates plus two scalar sparse coordinates.
-
-    The sparse-diagonal rows: a world pairs one compact dense articulation (its group ``group``, first coordinate
-    ``offset``) with diagonal-mass coordinates, and the sweep holds the velocity change in factor coordinates: ``u =
-    R^-T L^T P dv`` on the dense articulation (the walk's factor and its slips' release) and ``u = sqrt(m) dv`` on a
-    diagonal coordinate (a star's factor is diagonal). Row ``i``'s dense part is its walk's footprints ``Z = F L^-1 P
-    J^T`` at ``Z[(group * rows + i) * dofs + l]`` on coordinate ``offset + l`` (the walk's coordinate ``l``); its sparse
-    part is two slots ``s``: coordinate ``sparse_dof[(base + i) * 2 + s]`` (``-1`` for none, below ``-1`` an
-    independent chain's link) and ``Z_s = J_s / sqrt(m_s)``, a key's one step, at ``sparse_z[(base + i) * 2 + s]``. A row's velocity term is ``Z^T u``, its update
-    ``u += Z delta``, and two rows couple through ``Z_i^T Z_s``: ``W = Z^T Z``.
-
-    With lanes (a warp, or a segment of ``width`` lanes), lane ``l < dofs`` owns dense coordinate ``l`` and lanes
-    ``dofs`` and ``dofs + 1`` the slots: each lane's one product, zero without a coordinate, is reduced with the
-    lanes' sum; the other lanes add zero. A segment of at least ``dofs + 2`` lanes reduces the same products in the
-    same order as the warp, up to the sign of a zero sum. The visited row's lane entries are ``coord`` and ``z``
-    (:meth:`consume`).
-
-    With one thread (``Lanes(1)``), a row on the single coordinate ``coordinate`` (an independent scalar contact,
-    whose dense part is empty), through the slot that holds it: its product is rounded on its own (``__fmul_rn``,
-    no contraction into the right-hand side's add), as the lanes' sum of one product rounds it.
-
-    Written with the rows (:func:`.walk_rows.write_slot_rows`, :func:`.compact_contact.produce_contacts`).
-    """
-
-    dofs: int
-    rows: int
-    lanes: Lanes = Lanes()
-    Z: str = "dense_Z"
-    group: str = "dense_group"
-    offset: str = "dense_offset"
-    sparse_dof: str = "sparse_row_dof"
-    sparse_z: str = "sparse_row_z"
-    base: str = "row_base"
-    coordinate: str = "scalar_coord"
-    velocity: Velocity = Velocity()
-    name = "sparse_pair_z"
-
-    def _entries(self, row: str, coord: str, value: str, indent: str, active=None) -> str:
-        """Declare this lane's coordinate and entry of row ``row`` (``coord`` negative for none)."""
-        lane, P = self.lanes.lane, self.dofs
-        guard = f"{active} && " if active else ""
-        lines = [
-            f"int {coord} = -1;",
-            f"float {value} = 0.0f;",
-            f"if ({guard}{lane} < {P}) {{",
-            f"    {coord} = {self.offset} + {lane};",
-            f"    {value} = {self.Z}.data[({self.group} * {self.rows} + {row}) * {P} + {lane}];",
-            f"}} else if ({guard}{lane} <= {P + 1}) {{",
-            f"    const int sparse_entry = ({self.base} + {row}) * 2 + {lane} - {P};",
-            f"    {coord} = {self.sparse_dof}.data[sparse_entry];",
-            f"    {value} = {self.sparse_z}.data[sparse_entry];",
-            "}",
-        ]
-        return "\n".join(indent + line for line in lines)
-
-    def _slot(self, row: str, name: str, indent: str) -> str:
-        """One thread: declare ``name``, the entry of row ``row``'s slot that holds its coordinate."""
-        sparse_row = f"({self.base} + {row})"
-        return f"{indent}const int {name} = {sparse_row} * 2 + ({self.sparse_dof}.data[{sparse_row} * 2] >= 0 ? 0 : 1);"
-
-    def _here(self, sibling: str, out: str) -> list[str]:
-        """A slot lane's entry of row ``sibling`` on the lane's own coordinate ``coord``: the sibling's slot that
-        carries it, zero when none does (``out`` declared zero before)."""
-        lane, P = self.lanes.lane, self.dofs
-        return [
-            f"if ({lane} >= {P} && {lane} <= {P + 1}) {{",
-            f"    const int {out}_row = ({self.base} + {sibling}) * 2;",
-            f"    {out} = 0.0f;",
-            f"    if (coord >= 0 && coord == {self.sparse_dof}.data[{out}_row])",
-            f"        {out} = {self.sparse_z}.data[{out}_row];",
-            f"    else if (coord >= 0 && coord == {self.sparse_dof}.data[{out}_row + 1])",
-            f"        {out} = {self.sparse_z}.data[{out}_row + 1];",
-            "}",
-        ]
-
-    def consume(self, row: str, indent: str) -> str:
-        """Declare the visited row ``row``'s entries: this lane's ``coord`` and ``z``."""
-        if not self.lanes.parallel:
-            return f"{self._slot(row, 'row_entry', indent)}\n{indent}const float z = {self.sparse_z}.data[row_entry];"
-        return self._entries(row, "coord", "z", indent)
-
-    def residual(self, out: str, indent: str) -> str:
-        """``float out = Z_i^T u`` from the consumed entries (every lane holds it)."""
-        if not self.lanes.parallel:
-            return f"{indent}float {out} = __fmul_rn(z, {self.velocity.at(self.coordinate)});"
-        return (
-            f"{indent}float {out}_partial = coord >= 0 ? z * {self.velocity.at('coord')} : 0.0f;\n"
-            f"{indent}{self.lanes.reduce(f'{out}_partial')}\n"
-            f"{indent}float {out} = {out}_partial;"
-        )
-
-    def row_velocity(self, out: str, row: str, indent: str, *, active: str | None = None) -> str:
-        """``float out = Z_row^T u`` of a row outside the visit (``active``: whether this lane's row exists)."""
-        if not self.lanes.parallel:
-            return (
-                f"{self._slot(row, f'{out}_entry', indent)}\n"
-                f"{indent}float {out} = __fmul_rn({self.sparse_z}.data[{out}_entry], "
-                f"{self.velocity.at(self.coordinate)});"
-            )
-        return (
-            self._entries(row, f"{out}_coord", f"{out}_z", indent, active)
-            + f"\n{indent}float {out} = {out}_coord >= 0 ? {out}_z * {self.velocity.at(f'{out}_coord')} : 0.0f;"
-            + f"\n{indent}{self.lanes.reduce(out)}"
-        )
-
-    def pair_entries(self, sibling: str, indent: str) -> str:
-        """Load the sibling's entries once for the pair's terms and its apply: one thread's slot entry (``sib_z``); a
-        lane's coordinate and entry of the sibling, and the sibling's entry on the lane's own coordinate
-        (``sib_z_here``: a sparse slot's when the sibling carries that coordinate)."""
-        if not self.lanes.parallel:
-            return (
-                f"{self._slot(sibling, 'sib_entry', indent)}\n"
-                f"{indent}const float sib_z = {self.sparse_z}.data[sib_entry];"
-            )
-        lines = [
-            self._entries(sibling, "sib_coord", "sib_z", ""),
-            "float sib_z_here = sib_z;",
-            *self._here(sibling, "sib_z_here"),
-        ]
-        return "\n".join(indent + line for line in "\n".join(lines).split("\n"))
-
-    def pair_terms(self, row: str, sibling: str, rhs: Callable[[str], str], indent: str, *, own: bool = False) -> str:
-        """The pair's terms from the sibling's entries (:meth:`pair_entries`): one thread's two products, a lane's
-        two products reduced in one ladder."""
-        if own:
-            return super().pair_terms(row, sibling, rhs, indent, own=own)
-        if not self.lanes.parallel:
-            return (
-                f"{indent}float sibling_residual = __fmul_rn(sib_z, {self.velocity.at(self.coordinate)});\n"
-                f"{indent}sibling_residual += {rhs(sibling)};\n"
-                f"{indent}float cross = z * sib_z;"
-            )
-        return (
-            f"{indent}float sibling_residual = sib_coord >= 0 ? sib_z * {self.velocity.at('sib_coord')} : 0.0f;\n"
-            f"{indent}float cross = coord >= 0 ? z * sib_z_here : 0.0f;\n"
-            f"{indent}{self.lanes.reduce('sibling_residual', 'cross')}\n"
-            f"{indent}sibling_residual += {rhs(sibling)};"
-        )
-
-    def spin_terms(self, row: str, sibling: str, spin: str, rhs: Callable[[str], str], indent: str) -> str:
-        """The spin row's terms (contact torsion): its residual, and its couplings with the row and the sibling, each
-        an entry product on the visited row's coordinate, which a contact's rows share (one thread: its slot's)."""
-        if not self.lanes.parallel:
-            return (
-                f"{self._slot(spin, 'spin_entry', indent)}\n"
-                f"{indent}const float spin_z = {self.sparse_z}.data[spin_entry];\n"
-                f"{indent}float spin_residual = __fmul_rn(spin_z, {self.velocity.at(self.coordinate)});\n"
-                f"{indent}spin_residual += {rhs(spin)};\n"
-                f"{indent}float spin_cross = z * spin_z;\n"
-                f"{indent}float spin_cross_sibling = sib_z * spin_z;"
-            )
-        lines = [
-            self._entries(spin, "spin_coord", "spin_z", ""),
-            "float spin_z_here = spin_z;",
-            *self._here(spin, "spin_z_here"),
-            f"float spin_residual = spin_coord >= 0 ? spin_z * {self.velocity.at('spin_coord')} : 0.0f;",
-            "float spin_cross = coord >= 0 ? z * spin_z_here : 0.0f;",
-            "float spin_cross_sibling = coord >= 0 ? sib_z_here * spin_z_here : 0.0f;",
-            self.lanes.reduce("spin_residual", "spin_cross", "spin_cross_sibling"),
-            f"spin_residual += {rhs(spin)};",
-        ]
-        return "\n".join(indent + line for line in "\n".join(lines).split("\n"))
-
-    def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
-        """``float out = Z_i^T Z_s`` of the visited row ``row``: each lane's entry times the sibling's on its
-        coordinate (a sparse slot's, when the sibling carries that coordinate), reduced."""
-        if not self.lanes.parallel:
-            return (
-                f"{self._slot(sibling, f'{out}_entry', indent)}\n"
-                f"{indent}float {out} = z * {self.sparse_z}.data[{out}_entry];"
-            )
-        lane, P = self.lanes.lane, self.dofs
-        lines = [
-            f"float {out}_here = 0.0f;",
-            f"if ({lane} < {P}) {out}_here = {self.Z}.data[({self.group} * {self.rows} + {sibling}) * {P} + {lane}];",
-            *self._here(sibling, f"{out}_here"),
-            f"float {out} = coord >= 0 ? z * {out}_here : 0.0f;",
-            self.lanes.reduce(out),
-        ]
-        return "\n".join(indent + line for line in lines)
-
-    def apply(self, delta: str, indent: str) -> str:
-        """``u += Z_i delta`` from the consumed entries."""
-        if not self.lanes.parallel:
-            return f"\n{indent}{self.velocity.at(self.coordinate)} += z * {delta};"
-        return f"\n{indent}if (coord >= 0) {self.velocity.at('coord')} += z * {delta};"
-
-    def apply_row(self, row: str, delta: str, indent: str) -> str:
-        """``u += Z_row delta`` for a row outside the visit; the pair's sibling ``sib`` from its kept entries
-        (:meth:`pair_entries`)."""
-        if row == "sib":
-            if not self.lanes.parallel:
-                return f"\n{indent}{self.velocity.at(self.coordinate)} += sib_z * {delta};"
-            return f"\n{indent}if (sib_coord >= 0) {self.velocity.at('sib_coord')} += sib_z * {delta};"
-        if not self.lanes.parallel:
-            return (
-                f"\n{self._slot(row, 'apply_entry', indent)}\n"
-                f"{indent}{self.velocity.at(self.coordinate)} += {self.sparse_z}.data[apply_entry] * {delta};"
-            )
-        lines = [
-            self._entries(row, "apply_coord", "apply_z", ""),
-            f"if (apply_coord >= 0) {self.velocity.at('apply_coord')} += apply_z * {delta};",
-        ]
-        return "".join(f"\n{indent}{line}" for line in "\n".join(lines).split("\n"))
-
-    def unit_terms(self, head: str, indent: str) -> str:
-        """A contact unit's terms (:class:`.sweep.UnitZ`), the normal ``head`` and its tangents ``head + 1``, ``head +
-        2``: declare this lane's entries of the unit's rows (``unit_z0``..``unit_z2``) and the velocity on their
-        coordinate (``unit_u``), then reduce the rows' velocity terms and the pair's couplings in one ladder.
-
-        A contact's rows act on its two bodies' coordinates, which the build puts in the same slot of each row
-        (:func:`.walk_rows.slot_header`), so the lane that owns a coordinate holds all three rows' entries there: the
-        unit reads the velocity there once and writes it once (:meth:`unit_apply`)."""
-        lane, P, rows = self.lanes.lane, self.dofs, range(3)
-        lines = [
-            "int unit_coord = -1;",
-            f"float {', '.join(f'unit_z{k} = 0.0f' for k in rows)};",
-            f"if ({lane} < {P}) {{",
-            f"    unit_coord = {self.offset} + {lane};",
-            f"    const int unit_dense = ({self.group} * {self.rows} + {head}) * {P} + {lane};",
-            *(f"    unit_z{k} = {self.Z}.data[unit_dense + {k * P}];" for k in rows),
-            f"}} else if ({lane} <= {P + 1}) {{",
-            f"    const int unit_sparse = ({self.base} + {head}) * 2 + {lane} - {P};",
-            f"    unit_coord = {self.sparse_dof}.data[unit_sparse];",
-            *(f"    unit_z{k} = {self.sparse_z}.data[unit_sparse + {2 * k}];" for k in rows),
-            "}",
-            f"const float unit_u = unit_coord >= 0 ? {self.velocity.at('unit_coord')} : 0.0f;",
-            "float unit_jv0 = unit_z0 * unit_u, unit_jv1 = unit_z1 * unit_u, unit_jv2 = unit_z2 * unit_u;",
-            "float gram_n1 = unit_z0 * unit_z1, gram_n2 = unit_z0 * unit_z2, unit_cross = unit_z1 * unit_z2;",
-            self.lanes.reduce("unit_jv0", "unit_jv1", "unit_jv2", "gram_n1", "gram_n2", "unit_cross"),
-        ]
-        return "\n".join(indent + line for line in lines)
-
-    def unit_apply(self, indent: str) -> str:
-        """The unit's changes in one pass on this lane's coordinate; the lanes synchronize after it."""
-        change = "(unit_z0 * unit_dn + unit_z1 * unit_dt1) + unit_z2 * unit_dt2"
-        lines = [
-            "if ((unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f) && unit_coord >= 0)",
-            f"    {self.velocity.at('unit_coord')} = unit_u + ({change});",
-            self.lanes.sync(),
-        ]
-        return "\n".join(indent + line for line in lines)
-
-
-@dataclass(frozen=True)
 class SparseFactor(ResponseOperator):
     """Rows of ``Z = L^-1 P J^T`` as packed factor rows, acting on the factor-coordinate velocity delta.
 
@@ -1117,11 +871,11 @@ class SparseFactor(ResponseOperator):
         lines = [*head, *("    " + line for line in body.split("\n")), "}"]
         return "\n".join(indent + line if line.strip() else line for line in lines)
 
-    def guarded_coordinate(self, row: str) -> str:
-        """The coordinate of this lane's ``entry`` of row ``row``, -1 past the row (with lanes)."""
-        if not self.lanes.parallel:
-            return self.coordinate(row)
-        return f"entry < {self.width} ? {self.coordinate(row)} : -1"
+    def guarded_coordinate(self, row: str, exists: str = "") -> str:
+        """The coordinate of this lane's ``entry`` of row ``row``, -1 past the row (with lanes) or where the row's
+        condition ``exists`` fails."""
+        guards = " && ".join(c for c in (exists, f"entry < {self.width}" if self.lanes.parallel else "") if c)
+        return f"{guards} ? {self.coordinate(row)} : -1" if guards else self.coordinate(row)
 
     # -- the two actions ----------------------------------------------------------------------------------------------
 
@@ -1181,7 +935,7 @@ class SparseFactor(ResponseOperator):
         if kept:
             body.append("const int index = indices[q];")
         else:
-            body.append(f"const int index = {self.guarded_coordinate(rows[names[0]])};")
+            body.append(f"const int index = {self.guarded_coordinate(rows[names[0]], exists.get(names[0], ''))};")
             body += ["indices[q] = index;"] if keep_support else []
         body += [f"z_{name}[q] = index >= 0 ? {name}_value : 0.0f;" for name in loaded]
         # The sums take this lane's entries where the support has one; padding adds nothing.
@@ -1317,9 +1071,10 @@ class SparseFactor(ResponseOperator):
         """``out += Z_row . delta`` over this lane's entries, in order, unreduced."""
         return self.dot(((out, "row", None),), {"row": row}, indent, reduce=False)
 
-    def row_velocity(self, out: str, row: str, indent: str) -> str:
-        """``float out = Z_row . delta`` (every lane holds it), the row's entries kept for :meth:`apply_strided`."""
-        return self.dot(((out, "row", None),), {"row": row}, indent)
+    def row_velocity(self, out: str, row: str, indent: str, *, active: str = "") -> str:
+        """``float out = Z_row . delta`` (every lane holds it), the row's entries kept for :meth:`apply_strided`; zero
+        where ``active`` fails (no row)."""
+        return self.dot(((out, "row", None),), {"row": row}, indent, exists={"row": active} if active else None)
 
     def apply_strided(self, row: str, delta: str, indent: str) -> str:
         """``delta_v += Z_row delta`` from the entries :meth:`row_velocity` kept."""

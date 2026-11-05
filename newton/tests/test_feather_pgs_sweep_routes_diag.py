@@ -19,7 +19,7 @@ from pathlib import Path
 import warp as wp
 
 from newton._src.solvers.feather_pgs import sweep_routes_diag as routes
-from newton._src.solvers.feather_pgs.response_operator import FreeBodyZ, Lanes, SparsePairZ, Velocity
+from newton._src.solvers.feather_pgs.response_operator import FreeBodyZ, Lanes, Velocity
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
 from newton._src.solvers.feather_pgs.sweep import RowLaws, speed_row
 
@@ -81,8 +81,8 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
         self.assertIn("const int contact_start = min(dense_phase_bounds.data[world * 2 + 1], row_count);", units)
         self.assertIn("const int contact_start = row_count;", plain)
         self.assertNotIn("independent_group_count", plain)
-        # Independent contacts: one product rounded alone, as the warp's sum of it rounds.
-        self.assertIn("float jv = __fmul_rn(z, s_v[scalar_coord]);", units)
+        # Independent contacts: a row of one entry, on the chain's coordinate: one product, added to zero.
+        self.assertIn("const int index = scalar_coord;", units)
         # A chain visits a contact's normal and its pair's first tangent with their kinds (and the pair's parent) known,
         # so no visit reads row metadata; the second tangent is only zeroed while friction waits. A unit has a pair
         # only when it owns an anchor.
@@ -92,12 +92,11 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
             self.assertIn("parent = head;", text)
             self.assertNotIn("pair_visits", text)
         self.assertIn("if (head + 2 < row_count", units)
-        # A pair loads its sibling's entries once and reduces its two terms in one ladder; its apply reuses them.
+        # A first tangent reduces its pair's terms with its own residual, on the support's one load; the pair's apply
+        # reuses the entries the residual kept, the sibling's change first.
         for text in (units,):
-            self.assertEqual(text.count("SUM(sibling_residual, cross);"), 1)
-            self.assertEqual(text.count("const float sib_z = sparse_row_z.data[sib_entry];"), 1)
-            self.assertIn("s_v[scalar_coord] += sib_z * sib_delta;", text)
-            self.assertIn("if (sib_coord >= 0) s_v[sib_coord] += sib_z * sib_delta;", text)
+            self.assertIn("SUM(jv, sibling_jv, pair_coupling);", text)
+            self.assertIn("if (sib_delta != 0.0f) value += z_sib[q] * sib_delta;", text)
         # Every schedule solves a loaded coupled contact unit by the unit law in the warp's layout, before the row visits
         # an unloaded unit falls through to: the unit's three rows on a lane's coordinate, their velocity terms and the
         # pair's couplings in one ladder, the rows by the row law, one apply, the loop past the unit. A chain's contacts
@@ -108,14 +107,16 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
             self.assertEqual(text.count(loaded), 1)
             self.assertIn("float jv = r == 0 ? unit_jv0 : unit_jv1 + gram_n1 * unit_dn;", text)
             self.assertIn(
-                "s_v[unit_coord] = unit_u + ((unit_z0 * unit_dn + unit_z1 * unit_dt1) + unit_z2 * unit_dt2);", text
+                "s_v[indices[q]] = velocities[q] + ((z_normal[q] * unit_dn + z_tangent1[q] * unit_dt1) + "
+                "z_tangent2[q] * unit_dt2);",
+                text,
             )
             self.assertLess(text.index(loaded), text.rindex("const int row_type = s_meta_dense[i]"))
         for text in (units,):
             start = text.index("const int independent_group_count")
             chains = text[start : text.index("SYNC();", start)]
             self.assertNotIn("unit_jv", chains)
-            self.assertIn("float jv = __fmul_rn(z, s_v[scalar_coord]);", chains)
+            self.assertIn("const int index = scalar_coord;", chains)
         # The plain schedule has no chain phase: a contact a chain's link marks keeps its row visits there too, so every
         # schedule solves the same rows by the same law (the CUDA twins compare the schedules bit for bit).
         marked = "!(sparse_row_dof.data[(row_base + i) * 2] < -1 || sparse_row_dof.data[(row_base + i) * 2 + 1] < -1)"
@@ -198,25 +199,25 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
         # The lanes push the speed row's change from their first lane.
         self.assertIn("if (lane == 0) {", _speed_row(Lanes(32), Velocity("s_v")))
 
-    def test_sparse_pair_layouts(self):
-        warp = SparsePairZ(6, 32, Lanes(32))
-        self.assertIn(
-            "float jv_partial = coord >= 0 ? z * s_v[coord] : 0.0f;\nSUM(jv_partial);", warp.residual("jv", "")
-        )
-        consumed = warp.consume("i", "")
-        self.assertIn("lane <= 7", consumed)
-        # One whitened entry per lane: the dense part's Z, or a slot's Z_s, read where the coordinate is.
-        self.assertIn("z = dense_Z.data[(dense_group * 32 + i) * 6 + lane];", consumed)
-        self.assertIn("const int sparse_entry = (row_base + i) * 2 + lane - 6;", consumed)
-        self.assertIn("z = sparse_row_z.data[sparse_entry];", consumed)
-        # W = Z^T Z: the coupling and the apply read the same entries the residual does.
-        self.assertIn("float cross = coord >= 0 ? z * cross_here : 0.0f;", warp.coupling("cross", "i", "s", ""))
-        self.assertIn("if (coord >= 0) s_v[coord] += z * delta;", warp.apply("delta", ""))
-        segment = SparsePairZ(6, 32, Lanes(8, "batch_lane", segment=True))
-        self.assertIn("SEGMENT_SUM(8, v);", segment.row_velocity("v", "c", "", active="valid"))
-        self.assertIn("if (valid && batch_lane < 6)", segment.row_velocity("v", "c", "", active="valid"))
-        scalar = SparsePairZ(6, 32, Lanes(1))
-        self.assertIn("__fmul_rn(z, s_v[scalar_coord])", scalar.residual("jv", ""))
+    def test_slot_row_layouts(self):
+        """The sparse diagonal's rows are packed rows of a dense group and two slots: a lane an entry."""
+        warp = routes.slot_rows(6, 32, Lanes(32))
+        residual = warp.residual("jv", "")
+        self.assertIn("SUM(jv);", residual)
+        # One whitened entry per lane: the dense part's Z, or a slot's Z_s, at the entry's coordinate.
+        self.assertIn("dense_Z.data[(dense_group * 32 + i) * 6 + entry]", residual)
+        self.assertIn("sparse_row_z.data[(row_base + i) * 2 + entry - 6]", residual)
+        self.assertIn("sparse_row_dof.data[(row_base + i) * 2 + entry - 6]", residual)
+        # W = Z^T Z: a first tangent reduces its pair's terms with its own, on the shared support.
+        paired = warp.residual("jv", "", sibling="parent + 2", paired="row_type == 2")
+        self.assertIn("SUM(jv, sibling_jv, pair_coupling);", paired)
+        segment = routes.slot_rows(6, 32, Lanes(8, "batch_lane", segment=True))
+        velocity = segment.row_velocity("v", "c", "", active="valid")
+        self.assertIn("SEGMENT_SUM(8, v);", velocity)
+        self.assertIn("const int index = valid && entry < 8 ?", velocity)
+        scalar = routes.SCALAR_ROWS.residual("jv", "")
+        self.assertIn("const int index = scalar_coord;", scalar)
+        self.assertNotIn("SUM", scalar)
 
 
 def _assemble(kernel, arch: int = 120) -> dict:
