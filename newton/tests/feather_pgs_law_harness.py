@@ -814,7 +814,7 @@ def _walked_coordinates(solver):
         (forest.world_count, max(int(forest.max_world_dofs), 1)), dtype=float, device=solver.model.device
     )
     wp.launch(
-        walk_enter_kernel(),
+        walk_enter_kernel(factor.walk_classes),
         dim=factor.walk_arts.shape[0],
         inputs=[
             factor.walk_arts,

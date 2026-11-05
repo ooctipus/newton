@@ -297,27 +297,26 @@ class TreeKineticState:
         from .tree_scan import WALK_BOTH, WalkClass  # noqa: PLC0415
 
         factor, layout = self.solver.factor, self.layout
-        path = getattr(factor, "walk_path_host", None)
-        starts, ends = self.solver.model.articulation_start.numpy(), self.solver.forest.articulation_joint_end_host
+        walking = getattr(factor, "walk_class_host", None)
         classes = []
         for r, family in enumerate(layout.root_families if layout.forest else (layout.dofs,)):
             if family == 0:
                 classes.append(None)
                 continue
-            if path is None:
-                raise RuntimeError("The predictor solves by the walk: the solver holds it for every responding tree")
             arts = self._root_arts[:, r]
-            first = arts[0]
-            table = path[starts[first] : ends[first]]
+            if walking is None or np.any(walking[arts] < 0):
+                raise RuntimeError("The predictor solves by the walk: the solver holds it for every responding tree")
+            table = factor.walk_classes[walking[arts[0]]]
             for art in arts[1:].tolist():
-                if not np.array_equal(path[starts[art] : ends[art]], table):
+                other = factor.walk_classes[walking[art]]
+                if (other.parent, other.first) != (table.parent, table.first):
                     raise ValueError("A predictor group's trees of one root must share their walk's path table")
-            count = int(self.solver.forest.articulation_dof_count.numpy()[first])
+            count = table.coordinates
             # Each coordinate's column half where every tree of the root agrees, else read from its record.
             d0 = self.solver.forest.articulation_dof_start.numpy()
             halves = np.stack([factor.walk_half_host[int(d0[a]) : int(d0[a]) + count] for a in arts.tolist()])
             half = tuple(int(h[0]) if np.all(h == h[0]) else WALK_BOTH for h in halves.T)
-            classes.append(WalkClass(tuple(int(x) for x in table[:, 0]), (*(int(x) for x in table[:, 1]), count), half))
+            classes.append(WalkClass(table.parent, table.first, half))
         return tuple(classes)
 
     def _force_input(self, state_in, state_aug, control, predictor_qd, dt):

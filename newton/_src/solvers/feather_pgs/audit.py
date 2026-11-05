@@ -466,7 +466,7 @@ class Audit:
         solver = self.solver
         factor, forest = solver.factor, solver.forest
         wp.launch(
-            walk_enter_kernel(),
+            walk_enter_kernel(factor.walk_classes),
             dim=factor.walk_arts.shape[0],
             inputs=[
                 factor.walk_arts,

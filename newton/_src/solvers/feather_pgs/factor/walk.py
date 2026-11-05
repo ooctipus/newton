@@ -8,7 +8,7 @@ leave ``P^T L^-T u``) and ``meet``. On the device (FL3.1) a lane walks a seed up
 table in constant memory: the walk's preludes (:func:`walk_prelude`, :func:`walk_paths_prelude`,
 :func:`walk_row_prelude`, :func:`walk_down_prelude`, :func:`walk_loads_prelude`), the leave
 (:func:`walk_leave_kernel`), the walk's device struct (:class:`WalkTrees`) and its refresh, the inward pass
-(:func:`walk_inward`, :func:`walk_step_kernel`). The factor (:class:`.tree_factor.TreeFactor`) holds the walk's data.
+(:func:`walk_step_kernel`). The factor (:class:`.tree_factor.TreeFactor`) holds the walk's data.
 """
 
 from __future__ import annotations
@@ -479,7 +479,39 @@ _WALK_TABLE = """    // The classes' path tables in constant memory, class after
         WALK_BODIES = WALK_CLASS[cls + 1] - WALK_AT;
     };
     const auto WALK_PARENT_OF = [&](const int b) -> int { return WALK_PARENT[WALK_AT + b]; };
-    const auto WALK_FIRST_OF = [&](const int b) -> int { return WALK_FIRST[WALK_AT_FIRST + b]; };"""
+    const auto WALK_FIRST_OF = [&](const int b) -> int { return WALK_FIRST[WALK_AT_FIRST + b]; };$joins"""
+
+_WALK_JOINS = """
+    // Each body's join slot (WALK_JOIN, WalkClass.slots: -1 where no child other than the next body meets it).
+    $join_table
+    const auto WALK_JOIN_OF = [&](const int b) -> int { return WALK_JOIN[WALK_AT + b]; };"""
+
+
+def walk_table(tables: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...], joins: bool = False) -> str:
+    """The classes' path tables in constant memory (:data:`_WALK_TABLE`): ``WALK_TREE(cls)``, ``WALK_PARENT_OF``,
+    ``WALK_FIRST_OF`` and ``WALK_BODIES``, with ``joins`` each body's join slot (``WALK_JOIN_OF``,
+    :attr:`.tree_scan.WalkClass.slots`). No walking tree: one class of no body.
+
+    Args:
+        tables: Each class's path table: each body's parent (-1: the world, every parent before its children), and
+            each body's first coordinate with the count after the last.
+        joins: Whether to declare each body's join slot.
+    """
+    tables = tables or (((), (0,)),)
+    if any(len(first) != len(parent) + 1 or any(p >= b for b, p in enumerate(parent)) for parent, first in tables):
+        raise ValueError("a walk's path table needs every parent before its children and a first coordinate per body")
+    starts = [0]
+    for parent, _ in tables:
+        starts.append(starts[-1] + len(parent))
+    slots = [s for parent, first in tables for s in ts.WalkClass(parent, first).slots[0]]
+    return substitute(
+        _WALK_TABLE,
+        parent_table=ts.constant_table("WALK_PARENT", [p for parent, _ in tables for p in parent]),
+        first_table=ts.constant_table("WALK_FIRST", [f for _, first in tables for f in first]),
+        class_table=ts.constant_table("WALK_CLASS", starts),
+        joins=substitute(_WALK_JOINS, join_table=ts.constant_table("WALK_JOIN", slots)) if joins else "",
+    )
+
 
 _WALK_PATHS = """    // The tree a lane walks (WALK_TREE): its path table, each body's parent and first coordinate as int pairs
     // (TreeFactor.walk_path), and its bodies and coordinates. Set before each tree's walk.
@@ -980,19 +1012,9 @@ def walk_prelude(
             with spin).
         half: The classes' records' half as their walk reads them (``WALK_READ``, :func:`.tree_scan.classes_half`).
     """
+    table = walk_table(tables)
     # No walking tree: one class of no body.
     tables = tables or (((), (0,)),)
-    if any(len(first) != len(parent) + 1 or any(p >= b for b, p in enumerate(parent)) for parent, first in tables):
-        raise ValueError("a walk's path table needs every parent before its children and a first coordinate per body")
-    starts = [0]
-    for parent, _ in tables:
-        starts.append(starts[-1] + len(parent))
-    table = substitute(
-        _WALK_TABLE,
-        parent_table=ts.constant_table("WALK_PARENT", [p for parent, _ in tables for p in parent]),
-        first_table=ts.constant_table("WALK_FIRST", [f for _, first in tables for f in first]),
-        class_table=ts.constant_table("WALK_CLASS", starts),
-    )
     tag = hashlib.sha256(repr(tables).encode()).hexdigest()[:8] if len(tables) > 1 else str(len(tables[0][0]))
     name = f"walk_{rows}_{tag}" + ("" if half == WALK_BOTH else f"_{half}")
     return _walk_placement(name, table, rows, WALK_COORDINATE, WALK_LINK, WALK_NOW, half)
@@ -1004,8 +1026,9 @@ def walk_paths_prelude(
 ) -> DevicePrelude:
     """The device walk of any tree, for both devices: :func:`walk_prelude`'s functions over a path table in global
     memory, one tree at a time (``WALK_TREE(path, bodies, coordinates)`` before its walks), the table
-    :attr:`.tree_factor.TreeFactor.walk_path` holds for every articulation. The general placement's worlds hold any forest, so its
-    one writer and leave read each tree's table where a class's kernel bakes it into constant memory.
+    :attr:`.tree_factor.TreeFactor.walk_path` holds for every articulation. Its last readers are the parallel tiers' rows,
+    the matrix-free sweep's free bodies and the sparse diagonal's star walker; every other reader takes its classes'
+    tables (:func:`walk_prelude`).
 
     Args:
         rows: The rows a lane walks together (:func:`walk_prelude`).
@@ -1321,7 +1344,7 @@ def walk_leave_kernel(
         items("tid", flat=True),
         preludes=(
             memory_words(memory.Place.STREAMED),
-            *((walk_paths_prelude(1),) if release else ()),
+            *((walk_prelude(_tables(classes), 1),) if release else ()),
             walk_down_prelude(classes, WALK_UNROLL),
         ),
         dual=True,
@@ -1434,7 +1457,8 @@ _ENTER = """    if (tid >= arts.shape[0]) return;
     const int world = art_to_world.data[art], offset = world_offset.data[art];
     if (world < 0 || offset < 0) return;
     const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
-    WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), walk.joint_end.data[art] - j0, walk.dofs.data[art]);
+    // The tree's path: its class's table in constant memory.
+    WALK_TREE(walk.cls.data[art]);
     float* u = coordinates.data + (size_t)world * coordinates.shape[1] + offset;
     WALK_ENTER(walk.data.data + (size_t)d0 * $coordinate, walk.link.data + (size_t)j0 * $link, velocity.data + d0, u,
                reinterpret_cast<float*>(walk.scratch.data + j0));
@@ -1444,13 +1468,15 @@ _ENTER = """    if (tid >= arts.shape[0]) return;
 
 
 @functools.cache
-def walk_enter_kernel() -> wp.Kernel:
+def walk_enter_kernel(classes: tuple[WalkClass, ...]) -> wp.Kernel:
     """Each held tree's coordinates of a velocity in the walk's frame, ``u = L^T P v`` (``WALK_ENTER``), a thread per
-    tree, at its world coordinates: what the audit reads the walked rows against (:mod:`.audit`)."""
+    tree, each tree's path its class's (``classes``, :attr:`WalkTrees.cls`) in constant memory, at its world
+    coordinates: what the audit reads the walked rows against (:mod:`.audit`)."""
     from ..kernel_template import KernelTemplate, items  # noqa: PLC0415
 
+    tag = hashlib.sha256(repr(_tables(classes)).encode()).hexdigest()[:8]
     return KernelTemplate(
-        "walk_enter",
+        f"walk_enter_{tag}",
         (
             ("arts", wp.array[int]),
             ("walk", WalkTrees),
@@ -1461,7 +1487,7 @@ def walk_enter_kernel() -> wp.Kernel:
         ),
         substitute(_ENTER, coordinate=WALK_COORDINATE, link=WALK_LINK),
         items("tid", flat=True),
-        preludes=(walk_paths_prelude(1),),
+        preludes=(walk_prelude(_tables(classes), 1),),
         dual=True,
         native_name="walk_enter_native",
     ).kernel()
@@ -1506,8 +1532,10 @@ _INWARD = """    // The refresh by the tree's lane group (walk_group): the lane 
     // at a time; a lane builds each body of a batch (BODY, its path entry, its join slots and its last coordinate's
     // column), every lane runs the chain on it, read by shuffle. A body's lifted inertia is carried when its parent is
     // the next joint inward, else added into the parent's join slot (joins[parent], lane k's registers on CUDA, the
-    // CPU's one thread every slot) until the chain reaches it. On the CPU one thread is the group.
+    // CPU's one thread every slot) until the chain reaches it. On the CPU one thread is the group. The tree's path and
+    // join slots are its class's (WALK_TREE(cls): the classes' tables in constant memory).
     SYNC();
+    WALK_TREE(cls);
     // The refresh's arithmetic on one tree, float32 (TreeWalk's inward pass, on the factor's diagonal), at the step's
     // geometry the finish published, each coordinate's column in now and each body's link and frame point in
     // now_link: on a refresh they become the factor's frames. The lane feed's batches run it leaf first; the chain's
@@ -1651,8 +1679,6 @@ $step_update
     const auto LIFT = [&](float* h, const float* bd) {
 $lift
     };
-    const int* Pt = reinterpret_cast<const int*>(path.data);
-    const int* Jt = joins.data;
 #if defined(__CUDA_ARCH__)
     constexpr int HELD = 1;
 #else
@@ -1676,21 +1702,18 @@ $lift
     struct Feed { float w[26]; };
     enum { RECORD = INERTIA, UP = RECORD + 8, LO = UP + 1, HI = LO + 1, SLOT = HI + 1, INTO = SLOT + 1 };
     FEED(j0, j1 - 1, -1,
-        [&](int j) {
-            AHEAD(j);
-            WALK_TOUCH(Pt + 2 * j);
-            WALK_TOUCH(Jt + j);
-        },
+        [&](int j) { AHEAD(j); },
         [&](int mine, bool valid) -> Feed {
             Feed r;
             for (int k = 0; k < 26; ++k) r.w[k] = 0.0f;
             int up = -1, lo = 0, hi = 0, slot = -1, into = -1;
             if (valid) {
-                up = Pt[2 * mine];
-                lo = dof0 + Pt[2 * mine + 1];
-                hi = mine + 1 < j1 ? dof0 + Pt[2 * (mine + 1) + 1] : dof1;
-                slot = Jt[mine];
-                into = up >= 0 ? Jt[j0 + up] : -1;
+                const int b = mine - j0;
+                up = WALK_PARENT_OF(b);
+                lo = dof0 + WALK_FIRST_OF(b);
+                hi = dof0 + WALK_FIRST_OF(b + 1);
+                slot = WALK_JOIN_OF(b);
+                into = up >= 0 ? WALK_JOIN_OF(up) : -1;
                 BODY(mine, up >= 0 ? j0 + up : -1, r.w);
                 if (hi > lo) COLUMN(hi - 1, r.w + RECORD);
             }
@@ -1733,11 +1756,12 @@ $lift
 """
 
 
-@functools.cache
-def _walk_inward_snippet() -> str:
+def _walk_inward_snippet(classes: tuple[WalkClass, ...]) -> str:
     from ..device_preludes import CPU_MATH, LANE_FEED, dual_native, lane_group  # noqa: PLC0415
 
     step_head, step_update = ts.inward_step("h", "s")
+    table = walk_table(_tables(classes), joins=True)
+    tables = DevicePrelude("walk_tables", table, cpu=table)
     return dual_native(
         substitute(
             _INWARD,
@@ -1750,101 +1774,111 @@ def _walk_inward_snippet() -> str:
             frame=WALK_FRAME,
             slots=WALK_JOIN_SLOTS,
         ),
-        preludes=(walk_loads_prelude(), lane_group("lanes"), CPU_MATH, LANE_FEED),
+        preludes=(walk_loads_prelude(), tables, lane_group("lanes"), CPU_MATH, LANE_FEED),
     )
 
 
-@wp.func_native(_walk_inward_snippet())
-def walk_inward(
-    lanes: int,
-    j0: int,
-    j1: int,
-    dof0: int,
-    dof1: int,
-    path: wp.array[wp.vec2i],
-    joins: wp.array[int],
-    now: wp.array[wp.spatial_vector],
-    now_link: wp.array2d[float],
-    now_com: wp.array[wp.vec3],
-    armature: wp.array[float],
-    drive_row_by_dof: wp.array[int],
-    row_K: wp.array[float],
-    joint_child: wp.array[int],
-    body_q: wp.array[wp.transform],
-    body_mass: wp.array[float],
-    body_inertia: wp.array[wp.mat33],
-    link: wp.array2d[float],
-    data: wp.array2d[float],
-):
-    """The refresh's inward pass of the tree of joints ``[j0, j1)`` and coordinates ``[dof0, dof1)`` by its group of
-    ``lanes`` (one thread on the CPU), at the step's geometry the finish published (``now``, ``now_link``): the factor's
-    frames (each body's ``link``) and each coordinate's whole record in ``data`` (:data:`WALK_COORDINATE`), with each body's spatial inertia built in the pass from its pose and mass properties."""
-    ...
+def _tables(classes: tuple[WalkClass, ...]) -> tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]:
+    """The classes' path tables (:func:`walk_table`'s), each class's parent and first coordinate."""
+    return tuple((walk.parent, walk.first) for walk in classes)
 
 
-@wp.kernel(enable_backward=False)
-def walk_step_kernel(
-    arts: wp.array[int],
-    lanes: int,
-    mass_update_mask: wp.array[int],
-    articulation_start: wp.array[int],
-    articulation_joint_end: wp.array[int],
-    walk_path: wp.array[wp.vec2i],
-    walk_joins: wp.array[int],
-    joint_child: wp.array[int],
-    joint_qd_start: wp.array[int],
-    body_q: wp.array[wp.transform],
-    body_mass: wp.array[float],
-    body_inertia: wp.array[wp.mat33],
-    armature: wp.array[float],
-    drive_row_by_dof: wp.array[int],
-    row_K: wp.array[float],
-    walk_now: wp.array[wp.spatial_vector],
-    walk_now_link: wp.array2d[float],
-    walk_now_com: wp.array[wp.vec3],
-    articulation_origin: wp.array[wp.vec3],
-    clock: wp.array[Clock],
-    dt: float,
-    # outputs
-    walk_data: wp.array2d[float],
-    walk_link: wp.array2d[float],
-    walk_origin: wp.array[wp.vec3],
-):
-    """The walk's refresh, a group of ``lanes`` threads per tree (:meth:`TreeFactor.walk_step`), float32, at the poses
-    ``body_q`` holds, on the trees the refresh just factored (``mass_update_mask``; every other tree returns): the
-    step's geometry the finish published (``walk_now``, ``walk_now_link``, ``walk_now_com``) becomes the factor's frames,
-    with the articulation's origin they are relative to, and the group runs the refresh (:func:`walk_inward`, the lane
-    feed's batches), so the walk and ``L`` are one factor. Its first thread advances the step's ``clock`` past this
-    step (``dt``): the kernel reads no clock, the step's repair and mask read it before, its finish and warm start
-    after (:class:`.factor.kernels.Clock`)."""
-    tree, lane = wp.tid()
-    if tree == 0 and lane == 0:
-        clock_advance(clock, dt)
-    art = arts[tree]
-    if mass_update_mask[art] == 0:
-        return
-    j0 = articulation_start[art]
-    j1 = articulation_joint_end[art]
-    walk_inward(
-        lanes,
-        j0,
-        j1,
-        joint_qd_start[j0],
-        joint_qd_start[j1],
-        walk_path,
-        walk_joins,
-        walk_now,
-        walk_now_link,
-        walk_now_com,
-        armature,
-        drive_row_by_dof,
-        row_K,
-        joint_child,
-        body_q,
-        body_mass,
-        body_inertia,
-        walk_link,
-        walk_data,
-    )
-    if lane == 0:
-        walk_origin[art] = articulation_origin[art]
+@functools.cache
+def walk_step_kernel(classes: tuple[WalkClass, ...]) -> wp.Kernel:
+    """The walk's refresh of the walking classes ``classes``, a group of ``lanes`` threads per tree
+    (:meth:`TreeFactor.walk_step`), float32, at the poses ``body_q`` holds, on the trees the refresh just factored
+    (``mass_update_mask``; every other tree returns): the step's geometry the finish published (``walk_now``,
+    ``walk_now_link``, ``walk_now_com``) becomes the factor's frames, with the articulation's origin they are relative
+    to, and the group runs the refresh (the inward pass, the lane feed's batches; each tree's path and join slots its
+    class's in constant memory, ``walk_class``), so the walk and ``L`` are one factor. Its first thread advances the
+    step's ``clock`` past this step (``dt``): the kernel reads no clock, the step's repair and mask read it before, its
+    finish and warm start after (:class:`.factor.kernels.Clock`)."""
+    from ..kernel_template import python_kernel  # noqa: PLC0415
+
+    @wp.func_native(_walk_inward_snippet(classes))
+    def walk_inward(
+        lanes: int,
+        cls: int,
+        j0: int,
+        j1: int,
+        dof0: int,
+        dof1: int,
+        now: wp.array[wp.spatial_vector],
+        now_link: wp.array2d[float],
+        now_com: wp.array[wp.vec3],
+        armature: wp.array[float],
+        drive_row_by_dof: wp.array[int],
+        row_K: wp.array[float],
+        joint_child: wp.array[int],
+        body_q: wp.array[wp.transform],
+        body_mass: wp.array[float],
+        body_inertia: wp.array[wp.mat33],
+        link: wp.array2d[float],
+        data: wp.array2d[float],
+    ):
+        """The refresh's inward pass of the tree of joints ``[j0, j1)`` and coordinates ``[dof0, dof1)``, of class
+        ``cls``, by its group of ``lanes`` (one thread on the CPU), at the step's geometry the finish published
+        (``now``, ``now_link``): the factor's frames (each body's ``link``) and each coordinate's whole record in
+        ``data`` (:data:`WALK_COORDINATE`), with each body's spatial inertia built in the pass from its pose and mass
+        properties."""
+        ...
+
+    def walk_step(
+        arts: wp.array[int],
+        lanes: int,
+        mass_update_mask: wp.array[int],
+        articulation_start: wp.array[int],
+        articulation_joint_end: wp.array[int],
+        walk_class: wp.array[int],
+        joint_child: wp.array[int],
+        joint_qd_start: wp.array[int],
+        body_q: wp.array[wp.transform],
+        body_mass: wp.array[float],
+        body_inertia: wp.array[wp.mat33],
+        armature: wp.array[float],
+        drive_row_by_dof: wp.array[int],
+        row_K: wp.array[float],
+        walk_now: wp.array[wp.spatial_vector],
+        walk_now_link: wp.array2d[float],
+        walk_now_com: wp.array[wp.vec3],
+        articulation_origin: wp.array[wp.vec3],
+        clock: wp.array[Clock],
+        dt: float,
+        # outputs
+        walk_data: wp.array2d[float],
+        walk_link: wp.array2d[float],
+        walk_origin: wp.array[wp.vec3],
+    ):
+        tree, lane = wp.tid()
+        if tree == 0 and lane == 0:
+            clock_advance(clock, dt)
+        art = arts[tree]
+        if mass_update_mask[art] == 0:
+            return
+        j0 = articulation_start[art]
+        j1 = articulation_joint_end[art]
+        walk_inward(
+            lanes,
+            walk_class[art],
+            j0,
+            j1,
+            joint_qd_start[j0],
+            joint_qd_start[j1],
+            walk_now,
+            walk_now_link,
+            walk_now_com,
+            armature,
+            drive_row_by_dof,
+            row_K,
+            joint_child,
+            body_q,
+            body_mass,
+            body_inertia,
+            walk_link,
+            walk_data,
+        )
+        if lane == 0:
+            walk_origin[art] = articulation_origin[art]
+
+    tag = hashlib.sha256(repr(_tables(classes)).encode()).hexdigest()[:8]
+    return python_kernel(walk_step, f"walk_step_{tag}")

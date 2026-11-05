@@ -448,8 +448,9 @@ def walk_calls():
     yield "factor.walk.walk_leave_kernel", leave, (pair, True), {}
     nodes = Named("g1 nodes", (tuple(range(classes["g1"].coordinates - 1, -1, -1)),))
     yield "factor.walk.walk_leave_kernel", leave, (named["g1"], True, nodes), {}
-    yield "factor.walk.walk_enter_kernel", _unwrapped(factor_walk.walk_enter_kernel), (), {}
-    yield "factor.walk.walk_step_kernel", lambda: factor_walk.walk_step_kernel, (), {}
+    for walked in (named["g1"], pair):
+        yield "factor.walk.walk_enter_kernel", _unwrapped(factor_walk.walk_enter_kernel), (walked,), {}
+        yield "factor.walk.walk_step_kernel", _unwrapped(factor_walk.walk_step_kernel), (walked,), {}
 
     def layout(name, root):
         cls = classes[name]

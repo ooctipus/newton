@@ -1527,12 +1527,13 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
     const auto FRAME_STATUS = [&](const int bit) { RAISE(f.frame_status.data[0], bit); };
     struct WalkHold {
         float r[HOLD_WORDS][13];
-        int parent[HOLD_WORDS], first[HOLD_WORDS];
         float l[HOLD_WORDS][3];
     };
     // A held array (a word a lane) or a slotted one (a slip a lane) is the lane group's HELD: item x sits in lane
     // x % WIDTH's word or slot x / WIDTH, read by HELD_PICK(v, x) and, a row of a record or a link, HELD_ROW(v, x, out).
-    const auto HOLD_LOAD = [&](WalkHold& h, const float* data, const float* link, const int* path, const int n,
+    // The tree's path is its class's, each body's parent and first coordinate in constant memory (WalkClass's): no
+    // segment holds it.
+    const auto HOLD_LOAD = [&](WalkHold& h, const float* data, const float* link, const int* parent, const int n,
                                const int nb) {
         #pragma unroll
         for (int k = 0; k < HOLD_WORDS; ++k) {
@@ -1547,16 +1548,12 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
                 for (int m = 0; m < 13; ++m) h.r[k][m] = 0.0f;
             }
             if (x < nb) {
-                h.parent[k] = LDG(path + 2 * x);
-                h.first[k] = LDG(path + 2 * x + 1);
                 float l[6];
-                WALK_READ_LINK(WALK_LDG, l, link, x, h.parent[k]);
+                WALK_READ_LINK(WALK_LDG, l, link, x, parent[x]);
                 h.l[k][0] = l[0];
                 h.l[k][1] = l[1];
                 h.l[k][2] = l[2];
             } else {
-                h.parent[k] = -1;
-                h.first[k] = n;
                 h.l[k][0] = h.l[k][1] = h.l[k][2] = 0.0f;
             }
         }
@@ -1651,7 +1648,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
             WARP_SYNC();
         }
     };
-    // HELD_BUILD(h, a, n, nb, data, released, kept): the release of the tree's slips, coordinate-major. The slips are
+    // HELD_BUILD(h, parent, first, a, n, nb, data, released, kept): the release of the tree's slips, coordinate-major. The slips are
     // its coordinates whose released stiffness is positive, root-most first (ascending), slip j on lane j % WIDTH in
     // slot j / WIDTH (at most HOLD_SLIPS, the class's slip capacity, and the release's; a slip past them keeps its K
     // and raises status bit 0). A pivot that is not positive raises bit 1 (SAT_PHYS falsifier 1: the split
@@ -1664,8 +1661,8 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
     // coordinate: from their meeting point; b_j' = R_<j b_j, W9 P4). The recurrence takes one rsqrt of each new pivot
     // (the CPU: one over a square root) and multiplies. Every value is a register: the columns, the pivots (one a
     // coordinate), the pair states; nothing of the release is read back. Returns the slips.
-    const auto HELD_BUILD = [&](const WalkHold& h, const int a, const int n, const int nb, const float* data,
-                                const float* released, const float* kept) -> int {
+    const auto HELD_BUILD = [&](const WalkHold& h, const int* parent, const int* first, const int a, const int n,
+                                const int nb, const float* data, const float* released, const float* kept) -> int {
         auto& release = walk.release;
         const int depth = release.step.shape[2];
         const int cap = a < release.dof.shape[0] ? release.dof.shape[1] : 0;
@@ -1720,7 +1717,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
         const int deepest = slips > 0 ? HELD_PICK(is, slips - 1) : -1;
         #pragma unroll 1
         for (int b = nb - 1; b >= 0 && slips > 0; --b) {
-            const int f0 = HELD_PICK(h.first, b), f1 = HELD_PICK(h.first, b + 1);
+            const int f0 = first[b], f1 = first[b + 1];
             if (f0 > deepest) continue;
             bool in[HOLD_SLOTS], any = false;
             int start[HOLD_SLOTS];
@@ -1799,8 +1796,8 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
                         }
                 }
             }
-            const int up = HELD_PICK(h.parent, b);
-            const int last = HELD_PICK(h.first, up + 1) - 1;
+            const int up = parent[b];
+            const int last = first[up + 1] - 1;
             float l[3];
             HELD_ROW(h.l, b, l);
             #pragma unroll
@@ -1865,16 +1862,19 @@ def border_solve(layout: TreeLayout, classes: tuple) -> str:
         "const float* const data=walk.data.data+(size_t)d0*$WALK_COORDINATE;"
         "const float* const link=walk.link.data+(size_t)j0*$WALK_LINK;"
     )
-    hold = (
-        "const int nb=walk.joint_end.data[a]-j0;"
-        "WalkHold h;HOLD_LOAD(h,data,link,reinterpret_cast<const int*>(walk.path.data+j0),n,nb);"
+    hold = "const int nb=walk.joint_end.data[a]-j0;WalkHold h;HOLD_LOAD(h,data,link,HOLD_PARENT_{r},n,nb);"
+    # Each walked root's path, its class's table in constant memory.
+    tables = "".join(
+        f"        {ts.constant_table(f'HOLD_PARENT_{r}', classes[r].parent)}\n"
+        f"        {ts.constant_table(f'HOLD_FIRST_{r}', classes[r].first)}\n"
+        for r, _ in roots
     )
     # A tree the walk does not hold keeps its trial and flags bit 2.
     frame = (
         "        if(moved&{bit}) {{{tree}\n"
         "        if(d0+n>walk.data.shape[0]) {{if(lane==0) {{FRAME_STATUS(4);moved&=~{bit};}}}}\n"
         "        else if(lane<WIDTH) {{{hold}\n"
-        "            slips{r}=HELD_BUILD(h,a,n,nb,data,s+$WHITE+{offset},s+{offset});\n"
+        "            slips{r}=HELD_BUILD(h,HOLD_PARENT_{r},HOLD_FIRST_{r},a,n,nb,data,s+$WHITE+{offset},s+{offset});\n"
         "        }}}}\n"
     )
 
@@ -1883,16 +1883,20 @@ def border_solve(layout: TreeLayout, classes: tuple) -> str:
         # lane at once (HELD_APPLY), the walk down in place; the join states and the twists in the dead body words.
         walk_up, walk_down = classes[r].held(f"(s+$SIX_BODIES+{offset})", f"(s+$WHITE+{offset})", "s")
         return (
-            f"        if((moved&{2 << r})&&lane<WIDTH) {{{tree.format(art=_root_articulation(layout, r))}{hold}\n"
+            f"        if((moved&{2 << r})&&lane<WIDTH) {{{tree.format(art=_root_articulation(layout, r))}{hold.format(r=r)}\n"
             f"{walk_up}\n            HELD_APPLY(a,s+$WHITE+{offset},slips{r});\n{walk_down}\n        }}\n"
         )
 
     frames = "".join(
-        frame.format(bit=2 << r, r=r, offset=offset, tree=tree.format(art=_root_articulation(layout, r)), hold=hold)
+        frame.format(
+            bit=2 << r, r=r, offset=offset, tree=tree.format(art=_root_articulation(layout, r)), hold=hold.format(r=r)
+        )
         for r, offset in roots
     )
     text = (
-        "    {\n        "
+        "    {\n"
+        + tables
+        + "        "
         + "".join(f"int slips{r}=0;" for r, _ in roots)
         + "\n"
         + frames

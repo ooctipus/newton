@@ -740,12 +740,14 @@ class TreeFactor:
 
     def plan_walk(self, articulations: np.ndarray) -> None:
         """Hold the walk's data for ``articulations`` (the converted class's, every responding tree): each coordinate's
-        :data:`.factor.walk.WALK_COORDINATE` floats, each body's :data:`.factor.walk.WALK_LINK` floats and a twist of scratch, each body's path
-        entry (its parent and first coordinate within its tree, :func:`.factor.walk.walk_paths_prelude`) and its class's join slot
-        (:attr:`.tree_scan.WalkClass.slots`), the trees' lane group (:func:`.factor.walk.walk_work`), and the step's geometry the
-        finish publishes (:attr:`WalkTrees.now`, :attr:`WalkTrees.now_link`): the rows' seeds enter there. One launch on the factor's own refreshes
-        (:meth:`walk_step`) takes that geometry as the factor's frames and runs the inward pass, so the walk is the
-        factor ``L`` refreshes, to rounding.
+        :data:`.factor.walk.WALK_COORDINATE` floats, each body's :data:`.factor.walk.WALK_LINK` floats and a twist of scratch, each tree's
+        walking class (:attr:`walk_classes`, :attr:`walk_class`: its path and join slots, :class:`.tree_scan.WalkClass`), the
+        trees' lane group (:func:`.factor.walk.walk_work`), and the step's geometry the finish publishes
+        (:attr:`WalkTrees.now`, :attr:`WalkTrees.now_link`): the rows' seeds enter there. One launch on the factor's own
+        refreshes (:meth:`walk_step`, the classes' refresh) takes that geometry as the factor's frames and runs the inward
+        pass, so the walk is the factor ``L`` refreshes, to rounding. Each body's path entry in global memory
+        (:attr:`walk_path`, :func:`.factor.walk.walk_paths_prelude`) remains for the readers that do not yet read their
+        class's: the parallel tiers' rows, the matrix-free sweep's free bodies and the support placement's admission.
 
         Raises:
             ValueError: For a tree whose bodies do not come after their parents, or that holds more than
@@ -813,12 +815,9 @@ class TreeFactor:
             walk_class[art] = classes.setdefault(table, len(classes))
         self.walk_classes = tuple(classes)
         self.walk_class = wp.array(walk_class, dtype=wp.int32, device=device)
-        # The refresh's join slots (walk_inward) are its class's (WalkClass.slots): a parent waits in one for the
-        # lifted inertia of each child other than the joint after it.
-        joins = np.full(max(int(model.joint_count), 1), -1, dtype=np.int32)
-        for art in arts.tolist():
-            j0, j1 = int(start[art]), int(end[art])
-            joins[j0:j1] = self.walk_classes[walk_class[art]].slots[0]
+        self.walk_class_host = walk_class
+        # The refresh's join slots are its class's (WalkClass.slots): a parent waits in one for the lifted inertia of
+        # each child other than the joint after it.
         held = max((walk.slots[1] for walk in classes), default=0)
         if held > WALK_JOIN_SLOTS:
             raise ValueError(f"The walk holds at most {WALK_JOIN_SLOTS} joins of a tree at once, a tree needs {held}")
@@ -829,8 +828,8 @@ class TreeFactor:
         walked = int(np.count_nonzero(sizes > 1)) or int(arts.size)
         self.walk_shape = execution.shape(walk_work(walked, bodies, held), memory.device(device))
         self.walk_path = wp.array(path, dtype=wp.vec2i, device=device)
-        self.walk_joins = wp.array(joins, dtype=wp.int32, device=device)
         self.walk_path_host = path
+        self.walk_refresh = walk_step_kernel(self.walk_classes)
         # The one flag every walk reader's text is chosen by: whether a record (and a step column) can have a side.
         self.walk_side = both
         self.walk_data = wp.zeros(((2 if both else 1) * dofs, WALK_COORDINATE), dtype=wp.float32, device=device)
@@ -953,7 +952,7 @@ class TreeFactor:
         model = self.model
         lanes = self.walk_shape.lanes
         wp.launch(
-            walk_step_kernel,
+            self.walk_refresh,
             dim=(self.walk_arts.shape[0], lanes),
             inputs=[
                 self.walk_arts,
@@ -961,8 +960,7 @@ class TreeFactor:
                 self.mass_update_mask,
                 model.articulation_start,
                 self.forest.articulation_joint_end,
-                self.walk_path,
-                self.walk_joins,
+                self.walk_class,
                 model.joint_child,
                 model.joint_qd_start,
                 state.body_q,
