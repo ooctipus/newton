@@ -534,16 +534,17 @@ class ScalarBranchState:
     bank_compare = False
     motion_velocity = False
 
-    def __init__(self, solver, plan: ScalarBranchPlan):
-        """Bind the group's kernels; the owner's tree groups hold the topology proof."""
+    def __init__(self, solver, group):
+        """Bind the kernels of the held plan's scalar group ``group`` (:class:`.held_tree.HeldGroupPlan`); the owner's
+        tree groups hold the topology proof."""
         self.solver = solver
-        self.plan = plan
-        self.size = plan.size
+        self.plan = group
+        self.size = group.size
         self.sparse = self
-        model, device = solver.model, solver.model.device
-        self.group_count = plan.group_count
-        self.group_to_art = solver.forest.group_to_art[plan.size]
-        self.dof_joint_offset = solver.forest.crba_dof_joint_offset_by_size[plan.size]
+        device = solver.model.device
+        self.group_count = int(group.trees.size)
+        self.group_to_art = wp.array(group.trees, dtype=int, device=device)
+        self.dof_joint_offset = solver.forest.crba_dof_joint_offset_by_size[group.size]
         self._cache_to_art = self.group_to_art.reshape((self.group_count, 1))
         # The family holds no geometry cache; invalidation clears this flag only.
         self._geometry_valid = wp.zeros(self.group_count, dtype=int, device=device)
@@ -552,12 +553,8 @@ class ScalarBranchState:
         self.repair_kernel = repair_scalar_branches
         self.predictor_kernel = predict_prismatic_branches
         self.finish_kernel = finish_prismatic_branches
-        # The predict folds the branches' augmented drives, so the drive
-        # preparation runs only over the other DOFs.
-        other = np.ones(model.joint_dof_count, dtype=bool)
-        other[plan.dofs[(plan.dofs >= 0) & (plan.dofs < model.joint_dof_count)]] = False
-        others = np.flatnonzero(other).astype(np.int32)
-        self.other_drive_dofs = wp.array(others, dtype=int, device=device) if others.size else None
+        # The predict folds the branches' augmented drives: the held plan's drive coordinates are the others
+        # (:attr:`.held_tree.HeldPlan.drive_dofs`).
         self._plan_dimensions = self._dimensions()
 
     def _dimensions(self):

@@ -179,7 +179,7 @@ class TestTreeKineticStages(unittest.TestCase):
             solver.options = solver.laws.options = solver.factor.options = solver.placement.options = (
                 solver.sweep.options
             ) = dataclasses.replace(solver.options, enable_joint_velocity_limits=alternate)
-            owner = HeldTree(solver)
+            owner = HeldTree(solver, solver.spec.classes.held)
             state, output = model.state(), model.state()
             rng = np.random.default_rng(41)
             state.joint_qd.assign(rng.uniform(-0.4, 0.4, model.joint_dof_count).astype(np.float32))

@@ -632,8 +632,7 @@ class TreeFactor:
     ) -> None:
         """Launch the augmented drives of ``dofs`` (:func:`prepare_augmented_drives`; ``None``, every coordinate's
         without a list), apart from FK/ID; ``v_hat`` and ``v_out`` are last step's. Beside scalar branches, whose
-        predict folds their own, ``dofs`` are the others
-        (:attr:`.scalar_branches.ScalarBranchState.other_drive_dofs`)."""
+        predict folds their own, ``dofs`` are the others (:attr:`.held_tree.HeldPlan.drive_dofs`)."""
         model = self.model
         wp.launch(
             prepare_augmented_drives,

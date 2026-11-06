@@ -707,7 +707,7 @@ class TestFeatherPGSMixedTreeFrames(unittest.TestCase):
         joint = newton.ModelFlags.JOINT_PROPERTIES
         model = _build(wp.get_device("cpu"), worlds=2)
         solver = SolverFeatherPGS(model)
-        owner = HeldTree(solver)
+        owner = HeldTree(solver, solver.spec.classes.held)
         self.assertTrue(owner.groups)
         roots = _fixed_root_joints(model)
         self.assertEqual(len(roots), model.world_count)

@@ -18,6 +18,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import (
     cached_state_binding,
+    held_tree,
     tree_kinetic_state,
 )
 from newton._src.solvers.feather_pgs.factor.kernels import Clock
@@ -306,8 +307,8 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
                     owner = solver.factor.held
                     self.assertIsNotNone(owner, "The fixture must admit a held-tree owner")
                     if name == "forest":
-                        self.assertEqual(len(owner.groups), 1, owner.forest_reason)
-                        self.assertTrue(owner.groups[0].layout.forest, owner.forest_reason)
+                        self.assertEqual(len(owner.groups), 1, owner.reasons)
+                        self.assertTrue(owner.groups[0].layout.forest, owner.reasons)
                     rollout = _Rollout(model, solver)
                     rollout.step()  # the first repair builds every cache
                     before = _generations(owner)
@@ -448,7 +449,15 @@ def _cpu_owner(*, motion_velocity=False, worlds=2, pins=None):
         dataclasses.replace(solver.options, enable_joint_velocity_limits=motion_velocity)
     )
     solver.spec = dataclasses.replace(solver.spec, pins=SolverFeatherPGS.Pins(**(pins or {})))
-    owner = HeldTree(solver)
+    inputs = SimpleNamespace(
+        model=model,
+        options=solver.options,
+        forest=solver.forest,
+        laws=solver.laws,
+        factor=solver.factor,
+        pins=solver.spec.pins,
+    )
+    owner = HeldTree(solver, held_tree.plan(inputs))
     solver.factor.held = owner
     states = [model.state(), model.state()]
     return model, solver, owner, states, solver.factor
@@ -599,7 +608,7 @@ class TestFeatherPGSInputBank(unittest.TestCase):
         if owner is None:
             raise AssertionError(f"The {name} fixture must admit a held-tree owner")
         if name == "forest" and not (len(owner.groups) == 1 and owner.groups[0].layout.forest):
-            raise AssertionError(owner.forest_reason)
+            raise AssertionError(owner.reasons)
         return model, solver, owner
 
 
@@ -916,7 +925,7 @@ class TestFeatherPGSRepairLaunches(unittest.TestCase):
                     solver.options = solver.laws.options = solver.factor.options = solver.placement.options = (
                         solver.sweep.options
                     ) = dataclasses.replace(solver.options, enable_joint_velocity_limits=motion)
-                    owner = HeldTree(solver)
+                    owner = HeldTree(solver, solver.spec.classes.held)
                     groups = []
                     for group in owner.groups:
                         self.assertEqual(group.bank_compare, not motion)

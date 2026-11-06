@@ -511,11 +511,10 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
 
     # Stages 1-3: the tree factor (the drives, FK/ID, the mass refresh and the factor's, the walk's refresh with the
     # clock), then the predictor v_hat and the free roots' corrections.
-    scalar = getattr(factor.held, "scalar", None)
     stream = factor.dynamics_stream
 
-    # Scalar branches evaluate their own drives in their predict: the drives' stage takes the other coordinates.
-    drive_dofs = None if scalar is None else scalar.other_drive_dofs
+    # The drives' stage takes the held plan's coordinates: a scalar branch's predict evaluates its own drives.
+    drive_dofs = factor.held.drive_dofs
 
     def check_call(step):
         cached_state_binding.check_call(model.device, step.state_in, step.state_out, step.dt)
@@ -561,7 +560,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         factor.damp_spin(step.dt, solver.v_hat)
 
     drive_stages = ()
-    if factor.parallel_drives and (scalar is None or scalar.other_drive_dofs is not None):
+    if factor.parallel_drives and factor.held.prepares_drives:
         drive_stages = (drives_on_stream,) if stream is not None else (drives,)
     add(
         check_call,

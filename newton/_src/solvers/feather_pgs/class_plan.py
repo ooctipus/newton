@@ -146,6 +146,8 @@ class ClassPlan:
     mf_sweeps: bool
     """The matrix-free sweeps run and read the dense rows packed (:mod:`.packed_rows`): every class but native sparse
     factors (case K1) and the sparse diagonal (case K2), where a world has coordinates."""
+    held: held_tree.HeldPlan | None = None
+    """The held tree's plan: one held plan a world class, from the case's choice (:func:`.held_tree.plan`)."""
     diagonal: Diagonal | None = None
     packed: Packed | None = None
     paired: Paired | None = None
@@ -695,7 +697,8 @@ _CHOICE = {"K2": "diagonal", "K1": "packed", "K5": "paired", "K4": "tiers"}
 
 def plan_class(inputs: ClassInputs, *, general: str | None) -> ClassPlan:
     """The class's plan: each rule of :data:`RULES` in order until one fits; every case after it says which case
-    holds the class, and ``general`` (:func:`general_reason`), when given, is every case's reason."""
+    holds the class, and ``general`` (:func:`general_reason`), when given, is every case's reason. The held tree's plan
+    follows from the case's choice (:func:`.held_tree.plan`, which raises ValueError for a model it does not hold)."""
     descriptions = {name: description for name, description, _ in RULES}
     forest = inputs.forest
     case, reasons, choices = "K6", {}, {}
@@ -710,4 +713,11 @@ def plan_class(inputs: ClassInputs, *, general: str | None) -> ClassPlan:
         if choice is not None:
             case, choices[_CHOICE[name]] = name, choice
     mf_sweeps = case not in ("K1", "K2") and forest.world_count > 0 and forest.max_world_dofs > 0
-    return ClassPlan(case=case, reasons=MappingProxyType(reasons), mf_sweeps=mf_sweeps, **choices)
+    diagonal = choices.get("diagonal")
+    held = held_tree.plan(
+        inputs,
+        packed=choices.get("packed"),
+        compact=None if diagonal is None else diagonal.size,
+        scalar=None if diagonal is None else diagonal.scalar,
+    )
+    return ClassPlan(case=case, reasons=MappingProxyType(reasons), mf_sweeps=mf_sweeps, held=held, **choices)

@@ -188,7 +188,7 @@ class TestTreeKernelSwitches(unittest.TestCase):
         owners = {}
         for clocked in (False, True):
             with _switches(solver, clocked):
-                owners[clocked] = HeldTree(solver)
+                owners[clocked] = HeldTree(solver, solver.spec.classes.held)
             self.assertEqual(owners[clocked].clocked, clocked)
             for group in owners[clocked].groups:
                 self.assertEqual(group.clocked, clocked)
@@ -204,7 +204,7 @@ class TestTreeKernelSwitches(unittest.TestCase):
         """Repair and finish a CPU owner's trees and publish the poses and twists forward kinematics gives."""
         model = _build(wp.get_device("cpu"), worlds=2)
         solver = SolverFeatherPGS(model)
-        owner = HeldTree(solver)
+        owner = HeldTree(solver, solver.spec.classes.held)
         self.assertTrue(owner.groups)
         dt = 1.0 / 240.0
         state, expected = model.state(), model.state()

@@ -1236,6 +1236,12 @@ def _class_inputs():
     return SimpleNamespace(forest=SimpleNamespace(world_count=4, max_world_dofs=22))
 
 
+def _plan_class(inputs, *, general):
+    """The class plan of ``inputs`` without the held tree's plan, which reads the model the rules here do not."""
+    with patch.object(class_plan.held_tree, "plan", lambda inputs, **choices: None):
+        return class_plan.plan_class(inputs, general=general)
+
+
 class TestTierRule(unittest.TestCase):
     """Build the Jacobi tiers for case K4, a tree beside a free body, where no earlier case claims the class."""
 
@@ -1305,11 +1311,11 @@ class TestTierRule(unittest.TestCase):
         tiers = next(rule for name, _, rule in class_plan.RULES if name == "K4")
         rules = (("K5", "factor coordinates of a tree beside one free body", lambda inputs: (object(), None)),)
         with patch.object(class_plan, "RULES", (*rules, ("K4", "the Jacobi tiers", tiers))):
-            plan = class_plan.plan_class(_class_inputs(), general=None)
+            plan = _plan_class(_class_inputs(), general=None)
         self.assertEqual(plan.case, "K5")
         self.assertIn("case K5", plan.reasons["K4"])
         general = class_plan.general_reason(SolverFeatherPGS.Pins(), native=False)
-        self.assertIn("written for CUDA", class_plan.plan_class(_class_inputs(), general=general).reasons["K4"])
+        self.assertIn("written for CUDA", _plan_class(_class_inputs(), general=general).reasons["K4"])
         general = class_plan.general_reason(SolverFeatherPGS.Pins(placement="general"), native=True)
         self.assertIn("general placement", general)
 

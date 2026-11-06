@@ -195,22 +195,24 @@ def _held_tree(solver) -> dict:
     kind, groups = _held_tree_groups(solver)
     return {
         "owner": kind,
-        "layout_reason": getattr(owner, "forest_reason", None),
+        # Each world class's grouping and why (held_tree.HeldClass).
+        "classes": [
+            {"worlds": int(held.worlds.size), "grouping": held.grouping, "reason": held.reason}
+            for held in owner.plan.classes
+        ],
         # Whether a diagonal-mass group of world-fixed roots over one-coordinate
         # leaves runs as scalar branches.
         "scalar_branches": {
-            "enabled": getattr(owner, "scalar", None) is not None,
-            "reason": getattr(solver, "_scalar_branches_reason", None),
+            "enabled": owner.scalar is not None,
+            "reason": solver.spec.classes.scalar[1],
         },
-        "groups": [_tree_group(group) for group in groups],
+        "groups": [
+            _scalar_group(group, owner.drive_dofs) if group is owner.scalar else _tree_group(group) for group in groups
+        ],
     }
 
 
 def _tree_group(group) -> dict:
-    from .scalar_branches import ScalarBranchState  # noqa: PLC0415
-
-    if isinstance(group, ScalarBranchState):
-        return _scalar_group(group)
     layout, operator = group.layout, group.sparse
     return {
         "operator": operator.kind,
@@ -243,7 +245,7 @@ def _tree_group(group) -> dict:
     }
 
 
-def _scalar_group(group) -> dict:
+def _scalar_group(group, drive_dofs) -> dict:
     """A scalar branch group (``scalar_branches.py``) in the tree groups' schema.
 
     Its predict and finish run one thread per coordinate (``lanes``) and its
@@ -251,10 +253,9 @@ def _scalar_group(group) -> dict:
     (``trees_per_block``, ``block_dim``) are ``None``. Its repair compares no
     input banks (``input_validation`` is the group's, "identity": the stamp
     alone). ``drive_dofs`` counts the DOFs whose drives the drive kernel
-    still prepares, since the group's predict evaluates its own.
+    still prepares (the held plan's, ``drive_dofs``), since the group's predict evaluates its own.
     """
     size = int(group.size)
-    others = group.other_drive_dofs
     return {
         "operator": type(group).__name__,
         "size": size,
@@ -274,7 +275,7 @@ def _scalar_group(group) -> dict:
         "input_validation": "content" if group.bank_compare else "identity",
         "motion_velocity": bool(group.motion_velocity),
         "publishes_twists": False,
-        "drive_dofs": 0 if others is None else int(others.shape[0]),
+        "drive_dofs": 0 if drive_dofs is None else int(drive_dofs.shape[0]),
         "kernels": {
             "repair": _key(group.repair_kernel),
             "finish": _key(group.finish_kernel),
@@ -670,7 +671,7 @@ def _friction(solver) -> dict:
 
 def _dynamics(solver) -> dict:
     return {
-        "compact_diagonal_mass_dofs": json_value(solver._compact_diagonal_mass_size),
+        "compact_diagonal_mass_dofs": json_value(solver.spec.classes.diagonal_size),
         "diagonal_mass_dofs": sorted(int(size) for size in solver.forest.diagonal_mass_sizes),
         # The rows' graph's vertices: how many coordinate trees hold each number of coordinates.
         "tree_sizes": {str(size): int(n) for size, n in enumerate(np.bincount(solver.forest.tree_size)) if n},

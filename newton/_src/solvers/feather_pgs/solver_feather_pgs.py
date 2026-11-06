@@ -524,7 +524,6 @@ class SolverFeatherPGS(SolverBase):
         self._contact_material_placeholder = self._arrays.placeholder(wp.float32, (1,))
         self._bind_contact_material(None)
         self._allocate_common_buffers(model)
-        self._compact_diagonal_mass_size = self.spec.classes.diagonal_size
         self.sweep.place_packed(self.spec.classes.packed)
         # The matrix-free sweeps read the dense rows packed (packed_rows): every class but native sparse factors (case
         # K1) and the sparse diagonal (case K2). Decided before the buffers, since that placement allocates no size
@@ -569,18 +568,14 @@ class SolverFeatherPGS(SolverBase):
                 "Bilateral blocks are closed in the one writer's block phase (walk_rows): their class must walk, "
                 f"not case {case}."
             )
-        # Scalar branches take a diagonal-mass group of world-fixed roots over one-coordinate leaves (scalar_branches.py),
-        # which the held-tree owner then publishes: the compact diagonal's admission planned them.
-        self._scalar_branches, self._scalar_branches_reason = self.spec.classes.scalar
         # The walk is the trees' factor (Z4): the predictor solves every tree of its groups by it, a prescribed tree
         # beside a responding one in a size group included (the dense factor held it before Z4.2), the placements
-        # that walk read it for their rows and leave, and the border decides a slipping tree's step on it. A scalar
-        # branch predicts and decides in its own kernels (scalar_branches.py) and takes no walk.
-        responding = np.flatnonzero(self.forest.articulation_dof_count_host > 0)
-        if self._scalar_branches is not None:
-            responding = np.setdiff1d(responding, self.forest.group_to_art_host[self._scalar_branches.size])
-        if responding.size:
-            self.factor.plan_walk(responding)
+        # that walk read it for their rows and leave, and the border decides a slipping tree's step on it. The held
+        # plan names its trees (held_tree.HeldPlan.walking): a scalar branch predicts and decides in its own kernels
+        # (scalar_branches.py) and takes no walk.
+        walking = self.spec.classes.held.walking
+        if walking.size:
+            self.factor.plan_walk(walking)
         if self.placement.walks:
             self.placement.hold_units()
             if case == "K1":
