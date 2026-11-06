@@ -17,7 +17,7 @@ from functools import cache
 
 import warp as wp
 
-from ...core.memory import Buffer, Staging, arch_budget
+from ...core.memory import Staging, arch_budget
 from . import kernel_template
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .factor.walk import WalkTrees
@@ -34,6 +34,7 @@ from .sweep import (
     Diagonal,
     RowContext,
     RowLaws,
+    StagedRows,
     UnitZ,
     contact_unit,
     end_sweep,
@@ -47,7 +48,6 @@ from .sweep import (
     row_sums,
     row_update,
     row_visit,
-    spin_row,
     unit_held_loads,
     weight_arguments,
 )
@@ -167,13 +167,10 @@ def paired_factor_source(
     lanes = Lanes(32)
     laws = RowLaws(regularize=weighted, material=material, torsion=torsion, policy=solve_policy)
     op = _rows(D, lanes)
+    # The world's rows staged whole; a step divides by the diagonal.
+    rows = StagedRows(M, lanes, line="off", count="m", reciprocal=False)
     staging = Staging(
-        (
-            Buffer("s_lam", "float", M),
-            Buffer("s_rhs", "float", M),
-            Buffer("s_diag", "float", M),
-            Buffer("s_type", "unsigned char", M),
-        ),
+        rows.buffers(),
         groups=_PAIRED_WORLDS_PER_BLOCK,
         threads=32 * _PAIRED_WORLDS_PER_BLOCK,
         name="PairedScratch",
@@ -182,20 +179,18 @@ def paired_factor_source(
         row="i",
         kind="row_type",
         operator=op,
-        diagonal=Diagonal(lambda row: "denom" if row == "i" else f"s_diag[{row}]"),
-        load=lambda row: f"s_lam[{row}]",
-        store=lambda row, value: lanes.first(f"s_lam[{row}] = {value};"),
-        rhs=lambda row: f"s_rhs[{row}]",
-        mu=lambda row: f"world_row_mu.data[off + {row}]",
-        weight=lambda row: f"world_row_w.data[off + {row}]",
-        eps=lambda row: f"world_row_eps.data[off + {row}]",
+        diagonal=rows.diagonal("denom"),
+        load=rows.load,
+        store=rows.store,
+        rhs=rows.rhs_of,
+        mu=rows.mu,
+        weight=rows.weight,
+        eps=rows.eps,
         parent="parent",
-        ring_load=lambda parent, load=None: (
-            f"RING_LOAD({load or f's_lam[{parent}]'}, {parent}, m, ring_parent, ring_impulse)"
-        ),
+        ring_load=rows.ring_load,
         lanes=lanes,
         inline_velocity_limit=True,
-        spin_row=lambda parent: spin_row(parent, "m", lambda row: f"static_cast<int>(s_type[{row}])"),
+        spin_row=lambda parent: rows.spin_of(parent, "m"),
         # A friction triple reads its metric cached for the launch (sweep.friction_metric_law).
         **({"triple_law": "ROW_TRIPLE(parent, "} if torsion else {}),
     )
@@ -215,8 +210,7 @@ def paired_factor_source(
     if torsion:
         metric = (
             friction_metric_stage(
-                lambda row: f"static_cast<int>(s_type[{row}])",
-                lambda row: f"world_row_parent.data[off + {row}]",
+                *rows.scan(),
                 ctx.spin_row,
                 end="m",
                 record=friction_metric,
@@ -226,7 +220,7 @@ def paired_factor_source(
             + friction_metric_law("ROW_TRIPLE", friction_metric, "    ")
             + "\n"
         )
-    leave = f"""    for (int i = lane; i < m; i += 32) world_impulses.data[off + i] = s_lam[i];
+    leave = f"""{rows.stores("    ")}
     // The velocity change in the walk's coordinates, each lane's coordinate, to the step's one leave
     // (tree_factor.walk_leave_kernel), which walks each component's tree down in the rows' frame.
     if ({write}) walk.du.data[global_dof] += {op.velocity.array};"""
@@ -243,16 +237,9 @@ def paired_factor_source(
     const int dof_map_base = world * {D};
     const int primary_offset = primary_offset_by_world.data[world];
     const int secondary_offset = secondary_offset_by_world.data[world];
-    // A contact normal's patch ring links the region's next normal (-1 ends a point contact).
-    const auto ring_parent = [&](int r) {{ return world_row_parent.data[off + r]; }};
-    const auto ring_impulse = [&](int r) {{ return s_lam[r]; }};
+{rows.rings("    ")}
 
-    for (int i = lane; i < m; i += 32) {{
-        s_lam[i] = world_impulses.data[off + i];
-        s_rhs[i] = rhs_bias.data[off + i] + row_incident.data[off + i];
-        s_diag[i] = world_diag.data[off + i];
-        s_type[i] = static_cast<unsigned char>(world_row_type.data[off + i]);
-    }}
+{rows.loads("    ")}
     // The velocity change in factor coordinates per component, coordinate LANE in this lane's register.
     const int global_dof = lane < {D} ? world_dof_indices.data[dof_map_base + lane] : -1;
     // Each component's lane: this lane's coordinate in it (out of range on other lanes).
@@ -384,7 +371,7 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
         f"const float tangent1_z = {_load(op, 'head + 1')};",
         f"const float tangent2_z = {_load(op, 'head + 2')};",
         f"const float spin_z = {_load(op, 'head + 3')};",
-        _pair_unit(triple, laws, mu, spin="s_lam[tangent1 + 2]"),
+        _pair_unit(triple, laws, mu, spin=ctx.load("tangent1 + 2")),
     ]
     return (
         f"if ({ctx.spin_row('head')} >= 0) {{\n{indent(chr(10).join(spun), '    ')}\n}} else {{\n"
@@ -410,7 +397,7 @@ def _pair_unit(ctx: RowContext, laws: RowLaws, mu: str, *, spin: str | None = No
     spun = {"load_spin": spin} if laws.torsion else {}
     lines = [
         "float radius = 0.0f, load = 0.0f;" if laws.torsion else "float radius = 0.0f;",
-        pair_radius(ctx.ring_load("i"), mu, "s_lam[tangent1]", "s_lam[tangent1 + 1]", "", **spun),
+        pair_radius(ctx.ring_load("i"), mu, ctx.load("tangent1"), ctx.load("tangent1 + 1"), "", **spun),
         pair_update(pair, laws, pad=""),
     ]
     return "\n".join(lines)

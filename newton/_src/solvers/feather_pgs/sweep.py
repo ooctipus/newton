@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable
-from typing import ClassVar
+from typing import ClassVar, Protocol
 
 import warp as wp
 
@@ -159,6 +159,13 @@ class WorldRows:
         """A header row's stored inverse diagonal."""
         return f"__int_as_float(mf_meta.data[off_meta + {row} * 4 + 1])"
 
+    def diagonal(self, own: str) -> Diagonal:
+        """The rows' diagonals as the class keeps them (the visited row ``i``'s read into ``own``): a header row's
+        stored inverse, which its step multiplies by, or the dense rows' value, which a step divides by."""
+        if self.header:
+            return Diagonal(inverse=lambda row: own if row == "i" else self.inverse(row))
+        return Diagonal(lambda row: own if row == "i" else self.diag(row))
+
     def mu(self, row: str) -> str:
         return f"world_row_mu.data[off_mf + {row}]" if self.header else self.staged("s_mu_dense", row)
 
@@ -211,18 +218,18 @@ class WorldRows:
             return f"s_lam_mf[{row}] = {value};"
         return self.lanes.first(f"{self.impulses}[{row}] = {value};")
 
-    def ring_load(self, parent: str) -> str:
-        """The pooled normal load of the patch ring of normal row ``parent``."""
+    def ring_load(self, parent: str, load: str | None = None) -> str:
+        """The pooled normal load of the patch ring of normal row ``parent``, from ``load`` (its impulse)."""
         if self.header:
             member = self.parent_of("mf_meta.data[off_meta + patch_row * 4 + 3]")
             impulse = self.load("patch_row")
             return (
-                f"RING_LOAD({self.load(parent)}, {parent}, {self.capacity},\n"
+                f"RING_LOAD({load or self.load(parent)}, {parent}, {self.capacity},\n"
                 f"    [&](int patch_row) {{ return {member}; }},\n"
                 f"    [&](int patch_row) {{ return {impulse}; }})"
             )
         return (
-            f"RING_LOAD(s_lam_dense[{parent}], {parent}, {self.capacity},\n"
+            f"RING_LOAD({load or self.peek(parent)}, {parent}, {self.capacity},\n"
             f"    [&](int patch_row) {{ return {self.parent('patch_row', enclosed=True)}; }},\n"
             f"    [&](int patch_row) {{ return s_lam_dense[patch_row]; }})"
         )
@@ -287,6 +294,181 @@ def spin_row(parent: str, end: str, kind: Callable[[str], str], *, spin: str = s
     """
     row = f"({parent}) + 3"
     return f"({row} < ({end}) && {kind(row)} == {spin} ? {row} : -1)"
+
+
+class RowStore(Protocol):
+    """Where a world's rows live, as the row law and a sweep's phases read them: every accessor is native text at a
+    row index. Two stores answer it: :class:`WorldRows` (a class's rows in the row store's line, staged or streamed by
+    the class's policy: the matrix-free and sparse-diagonal sweeps) and :class:`StagedRows` (a world's rows staged
+    whole: the sparse and paired factor sweeps)."""
+
+    lanes: Lanes
+
+    def load(self, row: str) -> str:
+        """Row ``row``'s impulse on every lane."""
+
+    def peek(self, row: str) -> str:
+        """Row ``row``'s impulse as stored."""
+
+    def store(self, row: str, value: str) -> str:
+        """Row ``row``'s impulse store, by the lanes that own it."""
+
+    def rhs_of(self, row: str) -> str: ...
+
+    def diag(self, row: str) -> str: ...
+
+    def diagonal(self, own: str) -> Diagonal:
+        """The rows' diagonals as the store keeps them (:class:`Diagonal`), the visited row ``i``'s read into ``own``:
+        a stored reciprocal is multiplied by, a value divided by."""
+
+    def mu(self, row: str) -> str: ...
+
+    def weight(self, row: str) -> str: ...
+
+    def eps(self, row: str) -> str: ...
+
+    def kind(self, row: str, *, scan: bool = False) -> str: ...
+
+    def parent(self, row: str, *, enclosed: bool = False) -> str: ...
+
+    def ring_load(self, parent: str, load: str | None = None) -> str:
+        """The pooled normal load of the patch ring of normal row ``parent``, from ``load`` (its impulse)."""
+
+    def spin_of(self, parent: str, end: str) -> str:
+        """The spin row of the contact whose normal is row ``parent``, of rows ``[0, end)`` (:func:`spin_row`)."""
+
+    def scan(self) -> tuple[Callable[[str], str], Callable[[str], str]]:
+        """A row's kind and parent as a scan over the rows reads them (:func:`friction_metric_stage`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class StagedRows:
+    """A world's rows staged whole (the sparse and paired factor sweeps' store).
+
+    Impulses, right-hand sides (``rhs_bias + row_incident``), diagonals and kinds are staged per world (``s_impulse``,
+    ``s_rhs``, ``s_diag``, ``s_type``); every lane reads them and the first lane stores the impulses. With
+    ``reciprocal`` the diagonals' reciprocals are staged too (``s_inverse``): a row's diagonal is fixed for the solve,
+    so its reciprocal is formed once, at staging, and a row's step multiplies by it (the exit law reads the diagonal
+    itself); without, a step divides. Parents, friction coefficients, weights and compliances stream from the row
+    store's line from ``line``, the kernel's local for the world's first row; ``count`` is its local for the world's
+    row count, which bounds a patch ring's walk.
+
+    With ``triples`` (contact torsion, a sweep that solves friction triples in a phase of their own) a triple's pair
+    (a contact with a spin row, :func:`spin_row`) is staged as the spin row's kind: the row loop and the active scan
+    skip the triple's three rows, and the triple phase finds its normal by the staged kinds.
+    """
+
+    capacity: int
+    lanes: Lanes
+    line: str = "offset"
+    count: str = "count"
+    reciprocal: bool = True
+    triples: bool = False
+
+    def load(self, row: str) -> str:
+        return f"s_impulse[{row}]"
+
+    def peek(self, row: str) -> str:
+        return f"s_impulse[{row}]"
+
+    def store(self, row: str, value: str) -> str:
+        return self.lanes.first(f"s_impulse[{row}] = {value};")
+
+    def rhs_of(self, row: str) -> str:
+        return f"s_rhs[{row}]"
+
+    def diag(self, row: str) -> str:
+        return f"s_diag[{row}]"
+
+    def inverse(self, row: str) -> str:
+        return f"s_inverse[{row}]"
+
+    def diagonal(self, own: str) -> Diagonal:
+        return Diagonal(lambda row: own if row == "i" else self.diag(row), self.inverse if self.reciprocal else None)
+
+    def kind(self, row: str, *, scan: bool = False) -> str:
+        return f"s_type[{row}]"
+
+    def parent(self, row: str, *, enclosed: bool = False) -> str:
+        return f"world_row_parent.data[{self.line} + {row}]"
+
+    def mu(self, row: str) -> str:
+        return f"world_row_mu.data[{self.line} + {row}]"
+
+    def weight(self, row: str) -> str:
+        return f"world_row_w.data[{self.line} + {row}]"
+
+    def eps(self, row: str) -> str:
+        return f"world_row_eps.data[{self.line} + {row}]"
+
+    def ring_load(self, parent: str, load: str | None = None) -> str:
+        return f"RING_LOAD({load or self.load(parent)}, {parent}, {self.count}, ring_parent, ring_impulse)"
+
+    def spin_of(self, parent: str, end: str) -> str:
+        return spin_row(parent, end, lambda row: f"static_cast<int>({self.kind(row)})")
+
+    def scan(self) -> tuple[Callable[[str], str], Callable[[str], str]]:
+        return (lambda row: f"static_cast<int>({self.kind(row)})"), self.parent
+
+    # -- staging ---------------------------------------------------------------------------------------------------
+
+    def buffers(self) -> tuple[Buffer, ...]:
+        rows = self.capacity
+        inverse = (Buffer("s_inverse", "float", rows),) if self.reciprocal else ()
+        return (
+            Buffer("s_impulse", "float", rows),
+            Buffer("s_rhs", "float", rows),
+            Buffer("s_diag", "float", rows),
+            *inverse,
+            Buffer("s_type", "unsigned char", rows),
+        )
+
+    def rings(self, pad: str) -> str:
+        """The patch rings' accessors :meth:`ring_load` walks."""
+        return (
+            f"{pad}// A contact normal's patch ring links the region's next normal (-1 ends a point contact).\n"
+            f"{pad}const auto ring_parent = [&](int r) {{ return {self.parent('r')}; }};\n"
+            f"{pad}const auto ring_impulse = [&](int r) {{ return {self.load('r')}; }};"
+        )
+
+    def loads(self, pad: str) -> str:
+        """Stage the world's rows, a lane a row (with ``triples``, ``world_triples``: whether the world holds one)."""
+        lane, width, line, count = self.lanes.lane, self.lanes.width, self.line, self.count
+        kind = f"static_cast<unsigned char>(world_row_type.data[{line} + i])"
+        triple = ""
+        if self.triples:
+            kind = "static_cast<unsigned char>(kind)"
+            spin = spin_row("parent", count, lambda row: f"world_row_type.data[{line} + {row}]")
+            triple = (
+                f"{pad}    int kind = world_row_type.data[{line} + i];\n"
+                f"{pad}    if (kind == {FRICTION}) {{\n"
+                f"{pad}        const int parent = world_row_parent.data[{line} + i];\n"
+                f"{pad}        if ({spin} >= 0) kind = {TORSION};\n"
+                f"{pad}    }}\n"
+                f"{pad}    if (kind == {TORSION}) staged_triples = true;\n"
+            )
+        diagonal = f"{pad}    s_diag[i] = world_diag.data[{line} + i];\n"
+        if self.reciprocal:
+            diagonal = (
+                f"{pad}    const float diagonal = world_diag.data[{line} + i];\n"
+                f"{pad}    s_diag[i] = diagonal;\n"
+                f"{pad}    s_inverse[i] = 1.0f / diagonal;\n"
+            )
+        # Whether the world holds a friction triple (a spin row): the triple phase runs only where one does.
+        present = f"\n{pad}const bool world_triples = ANY(staged_triples);\n" if self.triples else ""
+        return (
+            (f"{pad}bool staged_triples = false;\n" if self.triples else "")
+            + f"{pad}for (int i = {lane}; i < {count}; i += {width}) {{\n"
+            f"{pad}    s_impulse[i] = world_impulses.data[{line} + i];\n"
+            f"{pad}    s_rhs[i] = rhs_bias.data[{line} + i] + row_incident.data[{line} + i];\n"
+            f"{diagonal}{triple}{pad}    s_type[i] = {kind};\n"
+            f"{pad}}}{present}"
+        )
+
+    def stores(self, pad: str) -> str:
+        """Publish the world's staged impulses."""
+        lane, width = self.lanes.lane, self.lanes.width
+        return f"{pad}for (int i = {lane}; i < {self.count}; i += {width}) world_impulses.data[{self.line} + i] = s_impulse[i];"
 
 
 # ---------------------------------------------------------------------------------------------------------------------

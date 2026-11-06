@@ -76,7 +76,7 @@ class TestPairedFactorRoute(unittest.TestCase):
         )
         for schedule in PAIRED_SCHEDULES[1:]:
             body, _ = sweep_routes_local.paired_factor_source(64, 23, 17, 6, **schedule)
-            held = "const float unit_lam0 = s_lam[head], unit_lam1 = s_lam[head + 1], unit_lam2 = s_lam[head + 2];"
+            held = "const float unit_lam0 = s_impulse[head], unit_lam1 = s_impulse[head + 1], unit_lam2 = s_impulse[head + 2];"
             self.assertIn(held, body)
             units = _block(body, "if (unit_lam0 != 0.0f || unit_lam1 != 0.0f || unit_lam2 != 0.0f) {")
             self.assertIn(unit, units)
@@ -88,7 +88,7 @@ class TestPairedFactorRoute(unittest.TestCase):
             # The rows read the impulses the unit held and pool the ring from the normal's new impulse in a register,
             # so they read no store of the unit: each row's stores wait for the lanes (a skipped normal leaves the
             # pair's first), no row synchronizes after its stores, and the unit does once after its apply.
-            self.assertEqual(re.findall(r"s_lam\[[^\]]*\](?! = )", units), [])
+            self.assertEqual(re.findall(r"s_impulse\[[^\]]*\](?! = )", units), [])
             self.assertIn("RING_LOAD(unit_normal, parent, m, ring_parent, ring_impulse)", units)
             # Nor do they read a staged right-hand side or diagonal after a barrier: the unit holds them too, loaded
             # before its ladder (the normal's check reads its declared diagonal before its barrier).
