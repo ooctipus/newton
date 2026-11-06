@@ -281,7 +281,6 @@ class TreeFactor:
         view.link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
         view.now = wp.zeros(1, dtype=wp.spatial_vector, device=device)
         view.now_link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
-        view.now_com = wp.zeros(1, dtype=wp.vec3, device=device)
         view.origin = view.now_origin = wp.zeros(1, dtype=wp.vec3, device=device)
         view.joint_art = wp.zeros(1, dtype=wp.int32, device=device)
         view.joint_start = model.articulation_start
@@ -291,7 +290,6 @@ class TreeFactor:
         view.dof_body = view.body_joint = wp.zeros(1, dtype=wp.int32, device=device)
         view.du = wp.zeros(1, dtype=wp.float32, device=device)
         view.release = release_view(max(int(model.articulation_count), 1), 0, 1, device)
-        view.body_art = forest.body_to_articulation
         view.first_art = wp.full(1, -1, dtype=wp.int32, device=device)
         view.cls = wp.zeros(1, dtype=wp.int32, device=device)
         return view
@@ -842,7 +840,7 @@ class TreeFactor:
         view = WalkTrees()
         view.data, view.link = self.walk_data, self.walk_link
         view.now = self.walk_now if both else self.joint_S_s
-        view.now_link, view.now_com = self.walk_now_link, self.joint_com_offset
+        view.now_link = self.walk_now_link
         view.origin, view.now_origin = self.walk_origin, self.articulation_origin
         view.joint_art = model.joint_articulation
         view.joint_start = model.articulation_start
@@ -864,9 +862,8 @@ class TreeFactor:
             depth if self.walk_slip_capacity else 1,
             device,
         )
-        # Where each body's tree lives: its articulation, and the responding articulation whose coordinates start at
-        # each global coordinate (-1 elsewhere), by which a matrix-free sweep finds a free body's tree.
-        view.body_art = forest.body_to_articulation
+        # The responding articulation whose coordinates start at each global coordinate (-1 elsewhere), by which a
+        # matrix-free sweep finds a free body's tree.
         first_art = np.full(dofs, -1, dtype=np.int32)
         starts = forest.articulation_dof_start.numpy()
         responding = np.flatnonzero(forest.articulation_response_dof_count.numpy() > 0)

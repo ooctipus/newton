@@ -1325,7 +1325,6 @@ def identity_walk(dofs: int, device) -> WalkTrees:
     walk.link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
     walk.now = wp.zeros(dofs, dtype=wp.spatial_vector, device=device)
     walk.now_link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
-    walk.now_com = wp.zeros(1, dtype=wp.vec3, device=device)
     walk.origin = walk.now_origin = wp.zeros(1, dtype=wp.vec3, device=device)
     for name, values in (
         ("joint_start", [0]),

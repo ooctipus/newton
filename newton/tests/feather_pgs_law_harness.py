@@ -993,7 +993,6 @@ def chain_walk(device, lowers) -> WalkTrees:
     walk.link = wp.zeros((total, WALK_LINK), dtype=wp.float32, device=device)
     walk.now = wp.array(np.asarray(now, dtype=np.float32).reshape(-1, 6), dtype=wp.spatial_vector, device=device)
     walk.now_link = wp.zeros((total, WALK_LINK), dtype=wp.float32, device=device)
-    walk.now_com = wp.zeros(total, dtype=wp.vec3, device=device)
     # One geometry's frames, at the world's origin: the factor's and the step's origins agree.
     walk.origin = walk.now_origin = wp.zeros(arts, dtype=wp.vec3, device=device)
     walk.joint_art = ints(np.repeat(np.arange(arts), sizes))
@@ -1001,7 +1000,6 @@ def chain_walk(device, lowers) -> WalkTrees:
     walk.dof_start, walk.dofs = ints(start[:-1]), ints(sizes)
     walk.dof_body, walk.body_joint = ints(dof_body), ints(np.arange(total))
     # Each chain's articulation at its first coordinate (a free body's tree, found by a sweep).
-    walk.body_art = walk.joint_art
     first_art = np.full(total, -1, dtype=np.int32)
     first_art[start[:-1]] = np.arange(arts)
     walk.first_art = ints(first_art)

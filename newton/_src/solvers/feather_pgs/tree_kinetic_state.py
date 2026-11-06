@@ -624,7 +624,7 @@ _EXTERNAL_FRAME = r"""float P[4];WALK_READ_POINT(WALK_LDG,P,walk.now_link.data+$
             input=Spatial::wrench_shift(input,wp::vec3(c[0]-P[0],c[1]-P[1],c[2]-P[2]));"""
 """A body's external wrench at its frame: the force keeps, the moment gains the centre of mass less the frame point
 (:func:`.spatial_laws.wrench_shift`), both the step's, the articulation's own (relative to its origin), as the walk's
-refresh forms its inertia's lever (``factor.walk.WalkTrees.now_com``, ``now_link``)."""
+refresh forms its inertia's lever (with ``factor.walk.WalkTrees.now_link``)."""
 
 _EXTERNAL_CARRY = r"""    if(nonzero) {
         if(lane==0) {
@@ -901,7 +901,7 @@ def get_helpers(
         if wp.static(body_velocity):
             data.body_v_s[body] = velocity
         # The body's centre of mass relative to its articulation's origin, by its joint: the predictor's external
-        # wrenches shift there, and the walk's refresh forms its inertia's lever from it (tree_factor.WalkTrees.now_com).
+        # wrenches shift there, and the walk's refresh forms its inertia's lever from it (walk_step_kernel's now_com).
         cache.com_offset[g.js + local] = radius
         if wp.static(clocked):
             clock_b2 = _clock()

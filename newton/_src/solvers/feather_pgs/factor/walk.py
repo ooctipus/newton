@@ -1359,9 +1359,8 @@ class WalkTrees:
 
     - ``data``, ``link``: :data:`WALK_COORDINATE` floats a coordinate and :data:`WALK_LINK` floats a body (each tree's
       path is its class's, ``cls``);
-    - ``now``, ``now_link``, ``now_com``: each coordinate's column at its body's frame, each body's link
-      (:data:`WALK_LINK`'s layout: its frame point) and its centre of mass (a ``vec3`` a joint), at the step's poses,
-      which the held tree's finish publishes with its motion columns: a seed enters the walk as ``J`` there (each column
+    - ``now``, ``now_link``: each coordinate's column at its body's frame and each body's link (:data:`WALK_LINK`'s
+      layout: its frame point), at the step's poses, which the held tree's finish publishes with its motion columns: a seed enters the walk as ``J`` there (each column
       shifted to its body's frame point in ``link`` by the body's motion since the refresh), so a held factor (a step
       between refreshes) whitens the step's ``J``, and a row's incident ``J v_hat`` is summed along its walk; a refresh
       takes them as the factor's frames;
@@ -1378,7 +1377,7 @@ class WalkTrees:
     - ``release``: the release of each tree's slips (the block primitive's first phase, :class:`WalkRelease`), which the
       predictor's border writes (:func:`.tree_kinetic_state.border_solve`, FL3.9): the rows take ``R``, the leave
       ``R^T`` and the audit's coordinates ``R^-T``;
-    - ``body_art``: each body's articulation; ``first_art``: the responding articulation whose coordinates start at
+    - ``first_art``: the responding articulation whose coordinates start at
       each global coordinate (-1 elsewhere), by which a matrix-free sweep finds a free body's tree
       (:class:`.sweep_routes.FreeBodyCoordinates`);
     - ``cls``: each walking articulation's class (:attr:`.tree_factor.TreeFactor.walk_classes`), by which a lane reads
@@ -1389,7 +1388,6 @@ class WalkTrees:
     link: wp.array2d[float]
     now: wp.array[wp.spatial_vector]
     now_link: wp.array2d[float]
-    now_com: wp.array[wp.vec3]
     origin: wp.array[wp.vec3]
     now_origin: wp.array[wp.vec3]
     joint_art: wp.array[int]
@@ -1401,7 +1399,6 @@ class WalkTrees:
     body_joint: wp.array[int]
     release: WalkRelease
     du: wp.array[float]
-    body_art: wp.array[int]
     first_art: wp.array[int]
     cls: wp.array[int]
 
