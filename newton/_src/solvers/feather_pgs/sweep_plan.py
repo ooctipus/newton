@@ -891,10 +891,15 @@ class Sweep:
             self._launch(tier.kernel, operands, tier.grid, tier.work.block, **named)
 
         if streams:
+            # The claims are queued first, ahead of the general sweep: on franka the widest tier (rows32) is the
+            # solve's critical path once the general bucket holds few worlds, and queued behind the general sweep's
+            # grid it started 8 us later a solve (PRO).
             main.record_event(self.claims_ready)
-            for stream in streams:
+            for stream, tier in zip(streams, self.tiers, strict=True):
                 stream.wait_event(self.claims_ready)
-        if not streams:
+                with wp.ScopedStream(stream, sync_enter=False):
+                    launch_tier(tier)
+        else:
             for tier in self.tiers:
                 launch_tier(tier)
         colored_kernel = self.mf_colored_kernel
@@ -916,10 +921,6 @@ class Sweep:
                 **queued(self.claim_colored, grid),
             )
         if streams:
-            # The general tail is queued first; the claims share only the ready dependency with it.
-            for stream, tier in zip(streams, self.tiers, strict=True):
-                with wp.ScopedStream(stream, sync_enter=False):
-                    launch_tier(tier)
             for stream, done in zip(streams, self.claims_done, strict=True):
                 stream.record_event(done)
                 main.wait_event(done)
