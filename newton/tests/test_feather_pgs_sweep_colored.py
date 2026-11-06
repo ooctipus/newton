@@ -175,7 +175,7 @@ class TestStageSlots(unittest.TestCase):
         full = 4 if torsion else 3
         return (((0, full), (full, 1)), ((0, 1), (1, full), (1 + full, 1)))
 
-    def _stage(self, device, weights, regularize: int, torsion: bool) -> tuple:
+    def _stage(self, device, weights, weighted: bool, torsion: bool) -> tuple:
         """Stage :meth:`units` with the row weights ``weights``: the staged units, their slot fields in the layout,
         and the rows' coefficients."""
         rng = np.random.default_rng(7)
@@ -195,7 +195,7 @@ class TestStageSlots(unittest.TestCase):
         slot_data = wp.zeros((self.WORLDS, layout.fields, records.shape[1]), dtype=float, device=device)
         slot_words = wp.zeros((self.WORLDS, layout.words, records.shape[1]), dtype=wp.int32, device=device)
         wp.launch(
-            sweep_units.stage_slots,
+            sweep_units.stage_slots(weighted),
             dim=records.shape[:2],
             inputs=[
                 row_lines(device),
@@ -208,7 +208,6 @@ class TestStageSlots(unittest.TestCase):
                 wp.array(mu, dtype=float, device=device),
                 weights,
                 0,
-                regularize,
                 layout.rows,
             ],
             outputs=[slot_data, slot_words],
@@ -232,7 +231,7 @@ class TestStageSlots(unittest.TestCase):
                     guard = np.full((self.WORLDS, self.ROWS), np.nan, dtype=np.float32)
                     guard[0, 0] = 1.0
                     stand_in = wp.array(guard, dtype=float, device=device)[:1, :1]
-                    staged, data, layout, row_mu = self._stage(device, stand_in, 0, torsion)
+                    staged, data, layout, row_mu = self._stage(device, stand_in, False, torsion)
                     for world, p, row, rows in staged:
                         self.assertEqual(
                             data[world, layout.weight, p], 1.0, f"world {world} unit {p}: stand-in indexed"
@@ -244,7 +243,7 @@ class TestStageSlots(unittest.TestCase):
                             )
                     weights = np.random.default_rng(3).uniform(0.2, 0.9, (self.WORLDS, self.ROWS)).astype(np.float32)
                     staged, data, layout, _ = self._stage(
-                        device, wp.array(weights, dtype=float, device=device), 1, torsion
+                        device, wp.array(weights, dtype=float, device=device), True, torsion
                     )
                     for world, p, row, _ in staged:
                         self.assertEqual(data[world, layout.weight, p], weights[world, row])

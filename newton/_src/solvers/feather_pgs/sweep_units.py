@@ -174,90 +174,96 @@ SLOT_FIELDS = FieldGroup(
 :class:`SlotLayout`."""
 
 
-@wp.kernel(enable_backward=False)
-def stage_slots(
-    mf_first: wp.array[int],
-    slot_world: wp.array[wp.int32],
-    world_colored: wp.array[wp.int32],
-    unit_count: wp.array[wp.int32],
-    color_slot: wp.array3d[wp.int32],
-    mf_meta: wp.array2d[wp.int32],
-    mf_Z: wp.array3d[float],
-    mf_row_mu: wp.array2d[float],
-    mf_row_w: wp.array2d[float],
-    body_base: int,
-    regularize: int,
-    layout_rows: int,
-    slot_data: wp.array3d[float],
-    slot_words: wp.array3d[wp.int32],
-):
-    """Gather each colored world's unit rows into its slot's slot-major :data:`SLOT_FIELDS` (one thread per slot and
-    unit), in the :class:`SlotLayout` of units of at most ``layout_rows`` rows.
+@cache
+def stage_slots(weighted: bool) -> wp.Kernel:
+    """The slot staging kernel of the laws (``weighted``: contact rows step by their weights, a constant of the plan
+    that every sweep compiles in, :class:`.sweep.RowLaws`)."""
 
-    A unit stages only what its rows hold: its pair's friction coefficient when it has a friction pair, its spin row's
-    when it has one, and its normal row's weight from ``mf_row_w`` only when ``regularize`` is set (the sweeps'
-    run-time switch); otherwise the solver binds a one-element stand-in for the weights, and the row's weight is 1.
-    The coefficients and weights are the row store's, the free bodies' row ``i`` at ``body_base + i`` of the line.
-    """
-    slot, p = wp.tid()
-    world = slot_world[slot]
-    if world_colored[world] == 0 or p >= unit_count[world]:
-        return
-    mf_line = mf_first[world]
-    row = color_slot[slot, p, 0]
-    rows = color_slot[slot, p, 1] & 7
-    for r in range(4):
-        if r < rows:
-            for k in range(12):
-                slot_data[slot, r * 12 + k, p] = mf_Z[mf_line, row + r, k]
-            slot_words[slot, r * 3, p] = mf_meta[mf_line, (row + r) * 4 + 1]
-            slot_words[slot, r * 3 + 1, p] = mf_meta[mf_line, (row + r) * 4 + 2]
-            slot_words[slot, r * 3 + 2, p] = mf_meta[mf_line, (row + r) * 4 + 3]
-        elif r == 3 and rows == 3 and layout_rows > 3:
-            # A friction contact without a spin row in a layout with spin rows: a zero row, whose terms and
-            # couplings are zero (:func:`.sweep.spin_row`).
-            for k in range(12):
-                slot_data[slot, r * 12 + k, p] = 0.0
-    entries = layout_rows * 12
-    mu = float(0.0)
-    if rows >= 3:
-        mu = mf_row_mu[mf_line, body_base + row + 1]
-    slot_data[slot, entries, p] = mu
-    weight = float(1.0)
-    if regularize != 0:
-        weight = mf_row_w[mf_line, body_base + row]
-    slot_data[slot, entries + 1, p] = weight
-    if layout_rows > 3:
-        # The spin row's torsional coefficient (contact torsion).
-        spin_mu = float(0.0)
-        if rows > 3:
-            spin_mu = mf_row_mu[mf_line, body_base + row + 3]
-        slot_data[slot, entries + 2, p] = spin_mu
-    if rows >= 3:
-        # The friction pair's patch ring: its normal's ring successors in ring order (the pooled load's walk).
-        words = wp.vec4i(-1, -1, -1, -1)
-        members = int(0)
-        hop = int(0)
-        rows_cap = mf_meta.shape[1] // 4
-        link = (mf_meta[mf_line, row * 4 + 3] >> 16) & 0xFFFF
-        r = wp.where(link == 0xFFFF, -1, link)
-        while r >= 0 and r != row and hop < rows_cap:
-            if members == _RING_MEMBERS:
-                members = -1
-                break
-            # Two 16-bit rows a word, low half first; an unused half stays 0xFFFF.
-            if members % 2 == 0:
-                words[members // 2] = (r & 0xFFFF) | (-65536)
-            else:
-                words[members // 2] = (words[members // 2] & 0xFFFF) | (r << 16)
-            members += 1
-            hop += 1
-            link = (mf_meta[mf_line, r * 4 + 3] >> 16) & 0xFFFF
+    @wp.kernel(enable_backward=False, module="unique")
+    def stage(
+        mf_first: wp.array[int],
+        slot_world: wp.array[wp.int32],
+        world_colored: wp.array[wp.int32],
+        unit_count: wp.array[wp.int32],
+        color_slot: wp.array3d[wp.int32],
+        mf_meta: wp.array2d[wp.int32],
+        mf_Z: wp.array3d[float],
+        mf_row_mu: wp.array2d[float],
+        mf_row_w: wp.array2d[float],
+        body_base: int,
+        layout_rows: int,
+        slot_data: wp.array3d[float],
+        slot_words: wp.array3d[wp.int32],
+    ):
+        """Gather each colored world's unit rows into its slot's slot-major :data:`SLOT_FIELDS` (one thread per slot and
+        unit), in the :class:`SlotLayout` of units of at most ``layout_rows`` rows.
+
+        A unit stages only what its rows hold: its pair's friction coefficient when it has a friction pair, its spin row's
+        when it has one, and its normal row's weight from ``mf_row_w`` only where the laws are weighted; otherwise the
+        solver binds a one-element stand-in for the weights, and the row's weight is 1.
+        The coefficients and weights are the row store's, the free bodies' row ``i`` at ``body_base + i`` of the line.
+        """
+        slot, p = wp.tid()
+        world = slot_world[slot]
+        if world_colored[world] == 0 or p >= unit_count[world]:
+            return
+        mf_line = mf_first[world]
+        row = color_slot[slot, p, 0]
+        rows = color_slot[slot, p, 1] & 7
+        for r in range(4):
+            if r < rows:
+                for k in range(12):
+                    slot_data[slot, r * 12 + k, p] = mf_Z[mf_line, row + r, k]
+                slot_words[slot, r * 3, p] = mf_meta[mf_line, (row + r) * 4 + 1]
+                slot_words[slot, r * 3 + 1, p] = mf_meta[mf_line, (row + r) * 4 + 2]
+                slot_words[slot, r * 3 + 2, p] = mf_meta[mf_line, (row + r) * 4 + 3]
+            elif r == 3 and rows == 3 and layout_rows > 3:
+                # A friction contact without a spin row in a layout with spin rows: a zero row, whose terms and
+                # couplings are zero (:func:`.sweep.spin_row`).
+                for k in range(12):
+                    slot_data[slot, r * 12 + k, p] = 0.0
+        entries = layout_rows * 12
+        mu = float(0.0)
+        if rows >= 3:
+            mu = mf_row_mu[mf_line, body_base + row + 1]
+        slot_data[slot, entries, p] = mu
+        weight = float(1.0)
+        if wp.static(weighted):
+            weight = mf_row_w[mf_line, body_base + row]
+        slot_data[slot, entries + 1, p] = weight
+        if layout_rows > 3:
+            # The spin row's torsional coefficient (contact torsion).
+            spin_mu = float(0.0)
+            if rows > 3:
+                spin_mu = mf_row_mu[mf_line, body_base + row + 3]
+            slot_data[slot, entries + 2, p] = spin_mu
+        if rows >= 3:
+            # The friction pair's patch ring: its normal's ring successors in ring order (the pooled load's walk).
+            words = wp.vec4i(-1, -1, -1, -1)
+            members = int(0)
+            hop = int(0)
+            rows_cap = mf_meta.shape[1] // 4
+            link = (mf_meta[mf_line, row * 4 + 3] >> 16) & 0xFFFF
             r = wp.where(link == 0xFFFF, -1, link)
-        ring = layout_rows * 3
-        for k in range(_RING_MEMBERS // 2):
-            slot_words[slot, ring + k, p] = words[k]
-        slot_words[slot, ring + _RING_MEMBERS // 2, p] = members
+            while r >= 0 and r != row and hop < rows_cap:
+                if members == _RING_MEMBERS:
+                    members = -1
+                    break
+                # Two 16-bit rows a word, low half first; an unused half stays 0xFFFF.
+                if members % 2 == 0:
+                    words[members // 2] = (r & 0xFFFF) | (-65536)
+                else:
+                    words[members // 2] = (words[members // 2] & 0xFFFF) | (r << 16)
+                members += 1
+                hop += 1
+                link = (mf_meta[mf_line, r * 4 + 3] >> 16) & 0xFFFF
+                r = wp.where(link == 0xFFFF, -1, link)
+            ring = layout_rows * 3
+            for k in range(_RING_MEMBERS // 2):
+                slot_words[slot, ring + k, p] = words[k]
+            slot_words[slot, ring + _RING_MEMBERS // 2, p] = members
+
+    return stage
 
 
 UNIT_ROWS = 3
@@ -619,6 +625,7 @@ class ColoredUnits:
         worlds: The capable worlds, in world order: slot ``k`` holds world ``worlds[k]``.
         rule: Which of them take the colored mapping at a pack (:class:`ColoredRule`).
         torsion: Contact torsion: a unit's spin row follows its friction pair (:func:`slot_layout`).
+        weighted: The laws' weighted rows: a unit stages its normal row's weight (:func:`stage_slots`).
     """
 
     def __init__(
@@ -631,6 +638,7 @@ class ColoredUnits:
         worlds,
         rule: ColoredRule = COLORED_RULE,
         torsion: bool = False,
+        weighted: bool = False,
     ):
         self.world_count, self.mf_rows = int(world_count), int(mf_rows)
         self.unit_capacity = unit_capacity(self.mf_rows)
@@ -652,6 +660,7 @@ class ColoredUnits:
         # Sticky: 1 once a world's units passed its slot's (the build's device status).
         self.status = wp.zeros(1, dtype=wp.int32, device=device)
         self.rule = rule
+        self.stage_kernel = stage_slots(bool(weighted))
         self.build_kernel = build_units_kernel(
             self.mf_rows,
             int(dofs),
@@ -672,10 +681,9 @@ class ColoredUnits:
         mf_row_mu,
         mf_row_w,
         body_base: int,
-        regularize: int,
     ) -> None:
         """Build every capable world's units and colors and stage the colored worlds' rows by color slot (the row
-        weights ``mf_row_w`` only under the sweeps' run-time switch ``regularize``: :func:`stage_slots`)."""
+        weights ``mf_row_w`` only where the laws are weighted: :func:`stage_slots`)."""
         units = self.units
         wp.launch_tiled(
             self.build_kernel,
@@ -686,7 +694,7 @@ class ColoredUnits:
             device=self.device,
         )
         wp.launch(
-            stage_slots,
+            self.stage_kernel,
             dim=(self.slot_count, self.unit_capacity),
             inputs=[
                 mf_first,
@@ -699,7 +707,6 @@ class ColoredUnits:
                 mf_row_mu,
                 mf_row_w,
                 int(body_base),
-                int(regularize),
                 self.layout.rows,
             ],
             outputs=[self.slots["slot_data"], self.slots["slot_words"]],

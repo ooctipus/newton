@@ -664,7 +664,6 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         placement.pack_free_body_meta()
 
     colored = sweep.colored_units
-    weighted = int(route.laws.weighted)
 
     def build_colored_units(step):
         # The colored worlds' units and colors follow the rows the pack just published.
@@ -677,7 +676,6 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
             placement.row_mu,
             placement.row_w,
             placement.body_base,
-            weighted,
         )
 
     def solve(step):

@@ -1086,6 +1086,7 @@ class Sweep:
                     worlds=capable,
                     rule=rule,
                     torsion=self.laws.spin_rows,
+                    weighted=self.laws.set.weighted,
                 )
                 self.mf_colored_kernel = self.kernel(
                     "mf_colored",

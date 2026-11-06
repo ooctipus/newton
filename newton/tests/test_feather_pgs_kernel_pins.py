@@ -280,6 +280,7 @@ def _solver_factory_calls():
         sweep_routes_diag,
         sweep_routes_local,
         sweep_routes_tiers,
+        sweep_units,
     )
 
     name = "sweep_levels."
@@ -316,6 +317,9 @@ def _solver_factory_calls():
         }
         factory = sweep_routes.mf_gs_kernel.__wrapped__
         yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
+    # The colored units' slot staging, under each law (the weights a constant of the plan).
+    for weighted in (False, True):
+        yield "sweep_units.stage_slots", sweep_units.stage_slots.__wrapped__, (weighted,), {}
     for components in (False, True):
         factory = sweep_routes_local.paired_factor_kernel.__wrapped__
         yield "sweep_routes_local.paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, components), {}
