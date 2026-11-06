@@ -1362,8 +1362,7 @@ def friction_triple_visit(
     The triple's law projects the residuals: ``law`` is the call up to its residual argument, ``(residual, old, mu,
     mu_t, load, omega)`` after it (:func:`.projection_laws.friction_triple_from_metric` of the contact's metric). The
     first lane stores the impulses, the three changes vote together and one apply writes each coordinate once
-    (:meth:`.SparseFactor.unit_apply`): the spin row's change, then the pair's second and first tangents', the order
-    the row loop applied them in.
+    (:meth:`.SparseFactor.unit_apply`): the three changes summed in the rows' order, then added.
     """
     op, diag = ctx.operator, ctx.diagonal
     names = (("tangent", "first"), ("sibling", "second"), ("spin", "spin"))
@@ -1393,7 +1392,7 @@ def friction_triple_visit(
         *(ctx.store(row, f"triple[{k}]") for k, (row, _) in enumerate(names)),
         "if (first_delta != 0.0f || second_delta != 0.0f || spin_delta != 0.0f) {",
         change_vote(laws, changes, "    "),
-        op.unit_apply((("spin", "spin_delta"), ("second", "second_delta"), ("first", "first_delta")), "    "),
+        op.unit_apply((("first", "first_delta"), ("second", "second_delta"), ("spin", "spin_delta")), "    "),
         "}",
         ctx.sync(),
     ]

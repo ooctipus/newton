@@ -549,8 +549,8 @@ def contact_units(sweep: SparseSweep, rows: SparseRows, op: SparseFactor, laws: 
     friction coefficient; one reduction gives the three rows' velocity terms. The rows then run the
     row law (:class:`.sweep.UnitZ`): the normal steps with the record's ``1/W_nn``, the pair solves at the new load from
     the record's metric, its residuals moved by the normal change through ``W_nt`` (in exact arithmetic the sequential
-    sweep); each coordinate takes the normal's, then the second tangent's, then the first tangent's change and is
-    written back once. With ``linked`` a pass at entry stores each anchor's other ring members, at most three, behind
+    sweep); each coordinate takes the sum of the normal's, the first tangent's and the second tangent's changes, added
+    once. With ``linked`` a pass at entry stores each anchor's other ring members, at most three, behind
     its record in the order the pair update pools them (-1: a longer ring, which keeps the walk). A row the guards
     decline keeps the ordinary update.
 
@@ -624,10 +624,8 @@ SYNC();"""
         unit_rows = {"normal": "i", "tangent": "tangent", "sibling": "sibling"}
         sums = (("unit_jv0", "normal", None), ("unit_jv1", "tangent", None), ("unit_jv2", "sibling", None))
         gather = op.dot(sums, unit_rows, "        ", keep_velocity=True, reduce=False)
-        # Per coordinate the normal's change, then the pair's: the row loop's order.
-        apply = op.axpy(
-            (("normal", "unit_dn"), ("sibling", "unit_dt2"), ("tangent", "unit_dt1")), "            ", kept=True
-        )
+        # Per coordinate the unit's changes summed in its rows' order, then added.
+        apply = op.unit_apply((("normal", "unit_dn"), ("tangent", "unit_dt1"), ("sibling", "unit_dt2")), "            ")
         ctx = RowContext(
             row="i",
             kind="row_type",

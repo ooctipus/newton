@@ -309,15 +309,10 @@ def sparse_diagonal_source(
         unit_sums, {"normal": "head", "tangent1": "head + 1", "tangent2": "head + 2"}, "        ", keep_velocity=True
     )
     # The unit's changes in one pass on each lane's coordinate, summed before they are added; the lanes synchronize.
-    unit_change = "(z_normal[q] * unit_dn + z_tangent1[q] * unit_dt1) + z_tangent2[q] * unit_dt2"
+    changes = (("normal", "unit_dn"), ("tangent1", "unit_dt1"), ("tangent2", "unit_dt2"))
     unit_apply = (
-        pair_op.entries_loop(
-            "if ((unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f) && indices[q] >= 0)\n"
-            f"    s_v[indices[q]] = velocities[q] + ({unit_change});",
-            "        ",
-            entry=False,
-        )
-        + f"\n        {warp.sync()}"
+        f"        if ({' || '.join(f'{change} != 0.0f' for _, change in changes)}) {{\n"
+        f"{pair_op.unit_apply(changes, '            ')}\n        }}\n        {warp.sync()}"
     )
 
     def contact_rows(head: str) -> str:

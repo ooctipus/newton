@@ -705,12 +705,22 @@ class SparseFactor(ResponseOperator):
         return text + "".join(f"\n{indent}{line}" for line in reduced.split("\n") if line)
 
     def axpy(
-        self, changes: tuple[tuple[str, str], ...], indent: str, *, row: str | None = None, kept: bool = False
+        self,
+        changes: tuple[tuple[str, str], ...],
+        indent: str,
+        *,
+        row: str | None = None,
+        kept: bool = False,
+        block: bool = False,
     ) -> str:
         """``delta_v += sum_k Z_k d_k`` over the ``(name, d)`` of ``changes``, from the entries a :meth:`dot` kept, or
-        their registers: one change adds in place; several read the velocity once (the one a ``dot`` kept with
-        ``kept``), add each nonzero change in the order given and write it back once. With ``row`` (one change) the
-        row's entries are read here."""
+        their registers, written back once. One change adds in place. Several read the velocity once (the one a
+        ``dot`` kept with ``kept``) and are either one row's sequence of applies, each nonzero change added in the
+        order given (a row and its friction sibling: the row-by-row sweep's arithmetic, each add one rounding), or,
+        with ``block``, one block's change (a contact unit's rows, solved together): their sum in the order given,
+        added once. A block's change rounds once at the velocity's scale, within half an ulp of the exact apply at
+        p99, where its changes added in turn round once each (up to 1.2 ulps at p99, and a change below half an ulp
+        of the velocity is lost). With ``row`` (one change) the row's entries are read here."""
         if row is not None or self.registers:
             first = row if row is not None else changes[0][0]
             entries = {
@@ -721,14 +731,21 @@ class SparseFactor(ResponseOperator):
             entries = {name: f"z_{name}[q]" for name, _ in changes}
             head, guard = [], "indices[q]"
         target = self.velocity.at(guard)
+        base = "velocities[q]" if kept else target
         if len(changes) == 1:
             ((name, delta),) = changes
             body = [*head, f"if ({guard} >= 0) {target} += {entries[name]} * {delta};"]
+        elif block:
+            terms = [f"{entries[name]} * {delta}" for name, delta in changes]
+            total = f"{terms[0]} + {terms[1]}"
+            for term in terms[2:]:
+                total = f"({total}) + {term}"
+            body = [*head, f"if ({guard} >= 0) {target} = {base} + ({total});"]
         else:
             body = [
                 *head,
                 f"if ({guard} >= 0) {{",
-                f"    float value = {'velocities[q]' if kept else target};",
+                f"    float value = {base};",
                 *(f"    if ({delta} != 0.0f) value += {entries[name]} * {delta};" for name, delta in changes),
                 f"    {target} = value;",
                 "}",
@@ -806,9 +823,9 @@ class SparseFactor(ResponseOperator):
         return self.dot(sums, {name: row for row, name in rows}, indent, keep_velocity=True)
 
     def unit_apply(self, changes: tuple[tuple[str, str], ...], indent: str) -> str:
-        """``delta_v += sum Z_row d`` over the ``(name, d)`` of :meth:`unit_terms`' rows, per entry in the order given,
-        each when nonzero, from the velocity :meth:`unit_terms` read, written back once."""
-        return self.axpy(changes, indent, kept=True)
+        """``delta_v += sum Z_row d`` over the ``(name, d)`` of :meth:`unit_terms`' rows, one block's change: their sum
+        in the order given, added once to the velocity :meth:`unit_terms` read (:meth:`axpy`)."""
+        return self.axpy(changes, indent, kept=True, block=True)
 
     def apply(self, delta: str, indent: str) -> str:
         """``delta_v += Z_row delta`` from the entries :meth:`residual` (or :meth:`row_velocity`) kept."""

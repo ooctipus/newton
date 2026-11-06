@@ -82,7 +82,8 @@ class TestPairedFactorRoute(unittest.TestCase):
             self.assertIn(unit, units)
             self.assertIn("float jv = r == 0 ? unit_jv0 : unit_jv1 + gram_n1 * unit_dn;", units)
             self.assertIn("fmaxf(fabsf(jv), unit_jv1_terms - fabsf(unit_dn) * gram_n1_terms)", units)
-            apply = "factor_velocity += (row_z * unit_dn + tangent1_z * unit_dt1) + tangent2_z * unit_dt2;"
+            # One block apply: the unit's changes summed in its rows' order, then added once.
+            apply = "factor_velocity = factor_velocity + ((row_z * unit_dn + tangent1_z * unit_dt1) + tangent2_z * unit_dt2);"
             self.assertIn(apply, units)
             # The rows read the impulses the unit held and pool the ring from the normal's new impulse in a register,
             # so they read no store of the unit: each row's stores wait for the lanes (a skipped normal leaves the
@@ -96,7 +97,7 @@ class TestPairedFactorRoute(unittest.TestCase):
             rows = units[units.index("for (int r = 0; r < 2; ++r) {") : units.index(apply)]
             self.assertEqual(re.findall(r"s_(?:rhs|diag)\[[^\]]*\]", rows), ["s_diag[i]"])
             self.assertEqual(units.count("SYNC();"), 2)
-            self.assertRegex(units, re.escape(apply) + r"\s+SYNC\(\);\s+}$")
+            self.assertRegex(units, re.escape(apply) + r"\s+}\s+}\s+SYNC\(\);\s+}$")
             rest = body[body.index(units) + len(units) :]
             self.assertTrue(rest.startswith(" else {"))
             unloaded = _block(rest, "else {")

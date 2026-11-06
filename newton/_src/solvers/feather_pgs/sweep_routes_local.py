@@ -324,7 +324,6 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
     (:func:`.sweep.friction_metric_law`), as on every sweep that solves a contact's rows one by one.
     """
     op = ctx.operator
-    velocity = op.velocity.array
     sums = (
         ("unit_jv0", "row", None),
         ("unit_jv1", "tangent1", None),
@@ -362,9 +361,10 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
         "ladder.",
         unit_ladder,
         unit_rows,
-        "    // The unit's changes in one pass: u += Z_n dn + Z_t1 dt1 + Z_t2 dt2; then its stores are every lane's.",
-        "    if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f)",
-        f"        {velocity} += (row_z * unit_dn + tangent1_z * unit_dt1) + tangent2_z * unit_dt2;",
+        "    // The unit's changes in one pass: u += (Z_n dn + Z_t1 dt1) + Z_t2 dt2; then its stores are every lane's.",
+        "    if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f) {",
+        unit_op.axpy((("row", "unit_dn"), ("tangent1", "unit_dt1"), ("tangent2", "unit_dt2")), "        ", block=True),
+        "    }",
         f"    {ctx.lanes.sync()}",
         "} else {",
         "    const int i = head, tangent1 = head + 1;",
