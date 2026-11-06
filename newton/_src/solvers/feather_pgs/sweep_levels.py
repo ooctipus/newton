@@ -26,16 +26,16 @@ from functools import cache
 
 import warp as wp
 
-from ...core.execution import append
+from ...core.execution import append, device_lanes
 from ...core.memory import Buffer, Staging
 from . import kernel_template
 from .contact_input import ContactInput
-from .device_preludes import SHARED_STORAGE, cuda_native, lane_group
+from .device_preludes import LANE_WORDS, SHARED_STORAGE, group_native, lane_group
 from .kernel_template import KernelTemplate, items, python_kernel
 from .row_kernels import PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
 
 
-def level_pass(*, units: str, resources: str, counts: str, store: str) -> str:
+def level_pass(*, units: str, resources: str, counts: str, store: str, lanes: int = 32) -> str:
     """Return CUDA source that levels a world's ``units`` units in row order (Cartier-Foata), by one warp, a batch of
     32 at a time.
 
@@ -52,10 +52,21 @@ def level_pass(*, units: str, resources: str, counts: str, store: str) -> str:
     none. ``counts`` formats an index into the units of each level so far: zero at the start for levels ``[0,
     units]``, and the batch's counts added. ``store`` keeps a valid unit's ``level`` and ``rank``. The fragment runs on
     every lane of the warp, uses the lane group, ``lane`` and the names ``resources`` and ``store`` read, and declares
-    ``levels``, the world's level count, on every lane.
+    ``levels``, the world's level count, on every lane. ``lanes`` is the group: a warp, or the CPU's one thread, a batch
+    of one unit, whose words are the lane group's (``MATCH``, ``BELOW``, ``COUNT``; :data:`.device_preludes.LANE_WORDS`).
     """
+    if lanes == 32:
+        same, below, count = (
+            "__match_any_sync(0xffffffffu, level)",
+            "__popc(same & ((1u << lane) - 1u))",
+            "__popc(same)",
+        )
+    elif lanes == 1:
+        same, below, count = "MATCH(level)", "BELOW(same)", "COUNT(same)"
+    else:
+        raise ValueError(f"the level pass runs a warp or one thread, got {lanes}")
     return f"""        int levels = 0;
-        for (int base = 0; base < {units}; base += 32) {{
+        for (int base = 0; base < {units}; base += {lanes}) {{
             const int unit = base + lane;
             bool valid = unit < {units};
 {resources}
@@ -85,11 +96,11 @@ def level_pass(*, units: str, resources: str, counts: str, store: str) -> str:
                 SYNC();
                 pending &= ~BALLOT(ready);
             }}
-            const unsigned same = __match_any_sync(0xffffffffu, level);
-            const int below = __popc(same & ((1u << lane) - 1u));
+            const unsigned same = {same};
+            const int below = {below};
             const int earlier = valid ? {counts.format("level")} : 0;
             SYNC();
-            if (valid && below == 0) {counts.format("level")} = earlier + __popc(same);
+            if (valid && below == 0) {counts.format("level")} = earlier + {count};
             SYNC();
             if (valid) {{
                 const int rank = earlier + below;
@@ -100,21 +111,22 @@ def level_pass(*, units: str, resources: str, counts: str, store: str) -> str:
         MAXIMUM(levels);"""
 
 
-def level_offsets(*, levels: str, counts: str) -> str:
+def level_offsets(*, levels: str, counts: str, lanes: int = 32) -> str:
     """Return CUDA source that turns the units of each of ``levels`` levels into each level's first place, in place:
     an exclusive scan by the block, a block of levels at a time; place ``levels`` is the unit count.
 
     ``counts`` formats an index into the counts (``levels + 1`` of them). The fragment runs on every thread of a block
     of ``THREADS`` threads in ``WARPS`` warps, and uses the lane group, ``tid``, ``lane``, ``warp`` and a shared
-    ``warp_count`` of a word a warp.
+    ``warp_count`` of a word a warp. ``lanes`` is a warp's lanes, or the CPU's one thread, which runs the block.
     """
+    last, barrier = ("31", "__syncthreads();") if lanes == 32 else (f"{lanes - 1}", "SYNC();")
     return f"""    int carry = 0;
     for (int base = 0; base <= {levels}; base += THREADS) {{
         const int c = base + tid;
         const int count = c < {levels} ? {counts.format("c")} : 0;
         const int below = SCAN(count);
-        if (lane == 31) warp_count[warp] = below + count;
-        __syncthreads();
+        if (lane == {last}) warp_count[warp] = below + count;
+        {barrier}
         int before = carry, total = 0;
         for (int w = 0; w < WARPS; ++w) {{
             if (w < warp) before += warp_count[w];
@@ -122,7 +134,7 @@ def level_offsets(*, levels: str, counts: str) -> str:
         }}
         if (c <= {levels}) {counts.format("c")} = before + below;
         carry += total;
-        __syncthreads();
+        {barrier}
     }}"""
 
 
@@ -219,12 +231,14 @@ def _get_sparse_contact_levels_kernel(
     build_serial_contacts: bool = False,
     torsion: bool = False,
 ) -> "wp.Kernel":
-    """The sparse-diagonal contact schedule over the contact units (:func:`_sparse_contact_levels_kernel`)."""
-    del device_arch
-    return _sparse_contact_levels_kernel(int(max_constraints), int(max_world_dofs), build_serial_contacts, torsion)
+    """The sparse-diagonal contact schedule over the contact units (:func:`_sparse_contact_levels_kernel`), a world a
+    warp on CUDA and a thread on the CPU (:func:`.execution.device_lanes`)."""
+    return _sparse_contact_levels_kernel(
+        int(max_constraints), int(max_world_dofs), build_serial_contacts, torsion, device_lanes(device_arch, 32)
+    )
 
 
-def _list_serial_contacts_source(*, count: str, stride: int, head: str, serial_capacity: int) -> str:
+def _list_serial_contacts_source(*, count: str, stride: int, head: str, serial_capacity: int, lanes: int = 32) -> str:
     """Return CUDA source that lists the contacts outside every level, in row order, across the warp.
 
     Contacts lie ``stride`` rows apart from ``contact_start``: position ``p`` is row ``contact_start + p * stride`` for
@@ -240,7 +254,7 @@ def _list_serial_contacts_source(*, count: str, stride: int, head: str, serial_c
     """
     return f"""
     int serial_count = 0;
-    for (int base = 0; base < {count}; base += 32) {{
+    for (int base = 0; base < {count}; base += {lanes}) {{
         const int normal = contact_start + (base + lane) * {stride};
         bool serial = false;
         if (base + lane < {count}) {{
@@ -257,7 +271,7 @@ def _list_serial_contacts_source(*, count: str, stride: int, head: str, serial_c
 
 
 @cache
-def levels_staging(max_constraints: int, max_world_dofs: int) -> Staging:
+def levels_staging(max_constraints: int, max_world_dofs: int, lanes: int = 32) -> Staging:
     """The contact schedule's shared working set, a world's warp: its coordinates' owner and level
     (:func:`level_pass`), each contact position's packed level and rank, and the offsets' warp sum."""
     return Staging(
@@ -267,11 +281,13 @@ def levels_staging(max_constraints: int, max_world_dofs: int) -> Staging:
             Buffer("unit_place", "int", max_constraints),
             Buffer("warp_count", "int", 1),
         ),
-        threads=32,
+        threads=lanes,
     )
 
 
-def _sparse_contact_levels_kernel(M: int, D: int, build_serial_contacts: bool, torsion: bool = False) -> "wp.Kernel":
+def _sparse_contact_levels_kernel(
+    M: int, D: int, build_serial_contacts: bool, torsion: bool = False, lanes: int = 32
+) -> "wp.Kernel":
     """Build the sparse-diagonal contact schedule over the contact units: the levels of the scalar contacts and the
     serial list of the rest.
 
@@ -288,15 +304,17 @@ def _sparse_contact_levels_kernel(M: int, D: int, build_serial_contacts: bool, t
     ``level_units[world, level_offsets[world, l]:level_offsets[world, l + 1]]``. The serial list
     (:func:`_list_serial_contacts_source`) holds the other unit heads in row order.
 
-    One warp a world, a block each: launch ``dim=[worlds]`` tiled with ``block_dim=32``.
+    One warp a world, a block each: launch ``dim=[worlds]`` tiled with ``block_dim=32``; on the CPU (``lanes`` 1) one
+    thread a world.
     """
+    L = lanes
     if M >= 1 << 15:
         raise ValueError(f"a world's contact schedule packs a unit's level and rank in 16 bits each: {M} rows")
     friction, spin = int(PGS_CONSTRAINT_TYPE_FRICTION), int(PGS_CONSTRAINT_TYPE_TORSION)
     kind = "world_row_type.data[row_base + normal]"
     # A unit's members (a tangent, or a spin row) follow its head; every other row of the segment heads a unit.
     unit_head = f"({kind} != {friction} && {kind} != {spin})" if torsion else f"{kind} != {friction}"
-    staging = levels_staging(M, D)
+    staging = levels_staging(M, D, L)
     staging.check("the sparse-diagonal contact schedule")
     resources = f"""            const int normal = contact_start + unit;
             int node_a = -1;
@@ -323,10 +341,11 @@ def _sparse_contact_levels_kernel(M: int, D: int, build_serial_contacts: bool, t
         resources=resources,
         counts=counts,
         store="unit_place[unit] = (level << 16) | rank;",
+        lanes=L,
     )
-    offsets = level_offsets(levels="levels", counts=counts)
+    offsets = level_offsets(levels="levels", counts=counts, lanes=L)
     serial = (
-        _list_serial_contacts_source(count="units", stride=1, head=unit_head, serial_capacity=M)
+        _list_serial_contacts_source(count="units", stride=1, head=unit_head, serial_capacity=M, lanes=L)
         if build_serial_contacts
         else ""
     )
@@ -340,15 +359,15 @@ def _sparse_contact_levels_kernel(M: int, D: int, build_serial_contacts: bool, t
     const int row_base = line * {M};
     const int sparse_world_base = line * {M} * 2;
 {staging.declarations("    ")}
-    for (int coordinate = lane; coordinate < {D}; coordinate += 32) {{
+    for (int coordinate = lane; coordinate < {D}; coordinate += {L}) {{
         node_owner[coordinate] = 32;
         node_level[coordinate] = -1;
     }}
-    for (int l = lane; l <= units; l += 32) {counts.format("l")} = 0;
+    for (int l = lane; l <= units; l += {L}) {counts.format("l")} = 0;
     SYNC();
 
     // A coupled unit reserves every coordinate it holds: a scalar contact sharing one stays in the serial order.
-    for (int normal = contact_start + lane; normal < contact_end; normal += 32) {{
+    for (int normal = contact_start + lane; normal < contact_end; normal += {L}) {{
         const int sparse_row = sparse_world_base + normal * 2;
         const int coord_0 = sparse_row_dof.data[sparse_row];
         const int coord_1 = sparse_row_dof.data[sparse_row + 1];
@@ -361,22 +380,19 @@ def _sparse_contact_levels_kernel(M: int, D: int, build_serial_contacts: bool, t
 {level}
     SYNC();
 {offsets}
-    for (int unit = lane; unit < units; unit += 32) {{
+    for (int unit = lane; unit < units; unit += {L}) {{
         const int place = unit_place[unit];
         if (place >= 0)
             level_units.data[world * {M} + {counts.format("(place >> 16)")} + (place & 0xFFFF)] = contact_start + unit;
     }}
     if (lane == 0) level_count.data[world] = levels;
-{serial}
-#endif
-"""
-    source = "#define THREADS 32\n#define WARPS 1\n#define RESERVED (-2)\n" + snippet.replace(
-        "#endif", "#undef THREADS\n#undef WARPS\n#undef RESERVED\n#endif"
-    )
+{serial}"""
+    defines = f"#define THREADS {L}\n#define WARPS 1\n#define RESERVED (-2)\n"
+    source = f"{defines}{snippet}\n#undef THREADS\n#undef WARPS\n#undef RESERVED\n"
     name = f"sparse_contact_levels_{M}_{D}"
     if build_serial_contacts:
         name += "_serial_contacts"
-    name += "_units" + ("_torsion" if torsion else "")
+    name += "_units" + ("_torsion" if torsion else "") + ("" if L == 32 else f"_lanes{L}")
     return KernelTemplate(
         name,
         kernel_template.params(
@@ -391,7 +407,7 @@ def _sparse_contact_levels_kernel(M: int, D: int, build_serial_contacts: bool, t
             ("serial_count_out", wp.array[int]),
             ("serial_normals", wp.array2d[int]),
         ),
-        cuda_native(source, preludes=(lane_group(32), SHARED_STORAGE)),
+        group_native(source, preludes=(lane_group(L), SHARED_STORAGE, *(() if L == 32 else (LANE_WORDS,))), lanes=L),
         dispatch=items("world"),
         composed=True,
         native_name="sparse_contact_levels_native",

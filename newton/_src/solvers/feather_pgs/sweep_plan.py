@@ -727,12 +727,14 @@ class Sweep:
     def _solve_packed(self, operands: dict) -> None:
         """Case K1: the sparse sweep in factor coordinates, then its velocity change back onto ``v_out``."""
         placement = self.placement
-        worlds_per_block = 64 // self.sparse_solve_lanes
+        layout = shape(
+            sweep_routes_sparse.sparse_work(self.forest.world_count, self.sparse_solve_lanes), device(self.model.device)
+        )
         self._launch(
             self.sparse_kernel,
             operands,
-            (self.forest.world_count + worlds_per_block - 1) // worlds_per_block,
-            64,
+            layout.grid,
+            layout.block,
             world_count=self.forest.world_count,
             row_dof=placement.sparse_row_dof,
             row_factor=placement.sparse_row_factor,
@@ -774,11 +776,12 @@ class Sweep:
         line)."""
         self.readout.count_skipped(self.placement.constraint_count, self.placement.mf_constraint_count)
         walked = {"walk": self.factor.walk_view()} if self.placement.walks else {}
+        layout = shape(sweep_routes_local.paired_work(self.forest.world_count), device(self.model.device))
         self._launch(
             self.paired_factor_kernel,
             operands,
-            (self.forest.world_count + 1) // 2,
-            64,
+            layout.grid,
+            layout.block,
             world_count=self.forest.world_count,
             # The factor rows: the packed rows at their world coordinates.
             factor_rows=self.placement.packed_Z,

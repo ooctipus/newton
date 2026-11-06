@@ -20,9 +20,10 @@ from typing import ClassVar
 
 import warp as wp
 
+from ...core.execution import device_lanes
 from ...core.memory import Buffer, Staging, arch_budget
 from . import kernel_template
-from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
+from .device_preludes import RING, SHARED_STORAGE, group_native, lane_group
 from .factor.walk import WalkTrees
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
@@ -127,7 +128,7 @@ class LimitZ(ResponseOperator):
 
 @dataclasses.dataclass(frozen=True)
 class LimitRows:
-    """The fused joint-limit rows of the coordinates a lane owns, ``d = lane + 32 k``: each coordinate's ``lower`` and
+    """The fused joint-limit rows of the coordinates a lane owns, ``d = lane + L k`` for ``L`` lanes: each coordinate's ``lower`` and
     ``upper`` row, their impulses and right-hand sides in the lane's registers for the launch
     (``limit_{row}_lambda_{k}``, ``limit_{row}_rhs_{k}``: the rows' incident velocities ``+-v_hat``,
     :func:`.row_kernels.prepare_fused_diagonal_joint_limits`), their diagonal ``A = s^2 + cfm`` (``limit_denom``), which
@@ -162,18 +163,18 @@ class LimitRows:
         )
 
 
-def _diagonal_limits(dofs: int, dense_dofs: int, laws: RowLaws) -> tuple[str, str, str, str]:
+def _diagonal_limits(dofs: int, dense_dofs: int, laws: RowLaws, lanes: int = 32) -> tuple[str, str, str, str]:
     """The fused joint limits of a world's diagonal-mass coordinates: declarations, loads, the pass and the stores.
 
     Coordinate ``d`` has a lower and an upper unilateral row (:class:`LimitRows`, :class:`LimitZ`), which the lane
-    that owns ``d = lane + 32 k`` steps by the row law (:func:`.sweep.row_update`, never weighted) where the
+    that owns ``d = lane + lanes k`` steps by the row law (:func:`.sweep.row_update`, never weighted) where the
     coordinate is active, its impulses starting at zero and written back at the end. The dense articulation's
     ``dense_dofs`` coordinates (from ``dense_offset``) hold no fused limit.
     """
     limit_laws = dataclasses.replace(laws, regularize=False, material=False, torsion=False)
     declarations, loads, rows, stores = [], [], [], []
-    for k in range((dofs + 31) // 32):
-        d = f"lane + {32 * k}" if k else "lane"
+    for k in range((dofs + lanes - 1) // lanes):
+        d = f"lane + {lanes * k}" if k else "lane"
         declarations.append(
             f"    int limit_active_{k} = 0;\n"
             f"    float limit_lower_rhs_{k} = 0.0f, limit_upper_rhs_{k} = 0.0f, limit_scale_{k} = 0.0f;\n"
@@ -265,13 +266,14 @@ class Levels:
     level. A contact's coordinate (``scalar_coord``) is its unmarked slot's."""
 
     capacity: int
+    lanes: int = 32
 
     def wrap(self, visit: str, pad: str) -> str:
         offsets = f"sparse_contact_level_offsets.data[world * {self.capacity + 1} + scalar_level"
         text = f"""const int scalar_levels = sparse_contact_level_count.data[world];
 for (int scalar_level = 0; scalar_level < scalar_levels; ++scalar_level) {{
     const int level_end = {offsets} + 1];
-    for (int place = {offsets}] + lane; place < level_end; place += 32) {{
+    for (int place = {offsets}] + lane; place < level_end; place += {self.lanes}) {{
         const int head = sparse_contact_level_units.data[world * {self.capacity} + place];
         const int normal_coord_0 = sparse_row_dof.data[(row_base + head) * 2];
         const int normal_coord_1 = sparse_row_dof.data[(row_base + head) * 2 + 1];
@@ -340,8 +342,10 @@ def sparse_diagonal_source(
     material: bool = False,
     seeded: bool = False,
     velocity_limits: bool = False,
+    lanes: int = 32,
 ) -> tuple[str, Staging]:
-    """The native body of the sparse-diagonal Gauss-Seidel sweep: one warp per world.
+    """The native body of the sparse-diagonal Gauss-Seidel sweep: one warp per world (``lanes``: or the CPU's one
+    thread, :func:`.execution.device_lanes`, whose batches hold one contact).
 
     Every sweep runs the world's fused diagonal joint limits (one lane per coordinate), then its independent scalar
     contacts (a level at a time, one lane per contact: a contact whose coordinate no coupled row touches commutes with
@@ -369,25 +373,29 @@ def sparse_diagonal_source(
     if speculative_contact_batches and (not contact_units or P + 2 > 16):
         raise ValueError("speculative contact batches require contact units with at most 16 response entries")
     _validate_dense_metadata_encoding(M)
-    batch_lanes = 8 if P + 2 <= 8 else 16
+    if lanes not in (1, 32):
+        raise ValueError(f"the sparse-diagonal sweep runs a warp or one thread a world, got {lanes}")
+    L = lanes
+    batch_lanes = min(8 if P + 2 <= 8 else 16, L)
     batch_shift = batch_lanes.bit_length() - 1
-    batch_contacts = 32 // batch_lanes
+    batch_contacts = L // batch_lanes
     scheduled = contact_units
 
-    warp = Lanes(32)
+    warp = Lanes(L)
     laws = RowLaws(regularize=weighted, material=material, policy=solve_policy, torsion=torsion)
     # Every lane (or a scalar contact's one thread) stores what it computed and reads its own stores.
     rows = WorldRows(M, lanes=warp, every_lane=True)
-    staging = Staging((Buffer("s_v", "float", D), *rows.buffers()), threads=32)
+    staging = Staging((Buffer("s_v", "float", D), *rows.buffers()), threads=L)
     # A friction triple reads its metric cached for the launch (sweep.friction_metric_law).
     cached = "ROW_TRIPLE" if torsion else None
 
-    def visit(lanes: Lanes, pad: str, *, kind: int | None = None, parent: str | None = None) -> str:
-        """Row ``i``'s row step (:func:`.sweep.row_step`) in a layout: the warp's, or one thread's (an independent
-        scalar contact on ``scalar_coord``). A ``kind`` (and a friction row's ``parent``) known where the visit is
-        emitted replaces the row's metadata."""
+    def visit(pad: str, *, scalar: bool = False, kind: int | None = None, parent: str | None = None) -> str:
+        """Row ``i``'s row step (:func:`.sweep.row_step`) in a layout: the world's group's (``warp``), or, ``scalar``,
+        one thread's (an independent scalar contact on ``scalar_coord``). A ``kind`` (and a friction row's ``parent``)
+        known where the visit is emitted replaces the row's metadata."""
+        lanes = Lanes(1) if scalar else warp
         store = dataclasses.replace(rows, lanes=lanes)
-        op = slot_rows(P, M, lanes) if lanes.parallel else SCALAR_ROWS
+        op = SCALAR_ROWS if scalar else slot_rows(P, M, lanes)
         # Velocity-limit rows wait for the last word.
         admission = f"if (row_type == {VELOCITY_LIMIT}) continue;" if velocity_limits and kind is None else ""
         return row_step(
@@ -491,15 +499,15 @@ def sparse_diagonal_source(
         pad = " " * 16
         tangents = f"""{pad}do {{
 {pad}    const int i = head + 1;
-{visit(Lanes(1), pad + "    ", kind=FRICTION, parent="head")}
+{visit(pad + "    ", scalar=True, kind=FRICTION, parent="head")}
 {pad}}} while (false);"""
         tangents = f"{pad}if ({owns_tangents('head', pad + '    ')}) {{\n{indent(tangents, '    ')}\n{pad}}}"
         normal = f"""                do {{
                     const int i = head;
-{visit(Lanes(1), pad + "    ", kind=CONTACT)}
+{visit(pad + "    ", scalar=True, kind=CONTACT)}
                 }} while (false);
 {tangents}"""
-        independent_phase = "\n" + Levels(M).wrap(normal, "        ") + "\n"
+        independent_phase = "\n" + Levels(M, L).wrap(normal, "        ") + "\n"
 
     def batch(index: str, count: str) -> str:
         """Test the batch of serial contacts from ``index``: one contact per segment of ``batch_lanes`` lanes, its
@@ -540,7 +548,7 @@ if (candidate_valid) {{
 }}
 const unsigned noop_lanes = BALLOT(candidate_noop);"""
 
-    row = visit(warp, "            ")
+    row = visit("            ")
     if not scheduled:
         # The rows hold no schedule: a normal row owning the tangent pair after it heads a contact unit, unless a
         # mark makes it a scalar contact (its rows keep their visits, as a scheduled sweep's level phase visits them).
@@ -576,7 +584,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
             "        ",
         )
 
-    declarations, limit_loads, limit_rows, limit_stores = _diagonal_limits(D, P, laws)
+    declarations, limit_loads, limit_rows, limit_stores = _diagonal_limits(D, P, laws, L)
     # A diagonal coordinate's factor is sqrt(m): its scale m^-1/2 (zero on the dense articulation's coordinates and
     # where no coordinate is mapped, which keep their velocity).
     diagonal_scale = (
@@ -626,20 +634,20 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
 
 {declarations}
 
-    for (int i = lane; i < row_count; i += 32) {{
+    for (int i = lane; i < row_count; i += {L}) {{
 {indent(rows.loads("i"), "        ")}
     }}
-    for (int d = lane; d < {D}; d += 32) s_v[d] = 0.0f;
+    for (int d = lane; d < {D}; d += {L}) s_v[d] = 0.0f;
 {limit_loads}
     SYNC();
 {seed}{metric}
 {level_loop((limit_rows, "        SYNC();", independent_phase, serial), (last_word,), exit=sweep_end)}
 
-    for (int i = lane; i < row_count; i += 32) world_impulses.data[off_dense + i] = {rows.peek("i")};
+    for (int i = lane; i < row_count; i += {L}) world_impulses.data[off_dense + i] = {rows.peek("i")};
     SYNC();
     // Leave factor coordinates: the dense articulation's change in the walk's coordinates to the step's one leave
     // (tree_factor.walk_leave_kernel, dv = P^T L^-T R^T u); dv = u / sqrt(m) on a diagonal coordinate.
-    for (int d = lane; d < {D}; d += 32) {{
+    for (int d = lane; d < {D}; d += {L}) {{
         const int global_dof = world_dof_indices.data[dof_map_base + d];
 {indent(diagonal_scale, "        ")}
         if (global_dof < 0) continue;
@@ -649,17 +657,16 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
             v_out.data[global_dof] += diagonal_scale > 0.0f ? s_v[d] * diagonal_scale : s_v[d];
     }}
 {limit_stores}
-#endif
 """
     cone = (CONE_LAW,) if torsion else ()
     preludes = (
-        lane_group(32),
+        lane_group(L),
         SHARED_STORAGE,
         RING,
         *law_preludes(PROJECTION_LAW, *cone),
         *solve_policy.preludes,
     )
-    return cuda_native(body, preludes=preludes), staging
+    return group_native(body, preludes=preludes, lanes=L), staging
 
 
 @cache
@@ -679,7 +686,9 @@ def sparse_diagonal_kernel(
     velocity_limits: bool = False,
 ) -> wp.Kernel:
     """The sparse-diagonal sweep kernel; weighted rows (:func:`.sweep.weight_arguments`) and material contacts
-    (:func:`.sweep.material_arguments`) add their operands."""
+    (:func:`.sweep.material_arguments`) add their operands. A world is a warp on CUDA and one thread on the CPU
+    (:func:`.execution.device_lanes`)."""
+    lanes = device_lanes(device_arch, 32)
     snippet, staging = sparse_diagonal_source(
         max_constraints,
         max_world_dofs,
@@ -692,6 +701,7 @@ def sparse_diagonal_kernel(
         material=material,
         seeded=seeded,
         velocity_limits=velocity_limits,
+        lanes=lanes,
     )
     staging.check("the sparse-diagonal sweep", arch_budget(device_arch))
     name = (
@@ -703,6 +713,7 @@ def sparse_diagonal_kernel(
         + ("_torsion" if torsion else "")
         + ("_seeded" if seeded else "")
         + ("_velocity_limits" if velocity_limits else "")
+        + ("" if lanes == 32 else f"_lanes{lanes}")
         + solve_policy.suffix
     )
     extra = (

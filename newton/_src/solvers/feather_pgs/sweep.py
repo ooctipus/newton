@@ -1354,9 +1354,10 @@ def contact_unit(
     change defers into ``unit_ds``, and the placement reduces its terms (``unit_jv3``, ``gram_n3``, ``unit_cross13``,
     ``unit_cross23``: :func:`_spin_terms`, zero for a unit of three) and applies it with the unit's.
     """
-    if (ctx.owned and ctx.lanes.parallel) != held:
+    if (held and not ctx.owned) or (ctx.lanes.parallel and ctx.owned and not held):
         raise ValueError(
-            "a contact unit holds its staged values in registers exactly where its first lane owns the stores"
+            "a contact unit holds its staged values in registers exactly where its first lane owns the stores (one "
+            "thread may hold them: it reads them as its stores)"
         )
     unit = dataclasses.replace(ctx, synced=False, first_store="r == 0" if check is None else None)
     if laws.torsion:

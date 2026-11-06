@@ -36,10 +36,10 @@ from functools import cache
 
 import warp as wp
 
-from ...core.execution import Work, shape
+from ...core.execution import Work, device_lanes, shape
 from ...core.memory import Buffer, Staging, arch_budget, built_for
 from . import kernel_template
-from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
+from .device_preludes import RING, SHARED_STORAGE, group_native, lane_group
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
 from .projection_laws import CONE_LAW, PROJECTION_LAW
@@ -114,6 +114,12 @@ THREADS = 64
 """Threads per block: ``64 / lanes`` worlds."""
 
 
+def sparse_work(worlds: int, lanes_per_world: int) -> Work:
+    """The sparse sweep's launch over ``worlds``: ``lanes_per_world`` lanes a world in blocks of :data:`THREADS`
+    (:func:`~newton._src.core.execution.shape` gives the device's: one thread a world on the CPU)."""
+    return Work(int(worlds), lanes=int(lanes_per_world), block=THREADS)
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------------------------------------------------
@@ -132,6 +138,8 @@ class SparseSweep:
     dofs: int
     support: int
     lanes: int
+    threads: int
+    """Threads a block: :data:`THREADS` on CUDA, one on the CPU (:func:`.execution.device_lanes`)."""
     active: bool
     table: bool
     triplets: bool
@@ -147,7 +155,7 @@ class SparseSweep:
     @property
     def groups(self) -> int:
         """Worlds per block."""
-        return THREADS // self.lanes
+        return self.threads // self.lanes
 
     @property
     def name(self) -> str:
@@ -185,8 +193,10 @@ def _resolve(
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
+    device_arch=None,
 ) -> SparseSweep:
-    """Validate the factory's options and resolve the sweep they configure."""
+    """Validate the factory's options and resolve the sweep they configure on ``device_arch``: the CPU's lane group
+    and block are one thread (:func:`.execution.device_lanes`)."""
     M, D, S = int(max_constraints), int(max_world_dofs), int(max_row_dofs)
     if int(mf_max_constraints) or int(free_row_dofs):
         raise ValueError("sparse PGS holds no physical free-body rows: mf_max_constraints and free_row_dofs must be 0")
@@ -204,7 +214,8 @@ def _resolve(
         rows=M,
         dofs=D,
         support=S,
-        lanes=L,
+        lanes=device_lanes(device_arch, L),
+        threads=device_lanes(device_arch, THREADS),
         active=active,
         table=bool(use_support_table),
         triplets=triplets,
@@ -650,7 +661,7 @@ def _staging(sweep: SparseSweep, rows: StagedRows, op: SparseFactor) -> Staging:
         buffers += [Buffer("s_normal_words", "unsigned", words), Buffer("s_selected_words", "unsigned", words)]
     if op.dense:
         buffers.append(Buffer(op.local, "float", sweep.rows * op.dense))
-    return Staging(tuple(buffers), groups=sweep.groups, threads=THREADS, layout="arrays")
+    return Staging(tuple(buffers), groups=sweep.groups, threads=sweep.threads, layout="arrays")
 
 
 def sparse_staging(max_constraints: int, max_world_dofs: int, max_row_dofs: int, **options) -> Staging:
@@ -723,11 +734,10 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
 
     for (int d = lane; d < {D}; d += {L}) factor_velocity_delta.data[world * {D} + d] = s_delta[d];
 {rows.stores("    ")}
-#endif
 """
     cone = (CONE_LAW,) if sweep.torsion else ()
     preludes = (lane_group(L), SHARED_STORAGE, RING, *law_preludes(PROJECTION_LAW, *cone), *sweep.policy.preludes)
-    return cuda_native(body, preludes=preludes), staging
+    return group_native(body, preludes=preludes, lanes=L), staging
 
 
 def sparse_source(
@@ -798,7 +808,8 @@ def sparse_kernel(
 ) -> wp.Kernel:
     """The sparse sweep kernel.
 
-    Launch ``ceil(world_count / (64 / lanes_per_world))`` tiles of 64 threads. Contact units take
+    Launch the shape of :func:`sparse_work` on the device: ``ceil(world_count / (64 / lanes_per_world))`` tiles of 64
+    threads on CUDA, a world a thread on the CPU. Contact units take
     ``contact_records`` after ``omega``; a solve readout appends its operand after ``support``. The
     working set must fit the static budget of ``device_arch`` (:func:`.memory.arch_budget`).
     """
@@ -820,6 +831,7 @@ def sparse_kernel(
         solve_policy=solve_policy,
         weighted=weighted,
         material=material,
+        device_arch=device_arch,
     )
     snippet, staging = _source(sweep)
     staging.check("the sparse sweep", arch_budget(device_arch))
