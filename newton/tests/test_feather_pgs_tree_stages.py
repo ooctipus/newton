@@ -6,6 +6,7 @@
 import dataclasses
 import re
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -217,6 +218,80 @@ class TestTreeKineticStages(unittest.TestCase):
     def test_finish_and_ordinary_repair_ignore_the_motion_input_cuda(self):
         """Leave bitwise-equal state after a CUDA finish or ordinary repair whose motion input holds NaN."""
         self.check_motion_input_ignored("cuda:0")
+
+
+def _keys(device, *, based, worlds=4, keys=8):
+    """``worlds`` worlds of ``keys`` one-coordinate trees each, a prismatic key a tree with a drive, limits and armature:
+    one body on the world, or (``based``) a fixed base under it, two bodies; random coordinates in and past the limits."""
+    template = newton.ModelBuilder(gravity=-9.81)
+    for k in range(keys):
+        frame = wp.transform(wp.vec3(0.02 * k, 0.0, 0.1), wp.quat_rpy(0.1 * k, -0.2, 0.3))
+        key = wp.transform(wp.vec3(0.0, 0.01, 0.01), wp.quat_rpy(0.2, 0.1 * k, 0.0))
+        body = template.add_link(
+            mass=0.01 + 1.0e-3 * k,
+            com=wp.vec3(0.0005, -0.0003, 0.002),
+            inertia=wp.mat33(np.diag([2.0e-6, 2.0e-6, 3.0e-6])),
+        )
+        joints, parent, anchor = [], -1, wp.transform_multiply(frame, key)
+        if based:
+            parent = template.add_link(mass=0.2, com=wp.vec3(0.0, 0.0, 0.01), inertia=wp.mat33(np.eye(3) * 1.0e-4))
+            joints.append(template.add_joint_fixed(parent=-1, child=parent, parent_xform=frame))
+            anchor = key
+        joints.append(
+            template.add_joint_prismatic(
+                parent=parent,
+                child=body,
+                parent_xform=anchor,
+                axis=wp.vec3(0.2 + 0.1 * k, 0.5, 0.9),
+                limit_lower=-0.004,
+                limit_upper=0.0,
+                target_ke=300.0 + 10.0 * k,
+                target_kd=1.5,
+                armature=1.0e-4,
+            )
+        )
+        template.add_articulation(joints)
+    builder = newton.ModelBuilder(gravity=-9.81)
+    builder.replicate(template, worlds, spacing=(1.0, 0.0, 0.0))
+    model = builder.finalize(device=device)
+    rng = np.random.default_rng(5)
+    model.joint_q.assign(rng.uniform(-0.005, 0.001, model.joint_coord_count).astype(np.float32))
+    model.joint_qd.assign(rng.uniform(-0.05, 0.05, model.joint_dof_count).astype(np.float32))
+    return model
+
+
+class TestNarrowTrees(unittest.TestCase):
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA unavailable")
+    def test_cuda_one_and_two_lane_trees_match_eight_lanes(self):
+        """Step one-body trees at one lane and two-body trees at two lanes bitwise as at eight.
+
+        A narrow tree packs 32 or 16 trees a warp, a thread or two a tree: every thread of the block is its tree's
+        lane, so the repair and the finish admit every tree (the CPU's one-thread group exits its block's other
+        logical lanes; a one-lane tree's thread is no such lane).
+        """
+        for based, narrow in ((False, 1), (True, 2)):
+            states = {}
+            for lanes in (narrow, 8):
+                model = _keys("cuda:0", based=based)
+                with patch.object(tree_kinetic_state, "held_lanes", lambda tree, groups, device, lanes=lanes: lanes):
+                    solver = SolverFeatherPGS(
+                        model, pgs_iterations=8, enable_joint_limits=True, update_mass_matrix_interval=2
+                    )
+                groups = solver.factor.held.groups
+                self.assertEqual(
+                    {(group.layout.lanes, group.group_count % group.layout.pack) for group in groups}, {(lanes, 0)}
+                )
+                pair = [model.state(), model.state()]
+                control = model.control()
+                for _ in range(12):
+                    solver.step(pair[0], pair[1], control, None, DT)
+                    pair.reverse()
+                states[lanes] = {
+                    name: getattr(pair[0], name).numpy() for name in ("joint_q", "joint_qd", "body_q", "body_qd")
+                }
+            with self.subTest(based=based, lanes=narrow):
+                for name, array in states[8].items():
+                    np.testing.assert_array_equal(states[narrow][name], array, err_msg=name)
 
 
 if __name__ == "__main__":

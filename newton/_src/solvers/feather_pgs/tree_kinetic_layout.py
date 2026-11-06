@@ -19,7 +19,8 @@ class TreeLayout:
     root_dofs: int
     permutation: tuple[int, ...]
     # Threads per tree. Small trees share a 32-thread block (two 16-lane
-    # trees, eight 4-lane trees, ...) with warp-level barriers; 64 gives a tree
+    # trees, eight 4-lane trees, ..., 32 one-lane trees) with warp-level
+    # barriers; 64 gives a tree
     # two warps (more than 32 bodies, or heavy chains packed into two warps);
     # 0 selects one tree per block of the warps its bodies need. A tree of more
     # than 64 bodies takes 64: every stage strides its bodies over the lanes,
@@ -68,7 +69,7 @@ class TreeLayout:
             raise ValueError("Cached forest roots start at body 0 and are fixed, free or a joint's coordinates")
         if self.lanes == 0:
             object.__setattr__(self, "lanes", 64 if self.bodies > 32 else 32)
-        if self.lanes not in (4, 8, 16, 32, 64) or self.lanes < min(self.bodies, 64):
+        if self.lanes not in (1, 2, 4, 8, 16, 32, 64) or self.lanes < min(self.bodies, 64):
             raise ValueError("Cached tree lanes must be a power of two covering every body, or 64")
         if self.root_dofs != self.root_coordinates[0] or self.root_dofs > self.dofs:
             raise ValueError("Cached trees require their root's coordinate count")

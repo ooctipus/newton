@@ -1048,7 +1048,9 @@ def get_state_kernel(
         lanes = _lanes()
         g.lane = lanes[0]
         g.stride = lanes[1]
-        if g.stride == 1 and logical_lane != 0:
+        # Where a tree takes one lane, its slot in the block is its logical lane: every thread on CUDA (32 one-lane
+        # trees a block), the first alone on the CPU (one thread is the block's one group, its other lanes exit).
+        if g.stride == 1 and logical_lane != lanes[2]:
             return g
         g.group = block * wp.static(pack) + lanes[2]
         g.art = p.group_to_art[g.group]
