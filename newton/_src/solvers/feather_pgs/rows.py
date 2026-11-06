@@ -110,8 +110,6 @@ def _holds_contact_rows(contacts: Contacts | None) -> bool:
         and contacts._rigid_contact_rows > 0
     )
 
-SLOT_LANES = 256
-"""A world's lanes in the sparse diagonal's writer (:meth:`RowLaws.write_slot_rows`), at most its rows: a block."""
 
 
 def velocity_prescale_launch(articulation_start: np.ndarray, *, joint_count: int, cuda: bool) -> tuple[int, int]:
@@ -867,10 +865,10 @@ class RowLaws:
                 solver.placement.keyed_rows.produce_contacts(contact_input)
 
             # The free bodies' contact rows, by the walk (walk_rows): a class with free bodies always walks, on the
-            # walkers' threads at its own line (walk_rows.FREE_ROWS_LINE): a contact's rows are its own, so the stride
+            # walkers' threads at its own line (walk_rows.WRITERS): a contact's rows are its own, so the stride
             # changes no row.
             if mf_active:
-                walker_threads = walk_rows.support_threads(rows, solver.model.device, walk_rows.FREE_ROWS_LINE)
+                walker_threads = walk_rows.support_threads(rows, solver.model.device, walk_rows.WRITERS["free_body"])
                 pool.launch(
                     walk_rows.write_free_body_rows,
                     walker_threads,
@@ -1074,7 +1072,7 @@ class RowLaws:
             walk_rows.writer_kernel(solver, part),
             dim=(solver.forest.world_count, lanes),
             inputs=inputs,
-            block_dim=walk_rows.WRITER_THREADS,
+            block_dim=walk_rows.WRITERS["packed"].block,
             device=model.device,
         )
 
@@ -1096,7 +1094,7 @@ class RowLaws:
         wp.launch(
             sweep.support_rows,
             dim=sweep.support_threads,
-            block_dim=walk_rows.SUPPORT_BLOCK,
+            block_dim=walk_rows.WRITERS["support"].block,
             inputs=[
                 dense_rows,
                 placement.unit_source,
@@ -1116,7 +1114,8 @@ class RowLaws:
         with its diagonal, incident velocity and rhs; then the independent chains' marks in the slots they hold (the
         sparse contact marker), which the claim reads after the patches link."""
         placement = solver.placement
-        lanes = min(placement.dense_max_constraints, SLOT_LANES)
+        # A world's lanes: a block, at most its rows.
+        lanes = min(placement.dense_max_constraints, walk_rows.WRITERS["slots"].block)
         wp.launch(
             walk_rows.slot_writer(solver),
             dim=(solver.forest.world_count, lanes),

@@ -98,7 +98,7 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
                 work = Work(10**7, lanes=1, block=128, registers=168, persistent=True, waves=2)
                 got = shape(work, device)
                 self.assertEqual(got.grid * got.block, walk_rows.support_threads(10**7, None))
-                self.assertEqual(got.bounds, (walk_rows.SUPPORT_BLOCK, walk_rows.SUPPORT_BLOCKS))
+                self.assertEqual(got.bounds, walk_rows.WRITERS["support"].bounds)
                 self.assertEqual(got.registers, walk_rows.SUPPORT_REGISTERS)
 
     def test_bounds_follow_the_register_line(self):
@@ -106,7 +106,7 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
             # The one walker's line: the general writer's six blocks of 128, the star's three of 256.
             ("writer", 128, walk_rows.WALKER_LINE, (128, 6)),
             ("star", 256, walk_rows.WALKER_LINE, (256, 3)),
-            ("writer with blocks", 128, walk_rows.BLOCKS_LINE, (128, 5)),
+            ("writer with blocks", 128, 96, (128, 5)),
             ("support", 256, 128, (256, 2)),
             ("colored", 256, 255, (256, 1)),
             ("predictor 32", 32, 56, (32, min(24, 1152 // 32))),
@@ -126,10 +126,20 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
                         self.assertEqual(bounds, (32, 32))
                     else:
                         self.assertEqual(bounds, old)
-        # The writers' bounds, built for the reference architecture whatever the device at hand.
-        self.assertEqual(walk_rows.walker_bounds(128), (128, 6))
-        self.assertEqual(walk_rows.walker_bounds(256), (256, 3))
-        self.assertEqual(walk_rows.walker_bounds(128, walk_rows.BLOCKS_LINE), (128, 5))
+        # The writers' bounds, built for the reference architecture whatever the device at hand: the measured lines.
+        bounds = {name: writer.bounds for name, writer in walk_rows.WRITERS.items()}
+        self.assertEqual(
+            bounds,
+            {
+                "packed": (128, 6),
+                "packed_blocks": (128, 5),
+                "slots": (256, 3),
+                "support_units": (256, 4),
+                "support": (128, 3),
+                "free_body": (256, 2),
+            },
+        )
+        self.assertEqual(walk_rows.SUPPORT_REGISTERS, 170)
 
     def test_carveout_steps(self):
         # H8: a predictor block over 1,664 B moves the PRO from 64 KiB to 100 KiB; ZY: 1 KiB at 256 threads keeps 16.
