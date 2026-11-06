@@ -614,7 +614,7 @@ _EXTERNAL_CARRY = r"""    if(nonzero) {
     }
 """
 """The walk's carry of the subtree wrenches, leaf first, one lane a tree (the walk's own order, one text for both
-devices): each body's wrench passes its joint into its parent's at the parent's frame (:func:`.tree_scan.edge`, ``(f, t
+devices): each body's wrench passes its joint into its parent's at the parent's frame (:data:`.tree_scan.WHITEN`'s joint, ``(f, t
 - d x f)``), ``d`` the parent's frame point less its own (``WALK_READ_LINK``, the step's links)."""
 
 _EXTERNAL_PROJECT = r"""float S[6];
@@ -1499,12 +1499,12 @@ def get_state_kernel(
     return python_kernel(kinetic_state, name)
 
 
-_EDGE_UP = ts.edge(ts.Direction.UP, ts.LOADED.lever, "p")
+_EDGE_UP = ts.WHITEN.joint(ts.LOADED.lever, "p")
 """A joint of the border's column walk up, on a loaded link ``l``."""
 _HELD_COLUMN = [
     f"float x = {ts.dot(ts.LOADED.s, ts.channels('p'))};",
     "if (c == i) x += 1.0f;",
-    *ts.step(ts.Direction.UP, ts.LOADED, "p", value="x", out="z", index="q"),
+    *ts.WHITEN.step(ts.LOADED, "p", value="x", out="z", index="q"),
 ]
 """A slip's column step, ``L^-1 P e_i`` walked up its root path: the unit covector a seed at the slip's coordinate,
 added there only (no ``0 +`` after it: the sign of a zero footprint is the walk's own)."""
@@ -2025,7 +2025,7 @@ def get_force_kernel(schedules: HeldSchedules, *, layout: TreeLayout = REFERENCE
             "WALK_LINK": WALK_LINK,
             "WALK_NOW": WALK_NOW,
         }
-        edge = ts.edge(ts.Direction.UP, ts.LOADED.lever, "q", into="w")
+        edge = ts.WHITEN.joint(ts.LOADED.lever, "q", into="w")
         external = {
             "FRAME": substitute(_EXTERNAL_FRAME, names),
             "CARRY": substitute(_EXTERNAL_CARRY, names, EDGE=ts.statements(edge, 16)),
@@ -2074,9 +2074,9 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
 
     sizes = {"coordinate": WALK_COORDINATE, "link": WALK_LINK}
     # The walk up of the force x into u, then the walk down of u into the trial's response (no prior).
-    up = ts.walk_texts(ts.Direction.UP, source="$X.u", sink="u[$c] = z;", value="x[$c]", prior="0.0f", **sizes)
+    up = ts.walk_texts(ts.WHITEN, source="$X.u", sink="u[$c] = z;", value="x[$c]", prior="0.0f", **sizes)
     down = ts.walk_texts(
-        ts.Direction.DOWN,
+        ts.LEAVE,
         source="$X.u",
         sink="qd($c, q, $X.p);",
         value="u[$c]",

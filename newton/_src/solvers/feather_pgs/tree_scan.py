@@ -57,7 +57,7 @@ Generation is text substitution only (``str.format`` on the fragments below).
 
 The factor's walk (TREE_SCAN T8) is the same scan on the factor's records: a
 coordinate's step and a joint's edge, root first or leaf first. Its arithmetic
-is written once here (:func:`edge`, on a schedule's names for the record,
+is written once here (:class:`WalkCombine`, on a schedule's names for the record,
 :class:`Record`), and every walk's schedule writes its steps through it.
 """
 
@@ -79,8 +79,10 @@ from .spatial_laws import SPATIAL
 from .tree_plan import TreePlan
 
 __all__ = [
+    "ENTER",
     "FETCHED",
     "INERTIA",
+    "LEAVE",
     "LOADED",
     "SCAN_PLAN",
     "TRANSFORM",
@@ -93,6 +95,7 @@ __all__ = [
     "WALK_STAGED",
     "WALK_TOUCH",
     "WALK_UNROLL",
+    "WHITEN",
     "Combine",
     "Direction",
     "Group",
@@ -103,6 +106,7 @@ __all__ = [
     "Schedule",
     "Storage",
     "WalkClass",
+    "WalkCombine",
     "add",
     "braced",
     "by_class",
@@ -113,8 +117,6 @@ __all__ = [
     "cross",
     "device_plan",
     "dot",
-    "edge",
-    "enter",
     "held_fits",
     "indent_text",
     "inward_edge",
@@ -126,7 +128,6 @@ __all__ = [
     "schedule_features",
     "slip",
     "statements",
-    "step",
     "tree_scan",
     "walk_texts",
 ]
@@ -1016,7 +1017,7 @@ def channels(state: str) -> tuple[str, ...]:
     return tuple(f"{state}[{k}]" for k in range(6))
 
 
-def step(
+def _step(
     direction: Direction,
     record: Record,
     state: str,
@@ -1047,15 +1048,15 @@ def step(
     return [output, *_update(up, record, state, out.rsplit(maxsplit=1)[-1], into, index)]
 
 
-def enter(record: Record, state: str, velocity: str, out: str, *, index: str = "k") -> list[str]:
-    """One coordinate's step of ``ENTER``, the walk down inverted (``u = L^T P qd``, root first): ``u = qd / (1 / ell)
+def _enter(record: Record, state: str, velocity: str, out: str, *, index: str = "k") -> list[str]:
+    """One coordinate's step of :data:`ENTER`, the walk down inverted (``u = L^T P qd``, root first): ``u = qd / (1 / ell)
     + ut . V`` into ``out``, then ``V += s qd``, on the coordinate's known ``velocity``."""
     head = f"{out} = {velocity} / {record.inverse} + {dot(record.ut, channels(state))};"
     return [head, *_update(False, record, state, velocity, None, index)]
 
 
 def _update(up: bool, record: Record, state: str, name: str, into: str | None, index: str) -> list[str]:
-    """A step's state update by its output ``name``: ``p -= ut z`` up, ``V += s q`` down (:func:`step`)."""
+    """A step's state update by its output ``name``: ``p -= ut z`` up, ``V += s q`` down (:func:`_step`)."""
     sign, terms = ("-", record.ut) if up else ("+", record.s)
     if record.indexed is not None:
         term = (record.indexed[1] if up else record.indexed[0]).format(k=index)
@@ -1066,7 +1067,7 @@ def _update(up: bool, record: Record, state: str, name: str, into: str | None, i
     return [f"{state}[{k}] {sign}= {terms[k]} * {name};" for k in range(6)]
 
 
-def edge(direction: Direction, lever, state: str, *, into: str | None = None) -> list[str]:
+def _edge(direction: Direction, lever, state: str, *, into: str | None = None) -> list[str]:
     """The statements that pass a joint of lever ``d`` (``lever``, three names).
 
     ``UP``: a wrench ``(f, t)`` passes to the parent's frame as ``(f, t - d x f)``: in place on ``state``, its force
@@ -1090,6 +1091,49 @@ def edge(direction: Direction, lever, state: str, *, into: str | None = None) ->
             f"{into}[{3 + k}] = {state}[{3 + k}];" for k in range(3)
         ]
     raise ValueError(f"a joint's edge runs up or down, not {direction.value}")
+
+
+@dataclass(frozen=True)
+class WalkCombine:
+    """A walk's arithmetic, the one skeleton's combine (``walk(tree, direction, combine, schedule, entries)``, U14): a
+    coordinate's step (:func:`_step`, :func:`_enter`) and a joint's edge (:func:`_edge`), in the walk's direction. Every
+    walk of the factor names one (:data:`WHITEN`, :data:`LEAVE`, :data:`ENTER`); the schedules (the class emitter
+    :meth:`WalkClass.walk`, the held lanes :meth:`WalkClass.held`, the path table's :func:`root_path`) place its
+    statements and hold no arithmetic of their own."""
+
+    direction: Direction
+    inverted: bool = False
+
+    def step(
+        self,
+        record: Record,
+        state: str,
+        *,
+        source: str = "",
+        value: str | None = None,
+        out: str = "const float z",
+        into: str | None = None,
+        index: str = "k",
+    ) -> list[str]:
+        """A coordinate's step on a six-float ``state``: its output statement, then the state's update
+        (:func:`_step`'s keywords; the enter's ``source`` is the coordinate's known velocity, ``out`` its output)."""
+        if self.inverted:
+            return _enter(record, state, source, out, index=index)
+        return _step(self.direction, record, state, source=source, value=value, out=out, into=into, index=index)
+
+    def joint(self, lever, state: str, *, into: str | None = None) -> list[str]:
+        """A joint of lever ``lever`` (three names) on ``state``, in place or into ``into`` (:func:`_edge`)."""
+        return _edge(self.direction, lever, state, into=into)
+
+
+WHITEN = WalkCombine(Direction.UP)
+"""The whitening, leaf first, ``u = L^-1 P x`` (a row's footprint, a solve's walk up)."""
+
+LEAVE = WalkCombine(Direction.DOWN)
+"""The leave, root first, ``P^T L^-T u`` (a velocity's walk down, a solve's walk down)."""
+
+ENTER = WalkCombine(Direction.DOWN, inverted=True)
+"""The leave inverted, root first, ``u = L^T P qd`` (the audit's coordinates, a free body's change pushed back)."""
 
 
 def statements(lines, pad: int = 0) -> str:
@@ -1221,7 +1265,7 @@ def inward_edge(lever, state: str) -> str:
 
 
 def walk_texts(
-    direction: Direction,
+    combine: WalkCombine,
     *,
     source: str,
     sink: str,
@@ -1230,26 +1274,22 @@ def walk_texts(
     coordinate: int,
     link: int,
     end: str = "",
-    inverted: bool = False,
 ) -> dict[str, str]:
-    """A whole-tree walk on fetched items (:data:`FETCHED`), as :meth:`WalkClass.walk`'s keywords: ``UP`` leaf first
-    (the whitening, ``u = L^-1 P x``), ``DOWN`` root first (``P^T L^-T u``, or ``inverted`` the enter ``u = L^T P qd``,
-    :func:`enter`). Its joint is the edge (into the parent leaf first, from it root first); its step the
-    coordinate's :func:`step` on ``$V`` from ``source`` (the enter's: ``sink`` its output's name, the coordinate's known
-    velocity ``source``), the caller's ``sink`` after the output and before the state's update; ``end`` a body's
+    """A whole-tree walk of ``combine`` on fetched items (:data:`FETCHED`), as :meth:`WalkClass.walk`'s keywords:
+    :data:`WHITEN` leaf first (``u = L^-1 P x``), :data:`LEAVE` root first (``P^T L^-T u``), :data:`ENTER` root first
+    (``u = L^T P qd``). Its joint is the combine's (into the parent leaf first, from it root first); its step the
+    combine's on ``$V`` from ``source`` (the enter's: ``sink`` its output's name, the coordinate's known velocity
+    ``source``), the caller's ``sink`` after the output and before the state's update; ``end`` a body's
     statements after its coordinates. Each step's record and input (``value``, and ``prior``, its output's prior value)
     and each joint's link are fetched ahead of the chain (``WALK_IN``, ``WALK_LINK_IN``) and asked of L1 before that
     (``WALK_TOUCH``); ``coordinate`` and ``link`` are the floats of a record and a link."""
-    up = direction is Direction.UP
-    if inverted:
-        if up:
-            raise ValueError("the enter walks down")
-        output, *update = enter(FETCHED, "$V", source, sink)
-        sink = ""
-    else:
-        output, *update = step(direction, FETCHED, "$V", source=source, out="const float z" if up else "const float q")
+    up = combine.direction is Direction.UP
+    # The enter's output is its sink (the coordinate's u); the others' a named value the sink reads.
+    out = sink if combine.inverted else "const float z" if up else "const float q"
+    output, *update = combine.step(FETCHED, "$V", source=source, out=out)
+    sink = "" if combine.inverted else sink
     texts = {
-        "joint": braced(edge(direction, FETCHED.lever, "$V" if up else "$P", into="$P" if up else "$V")),
+        "joint": braced(combine.joint(FETCHED.lever, "$V" if up else "$P", into="$P" if up else "$V")),
         "step": braced([output, *([sink] if sink else []), *update]),
         "end": end,
         "root_first": not up,
@@ -1692,15 +1732,15 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
         the walk down's twists through the same words (every lane writes them, as each body's twist out); a body's first
         joining child stores its state, the later ones add theirs. Lane 0 writes ``u`` (both walks). A lane holds ``HOLD_WORDS`` words of each held array (on the CPU's one lane, every item)."""
         parent = self.parent
-        edge_up = "".join(edge(Direction.UP, LOADED.lever, "p"))
-        edge_down = "".join(edge(Direction.DOWN, LOADED.lever, "V"))
+        edge_up = "".join(WHITEN.joint(LOADED.lever, "p"))
+        edge_down = "".join(LEAVE.joint(LOADED.lever, "V"))
         up, joined = [], set()
         up.append("{\n    float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};")
         for b in self.bodies_in(False):
             if b in joined:
                 up.append(f"    for (int k = 0; k < 6; ++k) p[k] += {state}[{6 * b} + k];")
             for c in self.coordinates_in(b, False):
-                output, update = step(Direction.UP, LOADED, "p", source=f"{x}[{c}]", into="q")
+                output, update = WHITEN.step(LOADED, "p", source=f"{x}[{c}]", into="q")
                 up.append(
                     f"    {{const float* d=h.r[{c}/WIDTH];{output}float q[6];{update}if(lane=={c}%WIDTH){u}[{c}]=z;"
                     f"for(int k=0;k<6;++k)p[k]=READ(q[k],{c}%WIDTH);}}"
@@ -1735,9 +1775,7 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
                     down.append(f"    for (int k = 0; k < 6; ++k) V[k] = {state}[{6 * parent_b} + k];")
                 down.append(f"    {{float l[3];HELD_ROW(h.l,{b},l);{edge_down}}}")
             for c in self.coordinates_in(b, True):
-                output, update = step(
-                    Direction.DOWN, LOADED, "V", source=f"uh[{c}/WIDTH]", out="const float q", into="W"
-                )
+                output, update = LEAVE.step(LOADED, "V", source=f"uh[{c}/WIDTH]", out="const float q", into="W")
                 down.append(
                     f"    {{const float* d=h.r[{c}/WIDTH];{output}float W[6];{update}if(lane=={c}%WIDTH){u}[{c}]=q;"
                     f"for(int k=0;k<6;++k)V[k]=READ(W[k],{c}%WIDTH);}}"

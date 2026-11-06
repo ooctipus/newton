@@ -746,13 +746,13 @@ _WALK_TEXTS = {
     "dot_q": ts.dot(ts.LOADED.s, ts.channels("q")),
     "dot_pose": ts.dot(_POSE, ts.channels("v")),
     "dot_j": ts.dot(("e0", "e1", "e2", "S[3]", "S[4]", "S[5]"), ts.channels("v")),
-    "step_q": ts.statements(ts.step(ts.Direction.UP, ts.LOADED, "q", value="x"), 20),
-    "seed_q": ts.statements(ts.step(ts.Direction.UP, ts.LOADED, "q", source="x[r]"), 12),
-    "sweep_seed": ts.statements(ts.step(ts.Direction.UP, ts.LOADED, "q", source="seed[r]"), 24),
-    "sweep_step": ts.statements(ts.step(ts.Direction.UP, ts.LOADED, "q", value="x"), 24),
-    "sweep_edge": ts.statements(ts.edge(ts.Direction.UP, ts.LOADED.lever, "q"), 20),
-    "edge_q": ts.statements(ts.edge(ts.Direction.UP, ts.LOADED.lever, "q"), 20),
-    "edge_v": ts.statements(ts.edge(ts.Direction.UP, ts.LOADED.lever, "v"), 24),
+    "step_q": ts.statements(ts.WHITEN.step(ts.LOADED, "q", value="x"), 20),
+    "seed_q": ts.statements(ts.WHITEN.step(ts.LOADED, "q", source="x[r]"), 12),
+    "sweep_seed": ts.statements(ts.WHITEN.step(ts.LOADED, "q", source="seed[r]"), 24),
+    "sweep_step": ts.statements(ts.WHITEN.step(ts.LOADED, "q", value="x"), 24),
+    "sweep_edge": ts.statements(ts.WHITEN.joint(ts.LOADED.lever, "q"), 20),
+    "edge_q": ts.statements(ts.WHITEN.joint(ts.LOADED.lever, "q"), 20),
+    "edge_v": ts.statements(ts.WHITEN.joint(ts.LOADED.lever, "v"), 24),
 }
 """The path walk's arithmetic (:data:`_WALK`): the rows' steps up (the held pose a source of statements, ``x``), a
 covector seed's first step, and the joints of the rows' and the seed wrenches' up."""
@@ -1056,48 +1056,40 @@ _WALK_ACCESS = """    // The class emitter's reads, ahead of its chain, by the o
     const auto WALK_LOAD = [&](const float* p) -> float { return *p; };"""
 
 
-def _walk_down(classes: tuple[WalkClass, ...], unroll: int, ahead: int | None, inverted: bool) -> str:
-    """The class emitter's walk down of ``classes``: ``WALK_DOWN``, the leave, or ``inverted`` ``WALK_ENTER``."""
-    if inverted:
-        texts = ts.walk_texts(
-            ts.Direction.DOWN,
-            source="$X.u",
-            sink="u[$c]",
-            value="qd[$c]",
-            prior="0.0f",
-            coordinate=WALK_COORDINATE,
-            link=WALK_LINK,
-            inverted=True,
-        )
-        walks = [walk.walk(**texts, unroll=unroll, ahead=ahead) for walk in classes]
-        walk = indent_text(ts.by_class(walks), 8)
-        return f"""    // WALK_ENTER(cls, data, link, qd, u): the walk down inverted, u = L^T P qd, of one tree of class cls on one lane,
-    // root first: each coordinate c of known velocity qd_c takes u_c = ell_c qd_c + ut_c . V, then V += s_c qd_c, V its
-    // body's twist at its frame, a register (the audit's coordinates, :func:`walk_enter_kernel`).
-    const auto WALK_ENTER = [&](const int cls, const float* data, const float* link, const float* qd, float* u) {{
-        (void)cls;
-{walk}
-    }};"""
-    texts = ts.walk_texts(
-        ts.Direction.DOWN,
-        source="$X.u",
-        sink="qd($c, q, $X.p);",
-        value="u($c)",
-        prior="prior($c)",
-        coordinate=WALK_COORDINATE,
-        link=WALK_LINK,
-        end="twist($b, $V);",
-    )
-    walks = [walk.walk(**texts, unroll=unroll, ahead=ahead) for walk in classes]
-    walk = indent_text(ts.by_class(walks), 8)
-    return f"""    // WALK_DOWN(cls, data, link, u, prior, qd, twist): the chain of the leave P^T L^-T u of one tree of class cls (an
+# The class emitter's walks down, one text a combine (:data:`.tree_scan.LEAVE`, :data:`.tree_scan.ENTER`): the macro's
+# description, its name and parameters after the class, the records and the links, and its step's sink, input and
+# prior output and a body's end (:func:`.tree_scan.walk_texts`).
+_WALK_DOWNS = {
+    ts.LEAVE: (
+        """    // WALK_DOWN(cls, data, link, u, prior, qd, twist): the chain of the leave P^T L^-T u of one tree of class cls (an
     // index into the classes the prelude was emitted for), on one lane, root first: each coordinate c takes
     // q = (u_c - ut_c . V) / ell_c, then V += s_c q, V its body's twist (v, w) at its frame, a register, which
     // twist(b, V) receives after the body's coordinates. u(c) reads coordinate c, prior(c) the value its output
     // updates (or 0), and qd(c, q, prior) writes the output. Every coordinate's record, link, u and prior are read
-    // WALK_AHEAD items ahead of the chain (WalkClass.walk), so qd may write in place, but not into a coordinate after c.
-    const auto WALK_DOWN = [&](const int cls, const float* data, const float* link, auto&& u, auto&& prior, auto&& qd,
-                               auto&& twist) {{
+    // WALK_AHEAD items ahead of the chain (WalkClass.walk), so qd may write in place, but not into a coordinate after c.""",
+        "WALK_DOWN",
+        "auto&& u, auto&& prior, auto&& qd,\n                               auto&& twist",
+        {"sink": "qd($c, q, $X.p);", "value": "u($c)", "prior": "prior($c)", "end": "twist($b, $V);"},
+    ),
+    ts.ENTER: (
+        """    // WALK_ENTER(cls, data, link, qd, u): the walk down inverted, u = L^T P qd, of one tree of class cls on one lane,
+    // root first: each coordinate c of known velocity qd_c takes u_c = ell_c qd_c + ut_c . V, then V += s_c qd_c, V its
+    // body's twist at its frame, a register (the audit's coordinates, :func:`walk_enter_kernel`).""",
+        "WALK_ENTER",
+        "const float* qd, float* u",
+        {"sink": "u[$c]", "value": "qd[$c]", "prior": "0.0f"},
+    ),
+}
+
+
+def _walk_down(classes: tuple[WalkClass, ...], unroll: int, ahead: int | None, combine: ts.WalkCombine) -> str:
+    """The class emitter's walk down of ``classes`` by ``combine`` (:data:`_WALK_DOWNS`): ``WALK_DOWN``, the leave, or
+    ``WALK_ENTER``."""
+    description, name, parameters, ends = _WALK_DOWNS[combine]
+    texts = ts.walk_texts(combine, source="$X.u", coordinate=WALK_COORDINATE, link=WALK_LINK, **ends)
+    walk = indent_text(ts.by_class([walk.walk(**texts, unroll=unroll, ahead=ahead) for walk in classes]), 8)
+    return f"""{description}
+    const auto {name} = [&](const int cls, const float* data, const float* link, {parameters}) {{
         (void)cls;
 {walk}
     }};"""
@@ -1117,7 +1109,7 @@ def walk_down_prelude(
     walk emitted by :meth:`WalkClass.walk` (straight-line code up to ``unroll`` coordinates), its links, records, ``u``
     and prior outputs read :data:`WALK_AHEAD` items ahead of the chain (``WALK_IN``), every twist a register, handed to
     ``twist(b, V)`` after its body; with ``enter`` the same walk inverted, ``WALK_ENTER(cls, data, link, qd, u)``, the
-    walk's coordinates of known velocities (``u = L^T P qd``, :func:`.tree_scan.enter`), the same walk with another
+    walk's coordinates of known velocities (``u = L^T P qd``, :data:`.tree_scan.ENTER`), the same walk with another
     combine.
 
     No shared memory and no scratch. The step's one leave takes the leave (:func:`walk_leave_kernel`), the audit the
@@ -1139,7 +1131,7 @@ def walk_down_prelude(
     tag = hashlib.sha256(
         repr((classes, unroll, WALK_AHEAD if ahead is None else ahead, WALK_TOUCH)).encode()
     ).hexdigest()[:8]
-    walks = [_walk_down(classes, unroll, ahead, inverted) for inverted, on in ((False, down), (True, enter)) if on]
+    walks = [_walk_down(classes, unroll, ahead, combine) for combine, on in ((ts.LEAVE, down), (ts.ENTER, enter)) if on]
     # The loads package carries the step's pin (WALK_MUL), under its one guard.
     walk = "\n".join((substitute(_WALK_ACCESS, unpacked=WALK_UNPACKED), *walks))
     texts = {cuda: _walk_loads_text(cuda) + "\n" + walk for cuda in (True, False)}
