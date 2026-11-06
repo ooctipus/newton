@@ -794,8 +794,8 @@ class RowLaws:
         """
         model = solver.model
         max_constraints = solver.placement.dense_max_constraints
-        mf_active = solver.forest.has_free_rigid_bodies
-        has_free_rigid_flag = 1 if mf_active else 0
+        # The free bodies' contacts take their own run only where a colored world sweeps its units (Placement).
+        has_free_rigid_flag = int(solver.placement.free_contact_rows)
         # Dummy arrays when MF is not active (kernel still needs valid pointers), preallocated: a per-step wp.zeros
         # would add an allocation and a memset every step and leave a captured graph a freed temporary.
         is_free_rigid = (
@@ -909,7 +909,8 @@ class RowLaws:
         their contacts' rows and their speed rows (:func:`.walk_rows.write_free_body_rows`), on its threads at its own
         line (:data:`.walk_rows.WRITERS`); their counts finalized with status."""
         placement, model = solver.placement, solver.model
-        if _holds_contact_rows(contacts):
+        # The free bodies' contacts are theirs only where they keep their own run (Placement.free_contact_rows).
+        if _holds_contact_rows(contacts) and placement.free_contact_rows:
             data = bind_contact_input(solver, state_in, solver.factor, contacts, dt, 1.0)
             rows = placement.contact_pool.launch_rows()
         else:

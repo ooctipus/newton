@@ -1426,8 +1426,9 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 )
 
     @unittest.skipUnless(wp.is_cuda_available(), "paired response fallback requires CUDA")
-    def test_paired_response_falls_back_for_matrix_free_rows(self):
-        """Keep mixed dense/matrix-free worlds in physical coordinates."""
+    def test_paired_response_holds_the_free_bodys_rows(self):
+        """Solve a world whose free body rests on a static plane as the general sweep does: the body is a one-node tree,
+        its contacts rows of the line the paired factor sweep holds beside the tree's."""
         run_kwargs = {
             "warmstart": False,
             "preelimination": False,
@@ -1443,7 +1444,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
 
         self.assertIsNone(reference_solver.sweep.paired_response_primary_size)
         self.assertTrue(paired_solver.sweep.paired_factor_coordinates)
-        self.assertTrue(any(sample[6] > 0 for sample in paired), "static contact generated no matrix-free rows")
+        self.assertTrue(all(sample[6] == 0 for sample in paired), "a lone free body's contacts are rows of the line")
         for step, (expected, actual) in enumerate(zip(reference, paired, strict=True)):
             self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
             np.testing.assert_array_equal(actual[5], expected[5], err_msg=f"row types differed at step {step}")

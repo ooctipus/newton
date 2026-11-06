@@ -30,7 +30,7 @@ from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_references as refs
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conformance
-from newton.tests.feather_pgs_law_harness import walk_inverse
+from newton.tests.feather_pgs_law_harness import line_rows, walk_inverse
 from newton.tests.test_feather_pgs_factor import newton_state_body_q, relative, transform_point
 
 H = 1.0 / 240.0
@@ -697,10 +697,10 @@ class TestQ11Stack(unittest.TestCase):
         model = builder.finalize(device=DEVICE)
         solver, state = _roll(model, 120, pgs_iterations=sweeps, mf_max_constraints=12 * count + 12)
         mass = float(model.body_mass.numpy()[0])
-        counts = int(solver.placement.mf_constraint_count.numpy()[0])
-        lam = solver.placement.impulses.numpy()[:, solver.placement.body_base :][0, :counts]
-        kinds = solver.placement.row_type.numpy()[:, solver.placement.body_base :][0, :counts]
-        sides = solver.placement.row_sides.numpy()[:, solver.placement.body_base :][0, :counts]
+        rows = line_rows(solver, 0)
+        lam = solver.placement.impulses.numpy()[0, rows]
+        kinds = solver.placement.row_type.numpy()[0, rows]
+        sides = solver.placement.row_sides.numpy()[0, rows]
         ground = (kinds == 0) & ((sides[:, 0] < 0) | (sides[:, 1] < 0))
         return float(np.sum(lam[ground])) / (H * mass * G0 * count), float(state.body_q.numpy()[-1, 2]) - (
             half + 2.0 * half * (count - 1)
@@ -870,9 +870,9 @@ class TestQ13Indeterminate(unittest.TestCase):
         solver, state = _roll(model, 240)
         v = state.body_qd.numpy()[0]
         self.assertLess(float(np.abs(v).max()), 1.0e-3)
-        count = int(solver.placement.mf_constraint_count.numpy()[0])
-        normal = solver.placement.row_type.numpy()[:, solver.placement.body_base :][0, :count] == 0
-        load = float(np.sum(solver.placement.impulses.numpy()[:, solver.placement.body_base :][0, :count][normal]))
+        rows = line_rows(solver, 0)
+        normal = solver.placement.row_type.numpy()[0, rows] == 0
+        load = float(np.sum(solver.placement.impulses.numpy()[0, rows][normal]))
         weight = float(model.body_mass.numpy()[0]) * G0 * H
         self.assertAlmostEqual(load, weight, delta=1.0e-3 * weight)
 

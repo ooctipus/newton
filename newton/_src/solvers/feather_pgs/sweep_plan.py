@@ -932,10 +932,11 @@ class Sweep:
 
     def patch_row_arrays(self):
         """Yield the contact routes that can hold patch rows: ``(route, parents, mu, impulses, first)``."""
-        # With only free response bodies, the allocator routes every responsive
-        # contact through matrix-free rows. Dense bilateral rows can still exist,
-        # but have no patch links or impulses.
-        if self.forest.has_non_free_articulations or not self.forest.has_free_rigid_bodies:
+        # The line's rows hold every contact but the free bodies' where they keep their own run
+        # (Placement.free_contact_rows): with only free response bodies there, the allocator routes every responsive
+        # contact through the free bodies' rows. Dense bilateral rows can still exist, but have no patch links or
+        # impulses.
+        if self.forest.has_non_free_articulations or not self.placement.free_contact_rows:
             yield (
                 0,
                 self.placement.row_parent,
@@ -943,7 +944,7 @@ class Sweep:
                 self.placement.impulses,
                 self.placement.dense_first,
             )
-        if self.forest.has_free_rigid_bodies:
+        if self.placement.free_contact_rows:
             # The free bodies' rows: the row store's, where their slots and parents count too.
             yield (
                 1,

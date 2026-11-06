@@ -15,7 +15,7 @@ from newton._src.solvers.feather_pgs.audit import AUDIT_SLOTS
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conformance
-from newton.tests.feather_pgs_law_harness import walk_inverse
+from newton.tests.feather_pgs_law_harness import line_rows, walk_inverse
 
 H = 1.0 / 240.0
 G0 = 9.81
@@ -213,13 +213,9 @@ class TestAudit(unittest.TestCase):
         """A velocity written after the solve moves G by exactly the formula's change."""
         solver, _state = _rollout(_box_model(self.device, mu=0.5), steps=120)
         before = float(solver.read_audit()["gap"][0])
-        count = int(solver.placement.mf_constraint_count.numpy()[0])
+        rows = line_rows(solver, 0)
         load = float(
-            np.sum(
-                solver.placement.impulses.numpy()[:, solver.placement.body_base :][0, :count][
-                    solver.placement.row_type.numpy()[:, solver.placement.body_base :][0, :count] == 0
-                ]
-            )
+            np.sum(solver.placement.impulses.numpy()[0, rows][solver.placement.row_type.numpy()[0, rows] == 0])
         )
         self.assertAlmostEqual(load, G0 * H, delta=1.0e-3 * G0 * H)
         dv = 0.01
@@ -274,10 +270,10 @@ class TestAudit(unittest.TestCase):
             _box_model(self.device), steps=240, pgs_contact_regularization=0.1, pgs_iterations=128
         )
         audit = solver.read_audit()
-        count = int(solver.placement.mf_constraint_count.numpy()[0])
-        lam = solver.placement.impulses.numpy()[:, solver.placement.body_base :][0, :count]
-        normal = solver.placement.row_type.numpy()[:, solver.placement.body_base :][0, :count] == 0
-        diagonal = solver.placement.diag.numpy()[:, solver.placement.body_base :][0, :count]
+        rows = line_rows(solver, 0)
+        lam = solver.placement.impulses.numpy()[0, rows]
+        normal = solver.placement.row_type.numpy()[0, rows] == 0
+        diagonal = solver.placement.diag.numpy()[0, rows]
         compliance = np.sum(0.1 * diagonal[normal] * lam[normal] ** 2)
         self.assertGreater(compliance, 1.0e-6)
         self.assertLess(abs(float(audit["gap"][0])), 0.02 * compliance)

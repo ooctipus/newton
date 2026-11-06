@@ -33,8 +33,11 @@ PATH_MATRIX_FREE = 1
 # No rows: the resolved-world classifier skipped the contact's world, whose
 # every candidate row separates at the predictor.
 PATH_RESOLVED = int(CONTACT_PATH_RESOLVED)
+# A free body is a one-node tree: a world's lone free body's contacts are rows of the line (only worlds that can take
+# the colored mapping keep the free bodies' own run, PATH_MATRIX_FREE).
+PATH_FREE_BODY = PATH_DENSE
 
-EXPECTED_PATHS = {"free": {PATH_MATRIX_FREE}, "articulated": {PATH_DENSE}}
+EXPECTED_PATHS = {"free": {PATH_FREE_BODY}, "articulated": {PATH_DENSE}}
 
 
 def _diagonal_inertia(value):
@@ -313,7 +316,7 @@ def test_penetrating_impact_replaces_baumgarte_with_restitution(test, device):
                 pgs_iterations=8,
             )
             test.assertEqual(result["contact_count"], 1, f"{label}: expected exactly one contact")
-            test.assertEqual(result["paths"], {PATH_MATRIX_FREE}, f"{label}: wrong contact route")
+            test.assertEqual(result["paths"], {PATH_FREE_BODY}, f"{label}: wrong contact route")
             _assert_velocity(test, result["before"], -speed, speed, f"{label}, incident state")
             _assert_velocity(test, result["after"], restitution * speed, speed, label)
 
@@ -653,7 +656,7 @@ def test_restitution_is_relative_to_a_moving_kinematic_surface(test, device):
             velocity_after = float(state_out.body_qd.numpy()[dynamic_body][2])
             expected_after = velocity_surface - restitution * closing_speed
             test.assertEqual(count, 1, f"{label}: expected one sphere contact")
-            test.assertEqual(paths, {PATH_MATRIX_FREE}, f"{label}: wrong contact route")
+            test.assertEqual(paths, {PATH_FREE_BODY}, f"{label}: wrong contact route")
             _assert_velocity(test, velocity_after, expected_after, closing_speed, label, rtol=5.0e-3)
             test.assertAlmostEqual(
                 velocity_surface - velocity_after,
@@ -689,7 +692,7 @@ def test_dense_and_free_body_rows_enforce_restitution(test, device):
     speed = 3.0
     separation = IMPACT_FRACTION * speed * DEFAULT_DT
     cases = (
-        ("free", "free", PATH_MATRIX_FREE),
+        ("free", "free", PATH_FREE_BODY),
         ("articulated", "articulated", PATH_DENSE),
     )
     for label, scene, expected_path in cases:
@@ -765,7 +768,7 @@ def test_multiworld_restitution_keeps_case_data_isolated(test, device):
                 with test.subTest(world=world):
                     crossing = impact_fraction < 1.0
                     # A contact that cannot reach the surface this step separates at the predictor.
-                    expected_path = PATH_MATRIX_FREE if crossing or not classified else PATH_RESOLVED
+                    expected_path = PATH_FREE_BODY if crossing or not classified else PATH_RESOLVED
                     test.assertEqual(
                         paths[contact_world == world].tolist(),
                         [expected_path],
@@ -857,7 +860,7 @@ def test_warm_start_history_does_not_change_or_repeat_restitution(test, device):
     # Both incident speeds used below must cross from this same authored pose.
     separation = IMPACT_FRACTION * 2.0 * DEFAULT_DT
     cases = (
-        ("MF", "free", PATH_MATRIX_FREE),
+        ("MF", "free", PATH_FREE_BODY),
         ("dense", "articulated", PATH_DENSE),
     )
     for label, scene, expected_path in cases:

@@ -990,7 +990,8 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         self.assertEqual(int(solver.placement.row_overflow_warning_emitted.numpy()[0]), 1)
 
     def test_constraint_overflow_warning_covers_matrix_free_rows(self):
-        """Identify overflows on the matrix-free contact row family."""
+        """Identify overflows of a free body's contact rows: a lone free body's are rows of the line, whose capacity
+        holds the free bodies' (``mf_max_constraints``) beside the dense rows'."""
         if not wp.get_device().is_cuda:
             self.skipTest("matrix-free FeatherPGS overflow coverage is CUDA-only")
 
@@ -1012,8 +1013,8 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         )
         solver.step(state_0, state_1, model.control(), contacts, DT)
 
-        self.assertGreater(int(solver.placement.row_dropped_mf.numpy().max()), 0)
-        self.assertEqual(int(solver.placement.row_overflow_warning_emitted.numpy()[1]), 1)
+        self.assertGreater(int(solver.placement.row_dropped_dense.numpy().max()), 0)
+        self.assertEqual(int(solver.placement.row_overflow_warning_emitted.numpy()[0]), 1)
 
     def test_feather_pgs_conformance(self):
         """SolverFeatherPGS rests a free-jointed foot at the same height on/off.
@@ -1067,10 +1068,11 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         if not wp.get_device().is_cuda:
             self.skipTest("FeatherPGS contact-mode conformance is a CUDA-only merge gate")
 
+        # A lone free body is a one-node tree: its contacts are rows of the line ("dense"), as the jointed foot's.
         configs = [
             (16, _prismatic_jointed_foot, "dense"),
-            (16, _free_jointed_foot, "mf"),
-            (None, _free_jointed_foot, "mf"),
+            (16, _free_jointed_foot, "dense"),
+            (None, _free_jointed_foot, "dense"),
         ]
         # The dense entries run 16 iterations. The ``None`` entry deliberately
         # omits pgs_iterations and asserts the production default (12), rather

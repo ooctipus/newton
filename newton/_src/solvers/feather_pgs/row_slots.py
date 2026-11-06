@@ -310,6 +310,26 @@ def _record_contact_run(
     """
 
 
+@wp.func
+def _free_body_family(
+    path: int,
+    free_line: int,
+    c: int,
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    is_free_rigid: wp.array[int],
+    response_dofs: wp.array[int],
+) -> bool:
+    """Whether contact ``c`` of the line (``path`` 0) is a free bodies' contact, every side a free rigid body or no
+    response, which ``free_line`` places after the line's other contact rows; the allocator's classification."""
+    if free_line == 0 or path != 0:
+        return False
+    a, b = contact_art_a[c], contact_art_b[c]
+    a_free = a < 0 or response_dofs[a] <= 0 or is_free_rigid[a] != 0
+    b_free = b < 0 or response_dofs[b] <= 0 or is_free_rigid[b] != 0
+    return a_free and b_free
+
+
 @wp.kernel(enable_backward=False)
 def record_world_contact_runs(
     contact_count: wp.array[int],
@@ -319,6 +339,11 @@ def record_world_contact_runs(
     contact_world: wp.array[int],
     contact_path: wp.array[int],
     contact_slots_needed: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    is_free_rigid: wp.array[int],
+    response_dofs: wp.array[int],
+    free_line: int,
     order_dense: int,
     order_mf: int,
     global_lead: int,
@@ -328,7 +353,8 @@ def record_world_contact_runs(
     run_last: wp.array2d[int],
     run_rows: wp.array2d[wp.vec2i],
 ):
-    """Record each (world, block) run's first and last routed contact and its rows (dense, matrix-free).
+    """Record each (world, block) run's first and last routed contact and its rows by family: the line's other rows,
+    then the free bodies' contacts (their own run, or with ``free_line`` rows of the line placed after the others).
 
     ``total_num_threads`` is a multiple of ``lanes`` (32 on CUDA, 1 on CPU), so each warp
     iteration covers 32 consecutive contacts.
@@ -347,8 +373,12 @@ def record_world_contact_runs(
             world = contact_world[c]
             shape = contact_shape0[c]
             needed = contact_slots_needed[c]
+            free = _free_body_family(path, free_line, c, contact_art_a, contact_art_b, is_free_rigid, response_dofs)
             if path == 0 and order_dense != 0:
-                dense = needed
+                if free:
+                    mf = needed
+                else:
+                    dense = needed
             if path == 1 and order_mf != 0:
                 mf = needed
             if dense > 0 or mf > 0:
@@ -362,6 +392,11 @@ def place_world_contact_runs(
     contact_world: wp.array[int],
     contact_path: wp.array[int],
     contact_slots_needed: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    is_free_rigid: wp.array[int],
+    response_dofs: wp.array[int],
+    free_line: int,
     dense_slot_counter: wp.array[int],
     dense_first_rejected_slot: wp.array[int],
     mf_slot_counter: wp.array[int],
@@ -396,6 +431,12 @@ def place_world_contact_runs(
     place_mf = total[1] > 0 and mf_first_rejected_slot[world] >= mf_slot_counter[world]
     next_dense = dense_slot_counter[world] - total[0]
     next_mf = body_base + mf_slot_counter[world] - total[1]
+    if free_line != 0:
+        # The free bodies' contacts are rows of the line: they follow its other contact rows, from the one counter.
+        place_dense = total[0] + total[1] > 0 and dense_first_rejected_slot[world] >= dense_slot_counter[world]
+        place_mf = place_dense
+        next_dense = dense_slot_counter[world] - total[0] - total[1]
+        next_mf = next_dense + total[0]
     for block in range(blocks):
         last = run_last[world, block]
         if not (place_dense or place_mf):
@@ -410,9 +451,12 @@ def place_world_contact_runs(
                 shape = contact_shape0[c]
                 needed = contact_slots_needed[c]
                 if owner == world and _contact_run_block(shape, global_lead, global_trail_start) == block:
-                    if path == 0 and place_dense:
+                    free = _free_body_family(
+                        path, free_line, c, contact_art_a, contact_art_b, is_free_rigid, response_dofs
+                    )
+                    if path == 0 and place_dense and not free:
                         dense = needed
-                    if path == 1 and place_mf:
+                    if (path == 1 or free) and place_mf:
                         mf = needed
             dense_below = warp_scan(dense)
             mf_below = warp_scan(mf)
@@ -423,6 +467,9 @@ def place_world_contact_runs(
                         units[dense_first[world], next_dense + dense_below + r] = unit_source(UNIT_CONTACT, 4 * c + r)
             if mf > 0:
                 contact_slot[c] = next_mf + mf_below
+                if free_line != 0 and units.shape[0] > 0:
+                    for r in range(mf):
+                        units[dense_first[world], next_mf + mf_below + r] = unit_source(UNIT_CONTACT, 4 * c + r)
             next_dense += warp_sum(dense)
             next_mf += warp_sum(mf)
     # Every lane has read the records before any is reset.

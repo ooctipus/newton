@@ -1077,11 +1077,11 @@ def _record_patch_routes(patches):
 class TestPatchSolverRoutes(unittest.TestCase):
     def test_solver_passes_every_patch_route(self):
         """Link and finish every route that holds patch rows, warm-started or not: no step seeds friction."""
-        # Both modes route the fixed-base arm's contacts through dense rows and the
-        # free box's through matrix-free rows; no route builds the third family.
-        configs = [("cpu", {}, (1, 1, 0))]
+        # Both modes route the fixed-base arm's contacts and the free box's through the line's rows (a free body is a
+        # one-node tree; only colored worlds keep a free bodies' run); no route builds the other families.
+        configs = [("cpu", {}, (1, 0, 0))]
         if wp.is_cuda_available():
-            configs.append(("cuda:0", {}, (1, 1, 0)))
+            configs.append(("cuda:0", {}, (1, 0, 0)))
         dts = (1.0 / 240.0, 1.0 / 240.0, 1.0 / 120.0, 1.0 / 480.0)
         for (device, mode, enabled), warmstart in itertools.product(configs, (False, True)):
             with self.subTest(device=device, warmstart=warmstart):
@@ -1131,7 +1131,8 @@ class TestPatchSolverRoutes(unittest.TestCase):
                         calls.clear()
                     self.assertFalse(np.any(solver.laws.friction_patches.previous.valid.numpy()))
                 if device == "cpu":
-                    self.assertLessEqual({0, 1}, paths, "contacts must use the dense and matrix-free routes")
+                    self.assertLessEqual({0}, paths, "contacts must use the line's rows")
+                    self.assertNotIn(1, paths, "a single free body keeps no run of its own")
 
 
 def _fill_sort_case(patches, live, rng, codes):

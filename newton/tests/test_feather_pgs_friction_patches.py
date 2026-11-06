@@ -15,8 +15,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.friction_patches import _FrictionPatchState, _pose_motion, patch_routes
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
-from newton.tests.feather_pgs_free_body_rows import free_body_jacobians
-from newton.tests.feather_pgs_law_harness import row_lines
+from newton.tests.feather_pgs_law_harness import line_rows, row_lines, unpacked_rows
 from newton.tests.feather_pgs_patch_reference import store_frame
 from newton.tests.test_feather_pgs_friction_anchors import _SQUEEZE_SOLVER, _build_v_jaws
 
@@ -986,15 +985,11 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         s1.body_f.assign([[1, 0, 0, 0, 0, 0.05]])
         solver.step(s1, s0, model.control(), contacts, dt)
         self.assertGreater(np.count_nonzero(solver.laws.friction_patches.current.source.numpy() >= 0), 0)
-        count = int(solver.placement.mf_constraint_count.numpy()[0])
-        self.assertTrue(np.all(solver.placement.contact_path.numpy()[:4] == 1))
-        J_a, _J_b = free_body_jacobians(solver)
-        solved = (
-            np.einsum(
-                "ij,i->j", J_a[0, :count], solver.placement.impulses.numpy()[:, solver.placement.body_base :][0, :count]
-            )
-            / dt
-        )
+        # A free body is a one-node tree: its contacts are rows of the line, at the world's six coordinates.
+        count = int(solver.placement.constraint_count.numpy()[0])
+        self.assertTrue(np.all(solver.placement.contact_path.numpy()[:4] == 0))
+        J = unpacked_rows(solver)[0]
+        solved = np.einsum("ij,i->j", J[0, :count], solver.placement.impulses.numpy()[0, :count]) / dt
         self.assertGreater(np.linalg.norm(solved[3:]), 0.01, "fixture must exercise a nonzero contact moment")
         solver.update_contacts(contacts)
         reported = contacts.force.numpy().sum(axis=0)
@@ -1088,9 +1083,8 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 contacts.rigid_contact_point1.assign([[-0.08, 0, 0], [0, 0, 0], [0.08, 0, 0]])
                 contacts.rigid_contact_normal.assign([[0, 0, -1]] * 3)
                 solver.step(model.state(), model.state(), model.control(), contacts, 0.005)
-                rows = solver.placement.row_type.numpy()[:, solver.placement.body_base :][
-                    0, : solver.placement.mf_constraint_count.numpy()[0]
-                ]
+                # A free body's contacts are rows of the line.
+                rows = solver.placement.row_type.numpy()[0, line_rows(solver, 0)]
                 self.assertEqual(np.count_nonzero(rows == PGS_CONSTRAINT_TYPE_FRICTION), 2)
                 np.testing.assert_allclose(solver.laws.friction_patches.view.weight.numpy()[:3], [0, 1, 0])
 

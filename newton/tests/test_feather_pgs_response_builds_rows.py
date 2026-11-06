@@ -20,7 +20,7 @@ from newton._src.solvers.feather_pgs import field_group, paired_components, resp
 from newton._src.solvers.feather_pgs.factor.walk import WALK_COORDINATE
 from newton._src.solvers.feather_pgs.paired_components import PairedComponentData
 from newton._src.solvers.feather_pgs.row_metadata import pack_mf_header, unpack_mf_header
-from newton.tests.feather_pgs_law_harness import row_lines, walk_inverse
+from newton.tests.feather_pgs_law_harness import row_lines, unpacked_rows, walk_inverse
 
 DEVICE = "cpu"
 
@@ -48,7 +48,6 @@ class TestFreeBodyRowsBuild(unittest.TestCase):
         inertia at its center of mass plus the armature, and the rows hold ``Z = L^-1 J^T`` with ``L L^T = H``.
         """
         import newton  # noqa: PLC0415
-        from newton.tests.feather_pgs_free_body_rows import free_body_jacobians  # noqa: PLC0415
 
         armature, mass, half = 0.05, 1.0, 0.1
         builder = newton.ModelBuilder()
@@ -70,7 +69,8 @@ class TestFreeBodyRowsBuild(unittest.TestCase):
         state, out = model.state(), model.state()
         pipeline.collide(state, contacts)
         solver.step(state, out, model.control(), contacts, 1.0 / 240.0)
-        rows = int(solver.placement.mf_constraint_count.numpy()[0])
+        # A free body is a one-node tree: its contact rows are the line's, packed at the world's coordinates.
+        rows = int(solver.placement.constraint_count.numpy()[0])
         self.assertGreater(rows, 0, "the box must touch the ground")
         # H at the center of mass: m on the linear block, the world-frame inertia on the angular one, plus armature.
         basis = np.array(wp.quat_to_matrix(rotation), dtype=np.float64).reshape(3, 3)
@@ -81,15 +81,10 @@ class TestFreeBodyRowsBuild(unittest.TestCase):
         H += armature * np.eye(6)
         L = np.linalg.inv(walk_inverse(solver, 0))  # the walk: H = L L^T
         np.testing.assert_allclose(L @ L.T, H, rtol=1e-5, atol=1e-6)
-        # The box is each row's one body (the ground has none): its side's Jacobian.
-        J_a, J_b = (J[0, :rows] for J in free_body_jacobians(solver))
-        J = np.where(
-            (solver.placement.row_sides.numpy()[:, solver.placement.body_base :][0, :rows, 0] >= 0)[:, None], J_a, J_b
-        )
+        # The box is each row's one body (the ground has none): the row's Jacobian over the world's six coordinates.
+        J = unpacked_rows(solver)[0][0, :rows]
         expected = np.einsum("ri,ij,rj->r", J, np.linalg.inv(H), J) + solver.options.pgs_cfm
-        np.testing.assert_allclose(
-            solver.placement.diag.numpy()[:, solver.placement.body_base :][0, :rows], expected, rtol=1e-5
-        )
+        np.testing.assert_allclose(solver.placement.diag.numpy()[0, :rows], expected, rtol=1e-5)
 
 
 def _walk_records(rng, trees, size):

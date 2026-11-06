@@ -297,7 +297,8 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
         builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
         model = builder.finalize(device="cpu")
-        solver = SolverFeatherPGS(model, mf_max_constraints=1)
+        # A free body's contacts are rows of the line: one row of each capacity cannot hold the box's.
+        solver = SolverFeatherPGS(model, dense_max_constraints=1, mf_max_constraints=1)
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
         state_in, state_out = model.state(), model.state()
@@ -541,8 +542,9 @@ class TestFeatherPGSReset(unittest.TestCase):
                 stepped, expected = run.step(), fresh.step()
                 for name in STATE_FIELDS:
                     np.testing.assert_array_equal(stepped[name], expected[name], err_msg=name)
-        # One matrix-free row a world cannot hold a box's contacts: the failure stays latched through a model change.
-        solver = SolverFeatherPGS(model, mf_max_constraints=1)
+        # Two rows a world (a free body's contacts are rows of the line) cannot hold a box's contacts: the failure stays
+        # latched through a model change.
+        solver = SolverFeatherPGS(model, dense_max_constraints=1, mf_max_constraints=1)
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
         pipeline.collide(start, contacts)

@@ -410,8 +410,7 @@ class SolverFeatherPGS(SolverBase):
                 exact rigid law. Values above ``1e6`` are rejected because they are not
                 numerically useful in the float32 solve. Defaults to 0.0.
             dense_max_constraints (int, optional): Maximum number of dense (articulation) contact constraint
-                rows stored per world. Free rigid body contacts are stored separately, bounded by
-                mf_max_constraints. Defaults to 32.
+                rows stored per world. Free rigid body contacts are bounded by mf_max_constraints. Defaults to 32.
             pgs_warmstart (bool, optional): Re-use dense and matrix-free contact normal
                 impulses from the previous frame. Contact normal rows carry by contact identity
                 through the collision pipeline's ``rigid_contact_match_index``; a non-``None``
@@ -422,8 +421,10 @@ class SolverFeatherPGS(SolverBase):
                 contract. Defaults to False.
             pgs_warmstart_decay (float, optional): Finite non-negative scale applied to
                 contact impulses carried from the previous frame. Defaults to 1.0.
-            mf_max_constraints (int, optional): Maximum number of matrix-free (free-body) rows per world, at
-                least 1. Packed metadata on CUDA supports at most 65535 rows. Defaults to 512.
+            mf_max_constraints (int, optional): Maximum number of free rigid body contact rows per world, at
+                least 1 and at most 65535. A free body is a one-node tree: its contact rows join the world's row
+                capacity, except in models whose worlds hold enough free bodies for the colored sweep, where they
+                keep a run of their own. Defaults to 512.
             enable_restitution: Whether rigid contacts apply their authored restitution coefficients. Defaults to
                 ``True`` to preserve FeatherPGS behavior before this option was exposed.
             restitution_velocity_threshold (float, optional): Minimum magnitude of the frozen pre-contact
@@ -483,7 +484,9 @@ class SolverFeatherPGS(SolverBase):
         # The passive joint forces and the per-coordinate drive rows the class rules read (the held tree's admission).
         self.factor.plan(self.forest, self.laws)
         pins = Pins() if pins is None else pins
-        capacities = Capacities.build(options, self.forest, self.laws.link_rows_per_world)
+        capacities = Capacities.build(
+            options, self.forest, self.laws.link_rows_per_world, self.laws.has_rigid_body_velocity_limits
+        )
         # The class plan, axis 3 of the route table: the placement case, decided by rules over the data above before
         # any owner of the class (class_plan.RULES, in precedence order).
         classes = plan_class(

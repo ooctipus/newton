@@ -99,6 +99,7 @@ def evaluate(data, raw, scratch, *, enabled=1, published=False, row_bound=(100, 
         published=published,
         row_bound=row_bound,
         free_normals=free_normals,
+        free_line=0,
     )
     return int(scratch.resolved.numpy()[0])
 
@@ -493,7 +494,10 @@ class TestResolvedWorlds(unittest.TestCase):
             owner.classify(state, augmented, contacts, DT)
         launch.assert_called_once()
         options = launch.call_args.kwargs
-        self.assertEqual(options["row_bound"], (48, 24))
+        # A free body is a one-node tree: its contacts are rows of the line, which hold their capacity (48 + 24), and the
+        # free bodies' rows their speed rows alone.
+        self.assertEqual(options["row_bound"], (72, solver.placement.mf_max_constraints))
+        self.assertEqual(options["free_line"], 1)
         self.assertIs(options["free_normals"], owner.free_normals)
         self.assertEqual(owner.free_normals.shape, (model.world_count,))
 
@@ -732,11 +736,19 @@ class TestResolvedWorldsDevice(unittest.TestCase):
         """
         model = _tossed_spheres(wp.get_device())
         # Thirty steps: each sphere rises about 5 cm and starts falling, inside the 10 cm contact gap.
-        options = {"steps": 30, "friction_anchor_beta": None, "solver_kwargs": {"mf_max_constraints": 2}}
+        # A free body's contacts are rows of the line: two rows a world cannot hold a contact's three.
+        options = {
+            "steps": 30,
+            "friction_anchor_beta": None,
+            "solver_kwargs": {"dense_max_constraints": 1, "mf_max_constraints": 1},
+        }
         complete_history, history = [], []
         plain_solver, plain, _ = _rollout(model, classifier=False, history=complete_history, toss_every=1, **options)
         solver, poses, _ = _rollout(model, classifier=True, history=history, toss_every=1, **options)
-        self.assertEqual(solver.sweep.resolved_worlds_owner.row_bound, (solver.placement.dense_max_constraints, 2))
+        self.assertEqual(
+            solver.sweep.resolved_worlds_owner.row_bound,
+            (solver.placement.dense_max_constraints, solver.placement.mf_max_constraints),
+        )
         held = sum(int(np.sum(record["separating"] & ~record["resolved"])) for record in history)
         self.assertGreater(held, 0, "no separating world was held for capacity")
         self.assertEqual(sum(record["marked"] for record in history), 0)

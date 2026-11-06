@@ -600,7 +600,7 @@ def check_raw_contact_normals(
 
 @wp.kernel(enable_backward=False)
 def finalize_resolved_worlds(
-    scratch: ResolvedWorldScratch, free_normals: wp.array[int], dense_rows: int, free_rows: int
+    scratch: ResolvedWorldScratch, free_normals: wp.array[int], dense_rows: int, free_rows: int, free_line: int
 ):
     """Publish once the limit, body and contact launches finish on one stream, resolving only worlds whose worst-case
     rows fit each route.
@@ -609,13 +609,15 @@ def finalize_resolved_worlds(
     allocator would reserve rows for, where a capacity rejection would keep it.
     Counting every checked limit as one dense row and every checked contact as
     three rows on its route (``free_normals`` on matrix-free rows, the rest on
-    dense rows), a world within both capacities has no such rejection, so the
-    release matches the complete path contact by contact.
+    dense rows; with ``free_line`` the free bodies' contacts are rows of the line, on the dense rows too), a world
+    within both capacities has no such rejection, so the release matches the complete path contact by contact.
     """
     world = wp.tid()
     value = int(0)
     if scratch.rejected[world] == 0 and scratch.global_invalid[0] == 0:
         free = free_normals[world]
+        if free_line != 0:
+            free = 0
         dense = scratch.checked_limits[world] + 3 * (scratch.checked_normals[world] - free)
         if dense <= dense_rows and 3 * free <= free_rows:
             value = 1
@@ -711,6 +713,8 @@ class ResolvedWorlds:
         # A world resolves only if its checked rows fit the dense and matrix-free capacities
         # (finalize_resolved_worlds).
         self.row_bound = (int(solver.placement.dense_max_constraints), int(solver.placement.mf_max_constraints))
+        # Where a free body's contacts are rows of the line (Placement.free_contact_rows false), they fit its capacity.
+        self.free_line = int(solver.forest.has_free_rigid_bodies and not solver.placement.free_contact_rows)
         SolverArrays(self.scratch, device).allocate(RESOLVED_WORLD_SCRATCH, world=worlds, body=solver.model.body_count)
         self.resolved = self.scratch.resolved
         # Per-world count of checked contacts on matrix-free rows, for the patch bound.
@@ -772,6 +776,7 @@ class ResolvedWorlds:
             solver.model.device,
             published=self.published,
             row_bound=self.row_bound,
+            free_line=self.free_line,
             free_normals=self.free_normals,
             pool=pool,
         )
@@ -798,6 +803,7 @@ def launch(
     published=False,
     row_bound,
     free_normals,
+    free_line,
     pool=None,
 ):
     """Run the decision launches in stream order on ``device``.
@@ -837,6 +843,6 @@ def launch(
     wp.launch(
         finalize_resolved_worlds,
         dim=worlds,
-        inputs=[scratch, free_normals, int(row_bound[0]), int(row_bound[1])],
+        inputs=[scratch, free_normals, int(row_bound[0]), int(row_bound[1]), int(free_line)],
         device=device,
     )

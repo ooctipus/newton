@@ -26,6 +26,7 @@ from dataclasses import asdict, dataclass
 from types import MappingProxyType
 from typing import NamedTuple
 
+import numpy as np
 import warp as wp
 
 from ...core.execution import Beside
@@ -99,15 +100,37 @@ class Capacities:
     """Matrix-free (free-body) rows a world (``mf_max_constraints``)."""
     row_pitch: int
     """A world's rows in the row store: the dense rows, then the free-body rows where free bodies exist."""
+    free_contact_rows: bool
+    """The free bodies' contacts keep a run of their own (the free-body rows): only where a world can take the colored
+    mapping, whose units are that run's (:func:`.sweep_units.capable_worlds`)."""
 
     @classmethod
-    def build(cls, options, forest: ForestPlan, link_rows: int) -> Capacities:
+    def build(cls, options, forest: ForestPlan, link_rows: int, speed_limits: bool) -> Capacities:
         """The capacities from the options and the forest: a link's rows are the closure's, on top of the rows the
-        option gives the world's contacts (``link_rows`` a world)."""
+        option gives the world's contacts (``link_rows`` a world).
+
+        A free body is a one-node tree: its contacts are rows of the line like any other, written by the one writer
+        and swept by the class's sweep. They keep a run of their own only where a world can take the colored mapping;
+        elsewhere their capacity (``mf_max_constraints``) joins the line's dense rows and the free-body rows hold the
+        bodies' speed rows alone (two a body under ``speed_limits``)."""
+        from .row_kernels import RIGID_SPEED_ROWS  # noqa: PLC0415
+        from .row_metadata import _validate_mf_metadata_encoding  # noqa: PLC0415
+        from .sweep_units import capable_worlds  # noqa: PLC0415
+
         dense = int(options.dense_max_constraints) + int(link_rows)
         free = int(options.mf_max_constraints)
+        _validate_mf_metadata_encoding(free)
+        free_bodies = forest.has_free_rigid_bodies
+        run = bool(free_bodies and capable_worlds(forest.free_rigid_per_world, free).size > 0)
+        if free_bodies and not run:
+            dense += free
+            speed_rows = RIGID_SPEED_ROWS * int(np.max(forest.free_rigid_per_world, initial=0))
+            free = max(speed_rows if speed_limits else 0, 1)
         return cls(
-            dense_rows=dense, free_body_rows=free, row_pitch=dense + (free if forest.has_free_rigid_bodies else 0)
+            dense_rows=dense,
+            free_body_rows=free,
+            row_pitch=dense + (free if free_bodies else 0),
+            free_contact_rows=run,
         )
 
     def record(self) -> dict:

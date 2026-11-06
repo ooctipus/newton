@@ -622,6 +622,8 @@ def _free_rigid_bodies(solver) -> dict:
     return {
         "count": count,
         "mixed_worlds": bool(solver.forest.has_mixed_contacts),
+        # Whether their contacts keep a run of their own (the colored worlds'), or are rows of the line.
+        "contact_run": bool(solver.placement.free_contact_rows),
         "owners": owners,
         "reason": "No free rigid bodies."
         if not count

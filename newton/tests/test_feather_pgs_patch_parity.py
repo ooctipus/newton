@@ -83,35 +83,33 @@ def _ring_pool_dropped(solver):
         yield
 
 
-_MF_RECORDS = ("row_type", "row_parent", "row_mu", "rhs", "impulses", "phi", "row_sides", "packed_Z")
-"""The free-body rows' records and packed rows a slot permutation moves: the line's, by the line's row (the slots' and
-parents' index)."""
+_LINE_RECORDS = ("row_type", "row_parent", "row_mu", "rhs", "impulses", "phi", "target_velocity", "row_sides")
+"""The contact rows' records a slot permutation moves: the line's, by the line's row (the slots' and parents' index)."""
 
 
 def _permuted_slots(solver, contacts, shift):
-    """Reserve the same matrix-free row blocks in rotated order, as other atomic outcomes would."""
+    """Reserve the same contact row blocks of the line in rotated order, as other atomic outcomes would."""
     count = int(contacts.rigid_contact_count.numpy()[0])
     slot, path = solver.placement.contact_slot.numpy().copy(), solver.placement.contact_path.numpy()
     world, needed = solver.placement.contact_world.numpy(), solver.placement.contact_slots_needed.numpy()
-    base = solver.placement.body_base
-    routed = [c for c in range(count) if path[c] == 1 and slot[c] >= 0 and needed[c] > 0]
-    rows = {name: getattr(solver.placement, name).numpy() for name in _MF_RECORDS}
+    routed = [c for c in range(count) if path[c] == 0 and slot[c] >= 0 and needed[c] > 0]
+    rows = {name: getattr(solver.placement, name).numpy() for name in _LINE_RECORDS}
     permuted = {name: values.copy() for name, values in rows.items()}
     moved = {}
     for w in np.unique(world[routed]):
         blocks = [c for c in routed if world[c] == w]
-        # This fixture's matrix-free rows are contacts only, so the blocks tile the world's rows.
+        # This fixture's rows are contacts only, so the blocks tile the world's rows.
         assert sorted(int(slot[c]) + k for c in blocks for k in range(int(needed[c]))) == list(
-            range(base, base + int(solver.placement.mf_constraint_count.numpy()[w]))
+            range(int(solver.placement.constraint_count.numpy()[w]))
         )
-        start = base
+        start = 0
         for c in blocks[shift:] + blocks[:shift]:
             for k in range(int(needed[c])):
                 moved[(w, int(slot[c]) + k)] = start + k
             slot[c] = start
             start += int(needed[c])
     for (w, old), new in moved.items():
-        for name in _MF_RECORDS:
+        for name in _LINE_RECORDS:
             permuted[name][w, new] = rows[name][w, old]
         parent = int(rows["row_parent"][w, old])
         permuted["row_parent"][w, new] = moved.get((w, parent), parent)
@@ -119,8 +117,7 @@ def _permuted_slots(solver, contacts, shift):
     stand_in = SimpleNamespace(
         placement=SimpleNamespace(
             **arrays,
-            body_base=base,
-            mf_constraint_count=solver.placement.mf_constraint_count,
+            constraint_count=solver.placement.constraint_count,
             contact_slot=wp.array(slot, device="cpu"),
             contact_path=solver.placement.contact_path,
             contact_world=solver.placement.contact_world,
@@ -128,12 +125,6 @@ def _permuted_slots(solver, contacts, shift):
         ),
         spec=SimpleNamespace(classes=SimpleNamespace(packed_size=None)),
         laws=SimpleNamespace(friction_patches=solver.laws.friction_patches),
-        # The walk, which whitened the rows.
-        factor=SimpleNamespace(walk_view=solver.factor.walk_view),
-        forest=SimpleNamespace(
-            body_to_articulation=solver.forest.body_to_articulation,
-            articulation_dof_start=solver.forest.articulation_dof_start,
-        ),
     )
     return stand_in
 
@@ -145,7 +136,8 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
             _model, solver, contacts, step = _ground_box("cpu")
             for _ in range(20):
                 step()
-            rows = contact_rows(solver, contacts, route=1, jacobian=True)
+            # A free body is a one-node tree: its contacts are rows of the line (route 0).
+            rows = contact_rows(solver, contacts, route=0)
         normals = [c for c, record in rows.items() if record["types"][0] == PGS_CONSTRAINT_TYPE_CONTACT]
         anchors = [c for c, record in rows.items() if len(record["types"]) >= 3]
         # A resting box face: four ring-linked normals, friction rows only on its one anchor, a pair and a spin row.
@@ -156,14 +148,14 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
             np.testing.assert_array_equal(rows[c]["types"][1:3], [PGS_CONSTRAINT_TYPE_FRICTION] * 2)
             np.testing.assert_array_equal(rows[c]["parents"][1:3], [c, c])
             self.assertGreater(rows[c]["patch"][0], 0.0)
-        self.assertEqual(assert_ring_coulomb(solver, route=1), 1)
+        self.assertEqual(assert_ring_coulomb(solver, route=0), 1)
         for shift in (1, 2, 3):
             with self.subTest(shift=shift):
                 stand_in = _permuted_slots(solver, contacts, shift)
                 self.assertFalse(
                     np.array_equal(stand_in.placement.contact_slot.numpy(), solver.placement.contact_slot.numpy())
                 )
-                permuted = contact_rows(stand_in, contacts, route=1, jacobian=True)
+                permuted = contact_rows(stand_in, contacts, route=0)
                 assert_rows_close(rows, permuted, atol=0.0, rtol=0.0)
                 assert_contact_impulses_close(rows, permuted, atol=0.0, rtol=0.0)
         # A resting box carries its weight: an impulse changed on one contact is reported on that contact.

@@ -27,7 +27,6 @@ import newton
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_SPEED
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
-from newton.tests.feather_pgs_law_harness import free_body_Z
 
 DT = 1.0 / 60.0
 # Speed limits of every free box [m/s, rad/s].
@@ -234,25 +233,38 @@ def _inverse(diagonal):
 
 
 def _free_body_rows(run):
-    """Return each world's free-body row types, axes, signs, right-hand sides and impulses: [world, row].
+    """Return each world's rows of its free bodies' line: types, axes, signs, right-hand sides and impulses, [world,
+    row]: the line's rows (the free bodies' contacts are rows of the line), then their speed rows (the free bodies'
+    rows from the store's body base).
 
     A speed row's axis is the first DOF of the velocity it bounds: 0 for the linear, 3 for the angular.
     """
-    solver = run.solver
-    count = solver.placement.mf_constraint_count.numpy()
-    rows = int(count.max())
-    # A speed row keeps its axis unwhitened.
-    jacobian = free_body_Z(solver)[:, :rows, :6]
+    placement = run.solver.placement
+    base = placement.body_base
+    lines = [
+        np.concatenate((np.arange(int(dense)), base + np.arange(int(free))))
+        for dense, free in zip(placement.constraint_count.numpy(), placement.mf_constraint_count.numpy(), strict=True)
+    ]
+    rows = max(len(line) for line in lines)
+
+    def gather(values):
+        out = np.zeros((len(lines), rows), values.dtype)
+        for world, line in enumerate(lines):
+            out[world, : len(line)] = values[world, line]
+        return out
+
+    # A speed row keeps its axis unwhitened, at its body's first entry (the free bodies' rows' sides layout).
+    jacobian = np.stack([gather(placement.packed_Z.numpy()[..., k]) for k in range(6)], axis=2)
     axis = np.argmax(np.abs(jacobian), axis=2)
     return SimpleNamespace(
-        count=count,
-        type=solver.placement.row_type.numpy()[:, solver.placement.body_base :][:, :rows],
+        count=np.array([len(line) for line in lines]),
+        type=gather(placement.row_type.numpy()),
         axis=axis,
         sign=np.sign(np.take_along_axis(jacobian, axis[..., None], axis=2)[..., 0]),
-        rhs=solver.placement.rhs.numpy()[:, solver.placement.body_base :][:, :rows],
+        rhs=gather(placement.rhs.numpy()),
         # The step's inverse of each row's effective mass, as its header caches it.
-        eff_mass_inv=_inverse(solver.placement.diag.numpy()[:, solver.placement.body_base :][:, :rows]),
-        impulses=solver.placement.impulses.numpy()[:, solver.placement.body_base :][:, :rows],
+        eff_mass_inv=_inverse(gather(placement.diag.numpy())),
+        impulses=gather(placement.impulses.numpy()),
     )
 
 

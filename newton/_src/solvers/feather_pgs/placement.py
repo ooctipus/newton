@@ -334,6 +334,10 @@ class Placement:
         self.dense_max_constraints = spec.capacities.dense_rows
         self.mf_max_constraints = spec.capacities.free_body_rows
         _validate_mf_metadata_encoding(self.mf_max_constraints)
+        # A free body is a one-node tree: its contacts keep a run of their own (the free bodies' rows from
+        # ``body_base``) only where a world can take the colored mapping; elsewhere they are rows of the line and the
+        # free bodies' rows hold their speed rows alone (the spec's capacities, step_plan.Capacities).
+        self.free_contact_rows = spec.capacities.free_contact_rows
         # The row store's line: the dense class's rows, then (with free rigid bodies) the free bodies' from
         # ``body_base``.
         self.body_base = self.dense_max_constraints
@@ -746,6 +750,17 @@ class Placement:
         device = self.model.device
         runs = (self.contact_run_first, self.contact_run_last, self.contact_run_rows)
         blocks = (self.contact_run_lead, self.contact_run_trail_start)
+        # Each contact's family: the free bodies' contacts follow the line's other contact rows, in their own run or,
+        # where they are rows of the line (free_contact_rows false), after its others from the one counter.
+        is_free_rigid = self.forest.is_free_rigid if self.forest.is_free_rigid is not None else self.dummy_is_free_rigid
+        free_line = int(self.forest.has_free_rigid_bodies and not self.free_contact_rows)
+        families = (
+            self.contact_art_a,
+            self.contact_art_b,
+            is_free_rigid,
+            self.forest.articulation_response_dof_count,
+            free_line,
+        )
         # Complete warps on CUDA, whose lanes merge each run's contacts before recording it.
         lanes = 32 if device.is_cuda else 1
         record_threads = -(-contact_build_threads // lanes) * lanes
@@ -761,6 +776,7 @@ class Placement:
                 self.contact_world,
                 self.contact_path,
                 self.contact_slots_needed,
+                *families,
                 order_dense,
                 order_mf,
                 *blocks,
@@ -776,6 +792,7 @@ class Placement:
                 self.contact_world,
                 self.contact_path,
                 self.contact_slots_needed,
+                *families,
                 self.slot_counter,
                 self.dense_first_rejected_slot,
                 mf_slot_counter,

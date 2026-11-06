@@ -1961,8 +1961,9 @@ OWNERSHIP = (
     (scenes.legged, "patch", 32, SPARSE, ("sparse_pgs",), ("mf_gs",)),
     (scenes.legged, "patch", 32, MF_PARALLEL, (), ("mf_gs",)),
     (scenes.legged, "patch", 32, KEYED_PARALLEL, (), ("mf_gs",)),
-    # The paired factor sweep solves worlds of independent components; coupled worlds take the mixed fallback.
-    (scenes.hand, "patch", 16, PAIRED, ("paired_factor", "mf_gs"), ()),
+    # The paired factor sweep solves its worlds whole: a lone free body's contacts are rows of the line, so the
+    # matrix-free sweep's free component holds no row.
+    (scenes.hand, "patch", 16, PAIRED, ("paired_factor",), ("mf_gs",)),
     (scenes.keyboard, "patch", 16, SPARSE_DIAGONAL, ("sparse_diagonal",), ("mf_gs",)),
     # Velocity-limit rows bind on the pushed arm: their last phase counts with the sweep's.
     (

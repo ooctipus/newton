@@ -168,8 +168,9 @@ def run_native_hydro_fixture(*, articulated=True):
                 np.testing.assert_array_equal(getattr(step_input, name).numpy(), value)
             step_input.clear_forces()
             solver.step(step_input, output, model.control(), contacts, 0.0025)
+            # A lone free body's contacts are rows of the line, as an articulation's are.
             paths = solver.placement.contact_path.numpy()[:count]
-            if not np.all(paths == (0 if articulated else 1)):
+            if not np.all(paths == 0):
                 raise AssertionError("Native hydro fixture did not use the requested contact route")
             # Both classes' rows are the one store's.
             impulses, row_types = solver.placement.impulses, solver.placement.row_type
@@ -207,9 +208,10 @@ class TestContactComplianceIntegration(unittest.TestCase):
         self.assertLess(abs(trace[-1, 2] - (0.05 - mass * 9.81 / 3000)), 2e-6)
 
     def test_mf_free_body_support(self):
-        """Recover the same indentation on real matrix-free free-body rows."""
+        """Recover the same indentation on a lone free body's contact rows, rows of the line (no world of one free
+        body keeps a run of its own: Placement.free_contact_rows)."""
         trace, paths, _solver, mass = run_fixture(articulated=False, enabled=True)
-        self.assertEqual(paths, {1})
+        self.assertEqual(paths, {0})
         self.assertLess(abs(trace[-1, 2] - (0.05 - mass * 9.81 / 3000)), 2e-6)
 
     def test_default_off_exact_state(self):
@@ -251,7 +253,7 @@ class TestContactComplianceIntegration(unittest.TestCase):
         )
 
     def test_native_hydro_free_body_manifold(self):
-        """Handle multiple MF hydro normals without indexing a dummy prescribed-target buffer."""
+        """Handle multiple hydro normals on a free body's rows without indexing a dummy prescribed-target buffer."""
         result = run_native_hydro_fixture(articulated=False)
         self.assertGreater(result["native_material"]["positive_stiffness_contacts"], 1)
         self.assertTrue(np.isfinite(list(result["compliant"].values())).all())

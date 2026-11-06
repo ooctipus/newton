@@ -1072,6 +1072,15 @@ def leave_walk(walk: WalkTrees, velocity, device) -> None:
     walk.du.zero_()
 
 
+def line_rows(solver, world: int) -> np.ndarray:
+    """World ``world``'s live rows by their index in its line: the line's rows from 0 (a free body's contacts among
+    them where they are rows of the line), then the free bodies' own rows from the store's ``body_base``."""
+    placement = solver.placement
+    dense = int(placement.constraint_count.numpy()[world])
+    free = int(placement.mf_constraint_count.numpy()[world])
+    return np.concatenate((np.arange(dense), placement.body_base + np.arange(free)))
+
+
 def free_body_Z(solver) -> np.ndarray:
     """Every world's free-body rows' packed entries ``[world, row, 12]`` (float32): the line's packed rows from
     ``body_base`` in the sides layout, side ``a``'s six then side ``b``'s (zero past a line narrower than twelve)."""

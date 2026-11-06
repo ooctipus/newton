@@ -268,10 +268,10 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         model, _, _ = _build_v_jaws(5.0)
         c_dense = check(model, _SQUEEZE_SOLVER)
         self.assertGreater(c_dense[0], 0)
-        # matrix-free route: free box resting on a static slab
+        # a lone free box resting on a static slab: a free body is a one-node tree, its contacts rows of the line
         model, _, _ = _build_incline(0.0, 0.5)
-        c_mf = check(model, {"pgs_iterations": 16, "pgs_beta": 0.05})
-        self.assertGreater(c_mf[1], 0)
+        c_free = check(model, {"pgs_iterations": 16, "pgs_beta": 0.05})
+        self.assertGreater(c_free[0], 0)
 
     def test_graph_capture_replays(self):
         """Capture and replay two steps with device-side anchor history under a CUDA graph."""
