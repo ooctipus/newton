@@ -497,7 +497,7 @@ class Audit:
         if route == "sparse_pgs":
             return sparse_class(int(placement.sparse_row_factor.shape[2]), bool(placement.sparse_row_support.enabled))
         if route == "sparse_diagonal":
-            size = placement.sparse_diagonal_dense_size
+            size = solver.spec.classes.dense_size
             return slot_class(int(size), int(placement.J_by_size[size].shape[1]))
         return packed_class(int(placement.packed_support), int(placement.packed_dense) == WIDE)
 
@@ -516,7 +516,7 @@ class Audit:
             ]
         # The walked rows (walk_rows) are in the walk's coordinates: their trees' coordinates are the walk's too.
         if route == "sparse_diagonal":
-            size = placement.sparse_diagonal_dense_size
+            size = solver.spec.classes.dense_size
             self._walk_coordinates(v, self.coordinates)
             return [
                 forest.world_dof_indices,

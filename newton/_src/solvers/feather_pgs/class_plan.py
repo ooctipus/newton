@@ -15,6 +15,7 @@ plan (:class:`ClassPlan`) and decide nothing of the case.
 from __future__ import annotations
 
 import functools
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -81,6 +82,11 @@ class Diagonal:
     """The star sizes whose limits fuse outside the dense rows."""
     fused_mask: np.ndarray
     """Each coordinate's fused limit (1) or none (0)."""
+    units: bool
+    """A contact is a unit: a normal row, followed by its friction rows only when its region holds an anchor (with
+    contact friction and no row-activation gap)."""
+    speculative_batches: bool
+    """The contact units run in speculative batches (a dense arm of at most 14 coordinates)."""
     scalar: ScalarBranchPlan | None
     """The star's group as scalar branches (:func:`.scalar_branches.plan_scalar_branches`), or ``None``."""
     scalar_reason: str
@@ -137,10 +143,38 @@ class ClassPlan:
     """``"K1"``, ``"K2"``, ``"K4"``, ``"K5"``, or ``"K6"`` (general) where no rule fits."""
     reasons: Mapping[str, str | None]
     """Why each case holds the class or does not."""
+    mf_sweeps: bool
+    """The matrix-free sweeps run and read the dense rows packed (:mod:`.packed_rows`): every class but native sparse
+    factors (case K1) and the sparse diagonal (case K2), where a world has coordinates."""
     diagonal: Diagonal | None = None
     packed: Packed | None = None
     paired: Paired | None = None
     tiers: Tiers | None = None
+
+    @property
+    def diagonal_size(self) -> int | None:
+        """The sparse diagonal's star size (case K2), or ``None``."""
+        return None if self.diagonal is None else self.diagonal.size
+
+    @property
+    def dense_size(self) -> int:
+        """The sparse diagonal's dense arm size (case K2), or 0."""
+        return 0 if self.diagonal is None else self.diagonal.dense_size
+
+    @property
+    def fused_sizes(self) -> frozenset[int]:
+        """The star sizes whose limits fuse outside the dense rows (case K2), or none."""
+        return frozenset() if self.diagonal is None else self.diagonal.fused_sizes
+
+    @property
+    def packed_size(self) -> int | None:
+        """The native sparse factor's size (case K1), or ``None``."""
+        return None if self.packed is None else self.packed.size
+
+    @property
+    def tier_rows(self) -> int:
+        """The Jacobi tiers' row bound (case K4), or 0 without tiers."""
+        return 0 if self.tiers is None else self.tiers.rows
 
     @property
     def scalar(self) -> tuple[ScalarBranchPlan | None, str]:
@@ -259,6 +293,7 @@ def diagonal_rule(inputs: ClassInputs) -> tuple[Diagonal | None, str]:
     held = held_tree.compact_decline(inputs, int(diagonal_size[0]), scalar=scalar is not None)
     if held is not None:
         return None, f"Only the held tree evaluates the compact diagonal. {held}"
+    units = bool(inputs.options.enable_contact_friction and inputs.options.contact_friction_gap_threshold == math.inf)
     choice = Diagonal(
         size=int(diagonal_size[0]),
         dense_size=int(dense_size[0]),
@@ -267,6 +302,8 @@ def diagonal_rule(inputs: ClassInputs) -> tuple[Diagonal | None, str]:
         dense_arts=dense_arts.astype(np.int32),
         fused_sizes=fused_sizes,
         fused_mask=fused_mask,
+        units=units,
+        speculative_batches=units and int(dense_size[0]) + 2 <= 16,
         scalar=scalar,
         scalar_reason=scalar_reason,
     )
@@ -664,6 +701,7 @@ def plan_class(inputs: ClassInputs, *, general: str | None) -> ClassPlan:
     """The class's plan: each rule of :data:`RULES` in order until one fits; every case after it says which case
     holds the class, and ``general`` (:func:`general_reason`), when given, is every case's reason."""
     descriptions = {name: description for name, description, _ in RULES}
+    forest = inputs.forest
     case, reasons, choices = "K6", {}, {}
     for name, _, rule in RULES:
         if general is not None:
@@ -675,4 +713,5 @@ def plan_class(inputs: ClassInputs, *, general: str | None) -> ClassPlan:
         choice, reasons[name] = rule(inputs)
         if choice is not None:
             case, choices[_CHOICE[name]] = name, choice
-    return ClassPlan(case=case, reasons=MappingProxyType(reasons), **choices)
+    mf_sweeps = case not in ("K1", "K2") and forest.world_count > 0 and forest.max_world_dofs > 0
+    return ClassPlan(case=case, reasons=MappingProxyType(reasons), mf_sweeps=mf_sweeps, **choices)

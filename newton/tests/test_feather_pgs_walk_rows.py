@@ -569,12 +569,12 @@ def slot_frames(solver, joint_q: np.ndarray, capture) -> dict:
     m^-1/2``). An arm whose drives slip this step is left to :class:`TestSlotFrame`."""
     forest, placement, factor = solver.forest, solver.placement, solver.factor
     out = {"rows": 0.0, "leave": 0.0, "worlds": 0}
-    n = int(placement.sparse_diagonal_dense_size)
+    n = int(solver.spec.classes.dense_size)
     Z = placement.J_by_size[n].numpy().astype(np.float64)
     slot_dof = placement.sparse_diagonal_row_dof.numpy()
     slot_z = placement.sparse_diagonal_row_z.numpy().astype(np.float64)
     groups = placement.sparse_diagonal_dense_groups.numpy()
-    arts = placement.sparse_diagonal_dense_arts_host
+    arts = solver.spec.classes.diagonal.dense_arts
     world_dofs = forest.world_dof_indices.numpy()
     inverse_mass = factor.diagonal_inverse_mass.numpy().astype(np.float64)
     starts = forest.articulation_dof_start.numpy()
@@ -680,7 +680,7 @@ class TestSlotFrame(unittest.TestCase):
         state, out = model.state(), model.state()
         joint_q = state.joint_q.numpy().astype(np.float64)
         solver.step(state, out, control, None, 1.0 / 60.0)
-        art = int(solver.placement.sparse_diagonal_dense_arts_host[0])
+        art = int(solver.spec.classes.diagonal.dense_arts[0])
         self.assertEqual(int(solver.factor.walk_view().release.count.numpy()[art]), 3)
         walk = solver.factor.walk(joint_q, art)
         n = walk.s.shape[0]
@@ -840,7 +840,7 @@ def support_rows(solver) -> dict:
     ``permutation`` back to the tree's)."""
     forest, placement, factor = solver.forest, solver.placement, solver.factor
     perm = np.asarray(factor.sparse_pattern.permutation)
-    size = int(placement.sparse_mass_matrix_size)
+    size = int(solver.spec.classes.packed_size)
     Z = placement.sparse_row_factor.numpy().astype(np.float64)
     table = bool(placement.sparse_row_support.enabled)
     if table:
@@ -876,7 +876,7 @@ def support_frames(solver, joint_q: np.ndarray) -> dict:
     (the predictor's border, its device data): ``z . R^-T u_hat`` is ``J v_hat`` and the leave is the
     walk down of ``R^T du``."""
     forest, placement, factor = solver.forest, solver.placement, solver.factor
-    size = int(placement.sparse_mass_matrix_size)
+    size = int(solver.spec.classes.packed_size)
     starts = forest.articulation_dof_start.numpy()
     release = solver.factor.walk_view().release
     incident = placement.row_incident.numpy().astype(np.float64)

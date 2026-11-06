@@ -18,7 +18,7 @@ from unittest import mock
 
 import warp as wp
 
-from newton._src.solvers.feather_pgs import keyed_rows
+from newton._src.solvers.feather_pgs import class_plan, keyed_rows
 from newton._src.solvers.feather_pgs.step_plan import StepPlan
 
 # Every kernel a contact-row producer launches to write dense contact rows outside the sweep: the one writer, the
@@ -78,10 +78,12 @@ def install_cpu_keyed_rows(solver):
         articulation_world_dof_offset=wp.zeros(model.articulation_count, dtype=int, device=model.device),
     )
     solver.placement.mf_constraint_count = wp.zeros(solver.forest.world_count, dtype=int, device=model.device)
-    solver.placement.ink_rows = 4
-    # Case K4's class walks: the tiers walk their keyed rows in the kernel, the one writer the general worlds' rows.
+    # Case K4's tiers of four rows; its class walks: the tiers walk their keyed rows in the kernel, the one writer the
+    # general worlds' rows.
+    classes = dataclasses.replace(solver.spec.classes, case="K4", tiers=class_plan.Tiers(sizes=None, meta=None, rows=4))
+    solver.spec = dataclasses.replace(solver.spec, classes=classes)
+    solver.placement.classes = solver.sweep.classes = classes
     solver.placement.walks = True
-    solver.spec = dataclasses.replace(solver.spec, classes=dataclasses.replace(solver.spec.classes, case="K4"))
     solver.sweep.case = "K4"
     route = dataclasses.replace(solver._plan.route, case="K4", producer="keyed_rows")
     solver.placement.keyed_rows = keyed_rows.KeyedRows(solver)

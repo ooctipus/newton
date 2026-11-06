@@ -493,8 +493,8 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
         device = wp.get_device("cuda:0")
         model = build_solver_fixture(device)
         solver, records = _record_schedules(model, device)
-        self.assertTrue(solver.placement.sparse_diagonal_contact_units)
-        self.assertTrue(solver.placement.sparse_diagonal_speculative_contact_batches)
+        self.assertTrue(solver.spec.classes.diagonal.units)
+        self.assertTrue(solver.spec.classes.diagonal.speculative_batches)
         self.assertEqual(len(records), 6)
         for step, (before, after) in enumerate(records):
             for world in range(before["row_count"].shape[0]):

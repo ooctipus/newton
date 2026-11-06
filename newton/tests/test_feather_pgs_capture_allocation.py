@@ -51,7 +51,7 @@ class TestFeatherPGSCaptureAllocation(unittest.TestCase):
         tiers = captured.solver.sweep.tiers
         self.assertTrue(tiers)
         tier_kernels = [tier.kernel for tier in tiers]
-        self.assertIsNotNone(captured.solver.placement.ink_sizes)
+        self.assertIsNotNone(captured.solver.spec.classes.tiers.sizes)
         allocated, tier_inputs = [], []
         zeros, launch_tiled = wp.zeros, wp.launch_tiled
 

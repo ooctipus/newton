@@ -521,14 +521,11 @@ class SolverFeatherPGS(SolverBase):
         self._contact_material_placeholder = self._arrays.placeholder(wp.float32, (1,))
         self._bind_contact_material(None)
         self._allocate_common_buffers(model)
-        self._compact_diagonal_mass_size = self.placement.sparse_diagonal_response_size
+        self._compact_diagonal_mass_size = self.spec.classes.diagonal_size
         self.sweep.place_packed(self.spec.classes.packed)
         # The matrix-free sweeps read the dense rows packed (packed_rows): every class but native sparse factors (case
         # K1) and the sparse diagonal (case K2). Decided before the buffers, since that placement allocates no size
         # group's Jacobian.
-        self.placement.mf_sweeps = bool(
-            case not in ("K1", "K2") and self.forest.world_count > 0 and self.forest.max_world_dofs > 0
-        )
         self._allocate_buffers(model)
         self.placement.allocate_world_rows(model)
         self.sweep.place_paired(self.spec.classes.paired, self.spec.classes.reasons["K5"])
@@ -553,11 +550,11 @@ class SolverFeatherPGS(SolverBase):
         # and leave by the walk; the keyed rows' general worlds are the one writer's (keyed_rows.keyed_general_units).
         # The support placement (case K1, FL3.4) whitens and leaves its rows by the walk too, into its support sink.
         general = case == "K1" or bool(
-            case in ("K6", "K5", "K4") and self.placement.mf_sweeps and np.any(self.forest.response_dof_count > 0)
+            case in ("K6", "K5", "K4") and self.spec.classes.mf_sweeps and np.any(self.forest.response_dof_count > 0)
         )
         # The sparse diagonal (case K2, FL3.5) walks each world's dense arm into its rows' dense parts and leaves it
         # by the walk; a key of the star is one step to the world (walk_rows.star_step) and holds no walk data.
-        diagonal = bool(case == "K2" and self.placement.sparse_diagonal_contact_solve)
+        diagonal = case == "K2"
         self.placement.walks = general or diagonal
         # Free bodies' rows are written by the walk only (walk_rows.write_free_body_rows). A responding free body gives
         # every case a walking class: K1 and K2 never hold free bodies, and K4-K6 sweep matrix-free (a world with the
@@ -619,11 +616,11 @@ class SolverFeatherPGS(SolverBase):
                 "keyed_rows" if self.placement.keyed_rows is not None else "walk" if self.placement.walks else "none"
             ),
             packed=self.placement.packed_response,
-            tier_rows=self.placement.ink_skip_rows(),
+            tier_rows=self.spec.classes.tier_rows,
             sizes={
-                "packed": self.placement.sparse_mass_matrix_size,
-                "diagonal": self.placement.sparse_diagonal_response_size if diagonal else None,
-                "dense": self.placement.sparse_diagonal_dense_size if diagonal else None,
+                "packed": self.spec.classes.packed_size,
+                "diagonal": self.spec.classes.diagonal_size,
+                "dense": self.spec.classes.dense_size if diagonal else None,
             },
         )
         # The step: its stages bound to the owners above from the spec and the route, the sweep's kernels and streams,
@@ -856,9 +853,10 @@ class SolverFeatherPGS(SolverBase):
             arrays.release(DOF_WORK)
             arrays.release(STAGE3_SNAPSHOTS)
 
+        diagonal = self.spec.classes.diagonal
         self.placement.fused_diagonal_limit_dof_mask = (
-            wp.array(self.placement.fused_diagonal_limit_dof_mask_host, dtype=wp.int32, device=model.device)
-            if self.placement.fused_diagonal_joint_limits
+            wp.array(diagonal.fused_mask, dtype=wp.int32, device=model.device)
+            if diagonal is not None and diagonal.fused_sizes
             else arrays.placeholder(wp.int32)
         )
         # The tree factor's mass-update mask, compact inverse mass, body inertia records and articulation origins.

@@ -747,7 +747,7 @@ class RowLaws:
     def limit_sizes(self, solver) -> tuple[int, ...]:
         """The size groups whose joint limits the warp producers write: the limited sizes the fused diagonal does not
         hold, in the forest's order."""
-        fused = solver.placement.fused_diagonal_joint_limit_sizes
+        fused = solver.spec.classes.fused_sizes
         return tuple(size for size in solver.forest.size_groups if size in self.joint_limit_sizes and size not in fused)
 
     def write_limits(self, solver, state_in: State, dt: float, sizes: tuple[int, ...]) -> None:

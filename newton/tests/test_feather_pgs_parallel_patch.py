@@ -1119,7 +1119,6 @@ class TestPatchParallelAdmission(unittest.TestCase):
                     par_sweeps_rule="auto",
                     par_sweeps_reason="auto: ...",
                 ),
-                placement=SimpleNamespace(ink_rows=64, ink_sizes=(_DOFS, 0, 0, 0)),
                 _plan=SimpleNamespace(
                     route=SimpleNamespace(
                         producer="walk",
@@ -1232,6 +1231,11 @@ class TestTierSweeps(unittest.TestCase):
         assert_budget_reaches_the_fixed_point(self, gaps[2], gaps[2000], float(np.max(np.abs(serial))))
 
 
+def _class_inputs():
+    """The class rules' inputs where no rule reads more than the forest's sizes."""
+    return SimpleNamespace(forest=SimpleNamespace(world_count=4, max_world_dofs=22))
+
+
 class TestTierRule(unittest.TestCase):
     """Build the Jacobi tiers for case K4, a tree beside a free body, where no earlier case claims the class."""
 
@@ -1302,7 +1306,7 @@ class TestTierRule(unittest.TestCase):
         tiers = next(rule for name, _, rule in class_plan.RULES if name == "K4")
         rules = (("K5", "factor coordinates of a tree beside one free body", lambda inputs: (object(), None)),)
         with patch.object(class_plan, "RULES", (*rules, ("K4", "the Jacobi tiers", tiers))):
-            plan = class_plan.plan_class(SimpleNamespace(), general=None)
+            plan = class_plan.plan_class(_class_inputs(), general=None)
         self.assertEqual(plan.case, "K5")
         self.assertIn("case K5", plan.reasons["K4"])
         for data, phrase in (
@@ -1310,7 +1314,7 @@ class TestTierRule(unittest.TestCase):
             ({"native": False, "eliminates": False}, "written for CUDA"),
         ):
             general = class_plan.general_reason(SolverFeatherPGS.Pins(), **data)
-            self.assertIn(phrase, class_plan.plan_class(SimpleNamespace(), general=general).reasons["K4"])
+            self.assertIn(phrase, class_plan.plan_class(_class_inputs(), general=general).reasons["K4"])
         general = class_plan.general_reason(SolverFeatherPGS.Pins(placement="general"), native=True, eliminates=False)
         self.assertIn("general placement", general)
 
@@ -1695,7 +1699,7 @@ def _assert_tier_owned(test, solver, budget):
     A tier takes a world with at most ``budget`` dense rows and no matrix-free rows; the serial sweep returns early
     for exactly those worlds, so a world in that domain is the tier's (``skip_tier_rows``).
     """
-    test.assertEqual(solver.placement.ink_rows, budget)
+    test.assertEqual(solver.spec.classes.tier_rows, budget)
     test.assertTrue(solver.sweep.tiers)
     counts, free_rows = solver.placement.constraint_count.numpy(), solver.placement.mf_constraint_count.numpy()
     test.assertGreater(int(counts.max()), 0)
@@ -1731,9 +1735,9 @@ class TestPatchParallelRoutes(unittest.TestCase):
         options = {"pins": {}}
         patch_tiers = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **options)
         for solver, linked in ((patch_tiers, True),):
-            self.assertEqual(solver.placement.ink_rows, 32)
+            self.assertEqual(solver.spec.classes.tier_rows, 32)
             # The tier owns the ordinary buffers for either law.
-            self.assertIsNone(solver.placement.sparse_mass_matrix_size)
+            self.assertIsNone(solver.spec.classes.packed_size)
             keys = [tier.kernel.key for tier in solver.sweep.tiers]
             self.assertTrue(keys)
             self.assertTrue(all(_law_key(key).endswith("_linked") == linked for key in keys), keys)
@@ -2161,7 +2165,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
             "serial": _matrix_free_solver(model, beta=0.2, parallel_rows=0, **converged),
         }
         for name, rows in (("declined", 8), ("owned", 32), ("serial", 0)):
-            self.assertEqual(arms[name].placement.ink_rows, rows, name)
+            self.assertEqual(arms[name].spec.classes.tier_rows, rows, name)
             keys = [tier.kernel.key for tier in arms[name].sweep.tiers]
             self.assertEqual(bool(keys), bool(rows), name)
             # Linked tiers with joint velocity limits take the last word.

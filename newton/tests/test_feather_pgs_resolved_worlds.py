@@ -800,7 +800,7 @@ class TestResolvedWorldsSparseRoute(unittest.TestCase):
                 dense_max_constraints=56,
             )
         self.assertLessEqual(set(env), set(solver.get_path_selection()["environment"]["unknown"]))
-        self.assertIsNotNone(solver.placement.sparse_mass_matrix_size)
+        self.assertIsNotNone(solver.spec.classes.packed_size)
         routes = solver.get_path_selection()["routes"]
         self.assertNotIn("research_sparse_factor", routes)
         self.assertEqual(routes["sweep"]["route"], "sparse_pgs")

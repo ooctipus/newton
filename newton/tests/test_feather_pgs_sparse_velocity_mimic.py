@@ -111,7 +111,7 @@ def _case(enabled, offset=0.025, scale=-0.5, error=-0.015, *, friction_anchor_be
 
 def _records(solver, group: int) -> np.ndarray:
     """The walk records of the sparse group's ``group``-th articulation (the factor the walk refreshes)."""
-    art = int(solver.forest.group_to_art[solver.placement.sparse_mass_matrix_size].numpy()[group])
+    art = int(solver.forest.group_to_art[solver.spec.classes.packed_size].numpy()[group])
     d0 = int(solver.forest.articulation_dof_start.numpy()[art])
     return solver.factor.walk_data.numpy()[d0 : d0 + int(solver.forest.articulation_dof_count.numpy()[art])].copy()
 

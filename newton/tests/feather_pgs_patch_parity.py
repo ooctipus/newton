@@ -66,7 +66,7 @@ def _jacobian(solver, route, world, count):
     if route == 1:
         J_a, J_b = free_body_jacobians(solver)
         return np.concatenate([J_a[world, :count], J_b[world, :count]], axis=1)
-    if solver.placement.sparse_mass_matrix_size is not None:
+    if solver.spec.classes.packed_size is not None:
         from newton.tests.test_feather_pgs_sparse_solver import TestFeatherPGSSparseSolver  # noqa: PLC0415
 
         return TestFeatherPGSSparseSolver()._sparse_rows_physical(solver, world, count)[1]
@@ -94,7 +94,7 @@ def contact_rows(solver, contacts, route=0, *, incident=False, jacobian=False, e
         solver.placement.contact_slots_needed.numpy()[:count],
     )
     arrays = route_arrays(solver, route)
-    if incident and route == 0 and solver.placement.sparse_mass_matrix_size is not None:
+    if incident and route == 0 and solver.spec.classes.packed_size is not None:
         arrays["rhs"] = arrays["rhs"] + solver.placement.row_incident.numpy()
     patches = solver.laws.friction_patches
     view = patches.view if patches is not None and patches.view.weight.shape[0] else None

@@ -148,7 +148,7 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         for name, law in (("patch", {}),):
             with self.subTest(law=name):
                 solver = SolverFeatherPGS(model, **law, **options)
-                self.assertEqual(solver.placement.sparse_mass_matrix_size, 18)
+                self.assertEqual(solver.spec.classes.packed_size, 18)
                 self.assertFalse(solver.sweep.sparse_active_rows)
                 self.assertIn("bitsets exceed shared memory", solver.sweep.sparse_active_rows_reason)
                 self.assertNotIn("_active", solver.sweep.sparse_kernel.key)

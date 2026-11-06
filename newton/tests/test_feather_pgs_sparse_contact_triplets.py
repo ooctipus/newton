@@ -431,7 +431,7 @@ class TestSparseContactTriplets(unittest.TestCase):
         classes = sum(
             getattr(support, name).numpy().nbytes for name in ("body_class", "pair_class", "class_dof", "limit_class")
         )
-        tiny = classes // (4 * model.world_count * (int(probe.placement.sparse_max_row_support) - 1))
+        tiny = classes // (4 * model.world_count * (int(probe.spec.classes.packed.max_support) - 1))
         cases = (
             (192, {"contact_units": None}, False),
             (192, {}, True),
@@ -456,9 +456,9 @@ class TestSparseContactTriplets(unittest.TestCase):
                     dense_max_constraints=capacity,
                 )
                 if capacity == high and not plain:
-                    self.assertIsNone(solver.placement.sparse_mass_matrix_size)
+                    self.assertIsNone(solver.spec.classes.packed_size)
                     continue
-                self.assertEqual(solver.placement.sparse_mass_matrix_size, 18)
+                self.assertEqual(solver.spec.classes.packed_size, 18)
                 self.assertEqual("contact_triplets" in solver.sweep.sparse_kernel.key, selected)
 
     def test_factory_on_coupled_fixture_cpu(self):
@@ -749,7 +749,7 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
                     pgs_warmstart=False,
                     dense_max_constraints=192,
                 )
-                self.assertEqual(solver.placement.sparse_mass_matrix_size, 18)
+                self.assertEqual(solver.spec.classes.packed_size, 18)
                 key = solver.sweep.sparse_kernel.key
                 # A sphere on each link touches at one point: no region of this model has a footprint, so no
                 # contact carries a spin row and the sweep is the plain variant (RowLaw.SPIN).

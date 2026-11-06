@@ -295,7 +295,7 @@ class TestVelocityLimitLawRollouts(unittest.TestCase):
         velocities = {}
         for name, pins in (("serial", {}), ("tier", {"tiers": 32, "tier_sweeps": 2000})):
             solver = _matrix_free_solver(model, pins=pins, pgs_iterations=2000)
-            self.assertEqual(solver.placement.ink_rows, 32 if name == "tier" else 0)
+            self.assertEqual(solver.spec.classes.tier_rows, 32 if name == "tier" else 0)
             state, out, control = model.state(), model.state(), model.control()
             control.joint_f.assign(torques)
             solver.step(state, out, control, None, 1.0 / 240.0)

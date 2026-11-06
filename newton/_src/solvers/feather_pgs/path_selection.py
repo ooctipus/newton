@@ -298,7 +298,7 @@ def _row_builder(solver, method, size) -> dict:
     (routes.free_rigid_bodies).
     """
     marker = ()
-    if solver._plan.route.case == "K2" and size == solver.placement.sparse_diagonal_response_size:
+    if size == solver.spec.classes.diagonal_size:
         # The sparse diagonal's marker encodes schedule links into the slots its writer just wrote.
         marker = () if solver.sweep.sparse_contact_marker is None else (solver.sweep.sparse_contact_marker,)
     if method == "walk":
@@ -382,14 +382,14 @@ def _paired_response(solver) -> dict:
 
 
 def _sparse_diagonal(solver) -> dict:
-    row = solver._plan.route
+    row, diagonal = solver._plan.route, solver.spec.classes.diagonal
     return {
         "enabled": row.case == "K2",
         "response_dofs": json_value(row.sizes["diagonal"]),
         "dense_dofs": int(row.sizes["dense"] or 0),
-        "contact_units": bool(solver.placement.sparse_diagonal_contact_units),
-        "speculative_contact_batches": bool(solver.placement.sparse_diagonal_speculative_contact_batches),
-        "fused_joint_limits": bool(solver.placement.fused_diagonal_joint_limits),
+        "contact_units": bool(diagonal is not None and diagonal.units),
+        "speculative_contact_batches": bool(diagonal is not None and diagonal.speculative_batches),
+        "fused_joint_limits": bool(solver.spec.classes.fused_sizes),
         "reason": row.reasons["K2"],
     }
 
@@ -410,7 +410,7 @@ def _sparse_mass_matrix(solver) -> dict:
     if size is not None:
         record.update(
             {
-                "max_row_support": json_value(solver.placement.sparse_max_row_support),
+                "max_row_support": json_value(solver.spec.classes.packed.max_support),
                 "solve_lanes": int(solver.sweep.sparse_solve_lanes),
                 "local_factors": bool(solver.sweep.sparse_local_factors),
                 "units_kernel": _key(solver.sweep.support_units_kernel),
@@ -674,7 +674,7 @@ def _dynamics(solver) -> dict:
         "tree_sizes": {str(size): int(n) for size, n in enumerate(np.bincount(solver.forest.tree_size)) if n},
         # The matrix-free sweeps' dense rows packed by support (packed_rows), and whether they serve the step alone.
         "packed_rows": {
-            "support": int(solver.placement.packed_support) if solver.placement.mf_sweeps else None,
+            "support": int(solver.placement.packed_support) if solver.spec.classes.mf_sweeps else None,
             "dense": bool(solver.placement.packed_dense),
             "response_only": bool(solver.placement.packed_response),
             "reason": solver.placement.packed_response_reason,

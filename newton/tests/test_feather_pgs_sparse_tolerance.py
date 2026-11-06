@@ -95,7 +95,7 @@ class TestFeatherPGSSparseExitLaw(unittest.TestCase):
             pgs_iterations=iterations,
             diagnostics=SolverFeatherPGS.Diagnostics(solve_readout=readout),
         )
-        self.assertIsNotNone(solver.placement.sparse_mass_matrix_size)
+        self.assertIsNotNone(solver.spec.classes.packed_size)
         states = [model.state() for _ in range(2)]
         states[0].joint_qd.fill_(0.3)
         newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])

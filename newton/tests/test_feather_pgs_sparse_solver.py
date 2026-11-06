@@ -177,7 +177,7 @@ def _over_budget_rows(model) -> int:
     staging = functools.partial(
         sweep_routes_sparse.sparse_staging,
         max_world_dofs=probe.forest.max_world_dofs,
-        max_row_dofs=probe.placement.sparse_max_row_support,
+        max_row_dofs=probe.spec.classes.packed.max_support,
         active_rows=probe.sweep.sparse_active_rows,
         linked_rows=True,
     )
@@ -234,7 +234,7 @@ def _step(case):
 def _tree(case, group: int, records: np.ndarray) -> np.ndarray:
     """The walk records of the sparse group's ``group``-th articulation."""
     solver = case[1]
-    art = int(solver.forest.group_to_art[solver.placement.sparse_mass_matrix_size].numpy()[group])
+    art = int(solver.forest.group_to_art[solver.spec.classes.packed_size].numpy()[group])
     d0 = int(solver.forest.articulation_dof_start.numpy()[art])
     return records[d0 : d0 + int(solver.forest.articulation_dof_count.numpy()[art])]
 
@@ -274,7 +274,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         sparse group holds no prescribed articulations."""
         _, solver, *_ = _case(True, prescribed=True)
         self.assertTrue(solver.forest.has_prescribed_response)
-        self.assertIsNone(solver.placement.sparse_mass_matrix_size)
+        self.assertIsNone(solver.spec.classes.packed_size)
         self.assertIn("holds no prescribed articulations", solver._plan.route.reasons["K1"])
 
     def assert_states_close(self, first, second):
@@ -289,7 +289,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
     def assert_sparse_state(self, case):
         """Check storage elimination, row support, impulses, and residual coordinates."""
         _, solver, state, *_ = case
-        size = solver.placement.sparse_mass_matrix_size
+        size = solver.spec.classes.packed_size
         self.assertEqual(size, 9)
         self.assertEqual(solver.placement.J_by_size[size].shape, (1, 1, 1))  # Only an argument stand-in remains.
         self.assertFalse(solver.placement.constraint_overflow.numpy().any())
@@ -349,7 +349,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
     def _order_multi_articulation_rows(self, case):
         """Give this fixture identical semantic row order without changing production allocation."""
         _, solver, _, _, _, _, contacts = case
-        sparse = solver.placement.sparse_mass_matrix_size is not None
+        sparse = solver.spec.classes.packed_size is not None
         names = [
             "rhs",
             "diag",
@@ -417,7 +417,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         dense = _case(False, robot_count=2)
         sparse = _case(True, robot_count=2, pins={"active_rows": False})
         self.assertFalse(sparse[1].sweep.sparse_active_rows)
-        self.assertEqual(sparse[1].placement.sparse_mass_matrix_size, 9)
+        self.assertEqual(sparse[1].spec.classes.packed_size, 9)
         self.assertEqual(sparse[1].forest.group_to_art[9].shape[0], 4)
         self.assertEqual(sparse[1].forest.world_count, 2)
         contact_seen = False
@@ -453,8 +453,8 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
     def test_trajectory_masked_reset_and_inertial_notify(self):
         """Match 32 contact steps and refresh only the requested cached factors."""
         dense, sparse = _case(False), _case(True)
-        self.assertIsNone(dense[1].placement.sparse_mass_matrix_size)
-        self.assertEqual(sparse[1].placement.sparse_mass_matrix_size, 9)
+        self.assertIsNone(dense[1].spec.classes.packed_size)
+        self.assertEqual(sparse[1].spec.classes.packed_size, 9)
         contact_seen = limit_seen = False
         for _ in range(32):
             for case in (dense, sparse):
@@ -512,20 +512,20 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         factors under either friction law (the route probe records it).
         """
         chain = _build_chain("cuda:0", base_z=1.2, contact_sphere="deep", ground=False)
-        self.assertIsNone(_make_solver(chain, True).placement.sparse_mass_matrix_size)
+        self.assertIsNone(_make_solver(chain, True).spec.classes.packed_size)
         model = _build_model()
-        self.assertIsNotNone(_make_solver(model, True, contact_torsion=True).placement.sparse_mass_matrix_size)
+        self.assertIsNotNone(_make_solver(model, True, contact_torsion=True).spec.classes.packed_size)
         for options in ({"dense_max_constraints": _over_budget_rows(model)},):
             with self.subTest(options=options):
                 solver = _make_solver(model, True, **options)
-                self.assertIsNone(solver.placement.sparse_mass_matrix_size)
+                self.assertIsNone(solver.spec.classes.packed_size)
                 # The existing path: the matrix-free sweeps, whose producers write the packed rows.
-                self.assertTrue(solver.placement.mf_sweeps)
+                self.assertTrue(solver.spec.classes.mf_sweeps)
                 self.assertGreater(solver.placement.packed_Z.size, 1)
 
     def test_warm_start_is_admitted(self):
         """Warm start seeds the sparse sweeps from carried impulses on models without free rigid bodies."""
-        self.assertEqual(_make_solver(_build_model(), True, pgs_warmstart=True).placement.sparse_mass_matrix_size, 9)
+        self.assertEqual(_make_solver(_build_model(), True, pgs_warmstart=True).spec.classes.packed_size, 9)
 
 
 if __name__ == "__main__":

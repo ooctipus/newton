@@ -303,7 +303,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
             case = _sparse_case(cached, kinematic_body=1)
             solver = case[1]
             # Ordinary dynamics take the dense factors: native sparse factors are the held tree's.
-            self.assertEqual(solver.placement.sparse_mass_matrix_size is not None, cached == "auto")
+            self.assertEqual(solver.spec.classes.packed_size is not None, cached == "auto")
             if cached == "auto":
                 self.assertEqual(solver.get_path_selection()["routes"]["held_tree"]["owner"], "tree")
             for _ in range(40):

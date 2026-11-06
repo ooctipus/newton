@@ -1861,7 +1861,7 @@ def placement_frames(solver, joint_q: np.ndarray, capture) -> dict:
     # (test_feather_pgs_walk_rows).
     from newton.tests.test_feather_pgs_walk_rows import slot_frames, walked_frames  # noqa: PLC0415
 
-    frames = slot_frames if placement.sparse_diagonal_contact_solve else walked_frames
+    frames = slot_frames if solver.spec.classes.diagonal is not None else walked_frames
     walked = frames(solver, joint_q, capture)
     out.update(rows=walked["rows"], leave=walked["leave"], general=walked["worlds"])
     return out

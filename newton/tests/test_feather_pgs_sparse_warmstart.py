@@ -74,7 +74,7 @@ class TestFeatherPGSSparseWarmstart(unittest.TestCase):
             pgs_iterations=iterations,
             pgs_warmstart=warmstart,
         )
-        self.assertIsNotNone(solver.placement.sparse_mass_matrix_size, solver._plan.route.reasons["K1"])
+        self.assertIsNotNone(solver.spec.classes.packed_size, solver._plan.route.reasons["K1"])
         self.assertEqual("_warm_start" in solver.sweep.sparse_kernel.key, warmstart)
         pipeline = newton.CollisionPipeline(model, contact_matching="latest")
         contacts = pipeline.contacts()

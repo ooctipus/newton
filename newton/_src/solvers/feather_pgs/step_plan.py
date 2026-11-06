@@ -640,7 +640,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         begin_rows,
         *((write_mimics,) if laws.mimic_warp_kernels and holds else ()),
         *((write_links,) if laws.link_count > 0 and holds else ()),
-        *((prepare_fused_limits,) if placement.fused_diagonal_joint_limits else ()),
+        *((prepare_fused_limits,) if spec.classes.fused_sizes else ()),
         *((write_limits,) if limit_sizes else ()),
         *((bound_limits,) if bounds else ()),
         *((write_velocity_limits,) if laws.velocity_limit_warp_kernels and holds and not keyed else ()),

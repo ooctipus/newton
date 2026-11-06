@@ -1108,7 +1108,7 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
         control = model.control()
         control.joint_target_q.assign(0.5 * np.cos(np.arange(control.joint_target_q.shape[0])).astype(np.float32))
         solver = sparse._make_solver(model, not dense, update_mass_matrix_interval=interval)
-        self.assertEqual(solver.placement.sparse_mass_matrix_size is not None, not dense)
+        self.assertEqual(solver.spec.classes.packed_size is not None, not dense)
         state, out = model.state(), model.state()
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
         history = []

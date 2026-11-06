@@ -251,7 +251,7 @@ class TestStarRows(unittest.TestCase):
                 )
             ]
             for solver in solvers:
-                self.assertTrue(solver.placement.sparse_diagonal_contact_units)
+                self.assertTrue(solver.spec.classes.diagonal.units)
             records = [check_star_records(self, solver) for solver in solvers]
             states = [[model.state(), model.state()] for _ in solvers]
             controls = [model.control() for _ in solvers]
@@ -323,7 +323,7 @@ class TestStarRows(unittest.TestCase):
                 )
             ]
             for solver in solvers:
-                self.assertTrue(solver.placement.sparse_diagonal_contact_units)
+                self.assertTrue(solver.spec.classes.diagonal.units)
             records = [check_star_records(self, solver) for solver in solvers]
             states = [[model.state(), model.state()] for _ in solvers]
             controls = [model.control() for _ in solvers]

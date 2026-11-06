@@ -116,7 +116,7 @@ def topology_plan(solver):
         sizes[0],
         sizes[1] if len(sizes) == 2 else 0,
         *block_offsets,
-        solver.placement.ink_rows,
+        solver.spec.classes.tier_rows,
         solver.options.enable_joint_velocity_limits,
         velocity_mask,
         # Without joint limits no coordinate holds a position-limit row (the one writer's limit family, step_plan).

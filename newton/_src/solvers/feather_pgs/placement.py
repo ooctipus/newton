@@ -315,6 +315,8 @@ class Placement:
         self.model = model
         self.options = options
         self.forest = forest = spec.forest
+        self.classes = spec.classes
+        """The class plan (:class:`.class_plan.ClassPlan`): the case whose rows this placement holds."""
         self.laws = laws
         self.factor = factor
         self.arrays = SolverArrays(self, model.device)
@@ -416,9 +418,7 @@ class Placement:
 
         rows = np.zeros(dof.size, dtype=np.int64)
         if has_position_limit_rows:
-            fuse_position_limits = np.isin(
-                self.forest.response_dof_count[art], list(self.fused_diagonal_joint_limit_sizes)
-            )
+            fuse_position_limits = np.isin(self.forest.response_dof_count[art], list(self.classes.fused_sizes))
             lower, upper = joint_limit_lower[dof], joint_limit_upper[dof]
             rows += ~fuse_position_limits & np.isfinite(lower)
             rows += ~fuse_position_limits & np.isfinite(upper)
@@ -483,11 +483,9 @@ class Placement:
         arrays = self.arrays
         for size in self.forest.size_groups:
             n_arts = self.forest.n_arts_by_size[size]
-            sparse_response = self.sparse_mass_matrix_size is not None or (
-                self.sparse_diagonal_contact_solve and size == self.sparse_diagonal_response_size
-            )
+            sparse_response = self.classes.packed is not None or size == self.classes.diagonal_size
             # The one writer walks the matrix-free sweeps' rows into the packed rows: no size group's rows.
-            response = 1 if sparse_response or self.mf_sweeps else 0
+            response = 1 if sparse_response or self.classes.mf_sweeps else 0
             sizes = {
                 "art": n_arts,
                 "size": size,
@@ -539,7 +537,7 @@ class Placement:
         world_dof = self.forest.max_world_dofs
         sizes = {"world": self.forest.world_count, "row": self.row_pitch, "world_dof": world_dof}
         arrays.allocate(DENSE_ROWS, **sizes)
-        fused = self.fused_diagonal_joint_limits
+        fused = bool(self.classes.fused_sizes)
         arrays.allocate(FUSED_DIAGONAL_LIMITS, **(sizes if fused else {"world": 1, "world_dof": 1}))
         # Per-row weights exist only for a weighted row law (relative regularization or material contacts), and
         # per-row compliance only for material contacts.
@@ -555,17 +553,18 @@ class Placement:
     def allocate_sparse_diagonal_rows(self):
         """The sparse-diagonal rows and their contact schedule (case K2)."""
         # The sparse-diagonal schedule's buffers, one row per world when it is off.
-        if self.sparse_diagonal_contact_solve:
+        diagonal = self.classes.diagonal
+        if diagonal is not None:
             self.arrays.allocate(SPARSE_DIAGONAL_ROWS, world=self.forest.world_count, row=self.dense_max_constraints)
         else:
             self.arrays.allocate(SPARSE_DIAGONAL_ROWS, world=1, row=1)
-        if self.sparse_diagonal_contact_units:
+        if diagonal is not None and diagonal.units:
             self.arrays.allocate(
                 SPARSE_CONTACT_GROUPS, world=self.forest.world_count, world_dof=self.forest.max_world_dofs
             )
         else:
             self.arrays.allocate(SPARSE_CONTACT_GROUPS, world=1, world_dof=1)
-        if self.sparse_diagonal_speculative_contact_batches:
+        if diagonal is not None and diagonal.speculative_batches:
             # A unit may be a single normal row: a world lists at most a unit a row.
             self.arrays.allocate(
                 SPARSE_CONTACT_SERIAL, world=self.forest.world_count, serial=self.dense_max_constraints
@@ -625,7 +624,7 @@ class Placement:
         """The matrix-free sweeps' rows, packed by support (:mod:`.packed_rows`): every row of the world's line, the
         free bodies' included (their two one-node trees of six are two sides like any other), each row as wide as two
         of its world's articulations hold; a placeholder without those sweeps."""
-        if self.mf_sweeps:
+        if self.classes.mf_sweeps:
             sizes, worlds = self.forest.articulation_response_dof_count.numpy(), self.forest.art_to_world.numpy()
             offsets = self.forest.articulation_world_dof_offset.numpy()
             # A row's sides follow articulation indices (row_records.row_sides); they follow the world's coordinates
@@ -641,7 +640,7 @@ class Placement:
             if self.factor.eliminates:
                 # A corrected row reaches every tree of its block.
                 self.packed_support, self.packed_dense = self.forest.max_world_dofs, packed_rows.WIDE
-            if self.ink_rows and not self.packed_dense:
+            if self.classes.tier_rows and not self.packed_dense:
                 raise RuntimeError("The parallel tiers read their worlds' packed rows at their coordinates")
             sizes = {"world": self.forest.world_count, "row": self.row_pitch, "support": self.packed_support}
         else:
@@ -655,7 +654,7 @@ class Placement:
         The matrix-free sweeps, and every route beside them, read the dense rows packed by support
         (:mod:`.packed_rows`): the packed build alone serves the step.
         """
-        self.packed_response_reason = None if self.mf_sweeps else "No matrix-free sweep reads packed rows."
+        self.packed_response_reason = None if self.classes.mf_sweeps else "No matrix-free sweep reads packed rows."
         self.packed_response = self.packed_response_reason is None
         if not self.packed_response:
             if paired_coordinates:
@@ -953,7 +952,9 @@ class Placement:
         support = RowSupport()
         support.sides = self.row_sides
         support.dofs = self.forest.articulation_response_dof_count
-        support.offset = self.forest.articulation_world_dof_offset if self.mf_sweeps else self.dummy_is_free_rigid
+        support.offset = (
+            self.forest.articulation_world_dof_offset if self.classes.mf_sweeps else self.dummy_is_free_rigid
+        )
         support.dense = int(self.packed_dense)
         support.first = self.dense_first
         support.units = self.unit_source if self.walks else self.dummy_units
@@ -961,7 +962,7 @@ class Placement:
 
     def ink_skip_rows(self) -> int:
         """The dense rows of the worlds the tiers own, whose response they form in-kernel (0 without tiers)."""
-        return int(getattr(self, "ink_rows", 0))
+        return self.classes.tier_rows
 
     def inkernel_response_inputs(self) -> dict:
         """The parallel tiers' operands beside the walk: the worlds' trees (``ink_meta``) and the rows' law's cfm."""

@@ -125,8 +125,8 @@ def _permuted_slots(solver, contacts, shift):
             contact_path=solver.placement.contact_path,
             contact_world=solver.placement.contact_world,
             contact_slots_needed=solver.placement.contact_slots_needed,
-            sparse_mass_matrix_size=None,
         ),
+        spec=SimpleNamespace(classes=SimpleNamespace(packed_size=None)),
         laws=SimpleNamespace(friction_patches=solver.laws.friction_patches),
         # The walk, which whitened the rows.
         factor=SimpleNamespace(walk_view=solver.factor.walk_view),

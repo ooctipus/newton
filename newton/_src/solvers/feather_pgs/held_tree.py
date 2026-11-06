@@ -481,7 +481,7 @@ class HeldTree:
             self.coverage = self.forest_reason = None
             self.groups = []
             return
-        if solver.placement.sparse_mass_matrix_size is not None:
+        if solver.spec.classes.packed is not None:
             # The sparse class: one complete group, which proves its own coverage (make_plan).
             self.coverage = self.forest_reason = scalar = None
             held = [sparse_group(solver)]

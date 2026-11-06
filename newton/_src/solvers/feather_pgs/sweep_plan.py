@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import math
 
 import numpy as np
 import warp as wp
@@ -104,6 +103,7 @@ class Sweep:
         self.laws = laws
         self.placement = placement
         self.factor = factor
+        self.classes = classes
         self.case = classes.case
         """The class's case (:attr:`.class_plan.ClassPlan.case`)."""
         self.pins = pins
@@ -112,40 +112,20 @@ class Sweep:
         self.readout = SolveReadoutRecord(self.policy)
 
     def place_diagonal(self, choice) -> None:
-        """Case K2, a tree beside a star: the sparse diagonal and the fused limits of its star, from the class plan's
-        choice (:class:`.class_plan.Diagonal`, ``None`` where the class is another case)."""
-        model, placement = self.model, self.placement
-        chosen = choice is not None
-        placement.sparse_diagonal_contact_solve = chosen
-        # Limit rows belong to this specialized owner; without it the ordinary rows keep them.
-        placement.fused_diagonal_joint_limit_sizes = choice.fused_sizes if chosen else frozenset()
-        placement.fused_diagonal_joint_limits = bool(placement.fused_diagonal_joint_limit_sizes)
-        placement.fused_diagonal_limit_dof_mask_host = (
-            choice.fused_mask if chosen else np.zeros(model.joint_dof_count, dtype=np.int32)
-        )
-        placement.sparse_diagonal_response_size = choice.size if chosen else None
-        placement.sparse_diagonal_dense_size = choice.dense_size if chosen else 0
-        # A contact is a unit: a normal row, followed by its friction rows only when its region holds an anchor.
-        placement.sparse_diagonal_contact_units = bool(
-            chosen and self.options.enable_contact_friction and self.options.contact_friction_gap_threshold == math.inf
-        )
-        placement.sparse_diagonal_speculative_contact_batches = bool(
-            placement.sparse_diagonal_contact_units and placement.sparse_diagonal_dense_size + 2 <= 16
-        )
+        """Case K2, a tree beside a star: each world's dense arm's offset and group, from the class plan's choice
+        (:class:`.class_plan.Diagonal`, ``None`` where the class is another case)."""
+        model, placement, chosen = self.model, self.placement, choice is not None
         placement.sparse_diagonal_dense_offsets = wp.array(
             choice.dense_offsets if chosen else np.zeros(1, dtype=np.int32), dtype=wp.int32, device=model.device
         )
         placement.sparse_diagonal_dense_groups = wp.array(
             choice.dense_groups if chosen else np.zeros(1, dtype=np.int32), dtype=wp.int32, device=model.device
         )
-        # Each world's dense arm, the tree the walk whitens and leaves (FL3.5).
-        placement.sparse_diagonal_dense_arts_host = choice.dense_arts if chosen else np.zeros(0, dtype=np.int32)
 
     def place_packed(self, choice) -> None:
         """Case K1, a single tree: native sparse factors with independent rigid-body response blocks, from the class
         plan's choice (:class:`.class_plan.Packed`, ``None`` where the class is another case)."""
         model = self.model
-        self.placement.sparse_mass_matrix_size = None
         self.sparse_velocity_limits = False
         self.support_rows = self.support_units_kernel = self._support_sink = None
         self.support_units = None
@@ -160,18 +140,15 @@ class Sweep:
         # The admitted contact units' block records.
         self.placement.sparse_contact_records = None
         self.placement.friction_metric = None
-        self.placement.sparse_max_row_support = None
         if choice is None:
             return
         sweep, max_support = dict(choice.sweep), choice.max_support
-        self.placement.sparse_mass_matrix_size = choice.size
         self.sparse_active_rows = sweep["active_rows"]
         self.sparse_active_rows_reason = choice.active_rows_reason
         self.sparse_contact_triplets = sweep["contact_triplets"]
         self.sparse_contact_triplets_reason = choice.contact_triplets_reason
         self.sparse_solve_lanes = sweep["lanes_per_world"]
         self.sparse_local_factors = sweep["local_factors"]
-        self.placement.sparse_max_row_support = max_support
         self.sparse_velocity_limits = choice.velocity_limits
         self.factor.allocate_sparse(choice.plan)
         self.placement.sparse_body_dof_mask = wp.array(choice.body_masks, dtype=wp.uint64, device=model.device)
@@ -230,7 +207,7 @@ class Sweep:
             ValueError: For a factored size whose articulations do not share one tree.
         """
         model, forest, factor = self.model, self.forest, self.factor
-        size = self.placement.sparse_mass_matrix_size
+        size = self.classes.packed_size
         arts = forest.group_to_art_host[size]
         # The group's tree: its articulations' walking classes' one path table.
         classes = factor.walk_classes
@@ -326,18 +303,15 @@ class Sweep:
         self.paired_factor_primary_arts_by_world = wp.array(primary_by_world, dtype=wp.int32, device=model.device)
 
     def place_tiers(self, choice) -> None:
-        """Case K4, the Jacobi tiers: their row bound and their in-kernel response's trees, from the class plan's
-        choice (:class:`.class_plan.Tiers`, ``None`` where the class is another case). ``ink_rows`` is 0 without
-        tiers; the keyed rows read it before the tiers are built."""
-        placement = self.placement
-        placement.ink_rows, placement.ink_sizes = (choice.rows, choice.sizes) if choice is not None else (0, None)
+        """Case K4, the Jacobi tiers: their in-kernel response's trees, from the class plan's choice
+        (:class:`.class_plan.Tiers`, ``None`` where the class is another case)."""
         if choice is not None:
-            placement.ink_meta = wp.array(choice.meta.reshape(-1), dtype=wp.int32, device=self.model.device)
+            self.placement.ink_meta = wp.array(choice.meta.reshape(-1), dtype=wp.int32, device=self.model.device)
 
     def _tier_frame(self) -> tuple[int, int]:
         """Each of the tiers' trees' slip capacity (:meth:`.tree_factor.TreeFactor.slip_capacity`): the release its rows
         and leave compile, none where no tree of that size holds a limited drive."""
-        na, nb = self.placement.ink_sizes[0], self.placement.ink_sizes[1]
+        na, nb = self.classes.tiers.sizes[0], self.classes.tiers.sizes[1]
         return tuple(
             self.factor.slip_capacity(self.forest.group_to_art[size].numpy()) if size else 0 for size in (na, nb)
         )
@@ -432,10 +406,11 @@ class Sweep:
             else None
         )
 
-        sparse_contact_schedule = self.placement.sparse_diagonal_contact_units
+        diagonal = self.classes.diagonal
+        sparse_contact_schedule = diagonal is not None and diagonal.units
         self.sparse_contact_marker = (
             _get_mark_independent_sparse_contact_candidates_kernel(
-                self.placement.sparse_diagonal_response_size,
+                self.classes.diagonal_size,
                 device_arch,
                 torsion=self.laws.spin_rows,
             )
@@ -447,7 +422,7 @@ class Sweep:
                 self.placement.dense_max_constraints,
                 self.forest.max_world_dofs,
                 device_arch,
-                build_serial_contacts=self.placement.sparse_diagonal_speculative_contact_batches,
+                build_serial_contacts=diagonal.speculative_batches,
                 torsion=self.laws.spin_rows,
             )
             if sparse_contact_schedule
@@ -459,17 +434,17 @@ class Sweep:
                 sweep_routes_diag.sparse_diagonal_kernel,
                 self.placement.dense_max_constraints,
                 self.forest.max_world_dofs,
-                self.placement.sparse_diagonal_dense_size,
+                diagonal.dense_size,
                 device_arch,
-                speculative_contact_batches=self.placement.sparse_diagonal_speculative_contact_batches,
-                contact_units=self.placement.sparse_diagonal_contact_units,
+                speculative_contact_batches=diagonal.speculative_batches,
+                contact_units=diagonal.units,
                 torsion=self.laws.spin_rows,
             )
-            if self.placement.sparse_diagonal_contact_solve
+            if diagonal is not None
             else None
         )
         row_by_row = self.sparse_diagonal_kernel is not None or self.paired_factor_kernel is not None
-        if self.laws.spin_rows and (self.placement.mf_sweeps or row_by_row):
+        if self.laws.spin_rows and (self.classes.mf_sweeps or row_by_row):
             # Static storage for graph capture: the friction triples' metrics, formed per launch by the sweeps that
             # visit a triple's rows one by one (sweep.friction_metric_stage).
             self.placement.arrays.allocate(
@@ -487,7 +462,7 @@ class Sweep:
         # The Jacobi tiers ahead of the matrix-free sweep (SweepTier), and their keyed rows' release.
         self.tiers = []
         self.tier_worlds = None
-        if self.placement.mf_sweeps:
+        if self.classes.mf_sweeps:
             # A test pin streams the impulses (storage is part of the kernel specialization key); the selection
             # sizes the resident row metadata with its choice.
             force_stream_mf_impulses = self.pins.mf_storage == "streamed"
@@ -510,7 +485,7 @@ class Sweep:
                     force_stream_mf_impulses=force_stream_mf_impulses,
                 )
             self.mf_gs_storage = storage
-            parallel_rows = self.placement.ink_rows
+            parallel_rows = self.classes.tier_rows
             # The colored mapping takes the worlds the unit builder's rule picks at every pack
             # (sweep_units.COLORED_RULE), among those whose free bodies and row capacity admit it: built, with a
             # storage slot each, for those worlds only, it runs beside the one-warp mapping. More of them than the
@@ -593,7 +568,7 @@ class Sweep:
                         rows=rows_,
                         sweeps=sweeps_,
                         min_rows=min_rows_,
-                        inkernel_response=self.placement.ink_sizes,
+                        inkernel_response=self.classes.tiers.sizes,
                         linked_rows=True,
                         velocity_limit_pass=self._parallel_velocity_limit_pass(),
                         frame=self._tier_frame(),
@@ -643,7 +618,7 @@ class Sweep:
     def claim(self) -> None:
         """Publish the schedule of the rows the row pass wrote and each owner's worlds (run after every producer)."""
         model = self.model
-        if self.placement.sparse_diagonal_contact_units:
+        if self.sparse_contact_schedule is not None:
             # Unit heads come from the row types and the tangent rows' parents.
             unit_rows = [self.placement.row_type, self.placement.row_parent]
             wp.launch(
@@ -784,8 +759,7 @@ class Sweep:
 
     def _solve_diagonal(self, operands: dict) -> None:
         """Case K2: the sparse-diagonal sweep over the schedule of :meth:`claim`."""
-        placement = self.placement
-        dense_size = placement.sparse_diagonal_dense_size
+        placement, dense_size = self.placement, self.classes.dense_size
         self._launch(
             self.sparse_diagonal_kernel,
             operands,

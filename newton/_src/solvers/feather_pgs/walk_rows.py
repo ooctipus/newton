@@ -1412,7 +1412,7 @@ SLOT_ROWS = (
     Field("single_dof", wp.int32, ("body",), owner="forest", attr="body_single_response_dof"),
     Field("dof_offset", wp.int32, ("articulation",), owner="forest", attr="articulation_world_dof_offset"),
     Field("inverse_mass", wp.float32, ("dof",), owner="factor", attr="diagonal_inverse_mass"),
-    Field("star", wp.int32, attr="sparse_diagonal_response_size", owner="placement"),
+    Field("star", wp.int32, attr="diagonal_size", owner="classes"),
     Field("dense_group", wp.int32, ("world",), attr="sparse_diagonal_dense_groups", owner="placement"),
     Field("Z", wp.float32, ("group", "row", "dense"), owner="dense"),
     Field("dof", wp.int32, ("world", "row", 2), attr="sparse_diagonal_row_dof", owner="placement"),
@@ -1435,7 +1435,8 @@ def bind_slot_rows(solver) -> SlotRows:
         placement=placement,
         forest=solver.forest,
         factor=solver.factor,
-        Z=placement.J_by_size[placement.sparse_diagonal_dense_size],
+        classes=solver.spec.classes,
+        Z=placement.J_by_size[solver.spec.classes.dense_size],
     )
 
 
@@ -1586,8 +1587,8 @@ def packed_sink(solver) -> RowSink:
     sink = row_sink(solver.factor, solver.forest, placement, solver.v_hat)
     sink.layout = placement.row_support()
     if solver.spec.classes.case == "K2":
-        sink.entries = placement.J_by_size[placement.sparse_diagonal_dense_size]
-        sink.star = int(placement.sparse_diagonal_response_size)
+        sink.entries = placement.J_by_size[solver.spec.classes.dense_size]
+        sink.star = int(solver.spec.classes.diagonal_size)
     else:
         sink.entries = placement.packed_Z
     return sink
