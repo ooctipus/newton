@@ -17,8 +17,8 @@ rows walked together from its first (1, 3, or 4 under contact torsion), or a joi
 - **the sparse diagonal** (case K2, FL3.5): the arm's side into the row's dense part, a key of the star one step to
   the row's slot (:func:`slot_rows_kernel`, :func:`slot_header`);
 - **the free bodies' rows** (``mf_Z``, each side's six of a row's twelve: a packed row by the free bodies' own row): a
-  contact row (:func:`write_free_body_rows`), or a speed row's axis, a covector, for its diagonal
-  (:func:`populate_rigid_velocity_limit_rows`), through the packed walker (:func:`packed_walker`).
+  contact row, or a speed row's axis, a covector at the body's root, for its diagonal, one writer over both
+  (:func:`write_free_body_rows`), through the packed walker (:func:`packed_walker`).
 
 Each row's header is its diagonal ``|z|^2 + cfm`` (the walk's sums of squares, re-read where two seeds share a side or
 a side slips), its incident velocity ``J v_hat`` (the step's ``J`` entries each walk passes) and its rhs by the row law
@@ -94,7 +94,6 @@ __all__ = [
     "free_body_sink",
     "packed_sink",
     "packed_walker",
-    "populate_rigid_velocity_limit_rows",
     "row_sink",
     "slot_rows_kernel",
     "slot_writer",
@@ -250,8 +249,8 @@ WRITERS = MappingProxyType(
   spill (sm_120, ur10-reach's class); at 128 they spilled 144 B a lane and loaded 412 B back, every unit's walk paid
   the spills' local-memory traffic, and the kinetic finish two launches later paid its L2 lines. Measured
   (``SP/core/FL/zwr8``, L5): franka-reach 4.3%, ant 1.3%, anymald 1.1% and ur10-reach 0.4% faster on the PRO.
-- **The free bodies' contacts**, a contact a thread, two waves of the line: the free-body writer
-  (:func:`write_free_body_rows`) at 128.
+- **The free bodies' units**, their contacts then their speed rows, a unit a thread, two waves of the line: the
+  free-body writer (:func:`write_free_body_rows`) at 128.
 """
 
 
@@ -1604,48 +1603,40 @@ walk_body_row = packed_walker(1, False, True, walk_tables((FREE_BODY_WALK,)), bo
 """The one unit walker into the free bodies' rows (:func:`packed_walker`): a row's sides from entry 0 and 6."""
 
 
-@wp.kernel(enable_backward=False, launch_bounds=WRITERS["free_body"].bounds)
-def write_free_body_rows(
-    sink: RowSink, rows: DenseRows, data: ContactInput, total_threads: int, law: PatchRowLaw, bias: RowBias
+@wp.func
+def free_body_contact_rows(sink: RowSink, rows: DenseRows, data: ContactInput, law: PatchRowLaw, bias: RowBias, c: int):
+    """Contact ``c``'s rows where the allocation routed it to the free bodies (``path`` 1): the contact's front end
+    formed once (:func:`.contact_input.contact_frame`), then each row's records by the contact law and the row as its
+    own unit (:func:`contact_row_unit`), walked by the one unit walker into the free bodies' rows
+    (:data:`walk_body_row`; the spin row a torque), with its diagonal ``|z|^2 + cfm``, its incident velocity and its rhs
+    by the row law (:func:`.row_kernels.row_bias`), as every writer's."""
+    slot = data.slot[c]
+    if data.path[c] != 1 or slot < 0:
+        return
+    line = sink.layout.first[data.world[c]]
+    # The allocation's extent: recomputing eligibility can cross a floating-point threshold.
+    count = int(1)
+    if data.slots_needed[c] >= 3:
+        count = data.slots_needed[c]
+    frame = contact_frame(data, law, c)
+    for row in range(count):
+        walk_body_row(sink, contact_row_unit(data, law, frame, c, row, line, slot + row))
+        row_bias(rows, bias, line, slot + row, sink.row_incident[line, slot + row])
+
+
+@wp.func
+def free_body_speed_rows(
+    bodies: FreeBodies, rows: DenseRows, sink: RowSink, speed_slot: wp.array[int], bias: RowBias, candidate: int
 ):
-    """The free bodies' contact rows (``path`` 1, grid-stride over the contacts): the contact's front end formed once
-    (:func:`.contact_input.contact_frame`), then each row's records by the contact law and the row as its own unit
-    (:func:`contact_row_unit`), walked by the one unit walker into the free bodies' rows (:data:`walk_body_row`; the
-    spin row a torque), with its diagonal ``|z|^2 + cfm``, its incident velocity and its rhs by the row law
-    (:func:`.row_kernels.row_bias`), as every writer's."""
-    for c in range(wp.tid(), data.count[0], total_threads):
-        slot = data.slot[c]
-        if data.path[c] != 1 or slot < 0:
-            continue
-        line = sink.layout.first[data.world[c]]
-        # The allocation's extent: recomputing eligibility can cross a floating-point threshold.
-        count = int(1)
-        if data.slots_needed[c] >= 3:
-            count = data.slots_needed[c]
-        frame = contact_frame(data, law, c)
-        for row in range(count):
-            walk_body_row(sink, contact_row_unit(data, law, frame, c, row, line, slot + row))
-            row_bias(rows, bias, line, slot + row, sink.row_incident[line, slot + row])
+    """Free rigid body ``candidate``'s speed rows, its linear and angular velocity limits, in the slots their
+    allocation reserved (:func:`.row_kernels.allocate_rigid_velocity_limit_slots`).
 
-
-@wp.kernel
-def populate_rigid_velocity_limit_rows(
-    bodies: FreeBodies,
-    rows: DenseRows,
-    sink: RowSink,
-    rigid_velocity_limit_slot: wp.array[int],
-    bias: RowBias,
-):
-    """Populate the free rigid bodies' speed rows, their linear and angular velocity limits.
-
-    A speed row's Jacobian is the unit vector of the first DOF of the velocity it bounds (``e_0`` for the linear
-    velocity, ``e_3`` for the angular one); the sweeps read the row's three DOFs from there, and its effective mass
-    converts the speed correction into the impulse the row stores. Its diagonal is that axis walked as a velocity
-    limit's covector at its coordinate (:data:`read_row_unit`, :data:`walk_body_row`), ``|L^-1 P e_k|^2 + cfm``; its
-    ``Z`` then holds the axis unwhitened, and its incident velocity is zero: the speed law reads the body's velocity
-    through its factor, not a row. ``mf_phi`` holds the limit; its rhs is the row law's (:func:`.row_kernels.row_bias`).
-    """
-    candidate = wp.tid()
+    A speed row's seed is a covector at the body's root: the unit vector of the first DOF of the velocity it bounds
+    (``e_0`` for the linear velocity, ``e_3`` for the angular one), a velocity limit's unit source. Its diagonal is that
+    axis walked (:data:`read_row_unit`, :data:`walk_body_row`), ``|L^-1 P e_k|^2 + cfm``; its ``Z`` then holds the axis
+    unwhitened and its incident velocity is zero: the speed law reads the body's velocity through its factor, not a
+    row, from the row's three DOFs, and its effective mass converts the speed correction into the impulse the row
+    stores. ``mf_phi`` holds the limit; its rhs is the row law's (:func:`.row_kernels.row_bias`)."""
     body = bodies.free_rigid_body_indices[candidate]
     art = bodies.body_to_articulation[body]
     if art < 0:
@@ -1660,7 +1651,7 @@ def populate_rigid_velocity_limit_rows(
 
     base = RIGID_SPEED_ROWS * candidate
     for speed_axis in range(RIGID_SPEED_ROWS):
-        slot = rigid_velocity_limit_slot[base + speed_axis]
+        slot = speed_slot[base + speed_axis]
         if slot < 0:
             continue
         limit = bodies.max_linear_velocity[body]
@@ -1686,6 +1677,31 @@ def populate_rigid_velocity_limit_rows(
         sink.entries[line, slot, k] = 1.0
         sink.row_incident[line, row] = 0.0
         row_bias(rows, bias, line, row, 0.0)
+
+
+@wp.kernel(enable_backward=False, launch_bounds=WRITERS["free_body"].bounds)
+def write_free_body_rows(
+    sink: RowSink,
+    rows: DenseRows,
+    data: ContactInput,
+    law: PatchRowLaw,
+    bodies: FreeBodies,
+    speed_slot: wp.array[int],
+    speed_bodies: int,
+    threads: int,
+    bias: RowBias,
+):
+    """The free bodies' rows (``mf_Z``, each side's six of a row's twelve), once their families' slots are reserved:
+    ``threads`` lanes stride over their units, the step's contacts (:func:`free_body_contact_rows`, those the
+    allocation routed to the free bodies), then the ``speed_bodies`` free rigid bodies' speed rows
+    (:func:`free_body_speed_rows`). Every unit's seeds walk into the free-body sink with the row law after the walk; a
+    unit's rows are its own, so the stride changes no row."""
+    contacts = data.count[0]
+    for item in range(wp.tid(), contacts + speed_bodies, threads):
+        if item < contacts:
+            free_body_contact_rows(sink, rows, data, law, bias, item)
+        else:
+            free_body_speed_rows(bodies, rows, sink, speed_slot, bias, item - contacts)
 
 
 def free_body_sink(solver) -> RowSink:

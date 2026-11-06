@@ -265,7 +265,7 @@ def allocate_rigid_velocity_limit_slots(
     mass velocity and the angular velocity: ``[v, omega]``. PhysX's
     ``maxLinearVelocity`` and ``maxAngularVelocity`` bound their magnitudes,
     ``|v| <= limit`` and ``|omega| <= limit``, so each finite limit owns one
-    speed row (:func:`.walk_rows.populate_rigid_velocity_limit_rows`) that the sweeps
+    speed row (:func:`.walk_rows.free_body_speed_rows`) that the sweeps
     project onto that ball, along the current velocity.
 
     ``velocity_limit_activation_fraction`` proximity-gates the allocation,

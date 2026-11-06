@@ -46,7 +46,7 @@ from .forest_plan import ForestPlan, RowLaw
 from .friction_patches import _FrictionPatchState as FrictionPatchState
 from .friction_patches import patch_row_law
 from .joint_table import bind as bind_joint_table
-from .joint_table import bind_free_bodies
+from .joint_table import FreeBodies, bind_free_bodies
 from .kernel_template import KernelTemplate, items, params
 from .route_table import Laws
 from .row_kernels import (
@@ -638,7 +638,8 @@ class RowLaws:
     # glued to that sequence. The stage list (:func:`.step_plan._stages`) runs the families a class holds, in this
     # order: :meth:`begin`, :meth:`write_mimics`, :meth:`write_links`, :meth:`prepare_fused_limits`,
     # :meth:`write_limits`, :meth:`bound_phase` (0), :meth:`write_velocity_limits`, :meth:`bound_phase` (1),
-    # :meth:`write_contacts`, :meth:`bound_free_body_contacts`, :meth:`write_free_body_limits`, :meth:`finalize_dense`
+    # :meth:`write_contacts`, :meth:`bound_free_body_contacts`, :meth:`allocate_free_body_limits`,
+    # :meth:`write_free_bodies`, :meth:`finalize_dense`
     # and the keyed rows' finish.
     #
     # Dense row-family layout: slots are handed out in the order [mimic][joint-limit][joint-velocity-limit]
@@ -768,9 +769,9 @@ class RowLaws:
     def write_contacts(
         self, solver, state_in: State, state_aug: State, contacts: Contacts, dt: float, producer: str
     ) -> None:
-        """The contact rows' slots (their unit sources, the one writer's seeds) and the free bodies' contact rows
-        (their counts finalized with status), after the joint families; the keyed rows' contacts where the tiers hold
-        them.
+        """The contact rows' slots, after the joint families: the dense rows' unit sources (the one writer's seeds) and
+        the free bodies' slots (their writer's, :meth:`write_free_bodies`); the keyed rows' contacts where the tiers
+        hold them.
 
         Args:
             solver: The solver whose step this is: its model, options, plan and primitives.
@@ -807,12 +808,9 @@ class RowLaws:
 
             self._build_friction_patches(solver, state_in, contacts)
 
-            # The allocator and the producers read the contacts, the bodies and the row law, and write the
-            # contacts' allocation records and their row records, through one struct
-            # (contact_input.ContactInput), bound for this step.
+            # The allocator and the keyed rows read the contacts, the bodies and the row law, and write the
+            # contacts' allocation records, through one struct (contact_input.ContactInput), bound for this step.
             contact_input = bind_contact_input(solver, state_in, state_aug, contacts, dt, 1.0)
-            # The friction row law every producer writes: point friction is the patch law with beta 0.
-            law = patch_row_law(solver)
 
             # The route's producer writes every contact row (get_path_selection() records it, routes.contact_rows).
             # The one writer's contact rows are its own to fill: their unit sources are written where their slots are
@@ -864,78 +862,16 @@ class RowLaws:
             if producer == "keyed_rows":
                 solver.placement.keyed_rows.produce_contacts(contact_input)
 
-            # The free bodies' contact rows, by the walk (walk_rows): a class with free bodies always walks, on the
-            # walkers' threads at its own line (walk_rows.WRITERS): a contact's rows are its own, so the stride
-            # changes no row.
-            if mf_active:
-                walker_threads = walk_rows.support_threads(rows, solver.model.device, walk_rows.WRITERS["free_body"])
-                pool.launch(
-                    walk_rows.write_free_body_rows,
-                    walker_threads,
-                    inputs=[
-                        walk_rows.free_body_sink(solver),
-                        bind_dense_rows(solver.placement),
-                        contact_input,
-                        walker_threads,
-                        law,
-                        self.bias(solver.options, dt),
-                    ],
-                    extent=count,
-                    clamp=True,
-                )
-
-            if mf_active:
-                self._finalize(solver, 1)
-
-                # ── MF warm-start seed ────────────────────────────────────
-                # contact_slot + mf_row_type are now populated for THIS step.
-                # mf_impulses was already memset at the top of this method
-                # (covers vel-limit rows, padding tail, friction rows, and any
-                # contact that returns early in the gather); here we gather matched
-                # contacts' previous normal impulses into their current slots by
-                # identity. The carry itself is the row store's (ws_prev_dense_*),
-                # whose rows the free bodies' slots index.
-                if solver.options.pgs_warmstart:
-                    match_index = getattr(contacts, "rigid_contact_match_index", None)
-                    if match_index is None:
-                        raise NotImplementedError(
-                            "FeatherPGS mf_warmstart=True requires the Contacts buffer to be "
-                            "created with contact_matching enabled (rigid_contact_match_index "
-                            "is None). Build the CollisionPipeline / Contacts with "
-                            'contact_matching="latest" (or "sticky").'
-                        )
-                    pool.launch(
-                        gather_mf_warmstart,
-                        rows,
-                        inputs=[
-                            bind_contact_routes(solver.placement, contacts),
-                            bind_mf_rows(solver.placement),
-                            match_index,
-                            solver.placement.ws_prev_slot_sorted,
-                            solver.placement.ws_prev_dense_impulses,
-                            solver.placement.ws_prev_dense_row_type,
-                            solver.placement.mf_constraint_count,
-                            solver.placement.ws_prev_contact_normal,
-                            solver.options.pgs_warmstart_decay,
-                            # Carried support impulses are proportional to dt: the step clock rescales them.
-                            solver.factor.clock,
-                            solver.placement.mf_max_constraints,
-                        ],
-                        outputs=[solver.placement.impulses],
-                        extent=count,
-                        max_blocks=solver.placement.contact_capacity_blocks,
-                    )
-
     def bound_free_body_contacts(self, solver) -> None:
         """Record where the free bodies' contact rows end: every contact and friction row precedes the velocity-limit
         rows in the matrix-free slots, so the sweeps loop the contact prefix in the contact phases and the limits' tail
         in the velocity-limit phase (staged with free bodies)."""
         wp.copy(solver.placement.mf_contact_rows_end, solver.placement.mf_slot_counter)
 
-    def write_free_body_limits(self, solver, dt: float) -> None:
-        """The free bodies' speed limits as matrix-free rows, not post-solve clamps: allocated after the contacts so
-        they hold the last free-body slots, which the sweeps visit in a final phase with the joints' velocity limits;
-        then the free-body counts finalized again (staged with free bodies that carry speed-limit slots)."""
+    def allocate_free_body_limits(self, solver) -> None:
+        """The free bodies' speed limits as matrix-free rows, not post-solve clamps: their slots, reserved after the
+        contacts' so they hold the last free-body slots, which the sweeps visit in a final phase with the joints'
+        velocity limits (staged with free bodies that carry speed-limit slots)."""
         placement, model = solver.placement, solver.model
         # Without articulation metadata no root is a free rigid body's, so the kernel reads no root's first DOF.
         root_dof_start = solver.forest.articulation_root_dof_start
@@ -956,19 +892,76 @@ class RowLaws:
             outputs=[placement.rigid_velocity_limit_slot, placement.mf_slot_counter, placement.mf_first_rejected_slot],
             device=model.device,
         )
+
+    def write_free_bodies(self, solver, state_in: State, contacts: Contacts | None, dt: float) -> None:
+        """The free bodies' rows, once their families' slots are reserved (staged with free bodies): one writer over
+        their contacts' rows and their speed rows (:func:`.walk_rows.write_free_body_rows`), on its threads at its own
+        line (:data:`.walk_rows.WRITERS`); their counts finalized with status; then the warm start's seed of their
+        contact normals, which reads the rows' types."""
+        placement, model = solver.placement, solver.model
+        contact_rows = _holds_contact_rows(contacts)
+        if contact_rows:
+            data = bind_contact_input(solver, state_in, solver.factor, contacts, dt, 1.0)
+            rows = placement.contact_pool.launch_rows()
+        else:
+            # No contact: the writer reads only the count, zero.
+            data, rows = ContactInput(), 0
+            data.count = placement.dummy_contact_count
+        speed = placement.rigid_velocity_limit_slot is not None
+        speed_bodies = solver.forest.free_rigid_body_count if speed else 0
+        threads = walk_rows.support_threads(rows + speed_bodies, model.device, walk_rows.WRITERS["free_body"])
         wp.launch(
-            walk_rows.populate_rigid_velocity_limit_rows,
-            dim=solver.forest.free_rigid_body_count,
+            walk_rows.write_free_body_rows,
+            dim=threads,
             inputs=[
-                bind_free_bodies(solver),
-                bind_dense_rows(placement),
                 walk_rows.free_body_sink(solver),
-                placement.rigid_velocity_limit_slot,
+                bind_dense_rows(placement),
+                data,
+                patch_row_law(solver),
+                bind_free_bodies(solver) if speed else FreeBodies(),
+                placement.rigid_velocity_limit_slot if speed else placement.dummy_is_free_rigid,
+                speed_bodies,
+                threads,
                 self.bias(solver.options, dt),
             ],
+            block_dim=walk_rows.WRITERS["free_body"].block,
             device=model.device,
         )
         self._finalize(solver, 1)
+
+        # The warm start's seed: the matched contacts' previous normal impulses gathered into their current slots by
+        # identity (the impulses were zeroed for the step; the carry is the row store's, ws_prev_dense_*, whose rows
+        # the free bodies' slots index). It reads this step's contact slots and the rows' types the writer wrote.
+        if contact_rows and solver.options.pgs_warmstart:
+            match_index = getattr(contacts, "rigid_contact_match_index", None)
+            if match_index is None:
+                raise NotImplementedError(
+                    "FeatherPGS mf_warmstart=True requires the Contacts buffer to be "
+                    "created with contact_matching enabled (rigid_contact_match_index "
+                    "is None). Build the CollisionPipeline / Contacts with "
+                    'contact_matching="latest" (or "sticky").'
+                )
+            placement.contact_pool.launch(
+                gather_mf_warmstart,
+                rows,
+                inputs=[
+                    bind_contact_routes(placement, contacts),
+                    bind_mf_rows(placement),
+                    match_index,
+                    placement.ws_prev_slot_sorted,
+                    placement.ws_prev_dense_impulses,
+                    placement.ws_prev_dense_row_type,
+                    placement.mf_constraint_count,
+                    placement.ws_prev_contact_normal,
+                    solver.options.pgs_warmstart_decay,
+                    # Carried support impulses are proportional to dt: the step clock rescales them.
+                    solver.factor.clock,
+                    placement.mf_max_constraints,
+                ],
+                outputs=[placement.impulses],
+                extent=contacts.rigid_contact_count,
+                max_blocks=placement.contact_capacity_blocks,
+            )
 
     def _finalize(self, solver, family: int) -> None:
         """Finalize a row class's counts with status (0: the dense rows, 1: the free bodies')."""

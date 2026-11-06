@@ -533,7 +533,8 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
 
     # Stage 4: the rows. The resolved-world claim, the row pass (each family's slots and seeds), the status and the
     # overflow warning; then the diagonals, the one writer (every walking class's: it walks the rows into their
-    # placement's sink after the row pass, each row's rhs by the row law; the free bodies' writer runs in the row pass),
+    # placement's sink after the row pass, each row's rhs by the row law; the free bodies' writer runs in the row pass,
+    # after their families' slots, beside the topology part),
     # the patches' link once every contact row's records are written, and the sweep's claims, which read the rows.
     resolved = sweep.resolved_worlds_owner
 
@@ -577,8 +578,11 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     def bound_free_body_contacts(step):
         laws.bound_free_body_contacts(solver)
 
-    def write_free_body_limits(step):
-        laws.write_free_body_limits(solver, step.dt)
+    def allocate_free_body_limits(step):
+        laws.allocate_free_body_limits(solver)
+
+    def write_free_bodies(step):
+        laws.write_free_bodies(solver, step.state_in, step.contacts, step.dt)
 
     def finalize_dense(step):
         laws.finalize_dense(solver)
@@ -613,10 +617,11 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         write_contacts,
         *((bound_free_body_contacts,) if forest.has_free_rigid_bodies else ()),
         *(
-            (write_free_body_limits,)
+            (allocate_free_body_limits,)
             if forest.has_free_rigid_bodies and placement.rigid_velocity_limit_slot is not None
             else ()
         ),
+        *((write_free_bodies,) if forest.has_free_rigid_bodies else ()),
         finalize_dense,
         *((finish_keyed,) if keyed else ()),
     )
