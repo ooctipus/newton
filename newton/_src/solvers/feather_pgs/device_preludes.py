@@ -465,6 +465,42 @@ CPU_MATH = DevicePrelude(
 ``fmaxf`` are Warp's ``wp::min`` and ``wp::max`` there, the same up to the sign of a zero; ``atomicOr`` is a plain
 ``|=`` of the one thread that runs the block; ``int4`` is a struct of four ints. CUDA has its own."""
 
+CPU_WORDS = DevicePrelude(
+    "cpu_words",
+    "    // CUDA's integer minimum and maximum and vector types: the device's own.",
+    """    // CUDA's words the case bodies read on the CPU beyond CPU_MATH: the integer minimum and maximum, float4,
+    // make_int4 (CPU_MATH's int4) and the one thread's atomicMin.
+    const auto min = [](auto a, auto b) { return b < a ? b : a; };
+    const auto max = [](auto a, auto b) { return a < b ? b : a; };
+    struct float4 { float x, y, z, w; };
+    const auto make_int4 = [](int x, int y, int z, int w) -> int4 { return int4{x, y, z, w}; };
+    const auto atomicMin = [](int* word, int value) -> int {
+        const int old = *word;
+        if (value < old) *word = value;
+        return old;
+    };""",
+)
+"""CUDA's ``min``, ``max``, ``float4``, ``make_int4`` and ``atomicMin`` on the CPU, after :data:`CPU_MATH` (its
+``int4``), for the case bodies a lane group of one lane runs (:func:`group_native`): ``atomicMin`` is the one thread's
+plain minimum. CUDA has its own."""
+
+
+def group_native(body: str, *, preludes: tuple[DevicePrelude, ...], lanes: int) -> str:
+    """Return a ``func_native`` snippet of a body over a lane group of ``lanes`` lanes.
+
+    A group of one lane is the CPU's (:func:`.execution.device_lanes`): its body runs on both devices
+    (:func:`dual_native`, with :data:`CPU_MATH` and :data:`CPU_WORDS`). A wider group is CUDA's: its body is CUDA's
+    only (:func:`cuda_native`, which closes its guard).
+
+    Args:
+        body: Native statements after the preludes, without a closing ``#endif``.
+        preludes: Device preludes the body declares, in the order they are defined.
+        lanes: The body's lane group.
+    """
+    if lanes == 1:
+        return dual_native(body, preludes=(*preludes, CPU_MATH, CPU_WORDS))
+    return cuda_native(body + "#endif\n", preludes=preludes)
+
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Patch rings

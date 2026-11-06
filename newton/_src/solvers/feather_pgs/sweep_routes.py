@@ -17,7 +17,7 @@ import warp as wp
 from ...core.execution import Work, device_lanes, shape
 from ...core.memory import REGISTERS_PER_THREAD, Buffer, Place, Staging, arch_budget, built_for
 from . import kernel_template, sweep_units
-from .device_preludes import CPU_MATH, RING, SHARED_STORAGE, cuda_native, dual_native, lane_group
+from .device_preludes import RING, SHARED_STORAGE, group_native, lane_group
 from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
@@ -989,9 +989,7 @@ def mf_gs_source(
         *solve_policy.preludes,
         FREE_BODY_WALKS,
     )
-    if lanes == 1:
-        return dual_native(body, preludes=(*preludes, CPU_MATH)), staging
-    return cuda_native(body + "#endif\n", preludes=preludes), staging
+    return group_native(body, preludes=preludes, lanes=lanes), staging
 
 
 @cache
