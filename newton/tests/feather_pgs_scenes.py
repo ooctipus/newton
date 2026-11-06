@@ -1011,7 +1011,7 @@ def gripper(
     )
 
 
-def keyboard(*, keys: int = 8, press: float = 0.003, worlds: int = 2) -> Scene:
+def keyboard(*, keys: int = 8, press: float = 0.003, worlds: int = 2, contact_matching: str | None = None) -> Scene:
     """A fixed frame of ``keys`` prismatic keys (a diagonal-mass articulation) and a six-coordinate arm pressing key 0.
 
     Keys hang on ``z`` prismatic joints held by PD drives inside a 1 cm travel.
@@ -1085,7 +1085,7 @@ def keyboard(*, keys: int = 8, press: float = 0.003, worlds: int = 2) -> Scene:
             )
 
     return Scene(
-        "keyboard",
+        "keyboard" if contact_matching is None else f"keyboard_{contact_matching}",
         build,
         dt=1.0 / 240.0,
         steps=160,
@@ -1093,6 +1093,7 @@ def keyboard(*, keys: int = 8, press: float = 0.003, worlds: int = 2) -> Scene:
         solver_options={"enable_joint_limits": True},
         control=control,
         tags=frozenset({"articulated_contact", "diagonal_mass"}),
+        contact_matching=contact_matching,
     )
 
 

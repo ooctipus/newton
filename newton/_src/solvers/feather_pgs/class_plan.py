@@ -231,7 +231,6 @@ def _fused_diagonal_limits(inputs: ClassInputs) -> tuple[frozenset[int], np.ndar
         and options.enable_joint_limits
         and options.enable_contact_friction
         and not options.enable_joint_velocity_limits
-        and not options.pgs_warmstart
         and not forest.has_free_rigid_bodies
         and laws.mimic_count == 0
         and laws.link_count == 0

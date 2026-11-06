@@ -439,6 +439,7 @@ class Sweep:
                 speculative_contact_batches=diagonal.speculative_batches,
                 contact_units=diagonal.units,
                 torsion=self.laws.spin_rows,
+                seeded=self.seeded,
             )
             if diagonal is not None
             else None

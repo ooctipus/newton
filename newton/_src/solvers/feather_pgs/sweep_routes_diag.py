@@ -47,6 +47,7 @@ from .sweep import (
     friction_metric,
     friction_metric_law,
     friction_metric_stage,
+    impulse_seed,
     indent,
     level_loop,
     material_arguments,
@@ -335,14 +336,16 @@ def sparse_diagonal_source(
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
+    seeded: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the sparse-diagonal Gauss-Seidel sweep: one warp per world.
 
     Every sweep runs the world's fused diagonal joint limits (one lane per coordinate), then its independent scalar
     contacts (a level at a time, one lane per contact: a contact whose coordinate no coupled row touches commutes with
     the coupled rows, and its one-product residual rounds as the warp's sum of it does), then the coupled rows in row order with
-    :func:`slot_rows`' warp layout, all on the velocity change in factor coordinates, from zero (left once before
-    it is added to the predictor). ``contact_units`` schedules the contacts (a normal, and its
+    :func:`slot_rows`' warp layout, all on the velocity change in factor coordinates, from zero, or with ``seeded``
+    from the response of the impulses the rows carry (:func:`.sweep.impulse_seed`: the warm start's; the fused limits
+    start from zero), left once before it is added to the predictor. ``contact_units`` schedules the contacts (a normal, and its
     tangent pair only when it owns an anchor): it skips an independent contact in the serial order and a pair whose patch carries no load. Every schedule, the plain
     one at a normal row that owns the tangent pair after it, solves a loaded coupled contact unit by the unit law
     (:func:`.sweep.contact_unit`) and visits an unloaded one, and a level's contacts, row by row: a level runs one lane
@@ -589,6 +592,12 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
             + friction_metric_law("ROW_TRIPLE", friction_metric, "    ")
             + "\n"
         )
+    # The impulses the rows carry into the first sweep, row by row in slot order through both slots and the dense part
+    # (a marked slot names no coordinate), as the general sweep's seed.
+    seed = ""
+    if seeded:
+        apply = pair_op.axpy((("row", "seed"),), "        ", row="i")
+        seed = impulse_seed("row_count", rows.peek("i"), f"({rows.kind('i', scan=True)})", apply, warp.sync()) + "\n"
     # The phase bound is the raw slot watermark: consumers clamp it to the world's rows.
     contact_start = "min(dense_phase_bounds.data[world * 2 + 1], row_count)" if scheduled else "row_count"
     body = f"""    const int line = dense_first.data[world];
@@ -613,7 +622,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     for (int d = lane; d < {D}; d += 32) s_v[d] = 0.0f;
 {limit_loads}
     SYNC();
-{metric}
+{seed}{metric}
 {level_loop((limit_rows, "        SYNC();", independent_phase, serial), exit=sweep_end)}
 
     for (int i = lane; i < row_count; i += 32) world_impulses.data[off_dense + i] = {rows.peek("i")};
@@ -656,6 +665,7 @@ def sparse_diagonal_kernel(
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
+    seeded: bool = False,
 ) -> wp.Kernel:
     """The sparse-diagonal sweep kernel; weighted rows (:func:`.sweep.weight_arguments`) and material contacts
     (:func:`.sweep.material_arguments`) add their operands."""
@@ -669,6 +679,7 @@ def sparse_diagonal_kernel(
         solve_policy=solve_policy,
         weighted=weighted,
         material=material,
+        seeded=seeded,
     )
     staging.check("the sparse-diagonal sweep", arch_budget(device_arch))
     name = (
@@ -678,6 +689,7 @@ def sparse_diagonal_kernel(
         + ("_weighted" if weighted else "")
         + ("_material" if material else "")
         + ("_torsion" if torsion else "")
+        + ("_seeded" if seeded else "")
         + solve_policy.suffix
     )
     extra = (

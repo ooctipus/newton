@@ -587,7 +587,7 @@ def census_calls():
             "sweep_routes_diag.sparse_diagonal_kernel",
             sweep_routes_diag.sparse_diagonal_kernel,
             ((64, 10, 9, ARCH),),
-            (_axis("speculative_contact_batches"), _axis("contact_units")),
+            (_axis("speculative_contact_batches"), _axis("contact_units"), _axis("seeded")),
         ),
         (
             "sweep_routes_tiers.parallel_kernel",

@@ -1631,6 +1631,15 @@ def cuda_groups() -> list:
                 KEYED_PARALLEL.but("keyed_parallel_warm_start", options=_WARM),
             ),
         ),
+        # The sparse diagonal starts from the impulses the warm start carries, its fused limits from zero (case K2).
+        Group(
+            _physics(scenes.keyboard(contact_matching="latest"), "patch", 16),
+            ref,
+            (
+                SPARSE_DIAGONAL.but("sparse_diagonal_warm_start", options=_WARM),
+                SPARSE_DIAGONAL_TREE.but("sparse_diagonal_tree_warm_start", options=_WARM),
+            ),
+        ),
         # The paired factor sweep and its components start from the impulses the warm start carries (case K5).
         Group(
             _physics(scenes.hand(contact_matching="latest"), "patch", 16),
