@@ -36,7 +36,7 @@ sweep's operator and layout reproduces its results.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import ClassVar, Protocol
 
 import warp as wp
@@ -1400,6 +1400,22 @@ def end_sweep(
         iteration=iteration,
         iterations=iterations,
         argmax=argmax,
+    )
+
+
+ITERATION = "iter"
+"""The sweep counter of :func:`level_loop`, as the exit law reads it (:func:`end_sweep`'s ``iteration``)."""
+
+
+def level_loop(phases: Sequence[str], last_word: Sequence[str] = (), *, exit: str) -> str:
+    """The iteration frame of every Gauss-Seidel sweep: per sweep, no change voted yet (``iteration_changed``), the
+    schedule's phases in order, the last word (the rows sorted last: velocity limits, the free bodies' speed rows),
+    then the exit law (``exit``: :func:`end_sweep` at :data:`ITERATION`), which ends the loop once a sweep is quiet."""
+    body = "\n".join(text.rstrip("\n") for text in (*phases, *last_word) if text.strip())
+    return (
+        f"    for (int {ITERATION} = 0; {ITERATION} < iterations; ++{ITERATION}) {{\n"
+        "        int iteration_changed = 0;\n"
+        f"{body}\n{exit.rstrip(chr(10))}\n    }}"
     )
 
 

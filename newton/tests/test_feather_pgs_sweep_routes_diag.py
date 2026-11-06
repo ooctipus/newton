@@ -129,7 +129,7 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
             self.assertIn("rhs_bias.data[off_dense + (i)] + row_incident.data[off_dense + (i)]", text)
             self.assertIn("v_out.data[global_dof] += diagonal_scale > 0.0f ? s_v[d] * diagonal_scale : s_v[d];", text)
             self.assertIn("sqrtf(diagonal_inverse_mass.data[global_dof])", text)
-            self.assertLess(text.index("for (int iteration = 0;"), text.index("walk.du.data[global_dof] += s_v[d];"))
+            self.assertLess(text.index("for (int iter = 0;"), text.index("walk.du.data[global_dof] += s_v[d];"))
             self.assertNotIn("WALK_DOWN", text)
 
 

@@ -29,6 +29,7 @@ from .row_inputs import RowArgument
 from .solve_policy import DEFAULT_POLICY, SolvePolicy
 from .sweep import (
     FRICTION,
+    ITERATION,
     TORSION,
     UNIT_HELD,
     Diagonal,
@@ -42,6 +43,7 @@ from .sweep import (
     friction_metric_law,
     friction_metric_stage,
     indent,
+    level_loop,
     material_arguments,
     pair_radius,
     pair_update,
@@ -248,10 +250,7 @@ def paired_factor_source(
     float {op.velocity.array} = 0.0f;
     SYNC();
 {metric}
-    for (int iter = 0; iter < iterations; ++iter) {{
-        int iteration_changed = 0;
-{indent(schedule, "        ")}
-{end_sweep(solve_policy, iteration="iter")}    }}
+{level_loop((indent(schedule, "        "),), exit=end_sweep(solve_policy, iteration=ITERATION))}
 
 {leave}
 {staging.undefine()}

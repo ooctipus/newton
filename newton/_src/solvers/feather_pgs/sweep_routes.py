@@ -30,6 +30,7 @@ from .solve_policy import DEFAULT_POLICY, QUIET_LITERAL, SolvePolicy, block_argm
 from .sweep import (
     CONTACT,
     FRICTION,
+    ITERATION,
     SPEED,
     VELOCITY_LIMIT,
     Diagonal,
@@ -46,6 +47,7 @@ from .sweep import (
     friction_metric_stage,
     impulse_seed,
     indent,
+    level_loop,
     material_arguments,
     rows_block,
     speed_rows_pass,
@@ -791,7 +793,7 @@ def mf_gs_source(
         sweep_end = sweep_exit(
             solve_policy,
             quiet=quiet,
-            iteration="iter",
+            iteration=ITERATION,
             lane="tid",
             argmax="BLOCK_ARGMAX",
         )
@@ -809,7 +811,7 @@ def mf_gs_source(
             f"\n    const int off_color = unit_slot * {units + 1};"
         )
     else:
-        sweep_end = end_sweep(solve_policy, iteration="iter")
+        sweep_end = end_sweep(solve_policy, iteration=ITERATION)
         head = "    const int lane = LANE;"
         first_warp = end_first_warp = ""
         barrier = "SYNC();"
@@ -862,6 +864,15 @@ def mf_gs_source(
         }}
         if ({"!__syncthreads_or(velocity_moved != 0)" if colored else "BALLOT(velocity_moved != 0) == 0u"}) iteration_changed = 0;
 """
+    dense_phase = rows_block(dense, dense_op, laws, admission=_DENSE_ADMISSION, metric=dense_metric, pad="        ")
+    sweeps = level_loop(
+        (
+            f"{first_warp}{dense_phase}\n{end_first_warp}" + ("        __syncthreads();" if colored else ""),
+            indent(free_phase, "    "),
+        ),
+        (f"{first_warp}{chr(10).join(passes)}\n{end_first_warp}",),
+        exit=sweep_vote + sweep_end,
+    )
     # The way back after the sweeps: the change in the walk's coordinates to the step's one leave (WalkTrees.du,
     # factor.walk.walk_leave_kernel).
     body = f"""{head}
@@ -897,15 +908,7 @@ def mf_gs_source(
 {end_first_warp}    {barrier}
 {seed}{first_warp}{metric_stage}{end_first_warp}{metric_build}
 
-    for (int iter = 0; iter < iterations; iter++) {{
-        int iteration_changed = 0;
-
-{first_warp}{rows_block(dense, dense_op, laws, admission=_DENSE_ADMISSION, metric=dense_metric, pad="        ")}
-{end_first_warp}{"        __syncthreads();" + chr(10) if colored else ""}
-{indent(free_phase, "    ")}
-
-{first_warp}{chr(10).join(passes)}
-{end_first_warp}{sweep_vote}{sweep_end}    }}
+{sweeps}
 
     {barrier}
 {first_warp}    for (int d = lane; d < {D}; d += STRIDE) {{

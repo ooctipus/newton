@@ -51,6 +51,7 @@ from .sparse_mass_matrix import _SparseRowSupport
 from .sweep import (
     CONTACT,
     FRICTION,
+    ITERATION,
     JOINT_LIMIT,
     TORSION,
     UNIT_HELD,
@@ -66,6 +67,7 @@ from .sweep import (
     friction_triple_visit,
     impulse_seed,
     indent,
+    level_loop,
     material_arguments,
     row_step,
     unit_held_loads,
@@ -712,11 +714,14 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
 {unit}
 {update}
         }}"""
-    triples = triple_phase(sweep, rows, op, laws, "        ") + "\n" if sweep.torsion else ""
+    triples = triple_phase(sweep, rows, op, laws, "        ") if sweep.torsion else ""
     passes = ""
     if sweep.velocity_limits:
         passes = velocity_limit_pass(rows, op, laws, end="count", pad="        ")
-    exit_ = end_sweep(sweep.policy, iteration="iter", violation=active_violation(sweep, op) if sweep.active else None)
+    exit_ = end_sweep(
+        sweep.policy, iteration=ITERATION, violation=active_violation(sweep, op) if sweep.active else None
+    )
+    sweeps = level_loop((*scan, row_loop, triples), (passes,), exit=exit_)
     body = f"""    const int lane = LANE;
     const int line = dense_first.data[world];
     __builtin_assume(line >= 0);
@@ -730,12 +735,7 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
 {rows.loads("    ")}
 {chr(10).join(setup)}
 
-    for (int iter = 0; iter < iterations; ++iter) {{
-        int iteration_changed = 0;
-{chr(10).join(scan)}
-{row_loop}
-{triples}{passes}
-{exit_}    }}
+{sweeps}
 
     for (int d = lane; d < {D}; d += {L}) factor_velocity_delta.data[world * {D} + d] = s_delta[d];
 {rows.stores("    ")}

@@ -33,6 +33,7 @@ from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound
 from .sweep import (
     CONTACT,
     FRICTION,
+    ITERATION,
     JOINT_LIMIT,
     TORSION,
     Diagonal,
@@ -47,6 +48,7 @@ from .sweep import (
     friction_metric_law,
     friction_metric_stage,
     indent,
+    level_loop,
     material_arguments,
     row_visit,
     weight_arguments,
@@ -516,7 +518,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
         f"{P};\nconst float diagonal_scale = !dense_coordinate && global_dof >= 0\n"
         "    ? sqrtf(diagonal_inverse_mass.data[global_dof]) : 0.0f;"
     )
-    sweep_end = end_sweep(solve_policy, iteration="iteration")
+    sweep_end = end_sweep(solve_policy, iteration=ITERATION)
     # Where spin rows may appear, every friction triple's metric is formed once per launch, at its first loaded visit
     # (sweep.friction_metric_stage), and its later visits only project.
     metric = ""
@@ -558,15 +560,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
 {limit_loads}
     SYNC();
 {metric}
-    for (int iteration = 0; iteration < iterations; ++iteration) {{
-        int iteration_changed = 0;
-
-{limit_rows}
-        SYNC();
-{independent_phase}
-{serial}
-
-{sweep_end}    }}
+{level_loop((limit_rows, "        SYNC();", independent_phase, serial), exit=sweep_end)}
 
     for (int i = lane; i < row_count; i += 32) world_impulses.data[off_dense + i] = {rows.peek("i")};
     SYNC();
