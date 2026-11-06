@@ -88,8 +88,8 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
         # so no visit reads row metadata; the second tangent is only zeroed while friction waits. A unit has a pair
         # only when it owns an anchor.
         for text in (units,):
-            self.assertRegex(text, r"const int i = head;\s+const int row_type = 0;")
-            self.assertRegex(text, r"const int i = head \+ 1;\s+const int row_type = 2;")
+            self.assertRegex(text, r"const int i = head;\s+int row_type = 0;")
+            self.assertRegex(text, r"const int i = head \+ 1;\s+int row_type = 2;")
             self.assertIn("parent = head;", text)
             self.assertNotIn("pair_visits", text)
         self.assertIn("if (head + 2 < row_count", units)
@@ -112,7 +112,7 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
                 "z_tangent2[q] * unit_dt2);",
                 text,
             )
-            self.assertLess(text.index(loaded), text.rindex("const int row_type = s_meta_dense[i]"))
+            self.assertLess(text.index(loaded), text.rindex("int row_type = s_meta_dense[i]"))
         for text in (units,):
             start = text.index("const int independent_group_count")
             chains = text[start : text.index("SYNC();", start)]

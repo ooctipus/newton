@@ -35,7 +35,6 @@ from .sweep import (
     FRICTION,
     ITERATION,
     JOINT_LIMIT,
-    TORSION,
     Diagonal,
     RowContext,
     RowLaws,
@@ -51,7 +50,7 @@ from .sweep import (
     indent,
     level_loop,
     material_arguments,
-    row_visit,
+    row_step,
     weight_arguments,
 )
 
@@ -315,54 +314,19 @@ def sparse_diagonal_source(
 
     warp = Lanes(32)
     laws = RowLaws(regularize=weighted, material=material, policy=solve_policy, torsion=torsion)
-    rows = WorldRows(M, lanes=warp)
+    # Every lane (or a chain's one thread) stores what it computed and reads its own stores.
+    rows = WorldRows(M, lanes=warp, every_lane=True)
     staging = Staging((Buffer("s_v", "float", D), *rows.buffers()), threads=32)
-
-    def context(lanes: Lanes, *, friction: bool = True) -> RowContext:
-        """The rows' context in a layout at row ``i``: the warp's (every lane stores, the warp synchronizes after the
-        apply) or one thread's (an independent scalar contact on ``scalar_coord``)."""
-        return RowContext(
-            row="i",
-            kind="row_type",
-            operator=slot_rows(P, M, lanes) if lanes.parallel else SCALAR_ROWS,
-            diagonal=Diagonal(lambda row: "denom" if row == "i" else rows.diag(row)),
-            load=rows.peek,
-            store=lambda row, value: f"{rows.peek(row)} = {value};",
-            rhs=rows.rhs_of,
-            mu=rows.mu,
-            weight=rows.weight,
-            eps=rows.eps,
-            parent="parent",
-            ring_load=rows.ring_load,
-            lanes=lanes,
-            inline_velocity_limit=False,
-            # Every lane (or the one thread) stores what it computed.
-            owned=False,
-            friction=friction,
-            spin_row=lambda parent: rows.spin_of(parent, "row_count"),
-            # A friction triple reads its metric cached for the launch (sweep.friction_metric_law).
-            **({"triple_law": "ROW_TRIPLE(parent, "} if torsion else {}),
-        )
+    # A friction triple reads its metric cached for the launch (sweep.friction_metric_law).
+    cached = "ROW_TRIPLE" if torsion else None
 
     def visit(lanes: Lanes, pad: str, *, kind: int | None = None, parent: str | None = None) -> str:
-        """Row ``i``'s visit in a layout (:func:`context`). A ``kind`` (and a friction row's ``parent``) known where the
-        visit is emitted replaces the row's metadata, so the visit compiles to that kind's law; a known kind other than
-        friction admits no pair."""
-        ctx = context(lanes, friction=kind in (None, FRICTION))
-        # A spin row is solved with its friction pair.
-        skip = f"{pad}if (row_type == {TORSION}) continue;\n" if torsion and kind is None else ""
-        return (
-            f"{pad}const int row_type = {rows.kind('i') if kind is None else kind};\n"
-            + skip
-            + row_visit(
-                ctx,
-                laws,
-                parent=rows.parent("i") if parent is None else parent,
-                check="denom",
-                declare=f"const float denom = {rows.diag('i')};",
-                pad=pad,
-            )
-        )
+        """Row ``i``'s row step (:func:`.sweep.row_step`) in a layout: the warp's, or one thread's (an independent
+        scalar contact on ``scalar_coord``). A ``kind`` (and a friction row's ``parent``) known where the visit is
+        emitted replaces the row's metadata."""
+        store = dataclasses.replace(rows, lanes=lanes)
+        op = slot_rows(P, M, lanes) if lanes.parallel else SCALAR_ROWS
+        return row_step(store, op, laws, end="row_count", kind=kind, parent=parent, metric=cached, pad=pad)
 
     pair_op = slot_rows(P, M, warp)
     # A unit's three rows on their shared support: their velocity terms, the pair's couplings with the normal and with
@@ -393,7 +357,7 @@ def sparse_diagonal_source(
     # A contact unit is a normal and its pair: a contact with a spin row declines it, and its rows take their visits,
     # the triple from its cached metric.
     unit_rows = contact_unit(
-        dataclasses.replace(context(warp), operator=UnitZ()),
+        RowContext.of(rows, UnitZ(), end="row_count", metric=cached),
         dataclasses.replace(laws, torsion=False),
         rows="unit_rows",
         declare=f"const int i = head + r;\nconst int row_type = r == 0 ? {CONTACT} : {FRICTION};\n"
