@@ -80,7 +80,7 @@ _SCALED_VOTES = {
     "sparse_diagonal": (
         "fabsf(delta_impulse) * (denom)",
         "fabsf(sib_delta) * (s_diag_dense[sib])",
-        "fabsf(delta_lambda) * (limit_denom)",
+        "fabsf(delta_impulse) * (limit_denom)",
     ),
 }
 

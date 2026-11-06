@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 from functools import cache
+from typing import ClassVar
 
 import warp as wp
 
@@ -26,10 +27,10 @@ from .factor.walk import WalkTrees
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
 from .projection_laws import CONE_LAW, PROJECTION_LAW
-from .response_operator import Lanes, SparseFactor, Velocity
+from .response_operator import Lanes, ResponseOperator, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_metadata import _validate_dense_metadata_encoding
-from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound
+from .solve_policy import DEFAULT_POLICY, SolvePolicy
 from .sweep import (
     CONTACT,
     FRICTION,
@@ -41,7 +42,6 @@ from .sweep import (
     SlotOrder,
     UnitZ,
     WorldRows,
-    change_vote,
     contact_unit,
     end_sweep,
     friction_metric,
@@ -51,6 +51,7 @@ from .sweep import (
     level_loop,
     material_arguments,
     row_step,
+    row_update,
     weight_arguments,
 )
 
@@ -94,16 +95,78 @@ SPARSE_DIAGONAL_ABI = kernel_template.params(
 """The sparse-diagonal sweep's operands (one world per launch item; a readout follows ``v_out``)."""
 
 
+@dataclasses.dataclass(frozen=True)
+class LimitZ(ResponseOperator):
+    """A fused joint-limit row's response on a diagonal coordinate (``coordinate``, of factor ``sqrt(m)``): an
+    unstored whitened row, ``Z = s`` for the lower row (``J = +1``) and ``Z = -s`` for the upper (``J = -1``), with
+    ``s = m^-1/2`` (``scale``); one thread's (the lane that owns the coordinate).
+
+    ``dot`` reduces the coordinate's scaled velocity ``s u``, and a row's velocity term is it with the row's sign
+    (:meth:`term`); ``axpy`` adds or subtracts ``s delta``. These are ``Z = -s``'s products negated exactly, in the
+    form whose machine code is the sweep's."""
+
+    coordinate: str
+    scale: str
+    upper: bool = False
+
+    def term(self, out: str) -> str:
+        """The row's velocity term ``Z . u`` from ``dot``'s ``s u`` in ``out``."""
+        return f"-{out}" if self.upper else out
+
+    def dot(self, sums, rows: dict[str, str], indent: str, **_) -> str:
+        return "\n".join(f"{indent}const float {out} = {self.scale} * s_v[{self.coordinate}];" for out, _, _ in sums)
+
+    def axpy(self, changes, indent: str, **_) -> str:
+        update = "-=" if self.upper else "+="
+        return "".join(f"\n{indent}s_v[{self.coordinate}] {update} {self.scale} * {delta};" for _, delta in changes)
+
+
+@dataclasses.dataclass(frozen=True)
+class LimitRows:
+    """The fused joint-limit rows of the coordinates a lane owns, ``d = lane + 32 k``: each coordinate's ``lower`` and
+    ``upper`` row, their impulses and right-hand sides in the lane's registers for the launch
+    (``limit_{row}_lambda_{k}``, ``limit_{row}_rhs_{k}``: the rows' incident velocities ``+-v_hat``,
+    :func:`.row_kernels.prepare_fused_diagonal_joint_limits`), their diagonal ``A = s^2 + cfm`` (``limit_denom``), which
+    the step divides by. Each lane stores its own rows."""
+
+    k: int
+    lanes: ClassVar[Lanes] = Lanes(1)
+
+    def load(self, row: str) -> str:
+        return f"limit_{row}_lambda_{self.k}"
+
+    def store(self, row: str, value: str) -> str:
+        return f"{self.load(row)} = {value};"
+
+    def rhs_of(self, row: str) -> str:
+        return f"limit_{row}_rhs_{self.k}"
+
+    def context(self, row: str, coordinate: str) -> RowContext:
+        """The row law's context of row ``row`` (``lower`` or ``upper``) of the coordinate ``coordinate``: a unilateral
+        row of a known kind (:data:`.sweep.JOINT_LIMIT`) on :class:`LimitZ`."""
+        return RowContext(
+            row=row,
+            kind=str(JOINT_LIMIT),
+            operator=LimitZ(coordinate, f"limit_scale_{self.k}", upper=row == "upper"),
+            diagonal=Diagonal(lambda _: "limit_denom"),
+            load=self.load,
+            store=self.store,
+            rhs=self.rhs_of,
+            lanes=self.lanes,
+            owned=False,
+            friction=False,
+        )
+
+
 def _diagonal_limits(dofs: int, dense_dofs: int, laws: RowLaws) -> tuple[str, str, str, str]:
     """The fused joint limits of a world's diagonal-mass coordinates: declarations, loads, the pass and the stores.
 
-    Coordinate ``d`` has a lower and an upper unilateral row (``J = +1``, ``-1``), unstored whitened rows on the
-    coordinate: ``Z = +-s`` with ``s = m^-1/2`` (``limit_scale``), their right-hand sides holding their incident
-    velocities ``+-v_hat`` (:func:`.row_kernels.prepare_fused_diagonal_joint_limits`), so ``J dv = +-s u``, ``A = s^2 + cfm`` (the step
-    divides by it) and ``u += +-s delta``. The lane that owns ``d = lane + 32 k`` keeps both impulses in registers for
-    the launch; they start at zero and are written back at the end. The dense articulation's ``dense_dofs``
-    coordinates (from ``dense_offset``) hold no fused limit.
+    Coordinate ``d`` has a lower and an upper unilateral row (:class:`LimitRows`, :class:`LimitZ`), which the lane
+    that owns ``d = lane + 32 k`` steps by the row law (:func:`.sweep.row_update`, never weighted) where the
+    coordinate is active, its impulses starting at zero and written back at the end. The dense articulation's
+    ``dense_dofs`` coordinates (from ``dense_offset``) hold no fused limit.
     """
+    limit_laws = dataclasses.replace(laws, regularize=False, material=False, torsion=False)
     declarations, loads, rows, stores = [], [], [], []
     for k in range((dofs + 31) // 32):
         d = f"lane + {32 * k}" if k else "lane"
@@ -123,26 +186,16 @@ def _diagonal_limits(dofs: int, dense_dofs: int, laws: RowLaws) -> tuple[str, st
             f"        if (global_dof >= 0 && !limit_dense) limit_scale_{k} = sqrtf(diagonal_inverse_mass.data[global_dof]);\n"
             "    }"
         )
+        limits = LimitRows(k)
         sides = []
-        for bit, side, sign, update in ((1, "lower", "", "+="), (2, "upper", "-", "-=")):
-            limit_bound = bound(f"limit_{side}_rhs_{k}", "fabsf(limit_velocity)", "old_lambda", diagonal="limit_denom")
-            limit = Change("delta_lambda", "limit_bound", str(JOINT_LIMIT), "limit_denom", scaled=True)
-            change = change_vote(laws, (limit,), " " * 20)
+        for bit, side in ((1, "lower"), (2, "upper")):
+            ctx = limits.context(side, d)
             sides.append(
                 f"            if ((limit_active_{k} & {bit}) != 0) {{\n"
-                f"                const float limit_velocity = limit_scale_{k} * s_v[{d}];\n"
-                f"                const float residual = {sign}limit_velocity + limit_{side}_rhs_{k};\n"
-                f"                const float old_lambda = limit_{side}_lambda_{k};\n"
-                f"                const float limit_bound = {limit_bound};\n"
-                "                const float new_lambda = ProjectionLaw::unilateral(\n"
-                "                    ProjectionLaw::relaxed_step(old_lambda, -residual / limit_denom, omega));\n"
-                "                const float delta_lambda = new_lambda - old_lambda;\n"
-                f"                limit_{side}_lambda_{k} = new_lambda;\n"
-                "                if (delta_lambda != 0.0f) {\n"
-                f"{change}\n"
-                f"                    s_v[{d}] {update} limit_scale_{k} * delta_lambda;\n"
-                "                }\n"
-                "            }"
+                + ctx.operator.dot((("limit_velocity", "row", None),), {"row": side}, " " * 16)
+                + "\n"
+                + row_update(ctx, limit_laws, residual=ctx.operator.term("limit_velocity"), pad=" " * 16)
+                + "\n            }"
             )
         rows.append(
             f"        if ({d} < {dofs} && limit_scale_{k} > 0.0f) {{\n"

@@ -590,12 +590,13 @@ class Diagonal:
         return f"{residual} / {self.diagonal(row)}"
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class RowContext:
     """What :func:`row_update` reads of a row: its kind, impulse, metadata, diagonal and response operator.
 
     The expressions are native code at the row index ``row``; ``kind`` is a
-    local the block has already declared.
+    local the block has already declared, or a known kind. Only friction rows read a row's friction coefficient,
+    parent and patch ring (``mu``, ``parent``, ``ring_load``), and only weighted laws its weight.
     """
 
     row: str
@@ -606,13 +607,13 @@ class RowContext:
     load: Callable[[str], str]
     store: Callable[[str, str], str]
     rhs: Callable[[str], str]
-    mu: Callable[[str], str]
-    weight: Callable[[str], str]
-    parent: str
-    ring_load: Callable[..., str]
+    lanes: Lanes
+    mu: Callable[[str], str] | None = None
+    weight: Callable[[str], str] | None = None
+    parent: str | None = None
+    ring_load: Callable[..., str] | None = None
     """The pooled normal load of the patch ring of normal row ``parent``: ``ring_load(parent)`` from the row's stored
     impulse, ``ring_load(parent, load)`` from ``load`` (a contact unit's normal in a register, :func:`contact_unit`)."""
-    lanes: Lanes
     eps: Callable[[str], str] | None = None
     """A row's compliance, where the laws have material contacts (:attr:`RowLaws.material`)."""
     contact_kinds: tuple[int, ...] = (CONTACT, JOINT_LIMIT)
