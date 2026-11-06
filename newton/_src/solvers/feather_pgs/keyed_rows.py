@@ -19,6 +19,7 @@ from functools import cache, partial
 
 import warp as wp
 
+from ...core.execution import Buckets, bucket_item
 from ...sim import ModelFlags
 from . import field_group
 from .contact_input import ContactInput
@@ -263,9 +264,8 @@ ${WEIGHT}${ROW_LAW}        c.phi.data[at] = phi; c.target.data[at] = target;
 def keyed_general_units(
     z: KineticRows,
     counts: wp.array[int],
-    mf_counts: wp.array[int],
     speed_first: wp.array[int],
-    parallel_rows: int,
+    walked: Buckets,
     primary: int,
     primary_offset: int,
     secondary_offset: int,
@@ -273,21 +273,18 @@ def keyed_general_units(
     dof_start: wp.array[int],
     sides: wp.array2d[wp.vec2i],
     units: wp.array2d[int],
-    owner: wp.array[int],
 ):
     """Hand the worlds the parallel tiers leave to the general sweep (those of more rows than the tiers hold or with
-    a free body's row: the free bodies' run's, or a speed row of the line, its last rows from ``speed_first``) to the
-    one writer (:func:`.walk_rows.walked_rows_kernel`), a thread a world: each row's unit
-    source from its key (a contact row's ``4 c + r``, a prefix row's covector ``~(2 d + side)`` at its tree's
-    coordinate) and a prefix row's sides; ``owner`` is 1 where the tiers hold the world (the writer skips it), 0 where
-    the writer walks its rows. The general worlds' rows then take the walk and the release ``R`` as every walked row.
-    It reads no contact input: a step without contacts binds none."""
-    world = wp.tid()
-    count = counts[world]
-    if count <= parallel_rows and mf_counts[world] == 0 and count <= speed_first[world]:
-        owner[world] = 1
+    a free body's row, the free bodies' run's or a speed row of the line: the claims' ``walked`` buckets,
+    :meth:`.sweep_plan.Sweep.walked_claims`) to the one writer (:func:`.walk_rows.walked_rows_kernel`), a thread an
+    item: each row's unit source from its key (a contact row's ``4 c + r``, a prefix row's covector ``~(2 d + side)`` at
+    its tree's coordinate) and a prefix row's sides, up to the line's speed rows (from ``speed_first``). The general
+    worlds' rows then take the walk and the release ``R`` as every walked row. It reads no contact input: a step without
+    contacts binds none."""
+    world = bucket_item(walked, wp.tid())
+    if world < 0:
         return
-    owner[world] = 0
+    count = counts[world]
     line = first[world]
     # The speed rows carry the unit sources their allocation wrote.
     for row in range(wp.min(wp.min(count, speed_first[world]), units.shape[1])):
@@ -392,8 +389,6 @@ class KeyedRows:
         self.data.first = solver.placement.dense_first
         self.data.rowkeys = SolverArrays(None, dev).array(KINETIC_ROWS[0], {"world": worlds, "row": capacity})
         self.maps = field_group.upload(RowMaps, dev, groups=groups, starts=starts, arts=arts)
-        # Each world's holder this step: 1 the tiers (their rows walked in the kernel), 0 the one writer.
-        self.owner = wp.ones(worlds, dtype=wp.int32, device=dev)
         self.contact_input = None
         # The placeholders of absent prefix tables, allocated before any capture.
         solver._arrays.placeholder(wp.int32)
@@ -467,16 +462,15 @@ class KeyedRows:
             inputs=[
                 self.data,
                 s.placement.constraint_count,
-                s.placement.mf_constraint_count,
                 s.placement.speed_first,
-                layout.parallel_rows,
+                s.sweep.walked_claims()[0],
                 na,
                 layout.primary_offset,
                 layout.secondary_offset,
                 s.placement.dense_first,
                 s.forest.articulation_dof_start,
             ],
-            outputs=[s.placement.row_sides, s.placement.unit_source, self.owner],
+            outputs=[s.placement.row_sides, s.placement.unit_source],
             device=s.model.device,
         )
 

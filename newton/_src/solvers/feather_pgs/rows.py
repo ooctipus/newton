@@ -1045,9 +1045,8 @@ class RowLaws:
             bind_dense_rows(placement),
             placement.row_support(),
             placement.constraint_count,
-            # The keyed tiers keep their worlds' seeds: the writer walks the general worlds' rows.
-            placement.keyed_rows.owner if placement.keyed_rows is not None else placement.dummy_is_free_rigid,
-            int(placement.keyed_rows is not None),
+            # The keyed tiers walk their worlds' seeds: the writer walks the other claims' worlds.
+            *solver.sweep.walked_claims(),
             lanes,
             contact_input,
             patch_row_law(solver),

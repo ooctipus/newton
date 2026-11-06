@@ -152,6 +152,38 @@ class Queue:
         region = self.region
         return self.count[b * self.kinds : (b + 1) * self.kinds], self.items[b * region : (b + 1) * region]
 
+    def span(self, first: int, last: int) -> Buckets:
+        """Buckets ``[first, last)`` of a one-kind queue as one list (:func:`bucket_item`)."""
+        if self.kinds != 1 or not 0 <= first <= last <= self.buckets:
+            raise ValueError(f"a list of buckets [{first}, {last}) of a one-kind queue of {self.buckets} buckets")
+        view = Buckets()
+        view.items, view.count, view.region, view.first, view.last = self.items, self.count, self.region, first, last
+        return view
+
+
+@wp.struct
+class Buckets:
+    """Consecutive buckets ``[first, last)`` of a one-kind :class:`Queue` read as one list: its items bucket by bucket
+    (:meth:`Queue.span`, :func:`bucket_item`)."""
+
+    items: wp.array[int]
+    count: wp.array[int]
+    region: int
+    first: int
+    last: int
+
+
+@wp.func
+def bucket_item(buckets: Buckets, item: int) -> int:
+    """The list's ``item``-th item, bucket by bucket, or -1 past its items (a bucket holds at most its region's)."""
+    k = item
+    for b in range(buckets.first, buckets.last):
+        n = wp.min(buckets.count[b], buckets.region)
+        if k < n:
+            return buckets.items[b * buckets.region + k]
+        k -= n
+    return -1
+
 
 _APPEND = r"""
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700

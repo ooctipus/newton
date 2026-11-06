@@ -24,7 +24,7 @@ import functools
 import numpy as np
 import warp as wp
 
-from ...core.execution import Queue, Work, shape
+from ...core.execution import Buckets, Queue, Work, shape
 from ...core.memory import Place, arch_budget, device
 from . import (
     packed_rows,
@@ -452,6 +452,10 @@ class Sweep:
         self.par_tiers = []
         # The claims' worlds (sweep_levels.claim_worlds): a bucket a tier, then the general sweep's.
         self.claims = None
+        # The one writer's list where it walks every world (walked_claims): empty.
+        self.every_world = Buckets()
+        self.every_world.items = self.every_world.count = wp.zeros(1, dtype=int, device=self.model.device)
+        self.every_world.region = self.every_world.first = self.every_world.last = 0
         if self.classes.mf_sweeps and self.paired_factor_kernel is None:
             # A test pin streams the impulses (storage is part of the kernel specialization key); the selection
             # sizes the resident row metadata with its choice.
@@ -637,6 +641,16 @@ class Sweep:
             outputs=[claims.items, claims.count],
             device=self.model.device,
         )
+
+    def walked_claims(self) -> tuple[Buckets, int]:
+        """The one writer's worlds (:func:`.walk_rows.walked_rows_kernel`): a list of the claims' buckets, and whether it
+        walks it or every world. Under keyed rows the tiers walk their worlds' seeds in their kernels, so the writer
+        walks the other claims' worlds: the general bucket and the candidates' (consecutive), which the unit builder
+        splits after the writer."""
+        if self.placement.keyed_rows is None:
+            return self.every_world, 0
+        general = self.claim_general
+        return self.claims.span(general, general + (1 if self.colored_units is None else 2)), 1
 
     def claim(self) -> None:
         """Publish the schedule of the rows the row pass wrote and each owner's worlds (run after every producer)."""

@@ -39,7 +39,7 @@ from typing import NamedTuple
 
 import warp as wp
 
-from ...core.execution import Work, shape
+from ...core.execution import Buckets, Work, bucket_item, shape
 from ...core.memory import built_for
 from . import field_group
 from .contact_input import ContactFrame, ContactInput, contact_frame
@@ -342,8 +342,7 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tupl
     """The one writer of the general placement, world-major: a world's group of ``lanes`` lanes (:func:`writer_lanes`)
     writes its rows in the block primitive's phases (FL3_design §1.4, W9), the group synchronized between them:
 
-    1. *rows*: a lane a row, every row of the world but a world an in-kernel owner holds (``owned``: the local owners'
-       packets walk their own seeds): a contact row's records by the contact law, then the row as its own unit
+    1. *rows*: a lane a row, every row of the world: a contact row's records by the contact law, then the row as its own unit
        (:func:`unit_reader`), walked by the one unit walker with the packed rows as its sink
        (:func:`packed_walker`; the spin row a torque), each side's slips released by the
        predictor's border's ``R`` (:func:`.tree_kinetic_state.border_solve`), then its rhs by the row law
@@ -369,7 +368,11 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tupl
 
     ``block`` (the topology part's kernel, :data:`WRITE_TOPOLOGY`; 0 for the others): a lane takes ``block``
     consecutive rows and walks its covector rows (limits, velocity limits, mimics) as one block, each tree's in one
-    sweep (:func:`block_walker`), a link row by the unit walker."""
+    sweep (:func:`block_walker`), a link row by the unit walker.
+
+    The worlds: every world, or with ``claimed`` the worlds of the claims' ``walked`` buckets
+    (:class:`~newton._src.core.execution.Buckets`, the claim stage's: :func:`.sweep_levels.claim_worlds`), a world a
+    lane group of the launch, where the keyed Jacobi tiers walk their own worlds' seeds in their kernels."""
     has_blocks = blocks > 0
     capacity = max(blocks, 1)
     mimics = int(mimic_blocks)
@@ -385,8 +388,8 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tupl
         rows: DenseRows,
         support: RowSupport,
         counts: wp.array[int],
-        owner: wp.array[int],
-        owned: int,
+        walked: Buckets,
+        claimed: int,
         lanes: int,
         data: ContactInput,
         law: PatchRowLaw,
@@ -400,14 +403,15 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tupl
         part: int,
     ):
         world, lane = wp.tid()
+        if claimed != 0:
+            # The claims' worlds: a lane group past them returns whole, before any barrier.
+            world = bucket_item(walked, world)
+            if world < 0:
+                return
         # The writer's rows are the line's dense rows: the packed rows past them are the free bodies'.
         dense_rows = support.units.shape[1]
         count = wp.min(counts[world], dense_rows)
         line = rows.first[world]
-        # A world an in-kernel owner holds (``owned`` and ``owner`` nonzero: the local owners' packets, whose kernels
-        # walk their seeds) is not the writer's: its whole group returns before any barrier.
-        if owned != 0 and owner[world] != 0:
-            return
         # The part's rows: the topology's below the family bound (the count is not final before the contact pass),
         # the rest above it.
         first = int(0)

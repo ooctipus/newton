@@ -23,7 +23,7 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.core.execution import Queue
+from newton._src.core.execution import Buckets, Queue, bucket_item
 from newton._src.solvers.feather_pgs import sweep_levels
 
 
@@ -296,6 +296,23 @@ class TestWorldLists(unittest.TestCase):
         count, items = lists.bucket(2)
         self.assertEqual((count.shape, items.shape), ((1,), (4,)))
         self.assertEqual(items.ptr, lists.items.ptr + 8 * 4)
+
+    def test_consecutive_buckets_read_as_one_list(self):
+        """A list of consecutive buckets holds their items bucket by bucket, at most a region's each, then none."""
+        lists = Queue(12, "cpu", buckets=3)
+        lists.items.assign(np.arange(12, dtype=np.int32) + 100)
+        lists.count.assign(np.array([4, 2, 9], dtype=np.int32))
+        out = wp.zeros(9, dtype=int, device="cpu")
+        wp.launch(_bucket_items, dim=9, inputs=[lists.span(1, 3)], outputs=[out], device="cpu")
+        np.testing.assert_array_equal(out.numpy(), [104, 105, 108, 109, 110, 111, -1, -1, -1])
+        with self.assertRaises(ValueError):
+            lists.span(2, 4)
+
+
+@wp.kernel
+def _bucket_items(buckets: Buckets, out: wp.array[int]):
+    item = wp.tid()
+    out[item] = bucket_item(buckets, item)
 
 
 if __name__ == "__main__":
