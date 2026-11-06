@@ -1,21 +1,61 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The sparse-diagonal contact schedule (case K2): which contacts of a world are independent, and in what order.
+"""The level builder: the schedules of the row order's trace, and the work lists the sweeps run over.
 
-The row pass marks the contacts confined to one coordinate of the diagonal articulation, and the builder links them
-into chains per coordinate, serial lists and groups of independent units, which the sweep reads.
+A world's units (a scalar row; a contact's normal with its pair and spin row) hold resources, the trees their rows
+touch; two units conflict when they share one. Every linear extension of the row order's trace (the partial order of
+conflicting pairs in row order) gives the same Gauss-Seidel iterate bit for bit, and the builder writes two of its
+invariants:
+
+- a unit's *level* (Cartier-Foata), one past the latest level of an earlier unit sharing a resource: a level's units
+  share none (the colored units, :mod:`.sweep_units`);
+- the *components* of the conflict graph, a *chain* where each unit holds one resource (case K2's scalar contacts on
+  a coordinate no coupled contact holds; the tiers' worlds, which share nothing).
+
+A schedule runs components side by side and a component's levels in order, so it is the row order's trace. The work
+lists are queues (:class:`~newton._src.core.execution.Queue`); :func:`list_worlds` buckets the Jacobi tiers'
+worlds.
+
+Case K2 (the sparse diagonal): the row pass marks the contacts confined to one coordinate of the diagonal articulation,
+and the builder links them into chains per coordinate and lists the rest in row order, which the sweep reads.
 """
 
 from functools import cache
 
 import warp as wp
 
+from ...core.execution import append
 from . import kernel_template
 from .contact_input import ContactInput
 from .device_preludes import lane_group
 from .kernel_template import KernelTemplate, items, python_kernel
 from .row_kernels import PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
+
+
+@wp.kernel
+def list_worlds(
+    rows: wp.array[int],
+    free_body_rows: wp.array[int],
+    bound: int,
+    width: int,
+    region: int,
+    # outputs: a Queue's (execution.Queue), a bucket a tier
+    items: wp.array[int],
+    count: wp.array[int],
+):
+    """Bucket the worlds whose rows are dense only and at most ``bound`` by their rows: bucket ``(rows - 1) // width``
+    of a queue of ``region`` slots a bucket.
+
+    The Jacobi tiers' worlds share nothing, so each is a component of its own and the order inside a bucket is the
+    atomics'; tier ``t`` serves ``(t * width, (t + 1) * width]`` rows and walks bucket ``t`` (an exiting block of a
+    tier's grid still paid four dependent global loads: about 55 us a launch at 16k worlds).
+    """
+    world = wp.tid()
+    m = rows[world]
+    if m <= 0 or m > bound or free_body_rows[world] != 0:
+        return
+    append(items, count, (m - 1) // width, region, world)
 
 
 @cache

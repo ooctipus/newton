@@ -46,6 +46,7 @@ __all__ = [
     "Shape",
     "Use",
     "Work",
+    "append",
     "device_lanes",
     "fill_lanes",
     "launch",
@@ -117,9 +118,10 @@ class Order(enum.Enum):
 class Queue:
     """A device work list: appended where its items are reserved, consumed by a persistent launch over its count.
 
-    ``items`` holds ``buckets`` regions of the list's slots; ``count`` one counter a kind a bucket (``count[kinds * b
-    + k]``), zeroed where a new list starts. A :class:`Work` over a queue is sized at :attr:`capacity`, its host bound;
-    the device's count is the launch's extent.
+    ``items`` holds ``buckets`` regions of the list's slots, bucket ``b`` at ``[b * region, (b + 1) * region)``
+    (:attr:`region`); ``count`` one counter a kind a bucket (``count[kinds * b + k]``), zeroed where a new list starts.
+    A :class:`Work` over a queue is sized at :attr:`capacity`, its host bound; the device's count is the launch's
+    extent. A kernel appends with :func:`append`, and a launch over one bucket reads :meth:`bucket`.
 
     Args:
         capacity: The most items the list holds.
@@ -137,6 +139,26 @@ class Queue:
         self.capacity, self.kinds, self.buckets, self.order = int(capacity), int(kinds), int(buckets), order
         self.items = wp.empty(max(self.capacity, 1), dtype=int, device=device)
         self.count = wp.zeros(self.kinds * self.buckets, dtype=int, device=device)
+
+    @property
+    def region(self) -> int:
+        """Slots a bucket."""
+        return self.capacity // self.buckets
+
+    def bucket(self, b: int) -> tuple[wp.array, wp.array]:
+        """Bucket ``b`` as a list of its own: its counters and its region of the slots."""
+        region = self.region
+        return self.count[b * self.kinds : (b + 1) * self.kinds], self.items[b * region : (b + 1) * region]
+
+
+@wp.func
+def append(items: wp.array[int], count: wp.array[int], bucket: int, region: int, item: int):
+    """Append ``item`` to bucket ``bucket`` of a :class:`Queue`'s ``items`` and ``count`` (one kind), one atomic an
+    append (:attr:`Order.ATOMIC`): its slot is the order threads reach the counter. The counter keeps the demand; an
+    append past the bucket's ``region`` slots is dropped (:func:`.device_preludes.reserve`'s contract)."""
+    slot = wp.atomic_add(count, bucket, 1)
+    if slot < region:
+        items[bucket * region + slot] = item
 
 
 @dataclasses.dataclass(frozen=True)

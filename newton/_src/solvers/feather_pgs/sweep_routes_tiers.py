@@ -76,6 +76,9 @@ TIER_SWEEPS_CAP = 128
 """The largest tier budget."""
 TIER_MAX_ROWS = 128
 """The most rows a tier holds: a lane per row in four warps, its staged block within the static budget."""
+TIER_ROWS = 32
+"""The rows a tier holds past the tier below it, a warp's: tier ``t`` serves ``(32 t, 32 (t + 1)]`` rows
+(:func:`.sweep_levels.list_worlds` buckets its worlds)."""
 REGISTER_LINE = 80
 """The register line of a tier: 24 warps a multiprocessor (6 in each of the register file's 4 sub-partitions). It is
 no cap: a tier's variants compile on both sides of it unbounded (72 registers plain, 100 to 108 keyed) and spill under
@@ -367,31 +370,3 @@ def parallel_kernel(
         velocity_limit_pass=bool(velocity_limit_pass),
         sweeps=int(sweeps),
     )
-
-
-@wp.kernel
-def classify_parallel_sweep_tiers(
-    world_constraint_count: wp.array[int],
-    mf_constraint_count: wp.array[int],
-    tier_lo: wp.array[int],
-    tier_hi: wp.array[int],
-    n_tiers: int,
-    # outputs
-    tier_worlds: wp.array2d[int],
-    tier_counts: wp.array[int],
-):
-    """Append each dense-only world to the list of the parallel sweep tier that owns it.
-
-    Tier ``t`` owns worlds with ``tier_lo[t] < rows <= tier_hi[t]`` and no matrix-free rows. Each tier kernel then
-    grid-strides over its own list instead of launching every world and exiting (an exiting block still paid four
-    dependent global loads: ~55 us per launch at 16k worlds).
-    """
-    world = wp.tid()
-    m = world_constraint_count[world]
-    if m <= 0 or mf_constraint_count[world] != 0:
-        return
-    for t in range(n_tiers):
-        if m > tier_lo[t] and m <= tier_hi[t]:
-            idx = wp.atomic_add(tier_counts, t, 1)
-            tier_worlds[t, idx] = world
-            return

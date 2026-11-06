@@ -26,12 +26,13 @@ from collections.abc import Callable
 import numpy as np
 import warp as wp
 
-from ...core.execution import shape
+from ...core.execution import Queue, shape
 from ...core.memory import Place, arch_budget, device
 from . import (
     host_index,
     packed_rows,
     route_table,
+    sweep_levels,
     sweep_routes,
     sweep_routes_diag,
     sweep_routes_local,
@@ -58,7 +59,6 @@ from .sweep_levels import (
     _get_mark_independent_sparse_contact_candidates_kernel,
 )
 from .sweep_routes_sparse import _SPARSE_LOCAL_WORKSPACE_BYTES
-from .sweep_routes_tiers import classify_parallel_sweep_tiers
 from .tree_plan import TreePlan, local_parents
 from .tree_scan import classes_half
 from .warm_start import (
@@ -90,9 +90,6 @@ a slot per four rows of the row store's line, a triple's rows."""
 
 __all__ = ["Sweep"]
 
-# Parallel tiers grid-stride over per-tier world lists from this many tiers on: one classify launch against
-# (tiers - 1) x worlds idle block entries.
-_TIER_LIST_MIN_TIERS = 3
 _CONTACT_JACOBIAN_MAX_DOF = 10
 # The paired response pairs a tree of _PAIRED_MIN_DOF to (32 - 6) coordinates, no star, with one free body, in a class
 # of more than _PAIRED_MIN_ROWS rows a world. The rows bound is the retired tiled H^-1 J^T plan's (execution_plan
@@ -1102,16 +1099,11 @@ class Sweep:
                     from .keyed_rows import get_parallel_factory  # noqa: PLC0415
 
                     parallel_factory = get_parallel_factory(parallel_factory, self.placement.keyed_rows.layout)
-                tiers = [(min(first + 32, parallel_rows), first) for first in range(0, parallel_rows, 32)]
+                width = sweep_routes_tiers.TIER_ROWS
+                tiers = [(min(first + width, parallel_rows), first) for first in range(0, parallel_rows, width)]
                 self.par_tiers = list(tiers)
-                if len(tiers) >= _TIER_LIST_MIN_TIERS:
-                    dev = model.device
-                    self.tier_lo = wp.array([lo for _, lo in tiers], dtype=wp.int32, device=dev)
-                    self.tier_hi = wp.array([hi for hi, _ in tiers], dtype=wp.int32, device=dev)
-                    self.tier_counts = wp.zeros(len(tiers), dtype=wp.int32, device=dev)
-                    self.tier_worlds = wp.empty((len(tiers), self.forest.world_count), dtype=wp.int32, device=dev)
-                    self.tier_count_views = [self.tier_counts[t : t + 1] for t in range(len(tiers))]
-                    self.tier_world_views = [self.tier_worlds[t] for t in range(len(tiers))]
+                # Each tier walks its bucket of the level builder's world list (sweep_levels.list_worlds).
+                self.tier_worlds = Queue(len(tiers) * self.forest.world_count, model.device, buckets=len(tiers))
                 tier_sweeps, self.par_sweeps_rule, self.par_sweeps_reason = self._parallel_tier_sweeps(tiers)
                 for tier_index, ((rows_, min_rows_), sweeps_) in enumerate(zip(tiers, tier_sweeps, strict=True)):
                     tier = self.kernel(
@@ -1131,8 +1123,7 @@ class Sweep:
                         frame=self._tier_frame(),
                         classes=self.factor.walk_classes,
                         pitch=self.placement.row_pitch,
-                        # A tier walks its own list of worlds where the plan keeps one.
-                        queued=self.tier_worlds is not None,
+                        queued=True,
                         **({"torsion": True} if self.laws.spin_rows else {}),
                     )
                     # On its own list, a tier takes a block a world of the list's capacity (its work's shape).
@@ -1384,41 +1375,34 @@ class Sweep:
 
         # The tiers own the worlds with only dense rows inside their row bound; the general sweep returns early for
         # those and solves the rest.
-        tier_lists = self.tier_worlds is not None
+        lists = self.tier_worlds
 
         def list_tiers():
-            if tier_lists:
-                self.tier_counts.zero_()
+            if lists is not None:
+                lists.count.zero_()
                 wp.launch(
-                    classify_parallel_sweep_tiers,
+                    sweep_levels.list_worlds,
                     dim=self.forest.world_count,
                     inputs=[
                         self.placement.constraint_count,
                         self.placement.mf_constraint_count,
-                        self.tier_lo,
-                        self.tier_hi,
-                        len(self.par_tiers),
+                        self.par_tiers[-1][0],
+                        sweep_routes_tiers.TIER_ROWS,
+                        lists.region,
                     ],
-                    outputs=[self.tier_worlds, self.tier_counts],
+                    outputs=[lists.items, lists.count],
                     device=self.model.device,
                 )
 
         def launch_tier(tier):
-            named = dict(walk)
-            dim = self.forest.world_count
-            if tier_lists:
-                # This tier grid-strides over its own compacted world list.
-                dim = tier.grid
-                named.update(
-                    general_world_count=self.tier_count_views[tier.tier],
-                    general_worlds=self.tier_world_views[tier.tier],
-                    general_world_grid_stride=tier.grid,
-                )
+            # A tier grid-strides over its bucket of the world list.
+            count, worlds = lists.bucket(tier.tier)
+            named = dict(walk, general_world_count=count, general_worlds=worlds, general_world_grid_stride=tier.grid)
             named.update(self.placement.inkernel_response_inputs())
             if tier.kinetic_rows:
                 keyed = self.placement.keyed_rows.parallel_arguments()
                 named.update(zip(("kinetic_rows", "patch_law"), keyed, strict=False))
-            self._launch(tier.kernel, operands, dim, tier.work.block, **named)
+            self._launch(tier.kernel, operands, tier.grid, tier.work.block, **named)
 
         # The claims in their order, the paired factor sweep's worlds then the tiers'. A paired factor sweep without
         # independent components shares worlds with the general sweep, so it runs ahead of the fork.
