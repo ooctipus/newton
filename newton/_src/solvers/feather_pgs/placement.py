@@ -599,7 +599,7 @@ class Placement:
         arrays = self.arrays
         worlds = self.forest.world_count
         rows = self.mf_max_constraints if self.forest.has_free_rigid_bodies else 1
-        arrays.allocate(MF_ROWS, world=worlds, mf_row=rows, mf_meta=4 * rows)
+        arrays.allocate(MF_ROWS, world=worlds, mf_meta=4 * rows)
 
         if not self.forest.has_free_rigid_bodies:
             # Only the ``is not None`` checks observe this on the inactive
@@ -623,8 +623,9 @@ class Placement:
             self.rigid_velocity_limit_slot = None
 
     def allocate_packed_rows(self) -> None:
-        """The matrix-free sweeps' dense rows, packed by support (:mod:`.packed_rows`): every world's row capacity,
-        each row as wide as two of its world's articulations hold; a placeholder without those sweeps."""
+        """The matrix-free sweeps' rows, packed by support (:mod:`.packed_rows`): every row of the world's line, the
+        free bodies' included (their two one-node trees of six are two sides like any other), each row as wide as two
+        of its world's articulations hold; a placeholder without those sweeps."""
         if self.mf_sweeps:
             sizes, worlds = self.forest.articulation_response_dof_count.numpy(), self.forest.art_to_world.numpy()
             offsets = self.forest.articulation_world_dof_offset.numpy()
@@ -643,11 +644,7 @@ class Placement:
                 self.packed_support, self.packed_dense = self.forest.max_world_dofs, packed_rows.WIDE
             if self.ink_rows and not self.packed_dense:
                 raise RuntimeError("The parallel tiers read their worlds' packed rows at their coordinates")
-            sizes = {
-                "world": self.forest.world_count,
-                "row": self.dense_max_constraints,
-                "support": self.packed_support,
-            }
+            sizes = {"world": self.forest.world_count, "row": self.row_pitch, "support": self.packed_support}
         else:
             self.packed_support, self.packed_dense = 1, 0
             sizes = {"world": 1, "row": 1, "support": 1}

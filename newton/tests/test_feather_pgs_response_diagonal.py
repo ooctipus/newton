@@ -25,7 +25,7 @@ from newton._src.solvers.feather_pgs.sweep_levels import (
 from newton._src.solvers.feather_pgs.sweep_routes_diag import sparse_diagonal_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_local import paired_factor_kernel, paired_factor_source
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import diagonal_walk, leave_walk, row_lines, row_velocity
+from newton.tests.feather_pgs_law_harness import diagonal_walk, free_body_Z, leave_walk, row_lines, row_velocity
 
 
 def _build_mixed_response_model(
@@ -206,8 +206,8 @@ def _run_mixed_response(
                 solver.placement.row_type.numpy()[:, solver.placement.body_base :][0, :mf_count].copy(),
                 # The free bodies' parents by their own row (the store's count in the world's line).
                 _class_rows(solver.placement.row_parent.numpy()[0, base : base + mf_count], base),
-                solver.placement.mf_Z.numpy()[0, :mf_count, :6].copy(),
-                solver.placement.mf_Z.numpy()[0, :mf_count, 6:].copy(),
+                free_body_Z(solver)[0, :mf_count, :6].copy(),
+                free_body_Z(solver)[0, :mf_count, 6:].copy(),
             )
         )
         state_in, state_out = state_out, state_in

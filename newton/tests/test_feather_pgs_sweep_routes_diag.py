@@ -171,18 +171,19 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
         self.assertIn("float jv = 0.0f;", residual)
         self.assertIn("const int entry = q;", residual)
         self.assertIn("for (int q = 0; q < 12; ++q) {", residual)
-        self.assertIn("jv += mf_Z.data[mf12_base + i * 12 + entry] * velocity;", residual)
+        self.assertIn("jv += packed_Z.data[free_base + i * 12 + entry] * velocity;", residual)
         self.assertIn(
             "((entry < 6 ? dof_a : dof_b) < 0 ? -1 : (entry < 6 ? dof_a + entry : dof_b + entry - 6))", residual
         )
         self.assertNotIn("SUM", residual)
         # The sibling residual sums its velocity term, then adds its right-hand side.
         sibling = op.dot((("sibling_residual", "sib", None),), {"sib": "sib"}, "", rhs={"sibling_residual": "rhs[sib]"})
-        self.assertIn("sibling_residual += mf_Z.data[mf12_base + sib * 12 + entry] * velocity;", sibling)
+        self.assertIn("sibling_residual += packed_Z.data[free_base + sib * 12 + entry] * velocity;", sibling)
         self.assertLess(sibling.index("* velocity;"), sibling.index("sibling_residual += rhs[sib];"))
         coupling = op.dot((("cross", "row", "sib"),), {"row": "i", "sib": "sib"}, "")
         self.assertIn(
-            "cross += mf_Z.data[mf12_base + i * 12 + entry] * mf_Z.data[mf12_base + sib * 12 + entry];", coupling
+            "cross += packed_Z.data[free_base + i * 12 + entry] * packed_Z.data[free_base + sib * 12 + entry];",
+            coupling,
         )
         # A speed row reads the body's physical velocity v = L^-T u by its walk, then pushes u by L^T dv the same way.
         speed = _speed_row(Lanes(1), Velocity("s_vel"))
@@ -207,11 +208,11 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
             rhs={"sibling_residual": "rhs[sib]"},
         )
         self.assertIn("SUM(sibling_residual, cross);\nsibling_residual += rhs[sib];", pair)
-        self.assertIn("cross += cur_z * mf_Z.data[mf12_base + sib * 12 + entry];", pair)
+        self.assertIn("cross += cur_z * packed_Z.data[free_base + sib * 12 + entry];", pair)
         # The second tangent applies on its own, read at its index.
         self.assertFalse(op.fused_pair_apply)
         self.assertIn(
-            "s_v[index] += mf_Z.data[mf12_base + sib * 12 + entry] * d;", op.axpy((("sib", "d"),), "", row="sib")
+            "s_v[index] += packed_Z.data[free_base + sib * 12 + entry] * d;", op.axpy((("sib", "d"),), "", row="sib")
         )
         self.assertIn("s_v[index] += cur_z * d;", op.axpy((("row", "d"),), ""))
         # The lanes push the speed row's change from their first lane.

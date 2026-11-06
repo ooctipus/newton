@@ -27,6 +27,7 @@ import newton
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_SPEED
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
+from newton.tests.feather_pgs_law_harness import free_body_Z
 
 DT = 1.0 / 60.0
 # Speed limits of every free box [m/s, rad/s].
@@ -241,7 +242,7 @@ def _free_body_rows(run):
     count = solver.placement.mf_constraint_count.numpy()
     rows = int(count.max())
     # A speed row keeps its axis unwhitened.
-    jacobian = solver.placement.mf_Z.numpy()[:, :rows, :6]
+    jacobian = free_body_Z(solver)[:, :rows, :6]
     axis = np.argmax(np.abs(jacobian), axis=2)
     return SimpleNamespace(
         count=count,

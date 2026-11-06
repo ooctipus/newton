@@ -162,7 +162,7 @@ def paired_factor_source(
     Returns the body and its staging.
     """
     M, D, P, S = int(max_constraints), int(max_world_dofs), int(primary_dofs), int(secondary_dofs)
-    # The row store's line (its dense rows, then the free bodies'); the packed rows keep M rows a world.
+    # The row store's line (its dense rows, then the free bodies'), the packed rows' too.
     pitch = M if pitch is None else int(pitch)
     if M <= 0:
         raise ValueError("max_constraints must be positive")
@@ -221,7 +221,7 @@ def paired_factor_source(
     const int line = dense_first.data[world];
     __builtin_assume(line >= 0);
     const int off = line * {pitch};
-    const int row_base = line * {M * D};
+    const int row_base = line * {pitch * D};
     const int dof_map_base = world * {D};
     const int primary_offset = primary_offset_by_world.data[world];
     const int secondary_offset = secondary_offset_by_world.data[world];

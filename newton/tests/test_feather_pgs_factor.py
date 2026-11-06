@@ -66,7 +66,7 @@ from newton._src.solvers.feather_pgs.tree_plan import UP_FIRST, UP_SUMS, TreePla
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conformance
-from newton.tests.feather_pgs_law_harness import dense_factor32, unpacked_rows, walk_inverse
+from newton.tests.feather_pgs_law_harness import dense_factor32, free_body_Z, unpacked_rows, walk_inverse
 from newton.tests.feather_pgs_mass_reference import MassReference
 from newton.tests.feather_pgs_tree_scan_fixture import (
     MOTION,
@@ -782,8 +782,8 @@ class Capture:
             offsets = solver.forest.articulation_world_dof_offset.numpy()
             dofs = np.where(sides >= 0, offsets[np.maximum(sides, 0)], -1)
             self.mf_final = (
-                placement.mf_Z.numpy()[..., :6].astype(np.float64),
-                placement.mf_Z.numpy()[..., 6:].astype(np.float64),
+                free_body_Z(solver)[..., :6].astype(np.float64),
+                free_body_Z(solver)[..., 6:].astype(np.float64),
                 placement.impulses.numpy()[:, placement.body_base :].astype(np.float64),
                 placement.mf_constraint_count.numpy().copy(),
                 sides[..., 0],

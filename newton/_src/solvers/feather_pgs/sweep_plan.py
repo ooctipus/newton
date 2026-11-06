@@ -1242,10 +1242,11 @@ class Sweep:
             "world_row_parent": placement.row_parent,
             "world_row_mu": placement.row_mu,
             "mf_constraint_count": placement.mf_constraint_count,
-            # The free bodies' placement: their Z and headers (their records are the row store's above).
+            # The free bodies' headers (their records and packed rows are the line's above).
             "mf_contact_rows_end": placement.mf_contact_rows_end,
             "mf_meta": placement.mf_meta_packed,
-            "mf_Z": placement.mf_Z,
+            # The sparse sweep's ABI slot of the free bodies' rows, read by no configuration (U10's hunk drops it).
+            "mf_Z": placement.packed_Z,
             "iterations": self.options.pgs_iterations,
             "omega": self.options.pgs_omega,
             "friction_metric": placement.friction_metric,

@@ -19,6 +19,7 @@ from newton.tests.feather_pgs_paired_fixture import (
     component_fixture,
     launch_components,
     launch_solve_pair,
+    line_rows,
     pack_endpoints,
     solve_fixture,
     solve_kernels,
@@ -61,7 +62,10 @@ class TestPairedComponents(unittest.TestCase):
             # The row store's records: the dense rows' from row 0, the free bodies' coefficients from the dense capacity.
             if name == "mf_mu":
                 actual = data.mu.numpy()[:, dense:]
-            elif name in ("rhs", "diag", "mu", "row_type", "row_parent"):
+            elif name == "mf_Z":
+                # The line's packed rows: the free bodies' from the dense capacity, in the sides layout.
+                actual = data.Y.numpy()[:, dense:, :12]
+            elif name in ("rhs", "diag", "mu", "row_type", "row_parent", "Y"):
                 actual = getattr(data, name).numpy()[:, :dense]
             else:
                 actual = getattr(data, name).numpy()
@@ -135,7 +139,7 @@ class TestPairedComponents(unittest.TestCase):
                 data = bind_components(host)
                 launch_components(data)
                 self.assertGreater(int(data.selector.numpy()[0]), 0)
-                np.testing.assert_array_equal(data.Y.numpy(), host["Y"])
+                np.testing.assert_array_equal(data.Y.numpy()[:, : host["Y"].shape[1]], host["Y"])
                 np.testing.assert_array_equal(data.counts.numpy(), host["counts"])
                 np.testing.assert_array_equal(data.mf_counts.numpy(), host["mf_counts"])
 
@@ -143,10 +147,12 @@ class TestPairedComponents(unittest.TestCase):
         """Reset dispatch each call and read only each newly authoritative active prefix."""
         host = component_fixture(4)
         data = bind_components(host)
+        dense = host["Y"].shape[1]
         for counts, mf_counts in (([0, 4, 4, 4], [3, 0, 3, 3]), ([8, 4, 4, 0], [6, 3, 6, 0]), ([0] * 4, [0] * 4)):
-            current = host["Y"].copy()
+            # The line's packed rows, the dense rows' tail past each world's count poisoned.
+            current = line_rows(host)
             for world, count in enumerate(counts):
-                current[world, count:] = np.nan
+                current[world, count:dense] = np.nan
             data.Y.assign(current)
             data.counts.assign(np.asarray(counts, np.int32))
             data.mf_counts.assign(np.asarray(mf_counts, np.int32))
@@ -154,7 +160,7 @@ class TestPairedComponents(unittest.TestCase):
             np.testing.assert_array_equal(data.selector.numpy(), np.where(np.asarray(mf_counts) > 0, -1, 0))
             result = data.Y.numpy()
             for world, count in enumerate(counts):
-                np.testing.assert_array_equal(result[world, count:], current[world, count:])
+                np.testing.assert_array_equal(result[world, count:dense], current[world, count:dense])
                 self.assertTrue(np.all(np.isfinite(result[world, :count])))
 
     def test_sizes_come_from_the_pair(self):

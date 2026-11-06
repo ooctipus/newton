@@ -87,6 +87,14 @@ def store(dense, body):
     return np.concatenate((dense, body), axis=1)
 
 
+def line_rows(host):
+    """The packed rows of each world's line: the dense rows (``Y``, at their world coordinates), then the free bodies'
+    (``mf_Z``, the sides layout: side ``a``'s six entries, then side ``b``'s)."""
+    body = np.zeros((*host["mf_Z"].shape[:2], host["Y"].shape[2]), np.float32)
+    body[..., :12] = host["mf_Z"]
+    return store(host["Y"], body)
+
+
 def bind_components(host, device="cpu"):
     """Bind the fixture as the paired-component descriptor (packed two-dimensional metadata ABI): its records in one
     row store, the free bodies' coefficients (``mf_mu``) at the dense capacity."""
@@ -102,9 +110,10 @@ def bind_components(host, device="cpu"):
     }
     for name, value in {**host, **records}.items():
         # Only the whitened rows are stored; the factor is the walk's records below, its group the primary's.
-        if name not in ("J", "L", "primary_group", "mf_mu"):
+        if name not in ("J", "L", "primary_group", "mf_mu", "mf_Z", "Y"):
             dtype = wp.int32 if value.dtype == np.int32 else wp.float32
             setattr(data, name, wp.array(value, dtype=dtype, device=device))
+    data.Y = wp.array(line_rows(host), dtype=wp.float32, device=device)
     data.body_base = host["rhs"].shape[1]
     data.first = row_lines(device)
     # The primary articulation of a world is its group's; its walk records hold the factor's rows (16 floats a
@@ -190,7 +199,6 @@ def solve_fixture(device):
         ("world_row_mu", "mu"),
         ("factor_rows", "Y"),
         ("mf_meta", "mf_meta"),
-        ("mf_Z", "mf_Z"),
     ):
         arrays[target] = getattr(data, field)
     # The sweeps add their velocity change in the walk's coordinates to the walk's du, from zero (the step's one leave
@@ -243,7 +251,7 @@ def _packed_rows(host, arrays, device):
     arrays["response_dofs"] = wp.array(sizes, dtype=wp.int32, device=device)
     arrays["articulation_world_dof_offset"] = wp.array(offsets, dtype=wp.int32, device=device)
     arrays["packed_dense"] = 1
-    arrays["packed_Z"] = wp.array(host["Y"], dtype=wp.float32, device=device)
+    arrays["packed_Z"] = wp.array(line_rows(host), dtype=wp.float32, device=device)
     # The row store's lines: the dense rows' sides, then the free bodies' rows (none read here).
     body = host["mf_mu"].shape[1]
     arrays["row_sides"] = wp.array(store(sides, np.zeros((worlds, body, 2), np.int32)), dtype=wp.vec2i, device=device)

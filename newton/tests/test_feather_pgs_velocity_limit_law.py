@@ -172,7 +172,6 @@ def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MAS
         return wp.array(value, dtype=dtype, device=device)
 
     zero_int, zero_float = array([0], wp.int32), array([[0.0]])
-    zero_rows = wp.zeros((1, 1, 12), dtype=wp.float32, device=device)
     values = {
         "world_constraint_count": array([count], wp.int32),
         "dense_first": row_lines(device),
@@ -198,7 +197,6 @@ def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MAS
         "mf_contact_rows_end": zero_int,
         "mf_meta": array([[0]], wp.int32),
         "mf_impulses": zero_float,
-        "mf_Z": zero_rows,
         "walk": chain_walk(device, [factor]),
         "mf_row_mu": zero_float,
         "mf_row_w": zero_float,

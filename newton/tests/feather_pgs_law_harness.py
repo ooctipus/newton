@@ -1072,11 +1072,21 @@ def leave_walk(walk: WalkTrees, velocity, device) -> None:
     walk.du.zero_()
 
 
+def free_body_Z(solver) -> np.ndarray:
+    """Every world's free-body rows' packed entries ``[world, row, 12]`` (float32): the line's packed rows from
+    ``body_base`` in the sides layout, side ``a``'s six then side ``b``'s (zero past a line narrower than twelve)."""
+    placement = solver.placement
+    packed = placement.packed_Z.numpy()[:, placement.body_base :, :12]
+    Z = np.zeros((*packed.shape[:2], 12), np.float32)
+    Z[..., : packed.shape[2]] = packed
+    return Z
+
+
 def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
     """:func:`incident_gaps` of the free-body rows: each row's ``|mf_row_incident - Z^T u_hat|`` over its two bodies'
     six coordinates, ``u_hat`` the walk's enter of ``v_hat`` (:func:`_walked_coordinates`), and its terms' magnitude."""
     incident = solver.placement.row_incident.numpy()[:, solver.placement.body_base :].astype(np.float64)
-    Z = solver.placement.mf_Z.numpy().astype(np.float64)
+    Z = free_body_Z(solver).astype(np.float64)
     Z_a, Z_b = Z[..., :6], Z[..., 6:]
     # Each row's sides: its responding bodies' articulations (one-node trees), -1 for none.
     sides, kinds = (

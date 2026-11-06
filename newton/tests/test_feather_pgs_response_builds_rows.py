@@ -102,8 +102,10 @@ def _components_data(P, rng, *, qualified=True):
     """Paired component inputs of two worlds: the first qualifies (valid rows on their own components), the second
     has a dense row on the free body's coordinates."""
     M, F, W = 6, 3, P + 6
-    Y = np.zeros((2, M, W), np.float32)
-    Y[:, :, :P] = rng.normal(size=(2, M, P))
+    # The line's packed rows: the dense rows at their world coordinates, then the free bodies' (sides layout).
+    Y = np.zeros((2, M + F, W), np.float32)
+    Y[:, :M, :P] = rng.normal(size=(2, M, P))
+    Y[:, M:, : min(12, W)] = rng.normal(size=(2, F, min(12, W)))
     Y[1, 1, P + 2] = 1.0  # couples the components: the world falls back
     row_type = np.array([[0, 2, 2, 3, 0, 3]] * 2, np.int32)
     row_parent = np.array([[-1, 0, 0, -1, -1, -1]] * 2, np.int32)
@@ -136,8 +138,8 @@ def _components_data(P, rng, *, qualified=True):
         row_type=row_type,
         row_parent=row_parent,
         mf_meta=meta,
-        mf_Z=rng.normal(size=(2, F, 12)).astype(np.float32),
         mf_mu=np.full((2, F), 0.5, np.float32),
+        body_base=M,
         first=row_lines(DEVICE),
         mf_first=row_lines(DEVICE),
     )

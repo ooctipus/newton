@@ -694,7 +694,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
             placement.dense_first,
             placement.mf_contact_rows_end,
             placement.mf_meta_packed,
-            placement.mf_Z,
+            placement.packed_Z,
             placement.row_mu,
             placement.row_w,
             placement.body_base,

@@ -284,26 +284,27 @@ def free_class() -> RowClass:
     coordinates of ``v+`` at the sides' world coordinates. A speed row's term is ``-|v|`` of the coordinates its
     unwhitened axis marks, linear from ``e_0`` or angular from ``e_3``, its bias the limit
     (:func:`.projection_laws.speed_row`): the law's own term, not a ``Z`` row."""
-    operator = dataclasses.replace(free_body_rows(ONE), velocity=Velocity("u"))
+    operator = dataclasses.replace(free_body_rows(ONE, "S"), velocity=Velocity("u"))
     return RowClass(
         "free",
         (
             ("row_type", wp.array2d[int]),
             ("row_sides", wp.array2d[wp.vec2i]),
             ("base", int),
-            ("mf_Z", wp.array3d[float]),
+            ("packed_Z", wp.array3d[float]),
             ("dof_start", wp.array[int]),
             ("world_offset", wp.array[int]),
             ("v", wp.array[float]),
             ("coordinates", wp.array2d[float]),
         ),
         """    const int records = line * row_type.shape[1] + base;
-    const int mf12_base = line * mf_Z.shape[1] * 12;
+    const int S = packed_Z.shape[2];
+    const size_t free_base = ((size_t)line * packed_Z.shape[1] + base) * S;
     const float* u = coordinates.data + (size_t)world * coordinates.shape[1];""",
         f"""        const wp::vec2i sides = row_sides.data[records + i];
         float term = 0.0f;
         if (row_type.data[records + i] == {int(ROW_SPEED)}) {{
-            const int start = dof_start.data[sides[0]] + (mf_Z.data[mf12_base + i * 12 + 3] != 0.0f ? 3 : 0);
+            const int start = dof_start.data[sides[0]] + (packed_Z.data[free_base + i * S + 3] != 0.0f ? 3 : 0);
             term = -wp::length(wp::vec3(v.data[start], v.data[start + 1], v.data[start + 2]));
         }} else {{
             const int dof_a = sides[0] >= 0 ? world_offset.data[sides[0]] : -1;
@@ -573,7 +574,7 @@ class Audit:
                 placement.row_type,
                 placement.row_sides,
                 int(placement.body_base),
-                placement.mf_Z,
+                placement.packed_Z,
                 solver.factor.walk_view().dof_start,
                 forest.articulation_world_dof_offset,
                 v,

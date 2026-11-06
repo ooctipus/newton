@@ -187,7 +187,7 @@ def stage_slots(weighted: bool) -> wp.Kernel:
         unit_count: wp.array[wp.int32],
         color_slot: wp.array3d[wp.int32],
         mf_meta: wp.array2d[wp.int32],
-        mf_Z: wp.array3d[float],
+        packed_Z: wp.array3d[float],
         mf_row_mu: wp.array2d[float],
         mf_row_w: wp.array2d[float],
         body_base: int,
@@ -201,7 +201,8 @@ def stage_slots(weighted: bool) -> wp.Kernel:
         A unit stages only what its rows hold: its pair's friction coefficient when it has a friction pair, its spin row's
         when it has one, and its normal row's weight from ``mf_row_w`` only where the laws are weighted; otherwise the
         solver binds a one-element stand-in for the weights, and the row's weight is 1.
-        The coefficients and weights are the row store's, the free bodies' row ``i`` at ``body_base + i`` of the line.
+        The coefficients, weights and packed rows are the line's, the free bodies' row ``i`` at ``body_base + i``; a
+        row's entries in the sides layout (:func:`.sweep_routes.free_body_rows`), twelve, or as many as the line holds.
         """
         slot, p = wp.tid()
         world = slot_world[slot]
@@ -210,10 +211,14 @@ def stage_slots(weighted: bool) -> wp.Kernel:
         mf_line = mf_first[world]
         row = color_slot[slot, p, 0]
         rows = color_slot[slot, p, 1] & 7
+        width = wp.min(packed_Z.shape[2], 12)
         for r in range(4):
             if r < rows:
                 for k in range(12):
-                    slot_data[slot, r * 12 + k, p] = mf_Z[mf_line, row + r, k]
+                    z = float(0.0)
+                    if k < width:
+                        z = packed_Z[mf_line, body_base + row + r, k]
+                    slot_data[slot, r * 12 + k, p] = z
                 slot_words[slot, r * 3, p] = mf_meta[mf_line, (row + r) * 4 + 1]
                 slot_words[slot, r * 3 + 1, p] = mf_meta[mf_line, (row + r) * 4 + 2]
                 slot_words[slot, r * 3 + 2, p] = mf_meta[mf_line, (row + r) * 4 + 3]
@@ -630,7 +635,7 @@ class ColoredUnits:
         mf_first,
         mf_contact_rows_end,
         mf_meta,
-        mf_Z,
+        packed_Z,
         mf_row_mu,
         mf_row_w,
         body_base: int,
@@ -656,7 +661,7 @@ class ColoredUnits:
                 units["unit_count"],
                 units["color_slot"],
                 mf_meta,
-                mf_Z,
+                packed_Z,
                 mf_row_mu,
                 mf_row_w,
                 int(body_base),

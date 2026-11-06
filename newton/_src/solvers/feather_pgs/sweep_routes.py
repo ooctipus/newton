@@ -90,15 +90,14 @@ MF_GS_ABI = kernel_template.params(
     ("mf_constraint_count", wp.array[int]),
     ("mf_contact_rows_end", wp.array[int]),
     ("mf_meta", wp.array2d[int]),
-    ("mf_Z", wp.array3d[float]),
     ("walk", WalkTrees),
     ("iterations", int),
     ("omega", float),
     ("v_out", wp.array[float]),
 )
 """The matrix-free sweep's native ABI: one world per call (the world queue's dispatch). The free bodies' rows are the
-row store's (the ``world_*`` records, from the dense capacity of the world's line); their ``Z`` and headers the
-free bodies' placement (``mf_*``)."""
+row store's (the ``world_*`` records) and the packed rows' (``packed_Z``), from the dense capacity of the world's line;
+their headers the free bodies' placement (``mf_*``)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -215,14 +214,17 @@ def packed_operator(support: int, lanes: Lanes, *, wide: bool = False) -> Sparse
     return SparseFactor(int(support), coordinate, value, lanes, velocity=Velocity("s_v"))
 
 
-def free_body_rows(lanes: Lanes) -> SparseFactor:
+def free_body_rows(lanes: Lanes, support: int | str = 12) -> SparseFactor:
     """The free bodies' rows, whitened: ``Z = L^-1 J^T`` over at most two free bodies, the 6 + 6 support class.
 
     A free body is a one-node tree; ``L`` is its held factor (``H = L L^T``, armature included), and the sweep holds the
-    change of the body's six velocity coordinates in factor coordinates, ``u = L^T dv`` (``s_v``). Row ``r``'s twelve
-    entries are one packed row at ``mf_Z[mf12_base + 12 r]``: entry ``e < 6`` at body ``a``'s coordinate ``dof_a + e``,
-    entry ``e >= 6`` at body ``b``'s ``dof_b + e - 6``, none for a negative body (the visit's ``dof_a``, ``dof_b``, which
-    every row of a contact shares). The builder stores ``1 / A_ii`` (``A_ii = cfm + |Z|^2``) in the row's header word.
+    change of the body's six velocity coordinates in factor coordinates, ``u = L^T dv`` (``s_v``). Its rows are packed
+    rows of the line (:mod:`.packed_rows`, ``support`` entries a row) from the free bodies' first row's ``free_base``,
+    in the sides layout: entry ``e < 6`` at body ``a``'s coordinate ``dof_a + e``, entry ``e >= 6`` at body ``b``'s
+    ``dof_b + e - 6``, none for a negative body (the visit's ``dof_a``, ``dof_b``, which every row of a contact shares).
+    Twelve entries hold a row, or ``support`` where the line is narrower (no world holds two free bodies, so no row
+    has a second side; a ``support`` known only at run time, a native expression, reads twelve, each where its
+    coordinate exists). The builder stores ``1 / A_ii`` (``A_ii = cfm + |Z|^2``) in the row's header word.
 
     ``Z``'s place: with lanes, lane ``l < 12`` owns entry ``l`` and the visited row's (``row``) is the free bodies' row
     loop's register ``cur_z``, loaded a row ahead (:func:`.sweep.rows_block`); every other row, its friction sibling
@@ -240,9 +242,17 @@ def free_body_rows(lanes: Lanes) -> SparseFactor:
             if lanes.parallel:
                 return "cur_z"
             row = "i"
-        return f"mf_Z.data[mf12_base + {row} * 12 + {entry}]"
+        return f"packed_Z.data[free_base + {row} * {support} + {entry}]"
 
-    return SparseFactor(12, coordinate, value, lanes, velocity=Velocity("s_v"), registers=True, fused_pair_apply=False)
+    return SparseFactor(
+        12 if isinstance(support, str) else min(12, int(support)),
+        coordinate,
+        value,
+        lanes,
+        velocity=Velocity("s_v"),
+        registers=True,
+        fused_pair_apply=False,
+    )
 
 
 MAPPINGS = ("warp", "colored")
@@ -721,7 +731,7 @@ def mf_gs_source(
     dense = WorldRows(M_D, staging=places.staging, lanes=row_lanes)
     free = WorldRows(M_MF, staging="header", stream=places.impulses is Place.GLOBAL, lanes=row_lanes)
     dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows)
-    free_op = free_body_rows(row_lanes)
+    free_op = free_body_rows(row_lanes, max_row_dofs)
     staging = mf_gs_staging(
         M_D,
         M_MF,
@@ -901,8 +911,8 @@ def mf_gs_source(
     int off_dense = line * {P};
     int off_mf = off_dense + {M_D};
     int off_meta = line * {M_MF} * 4;{component}
-    const size_t packed_base = (size_t)line * {M_D * int(max_row_dofs)};
-    int mf12_base = line * {M_MF} * 12;{offsets}
+    const size_t packed_base = (size_t)line * {P * int(max_row_dofs)};
+    const size_t free_base = packed_base + {M_D * int(max_row_dofs)};{offsets}
 
 {staging.declarations("    ")}
 {free.declaration()}{trace_reduction}

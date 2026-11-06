@@ -83,11 +83,9 @@ def _ring_pool_dropped(solver):
         yield
 
 
-_MF_RECORDS = ("row_type", "row_parent", "row_mu", "rhs", "impulses", "phi", "row_sides")
-"""The free-body rows' records a slot permutation moves: the row store's, by the line's row (the slots' and parents'
-index)."""
-_MF_Z = ("mf_Z",)
-"""The free-body rows' placement a slot permutation moves, by the free bodies' own row."""
+_MF_RECORDS = ("row_type", "row_parent", "row_mu", "rhs", "impulses", "phi", "row_sides", "packed_Z")
+"""The free-body rows' records and packed rows a slot permutation moves: the line's, by the line's row (the slots' and
+parents' index)."""
 
 
 def _permuted_slots(solver, contacts, shift):
@@ -97,7 +95,7 @@ def _permuted_slots(solver, contacts, shift):
     world, needed = solver.placement.contact_world.numpy(), solver.placement.contact_slots_needed.numpy()
     base = solver.placement.body_base
     routed = [c for c in range(count) if path[c] == 1 and slot[c] >= 0 and needed[c] > 0]
-    rows = {name: getattr(solver.placement, name).numpy() for name in (*_MF_RECORDS, *_MF_Z)}
+    rows = {name: getattr(solver.placement, name).numpy() for name in _MF_RECORDS}
     permuted = {name: values.copy() for name, values in rows.items()}
     moved = {}
     for w in np.unique(world[routed]):
@@ -115,8 +113,6 @@ def _permuted_slots(solver, contacts, shift):
     for (w, old), new in moved.items():
         for name in _MF_RECORDS:
             permuted[name][w, new] = rows[name][w, old]
-        for name in _MF_Z:
-            permuted[name][w, new - base] = rows[name][w, old - base]
         parent = int(rows["row_parent"][w, old])
         permuted["row_parent"][w, new] = moved.get((w, parent), parent)
     arrays = {name: wp.array(values, device="cpu") for name, values in permuted.items()}

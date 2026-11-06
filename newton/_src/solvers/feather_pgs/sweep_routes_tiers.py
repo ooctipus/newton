@@ -128,11 +128,11 @@ def _operands(
     return groups, operands
 
 
-def _stored_row(max_constraints: int, dofs: int) -> str:
+def _stored_row(pitch: int, dofs: int) -> str:
     """Read the lane's row as the one writer stored it (:mod:`.walk_rows`: the packed sink at its world coordinates, the
-    slips' frame applied) and its incident velocity ``J v_hat`` (``row_incident``)."""
+    slips' frame applied; ``pitch`` rows a world's line) and its incident velocity ``J v_hat`` (``row_incident``)."""
     return (
-        f"        const float* Z_row = &packed_Z.data[((size_t)line * {max_constraints} + i) * packed_Z.shape[2]];\n"
+        f"        const float* Z_row = &packed_Z.data[((size_t)line * {pitch} + i) * packed_Z.shape[2]];\n"
         "        #pragma unroll\n"
         f"        for (int q = 0; q < {dofs}; ++q) Zi[q * ZS] = Z_row[q];\n"
         "        incident = row_incident.data[off_dense + i];"
@@ -200,7 +200,7 @@ def parallel_source(
         D,
         AM + 4,
         lanes,
-        read=operands.read if operands is not None else _stored_row(M_D, D),
+        read=operands.read if operands is not None else _stored_row(M_D if pitch is None else int(pitch), D),
         walked=operands is not None,
         frame=tuple(int(cap) for cap in frame),
         classes=len(classes),

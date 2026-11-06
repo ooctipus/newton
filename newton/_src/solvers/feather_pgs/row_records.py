@@ -6,7 +6,7 @@
 One store holds every world line's rows (:data:`DENSE_ROWS`): the dense class's from row 0, then the
 free bodies' from the store's ``body_base``. :data:`DenseRows` is the Warp struct of the dense class's records; the
 contact producers' input (:data:`.contact_input.ContactInput`) carries the same fields. :data:`MfRows` reads the free
-bodies' rows: the same records at ``base``, and their placement (bodies, coordinates, ``Z``).
+bodies' rows: the same records at ``base``. Every row's whitened ``Z`` is the packed rows' (:mod:`.packed_rows`).
 """
 
 import dataclasses
@@ -36,16 +36,13 @@ contact's slot and its rows' parents count in the line. ``row_incident`` is each
 incident velocity ``J v_hat``, written where its walk sums it: the one writer (:mod:`.walk_rows`), the free bodies'
 writer (:func:`.walk_rows.write_free_body_rows`)."""
 
-MF_ROWS = FieldGroup(
-    Field("mf_Z", wp.float32, ("world", "mf_row", 12), owner="placement"),
-    Field("mf_meta_packed", wp.int32, ("world", "mf_meta"), owner="placement"),
-)
-"""The free bodies' placement: each side's six entries (the row's Jacobian ``J`` as the writers store it, its whitened
-form ``Z = L^-1 J^T`` once the rows' build has run, ``L`` the body's held factor; two one-node trees of six), and the
-packed header the sweeps read, which the placement stages each step from the records: four ints per row (dof pair,
-inverse effective mass ``1 / A_ii``, the residual at zero velocity change, type and parent). The rows' records are the
-row store's (:data:`DENSE_ROWS`, from ``body_base``): their sides are their responding bodies' articulations in the
-rows' ``a``/``b`` order (-1 for none) and their ``diag`` the effective mass ``A_ii``."""
+MF_ROWS = FieldGroup(Field("mf_meta_packed", wp.int32, ("world", "mf_meta"), owner="placement"))
+"""The free bodies' packed header the sweeps read, which the placement stages each step from the records: four ints
+per row (dof pair, inverse effective mass ``1 / A_ii``, the residual at zero velocity change, type and parent). The
+rows themselves are the line's: their records the row store's (:data:`DENSE_ROWS`, from ``body_base``), their sides
+their responding bodies' articulations in the rows' ``a``/``b`` order (-1 for none), their ``diag`` the effective mass
+``A_ii``, and their whitened ``Z = L^-1 J^T`` (``L`` the body's held factor: two one-node trees of six) the packed
+rows' (:data:`.packed_rows.PACKED_ROWS`, the line's rows at the world's support)."""
 
 
 RECORDS = (
@@ -146,7 +143,6 @@ class RowSupport:
 
 
 MF_RECORDS = (
-    *(dataclasses.replace(MF_ROWS[attr], name=name, attr=attr) for name, attr in (("Z", "mf_Z"),)),
     *(
         dataclasses.replace(DENSE_ROWS[attr], name=name, attr=attr, owner="placement")
         for name, attr in (
@@ -167,8 +163,7 @@ MF_RECORDS = (
     Field("first", wp.int32, ("world",), attr="dense_first", owner="placement"),
     Field("base", wp.int32, attr="body_base", owner="placement"),
 )
-"""Each free-body row's per-body blocks (the writers' ``J``, whitened in place to ``Z`` by the rows' build), by world
-line and free-body row ``i``; and its records, the row store's at row ``base + i`` of the world's line (one row index
+"""Each free-body row's records, the row store's at row ``base + i`` of the world's line (one row index
 for both classes: a free-body contact's slot, its rows' parents): kind, friction parent, coefficient, the row law's
 beta, gap, restitution, incident velocity (``J v_hat``, stored by the build), rhs, target, effective mass ``A_ii``,
 material compliance and sides (the responding bodies' articulations in ``a``/``b`` order, -1 for none)."""

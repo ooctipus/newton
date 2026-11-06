@@ -47,12 +47,11 @@ PAIRED_COMPONENTS = (
     Field("row_type", wp.int32, ("world", "row"), owner="placement"),
     Field("row_parent", wp.int32, ("world", "row"), owner="placement"),
     Field("mf_meta", wp.int32, ("world", "mf_meta"), owner="step"),
-    Field("mf_Z", wp.float32, ("world", "mf_row", 12), owner="placement"),
     Field("body_base", wp.int32, owner="placement"),
 )
-"""The component classifier's inputs: the row store's records (the dense rows from row 0, packed and whitened at their
-world coordinates, :mod:`.packed_rows`; the free bodies' from ``body_base``) and the free bodies' placement, the pair
-layout and its own selector."""
+"""The component classifier's inputs: the row store's records and packed rows (the dense rows from row 0, whitened at
+their world coordinates, :mod:`.packed_rows`; the free bodies' from ``body_base``, in the sides layout), the free
+bodies' headers, the pair layout and its own selector."""
 
 PairedComponentData = field_group.struct("PairedComponentData", PAIRED_COMPONENTS, __name__)
 
@@ -205,10 +204,9 @@ _PAIRED_COMPONENTS = r"""
                         && static_cast<int>(static_cast<unsigned int>(t2) >> 16) == p;
                 }
             }
-            for (int d = 0; d < $SECONDARY; ++d) {
-                valid &= wp::isfinite(data.mf_Z.data[r * 2 * $SECONDARY + d])
-                    && wp::isfinite(data.mf_Z.data[r * 2 * $SECONDARY + $SECONDARY + d]);
-            }
+            // The row's packed entries, the two sides' six each where the line holds them (free_body_rows).
+            const float* z = data.Y.data + ((size_t)data.first.data[world] * M + data.body_base + row) * $WORLD;
+            for (int d = 0; d < 2 * $SECONDARY && d < $WORLD; ++d) valid &= wp::isfinite(z[d]);
         }
         if (ALL(valid != 0) && LANE == 0) data.selector.data[world] = -1;
     }

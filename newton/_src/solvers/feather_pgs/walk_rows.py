@@ -16,7 +16,7 @@ rows walked together from its first (1, 3, or 4 under contact torsion), or a joi
   table (:func:`packed_walker`), world-major with the bilateral blocks' closure (:func:`walked_rows_kernel`);
 - **the sparse diagonal** (case K2, FL3.5): the arm's side into the row's dense part, a key of the star one step to
   the row's slot (:func:`slot_rows_kernel`, :func:`slot_header`);
-- **the free bodies' rows** (``mf_Z``, each side's six of a row's twelve: a packed row by the free bodies' own row): a
+- **the free bodies' rows** (the packed rows of the line from ``body_base``, each side six entries): a
   contact row, or a speed row's axis, a covector at the body's root, for its diagonal, one writer over both
   (:func:`write_free_body_rows`), through the packed walker (:func:`packed_walker`).
 
@@ -399,7 +399,9 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tupl
         part: int,
     ):
         world, lane = wp.tid()
-        count = wp.min(counts[world], sink.entries.shape[1])
+        # The writer's rows are the line's dense rows: the packed rows past them are the free bodies'.
+        dense_rows = support.units.shape[1]
+        count = wp.min(counts[world], dense_rows)
         line = rows.first[world]
         # A world an in-kernel owner holds (``owned`` and ``owner`` nonzero: the local owners' packets, whose kernels
         # walk their seeds) is not the writer's: its whole group returns before any barrier.
@@ -410,7 +412,7 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tupl
         first = int(0)
         end = count
         if part == WRITE_TOPOLOGY:
-            end = wp.min(bounds[world, 1], sink.entries.shape[1])
+            end = wp.min(bounds[world, 1], dense_rows)
         elif part == WRITE_REST:
             first = wp.min(bounds[world, 1], count)
         if wp.static(block > 0):
@@ -817,7 +819,7 @@ class RowSink:
     each body's and coordinate's support mask (factor coordinates), each articulation's first world coordinate, and the
     rows' coordinates and block records; the packed rows' layout, where each side's entries sit in a packed row
     (:class:`.dense_rows.RowSupport`, :func:`packed_walker`), the star's coordinates (the sparse diagonal's), and the
-    free bodies' first row in the store's line (``base``: their entries index by their own row). A placement binds what
+    free bodies' first row in the store's line (``base``: their slots count from it). A placement binds what
     its writer reads."""
 
     walk: WalkTrees
@@ -948,17 +950,14 @@ _CLASS_TREE = """        // The tree's class: its path from the classes' tables 
 
 
 @cache
-def packed_walker(
-    rows: int, spin: bool, side: bool, tables: tuple, star: bool = False, bodies: bool = False
-) -> wp.Function:
+def packed_walker(rows: int, spin: bool, side: bool, tables: tuple, star: bool = False) -> wp.Function:
     """The general placement's unit walker (:data:`_SUPPORT`, the support writer's text with the packed rows as its
     sink): a unit's ``rows`` rows walked together through its tree's path, each footprint stored at its coordinate's entry
     in the side's packed row, its diagonal ``|z|^2 + cfm`` and incident ``J v_hat`` from the same walk; ``spin``: the
     unit's fourth row is its spin row; ``side``: whether records can have a side. With ``star``, the sparse diagonal's:
     the arm's side into the row's dense part (its size group's row, ``unit.group``), a key's side left to the writer
-    (:func:`star_step`), and the diagonal stored without its slots' squares and ``cfm``, which the writer adds. With
-    ``bodies``, the free bodies': their packed rows by their own row, the row's less ``sink.base``
-    (:func:`write_free_body_rows`). ``tables``: the walking classes' path tables (:func:`.factor.walk.walk_prelude`),
+    (:func:`star_step`), and the diagonal stored without its slots' squares and ``cfm``, which the writer adds.
+    ``tables``: the walking classes' path tables (:func:`.factor.walk.walk_prelude`),
     fixed at build, each tree's path read from constant memory by its class (one table: every tree's)."""
     tree = _CLASS_TREE if len(tables) > 1 else ""
     body = substitute(
@@ -982,7 +981,7 @@ def packed_walker(
         wrench=substitute(_PACKED_WRENCH, spin=int(spin)),
         close="",
         entries_end="S",
-        zrow="(unit.group * sink.entries.shape[1] + unit.slot)" if star else "(row0 - sink.base)" if bodies else "row0",
+        zrow="(unit.group * sink.entries.shape[1] + unit.slot)" if star else "row0",
         diag="norm[r]" if star else _HEADER_DIAG,
         # RD a plain load here, not the support writer's non-coherent __ldg: the K2 writer ran 1.4% faster on sm_120.
         rd="*p",
@@ -991,7 +990,6 @@ def packed_walker(
     walk = walk_prelude(tables, rows, half)
     tag = ("_spin" if spin else "") + walk.name.removeprefix(f"walk_{rows}")
     tag += "_star" if star else ""
-    tag += "_bodies" if bodies else ""
     snippet = dual_native(body, preludes=(walk, walk_row_prelude(rows)))
     return unit_walker(f"packed_walk_{rows}{tag}", snippet)
 
@@ -1596,11 +1594,12 @@ def packed_sink(solver) -> RowSink:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# The free bodies' rows: each side's six of a row's twelve, a packed row by the free bodies' own row
+# The free bodies' rows: packed rows of the line, each side six entries
 # ---------------------------------------------------------------------------------------------------------------------
 
-walk_body_row = packed_walker(1, False, True, walk_tables((FREE_BODY_WALK,)), bodies=True)
-"""The one unit walker into the free bodies' rows (:func:`packed_walker`): a row's sides from entry 0 and 6."""
+walk_body_row = packed_walker(1, False, True, walk_tables((FREE_BODY_WALK,)))
+"""The one unit walker into the free bodies' rows (:func:`packed_walker`), packed rows of the line in the sides layout:
+a row's sides in its ``a``/``b`` order, six entries each."""
 
 
 @wp.func
@@ -1672,9 +1671,9 @@ def free_body_speed_rows(
         k = 3 * speed_axis
         source = unit_source(UNIT_VELOCITY, 2 * (sink.walk.dof_start[art] + k))
         walk_body_row(sink, read_row_unit(rows, ContactInput(), PatchRowLaw(), JointSeeds(), line, row, source))
-        for e in range(12):
-            sink.entries[line, slot, e] = 0.0
-        sink.entries[line, slot, k] = 1.0
+        for e in range(sink.entries.shape[2]):
+            sink.entries[line, row, e] = 0.0
+        sink.entries[line, row, k] = 1.0
         sink.row_incident[line, row] = 0.0
         row_bias(rows, bias, line, row, 0.0)
 
@@ -1691,7 +1690,7 @@ def write_free_body_rows(
     threads: int,
     bias: RowBias,
 ):
-    """The free bodies' rows (``mf_Z``, each side's six of a row's twelve), once their families' slots are reserved:
+    """The free bodies' rows (the line's packed rows from ``body_base``), once their families' slots are reserved:
     ``threads`` lanes stride over their units, the step's contacts (:func:`free_body_contact_rows`, those the
     allocation routed to the free bodies), then the ``speed_bodies`` free rigid bodies' speed rows
     (:func:`free_body_speed_rows`). Every unit's seeds walk into the free-body sink with the row law after the walk; a
@@ -1705,11 +1704,12 @@ def write_free_body_rows(
 
 
 def free_body_sink(solver) -> RowSink:
-    """The free bodies' sink (:class:`RowSink`, :data:`walk_body_row`): their rows ``mf_Z`` by their own row from the
-    store's ``body_base``, each side's entries after the row's first side (the packed rows' layout, not dense)."""
+    """The free bodies' sink (:class:`RowSink`, :data:`walk_body_row`): the packed rows of the line from the store's
+    ``body_base`` (``base``: the free bodies' slots count from it), each side's entries after the row's first side (the
+    packed rows' sides layout, whatever the dense rows' layout: :func:`.sweep_routes.free_body_rows`)."""
     placement = solver.placement
     sink = row_sink(solver.factor, solver.forest, placement, solver.v_hat)
     layout = placement.row_support()
     layout.dense = 0
-    sink.layout, sink.entries, sink.base = layout, placement.mf_Z, int(placement.body_base)
+    sink.layout, sink.entries, sink.base = layout, placement.packed_Z, int(placement.body_base)
     return sink

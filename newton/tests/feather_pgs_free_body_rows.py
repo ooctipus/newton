@@ -18,7 +18,7 @@ from newton._src.core.memory import Place
 from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.factor.walk import unpack_walk_records
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
-from newton.tests.feather_pgs_law_harness import chain_walk
+from newton.tests.feather_pgs_law_harness import chain_walk, free_body_Z
 
 
 def free_body_jacobians(solver, Z_a=None, Z_b=None):
@@ -28,7 +28,7 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
     ones that whitened it, the step's).
     """
     # Each row's packed twelve: side a's six, then side b's.
-    Z = solver.placement.mf_Z.numpy()
+    Z = free_body_Z(solver)
     Z_a = Z[..., :6] if Z_a is None else np.asarray(Z_a)
     Z_b = Z[..., 6:] if Z_b is None else np.asarray(Z_b)
     sides = solver.placement.row_sides.numpy()[:, solver.placement.body_base :]
@@ -83,8 +83,9 @@ def sweep_free_body_rows(
     meta = np.zeros((1, capacity * 4), np.int32)
     for row in range(rows):
         meta[0, 4 * row : 4 * row + 4] = _pack(0, inverse[row], rhs[row], types[row], parents[row])
-    padded = np.zeros((1, capacity, 6), np.float32)
-    padded[0, :rows] = Z
+    # The line's packed rows (six entries: the body's coordinates), the free bodies' from the dense capacity.
+    packed = np.zeros((1, dense + capacity, 6), np.float32)
+    packed[0, dense : dense + rows] = Z
 
     def per_row(values, dtype=np.float32):
         out = np.zeros((1, dense + capacity), dtype)
@@ -101,7 +102,7 @@ def sweep_free_body_rows(
         "mf_contact_rows_end": wp.array((rows,), dtype=wp.int32, device=device),
         "mf_meta": wp.array(meta, device=device),
         "world_impulses": per_row(impulses),
-        "mf_Z": wp.array(np.concatenate([padded, np.zeros_like(padded)], axis=-1), device=device),
+        "packed_Z": wp.array(packed, device=device),
         "world_row_mu": per_row(mu),
         "world_row_w": per_row(np.ones(rows) if weights is None else weights),
         # The body's unit factor as a walk: the sweep adds its change into walk.du, which no row reads back.
