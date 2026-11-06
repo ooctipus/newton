@@ -211,17 +211,20 @@ class TestLevelsAreTheRowOrder(unittest.TestCase):
 class TestWorldLists(unittest.TestCase):
     def test_each_world_lands_in_its_claim_s_bucket(self):
         """A world of dense rows only (no speed row) and at most the bound lands in the bucket of its 32-row tier, once;
-        any other world with rows in the general bucket; a world without rows in none."""
+        any other world with rows in the colored candidates' bucket where it has a slot (and the claims have one), else
+        in the general bucket; a world without rows in none."""
         rng = np.random.default_rng(7)
         worlds, bound, width = 500, 100, 32
         rows = rng.integers(0, 140, worlds).astype(np.int32)
         free = (rng.random(worlds) < 0.2).astype(np.int32) * rng.integers(1, 9, worlds).astype(np.int32)
         # Where the line's speed rows start: a world with any (rows past it) is the general sweep's too.
         speed_first = rows - (rng.random(worlds) < 0.2).astype(np.int32) * rng.integers(0, 3, worlds).astype(np.int32)
+        slot = np.where(rng.random(worlds) < 0.3, np.arange(worlds), -1).astype(np.int32)
         tiers = -(-bound // width)
-        for device in _devices():
-            with self.subTest(device=device):
-                claims = Queue((tiers + 1) * worlds, device, buckets=tiers + 1)
+        for device, candidates in itertools.product(_devices(), (False, True)):
+            with self.subTest(device=device, candidates=candidates):
+                buckets = tiers + 1 + int(candidates)
+                claims = Queue(buckets * worlds, device, buckets=buckets)
                 wp.launch(
                     sweep_levels.claim_worlds,
                     dim=worlds,
@@ -229,22 +232,28 @@ class TestWorldLists(unittest.TestCase):
                         wp.array(rows, dtype=int, device=device),
                         wp.array(free, dtype=int, device=device),
                         wp.array(speed_first, dtype=int, device=device),
+                        wp.array(slot, dtype=wp.int32, device=device),
                         bound,
                         width,
                         tiers,
+                        tiers + 1 if candidates else -1,
                         claims.region,
                     ],
                     outputs=[claims.items, claims.count],
                     device=device,
                 )
                 tiered = (rows > 0) & (rows <= bound) & (free == 0) & (rows <= speed_first)
-                for bucket in range(tiers + 1):
+                rest = ~tiered & ((rows > 0) | (free > 0))
+                slotted = (slot >= 0) & candidates
+                for bucket in range(buckets):
                     count, items = (array.numpy() for array in claims.bucket(bucket))
                     if bucket < tiers:
                         lo, hi = bucket * width, min((bucket + 1) * width, bound)
                         want = np.flatnonzero((rows > lo) & (rows <= hi) & tiered)
+                    elif bucket == tiers:
+                        want = np.flatnonzero(rest & ~slotted)
                     else:
-                        want = np.flatnonzero(~tiered & ((rows > 0) | (free > 0)))
+                        want = np.flatnonzero(rest & slotted)
                     self.assertEqual(int(count[0]), want.size)
                     np.testing.assert_array_equal(np.sort(items[: count[0]]), want)
 
@@ -263,9 +272,11 @@ class TestWorldLists(unittest.TestCase):
                         wp.array(rows, dtype=int, device=device),
                         wp.zeros(worlds, dtype=int, device=device),
                         wp.array(rows, dtype=int, device=device),
+                        wp.zeros(1, dtype=wp.int32, device=device),
                         3 * width,
                         width,
                         3,
+                        -1,
                         lists.region,
                     ],
                     outputs=[lists.items, lists.count],

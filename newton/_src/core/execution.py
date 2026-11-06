@@ -34,6 +34,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import math
+import string
 
 import warp as wp
 
@@ -155,21 +156,30 @@ class Queue:
 _APPEND = r"""
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     // The warp's lanes that append to one bucket share one atomic: the lowest takes their slots, each its rank.
-    const unsigned peers = __match_any_sync(__activemask(), bucket);
+    const unsigned peers = __match_any_sync(__activemask(), $bucket);
     const int lane = (int)(threadIdx.x & 31), leader = __ffs(peers) - 1;
     int first = 0;
-    if (lane == leader) first = atomicAdd(&count.data[bucket], __popc(peers));
+    if (lane == leader) first = atomicAdd(&$count.data[$bucket], __popc(peers));
     const int slot = __shfl_sync(peers, first, leader) + __popc(peers & ((1u << lane) - 1u));
 #elif defined(__CUDA_ARCH__)
-    const int slot = atomicAdd(&count.data[bucket], 1);
+    const int slot = atomicAdd(&$count.data[$bucket], 1);
 #else
-    const int slot = count.data[bucket]++;
+    const int slot = $count.data[$bucket]++;
 #endif
-    if (slot < region) items.data[bucket * region + slot] = item;
+    if (slot < $region) $items.data[$bucket * $region + slot] = $item;
 """
 
 
-@wp.func_native(_APPEND)
+def appended(items: str, count: str, bucket: str, region: str, item: str) -> str:
+    """:func:`append`'s statements over a native body's names (a :class:`Queue`'s ``items`` and ``count``, and plain
+    names, not expressions, for the rest), for a native kernel that appends: one append, in either form. The
+    statements declare ``peers``, ``lane``, ``leader``, ``first`` and ``slot``: the caller puts them in a block of
+    their own."""
+    names = {"items": items, "count": count, "bucket": bucket, "region": region, "item": item}
+    return string.Template(_APPEND).substitute(names)
+
+
+@wp.func_native(appended("items", "count", "bucket", "region", "item"))
 def append(items: wp.array[int], count: wp.array[int], bucket: int, region: int, item: int):
     """Append ``item`` to bucket ``bucket`` of a :class:`Queue`'s ``items`` and ``count`` (one kind), one atomic a
     warp a bucket (:attr:`Order.GROUP`): the warp's appends to a bucket take consecutive slots in lane order, from one

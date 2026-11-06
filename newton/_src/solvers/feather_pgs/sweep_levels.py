@@ -143,18 +143,23 @@ def claim_worlds(
     rows: wp.array[int],
     free_body_rows: wp.array[int],
     speed_first: wp.array[int],
+    slot: wp.array[wp.int32],
     bound: int,
     width: int,
     general: int,
+    candidate: int,
     region: int,
-    # outputs: a Queue's (execution.Queue), a bucket a tier, then the general sweep's
+    # outputs: a Queue's (execution.Queue), a bucket a tier, then the general sweep's and the colored candidates'
     items: wp.array[int],
     count: wp.array[int],
 ):
     """Write each world with rows into its class's bucket of one queue of ``region`` slots a bucket: a world whose rows
-    are dense only and at most ``bound`` into its Jacobi tier's, ``(rows - 1) // width``; any other world with rows
-    into ``general``, the general sweep's. A world without rows takes none. A free body's rows are not dense only:
-    those in the free bodies' run (``free_body_rows``) and the line's speed rows (its rows from ``speed_first``).
+    are dense only and at most ``bound`` into its Jacobi tier's, ``(rows - 1) // width``; any other world with a colored
+    storage ``slot`` (``slot[world] >= 0``, :class:`.sweep_units.ColoredUnits`) into ``candidate``, which the unit
+    builder walks and splits into the colored bucket and the general one (``candidate`` negative: no colored mapping,
+    and ``slot`` is not read); the rest into ``general``, the general sweep's. A world without rows takes none. A free
+    body's rows are not dense only: those in the free bodies' run (``free_body_rows``) and the line's speed rows (its
+    rows from ``speed_first``).
 
     A claim's worlds share nothing with another's, so each is a component of its own and the order inside a bucket is
     free (:func:`~newton._src.core.execution.append`'s, an atomic a warp a bucket); tier ``t`` serves
@@ -169,6 +174,9 @@ def claim_worlds(
     bucket = general
     if mf == 0 and m <= bound and m <= speed_first[world]:
         bucket = (m - 1) // width
+    elif candidate >= 0:
+        if slot[world] >= 0:
+            bucket = candidate
     append(items, count, bucket, region, world)
 
 

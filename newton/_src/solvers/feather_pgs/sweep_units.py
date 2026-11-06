@@ -35,12 +35,14 @@ the rows are.
 from __future__ import annotations
 
 import dataclasses
+import re
 from functools import cache
 from typing import NamedTuple
 
 import numpy as np
 import warp as wp
 
+from ...core.execution import Queue, appended
 from ...core.memory import STATIC_SHARED_BYTES, Buffer, Staging, static_budget
 from . import kernel_template, sweep_levels
 from .device_preludes import SHARED_STORAGE, cuda_native, lane_group
@@ -98,14 +100,12 @@ clutter, about 12 units per color, gain 5.7 and 2.4x at 128 worlds. At 1024 worl
 lose at 2.3 and 6.6 units per color (0.35 and 0.62x), as :meth:`ColoredRule.at_scale` requires."""
 
 WORLD_FIELDS = FieldGroup(
-    # 1 where the colored mapping takes the world (:class:`ColoredRule`), else 0: the one-warp mapping keeps it.
-    Field("world_colored", wp.int32, ("world",)),
     # The world's storage slot, -1 for a world that cannot take the colored mapping (:func:`capable_worlds`).
     Field("world_slot", wp.int32, ("world",)),
     Field("unit_count", wp.int32, ("world",)),
     Field("color_count", wp.int32, ("world",)),
 )
-"""Every world's mapping, slot and unit and color counts."""
+"""Every world's slot and unit and color counts (a candidate's, as the unit builder last walked it)."""
 
 UNIT_FIELDS = FieldGroup(
     # First row and row count of each unit, in row order.
@@ -182,8 +182,9 @@ def stage_slots(weighted: bool) -> wp.Kernel:
     @wp.kernel(enable_backward=False, module="unique")
     def stage(
         mf_first: wp.array[int],
-        slot_world: wp.array[wp.int32],
-        world_colored: wp.array[wp.int32],
+        colored_count: wp.array[int],
+        colored_worlds: wp.array[int],
+        world_slot: wp.array[wp.int32],
         unit_count: wp.array[wp.int32],
         color_slot: wp.array3d[wp.int32],
         mf_meta: wp.array2d[wp.int32],
@@ -195,8 +196,9 @@ def stage_slots(weighted: bool) -> wp.Kernel:
         slot_data: wp.array3d[float],
         slot_words: wp.array3d[wp.int32],
     ):
-        """Gather each colored world's unit rows into its slot's slot-major :data:`SLOT_FIELDS` (one thread per slot and
-        unit), in the :class:`SlotLayout` of units of at most ``layout_rows`` rows.
+        """Gather each colored world's unit rows into its slot's slot-major :data:`SLOT_FIELDS` (one thread per item of
+        the colored bucket, ``colored_count[0]`` worlds of ``colored_worlds``, and unit), in the :class:`SlotLayout` of
+        units of at most ``layout_rows`` rows.
 
         A unit stages only what its rows hold: its pair's friction coefficient when it has a friction pair, its spin row's
         when it has one, and its normal row's weight from ``mf_row_w`` only where the laws are weighted; otherwise the
@@ -204,9 +206,12 @@ def stage_slots(weighted: bool) -> wp.Kernel:
         The coefficients, weights and packed rows are the line's, the free bodies' row ``i`` at ``body_base + i``; a
         row's entries in the sides layout (:func:`.sweep_routes.free_body_rows`), twelve, or as many as the line holds.
         """
-        slot, p = wp.tid()
-        world = slot_world[slot]
-        if world_colored[world] == 0 or p >= unit_count[world]:
+        item, p = wp.tid()
+        if item >= colored_count[0]:
+            return
+        world = colored_worlds[item]
+        slot = world_slot[world]
+        if p >= unit_count[world]:
             return
         mf_line = mf_first[world]
         row = color_slot[slot, p, 0]
@@ -338,16 +343,16 @@ SHARED_DECLARATIONS
     const int mf_line = mf_first.data[world];
     __builtin_assume(mf_line >= 0);
     const int off_meta = mf_line * MF_ROWS * 4;
-    // The world's slot holds its units and colors; a world without one, or with fewer contact rows than the rule's
-    // units, keeps the one-warp sweep: no units.
+    // The world's slot (a candidate's: the claim stage's) holds its units and colors; a world with fewer contact rows
+    // than the rule's units keeps the one-warp sweep: no units, the general bucket.
     const int slot = world_slot.data[world];
     const int off_mf = slot * UNITS;
     const int off_color = slot * (UNITS + 1);
-    if (slot < 0 || end < MIN_UNITS) {
+    if (end < MIN_UNITS) {
         if (tid == 0) {
-            world_colored.data[world] = 0;
             unit_count.data[world] = 0;
             color_count.data[world] = 0;
+            APPEND_CLAIM(general_bucket)
         }
         return;
     }
@@ -398,9 +403,9 @@ SHARED_DECLARATIONS
     if (units > UNITS) {
         // Past the slot's units: the one-warp sweep keeps the world, and the units' capacity status records it once.
         if (tid == 0) {
-            world_colored.data[world] = 0;
             unit_count.data[world] = units;
             color_count.data[world] = 0;
+            APPEND_CLAIM(general_bucket)
             if (atomicOr(&unit_status.data[0], 1) == 0)
                 printf("Warning: FeatherPGS colored sweep: world %d has %d contact units, over its slot's %d; the "
                        "one-warp mapping keeps it.\n", world, units, UNITS);
@@ -452,7 +457,7 @@ LEVEL_OFFSETS
     }
     if (tid == 0) {
         unit_count.data[world] = units;
-        world_colored.data[world] = COLORED(units, colors) ? 1 : 0;
+        APPEND_CLAIM(COLORED(units, colors) ? colored_bucket : general_bucket)
     }
 #endif
 """
@@ -504,6 +509,17 @@ _SPIN_UNIT_ROWS = """            while (row + rows < end && rows < 4) {
 """Under contact torsion: its friction pair, then its spin row."""
 
 
+def _append_claim(match: re.Match) -> str:
+    """``APPEND_CLAIM(bucket)`` in the builder's source: the world appended to the claims' ``bucket``, the one append's
+    statements (:func:`~newton._src.core.execution.appended`) in a block of their own."""
+    pad = match.group(1)
+    statements = appended("claim_items", "claim_count", "claim", "claim_region", "world").strip("\n")
+    inner = "\n".join(
+        f"{pad}    {line.strip()}" if not line.startswith("#") else line for line in statements.splitlines()
+    )
+    return f"{pad}{{\n{pad}    const int claim = {match.group(2)};\n{inner}\n{pad}}}\n"
+
+
 def build_units_kernel(
     mf_rows: int,
     dofs: int,
@@ -516,12 +532,14 @@ def build_units_kernel(
     """The unit builder of worlds with ``mf_rows`` free-body rows and ``dofs`` coordinates, in slots of ``units``
     units (:func:`unit_capacity`); under contact ``torsion`` a unit's spin row follows its pair.
 
-    One block of :data:`BUILD_WARPS` warps per world: launch ``dim=[worlds]`` tiled with ``block_dim=32 *
+    One block of :data:`BUILD_WARPS` warps per world of the claims' candidate bucket (a world with a slot,
+    :func:`.sweep_levels.claim_worlds`): launch tiled over the bucket's capacity, the slots, with ``block_dim=32 *
     BUILD_WARPS``. Inputs: ``mf_constraint_count``, ``mf_contact_rows_end`` and ``mf_meta``; outputs:
-    :data:`WORLD_FIELDS` (each world's mapping by ``rule``; ``world_slot`` is read) and its slot's
-    :data:`UNIT_FIELDS`. A world without a slot, or with fewer contact rows than the rule's units, takes no units, and
-    a world of more units than its slot holds sets ``unit_status``: the one-warp sweep keeps both. Its shared working set (:func:`build_staging`) must fit ``static_bytes`` (a device's
-    :func:`.memory.static_budget`).
+    :data:`WORLD_FIELDS` (``world_slot`` is read) and its slot's :data:`UNIT_FIELDS`, and each world appended to the
+    claims' colored bucket or their general one by ``rule`` (:func:`~newton._src.core.execution.append`'s
+    statements). A world with fewer contact rows than the rule's units takes no units, and a world of more units than
+    its slot holds sets ``unit_status``: the one-warp sweep keeps both. Its shared working set (:func:`build_staging`)
+    must fit ``static_bytes`` (a device's :func:`.memory.static_budget`).
     """
     staging = build_staging(dofs)
     staging.check("the unit builder", static_bytes)
@@ -547,6 +565,8 @@ def build_units_kernel(
             "#undef CONTACT\n#undef FRICTION\n#undef PARENT\n#endif",
         )
     )
+    # The appends last: their statements hold a preprocessor branch of their own.
+    source = re.sub(r"( *)APPEND_CLAIM\((.*)\)\n", _append_claim, source)
     params = kernel_template.params(
         ("mf_constraint_count", wp.array[int]),
         ("mf_first", wp.array[int]),
@@ -555,12 +575,18 @@ def build_units_kernel(
         *WORLD_FIELDS,
         *UNIT_FIELDS,
         ("unit_status", wp.array[int]),
+        # The claims (execution.Queue) the builder appends each world to: its colored bucket or its general one.
+        ("claim_items", wp.array[int]),
+        ("claim_count", wp.array[int]),
+        ("claim_region", int),
+        ("colored_bucket", int),
+        ("general_bucket", int),
     )
     return KernelTemplate(
         f"sweep_units_{mf_rows}_{dofs}_{int(units)}_{rule.name}_w{BUILD_WARPS}" + ("_torsion" if torsion else ""),
         params,
         cuda_native(source, preludes=(lane_group(32), SHARED_STORAGE)),
-        dispatch=kernel_template.items("world"),
+        dispatch=kernel_template.items("world", queue=("candidate_count", "candidate_stride", "candidate_worlds")),
         composed=True,
         native_name="sweep_units_native",
         launch_bounds=(32 * BUILD_WARPS, 1),
@@ -571,9 +597,10 @@ class ColoredUnits:
     """The units and colors of the worlds the colored sweep may take, built from the packed rows at every pack.
 
     Only the capable worlds (:func:`capable_worlds`) hold storage, a slot each; the others always keep the one-warp
-    mapping. Every world holds its mapping, slot and counts (:data:`WORLD_FIELDS`). A slot holds
-    :func:`unit_capacity` units; a world with more keeps the one-warp mapping and sets the capacity status
-    (:meth:`capacity_status`).
+    mapping. Every world holds its slot and counts (:data:`WORLD_FIELDS`). A slot holds :func:`unit_capacity` units; a
+    world with more keeps the one-warp mapping and sets the capacity status (:meth:`capacity_status`). The mapping is
+    a claim: the builder walks the claims' candidate bucket (the worlds with rows and a slot,
+    :func:`.sweep_levels.claim_worlds`) and appends each to the colored bucket or the general one.
 
     Args:
         world_count: Worlds of the solver.
@@ -584,6 +611,8 @@ class ColoredUnits:
         rule: Which of them take the colored mapping at a pack (:class:`ColoredRule`).
         torsion: Contact torsion: a unit's spin row follows its friction pair (:func:`slot_layout`).
         weighted: The laws' weighted rows: a unit stages its normal row's weight (:func:`stage_slots`).
+        claims: The step's claims (:attr:`.sweep_plan.Sweep.claims`).
+        buckets: Its candidate, colored and general buckets.
     """
 
     def __init__(
@@ -597,8 +626,12 @@ class ColoredUnits:
         rule: ColoredRule = COLORED_RULE,
         torsion: bool = False,
         weighted: bool = False,
+        claims: Queue,
+        buckets: tuple[int, int, int],
     ):
         self.world_count, self.mf_rows = int(world_count), int(mf_rows)
+        self.claims = claims
+        self.candidate, self.colored, self.general = buckets
         self.unit_capacity = unit_capacity(self.mf_rows)
         slot_world = np.asarray(worlds, dtype=np.int32)
         self.slot_count = int(slot_world.size)
@@ -611,7 +644,6 @@ class ColoredUnits:
         world_slot = np.full(self.world_count, -1, dtype=np.int32)
         world_slot[slot_world] = np.arange(self.slot_count, dtype=np.int32)
         self.units["world_slot"] = wp.array(world_slot, dtype=wp.int32, device=device)
-        self.slot_world = wp.array(slot_world, dtype=wp.int32, device=device)
         self.slots = {
             field.name: wp.zeros(field.shape(sizes), dtype=field.dtype, device=device) for field in SLOT_FIELDS
         }
@@ -640,14 +672,33 @@ class ColoredUnits:
         mf_row_w,
         body_base: int,
     ) -> None:
-        """Build every capable world's units and colors and stage the colored worlds' rows by color slot (the row
-        weights ``mf_row_w`` only where the laws are weighted: :func:`stage_slots`)."""
-        units = self.units
+        """Build each candidate world's units and colors, claim it for the colored mapping or the general one, and
+        stage the colored worlds' rows by color slot (the row weights ``mf_row_w`` only where the laws are weighted:
+        :func:`stage_slots`). Both launches walk their bucket on a grid of its capacity, the slots."""
+        units, claims = self.units, self.claims
+        candidates, candidate_worlds = claims.bucket(self.candidate)
+        colored, colored_worlds = claims.bucket(self.colored)
         wp.launch_tiled(
             self.build_kernel,
-            dim=[self.world_count],
-            inputs=[mf_constraint_count, mf_first, mf_contact_rows_end, mf_meta],
-            outputs=[*(units[field.name] for field in (*WORLD_FIELDS, *UNIT_FIELDS)), self.status],
+            dim=[self.slot_count],
+            inputs=[
+                candidates,
+                self.slot_count,
+                candidate_worlds,
+                mf_constraint_count,
+                mf_first,
+                mf_contact_rows_end,
+                mf_meta,
+            ],
+            outputs=[
+                *(units[field.name] for field in (*WORLD_FIELDS, *UNIT_FIELDS)),
+                self.status,
+                claims.items,
+                claims.count,
+                claims.region,
+                self.colored,
+                self.general,
+            ],
             block_dim=32 * BUILD_WARPS,
             device=self.device,
         )
@@ -656,8 +707,9 @@ class ColoredUnits:
             dim=(self.slot_count, self.unit_capacity),
             inputs=[
                 mf_first,
-                self.slot_world,
-                units["world_colored"],
+                colored,
+                colored_worlds,
+                units["world_slot"],
                 units["unit_count"],
                 units["color_slot"],
                 mf_meta,
@@ -672,14 +724,9 @@ class ColoredUnits:
         )
 
     @property
-    def world_colored(self) -> wp.array:
-        """Each world's mapping (1: colored), which the one-warp sweep reads to leave those worlds."""
-        return self.units["world_colored"]
-
-    @property
     def nbytes(self) -> int:
         """Device memory of the units, colors and staged slots [B]."""
-        arrays = (*self.units.values(), *self.slots.values(), self.slot_world, self.status)
+        arrays = (*self.units.values(), *self.slots.values(), self.status)
         return sum(array.capacity for array in arrays)
 
     def capacity_status(self) -> bool:
@@ -689,19 +736,24 @@ class ColoredUnits:
 
     def operands(self) -> dict:
         """The colored sweep's operands by name (:data:`.sweep_routes.COLORED_ABI`, after the matrix-free sweep's)."""
-        names = ("world_colored", "world_slot", "color_count", "color_offset", "color_slot")
+        names = ("world_slot", "color_count", "color_offset", "color_slot")
         return {**{name: self.units[name] for name in names}, **self.slots}
 
     def stats(self) -> list[dict]:
-        """The last build's units, colors, largest color and mapping of each world that took units (a host
-        readback)."""
+        """The last build's units, colors, largest color and mapping of each candidate world that took units, in world
+        order (a host readback)."""
+
+        def bucket(b: int) -> np.ndarray:
+            count, items = self.claims.bucket(b)
+            return items.numpy()[: int(count.numpy()[0])]
+
         counts = self.units["unit_count"].numpy()
         colors = self.units["color_count"].numpy()
         offsets = self.units["color_offset"].numpy()
-        colored = self.units["world_colored"].numpy()
         slots = self.units["world_slot"].numpy()
+        colored = set(bucket(self.colored).tolist())
         worlds = []
-        for world in range(self.world_count):
+        for world in sorted(bucket(self.candidate).tolist()):
             if counts[world] == 0:
                 continue
             slot = int(slots[world])
@@ -713,7 +765,7 @@ class ColoredUnits:
                     "units": int(counts[world]),
                     "colors": int(colors[world]),
                     "largest_color": int(sizes.max()) if colors[world] else 0,
-                    "colored": bool(colored[world]),
+                    "colored": world in colored,
                 }
             )
         return worlds

@@ -60,13 +60,10 @@ _LINE_ADMISSION = f"if (row_type == {VELOCITY_LIMIT} || row_type == {SPEED}) con
 _MF_ADMISSION = f"if (mf_rt == {SPEED}) continue;"
 
 
-def worlds(queued: bool) -> kernel_template.Dispatch:
-    """The worlds a sweep launch covers, chosen once in the plan: a block a world, or (``queued``) a device list of
-    them (``general_worlds``, its count first) walked with the grid's stride: its claim's bucket of the claims' worlds
-    (:func:`.sweep_levels.claim_worlds`)."""
-    return kernel_template.items(
-        "world", queue=("general_world_count", "general_world_grid_stride", "general_worlds") if queued else None
-    )
+def worlds() -> kernel_template.Dispatch:
+    """The worlds a sweep launch covers: its claim's bucket of the claims' worlds (:func:`.sweep_levels.claim_worlds`),
+    a device list (``general_worlds``, its count first) walked with the grid's stride."""
+    return kernel_template.items("world", queue=("general_world_count", "general_world_grid_stride", "general_worlds"))
 
 
 MF_GS_ABI = kernel_template.params(
@@ -276,13 +273,8 @@ COLORED_WORK = Work(0, lanes=COLORED_THREADS, registers=REGISTERS_PER_THREAD)
 COLOR_CHUNK = 256
 """Color offsets a colored block stages at a time: a world's colors are bounded by its units, not by the block."""
 
-COLORED_WORLDS_ABI = kernel_template.params(*MF_GS_ABI[:-1], ("world_colored", wp.array[int]), MF_GS_ABI[-1])
-"""The one-warp mapping's ABI beside the colored one: the matrix-free sweep's, then each world's mapping
-(:data:`.sweep_units.UNIT_FIELDS`' ``world_colored``) before ``v_out``."""
-
 COLORED_ABI = kernel_template.params(
     *MF_GS_ABI[:-1],
-    ("world_colored", wp.array[int]),
     ("world_slot", wp.array[int]),
     ("color_count", wp.array[int]),
     ("color_offset", wp.array2d[int]),
@@ -292,8 +284,7 @@ COLORED_ABI = kernel_template.params(
     ("slot_metric", wp.array3d[float]),
     ("v_out", wp.array[float]),
 )
-"""The colored mapping's native ABI: the matrix-free sweep's, then each world's mapping and storage slot, the worlds'
-color counts, their slots' colors and staged units (:data:`.sweep_units.WORLD_FIELDS`, :data:`.sweep_units.UNIT_FIELDS`,
+"""The colored mapping's native ABI: the matrix-free sweep's, then each world's storage slot, the worlds' color counts, their slots' colors and staged units (:data:`.sweep_units.WORLD_FIELDS`, :data:`.sweep_units.UNIT_FIELDS`,
 :data:`.sweep_units.SLOT_FIELDS`) before ``v_out``."""
 
 
@@ -680,7 +671,6 @@ def mf_gs_source(
     *,
     max_row_dofs: int | None = None,
     mapping: str = "warp",
-    colored_worlds: bool = False,
     places: RowPlaces = STAGED_ROWS,
     has_dense_velocity_limit_rows: bool = True,
     contact_torsion: bool = False,
@@ -704,10 +694,9 @@ def mf_gs_source(
 
     ``mapping`` places the free-body rows on threads (:data:`MAPPINGS`): ``"warp"``, the world's warp visits them in
     row order; ``"colored"``, a block of :data:`COLORED_THREADS` visits their colors in order and a color's units at
-    once, the world's first warp running everything else. Both are the same row-order Gauss-Seidel sweep. Each world's
-    mapping is the unit builder's (``world_colored``, :class:`.sweep_units.ColoredRule`): the colored kernel returns
-    for the warp's worlds and, with ``colored_worlds`` (the solver builds both), the warp's kernel for the colored
-    ones.
+    once, the world's first warp running everything else. Both are the same row-order Gauss-Seidel sweep. Each walks
+    its claim's bucket (:func:`worlds`): the unit builder's rule (:class:`.sweep_units.ColoredRule`) appends a world to
+    the colored bucket or the general one.
 
     With ``weighted`` contact rows step by their regularization weights, ``material`` contacts' from their compliance
     (:class:`.sweep.RowLaws`, a constant of the step's laws).
@@ -725,7 +714,7 @@ def mf_gs_source(
     if mapping not in MAPPINGS:
         raise ValueError(f"mapping must be one of {MAPPINGS}, got {mapping!r}")
     colored = mapping == "colored"
-    if (colored or colored_worlds) and not free_rows:
+    if colored and not free_rows:
         raise ValueError("the colored mapping sweeps the free bodies' run: it needs free_rows")
     if lanes not in (1, 32) or (colored and lanes != 32):
         raise ValueError(f"the warp mapping runs 32 lanes or one thread, the colored mapping 32; got {lanes}")
@@ -754,10 +743,6 @@ def mf_gs_source(
     )
 
     dense_count = "int m_dense = world_constraint_count.data[world];"
-    mapped = ""
-    if colored or colored_worlds:
-        # The worlds of the other mapping, as the unit builder assigned them at the pack.
-        mapped = f"\n    if (world_colored.data[world] {'==' if colored else '!='} 0) return;"
     dense_loads = indent(dense.loads("i"), "        ")
     mf_load = free.loads("i")
     mf_store = free.stores("i")
@@ -942,7 +927,7 @@ def mf_gs_source(
     if (m_dense > {M_D}) m_dense = {M_D};
     if (m_mf > {M_MF}) m_mf = {M_MF};
     int mf_contact_end = mf_contact_rows_end.data[world];
-    if (mf_contact_end > m_mf) mf_contact_end = m_mf;{mapped}
+    if (mf_contact_end > m_mf) mf_contact_end = m_mf;
 
     int dof_map_base = world * {D};
     const int line = dense_first.data[world];
@@ -995,7 +980,6 @@ def mf_gs_kernel(
     *,
     max_row_dofs: int | None = None,
     mapping: str = "warp",
-    colored_worlds: bool = False,
     places: RowPlaces = STAGED_ROWS,
     has_dense_velocity_limit_rows: bool = True,
     contact_torsion: bool = False,
@@ -1010,9 +994,9 @@ def mf_gs_kernel(
 ) -> wp.Kernel:
     """The matrix-free Gauss-Seidel sweep kernel of a thread mapping (:func:`mf_gs_source`): the warp's launches a
     warp per world item (one thread on the CPU, :func:`.execution.device_lanes`) and takes :data:`MF_GS_ABI`
-    (:data:`COLORED_WORLDS_ABI` with ``colored_worlds``), the colored one :data:`COLORED_THREADS` and takes
-    :data:`COLORED_ABI`. The warp's walks its worlds from a device list (:func:`worlds`): the general sweep's bucket of
-    the claims' worlds (:func:`.sweep_levels.claim_worlds`), which holds no Jacobi tier's world."""
+    the colored one :data:`COLORED_THREADS` and takes :data:`COLORED_ABI`. Each walks its worlds from a device list
+    (:func:`worlds`): its bucket of the claims' worlds (:func:`.sweep_levels.claim_worlds`), the general sweep's (no
+    Jacobi tier's world, no colored one) or the colored one's (the unit builder's appends)."""
     max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
     snippet, staging = mf_gs_source(
         max_constraints,
@@ -1020,7 +1004,6 @@ def mf_gs_kernel(
         max_world_dofs,
         max_row_dofs=max_row_dofs,
         mapping=mapping,
-        colored_worlds=colored_worlds,
         places=places,
         has_dense_velocity_limit_rows=has_dense_velocity_limit_rows,
         contact_torsion=contact_torsion,
@@ -1042,7 +1025,6 @@ def mf_gs_kernel(
         f"_densevlim{int(has_dense_velocity_limit_rows)}"
         + places.suffix
         + ("_torsion" if contact_torsion else "")
-        + ("_cw" if colored_worlds and not colored else "")
         + ("_weighted" if weighted else "")
         + ("_material" if material else "")
         + ("_seeded" if seeded else "")
@@ -1055,9 +1037,9 @@ def mf_gs_kernel(
     )
     return KernelTemplate.from_abi(
         name,
-        COLORED_ABI if colored else COLORED_WORLDS_ABI if colored_worlds else MF_GS_ABI,
+        COLORED_ABI if colored else MF_GS_ABI,
         snippet,
-        worlds(not colored),
+        worlds(),
         extra=(
             # Where spin rows may appear, every friction contact's metric (sweep.friction_metric_stage).
             *((RowArgument("friction_metric", wp.array3d[float], after="omega"),) if contact_torsion else ()),

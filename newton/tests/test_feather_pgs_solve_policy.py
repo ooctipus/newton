@@ -307,8 +307,7 @@ class TestSolvePolicy(unittest.TestCase):
 
         for dispatch in (
             kernel_template.items("world", groups=1, lanes=32, guard="world_count"),
-            sweep_routes.worlds(False),
-            sweep_routes.worlds(True),
+            sweep_routes.worlds(),
         ):
             with self.subTest(dispatch=dispatch.body), self.assertRaisesRegex(ValueError, "world"):
                 KernelTemplate.from_abi("bad_dispatch", signature, "", dispatch)
@@ -318,7 +317,7 @@ class TestSolvePolicy(unittest.TestCase):
 
         def template(policy):
             return KernelTemplate.from_abi(
-                "mf_gs", sweep_routes.MF_GS_ABI, "", sweep_routes.worlds(True), extra=policy.arguments, composed=True
+                "mf_gs", sweep_routes.MF_GS_ABI, "", sweep_routes.worlds(), extra=policy.arguments, composed=True
             )
 
         counted, plain = template(SWEEPS), template(DEFAULT_POLICY)
@@ -328,7 +327,7 @@ class TestSolvePolicy(unittest.TestCase):
         self.assertEqual(plain.signature, counted.signature[:-1])
         self.assertEqual(plain.native_params, counted.native_params[:-1])
         # The world queue's operands lead the kernel's signature; the native function takes the world instead.
-        queue = sweep_routes.worlds(True).extra
+        queue = sweep_routes.worlds().extra
         self.assertEqual(plain.signature[: len(queue)], queue)
         self.assertEqual(plain.native_params[0], ("world", int))
 

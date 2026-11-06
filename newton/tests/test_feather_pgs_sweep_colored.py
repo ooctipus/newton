@@ -195,8 +195,10 @@ class TestStageSlots(unittest.TestCase):
             dim=records.shape[:2],
             inputs=[
                 row_lines(device),
+                # Every world in the colored bucket, each in the slot of its index.
+                wp.array([self.WORLDS], dtype=int, device=device),
+                wp.array(np.arange(self.WORLDS), dtype=int, device=device),
                 wp.array(np.arange(self.WORLDS), dtype=wp.int32, device=device),
-                wp.ones(self.WORLDS, dtype=wp.int32, device=device),
                 wp.array([len(world) for world in units], dtype=wp.int32, device=device),
                 wp.array(records, dtype=wp.int32, device=device),
                 wp.array(meta, dtype=wp.int32, device=device),
@@ -296,7 +298,7 @@ class TestColoredSweep(unittest.TestCase):
         units = solver.sweep.colored_units
         self.assertEqual(record["capable_worlds"], solver.forest.world_count)
         self.assertEqual(record["waves"], 1, "the tray's worlds fit one wave on the device's SMs")
-        arrays = (*units.units.values(), *units.slots.values(), units.slot_world, units.status)
+        arrays = (*units.units.values(), *units.slots.values(), units.status)
         self.assertEqual(record["storage_bytes"], sum(array.capacity for array in arrays))
         self.assertGreater(record["storage_bytes"], 0)
         # A slot holds a unit for every three rows of the row capacity.

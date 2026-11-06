@@ -704,6 +704,9 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     def latch_status(step):
         placement.latch_status(step.contacts)
 
+    def claim_worlds(step):
+        sweep.claim_worlds()
+
     def claim(step):
         sweep.claim()
 
@@ -726,6 +729,9 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         *((classify_resolved_worlds,) if resolved is not None else ()),
         *write_rows,
         latch_status,
+        # The claim stage: each world into its claim's bucket once the counts are final; the one writer, the unit
+        # builder and the sweeps walk their buckets.
+        *((claim_worlds,) if sweep.claims is not None else ()),
         *((warn_overflow,) if solver.options.diagnostics.overflow_warning else ()),
         nvtx="S4_ContactBuild",
     )

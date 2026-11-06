@@ -363,7 +363,7 @@ def parallel_kernel(
         name,
         PARALLEL_ABI,
         snippet,
-        worlds(True),
+        worlds(),
         extra=(
             *(operands.arguments if operands is not None else ()),
             *material_arguments(material),

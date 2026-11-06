@@ -500,7 +500,6 @@ class Sweep:
                 "has_dense_velocity_limit_rows": self.options.enable_joint_velocity_limits,
                 "places": storage.places,
                 "contact_torsion": self.laws.spin_rows,
-                "colored_worlds": colored,
                 "max_row_dofs": self.placement.packed_support,
                 "seeded": self.seeded,
                 "wide_rows": self.placement.packed_dense == packed_rows.WIDE,
@@ -520,16 +519,6 @@ class Sweep:
                 **mf_gs_options,
             )
             if colored:
-                self.colored_units = sweep_units.ColoredUnits(
-                    self.forest.world_count,
-                    self.placement.mf_max_constraints,
-                    self.forest.max_world_dofs,
-                    model.device,
-                    worlds=capable,
-                    rule=rule,
-                    torsion=self.laws.spin_rows,
-                    weighted=self.laws.set.weighted,
-                )
                 self.mf_colored_kernel = self.kernel(
                     "mf_colored",
                     sweep_routes.mf_gs_kernel,
@@ -570,9 +559,28 @@ class Sweep:
                     # On its own list, a tier takes a block a world of the list's capacity (its work's shape).
                     grid = shape(dataclasses.replace(tier.work, items=self.forest.world_count), device(model.device))
                     self.tiers.append(dataclasses.replace(tier, tier=tier_index, grid=grid.grid))
-            # Each tier and the general sweep walk their bucket of the claims' worlds, which hold every world.
+            # Each sweep walks its bucket of the claims' worlds (claim_worlds), a bucket of every world's slots: a tier's,
+            # the general sweep's, and with the colored mapping its candidates' (which the unit builder walks) and the
+            # colored worlds' (which it appends).
             worlds = self.forest.world_count
-            self.claims = Queue((len(self.tiers) + 1) * worlds, model.device, buckets=len(self.tiers) + 1)
+            self.claim_general = len(self.tiers)
+            self.claim_candidate = self.claim_general + 1 if colored else -1
+            self.claim_colored = self.claim_general + 2 if colored else -1
+            buckets = self.claim_general + (3 if colored else 1)
+            self.claims = Queue(buckets * worlds, model.device, buckets=buckets)
+            if colored:
+                self.colored_units = sweep_units.ColoredUnits(
+                    self.forest.world_count,
+                    self.placement.mf_max_constraints,
+                    self.forest.max_world_dofs,
+                    model.device,
+                    worlds=capable,
+                    rule=rule,
+                    torsion=self.laws.spin_rows,
+                    weighted=self.laws.set.weighted,
+                    claims=self.claims,
+                    buckets=(self.claim_candidate, self.claim_colored, self.claim_general),
+                )
             # The general sweep walks its bucket on a persistent grid, a warp a world (the queue's launch): a block a
             # world of the bucket's capacity dispatched its exiting blocks behind the bucket's, which held the
             # multiprocessors, and the claims beside it started late (franka's widest tier 14 us later, PRO).
@@ -604,6 +612,31 @@ class Sweep:
         self.claim_streams = tuple(wp.Stream(model.device) for _ in range(claims))
         self.claims_ready = wp.Event(model.device) if claims else None
         self.claims_done = tuple(wp.Event(model.device) for _ in range(claims))
+
+    def claim_worlds(self) -> None:
+        """The claim stage: every world with rows into its claim's bucket of :attr:`claims`
+        (:func:`.sweep_levels.claim_worlds`), once the row counts are final (after the status latch): a tier's (only dense
+        rows, inside the tiers' row bound), the colored candidates' (a world with a colored storage slot) or the
+        general sweep's. The one writer, the unit builder and every sweep read their buckets."""
+        claims, units = self.claims, self.colored_units
+        claims.count.zero_()
+        wp.launch(
+            sweep_levels.claim_worlds,
+            dim=self.forest.world_count,
+            inputs=[
+                self.placement.constraint_count,
+                self.placement.mf_constraint_count,
+                self.placement.speed_first,
+                units.units["world_slot"] if units is not None else self.placement.dummy_is_free_rigid,
+                self.par_tiers[-1][0] if self.par_tiers else 0,
+                sweep_routes_tiers.TIER_ROWS,
+                self.claim_general,
+                self.claim_candidate,
+                claims.region,
+            ],
+            outputs=[claims.items, claims.count],
+            device=self.model.device,
+        )
 
     def claim(self) -> None:
         """Publish the schedule of the rows the row pass wrote and each owner's worlds (run after every producer)."""
@@ -808,26 +841,8 @@ class Sweep:
         # The sweeps leave by the walk (sweep_routes.leave_all) and find a free body's tree in it.
         walk = {} if self.factor.walk_arts is None else {"walk": self.factor.walk_view()}
 
-        # Every world with rows in its claim's bucket: a tier's (only dense rows, inside the tiers' row bound) or the
-        # general sweep's (sweep_levels.claim_worlds). Each sweep walks its bucket.
+        # Each sweep walks its claim's bucket (claim_worlds, the step's claim stage).
         claims = self.claims
-        general = len(self.tiers)
-        claims.count.zero_()
-        wp.launch(
-            sweep_levels.claim_worlds,
-            dim=self.forest.world_count,
-            inputs=[
-                self.placement.constraint_count,
-                self.placement.mf_constraint_count,
-                self.placement.speed_first,
-                self.par_tiers[-1][0] if self.par_tiers else 0,
-                sweep_routes_tiers.TIER_ROWS,
-                general,
-                claims.region,
-            ],
-            outputs=[claims.items, claims.count],
-            device=self.model.device,
-        )
 
         def queued(bucket, grid):
             count, worlds = claims.bucket(bucket)
@@ -853,11 +868,19 @@ class Sweep:
         colored = {} if colored_kernel is None else self.colored_units.operands()
         # The general sweep's bucket, on its persistent grid.
         grid = self.general_grid
-        self._launch(mf_gs_kernel, operands, grid, 32, **walk, **colored, **queued(general, grid))
+        self._launch(mf_gs_kernel, operands, grid, 32, **walk, **colored, **queued(self.claim_general, grid))
         if colored_kernel is not None:
-            # The worlds the unit builder's rule picked: a block each, a color's units at once.
+            # The colored bucket (the unit builder's rule picked its worlds): a block a world of its capacity, the
+            # colored storage's slots, a color's units at once.
+            grid = self.colored_units.slot_count
             self._launch(
-                colored_kernel, operands, self.forest.world_count, sweep_routes.COLORED_THREADS, **walk, **colored
+                colored_kernel,
+                operands,
+                grid,
+                sweep_routes.COLORED_THREADS,
+                **walk,
+                **colored,
+                **queued(self.claim_colored, grid),
             )
         if streams:
             # The general tail is queued first; the claims share only the ready dependency with it.
