@@ -73,6 +73,12 @@ RECORD_WORDS = 8
 """Words of a row's record (:func:`pack_row_record`): two ``int4``, which a row loop loads a row ahead."""
 
 
+def validate_record_coordinates(max_world_dofs: int) -> None:
+    """Reject worlds whose coordinates a record's 16-bit halves cannot hold (its sides' first world coordinates)."""
+    if int(max_world_dofs) > 32767:
+        raise ValueError(f"a row's record holds world coordinates below 32768; a world holds {max_world_dofs}")
+
+
 def pack_row_record(
     record: str,
     dof_a: str,

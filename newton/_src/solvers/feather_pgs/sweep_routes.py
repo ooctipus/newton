@@ -22,7 +22,12 @@ from .kernel_template import Dispatch
 from .packed_rows import PACKED_SIDES, RECORD_SIDES
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
-from .row_metadata import RECORD_WORDS, _validate_dense_metadata_encoding, _validate_mf_metadata_encoding
+from .row_metadata import (
+    RECORD_WORDS,
+    _validate_dense_metadata_encoding,
+    _validate_mf_metadata_encoding,
+    validate_record_coordinates,
+)
 from .solve_policy import QUIET_LITERAL, block_argmax, sweep_exit
 from .sweep import (
     CONTACT,
@@ -991,6 +996,7 @@ class GeneralSweep(SweepConfig):
         if self.mapping == "colored" and not self.free_rows:
             raise ValueError("the colored mapping sweeps the free bodies' run: it needs free_rows")
         _validate_dense_metadata_encoding(self.max_constraints)
+        validate_record_coordinates(self.max_world_dofs)
         if self.material and not self.weighted:
             raise ValueError("material contacts step by their weights: their sweeps are weighted")
         dofs = self.max_world_dofs if self.max_row_dofs is None else self.max_row_dofs
