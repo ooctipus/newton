@@ -230,6 +230,34 @@ class TestWorldLists(unittest.TestCase):
                     self.assertEqual(int(count[0]), want.size)
                     np.testing.assert_array_equal(np.sort(items[: count[0]]), want)
 
+    def test_appends_past_a_region_are_dropped(self):
+        """A bucket keeps its first ``region`` appends, each world once, and its counter the demand (the reservation's
+        overflow contract), whichever warps share a bucket's atomic."""
+        worlds, width, region = 1000, 32, 100
+        rows = (np.arange(worlds) % 3 * width + 1).astype(np.int32)
+        for device in _devices():
+            with self.subTest(device=device):
+                lists = Queue(3 * region, device, buckets=3)
+                wp.launch(
+                    sweep_levels.list_worlds,
+                    dim=worlds,
+                    inputs=[
+                        wp.array(rows, dtype=int, device=device),
+                        wp.zeros(worlds, dtype=int, device=device),
+                        3 * width,
+                        width,
+                        lists.region,
+                    ],
+                    outputs=[lists.items, lists.count],
+                    device=device,
+                )
+                for tier in range(3):
+                    count, items = (array.numpy() for array in lists.bucket(tier))
+                    want = np.flatnonzero(rows == tier * width + 1)
+                    self.assertEqual(int(count[0]), want.size)
+                    self.assertEqual(np.unique(items).size, region)
+                    self.assertTrue(np.isin(items, want).all())
+
     def test_a_bucket_is_a_list_of_its_own(self):
         """A bucket's views are its counter and its region of the slots."""
         lists = Queue(12, "cpu", buckets=3)

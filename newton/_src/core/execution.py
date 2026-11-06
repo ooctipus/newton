@@ -110,7 +110,8 @@ class Order(enum.Enum):
     ATOMIC = "atomic"
     """One atomic an append: slots in the order threads reach the counter."""
     GROUP = "group"
-    """One atomic a lane group (the lane group's ``RESERVE``): a group's appends in lane order."""
+    """One atomic a lane group a bucket (:func:`append`, the lane group's ``RESERVE``): a group's appends to a bucket in
+    lane order, the groups' in the order they reach the counter."""
     ORDERED = "ordered"
     """Slots in input order (the lane group's ``ORDERED``, or ``ORDERED_TILES`` across blocks)."""
 
@@ -131,7 +132,7 @@ class Queue:
         order: How appends take their slots.
     """
 
-    def __init__(self, capacity: int, device=None, *, kinds: int = 1, buckets: int = 1, order: Order = Order.ATOMIC):
+    def __init__(self, capacity: int, device=None, *, kinds: int = 1, buckets: int = 1, order: Order = Order.GROUP):
         if int(capacity) < 0 or kinds < 1 or buckets < 1:
             raise ValueError(
                 f"a queue needs a capacity and at least one kind and bucket: {capacity}, {kinds}, {buckets}"
@@ -151,14 +152,30 @@ class Queue:
         return self.count[b * self.kinds : (b + 1) * self.kinds], self.items[b * region : (b + 1) * region]
 
 
-@wp.func
+_APPEND = r"""
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    // The warp's lanes that append to one bucket share one atomic: the lowest takes their slots, each its rank.
+    const unsigned peers = __match_any_sync(__activemask(), bucket);
+    const int lane = (int)(threadIdx.x & 31), leader = __ffs(peers) - 1;
+    int first = 0;
+    if (lane == leader) first = atomicAdd(&count.data[bucket], __popc(peers));
+    const int slot = __shfl_sync(peers, first, leader) + __popc(peers & ((1u << lane) - 1u));
+#elif defined(__CUDA_ARCH__)
+    const int slot = atomicAdd(&count.data[bucket], 1);
+#else
+    const int slot = count.data[bucket]++;
+#endif
+    if (slot < region) items.data[bucket * region + slot] = item;
+"""
+
+
+@wp.func_native(_APPEND)
 def append(items: wp.array[int], count: wp.array[int], bucket: int, region: int, item: int):
-    """Append ``item`` to bucket ``bucket`` of a :class:`Queue`'s ``items`` and ``count`` (one kind), one atomic an
-    append (:attr:`Order.ATOMIC`): its slot is the order threads reach the counter. The counter keeps the demand; an
-    append past the bucket's ``region`` slots is dropped (:func:`.device_preludes.reserve`'s contract)."""
-    slot = wp.atomic_add(count, bucket, 1)
-    if slot < region:
-        items[bucket * region + slot] = item
+    """Append ``item`` to bucket ``bucket`` of a :class:`Queue`'s ``items`` and ``count`` (one kind), one atomic a
+    warp a bucket (:attr:`Order.GROUP`): the warp's appends to a bucket take consecutive slots in lane order, from one
+    atomic of the lowest of them. The counter keeps the demand; an append past the bucket's ``region`` slots is dropped
+    (:func:`.device_preludes.reserve`'s contract). Every lane of the warp that reaches the call may append, to any
+    bucket; a lane that does not reach it takes no part."""
 
 
 @dataclasses.dataclass(frozen=True)

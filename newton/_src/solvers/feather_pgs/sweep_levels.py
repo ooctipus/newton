@@ -137,8 +137,8 @@ def list_worlds(
     """Bucket the worlds whose rows are dense only and at most ``bound`` by their rows: bucket ``(rows - 1) // width``
     of a queue of ``region`` slots a bucket.
 
-    The Jacobi tiers' worlds share nothing, so each is a component of its own and the order inside a bucket is the
-    atomics'; tier ``t`` serves ``(t * width, (t + 1) * width]`` rows and walks bucket ``t`` (an exiting block of a
+    The Jacobi tiers' worlds share nothing, so each is a component of its own and the order inside a bucket is free
+    (:func:`~newton._src.core.execution.append`'s, an atomic a warp a bucket); tier ``t`` serves ``(t * width, (t + 1) * width]`` rows and walks bucket ``t`` (an exiting block of a
     tier's grid still paid four dependent global loads: about 55 us a launch at 16k worlds).
     """
     world = wp.tid()
