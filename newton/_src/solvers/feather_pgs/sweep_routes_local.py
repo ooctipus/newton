@@ -44,6 +44,7 @@ from .sweep import (
     friction_metric,
     friction_metric_law,
     friction_metric_stage,
+    impulse_seed,
     indent,
     level_loop,
     material_arguments,
@@ -140,10 +141,12 @@ def paired_factor_source(
     weighted: bool = False,
     material: bool = False,
     pitch: int | None = None,
+    seeded: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the paired factor sweep: a world's rows in the factor coordinates of its articulation and
     free body, a warp per world, the velocity change from the predictor, ``u = L^T dv``, from zero in a register per
-    lane: dense rows of ``Z = L^-1 J^T`` (:class:`.SparseFactor`, entry ``l`` at coordinate ``l``), lane ``l`` holding
+    lane, or with ``seeded`` from the response of the impulses the rows carry (:func:`.sweep.impulse_seed`: the warm
+    start's and the closed loop's): dense rows of ``Z = L^-1 J^T`` (:class:`.SparseFactor`, entry ``l`` at coordinate ``l``), lane ``l`` holding
     coordinate ``l`` of ``u`` and of the rows it acts on, which the schedule loads into registers (:func:`_load`, or
     the pipeline of :func:`_consume`).
     Under ``torsion`` a friction pair may have its contact's spin row after it (:func:`.sweep.spin_row`): such a
@@ -208,6 +211,12 @@ def paired_factor_source(
             + friction_metric_law("ROW_TRIPLE", friction_metric, "    ")
             + "\n"
         )
+    # The impulses the rows carry into the first sweep, row by row in slot order (the general sweep's seed).
+    seed = ""
+    if seeded:
+        apply = op.axpy((("row", "seed"),), "        ")
+        row = (f"const float row_z = {_load(op, 'i')};",)
+        seed = impulse_seed("m", rows.load("i"), rows.kind("i"), apply, op.lanes.sync(), declare=row) + "\n"
     leave = f"""{rows.stores("    ")}
     // The velocity change in the walk's coordinates, each lane's coordinate, to the step's one leave
     // (tree_factor.walk_leave_kernel), which walks each component's tree down in the rows' frame.
@@ -235,7 +244,7 @@ def paired_factor_source(
     const int secondary_lane = lane - secondary_offset;
     float {op.velocity.array} = 0.0f;
     SYNC();
-{metric}
+{seed}{metric}
 {level_loop((indent(schedule, "        "),), exit=end_sweep(solve_policy, iteration=ITERATION))}
 
 {leave}
@@ -437,6 +446,7 @@ def paired_factor_kernel(
     weighted: bool = False,
     material: bool = False,
     pitch: int | None = None,
+    seeded: bool = False,
 ) -> wp.Kernel:
     """The paired factor sweep kernel; weighted rows' and material contacts' operands (:func:`.sweep.weight_arguments`,
     :func:`.sweep.material_arguments`), a readout's operand and the walk's view follow ``v_out``."""
@@ -452,6 +462,7 @@ def paired_factor_kernel(
         weighted=weighted,
         material=material,
         pitch=pitch,
+        seeded=seeded,
     )
     staging.check("the paired factor sweep", arch_budget(device_arch))
     name = (
@@ -462,6 +473,7 @@ def paired_factor_kernel(
         + ("_material" if material else "")
         + ("_torsion" if torsion else "")
         + ("" if pitch is None or pitch == max_constraints else f"_p{int(pitch)}")
+        + ("_seeded" if seeded else "")
         + "_walk"
         + solve_policy.suffix
     )

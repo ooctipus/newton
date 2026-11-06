@@ -1622,6 +1622,12 @@ def cuda_groups() -> list:
             ref,
             (SPARSE.but("sparse_warm_start", options=_WARM),),
         ),
+        # The paired factor sweep and its components start from the impulses the warm start carries (case K5).
+        Group(
+            _physics(scenes.hand(contact_matching="latest"), "patch", 16),
+            ref,
+            (PAIRED.but("paired_warm_start", options=_WARM),),
+        ),
         Group(_physics(scenes.ball_drop(), "patch", 16), ref, (MF_HELD,)),
         Group(_physics(scenes.box_push(), "patch", 16), ref, (MF_HELD,)),
         Group(_physics(scenes.chain(), None, 16), ref, (MF_HELD, MF_PARALLEL)),

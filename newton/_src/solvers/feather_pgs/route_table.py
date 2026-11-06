@@ -96,9 +96,9 @@ CAPABILITIES = {
         "no_preelimination",
     ),
     # The paired factor's sweep in factor coordinates (one articulation and one free body per world).
-    "paired_factor": ("cuda", "plain", "iterations"),
+    "paired_factor": ("cuda", "no_preelimination", "iterations"),
     # Its runtime claim: independent articulation and free-body components per world.
-    "components": ("cuda", "plain", "no_mimic"),
+    "components": ("cuda", "no_preelimination", "no_mimic"),
     # The Jacobi tiers of dense trees beside a free body (case K4), whose sweep budget a build fixes.
     "tiers": ("cuda", "iterations"),
     # The keyed in-kernel row producer of the tiers.

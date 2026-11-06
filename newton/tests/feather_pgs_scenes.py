@@ -1103,6 +1103,7 @@ def hand(
     press: float = 0.002,
     worlds: int = 2,
     lift_velocity_limit: float | None = None,
+    contact_matching: str | None = None,
 ) -> Scene:
     """A 17-coordinate hand (a ``z`` lift under four 4-joint fingers) balancing a free 0.5 kg cube on its fingertips.
 
@@ -1175,6 +1176,8 @@ def hand(
             _set_targets(model, control, {world * joints + 1: 0.001 + press + 0.001 * world for world in range(worlds)})
 
     name = "hand" if lift_velocity_limit is None else "hand_lift_velocity_limit"
+    if contact_matching is not None:
+        name = f"{name}_{contact_matching}"
     return Scene(
         name,
         build,
@@ -1184,6 +1187,7 @@ def hand(
         solver_options={"dense_max_constraints": 64},
         control=control,
         tags=frozenset({"articulated_contact"}),
+        contact_matching=contact_matching,
     )
 
 

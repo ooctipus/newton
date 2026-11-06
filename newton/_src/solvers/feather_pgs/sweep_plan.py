@@ -881,12 +881,7 @@ class Sweep:
 
     def _select_paired_response(self) -> tuple[int, int, np.ndarray] | None:
         """Select one complete robot/free-body response pair per world."""
-        if (
-            self.routes.case in ("K1", "K2")
-            or self.factor.eliminates
-            or self.options.pgs_warmstart
-            or 6 not in self.forest.size_groups
-        ):
+        if self.routes.case in ("K1", "K2") or self.factor.eliminates or 6 not in self.forest.size_groups:
             return None
 
         response_dofs = self.forest.response_dof_count
@@ -929,6 +924,8 @@ class Sweep:
         device_arch = model.device.arch
         from . import paired_components  # noqa: PLC0415
 
+        # The sweeps start from the impulses the rows carry: the warm start's, the closed loop's projection.
+        self.seeded = bool(self.options.pgs_warmstart or self.factor.eliminates)
         self.paired_components = None
         self.paired_components_reason = paired_components.decline(self)
         if self.paired_components_reason is None:
@@ -949,6 +946,7 @@ class Sweep:
                 contact_units=self.factor_coordinate_contact_units,
                 torsion=self.laws.spin_rows,
                 pitch=self.placement.row_pitch,
+                seeded=self.seeded,
             )
             if self.paired_factor_coordinates
             else None
@@ -1009,8 +1007,6 @@ class Sweep:
         # The Jacobi tiers ahead of the matrix-free sweep (SweepTier), and their keyed rows' release.
         self.tiers = []
         self.tier_worlds = None
-        # The sweeps start from the impulses the rows carry: the warm start's, the closed loop's projection.
-        self.seeded = bool(self.options.pgs_warmstart or self.factor.eliminates)
         if self.placement.mf_sweeps:
             # A test pin streams the impulses (storage is part of the kernel specialization key); the selection
             # sizes the resident row metadata with its choice.
