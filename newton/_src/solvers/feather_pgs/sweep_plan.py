@@ -420,7 +420,6 @@ class Sweep:
         # full sweep before the active-row scan claims whole warps.
         small_world_lanes = self._sparse_small_world_lanes(staging, budget)
         active_rows, active_rows_reason = self._admit_sparse_active_rows(
-            velocity_candidate=velocity_candidate,
             small_world_lanes=small_world_lanes,
             fits=lambda: staging(active_rows=True).fits(budget),
         )
@@ -456,7 +455,6 @@ class Sweep:
         triplet_capacity = self.placement.dense_max_constraints // 3
         contact_triplets, contact_triplets_reason = self._admit_sparse_contact_triplets(
             active_rows=active_rows,
-            velocity_candidate=velocity_candidate,
             use_support_table=use_support_table,
             lanes=lanes,
             fits=lambda: (
@@ -773,27 +771,22 @@ class Sweep:
         lanes = 8 if self.forest.max_world_dofs <= 8 else 16
         return lanes if staging(lanes_per_world=lanes).fits(budget) else 0
 
-    def _admit_sparse_active_rows(
-        self, *, velocity_candidate: bool, small_world_lanes: int, fits: Callable[[], bool]
-    ) -> tuple[bool, str]:
+    def _admit_sparse_active_rows(self, *, small_world_lanes: int, fits: Callable[[], bool]) -> tuple[bool, str]:
         """Decide whether the native sparse sweep selects its normal and limit rows at sweep entry, and why.
 
         Under this law a zero-impulse row that a sweep's earlier updates violate waits for
         the next sweep. Patch friction (``friction_anchor_beta > 0``) adopts it: a friction
         pair is visited while any normal of its patch ring is selected or the pair holds
-        impulse, which skips only pairs whose update would be a no-op. Small worlds keep
-        their packed lanes. Under either law, a scan whose row bitsets exceed shared memory
-        leaves the full ordered sweep.
+        impulse, which skips only pairs whose update would be a no-op. Velocity-limit rows keep
+        their last word after the scanned rows. Small worlds keep their packed lanes. A scan
+        whose row bitsets exceed shared memory leaves the full ordered sweep.
 
         Args:
-            velocity_candidate: Whether the sweep carries joint velocity-limit rows.
             small_world_lanes: Lanes per world of a packed small-world sweep, 0 for whole warps.
             fits: Whether the active-row scan's working set fits shared memory, evaluated last.
         """
         if not self.pins.get("active_rows", True):
             return False, "A test pin keeps the full ordered sweep (active_rows=False)."
-        if velocity_candidate:
-            return False, "Velocity-limit rows keep full ordered sweeps."
         if small_world_lanes:
             return False, (
                 f"Patch friction (friction_anchor_beta > 0) keeps the packed {small_world_lanes}-lane full sweep "
@@ -810,31 +803,26 @@ class Sweep:
         self,
         *,
         active_rows: bool,
-        velocity_candidate: bool,
         use_support_table: bool,
         lanes: int,
         fits: Callable[[], bool],
     ) -> tuple[bool, str]:
         """Decide whether the sparse sweep fuses contact triplets, and why: wherever the row structure admits them.
 
-        Point friction fuses them in the active-row scan. Patch friction fuses its anchor
-        units, pooling their ring loads as the ordinary pair update does, in the active
-        scan or else in the full ordered sweep; velocity-limit, free-body and packed
-        small-world sweeps keep ordinary updates. A fused triplet is a contact unit
-        on its Gram block (:func:`.sweep_routes_sparse.contact_units`): in exact arithmetic
-        the ordinary sweep's normal and pair updates, in one reduction and one apply.
+        Patch friction fuses its anchor units, pooling their ring loads as the ordinary pair
+        update does, in the active scan or else in the full ordered sweep; packed small-world
+        sweeps keep ordinary updates. A fused triplet is a contact unit on its Gram block
+        (:func:`.sweep_routes_sparse.contact_units`): in exact arithmetic the ordinary sweep's
+        normal and pair updates, in one reduction and one apply.
 
         Args:
             active_rows: Whether the sweep selects its rows at sweep entry.
-            velocity_candidate: Whether the sweep carries joint velocity-limit rows.
             use_support_table: Whether rows read the shared support table.
             lanes: Lanes per world of the sweep.
             fits: Whether contact units fit the row capacity and shared memory, evaluated last.
         """
         if "contact_units" in self.pins and self.pins["contact_units"] != "triplets":
             return False, "A test pin keeps unfused contact rows (contact_units=None)."
-        if not active_rows and (velocity_candidate or self.forest.has_free_rigid_bodies):
-            return False, "Velocity-limit and free-body sweeps keep ordinary updates."
         if lanes < 32:
             return False, f"Small worlds keep their packed {lanes}-lane full sweep."
         if not use_support_table:

@@ -39,10 +39,8 @@ def _admission_probe(**changes):
     return probe
 
 
-def _admit(probe, *, velocity=False, lanes=0, fits=True):
-    return Sweep._admit_sparse_active_rows(
-        probe, velocity_candidate=velocity, small_world_lanes=lanes, fits=lambda: fits
-    )
+def _admit(probe, *, lanes=0, fits=True):
+    return Sweep._admit_sparse_active_rows(probe, small_world_lanes=lanes, fits=lambda: fits)
 
 
 class TestFeatherPGSSparsePatchRows(unittest.TestCase):

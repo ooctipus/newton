@@ -670,19 +670,17 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
                 self.assertNotIn("contact_triplets", kernel.key)
 
     def test_patch_triplet_admission_cpu(self):
-        """Fuse patch triplets in the linked active scan or the full sweep; never in packed or free sweeps."""
+        """Fuse patch triplets in the linked active scan or the full sweep; never in packed sweeps."""
         cases = (
-            # Probe changes, active rows, velocity limits, support table, lanes, fits; admitted, reason.
-            ({}, True, False, True, 32, True, True, "active-row scan"),
-            ({}, False, False, True, 32, True, True, "full ordered sweep"),
-            ({}, False, False, True, 16, True, False, "16-lane"),
-            ({}, False, True, True, 32, True, False, "Velocity-limit"),
-            ({"forest": SimpleNamespace(has_free_rigid_bodies=True)}, False, False, True, 32, True, False, "free-body"),
-            ({}, True, False, False, 32, True, False, "support table"),
-            ({}, True, False, True, 32, False, False, "room for contact units"),
-            ({"pins": {"contact_units": None}}, True, False, True, 32, True, False, "contact_units=None"),
+            # Probe changes, active rows, support table, lanes, fits; admitted, reason.
+            ({}, True, True, 32, True, True, "active-row scan"),
+            ({}, False, True, 32, True, True, "full ordered sweep"),
+            ({}, False, True, 16, True, False, "16-lane"),
+            ({}, True, False, 32, True, False, "support table"),
+            ({}, True, True, 32, False, False, "room for contact units"),
+            ({"pins": {"contact_units": None}}, True, True, 32, True, False, "contact_units=None"),
         )
-        for changes, active, velocity, table, lanes, fits, admitted, phrase in cases:
+        for changes, active, table, lanes, fits, admitted, phrase in cases:
             probe = SimpleNamespace(
                 pins={},
                 forest=SimpleNamespace(has_free_rigid_bodies=False),
@@ -690,11 +688,10 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
             )
             for name, value in changes.items():
                 setattr(probe, name, value)
-            with self.subTest(changes=changes, active=active, velocity=velocity, table=table, lanes=lanes, fits=fits):
+            with self.subTest(changes=changes, active=active, table=table, lanes=lanes, fits=fits):
                 decision, reason = Sweep._admit_sparse_contact_triplets(
                     probe,
                     active_rows=active,
-                    velocity_candidate=velocity,
                     use_support_table=table,
                     lanes=lanes,
                     fits=lambda fits=fits: fits,

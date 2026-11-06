@@ -1661,6 +1661,25 @@ def cuda_groups() -> list:
                 MF_PARALLEL,
             ),
         ),
+        # Native sparse factors select their rows at sweep entry and fuse their contact units beside velocity-limit
+        # rows, which keep their last word (case K1; a row capacity past the small worlds' packed lanes).
+        Group(
+            _physics(scenes.legged(), "patch", 32, "velocity_limits", dense_max_constraints=96, **vlimits),
+            ref,
+            (
+                Route(
+                    "sparse_velocity_limits_active",
+                    "cuda",
+                    options=_MF,
+                    expect={
+                        "sweep.route": "sparse_pgs",
+                        "sparse_mass_matrix.velocity_limits": True,
+                        "sparse_mass_matrix.active_rows": True,
+                        "sparse_mass_matrix.contact_triplets": True,
+                    },
+                ),
+            ),
+        ),
         # A mimic row is an articulation row: the paired worlds still split into components (case K5).
         Group(
             _physics(scenes.hand(mimic=True), "patch", 16, "mimic"),
