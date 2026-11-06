@@ -71,8 +71,8 @@ def sweep_free_body_rows(
     The body has a unit mass factor, so its rows' whitened entries ``Z`` (``[row, 6]``) act on its velocity directly
     and the rows' Delassus block is ``Z Z^T``; each row stores the inverse of its diagonal ``|Z_i|^2`` (zero for an
     empty row). The sweep starts from ``impulses`` (zero by default), seeded with their velocity change ``Z^T
-    impulses``, so a row's residual is ``(Z Z^T impulses)_i + rhs_i``. ``weights`` are the rows' regularization weights
-    (``regularize``). Contact rows have no parent; a friction row's parent is its normal row.
+    impulses``, so a row's residual is ``(Z Z^T impulses)_i + rhs_i``. ``weights`` are the rows' regularization weights,
+    which a ``regularize`` sweep (weighted laws) steps by. Contact rows have no parent; a friction row's parent is its normal row.
     """
     Z = np.asarray(Z, np.float32)
     # The row store's line: 8 dense rows (none live), then the free bodies' from row 8.
@@ -108,7 +108,6 @@ def sweep_free_body_rows(
         "walk": chain_walk(device, [np.eye(6)]),
         "iterations": int(iterations),
         "omega": 1.0,
-        "regularize": int(regularize),
         "v_out": wp.zeros(6, dtype=wp.float32, device=device),
     }
     kernel = sweep_routes.mf_gs_kernel(
@@ -119,6 +118,7 @@ def sweep_free_body_rows(
         has_dense_velocity_limit_rows=False,
         places=sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL),
         seeded=True,
+        weighted=regularize,
     )
     arguments = {arg.label: arg for arg in kernel.adj.args}
     inputs = []

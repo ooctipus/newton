@@ -564,7 +564,6 @@ class Sweep:
             warm_start=self.options.pgs_warmstart,
             linked_rows=True,
             device_arch=model.device.arch,
-            weighted=self.laws.set.weighted,
             **torsion,
         )
 
@@ -776,15 +775,17 @@ class Sweep:
 
         Args:
             route: Owner of the sweep in the records, such as ``"sparse_pgs"``.
-            factory: The sweep factory, which takes the policy as ``solve_policy`` and returns a kernel or a
-                :class:`SweepTier`.
+            factory: The sweep factory, which takes the policy as ``solve_policy`` and the laws' constants as
+                ``weighted`` and ``material``, and returns a kernel or a :class:`SweepTier`.
             *args: Positional arguments of the factory.
             readout_budget: The sweep budget the kernel compiles in (a parallel tier's), or ``None`` for the
                 solver's iteration counts.
             **kwargs: Keyword arguments of the factory.
         """
         policy = self.policy
-        built = factory(*args, solve_policy=policy, material=bool(self.options.contact_compliance), **kwargs)
+        # The laws' constants, compiled into every sweep: weighted rows and material contacts.
+        laws = {"weighted": self.laws.set.weighted, "material": bool(self.options.contact_compliance)}
+        built = factory(*args, solve_policy=policy, **laws, **kwargs)
         kernel = built.kernel if isinstance(built, SweepTier) else built
         budget = int(self.options.pgs_iterations if readout_budget is None else readout_budget)
         self.readout.register(
@@ -948,7 +949,6 @@ class Sweep:
                 device_arch,
                 independent_components=self.paired_components is not None,
                 contact_units=self.factor_coordinate_contact_units,
-                weighted=self.laws.set.weighted,
                 torsion=self.laws.spin_rows,
                 pitch=self.placement.row_pitch,
             )
@@ -987,7 +987,6 @@ class Sweep:
                 device_arch,
                 speculative_contact_batches=self.placement.sparse_diagonal_speculative_contact_batches,
                 contact_units=self.placement.sparse_diagonal_contact_units,
-                weighted=self.laws.set.weighted,
                 torsion=self.laws.spin_rows,
             )
             if self.placement.sparse_diagonal_contact_solve
@@ -1127,7 +1126,6 @@ class Sweep:
                         inkernel_response=self.placement.ink_sizes,
                         linked_rows=True,
                         velocity_limit_pass=self._parallel_velocity_limit_pass(),
-                        weighted=self.laws.set.weighted,
                         frame=self._tier_frame(),
                         classes=self.factor.walk_classes,
                         pitch=self.placement.row_pitch,
@@ -1256,7 +1254,6 @@ class Sweep:
             "mf_contact_rows_end": placement.mf_contact_rows_end,
             "mf_meta": placement.mf_meta_packed,
             "mf_Z": placement.mf_Z,
-            "regularize": int(self.laws.set.weighted),
             "iterations": self.options.pgs_iterations,
             "omega": self.options.pgs_omega,
             "friction_metric": placement.friction_metric,

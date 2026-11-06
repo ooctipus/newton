@@ -204,7 +204,6 @@ def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MAS
         "mf_row_w": zero_float,
         "iterations": iterations,
         "omega": 1.0,
-        "regularize": 0,
         "v_out": array(_CHAIN_VELOCITY.astype(np.float32)),
     }
     return values

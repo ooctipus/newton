@@ -261,7 +261,6 @@ def solve_pair_launches(data, arrays, *, enabled, arch, iterations=8):
         world_count=5,
         iterations=iterations,
         omega=1.0,
-        regularize=0,
     )
     if enabled:
         values["component_selector"] = values["world_mf_constraint_count"] = data.selector

@@ -92,7 +92,6 @@ MF_GS_ABI = kernel_template.params(
     ("walk", WalkTrees),
     ("iterations", int),
     ("omega", float),
-    ("regularize", int),
     ("v_out", wp.array[float]),
 )
 """The matrix-free sweep's native ABI: one world per call (the world queue's dispatch). The free bodies' rows are the
@@ -661,6 +660,7 @@ def mf_gs_source(
     independent_components: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     lanes: int = 32,
+    weighted: bool = False,
     material: bool = False,
     seeded: bool = False,
     wide_rows: bool = False,
@@ -680,6 +680,9 @@ def mf_gs_source(
     mapping is the unit builder's (``world_colored``, :class:`.sweep_units.ColoredRule`): the colored kernel returns
     for the warp's worlds and, with ``colored_worlds`` (the solver builds both), the warp's kernel for the colored
     ones.
+
+    With ``weighted`` contact rows step by their regularization weights, ``material`` contacts' from their compliance
+    (:class:`.sweep.RowLaws`, a constant of the step's laws).
 
     ``lanes`` is the warp mapping's lane group (:func:`.execution.device_lanes`): a warp on CUDA, or one thread, which
     runs the world on either device (the CPU's mapping), so that body composes for both (:func:`.dual_native`).
@@ -701,7 +704,9 @@ def mf_gs_source(
     P = int(M_D + M_MF if pitch is None else pitch)
     max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
     row_lanes = Lanes(lanes)
-    laws = RowLaws(regularize=True, material=material, torsion=contact_torsion, policy=solve_policy)
+    if material and not weighted:
+        raise ValueError("material contacts step by their weights: their sweeps are weighted")
+    laws = RowLaws(regularize=weighted, material=material, torsion=contact_torsion, policy=solve_policy)
     dense = WorldRows(M_D, staging=places.staging, lanes=row_lanes)
     free = WorldRows(M_MF, staging="header", stream=places.impulses is Place.GLOBAL, lanes=row_lanes)
     dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows)
@@ -945,6 +950,7 @@ def mf_gs_kernel(
     skip_tier_rows: int = 0,
     independent_components: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
+    weighted: bool = False,
     material: bool = False,
     seeded: bool = False,
     wide_rows: bool = False,
@@ -970,6 +976,7 @@ def mf_gs_kernel(
         independent_components=independent_components,
         solve_policy=solve_policy,
         lanes=32 if mapping == "colored" else device_lanes(device_arch),
+        weighted=weighted,
         material=material,
         seeded=seeded,
         wide_rows=wide_rows,
@@ -987,6 +994,7 @@ def mf_gs_kernel(
         + (f"_skiptier{int(skip_tier_rows)}" if skip_tier_rows > 0 else "")
         + ("_components" if independent_components else "")
         + ("_cw" if colored_worlds and not colored else "")
+        + ("_weighted" if weighted else "")
         + ("_material" if material else "")
         + ("_seeded" if seeded else "")
         + ("_wide" if wide_rows else "")

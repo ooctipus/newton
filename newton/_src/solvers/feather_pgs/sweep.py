@@ -299,7 +299,8 @@ class RowLaws:
     """The physics a sweep's rows obey, beyond each row kind's projection.
 
     Args:
-        regularize: Contact rows take their regularization weight when the run-time ``regularize`` is set.
+        regularize: Contact rows take their regularization weight (the laws are weighted): a constant of the step's
+            laws, compiled into every sweep.
         material: Material contacts exist: a contact row of compliance ``eps > 0`` takes the weight ``d / (d + eps)``
             from the diagonal the placement forms (:func:`row_weight`), its stored one otherwise.
         torsion: Spin rows may follow friction pairs (:func:`spin_row`): the row loops skip the spin rows, and a
@@ -326,9 +327,8 @@ def row_weight(weight: str, eps: str, diagonal: str) -> str:
 
 
 def weight_arguments(weighted: bool) -> tuple[RowArgument, ...]:
-    """The operands a sweep whose ABI holds no row weights takes once its laws are weighted: the dense rows' weights
-    and the run-time switch ``regularize``."""
-    return (RowArgument("world_row_w", wp.array2d[float]), RowArgument("regularize", int)) if weighted else ()
+    """The operands a sweep whose ABI holds no row weights takes once its laws are weighted: the rows' weights."""
+    return (RowArgument("world_row_w", wp.array2d[float]),) if weighted else ()
 
 
 def material_arguments(material: bool) -> tuple[RowArgument, ...]:
@@ -484,7 +484,7 @@ def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> st
             weight = row_weight(weight, ctx.eps(row), diag.value(row))
         lines += [
             f"float delta = {step};",
-            f"if ({kind} == {CONTACT} && regularize)",
+            f"if ({kind} == {CONTACT})",
             f"    delta = ProjectionLaw::regularized_delta(delta, {weight}, old_impulse);",
             "float new_impulse = ProjectionLaw::relaxed_step(old_impulse, delta, omega);",
         ]
@@ -2159,7 +2159,7 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
         stored = "world_row_w.data[off_dense + lane]"
         if laws.material:
             stored = row_weight(stored, "world_row_eps.data[off_dense + lane]", "row_diag")
-        weight = f"{pad}const float row_w = (row_contact && regularize) ? {stored} : 1.0f;"
+        weight = f"{pad}const float row_w = row_contact ? {stored} : 1.0f;"
     inner = pad + "    "
     hot = inner + "    "
     change = Change("x_new - x_from", "row_bound", "s_type[i]" if rows.types else "-1", "row_inv_step")
