@@ -264,6 +264,7 @@ def keyed_general_units(
     z: KineticRows,
     counts: wp.array[int],
     mf_counts: wp.array[int],
+    speed_first: wp.array[int],
     parallel_rows: int,
     primary: int,
     primary_offset: int,
@@ -275,19 +276,21 @@ def keyed_general_units(
     owner: wp.array[int],
 ):
     """Hand the worlds the parallel tiers leave to the general sweep (those of more rows than the tiers hold or with
-    matrix-free rows) to the one writer (:func:`.walk_rows.walked_rows_kernel`), a thread a world: each row's unit
+    a free body's row: the free bodies' run's, or a speed row of the line, its last rows from ``speed_first``) to the
+    one writer (:func:`.walk_rows.walked_rows_kernel`), a thread a world: each row's unit
     source from its key (a contact row's ``4 c + r``, a prefix row's covector ``~(2 d + side)`` at its tree's
     coordinate) and a prefix row's sides; ``owner`` is 1 where the tiers hold the world (the writer skips it), 0 where
     the writer walks its rows. The general worlds' rows then take the walk and the release ``R`` as every walked row.
     It reads no contact input: a step without contacts binds none."""
     world = wp.tid()
     count = counts[world]
-    if count <= parallel_rows and mf_counts[world] == 0:
+    if count <= parallel_rows and mf_counts[world] == 0 and count <= speed_first[world]:
         owner[world] = 1
         return
     owner[world] = 0
     line = first[world]
-    for row in range(wp.min(count, units.shape[1])):
+    # The speed rows carry the unit sources their allocation wrote.
+    for row in range(wp.min(wp.min(count, speed_first[world]), units.shape[1])):
         key = z.rowkeys[line, row]
         if key < 0:
             token = -1 - key
@@ -465,6 +468,7 @@ class KeyedRows:
                 self.data,
                 s.placement.constraint_count,
                 s.placement.mf_constraint_count,
+                s.placement.speed_first,
                 layout.parallel_rows,
                 na,
                 layout.primary_offset,

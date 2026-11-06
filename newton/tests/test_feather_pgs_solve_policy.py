@@ -104,8 +104,8 @@ def _factory_calls():
         (
             "paired",
             sweep_routes_local.paired_factor_kernel.__wrapped__,
-            (192, 29, 23, 6, "120", True),
-            {"contact_units": True},
+            (192, 29, 23, 6, "120"),
+            {"contact_units": True, "speed_rows": True},
         ),
         (
             "sparse_diagonal",
@@ -166,16 +166,15 @@ def _vote_census():
             (
                 _axis("places", sweep_routes.ROW_PLACES),
                 _axis("has_dense_velocity_limit_rows"),
-                _axis("factor_coordinates"),
                 _axis("skip_tier_rows", (0, 32)),
-                _axis("independent_components"),
+                _axis("speed_rows"),
             ),
         ),
         (
             "paired",
             sweep_routes_local.paired_factor_kernel.__wrapped__,
             (192, 29, 23, 6, "120"),
-            (_axis("independent_components"), _axis("contact_units")),
+            (_axis("speed_rows"), _axis("contact_units")),
         ),
         (
             "sparse_diagonal",
@@ -454,13 +453,13 @@ class TestExitLaw(unittest.TestCase):
             checked[name] += 1
         # The admitted combinations per factory: a factory gate that starts refusing some must not shrink the census.
         # The sparse sweep composes velocity limits with the active scan and units, and a lane group with any of them;
-        # the general sweep composes factor coordinates with dense velocity-limit rows.
+        # the general sweep composes the line's speed rows with dense velocity-limit rows and the tiers' skip.
         self.assertEqual(
             checked,
             {
                 "sparse": 128,
                 "sparse_lanes": 16,
-                "mf_gs": 72,
+                "mf_gs": 48,
                 "paired": 4,
                 "sparse_diagonal": 12,
             },

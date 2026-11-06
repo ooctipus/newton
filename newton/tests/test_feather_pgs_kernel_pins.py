@@ -179,16 +179,20 @@ def _readout_calls():
     kwargs = {"contact_units": True, "speculative_contact_batches": True, **readout}
     yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (1024, 114, 6, _ARCH), kwargs
     factory = sweep_routes.mf_gs_kernel.__wrapped__
-    no_limits = {"has_dense_velocity_limit_rows": False}
     for args, kwargs in (
         ((192, 64, 22, _ARCH), {}),
-        ((192, 64, 29, _ARCH), {**no_limits, "factor_coordinates": True, "independent_components": True}),
+        ((192, 64, 22, _ARCH), {"free_rows": False, "speed_rows": True}),
     ):
         yield "sweep_routes.mf_gs_kernel", factory, args, {**kwargs, **readout}
     factory = sweep_routes_local.paired_factor_kernel.__wrapped__
     for units in (False, True):
         kwargs = {"contact_units": True, **readout} if units else readout
-        yield "sweep_routes_local.paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, True), kwargs
+        yield (
+            "sweep_routes_local.paired_factor_kernel",
+            factory,
+            (192, 29, 23, 6, _ARCH),
+            {**kwargs, "speed_rows": True},
+        )
 
 
 def _module_kernels():
@@ -318,12 +322,12 @@ def _solver_factory_calls():
         # The velocity-limit rows' last word.
         kwargs = {**kwargs, "velocity_limits": True}
         yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (64, 10, 9, _ARCH), kwargs
-    for skip_rows, limits, coordinates, components in itertools.product((0, 32), *([(False, True)] * 3)):
+    for skip_rows, limits, free, speed in itertools.product((0, 32), *([(False, True)] * 3)):
         kwargs = {
             "skip_tier_rows": skip_rows,
             "has_dense_velocity_limit_rows": limits,
-            "factor_coordinates": coordinates,
-            "independent_components": components,
+            "free_rows": free,
+            "speed_rows": speed,
         }
         factory = sweep_routes.mf_gs_kernel.__wrapped__
         yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
@@ -340,14 +344,14 @@ def _solver_factory_calls():
     # The colored units' slot staging, under each law (the weights a constant of the plan).
     for weighted in (False, True):
         yield "sweep_units.stage_slots", sweep_units.stage_slots.__wrapped__, (weighted,), {}
-    for components in (False, True):
+    for speed in (False, True):
         factory = sweep_routes_local.paired_factor_kernel.__wrapped__
-        yield "sweep_routes_local.paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, components), {}
+        yield "sweep_routes_local.paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH), {"speed_rows": speed}
     # The unit walks of the same factory.
-    for components in (False, True):
+    for speed in (False, True):
         factory = sweep_routes_local.paired_factor_kernel.__wrapped__
-        args = (192, 29, 23, 6, _ARCH, components)
-        yield "sweep_routes_local.paired_factor_kernel", factory, args, {"contact_units": True}
+        args = (192, 29, 23, 6, _ARCH)
+        yield "sweep_routes_local.paired_factor_kernel", factory, args, {"contact_units": True, "speed_rows": speed}
 
     # Parallel tiers: one articulation per world, its response formed in-kernel.
     for tier in ((32, 0), (48, 32)):
@@ -363,14 +367,12 @@ def _suite_shape_calls():
     Each call reproduces the kernel name its route records and, where a head
     profile ran the route, the profile's kernel suffix: the matrix-free
     Gauss-Seidel, sparse, sparse-diagonal and keyed parallel sweeps, the keyed
-    limit rows, the sparse mass factors, the sparse contact responses, the
-    paired-component preparation. A byte-identical
+    limit rows, the sparse mass factors and the sparse contact responses. A byte-identical
     rewrite of their generators then keeps the binaries the suite runs.
     """
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
         keyed_row_layout,
         keyed_rows,
-        paired_components,
         sweep_routes,
         sweep_routes_diag,
         sweep_routes_sparse,
@@ -383,7 +385,7 @@ def _suite_shape_calls():
     for args, kwargs in (
         ((192, 64, 22, _ARCH), {}),
         ((192, 64, 22, _ARCH), {"skip_tier_rows": 128}),
-        ((192, 64, 29, _ARCH), {**no_limits, "factor_coordinates": True, "independent_components": True}),
+        ((192, 64, 22, _ARCH), {"free_rows": False, "speed_rows": True, "skip_tier_rows": 128}),
         ((72, 32, 18, _ARCH), {**no_limits, "skip_tier_rows": 48}),
     ):
         yield "sweep_routes.mf_gs_kernel", factory, args, kwargs
@@ -413,8 +415,6 @@ def _suite_shape_calls():
             kwargs = {"rows": rows, "min_rows": min_rows, "sweeps": 24, "inkernel_response": blocks}
             yield "keyed_rows.get_parallel_factory", parallel, (layout, *shape), kwargs
     yield "keyed_row_layout.prefix_kernel", limit_prefix, (limited,), {}
-    components = paired_components.paired_components_kernel.__wrapped__
-    yield "paired_components.paired_components_kernel", components, (23, 6), {}
 
 
 def _keyed_row_calls():

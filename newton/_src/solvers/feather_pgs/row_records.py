@@ -114,6 +114,10 @@ UNIT_LINK = wp.constant(4)
 """A link's row: index ``6 link + row``."""
 UNIT_VELOCITY = wp.constant(5)
 """A joint velocity limit's row: index ``2 dof + side``, side 0 the lower (``+e_dof``), side 1 the upper (``-e_dof``)."""
+UNIT_SPEED = wp.constant(6)
+"""A free body's speed row: index ``2 dof``, ``dof`` the first coordinate of the velocity it bounds (its linear
+velocity's or its angular one's), seeded ``+e_dof`` as a velocity limit's lower side; the writer stores the axis
+unwhitened (:func:`.walk_rows.speed_axis`)."""
 UNIT_SHIFT = wp.constant(28)
 """Bits of a unit source's index: its kind sits above them."""
 

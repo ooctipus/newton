@@ -279,28 +279,19 @@ class Sweep:
         # the factor sweep walks them with the generic path's row order and
         # arithmetic, solving each tangent pair once.
         self.factor_coordinate_contact_units = bool(self.paired_factor_coordinates and not self.laws.set.compliance)
-        self.paired_factor_primary_offsets_by_world = None
         self.paired_factor_secondary_offsets_by_world = None
-        self.paired_factor_primary_arts_by_world = None
         if choice is None:
             return
         primary_arts = forest.group_to_art_host[choice.primary]
         secondary_arts = forest.group_to_art_host[choice.secondary]
-        primary_offsets = np.empty(forest.world_count, dtype=np.int32)
+        # Each world's free body's first world coordinate, where its speed rows read its velocity.
         secondary_offsets = np.empty(forest.world_count, dtype=np.int32)
-        # Each world's articulation: where the paired components' check reads its walk (paired_components).
-        primary_by_world = np.full(forest.world_count, -1, dtype=np.int32)
+        dof_start = forest.articulation_dof_start_host
         for primary_group, primary_art in enumerate(primary_arts):
             world = int(forest.articulation_world[primary_art])
             secondary_art = int(secondary_arts[int(choice.groups[primary_group])])
-            primary_by_world[world] = int(primary_art)
-            dof_start = forest.articulation_dof_start_host
-            primary_first = dof_start[primary_art] < dof_start[secondary_art]
-            primary_offsets[world] = 0 if primary_first else choice.secondary
-            secondary_offsets[world] = choice.primary if primary_first else 0
-        self.paired_factor_primary_offsets_by_world = wp.array(primary_offsets, dtype=wp.int32, device=model.device)
+            secondary_offsets[world] = choice.primary if dof_start[primary_art] < dof_start[secondary_art] else 0
         self.paired_factor_secondary_offsets_by_world = wp.array(secondary_offsets, dtype=wp.int32, device=model.device)
-        self.paired_factor_primary_arts_by_world = wp.array(primary_by_world, dtype=wp.int32, device=model.device)
 
     def place_tiers(self, choice) -> None:
         """Case K4, the Jacobi tiers: their in-kernel response's trees, from the class plan's choice
@@ -376,17 +367,12 @@ class Sweep:
         """Build the paired response and the sweeps."""
         model = self.model
         device_arch = model.device.arch
-        from . import paired_components  # noqa: PLC0415
 
         # The sweeps start from the impulses the rows carry: the warm start's, the closed loop's projection.
         self.seeded = bool(self.options.pgs_warmstart or self.factor.eliminates)
-        self.paired_components = None
-        self.paired_components_reason = paired_components.decline(self)
-        if self.paired_components_reason is None:
-            self.paired_components = paired_components.PairedComponents(self)
-            self.paired_components_reason = (
-                "Admitted: each paired world splits into independent articulation and free-body components."
-            )
+        # The line's speed rows (step_plan.Capacities.speed_rows), where a free body's rows are the line's.
+        speed_rows = self.placement.speed_rows > 0
+        # Case K5 owns every row of its worlds, its free body's contacts and speed rows among them (rows of the line).
         self.paired_factor_kernel = (
             self.kernel(
                 "paired_factor",
@@ -396,11 +382,11 @@ class Sweep:
                 self.paired_response_primary_size,
                 self.paired_response_secondary_size,
                 device_arch,
-                independent_components=self.paired_components is not None,
                 contact_units=self.factor_coordinate_contact_units,
                 torsion=self.laws.spin_rows,
                 pitch=self.placement.row_pitch,
                 seeded=self.seeded,
+                speed_rows=speed_rows,
             )
             if self.paired_factor_coordinates
             else None
@@ -464,7 +450,7 @@ class Sweep:
         # The Jacobi tiers ahead of the matrix-free sweep (SweepTier), and their keyed rows' release.
         self.tiers = []
         self.tier_worlds = None
-        if self.classes.mf_sweeps:
+        if self.classes.mf_sweeps and self.paired_factor_kernel is None:
             # A test pin streams the impulses (storage is part of the kernel specialization key); the selection
             # sizes the resident row metadata with its choice.
             force_stream_mf_impulses = self.pins.mf_storage == "streamed"
@@ -480,6 +466,7 @@ class Sweep:
                         self.placement.dense_max_constraints,
                         self.placement.mf_max_constraints,
                         self.forest.max_world_dofs,
+                        free_rows=self.placement.free_contact_rows,
                     ),
                     arch_budget(device_arch),
                     block_count=self.forest.world_count,
@@ -493,9 +480,12 @@ class Sweep:
             # storage slot each, for those worlds only, it runs beside the one-warp mapping. More of them than the
             # device holds colored blocks run in waves, which scales the rule (ColoredRule.at_scale).
             rule = sweep_units.COLORED_RULE
-            capable = sweep_units.capable_worlds(
-                self.forest.free_rigid_per_world, self.placement.mf_max_constraints, rule
-            )
+            # The colored mapping sweeps the free bodies' run, which exists only where a world can take it.
+            capable = np.zeros(0, dtype=np.int32)
+            if self.placement.free_contact_rows:
+                capable = sweep_units.capable_worlds(
+                    self.forest.free_rigid_per_world, self.placement.mf_max_constraints, rule
+                )
             if model.device.is_cuda and capable.size > 0:
                 found = device(model.device)
                 rule = rule.at_scale(capable.size, shape(sweep_routes.COLORED_WORK, found).blocks_per_sm * found.sms)
@@ -508,13 +498,13 @@ class Sweep:
                 "has_dense_velocity_limit_rows": self.options.enable_joint_velocity_limits,
                 "places": storage.places,
                 "contact_torsion": self.laws.spin_rows,
-                "factor_coordinates": self.paired_factor_coordinates,
                 "skip_tier_rows": parallel_rows,
-                "independent_components": self.paired_components is not None,
                 "colored_worlds": colored,
                 "max_row_dofs": self.placement.packed_support,
                 "seeded": self.seeded,
                 "wide_rows": self.placement.packed_dense == packed_rows.WIDE,
+                "free_rows": self.placement.free_contact_rows,
+                "speed_rows": speed_rows,
             }
             mf_gs_shape = (
                 self.placement.dense_max_constraints,
@@ -582,6 +572,7 @@ class Sweep:
                     # On its own list, a tier takes a block a world of the list's capacity (its work's shape).
                     grid = shape(dataclasses.replace(tier.work, items=self.forest.world_count), device(model.device))
                     self.tiers.append(dataclasses.replace(tier, tier=tier_index, grid=grid.grid))
+        if self.classes.mf_sweeps:
             # No matrix-free sweep enters a world without rows; the readout counts those solves as skipped.
             self.readout.register_skipped(world_count=int(self.forest.world_count), device=model.device)
         # The sweeps that walk their rows (and the Jacobi tiers, which always leave by the walk) add their change to the
@@ -592,15 +583,11 @@ class Sweep:
         """Open the claims' streams: the sweeps that own their worlds run on them beside the matrix-free sweep.
 
         The claims touch nothing the matrix-free sweep touches, so they fork after the rows are published and join
-        before the leave:
+        before the leave: the Jacobi tiers, whose worlds hold no free-body row, the worlds the matrix-free sweep
+        returns from. A tier's worlds are those of its row count, so each tier is a claim of its own.
 
-        - the paired factor sweep over independent components (admitted on CUDA, under the factor-coordinate sweep's
-          plain policy), whose coordinates of a split world are disjoint from the general sweep's;
-        - the Jacobi tiers, whose worlds hold no free-body row, the worlds the matrix-free sweep returns from. A tier's
-          worlds are those of its row count, so each tier is a claim of its own.
-
-        A stream a claim: the first takes the paired factor sweep where it forks, then the tiers' lists and the first
-        tier; every other tier its own, once the lists are written.
+        A stream a claim: the first takes the tiers' lists and the first tier; every other tier its own, once the lists
+        are written.
 
         The other side streams (inertia, dynamics, memset) read no contact rows nor the contact pool's ready count:
         they run factorizations and articulation data. The claims do (the keyed tiers), between the fork and the join
@@ -608,10 +595,7 @@ class Sweep:
         for the launch stream therefore waits for them too (:meth:`ContactPool.add_reader_stream`).
         """
         model = self.model
-        self.paired_forks = bool(
-            overlap and self.paired_components is not None and self.paired_factor_kernel is not None
-        )
-        claims = max(int(self.paired_forks), len(self.tiers)) if wp.get_device(model.device).is_cuda and overlap else 0
+        claims = len(self.tiers) if wp.get_device(model.device).is_cuda and overlap else 0
         self.claim_streams = tuple(wp.Stream(model.device) for _ in range(claims))
         self.claims_ready = wp.Event(model.device) if claims else None
         self.claims_listed = wp.Event(model.device) if claims > 1 else None
@@ -676,10 +660,7 @@ class Sweep:
             "world_constraint_count": placement.constraint_count,
             "dense_first": placement.dense_first,
             "dense_phase_bounds": placement.dense_phase_bounds,
-            # The paired components' signed selector (sweep_routes.mf_gs_source), where they split worlds.
-            "component_selector": self.placement.dummy_is_free_rigid
-            if self.paired_components is None
-            else self.paired_components.selector,
+            "speed_first": placement.speed_first,
             "world_dof_indices": forest.world_dof_indices,
             "rhs_bias": placement.rhs,
             "row_incident": placement.row_incident,
@@ -730,6 +711,8 @@ class Sweep:
             self._solve_packed(operands)
         elif self.case == "K2":
             self._solve_diagonal(operands)
+        elif self.case == "K5":
+            self._solve_paired(operands)
         elif self.forest.max_world_dofs:
             self._solve_claims(operands)
         if self.leaves:
@@ -786,42 +769,34 @@ class Sweep:
             fused_limit_upper_lambda=placement.fused_diagonal_limit_upper_lambda,
         )
 
+    def _solve_paired(self, operands: dict) -> None:
+        """Case K5: the paired factor sweep, which owns every row of its worlds (its free body's are rows of the
+        line)."""
+        self.readout.count_skipped(self.placement.constraint_count, self.placement.mf_constraint_count)
+        walked = {"walk": self.factor.walk_view()} if self.placement.walks else {}
+        self._launch(
+            self.paired_factor_kernel,
+            operands,
+            (self.forest.world_count + 1) // 2,
+            64,
+            world_count=self.forest.world_count,
+            # The factor rows: the packed rows at their world coordinates.
+            factor_rows=self.placement.packed_Z,
+            secondary_offset_by_world=self.paired_factor_secondary_offsets_by_world,
+            **walked,
+        )
+
     def _solve_claims(self, operands: dict) -> None:
-        """The other cases: the claims that own their worlds (the paired factor sweep's, the Jacobi tiers'), on the
-        claims' streams where they are open (:meth:`open_streams`), beside the matrix-free sweep of the rest."""
+        """The general cases: the claims that own their worlds (the Jacobi tiers'), on the claims' streams where they
+        are open (:meth:`open_streams`), beside the matrix-free sweep of the rest."""
         mf_gs_kernel = self.mf_gs_kernel
         if mf_gs_kernel is None:
             raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")
 
         # Under a readout, count the worlds without rows of any family, which no sweep enters.
         self.readout.count_skipped(self.placement.constraint_count, self.placement.mf_constraint_count)
-        factor_kernel = self.paired_factor_kernel
-        components = self.paired_components
-        if components is not None:
-            components.prepare(self, self.placement.rhs, self.placement.mf_meta_packed)
         streams = self.claim_streams
         main = wp.get_stream(self.model.device) if streams else None
-
-        walked = {}
-        if factor_kernel is not None and self.placement.walks:
-            walked = {"walk": self.factor.walk_view()}
-
-        def launch_factor_solve():
-            self._launch(
-                factor_kernel,
-                operands,
-                (self.forest.world_count + 1) // 2,
-                64,
-                world_count=self.forest.world_count,
-                # The factor rows: the packed rows at their world coordinates.
-                factor_rows=self.placement.packed_Z,
-                world_mf_constraint_count=(
-                    self.placement.mf_constraint_count if components is None else components.selector
-                ),
-                primary_offset_by_world=self.paired_factor_primary_offsets_by_world,
-                secondary_offset_by_world=self.paired_factor_secondary_offsets_by_world,
-                **walked,
-            )
 
         # The sweeps leave by the walk (sweep_routes.leave_all) and find a free body's tree in it.
         walk = {} if self.factor.walk_arts is None else {"walk": self.factor.walk_view()}
@@ -839,6 +814,7 @@ class Sweep:
                     inputs=[
                         self.placement.constraint_count,
                         self.placement.mf_constraint_count,
+                        self.placement.speed_first,
                         self.par_tiers[-1][0],
                         sweep_routes_tiers.TIER_ROWS,
                         lists.region,
@@ -857,11 +833,6 @@ class Sweep:
                 named.update(zip(("kinetic_rows", "patch_law"), keyed, strict=False))
             self._launch(tier.kernel, operands, tier.grid, tier.work.block, **named)
 
-        # The claims in their order, the paired factor sweep's worlds then the tiers'. A paired factor sweep without
-        # independent components shares worlds with the general sweep, so it runs ahead of the fork.
-        fork_factor = bool(streams) and self.paired_forks
-        if factor_kernel is not None and not fork_factor:
-            launch_factor_solve()
         if streams:
             main.record_event(self.claims_ready)
             for stream in streams:
@@ -881,8 +852,6 @@ class Sweep:
         if streams:
             # The general tail is queued first; the claims share only the ready dependency with it.
             with wp.ScopedStream(streams[0], sync_enter=False):
-                if fork_factor:
-                    launch_factor_solve()
                 list_tiers()
             if self.claims_listed is not None:
                 streams[0].record_event(self.claims_listed)

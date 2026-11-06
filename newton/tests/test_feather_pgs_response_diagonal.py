@@ -681,17 +681,13 @@ def _paired_unit_rows(seed, *, worlds=6, capacity=64, primary=23, secondary=6):
     return rows
 
 
-def _launch_paired_factor_solve(kernel, rows, device, *, primary, components, iterations, omega):
+def _launch_paired_factor_solve(kernel, rows, device, *, primary, iterations, omega):
     """Run one paired factor-coordinate sweep over the rows and the step's leave of its change (:func:`.leave_walk`,
     each world's coordinates a diagonal walk, :func:`.diagonal_walk`); return its impulses and velocities."""
     worlds, _capacity, dofs = rows["factor_rows"].shape
-    secondary = dofs - primary
     rng = np.random.default_rng(99)
     walk = diagonal_walk(rng.uniform(0.3, 1.5, (worlds, dofs)), device)
     odd = np.arange(worlds) % 2 == 1
-    selector = np.zeros(worlds, np.int32)
-    if components:
-        selector[2] = -1
 
     def array(value, dtype):
         return wp.array(np.ascontiguousarray(value), dtype=dtype, device=device)
@@ -715,8 +711,8 @@ def _launch_paired_factor_solve(kernel, rows, device, *, primary, components, it
             array(rows["row_type"], wp.int32),
             array(rows["row_parent"], wp.int32),
             array(rows["row_mu"], wp.float32),
-            array(selector, wp.int32),
-            array(np.where(odd, secondary, 0).astype(np.int32), wp.int32),
+            # No speed row: every world's rows are its schedule's.
+            array(rows["row_count"], wp.int32),
             array(np.where(odd, 0, primary).astype(np.int32), wp.int32),
             iterations,
             omega,
@@ -733,8 +729,8 @@ def _launch_paired_factor_solve(kernel, rows, device, *, primary, components, it
 class TestPairedFactorUnitSource(unittest.TestCase):
     def test_unit_walk_replaces_the_runtime_layout_test(self):
         """Walk units from each row's type and parent; neither schedule tests a layout."""
-        units = paired_factor_source(192, 29, 23, 6, contact_units=True, independent_components=True)[0]
-        general = paired_factor_source(192, 29, 23, 6, independent_components=True)[0]
+        units = paired_factor_source(192, 29, 23, 6, contact_units=True)[0]
+        general = paired_factor_source(192, 29, 23, 6)[0]
         # A unit owns tangent rows only when the next row is a tangent naming it as parent; three
         # normal-only units must not read as one triple, so the walk needs no stride-3 layout test.
         self.assertIn("world_row_parent.data[off + tangent1] == i", units)
@@ -744,8 +740,8 @@ class TestPairedFactorUnitSource(unittest.TestCase):
         self.assertNotIn("triple_layout", general)
         factory = paired_factor_kernel.__wrapped__
         self.assertEqual(
-            factory(192, 29, 23, 6, "120", True, contact_units=True).key,
-            "sweep_paired_factor_192_29_23_6_units_components_walk",
+            factory(192, 29, 23, 6, "120", contact_units=True).key,
+            "sweep_paired_factor_192_29_23_6_units_walk",
         )
 
 
@@ -761,17 +757,15 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         reproduces the general sweep's bits.
         """
         device = wp.get_device("cuda:0")
-        for (capacity, primary, secondary), components, (iterations, omega) in itertools.product(
-            ((64, 23, 6), (48, 10, 6)), (False, True), ((8, 1.0), (8, 0.9), (5, 1.0))
+        for (capacity, primary, secondary), (iterations, omega) in itertools.product(
+            ((64, 23, 6), (48, 10, 6)), ((8, 1.0), (8, 0.9), (5, 1.0))
         ):
             rows = _paired_unit_rows(capacity + primary, capacity=capacity, primary=primary, secondary=secondary)
             self.assertGreater(rows["anchors"], 4)
             self.assertGreater(rows["loaded_rings"], 0)
             dofs = primary + secondary
             kernels = [
-                paired_factor_kernel(
-                    capacity, dofs, primary, secondary, str(device.arch), independent_components=components, **kwargs
-                )
+                paired_factor_kernel(capacity, dofs, primary, secondary, str(device.arch), **kwargs)
                 for kwargs in ({}, {"contact_units": True})
             ]
             general, units = (
@@ -780,13 +774,12 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     rows,
                     device,
                     primary=primary,
-                    components=components,
                     iterations=iterations,
                     omega=omega,
                 )
                 for kernel in kernels
             )
-            with self.subTest(capacity=capacity, components=components, iterations=iterations, omega=omega):
+            with self.subTest(capacity=capacity, iterations=iterations, omega=omega):
                 self.assertFalse(np.array_equal(general[0], rows["impulses"]), "the sweep changed no impulse")
                 tangents = rows["row_type"] == PGS_CONSTRAINT_TYPE_FRICTION
                 self.assertTrue(np.any(general[0][tangents] != 0.0), "no tangent row was loaded")
@@ -801,13 +794,12 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     cold,
                     device,
                     primary=primary,
-                    components=components,
                     iterations=1,
                     omega=omega,
                 )
                 for kernel in kernels
             )
-            with self.subTest("cold", capacity=capacity, components=components, omega=omega):
+            with self.subTest("cold", capacity=capacity, omega=omega):
                 tangents = cold["row_type"] == PGS_CONSTRAINT_TYPE_FRICTION
                 self.assertTrue(np.any(general[0][tangents] != 0.0), "no tangent row was loaded")
                 for unit_values, general_values in zip(units, general, strict=True):

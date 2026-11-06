@@ -91,10 +91,16 @@ def _add_body(builder, xform, limits):
     )
 
 
-def _add_arm(builder):
-    """Add a one-joint arm to the current world, so the world's sweep visits dense rows before its free-body rows."""
-    link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.1))
-    builder.add_articulation([builder.add_joint_revolute(-1, link, axis=newton.Axis.Y)])
+def _add_arm(builder, joints=1):
+    """Add an arm of ``joints`` revolute joints in a chain to the current world, so the world's sweep visits dense rows
+    before its free bodies' speed rows; 17 to 26 joints beside the box make the paired factor sweep's class (case
+    K5)."""
+    parent, chain = -1, []
+    for _ in range(joints):
+        link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.1))
+        chain.append(builder.add_joint_revolute(parent, link, axis=newton.Axis.Y))
+        parent = link
+    builder.add_articulation(chain)
 
 
 def _run(builder, device, bodies, *, velocities=None, wrenches=None, **options):
@@ -149,8 +155,7 @@ def _free_boxes(
     Args:
         device: Warp device of the model and solver.
         worlds: Initial (linear [m/s], angular [rad/s]) velocity of each world's box.
-        articulated: Add a one-joint arm to every world, so its sweep visits dense rows before the free-body
-            rows.
+        articulated: Add an arm of this many joints (``True``: one) to every world (:func:`_add_arm`).
         limits: (linear [m/s], angular [rad/s]) speed limits of every box; None leaves the speed attributes
             unregistered.
         fraction: The solver's ``velocity_limit_activation_fraction``.
@@ -164,7 +169,7 @@ def _free_boxes(
         builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
         boxes.append(box)
         if articulated:
-            _add_arm(builder)
+            _add_arm(builder, int(articulated))
         builder.end_world()
     return _run(
         builder,
@@ -234,8 +239,8 @@ def _inverse(diagonal):
 
 def _free_body_rows(run):
     """Return each world's rows of its free bodies' line: types, axes, signs, right-hand sides and impulses, [world,
-    row]: the line's rows (the free bodies' contacts are rows of the line), then their speed rows (the free bodies'
-    rows from the store's body base).
+    row]: the line's rows (the free bodies' contacts and speed rows are rows of the line, the speed rows its last),
+    then the free bodies' run's (from the store's body base) where their worlds keep one.
 
     A speed row's axis is the first DOF of the velocity it bounds: 0 for the linear, 3 for the angular.
     """
@@ -253,14 +258,21 @@ def _free_body_rows(run):
             out[world, : len(line)] = values[world, line]
         return out
 
-    # A speed row keeps its axis unwhitened, at its body's first entry (the free bodies' rows' sides layout).
-    jacobian = np.stack([gather(placement.packed_Z.numpy()[..., k]) for k in range(6)], axis=2)
-    axis = np.argmax(np.abs(jacobian), axis=2)
+    # A speed row keeps its axis unwhitened, at its side's entries (packed_rows: from the side's world coordinate where
+    # the rows are dense, else from entry 0).
+    jacobian = np.stack(
+        [gather(placement.packed_Z.numpy()[..., k]) for k in range(placement.packed_Z.shape[2])], axis=2
+    )
+    offset = run.solver.forest.articulation_world_dof_offset.numpy()
+    first = np.where(
+        int(placement.packed_dense) != 0, offset[np.maximum(gather(placement.row_sides.numpy()[..., 0]), 0)], 0
+    )
+    axis = np.argmax(np.abs(jacobian), axis=2) - first
     return SimpleNamespace(
         count=np.array([len(line) for line in lines]),
         type=gather(placement.row_type.numpy()),
         axis=axis,
-        sign=np.sign(np.take_along_axis(jacobian, axis[..., None], axis=2)[..., 0]),
+        sign=np.sign(np.take_along_axis(jacobian, (axis + first)[..., None], axis=2)[..., 0]),
         rhs=gather(placement.rhs.numpy()),
         # The step's inverse of each row's effective mass, as its header caches it.
         eff_mass_inv=_inverse(gather(placement.diag.numpy())),
@@ -336,9 +348,13 @@ class _FreeBodyVelocityLimitChecks:
         wrenches = [np.concatenate((force, torque)) for _, _, force, torque in PAST]
         predicted = np.array([np.concatenate(world) for world in worlds]) + np.array(wrenches)
         expected = _clamped_magnitudes(predicted)
-        for articulated, fraction in ((False, 0.0), (True, 0.0), (False, 0.7)):
+        # A 17-joint arm beside the box: on CUDA the paired factor sweep's class (case K5), which sweeps the box's
+        # speed rows on its lanes.
+        for articulated, fraction in ((False, 0.0), (True, 0.0), (False, 0.7), (17, 0.0)):
             with self.subTest(articulated=articulated, fraction=fraction):
                 run = _free_boxes(self.device, worlds, articulated=articulated, wrenches=wrenches, fraction=fraction)
+                if articulated == 17 and wp.get_device(self.device).is_cuda:
+                    self.assertEqual(run.solver.spec.classes.case, "K5")
                 velocity = _step(run)
                 self.check_rows_are_velocity_limits(run)
                 _assert_on_limit_scale(velocity, expected)
@@ -428,7 +444,9 @@ class TestFreeBodyVelocityLimits(_FreeBodyVelocityLimitChecks, unittest.TestCase
             with self.subTest(name):
                 run = _free_boxes(self.device, world, **options)
                 _step(run)
-                self.assertEqual(int(run.solver.placement.mf_constraint_count.numpy().sum()) > 0, built)
+                rows = _free_body_rows(run)
+                live = np.arange(rows.type.shape[1])[None, :] < rows.count[:, None]
+                self.assertEqual(bool(np.any(live & (rows.type == PGS_CONSTRAINT_TYPE_SPEED))), built)
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "the CUDA sweeps need CUDA")

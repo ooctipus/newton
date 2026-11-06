@@ -443,7 +443,10 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
     sides_all = placement.row_sides.numpy()
     counts = placement.constraint_count.numpy()
     first = placement.dense_first.numpy()
+    kinds_all = placement.row_type.numpy()
     walks, hats = {}, {}
+    # A world whose speed ball acted: a speed row of the line (its last rows) or of the free bodies' run.
+    ball = np.zeros(int(forest.world_count), dtype=bool)
 
     def walk_of(art):
         if art not in walks:
@@ -463,6 +466,10 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
         if count == 0:
             continue
         for row in range(count):
+            if kinds_all[line, row] == PGS_CONSTRAINT_TYPE_SPEED:
+                # A speed row keeps its unwhitened axis: its law reads the body's velocity, not a row.
+                ball[world] |= capture.impulses[line, row] != 0.0
+                continue
             term, scale_z, scale_u, length = 0.0, 0.0, 0.0, 0
             at = 0
             skip = False
@@ -487,7 +494,6 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
                 out["rows"] = max(out["rows"], abs(term - incident[line, row]) / bound)
         out["worlds"] += 1
     # The free bodies' rows: each side a six-step walk, against the incident velocity the writer summed.
-    ball = np.zeros(int(forest.world_count), dtype=bool)
     free_du = {}
     if capture.mf_final is not None:
         Z_a, Z_b, lam, mf_counts, side_a, side_b, _dof_a, _dof_b, kinds = capture.mf_final

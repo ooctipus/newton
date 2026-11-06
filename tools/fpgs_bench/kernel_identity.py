@@ -164,8 +164,8 @@ def factory_calls():
         {"places": sweep_routes.RowPlaces(impulses=Place.GLOBAL)},
         {"contact_torsion": True},
         {"skip_tier_rows": 32},
-        {"factor_coordinates": True},
-        {"factor_coordinates": True, "independent_components": True},
+        {"free_rows": False},
+        {"free_rows": False, "speed_rows": True},
     )
     for base in ({}, {"has_dense_velocity_limit_rows": False}):
         for change in toggles:
@@ -496,7 +496,7 @@ def walk_calls():
     pair = Named("(franka, cube)", (tables["franka"], tables["cube"]))
     yield "walk_rows.walked_rows_kernel", _unwrapped(walk_rows.walked_rows_kernel), (0, False, False, pair), {}
     mf_gs = _unwrapped(sweep_routes.mf_gs_kernel)
-    free = {"factor_coordinates": True, "independent_components": True, "has_dense_velocity_limit_rows": False}
+    free = {"free_rows": False, "speed_rows": True, "has_dense_velocity_limit_rows": False}
     yield "sweep_routes.mf_gs_kernel", mf_gs, (64, 32, 12, ARCH), free
     tiers = {"rows": 32, "min_rows": 0, "sweeps": 24, "inkernel_response": (18, 0, 0, 0)}
     yield "sweep_routes_tiers.parallel_kernel", sweep_routes_tiers.parallel_kernel, (64, 32, 18, ARCH), tiers
@@ -550,9 +550,8 @@ def census_calls():
         _axis("places", sweep_routes.ROW_PLACES),
         _axis("has_dense_velocity_limit_rows", (True, False)),
         _axis("contact_torsion"),
-        _axis("factor_coordinates"),
         _axis("skip_tier_rows", (0, 32)),
-        _axis("independent_components"),
+        _axis("speed_rows"),
     )
     keyed = KeyedLayout(16, 6, 0, 16, 128, False, 0)
     specs = (
@@ -581,7 +580,7 @@ def census_calls():
             "sweep_routes_local.paired_factor_kernel",
             sweep_routes_local.paired_factor_kernel,
             ((192, 29, 23, 6, ARCH),),
-            (_axis("independent_components"), _axis("contact_units")),
+            (_axis("speed_rows"), _axis("contact_units")),
         ),
         (
             "sweep_routes_diag.sparse_diagonal_kernel",

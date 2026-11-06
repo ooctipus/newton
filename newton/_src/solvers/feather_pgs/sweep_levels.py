@@ -130,6 +130,7 @@ def level_offsets(*, levels: str, counts: str) -> str:
 def list_worlds(
     rows: wp.array[int],
     free_body_rows: wp.array[int],
+    speed_first: wp.array[int],
     bound: int,
     width: int,
     region: int,
@@ -138,7 +139,8 @@ def list_worlds(
     count: wp.array[int],
 ):
     """Bucket the worlds whose rows are dense only and at most ``bound`` by their rows: bucket ``(rows - 1) // width``
-    of a queue of ``region`` slots a bucket.
+    of a queue of ``region`` slots a bucket. A world with a free body's row (in the free bodies' run, or a speed row
+    of the line, its rows from ``speed_first``) is the general sweep's.
 
     The Jacobi tiers' worlds share nothing, so each is a component of its own and the order inside a bucket is free
     (:func:`~newton._src.core.execution.append`'s, an atomic a warp a bucket); tier ``t`` serves ``(t * width, (t + 1) * width]`` rows and walks bucket ``t`` (an exiting block of a
@@ -146,7 +148,7 @@ def list_worlds(
     """
     world = wp.tid()
     m = rows[world]
-    if m <= 0 or m > bound or free_body_rows[world] != 0:
+    if m <= 0 or m > bound or free_body_rows[world] != 0 or m > speed_first[world]:
         return
     append(items, count, (m - 1) // width, region, world)
 

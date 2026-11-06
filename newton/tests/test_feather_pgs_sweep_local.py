@@ -25,11 +25,11 @@ PAIRED_SCHEDULES = ({}, {"contact_units": True})
 
 
 def _paired_variants():
-    for schedule, components, policy in itertools.product(
+    for schedule, speed, policy in itertools.product(
         PAIRED_SCHEDULES, (False, True), (DEFAULT_POLICY, SolvePolicy(readout="sweeps"))
     ):
-        kwargs = {**schedule, "independent_components": components, "solve_policy": policy}
-        yield f"{list(schedule) or 'general'} components={components}{policy.suffix}", (64, 23, 17, 6, "120"), kwargs
+        kwargs = {**schedule, "speed_rows": speed, "solve_policy": policy}
+        yield f"{list(schedule) or 'general'} speed={speed}{policy.suffix}", (64, 23, 17, 6, "120"), kwargs
 
 
 def _block(body: str, head: str) -> str:
@@ -47,7 +47,7 @@ class TestPairedFactorRoute(unittest.TestCase):
     """The paired factor sweep (``sweep_routes_local.paired_factor_kernel``)."""
 
     def test_variants_build(self):
-        """Every schedule builds, with and without independent components and with a counted readout."""
+        """Every schedule builds, with and without the line's speed rows and with a counted readout."""
         for label, args, kwargs in _paired_variants():
             with self.subTest(label):
                 self.assertTrue(_PAIRED(*args, **kwargs).key)
@@ -159,7 +159,7 @@ class TestOfflineCompile(unittest.TestCase):
         for schedule in PAIRED_SCHEDULES:
             with self.subTest(schedule):
                 args = (64, 23, 17, 6, "120")
-                kwargs = {**schedule, "independent_components": True}
+                kwargs = {**schedule, "speed_rows": True}
                 self._compile(_PAIRED(*args, **kwargs), 64)
 
 

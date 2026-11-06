@@ -7,8 +7,7 @@ The rows are the walk's (:mod:`.walk_rows`: the one writer walks every row's see
 module packs the free-body rows (:func:`.sweep_routes.free_body_rows`, rows over at most two free bodies) into the
 row word (:func:`free_body_meta_kernel`, :func:`.row_metadata.pack_mf_header`, which the sweeps' row loop decodes:
 its sides' coordinates, ``1 / A_ii``); their ``A_ii`` is the walk's (:func:`.walk_rows.write_free_body_rows`), their rhs the rows' law's.
-The bilateral closure is the factor's (:mod:`.factor.closure`), the paired rows' qualification the paired
-components' (:func:`.paired_components.paired_components_kernel`).
+The bilateral closure is the factor's (:mod:`.factor.closure`).
 """
 
 from __future__ import annotations

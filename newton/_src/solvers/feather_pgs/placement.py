@@ -82,8 +82,12 @@ WORLD_ROW_STATE = FieldGroup(
     Field("dense_phase_bounds", wp.int32, ("world", 2), owner="placement"),
     # First matrix-free slot past the contact/friction rows (start of the velocity-limit tail).
     Field("mf_contact_rows_end", wp.int32, ("world",), owner="placement"),
+    # The line's first speed row, past every contact row: a free body's speed rows are the line's last rows where
+    # they are rows of the line (step_plan.Capacities.speed_rows), so the rows [speed_first, m_dense) are speed rows.
+    Field("speed_first", wp.int32, ("world",), owner="placement"),
 )
-"""Per-world row-family boundaries: the dense rows' phases and the free bodies' contact rows' end."""
+"""Per-world row-family boundaries: the dense rows' phases, the free bodies' contact rows' end and the line's speed
+rows' start."""
 
 CONTACT_RUNS = FieldGroup(
     Field("contact_run_first", wp.int32, ("world", "run_block"), fill=2**31 - 1, owner="placement"),
@@ -334,10 +338,12 @@ class Placement:
         self.dense_max_constraints = spec.capacities.dense_rows
         self.mf_max_constraints = spec.capacities.free_body_rows
         _validate_mf_metadata_encoding(self.mf_max_constraints)
-        # A free body is a one-node tree: its contacts keep a run of their own (the free bodies' rows from
-        # ``body_base``) only where a world can take the colored mapping; elsewhere they are rows of the line and the
-        # free bodies' rows hold their speed rows alone (the spec's capacities, step_plan.Capacities).
+        # A free body is a one-node tree: its contacts and speed rows keep a run of their own (the free bodies' rows
+        # from ``body_base``) only where a world can take the colored mapping; elsewhere they are rows of the line,
+        # the speed rows its last (``speed_rows`` a world), and the free bodies' rows hold none (the spec's
+        # capacities, step_plan.Capacities).
         self.free_contact_rows = spec.capacities.free_contact_rows
+        self.speed_rows = spec.capacities.speed_rows
         # The row store's line: the dense class's rows, then (with free rigid bodies) the free bodies' from
         # ``body_base``.
         self.body_base = self.dense_max_constraints
@@ -597,12 +603,12 @@ class Placement:
             response_builds_rows.free_body_meta_kernel(
                 self.mf_max_constraints, self.row_pitch, self.body_base, self.mf_meta_lanes, model.device.arch
             )
-            if self.forest.has_free_rigid_bodies and self.mf_max_constraints > 0
+            if self.free_contact_rows
             else None
         )
         arrays = self.arrays
         worlds = self.forest.world_count
-        rows = self.mf_max_constraints if self.forest.has_free_rigid_bodies else 1
+        rows = self.mf_max_constraints if self.free_contact_rows else 1
         arrays.allocate(MF_ROWS, world=worlds, mf_meta=4 * rows)
 
         if not self.forest.has_free_rigid_bodies:

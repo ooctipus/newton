@@ -362,7 +362,6 @@ def _paired_response(solver) -> dict:
     if primary is None:
         return {"enabled": False, "reason": solver.sweep.paired_response_reason}
     factor = row.case == "K5"
-    overlap = bool(solver.sweep.claim_streams) and solver.sweep.paired_forks
     return {
         "enabled": True,
         "primary_dofs": int(primary),
@@ -371,12 +370,6 @@ def _paired_response(solver) -> dict:
         # Why the paired response keeps its register inverse instead of factor coordinates (None when admitted).
         "factor_coordinates_reason": row.reasons["K5"],
         "contact_units": bool(solver.sweep.factor_coordinate_contact_units),
-        "components": solver.sweep.paired_components is not None,
-        "components_reason": solver.sweep.paired_components_reason,
-        "two_stream_overlap": overlap,
-        "two_stream_reason": "The paired factor sweep and the general sweep fork onto two streams."
-        if overlap
-        else "Overlap needs independent components on parallel CUDA streams without debug.",
         "reason": "One articulation factor and one free body per world share one response"
         + (" in factor coordinates." if factor else " with a register inverse."),
     }

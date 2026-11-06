@@ -101,40 +101,47 @@ class Capacities:
     row_pitch: int
     """A world's rows in the row store: the dense rows, then the free-body rows where free bodies exist."""
     free_contact_rows: bool
-    """The free bodies' contacts keep a run of their own (the free-body rows): only where a world can take the colored
-    mapping, whose units are that run's (:func:`.sweep_units.capable_worlds`)."""
+    """The free bodies' contacts and speed rows keep a run of their own (the free-body rows): only where a world can
+    take the colored mapping, whose units are that run's (:func:`.sweep_units.capable_worlds`)."""
+    speed_rows: int
+    """The free bodies' speed rows a world holds on the line (two a body under speed limits), where they are rows of
+    the line: the line's last rows, from its phase bound 2 (:meth:`.rows.RowLaws.bound_phase`); 0 elsewhere."""
 
     @classmethod
     def build(cls, options, forest: ForestPlan, link_rows: int, speed_limits: bool) -> Capacities:
         """The capacities from the options and the forest: a link's rows are the closure's, on top of the rows the
         option gives the world's contacts (``link_rows`` a world).
 
-        A free body is a one-node tree: its contacts are rows of the line like any other, written by the one writer
-        and swept by the class's sweep. They keep a run of their own only where a world can take the colored mapping;
-        elsewhere their capacity (``mf_max_constraints``) joins the line's dense rows and the free-body rows hold the
-        bodies' speed rows alone (two a body under ``speed_limits``)."""
+        A free body is a one-node tree: its contacts and speed rows are rows of the line like any other, written by
+        the one writer and swept by the class's sweep. They keep a run of their own only where a world can take the
+        colored mapping; elsewhere their capacity (``mf_max_constraints``) and the speed rows' join the line's dense
+        rows, and the free-body rows hold none."""
+        from . import sweep_units  # noqa: PLC0415
         from .row_kernels import RIGID_SPEED_ROWS  # noqa: PLC0415
         from .row_metadata import _validate_mf_metadata_encoding  # noqa: PLC0415
-        from .sweep_units import capable_worlds  # noqa: PLC0415
 
         dense = int(options.dense_max_constraints) + int(link_rows)
         free = int(options.mf_max_constraints)
         _validate_mf_metadata_encoding(free)
         free_bodies = forest.has_free_rigid_bodies
-        run = bool(free_bodies and capable_worlds(forest.free_rigid_per_world, free).size > 0)
+        # The production rule decides the run (the rows' layout); a test that relaxes the rule changes only which of
+        # the run's worlds the colored mapping takes.
+        run = bool(free_bodies and sweep_units.capable_worlds(forest.free_rigid_per_world, free).size > 0)
+        speed_rows = 0
         if free_bodies and not run:
-            dense += free
-            speed_rows = RIGID_SPEED_ROWS * int(np.max(forest.free_rigid_per_world, initial=0))
-            speed_rows = max(speed_rows if speed_limits else 0, 1)
+            speed_rows = RIGID_SPEED_ROWS * int(np.max(forest.free_rigid_per_world, initial=0)) if speed_limits else 0
+            dense += free + speed_rows
             # The line ends on a whole L1 line, so every world's line starts on one (a line of 258 rows split each
-            # world's writes across lines: allegro's keyed limit prefix ran 2x): the free bodies' rows fill it.
+            # world's writes across lines: allegro's keyed limit prefix ran 2x): the free bodies' (empty) rows fill
+            # it, one at least.
             line = L1_LINE_BYTES // 4
-            free = -(-(dense + speed_rows) // line) * line - dense
+            free = -(-(dense + 1) // line) * line - dense
         return cls(
             dense_rows=dense,
             free_body_rows=free,
             row_pitch=dense + (free if free_bodies else 0),
             free_contact_rows=run,
+            speed_rows=speed_rows,
         )
 
     def record(self) -> dict:
@@ -636,6 +643,9 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     def bound_free_body_contacts(step):
         laws.bound_free_body_contacts(solver)
 
+    def bound_speed_rows(step):
+        laws.bound_speed_rows(solver)
+
     def allocate_free_body_limits(step):
         laws.allocate_free_body_limits(solver)
 
@@ -650,6 +660,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
 
     # The dense rows' family bounds exist where the row pass holds the dense rows' order (no keyed rows).
     bounds = not keyed
+    run = placement.free_contact_rows
 
     # The rows a world's topology fixes (links, mimics, limits) are known once their families are written, before the
     # contacts: where the family bound holds them and the one writer walks the general placement's rows, it walks them
@@ -673,13 +684,16 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         *((bound_velocity_limits,) if bounds else ()),
         *((write_topology_rows,) if topology is not None else ()),
         write_contacts,
-        *((bound_free_body_contacts,) if forest.has_free_rigid_bodies else ()),
+        # The free bodies' run (their contacts and speed rows) where a colored world holds one, else the line's speed
+        # rows, its last: the tiers and the sweeps read where they start.
+        *((bound_free_body_contacts,) if run else ()),
+        *((bound_speed_rows,) if placement.speed_rows or spec.classes.tiers is not None else ()),
         *(
             (allocate_free_body_limits,)
             if forest.has_free_rigid_bodies and placement.rigid_velocity_limit_slot is not None
             else ()
         ),
-        *((write_free_bodies,) if forest.has_free_rigid_bodies else ()),
+        *((write_free_bodies,) if run else ()),
         finalize_dense,
         *((finish_keyed,) if keyed else ()),
     )
@@ -765,7 +779,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     add(
         *((seed_blocks,) if spec.laws.preelimination else ()),
         start_velocity,
-        *((pack_free_body_meta,) if forest.has_free_rigid_bodies else ()),
+        *((pack_free_body_meta,) if placement.free_contact_rows else ()),
         *((build_colored_units,) if colored is not None else ()),
         nvtx="S5_GatherJY",
     )

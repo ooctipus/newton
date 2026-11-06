@@ -1736,11 +1736,11 @@ def cuda_groups() -> list:
                 MF_PARALLEL.but("mf_parallel_preelimination"),
             ),
         ),
-        # A mimic row is an articulation row: the paired worlds still split into components (case K5).
+        # A mimic row is an articulation row: the paired factor sweep owns the worlds (case K5).
         Group(
             _physics(scenes.hand(mimic=True), "patch", 16, "mimic"),
             ref,
-            (PAIRED.but("paired_mimic", expect={"paired_response.components": True}),),
+            (PAIRED.but("paired_mimic"),),
         ),
         # The paired factor sweep steps velocity-limit rows in place, in slot order, and the general sweep its coupled
         # worlds' by their last word: a lift whose drive passes its velocity limit (case K5).

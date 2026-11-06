@@ -96,8 +96,8 @@ def _solve(fixture, schedule, device, iterations):
         "world_row_type": array(fixture["types"]),
         "world_row_parent": array(fixture["parents"]),
         "world_row_mu": array(fixture["mu"]),
-        "world_mf_constraint_count": array(np.zeros(WORLDS, np.int32)),
-        "primary_offset_by_world": array(np.zeros(WORLDS, np.int32)),
+        # No speed row: every world's rows are its schedule's.
+        "speed_first": array(np.full(WORLDS, CAPACITY, np.int32)),
         "secondary_offset_by_world": array(np.full(WORLDS, PRIMARY, np.int32)),
         "iterations": iterations,
         "omega": 1.0,

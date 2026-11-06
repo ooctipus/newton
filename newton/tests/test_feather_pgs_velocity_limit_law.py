@@ -178,7 +178,7 @@ def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MAS
         "mf_first": row_lines(device),
         # Every row is in the velocity-limit segment.
         "dense_phase_bounds": array([[0, count]], wp.int32),
-        "component_selector": zero_int,
+        "speed_first": array([count], wp.int32),
         "world_dof_indices": array([[0, 1]], wp.int32),
         "rhs_bias": array(bias),
         "row_incident": array(incident),

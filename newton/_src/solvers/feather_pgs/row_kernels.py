@@ -17,7 +17,7 @@ from .device_preludes import reserve
 from .field_group import Field, FieldGroup
 from .joint_table import FreeBodies, JointTable
 from .row_laws import LINK_ROWS, contact_restitution_rhs, joint_limit_side, limit_rhs, row_rhs, velocity_limit_active
-from .row_records import UNIT_LINK, DenseRows, RowSupport, row_sides, unit_source
+from .row_records import UNIT_LINK, UNIT_SPEED, DenseRows, RowSupport, row_sides, unit_source
 
 LINK_PLAN = FieldGroup(
     Field("_link_primary", wp.int32, ("link",), owner="laws"),
@@ -252,21 +252,29 @@ def allocate_rigid_velocity_limit_slots(
     articulation_root_dof_start: wp.array[int],
     joint_qd: wp.array[float],
     velocity_limit_activation_fraction: float,
-    mf_max_constraints: int,
+    capacity: int,
     resolved_worlds: wp.array[int],
+    base: int,
     # outputs
     rigid_velocity_limit_slot: wp.array[int],
-    mf_slot_counter: wp.array[int],
-    mf_first_rejected_slot: wp.array[int],
+    slot_counter: wp.array[int],
+    first_rejected_slot: wp.array[int],
+    rows: DenseRows,
+    units: wp.array2d[int],
 ):
-    """Allocate one MF speed row per finitely limited speed of a free rigid body.
+    """Allocate one speed row per finitely limited speed of a free rigid body, and write its record and unit source.
 
     Free-rigid generalized velocity is stored as six root DOFs, the center of
     mass velocity and the angular velocity: ``[v, omega]``. PhysX's
     ``maxLinearVelocity`` and ``maxAngularVelocity`` bound their magnitudes,
     ``|v| <= limit`` and ``|omega| <= limit``, so each finite limit owns one
-    speed row (:func:`.walk_rows.free_body_speed_rows`) that the sweeps
-    project onto that ball, along the current velocity.
+    speed row that the sweeps project onto that ball, along the current velocity.
+
+    The rows follow the free bodies' contacts (:attr:`.step_plan.Capacities.free_contact_rows`): rows of the line,
+    reserved on its counter after every contact (its last rows, from ``speed_first``), or the free bodies' run's from
+    ``base``. A row's record is the speed law's: its side the body's tree, its target ``-limit`` (its rhs the limit, as
+    a joint velocity limit's) and no gap; its unit source (:data:`.row_records.UNIT_SPEED`) seeds the axis it bounds at
+    the body's root, which the writer walks (:func:`.walk_rows.speed_axis`).
 
     ``velocity_limit_activation_fraction`` proximity-gates the allocation,
     as the joint velocity limits (:func:`.prefix_rows.velocity_limits`): a positive fraction
@@ -276,10 +284,10 @@ def allocate_rigid_velocity_limit_slots(
     """
     candidate = wp.tid()
     body = bodies.free_rigid_body_indices[candidate]
-    base = RIGID_SPEED_ROWS * candidate
+    first = RIGID_SPEED_ROWS * candidate
 
     for row in range(RIGID_SPEED_ROWS):
-        rigid_velocity_limit_slot[base + row] = -1
+        rigid_velocity_limit_slot[first + row] = -1
 
     art = bodies.body_to_articulation[body]
     if art < 0:
@@ -295,6 +303,7 @@ def allocate_rigid_velocity_limit_slots(
     if world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
         return
 
+    line = rows.first[world]
     for speed_axis in range(RIGID_SPEED_ROWS):
         limit = bodies.max_linear_velocity[body]
         if speed_axis == 1:
@@ -308,6 +317,20 @@ def allocate_rigid_velocity_limit_slots(
         if not velocity_limit_active(limit, speed, velocity_limit_activation_fraction):
             continue
 
-        rigid_velocity_limit_slot[base + speed_axis] = reserve(
-            mf_slot_counter, world, 1, mf_max_constraints, mf_first_rejected_slot
-        )
+        slot = reserve(slot_counter, world, 1, capacity, first_rejected_slot)
+        rigid_velocity_limit_slot[first + speed_axis] = slot
+        if slot < 0:
+            continue
+        row = base + slot
+        # The one writer's unit source, where it writes the row (the line's); the run's rows are their writer's.
+        if row < units.shape[1]:
+            units[line, row] = unit_source(UNIT_SPEED, 2 * root_dof)
+        rows.sides[line, row] = wp.vec2i(art, -1)
+        rows.row_type[line, row] = PGS_CONSTRAINT_TYPE_SPEED
+        rows.row_parent[line, row] = -1
+        rows.row_mu[line, row] = 0.0
+        # The speed law's bias is its limit: the row's target is ``-limit``, as a joint velocity limit's, and its rhs
+        # ``-target`` (:func:`.row_laws.row_rhs`); it has no gap.
+        rows.row_beta[line, row] = 0.0
+        rows.phi[line, row] = 0.0
+        rows.target[line, row] = -limit

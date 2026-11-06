@@ -210,11 +210,14 @@ class TestLevelsAreTheRowOrder(unittest.TestCase):
 
 class TestWorldLists(unittest.TestCase):
     def test_each_tier_buckets_exactly_its_worlds(self):
-        """A world of dense rows only and at most the bound lands in the bucket of its 32-row tier, once; others in none."""
+        """A world of dense rows only (no speed row) and at most the bound lands in the bucket of its 32-row tier, once;
+        others in none."""
         rng = np.random.default_rng(7)
         worlds, bound, width = 500, 100, 32
         rows = rng.integers(0, 140, worlds).astype(np.int32)
         free = (rng.random(worlds) < 0.2).astype(np.int32) * rng.integers(1, 9, worlds).astype(np.int32)
+        # Where the line's speed rows start: a world with any (rows past it) is the general sweep's too.
+        speed_first = rows - (rng.random(worlds) < 0.2).astype(np.int32) * rng.integers(0, 3, worlds).astype(np.int32)
         tiers = -(-bound // width)
         for device in _devices():
             with self.subTest(device=device):
@@ -225,6 +228,7 @@ class TestWorldLists(unittest.TestCase):
                     inputs=[
                         wp.array(rows, dtype=int, device=device),
                         wp.array(free, dtype=int, device=device),
+                        wp.array(speed_first, dtype=int, device=device),
                         bound,
                         width,
                         lists.region,
@@ -235,7 +239,7 @@ class TestWorldLists(unittest.TestCase):
                 for tier in range(tiers):
                     count, items = (array.numpy() for array in lists.bucket(tier))
                     lo, hi = tier * width, min((tier + 1) * width, bound)
-                    want = np.flatnonzero((rows > lo) & (rows <= hi) & (free == 0))
+                    want = np.flatnonzero((rows > lo) & (rows <= hi) & (free == 0) & (rows <= speed_first))
                     self.assertEqual(int(count[0]), want.size)
                     np.testing.assert_array_equal(np.sort(items[: count[0]]), want)
 
@@ -253,6 +257,7 @@ class TestWorldLists(unittest.TestCase):
                     inputs=[
                         wp.array(rows, dtype=int, device=device),
                         wp.zeros(worlds, dtype=int, device=device),
+                        wp.array(rows, dtype=int, device=device),
                         3 * width,
                         width,
                         lists.region,

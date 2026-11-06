@@ -1,9 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The free-body and factor-row builds of the response operators on their own: the free-body row word the sweeps
-decode, the paired components' qualification of a world, and (with ``ptxas`` on ``PATH``) the native builds'
-offline CUDA assembly without spills.
+"""The free-body row build of the response operators on its own: the free-body row word the sweeps decode, and (with
+``ptxas`` on ``PATH``) the native build's offline CUDA assembly without spills.
 """
 
 import re
@@ -16,11 +15,10 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import field_group, paired_components, response_builds_rows
+from newton._src.solvers.feather_pgs import response_builds_rows
 from newton._src.solvers.feather_pgs.factor.walk import WALK_COORDINATE
-from newton._src.solvers.feather_pgs.paired_components import PairedComponentData
 from newton._src.solvers.feather_pgs.row_metadata import pack_mf_header, unpack_mf_header
-from newton.tests.feather_pgs_law_harness import row_lines, unpacked_rows, walk_inverse
+from newton.tests.feather_pgs_law_harness import unpacked_rows, walk_inverse
 
 DEVICE = "cpu"
 
@@ -93,68 +91,6 @@ def _walk_records(rng, trees, size):
     return (rng.normal(size=(trees * size, WALK_COORDINATE)) * 0.3).astype(np.float32)
 
 
-def _components_data(P, rng, *, qualified=True):
-    """Paired component inputs of two worlds: the first qualifies (valid rows on their own components), the second
-    has a dense row on the free body's coordinates."""
-    M, F, W = 6, 3, P + 6
-    # The line's packed rows: the dense rows at their world coordinates, then the free bodies' (sides layout).
-    Y = np.zeros((2, M + F, W), np.float32)
-    Y[:, :M, :P] = rng.normal(size=(2, M, P))
-    Y[:, M:, : min(12, W)] = rng.normal(size=(2, F, min(12, W)))
-    Y[1, 1, P + 2] = 1.0  # couples the components: the world falls back
-    row_type = np.array([[0, 2, 2, 3, 0, 3]] * 2, np.int32)
-    row_parent = np.array([[-1, 0, 0, -1, -1, -1]] * 2, np.int32)
-    meta = np.zeros((2, F * 4), np.int32)
-    for row, (kind, parent) in enumerate(((0, 0xFFFF), (2, 0), (2, 0))):
-        meta[:, row * 4] = (P << 16) | 0xFFFF
-        meta[:, row * 4 + 1] = np.float32(0.5).view(np.int32)
-        meta[:, row * 4 + 2] = np.float32(0.1).view(np.int32)
-        meta[:, row * 4 + 3] = np.array(kind | (parent << 16), np.uint32).view(np.int32)
-    walk = _walk_records(rng, 2, P)
-    if not qualified:
-        walk[0, 0] = np.inf
-    return field_group.upload(
-        PairedComponentData,
-        DEVICE,
-        world_count=2,
-        counts=np.array([M, M], np.int32),
-        mf_counts=np.array([3, 3], np.int32),
-        primary_offset=np.zeros(2, np.int32),
-        secondary_offset=np.full(2, P, np.int32),
-        primary_group=np.array([0, 1], np.int32),
-        selector=np.full(2, 7, np.int32),
-        Y=Y,
-        primary_art=np.array([0, 1], np.int32),
-        dof_start=np.array([0, P], np.int32),
-        walk=walk,
-        rhs=rng.normal(size=(2, M)).astype(np.float32),
-        diag=rng.uniform(0.1, 1.0, (2, M)).astype(np.float32),
-        mu=np.full((2, M), 0.5, np.float32),
-        row_type=row_type,
-        row_parent=row_parent,
-        mf_meta=meta,
-        mf_mu=np.full((2, F), 0.5, np.float32),
-        body_base=M,
-        first=row_lines(DEVICE),
-        mf_first=row_lines(DEVICE),
-    )
-
-
-class TestFactorRowsBuild(unittest.TestCase):
-    """Paired factor rows: the held form of qualified worlds."""
-
-    def test_components(self):
-        """A world whose rows stay on their own components qualifies (selector -1); a coupled one falls back (3)."""
-        for P in (5, 22):
-            for qualified in (True, False):
-                with self.subTest(primary=P, qualified=qualified):
-                    data = _components_data(P, np.random.default_rng(37), qualified=qualified)
-                    wp.launch(
-                        paired_components.paired_components_kernel(P), dim=(2, 128), inputs=[2, data], device=DEVICE
-                    )
-                    self.assertEqual(list(data.selector.numpy()), [-1 if qualified else 3, 3])
-
-
 def _assemble(kernel, arch: int = 120) -> dict:
     """Assemble a kernel's module offline (Warp's PTX, then ``ptxas``) and return its entry's resources."""
     with tempfile.TemporaryDirectory() as directory:
@@ -184,7 +120,6 @@ class TestNativeBuildsAssemble(unittest.TestCase):
     def test_native_builds_assemble_without_spills(self):
         builds = {
             "free-body words": lambda: response_builds_rows.free_body_meta_kernel(64, 8 + 64, 8, 32, "sm_120"),
-            "paired components": lambda: paired_components.paired_components_kernel(22),
         }
         for name, build in builds.items():
             with self.subTest(build=name):

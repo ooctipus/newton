@@ -42,7 +42,7 @@ from typing import ClassVar, Protocol
 import warp as wp
 
 from ...core.memory import Buffer
-from .response_operator import Lanes, ResponseOperator, Velocity
+from .response_operator import Lanes, LaneVelocity, ResponseOperator, Velocity
 from .row_inputs import RowArgument
 from .row_kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -1957,28 +1957,61 @@ def velocity_limit_pass(rows: WorldRows, op, laws: RowLaws, *, end: str = "m_den
     return indent("\n".join(lines), pad)
 
 
-def speed_rows_pass(rows: WorldRows, op, laws: RowLaws, *, walk, pad: str = "            ") -> str:
-    """Free-body speed rows (``[mf_contact_end, m_mf)``) after every other row: each bounds the magnitude of its
-    body's linear (axis ``e_0``) or angular (axis ``e_3``) velocity, along that velocity (:func:`speed_row`), which
-    the body's ``walk`` reads and pushes; ``op`` holds the rows' entries and the velocity."""
+def speed_rows_pass(
+    rows: RowStore,
+    op,
+    laws: RowLaws,
+    *,
+    walk,
+    start: str = "mf_contact_end",
+    end: str = "m_mf",
+    body: tuple[str, str, str] | None = None,
+    pad: str = "            ",
+) -> str:
+    """Free-body speed rows (``[start, end)``, a class's last rows) after every other row: each bounds the magnitude
+    of its body's linear (axis ``e_0``) or angular (axis ``e_3``) velocity, along that velocity (:func:`speed_row`),
+    which the body's ``walk`` reads and pushes; ``op`` holds the rows' entries and the velocity.
+
+    The free bodies' run's rows (``rows`` the header's) carry their body's first coordinate, inverse diagonal and
+    right-hand side in their header; the line's (a dense store) name their body by ``body``: the statements that
+    declare row ``i``'s, the expression of its first world coordinate, and that of the entry its unwhitened axis marks
+    at the body's coordinate 3 (:func:`.walk_rows.speed_axis`)."""
     lanes = rows.lanes
-    lines = [
-        "for (int i = mf_contact_end; i < m_mf; i++) {",
-        "    int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i * 4]);",
-        unpack_mf_header("meta", "    "),
-        f"    if (mf_rt != {SPEED}) continue;",
-        "    if (mf_diag <= 0.0f || dof_a < 0) continue;",
-        "",
-        f"    const int speed_axis = {op.element('i', '3')} != 0.0f ? 3 : 0;",
+    if getattr(rows, "header", False):
+        lines = [
+            f"for (int i = {start}; i < {end}; i++) {{",
+            "    int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i * 4]);",
+            unpack_mf_header("meta", "    "),
+            f"    if (mf_rt != {SPEED}) continue;",
+            "    if (mf_diag <= 0.0f || dof_a < 0) continue;",
+            "",
+            f"    const int speed_axis = {op.element('i', '3')} != 0.0f ? 3 : 0;",
+        ]
+        rhs, inverse, first = "__int_as_float(meta.z)", "mf_diag", "dof_a"
+        store = lanes.first(rows.store("i", "speed_row[0]")) if not rows.stream else rows.store("i", "speed_row[0]")
+    else:
+        declare, first, axis = body
+        lines = [
+            f"for (int i = {start}; i < {end}; i++) {{",
+            f"    const float speed_diag = {rows.diag('i')};",
+            "    if (speed_diag <= 0.0f) continue;",
+            "    const float speed_inverse = 1.0f / speed_diag;",
+            *(f"    {line}" for line in declare),
+            f"    const int speed_axis = {axis} != 0.0f ? 3 : 0;",
+        ]
+        rhs, inverse = rows.rhs_of("i"), "speed_inverse"
+        store = rows.store("i", "speed_row[0]")
+    lines += [
         speed_row(
             walk,
             laws,
             velocity=op.velocity,
             load=rows.load("i"),
-            store=lanes.first(rows.store("i", "speed_row[0]")) if not rows.stream else rows.store("i", "speed_row[0]"),
+            store=store,
             lanes=lanes,
-            rhs="__int_as_float(meta.z)",
-            inverse="mf_diag",
+            rhs=rhs,
+            inverse=inverse,
+            body=first,
             pad="    ",
         ),
         "}",
@@ -2008,9 +2041,19 @@ def speed_row(
     the squares added in coordinate order; the lanes then synchronize. The row's law (:func:`.projection_laws.speed_row`)
     gives its stored value (``store`` stores ``speed_row[0]``, the total of the row's impulse ``load``) and the scale
     that pushes the velocity back along itself, ``u += L^T dv`` by the walk in (``walk.walk_enter(first, velocity,
-    out)``), one thread or the first lane. ``inverse`` is the row's stored inverse diagonal.
+    out)``), one thread or the first lane. Where each lane holds its own coordinate in a register
+    (:class:`.response_operator.LaneVelocity`), the body's six lanes stage theirs in the world's ``s_speed`` first and
+    take them back after. ``inverse`` is the row's inverse diagonal.
     """
-    v = velocity.at(f"{body} + k")
+    registers = isinstance(velocity, LaneVelocity)
+    stage = take = ""
+    if registers:
+        held = f"{lanes.lane} >= {body} && {lanes.lane} < {body} + 6"
+        stage = f"{pad}if ({held}) s_speed[{lanes.lane} - ({body})] = {velocity.array};\n{pad}{lanes.sync()}"
+        take = f"{pad}if ({held}) {velocity.array} = s_speed[{lanes.lane} - ({body})];"
+        v = "s_speed[k]"
+    else:
+        v = velocity.at(f"{body} + k")
     speed = [
         "float speed_v[6];",
         f"for (int k = 0; k < 6; ++k) speed_v[k] = {v};",
@@ -2033,6 +2076,7 @@ def speed_row(
     if lanes.parallel:
         push = f"if ({lanes.lane} == 0) {{\n{push}\n}}"
     lines = [
+        *((stage,) if stage else ()),
         "\n".join(pad + line for line in "\n".join(speed).split("\n")),
         f"{pad}const float old_mf_vlim = {load};",
         f"{pad}const float bound_speed = {bound(rhs, 'speed_mf_vlim', 'old_mf_vlim', step=inverse)};",
@@ -2054,6 +2098,8 @@ def speed_row(
     ]
     if lanes.sync():
         lines.append(f"{pad}{lanes.sync()}")
+    if take:
+        lines.append(take)
     return "\n".join(lines)
 
 

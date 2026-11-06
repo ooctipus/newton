@@ -942,12 +942,18 @@ def check_rows(solver, joint_q: np.ndarray, capture: Capture, rng) -> RowCheck:
     # The leave: the step's du is sum Z lambda over its final rows; each articulation leaves it once.
     D = int(forest.max_world_dofs)
     du = np.zeros((int(forest.world_count), max(D, 1)))
+    ball = np.zeros(du.shape[0], dtype=bool)
     # Every stored row's footprints, the one writer's (FL3.3, whose rows form no J).
     if getattr(solver.placement, "walks", False):
+        kinds_line = solver.placement.row_type.numpy()
         for world, count in enumerate(capture.counts):
             line = int(capture.dense_first[world])
             for row in range(int(count)):
                 lam = capture.impulses[line, row]
+                if kinds_line[line, row] == PGS_CONSTRAINT_TYPE_SPEED:
+                    # A speed row of the line: its speed ball's law, not a row (as the free bodies' run's below).
+                    ball[world] |= lam != 0.0
+                    continue
                 if dense:
                     du[world, :D] += capture.Z_final[line, row, :D] * lam
                     continue
@@ -958,7 +964,6 @@ def check_rows(solver, joint_q: np.ndarray, capture: Capture, rng) -> RowCheck:
                     n, offset = int(sizes[art]), int(offsets[art])
                     du[world, offset : offset + n] += capture.Z_final[line, row, first : first + n] * lam
                     first += n
-    ball = np.zeros(du.shape[0], dtype=bool)
     if capture.mf_final is not None:
         Z_a, Z_b, lam, counts, _, _, dof_a, dof_b, kinds = capture.mf_final
         for world, count in enumerate(counts):

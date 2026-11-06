@@ -87,6 +87,7 @@ class AuditRows:
     impulses: wp.array2d[float]
     counts: wp.array[int]
     mf_counts: wp.array[int]
+    speed_first: wp.array[int]
     skip_rows_le: int
     keyed: int
     weighted: int
@@ -105,8 +106,9 @@ def contact_compliance(weight: float, eps: float, diagonal: float) -> float:
 
 @wp.func
 def tier_world(a: AuditRows, world: int) -> bool:
-    """Whether the parallel tiers form ``world``'s rows in their kernel."""
-    return a.skip_rows_le > 0 and a.counts[world] <= a.skip_rows_le and a.mf_counts[world] == 0
+    """Whether the parallel tiers form ``world``'s rows in their kernel (:func:`.sweep_levels.list_worlds`)."""
+    count = a.counts[world]
+    return a.skip_rows_le > 0 and count <= a.skip_rows_le and a.mf_counts[world] == 0 and count <= a.speed_first[world]
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -178,7 +180,8 @@ def rows_kernel(cls: RowClass) -> wp.Kernel:
 def packed_class(support: int, wide: bool) -> RowClass:
     """The packed rows (:func:`.sweep_routes.packed_operator`): ``Z_i^T u+``, ``u`` the walk's coordinates of ``v+``;
     a world whose rows the tiers form reads ``J_i v+`` (``Z`` there holds ``J``), every other
-    ``(J_i v_hat + Z_i^T u+) - Z_i^T u_hat``."""
+    ``(J_i v_hat + Z_i^T u+) - Z_i^T u_hat``. A free body's speed row, a row of the line, reads its law's own term,
+    as the free bodies' run's (:func:`free_class`)."""
     operator = packed_operator(support, ONE, wide=wide)
     at_u = dataclasses.replace(operator, velocity=Velocity("u"))
     at_hat = dataclasses.replace(operator, velocity=Velocity("u_hat"))
@@ -195,22 +198,36 @@ def packed_class(support: int, wide: bool) -> RowClass:
             ("hat", wp.array2d[float]),
             ("incident", wp.array2d[float]),
             ("mf_counts", wp.array[int]),
+            ("speed_first", wp.array[int]),
             ("tier_rows", int),
+            ("row_type", wp.array2d[int]),
+            ("dof_start", wp.array[int]),
+            ("v", wp.array[float]),
         ),
         """    const int off_dense = line * row_sides.shape[1];
     const int packed_base = line * packed_Z.shape[1] * packed_Z.shape[2];
     const int dof_map_base = world * world_dof_indices.shape[1];
     const float* u = coordinates.data + (size_t)world * coordinates.shape[1];
     const float* u_hat = hat.data + (size_t)world * hat.shape[1];
-    const bool tier = tier_rows > 0 && counts.data[world] <= tier_rows && mf_counts.data[world] == 0;""",
-        _sum(at_u, "zu", "0.0f")
+    const bool tier = tier_rows > 0 && counts.data[world] <= tier_rows && mf_counts.data[world] == 0
+        && counts.data[world] <= speed_first.data[world];""",
+        f"""        float term = 0.0f;
+        if (row_type.data[off_dense + i] == {int(ROW_SPEED)}) {{
+            const wp::vec2i sides = row_sides.data[off_dense + i];
+            const float axis = packed_Z.data[packed_base + i * packed_Z.shape[2] + PACKED_FIRST(sides, sides[0]) + 3];
+            const int start = dof_start.data[sides[0]] + (axis != 0.0f ? 3 : 0);
+            term = -wp::length(wp::vec3(v.data[start], v.data[start + 1], v.data[start + 2]));
+        }} else {{
+"""
+        + _sum(at_u, "zu", "0.0f")
         + """
-        float term = zu;
+        term = zu;
         if (!tier) {
 """
         + _sum(at_hat, "zhat", "0.0f")
         + """
             term = incident.data[(size_t)line * incident.shape[1] + i] + zu - zhat;
+        }
         }""",
         (PACKED_SIDES,),
     )
@@ -462,6 +479,7 @@ class Audit:
         a.impulses = solver.placement.impulses
         a.counts = solver.placement.constraint_count
         a.mf_counts = solver.placement.mf_constraint_count
+        a.speed_first = solver.placement.speed_first
         a.skip_rows_le = int(solver.placement.ink_skip_rows())
         a.keyed = int(solver.placement.keyed_rows is not None)
         a.weighted = int(solver.laws.set.weighted)
@@ -543,7 +561,11 @@ class Audit:
             self.coordinates_hat,
             placement.row_incident,
             placement.mf_constraint_count,
+            placement.speed_first,
             int(placement.ink_skip_rows()),
+            placement.row_type,
+            forest.articulation_dof_start,
+            v,
         ]
 
     def launch(self) -> None:

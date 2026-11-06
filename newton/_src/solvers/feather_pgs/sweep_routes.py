@@ -56,6 +56,7 @@ from .sweep import (
 
 # The row loops leave the velocity-limit and speed rows to the passes at the end of every sweep (the last word).
 _DENSE_ADMISSION = f"if (row_type == {VELOCITY_LIMIT}) continue;"
+_LINE_ADMISSION = f"if (row_type == {VELOCITY_LIMIT} || row_type == {SPEED}) continue;"
 _MF_ADMISSION = f"if (mf_rt == {SPEED}) continue;"
 
 
@@ -72,7 +73,7 @@ MF_GS_ABI = kernel_template.params(
     ("world_constraint_count", wp.array[int]),
     ("dense_first", wp.array[int]),
     ("dense_phase_bounds", wp.array2d[int]),
-    ("component_selector", wp.array[int]),
+    ("speed_first", wp.array[int]),
     ("world_dof_indices", wp.array2d[int]),
     ("rhs_bias", wp.array2d[float]),
     ("row_incident", wp.array2d[float]),
@@ -95,9 +96,9 @@ MF_GS_ABI = kernel_template.params(
     ("omega", float),
     ("v_out", wp.array[float]),
 )
-"""The matrix-free sweep's native ABI: one world per call (the world queue's dispatch). The free bodies' rows are the
-row store's (the ``world_*`` records) and the packed rows' (``packed_Z``), from the dense capacity of the world's line;
-their headers the free bodies' placement (``mf_*``)."""
+"""The matrix-free sweep's native ABI: one world per call (the world queue's dispatch). The free bodies' run's rows are
+the row store's (the ``world_*`` records) and the packed rows' (``packed_Z``), from the dense capacity of the world's
+line; their headers the free bodies' placement (``mf_*``). ``speed_first``: where the line's speed rows start."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -196,6 +197,11 @@ class FreeBodyCoordinates:
 
 FREE_BODY_COORDINATES = FreeBodyCoordinates()
 """The free bodies' way into and out of walk coordinates in a matrix-free sweep (:class:`FreeBodyCoordinates`)."""
+
+FREE_BODY_WALKS = walk_down_prelude((FREE_BODY_WALK,), ahead=0, enter=True)
+"""The leave and the enter of :data:`FREE_BODY_COORDINATES`, compiled into a sweep that visits speed rows: a one-body
+walk is no chain whose loads a lane could hold ahead, and the default prefetch held the paired factor sweep at 116
+registers a lane against 80 without it (sm_120, ptxas)."""
 
 
 def packed_operator(support: int, lanes: Lanes, *, wide: bool = False) -> SparseFactor:
@@ -641,12 +647,13 @@ def mf_gs_staging(
     places: RowPlaces = STAGED_ROWS,
     traces: bool = False,
     wide_rows: bool = False,
+    free_rows: bool = True,
 ) -> Staging:
     """The shared working set of a world's matrix-free sweep block (:func:`mf_gs_source` declares it): the world's
-    velocity, its dense rows' impulses and staged metadata, the free-body impulses unless they stream, and the colored
-    mapping's color offsets (and its trace's warp maxima)."""
+    velocity, its dense rows' impulses and staged metadata, the free bodies' run's impulses (``free_rows``) unless they
+    stream, and the colored mapping's color offsets (and its trace's warp maxima)."""
     dense = WorldRows(max_constraints, staging=places.staging)
-    free = WorldRows(mf_max_constraints, staging="header", stream=places.impulses is Place.GLOBAL)
+    free = WorldRows(mf_max_constraints, staging="header", stream=places.impulses is Place.GLOBAL or not free_rows)
     colored = ()
     if mapping == "colored":
         warps = COLORED_THREADS // 32
@@ -676,9 +683,7 @@ def mf_gs_source(
     places: RowPlaces = STAGED_ROWS,
     has_dense_velocity_limit_rows: bool = True,
     contact_torsion: bool = False,
-    factor_coordinates: bool = False,
     skip_tier_rows: int = 0,
-    independent_components: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     lanes: int = 32,
     weighted: bool = False,
@@ -686,6 +691,8 @@ def mf_gs_source(
     seeded: bool = False,
     wide_rows: bool = False,
     pitch: int | None = None,
+    free_rows: bool = True,
+    speed_rows: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the matrix-free Gauss-Seidel sweep: a world's dense rows (:func:`packed_operator`, packed
     whitened rows of ``max_row_dofs`` entries, by default as many as the world's coordinates) and its free-body rows
@@ -705,6 +712,11 @@ def mf_gs_source(
     With ``weighted`` contact rows step by their regularization weights, ``material`` contacts' from their compliance
     (:class:`.sweep.RowLaws`, a constant of the step's laws).
 
+    A free body's rows are the free bodies' run's where its world can take the colored mapping (``free_rows``: the
+    free phase and its speed rows), else rows of the line (:attr:`.step_plan.Capacities.free_contact_rows`): its
+    contacts the dense rows', its speed rows (``speed_rows``) the line's last, from ``speed_first``, which the dense
+    rows' last word visits after the velocity limits (:func:`.sweep.speed_rows_pass`).
+
     ``lanes`` is the warp mapping's lane group (:func:`.execution.device_lanes`): a warp on CUDA, or one thread, which
     runs the world on either device (the CPU's mapping), so that body composes for both (:func:`.dual_native`).
 
@@ -713,8 +725,8 @@ def mf_gs_source(
     if mapping not in MAPPINGS:
         raise ValueError(f"mapping must be one of {MAPPINGS}, got {mapping!r}")
     colored = mapping == "colored"
-    if independent_components and not factor_coordinates:
-        raise ValueError("Independent components require the paired factor-coordinate solve")
+    if (colored or colored_worlds) and not free_rows:
+        raise ValueError("the colored mapping sweeps the free bodies' run: it needs free_rows")
     if lanes not in (1, 32) or (colored and lanes != 32):
         raise ValueError(f"the warp mapping runs 32 lanes or one thread, the colored mapping 32; got {lanes}")
     _validate_dense_metadata_encoding(max_constraints)
@@ -738,27 +750,15 @@ def mf_gs_source(
         places=places,
         traces=solve_policy.traces,
         wide_rows=wide_rows,
+        free_rows=free_rows,
     )
 
-    # Ownership: the paired owner's signed selector arrives in component_selector under independent components.
     dense_count = "int m_dense = world_constraint_count.data[world];"
-    component = owned = ""
-    if independent_components:
-        dense_count = (
-            "const bool split_component = component_selector.data[world] < 0;\n"
-            "    int m_dense = split_component ? 0 : world_constraint_count.data[world];"
-        )
-        component = (
-            "\n    const int first_dofs = split_component ? mf_meta.data[off_meta] : 0;"
-            "\n    const int component_offset = split_component ? "
-            "max(first_dofs >> 16, static_cast<int>(static_cast<short>(first_dofs & 65535))) : 0;"
-        )
-        owned = " && (!split_component || (d >= component_offset && d < component_offset + 6))"
     skips = []
-    if factor_coordinates:
-        skips.append("    if (m_mf == 0) return;")
     if skip_tier_rows > 0:
-        skips.append(f"    if (m_mf == 0 && m_dense <= {int(skip_tier_rows)}) return;")
+        # The tiers' worlds (sweep_levels.list_worlds): no free body's row, the line's speed rows included.
+        speed = " && m_dense <= speed_start" if speed_rows else ""
+        skips.append(f"    if (m_mf == 0 && m_dense <= {int(skip_tier_rows)}{speed}) return;")
     mapped = ""
     if colored or colored_worlds:
         # The worlds of the other mapping, as the unit builder assigned them at the pack.
@@ -770,8 +770,31 @@ def mf_gs_source(
     passes = []
     if has_dense_velocity_limit_rows:
         passes.append(velocity_limit_pass(dense, dense_op, laws, pad="        "))
-    # The free bodies' speed rows leave and enter by the walk, as their rows were written (walk_rows).
-    passes.append(speed_rows_pass(free, free_op, laws, walk=FREE_BODY_COORDINATES, pad="        "))
+    # The free bodies' speed rows leave and enter by the walk, as their rows were written (walk_rows): the run's, or
+    # the line's last rows, each naming its body by its side.
+    if free_rows:
+        passes.append(speed_rows_pass(free, free_op, laws, walk=FREE_BODY_COORDINATES, pad="        "))
+    if speed_rows:
+        body = (
+            (
+                "const wp::vec2i speed_sides = row_sides.data[off_dense + i];",
+                "const int speed_body = articulation_world_dof_offset.data[speed_sides[0]];",
+            ),
+            "speed_body",
+            dense_op.element("i", "PACKED_FIRST(speed_sides, speed_sides[0]) + 3"),
+        )
+        passes.append(
+            speed_rows_pass(
+                dense,
+                dense_op,
+                laws,
+                walk=FREE_BODY_COORDINATES,
+                start="speed_start",
+                end="m_dense",
+                body=body,
+                pad="        ",
+            )
+        )
 
     # Where spin rows may appear, every friction triple's metric is formed once per launch, at its first loaded visit
     # (sweep.friction_metric_stage), and its later visits only project: the dense rows' in either mapping, the free
@@ -792,7 +815,7 @@ def mf_gs_source(
             )
             + "\n"
         )
-        if not colored:
+        if free_rows and not colored:
             free_metric = "FREE_TRIPLE"
             friction_laws += friction_metric_law(free_metric, free_record, "    ") + "\n"
             stage = friction_metric_stage(
@@ -832,7 +855,9 @@ def mf_gs_source(
         head = "    const int lane = LANE;"
         first_warp = end_first_warp = ""
         barrier = "SYNC();"
-        free_phase = rows_block(free, free_op, laws, admission=_MF_ADMISSION, metric=free_metric, pad="    ")
+        free_phase = ""
+        if free_rows:
+            free_phase = rows_block(free, free_op, laws, admission=_MF_ADMISSION, metric=free_metric, pad="    ")
         offsets = trace_reduction = ""
 
     thread, threads = ("tid", "(int)blockDim.x") if colored else ("lane", "STRIDE")
@@ -847,18 +872,24 @@ def mf_gs_source(
                 dense_op.axpy((("row", "seed"),), "        ", row="i"),
                 row_lanes.sync(),
             ),
-            impulse_seed(
-                "m_mf",
-                free.load("i"),
-                "(mf_meta.data[off_meta + i * 4 + 3] & 0xFFFF)",
-                free_op.axpy((("row", "seed"),), "        ", row="i"),
-                row_lanes.sync(),
-                skip=SPEED,
-                declare=(
-                    "const int packed_dofs = mf_meta.data[off_meta + i * 4];",
-                    "const int dof_a = packed_dofs >> 16, dof_b = (packed_dofs << 16) >> 16;",
+        )
+        seeds += (
+            (
+                impulse_seed(
+                    "m_mf",
+                    free.load("i"),
+                    "(mf_meta.data[off_meta + i * 4 + 3] & 0xFFFF)",
+                    free_op.axpy((("row", "seed"),), "        ", row="i"),
+                    row_lanes.sync(),
+                    skip=SPEED,
+                    declare=(
+                        "const int packed_dofs = mf_meta.data[off_meta + i * 4];",
+                        "const int dof_a = packed_dofs >> 16, dof_b = (packed_dofs << 16) >> 16;",
+                    ),
                 ),
-            ),
+            )
+            if free_rows
+            else ()
         )
         seed = f"{first_warp}{chr(10).join(seeds)}\n{end_first_warp}    {barrier}\n"
     # Wide rows, which the bilateral block corrected, can be collinear (a jammed loop), and collinear rows can trade
@@ -881,7 +912,8 @@ def mf_gs_source(
         }}
         if ({"!__syncthreads_or(velocity_moved != 0)" if colored else "BALLOT(velocity_moved != 0) == 0u"}) iteration_changed = 0;
 """
-    dense_phase = rows_block(dense, dense_op, laws, admission=_DENSE_ADMISSION, metric=dense_metric, pad="        ")
+    admission = _LINE_ADMISSION if speed_rows else _DENSE_ADMISSION
+    dense_phase = rows_block(dense, dense_op, laws, admission=admission, metric=dense_metric, pad="        ")
     sweeps = level_loop(
         (
             f"{first_warp}{dense_phase}\n{end_first_warp}" + ("        __syncthreads();" if colored else ""),
@@ -892,10 +924,25 @@ def mf_gs_source(
     )
     # The way back after the sweeps: the change in the walk's coordinates to the step's one leave (WalkTrees.du,
     # factor.walk.walk_leave_kernel).
+    # The free bodies' run's rows (free_rows): their count, impulses' staging and publication.
+    mf_count, free_view, free_loads, free_stores = "int m_mf = 0;", "", "", ""
+    if free_rows:
+        mf_count = "int m_mf = mf_constraint_count.data[world];"
+        free_view = free.declaration()
+        free_loads = f"""
+    for (int i = lane; i < m_mf; i += STRIDE) {{
+        {mf_load}
+    }}"""
+        free_stores = f"""
+    for (int i = lane; i < m_mf; i += STRIDE) {{
+        {mf_store}
+    }}"""
+    if speed_rows:
+        dense_count += "\n    const int speed_start = speed_first.data[world];"
     body = f"""{head}
 
     {dense_count}
-    int m_mf = mf_constraint_count.data[world];
+    {mf_count}
     if (m_dense == 0 && m_mf == 0) return;
     if (m_dense > {M_D}) m_dense = {M_D};
     if (m_mf > {M_MF}) m_mf = {M_MF};
@@ -908,19 +955,16 @@ def mf_gs_source(
     __builtin_assume(line >= 0);
     int off_dense = line * {P};
     int off_mf = off_dense + {M_D};
-    int off_meta = line * {M_MF} * 4;{component}
+    int off_meta = line * {M_MF} * 4;
     const size_t packed_base = (size_t)line * {P * int(max_row_dofs)};
     const size_t free_base = packed_base + {M_D * int(max_row_dofs)};{offsets}
 
 {staging.declarations("    ")}
-{free.declaration()}{trace_reduction}
+{free_view}{trace_reduction}
 {friction_laws}
 {first_warp}    for (int i = lane; i < m_dense; i += STRIDE) {{
 {dense_loads}
-    }}
-    for (int i = lane; i < m_mf; i += STRIDE) {{
-        {mf_load}
-    }}
+    }}{free_loads}
     for (int d = lane; d < {D}; d += STRIDE) s_v[d] = 0.0f;
 {end_first_warp}    {barrier}
 {seed}{first_warp}{metric_stage}{end_first_warp}{metric_build}
@@ -930,14 +974,11 @@ def mf_gs_source(
     {barrier}
 {first_warp}    for (int d = lane; d < {D}; d += STRIDE) {{
         int global_dof = world_dof_indices.data[dof_map_base + d];
-        if (global_dof >= 0{owned}) walk.du.data[global_dof] += s_v[d];
+        if (global_dof >= 0) walk.du.data[global_dof] += s_v[d];
     }}
     for (int i = lane; i < m_dense; i += STRIDE) {{
         {dense.stores("i")}
-    }}
-    for (int i = lane; i < m_mf; i += STRIDE) {{
-        {mf_store}
-    }}
+    }}{free_stores}
 {end_first_warp}"""
     preludes = (
         lane_group(lanes),
@@ -946,7 +987,7 @@ def mf_gs_source(
         PACKED_SIDES,
         *law_preludes(PROJECTION_LAW, *((CONE_LAW,) if contact_torsion else ())),
         *solve_policy.preludes,
-        walk_down_prelude((FREE_BODY_WALK,), enter=True),
+        FREE_BODY_WALKS,
     )
     if lanes == 1:
         return dual_native(body, preludes=(*preludes, CPU_MATH)), staging
@@ -966,15 +1007,15 @@ def mf_gs_kernel(
     places: RowPlaces = STAGED_ROWS,
     has_dense_velocity_limit_rows: bool = True,
     contact_torsion: bool = False,
-    factor_coordinates: bool = False,
     skip_tier_rows: int = 0,
-    independent_components: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
     seeded: bool = False,
     wide_rows: bool = False,
     pitch: int | None = None,
+    free_rows: bool = True,
+    speed_rows: bool = False,
 ) -> wp.Kernel:
     """The matrix-free Gauss-Seidel sweep kernel of a thread mapping (:func:`mf_gs_source`): the warp's launches a
     warp per world item (one thread on the CPU, :func:`.execution.device_lanes`) and takes :data:`MF_GS_ABI`
@@ -991,9 +1032,7 @@ def mf_gs_kernel(
         places=places,
         has_dense_velocity_limit_rows=has_dense_velocity_limit_rows,
         contact_torsion=contact_torsion,
-        factor_coordinates=factor_coordinates,
         skip_tier_rows=skip_tier_rows,
-        independent_components=independent_components,
         solve_policy=solve_policy,
         lanes=32 if mapping == "colored" else device_lanes(device_arch),
         weighted=weighted,
@@ -1001,6 +1040,8 @@ def mf_gs_kernel(
         seeded=seeded,
         wide_rows=wide_rows,
         pitch=pitch,
+        free_rows=free_rows,
+        speed_rows=speed_rows,
     )
     colored = mapping == "colored"
     staging.check(f"the {mapping} matrix-free sweep", arch_budget(device_arch))
@@ -1010,15 +1051,15 @@ def mf_gs_kernel(
         f"_densevlim{int(has_dense_velocity_limit_rows)}"
         + places.suffix
         + ("_torsion" if contact_torsion else "")
-        + ("_factor" if factor_coordinates else "")
         + (f"_skiptier{int(skip_tier_rows)}" if skip_tier_rows > 0 else "")
-        + ("_components" if independent_components else "")
         + ("_cw" if colored_worlds and not colored else "")
         + ("_weighted" if weighted else "")
         + ("_material" if material else "")
         + ("_seeded" if seeded else "")
         + ("_wide" if wide_rows else "")
         + (f"_p{pitch}" if pitch is not None and pitch != max_constraints + mf_max_constraints else "")
+        + ("" if free_rows else "_line")
+        + ("_speed" if speed_rows else "")
         + "_walk"
         + solve_policy.suffix
     )

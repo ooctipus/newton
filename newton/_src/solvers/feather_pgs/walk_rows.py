@@ -64,7 +64,7 @@ from .joint_table import FreeBodies
 from .kernel_template import python_kernel
 from .projection_laws import friction_ball_metric, friction_pair_metric
 from .row_build import write_contact_row
-from .row_kernels import PGS_CONSTRAINT_TYPE_SPEED, RIGID_SPEED_ROWS, RowBias, row_bias
+from .row_kernels import RIGID_SPEED_ROWS, RowBias, row_bias
 from .row_laws import LINK_ROWS
 from .row_records import (
     UNIT_CONTACT,
@@ -72,6 +72,7 @@ from .row_records import (
     UNIT_LINK,
     UNIT_MIMIC,
     UNIT_SHIFT,
+    UNIT_SPEED,
     UNIT_VELOCITY,
     DenseRows,
     RowSupport,
@@ -437,10 +438,14 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tupl
                     row_bias(rows, bias, line, slot, sink.row_incident[line, slot])
             return
         for slot in range(first + lane, end, lanes):
-            unit = read_unit(rows, data, law, seeds, line, slot, support.units[line, slot])
+            source = support.units[line, slot]
+            unit = read_unit(rows, data, law, seeds, line, slot, source)
             if unit.rows > 0:
                 walk(sink, unit)
-                row_bias(rows, bias, line, slot, sink.row_incident[line, slot])
+                incident = sink.row_incident[line, slot]
+                if source >> UNIT_SHIFT == UNIT_SPEED:
+                    incident = speed_axis(sink, line, slot, unit.art_a, unit.dof0)
+                row_bias(rows, bias, line, slot, incident)
         if wp.static(has_blocks):
             # The closure reads every row of the world: the launch that writes the last of them closes.
             if part != WRITE_TOPOLOGY:
@@ -1652,58 +1657,49 @@ def free_body_contact_rows(sink: RowSink, rows: DenseRows, data: ContactInput, l
 
 
 @wp.func
+def speed_axis(sink: RowSink, line: int, slot: int, art: int, dof: int) -> float:
+    """A speed row's epilogue, after its seed's walk gave its diagonal ``|L^-1 P e_k|^2 + cfm``: its ``Z`` holds the
+    axis it bounds unwhitened (``e_k`` at the entry of its side's coordinate ``k``, every other entry zero), and its
+    incident velocity is zero (returned): the speed law reads the body's velocity through its factor, not a row, from
+    the row's three coordinates (:func:`.sweep.speed_row`), and its effective mass converts the speed correction into
+    the impulse the row stores. Every writer of a speed row's (:data:`.row_records.UNIT_SPEED`)."""
+    layout = sink.layout
+    k = dof - sink.walk.dof_start[art]
+    entry = k
+    if layout.dense != 0:
+        entry = layout.offset[art] + k
+    for e in range(sink.entries.shape[2]):
+        sink.entries[line, slot, e] = 0.0
+    sink.entries[line, slot, entry] = 1.0
+    sink.row_incident[line, slot] = 0.0
+    return 0.0
+
+
+@wp.func
 def free_body_speed_rows(
     bodies: FreeBodies, rows: DenseRows, sink: RowSink, speed_slot: wp.array[int], bias: RowBias, candidate: int
 ):
-    """Free rigid body ``candidate``'s speed rows, its linear and angular velocity limits, in the slots their
-    allocation reserved (:func:`.row_kernels.allocate_rigid_velocity_limit_slots`).
-
-    A speed row's seed is a covector at the body's root: the unit vector of the first DOF of the velocity it bounds
-    (``e_0`` for the linear velocity, ``e_3`` for the angular one), a velocity limit's unit source. Its diagonal is that
-    axis walked (:data:`read_row_unit`, :data:`walk_body_row`), ``|L^-1 P e_k|^2 + cfm``; its ``Z`` then holds the axis
-    unwhitened and its incident velocity is zero: the speed law reads the body's velocity through its factor, not a
-    row, from the row's three DOFs, and its effective mass converts the speed correction into the impulse the row
-    stores. ``mf_phi`` holds the limit; its rhs is the row law's (:func:`.row_kernels.row_bias`)."""
+    """Free rigid body ``candidate``'s speed rows in the free bodies' run, in the slots and with the records and unit
+    sources their allocation wrote (:func:`.row_kernels.allocate_rigid_velocity_limit_slots`): each the seed of the
+    axis it bounds at the body's root, walked (:data:`read_row_unit`, :data:`walk_body_row`), then its axis
+    (:func:`speed_axis`) and its rhs by the row law (:func:`.row_kernels.row_bias`), as the one writer's."""
     body = bodies.free_rigid_body_indices[candidate]
     art = bodies.body_to_articulation[body]
     if art < 0:
         return
-    if bodies.is_free_rigid[art] == 0:
-        return
-
     world = bodies.art_to_world[art]
     if world < 0:
         return
     line = rows.first[world]
-
-    base = RIGID_SPEED_ROWS * candidate
-    for speed_axis in range(RIGID_SPEED_ROWS):
-        slot = speed_slot[base + speed_axis]
+    for k in range(RIGID_SPEED_ROWS):
+        slot = speed_slot[RIGID_SPEED_ROWS * candidate + k]
         if slot < 0:
             continue
-        limit = bodies.max_linear_velocity[body]
-        if speed_axis == 1:
-            limit = bodies.max_angular_velocity[body]
-
         row = sink.base + slot
-        rows.sides[line, row] = wp.vec2i(art, -1)
-        rows.row_type[line, row] = PGS_CONSTRAINT_TYPE_SPEED
-        rows.row_parent[line, row] = -1
-        rows.row_mu[line, row] = 0.0
-        # The speed law's bias is its limit: the row's target is ``-limit``, as a joint velocity limit's, and its rhs
-        # ``-target`` (:func:`.row_laws.row_rhs`); it has no gap.
-        rows.row_beta[line, row] = 0.0
-        rows.phi[line, row] = 0.0
-        rows.target[line, row] = -limit
-
-        k = 3 * speed_axis
-        source = unit_source(UNIT_VELOCITY, 2 * (sink.walk.dof_start[art] + k))
-        walk_body_row(sink, read_row_unit(rows, ContactInput(), PatchRowLaw(), JointSeeds(), line, row, source))
-        for e in range(sink.entries.shape[2]):
-            sink.entries[line, row, e] = 0.0
-        sink.entries[line, row, k] = 1.0
-        sink.row_incident[line, row] = 0.0
-        row_bias(rows, bias, line, row, 0.0)
+        source = unit_source(UNIT_SPEED, 2 * (sink.walk.dof_start[art] + 3 * k))
+        unit = read_row_unit(rows, ContactInput(), PatchRowLaw(), JointSeeds(), line, row, source)
+        walk_body_row(sink, unit)
+        row_bias(rows, bias, line, row, speed_axis(sink, line, row, art, unit.dof0))
 
 
 @wp.kernel(enable_backward=False, launch_bounds=WRITERS["free_body"].bounds)

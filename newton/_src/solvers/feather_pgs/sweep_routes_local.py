@@ -17,7 +17,7 @@ from functools import cache
 
 import warp as wp
 
-from ...core.memory import Staging, arch_budget
+from ...core.memory import Buffer, Staging, arch_budget
 from . import kernel_template
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .factor.walk import WalkTrees
@@ -53,9 +53,11 @@ from .sweep import (
     row_step,
     row_sums,
     row_update,
+    speed_rows_pass,
     unit_held_loads,
     weight_arguments,
 )
+from .sweep_routes import FREE_BODY_COORDINATES, FREE_BODY_WALKS
 
 # ---------------------------------------------------------------------------------------------------------------------
 # The paired factor sweep: rows in factor coordinates, a warp per world, three schedules
@@ -75,14 +77,14 @@ PAIRED_FACTOR_ABI = kernel_template.params(
     ("world_row_type", wp.array2d[int]),
     ("world_row_parent", wp.array2d[int]),
     ("world_row_mu", wp.array2d[float]),
-    ("world_mf_constraint_count", wp.array[int]),
-    ("primary_offset_by_world", wp.array[int]),
+    ("speed_first", wp.array[int]),
     ("secondary_offset_by_world", wp.array[int]),
     ("iterations", int),
     ("omega", float),
     ("v_out", wp.array[float]),
 )
-"""The paired factor sweep's native ABI: one world per warp, two per block (a tail-guarded tiled dispatch)."""
+"""The paired factor sweep's native ABI: one world per warp, two per block (a tail-guarded tiled dispatch); the line's
+speed rows from ``speed_first``, its free body's first world coordinate ``secondary_offset_by_world``."""
 
 _PAIRED_WORLDS_PER_BLOCK = 2
 
@@ -133,7 +135,6 @@ def paired_factor_source(
     max_world_dofs: int,
     primary_dofs: int,
     secondary_dofs: int,
-    independent_components: bool = False,
     *,
     contact_units: bool = False,
     torsion: bool = False,
@@ -142,6 +143,7 @@ def paired_factor_source(
     material: bool = False,
     pitch: int | None = None,
     seeded: bool = False,
+    speed_rows: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the paired factor sweep: a world's rows in the factor coordinates of its articulation and
     free body, a warp per world, the velocity change from the predictor, ``u = L^T dv``, from zero in a register per
@@ -154,9 +156,11 @@ def paired_factor_source(
     for the launch (:func:`.sweep.friction_metric_law`).
 
     The schedule visits the rows in slot order: row by row; with ``contact_units``, each row, and a row with the tangent pair it owns (patch contacts own one when they hold an
-    anchor) as a contact unit (:func:`_contact_unit`: a loaded unit on its Gram block, one ladder and one apply). With
-    ``independent_components`` a world whose signed free-body row count is negative solves only its articulation's
-    coordinates (its free body's rows run in the matrix-free sweep).
+    anchor) as a contact unit (:func:`_contact_unit`: a loaded unit on its Gram block, one ladder and one apply). The
+    sweep owns every row of its worlds, its free body's among them: the free body's contacts are rows of the line, and
+    with ``speed_rows`` its speed rows are the line's last (from ``speed_first``), which each sweep's last word visits
+    on the body's six lanes (:func:`.sweep.speed_rows_pass`, the body's walk read through
+    :data:`.sweep_routes.FREE_BODY_COORDINATES`).
 
     The rows are the walk's (:mod:`.walk_rows`): the velocity change in the walk's coordinates goes to the step's one
     leave (:attr:`.factor.walk.WalkTrees.du`, :func:`.factor.walk.walk_leave_kernel`), which walks each component's
@@ -177,24 +181,28 @@ def paired_factor_source(
     # The world's rows staged whole; a step divides by the diagonal.
     rows = StagedRows(M, lanes, line="off", count="m", reciprocal=False)
     staging = Staging(
-        rows.buffers(),
+        # A speed row stages its body's six coordinates (sweep.speed_row).
+        (*rows.buffers(), *((Buffer("s_speed", "float", 6),) if speed_rows else ())),
         groups=_PAIRED_WORLDS_PER_BLOCK,
         threads=32 * _PAIRED_WORLDS_PER_BLOCK,
         name="PairedScratch",
     )
     # A friction triple reads its metric cached for the launch (sweep.friction_metric_law).
     cached = "ROW_TRIPLE" if torsion else None
-    ctx = RowContext.of(rows, op, end="m", metric=cached, inline_velocity_limit=True)
-    schedule = _paired_units(ctx, laws) if contact_units else _paired_rows(rows, op, laws, "m", cached)
-
-    world_rows = "if (m == 0 || world_mf_constraint_count.data[world] != 0) return;"
-    write = "global_dof >= 0"
-    if independent_components:
-        world_rows = (
-            "if (m == 0 || world_mf_constraint_count.data[world] > 0) return;\n"
-            "    const bool split_component = world_mf_constraint_count.data[world] < 0;"
+    # The schedule's rows: the line's every row but its speed rows, its last.
+    end = "m_rows" if speed_rows else "m"
+    ctx = RowContext.of(rows, op, end=end, metric=cached, inline_velocity_limit=True)
+    schedule = _paired_units(ctx, laws, end) if contact_units else _paired_rows(rows, op, laws, end, cached)
+    last_word = ()
+    world_rows = "if (m == 0) return;"
+    if speed_rows:
+        world_rows += "\n    const int m_rows = min(speed_first.data[world], m);"
+        body = ((), "secondary_offset", f"{_ROWS}.data[row_base + i * {D} + secondary_offset + 3]")
+        speed = speed_rows_pass(
+            rows, op, laws, walk=FREE_BODY_COORDINATES, start="m_rows", end="m", body=body, pad="        "
         )
-        write += f" && (!split_component || (primary_lane >= 0 && primary_lane < {P}))"
+        last_word = (speed,)
+    write = "global_dof >= 0"
     # Where spin rows may appear, every friction triple's metric is formed once per launch, at its first loaded visit
     # (sweep.friction_metric_stage), and its later visits only project.
     metric = ""
@@ -232,20 +240,16 @@ def paired_factor_source(
     const int off = line * {pitch};
     const int row_base = line * {pitch * D};
     const int dof_map_base = world * {D};
-    const int primary_offset = primary_offset_by_world.data[world];
     const int secondary_offset = secondary_offset_by_world.data[world];
 {rows.rings("    ")}
 
 {rows.loads("    ")}
     // The velocity change in factor coordinates per component, coordinate LANE in this lane's register.
     const int global_dof = lane < {D} ? world_dof_indices.data[dof_map_base + lane] : -1;
-    // Each component's lane: this lane's coordinate in it (out of range on other lanes).
-    const int primary_lane = lane - primary_offset;
-    const int secondary_lane = lane - secondary_offset;
     float {op.velocity.array} = 0.0f;
     SYNC();
 {seed}{metric}
-{level_loop((indent(schedule, "        "),), exit=end_sweep(solve_policy, iteration=ITERATION))}
+{level_loop((indent(schedule, "        "),), last_word, exit=end_sweep(solve_policy, iteration=ITERATION))}
 
 {leave}
 {staging.undefine()}
@@ -258,6 +262,7 @@ def paired_factor_source(
         RING,
         *law_preludes(PROJECTION_LAW, *cone),
         *solve_policy.preludes,
+        *((FREE_BODY_WALKS,) if speed_rows else ()),
     )
     return cuda_native(body, preludes=preludes), staging
 
@@ -406,7 +411,7 @@ def _unit_row(ctx: RowContext, laws: RowLaws, kind: str, *, load: bool = True) -
     return "\n".join(line for line in lines if line)
 
 
-def _paired_units(ctx: RowContext, laws: RowLaws) -> str:
+def _paired_units(ctx: RowContext, laws: RowLaws, end: str = "m") -> str:
     """Contact units in slot order: a row by the row law, or, with the tangent pair it owns, a contact unit.
 
     A row owns the next two rows when they are tangent rows naming it as parent (and the spin row after them where it
@@ -418,7 +423,7 @@ def _paired_units(ctx: RowContext, laws: RowLaws) -> str:
         *((f"    if (row_type == {TORSION}) continue;",) if laws.torsion else ()),
         f"    if (row_type == {FRICTION}) continue;",
         "    const int tangent1 = i + 1;",
-        f"    const bool owns_tangents = i + 2 < m && static_cast<int>(s_type[tangent1]) == {FRICTION}",
+        f"    const bool owns_tangents = i + 2 < {end} && static_cast<int>(s_type[tangent1]) == {FRICTION}",
         "        && world_row_parent.data[off + tangent1] == i;",
         "    if (!owns_tangents) {",
         indent(_unit_row(ctx, laws, "row_type"), "        "),
@@ -428,7 +433,7 @@ def _paired_units(ctx: RowContext, laws: RowLaws) -> str:
         "    const int head = i;",
         indent(_contact_unit(ctx, laws, "row_type", "world_row_mu.data[off + tangent1]"), "    "),
     ]
-    return UnitStride("m").wrap("\n".join(lines), "")
+    return UnitStride(end).wrap("\n".join(lines), "")
 
 
 @cache
@@ -438,7 +443,6 @@ def paired_factor_kernel(
     primary_dofs: int,
     secondary_dofs: int,
     device_arch: str,
-    independent_components: bool = False,
     *,
     contact_units: bool = False,
     torsion: bool = False,
@@ -447,6 +451,7 @@ def paired_factor_kernel(
     material: bool = False,
     pitch: int | None = None,
     seeded: bool = False,
+    speed_rows: bool = False,
 ) -> wp.Kernel:
     """The paired factor sweep kernel; weighted rows' and material contacts' operands (:func:`.sweep.weight_arguments`,
     :func:`.sweep.material_arguments`), a readout's operand and the walk's view follow ``v_out``."""
@@ -455,7 +460,6 @@ def paired_factor_kernel(
         max_world_dofs,
         primary_dofs,
         secondary_dofs,
-        independent_components,
         contact_units=contact_units,
         torsion=torsion,
         solve_policy=solve_policy,
@@ -463,17 +467,18 @@ def paired_factor_kernel(
         material=material,
         pitch=pitch,
         seeded=seeded,
+        speed_rows=speed_rows,
     )
     staging.check("the paired factor sweep", arch_budget(device_arch))
     name = (
         f"sweep_paired_factor_{max_constraints}_{max_world_dofs}_{primary_dofs}_{secondary_dofs}"
         + ("_units" if contact_units else "")
-        + ("_components" if independent_components else "")
         + ("_weighted" if weighted else "")
         + ("_material" if material else "")
         + ("_torsion" if torsion else "")
         + ("" if pitch is None or pitch == max_constraints else f"_p{int(pitch)}")
         + ("_seeded" if seeded else "")
+        + ("_speed" if speed_rows else "")
         + "_walk"
         + solve_policy.suffix
     )

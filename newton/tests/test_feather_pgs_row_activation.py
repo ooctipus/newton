@@ -22,6 +22,7 @@ from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     allocate_rigid_velocity_limit_slots,
 )
+from newton._src.solvers.feather_pgs.row_records import DenseRows
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import PREFIX_RECORDS, prefix_warp_rows
 
@@ -292,8 +293,23 @@ def _allocated_rigid_velocity_slots(
             fraction,
             64,
             wp.array([int(resolved)], dtype=wp.int32, device=device),
+            0,
         ],
-        outputs=[rigid_velocity_limit_slot, mf_slot_counter, wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device)],
+        outputs=[
+            rigid_velocity_limit_slot,
+            mf_slot_counter,
+            wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
+            # The rows' records, one line of 64 (the speed law's record of each reserved row).
+            field_group.upload(
+                DenseRows,
+                device,
+                **{name: np.zeros((1, 64), np.int32) for name in ("row_type", "row_parent")},
+                **{name: np.zeros((1, 64), np.float32) for name in ("row_mu", "row_beta", "phi", "target")},
+                sides=np.zeros((1, 64, 2), np.int32),
+                first=[0],
+            ),
+            wp.zeros((1, 64), dtype=wp.int32, device=device),
+        ],
         device=device,
     )
     return rigid_velocity_limit_slot.numpy().tolist(), int(mf_slot_counter.numpy()[0])

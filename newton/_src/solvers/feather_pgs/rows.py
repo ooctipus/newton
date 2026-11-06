@@ -874,20 +874,42 @@ class RowLaws:
                 solver.placement.keyed_rows.produce_contacts(contact_input)
 
     def bound_free_body_contacts(self, solver) -> None:
-        """Record where the free bodies' contact rows end: every contact and friction row precedes the velocity-limit
-        rows in the matrix-free slots, so the sweeps loop the contact prefix in the contact phases and the limits' tail
-        in the velocity-limit phase (staged with free bodies)."""
+        """Record where the free bodies' contact rows end in their run: every contact and friction row precedes the
+        speed rows in the run's slots, so the sweeps loop the contact prefix in the contact phases and the speed rows'
+        tail in the last word (staged with the run, :attr:`.step_plan.Capacities.free_contact_rows`)."""
         wp.copy(solver.placement.mf_contact_rows_end, solver.placement.mf_slot_counter)
 
+    def bound_speed_rows(self, solver) -> None:
+        """Record where the line's speed rows start (``speed_first``): every contact row is reserved, so the free
+        bodies' speed rows, reserved next, are the line's last rows (staged where the line holds them or the tiers
+        read it)."""
+        wp.copy(solver.placement.speed_first, solver.placement.slot_counter)
+
     def allocate_free_body_limits(self, solver) -> None:
-        """The free bodies' speed limits as matrix-free rows, not post-solve clamps: their slots, reserved after the
-        contacts' so they hold the last free-body slots, which the sweeps visit in a final phase with the joints'
-        velocity limits (staged with free bodies that carry speed-limit slots)."""
+        """The free bodies' speed limits as rows, not post-solve clamps: their slots, records and unit sources,
+        reserved after the contacts' so they are the last rows of the line (or of the free bodies' run, where their
+        contacts keep one), which the sweeps visit in their last word with the joints' velocity limits (staged with free
+        bodies that carry speed-limit slots)."""
         placement, model = solver.placement, solver.model
         # Without articulation metadata no root is a free rigid body's, so the kernel reads no root's first DOF.
         root_dof_start = solver.forest.articulation_root_dof_start
         if root_dof_start is None:
             root_dof_start = placement.dummy_is_free_rigid
+        if placement.free_contact_rows:
+            counter, capacity, rejected = (
+                placement.mf_slot_counter,
+                placement.mf_max_constraints,
+                placement.mf_first_rejected_slot,
+            )
+            base, units = placement.body_base, placement.no_units
+        else:
+            counter, capacity, rejected = (
+                placement.slot_counter,
+                placement.dense_max_constraints,
+                placement.dense_first_rejected_slot,
+            )
+            # A class with free bodies walks (SolverFeatherPGS): the one writer takes the line's speed rows.
+            base, units = 0, placement.unit_source
         wp.launch(
             allocate_rigid_velocity_limit_slots,
             dim=solver.forest.free_rigid_body_count,
@@ -897,10 +919,11 @@ class RowLaws:
                 root_dof_start,
                 solver.v_hat,
                 solver.options.velocity_limit_activation_fraction,
-                placement.mf_max_constraints,
+                capacity,
                 solver.sweep.resolved_worlds,
+                base,
             ],
-            outputs=[placement.rigid_velocity_limit_slot, placement.mf_slot_counter, placement.mf_first_rejected_slot],
+            outputs=[placement.rigid_velocity_limit_slot, counter, rejected, bind_dense_rows(placement), units],
             device=model.device,
         )
 
