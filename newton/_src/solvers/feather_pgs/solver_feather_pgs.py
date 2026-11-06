@@ -183,7 +183,6 @@ class SolverFeatherPGS(SolverBase):
     #   row_support False: sparse rows on explicit indices.     placement "general": case K6 (route_table.RouteTable).
     #   tiers: the Jacobi tiers' row bound, on any class whose response they form (0: no tiers).
     #   tier_sweeps: every Jacobi tier's sweep budget, in place of the equal-accuracy rule.
-    #   compact_contact False: no compact contact boundary (the sparse diagonal's one writer writes the rows).
     _route_pins: ClassVar[dict[str, object]] = {}
 
     @classmethod
@@ -538,23 +537,6 @@ class SolverFeatherPGS(SolverBase):
         self.placement.mf_sweeps = bool(
             self.routes.case not in ("K1", "K2") and self.forest.world_count > 0 and self.forest.max_world_dofs > 0
         )
-        # The compact boundary owns the rows and response of every world the sparse-diagonal owner pairs with a
-        # six-coordinate dense articulation (decided before the buffers: it clears its own rows, so their Jacobian
-        # needs no second buffer). It writes every contact row law: point and patch friction, contact torsion's spin
-        # rows and material contacts.
-        from .compact_contact import supported  # noqa: PLC0415
-
-        declined = (
-            "A test pin withholds the compact contact boundary."
-            if self._route_pins.get("compact_contact") is False
-            else None
-            if supported(self)
-            else "Declined: requires the six-coordinate sparse-diagonal triple or unit contract and no row checks."
-        )
-        self.placement.compact_contact_boundary = declined is None
-        self.placement.compact_contact_reason = (
-            declined or "Admitted: the six-coordinate sparse-diagonal triples or units."
-        )
         self._allocate_buffers(model)
         self.placement.allocate_world_rows(model)
         self.sweep.admit_paired()
@@ -643,19 +625,13 @@ class SolverFeatherPGS(SolverBase):
         self.placement.place_dense_response(paired_coordinates=self.sweep.paired_factor_coordinates)
         # The route: the row of the route table the class takes. The step plan and the route record read it. Its
         # producer writes every contact row, decided once from the owners' admissions: keyed rows (the tiers' in-kernel
-        # sink, case K4), the compact boundary (the sparse diagonal's contact-major producer, case K2), else the one
-        # writer where the class walks its rows, else none (no responding coordinate: no contact is admitted).
+        # sink, case K4), else the one writer where the class walks its rows, else none (no responding coordinate: no
+        # contact is admitted).
         diagonal = self.routes.case == "K2"
         route = self.routes.finish(
             self.laws.set,
             producer=(
-                "keyed_rows"
-                if self.placement.keyed_rows is not None
-                else "compact_contact_boundary"
-                if self.placement.compact_contact_boundary
-                else "walk"
-                if self.placement.walks
-                else "none"
+                "keyed_rows" if self.placement.keyed_rows is not None else "walk" if self.placement.walks else "none"
             ),
             packed=self.placement.packed_response,
             tier_rows=self.placement.ink_skip_rows(),

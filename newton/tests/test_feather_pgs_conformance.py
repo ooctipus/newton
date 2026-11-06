@@ -19,11 +19,10 @@ Routes
     test that reads the solve readout. Covered on CUDA: native sparse factors
     (with contact triplets), the matrix-free Gauss-Seidel sweep with its
     parallel and keyed-parallel tiers, the paired factor sweep
-    and the sparse-diagonal sweep (sparse-diagonal rows and the compact contact
-    boundary); on CPU, the general row of the matrix-free sweep, one thread per
+    and the sparse-diagonal sweep (its slot rows); on CPU, the general row of the matrix-free sweep, one thread per
     world. Dynamics owners: the held groups (sparse, tree and forest), scalar
     branches and ordinary dynamics. Contact-row producers: the one writer (into the general, the support and the
-    sparse diagonal's sinks), keyed rows and the compact contact boundary. Friction: the one-wrench patch friction
+    sparse diagonal's sinks) and keyed rows. Friction: the one-wrench patch friction
     (``friction_anchor_beta`` 0.2).
 
 Scenes and features
@@ -1477,14 +1476,11 @@ REFERENCE_CPU = Route(
 CPU = Route("cpu", "cpu", options=_MF, expect={"sweep.route": "matrix_free_gs"})
 
 
-# The sparse diagonal's one writer walks the rows of a dense articulation other than six coordinates (franka-cabinet's
-# nine); on the keyboard the compact boundary would own them, so these routes withhold its admission.
-_SPARSE_DIAGONAL_ROWS = {"compact_contact": False}
+# The sparse diagonal's one writer walks every row of the star and its dense articulation.
 SPARSE_DIAGONAL = Route(
     "sparse_diagonal_scalar",
     "cuda",
     options=_MF,
-    pins=_SPARSE_DIAGONAL_ROWS,
     expect={
         "sweep.route": "sparse_diagonal",
         "contact_rows.producer": "walk",
@@ -1496,23 +1492,12 @@ SPARSE_DIAGONAL_TREE = Route(
     "cuda",
     # The franka-cabinet route: sparse-diagonal rows with the diagonal-mass group in a held tree.
     options=_MF,
-    pins={"star": "held", **_SPARSE_DIAGONAL_ROWS},
+    pins={"star": "held"},
     expect={
         "sweep.route": "sparse_diagonal",
         "contact_rows.producer": "walk",
         "held_tree.scalar_branches.enabled": False,
         "held_tree.groups.0.operator": "tree",
-    },
-)
-COMPACT_BOUNDARY = Route(
-    "compact_contact_boundary",
-    "cuda",
-    # The keyboard recipe's route: the compact boundary owns a six-coordinate dense articulation's rows.
-    options=_MF,
-    expect={
-        "sweep.route": "sparse_diagonal",
-        "contact_rows.producer": "compact_contact_boundary",
-        "held_tree.scalar_branches.enabled": True,
     },
 )
 
@@ -1598,16 +1583,15 @@ def cuda_groups() -> list:
             Group(
                 _physics(scenes.keyboard(), law, 16),
                 ref,
-                (SPARSE_DIAGONAL, SPARSE_DIAGONAL_TREE, COMPACT_BOUNDARY),
+                (SPARSE_DIAGONAL, SPARSE_DIAGONAL_TREE),
             ),
-            # The sparse diagonal's and the compact boundary's spin rows (their units and quads), against the general
-            # route's.
+            # The sparse diagonal's spin rows (their units and quads), against the general route's.
             Group(
                 _physics(scenes.keyboard(), law, 16, "torsion", contact_torsion=True),
                 ref,
                 tuple(
                     route.but(f"{route.name}_torsion", expect={"friction.torsion": True})
-                    for route in (SPARSE_DIAGONAL, COMPACT_BOUNDARY)
+                    for route in (SPARSE_DIAGONAL,)
                 ),
             ),
             Group(_physics(scenes.hand(), law, 16), ref, (PAIRED, PAIRED_FOREST)),
@@ -1681,7 +1665,7 @@ def cuda_groups() -> list:
     for scene, iterations, routes in (
         (scenes.legged(), 32, (SPARSE, MF_HELD, MF_PARALLEL, KEYED_PARALLEL)),
         (scenes.gripper(), 32, (MF_DEFAULT, MF_FOREST)),
-        (scenes.keyboard(), 16, (SPARSE_DIAGONAL, SPARSE_DIAGONAL_TREE, COMPACT_BOUNDARY)),
+        (scenes.keyboard(), 16, (SPARSE_DIAGONAL, SPARSE_DIAGONAL_TREE)),
         (scenes.hand(), 16, (PAIRED, PAIRED_FOREST)),
     ):
         material = _material(scene)
@@ -1933,7 +1917,6 @@ OWNERSHIP = (
     # The paired factor sweep solves worlds of independent components; coupled worlds take the mixed fallback.
     (scenes.hand, "patch", 16, PAIRED, ("paired_factor", "mf_gs"), ()),
     (scenes.keyboard, "patch", 16, SPARSE_DIAGONAL, ("sparse_diagonal",), ("mf_gs",)),
-    (scenes.keyboard, "patch", 16, COMPACT_BOUNDARY, ("sparse_diagonal",), ("mf_gs",)),
     # Velocity-limit rows bind on the pushed arm: their last phase counts with the sweep's.
     (
         scenes.pushed_arm,

@@ -1736,7 +1736,7 @@ class TestQ18ManufacturedCUDA(unittest.TestCase):
         (scenes.box_stack, 60, 2.0 / 3.0, ("MF_HELD", "MF_DEFAULT")),
         (scenes.legged, 30, 2.0 / 3.0, ("MF_HELD", "SPARSE")),
         (scenes.gripper, 60, SPARSE, ("MF_DEFAULT", "MF_FOREST")),
-        (scenes.keyboard, 30, 2.0 / 3.0, ("SPARSE_DIAGONAL", "SPARSE_DIAGONAL_TREE", "COMPACT_BOUNDARY")),
+        (scenes.keyboard, 30, 2.0 / 3.0, ("SPARSE_DIAGONAL", "SPARSE_DIAGONAL_TREE")),
         (scenes.hand, 30, 2.0 / 3.0, ("PAIRED", "PAIRED_FOREST")),
     )
     """``(build, settle, loaded, routes)``, as :attr:`TestQ18Manufactured.SCENES`."""

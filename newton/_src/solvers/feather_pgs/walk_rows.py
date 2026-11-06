@@ -15,8 +15,7 @@ rows walked together from its first (1, 3, or 4 under contact torsion), or a joi
 - **the general placement** (case K6, FL3.3): each side's entries in the packed rows, through each tree's class's path
   table (:func:`packed_walker`), world-major with the bilateral blocks' closure (:func:`walked_rows_kernel`);
 - **the sparse diagonal** (case K2, FL3.5): the arm's side into the row's dense part, a key of the star one step to
-  the row's slot (:func:`slot_rows_kernel`, :func:`slot_header`; the compact boundary's producer,
-  :func:`.compact_contact.contacts_kernel`);
+  the row's slot (:func:`slot_rows_kernel`, :func:`slot_header`);
 - **the free bodies' rows** (``mf_Z``, each side's six of a row's twelve: a packed row by the free bodies' own row): a
   contact row (:func:`write_free_body_rows`), or a speed row's axis, a covector, for its diagonal
   (:func:`populate_rigid_velocity_limit_rows`), through the packed walker (:func:`packed_walker`).
@@ -205,7 +204,7 @@ its walk fits, for a latency-bound walk whose speed follows its resident warps. 
 it, five (96 registers: 97 unbounded, and six spilled 88 B a thread, sm_120)."""
 
 STAR_LINE = 256, 3
-"""The star's walkers' launch bound (:func:`slot_rows_kernel`, :func:`.compact_contact.contacts_kernel`): a block of
+"""The star's writer's launch bound (:func:`slot_rows_kernel`): a block of
 Warp's 256 threads, three a multiprocessor, the one writer's line of 80 registers (24 warps). Unbound, the class
 tables' walk takes 84-86 registers, past the granule: 16 warps (franka-cabinet 7% slower, gate_fast)."""
 
@@ -1497,11 +1496,10 @@ bodies'."""
 @cache
 def slot_rows_kernel(side: bool, tables: tuple) -> wp.Kernel:
     """The one writer on the sparse diagonal: a world's ``lanes`` threads stride over its rows (``dim = (worlds,
-    lanes)``), every row (``counts``, the allocation's watermark) or its limit prefix alone (``prefix``:
-    ``bounds[:, 1]``, where the compact boundary writes the contact rows in its producer), a row a lane: a contact row's
-    records by the contact law, then each row as its own unit (:data:`read_row_unit`), walked by the one unit walker
-    with the star (:func:`packed_walker`; the spin row a torque) and finished (:func:`slot_header`). ``side`` and
-    ``tables`` as :func:`packed_walker`'s: the walk of the solver's classes (:func:`slot_writer`)."""
+    lanes)``), every row up to the allocation's watermark (``counts``) within the capacity, a row a lane: a contact
+    row's records by the contact law, then each row as its own unit (:data:`read_row_unit`), walked by the one unit
+    walker with the star (:func:`packed_walker`; the spin row a torque) and finished (:func:`slot_header`). ``side``
+    and ``tables`` as :func:`packed_walker`'s: the walk of the solver's classes (:func:`slot_writer`)."""
     walk = packed_walker(1, False, side, tables, star=True)
 
     def write_slot_rows(
@@ -1510,8 +1508,6 @@ def slot_rows_kernel(side: bool, tables: tuple) -> wp.Kernel:
         slots: SlotRows,
         sink: RowSink,
         counts: wp.array[int],
-        bounds: wp.array2d[int],
-        prefix: int,
         lanes: int,
         data: ContactInput,
         law: PatchRowLaw,
@@ -1519,10 +1515,7 @@ def slot_rows_kernel(side: bool, tables: tuple) -> wp.Kernel:
         bias: RowBias,
     ):
         world, lane = wp.tid()
-        end = counts[world]
-        if prefix != 0:
-            end = bounds[world, 1]
-        end = wp.min(end, support.units.shape[1])
+        end = wp.min(counts[world], support.units.shape[1])
         line = rows.first[world]
         for slot in range(lane, end, lanes):
             unit = read_row_unit(rows, data, law, JointSeeds(), line, slot, support.units[line, slot])

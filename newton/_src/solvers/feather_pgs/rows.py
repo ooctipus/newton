@@ -183,8 +183,7 @@ def _prefix_warp_kernel(size: int, groups: int, family: str, mimics: int = 0) ->
         extra = "            law.mimic_slot.data[mimic] = slot;\n"
     else:
         source, extra = f"({kind} << {int(UNIT_SHIFT)}) | (2 * (first_dof + d0) + (w0 < 0.0f ? 1 : 0))", ""
-    # The row's seed: its unit source, the coordinate's side, in the units' own rows (the compact boundary keeps its
-    # limit prefix's alone).
+    # The row's seed: its unit source, the coordinate's side, in the units' own rows.
     sink = f"""{extra}            if (slot < support.units.shape[1])
                 support.units.data[(size_t)prefix_line * support.units.shape[1] + slot] = {source};"""
     if family == "mimics":
@@ -865,13 +864,8 @@ class RowLaws:
             # The one writer's contact rows ("walk") take their records in the writer (walk_rows).
             if producer == "keyed_rows":
                 solver.placement.keyed_rows.produce_contacts(contact_input)
-            elif producer == "compact_contact_boundary":
-                from .compact_contact import launch_contacts  # noqa: PLC0415
-
-                launch_contacts(solver, contact_input, dt)
             if slots:
-                # The sparse diagonal's rows, every one or the compact boundary's limit prefix, then the independent
-                # chains' marks in the slots they hold.
+                # The sparse diagonal's rows, then the independent chains' marks in the slots they hold.
                 self.write_slot_rows(solver, contact_input, law, dt)
                 slots_written = True
                 if solver.sweep.sparse_contact_marker is not None:
@@ -1135,12 +1129,10 @@ class RowLaws:
         )
 
     def write_slot_rows(self, solver, contact_input: ContactInput, law, dt: float) -> None:
-        """The sparse diagonal's one writer (:func:`.walk_rows.slot_writer`): every dense row, or under the compact
-        boundary its limit prefix, walked into the slots sink with its diagonal, incident velocity and rhs."""
+        """The sparse diagonal's one writer (:func:`.walk_rows.slot_writer`): every dense row walked into the slots sink
+        with its diagonal, incident velocity and rhs."""
         placement = solver.placement
-        prefix = bool(placement.compact_contact_boundary)
-        rows = max(int(placement.dense_internal_max_rows), 1) if prefix else placement.dense_max_constraints
-        lanes = min(rows, SLOT_LANES)
+        lanes = min(placement.dense_max_constraints, SLOT_LANES)
         wp.launch(
             walk_rows.slot_writer(solver),
             dim=(solver.forest.world_count, lanes),
@@ -1150,8 +1142,6 @@ class RowLaws:
                 walk_rows.bind_slot_rows(solver),
                 walk_rows.packed_sink(solver),
                 placement.slot_counter,
-                placement.dense_phase_bounds,
-                int(prefix),
                 lanes,
                 contact_input,
                 law,

@@ -1055,11 +1055,8 @@ class Placement:
     # ---------------------------------------------------------------------------------------------------------------
 
     def hold_units(self) -> None:
-        """The one writer's unit sources (:mod:`.walk_rows`): an int per row, by world line and row; under the compact
-        boundary only its limit prefix's (its producer walks the contact rows where it reads them)."""
-        rows = (
-            max(int(self.dense_internal_max_rows), 1) if self.compact_contact_boundary else self.dense_max_constraints
-        )
+        """The one writer's unit sources (:mod:`.walk_rows`): an int per row, by world line and row."""
+        rows = self.dense_max_constraints
         self.unit_source = wp.full((self.forest.world_count, rows), 0, dtype=wp.int32, device=self.model.device)
 
     def diagonals(self) -> None:

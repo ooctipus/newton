@@ -30,11 +30,7 @@ from newton._src.solvers.feather_pgs.sweep_levels import (
     _get_build_independent_sparse_contact_groups_kernel,
 )
 from newton.tests.feather_pgs_law_harness import row_lines
-from newton.tests.test_feather_pgs_compact_contact import (
-    build_solver_fixture,
-    compact_boundary,
-    install_patch_contacts,
-)
+from newton.tests.test_feather_pgs_compact_contact import build_solver_fixture, install_patch_contacts
 from newton.tests.test_feather_pgs_response_diagonal import _mark_patch_units, _patch_unit_cases, _unit_schedule_oracle
 
 _FRICTION = PGS_CONSTRAINT_TYPE_FRICTION
@@ -338,18 +334,15 @@ def _differing_worlds(first, second):
     return np.any([np.any((first[name] != second[name]).reshape(worlds, -1), axis=1) for name in _OUTPUTS], axis=0)
 
 
-def _record_schedules(model, device, *, compact, steps=6):
+def _record_schedules(model, device, *, steps=6):
     """Step a solver over the patch fixture's contacts; return each schedule build's rows before and outputs after."""
-    with (
-        compact_boundary(compact),
-    ):
-        solver = newton.solvers.SolverFeatherPGS(
-            model,
-            pgs_iterations=8,
-            enable_joint_limits=True,
-            dense_max_constraints=64,
-            mf_max_constraints=64,
-        )
+    solver = newton.solvers.SolverFeatherPGS(
+        model,
+        pgs_iterations=8,
+        enable_joint_limits=True,
+        dense_max_constraints=64,
+        mf_max_constraints=64,
+    )
     names = ("row_count", "first", "bounds", "row_type", "row_parent", *_OUTPUTS)
     records = []
     launch = wp.launch
@@ -499,21 +492,18 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
         """
         device = wp.get_device("cuda:0")
         model = build_solver_fixture(device)
-        for compact in (False, True):
-            with self.subTest(compact=compact):
-                solver, records = _record_schedules(model, device, compact=compact)
-                self.assertTrue(solver.placement.sparse_diagonal_contact_units)
-                self.assertTrue(solver.placement.sparse_diagonal_speculative_contact_batches)
-                self.assertEqual(solver.placement.compact_contact_boundary, compact)
-                self.assertEqual(len(records), 6)
-                for step, (before, after) in enumerate(records):
-                    for world in range(before["row_count"].shape[0]):
-                        self.assertTrue(_rows_form_units(before, world), f"step {step} world {world}")
-                    marks = _unit_builder_path_marks(before, device)
-                    np.testing.assert_array_equal(marks, 1, err_msg=f"step {step}: worlds left the parallel path")
-                    _assert_outputs_equal(after, _serial_unit_walks(before, serial_contacts=True), f"step {step}")
-                self.assertGreater(sum(int(np.sum(after["group_count"])) for _, after in records), 0)
-                self.assertGreater(sum(int(np.sum(after["serial_count"])) for _, after in records), 0)
+        solver, records = _record_schedules(model, device)
+        self.assertTrue(solver.placement.sparse_diagonal_contact_units)
+        self.assertTrue(solver.placement.sparse_diagonal_speculative_contact_batches)
+        self.assertEqual(len(records), 6)
+        for step, (before, after) in enumerate(records):
+            for world in range(before["row_count"].shape[0]):
+                self.assertTrue(_rows_form_units(before, world), f"step {step} world {world}")
+            marks = _unit_builder_path_marks(before, device)
+            np.testing.assert_array_equal(marks, 1, err_msg=f"step {step}: worlds left the parallel path")
+            _assert_outputs_equal(after, _serial_unit_walks(before, serial_contacts=True), f"step {step}")
+        self.assertGreater(sum(int(np.sum(after["group_count"])) for _, after in records), 0)
+        self.assertGreater(sum(int(np.sum(after["serial_count"])) for _, after in records), 0)
 
 
 if __name__ == "__main__":

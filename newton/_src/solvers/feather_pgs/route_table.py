@@ -197,8 +197,7 @@ class RouteRow:
     """Axis 3: the placement case (:data:`CASES`, or ``"K6"`` general)."""
     producer: str
     """Axis 3: the producer of the contact rows, decided once at construction: ``walk`` (the one writer), ``keyed_rows``
-    (the tiers' in-kernel rows), ``compact_contact_boundary`` (the sparse diagonal's contact-major producer) or ``none``
-    (a class without a responding coordinate admits no contact)."""
+    (the tiers' in-kernel rows) or ``none`` (a class without a responding coordinate admits no contact)."""
     packed: bool
     """Axis 3: the matrix-free sweeps read the dense rows packed by support, so no size builds a response."""
     tier_rows: int

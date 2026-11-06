@@ -713,7 +713,6 @@ class TestSlotFrame(unittest.TestCase):
         from newton.tests import test_feather_pgs_conformance as conformance  # noqa: PLC0415
 
         names = {route.name for route in (conformance.SPARSE_DIAGONAL, conformance.SPARSE_DIAGONAL_TREE)}
-        names.add(conformance.COMPACT_BOUNDARY.name)
         done = set()
         for group in conformance.cuda_groups():
             for route in (group.reference, *group.routes):

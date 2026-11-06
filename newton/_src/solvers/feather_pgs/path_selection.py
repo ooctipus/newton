@@ -288,8 +288,8 @@ def _kernel_names(kernels) -> list:
 def _row_builder(solver, method, size) -> dict:
     """Name the kernels that build one DOF size's dense contact rows outside the sweep.
 
-    Mirrors the producers' launches, in launch order: the one writer, compact_contact.launch_contacts,
-    LocalRowPackets.produce_contacts and finish_rows, and KeyedRows.produce_contacts and finish_rows.
+    Mirrors the producers' launches, in launch order: the one writer, and KeyedRows.produce_contacts and
+    finish_rows.
     A launch shared by several sizes (a producer's contact kernel) is named under each of them. Rows built elsewhere are not named: keyed rows' direct rows, which the parallel tiers
     build in the sweep (``direct_rows`` points to routes.sweep.tiers), and the free-body matrix-free
     rows, which walk_rows.write_free_body_rows writes for the contacts the allocation routes to them
@@ -319,11 +319,6 @@ def _row_builder(solver, method, size) -> dict:
         # The parallel tiers (routes.sweep.tiers) build the direct rows in the sweep; the one writer walks the rows
         # of every other world (keyed_general_units hands them over).
         kernels = (keyed_rows.scatter_contact_keys, keyed_rows.keyed_general_units, walk_rows.writer_kernel(solver))
-    elif method == "compact_contact_boundary":
-        from . import compact_contact, walk_rows  # noqa: PLC0415 - the owner's modules; loaded with the owner
-
-        # The boundary writes the contact rows whole; the one writer walks the limit prefix (walk_rows).
-        kernels = (compact_contact.contact_producer(solver), walk_rows.slot_writer(solver), *marker)
     else:
         raise ValueError(f"No contact-row builder kernels are known for the method {method!r}.")
     entry = {"method": method, "kernels": _kernel_names(kernels)}
@@ -342,10 +337,6 @@ def _contact_rows(solver) -> dict:
         # for the dense contact rows built outside the sweep (_row_builder names the rows built elsewhere).
         "builder_by_dof": {str(int(size)): _row_builder(solver, row.producer, size) for size in sizes},
         "keyed_rows": {"enabled": row.producer == "keyed_rows", "reason": solver.placement.keyed_rows_reason},
-        "compact_contact": {
-            "boundary": row.producer == "compact_contact_boundary",
-            "reason": solver.placement.compact_contact_reason,
-        },
     }
 
 

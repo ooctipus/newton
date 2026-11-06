@@ -1,24 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The compact boundary against the sparse diagonal's one writer (FL3.5): one row law and walk, two mappings.
+"""The sparse diagonal's one writer on the compact diagonal (FL3.5): a real two-world model, a 108-key star beside a
+six-coordinate chain.
 
-The compact boundary writes the sparse diagonal's contact rows where it reads the contacts
-(:func:`.compact_contact.contacts_kernel`); without it the one writer walks them from their unit sources
-(:func:`.walk_rows.slot_rows_kernel`). Both call the same row functions, so on a real two-world model (a 108-key star
-beside a six-coordinate chain) their steps, rows, impulses and anchor history agree. The rows' arithmetic is held to
-the walk's invariants in ``test_feather_pgs_walk_rows`` (:class:`TestSlotFrame`).
+The one writer walks every row from its unit source (:func:`.walk_rows.slot_rows_kernel`): the solver steps, resets,
+takes a model change and replays a graph with the route record naming the row builders it launches, and under patch
+friction its rows link their rings and keep the patch law. The rows' arithmetic is held to the walk's invariants in
+``test_feather_pgs_walk_rows`` (:class:`TestSlotFrame`). The model is the fixture of the contact schedule and scalar
+branch tests.
 """
 
 import unittest
-from types import SimpleNamespace
-from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import compact_contact as compact
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
     assert_history_close,
@@ -27,19 +25,6 @@ from newton.tests.feather_pgs_patch_parity import (
     contact_rows,
 )
 from newton.tests.feather_pgs_row_builders import assert_row_builders_named, launched_kernels
-
-
-def _unsupported(solver) -> bool:
-    return False
-
-
-def compact_boundary(enabled: bool):
-    """Admit the compact contact boundary where the data supports it, or withhold it from the sparse-diagonal owner.
-
-    Withheld, the one writer walks the rows from their unit sources, as for a dense articulation other than six
-    coordinates.
-    """
-    return mock.patch.object(compact, "supported", compact.supported if enabled else _unsupported)
 
 
 def build_solver_fixture(device):
@@ -205,35 +190,18 @@ def assert_patch_tangent_law(solver, contacts):
     return anchors
 
 
-# The two solver arms of the CUDA tests: the sparse diagonal's one writer, then the compact boundary.
-_ARMS = ("walk", "compact")
-
-
-def check_compact_records(test, solvers):
-    """Check and return the contact-row records of the two arms of ``build_solver_fixture``.
-
-    Each names the builders of the diagonal-mass size (108) and the dense six with the friction law's
-    variants. The marker encodes schedule links into the sparse rows: of point friction's triples, or of
-    patch friction's units.
-    """
-    records = []
-    for solver, arm in zip(solvers, _ARMS, strict=True):
-        record = solver.get_path_selection()["routes"]["contact_rows"]
-        marker = solver.sweep.sparse_contact_marker.key
-        # The one writer walks every row from its unit source; the boundary writes the contact rows and the writer
-        # its limit prefix.
-        producer = "walk" if arm == "walk" else "compact_contact_boundary"
-        first = [] if arm == "walk" else ["produce_contacts"]
-        expected = {
-            "108": (producer, [*first, "write_slot_rows", marker]),
-            "6": (producer, [*first, "write_slot_rows"]),
-        }
-        test.assertEqual(record["producer"], producer)
-        test.assertEqual(
-            {size: (entry["method"], entry["kernels"]) for size, entry in record["builder_by_dof"].items()}, expected
-        )
-        records.append(record)
-    return records
+def check_star_records(test, solver):
+    """Check and return the contact-row record of ``build_solver_fixture``'s solver: the one writer names the builders
+    of the diagonal-mass size (108) and the dense six. The marker encodes schedule links into the sparse rows (the
+    patch friction's units)."""
+    record = solver.get_path_selection()["routes"]["contact_rows"]
+    marker = solver.sweep.sparse_contact_marker.key
+    expected = {"108": ("walk", ["write_slot_rows", marker]), "6": ("walk", ["write_slot_rows"])}
+    test.assertEqual(record["producer"], "walk")
+    test.assertEqual(
+        {size: (entry["method"], entry["kernels"]) for size, entry in record["builder_by_dof"].items()}, expected
+    )
+    return record
 
 
 def ring_carries_friction(records, first):
@@ -249,43 +217,9 @@ def ring_carries_friction(records, first):
     return False
 
 
-class TestCompactContact(unittest.TestCase):
-    def test_exact_mode_admission(self):
-        """Reject incomplete mode compositions before any contact ownership changes.
-
-        The sparse-diagonal owner's own admission (its fused limits: augmented drives, no velocity-limit, mimic or
-        connect rows, no debug rows or pre-elimination) is the owner's, which its case (K2) stands for here.
-        """
-        valid = {
-            "model": SimpleNamespace(device=SimpleNamespace(is_cuda=True)),
-            "routes": SimpleNamespace(case="K2"),
-            "_compact_diagonal_mass_size": 108,
-            "sparse_diagonal_dense_size": 6,
-            "sparse_diagonal_response_size": 108,
-            "sparse_diagonal_contact_units": True,
-            "dense_max_constraints": 40,
-            "dense_internal_max_rows": 12,
-        }
-
-        def probe(fields):
-            """The class's fields on the solver, the placement's on its placement."""
-            owners = ("model", "routes", "_compact_diagonal_mass_size")
-            placement = {name: value for name, value in fields.items() if name not in owners}
-            return SimpleNamespace(placement=SimpleNamespace(**placement), **{name: fields[name] for name in owners})
-
-        self.assertTrue(compact.supported(probe(valid)))
-        for name, value in (
-            ("routes", SimpleNamespace(case="K6")),
-            ("sparse_diagonal_dense_size", 7),
-            ("sparse_diagonal_contact_units", False),
-            ("dense_max_constraints", 11),
-            ("dense_internal_max_rows", 13),
-            ("_compact_diagonal_mass_size", None),
-        ):
-            self.assertFalse(compact.supported(probe({**valid, name: value})), name)
-
+class TestStarRows(unittest.TestCase):
     def test_actual_fixture_layout_and_cpu_fallback(self):
-        """Exercise the real model/Contacts field binding and exact unsupported CPU fallback."""
+        """Exercise the real model/Contacts field binding, and the solver's construction on the CPU."""
         model = build_solver_fixture("cpu")
         self.assertEqual(model.joint_dof_count, 228)
         self.assertEqual(model.shape_count, 8)
@@ -294,41 +228,31 @@ class TestCompactContact(unittest.TestCase):
         contacts = newton.Contacts(8, 0, device=model.device)
         install_contacts(model, state, contacts)
         self.assertEqual(contacts.rigid_contact_count.numpy()[0], 6)
-        solver = newton.solvers.SolverFeatherPGS(model, dense_max_constraints=64)
-        self.assertFalse(solver.placement.compact_contact_boundary)
+        newton.solvers.SolverFeatherPGS(model, dense_max_constraints=64)
 
     def test_cuda_actual_solver_step_reset_notify_and_graphs(self):
         """Use the actual allocator, scheduler, RHS and eight-sweep solve with loaded contacts.
 
-        The contacts run the unit schedule; each arm's route record names exactly the row
-        builders its first step launches.
+        The contacts run the unit schedule; the route record names exactly the row builders the first step launches.
         """
         devices = wp.get_cuda_devices()
         if not devices:
             self.skipTest("Actual sparse constructor and parallel-stream capture require CUDA")
         for device in devices:
             model = build_solver_fixture(device)
-            solvers = []
-            for enabled in (False, True):
-                with (
-                    compact_boundary(enabled),
-                ):
-                    solvers.append(
-                        newton.solvers.SolverFeatherPGS(
-                            model,
-                            pgs_iterations=8,
-                            update_mass_matrix_interval=2,
-                            enable_joint_limits=True,
-                            dense_max_constraints=64,
-                            mf_max_constraints=64,
-                        )
-                    )
-            self.assertFalse(solvers[0].placement.compact_contact_boundary)
-            self.assertTrue(solvers[1].placement.compact_contact_boundary)
-            self.assertLessEqual(solvers[1].placement.dense_internal_max_rows, 12)
+            solvers = [
+                newton.solvers.SolverFeatherPGS(
+                    model,
+                    pgs_iterations=8,
+                    update_mass_matrix_interval=2,
+                    enable_joint_limits=True,
+                    dense_max_constraints=64,
+                    mf_max_constraints=64,
+                )
+            ]
             for solver in solvers:
                 self.assertTrue(solver.placement.sparse_diagonal_contact_units)
-            records = check_compact_records(self, solvers)
+            records = [check_star_records(self, solver) for solver in solvers]
             states = [[model.state(), model.state()] for _ in solvers]
             controls = [model.control() for _ in solvers]
             contacts = [newton.Contacts(8, 0, device=device) for _ in solvers]
@@ -379,35 +303,28 @@ class TestCompactContact(unittest.TestCase):
                     wp.capture_launch(graph)
                 compare()
 
-    def test_cuda_patch_rows_match_the_original_producers(self):
-        """Write persistent patch rows from the compact boundary as the original producers do.
-
-        All arms run the sparse unit schedule under default patch friction; the compact arms replace only
-        the row producer, so rows by contact, impulses, states and anchor history must agree.
+    def test_cuda_patch_rows_keep_the_patch_law(self):
+        """Write persistent patch rows by the one writer under the sparse unit schedule and default patch friction:
+        normal-only units link into their rings, loaded rings carry friction, the tangents keep the patch law, and
+        the rings schedule independently or, on a coupled coordinate, serially.
         """
         devices = wp.get_cuda_devices()
         if not devices:
             self.skipTest("Actual sparse constructor requires CUDA")
         for device in devices:
             model = build_solver_fixture(device)
-            solvers = []
-            for enabled in (False, True):
-                with (
-                    compact_boundary(enabled),
-                ):
-                    solvers.append(
-                        newton.solvers.SolverFeatherPGS(
-                            model,
-                            pgs_iterations=8,
-                            enable_joint_limits=True,
-                            dense_max_constraints=64,
-                            mf_max_constraints=64,
-                        )
-                    )
-            for solver, enabled in zip(solvers, (False, True), strict=True):
+            solvers = [
+                newton.solvers.SolverFeatherPGS(
+                    model,
+                    pgs_iterations=8,
+                    enable_joint_limits=True,
+                    dense_max_constraints=64,
+                    mf_max_constraints=64,
+                )
+            ]
+            for solver in solvers:
                 self.assertTrue(solver.placement.sparse_diagonal_contact_units)
-                self.assertEqual(solver.placement.compact_contact_boundary, enabled)
-            records = check_compact_records(self, solvers)
+            records = [check_star_records(self, solver) for solver in solvers]
             states = [[model.state(), model.state()] for _ in solvers]
             controls = [model.control() for _ in solvers]
             contacts = [newton.Contacts(24, 0, device=device) for _ in solvers]
@@ -453,8 +370,8 @@ class TestCompactContact(unittest.TestCase):
                 )
             self.assertTrue(linked, "A normal-only unit must link into a patch ring")
             self.assertTrue(pooled, "A loaded normal-only unit must share a ring that carries friction")
-            # In every arm the level support's ring schedules independently; the coupled ring keeps the tilted
-            # support's ring serial, in speculative batches.
+            # The level support's ring schedules independently; the coupled ring keeps the tilted support's ring
+            # serial, in speculative batches.
             self.assertEqual(independent, [True] * len(solvers), "A patch ring must schedule independently")
             self.assertEqual(serial, [True] * len(solvers), "Patch rings on a coupled coordinate must stay serial")
             self.assertTrue(solvers[0].laws.friction_patches.previous.valid.numpy().any(), "Anchors must carry history")

@@ -322,7 +322,7 @@ class TestAuditCUDA(TestAudit):
             (scenes.legged, (conformance.MF_HELD, conformance.SPARSE, conformance.MF_PARALLEL)),
             (scenes.gripper, (conformance.MF_PARALLEL,)),
             (scenes.hand, (conformance.PAIRED,)),
-            (scenes.keyboard, (conformance.SPARSE_DIAGONAL, conformance.COMPACT_BOUNDARY)),
+            (scenes.keyboard, (conformance.SPARSE_DIAGONAL,)),
         ):
             scene = build()
             for route in routes:

@@ -266,15 +266,12 @@ class StepPlan:
 
 
 def _response(row: RouteRow, forest) -> dict[int, Route]:
-    """Where each size's rows are whitened: by a contact owner (native sparse factors, case K1, or the compact
-    boundary), in place by the sparse diagonal (case K2's pair) or in the packed rows' build (every other class)."""
-    owner = row.producer == "compact_contact_boundary" or row.case == "K1"
+    """Where each size's rows are whitened: by native sparse factors' support writer (case K1), in place by the sparse
+    diagonal (case K2's pair) or in the packed rows' build (every other class)."""
     routes = {}
     for size in forest.size_groups:
-        if owner:
-            routes[size] = Route(
-                "owner", "The contact owner and the bounded limit prefix publish the complete response."
-            )
+        if row.case == "K1":
+            routes[size] = Route("owner", "Native sparse factors' writer whitens every row into its support.")
         elif row.case == "K2" and size in (row.sizes["diagonal"], row.sizes["dense"]):
             routes[size] = Route(
                 "sparse_diagonal", "The sparse-diagonal owner whitens its rows in place: no size builds a response."

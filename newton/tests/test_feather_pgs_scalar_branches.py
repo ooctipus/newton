@@ -27,7 +27,6 @@ from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_mass_reference import MassReference
 from newton.tests.test_feather_pgs_cache_validity import _set_clock
-from newton.tests.test_feather_pgs_compact_contact import compact_boundary
 
 DT = 1.0 / 240.0
 GRAVITY = (0.7, -1.2, -9.1)
@@ -268,8 +267,8 @@ def same(test, expected, actual, index, name):
     np.testing.assert_allclose(actual, expected, rtol=ARM_FLOOR, atol=2.0e-6, err_msg=name)
 
 
-def recipe_solver(model, *, scalar, compact=True, pins=None, **options):
-    """The keyboard recipe's solver: compact contacts, plus scalar branches if asked; ``pins`` are more route pins."""
+def recipe_solver(model, *, scalar, pins=None, **options):
+    """The keyboard recipe's solver, plus scalar branches if asked; ``pins`` are more route pins."""
     arguments = {
         "pgs_iterations": 8,
         "update_mass_matrix_interval": 2,
@@ -278,10 +277,7 @@ def recipe_solver(model, *, scalar, compact=True, pins=None, **options):
         "mf_max_constraints": 64,
         **options,
     }
-    with (
-        compact_boundary(compact),
-        mock.patch.dict(SolverFeatherPGS._route_pins, {**({} if scalar else {"star": "held"}), **(pins or {})}),
-    ):
+    with mock.patch.dict(SolverFeatherPGS._route_pins, {**({} if scalar else {"star": "held"}), **(pins or {})}):
         return SolverFeatherPGS(model, **arguments)
 
 
