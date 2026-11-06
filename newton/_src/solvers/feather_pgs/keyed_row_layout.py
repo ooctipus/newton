@@ -70,6 +70,9 @@ def topology_plan(solver):
     art_joint = model.articulation_start.numpy()
     joint_dof = model.joint_qd_start.numpy()
     joint_type = model.joint_type.numpy()
+    if solver.laws.mimic_count:
+        # The prefix keys a coordinate's limit rows; a mimic row spans two coordinates (the one writer's mimic family).
+        raise ValueError("keyed rows key no mimic row")
     velocity_mask, position_mask = 0, 0
     q_index = solver.laws.joint_limit_q_index_host
     for column, size in enumerate(sizes):

@@ -170,7 +170,7 @@ def eligible_solver():
         pins={},
         factor=SimpleNamespace(parallel_drives=True, eliminates=False),
         placement=SimpleNamespace(),
-        routes=RouteTable({}, native=True),
+        routes=RouteTable({}, native=True, eliminates=False),
         forest=forest,
         options=options,
         laws=LawsProbe(

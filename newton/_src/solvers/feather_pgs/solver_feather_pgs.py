@@ -47,7 +47,7 @@ from .path_selection import (
     route_selection,
 )
 from .placement import Placement
-from .route_table import RouteTable, capable
+from .route_table import RouteTable
 from .rows import RowLaws
 from .step_plan import Step, StepPlan, StepSpec
 from .sweep_plan import Sweep
@@ -490,7 +490,7 @@ class SolverFeatherPGS(SolverBase):
         # The placement: where the rows live, their capacities and status.
         self.placement = Placement(model, options, self.forest, self.laws, self.factor)
         self.factor.plan_blocks(self.forest, self.laws)
-        # Axis 2 of the route table, the row laws, which every owner's admission reads (route_table.capable).
+        # Axis 2 of the route table, the row laws (route_table.Laws).
         self.laws.decide(preelimination=self.factor.eliminates)
         laws = self.laws.set
         # The passive joint forces and the per-coordinate drive rows the held tree's admission reads.
@@ -500,7 +500,7 @@ class SolverFeatherPGS(SolverBase):
 
         # Axis 3 of the route table, the placement case: the owners below, in precedence order (route_table.CASES),
         # each test their own fit once no earlier case holds the class, and the first that fits claims it.
-        self.routes = RouteTable(self._route_pins, native=model.device.is_cuda)
+        self.routes = RouteTable(self._route_pins, native=model.device.is_cuda, eliminates=self.factor.eliminates)
         # The sweep: its owners claim the class below, in the route table's order.
         self.sweep = Sweep(
             model,
@@ -544,19 +544,12 @@ class SolverFeatherPGS(SolverBase):
         # The producer of the tiers' rows (case K4), admitted by its own fit: keyed rows (keyed_rows.create_owner),
         # which write the point and the patch row law.
         self.placement.keyed_rows = None
-        if (declined := capable("keyed_rows", self.laws.set)) is not None:
-            self.placement.keyed_rows_reason = declined
-        elif self._route_pins.get("producer") not in (None, "keyed_rows"):
+        if self._route_pins.get("producer") not in (None, "keyed_rows"):
             self.placement.keyed_rows_reason = "A test pin selects another contact-row producer."
         else:
             from .keyed_rows import create_owner as create_kinetic_rows_owner  # noqa: PLC0415
 
-            self.placement.keyed_rows = create_kinetic_rows_owner(self)
-            self.placement.keyed_rows_reason = (
-                "Admitted: the in-kernel parallel sweep builds keyed rows for its bounded worlds."
-                if self.placement.keyed_rows is not None
-                else "Keyed rows need the Jacobi tiers (routes.sweep.tiers) and a topology their layout keys."
-            )
+            self.placement.keyed_rows, self.placement.keyed_rows_reason = create_kinetic_rows_owner(self)
         # The general placement (case K6) and the paired factor coordinates (case K5, a tree beside one free body)
         # whiten and leave their rows by the walk (FL3.3): the factor holds the walk's data for every responding tree, a
         # free rigid body's six coordinates included, and the one writer, the free bodies' writer and the sweeps' leaves

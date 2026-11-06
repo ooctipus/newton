@@ -1,20 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The route table: the row laws a solver's worlds solve, the laws each placement implements, and the placement case.
+"""The route table: the row laws a solver's worlds solve and the placement case.
 
-The row laws (:class:`Laws`) are read once from the physics options and the model, never from a route. Each
-placement and schedule declares once, in :data:`CAPABILITIES`, the laws it implements, and :func:`capable` is the one
-test of them that the owners' admissions read: an owner then tests only its own topology fit. The placement axis
-(:class:`RouteTable`) gives the class to one case, decided once in the precedence :data:`CASES`: an owner reads the
-case instead of the other owners' decisions.
+The row laws (:class:`Laws`) are read once from the physics options and the model, never from a route; every
+placement's writer and sweep call each law's function, so no placement declines a law and an owner tests only its own
+fit (topology, sizes, the device's budget). The placement axis (:class:`RouteTable`) gives the class to one case,
+decided once in the precedence :data:`CASES`: an owner reads the case instead of the other owners' decisions. The data
+that keep every class general are read once, here: a test pin, the device, and the bilateral pre-elimination.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-__all__ = ["CAPABILITIES", "CASES", "Laws", "RouteRow", "RouteTable", "capable"]
+__all__ = ["CASES", "Laws", "RouteRow", "RouteTable"]
 
 
 @dataclass(frozen=True)
@@ -39,13 +39,6 @@ class Laws:
     mimic: bool
     """The model has mimic rows."""
 
-    PLAIN = "no warm start or bilateral pre-elimination"
-
-    @property
-    def plain(self) -> bool:
-        """The sweep policy the specialized placements assume (:attr:`PLAIN`)."""
-        return not (self.warm_start or self.preelimination)
-
     @property
     def weighted(self) -> bool:
         """Contact rows step by their weights: the relative regularization's, or a material contact's from its
@@ -69,42 +62,7 @@ class Laws:
 
     def record(self) -> dict:
         """The laws as a JSON-compliant record, with the derived ones."""
-        return {**asdict(self), "plain": self.plain, "weighted": self.weighted}
-
-
-# Each requirement a placement or schedule may hold: (test of the laws, what it requires).
-_REQUIREMENTS = {
-    "no_mimic": (lambda laws: not laws.mimic, "no mimic rows"),
-    "no_preelimination": (lambda laws: not laws.preelimination, "no bilateral pre-elimination"),
-}
-
-CAPABILITIES = {
-    # The packed placement of a single tree: native sparse factors and their sweep.
-    "packed": ("no_preelimination",),
-    # The paired factor's sweep in factor coordinates (one articulation and one free body per world).
-    "paired_factor": ("no_preelimination",),
-    # Its runtime claim: independent articulation and free-body components per world.
-    "components": ("no_preelimination", "no_mimic"),
-    # The keyed in-kernel row producer of the tiers.
-    "keyed_rows": ("no_preelimination", "no_mimic"),
-}
-"""The laws each placement or schedule implements, by owner: what its admission reads through :func:`capable`."""
-
-_LABELS = {
-    "packed": "Native sparse factors need",
-    "paired_factor": "The factor-coordinate sweep needs",
-    "components": "Components need",
-    "keyed_rows": "Keyed rows need",
-}
-
-
-def capable(owner: str, laws: Laws) -> str | None:
-    """Why ``owner`` does not implement the solver's ``laws``, or ``None`` when it does (:data:`CAPABILITIES`)."""
-    for requirement in CAPABILITIES[owner]:
-        holds, phrase = _REQUIREMENTS[requirement]
-        if not holds(laws):
-            return f"{_LABELS[owner]} {phrase}."
-    return None
+        return {**asdict(self), "weighted": self.weighted}
 
 
 CASES = {
@@ -124,22 +82,24 @@ class RouteTable:
     budget) after :meth:`taken`, which says why an earlier case holds the class, :meth:`claim` gives the class to
     the first that fits, and each writes its case's reason. The producers and the runtime claims read :attr:`case`;
     once they have decided, :meth:`finish` returns the route, which the step's spec holds (:class:`.step_plan.StepSpec`).
-    The test pin ``placement="general"`` keeps every class general, and so does a device without the cases' native
-    bodies (``native``: they are written for CUDA; the CPU runs the general placement).
+    Three data keep every class general, read once here: the test pin ``placement="general"``; a device without the
+    cases' native bodies (``native``: they are written for CUDA, so the CPU runs the general placement); and the
+    bilateral pre-elimination (``eliminates``), whose blocks the one writer's block phase closes and whose wide rows
+    only the general sweep's exit reads (the cases' writers and sweeps take neither yet).
     """
 
-    def __init__(self, pins, *, native: bool):
+    def __init__(self, pins, *, native: bool, eliminates: bool):
         self.case = "K6"
         """The case holding the class: a key of :data:`CASES`, or ``"K6"`` (general) while none claims it."""
         self.reasons: dict[str, str | None] = {}
         """Why each asked case holds the class or does not, written by its owner."""
-        self._general = (
-            "A test pin keeps the general placement (placement='general')."
-            if pins.get("placement") == "general"
-            else None
-            if native
-            else "The device runs the general placement: the cases' native bodies are written for CUDA."
+        general = (
+            (pins.get("placement") == "general", "A test pin keeps the general placement (placement='general')."),
+            (not native, "The device runs the general placement: the cases' native bodies are written for CUDA."),
+            (eliminates, "Bilateral pre-elimination closes its blocks in the general row's block phase."),
         )
+        self._general = next((reason for holds, reason in general if holds), None)
+        """Why every class keeps the general placement, or ``None``."""
         self._asked = -1
 
     def taken(self, case: str) -> str | None:

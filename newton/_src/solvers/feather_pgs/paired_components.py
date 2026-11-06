@@ -25,7 +25,6 @@ from . import field_group, kernel_template
 from .device_preludes import lane_group
 from .field_group import Field
 from .kernel_template import KernelTemplate, items
-from .route_table import capable
 from .row_kernels import PGS_CONSTRAINT_TYPE_SPEED
 from .step_plan import first_failed
 
@@ -62,9 +61,9 @@ PAIRED_COMPONENT_THREADS = 128
 
 
 def decline(sweep) -> str | None:
-    """Why the sweep's paired worlds cannot be split into components, or ``None`` when they can: the laws
-    components implement (``route_table.CAPABILITIES``), then their fit."""
-    return capable("components", sweep.laws.set) or first_failed(
+    """Why the sweep's paired worlds cannot be split into components, or ``None`` when they can: their fit (each
+    world's rows are qualified at run time, a mimic's among its articulation's)."""
+    return first_failed(
         (
             (sweep.routes.case == "K5", "Components need the paired factor-coordinate sweep (case K5)."),
             (

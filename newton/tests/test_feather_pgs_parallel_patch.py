@@ -1234,10 +1234,10 @@ class TestTierSweeps(unittest.TestCase):
         assert_budget_reaches_the_fixed_point(self, gaps[2], gaps[2000], float(np.max(np.abs(serial))))
 
 
-def _routes(case=None, native=True, **pins):
+def _routes(case=None, native=True, eliminates=False, **pins):
     """A route table whose class ``case`` holds (``None``: no earlier case claims it), on a device that runs the
-    cases' native bodies or (``native=False``) on the CPU."""
-    routes = RouteTable(pins, native=native)
+    cases' native bodies or (``native=False``) on the CPU, with or without the bilateral pre-elimination."""
+    routes = RouteTable(pins, native=native, eliminates=eliminates)
     if case is not None:
         routes.taken(case)
         routes.claim(case)
@@ -1282,7 +1282,7 @@ class TestTierRule(unittest.TestCase):
         for changes, reason in (
             # Packed factors (a single tree) or the sparse diagonal (a star) leave no matrix-free sweep.
             ({"mf_sweeps": False}, "No matrix-free sweep"),
-            ({"factor": SimpleNamespace(eliminates=True)}, "pre-elimination"),
+            ({"routes": _routes(eliminates=True)}, "pre-elimination"),
             ({"routes": _routes("K5")}, "case K5"),
             ({"forest": SimpleNamespace(has_free_rigid_bodies=False, has_non_free_articulations=True)}, "case K4"),
             ({"forest": SimpleNamespace(has_free_rigid_bodies=True, has_non_free_articulations=False)}, "case K4"),

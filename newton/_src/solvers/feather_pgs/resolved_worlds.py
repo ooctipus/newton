@@ -658,7 +658,7 @@ def decline(solver) -> str | None:
             (not laws.compliance, "Material contacts are outside the rigid contact law it classifies."),
             (getattr(solver.placement, "keyed_rows", None) is None, "Keyed rows own the contact rows."),
             (
-                laws.plain
+                not laws.warm_start
                 and not laws.regularized
                 and not laws.velocity_limits
                 and solver.routes.case not in ("K1", "K2")

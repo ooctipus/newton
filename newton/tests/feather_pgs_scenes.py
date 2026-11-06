@@ -1104,6 +1104,7 @@ def hand(
     worlds: int = 2,
     lift_velocity_limit: float | None = None,
     contact_matching: str | None = None,
+    mimic: bool = False,
 ) -> Scene:
     """A 17-coordinate hand (a ``z`` lift under four 4-joint fingers) balancing a free 0.5 kg cube on its fingertips.
 
@@ -1113,7 +1114,8 @@ def hand(
     world ``w``. The cube touches only the fingertips, so hand and cube are one
     coupled component without matrix-free rows. The last world sets its cube
     on the ground 0.3 m aside instead: there the hand touches nothing and the
-    cube only the ground. ``lift_velocity_limit`` [m/s] bounds the lift's speed, which its drive's step passes.
+    cube only the ground. ``lift_velocity_limit`` [m/s] bounds the lift's speed, which its drive's step passes;
+    with ``mimic`` the first finger's second joint follows its first.
     """
     cube, tip, link, palm_z = 0.05, 0.008, 0.03, 0.05
     lift = {} if lift_velocity_limit is None else {"velocity_limit": lift_velocity_limit}
@@ -1161,6 +1163,8 @@ def hand(
                 cfg=_cfg(mu=0.8, density=0.0, group=SELF),
             )
         builder.add_articulation(joints)
+        if mimic:
+            builder.add_constraint_mimic(joint0=joints[3], joint1=joints[2], coef0=0.0, coef1=1.0)
         _free_box(builder, (0.0, 0.0, cube_z), half=cube, mass=0.5, mu=0.8)
         replicated = _replicate(builder, worlds, _cfg(mu=0.8))
         # The last joint is the last world's cube: set it on the ground beside the hand.
@@ -1176,6 +1180,8 @@ def hand(
             _set_targets(model, control, {world * joints + 1: 0.001 + press + 0.001 * world for world in range(worlds)})
 
     name = "hand" if lift_velocity_limit is None else "hand_lift_velocity_limit"
+    if mimic:
+        name = f"{name}_mimic"
     if contact_matching is not None:
         name = f"{name}_{contact_matching}"
     return Scene(

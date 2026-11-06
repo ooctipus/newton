@@ -31,7 +31,6 @@ from .keyed_row_layout import prefix_kernel
 from .keyed_row_layout import topology_plan as direct_topology_plan
 from .law_source import law_preludes
 from .prefix_rows import LAW, VELOCITY_LAW
-from .route_table import capable
 from .row_build import contact_torsion_mu
 from .row_inputs import ParallelRowInputs, RowArgument
 from .row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
@@ -482,13 +481,12 @@ class KeyedRows:
         return [self.data, self.law]
 
 
-def create_owner(solver):
-    """Admit one bounded complete numerical law for the rows of the in-kernel parallel tiers' class (case K4): the
-    laws keyed rows implement (``route_table.CAPABILITIES``), then their fit."""
-    supported = solver.routes.case == "K4" and capable("keyed_rows", solver.laws.set) is None
-    if not supported:
-        return None
+def create_owner(solver) -> tuple[KeyedRows | None, str]:
+    """The keyed rows of the in-kernel parallel tiers' class (case K4) where their layout keys its topology
+    (:func:`.keyed_row_layout.topology_plan`), and why or why not."""
+    if solver.routes.case != "K4":
+        return None, "Keyed rows need the Jacobi tiers (routes.sweep.tiers)."
     try:
-        return KeyedRows(solver)
-    except ValueError:
-        return None
+        return KeyedRows(solver), "Admitted: the in-kernel parallel sweep builds keyed rows for its bounded worlds."
+    except ValueError as error:
+        return None, f"The keyed layout does not key the class: {error}."

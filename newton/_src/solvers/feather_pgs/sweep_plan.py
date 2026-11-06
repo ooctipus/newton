@@ -47,7 +47,6 @@ from .field_group import Field, FieldGroup
 from .forest_plan import row_support
 from .friction_patches import patch_routes
 from .kernel_template import SweepTier
-from .route_table import capable
 from .solve_policy import SolvePolicy, SolveReadoutRecord
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport, row_supports
@@ -150,8 +149,7 @@ class Sweep:
         self.paired_response_candidate_sizes = frozenset(
             size
             for size in self.forest.size_groups
-            if not self.factor.eliminates
-            and size >= _PAIRED_MIN_DOF
+            if size >= _PAIRED_MIN_DOF
             and size + 6 <= 32
             and size not in self.forest.diagonal_mass_sizes
             and self.placement.dense_max_constraints > _PAIRED_MIN_ROWS
@@ -234,8 +232,6 @@ class Sweep:
             and self.options.enable_contact_friction
             and not self.options.enable_joint_velocity_limits
             and not self.options.pgs_warmstart
-            and not self.options.pgs_warmstart
-            and not self.factor.eliminates
             and not self.forest.has_free_rigid_bodies
             and self.laws.mimic_count == 0
             and self.laws.link_count == 0
@@ -323,33 +319,15 @@ class Sweep:
         self.placement.sparse_max_row_support = None
         # Case K1, a single tree.
         velocity_candidate = self.options.enable_joint_velocity_limits and not self.forest.has_free_rigid_bodies
-        declined = (
-            self.routes.taken("K1")
-            or capable("packed", self.laws.set)
-            or first_failed(
+        declined = self.routes.taken("K1") or first_failed(
+            (
+                (self.pins.get("storage") != "dense", "A test pin keeps dense storage (storage='dense')."),
+                (not self.pins.get("tiers"), "A test pin builds the Jacobi tiers (tiers) on dense storage."),
+                (self.factor.parallel_drives, "Drive topology is not supported by native sparse factors."),
                 (
-                    (
-                        self.pins.get("storage") != "dense",
-                        "A test pin keeps dense storage (storage='dense').",
-                    ),
-                    (not self.pins.get("tiers"), "A test pin builds the Jacobi tiers (tiers) on dense storage."),
-                    (
-                        self.factor.parallel_drives,
-                        "Drive topology is not supported by native sparse factors.",
-                    ),
-                    (
-                        not self.options.enable_joint_velocity_limits or velocity_candidate,
-                        "Velocity-limit rows need worlds without free bodies on native sparse factors.",
-                    ),
-                    (
-                        not self.options.pgs_warmstart or not self.forest.has_free_rigid_bodies,
-                        "PGS warm starting with free rigid bodies requires the ordinary factor/row composition.",
-                    ),
-                    (
-                        not self.laws.mimic_count or velocity_candidate,
-                        "Mimic rows require the sparse velocity-row composition.",
-                    ),
-                )
+                    not self.laws.mimic_count or velocity_candidate,
+                    "Mimic rows require the sparse velocity-row composition.",
+                ),
             )
         )
         if declined is not None:
@@ -650,9 +628,7 @@ class Sweep:
             )
         self.paired_response_primary_size = response_pair[0] if response_pair is not None else None
         self.paired_response_secondary_size = response_pair[1] if response_pair is not None else None
-        self.routes.reasons["K5"] = ("No paired response." if response_pair is None else None) or capable(
-            "paired_factor", laws
-        )
+        self.routes.reasons["K5"] = "No paired response." if response_pair is None else None
         self.paired_factor_coordinates = self.routes.claim("K5", self.routes.reasons["K5"] is None)
         # Patch contacts are units of one row, or three (four with a spin row) when they own an anchor;
         # the factor sweep walks them with the generic path's row order and
@@ -705,10 +681,6 @@ class Sweep:
             (
                 (self.placement.mf_sweeps, "No matrix-free sweep runs whose dense rows the tiers could take."),
                 (pinned is None or bool(pinned), "A test pin builds no tier (tiers=0)."),
-                (
-                    not self.factor.eliminates,
-                    "Bilateral pre-elimination corrects the packed rows, which the tiers walk anew.",
-                ),
                 (
                     bool(pinned) or (self.forest.has_free_rigid_bodies and self.forest.has_non_free_articulations),
                     "The tiers serve a tree beside a free body (case K4).",
@@ -874,7 +846,7 @@ class Sweep:
 
     def _select_paired_response(self) -> tuple[int, int, np.ndarray] | None:
         """Select one complete robot/free-body response pair per world."""
-        if self.routes.case in ("K1", "K2") or self.factor.eliminates or 6 not in self.forest.size_groups:
+        if self.routes.case in ("K1", "K2") or 6 not in self.forest.size_groups:
             return None
 
         response_dofs = self.forest.response_dof_count
