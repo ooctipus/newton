@@ -534,8 +534,8 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     # Stage 4: the rows. The resolved-world claim, the row pass (each family's slots and seeds), the status and the
     # overflow warning; then the diagonals, the one writer (every walking class's: it walks the rows into their
     # placement's sink after the row pass, each row's rhs by the row law; the free bodies' writer runs in the row pass,
-    # after their families' slots, beside the topology part),
-    # the patches' link once every contact row's records are written, and the sweep's claims, which read the rows.
+    # after their families' slots, beside the topology part), the patches' link once every contact row's records are
+    # written, and the sweep's claims, which read the rows.
     resolved = sweep.resolved_worlds_owner
 
     def classify_resolved_worlds(step):

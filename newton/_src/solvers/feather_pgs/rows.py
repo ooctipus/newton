@@ -45,8 +45,8 @@ from .field_group import Field, FieldGroup, SolverArrays
 from .forest_plan import ForestPlan, RowLaw
 from .friction_patches import _FrictionPatchState as FrictionPatchState
 from .friction_patches import patch_row_law
-from .joint_table import bind as bind_joint_table
 from .joint_table import FreeBodies, bind_free_bodies
+from .joint_table import bind as bind_joint_table
 from .kernel_template import KernelTemplate, items, params
 from .route_table import Laws
 from .row_kernels import (
@@ -109,7 +109,6 @@ def _holds_contact_rows(contacts: Contacts | None) -> bool:
         and getattr(contacts, "rigid_contact_count", None) is not None
         and contacts._rigid_contact_rows > 0
     )
-
 
 
 def velocity_prescale_launch(articulation_start: np.ndarray, *, joint_count: int, cuda: bool) -> tuple[int, int]:

@@ -760,8 +760,8 @@ def catalogue() -> list:
 
 
 class Capture:
-    """The rows a step builds: whether the class holds free bodies' rows (their writers stage with free bodies,
-    :meth:`.rows.RowLaws.write_contacts`), then the step's last values."""
+    """The rows a step builds: whether the class holds free bodies' rows (their writer stages with free bodies,
+    :meth:`.rows.RowLaws.write_free_bodies`), then the step's last values."""
 
     def __init__(self, solver):
         self.solver = solver
