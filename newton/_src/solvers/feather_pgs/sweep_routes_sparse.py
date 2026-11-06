@@ -67,7 +67,7 @@ from .sweep import (
     impulse_seed,
     indent,
     material_arguments,
-    row_visit,
+    row_step,
     unit_held_loads,
     velocity_limit_pass,
     weight_arguments,
@@ -382,53 +382,6 @@ def warm_start_seed(op: SparseFactor, pad: str) -> str:
     )
 
 
-def ordinary_rows(rows: StagedRows, op: SparseFactor, laws: RowLaws, *, skip_velocity_limits: bool, pad: str) -> str:
-    """Row ``i``'s visit and update under the shared row law (:func:`.sweep.row_visit`).
-
-    The friction gate, then the first tangent of a pair on its ring's disk; the residual reduces the pair's
-    second-tangent term and coupling with it (:func:`.sweep.row_sums`). Velocity-limit rows wait for the
-    last-word pass (``skip_velocity_limits``). Under contact torsion the rows staged as spin rows, a friction triple's
-    (:class:`.sweep.StagedRows`), are the triple phase's: the loop skips them and carries none of the triple's code. The
-    first lane stores the impulses after every lane has read them.
-    """
-    lanes = rows.lanes
-    # The row's and its pair's impulses are read once, at admission, before the reduction.
-    held = {"i": "row_impulse", "sib": "pair_impulse"}
-    ctx = RowContext(
-        row="i",
-        kind="row_type",
-        operator=op,
-        diagonal=rows.diagonal("denom"),
-        load=lambda row: held.get(row) or rows.load(row),
-        store=rows.store,
-        rhs=rows.rhs_of,
-        mu=rows.mu,
-        weight=rows.weight,
-        eps=rows.eps,
-        parent="parent",
-        ring_load=rows.ring_load,
-        lanes=lanes,
-        fenced=False,
-    )
-    head = [
-        f"int row_type = {rows.kind('i')};",
-        f"if (row_type == {VELOCITY_LIMIT}) continue;" if skip_velocity_limits else "",
-        # A friction triple's rows are the triple phase's (contact torsion).
-        f"if (row_type == {TORSION}) continue;" if laws.torsion else "",
-    ]
-    visit = row_visit(
-        ctx,
-        dataclasses.replace(laws, torsion=False),
-        parent=rows.parent("i"),
-        check="denom",
-        declare=f"float denom = {rows.diag('i')};",
-        hold=f"const float row_impulse = {rows.load('i')};\nfloat pair_impulse = 0.0f;",
-        keep_next="pair_impulse",
-        pad=pad,
-    )
-    return indent("\n".join(line for line in head if line), pad) + "\n" + visit
-
-
 # ---------------------------------------------------------------------------------------------------------------------
 # Contact units: a contact normal and its friction pair on their Gram block, by the row law
 # ---------------------------------------------------------------------------------------------------------------------
@@ -462,10 +415,10 @@ def contact_units(sweep: SparseSweep, rows: StagedRows, op: SparseFactor, laws: 
     sweep); each coordinate takes the sum of the normal's, the first tangent's and the second tangent's changes, added
     once. With ``linked`` a pass at entry stores each anchor's other ring members, at most three, behind
     its record in the order the pair update pools them (-1: a longer ring, which keeps the walk). A row the guards
-    decline keeps the ordinary update.
+    decline keeps the row step (:func:`.sweep.row_step`).
 
     Under contact torsion a contact with a spin row is a friction triple, its pair staged as spin rows
-    (:class:`.sweep.StagedRows`): the guards decline it, its normal takes the ordinary update and the triple phase its pair
+    (:class:`.sweep.StagedRows`): the guards decline it, its normal takes the row step and the triple phase its pair
     and spin row (:func:`triple_phase`). With ``linked`` the entry pass stores a triple's ring members too, which its
     visit pools.
     """
@@ -710,7 +663,7 @@ def sparse_staging(max_constraints: int, max_world_dofs: int, max_row_dofs: int,
 
 def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     """The sweep's native body: staging and setup, then per sweep the active scan, the row loop (contact unit, then
-    the ordinary update), the friction triples (contact torsion), the last-word velocity-limit pass and the exit;
+    the row step), the friction triples (contact torsion), the last-word velocity-limit pass and the exit;
     then the publication."""
     M, D, S, L = sweep.rows, sweep.dofs, sweep.support, sweep.lanes
     lanes = Lanes(L)
@@ -739,7 +692,11 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
         scan.append(active_scan(sweep, op, "        "))
     if sweep.triplets:
         scan.append("        int consumed_tangent = -1;")
-    update = ordinary_rows(rows, op, laws, skip_velocity_limits=sweep.velocity_limits, pad=body_pad)
+    # Velocity-limit rows wait for the last-word pass; under contact torsion the triples are the triple phase's.
+    admission = f"if (row_type == {VELOCITY_LIMIT}) continue;" if sweep.velocity_limits else ""
+    update = row_step(
+        rows, op, laws, end="count", admission=admission, held=True, triple_phase=sweep.torsion, pad=body_pad
+    )
     if sweep.active:
         row_loop = f"""        for (int word = 0; word < (count + 31) / 32; ++word) {{
             unsigned pending = s_selected_words[word];

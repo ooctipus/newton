@@ -1485,6 +1485,75 @@ def _header_consume(op, row: str, end: str, indent: str) -> str:
     )
 
 
+def row_step(
+    rows: RowStore,
+    op,
+    laws: RowLaws,
+    *,
+    end: str,
+    admission: str = "",
+    held: bool = False,
+    triple_phase: bool = False,
+    metric: str | None = None,
+    pad: str = "            ",
+) -> str:
+    """Row ``i``'s step in a row loop over a store's rows ``[0, end)``: its kind read from the store, the schedule's
+    skips, then the shared visit (:func:`row_visit`): admission, residual and row law. Every row loop of the sparse
+    and matrix-free sweeps runs this text; three data choices are all that differ:
+
+    - ``held``: the row's and its pair's impulses are read at admission into registers (``row_impulse``,
+      ``pair_impulse``) and the law reads them there; the first lane's stores then need no fence before the applies
+      (the sparse sweep's rows);
+    - the store's reciprocal: a store that keeps the diagonals' reciprocals steps by multiplying, otherwise by
+      dividing (:meth:`RowStore.diagonal`): a rounding difference kept as data;
+    - ``triple_phase``: a friction triple's rows are solved in a phase of their own after the loop (the store restaged
+      its pair as spin rows, :attr:`StagedRows.triples`), and the loop's visit carries none of the triple's code;
+      otherwise a spin row is solved with its friction pair in the loop (the store's :meth:`RowStore.spin_of`), its
+      metric cached for the launch with ``metric`` (the law :func:`friction_metric_law` declared,
+      :func:`friction_metric_stage`).
+
+    A spin row is skipped first (solved with its pair, here or in the triple phase), then ``admission``, the
+    schedule's own skips (velocity limits, which the last word solves).
+    """
+    registers = {"i": "row_impulse", "sib": "pair_impulse"} if held else {}
+    ctx = RowContext(
+        row="i",
+        kind="row_type",
+        operator=op,
+        diagonal=rows.diagonal("denom"),
+        load=lambda row: registers.get(row) or rows.load(row),
+        store=rows.store,
+        rhs=rows.rhs_of,
+        mu=rows.mu,
+        weight=rows.weight,
+        eps=rows.eps,
+        parent="parent",
+        ring_load=rows.ring_load,
+        lanes=rows.lanes,
+        spin_row=lambda contact: rows.spin_of(contact, end),
+        fenced=not held,
+        **({"triple_law": f"{metric}(parent, "} if metric is not None else {}),
+    )
+    hold = {"hold": "const float row_impulse = " + rows.load("i") + ";\nfloat pair_impulse = 0.0f;"} if held else {}
+    head = [
+        f"int row_type = {rows.kind('i')};",
+        # A spin row is solved with its friction pair (torsion).
+        f"if (row_type == {TORSION}) continue;" if laws.torsion else "",
+        admission,
+    ]
+    visit = row_visit(
+        ctx,
+        dataclasses.replace(laws, torsion=False) if triple_phase else laws,
+        parent=rows.parent("i"),
+        check="denom",
+        declare=f"float denom = {rows.diag('i')};",
+        keep_next="pair_impulse" if held else None,
+        pad=pad,
+        **hold,
+    )
+    return indent("\n".join(line for line in head if line), pad) + "\n" + visit
+
+
 def rows_block(
     rows: WorldRows,
     op,
@@ -1496,10 +1565,11 @@ def rows_block(
     pad: str = "        ",
 ) -> str:
     """The Gauss-Seidel loop over a world's rows of one class ``[0, end)`` in slot order (:class:`WorldRows`): the
-    dense rows on packed rows (:class:`.response_operator.SparseFactor`, to ``m_dense``), the free bodies' on their
-    ``Z`` (:func:`.sweep_routes.free_body_rows`, to ``mf_contact_end``). The free bodies' loop is software-pipelined:
-    each row's header word and this lane's entry of its ``Z`` load a row ahead (``pre_meta``, ``pre_z``), and the
-    visit takes them as ``meta`` and ``cur_z``, the visited row's entry its operator reads.
+    dense rows on packed rows (:class:`.response_operator.SparseFactor`, to ``m_dense``), each by the row step
+    (:func:`row_step`), the free bodies' on their ``Z`` (:func:`.sweep_routes.free_body_rows`, to
+    ``mf_contact_end``). The free bodies' loop is software-pipelined: each row's header word and this lane's entry of
+    its ``Z`` load a row ahead (``pre_meta``, ``pre_z``), and the visit takes them as ``meta`` and ``cur_z``, the
+    visited row's entry its operator reads.
 
     ``admission`` holds the block's own skips, run after the row's kind is read. A dense friction pair's second
     tangent shares its first tangent's entries: the first tangent's residual reduces the pair's terms with its own
@@ -1511,35 +1581,20 @@ def rows_block(
     launch, at its first loaded visit (:func:`friction_metric_stage`).
     """
     inner = pad + "    "
-    header = rows.header
-    cached = {} if metric is None else {"triple_law": f"{metric}(parent, "}
     if end is None:
-        end = "mf_contact_end" if header else "m_dense"
-    if header:
-        diagonal = Diagonal(inverse=lambda row: "mf_diag" if row == "i" else rows.inverse(row))
-        kind, check, declare = "mf_rt", "mf_diag", ""
-        head = _header_consume(op, "i", end, inner)
-        parent = rows.parent_of("packed_tp")
-        rhs = lambda row: "__int_as_float(meta.z)" if row == "i" else rows.rhs_of(row)  # noqa: E731
-        prologue = (
-            f"{pad}int4 pre_meta;\n{pad}float pre_z = 0.0f;\n"
-            f"{pad}if ({end} > 0) {{\n{_header_load(op, '0', pad + '    ')}\n{pad}}}\n"
-        )
-    else:
-        diagonal = Diagonal(lambda row: "denom" if row == "i" else rows.diag(row))
-        kind, check, declare = "row_type", "denom", f"float denom = {rows.diag('i')};"
-        head = f"{inner}int row_type = {rows.kind('i')};"
-        parent = rows.parent("i")
-        rhs = rows.rhs_of
-        prologue = ""
+        end = "mf_contact_end" if rows.header else "m_dense"
+    if not rows.header:
+        step = row_step(rows, op, laws, end=end, admission=admission, metric=metric, pad=inner)
+        return f"{pad}for (int i = 0; i < {end}; i++) {{\n{step}\n{pad}}}"
+    cached = {} if metric is None else {"triple_law": f"{metric}(parent, "}
     ctx = RowContext(
         row="i",
-        kind=kind,
+        kind="mf_rt",
         operator=op,
-        diagonal=diagonal,
+        diagonal=rows.diagonal("mf_diag"),
         load=rows.load,
         store=rows.store,
-        rhs=rhs,
+        rhs=lambda row: "__int_as_float(meta.z)" if row == "i" else rows.rhs_of(row),
         mu=rows.mu,
         weight=rows.weight,
         parent="parent",
@@ -1547,16 +1602,21 @@ def rows_block(
         lanes=rows.lanes,
         eps=rows.eps,
         spin_row=lambda contact: rows.spin_of(contact, end),
-        **({"contact_kinds": (CONTACT,), "owned": False} if header else {}),
+        contact_kinds=(CONTACT,),
+        owned=False,
         **cached,
     )
     body = [
-        head,
+        _header_consume(op, "i", end, inner),
         # A spin row is solved with its friction pair (torsion).
-        f"{inner}if ({kind} == {TORSION}) continue;" if laws.torsion else "",
+        f"{inner}if (mf_rt == {TORSION}) continue;" if laws.torsion else "",
         indent(admission, inner) if admission else "",
-        row_visit(ctx, laws, parent=parent, check=check, declare=declare, pad=inner),
+        row_visit(ctx, laws, parent=rows.parent_of("packed_tp"), check="mf_diag", declare="", pad=inner),
     ]
+    prologue = (
+        f"{pad}int4 pre_meta;\n{pad}float pre_z = 0.0f;\n"
+        f"{pad}if ({end} > 0) {{\n{_header_load(op, '0', pad + '    ')}\n{pad}}}\n"
+    )
     return (
         f"{prologue}{pad}for (int i = 0; i < {end}; i++) {{\n" + "\n".join(line for line in body if line) + f"\n{pad}}}"
     )
