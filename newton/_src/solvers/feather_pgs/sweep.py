@@ -901,7 +901,6 @@ class UnitZ(ResponseOperator):
     cached: bool = False
     magnitudes: bool = False
     fused_pair_apply: bool = False
-    name = "unit"
 
     def terms(self, out: str, rhs: str, *, whole: bool) -> str:
         if not self.magnitudes:

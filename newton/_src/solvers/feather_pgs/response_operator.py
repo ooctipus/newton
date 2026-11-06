@@ -124,7 +124,6 @@ class ResponseOperator:
     (:class:`.sweep.Diagonal`), not the operator's.
     """
 
-    name = "response"
     applies = True
     """Whether :meth:`apply` writes state the row's lanes share (the velocity, a maintained residual), so the lanes
     synchronize after it. An impulse-space operator without apply leaves every lane its own copy of the impulses."""
@@ -410,8 +409,6 @@ class TransposedResponse(ResponseOperator):
         if self.walked is None:
             raise ValueError("the transposed response holds walked rows")
 
-    name = "transposed_response"
-
     @property
     def stride(self) -> int:
         return self.capacity + 4
@@ -592,7 +589,6 @@ class SparseFactor(ResponseOperator):
     fused_pair_apply: bool = True
     """A row's apply takes its friction pair's second tangent too, written back once (:meth:`apply_pair`); without it
     the second tangent applies on its own first (:meth:`apply_row`), then the row (:meth:`apply`)."""
-    name = "sparse_factor"
 
     @property
     def width(self) -> int:
