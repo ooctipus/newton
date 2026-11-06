@@ -30,7 +30,7 @@ import numpy as np
 import warp as wp
 
 from ...core.execution import Beside
-from ...core.memory import Device, device
+from ...core.memory import L1_LINE_BYTES, Device, device
 from ...sim import ModelFlags
 from . import cached_state_binding
 from .class_plan import ClassPlan
@@ -125,7 +125,11 @@ class Capacities:
         if free_bodies and not run:
             dense += free
             speed_rows = RIGID_SPEED_ROWS * int(np.max(forest.free_rigid_per_world, initial=0))
-            free = max(speed_rows if speed_limits else 0, 1)
+            speed_rows = max(speed_rows if speed_limits else 0, 1)
+            # The line ends on a whole L1 line, so every world's line starts on one (a line of 258 rows split each
+            # world's writes across lines: allegro's keyed limit prefix ran 2x): the free bodies' rows fill it.
+            line = L1_LINE_BYTES // 4
+            free = -(-(dense + speed_rows) // line) * line - dense
         return cls(
             dense_rows=dense,
             free_body_rows=free,
