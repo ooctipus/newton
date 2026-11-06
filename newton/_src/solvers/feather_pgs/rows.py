@@ -183,9 +183,9 @@ def _prefix_warp_kernel(size: int, groups: int, family: str, mimics: int = 0) ->
         extra = "            law.mimic_slot.data[mimic] = slot;\n"
     else:
         source, extra = f"({kind} << {int(UNIT_SHIFT)}) | (2 * (first_dof + d0) + (w0 < 0.0f ? 1 : 0))", ""
-    # The row's seed: its unit source, the coordinate's side, in the units' own rows.
-    sink = f"""{extra}            if (slot < support.units.shape[1])
-                support.units.data[(size_t)prefix_line * support.units.shape[1] + slot] = {source};"""
+    # The row's seed: its unit source, the coordinate's side, in the units' own rows. The sink runs on an accepted slot
+    # (below the capacity), and the unit sources are the capacity wide (Placement.hold_units).
+    sink = f"""{extra}            support.units.data[(size_t)prefix_line * support.units.shape[1] + slot] = {source};"""
     if family == "mimics":
         candidates = prefix_rows.mimics(mimics, "law.")
     elif family == "velocity":
