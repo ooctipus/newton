@@ -453,10 +453,11 @@ class TestExitLaw(unittest.TestCase):
                     self.fail(f"{kernel.key} {kwargs}: the readout records no exit or more than one")
             checked[name] += 1
         # The admitted combinations per factory: a factory gate that starts refusing some must not shrink the census.
+        # The sparse sweep composes velocity limits with the active scan and units, and a lane group with any of them.
         self.assertEqual(
             checked,
             {
-                "sparse": 40,
+                "sparse": 128,
                 "sparse_lanes": 16,
                 "mf_gs": 48,
                 "paired": 4,
