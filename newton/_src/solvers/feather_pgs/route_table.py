@@ -38,8 +38,6 @@ class Laws:
     """Bilateral rows are pre-eliminated through a Schur complement."""
     mimic: bool
     """The model has mimic rows."""
-    cuda: bool
-    """The device is CUDA, which runs the native bodies written for CUDA only (``cuda_native``)."""
 
     PLAIN = "no warm start or bilateral pre-elimination"
 
@@ -67,7 +65,6 @@ class Laws:
             warm_start=bool(options.pgs_warmstart),
             preelimination=bool(preelimination),
             mimic=bool(laws.mimic_count),
-            cuda=bool(model.device.is_cuda),
         )
 
     def record(self) -> dict:
@@ -77,24 +74,19 @@ class Laws:
 
 # Each requirement a placement or schedule may hold: (test of the laws, what it requires).
 _REQUIREMENTS = {
-    "cuda": (lambda laws: laws.cuda, "a CUDA device (their native bodies are written for CUDA only)"),
     "no_mimic": (lambda laws: not laws.mimic, "no mimic rows"),
     "no_preelimination": (lambda laws: not laws.preelimination, "no bilateral pre-elimination"),
 }
 
 CAPABILITIES = {
     # The packed placement of a single tree: native sparse factors and their sweep.
-    "packed": ("cuda", "no_preelimination"),
+    "packed": ("no_preelimination",),
     # The paired factor's sweep in factor coordinates (one articulation and one free body per world).
-    "paired_factor": ("cuda", "no_preelimination"),
+    "paired_factor": ("no_preelimination",),
     # Its runtime claim: independent articulation and free-body components per world.
-    "components": ("cuda", "no_preelimination", "no_mimic"),
-    # The Jacobi tiers of dense trees beside a free body (case K4), whose sweep budget a build fixes.
-    "tiers": ("cuda",),
+    "components": ("no_preelimination", "no_mimic"),
     # The keyed in-kernel row producer of the tiers.
-    "keyed_rows": ("cuda", "no_preelimination", "no_mimic"),
-    # The colored mapping of the free-body rows' contact units.
-    "colored": ("cuda",),
+    "keyed_rows": ("no_preelimination", "no_mimic"),
 }
 """The laws each placement or schedule implements, by owner: what its admission reads through :func:`capable`."""
 
@@ -102,9 +94,7 @@ _LABELS = {
     "packed": "Native sparse factors need",
     "paired_factor": "The factor-coordinate sweep needs",
     "components": "Components need",
-    "tiers": "The Jacobi tiers need",
     "keyed_rows": "Keyed rows need",
-    "colored": "Colored units need",
 }
 
 
@@ -134,15 +124,22 @@ class RouteTable:
     budget) after :meth:`taken`, which says why an earlier case holds the class, :meth:`claim` gives the class to
     the first that fits, and each writes its case's reason. The producers and the runtime claims read :attr:`case`;
     once they have decided, :meth:`finish` returns the route, which the step's spec holds (:class:`.step_plan.StepSpec`).
-    The test pin ``placement="general"`` keeps every class general.
+    The test pin ``placement="general"`` keeps every class general, and so does a device without the cases' native
+    bodies (``native``: they are written for CUDA; the CPU runs the general placement).
     """
 
-    def __init__(self, pins):
+    def __init__(self, pins, *, native: bool):
         self.case = "K6"
         """The case holding the class: a key of :data:`CASES`, or ``"K6"`` (general) while none claims it."""
         self.reasons: dict[str, str | None] = {}
         """Why each asked case holds the class or does not, written by its owner."""
-        self._general = pins.get("placement") == "general"
+        self._general = (
+            "A test pin keeps the general placement (placement='general')."
+            if pins.get("placement") == "general"
+            else None
+            if native
+            else "The device runs the general placement: the cases' native bodies are written for CUDA."
+        )
         self._asked = -1
 
     def taken(self, case: str) -> str | None:
@@ -152,7 +149,7 @@ class RouteTable:
             raise RuntimeError(f"Case {case} is asked after a later case; owners are asked in CASES order.")
         self._asked = order
         if self._general:
-            return "A test pin keeps the general placement (placement='general')."
+            return self._general
         if self.case != "K6":
             return f"The class is case {self.case}: {CASES[self.case]}."
         return None

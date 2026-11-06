@@ -154,7 +154,6 @@ class LawsProbe(SimpleNamespace):
             warm_start=options.pgs_warmstart,
             preelimination=False,
             mimic=bool(self.mimic_count),
-            cuda=True,
         )
 
 
@@ -171,7 +170,7 @@ def eligible_solver():
         pins={},
         factor=SimpleNamespace(parallel_drives=True, eliminates=False),
         placement=SimpleNamespace(),
-        routes=RouteTable({}),
+        routes=RouteTable({}, native=True),
         forest=forest,
         options=options,
         laws=LawsProbe(

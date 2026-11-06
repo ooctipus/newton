@@ -31,7 +31,6 @@ from ...core.memory import Place, arch_budget, device
 from . import (
     host_index,
     packed_rows,
-    route_table,
     sweep_levels,
     sweep_routes,
     sweep_routes_diag,
@@ -151,8 +150,7 @@ class Sweep:
         self.paired_response_candidate_sizes = frozenset(
             size
             for size in self.forest.size_groups
-            if model.device.is_cuda
-            and not self.factor.eliminates
+            if not self.factor.eliminates
             and size >= _PAIRED_MIN_DOF
             and size + 6 <= 32
             and size not in self.forest.diagonal_mass_sizes
@@ -231,8 +229,7 @@ class Sweep:
         self.placement.fused_diagonal_joint_limit_sizes = frozenset()
         self.placement.fused_diagonal_limit_dof_mask_host = np.zeros(model.joint_dof_count, dtype=np.int32)
         supported = bool(
-            model.device.is_cuda
-            and model.joint_dof_count > 0
+            model.joint_dof_count > 0
             and self.options.enable_joint_limits
             and self.options.enable_contact_friction
             and not self.options.enable_joint_velocity_limits
@@ -704,22 +701,18 @@ class Sweep:
         """
         pinned = self.pins.get("tiers")
         self.placement.ink_rows, self.placement.ink_sizes = 0, None
-        reason = (
-            self.routes.taken("K4")
-            or capable("tiers", self.laws.set)
-            or first_failed(
+        reason = self.routes.taken("K4") or first_failed(
+            (
+                (self.placement.mf_sweeps, "No matrix-free sweep runs whose dense rows the tiers could take."),
+                (pinned is None or bool(pinned), "A test pin builds no tier (tiers=0)."),
                 (
-                    (self.placement.mf_sweeps, "No matrix-free sweep runs whose dense rows the tiers could take."),
-                    (pinned is None or bool(pinned), "A test pin builds no tier (tiers=0)."),
-                    (
-                        not self.factor.eliminates,
-                        "Bilateral pre-elimination corrects the packed rows, which the tiers walk anew.",
-                    ),
-                    (
-                        bool(pinned) or (self.forest.has_free_rigid_bodies and self.forest.has_non_free_articulations),
-                        "The tiers serve a tree beside a free body (case K4).",
-                    ),
-                )
+                    not self.factor.eliminates,
+                    "Bilateral pre-elimination corrects the packed rows, which the tiers walk anew.",
+                ),
+                (
+                    bool(pinned) or (self.forest.has_free_rigid_bodies and self.forest.has_non_free_articulations),
+                    "The tiers serve a tree beside a free body (case K4).",
+                ),
             )
         )
         if reason is None:
@@ -1045,7 +1038,7 @@ class Sweep:
                 capable = sweep_units.capable_worlds(
                     self.forest.free_rigid_per_world, self.placement.mf_max_constraints, rule
                 )
-            colored = capable.size > 0 and route_table.capable("colored", self.laws.set) is None
+            colored = bool(model.device.is_cuda and capable.size > 0)
             mf_gs_options = {
                 "pitch": self.placement.row_pitch,
                 "has_dense_velocity_limit_rows": self.options.enable_joint_velocity_limits,

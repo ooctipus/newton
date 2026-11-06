@@ -500,7 +500,7 @@ class SolverFeatherPGS(SolverBase):
 
         # Axis 3 of the route table, the placement case: the owners below, in precedence order (route_table.CASES),
         # each test their own fit once no earlier case holds the class, and the first that fits claims it.
-        self.routes = RouteTable(self._route_pins)
+        self.routes = RouteTable(self._route_pins, native=model.device.is_cuda)
         # The sweep: its owners claim the class below, in the route table's order.
         self.sweep = Sweep(
             model,

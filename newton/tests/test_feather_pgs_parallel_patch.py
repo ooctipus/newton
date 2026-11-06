@@ -1234,9 +1234,10 @@ class TestTierSweeps(unittest.TestCase):
         assert_budget_reaches_the_fixed_point(self, gaps[2], gaps[2000], float(np.max(np.abs(serial))))
 
 
-def _routes(case=None, **pins):
-    """A route table whose class ``case`` holds (``None``: no earlier case claims it)."""
-    routes = RouteTable(pins)
+def _routes(case=None, native=True, **pins):
+    """A route table whose class ``case`` holds (``None``: no earlier case claims it), on a device that runs the
+    cases' native bodies or (``native=False``) on the CPU."""
+    routes = RouteTable(pins, native=native)
     if case is not None:
         routes.taken(case)
         routes.claim(case)
@@ -1287,7 +1288,7 @@ class TestTierRule(unittest.TestCase):
             ({"forest": SimpleNamespace(has_free_rigid_bodies=True, has_non_free_articulations=False)}, "case K4"),
             ({"routes": _routes(placement="general")}, "general placement"),
             # The tiers' bodies are written for CUDA only (the CPU takes the general row).
-            ({"laws": SimpleNamespace(set=plain_laws(cuda=False))}, "CUDA device"),
+            ({"routes": _routes(native=False)}, "written for CUDA"),
             ({"pins": {"tiers": 0}}, "tiers=0"),
             (
                 {"inkernel_response_meta": lambda: (None, "A world has several articulations of size 6.")},
