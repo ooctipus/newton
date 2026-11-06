@@ -273,7 +273,6 @@ class TestRowTail(unittest.TestCase):
     def test_the_sibling_applies_before_the_row(self):
         update = self._update(_Rows())
         self.assertLess(update.index("v += Y(sib) * sib_delta;"), update.index("v += Y(row) * delta_impulse;"))
-        self.assertEqual(update.count("SYNC();"), 3)
 
     def test_a_fused_pair_apply_votes_and_applies_both_changes_at_once(self):
         update = self._update(_FusedRows())
@@ -292,9 +291,12 @@ class TestRowTail(unittest.TestCase):
         self.assertNotIn("sib", update)
         self.assertIn("v += Y(row) * delta_impulse;", update)
 
-    def test_an_unfenced_row_synchronizes_before_its_stores_and_after_its_apply(self):
-        update = self._update(_Rows(), fenced=False)
+    def test_an_owned_row_synchronizes_before_its_stores_and_after_its_apply(self):
+        """The applies read no impulse, so the first lane's stores need no barrier before them: the row's closing one
+        orders the stores before the next row's reads."""
+        update = self._update(_Rows())
         self.assertEqual(update.count("SYNC();"), 2)
+        self.assertLess(update.index("SYNC();"), update.index("if (lane == 0)"))
 
     def test_the_exit_law_quiets_changes_at_the_rounding_floor(self):
         """A change is loud beyond its row's bound at the old impulse, in its storage's form: phi against

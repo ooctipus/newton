@@ -511,7 +511,6 @@ SYNC();"""
             parent="parent",
             ring_load=ring_load,
             lanes=rows.lanes,
-            fenced=False,
             pair_law="UNIT_PAIR(0, ",
         )
         declare = f"""const int i = head + r;
@@ -625,7 +624,6 @@ def triple_phase(sweep: SparseSweep, rows: StagedRows, op: SparseFactor, laws: R
         parent="head",
         ring_load=rows.ring_load,
         lanes=rows.lanes,
-        fenced=False,
     )
     # A triple's normal is a contact whose next row is staged as a spin row; only a world whose staging found a
     # triple (world_triples, uniform over its lanes) scans for them.

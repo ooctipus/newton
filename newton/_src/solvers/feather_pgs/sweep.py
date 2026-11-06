@@ -612,10 +612,9 @@ class RowContext:
     same arguments after a leading ``int`` of its own (a cache of the triple's metric, :func:`cached_triple_law`)."""
     owned: bool = True
     """The row's first lane owns the stored impulses: the lanes synchronize before the stores (every lane has read
-    the impulses the first lane overwrites; :attr:`first_store`) and, with :attr:`fenced`, after them. Otherwise every
-    lane stores what it computed, as every other lane does, and reads only its own stores."""
-    fenced: bool = True
-    """The lanes also synchronize between the first lane's stores and the applies, which read no impulse."""
+    the impulses the first lane overwrites; :attr:`first_store`); the applies after them read no impulse, and the
+    row's closing barrier (:meth:`sync`) orders the stores before the next row's reads. Otherwise every lane stores
+    what it computed, as every other lane does, and reads only its own stores."""
     first_store: str | None = None
     """For rows that read their impulses from registers loaded before them (a contact unit's, :func:`contact_unit`),
     the condition under which a row's stores are the first since those loads: only these wait for the lanes. ``None``:
@@ -771,7 +770,6 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
             else "",
             "}",
         ]
-    lines.append(ctx.lanes.sync() if ctx.owned and ctx.fenced else "")
     if ctx.friction and laws.torsion and not _sibling_in_pair(ctx):
         # The spin row's change, ahead of the pair's (its own apply: the triple's rows apply one at a time).
         lines += [
@@ -1312,7 +1310,7 @@ def contact_unit(
         raise ValueError(
             "a contact unit holds its staged values in registers exactly where its first lane owns the stores"
         )
-    unit = dataclasses.replace(ctx, fenced=False, synced=False, first_store="r == 0" if check is None else None)
+    unit = dataclasses.replace(ctx, synced=False, first_store="r == 0" if check is None else None)
     if laws.torsion:
         # The unit's rows are the data's: a fourth row is the pair's spin row (:func:`spin_row`).
         unit = dataclasses.replace(unit, spin_row=lambda contact: f"(({rows}) > 3 ? ({contact}) + 3 : -1)")
@@ -1625,8 +1623,7 @@ def row_step(
     and matrix-free sweeps runs this text; three data choices are all that differ:
 
     - ``held``: the row's and its pair's impulses are read at admission into registers (``row_impulse``,
-      ``pair_impulse``) and the law reads them there; the first lane's stores then need no fence before the applies
-      (the sparse sweep's rows);
+      ``pair_impulse``) and the law reads them there (the sparse sweep's rows);
     - the store's reciprocal: a store that keeps the diagonals' reciprocals steps by multiplying, otherwise by
       dividing (:meth:`RowStore.diagonal`): a rounding difference kept as data;
     - ``triple_phase``: a friction triple's rows are solved in a phase of their own after the loop (the store restaged
@@ -1654,7 +1651,6 @@ def row_step(
         ring_load=rows.ring_load,
         lanes=rows.lanes,
         spin_row=lambda contact: rows.spin_of(contact, end),
-        fenced=not held,
         **({"triple_law": f"{metric}(parent, "} if metric is not None else {}),
     )
     hold = {"hold": "const float row_impulse = " + rows.load("i") + ";\nfloat pair_impulse = 0.0f;"} if held else {}
