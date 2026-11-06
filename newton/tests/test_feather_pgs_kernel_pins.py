@@ -285,6 +285,8 @@ def _dense_build_calls():
         yield "walk_rows.walked_rows_kernel", walk_rows.walked_rows_kernel.__wrapped__, block, {}
     # The sparse diagonal's one writer, the star's walker on the same classes.
     yield "walk_rows.slot_rows_kernel", walk_rows.slot_rows_kernel.__wrapped__, (True, tables), {}
+    # With velocity-limit rows: a key's joint row is one step to the world, into a slot.
+    yield "walk_rows.slot_rows_kernel", walk_rows.slot_rows_kernel.__wrapped__, (True, tables, True), {}
 
 
 def _solver_factory_calls():
@@ -312,6 +314,9 @@ def _solver_factory_calls():
     for batches in (False, True):
         kwargs = {"contact_units": True, "speculative_contact_batches": batches}
         factory = sweep_routes_diag.sparse_diagonal_kernel.__wrapped__
+        yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (64, 10, 9, _ARCH), kwargs
+        # The velocity-limit rows' last word.
+        kwargs = {**kwargs, "velocity_limits": True}
         yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (64, 10, 9, _ARCH), kwargs
     for skip_rows, limits, coordinates, components in itertools.product((0, 32), *([(False, True)] * 3)):
         kwargs = {

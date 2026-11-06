@@ -1640,6 +1640,27 @@ def cuda_groups() -> list:
                 SPARSE_DIAGONAL_TREE.but("sparse_diagonal_tree_warm_start", options=_WARM),
             ),
         ),
+        # The sparse diagonal gives its velocity-limit rows the last word, a key's in a slot as a contact's seed, and
+        # its fused position limits stay (case K2): a press whose drives pass the keys' and the arm's limits.
+        Group(
+            # The keys' and the arm's velocity rows beside the contacts: a row capacity past the default 32.
+            _physics(
+                scenes.keyboard(velocity_limit=0.01),
+                "patch",
+                16,
+                "velocity_limits",
+                dense_max_constraints=64,
+                **vlimits,
+            ),
+            ref,
+            (
+                # Scalar branches keep velocity-limited stars on the held tree's ordinary dynamics.
+                SPARSE_DIAGONAL.but(
+                    "sparse_diagonal_velocity_limits", expect={"held_tree.scalar_branches.enabled": False}
+                ),
+                SPARSE_DIAGONAL_TREE.but("sparse_diagonal_tree_velocity_limits"),
+            ),
+        ),
         # The paired factor sweep and its components start from the impulses the warm start carries (case K5).
         Group(
             _physics(scenes.hand(contact_matching="latest"), "patch", 16),

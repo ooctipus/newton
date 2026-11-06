@@ -1441,6 +1441,14 @@ def bind_slot_rows(solver) -> SlotRows:
 
 
 @wp.func
+def key_step(slots: SlotRows, v_hat: wp.array[float], dof: int, j: float):
+    """A row's ``J`` entry ``j`` on coordinate ``dof`` of a key of the star, one step to the world: its footprint ``z =
+    j / ell`` (``1 / ell = sqrt(m^-1)``) and its incident velocity ``j v_hat``, in the slot of the key's world
+    coordinate. A contact's seed (:func:`star_step`) and a joint row's covector (:func:`slot_header`) both take it."""
+    return j * wp.sqrt(slots.inverse_mass[dof]), j * v_hat[dof]
+
+
+@wp.func
 def star_step(
     slots: SlotRows,
     data: ContactInput,
@@ -1452,10 +1460,9 @@ def star_step(
     direction: wp.vec3,
     point: wp.vec3,
 ):
-    """A seed on the star, one step to the world: the key's world coordinate and footprint ``z = (s . w) / ell``, ``s .
-    w`` the step's ``J`` entry of ``sign``'s contact row ``row`` along ``direction`` at ``point``
-    (:func:`.contact_laws.contact_row_entry`) and ``1 / ell = sqrt(m^-1)``, and its incident velocity ``j v_hat``;
-    ``(-1, 0, 0)`` for a body without a single response coordinate in its articulation's window."""
+    """A contact's seed on the star: :func:`key_step` of the step's ``J`` entry of ``sign``'s contact row ``row`` along
+    ``direction`` at ``point`` (:func:`.contact_laws.contact_row_entry`); ``(-1, 0, 0)`` for a body without a single
+    response coordinate in its articulation's window."""
     coordinate = int(-1)
     value = float(0.0)
     incident = float(0.0)
@@ -1465,59 +1472,75 @@ def star_step(
         if local >= 0 and local < slots.star:
             coordinate = slots.dof_offset[art] + local
             j = contact_row_entry(row, data.motion[dof], direction, point, data.origin[art]) * sign
-            value = j * wp.sqrt(slots.inverse_mass[dof])
-            incident = j * v_hat[dof]
+            value, incident = key_step(slots, v_hat, dof, j)
     return coordinate, value, incident
 
 
-@wp.func
-def slot_header(
-    rows: DenseRows,
-    slots: SlotRows,
-    data: ContactInput,
-    v_hat: wp.array[float],
-    unit: RowUnit,
-    bias: RowBias,
-):
+@cache
+def slot_header(keys: bool) -> wp.Function:
     """Finish the sparse diagonal's row ``unit.slot`` once the walk wrote its arm's footprints, norm and incident
     (:func:`packed_walker` with the star): each endpoint on a key of the star, one step to the world into the row's two
     slots (:func:`star_step`, merged into the first on one coordinate), its diagonal ``(|z|^2 + sum_s z_s^2) + cfm``, its
-    incident velocity with the keys' and its rhs by the row law (:func:`.kernels.row_bias`)."""
-    line = unit.line
-    slot = unit.slot
-    row = unit.row
-    coord_a = int(-1)
-    z_a = float(0.0)
-    coord_b = int(-1)
-    z_b = float(0.0)
-    incident = slots.incident[line, slot]
-    if unit.dof0 < 0:
-        direction = unit.frame[0]
-        point = unit.point
-        if unit.body_a >= 0 and unit.art_a >= 0:
-            if data.response_dofs[unit.art_a] == slots.star:
-                coord_a, z_a, key = star_step(slots, data, v_hat, unit.art_a, unit.body_a, 1.0, row, direction, point)
-                incident += key
-        if unit.body_b >= 0 and unit.art_b >= 0:
-            if data.response_dofs[unit.art_b] == slots.star:
-                coord_b, z_b, key = star_step(slots, data, v_hat, unit.art_b, unit.body_b, -1.0, row, direction, point)
-                incident += key
-    if coord_a >= 0 and coord_a == coord_b:
-        z_a += z_b
-        coord_b = -1
-        z_b = 0.0
-    slots.dof[line, slot, 0] = coord_a
-    slots.dof[line, slot, 1] = coord_b
-    slots.z[line, slot, 0] = z_a
-    slots.z[line, slot, 1] = z_b
-    sparse = float(0.0)
-    if coord_a >= 0:
-        sparse += z_a * z_a
-    if coord_b >= 0:
-        sparse += z_b * z_b
-    rows.diag[line, slot] = (rows.diag[line, slot] + sparse) + rows.cfm
-    slots.incident[line, slot] = incident
-    row_bias(rows, bias, line, slot, incident)
+    incident velocity with the keys' and its rhs by the row law (:func:`.kernels.row_bias`). With ``keys`` a joint
+    row's covector ``value0 e_dof0`` on a key (a velocity limit's: the star's position limits are fused) is one step
+    to the world too (:func:`key_step`), into the first slot."""
+
+    def header(
+        rows: DenseRows,
+        slots: SlotRows,
+        data: ContactInput,
+        v_hat: wp.array[float],
+        unit: RowUnit,
+        bias: RowBias,
+    ):
+        line = unit.line
+        slot = unit.slot
+        row = unit.row
+        coord_a = int(-1)
+        z_a = float(0.0)
+        coord_b = int(-1)
+        z_b = float(0.0)
+        incident = slots.incident[line, slot]
+        if unit.dof0 < 0:
+            direction = unit.frame[0]
+            point = unit.point
+            if unit.body_a >= 0 and unit.art_a >= 0:
+                if data.response_dofs[unit.art_a] == slots.star:
+                    coord_a, z_a, key = star_step(
+                        slots, data, v_hat, unit.art_a, unit.body_a, 1.0, row, direction, point
+                    )
+                    incident += key
+            if unit.body_b >= 0 and unit.art_b >= 0:
+                if data.response_dofs[unit.art_b] == slots.star:
+                    coord_b, z_b, key = star_step(
+                        slots, data, v_hat, unit.art_b, unit.body_b, -1.0, row, direction, point
+                    )
+                    incident += key
+        if wp.static(keys):
+            if unit.dof0 >= 0 and unit.art_a >= 0:
+                if data.response_dofs[unit.art_a] == slots.star:
+                    coord_a = slots.dof_offset[unit.art_a] + (unit.dof0 - data.dof_start[unit.art_a])
+                    z_a, key = key_step(slots, v_hat, unit.dof0, unit.value0)
+                    incident += key
+        if coord_a >= 0 and coord_a == coord_b:
+            z_a += z_b
+            coord_b = -1
+            z_b = 0.0
+        slots.dof[line, slot, 0] = coord_a
+        slots.dof[line, slot, 1] = coord_b
+        slots.z[line, slot, 0] = z_a
+        slots.z[line, slot, 1] = z_b
+        sparse = float(0.0)
+        if coord_a >= 0:
+            sparse += z_a * z_a
+        if coord_b >= 0:
+            sparse += z_b * z_b
+        rows.diag[line, slot] = (rows.diag[line, slot] + sparse) + rows.cfm
+        slots.incident[line, slot] = incident
+        row_bias(rows, bias, line, slot, incident)
+
+    header.__name__ = header.__qualname__ = "slot_header"
+    return wp.func(header)
 
 
 read_row_unit = unit_reader(False)
@@ -1526,13 +1549,15 @@ bodies'."""
 
 
 @cache
-def slot_rows_kernel(side: bool, tables: tuple) -> wp.Kernel:
+def slot_rows_kernel(side: bool, tables: tuple, keys: bool = False) -> wp.Kernel:
     """The one writer on the sparse diagonal: a world's ``lanes`` threads stride over its rows (``dim = (worlds,
     lanes)``), every row up to the allocation's watermark (``counts``) within the capacity, a row a lane: a contact
     row's records by the contact law, then each row as its own unit (:data:`read_row_unit`), walked by the one unit
     walker with the star (:func:`packed_walker`; the spin row a torque) and finished (:func:`slot_header`). ``side``
-    and ``tables`` as :func:`packed_walker`'s: the walk of the solver's classes (:func:`slot_writer`)."""
+    and ``tables`` as :func:`packed_walker`'s: the walk of the solver's classes (:func:`slot_writer`); ``keys``: a
+    joint row can sit on a key (:func:`slot_header`)."""
     walk = packed_walker(1, False, side, tables, star=True)
+    header = slot_header(keys)
 
     def write_slot_rows(
         rows: DenseRows,
@@ -1554,17 +1579,19 @@ def slot_rows_kernel(side: bool, tables: tuple) -> wp.Kernel:
             if unit.rows > 0:
                 unit.group = slots.dense_group[world]
                 walk(sink, unit)
-                slot_header(rows, slots, data, v_hat, unit, bias)
+                header(rows, slots, data, v_hat, unit, bias)
 
-    return python_kernel(write_slot_rows, "write_slot_rows", launch_bounds=WRITERS["slots"].bounds)
+    name = "write_slot_rows" + ("_keys" if keys else "")
+    return python_kernel(write_slot_rows, name, launch_bounds=WRITERS["slots"].bounds)
 
 
 def slot_writer(solver) -> wp.Kernel:
     """The sparse diagonal's one writer for the solver's walk (:func:`slot_rows_kernel`): the records' side where a
     walked joint can have two halves (:attr:`.tree_factor.TreeFactor.walk_side`) and the walking classes' paths
-    (:attr:`.tree_factor.TreeFactor.walk_classes`)."""
+    (:attr:`.tree_factor.TreeFactor.walk_classes`); a key's joint rows where the step writes velocity-limit rows."""
     factor = solver.factor
-    return slot_rows_kernel(factor.walk_side, walk_tables(factor.walk_classes))
+    keys = bool(solver.options.enable_joint_velocity_limits)
+    return slot_rows_kernel(factor.walk_side, walk_tables(factor.walk_classes), keys)
 
 
 def row_sink(factor, forest, placement, v_hat: wp.array) -> RowSink:

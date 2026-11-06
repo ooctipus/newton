@@ -181,7 +181,7 @@ def _vote_census():
             "sparse_diagonal",
             sweep_routes_diag.sparse_diagonal_kernel.__wrapped__,
             (64, 10, 9, "120"),
-            (_axis("speculative_contact_batches"), _axis("contact_units"), _axis("seeded")),
+            (_axis("speculative_contact_batches"), _axis("contact_units"), _axis("seeded"), _axis("velocity_limits")),
         ),
     )
     for name, factory, args, axes in specs:
@@ -462,7 +462,7 @@ class TestExitLaw(unittest.TestCase):
                 "sparse_lanes": 16,
                 "mf_gs": 72,
                 "paired": 4,
-                "sparse_diagonal": 6,
+                "sparse_diagonal": 12,
             },
         )
 

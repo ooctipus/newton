@@ -36,6 +36,7 @@ from .sweep import (
     FRICTION,
     ITERATION,
     JOINT_LIMIT,
+    VELOCITY_LIMIT,
     Diagonal,
     RowContext,
     RowLaws,
@@ -53,6 +54,7 @@ from .sweep import (
     material_arguments,
     row_step,
     row_update,
+    velocity_limit_pass,
     weight_arguments,
 )
 
@@ -337,6 +339,7 @@ def sparse_diagonal_source(
     weighted: bool = False,
     material: bool = False,
     seeded: bool = False,
+    velocity_limits: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the sparse-diagonal Gauss-Seidel sweep: one warp per world.
 
@@ -352,7 +355,9 @@ def sparse_diagonal_source(
     per contact, whose row visits reduce nothing, and a unit branch there splits the warp's lanes. With
     ``speculative_contact_batches`` the coupled contacts come from the world's serial list, and a batch of them
     (one per segment of the warp) is tested first: a batch whose normals stay zero without load is skipped whole,
-    otherwise the sweep enters the batch at its first active contact. Under contact ``torsion`` a friction contact's
+    otherwise the sweep enters the batch at its first active contact. With ``velocity_limits`` the coupled visits
+    admit no velocity-limit row, which takes the last word of every sweep (:func:`.sweep.velocity_limit_pass`), as the
+    general sweep's; a key's limit row is one step to the world in a slot, as a contact's seed. Under contact ``torsion`` a friction contact's
     spin row follows its pair (four rows: a triple's stride is four); such a contact declines the unit, and its pair's
     visit solves the triple from its metric cached for the launch (:func:`.sweep.friction_metric_law`). The dense
     articulation's change goes to the step's one leave in the walk's coordinates
@@ -383,7 +388,11 @@ def sparse_diagonal_source(
         emitted replaces the row's metadata."""
         store = dataclasses.replace(rows, lanes=lanes)
         op = slot_rows(P, M, lanes) if lanes.parallel else SCALAR_ROWS
-        return row_step(store, op, laws, end="row_count", kind=kind, parent=parent, metric=cached, pad=pad)
+        # Velocity-limit rows wait for the last word.
+        admission = f"if (row_type == {VELOCITY_LIMIT}) continue;" if velocity_limits and kind is None else ""
+        return row_step(
+            store, op, laws, end="row_count", kind=kind, parent=parent, admission=admission, metric=cached, pad=pad
+        )
 
     pair_op = slot_rows(P, M, warp)
     # A unit's three rows on their shared support: their velocity terms, the pair's couplings with the normal and with
@@ -598,6 +607,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     if seeded:
         apply = pair_op.axpy((("row", "seed"),), "        ", row="i")
         seed = impulse_seed("row_count", rows.peek("i"), f"({rows.kind('i', scan=True)})", apply, warp.sync()) + "\n"
+    last_word = velocity_limit_pass(rows, pair_op, laws, end="row_count", pad="        ") if velocity_limits else ""
     # The phase bound is the raw slot watermark: consumers clamp it to the world's rows.
     contact_start = "min(dense_phase_bounds.data[world * 2 + 1], row_count)" if scheduled else "row_count"
     body = f"""    const int line = dense_first.data[world];
@@ -623,7 +633,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
 {limit_loads}
     SYNC();
 {seed}{metric}
-{level_loop((limit_rows, "        SYNC();", independent_phase, serial), exit=sweep_end)}
+{level_loop((limit_rows, "        SYNC();", independent_phase, serial), (last_word,), exit=sweep_end)}
 
     for (int i = lane; i < row_count; i += 32) world_impulses.data[off_dense + i] = {rows.peek("i")};
     SYNC();
@@ -666,6 +676,7 @@ def sparse_diagonal_kernel(
     weighted: bool = False,
     material: bool = False,
     seeded: bool = False,
+    velocity_limits: bool = False,
 ) -> wp.Kernel:
     """The sparse-diagonal sweep kernel; weighted rows (:func:`.sweep.weight_arguments`) and material contacts
     (:func:`.sweep.material_arguments`) add their operands."""
@@ -680,6 +691,7 @@ def sparse_diagonal_kernel(
         weighted=weighted,
         material=material,
         seeded=seeded,
+        velocity_limits=velocity_limits,
     )
     staging.check("the sparse-diagonal sweep", arch_budget(device_arch))
     name = (
@@ -690,6 +702,7 @@ def sparse_diagonal_kernel(
         + ("_material" if material else "")
         + ("_torsion" if torsion else "")
         + ("_seeded" if seeded else "")
+        + ("_velocity_limits" if velocity_limits else "")
         + solve_policy.suffix
     )
     extra = (

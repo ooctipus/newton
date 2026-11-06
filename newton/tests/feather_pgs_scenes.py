@@ -1020,16 +1020,24 @@ def gripper(
     )
 
 
-def keyboard(*, keys: int = 8, press: float = 0.003, worlds: int = 2, contact_matching: str | None = None) -> Scene:
+def keyboard(
+    *,
+    keys: int = 8,
+    press: float = 0.003,
+    worlds: int = 2,
+    contact_matching: str | None = None,
+    velocity_limit: float | None = None,
+) -> Scene:
     """A fixed frame of ``keys`` prismatic keys (a diagonal-mass articulation) and a six-coordinate arm pressing key 0.
 
     Keys hang on ``z`` prismatic joints held by PD drives inside a 1 cm travel.
     The arm stacks prismatic ``z``, ``x``, ``y`` and revolute ``z``, ``y``,
     ``x`` joints at one point and carries a sphere tip that starts 1 mm above
     key 0; its ``z`` drive presses ``press`` [m] past contact, ``w`` mm more in
-    world ``w``.
+    world ``w``. ``velocity_limit`` [m/s or rad/s] bounds every key's and arm joint's speed, which the press passes.
     """
     tip = 0.01
+    speed = {} if velocity_limit is None else {"velocity_limit": velocity_limit}
 
     def build(device):
         builder = _builder()
@@ -1051,6 +1059,7 @@ def keyboard(*, keys: int = 8, press: float = 0.003, worlds: int = 2, contact_ma
                     target_kd=2.0,
                     limit_lower=-0.008,
                     limit_upper=0.002,
+                    **speed,
                 )
             )
         builder.add_articulation(joints)
@@ -1078,6 +1087,7 @@ def keyboard(*, keys: int = 8, press: float = 0.003, worlds: int = 2, contact_ma
                     target_kd=20.0 if kind == "prismatic" else 0.2,
                     limit_lower=-0.05,
                     limit_upper=0.05,
+                    **speed,
                 )
             )
             parent = body
@@ -1093,8 +1103,11 @@ def keyboard(*, keys: int = 8, press: float = 0.003, worlds: int = 2, contact_ma
                 model, control, {world * joints + keys + 2: 0.001 + press + 0.001 * world for world in range(worlds)}
             )
 
+    name = "keyboard" if velocity_limit is None else "keyboard_velocity_limit"
+    if contact_matching is not None:
+        name = f"{name}_{contact_matching}"
     return Scene(
-        "keyboard" if contact_matching is None else f"keyboard_{contact_matching}",
+        name,
         build,
         dt=1.0 / 240.0,
         steps=160,

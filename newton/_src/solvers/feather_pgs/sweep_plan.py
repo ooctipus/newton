@@ -440,6 +440,7 @@ class Sweep:
                 contact_units=diagonal.units,
                 torsion=self.laws.spin_rows,
                 seeded=self.seeded,
+                velocity_limits=bool(self.options.enable_joint_velocity_limits),
             )
             if diagonal is not None
             else None
