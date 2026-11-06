@@ -1330,7 +1330,6 @@ def plain_laws(**changes) -> Laws:
         "warm_start": False,
         "preelimination": False,
         "mimic": False,
-        "iterations": True,
         "cuda": True,
     }
     return Laws(**{**laws, **changes})

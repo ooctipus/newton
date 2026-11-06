@@ -90,15 +90,15 @@ def tier_sweeps(rows: int, iterations: int) -> int:
     """The sweep budget of a parallel tier serving up to ``rows`` rows: the equal-accuracy rule.
 
     ``ceil(c * iterations * sqrt(rows / 32))`` for the factor ``c = p / q``
-    (:data:`TIER_SWEEPS_PER_ITERATION`), at most :data:`TIER_SWEEPS_CAP` and
-    never fewer than one. The ceiling is exact: the least ``n`` with ``32 q^2
-    n^2 >= (p iterations)^2 rows``.
+    (:data:`TIER_SWEEPS_PER_ITERATION`), at most :data:`TIER_SWEEPS_CAP`: none
+    at no iterations, as the serial sweeps run none. The ceiling is exact: the
+    least ``n`` with ``32 q^2 n^2 >= (p iterations)^2 rows``.
     """
     factor = TIER_SWEEPS_PER_ITERATION
     numerator = (factor.numerator * int(iterations)) ** 2 * int(rows)
     square = -(-numerator // (32 * factor.denominator**2))
     raw = math.isqrt(square - 1) + 1 if square > 0 else 0
-    return max(1, min(raw, TIER_SWEEPS_CAP))
+    return min(raw, TIER_SWEEPS_CAP)
 
 
 def _operands(
@@ -228,7 +228,8 @@ def parallel_source(
     def scale(aii, bound, pad):
         return jacobi_scale(aii, bound, cfm="cfm", pad=pad)
 
-    last_word = jacobi_limit_pass(store, op) if velocity_limit_pass else ""
+    # The velocity limits' last word closes the sweeps: none without a sweep, as the serial sweeps' at no iterations.
+    last_word = jacobi_limit_pass(store, op) if velocity_limit_pass and sweeps else ""
     body = f"""    const int lane = LANE;
 {dense_tier_world(AM, int(min_rows), D, M_D, rows="n_rows", support=D, pitch=M_D if pitch is None else int(pitch))}
 

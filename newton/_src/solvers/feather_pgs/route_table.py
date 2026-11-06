@@ -38,8 +38,6 @@ class Laws:
     """Bilateral rows are pre-eliminated through a Schur complement."""
     mimic: bool
     """The model has mimic rows."""
-    iterations: bool
-    """The position solve has a positive iteration budget."""
     cuda: bool
     """The device is CUDA, which runs the native bodies written for CUDA only (``cuda_native``)."""
 
@@ -69,7 +67,6 @@ class Laws:
             warm_start=bool(options.pgs_warmstart),
             preelimination=bool(preelimination),
             mimic=bool(laws.mimic_count),
-            iterations=options.pgs_iterations > 0,
             cuda=bool(model.device.is_cuda),
         )
 
@@ -82,25 +79,20 @@ class Laws:
 _REQUIREMENTS = {
     "cuda": (lambda laws: laws.cuda, "a CUDA device (their native bodies are written for CUDA only)"),
     "no_mimic": (lambda laws: not laws.mimic, "no mimic rows"),
-    "iterations": (lambda laws: laws.iterations, "a positive iteration budget"),
     "no_preelimination": (lambda laws: not laws.preelimination, "no bilateral pre-elimination"),
 }
 
 CAPABILITIES = {
     # The packed placement of a single tree: native sparse factors and their sweep.
-    "packed": (
-        "cuda",
-        "iterations",
-        "no_preelimination",
-    ),
+    "packed": ("cuda", "no_preelimination"),
     # The paired factor's sweep in factor coordinates (one articulation and one free body per world).
-    "paired_factor": ("cuda", "no_preelimination", "iterations"),
+    "paired_factor": ("cuda", "no_preelimination"),
     # Its runtime claim: independent articulation and free-body components per world.
     "components": ("cuda", "no_preelimination", "no_mimic"),
     # The Jacobi tiers of dense trees beside a free body (case K4), whose sweep budget a build fixes.
-    "tiers": ("cuda", "iterations"),
+    "tiers": ("cuda",),
     # The keyed in-kernel row producer of the tiers.
-    "keyed_rows": ("cuda", "no_preelimination", "iterations", "no_mimic"),
+    "keyed_rows": ("cuda", "no_preelimination", "no_mimic"),
     # The colored mapping of the free-body rows' contact units.
     "colored": ("cuda",),
 }

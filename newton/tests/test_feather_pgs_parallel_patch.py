@@ -1164,7 +1164,7 @@ class TestTierSweeps(unittest.TestCase):
             (32, 1, 4),  # 3.5 rounds up
             (32, 32, 112),
             (32, 64, 128),  # the cap
-            (64, 0, 1),  # at least one sweep
+            (64, 0, 0),  # no sweep at no iterations, as the serial sweeps
         ):
             with self.subTest(rows=rows, iterations=iterations):
                 self.assertEqual(sweep_routes_tiers.tier_sweeps(rows, iterations), expected)
@@ -1178,9 +1178,7 @@ class TestTierSweeps(unittest.TestCase):
             exact = 0
             while 32 * (q * exact) ** 2 < (p * iterations) ** 2 * rows:
                 exact += 1
-            if sweep_routes_tiers.tier_sweeps(rows, iterations) != min(
-                max(exact, 1), sweep_routes_tiers.TIER_SWEEPS_CAP
-            ):
+            if sweep_routes_tiers.tier_sweeps(rows, iterations) != min(exact, sweep_routes_tiers.TIER_SWEEPS_CAP):
                 wrong.append((rows, iterations))
         self.assertEqual(wrong, [])
 

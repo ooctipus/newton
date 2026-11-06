@@ -154,7 +154,6 @@ class LawsProbe(SimpleNamespace):
             warm_start=options.pgs_warmstart,
             preelimination=False,
             mimic=bool(self.mimic_count),
-            iterations=options.pgs_iterations > 0,
             cuda=True,
         )
 
