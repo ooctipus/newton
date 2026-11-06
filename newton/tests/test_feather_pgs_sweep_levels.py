@@ -6,10 +6,10 @@
 A world's units hold resources (the bodies, coordinates or trees their rows touch), and two units conflict when they
 share one. The tests check, on the CPU:
 
-- that a Gauss-Seidel sweep run by the builder's levels (each level's units in any order), by its chains (case K2: a
-  lane a chain, the chains side by side, then the rest in row order) or by its components (case K5: a world's two
-  trees apart) gives the row order's iterate bit for bit, and that an order putting one conflicting pair out of row
-  order does not;
+- that a Gauss-Seidel sweep run by the builder's levels (each level's units in any order), by its scalar contacts'
+  levels (case K2: the levels of the one-coordinate contacts on coordinates no coupled contact holds, each level's
+  contacts side by side, then the rest in row order) or by its components (case K5: a world's two trees apart) gives
+  the row order's iterate bit for bit, and that an order putting one conflicting pair out of row order does not;
 - that the level pass's rounds (:func:`.sweep_levels.level_pass`: a batch of 32 units, a unit committing once it owns
   both its resources) give the row-order levels (:func:`levels`, the rule the colored units' CUDA test compares the
   device with);
@@ -168,26 +168,35 @@ class TestLevelsAreTheRowOrder(unittest.TestCase):
         v, impulses = world.sweep(order)
         self.assertFalse(np.array_equal(v, reference[0]) and np.array_equal(impulses, reference[1]))
 
-    def test_chains_sweep_the_row_order(self):
-        """Case K2: one-resource units on a resource no two-resource unit holds form chains; a lane a chain, the
-        chains side by side, then every other unit in row order."""
+    def test_scalar_contact_levels_sweep_the_row_order(self):
+        """Case K2: one-resource units on a resource no two-resource unit holds are leveled over their resources (a
+        resource's chain, its ``k``-th unit level ``k``); each level's units side by side, in any order, then every
+        other unit in row order."""
         rng = np.random.default_rng(5)
         for pair in (0.2, 0.5):
             # Coupled units on the first 8 bodies (a tree's coordinates), scalar ones on any of 20.
             resources = [held if len(held) > 1 else (int(rng.integers(20)),) for held in _trace(rng, 80, 8, pair)]
             world = World(rng, resources)
             coupled = {r for held in world.resources if len(held) > 1 for r in held}
+            scalar = [unit for unit, held in enumerate(world.resources) if len(held) == 1 and held[0] not in coupled]
+            level = levels([world.resources[unit] for unit in scalar])
             chains = {}
-            for unit, held in enumerate(world.resources):
-                if len(held) == 1 and held[0] not in coupled:
-                    chains.setdefault(held[0], []).append(unit)
+            for unit in scalar:
+                chains.setdefault(world.resources[unit][0], []).append(unit)
             self.assertGreater(len(chains), 1)
-            # Lanes advance together: the chains' first units, then their second units, and so on.
-            lanes = list(chains.values())
-            order = [chain[k] for k in range(max(map(len, lanes))) for chain in lanes if k < len(chain)]
-            chained = set(order)
-            order += [unit for unit in range(len(world.resources)) if unit not in chained]
-            _same(self, world.sweep(order), world.sweep(range(len(world.resources))))
+            self.assertGreater(int(level.max()), 0)
+            # A unit's level is its place in its resource's chain.
+            for unit, value in zip(scalar, level, strict=True):
+                self.assertEqual(chains[world.resources[unit][0]].index(unit), value)
+            reference = world.sweep(range(len(world.resources)))
+            for shuffle in (False, True):
+                order = []
+                for value in range(int(level.max()) + 1):
+                    members = [unit for unit, held in zip(scalar, level, strict=True) if held == value][::-1]
+                    order.extend(rng.permutation(members) if shuffle else members)
+                leveled = set(order)
+                order += [unit for unit in range(len(world.resources)) if unit not in leveled]
+                _same(self, world.sweep(order), reference)
 
     def test_components_sweep_the_row_order(self):
         """Case K5: a world whose rows each hold its articulation or its free body splits into the two."""

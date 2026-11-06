@@ -81,10 +81,10 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
         # The phase bound is clamped to the world's rows; the plain schedule has no contact segment.
         self.assertIn("const int contact_start = min(dense_phase_bounds.data[world * 2 + 1], row_count);", units)
         self.assertIn("const int contact_start = row_count;", plain)
-        self.assertNotIn("independent_group_count", plain)
-        # Independent contacts: a row of one entry, on the chain's coordinate: one product, added to zero.
+        self.assertNotIn("scalar_levels", plain)
+        # Independent contacts: a row of one entry, on the contact's coordinate: one product, added to zero.
         self.assertIn("const int index = scalar_coord;", units)
-        # A chain visits a contact's normal and its pair's first tangent with their kinds (and the pair's parent) known,
+        # A level visits a contact's normal and its pair's first tangent with their kinds (and the pair's parent) known,
         # so no visit reads row metadata; the second tangent is only zeroed while friction waits. A unit has a pair
         # only when it owns an anchor.
         for text in (units,):
@@ -100,7 +100,7 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
             self.assertIn("if (sib_delta != 0.0f) value += z_sib[q] * sib_delta;", text)
         # Every schedule solves a loaded coupled contact unit by the unit law in the warp's layout, before the row visits
         # an unloaded unit falls through to: the unit's three rows on a lane's coordinate, their velocity terms and the
-        # pair's couplings in one ladder, the rows by the row law, one apply, the loop past the unit. A chain's contacts
+        # pair's couplings in one ladder, the rows by the row law, one apply, the loop past the unit. A level's contacts
         # keep their row visits (one lane per contact: a unit branch there would split the warp's lanes).
         loaded = "if (s_lam_dense[i] != 0.0f || s_lam_dense[i + 1] != 0.0f || s_lam_dense[i + 2] != 0.0f) {"
         for text in (plain, units):
@@ -114,11 +114,11 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
             )
             self.assertLess(text.index(loaded), text.rindex("int row_type = s_meta_dense[i]"))
         for text in (units,):
-            start = text.index("const int independent_group_count")
-            chains = text[start : text.index("SYNC();", start)]
-            self.assertNotIn("unit_jv", chains)
-            self.assertIn("const int index = scalar_coord;", chains)
-        # The plain schedule has no chain phase: a contact a chain's link marks keeps its row visits there too, so every
+            start = text.index("const int scalar_levels")
+            levels = text[start : text.index("SYNC();", start)]
+            self.assertNotIn("unit_jv", levels)
+            self.assertIn("const int index = scalar_coord;", levels)
+        # The plain schedule has no level phase: a contact the marker marks keeps its row visits there too, so every
         # schedule solves the same rows by the same law (the CUDA twins compare the schedules bit for bit).
         marked = "!(sparse_row_dof.data[(row_base + i) * 2] < -1 || sparse_row_dof.data[(row_base + i) * 2 + 1] < -1)"
         self.assertLess(plain.index(marked), plain.index(loaded))

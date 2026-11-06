@@ -360,7 +360,7 @@ class TestStarRows(unittest.TestCase):
                     solver.check_constraint_capacity()
                     assert_ring_coulomb(solver)
                     self.assertGreater(assert_patch_tangent_law(solver, contacts[index]), 0)
-                    independent[index] |= bool(np.any(solver.placement.sparse_contact_group_count.numpy() > 0))
+                    independent[index] |= bool(np.any(solver.placement.sparse_contact_level_count.numpy() > 0))
                     serial[index] |= bool(np.any(solver.placement.sparse_contact_serial_count.numpy() > 0))
                 linked |= any(len(record["types"]) == 1 and record["parents"][0] >= 0 for record in reference.values())
                 pooled |= any(

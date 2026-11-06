@@ -48,8 +48,8 @@ from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport, row_supports
 from .sweep import FRICTION_METRIC_FLOATS
 from .sweep_levels import (
-    _get_build_independent_sparse_contact_groups_kernel,
     _get_mark_independent_sparse_contact_candidates_kernel,
+    _get_sparse_contact_levels_kernel,
 )
 from .tree_scan import classes_half
 from .warm_start import (
@@ -418,7 +418,7 @@ class Sweep:
             else None
         )
         self.sparse_contact_schedule = (
-            _get_build_independent_sparse_contact_groups_kernel(
+            _get_sparse_contact_levels_kernel(
                 self.placement.dense_max_constraints,
                 self.forest.max_world_dofs,
                 device_arch,
@@ -619,24 +619,25 @@ class Sweep:
         """Publish the schedule of the rows the row pass wrote and each owner's worlds (run after every producer)."""
         model = self.model
         if self.sparse_contact_schedule is not None:
-            # Unit heads come from the row types and the tangent rows' parents.
-            unit_rows = [self.placement.row_type, self.placement.row_parent]
-            wp.launch(
+            # Unit heads come from the row types; a world's warp a block (its levels' shared working set).
+            wp.launch_tiled(
                 self.sparse_contact_schedule,
-                dim=self.forest.world_count * 32,
+                dim=[self.forest.world_count],
                 inputs=[
                     self.placement.constraint_count,
                     self.placement.dense_first,
                     self.placement.dense_phase_bounds,
-                    *unit_rows,
+                    self.placement.row_type,
                 ],
                 outputs=[
                     self.placement.sparse_diagonal_row_dof,
-                    self.placement.sparse_contact_group_count,
-                    self.placement.sparse_contact_group_heads,
+                    self.placement.sparse_contact_level_count,
+                    self.placement.sparse_contact_level_offsets,
+                    self.placement.sparse_contact_level_units,
                     self.placement.sparse_contact_serial_count,
                     self.placement.sparse_contact_serial_normals,
                 ],
+                block_dim=32,
                 device=model.device,
             )
 
@@ -765,8 +766,9 @@ class Sweep:
             operands,
             self.forest.world_count,
             32,
-            sparse_contact_group_count=placement.sparse_contact_group_count,
-            sparse_contact_group_heads=placement.sparse_contact_group_heads,
+            sparse_contact_level_count=placement.sparse_contact_level_count,
+            sparse_contact_level_offsets=placement.sparse_contact_level_offsets,
+            sparse_contact_level_units=placement.sparse_contact_level_units,
             sparse_contact_serial_count=placement.sparse_contact_serial_count,
             sparse_contact_serial_normals=placement.sparse_contact_serial_normals,
             dense_offsets=placement.sparse_diagonal_dense_offsets,

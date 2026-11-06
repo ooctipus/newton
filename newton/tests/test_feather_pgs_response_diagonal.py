@@ -18,8 +18,8 @@ from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
 from newton._src.solvers.feather_pgs.sweep_levels import (
-    _get_build_independent_sparse_contact_groups_kernel,
     _get_mark_independent_sparse_contact_candidates_kernel,
+    _get_sparse_contact_levels_kernel,
 )
 from newton._src.solvers.feather_pgs.sweep_routes_diag import sparse_diagonal_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_local import paired_factor_kernel, paired_factor_source
@@ -456,35 +456,45 @@ def _mark_patch_units(rows, device):
 def _unit_schedule_oracle(rows, marked):
     """Return the unit schedule the builder must produce from marked unit heads.
 
-    Every row other than a tangent row heads a unit. A marked head joins its coordinate's chain unless a
-    coupled unit uses that coordinate; chains link in ascending row order (``-(next + 3)``, ``-2`` at the
-    end), group heads list each chain's first unit by coordinate, and the serial list holds the remaining
-    heads in row order.
+    Every row other than a tangent row heads a unit. A marked head is a scalar contact on its coordinate unless a
+    coupled unit uses that coordinate (its mark then becomes ``-1``); a coordinate's ``k``-th scalar contact in row
+    order is level ``k``, and each level lists its contacts in row order (``level_count`` levels, level ``l`` the
+    heads ``level_units[level_offsets[l]:level_offsets[l + 1]]``). The serial list holds the remaining heads in row
+    order.
     """
     links = marked.copy()
-    group_count = np.zeros(rows["worlds"], np.int32)
-    group_heads = np.full((rows["worlds"], rows["dofs"]), -1, np.int32)
+    capacity = marked.shape[1]
+    level_count = np.zeros(rows["worlds"], np.int32)
+    level_offsets = np.zeros((rows["worlds"], capacity + 1), np.int32)
+    level_units = np.zeros((rows["worlds"], capacity), np.int32)
     serial = []
     for w in range(rows["worlds"]):
         start, end = int(rows["bounds"][w, 1]), int(rows["row_count"][w])
         heads = [row for row in range(start, end) if rows["row_type"][w, row] != PGS_CONSTRAINT_TYPE_FRICTION]
         candidates = [row for row in heads if np.any(marked[w, row] < -1)]
         reserved = {int(c) for row in heads if row not in candidates for c in marked[w, row] if c >= 0}
-        chains = {}
+        levels, placed = [], {}
         for row in candidates:
             coordinate, slot = int(np.max(marked[w, row])), int(np.argmin(marked[w, row]))
             if coordinate in reserved:
                 links[w, row, slot] = -1
             else:
-                chains.setdefault(coordinate, []).append((row, slot))
-        for chain in chains.values():
-            for (row, slot), following in zip(chain, [*chain[1:], None], strict=True):
-                links[w, row, slot] = -2 if following is None else -(following[0] + 3)
-        firsts = [chain[0][0] for _, chain in sorted(chains.items())]
-        group_count[w] = len(firsts)
-        group_heads[w, : len(firsts)] = firsts
+                level = placed.get(coordinate, 0)
+                placed[coordinate] = level + 1
+                levels += [[]] * (level + 1 - len(levels))
+                levels[level] = [*levels[level], row]
+        level_count[w] = len(levels)
+        units = [row for level in levels for row in level]
+        level_units[w, : len(units)] = units
+        level_offsets[w, : len(levels) + 1] = np.cumsum([0, *(len(level) for level in levels)])
         serial.append([row for row in heads if not np.any(links[w, row] < -1)])
-    return {"sparse_row_dof": links, "group_count": group_count, "group_heads": group_heads, "serial": serial}
+    return {
+        "sparse_row_dof": links,
+        "level_count": level_count,
+        "level_offsets": level_offsets,
+        "level_units": level_units,
+        "serial": serial,
+    }
 
 
 def _unit_rows(rows, world, head):
@@ -498,14 +508,10 @@ def _unit_rows(rows, world, head):
 
 
 def _unit_schedule_order(rows, schedule, world):
-    """Rows in the unit schedule's order: independent chains by coordinate, the prefix, then serial units."""
+    """Rows in the unit schedule's order: the scalar contacts level by level, the prefix, then serial units."""
     order = []
-    for first in schedule["group_heads"][world, : schedule["group_count"][world]]:
-        head = int(first)
-        while head >= 0:
-            order += _unit_rows(rows, world, head)
-            link = int(np.min(schedule["sparse_row_dof"][world, head]))
-            head = -1 if link == -2 else -link - 3
+    for head in schedule["level_units"][world, : schedule["level_offsets"][world, schedule["level_count"][world]]]:
+        order += _unit_rows(rows, world, int(head))
     order += list(range(int(rows["bounds"][world, 1])))
     for head in schedule["serial"][world]:
         order += _unit_rows(rows, world, head)
@@ -900,7 +906,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 wp.array(row_mu, device=device),
                 wp.zeros((1, 2), dtype=wp.int32, device=device),
                 wp.zeros(1, dtype=wp.int32, device=device),
-                wp.empty((1, world_dofs), dtype=wp.int32, device=device),
+                wp.zeros((1, max_constraints + 1), dtype=wp.int32, device=device),
+                wp.empty((1, max_constraints), dtype=wp.int32, device=device),
                 wp.zeros(1, dtype=wp.int32, device=device),
                 wp.empty((1, max_constraints), dtype=wp.int32, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
@@ -1006,7 +1013,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 wp.array(row_mu, device=device),
                 wp.zeros((1, 2), dtype=wp.int32, device=device),
                 wp.zeros(1, dtype=wp.int32, device=device),
-                wp.empty((1, world_dofs), dtype=wp.int32, device=device),
+                wp.zeros((1, max_constraints + 1), dtype=wp.int32, device=device),
+                wp.empty((1, max_constraints), dtype=wp.int32, device=device),
                 wp.array((len(normal_rows),), dtype=wp.int32, device=device),
                 wp.array(normal_rows[None, :], device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
@@ -1054,8 +1062,9 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         sparse_row_dof_np[0, 6:9, 0] = 3
         sparse_row_dof_np[0, 9:12, 0] = 2
         sparse_row_dof = wp.array(sparse_row_dof_np, device=device)
-        group_count = wp.zeros(1, dtype=wp.int32, device=device)
-        group_heads = wp.empty((1, max_world_dofs), dtype=wp.int32, device=device)
+        level_count = wp.zeros(1, dtype=wp.int32, device=device)
+        level_offsets = wp.empty((1, max_constraints + 1), dtype=wp.int32, device=device)
+        level_units = wp.empty((1, max_constraints), dtype=wp.int32, device=device)
         serial_count = wp.zeros(1, dtype=wp.int32, device=device)
         serial_normals = wp.empty((1, max_constraints), dtype=wp.int32, device=device)
 
@@ -1083,36 +1092,36 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             outputs=[sparse_row_dof],
             device=device,
         )
-        schedule = _get_build_independent_sparse_contact_groups_kernel(
+        schedule = _get_sparse_contact_levels_kernel(
             max_constraints, max_world_dofs, str(device.arch), build_serial_contacts=True
         )
         # Four three-row contact units: a normal heading its tangent pair, which names it as parent.
         heads = np.arange(0, max_constraints, 3)
         row_type = np.full((1, max_constraints), PGS_CONSTRAINT_TYPE_FRICTION, dtype=np.int32)
         row_type[0, heads] = PGS_CONSTRAINT_TYPE_CONTACT
-        row_parent = np.repeat(heads, 3)[None, :].astype(np.int32)
-        row_parent[0, heads] = -1
-        wp.launch(
+        wp.launch_tiled(
             schedule,
-            dim=32,
+            dim=[1],
             inputs=[
                 wp.array((max_constraints,), dtype=wp.int32, device=device),
                 row_lines(device),
                 wp.zeros((1, 2), dtype=wp.int32, device=device),
                 wp.array(row_type, device=device),
-                wp.array(row_parent, device=device),
             ],
-            outputs=[sparse_row_dof, group_count, group_heads, serial_count, serial_normals],
+            outputs=[sparse_row_dof, level_count, level_offsets, level_units, serial_count, serial_normals],
+            block_dim=32,
             device=device,
         )
         wp.synchronize_device(device)
 
-        self.assertEqual(int(group_count.numpy()[0]), 1)
-        self.assertEqual(int(group_heads.numpy()[0, 0]), 0)
+        # Rows 0 and 9 share coordinate 2: levels 0 and 1. Row 6's coordinate 3 is row 3's, a coupled unit's.
+        self.assertEqual(int(level_count.numpy()[0]), 2)
+        np.testing.assert_array_equal(level_offsets.numpy()[0, :3], np.array((0, 1, 2), dtype=np.int32))
+        np.testing.assert_array_equal(level_units.numpy()[0, :2], np.array((0, 9), dtype=np.int32))
         self.assertEqual(int(serial_count.numpy()[0]), 2)
         np.testing.assert_array_equal(serial_normals.numpy()[0, :2], np.array((3, 6), dtype=np.int32))
-        normal_links = sparse_row_dof.numpy()[0, ::3, 1]
-        np.testing.assert_array_equal(normal_links, np.array((-12, -1, -1, -2), dtype=np.int32))
+        normal_marks = sparse_row_dof.numpy()[0, ::3, 1]
+        np.testing.assert_array_equal(normal_marks, np.array((-2, -1, -1, -2), dtype=np.int32))
 
     def test_unit_marker_admits_one_and_three_row_units(self):
         """Mark patch units of one or three rows confined to one diagonal coordinate, as triples are marked."""
@@ -1165,10 +1174,10 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         """Name the unit variants and keep speculative batches within sixteen response lanes."""
         solve = sparse_diagonal_kernel(24, 12, 9, "120", contact_units=True)
         batched = sparse_diagonal_kernel(24, 12, 9, "120", contact_units=True, speculative_contact_batches=True)
-        builder = _get_build_independent_sparse_contact_groups_kernel(24, 12, "120", build_serial_contacts=True)
+        builder = _get_sparse_contact_levels_kernel(24, 12, "120", build_serial_contacts=True)
         self.assertEqual(solve.key, "sweep_sparse_diagonal_24_12_9_units")
         self.assertEqual(batched.key, "sweep_sparse_diagonal_24_12_9_speculative_batches_units")
-        self.assertEqual(builder.key, "build_independent_sparse_contact_groups_24_12_serial_contacts_units")
+        self.assertEqual(builder.key, "sparse_contact_levels_24_12_serial_contacts_units")
         for kwargs in ({"contact_units": True, "speculative_contact_batches": True, "dense_dofs": 15},):
             dense_dofs = kwargs.pop("dense_dofs", 9)
             with self.subTest(**kwargs), self.assertRaises(ValueError):
@@ -1178,7 +1187,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         """Keep GS order on every coordinate when sweeping in the unit schedule's order.
 
         The schedule oracle is the reference the CUDA unit builder must reproduce. Sweeping the
-        rows in its order (independent chains first, then the prefix and the serial units) must give
+        rows in its order (the scalar contacts level by level first, then the prefix and the serial units) must give
         exactly the impulses and velocities of the original row order, including on independent patch
         rings that mix one- and three-row units. The members of a fixture ring share one coordinate, so
         the oracle cannot split a ring's independence marks; the CUDA builder twin checks that property
@@ -1196,7 +1205,9 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     lengths = {len(_unit_rows(rows, world, head)) for head in members}
                     if lengths == {1, 3} and np.any(schedule["sparse_row_dof"][world, members] < -1):
                         mixed_rings += 1
-                independent += sum(int(count) for count in schedule["group_count"])
+                independent += int(
+                    np.sum(schedule["level_offsets"][np.arange(rows["worlds"]), schedule["level_count"]])
+                )
                 serial += sum(len(heads) for heads in schedule["serial"])
                 for iterations in (6, 5):
                     original = _ring_pooled_serial_reference(rows, iterations=iterations)
@@ -1219,32 +1230,35 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 worlds, dofs = rows["worlds"], rows["dofs"]
                 for serial_contacts in (False, True):
                     sparse_row_dof = wp.array(marked, device=device)
-                    group_count = wp.full(worlds, -7, dtype=wp.int32, device=device)
-                    group_heads = wp.full((worlds, dofs), -7, dtype=wp.int32, device=device)
+                    level_count = wp.full(worlds, -7, dtype=wp.int32, device=device)
+                    level_offsets = wp.full((worlds, capacity + 1), -7, dtype=wp.int32, device=device)
+                    level_units = wp.full((worlds, capacity), -7, dtype=wp.int32, device=device)
                     serial_count = wp.full(worlds, -7, dtype=wp.int32, device=device)
                     serial_heads = wp.full((worlds, capacity), -7, dtype=wp.int32, device=device)
-                    schedule = _get_build_independent_sparse_contact_groups_kernel(
+                    schedule = _get_sparse_contact_levels_kernel(
                         capacity, dofs, str(device.arch), build_serial_contacts=serial_contacts
                     )
-                    wp.launch(
+                    wp.launch_tiled(
                         schedule,
-                        dim=worlds * 32,
+                        dim=[worlds],
                         inputs=[
                             wp.array(rows["row_count"], device=device),
                             row_lines(device),
                             wp.array(rows["bounds"], device=device),
                             wp.array(rows["row_type"], device=device),
-                            wp.array(rows["row_parent"], device=device),
                         ],
-                        outputs=[sparse_row_dof, group_count, group_heads, serial_count, serial_heads],
+                        outputs=[sparse_row_dof, level_count, level_offsets, level_units, serial_count, serial_heads],
+                        block_dim=32,
                         device=device,
                     )
                     np.testing.assert_array_equal(sparse_row_dof.numpy(), expected["sparse_row_dof"])
-                    np.testing.assert_array_equal(group_count.numpy(), expected["group_count"])
+                    np.testing.assert_array_equal(level_count.numpy(), expected["level_count"])
                     for world in range(worlds):
-                        count = int(expected["group_count"][world])
+                        levels = int(expected["level_count"][world])
+                        offsets = expected["level_offsets"][world, : levels + 1]
+                        np.testing.assert_array_equal(level_offsets.numpy()[world, : levels + 1], offsets)
                         np.testing.assert_array_equal(
-                            group_heads.numpy()[world, :count], expected["group_heads"][world, :count]
+                            level_units.numpy()[world, : offsets[-1]], expected["level_units"][world, : offsets[-1]]
                         )
                         if serial_contacts:
                             heads = expected["serial"][world]
@@ -1304,8 +1318,9 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                             wp.array(rows["row_parent"], device=device),
                             wp.array(rows["row_mu"], device=device),
                             wp.array(rows["bounds"], device=device),
-                            wp.array(schedule["group_count"], device=device),
-                            wp.array(schedule["group_heads"], device=device),
+                            wp.array(schedule["level_count"], device=device),
+                            wp.array(schedule["level_offsets"], device=device),
+                            wp.array(schedule["level_units"], device=device),
                             wp.array([len(heads) for heads in schedule["serial"]], dtype=wp.int32, device=device),
                             wp.array(serial_heads, device=device),
                             wp.array(rows["dense_offsets"], device=device),

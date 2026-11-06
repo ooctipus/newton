@@ -6,7 +6,7 @@
 :func:`sparse_diagonal_kernel`: a world's dense group plus diagonal-mass coordinates as whitened rows
 (:func:`slot_rows`, a :class:`.SparseFactor`), one warp per world, on the velocity change from the predictor in factor coordinates, from zero:
 ``du = R^-T L^T P dv`` on the dense articulation (the walk's factor and its slips' release, the frame its rows were whitened
-in) and ``du = sqrt(m) dv`` on a diagonal coordinate, left once and added to the predictor. Each sweep runs its coordinates' fused joint limits, its independent scalar contacts one lane per chain, then its
+in) and ``du = sqrt(m) dv`` on a diagonal coordinate, left once and added to the predictor. Each sweep runs its coordinates' fused joint limits, its independent scalar contacts a level at a time, a lane a contact, then its
 coupled rows in order (plain or contact units, optionally with speculative batches), a loaded coupled
 contact unit by the unit law (:func:`.sweep.contact_unit`). Its working set fits the static
 budget of the device it is built for (:func:`.memory.arch_budget`).
@@ -71,8 +71,9 @@ SPARSE_DIAGONAL_ABI = kernel_template.params(
     ("world_row_parent", wp.array2d[int]),
     ("world_row_mu", wp.array2d[float]),
     ("dense_phase_bounds", wp.array2d[int]),
-    ("sparse_contact_group_count", wp.array[int]),
-    ("sparse_contact_group_heads", wp.array2d[int]),
+    ("sparse_contact_level_count", wp.array[int]),
+    ("sparse_contact_level_offsets", wp.array2d[int]),
+    ("sparse_contact_level_units", wp.array2d[int]),
     ("sparse_contact_serial_count", wp.array[int]),
     ("sparse_contact_serial_normals", wp.array2d[int]),
     ("dense_offsets", wp.array[int]),
@@ -220,7 +221,7 @@ def slot_rows(dense: int, rows: int, lanes: Lanes) -> SparseFactor:
     walk's factor and its slips' release) and ``u = sqrt(m) dv`` on a diagonal coordinate (a star's factor is
     diagonal). Row ``i``'s entry ``e < dense`` is its walk's footprint at ``dense_Z[(dense_group * rows + i) * dense +
     e]`` on coordinate ``dense_offset + e``; entries ``dense`` and ``dense + 1`` are its two slots, coordinate
-    ``sparse_row_dof[(row_base + i) * 2 + s]`` (``-1`` for none, below ``-1`` an independent chain's link) and ``Z_s =
+    ``sparse_row_dof[(row_base + i) * 2 + s]`` (``-1`` for none, below ``-1`` a scalar contact's mark) and ``Z_s =
     J_s / sqrt(m_s)``, a key's one step, at ``sparse_row_z``. A contact's rows act on its two bodies' coordinates,
     which the build puts in the same slot of each row (:func:`.walk_rows.slot_header`): its rows share a support.
     """
@@ -249,31 +250,31 @@ SCALAR_ROWS = SparseFactor(
     Lanes(1),
     velocity=Velocity("s_v"),
 )
-"""An independent scalar contact's rows, one thread: one entry, on the chain's coordinate ``scalar_coord``, through the
-slot that holds it (the other is the chain's link); its dense part is empty."""
+"""An independent scalar contact's rows, one thread: one entry, on its coordinate ``scalar_coord``, through the slot
+that holds it (the other is marked); its dense part is empty."""
 
 
 @dataclasses.dataclass(frozen=True)
-class Chains:
-    """The independent scalar chains, a lane a chain (``sparse_contact_group_heads``), each chain's contacts in chain
-    order, ``head`` at a time: a contact's normal links the chain's next contact through its free slot (-2 ends the
-    chain), and its coordinate (``scalar_coord``) is the chain's. The lanes synchronize after the phase."""
+class Levels:
+    """The independent scalar contacts by level (:func:`.sweep_levels._sparse_contact_levels_kernel`), a level at a
+    time and a lane a contact of it (``head``), each level's contacts in row order: a level holds at most one contact a
+    coordinate, and a coordinate's contacts lie in successive levels in row order, so the lanes synchronize after each
+    level. A contact's coordinate (``scalar_coord``) is its unmarked slot's."""
 
-    dofs: int
+    capacity: int
 
     def wrap(self, visit: str, pad: str) -> str:
-        text = f"""const int independent_group_count = sparse_contact_group_count.data[world];
-for (int group = lane; group < independent_group_count; group += 32) {{
-    int next_normal = sparse_contact_group_heads.data[world * {self.dofs} + group];
-    while (next_normal >= 0) {{
-        const int head = next_normal;
+        offsets = f"sparse_contact_level_offsets.data[world * {self.capacity + 1} + scalar_level"
+        text = f"""const int scalar_levels = sparse_contact_level_count.data[world];
+for (int scalar_level = 0; scalar_level < scalar_levels; ++scalar_level) {{
+    const int level_end = {offsets} + 1];
+    for (int place = {offsets}] + lane; place < level_end; place += 32) {{
+        const int head = sparse_contact_level_units.data[world * {self.capacity} + place];
         const int normal_coord_0 = sparse_row_dof.data[(row_base + head) * 2];
         const int normal_coord_1 = sparse_row_dof.data[(row_base + head) * 2 + 1];
         const int scalar_coord = normal_coord_0 >= 0 ? normal_coord_0 : normal_coord_1;
-        const int link = normal_coord_0 < -1 ? normal_coord_0 : normal_coord_1;
-        next_normal = link == -2 ? -1 : -link - 3;
 """
-        return indent(text, pad) + f"{visit}\n{pad}    }}\n{pad}}}\n{pad}SYNC();"
+        return indent(text, pad) + f"{visit}\n{pad}    }}\n{pad}    SYNC();\n{pad}}}"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -338,13 +339,13 @@ def sparse_diagonal_source(
     """The native body of the sparse-diagonal Gauss-Seidel sweep: one warp per world.
 
     Every sweep runs the world's fused diagonal joint limits (one lane per coordinate), then its independent scalar
-    contacts (one lane per chain: a contact whose coordinate no coupled row touches commutes with the coupled rows,
-    and its one-product residual rounds as the warp's sum of it does), then the coupled rows in row order with
+    contacts (a level at a time, one lane per contact: a contact whose coordinate no coupled row touches commutes with
+    the coupled rows, and its one-product residual rounds as the warp's sum of it does), then the coupled rows in row order with
     :func:`slot_rows`' warp layout, all on the velocity change in factor coordinates, from zero (left once before
     it is added to the predictor). ``contact_units`` schedules the contacts (a normal, and its
     tangent pair only when it owns an anchor): it skips an independent contact in the serial order and a pair whose patch carries no load. Every schedule, the plain
     one at a normal row that owns the tangent pair after it, solves a loaded coupled contact unit by the unit law
-    (:func:`.sweep.contact_unit`) and visits an unloaded one, and a chain's contacts, row by row: a chain runs one lane
+    (:func:`.sweep.contact_unit`) and visits an unloaded one, and a level's contacts, row by row: a level runs one lane
     per contact, whose row visits reduce nothing, and a unit branch there splits the warp's lanes. With
     ``speculative_contact_batches`` the coupled contacts come from the world's serial list, and a batch of them
     (one per segment of the warp) is tested first: a batch whose normals stay zero without load is skipped whole,
@@ -367,7 +368,7 @@ def sparse_diagonal_source(
 
     warp = Lanes(32)
     laws = RowLaws(regularize=weighted, material=material, policy=solve_policy, torsion=torsion)
-    # Every lane (or a chain's one thread) stores what it computed and reads its own stores.
+    # Every lane (or a scalar contact's one thread) stores what it computed and reads its own stores.
     rows = WorldRows(M, lanes=warp, every_lane=True)
     staging = Staging((Buffer("s_v", "float", D), *rows.buffers()), threads=32)
     # A friction triple reads its metric cached for the launch (sweep.friction_metric_law).
@@ -441,7 +442,7 @@ def sparse_diagonal_source(
         return indent(text, " " * 12)
 
     def independent(head: str) -> str:
-        """Whether the contact headed by row ``head`` belongs to an independent chain (a slot holds a link)."""
+        """Whether the contact headed by row ``head`` is an independent scalar contact (a slot holds its mark)."""
         return f"sparse_row_dof.data[(row_base + {head}) * 2] < -1 || sparse_row_dof.data[(row_base + {head}) * 2 + 1] < -1"
 
     def owns_tangents(head: str, pad: str) -> str:
@@ -467,12 +468,12 @@ def sparse_diagonal_source(
             "            }"
         )
 
-    # Independent scalar chains: one lane per chain, its contacts in chain order. Schedule construction excludes every
-    # coordinate a coupled row touches, so they commute with the coupled rows. A contact's normal links the chain's
-    # next contact through its free slot (-2 ends the chain). A contact is a normal row and, for a triple or a unit
-    # that owns an anchor, the tangent pair after it, which names the normal as parent: the visits' kinds are known
-    # here, so each compiles to its own law. The pair is solved at its first tangent. A visit that skips its row leaves
-    # its block (do-while), not the chain.
+    # Independent scalar contacts: a level at a time, one lane per contact. Schedule construction excludes every
+    # coordinate a coupled row touches, so they commute with the coupled rows, and a coordinate's contacts lie in
+    # successive levels in row order. A contact is a normal row and, for a triple or a unit that owns an anchor, the
+    # tangent pair after it, which names the normal as parent: the visits' kinds are known here, so each compiles to
+    # its own law. The pair is solved at its first tangent. A visit that skips its row leaves its block (do-while),
+    # not the level.
     independent_phase = ""
     if scheduled:
         pad = " " * 16
@@ -486,7 +487,7 @@ def sparse_diagonal_source(
 {visit(Lanes(1), pad + "    ", kind=CONTACT)}
                 }} while (false);
 {tangents}"""
-        independent_phase = "\n" + Chains(D).wrap(normal, "        ") + "\n"
+        independent_phase = "\n" + Levels(M).wrap(normal, "        ") + "\n"
 
     def batch(index: str, count: str) -> str:
         """Test the batch of serial contacts from ``index``: one contact per segment of ``batch_lanes`` lanes, its
@@ -530,7 +531,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     row = visit(warp, "            ")
     if not scheduled:
         # The rows hold no schedule: a normal row owning the tangent pair after it heads a contact unit, unless a
-        # chain's link marks it (its rows keep their visits, as a scheduled sweep's chain phase visits them).
+        # mark makes it a scalar contact (its rows keep their visits, as a scheduled sweep's level phase visits them).
         head = f"({rows.kind('i')}) == {CONTACT} && {owns_tangents('i', ' ' * 16)}\n{' ' * 16}&& !({independent('i')})"
         serial = SlotOrder("row_count").wrap(f"{coupled(head)}\n{row}", "        ")
     elif not speculative_contact_batches:

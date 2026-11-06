@@ -119,11 +119,13 @@ SPARSE_DIAGONAL_ROWS = FieldGroup(
 )
 """Each sparse-diagonal row's two response coordinates and their whitened entries ``J / sqrt(m)``."""
 
-SPARSE_CONTACT_GROUPS = FieldGroup(
-    Field("sparse_contact_group_count", wp.int32, ("world",), owner="placement"),
-    Field("sparse_contact_group_heads", wp.int32, ("world", "world_dof"), fill=None, owner="placement"),
+SPARSE_CONTACT_LEVELS = FieldGroup(
+    Field("sparse_contact_level_count", wp.int32, ("world",), owner="placement"),
+    Field("sparse_contact_level_offsets", wp.int32, ("world", "level"), fill=None, owner="placement"),
+    Field("sparse_contact_level_units", wp.int32, ("world", "unit"), fill=None, owner="placement"),
 )
-"""Independent contact groups per world (triples or units), by head row."""
+"""The scalar contacts' levels per world (:func:`.sweep_levels._sparse_contact_levels_kernel`): each level's first
+place, and the units' head rows level by level."""
 
 SPARSE_CONTACT_SERIAL = FieldGroup(
     Field("sparse_contact_serial_count", wp.int32, ("world",), owner="placement"),
@@ -559,11 +561,11 @@ class Placement:
         else:
             self.arrays.allocate(SPARSE_DIAGONAL_ROWS, world=1, row=1)
         if diagonal is not None and diagonal.units:
-            self.arrays.allocate(
-                SPARSE_CONTACT_GROUPS, world=self.forest.world_count, world_dof=self.forest.max_world_dofs
-            )
+            # A world's rows hold at most a unit a row, so at most that many levels.
+            rows = self.dense_max_constraints
+            self.arrays.allocate(SPARSE_CONTACT_LEVELS, world=self.forest.world_count, level=rows + 1, unit=rows)
         else:
-            self.arrays.allocate(SPARSE_CONTACT_GROUPS, world=1, world_dof=1)
+            self.arrays.allocate(SPARSE_CONTACT_LEVELS, world=1, level=1, unit=1)
         if diagonal is not None and diagonal.speculative_batches:
             # A unit may be a single normal row: a world lists at most a unit a row.
             self.arrays.allocate(

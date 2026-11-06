@@ -302,9 +302,9 @@ def _solver_factory_calls():
     factory = sweep_routes_diag.sparse_diagonal_kernel.__wrapped__
     yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (64, 10, 9, _ARCH), {}
     for serial in (False, True):
-        factory = sweep_levels._get_build_independent_sparse_contact_groups_kernel.__wrapped__
+        factory = sweep_levels._get_sparse_contact_levels_kernel.__wrapped__
         kwargs = {"build_serial_contacts": serial}
-        yield name + "_get_build_independent_sparse_contact_groups_kernel", factory, (64, 10, _ARCH), kwargs
+        yield name + "_get_sparse_contact_levels_kernel", factory, (64, 10, _ARCH), kwargs
     for dofs in (1, 2):
         factory = sweep_levels._get_mark_independent_sparse_contact_candidates_kernel.__wrapped__
         yield name + "_get_mark_independent_sparse_contact_candidates_kernel", factory, (dofs, _ARCH), {}
@@ -576,7 +576,7 @@ class TestFeatherPGSKernelPins(unittest.TestCase):
             "sweep_routes_sparse.sparse_kernel",
             "walk_rows.support_rows_kernel",
             "sweep_routes_diag.sparse_diagonal_kernel",
-            "sweep_levels._get_build_independent_sparse_contact_groups_kernel",
+            "sweep_levels._get_sparse_contact_levels_kernel",
             "sweep_levels._get_mark_independent_sparse_contact_candidates_kernel",
             "sweep_routes_tiers.parallel_kernel",
             "sweep_routes_local.paired_factor_kernel",
