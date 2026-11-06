@@ -66,7 +66,6 @@ from .sweep import (
     impulse_seed,
     indent,
     material_arguments,
-    row_sums,
     row_visit,
     spin_row,
     unit_held_loads,
@@ -509,7 +508,6 @@ def ordinary_rows(rows: SparseRows, op: SparseFactor, laws: RowLaws, *, skip_vel
         # A friction triple's rows are the triple phase's (contact torsion).
         f"if (row_type == {TORSION}) continue;" if laws.torsion else "",
     ]
-    residual = row_sums(op, "jv", pad, sibling="parent + 2", paired=f"row_type == {FRICTION}")
     visit = row_visit(
         ctx,
         dataclasses.replace(laws, torsion=False),
@@ -518,7 +516,6 @@ def ordinary_rows(rows: SparseRows, op: SparseFactor, laws: RowLaws, *, skip_vel
         declare=f"float denom = {rows.diag('i')};",
         hold=f"const float row_impulse = {rows.load('i')};\nfloat pair_impulse = 0.0f;",
         keep_next="pair_impulse",
-        residual=residual,
         pad=pad,
     )
     return indent("\n".join(line for line in head if line), pad) + "\n" + visit

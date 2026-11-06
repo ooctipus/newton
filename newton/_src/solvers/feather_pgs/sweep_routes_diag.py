@@ -48,7 +48,6 @@ from .sweep import (
     friction_metric_stage,
     indent,
     material_arguments,
-    row_sums,
     row_visit,
     weight_arguments,
 )
@@ -277,8 +276,6 @@ def sparse_diagonal_source(
         visit is emitted replaces the row's metadata, so the visit compiles to that kind's law; a known kind other than
         friction admits no pair."""
         ctx = context(lanes, friction=kind in (None, FRICTION))
-        # A first tangent's residual reduces its pair's terms with its own, on the support's one load.
-        pair = {"sibling": "parent + 2", "paired": f"row_type == {FRICTION}"} if ctx.friction else {}
         # A spin row is solved with its friction pair.
         skip = f"{pad}if (row_type == {TORSION}) continue;\n" if torsion and kind is None else ""
         return (
@@ -290,7 +287,6 @@ def sparse_diagonal_source(
                 parent=rows.parent("i") if parent is None else parent,
                 check="denom",
                 declare=f"const float denom = {rows.diag('i')};",
-                residual=row_sums(ctx.operator, "jv", pad, **pair),
                 pad=pad,
             )
         )

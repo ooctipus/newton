@@ -860,8 +860,6 @@ def row_visit(
     declare: str = "",
     hold: str = "",
     keep_next: str | None = None,
-    entries: str = "",
-    residual: str | None = None,
     pad: str = "            ",
 ) -> str:
     """Visit row ``i`` (``ctx.row``) of a row loop, its kind ``ctx.kind`` declared: admission, residual and row law.
@@ -871,8 +869,9 @@ def row_visit(
     diagonal ``check`` (its value or stored inverse, declared by ``declare``), unless the schedule admitted the rows
     on it already (``None``). ``hold`` declares, after the check, registers the disk and the law read (``keep_next``
     keeps the second tangent's impulse in one); the disk joins the admission's block when nothing comes between
-    them. ``entries`` declares what the operator reads of the row and ``residual`` reduces ``jv`` (the operator's
-    :func:`row_sums` by default). Rows without friction pairs (``ctx.friction`` false) have no
+    them. The residual's velocity term ``jv`` is the operator's (:func:`row_sums`); where the rows have friction pairs
+    and the operator's rows are in memory (:attr:`.ResponseOperator.pair_with_visit`), a first tangent's ladder also
+    reduces its pair's terms, on the support's one load. Rows without friction pairs (``ctx.friction`` false) have no
     admission or disk. A skipped row continues the loop.
     """
     row, kind, op = ctx.row, ctx.kind, ctx.operator
@@ -896,11 +895,8 @@ def row_visit(
             *between,
             friction_radius(kind, *disk, pad, keep_next=keep_next, **spin) if pairs else "",
         ]
-    lines += [
-        indent(entries, pad) if entries else "",
-        row_sums(op, "jv", pad) if residual is None else residual,
-        row_update(ctx, laws, residual="jv", pad=pad),
-    ]
+    pair = {"sibling": "parent + 2", "paired": f"{kind} == {FRICTION}"} if pairs and op.pair_with_visit else {}
+    lines += [row_sums(op, "jv", pad, **pair), row_update(ctx, laws, residual="jv", pad=pad)]
     return "\n".join(line for line in lines if line)
 
 
@@ -1339,7 +1335,7 @@ def rows_block(
         end = "mf_contact_end" if header else "m_dense"
     if header:
         diagonal = Diagonal(inverse=lambda row: "mf_diag" if row == "i" else rows.inverse(row))
-        kind, check, declare, residual = "mf_rt", "mf_diag", "", None
+        kind, check, declare = "mf_rt", "mf_diag", ""
         head = _header_consume(op, "i", end, inner)
         parent = rows.parent_of("packed_tp")
         rhs = lambda row: "__int_as_float(meta.z)" if row == "i" else rows.rhs_of(row)  # noqa: E731
@@ -1353,7 +1349,6 @@ def rows_block(
         head = f"{inner}int row_type = {rows.kind('i')};"
         parent = rows.parent("i")
         rhs = rows.rhs_of
-        residual = row_sums(op, "jv", inner, sibling="parent + 2", paired=f"row_type == {FRICTION}")
         prologue = ""
     ctx = RowContext(
         row="i",
@@ -1378,7 +1373,7 @@ def rows_block(
         # A spin row is solved with its friction pair (torsion).
         f"{inner}if ({kind} == {TORSION}) continue;" if laws.torsion else "",
         indent(admission, inner) if admission else "",
-        row_visit(ctx, laws, parent=parent, check=check, declare=declare, residual=residual, pad=inner),
+        row_visit(ctx, laws, parent=parent, check=check, declare=declare, pad=inner),
     ]
     return (
         f"{prologue}{pad}for (int i = 0; i < {end}; i++) {{\n" + "\n".join(line for line in body if line) + f"\n{pad}}}"
