@@ -8,18 +8,17 @@ import os
 import unittest
 from itertools import product
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import warp as wp
 
 from newton._src.core.memory import arch_budget
+from newton._src.solvers.feather_pgs import class_plan
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
-from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel, sparse_staging
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import row_lines
@@ -681,16 +680,9 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
             ({"pins": {"contact_units": None}}, True, True, 32, True, False, "contact_units=None"),
         )
         for changes, active, table, lanes, fits, admitted, phrase in cases:
-            probe = SimpleNamespace(
-                pins={},
-                forest=SimpleNamespace(has_free_rigid_bodies=False),
-                laws=SimpleNamespace(),
-            )
-            for name, value in changes.items():
-                setattr(probe, name, value)
             with self.subTest(changes=changes, active=active, table=table, lanes=lanes, fits=fits):
-                decision, reason = Sweep._admit_sparse_contact_triplets(
-                    probe,
+                decision, reason = class_plan.contact_triplets_rule(
+                    changes.get("pins", {}),
                     active_rows=active,
                     use_support_table=table,
                     lanes=lanes,

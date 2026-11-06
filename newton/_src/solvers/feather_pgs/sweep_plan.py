@@ -5,7 +5,7 @@
 
 :class:`Sweep` owns the solve of one step:
 
-- the admission of the owners that sweep their own worlds (the route table's cases, in its order), with their kernels
+- the owners that sweep their own worlds, built from the class plan's case (:mod:`.class_plan`), with their kernels
   and streams (:meth:`Sweep.build`, :meth:`Sweep.open_streams`);
 - the claims: the worlds the row pass left to each owner (:meth:`Sweep.claim`), and the resolved worlds;
 - the warm start: the normal impulses gathered by contact identity (:meth:`Sweep.warm_start`), and what a step
@@ -21,7 +21,6 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from collections.abc import Callable
 
 import numpy as np
 import warp as wp
@@ -29,7 +28,6 @@ import warp as wp
 from ...core.execution import Queue, shape
 from ...core.memory import Place, arch_budget, device
 from . import (
-    host_index,
     packed_rows,
     sweep_levels,
     sweep_routes,
@@ -44,20 +42,16 @@ from .contact_forces import compute_contact_linear_force_from_impulses, pack_con
 from .contact_input import bind_routes as bind_contact_routes
 from .execution_plan import _MFGSStorage, _select_mfgs_storage
 from .field_group import Field, FieldGroup
-from .forest_plan import row_support
 from .friction_patches import patch_routes
 from .kernel_template import SweepTier
 from .solve_policy import SolvePolicy, SolveReadoutRecord
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport, row_supports
-from .step_plan import first_failed
 from .sweep import FRICTION_METRIC_FLOATS
 from .sweep_levels import (
     _get_build_independent_sparse_contact_groups_kernel,
     _get_mark_independent_sparse_contact_candidates_kernel,
 )
-from .sweep_routes_sparse import _SPARSE_LOCAL_WORKSPACE_BYTES
-from .tree_plan import TreePlan, local_parents
 from .tree_scan import classes_half
 from .warm_start import (
     bind_carry,
@@ -88,37 +82,6 @@ a slot per four rows of the row store's line, a triple's rows."""
 
 __all__ = ["Sweep"]
 
-_CONTACT_JACOBIAN_MAX_DOF = 10
-# The paired response pairs a tree of _PAIRED_MIN_DOF to (32 - 6) coordinates, no star, with one free body, in a class
-# of more than _PAIRED_MIN_ROWS rows a world. The rows bound is the retired tiled H^-1 J^T plan's (execution_plan
-# before 0.4): it admitted a size whose 32-row chunk was below dense_max_constraints. Its footprint at 26 coordinates
-# and 32 rows, 26 * 26 * 4 + 3 * 26 * 32 * 4 + 64 * 4 = 12,944 B, fits every CUDA device (at least 48 KiB a block), so
-# the chunk was min(32, dense_max_constraints) and the test was dense_max_constraints > 32.
-_PAIRED_MIN_DOF = 17
-_PAIRED_MIN_ROWS = 32
-
-
-def _world_diagonal_pairs(
-    articulation_world: np.ndarray, response_dof_count: np.ndarray, world_count: int, diagonal_sizes: frozenset[int]
-) -> tuple[np.ndarray, np.ndarray] | None:
-    """Split each world's two response articulations into the one whose size is in ``diagonal_sizes`` and the other.
-
-    Returns:
-        ``(diagonal, dense)`` articulation indices per world, or ``None`` unless every
-        world has exactly two response articulations, exactly one of them diagonal.
-    """
-    articulations = np.flatnonzero(response_dof_count > 0)
-    bounds, order = host_index.group_by(articulation_world[articulations], world_count)
-    if np.any(np.diff(bounds) != 2):
-        return None
-    # Each world's pair, in ascending articulation order.
-    pairs = articulations[order].reshape(world_count, 2)
-    diagonal = np.isin(response_dof_count[pairs], list(diagonal_sizes))
-    if np.any(diagonal.sum(axis=1) != 1):
-        return None
-    first_diagonal = diagonal[:, 0]
-    return np.where(first_diagonal, pairs[:, 0], pairs[:, 1]), np.where(first_diagonal, pairs[:, 1], pairs[:, 0])
-
 
 class Sweep:
     """The solve of one step, with the owners that claim their worlds (see the module's docstring).
@@ -130,177 +93,58 @@ class Sweep:
         laws: The row laws.
         placement: The placement.
         factor: The tree factor.
-        routes: The route table the owners claim the class from.
+        classes: The class plan (:class:`.class_plan.ClassPlan`): the case and its choice, which the owners build.
         pins: The test-only route pins.
     """
 
-    def __init__(self, model, options, forest, laws, placement, factor, routes, pins):
+    def __init__(self, model, options, forest, laws, placement, factor, classes, pins):
         self.model = model
         self.options = options
         self.forest = forest
         self.laws = laws
         self.placement = placement
         self.factor = factor
-        self.routes = routes
+        self.case = classes.case
+        """The class's case (:attr:`.class_plan.ClassPlan.case`)."""
         self.pins = pins
         # Every sweep compiles the exit law and the policy's readout.
         self.policy = SolvePolicy(readout=options.diagnostics.solve_readout)
         self.readout = SolveReadoutRecord(self.policy)
-        self.paired_response_candidate_sizes = frozenset(
-            size
-            for size in self.forest.size_groups
-            if size >= _PAIRED_MIN_DOF
-            and size + 6 <= 32
-            and size not in self.forest.diagonal_mass_sizes
-            and self.placement.dense_max_constraints > _PAIRED_MIN_ROWS
-        )
 
-    def admit_diagonal(self, held_decline: Callable) -> None:
-        """Case K2, a tree beside a star: the sparse diagonal, with the fused limits of its star."""
-        model = self.model
-        self._select_fused_diagonal_limits()
-        # Case K2, a tree beside a star: the sparse diagonal.
-        declined = self.routes.taken("K2")
-        sparse_diagonal_pair = (
-            None
-            if declined
-            else self._select_sparse_diagonal_response_pair(
-                factor_dense_contract=self.placement.fused_diagonal_joint_limits
-            )
+    def place_diagonal(self, choice) -> None:
+        """Case K2, a tree beside a star: the sparse diagonal and the fused limits of its star, from the class plan's
+        choice (:class:`.class_plan.Diagonal`, ``None`` where the class is another case)."""
+        model, placement = self.model, self.placement
+        chosen = choice is not None
+        placement.sparse_diagonal_contact_solve = chosen
+        # Limit rows belong to this specialized owner; without it the ordinary rows keep them.
+        placement.fused_diagonal_joint_limit_sizes = choice.fused_sizes if chosen else frozenset()
+        placement.fused_diagonal_joint_limits = bool(placement.fused_diagonal_joint_limit_sizes)
+        placement.fused_diagonal_limit_dof_mask_host = (
+            choice.fused_mask if chosen else np.zeros(model.joint_dof_count, dtype=np.int32)
         )
-        held = None
-        if sparse_diagonal_pair is not None:
-            held = held_decline(sparse_diagonal_pair[0])
-            if held is not None:
-                sparse_diagonal_pair = None
-        self.placement.sparse_diagonal_contact_solve = self.routes.claim("K2", sparse_diagonal_pair is not None)
-        if declined:
-            self.routes.reasons["K2"] = declined
-        elif held is not None:
-            self.routes.reasons["K2"] = f"Only the held tree evaluates the compact diagonal. {held}"
-        elif sparse_diagonal_pair is None:
-            self.routes.reasons["K2"] = (
-                "No world pairs a diagonal-mass articulation with fused limits and one compact dense articulation."
-            )
-        else:
-            self.routes.reasons["K2"] = (
-                "One diagonal-mass articulation and one compact dense articulation per world share one owner."
-            )
-        if sparse_diagonal_pair is None:
-            # Limit rows belong to this specialized owner. If the complete
-            # response composition is unavailable, retain the ordinary rows.
-            self.placement.fused_diagonal_joint_limits = False
-            self.placement.fused_diagonal_joint_limit_sizes = frozenset()
-            self.placement.fused_diagonal_limit_dof_mask_host.fill(0)
-        self.placement.sparse_diagonal_response_size = (
-            sparse_diagonal_pair[0] if sparse_diagonal_pair is not None else None
-        )
-        self.placement.sparse_diagonal_dense_size = sparse_diagonal_pair[1] if sparse_diagonal_pair is not None else 0
+        placement.sparse_diagonal_response_size = choice.size if chosen else None
+        placement.sparse_diagonal_dense_size = choice.dense_size if chosen else 0
         # A contact is a unit: a normal row, followed by its friction rows only when its region holds an anchor.
-        self.placement.sparse_diagonal_contact_units = bool(
-            self.placement.sparse_diagonal_contact_solve
-            and self.options.enable_contact_friction
-            and self.options.contact_friction_gap_threshold == math.inf
+        placement.sparse_diagonal_contact_units = bool(
+            chosen and self.options.enable_contact_friction and self.options.contact_friction_gap_threshold == math.inf
         )
-        self.placement.sparse_diagonal_speculative_contact_batches = bool(
-            self.placement.sparse_diagonal_contact_units and self.placement.sparse_diagonal_dense_size + 2 <= 16
+        placement.sparse_diagonal_speculative_contact_batches = bool(
+            placement.sparse_diagonal_contact_units and placement.sparse_diagonal_dense_size + 2 <= 16
         )
-        self.placement.sparse_diagonal_dense_offsets = wp.array(
-            sparse_diagonal_pair[2] if sparse_diagonal_pair is not None else np.zeros(1, dtype=np.int32),
-            dtype=wp.int32,
-            device=model.device,
+        placement.sparse_diagonal_dense_offsets = wp.array(
+            choice.dense_offsets if chosen else np.zeros(1, dtype=np.int32), dtype=wp.int32, device=model.device
         )
-        self.placement.sparse_diagonal_dense_groups = wp.array(
-            sparse_diagonal_pair[3] if sparse_diagonal_pair is not None else np.zeros(1, dtype=np.int32),
-            dtype=wp.int32,
-            device=model.device,
+        placement.sparse_diagonal_dense_groups = wp.array(
+            choice.dense_groups if chosen else np.zeros(1, dtype=np.int32), dtype=wp.int32, device=model.device
         )
         # Each world's dense arm, the tree the walk whitens and leaves (FL3.5).
-        self.placement.sparse_diagonal_dense_arts_host = (
-            sparse_diagonal_pair[4] if sparse_diagonal_pair is not None else np.zeros(0, dtype=np.int32)
-        )
+        placement.sparse_diagonal_dense_arts_host = choice.dense_arts if chosen else np.zeros(0, dtype=np.int32)
 
-    def _select_fused_diagonal_limits(self) -> None:
-        """Select independent position limits that can remain outside the dense row system."""
+    def place_packed(self, choice) -> None:
+        """Case K1, a single tree: native sparse factors with independent rigid-body response blocks, from the class
+        plan's choice (:class:`.class_plan.Packed`, ``None`` where the class is another case)."""
         model = self.model
-        self.placement.fused_diagonal_joint_limits = False
-        self.placement.fused_diagonal_joint_limit_sizes = frozenset()
-        self.placement.fused_diagonal_limit_dof_mask_host = np.zeros(model.joint_dof_count, dtype=np.int32)
-        supported = bool(
-            model.joint_dof_count > 0
-            and self.options.enable_joint_limits
-            and self.options.enable_contact_friction
-            and not self.options.enable_joint_velocity_limits
-            and not self.options.pgs_warmstart
-            and not self.forest.has_free_rigid_bodies
-            and self.laws.mimic_count == 0
-            and self.laws.link_count == 0
-        )
-        if not supported:
-            return
-
-        candidate_sizes = self.forest.diagonal_mass_sizes.intersection(self.laws.joint_limit_sizes)
-        if not candidate_sizes:
-            return
-        response_dof_count = self.forest.response_dof_count
-        articulation_world = self.forest.articulation_world
-        articulation_dof_start = self.forest.articulation_dof_start_host
-        pairs = _world_diagonal_pairs(articulation_world, response_dof_count, self.forest.world_count, candidate_sizes)
-        if pairs is None:
-            return
-        diagonal_articulations, dense_articulations = pairs
-        dense_size = response_dof_count[dense_articulations]
-        if np.any((dense_size <= 0) | (dense_size > _CONTACT_JACOBIAN_MAX_DOF)):
-            return
-
-        # The diagonal articulations with a limited DOF fuse all their DOFs' limits.
-        diagonal_size = response_dof_count[diagonal_articulations]
-        art, local_dof = host_index.expand(diagonal_size)
-        dof = articulation_dof_start[diagonal_articulations][art] + local_dof
-        valid = self.laws.joint_limit_q_index_host[dof] >= 0
-        limited = np.bincount(art[valid], minlength=diagonal_articulations.size) > 0
-        self.placement.fused_diagonal_limit_dof_mask_host[dof[limited[art]]] = valid[limited[art]]
-        # Add each size where a world first has it, as the per-world set did.
-        selected_sizes: set[int] = {int(size) for size in host_index.ordered_unique(diagonal_size[limited])}
-        self.placement.fused_diagonal_joint_limit_sizes = frozenset(selected_sizes)
-        self.placement.fused_diagonal_joint_limits = bool(selected_sizes)
-
-    def _select_sparse_diagonal_response_pair(
-        self, *, factor_dense_contract: bool
-    ) -> tuple[int, int, np.ndarray, np.ndarray, np.ndarray] | None:
-        """Select one independent wide component plus one compact dense component per world: the two sizes, then per
-        world the dense component's first world coordinate, its group index and its articulation."""
-        if not factor_dense_contract or not self.placement.fused_diagonal_joint_limits:
-            return None
-
-        response_dofs = self.forest.response_dof_count
-        articulation_world = self.forest.articulation_world
-        is_free_rigid = self.forest.is_free_rigid_host
-        offsets = self.forest.articulation_world_dof_offset.numpy()
-        group_indices = self.forest.art_group_idx.numpy()
-        pairs = _world_diagonal_pairs(
-            articulation_world, response_dofs, self.forest.world_count, self.placement.fused_diagonal_joint_limit_sizes
-        )
-        if pairs is None or self.forest.world_count == 0:
-            return None
-        diagonal_arts, dense_arts = pairs
-        if np.any(is_free_rigid[diagonal_arts] != 0) or np.any(is_free_rigid[dense_arts] != 0):
-            return None
-        # Every world pairs the same two sizes.
-        diagonal_size = response_dofs[diagonal_arts]
-        dense_size = response_dofs[dense_arts]
-        if np.any((dense_size <= 0) | (dense_size > _CONTACT_JACOBIAN_MAX_DOF)):
-            return None
-        if np.any(diagonal_size != diagonal_size[0]) or np.any(dense_size != dense_size[0]):
-            return None
-        dense_offsets = offsets[dense_arts].astype(np.int32)
-        dense_groups = group_indices[dense_arts].astype(np.int32)
-        if np.any(dense_offsets < 0) or np.any(dense_groups < 0):
-            return None
-        return int(diagonal_size[0]), int(dense_size[0]), dense_offsets, dense_groups, dense_arts.astype(np.int32)
-
-    def admit_packed(self, model, held_decline: Callable) -> None:
-        """Select sparse articulation factors with independent rigid-body response blocks."""
         self.placement.sparse_mass_matrix_size = None
         self.sparse_velocity_limits = False
         self.support_rows = self.support_units_kernel = self._support_sink = None
@@ -317,201 +161,33 @@ class Sweep:
         self.placement.sparse_contact_records = None
         self.placement.friction_metric = None
         self.placement.sparse_max_row_support = None
-        # Case K1, a single tree.
-        velocity_candidate = self.options.enable_joint_velocity_limits and not self.forest.has_free_rigid_bodies
-        declined = self.routes.taken("K1") or first_failed(
-            (
-                (self.pins.get("storage") != "dense", "A test pin keeps dense storage (storage='dense')."),
-                (not self.pins.get("tiers"), "A test pin builds the Jacobi tiers (tiers) on dense storage."),
-                (self.factor.parallel_drives, "Drive topology is not supported by native sparse factors."),
-                (
-                    not self.laws.mimic_count or velocity_candidate,
-                    "Mimic rows require the sparse velocity-row composition.",
-                ),
-            )
-        )
-        if declined is not None:
-            self.routes.reasons["K1"] = declined
+        if choice is None:
             return
-        # Decide ownership before omitting dense buffers. Explicit research
-        # recipes retain their own admission and fallback, including when their
-        # requested owner later declines the topology. They cannot acquire
-        # dense storage after this sparse allocation decision.
-        if self.forest.has_free_rigid_bodies:
-            # A world that pairs an articulation with free rigid bodies is served
-            # by the held-tree owner and the paired response on the dense route
-            # (measured: Kuka lift 12.7 ms there against 15.5 on sparse factors).
-            # Both friction laws: patch friction walks contact units in the paired
-            # sweep and keeps the resolved-world classifier. Native sparse factors never serve free rigid bodies.
-            self.routes.reasons["K1"] = (
-                "Worlds with free rigid bodies keep the dense route for the held-tree owner and paired response."
-            )
-            return
-        response_dofs = self.forest.response_dof_count
-        if velocity_candidate and (self.forest.has_prescribed_response or np.any(self.factor.kinematic_dof_mask_host)):
-            self.routes.reasons["K1"] = "Sparse velocity rows do not support prescribed-coordinate topology."
-            return
-        free_rigid = self.forest.is_free_rigid_host != 0
-        articulated = np.flatnonzero((response_dofs > 0) & ~free_rigid)
-        sizes = np.unique(response_dofs[articulated])
-        if len(sizes) != 1:
-            self.routes.reasons["K1"] = "Native sparse factors require one articulated response DOF size."
-            return
-        size = int(sizes[0])
-        # The endpoint support uses one 64-bit ancestry mask, not a robot-specific DOF limit.
-        if (
-            size > 64
-            or size not in self.forest.crba_dof_joint_offset_by_size
-            or size in self.forest.diagonal_mass_sizes
-        ):
-            self.routes.reasons["K1"] = (
-                "Articulated topology needs at most 64 response DOFs, a CRBA mapping and non-diagonal inertia."
-            )
-            return
-        articulated_counts = np.bincount(self.forest.articulation_world[articulated], minlength=self.forest.world_count)
-        articulation_start = model.articulation_start.numpy()
-        joint_ancestor = model.joint_ancestor.numpy()
-        joint_qd_start = model.joint_qd_start.numpy()
-        art = int(self.forest.group_to_art[size].numpy()[0])
-        start = int(articulation_start[art])
-        end = int(self.forest.articulation_joint_end_host[art])
-        tree = TreePlan.build(
-            local_parents(joint_ancestor, [start], end - start)[0], np.diff(joint_qd_start[start : end + 1])
-        )
-        plan = tree.factor
-        # Velocity rows can benefit from factor-coordinate response even for a
-        # serial chain; this owner does not require zeros in the mass factor.
-        if plan.dof_count != size or (not velocity_candidate and plan.nonzero_count >= size * (size + 1) // 2):
-            self.routes.reasons["K1"] = "Topology has no usable sparse factor layout for this row policy."
-            return
-        # Native sparse factors are the held tree's representation: a candidate only where it takes their group.
-        held = held_decline(size, plan, velocity_limits=velocity_candidate)
-        if held is not None:
-            self.routes.reasons["K1"] = f"Only the held tree evaluates native sparse factors. {held}"
-            return
-
-        mimic_dofs = None
-        if self.laws.mimic_count:
-            mimic_indices = self.laws._mimic_art_list.numpy()
-            mimic_arts, _ = host_index.expand(np.diff(self.laws.mimic_art_start_np))
-            starts = self.forest.articulation_dof_start_host[mimic_arts]
-            mimic_dofs = (
-                self.laws._mimic_dof0.numpy()[mimic_indices] - starts,
-                self.laws._mimic_dof1.numpy()[mimic_indices] - starts,
-            )
-        body_masks, max_support = row_support(self.forest, model, plan, articulated, articulated_counts, mimic_dofs)
-        if not max_support:
-            self.routes.reasons["K1"] = "Topology has no responsive row support."
-            return
-        # The sweep's shared working set (sweep_routes_sparse.sparse_staging) against the device's static budget:
-        # each shared-memory choice below reads its own sweep's working set, and the route is admitted by the working
-        # set of the sweep it launches, which the sweep's factory checks the same way.
-        budget = arch_budget(model.device.arch)
-        staging = functools.partial(
-            sweep_routes_sparse.sparse_staging,
-            self.placement.dense_max_constraints,
-            self.forest.max_world_dofs,
-            int(max_support),
-            velocity_limits=velocity_candidate,
-            linked_rows=True,
-            torsion=self.laws.spin_rows,
-        )
-        # Patch friction keeps the packed lanes of small worlds, so size them from the
-        # full sweep before the active-row scan claims whole warps.
-        small_world_lanes = self._sparse_small_world_lanes(staging, budget)
-        active_rows, active_rows_reason = self._admit_sparse_active_rows(
-            small_world_lanes=small_world_lanes,
-            fits=lambda: staging(active_rows=True).fits(budget),
-        )
-        shape = (self.forest.world_count, self.placement.dense_max_constraints, max_support)
-        offsets = self.forest.articulation_world_dof_offset.numpy()
-        support_classes = None
-        if (
-            self.pins.get("row_support", True)
-            and not self.laws.mimic_count
-            and np.all(articulated_counts == 1)
-            and size == self.forest.max_world_dofs
-            and np.all(offsets[articulated] == 0)
-        ):
-            # The classes of the bodies a contact can name (those with shapes; the row width is theirs too): a
-            # shape-less body takes the empty class.
-            contact_bodies = np.zeros(body_masks.shape[0], dtype=bool)
-            shape_body = model.shape_body.numpy()
-            contact_bodies[shape_body[shape_body >= 0]] = True
-            classes = tree.support_classes(np.where(contact_bodies, body_masks, np.uint64(0)), max_support)
-            if classes is not None:
-                table_bytes = sum(
-                    getattr(classes, name).nbytes for name in ("body_class", "pair_class", "class_dof", "limit_class")
-                )
-                table_bytes += 4 * self.forest.world_count * self.placement.dense_max_constraints
-                # Small batches with many support patterns can favor direct indices.
-                if table_bytes < 4 * int(np.prod(shape)):
-                    support_classes = classes
-        # Unsupported mixed worlds retain explicit row indices and their existing kernels.
-        use_support_table = support_classes is not None
-        # A small world packs a lane group of 8 or 16 (_sparse_small_world_lanes) without changing this owner's row
-        # representation, sweep policy or velocity-limit phase.
-        lanes = small_world_lanes if small_world_lanes and not active_rows else 32
-        triplet_capacity = self.placement.dense_max_constraints // 3
-        contact_triplets, contact_triplets_reason = self._admit_sparse_contact_triplets(
-            active_rows=active_rows,
-            use_support_table=use_support_table,
-            lanes=lanes,
-            fits=lambda: (
-                triplet_capacity > 0
-                and staging(active_rows=active_rows, use_support_table=use_support_table, contact_triplets=True).fits(
-                    budget
-                )
-            ),
-        )
-        # Large resident workspaces regressed whole-step timing in measured
-        # small systems. Keep the global-row consumer when the cache is large.
-        local_factors = bool(
-            lanes < 32
-            and staging(lanes_per_world=lanes, local_factors=True).bytes <= min(budget, _SPARSE_LOCAL_WORKSPACE_BYTES)
-        )
-        sweep = {
-            "active_rows": active_rows,
-            "use_support_table": use_support_table,
-            "contact_triplets": contact_triplets,
-            "lanes_per_world": lanes,
-            "local_factors": local_factors,
-        }
-        solve = staging(**sweep)
-        if not solve.fits(budget):
-            self.routes.reasons["K1"] = (
-                f"Row capacity needs {solve.bytes} bytes of shared memory for sparse solving; limit is {budget}."
-            )
-            return
-        self.routes.reasons["K1"] = (
-            f"Automatic sparse selection: {size}-DOF topology and row policy admitted; "
-            f"solve uses {solve.bytes}/{budget} bytes of shared memory."
-        )
-        self.routes.claim("K1")
-        self.placement.sparse_mass_matrix_size = size
-        self.sparse_active_rows = active_rows
-        self.sparse_active_rows_reason = active_rows_reason
-        self.sparse_contact_triplets = contact_triplets
-        self.sparse_contact_triplets_reason = contact_triplets_reason
-        self.sparse_solve_lanes = lanes
-        self.sparse_local_factors = local_factors
-        self.placement.sparse_max_row_support = int(max_support)
-        self.sparse_velocity_limits = velocity_candidate
-        self.factor.allocate_sparse(plan)
-        self.placement.sparse_body_dof_mask = wp.array(body_masks, dtype=wp.uint64, device=model.device)
-        if use_support_table:
+        sweep, max_support = dict(choice.sweep), choice.max_support
+        self.placement.sparse_mass_matrix_size = choice.size
+        self.sparse_active_rows = sweep["active_rows"]
+        self.sparse_active_rows_reason = choice.active_rows_reason
+        self.sparse_contact_triplets = sweep["contact_triplets"]
+        self.sparse_contact_triplets_reason = choice.contact_triplets_reason
+        self.sparse_solve_lanes = sweep["lanes_per_world"]
+        self.sparse_local_factors = sweep["local_factors"]
+        self.placement.sparse_max_row_support = max_support
+        self.sparse_velocity_limits = choice.velocity_limits
+        self.factor.allocate_sparse(choice.plan)
+        self.placement.sparse_body_dof_mask = wp.array(choice.body_masks, dtype=wp.uint64, device=model.device)
+        if sweep["use_support_table"]:
             self.placement.sparse_row_support = row_supports(
-                support_classes, self.forest.world_count, self.placement.dense_max_constraints, model.device
+                choice.support_classes, self.forest.world_count, self.placement.dense_max_constraints, model.device
             )
-        if contact_triplets or self.laws.spin_rows:
+        if self.sparse_contact_triplets or self.laws.spin_rows:
             # Static storage for graph capture: the builder writes the block records of each step's
             # contact units, every friction triple's metric among them where spin rows may appear; linked sweeps add
             # each anchor's ring members once per call.
             width = CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS
             self.placement.arrays.allocate(
-                SPARSE_CONTACT_RECORDS, world=self.forest.world_count, triplet=triplet_capacity, record=width
+                SPARSE_CONTACT_RECORDS, world=self.forest.world_count, triplet=choice.triplet_capacity, record=width
             )
-        index_shape = (1, 1, 1) if use_support_table else shape
+        index_shape = choice.index_shape
         self.placement.arrays.allocate(
             SPARSE_ROWS,
             index_world=index_shape[0],
@@ -614,86 +290,49 @@ class Sweep:
             self.support_threads = walk_rows.support_threads(worlds * capacity, self.model.device)
         return self._support_sink
 
-    def admit_paired(self) -> None:
-        """Case K5, a tree beside one free body: the paired response and its factor coordinates."""
-        model = self.model
-        laws = self.laws.set
-        self.paired_response_reason = self.routes.taken("K5")
-        response_pair = None if self.paired_response_reason else self._select_paired_response()
-        if response_pair is None and self.paired_response_reason is None:
-            self.paired_response_reason = (
-                f"No world pairs one tree of {_PAIRED_MIN_DOF} to 26 coordinates with exactly one free body."
-            )
-        self.paired_response_primary_size = response_pair[0] if response_pair is not None else None
-        self.paired_response_secondary_size = response_pair[1] if response_pair is not None else None
-        self.routes.reasons["K5"] = "No paired response." if response_pair is None else None
-        self.paired_factor_coordinates = self.routes.claim("K5", self.routes.reasons["K5"] is None)
+    def place_paired(self, choice, reason: str | None) -> None:
+        """Case K5, a tree beside one free body: the paired response and its factor coordinates, from the class plan's
+        choice (:class:`.class_plan.Paired`, ``None`` where the class is another case, ``reason`` saying why)."""
+        model, forest = self.model, self.forest
+        self.paired_response_reason = reason
+        self.paired_factor_coordinates = choice is not None
+        self.paired_response_primary_size = choice.primary if choice is not None else None
+        self.paired_response_secondary_size = choice.secondary if choice is not None else None
         # Patch contacts are units of one row, or three (four with a spin row) when they own an anchor;
         # the factor sweep walks them with the generic path's row order and
         # arithmetic, solving each tangent pair once.
-        self.factor_coordinate_contact_units = bool(self.paired_factor_coordinates and not laws.compliance)
+        self.factor_coordinate_contact_units = bool(self.paired_factor_coordinates and not self.laws.set.compliance)
         self.paired_factor_primary_offsets_by_world = None
         self.paired_factor_secondary_offsets_by_world = None
         self.paired_factor_primary_arts_by_world = None
-        if self.paired_factor_coordinates:
-            primary_arts = self.forest.group_to_art_host[response_pair[0]]
-            secondary_arts = self.forest.group_to_art_host[response_pair[1]]
-            primary_offsets = np.empty(self.forest.world_count, dtype=np.int32)
-            secondary_offsets = np.empty(self.forest.world_count, dtype=np.int32)
-            # Each world's articulation: where the paired components' check reads its walk (paired_components).
-            primary_by_world = np.full(self.forest.world_count, -1, dtype=np.int32)
-            articulation_world = self.forest.articulation_world
-            articulation_dof_start = self.forest.articulation_dof_start_host
-            for primary_group, primary_art in enumerate(primary_arts):
-                world = int(articulation_world[primary_art])
-                secondary_group = int(response_pair[2][primary_group])
-                secondary_art = int(secondary_arts[secondary_group])
-                primary_by_world[world] = int(primary_art)
-                primary_first = articulation_dof_start[primary_art] < articulation_dof_start[secondary_art]
-                primary_offsets[world] = 0 if primary_first else response_pair[1]
-                secondary_offsets[world] = response_pair[0] if primary_first else 0
-            self.paired_factor_primary_offsets_by_world = wp.array(primary_offsets, dtype=wp.int32, device=model.device)
-            self.paired_factor_secondary_offsets_by_world = wp.array(
-                secondary_offsets, dtype=wp.int32, device=model.device
-            )
-            self.paired_factor_primary_arts_by_world = wp.array(primary_by_world, dtype=wp.int32, device=model.device)
+        if choice is None:
+            return
+        primary_arts = forest.group_to_art_host[choice.primary]
+        secondary_arts = forest.group_to_art_host[choice.secondary]
+        primary_offsets = np.empty(forest.world_count, dtype=np.int32)
+        secondary_offsets = np.empty(forest.world_count, dtype=np.int32)
+        # Each world's articulation: where the paired components' check reads its walk (paired_components).
+        primary_by_world = np.full(forest.world_count, -1, dtype=np.int32)
+        for primary_group, primary_art in enumerate(primary_arts):
+            world = int(forest.articulation_world[primary_art])
+            secondary_art = int(secondary_arts[int(choice.groups[primary_group])])
+            primary_by_world[world] = int(primary_art)
+            dof_start = forest.articulation_dof_start_host
+            primary_first = dof_start[primary_art] < dof_start[secondary_art]
+            primary_offsets[world] = 0 if primary_first else choice.secondary
+            secondary_offsets[world] = choice.primary if primary_first else 0
+        self.paired_factor_primary_offsets_by_world = wp.array(primary_offsets, dtype=wp.int32, device=model.device)
+        self.paired_factor_secondary_offsets_by_world = wp.array(secondary_offsets, dtype=wp.int32, device=model.device)
+        self.paired_factor_primary_arts_by_world = wp.array(primary_by_world, dtype=wp.int32, device=model.device)
 
-    def plan_tier_rows(self) -> None:
-        """Choose the Jacobi tiers from the class (case K4): their row bound and their in-kernel response.
-
-        The tiers serve the dense rows of a tree beside a free body where no earlier case claims the class
-        (:meth:`.route_table.RouteTable.taken`). They form each world's response in the kernel, which bounds the class
-        (:meth:`.placement.Placement.inkernel_response_meta`: one articulation of each of one or two sizes per world, at most
-        ``_INKERNEL_MAX_DOF`` coordinates each), under the contact laws they implement: they pool each friction pair's
-        cone over its patch ring and step it isotropically, so a sliding pair converges to the serial pair solve's maximal
-        dissipation under either friction law (per-row steps moved body-velocity RMS by 0.4-0.9% on two contact-rich
-        patch workloads, and left point tiers 3.9 times the serial sweep's p90 error from its fixed point on anymal-D's
-        33-48-row worlds). Their row bound is the dense row capacity, at most
-        :data:`.sweep_routes_tiers.TIER_MAX_ROWS`, in whole quads; a test pin (``tiers``) sets it on any class whose
-        response they form. ``ink_rows`` is 0 without tiers and the route table's K4 reason says why or why not
-        (``routes.row.reasons``). The keyed rows read this before the tiers are built.
-        """
-        pinned = self.pins.get("tiers")
-        self.placement.ink_rows, self.placement.ink_sizes = 0, None
-        reason = self.routes.taken("K4") or first_failed(
-            (
-                (self.placement.mf_sweeps, "No matrix-free sweep runs whose dense rows the tiers could take."),
-                (pinned is None or bool(pinned), "A test pin builds no tier (tiers=0)."),
-                (
-                    bool(pinned) or (self.forest.has_free_rigid_bodies and self.forest.has_non_free_articulations),
-                    "The tiers serve a tree beside a free body (case K4).",
-                ),
-            )
-        )
-        if reason is None:
-            sizes, reason = self.placement.inkernel_response_meta()
-            rows = min(int(self.placement.dense_max_constraints), int(pinned or sweep_routes_tiers.TIER_MAX_ROWS))
-            rows -= rows % 4
-            if self.routes.claim("K4", sizes is not None and rows > 0):
-                self.placement.ink_sizes, self.placement.ink_rows = sizes, rows
-            elif sizes is not None:
-                reason = f"The dense row capacity {self.placement.dense_max_constraints} holds no tier of four rows."
-        self.routes.reasons["K4"] = reason
+    def place_tiers(self, choice) -> None:
+        """Case K4, the Jacobi tiers: their row bound and their in-kernel response's trees, from the class plan's
+        choice (:class:`.class_plan.Tiers`, ``None`` where the class is another case). ``ink_rows`` is 0 without
+        tiers; the keyed rows read it before the tiers are built."""
+        placement = self.placement
+        placement.ink_rows, placement.ink_sizes = (choice.rows, choice.sizes) if choice is not None else (0, None)
+        if choice is not None:
+            placement.ink_meta = wp.array(choice.meta.reshape(-1), dtype=wp.int32, device=self.model.device)
 
     def _tier_frame(self) -> tuple[int, int]:
         """Each of the tiers' trees' slip capacity (:meth:`.tree_factor.TreeFactor.slip_capacity`): the release its rows
@@ -758,118 +397,6 @@ class Sweep:
             device=self.model.device,
         )
         return built
-
-    def _sparse_small_world_lanes(self, staging, budget: int) -> int:
-        """Return the lanes per world (8 or 16) that pack a small complete sparse sweep, or 0 for whole warps.
-
-        Args:
-            staging: The sweep's working set for its options (:func:`.sweep_routes_sparse.sparse_staging`).
-            budget: Static shared memory available to one block [B].
-        """
-        if self.forest.max_world_dofs > 16 or self.placement.dense_max_constraints > 64:
-            return 0
-        lanes = 8 if self.forest.max_world_dofs <= 8 else 16
-        return lanes if staging(lanes_per_world=lanes).fits(budget) else 0
-
-    def _admit_sparse_active_rows(self, *, small_world_lanes: int, fits: Callable[[], bool]) -> tuple[bool, str]:
-        """Decide whether the native sparse sweep selects its normal and limit rows at sweep entry, and why.
-
-        Under this law a zero-impulse row that a sweep's earlier updates violate waits for
-        the next sweep. Patch friction (``friction_anchor_beta > 0``) adopts it: a friction
-        pair is visited while any normal of its patch ring is selected or the pair holds
-        impulse, which skips only pairs whose update would be a no-op. Velocity-limit rows keep
-        their last word after the scanned rows. Small worlds keep their packed lanes. A scan
-        whose row bitsets exceed shared memory leaves the full ordered sweep.
-
-        Args:
-            small_world_lanes: Lanes per world of a packed small-world sweep, 0 for whole warps.
-            fits: Whether the active-row scan's working set fits shared memory, evaluated last.
-        """
-        if not self.pins.get("active_rows", True):
-            return False, "A test pin keeps the full ordered sweep (active_rows=False)."
-        if small_world_lanes:
-            return False, (
-                f"Patch friction (friction_anchor_beta > 0) keeps the packed {small_world_lanes}-lane full sweep "
-                "of small worlds."
-            )
-        if not fits():
-            return False, "The full ordered sweep: the active-row scan's row bitsets exceed shared memory."
-        return True, (
-            "Normal and limit rows are selected at sweep entry; a patch friction pair (friction_anchor_beta > 0) "
-            "while any normal of its ring is selected or the pair holds impulse."
-        )
-
-    def _admit_sparse_contact_triplets(
-        self,
-        *,
-        active_rows: bool,
-        use_support_table: bool,
-        lanes: int,
-        fits: Callable[[], bool],
-    ) -> tuple[bool, str]:
-        """Decide whether the sparse sweep fuses contact triplets, and why: wherever the row structure admits them.
-
-        Patch friction fuses its anchor units, pooling their ring loads as the ordinary pair
-        update does, in the active scan or else in the full ordered sweep; packed small-world
-        sweeps keep ordinary updates. A fused triplet is a contact unit on its Gram block
-        (:func:`.sweep_routes_sparse.contact_units`): in exact arithmetic the ordinary sweep's
-        normal and pair updates, in one reduction and one apply.
-
-        Args:
-            active_rows: Whether the sweep selects its rows at sweep entry.
-            use_support_table: Whether rows read the shared support table.
-            lanes: Lanes per world of the sweep.
-            fits: Whether contact units fit the row capacity and shared memory, evaluated last.
-        """
-        if "contact_units" in self.pins and self.pins["contact_units"] != "triplets":
-            return False, "A test pin keeps unfused contact rows (contact_units=None)."
-        if lanes < 32:
-            return False, f"Small worlds keep their packed {lanes}-lane full sweep."
-        if not use_support_table:
-            return False, "Triplets need the row support table."
-        if not fits():
-            return False, "Row capacity or shared memory leaves no room for contact units."
-        sweep = "active-row scan" if active_rows else "full ordered sweep"
-        return True, f"Fused wherever the rows admit them: patch anchor units pool their ring loads in the {sweep}."
-
-    def _select_paired_response(self) -> tuple[int, int, np.ndarray] | None:
-        """Select one complete robot/free-body response pair per world."""
-        if self.routes.case in ("K1", "K2") or 6 not in self.forest.size_groups:
-            return None
-
-        response_dofs = self.forest.response_dof_count
-        articulation_world = self.forest.articulation_world
-        is_free_rigid = self.forest.is_free_rigid_host
-        # Each world's response articulations, in ascending order.
-        responding = np.flatnonzero(response_dofs > 0)
-        world_bounds, order = host_index.group_by(articulation_world[responding], self.forest.world_count)
-        responding = responding[order].tolist()
-        response_by_world = [responding[world_bounds[w] : world_bounds[w + 1]] for w in range(self.forest.world_count)]
-
-        secondary_group_arts = self.forest.group_to_art_host[6]
-        secondary_group_index = {int(art): group for group, art in enumerate(secondary_group_arts)}
-        for primary_size in sorted(self.paired_response_candidate_sizes, reverse=True):
-            primary_arts = self.forest.group_to_art_host.get(primary_size, ())
-            if len(primary_arts) != self.forest.world_count:
-                continue
-            paired_groups: list[int] = []
-            paired_arts: list[int] = []
-            for primary_art in primary_arts:
-                world_arts = response_by_world[int(articulation_world[primary_art])]
-                secondaries = [
-                    art
-                    for art in world_arts
-                    if art != primary_art and response_dofs[art] == 6 and is_free_rigid[art] != 0
-                ]
-                if len(world_arts) != 2 or len(secondaries) != 1:
-                    break
-                secondary_art = secondaries[0]
-                paired_arts.append(secondary_art)
-                paired_groups.append(secondary_group_index[secondary_art])
-            else:
-                if len(set(paired_arts)) == len(secondary_group_arts) and set(paired_arts) == set(secondary_group_arts):
-                    return primary_size, 6, np.asarray(paired_groups, dtype=np.int32)
-        return None
 
     def build(self) -> None:
         """Build the paired response and the sweeps."""
@@ -1220,19 +747,19 @@ class Sweep:
         if self.options.pgs_iterations <= 0 and not self.seeded:
             return
         operands = self._operands(v_hat, v_out)
-        if self.leaves and self.routes.case != "K1":
+        if self.leaves and self.case != "K1":
             # The sweeps add their change into the walk's du from zero.
             self.factor.walk_view().du.zero_()
-        if self.routes.case == "K1":
+        if self.case == "K1":
             self._solve_packed(operands)
-        elif self.routes.case == "K2":
+        elif self.case == "K2":
             self._solve_diagonal(operands)
         elif self.forest.max_world_dofs:
             self._solve_claims(operands)
         if self.leaves:
             # The step's one leave: every walking tree's change in the walk's coordinates (the sparse sweep's in its
             # factor coordinates).
-            if self.routes.case == "K1":
+            if self.case == "K1":
                 delta = self.placement.sparse_factor_velocity_delta
                 self.factor.leave(v_out, delta.reshape((delta.size,)), self.support_du_base)
             else:

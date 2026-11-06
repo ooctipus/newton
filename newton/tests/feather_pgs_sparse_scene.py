@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Branched floating or fixed trees with one contacting foot, on native sparse factors or dense storage: the scene,
-the paired solvers and their stepping, shared by the sparse-route tests; and the host probes of the sparse admission
-(:class:`ForestProbe`, :func:`eligible_solver`), which stop it where topology planning starts."""
+the paired solvers and their stepping, shared by the sparse-route tests; and the host probes of the sparse rule
+(:class:`ForestProbe`, :func:`eligible_inputs`), which stop it where topology planning starts."""
 
 from types import SimpleNamespace
 from unittest import mock
@@ -12,7 +12,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.route_table import Laws, RouteTable
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import standing_model
 
@@ -138,27 +137,9 @@ class ForestProbe(SimpleNamespace):
         raise TopologyReached
 
 
-class LawsProbe(SimpleNamespace):
-    """The probe's row-law tables, with the laws axis read from them and the probe's options as ``Laws.build`` reads
-    a solver's (a CUDA model without gradients)."""
-
-    @property
-    def set(self):
-        options = self.options
-        return Laws(
-            regularized=self.regularization_enabled,
-            torsion=self.contact_torsion_enabled,
-            compliance=options.contact_compliance,
-            limits=True,
-            velocity_limits=options.enable_joint_velocity_limits,
-            warm_start=options.pgs_warmstart,
-            preelimination=False,
-            mimic=bool(self.mimic_count),
-        )
-
-
-def eligible_solver():
-    """Provide only the host fields needed before topology planning starts."""
+def eligible_inputs():
+    """The class rules' inputs (:class:`.class_plan.ClassInputs`) the sparse rule reads before topology planning
+    starts: a CUDA model, plain options, one mimic-free tree without free bodies, per-coordinate drives."""
     forest = ForestProbe(has_free_rigid_bodies=False)
     options = SimpleNamespace(
         pgs_iterations=8,
@@ -167,30 +148,25 @@ def eligible_solver():
         contact_compliance=False,
     )
     return SimpleNamespace(
+        model=SimpleNamespace(device=SimpleNamespace(is_cuda=True)),
         pins={},
         factor=SimpleNamespace(parallel_drives=True, eliminates=False),
-        placement=SimpleNamespace(),
-        routes=RouteTable({}, native=True, eliminates=False),
+        dense_rows=32,
         forest=forest,
         options=options,
-        laws=LawsProbe(
-            options=options,
-            forest=forest,
-            regularization_enabled=False,
-            contact_torsion_enabled=False,
-            mimic_count=0,
-        ),
+        laws=SimpleNamespace(options=options, forest=forest, mimic_count=0),
+        packed_decline=None,
     )
 
 
-def change_probe(solver, name, value):
+def change_probe(inputs, name, value):
     """Set a probe's field: an option in its options record, its forest plan in both places that read it."""
     if name == "forest":
-        solver.forest = solver.laws.forest = value
-    elif hasattr(solver.options, name):
-        setattr(solver.options, name, value)
+        inputs.forest = inputs.laws.forest = value
+    elif hasattr(inputs.options, name):
+        setattr(inputs.options, name, value)
     else:
-        setattr(solver, name, value)
+        setattr(inputs, name, value)
 
 
 def equal_dof_trees(branches, depth, device):

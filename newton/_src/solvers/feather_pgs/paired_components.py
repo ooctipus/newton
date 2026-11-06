@@ -65,7 +65,7 @@ def decline(sweep) -> str | None:
     world's rows are qualified at run time, a mimic's among its articulation's)."""
     return first_failed(
         (
-            (sweep.routes.case == "K5", "Components need the paired factor-coordinate sweep (case K5)."),
+            (sweep.case == "K5", "Components need the paired factor-coordinate sweep (case K5)."),
             (
                 sweep.paired_response_secondary_size == FREE_BODY_DOFS
                 and 1 <= (sweep.paired_response_primary_size or 0) <= 32,

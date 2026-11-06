@@ -28,7 +28,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import field_group, keyed_rows, path_selection, sweep_routes_tiers
+from newton._src.solvers.feather_pgs import class_plan, field_group, keyed_rows, path_selection, sweep_routes_tiers
 from newton._src.solvers.feather_pgs import sweep as emitter
 from newton._src.solvers.feather_pgs.device_preludes import RING
 from newton._src.solvers.feather_pgs.factor.kernels import prescale_joint_velocity_limits
@@ -36,7 +36,6 @@ from newton._src.solvers.feather_pgs.factor.walk import WALK_LINK, WalkTrees, pa
 from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.placement import Placement
-from newton._src.solvers.feather_pgs.route_table import RouteTable
 from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -52,7 +51,6 @@ from newton.tests.feather_pgs_law_harness import (
     bias_rows,
     keyed_classes,
     leave_walk,
-    plain_laws,
     row_bias,
     row_lines,
     unpacked_rows,
@@ -1234,76 +1232,95 @@ class TestTierSweeps(unittest.TestCase):
         assert_budget_reaches_the_fixed_point(self, gaps[2], gaps[2000], float(np.max(np.abs(serial))))
 
 
-def _routes(case=None, native=True, eliminates=False, **pins):
-    """A route table whose class ``case`` holds (``None``: no earlier case claims it), on a device that runs the
-    cases' native bodies or (``native=False``) on the CPU, with or without the bilateral pre-elimination."""
-    routes = RouteTable(pins, native=native, eliminates=eliminates)
-    if case is not None:
-        routes.taken(case)
-        routes.claim(case)
-    return routes
-
-
 class TestTierRule(unittest.TestCase):
     """Build the Jacobi tiers for case K4, a tree beside a free body, where no earlier case claims the class."""
 
     @staticmethod
-    def _probe(**changes):
-        """A solver's tier inputs, allegro's by default (a 16-coordinate hand and a cube, 192 dense rows)."""
-        probe = SimpleNamespace(
-            factor=SimpleNamespace(eliminates=False),
-            placement=SimpleNamespace(
-                mf_sweeps=changes.pop("mf_sweeps", True),
-                dense_max_constraints=changes.pop("dense_max_constraints", 192),
-                inkernel_response_meta=changes.pop(
-                    "inkernel_response_meta",
-                    lambda: ((16, 6, 0, 16), "The parallel tiers form the response in-kernel."),
-                ),
-            ),
+    def _rule(response=((16, 6, 0, 16), "The parallel tiers form the response in-kernel."), **changes):
+        """The tier rule on a class's inputs, allegro's by default (a 16-coordinate hand and a cube, 192 dense rows),
+        with the in-kernel response ``response`` (its sizes and why)."""
+        inputs = SimpleNamespace(
             pins={},
-            routes=_routes(),
-            laws=SimpleNamespace(set=plain_laws()),
-            forest=SimpleNamespace(has_free_rigid_bodies=True, has_non_free_articulations=True),
+            dense_rows=192,
+            forest=SimpleNamespace(
+                world_count=4, max_world_dofs=22, has_free_rigid_bodies=True, has_non_free_articulations=True
+            ),
         )
         for name, value in changes.items():
-            setattr(probe, name, value)
-        Sweep.plan_tier_rows(probe)
-        return probe
+            setattr(inputs, name, value)
+        sizes, reason = response
+        meta = None if sizes is None else np.zeros((4, 4), np.int32)
+        with patch.object(class_plan, "tier_response", lambda forest: (sizes, meta, reason)):
+            return class_plan.tier_rule(inputs)
 
     def test_a_tree_beside_a_body_takes_the_tiers(self):
         """Bound the tiers by the dense row capacity, at most 128 rows, in whole quads."""
-        probe = self._probe()
-        self.assertEqual((probe.placement.ink_rows, probe.placement.ink_sizes), (128, (16, 6, 0, 16)))
-        self.assertEqual(self._probe(dense_max_constraints=50).placement.ink_rows, 48)
-        self.assertIsNone(self._probe(dense_max_constraints=3).placement.ink_sizes)
+        choice, _ = self._rule()
+        self.assertEqual((choice.rows, choice.sizes), (128, (16, 6, 0, 16)))
+        self.assertEqual(self._rule(dense_rows=50)[0].rows, 48)
+        self.assertIsNone(self._rule(dense_rows=3)[0])
 
     def test_other_classes_keep_their_placement(self):
         """Leave every other class to its own placement and say why."""
         for changes, reason in (
-            # Packed factors (a single tree) or the sparse diagonal (a star) leave no matrix-free sweep.
-            ({"mf_sweeps": False}, "No matrix-free sweep"),
-            ({"routes": _routes(eliminates=True)}, "pre-elimination"),
-            ({"routes": _routes("K5")}, "case K5"),
-            ({"forest": SimpleNamespace(has_free_rigid_bodies=False, has_non_free_articulations=True)}, "case K4"),
-            ({"forest": SimpleNamespace(has_free_rigid_bodies=True, has_non_free_articulations=False)}, "case K4"),
-            ({"routes": _routes(placement="general")}, "general placement"),
-            # The tiers' bodies are written for CUDA only (the CPU takes the general row).
-            ({"routes": _routes(native=False)}, "written for CUDA"),
-            ({"pins": {"tiers": 0}}, "tiers=0"),
+            # A class with no coordinate a world leaves no matrix-free sweep.
             (
-                {"inkernel_response_meta": lambda: (None, "A world has several articulations of size 6.")},
-                "several",
+                {
+                    "forest": SimpleNamespace(
+                        world_count=4, max_world_dofs=0, has_free_rigid_bodies=True, has_non_free_articulations=True
+                    )
+                },
+                "No matrix-free sweep",
             ),
+            (
+                {
+                    "forest": SimpleNamespace(
+                        world_count=4, max_world_dofs=22, has_free_rigid_bodies=False, has_non_free_articulations=True
+                    )
+                },
+                "case K4",
+            ),
+            (
+                {
+                    "forest": SimpleNamespace(
+                        world_count=4, max_world_dofs=22, has_free_rigid_bodies=True, has_non_free_articulations=False
+                    )
+                },
+                "case K4",
+            ),
+            ({"pins": {"tiers": 0}}, "tiers=0"),
+            ({"response": (None, "A world has several articulations of size 6.")}, "several"),
         ):
             with self.subTest(changes=sorted(changes)):
-                probe = self._probe(**changes)
-                self.assertEqual((probe.placement.ink_rows, probe.placement.ink_sizes), (0, None))
-                self.assertIn(reason, probe.routes.reasons["K4"])
+                choice, why = self._rule(**changes)
+                self.assertIsNone(choice)
+                self.assertIn(reason, why)
+
+    def test_an_earlier_case_or_the_general_data_keep_the_class(self):
+        """Give the class to an earlier case that fits, and keep every class general under a pin, the CPU or the
+        bilateral pre-elimination."""
+        tiers = next(rule for name, _, rule in class_plan.RULES if name == "K4")
+        rules = (("K5", "factor coordinates of a tree beside one free body", lambda inputs: (object(), None)),)
+        with patch.object(class_plan, "RULES", (*rules, ("K4", "the Jacobi tiers", tiers))):
+            plan = class_plan.plan_class(SimpleNamespace(), general=None)
+        self.assertEqual(plan.case, "K5")
+        self.assertIn("case K5", plan.reasons["K4"])
+        for data, phrase in (
+            ({"native": True, "eliminates": True}, "pre-elimination"),
+            ({"native": False, "eliminates": False}, "written for CUDA"),
+        ):
+            general = class_plan.general_reason({}, **data)
+            self.assertIn(phrase, class_plan.plan_class(SimpleNamespace(), general=general).reasons["K4"])
+        general = class_plan.general_reason({"placement": "general"}, native=True, eliminates=False)
+        self.assertIn("general placement", general)
 
     def test_a_pin_builds_the_tiers_on_a_single_tree(self):
         """Build the tiers a test pin asks for on a class whose response they form, at the pinned bound."""
-        probe = self._probe(_has_free_rigid_bodies=False, pins={"tiers": 32})
-        self.assertEqual((probe.placement.ink_rows, probe.placement.ink_sizes), (32, (16, 6, 0, 16)))
+        forest = SimpleNamespace(
+            world_count=4, max_world_dofs=22, has_free_rigid_bodies=False, has_non_free_articulations=True
+        )
+        choice, _ = self._rule(forest=forest, pins={"tiers": 32})
+        self.assertEqual((choice.rows, choice.sizes), (32, (16, 6, 0, 16)))
 
 
 def _dummy(arg):

@@ -146,8 +146,6 @@ __all__ = ["Placement"]
 
 # Per-world preset of the first rejected row slot: no reservation was rejected.
 _ROW_SLOT_UNBOUNDED = ROW_SLOT_UNBOUNDED
-# The largest articulation the tiers hold (case K4): a lane keeps its row's coordinates in registers.
-_INKERNEL_MAX_DOF = 32
 
 
 @wp.kernel
@@ -667,45 +665,6 @@ class Placement:
             return
         if paired_coordinates and not self.packed_dense:
             raise RuntimeError("The paired factor-coordinate sweep reads packed rows at their world coordinates")
-
-    def inkernel_response_meta(self) -> tuple[tuple[int, int, int, int] | None, str]:
-        """Return the in-kernel response's group sizes and offsets ``(NA, NB, OA, OB)``, or ``None``, and why.
-
-        The parallel tiers walk the rows of up to two size groups, one articulation of each size per world with a
-        primary in every world, at one world DOF offset per size when the response is written in world layout:
-        ``ink_meta`` holds each world's articulation of each size and its first world coordinate (``-1`` for none).
-        """
-        if self.forest.art_to_world is None:
-            return None, "No articulation->world map."
-        if not (1 <= len(self.forest.size_groups) <= 2):
-            return None, f"{len(self.forest.size_groups)} size groups; the in-kernel response takes one or two."
-        sizes = sorted((int(s) for s in self.forest.size_groups), reverse=True)
-        if sizes[0] > _INKERNEL_MAX_DOF:
-            return None, f"Size {sizes[0]} exceeds the tiers' {_INKERNEL_MAX_DOF} coordinates a row."
-        art_to_world = self.forest.art_to_world.numpy()
-        dof_off = self.forest.articulation_world_dof_offset.numpy()
-        meta = -np.ones((self.forest.world_count, 4), dtype=np.int32)
-        offsets = [0, 0]
-        for col, size in enumerate(sizes):
-            g2a = self.forest.group_to_art[size].numpy()
-            worlds = art_to_world[g2a]
-            if np.unique(worlds).size != worlds.size:
-                return None, f"A world has several articulations of size {size}."
-            # The rows lie at their world coordinates (the packed rows' dense layout).
-            off = dof_off[g2a]
-            if off.size and np.any(off != off[0]):
-                # The register rows use compile-time offsets.
-                return None, f"The world DOF offsets of size {size} differ."
-            offsets[col] = int(off[0]) if off.size else 0
-            meta[worlds, 2 * col] = g2a
-            meta[worlds, 2 * col + 1] = off
-        if np.any(meta[:, 0] < 0):
-            return None, "A world has no primary articulation."
-        nb = sizes[1] if len(sizes) > 1 else 0
-        if offsets[0] + sizes[0] > self.forest.max_world_dofs or (nb and offsets[1] + nb > self.forest.max_world_dofs):
-            return None, "The group DOFs exceed the world DOF count."
-        self.ink_meta = wp.array(meta.reshape(-1), dtype=wp.int32, device=self.model.device)
-        return (sizes[0], nb, offsets[0], offsets[1]), f"The parallel tiers walk the rows of sizes {sizes}."
 
     def allocate_status(self):
         """The capacity status, the overflow warning and the row telemetry."""

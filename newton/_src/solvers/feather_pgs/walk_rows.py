@@ -1585,7 +1585,7 @@ def packed_sink(solver) -> RowSink:
     placement = solver.placement
     sink = row_sink(solver.factor, solver.forest, placement, solver.v_hat)
     sink.layout = placement.row_support()
-    if solver.routes.case == "K2":
+    if solver.classes.case == "K2":
         sink.entries = placement.J_by_size[placement.sparse_diagonal_dense_size]
         sink.star = int(placement.sparse_diagonal_response_size)
     else:

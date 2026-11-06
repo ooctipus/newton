@@ -5,17 +5,16 @@
 
 import os
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import class_plan
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
-from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_sparse_scene as sparse_scene
@@ -33,7 +32,7 @@ from newton.tests.feather_pgs_sparse_scene import (
     ForestProbe,
     TopologyReached,
     change_probe,
-    eligible_solver,
+    eligible_inputs,
 )
 from newton.tests.test_feather_pgs_sparse_pgs import _sweep
 
@@ -46,36 +45,33 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
         seeds its factor delta with the carried impulses' response. Material
         contacts are admitted: the sparse sweeps step them by their weights.
         """
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         recipes = ({}, {"pgs_warmstart": True}, {"contact_compliance": True})
         for recipe in recipes:
-            solver = eligible_solver()
-            solver.options.enable_joint_velocity_limits = True
+            inputs = eligible_inputs()
+            inputs.options.enable_joint_velocity_limits = True
             for key, value in recipe.items():
-                change_probe(solver, key, value)
+                change_probe(inputs, key, value)
             with (
                 self.subTest(recipe=recipe),
                 mock.patch.dict(os.environ, {}, clear=True),
                 self.assertRaises(TopologyReached),
             ):
-                Sweep.admit_packed(solver, model, None)
+                class_plan.packed_rule(inputs)
 
     def test_default_and_unsupported_recipes_keep_existing_owner(self):
         """Decline unsupported laws before removing ordinary response storage."""
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         for changes in (
             {"pins": {"storage": "dense"}},
             {"pgs_warmstart": True, "forest": ForestProbe(has_free_rigid_bodies=True)},
             {"forest": ForestProbe(has_free_rigid_bodies=True)},
         ):
             with self.subTest(changes=changes), mock.patch.dict(os.environ, {}, clear=True):
-                solver = eligible_solver()
-                solver.options.enable_joint_velocity_limits = True
+                inputs = eligible_inputs()
+                inputs.options.enable_joint_velocity_limits = True
                 for key, value in changes.items():
-                    change_probe(solver, key, value)
-                Sweep.admit_packed(solver, model, None)
-                self.assertFalse(solver.sparse_velocity_limits)
-                self.assertIsNone(solver.placement.sparse_mass_matrix_size)
+                    change_probe(inputs, key, value)
+                choice, _ = class_plan.packed_rule(inputs)
+                self.assertIsNone(choice)
 
 
 def _physical_sweep(jacobian, response, initial, bias, diagonal, kinds, parents, mu, impulses, *, iterations, omega):

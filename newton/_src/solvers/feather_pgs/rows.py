@@ -980,9 +980,9 @@ class RowLaws:
             if contacts is not None
             else ContactInput()
         )
-        if solver.routes.case == "K1":
+        if solver.classes.case == "K1":
             self.write_support(solver, state_in, contact_input, dt)
-        elif solver.routes.case == "K2":
+        elif solver.classes.case == "K2":
             self.write_slot_rows(solver, contacts, contact_input, dt)
         else:
             self.write_general(solver, state_in, contact_input, dt, part)

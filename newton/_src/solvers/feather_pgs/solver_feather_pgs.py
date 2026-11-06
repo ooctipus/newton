@@ -37,6 +37,7 @@ from ..solver import SolverBase
 from . import environment_flags as _environment_flags
 from .audit import Audit
 from .body_cut import BodyCut
+from .class_plan import ClassInputs, general_reason, plan_class
 from .configuration import Diagnostics, check_options
 from .field_group import Field, FieldGroup, SolverArrays
 from .forest_plan import ForestPlan, joint_forest
@@ -47,7 +48,7 @@ from .path_selection import (
     route_selection,
 )
 from .placement import Placement
-from .route_table import RouteTable
+from .route_table import RouteRow
 from .rows import RowLaws
 from .step_plan import Step, StepPlan, StepSpec
 from .sweep_plan import Sweep
@@ -178,7 +179,7 @@ class SolverFeatherPGS(SolverBase):
     #   active_rows False: full-order sparse sweeps.           contact_units None: unfused sparse contact triplets.
     #   transaction "single" or "staged": fused triplets'.     mf_storage "streamed": streamed matrix-free impulses.
     #   predicted_twists False: the held tree's predictor without the twists' publication.
-    #   row_support False: sparse rows on explicit indices.     placement "general": case K6 (route_table.RouteTable).
+    #   row_support False: sparse rows on explicit indices.     placement "general": case K6 (class_plan.general_reason).
     #   tiers: the Jacobi tiers' row bound, on any class whose response they form (0: no tiers).
     #   tier_sweeps: every Jacobi tier's sweep budget, in place of the equal-accuracy rule.
     _route_pins: ClassVar[dict[str, object]] = {}
@@ -502,10 +503,30 @@ class SolverFeatherPGS(SolverBase):
         from . import held_tree  # noqa: PLC0415
         from .scalar_branches import plan_scalar_branches  # noqa: PLC0415
 
-        # Axis 3 of the route table, the placement case: the owners below, in precedence order (route_table.CASES),
-        # each test their own fit once no earlier case holds the class, and the first that fits claims it.
-        self.routes = RouteTable(self._route_pins, native=model.device.is_cuda, eliminates=self.factor.eliminates)
-        # The sweep: its owners claim the class below, in the route table's order.
+        def diagonal_decline(size: int) -> str | None:
+            """Its compact diagonal is the held tree's representation: a candidate only where the held tree takes
+            the dense groups with it, the diagonal group as scalar branches or a held family."""
+            scalar, _ = plan_scalar_branches(self, size=size)
+            return held_tree.compact_decline(self, size, scalar=scalar is not None)
+
+        # The class plan, axis 3 of the route table: the placement case, decided by rules over the data above before
+        # any case owner (class_plan.RULES, in precedence order); each owner below builds its case's choice.
+        self.classes = plan_class(
+            ClassInputs(
+                model=model,
+                options=options,
+                forest=self.forest,
+                laws=self.laws,
+                factor=self.factor,
+                pins=self._route_pins,
+                dense_rows=self.spec.capacities.dense_rows,
+                diagonal_decline=diagonal_decline,
+                packed_decline=functools.partial(held_tree.sparse_decline, self),
+            ),
+            general=general_reason(self._route_pins, native=model.device.is_cuda, eliminates=self.factor.eliminates),
+        )
+        case = self.classes.case
+        # The sweep: its owners build the class's case.
         self.sweep = Sweep(
             model,
             options,
@@ -513,37 +534,30 @@ class SolverFeatherPGS(SolverBase):
             self.laws,
             self.placement,
             self.factor,
-            self.routes,
+            self.classes,
             self._route_pins,
         )
-
-        def diagonal_decline(size: int) -> str | None:
-            """Its compact diagonal is the held tree's representation: a candidate only where the held tree takes
-            the dense groups with it, the diagonal group as scalar branches or a held family."""
-            scalar, _ = plan_scalar_branches(self, size=size)
-            return held_tree.compact_decline(self, size, scalar=scalar is not None)
-
-        self.sweep.admit_diagonal(diagonal_decline)
+        self.sweep.place_diagonal(self.classes.diagonal)
         self.placement.dense_internal_max_rows = self.placement.internal_rows_per_world(model)
         self.placement.dense_internal_rows_at_once = self.placement.internal_rows_per_world(model, at_once=True)
         self._contact_material_placeholder = self._arrays.placeholder(wp.float32, (1,))
         self._bind_contact_material(None)
         self._allocate_common_buffers(model)
         self._compact_diagonal_mass_size = self.placement.sparse_diagonal_response_size
-        self.sweep.admit_packed(model, functools.partial(held_tree.sparse_decline, self))
+        self.sweep.place_packed(self.classes.packed)
         # The matrix-free sweeps read the dense rows packed (packed_rows): every class but native sparse factors (case
         # K1) and the sparse diagonal (case K2). Decided before the buffers, since that placement allocates no size
         # group's Jacobian.
         self.placement.mf_sweeps = bool(
-            self.routes.case not in ("K1", "K2") and self.forest.world_count > 0 and self.forest.max_world_dofs > 0
+            case not in ("K1", "K2") and self.forest.world_count > 0 and self.forest.max_world_dofs > 0
         )
         self._allocate_buffers(model)
         self.placement.allocate_world_rows(model)
-        self.sweep.admit_paired()
+        self.sweep.place_paired(self.classes.paired, self.classes.reasons["K5"])
         self.placement.allocate_sparse_diagonal_rows()
         self.placement.allocate_free_body_rows(model)
         self.factor.scatter_armature()
-        self.sweep.plan_tier_rows()
+        self.sweep.place_tiers(self.classes.tiers)
         self.placement.allocate_packed_rows()
         # The producer of the tiers' rows (case K4), admitted by its own fit: keyed rows (keyed_rows.create_owner),
         # which write the point and the patch row law.
@@ -560,24 +574,22 @@ class SolverFeatherPGS(SolverBase):
         # read it. The Jacobi tiers (case K4, FL3.7) read the one writer's rows, or walk their keyed rows in the kernel,
         # and leave by the walk; the keyed rows' general worlds are the one writer's (keyed_rows.keyed_general_units).
         # The support placement (case K1, FL3.4) whitens and leaves its rows by the walk too, into its support sink.
-        general = self.routes.case == "K1" or bool(
-            self.routes.case in ("K6", "K5", "K4")
-            and self.placement.mf_sweeps
-            and np.any(self.forest.response_dof_count > 0)
+        general = case == "K1" or bool(
+            case in ("K6", "K5", "K4") and self.placement.mf_sweeps and np.any(self.forest.response_dof_count > 0)
         )
         # The sparse diagonal (case K2, FL3.5) walks each world's dense arm into its rows' dense parts and leaves it
         # by the walk; a key of the star is one step to the world (walk_rows.star_step) and holds no walk data.
-        diagonal = bool(self.routes.case == "K2" and self.placement.sparse_diagonal_contact_solve)
+        diagonal = bool(case == "K2" and self.placement.sparse_diagonal_contact_solve)
         self.placement.walks = general or diagonal
         # Free bodies' rows are written by the walk only (walk_rows.write_free_body_rows). A responding free body gives
         # every case a walking class: K1 and K2 never hold free bodies, and K4-K6 sweep matrix-free (a world with the
         # body's six coordinates).
         if self.forest.has_free_rigid_bodies and not self.placement.walks:
-            raise RuntimeError(f"Free bodies' rows are written by the walk: case {self.routes.case} must walk.")
+            raise RuntimeError(f"Free bodies' rows are written by the walk: case {case} must walk.")
         if self.factor.eliminates and not self.placement.walks:
             raise RuntimeError(
                 "Bilateral blocks are closed in the one writer's block phase (walk_rows): their class must walk "
-                f"(case K6 with the matrix-free sweeps), not case {self.routes.case}."
+                f"(case K6 with the matrix-free sweeps), not case {case}."
             )
         # Scalar branches take a diagonal-mass group of world-fixed roots over one-coordinate leaves (scalar_branches.py),
         # which the held-tree owner then publishes: the compact diagonal's admission planned them.
@@ -593,7 +605,7 @@ class SolverFeatherPGS(SolverBase):
             self.factor.plan_walk(responding)
         if self.placement.walks:
             self.placement.hold_units()
-            if self.routes.case == "K1":
+            if case == "K1":
                 self.sweep.plan_support_walk()
         self.sweep.build()
         self.sweep.open_streams(overlap=self.options.diagnostics.sync_timings is None)
@@ -620,9 +632,11 @@ class SolverFeatherPGS(SolverBase):
         # producer writes every contact row, decided once from the owners' admissions: keyed rows (the tiers' in-kernel
         # sink, case K4), else the one writer where the class walks its rows, else none (no responding coordinate: no
         # contact is admitted).
-        diagonal = self.routes.case == "K2"
-        route = self.routes.finish(
-            self.laws.set,
+        diagonal = case == "K2"
+        route = RouteRow(
+            laws=self.laws.set,
+            case=case,
+            reasons=dict(self.classes.reasons),
             producer=(
                 "keyed_rows" if self.placement.keyed_rows is not None else "walk" if self.placement.walks else "none"
             ),

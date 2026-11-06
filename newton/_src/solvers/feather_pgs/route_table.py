@@ -1,20 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The route table: the row laws a solver's worlds solve and the placement case.
+"""The route table: the row laws a solver's worlds solve and the route its class takes.
 
 The row laws (:class:`Laws`) are read once from the physics options and the model, never from a route; every
-placement's writer and sweep call each law's function, so no placement declines a law and an owner tests only its own
-fit (topology, sizes, the device's budget). The placement axis (:class:`RouteTable`) gives the class to one case,
-decided once in the precedence :data:`CASES`: an owner reads the case instead of the other owners' decisions. The data
-that keep every class general are read once, here: a test pin, the device, and the bilateral pre-elimination.
+placement's writer and sweep call each law's function, so no placement declines a law. The class's placement case is
+decided by rules over data before its owners (:mod:`.class_plan`); the route (:class:`RouteRow`) records it with what
+the owners built from it.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-__all__ = ["CASES", "Laws", "RouteRow", "RouteTable"]
+__all__ = ["Laws", "RouteRow"]
 
 
 @dataclass(frozen=True)
@@ -65,82 +64,18 @@ class Laws:
         return {**asdict(self), "weighted": self.weighted}
 
 
-CASES = {
-    "K2": "the sparse diagonal of a tree beside a star",
-    "K1": "native sparse factors of a single tree",
-    "K5": "factor coordinates of a tree beside one free body",
-    "K4": "the Jacobi tiers of dense trees beside a free body",
-}
-"""The placement axis's specialized cases (placement and producer by class shape), in precedence order: the first
-whose owner fits the class claims it. A class no case claims keeps the general placement, case K6."""
-
-
-class RouteTable:
-    """The placement axis: the case of the solver's class, decided once in :data:`CASES` order, and the route row.
-
-    Construction asks the owners in that order. Each tests only its own fit (topology, sizes, capability, the device's
-    budget) after :meth:`taken`, which says why an earlier case holds the class, :meth:`claim` gives the class to
-    the first that fits, and each writes its case's reason. The producers and the runtime claims read :attr:`case`;
-    once they have decided, :meth:`finish` returns the route, which the step's spec holds (:class:`.step_plan.StepSpec`).
-    Three data keep every class general, read once here: the test pin ``placement="general"``; a device without the
-    cases' native bodies (``native``: they are written for CUDA, so the CPU runs the general placement); and the
-    bilateral pre-elimination (``eliminates``), whose blocks the one writer's block phase closes and whose wide rows
-    only the general sweep's exit reads (the cases' writers and sweeps take neither yet).
-    """
-
-    def __init__(self, pins, *, native: bool, eliminates: bool):
-        self.case = "K6"
-        """The case holding the class: a key of :data:`CASES`, or ``"K6"`` (general) while none claims it."""
-        self.reasons: dict[str, str | None] = {}
-        """Why each asked case holds the class or does not, written by its owner."""
-        general = (
-            (pins.get("placement") == "general", "A test pin keeps the general placement (placement='general')."),
-            (not native, "The device runs the general placement: the cases' native bodies are written for CUDA."),
-            (eliminates, "Bilateral pre-elimination closes its blocks in the general row's block phase."),
-        )
-        self._general = next((reason for holds, reason in general if holds), None)
-        """Why every class keeps the general placement, or ``None``."""
-        self._asked = -1
-
-    def taken(self, case: str) -> str | None:
-        """Why ``case`` may not claim the class (the general pin, or an earlier case holds it), or ``None``."""
-        order = list(CASES).index(case)
-        if order < self._asked:
-            raise RuntimeError(f"Case {case} is asked after a later case; owners are asked in CASES order.")
-        self._asked = order
-        if self._general:
-            return self._general
-        if self.case != "K6":
-            return f"The class is case {self.case}: {CASES[self.case]}."
-        return None
-
-    def claim(self, case: str, fits: bool = True) -> bool:
-        """Give the class to ``case`` (the case :meth:`taken` last asked about) when its own fit holds; return
-        whether it holds the class."""
-        if fits:
-            if list(CASES).index(case) != self._asked or self.case != "K6" or self._general:
-                raise RuntimeError(f"Case {case} claims a class it was not offered.")
-            self.case = case
-        return fits
-
-    def finish(self, laws: Laws, **axes) -> RouteRow:
-        """The route of the solver's class from the laws, the decided case and its reasons, and the other ``axes``
-        (:class:`RouteRow`'s fields)."""
-        return RouteRow(laws=laws, case=self.case, reasons=dict(self.reasons), **axes)
-
-
 @dataclass(frozen=True)
 class RouteRow:
-    """The solver's route: the row of the route table its class takes, fixed once every owner has decided.
+    """The solver's route: the row of the route table its class takes, fixed once every owner has built.
 
-    The step's spec holds it (:attr:`.step_plan.StepSpec.route`); the step plan and the route record read it there,
-    not the owners' state.
+    The step's plan holds it (:attr:`.step_plan.StepPlan.route`); the stages and the route record read it there, not
+    the owners' state.
     """
 
     laws: Laws
     """Axis 2: the row laws."""
     case: str
-    """Axis 3: the placement case (:data:`CASES`, or ``"K6"`` general)."""
+    """Axis 3: the placement case (:data:`.class_plan.RULES`, or ``"K6"`` general)."""
     producer: str
     """Axis 3: the producer of the contact rows, decided once at construction: ``walk`` (the one writer), ``keyed_rows``
     (the tiers' in-kernel rows) or ``none`` (a class without a responding coordinate admits no contact)."""
@@ -151,7 +86,7 @@ class RouteRow:
     sizes: dict[str, int | None]
     """The case owners' sizes: ``"packed"`` (K1's factored size), ``"diagonal"`` and ``"dense"`` (K2's pair)."""
     reasons: dict[str, str | None]
-    """Why each case holds the class or does not (:attr:`RouteTable.reasons`)."""
+    """Why each case holds the class or does not (:attr:`.class_plan.ClassPlan.reasons`)."""
 
     def record(self) -> dict:
         """The row's axes and each case's reason as a JSON-compliant record (``routes.row``; the laws are

@@ -1853,7 +1853,7 @@ def placement_frames(solver, joint_q: np.ndarray, capture) -> dict:
     world of the support placement, case K1 (``unstored``: its rows are :class:`TestSupportPlacement`'s)."""
     forest, placement = solver.forest, solver.placement
     out = {"rows": 0.0, "leave": 0.0, "general": 0, "unstored": 0}
-    if not getattr(placement, "walks", False) or solver.routes.case == "K1":
+    if not getattr(placement, "walks", False) or solver.classes.case == "K1":
         out["unstored"] = int(forest.world_count)
         return out
     # The one writer of the general placement (FL3.3) and of the sparse diagonal (FL3.5): its rows are walked from

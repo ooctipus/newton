@@ -671,7 +671,7 @@ class TestSlotFrame(unittest.TestCase):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_iterations=30, enable_joint_limits=True)
-        self.assertEqual(solver.routes.case, "K2")
+        self.assertEqual(solver.classes.case, "K2")
         self.assertTrue(solver.placement.walks)
         state, out = model.state(), model.state()
         joint_q = state.joint_q.numpy().astype(np.float64)
@@ -793,7 +793,7 @@ class TestPairedPlacement(unittest.TestCase):
                         dense_max_constraints=96,
                         mf_max_constraints=32,
                     )
-                self.assertEqual(solver.routes.case, "K5")
+                self.assertEqual(solver.classes.case, "K5")
                 self.assertTrue(solver.placement.walks)
                 self.assertIsNotNone(solver.sweep.paired_factor_kernel)
                 capture = Capture(solver)
@@ -940,7 +940,7 @@ class TestSupportPlacement(unittest.TestCase):
             with self.subTest(shape=shape, options=options):
                 case = scene.make_case(True, options=options, **shape)
                 solver = case[1]
-                self.assertEqual(solver.routes.case, "K1")
+                self.assertEqual(solver.classes.case, "K1")
                 # Every step: a bouncing foot holds rows on some steps only.
                 for _ in range(6):
                     joint_q = solver.cut.mirror(case[2]).joint_q.numpy().astype(np.float64)
@@ -967,7 +967,7 @@ class TestSupportPlacement(unittest.TestCase):
                 enable_joint_limits=True,
                 enable_joint_velocity_limits=True,
             )
-        self.assertEqual(solver.routes.case, "K1")
+        self.assertEqual(solver.classes.case, "K1")
         state, out = model.state(), model.state()
         joint_q = state.joint_q.numpy().astype(np.float64)
         solver.step(state, out, control, None, 1.0 / 60.0)

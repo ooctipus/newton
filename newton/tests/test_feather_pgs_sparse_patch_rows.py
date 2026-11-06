@@ -14,8 +14,7 @@ import warp as wp
 
 import newton
 from newton._src.core.memory import arch_budget
-from newton._src.solvers.feather_pgs import sweep_routes_sparse
-from newton._src.solvers.feather_pgs.sweep_plan import Sweep
+from newton._src.solvers.feather_pgs import class_plan, sweep_routes_sparse
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import standing_model
 from newton.tests.feather_pgs_sparse_scene import equal_dof_trees
@@ -26,21 +25,8 @@ DT = 1.0 / 400.0
 _UNFUSED = {"contact_units": None}
 
 
-def _admission_probe(**changes):
-    """Provide the host fields the sparse sweep policy reads, for an admitted 18-DOF, 256-row route."""
-    probe = SimpleNamespace(
-        pins={},
-        placement=SimpleNamespace(dense_max_constraints=256),
-        forest=SimpleNamespace(max_world_dofs=18),
-        laws=SimpleNamespace(),
-    )
-    for name, value in changes.items():
-        setattr(probe, name, value)
-    return probe
-
-
-def _admit(probe, *, lanes=0, fits=True):
-    return Sweep._admit_sparse_active_rows(probe, small_world_lanes=lanes, fits=lambda: fits)
+def _admit(pins, *, lanes=0, fits=True):
+    return class_plan.active_rows_rule(pins, small_world_lanes=lanes, fits=lambda: fits)
 
 
 class TestFeatherPGSSparsePatchRows(unittest.TestCase):
@@ -54,8 +40,7 @@ class TestFeatherPGSSparsePatchRows(unittest.TestCase):
             ({}, 0, False, False, "bitsets exceed shared memory"),
         ):
             with self.subTest(pins=pins, lanes=lanes, fits=fits):
-                probe = _admission_probe(pins=pins)
-                active, reason = _admit(probe, lanes=lanes, fits=fits)
+                active, reason = _admit(pins, lanes=lanes, fits=fits)
                 self.assertEqual(active, expected)
                 self.assertIn(phrase, reason)
 
@@ -73,15 +58,12 @@ class TestFeatherPGSSparsePatchRows(unittest.TestCase):
                 self.subTest(dofs=dofs, rows=rows, environment=environment, slack=slack),
                 mock.patch.dict(os.environ, environment, clear=True),
             ):
-                probe = _admission_probe(
-                    forest=SimpleNamespace(max_world_dofs=dofs),
-                    placement=SimpleNamespace(dense_max_constraints=rows),
-                )
                 staging = functools.partial(sweep_routes_sparse.sparse_staging, rows, dofs, dofs)
                 # A world past 16 DOFs or 64 rows never packs; its budget is moot.
                 packable = dofs <= 16 and rows <= 64
                 packed = staging(lanes_per_world=8 if dofs <= 8 else 16).bytes if packable else 1 << 20
-                lanes = Sweep._sparse_small_world_lanes(probe, staging, packed + slack)
+                forest = SimpleNamespace(max_world_dofs=dofs)
+                lanes = class_plan._small_world_lanes(forest, rows, staging, packed + slack)
                 self.assertEqual(lanes, expected)
 
 
