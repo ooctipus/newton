@@ -22,9 +22,10 @@ from types import MappingProxyType
 import numpy as np
 
 from ...core.memory import arch_budget
-from . import host_index, sweep_routes_sparse
+from . import held_tree, host_index, sweep_routes_sparse
 from .forest_plan import row_support
-from .step_plan import Pins, first_failed
+from .route_table import Pins, first_failed
+from .scalar_branches import ScalarBranchPlan, plan_scalar_branches
 from .sweep_routes_sparse import _SPARSE_LOCAL_WORKSPACE_BYTES
 from .sweep_routes_tiers import TIER_MAX_ROWS
 from .tree_plan import TreePlan, local_parents
@@ -57,13 +58,9 @@ class ClassInputs:
     factor: object
     """The tree factor's drive plan and kinematic mask (:class:`.tree_factor.TreeFactor`, once planned)."""
     pins: Pins
-    """The test-only route pins (:class:`.step_plan.Pins`)."""
+    """The test-only route pins (:class:`.route_table.Pins`)."""
     dense_rows: int
     """The dense rows a world (:attr:`.step_plan.Capacities.dense_rows`)."""
-    diagonal_decline: Callable[[int], str | None]
-    """Why the held tree would not take a compact diagonal of a size, or ``None`` (:func:`.held_tree.compact_decline`)."""
-    packed_decline: Callable[..., str | None]
-    """Why the held tree would not take a native sparse factor, or ``None`` (:func:`.held_tree.sparse_decline`)."""
 
 
 @dataclass(frozen=True, eq=False)
@@ -84,6 +81,10 @@ class Diagonal:
     """The star sizes whose limits fuse outside the dense rows."""
     fused_mask: np.ndarray
     """Each coordinate's fused limit (1) or none (0)."""
+    scalar: ScalarBranchPlan | None
+    """The star's group as scalar branches (:func:`.scalar_branches.plan_scalar_branches`), or ``None``."""
+    scalar_reason: str
+    """Why the star's group runs as scalar branches or not."""
 
 
 @dataclass(frozen=True, eq=False)
@@ -140,6 +141,14 @@ class ClassPlan:
     packed: Packed | None = None
     paired: Paired | None = None
     tiers: Tiers | None = None
+
+    @property
+    def scalar(self) -> tuple[ScalarBranchPlan | None, str]:
+        """The star's group as scalar branches and why (:attr:`Diagonal.scalar`): none without the sparse
+        diagonal."""
+        if self.diagonal is None:
+            return None, "No diagonal-mass group shares the sparse-diagonal response."
+        return self.diagonal.scalar, self.diagonal.scalar_reason
 
 
 def general_reason(pins, *, native: bool, eliminates: bool) -> str | None:
@@ -244,7 +253,10 @@ def diagonal_rule(inputs: ClassInputs) -> tuple[Diagonal | None, str]:
     dense_groups = forest.art_group_idx.numpy()[dense_arts].astype(np.int32)
     if np.any(dense_offsets < 0) or np.any(dense_groups < 0):
         return None, missing
-    held = inputs.diagonal_decline(int(diagonal_size[0]))
+    # Its compact diagonal is the held tree's representation: a candidate only where the held tree takes the dense
+    # groups with it, the diagonal group as scalar branches or a held family.
+    scalar, scalar_reason = plan_scalar_branches(inputs, size=int(diagonal_size[0]))
+    held = held_tree.compact_decline(inputs, int(diagonal_size[0]), scalar=scalar is not None)
     if held is not None:
         return None, f"Only the held tree evaluates the compact diagonal. {held}"
     choice = Diagonal(
@@ -255,6 +267,8 @@ def diagonal_rule(inputs: ClassInputs) -> tuple[Diagonal | None, str]:
         dense_arts=dense_arts.astype(np.int32),
         fused_sizes=fused_sizes,
         fused_mask=fused_mask,
+        scalar=scalar,
+        scalar_reason=scalar_reason,
     )
     return choice, "One diagonal-mass articulation and one compact dense articulation per world share one owner."
 
@@ -285,7 +299,7 @@ def active_rows_rule(pins, *, small_world_lanes: int, fits: Callable[[], bool]) 
     whose row bitsets exceed shared memory leaves the full ordered sweep.
 
     Args:
-        pins: The test-only route pins (:class:`.step_plan.Pins`).
+        pins: The test-only route pins (:class:`.route_table.Pins`).
         small_world_lanes: Lanes per world of a packed small-world sweep, 0 for whole warps.
         fits: Whether the active-row scan's working set fits shared memory, evaluated last.
     """
@@ -316,7 +330,7 @@ def contact_triplets_rule(
     normal and pair updates, in one reduction and one apply.
 
     Args:
-        pins: The test-only route pins (:class:`.step_plan.Pins`).
+        pins: The test-only route pins (:class:`.route_table.Pins`).
         active_rows: Whether the sweep selects its rows at sweep entry.
         use_support_table: Whether rows read the shared support table.
         lanes: Lanes per world of the sweep.
@@ -394,7 +408,7 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     if plan.dof_count != size or (not velocity_candidate and plan.nonzero_count >= size * (size + 1) // 2):
         return None, "Topology has no usable sparse factor layout for this row policy."
     # Native sparse factors are the held tree's representation: a candidate only where it takes their group.
-    held = inputs.packed_decline(size, plan, velocity_limits=velocity_candidate)
+    held = held_tree.sparse_decline(inputs, size, plan, velocity_limits=velocity_candidate)
     if held is not None:
         return None, f"Only the held tree evaluates native sparse factors. {held}"
 

@@ -94,7 +94,7 @@ class Sweep:
         placement: The placement.
         factor: The tree factor.
         classes: The class plan (:class:`.class_plan.ClassPlan`): the case and its choice, which the owners build.
-        pins: The test-only route pins (:class:`.step_plan.Pins`).
+        pins: The test-only route pins (:class:`.route_table.Pins`).
     """
 
     def __init__(self, model, options, forest, laws, placement, factor, classes, pins):

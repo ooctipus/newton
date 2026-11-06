@@ -25,8 +25,8 @@ from . import field_group, kernel_template
 from .device_preludes import lane_group
 from .field_group import Field
 from .kernel_template import KernelTemplate, items
+from .route_table import first_failed
 from .row_kernels import PGS_CONSTRAINT_TYPE_SPEED
-from .step_plan import first_failed
 
 PAIRED_COMPONENTS = (
     Field("world_count", wp.int32, owner="components"),

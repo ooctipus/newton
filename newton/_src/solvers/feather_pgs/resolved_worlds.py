@@ -27,6 +27,7 @@ from . import field_group
 from .contact_laws import contact_points, contact_responds, contact_restitution, jacobian_entry
 from .field_group import Field, FieldGroup, SolverArrays
 from .joint_table import JOINTS
+from .route_table import first_failed
 from .row_laws import (
     contact_capped_beta,
     contact_depenetration_cap,
@@ -35,7 +36,6 @@ from .row_laws import (
     joint_limit_side,
     limit_rhs,
 )
-from .step_plan import first_failed
 
 LANES = 32
 
@@ -661,7 +661,7 @@ def decline(solver) -> str | None:
                 not laws.warm_start
                 and not laws.regularized
                 and not laws.velocity_limits
-                and solver.classes.case not in ("K1", "K2")
+                and solver.spec.classes.case not in ("K1", "K2")
                 and solver.factor.block_count == 0
                 and all(getattr(solver.laws, name, object()) == value for name, value in laws_exact.items())
                 and solver.options.enable_bilateral_preelimination is False

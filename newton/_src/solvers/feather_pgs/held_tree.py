@@ -84,30 +84,27 @@ def _diagonal_geometry(
     inverse[dof] = 1.0 / mass
 
 
-def decline(solver, *, sparse: bool | None = None) -> str | None:
-    """Why the held tree does not evaluate a representation of the solver's dynamics, or ``None`` when it does.
+def decline(forest, laws, factor, *, sparse: bool | None) -> str | None:
+    """Why the held tree does not evaluate a representation of the dynamics of ``forest``, or ``None`` when it does.
 
     The terms of the representation: the native sparse factor's group (``sparse``: whether it carries velocity-limit
-    rows; by default the representation the solver chose, and its admission passes its candidate through
-    :func:`sparse_decline`), then the drive rows every dense group reads. A term is read only once the earlier ones
-    hold.
+    rows, ``None`` for the dense groups), with the row ``laws``, then the drive rows every dense group reads (the
+    ``factor``'s drive plan). A term is read only once the earlier ones hold.
     """
-    if sparse is None and getattr(solver.placement, "sparse_mass_matrix_size", None) is not None:
-        sparse = solver.sweep.sparse_velocity_limits
     # The owner holds no rows, impulses or patch frames: the patch build, link, seed and finish stay on the solver
     # pipeline around it, so it serves every contact law. Torsion rows read the joint motions and body twists every
     # group publishes (joint_S_s, body_v_s); compliance reads no dynamics.
     if sparse is not None:
         velocity_limits = sparse
-        if solver.forest.has_free_rigid_bodies:
+        if forest.has_free_rigid_bodies:
             return "The sparse factor's group holds no free rigid bodies."
-        if solver.laws.mimic_count and not (
-            velocity_limits and solver.laws.mimic_valid_np is not None and np.all(solver.laws.mimic_valid_np)
+        if laws.mimic_count and not (
+            velocity_limits and laws.mimic_valid_np is not None and np.all(laws.mimic_valid_np)
         ):
             return "Mimic rows on the sparse factor need its velocity-limit rows and valid mimic pairs."
-        if solver.forest.has_prescribed_response:
+        if forest.has_prescribed_response:
             return "The sparse factor's group holds no prescribed articulations."
-    if not solver.factor.parallel_drives and solver.forest.size_groups:
+    if not factor.parallel_drives and forest.size_groups:
         return "The held tree needs the per-coordinate drive preparation (augmented drives, owned drive rows)."
     return None
 
@@ -117,62 +114,58 @@ def _prescribed_articulations(forest):
     return np.flatnonzero(forest.prescribed_articulation.numpy() != 0).astype(np.int32)
 
 
-def _coverage(solver, compact):
+def _coverage(model, forest, compact):
     """Prove disjoint articulation and physical coordinate ownership; ``compact`` is the compact diagonal size the
     groups carry. An articulation no size group holds has no coordinates (a ``"rest"`` group), and a body outside
     the articulations stays outside the solver."""
-    model = solver.model
-    prescribed = _prescribed_articulations(solver.forest)
+    prescribed = _prescribed_articulations(forest)
     owned, _ = tree_joints(model)
-    arts = np.concatenate(
-        [solver.forest.group_to_art[size].numpy() for size in solver.forest.size_groups] + [prescribed]
-    )
+    arts = np.concatenate([forest.group_to_art[size].numpy() for size in forest.size_groups] + [prescribed])
     if np.unique(arts).size != arts.size:
         raise ValueError("Mixed tree factors must hold an articulation at most once")
     starts = model.articulation_start.numpy()
     if starts[0] != 0 or starts[-1] != model.joint_count or np.any(np.diff(starts) <= 0):
         raise ValueError("Mixed tree cache requires contiguous nonempty articulations")
     qd = model.joint_qd_start.numpy()
-    ends = solver.forest.articulation_joint_end_host
-    ds = solver.forest.articulation_dof_start.numpy()
+    ends = forest.articulation_joint_end_host
+    ds = forest.articulation_dof_start.numpy()
     if not np.array_equal(ds, qd[starts[:-1]]):
         raise ValueError("Mixed tree factor starts must preserve physical coordinate ownership")
-    for size in solver.forest.size_groups:
-        group = solver.forest.group_to_art[size].numpy()
+    for size in forest.size_groups:
+        group = forest.group_to_art[size].numpy()
         if np.any(qd[ends[group]] - qd[starts[group]] != size):
             raise ValueError("Mixed tree factor size disagrees with its physical coordinates")
-        if solver.forest.n_arts_by_size[size] != len(group):
+        if forest.n_arts_by_size[size] != len(group):
             raise ValueError("Mixed tree factor count disagrees with its group map")
     if prescribed.size and np.any(qd[ends[prescribed]] - qd[starts[prescribed]] != 6):
         raise ValueError("Prescribed cached roots must be six-coordinate free bodies")
     if np.unique(model.joint_child.numpy()[owned]).size != np.count_nonzero(owned):
         raise ValueError("Mixed tree cache must publish a body at most once")
     return (
-        tuple(solver.forest.size_groups),
-        tuple(sorted(solver.forest.n_arts_by_size.items())),
+        tuple(forest.size_groups),
+        tuple(sorted(forest.n_arts_by_size.items())),
         compact,
         int(prescribed.size),
     )
 
 
-def _template(solver, first_art, last_art=None, *, coordinates=True):
+def _template(model, forest, first_art, last_art=None, *, coordinates=True):
     """The mass pattern of the trees of articulations ``first_art`` through ``last_art`` (one tree by default; a
     world's forest in local order), from their local parents and each joint's coordinates (none without
     ``coordinates``)."""
-    model = solver.model
     first = int(model.articulation_start.numpy()[first_art])
-    end = int(solver.forest.articulation_joint_end_host[first_art if last_art is None else last_art])
+    end = int(forest.articulation_joint_end_host[first_art if last_art is None else last_art])
     parents = local_parents(model.joint_ancestor.numpy(), [first], end - first)[0]
     counts = np.diff(model.joint_qd_start.numpy())[first:end] if coordinates else np.zeros(end - first, np.int32)
     return TreePlan.build(parents, counts).factor
 
 
-def _fit(solver, group_to_art, mass, *, prescribed=False, complete=False):
+def _fit(model, forest, group_to_art, mass, *, prescribed=False, complete=False):
     """The metadata (:func:`operator_metadata`) of a held group of the trees ``group_to_art`` on the pattern
     ``mass``, once its layout fits (:func:`.make_plan`; raises ValueError where it does not)."""
     host = operator_metadata(mass)
-    plan = SimpleNamespace(group_to_art=group_to_art, art_to_world=solver.forest.art_to_world)
-    make_plan(solver.model, SimpleNamespace(plan=plan, host=host, prescribed=prescribed), complete=complete)
+    plan = SimpleNamespace(group_to_art=group_to_art, art_to_world=forest.art_to_world)
+    make_plan(model, SimpleNamespace(plan=plan, host=host, prescribed=prescribed), complete=complete)
     return host
 
 
@@ -182,58 +175,61 @@ def _topologies(forest, size) -> list:
     return [(int(first), int(last)) for first, last in itertools.pairwise(bounds)]
 
 
-def _size_trees(solver, size, span, *, diagonal):
+def _size_trees(model, forest, size, span, *, diagonal):
     """The range ``span`` of size group ``size`` (:func:`_topologies`): its articulations, mass pattern and metadata.
     Raises ValueError where the trees do not fit a held group."""
-    group_to_art = solver.forest.group_to_art[size][span[0] : span[1]]
-    mass = _template(solver, int(group_to_art.numpy()[0]))
+    group_to_art = forest.group_to_art[size][span[0] : span[1]]
+    mass = _template(model, forest, int(group_to_art.numpy()[0]))
     if mass.dof_count != size:
         raise ValueError("Mixed tree physical and factor dimensions differ")
     if diagonal and mass.nonzero_count != size:
         raise ValueError("Compact diagonal cache requires independent physical coordinates")
-    return group_to_art, _fit(solver, group_to_art, mass)
+    return group_to_art, _fit(model, forest, group_to_art, mass)
 
 
-def _prescribed_trees(solver):
+def _prescribed_trees(model, forest):
     """The prescribed free bodies: their articulations and the metadata of their one-body six-coordinate pattern."""
-    group_to_art = wp.array(_prescribed_articulations(solver.forest), dtype=int, device=solver.model.device)
-    return group_to_art, _fit(solver, group_to_art, TreePlan.build([-1], [6]).factor, prescribed=True)
+    group_to_art = wp.array(_prescribed_articulations(forest), dtype=int, device=model.device)
+    return group_to_art, _fit(model, forest, group_to_art, TreePlan.build([-1], [6]).factor, prescribed=True)
 
 
-def sparse_decline(solver, size, plan, *, velocity_limits) -> str | None:
+def sparse_decline(inputs, size, plan, *, velocity_limits) -> str | None:
     """Why the held tree would not take a native sparse factor of ``size`` coordinates and pattern ``plan``, or
     ``None``: :func:`decline` of the candidate, then its one complete group's fit.
 
-    Only the held tree evaluates native sparse factors, so their admission reads this before choosing one.
+    Only the held tree evaluates native sparse factors, so their rule (:func:`.class_plan.packed_rule`) reads this,
+    with the class's ``inputs`` (:class:`.class_plan.ClassInputs`), before choosing one.
     """
-    reason = decline(solver, sparse=velocity_limits)
+    reason = decline(inputs.forest, inputs.laws, inputs.factor, sparse=velocity_limits)
     if reason is not None:
         return reason
     try:
-        _fit(solver, solver.forest.group_to_art[size], plan, complete=True)
+        _fit(inputs.model, inputs.forest, inputs.forest.group_to_art[size], plan, complete=True)
     except ValueError as error:
         return f"The topology does not fit the held groups: {error}"
     return None
 
 
-def compact_decline(solver, size, *, scalar) -> str | None:
+def compact_decline(inputs, size, *, scalar) -> str | None:
     """Why the held tree would not take the dense size groups with a compact diagonal of ``size`` coordinates, or
     ``None``: :func:`decline`, then the groups' fit (the coverage, the
     diagonal group unless ``scalar`` branches take it, every other size group, the prescribed roots).
 
-    Only the held tree evaluates a compact diagonal, so the sparse-diagonal response reads this before choosing one.
+    Only the held tree evaluates a compact diagonal, so the sparse diagonal's rule (:func:`.class_plan.diagonal_rule`)
+    reads this, with the class's ``inputs`` (:class:`.class_plan.ClassInputs`), before choosing one.
     """
-    reason = decline(solver)
+    model, forest = inputs.model, inputs.forest
+    reason = decline(forest, inputs.laws, inputs.factor, sparse=None)
     if reason is not None:
         return reason
     try:
-        _coverage(solver, size)
-        for group_size in solver.forest.size_groups:
+        _coverage(model, forest, size)
+        for group_size in forest.size_groups:
             if group_size != size or not scalar:
-                for span in _topologies(solver.forest, group_size):
-                    _size_trees(solver, group_size, span, diagonal=group_size == size)
-        if _prescribed_articulations(solver.forest).size:
-            _prescribed_trees(solver)
+                for span in _topologies(forest, group_size):
+                    _size_trees(model, forest, group_size, span, diagonal=group_size == size)
+        if _prescribed_articulations(forest).size:
+            _prescribed_trees(model, forest)
     except ValueError as error:
         return f"The topology does not fit the held groups: {error}"
     return None
@@ -316,7 +312,7 @@ def _tree_group(solver, size, span) -> HeldGroup:
     """The range ``span`` of a size group as a held group: the trees of one topology. A walking group refreshes
     nothing of its own; the compact diagonal refreshes its inverse mass from the held geometry."""
     diagonal = size == solver._compact_diagonal_mass_size
-    group_to_art, host = _size_trees(solver, size, span, diagonal=diagonal)
+    group_to_art, host = _size_trees(solver.model, solver.forest, size, span, diagonal=diagonal)
     if not diagonal:
         return HeldGroup(solver, "tree", group_to_art, host, size=size)
     count = span[1] - span[0]
@@ -342,7 +338,7 @@ def _prescribed_group(solver) -> HeldGroup:
     publishes the body exactly as it does for a dynamic free body. This is
     the generic form of a per-world free-root slot.
     """
-    group_to_art, host = _prescribed_trees(solver)
+    group_to_art, host = _prescribed_trees(solver.model, solver.forest)
     return HeldGroup(solver, "prescribed", group_to_art, host, size=6, response="diagonal")
 
 
@@ -354,7 +350,8 @@ def _rest_group(solver, span) -> HeldGroup:
     """
     arts = solver.forest.rest_articulations[span[0] : span[1]]
     group_to_art = wp.array(arts, dtype=int, device=solver.model.device)
-    host = _fit(solver, group_to_art, _template(solver, arts[0], coordinates=False))
+    model, forest = solver.model, solver.forest
+    host = _fit(model, forest, group_to_art, _template(model, forest, arts[0], coordinates=False))
     return HeldGroup(solver, "rest", group_to_art, host, size=0, response="diagonal")
 
 
@@ -379,7 +376,7 @@ def forest_default(solver):
 
 def forest_families(solver):
     """The per-root family sizes of the forest (0 for a prescribed root), or ``None``."""
-    if decline(solver) is not None:
+    if decline(solver.forest, solver.laws, solver.factor, sparse=None) is not None:
         return None
     if getattr(solver, "_scalar_branches", None) is not None:
         # Scalar branches own their size group outside any tree plan.
@@ -444,7 +441,7 @@ def _forest_group(solver) -> HeldGroup:
     roots = tuple(
         0 if prescribed[a] else (-int(counts[a]) if counts[a] == diagonal else int(counts[a])) for a in arts[0]
     )
-    mass = _template(solver, arts[0, 0], arts[0, -1])
+    mass = _template(solver.model, solver.forest, arts[0, 0], arts[0, -1])
     # Each diagonal-mass root's refresh reads its coordinates' H_ii from the forest's collection, from the root's
     # offset (the coordinates of the world's trees before it).
     offsets = np.concatenate(([0], np.cumsum(counts[arts[0]])))
@@ -489,7 +486,7 @@ class HeldTree:
             self.coverage = self.forest_reason = scalar = None
             held = [sparse_group(solver)]
         else:
-            self.coverage = _coverage(solver, solver._compact_diagonal_mass_size)
+            self.coverage = _coverage(solver.model, solver.forest, solver._compact_diagonal_mass_size)
             self._dimensions = (solver.model.joint_count, solver.model.body_count, solver.model.articulation_count)
             # The coverage proof's inputs, compared on the device on notification.
             self._proof = DeviceProof(list(self._coverage_arrays()), solver.model.device)
@@ -628,7 +625,10 @@ def install(solver) -> HeldTree:
     The native sparse factor and the compact diagonal are the held tree's representations: they are chosen only
     where :func:`sparse_decline` and :func:`compact_decline` admit them.
     """
-    reason = decline(solver)
+    packed = solver.spec.classes.packed
+    reason = decline(
+        solver.forest, solver.laws, solver.factor, sparse=None if packed is None else packed.velocity_limits
+    )
     if reason is not None:
         raise ValueError(f"FeatherPGS cannot hold this model: {reason}")
     try:

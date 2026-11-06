@@ -464,7 +464,7 @@ class TestResolvedWorlds(unittest.TestCase):
         self.assertTrue(rw.supported(solver))
         solver.laws.set = plain_laws(compliance=True)
         self.assertFalse(rw.supported(solver))
-        solver.classes.case = "K1"
+        solver.spec.classes.case = "K1"
         self.assertFalse(rw.supported(solver))
 
     def test_classify_bounds_worlds_by_the_solver_capacities(self):
@@ -509,9 +509,8 @@ def _admissible_solver():
     return SimpleNamespace(
         factor=SimpleNamespace(block_count=0),
         placement=SimpleNamespace(keyed_rows=None),
-        classes=SimpleNamespace(case="K6"),
         model=SimpleNamespace(device=SimpleNamespace(is_cuda=False)),
-        spec=SimpleNamespace(pins=SolverFeatherPGS.Pins()),
+        spec=SimpleNamespace(pins=SolverFeatherPGS.Pins(), classes=SimpleNamespace(case="K6")),
         forest=SimpleNamespace(
             max_world_dofs=29,
             world_dof_indices=1,

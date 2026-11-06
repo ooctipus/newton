@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import copy
-import functools
 import sys
 
 import numpy as np
@@ -47,9 +46,9 @@ from .path_selection import (
     route_selection,
 )
 from .placement import Placement
-from .route_table import RouteRow
+from .route_table import Pins, RouteRow
 from .rows import RowLaws
-from .step_plan import Pins, Step, StepPlan, StepSpec
+from .step_plan import Capacities, Step, StepPlan, StepSpec
 from .sweep_plan import Sweep
 from .tree_factor import TreeFactor
 
@@ -169,7 +168,7 @@ class SolverFeatherPGS(SolverBase):
     """
 
     Pins = Pins
-    """The test-only route pins a test passes as ``pins`` (:class:`.step_plan.Pins`)."""
+    """The test-only route pins a test passes as ``pins`` (:class:`.route_table.Pins`)."""
 
     @classmethod
     def register_custom_attributes(cls, builder: ModelBuilder) -> None:
@@ -481,41 +480,30 @@ class SolverFeatherPGS(SolverBase):
         # Axis 2 of the route table, the row laws (route_table.Laws).
         self.laws.decide(preelimination=self.factor.eliminates)
         laws = self.laws.set
-        # The step's spec: every unknown that decides its path, gathered before any owner of the step, which each
-        # owner below reads.
-        self.spec = StepSpec.build(
-            model, options, self.cut, self.forest, laws, self.laws.link_rows_per_world, Pins() if pins is None else pins
-        )
-        # The placement: where the rows live, their capacities and status.
-        self.placement = Placement(self.spec, model, options, self.laws, self.factor)
-        # The passive joint forces and the per-coordinate drive rows the held tree's admission reads.
+        # The passive joint forces and the per-coordinate drive rows the class rules read (the held tree's admission).
         self.factor.plan(self.forest, self.laws)
-        from . import held_tree  # noqa: PLC0415
-        from .scalar_branches import plan_scalar_branches  # noqa: PLC0415
-
-        def diagonal_decline(size: int) -> str | None:
-            """Its compact diagonal is the held tree's representation: a candidate only where the held tree takes
-            the dense groups with it, the diagonal group as scalar branches or a held family."""
-            scalar, _ = plan_scalar_branches(self, size=size)
-            return held_tree.compact_decline(self, size, scalar=scalar is not None)
-
+        pins = Pins() if pins is None else pins
+        capacities = Capacities.build(options, self.forest, self.laws.link_rows_per_world)
         # The class plan, axis 3 of the route table: the placement case, decided by rules over the data above before
-        # any case owner (class_plan.RULES, in precedence order); each owner below builds its case's choice.
-        self.classes = plan_class(
+        # any owner of the class (class_plan.RULES, in precedence order).
+        classes = plan_class(
             ClassInputs(
                 model=model,
                 options=options,
                 forest=self.forest,
                 laws=self.laws,
                 factor=self.factor,
-                pins=self.spec.pins,
-                dense_rows=self.spec.capacities.dense_rows,
-                diagonal_decline=diagonal_decline,
-                packed_decline=functools.partial(held_tree.sparse_decline, self),
+                pins=pins,
+                dense_rows=capacities.dense_rows,
             ),
-            general=general_reason(self.spec.pins, native=model.device.is_cuda, eliminates=self.factor.eliminates),
+            general=general_reason(pins, native=model.device.is_cuda, eliminates=self.factor.eliminates),
         )
-        case = self.classes.case
+        # The step's spec: every unknown that decides its path, gathered before any owner of the step, which each
+        # owner below reads and builds its part of the class plan from.
+        self.spec = StepSpec.build(model, options, self.cut, self.forest, laws, pins, capacities, classes)
+        # The placement: where the rows live, their capacities and status.
+        self.placement = Placement(self.spec, model, options, self.laws, self.factor)
+        case = classes.case
         # The sweep: its owners build the class's case.
         self.sweep = Sweep(
             model,
@@ -524,17 +512,17 @@ class SolverFeatherPGS(SolverBase):
             self.laws,
             self.placement,
             self.factor,
-            self.classes,
+            self.spec.classes,
             self.spec.pins,
         )
-        self.sweep.place_diagonal(self.classes.diagonal)
+        self.sweep.place_diagonal(self.spec.classes.diagonal)
         self.placement.dense_internal_max_rows = self.placement.internal_rows_per_world(model)
         self.placement.dense_internal_rows_at_once = self.placement.internal_rows_per_world(model, at_once=True)
         self._contact_material_placeholder = self._arrays.placeholder(wp.float32, (1,))
         self._bind_contact_material(None)
         self._allocate_common_buffers(model)
         self._compact_diagonal_mass_size = self.placement.sparse_diagonal_response_size
-        self.sweep.place_packed(self.classes.packed)
+        self.sweep.place_packed(self.spec.classes.packed)
         # The matrix-free sweeps read the dense rows packed (packed_rows): every class but native sparse factors (case
         # K1) and the sparse diagonal (case K2). Decided before the buffers, since that placement allocates no size
         # group's Jacobian.
@@ -543,11 +531,11 @@ class SolverFeatherPGS(SolverBase):
         )
         self._allocate_buffers(model)
         self.placement.allocate_world_rows(model)
-        self.sweep.place_paired(self.classes.paired, self.classes.reasons["K5"])
+        self.sweep.place_paired(self.spec.classes.paired, self.spec.classes.reasons["K5"])
         self.placement.allocate_sparse_diagonal_rows()
         self.placement.allocate_free_body_rows(model)
         self.factor.scatter_armature()
-        self.sweep.place_tiers(self.classes.tiers)
+        self.sweep.place_tiers(self.spec.classes.tiers)
         self.placement.allocate_packed_rows()
         # The producer of the tiers' rows (case K4), admitted by its own fit: keyed rows (keyed_rows.create_owner),
         # which write the point and the patch row law.
@@ -583,7 +571,7 @@ class SolverFeatherPGS(SolverBase):
             )
         # Scalar branches take a diagonal-mass group of world-fixed roots over one-coordinate leaves (scalar_branches.py),
         # which the held-tree owner then publishes: the compact diagonal's admission planned them.
-        self._scalar_branches, self._scalar_branches_reason = plan_scalar_branches(self)
+        self._scalar_branches, self._scalar_branches_reason = self.spec.classes.scalar
         # The walk is the trees' factor (Z4): the predictor solves every tree of its groups by it, a prescribed tree
         # beside a responding one in a size group included (the dense factor held it before Z4.2), the placements
         # that walk read it for their rows and leave, and the border decides a slipping tree's step on it. A scalar
@@ -626,7 +614,7 @@ class SolverFeatherPGS(SolverBase):
         route = RouteRow(
             laws=self.laws.set,
             case=case,
-            reasons=dict(self.classes.reasons),
+            reasons=dict(self.spec.classes.reasons),
             producer=(
                 "keyed_rows" if self.placement.keyed_rows is not None else "walk" if self.placement.walks else "none"
             ),

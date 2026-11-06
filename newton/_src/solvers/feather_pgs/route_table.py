@@ -5,15 +5,63 @@
 
 The row laws (:class:`Laws`) are read once from the physics options and the model, never from a route; every
 placement's writer and sweep call each law's function, so no placement declines a law. The class's placement case is
-decided by rules over data before its owners (:mod:`.class_plan`); the route (:class:`RouteRow`) records it with what
-the owners built from it.
+decided by rules over data before its owners (:mod:`.class_plan`), each rule saying why the class does not fit by the
+first check that fails (:func:`first_failed`); a test fixes a route by its pins (:class:`Pins`). The route
+(:class:`RouteRow`) records the case with what the owners built from it.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 
-__all__ = ["Laws", "RouteRow"]
+__all__ = ["Laws", "Pins", "RouteRow", "first_failed"]
+
+
+def first_failed(checks) -> str | None:
+    """The reason of the first ``(holds, reason)`` check that fails, or ``None`` when every check holds."""
+    return next((reason for holds, reason in checks if not holds), None)
+
+
+@dataclass(frozen=True)
+class Pins:
+    """Test-only route pins: an axis value a test fixes where the rules would choose another, so that every route the
+    data can select runs on the test scenes. Only a test passes them (``SolverFeatherPGS(..., pins=...)``); the spec
+    holds them and the route record lists those in force (``routes.spec.pins``)."""
+
+    storage: str | None = None
+    """``"dense"``: no packed (native sparse) factor."""
+    grouping: str | None = None
+    """``"forest"`` or ``"per_size"``: the held families."""
+    star: str | None = None
+    """``"held"``: a star's diagonal family in the held tree."""
+    producer: str | None = None
+    """``"walk"``: no keyed rows."""
+    claims: tuple[str, ...] = ("resolved_worlds",)
+    """The runtime claims kept, of ``("resolved_worlds",)``."""
+    active_rows: bool = True
+    """``False``: full-order sparse sweeps."""
+    contact_units: str | None = "triplets"
+    """``None``: unfused sparse contact triplets."""
+    mf_storage: str | None = None
+    """``"streamed"``: streamed matrix-free impulses."""
+    predicted_twists: bool = True
+    """``False``: the held tree's predictor without the twists' publication."""
+    row_support: bool = True
+    """``False``: sparse rows on explicit indices."""
+    placement: str | None = None
+    """``"general"``: every class keeps the general placement, case K6 (:func:`.class_plan.general_reason`)."""
+    tiers: int | None = None
+    """The Jacobi tiers' row bound, on any class whose response they form (0: no tiers)."""
+    tier_sweeps: int | None = None
+    """Every Jacobi tier's sweep budget, in place of the equal-accuracy rule."""
+
+    def record(self) -> dict:
+        """The pins in force (those off their defaults) as a JSON-compliant record."""
+        return {
+            pin.name: list(value) if isinstance(value, tuple) else value
+            for pin in fields(self)
+            if (value := getattr(self, pin.name)) != pin.default
+        }
 
 
 @dataclass(frozen=True)

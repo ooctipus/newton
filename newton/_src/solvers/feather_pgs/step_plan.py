@@ -4,11 +4,12 @@
 """The step's spec and plan: every unknown that decides the step's path, gathered first, and what each stage launches.
 
 :class:`StepSpec` is the frozen record of the unknowns, built once the forest and the row laws are known and before any
-owner of the step: the device, the forest, the laws, the capacities, the mass cadence and the diagnostics in force.
-Every owner built after it reads it; nothing in it is computed a second time elsewhere.
+owner of the step: the device, the forest, the laws, the test pins, the capacities, the class plan (the case the class
+rules give the class, :mod:`.class_plan`), the mass cadence and the diagnostics in force. Every owner built after it
+reads it; nothing in it is computed a second time elsewhere.
 
-:class:`StepPlan` is what the owners decided from it: the class's route (the row of the route table: the placement
-case and producer, decided by the case owners' admissions), the sweep's kernels and streams, and the stages. The
+:class:`StepPlan` is what the owners built from it: the class's route (the row of the route table: the spec's case, the
+producer and the sizes the owners built), the sweep's kernels and streams, and the stages. The
 plan's :attr:`StepPlan.stages` are the step: each a closure bound once to its owners, chosen from the spec and the
 route, so ``step()`` is the stages run in order on a :class:`Step` with no construction constant re-tested. Every
 stage whose work depends on the articulation size (where stage 4 whitens the rows) has one table: each size's route
@@ -21,7 +22,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass
 from types import MappingProxyType
 from typing import NamedTuple
 
@@ -31,13 +32,13 @@ from ...core.execution import Beside
 from ...core.memory import Device, device
 from ...sim import ModelFlags
 from . import cached_state_binding
+from .class_plan import ClassPlan
 from .forest_plan import ForestPlan
-from .route_table import Laws, RouteRow
+from .route_table import Laws, Pins, RouteRow
 from .walk_rows import WRITE_REST, WRITE_TOPOLOGY
 
 __all__ = [
     "Capacities",
-    "Pins",
     "Route",
     "SolveRoute",
     "Stage",
@@ -45,7 +46,6 @@ __all__ = [
     "StepPlan",
     "StepSpec",
     "TopologyPin",
-    "first_failed",
     "kernel_key",
 ]
 
@@ -53,11 +53,6 @@ __all__ = [
 def kernel_key(kernel) -> str | None:
     """A kernel's key (a factory's product without one: its type's name), or ``None`` for no kernel."""
     return None if kernel is None else getattr(kernel, "key", type(kernel).__name__)
-
-
-def first_failed(checks) -> str | None:
-    """The reason of the first ``(holds, reason)`` check that fails, or ``None`` when every check holds."""
-    return next((reason for holds, reason in checks if not holds), None)
 
 
 NUMERIC_PROPERTIES = (
@@ -120,48 +115,6 @@ class Capacities:
         return asdict(self)
 
 
-@dataclass(frozen=True)
-class Pins:
-    """Test-only route pins: an axis value a test fixes where the rules would choose another, so that every route the
-    data can select runs on the test scenes. Only a test passes them (``SolverFeatherPGS(..., pins=...)``); the spec
-    holds them and the route record lists those in force (``routes.spec.pins``)."""
-
-    storage: str | None = None
-    """``"dense"``: no packed (native sparse) factor."""
-    grouping: str | None = None
-    """``"forest"`` or ``"per_size"``: the held families."""
-    star: str | None = None
-    """``"held"``: a star's diagonal family in the held tree."""
-    producer: str | None = None
-    """``"walk"``: no keyed rows."""
-    claims: tuple[str, ...] = ("resolved_worlds",)
-    """The runtime claims kept, of ``("resolved_worlds",)``."""
-    active_rows: bool = True
-    """``False``: full-order sparse sweeps."""
-    contact_units: str | None = "triplets"
-    """``None``: unfused sparse contact triplets."""
-    mf_storage: str | None = None
-    """``"streamed"``: streamed matrix-free impulses."""
-    predicted_twists: bool = True
-    """``False``: the held tree's predictor without the twists' publication."""
-    row_support: bool = True
-    """``False``: sparse rows on explicit indices."""
-    placement: str | None = None
-    """``"general"``: every class keeps the general placement, case K6 (:func:`.class_plan.general_reason`)."""
-    tiers: int | None = None
-    """The Jacobi tiers' row bound, on any class whose response they form (0: no tiers)."""
-    tier_sweeps: int | None = None
-    """Every Jacobi tier's sweep budget, in place of the equal-accuracy rule."""
-
-    def record(self) -> dict:
-        """The pins in force (those off their defaults) as a JSON-compliant record."""
-        return {
-            pin.name: list(value) if isinstance(value, tuple) else value
-            for pin in fields(self)
-            if (value := getattr(self, pin.name)) != pin.default
-        }
-
-
 DIAGNOSTICS = ("nvtx", "snapshots", "audit", "row_watermark", "readout", "sync_timings")
 """The diagnostics a spec may hold, in the record's order."""
 
@@ -184,6 +137,9 @@ class StepSpec:
     pins: Pins
     """The test-only route pins in force (:class:`Pins`; none in production)."""
     capacities: Capacities
+    classes: ClassPlan
+    """The class plan (:class:`.class_plan.ClassPlan`): the case the class rules give the solver's class, with each
+    case's reason and the chosen case's plan, which its owners build."""
     mass_interval: int
     """Steps between mass refreshes (``update_mass_matrix_interval``)."""
     articulated: bool
@@ -197,9 +153,19 @@ class StepSpec:
     ``audit``, ``row_watermark``, ``readout`` (the sweeps' counters), ``sync_timings``."""
 
     @classmethod
-    def build(cls, model, options, cut, forest: ForestPlan, laws: Laws, link_rows: int, pins: Pins) -> StepSpec:
+    def build(
+        cls,
+        model,
+        options,
+        cut,
+        forest: ForestPlan,
+        laws: Laws,
+        pins: Pins,
+        capacities: Capacities,
+        classes: ClassPlan,
+    ) -> StepSpec:
         """Gather the spec from the ``model``, the checked ``options``, the body ``cut``, the ``forest``, the row
-        ``laws``, the ``link_rows`` a world holds and the test ``pins``."""
+        ``laws``, the test ``pins``, the ``capacities`` and the class plan (``classes``)."""
         diagnostics = options.diagnostics
         requested = {
             "nvtx": diagnostics.nvtx,
@@ -214,7 +180,8 @@ class StepSpec:
             forest=forest,
             laws=laws,
             pins=pins,
-            capacities=Capacities.build(options, forest, link_rows),
+            capacities=capacities,
+            classes=classes,
             mass_interval=int(options.update_mass_matrix_interval),
             articulated=bool(model.articulation_count),
             particles=bool(model.particle_count),

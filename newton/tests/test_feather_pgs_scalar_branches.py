@@ -13,6 +13,7 @@ integrate.
 
 import dataclasses
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -254,6 +255,14 @@ def cpu_solver(model, size):
     return solver
 
 
+def scalar_plan(solver):
+    """The scalar-branch plan (and why) of a solver's diagonal-mass group of its compact diagonal size."""
+    inputs = SimpleNamespace(
+        model=solver.model, options=solver.options, forest=solver.forest, factor=solver.factor, pins=solver.spec.pins
+    )
+    return sb.plan_scalar_branches(inputs, size=solver._compact_diagonal_mass_size)
+
+
 def branch_size(model):
     """Coordinates of the branch articulation (the first of each world)."""
     start = model.articulation_start.numpy()[:2]
@@ -353,7 +362,7 @@ class _Pair:
         self.head = SolverFeatherPGS(model, enable_joint_limits=True, update_mass_matrix_interval=2)
         self.mine = cpu_solver(model, size)
         self.reference = MassReference(model)
-        self.plan, self.reason = sb.plan_scalar_branches(self.mine)
+        self.plan, self.reason = scalar_plan(self.mine)
         if self.plan is None:
             raise AssertionError(self.reason)
         self.state = sb.ScalarBranchState(self.mine, self.plan)
@@ -487,7 +496,7 @@ def check_owner_launches(test, device):
         if device.is_cpu:
             model = build_branch_model(device, worlds=2)
             solver = cpu_solver(model, branch_size(model))
-            solver._scalar_branches, _reason = sb.plan_scalar_branches(solver)
+            solver._scalar_branches, _reason = scalar_plan(solver)
             owner = HeldTree(solver)
         else:
             model = build_branch_model(device, worlds=2, leaves=PRESS_LEAVES, shapes=True)
@@ -552,14 +561,14 @@ class TestScalarBranchRule(unittest.TestCase):
         """Admit prismatic leaf stars on FIXED and zero-coordinate D6 roots; leave revolute leaves to the held tree."""
         for kinds in (("revolute",), ("prismatic", "revolute")):
             with self.subTest(kinds=kinds):
-                plan, reason = sb.plan_scalar_branches(cpu_solver(build_branch_model(kinds=kinds), 7))
+                plan, reason = scalar_plan(cpu_solver(build_branch_model(kinds=kinds), 7))
                 self.assertIsNone(plan)
                 self.assertIn("revolute leaves run in the held tree's diagonal-mass group", reason)
         for root in ("fixed", "d6"):
             with self.subTest(root=root):
                 model = build_branch_model(root=root)
                 solver = cpu_solver(model, 7)
-                plan, reason = sb.plan_scalar_branches(solver)
+                plan, reason = scalar_plan(solver)
                 self.assertIsNotNone(plan, reason)
                 self.assertEqual((plan.size, plan.group_count), (7, model.world_count))
                 self.assertIn("run as scalar branches", reason)
@@ -626,7 +635,7 @@ class TestScalarBranchRule(unittest.TestCase):
         """
         model = build_branch_model(worlds=2)
         solver = cpu_solver(model, 7)
-        solver._scalar_branches, _reason = sb.plan_scalar_branches(solver)
+        solver._scalar_branches, _reason = scalar_plan(solver)
         owners = {"scalar": HeldTree(solver)}
         with mock.patch.object(solver, "_scalar_branches", None):
             owners["plain"] = HeldTree(solver)
@@ -684,7 +693,7 @@ class TestScalarBranchRule(unittest.TestCase):
         joint = newton.ModelFlags.JOINT_PROPERTIES
         model = build_branch_model(worlds=2)
         solver = cpu_solver(model, 7)
-        solver._scalar_branches, _reason = sb.plan_scalar_branches(solver)
+        solver._scalar_branches, _reason = scalar_plan(solver)
         owner = HeldTree(solver)
         validate = DeviceProof.validate
         with mock.patch.object(DeviceProof, "validate", autospec=True, side_effect=validate) as proofs:

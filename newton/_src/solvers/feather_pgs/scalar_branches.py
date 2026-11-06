@@ -468,46 +468,44 @@ class ScalarBranchPlan:
     """The group's DOFs, sorted."""
 
 
-def plan_scalar_branches(solver, *, size: int | None = None) -> tuple[ScalarBranchPlan | None, str]:
-    """Decide whether the solver's diagonal-mass group runs as scalar branches.
+def plan_scalar_branches(inputs, *, size: int | None) -> tuple[ScalarBranchPlan | None, str]:
+    """Decide whether the diagonal-mass group of ``size`` coordinates runs as scalar branches.
 
-    The rule is topology only: the group must be the compact diagonal-mass size
-    of the sparse-diagonal response (``size``, by default the solver's; the
-    response's admission passes its candidate), each of its coordinates must
-    move one body, and each articulation must pass :func:`branch_topology`.
+    The rule is topology only: the group must be the compact diagonal-mass size of the sparse-diagonal response
+    (``size``, ``None`` without one), each of its coordinates must move one body, and each articulation must pass
+    :func:`branch_topology`. The sparse diagonal's rule (:func:`.class_plan.diagonal_rule`) reads it with the class's
+    ``inputs`` (:class:`.class_plan.ClassInputs`).
 
     Returns:
         ``(plan, reason)``; ``plan`` is ``None`` when the group stays as it is.
     """
     if size is None:
-        size = solver._compact_diagonal_mass_size
-    if size is None:
         return None, "No diagonal-mass group shares the sparse-diagonal response."
-    if solver.spec.pins.star == "held":
+    if inputs.pins.star == "held":
         return None, "A test pin keeps the diagonal-mass group in the held tree (star='held')."
-    model = solver.model
+    model, forest, factor = inputs.model, inputs.forest, inputs.factor
     if model.particle_count:
         return None, "Scalar branches exclude particles."
-    if solver.options.enable_joint_velocity_limits:
+    if inputs.options.enable_joint_velocity_limits:
         return None, "Joint velocity limits keep the diagonal-mass group on its ordinary dynamics."
-    if size not in solver.forest.direct_diagonal_inertia_sizes:
+    if size not in forest.direct_diagonal_inertia_sizes:
         return None, "The diagonal-mass group has coordinates that do not each move one body."
-    articulations = solver.forest.group_to_art[size].numpy()
-    kinds, reason = branch_topology(model, articulations, solver.forest.articulation_joint_end.numpy())
+    articulations = forest.group_to_art[size].numpy()
+    kinds, reason = branch_topology(model, articulations, forest.articulation_joint_end.numpy())
     if kinds is None:
         return None, reason
-    offsets = solver.forest.crba_dof_joint_offset_by_size[size].numpy()
+    offsets = forest.crba_dof_joint_offset_by_size[size].numpy()
     if kinds.shape[1] != size or not np.array_equal(offsets, np.arange(1, size + 1)):
         return None, "The diagonal-mass group's coordinates do not follow its leaves."
-    if not solver.factor.parallel_drives:
+    if not factor.parallel_drives:
         return None, "Scalar branches evaluate the augmented drives of the owned drive-row topology."
     roots = model.articulation_start.numpy()[articulations]
     leaf = np.arange(size)[None, :]
     dofs = model.joint_qd_start.numpy()[roots][:, None] + leaf
     coordinates = model.joint_q_start.numpy()[roots][:, None] + leaf
-    driven = solver.factor.drive_row_by_dof.numpy()[dofs] >= 0
+    driven = factor.drive_row_by_dof.numpy()[dofs] >= 0
     # The kernels read a driven leaf's coordinate directly; the drive rows must address the same one.
-    if np.any(solver.factor.drive_q_index_by_dof.numpy()[dofs][driven] != coordinates[driven]):
+    if np.any(factor.drive_q_index_by_dof.numpy()[dofs][driven] != coordinates[driven]):
         return None, "The augmented drives of the diagonal-mass group do not read its leaf coordinates."
     plan = ScalarBranchPlan(
         size=int(size),
