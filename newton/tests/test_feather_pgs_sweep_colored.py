@@ -144,6 +144,9 @@ class TestCapableWorlds(unittest.TestCase):
         np.testing.assert_array_equal(sweep_units.capable_worlds(free, 512, rule), [1, 3])
         self.assertEqual(sweep_units.capable_worlds(free, 63, rule).size, 0)
         self.assertEqual(sweep_units.capable_worlds(np.ones(16384), 512, rule).size, 0)
+        # A world of one free body runs one unit a color whatever the rule: it never takes the colored mapping.
+        anything = sweep_units.ColoredRule(min_units=1, parallelism=0.0)
+        np.testing.assert_array_equal(sweep_units.capable_worlds(free, 512, anything), [1, 3, 4])
 
     def test_waves_of_worlds_scale_the_units_per_color(self):
         """Colored worlds past the device's blocks at once run in waves: each wave multiplies the units per color a

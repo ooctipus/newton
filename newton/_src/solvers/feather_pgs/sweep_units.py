@@ -206,7 +206,8 @@ def stage_slots(weighted: bool) -> wp.Kernel:
         when it has one, and its normal row's weight from ``mf_row_w`` only where the laws are weighted; otherwise the
         solver binds a one-element stand-in for the weights, and the row's weight is 1.
         The coefficients, weights and packed rows are the line's, the free bodies' row ``i`` at ``body_base + i``; a
-        row's entries in the sides layout (:func:`.sweep_routes.free_body_rows`), twelve, or as many as the line holds.
+        row's twelve entries in the sides layout (:func:`.sweep_routes.free_body_rows`): a capable world holds two
+        free bodies, so its line holds twelve (:func:`capable_worlds`, asserted at the plan by :class:`ColoredUnits`).
         """
         item, p = wp.tid()
         if item >= colored_count[0]:
@@ -218,14 +219,10 @@ def stage_slots(weighted: bool) -> wp.Kernel:
         mf_line = mf_first[world]
         row = color_slot[slot, p, 0]
         rows = color_slot[slot, p, 1] & 7
-        width = wp.min(packed_Z.shape[2], 12)
         for r in range(4):
             if r < rows:
                 for k in range(12):
-                    z = float(0.0)
-                    if k < width:
-                        z = packed_Z[mf_line, body_base + row + r, k]
-                    slot_data[slot, r * 12 + k, p] = z
+                    slot_data[slot, r * 12 + k, p] = packed_Z[mf_line, body_base + row + r, k]
                 record = (record_base + row + r) * _RECORD_WORDS
                 slot_words[slot, r * 3, p] = row_record[mf_line, record + 1]
                 slot_words[slot, r * 3 + 1, p] = row_record[mf_line, record + 2]
@@ -319,7 +316,9 @@ class UnitPlan:
 def capable_worlds(free_bodies, mf_rows: int, rule: ColoredRule = COLORED_RULE):
     """The worlds that can take the colored mapping, from the model at construction: a world's units per color are
     at most its free bodies (each color holds a unit of the busiest body, at least ``units / bodies`` units share
-    one), so it needs ``rule.units_per_color`` of them, and a row capacity of ``rule.min_units`` (a unit has a row).
+    one), so it needs ``rule.units_per_color`` of them and at least two (a world of one runs a unit a color, never
+    two at once), and a row capacity of ``rule.min_units`` (a unit has a row). Two free bodies hold twelve
+    coordinates, so a capable world's line holds a unit's twelve entries (:class:`ColoredUnits`).
 
     Args:
         free_bodies: Free rigid bodies per world (array of the worlds).
@@ -331,7 +330,7 @@ def capable_worlds(free_bodies, mf_rows: int, rule: ColoredRule = COLORED_RULE):
     """
     if int(mf_rows) < int(rule.min_units):
         return np.zeros(0, dtype=np.int32)
-    return np.flatnonzero(np.asarray(free_bodies) >= rule.units_per_color).astype(np.int32)
+    return np.flatnonzero(np.asarray(free_bodies) >= max(rule.units_per_color, 2)).astype(np.int32)
 
 
 _BUILD_SOURCE = r"""
@@ -618,6 +617,8 @@ class ColoredUnits:
         weighted: The laws' weighted rows: a unit stages its normal row's weight (:func:`stage_slots`).
         claims: The step's claims (:attr:`.sweep_plan.Sweep.claims`).
         buckets: Its candidate, colored and general buckets.
+        support: The line's packed rows' entries (:func:`.packed_rows.support_width`): twelve or more, since a capable
+            world holds two free bodies (:func:`capable_worlds`); :func:`stage_slots` reads twelve unguarded.
     """
 
     def __init__(
@@ -633,7 +634,10 @@ class ColoredUnits:
         weighted: bool = False,
         claims: Queue,
         buckets: tuple[int, int, int],
+        support: int = 12,
     ):
+        if int(support) < 12:
+            raise ValueError(f"a colored world's line holds two free bodies' twelve entries, not {support}")
         self.world_count, self.mf_rows = int(world_count), int(mf_rows)
         self.claims = claims
         self.candidate, self.colored, self.general = buckets
