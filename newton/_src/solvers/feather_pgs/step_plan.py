@@ -136,10 +136,6 @@ class StepSpec:
     """The model holds particles, whose forces and integration the step runs."""
     pure_forest: bool
     """The model is its own forest (:mod:`.body_cut`): the step reads and publishes the caller's states directly."""
-    rhs: str
-    """Where the dense rows' writers write them with their right-hand sides: ``"walk"``, the one writer, which walks
-    the rows after the row pass (every walking class but the sparse diagonal's); ``"producers"``, inside the row pass
-    (the sparse diagonal's slot rows, the keyed rows; a class that walks no rows holds none)."""
     kernels: Mapping[str, str | None]
     """The sweep's kernel keys by route: ``sparse``, ``sparse_diagonal``, ``paired_factor``, ``mf_gs`` and
     ``mf_colored`` (``None`` where the class builds none)."""
@@ -170,7 +166,6 @@ class StepSpec:
             articulated=bool(model.articulation_count),
             particles=bool(model.particle_count),
             pure_forest=bool(solver.cut.pure),
-            rhs="walk" if placement.walks and route.case != "K2" else "producers",
             kernels=MappingProxyType(
                 {
                     "sparse": kernel_key(sweep.sparse_kernel) if route.case == "K1" else None,
@@ -198,7 +193,6 @@ class StepSpec:
             "articulated": self.articulated,
             "particles": self.particles,
             "pure_forest": self.pure_forest,
-            "rhs": self.rhs,
             "kernels": dict(self.kernels),
             "streams": list(self.streams),
             "diagnostics": list(self.diagnostics),
@@ -537,10 +531,10 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     if not spec.particles:
         add(wait_for_collision)
 
-    # Stage 4: the rows. The resolved-world claim, the row pass, the patches' link once every contact row's records are
-    # written, the status, the sweep's claims and the overflow warning; then the diagonals and the one writer (spec.rhs:
-    # it walks the rows into their placement's sink after the row pass, or the row pass's producers wrote them); every
-    # writer writes its rows' rhs by the row law, the free bodies' in the row pass.
+    # Stage 4: the rows. The resolved-world claim, the row pass (each family's slots and seeds), the status and the
+    # overflow warning; then the diagonals, the one writer (every walking class's: it walks the rows into their
+    # placement's sink after the row pass, each row's rhs by the row law; the free bodies' writer runs in the row pass),
+    # the patches' link once every contact row's records are written, and the sweep's claims, which read the rows.
     resolved = sweep.resolved_worlds_owner
 
     def classify_resolved_worlds(step):
@@ -599,8 +593,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     # contacts: where the family bound holds them and the one writer walks the general placement's rows, it walks them
     # beside the contact pass (Beside) and the rest after it, the two parts joined before the rest. Their diagonals
     # start from zero before them.
-    walk = spec.rhs == "walk"
-    topology = Beside(model.device) if walk and bounds and route.case != "K1" else None
+    topology = Beside(model.device) if holds and bounds and route.case not in ("K1", "K2") else None
 
     def write_topology_rows(step):
         if placement.clears_diagonals:
@@ -650,19 +643,22 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         topology.join()
         laws.write_walked(solver, step.state_in, step.contacts, step.dt, WRITE_REST)
 
-    # The one writer writes its contact rows' records after the row pass, so the patches link after it there.
-    link = (link_patches,)
+    # The one writer writes its contact rows' records after the row pass, so the patches link after it; the claims
+    # (the sparse diagonal's schedule) read the rows it wrote and the marks of their slots.
     add(
         *((classify_resolved_worlds,) if resolved is not None else ()),
         *write_rows,
-        *(link if spec.rhs != "walk" else ()),
         latch_status,
-        claim,
         *((warn_overflow,) if solver.options.diagnostics.overflow_warning else ()),
         nvtx="S4_ContactBuild",
     )
-    rhs = {"walk": (write_walked, *link), "producers": ()}[spec.rhs]
-    add(*((diagonals,) if placement.clears_diagonals and topology is None else ()), *rhs, nvtx="S4_HinvJt_Diag_RHS")
+    add(
+        *((diagonals,) if placement.clears_diagonals and topology is None else ()),
+        *((write_walked,) if holds else ()),
+        link_patches,
+        claim,
+        nvtx="S4_HinvJt_Diag_RHS",
+    )
 
     # Stages 5 and 6: the impulses' start (the warm start's normals, the closures' seeds), the claims that
     # follow the published rows, and the sweep.

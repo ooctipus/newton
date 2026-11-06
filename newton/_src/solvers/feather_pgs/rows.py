@@ -101,6 +101,15 @@ JOINT_ROW_WARPS = 4
 
 _CONTACT_BUILD_THREAD_CAP = 65536
 
+
+def _holds_contact_rows(contacts: Contacts | None) -> bool:
+    """Whether the step's contacts can hold rows: a counted stream with rows."""
+    return (
+        contacts is not None
+        and getattr(contacts, "rigid_contact_count", None) is not None
+        and contacts._rigid_contact_rows > 0
+    )
+
 SLOT_LANES = 256
 """A world's lanes in the sparse diagonal's writer (:meth:`RowLaws.write_slot_rows`), at most its rows: a block."""
 
@@ -761,8 +770,9 @@ class RowLaws:
     def write_contacts(
         self, solver, state_in: State, state_aug: State, contacts: Contacts, dt: float, producer: str
     ) -> None:
-        """The contact rows, the free bodies' contact rows (their counts finalized with status) and the sparse
-        diagonal's rows, after the joint families.
+        """The contact rows' slots (their unit sources, the one writer's seeds) and the free bodies' contact rows
+        (their counts finalized with status), after the joint families; the keyed rows' contacts where the tiers hold
+        them.
 
         Args:
             solver: The solver whose step this is: its model, options, plan and primitives.
@@ -788,16 +798,7 @@ class RowLaws:
         mf_dropped_rows = solver.placement.row_dropped_mf
         mf_first_rejected_slot = solver.placement.mf_first_rejected_slot
 
-        # The sparse diagonal on the walk (FL3.5): its rows read the slips' release (the predictor's border), its
-        # contact producers among them.
-        slots = solver.placement.walks and solver.placement.sparse_diagonal_contact_solve
-        slots_written = False
-
-        if (
-            contacts is not None
-            and getattr(contacts, "rigid_contact_count", None) is not None
-            and contacts._rigid_contact_rows > 0
-        ):
+        if _holds_contact_rows(contacts):
             enable_friction_flag = 1 if solver.options.enable_contact_friction else 0
             pool = solver.placement.contact_pool
             count = contacts.rigid_contact_count
@@ -864,19 +865,6 @@ class RowLaws:
             # The one writer's contact rows ("walk") take their records in the writer (walk_rows).
             if producer == "keyed_rows":
                 solver.placement.keyed_rows.produce_contacts(contact_input)
-            if slots:
-                # The sparse diagonal's rows, then the independent chains' marks in the slots they hold.
-                self.write_slot_rows(solver, contact_input, law, dt)
-                slots_written = True
-                if solver.sweep.sparse_contact_marker is not None:
-                    pool.launch(
-                        solver.sweep.sparse_contact_marker,
-                        contact_build_threads,
-                        inputs=[solver.placement.dense_first, contact_input, contact_build_threads],
-                        outputs=[solver.placement.sparse_diagonal_row_dof],
-                        extent=count,
-                        clamp=True,
-                    )
 
             # The free bodies' contact rows, by the walk (walk_rows): a class with free bodies always walks, on the
             # walkers' threads at its own line (walk_rows.FREE_ROWS_LINE): a contact's rows are its own, so the stride
@@ -939,10 +927,6 @@ class RowLaws:
                         extent=count,
                         max_blocks=solver.placement.contact_capacity_blocks,
                     )
-
-        if slots and not slots_written:
-            # Without contact rows the sparse diagonal's rows are its limits.
-            self.write_slot_rows(solver, ContactInput(), patch_row_law(solver), dt)
 
     def bound_free_body_contacts(self, solver) -> None:
         """Record where the free bodies' contact rows end: every contact and friction row precedes the velocity-limit
@@ -1019,15 +1003,23 @@ class RowLaws:
     def write_walked(
         self, solver, state_in, contacts: Contacts | None, dt: float, part: int = walk_rows.WRITE_ROWS
     ) -> None:
-        """The one writer: every dense row's seed walked into its placement's sink, its diagonal, incident velocity and
-        rhs, once the predictor's ``v_hat`` and its decided set are known. The general placement's
-        (:func:`.walk_rows.walked_rows_kernel`): a world's lanes release its trees' slips, write and close its bilateral
-        blocks, then walk every other row into the packed rows, corrected on the blocks it touches; ``part`` its rows
-        (every row, the topology's, or the rest). The support placement's (case K1, :meth:`write_support`)."""
+        """The one writer, after the row pass: every dense row's seed walked into its placement's sink, its diagonal,
+        incident velocity and rhs, once the predictor's ``v_hat`` and its decided set are known. The general
+        placement's (:func:`.walk_rows.walked_rows_kernel`): a world's lanes release its trees' slips, write and close
+        its bilateral blocks, then walk every other row into the packed rows, corrected on the blocks it touches;
+        ``part`` its rows (every row, the topology's, or the rest). The support placement's (case K1,
+        :meth:`write_support`); the sparse diagonal's (case K2, :meth:`write_slot_rows`)."""
+        contact_input = (
+            bind_contact_input(solver, state_in, solver.factor, contacts, dt, 1.0)
+            if contacts is not None
+            else ContactInput()
+        )
         if solver.routes.case == "K1":
-            self.write_support(solver, state_in, contacts, dt)
+            self.write_support(solver, state_in, contact_input, dt)
+        elif solver.routes.case == "K2":
+            self.write_slot_rows(solver, contacts, contact_input, dt)
         else:
-            self.write_general(solver, state_in, contacts, dt, part)
+            self.write_general(solver, state_in, contact_input, dt, part)
 
     def joint_seeds(self, solver, state_in) -> walk_rows.JointSeeds:
         """What the one writer's seeds read besides the contact input (:class:`.walk_rows.JointSeeds`): the mimics' and
@@ -1047,13 +1039,9 @@ class RowLaws:
         seeds.body_com = model.body_com
         return seeds
 
-    def write_general(self, solver, state_in, contacts: Contacts | None, dt: float, part: int) -> None:
+    def write_general(self, solver, state_in, contact_input: ContactInput, dt: float, part: int) -> None:
         """The general placement's one writer (:func:`.walk_rows.walked_rows_kernel`), the rows of ``part``."""
         placement, factor, model = solver.placement, solver.factor, solver.model
-        # Without contacts no row is a contact's: the writer reads no contact input.
-        contact_input = (
-            bind_contact_input(solver, state_in, factor, contacts, dt, 1.0) if contacts is not None else ContactInput()
-        )
         dummy_int = placement.dummy_is_free_rigid
         blocks = factor.block_capacity if factor.eliminates else 0
         # The topology part's lanes from the rows a world's topology holds at once, a block of them a lane; the
@@ -1090,16 +1078,11 @@ class RowLaws:
             device=model.device,
         )
 
-    def write_support(self, solver, state_in, contacts: Contacts | None, dt: float) -> None:
+    def write_support(self, solver, state_in, contact_input: ContactInput, dt: float) -> None:
         """Case K1's writer in two launches: the step's units listed, with the contact rows' records
         (:func:`.walk_rows.support_units_kernel`), then the walkers over the list into the support sink, a lane a unit
         (:func:`.walk_rows.support_rows_kernel`), each row of a slipping tree released by the predictor's border."""
         placement, model, sweep = solver.placement, solver.model, solver.sweep
-        contact_input = (
-            bind_contact_input(solver, state_in, solver.factor, contacts, dt, 1.0)
-            if contacts is not None
-            else ContactInput()
-        )
         dense_rows, law = bind_dense_rows(placement), patch_row_law(solver)
         sink = sweep.support_sink(solver.v_hat)
         units = sweep.support_units
@@ -1128,9 +1111,10 @@ class RowLaws:
             device=model.device,
         )
 
-    def write_slot_rows(self, solver, contact_input: ContactInput, law, dt: float) -> None:
+    def write_slot_rows(self, solver, contacts: Contacts | None, contact_input: ContactInput, dt: float) -> None:
         """The sparse diagonal's one writer (:func:`.walk_rows.slot_writer`): every dense row walked into the slots sink
-        with its diagonal, incident velocity and rhs."""
+        with its diagonal, incident velocity and rhs; then the independent chains' marks in the slots they hold (the
+        sparse contact marker), which the claim reads after the patches link."""
         placement = solver.placement
         lanes = min(placement.dense_max_constraints, SLOT_LANES)
         wp.launch(
@@ -1141,15 +1125,27 @@ class RowLaws:
                 placement.row_support(),
                 walk_rows.bind_slot_rows(solver),
                 walk_rows.packed_sink(solver),
-                placement.slot_counter,
+                placement.constraint_count,
                 lanes,
                 contact_input,
-                law,
+                patch_row_law(solver),
                 solver.v_hat,
                 self.bias(solver.options, dt),
             ],
             device=solver.model.device,
         )
+        marker = solver.sweep.sparse_contact_marker
+        if marker is not None and _holds_contact_rows(contacts):
+            pool = placement.contact_pool
+            threads = min(pool.launch_rows(), _CONTACT_BUILD_THREAD_CAP)
+            pool.launch(
+                marker,
+                threads,
+                inputs=[placement.dense_first, contact_input, threads],
+                outputs=[placement.sparse_diagonal_row_dof],
+                extent=contacts.rigid_contact_count,
+                clamp=True,
+            )
 
     def _build_friction_patches(self, solver, state_in, contacts):
         """Construct the shared contact law independently of the dynamics owner."""

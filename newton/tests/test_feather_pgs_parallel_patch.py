@@ -884,7 +884,7 @@ def _linked_rows(solver, state, contacts, dt):
 
     def linked(self, step_solver, *args):
         link_patches(self, step_solver, *args)
-        if step_solver is solver and step_solver.spec.rhs == "walk":
+        if step_solver is solver and step_solver.placement.walks:
             rows.update({name: getattr(solver.placement, name).numpy().copy() for name in _ROW_ARRAYS})
             raise _RowsBuilt
 
