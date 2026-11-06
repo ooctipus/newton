@@ -24,7 +24,7 @@ import functools
 import numpy as np
 import warp as wp
 
-from ...core.execution import Buckets, Queue, Work, shape
+from ...core.execution import Beside, Buckets, Queue, Work, shape
 from ...core.memory import Place, arch_budget, device
 from . import (
     packed_rows,
@@ -452,6 +452,7 @@ class Sweep:
         self.par_tiers = []
         # The claims' worlds (sweep_levels.claim_worlds): a bucket a tier, then the general sweep's.
         self.claims = None
+        self.claims_beside = None
         # The one writer's list where it walks every world (walked_claims): empty.
         self.every_world = Buckets()
         self.every_world.items = self.every_world.count = wp.zeros(1, dtype=int, device=self.model.device)
@@ -571,6 +572,9 @@ class Sweep:
             self.claim_colored = self.claim_general + 2 if colored else -1
             buckets = self.claim_general + (3 if colored else 1)
             self.claims = Queue(buckets * worlds, model.device, buckets=buckets)
+            # The claim stage runs beside the step's stream until its first reader (claim_worlds), except under keyed
+            # rows, whose hand-off reads it right away.
+            self.claims_beside = Beside(model.device) if self.placement.keyed_rows is None else None
             if colored:
                 self.colored_units = sweep_units.ColoredUnits(
                     self.forest.world_count,
@@ -620,7 +624,22 @@ class Sweep:
         """The claim stage: every world with rows into its claim's bucket of :attr:`claims`
         (:func:`.sweep_levels.claim_worlds`), once the row counts are final (after the status latch): a tier's (only dense
         rows, inside the tiers' row bound), the colored candidates' (a world with a colored storage slot) or the
-        general sweep's. The one writer, the unit builder and every sweep read their buckets."""
+        general sweep's. The one writer, the unit builder and every sweep read their buckets.
+
+        Without keyed rows its first reader is the unit builder or the sweep: it runs beside the stage's stream (its
+        count reset and its launch, about 10 us a step's solve on franka's critical path, PRO) until
+        :meth:`join_claims`."""
+        if self.claims_beside is not None:
+            self.claims_beside.start(self._claim_worlds)
+        else:
+            self._claim_worlds()
+
+    def join_claims(self) -> None:
+        """Make the step's stream wait for the claim stage (before its first reader)."""
+        if self.claims_beside is not None:
+            self.claims_beside.join()
+
+    def _claim_worlds(self) -> None:
         claims, units = self.claims, self.colored_units
         claims.count.zero_()
         wp.launch(
@@ -751,6 +770,7 @@ class Sweep:
 
     def solve(self, v_hat: wp.array, v_out: wp.array) -> None:
         """Launch the step's sweeps from the predictor ``v_hat`` into ``v_out``: the claims in order, then the rest."""
+        self.join_claims()
         if self.options.pgs_iterations <= 0 and not self.seeded:
             return
         operands = self._operands(v_hat, v_out)

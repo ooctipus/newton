@@ -766,7 +766,8 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     colored = sweep.colored_units
 
     def build_colored_units(step):
-        # The colored worlds' units and colors follow the rows the pack just published.
+        # The colored worlds' units and colors follow the rows the pack just published, over the claims' candidates.
+        sweep.join_claims()
         colored.build(
             placement.mf_constraint_count,
             placement.dense_first,
