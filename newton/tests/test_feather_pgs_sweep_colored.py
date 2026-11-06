@@ -39,6 +39,7 @@ from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conf
 from newton.tests.feather_pgs_law_harness import row_lines
+from newton.tests.test_feather_pgs_sweep_levels import levels
 
 
 def tray(*, mu: float = 0.6, grid: int = 3, layers: int = 2) -> scenes.Scene:
@@ -114,14 +115,9 @@ def reference_units(meta, count: int, end: int) -> dict:
             rows += 1
         word = int(meta[row, 0])
         units.append((row, rows, _signed(word >> 16, 16), _signed(word, 16)))
-    level, colors = {}, []
-    for _, _, a, b in units:
-        bodies = [dof for dof in {a, b} if dof >= 0]
-        color = max([level[dof] + 1 for dof in bodies if dof in level], default=0)
-        for dof in bodies:
-            level[dof] = color
-        colors.append(color)
-    count = max(colors, default=-1) + 1
+    # A unit's color is its level over its bodies (the level builder's rule).
+    colors = levels([tuple(dof for dof in {a, b} if dof >= 0) for _, _, a, b in units])
+    count = int(colors.max(initial=-1)) + 1
     sizes = np.bincount(np.asarray(colors, dtype=np.int64), minlength=count)
     order = sorted(range(len(units)), key=lambda unit: (colors[unit], unit))
     return {
