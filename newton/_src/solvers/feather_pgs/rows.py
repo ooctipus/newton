@@ -142,10 +142,23 @@ def velocity_prescale_launch(articulation_start: np.ndarray, *, joint_count: int
     return lanes, (count * lanes + 31) // 32 * 32
 
 
+PREFIX_LINE = 40
+"""The joint row families' warps' register line (:func:`_prefix_warp_kernel`): twelve blocks of 128 a multiprocessor,
+every thread the sm_120 keeps. Unbound, the velocity and mimic warps took 44 registers once their unit-source store
+lost its second bound, ten blocks: franka-reach's mimic warp ran 72.5 -> 91.7 us a step and its velocity warp 42.1 ->
+48.4 (PRO); the velocity warp over 23 to 43 coordinates took 48. At the line every family and size holds 40 with no
+spill (sm_120, ptxas)."""
+
+
+def _prefix_work(articulations: int) -> Work:
+    """The joint row families' work: a warp an articulation, :data:`JOINT_ROW_WARPS` a block, at :data:`PREFIX_LINE`."""
+    return Work(articulations, lanes=32, block=32 * JOINT_ROW_WARPS, registers=PREFIX_LINE)
+
+
 def prefix_shape(articulations: int, device) -> Shape:
     """The joint row families' launch over ``articulations`` (:func:`_prefix_warp_kernel`): a warp an articulation,
     :data:`JOINT_ROW_WARPS` a block, on CUDA; an articulation a thread on the CPU (:func:`.execution.shape`)."""
-    return shape(Work(articulations, lanes=32, block=32 * JOINT_ROW_WARPS), memory.device(device))
+    return shape(_prefix_work(articulations), memory.device(device))
 
 
 def _prefix_warp_params(law) -> tuple:
@@ -230,6 +243,8 @@ def _prefix_warp_kernel(size: int, groups: int, family: str, mimics: int = 0) ->
         preludes=(lane_group(32), *ROW_LAW.preludes()),
         dual=True,
         native_name=native,
+        # The bound of the architecture the build is sized for, whatever the device at hand.
+        launch_bounds=shape(_prefix_work(0), memory.built_for(None)).bounds,
     ).kernel()
 
 
