@@ -43,13 +43,13 @@ from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_TORSION,
-    compute_world_contact_bias,
 )
 from newton._src.solvers.feather_pgs.row_records import DenseRows
 from newton._src.solvers.feather_pgs.rows import RowLaws, velocity_prescale_launch
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import (
+    bias_rows,
     keyed_classes,
     leave_walk,
     plain_laws,
@@ -869,8 +869,8 @@ _ROW_ARRAYS = (
 
 
 def _linked_rows(solver, state, contacts, dt):
-    """Step until the contact rows are built and linked, and return host copies of the rows: the row pass's (its
-    ``J``), with the records the one writer writes after it where the placement walks, once the patches link them."""
+    """Step until the contact rows are built and linked, and return host copies of the rows: the row pass's records,
+    with those the one writer writes after it where the placement walks, once the patches link them."""
     rows = {}
     finalize = Placement.latch_status
     link_patches = RowLaws.link_patches
@@ -879,7 +879,6 @@ def _linked_rows(solver, state, contacts, dt):
         finalize(self, step_contacts)
         if self is solver.placement:
             rows.update({name: getattr(self, name).numpy().copy() for name in _ROW_ARRAYS})
-            rows["J"] = {size: self.jacobian_rows(size).numpy().copy() for size in self.forest.size_groups}
             if not self.walks:
                 raise _RowsBuilt
 
@@ -944,7 +943,7 @@ def _general_bias(solver, rows, dt):
         first=row_lines(device),
     )
     wp.launch(
-        compute_world_contact_bias,
+        bias_rows,
         dim=(rhs.shape[0], rhs.shape[1]),
         inputs=[
             records,

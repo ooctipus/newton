@@ -15,8 +15,9 @@
   is decided.
 
 The step's row pass is the families' methods, from :meth:`RowLaws.begin` to :meth:`RowLaws.write_contacts`, in the
-launch order that fixes the slot order (the stage list runs those a class holds), and :meth:`RowLaws.write_rhs` the
-dense rows' right-hand sides once their diagonals are known.
+launch order that fixes the slot order (the stage list runs those a class holds): each family records its rows and
+their seeds, and the one writer walks them (:meth:`RowLaws.write_walked`, :mod:`.walk_rows`) into the class's sink with
+their diagonals, incident velocities and right-hand sides.
 The device law functions stay in :mod:`.row_laws`, :mod:`.row_build` and :mod:`.prefix_rows`.
 """
 
@@ -30,7 +31,7 @@ import numpy as np
 import warp as wp
 
 from ...core import memory
-from ...core.execution import Shape, Work, fill_lanes, launch, shape
+from ...core.execution import Shape, Work, launch, shape
 from ...sim import Contacts, Model, State
 from ...sim.enums import JointType
 from . import field_group, host_index, prefix_rows, walk_rows
@@ -55,7 +56,6 @@ from .row_kernels import (
     RowBias,
     allocate_link_slots,
     allocate_rigid_velocity_limit_slots,
-    compute_world_contact_bias,
     prepare_fused_diagonal_joint_limits,
     write_link_rows,
 )
@@ -101,9 +101,8 @@ JOINT_ROW_WARPS = 4
 
 _CONTACT_BUILD_THREAD_CAP = 65536
 
-BIAS_LANES = 256
-"""The fewest threads a world's rows get in the bias launch (:func:`.row_kernels.compute_world_contact_bias`), a block:
-fewer worlds than fill the device take more (:func:`.launch.fill_lanes`), at most the rows' capacity."""
+SLOT_LANES = 256
+"""A world's lanes in the sparse diagonal's writer (:meth:`RowLaws.write_slot_rows`), at most its rows: a block."""
 
 
 def velocity_prescale_launch(articulation_start: np.ndarray, *, joint_count: int, cuda: bool) -> tuple[int, int]:
@@ -144,8 +143,8 @@ def prefix_shape(articulations: int, device) -> Shape:
 
 def _prefix_warp_params(law) -> tuple:
     """The warp prefix producers' operands after the articulations' count (the dispatch's guard): the family's law
-    (:data:`.prefix_rows.LAW`, with the velocity or the mimic family's inputs), the rows' placement and Jacobian rows
-    (:func:`.row_records.jacobian_row`: the packed rows, by world, or the size group's)."""
+    (:data:`.prefix_rows.LAW`, with the velocity or the mimic family's inputs) and the rows' placement (its unit
+    sources, :class:`.row_records.RowSupport`)."""
     return params(
         ("articulation_dof_start", wp.array[int]),
         ("art_to_world", wp.array[int]),
@@ -153,7 +152,6 @@ def _prefix_warp_params(law) -> tuple:
         ("resolved_worlds", wp.array[int]),
         ("law", law),
         ("support", RowSupport),
-        ("J_group", wp.array3d[float]),
     )
 
 
@@ -172,34 +170,23 @@ _PREFIX_FAMILIES = {
 
 @cache
 def _prefix_warp_kernel(size: int, groups: int, family: str, mimics: int = 0) -> wp.Kernel:
-    """A joint row family of the general route and the one writer, one warp per articulation of ``size`` coordinates
+    """A joint row family of the one writer, one warp per articulation of ``size`` coordinates
     (:func:`.prefix_rows.prefix_rows`), ``groups`` a block (:func:`prefix_shape`'s, one on the CPU): its joint limits, its joint
     velocity limits, or its mimics (at most ``mimics`` an articulation). The warp takes each candidate's law, reserves
-    the active rows on the world's counter, writes their records and publishes each row's side: its unit source for
-    the one writer, else its Jacobian row (a mimic's two coordinates; its slot in ``mimic_slot`` too). The joint
-    limits skip the resolved worlds; every world takes its velocity limits and mimics."""
+    the active rows on the world's counter, writes their records and publishes each row's seed, its unit source, which
+    the one writer walks (a mimic's slot in ``mimic_slot`` too). The joint limits skip the resolved worlds; every world
+    takes its velocity limits and mimics."""
     name, native, law, kind = _PREFIX_FAMILIES[family]
     kind = int(kind)
     if family == "mimics":
-        source, second = f"({kind} << {int(UNIT_SHIFT)}) | mimic", "\n                J_side[d1] = w1;"
+        source = f"({kind} << {int(UNIT_SHIFT)}) | mimic"
         extra = "            law.mimic_slot.data[mimic] = slot;\n"
     else:
-        source, second, extra = f"({kind} << {int(UNIT_SHIFT)}) | (2 * (first_dof + d0) + (w0 < 0.0f ? 1 : 0))", "", ""
-    # A row's side: its articulation's coordinates in the packed rows (cleared, then the coefficients), or the size
-    # group's row (cleared each step).
-    sink = f"""{extra}            if (support.walks != 0) {{
-                // The one writer walks the row (walk_rows): its unit source, the coordinate's side, in the units' own
-                // rows (the compact boundary keeps its limit prefix's alone).
-                if (slot < support.units.shape[1])
-                    support.units.data[(size_t)prefix_line * support.units.shape[1] + slot] =
-                        {source};
-            }} else {{
-                float* J_side = &J_group.data[((size_t)row_index * J_group.shape[1] + slot) * J_group.shape[2] + first];
-                if (support.packed != 0) {{
-                    for (int e = 0; e < {size}; ++e) J_side[e] = 0.0f;
-                }}
-                J_side[d0] = w0;{second}
-            }}"""
+        source, extra = f"({kind} << {int(UNIT_SHIFT)}) | (2 * (first_dof + d0) + (w0 < 0.0f ? 1 : 0))", ""
+    # The row's seed: its unit source, the coordinate's side, in the units' own rows (the compact boundary keeps its
+    # limit prefix's alone).
+    sink = f"""{extra}            if (slot < support.units.shape[1])
+                support.units.data[(size_t)prefix_line * support.units.shape[1] + slot] = {source};"""
     if family == "mimics":
         candidates = prefix_rows.mimics(mimics, "law.")
     elif family == "velocity":
@@ -227,10 +214,7 @@ def _prefix_warp_kernel(size: int, groups: int, family: str, mimics: int = 0) ->
         )
     body = f"""    const int art = group_to_art.data[group];
     const int world = art_to_world.data[art];
-{head}{first_dof}    // The rows' first index and the side's first entry (dense_rows.jacobian_row; one side).
-    const int row_index = support.packed != 0 ? support.first.data[world] : group;
-    const int first = support.packed != 0 && support.dense != 0 ? support.offset.data[art] : 0;
-{rows}"""
+{head}{first_dof}{rows}"""
     suffix = f"_m{mimics}" if family == "mimics" else ""
     return KernelTemplate(
         f"{name}_{size}_{groups}{suffix}",
@@ -244,19 +228,18 @@ def _prefix_warp_kernel(size: int, groups: int, family: str, mimics: int = 0) ->
 
 
 def joint_limit_warp_kernel(size: int, groups: int) -> wp.Kernel:
-    """The general route's and the one writer's joint-limit rows, one warp per articulation (:func:`_prefix_warp_kernel`)."""
+    """The one writer's joint-limit rows, one warp per articulation (:func:`_prefix_warp_kernel`)."""
     return _prefix_warp_kernel(size, groups, "limits")
 
 
 def velocity_limit_warp_kernel(size: int, groups: int) -> wp.Kernel:
-    """The general route's and the one writer's joint velocity-limit rows, one warp per articulation
-    (:func:`_prefix_warp_kernel`)."""
+    """The one writer's joint velocity-limit rows, one warp per articulation (:func:`_prefix_warp_kernel`)."""
     return _prefix_warp_kernel(size, groups, "velocity")
 
 
 def mimic_warp_kernel(size: int, groups: int, mimics: int) -> wp.Kernel:
-    """The general route's and the one writer's mimic rows, at most ``mimics`` an articulation, one warp per
-    articulation (:func:`_prefix_warp_kernel`)."""
+    """The one writer's mimic rows, at most ``mimics`` an articulation, one warp per articulation
+    (:func:`_prefix_warp_kernel`)."""
     return _prefix_warp_kernel(size, groups, "mimics", mimics)
 
 
@@ -641,7 +624,6 @@ class RowLaws:
                 law,
                 support,
             ],
-            outputs=[solver.placement.jacobian_rows(size)],
             device=solver.model.device,
         )
 
@@ -691,7 +673,7 @@ class RowLaws:
         for size, warp_kernel in self.mimic_warp_kernels.items():
             self._launch_prefix_warp(solver, warp_kernel, size, law, support)
 
-    def write_links(self, solver, state_in: State, state_aug: State) -> None:
+    def write_links(self, solver, state_in: State) -> None:
         """The links' rows, static per model, their sides the trees of the link's two pieces (staged with links)."""
         model = solver.model
         links = field_group.bind(Links, laws=self)
@@ -706,19 +688,14 @@ class RowLaws:
             write_link_rows,
             dim=self.link_count,
             inputs=[
-                bind_joint_table(solver),
                 links,
                 state_in.body_q,
                 model.body_com,
-                solver.forest.body_to_joint,
                 solver.forest.body_to_articulation,
-                model.joint_ancestor,
-                state_aug.joint_S_s,
-                solver.factor.articulation_origin,
                 solver.options.pgs_beta,
                 solver.placement.row_support(),
             ],
-            outputs=[solver.placement.packed_Z, bind_dense_rows(solver.placement)],
+            outputs=[bind_dense_rows(solver.placement)],
             device=model.device,
         )
 
@@ -1037,12 +1014,6 @@ class RowLaws:
         """Finalize the dense rows' counts with status, after every dense producer."""
         self._finalize(solver, 0)
 
-    def write_rhs(self, solver, dt: float) -> None:
-        """Each dense row's rhs: its bias, or a bouncing contact's rebound (``compute_world_contact_bias``), where no
-        producer writes it (the stage list's ``rhs == "bias"``, :attr:`.step_plan.StepSpec.rhs`)."""
-        placement = solver.placement
-        self._bias(solver, dt, placement.constraint_count, placement.dense_max_constraints)
-
     def bias(self, options, dt: float) -> RowBias:
         """The rows' law's step parameters (:class:`.row_kernels.RowBias`) of a step of ``dt``."""
         bias = RowBias()
@@ -1050,24 +1021,6 @@ class RowLaws:
         bias.contact_w, bias.restitution_threshold = self.contact_w, self.effective_restitution_velocity_threshold
         bias.weighted, bias.material = int(self.set.weighted), int(options.contact_compliance)
         return bias
-
-    def _bias(self, solver, dt: float, counts: wp.array, capacity: int) -> None:
-        """The rows' bias launch over a class of rows: ``counts`` a world, at most ``capacity``."""
-        # A world's lanes: a block, or enough that the worlds fill the device, at most its capacity.
-        lanes = min(capacity, fill_lanes(solver.forest.world_count, solver.model.device, BIAS_LANES))
-        wp.launch(
-            compute_world_contact_bias,
-            dim=(solver.forest.world_count, lanes),
-            inputs=[
-                bind_dense_rows(solver.placement),
-                solver.placement.row_incident,
-                counts,
-                capacity,
-                lanes,
-                self.bias(solver.options, dt),
-            ],
-            device=solver.model.device,
-        )
 
     def write_walked(
         self, solver, state_in, contacts: Contacts | None, dt: float, part: int = walk_rows.WRITE_ROWS
@@ -1187,7 +1140,7 @@ class RowLaws:
         placement = solver.placement
         prefix = bool(placement.compact_contact_boundary)
         rows = max(int(placement.dense_internal_max_rows), 1) if prefix else placement.dense_max_constraints
-        lanes = min(rows, BIAS_LANES)
+        lanes = min(rows, SLOT_LANES)
         wp.launch(
             walk_rows.slot_writer(solver),
             dim=(solver.forest.world_count, lanes),

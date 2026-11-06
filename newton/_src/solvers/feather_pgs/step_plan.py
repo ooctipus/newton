@@ -136,9 +136,9 @@ class StepSpec:
     pure_forest: bool
     """The model is its own forest (:mod:`.body_cut`): the step reads and publishes the caller's states directly."""
     rhs: str
-    """Who writes the dense rows' right-hand sides: ``"walk"``, the one writer, which walks the rows after the row pass
-    (every walking class but the sparse diagonal's); ``"producers"``, the row pass's own producers (the sparse
-    diagonal's slot rows, the keyed rows); ``"bias"``, the rows' bias launch apart."""
+    """Where the dense rows' writers write them with their right-hand sides: ``"walk"``, the one writer, which walks
+    the rows after the row pass (every walking class but the sparse diagonal's); ``"producers"``, inside the row pass
+    (the sparse diagonal's slot rows, the keyed rows; a class that walks no rows holds none)."""
     kernels: Mapping[str, str | None]
     """The sweep's kernel keys by route: ``sparse``, ``sparse_diagonal``, ``paired_factor``, ``mf_gs`` and
     ``mf_colored`` (``None`` where the class builds none)."""
@@ -169,13 +169,7 @@ class StepSpec:
             articulated=bool(model.articulation_count),
             particles=bool(model.particle_count),
             pure_forest=bool(solver.cut.pure),
-            rhs=(
-                "walk"
-                if placement.walks and route.case != "K2"
-                else "producers"
-                if placement.walks or placement.keyed_rows is not None
-                else "bias"
-            ),
+            rhs="walk" if placement.walks and route.case != "K2" else "producers",
             kernels=MappingProxyType(
                 {
                     "sparse": kernel_key(sweep.sparse_kernel) if route.case == "K1" else None,
@@ -526,17 +520,20 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         add(wait_for_collision)
 
     # Stage 4: the rows. The resolved-world claim, the row pass, the patches' link once every contact row's records are
-    # written, the status, the sweep's claims and the overflow warning; then the diagonals and the right-hand sides'
-    # writer (spec.rhs: the one writer walks the rows into their placement's sink, the producers wrote them, or the rows'
-    # bias is written apart); the free bodies' writers write their rows' rhs in the row pass.
+    # written, the status, the sweep's claims and the overflow warning; then the diagonals and the one writer (spec.rhs:
+    # it walks the rows into their placement's sink after the row pass, or the row pass's producers wrote them); every
+    # writer writes its rows' rhs by the row law, the free bodies' in the row pass.
     resolved = sweep.resolved_worlds_owner
 
     def classify_resolved_worlds(step):
         resolved.classify(step.state_in, factor, step.contacts, step.dt)
 
-    # The row pass, its families in the launch order that is the slot order (rows.py): each family a class holds.
+    # The row pass, its families in the launch order that is the slot order (rows.py): each family a class holds. The
+    # joint families' rows are seeds the one writer walks: a class that walks no rows has no responding coordinate, and
+    # holds none (no contact is admitted there either).
     keyed = placement.keyed_rows is not None
-    limit_sizes = laws.limit_sizes(solver) if solver.options.enable_joint_limits and not keyed else ()
+    holds = placement.walks
+    limit_sizes = laws.limit_sizes(solver) if solver.options.enable_joint_limits and holds and not keyed else ()
 
     def begin_rows(step):
         laws.begin(solver, step.state_in, factor, step.dt)
@@ -545,7 +542,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         laws.write_mimics(solver, step.state_in, step.dt)
 
     def write_links(step):
-        laws.write_links(solver, step.state_in, factor)
+        laws.write_links(solver, step.state_in)
 
     def prepare_fused_limits(step):
         laws.prepare_fused_limits(solver, step.state_in, step.dt)
@@ -594,12 +591,12 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
 
     write_rows = (
         begin_rows,
-        *((write_mimics,) if laws.mimic_warp_kernels else ()),
-        *((write_links,) if laws.link_count > 0 else ()),
+        *((write_mimics,) if laws.mimic_warp_kernels and holds else ()),
+        *((write_links,) if laws.link_count > 0 and holds else ()),
         *((prepare_fused_limits,) if placement.fused_diagonal_joint_limits else ()),
         *((write_limits,) if limit_sizes else ()),
         *((bound_limits,) if bounds else ()),
-        *((write_velocity_limits,) if laws.velocity_limit_warp_kernels and not keyed else ()),
+        *((write_velocity_limits,) if laws.velocity_limit_warp_kernels and holds and not keyed else ()),
         *((bound_velocity_limits,) if bounds else ()),
         *((write_topology_rows,) if topology is not None else ()),
         write_contacts,
@@ -635,9 +632,6 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         topology.join()
         laws.write_walked(solver, step.state_in, step.contacts, step.dt, WRITE_REST)
 
-    def write_rhs(step):
-        laws.write_rhs(solver, step.dt)
-
     # The one writer writes its contact rows' records after the row pass, so the patches link after it there.
     link = (link_patches,)
     add(
@@ -649,7 +643,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         *((warn_overflow,) if solver.options.diagnostics.overflow_warning else ()),
         nvtx="S4_ContactBuild",
     )
-    rhs = {"walk": (write_walked, *link), "producers": (), "bias": (write_rhs,)}[spec.rhs]
+    rhs = {"walk": (write_walked, *link), "producers": ()}[spec.rhs]
     add(*((diagonals,) if placement.clears_diagonals and topology is None else ()), *rhs, nvtx="S4_HinvJt_Diag_RHS")
 
     # Stages 5 and 6: the impulses' start (the warm start's normals, the closures' seeds), the claims that

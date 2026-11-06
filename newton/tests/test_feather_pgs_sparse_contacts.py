@@ -10,9 +10,8 @@ from newton._src.solvers.feather_pgs import field_group, row_records
 from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
-    compute_world_contact_bias,
 )
-from newton.tests.feather_pgs_law_harness import row_bias, row_lines
+from newton.tests.feather_pgs_law_harness import bias_rows, row_bias, row_lines
 
 
 def _array(value, dtype=float):
@@ -36,7 +35,7 @@ class TestSparseContacts(unittest.TestCase):
         def right_hand_sides(coefficient):
             rhs = _full((1, row_count), -7.0)
             wp.launch(
-                compute_world_contact_bias,
+                bias_rows,
                 dim=(1, row_count),
                 inputs=[
                     field_group.upload(

@@ -42,7 +42,7 @@ from newton._src.solvers.feather_pgs.factor.walk import (
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, PatchRowLaw
 from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.route_table import Laws
-from newton._src.solvers.feather_pgs.row_records import DenseRows, MfRows, RowSupport
+from newton._src.solvers.feather_pgs.row_records import UNIT_MIMIC, UNIT_SHIFT, DenseRows, MfRows, RowSupport
 from newton._src.solvers.feather_pgs.tree_scan import WalkClass
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -664,6 +664,24 @@ def row_bias(dt, speculative_scale, contact_w, restitution_threshold, weighted, 
     return bias
 
 
+@wp.kernel
+def bias_rows(
+    rows: DenseRows,
+    row_incident: wp.array2d[float],
+    world_constraint_count: wp.array[int],
+    max_constraints: int,
+    lanes: int,
+    bias: row_kernels.RowBias,
+):
+    """The row law over a store's rows, as every writer applies it after its walk (:func:`.row_kernels.row_bias`):
+    ``dim = (worlds, lanes)``, a world's lanes striding over its first ``min(count, max_constraints)`` rows."""
+    world, lane = wp.tid()
+    count = wp.min(world_constraint_count[world], max_constraints)
+    line = rows.first[world]
+    for i in range(lane, count, lanes):
+        row_kernels.row_bias(rows, bias, line, i, row_incident[line, i])
+
+
 def row_lines(device) -> wp.array:
     """The row table of a hand-built scene, read by world: its worlds keep their rows on their own lines."""
     key = str(device)
@@ -718,27 +736,16 @@ def contact_input(values, device):
     return bind_struct(ContactInput, {"rigid_body_max_depenetration_velocity": uncapped, **values}, device)
 
 
-def row_support(sides, dofs, offsets, dense, device, worlds=None) -> RowSupport:
-    """A packed :class:`.row_records.RowSupport` of test rows: ``sides`` ``[world, row, 2]`` articulation indices (-1
-    for none), each articulation's coordinates, first world coordinate and world (``worlds``, default 0), and the
-    layout (``dense``: entry ``e`` is coordinate ``e``)."""
+def unit_rows(device, worlds: int, rows: int) -> RowSupport:
+    """The rows' placement of a producer under test (:class:`.row_records.RowSupport`): ``worlds`` lines of ``rows``
+    rows whose unit sources (``units``) the producer writes, the seeds the one writer walks."""
     support = RowSupport()
-    support.sides = wp.array(np.ascontiguousarray(sides, dtype=np.int32), dtype=wp.vec2i, device=device)
-    support.dofs = wp.array(np.asarray(dofs, dtype=np.int32), dtype=wp.int32, device=device)
-    support.offset = wp.array(np.asarray(offsets, dtype=np.int32), dtype=wp.int32, device=device)
-    worlds = np.zeros(len(dofs), dtype=np.int32) if worlds is None else np.asarray(worlds, dtype=np.int32)
-    support.world = wp.array(worlds, dtype=wp.int32, device=device)
-    support.dense = int(dense)
-    support.packed = 1
+    support.sides = wp.zeros((worlds, rows), dtype=wp.vec2i, device=device)
+    support.dofs = wp.zeros(1, dtype=wp.int32, device=device)
+    support.offset = wp.zeros(1, dtype=wp.int32, device=device)
+    support.dense = 0
     support.first = row_lines(device)
-    return support
-
-
-def group_rows(device) -> RowSupport:
-    """The size groups' rows as the producers' placement (:class:`.row_records.RowSupport`, not packed): a producer
-    writes an articulation's side of a row at its group, from entry 0."""
-    support = row_support(np.full((1, 1, 2), -1, dtype=np.int32), [0], [0], 0, device)
-    support.packed = 0
+    support.units = wp.zeros((worlds, rows), dtype=wp.int32, device=device)
     return support
 
 
@@ -757,16 +764,17 @@ PREFIX_RECORDS = {
 def prefix_warp_rows(
     device, arts: int, size: int, rows: int, *, family="limits", mimics=0, resolved=None, **law
 ) -> dict:
-    """Launch a joint row family's warp of the general route (``family``: the joint limits'
-    :func:`.rows.joint_limit_warp_kernel`, the joint velocity limits' ``"velocity"`` or the mimics' ``"mimics"``, at most
-    ``mimics`` an articulation), as :meth:`.rows.RowLaws.write` launches it (:func:`.rows.prefix_shape`), on the size
-    groups' rows.
+    """Launch a joint row family's warp (``family``: the joint limits' :func:`.rows.joint_limit_warp_kernel`, the joint
+    velocity limits' ``"velocity"`` or the mimics' ``"mimics"``, at most ``mimics`` an articulation), as
+    :meth:`.rows.RowLaws.write_limits` launches it (:func:`.rows.prefix_shape`), its seeds into unit sources
+    (:func:`unit_rows`).
 
     Articulation ``a`` is world ``a`` and group ``a``, its ``size`` coordinates from ``a * size``; its world holds
     ``rows`` rows. ``law`` holds the law's inputs by :data:`.prefix_rows.LAW`'s (and the family's) names; every
     coordinate is a limit coordinate and none is prescribed unless it says. ``resolved`` is the worlds' resolved mask
-    (``None``: none). Returns each world's row count (``count``), the Jacobian rows ``J``, the records by name and every
-    array the law was given, as numpy arrays.
+    (``None``: none). Returns each world's row count (``count``), the unit sources ``units`` and the rows' seeds as
+    Jacobian rows ``J`` (each covector at its articulation's coordinates: :func:`.walk_rows.joint_seeds`), the records
+    by name and every array the law was given, as numpy arrays.
     """
     from newton._src.core import execution  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import prefix_rows  # noqa: PLC0415
@@ -797,7 +805,7 @@ def prefix_warp_rows(
         **records,
         **law,
     )
-    J = wp.zeros((arts, rows, size), dtype=wp.float32, device=device)
+    support = unit_rows(device, arts, rows)
     order = wp.array(np.arange(arts), dtype=wp.int32, device=device)
     execution.launch(
         kernel,
@@ -809,15 +817,27 @@ def prefix_warp_rows(
             order,
             wp.array(np.zeros(0) if resolved is None else np.asarray(resolved), dtype=wp.int32, device=device),
             struct,
-            group_rows(device),
+            support,
         ],
-        outputs=[J],
         device=device,
     )
     arrays = {name: value for name, value in law.items() if isinstance(value, wp.array)}
+    units, count = support.units.numpy(), counter.numpy()
+    # The seeds the one writer walks (walk_rows.joint_seeds): a limit's or velocity limit's +-e_dof, a mimic's
+    # e_dof0 - coef1 e_dof1.
+    J = np.zeros((arts, rows, size), dtype=np.float32)
+    for a in range(arts):
+        for row in range(min(int(count[a]), rows)):
+            kind, index = int(units[a, row]) >> int(UNIT_SHIFT), int(units[a, row]) & ((1 << int(UNIT_SHIFT)) - 1)
+            if kind == int(UNIT_MIMIC):
+                J[a, row, int(law["mimic_dof0"].numpy()[index]) - a * size] = 1.0
+                J[a, row, int(law["mimic_dof1"].numpy()[index]) - a * size] = -float(law["mimic_coef1"].numpy()[index])
+            else:
+                J[a, row, index // 2 - a * size] = 1.0 - 2.0 * (index % 2)
     return {
-        "count": counter.numpy(),
-        "J": J.numpy(),
+        "count": count,
+        "units": units,
+        "J": J,
         **{name: array.numpy() for name, array in {**arrays, **records}.items()},
     }
 
@@ -1206,15 +1226,11 @@ def call(kernel, dim, device, **values):
     """Launch ``kernel`` with arguments by name; numpy inputs become arrays of the argument's dtype.
 
     A struct argument of :data:`STRUCT_ARGUMENTS` is bound from the values by the scenes' names
-    (:func:`bind_struct`), and a producer's placement not given is the size groups' rows (:func:`group_rows`).
+    (:func:`bind_struct`).
     Returns every array argument (and every array of such a struct) by name, so a test reads the outputs it needs.
     """
     args, arrays = [], {}
     for var in kernel.adj.args:
-        if var.type is RowSupport and var.label not in values:
-            # A producer's placement: the size groups' rows the scenes give (group_rows).
-            args.append(group_rows(device))
-            continue
         if var.type in STRUCT_ARGUMENTS and var.label not in values:
             value, struct_arrays = bind_struct(var.type, values, device)
             arrays.update(struct_arrays)

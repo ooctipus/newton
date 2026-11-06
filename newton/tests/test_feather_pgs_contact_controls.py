@@ -13,11 +13,10 @@ from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.contact_forces import compute_contact_linear_force_from_impulses
 from newton._src.solvers.feather_pgs.contact_input import ContactInput, ContactRoutes
 from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED
-from newton._src.solvers.feather_pgs.row_kernels import compute_world_contact_bias
 from newton._src.solvers.feather_pgs.row_records import DenseRows
 from newton._src.solvers.feather_pgs.row_slots import allocate_world_contact_slots
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import anchored_patches, row_bias, row_lines
+from newton.tests.feather_pgs_law_harness import anchored_patches, bias_rows, row_bias, row_lines
 
 PATH_DENSE = 0
 PATH_MATRIX_FREE = 1
@@ -209,7 +208,7 @@ def _speculative_rhs(scale: float) -> float:
         first=row_lines("cpu"),
     )
     wp.launch(
-        compute_world_contact_bias,
+        bias_rows,
         dim=(1, 1),
         inputs=[
             rows,

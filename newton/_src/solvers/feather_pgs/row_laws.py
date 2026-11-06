@@ -8,7 +8,7 @@ target and its stabilization. Every row builder and sweep that forms a row's
 ``rhs`` takes it from these laws, in Warp or in native CUDA (:mod:`.law_source`):
 
 * :func:`row_rhs` is the position-level law of every row type, the canonical
-  form of :func:`.row_kernels.compute_world_contact_bias`: ``x * inv_dt`` with
+  form of :func:`.row_kernels.row_bias`: ``x * inv_dt`` with
   ``inv_dt = 1 / dt``, the bias scaled by ``bias_scale``, a contact row's
   regularization weight ``contact_w`` on Baumgarte rows only;
 * :func:`contact_rhs` is a contact normal row's law: Baumgarte correction of a

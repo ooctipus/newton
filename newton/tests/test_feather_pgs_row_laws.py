@@ -16,6 +16,7 @@ import warp as wp
 from newton._src.solvers.feather_pgs import field_group, row_kernels, row_laws
 from newton._src.solvers.feather_pgs.row_records import DenseRows
 from newton.tests.feather_pgs_law_harness import (
+    bias_rows,
     call,
     mismatches,
     prefix_warp_rows,
@@ -71,15 +72,16 @@ def _rows(rng, worlds, rows):
     return phi, kind, beta, target
 
 
-def test_row_rhs_matches_world_contact_bias(test, device):
-    """Equal ``row_kernels.compute_world_contact_bias`` bitwise for every row kind and setting."""
+def test_row_rhs_matches_bias_rows(test, device):
+    """Equal the row law over a store's rows (``row_kernels.row_bias``, :func:`bias_rows`) bitwise for every row kind and
+    setting."""
     rng = np.random.default_rng(11)
     worlds, rows = 16, 64
     phi, kind, beta, target = _rows(rng, worlds, rows)
     for dt, contact_spec, contact_w in ((1.0 / 60.0, 1.0, 1.0), (1.0 / 120.0, 0.0, 0.5), (7.0e-3, 0.3, 0.98)):
         with test.subTest(dt=dt, contact_spec=contact_spec, contact_w=contact_w):
             out = call(
-                row_kernels.compute_world_contact_bias,
+                bias_rows,
                 (worlds, rows),
                 device,
                 world_constraint_count=np.full(worlds, rows, dtype=np.int32),
@@ -288,7 +290,7 @@ def _law_row_beta(
 
 
 def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
-    """Equal the free-body rows' rhs (``row_kernels.compute_world_contact_bias`` on their records): the contact law with its
+    """Equal the free-body rows' rhs (``row_kernels.row_bias`` on their records, as their writers apply it): the contact law with its
     bodies' depenetration cap and weights, from the incident velocity the walk summed."""
     rng = np.random.default_rng(13)
     worlds, rows = 8, 48
@@ -341,7 +343,7 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
         first=row_lines(device),
     )
     call(
-        row_kernels.compute_world_contact_bias,
+        bias_rows,
         (worlds, rows),
         device,
         rows=records,
@@ -373,7 +375,7 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
     np.testing.assert_array_equal(records.row_w.numpy(), law["row_w"].numpy())
     magnitude = np.abs(phi) * 60.0 + np.abs(target)
     test.assertLessEqual(
-        unified("mf rhs (compute_world_contact_bias)", reference_rhs.ravel(), law_rhs.ravel(), magnitude.ravel(), 2.0),
+        unified("mf rhs (row_bias)", reference_rhs.ravel(), law_rhs.ravel(), magnitude.ravel(), 2.0),
         2.0,
     )
     # Rows whose bias the variant does not touch (speed rows, restitution) stay bitwise.
@@ -426,7 +428,7 @@ def test_restitution_matches_matrix_free_restitution(test, device):
         "restitution_velocity_threshold": 0.2,
     }
     out = call(
-        row_kernels.compute_world_contact_bias,
+        bias_rows,
         (worlds, rows),
         device,
         world_constraint_count=np.full(worlds, rows, dtype=np.int32),

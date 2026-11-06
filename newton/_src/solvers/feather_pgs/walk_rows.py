@@ -887,7 +887,7 @@ _PACKED_SIDE = """$skip$tree
             if (body_b >= 0 && art_b == art) ++seeds;
         }
         if (seeds == 0) continue;
-        // The side's first entry (dense_rows.jacobian_row): in a packed row the articulation's first world coordinate
+        // The side's first entry (row_records.RowSupport): in a packed row the articulation's first world coordinate
         // (dense) or after the row's first side; in a size group's dense part (the star's arm) entry 0.
         const int base = $base;
         // Two seeds on one tree add where their paths meet, then the rows are re-read for their norms.

@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The contact row allocation and the Jacobian's ancestor walk against the contact laws they compose.
+"""The contact row allocation against the contact laws it composes.
 
-Contact endpoints and admission, and Jacobian entries: each kernel's output equals the laws' composition written out
+Contact endpoints and admission: each kernel's output equals the laws' composition written out
 in this module. The gap's precision far from the origin is tested with its consumers (the resolved-world classifier in
 ``test_feather_pgs_resolved_worlds``, the rows in ``test_feather_pgs_regimes`` Q20), the torsion oracle in
 ``test_feather_pgs_torsion_device``.
@@ -14,9 +14,8 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import contact_filters, contact_laws, friction_patches, row_kernels, row_slots
+from newton._src.solvers.feather_pgs import contact_filters, contact_laws, friction_patches, row_slots
 from newton.tests.feather_pgs_law_harness import (
-    assert_reproduces,
     call,
     register_device_tests,
     transforms,
@@ -24,7 +23,7 @@ from newton.tests.feather_pgs_law_harness import (
 )
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Contact row allocation and the ancestor walk against the laws
+# Contact row allocation against the laws
 # ---------------------------------------------------------------------------------------------------------------------
 
 
@@ -222,95 +221,8 @@ def test_contact_endpoints_match_row_allocation(test, device):
         np.testing.assert_array_equal(out[name].numpy()[admitted], law[law_name].numpy()[admitted], name)
 
 
-@wp.kernel
-def _kernel_ancestor_rows(
-    body: wp.array[int],
-    sign: wp.array[float],
-    point: wp.array[wp.vec3],
-    origin: wp.array[wp.vec3],
-    direction: wp.array[wp.vec3],
-    body_to_joint: wp.array[int],
-    joint_ancestor: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_S_s: wp.array[wp.spatial_vector],
-    n_dofs: int,
-    J_group: wp.array3d[float],
-):
-    row = wp.tid()
-    row_kernels.accumulate_jacobian_row_world(
-        body[row],
-        sign[row],
-        point[row],
-        origin[row],
-        direction[row],
-        False,
-        body_to_joint,
-        joint_ancestor,
-        joint_qd_start,
-        joint_S_s,
-        0,
-        n_dofs,
-        wp.vec2i(0, 0),
-        row,
-        J_group,
-    )
-
-
-@wp.kernel
-def _law_ancestor_rows(
-    body: wp.array[int],
-    sign: wp.array[float],
-    point: wp.array[wp.vec3],
-    origin: wp.array[wp.vec3],
-    direction: wp.array[wp.vec3],
-    body_to_joint: wp.array[int],
-    joint_ancestor: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_S_s: wp.array[wp.spatial_vector],
-    n_dofs: int,
-    J_group: wp.array3d[float],
-):
-    row = wp.tid()
-    if body[row] < 0:
-        return
-    joint = body_to_joint[body[row]]
-    while joint >= 0:
-        for dof in range(joint_qd_start[joint], joint_qd_start[joint + 1]):
-            if dof < n_dofs:
-                J_group[0, row, dof] += sign[row] * contact_laws.jacobian_entry(
-                    joint_S_s[dof], direction[row], point[row], origin[row]
-                )
-        joint = joint_ancestor[joint]
-
-
-def test_jacobian_entry_matches_ancestor_walk(test, device):
-    """Equal ``accumulate_jacobian_row_world``'s walk up the tree bitwise, multi-coordinate joints included."""
-    rng = np.random.default_rng(35)
-    joints, rows = 7, 512
-    ancestor = np.array([-1, 0, 1, 1, 3, 0, 5], dtype=np.int32)
-    qd_start = np.array([0, 6, 7, 8, 11, 12, 13, 14], dtype=np.int32)  # a free root, then 1- and 3-coordinate joints
-    dofs = int(qd_start[-1])
-    values = {
-        "body": rng.integers(-1, joints, rows).astype(np.int32),
-        "sign": rng.choice(np.array([1.0, -1.0], dtype=np.float32), rows),
-        "point": rng.normal(size=(rows, 3)).astype(np.float32),
-        "origin": rng.normal(size=(rows, 3)).astype(np.float32),
-        "direction": unit_vectors(rng, rows),
-        "body_to_joint": np.arange(joints, dtype=np.int32),
-        "joint_ancestor": ancestor,
-        "joint_qd_start": qd_start,
-        "joint_S_s": rng.normal(size=(dofs, 6)).astype(np.float32),
-        "n_dofs": dofs,
-    }
-    out = call(_kernel_ancestor_rows, rows, device, J_group=np.zeros((1, rows, dofs), dtype=np.float32), **values)
-    law = call(_law_ancestor_rows, rows, device, J_group=np.zeros((1, rows, dofs), dtype=np.float32), **values)
-    arm = np.abs(values["point"] - values["origin"]).sum(axis=1)
-    entry = np.abs(values["joint_S_s"]).sum(axis=1).max() * (1.0 + arm)
-    assert_reproduces(test, device, out["J_group"].numpy()[0], law["J_group"].numpy()[0], entry, "ancestor walk J")
-
-
 class TestFeatherPGSContactLaws(unittest.TestCase):
-    """The contact row allocation and the ancestor walk against the laws."""
+    """The contact row allocation against the laws."""
 
 
 register_device_tests(TestFeatherPGSContactLaws, globals())

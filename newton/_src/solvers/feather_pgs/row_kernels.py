@@ -13,12 +13,11 @@ import warp as wp
 
 from ...sim import BodyFlags
 from . import field_group
-from .contact_laws import jacobian_entry, spin_entry
 from .device_preludes import reserve
 from .field_group import Field, FieldGroup
 from .joint_table import FreeBodies, JointTable
 from .row_laws import LINK_ROWS, contact_restitution_rhs, joint_limit_side, limit_rhs, row_rhs, velocity_limit_active
-from .row_records import UNIT_LINK, DenseRows, RowSupport, clear_side, jacobian_row, row_sides, unit_source
+from .row_records import UNIT_LINK, DenseRows, RowSupport, row_sides, unit_source
 
 LINK_PLAN = FieldGroup(
     Field("_link_primary", wp.int32, ("link",), owner="laws"),
@@ -135,45 +134,6 @@ def rotation_log(primary: wp.quat, shadow: wp.quat) -> wp.vec3:
     return 2.0 * wp.atan2(wp.length(v), error[3]) * wp.normalize(v)
 
 
-@wp.func
-def link_side(
-    joints: JointTable,
-    support: RowSupport,
-    body: int,
-    art: int,
-    sign: float,
-    point: wp.vec3,
-    direction: wp.vec3,
-    angular: bool,
-    sides: wp.vec2i,
-    body_to_joint: wp.array[int],
-    joint_ancestor: wp.array[int],
-    joint_S_s: wp.array[wp.spatial_vector],
-    articulation_origin: wp.array[wp.vec3],
-    row: int,
-    J: wp.array3d[float],
-):
-    """Accumulate one piece's twist into link row ``row``; a piece on no response coordinates adds nothing."""
-    if support.dofs[art] > 0:
-        accumulate_jacobian_row_world(
-            body,
-            sign,
-            point,
-            articulation_origin[art],
-            direction,
-            angular,
-            body_to_joint,
-            joint_ancestor,
-            joints.joint_qd_start,
-            joint_S_s,
-            joints.articulation_dof_start[art],
-            support.dofs[art],
-            jacobian_row(support, 0, art, sides),
-            row,
-            J,
-        )
-
-
 @wp.kernel
 def allocate_link_slots(
     links: Links,
@@ -191,23 +151,18 @@ def allocate_link_slots(
 
 @wp.kernel
 def write_link_rows(
-    joints: JointTable,
     links: Links,
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
-    body_to_joint: wp.array[int],
     body_to_articulation: wp.array[int],
-    joint_ancestor: wp.array[int],
-    joint_S_s: wp.array[wp.spatial_vector],
-    articulation_origin: wp.array[wp.vec3],
     pgs_beta: float,
     support: RowSupport,
     # outputs
-    J: wp.array3d[float],
     rows: DenseRows,
 ):
-    """Write each link's rows, on the sides of its two pieces' trees (:func:`.dense_rows.row_sides`), which may be one
-    tree. The rows cover the sides whole, zeros included: the walks accumulate, so shared ancestors cancel."""
+    """Write each link's rows' records and unit sources (the one writer walks their two pieces' wrenches,
+    :func:`.walk_rows.unit_reader`), on the sides of its two pieces' trees (:func:`.row_records.row_sides`), which may
+    be one tree."""
     k = wp.tid()
     base = links.slot[k]
     if base < 0:
@@ -225,48 +180,7 @@ def write_link_rows(
         slot = base + row
         axis = row % 3
         angular = row >= 3
-        if support.walks != 0:
-            support.units[line, slot] = unit_source(UNIT_LINK, LINK_ROWS * k + row)
-        else:
-            for side in range(2):
-                if sides[side] >= 0:
-                    clear_side(support, J, jacobian_row(support, 0, sides[side], sides), slot, sides[side])
-            direction = wp.vec3(0.0, 0.0, 0.0)
-            direction[axis] = 1.0
-            link_side(
-                joints,
-                support,
-                primary,
-                art_p,
-                1.0,
-                point_p,
-                direction,
-                angular,
-                sides,
-                body_to_joint,
-                joint_ancestor,
-                joint_S_s,
-                articulation_origin,
-                slot,
-                J,
-            )
-            link_side(
-                joints,
-                support,
-                shadow,
-                art_s,
-                -1.0,
-                point_s,
-                direction,
-                angular,
-                sides,
-                body_to_joint,
-                joint_ancestor,
-                joint_S_s,
-                articulation_origin,
-                slot,
-                J,
-            )
+        support.units[line, slot] = unit_source(UNIT_LINK, LINK_ROWS * k + row)
         rows.row_type[line, slot] = PGS_CONSTRAINT_TYPE_LINK
         rows.sides[line, slot] = sides
         rows.row_parent[line, slot] = -1
@@ -274,44 +188,6 @@ def write_link_rows(
         rows.row_beta[line, slot] = pgs_beta
         rows.phi[line, slot] = turn[axis] if angular else gap[axis]
         rows.target[line, slot] = 0.0
-
-
-@wp.func
-def accumulate_jacobian_row_world(
-    body_index: int,
-    sign: float,
-    point_world: wp.vec3,
-    origin: wp.vec3,
-    direction: wp.vec3,
-    spin: bool,
-    body_to_joint: wp.array[int],
-    joint_ancestor: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_S_s: wp.array[wp.spatial_vector],
-    art_dof_start: int,
-    n_dofs: int,
-    at: wp.vec2i,
-    row: int,
-    J_group: wp.array3d[float],
-):
-    """Accumulate Jacobian contributions by walking up the kinematic tree, into the side at ``at``
-    (:func:`.dense_rows.jacobian_row`) of row ``row``: :func:`.contact_laws.jacobian_entry` along ``direction`` at
-    ``point_world``, or a contact's spin row (``spin``) about ``direction`` (:func:`.contact_laws.spin_entry`)."""
-    if body_index < 0:
-        return
-
-    curr_joint = body_to_joint[body_index]
-    while curr_joint >= 0:
-        for global_dof in range(joint_qd_start[curr_joint], joint_qd_start[curr_joint + 1]):
-            local_dof = global_dof - art_dof_start
-            if local_dof >= 0 and local_dof < n_dofs:
-                entry = float(0.0)
-                if spin:
-                    entry = spin_entry(joint_S_s[global_dof], direction)
-                else:
-                    entry = jacobian_entry(joint_S_s[global_dof], direction, point_world, origin)
-                J_group[at[0], row, at[1] + local_dof] += sign * entry
-        curr_joint = joint_ancestor[curr_joint]
 
 
 # =============================================================================
@@ -362,38 +238,6 @@ def row_bias(rows: DenseRows, bias: RowBias, line: int, i: int, incident: float)
     rows.rhs[line, i] = rhs
     if bias.weighted != 0:
         rows.row_w[line, i] = row_w
-
-
-@wp.kernel
-def compute_world_contact_bias(
-    rows: DenseRows,
-    row_incident: wp.array2d[float],
-    world_constraint_count: wp.array[int],
-    max_constraints: int,
-    lanes: int,
-    bias: RowBias,
-):
-    """Compute each world row's RHS bias by its row law (:func:`.row_laws.row_rhs`); ``J*v`` is added later.
-
-    The RHS follows the convention: rhs = J*v + stabilization; a penetrating contact's Baumgarte term
-    ``beta * phi / dt`` is negative and leads to positive impulses when resolved by PGS. A restitutive contact that
-    fires takes the rebound of :func:`.row_laws.contact_restitution_rhs` from its incident velocity instead (weight 1).
-
-    ``weighted`` rows store their relative regularization weight. A material contact (``material``: its writer stored
-    its rhs and compliance ``eps``, from which the sweeps form its weight, :func:`.sweep.row_weight`) keeps
-    its rhs.
-
-    A world's ``lanes`` threads stride over its live rows (``dim = (world_count, lanes)``): the grid follows the
-    worlds, and a world's slots past its rows cost no thread beyond its lanes. The previous one-thread-per-world loop
-    left the GPU idle (64-128 blocks) for 30-60 us per launch.
-    """
-    world, lane = wp.tid()
-    count = wp.min(world_constraint_count[world], max_constraints)
-    if lane >= count:
-        return
-    line = rows.first[world]
-    for i in range(lane, count, lanes):
-        row_bias(rows, bias, line, i, row_incident[line, i])
 
 
 RIGID_SPEED_ROWS = wp.constant(2)

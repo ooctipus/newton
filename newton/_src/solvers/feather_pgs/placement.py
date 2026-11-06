@@ -500,7 +500,7 @@ class Placement:
             sparse_response = self.sparse_mass_matrix_size is not None or (
                 self.sparse_diagonal_contact_solve and size == self.sparse_diagonal_response_size
             )
-            # The matrix-free sweeps' producers write the packed rows (jacobian_rows): no size group's Jacobian.
+            # The one writer walks the matrix-free sweeps' rows into the packed rows: no size group's rows.
             response = 1 if sparse_response or self.mf_sweeps else 0
             sizes = {
                 "art": n_arts,
@@ -1028,26 +1028,19 @@ class Placement:
     # ---------------------------------------------------------------------------------------------------------------
 
     def row_support(self) -> RowSupport:
-        """Where the dense rows' Jacobian entries sit (:class:`.row_records.RowSupport`): the matrix-free sweeps' packed
-        rows (their sides, the articulations' coordinates, first world coordinates and worlds, and the layout), or
-        each size group's rows. Without the matrix-free sweeps there are no packed rows: the articulations' offsets and
-        worlds are one-entry placeholders."""
+        """Where the dense rows' entries sit and the seeds the one writer walks (:class:`.row_records.RowSupport`): the
+        rows' sides, the articulations' coordinates and first world coordinates, the layout, and the unit sources.
+        Without the matrix-free sweeps there are no packed rows: the articulations' offsets are a one-entry
+        placeholder. A class that walks no rows holds none (:func:`.step_plan._stages`): its unit sources are a
+        placeholder."""
         support = RowSupport()
         support.sides = self.row_sides
         support.dofs = self.forest.articulation_response_dof_count
         support.offset = self.forest.articulation_world_dof_offset if self.mf_sweeps else self.dummy_is_free_rigid
-        support.world = self.forest.art_to_world if self.mf_sweeps else self.dummy_is_free_rigid
         support.dense = int(self.packed_dense)
-        support.packed = int(self.mf_sweeps)
         support.first = self.dense_first
-        support.walks = int(self.walks)
         support.units = self.unit_source if self.walks else self.dummy_units
         return support
-
-    def jacobian_rows(self, size: int) -> wp.array:
-        """The Jacobian rows the producers of a size's rows write (:func:`.row_records.jacobian_row`): the packed rows
-        (:mod:`.packed_rows`) under the matrix-free sweeps, else the size group's rows."""
-        return self.packed_Z if self.mf_sweeps else self.J_by_size[size]
 
     def ink_skip_rows(self) -> int:
         """The dense rows of the worlds the tiers own, whose response they form in-kernel (0 without tiers)."""

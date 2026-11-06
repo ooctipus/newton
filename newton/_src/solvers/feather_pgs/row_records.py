@@ -130,50 +130,19 @@ def unit_source(kind: int, index: int) -> int:
 
 @wp.struct
 class RowSupport:
-    """Where a dense row's Jacobian entries sit. In the matrix-free sweeps' packed rows (``packed``,
-    :mod:`.packed_rows`) a row of world ``w`` is ``J[w, row, :]``: its sides (``sides``: :func:`row_sides`), each
-    articulation's coordinates (``dofs``), first world coordinate (``offset``) and world (``world``), and the layout
-    (``dense``: entry ``e`` is world coordinate ``e``; else the first side's entries, then the second's). Otherwise a
-    size group's rows hold each articulation's side from entry 0, row ``J[group, row, :]``.
-
-    Where the one writer walks the rows (``walks``, :mod:`.walk_rows`), a producer writes no ``J``: it records each
-    row's unit source (``units``, :func:`unit_source`), by world line and row, from which the writer takes its seed."""
+    """Where a dense row's entries sit in the packed rows (:mod:`.packed_rows`), and the seed the one writer walks into
+    them (:mod:`.walk_rows`). A row of world ``w`` is ``Z[first[w], row, :]``: its sides (``sides``: :func:`row_sides`),
+    each articulation's coordinates (``dofs``) and first world coordinate (``offset``), and the layout (``dense``: entry
+    ``e`` is world coordinate ``e``; else the first side's entries, then the second's). A producer writes no entry: it
+    records each row's unit source (``units``, :func:`unit_source`), by world line and row, from which the writer
+    takes its seed."""
 
     sides: wp.array2d[wp.vec2i]
     dofs: wp.array[int]
     offset: wp.array[int]
-    world: wp.array[int]
     dense: int
-    packed: int
     first: wp.array[int]
     units: wp.array2d[int]
-    walks: int
-
-
-@wp.func
-def jacobian_row(support: RowSupport, group: int, art: int, sides: wp.vec2i) -> wp.vec2i:
-    """Where articulation ``art``'s side of a row with ``sides`` starts in the Jacobian rows a producer writes: the
-    rows' first index and the side's first entry (``J[at[0], row, at[1] + e]`` is the side's coordinate ``e``). The
-    packed rows (:class:`RowSupport`) hold it at its world coordinates (dense) or after the row's first side; a size
-    group's rows at its group, from entry 0."""
-    if support.packed == 0:
-        return wp.vec2i(group, 0)
-    line = support.first[support.world[art]]
-    if support.dense != 0:
-        return wp.vec2i(line, support.offset[art])
-    if art == sides[0]:
-        return wp.vec2i(line, 0)
-    return wp.vec2i(line, support.dofs[sides[0]])
-
-
-@wp.func
-def clear_side(support: RowSupport, J: wp.array3d[float], at: wp.vec2i, row: int, art: int):
-    """Zero articulation ``art``'s side of a packed row (at ``at``: :func:`jacobian_row`) before a producer writes
-    only its nonzero entries: the packed rows are never cleared, every producer writes its rows' sides whole. A size
-    group's rows are cleared each step: nothing to do."""
-    if support.packed != 0:
-        for e in range(support.dofs[art]):
-            J[at[0], row, at[1] + e] = 0.0
 
 
 MF_RECORDS = (
