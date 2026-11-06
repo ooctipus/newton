@@ -39,7 +39,7 @@ from typing import NamedTuple
 
 import warp as wp
 
-from ...core.execution import Buckets, Work, bucket_item, shape
+from ...core.execution import Buckets, Queue, Work, append, bucket_item, shape
 from ...core.memory import built_for
 from . import field_group
 from .contact_input import ContactFrame, ContactInput, contact_frame
@@ -91,6 +91,7 @@ __all__ = [
     "RowUnit",
     "SlotRows",
     "UnitList",
+    "UnitQueues",
     "bind_slot_rows",
     "free_body_sink",
     "packed_sink",
@@ -1148,100 +1149,80 @@ SUPPORT_UNIT_LANES = 16
 units, a lane a row; the walkers' lanes (:func:`support_threads`) do not depend on it."""
 
 UNIT_BUCKETS = 16
-"""The unit list's buckets (:class:`UnitList`): a world's units go to bucket ``world % UNIT_BUCKETS``, so the lane
-groups' reservations spread over that many counters of each kind."""
+"""The unit list's buckets (:class:`UnitList`): a world's units go to bucket ``world % UNIT_BUCKETS`` of their kind's
+queue, so the lane groups' appends spread over that many counters of each kind."""
 
 
 @wp.struct
 class UnitList:
     """The step's units, one fixed slot each (:func:`support_units_kernel` appends, :func:`support_rows_kernel`
     walks), listed by kind so a warp of walkers runs one walker: units of four rows (a contact with its spin row),
-    units of three (a contact's normal and pair) and units of one row. A unit is a row's seed and the rows it walks
-    together, at least one row, so a world's units fit its rows' ``capacity`` and its units of four a quarter of it:
-    the list holds every world's at those bounds and cannot overflow. Bucket ``b`` holds its worlds' units in
-    ``span`` slots, the units of three from the front and the one-row units from the back, then ``quad`` slots of
-    units of four (none where no spin rows appear), each as ``line * capacity + slot`` of its first row;
-    ``count[3 b]``, ``count[3 b + 1]`` and ``count[3 b + 2]`` are its counts of three, one and four rows, zeroed
-    before the step's append. The order within a kind is the lane groups' arrival, on which no unit's rows depend."""
+    units of two or three (a contact's normal and pair) and units of one row, each kind a
+    :class:`~newton._src.core.execution.Queue` of :data:`UNIT_BUCKETS` buckets (:class:`UnitQueues`, read here as
+    :class:`~newton._src.core.execution.Buckets`). A unit is a row's seed and the rows it walks together, at least
+    one row, so a world's units of one row fit its rows' ``capacity``, its wider units half of it and its units of four
+    a quarter: each kind's region holds its bucket's worlds at that bound, and the list cannot overflow. An item is
+    ``line * capacity + slot`` of the unit's first row. The order within a kind is the appends' arrival, on which no
+    unit's rows depend."""
 
-    entry: wp.array[int]
-    count: wp.array[int]
-    span: int
-    quad: int
+    quad: Buckets
+    wide: Buckets
+    one: Buckets
     capacity: int
 
 
-def unit_list(worlds: int, capacity: int, device, *, spin_rows: bool) -> UnitList:
-    """An empty :class:`UnitList` for ``worlds`` worlds of ``capacity`` rows each; with ``spin_rows`` (the laws let
-    contacts carry spin rows) its region of units of four."""
-    units = UnitList()
-    units.capacity = int(capacity)
-    per_bucket = -(-int(worlds) // UNIT_BUCKETS)
-    units.span = per_bucket * int(capacity)
-    units.quad = per_bucket * (int(capacity) // 4) if spin_rows else 0
-    units.entry = wp.empty(max(UNIT_BUCKETS * (units.span + units.quad), 1), dtype=int, device=device)
-    units.count = wp.zeros(3 * UNIT_BUCKETS, dtype=int, device=device)
-    return units
+class UnitQueues:
+    """The unit list's queues, a kind each (units of four, of two or three, of one row), and their view
+    (:attr:`list`)."""
+
+    def __init__(self, worlds: int, capacity: int, device, *, spin_rows: bool):
+        per_bucket = -(-int(worlds) // UNIT_BUCKETS)
+        rows = (int(capacity) // 4 if spin_rows else 0, int(capacity) // 2, int(capacity))
+        self.queues = tuple(Queue(UNIT_BUCKETS * per_bucket * n, device, buckets=UNIT_BUCKETS) for n in rows)
+        self.list = UnitList()
+        self.list.quad, self.list.wide, self.list.one = (queue.span(0, UNIT_BUCKETS) for queue in self.queues)
+        self.list.capacity = int(capacity)
+
+    def start(self) -> None:
+        """Empty the list before the step's appends."""
+        for queue in self.queues:
+            queue.count.zero_()
 
 
-_UNIT_APPEND = """    // This round's units of the world's lane group into its bucket: one reservation a kind for the group.
-    const bool wide = rows > 1 && rows < 4;
-    const unsigned wide_votes = BALLOT(wide), one_votes = BALLOT(rows == 1), quad_votes = BALLOT(rows == 4);
-    const int wide_first = RESERVE(units.count.data + 3 * bucket, COUNT(wide_votes));
-    const int one_first = RESERVE(units.count.data + 3 * bucket + 1, COUNT(one_votes));
-    int* const region = units.entry.data + (size_t)bucket * (units.span + units.quad);
-    if (wide) region[wide_first + BELOW(wide_votes)] = entry;
-    if (rows == 1) region[units.span - 1 - (one_first + BELOW(one_votes))] = entry;
-    if (quad_votes != 0) {
-        const int quad_first = RESERVE(units.count.data + 3 * bucket + 2, COUNT(quad_votes));
-        if (rows == 4) region[units.span + quad_first + BELOW(quad_votes)] = entry;
-    }"""
-
-
-@wp.func_native(dual_native(_UNIT_APPEND, preludes=(lane_group("lanes"),)))
-def unit_append(lanes: int, units: UnitList, bucket: int, rows: int, entry: int):
-    """Append this lane's unit of ``rows`` rows (0 for none) to bucket ``bucket`` of ``units``
-    (:class:`UnitList`); every lane of the world's group of ``lanes`` calls it together."""
+def unit_list(worlds: int, capacity: int, device, *, spin_rows: bool) -> UnitQueues:
+    """An empty unit list for ``worlds`` worlds of ``capacity`` rows each; with ``spin_rows`` (the laws let contacts
+    carry spin rows) its queue of units of four holds them."""
+    return UnitQueues(worlds, capacity, device, spin_rows=spin_rows)
 
 
 @wp.func
-def unit_total(units: UnitList) -> int:
-    """The list's units over its buckets."""
+def kind_total(units: Buckets) -> int:
+    """A kind's units over its buckets."""
     total = int(0)
-    for k in range(3 * UNIT_BUCKETS):
-        total += units.count[k]
+    for b in range(units.first, units.last):
+        total += units.count[b]
     return total
 
 
 @wp.func
+def unit_total(units: UnitList) -> int:
+    """The list's units over its kinds."""
+    return kind_total(units.quad) + kind_total(units.wide) + kind_total(units.one)
+
+
+@wp.func
 def unit_entry(units: UnitList, item: int) -> int:
-    """The list's ``item``-th unit: its units of four first, then of three, bucket by bucket, then its one-row
-    units."""
-    quads = int(0)
-    wide = int(0)
-    for b in range(UNIT_BUCKETS):
-        quads += units.count[3 * b + 2]
-        wide += units.count[3 * b]
-    kind = int(2)
+    """The list's ``item``-th unit: its units of four first, then of two or three, then of one row, each kind bucket
+    by bucket (:func:`~newton._src.core.execution.bucket_item`)."""
     rank = item
-    if item >= quads:
-        kind = 0
-        rank = item - quads
-        if rank >= wide:
-            kind = 1
-            rank -= wide
-    b = int(0)
-    n = units.count[kind]
-    while rank >= n:
-        rank -= n
-        b += 1
-        n = units.count[3 * b + kind]
-    at = rank
-    if kind == 1:
-        at = units.span - 1 - rank
-    elif kind == 2:
-        at = units.span + rank
-    return units.entry[b * (units.span + units.quad) + at]
+    quads = kind_total(units.quad)
+    if rank < quads:
+        return bucket_item(units.quad, rank)
+    rank -= quads
+    wide = kind_total(units.wide)
+    if rank < wide:
+        return bucket_item(units.wide, rank)
+    return bucket_item(units.one, rank - wide)
 
 
 @cache
@@ -1280,7 +1261,14 @@ def support_units_kernel(max_rows: int, lanes: int) -> wp.Kernel:
                         unit_rows = wp.min(data.slots_needed[c], wp.static(max_rows))
                 elif kind == UNIT_LIMIT or kind == UNIT_VELOCITY or kind == UNIT_MIMIC:
                     unit_rows = 1
-            unit_append(wp.static(lanes), units, bucket, unit_rows, line * units.capacity + slot)
+            # Each unit into its kind's queue, one atomic a warp a bucket (execution.append).
+            entry = line * units.capacity + slot
+            if unit_rows == 1:
+                append(units.one.items, units.one.count, bucket, units.one.region, entry)
+            elif unit_rows == 4:
+                append(units.quad.items, units.quad.count, bucket, units.quad.region, entry)
+            elif unit_rows > 1:
+                append(units.wide.items, units.wide.count, bucket, units.wide.region, entry)
 
     return python_kernel(kernel, f"support_units_{max_rows}_{lanes}", launch_bounds=WRITERS["support_units"].bounds)
 

@@ -1075,11 +1075,11 @@ class RowLaws:
         dense_rows, law = bind_dense_rows(placement), patch_row_law(solver)
         sink = sweep.support_sink(solver.v_hat)
         units = sweep.support_units
-        units.count.zero_()
+        units.start()
         wp.launch(
             sweep.support_units_kernel,
             dim=(solver.forest.world_count, sweep.support_lanes),
-            inputs=[dense_rows, placement.unit_source, placement.constraint_count, contact_input, law, units],
+            inputs=[dense_rows, placement.unit_source, placement.constraint_count, contact_input, law, units.list],
             device=model.device,
         )
         wp.launch(
@@ -1089,7 +1089,7 @@ class RowLaws:
             inputs=[
                 dense_rows,
                 placement.unit_source,
-                units,
+                units.list,
                 sweep.support_threads,
                 contact_input,
                 law,
