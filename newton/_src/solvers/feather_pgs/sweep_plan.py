@@ -24,7 +24,7 @@ import functools
 import numpy as np
 import warp as wp
 
-from ...core.execution import Queue, shape
+from ...core.execution import Queue, Work, shape
 from ...core.memory import Place, arch_budget, device
 from . import (
     packed_rows,
@@ -573,6 +573,10 @@ class Sweep:
             # Each tier and the general sweep walk their bucket of the claims' worlds, which hold every world.
             worlds = self.forest.world_count
             self.claims = Queue((len(self.tiers) + 1) * worlds, model.device, buckets=len(self.tiers) + 1)
+            # The general sweep walks its bucket on a persistent grid, a warp a world (the queue's launch): a block a
+            # world of the bucket's capacity dispatched its exiting blocks behind the bucket's, which held the
+            # multiprocessors, and the claims beside it started late (franka's widest tier 14 us later, PRO).
+            self.general_grid = shape(Work(worlds, lanes=32, block=32, persistent=True), device(model.device)).grid
         if self.classes.mf_sweeps:
             # No matrix-free sweep enters a world without rows; the readout counts those solves as skipped.
             self.readout.register_skipped(world_count=int(self.forest.world_count), device=model.device)
@@ -847,9 +851,9 @@ class Sweep:
                 launch_tier(tier)
         colored_kernel = self.mf_colored_kernel
         colored = {} if colored_kernel is None else self.colored_units.operands()
-        # The general sweep's bucket, a block a world of its capacity (every world).
-        worlds = self.forest.world_count
-        self._launch(mf_gs_kernel, operands, worlds, 32, **walk, **colored, **queued(general, worlds))
+        # The general sweep's bucket, on its persistent grid.
+        grid = self.general_grid
+        self._launch(mf_gs_kernel, operands, grid, 32, **walk, **colored, **queued(general, grid))
         if colored_kernel is not None:
             # The worlds the unit builder's rule picked: a block each, a color's units at once.
             self._launch(
