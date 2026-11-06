@@ -172,7 +172,7 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
                 self.assertFalse(solver.sweep.sparse_active_rows)
                 self.assertIn("bitsets exceed shared memory", solver.sweep.sparse_active_rows_reason)
                 self.assertNotIn("_active", solver.sweep.sparse_kernel.key)
-                self.assertIn(f"{full.bytes}/{budget}", solver.spec.route.reasons["K1"])
+                self.assertIn(f"{full.bytes}/{budget}", solver._plan.route.reasons["K1"])
 
     def test_small_worlds_keep_their_packed_patch_sweep(self):
         """Keep the packed 16-lane full sweep of a 9-DOF, 32-row patch world, bitwise, with active rows pinned off."""

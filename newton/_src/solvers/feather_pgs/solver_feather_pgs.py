@@ -487,12 +487,16 @@ class SolverFeatherPGS(SolverBase):
         # The row laws' tables: the contact law, speed limits, the joint-limit tables, the mimic and link plans,
         # contact torsion and the materials.
         self.laws = RowLaws.build(model, self.forest, options)
-        # The placement: where the rows live, their capacities and status.
-        self.placement = Placement(model, options, self.forest, self.laws, self.factor)
+        # The closure's bilateral blocks, which decide the pre-elimination.
         self.factor.plan_blocks(self.forest, self.laws)
         # Axis 2 of the route table, the row laws (route_table.Laws).
         self.laws.decide(preelimination=self.factor.eliminates)
         laws = self.laws.set
+        # The step's spec: every unknown that decides its path, gathered before any owner of the step, which each
+        # owner below reads.
+        self.spec = StepSpec.build(model, options, self.cut, self.forest, laws, self.laws.link_rows_per_world)
+        # The placement: where the rows live, their capacities and status.
+        self.placement = Placement(self.spec, model, options, self.laws, self.factor)
         # The passive joint forces and the per-coordinate drive rows the held tree's admission reads.
         self.factor.plan(self.forest, self.laws)
         from . import held_tree  # noqa: PLC0415
@@ -630,25 +634,9 @@ class SolverFeatherPGS(SolverBase):
                 "dense": self.placement.sparse_diagonal_dense_size if diagonal else None,
             },
         )
-        # The step's spec: every unknown that decides its path, gathered once; the plan and the route record read it.
-        self.spec = StepSpec.build(
-            self,
-            route,
-            diagnostics=tuple(
-                name
-                for name, on in (
-                    ("nvtx", self.options.diagnostics.nvtx),
-                    ("snapshots", self.options.diagnostics.snapshots),
-                    ("audit", self._audit is not None),
-                    ("row_watermark", self.options.diagnostics.row_watermark),
-                    ("readout", bool(self.sweep.readout.kernels)),
-                    ("sync_timings", self.options.diagnostics.sync_timings is not None),
-                )
-                if on
-            ),
-        )
-        # The step: its stages bound to the owners above and its per-stage dispatch tables, which the route record reads.
-        self._plan = StepPlan.build(self.spec, self)
+        # The step: its stages bound to the owners above from the spec and the route, the sweep's kernels and streams,
+        # and its per-stage dispatch tables, which the route record reads.
+        self._plan = StepPlan.build(self.spec, route, self)
         # Record the applied options once; get_path_selection() returns detached copies.
         self._applied_options = applied_options(self, SolverFeatherPGS.__init__, requested_options)
 
@@ -707,12 +695,12 @@ class SolverFeatherPGS(SolverBase):
         floats are strings).
         """
         selection = {
-            "sparse_mass_matrix": "on" if self.spec.case == "K1" else "off",
+            "sparse_mass_matrix": "on" if self._plan.route.case == "K1" else "off",
             "cached_dynamics": "on",
             "publication": "cached",
             "cached_prediction": "tree",
             "reasons": {
-                "sparse_mass_matrix": self.spec.route.reasons["K1"],
+                "sparse_mass_matrix": self._plan.route.reasons["K1"],
                 "publication": "Paired cache owns next-state publication.",
             },
         }

@@ -306,17 +306,17 @@ class Placement:
     allocates its rows on :attr:`arrays` as it admits them.
 
     Args:
+        spec: The step's spec: the forest and the row capacities.
         model: The solver's model.
         options: The solver's physics options (:class:`.configuration.Options`).
-        forest: The forest plan.
         laws: The row laws.
         factor: The tree factor.
     """
 
-    def __init__(self, model, options, forest, laws, factor):
+    def __init__(self, spec, model, options, laws, factor):
         self.model = model
         self.options = options
-        self.forest = forest
+        self.forest = forest = spec.forest
         self.laws = laws
         self.factor = factor
         self.arrays = SolverArrays(self, model.device)
@@ -327,14 +327,15 @@ class Placement:
         # Launches over the contact capacity (the force export, the warm start's carry and gathers, the keyed-row key
         # scatters) grid-stride over about one wave of blocks.
         self.contact_capacity_blocks = contact_capacity_blocks(model.device)
-        # A link's rows are the closure's: they come on top of the rows the option gives the world's contacts.
-        self.dense_max_constraints = options.dense_max_constraints + laws.link_rows_per_world
-        self.mf_max_constraints = options.mf_max_constraints
+        # The spec's capacities (step_plan.Capacities): a link's rows come on top of the rows the option gives the
+        # world's contacts.
+        self.dense_max_constraints = spec.capacities.dense_rows
+        self.mf_max_constraints = spec.capacities.free_body_rows
         _validate_mf_metadata_encoding(self.mf_max_constraints)
         # The row store's line: the dense class's rows, then (with free rigid bodies) the free bodies' from
         # ``body_base``.
         self.body_base = self.dense_max_constraints
-        self.row_pitch = self.dense_max_constraints + (self.mf_max_constraints if forest.has_free_rigid_bodies else 0)
+        self.row_pitch = spec.capacities.row_pitch
         # All inactive weight arguments alias this one element. Their producer kernels skip stores and their consumer
         # kernels skip reads when regularization is disabled.
         self.contact_row_w_dummy = self.arrays.placeholder(wp.float32, (1, 1), 1.0)

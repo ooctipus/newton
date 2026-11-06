@@ -1123,7 +1123,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
                     par_sweeps_reason="auto: ...",
                 ),
                 placement=SimpleNamespace(ink_rows=64, ink_sizes=(_DOFS, 0, 0, 0)),
-                spec=SimpleNamespace(
+                _plan=SimpleNamespace(
                     route=SimpleNamespace(
                         producer="walk",
                         reasons={"K4": "The parallel tiers form the response of sizes [12] in-kernel."},

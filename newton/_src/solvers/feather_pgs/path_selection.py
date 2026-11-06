@@ -132,22 +132,23 @@ def route_selection(solver) -> dict:
     """Describe every construction-time owner and variant that decides which kernels run.
 
     The owners' records take whether they hold the class, their sizes and their reasons from the solver's route
-    (``routes.row``, :class:`.route_table.RouteRow`, held by the step's spec); the rest of each record is the owner's
-    own structure. ``routes.spec`` is the spec's own fields (:meth:`.step_plan.StepSpec.record`).
+    (``routes.row``, :class:`.route_table.RouteRow`, held by the step's plan); the rest of each record is the owner's
+    own structure. ``routes.spec`` is the spec's own fields (:meth:`.step_plan.StepSpec.record`) and ``routes.stages``
+    the plan's (:meth:`.step_plan.StepPlan.record`).
     """
-    row = solver.spec.route
+    row = solver._plan.route
 
     return {
         "articulations_by_dof": {str(int(size)): int(count) for size, count in solver.forest.n_arts_by_size.items()},
         # The test-only axis pins in force (SolverFeatherPGS._route_pins); empty in production.
         "pins": json_value(dict(solver._route_pins)),
-        # The step's spec: the device, capacities, cadence, sweep kernels, streams and diagnostics (step_plan.StepSpec).
+        # The step's spec: the device, capacities, cadence and diagnostics (step_plan.StepSpec).
         "spec": json_value(solver.spec.record()),
         # The route: the row of the route table the class takes, its axes and each placement case's reason.
         "row": json_value(row.record()),
-        # The row laws every owner's admission reads (route_table.Laws).
-        "laws": row.laws.record(),
-        # The per-stage dispatch tables step() launches through (step_plan.StepPlan).
+        # The row laws every owner's admission reads (route_table.Laws, the spec's).
+        "laws": solver.spec.laws.record(),
+        # The per-stage dispatch tables step() launches through, the sweep's kernels and streams (step_plan.StepPlan).
         "stages": solver._plan.record(),
         "held_tree": _held_tree(solver),
         "contact_rows": _contact_rows(solver),
@@ -185,7 +186,7 @@ def _held_tree_groups(solver) -> tuple:
     # Scalar branch groups hold no tree layout.
     if any(getattr(getattr(group, "layout", None), "forest", False) for group in groups):
         return "forest", groups
-    return ("tree" if solver.spec.route.case == "K1" else "mixed"), groups
+    return ("tree" if solver._plan.route.case == "K1" else "mixed"), groups
 
 
 def _held_tree(solver) -> dict:
@@ -296,7 +297,7 @@ def _row_builder(solver, method, size) -> dict:
     (routes.free_rigid_bodies).
     """
     marker = ()
-    if solver.spec.case == "K2" and size == solver.placement.sparse_diagonal_response_size:
+    if solver._plan.route.case == "K2" and size == solver.placement.sparse_diagonal_response_size:
         # The sparse diagonal's marker encodes schedule links into the slots its writer just wrote.
         marker = () if solver.sweep.sparse_contact_marker is None else (solver.sweep.sparse_contact_marker,)
     if method == "walk":
@@ -305,9 +306,9 @@ def _row_builder(solver, method, size) -> dict:
         # The allocator writes the contact rows' unit sources; the one writer writes every contact row's records and
         # walks every row (walk_rows): the general placement's into its packed rows, the support placement's (K1)
         # into its support sink, the sparse diagonal's (K2) into its slots sink.
-        if solver.spec.case == "K1":
+        if solver._plan.route.case == "K1":
             writers = (solver.sweep.support_units_kernel, solver.sweep.support_rows)
-        elif solver.spec.case == "K2":
+        elif solver._plan.route.case == "K2":
             writers = (walk_rows.slot_writer(solver),)
         else:
             # The general placement's rows in two parts: the topology's, walked in blocks, and the rest.
@@ -328,7 +329,7 @@ def _row_builder(solver, method, size) -> dict:
 
 
 def _contact_rows(solver) -> dict:
-    row = solver.spec.route
+    row = solver._plan.route
     # The route's producer writes every contact row (the row pass, RowLaws.write_contacts, takes it from the plan).
     sizes = solver.forest.size_groups if row.producer != "none" else ()
     return {
@@ -354,7 +355,7 @@ def _contact_consumers(solver) -> dict:
 
 
 def _paired_response(solver) -> dict:
-    row = solver.spec.route
+    row = solver._plan.route
     primary = solver.sweep.paired_response_primary_size
     if primary is None:
         return {"enabled": False, "reason": solver.sweep.paired_response_reason}
@@ -380,7 +381,7 @@ def _paired_response(solver) -> dict:
 
 
 def _sparse_diagonal(solver) -> dict:
-    row = solver.spec.route
+    row = solver._plan.route
     return {
         "enabled": row.case == "K2",
         "response_dofs": json_value(row.sizes["diagonal"]),
@@ -393,7 +394,7 @@ def _sparse_diagonal(solver) -> dict:
 
 
 def _sparse_mass_matrix(solver) -> dict:
-    row = solver.spec.route
+    row = solver._plan.route
     size = row.sizes["packed"]
     record = {
         "size": json_value(size),
@@ -434,7 +435,7 @@ def _sweep(solver) -> dict:
         if packed
         else "Skipped: without free rigid bodies no matrix-free row exists.",
     }
-    kernels = solver.spec.kernels
+    kernels = solver._plan.kernels
     record = {
         "route": route,
         "reason": solve.route.reason,
@@ -461,7 +462,7 @@ def _mf_colored(solver) -> dict | None:
     units = solver.sweep.colored_units
     rule = units.rule
     return {
-        "kernel": solver.spec.kernels["mf_colored"],
+        "kernel": solver._plan.kernels["mf_colored"],
         "min_units": int(rule.min_units),
         "parallelism": json_value(rule.parallelism),
         # The waves the capable worlds take on the device's SMs, which multiply the units per color a world needs.
@@ -531,7 +532,7 @@ def _mf_gs_storage(solver) -> dict | None:
 
 
 def _tiers(solver) -> dict | None:
-    row = solver.spec.route
+    row = solver._plan.route
     tiers = list(solver.sweep.tiers)
     if not tiers:
         return None
@@ -608,7 +609,7 @@ def _velocity_limits(solver) -> dict:
 
 
 def _free_rigid_bodies(solver) -> dict:
-    row = solver.spec.route
+    row = solver._plan.route
     count = int(solver.forest.free_rigid_body_count)
     owners = []
     if count:
