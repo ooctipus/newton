@@ -21,15 +21,15 @@ solve failed to account for. It needs no reference, and it cannot catch a wrong 
 solved, not that they are right.
 
 The rows' velocity terms are one kernel over the one ``Z`` operator's ``dot`` (:func:`rows_kernel`), a thread a world,
-each row's entries summed in order (:data:`ONE`): the support class is its data (:class:`RowClass`), the sweep's own
-for each store. Packed rows (:func:`packed_class`) and the sparse diagonal's (:func:`slot_class`) read ``Z_i^T u+`` with
-``u+`` the walk's coordinates of ``v+`` (:func:`.factor.walk.walk_enter_kernel`), so a defect in leaving factor
-coordinates shows too, and corrected rows and targets agree on a closure; native sparse rows (:func:`sparse_class`)
-hold no dense factor and read their own ``J_i v_hat + Z_i^T du``; the free bodies' (:func:`free_class`) are the 6 + 6
-class over the walk's coordinates. One law kernel (:func:`audit_world`) then reads both stores and adds each contact
-normal's ``eps_i lambda_i``. The sparse diagonal's fused limits, which no store holds, read their law in place
-(:func:`fused_limits`). A world whose rows exist only inside its sweep (keyed rows) has none to read: it reports NaN
-and is not summed.
+each row's entries summed in order (:data:`ONE`); a support class is its data (:class:`RowClass`). Packed rows
+(:func:`packed_class`) and the sparse diagonal's (:func:`slot_class`) read ``Z_i^T u+`` with ``u+`` the walk's
+coordinates of ``v+`` (:func:`.factor.walk.walk_enter_kernel`), so a defect in leaving factor coordinates shows too, and
+corrected rows and targets agree on a closure; native sparse rows (:func:`sparse_class`) hold no dense factor and read
+their own ``J_i v_hat + Z_i^T du``; the free bodies' (:func:`free_class`) are the 6 + 6 class over the walk's
+coordinates, its twelve entries one chain as the sweep's one thread sums them. One law kernel (:func:`audit_world`) then
+reads both stores and adds each contact normal's ``eps_i lambda_i``. The sparse diagonal's fused limits, which no store
+holds, read their law in place (:func:`fused_limits`). A world whose rows exist only inside its sweep (keyed rows) has
+none to read: it reports NaN and is not summed.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ from .row_laws import (
 from .row_records import DenseRows
 from .row_records import bind as bind_dense_rows
 from .sparse_mass_matrix import _SparseRowSupport
-from .sweep_routes import packed_operator
+from .sweep_routes import free_body_rows, packed_operator
 from .sweep_routes_diag import slot_rows
 
 __all__ = ["AUDIT_FIELDS", "AUDIT_SLOTS", "Audit"]
@@ -284,14 +284,7 @@ def free_class() -> RowClass:
     coordinates of ``v+`` at the sides' world coordinates. A speed row's term is ``-|v|`` of the coordinates its
     unwhitened axis marks, linear from ``e_0`` or angular from ``e_3``, its bias the limit
     (:func:`.projection_laws.speed_row`): the law's own term, not a ``Z`` row."""
-    # One side's six entries at a time, each side summed from zero, then the two added.
-    half = SparseFactor(
-        6,
-        lambda row, entry: f"(dof < 0 ? -1 : dof + {entry})",
-        lambda row, entry: f"mf_Z.data[mf12_base + i * 12 + side + {entry}]",
-        ONE,
-        velocity=Velocity("u"),
-    )
+    operator = dataclasses.replace(free_body_rows(ONE), velocity=Velocity("u"))
     return RowClass(
         "free",
         (
@@ -315,15 +308,10 @@ def free_class() -> RowClass:
         }} else {{
             const int dof_a = sides[0] >= 0 ? world_offset.data[sides[0]] : -1;
             const int dof_b = sides[1] >= 0 ? world_offset.data[sides[1]] : -1;
-            int dof = dof_a, side = 0;
 """
-        + _sum(half, "za", "0.0f")
+        + _sum(operator, "z", "0.0f")
         + """
-            dof = dof_b; side = 6;
-"""
-        + _sum(half, "zb", "0.0f")
-        + """
-            term = za + zb;
+            term = z;
         }""",
     )
 
