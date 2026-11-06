@@ -1067,21 +1067,22 @@ def _update(up: bool, record: Record, state: str, name: str, into: str | None, i
     return [f"{state}[{k}] {sign}= {terms[k]} * {name};" for k in range(6)]
 
 
-def _edge(direction: Direction, lever, state: str, *, into: str | None = None) -> list[str]:
+def _edge(direction: Direction, lever, state: str, *, into: str | None = None, first: bool = False) -> list[str]:
     """The statements that pass a joint of lever ``d`` (``lever``, three names).
 
     ``UP``: a wrench ``(f, t)`` passes to the parent's frame as ``(f, t - d x f)``: in place on ``state``, its force
-    read first, or added into the parent's ``into``. ``DOWN``: a twist ``(v, w)`` passes to the child's frame as
-    ``(v + d x w, w)``: in place on ``state``, or from the parent's ``state`` into the child's ``into``.
+    read first, or added into the parent's ``into`` (``first``: assigned, the parent's first child). ``DOWN``: a twist
+    ``(v, w)`` passes to the child's frame as ``(v + d x w, w)``: in place on ``state``, or from the parent's ``state``
+    into the child's ``into``.
     """
     if direction is Direction.UP:
         if into is None:
             force = ("fx", "fy", "fz")
             head = f"const float fx = {state}[0], fy = {state}[1], fz = {state}[2];"
             return [head] + [f"{state}[{3 + k}] -= {cross(lever, force, k)};" for k in range(3)]
-        force = channels(state)[:3]
-        return [f"{into}[{k}] += {state}[{k}];" for k in range(3)] + [
-            f"{into}[{3 + k}] += {state}[{3 + k}] - ({cross(lever, force, k)});" for k in range(3)
+        force, op = channels(state)[:3], "=" if first else "+="
+        return [f"{into}[{k}] {op} {state}[{k}];" for k in range(3)] + [
+            f"{into}[{3 + k}] {op} {state}[{3 + k}] - ({cross(lever, force, k)});" for k in range(3)
         ]
     if direction is Direction.DOWN:
         turn = channels(state)[3:]
@@ -1121,9 +1122,10 @@ class WalkCombine:
             return _enter(record, state, source, out, index=index)
         return _step(self.direction, record, state, source=source, value=value, out=out, into=into, index=index)
 
-    def joint(self, lever, state: str, *, into: str | None = None) -> list[str]:
-        """A joint of lever ``lever`` (three names) on ``state``, in place or into ``into`` (:func:`_edge`)."""
-        return _edge(self.direction, lever, state, into=into)
+    def joint(self, lever, state: str, *, into: str | None = None, first: bool = False) -> list[str]:
+        """A joint of lever ``lever`` (three names) on ``state``, in place or into ``into`` (:func:`_edge`; ``first``
+        a leaf-first walk's first child of its parent, which assigns)."""
+        return _edge(self.direction, lever, state, into=into, first=first)
 
 
 WHITEN = WalkCombine(Direction.UP)
@@ -1469,6 +1471,7 @@ class WalkClass:
         touch_step: str = "",
         ahead: int | None = None,
         hold: bool = False,
+        joint_first: str = "",
     ) -> str:
         """Native statements that walk the class's tree on a state of ``width`` floats a body, in either direction.
 
@@ -1507,6 +1510,8 @@ class WalkClass:
             hold: Every item's line touched, then every item fetched, before the chain (straight-line code only): the
                 inputs held for a second walk over the same items (:meth:`walk_twice`). Touched first: on the RTX PRO
                 6000 the bare fetches of a free cube's records ran 9.2 -> 12.6 us; touched first, 8.3 (hold p2).
+            joint_first: Leaf first, straight-line: the joint of a parent's first child in the walk's order, which
+                assigns the parent's state rather than adding to its zero (none: ``joint`` for every child).
         """
         bodies, coordinates = len(self.parent), self.coordinates
         zero = "{" + ", ".join(["0.0f"] * width) + "}"
@@ -1572,16 +1577,19 @@ class WalkClass:
                     lines += body_text(b, state)
             else:
                 lines.append(f"float {', '.join(f'walk{b}[{width}] = {zero}' for b in range(bodies))};")
+                joined = set()
                 for b in bodies_order:
                     up = self.parent[b]
                     lines += body_text(b, f"walk{b}")
                     if up >= 0:
                         lines += take(("l", b))
-                        lines.append(_fill(joint, b=b, V=f"walk{b}", P=f"walk{up}", L=f"walk_l{b}"))
+                        text = joint_first if joint_first and up not in joined else joint
+                        joined.add(up)
+                        lines.append(_fill(text, b=b, V=f"walk{b}", P=f"walk{up}", L=f"walk_l{b}"))
             return "\n".join(lines)
 
-        if hold:
-            raise ValueError("a walk holds its items in straight-line code only")
+        if hold or joint_first:
+            raise ValueError("a walk holds its items, or assigns a first child, in straight-line code only")
         # The loop form: the walk's steps as a sequence of slots in the walk's order, a slot per coordinate and one
         # for a body without coordinates, each naming its body, its coordinate (-1 for none) and whether it is the
         # first (the body's joint before it root first, its gathering leaf first) or the last of its body's (the
@@ -1727,62 +1735,35 @@ for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
         class's order, no loop and no pick of a parent or a first coordinate on the chain. Each coordinate's step runs
         on every lane from the lane's own held word of the records (the coordinate's lane: its own record), and the
         walk's six-float state is then read from the coordinate's lane (six shuffles, where reading the record took
-        thirteen); each body's link by shuffle from the lane that holds it (``HELD_ROW`` at a constant). A body's
-        state passes to a parent that is not the body before it through ``state`` (six words a body, lane 0 writes),
-        the walk down's twists through the same words (every lane writes them, as each body's twist out); a body's first
-        joining child stores its state, the later ones add theirs. Lane 0 writes ``u`` (both walks). A lane holds ``HOLD_WORDS`` words of each held array (on the CPU's one lane, every item)."""
-        parent = self.parent
-        edge_up = "".join(WHITEN.joint(LOADED.lever, "p"))
-        edge_down = "".join(LEAVE.joint(LOADED.lever, "V"))
-        up, joined = [], set()
-        up.append("{\n    float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};")
-        for b in self.bodies_in(False):
-            if b in joined:
-                up.append(f"    for (int k = 0; k < 6; ++k) p[k] += {state}[{6 * b} + k];")
-            for c in self.coordinates_in(b, False):
-                output, update = WHITEN.step(LOADED, "p", source=f"{x}[{c}]", into="q")
-                up.append(
-                    f"    {{const float* d=h.r[{c}/WIDTH];{output}float q[6];{update}if(lane=={c}%WIDTH){u}[{c}]=z;"
-                    f"for(int k=0;k<6;++k)p[k]=READ(q[k],{c}%WIDTH);}}"
-                )
-            parent_b = parent[b]
-            if parent_b >= 0:
-                up.append(f"    {{float l[3];HELD_ROW(h.l,{b},l);{edge_up}}}")
-            if parent_b != b - 1:
-                if parent_b >= 0:
-                    if parent_b in joined:
-                        up.append(f"    if(lane==0)for(int k=0;k<6;++k){state}[{6 * parent_b}+k]+=p[k];")
-                    else:
-                        up.append(f"    if(lane==0)for(int k=0;k<6;++k){state}[{6 * parent_b}+k]=p[k];")
-                        joined.add(parent_b)
-                    up.append("    WARP_SYNC();")
-                if b > 0:
-                    up.append("    for (int k = 0; k < 6; ++k) p[k] = 0.0f;")
-        up.append("    WARP_SYNC();\n}")
-        down = [
-            "{\n    float uh[HOLD_WORDS];",
-            "    #pragma unroll",
-            f"    for (int k = 0; k < HOLD_WORDS; ++k) uh[k] = lane + k * WIDTH < {self.coordinates} ? {u}[lane + k * WIDTH] : 0.0f;",
-            "    WARP_SYNC();",
-            "    float V[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};",
-        ]
-        for b in self.bodies_in(True):
-            parent_b = parent[b]
-            if parent_b < 0:
-                down.append("    for (int k = 0; k < 6; ++k) V[k] = 0.0f;")
-            else:
-                if parent_b != b - 1:
-                    down.append(f"    for (int k = 0; k < 6; ++k) V[k] = {state}[{6 * parent_b} + k];")
-                down.append(f"    {{float l[3];HELD_ROW(h.l,{b},l);{edge_down}}}")
-            for c in self.coordinates_in(b, True):
-                output, update = LEAVE.step(LOADED, "V", source=f"uh[{c}/WIDTH]", out="const float q", into="W")
-                down.append(
-                    f"    {{const float* d=h.r[{c}/WIDTH];{output}float W[6];{update}if(lane=={c}%WIDTH){u}[{c}]=q;"
-                    f"for(int k=0;k<6;++k)V[k]=READ(W[k],{c}%WIDTH);}}"
-                )
-            down.append(f"    for (int k = 0; k < 6; ++k) {state}[{6 * b} + k] = V[k];")
-        down.append("    WARP_SYNC();\n}")
-        return "\n".join(up), "\n".join(down)
+        thirteen); each body's link by shuffle from the lane that holds it (``HELD_ROW`` at a constant). Both walks are
+        the class emitter's straight-line form (:meth:`walk`, the held texts its step and joint): each body's state a
+        register array, a parent's first child assigning it (``joint_first``), the walk down's twists out in ``state``
+        (six words a body, every lane writes them). Lane 0 writes ``u`` (both walks). A lane holds ``HOLD_WORDS``
+        words of each held array (on the CPU's one lane, every item)."""
+        # The held texts name the border's words with the layout's $ slots: escaped for the emitter's own slots.
+        x, u, state = (name.replace("$", "$$") for name in (x, u, state))
+        up_out, up_update = WHITEN.step(LOADED, "$V", source=f"{x}[$c]", into="q")
+        down_out, down_update = LEAVE.step(LOADED, "$V", source="uh[$c/WIDTH]", out="const float q", into="W")
+        held = "{const float* d=h.r[$c/WIDTH];%s%sfor(int k=0;k<6;++k)$V[k]=READ(%s[k],$c%%WIDTH);}"
+        link = "{float l[3];HELD_ROW(h.l,$b,l);%s}"
+        up = self.walk(
+            link % "".join(WHITEN.joint(LOADED.lever, "$V", into="$P")),
+            held % (up_out, f"float q[6];{up_update}if(lane==$c%WIDTH){u}[$c]=z;", "q"),
+            root_first=False,
+            unroll=self.coordinates,
+            joint_first=link % "".join(WHITEN.joint(LOADED.lever, "$V", into="$P", first=True)),
+        )
+        down = self.walk(
+            link % "".join(LEAVE.joint(LOADED.lever, "$P", into="$V")),
+            held % (down_out, f"float W[6];{down_update}if(lane==$c%WIDTH){u}[$c]=q;", "W"),
+            end=f"for (int k = 0; k < 6; ++k) {state}[6 * $b + k] = $V[k];",
+            unroll=self.coordinates,
+        )
+        uh = (
+            f"float uh[HOLD_WORDS];\n#pragma unroll\nfor (int k = 0; k < HOLD_WORDS; ++k) uh[k] = lane + k * WIDTH < "
+            f"{self.coordinates} ? {u.replace('$$', '$')}[lane + k * WIDTH] : 0.0f;\nWARP_SYNC();"
+        )
+        return "{\n" + up + "\nWARP_SYNC();\n}", "{\n" + uh + "\n" + down + "\nWARP_SYNC();\n}"
 
     def touch(self, items: int) -> int:
         """How many items ahead of its chain a walk asks L1 for an item's lines: :data:`WALK_TOUCH`, at most the
