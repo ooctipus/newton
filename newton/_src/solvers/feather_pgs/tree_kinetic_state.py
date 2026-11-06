@@ -353,14 +353,42 @@ def _bank_binding(coordinates, layout):
     return matches
 
 
-@wp.func_native("float* s=reinterpret_cast<float*>(address);for(int k=0;k<7;++k)s[7*body+k]=pose[k];")
-def _store_pose(address: wp.uint64, body: int, pose: wp.transform): ...
-
-
-@wp.func_native(
-    "float* s=reinterpret_cast<float*>(address);wp::transform p;for(int k=0;k<7;++k)p[k]=s[7*body+k];return p;"
+# A tree's block of words (TreeLayout): one store and one load of a vector's components as consecutive floats from
+# float ``word`` of the block at ``address``, for each vector type a block holds (a ``vec3``, a spatial vector, a
+# transform, an inertia record). Each caller names its word from the layout's offsets.
+_STORE_WORDS = "float* s=reinterpret_cast<float*>(address)+word;for(unsigned k=0;k<sizeof(value)/4;++k)s[k]=value[k];"
+_LOAD_WORDS = (
+    "auto value=like;const float* s=reinterpret_cast<const float*>(address)+word;"
+    "for(unsigned k=0;k<sizeof(value)/4;++k)value[k]=s[k];return value;"
 )
-def _load_pose(address: wp.uint64, body: int) -> wp.transform: ...
+
+
+@wp.func_native(_STORE_WORDS)
+def store_words(address: wp.uint64, word: int, value: wp.vec3): ...
+
+
+@wp.func_native(_STORE_WORDS)
+def store_words(address: wp.uint64, word: int, value: wp.spatial_vector): ...
+
+
+@wp.func_native(_STORE_WORDS)
+def store_words(address: wp.uint64, word: int, value: wp.transform): ...
+
+
+@wp.func_native(_STORE_WORDS)
+def store_words(address: wp.uint64, word: int, value: inertia_record): ...
+
+
+@wp.func_native(_LOAD_WORDS)
+def load_words(address: wp.uint64, word: int, like: wp.vec3) -> wp.vec3: ...
+
+
+@wp.func_native(_LOAD_WORDS)
+def load_words(address: wp.uint64, word: int, like: wp.spatial_vector) -> wp.spatial_vector: ...
+
+
+@wp.func_native(_LOAD_WORDS)
+def load_words(address: wp.uint64, word: int, like: wp.transform) -> wp.transform: ...
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -758,13 +786,6 @@ _STORAGE_SOURCE = r"""
 """
 
 
-_STORE_TERMS_SOURCE = r"""
-    float* s=reinterpret_cast<float*>(address);
-    for(int k=0;k<6;++k)s[$WRENCH+6*body+k]=wrench[k];
-    if(refresh)for(int k=0;k<13;++k)s[$MOMENT+13*body+k]=record[k];
-"""
-
-
 def _native_clocks(clocked, owner, *, stages, column):
     """Return a native's cycle-counter fragments ``CLOCK0`` to ``CLOCK<stages>``, empty unless ``clocked``.
 
@@ -813,6 +834,7 @@ def get_helpers(
     compact diagonal's refresh (:data:`_DIAGONAL`). They change the emitted
     code, so they are arguments (cache-key members), never environment reads.
     """
+    wrench_word, moment_word = layout.wrench_offset, layout.moment_offset
     pose_source = _down(layout, ts.TRANSFORM, schedules.pose, _POSE_SLOTS)
     motion_source = _down(layout, ts.TWIST if layout.own_bias else _MOTION, schedules.motion, _MOTION_SLOTS)
     reduction = _reduction(_REDUCE, schedules.reduce, _REDUCE_SLOTS)
@@ -828,50 +850,11 @@ def get_helpers(
     @wp.func_native(layout.native(_STORAGE_SOURCE, BLOCK=_placed_block(layout, "values", "$TOTAL")))
     def _storage(plan: HeldPlan, group: int) -> wp.uint64: ...
 
-    @wp.func_native(
-        layout.render("float* s=reinterpret_cast<float*>(address)+$MOTION;for(int k=0;k<6;++k)s[6*body+k]=v[k];")
-    )
-    def _store_motion(address: wp.uint64, body: int, v: wp.spatial_vector): ...
-
-    @wp.func_native(
-        layout.render(
-            "float* s=reinterpret_cast<float*>(address)+$MOTION+$SIX_BODIES*acceleration;wp::spatial_vector v;for(int k=0;k<6;++k)v[k]=s[6*body+k];return v;"
-        )
-    )
-    def _load_motion(address: wp.uint64, body: int, acceleration: int) -> wp.spatial_vector: ...
-
-    @wp.func_native(
-        layout.render(
-            "float* s=reinterpret_cast<float*>(address)+$MOTION+$SIX_BODIES;for(int k=0;k<6;++k)s[6*body+k]=a[k];"
-        )
-    )
-    def _store_bias(address: wp.uint64, body: int, a: wp.spatial_vector): ...
-
-    @wp.func_native(
-        layout.render("float* s=reinterpret_cast<float*>(address)+$ORIGIN+3*shift;for(int k=0;k<3;++k)s[k]=v[k];")
-    )
-    def _store_origin(address: wp.uint64, shift: int, v: wp.vec3): ...
-
-    @wp.func_native(
-        layout.render("float* s=reinterpret_cast<float*>(address)+$ORIGIN+3*shift;return wp::vec3(s[0],s[1],s[2]);")
-    )
-    def _load_origin(address: wp.uint64, shift: int) -> wp.vec3: ...
-
-    @wp.func_native(
-        layout.render("float* s=reinterpret_cast<float*>(address)+$AXIS;for(int k=0;k<6;++k)s[6*dof+k]=v[k];")
-    )
-    def _store_axis(address: wp.uint64, dof: int, v: wp.spatial_vector): ...
-
     @wp.func_native(pose_source)
     def _scan_poses(address: wp.uint64, p: HeldPlan): ...
 
     @wp.func_native(motion_source)
     def _scan_motion(address: wp.uint64, p: HeldPlan): ...
-
-    @wp.func_native(layout.render(_STORE_TERMS_SOURCE))
-    def _store_terms(
-        address: wp.uint64, body: int, wrench: wp.spatial_vector, record: inertia_record, refresh: int
-    ): ...
 
     # A root-only free body is a free rigid body (in a forest, a free root may
     # be one): the matrix-free contact path reads its spatial inertia and bias
@@ -922,7 +905,9 @@ def get_helpers(
         cache.com_offset[g.js + local] = radius
         if wp.static(clocked):
             clock_b2 = _clock()
-        _store_terms(g.address, local, wrench, record, g.refresh)
+        store_words(g.address, wp.static(wrench_word) + 6 * local, wrench)
+        if g.refresh != 0:
+            store_words(g.address, wp.static(moment_word) + 13 * local, record)
         if wp.static(free_rigid):
             if data.is_free_rigid[data.body_to_articulation[body]] != 0:
                 data.body_q_com[body] = pose_com
@@ -975,16 +960,9 @@ def get_helpers(
     return SimpleNamespace(
         _body_terms=_body_terms,
         _collect=_collect,
-        _load_motion=_load_motion,
-        _load_origin=_load_origin,
         _scan_motion=_scan_motion,
         _scan_poses=_scan_poses,
         _storage=_storage,
-        _store_axis=_store_axis,
-        _store_bias=_store_bias,
-        _store_motion=_store_motion,
-        _store_origin=_store_origin,
-        _store_terms=_store_terms,
     )
 
 
@@ -1038,8 +1016,11 @@ def get_state_kernel(
     banked = bank_coordinates != 0
     _bank_matches = _bank_binding(bank_coordinates, layout) if banked else None
     scan_poses, scan_motion, collect, body_terms = h._scan_poses, h._scan_motion, h._collect, h._body_terms
-    _storage, _store_motion, _load_motion, _store_bias = h._storage, h._store_motion, h._load_motion, h._store_bias
-    _store_origin, _load_origin, _store_axis = h._store_origin, h._load_origin, h._store_axis
+    _storage = h._storage
+    # The words of a tree's block (TreeLayout): poses (7 a body) from 0, then each body's twist and bias acceleration
+    # (6 each), the axes (6 a coordinate) and each root's origin and shift (3 each).
+    motion_word, bias_word = 7 * layout.bodies, 13 * layout.bodies
+    axis_word, origin_word = layout.axis_offset, layout.origin_offset
     bodies, dofs, pack, free_root = layout.bodies, layout.dofs, layout.pack, layout.free_root
     roots, free_roots, forest, own_bias = len(layout.roots), layout.free_root_count, layout.forest, layout.own_bias
     from .spatial_laws import store_columns  # noqa: PLC0415
@@ -1215,13 +1196,17 @@ def get_state_kernel(
             relative = joint_frame_pose(data.joint_X_p[joint], transform, data.joint_X_c[joint])
             if wp.static(not forest):
                 if local == 0:
-                    _store_origin(g.address, 1, wp.transform_get_translation(relative))
+                    store_words(g.address, wp.static(origin_word + 3), wp.transform_get_translation(relative))
                     relative = wp.transform(wp.vec3(), wp.transform_get_rotation(relative))
             else:
                 if plan.parent[local] < 0:
-                    _store_origin(g.address, 2 * plan.root_of[local] + 1, wp.transform_get_translation(relative))
+                    store_words(
+                        g.address,
+                        wp.static(origin_word) + 3 * (2 * plan.root_of[local] + 1),
+                        wp.transform_get_translation(relative),
+                    )
                     relative = wp.transform(wp.vec3(), wp.transform_get_rotation(relative))
-            _store_pose(g.address, local, relative)
+            store_words(g.address, 7 * local, relative)
         _sync()
 
     @wp.func
@@ -1231,16 +1216,20 @@ def get_state_kernel(
         if wp.static(not forest):
             if g.lane == 0:
                 root_body = data.joint_child[g.js]
-                origin = wp.transform_point(_load_pose(g.address, 0), data.body_com[root_body])
-                _store_origin(g.address, 0, origin)
-                data.articulation_origin[g.art] = origin + _load_origin(g.address, 1)
+                origin = wp.transform_point(load_words(g.address, 0, wp.transform()), data.body_com[root_body])
+                store_words(g.address, wp.static(origin_word), origin)
+                data.articulation_origin[g.art] = origin + load_words(g.address, wp.static(origin_word + 3), wp.vec3())
         else:
             for root in range(g.lane, wp.static(roots), g.stride):
                 root_local = plan.root_local[root]
                 root_body = data.joint_child[g.js + root_local]
-                origin = wp.transform_point(_load_pose(g.address, root_local), data.body_com[root_body])
-                _store_origin(g.address, 2 * root, origin)
-                data.articulation_origin[plan.arts[g.group, root]] = origin + _load_origin(g.address, 2 * root + 1)
+                origin = wp.transform_point(
+                    load_words(g.address, 7 * root_local, wp.transform()), data.body_com[root_body]
+                )
+                store_words(g.address, wp.static(origin_word) + 3 * (2 * root), origin)
+                data.articulation_origin[plan.arts[g.group, root]] = origin + load_words(
+                    g.address, wp.static(origin_word) + 3 * (2 * root + 1), wp.vec3()
+                )
         _sync()
 
     @wp.func
@@ -1265,11 +1254,11 @@ def get_state_kernel(
             joint = g.js + local
             parent = plan.parent[local]
             if wp.static(forest):
-                origin = _load_origin(g.address, 2 * plan.root_of[local])
-                shift = _load_origin(g.address, 2 * plan.root_of[local] + 1)
+                origin = load_words(g.address, wp.static(origin_word) + 3 * (2 * plan.root_of[local]), wp.vec3())
+                shift = load_words(g.address, wp.static(origin_word) + 3 * (2 * plan.root_of[local] + 1), wp.vec3())
             anchor = data.joint_X_p[joint]
             if parent >= 0:
-                anchor = _load_pose(g.address, parent) * anchor
+                anchor = load_words(g.address, 7 * parent, wp.transform()) * anchor
             else:
                 anchor = wp.transform(wp.transform_get_translation(anchor) - shift, wp.transform_get_rotation(anchor))
             # The joint's frame point (shifted with the root): its anchor, a free joint's child's centre of mass.
@@ -1301,7 +1290,7 @@ def get_state_kernel(
             columns = data.walk_now.shape[0] > 0
             for k in range(lin + ang):
                 column = data.joint_S_s[start + k]
-                _store_axis(g.address, start - g.ds + k, column)
+                store_words(g.address, wp.static(axis_word) + 6 * (start - g.ds + k), column)
                 if wp.static(not two_half):
                     if columns:
                         if k < lin:
@@ -1312,7 +1301,9 @@ def get_state_kernel(
                 kind = data.joint_type[joint]
                 free = kind == JointType.FREE or kind == JointType.DISTANCE
                 if free:
-                    point = wp.transform_point(_load_pose(g.address, local), data.body_com[data.joint_child[joint]])
+                    point = wp.transform_point(
+                        load_words(g.address, 7 * local, wp.transform()), data.body_com[data.joint_child[joint]]
+                    )
                 if wp.static(two_half):
                     # A group with a joint whose column has two halves at its frame (a D6 joint's turns after its
                     # slides, a free joint's turns below a root): the columns again, at the anchor's rotation alone.
@@ -1339,9 +1330,9 @@ def get_state_kernel(
                 frame = point - origin
                 for k in range(3):
                     data.walk_now_link[joint, wp.static(WALK_FRAME) + k] = frame[k]
-            _store_motion(g.address, local, velocity)
+            store_words(g.address, wp.static(motion_word) + 6 * local, velocity)
             if wp.static(own_bias):
-                _store_bias(g.address, local, bias)
+                store_words(g.address, wp.static(bias_word) + 6 * local, bias)
             if wp.static(clocked):
                 clock_m3 = _clock()
                 if local == 0 and data.stage_clocks.shape[0] > g.group:
@@ -1359,9 +1350,9 @@ def get_state_kernel(
         for local in range(g.lane, bodies, g.stride):
             body = data.joint_child[g.js + local]
             if wp.static(forest):
-                origin = _load_origin(g.address, 2 * plan.root_of[local])
-                shift = _load_origin(g.address, 2 * plan.root_of[local] + 1)
-            pose = _load_pose(g.address, local)
+                origin = load_words(g.address, wp.static(origin_word) + 3 * (2 * plan.root_of[local]), wp.vec3())
+                shift = load_words(g.address, wp.static(origin_word) + 3 * (2 * plan.root_of[local] + 1), wp.vec3())
+            pose = load_words(g.address, 7 * local, wp.transform())
             data.body_q[body] = wp.transform(
                 wp.transform_get_translation(pose) + shift, wp.transform_get_rotation(pose)
             )
@@ -1372,8 +1363,8 @@ def get_state_kernel(
                 pose,
                 pose * data.body_X_com[body],
                 origin,
-                _load_motion(g.address, local, 0),
-                _load_motion(g.address, local, 1),
+                load_words(g.address, wp.static(motion_word) + 6 * local, wp.spatial_vector()),
+                load_words(g.address, wp.static(bias_word) + 6 * local, wp.spatial_vector()),
                 data,
                 cache,
             )
@@ -1457,8 +1448,8 @@ def get_state_kernel(
         if wp.static(clocked):
             clock_2 = _clock()
         poses(g, plan, data)
-        origin = _load_origin(g.address, 0)
-        shift = _load_origin(g.address, 1)
+        origin = load_words(g.address, wp.static(origin_word), wp.vec3())
+        shift = load_words(g.address, wp.static(origin_word + 3), wp.vec3())
         if wp.static(motion_velocity):
             qd = motion_qd
         if wp.static(clocked):
