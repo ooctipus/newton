@@ -17,8 +17,8 @@ from functools import cache
 
 import warp as wp
 
-from ...core.execution import Work, device_lanes
-from ...core.memory import Buffer, Staging, arch_budget
+from ...core.execution import Work, device_lanes, shape
+from ...core.memory import Buffer, Staging, arch_budget, built_for
 from . import kernel_template
 from .device_preludes import RING, SHARED_STORAGE, group_native, lane_group
 from .factor.walk import WalkTrees
@@ -89,11 +89,26 @@ speed rows from ``speed_first``, its free body's first world coordinate ``second
 
 _PAIRED_WORLDS_PER_BLOCK = 2
 
+PAIRED_REGISTER_LINE = 80
+"""The paired factor sweep's register line: 12 blocks of two worlds a multiprocessor. It is no cap (the layer's
+``Work.cap``): the sweep is bound only where its shared memory keeps no more blocks than the line, as the tiers are,
+which the line's speed rows need: unbounded, kuka's sweep with them compiles at 96 registers (10 blocks of the 11 its
+shared memory keeps on sm_120), within the line at 80 with the same 24-byte stack."""
 
-def paired_work(worlds: int) -> Work:
+
+def paired_work(worlds: int, shared: int = 0) -> Work:
     """The paired factor sweep's launch over ``worlds``: a warp a world, :data:`_PAIRED_WORLDS_PER_BLOCK` a block
-    (:func:`~newton._src.core.execution.shape` gives the device's: one thread a world on the CPU)."""
-    return Work(int(worlds), lanes=32, block=32 * _PAIRED_WORLDS_PER_BLOCK)
+    (:func:`~newton._src.core.execution.shape` gives the device's: one thread a world on the CPU), at the register
+    line :data:`PAIRED_REGISTER_LINE`, which bounds the kernel where its block's ``shared`` memory keeps no more
+    blocks than the line."""
+    return Work(
+        int(worlds),
+        lanes=32,
+        block=32 * _PAIRED_WORLDS_PER_BLOCK,
+        registers=PAIRED_REGISTER_LINE,
+        cap=False,
+        shared=int(shared),
+    )
 
 
 _ROWS = "factor_rows"
@@ -551,4 +566,5 @@ def paired_factor_kernel(
         ),
         composed=True,
         native_name="sweep_paired_factor_native",
+        launch_bounds=shape(paired_work(0, staging.bytes), built_for(device_arch)).bounds,
     ).kernel()
