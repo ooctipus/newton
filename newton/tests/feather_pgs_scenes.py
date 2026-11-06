@@ -1096,7 +1096,14 @@ def keyboard(*, keys: int = 8, press: float = 0.003, worlds: int = 2) -> Scene:
     )
 
 
-def hand(*, fingers: int = 4, segments: int = 4, press: float = 0.002, worlds: int = 2) -> Scene:
+def hand(
+    *,
+    fingers: int = 4,
+    segments: int = 4,
+    press: float = 0.002,
+    worlds: int = 2,
+    lift_velocity_limit: float | None = None,
+) -> Scene:
     """A 17-coordinate hand (a ``z`` lift under four 4-joint fingers) balancing a free 0.5 kg cube on its fingertips.
 
     The fingers stand straight up from the palm's corners, their sphere tips
@@ -1105,9 +1112,10 @@ def hand(*, fingers: int = 4, segments: int = 4, press: float = 0.002, worlds: i
     world ``w``. The cube touches only the fingertips, so hand and cube are one
     coupled component without matrix-free rows. The last world sets its cube
     on the ground 0.3 m aside instead: there the hand touches nothing and the
-    cube only the ground.
+    cube only the ground. ``lift_velocity_limit`` [m/s] bounds the lift's speed, which its drive's step passes.
     """
     cube, tip, link, palm_z = 0.05, 0.008, 0.03, 0.05
+    lift = {} if lift_velocity_limit is None else {"velocity_limit": lift_velocity_limit}
     corners = ((0.03, 0.03), (0.03, -0.03), (-0.03, 0.03), (-0.03, -0.03))[:fingers]
     cube_z = palm_z + 0.01 + segments * link + tip + 0.001 + cube
 
@@ -1124,6 +1132,7 @@ def hand(*, fingers: int = 4, segments: int = 4, press: float = 0.002, worlds: i
                 parent_xform=wp.transform(wp.vec3(0.0, 0.0, palm_z)),
                 target_ke=1000.0,
                 target_kd=30.0,
+                **lift,
             ),
         ]
         for corner in corners:
@@ -1165,8 +1174,9 @@ def hand(*, fingers: int = 4, segments: int = 4, press: float = 0.002, worlds: i
             joints = model.joint_count // worlds
             _set_targets(model, control, {world * joints + 1: 0.001 + press + 0.001 * world for world in range(worlds)})
 
+    name = "hand" if lift_velocity_limit is None else "hand_lift_velocity_limit"
     return Scene(
-        "hand",
+        name,
         build,
         dt=1.0 / 240.0,
         steps=120,

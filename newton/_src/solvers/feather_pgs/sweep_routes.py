@@ -713,8 +713,6 @@ def mf_gs_source(
     if mapping not in MAPPINGS:
         raise ValueError(f"mapping must be one of {MAPPINGS}, got {mapping!r}")
     colored = mapping == "colored"
-    if factor_coordinates and has_dense_velocity_limit_rows:
-        raise ValueError("factor coordinates require the paired contact solve")
     if independent_components and not factor_coordinates:
         raise ValueError("Independent components require the paired factor-coordinate solve")
     if lanes not in (1, 32) or (colored and lanes != 32):

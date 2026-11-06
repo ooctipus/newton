@@ -83,7 +83,6 @@ _REQUIREMENTS = {
     "cuda": (lambda laws: laws.cuda, "a CUDA device (their native bodies are written for CUDA only)"),
     "plain": (lambda laws: laws.plain, Laws.PLAIN),
     "limits": (lambda laws: laws.limits, "joint-limit rows (enable_joint_limits)"),
-    "no_velocity_limits": (lambda laws: not laws.velocity_limits, "no joint velocity-limit rows"),
     "no_mimic": (lambda laws: not laws.mimic, "no mimic rows"),
     "iterations": (lambda laws: laws.iterations, "a positive iteration budget"),
     "no_preelimination": (lambda laws: not laws.preelimination, "no bilateral pre-elimination"),
@@ -97,7 +96,7 @@ CAPABILITIES = {
         "no_preelimination",
     ),
     # The paired factor's sweep in factor coordinates (one articulation and one free body per world).
-    "paired_factor": ("cuda", "plain", "iterations", "no_velocity_limits"),
+    "paired_factor": ("cuda", "plain", "iterations"),
     # Its runtime claim: independent articulation and free-body components per world.
     "components": ("cuda", "plain", "no_mimic"),
     # The Jacobi tiers of dense trees beside a free body (case K4), whose sweep budget a build fixes.

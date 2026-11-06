@@ -1644,6 +1644,13 @@ def cuda_groups() -> list:
                 MF_PARALLEL,
             ),
         ),
+        # The paired factor sweep steps velocity-limit rows in place, in slot order, and the general sweep its coupled
+        # worlds' by their last word: a lift whose drive passes its velocity limit (case K5).
+        Group(
+            _physics(scenes.hand(lift_velocity_limit=0.02), "patch", 16, "velocity_limits", **vlimits),
+            ref,
+            (PAIRED.but("paired_velocity_limits"),),
+        ),
     ]
     # The CT benchmark's torsion checks: T1 articulated and free, T3 at every offset (7 mm, where the elliptic cone
     # holds and a pair-first law slips, included) and T4 against the patch's limit surface.
