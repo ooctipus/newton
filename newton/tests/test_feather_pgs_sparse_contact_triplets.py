@@ -206,9 +206,6 @@ class DeviceSolve:
             array(data["row_mu"]),
             array(np.arange(self.worlds * self.dofs).reshape(self.worlds, self.dofs), int),
             zeros(self.worlds * self.dofs),
-            zeros(self.worlds, int),
-            zeros((self.worlds, 4), int),
-            zeros((self.worlds, 1, 12)),
             int(data["iterations"]),
             float(data["omega"]),
         ]

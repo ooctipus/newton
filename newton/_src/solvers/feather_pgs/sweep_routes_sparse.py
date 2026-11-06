@@ -102,16 +102,13 @@ SPARSE_ABI = kernel_template.params(
     ("world_row_mu", wp.array2d[float]),
     ("world_dof_indices", wp.array2d[int]),
     ("v_hat", wp.array[float]),
-    ("mf_constraint_count", wp.array[int]),
-    ("mf_meta", wp.array2d[int]),
-    ("mf_Z", wp.array3d[float]),
     ("iterations", int),
     ("omega", float),
     ("factor_velocity_delta", wp.array2d[float]),
     ("support", _SparseRowSupport),
 )
-"""The sparse sweep's native ABI (one world per call). ``world_dof_indices``, ``v_hat``, the ``mf_*`` operands and
-the factory's free-body capacities are read by no configuration: the sweep holds no free-body rows."""
+"""The sparse sweep's native ABI (one world per call). ``world_dof_indices``, ``v_hat`` and the factory's free-body
+capacities are read by no configuration: the sweep holds no free-body rows."""
 
 THREADS = 64
 """Threads per block: ``64 / lanes`` worlds."""

@@ -131,9 +131,6 @@ class _SparseCase:
             padded(mu),
             wp.array(np.arange(worlds * dofs).reshape(worlds, dofs), dtype=int, device=device),
             wp.zeros(worlds * dofs, device=device),
-            wp.zeros(worlds, dtype=int, device=device),
-            wp.zeros((worlds, 4), dtype=int, device=device),
-            wp.zeros((worlds, 1, 12), device=device),
         ]
         self.omega = omega
         worlds_per_block = 64 // options.get("lanes_per_world", 32)
