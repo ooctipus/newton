@@ -193,15 +193,9 @@ def _resolve(
         raise ValueError("sparse PGS requires positive capacities and max_row_dofs <= max_world_dofs")
     if use_support_table and D > 64:
         raise ValueError("sparse support tables require at most 64 factored DOFs")
-    if velocity_limits and (active_rows or contact_triplets):
-        raise ValueError("sparse joint velocity limits require full articulated row sweeps")
     L = int(lanes_per_world)
     if L not in (8, 16, 32):
         raise ValueError("sparse PGS requires 8, 16 or 32 lanes per world")
-    if L < 32 and (D > L or active_rows or contact_triplets):
-        raise ValueError("subwarp sparse PGS requires a small complete articulated sweep")
-    if local_factors and (D > 16 or M > 64 or active_rows or contact_triplets):
-        raise ValueError("local factor storage requires a small complete articulated sweep")
     active = bool(active_rows)
     triplets = bool(contact_triplets) and (active or bool(linked_rows)) and bool(use_support_table) and M >= 3 + torsion
     linked = bool(linked_rows) and (active or triplets)
@@ -393,11 +387,21 @@ def active_scan(sweep: SparseSweep, op: SparseFactor, pad: str) -> str:
             "    ((s_normal_words[parent / 32] >> (parent & 31)) & 1u) != 0u\n"
             f"    || s_impulse[row] != 0.0f || {held});"
         )
-    lane_zero = op.lanes.first
+    lane_zero, L = op.lanes.first, sweep.lanes
+    # A word holds 32 rows' bits; a group of fewer lanes fills it L bits at a time, from its first lane.
+    if L == 32:
+        bit, fill = "lane", lambda words: f"{words}[first / 32] = mask;"
+    else:
+        bit = "((first & 31) + lane)"
+
+        def fill(words: str) -> str:
+            kept = f"((first & 31) != 0 ? {words}[first / 32] : 0u)"
+            return f"{words}[first / 32] = {kept} | (mask << (first & 31));"
+
     select = f"!select_active || (kind != {CONTACT} && kind != {JOINT_LIMIT}) || s_impulse[row] != 0.0f"
     # A triple's rows are the triple phase's: never selected.
     rowed = f"kind != {FRICTION} && kind != {TORSION}" if sweep.torsion else f"kind != {FRICTION}"
-    text = f"""for (int first = 0; first < count; first += 32) {{
+    text = f"""for (int first = 0; first < count; first += {L}) {{
     const int row = first + lane;
     bool selected = false;
     if (row < count) {{
@@ -413,21 +417,21 @@ def active_scan(sweep: SparseSweep, op: SparseFactor, pad: str) -> str:
         }}
     }}
     const unsigned mask = BALLOT(selected);
-    {lane_zero("s_normal_words[first / 32] = mask;")}
+    {lane_zero(fill("s_normal_words"))}
 }}
 SYNC();
-for (int first = 0; first < count; first += 32) {{
+for (int first = 0; first < count; first += {L}) {{
     const int row = first + lane;
     bool selected = false;
     if (row < count) {{
-        selected = !select_active || ((s_normal_words[first / 32] >> lane) & 1u) != 0u;
+        selected = !select_active || ((s_normal_words[first / 32] >> {bit}) & 1u) != 0u;
         if (select_active && s_type[row] == {FRICTION}) {{
             const int parent = world_row_parent.data[offset + row];
 {indent(tangent, "            ")}
         }}
     }}
     const unsigned mask = BALLOT(selected);
-    {lane_zero("s_selected_words[first / 32] = mask;")}
+    {lane_zero(fill("s_selected_words"))}
 }}
 SYNC();"""
     return indent(text, pad)
@@ -443,7 +447,7 @@ def active_violation(sweep: SparseSweep, op: SparseFactor) -> tuple[str, str, st
     code = f"""float sweep_violation = 0.0f;
 int sweep_violation_kind = -1;
 int sweep_violation_loud = 0;
-for (int first = 0; first < count; first += 32) {{
+for (int first = 0; first < count; first += {sweep.lanes}) {{
     const int row = first + lane;
     const int kind = row < count ? static_cast<int>(s_type[row]) : -1;
     if ((kind == {CONTACT} || kind == {JOINT_LIMIT}) && s_impulse[row] == 0.0f && s_diag[row] > 0.0f) {{
@@ -569,7 +573,7 @@ def contact_units(sweep: SparseSweep, rows: SparseRows, op: SparseFactor, laws: 
     if sweep.linked:
         setup = f"""// Each anchor's other ring members, at most three, in the order the pair update pools them; -1 marks a
 // longer ring, which keeps the walk. Visits read them with the record.
-for (int normal = lane; normal + 2 < count; normal += 32) {{
+for (int normal = lane; normal + 2 < count; normal += {sweep.lanes}) {{
     if (s_type[normal] != {CONTACT} || {pair_rows}) continue;
     const int first = world_row_parent.data[offset + normal];
     int second = -1, third = -1, others = 0;

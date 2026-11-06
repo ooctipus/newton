@@ -153,15 +153,46 @@ class TestSparseSweepConfiguration(unittest.TestCase):
             ((0, 6, 4), {}),
             ((16, 6, 7), {}),
             ((16, 72, 4), {"use_support_table": True}),
-            ((16, 6, 4), {"velocity_limits": True, "active_rows": True}),
             ((16, 6, 4), {"lanes_per_world": 4}),
-            ((16, 18, 4), {"lanes_per_world": 16}),
-            ((16, 6, 4), {"lanes_per_world": 8, "active_rows": True}),
-            ((96, 6, 4), {"local_factors": True}),
         )
         for args, options in cases:
             with self.subTest(args=args, options=options), self.assertRaises(ValueError):
                 EMITTER(*args, **options)
+
+    def test_the_options_compose(self):
+        """Velocity limits after an active sweep or contact units, a group of fewer lanes than the world's coordinates
+        or with the active scan and units, and local factors of any size the working set fits: each a sweep."""
+        cases = (
+            ((16, 6, 4), {"velocity_limits": True, "active_rows": True}),
+            (
+                (16, 6, 4),
+                {"velocity_limits": True, "active_rows": True, "use_support_table": True, "contact_triplets": True},
+            ),
+            ((16, 18, 4), {"lanes_per_world": 16}),
+            (
+                (64, 18, 4),
+                {"lanes_per_world": 8, "active_rows": True, "use_support_table": True, "contact_triplets": True},
+            ),
+            ((96, 6, 4), {"local_factors": True}),
+            (
+                (64, 24, 12),
+                {"local_factors": True, "active_rows": True, "use_support_table": True, "contact_triplets": True},
+            ),
+        )
+        for args, options in cases:
+            with self.subTest(args=args, options=options):
+                body, staging = routes.sparse_source(*args, **options)
+                self.assertIn("for (int iter = 0; iter < iterations; ++iter)", body)
+                self.assertGreater(staging.bytes, 0)
+                self.assertTrue(EMITTER(*args, **options).key.startswith(f"sweep_sparse_{args[0]}_{args[1]}_{args[2]}"))
+        # A group of 8 lanes fills each 32-row word of the active scan's bitsets 8 bits at a time.
+        body, _ = routes.sparse_source(64, 18, 4, lanes_per_world=8, active_rows=True)
+        self.assertIn("for (int first = 0; first < count; first += 8) {", body)
+        self.assertIn(
+            "s_normal_words[first / 32] = ((first & 31) != 0 ? s_normal_words[first / 32] : 0u) | (mask << (first & 31));",
+            body,
+        )
+        self.assertIn("((s_normal_words[first / 32] >> ((first & 31) + lane)) & 1u) != 0u", body)
 
     def test_shared_memory_is_the_staging(self):
         """Declare the staging's shared arrays: every buffer one array of every world's copy, in world order."""

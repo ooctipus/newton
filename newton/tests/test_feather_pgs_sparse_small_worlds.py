@@ -4,6 +4,7 @@
 """Check packed independent worlds against the physical velocity/contact law."""
 
 import unittest
+from itertools import product
 from unittest import mock
 
 import numpy as np
@@ -91,6 +92,75 @@ class TestSparseSmallWorlds(unittest.TestCase):
                                     atol=3e-5,
                                     rtol=3e-4,
                                 )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
+    def test_lane_groups_compose_the_active_scan_units_and_local_factors(self):
+        """A group of 8 or 16 lanes runs the active scan and contact units on worlds wider than the group, and local
+        factors serve worlds wider than 16 coordinates (the 192-row fixture's 18): each as a warp's sweep does, the
+        physical active sweep's answer within rounding, and the warp's. The 29-row offset puts the units and the
+        scan's selections across 32-row words, which a group fills a part at a time."""
+        settings = ({"seeded": True}, {"offset": 29, "seeded": True}, {"omega": 0.7, "seeded": True})
+        for (lanes, local), options in product(((8, False), (16, False), (32, True)), settings):
+            with self.subTest(lanes=lanes, local_factors=local, **options):
+                data, physical = fixtures.fixture(**options)
+                warp = fixtures.DeviceSolve(data, candidate=True)
+
+                def factory(capacity, dofs, width, *, _lanes=lanes, _local=local, **_kwargs):
+                    return sparse_kernel(
+                        capacity,
+                        dofs,
+                        width,
+                        active_rows=True,
+                        use_support_table=True,
+                        contact_triplets=True,
+                        lanes_per_world=_lanes,
+                        local_factors=_local,
+                    )
+
+                with mock.patch.object(fixtures, "factory", factory):
+                    group = fixtures.DeviceSolve(data, candidate=True)
+                self.assertTrue(group.units)
+                self.assertIn("_active_support_table_contact_triplets", group.kernel.key)
+                warp.launch()
+                group.launch()
+                fixtures.assert_output(self, data, *group.result(), physical=physical, reference=warp.result())
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
+    def test_velocity_limits_compose_the_active_scan_and_units(self):
+        """The last-word velocity-limit pass after an active sweep with contact units, in a warp or a smaller group:
+        the physical sweep's answer (contacts first, then the velocity-limit totals)."""
+        for lanes, sign in product((32, 16, 8), (-1.0, 1.0)):
+            with self.subTest(lanes=lanes, sign=sign):
+                data, physical, factor = velocity._solve_data(sign, contact=True, iterations=8, omega=0.4)
+                data["initial_impulses"][:] = 0.0
+                physical = (*physical[:-1], np.zeros_like(physical[-1]))
+
+                def factory(capacity, dofs, width, *, _lanes=lanes, **_kwargs):
+                    return sparse_kernel(
+                        capacity,
+                        dofs,
+                        width,
+                        active_rows=True,
+                        use_support_table=True,
+                        contact_triplets=True,
+                        velocity_limits=True,
+                        lanes_per_world=_lanes,
+                    )
+
+                with mock.patch.object(fixtures, "factory", factory):
+                    solve = fixtures.DeviceSolve(data, candidate=True)
+                self.assertTrue(solve.units)
+                self.assertIn("_active_support_table_contact_triplets_velocity_limits", solve.kernel.key)
+                solve.launch()
+                delta, impulses = solve.result()
+                expected_velocity, expected_impulses = velocity._physical_sweep(*physical, iterations=8, omega=0.4)
+                for world in (0, 2):
+                    actual = physical[2] + np.linalg.solve(factor.T, delta[world])
+                    np.testing.assert_allclose(actual, expected_velocity, atol=3e-5, rtol=3e-4)
+                    np.testing.assert_allclose(
+                        impulses[world, : len(expected_impulses)], expected_impulses, atol=3e-5, rtol=3e-4
+                    )
+                np.testing.assert_array_equal(delta[1], 0.0)
 
 
 if __name__ == "__main__":
