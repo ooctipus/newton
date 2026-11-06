@@ -1560,15 +1560,27 @@ ITERATION = "iter"
 """The sweep counter of :func:`level_loop`, as the exit law reads it (:func:`end_sweep`'s ``iteration``)."""
 
 
-def level_loop(phases: Sequence[str], last_word: Sequence[str] = (), *, exit: str) -> str:
-    """The iteration frame of every Gauss-Seidel sweep: per sweep, no change voted yet (``iteration_changed``), the
-    schedule's phases in order, the last word (the rows sorted last: velocity limits, the free bodies' speed rows),
-    then the exit law (``exit``: :func:`end_sweep` at :data:`ITERATION`), which ends the loop once a sweep is quiet."""
+def level_loop(
+    phases: Sequence[str],
+    last_word: Sequence[str] = (),
+    *,
+    exit: str,
+    iteration: str = ITERATION,
+    budget: str = "iterations",
+    resume: bool = False,
+    pad: str = "    ",
+) -> str:
+    """The iteration frame of every sweep: per sweep, no change voted yet (``iteration_changed``), the schedule's
+    phases in order, the last word (the rows sorted last: velocity limits, the free bodies' speed rows), then the exit
+    law (``exit``: :func:`end_sweep` at ``iteration``), which ends the loop once a sweep is quiet, or the ``budget``
+    of sweeps. With ``resume`` the counter is the caller's and the loop takes it up where it stopped: a Jacobi law's
+    epochs, each a run of sweeps of one metric (:func:`jacobi_sweeps`)."""
     body = "\n".join(text.rstrip("\n") for text in (*phases, *last_word) if text.strip())
+    start = "" if resume else f"int {iteration} = 0"
     return (
-        f"    for (int {ITERATION} = 0; {ITERATION} < iterations; ++{ITERATION}) {{\n"
-        "        int iteration_changed = 0;\n"
-        f"{body}\n{exit.rstrip(chr(10))}\n    }}"
+        f"{pad}for ({start}; {iteration} < {budget}; ++{iteration}) {{\n"
+        f"{pad}    int iteration_changed = 0;\n"
+        f"{body}\n{exit.rstrip(chr(10))}\n{pad}}}"
     )
 
 
@@ -2575,28 +2587,10 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
     hot = inner + "    "
     change = Change("x_new - x_from", "row_bound", "s_type[i]" if rows.types else "-1", "row_inv_step")
     block = rows.threads > 32
-    lines = [
-        rows.freeze(pad),
-        isotropic_friction_step(rows, pad),
-        # The lane's row: its residual at zero impulse, fixed through the sweeps, and its step size, set again when a
-        # row joins the steps' bound.
-        f"{pad}const float row_rhs = lane < {rows.rows} ? s_rhs[lane] : 0.0f;",
-        f"{pad}float row_step = lane < {rows.rows} ? s_step[lane] : 0.0f;",
-        f"{pad}float row_inv_step = row_step > 0.0f ? 1.0f / row_step : 0.0f;",
-        # The step's share of a Gauss-Seidel step (omega w_i): the bound's impulse term in the step's units.
-        f"{pad}float row_share = row_diag * row_step;",
-        weight,
-        f"{pad}float t_k = 1.0f;",
-        # The sweeps run in epochs of one metric: a row that joins the steps' bound ends its epoch after its sweep's
-        # vote (the flag it raised is read alike by every lane), and the join sets the next epoch's steps.
-        f"{pad}int sweep = 0;",
-        f"{pad}for (;;) {{",
-        f"{inner}for (; sweep < {sweeps}; ++sweep) {{",
-        op.gather(hot),
-        _jacobi_step(rows, op, laws, hot),
-        f"{hot}int iteration_changed = 0;",
-        _jacobi_projection(rows, pooled=pooled, pad=hot),
-        _jacobi_momentum(rows, pad=hot),
+    budget = str(int(sweeps))
+    # A sweep: every row's step from the extrapolated impulses, the blocks' projection and the momentum, then each
+    # row's store and vote.
+    vote = [
         f"{hot}{{",
         f"{hot}    const int i = lane;",
         f"{hot}    if (i < {rows.rows}) {{",
@@ -2609,15 +2603,38 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
         f"{hot}    }}",
         f"{hot}}}",
         f"{hot}SYNC();",
+    ]
+    phases = (
+        op.gather(hot),
+        _jacobi_step(rows, op, laws, hot),
+        _jacobi_projection(rows, pooled=pooled, pad=hot),
+        _jacobi_momentum(rows, pad=hot),
+        "\n".join(vote),
+    )
+    # The exit law; a row that joined the steps' bound ends its epoch after its sweep's vote (the flag it raised is
+    # read alike by every lane), and the join sets the next epoch's steps.
+    exit_ = (
         end_sweep(
-            policy,
-            iteration="sweep",
-            block=block,
-            iterations=str(int(sweeps)),
-            argmax="BLOCK_ARGMAX" if block else "ARGMAX",
-        ).rstrip("\n"),
-        f"{hot}if (s_joined[0]) {{ ++sweep; break; }}",
-        f"{inner}}}",
+            policy, iteration="sweep", block=block, iterations=budget, argmax="BLOCK_ARGMAX" if block else "ARGMAX"
+        ).rstrip("\n")
+        + f"\n{hot}if (s_joined[0]) {{ ++sweep; break; }}"
+    )
+    lines = [
+        rows.freeze(pad),
+        isotropic_friction_step(rows, pad),
+        # The lane's row: its residual at zero impulse, fixed through the sweeps, and its step size, set again when a
+        # row joins the steps' bound.
+        f"{pad}const float row_rhs = lane < {rows.rows} ? s_rhs[lane] : 0.0f;",
+        f"{pad}float row_step = lane < {rows.rows} ? s_step[lane] : 0.0f;",
+        f"{pad}float row_inv_step = row_step > 0.0f ? 1.0f / row_step : 0.0f;",
+        # The step's share of a Gauss-Seidel step (omega w_i): the bound's impulse term in the step's units.
+        f"{pad}float row_share = row_diag * row_step;",
+        weight,
+        f"{pad}float t_k = 1.0f;",
+        # The sweeps run in epochs of one metric (level_loop's resumed counter).
+        f"{pad}int sweep = 0;",
+        f"{pad}for (;;) {{",
+        level_loop(phases, exit=exit_, iteration="sweep", budget=budget, resume=True, pad=inner),
         f"{inner}if (sweep >= {sweeps} || !s_joined[0]) break;",
         _jacobi_join(rows, op, scale, inner),
         f"{pad}}}",
