@@ -475,24 +475,6 @@ def _push_prologue(response: Callable[[str, str], str], lanes: Lanes, dofs: int,
     ]
 
 
-def _push_velocity(out: str, row: Callable[[str], str], lanes: Lanes, dofs: int):
-    """Lines of ``float out = Z_i w`` and ``zz = |Z_i|^2`` over ``lanes``, in one ladder."""
-    return [
-        f"float {out} = 0.0f, zz = 0.0f;",
-        f"for (int d = {lanes.lane}; d < {dofs}; d += {lanes.width}) {{",
-        f"    const float row = {row('d')};",
-        f"    {out} += row * s_dv[d];",
-        "    zz += row * row;",
-        "}",
-        lanes.reduce(out, "zz"),
-    ]
-
-
-def _push_apply(delta: str, column: Callable[[str], str], lanes: Lanes, dofs: int):
-    """Lines of ``w += Y_i delta`` over ``lanes``."""
-    return [f"for (int d = {lanes.lane}; d < {dofs}; d += {lanes.width}) s_dv[d] += {column('d')} * {delta};"]
-
-
 @dataclass(frozen=True)
 class WalkedRows:
     """A world's rows in the walk's coordinates, built in the kernel: each row's seeds walked up its trees' root paths
@@ -609,13 +591,16 @@ class WalkedRows:
         ]
         return _lines(lines, indent)
 
-    def push_velocity(self, out: str, z: Callable[[str, str], str], lanes: Lanes, indent: str) -> str:
-        """``float out = Z_i w`` and ``zz = |Z_i|^2`` of the pushed row ``i`` over ``lanes``, in one ladder."""
-        return _lines(_push_velocity(out, lambda d: z("i", d), lanes, self.dofs), indent)
-
-    def push_diagonal(self) -> str:
-        """``A_ii = |Z_i|^2 + cfm`` (the rows' law's), from the squares :meth:`push_velocity` reduced."""
-        return "zz + cfm"
+    def operator(self, target: str, lanes: Lanes, velocity: Velocity) -> "SparseFactor":
+        """The staged rows as the operator's walked support class: row ``r``'s entry ``d`` at coordinate ``d``, its
+        value ``target[d * stride + r]`` (as :meth:`stage` wrote it), on the velocity ``velocity``."""
+        return SparseFactor(
+            self.dofs,
+            lambda row, entry: entry,
+            lambda row, entry: f"{target}[{entry} * {self.stride} + {row}]",
+            lanes,
+            velocity=velocity,
+        )
 
 
 @dataclass(frozen=True)
@@ -795,17 +780,10 @@ class TransposedResponse(ResponseOperator):
         """``w = Y^T x`` before the pushes of the last word."""
         return _lines(_push_prologue(self._yt, self.lanes, self.dofs, self.rows), indent)
 
-    def push_velocity(self, out: str, lanes: Lanes, indent: str) -> str:
-        """``float out = Z_i w`` and ``zz = |Z_i|^2`` over ``lanes``."""
-        return self.walked.push_velocity(out, self._yt, lanes, indent)
-
-    def push_apply(self, delta: str, lanes: Lanes, indent: str) -> str:
-        """``w += Y_i delta`` after a push of row ``i``."""
-        return _lines(_push_apply(delta, lambda d: self._yt("i", d), lanes, self.dofs), indent)
-
-    def push_diagonal(self) -> str:
-        """``A_ii`` of a pushed row, formed from its row."""
-        return self.walked.push_diagonal()
+    def staged(self, lanes: Lanes) -> "SparseFactor":
+        """The staged rows (``s_Yt``) on ``w`` (``s_dv``), the walked support class: the last word's row actions
+        (:func:`.sweep.jacobi_limit_pass`)."""
+        return self.walked.operator("s_Yt", lanes, Velocity("s_dv"))
 
 
 @dataclass(frozen=True)

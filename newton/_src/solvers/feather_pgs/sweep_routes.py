@@ -168,8 +168,6 @@ class FreeBodyCoordinates:
     (:data:`.factor.walk.FREE_BODY_WALK`, :func:`.factor.walk.walk_down_prelude`), compiled.
     """
 
-    op = FreeBodyZ()
-
     def _walked(self, first: str, call: str) -> str:
         """``call`` (a walk of :func:`.factor.walk.walk_down_prelude` on ``data`` and ``link``) on the tree whose first
         world coordinate is ``first``."""

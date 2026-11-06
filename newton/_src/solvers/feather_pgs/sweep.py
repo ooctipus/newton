@@ -2150,12 +2150,13 @@ def jacobi_limit_pass(rows: JacobiRows, op, *, pad: str = "    ") -> str:
     its limit, ``x_i += -r_i / A_ii`` (the row law's update from a zero impulse,
     :func:`.projection_laws.velocity_limit_update`, added to the row's total). The pass only pushes: it changes
     nothing at the sweeps' fixed point, where no row is violated, and gives the limits the last word of a world
-    stopped early, as the Gauss-Seidel sweeps' end pass does. The operator forms ``(A x)_i``
-    (:meth:`~.TransposedResponse.push_velocity`, on ``w = Y^T x`` where it keeps one, following each push).
+    stopped early, as the Gauss-Seidel sweeps' end pass does. The staged rows' walked support class forms
+    ``(A x)_i = Z_i . w`` on ``w = Y^T x`` (:meth:`~.TransposedResponse.push_prologue`) with ``A_ii = |Z_i|^2 + cfm``
+    in one ladder, and each push adds its change to ``w`` (:meth:`~.TransposedResponse.staged`).
     """
     if not rows.limits:
         raise ValueError("the last word pushes the velocity-limit rows the rows stage")
-    warp = Lanes(32)
+    pushed = op.staged(Lanes(32))
     body = "            "
     lines = [
         "{",
@@ -2164,14 +2165,14 @@ def jacobi_limit_pass(rows: JacobiRows, op, *, pad: str = "    ") -> str:
         "    if (lane < 32) {",
         f"        for (int i = 0; i < {rows.rows}; ++i) {{",
         f"            if (!{rows.clamps('i')} || s_vlim[i] == 0) continue;",
-        op.push_velocity("part", warp, body),
+        pushed.dot((("part", "row", None), ("zz", "row", "row")), {"row": "i"}, body),
         "            const float r_vlim = s_rhs[i] + part;",
-        f"            const float diag_vlim = {op.push_diagonal()};",
+        "            const float diag_vlim = zz + cfm;",
         "            const float delta_vlim = diag_vlim > 0.0f",
         "                ? ProjectionLaw::velocity_limit_update(0.0f, r_vlim / diag_vlim).v1 : 0.0f;",
         "            if (delta_vlim != 0.0f) {",
         "                if (lane == 0) s_x[i] += delta_vlim;",
-        op.push_apply("delta_vlim", warp, body + "    "),
+        pushed.axpy((("row", "delta_vlim"),), body + "    ", row="i"),
         "            }",
         "            WARP_SYNC();",
         "        }",
