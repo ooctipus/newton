@@ -671,7 +671,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         placement.prepare_impulses()
 
     def warm_start(step):
-        sweep.warm_start(step.contacts, step.dt)
+        sweep.warm_start(step.contacts)
 
     def seed_blocks(step):
         # The closure's seed: the one writer closed the bilateral blocks and corrected the other rows; the blocks'

@@ -9,13 +9,8 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import field_group
-from newton._src.solvers.feather_pgs.contact_input import ContactRoutes
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
-from newton._src.solvers.feather_pgs.row_records import MfRows
-from newton._src.solvers.feather_pgs.warm_start import gather_mf_warmstart
-from newton.tests.feather_pgs_law_harness import row_lines
-from newton.tests.test_feather_pgs_warmstart import carry_of, step_clock
+from newton.tests.test_feather_pgs_warmstart import gather_rows
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices
 
 
@@ -62,42 +57,18 @@ def test_warm_carry_kernel_scales_rows_exactly(test: unittest.TestCase, device):
         current_types = np.full((1, max_c), -1, dtype=np.int32)
         current_types[0, 2] = PGS_CONSTRAINT_TYPE_CONTACT
         current_types[0, 3:5] = PGS_CONSTRAINT_TYPE_FRICTION
-        current_parents = np.full((1, max_c), -1, dtype=np.int32)
-        current_parents[0, 3:5] = 2
 
-        impulses = wp.zeros((1, max_c), dtype=wp.float32)
-        wp.launch(
-            gather_mf_warmstart,
-            dim=1,
-            inputs=[
-                field_group.upload(
-                    ContactRoutes,
-                    device,
-                    count=[1],
-                    path=[1],  # matrix-free
-                    slot=[2],  # current base slot
-                    world=[0],
-                    normal=wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3),
-                ),
-                field_group.upload(
-                    MfRows,
-                    device,
-                    row_type=current_types,
-                    row_parent=current_parents,
-                    row_mu=wp.full((1, max_c), 100.0, dtype=wp.float32),
-                    first=row_lines(device),
-                ),
-                wp.array([0], dtype=wp.int32),  # current -> previous contact
-                carry_of(prev_impulses[0], prev_types[0], [4], device),  # the previous contact's rows from slot 4
-                wp.array([5], dtype=wp.int32),
-                0.75,
-                step_clock(4.0, device),
-            ],
-            outputs=[impulses],
+        carried = gather_rows(
+            prev_impulses=prev_impulses[0],
+            prev_types=prev_types[0],
+            prev_slots=[4],
+            current_types=current_types[0],
+            current_slots=[2],
+            match_indices=[0],
+            decay=0.75,
+            dt_scale=4.0,
             device=device,
         )
-
-        carried = impulses.numpy()[0]
         np.testing.assert_allclose(carried[2], 3.0 * prev_impulses[0, 4], rtol=0.0, atol=1.0e-6)
         np.testing.assert_array_equal(carried[[0, 1, 3, 4, 5, 6, 7]], np.zeros(7, dtype=np.float32))
 

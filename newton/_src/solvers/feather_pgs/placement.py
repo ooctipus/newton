@@ -749,8 +749,8 @@ class Placement:
     def begin(self):
         """Clear the rows' allocation state before the row pass writes them."""
         # One launch clears the world-level allocation state and, with free rigid bodies, the free bodies'
-        # counters and impulses (PGS reads their impulses before its first write; the warm-start seed pass
-        # re-gathers after the free bodies' writer). Other row buffers are fully overwritten by their producers.
+        # counters and impulses (PGS reads their impulses before its first write; the warm start's gather seeds
+        # their normals after the row pass). Other row buffers are fully overwritten by their producers.
         mf_active = self.forest.has_free_rigid_bodies
         wp.launch(
             _clear_dense_row_state,

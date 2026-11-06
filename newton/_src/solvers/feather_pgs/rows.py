@@ -38,7 +38,6 @@ from . import field_group, host_index, prefix_rows, walk_rows
 from .configuration import Options
 from .contact_input import ContactInput
 from .contact_input import bind as bind_contact_input
-from .contact_input import bind_routes as bind_contact_routes
 from .device_preludes import lane_group
 from .factor.fields import Preelim
 from .field_group import Field, FieldGroup, SolverArrays
@@ -62,9 +61,7 @@ from .row_kernels import (
 from .row_laws import LINK_ROWS, ROW_LAW
 from .row_records import UNIT_LIMIT, UNIT_MIMIC, UNIT_SHIFT, UNIT_VELOCITY, RowSupport
 from .row_records import bind as bind_dense_rows
-from .row_records import bind_mf as bind_mf_rows
 from .row_slots import allocate_world_contact_slots, finalize_constraint_counts_with_status, snapshot_dense_phase_bound
-from .warm_start import bind_carry, gather_mf_warmstart
 
 VELOCITY_LIMIT_SLOTS = FieldGroup(
     Field("velocity_limit_slot", wp.int32, ("limit_row",), fill=-1, owner="laws"),
@@ -910,11 +907,9 @@ class RowLaws:
     def write_free_bodies(self, solver, state_in: State, contacts: Contacts | None, dt: float) -> None:
         """The free bodies' rows, once their families' slots are reserved (staged with free bodies): one writer over
         their contacts' rows and their speed rows (:func:`.walk_rows.write_free_body_rows`), on its threads at its own
-        line (:data:`.walk_rows.WRITERS`); their counts finalized with status; then the warm start's seed of their
-        contact normals, which reads the rows' types."""
+        line (:data:`.walk_rows.WRITERS`); their counts finalized with status."""
         placement, model = solver.placement, solver.model
-        contact_rows = _holds_contact_rows(contacts)
-        if contact_rows:
+        if _holds_contact_rows(contacts):
             data = bind_contact_input(solver, state_in, solver.factor, contacts, dt, 1.0)
             rows = placement.contact_pool.launch_rows()
         else:
@@ -942,36 +937,6 @@ class RowLaws:
             device=model.device,
         )
         self._finalize(solver, 1)
-
-        # The warm start's seed: the matched contacts' previous normal impulses gathered into their current slots by
-        # identity (the impulses were zeroed for the step; the carry is the contacts', :data:`.warm_start.ContactCarry`).
-        # It reads this step's contact slots and the rows' types the writer wrote.
-        if contact_rows and solver.options.pgs_warmstart:
-            match_index = getattr(contacts, "rigid_contact_match_index", None)
-            if match_index is None:
-                raise NotImplementedError(
-                    "FeatherPGS mf_warmstart=True requires the Contacts buffer to be "
-                    "created with contact_matching enabled (rigid_contact_match_index "
-                    "is None). Build the CollisionPipeline / Contacts with "
-                    'contact_matching="latest" (or "sticky").'
-                )
-            placement.contact_pool.launch(
-                gather_mf_warmstart,
-                rows,
-                inputs=[
-                    bind_contact_routes(placement, contacts),
-                    bind_mf_rows(placement),
-                    match_index,
-                    bind_carry(placement),
-                    placement.mf_constraint_count,
-                    solver.options.pgs_warmstart_decay,
-                    # Carried support impulses are proportional to dt: the step clock rescales them.
-                    solver.factor.clock,
-                ],
-                outputs=[placement.impulses],
-                extent=contacts.rigid_contact_count,
-                max_blocks=placement.contact_capacity_blocks,
-            )
 
     def _finalize(self, solver, family: int) -> None:
         """Finalize a row class's counts with status (0: the dense rows, 1: the free bodies')."""

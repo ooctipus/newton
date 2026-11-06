@@ -48,7 +48,6 @@ from .forest_plan import row_support
 from .friction_patches import patch_routes
 from .kernel_template import SweepTier
 from .route_table import capable
-from .row_records import bind as bind_dense_rows
 from .solve_policy import SolvePolicy, SolveReadoutRecord
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport, row_supports
@@ -66,7 +65,7 @@ from .warm_start import (
     bind_carry,
     carry_contacts,
     forget_carried_contacts,
-    gather_dense_warmstart,
+    gather_carried_normals,
     reset_world_impulses,
 )
 
@@ -1199,27 +1198,30 @@ class Sweep:
                 device=model.device,
             )
 
-    def warm_start(self, contacts, dt: float) -> None:
-        """Gather the dense rows' normal impulses of the previous step by contact identity (:mod:`.warm_start`)."""
-        if self.options.pgs_warmstart and contacts is not None:
-            match_index = contacts.rigid_contact_match_index
-            pool = self.placement.contact_pool
-            pool.launch(
-                gather_dense_warmstart,
-                pool.launch_rows(),
-                inputs=[
-                    bind_contact_routes(self.placement, contacts),
-                    bind_dense_rows(self.placement),
-                    match_index,
-                    bind_carry(self.placement),
-                    self.placement.constraint_count,
-                    self.options.pgs_warmstart_decay,
-                    self.factor.clock,
-                ],
-                outputs=[self.placement.impulses],
-                extent=contacts.rigid_contact_count,
-                max_blocks=self.placement.contact_capacity_blocks,
-            )
+    def warm_start(self, contacts) -> None:
+        """Gather the previous step's normal impulses by contact identity into both row classes' normal rows, one launch
+        over the contacts (:func:`.warm_start.gather_carried_normals`)."""
+        if contacts is None:
+            return
+        placement = self.placement
+        pool = placement.contact_pool
+        pool.launch(
+            gather_carried_normals,
+            pool.launch_rows(),
+            inputs=[
+                bind_contact_routes(placement, contacts),
+                contacts.rigid_contact_match_index,
+                bind_carry(placement),
+                placement.dense_first,
+                placement.row_type,
+                self.options.pgs_warmstart_decay,
+                # Carried support impulses are proportional to dt: the step clock rescales them.
+                self.factor.clock,
+            ],
+            outputs=[placement.impulses],
+            extent=contacts.rigid_contact_count,
+            max_blocks=placement.contact_capacity_blocks,
+        )
 
     def _operands(self, v_hat: wp.array, v_out: wp.array) -> dict:
         """The step's sweep operands by parameter name, which every sweep kernel takes from (:meth:`_launch`). A row

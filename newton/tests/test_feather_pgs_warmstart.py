@@ -15,12 +15,10 @@ from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.contact_input import ContactRoutes
 from newton._src.solvers.feather_pgs.factor.kernels import Clock
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
-from newton._src.solvers.feather_pgs.row_records import DenseRows, MfRows
 from newton._src.solvers.feather_pgs.warm_start import (
     ContactCarry,
     carry_contacts,
-    gather_dense_warmstart,
-    gather_mf_warmstart,
+    gather_carried_normals,
     prepare_world_impulses,
 )
 from newton.tests.feather_pgs_law_harness import row_lines
@@ -129,52 +127,43 @@ def carry_of(prev_impulses, prev_types, prev_slots, device="cpu", normal=(0.0, 0
     return carry
 
 
-def _gather_dense_rows(
+def gather_rows(
     *,
     prev_impulses,
     prev_types,
     prev_slots,
     current_types,
-    current_parents,
     current_slots,
     match_indices,
-    count,
     decay=1.0,
     dt_scale=1.0,
+    device="cpu",
 ):
-    """Launch the dense identity gather on CPU and return its row buffer."""
-    max_c = len(current_types)
+    """Carry a step's contacts (:func:`carry_of`), then launch the one identity gather over the next step's contacts,
+    at ``current_slots`` of world 0's line (either row class: one row index), and return the line it seeded."""
     n = len(current_slots)
-    impulses = wp.zeros((1, max_c), dtype=wp.float32, device="cpu")
+    impulses = wp.zeros((1, len(current_types)), dtype=wp.float32, device=device)
     wp.launch(
-        gather_dense_warmstart,
+        gather_carried_normals,
         dim=n,
         inputs=[
             field_group.upload(
                 ContactRoutes,
-                "cpu",
+                device,
                 count=[n],
-                path=[0] * n,
                 slot=current_slots,
                 world=[0] * n,
-                normal=wp.array([[0.0, 0.0, 1.0]] * n, dtype=wp.vec3, device="cpu"),
+                normal=wp.array([[0.0, 0.0, 1.0]] * n, dtype=wp.vec3, device=device),
             ),
-            field_group.upload(
-                DenseRows,
-                "cpu",
-                row_type=[current_types],
-                row_parent=[current_parents],
-                row_mu=wp.full((1, max_c), 100.0, dtype=wp.float32, device="cpu"),
-                first=row_lines("cpu"),
-            ),
-            wp.array(match_indices, dtype=wp.int32, device="cpu"),
-            carry_of(prev_impulses, prev_types, prev_slots),
-            wp.array([count], dtype=wp.int32, device="cpu"),
+            wp.array(match_indices, dtype=wp.int32, device=device),
+            carry_of(prev_impulses, prev_types, prev_slots, device),
+            row_lines(device),
+            wp.array([current_types], dtype=wp.int32, device=device),
             decay,
-            step_clock(dt_scale, "cpu"),
+            step_clock(dt_scale, device),
         ],
         outputs=[impulses],
-        device="cpu",
+        device=device,
     )
     return impulses.numpy()[0]
 
@@ -200,122 +189,57 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
     def test_only_normals_carry(self):
         """The gather seeds each matched contact's normal row; every friction row starts cold, also where the contact
         held the same pair last step, and no neighbour's tangent lands in another contact's span."""
-        c, f, dead = PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, -1
+        c, f = PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 
         # Both contacts keep their spans (3 rows each): the normals carry, the pairs do not.
-        got = _gather_dense_rows(
+        got = gather_rows(
             prev_impulses=[11.0, 22.0, 33.0, 55.0, 66.0, 77.0],
             prev_types=[c, f, f, c, f, f],
             prev_slots=[0, 3],
             current_types=[c, f, f, c, f, f],
-            current_parents=[dead, 0, 0, dead, 3, 3],
             current_slots=[0, 3],
             match_indices=[0, 1],
-            count=6,
         )
         np.testing.assert_array_equal(got, np.array([11.0, 0.0, 0.0, 55.0, 0.0, 0.0], dtype=np.float32))
 
         # A: 3 -> 1 rows, B: 1 -> 3 rows. A's previous second tangent lands at
         # B's current first tangent by raw offset and must not be written there.
-        got = _gather_dense_rows(
+        got = gather_rows(
             prev_impulses=[11.0, 22.0, 33.0, 55.0],
             prev_types=[c, f, f, c],
             prev_slots=[0, 3],
             current_types=[c, c, f, f],
-            current_parents=[dead, dead, 1, 1],
             current_slots=[0, 1],
             match_indices=[0, 1],
-            count=4,
         )
         np.testing.assert_array_equal(got, np.array([11.0, 55.0, 0.0, 0.0], dtype=np.float32))
 
         # A: 1 -> 3 rows, B: 3 -> 1 rows. A's second destination tangent
         # overlaps B's previous first tangent and must stay cold.
-        got = _gather_dense_rows(
+        got = gather_rows(
             prev_impulses=[11.0, 55.0, 66.0, 77.0],
             prev_types=[c, c, f, f],
             prev_slots=[0, 1],
             current_types=[c, f, f, c],
-            current_parents=[dead, 0, 0, dead],
             current_slots=[0, 3],
             match_indices=[0, 1],
-            count=4,
         )
         np.testing.assert_array_equal(got, np.array([11.0, 0.0, 0.0, 55.0], dtype=np.float32))
 
     def test_slot_churn_uses_identity_and_scales_dt(self):
         """Contact-order and slot churn follows match identity, not row index."""
         c, dead = PGS_CONSTRAINT_TYPE_CONTACT, -1
-        got = _gather_dense_rows(
+        got = gather_rows(
             prev_impulses=[55.0, 0.0, 0.0, 0.0, 11.0],
             prev_types=[c, dead, dead, dead, c],
             prev_slots=[4, 0],  # previous sorted contacts A, B
             current_types=[dead, c, dead, dead, c],
-            current_parents=[dead] * 5,
             current_slots=[1, 4],  # current sorted contacts B, A
             match_indices=[1, 0],
-            count=5,
             decay=0.5,
             dt_scale=4.0,
         )
         np.testing.assert_array_equal(got, np.array([0.0, 110.0, 0.0, 0.0, 22.0], dtype=np.float32))
-
-    def test_mf_gather_carries_only_normals(self):
-        """The matrix-free mirror: the normals carry, and A's old tangent never reaches B's new span."""
-        c, f, dead = PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, -1
-        current_types = wp.array([[c, c, f, f]], dtype=wp.int32, device="cpu")
-        current_parents = wp.array([[dead, dead, 1, 1]], dtype=wp.int32, device="cpu")
-        contact_count = wp.array([2], dtype=wp.int32, device="cpu")
-        contact_slots = wp.array([0, 1], dtype=wp.int32, device="cpu")
-        contact_world = wp.array([0, 0], dtype=wp.int32, device="cpu")
-        match_indices = wp.array([0, 1], dtype=wp.int32, device="cpu")
-        constraint_count = wp.array([4], dtype=wp.int32, device="cpu")
-
-        mf_impulses = wp.zeros((1, 4), dtype=wp.float32, device="cpu")
-        wp.launch(
-            gather_mf_warmstart,
-            dim=2,
-            inputs=[
-                field_group.upload(
-                    ContactRoutes,
-                    "cpu",
-                    count=contact_count,
-                    path=[1, 1],
-                    slot=contact_slots,
-                    world=contact_world,
-                    normal=wp.array([[0.0, 0.0, 1.0]] * 2, dtype=wp.vec3, device="cpu"),
-                ),
-                field_group.upload(
-                    MfRows,
-                    "cpu",
-                    row_type=current_types,
-                    row_parent=current_parents,
-                    row_mu=wp.full((1, 4), 100.0, dtype=wp.float32, device="cpu"),
-                    first=row_lines("cpu"),
-                ),
-                match_indices,
-                carry_of([11.0, 22.0, 33.0, 55.0], [c, f, f, c], [0, 3]),
-                constraint_count,
-                1.0,
-                step_clock(1.0, "cpu"),
-            ],
-            outputs=[mf_impulses],
-            device="cpu",
-        )
-        np.testing.assert_array_equal(mf_impulses.numpy()[0], np.array([11.0, 55.0, 0.0, 0.0], dtype=np.float32))
-
-    def test_current_slot_is_bounded_by_constraint_count(self):
-        got = _gather_dense_rows(
-            prev_impulses=[9.0, 0.0, 0.0, 0.0, 0.0],
-            prev_types=[PGS_CONSTRAINT_TYPE_CONTACT, -1, -1, -1, -1],
-            prev_slots=[0],
-            current_types=[-1, -1, -1, -1, PGS_CONSTRAINT_TYPE_CONTACT],
-            current_parents=[-1] * 5,
-            current_slots=[4],
-            match_indices=[0],
-            count=4,
-        )
-        np.testing.assert_array_equal(got, np.zeros(5, dtype=np.float32))
 
     def test_constructor_layout_and_decay_validation(self):
         parameters = tuple(inspect.signature(newton.solvers.SolverFeatherPGS).parameters)
