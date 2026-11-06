@@ -1708,6 +1708,19 @@ def cuda_groups() -> list:
                 ),
             ),
         ),
+        # Native sparse factors take mimic rows in every composition (the support writer walks a mimic's two
+        # covectors as any joint row's), and velocity-limit rows beside a kinematic root, whose coordinates the
+        # row laws give no row (case K1).
+        Group(
+            _physics(scenes.legged(mimic=True), "patch", 32, "mimic"),
+            ref,
+            (SPARSE.but("sparse_mimic"),),
+        ),
+        Group(
+            _physics(scenes.legged(kinematic_base=True), "patch", 32, "velocity_limits", **vlimits),
+            ref,
+            (SPARSE.but("sparse_kinematic_velocity_limits", expect={"sparse_mass_matrix.velocity_limits": True}),),
+        ),
         # Bilateral pre-elimination on the cases the one writer writes: the paired factor sweep (case K5) and the
         # Jacobi tiers on its rows (case K4), from the closed blocks' seed.
         Group(

@@ -831,7 +831,14 @@ def pushed_arm(*, velocity_limit: float = 1.0, torque: float = 2.0) -> Scene:
 
 
 def legged(
-    *, knees: bool = True, legs: int = 4, mu: float = 0.8, worlds: int = 2, contact_matching: str | None = None
+    *,
+    knees: bool = True,
+    legs: int = 4,
+    mu: float = 0.8,
+    worlds: int = 2,
+    contact_matching: str | None = None,
+    mimic: bool = False,
+    kinematic_base: bool = False,
 ) -> Scene:
     """A free-floating 4 kg base standing on ``legs`` legs with sphere feet, joints held by PD drives.
 
@@ -839,6 +846,8 @@ def legged(
     crouched at hip 0.5 and knee -1.0 rad; without, a straight hip-only leg
     (10 coordinates). Only the base and the feet carry shapes, and feet start
     5 mm above the ground. World ``w`` targets a hip 0.05 ``w`` rad straighter.
+    With ``mimic`` the last leg's hip follows the first's (a mimic row in the tree); with ``kinematic_base`` the base
+    is kinematic (six prescribed coordinates at the tree's root), held where it starts while the legs reach down.
     """
     hip_sites = ((0.15, 0.1), (0.15, -0.1), (-0.15, 0.1), (-0.15, -0.1))[:legs]
     hip, knee = (0.5, -1.0) if knees else (0.0, 0.0)
@@ -881,13 +890,21 @@ def legged(
     def build(device):
         template = _builder()
         base = template.add_link(
-            xform=wp.transform(wp.vec3(0.0, 0.0, base_z)), mass=4.0, inertia=_box_inertia(4.0, 0.2, 0.12, 0.05)
+            xform=wp.transform(wp.vec3(0.0, 0.0, base_z)),
+            mass=4.0,
+            inertia=_box_inertia(4.0, 0.2, 0.12, 0.05),
+            is_kinematic=kinematic_base,
         )
         template.add_shape_box(base, hx=0.2, hy=0.12, hz=0.05, cfg=_cfg(mu=mu, density=0.0, group=SELF))
         joints = [template.add_joint_free(base)]
         for site in hip_sites:
             joints.extend(add_leg(template, base, site))
         template.add_articulation(joints)
+        if mimic:
+            per_leg = 2 if knees else 1
+            template.add_constraint_mimic(
+                joint0=joints[1 + per_leg * (legs - 1)], joint1=joints[1], coef0=0.0, coef1=1.0
+            )
         coordinates = np.array(template.joint_q, dtype=np.float64)
         pose = [hip, knee] if knees else [hip]
         for leg in range(legs):
@@ -913,6 +930,8 @@ def legged(
             _set_targets(model, control, targets)
 
     name = "legged" if knees else "legged_straight"
+    name += "_mimic" if mimic else ""
+    name += "_kinematic_base" if kinematic_base else ""
     if contact_matching is not None:
         name = f"{name}_{contact_matching}"
     return Scene(

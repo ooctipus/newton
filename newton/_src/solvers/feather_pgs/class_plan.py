@@ -404,10 +404,6 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
                 "Bilateral pre-elimination closes its blocks in the one writer's block phase; the support writer has "
                 "none.",
             ),
-            (
-                not laws.mimic_count or velocity_candidate,
-                "Mimic rows require the sparse velocity-row composition.",
-            ),
         )
     )
     if declined is not None:
@@ -420,8 +416,6 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
         # sweep and keeps the resolved-world classifier. Native sparse factors never serve free rigid bodies.
         return None, "Worlds with free rigid bodies keep the dense route for the held-tree owner and paired response."
     response_dofs = forest.response_dof_count
-    if velocity_candidate and (forest.has_prescribed_response or np.any(factor.kinematic_dof_mask_host)):
-        return None, "Sparse velocity rows do not support prescribed-coordinate topology."
     free_rigid = forest.is_free_rigid_host != 0
     articulated = np.flatnonzero((response_dofs > 0) & ~free_rigid)
     sizes = np.unique(response_dofs[articulated])
@@ -447,7 +441,7 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     if plan.dof_count != size or (not velocity_candidate and plan.nonzero_count >= size * (size + 1) // 2):
         return None, "Topology has no usable sparse factor layout for this row policy."
     # Native sparse factors are the held tree's representation: a candidate only where it takes their group.
-    held = held_tree.sparse_decline(inputs, size, plan, velocity_limits=velocity_candidate)
+    held = held_tree.sparse_decline(inputs, size, plan)
     if held is not None:
         return None, f"Only the held tree evaluates native sparse factors. {held}"
 

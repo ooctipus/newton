@@ -84,24 +84,19 @@ def _diagonal_geometry(
     inverse[dof] = 1.0 / mass
 
 
-def decline(forest, laws, factor, *, sparse: bool | None) -> str | None:
+def decline(forest, factor, *, sparse: bool) -> str | None:
     """Why the held tree does not evaluate a representation of the dynamics of ``forest``, or ``None`` when it does.
 
-    The terms of the representation: the native sparse factor's group (``sparse``: whether it carries velocity-limit
-    rows, ``None`` for the dense groups), with the row ``laws``, then the drive rows every dense group reads (the
-    ``factor``'s drive plan). A term is read only once the earlier ones hold.
+    The terms of the representation: the native sparse factor's group (``sparse``), then the drive rows every dense
+    group reads (the ``factor``'s drive plan). A term is read only once the earlier ones hold. The owner evaluates
+    dynamics, not rows: the row laws (mimic rows, velocity limits) are the writers' and the sweeps'.
     """
     # The owner holds no rows, impulses or patch frames: the patch build, link, seed and finish stay on the solver
     # pipeline around it, so it serves every contact law. Torsion rows read the joint motions and body twists every
     # group publishes (joint_S_s, body_v_s); compliance reads no dynamics.
-    if sparse is not None:
-        velocity_limits = sparse
+    if sparse:
         if forest.has_free_rigid_bodies:
             return "The sparse factor's group holds no free rigid bodies."
-        if laws.mimic_count and not (
-            velocity_limits and laws.mimic_valid_np is not None and np.all(laws.mimic_valid_np)
-        ):
-            return "Mimic rows on the sparse factor need its velocity-limit rows and valid mimic pairs."
         if forest.has_prescribed_response:
             return "The sparse factor's group holds no prescribed articulations."
     if not factor.parallel_drives and forest.size_groups:
@@ -193,14 +188,14 @@ def _prescribed_trees(model, forest):
     return group_to_art, _fit(model, forest, group_to_art, TreePlan.build([-1], [6]).factor, prescribed=True)
 
 
-def sparse_decline(inputs, size, plan, *, velocity_limits) -> str | None:
+def sparse_decline(inputs, size, plan) -> str | None:
     """Why the held tree would not take a native sparse factor of ``size`` coordinates and pattern ``plan``, or
     ``None``: :func:`decline` of the candidate, then its one complete group's fit.
 
     Only the held tree evaluates native sparse factors, so their rule (:func:`.class_plan.packed_rule`) reads this,
     with the class's ``inputs`` (:class:`.class_plan.ClassInputs`), before choosing one.
     """
-    reason = decline(inputs.forest, inputs.laws, inputs.factor, sparse=velocity_limits)
+    reason = decline(inputs.forest, inputs.factor, sparse=True)
     if reason is not None:
         return reason
     try:
@@ -219,7 +214,7 @@ def compact_decline(inputs, size, *, scalar) -> str | None:
     reads this, with the class's ``inputs`` (:class:`.class_plan.ClassInputs`), before choosing one.
     """
     model, forest = inputs.model, inputs.forest
-    reason = decline(forest, inputs.laws, inputs.factor, sparse=None)
+    reason = decline(forest, inputs.factor, sparse=False)
     if reason is not None:
         return reason
     try:
@@ -376,7 +371,7 @@ def forest_default(solver):
 
 def forest_families(solver):
     """The per-root family sizes of the forest (0 for a prescribed root), or ``None``."""
-    if decline(solver.forest, solver.laws, solver.factor, sparse=None) is not None:
+    if decline(solver.forest, solver.factor, sparse=False) is not None:
         return None
     if getattr(solver, "_scalar_branches", None) is not None:
         # Scalar branches own their size group outside any tree plan.
@@ -625,10 +620,7 @@ def install(solver) -> HeldTree:
     The native sparse factor and the compact diagonal are the held tree's representations: they are chosen only
     where :func:`sparse_decline` and :func:`compact_decline` admit them.
     """
-    packed = solver.spec.classes.packed
-    reason = decline(
-        solver.forest, solver.laws, solver.factor, sparse=None if packed is None else packed.velocity_limits
-    )
+    reason = decline(solver.forest, solver.factor, sparse=solver.spec.classes.packed is not None)
     if reason is not None:
         raise ValueError(f"FeatherPGS cannot hold this model: {reason}")
     try:
