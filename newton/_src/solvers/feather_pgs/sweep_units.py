@@ -42,7 +42,7 @@ import numpy as np
 import warp as wp
 
 from ...core.memory import STATIC_SHARED_BYTES, Buffer, Staging, static_budget
-from . import kernel_template
+from . import kernel_template, sweep_levels
 from .device_preludes import SHARED_STORAGE, cuda_native, lane_group
 from .field_group import Field, FieldGroup
 from .kernel_template import KernelTemplate
@@ -420,87 +420,20 @@ SHARED_DECLARATIONS
         return used_prefix[dof >> 5] + __popc(used_bits[dof >> 5] & ((1u << (dof & 31)) - 1u));
     };
 
-    // Levels in row order, by the first warp, a batch of 32 units at a time. A unit's color is one past the latest
-    // color of its bodies, so units on a body keep their row order. In each round every pending unit claims its
-    // bodies (the lowest lane wins); a unit that owns both commits its color: no earlier pending unit shares a body
-    // with it, so it sees every earlier unit's color, exactly as a pass in row order would. After its round each
-    // unit takes its rank in its color: the color's units of earlier rounds (color_offset counts them) and the
-    // round's units of the color below it.
+    // Levels in row order (the level builder's pass): a unit's color is one past the latest color of its bodies, so
+    // units on a body keep their row order. The counts of colors [0, units] start at zero; a unit's rank is its
+    // place among its color's units in row order.
     if (warp == 0) {
-        int colors = 0;
-        for (int base = 0; base < units; base += 32) {
-            const int unit = base + lane;
-            const bool valid = unit < units;
-            const int dofs = valid ? unit_dofs.data[off_mf + unit] : 0;
-            const int dof_a = valid ? dofs >> 16 : -1;
-            int dof_b = valid ? (dofs << 16) >> 16 : -1;
-            if (dof_b == dof_a) dof_b = -1;
-            const int node_a = dof_a >= 0 ? NODE(dof_a) : -1;
-            const int node_b = dof_b >= 0 ? NODE(dof_b) : -1;
-            unsigned pending = BALLOT(valid);
-            int color = -1;
-            while (pending != 0u) {
-                const bool mine = ((pending >> lane) & 1u) != 0u;
-                if (mine) {
-                    if (node_a >= 0) atomicMin(&node_owner[node_a], lane);
-                    if (node_b >= 0) atomicMin(&node_owner[node_b], lane);
-                }
-                SYNC();
-                const bool ready = mine && (node_a < 0 || node_owner[node_a] == lane)
-                    && (node_b < 0 || node_owner[node_b] == lane);
-                if (ready) {
-                    color = 0;
-                    if (node_a >= 0) color = max(color, node_level[node_a] + 1);
-                    if (node_b >= 0) color = max(color, node_level[node_b] + 1);
-                    if (node_a >= 0) node_level[node_a] = color;
-                    if (node_b >= 0) node_level[node_b] = color;
-                }
-                SYNC();
-                if (mine) {
-                    if (node_a >= 0) node_owner[node_a] = 32;
-                    if (node_b >= 0) node_owner[node_b] = 32;
-                }
-                SYNC();
-                pending &= ~BALLOT(ready);
-            }
-            const unsigned same = __match_any_sync(0xffffffffu, color);
-            const int below = __popc(same & ((1u << lane) - 1u));
-            const int earlier = valid ? color_offset.data[off_color + color] : 0;
-            SYNC();
-            if (valid && below == 0) color_offset.data[off_color + color] = earlier + __popc(same);
-            SYNC();
-            if (valid) {
-                unit_color.data[off_mf + unit] = color;
-                unit_rank.data[off_mf + unit] = earlier + below;
-            }
-            colors = max(colors, color + 1);
-        }
-        MAXIMUM(colors);
+LEVEL_PASS
         if (lane == 0) {
-            color_count.data[world] = colors;
-            colors_s[0] = colors;
+            color_count.data[world] = levels;
+            colors_s[0] = levels;
         }
     }
     __syncthreads();
-    // Color offsets: an exclusive scan of the counts, in place, a block of colors at a time; offset `colors` is the
-    // unit count.
+    // Color offsets: an exclusive scan of the counts, in place; offset `colors` is the unit count.
     const int colors = colors_s[0];
-    int carry = 0;
-    for (int base = 0; base <= colors; base += THREADS) {
-        const int c = base + tid;
-        const int count = c < colors ? color_offset.data[off_color + c] : 0;
-        const int below = SCAN(count);
-        if (lane == 31) warp_count[warp] = below + count;
-        __syncthreads();
-        int before = carry, total = 0;
-        for (int w = 0; w < WARPS; ++w) {
-            if (w < warp) before += warp_count[w];
-            total += warp_count[w];
-        }
-        if (c <= colors) color_offset.data[off_color + c] = before + below;
-        carry += total;
-        __syncthreads();
-    }
+LEVEL_OFFSETS
     // Each color's units in row order: a unit's position is its color's offset plus its rank.
     for (int unit = tid; unit < units; unit += THREADS) {
         const int color = unit_color.data[off_mf + unit];
@@ -518,6 +451,23 @@ SHARED_DECLARATIONS
     }
 #endif
 """
+
+
+_UNIT_RESOURCES = """            const int dofs = valid ? unit_dofs.data[off_mf + unit] : 0;
+            const int dof_a = valid ? dofs >> 16 : -1;
+            int dof_b = valid ? (dofs << 16) >> 16 : -1;
+            if (dof_b == dof_a) dof_b = -1;
+            const int node_a = dof_a >= 0 ? NODE(dof_a) : -1;
+            const int node_b = dof_b >= 0 ? NODE(dof_b) : -1;"""
+"""A unit's resources: its bodies, by the compact ids of their first coordinates."""
+
+_LEVEL_PASS = sweep_levels.level_pass(
+    units="units",
+    resources=_UNIT_RESOURCES,
+    counts="color_offset.data[off_color + {}]",
+    store="unit_color.data[off_mf + unit] = level;\n                unit_rank.data[off_mf + unit] = rank;",
+)
+_LEVEL_OFFSETS = sweep_levels.level_offsets(levels="colors", counts="color_offset.data[off_color + {}]")
 
 
 @cache
@@ -582,7 +532,10 @@ def build_units_kernel(
         f"#define THREADS {32 * BUILD_WARPS}\n#define NODES {dofs // 6 + 1}\n#define WORDS {words}\n"
         f"#define CONTACT {int(PGS_CONSTRAINT_TYPE_CONTACT)}\n#define FRICTION {int(PGS_CONSTRAINT_TYPE_FRICTION)}\n"
         f"#define PARENT(PACKED_WORD) ({parent})\n"
-        + body.replace("SHARED_DECLARATIONS", staging.declarations()).replace(
+        + body.replace("SHARED_DECLARATIONS", staging.declarations())
+        .replace("LEVEL_PASS", _LEVEL_PASS)
+        .replace("LEVEL_OFFSETS", _LEVEL_OFFSETS)
+        .replace(
             "#endif",
             "#undef MF_ROWS\n#undef UNITS\n#undef MIN_UNITS\n#undef COLORED\n#undef WARPS\n#undef THREADS\n#undef NODES\n"
             "#undef WORDS\n"

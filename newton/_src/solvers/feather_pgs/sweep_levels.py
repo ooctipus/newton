@@ -13,9 +13,9 @@ invariants:
 - the *components* of the conflict graph, a *chain* where each unit holds one resource (case K2's scalar contacts on
   a coordinate no coupled contact holds; the tiers' worlds, which share nothing).
 
-A schedule runs components side by side and a component's levels in order, so it is the row order's trace. The work
-lists are queues (:class:`~newton._src.core.execution.Queue`); :func:`list_worlds` buckets the Jacobi tiers'
-worlds.
+A schedule runs components side by side and a component's levels in order, so it is the row order's trace.
+:func:`level_pass` levels a world's units and :func:`level_offsets` places each level's units; the work lists are
+queues (:class:`~newton._src.core.execution.Queue`): :func:`list_worlds` buckets the Jacobi tiers' worlds.
 
 Case K2 (the sparse diagonal): the row pass marks the contacts confined to one coordinate of the diagonal articulation,
 and the builder links them into chains per coordinate and lists the rest in row order, which the sweep reads.
@@ -31,6 +31,96 @@ from .contact_input import ContactInput
 from .device_preludes import lane_group
 from .kernel_template import KernelTemplate, items, python_kernel
 from .row_kernels import PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
+
+
+def level_pass(*, units: str, resources: str, counts: str, store: str) -> str:
+    """Return CUDA source that levels a world's ``units`` units in row order (Cartier-Foata), by one warp, a batch of
+    32 at a time.
+
+    A unit's ``level`` is one past the latest level of an earlier unit on either of its resources, so units that share
+    one keep their row order and a level's units share none. In each round every pending unit of the batch claims its
+    resources (the lowest lane wins), and a unit that owns both commits its level: no earlier pending unit shares a
+    resource with it, so it sees every earlier unit's level, as a pass in row order would. After its batch a unit takes
+    its ``rank``, its place among its level's units in row order: the level's units of earlier batches and the batch's
+    units of the level on lower lanes.
+
+    ``resources`` declares, for lane's ``unit`` (``valid`` when it is below ``units``), its resources ``node_a`` and
+    ``node_b``: compact ids into the warp's shared ``node_owner`` (32 at the start) and ``node_level`` (-1), or -1 for
+    none. ``counts`` formats an index into the units of each level so far: zero at the start for levels ``[0,
+    units]``, and the batch's counts added. ``store`` keeps a valid unit's ``level`` and ``rank``. The fragment runs on
+    every lane of the warp, uses the lane group, ``lane`` and the names ``resources`` and ``store`` read, and declares
+    ``levels``, the world's level count, on every lane.
+    """
+    return f"""        int levels = 0;
+        for (int base = 0; base < {units}; base += 32) {{
+            const int unit = base + lane;
+            const bool valid = unit < {units};
+{resources}
+            unsigned pending = BALLOT(valid);
+            int level = -1;
+            while (pending != 0u) {{
+                const bool mine = ((pending >> lane) & 1u) != 0u;
+                if (mine) {{
+                    if (node_a >= 0) atomicMin(&node_owner[node_a], lane);
+                    if (node_b >= 0) atomicMin(&node_owner[node_b], lane);
+                }}
+                SYNC();
+                const bool ready = mine && (node_a < 0 || node_owner[node_a] == lane)
+                    && (node_b < 0 || node_owner[node_b] == lane);
+                if (ready) {{
+                    level = 0;
+                    if (node_a >= 0) level = max(level, node_level[node_a] + 1);
+                    if (node_b >= 0) level = max(level, node_level[node_b] + 1);
+                    if (node_a >= 0) node_level[node_a] = level;
+                    if (node_b >= 0) node_level[node_b] = level;
+                }}
+                SYNC();
+                if (mine) {{
+                    if (node_a >= 0) node_owner[node_a] = 32;
+                    if (node_b >= 0) node_owner[node_b] = 32;
+                }}
+                SYNC();
+                pending &= ~BALLOT(ready);
+            }}
+            const unsigned same = __match_any_sync(0xffffffffu, level);
+            const int below = __popc(same & ((1u << lane) - 1u));
+            const int earlier = valid ? {counts.format("level")} : 0;
+            SYNC();
+            if (valid && below == 0) {counts.format("level")} = earlier + __popc(same);
+            SYNC();
+            if (valid) {{
+                const int rank = earlier + below;
+                {store}
+            }}
+            levels = max(levels, level + 1);
+        }}
+        MAXIMUM(levels);"""
+
+
+def level_offsets(*, levels: str, counts: str) -> str:
+    """Return CUDA source that turns the units of each of ``levels`` levels into each level's first place, in place:
+    an exclusive scan by the block, a block of levels at a time; place ``levels`` is the unit count.
+
+    ``counts`` formats an index into the counts (``levels + 1`` of them). The fragment runs on every thread of a block
+    of ``THREADS`` threads in ``WARPS`` warps, and uses the lane group, ``tid``, ``lane``, ``warp`` and a shared
+    ``warp_count`` of a word a warp.
+    """
+    return f"""    int carry = 0;
+    for (int base = 0; base <= {levels}; base += THREADS) {{
+        const int c = base + tid;
+        const int count = c < {levels} ? {counts.format("c")} : 0;
+        const int below = SCAN(count);
+        if (lane == 31) warp_count[warp] = below + count;
+        __syncthreads();
+        int before = carry, total = 0;
+        for (int w = 0; w < WARPS; ++w) {{
+            if (w < warp) before += warp_count[w];
+            total += warp_count[w];
+        }}
+        if (c <= {levels}) {counts.format("c")} = before + below;
+        carry += total;
+        __syncthreads();
+    }}"""
 
 
 @wp.kernel
