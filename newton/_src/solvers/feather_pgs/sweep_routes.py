@@ -62,7 +62,8 @@ _MF_ADMISSION = f"if (mf_rt == {SPEED}) continue;"
 
 def worlds(queued: bool) -> kernel_template.Dispatch:
     """The worlds a sweep launch covers, chosen once in the plan: a block a world, or (``queued``) a device list of
-    them (``general_worlds``, its count first) walked with the grid's stride, such as a Jacobi tier's own list."""
+    them (``general_worlds``, its count first) walked with the grid's stride: its claim's bucket of the claims' worlds
+    (:func:`.sweep_levels.claim_worlds`)."""
     return kernel_template.items(
         "world", queue=("general_world_count", "general_world_grid_stride", "general_worlds") if queued else None
     )
@@ -683,7 +684,6 @@ def mf_gs_source(
     places: RowPlaces = STAGED_ROWS,
     has_dense_velocity_limit_rows: bool = True,
     contact_torsion: bool = False,
-    skip_tier_rows: int = 0,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     lanes: int = 32,
     weighted: bool = False,
@@ -754,11 +754,6 @@ def mf_gs_source(
     )
 
     dense_count = "int m_dense = world_constraint_count.data[world];"
-    skips = []
-    if skip_tier_rows > 0:
-        # The tiers' worlds (sweep_levels.list_worlds): no free body's row, the line's speed rows included.
-        speed = " && m_dense <= speed_start" if speed_rows else ""
-        skips.append(f"    if (m_mf == 0 && m_dense <= {int(skip_tier_rows)}{speed}) return;")
     mapped = ""
     if colored or colored_worlds:
         # The worlds of the other mapping, as the unit builder assigned them at the pack.
@@ -946,7 +941,6 @@ def mf_gs_source(
     if (m_dense == 0 && m_mf == 0) return;
     if (m_dense > {M_D}) m_dense = {M_D};
     if (m_mf > {M_MF}) m_mf = {M_MF};
-{chr(10).join(skips)}
     int mf_contact_end = mf_contact_rows_end.data[world];
     if (mf_contact_end > m_mf) mf_contact_end = m_mf;{mapped}
 
@@ -1005,7 +999,6 @@ def mf_gs_kernel(
     places: RowPlaces = STAGED_ROWS,
     has_dense_velocity_limit_rows: bool = True,
     contact_torsion: bool = False,
-    skip_tier_rows: int = 0,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
@@ -1018,7 +1011,8 @@ def mf_gs_kernel(
     """The matrix-free Gauss-Seidel sweep kernel of a thread mapping (:func:`mf_gs_source`): the warp's launches a
     warp per world item (one thread on the CPU, :func:`.execution.device_lanes`) and takes :data:`MF_GS_ABI`
     (:data:`COLORED_WORLDS_ABI` with ``colored_worlds``), the colored one :data:`COLORED_THREADS` and takes
-    :data:`COLORED_ABI`."""
+    :data:`COLORED_ABI`. The warp's walks its worlds from a device list (:func:`worlds`): the general sweep's bucket of
+    the claims' worlds (:func:`.sweep_levels.claim_worlds`), which holds no Jacobi tier's world."""
     max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
     snippet, staging = mf_gs_source(
         max_constraints,
@@ -1030,7 +1024,6 @@ def mf_gs_kernel(
         places=places,
         has_dense_velocity_limit_rows=has_dense_velocity_limit_rows,
         contact_torsion=contact_torsion,
-        skip_tier_rows=skip_tier_rows,
         solve_policy=solve_policy,
         lanes=32 if mapping == "colored" else device_lanes(device_arch),
         weighted=weighted,
@@ -1049,7 +1042,6 @@ def mf_gs_kernel(
         f"_densevlim{int(has_dense_velocity_limit_rows)}"
         + places.suffix
         + ("_torsion" if contact_torsion else "")
-        + (f"_skiptier{int(skip_tier_rows)}" if skip_tier_rows > 0 else "")
         + ("_cw" if colored_worlds and not colored else "")
         + ("_weighted" if weighted else "")
         + ("_material" if material else "")
@@ -1065,7 +1057,7 @@ def mf_gs_kernel(
         name,
         COLORED_ABI if colored else COLORED_WORLDS_ABI if colored_worlds else MF_GS_ABI,
         snippet,
-        worlds(False),
+        worlds(not colored),
         extra=(
             # Where spin rows may appear, every friction contact's metric (sweep.friction_metric_stage).
             *((RowArgument("friction_metric", wp.array3d[float], after="omega"),) if contact_torsion else ()),

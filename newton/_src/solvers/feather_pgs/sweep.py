@@ -2111,8 +2111,6 @@ def speed_row(
 
 
 def dense_tier_world(
-    capacity: int,
-    min_rows: int,
     dofs: int,
     max_constraints: int,
     *,
@@ -2121,19 +2119,15 @@ def dense_tier_world(
     pitch: int,
     pad: str = "    ",
 ) -> str:
-    """Enter a world of a dense-row tier, or return: one without free-body rows and with more than ``min_rows`` and
-    at most ``capacity`` dense rows.
+    """Enter a world of a dense-row tier: one of its bucket of the claims' worlds (:func:`.sweep_levels.claim_worlds`),
+    so one without free-body rows and with the tier's count of dense rows.
 
-    Declares ``m_dense``, ``m_mf``, ``rows`` (the rows the tier holds, ``m_dense``), ``dof_map_base``,
-    ``off_dense`` (the world's line of the row store, ``pitch`` rows a line), and the world's first packed row entry
-    ``packed_base`` (the line's rows of ``support`` entries: :mod:`.packed_rows`).
+    Declares ``m_dense``, ``rows`` (the rows the tier holds, ``m_dense``), ``dof_map_base``, ``off_dense`` (the world's
+    line of the row store, ``pitch`` rows a line), and the world's first packed row entry ``packed_base`` (the line's
+    rows of ``support`` entries: :mod:`.packed_rows`).
     """
     base = f"const size_t packed_base = (size_t)line * {int(pitch) * int(support)};"
     return f"""{pad}int m_dense = world_constraint_count.data[world];
-{pad}const int m_mf = mf_constraint_count.data[world];
-{pad}if (m_dense == 0 || m_mf != 0) return;
-{pad}if (m_dense > {capacity} || m_dense <= {min_rows}) return;
-
 {pad}const int {rows} = m_dense;
 {pad}const int dof_map_base = world * {dofs};
 {pad}const int line = dense_first.data[world];

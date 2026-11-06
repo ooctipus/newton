@@ -16,7 +16,7 @@ invariants:
 
 A schedule runs components side by side and a component's levels in order, so it is the row order's trace.
 :func:`level_pass` levels a world's units and :func:`level_offsets` places each level's units; the work lists are
-queues (:class:`~newton._src.core.execution.Queue`): :func:`list_worlds` buckets the Jacobi tiers' worlds.
+queues (:class:`~newton._src.core.execution.Queue`): :func:`claim_worlds` writes each world into its claim's bucket.
 
 Case K2 (the sparse diagonal): the row pass marks the contacts confined to one coordinate of the diagonal articulation,
 and the builder levels them over their coordinates and lists the rest in row order, which the sweep reads.
@@ -139,30 +139,37 @@ def level_offsets(*, levels: str, counts: str, lanes: int = 32) -> str:
 
 
 @wp.kernel
-def list_worlds(
+def claim_worlds(
     rows: wp.array[int],
     free_body_rows: wp.array[int],
     speed_first: wp.array[int],
     bound: int,
     width: int,
+    general: int,
     region: int,
-    # outputs: a Queue's (execution.Queue), a bucket a tier
+    # outputs: a Queue's (execution.Queue), a bucket a tier, then the general sweep's
     items: wp.array[int],
     count: wp.array[int],
 ):
-    """Bucket the worlds whose rows are dense only and at most ``bound`` by their rows: bucket ``(rows - 1) // width``
-    of a queue of ``region`` slots a bucket. A world with a free body's row (in the free bodies' run, or a speed row
-    of the line, its rows from ``speed_first``) is the general sweep's.
+    """Write each world with rows into its class's bucket of one queue of ``region`` slots a bucket: a world whose rows
+    are dense only and at most ``bound`` into its Jacobi tier's, ``(rows - 1) // width``; any other world with rows
+    into ``general``, the general sweep's. A world without rows takes none. A free body's rows are not dense only:
+    those in the free bodies' run (``free_body_rows``) and the line's speed rows (its rows from ``speed_first``).
 
-    The Jacobi tiers' worlds share nothing, so each is a component of its own and the order inside a bucket is free
-    (:func:`~newton._src.core.execution.append`'s, an atomic a warp a bucket); tier ``t`` serves ``(t * width, (t + 1) * width]`` rows and walks bucket ``t`` (an exiting block of a
-    tier's grid still paid four dependent global loads: about 55 us a launch at 16k worlds).
+    A claim's worlds share nothing with another's, so each is a component of its own and the order inside a bucket is
+    free (:func:`~newton._src.core.execution.append`'s, an atomic a warp a bucket); tier ``t`` serves
+    ``(t * width, (t + 1) * width]`` rows and walks bucket ``t``, the general sweep bucket ``general`` (an exiting block
+    of a grid over every world paid four dependent global loads: about 55 us a launch at 16k worlds).
     """
     world = wp.tid()
     m = rows[world]
-    if m <= 0 or m > bound or free_body_rows[world] != 0 or m > speed_first[world]:
+    mf = free_body_rows[world]
+    if m <= 0 and mf <= 0:
         return
-    append(items, count, (m - 1) // width, region, world)
+    bucket = general
+    if mf == 0 and m <= bound and m <= speed_first[world]:
+        bucket = (m - 1) // width
+    append(items, count, bucket, region, world)
 
 
 @cache

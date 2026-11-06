@@ -166,7 +166,6 @@ def _vote_census():
             (
                 _axis("places", sweep_routes.ROW_PLACES),
                 _axis("has_dense_velocity_limit_rows"),
-                _axis("skip_tier_rows", (0, 32)),
                 _axis("speed_rows"),
             ),
         ),
@@ -459,7 +458,7 @@ class TestExitLaw(unittest.TestCase):
             {
                 "sparse": 128,
                 "sparse_lanes": 16,
-                "mf_gs": 48,
+                "mf_gs": 24,
                 "paired": 4,
                 "sparse_diagonal": 12,
             },

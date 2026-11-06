@@ -13,8 +13,8 @@ share one. The tests check, on the CPU:
 - that the level pass's rounds (:func:`.sweep_levels.level_pass`: a batch of 32 units, a unit committing once it owns
   both its resources) give the row-order levels (:func:`levels`, the rule the colored units' CUDA test compares the
   device with);
-- that the Jacobi tiers' world lists bucket exactly each tier's worlds (:func:`.sweep_levels.list_worlds`, one
-  :class:`~newton._src.core.execution.Queue`, a bucket a tier).
+- that the claims write every world with rows into exactly its claim's bucket (:func:`.sweep_levels.claim_worlds`,
+  one :class:`~newton._src.core.execution.Queue`, a bucket a Jacobi tier, then the general sweep's).
 """
 
 import itertools
@@ -209,9 +209,9 @@ class TestLevelsAreTheRowOrder(unittest.TestCase):
 
 
 class TestWorldLists(unittest.TestCase):
-    def test_each_tier_buckets_exactly_its_worlds(self):
+    def test_each_world_lands_in_its_claim_s_bucket(self):
         """A world of dense rows only (no speed row) and at most the bound lands in the bucket of its 32-row tier, once;
-        others in none."""
+        any other world with rows in the general bucket; a world without rows in none."""
         rng = np.random.default_rng(7)
         worlds, bound, width = 500, 100, 32
         rows = rng.integers(0, 140, worlds).astype(np.int32)
@@ -221,9 +221,9 @@ class TestWorldLists(unittest.TestCase):
         tiers = -(-bound // width)
         for device in _devices():
             with self.subTest(device=device):
-                lists = Queue(tiers * worlds, device, buckets=tiers)
+                claims = Queue((tiers + 1) * worlds, device, buckets=tiers + 1)
                 wp.launch(
-                    sweep_levels.list_worlds,
+                    sweep_levels.claim_worlds,
                     dim=worlds,
                     inputs=[
                         wp.array(rows, dtype=int, device=device),
@@ -231,15 +231,20 @@ class TestWorldLists(unittest.TestCase):
                         wp.array(speed_first, dtype=int, device=device),
                         bound,
                         width,
-                        lists.region,
+                        tiers,
+                        claims.region,
                     ],
-                    outputs=[lists.items, lists.count],
+                    outputs=[claims.items, claims.count],
                     device=device,
                 )
-                for tier in range(tiers):
-                    count, items = (array.numpy() for array in lists.bucket(tier))
-                    lo, hi = tier * width, min((tier + 1) * width, bound)
-                    want = np.flatnonzero((rows > lo) & (rows <= hi) & (free == 0) & (rows <= speed_first))
+                tiered = (rows > 0) & (rows <= bound) & (free == 0) & (rows <= speed_first)
+                for bucket in range(tiers + 1):
+                    count, items = (array.numpy() for array in claims.bucket(bucket))
+                    if bucket < tiers:
+                        lo, hi = bucket * width, min((bucket + 1) * width, bound)
+                        want = np.flatnonzero((rows > lo) & (rows <= hi) & tiered)
+                    else:
+                        want = np.flatnonzero(~tiered & ((rows > 0) | (free > 0)))
                     self.assertEqual(int(count[0]), want.size)
                     np.testing.assert_array_equal(np.sort(items[: count[0]]), want)
 
@@ -250,9 +255,9 @@ class TestWorldLists(unittest.TestCase):
         rows = (np.arange(worlds) % 3 * width + 1).astype(np.int32)
         for device in _devices():
             with self.subTest(device=device):
-                lists = Queue(3 * region, device, buckets=3)
+                lists = Queue(4 * region, device, buckets=4)
                 wp.launch(
-                    sweep_levels.list_worlds,
+                    sweep_levels.claim_worlds,
                     dim=worlds,
                     inputs=[
                         wp.array(rows, dtype=int, device=device),
@@ -260,6 +265,7 @@ class TestWorldLists(unittest.TestCase):
                         wp.array(rows, dtype=int, device=device),
                         3 * width,
                         width,
+                        3,
                         lists.region,
                     ],
                     outputs=[lists.items, lists.count],

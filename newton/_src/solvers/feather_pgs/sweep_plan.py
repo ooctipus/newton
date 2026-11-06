@@ -449,7 +449,9 @@ class Sweep:
         self.mf_gs_storage = None
         # The Jacobi tiers ahead of the matrix-free sweep (SweepTier), and their keyed rows' release.
         self.tiers = []
-        self.tier_worlds = None
+        self.par_tiers = []
+        # The claims' worlds (sweep_levels.claim_worlds): a bucket a tier, then the general sweep's.
+        self.claims = None
         if self.classes.mf_sweeps and self.paired_factor_kernel is None:
             # A test pin streams the impulses (storage is part of the kernel specialization key); the selection
             # sizes the resident row metadata with its choice.
@@ -498,7 +500,6 @@ class Sweep:
                 "has_dense_velocity_limit_rows": self.options.enable_joint_velocity_limits,
                 "places": storage.places,
                 "contact_torsion": self.laws.spin_rows,
-                "skip_tier_rows": parallel_rows,
                 "colored_worlds": colored,
                 "max_row_dofs": self.placement.packed_support,
                 "seeded": self.seeded,
@@ -545,8 +546,6 @@ class Sweep:
                 width = sweep_routes_tiers.TIER_ROWS
                 tiers = [(min(first + width, parallel_rows), first) for first in range(0, parallel_rows, width)]
                 self.par_tiers = list(tiers)
-                # Each tier walks its bucket of the level builder's world list (sweep_levels.list_worlds).
-                self.tier_worlds = Queue(len(tiers) * self.forest.world_count, model.device, buckets=len(tiers))
                 tier_sweeps, self.par_sweeps_rule, self.par_sweeps_reason = self._parallel_tier_sweeps(tiers)
                 for tier_index, ((rows_, min_rows_), sweeps_) in enumerate(zip(tiers, tier_sweeps, strict=True)):
                     tier = self.kernel(
@@ -566,12 +565,14 @@ class Sweep:
                         frame=self._tier_frame(),
                         classes=self.factor.walk_classes,
                         pitch=self.placement.row_pitch,
-                        queued=True,
                         **({"torsion": True} if self.laws.spin_rows else {}),
                     )
                     # On its own list, a tier takes a block a world of the list's capacity (its work's shape).
                     grid = shape(dataclasses.replace(tier.work, items=self.forest.world_count), device(model.device))
                     self.tiers.append(dataclasses.replace(tier, tier=tier_index, grid=grid.grid))
+            # Each tier and the general sweep walk their bucket of the claims' worlds, which hold every world.
+            worlds = self.forest.world_count
+            self.claims = Queue((len(self.tiers) + 1) * worlds, model.device, buckets=len(self.tiers) + 1)
         if self.classes.mf_sweeps:
             # No matrix-free sweep enters a world without rows; the readout counts those solves as skipped.
             self.readout.register_skipped(world_count=int(self.forest.world_count), device=model.device)
@@ -583,11 +584,11 @@ class Sweep:
         """Open the claims' streams: the sweeps that own their worlds run on them beside the matrix-free sweep.
 
         The claims touch nothing the matrix-free sweep touches, so they fork after the rows are published and join
-        before the leave: the Jacobi tiers, whose worlds hold no free-body row, the worlds the matrix-free sweep
-        returns from. A tier's worlds are those of its row count, so each tier is a claim of its own.
+        before the leave: the Jacobi tiers, whose worlds hold no free-body row (nor a speed row of the line), none of
+        the matrix-free sweep's. A tier's worlds are those of its row count, so each tier is a claim of its own.
 
-        A stream a claim: the first takes the tiers' lists and the first tier; every other tier its own, once the lists
-        are written.
+        The claims' worlds are written before the fork (:func:`.sweep_levels.claim_worlds`), since the matrix-free sweep
+        walks its bucket of them too. A stream a tier.
 
         The other side streams (inertia, dynamics, memset) read no contact rows nor the contact pool's ready count:
         they run factorizations and articulation data. The claims do (the keyed tiers), between the fork and the join
@@ -598,7 +599,6 @@ class Sweep:
         claims = len(self.tiers) if wp.get_device(model.device).is_cuda and overlap else 0
         self.claim_streams = tuple(wp.Stream(model.device) for _ in range(claims))
         self.claims_ready = wp.Event(model.device) if claims else None
-        self.claims_listed = wp.Event(model.device) if claims > 1 else None
         self.claims_done = tuple(wp.Event(model.device) for _ in range(claims))
 
     def claim(self) -> None:
@@ -804,32 +804,34 @@ class Sweep:
         # The sweeps leave by the walk (sweep_routes.leave_all) and find a free body's tree in it.
         walk = {} if self.factor.walk_arts is None else {"walk": self.factor.walk_view()}
 
-        # The tiers own the worlds with only dense rows inside their row bound; the general sweep returns early for
-        # those and solves the rest.
-        lists = self.tier_worlds
+        # Every world with rows in its claim's bucket: a tier's (only dense rows, inside the tiers' row bound) or the
+        # general sweep's (sweep_levels.claim_worlds). Each sweep walks its bucket.
+        claims = self.claims
+        general = len(self.tiers)
+        claims.count.zero_()
+        wp.launch(
+            sweep_levels.claim_worlds,
+            dim=self.forest.world_count,
+            inputs=[
+                self.placement.constraint_count,
+                self.placement.mf_constraint_count,
+                self.placement.speed_first,
+                self.par_tiers[-1][0] if self.par_tiers else 0,
+                sweep_routes_tiers.TIER_ROWS,
+                general,
+                claims.region,
+            ],
+            outputs=[claims.items, claims.count],
+            device=self.model.device,
+        )
 
-        def list_tiers():
-            if lists is not None:
-                lists.count.zero_()
-                wp.launch(
-                    sweep_levels.list_worlds,
-                    dim=self.forest.world_count,
-                    inputs=[
-                        self.placement.constraint_count,
-                        self.placement.mf_constraint_count,
-                        self.placement.speed_first,
-                        self.par_tiers[-1][0],
-                        sweep_routes_tiers.TIER_ROWS,
-                        lists.region,
-                    ],
-                    outputs=[lists.items, lists.count],
-                    device=self.model.device,
-                )
+        def queued(bucket, grid):
+            count, worlds = claims.bucket(bucket)
+            return {"general_world_count": count, "general_worlds": worlds, "general_world_grid_stride": grid}
 
         def launch_tier(tier):
-            # A tier grid-strides over its bucket of the world list.
-            count, worlds = lists.bucket(tier.tier)
-            named = dict(walk, general_world_count=count, general_worlds=worlds, general_world_grid_stride=tier.grid)
+            # A tier grid-strides over its bucket.
+            named = dict(walk, **queued(tier.tier, tier.grid))
             named.update(self.placement.inkernel_response_inputs())
             if tier.kinetic_rows:
                 keyed = self.placement.keyed_rows.parallel_arguments()
@@ -841,12 +843,13 @@ class Sweep:
             for stream in streams:
                 stream.wait_event(self.claims_ready)
         if not streams:
-            list_tiers()
             for tier in self.tiers:
                 launch_tier(tier)
         colored_kernel = self.mf_colored_kernel
         colored = {} if colored_kernel is None else self.colored_units.operands()
-        self._launch(mf_gs_kernel, operands, self.forest.world_count, 32, **walk, **colored)
+        # The general sweep's bucket, a block a world of its capacity (every world).
+        worlds = self.forest.world_count
+        self._launch(mf_gs_kernel, operands, worlds, 32, **walk, **colored, **queued(general, worlds))
         if colored_kernel is not None:
             # The worlds the unit builder's rule picked: a block each, a color's units at once.
             self._launch(
@@ -854,14 +857,7 @@ class Sweep:
             )
         if streams:
             # The general tail is queued first; the claims share only the ready dependency with it.
-            with wp.ScopedStream(streams[0], sync_enter=False):
-                list_tiers()
-            if self.claims_listed is not None:
-                streams[0].record_event(self.claims_listed)
-            for t, tier in enumerate(self.tiers):
-                stream = streams[t]
-                if t:
-                    stream.wait_event(self.claims_listed)
+            for stream, tier in zip(streams, self.tiers, strict=True):
                 with wp.ScopedStream(stream, sync_enter=False):
                     launch_tier(tier)
             for stream, done in zip(streams, self.claims_done, strict=True):

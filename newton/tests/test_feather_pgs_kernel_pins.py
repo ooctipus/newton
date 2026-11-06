@@ -322,9 +322,8 @@ def _solver_factory_calls():
         # The velocity-limit rows' last word.
         kwargs = {**kwargs, "velocity_limits": True}
         yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (64, 10, 9, _ARCH), kwargs
-    for skip_rows, limits, free, speed in itertools.product((0, 32), *([(False, True)] * 3)):
+    for limits, free, speed in itertools.product(*([(False, True)] * 3)):
         kwargs = {
-            "skip_tier_rows": skip_rows,
             "has_dense_velocity_limit_rows": limits,
             "free_rows": free,
             "speed_rows": speed,
@@ -337,7 +336,6 @@ def _solver_factory_calls():
         kwargs = {
             "places": sweep_routes.RowPlaces(Place.GLOBAL, Place.SHARED),
             "has_dense_velocity_limit_rows": limits,
-            "skip_tier_rows": 0 if limits else 32,
         }
         factory = sweep_routes.mf_gs_kernel.__wrapped__
         yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
@@ -384,9 +382,8 @@ def _suite_shape_calls():
     factory = sweep_routes.mf_gs_kernel.__wrapped__
     for args, kwargs in (
         ((192, 64, 22, _ARCH), {}),
-        ((192, 64, 22, _ARCH), {"skip_tier_rows": 128}),
-        ((192, 64, 22, _ARCH), {"free_rows": False, "speed_rows": True, "skip_tier_rows": 128}),
-        ((72, 32, 18, _ARCH), {**no_limits, "skip_tier_rows": 48}),
+        ((192, 64, 22, _ARCH), {"free_rows": False, "speed_rows": True}),
+        ((72, 32, 18, _ARCH), no_limits),
     ):
         yield "sweep_routes.mf_gs_kernel", factory, args, kwargs
     factory = sweep_routes_sparse.sparse_kernel.__wrapped__

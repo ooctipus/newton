@@ -163,7 +163,6 @@ def factory_calls():
         {"places": sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL)},
         {"places": sweep_routes.RowPlaces(impulses=Place.GLOBAL)},
         {"contact_torsion": True},
-        {"skip_tier_rows": 32},
         {"free_rows": False},
         {"free_rows": False, "speed_rows": True},
     )
@@ -550,7 +549,6 @@ def census_calls():
         _axis("places", sweep_routes.ROW_PLACES),
         _axis("has_dense_velocity_limit_rows", (True, False)),
         _axis("contact_torsion"),
-        _axis("skip_tier_rows", (0, 32)),
         _axis("speed_rows"),
     )
     keyed = KeyedLayout(16, 6, 0, 16, 128, False, 0)

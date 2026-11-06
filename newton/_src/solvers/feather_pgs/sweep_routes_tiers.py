@@ -79,7 +79,7 @@ TIER_MAX_ROWS = 128
 """The most rows a tier holds: a lane per row in four warps, its staged block within the static budget."""
 TIER_ROWS = 32
 """The rows a tier holds past the tier below it, a warp's: tier ``t`` serves ``(32 t, 32 (t + 1)]`` rows
-(:func:`.sweep_levels.list_worlds` buckets its worlds)."""
+(:func:`.sweep_levels.claim_worlds` buckets its worlds)."""
 REGISTER_LINE = 80
 """The register line of a tier: 24 warps a multiprocessor (6 in each of the register file's 4 sub-partitions). It is
 no cap: a tier's variants compile on both sides of it unbounded (72 registers plain, 100 to 108 keyed) and spill under
@@ -247,7 +247,7 @@ def parallel_source(
     }}"""
     publish = op.publish(indent="    ", applied=lambda row: f"s_x[{row}]") + "\n" + store.stores()
     body = f"""    const int lane = LANE;
-{dense_tier_world(AM, int(min_rows), D, M_D, rows="n_rows", support=D, pitch=M_D if pitch is None else int(pitch))}
+{dense_tier_world(D, M_D, rows="n_rows", support=D, pitch=M_D if pitch is None else int(pitch))}
 
 {staging.declarations("    ")}{trace_reduction}
 {op.declarations("    ")}
@@ -302,7 +302,6 @@ def parallel_kernel(
     frame: tuple[int, int] = (0, 0),
     classes: tuple[WalkClass, ...] = (),
     pitch: int | None = None,
-    queued: bool = False,
 ) -> SweepTier:
     """A parallel tier: its kernel (:data:`PARALLEL_ABI`) and its launch descriptor.
 
@@ -312,8 +311,8 @@ def parallel_kernel(
     rows. Its worlds' stored rows (:mod:`.walk_rows`) lie at their coordinates, ``max_world_dofs`` entries a row.
     With ``weighted`` its contact rows step by their weights, ``material`` contacts' from their compliance; ``frame``
     is each tree's slip capacity (:class:`.WalkedRows`); ``classes`` the walking classes whose trees its keyed rows
-    walk (:attr:`.tree_factor.TreeFactor.walk_classes`); ``queued`` takes its worlds from a device list
-    (:func:`.sweep_routes.worlds`).
+    walk (:attr:`.tree_factor.TreeFactor.walk_classes`). It walks its bucket of the claims' worlds
+    (:func:`.sweep_routes.worlds`, :func:`.sweep_levels.claim_worlds`), which holds its worlds only.
     """
     if material and not weighted:
         raise ValueError("material contacts step by their weights: their tiers are weighted")
@@ -364,7 +363,7 @@ def parallel_kernel(
         name,
         PARALLEL_ABI,
         snippet,
-        worlds(queued),
+        worlds(True),
         extra=(
             *(operands.arguments if operands is not None else ()),
             *material_arguments(material),

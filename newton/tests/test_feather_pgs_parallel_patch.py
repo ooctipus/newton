@@ -1699,8 +1699,9 @@ def _pushed_sphere(device, *, limit=0.5, dt=1.0 / 240.0):
 def _assert_tier_owned(test, solver, budget):
     """Require the parallel tiers to have solved every world with rows in the last step.
 
-    A tier takes a world with at most ``budget`` dense rows and no matrix-free rows; the serial sweep returns early
-    for exactly those worlds, so a world in that domain is the tier's (``skip_tier_rows``).
+    A tier takes a world with at most ``budget`` dense rows and no matrix-free rows; the claims write exactly those
+    worlds into the tiers' buckets and every other one into the general sweep's (:func:`.sweep_levels.claim_worlds`),
+    so a world in that domain is the tier's.
     """
     test.assertEqual(solver.spec.classes.tier_rows, budget)
     test.assertTrue(solver.sweep.tiers)
