@@ -499,7 +499,7 @@ class SolverFeatherPGS(SolverBase):
                 pins=pins,
                 dense_rows=capacities.dense_rows,
             ),
-            general=general_reason(pins, native=model.device.is_cuda, eliminates=self.factor.eliminates),
+            general=general_reason(pins, native=model.device.is_cuda),
         )
         # The step's spec: every unknown that decides its path, gathered before any owner of the step, which each
         # owner below reads and builds its part of the class plan from.
@@ -566,8 +566,8 @@ class SolverFeatherPGS(SolverBase):
             raise RuntimeError(f"Free bodies' rows are written by the walk: case {case} must walk.")
         if self.factor.eliminates and not self.placement.walks:
             raise RuntimeError(
-                "Bilateral blocks are closed in the one writer's block phase (walk_rows): their class must walk "
-                f"(case K6 with the matrix-free sweeps), not case {case}."
+                "Bilateral blocks are closed in the one writer's block phase (walk_rows): their class must walk, "
+                f"not case {case}."
             )
         # Scalar branches take a diagonal-mass group of world-fixed roots over one-coordinate leaves (scalar_branches.py),
         # which the held-tree owner then publishes: the compact diagonal's admission planned them.

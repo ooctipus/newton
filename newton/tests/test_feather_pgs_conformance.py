@@ -1687,6 +1687,21 @@ def cuda_groups() -> list:
                 ),
             ),
         ),
+        # Bilateral pre-elimination on the cases the one writer writes: the paired factor sweep (case K5) and the
+        # Jacobi tiers on its rows (case K4), from the closed blocks' seed.
+        Group(
+            _physics(scenes.hand(mimic=True), "patch", 16, "preelimination", enable_bilateral_preelimination=True),
+            ref,
+            (PAIRED.but("paired_preelimination", expect={"paired_response.factor_coordinates": True}),),
+        ),
+        Group(
+            _physics(scenes.gripper(mimic=True), "patch", 32, "preelimination", enable_bilateral_preelimination=True),
+            ref,
+            (
+                MF_DEFAULT.but("mf_default_preelimination", expect={"contact_rows.producer": "walk"}),
+                MF_PARALLEL.but("mf_parallel_preelimination"),
+            ),
+        ),
         # A mimic row is an articulation row: the paired worlds still split into components (case K5).
         Group(
             _physics(scenes.hand(mimic=True), "patch", 16, "mimic"),

@@ -929,7 +929,13 @@ def legged(
 
 
 def gripper(
-    *, mu: float = 1.0, squeeze: float = 0.005, lift: float = 0.04, worlds: int = 2, table: bool = False
+    *,
+    mu: float = 1.0,
+    squeeze: float = 0.005,
+    lift: float = 0.04,
+    worlds: int = 2,
+    table: bool = False,
+    mimic: bool = False,
 ) -> Scene:
     """A lift and two prismatic fingers squeeze a free 0.2 kg box on the ground, then lift it by ``lift`` [m].
 
@@ -937,7 +943,8 @@ def gripper(
     finger presses about ``400 N/m * squeeze``, so friction can hold twice the
     box's weight; world ``w`` squeezes ``w`` mm more, so worlds differ. With
     ``table`` the box rests on a kinematic table instead of the ground: a
-    prescribed root, as a manipulation task's table is.
+    prescribed root, as a manipulation task's table is. With ``mimic`` the second
+    finger follows the first, as a parallel gripper's do.
     """
     half = 0.04
     lift_start, lift_speed = 60, 0.2
@@ -975,6 +982,8 @@ def gripper(
                 )
             )
         builder.add_articulation(joints)
+        if mimic:
+            builder.add_constraint_mimic(joint0=joints[3], joint1=joints[2], coef0=0.0, coef1=1.0)
         if table:
             top = builder.add_body(
                 xform=wp.transform(wp.vec3(0.0, 0.0, -0.01)),
@@ -997,7 +1006,7 @@ def gripper(
         _set_targets(model, control, targets)
 
     return Scene(
-        "gripper_table" if table else "gripper",
+        ("gripper_table" if table else "gripper") + ("_mimic" if mimic else ""),
         build,
         dt=1.0 / 240.0,
         steps=140,

@@ -1301,21 +1301,16 @@ class TestTierRule(unittest.TestCase):
                 self.assertIn(reason, why)
 
     def test_an_earlier_case_or_the_general_data_keep_the_class(self):
-        """Give the class to an earlier case that fits, and keep every class general under a pin, the CPU or the
-        bilateral pre-elimination."""
+        """Give the class to an earlier case that fits, and keep every class general under a pin or the CPU."""
         tiers = next(rule for name, _, rule in class_plan.RULES if name == "K4")
         rules = (("K5", "factor coordinates of a tree beside one free body", lambda inputs: (object(), None)),)
         with patch.object(class_plan, "RULES", (*rules, ("K4", "the Jacobi tiers", tiers))):
             plan = class_plan.plan_class(_class_inputs(), general=None)
         self.assertEqual(plan.case, "K5")
         self.assertIn("case K5", plan.reasons["K4"])
-        for data, phrase in (
-            ({"native": True, "eliminates": True}, "pre-elimination"),
-            ({"native": False, "eliminates": False}, "written for CUDA"),
-        ):
-            general = class_plan.general_reason(SolverFeatherPGS.Pins(), **data)
-            self.assertIn(phrase, class_plan.plan_class(_class_inputs(), general=general).reasons["K4"])
-        general = class_plan.general_reason(SolverFeatherPGS.Pins(placement="general"), native=True, eliminates=False)
+        general = class_plan.general_reason(SolverFeatherPGS.Pins(), native=False)
+        self.assertIn("written for CUDA", class_plan.plan_class(_class_inputs(), general=general).reasons["K4"])
+        general = class_plan.general_reason(SolverFeatherPGS.Pins(placement="general"), native=True)
         self.assertIn("general placement", general)
 
     def test_a_pin_builds_the_tiers_on_a_single_tree(self):

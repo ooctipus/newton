@@ -7,8 +7,8 @@ Each case's rule (:data:`RULES`, in precedence order) reads only data known befo
 laws, the options, the row capacity, the device's shared budget, the test pins, the factor's drive plan and the held
 tree's admission of the representation the case needs. It returns the case's choice (what its owner builds) or why the
 class does not fit. :func:`plan_class` applies the rules in order: the first that fits gives the class its case, and
-every later case says which case holds the class. Three data keep every class general: a test pin, a device without
-the cases' native bodies, and the bilateral pre-elimination (:func:`general_reason`). The owners then build from the
+every later case says which case holds the class. Two data keep every class general: a test pin and a device without
+the cases' native bodies (:func:`general_reason`). The owners then build from the
 plan (:class:`ClassPlan`) and decide nothing of the case.
 """
 
@@ -185,16 +185,15 @@ class ClassPlan:
         return self.diagonal.scalar, self.diagonal.scalar_reason
 
 
-def general_reason(pins, *, native: bool, eliminates: bool) -> str | None:
-    """Why every class keeps the general placement, or ``None``: the test pin ``placement="general"``; a device without
-    the cases' native bodies (``native``: they are written for CUDA, so the CPU runs the general placement); and the
-    bilateral pre-elimination (``eliminates``), whose blocks the one writer's block phase closes and whose wide rows
-    only the general sweep's exit reads (the cases' writers and sweeps take neither yet)."""
+def general_reason(pins, *, native: bool) -> str | None:
+    """Why every class keeps the general placement, or ``None``: the test pin ``placement="general"`` or a device
+    without the cases' native bodies (``native``: they are written for CUDA, so the CPU runs the general placement).
+    The bilateral pre-elimination is no general datum: its blocks close in the one writer's block phase, so each case
+    whose writer lacks that phase declines it in its own rule (K1's support writer, the keyed layout)."""
     return first_failed(
         (
             (pins.placement != "general", "A test pin keeps the general placement (placement='general')."),
             (native, "The device runs the general placement: the cases' native bodies are written for CUDA."),
-            (not eliminates, "Bilateral pre-elimination closes its blocks in the general row's block phase."),
         )
     )
 
@@ -401,6 +400,11 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
             (pins.storage != "dense", "A test pin keeps dense storage (storage='dense')."),
             (not pins.tiers, "A test pin builds the Jacobi tiers (tiers) on dense storage."),
             (factor.parallel_drives, "Drive topology is not supported by native sparse factors."),
+            (
+                not factor.eliminates,
+                "Bilateral pre-elimination closes its blocks in the one writer's block phase; the support writer has "
+                "none.",
+            ),
             (
                 not laws.mimic_count or velocity_candidate,
                 "Mimic rows require the sparse velocity-row composition.",

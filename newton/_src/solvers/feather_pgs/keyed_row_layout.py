@@ -56,6 +56,9 @@ class KeyedLayout:
 def topology_plan(solver):
     """Derive uniform block offsets and supported velocity DOFs from the model: the layout, then each world's group
     index, first coordinate and articulation of each size."""
+    if solver.factor.eliminates:
+        # The tiers walk keyed rows anew, without the one writer's closure of the bilateral blocks.
+        raise ValueError("keyed rows take no bilateral pre-elimination")
     sizes = sorted((int(n) for n in solver.forest.size_groups), reverse=True)
     if not 1 <= len(sizes) <= 2 or sum(sizes) != solver.forest.max_world_dofs:
         raise ValueError("keyed rows require at most two complete uniform size groups")
