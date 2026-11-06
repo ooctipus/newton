@@ -91,6 +91,8 @@ class Diagonal:
     """The star's group as scalar branches (:func:`.scalar_branches.plan_scalar_branches`), or ``None``."""
     scalar_reason: str
     """Why the star's group runs as scalar branches or not."""
+    held: held_tree.HeldPlan
+    """The held tree's plan with this compact diagonal, which admitted the case (:func:`.held_tree.plan`)."""
 
 
 @dataclass(frozen=True, eq=False)
@@ -289,9 +291,10 @@ def diagonal_rule(inputs: ClassInputs) -> tuple[Diagonal | None, str]:
     # Its compact diagonal is the held tree's representation: a candidate only where the held tree takes the dense
     # groups with it, the diagonal group as scalar branches or a held family.
     scalar, scalar_reason = plan_scalar_branches(inputs, size=int(diagonal_size[0]))
-    held = held_tree.compact_decline(inputs, int(diagonal_size[0]), scalar=scalar is not None)
-    if held is not None:
-        return None, f"Only the held tree evaluates the compact diagonal. {held}"
+    try:
+        held = held_tree.plan(inputs, compact=int(diagonal_size[0]), scalar=scalar)
+    except ValueError as error:
+        return None, f"Only the held tree evaluates the compact diagonal. {error}"
     units = bool(inputs.options.enable_contact_friction and inputs.options.contact_friction_gap_threshold == math.inf)
     choice = Diagonal(
         size=int(diagonal_size[0]),
@@ -305,6 +308,7 @@ def diagonal_rule(inputs: ClassInputs) -> tuple[Diagonal | None, str]:
         speculative_batches=units and int(dense_size[0]) + 2 <= 16,
         scalar=scalar,
         scalar_reason=scalar_reason,
+        held=held,
     )
     return choice, "One diagonal-mass articulation and one compact dense articulation per world share one owner."
 
@@ -698,7 +702,8 @@ _CHOICE = {"K2": "diagonal", "K1": "packed", "K5": "paired", "K4": "tiers"}
 def plan_class(inputs: ClassInputs, *, general: str | None) -> ClassPlan:
     """The class's plan: each rule of :data:`RULES` in order until one fits; every case after it says which case
     holds the class, and ``general`` (:func:`general_reason`), when given, is every case's reason. The held tree's plan
-    follows from the case's choice (:func:`.held_tree.plan`, which raises ValueError for a model it does not hold)."""
+    follows from the case's choice: the sparse diagonal's admitted it (:attr:`Diagonal.held`), else it is built here
+    (:func:`.held_tree.plan`, which raises ValueError for a model it does not hold)."""
     descriptions = {name: description for name, description, _ in RULES}
     forest = inputs.forest
     case, reasons, choices = "K6", {}, {}
@@ -714,10 +719,11 @@ def plan_class(inputs: ClassInputs, *, general: str | None) -> ClassPlan:
             case, choices[_CHOICE[name]] = name, choice
     mf_sweeps = case not in ("K1", "K2") and forest.world_count > 0 and forest.max_world_dofs > 0
     diagonal = choices.get("diagonal")
-    held = held_tree.plan(
-        inputs,
-        packed=choices.get("packed"),
-        compact=None if diagonal is None else diagonal.size,
-        scalar=None if diagonal is None else diagonal.scalar,
-    )
+    if diagonal is not None:
+        held = diagonal.held
+    else:
+        try:
+            held = held_tree.plan(inputs, packed=choices.get("packed"))
+        except ValueError as error:
+            raise ValueError(f"FeatherPGS cannot hold this model: {error}") from error
     return ClassPlan(case=case, reasons=MappingProxyType(reasons), mf_sweeps=mf_sweeps, held=held, **choices)

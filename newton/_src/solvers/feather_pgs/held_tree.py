@@ -204,33 +204,6 @@ def sparse_decline(inputs, size, plan) -> str | None:
     return None
 
 
-def compact_decline(inputs, size, *, scalar) -> str | None:
-    """Why the held tree would not take the dense size groups with a compact diagonal of ``size`` coordinates, or
-    ``None``: :func:`decline`, then the groups' fit (the coverage, the
-    diagonal group unless ``scalar`` branches take it, every other size group, the prescribed roots).
-
-    Only the held tree evaluates a compact diagonal, so the sparse diagonal's rule (:func:`.class_plan.diagonal_rule`)
-    reads this, with the class's ``inputs`` (:class:`.class_plan.ClassInputs`), before choosing one.
-    """
-    model, forest = inputs.model, inputs.forest
-    reason = decline(forest, inputs.factor, sparse=False)
-    if reason is not None:
-        return reason
-    try:
-        _coverage(model, forest, size)
-        for group_size in forest.size_groups:
-            if group_size != size or not scalar:
-                for first, last in _topologies(forest, group_size):
-                    trees = forest.group_to_art_host[group_size][first:last]
-                    _size_trees(model, forest, group_size, trees, diagonal=group_size == size)
-        prescribed = _prescribed_articulations(forest)
-        if prescribed.size:
-            _fit(model, forest, prescribed, _FREE_BODY, prescribed=True)
-    except ValueError as error:
-        return f"The topology does not fit the held groups: {error}"
-    return None
-
-
 _FREE_BODY = TreePlan.build([-1], [6]).factor
 """The mass pattern of a prescribed free body: one body of six coordinates."""
 
@@ -478,13 +451,17 @@ def plan(inputs, *, packed=None, compact=None, scalar=None) -> HeldPlan:
     the class plan's choices (:func:`held_class`), their groups composed, the dense groups' coverage, the walk's trees
     and the drive stage's coordinates.
 
+    The plan's failure is the held tree's decline of the choices: the sparse diagonal's rule
+    (:func:`.class_plan.diagonal_rule`) builds the plan with its compact diagonal and keeps it, or declines with why.
+
     Raises:
-        ValueError: For a model the held tree does not hold, naming why.
+        ValueError: For a model the held tree does not hold, naming why (:func:`decline`, or the group that does not
+            fit).
     """
     model, forest = inputs.model, inputs.forest
     reason = decline(forest, inputs.factor, sparse=packed is not None)
     if reason is not None:
-        raise ValueError(f"FeatherPGS cannot hold this model: {reason}")
+        raise ValueError(reason)
     drive_dofs = None
     if scalar is not None:
         other = np.ones(model.joint_dof_count, dtype=bool)
@@ -500,7 +477,7 @@ def plan(inputs, *, packed=None, compact=None, scalar=None) -> HeldPlan:
             for world_class in forest.world_classes
         )
     except ValueError as error:
-        raise ValueError(f"FeatherPGS cannot hold this model: {error}") from error
+        raise ValueError(f"The topology does not fit the held groups: {error}") from error
     groups = compose(classes)
     folded = [group.trees for group in groups if group.kind == "scalar"]
     if folded:
