@@ -56,7 +56,7 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
 
 
 def _pack(dof_a: int, inverse: float, rhs: float, kind: int, parent: int) -> tuple[int, int, int, int]:
-    """A free-body row's packed word (:meth:`.FreeBodyZ.pack`): its body's first coordinate (``dof_b`` none), the bits
+    """A free-body row's packed word (:func:`.row_metadata.pack_mf_header`): its body's first coordinate (``dof_b`` none), the bits
     of its stored inverse diagonal and right-hand side, its type and its parent (0xFFFF for none)."""
     word = np.uint32(((int(parent) & 0xFFFF) << 16) | int(kind)).view(np.int32)
     as_int = np.array((inverse, rhs), np.float32).view(np.int32)

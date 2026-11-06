@@ -19,24 +19,24 @@ import warp as wp
 from newton._src.solvers.feather_pgs import field_group, paired_components, response_builds_rows
 from newton._src.solvers.feather_pgs.factor.walk import WALK_COORDINATE
 from newton._src.solvers.feather_pgs.paired_components import PairedComponentData
-from newton._src.solvers.feather_pgs.response_operator import FreeBodyZ
+from newton._src.solvers.feather_pgs.row_metadata import pack_mf_header, unpack_mf_header
 from newton.tests.feather_pgs_law_harness import row_lines, walk_inverse
 
 DEVICE = "cpu"
 
 
-class TestFreeBodyZBuild(unittest.TestCase):
+class TestFreeBodyRowsBuild(unittest.TestCase):
     """The free-body rows' build."""
 
     def test_meta_word_is_the_consumed_word(self):
-        """The packed word's fields are the ones :meth:`.FreeBodyZ.consume` decodes."""
-        word = FreeBodyZ().pack("w", "a", "b", "inv", "rhs", "kind", "parent", "")
+        """The packed word's fields are the ones the sweeps' row loop decodes."""
+        word = pack_mf_header("w", "a", "b", "inv", "rhs", "kind", "parent", "")
         self.assertIn("w.x = (a << 16) | (b & 0xFFFF);", word)
         self.assertIn("w.y = __float_as_int(inv);", word)
-        consume = FreeBodyZ().consume("i", "n", "")
+        consume = unpack_mf_header("w", "")
         self.assertIn("int dof_a = packed_dofs >> 16;", consume)
         self.assertIn("int dof_b = (packed_dofs << 16) >> 16;", consume)
-        self.assertIn("float mf_diag = __int_as_float(meta.y);", consume)
+        self.assertIn("float mf_diag = __int_as_float(w.y);", consume)
         with self.assertRaises(ValueError):
             response_builds_rows.free_body_meta_kernel(70000, 8 + 70000, 8, 32, "sm_120")
 

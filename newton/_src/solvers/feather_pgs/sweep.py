@@ -52,7 +52,12 @@ from .row_kernels import (
     PGS_CONSTRAINT_TYPE_SPEED,
     PGS_CONSTRAINT_TYPE_TORSION,
 )
-from .row_metadata import _DENSE_META_ROW_TYPE_BITS, _DENSE_META_ROW_TYPE_MASK, _mf_parent_expression
+from .row_metadata import (
+    _DENSE_META_ROW_TYPE_BITS,
+    _DENSE_META_ROW_TYPE_MASK,
+    _mf_parent_expression,
+    unpack_mf_header,
+)
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound, sweep_exit, terms_bound, vote
 
 CONTACT = int(PGS_CONSTRAINT_TYPE_CONTACT)
@@ -88,7 +93,7 @@ class WorldRows:
       records' kinds whenever the metadata streams);
     - ``"header"``: the free bodies' placement's header, one packed ``int4`` per row (``mf_meta``: the sides' first
       coordinates ``dof_a << 16 | dof_b``, the inverse diagonal, the right-hand side, and ``kind | parent << 16``),
-      which the operator's pipeline reads (:meth:`.FreeBodyZ.consume`).
+      which the free bodies' row loop reads a row ahead (:func:`rows_block`).
 
     Impulses are staged (``s_lam_dense``, ``s_lam_mf``) or, with ``stream`` (the header's rows), read and written in
     place (``g_lam_mf``). A dense row's and a streamed one's impulse is owned by the row's first lane, whose value
@@ -1242,6 +1247,30 @@ def _block(lines: list[str], pad: str) -> str:
     return "{\n" + indent("\n".join(lines), pad + "    ") + f"\n{pad}}}"
 
 
+def _header_load(op, row: str, indent: str) -> str:
+    """Load row ``row``'s packed header word and this lane's entry of its ``Z`` into the header pipeline's registers
+    (``pre_meta``, ``pre_z``)."""
+    lane = op.lanes.lane
+    meta = "off_meta" if row == "0" else f"off_meta + ({row}) * 4"
+    return (
+        f"{indent}pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[{meta}]);\n"
+        f"{indent}if ({lane} < {op.width}) pre_z = {op.element(row, lane)};"
+    )
+
+
+def _header_consume(op, row: str, end: str, indent: str) -> str:
+    """Take row ``row``'s header word and entry from the pipeline (``meta``, ``cur_z``), load row ``row + 1``'s (before
+    ``end``) and decode the word (:func:`.row_metadata.unpack_mf_header`)."""
+    return (
+        f"{indent}int4 meta = pre_meta;\n"
+        f"{indent}float cur_z = pre_z;\n"
+        f"{indent}if ({row} + 1 < {end}) {{\n"
+        + _header_load(op, f"{row} + 1", indent + "    ")
+        + f"\n{indent}}}\n"
+        + unpack_mf_header("meta", indent)
+    )
+
+
 def rows_block(
     rows: WorldRows,
     op,
@@ -1254,8 +1283,9 @@ def rows_block(
 ) -> str:
     """The Gauss-Seidel loop over a world's rows of one class ``[0, end)`` in slot order (:class:`WorldRows`): the
     dense rows on packed rows (:class:`.response_operator.SparseFactor`, to ``m_dense``), the free bodies' on their
-    ``Z`` (:class:`.response_operator.FreeBodyZ`, to ``mf_contact_end``), whose header the operator's pipeline reads
-    a row ahead.
+    ``Z`` (:func:`.sweep_routes.free_body_rows`, to ``mf_contact_end``). The free bodies' loop is software-pipelined:
+    each row's header word and this lane's entry of its ``Z`` load a row ahead (``pre_meta``, ``pre_z``), and the
+    visit takes them as ``meta`` and ``cur_z``, the visited row's entry its operator reads.
 
     ``admission`` holds the block's own skips, run after the row's kind is read. A dense friction pair's second
     tangent shares its first tangent's entries: the first tangent's residual reduces the pair's terms with its own
@@ -1274,11 +1304,12 @@ def rows_block(
     if header:
         diagonal = Diagonal(inverse=lambda row: "mf_diag" if row == "i" else rows.inverse(row))
         kind, check, declare, residual = "mf_rt", "mf_diag", "", None
-        head = op.consume("i", end, inner)
+        head = _header_consume(op, "i", end, inner)
         parent = rows.parent_of("packed_tp")
         rhs = lambda row: "__int_as_float(meta.z)" if row == "i" else rows.rhs_of(row)  # noqa: E731
         prologue = (
-            f"{op.pipeline_registers(pad)}\n{pad}if ({end} > 0) {{\n{op.prefetch_first('0', pad + '    ')}\n{pad}}}\n"
+            f"{pad}int4 pre_meta;\n{pad}float pre_z = 0.0f;\n"
+            f"{pad}if ({end} > 0) {{\n{_header_load(op, '0', pad + '    ')}\n{pad}}}\n"
         )
     else:
         diagonal = Diagonal(lambda row: "denom" if row == "i" else rows.diag(row))
@@ -1475,7 +1506,7 @@ def speed_rows_pass(rows: WorldRows, op, laws: RowLaws, *, walk, pad: str = "   
         "    float mf_diag = __int_as_float(meta.y);",
         "    if (mf_diag <= 0.0f || dof_a < 0) continue;",
         "",
-        f"    const int speed_axis = {op.Z}.data[{op.base} + i * 12 + 3] != 0.0f ? 3 : 0;",
+        f"    const int speed_axis = {op.element('i', '3')} != 0.0f ? 3 : 0;",
         speed_row(
             walk,
             laws,

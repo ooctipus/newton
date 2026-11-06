@@ -23,7 +23,7 @@ from .kernel_template import KernelTemplate
 from .law_source import law_preludes
 from .packed_rows import PACKED_SIDES
 from .projection_laws import CONE_LAW, PROJECTION_LAW
-from .response_operator import FreeBodyZ, Lanes, SparseFactor, Velocity
+from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import DEFAULT_POLICY, QUIET_LITERAL, SolvePolicy, block_argmax, sweep_exit
@@ -214,6 +214,35 @@ def packed_operator(support: int, lanes: Lanes, *, wide: bool = False) -> Sparse
     return SparseFactor(int(support), coordinate, value, lanes, velocity=Velocity("s_v"))
 
 
+def free_body_rows(lanes: Lanes) -> SparseFactor:
+    """The free bodies' rows, whitened: ``Z = L^-1 J^T`` over at most two free bodies, the 6 + 6 support class.
+
+    A free body is a one-node tree; ``L`` is its held factor (``H = L L^T``, armature included), and the sweep holds the
+    change of the body's six velocity coordinates in factor coordinates, ``u = L^T dv`` (``s_v``). Row ``r``'s twelve
+    entries are one packed row at ``mf_Z[mf12_base + 12 r]``: entry ``e < 6`` at body ``a``'s coordinate ``dof_a + e``,
+    entry ``e >= 6`` at body ``b``'s ``dof_b + e - 6``, none for a negative body (the visit's ``dof_a``, ``dof_b``, which
+    every row of a contact shares). The builder stores ``1 / A_ii`` (``A_ii = cfm + |Z|^2``) in the row's header word.
+
+    ``Z``'s place: with lanes, lane ``l < 12`` owns entry ``l`` and the visited row's (``row``) is the free bodies' row
+    loop's register ``cur_z``, loaded a row ahead (:func:`.sweep.rows_block`); every other row, its friction sibling
+    (``sib``), spin row (``spin``) or a seed's row, is read where it is used. One thread reads every row where it is
+    used, the visited one at the loop's ``i``. The loop's rows do not own their stores, so a friction pair applies its
+    second tangent on its own (``fused_pair_apply`` false).
+    """
+
+    def coordinate(row: str, entry: str) -> str:
+        return f"({entry} < 6 ? (dof_a >= 0 ? dof_a + {entry} : -1) : (dof_b >= 0 ? dof_b + {entry} - 6 : -1))"
+
+    def value(row: str, entry: str) -> str:
+        if row == "row":
+            if lanes.parallel:
+                return "cur_z"
+            row = "i"
+        return f"mf_Z.data[mf12_base + {row} * 12 + {entry}]"
+
+    return SparseFactor(12, coordinate, value, lanes, velocity=Velocity("s_v"), registers=True, fused_pair_apply=False)
+
+
 MAPPINGS = ("warp", "colored")
 """The matrix-free sweep's thread mappings of a world's free-body rows: one warp visits them in row order, or a block
 visits their colors in order and each color's units at once (:mod:`.sweep_units`)."""
@@ -342,19 +371,6 @@ def _unit_apply(pad: str, *, torsion: bool = False) -> str:
         f"            s_v[dof_b + k] = unit_u[6 + k] + ({sum_(1)});",
         "    }",
         "}",
-    ]
-    return indent("\n".join(lines), pad)
-
-
-def _colored_pair_metric(op: FreeBodyZ, diagonal: Diagonal, pad: str) -> str:
-    """Native statements, after a unit's ``E`` and ``W`` and ``dof_a``, ``dof_b`` are declared: its friction pair's
-    metric (``ProjectionLaw::friction_pair_metric`` of the first tangent's diagonal, the pair's coupling and the
-    second tangent's diagonal), formed exactly as the visit's pair law forms it."""
-    lines = [
-        "const int r = 1;",
-        "const float mf_diag = __int_as_float(W[3]);",
-        op.coupling("cross", "i", "sib", ""),
-        f"const auto metric = ProjectionLaw::friction_pair_metric({diagonal.value('i')}, cross, {diagonal.value('sib')});",
     ]
     return indent("\n".join(lines), pad)
 
@@ -490,25 +506,36 @@ const float mf_diag = __int_as_float(meta.y);"""
             }}"""
 
 
+def _colored_diagonal(r: int) -> str:
+    """A colored unit's row ``r``'s diagonal ``A_rr`` from its stored inverse (``W[3 r]``; zero for a zero one)."""
+    return f"(__int_as_float(W[{3 * r}]) > 0.0f ? 1.0f / __int_as_float(W[{3 * r}]) : 0.0f)"
+
+
+def _colored_pair_metric(pad: str) -> str:
+    """Native statements, after a unit's ``W`` and its pair's coupling ``unit_cross`` are declared: its friction pair's
+    metric (``ProjectionLaw::friction_pair_metric`` of the first tangent's diagonal, the pair's coupling and the
+    second tangent's diagonal), formed exactly as the visit's pair law forms it."""
+    return f"{pad}const auto metric = ProjectionLaw::friction_pair_metric({_colored_diagonal(1)}, unit_cross, {_colored_diagonal(2)});"
+
+
 def _colored_friction_metric(layout: sweep_units.SlotLayout, pad: str) -> list[str]:
     """Native statements under contact torsion, after a unit's ``E``, ``W``, ``slot`` and its rows' couplings are
     declared: its friction metric (``friction_metric``, :data:`TRIPLE_METRIC` floats), the friction triple's
     (``ProjectionLaw::friction_ball_metric`` of its friction rows' block) with a spin row, else the pair's
     (``ProjectionLaw::friction_pair_metric``), each formed from the diagonals the visit reads."""
-    diagonal = lambda r: f"(__int_as_float(W[{3 * r}]) > 0.0f ? 1.0f / __int_as_float(W[{3 * r}]) : 0.0f)"  # noqa: E731
     lines = [
         f"float friction_metric[{TRIPLE_METRIC}] = {{}};",
         "if ((slot.y & 7) == 4) {",
         "    const auto triple = ProjectionLaw::friction_ball_metric(",
-        f"        wp::mat33({diagonal(1)}, unit_cross, unit_cross13,",
-        f"                  unit_cross, {diagonal(2)}, unit_cross23,",
-        f"                  unit_cross13, unit_cross23, {diagonal(3)}),",
+        f"        wp::mat33({_colored_diagonal(1)}, unit_cross, unit_cross13,",
+        f"                  unit_cross, {_colored_diagonal(2)}, unit_cross23,",
+        f"                  unit_cross13, unit_cross23, {_colored_diagonal(3)}),",
         f"        E[{layout.mu}], E[{layout.spin_mu}]);",
         "    const wp::quat basis = wp::quat_from_matrix(triple.v1);",
         "    for (int f = 0; f < 3; ++f) friction_metric[f] = triple.v0[f];",
         "    for (int f = 0; f < 4; ++f) friction_metric[4 + f] = basis[f];",
         "} else {",
-        f"    const auto metric = ProjectionLaw::friction_pair_metric({diagonal(1)}, unit_cross, {diagonal(2)});",
+        _colored_pair_metric("    "),
         *(f"    friction_metric[{f}] = {value};" for f, value in enumerate(_PAIR_METRIC)),
         "}",
     ]
@@ -541,41 +568,21 @@ def _colored_metrics(units: int, *, torsion: bool = False) -> str:
         "#pragma unroll",
         f"            for (int f = 0; f < {fields}; ++f) E[f] = slot_data.data[slot_base + f * {units}];",
     ]
-    values = names
-    if torsion:
-        # The friction rows' couplings too, which form the friction metric with the rows' diagonals.
-        couplings = (*couplings, *_TRIPLE_COUPLINGS)
-        rows = [
-            *head,
-            f"            const int word_base = unit_slot * {words * units} + p;",
-            f"            float E[{fields}];",
-            f"            int W[{words}];",
-            *stage,
-            "#pragma unroll",
-            f"            for (int f = 0; f < 12; ++f) W[f] = slot_words.data[word_base + f * {units}];",
-            "            // The Gram couplings of the unit's rows: per coordinate, body a's then b's products.",
-        ]
-        values = [*(f"friction_metric[{f}]" for f in range(TRIPLE_METRIC)), *names]
-    else:
-        op = FreeBodyZ(
-            Lanes(1),
-            velocity=Velocity("s_v"),
-            entry=lambda side, row, k: f"E[{ {'i': 'r', 'sib': '2'}[row] } * 12 + {side * 6} + {k}]",
-        )
-        diagonal = Diagonal(inverse=lambda row: "mf_diag" if row == "i" else "__int_as_float(W[2 * 3])")
-        rows = [
-            *head,
-            f"            const int word_base = unit_slot * {words * units} + p;",
-            f"            float E[{fields}];",
-            f"            int W[{words}];",
-            *stage,
-            "#pragma unroll",
-            f"            for (int f = 0; f < 9; ++f) W[f] = slot_words.data[word_base + f * {units}];",
-            _colored_pair_metric(op, diagonal, " " * 12),
-            "            // The Gram couplings of the pair's tangents with the normal, Z_n . Z_t1 and Z_n . Z_t2: per coordinate,",
-            "            // body a's then b's products.",
-        ]
-        values = [*_PAIR_METRIC, *names]
+    # The friction rows' couplings too, which form the friction metric with the rows' diagonals: the pair's, and under
+    # torsion the spin row's with each tangent.
+    couplings = (*couplings, *(_TRIPLE_COUPLINGS if torsion else _TRIPLE_COUPLINGS[:1]))
+    metric = _colored_friction_metric(layout, " " * 12) if torsion else [_colored_pair_metric(" " * 12)]
+    values = [*((f"friction_metric[{f}]" for f in range(TRIPLE_METRIC)) if torsion else _PAIR_METRIC), *names]
+    rows = [
+        *head,
+        f"            const int word_base = unit_slot * {words * units} + p;",
+        f"            float E[{fields}];",
+        f"            int W[{words}];",
+        *stage,
+        "#pragma unroll",
+        f"            for (int f = 0; f < {layout.ring}; ++f) W[f] = slot_words.data[word_base + f * {units}];",
+        "            // The Gram couplings of the unit's rows: per coordinate, body a's then b's products.",
+    ]
 
     def products(side: int) -> list[str]:
         entry = lambda row: f"E[{12 * row + 6 * side} + k]" if 12 * row + 6 * side else "E[k]"  # noqa: E731
@@ -591,7 +598,7 @@ def _colored_metrics(units: int, *, torsion: bool = False) -> str:
         *products(1),
         "                }",
         "            }",
-        *(_colored_friction_metric(layout, " " * 12) if torsion else ()),
+        *metric,
         f"            const int at = unit_slot * {layout.metric * units} + p;",
         *(
             f"            slot_metric.data[at{f' + {f * units}' if f else ''}] = {value};"
@@ -660,7 +667,7 @@ def mf_gs_source(
 ) -> tuple[str, Staging]:
     """The native body of the matrix-free Gauss-Seidel sweep: a world's dense rows (:func:`packed_operator`, packed
     whitened rows of ``max_row_dofs`` entries, by default as many as the world's coordinates) and its free-body rows
-    (:class:`.FreeBodyZ`), then its end-of-sweep passes, on the world's velocity change from the predictor in walk
+    (:func:`free_body_rows`), then its end-of-sweep passes, on the world's velocity change from the predictor in walk
     coordinates (:class:`FreeBodyCoordinates`), from zero, or with ``seeded`` from the response of the impulses the
     rows carry (:func:`.sweep.impulse_seed`). The launch adds it to the walk's ``du`` (:attr:`.factor.walk.WalkTrees.du`),
     which the step's one leave walks down onto ``v_out`` (:func:`.factor.walk.walk_leave_kernel`); a free body's speed
@@ -697,7 +704,7 @@ def mf_gs_source(
     dense = WorldRows(M_D, staging=places.staging, lanes=row_lanes)
     free = WorldRows(M_MF, staging="header", stream=places.impulses is Place.GLOBAL, lanes=row_lanes)
     dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows)
-    free_op = FreeBodyZ(row_lanes)
+    free_op = free_body_rows(row_lanes)
     staging = mf_gs_staging(
         M_D,
         M_MF,

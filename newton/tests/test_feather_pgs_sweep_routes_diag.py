@@ -19,9 +19,10 @@ from pathlib import Path
 import warp as wp
 
 from newton._src.solvers.feather_pgs import sweep_routes_diag as routes
-from newton._src.solvers.feather_pgs.response_operator import FreeBodyZ, Lanes, Velocity
+from newton._src.solvers.feather_pgs.response_operator import Lanes, Velocity
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
 from newton._src.solvers.feather_pgs.sweep import RowLaws, speed_row
+from newton._src.solvers.feather_pgs.sweep_routes import free_body_rows
 
 _POLICIES = (SolvePolicy(), SolvePolicy(readout="sweeps"), SolvePolicy(readout="trace"))
 _SCHEDULES = (
@@ -164,25 +165,25 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
     """The operators' layouts emit the order of the sweeps they replace."""
 
     def test_free_body_one_thread(self):
-        op = FreeBodyZ(Lanes(1), velocity=Velocity("s_vel"))
+        op = free_body_rows(Lanes(1))
         residual = op.residual("jv", "")
-        # Each side's six products as one expression, added to the residual: a's, then b's.
-        terms = " + ".join(
-            f"mf_Z.data[mf12_base + i * 12 + {k}] * s_vel[dof_a{f' + {k}' if k else ''}]" for k in range(6)
+        # One thread sums the twelve entries in order, a's six then b's, from zero; the visited row is read at i.
+        self.assertIn("float jv = 0.0f;", residual)
+        self.assertIn("const int entry = q;", residual)
+        self.assertIn("for (int q = 0; q < 12; ++q) {", residual)
+        self.assertIn("jv += mf_Z.data[mf12_base + i * 12 + entry] * velocity;", residual)
+        self.assertIn(
+            "(entry < 6 ? (dof_a >= 0 ? dof_a + entry : -1) : (dof_b >= 0 ? dof_b + entry - 6 : -1))", residual
         )
-        self.assertIn(f"jv += {terms};", residual)
-        self.assertLess(residual.index("dof_a >= 0"), residual.index("dof_b >= 0"))
-        # The sibling residual starts from its right-hand side; a and b alternate per coordinate.
+        self.assertNotIn("SUM", residual)
+        # The sibling residual sums its velocity term, then adds its right-hand side.
         sibling = op.sibling_residual("sibling_residual", "sib", "", "rhs[sib]")
-        self.assertIn("float sibling_residual = rhs[sib];", sibling)
-        a = sibling.index("if (dof_a >= 0) sibling_residual += mf_Z.data[mf12_base + sib * 12 + k] * s_vel[dof_a + k];")
-        b = sibling.index(
-            "if (dof_b >= 0) sibling_residual += mf_Z.data[mf12_base + sib * 12 + 6 + k] * s_vel[dof_b + k];"
-        )
-        self.assertLess(a, b)
+        self.assertIn("sibling_residual += mf_Z.data[mf12_base + sib * 12 + entry] * velocity;", sibling)
+        self.assertLess(sibling.index("* velocity;"), sibling.index("sibling_residual += rhs[sib];"))
         coupling = op.coupling("cross", "i", "sib", "")
-        self.assertIn("float cross = 0.0f;", coupling)
-        self.assertIn("cross += mf_Z.data[mf12_base + i * 12 + k] * mf_Z.data[mf12_base + sib * 12 + k];", coupling)
+        self.assertIn(
+            "cross += mf_Z.data[mf12_base + i * 12 + entry] * mf_Z.data[mf12_base + sib * 12 + entry];", coupling
+        )
         # A speed row reads the body's physical velocity v = L^-T u by its walk, then pushes u by L^T dv the same way.
         speed = _speed_row(Lanes(1), Velocity("s_vel"))
         self.assertIn("speed_v[k] = s_vel[f + k];", speed)
@@ -191,11 +192,21 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
         self.assertIn("WALK_ENTER_OF(f, speed_dv, speed_du);", speed)
         self.assertIn("s_vel[f + k] += speed_du[k];", speed)
 
-    def test_free_body_lanes_keep_their_text(self):
-        op = FreeBodyZ(Lanes(32))
-        self.assertIn(
-            "SUM(sibling_residual);\nsibling_residual += rhs;", op.sibling_residual("sibling_residual", "s", "", "rhs")
-        )
+    def test_free_body_lanes(self):
+        op = free_body_rows(Lanes(32))
+        # A lane an entry: the visited row's is the loop's pipelined register, every other row's is read at its index.
+        residual = op.residual("jv", "")
+        self.assertIn("jv += cur_z * velocity;", residual)
+        self.assertIn("const int index = entry < 12 ?", residual)
+        self.assertIn("SUM(jv);", residual)
+        # A friction pair's terms reduce in one ladder, the right-hand side added after.
+        pair = op.pair_terms("i", "sib", lambda row: f"rhs[{row}]", "")
+        self.assertIn("SUM(sibling_residual, cross);\nsibling_residual += rhs[sib];", pair)
+        self.assertIn("cross += cur_z * mf_Z.data[mf12_base + sib * 12 + entry];", pair)
+        # The second tangent applies on its own, read at its index.
+        self.assertFalse(op.fused_pair_apply)
+        self.assertIn("s_v[index] += mf_Z.data[mf12_base + sib * 12 + entry] * d;", op.apply_row("sib", "d", ""))
+        self.assertIn("s_v[index] += cur_z * d;", op.apply("d", ""))
         # The lanes push the speed row's change from their first lane.
         self.assertIn("if (lane == 0) {", _speed_row(Lanes(32), Velocity("s_v")))
 

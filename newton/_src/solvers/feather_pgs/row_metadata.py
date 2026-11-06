@@ -37,3 +37,33 @@ def _mf_parent_expression(packed: str, max_constraints: int) -> str:
     # Adding one modulo 2^16 maps the 0xffff sentinel to zero before signed
     # subtraction; valid high parent indices never undergo sign extension.
     return f"static_cast<int>(((static_cast<unsigned int>({packed}) >> 16) + 1u) & 0xffffu) - 1"
+
+
+def pack_mf_header(word: str, dof_a: str, dof_b: str, inverse: str, rhs: str, kind: str, parent: str, indent: str):
+    """Declare ``int4 word``, a free-body row's packed header word as :func:`unpack_mf_header` decodes it.
+
+    ``x``: the bodies' first world coordinates, ``dof_a`` in the high and ``dof_b`` in the low 16 bits (-1 for
+    none); ``y`` and ``z``: the bits of the stored inverse diagonal and of the right-hand side; ``w``: the row
+    type in the low and the parent (0xFFFF for none) in the high 16 bits.
+    """
+    return (
+        f"{indent}int4 {word};\n"
+        f"{indent}{word}.x = ({dof_a} << 16) | ({dof_b} & 0xFFFF);\n"
+        f"{indent}{word}.y = __float_as_int({inverse});\n"
+        f"{indent}{word}.z = __float_as_int({rhs});\n"
+        f"{indent}{word}.w = static_cast<int>(static_cast<unsigned int>({kind}) | "
+        f"(static_cast<unsigned int>({parent}) << 16));"
+    )
+
+
+def unpack_mf_header(word: str, indent: str) -> str:
+    """Declare a free-body row's fields from its packed header word ``word`` (:func:`pack_mf_header`): ``dof_a``,
+    ``dof_b``, ``mf_diag`` (the stored inverse diagonal), ``packed_tp`` and ``mf_rt`` (the row type)."""
+    return (
+        f"{indent}int packed_dofs = {word}.x;\n"
+        f"{indent}int dof_a = packed_dofs >> 16;\n"
+        f"{indent}int dof_b = (packed_dofs << 16) >> 16;\n"
+        f"{indent}float mf_diag = __int_as_float({word}.y);\n"
+        f"{indent}int packed_tp = {word}.w;\n"
+        f"{indent}int mf_rt = packed_tp & 0xFFFF;"
+    )

@@ -4,9 +4,9 @@
 """The free-body rows' headers and addressing.
 
 The rows are the walk's (:mod:`.walk_rows`: the one writer walks every row's seeds into its whitened form ``Z``). This
-module packs the free-body rows (:class:`.response_operator.FreeBodyZ`, rows over at most two free bodies) into the
-row word (:func:`free_body_meta_kernel`, which :meth:`.FreeBodyZ.consume` decodes: its sides' coordinates,
-``1 / A_ii``); their ``A_ii`` is the walk's (:func:`.walk_rows.write_free_body_rows`), their rhs the rows' law's.
+module packs the free-body rows (:func:`.sweep_routes.free_body_rows`, rows over at most two free bodies) into the
+row word (:func:`free_body_meta_kernel`, :func:`.row_metadata.pack_mf_header`, which the sweeps' row loop decodes:
+its sides' coordinates, ``1 / A_ii``); their ``A_ii`` is the walk's (:func:`.walk_rows.write_free_body_rows`), their rhs the rows' law's.
 The bilateral closure is the factor's (:mod:`.factor.closure`), the paired rows' qualification the paired
 components' (:func:`.paired_components.paired_components_kernel`).
 """
@@ -20,11 +20,10 @@ import warp as wp
 from . import kernel_template
 from .device_preludes import CPU_MATH, dual_native, lane_group
 from .kernel_template import KernelTemplate
-from .response_operator import FreeBodyZ
-from .row_metadata import _validate_mf_metadata_encoding
+from .row_metadata import _validate_mf_metadata_encoding, pack_mf_header
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Free-body rows (FreeBodyZ)
+# Free-body rows
 # ---------------------------------------------------------------------------------------------------------------------
 #
 # A free-body row acts on at most two free rigid bodies, ``a`` and ``b`` (a negative body for none), through six
@@ -37,7 +36,7 @@ from .row_metadata import _validate_mf_metadata_encoding
 
 @cache
 def free_body_meta_kernel(mf_max_constraints: int, pitch: int, base: int, lanes: int, device_arch: str) -> wp.Kernel:
-    """Pack each world's free-body rows into the 128-bit word the matrix-free sweeps load (:meth:`.FreeBodyZ.pack`).
+    """Pack each world's free-body rows into the 128-bit word the matrix-free sweeps load (:func:`.row_metadata.pack_mf_header`).
 
     A group of ``lanes`` lanes per world (``wp.launch_tiled`` over the worlds: a warp, or a block when few worlds
     would idle the device, :func:`.execution.fill_lanes`; one thread on the CPU), a lane per row; the word holds the
@@ -48,7 +47,7 @@ def free_body_meta_kernel(mf_max_constraints: int, pitch: int, base: int, lanes:
     free bodies' first row, as the sweeps stage their impulses. ``device_arch`` keys the variant.
     """
     _validate_mf_metadata_encoding(mf_max_constraints)
-    word = FreeBodyZ().pack("packed", "da", "db", "inverse", "rhs_val", "rt", "par", "        ")
+    word = pack_mf_header("packed", "da", "db", "inverse", "rhs_val", "rt", "par", "        ")
     body = f"""    int m_mf = mf_constraint_count.data[world];
     const int mf_line = first.data[world];
     __builtin_assume(mf_line >= 0);
