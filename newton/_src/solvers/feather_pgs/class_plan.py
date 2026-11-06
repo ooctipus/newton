@@ -7,8 +7,9 @@ Each case's rule (:data:`RULES`, in precedence order) reads only data known befo
 laws, the options, the row capacity, the device's shared budget, the test pins, the factor's drive plan and the held
 tree's admission of the representation the case needs. It returns the case's choice (what its owner builds) or why the
 class does not fit. :func:`plan_class` applies the rules in order: the first that fits gives the class its case, and
-every later case says which case holds the class. Two data keep every class general: a test pin and a device without
-the cases' native bodies (:func:`general_reason`). The owners then build from the
+every later case says which case holds the class. One datum keeps every class general: a test pin
+(:func:`general_reason`). Each case's body runs on both devices, the CPU's one thread a lane group, so the device
+decides no case but K4's, whose Jacobi tiers run a lane a row (:func:`tier_rule`). The owners then build from the
 plan (:class:`ClassPlan`) and decide nothing of the case.
 """
 
@@ -189,16 +190,13 @@ class ClassPlan:
         return self.diagonal.scalar, self.diagonal.scalar_reason
 
 
-def general_reason(pins, *, native: bool) -> str | None:
-    """Why every class keeps the general placement, or ``None``: the test pin ``placement="general"`` or a device
-    without the cases' native bodies (``native``: they are written for CUDA, so the CPU runs the general placement).
+def general_reason(pins) -> str | None:
+    """Why every class keeps the general placement, or ``None``: the test pin ``placement="general"``. Each case's body
+    runs on both devices (the CPU's one thread runs its lane group), so the device is no datum of the case.
     The bilateral pre-elimination is no general datum: its blocks close in the one writer's block phase, so each case
     whose writer lacks that phase declines it in its own rule (K1's support writer, the keyed layout)."""
     return first_failed(
-        (
-            (pins.placement != "general", "A test pin keeps the general placement (placement='general')."),
-            (native, "The device runs the general placement: the cases' native bodies are written for CUDA."),
-        )
+        ((pins.placement != "general", "A test pin keeps the general placement (placement='general')."),)
     )
 
 
@@ -659,11 +657,16 @@ def tier_rule(inputs: ClassInputs) -> tuple[Tiers | None, str]:
     body-velocity RMS by 0.4-0.9% on two contact-rich patch workloads, and left point tiers 3.9 times the serial
     sweep's p90 error from its fixed point on anymal-D's 33-48-row worlds). Their row bound is the dense row capacity,
     at most :data:`.sweep_routes_tiers.TIER_MAX_ROWS`, in whole quads; a test pin (``tiers``) sets it on any class
-    whose response they form.
+    whose response they form. They run on CUDA only: a lane a row of a block's group, whose one-lane form is not built.
     """
     forest, pinned = inputs.forest, inputs.pins.tiers
     reason = first_failed(
         (
+            (
+                inputs.model.device.is_cuda,
+                "The tiers run a lane a row of a block's group: their body is CUDA's (its one-lane form is designed, "
+                "U18).",
+            ),
             (
                 forest.world_count > 0 and forest.max_world_dofs > 0,
                 "No matrix-free sweep runs whose dense rows the tiers could take.",

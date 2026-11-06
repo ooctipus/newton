@@ -257,10 +257,15 @@ class TestContactUnit(unittest.TestCase):
                 self.assertEqual(unit.count("SYNC();"), 0)
 
     def test_owned_rows_hold_their_impulses_exactly_where_the_lanes_share_the_stores(self):
+        """A lane group's owned rows hold their staged values, rows every lane stores never do, and one thread may:
+        it reads the registers it loaded as it would its own stores (the CPU's one-lane form of a case's unit)."""
         with self.assertRaises(ValueError):
             self._unit(held=False)
         with self.assertRaises(ValueError):
-            self._unit(Lanes(1))
+            self._unit(owned=False)
+        unit = self._unit(Lanes(1))
+        self.assertIn("float unit_normal = unit_lam0;", unit)
+        self.assertEqual(unit.count("SYNC();"), 0)
 
 
 class TestRowTail(unittest.TestCase):

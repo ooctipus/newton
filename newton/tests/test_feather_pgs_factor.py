@@ -1307,11 +1307,18 @@ class TestWalkF1(unittest.TestCase):
                 self.check(check_rows(solver, joint_q, capture, np.random.default_rng(7)))
 
 
+_OWN_ROW_LAYOUTS = ("K1", "K2")
+"""The cases whose rows live in their own layouts, not the packed store F1 reads: K1's support rows in factor
+coordinates, K2's slot rows (their sweeps' tests read them)."""
+
+
 def _add_f1_tests():
     for physics, route in catalogue():
 
         def test(self, physics=physics, route=route):
             solver, joint_q, capture = run_route(physics, route)
+            if solver.spec.classes.case in _OWN_ROW_LAYOUTS:
+                self.skipTest(f"case {solver.spec.classes.case} writes its rows in its own layout")
             self.check(check_rows(solver, joint_q, capture, np.random.default_rng(7)))
 
         test.__doc__ = f"F1 on {physics.name} through {route.name}."

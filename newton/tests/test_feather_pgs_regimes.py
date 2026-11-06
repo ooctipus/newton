@@ -1728,11 +1728,12 @@ class TestQ18Manufactured(unittest.TestCase):
                         self.assertLess(max(problem.residual(solver)), self.TOLERANCE)
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "needs CUDA")
-class TestQ18ManufacturedCUDA(unittest.TestCase):
-    """Q18 on every CUDA placement: each must return the solution the core returns, on seeds its own settled pose makes
-    regular. The Jacobi tiers are read apart (:meth:`test_tiers_return_the_solution`)."""
+class TestQ18Placements(unittest.TestCase):
+    """Q18 on every placement the CPU takes: each case's body runs there at one lane, and must return the solution
+    the core returns, on seeds its own settled pose makes regular. The Jacobi tiers run on CUDA only
+    (:class:`TestQ18ManufacturedCUDA`)."""
 
+    DEVICE = DEVICE
     PLACEMENTS = (
         (scenes.box_stack, 60, 2.0 / 3.0, ("MF_HELD", "MF_DEFAULT")),
         (scenes.legged, 30, 2.0 / 3.0, ("MF_HELD", "SPARSE")),
@@ -1741,20 +1742,28 @@ class TestQ18ManufacturedCUDA(unittest.TestCase):
         (scenes.hand, 30, 2.0 / 3.0, ("PAIRED", "PAIRED_FOREST")),
     )
     """``(build, settle, loaded, routes)``, as :attr:`TestQ18Manufactured.SCENES`."""
-    TIERS = ("MF_PARALLEL", "KEYED_PARALLEL")
-    """The Jacobi tiers (K4), on legged."""
 
     def _placements(self, spin, count):
         for build, settle, loaded, names in self.PLACEMENTS:
             entry = (build, settle, min(loaded, SPARSE) if spin else loaded)
             for name in names:
-                check_regular_scenes(self, (entry,), getattr(conformance, name), "cuda:0", spin=spin, count=count)
+                route = dataclasses.replace(getattr(conformance, name), device=self.DEVICE.split(":")[0])
+                check_regular_scenes(self, (entry,), route, self.DEVICE, spin=spin, count=count)
 
     def test_every_placement_returns_the_solution(self):
         self._placements(False, 3)
 
     def test_every_placement_holds_spin_rows(self):
         self._placements(True, 1)
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "needs CUDA")
+class TestQ18ManufacturedCUDA(TestQ18Placements):
+    """Q18 on every CUDA placement, the Jacobi tiers among them, read apart (:meth:`test_tiers_return_the_solution`)."""
+
+    DEVICE = "cuda:0"
+    TIERS = ("MF_PARALLEL", "KEYED_PARALLEL")
+    """The Jacobi tiers (K4), on legged."""
 
     @known_failure(
         "E2: the Jacobi tiers' momentum on a sliding Coulomb face (K4)",

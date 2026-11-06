@@ -499,7 +499,7 @@ class SolverFeatherPGS(SolverBase):
                 pins=pins,
                 dense_rows=capacities.dense_rows,
             ),
-            general=general_reason(pins, native=model.device.is_cuda),
+            general=general_reason(pins),
         )
         # The step's spec: every unknown that decides its path, gathered before any owner of the step, which each
         # owner below reads and builds its part of the class plan from.

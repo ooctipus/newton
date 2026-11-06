@@ -247,10 +247,12 @@ def branch_articulations(model):
     return np.arange(0, model.articulation_count, model.articulation_count // model.world_count)
 
 
-def cpu_solver(model):
+def cpu_solver(model, pins=None):
     """A CPU solver of a branch model: the scalar kernels and the head kernels bind the arrays the CUDA route binds
-    once its held plan carries the CUDA route's compact diagonal (:func:`held_plan`)."""
-    return SolverFeatherPGS(model, enable_joint_limits=True, update_mass_matrix_interval=2)
+    once its held plan carries the CUDA route's compact diagonal (:func:`held_plan`); ``pins`` its test pins."""
+    return SolverFeatherPGS(
+        model, pins=pins or SolverFeatherPGS.Pins(), enable_joint_limits=True, update_mass_matrix_interval=2
+    )
 
 
 def _inputs(solver):
@@ -652,7 +654,8 @@ class TestScalarBranchRule(unittest.TestCase):
         that bank too. Launches are recorded, not run.
         """
         model = build_branch_model(worlds=2)
-        solver = cpu_solver(model)
+        # The general placement's walk holds every tree, so both owners bind on one solver.
+        solver = cpu_solver(model, SolverFeatherPGS.Pins(placement="general"))
         owners = {
             "scalar": HeldTree(solver, held_plan(solver, 7)),
             "plain": HeldTree(solver, held_plan(solver, 7, scalar=False)),

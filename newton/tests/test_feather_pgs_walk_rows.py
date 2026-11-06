@@ -740,14 +740,17 @@ class TestSlotFrame(unittest.TestCase):
 
 
 class TestWalkedPlacement(unittest.TestCase):
-    """Every walked row of the CPU catalogue's general worlds against its physical ``J``, and the leave in its frame."""
+    """Every walked row of the CPU catalogue's general worlds against its physical ``J``, and the leave in its frame.
+
+    The general placement's rows (case K6): each problem's reference route runs it, and a default route the CPU gives
+    another case (K1, K2, K5 write their rows in their own layouts) is left to that case's own tests."""
 
     def test_one_frame_on_the_cpu_catalogue(self):
         worst = {"rows": 0.0, "free_rows": 0.0, "leave": 0.0}
         worlds = free_bodies = 0
         for physics, route in catalogue():
             solver, joint_q, capture = run_route(physics, route, device="cpu", steps=4)
-            if not solver.placement.walks:
+            if not solver.placement.walks or solver.spec.classes.case != "K6":
                 continue
             result = walked_frames(solver, joint_q, capture)
             worlds += result["worlds"]

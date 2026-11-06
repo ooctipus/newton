@@ -991,8 +991,10 @@ class TestKeyedPatchRows(unittest.TestCase):
             "dense_max_constraints": 64,
             "joint_limit_activation_gap": 0.1,
         }
-        general = SolverFeatherPGS(model, **options)
-        keyed = SolverFeatherPGS(model, **options)
+        # Both on the general placement, which the keyed rows' stand-ins take over (install_cpu_keyed_rows).
+        pins = SolverFeatherPGS.Pins(placement="general")
+        general = SolverFeatherPGS(model, pins=pins, **options)
+        keyed = SolverFeatherPGS(model, pins=pins, **options)
         keyed.laws.friction_patches = general.laws.friction_patches
         install_cpu_keyed_rows(keyed)
         if late_beta is not None:
@@ -1250,6 +1252,7 @@ class TestTierRule(unittest.TestCase):
         """The tier rule on a class's inputs, allegro's by default (a 16-coordinate hand and a cube, 192 dense rows),
         with the in-kernel response ``response`` (its sizes and why)."""
         inputs = SimpleNamespace(
+            model=SimpleNamespace(device=SimpleNamespace(is_cuda=True)),
             pins=SolverFeatherPGS.Pins(),
             dense_rows=192,
             forest=SimpleNamespace(
@@ -1300,6 +1303,8 @@ class TestTierRule(unittest.TestCase):
             ),
             ({"pins": SolverFeatherPGS.Pins(tiers=0)}, "tiers=0"),
             ({"response": (None, "A world has several articulations of size 6.")}, "several"),
+            # Their body runs a lane a row: the CPU's one thread runs no tier.
+            ({"model": SimpleNamespace(device=SimpleNamespace(is_cuda=False))}, "lane a row"),
         ):
             with self.subTest(changes=sorted(changes)):
                 choice, why = self._rule(**changes)
@@ -1307,17 +1312,17 @@ class TestTierRule(unittest.TestCase):
                 self.assertIn(reason, why)
 
     def test_an_earlier_case_or_the_general_data_keep_the_class(self):
-        """Give the class to an earlier case that fits, and keep every class general under a pin or the CPU."""
+        """Give the class to an earlier case that fits, and keep every class general under a pin."""
         tiers = next(rule for name, _, rule in class_plan.RULES if name == "K4")
         rules = (("K5", "factor coordinates of a tree beside one free body", lambda inputs: (object(), None)),)
         with patch.object(class_plan, "RULES", (*rules, ("K4", "the Jacobi tiers", tiers))):
             plan = _plan_class(_class_inputs(), general=None)
         self.assertEqual(plan.case, "K5")
         self.assertIn("case K5", plan.reasons["K4"])
-        general = class_plan.general_reason(SolverFeatherPGS.Pins(), native=False)
-        self.assertIn("written for CUDA", _plan_class(_class_inputs(), general=general).reasons["K4"])
-        general = class_plan.general_reason(SolverFeatherPGS.Pins(placement="general"), native=True)
+        self.assertIsNone(class_plan.general_reason(SolverFeatherPGS.Pins()))
+        general = class_plan.general_reason(SolverFeatherPGS.Pins(placement="general"))
         self.assertIn("general placement", general)
+        self.assertIn("general placement", _plan_class(_class_inputs(), general=general).reasons["K4"])
 
     def test_a_pin_builds_the_tiers_on_a_single_tree(self):
         """Build the tiers a test pin asks for on a class whose response they form, at the pinned bound."""
