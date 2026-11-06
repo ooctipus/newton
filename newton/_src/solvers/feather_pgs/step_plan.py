@@ -528,7 +528,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     # Stage 4: the rows. The resolved-world claim, the row pass, the patches' link once every contact row's records are
     # written, the status, the sweep's claims and the overflow warning; then the diagonals and the right-hand sides'
     # writer (spec.rhs: the one writer walks the rows into their placement's sink, the producers wrote them, or the rows'
-    # bias is written apart), then the free bodies' rows' rhs.
+    # bias is written apart); the free bodies' writers write their rows' rhs in the row pass.
     resolved = sweep.resolved_worlds_owner
 
     def classify_resolved_worlds(step):
@@ -569,7 +569,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         laws.bound_free_body_contacts(solver)
 
     def write_free_body_limits(step):
-        laws.write_free_body_limits(solver)
+        laws.write_free_body_limits(solver, step.dt)
 
     def finalize_dense(step):
         laws.finalize_dense(solver)
@@ -638,13 +638,6 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     def write_rhs(step):
         laws.write_rhs(solver, step.dt)
 
-    def write_free_body_rhs(step):
-        laws.write_free_body_rhs(solver, step.dt)
-
-    def write_free_body_rhs_timed(step):
-        with solver._sync_timed("s4_mf_setup"):
-            laws.write_free_body_rhs(solver, step.dt)
-
     # The one writer writes its contact rows' records after the row pass, so the patches link after it there.
     link = (link_patches,)
     add(
@@ -658,8 +651,6 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     )
     rhs = {"walk": (write_walked, *link), "producers": (), "bias": (write_rhs,)}[spec.rhs]
     add(*((diagonals,) if placement.clears_diagonals and topology is None else ()), *rhs, nvtx="S4_HinvJt_Diag_RHS")
-    if forest.has_free_rigid_bodies:
-        add(write_free_body_rhs_timed if "sync_timings" in diagnostics else write_free_body_rhs, nvtx="S4_MF_Setup")
 
     # Stages 5 and 6: the impulses' start (the warm start's normals, the closures' seeds), the claims that
     # follow the published rows, and the sweep.

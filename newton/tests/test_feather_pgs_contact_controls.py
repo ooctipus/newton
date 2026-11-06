@@ -192,16 +192,16 @@ def _launch_articulation_pair_contact_allocator(
     return int(contact_slot.numpy()[0]), int(contact_path.numpy()[0]), slots_needed
 
 
-def _speculative_rhs(scale: float, base: int = 0) -> float:
-    """Return the positive-gap RHS for a requested speculative scale of a row at ``base`` of its line: the dense rows
-    from 0, the free bodies' rows after them (their writers store the normal row's capped beta)."""
-    rhs = wp.zeros((1, base + 1), dtype=wp.float32, device="cpu")
+def _speculative_rhs(scale: float) -> float:
+    """Return the positive-gap RHS for a requested speculative scale: the row law every writer applies
+    (:func:`.row_kernels.row_bias`), the free bodies' among them (their writers store the normal row's capped beta)."""
+    rhs = wp.zeros((1, 1), dtype=wp.float32, device="cpu")
     rows = field_group.upload(
         DenseRows,
         "cpu",
-        phi=[[1.0] * (base + 1)],
-        row_beta=[[0.2] * (base + 1)],
-        row_type=[[0] * (base + 1)],
+        phi=[[1.0]],
+        row_beta=[[0.2]],
+        row_type=[[0]],
         target=wp.zeros_like(rhs),
         restitution=wp.zeros_like(rhs),
         rhs=rhs,
@@ -216,13 +216,12 @@ def _speculative_rhs(scale: float, base: int = 0) -> float:
             wp.zeros_like(rhs),
             wp.array([1], dtype=wp.int32, device="cpu"),
             1,
-            base,
             1,
             row_bias(0.5, scale, 1.0, 0.0, 0, 0),
         ],
         device="cpu",
     )
-    return float(rhs.numpy()[0, base])
+    return float(rhs.numpy()[0, 0])
 
 
 class TestFeatherPGSContactControls(unittest.TestCase):
@@ -378,15 +377,9 @@ class TestFeatherPGSContactControls(unittest.TestCase):
         self.assertEqual(deep_pair, (0, PATH_DENSE, 3))
 
     def test_speculative_scale_controls_every_position_rhs_family(self):
-        """Scale positive-gap position bias on dense and MF rows."""
-        rhs_families = {
-            "dense": _speculative_rhs,
-            "matrix_free": lambda scale: _speculative_rhs(scale, base=1),
-        }
-        for name, compute_rhs in rhs_families.items():
-            with self.subTest(family=name):
-                self.assertEqual(compute_rhs(0.0), 0.0)
-                self.assertAlmostEqual(compute_rhs(1.0), 2.0, places=6)
+        """Scale positive-gap position bias by the one row law every writer applies (dense and free-body rows)."""
+        self.assertEqual(_speculative_rhs(0.0), 0.0)
+        self.assertAlmostEqual(_speculative_rhs(1.0), 2.0, places=6)
 
     def test_gap_gate_prevents_all_route_allocations(self):
         """Drop positive gaps above the gate before any route reserves a slot."""

@@ -370,7 +370,6 @@ def compute_world_contact_bias(
     row_incident: wp.array2d[float],
     world_constraint_count: wp.array[int],
     max_constraints: int,
-    base: int,
     lanes: int,
     bias: RowBias,
 ):
@@ -386,15 +385,14 @@ def compute_world_contact_bias(
 
     A world's ``lanes`` threads stride over its live rows (``dim = (world_count, lanes)``): the grid follows the
     worlds, and a world's slots past its rows cost no thread beyond its lanes. The previous one-thread-per-world loop
-    left the GPU idle (64-128 blocks) for 30-60 us per launch. A class's rows start at ``base`` of the store's line: 0
-    the dense rows, ``body_base`` the free bodies' (their writers stored their diagonals and incident velocities).
+    left the GPU idle (64-128 blocks) for 30-60 us per launch.
     """
     world, lane = wp.tid()
     count = wp.min(world_constraint_count[world], max_constraints)
     if lane >= count:
         return
     line = rows.first[world]
-    for i in range(base + lane, base + count, lanes):
+    for i in range(lane, count, lanes):
         row_bias(rows, bias, line, i, row_incident[line, i])
 
 

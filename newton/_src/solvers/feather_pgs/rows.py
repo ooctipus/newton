@@ -915,7 +915,14 @@ class RowLaws:
                 pool.launch(
                     walk_rows.write_free_body_rows,
                     walker_threads,
-                    inputs=[walk_rows.free_body_sink(solver), contact_input, walker_threads, law],
+                    inputs=[
+                        walk_rows.free_body_sink(solver),
+                        bind_dense_rows(solver.placement),
+                        contact_input,
+                        walker_threads,
+                        law,
+                        self.bias(solver.options, dt),
+                    ],
                     extent=count,
                     clamp=True,
                 )
@@ -972,7 +979,7 @@ class RowLaws:
         in the velocity-limit phase (staged with free bodies)."""
         wp.copy(solver.placement.mf_contact_rows_end, solver.placement.mf_slot_counter)
 
-    def write_free_body_limits(self, solver) -> None:
+    def write_free_body_limits(self, solver, dt: float) -> None:
         """The free bodies' speed limits as matrix-free rows, not post-solve clamps: allocated after the contacts so
         they hold the last free-body slots, which the sweeps visit in a final phase with the joints' velocity limits;
         then the free-body counts finalized again (staged with free bodies that carry speed-limit slots)."""
@@ -1004,6 +1011,7 @@ class RowLaws:
                 bind_dense_rows(placement),
                 walk_rows.free_body_sink(solver),
                 placement.rigid_velocity_limit_slot,
+                self.bias(solver.options, dt),
             ],
             device=model.device,
         )
@@ -1033,14 +1041,7 @@ class RowLaws:
         """Each dense row's rhs: its bias, or a bouncing contact's rebound (``compute_world_contact_bias``), where no
         producer writes it (the stage list's ``rhs == "bias"``, :attr:`.step_plan.StepSpec.rhs`)."""
         placement = solver.placement
-        self._bias(solver, dt, placement.constraint_count, placement.dense_max_constraints, 0)
-
-    def write_free_body_rhs(self, solver, dt: float) -> None:
-        """The free bodies' rows' rhs by the rows' law (``compute_world_contact_bias`` from the store's ``body_base``):
-        their writers stored their diagonals and incident velocities (:func:`.walk_rows.write_free_body_rows`,
-        :func:`.walk_rows.populate_rigid_velocity_limit_rows`)."""
-        placement = solver.placement
-        self._bias(solver, dt, placement.mf_constraint_count, placement.mf_max_constraints, placement.body_base)
+        self._bias(solver, dt, placement.constraint_count, placement.dense_max_constraints)
 
     def bias(self, options, dt: float) -> RowBias:
         """The rows' law's step parameters (:class:`.row_kernels.RowBias`) of a step of ``dt``."""
@@ -1050,8 +1051,8 @@ class RowLaws:
         bias.weighted, bias.material = int(self.set.weighted), int(options.contact_compliance)
         return bias
 
-    def _bias(self, solver, dt: float, counts: wp.array, capacity: int, base: int) -> None:
-        """The rows' bias launch over a class of rows: ``counts`` a world, at most ``capacity``, from row ``base``."""
+    def _bias(self, solver, dt: float, counts: wp.array, capacity: int) -> None:
+        """The rows' bias launch over a class of rows: ``counts`` a world, at most ``capacity``."""
         # A world's lanes: a block, or enough that the worlds fill the device, at most its capacity.
         lanes = min(capacity, fill_lanes(solver.forest.world_count, solver.model.device, BIAS_LANES))
         wp.launch(
@@ -1062,7 +1063,6 @@ class RowLaws:
                 solver.placement.row_incident,
                 counts,
                 capacity,
-                base,
                 lanes,
                 self.bias(solver.options, dt),
             ],

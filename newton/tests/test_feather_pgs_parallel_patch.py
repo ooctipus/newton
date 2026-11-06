@@ -951,7 +951,6 @@ def _general_bias(solver, rows, dt):
             wp.zeros_like(rhs),
             count,
             rhs.shape[1],
-            0,
             rhs.shape[1],
             row_bias(dt, solver.options.contact_speculative_scale, 1.0, 0.0, 0, 0),
         ],

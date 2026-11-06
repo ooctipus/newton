@@ -303,24 +303,19 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         self.assertLess(abs(bq[box][2] - bq[jaws[0]][2]), 0.01)
 
 
-def _rhs_for_family(family: str, *, phi, row_beta, dt, device="cpu"):
-    """RHS of one world with rows [CONTACT, FRICTION, FRICTION] for one RHS kernel family, from the records every row
-    builder stores: the raw separation ``phi`` and the row law's ``row_beta``. The free bodies' rows (``mf_setup``) take
-    the same bias launch from their first row in the store's line (here 3, after three dense rows)."""
-    base = {"dense": 0, "mf_setup": 3}[family]
+def _rhs(*, phi, row_beta, dt, device="cpu"):
+    """RHS of one world with rows [CONTACT, FRICTION, FRICTION] by the row law every writer applies (the free bodies'
+    among them), from the records every row builder stores: the raw separation ``phi`` and the row law's
+    ``row_beta``."""
     contact, friction = PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
-
-    def line(values):
-        return [[0.0] * base + list(values)]
-
-    zeros = lambda: wp.zeros((1, base + 3), dtype=wp.float32, device=device)  # noqa: E731
+    zeros = lambda: wp.zeros((1, 3), dtype=wp.float32, device=device)  # noqa: E731
     rhs = zeros()
     rows = field_group.upload(
         DenseRows,
         device,
-        phi=line(phi),
-        row_beta=line(row_beta),
-        row_type=wp.array([[contact] * base + [contact, friction, friction]], dtype=wp.int32, device=device),
+        phi=[list(phi)],
+        row_beta=[list(row_beta)],
+        row_type=wp.array([[contact, friction, friction]], dtype=wp.int32, device=device),
         target=zeros(),
         restitution=zeros(),
         rhs=rhs,
@@ -328,9 +323,9 @@ def _rhs_for_family(family: str, *, phi, row_beta, dt, device="cpu"):
         first=row_lines(device),
     )
     count = wp.array([3], dtype=wp.int32, device=device)
-    inputs = [rows, zeros(), count, 3, base, 3, row_bias(dt, 1.0, 1.0, 0.0, 0, 0)]
+    inputs = [rows, zeros(), count, 3, 3, row_bias(dt, 1.0, 1.0, 0.0, 0, 0)]
     wp.launch(compute_world_contact_bias, dim=(1, 3), inputs=inputs, device=device)
-    return rhs.numpy()[0, base:]
+    return rhs.numpy()[0]
 
 
 def _build_two_world_free_model(device):
@@ -347,15 +342,12 @@ class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
     """Device-agnostic checks of the anchor bookkeeping (run on CPU)."""
 
     def test_rhs_bias_matches_on_every_row_family(self):
-        """Apply equal positional bias on all row families."""
+        """Apply the positional bias of the one row law every writer applies (dense and free-body rows)."""
         pgs_beta, fa_beta, dt = 0.05, 0.3, 0.005
         phi_n, e0, e1 = -2.0e-3, 1.0e-4, -2.5e-4
         expect_pos = np.array([pgs_beta * phi_n / dt, fa_beta * e0 / dt, fa_beta * e1 / dt], dtype=np.float32)
         records = {"phi": [phi_n, e0, e1], "row_beta": [pgs_beta, fa_beta, fa_beta], "dt": dt}
-        dense = _rhs_for_family("dense", **records)
-        np.testing.assert_allclose(dense, expect_pos, rtol=1.0e-5)
-        # One law: the free bodies' headers give the dense rows' bits.
-        np.testing.assert_array_equal(_rhs_for_family("mf_setup", **records), dense, err_msg="mf_setup")
+        np.testing.assert_allclose(_rhs(**records), expect_pos, rtol=1.0e-5)
 
     def test_reset_clears_anchor_history_full_and_masked(self):
         """Drop carried anchors of selected worlds on reset, including without warm starting."""

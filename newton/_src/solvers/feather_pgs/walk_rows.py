@@ -1578,23 +1578,27 @@ walk_body_row = packed_walker(1, False, True, walk_tables((FREE_BODY_WALK,)), bo
 
 
 @wp.kernel(enable_backward=False, launch_bounds=FREE_ROWS_LINE)
-def write_free_body_rows(sink: RowSink, data: ContactInput, total_threads: int, law: PatchRowLaw):
+def write_free_body_rows(
+    sink: RowSink, rows: DenseRows, data: ContactInput, total_threads: int, law: PatchRowLaw, bias: RowBias
+):
     """The free bodies' contact rows (``path`` 1, grid-stride over the contacts): the contact's front end formed once
     (:func:`.contact_input.contact_frame`), then each row's records by the contact law and the row as its own unit
     (:func:`contact_row_unit`), walked by the one unit walker into the free bodies' rows (:data:`walk_body_row`; the
-    spin row a torque), with its diagonal ``|z|^2 + cfm`` and incident velocity."""
+    spin row a torque), with its diagonal ``|z|^2 + cfm``, its incident velocity and its rhs by the row law
+    (:func:`.row_kernels.row_bias`), as every writer's."""
     for c in range(wp.tid(), data.count[0], total_threads):
         slot = data.slot[c]
         if data.path[c] != 1 or slot < 0:
             continue
         line = sink.layout.first[data.world[c]]
         # The allocation's extent: recomputing eligibility can cross a floating-point threshold.
-        rows = int(1)
+        count = int(1)
         if data.slots_needed[c] >= 3:
-            rows = data.slots_needed[c]
+            count = data.slots_needed[c]
         frame = contact_frame(data, law, c)
-        for row in range(rows):
+        for row in range(count):
             walk_body_row(sink, contact_row_unit(data, law, frame, c, row, line, slot + row))
+            row_bias(rows, bias, line, slot + row, sink.row_incident[line, slot + row])
 
 
 @wp.kernel
@@ -1603,6 +1607,7 @@ def populate_rigid_velocity_limit_rows(
     rows: DenseRows,
     sink: RowSink,
     rigid_velocity_limit_slot: wp.array[int],
+    bias: RowBias,
 ):
     """Populate the free rigid bodies' speed rows, their linear and angular velocity limits.
 
@@ -1611,7 +1616,7 @@ def populate_rigid_velocity_limit_rows(
     converts the speed correction into the impulse the row stores. Its diagonal is that axis walked as a velocity
     limit's covector at its coordinate (:data:`read_row_unit`, :data:`walk_body_row`), ``|L^-1 P e_k|^2 + cfm``; its
     ``Z`` then holds the axis unwhitened, and its incident velocity is zero: the speed law reads the body's velocity
-    through its factor, not a row. ``mf_phi`` holds the limit.
+    through its factor, not a row. ``mf_phi`` holds the limit; its rhs is the row law's (:func:`.row_kernels.row_bias`).
     """
     candidate = wp.tid()
     body = bodies.free_rigid_body_indices[candidate]
@@ -1653,6 +1658,7 @@ def populate_rigid_velocity_limit_rows(
             sink.entries[line, slot, e] = 0.0
         sink.entries[line, slot, k] = 1.0
         sink.row_incident[line, row] = 0.0
+        row_bias(rows, bias, line, row, 0.0)
 
 
 def free_body_sink(solver) -> RowSink:

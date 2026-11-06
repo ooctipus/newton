@@ -760,20 +760,12 @@ def catalogue() -> list:
 
 
 class Capture:
-    """The rows a step builds, around the free bodies' rhs (:meth:`.rows.RowLaws.write_free_body_rhs`): whether a step
-    had free bodies' rows, then the step's last values."""
+    """The rows a step builds: whether the class holds free bodies' rows (their writers stage with free bodies,
+    :meth:`.rows.RowLaws.write_contacts`), then the step's last values."""
 
     def __init__(self, solver):
         self.solver = solver
-        self.mf = None
-        laws = solver.laws
-        free = laws.write_free_body_rhs
-
-        def write_free_body_rhs(*args, **kwargs):
-            self.mf = True
-            return free(*args, **kwargs)
-
-        laws.write_free_body_rhs = write_free_body_rhs
+        self.mf = True if solver.forest.has_free_rigid_bodies else None
 
     def finish(self):
         """The step's end: its final rows and impulses (after any elimination), the predictor and the velocity."""

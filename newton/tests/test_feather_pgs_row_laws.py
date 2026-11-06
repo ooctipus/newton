@@ -84,7 +84,6 @@ def test_row_rhs_matches_world_contact_bias(test, device):
                 device,
                 world_constraint_count=np.full(worlds, rows, dtype=np.int32),
                 max_constraints=rows,
-                base=0,
                 lanes=rows,
                 world_phi=phi,
                 world_row_beta=beta,
@@ -349,7 +348,6 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
         row_incident=incident,
         world_constraint_count=np.full(worlds, rows, dtype=np.int32),
         max_constraints=rows,
-        base=0,
         lanes=rows,
         bias=row_bias(
             shared["dt"],
@@ -433,7 +431,6 @@ def test_restitution_matches_matrix_free_restitution(test, device):
         device,
         world_constraint_count=np.full(worlds, rows, dtype=np.int32),
         max_constraints=rows,
-        base=0,
         lanes=rows,
         world_row_beta=beta,
         bias=row_bias(common["dt"], 1.0, 0.5, common["restitution_velocity_threshold"], 1, 0),
