@@ -231,7 +231,8 @@ def free_body_rows(lanes: Lanes) -> SparseFactor:
     """
 
     def coordinate(row: str, entry: str) -> str:
-        return f"({entry} < 6 ? (dof_a >= 0 ? dof_a + {entry} : -1) : (dof_b >= 0 ? dof_b + {entry} - 6 : -1))"
+        # The side's body first, then its coordinate: a guard the compiler folds into the body's test.
+        return f"(({entry} < 6 ? dof_a : dof_b) < 0 ? -1 : ({entry} < 6 ? dof_a + {entry} : dof_b + {entry} - 6))"
 
     def value(row: str, entry: str) -> str:
         if row == "row":

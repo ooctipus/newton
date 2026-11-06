@@ -173,7 +173,7 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
         self.assertIn("for (int q = 0; q < 12; ++q) {", residual)
         self.assertIn("jv += mf_Z.data[mf12_base + i * 12 + entry] * velocity;", residual)
         self.assertIn(
-            "(entry < 6 ? (dof_a >= 0 ? dof_a + entry : -1) : (dof_b >= 0 ? dof_b + entry - 6 : -1))", residual
+            "((entry < 6 ? dof_a : dof_b) < 0 ? -1 : (entry < 6 ? dof_a + entry : dof_b + entry - 6))", residual
         )
         self.assertNotIn("SUM", residual)
         # The sibling residual sums its velocity term, then adds its right-hand side.
