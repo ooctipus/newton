@@ -160,34 +160,35 @@ def write_link_rows(
     # outputs
     rows: DenseRows,
 ):
-    """Write each link's rows' records and unit sources (the one writer walks their two pieces' wrenches,
+    """Write each link row's record and unit source (the one writer walks its two pieces' wrenches,
     :func:`.walk_rows.unit_reader`), on the sides of its two pieces' trees (:func:`.row_records.row_sides`), which may
-    be one tree."""
-    k = wp.tid()
+    be one tree: a thread a row, link ``k``'s row ``r`` thread ``LINK_ROWS k + r``, its unit source's index. A linear
+    row's error is the pieces' centre-of-mass gap, an angular row's their rotation's log, each the row's axis of it."""
+    i = wp.tid()
+    k = i // LINK_ROWS
+    row = i - LINK_ROWS * k
     base = links.slot[k]
     if base < 0:
         return
     primary, shadow = links.primary[k], links.shadow[k]
-    point_p = wp.transform_point(body_q[primary], body_com[primary])
-    point_s = wp.transform_point(body_q[shadow], body_com[shadow])
-    gap = point_p - point_s
-    turn = rotation_log(wp.transform_get_rotation(body_q[primary]), wp.transform_get_rotation(body_q[shadow]))
-    art_p, art_s = body_to_articulation[primary], body_to_articulation[shadow]
-    sides = row_sides(art_p, art_s, support.dofs)
-    world = links.world[k]
-    line = rows.first[world]
-    for row in range(LINK_ROWS):
-        slot = base + row
-        axis = row % 3
-        angular = row >= 3
-        support.units[line, slot] = unit_source(UNIT_LINK, LINK_ROWS * k + row)
-        rows.row_type[line, slot] = PGS_CONSTRAINT_TYPE_LINK
-        rows.sides[line, slot] = sides
-        rows.row_parent[line, slot] = -1
-        rows.row_mu[line, slot] = 0.0
-        rows.row_beta[line, slot] = pgs_beta
-        rows.phi[line, slot] = turn[axis] if angular else gap[axis]
-        rows.target[line, slot] = 0.0
+    if row >= 3:
+        error = rotation_log(wp.transform_get_rotation(body_q[primary]), wp.transform_get_rotation(body_q[shadow]))
+    else:
+        error = wp.transform_point(body_q[primary], body_com[primary]) - wp.transform_point(
+            body_q[shadow], body_com[shadow]
+        )
+    axis = row % 3
+    line = rows.first[links.world[k]]
+    slot = base + row
+    support.units[line, slot] = unit_source(UNIT_LINK, i)
+    rows.row_type[line, slot] = PGS_CONSTRAINT_TYPE_LINK
+    rows.sides[line, slot] = row_sides(body_to_articulation[primary], body_to_articulation[shadow], support.dofs)
+    rows.row_parent[line, slot] = -1
+    rows.row_mu[line, slot] = 0.0
+    rows.row_beta[line, slot] = pgs_beta
+    # The row's axis by selects: written through a runtime index it would sit in local memory.
+    rows.phi[line, slot] = wp.where(axis == 0, error[0], wp.where(axis == 1, error[1], error[2]))
+    rows.target[line, slot] = 0.0
 
 
 # =============================================================================

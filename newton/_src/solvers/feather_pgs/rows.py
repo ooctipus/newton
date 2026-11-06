@@ -685,7 +685,7 @@ class RowLaws:
         )
         wp.launch(
             write_link_rows,
-            dim=self.link_count,
+            dim=LINK_ROWS * self.link_count,
             inputs=[
                 links,
                 state_in.body_q,
