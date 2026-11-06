@@ -132,11 +132,9 @@ class Sweep:
         factor: The tree factor.
         routes: The route table the owners claim the class from.
         pins: The test-only route pins.
-        timed: The solver's synchronized timing scope.
-        nvtx: Whether the step's scopes mark NVTX ranges.
     """
 
-    def __init__(self, model, options, forest, laws, placement, factor, routes, pins, *, timed, nvtx):
+    def __init__(self, model, options, forest, laws, placement, factor, routes, pins):
         self.model = model
         self.options = options
         self.forest = forest
@@ -145,8 +143,6 @@ class Sweep:
         self.factor = factor
         self.routes = routes
         self.pins = pins
-        self.timed = timed
-        self.nvtx = nvtx
         # Every sweep compiles the exit law and the policy's readout.
         self.policy = SolvePolicy(readout=options.diagnostics.solve_readout)
         self.readout = SolveReadoutRecord(self.policy)
@@ -1345,7 +1341,6 @@ class Sweep:
     def _solve_claims(self, operands: dict) -> None:
         """The other cases: the claims that own their worlds (the paired factor sweep's, the Jacobi tiers'), on the
         claims' streams where they are open (:meth:`open_streams`), beside the matrix-free sweep of the rest."""
-        iterations = self.options.pgs_iterations
         mf_gs_kernel = self.mf_gs_kernel
         if mf_gs_kernel is None:
             raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")
@@ -1364,22 +1359,21 @@ class Sweep:
             walked = {"walk": self.factor.walk_view()}
 
         def launch_factor_solve():
-            with self.timed(f"factor_pgs_iters{iterations}"):
-                self._launch(
-                    factor_kernel,
-                    operands,
-                    (self.forest.world_count + 1) // 2,
-                    64,
-                    world_count=self.forest.world_count,
-                    # The factor rows: the packed rows at their world coordinates.
-                    factor_rows=self.placement.packed_Z,
-                    world_mf_constraint_count=(
-                        self.placement.mf_constraint_count if components is None else components.selector
-                    ),
-                    primary_offset_by_world=self.paired_factor_primary_offsets_by_world,
-                    secondary_offset_by_world=self.paired_factor_secondary_offsets_by_world,
-                    **walked,
-                )
+            self._launch(
+                factor_kernel,
+                operands,
+                (self.forest.world_count + 1) // 2,
+                64,
+                world_count=self.forest.world_count,
+                # The factor rows: the packed rows at their world coordinates.
+                factor_rows=self.placement.packed_Z,
+                world_mf_constraint_count=(
+                    self.placement.mf_constraint_count if components is None else components.selector
+                ),
+                primary_offset_by_world=self.paired_factor_primary_offsets_by_world,
+                secondary_offset_by_world=self.paired_factor_secondary_offsets_by_world,
+                **walked,
+            )
 
         # The sweeps leave by the walk (sweep_routes.leave_all) and find a free body's tree in it.
         walk = {} if self.factor.walk_arts is None else {"walk": self.factor.walk_view()}
@@ -1431,19 +1425,18 @@ class Sweep:
             main.record_event(self.claims_ready)
             for stream in streams:
                 stream.wait_event(self.claims_ready)
-        with self.timed(f"mfgs_iters{iterations}"):
-            if not streams:
-                list_tiers()
-                for tier in self.tiers:
-                    launch_tier(tier)
-            colored_kernel = self.mf_colored_kernel
-            colored = {} if colored_kernel is None else self.colored_units.operands()
-            self._launch(mf_gs_kernel, operands, self.forest.world_count, 32, **walk, **colored)
-            if colored_kernel is not None:
-                # The worlds the unit builder's rule picked: a block each, a color's units at once.
-                self._launch(
-                    colored_kernel, operands, self.forest.world_count, sweep_routes.COLORED_THREADS, **walk, **colored
-                )
+        if not streams:
+            list_tiers()
+            for tier in self.tiers:
+                launch_tier(tier)
+        colored_kernel = self.mf_colored_kernel
+        colored = {} if colored_kernel is None else self.colored_units.operands()
+        self._launch(mf_gs_kernel, operands, self.forest.world_count, 32, **walk, **colored)
+        if colored_kernel is not None:
+            # The worlds the unit builder's rule picked: a block each, a color's units at once.
+            self._launch(
+                colored_kernel, operands, self.forest.world_count, sweep_routes.COLORED_THREADS, **walk, **colored
+            )
         if streams:
             # The general tail is queued first; the claims share only the ready dependency with it.
             with wp.ScopedStream(streams[0], sync_enter=False):
@@ -1519,20 +1512,16 @@ class Sweep:
                 self.placement.dense_first,
             )
 
-    def carry(self, state_in, state_out, contacts, dt: float) -> None:
-        """Store what the next step reads: the patches' history, the impulses and their row tables by contact identity."""
-        with wp.ScopedTimer("S7_Friction_Patch_Carry", print=False, use_nvtx=self.nvtx, synchronize=False):
-            self.finish_patches(state_in, state_out, contacts, dt)
+    def carry_impulses(self, contacts) -> None:
+        """Store the row store's impulses and row kinds, both classes' rows, which the next step's warm start reads."""
+        wp.copy(self.placement.ws_prev_dense_impulses, self.placement.impulses)
+        wp.copy(self.placement.ws_prev_dense_row_type, self.placement.row_type)
+        if contacts is None:
+            self.placement.ws_prev_dense_row_type.fill_(-1)
 
-        if self.options.pgs_warmstart and self.placement.ws_prev_dense_impulses is not None:
-            # The row store's carry, both classes' rows.
-            with wp.ScopedTimer("S7_Warmstart_Carry", print=False, use_nvtx=self.nvtx, synchronize=self.nvtx):
-                wp.copy(self.placement.ws_prev_dense_impulses, self.placement.impulses)
-                wp.copy(self.placement.ws_prev_dense_row_type, self.placement.row_type)
-                if contacts is None:
-                    self.placement.ws_prev_dense_row_type.fill_(-1)
-
-        if self.options.pgs_warmstart and contacts is not None:
+    def carry_contacts(self, contacts) -> None:
+        """Store each contact row's slot tables by contact identity, which the next step's warm start reads."""
+        if contacts is not None:
             # One thread per row the contact stream ever used: the slot tables of every such row are rewritten.
             pool = self.placement.contact_pool
             used = pool.rows_used if contacts._rigid_contact_pool is pool else None

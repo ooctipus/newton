@@ -16,8 +16,6 @@
 import copy
 import functools
 import sys
-import time
-from contextlib import contextmanager
 from typing import ClassVar
 
 import numpy as np
@@ -513,8 +511,6 @@ class SolverFeatherPGS(SolverBase):
             self.factor,
             self.routes,
             self._route_pins,
-            timed=self._sync_timed,
-            nvtx=self.options.diagnostics.nvtx,
         )
 
         def diagonal_decline(size: int) -> str | None:
@@ -824,22 +820,6 @@ class SolverFeatherPGS(SolverBase):
         self.laws.friction_patches.reset(world_mask)
         self.factor.reset_cache(world_mask)
         self.sweep.clear_history(world_mask)
-
-    @contextmanager
-    def _sync_timed(self, label: str):
-        if not self.options.diagnostics.timed(self._step):
-            yield
-            return
-
-        wp.synchronize()
-        t0 = time.perf_counter()
-        yield
-        wp.synchronize()
-        dt_ms = (time.perf_counter() - t0) * 1000.0
-        print(
-            f"[fpgs-sync] step={getattr(self, '_step', -1)} {label}={dt_ms:.3f} ms",
-            flush=True,
-        )
 
     def set_loop_joint_enabled(self, joint: int, enabled: bool) -> None:
         """Enable or disable the closure of a loop joint, of any type, at runtime.

@@ -23,6 +23,7 @@ construction has not, and nothing in it changes after construction.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from types import MappingProxyType
@@ -330,6 +331,23 @@ class Stage(NamedTuple):
     run: Callable[[Step], None]
 
 
+def _timed(stage: Stage, timed: Callable[[int], bool]) -> Stage:
+    """``stage`` as a timed stage (``Diagnostics.sync_timings``): on a step ``timed`` names it synchronizes before and
+    after the stage and prints its time; on every other step it runs the stage alone."""
+
+    def run(step):
+        if not timed(step.index):
+            stage.run(step)
+            return
+        wp.synchronize()
+        start = time.perf_counter()
+        stage.run(step)
+        wp.synchronize()
+        print(f"[fpgs-sync] step={step.index} {stage.name}={(time.perf_counter() - start) * 1000.0:.3f} ms", flush=True)
+
+    return Stage(stage.name, run)
+
+
 def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     """The step's stages, each bound once to its owners.
 
@@ -347,9 +365,11 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     )
     route, forest, diagnostics = spec.route, spec.forest, spec.diagnostics
     stages: list[Stage] = []
+    timed = solver.options.diagnostics.timed if "sync_timings" in diagnostics else None
 
     def add(*runs, nvtx: str | None = None) -> None:
-        """Append ``runs`` as stages; under the NVTX diagnostic a named group runs as one stage inside its range."""
+        """Append ``runs`` as stages; under the NVTX diagnostic a named group runs as one stage inside its range, and
+        under the timings each stage runs as a timed stage (:func:`_timed`)."""
         if nvtx is not None and "nvtx" in diagnostics:
 
             def ranged(step, runs=runs, name=nvtx):
@@ -357,9 +377,10 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
                     for run in runs:
                         run(step)
 
-            stages.append(Stage(nvtx, ranged))
+            added = (Stage(nvtx, ranged),)
         else:
-            stages.extend(Stage(run.__name__, run) for run in runs)
+            added = tuple(Stage(run.__name__, run) for run in runs)
+        stages.extend(added if timed is None else (_timed(stage, timed) for stage in added))
 
     def enter(step):
         step.state_in, step.state_out, step.control = cut.enter(
@@ -702,8 +723,14 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     def finish(step):
         factor.finish(step.state_in, step.state_out, step.dt)
 
-    def carry(step):
-        sweep.carry(step.state_in, step.state_out, step.contacts, step.dt)
+    def carry_patches(step):
+        sweep.finish_patches(step.state_in, step.state_out, step.contacts, step.dt)
+
+    def carry_impulses(step):
+        sweep.carry_impulses(step.contacts)
+
+    def carry_contacts(step):
+        sweep.carry_contacts(step.contacts)
 
     def watermarks(step):
         placement.record_watermarks(step.contacts)
@@ -715,7 +742,12 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     add(finish, nvtx="S7_Integrate")
     if spec.particles:
         add(integrate_particles)
-    add(carry)
+    # The carry: the patches' history, then under the warm start the impulses and the contacts' slot tables.
+    add(carry_patches, nvtx="S7_Friction_Patch_Carry")
+    if solver.options.pgs_warmstart and placement.ws_prev_dense_impulses is not None:
+        add(carry_impulses, nvtx="S7_Warmstart_Carry")
+    if solver.options.pgs_warmstart:
+        add(carry_contacts)
     if "row_watermark" in diagnostics:
         add(watermarks, *((resolved_watermark,) if resolved is not None else ()))
     add(count, *boundary)

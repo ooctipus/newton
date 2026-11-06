@@ -85,8 +85,9 @@ class Diagnostics:
             reads NaN (``routes.diagnostics.audit`` says which).
         stage_clocks: Compile per-stage cycle counters into the held tree's kernels (``_stage_clocks``). It changes the
             emitted code, not what it computes.
-        sync_timings: ``(first_step, steps)``: synchronize around each stage of those steps and print its time.
-            The sweep's streams then run without overlap. ``None`` times nothing.
+        sync_timings: ``(first_step, steps)``: synchronize around each stage of those steps and print its time;
+            the step plan then runs each stage as a timed stage. The sweep's streams then run without overlap.
+            ``None`` times nothing.
     """
 
     nvtx: bool = False
