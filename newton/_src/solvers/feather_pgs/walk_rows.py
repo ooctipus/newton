@@ -37,6 +37,8 @@ from functools import cache
 
 import warp as wp
 
+from ...core.execution import Work, shape
+from ...core.memory import built_for
 from . import field_group
 from .contact_input import ContactFrame, ContactInput, contact_frame
 from .contact_laws import CONTACT_SPIN_ROW, contact_row_entry, contact_seed, spin_seed
@@ -197,16 +199,23 @@ writer turns issue-bound (ZK7, franka at 16,384 worlds: the part 39 us at one ro
 WRITER_THREADS = 128
 """Threads of a block of the one writer: whole world groups of up to 32 lanes."""
 
-WRITER_BLOCKS = 6, 5
-"""The one writer's blocks a multiprocessor (its launch bound), without and with bilateral blocks: the register line
-its walk fits, for a latency-bound walk whose speed follows its resident warps. Without blocks (no link rows), six
-(80 registers, 24 warps); with blocks, whose link rows hold a second point across the walk and whose closure follows
-it, five (96 registers: 97 unbounded, and six spilled 88 B a thread, sm_120)."""
+WALKER_LINE = 80
+"""The one walker's register line: a world-lane writer of the packed rows or the star's slots holds its walk at 80
+registers, 24 warps a multiprocessor, for a latency-bound walk whose speed follows its resident warps. Unbound, the
+class tables' walk takes 84-86 registers, past the granule: 16 warps (franka-cabinet 7% slower, gate_fast). The
+writers' launch bounds are this line at their blocks (:func:`walker_bounds`): the general writer's six blocks of
+128, the star's three of 256."""
 
-STAR_LINE = 256, 3
-"""The star's writer's launch bound (:func:`slot_rows_kernel`): a block of
-Warp's 256 threads, three a multiprocessor, the one writer's line of 80 registers (24 warps). Unbound, the class
-tables' walk takes 84-86 registers, past the granule: 16 warps (franka-cabinet 7% slower, gate_fast)."""
+BLOCKS_LINE = 96
+"""The general writer's line where it closes bilateral blocks (:func:`walked_rows_kernel`): its link rows hold a second
+point across the walk and its closure follows it, 96 registers (97 unbounded; at the walker's line it spilled 88 B a
+thread, sm_120), five blocks of 128."""
+
+
+def walker_bounds(block: int, line: int = WALKER_LINE) -> tuple[int, int]:
+    """A writer's launch bound: its ``block`` at a register ``line`` (:class:`.core.execution.Work`), the blocks a
+    multiprocessor of the architecture the build is sized for keeps at that line."""
+    return shape(Work(0, block=block, registers=line), built_for(None)).bounds
 
 
 @cache
@@ -414,7 +423,7 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tupl
     name = "write_walked_rows" + (f"_blocks{blocks}" if has_blocks else "")
     name += "_mimics" if mimic_blocks else ""
     name += f"_topology{block}" if block else ""
-    return python_kernel(kernel, name, launch_bounds=(WRITER_THREADS, WRITER_BLOCKS[int(has_blocks)]))
+    return python_kernel(kernel, name, launch_bounds=walker_bounds(WRITER_THREADS, BLOCKS_LINE if has_blocks else WALKER_LINE))
 
 
 def writer_kernel(solver, part: int = WRITE_ROWS) -> wp.Kernel:
@@ -1524,7 +1533,7 @@ def slot_rows_kernel(side: bool, tables: tuple) -> wp.Kernel:
                 walk(sink, unit)
                 slot_header(rows, slots, data, v_hat, unit, bias)
 
-    return python_kernel(write_slot_rows, "write_slot_rows", launch_bounds=STAR_LINE)
+    return python_kernel(write_slot_rows, "write_slot_rows", launch_bounds=walker_bounds(256))
 
 
 def slot_writer(solver) -> wp.Kernel:

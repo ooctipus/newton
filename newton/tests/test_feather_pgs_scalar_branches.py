@@ -577,7 +577,7 @@ class TestScalarBranchRule(unittest.TestCase):
 
     def test_admits_the_keyboard_shaped_fixture(self):
         """Admit the 108-key group of the two-world 108+6 fixture, whatever the arm's root."""
-        from newton.tests.test_feather_pgs_compact_contact import build_solver_fixture  # noqa: PLC0415
+        from newton.tests.test_feather_pgs_star_rows import build_solver_fixture  # noqa: PLC0415
 
         model = build_solver_fixture("cpu")
         kinds, reason = sb.branch_topology(model, np.array([0, 2]), model.articulation_start.numpy()[1:])

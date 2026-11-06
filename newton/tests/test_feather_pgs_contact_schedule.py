@@ -30,7 +30,7 @@ from newton._src.solvers.feather_pgs.sweep_levels import (
     _get_build_independent_sparse_contact_groups_kernel,
 )
 from newton.tests.feather_pgs_law_harness import row_lines
-from newton.tests.test_feather_pgs_compact_contact import build_solver_fixture, install_patch_contacts
+from newton.tests.test_feather_pgs_star_rows import build_solver_fixture, install_patch_contacts
 from newton.tests.test_feather_pgs_response_diagonal import _mark_patch_units, _patch_unit_cases, _unit_schedule_oracle
 
 _FRICTION = PGS_CONSTRAINT_TYPE_FRICTION

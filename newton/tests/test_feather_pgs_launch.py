@@ -103,8 +103,10 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
 
     def test_bounds_follow_the_register_line(self):
         cases = (
-            ("writer", 128, 80, (128, walk_rows.WRITER_BLOCKS[0])),
-            ("writer with blocks", 128, 96, (128, walk_rows.WRITER_BLOCKS[1])),
+            # The one walker's line: the general writer's six blocks of 128, the star's three of 256.
+            ("writer", 128, walk_rows.WALKER_LINE, (128, 6)),
+            ("star", 256, walk_rows.WALKER_LINE, (256, 3)),
+            ("writer with blocks", 128, walk_rows.BLOCKS_LINE, (128, 5)),
             ("support", 256, 128, (256, 2)),
             ("colored", 256, 255, (256, 1)),
             ("predictor 32", 32, 56, (32, min(24, 1152 // 32))),
@@ -124,6 +126,10 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
                         self.assertEqual(bounds, (32, 32))
                     else:
                         self.assertEqual(bounds, old)
+        # The writers' bounds, built for the reference architecture whatever the device at hand.
+        self.assertEqual(walk_rows.walker_bounds(128), (128, 6))
+        self.assertEqual(walk_rows.walker_bounds(256), (256, 3))
+        self.assertEqual(walk_rows.walker_bounds(128, walk_rows.BLOCKS_LINE), (128, 5))
 
     def test_carveout_steps(self):
         # H8: a predictor block over 1,664 B moves the PRO from 64 KiB to 100 KiB; ZY: 1 KiB at 256 threads keeps 16.
