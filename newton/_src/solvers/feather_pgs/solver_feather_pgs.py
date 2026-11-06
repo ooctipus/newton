@@ -40,7 +40,6 @@ from . import environment_flags as _environment_flags
 from .audit import Audit
 from .body_cut import BodyCut
 from .configuration import Diagnostics, check_options
-from .contact_row_plan import contact_row_plan
 from .field_group import Field, FieldGroup, SolverArrays
 from .forest_plan import ForestPlan, joint_forest
 from .path_selection import (
@@ -642,11 +641,22 @@ class SolverFeatherPGS(SolverBase):
         self.sweep.resolved_worlds_reason = classifier.reason
 
         self.placement.place_dense_response(paired_coordinates=self.sweep.paired_factor_coordinates)
-        # The route: the row of the route table the class takes. The step plan and the route record read it.
+        # The route: the row of the route table the class takes. The step plan and the route record read it. Its
+        # producer writes every contact row, decided once from the owners' admissions: keyed rows (the tiers' in-kernel
+        # sink, case K4), the compact boundary (the sparse diagonal's contact-major producer, case K2), else the one
+        # writer where the class walks its rows, else none (no responding coordinate: no contact is admitted).
         diagonal = self.routes.case == "K2"
         route = self.routes.finish(
             self.laws.set,
-            producer=contact_row_plan(self).producer,
+            producer=(
+                "keyed_rows"
+                if self.placement.keyed_rows is not None
+                else "compact_contact_boundary"
+                if self.placement.compact_contact_boundary
+                else "walk"
+                if self.placement.walks
+                else "none"
+            ),
             packed=self.placement.packed_response,
             tier_rows=self.placement.ink_skip_rows(),
             sizes={

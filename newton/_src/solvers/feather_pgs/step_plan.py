@@ -563,7 +563,7 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
         laws.bound_phase(solver, 1)
 
     def write_contacts(step):
-        laws.write_contacts(solver, step.state_in, factor, step.contacts, step.dt)
+        laws.write_contacts(solver, step.state_in, factor, step.contacts, step.dt, route.producer)
 
     def bound_free_body_contacts(step):
         laws.bound_free_body_contacts(solver)

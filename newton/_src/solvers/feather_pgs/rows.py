@@ -38,7 +38,6 @@ from .configuration import Options
 from .contact_input import ContactInput
 from .contact_input import bind as bind_contact_input
 from .contact_input import bind_routes as bind_contact_routes
-from .contact_row_plan import contact_row_plan
 from .device_preludes import lane_group
 from .factor.fields import Preelim
 from .field_group import Field, FieldGroup, SolverArrays
@@ -783,7 +782,9 @@ class RowLaws:
         for size, warp_kernel in self.velocity_limit_warp_kernels.items():
             self._launch_prefix_warp(solver, warp_kernel, size, law, support)
 
-    def write_contacts(self, solver, state_in: State, state_aug: State, contacts: Contacts, dt: float) -> None:
+    def write_contacts(
+        self, solver, state_in: State, state_aug: State, contacts: Contacts, dt: float, producer: str
+    ) -> None:
         """The contact rows, the free bodies' contact rows (their counts finalized with status) and the sparse
         diagonal's rows, after the joint families.
 
@@ -793,6 +794,7 @@ class RowLaws:
             state_aug: The step's dynamics (the tree factor).
             contacts: The step's contacts, or ``None``.
             dt: The step size.
+            producer: The route's producer of the contact rows (:attr:`.route_table.RouteRow.producer`), from the plan.
         """
         model = solver.model
         max_constraints = solver.placement.dense_max_constraints
@@ -837,11 +839,10 @@ class RowLaws:
             # The friction row law every producer writes: point friction is the patch law with beta 0.
             law = patch_row_law(solver)
 
-            # The class's case names the producer that writes every contact row (contact_row_plan):
-            # get_path_selection() records the same plan (routes.contact_rows). The one writer's contact rows are
-            # its own to fill: their unit sources are written where their slots are reserved.
-            plan = contact_row_plan(solver)
-            units = solver.placement.unit_source if plan.producer == "walk" else solver.placement.no_units
+            # The route's producer writes every contact row (get_path_selection() records it, routes.contact_rows).
+            # The one writer's contact rows are its own to fill: their unit sources are written where their slots are
+            # reserved.
+            units = solver.placement.unit_source if producer == "walk" else solver.placement.no_units
             # Under persistent patch friction, contacts of resolved worlds that the complete path would
             # give rows are marked so the patch finish releases their anchors (row_slots.py).
             pool.launch(
@@ -885,9 +886,9 @@ class RowLaws:
                 )
 
             # The one writer's contact rows ("walk") take their records in the writer (walk_rows).
-            if plan.producer == "keyed_rows":
+            if producer == "keyed_rows":
                 solver.placement.keyed_rows.produce_contacts(contact_input)
-            elif plan.producer == "compact_contact_boundary":
+            elif producer == "compact_contact_boundary":
                 from .compact_contact import launch_contacts  # noqa: PLC0415
 
                 launch_contacts(solver, contact_input, dt)

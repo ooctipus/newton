@@ -22,7 +22,6 @@ import numpy as np
 from ...core.live_sort import SLOT_BITS
 from ...core.memory import Place
 from ...sim.contacts import CAPACITY_BLOCKS_PER_SM
-from .contact_row_plan import contact_row_plan
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF
 from .step_plan import kernel_key as _key
 
@@ -286,7 +285,7 @@ def _kernel_names(kernels) -> list:
     return [kernel if isinstance(kernel, str) else _key(kernel) for kernel in kernels]
 
 
-def _row_builder(solver, plan, size) -> dict:
+def _row_builder(solver, method, size) -> dict:
     """Name the kernels that build one DOF size's dense contact rows outside the sweep.
 
     Mirrors the producers' launches, in launch order: the one writer, compact_contact.launch_contacts,
@@ -296,7 +295,6 @@ def _row_builder(solver, plan, size) -> dict:
     rows, which walk_rows.write_free_body_rows writes for the contacts the allocation routes to them
     (routes.free_rigid_bodies).
     """
-    method = plan.methods[size]
     marker = ()
     if solver.spec.case == "K2" and size == solver.placement.sparse_diagonal_response_size:
         # The sparse diagonal's marker encodes schedule links into the slots its writer just wrote.
@@ -336,13 +334,13 @@ def _row_builder(solver, plan, size) -> dict:
 
 def _contact_rows(solver) -> dict:
     row = solver.spec.route
-    # The plan the row pass (RowLaws.write_contacts) dispatches on: the route's producer writes every contact row.
-    plan = contact_row_plan(solver)
+    # The route's producer writes every contact row (the row pass, RowLaws.write_contacts, takes it from the plan).
+    sizes = solver.forest.size_groups if row.producer != "none" else ()
     return {
         "producer": row.producer,
         # Every producer, every size: the builder method, its kernels in launch order and the law they write,
         # for the dense contact rows built outside the sweep (_row_builder names the rows built elsewhere).
-        "builder_by_dof": {str(int(size)): _row_builder(solver, plan, size) for size in plan.methods},
+        "builder_by_dof": {str(int(size)): _row_builder(solver, row.producer, size) for size in sizes},
         "keyed_rows": {"enabled": row.producer == "keyed_rows", "reason": solver.placement.keyed_rows_reason},
         "compact_contact": {
             "boundary": row.producer == "compact_contact_boundary",
