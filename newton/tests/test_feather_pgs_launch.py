@@ -26,9 +26,16 @@ GB300 = Device.of(103, 152, 232_448)
 WORLDS = (64, 128, 512, 1024, 4096, 16384, 65536)
 
 
-def _warp_device(device: Device):
-    """A stand-in Warp device of ``device`` for today's rules, which read ``is_cuda`` and ``sm_count``."""
-    return types.SimpleNamespace(is_cuda=device.cuda, sm_count=device.sms)
+def _current_device(device: Device):
+    """Warp's current device as a stand-in of ``device`` for today's rules, which read ``is_cuda`` and ``sm_count``. A
+    device asked for by name stays Warp's own: the writers' table sizes its shapes for the CUDA device at hand."""
+    stand_in = types.SimpleNamespace(is_cuda=device.cuda, sm_count=device.sms)
+    get_device = wp.get_device
+
+    def current(ident=None):
+        return stand_in if ident is None else get_device(ident)
+
+    return mock.patch.object(wp, "get_device", side_effect=current)
 
 
 class TestDevice(unittest.TestCase):
@@ -93,7 +100,7 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
 
     def test_support_walkers_are_two_waves_of_their_line(self):
         for device in (PRO, GB300):
-            with self.subTest(arch=device.arch), mock.patch.object(wp, "get_device", return_value=_warp_device(device)):
+            with self.subTest(arch=device.arch), _current_device(device):
                 # The line its four-row walker holds without a spill (164, in whole granules of 8).
                 work = Work(10**7, lanes=1, block=128, registers=168, persistent=True, waves=2)
                 got = shape(work, device)
@@ -160,7 +167,7 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
     def test_fill_differs_only_where_named(self):
         # The rule fills the device's resident threads (1,536 or 2,048 a multiprocessor), fill_lanes 1,024.
         for device in (PRO, GB300):
-            with mock.patch.object(wp, "get_device", return_value=_warp_device(device)):
+            with _current_device(device):
                 for worlds in WORLDS:
                     with self.subTest(arch=device.arch, worlds=worlds):
                         old = execution.fill_lanes(worlds, None)
@@ -170,7 +177,7 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
     def test_writer_lanes_differ_only_where_named(self):
         named = {(120, 20): 16, (120, 40): 16, (103, 12): 8, (103, 20): 8, (103, 40): 8}
         for device in (PRO, GB300):
-            with mock.patch.object(wp, "get_device", return_value=_warp_device(device)):
+            with _current_device(device):
                 for worlds in (1024, 4096, 16384):
                     for rows in (2, 6, 12, 20, 40):
                         with self.subTest(arch=device.arch, worlds=worlds, rows=rows):
