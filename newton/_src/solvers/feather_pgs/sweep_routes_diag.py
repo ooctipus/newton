@@ -48,6 +48,7 @@ from .sweep import (
     friction_metric_stage,
     indent,
     material_arguments,
+    row_sums,
     row_visit,
     weight_arguments,
 )
@@ -289,7 +290,7 @@ def sparse_diagonal_source(
                 parent=rows.parent("i") if parent is None else parent,
                 check="denom",
                 declare=f"const float denom = {rows.diag('i')};",
-                residual=ctx.operator.residual("jv", pad, **pair),
+                residual=row_sums(ctx.operator, "jv", pad, **pair),
                 pad=pad,
             )
         )
@@ -312,7 +313,7 @@ def sparse_diagonal_source(
     changes = (("normal", "unit_dn"), ("tangent1", "unit_dt1"), ("tangent2", "unit_dt2"))
     unit_apply = (
         f"        if ({' || '.join(f'{change} != 0.0f' for _, change in changes)}) {{\n"
-        f"{pair_op.unit_apply(changes, '            ')}\n        }}\n        {warp.sync()}"
+        f"{pair_op.axpy(changes, '            ', kept=True, block=True)}\n        }}\n        {warp.sync()}"
     )
 
     def contact_rows(head: str) -> str:
@@ -443,7 +444,7 @@ const int candidate_index = {index} + batch_group;
 const bool candidate_valid = candidate_index < {count};
 const int candidate_normal = candidate_valid
     ? sparse_contact_serial_normals.data[world * {M} + candidate_index] : -1;
-{segment.row_velocity("candidate_velocity", "candidate_normal", "", active="candidate_valid")}
+{segment.dot((("candidate_velocity", "row", None),), {"row": "candidate_normal"}, "", exists={"row": "candidate_valid"})}
 bool candidate_noop = !candidate_valid;
 if (candidate_valid) {{
     const float old_impulse = {rows.peek("candidate_normal")};

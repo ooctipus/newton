@@ -22,6 +22,7 @@ from newton._src.solvers.feather_pgs.sweep import (
     change_vote,
     contact_unit,
     friction_radius,
+    row_sums,
     row_update,
     row_visit,
     unit_held_loads,
@@ -30,24 +31,21 @@ from newton._src.solvers.feather_pgs.sweep import (
 
 @dataclasses.dataclass(frozen=True)
 class _Rows(ResponseOperator):
-    """An operator of named sums: the least an operator implements for a friction pair."""
+    """An operator of named sums: the two actions the row law takes, ``dot`` and ``axpy``."""
 
-    name = "rows"
+    def dot(self, sums, rows, indent, *, rhs=None, **_):
+        rhs = rhs or {}
+        lines = [
+            f"{indent}float {out} = "
+            + (f"J_v({rows[row]})" if other is None else f"J_Y({rows[row]}, {rows[other]})")
+            + ";"
+            for out, row, other in sums
+        ]
+        return "\n".join(lines + [f"{indent}{out} += {rhs[out]};" for out, _, _ in sums if out in rhs])
 
-    def residual(self, out, indent):
-        return f"{indent}float {out} = J_i_v;"
-
-    def row_velocity(self, out, row, indent):
-        return f"{indent}float {out} = J_v({row});"
-
-    def coupling(self, out, row, sibling, indent):
-        return f"{indent}float {out} = J_Y({row}, {sibling});"
-
-    def apply(self, delta, indent):
-        return f"\n{indent}v += Y_i * {delta};"
-
-    def apply_row(self, row, delta, indent):
-        return f"\n{indent}v += Y({row}) * {delta};"
+    def axpy(self, changes, indent, *, row=None, **_):
+        ((name, delta),) = changes
+        return f"\n{indent}v += Y({row or name}) * {delta};"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -56,8 +54,10 @@ class _FusedRows(_Rows):
 
     fused_pair_apply = True
 
-    def apply_pair(self, sibling_delta, delta, indent):
-        return f"\n{indent}apply_pair({sibling_delta}, {delta});"
+    def axpy(self, changes, indent, *, row=None, **_):
+        if len(changes) == 1:
+            return super().axpy(changes, indent, row=row)
+        return f"\n{indent}apply_pair({', '.join(delta for _, delta in changes)});"
 
 
 def _rhs(row):
@@ -83,30 +83,53 @@ def _context(operator, lanes=None, **options):
     )
 
 
-class TestResponseOperatorInterface(unittest.TestCase):
-    """The base class's defaults: the sibling's residual, the pair's terms and the end passes' apply."""
+class TestRowSums(unittest.TestCase):
+    """The row law's sums by the operator's ``dot``: the visit's residual, its pair's terms and a contact unit's."""
 
-    def test_sibling_residual_is_the_row_velocity_then_its_rhs(self):
-        self.assertEqual(_Rows().sibling_residual("s", "sib", "", "rhs[sib]"), "float s = J_v(sib);\ns += rhs[sib];")
+    _PACKED = SparseFactor(16, lambda row, e: f"dof[{row}][{e}]", lambda row, e: f"Z[{row}][{e}]", Lanes(32))
 
-    def test_pair_terms_compose_the_sibling_residual_and_the_coupling(self):
-        rows = _Rows()
-        self.assertEqual(
-            rows.pair_terms("i", "sib", _rhs, ""),
-            "float sibling_residual = J_v(sib);\nsibling_residual += rhs[sib];\nfloat cross = J_Y(i, sib);",
+    def test_a_visit_in_memory_reduces_its_pair_in_its_own_ladder(self):
+        self.assertTrue(self._PACKED.pair_with_visit)
+        sums = row_sums(self._PACKED, "jv", "", sibling="parent + 2", paired="k == 2")
+        self.assertIn("SUM(jv, sibling_jv, pair_coupling);", sums)
+        self.assertIn("const float sib_value = k == 2 && entry < 16 ? Z[(parent + 2)][entry] : 0.0f;", sums)
+        self.assertEqual(row_sums(self._PACKED, "jv", ""), self._PACKED.dot((("jv", "row", None),), {"row": "i"}, ""))
+
+    def test_sums_an_earlier_ladder_reduced_are_declared_from_it(self):
+        sums = (("residual", "row", None), ("sibling_residual", "sib", None), ("cross", "row", "sib"))
+        terms = self._PACKED.dot(
+            sums,
+            {"row": "i", "sib": "sib"},
+            "",
+            rhs={"residual": "rhs[i]", "sibling_residual": "rhs[sib]"},
+            reduced={"sibling_residual": "sibling_jv", "cross": "pair_coupling"},
         )
-        own = rows.pair_terms("i", "sib", _rhs, "", own=True)
-        self.assertTrue(own.startswith("float residual = J_i_v;\nresidual += rhs[i];\n"))
+        self.assertNotIn("sib_value", terms)
+        self.assertTrue(
+            terms.endswith(
+                "SUM(residual);\nresidual += rhs[i];\nfloat sibling_residual = sibling_jv;\n"
+                "sibling_residual += rhs[sib];\nfloat cross = pair_coupling;"
+            )
+        )
 
-    def test_end_passes_apply_a_row_through_apply_row(self):
-        self.assertEqual(_Rows().apply_strided("r", "d", ""), _Rows().apply_row("r", "d", ""))
-        # Packed rows apply the entries their row velocity kept.
-        packed = SparseFactor(16, lambda row, e: f"dof[{row}][{e}]", lambda row, e: f"Z[{row}][{e}]", Lanes(32))
-        self.assertEqual(packed.apply_strided("r", "d", ""), packed.apply("d", ""))
-
-    def test_an_operator_names_the_action_it_lacks(self):
-        with self.assertRaisesRegex(NotImplementedError, "_Rows has no pair apply"):
-            _Rows().apply_pair("a", "b", "")
+    def test_a_unit_dots_moved_terms_and_its_gram_entries(self):
+        sums = (("spin_residual", "spin", None), ("spin_cross", "row", "spin"), ("spin_cross_sibling", "sib", "spin"))
+        self.assertEqual(
+            UnitZ().dot(sums, {}, "", rhs={"spin_residual": "b"}),
+            "float spin_residual = (unit_jv3 + gram_n3 * unit_dn) + b;\nconst float spin_cross = unit_cross13;\n"
+            "const float spin_cross_sibling = unit_cross23;",
+        )
+        self.assertTrue(
+            UnitZ(cached=True)
+            .dot(sums, {}, "")
+            .endswith("const float spin_cross = 0.0f, spin_cross_sibling = 0.0f;  // the cached metric replaces them")
+        )
+        self.assertEqual(
+            UnitZ().axpy((("sib", "a"), ("row", "b")), ""),
+            "\nunit_dt2 += a;\nif (r == 0) unit_dn += b; else unit_dt1 += b;",
+        )
+        with self.assertRaisesRegex(ValueError, "moved residual"):
+            UnitZ().dot((("residual", "row", None),), {}, "", rhs={"residual": "b"})
 
 
 class TestDiagonal(unittest.TestCase):
@@ -249,7 +272,7 @@ class TestRowTail(unittest.TestCase):
 
     def test_the_sibling_applies_before_the_row(self):
         update = self._update(_Rows())
-        self.assertLess(update.index("v += Y(sib) * sib_delta;"), update.index("v += Y_i * delta_impulse;"))
+        self.assertLess(update.index("v += Y(sib) * sib_delta;"), update.index("v += Y(row) * delta_impulse;"))
         self.assertEqual(update.count("SYNC();"), 3)
 
     def test_a_fused_pair_apply_votes_and_applies_both_changes_at_once(self):
@@ -267,7 +290,7 @@ class TestRowTail(unittest.TestCase):
     def test_rows_without_friction_pairs_store_and_apply_the_row_only(self):
         update = self._update(_FusedRows(), friction=False)
         self.assertNotIn("sib", update)
-        self.assertIn("v += Y_i * delta_impulse;", update)
+        self.assertIn("v += Y(row) * delta_impulse;", update)
 
     def test_an_unfenced_row_synchronizes_before_its_stores_and_after_its_apply(self):
         update = self._update(_Rows(), fenced=False)

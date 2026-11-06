@@ -446,7 +446,7 @@ class RowContext:
     (:func:`spin_row`), where the laws allow spin rows."""
     pair_residual: bool = False
     """A friction pair reduces its first tangent's residual again with the pair's terms
-    (:meth:`.ResponseOperator.pair_terms` with ``own``) and solves on it in place of the row's: the free-body loop's
+    (:func:`_pair_terms` with ``own``) and solves on it in place of the row's: the free-body loop's
     friction step."""
 
     def sync(self) -> str:
@@ -531,7 +531,7 @@ def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> st
                     (guard.get(sibling, "") + ctx.record(sibling, delta)) if ctx.record is not None else "",
                     f"if ({delta} != 0.0f) {{",
                     change_vote(laws, (change,), "    "),
-                    indent(op.apply_row(sibling, delta, "").lstrip("\n"), "    "),
+                    indent(op.axpy(((sibling, delta),), "", row=sibling).lstrip("\n"), "    "),
                     "}",
                 )
                 if line
@@ -595,7 +595,7 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
         lines += [
             "if (spin_delta != 0.0f) {",
             change_vote(laws, (_spin_change(ctx),), "    "),
-            indent(op.apply_row("spin", "spin_delta", "").lstrip("\n"), "    "),
+            indent(op.axpy((("spin", "spin_delta"),), "", row="spin").lstrip("\n"), "    "),
             "}",
         ]
     row_change = ctx.diagonal.change("delta_impulse", "row_bound", kind, row)
@@ -606,7 +606,7 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
         lines += [
             "if (delta_impulse != 0.0f || sib_delta != 0.0f) {",
             change_vote(laws, (row_change, sib_change), "    "),
-            indent(op.apply_pair("sib_delta", "delta_impulse", "").lstrip("\n"), "    "),
+            indent(op.axpy((("sib", "sib_delta"), ("row", "delta_impulse")), "").lstrip("\n"), "    "),
             "}",
         ]
     else:
@@ -614,13 +614,13 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
             lines += [
                 "if (sib_delta != 0.0f) {",
                 change_vote(laws, (sib_change,), "    "),
-                indent(op.apply_row("sib", "sib_delta", "").lstrip("\n"), "    "),
+                indent(op.axpy((("sib", "sib_delta"),), "", row="sib").lstrip("\n"), "    "),
                 "}",
             ]
         lines += [
             "if (delta_impulse != 0.0f) {",
             change_vote(laws, (row_change,), "    "),
-            indent(op.apply("delta_impulse", "").lstrip("\n"), "    "),
+            indent(op.axpy((("row", "delta_impulse"),), "").lstrip("\n"), "    "),
             "}",
         ]
     lines.append(ctx.sync() if ctx.synced else "")
@@ -633,7 +633,7 @@ def pair_update(ctx: RowContext, laws: RowLaws, *, pad: str) -> str:
     A unit schedule solves a contact's tangent pair right after its normal
     row ``ctx.parent``, on the disk of ``radius`` (declared by the block): the
     operator reduces the first tangent's residual with the pair's terms
-    (:meth:`.ResponseOperator.pair_terms`), the pair is projected as in
+    (:func:`_pair_terms`), the pair is projected as in
     :func:`row_update`, and the same tail stores, votes and applies.
     """
     lines = [
@@ -669,6 +669,26 @@ def _spin_bound(ctx: RowContext) -> str:
     return ctx.diagonal.bound(rhs, op.terms("spin_residual", rhs, whole=True), "spin_impulse", "spin")
 
 
+def _pair_terms(ctx: RowContext, *, own: bool) -> str:
+    """Declare a friction pair's ``sibling_residual`` (``Z_s . u + rhs_s``) and ``cross`` (``Z_t . Z_s``), and with
+    ``own`` the first tangent's ``residual`` (``Z_t . u + rhs_t``, a pair solved as one unit): one ladder of the
+    operator's, or the sums the visit's residual reduced with its own (:attr:`.ResponseOperator.pair_with_visit`)."""
+    op, rhs = ctx.operator, ctx.rhs
+    sums = ((("residual", "row", None),) if own else ()) + (("sibling_residual", "sib", None), ("cross", "row", "sib"))
+    added = {**({"residual": rhs(ctx.row)} if own else {}), "sibling_residual": rhs("sib")}
+    reduced = {"sibling_residual": "sibling_jv", "cross": "pair_coupling"} if op.pair_with_visit else None
+    return op.dot(sums, {"row": ctx.row, "sib": "sib"}, "    ", rhs=added, reduced=reduced)
+
+
+def _spin_terms(ctx: RowContext) -> str:
+    """Declare a friction triple's spin terms (contact torsion), after :func:`_pair_terms`: ``spin_residual``
+    (``Z_p . u + rhs_p``) and its couplings with the tangents, ``spin_cross`` (``Z_t . Z_p``) and
+    ``spin_cross_sibling`` (``Z_s . Z_p``), in one ladder on the support and entries the pair's kept."""
+    sums = (("spin_residual", "spin", None), ("spin_cross", "row", "spin"), ("spin_cross_sibling", "sib", "spin"))
+    rows = {"row": ctx.row, "sib": "sib", "spin": "spin"}
+    return ctx.operator.dot(sums, rows, "    ", kept=("row", "sib"), rhs={"spin_residual": ctx.rhs("spin")})
+
+
 def friction_pair(ctx: RowContext, laws: RowLaws, *, own: bool = False) -> str:
     """The friction pair at its first tangent: both tangents on the disk of ``radius`` (``sib_new``, ``sib_delta``).
 
@@ -676,20 +696,19 @@ def friction_pair(ctx: RowContext, laws: RowLaws, *, own: bool = False) -> str:
     rows may appear (``laws.torsion``) a contact with a spin row (``spin``, after the pair: :func:`spin_row`) solves
     its pair and spin row as the friction triple on its elliptic cone of the pooled normal ``load``
     (:func:`.projection_laws.friction_triple`, the cone's one law every sweep calls): the spin row's coefficient is its
-    ``mu`` field, its terms the operator's (:meth:`.ResponseOperator.spin_terms`). A contact without one keeps the
+    ``mu`` field, its terms the operator's (:func:`_spin_terms`). A contact without one keeps the
     pair's own law and code, which the triple of a zero spin coefficient equals.
     """
     op = ctx.operator
     head = [
         f"sib = {ctx.parent} + 2;",
         f"const float sibling_impulse = {ctx.load('sib')};",
-        op.pair_entries("sib", ""),
     ]
     pair = [
         "wp::vec2 pair(0.0f);",
         "// Zero load gives a zero disk; avoid unused tangent reductions.",
         "if (radius > 0.0f) {",
-        op.pair_terms(ctx.row, "sib", ctx.rhs, "    ", own=own),
+        _pair_terms(ctx, own=own),
         f"    row_bound = {_row_bound(ctx, op.terms('residual', ctx.rhs(ctx.row), whole=True))};" if own else "",
         f"    sib_bound = {_sibling_bound(ctx)};",
         f"    pair = {ctx.pair_law}{ctx.diagonal.value(ctx.row)}, cross, {ctx.diagonal.value('sib')},",
@@ -723,8 +742,8 @@ def _friction_triple(ctx: RowContext, *, own: bool) -> str:
         "wp::vec3 triple_residual(0.0f);",
         "// Zero load gives a zero cone; avoid unused reductions.",
         "if (load > 0.0f) {",
-        op.pair_terms(ctx.row, "sib", ctx.rhs, "    ", own=own),
-        op.spin_terms(ctx.row, "sib", "spin", ctx.rhs, "    "),
+        _pair_terms(ctx, own=own),
+        _spin_terms(ctx),
         f"    row_bound = {_row_bound(ctx, op.terms('residual', ctx.rhs(ctx.row), whole=True))};" if own else "",
         f"    sib_bound = {_sibling_bound(ctx)};",
         f"    spin_bound = {_spin_bound(ctx)};",
@@ -819,6 +838,19 @@ def friction_radius(
     return f"{pad}if ({kind} == {FRICTION}) {{\n{radius}\n{pad}}}"
 
 
+def row_sums(op, out: str, pad: str, *, row: str = "i", sibling: str | None = None, paired: str = "false") -> str:
+    """``float out = Z_row . u``, the visited row's velocity term (every lane holds it), by the operator's ``dot``.
+
+    With ``sibling`` a ``paired`` row (a first tangent) also reduces its pair's terms in the same ladder,
+    ``sibling_jv = Z_sibling . u`` and ``pair_coupling = Z_row . Z_sibling``, on the support's one load (rows in
+    memory: :attr:`.ResponseOperator.pair_with_visit`), the sibling's entries kept for the pair's apply.
+    """
+    if sibling is None:
+        return op.dot(((out, "row", None),), {"row": row}, pad)
+    sums = ((out, "row", None), ("sibling_jv", "sib", None), ("pair_coupling", "row", "sib"))
+    return op.dot(sums, {"row": row, "sib": sibling}, pad, exists={"sib": paired})
+
+
 def row_visit(
     ctx: RowContext,
     laws: RowLaws,
@@ -840,7 +872,7 @@ def row_visit(
     on it already (``None``). ``hold`` declares, after the check, registers the disk and the law read (``keep_next``
     keeps the second tangent's impulse in one); the disk joins the admission's block when nothing comes between
     them. ``entries`` declares what the operator reads of the row and ``residual`` reduces ``jv`` (the operator's
-    :meth:`~.ResponseOperator.residual` by default). Rows without friction pairs (``ctx.friction`` false) have no
+    :func:`row_sums` by default). Rows without friction pairs (``ctx.friction`` false) have no
     admission or disk. A skipped row continues the loop.
     """
     row, kind, op = ctx.row, ctx.kind, ctx.operator
@@ -866,7 +898,7 @@ def row_visit(
         ]
     lines += [
         indent(entries, pad) if entries else "",
-        op.residual("jv", pad) if residual is None else residual,
+        row_sums(op, "jv", pad) if residual is None else residual,
         row_update(ctx, laws, residual="jv", pad=pad),
     ]
     return "\n".join(line for line in lines if line)
@@ -875,6 +907,21 @@ def row_visit(
 # ---------------------------------------------------------------------------------------------------------------------
 # The contact unit: a contact normal and its friction pair on the unit's Gram block
 # ---------------------------------------------------------------------------------------------------------------------
+
+
+# The unit's rows by their names in the visit: the visited row (the normal, then the first tangent), its friction
+# sibling and its spin row. A row's velocity term is its reduced term moved by the normal's change.
+_UNIT_MOVED = {
+    "row": "r == 0 ? unit_jv0 : unit_jv1 + gram_n1 * unit_dn",
+    "sib": "(unit_jv2 + gram_n2 * unit_dn)",
+    "spin": "(unit_jv3 + gram_n3 * unit_dn)",
+}
+_UNIT_GRAM = {("row", "sib"): "unit_cross", ("row", "spin"): "unit_cross13", ("sib", "spin"): "unit_cross23"}
+_UNIT_CHANGE = {
+    "row": "if (r == 0) unit_dn += {d}; else unit_dt1 += {d};",
+    "sib": "unit_dt2 += {d};",
+    "spin": "unit_ds += {d};",
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -912,45 +959,35 @@ class UnitZ(ResponseOperator):
             return f"fmaxf({moved}, unit_jv3_terms - fabsf(unit_dn) * gram_n3_terms)"
         return f"(r == 0 ? unit_jv0_terms : fmaxf({moved}, unit_jv1_terms - fabsf(unit_dn) * gram_n1_terms))"
 
-    def residual(self, out: str, indent: str) -> str:
-        return f"{indent}float {out} = r == 0 ? unit_jv0 : unit_jv1 + gram_n1 * unit_dn;"
-
-    def sibling_residual(self, out: str, sibling: str, indent: str, rhs: str) -> str:
-        return f"{indent}float {out} = (unit_jv2 + gram_n2 * unit_dn) + {rhs};"
-
-    def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
-        if self.cached:
-            return f"{indent}const float {out} = 0.0f;  // the cached metric replaces the coupling"
-        return f"{indent}const float {out} = unit_cross;"
-
-    def pair_terms(self, row: str, sibling: str, rhs: Callable[[str], str], indent: str, *, own: bool = False) -> str:
-        if own:
-            raise ValueError("a contact unit's first tangent reads its moved residual through the row visit")
-        lines = (
-            self.sibling_residual("sibling_residual", sibling, indent, rhs(sibling)),
-            self.coupling("cross", row, sibling, indent),
-        )
-        return "\n".join(line for line in lines if line != "")
-
-    def spin_terms(self, row: str, sibling: str, spin: str, rhs: Callable[[str], str], indent: str) -> str:
-        """The spin row's moved residual ``Z_s^T u + G_sn dn`` and its couplings with the pair, under contact
-        torsion."""
-        if self.cached:
-            coupling = (
-                f"{indent}const float spin_cross = 0.0f, spin_cross_sibling = 0.0f;  // the cached metric replaces them"
-            )
+    def dot(self, sums, rows: dict[str, str], indent: str, *, rhs: dict[str, str] | None = None, **_) -> str:
+        """``float out = Z_row . other`` for each ``(out, row, other)`` of ``sums`` on the unit's block: a velocity
+        term the placement reduced, moved by the normal's change (``Z_t^T (u + Z_n dn)``), its right-hand side
+        ``rhs`` added in the same expression; a Gram entry the placement's reduction gave, or, where the friction law
+        reads a metric cached for the unit (``cached``), zero, the Gram entries of one call declared together. The
+        operator's ladder and entries are the placement's, so the velocity form's other options read nothing here."""
+        rhs = rhs or {}
+        lines, grams = [], []
+        for out, row, other in sums:
+            if other is not None:
+                grams.append((out, _UNIT_GRAM[(row, other)]))
+                continue
+            if row == "row" and out in rhs:
+                raise ValueError("a contact unit's first tangent reads its moved residual through the row visit")
+            added = f" + {rhs[out]}" if out in rhs else ""
+            lines.append(f"{indent}float {out} = {_UNIT_MOVED[row]}{added};")
+        if grams and self.cached:
+            replaced = "the coupling" if len(grams) == 1 else "them"
+            zeros = ", ".join(f"{out} = 0.0f" for out, _ in grams)
+            lines.append(f"{indent}const float {zeros};  // the cached metric replaces {replaced}")
         else:
-            coupling = f"{indent}const float spin_cross = unit_cross13;\n{indent}const float spin_cross_sibling = unit_cross23;"
-        return f"{indent}float spin_residual = (unit_jv3 + gram_n3 * unit_dn) + {rhs(spin)};\n" + coupling
+            lines += [f"{indent}const float {out} = {value};" for out, value in grams]
+        return "\n".join(lines)
 
-    def apply(self, delta: str, indent: str) -> str:
-        return f"\n{indent}if (r == 0) unit_dn += {delta}; else unit_dt1 += {delta};"
-
-    def apply_row(self, row: str, delta: str, indent: str) -> str:
-        return f"\n{indent}{'unit_ds' if row == 'spin' else 'unit_dt2'} += {delta};"
-
-    def apply_pair(self, sibling_delta: str, delta: str, indent: str) -> str:
-        return f"\n{indent}unit_dt2 += {sibling_delta};" + self.apply(delta, indent)
+    def axpy(self, changes: tuple[tuple[str, str], ...], indent: str, *, row: str | None = None, **_) -> str:
+        """``u += Z_k d_k`` of each ``(name, d)`` of ``changes``, deferred into the unit's changes (``unit_dn``,
+        ``unit_dt1``, ``unit_dt2``, ``unit_ds``), which the placement applies once after the unit; ``row`` names the
+        visit's row of one change."""
+        return "".join(f"\n{indent}" + _UNIT_CHANGE[row or name].format(d=delta) for name, delta in changes)
 
 
 def cached_pair_law(name: str, low: str, high: str, axis: tuple[str, str], pad: str) -> str:
@@ -1091,7 +1128,7 @@ def contact_unit(
     the pair's visit solves with it (the friction triple, :func:`friction_pair`); a unit of three solves its pair as
     the triple of a zero spin coefficient (:func:`spin_row`). ``held`` holds the spin row's staged values fourth, its
     change defers into ``unit_ds``, and the placement reduces its terms (``unit_jv3``, ``gram_n3``, ``unit_cross13``,
-    ``unit_cross23``: :meth:`UnitZ.spin_terms`, zero for a unit of three) and applies it with the unit's.
+    ``unit_cross23``: :func:`_spin_terms`, zero for a unit of three) and applies it with the unit's.
     """
     if (ctx.owned and ctx.lanes.parallel) != held:
         raise ValueError(
@@ -1288,7 +1325,7 @@ def rows_block(
 
     ``admission`` holds the block's own skips, run after the row's kind is read. A dense friction pair's second
     tangent shares its first tangent's entries: the first tangent's residual reduces the pair's terms with its own
-    (:meth:`.SparseFactor.residual`). A header row's impulses need no barrier around their stores: every lane stores
+    (:func:`row_sums`). A header row's impulses need no barrier around their stores: every lane stores
     the value it computed (or, streamed, the first lane stores and every read takes the first lane's value), so a lane
     only ever reads its own stores.
 
@@ -1316,7 +1353,7 @@ def rows_block(
         head = f"{inner}int row_type = {rows.kind('i')};"
         parent = rows.parent("i")
         rhs = rows.rhs_of
-        residual = op.residual("jv", inner, sibling="parent + 2", paired=f"row_type == {FRICTION}")
+        residual = row_sums(op, "jv", inner, sibling="parent + 2", paired=f"row_type == {FRICTION}")
         prologue = ""
     ctx = RowContext(
         row="i",
@@ -1357,11 +1394,11 @@ def friction_triple_visit(
 
     ``metric`` loads what the law and the pool read, first and off the chain; ``pool`` forms the pooled normal ``load``
     (an expression, its patch ring's), and a zero cone with no carried impulse is skipped (``continue``) before one
-    reduction of the three rows' velocity terms on the contact's shared support (:meth:`.SparseFactor.unit_terms`).
+    reduction of the three rows' velocity terms on the contact's shared support (``dot``).
     The triple's law projects the residuals: ``law`` is the call up to its residual argument, ``(residual, old, mu,
     mu_t, load, omega)`` after it (:func:`.projection_laws.friction_triple_from_metric` of the contact's metric). The
     first lane stores the impulses, the three changes vote together and one apply writes each coordinate once
-    (:meth:`.SparseFactor.unit_apply`): the three changes summed in the rows' order, then added.
+    (``axpy`` of a block): the three changes summed in the rows' order, then added.
     """
     op, diag = ctx.operator, ctx.diagonal
     names = (("tangent", "first"), ("sibling", "second"), ("spin", "spin"))
@@ -1378,7 +1415,12 @@ def friction_triple_visit(
         *(f"const float {name}_old = {ctx.load(row)};" for row, name in names),
         "// Zero load gives a zero cone: a triple without impulse moves nothing.",
         "if (load == 0.0f && first_old == 0.0f && second_old == 0.0f && spin_old == 0.0f) continue;",
-        op.unit_terms(names, ""),
+        op.dot(
+            tuple((f"{name}_jv", name, None) for _, name in names),
+            {name: row for row, name in names},
+            "",
+            keep_velocity=True,
+        ),
         *(f"const float {name}_residual = {name}_jv + {rhs[name]};" for _, name in names),
         *(
             f"const float {name}_bound = {diag.bound(rhs[name], op.terms(f'{name}_jv', rhs[name], whole=False), f'{name}_old', row)};"
@@ -1391,7 +1433,12 @@ def friction_triple_visit(
         *(ctx.store(row, f"triple[{k}]") for k, (row, _) in enumerate(names)),
         "if (first_delta != 0.0f || second_delta != 0.0f || spin_delta != 0.0f) {",
         change_vote(laws, changes, "    "),
-        op.unit_apply((("first", "first_delta"), ("second", "second_delta"), ("spin", "spin_delta")), "    "),
+        op.axpy(
+            (("first", "first_delta"), ("second", "second_delta"), ("spin", "spin_delta")),
+            "    ",
+            kept=True,
+            block=True,
+        ),
         "}",
         ctx.sync(),
     ]
@@ -1425,7 +1472,7 @@ def impulse_seed(
         impulse: Row ``i``'s impulse.
         kind: Row ``i``'s type.
         skip: The kind left out (``VELOCITY_LIMIT`` or ``SPEED``).
-        apply: ``du += Z_i seed`` (the operator's ``apply_row``, indented for this block).
+        apply: ``du += Z_i seed`` (the operator's ``axpy`` of row ``i``, indented for this block).
         sync: The lanes' barrier after a row.
         declare: Statements row ``i``'s ``apply`` needs.
         pad: Indentation of the emitted statements.
@@ -1454,7 +1501,7 @@ def velocity_limit_pass(rows: WorldRows, op, laws: RowLaws, *, end: str = "m_den
     Each row keeps a unilateral total (:func:`.projection_laws.velocity_limit_update`), owned by the row's first
     lane. ``rows`` stages the rows' impulses, kinds, diagonals and right-hand sides (:class:`WorldRows`, or a route's
     store of the same accessors); the operator reduces each row's velocity term outside the row loop
-    (:meth:`~.ResponseOperator.row_velocity`).
+    (``dot``).
     """
     lanes = rows.lanes
     lines = [
@@ -1463,7 +1510,7 @@ def velocity_limit_pass(rows: WorldRows, op, laws: RowLaws, *, end: str = "m_den
         f"    float denom = {rows.diag('i')};",
         "    if (denom <= 0.0f) continue;",
         "",
-        op.row_velocity("my_sum_vlim", "i", "    "),
+        op.dot((("my_sum_vlim", "row", None),), {"row": "i"}, "    "),
         "    float jv_vlim = my_sum_vlim;",
         "",
         f"    float residual_vlim = jv_vlim + {rows.rhs_of('i')};",
@@ -1479,7 +1526,7 @@ def velocity_limit_pass(rows: WorldRows, op, laws: RowLaws, *, end: str = "m_den
         "",
         "    if (delta_impulse_vlim != 0.0f) {",
         change_vote(laws, (change,), "        "),
-        op.apply_strided("i", "delta_impulse_vlim", "        "),
+        op.axpy((("row", "delta_impulse_vlim"),), "        "),
         "    }",
         f"    {lanes.sync()}",
         "}",

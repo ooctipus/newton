@@ -116,20 +116,22 @@ class LaneVelocity(Velocity):
 
 
 class ResponseOperator:
-    """A row response representation: residual, coupling and apply, emitted per row.
+    """A row response representation, which the row law (:mod:`.sweep`) acts through by two actions: ``dot``, sums
+    ``Z_row . u`` and Gram entries ``Z_row . Z_other`` reduced in one ladder, and ``axpy``, ``u += sum_k Z_k d_k``.
 
-    The row actions are native statements at the indentation ``indent``; an
-    operator implements the ones its sweeps take. The visited row is ``i``.
-    A row's diagonal ``A_ii`` is its row store's, which the row law reads
-    (:class:`.sweep.Diagonal`), not the operator's.
+    The actions are native statements at the indentation ``indent``. A row's diagonal ``A_ii`` is its row store's,
+    which the row law reads (:class:`.sweep.Diagonal`), not the operator's.
     """
 
     applies = True
-    """Whether :meth:`apply` writes state the row's lanes share (the velocity, a maintained residual), so the lanes
-    synchronize after it. An impulse-space operator without apply leaves every lane its own copy of the impulses."""
+    """Whether ``axpy`` writes state the row's lanes share (the velocity, a maintained residual), so the lanes
+    synchronize after it. An impulse-space operator without it leaves every lane its own copy of the impulses."""
     fused_pair_apply = False
-    """Whether a row's apply takes its friction pair's second tangent too (``apply_pair``: the sibling's change, then
-    the row's, per entry, written back once) instead of ``apply_row`` of the sibling then ``apply`` of the row."""
+    """Whether a row's apply takes its friction pair's second tangent too (the sibling's change, then the row's, per
+    entry, written back once) instead of the sibling's apply, then the row's."""
+    pair_with_visit = False
+    """Whether the visited row's residual reduces its friction pair's sums in its own ladder (``sibling_jv``,
+    ``pair_coupling``: :func:`.sweep.row_sums`), which the pair's terms then read instead of reducing their own."""
 
     def terms(self, out: str, rhs: str, *, whole: bool) -> str:
         """``S_i`` of a sum this operator reduced into ``out``, the magnitude of the terms its velocity sum adds, or a
@@ -139,78 +141,6 @@ class ResponseOperator:
         side ``rhs`` (``whole``). An operator that reduces ``sum_k |t_ik|`` beside the sum returns it.
         """
         return terms_bound(out, rhs) if whole else f"fabsf({out})"
-
-    # -- row actions ---------------------------------------------------------------------------------------------------
-
-    def _lacks(self, action: str):
-        return NotImplementedError(f"{type(self).__name__} has no {action}")
-
-    def residual(self, out: str, indent: str) -> str:
-        """``float out = J_i v`` of the visited row (every lane holds it)."""
-        raise self._lacks("residual")
-
-    def row_velocity(self, out: str, row: str, indent: str) -> str:
-        """``float out = J_row v`` of a row outside the visit (every lane holds it)."""
-        raise self._lacks("row velocity")
-
-    def sibling_residual(self, out: str, sibling: str, indent: str, rhs: str) -> str:
-        """``float out = J_s v + rhs`` of the friction sibling ``sibling``: its row velocity, then its right-hand
-        side ``rhs``."""
-        return f"{self.row_velocity(out, sibling, indent)}\n{indent}{out} += {rhs};"
-
-    def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
-        """``float out = J_i Y_s``: the pair's off-diagonal entry."""
-        raise self._lacks("pair coupling")
-
-    def pair_entries(self, sibling: str, indent: str) -> str:
-        """Declare what a friction pair's terms and its second tangent's apply read of the sibling ``sibling``, once,
-        before the pair's disk: nothing by default (:meth:`pair_terms` and :meth:`apply_row` read their own)."""
-        return ""
-
-    def pair_terms(self, row: str, sibling: str, rhs: Callable[[str], str], indent: str, *, own: bool = False) -> str:
-        """Declare a friction pair's ``sibling_residual`` (``J_s v + rhs_s``) and ``cross`` (``J_i Y_s``).
-
-        With ``own`` the row's residual is reduced here too: ``residual`` (``J_i v + rhs_i``) of the operator's
-        current row, for a pair solved as one unit. ``rhs`` maps a row index to its right-hand side. An operator
-        whose lanes reduce several sums in one ladder reduces the pair's sums together.
-        """
-        lines = []
-        if own:
-            lines.append(self.residual("residual", indent))
-            lines.append(f"{indent}residual += {rhs(row)};")
-        lines += [
-            self.sibling_residual("sibling_residual", sibling, indent, rhs(sibling)),
-            self.coupling("cross", row, sibling, indent),
-        ]
-        return "\n".join(line for line in lines if line != "")
-
-    def spin_terms(self, row: str, sibling: str, spin: str, rhs: Callable[[str], str], indent: str) -> str:
-        """Declare a friction triple's spin terms (contact torsion), after :meth:`pair_terms`: ``spin_residual``
-        (``J_p v + rhs_p`` of the spin row ``spin``) and its couplings with the tangents, ``spin_cross``
-        (``J_i Y_p``) and ``spin_cross_sibling`` (``J_s Y_p``)."""
-        lines = (
-            self.sibling_residual("spin_residual", spin, indent, rhs(spin)),
-            self.coupling("spin_cross", row, spin, indent),
-            self.coupling("spin_cross_sibling", sibling, spin, indent),
-        )
-        return "\n".join(line for line in lines if line != "")
-
-    def apply(self, delta: str, indent: str) -> str:
-        """``v += Y_i delta`` of the visited row."""
-        raise self._lacks("apply")
-
-    def apply_row(self, row: str, delta: str, indent: str) -> str:
-        """``v += Y_row delta`` of a row outside the visit (the friction sibling)."""
-        raise self._lacks("row apply")
-
-    def apply_pair(self, sibling_delta: str, delta: str, indent: str) -> str:
-        """``v += Y_s sibling_delta + Y_i delta`` in one pass (:attr:`fused_pair_apply`)."""
-        raise self._lacks("pair apply")
-
-    def apply_strided(self, row: str, delta: str, indent: str) -> str:
-        """``v += Y_row delta`` after :meth:`row_velocity` of the same row (the end-of-sweep passes): by default
-        :meth:`apply_row`; an operator may reuse what the row velocity kept."""
-        return self.apply_row(row, delta, indent)
 
 
 def _applied_sum(out: str, start: str, response: Callable[[str], str], applied: Callable[[str], str], rows: str):
@@ -587,8 +517,8 @@ class SparseFactor(ResponseOperator):
     magnitudes: bool = False
     """Each velocity sum also reduces its terms' magnitude, which the exit law's vote reads (:meth:`terms`)."""
     fused_pair_apply: bool = True
-    """A row's apply takes its friction pair's second tangent too, written back once (:meth:`apply_pair`); without it
-    the second tangent applies on its own first (:meth:`apply_row`), then the row (:meth:`apply`)."""
+    """A row's apply takes its friction pair's second tangent too, one :meth:`axpy` of the sibling's change, then the
+    row's, written back once; without it the second tangent applies on its own first, then the row."""
 
     @property
     def width(self) -> int:
@@ -643,6 +573,8 @@ class SparseFactor(ResponseOperator):
         keep_velocity: bool = False,
         magnitudes: tuple[str, ...] = (),
         reduce: bool = True,
+        rhs: dict[str, str] | None = None,
+        reduced: dict[str, str] | None = None,
     ) -> str:
         """``float out = Z_row . other`` for each ``(out, row, other)`` of ``sums`` (``other`` ``None`` for the velocity,
         else a row: a Gram entry), over the rows' shared support, reduced in one ladder (every lane holds them).
@@ -654,9 +586,23 @@ class SparseFactor(ResponseOperator):
         their entries and the support are read again, not loaded. Each velocity sum of an operator with
         ``magnitudes``, and each sum ``magnitudes`` names, also reduces its terms' magnitude ``{out}_terms`` beside
         it (:meth:`terms`). Without ``reduce`` the sums accumulate this lane's entries into ``out``, declared before,
-        in order.
+        in order. A sum of ``rhs`` adds its right-hand side after the ladder (``out += rhs``); a sum of ``reduced`` was
+        reduced by an earlier ladder under another name (``out`` -> that name), which it is declared from, after the
+        ladder, its right-hand side added beside it.
         """
-        exists = exists or {}
+        exists, rhs, reduced = exists or {}, rhs or {}, reduced or {}
+        later = []
+        for out, _, _ in sums:
+            if out in reduced:
+                later.append(f"float {out} = {reduced[out]};")
+                later += [f"{out} += {rhs[out]};"] if out in rhs else []
+        if reduced:
+            sums = tuple(s for s in sums if s[0] not in reduced)
+            rows = {name: row for name, row in rows.items() if any(name in (r, o) for _, r, o in sums)}
+        added = [f"{out} += {rhs[out]};" for out, _, _ in sums if out in rhs]
+        tail = "".join(f"\n{indent}{line}" for line in (*added, *later))
+        if not sums:
+            return tail.removeprefix("\n")
         count, names = self.entries, list(rows)
         kept = () if self.registers else kept
         loaded = [] if self.registers else [name for name in names if name not in kept]
@@ -697,8 +643,8 @@ class SparseFactor(ResponseOperator):
                 guarded.append(f"{out}_terms += fabsf({product});")
         body += ["if (index >= 0) {", *("    " + line for line in guarded), "}"]
         text = "\n".join(indent + line for line in lines) + "\n" + self.entries_loop("\n".join(body), indent)
-        reduced = self.lanes.reduce(*outs) if reduce else ""
-        return text + "".join(f"\n{indent}{line}" for line in reduced.split("\n") if line)
+        ladder = self.lanes.reduce(*outs) if reduce else ""
+        return text + "".join(f"\n{indent}{line}" for line in ladder.split("\n") if line) + tail
 
     def axpy(
         self,
@@ -748,106 +694,15 @@ class SparseFactor(ResponseOperator):
             ]
         return self.entries_loop("\n".join(body), indent, entry=bool(head))
 
-    # -- the row law's actions, as the two ------------------------------------------------------------------------
-
-    def residual(
-        self,
-        out: str,
-        indent: str,
-        *,
-        row: str = "i",
-        sibling: str | None = None,
-        paired: str = "false",
-    ) -> str:
-        """``float out = Z_row . delta`` (every lane holds it), the row's entries kept for :meth:`apply`.
-
-        With ``sibling``, a ``paired`` row (a first tangent) also reduces ``sibling_jv = Z_sibling . delta`` and
-        ``pair_coupling = Z_row . Z_sibling`` in the same ``SUM`` and keeps the sibling's entries for
-        :meth:`apply_pair`; a contact's spin row, where it has one, reduces its own terms (:meth:`spin_terms`).
-        """
-        if sibling is None:
-            return self.dot(((out, "row", None),), {"row": row}, indent)
-        sums = ((out, "row", None), ("sibling_jv", "sib", None), ("pair_coupling", "row", "sib"))
-        return self.dot(sums, {"row": row, "sib": sibling}, indent, exists={"sib": paired})
-
     def terms(self, out: str, rhs: str, *, whole: bool) -> str:
         """``sum_k |Z_k u_k|`` of a velocity sum reduced into ``out``, reduced beside it (``magnitudes``)."""
         return f"{out}_terms" if self.magnitudes else super().terms(out, rhs, whole=whole)
 
-    def sibling_residual(self, out: str, sibling: str, indent: str, rhs: str) -> str:
-        """``float out = Z_s . delta + rhs`` of the pair's second tangent, whose sum :meth:`residual` reduced (rows in
-        memory), or its own (rows in registers)."""
-        if self.registers:
-            return f"{self.dot(((out, 'sib', None),), {'sib': sibling}, indent)}\n{indent}{out} += {rhs};"
-        return f"{indent}float {out} = sibling_jv;\n{indent}{out} += {rhs};"
-
-    def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
-        """``float out = Z_t . Z_s``: the pair's off-diagonal entry, which :meth:`residual` reduced (rows in memory),
-        or its own (rows in registers)."""
-        if self.registers:
-            return self.dot(((out, "row", "sib"),), {"row": row, "sib": sibling}, indent)
-        return f"{indent}float {out} = pair_coupling;"
-
-    def pair_terms(self, row: str, sibling: str, rhs: Callable[[str], str], indent: str, *, own: bool = False) -> str:
-        """The pair's terms. Rows in memory: the visit's residual reduced them with its own, on the support's one load
-        (:meth:`residual`). Rows in registers: the pair's sums in one ladder of their own, the row's residual first
-        with ``own``."""
-        if not self.registers:
-            return super().pair_terms(row, sibling, rhs, indent, own=own)
-        sums = ((("residual", "row", None),) if own else ()) + (
-            ("sibling_residual", "sib", None),
-            ("cross", "row", "sib"),
-        )
-        lines = [self.dot(sums, {"row": row, "sib": sibling}, indent)]
-        if own:
-            lines.append(f"{indent}residual += {rhs(row)};")
-        lines.append(f"{indent}sibling_residual += {rhs(sibling)};")
-        return "\n".join(lines)
-
-    def spin_terms(self, row: str, sibling: str, spin: str, rhs: Callable[[str], str], indent: str) -> str:
-        """The spin row's residual and its couplings with the pair, reduced in one ladder on the support and entries
-        :meth:`residual` kept (a contact's rows share its support): only a contact with a spin row pays them."""
-        sums = (("spin_residual", "spin", None), ("spin_cross", "row", "spin"), ("spin_cross_sibling", "sib", "spin"))
-        terms = self.dot(sums, {"row": row, "sib": sibling, "spin": spin}, indent, kept=("row", "sib"))
-        return f"{terms}\n{indent}spin_residual += {rhs(spin)};"
-
-    def unit_terms(self, rows: tuple[tuple[str, str], ...], indent: str) -> str:
-        """``float {name}_jv = Z_row . delta`` of each ``(row, name)`` of a contact's rows, which share the first row's
-        support, reduced in one ladder; the support, the velocity there and each row's entries are kept for
-        :meth:`unit_apply`."""
-        sums = tuple((f"{name}_jv", name, None) for _, name in rows)
-        return self.dot(sums, {name: row for row, name in rows}, indent, keep_velocity=True)
-
-    def unit_apply(self, changes: tuple[tuple[str, str], ...], indent: str) -> str:
-        """``delta_v += sum Z_row d`` over the ``(name, d)`` of :meth:`unit_terms`' rows, one block's change: their sum
-        in the order given, added once to the velocity :meth:`unit_terms` read (:meth:`axpy`)."""
-        return self.axpy(changes, indent, kept=True, block=True)
-
-    def apply(self, delta: str, indent: str) -> str:
-        """``delta_v += Z_row delta`` from the entries :meth:`residual` (or :meth:`row_velocity`) kept."""
-        return self.axpy((("row", delta),), indent)
-
-    def apply_pair(self, sibling_delta: str, delta: str, indent: str) -> str:
-        """``delta_v += Z_s sibling_delta + Z_row delta`` from :meth:`residual`'s entries: per entry the sibling's
-        change, then the row's, each when nonzero, written back once."""
-        return self.axpy((("sib", sibling_delta), ("row", delta)), indent)
-
-    def accumulate(self, out: str, row: str, indent: str) -> str:
-        """``out += Z_row . delta`` over this lane's entries, in order, unreduced."""
-        return self.dot(((out, "row", None),), {"row": row}, indent, reduce=False)
-
-    def row_velocity(self, out: str, row: str, indent: str, *, active: str = "") -> str:
-        """``float out = Z_row . delta`` (every lane holds it), the row's entries kept for :meth:`apply_strided`; zero
-        where ``active`` fails (no row)."""
-        return self.dot(((out, "row", None),), {"row": row}, indent, exists={"row": active} if active else None)
-
-    def apply_strided(self, row: str, delta: str, indent: str) -> str:
-        """``delta_v += Z_row delta`` from the entries :meth:`row_velocity` kept."""
-        return self.apply(delta, indent)
-
-    def apply_row(self, row: str, delta: str, indent: str) -> str:
-        """``delta_v += Z_row delta``, the row's entries read here."""
-        return self.axpy((("row", delta),), indent, row=row)
+    @property
+    def pair_with_visit(self) -> bool:
+        """Rows in memory: the visited row's residual reduces its pair's sums on the support's one load. Rows in
+        registers reduce the pair's own ladder."""
+        return not self.registers
 
     def expand(self, rows: str, indent: str) -> str:
         """Expand the packed rows ``[0, rows)`` into the dense rows (``local``), zero elsewhere; ends unsynchronized."""

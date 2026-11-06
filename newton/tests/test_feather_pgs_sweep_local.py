@@ -115,16 +115,20 @@ class TestResponseOperators(unittest.TestCase):
     def test_register_rows_fuse_a_pair_ladder(self):
         rows = sweep_routes_local._rows(23, Lanes(32))
         rhs = lambda r: f"s_rhs[{r}]"  # noqa: E731
-        fused = rows.pair_terms("i", "sib", rhs, "", own=True)
+        sums = (("residual", "row", None), ("sibling_residual", "sib", None), ("cross", "row", "sib"))
+        fused = rows.dot(
+            sums, {"row": "i", "sib": "sib"}, "", rhs={"residual": rhs("i"), "sibling_residual": rhs("sib")}
+        )
+        self.assertFalse(rows.pair_with_visit)
         self.assertIn("SUM(residual, residual_terms, sibling_residual, sibling_residual_terms, cross);", fused)
         self.assertIn("residual_terms += fabsf(row_z * velocity);", fused)
         self.assertIn("const float velocity = factor_velocity;", fused)
         self.assertNotIn("indices", fused)
         self.assertEqual(rows.terms("residual", "s_rhs[i]", whole=True), "residual_terms")
         self.assertIn("residual += s_rhs[i];", fused)
-        self.assertIn("if (index >= 0) factor_velocity += row_z * d;", rows.apply("d", ""))
-        self.assertIn("if (index >= 0) factor_velocity += spin_z * d;", rows.apply_row("spin", "d", ""))
-        pair = rows.apply_pair("sd", "d", "")
+        self.assertIn("if (index >= 0) factor_velocity += row_z * d;", rows.axpy((("row", "d"),), ""))
+        self.assertIn("if (index >= 0) factor_velocity += spin_z * d;", rows.axpy((("spin", "d"),), ""))
+        pair = rows.axpy((("sib", "sd"), ("row", "d")), "")
         self.assertLess(pair.index("value += sibling_z * sd;"), pair.index("value += row_z * d;"))
 
 

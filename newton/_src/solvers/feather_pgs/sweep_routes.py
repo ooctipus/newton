@@ -370,7 +370,7 @@ def _unit_apply(pad: str, *, torsion: bool = False) -> str:
     changes = tuple((part, change) for part, _, change in _unit_rows(torsion))
     lines = [
         f"if ({' || '.join(f'{change} != 0.0f' for _, change in changes)}) {{",
-        _staged_rows(torsion).unit_apply(changes, "    "),
+        _staged_rows(torsion).axpy(changes, "    ", kept=True, block=True),
         "}",
     ]
     return indent("\n".join(lines), pad)
@@ -820,14 +820,14 @@ def mf_gs_source(
                 "m_dense",
                 dense.peek("i"),
                 f"({dense.kind('i', scan=True)})",
-                dense_op.apply_row("i", "seed", "        "),
+                dense_op.axpy((("row", "seed"),), "        ", row="i"),
                 row_lanes.sync(),
             ),
             impulse_seed(
                 "m_mf",
                 free.load("i"),
                 "(mf_meta.data[off_meta + i * 4 + 3] & 0xFFFF)",
-                free_op.apply_row("i", "seed", "        "),
+                free_op.axpy((("row", "seed"),), "        ", row="i"),
                 row_lanes.sync(),
                 skip=SPEED,
                 declare=(

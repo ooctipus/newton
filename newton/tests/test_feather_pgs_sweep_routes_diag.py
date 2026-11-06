@@ -21,7 +21,7 @@ import warp as wp
 from newton._src.solvers.feather_pgs import sweep_routes_diag as routes
 from newton._src.solvers.feather_pgs.response_operator import Lanes, Velocity
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
-from newton._src.solvers.feather_pgs.sweep import RowLaws, speed_row
+from newton._src.solvers.feather_pgs.sweep import RowLaws, row_sums, speed_row
 from newton._src.solvers.feather_pgs.sweep_routes import free_body_rows
 
 _POLICIES = (SolvePolicy(), SolvePolicy(readout="sweeps"), SolvePolicy(readout="trace"))
@@ -166,7 +166,7 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
 
     def test_free_body_one_thread(self):
         op = free_body_rows(Lanes(1))
-        residual = op.residual("jv", "")
+        residual = row_sums(op, "jv", "")
         # One thread sums the twelve entries in order, a's six then b's, from zero; the visited row is read at i.
         self.assertIn("float jv = 0.0f;", residual)
         self.assertIn("const int entry = q;", residual)
@@ -177,10 +177,10 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
         )
         self.assertNotIn("SUM", residual)
         # The sibling residual sums its velocity term, then adds its right-hand side.
-        sibling = op.sibling_residual("sibling_residual", "sib", "", "rhs[sib]")
+        sibling = op.dot((("sibling_residual", "sib", None),), {"sib": "sib"}, "", rhs={"sibling_residual": "rhs[sib]"})
         self.assertIn("sibling_residual += mf_Z.data[mf12_base + sib * 12 + entry] * velocity;", sibling)
         self.assertLess(sibling.index("* velocity;"), sibling.index("sibling_residual += rhs[sib];"))
-        coupling = op.coupling("cross", "i", "sib", "")
+        coupling = op.dot((("cross", "row", "sib"),), {"row": "i", "sib": "sib"}, "")
         self.assertIn(
             "cross += mf_Z.data[mf12_base + i * 12 + entry] * mf_Z.data[mf12_base + sib * 12 + entry];", coupling
         )
@@ -195,38 +195,45 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
     def test_free_body_lanes(self):
         op = free_body_rows(Lanes(32))
         # A lane an entry: the visited row's is the loop's pipelined register, every other row's is read at its index.
-        residual = op.residual("jv", "")
+        residual = row_sums(op, "jv", "")
         self.assertIn("jv += cur_z * velocity;", residual)
         self.assertIn("const int index = entry < 12 ?", residual)
         self.assertIn("SUM(jv);", residual)
         # A friction pair's terms reduce in one ladder, the right-hand side added after.
-        pair = op.pair_terms("i", "sib", lambda row: f"rhs[{row}]", "")
+        pair = op.dot(
+            (("sibling_residual", "sib", None), ("cross", "row", "sib")),
+            {"row": "i", "sib": "sib"},
+            "",
+            rhs={"sibling_residual": "rhs[sib]"},
+        )
         self.assertIn("SUM(sibling_residual, cross);\nsibling_residual += rhs[sib];", pair)
         self.assertIn("cross += cur_z * mf_Z.data[mf12_base + sib * 12 + entry];", pair)
         # The second tangent applies on its own, read at its index.
         self.assertFalse(op.fused_pair_apply)
-        self.assertIn("s_v[index] += mf_Z.data[mf12_base + sib * 12 + entry] * d;", op.apply_row("sib", "d", ""))
-        self.assertIn("s_v[index] += cur_z * d;", op.apply("d", ""))
+        self.assertIn(
+            "s_v[index] += mf_Z.data[mf12_base + sib * 12 + entry] * d;", op.axpy((("sib", "d"),), "", row="sib")
+        )
+        self.assertIn("s_v[index] += cur_z * d;", op.axpy((("row", "d"),), ""))
         # The lanes push the speed row's change from their first lane.
         self.assertIn("if (lane == 0) {", _speed_row(Lanes(32), Velocity("s_v")))
 
     def test_slot_row_layouts(self):
         """The sparse diagonal's rows are packed rows of a dense group and two slots: a lane an entry."""
         warp = routes.slot_rows(6, 32, Lanes(32))
-        residual = warp.residual("jv", "")
+        residual = row_sums(warp, "jv", "")
         self.assertIn("SUM(jv);", residual)
         # One whitened entry per lane: the dense part's Z, or a slot's Z_s, at the entry's coordinate.
         self.assertIn("dense_Z.data[(dense_group * 32 + i) * 6 + entry]", residual)
         self.assertIn("sparse_row_z.data[(row_base + i) * 2 + entry - 6]", residual)
         self.assertIn("sparse_row_dof.data[(row_base + i) * 2 + entry - 6]", residual)
         # W = Z^T Z: a first tangent reduces its pair's terms with its own, on the shared support.
-        paired = warp.residual("jv", "", sibling="parent + 2", paired="row_type == 2")
+        paired = row_sums(warp, "jv", "", sibling="parent + 2", paired="row_type == 2")
         self.assertIn("SUM(jv, sibling_jv, pair_coupling);", paired)
         segment = routes.slot_rows(6, 32, Lanes(8, "batch_lane", segment=True))
-        velocity = segment.row_velocity("v", "c", "", active="valid")
+        velocity = segment.dot((("v", "row", None),), {"row": "c"}, "", exists={"row": "valid"})
         self.assertIn("SEGMENT_SUM(8, v);", velocity)
         self.assertIn("const int index = valid && entry < 8 ?", velocity)
-        scalar = routes.SCALAR_ROWS.residual("jv", "")
+        scalar = row_sums(routes.SCALAR_ROWS, "jv", "")
         self.assertIn("const int index = scalar_coord;", scalar)
         self.assertNotIn("SUM", scalar)
 

@@ -44,6 +44,7 @@ from .sweep import (
     material_arguments,
     pair_radius,
     pair_update,
+    row_sums,
     row_update,
     row_visit,
     spin_row,
@@ -429,7 +430,7 @@ def _unit_row(ctx: RowContext, laws: RowLaws, kind: str, *, load: bool = True) -
     lines = [
         f"const float row_z = {_load(op, 'i')};" if load else "",
         "if (s_diag[i] > 0.0f) {",
-        op.residual("jv", "    "),
+        row_sums(op, "jv", "    "),
         row_update(row, laws, residual="jv", pad="    "),
         "}",
     ]

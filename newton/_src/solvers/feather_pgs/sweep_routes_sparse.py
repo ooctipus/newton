@@ -66,6 +66,7 @@ from .sweep import (
     impulse_seed,
     indent,
     material_arguments,
+    row_sums,
     row_visit,
     spin_row,
     unit_held_loads,
@@ -376,7 +377,7 @@ def active_scan(sweep: SparseSweep, op: SparseFactor, pad: str) -> str:
     held = "s_impulse[parent + 2] != 0.0f"
     serial = dataclasses.replace(op, lanes=Lanes(1, "0"))
     # The delta is zero at the first sweep unless warm starting seeded it.
-    dot = serial.accumulate("dot", "row", "")
+    dot = serial.dot((("dot", "row", None),), {"row": "row"}, "", reduce=False)
     if not sweep.warm_start:
         dot = "if (iter != 0) {\n" + indent(dot, "    ") + "\n}"
     if sweep.linked:
@@ -447,7 +448,7 @@ for (int first = 0; first < count; first += 32) {{
     const int kind = row < count ? static_cast<int>(s_type[row]) : -1;
     if ((kind == {CONTACT} || kind == {JOINT_LIMIT}) && s_impulse[row] == 0.0f && s_diag[row] > 0.0f) {{
         float dot = 0.0f;
-{serial.accumulate("dot", "row", "        ")}
+{serial.dot((("dot", "row", None),), {"row": "row"}, "        ", reduce=False)}
         const float residual = dot + s_rhs[row];
         const float excess = isfinite(residual) ? omega * fmaxf(-residual, 0.0f) : __int_as_float(0x7f800000);
         if (excess != 0.0f && ({visit.loud})) sweep_violation_loud = 1;
@@ -466,7 +467,7 @@ def warm_start_seed(op: SparseFactor, pad: str) -> str:
     """Give the delta the response of the impulses the row buffer carries, before the first sweep
     (:func:`.sweep.impulse_seed`)."""
     return impulse_seed(
-        "count", "s_impulse[i]", "s_type[i]", op.apply_row("i", "seed", "        "), op.lanes.sync(), pad=pad
+        "count", "s_impulse[i]", "s_type[i]", op.axpy((("row", "seed"),), "        ", row="i"), op.lanes.sync(), pad=pad
     )
 
 
@@ -474,7 +475,7 @@ def ordinary_rows(rows: SparseRows, op: SparseFactor, laws: RowLaws, *, skip_vel
     """Row ``i``'s visit and update under the shared row law (:func:`.sweep.row_visit`).
 
     The friction gate, then the first tangent of a pair on its ring's disk; the residual reduces the pair's
-    second-tangent term and coupling with it (:meth:`.SparseFactor.residual`). Velocity-limit rows wait for the
+    second-tangent term and coupling with it (:func:`.sweep.row_sums`). Velocity-limit rows wait for the
     last-word pass (``skip_velocity_limits``). Under contact torsion the rows staged as spin rows, a friction triple's
     (:class:`SparseRows`), are the triple phase's: the loop skips them and carries none of the triple's code. The
     first lane stores the impulses after every lane has read them.
@@ -504,7 +505,7 @@ def ordinary_rows(rows: SparseRows, op: SparseFactor, laws: RowLaws, *, skip_vel
         # A friction triple's rows are the triple phase's (contact torsion).
         f"if (row_type == {TORSION}) continue;" if laws.torsion else "",
     ]
-    residual = op.residual("jv", pad, sibling="parent + 2", paired=f"row_type == {FRICTION}")
+    residual = row_sums(op, "jv", pad, sibling="parent + 2", paired=f"row_type == {FRICTION}")
     visit = row_visit(
         ctx,
         dataclasses.replace(laws, torsion=False),
@@ -625,7 +626,8 @@ SYNC();"""
         sums = (("unit_jv0", "normal", None), ("unit_jv1", "tangent", None), ("unit_jv2", "sibling", None))
         gather = op.dot(sums, unit_rows, "        ", keep_velocity=True, reduce=False)
         # Per coordinate the unit's changes summed in its rows' order, then added.
-        apply = op.unit_apply((("normal", "unit_dn"), ("tangent", "unit_dt1"), ("sibling", "unit_dt2")), "            ")
+        changes = (("normal", "unit_dn"), ("tangent", "unit_dt1"), ("sibling", "unit_dt2"))
+        apply = op.axpy(changes, "            ", kept=True, block=True)
         ctx = RowContext(
             row="i",
             kind="row_type",
