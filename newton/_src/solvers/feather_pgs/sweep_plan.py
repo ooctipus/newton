@@ -487,7 +487,7 @@ class Sweep:
             force_stream_mf_impulses = self.pins.mf_storage == "streamed"
             on_cpu = Place.GLOBAL if force_stream_mf_impulses else Place.SHARED
             storage = _MFGSStorage(
-                sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL, on_cpu),
+                sweep_routes.RowPlaces(Place.GLOBAL, on_cpu),
                 "Without CUDA no shared-memory storage applies.",
             )
             if model.device.is_cuda:
@@ -500,11 +500,13 @@ class Sweep:
                         free_rows=self.placement.free_contact_rows,
                     ),
                     arch_budget(device_arch),
-                    block_count=self.forest.world_count,
-                    sm_count=int(model.device.sm_count),
                     force_stream_mf_impulses=force_stream_mf_impulses,
                 )
             self.mf_gs_storage = storage
+            # The streamed rows' records: the dense rows' too where their metadata streams.
+            self.placement.allocate_row_records(
+                sweep_routes.record_first(self.placement.dense_max_constraints, storage.places)
+            )
             parallel_rows = self.classes.tier_rows
             # The general sweep's warp mapping: its places the storage's, its rows the placement's.
             self.general_sweep = sweep_routes.GeneralSweep(
@@ -778,9 +780,9 @@ class Sweep:
             "world_row_parent": placement.row_parent,
             "world_row_mu": placement.row_mu,
             "mf_constraint_count": placement.mf_constraint_count,
-            # The free bodies' headers (their records and packed rows are the line's above).
             "mf_contact_rows_end": placement.mf_contact_rows_end,
-            "mf_meta": placement.mf_meta_packed,
+            # The streamed rows' records (the free bodies', and the dense rows' where they stream).
+            "row_record": placement.row_record,
             "iterations": self.options.pgs_iterations,
             "omega": self.options.pgs_omega,
             "friction_metric": placement.friction_metric,

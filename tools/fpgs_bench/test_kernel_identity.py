@@ -200,10 +200,10 @@ class TestKernelIdentity(unittest.TestCase):
         skipped, _ = identity.census(("sweep_routes_diag.DiagonalSweep",), skip=rows.keys())
         self.assertEqual(skipped, {})
 
-    def test_census_crosses_resident_row_metadata(self):
-        """Cross the matrix-free sweep with resident row metadata, which rewrites its row loads."""
+    def test_census_crosses_streamed_row_records(self):
+        """Cross the matrix-free sweep with streamed row records, which rewrite its row loads."""
         calls = [kwargs for name, _, _, kwargs in identity.census_calls() if name.endswith("sweep_routes.GeneralSweep")]
-        self.assertTrue(any(kwargs["places"].staging == "resident" for kwargs in calls))
+        self.assertTrue(any(kwargs["places"].staging == "record" for kwargs in calls))
 
     def test_coordinate_tree_kernels_are_recorded_with_the_pins(self):
         """Record every kernel of the held-tree owner's one-coordinate class in the pins family.

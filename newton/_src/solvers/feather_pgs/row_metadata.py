@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared packed dense and matrix-free row metadata contracts."""
+"""Shared packed dense and matrix-free row metadata contracts, and the row record the sweeps stream."""
 
 from .row_kernels import PGS_CONSTRAINT_TYPE_COUNT
 
@@ -66,4 +66,54 @@ def unpack_mf_header(word: str, indent: str) -> str:
         f"{indent}float mf_diag = __int_as_float({word}.y);\n"
         f"{indent}int packed_tp = {word}.w;\n"
         f"{indent}int mf_rt = packed_tp & 0xFFFF;"
+    )
+
+
+RECORD_WORDS = 8
+"""Words of a row's record (:func:`pack_row_record`): two ``int4``, which a row loop loads a row ahead."""
+
+
+def pack_row_record(
+    record: str,
+    dof_a: str,
+    dof_b: str,
+    n_a: str,
+    n_b: str,
+    diagonal: str,
+    rhs: str,
+    kind: str,
+    parent: str,
+    mu: str,
+    indent: str,
+) -> str:
+    """Store a row's record at the ``int`` pointer ``record``: everything a row loop reads of the row but its ``Z``
+    and its impulse, in two ``int4`` (:data:`RECORD_WORDS`).
+
+    The first is the header (:func:`pack_mf_header`): the first world coordinates of the row's sides ``dof_a`` and
+    ``dof_b`` (-1 for no side), the bits of its stored diagonal (the class's form: the free bodies' inverse, the dense
+    rows' ``A_ii``), of its right-hand side (the law's plus its incident velocity: its residual at ``du = 0``), and its
+    kind and parent (0xFFFF for none). The second holds the sides' widths ``n_a`` and ``n_b`` (two 16-bit halves), the
+    bits of the row's friction coefficient and two zero words.
+    """
+    return (
+        pack_mf_header("record_a", dof_a, dof_b, diagonal, rhs, kind, parent, indent) + f"\n{indent}int4 record_b;\n"
+        f"{indent}record_b.x = {n_a} | ({n_b} << 16);\n"
+        f"{indent}record_b.y = __float_as_int({mu});\n"
+        f"{indent}record_b.z = 0;\n"
+        f"{indent}record_b.w = 0;\n"
+        f"{indent}*reinterpret_cast<int4*>({record}) = record_a;\n"
+        f"{indent}*reinterpret_cast<int4*>({record} + 4) = record_b;"
+    )
+
+
+def record_word(row: str, word: int, base: str) -> str:
+    """Word ``word`` of row ``row``'s record, the records of its class from ``base`` (a native ``int`` offset)."""
+    return f"row_record.data[{base} + ({row}) * {RECORD_WORDS} + {word}]"
+
+
+def load_row_record(a: str, b: str, row: str, base: str, indent: str) -> str:
+    """Load row ``row``'s record into the ``int4`` locals ``a`` and ``b`` (the class's records from ``base``)."""
+    at = f"&row_record.data[{base} + ({row}) * {RECORD_WORDS}]"
+    return (
+        f"{indent}{a} = *reinterpret_cast<const int4*>({at});\n{indent}{b} = *reinterpret_cast<const int4*>({at} + 4);"
     )

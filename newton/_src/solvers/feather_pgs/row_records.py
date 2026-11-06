@@ -36,13 +36,15 @@ contact's slot and its rows' parents count in the line. ``row_incident`` is each
 incident velocity ``J v_hat``, written where its walk sums it: the one writer (:mod:`.walk_rows`), the free bodies'
 writer (:func:`.walk_rows.write_free_body_rows`)."""
 
-MF_ROWS = FieldGroup(Field("mf_meta_packed", wp.int32, ("world", "mf_meta"), owner="placement"))
-"""The free bodies' packed header the sweeps read, which the placement stages each step from the records: four ints
-per row (dof pair, inverse effective mass ``1 / A_ii``, the residual at zero velocity change, type and parent). The
+ROW_RECORDS = FieldGroup(Field("row_record", wp.int32, ("world", "record"), owner="placement"))
+"""The streamed rows' records, which the sweeps' row loops load a row ahead, packed each step from the row store
+(:func:`.response_builds_rows.row_record_kernel`, :func:`.row_metadata.pack_row_record`): eight ints a row, the line's
+rows from the plan's first streamed row (the dense rows' where a sweep streams their metadata, else the free bodies'
+from ``body_base``, which always stream). A free row's record keeps the inverse of its effective mass ``A_ii``; its
 rows themselves are the line's: their records the row store's (:data:`DENSE_ROWS`, from ``body_base``), their sides
-their responding bodies' articulations in the rows' ``a``/``b`` order (-1 for none), their ``diag`` the effective mass
-``A_ii``, and their whitened ``Z = L^-1 J^T`` (``L`` the body's held factor: two one-node trees of six) the packed
-rows' (:data:`.packed_rows.PACKED_ROWS`, the line's rows at the world's support)."""
+their responding bodies' articulations in the rows' ``a``/``b`` order (-1 for none), and their whitened
+``Z = L^-1 J^T`` (``L`` the body's held factor: two one-node trees of six) the packed rows'
+(:data:`.packed_rows.PACKED_ROWS`, the line's rows at the world's support)."""
 
 
 RECORDS = (

@@ -35,7 +35,7 @@ import warp as wp
 from .device_preludes import DevicePrelude
 from .field_group import Field, FieldGroup
 
-__all__ = ["PACKED_ROWS", "PACKED_SIDES", "WIDE", "support_width"]
+__all__ = ["PACKED_ROWS", "PACKED_SIDES", "RECORD_SIDES", "WIDE", "support_width"]
 
 WIDE = 2
 """The ``dense`` layout of rows that bilateral elimination corrected: every entry is a world coordinate's, sides or
@@ -65,6 +65,20 @@ _PACKED_SIDES = """    // A packed row's entries (packed_rows): PACKED_COORDINAT
     };"""
 
 PACKED_SIDES = DevicePrelude("packed_sides", _PACKED_SIDES, _PACKED_SIDES)
+
+_RECORD_SIDES = """    // A streamed row's entries from its record (row_metadata.pack_row_record): RECORD_COORDINATE(firsts, widths, e)
+    // is PACKED_COORDINATE of the row's sides from their first world coordinates (16-bit halves, -1 for none) and
+    // widths, which the record holds.
+    const auto RECORD_COORDINATE = [&](const int firsts, const int widths, const int e) {
+        const int off0 = firsts >> 16, off1 = (firsts << 16) >> 16;
+        const int n0 = widths & 0xFFFF, n1 = (widths >> 16) & 0xFFFF;
+        if (packed_dense != 0) return ((e >= off0 && e < off0 + n0) || (e >= off1 && e < off1 + n1)) ? e : -1;
+        return e < n0 ? off0 + e : (e < n0 + n1 ? off1 + e - n0 : -1);
+    };"""
+
+RECORD_SIDES = DevicePrelude("record_sides", _RECORD_SIDES, _RECORD_SIDES)
+"""``RECORD_COORDINATE(firsts, widths, e)``: a packed row's coordinates from the words of its record that hold its
+sides (:func:`.row_metadata.pack_row_record`), for native sources that take ``packed_dense``."""
 """``PACKED_COORDINATE(sides, e)`` and ``PACKED_FIRST(sides, art)`` for native sources that take ``response_dofs``,
 ``articulation_world_dof_offset`` and ``packed_dense``: a packed row's coordinates and sides from its sides (no stored
 coordinates)."""

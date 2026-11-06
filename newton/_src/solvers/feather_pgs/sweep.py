@@ -62,6 +62,8 @@ from .row_metadata import (
     _DENSE_META_ROW_TYPE_BITS,
     _DENSE_META_ROW_TYPE_MASK,
     _mf_parent_expression,
+    load_row_record,
+    record_word,
     unpack_mf_header,
 )
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound, sweep_exit, terms_bound, vote
@@ -87,71 +89,94 @@ def indent(text: str, prefix: str) -> str:
 @dataclasses.dataclass(frozen=True)
 class WorldRows:
     """A world's rows of one class in the row store's line (the ``world_*`` records): the dense class's from
-    ``off_dense``, the free bodies' from ``off_mf``, ``capacity`` slots each, read by the class's staging policy.
+    ``off_dense``, the free bodies' (``free``) from ``off_mf``, ``capacity`` slots each, read by the class's staging
+    policy.
 
     ``staging`` says where a row's metadata come from:
 
     - ``"shared"``: the right-hand side (the law's bias plus the row's incident velocity ``row_incident``: the row's
       residual at ``du = 0``), diagonal and friction coefficient are staged in shared memory, and the kind and parent
       as one packed word per row (``s_meta_dense``: the kind in the low bits, the parent plus one above);
-    - ``"resident"``: only the packed word is staged, the rest streams from the records;
-    - ``"streamed"``: everything streams from the records (the end-of-sweep scans, :meth:`kind` with ``scan``, read the
-      records' kinds whenever the metadata streams);
-    - ``"header"``: the free bodies' placement's header, one packed ``int4`` per row (``mf_meta``: the sides' first
-      coordinates ``dof_a << 16 | dof_b``, the inverse diagonal, the right-hand side, and ``kind | parent << 16``),
-      which the free bodies' row loop reads a row ahead (:func:`rows_block`).
+    - ``"record"``: the rows' records stream (``row_record``, :func:`.row_metadata.pack_row_record`: a row's sides,
+      stored diagonal, right-hand side, kind, parent and friction coefficient in two ``int4``), the class's from
+      ``off_rec_dense`` or ``off_rec_mf``. A row loop loads the visited row's record a row ahead into registers
+      (``rec_a``, ``rec_b``: :func:`rows_block`; a loop that does not pipeline declares them, :meth:`visit`), which
+      every read of row ``i`` takes; any other row's read takes its record's word. The free bodies' rows always
+      stream, and their records keep the inverse of their diagonal, which their step multiplies by; the dense rows'
+      keep ``A_ii``, which a step divides by.
 
-    Impulses are staged (``s_lam_dense``, ``s_lam_mf``) or, with ``stream`` (the header's rows), read and written in
-    place (``g_lam_mf``). A dense row's and a streamed one's impulse is owned by the row's first lane, whose value
-    every lane takes by broadcast; a staged header row's every lane stores what it computed, and so does every row's
-    with ``every_lane`` (the sparse-diagonal sweep's: each lane reads its own stores). Staged and streamed reads hold
-    identical values.
+    Impulses are staged (``s_lam_dense``, ``s_lam_mf``) or, with ``stream`` (the free bodies' rows), read and written
+    in place (``g_lam_mf``). A dense row's impulse is owned by the row's first lane, whose value every lane takes by
+    broadcast; a staged free row's every lane stores what it computed, and so does every row's with ``every_lane``
+    (the sparse-diagonal sweep's: each lane reads its own stores). Staged and streamed reads hold identical values.
     """
 
     capacity: int
     staging: str = "shared"
+    free: bool = False
     stream: bool = False
     rhs: str = "rhs_bias"
     lanes: Lanes = dataclasses.field(default_factory=Lanes)
     every_lane: bool = False
 
-    STAGINGS: ClassVar[tuple[str, ...]] = ("shared", "resident", "streamed", "header")
+    STAGINGS: ClassVar[tuple[str, ...]] = ("shared", "record")
     STAGED: ClassVar[dict[str, str]] = {
         "s_rhs_dense": "rhs",
         "s_diag_dense": "world_diag",
         "s_mu_dense": "world_row_mu",
     }
+    VISITED: ClassVar[str] = "i"
+    """The row a row loop visits, whose record the loop holds in registers."""
 
     def __post_init__(self):
         if self.staging not in self.STAGINGS:
             raise ValueError(f"staging must be one of {self.STAGINGS}, got {self.staging!r}")
-        if self.stream and not self.header:
-            raise ValueError("only the header's rows stream their impulses")
+        if self.free and self.staging != "record":
+            raise ValueError("the free bodies' rows stream their records")
+        if self.stream and not self.free:
+            raise ValueError("only the free bodies' rows stream their impulses")
 
     @property
-    def header(self) -> bool:
-        return self.staging == "header"
+    def record(self) -> bool:
+        return self.staging == "record"
 
     @property
     def own_stores(self) -> bool:
-        """Every lane stores the impulse it computed and reads its own stores (a staged header row, ``every_lane``)."""
-        return self.every_lane or (self.header and not self.stream)
+        """Every lane stores the impulse it computed and reads its own stores (a staged free row, ``every_lane``)."""
+        return self.every_lane or (self.free and not self.stream)
 
     @property
     def owned(self) -> bool:
         """The row's first lane owns its stored impulse, which other lanes read directly: its stores wait for them.
-        A header row's every read takes its own lane's store or the first lane's by broadcast."""
-        return not (self.header or self.every_lane)
+        A free row's every read takes its own lane's store or the first lane's by broadcast."""
+        return not (self.free or self.every_lane)
 
     @property
     def base(self) -> str:
         """The class's first row in the world's line."""
-        return "off_mf" if self.header else "off_dense"
+        return "off_mf" if self.free else "off_dense"
+
+    @property
+    def records(self) -> str:
+        """The class's first record in the line's records."""
+        return "off_rec_mf" if self.free else "off_rec_dense"
 
     @property
     def impulses(self) -> str:
         """The staged impulses (or, with ``stream``, the world's in place)."""
-        return "g_lam_mf" if self.stream else "s_lam_mf" if self.header else "s_lam_dense"
+        return "g_lam_mf" if self.stream else "s_lam_mf" if self.free else "s_lam_dense"
+
+    def word(self, row: str, word: int) -> str:
+        """Word ``word`` of row ``row``'s record: the visited row's from its registers."""
+        if row == self.VISITED:
+            return f"rec_{'ab'[word // 4]}.{'xyzw'[word % 4]}"
+        return record_word(row, word, self.records)
+
+    def visit(self, row: str = "i") -> str:
+        """Declare the visited row's record registers for a loop that does not load them a row ahead."""
+        if not self.record:
+            return ""
+        return "int4 rec_a, rec_b;\n" + load_row_record("rec_a", "rec_b", row, self.records, "")
 
     def _source(self, name: str) -> str:
         source = self.STAGED[name]
@@ -163,30 +188,34 @@ class WorldRows:
         return f"({value} + row_incident.data[off_dense + ({row})])" if name == "s_rhs_dense" else value
 
     def staged(self, name: str, row: str) -> str:
-        """Row ``row``'s value of the staged array ``name`` (staged or streamed)."""
-        return f"{name}[{row}]" if self.staging == "shared" else self._stored(name, row)
+        """Row ``row``'s value of the staged array ``name``."""
+        return f"{name}[{row}]"
 
     def rhs_of(self, row: str) -> str:
-        if self.header:
-            return f"__int_as_float(mf_meta.data[off_meta + {row} * 4 + 2])"
+        if self.record:
+            return f"__int_as_float({self.word(row, 2)})"
         return self.staged("s_rhs_dense", row)
 
     def diag(self, row: str) -> str:
+        if self.record:
+            return f"__int_as_float({self.word(row, 1)})"
         return self.staged("s_diag_dense", row)
 
     def inverse(self, row: str) -> str:
-        """A header row's stored inverse diagonal."""
-        return f"__int_as_float(mf_meta.data[off_meta + {row} * 4 + 1])"
+        """A free row's stored inverse diagonal."""
+        return f"__int_as_float({self.word(row, 1)})"
 
     def diagonal(self, own: str) -> Diagonal:
-        """The rows' diagonals as the class keeps them (the visited row ``i``'s read into ``own``): a header row's
+        """The rows' diagonals as the class keeps them (the visited row ``i``'s read into ``own``): a free row's
         stored inverse, which its step multiplies by, or the dense rows' value, which a step divides by."""
-        if self.header:
+        if self.free:
             return Diagonal(inverse=lambda row: own if row == "i" else self.inverse(row))
         return Diagonal(lambda row: own if row == "i" else self.diag(row))
 
     def mu(self, row: str) -> str:
-        return f"world_row_mu.data[off_mf + {row}]" if self.header else self.staged("s_mu_dense", row)
+        if self.record:
+            return f"__int_as_float({self.word(row, 5)})"
+        return self.staged("s_mu_dense", row)
 
     def weight(self, row: str) -> str:
         return f"world_row_w.data[{self.base} + {row}]"
@@ -195,31 +224,28 @@ class WorldRows:
         return f"world_row_eps.data[{self.base} + {row}]"
 
     def kind(self, row: str, *, scan: bool = False) -> str:
-        if self.staging == "shared" or (self.staging == "resident" and not scan):
-            return f"s_meta_dense[{row}] & {_DENSE_META_ROW_TYPE_MASK}"
-        return f"world_row_type.data[off_dense + {row}]"
+        if self.record:
+            return f"({self.word(row, 3)} & 0xFFFF)"
+        return f"s_meta_dense[{row}] & {_DENSE_META_ROW_TYPE_MASK}"
 
     def parent(self, row: str, *, enclosed: bool = False) -> str:
-        if self.staging == "streamed":
-            return f"world_row_parent.data[off_dense + {row}]"
-        decoded = f"(s_meta_dense[{row}] >> {_DENSE_META_ROW_TYPE_BITS}) - 1"
+        decoded = (
+            self.parent_of(self.word(row, 3))
+            if self.record
+            else f"(s_meta_dense[{row}] >> {_DENSE_META_ROW_TYPE_BITS}) - 1"
+        )
         return f"({decoded})" if enclosed else decoded
 
     def parent_of(self, packed: str) -> str:
-        """A header row's parent from its packed ``kind | parent << 16`` word."""
+        """A row's parent from its record's packed ``kind | parent << 16`` word."""
         return _mf_parent_expression(packed, self.capacity)
 
     def scan(self) -> tuple[Callable[[str], str], Callable[[str], str]]:
         """A row's kind and parent as a scan over the rows reads them (:func:`friction_metric_stage`)."""
-        if self.header:
-            word = lambda row: f"mf_meta.data[off_meta + ({row}) * 4 + 3]"  # noqa: E731
-            return (lambda row: f"({word(row)} & 0xFFFF)"), (lambda row: self.parent_of(word(row)))
         return (lambda row: f"({self.kind(row, scan=True)})"), self.parent
 
     def spin_of(self, parent: str, end: str) -> str:
         """The spin row of the contact whose normal is row ``parent``, of rows ``[0, end)`` (:func:`spin_row`)."""
-        if self.header:
-            return spin_row(parent, end, lambda row: f"(mf_meta.data[off_meta + ({row}) * 4 + 3] & 0xFFFF)")
         return spin_row(parent, end, lambda row: f"({self.kind(row)})")
 
     def load(self, row: str) -> str:
@@ -239,8 +265,8 @@ class WorldRows:
 
     def ring_load(self, parent: str, load: str | None = None) -> str:
         """The pooled normal load of the patch ring of normal row ``parent``, from ``load`` (its impulse)."""
-        if self.header:
-            member = self.parent_of("mf_meta.data[off_meta + patch_row * 4 + 3]")
+        if self.free:
+            member = self.parent("patch_row")
             impulse = self.load("patch_row")
             return (
                 f"RING_LOAD({load or self.load(parent)}, {parent}, {self.capacity},\n"
@@ -259,10 +285,10 @@ class WorldRows:
         return (["s_rhs_dense", "s_diag_dense"], ["s_mu_dense"]) if self.staging == "shared" else ([], [])
 
     def buffers(self) -> tuple[Buffer, ...]:
-        if self.header:
+        if self.free:
             return () if self.stream else (Buffer("s_lam_mf", "float", self.capacity),)
         head, tail = self.staged_names()
-        packed = [Buffer("s_meta_dense", "int", self.capacity)] if self.staging != "streamed" else []
+        packed = [Buffer("s_meta_dense", "int", self.capacity)] if self.staging == "shared" else []
         return (
             Buffer("s_lam_dense", "float", self.capacity),
             *(Buffer(name, "float", self.capacity) for name in head),
@@ -281,17 +307,16 @@ class WorldRows:
         if self.stream:
             return ""
         lines = [f"{self.impulses}[{row}] = world_impulses.data[{self.base} + {row}];"]
-        if self.header:
+        if self.record:
             return lines[0]
         head, tail = self.staged_names()
         lines += [f"{name}[{row}] = {self._stored(name, row)};" for name in head]
-        if self.staging != "streamed":
-            lines += [
-                f"int row_type = world_row_type.data[off_dense + {row}];",
-                f"int row_parent = world_row_parent.data[off_dense + {row}];",
-                f"s_meta_dense[{row}] = (row_type & {_DENSE_META_ROW_TYPE_MASK}) | "
-                f"((row_parent + 1) << {_DENSE_META_ROW_TYPE_BITS});",
-            ]
+        lines += [
+            f"int row_type = world_row_type.data[off_dense + {row}];",
+            f"int row_parent = world_row_parent.data[off_dense + {row}];",
+            f"s_meta_dense[{row}] = (row_type & {_DENSE_META_ROW_TYPE_MASK}) | "
+            f"((row_parent + 1) << {_DENSE_META_ROW_TYPE_BITS});",
+        ]
         lines += [f"{name}[{row}] = {self._stored(name, row)};" for name in tail]
         return "\n".join(lines)
 
@@ -362,6 +387,9 @@ class RowStore(Protocol):
     def scan(self) -> tuple[Callable[[str], str], Callable[[str], str]]:
         """A row's kind and parent as a scan over the rows reads them (:func:`friction_metric_stage`)."""
 
+    def visit(self, row: str = "i") -> str:
+        """What a loop over the rows declares before it reads row ``row`` (a streamed record's registers)."""
+
 
 @dataclasses.dataclass(frozen=True)
 class StagedRows:
@@ -428,6 +456,9 @@ class StagedRows:
 
     def ring_load(self, parent: str, load: str | None = None) -> str:
         return f"RING_LOAD({load or self.load(parent)}, {parent}, {self.count}, ring_parent, ring_impulse)"
+
+    def visit(self, row: str = "i") -> str:
+        return ""
 
     def spin_of(self, parent: str, end: str) -> str:
         return spin_row(parent, end, lambda row: f"static_cast<int>({self.kind(row)})")
@@ -1649,27 +1680,44 @@ def _block(lines: list[str], pad: str) -> str:
     return "{\n" + indent("\n".join(lines), pad + "    ") + f"\n{pad}}}"
 
 
-def _header_load(op, row: str, indent: str) -> str:
-    """Load row ``row``'s packed header word and this lane's entry of its ``Z`` into the header pipeline's registers
-    (``pre_meta``, ``pre_z``)."""
-    lane = op.lanes.lane
-    meta = "off_meta" if row == "0" else f"off_meta + ({row}) * 4"
-    return (
-        f"{indent}pre_meta = *reinterpret_cast<const int4*>(&mf_meta.data[{meta}]);\n"
-        f"{indent}if ({lane} < {op.width}) pre_z = {op.element(row, lane)};"
-    )
+def _record_load(rows: WorldRows, op, row: str, indent: str) -> str:
+    """Load row ``row``'s record into the row loop's pipeline registers (``pre_a``, ``pre_b``), and, where the
+    operator keeps the visited row's entries in registers (the free bodies'), this lane's entry of its ``Z``
+    (``pre_z``)."""
+    text = load_row_record("pre_a", "pre_b", row, rows.records, indent)
+    if op.registers:
+        text += f"\n{indent}if ({op.lanes.lane} < {op.width}) pre_z = {op.element(row, op.lanes.lane)};"
+    return text
 
 
-def _header_consume(op, row: str, end: str, indent: str) -> str:
-    """Take row ``row``'s header word and entry from the pipeline (``meta``, ``cur_z``), load row ``row + 1``'s (before
-    ``end``) and decode the word (:func:`.row_metadata.unpack_mf_header`)."""
-    return (
-        f"{indent}int4 meta = pre_meta;\n"
-        f"{indent}float cur_z = pre_z;\n"
-        f"{indent}if ({row} + 1 < {end}) {{\n"
-        + _header_load(op, f"{row} + 1", indent + "    ")
-        + f"\n{indent}}}\n"
-        + unpack_mf_header("meta", indent)
+def _record_consume(rows: WorldRows, op, row: str, end: str, indent: str) -> str:
+    """Take row ``row``'s record (``rec_a``, ``rec_b``) and entry (``cur_z``) from the pipeline and load row
+    ``row + 1``'s (before ``end``); a free row's header word decodes into its sides' coordinates and its fields
+    (:func:`.row_metadata.unpack_mf_header`)."""
+    lines = [f"{indent}const int4 rec_a = pre_a;", f"{indent}const int4 rec_b = pre_b;"]
+    if op.registers:
+        lines.append(f"{indent}float cur_z = pre_z;")
+    lines += [
+        f"{indent}if ({row} + 1 < {end}) {{",
+        _record_load(rows, op, f"{row} + 1", indent + "    "),
+        f"{indent}}}",
+    ]
+    if rows.free:
+        lines.append(unpack_mf_header("rec_a", indent))
+    return "\n".join(lines)
+
+
+def _record_pipeline(rows: WorldRows, op, end: str) -> Pipelined:
+    """A record store's rows ``[0, end)`` in slot order, each row's record loaded a row ahead (the pipeline's
+    registers in a block of their own: a sweep pipelines each of its classes)."""
+    z = "float pre_z = 0.0f;\n{pad}" if op.registers else ""
+    return Pipelined(
+        end,
+        lambda pad: (
+            f"{pad}int4 pre_a, pre_b;\n{pad}{z.format(pad=pad)}"
+            f"if ({end} > 0) {{\n{_record_load(rows, op, '0', pad + '    ')}\n{pad}}}"
+        ),
+        lambda row, pad: _record_consume(rows, op, row, end, pad),
     )
 
 
@@ -1759,13 +1807,13 @@ def rows_block(
     """The Gauss-Seidel loop over a world's rows of one class ``[0, end)`` in slot order (:class:`WorldRows`): the
     dense rows on packed rows (:class:`.response_operator.SparseFactor`, to ``m_dense``), each by the row step
     (:func:`row_step`), the free bodies' on their ``Z`` (:func:`.sweep_routes.free_body_rows`, to
-    ``mf_contact_end``). The free bodies' loop is software-pipelined: each row's header word and this lane's entry of
-    its ``Z`` load a row ahead (``pre_meta``, ``pre_z``), and the visit takes them as ``meta`` and ``cur_z``, the
-    visited row's entry its operator reads.
+    ``mf_contact_end``). Where the rows' records stream, the loop is software-pipelined: each row's record (and, for
+    the free bodies' operator, this lane's entry of its ``Z``) loads a row ahead (``pre_a``, ``pre_b``, ``pre_z``), and
+    the visit takes them as ``rec_a``, ``rec_b`` and ``cur_z``.
 
     ``admission`` holds the block's own skips, run after the row's kind is read. A dense friction pair's second
     tangent shares its first tangent's entries: the first tangent's residual reduces the pair's terms with its own
-    (:func:`row_sums`). A header row's impulses need no barrier around their stores: every lane stores
+    (:func:`row_sums`). A free row's impulses need no barrier around their stores: every lane stores
     the value it computed (or, streamed, the first lane stores and every read takes the first lane's value), so a lane
     only ever reads its own stores.
 
@@ -1774,10 +1822,12 @@ def rows_block(
     """
     inner = pad + "    "
     if end is None:
-        end = "mf_contact_end" if rows.header else "m_dense"
-    if not rows.header:
-        order = SlotOrder(end)
-        return order.wrap(row_step(rows, op, laws, end=end, admission=admission, metric=metric, pad=inner), pad)
+        end = "mf_contact_end" if rows.free else "m_dense"
+    if not rows.free:
+        visit = row_step(rows, op, laws, end=end, admission=admission, metric=metric, pad=inner)
+        if rows.record:
+            return f"{pad}{{\n{_record_pipeline(rows, op, end).wrap(visit, pad)}\n{pad}}}"
+        return SlotOrder(end).wrap(visit, pad)
     cached = {} if metric is None else {"triple_law": f"{metric}(parent, "}
     ctx = RowContext(
         row="i",
@@ -1786,7 +1836,7 @@ def rows_block(
         diagonal=rows.diagonal("mf_diag"),
         load=rows.load,
         store=rows.store,
-        rhs=lambda row: "__int_as_float(meta.z)" if row == "i" else rows.rhs_of(row),
+        rhs=rows.rhs_of,
         mu=rows.mu,
         weight=rows.weight,
         parent="parent",
@@ -1804,15 +1854,7 @@ def rows_block(
         indent(admission, inner) if admission else "",
         row_visit(ctx, laws, parent=rows.parent_of("packed_tp"), check="mf_diag", declare="", pad=inner),
     ]
-    headers = Pipelined(
-        end,
-        lambda pad: (
-            f"{pad}int4 pre_meta;\n{pad}float pre_z = 0.0f;\n"
-            f"{pad}if ({end} > 0) {{\n{_header_load(op, '0', pad + '    ')}\n{pad}}}"
-        ),
-        lambda row, pad: _header_consume(op, row, end, pad),
-    )
-    return headers.wrap("\n".join(line for line in body if line), pad)
+    return f"{pad}{{\n{_record_pipeline(rows, op, end).wrap(chr(10).join(line for line in body if line), pad)}\n{pad}}}"
 
 
 def friction_triple_visit(
@@ -1934,8 +1976,10 @@ def velocity_limit_pass(rows: WorldRows, op, laws: RowLaws, *, end: str = "m_den
     (``dot``).
     """
     lanes = rows.lanes
+    visit = rows.visit("i")
     lines = [
         f"for (int i = 0; i < {end}; i++) {{",
+        *((indent(visit, "    "),) if visit else ()),
         f"    if (({rows.kind('i', scan=True)}) != {VELOCITY_LIMIT}) continue;",
         f"    float denom = {rows.diag('i')};",
         "    if (denom <= 0.0f) continue;",
@@ -1979,27 +2023,29 @@ def speed_rows_pass(
     of its body's linear (axis ``e_0``) or angular (axis ``e_3``) velocity, along that velocity (:func:`speed_row`),
     which the body's ``walk`` reads and pushes; ``op`` holds the rows' entries and the velocity.
 
-    The free bodies' run's rows (``rows`` the header's) carry their body's first coordinate, inverse diagonal and
-    right-hand side in their header; the line's (a dense store) name their body by ``body``: the statements that
+    The free bodies' run's rows (``rows.free``) carry their body's first coordinate, inverse diagonal and right-hand
+    side in their record; the line's (a dense store) name their body by ``body``: the statements that
     declare row ``i``'s, the expression of its first world coordinate, and that of the entry its unwhitened axis marks
     at the body's coordinate 3 (:func:`.walk_rows.speed_axis`)."""
     lanes = rows.lanes
-    if getattr(rows, "header", False):
+    visit = indent(rows.visit("i"), "    ") if hasattr(rows, "visit") else ""
+    if getattr(rows, "free", False):
         lines = [
             f"for (int i = {start}; i < {end}; i++) {{",
-            "    int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i * 4]);",
-            unpack_mf_header("meta", "    "),
+            visit,
+            unpack_mf_header("rec_a", "    "),
             f"    if (mf_rt != {SPEED}) continue;",
             "    if (mf_diag <= 0.0f || dof_a < 0) continue;",
             "",
             f"    const int speed_axis = {op.element('i', '3')} != 0.0f ? 3 : 0;",
         ]
-        rhs, inverse, first = "__int_as_float(meta.z)", "mf_diag", "dof_a"
+        rhs, inverse, first = rows.rhs_of("i"), "mf_diag", "dof_a"
         store = lanes.first(rows.store("i", "speed_row[0]")) if not rows.stream else rows.store("i", "speed_row[0]")
     else:
         declare, first, axis = body
         lines = [
             f"for (int i = {start}; i < {end}; i++) {{",
+            *((visit,) if visit else ()),
             f"    const float speed_diag = {rows.diag('i')};",
             "    if (speed_diag <= 0.0f) continue;",
             "    const float speed_inverse = 1.0f / speed_diag;",

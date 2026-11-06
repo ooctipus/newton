@@ -422,21 +422,22 @@ def _sparse_mass_matrix(solver) -> dict:
 def _sweep(solver) -> dict:
     solve = solver._plan.solve
     route = solve.route.name
-    # Only free rigid bodies produce matrix-free rows: the pack kernel is built where it launches.
-    packed = solver.placement.pack_mf_meta_kernel is not None
-    mf_meta_pack = {
+    # The streamed rows' records: the pack kernel is built where a sweep streams a row.
+    packed = solver.placement.row_record_kernel is not None
+    record_pack = {
         "launched": packed,
-        "kernel": _key(solver.placement.pack_mf_meta_kernel),
-        "reason": "Free rigid-body rows pack their metadata each step."
+        "kernel": _key(solver.placement.row_record_kernel),
+        "first": int(solver.placement.record_first),
+        "reason": "The streamed rows pack their records each step."
         if packed
-        else "Skipped: without free rigid bodies no matrix-free row exists.",
+        else "Skipped: no sweep streams a row's metadata.",
     }
     kernels = solver._plan.kernels
     record = {
         "route": route,
         "reason": solve.route.reason,
         "iterations": int(solver.options.pgs_iterations),
-        "mf_meta_pack": mf_meta_pack,
+        "row_record_pack": record_pack,
         "sparse": kernels["sparse"],
         "sparse_diagonal": kernels["sparse_diagonal"],
         "paired_factor": kernels["paired_factor"],
@@ -521,7 +522,6 @@ def _mf_gs_storage(solver) -> dict | None:
     places = storage.places
     return {
         "metadata": storage_class(places.metadata),
-        "row_types_and_parents": storage_class(places.kinds),
         "mf_impulses": storage_class(places.impulses),
         "reason": storage.reason,
     }

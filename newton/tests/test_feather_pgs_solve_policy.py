@@ -414,12 +414,8 @@ class TestExitLaw(unittest.TestCase):
             body = max(_native_snippets(plain), key=len)
             law_sites = len(_LAW_SITE.findall(body))
             places = kwargs.get("places")
-            if (
-                places is not None
-                and places.staging == "resident"
-                and ("_smeta" not in plain.key or "s_meta_dense" not in body)
-            ):
-                self.fail(f"{plain.key} {kwargs}: resident row metadata is not resident")
+            if places is not None and places.staging == "record" and "s_meta_dense" in body:
+                self.fail(f"{plain.key} {kwargs}: streamed rows stage their metadata")
             for policy in (DEFAULT_POLICY, SWEEPS, TRACE):
                 kernel = factory(*args, solve_policy=policy, **kwargs)
                 self.assertEqual(kernel.key, plain.key + policy.suffix, kwargs)
@@ -455,7 +451,7 @@ class TestExitLaw(unittest.TestCase):
             {
                 "sparse": 128,
                 "sparse_lanes": 16,
-                "mf_gs": 24,
+                "mf_gs": 16,
                 "paired": 4,
                 "sparse_diagonal": 12,
             },

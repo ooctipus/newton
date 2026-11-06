@@ -325,11 +325,10 @@ def _solver_factory_calls():
         }
         factory = built(sweep_routes.GeneralSweep)
         yield "sweep_routes.GeneralSweep", factory, (64, 32, 12, _ARCH), kwargs
-    # Streamed metadata with the packed row types and parents resident, which single-wave launches
-    # of large dense capacities select; limits add the limit scans' global reads.
+    # Streamed row records, which large dense capacities select; limits add the limit pass's record reads.
     for limits in (False, True):
         kwargs = {
-            "places": sweep_routes.RowPlaces(Place.GLOBAL, Place.SHARED),
+            "places": sweep_routes.RowPlaces(Place.GLOBAL),
             "has_dense_velocity_limit_rows": limits,
         }
         factory = built(sweep_routes.GeneralSweep)
@@ -592,8 +591,8 @@ class TestFeatherPGSKernelPins(unittest.TestCase):
         ):
             with self.subTest(flag=flag):
                 self.assertTrue(any(flag in name for name in sparse))
-        # The MF-GS kernels that keep row metadata resident are pinned.
-        self.assertTrue([name for name in self.current if "RowPlaces(GLOBAL, SHARED, SHARED)" in name])
+        # The MF-GS kernels that stream their row records are pinned.
+        self.assertTrue([name for name in self.current if "RowPlaces(GLOBAL, SHARED)" in name])
         # The linked tiers are pinned.
         linked = [name for name in self.current if "linked_rows=True" in name]
         self.assertTrue(linked)

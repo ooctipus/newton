@@ -19,10 +19,10 @@ from ...core.memory import REGISTERS_PER_THREAD, Buffer, Place, Staging
 from . import kernel_template, sweep_units
 from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude
 from .kernel_template import Dispatch
-from .packed_rows import PACKED_SIDES
+from .packed_rows import PACKED_SIDES, RECORD_SIDES
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
-from .row_metadata import _validate_dense_metadata_encoding
+from .row_metadata import RECORD_WORDS, _validate_dense_metadata_encoding, _validate_mf_metadata_encoding
 from .solve_policy import QUIET_LITERAL, block_argmax, sweep_exit
 from .sweep import (
     CONTACT,
@@ -85,7 +85,7 @@ MF_GS_ABI = kernel_template.params(
     ("world_row_mu", wp.array2d[float]),
     ("mf_constraint_count", wp.array[int]),
     ("mf_contact_rows_end", wp.array[int]),
-    ("mf_meta", wp.array2d[int]),
+    ("row_record", wp.array2d[int]),
     ("walk", WalkTrees),
     ("iterations", int),
     ("omega", float),
@@ -93,7 +93,8 @@ MF_GS_ABI = kernel_template.params(
 )
 """The matrix-free sweep's native ABI: one world per call (the world queue's dispatch). The free bodies' run's rows are
 the row store's (the ``world_*`` records) and the packed rows' (``packed_Z``), from the dense capacity of the world's
-line; their headers the free bodies' placement (``mf_*``). ``speed_first``: where the line's speed rows start."""
+line; the streamed rows' records the line's (``row_record``, :func:`.row_metadata.pack_row_record`). ``speed_first``:
+where the line's speed rows start."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -103,51 +104,49 @@ class RowPlaces:
     places hold identical values, so the sweep's results are the same.
 
     Args:
-        metadata: The dense rows' right-hand sides, diagonals and friction coefficients.
-        kinds: The dense rows' kinds and parents (one packed word a row): shared wherever the metadata is.
+        metadata: The dense rows' right-hand sides, diagonals, friction coefficients, kinds and parents: staged, or
+            their records streamed a row ahead (:class:`.sweep.WorldRows`).
         impulses: The free bodies' impulses.
     """
 
     metadata: Place = Place.SHARED
-    kinds: Place = Place.SHARED
     impulses: Place = Place.SHARED
 
     def __post_init__(self):
-        if {self.metadata, self.kinds, self.impulses} - {Place.SHARED, Place.GLOBAL}:
+        if {self.metadata, self.impulses} - {Place.SHARED, Place.GLOBAL}:
             raise ValueError(f"row operands live in shared or global memory: {self}")
-        if self.metadata is Place.SHARED and self.kinds is not Place.SHARED:
-            raise ValueError("staged metadata stages the rows' kinds with it")
 
     def __repr__(self) -> str:
-        return f"RowPlaces({self.metadata.name}, {self.kinds.name}, {self.impulses.name})"
+        return f"RowPlaces({self.metadata.name}, {self.impulses.name})"
 
     @property
     def staging(self) -> str:
-        """The dense rows' staging policy (:class:`.sweep.WorldRows`)."""
-        if self.metadata is Place.SHARED:
-            return "shared"
-        return "resident" if self.kinds is Place.SHARED else "streamed"
+        """The dense rows' staging policy (:class:`.sweep.WorldRows`): staged, or their records streamed."""
+        return "shared" if self.metadata is Place.SHARED else "record"
 
     @property
     def suffix(self) -> str:
         """The places' part of a kernel's name."""
-        return (
-            ("" if self.metadata is Place.SHARED else "_gmeta")
-            + ("_smeta" if self.staging == "resident" else "")
-            + ("" if self.impulses is Place.SHARED else "_glambda")
+        return ("" if self.metadata is Place.SHARED else "_gmeta") + (
+            "" if self.impulses is Place.SHARED else "_glambda"
         )
 
 
 STAGED_ROWS = RowPlaces()
 """Every row operand in the block's shared stage, the default."""
 
+
+def record_first(max_constraints: int, places: RowPlaces) -> int:
+    """The line's first row with a record (:func:`.row_metadata.pack_row_record`): the dense rows' first where their
+    metadata streams, else the free bodies' (from the dense capacity ``max_constraints``), which always stream."""
+    return 0 if places.staging == "record" else int(max_constraints)
+
+
 ROW_PLACES = (
     STAGED_ROWS,
     RowPlaces(impulses=Place.GLOBAL),
+    RowPlaces(Place.GLOBAL),
     RowPlaces(Place.GLOBAL, Place.GLOBAL),
-    RowPlaces(Place.GLOBAL, Place.GLOBAL, Place.GLOBAL),
-    RowPlaces(Place.GLOBAL, Place.SHARED),
-    RowPlaces(Place.GLOBAL, Place.SHARED, Place.GLOBAL),
 )
 """Every placement of the sweep's row operands (the census's axis)."""
 
@@ -199,14 +198,17 @@ walk is no chain whose loads a lane could hold ahead, and the default prefetch h
 registers a lane against 80 without it (sm_120, ptxas)."""
 
 
-def packed_operator(support: int, lanes: Lanes, *, wide: bool = False) -> SparseFactor:
+def packed_operator(support: int, lanes: Lanes, *, wide: bool = False, rows: WorldRows | None = None) -> SparseFactor:
     """The dense rows of a matrix-free sweep: packed whitened rows of ``support`` entries (:mod:`.packed_rows`), their
-    world coordinates from their sides (``PACKED_COORDINATE``), or with ``wide`` rows every coordinate of the world, and
-    values from the world's first row (``packed_base``), over the factor velocity change the sweep stages (``s_v``)."""
+    world coordinates from their sides (``PACKED_COORDINATE``; where ``rows`` stream their records, from the sides
+    their records hold, ``RECORD_COORDINATE``), or with ``wide`` rows every coordinate of the world, and values from the
+    world's first row (``packed_base``), over the factor velocity change the sweep stages (``s_v``)."""
 
     def coordinate(row, entry):
         if wide:
             return f"(world_dof_indices.data[dof_map_base + ({entry})] >= 0 ? ({entry}) : -1)"
+        if rows is not None and rows.record:
+            return f"RECORD_COORDINATE({rows.word(row, 0)}, {rows.word(row, 4)}, {entry})"
         return f"PACKED_COORDINATE(row_sides.data[off_dense + ({row})], {entry})"
 
     def value(row, entry):
@@ -406,7 +408,7 @@ def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str
     """A color's units, one thread each, at block stride: each loads its slot's fields at once
     (:data:`.sweep_units.SLOT_FIELDS`, field by field across the color's ``units`` slots) and runs the free-body row
     law, unrolled over the unit's rows, on the world's staged velocity. No other unit of the color shares a body."""
-    unit_rows = WorldRows(M_MF, staging="header", stream=free.stream, lanes=Lanes(1))
+    unit_rows = WorldRows(M_MF, staging="record", free=True, stream=free.stream, lanes=Lanes(1))
     torsion = laws.torsion
     layout = sweep_units.slot_layout(torsion)
 
@@ -639,7 +641,9 @@ def mf_gs_staging(
     velocity, its dense rows' impulses and staged metadata, the free bodies' run's impulses (``free_rows``) unless they
     stream, and the colored mapping's color offsets (and its trace's warp maxima)."""
     dense = WorldRows(max_constraints, staging=places.staging)
-    free = WorldRows(mf_max_constraints, staging="header", stream=places.impulses is Place.GLOBAL or not free_rows)
+    free = WorldRows(
+        mf_max_constraints, staging="record", free=True, stream=places.impulses is Place.GLOBAL or not free_rows
+    )
     colored = ()
     if mapping == "colored":
         warps = COLORED_THREADS // 32
@@ -697,8 +701,10 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     row_lanes = Lanes(lanes)
     laws = sweep.laws
     dense = WorldRows(M_D, staging=places.staging, lanes=row_lanes)
-    free = WorldRows(M_MF, staging="header", stream=places.impulses is Place.GLOBAL, lanes=row_lanes)
-    dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows)
+    free = WorldRows(M_MF, staging="record", free=True, stream=places.impulses is Place.GLOBAL, lanes=row_lanes)
+    if dense.record:
+        _validate_mf_metadata_encoding(M_D)
+    dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows, rows=dense)
     free_op = free_body_rows(row_lanes, max_row_dofs)
     staging = mf_gs_staging(
         M_D,
@@ -820,6 +826,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
                 f"({dense.kind('i', scan=True)})",
                 dense_op.axpy((("row", "seed"),), "        ", row="i"),
                 row_lanes.sync(),
+                declare=tuple(line for line in dense.visit("i").split("\n") if line),
             ),
         )
         seeds += (
@@ -827,12 +834,13 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
                 impulse_seed(
                     "m_mf",
                     free.load("i"),
-                    "(mf_meta.data[off_meta + i * 4 + 3] & 0xFFFF)",
+                    free.kind("i"),
                     free_op.axpy((("row", "seed"),), "        ", row="i"),
                     row_lanes.sync(),
                     skip=SPEED,
                     declare=(
-                        "const int packed_dofs = mf_meta.data[off_meta + i * 4];",
+                        *free.visit("i").split("\n"),
+                        "const int packed_dofs = rec_a.x;",
                         "const int dof_a = packed_dofs >> 16, dof_b = (packed_dofs << 16) >> 16;",
                     ),
                 ),
@@ -871,6 +879,13 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         (f"{first_warp}{chr(10).join(passes)}\n{end_first_warp}",),
         exit=sweep_vote + sweep_end,
     )
+    # The streamed rows' records (row_record): the line's from its first streamed row, the dense rows' where theirs
+    # stream, then the free bodies' (Sweep.build allocates them alike, Placement.allocate_row_records).
+    first_record = record_first(M_D, places)
+    line_records, free_records = (P - first_record) * RECORD_WORDS, (M_D - first_record) * RECORD_WORDS
+    records = f"    const int off_rec_mf = line * {line_records} + {free_records};"
+    if dense.record:
+        records = f"    const int off_rec_dense = line * {P * RECORD_WORDS};\n" + records
     # The way back after the sweeps: the change in the walk's coordinates to the step's one leave (WalkTrees.du,
     # factor.walk.walk_leave_kernel).
     # The free bodies' run's rows (free_rows): their count, impulses' staging and publication.
@@ -903,7 +918,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     __builtin_assume(line >= 0);
     int off_dense = line * {P};
     int off_mf = off_dense + {M_D};
-    int off_meta = line * {M_MF} * 4;
+{records}
     const size_t packed_base = (size_t)line * {P * int(max_row_dofs)};
     const size_t free_base = packed_base + {M_D * int(max_row_dofs)};{offsets}
 
@@ -928,7 +943,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         {dense.stores("i")}
     }}{free_stores}
 {end_first_warp}"""
-    return sweep.native(body, lanes=lanes, rows=(PACKED_SIDES,), walks=(FREE_BODY_WALKS,)), staging
+    return sweep.native(body, lanes=lanes, rows=(PACKED_SIDES, RECORD_SIDES), walks=(FREE_BODY_WALKS,)), staging
 
 
 @dataclasses.dataclass(frozen=True)
@@ -943,8 +958,9 @@ class GeneralSweep(SweepConfig):
     - the level's mapping (:data:`MAPPINGS`): ``"warp"``, the world's warp visits its rows in row order; ``"colored"``,
       a block visits the free bodies' colors in order and a color's units at once (the unit builder's rule picks the
       worlds, :class:`.sweep_units.ColoredRule`);
-    - the row record: ``places``, where the rows' metadata, kinds and the free bodies' impulses live
-      (:class:`RowPlaces`, staged or streamed, the plan's storage choice);
+    - the row record: ``places``, where the rows' metadata and the free bodies' impulses live (:class:`RowPlaces`, the
+      plan's storage choice): the dense rows' metadata staged, or their records streamed a row ahead
+      (:class:`.sweep.WorldRows`' ``"record"`` staging); the free rows always stream their records;
     - the support class: ``max_row_dofs`` (the placement's packed support), ``wide_rows`` (rows over every coordinate,
       the bilateral block's), and the free bodies' 6 + 6 class: ``free_rows`` their own run, else rows of the line,
       their ``speed_rows`` the line's last;

@@ -724,8 +724,8 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         # The sweeps add their velocity change to the predictor; a world without rows keeps it.
         wp.copy(solver.v_out, solver.v_hat)
 
-    def pack_free_body_meta(step):
-        placement.pack_free_body_meta()
+    def pack_row_records(step):
+        placement.pack_row_records()
 
     colored = sweep.colored_units
 
@@ -736,7 +736,8 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
             placement.mf_constraint_count,
             placement.dense_first,
             placement.mf_contact_rows_end,
-            placement.mf_meta_packed,
+            placement.row_record,
+            placement.body_base - placement.record_first,
             placement.packed_Z,
             placement.row_mu,
             placement.row_w,
@@ -750,7 +751,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     add(
         *((seed_blocks,) if spec.laws.preelimination else ()),
         start_velocity,
-        *((pack_free_body_meta,) if placement.free_contact_rows else ()),
+        *((pack_row_records,) if placement.row_record_kernel is not None else ()),
         *((build_colored_units,) if colored is not None else ()),
         nvtx="S5_GatherJY",
     )

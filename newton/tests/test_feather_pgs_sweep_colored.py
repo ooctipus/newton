@@ -35,6 +35,7 @@ from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_TORSION,
 )
+from newton._src.solvers.feather_pgs.row_metadata import RECORD_WORDS
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conf
@@ -176,7 +177,8 @@ class TestStageSlots(unittest.TestCase):
         and the rows' coefficients."""
         rng = np.random.default_rng(7)
         layout, units = sweep_units.slot_layout(torsion), self.units(torsion)
-        meta = np.zeros((self.WORLDS, self.ROWS, 4), dtype=np.int64)
+        # The free rows' records (row_metadata.pack_row_record): their kind and parent words.
+        meta = np.zeros((self.WORLDS, self.ROWS, RECORD_WORDS), dtype=np.int64)
         records = np.zeros((self.WORLDS, max(len(world) for world in units), 4), dtype=np.int32)
         for world, world_units in enumerate(units):
             for p, (row, rows) in enumerate(world_units):
@@ -186,7 +188,7 @@ class TestStageSlots(unittest.TestCase):
                 for r in range(row + 1, row + rows):
                     kind = PGS_CONSTRAINT_TYPE_TORSION if r == row + 3 else PGS_CONSTRAINT_TYPE_FRICTION
                     meta[world, r, 3] = kind | (row << 16)
-        meta = meta.astype(np.uint32).view(np.int32).reshape(self.WORLDS, 4 * self.ROWS)
+        meta = meta.astype(np.uint32).view(np.int32).reshape(self.WORLDS, RECORD_WORDS * self.ROWS)
         mu = rng.uniform(0.1, 1.0, (self.WORLDS, self.ROWS)).astype(np.float32)
         slot_data = wp.zeros((self.WORLDS, layout.fields, records.shape[1]), dtype=float, device=device)
         slot_words = wp.zeros((self.WORLDS, layout.words, records.shape[1]), dtype=wp.int32, device=device)
@@ -202,6 +204,7 @@ class TestStageSlots(unittest.TestCase):
                 wp.array([len(world) for world in units], dtype=wp.int32, device=device),
                 wp.array(records, dtype=wp.int32, device=device),
                 wp.array(meta, dtype=wp.int32, device=device),
+                0,
                 wp.array(rng.standard_normal((self.WORLDS, self.ROWS, 12)), dtype=float, device=device),
                 wp.array(mu, dtype=float, device=device),
                 weights,
@@ -266,9 +269,10 @@ class TestColoredSweep(unittest.TestCase):
         solver = solvers[-1]
         self.assertIsNotNone(solver.sweep.colored_units, "the tray's worlds take the colored mapping")
         host = {name: array.numpy() for name, array in solver.sweep.colored_units.units.items()}
-        metas = solver.placement.mf_meta_packed.numpy().reshape(
-            solver.forest.world_count, solver.placement.mf_max_constraints, 4
-        )
+        # The free bodies' records (row_metadata.pack_row_record), their header words first.
+        placement = solver.placement
+        records = placement.row_record.numpy().reshape(solver.forest.world_count, -1, RECORD_WORDS)
+        metas = records[:, placement.record_base : placement.record_base + placement.mf_max_constraints, :4]
         return solver, host, metas
 
     def test_units_follow_the_host_rules(self):

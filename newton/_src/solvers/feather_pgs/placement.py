@@ -14,7 +14,7 @@
 
 A step calls :meth:`Placement.begin` (clear the allocation state), then the row pass writes into its slots
 (:meth:`Placement.place_sorted_contact_rows`, :meth:`Placement.latch_status`, :meth:`Placement.warn_overflow`),
-:meth:`Placement.diagonals`, :meth:`Placement.prepare_impulses` and :meth:`Placement.pack_free_body_meta`.
+:meth:`Placement.diagonals`, :meth:`Placement.prepare_impulses` and :meth:`Placement.pack_row_records`.
 
 It also holds which placement the class takes: the native sparse size, the sparse-diagonal pair and the row producers.
 The row pass and the sweeps read its fields.
@@ -34,8 +34,8 @@ from . import host_index, packed_rows, response_builds_rows
 from .field_group import Field, FieldGroup, SolverArrays, fields_of
 from .row_kernels import RIGID_SPEED_ROWS
 from .row_laws import LINK_ROWS
-from .row_metadata import _validate_mf_metadata_encoding
-from .row_records import DENSE_ROWS, MF_ROWS, RowSupport
+from .row_metadata import RECORD_WORDS, _validate_mf_metadata_encoding
+from .row_records import DENSE_ROWS, ROW_RECORDS, RowSupport
 from .row_slots import place_world_contact_runs, record_world_contact_runs
 from .warm_start import ContactCarry, prepare_world_impulses
 
@@ -592,24 +592,10 @@ class Placement:
         but ``mf_constraint_count`` stays zero (``_clear_dense_row_state`` and
         ``finalize_constraint_counts_with_status`` write it only when MF is
         active), so every access sits inside a loop bounded by
-        ``m_mf == 0`` and no element is ever read or written; :meth:`pack_free_body_meta`
-        skips its launch. The rows then hold one slot per world and the per-world
-        counts keep their real width.
+        ``m_mf == 0`` and no element is ever read or written. The rows' records
+        follow the sweep's plan (:meth:`allocate_row_records`).
         """
-        # Only free rigid bodies produce matrix-free rows, which the CUDA step packs each step: a world's lanes a warp,
-        # or a block when few worlds would idle the device.
-        self.mf_meta_lanes = fill_lanes(self.forest.world_count, model.device)
-        self.pack_mf_meta_kernel = (
-            response_builds_rows.free_body_meta_kernel(
-                self.mf_max_constraints, self.row_pitch, self.body_base, self.mf_meta_lanes, model.device.arch
-            )
-            if self.free_contact_rows
-            else None
-        )
-        arrays = self.arrays
-        worlds = self.forest.world_count
-        rows = self.mf_max_constraints if self.free_contact_rows else 1
-        arrays.allocate(MF_ROWS, world=worlds, mf_meta=4 * rows)
+        self.row_record = self.row_record_kernel = None
 
         if not self.forest.has_free_rigid_bodies:
             # Only the ``is not None`` checks observe this on the inactive
@@ -702,8 +688,37 @@ class Placement:
         else:
             self.arrays.release(ROW_WATERMARKS)
 
+    def allocate_row_records(self, first: int) -> None:
+        """Allocate the streamed rows' records (:data:`.row_records.ROW_RECORDS`) from the line's row ``first``, which
+        the sweep's plan decides (``Sweep.build``: the dense rows' first where the sweep streams their metadata, else
+        the free bodies'), and the step's pack of them (:func:`.response_builds_rows.row_record_kernel`): a world's
+        lanes a warp, or a block when few worlds would idle the device."""
+        self.record_first = int(first)
+        rows = self.row_pitch - self.record_first
+        free_rows = self.mf_max_constraints if self.free_contact_rows else 0
+        self.row_record_kernel = None
+        if rows > 0 and (self.record_first < self.body_base or free_rows > 0):
+            self.record_lanes = fill_lanes(self.forest.world_count, self.model.device)
+            self.row_record_kernel = response_builds_rows.row_record_kernel(
+                self.row_pitch,
+                self.record_first,
+                self.body_base,
+                free_rows,
+                self.record_lanes,
+                self.model.device.arch,
+            )
+        self.arrays.allocate(ROW_RECORDS, world=self.forest.world_count, record=RECORD_WORDS * max(rows, 1))
+
+    @property
+    def record_base(self) -> int:
+        """The free bodies' first record in a line's records (:meth:`allocate_row_records`)."""
+        return self.body_base - self.record_first
+
     def allocate_placeholders(self):
         """The operands of the features that are off."""
+        if self.row_record is None:
+            # No sweep streams a row (no matrix-free sweep): the records' operand alone.
+            self.allocate_row_records(self.row_pitch)
         # Operands of the features that are off (SolverArrays.placeholder).
         placeholder = self.arrays.placeholder
         self.dummy_is_free_rigid = placeholder(wp.int32, (1,))
@@ -1017,25 +1032,28 @@ class Placement:
         response."""
         return bool(self.packed_response)
 
-    def pack_free_body_meta(self) -> None:
-        """Pack the free bodies' rows' metadata for the matrix-free sweeps (staged only with free bodies, the only
-        producers of matrix-free rows)."""
+    def pack_row_records(self) -> None:
+        """Pack the streamed rows' records for the matrix-free sweeps (staged where a sweep streams a row:
+        :meth:`allocate_row_records`)."""
         wp.launch_tiled(
-            self.pack_mf_meta_kernel,
+            self.row_record_kernel,
             dim=[self.forest.world_count],
             inputs=[
+                self.constraint_count,
                 self.mf_constraint_count,
                 self.dense_first,
                 self.forest.articulation_world_dof_offset,
+                self.forest.articulation_response_dof_count,
                 self.row_sides,
                 self.diag,
                 self.rhs,
                 self.row_incident,
                 self.row_type,
                 self.row_parent,
+                self.row_mu,
             ],
-            outputs=[self.mf_meta_packed],
-            block_dim=self.mf_meta_lanes,
+            outputs=[self.row_record],
+            block_dim=self.record_lanes,
             device=self.model.device,
         )
 

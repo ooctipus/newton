@@ -40,7 +40,7 @@ from newton.tests.feather_pgs_law_harness import (
 # Each site is the law call one visit of a velocity-limit row compiles (projection_laws.velocity_limit_update and
 # its free-body form speed_row), from the row's total.
 _DENSE_PASS = "ProjectionLaw::velocity_limit_update(old_vlim, residual_vlim / denom)"
-_SPEED_PASS = "ProjectionLaw::speed_row(speed_mf_vlim, __int_as_float(meta.z), mf_diag, old_mf_vlim)"
+_SPEED_PASS = "ProjectionLaw::speed_row(speed_mf_vlim, __int_as_float(rec_a.z), mf_diag, old_mf_vlim)"
 _GENERATORS = {
     "mf_gs": (
         built(sweep_routes.GeneralSweep),
@@ -64,7 +64,7 @@ _GENERATORS = {
     "mf_gs_global_metadata": (
         built(sweep_routes.GeneralSweep),
         (64, 32, 12, "120"),
-        {"places": sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL)},
+        {"places": sweep_routes.RowPlaces(Place.GLOBAL)},
         (_DENSE_PASS, _SPEED_PASS),
     ),
     "sparse_limits": (
@@ -207,7 +207,7 @@ def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MAS
         "world_row_mu": array(np.zeros((1, capacity), np.float32)),
         "mf_constraint_count": zero_int,
         "mf_contact_rows_end": zero_int,
-        "mf_meta": array([[0]], wp.int32),
+        "row_record": array([[0] * 8], wp.int32),
         "mf_impulses": zero_float,
         "walk": chain_walk(device, [factor]),
         "mf_row_mu": zero_float,

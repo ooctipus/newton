@@ -16,8 +16,6 @@ from .sweep_routes import RowPlaces
 _MFGS_RESIDENT_METADATA_MAX_BYTES = 4096
 """Row metadata a matrix-free sweep keeps resident at most [B]: larger working sets cost more occupancy than their
 repeated global loads (one 4-KiB set)."""
-# Static shared memory a block may declare to keep its packed row metadata resident [B].
-_MFGS_STATIC_SHARED_MAX_BYTES = 48 * 1024
 
 
 class _MFGSStorage(NamedTuple):
@@ -32,8 +30,6 @@ def _select_mfgs_storage(
     staging: Callable[..., Staging],
     budget: int,
     *,
-    block_count: int,
-    sm_count: int,
     force_stream_mf_impulses: bool = False,
 ) -> _MFGSStorage:
     """Place the sweep's row operands without changing row capacity or order.
@@ -42,36 +38,34 @@ def _select_mfgs_storage(
     device's static shared memory per block (:func:`.memory.static_budget`): every choice below is a fit of the
     declared working set, not a mirrored count.
 
-    The rows' metadata is shared when it takes at most :data:`_MFGS_RESIDENT_METADATA_MAX_BYTES` and the block fits.
-    The free bodies' impulses are global only when they cannot fit alongside the world velocity and the dense state (a
-    capacity choice, not a claim that global storage is faster), or on ``force_stream_mf_impulses`` (the solver's
-    test pin ``mf_storage='streamed'``). Global metadata keeps the rows' kinds and parents shared when the launch grid
-    of ``block_count`` blocks holds at most one block per SM, so they cannot cost concurrency, and the block then
-    declares at most :data:`_MFGS_STATIC_SHARED_MAX_BYTES`. Both places hold identical values, so results are bitwise
-    identical.
+    The rows' metadata is shared when it takes at most :data:`_MFGS_RESIDENT_METADATA_MAX_BYTES` and the block fits;
+    otherwise the rows' records stream, a row ahead (:class:`.sweep.WorldRows`). The free bodies' impulses are global
+    only when they cannot fit alongside the world velocity and the dense state (a capacity choice, not a claim that
+    global storage is faster), or on ``force_stream_mf_impulses`` (the solver's test pin ``mf_storage='streamed'``).
+    Both places hold identical values, so results are bitwise identical.
     """
     SHARED, GLOBAL = Place.SHARED, Place.GLOBAL
     resident = staging(places=RowPlaces())
-    streamed = staging(places=RowPlaces(GLOBAL, GLOBAL))
+    streamed = staging(places=RowPlaces(GLOBAL))
     metadata_bytes = resident.bytes - streamed.bytes
     metadata_budget = _MFGS_RESIDENT_METADATA_MAX_BYTES
     metadata = SHARED if metadata_bytes <= metadata_budget and resident.fits(budget) else GLOBAL
     if metadata is SHARED:
         reason = f"Row metadata is resident: {metadata_bytes} bytes fit the {metadata_budget}-byte budget."
     elif metadata_bytes > metadata_budget:
-        reason = f"Row metadata streams: {metadata_bytes} bytes exceed the {metadata_budget}-byte budget."
+        reason = f"Row records stream: {metadata_bytes} bytes of metadata exceed the {metadata_budget}-byte budget."
     else:
         reason = (
-            f"Row metadata streams: resident, the block would declare {resident.bytes} bytes of static shared "
+            f"Row records stream: resident, the block would declare {resident.bytes} bytes of static shared "
             f"memory; the device's budget is {budget}."
         )
-    fixed = staging(places=RowPlaces(metadata, metadata, GLOBAL))
+    fixed = staging(places=RowPlaces(metadata, GLOBAL))
     if not fixed.fits(budget):
         raise ValueError(
             f"MF-GS world velocity and dense state require {fixed.bytes} bytes of static shared memory even with "
             f"streamed MF impulses, but the device's budget is {budget} bytes"
         )
-    with_impulses = staging(places=RowPlaces(metadata, metadata))
+    with_impulses = staging(places=RowPlaces(metadata))
     impulses = SHARED
     if not with_impulses.fits(budget):
         impulses = GLOBAL
@@ -79,24 +73,4 @@ def _select_mfgs_storage(
     elif force_stream_mf_impulses:
         impulses = GLOBAL
         reason += " MF impulses stream on request (test pin mf_storage='streamed')."
-    kinds = metadata
-    if metadata is GLOBAL:
-        candidate = staging(places=RowPlaces(GLOBAL, SHARED, impulses))
-        limit = min(_MFGS_STATIC_SHARED_MAX_BYTES, budget)
-        if block_count > sm_count:
-            reason += (
-                f" Row types and parents stream too: the {block_count}-block grid exceeds one block per SM "
-                f"({sm_count} SMs)."
-            )
-        elif not candidate.fits(limit):
-            reason += (
-                f" Row types and parents stream too: resident, the block would declare {candidate.bytes} bytes of "
-                f"static shared memory, over the {limit}-byte budget."
-            )
-        else:
-            kinds = SHARED
-            reason += (
-                f" Row types and parents stay resident: the {block_count}-block grid fits one block per SM "
-                f"({sm_count} SMs) and the block declares {candidate.bytes} <= {limit} bytes of static shared memory."
-            )
-    return _MFGSStorage(RowPlaces(metadata, kinds, impulses), reason)
+    return _MFGSStorage(RowPlaces(metadata, impulses), reason)
