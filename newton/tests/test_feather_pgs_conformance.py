@@ -1627,12 +1627,6 @@ def cuda_groups() -> list:
                 KEYED_PARALLEL.but("keyed_parallel_warm_start", options=_WARM),
             ),
         ),
-        # Without joint limits the keyed rows hold no position-limit row.
-        Group(
-            _physics(scenes.legged(), "patch", 32, "no_limits", enable_joint_limits=False),
-            ref,
-            (KEYED_PARALLEL.but("keyed_parallel_no_limits"),),
-        ),
         # The paired factor sweep and its components start from the impulses the warm start carries (case K5).
         Group(
             _physics(scenes.hand(contact_matching="latest"), "patch", 16),

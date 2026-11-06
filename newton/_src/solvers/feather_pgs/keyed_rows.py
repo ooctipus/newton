@@ -486,6 +486,10 @@ def create_owner(solver) -> tuple[KeyedRows | None, str]:
     (:func:`.keyed_row_layout.topology_plan`), and why or why not."""
     if solver.routes.case != "K4":
         return None, "Keyed rows need the Jacobi tiers (routes.sweep.tiers)."
+    if not solver.options.enable_joint_limits:
+        # Their layout freezes the class's structure: a run-time change the one writer takes (a body made kinematic)
+        # asks to reconstruct the solver. Classes without joint limits keep the one writer and that change.
+        return None, "Keyed rows take the classes with joint limits; this class keeps the one writer."
     try:
         return KeyedRows(solver), "Admitted: the in-kernel parallel sweep builds keyed rows for its bounded worlds."
     except ValueError as error:
