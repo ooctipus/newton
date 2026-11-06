@@ -39,6 +39,7 @@ from .sweep import (
     Diagonal,
     RowContext,
     RowLaws,
+    SlotOrder,
     UnitZ,
     WorldRows,
     change_vote,
@@ -198,6 +199,76 @@ SCALAR_ROWS = SparseFactor(
 )
 """An independent scalar contact's rows, one thread: one entry, on the chain's coordinate ``scalar_coord``, through the
 slot that holds it (the other is the chain's link); its dense part is empty."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Chains:
+    """The independent scalar chains, a lane a chain (``sparse_contact_group_heads``), each chain's contacts in chain
+    order, ``head`` at a time: a contact's normal links the chain's next contact through its free slot (-2 ends the
+    chain), and its coordinate (``scalar_coord``) is the chain's. The lanes synchronize after the phase."""
+
+    dofs: int
+
+    def wrap(self, visit: str, pad: str) -> str:
+        text = f"""const int independent_group_count = sparse_contact_group_count.data[world];
+for (int group = lane; group < independent_group_count; group += 32) {{
+    int next_normal = sparse_contact_group_heads.data[world * {self.dofs} + group];
+    while (next_normal >= 0) {{
+        const int head = next_normal;
+        const int normal_coord_0 = sparse_row_dof.data[(row_base + head) * 2];
+        const int normal_coord_1 = sparse_row_dof.data[(row_base + head) * 2 + 1];
+        const int scalar_coord = normal_coord_0 >= 0 ? normal_coord_0 : normal_coord_1;
+        const int link = normal_coord_0 < -1 ? normal_coord_0 : normal_coord_1;
+        next_normal = link == -2 ? -1 : -link - 3;
+"""
+        return indent(text, pad) + f"{visit}\n{pad}    }}\n{pad}}}\n{pad}SYNC();"
+
+
+@dataclasses.dataclass(frozen=True)
+class SpeculativeUnits:
+    """The serial contact units in their schedule's order (``sparse_contact_serial_normals``), each entered at its head
+    and walked row by row, ``i`` at a time: a batch of ``contacts`` units is tested together (``test``, a lane segment a
+    unit, declares ``noop_lanes``) and skipped up to its first unit that would change; a unit that ``owns`` a tangent
+    pair spans ``rows`` rows and its tangent unit is ``tangent_unit``."""
+
+    capacity: int
+    contacts: int
+    shift: int
+    test: str
+    owns: str
+    rows: str
+
+    def wrap(self, visit: str, pad: str) -> str:
+        head = f"""const int serial_unit_count = sparse_contact_serial_count.data[world];
+int serial_unit = 0;
+int unit_end = contact_start;
+int tangent_unit = -1;
+for (int i = 0; i < row_count; ++i) {{
+    if (i >= unit_end) {{
+        int unit_head = -1;
+        while (serial_unit < serial_unit_count) {{
+            if ((serial_unit & {self.contacts - 1}) == 0) {{
+{indent(self.test, "                ")}
+                if (noop_lanes == MASK) {{
+                    serial_unit += {self.contacts};
+                    continue;
+                }}
+                serial_unit += FIRST(~noop_lanes) >> {self.shift};
+            }}
+            unit_head = sparse_contact_serial_normals.data[world * {self.capacity} + serial_unit];
+            ++serial_unit;
+            break;
+        }}
+        if (unit_head < 0) break;
+        i = unit_head;
+        unit_end = i + 1;
+        tangent_unit = -1;
+        if ({self.owns}) {{
+            unit_end = i + {self.rows};
+            tangent_unit = i;
+        }}
+    }}"""
+        return indent(head, pad) + f"\n{visit}\n{pad}}}"
 
 
 def sparse_diagonal_source(
@@ -393,26 +464,12 @@ def sparse_diagonal_source(
 {visit(Lanes(1), pad + "    ", kind=FRICTION, parent="head")}
 {pad}}} while (false);"""
         tangents = f"{pad}if ({owns_tangents('head', pad + '    ')}) {{\n{indent(tangents, '    ')}\n{pad}}}"
-        independent_phase = f"""
-        const int independent_group_count = sparse_contact_group_count.data[world];
-        for (int group = lane; group < independent_group_count; group += 32) {{
-            int next_normal = sparse_contact_group_heads.data[world * {D} + group];
-            while (next_normal >= 0) {{
-                const int head = next_normal;
-                const int normal_coord_0 = sparse_row_dof.data[(row_base + head) * 2];
-                const int normal_coord_1 = sparse_row_dof.data[(row_base + head) * 2 + 1];
-                const int scalar_coord = normal_coord_0 >= 0 ? normal_coord_0 : normal_coord_1;
-                const int link = normal_coord_0 < -1 ? normal_coord_0 : normal_coord_1;
-                next_normal = link == -2 ? -1 : -link - 3;
-                do {{
+        normal = f"""                do {{
                     const int i = head;
 {visit(Lanes(1), pad + "    ", kind=CONTACT)}
                 }} while (false);
-{tangents}
-            }}
-        }}
-        SYNC();
-"""
+{tangents}"""
+        independent_phase = "\n" + Chains(D).wrap(normal, "        ") + "\n"
 
     def batch(index: str, count: str) -> str:
         """Test the batch of serial contacts from ``index``: one contact per segment of ``batch_lanes`` lanes, its
@@ -458,57 +515,36 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
         # The rows hold no schedule: a normal row owning the tangent pair after it heads a contact unit, unless a
         # chain's link marks it (its rows keep their visits, as a scheduled sweep's chain phase visits them).
         head = f"({rows.kind('i')}) == {CONTACT} && {owns_tangents('i', ' ' * 16)}\n{' ' * 16}&& !({independent('i')})"
-        serial = f"""        for (int i = 0; i < row_count; ++i) {{
-{coupled(head)}
-{row}
-        }}"""
+        serial = SlotOrder("row_count").wrap(f"{coupled(head)}\n{row}", "        ")
     elif not speculative_contact_batches:
-        serial = f"""        for (int i = 0; i < row_count; ++i) {{
-            if (i >= contact_start) {{
+        serial = SlotOrder("row_count").wrap(
+            f"""            if (i >= contact_start) {{
                 // A tangent row's parent is its unit's head.
                 const int unit_head = ({rows.kind("i")}) == {FRICTION} ? {rows.parent("i")} : i;
                 if ({independent("unit_head")}) continue;
             }}
 {coupled(f"i >= contact_start && ({rows.kind('i')}) == {CONTACT} && {owns_tangents('i', ' ' * 16)}")}
 {row}
-{inactive_pair(f"i >= contact_start && ({rows.kind('i')}) == {CONTACT} && {owns_tangents('i', ' ' * 16)}", "i")}
-        }}"""
+{inactive_pair(f"i >= contact_start && ({rows.kind('i')}) == {CONTACT} && {owns_tangents('i', ' ' * 16)}", "i")}""",
+            "        ",
+        )
     else:
         # Units have one or three rows (four with a spin row): the loop walks real rows and enters each serial unit at
         # its head.
-        serial = f"""        const int serial_unit_count = sparse_contact_serial_count.data[world];
-        int serial_unit = 0;
-        int unit_end = contact_start;
-        int tangent_unit = -1;
-        for (int i = 0; i < row_count; ++i) {{
-            if (i >= unit_end) {{
-                int unit_head = -1;
-                while (serial_unit < serial_unit_count) {{
-                    if ((serial_unit & {batch_contacts - 1}) == 0) {{
-{indent(batch("serial_unit", "serial_unit_count"), "                        ")}
-                        if (noop_lanes == MASK) {{
-                            serial_unit += {batch_contacts};
-                            continue;
-                        }}
-                        serial_unit += FIRST(~noop_lanes) >> {batch_shift};
-                    }}
-                    unit_head = sparse_contact_serial_normals.data[world * {M} + serial_unit];
-                    ++serial_unit;
-                    break;
-                }}
-                if (unit_head < 0) break;
-                i = unit_head;
-                unit_end = i + 1;
-                tangent_unit = -1;
-                if ({owns_tangents("i", " " * 20)}) {{
-                    unit_end = i + {contact_rows("i")};
-                    tangent_unit = i;
-                }}
-            }}
-{coupled("i == tangent_unit")}
+        units = SpeculativeUnits(
+            M,
+            batch_contacts,
+            batch_shift,
+            batch("serial_unit", "serial_unit_count"),
+            owns_tangents("i", " " * 12),
+            contact_rows("i"),
+        )
+        serial = units.wrap(
+            f"""{coupled("i == tangent_unit")}
 {row}
-{inactive_pair("i == tangent_unit", "i")}
-        }}"""
+{inactive_pair("i == tangent_unit", "i")}""",
+            "        ",
+        )
 
     declarations, limit_loads, limit_rows, limit_stores = _diagonal_limits(D, P, laws)
     # A diagonal coordinate's factor is sqrt(m): its scale m^-1/2 (zero on the dense articulation's coordinates and

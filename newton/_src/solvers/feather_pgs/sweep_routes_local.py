@@ -33,9 +33,11 @@ from .sweep import (
     TORSION,
     UNIT_HELD,
     Diagonal,
+    Pipelined,
     RowContext,
     RowLaws,
     StagedRows,
+    UnitStride,
     UnitZ,
     contact_unit,
     end_sweep,
@@ -275,10 +277,10 @@ def _paired_rows(ctx: RowContext, laws: RowLaws, end: str) -> str:
     if laws.torsion:
         # The pair's contact's spin row if it has one (the visit's ``spin``), solved with it (the friction triple).
         sibling += f"const float spin_z = row_type == {FRICTION} && spin >= 0 ? ({_load(op, 'spin')}) : 0.0f;\n"
+    rows = Pipelined(
+        end, lambda pad: f"{pad}float pre_z = {_load(op, '0')};", lambda row, pad: _consume(op, row, end, pad)
+    )
     lines = [
-        f"float pre_z = {_load(op, '0')};",
-        f"for (int i = 0; i < {end}; ++i) {{",
-        _consume(op, "i", end, "    "),
         "    const int row_type = static_cast<int>(s_type[i]);",
         f"    if (row_type == {TORSION}) continue;" if laws.torsion else "",
         row_visit(
@@ -289,9 +291,8 @@ def _paired_rows(ctx: RowContext, laws: RowLaws, end: str) -> str:
             declare=sibling + "const float denom = s_diag[i];",
             pad="    ",
         ),
-        "}",
     ]
-    return "\n".join(line for line in lines if line)
+    return rows.wrap("\n".join(line for line in lines if line), "")
 
 
 def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
@@ -430,7 +431,6 @@ def _paired_units(ctx: RowContext, laws: RowLaws) -> str:
     has one: :func:`.sweep.spin_row`). A tangent row outside a unit is left alone.
     """
     lines = [
-        "for (int i = 0, step = 1; i < m; i += step) {",
         "    const int row_type = static_cast<int>(s_type[i]);",
         "    step = 1;",
         *((f"    if (row_type == {TORSION}) continue;",) if laws.torsion else ()),
@@ -445,9 +445,8 @@ def _paired_units(ctx: RowContext, laws: RowLaws) -> str:
         f"    step = {ctx.spin_row('i')} >= 0 ? 4 : 3;" if laws.torsion else "    step = 3;",
         "    const int head = i;",
         indent(_contact_unit(ctx, laws, "row_type", "world_row_mu.data[off + tangent1]"), "    "),
-        "}",
     ]
-    return "\n".join(lines)
+    return UnitStride("m").wrap("\n".join(lines), "")
 
 
 @cache

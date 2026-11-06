@@ -1403,6 +1403,113 @@ def end_sweep(
     )
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Schedules: how a phase enumerates its units, and the sweeps' iteration frame
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class SlotOrder:
+    """A phase's rows ``[0, end)`` in slot order, row ``i`` at a time (the matrix-free sweep's dense rows, the sparse
+    sweep without its active subword, the sparse-diagonal sweep's coupled rows)."""
+
+    end: str
+
+    def inner(self, pad: str) -> str:
+        """The visit's indentation inside the loop at ``pad``."""
+        return pad + "    "
+
+    def wrap(self, visit: str, pad: str) -> str:
+        return f"{pad}for (int i = 0; i < {self.end}; ++i) {{\n{visit}\n{pad}}}"
+
+
+@dataclasses.dataclass(frozen=True)
+class SelectedRows:
+    """The rows a scan at the sweep's entry selected into the bitset ``words`` (the sparse sweep's active subword,
+    :func:`.sweep_routes_sparse.active_scan`), popped in slot order, row ``i`` at a time."""
+
+    count: str
+    words: str = "s_selected_words"
+
+    def inner(self, pad: str) -> str:
+        return pad + "        "
+
+    def wrap(self, visit: str, pad: str) -> str:
+        return (
+            f"{pad}for (int word = 0; word < ({self.count} + 31) / 32; ++word) {{\n"
+            f"{pad}    unsigned pending = {self.words}[word];\n"
+            f"{pad}    while (pending != 0u) {{\n"
+            f"{pad}        const int i = word * 32 + FIRST(pending);\n"
+            f"{pad}        pending &= pending - 1u;\n"
+            f"{visit}\n"
+            f"{pad}    }}\n"
+            f"{pad}}}"
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class Pipelined:
+    """A phase's rows ``[0, end)`` in slot order with what a row's visit reads first loaded a row ahead: ``prologue``
+    loads row 0's before the loop, ``consume(row, indent)`` takes row ``row``'s and loads the next's (the free
+    bodies' header words and ``Z`` entries, :func:`rows_block`; the paired factor sweep's factor rows)."""
+
+    end: str
+    prologue: Callable[[str], str]
+    consume: Callable[[str, str], str]
+
+    def inner(self, pad: str) -> str:
+        return pad + "    "
+
+    def wrap(self, visit: str, pad: str) -> str:
+        return (
+            f"{self.prologue(pad)}\n{pad}for (int i = 0; i < {self.end}; ++i) {{\n"
+            f"{self.consume('i', pad + '    ')}\n{visit}\n{pad}}}"
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class BallotHeads:
+    """The heads of a phase's units, found by the lanes together, a lane a row of ``[0, count)`` (``test(row)``),
+    and visited in slot order, ``head`` at a time (the sparse sweep's friction triples, :func:`.sweep_routes_sparse.
+    triple_phase`); ``guard`` skips the phase where the world holds none."""
+
+    count: str
+    lanes: Lanes
+    test: Callable[[str], str]
+    guard: str = ""
+
+    def inner(self, pad: str) -> str:
+        return pad + "        "
+
+    def wrap(self, visit: str, pad: str) -> str:
+        guard = f"if ({self.guard}) " if self.guard else ""
+        return (
+            f"{pad}{guard}for (int first = 0; first < {self.count}; first += {self.lanes.width}) {{\n"
+            f"{pad}    const int row = first + {self.lanes.lane};\n"
+            f"{pad}    unsigned heads = BALLOT({self.test('row')});\n"
+            f"{pad}    while (heads != 0u) {{\n"
+            f"{pad}        const int head = first + FIRST(heads);\n"
+            f"{pad}        heads &= heads - 1u;\n"
+            f"{visit}\n"
+            f"{pad}    }}\n"
+            f"{pad}}}"
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class UnitStride:
+    """A phase's rows ``[0, end)`` in slot order a unit at a time: the visit sets ``step`` to its unit's rows (one, or a
+    contact's three or four: the paired factor sweep's contact units)."""
+
+    end: str
+
+    def inner(self, pad: str) -> str:
+        return pad + "    "
+
+    def wrap(self, visit: str, pad: str) -> str:
+        return f"{pad}for (int i = 0, step = 1; i < {self.end}; i += step) {{\n{visit}\n{pad}}}"
+
+
 ITERATION = "iter"
 """The sweep counter of :func:`level_loop`, as the exit law reads it (:func:`end_sweep`'s ``iteration``)."""
 
@@ -1600,8 +1707,8 @@ def rows_block(
     if end is None:
         end = "mf_contact_end" if rows.header else "m_dense"
     if not rows.header:
-        step = row_step(rows, op, laws, end=end, admission=admission, metric=metric, pad=inner)
-        return f"{pad}for (int i = 0; i < {end}; i++) {{\n{step}\n{pad}}}"
+        order = SlotOrder(end)
+        return order.wrap(row_step(rows, op, laws, end=end, admission=admission, metric=metric, pad=inner), pad)
     cached = {} if metric is None else {"triple_law": f"{metric}(parent, "}
     ctx = RowContext(
         row="i",
@@ -1623,19 +1730,20 @@ def rows_block(
         **cached,
     )
     body = [
-        _header_consume(op, "i", end, inner),
         # A spin row is solved with its friction pair (torsion).
         f"{inner}if (mf_rt == {TORSION}) continue;" if laws.torsion else "",
         indent(admission, inner) if admission else "",
         row_visit(ctx, laws, parent=rows.parent_of("packed_tp"), check="mf_diag", declare="", pad=inner),
     ]
-    prologue = (
-        f"{pad}int4 pre_meta;\n{pad}float pre_z = 0.0f;\n"
-        f"{pad}if ({end} > 0) {{\n{_header_load(op, '0', pad + '    ')}\n{pad}}}\n"
+    headers = Pipelined(
+        end,
+        lambda pad: (
+            f"{pad}int4 pre_meta;\n{pad}float pre_z = 0.0f;\n"
+            f"{pad}if ({end} > 0) {{\n{_header_load(op, '0', pad + '    ')}\n{pad}}}"
+        ),
+        lambda row, pad: _header_consume(op, row, end, pad),
     )
-    return (
-        f"{prologue}{pad}for (int i = 0; i < {end}; i++) {{\n" + "\n".join(line for line in body if line) + f"\n{pad}}}"
-    )
+    return headers.wrap("\n".join(line for line in body if line), pad)
 
 
 def friction_triple_visit(

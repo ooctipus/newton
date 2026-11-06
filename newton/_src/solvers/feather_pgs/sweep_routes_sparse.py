@@ -56,9 +56,12 @@ from .sweep import (
     TORSION,
     UNIT_HELD,
     VELOCITY_LIMIT,
+    BallotHeads,
     Diagonal,
     RowContext,
     RowLaws,
+    SelectedRows,
+    SlotOrder,
     StagedRows,
     UnitZ,
     cached_pair_law,
@@ -624,20 +627,18 @@ def triple_phase(sweep: SparseSweep, rows: StagedRows, op: SparseFactor, laws: R
         lanes=rows.lanes,
         fenced=False,
     )
-    visit = friction_triple_visit(
-        ctx, laws, head="head", metric="\n".join(metric), pool="\n".join(pool), load="pooled", law=law, pad="        "
+    # A triple's normal is a contact whose next row is staged as a spin row; only a world whose staging found a
+    # triple (world_triples, uniform over its lanes) scans for them.
+    heads = BallotHeads(
+        "count",
+        rows.lanes,
+        lambda row: f"{row} + 1 < count && {rows.kind(row)} == {CONTACT} && {rows.kind(f'{row} + 1')} == {TORSION}",
+        guard="world_triples",
     )
-    # Only a world whose staging found a triple (world_triples, uniform over its lanes) scans for them.
-    text = f"""if (world_triples) for (int first = 0; first < count; first += {sweep.lanes}) {{
-    const int row = first + lane;
-    unsigned heads = BALLOT(row + 1 < count && s_type[row] == {CONTACT} && s_type[row + 1] == {TORSION});
-    while (heads != 0u) {{
-        const int head = first + FIRST(heads);
-        heads &= heads - 1u;
-{visit}
-    }}
-}}"""
-    return indent(text, pad)
+    visit = friction_triple_visit(
+        ctx, laws, head="head", metric="\n".join(metric), pool="\n".join(pool), load="pooled", law=law, pad=""
+    )
+    return heads.wrap(indent(visit, heads.inner(pad)), pad)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -682,7 +683,9 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
         setup.append(active_selection(sweep, "    "))
     if sweep.warm_start:
         setup.append(warm_start_seed(op, "    "))
-    body_pad = "                " if sweep.active else "            "
+    # The row loop's enumeration: the rows the active scan selected, or every row.
+    order = SelectedRows("count") if sweep.active else SlotOrder("count")
+    body_pad = order.inner("        ")
     unit = ""
     if sweep.triplets:
         unit_setup, unit = contact_units(sweep, rows, op, laws, body_pad)
@@ -699,21 +702,7 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     update = row_step(
         rows, op, laws, end="count", admission=admission, held=True, triple_phase=sweep.torsion, pad=body_pad
     )
-    if sweep.active:
-        row_loop = f"""        for (int word = 0; word < (count + 31) / 32; ++word) {{
-            unsigned pending = s_selected_words[word];
-            while (pending != 0u) {{
-                const int i = word * 32 + FIRST(pending);
-                pending &= pending - 1u;
-{unit}
-{update}
-            }}
-        }}"""
-    else:
-        row_loop = f"""        for (int i = 0; i < count; ++i) {{
-{unit}
-{update}
-        }}"""
+    row_loop = order.wrap(f"{unit}\n{update}", "        ")
     triples = triple_phase(sweep, rows, op, laws, "        ") if sweep.torsion else ""
     passes = ""
     if sweep.velocity_limits:

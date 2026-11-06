@@ -377,6 +377,29 @@ def _unit_apply(pad: str, *, torsion: bool = False) -> str:
     return indent("\n".join(lines), pad)
 
 
+@dataclasses.dataclass(frozen=True)
+class Colours:
+    """A colored world's units by colour, a thread a unit at block stride, unit ``p`` at a time: each colour's units are
+    the range of ``color_offset`` (``chunk`` colours' offsets staged at a time), and the block synchronizes after each
+    colour (no two units of a colour share a body)."""
+
+    chunk: int
+
+    def wrap(self, visit: str, pad: str) -> str:
+        head = f"""const int colors = color_count.data[world];
+for (int color = 0; color < colors; ++color) {{
+    // The offsets of the next chunk of colors (the barrier after the last color freed the previous one).
+    const int chunk = color % {self.chunk};
+    if (chunk == 0) {{
+        for (int c = tid; c <= {self.chunk} && color + c <= colors; c += blockDim.x)
+            s_color_offset[c] = color_offset.data[off_color + color + c];
+        __syncthreads();
+    }}
+    const int end_unit = s_color_offset[chunk + 1];
+    for (int p = s_color_offset[chunk] + tid; p < end_unit; p += blockDim.x) {{"""
+        return indent(head, pad) + f"\n{visit}\n{pad}    }}\n{pad}    __syncthreads();\n{pad}}}"
+
+
 def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str:
     """A color's units, one thread each, at block stride: each loads its slot's fields at once
     (:data:`.sweep_units.SLOT_FIELDS`, field by field across the color's ``units`` slots) and runs the free-body row
@@ -473,19 +496,7 @@ const float mf_diag = __int_as_float(meta.y);"""
         check="mf_diag",
         pad=" " * 20,
     )
-    return f"""{ring_sum}
-            const int colors = color_count.data[world];
-            for (int color = 0; color < colors; ++color) {{
-                // The offsets of the next chunk of colors (the barrier after the last color freed the previous one).
-                const int chunk = color % {COLOR_CHUNK};
-                if (chunk == 0) {{
-                    for (int c = tid; c <= {COLOR_CHUNK} && color + c <= colors; c += blockDim.x)
-                        s_color_offset[c] = color_offset.data[off_color + color + c];
-                    __syncthreads();
-                }}
-                const int end_unit = s_color_offset[chunk + 1];
-                for (int p = s_color_offset[chunk] + tid; p < end_unit; p += blockDim.x) {{
-                    const int4 slot = __ldg(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + p) * 4]));
+    visit = f"""                    const int4 slot = __ldg(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + p) * 4]));
                     const int unit_row = slot.x, rows = slot.y, dof_a = slot.z, dof_b = slot.w;
                     const int slot_base = unit_slot * {fields * units} + p;
                     const int word_base = unit_slot * {words * units} + p;
@@ -502,10 +513,8 @@ const float mf_diag = __int_as_float(meta.y);"""
                         metric[f] = slot_metric.data[unit_slot * {layout.metric * units} + p + f * {units}];
 {_unit_terms(" " * 20, torsion=torsion)}
 {unit}
-{_unit_apply(" " * 20, torsion=torsion)}
-                }}
-                __syncthreads();
-            }}"""
+{_unit_apply(" " * 20, torsion=torsion)}"""
+    return f"{ring_sum}\n{Colours(COLOR_CHUNK).wrap(visit, ' ' * 12)}"
 
 
 def _colored_diagonal(r: int) -> str:
