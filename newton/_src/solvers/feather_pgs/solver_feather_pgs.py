@@ -555,7 +555,7 @@ class SolverFeatherPGS(SolverBase):
             self.placement.keyed_rows_reason = (
                 "Admitted: the in-kernel parallel sweep builds keyed rows for its bounded worlds."
                 if self.placement.keyed_rows is not None
-                else "Keyed rows need the Jacobi tiers (routes.sweep.tiers) and a plain matrix-free policy."
+                else "Keyed rows need the Jacobi tiers (routes.sweep.tiers) and a topology their layout keys."
             )
         # The general placement (case K6) and the paired factor coordinates (case K5, a tree beside one free body)
         # whiten and leave their rows by the walk (FL3.3): the factor holds the walk's data for every responding tree, a

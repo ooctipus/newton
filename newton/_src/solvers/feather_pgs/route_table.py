@@ -81,8 +81,6 @@ class Laws:
 # Each requirement a placement or schedule may hold: (test of the laws, what it requires).
 _REQUIREMENTS = {
     "cuda": (lambda laws: laws.cuda, "a CUDA device (their native bodies are written for CUDA only)"),
-    "plain": (lambda laws: laws.plain, Laws.PLAIN),
-    "limits": (lambda laws: laws.limits, "joint-limit rows (enable_joint_limits)"),
     "no_mimic": (lambda laws: not laws.mimic, "no mimic rows"),
     "iterations": (lambda laws: laws.iterations, "a positive iteration budget"),
     "no_preelimination": (lambda laws: not laws.preelimination, "no bilateral pre-elimination"),
@@ -102,7 +100,7 @@ CAPABILITIES = {
     # The Jacobi tiers of dense trees beside a free body (case K4), whose sweep budget a build fixes.
     "tiers": ("cuda", "iterations"),
     # The keyed in-kernel row producer of the tiers.
-    "keyed_rows": ("cuda", "plain", "limits", "iterations", "no_mimic"),
+    "keyed_rows": ("cuda", "no_preelimination", "iterations", "no_mimic"),
     # The colored mapping of the free-body rows' contact units.
     "colored": ("cuda",),
 }

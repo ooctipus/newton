@@ -1617,10 +1617,21 @@ def cuda_groups() -> list:
             ref,
             (MF_HELD.but("mf_held_warm_start", options=_WARM),),
         ),
+        # The Jacobi tiers start from the impulses the warm start carries, on the one writer's rows and on keyed rows.
         Group(
             _physics(scenes.legged(contact_matching="latest"), "patch", 32),
             ref,
-            (SPARSE.but("sparse_warm_start", options=_WARM),),
+            (
+                SPARSE.but("sparse_warm_start", options=_WARM),
+                MF_PARALLEL.but("mf_parallel_warm_start", options=_WARM),
+                KEYED_PARALLEL.but("keyed_parallel_warm_start", options=_WARM),
+            ),
+        ),
+        # Without joint limits the keyed rows hold no position-limit row.
+        Group(
+            _physics(scenes.legged(), "patch", 32, "no_limits", enable_joint_limits=False),
+            ref,
+            (KEYED_PARALLEL.but("keyed_parallel_no_limits"),),
         ),
         # The paired factor sweep and its components start from the impulses the warm start carries (case K5).
         Group(

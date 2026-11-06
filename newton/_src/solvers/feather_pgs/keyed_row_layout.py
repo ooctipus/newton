@@ -116,7 +116,8 @@ def topology_plan(solver):
         solver.placement.ink_rows,
         solver.options.enable_joint_velocity_limits,
         velocity_mask,
-        position_mask,
+        # Without joint limits no coordinate holds a position-limit row (the one writer's limit family, step_plan).
+        position_mask if solver.options.enable_joint_limits else 0,
     )
     return layout, groups, dof_starts, arts_by_world
 
@@ -149,7 +150,10 @@ def prefix_kernel(layout, prefix_type, rows_type):
         tuple(d for d in range(layout.dofs) if mask & (1 << d)) for mask in (layout.position_eligibility, velocities)
     )
     source = clear + prefix_rows(
-        ((limits(positions, dof, "p."),), (velocity_limits(velocities, dof, "p."),) if velocities else ()),
+        (
+            (limits(positions, dof, "p."),) if positions else (),
+            (velocity_limits(velocities, dof, "p."),) if velocities else (),
+        ),
         law="p.",
         sink=sink,
         ordered=True,
