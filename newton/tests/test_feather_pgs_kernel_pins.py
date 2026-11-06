@@ -140,6 +140,21 @@ def _keyed_last_word_calls():
         yield (_keyed_layout(velocity_limits=True), 128, 32, 22, _ARCH), {**kwargs, "velocity_limit_pass": True}
 
 
+def _audit_calls():
+    """The audit's one rows kernel at each support class the suite's routes read: ``(name, factory, args, kwargs)``."""
+    from newton._src.solvers.feather_pgs import audit  # noqa: PLC0415
+
+    def kernel(row_class):
+        return lambda *args: audit.rows_kernel(row_class(*args))
+
+    for support, wide in ((12, False), (18, False), (25, True)):
+        yield "audit.packed_class", kernel(audit.packed_class), (support, wide), {}
+    for support, table in ((12, False), (12, True), (16, True)):
+        yield "audit.sparse_class", kernel(audit.sparse_class), (support, table), {}
+    yield "audit.slot_class", kernel(audit.slot_class), (6, 1024), {}
+    yield "audit.free_class", kernel(audit.free_class), (), {}
+
+
 def _readout_calls():
     """Opt-in sweep readouts of the suite's counted sweeps: ``(name, factory, args, kwargs)``.
 
@@ -427,6 +442,7 @@ def _factory_kernels():
         _suite_shape_calls(),
         _keyed_row_calls(),
         _readout_calls(),
+        _audit_calls(),
     ):
         try:
             kernel = factory(*args, **kwargs)

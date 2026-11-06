@@ -20,23 +20,32 @@ For any ``lambda`` with ``v+ = v_hat + M^-1 J^T lambda``,
 solve failed to account for. It needs no reference, and it cannot catch a wrong law: ``G = 0`` says the stated rows were
 solved, not that they are right.
 
-Each row store fills the rows' ``J_i v+ + eps_i lambda_i`` (:func:`packed_rows`, :func:`sparse_rows`,
-:func:`diagonal_rows`, :func:`free_rows`), and one kernel applies the law to the stores (:func:`audit_world`). Packed
-rows are read as ``Z_i^T u+`` with ``u+`` the walk's coordinates of ``v+`` (:func:`.factor.walk.walk_enter_kernel`) and
-the sparse diagonal's likewise, so a defect in leaving factor coordinates shows too, and corrected rows and targets agree
-on a closure. Native sparse rows hold no dense factor and
-read their own ``J_i v_hat + Z_i^T du``. A world whose rows exist only inside its sweep (keyed rows) has
-none to read: it reports NaN and is not summed.
+The rows' velocity terms are one kernel over the one ``Z`` operator's ``dot`` (:func:`rows_kernel`), a thread a world,
+each row's entries summed in order (:data:`ONE`): the support class is its data (:class:`RowClass`), the sweep's own
+for each store. Packed rows (:func:`packed_class`) and the sparse diagonal's (:func:`slot_class`) read ``Z_i^T u+`` with
+``u+`` the walk's coordinates of ``v+`` (:func:`.factor.walk.walk_enter_kernel`), so a defect in leaving factor
+coordinates shows too, and corrected rows and targets agree on a closure; native sparse rows (:func:`sparse_class`)
+hold no dense factor and read their own ``J_i v_hat + Z_i^T du``; the free bodies' (:func:`free_class`) are the 6 + 6
+class over the walk's coordinates. One law kernel (:func:`audit_world`) then reads both stores and adds each contact
+normal's ``eps_i lambda_i``. The sparse diagonal's fused limits, which no store holds, read their law in place
+(:func:`fused_limits`). A world whose rows exist only inside its sweep (keyed rows) has none to read: it reports NaN
+and is not summed.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import functools
+
 import warp as wp
 
-from .factor.walk import WalkTrees, walk_enter_kernel
+from .device_preludes import substitute
+from .factor.walk import walk_enter_kernel
 from .field_group import Field, FieldGroup, SolverArrays
 from .friction_patches import patch_normal_load
-from .packed_rows import WIDE
+from .kernel_template import KernelTemplate, items
+from .packed_rows import PACKED_SIDES, WIDE
+from .response_operator import Lanes, SparseFactor, Velocity
 from .row_laws import (
     ROW_CONTACT,
     ROW_FRICTION,
@@ -45,10 +54,11 @@ from .row_laws import (
     ROW_SPEED,
     ROW_TORSION,
 )
-from .row_records import DenseRows, MfRows, RowSupport
+from .row_records import DenseRows
 from .row_records import bind as bind_dense_rows
-from .row_records import bind_mf as bind_mf_rows
 from .sparse_mass_matrix import _SparseRowSupport
+from .sweep_routes import packed_operator
+from .sweep_routes_diag import slot_rows
 
 __all__ = ["AUDIT_FIELDS", "AUDIT_SLOTS", "Audit"]
 
@@ -69,8 +79,9 @@ eps_i lambda_i``, and the ``(G, D, W)`` of the rows no store holds, the sparse d
 
 @wp.struct
 class AuditRows:
-    """What every audit kernel reads: the dense rows, their impulses and counts, the free-body counts, the skips of the
-    rows' build (:func:`.packed_rows._skipped`) and whether keyed rows hold the tiers' rows, and the laws in play."""
+    """What the law reads: the row store's records and impulses, the dense and free-body counts, whether the tiers form
+    the rows of their worlds in their kernel (:func:`.packed_rows._skipped`) and keyed rows hold them, and the laws in
+    play."""
 
     rows: DenseRows
     impulses: wp.array2d[float]
@@ -84,27 +95,12 @@ class AuditRows:
 
 
 @wp.func
-def row_compliance(kind: int, weight: float, eps: float, diagonal: float) -> float:
-    """A row's ``eps_i``: a material contact's, else the relative regularization's ``g d`` from its weight ``1 / (1 +
-    g)``; the sweeps regularize contact normals only (:func:`.sweep.row_weight`)."""
-    if kind != ROW_CONTACT:
-        return 0.0
+def contact_compliance(weight: float, eps: float, diagonal: float) -> float:
+    """A contact normal's ``eps_i``: a material contact's, else the relative regularization's ``g d`` from its weight
+    ``1 / (1 + g)``; the sweeps regularize contact normals only (:func:`.sweep.row_weight`)."""
     if eps > 0.0:
         return eps
     return (1.0 / weight - 1.0) * diagonal
-
-
-@wp.func
-def with_compliance(a: AuditRows, world: int, i: int, term: float) -> float:
-    """A dense row's velocity term ``term`` plus ``eps_i lambda_i``."""
-    line = a.rows.first[world]
-    weight = float(1.0)
-    if a.weighted != 0:
-        weight = a.rows.row_w[line, i]
-    eps = float(0.0)
-    if a.material != 0:
-        eps = a.rows.row_eps[line, i]
-    return term + row_compliance(a.rows.row_type[line, i], weight, eps, a.rows.diag[line, i]) * a.impulses[line, i]
 
 
 @wp.func
@@ -113,121 +109,223 @@ def tier_world(a: AuditRows, world: int) -> bool:
     return a.skip_rows_le > 0 and a.counts[world] <= a.skip_rows_le and a.mf_counts[world] == 0
 
 
-@wp.func
-def packed_dot(support: RowSupport, entries: wp.array3d[float], x: wp.array2d[float], world: int, i: int) -> float:
-    """One packed row against its world's coordinates, side by side (:mod:`.packed_rows`)."""
-    out = float(0.0)
-    line = support.first[world]
-    if support.dense == WIDE:
-        for e in range(entries.shape[2]):
-            if e < x.shape[1]:
-                out += entries[line, i, e] * x[world, e]
-        return out
-    sides = support.sides[line, i]
-    first = int(0)
-    for side in range(2):
-        art = sides[side]
-        if art >= 0:
-            n = support.dofs[art]
-            offset = support.offset[art]
-            at = first
-            if support.dense != 0:
-                at = offset
-            for e in range(n):
-                out += entries[line, i, at + e] * x[world, offset + e]
-            first += n
-    return out
+# ---------------------------------------------------------------------------------------------------------------------
+# The rows' velocity terms: one kernel over the one Z operator's dot, a support class its data
+# ---------------------------------------------------------------------------------------------------------------------
+
+ONE = Lanes(1, "0")
+"""The audit's lanes: one thread a world, each row's entries summed in order (:class:`.response_operator.Lanes`)."""
 
 
-@wp.kernel(enable_backward=False)
-def packed_rows(
-    a: AuditRows,
-    support: RowSupport,
-    J: wp.array3d[float],
-    Z: wp.array3d[float],
-    coordinates: wp.array2d[float],
-    hat: wp.array2d[float],
-    incident: wp.array2d[float],
-    velocity: wp.array2d[float],
-):
-    """One thread per world: each packed row's ``J_i v+ + eps_i lambda_i``."""
-    world = wp.tid()
-    keeps = tier_world(a, world)
-    for i in range(wp.min(a.counts[world], a.capacity)):
-        term = float(0.0)
-        if keeps:
-            term = packed_dot(support, J, coordinates, world, i)
-        else:
-            term = (
-                incident[a.rows.first[world], i]
-                + packed_dot(support, Z, coordinates, world, i)
-                - packed_dot(support, Z, hat, world, i)
-            )
-        velocity[world, i] = with_compliance(a, world, i, term)
+@dataclasses.dataclass(frozen=True)
+class Called(Velocity):
+    """``u`` at a coordinate through a native function of it, ``array(index)``."""
+
+    def at(self, index: str) -> str:
+        return f"{self.array}({index})"
 
 
-@wp.kernel(enable_backward=False)
-def sparse_rows(
-    a: AuditRows,
-    support: _SparseRowSupport,
-    row_dof: wp.array3d[int],
-    row_factor: wp.array3d[float],
-    row_incident: wp.array2d[float],
-    delta: wp.array2d[float],
-    velocity: wp.array2d[float],
-):
-    """One thread per world: each native sparse row's ``J_i v_hat + Z_i^T du + eps_i lambda_i``, entries through the
-    shared support table or explicit coordinates (:func:`.sweep_routes_sparse.factor_operator`)."""
-    world = wp.tid()
-    line = a.rows.first[world]
-    for i in range(wp.min(a.counts[world], a.capacity)):
-        term = row_incident[line, i]
-        for e in range(row_factor.shape[2]):
-            coordinate = int(-1)
-            if support.enabled != 0:
-                coordinate = support.class_dof[support.row_class[line, i], e]
-            else:
-                coordinate = row_dof[line, i, e]
-            if coordinate >= 0:
-                term += row_factor[line, i, e] * delta[world, coordinate]
-        velocity[world, i] = with_compliance(a, world, i, term)
+def _sum(operator: SparseFactor, out: str, start: str) -> str:
+    """``float out = start``, then ``out += Z_i . u`` over row ``i``'s entries in order: the operator's one-thread
+    ``dot`` (its velocity ``u``)."""
+    dot = operator.dot(((out, "row", None),), {"row": "i"}, "            ", reduce=False)
+    return f"        float {out} = {start};\n        {{\n{dot}\n        }}"
 
 
-@wp.kernel(enable_backward=False)
-def diagonal_rows(
-    a: AuditRows,
-    world_dof_indices: wp.array2d[int],
-    dense_offsets: wp.array[int],
-    dense_groups: wp.array[int],
-    dense_dofs: int,
-    coordinates: wp.array2d[float],
-    dense_Z: wp.array3d[float],
-    sparse_row_dof: wp.array3d[int],
-    sparse_row_z: wp.array3d[float],
-    inverse_mass: wp.array[float],
-    v: wp.array[float],
-    velocity: wp.array2d[float],
-):
-    """One thread per world: each sparse-diagonal row's ``Z_i^T u+ + eps_i lambda_i``, ``u`` on the dense part the walk's
-    coordinates of ``v`` (``coordinates``, :func:`.tree_factor.walk_enter_kernel`, the frame its rows were whitened in)
-    and ``u = v / s``, ``s = m^-1/2``, on a slot's coordinate."""
-    world = wp.tid()
-    offset = dense_offsets[world]
-    group = dense_groups[world]
-    line = a.rows.first[world]
-    for i in range(wp.min(a.counts[world], a.capacity)):
-        term = float(0.0)
-        for c in range(dense_dofs):
-            term += dense_Z[group, i, c] * coordinates[world, offset + c]
-        for slot in range(2):
-            world_dof = sparse_row_dof[line, i, slot]
-            if world_dof >= 0:
-                dof = world_dof_indices[world, world_dof]
-                if dof >= 0:
-                    scale = wp.sqrt(inverse_mass[dof])
-                    if scale > 0.0:
-                        term += sparse_row_z[line, i, slot] * (v[dof] / scale)
-        velocity[world, i] = with_compliance(a, world, i, term)
+@dataclasses.dataclass(frozen=True)
+class RowClass:
+    """A support class whose rows the audit reads: the operands beside the kernel's own, a world's names (``prologue``,
+    after ``line`` and ``count``) and row ``i``'s statements that declare its velocity term ``term``."""
+
+    name: str
+    operands: tuple
+    prologue: str
+    row: str
+    preludes: tuple = ()
+
+
+_ROWS = """    const int line = first.data[world];
+    const int count = counts.data[world] < capacity ? counts.data[world] : capacity;
+$prologue
+    for (int i = 0; i < count; ++i) {
+$row
+        velocity.data[(size_t)world * velocity.shape[1] + i] = term;
+    }
+"""
+
+
+@functools.cache
+def rows_kernel(cls: RowClass) -> wp.Kernel:
+    """The rows' velocity terms of support class ``cls``, a thread a world: each row ``i``'s ``term`` into
+    ``velocity[world, i]``, over the world's ``min(counts[world], capacity)`` rows from its line ``first[world]``."""
+    common = (
+        ("first", wp.array[int]),
+        ("counts", wp.array[int]),
+        ("capacity", int),
+        ("velocity", wp.array2d[float]),
+    )
+    return KernelTemplate(
+        f"audit_rows_{cls.name}",
+        (*common, *cls.operands),
+        substitute(_ROWS, prologue=cls.prologue, row=cls.row),
+        items("world", flat=True),
+        preludes=cls.preludes,
+        dual=True,
+        native_name="audit_rows_native",
+    ).kernel()
+
+
+def packed_class(support: int, wide: bool) -> RowClass:
+    """The packed rows (:func:`.sweep_routes.packed_operator`): ``Z_i^T u+``, ``u`` the walk's coordinates of ``v+``;
+    a world whose rows the tiers form reads ``J_i v+`` (``Z`` there holds ``J``), every other
+    ``(J_i v_hat + Z_i^T u+) - Z_i^T u_hat``."""
+    operator = packed_operator(support, ONE, wide=wide)
+    at_u = dataclasses.replace(operator, velocity=Velocity("u"))
+    at_hat = dataclasses.replace(operator, velocity=Velocity("u_hat"))
+    return RowClass(
+        f"packed{support}{'_wide' if wide else ''}",
+        (
+            ("row_sides", wp.array2d[wp.vec2i]),
+            ("response_dofs", wp.array[int]),
+            ("articulation_world_dof_offset", wp.array[int]),
+            ("packed_dense", int),
+            ("world_dof_indices", wp.array2d[int]),
+            ("packed_Z", wp.array3d[float]),
+            ("coordinates", wp.array2d[float]),
+            ("hat", wp.array2d[float]),
+            ("incident", wp.array2d[float]),
+            ("mf_counts", wp.array[int]),
+            ("tier_rows", int),
+        ),
+        """    const int off_dense = line * row_sides.shape[1];
+    const int packed_base = line * packed_Z.shape[1] * packed_Z.shape[2];
+    const int dof_map_base = world * world_dof_indices.shape[1];
+    const float* u = coordinates.data + (size_t)world * coordinates.shape[1];
+    const float* u_hat = hat.data + (size_t)world * hat.shape[1];
+    const bool tier = tier_rows > 0 && counts.data[world] <= tier_rows && mf_counts.data[world] == 0;""",
+        _sum(at_u, "zu", "0.0f")
+        + """
+        float term = zu;
+        if (!tier) {
+"""
+        + _sum(at_hat, "zhat", "0.0f")
+        + """
+            term = incident.data[(size_t)line * incident.shape[1] + i] + zu - zhat;
+        }""",
+        (PACKED_SIDES,),
+    )
+
+
+def sparse_class(support: int, table: bool) -> RowClass:
+    """Native sparse factors' rows (case K1, :func:`.sweep_routes_sparse.factor_operator`): ``J_i v_hat + Z_i^T du``,
+    summed from the incident, entries through the support table or explicit coordinates."""
+
+    def index(row, entry):
+        if table:
+            return f"support.class_dof.data[support.row_class.data[offset + {row}] * {support} + {entry}]"
+        return f"row_dof.data[row_base + {row} * {support} + {entry}]"
+
+    def factor(row, entry):
+        return f"row_factor.data[row_base + {row} * {support} + {entry}]"
+
+    operator = SparseFactor(support, index, factor, ONE, velocity=Velocity("du"))
+    return RowClass(
+        f"sparse{support}{'_table' if table else ''}",
+        (
+            ("support", _SparseRowSupport),
+            ("row_dof", wp.array3d[int]),
+            ("row_factor", wp.array3d[float]),
+            ("row_incident", wp.array2d[float]),
+            ("delta", wp.array2d[float]),
+        ),
+        """    const int offset = line * support.row_class.shape[1];
+    const int row_base = line * row_factor.shape[1] * row_factor.shape[2];
+    const float* du = delta.data + (size_t)world * delta.shape[1];""",
+        _sum(operator, "term", "row_incident.data[(size_t)line * row_incident.shape[1] + i]"),
+    )
+
+
+def slot_class(dense: int, rows: int) -> RowClass:
+    """The sparse diagonal's rows (case K2, :func:`.sweep_routes_diag.slot_rows`): ``Z_i^T u+``, ``u`` on the dense
+    group the walk's coordinates of ``v+`` (the frame its rows were whitened in) and ``u = v / s``, ``s = m^-1/2``, on a
+    slot's coordinate (zero where the coordinate has no inverse mass)."""
+    operator = dataclasses.replace(slot_rows(dense, rows, ONE), velocity=Called("U"))
+    return RowClass(
+        f"slots{dense}_{rows}",
+        (
+            ("world_dof_indices", wp.array2d[int]),
+            ("dense_offsets", wp.array[int]),
+            ("dense_groups", wp.array[int]),
+            ("coordinates", wp.array2d[float]),
+            ("dense_Z", wp.array3d[float]),
+            ("sparse_row_dof", wp.array3d[int]),
+            ("sparse_row_z", wp.array3d[float]),
+            ("inverse_mass", wp.array[float]),
+            ("v", wp.array[float]),
+        ),
+        f"""    const int dense_offset = dense_offsets.data[world], dense_group = dense_groups.data[world];
+    const int row_base = line * sparse_row_dof.shape[1];
+    const float* u = coordinates.data + (size_t)world * coordinates.shape[1];
+    const int* dofs = world_dof_indices.data + (size_t)world * world_dof_indices.shape[1];
+    const auto U = [&](const int c) -> float {{
+        if (c >= dense_offset && c < dense_offset + {dense}) return u[c];
+        const int dof = dofs[c];
+        if (dof < 0) return 0.0f;
+        const float scale = wp::sqrt(inverse_mass.data[dof]);
+        return scale > 0.0f ? v.data[dof] / scale : 0.0f;
+    }};""",
+        _sum(operator, "term", "0.0f"),
+    )
+
+
+@functools.cache
+def free_class() -> RowClass:
+    """The free bodies' rows, the 6 + 6 class (:func:`.sweep_routes.free_body_rows`): ``Z_i^T u+`` over the walk's
+    coordinates of ``v+`` at the sides' world coordinates. A speed row's term is ``-|v|`` of the coordinates its
+    unwhitened axis marks, linear from ``e_0`` or angular from ``e_3``, its bias the limit
+    (:func:`.projection_laws.speed_row`): the law's own term, not a ``Z`` row."""
+    # One side's six entries at a time, each side summed from zero, then the two added.
+    half = SparseFactor(
+        6,
+        lambda row, entry: f"(dof < 0 ? -1 : dof + {entry})",
+        lambda row, entry: f"mf_Z.data[mf12_base + i * 12 + side + {entry}]",
+        ONE,
+        velocity=Velocity("u"),
+    )
+    return RowClass(
+        "free",
+        (
+            ("row_type", wp.array2d[int]),
+            ("row_sides", wp.array2d[wp.vec2i]),
+            ("base", int),
+            ("mf_Z", wp.array3d[float]),
+            ("dof_start", wp.array[int]),
+            ("world_offset", wp.array[int]),
+            ("v", wp.array[float]),
+            ("coordinates", wp.array2d[float]),
+        ),
+        """    const int records = line * row_type.shape[1] + base;
+    const int mf12_base = line * mf_Z.shape[1] * 12;
+    const float* u = coordinates.data + (size_t)world * coordinates.shape[1];""",
+        f"""        const wp::vec2i sides = row_sides.data[records + i];
+        float term = 0.0f;
+        if (row_type.data[records + i] == {int(ROW_SPEED)}) {{
+            const int start = dof_start.data[sides[0]] + (mf_Z.data[mf12_base + i * 12 + 3] != 0.0f ? 3 : 0);
+            term = -wp::length(wp::vec3(v.data[start], v.data[start + 1], v.data[start + 2]));
+        }} else {{
+            const int dof_a = sides[0] >= 0 ? world_offset.data[sides[0]] : -1;
+            const int dof_b = sides[1] >= 0 ? world_offset.data[sides[1]] : -1;
+            int dof = dof_a, side = 0;
+"""
+        + _sum(half, "za", "0.0f")
+        + """
+            dof = dof_b; side = 6;
+"""
+        + _sum(half, "zb", "0.0f")
+        + """
+            term = za + zb;
+        }""",
+    )
 
 
 @wp.kernel(enable_backward=False)
@@ -264,109 +362,45 @@ def limit_row(total: wp.vec3, impulse: float, term: float, bias: float) -> wp.ve
 
 
 @wp.func
-def walked_side(
-    Z: wp.array3d[float],
-    line: int,
-    row: int,
-    side: int,
-    art: int,
-    world: int,
-    world_offset: wp.array[int],
-    coordinates: wp.array2d[float],
-) -> float:
-    """``Z_side^T u``: one side (its six entries from ``side`` of the row's twelve; articulation ``art``, -1 for none)
-    of a walked free-body row over the walk's coordinates of the published velocity
-    (:func:`.tree_factor.walk_enter_kernel`)."""
-    if art < 0:
-        return 0.0
-    start = world_offset[art]
-    out = float(0.0)
-    for k in range(6):
-        out += Z[line, row, side + k] * coordinates[world, start + k]
-    return out
-
-
-@wp.kernel(enable_backward=False)
-def free_rows(
-    a: AuditRows,
-    mf: MfRows,
-    walk: WalkTrees,
-    impulses: wp.array2d[float],
-    weights: wp.array2d[float],
-    v: wp.array[float],
-    world_offset: wp.array[int],
-    coordinates: wp.array2d[float],
-    velocity: wp.array2d[float],
-):
-    """One thread per world: each free-body row's ``J_i v+ + eps_i lambda_i``, its sides over the walk's coordinates
-    (``coordinates``, by world coordinate). A speed row's term is ``-|v|`` of the coordinates its unwhitened axis marks, linear from ``e_0`` or angular from ``e_3``,
-    its bias the limit (:func:`.projection_laws.speed_row`)."""
-    world = wp.tid()
-    line = mf.first[world]
-    for i in range(a.mf_counts[world]):
-        # Row ``i``'s ``Z`` there, its records at ``mf.base + i`` of the world's line.
-        r = mf.base + i
-        kind = mf.row_type[line, r]
-        sides = mf.sides[line, r]
-        if kind == ROW_SPEED:
-            start = walk.dof_start[sides[0]]
-            if mf.Z[line, i, 3] != 0.0:
-                start += 3
-            velocity[world, i] = -wp.length(wp.vec3(v[start], v[start + 1], v[start + 2]))
-            continue
-        term = walked_side(mf.Z, line, i, 0, sides[0], world, world_offset, coordinates)
-        term += walked_side(mf.Z, line, i, 6, sides[1], world, world_offset, coordinates)
-        diagonal = mf.diag[line, r]
-        if diagonal > 0.0:
-            weight = float(1.0)
-            if a.weighted != 0:
-                weight = weights[line, r]
-            eps = float(0.0)
-            if a.material != 0:
-                eps = mf.eps[line, r]
-            term += row_compliance(kind, weight, eps, diagonal) * impulses[line, r]
-        velocity[world, i] = term
-
-
-@wp.func
-def audit_store(
-    world: int,
-    line: int,
-    base: int,
-    count: int,
-    kinds: wp.array2d[int],
-    parents: wp.array2d[int],
-    mus: wp.array2d[float],
-    impulses: wp.array2d[float],
-    rhs: wp.array2d[float],
-    velocity: wp.array2d[float],
-) -> wp.vec3:
+def audit_store(a: AuditRows, world: int, line: int, base: int, count: int, velocity: wp.array2d[float]) -> wp.vec3:
     """One row class's ``(G, D, W)``: its ``count`` rows from ``base`` of the world's line, row ``i``'s velocity term
-    at ``velocity[world, i]``. A contact's friction block is its pair after its normal, then its spin row if any: its
-    first tangent reads it whole, and its other rows add only their work."""
+    at ``velocity[world, i]``, a contact normal with a positive diagonal plus its ``eps_i lambda_i``. A contact's
+    friction block is its pair after its normal, then its spin row if any: its first tangent reads it whole, and its
+    other rows add only their work."""
+    rows = a.rows
     gap = float(0.0)
     violation = float(0.0)
     work = float(0.0)
     for i in range(count):
         r = base + i
-        kind = kinds[line, r]
-        impulse = impulses[line, r]
-        bias = rhs[line, r]
-        residual = velocity[world, i] + bias
+        kind = rows.row_type[line, r]
+        impulse = a.impulses[line, r]
+        bias = rows.rhs[line, r]
+        term = velocity[world, i]
+        diagonal = rows.diag[line, r]
+        if kind == ROW_CONTACT and diagonal > 0.0:
+            weight = float(1.0)
+            if a.weighted != 0:
+                weight = rows.row_w[line, r]
+            eps = float(0.0)
+            if a.material != 0:
+                eps = rows.row_eps[line, r]
+            term += contact_compliance(weight, eps, diagonal) * impulse
+        residual = term + bias
         work -= impulse * bias
         if kind == ROW_FRICTION or kind == ROW_TORSION:
-            if kind == ROW_FRICTION and parents[line, r] == r - 1:
-                second = velocity[world, i + 1] + rhs[line, r + 1]
+            if kind == ROW_FRICTION and rows.row_parent[line, r] == r - 1:
+                second = velocity[world, i + 1] + rows.rhs[line, r + 1]
                 spin = float(0.0)
                 spin_scale = float(0.0)
-                term = impulse * residual + impulses[line, r + 1] * second
+                term = impulse * residual + a.impulses[line, r + 1] * second
                 if i + 2 < count:
-                    if kinds[line, r + 2] == ROW_TORSION:
-                        spin = velocity[world, i + 2] + rhs[line, r + 2]
-                        spin_scale = mus[line, r + 2]
-                        term += impulses[line, r + 2] * spin
-                scaled = wp.vec3(mus[line, r] * residual, mus[line, r + 1] * second, spin_scale * spin)
-                term += patch_normal_load(parents, impulses, line, r - 1) * wp.length(scaled)
+                    if rows.row_type[line, r + 2] == ROW_TORSION:
+                        spin = velocity[world, i + 2] + rows.rhs[line, r + 2]
+                        spin_scale = rows.row_mu[line, r + 2]
+                        term += a.impulses[line, r + 2] * spin
+                scaled = wp.vec3(rows.row_mu[line, r] * residual, rows.row_mu[line, r + 1] * second, spin_scale * spin)
+                term += patch_normal_load(rows.row_parent, a.impulses, line, r - 1) * wp.length(scaled)
                 gap += wp.abs(term)
             continue
         gap += wp.abs(impulse * residual)
@@ -380,37 +414,23 @@ def audit_store(
 @wp.kernel(enable_backward=False)
 def audit_world(
     a: AuditRows,
-    mf: MfRows,
-    mf_impulses: wp.array2d[float],
+    base: int,
     velocity: wp.array2d[float],
     mf_velocity: wp.array2d[float],
     fused: wp.array[wp.vec3],
     readout: wp.array2d[float],
 ):
-    """One thread per world: the row laws of both stores over the rows' velocity terms, into :data:`AUDIT_SLOTS`."""
+    """One thread per world: the row laws of both stores over the rows' velocity terms, into :data:`AUDIT_SLOTS`; the
+    free bodies' rows from ``base`` of the world's line."""
     world = wp.tid()
     if tier_world(a, world) and a.keyed != 0:
         readout[world, 0] = wp.nan
         readout[world, 1] = wp.nan
         readout[world, 2] = wp.nan
         return
-    rows = a.rows
-    count = wp.min(a.counts[world], a.capacity)
-    dense = audit_store(
-        world, rows.first[world], 0, count, rows.row_type, rows.row_parent, rows.row_mu, a.impulses, rows.rhs, velocity
-    )
-    free = audit_store(
-        world,
-        mf.first[world],
-        mf.base,
-        a.mf_counts[world],
-        mf.row_type,
-        mf.row_parent,
-        mf.row_mu,
-        mf_impulses,
-        mf.rhs,
-        mf_velocity,
-    )
+    line = a.rows.first[world]
+    dense = audit_store(a, world, line, 0, wp.min(a.counts[world], a.capacity), velocity)
+    free = audit_store(a, world, line, base, a.mf_counts[world], mf_velocity)
     extra = fused[world]
     gap = dense[0] + free[0] + extra[0]
     violation = wp.max(wp.max(dense[1], free[1]), extra[1])
@@ -479,78 +499,101 @@ class Audit:
             device=solver.model.device,
         )
 
-    def launch(self) -> None:
-        """Audit the step: after the solve, on the published velocity ``v_out``."""
-        solver, forest = self.solver, self.solver.forest
-        device, worlds = solver.model.device, forest.world_count
-        a, mf, v = self._operands(), bind_mf_rows(solver.placement), solver.v_out
+    @functools.cached_property
+    def dense_class(self) -> RowClass:
+        """The dense rows' support class, by the solve's route (:attr:`.step_plan.StepPlan.solve`), chosen once."""
+        solver = self.solver
+        placement = solver.placement
         route = solver._plan.solve.route.name
         if route == "sparse_pgs":
-            inputs = [
-                a,
-                solver.placement.sparse_row_support,
-                solver.placement.sparse_row_dof,
-                solver.placement.sparse_row_factor,
-                solver.placement.row_incident,
-                solver.placement.sparse_factor_velocity_delta,
+            return sparse_class(int(placement.sparse_row_factor.shape[2]), bool(placement.sparse_row_support.enabled))
+        if route == "sparse_diagonal":
+            size = placement.sparse_diagonal_dense_size
+            return slot_class(int(size), int(placement.J_by_size[size].shape[1]))
+        return packed_class(int(placement.packed_support), int(placement.packed_dense) == WIDE)
+
+    def _dense_operands(self, v: wp.array) -> list:
+        """The dense class's operands this step; the walk's coordinates of ``v`` (and ``v_hat``) where its rows read
+        them."""
+        solver, forest, placement = self.solver, self.solver.forest, self.solver.placement
+        route = solver._plan.solve.route.name
+        if route == "sparse_pgs":
+            return [
+                placement.sparse_row_support,
+                placement.sparse_row_dof,
+                placement.sparse_row_factor,
+                placement.row_incident,
+                placement.sparse_factor_velocity_delta,
             ]
-            wp.launch(sparse_rows, dim=worlds, inputs=inputs, outputs=[self.velocity], device=device)
-        elif route == "sparse_diagonal":
-            size = solver.placement.sparse_diagonal_dense_size
-            # The dense arms' rows are the walk's (walk_rows): their coordinates are the walk's too.
+        # The walked rows (walk_rows) are in the walk's coordinates: their trees' coordinates are the walk's too.
+        if route == "sparse_diagonal":
+            size = placement.sparse_diagonal_dense_size
             self._walk_coordinates(v, self.coordinates)
-            inputs = [
-                a,
+            return [
                 forest.world_dof_indices,
-                solver.placement.sparse_diagonal_dense_offsets,
-                solver.placement.sparse_diagonal_dense_groups,
-                size,
+                placement.sparse_diagonal_dense_offsets,
+                placement.sparse_diagonal_dense_groups,
                 self.coordinates,
-                solver.placement.J_by_size[size],
-                solver.placement.sparse_diagonal_row_dof,
-                solver.placement.sparse_diagonal_row_z,
+                placement.J_by_size[size],
+                placement.sparse_diagonal_row_dof,
+                placement.sparse_diagonal_row_z,
                 solver.factor.diagonal_inverse_mass,
                 v,
             ]
-            wp.launch(diagonal_rows, dim=worlds, inputs=inputs, outputs=[self.velocity], device=device)
+        if placement.walks:
+            self._walk_coordinates(v, self.coordinates)
+            self._walk_coordinates(solver.v_hat, self.coordinates_hat)
+        return [
+            placement.row_sides,
+            forest.articulation_response_dof_count,
+            forest.articulation_world_dof_offset,
+            int(placement.packed_dense),
+            forest.world_dof_indices,
+            placement.packed_Z,
+            self.coordinates,
+            self.coordinates_hat,
+            placement.row_incident,
+            placement.mf_constraint_count,
+            int(placement.ink_skip_rows()),
+        ]
+
+    def launch(self) -> None:
+        """Audit the step: after the solve, on the published velocity ``v_out``: each store's velocity terms by the one
+        rows kernel of its support class, the sparse diagonal's fused limits, then the law."""
+        solver, forest, placement = self.solver, self.solver.forest, self.solver.placement
+        device, worlds, v = solver.model.device, forest.world_count, solver.v_out
+        first, capacity = placement.dense_first, placement.dense_max_constraints
+        wp.launch(
+            rows_kernel(self.dense_class),
+            dim=worlds,
+            inputs=[first, placement.constraint_count, capacity, self.velocity, *self._dense_operands(v)],
+            device=device,
+        )
+        if solver._plan.solve.route.name == "sparse_diagonal":
             limits = [
-                solver.placement.fused_diagonal_limit_active,
-                solver.placement.fused_diagonal_limit_lower_rhs,
-                solver.placement.fused_diagonal_limit_upper_rhs,
-                solver.placement.fused_diagonal_limit_lower_lambda,
-                solver.placement.fused_diagonal_limit_upper_lambda,
+                placement.fused_diagonal_limit_active,
+                placement.fused_diagonal_limit_lower_rhs,
+                placement.fused_diagonal_limit_upper_rhs,
+                placement.fused_diagonal_limit_lower_lambda,
+                placement.fused_diagonal_limit_upper_lambda,
                 forest.world_dof_indices,
                 v,
             ]
             wp.launch(fused_limits, dim=worlds, inputs=limits, outputs=[self.fused], device=device)
-        else:
-            if solver.placement.walks:
-                # The one writer's rows are the walk's (walk_rows): their trees' coordinates are the walk's too.
-                self._walk_coordinates(v, self.coordinates)
-                self._walk_coordinates(solver.v_hat, self.coordinates_hat)
-            inputs = [
-                a,
-                solver.placement.row_support(),
-                solver.placement.packed_Z,
-                solver.placement.packed_Z,
-                self.coordinates,
-                self.coordinates_hat,
-                solver.placement.row_incident,
-            ]
-            wp.launch(packed_rows, dim=worlds, inputs=inputs, outputs=[self.velocity], device=device)
         if forest.has_free_rigid_bodies:
-            inputs = [
-                a,
-                mf,
-                solver.factor.walk_view(),
-                solver.placement.impulses,
-                solver.placement.row_w,
-                v,
+            free = [
+                placement.row_type,
+                placement.row_sides,
+                int(placement.body_base),
+                placement.mf_Z,
+                solver.factor.walk_view().dof_start,
                 forest.articulation_world_dof_offset,
+                v,
                 self.coordinates,
             ]
-            wp.launch(free_rows, dim=worlds, inputs=inputs, outputs=[self.mf_velocity], device=device)
-        inputs = [a, mf, solver.placement.impulses, self.velocity, self.mf_velocity, self.fused]
+            mf = [first, placement.mf_constraint_count, placement.mf_max_constraints, self.mf_velocity]
+            wp.launch(rows_kernel(free_class()), dim=worlds, inputs=[*mf, *free], device=device)
+        inputs = [self._operands(), int(placement.body_base), self.velocity, self.mf_velocity, self.fused]
         wp.launch(audit_world, dim=worlds, inputs=inputs, outputs=[self.readout], device=device)
 
     def read(self) -> dict:
