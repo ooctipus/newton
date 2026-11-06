@@ -314,17 +314,17 @@ def _unit_couplings(torsion: bool) -> tuple[int, tuple]:
 
 def _unit_terms(pad: str, *, torsion: bool = False) -> str:
     """Native statements, after a unit's ``E``, ``metric``, ``rows`` and ``dof_a``, ``dof_b`` are declared: the unit's
-    velocity on its bodies (``velocities``, at its entries), its rows' velocity terms from it (each side's six products, then the sides
-    added) and the cached Gram couplings of the pair with the normal; under ``torsion`` the spin row's term too and
-    its coupling with the normal (:attr:`.sweep_units.SlotLayout.metric`)."""
+    velocity at its staged rows' entries (``velocities``, :func:`_staged_rows`), its rows' velocity terms from it (each
+    side's six products, then the sides added) and the cached Gram couplings of the pair with the normal; under
+    ``torsion`` the spin row's term too and its coupling with the normal (:attr:`.sweep_units.SlotLayout.metric`)."""
     rows = _unit_rows(torsion)
     start, couplings = _unit_couplings(torsion)
     lines = [
         "float velocities[12];",
         "#pragma unroll",
         "for (int k = 0; k < 6; ++k) {",
-        "    velocities[k] = dof_a >= 0 ? s_v[dof_a + k] : 0.0f;",
-        "    velocities[6 + k] = dof_b >= 0 ? s_v[dof_b + k] : 0.0f;",
+        "    velocities[2 * k] = dof_a >= 0 ? s_v[dof_a + k] : 0.0f;",
+        "    velocities[2 * k + 1] = dof_b >= 0 ? s_v[dof_b + k] : 0.0f;",
         "}",
         f"float {', '.join(f'{term} = 0.0f' for _, term, _ in rows)};",
         "#pragma unroll",
@@ -333,7 +333,7 @@ def _unit_terms(pad: str, *, torsion: bool = False) -> str:
         f"    float {', '.join(f'{part} = 0.0f' for part, _, _ in rows)};",
         "#pragma unroll",
         "    for (int k = 0; k < 6; ++k) {",
-        "        const float u = velocities[side * 6 + k];",
+        "        const float u = velocities[2 * k + side];",
         *(
             f"        {part} += E[{f'{12 * r} + ' if r else ''}side * 6 + k] * u;"
             for r, (part, _, _) in enumerate(rows)
@@ -346,20 +346,31 @@ def _unit_terms(pad: str, *, torsion: bool = False) -> str:
     return indent("\n".join(lines), pad)
 
 
+def _staged_rows(torsion: bool) -> SparseFactor:
+    """A colored unit's rows as its slot staged them (``E[12 r + 6 side + k]``, row ``r`` of :func:`_unit_rows`), one
+    thread's 6 + 6 support class enumerated a coordinate at a time: entry ``2 k + side`` is body ``side``'s coordinate
+    ``k``, so an apply writes each coordinate's two bodies together. The unit's velocity at entry ``q`` is
+    ``velocities[q]`` (:func:`_unit_terms`)."""
+    order = {part: r for r, (part, _, _) in enumerate(_unit_rows(torsion))}
+
+    def coordinate(row: str, entry: str) -> str:
+        body = f"(({entry}) & 1 ? dof_b : dof_a)"
+        return f"({body} < 0 ? -1 : {body} + (({entry}) >> 1))"
+
+    def value(row: str, entry: str) -> str:
+        return f"E[{12 * order[row]} + 6 * (({entry}) & 1) + (({entry}) >> 1)]"
+
+    return dataclasses.replace(free_body_rows(Lanes(1)), index=coordinate, factor=value)
+
+
 def _unit_apply(pad: str, *, torsion: bool = False) -> str:
-    """The unit's deferred changes in one pass on its staged rows (``E[12 r + e]``, the free bodies' 6 + 6 support):
-    ``u += Z_n dn + Z_t1 dt1 + Z_t2 dt2`` on each of its bodies' coordinates (and ``Z_s ds`` of its spin row under
-    ``torsion``), summed in the rows' order and added once to the velocity :func:`_unit_terms` read."""
-    rows = _unit_rows(torsion)
-    order = {part: r for r, (part, _, _) in enumerate(rows)}
-    staged = dataclasses.replace(
-        free_body_rows(Lanes(1)),
-        factor=lambda row, entry: f"E[{12 * order[row]} + {entry}]" if order[row] else f"E[{entry}]",
-    )
-    changes = tuple((part, change) for part, _, change in rows)
+    """The unit's deferred changes in one pass on its staged rows (:func:`_staged_rows`): ``u += Z_n dn + Z_t1 dt1 +
+    Z_t2 dt2`` on each of its bodies' coordinates (and ``Z_s ds`` of its spin row under ``torsion``), summed in the
+    rows' order and added once to the velocity :func:`_unit_terms` read."""
+    changes = tuple((part, change) for part, _, change in _unit_rows(torsion))
     lines = [
         f"if ({' || '.join(f'{change} != 0.0f' for _, change in changes)}) {{",
-        staged.unit_apply(changes, "    "),
+        _staged_rows(torsion).unit_apply(changes, "    "),
         "}",
     ]
     return indent("\n".join(lines), pad)
