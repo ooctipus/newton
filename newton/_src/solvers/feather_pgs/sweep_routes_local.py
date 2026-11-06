@@ -49,9 +49,9 @@ from .sweep import (
     material_arguments,
     pair_radius,
     pair_update,
+    row_step,
     row_sums,
     row_update,
-    row_visit,
     unit_held_loads,
     weight_arguments,
 )
@@ -179,26 +179,10 @@ def paired_factor_source(
         threads=32 * _PAIRED_WORLDS_PER_BLOCK,
         name="PairedScratch",
     )
-    ctx = RowContext(
-        row="i",
-        kind="row_type",
-        operator=op,
-        diagonal=rows.diagonal("denom"),
-        load=rows.load,
-        store=rows.store,
-        rhs=rows.rhs_of,
-        mu=rows.mu,
-        weight=rows.weight,
-        eps=rows.eps,
-        parent="parent",
-        ring_load=rows.ring_load,
-        lanes=lanes,
-        inline_velocity_limit=True,
-        spin_row=lambda parent: rows.spin_of(parent, "m"),
-        # A friction triple reads its metric cached for the launch (sweep.friction_metric_law).
-        **({"triple_law": "ROW_TRIPLE(parent, "} if torsion else {}),
-    )
-    schedule = _paired_units(ctx, laws) if contact_units else _paired_rows(ctx, laws, "m")
+    # A friction triple reads its metric cached for the launch (sweep.friction_metric_law).
+    cached = "ROW_TRIPLE" if torsion else None
+    ctx = RowContext.of(rows, op, end="m", metric=cached, inline_velocity_limit=True)
+    schedule = _paired_units(ctx, laws) if contact_units else _paired_rows(rows, op, laws, "m", cached)
 
     world_rows = "if (m == 0 || world_mf_constraint_count.data[world] != 0) return;"
     write = "global_dof >= 0"
@@ -269,30 +253,19 @@ def paired_factor_source(
     return cuda_native(body, preludes=preludes), staging
 
 
-def _paired_rows(ctx: RowContext, laws: RowLaws, end: str) -> str:
-    """Rows ``[0, end)`` one at a time in slot order, each row's factor row pipelined; a friction pair at its first
-    tangent, its sibling's factor row loaded with the pair."""
-    op = ctx.operator
+def _paired_rows(rows: StagedRows, op: SparseFactor, laws: RowLaws, end: str, metric: str | None) -> str:
+    """Rows ``[0, end)`` one at a time in slot order by the row step (:func:`.sweep.row_step`), velocity limits in
+    place, each row's factor row pipelined; a friction pair at its first tangent, its sibling's factor row loaded with
+    the pair."""
     sibling = f"const float sibling_z = row_type == {FRICTION} ? ({_load(op, 'parent + 2')}) : 0.0f;\n"
     if laws.torsion:
         # The pair's contact's spin row if it has one (the visit's ``spin``), solved with it (the friction triple).
         sibling += f"const float spin_z = row_type == {FRICTION} && spin >= 0 ? ({_load(op, 'spin')}) : 0.0f;\n"
-    rows = Pipelined(
+    order = Pipelined(
         end, lambda pad: f"{pad}float pre_z = {_load(op, '0')};", lambda row, pad: _consume(op, row, end, pad)
     )
-    lines = [
-        "    const int row_type = static_cast<int>(s_type[i]);",
-        f"    if (row_type == {TORSION}) continue;" if laws.torsion else "",
-        row_visit(
-            ctx,
-            laws,
-            parent="world_row_parent.data[off + i]",
-            check="denom",
-            declare=sibling + "const float denom = s_diag[i];",
-            pad="    ",
-        ),
-    ]
-    return rows.wrap("\n".join(line for line in lines if line), "")
+    step = row_step(rows, op, laws, end=end, loads=sibling, inline_velocity_limit=True, metric=metric, pad="    ")
+    return order.wrap(step, "")
 
 
 def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:

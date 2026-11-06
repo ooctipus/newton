@@ -97,8 +97,9 @@ class WorldRows:
 
     Impulses are staged (``s_lam_dense``, ``s_lam_mf``) or, with ``stream`` (the header's rows), read and written in
     place (``g_lam_mf``). A dense row's and a streamed one's impulse is owned by the row's first lane, whose value
-    every lane takes by broadcast; a staged header row's every lane stores what it computed. Staged and streamed reads
-    hold identical values.
+    every lane takes by broadcast; a staged header row's every lane stores what it computed, and so does every row's
+    with ``every_lane`` (the sparse-diagonal sweep's: each lane reads its own stores). Staged and streamed reads hold
+    identical values.
     """
 
     capacity: int
@@ -106,6 +107,7 @@ class WorldRows:
     stream: bool = False
     rhs: str = "rhs_bias"
     lanes: Lanes = dataclasses.field(default_factory=Lanes)
+    every_lane: bool = False
 
     STAGINGS: ClassVar[tuple[str, ...]] = ("shared", "resident", "streamed", "header")
     STAGED: ClassVar[dict[str, str]] = {
@@ -123,6 +125,17 @@ class WorldRows:
     @property
     def header(self) -> bool:
         return self.staging == "header"
+
+    @property
+    def own_stores(self) -> bool:
+        """Every lane stores the impulse it computed and reads its own stores (a staged header row, ``every_lane``)."""
+        return self.every_lane or (self.header and not self.stream)
+
+    @property
+    def owned(self) -> bool:
+        """The row's first lane owns its stored impulse, which other lanes read directly: its stores wait for them.
+        A header row's every read takes its own lane's store or the first lane's by broadcast."""
+        return not (self.header or self.every_lane)
 
     @property
     def base(self) -> str:
@@ -205,8 +218,8 @@ class WorldRows:
 
     def load(self, row: str) -> str:
         """Row ``row``'s impulse on every lane (read by the first lane where it owns it)."""
-        if self.header and not self.stream:
-            return f"s_lam_mf[{row}]"
+        if self.own_stores:
+            return self.peek(row)
         return self.lanes.broadcast(f"{self.impulses}[{row}]")
 
     def peek(self, row: str) -> str:
@@ -214,8 +227,8 @@ class WorldRows:
         return f"{self.impulses}[{row}]"
 
     def store(self, row: str, value: str) -> str:
-        if self.header and not self.stream:
-            return f"s_lam_mf[{row}] = {value};"
+        if self.own_stores:
+            return f"{self.impulses}[{row}] = {value};"
         return self.lanes.first(f"{self.impulses}[{row}] = {value};")
 
     def ring_load(self, parent: str, load: str | None = None) -> str:
@@ -303,6 +316,9 @@ class RowStore(Protocol):
     whole: the sparse and paired factor sweeps)."""
 
     lanes: Lanes
+    owned: bool
+    """The row's first lane owns its stored impulse, which other lanes read: its stores wait for their reads
+    (:attr:`RowContext.owned`). Otherwise every lane reads its own stores, or the first lane's by broadcast."""
 
     def load(self, row: str) -> str:
         """Row ``row``'s impulse on every lane."""
@@ -364,6 +380,9 @@ class StagedRows:
     count: str = "count"
     reciprocal: bool = True
     triples: bool = False
+
+    owned: ClassVar[bool] = True
+    """The first lane stores the staged impulses, which every lane reads."""
 
     def load(self, row: str) -> str:
         return f"s_impulse[{row}]"
@@ -629,6 +648,34 @@ class RowContext:
     """A friction pair reduces its first tangent's residual again with the pair's terms
     (:func:`_pair_terms` with ``own``) and solves on it in place of the row's: the free-body loop's
     friction step."""
+
+    @classmethod
+    def of(
+        cls, rows: RowStore, op, *, end: str, own: str = "denom", metric: str | None = None, **choices
+    ) -> RowContext:
+        """The context of row ``i`` of a row loop over a store's rows ``[0, end)``: every row accessor is the store's
+        (:class:`RowStore`), its ownership included, the visited row's diagonal read into the local ``own``, its kind
+        into ``row_type`` and a friction row's parent into ``parent``; with ``metric`` a friction triple's law reads
+        its metric cached for the launch (:func:`friction_metric_law`). ``choices`` sets the context's other fields."""
+        return cls(
+            row="i",
+            kind="row_type",
+            operator=op,
+            diagonal=rows.diagonal(own),
+            load=rows.load,
+            store=rows.store,
+            rhs=rows.rhs_of,
+            mu=rows.mu,
+            weight=rows.weight,
+            eps=rows.eps,
+            parent="parent",
+            ring_load=rows.ring_load,
+            lanes=rows.lanes,
+            owned=rows.owned,
+            spin_row=lambda contact: rows.spin_of(contact, end),
+            **({"triple_law": f"{metric}(parent, "} if metric is not None else {}),
+            **choices,
+        )
 
     def sync(self) -> str:
         """The barrier after a row's stores and apply: needed when the lanes share them (the first lane's impulses, or
@@ -1612,15 +1659,20 @@ def row_step(
     laws: RowLaws,
     *,
     end: str,
+    kind: int | None = None,
+    parent: str | None = None,
     admission: str = "",
+    loads: str = "",
     held: bool = False,
     triple_phase: bool = False,
+    inline_velocity_limit: bool = False,
     metric: str | None = None,
     pad: str = "            ",
 ) -> str:
     """Row ``i``'s step in a row loop over a store's rows ``[0, end)``: its kind read from the store, the schedule's
-    skips, then the shared visit (:func:`row_visit`): admission, residual and row law. Every row loop of the sparse
-    and matrix-free sweeps runs this text; three data choices are all that differ:
+    skips, then the shared visit (:func:`row_visit`): admission, residual and row law, in the store's context
+    (:meth:`RowContext.of`: who owns a row's stores is the store's). Every row loop of the sparse, matrix-free,
+    sparse-diagonal and paired factor sweeps runs this text; its data choices are all that differ:
 
     - ``held``: the row's and its pair's impulses are read at admission into registers (``row_impulse``,
       ``pair_impulse``) and the law reads them there (the sparse sweep's rows);
@@ -1630,42 +1682,43 @@ def row_step(
       its pair as spin rows, :attr:`StagedRows.triples`), and the loop's visit carries none of the triple's code;
       otherwise a spin row is solved with its friction pair in the loop (the store's :meth:`RowStore.spin_of`), its
       metric cached for the launch with ``metric`` (the law :func:`friction_metric_law` declared,
-      :func:`friction_metric_stage`).
+      :func:`friction_metric_stage`);
+    - ``inline_velocity_limit``: velocity-limit rows take their law in place, in slot order (the paired factor
+      sweep), instead of the last word (:func:`velocity_limit_pass`), which ``admission`` then skips them for;
+    - ``loads``: what the operator reads of the row and its pair in registers, loaded after the admission (the paired
+      factor sweep's ``sibling_z`` and ``spin_z``);
+    - a row known where the step is emitted (``kind``, and a friction row's ``parent``) replaces its metadata, so the
+      step compiles to that kind's law: a known kind is no spin row, and one other than friction admits no pair (the
+      sparse-diagonal sweep's chains).
 
     A spin row is skipped first (solved with its pair, here or in the triple phase), then ``admission``, the
     schedule's own skips (velocity limits, which the last word solves).
     """
-    registers = {"i": "row_impulse", "sib": "pair_impulse"} if held else {}
-    ctx = RowContext(
-        row="i",
-        kind="row_type",
-        operator=op,
-        diagonal=rows.diagonal("denom"),
-        load=lambda row: registers.get(row) or rows.load(row),
-        store=rows.store,
-        rhs=rows.rhs_of,
-        mu=rows.mu,
-        weight=rows.weight,
-        eps=rows.eps,
-        parent="parent",
-        ring_load=rows.ring_load,
-        lanes=rows.lanes,
-        spin_row=lambda contact: rows.spin_of(contact, end),
-        **({"triple_law": f"{metric}(parent, "} if metric is not None else {}),
+    ctx = RowContext.of(
+        rows,
+        op,
+        end=end,
+        metric=metric,
+        friction=kind in (None, FRICTION),
+        inline_velocity_limit=inline_velocity_limit,
     )
-    hold = {"hold": "const float row_impulse = " + rows.load("i") + ";\nfloat pair_impulse = 0.0f;"} if held else {}
+    hold = {}
+    if held:
+        registers = {"i": "row_impulse", "sib": "pair_impulse"}
+        ctx = dataclasses.replace(ctx, load=lambda row: registers.get(row) or rows.load(row))
+        hold = {"hold": "const float row_impulse = " + rows.load("i") + ";\nfloat pair_impulse = 0.0f;"}
     head = [
-        f"int row_type = {rows.kind('i')};",
+        f"int row_type = {rows.kind('i') if kind is None else kind};",
         # A spin row is solved with its friction pair (torsion).
-        f"if (row_type == {TORSION}) continue;" if laws.torsion else "",
+        f"if (row_type == {TORSION}) continue;" if laws.torsion and kind is None else "",
         admission,
     ]
     visit = row_visit(
         ctx,
         dataclasses.replace(laws, torsion=False) if triple_phase else laws,
-        parent=rows.parent("i"),
+        parent=rows.parent("i") if parent is None else parent,
         check="denom",
-        declare=f"float denom = {rows.diag('i')};",
+        declare=f"{loads}float denom = {rows.diag('i')};",
         keep_next="pair_impulse" if held else None,
         pad=pad,
         **hold,
