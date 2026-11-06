@@ -14,8 +14,10 @@ step after step along the stance's indeterminate force modes until the feet reac
 
 import warp as wp
 
+from . import field_group
 from .contact_input import ContactRoutes
 from .factor.kernels import Clock, clock_dt_ratio
+from .field_group import Field
 from .row_kernels import PGS_CONSTRAINT_TYPE_CONTACT
 from .row_records import DenseRows, MfRows
 
@@ -53,25 +55,69 @@ def prepare_world_impulses(
         world_impulses[line, i] = 0.0
 
 
+ContactCarry = field_group.struct(
+    "ContactCarry",
+    (
+        Field("normal", wp.vec3, ("contact",), attr="carry_normal", owner="placement"),
+        Field("impulse", wp.float32, ("contact",), attr="carry_impulse", owner="placement"),
+    ),
+    __name__,
+)
+"""What a step keeps for the next, by contact identity: each contact's normal and its converged normal impulse (zero
+where it held no normal row: a carried zero is the cold start). One record, written once a step by
+:func:`carry_contacts`; the next step's gather reads it through the contacts' match index. The contact pool's rows
+hold it (``carry_normal``, ``carry_impulse``). FeatherPGS consumes the sorted contacts, so a contact's index is its
+sorted index, by which the next frame's ``rigid_contact_match_index`` names it."""
+
+
+def bind_carry(placement):
+    """Bind the placement's :data:`ContactCarry`."""
+    return field_group.bind(ContactCarry, placement=placement)
+
+
 @wp.kernel
-def reset_world_warmstart_buffers(
+def carry_contacts(
+    routes: ContactRoutes,
     first: wp.array[int],
-    world_mask: wp.array[wp.bool],
+    row_type: wp.array2d[int],
     impulses: wp.array2d[float],
-    prev_impulses: wp.array2d[float],
-    prev_row_type: wp.array2d[int],
+    carry: ContactCarry,
 ):
-    """Clear persistent warm-start state for selected worlds: their lines of the row store, both classes' rows."""
+    """Write the carry: each contact's normal and the impulse of its normal row, read at its slot of its world's line
+    (one row index for both classes); zero past the contacts, over every row the stream used."""
+    c = wp.tid()
+    impulse = float(0.0)
+    if c < routes.count[0]:
+        carry.normal[c] = routes.normal[c]
+        slot = routes.slot[c]
+        if slot >= 0:
+            line = first[routes.world[c]]
+            if row_type[line, slot] == PGS_CONSTRAINT_TYPE_CONTACT:
+                impulse = impulses[line, slot]
+    carry.impulse[c] = impulse
+
+
+@wp.kernel
+def forget_carried_contacts(world: wp.array[int], world_mask: wp.array[wp.bool], carry: ContactCarry):
+    """Forget the carried impulses of the selected worlds' contacts (every contact without a mask), each contact's
+    world the allocator's of the carried step (``contact_world``)."""
+    c = wp.tid()
+    if world_mask:
+        w = world[c]
+        if w < 0 or w >= world_mask.shape[0] or not world_mask[w]:
+            return
+    carry.impulse[c] = 0.0
+
+
+@wp.kernel
+def reset_world_impulses(first: wp.array[int], world_mask: wp.array[wp.bool], impulses: wp.array2d[float]):
+    """Clear the selected worlds' lines of the row store, both classes' rows."""
     world = wp.tid()
     if world_mask and not world_mask[world]:
         return
     line = first[world]
     for row in range(impulses.shape[1]):
         impulses[line, row] = 0.0
-    for row in range(prev_impulses.shape[1]):
-        prev_impulses[line, row] = 0.0
-    for row in range(prev_row_type.shape[1]):
-        prev_row_type[line, row] = -1
 
 
 # =============================================================================
@@ -107,14 +153,10 @@ def gather_mf_warmstart(
     routes: ContactRoutes,
     mf: MfRows,
     match_index: wp.array[int],  # rigid_contact_match_index (sorted-current -> prev-sorted idx)
-    prev_slot_sorted: wp.array[int],  # prev-sorted contact idx -> prev base MF slot (or -1)
-    prev_mf_impulses: wp.array2d[float],
-    prev_mf_row_type: wp.array2d[int],
+    carry: ContactCarry,
     mf_constraint_count: wp.array[int],
-    previous_normal: wp.array[wp.vec3],
     decay: float,
     clock: wp.array[Clock],
-    mf_max_c: int,
     # in-out
     mf_impulses: wp.array2d[float],
 ):
@@ -129,9 +171,8 @@ def gather_mf_warmstart(
     The step clock's ratio (:func:`.factor.kernels.clock_dt_ratio`, dt_now / dt_prev) rescales carried impulses
     across step-size changes (impulse is proportional to dt for quasi-static loads); 1.0 at fixed dt.
 
-    ``match_index[c] >= 0`` is the previous frame's *sorted* contact index; ``prev_slot_sorted`` is keyed the same way
-    (see solver writeback), so ``prev_slot = prev_slot_sorted[match_index[c]]`` is the base slot that contact occupied
-    last step.
+    ``match_index[c] >= 0`` is the previous frame's *sorted* contact index, by which the carry is keyed
+    (:func:`carry_contacts`).
     """
     c = wp.tid()
     if c >= routes.count[0]:
@@ -144,40 +185,12 @@ def gather_mf_warmstart(
         return
     world = routes.world[c]
     # The free bodies' rows in the world's line: from ``mf.base``, the slots' and parents' row index.
-    capacity = mf.base + mf_max_c
-    prev_slot = prev_slot_sorted[mi]
-    if new_slot >= mf.base + mf_constraint_count[world] or prev_slot < 0 or prev_slot >= capacity:
+    if new_slot >= mf.base + mf_constraint_count[world]:
         return
     mf_line = mf.first[world]
-    if (
-        mf.row_type[mf_line, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT
-        and prev_mf_row_type[mf_line, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT
-    ):
-        impulse = decay * clock_dt_ratio(clock[0]) * prev_mf_impulses[mf_line, prev_slot]
-        mf_impulses[mf_line, new_slot] = carried_normal(impulse, routes.normal[c], previous_normal[mi])
-
-
-@wp.kernel
-def snapshot_contact_warmstart(
-    routes: ContactRoutes,
-    previous_dense_slot: wp.array[int],
-    previous_mf_slot: wp.array[int],
-    previous_normal: wp.array[wp.vec3],
-):
-    """Save all contact routes and live normals in one launch."""
-    contact = wp.tid()
-    active = contact < routes.count[0]
-    path = int(-1)
-    slot = int(-1)
-    if active:
-        path = routes.path[contact]
-        slot = routes.slot[contact]
-        previous_normal[contact] = routes.normal[contact]
-    # One thread per ready row; an empty table is a path the solver does not take.
-    if previous_dense_slot.shape[0] > 0:
-        previous_dense_slot[contact] = wp.where(path == 0, slot, -1)
-    if previous_mf_slot.shape[0] > 0:
-        previous_mf_slot[contact] = wp.where(path == 1, slot, -1)
+    if mf.row_type[mf_line, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT:
+        impulse = decay * clock_dt_ratio(clock[0]) * carry.impulse[mi]
+        mf_impulses[mf_line, new_slot] = carried_normal(impulse, routes.normal[c], carry.normal[mi])
 
 
 @wp.kernel
@@ -185,14 +198,10 @@ def gather_dense_warmstart(
     routes: ContactRoutes,
     rows: DenseRows,
     match_index: wp.array[int],  # rigid_contact_match_index (sorted-current -> prev-sorted idx)
-    prev_slot_sorted: wp.array[int],  # prev-sorted contact idx -> prev dense normal row (or -1)
-    prev_dense_impulses: wp.array2d[float],
-    prev_dense_row_type: wp.array2d[int],
+    carry: ContactCarry,
     world_constraint_count: wp.array[int],
-    previous_normal: wp.array[wp.vec3],
     decay: float,
     clock: wp.array[Clock],
-    max_constraints: int,
     # in-out
     world_impulses: wp.array2d[float],
 ):
@@ -214,13 +223,9 @@ def gather_dense_warmstart(
     if new_slot < 0 or mi < 0:
         return
     world = routes.world[c]
-    prev_slot = prev_slot_sorted[mi]
-    if new_slot >= world_constraint_count[world] or prev_slot < 0 or prev_slot >= max_constraints:
+    if new_slot >= world_constraint_count[world]:
         return
     line = rows.first[world]
-    if (
-        rows.row_type[line, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT
-        and prev_dense_row_type[line, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT
-    ):
-        impulse = decay * clock_dt_ratio(clock[0]) * prev_dense_impulses[line, prev_slot]
-        world_impulses[line, new_slot] = carried_normal(impulse, routes.normal[c], previous_normal[mi])
+    if rows.row_type[line, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT:
+        impulse = decay * clock_dt_ratio(clock[0]) * carry.impulse[mi]
+        world_impulses[line, new_slot] = carried_normal(impulse, routes.normal[c], carry.normal[mi])

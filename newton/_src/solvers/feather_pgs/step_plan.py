@@ -727,11 +727,8 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     def carry_patches(step):
         sweep.finish_patches(step.state_in, step.state_out, step.contacts, step.dt)
 
-    def carry_impulses(step):
-        sweep.carry_impulses(step.contacts)
-
-    def carry_contacts(step):
-        sweep.carry_contacts(step.contacts)
+    def carry(step):
+        sweep.carry(step.contacts)
 
     def watermarks(step):
         placement.record_watermarks(step.contacts)
@@ -743,12 +740,10 @@ def _stages(spec: StepSpec, solver) -> tuple[Stage, ...]:
     add(finish, nvtx="S7_Integrate")
     if spec.particles:
         add(integrate_particles)
-    # The carry: the patches' history, then under the warm start the impulses and the contacts' slot tables.
+    # The carry: the patches' history, then under the warm start the contacts' normals and normal impulses.
     add(carry_patches, nvtx="S7_Friction_Patch_Carry")
-    if solver.options.pgs_warmstart and placement.ws_prev_dense_impulses is not None:
-        add(carry_impulses, nvtx="S7_Warmstart_Carry")
-    if solver.options.pgs_warmstart:
-        add(carry_contacts)
+    if route.laws.warm_start:
+        add(carry, nvtx="S7_Warmstart_Carry")
     if "row_watermark" in diagnostics:
         add(watermarks, *((resolved_watermark,) if resolved is not None else ()))
     add(count, *boundary)

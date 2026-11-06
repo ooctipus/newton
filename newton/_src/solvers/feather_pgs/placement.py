@@ -31,13 +31,13 @@ from ...sim import Contacts
 from ...sim.contacts import contact_capacity_blocks
 from ...sim.enums import JointType
 from . import host_index, packed_rows, response_builds_rows
-from .field_group import Field, FieldGroup, SolverArrays
+from .field_group import Field, FieldGroup, SolverArrays, fields_of
 from .row_kernels import RIGID_SPEED_ROWS
 from .row_laws import LINK_ROWS
 from .row_metadata import _validate_mf_metadata_encoding
 from .row_records import DENSE_ROWS, MF_ROWS, RowSupport
 from .row_slots import place_world_contact_runs, record_world_contact_runs
-from .warm_start import prepare_world_impulses
+from .warm_start import ContactCarry, prepare_world_impulses
 
 ROW_SLOT_UNBOUNDED = 2**31 - 1
 """First rejected slot of a row family that rejected none this step."""
@@ -52,13 +52,6 @@ law) or a material contact's ``d / (d + eps)``."""
 
 DENSE_ROW_EPS = FieldGroup(Field("row_eps", wp.float32, ("world", "row"), owner="placement"))
 """Per-row compliance of material contact normals (``contact_compliance``); zero elsewhere."""
-
-DENSE_WARMSTART = FieldGroup(
-    Field("ws_prev_dense_impulses", wp.float32, ("world", "row"), owner="placement"),
-    Field("ws_prev_dense_row_type", wp.int32, ("world", "row"), fill=-1, owner="placement"),
-)
-"""Identity-matched warm-start carry of the row store: last step's converged impulses and their row types (its
-normals are what the next step gathers, :mod:`.warm_start`)."""
 
 FUSED_DIAGONAL_LIMITS = FieldGroup(
     Field("fused_diagonal_limit_active", wp.int32, ("world", "world_dof"), owner="placement"),
@@ -331,7 +324,7 @@ class Placement:
         # ``body_base``.
         worlds = np.arange(forest.world_count, dtype=np.int32)
         self.dense_first = wp.array(worlds, dtype=wp.int32, device=model.device)
-        # Launches over the contact capacity (the force export, the warm-start snapshot and gathers, the keyed-row key
+        # Launches over the contact capacity (the force export, the warm start's carry and gathers, the keyed-row key
         # scatters) grid-stride over about one wave of blocks.
         self.contact_capacity_blocks = contact_capacity_blocks(model.device)
         # A link's rows are the closure's: they come on top of the rows the option gives the world's contacts.
@@ -342,11 +335,6 @@ class Placement:
         # ``body_base``.
         self.body_base = self.dense_max_constraints
         self.row_pitch = self.dense_max_constraints + (self.mf_max_constraints if forest.has_free_rigid_bodies else 0)
-        # The carry's tables, allocated with their rows only when enabled.
-        self.ws_prev_dense_impulses = None
-        self.ws_prev_dense_row_type = None
-        self.ws_prev_dense_slot_sorted = None
-        self.ws_prev_slot_sorted = None
         # All inactive weight arguments alias this one element. Their producer kernels skip stores and their consumer
         # kernels skip reads when regularization is disabled.
         self.contact_row_w_dummy = self.arrays.placeholder(wp.float32, (1, 1), 1.0)
@@ -468,10 +456,9 @@ class Placement:
         ]
         # Row builders always receive a zero phi view when patch friction is off.
         contact_fields.append(ContactField("friction_patch_phi", wp.vec2))
+        # The warm start's carry by contact identity (:data:`.warm_start.ContactCarry`).
         if self.options.pgs_warmstart:
-            contact_fields.append(ContactField("ws_prev_contact_normal", wp.vec3))
-        else:
-            self.ws_prev_contact_normal = None
+            contact_fields += [ContactField(field.attr, field.dtype) for field in fields_of(ContactCarry)]
         self.contact_rows = self.contact_pool.rows(contact_fields, on_rows=self._on_contact_rows)
         # The friction patch state and the velocity-limit slots.
         self.laws.allocate(model, self.contact_pool, self.friction_patch_phi)
@@ -519,9 +506,6 @@ class Placement:
         if patches is not None:
             patches.view.phi = self.friction_patch_phi
 
-    def _publish_contact_rows(self, rows) -> None:
-        rows.publish(self)
-
     def follow_contacts(self, contacts: Contacts) -> None:
         """Hold at least ``contacts``' rigid rows, and grow with the pool of a pipeline's buffer from now on (staged where
         the model holds articulations, whose rows own a contact pool)."""
@@ -556,13 +540,6 @@ class Placement:
         world_dof = self.forest.max_world_dofs
         sizes = {"world": self.forest.world_count, "row": self.row_pitch, "world_dof": world_dof}
         arrays.allocate(DENSE_ROWS, **sizes)
-        # The row store's identity-matched warm-start carry, both classes' rows: the matched carry must never silently
-        # degrade to index reuse.
-        if self.options.pgs_warmstart:
-            arrays.allocate(DENSE_WARMSTART, **sizes)
-            self.ws_prev_dense_slot_rows = self.contact_pool.rows(
-                (ContactField("ws_prev_dense_slot_sorted", wp.int32, -1),), on_rows=self._publish_contact_rows
-            )
         fused = self.fused_diagonal_joint_limits
         arrays.allocate(FUSED_DIAGONAL_LIMITS, **(sizes if fused else {"world": 1, "world_dof": 1}))
         # Per-row weights exist only for a weighted row law (relative regularization or material contacts), and
@@ -633,23 +610,6 @@ class Placement:
                 else None
             )
             return
-
-        # The free bodies' warm-start slots, allocated ONLY when the feature is on so the default-off path has zero
-        # memory / CUDA-graph delta (their impulses and row types are the row store's carry):
-        # ``ws_prev_slot_sorted`` records, per *current sorted contact index*,
-        # the base MF slot that contact occupied last step. Because FeatherPGS
-        # consumes the already-sorted contact arrays, the contact array index is
-        # the sorted index, so next step's ``rigid_contact_match_index`` (which
-        # references the previous frame's *sorted* index) indexes directly into
-        # this table — no matcher permutation access required.
-        if self.options.pgs_warmstart:
-            pool = getattr(self, "contact_pool", None)
-            if pool is None:
-                self.ws_prev_slot_sorted = wp.full((1,), -1, dtype=wp.int32, device=model.device)
-            else:
-                self.ws_prev_slot_rows = pool.rows(
-                    (ContactField("ws_prev_slot_sorted", wp.int32, -1),), on_rows=self._publish_contact_rows
-                )
 
         if self.laws.has_rigid_body_velocity_limits and self.forest.free_rigid_body_count > 0:
             # Two speed rows per free rigid body: its linear and its angular speed.

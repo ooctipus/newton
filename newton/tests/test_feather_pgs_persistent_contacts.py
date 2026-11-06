@@ -36,6 +36,9 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
         solver.step(state, output, model.control(), contacts, 1.0 / 240.0)
+        # The carry is keyed by the stepped contacts, each in its allocator's world.
+        stepped = int(contacts.rigid_contact_count.numpy()[0])
+        carried_worlds = solver.placement.contact_world.numpy()[:stepped]
         mask = wp.array([False, False, False], dtype=wp.bool, device=model.device)
         solver_mask = mask[:2]
         # Compile both reset paths before capture.
@@ -49,11 +52,12 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
             values = np.zeros(3, dtype=bool)
             values[selected] = True
             mask.assign(values)
-            solver.placement.ws_prev_dense_impulses[:, solver.placement.body_base :].fill_(1.0)
+            solver.placement.carry_impulse.fill_(1.0)
             wp.capture_launch(capture.graph)
-            previous = solver.placement.ws_prev_dense_impulses.numpy()[:, solver.placement.body_base :]
-            self.assertTrue(np.all(previous[selected] == 0.0))
-            self.assertTrue(np.all(previous[1 - selected] == 1.0))
+            previous = solver.placement.carry_impulse.numpy()[:stepped]
+            self.assertTrue(np.any(carried_worlds == selected) and np.any(carried_worlds == 1 - selected))
+            self.assertTrue(np.all(previous[carried_worlds == selected] == 0.0))
+            self.assertTrue(np.all(previous[carried_worlds == 1 - selected] == 1.0))
             count = int(contacts.rigid_contact_count.numpy()[0])
             shape0 = contacts.rigid_contact_shape0.numpy()[:count]
             shape1 = contacts.rigid_contact_shape1.numpy()[:count]
@@ -64,8 +68,8 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
             self.assertTrue(np.all(matches[worlds == 1 - selected] >= 0))
 
     def _carry_contact(self, *, rotated=False, device="cpu"):
-        """Step a resting box contact once, give its rows a carried normal and tangent pair, turn its normal, and step
-        it again without a sweep: the rows hold what the warm start seeded."""
+        """Step a resting box contact once, give it a carried normal impulse, turn its normal, and step it again
+        without a sweep: the rows hold what the warm start seeded."""
         builder = newton.ModelBuilder(up_axis=newton.Axis.X, gravity=wp.vec3(0.0))
         builder.add_ground_plane()
         body = builder.add_body(xform=wp.transform(wp.vec3(0.1, 0.0, 0.0), wp.quat_identity()))
@@ -91,9 +95,7 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
         slot = int(solver.placement.contact_slot.numpy()[0])
         self.assertGreaterEqual(slot, 0)
-        previous = solver.placement.ws_prev_dense_impulses.numpy()
-        previous[0, slot : slot + 3] = (1.0, 0.5, 0.25)
-        solver.placement.ws_prev_dense_impulses.assign(previous)
+        solver.placement.carry_impulse[:1].fill_(1.0)
         normals[0] = new_normal
         contacts.rigid_contact_normal.assign(normals)
         contacts.rigid_contact_match_index.fill_(-1)
@@ -106,7 +108,7 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
 
     def test_carried_contact_seeds_only_its_normal(self):
         """A matched contact starts from its carried normal impulse, across a basis seam and a 30-degree turn of its
-        normal; its friction pair starts cold, whatever the cache held: the anchor's displacement is the friction's
+        normal; its friction pair starts cold (the carry holds none): the anchor's displacement is the friction's
         history."""
         devices = ["cpu", wp.get_cuda_device()] if wp.is_cuda_available() else ["cpu"]
         for device in devices:

@@ -15,7 +15,7 @@ from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONT
 from newton._src.solvers.feather_pgs.row_records import MfRows
 from newton._src.solvers.feather_pgs.warm_start import gather_mf_warmstart
 from newton.tests.feather_pgs_law_harness import row_lines
-from newton.tests.test_feather_pgs_warmstart import step_clock
+from newton.tests.test_feather_pgs_warmstart import carry_of, step_clock
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices
 
 
@@ -88,14 +88,10 @@ def test_warm_carry_kernel_scales_rows_exactly(test: unittest.TestCase, device):
                     first=row_lines(device),
                 ),
                 wp.array([0], dtype=wp.int32),  # current -> previous contact
-                wp.array([4], dtype=wp.int32),  # previous base slot
-                wp.array(prev_impulses, dtype=wp.float32),
-                wp.array(prev_types, dtype=wp.int32),
+                carry_of(prev_impulses[0], prev_types[0], [4], device),  # the previous contact's rows from slot 4
                 wp.array([5], dtype=wp.int32),
-                wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3),
                 0.75,
                 step_clock(4.0, device),
-                max_c,
             ],
             outputs=[impulses],
             device=device,

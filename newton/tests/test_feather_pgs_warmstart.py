@@ -17,6 +17,8 @@ from newton._src.solvers.feather_pgs.factor.kernels import Clock
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 from newton._src.solvers.feather_pgs.row_records import DenseRows, MfRows
 from newton._src.solvers.feather_pgs.warm_start import (
+    ContactCarry,
+    carry_contacts,
     gather_dense_warmstart,
     gather_mf_warmstart,
     prepare_world_impulses,
@@ -96,6 +98,37 @@ def _run_press(
     return impulse_sums, speeds, state_0
 
 
+def carry_of(prev_impulses, prev_types, prev_slots, device="cpu", normal=(0.0, 0.0, 1.0)):
+    """The carry a step leaves (:func:`carry_contacts`): its contacts at ``prev_slots`` of world 0's line, whose rows
+    held ``prev_impulses`` of kinds ``prev_types``; every contact's normal ``normal``."""
+    n, rows = len(prev_slots), len(prev_types)
+    carry = field_group.upload(
+        ContactCarry,
+        device,
+        normal=wp.zeros(n, dtype=wp.vec3, device=device),
+        impulse=wp.zeros(n, dtype=wp.float32, device=device),
+    )
+    wp.launch(
+        carry_contacts,
+        dim=n,
+        inputs=[
+            field_group.upload(
+                ContactRoutes,
+                device,
+                count=[n],
+                slot=prev_slots,
+                world=[0] * n,
+                normal=wp.array([normal] * n, dtype=wp.vec3, device=device),
+            ),
+            row_lines(device),
+            wp.array([prev_types], dtype=wp.int32, device=device),
+        ],
+        outputs=[wp.array([prev_impulses], dtype=wp.float32, device=device).reshape((1, rows)), carry],
+        device=device,
+    )
+    return carry
+
+
 def _gather_dense_rows(
     *,
     prev_impulses,
@@ -135,14 +168,10 @@ def _gather_dense_rows(
                 first=row_lines("cpu"),
             ),
             wp.array(match_indices, dtype=wp.int32, device="cpu"),
-            wp.array(prev_slots, dtype=wp.int32, device="cpu"),
-            wp.array([prev_impulses], dtype=wp.float32, device="cpu"),
-            wp.array([prev_types], dtype=wp.int32, device="cpu"),
+            carry_of(prev_impulses, prev_types, prev_slots),
             wp.array([count], dtype=wp.int32, device="cpu"),
-            wp.array([[0.0, 0.0, 1.0]] * n, dtype=wp.vec3, device="cpu"),
             decay,
             step_clock(dt_scale, "cpu"),
-            max_c,
         ],
         outputs=[impulses],
         device="cpu",
@@ -234,15 +263,12 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
     def test_mf_gather_carries_only_normals(self):
         """The matrix-free mirror: the normals carry, and A's old tangent never reaches B's new span."""
         c, f, dead = PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, -1
-        prev_impulses = wp.array([[11.0, 22.0, 33.0, 55.0]], dtype=wp.float32, device="cpu")
-        prev_types = wp.array([[c, f, f, c]], dtype=wp.int32, device="cpu")
         current_types = wp.array([[c, c, f, f]], dtype=wp.int32, device="cpu")
         current_parents = wp.array([[dead, dead, 1, 1]], dtype=wp.int32, device="cpu")
         contact_count = wp.array([2], dtype=wp.int32, device="cpu")
         contact_slots = wp.array([0, 1], dtype=wp.int32, device="cpu")
         contact_world = wp.array([0, 0], dtype=wp.int32, device="cpu")
         match_indices = wp.array([0, 1], dtype=wp.int32, device="cpu")
-        prev_slots = wp.array([0, 3], dtype=wp.int32, device="cpu")
         constraint_count = wp.array([4], dtype=wp.int32, device="cpu")
 
         mf_impulses = wp.zeros((1, 4), dtype=wp.float32, device="cpu")
@@ -268,14 +294,10 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
                     first=row_lines("cpu"),
                 ),
                 match_indices,
-                prev_slots,
-                prev_impulses,
-                prev_types,
+                carry_of([11.0, 22.0, 33.0, 55.0], [c, f, f, c], [0, 3]),
                 constraint_count,
-                wp.array([[0.0, 0.0, 1.0]] * 2, dtype=wp.vec3, device="cpu"),
                 1.0,
                 step_clock(1.0, "cpu"),
-                4,
             ],
             outputs=[mf_impulses],
             device="cpu",
@@ -348,8 +370,8 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         pipeline.collide(state_0, contacts)
         self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 1)
         solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
-        old_slot = int(solver.placement.ws_prev_slot_sorted.numpy()[0])
-        old_impulse = float(solver.placement.ws_prev_dense_impulses.numpy()[0, old_slot])
+        old_slot = int(solver.placement.contact_slot.numpy()[0])
+        old_impulse = float(solver.placement.carry_impulse.numpy()[0])
         self.assertGreater(old_impulse, 0.0)
 
         # Bring the lower shape-id sphere into contact. Sorting inserts it

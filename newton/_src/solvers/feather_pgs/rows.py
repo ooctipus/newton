@@ -64,7 +64,7 @@ from .row_records import UNIT_LIMIT, UNIT_MIMIC, UNIT_SHIFT, UNIT_VELOCITY, RowS
 from .row_records import bind as bind_dense_rows
 from .row_records import bind_mf as bind_mf_rows
 from .row_slots import allocate_world_contact_slots, finalize_constraint_counts_with_status, snapshot_dense_phase_bound
-from .warm_start import gather_mf_warmstart
+from .warm_start import bind_carry, gather_mf_warmstart
 
 VELOCITY_LIMIT_SLOTS = FieldGroup(
     Field("velocity_limit_slot", wp.int32, ("limit_row",), fill=-1, owner="laws"),
@@ -944,8 +944,8 @@ class RowLaws:
         self._finalize(solver, 1)
 
         # The warm start's seed: the matched contacts' previous normal impulses gathered into their current slots by
-        # identity (the impulses were zeroed for the step; the carry is the row store's, ws_prev_dense_*, whose rows
-        # the free bodies' slots index). It reads this step's contact slots and the rows' types the writer wrote.
+        # identity (the impulses were zeroed for the step; the carry is the contacts', :data:`.warm_start.ContactCarry`).
+        # It reads this step's contact slots and the rows' types the writer wrote.
         if contact_rows and solver.options.pgs_warmstart:
             match_index = getattr(contacts, "rigid_contact_match_index", None)
             if match_index is None:
@@ -962,15 +962,11 @@ class RowLaws:
                     bind_contact_routes(placement, contacts),
                     bind_mf_rows(placement),
                     match_index,
-                    placement.ws_prev_slot_sorted,
-                    placement.ws_prev_dense_impulses,
-                    placement.ws_prev_dense_row_type,
+                    bind_carry(placement),
                     placement.mf_constraint_count,
-                    placement.ws_prev_contact_normal,
                     solver.options.pgs_warmstart_decay,
                     # Carried support impulses are proportional to dt: the step clock rescales them.
                     solver.factor.clock,
-                    placement.mf_max_constraints,
                 ],
                 outputs=[placement.impulses],
                 extent=contacts.rigid_contact_count,

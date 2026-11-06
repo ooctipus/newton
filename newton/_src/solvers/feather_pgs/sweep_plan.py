@@ -62,7 +62,13 @@ from .sweep_routes_sparse import _SPARSE_LOCAL_WORKSPACE_BYTES
 from .sweep_routes_tiers import classify_parallel_sweep_tiers
 from .tree_plan import TreePlan, local_parents
 from .tree_scan import classes_half
-from .warm_start import gather_dense_warmstart, reset_world_warmstart_buffers, snapshot_contact_warmstart
+from .warm_start import (
+    bind_carry,
+    carry_contacts,
+    forget_carried_contacts,
+    gather_dense_warmstart,
+    reset_world_impulses,
+)
 
 SPARSE_ROWS = FieldGroup(
     Field("sparse_row_dof", wp.int32, ("index_world", "index_row", "index_support"), fill=None, owner="placement"),
@@ -1195,7 +1201,7 @@ class Sweep:
 
     def warm_start(self, contacts, dt: float) -> None:
         """Gather the dense rows' normal impulses of the previous step by contact identity (:mod:`.warm_start`)."""
-        if self.options.pgs_warmstart and self.placement.ws_prev_dense_impulses is not None and contacts is not None:
+        if self.options.pgs_warmstart and contacts is not None:
             match_index = contacts.rigid_contact_match_index
             pool = self.placement.contact_pool
             pool.launch(
@@ -1205,14 +1211,10 @@ class Sweep:
                     bind_contact_routes(self.placement, contacts),
                     bind_dense_rows(self.placement),
                     match_index,
-                    self.placement.ws_prev_dense_slot_sorted,
-                    self.placement.ws_prev_dense_impulses,
-                    self.placement.ws_prev_dense_row_type,
+                    bind_carry(self.placement),
                     self.placement.constraint_count,
-                    self.placement.ws_prev_contact_normal,
                     self.options.pgs_warmstart_decay,
                     self.factor.clock,
-                    self.placement.dense_max_constraints,
                 ],
                 outputs=[self.placement.impulses],
                 extent=contacts.rigid_contact_count,
@@ -1512,50 +1514,49 @@ class Sweep:
                 self.placement.dense_first,
             )
 
-    def carry_impulses(self, contacts) -> None:
-        """Store the row store's impulses and row kinds, both classes' rows, which the next step's warm start reads."""
-        wp.copy(self.placement.ws_prev_dense_impulses, self.placement.impulses)
-        wp.copy(self.placement.ws_prev_dense_row_type, self.placement.row_type)
+    def carry(self, contacts) -> None:
+        """Write the warm start's carry, one record by contact identity which the next step's gather reads: each
+        contact's normal and its normal row's impulse (:func:`.warm_start.carry_contacts`), over every row the contact
+        stream ever used. Without contacts the record carries nothing."""
+        placement = self.placement
+        carry = bind_carry(placement)
+        pool = placement.contact_pool
         if contacts is None:
-            self.placement.ws_prev_dense_row_type.fill_(-1)
-
-    def carry_contacts(self, contacts) -> None:
-        """Store each contact row's slot tables by contact identity, which the next step's warm start reads."""
-        if contacts is not None:
-            # One thread per row the contact stream ever used: the slot tables of every such row are rewritten.
-            pool = self.placement.contact_pool
-            used = pool.rows_used if contacts._rigid_contact_pool is pool else None
-            pool.launch(
-                snapshot_contact_warmstart,
-                pool.launch_rows(),
-                inputs=[bind_contact_routes(self.placement, contacts)],
-                outputs=[
-                    self.placement.ws_prev_dense_slot_sorted,
-                    self.placement.ws_prev_slot_sorted,
-                    self.placement.ws_prev_contact_normal,
-                ],
-                extent=pool.ready_rows if used is None else used,
-                max_blocks=self.placement.contact_capacity_blocks,
-            )
+            # A memset of today's rows: a capture of it is recaptured after growth.
+            pool.note_unbound()
+            carry.impulse.zero_()
+            return
+        used = pool.rows_used if contacts._rigid_contact_pool is pool else None
+        pool.launch(
+            carry_contacts,
+            pool.launch_rows(),
+            inputs=[bind_contact_routes(placement, contacts), placement.dense_first, placement.row_type],
+            outputs=[placement.impulses, carry],
+            extent=pool.ready_rows if used is None else used,
+            max_blocks=placement.contact_capacity_blocks,
+        )
 
     def clear_history(self, world_mask: wp.array | None) -> None:
-        """Discard solver impulses independently of latched capacity status."""
+        """Discard the masked worlds' impulses and their contacts' carry (every world's without a mask), independently
+        of latched capacity status."""
         if self.forest.world_count == 0 or not self.options.pgs_warmstart:
             return
-        # ws_prev_slot_sorted is intentionally NOT cleared here: the warm start's gathers only seed impulses from
-        # previous slots whose carried row type marks a contact row, so the row_type = -1 sentinel written below
-        # (together with the zeroed impulses) neutralizes any stale previous-slot mapping for reset worlds.
+        placement = self.placement
         wp.launch(
-            reset_world_warmstart_buffers,
+            reset_world_impulses,
             dim=self.forest.world_count,
-            inputs=[
-                self.placement.dense_first,
-                world_mask,
-                self.placement.impulses,
-                self.placement.ws_prev_dense_impulses,
-                self.placement.ws_prev_dense_row_type,
-            ],
+            inputs=[placement.dense_first, world_mask],
+            outputs=[placement.impulses],
             device=self.model.device,
+        )
+        # Each contact's world is the allocator's of the carried step until the next step allocates.
+        pool = placement.contact_pool
+        pool.launch(
+            forget_carried_contacts,
+            pool.launch_rows(),
+            inputs=[placement.contact_world, world_mask],
+            outputs=[bind_carry(placement)],
+            extent=pool.ready_rows,
         )
 
     def forces(self, contacts) -> None:

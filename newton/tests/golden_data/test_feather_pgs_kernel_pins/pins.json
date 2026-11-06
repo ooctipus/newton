@@ -413,11 +413,12 @@
   "walk_rows.walked_rows_kernel(8, True, True, (((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11)), ((-1,), (0, 6))))": "1c5aa22166044933fa2286b1bb178f77b5f5beb2f4ae016a46a50df7a0cd00e9",
   "walk_rows.walked_rows_kernel(8, True, True, (((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11)), ((-1,), (0, 6))), 1)": "7e2df2287b926713392696b668e8ff4e07dd4cc7ecf73c072a02781fee805a3c",
   "walk_rows.write_free_body_rows": "7469f16ee56a38343717ffff7bb0c8a55661d7e6db16197f98f72973fe7c1e30",
-  "warm_start.gather_dense_warmstart": "f4b8d19c488e7bb567f2ecc2f806582b8b7498705c40c0d6af4d6a0e22ee2123",
-  "warm_start.gather_mf_warmstart": "c6f29c07588c7d9777941e00df3dc0d92ab183bc3612b2e5aaafe9da30ec5ead",
+  "warm_start.carry_contacts": "1e3d20933ad35e6cea95e919c9b15ce7205cc9dba2e11c732becc84a62188e79",
+  "warm_start.forget_carried_contacts": "aca3e2aa48e35b6b5d4b1bfa00a374383fe8466ee1157669f2f7e478324cba20",
+  "warm_start.gather_dense_warmstart": "9beb37d0405d31220023f4a7bf3976cf76f6d1384493e88ae0771aa8923b18a8",
+  "warm_start.gather_mf_warmstart": "8649989efd880a70a3e79e77996dc7c976b04999157fe0b300ab423f8eb861d3",
   "warm_start.prepare_world_impulses": "ef95f5e2e4ffaa5e28b1cf712eecd97c6294c59ed9fa8a7bb66e77561996a381",
-  "warm_start.reset_world_warmstart_buffers": "1e6ce57df65c0f10ec203f48111034be0d5c02b70ace080007cf01c87d80357e",
-  "warm_start.snapshot_contact_warmstart": "777f64a58583f892801e8f8e850eca8553e57f8d1aa7d47dae4a1b15c73803cc"
+  "warm_start.reset_world_impulses": "eaff9d7e371f52a8e01e264aac4b43427fb7b35d5681420bc0ae82cb50466b3e"
  },
  "warp": "1.17.0"
 }
