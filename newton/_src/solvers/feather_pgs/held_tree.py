@@ -523,7 +523,7 @@ class HeldTree:
         """The held groups of dense or compact coordinates: one per world (a forest) where the default or a test pin
         chooses it and the layout admits it, else one per size group's topology beside the prescribed and rest
         groups; ``forest_reason`` names the choice."""
-        override = solver._route_pins.get("grouping")
+        override = solver.spec.pins.grouping
         forest = override == "forest" if override is not None else forest_default(solver)
         if forest and forest_supported(solver):
             self.forest_reason = (

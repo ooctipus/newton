@@ -13,7 +13,6 @@ changes ordinary dynamics rejects raise its error before anything changes.
 
 import unittest
 from types import SimpleNamespace
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -387,16 +386,12 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
         """Both group forms of a world with a prescribed root keep the owner while its probe toggles."""
         wrench = np.array([2.0, 0.0, 0.0, 0.0, 0.0, 0.5], np.float32)
         for forest in ("1", "0"):
-            with (
-                self.subTest(forest=forest),
-                mock.patch.object(
-                    SolverFeatherPGS, "_route_pins", {"grouping": "forest" if forest == "1" else "per_size"}
-                ),
-            ):
+            pins = SolverFeatherPGS.Pins(grouping="forest" if forest == "1" else "per_size")
+            with self.subTest(forest=forest):
                 runs = {}
                 for cached in ("off", "auto"):
                     model, box, probe = _pair_scene()
-                    solver = _solver(model, cached)
+                    solver = _solver(model, cached, pins=pins)
                     self.assertTrue(solver.forest.has_prescribed_response)
                     if cached == "auto":
                         groups = solver.factor.held.groups

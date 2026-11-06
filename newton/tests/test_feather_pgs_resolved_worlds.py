@@ -376,7 +376,7 @@ class TestResolvedWorlds(unittest.TestCase):
         """Keep unsupported solvers disabled without raising or launching."""
         solver = SimpleNamespace(
             model=SimpleNamespace(device=wp.get_device("cpu")),
-            _route_pins={},
+            spec=SimpleNamespace(pins=SolverFeatherPGS.Pins()),
             placement=SimpleNamespace(keyed_rows=None),
             laws=SimpleNamespace(set=plain_laws(warm_start=True)),
         )
@@ -511,7 +511,7 @@ def _admissible_solver():
         placement=SimpleNamespace(keyed_rows=None),
         classes=SimpleNamespace(case="K6"),
         model=SimpleNamespace(device=SimpleNamespace(is_cuda=False)),
-        _route_pins={},
+        spec=SimpleNamespace(pins=SolverFeatherPGS.Pins()),
         forest=SimpleNamespace(
             max_world_dofs=29,
             world_dof_indices=1,
@@ -547,15 +547,15 @@ def _rollout(
     pins = {"storage": "dense", "predicted_twists": bool(published), "tiers": 0}
     if not classifier:
         pins["claims"] = ()
-    with patch.object(SolverFeatherPGS, "_route_pins", pins):
-        solver = SolverFeatherPGS(
-            model,
-            pgs_iterations=8,
-            enable_joint_limits=True,
-            update_mass_matrix_interval=2,
-            friction_anchor_beta=friction_anchor_beta,
-            **(solver_kwargs or {}),
-        )
+    solver = SolverFeatherPGS(
+        model,
+        pins=SolverFeatherPGS.Pins(**pins),
+        pgs_iterations=8,
+        enable_joint_limits=True,
+        update_mass_matrix_interval=2,
+        friction_anchor_beta=friction_anchor_beta,
+        **(solver_kwargs or {}),
+    )
     pipeline = newton.CollisionPipeline(model, deterministic=True)
     contacts = pipeline.contacts()
     states = [model.state() for _ in range(2)]

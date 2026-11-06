@@ -1087,10 +1087,14 @@ class TestPatchSolverRoutes(unittest.TestCase):
             with self.subTest(device=device, warmstart=warmstart):
                 model = _arm_over_box(wp.get_device(device), worlds=2)
                 # The routes hold rows on the complete path: the box's speculative contacts separate at first.
-                with mock.patch.object(newton.solvers.SolverFeatherPGS, "_route_pins", {"claims": ()}):
-                    solver = newton.solvers.SolverFeatherPGS(
-                        model, pgs_iterations=4, pgs_warmstart=warmstart, pgs_warmstart_decay=0.8, **mode
-                    )
+                solver = newton.solvers.SolverFeatherPGS(
+                    model,
+                    pgs_iterations=4,
+                    pgs_warmstart=warmstart,
+                    pgs_warmstart_decay=0.8,
+                    pins=newton.solvers.SolverFeatherPGS.Pins(claims=()),
+                    **mode,
+                )
                 self.assertGreater(solver.laws.friction_anchor_beta, 0.0)
                 arrays = (
                     (solver.placement.row_parent, solver.placement.row_mu, solver.placement.impulses),

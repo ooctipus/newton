@@ -6,7 +6,6 @@ the paired solvers and their stepping, shared by the sparse-route tests; and the
 (:class:`ForestProbe`, :func:`eligible_inputs`), which stop it where topology planning starts."""
 
 from types import SimpleNamespace
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -95,8 +94,8 @@ def make_solver(model, enabled, pins=None, **overrides):
         "update_mass_matrix_interval": 2,
     }
     options.update(overrides)
-    with mock.patch.dict(SolverFeatherPGS._route_pins, {**({} if enabled else {"storage": "dense"}), **(pins or {})}):
-        return SolverFeatherPGS(model, **options)
+    pins = {**({} if enabled else {"storage": "dense"}), **(pins or {})}
+    return SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(**pins), **options)
 
 
 def make_case(enabled, *, options=None, pins=None, contact_matching=None, deterministic=False, standing=False, **shape):
@@ -149,7 +148,7 @@ def eligible_inputs():
     )
     return SimpleNamespace(
         model=SimpleNamespace(device=SimpleNamespace(is_cuda=True)),
-        pins={},
+        pins=SolverFeatherPGS.Pins(),
         factor=SimpleNamespace(parallel_drives=True, eliminates=False),
         dense_rows=32,
         forest=forest,

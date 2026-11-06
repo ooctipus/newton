@@ -277,8 +277,8 @@ def recipe_solver(model, *, scalar, pins=None, **options):
         "mf_max_constraints": 64,
         **options,
     }
-    with mock.patch.dict(SolverFeatherPGS._route_pins, {**({} if scalar else {"star": "held"}), **(pins or {})}):
-        return SolverFeatherPGS(model, **arguments)
+    pins = {**({} if scalar else {"star": "held"}), **(pins or {})}
+    return SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(**pins), **arguments)
 
 
 def dense_head(model, *, rows=64, **options):

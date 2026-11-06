@@ -19,8 +19,7 @@ DENSE_PINS = {"storage": "dense"}
 
 
 def _dense_solver(model, **options):
-    with mock.patch.dict(SolverFeatherPGS._route_pins, DENSE_PINS):
-        return SolverFeatherPGS(model, **options)
+    return SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(**DENSE_PINS), **options)
 
 
 # Per-articulation initial pose/velocity: [base, left branch, right branch].

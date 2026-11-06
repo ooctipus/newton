@@ -1495,6 +1495,7 @@ class ManufacturedScene:
         options = {**conformance.BASE_OPTIONS, **scene.solver_options, **route.options}
         options.update(
             {
+                "pins": route.solver_pins(),
                 "contact_torsion": spin,
                 "pgs_iterations": sweeps,
                 "diagnostics": SolverFeatherPGS.Diagnostics(audit=True),

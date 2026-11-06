@@ -16,7 +16,6 @@
 import copy
 import functools
 import sys
-from typing import ClassVar
 
 import numpy as np
 import warp as wp
@@ -50,7 +49,7 @@ from .path_selection import (
 from .placement import Placement
 from .route_table import RouteRow
 from .rows import RowLaws
-from .step_plan import Step, StepPlan, StepSpec
+from .step_plan import Pins, Step, StepPlan, StepSpec
 from .sweep_plan import Sweep
 from .tree_factor import TreeFactor
 
@@ -169,20 +168,8 @@ class SolverFeatherPGS(SolverBase):
     that grows with the body's distance from the world origin.
     """
 
-    # Test-only route pins: an axis value a test fixes where the rules would choose another, so that every route the
-    # data can select runs on the test scenes. No option or environment variable sets one; the route record lists them
-    # (routes.pins). Keys:
-    #   storage "dense": no packed (native sparse) factor.
-    #   grouping "forest" or "per_size": the held families.   star "held": a star's diagonal family in the held tree.
-    #   producer "walk": no keyed rows.
-    #   claims: the runtime claims kept, of ("resolved_worlds",).
-    #   active_rows False: full-order sparse sweeps.           contact_units None: unfused sparse contact triplets.
-    #   transaction "single" or "staged": fused triplets'.     mf_storage "streamed": streamed matrix-free impulses.
-    #   predicted_twists False: the held tree's predictor without the twists' publication.
-    #   row_support False: sparse rows on explicit indices.     placement "general": case K6 (class_plan.general_reason).
-    #   tiers: the Jacobi tiers' row bound, on any class whose response they form (0: no tiers).
-    #   tier_sweeps: every Jacobi tier's sweep budget, in place of the equal-accuracy rule.
-    _route_pins: ClassVar[dict[str, object]] = {}
+    Pins = Pins
+    """The test-only route pins a test passes as ``pins`` (:class:`.step_plan.Pins`)."""
 
     @classmethod
     def register_custom_attributes(cls, builder: ModelBuilder) -> None:
@@ -267,6 +254,7 @@ class SolverFeatherPGS(SolverBase):
         contact_torsion: bool = False,
         contact_compliance: bool = False,
         diagnostics: Diagnostics | None = None,
+        pins: Pins | None = None,
     ):
         """Create the solver for ``model``.
 
@@ -451,6 +439,8 @@ class SolverFeatherPGS(SolverBase):
                 snapshots, row watermarks, the overflow warning, the sweep readout, the audit and synchronized
                 timings. None changes a computed value. ``None`` takes the defaults (only the
                 overflow warning on).
+            pins: Test-only route pins (:class:`Pins`): axis values a test fixes where the rules would choose
+                others. ``None`` (production) fixes none.
 
         Raises:
             ValueError: For a model that records gradients (``requires_grad``): FeatherPGS has no gradients.
@@ -461,8 +451,6 @@ class SolverFeatherPGS(SolverBase):
         requested_options = dict(locals())
         # Read the FEATHER_PGS_* environment once; undeclared names are recorded, not rejected.
         self._environment_record = _environment_flags.record()
-        # The test pins in force at construction, which every admission reads and the route record lists.
-        self._route_pins = dict(type(self)._route_pins)
         # The solver's own model, a pure forest (:mod:`.body_cut`): everything below reads it.
         self.cut = BodyCut.of(model)
         model = self.cut.model
@@ -495,7 +483,9 @@ class SolverFeatherPGS(SolverBase):
         laws = self.laws.set
         # The step's spec: every unknown that decides its path, gathered before any owner of the step, which each
         # owner below reads.
-        self.spec = StepSpec.build(model, options, self.cut, self.forest, laws, self.laws.link_rows_per_world)
+        self.spec = StepSpec.build(
+            model, options, self.cut, self.forest, laws, self.laws.link_rows_per_world, Pins() if pins is None else pins
+        )
         # The placement: where the rows live, their capacities and status.
         self.placement = Placement(self.spec, model, options, self.laws, self.factor)
         # The passive joint forces and the per-coordinate drive rows the held tree's admission reads.
@@ -518,12 +508,12 @@ class SolverFeatherPGS(SolverBase):
                 forest=self.forest,
                 laws=self.laws,
                 factor=self.factor,
-                pins=self._route_pins,
+                pins=self.spec.pins,
                 dense_rows=self.spec.capacities.dense_rows,
                 diagonal_decline=diagonal_decline,
                 packed_decline=functools.partial(held_tree.sparse_decline, self),
             ),
-            general=general_reason(self._route_pins, native=model.device.is_cuda, eliminates=self.factor.eliminates),
+            general=general_reason(self.spec.pins, native=model.device.is_cuda, eliminates=self.factor.eliminates),
         )
         case = self.classes.case
         # The sweep: its owners build the class's case.
@@ -535,7 +525,7 @@ class SolverFeatherPGS(SolverBase):
             self.placement,
             self.factor,
             self.classes,
-            self._route_pins,
+            self.spec.pins,
         )
         self.sweep.place_diagonal(self.classes.diagonal)
         self.placement.dense_internal_max_rows = self.placement.internal_rows_per_world(model)
@@ -562,7 +552,7 @@ class SolverFeatherPGS(SolverBase):
         # The producer of the tiers' rows (case K4), admitted by its own fit: keyed rows (keyed_rows.create_owner),
         # which write the point and the patch row law.
         self.placement.keyed_rows = None
-        if self._route_pins.get("producer") not in (None, "keyed_rows"):
+        if self.spec.pins.producer not in (None, "keyed_rows"):
             self.placement.keyed_rows_reason = "A test pin selects another contact-row producer."
         else:
             from .keyed_rows import create_owner as create_kinetic_rows_owner  # noqa: PLC0415

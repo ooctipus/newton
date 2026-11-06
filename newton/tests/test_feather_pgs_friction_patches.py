@@ -1189,15 +1189,15 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 released.append((kwargs["inputs"][2].numpy().copy(), kwargs["inputs"][3].numpy().copy()))
             return launch(kernel, *args, **kwargs)
 
-        with mock.patch.dict(newton.solvers.SolverFeatherPGS._route_pins, {"storage": "dense"}):
-            solver = newton.solvers.SolverFeatherPGS(
-                model,
-                pgs_iterations=8,
-                enable_joint_limits=True,
-                update_mass_matrix_interval=2,
-                dense_max_constraints=256,
-                friction_anchor_beta=0.2,
-            )
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            pins=newton.solvers.SolverFeatherPGS.Pins(storage="dense"),
+            pgs_iterations=8,
+            enable_joint_limits=True,
+            update_mass_matrix_interval=2,
+            dense_max_constraints=256,
+            friction_anchor_beta=0.2,
+        )
         self.assertEqual(solver.get_path_selection()["publication"], "cached")
         # Sorted contacts: the narrow phase's output order no longer depends on thread scheduling.
         pipeline = newton.CollisionPipeline(model, deterministic=True)

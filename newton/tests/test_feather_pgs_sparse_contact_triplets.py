@@ -447,10 +447,10 @@ class TestSparseContactTriplets(unittest.TestCase):
             with (
                 self.subTest(capacity=capacity, pins=pins),
                 mock.patch.dict(os.environ, {}, clear=True),
-                mock.patch.dict(SolverFeatherPGS._route_pins, pins),
             ):
                 solver = SolverFeatherPGS(
                     model,
+                    pins=SolverFeatherPGS.Pins(**pins),
                     enable_joint_velocity_limits=False,
                     pgs_warmstart=False,
                     dense_max_constraints=capacity,
@@ -682,7 +682,7 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         for changes, active, table, lanes, fits, admitted, phrase in cases:
             with self.subTest(changes=changes, active=active, table=table, lanes=lanes, fits=fits):
                 decision, reason = class_plan.contact_triplets_rule(
-                    changes.get("pins", {}),
+                    SolverFeatherPGS.Pins(**changes.get("pins", {})),
                     active_rows=active,
                     use_support_table=table,
                     lanes=lanes,
@@ -741,10 +741,10 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
             with (
                 self.subTest(pins=pins),
                 mock.patch.dict(os.environ, {}, clear=True),
-                mock.patch.dict(SolverFeatherPGS._route_pins, pins),
             ):
                 solver = SolverFeatherPGS(
                     model,
+                    pins=SolverFeatherPGS.Pins(**pins),
                     enable_joint_velocity_limits=False,
                     pgs_warmstart=False,
                     dense_max_constraints=192,

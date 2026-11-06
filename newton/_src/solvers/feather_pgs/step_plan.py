@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from types import MappingProxyType
 from typing import NamedTuple
 
@@ -37,6 +37,7 @@ from .walk_rows import WRITE_REST, WRITE_TOPOLOGY
 
 __all__ = [
     "Capacities",
+    "Pins",
     "Route",
     "SolveRoute",
     "Stage",
@@ -119,6 +120,48 @@ class Capacities:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class Pins:
+    """Test-only route pins: an axis value a test fixes where the rules would choose another, so that every route the
+    data can select runs on the test scenes. Only a test passes them (``SolverFeatherPGS(..., pins=...)``); the spec
+    holds them and the route record lists those in force (``routes.spec.pins``)."""
+
+    storage: str | None = None
+    """``"dense"``: no packed (native sparse) factor."""
+    grouping: str | None = None
+    """``"forest"`` or ``"per_size"``: the held families."""
+    star: str | None = None
+    """``"held"``: a star's diagonal family in the held tree."""
+    producer: str | None = None
+    """``"walk"``: no keyed rows."""
+    claims: tuple[str, ...] = ("resolved_worlds",)
+    """The runtime claims kept, of ``("resolved_worlds",)``."""
+    active_rows: bool = True
+    """``False``: full-order sparse sweeps."""
+    contact_units: str | None = "triplets"
+    """``None``: unfused sparse contact triplets."""
+    mf_storage: str | None = None
+    """``"streamed"``: streamed matrix-free impulses."""
+    predicted_twists: bool = True
+    """``False``: the held tree's predictor without the twists' publication."""
+    row_support: bool = True
+    """``False``: sparse rows on explicit indices."""
+    placement: str | None = None
+    """``"general"``: every class keeps the general placement, case K6 (:func:`.class_plan.general_reason`)."""
+    tiers: int | None = None
+    """The Jacobi tiers' row bound, on any class whose response they form (0: no tiers)."""
+    tier_sweeps: int | None = None
+    """Every Jacobi tier's sweep budget, in place of the equal-accuracy rule."""
+
+    def record(self) -> dict:
+        """The pins in force (those off their defaults) as a JSON-compliant record."""
+        return {
+            pin.name: list(value) if isinstance(value, tuple) else value
+            for pin in fields(self)
+            if (value := getattr(self, pin.name)) != pin.default
+        }
+
+
 DIAGNOSTICS = ("nvtx", "snapshots", "audit", "row_watermark", "readout", "sync_timings")
 """The diagnostics a spec may hold, in the record's order."""
 
@@ -138,6 +181,8 @@ class StepSpec:
     """The forest after the body cut: topology, groups, world mapping (frozen)."""
     laws: Laws
     """The row laws (:class:`.route_table.Laws`), read from the options, the model and the closure's blocks."""
+    pins: Pins
+    """The test-only route pins in force (:class:`Pins`; none in production)."""
     capacities: Capacities
     mass_interval: int
     """Steps between mass refreshes (``update_mass_matrix_interval``)."""
@@ -152,9 +197,9 @@ class StepSpec:
     ``audit``, ``row_watermark``, ``readout`` (the sweeps' counters), ``sync_timings``."""
 
     @classmethod
-    def build(cls, model, options, cut, forest: ForestPlan, laws: Laws, link_rows: int) -> StepSpec:
+    def build(cls, model, options, cut, forest: ForestPlan, laws: Laws, link_rows: int, pins: Pins) -> StepSpec:
         """Gather the spec from the ``model``, the checked ``options``, the body ``cut``, the ``forest``, the row
-        ``laws`` and the ``link_rows`` a world holds."""
+        ``laws``, the ``link_rows`` a world holds and the test ``pins``."""
         diagnostics = options.diagnostics
         requested = {
             "nvtx": diagnostics.nvtx,
@@ -168,6 +213,7 @@ class StepSpec:
             device=device(model.device),
             forest=forest,
             laws=laws,
+            pins=pins,
             capacities=Capacities.build(options, forest, link_rows),
             mass_interval=int(options.update_mass_matrix_interval),
             articulated=bool(model.articulation_count),
@@ -180,6 +226,7 @@ class StepSpec:
         """The spec's own fields as a JSON-compliant record (``routes.spec``; the laws are ``routes.laws``)."""
         return {
             "device": {"arch": self.device.arch, "sms": self.device.sms},
+            "pins": self.pins.record(),
             "capacities": self.capacities.record(),
             "mass_interval": self.mass_interval,
             "articulated": self.articulated,

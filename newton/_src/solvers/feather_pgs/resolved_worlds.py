@@ -650,7 +650,7 @@ def decline(solver) -> str | None:
     return first_failed(
         (
             (
-                "resolved_worlds" in solver._route_pins.get("claims", ("resolved_worlds",)),
+                "resolved_worlds" in solver.spec.pins.claims,
                 "A test pin drops the resolved-world claim.",
             ),
             # A separating contact carries no load, so its friction and spin rows (contact torsion) carry nothing either:

@@ -3,7 +3,6 @@
 
 import itertools
 import unittest
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -155,19 +154,19 @@ def _run_mixed_response(
     # The arms compare serial owners: the pin keeps the Jacobi tiers (case K4, a tree beside a free body) off the
     # worlds no other owner claims.
     pins = {"tiers": 0, **({"placement": "general"} if route == "general" else {})}
-    with mock.patch.object(SolverFeatherPGS, "_route_pins", pins):
-        solver = SolverFeatherPGS(
-            model,
-            pgs_warmstart=warmstart,
-            enable_bilateral_preelimination=preelimination,
-            enable_contact_friction=friction > 0.0,
-            enable_joint_limits=inactive_joint_limit_capacity,
-            joint_limit_activation_gap=0.0,
-            pgs_iterations=8,
-            pgs_contact_regularization=contact_regularization,
-            dense_max_constraints=dense_max_constraints,
-            mf_max_constraints=32,
-        )
+    solver = SolverFeatherPGS(
+        model,
+        pins=SolverFeatherPGS.Pins(**pins),
+        pgs_warmstart=warmstart,
+        enable_bilateral_preelimination=preelimination,
+        enable_contact_friction=friction > 0.0,
+        enable_joint_limits=inactive_joint_limit_capacity,
+        joint_limit_activation_gap=0.0,
+        pgs_iterations=8,
+        pgs_contact_regularization=contact_regularization,
+        dense_max_constraints=dense_max_constraints,
+        mf_max_constraints=32,
+    )
     state_in, state_out = model.state(), model.state()
     joint_qd = state_in.joint_qd.numpy()
     free_articulation = int(np.flatnonzero(solver.forest.is_free_rigid_host)[0])
@@ -1450,17 +1449,16 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         hold the spin rows."""
         model = _build_mixed_response_model("cuda:0", dof_count=23, friction=0.7)
         solvers = {}
-        with mock.patch.object(SolverFeatherPGS, "_route_pins", {}):
-            for torsion in (False, True):
-                solvers[torsion] = SolverFeatherPGS(
-                    model,
-                    enable_joint_limits=True,
-                    joint_limit_activation_gap=0.0,
-                    pgs_iterations=8,
-                    dense_max_constraints=96,
-                    mf_max_constraints=32,
-                    contact_torsion=torsion,
-                )
+        for torsion in (False, True):
+            solvers[torsion] = SolverFeatherPGS(
+                model,
+                enable_joint_limits=True,
+                joint_limit_activation_gap=0.0,
+                pgs_iterations=8,
+                dense_max_constraints=96,
+                mf_max_constraints=32,
+                contact_torsion=torsion,
+            )
         self.assertTrue(solvers[False].sweep.paired_factor_coordinates)
         # Patch rows are not uniform triples; the factor sweep walks patch contact units instead.
         self.assertTrue(solvers[False].sweep.factor_coordinate_contact_units)

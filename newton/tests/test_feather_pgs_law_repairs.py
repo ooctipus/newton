@@ -1018,7 +1018,9 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
     def _roll(self, device, pins, *, scene=_driven_forest, **options):
         with conformance.route_context(conformance.Route("drives", device.split(":")[0], pins=pins)):
             model, control = scene(device)
-            solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_iterations=4, **options)
+            solver = SolverFeatherPGS(
+                model, angular_damping=0.0, pgs_iterations=4, pins=SolverFeatherPGS.Pins(**pins), **options
+            )
         state, out = model.state(), model.state()
         history = []
         targets = np.random.default_rng(1).uniform(-1.0, 1.0, (120, model.joint_dof_count))
@@ -1069,7 +1071,9 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
                 arms = []
                 for captured in (False, True):
                     model, control = _driven_forest("cuda:0")
-                    solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_iterations=4)
+                    solver = SolverFeatherPGS(
+                        model, angular_damping=0.0, pgs_iterations=4, pins=SolverFeatherPGS.Pins(**pins)
+                    )
                     state, out = model.state(), model.state()
                     graph = None
                     if captured:

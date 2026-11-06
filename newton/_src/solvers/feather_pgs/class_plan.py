@@ -24,7 +24,7 @@ import numpy as np
 from ...core.memory import arch_budget
 from . import host_index, sweep_routes_sparse
 from .forest_plan import row_support
-from .step_plan import first_failed
+from .step_plan import Pins, first_failed
 from .sweep_routes_sparse import _SPARSE_LOCAL_WORKSPACE_BYTES
 from .sweep_routes_tiers import TIER_MAX_ROWS
 from .tree_plan import TreePlan, local_parents
@@ -56,8 +56,8 @@ class ClassInputs:
     """The row laws' tables (:class:`.rows.RowLaws`)."""
     factor: object
     """The tree factor's drive plan and kinematic mask (:class:`.tree_factor.TreeFactor`, once planned)."""
-    pins: Mapping
-    """The test-only route pins."""
+    pins: Pins
+    """The test-only route pins (:class:`.step_plan.Pins`)."""
     dense_rows: int
     """The dense rows a world (:attr:`.step_plan.Capacities.dense_rows`)."""
     diagonal_decline: Callable[[int], str | None]
@@ -149,7 +149,7 @@ def general_reason(pins, *, native: bool, eliminates: bool) -> str | None:
     only the general sweep's exit reads (the cases' writers and sweeps take neither yet)."""
     return first_failed(
         (
-            (pins.get("placement") != "general", "A test pin keeps the general placement (placement='general')."),
+            (pins.placement != "general", "A test pin keeps the general placement (placement='general')."),
             (native, "The device runs the general placement: the cases' native bodies are written for CUDA."),
             (not eliminates, "Bilateral pre-elimination closes its blocks in the general row's block phase."),
         )
@@ -285,11 +285,11 @@ def active_rows_rule(pins, *, small_world_lanes: int, fits: Callable[[], bool]) 
     whose row bitsets exceed shared memory leaves the full ordered sweep.
 
     Args:
-        pins: The test-only route pins.
+        pins: The test-only route pins (:class:`.step_plan.Pins`).
         small_world_lanes: Lanes per world of a packed small-world sweep, 0 for whole warps.
         fits: Whether the active-row scan's working set fits shared memory, evaluated last.
     """
-    if not pins.get("active_rows", True):
+    if not pins.active_rows:
         return False, "A test pin keeps the full ordered sweep (active_rows=False)."
     if small_world_lanes:
         return False, (
@@ -316,13 +316,13 @@ def contact_triplets_rule(
     normal and pair updates, in one reduction and one apply.
 
     Args:
-        pins: The test-only route pins.
+        pins: The test-only route pins (:class:`.step_plan.Pins`).
         active_rows: Whether the sweep selects its rows at sweep entry.
         use_support_table: Whether rows read the shared support table.
         lanes: Lanes per world of the sweep.
         fits: Whether contact units fit the row capacity and shared memory, evaluated last.
     """
-    if "contact_units" in pins and pins["contact_units"] != "triplets":
+    if pins.contact_units != "triplets":
         return False, "A test pin keeps unfused contact rows (contact_units=None)."
     if lanes < 32:
         return False, f"Small worlds keep their packed {lanes}-lane full sweep."
@@ -348,8 +348,8 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     velocity_candidate = options.enable_joint_velocity_limits and not forest.has_free_rigid_bodies
     declined = first_failed(
         (
-            (pins.get("storage") != "dense", "A test pin keeps dense storage (storage='dense')."),
-            (not pins.get("tiers"), "A test pin builds the Jacobi tiers (tiers) on dense storage."),
+            (pins.storage != "dense", "A test pin keeps dense storage (storage='dense')."),
+            (not pins.tiers, "A test pin builds the Jacobi tiers (tiers) on dense storage."),
             (factor.parallel_drives, "Drive topology is not supported by native sparse factors."),
             (
                 not laws.mimic_count or velocity_candidate,
@@ -435,7 +435,7 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     offsets = forest.articulation_world_dof_offset.numpy()
     support_classes = None
     if (
-        pins.get("row_support", True)
+        pins.row_support
         and not laws.mimic_count
         and np.all(articulated_counts == 1)
         and size == forest.max_world_dofs
@@ -608,7 +608,7 @@ def tier_rule(inputs: ClassInputs) -> tuple[Tiers | None, str]:
     at most :data:`.sweep_routes_tiers.TIER_MAX_ROWS`, in whole quads; a test pin (``tiers``) sets it on any class
     whose response they form.
     """
-    forest, pinned = inputs.forest, inputs.pins.get("tiers")
+    forest, pinned = inputs.forest, inputs.pins.tiers
     reason = first_failed(
         (
             (

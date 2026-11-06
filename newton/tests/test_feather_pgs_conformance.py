@@ -11,7 +11,7 @@ kernels freely as long as the physics holds.
 
 Routes
     A route is a set of constructor options and test-only axis pins
-    (``SolverFeatherPGS._route_pins``), set for the whole run. Every run reads
+    (``SolverFeatherPGS.Pins``), passed to the solver it builds. Every run reads
     ``get_path_selection()["routes"]`` before its first step and asserts the
     record the route expects, so a test cannot silently run another route.
     Owners that claim worlds at run time (sparse factors, the parallel tiers,
@@ -155,9 +155,13 @@ class Route:
     options: dict = dataclasses.field(default_factory=dict)
     """Constructor options that select the route."""
     pins: dict = dataclasses.field(default_factory=dict)
-    """Axis values the route fixes where the rules would choose others (``SolverFeatherPGS._route_pins``)."""
+    """Axis values the route fixes where the rules would choose others (``SolverFeatherPGS.Pins``)."""
     expect: dict = dataclasses.field(default_factory=dict)
     """Route-record values the run must report: ``"key.path": value`` into ``get_path_selection()["routes"]``."""
+
+    def solver_pins(self) -> SolverFeatherPGS.Pins:
+        """The route's pins as its solver takes them."""
+        return SolverFeatherPGS.Pins(**self.pins)
 
     def but(
         self, name: str, *, options: dict | None = None, pins: dict | None = None, expect: dict | None = None
@@ -187,13 +191,13 @@ def route_value(routes: dict, path: str):
 
 @contextlib.contextmanager
 def route_context(route: Route):
-    """Set the route's pins, clearing every solver variable of the environment."""
+    """Clear every solver variable of the environment for a run of ``route``; the route's pins are its solver's
+    (:meth:`Route.solver_pins`)."""
     names = [name for name in os.environ if name.startswith(("FEATHER_PGS_", "IL_NEWTON_FPGS_"))]
     with contextlib.ExitStack() as stack:
         stack.enter_context(mock.patch.dict(os.environ))
         for name in names:
             del os.environ[name]
-        stack.enter_context(mock.patch.object(SolverFeatherPGS, "_route_pins", dict(route.pins)))
         yield
 
 
@@ -316,7 +320,7 @@ def simulate(
         ]
     merged = {**BASE_OPTIONS, **scene.solver_options, **(options or {}), **route.options}
     with route_context(route):
-        solver = SolverFeatherPGS(model, **merged)
+        solver = SolverFeatherPGS(model, pins=route.solver_pins(), **merged)
         routes = solver.get_path_selection()["routes"]
         state, out, scratch = model.state(), model.state(), model.state()
         control = model.control()

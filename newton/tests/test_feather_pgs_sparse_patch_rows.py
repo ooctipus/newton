@@ -26,7 +26,7 @@ _UNFUSED = {"contact_units": None}
 
 
 def _admit(pins, *, lanes=0, fits=True):
-    return class_plan.active_rows_rule(pins, small_world_lanes=lanes, fits=lambda: fits)
+    return class_plan.active_rows_rule(SolverFeatherPGS.Pins(**pins), small_world_lanes=lanes, fits=lambda: fits)
 
 
 class TestFeatherPGSSparsePatchRows(unittest.TestCase):
@@ -103,10 +103,8 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
     def test_route_record_reports_linked_active_rows(self):
         """Run the law on the linked active-row kernel, and the full sweep when the policy is off."""
         model = _build_model()
-        with mock.patch.dict(SolverFeatherPGS._route_pins, _UNFUSED):
-            patch_friction = _make_solver(model, True, dense_max_constraints=96)
-        with mock.patch.dict(SolverFeatherPGS._route_pins, {**_UNFUSED, "active_rows": False}):
-            switched_off = _make_solver(model, True, dense_max_constraints=96)
+        patch_friction = _make_solver(model, True, pins=_UNFUSED, dense_max_constraints=96)
+        switched_off = _make_solver(model, True, pins={**_UNFUSED, "active_rows": False}, dense_max_constraints=96)
         records = {
             name: solver.get_path_selection()["routes"]["sparse_mass_matrix"]
             for name, solver in (("patch", patch_friction), ("off", switched_off))
@@ -160,8 +158,7 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         """Keep the packed 16-lane full sweep of a 9-DOF, 32-row patch world, bitwise, with active rows pinned off."""
         model = _build_model()
         solvers = {"on": _make_solver(model, True)}
-        with mock.patch.dict(SolverFeatherPGS._route_pins, {"active_rows": False}):
-            solvers["off"] = _make_solver(model, True)
+        solvers["off"] = _make_solver(model, True, pins={"active_rows": False})
         for solver in solvers.values():
             self.assertEqual(solver.sweep.sparse_solve_lanes, 16)
             self.assertFalse(solver.sweep.sparse_active_rows)
@@ -192,8 +189,7 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
             pins = {"active_rows": False}
             if triplets == "0":
                 pins["contact_units"] = None
-            with mock.patch.dict(SolverFeatherPGS._route_pins, pins):
-                solvers[triplets] = _make_solver(model, True, **options)
+            solvers[triplets] = _make_solver(model, True, pins=pins, **options)
         # The full ordered sweep: no "_active" between the support width and the table; patch friction's sweeps read
         # spin rows (``_torsion``).
         self.assertRegex(solvers["1"].sweep.sparse_kernel.key, r"_\d+_support_table_contact_triplets_linked_torsion$")
@@ -238,10 +234,8 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         """
         model = standing_model("cuda:0", worlds=2)
         options = {"dense_max_constraints": 96, "pgs_iterations": 8, "enable_joint_limits": False}
-        with mock.patch.dict(SolverFeatherPGS._route_pins, _UNFUSED):
-            solvers = {"active": _make_solver(model, True, **options)}
-        with mock.patch.dict(SolverFeatherPGS._route_pins, {**_UNFUSED, "active_rows": False}):
-            solvers["full"] = _make_solver(model, True, **options)
+        solvers = {"active": _make_solver(model, True, pins=_UNFUSED, **options)}
+        solvers["full"] = _make_solver(model, True, pins={**_UNFUSED, "active_rows": False}, **options)
         self.assertTrue(solvers["active"].sweep.sparse_active_rows)
         self.assertFalse(solvers["full"].sweep.sparse_active_rows)
         runs = {name: _rollout(solver, model, steps=240, slide_world=1, speed=0.6) for name, solver in solvers.items()}

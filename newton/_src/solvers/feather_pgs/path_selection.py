@@ -69,8 +69,10 @@ def json_value(value):
 
 @functools.cache
 def _declared_defaults(init) -> dict:
-    parameters = list(inspect.signature(init).parameters.values())[2:]  # after self and model
-    return {parameter.name: parameter.default for parameter in parameters}
+    """Every option's declared default: the parameters after ``self`` and ``model``, but the test pins, which are the
+    spec's (``routes.spec.pins``), not an option."""
+    parameters = list(inspect.signature(init).parameters.values())[2:]
+    return {parameter.name: parameter.default for parameter in parameters if parameter.name != "pins"}
 
 
 def _is_default(value, default) -> bool:
@@ -140,9 +142,8 @@ def route_selection(solver) -> dict:
 
     return {
         "articulations_by_dof": {str(int(size)): int(count) for size, count in solver.forest.n_arts_by_size.items()},
-        # The test-only axis pins in force (SolverFeatherPGS._route_pins); empty in production.
-        "pins": json_value(dict(solver._route_pins)),
-        # The step's spec: the device, capacities, cadence and diagnostics (step_plan.StepSpec).
+        # The step's spec: the device, the test pins in force (none in production), capacities, cadence and
+        # diagnostics (step_plan.StepSpec).
         "spec": json_value(solver.spec.record()),
         # The route: the row of the route table the class takes, its axes and each placement case's reason.
         "row": json_value(row.record()),

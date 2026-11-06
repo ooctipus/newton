@@ -87,11 +87,8 @@ def _mixed_solver(model, *, forest=False, lanes=None, **options):
         "update_mass_matrix_interval": 2,
         **options,
     }
-    with (
-        patch.object(SolverFeatherPGS, "_route_pins", pins),
-        fixed_lanes(lanes) if lanes is not None else contextlib.nullcontext(),
-    ):
-        return SolverFeatherPGS(model, **settings)
+    with fixed_lanes(lanes) if lanes is not None else contextlib.nullcontext():
+        return SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(**pins), **settings)
 
 
 def _owned_case(name, device, **options):
@@ -450,7 +447,7 @@ def _cpu_owner(*, motion_velocity=False, worlds=2, pins=None):
     solver.options = solver.laws.options = solver.factor.options = solver.placement.options = solver.sweep.options = (
         dataclasses.replace(solver.options, enable_joint_velocity_limits=motion_velocity)
     )
-    solver._route_pins.update(pins or {})
+    solver.spec = dataclasses.replace(solver.spec, pins=SolverFeatherPGS.Pins(**(pins or {})))
     owner = HeldTree(solver)
     solver.factor.held = owner
     states = [model.state(), model.state()]

@@ -4,7 +4,6 @@
 """The generic mixed-tree cache owner covers fixed-base arms together with free rigid bodies."""
 
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -270,15 +269,15 @@ def _rollout(
         pins["grouping"] = "forest" if forest else "per_size"
     if scalar is False:
         pins["star"] = "held"
-    with patch.object(SolverFeatherPGS, "_route_pins", pins):
-        solver = SolverFeatherPGS(
-            model,
-            pgs_iterations=pgs_iterations,
-            enable_joint_limits=True,
-            update_mass_matrix_interval=2,
-            **({} if rows is None else {"dense_max_constraints": rows}),
-            **(attrs or {}),
-        )
+    solver = SolverFeatherPGS(
+        model,
+        pins=SolverFeatherPGS.Pins(**pins),
+        pgs_iterations=pgs_iterations,
+        enable_joint_limits=True,
+        update_mass_matrix_interval=2,
+        **({} if rows is None else {"dense_max_constraints": rows}),
+        **(attrs or {}),
+    )
     state_owner = solver.factor.held
     if not owner:
         recomputing(solver)

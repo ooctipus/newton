@@ -61,7 +61,7 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
     def test_default_and_unsupported_recipes_keep_existing_owner(self):
         """Decline unsupported laws before removing ordinary response storage."""
         for changes in (
-            {"pins": {"storage": "dense"}},
+            {"pins": SolverFeatherPGS.Pins(storage="dense")},
             {"pgs_warmstart": True, "forest": ForestProbe(has_free_rigid_bodies=True)},
             {"forest": ForestProbe(has_free_rigid_bodies=True)},
         ):
@@ -173,19 +173,19 @@ def _case(
     limits.reshape(2, -1)[:, -1] = np.inf
     model.joint_velocity_limit.assign(limits)
     pins = {} if enabled else {"storage": "dense"}
-    with mock.patch.dict(SolverFeatherPGS._route_pins, pins):
-        solver = SolverFeatherPGS(
-            model,
-            enable_joint_limits=True,
-            enable_joint_velocity_limits=True,
-            velocity_limit_activation_fraction=activation_fraction,
-            pgs_iterations=8,
-            pgs_warmstart=False,
-            dense_max_constraints=32,
-            mf_max_constraints=32,
-            update_mass_matrix_interval=2,
-            restitution_velocity_threshold=0.01,
-        )
+    solver = SolverFeatherPGS(
+        model,
+        pins=SolverFeatherPGS.Pins(**pins),
+        enable_joint_limits=True,
+        enable_joint_velocity_limits=True,
+        velocity_limit_activation_fraction=activation_fraction,
+        pgs_iterations=8,
+        pgs_warmstart=False,
+        dense_max_constraints=32,
+        mf_max_constraints=32,
+        update_mass_matrix_interval=2,
+        restitution_velocity_threshold=0.01,
+    )
     state, out, control = model.state(), model.state(), model.control()
     qd = state.joint_qd.numpy().copy().reshape(2, -1)
     qd[1] *= -1.0

@@ -23,7 +23,6 @@
 
 import unittest
 import warnings
-from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -365,10 +364,15 @@ class TestSupportSlipRelease(unittest.TestCase):
 def _hinges_step(pins: dict, iterations: int = 30, **options) -> tuple:
     """One step of :func:`slipping_hinges` on CUDA under route ``pins``: the solver and its published velocity."""
     model, control = slipping_hinges("cuda:0")
-    with patch.dict(SolverFeatherPGS._route_pins, pins), warnings.catch_warnings():
+    with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         solver = SolverFeatherPGS(
-            model, angular_damping=0.0, pgs_iterations=iterations, enable_joint_limits=True, **options
+            model,
+            angular_damping=0.0,
+            pgs_iterations=iterations,
+            enable_joint_limits=True,
+            pins=SolverFeatherPGS.Pins(**pins),
+            **options,
         )
     state, out = model.state(), model.state()
     solver.step(state, out, control, None, 1.0 / 60.0)

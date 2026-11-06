@@ -158,7 +158,7 @@ class TreeKineticState:
         # warp-sized trees whose scans keep to their lane groups (a CUDA register scan), and publishes them unless
         # the test pin predicted_twists=False leaves the classifier to its own kernel.
         self._predicts_twists = native.publishes_twists(self.layout, self.schedules, cuda=device.is_cuda)
-        self.publishes_twists = self._predicts_twists and solver._route_pins.get("predicted_twists", True)
+        self.publishes_twists = self._predicts_twists and solver.spec.pins.predicted_twists
         self._no_twists = solver._arrays.placeholder(wp.spatial_vector)
         if self.publishes_twists:
             if getattr(solver, "_predicted_twist", None) is None:

@@ -829,8 +829,7 @@ class TestParallelPatchReference(unittest.TestCase):
         model = _pushed_sphere("cpu")
         limits = model.joint_velocity_limit.numpy().astype(np.float64)
         model.joint_qd.assign(prescaled_joint_velocity(model))  # what the matrix-free route predicts from
-        with patch.dict(SolverFeatherPGS._route_pins, _DENSE):
-            solver = SolverFeatherPGS(model, friction_anchor_beta=0.2)
+        solver = SolverFeatherPGS(model, friction_anchor_beta=0.2, pins=SolverFeatherPGS.Pins(**_DENSE))
         _rollout(model, solver, 1)
         mass_matrix = MassReference(model).mass_matrix(model.joint_q.numpy(), 0)
         case = with_velocity_limit_rows(world_case(solver)[0], mass_matrix, limits, solver.options.pgs_cfm)
@@ -1184,7 +1183,7 @@ class TestTierSweeps(unittest.TestCase):
         """Budget point and linked tiers by one rule."""
         tiers = [(32, 0), (64, 32), (96, 64), (128, 96)]
         for _ in range(1):
-            probe = SimpleNamespace(pins={}, options=SimpleNamespace(pgs_iterations=12))
+            probe = SimpleNamespace(pins=SolverFeatherPGS.Pins(), options=SimpleNamespace(pgs_iterations=12))
             with self.subTest():
                 budgets, rule, reason = Sweep._parallel_tier_sweeps(probe, tiers)
                 self.assertEqual((budgets, rule), ([42, 60, 73, 84], "auto"))
@@ -1193,7 +1192,7 @@ class TestTierSweeps(unittest.TestCase):
                 self.assertIn("at most 128", reason)
         # A test pin sets every tier's budget.
         probe = SimpleNamespace(
-            pins={"tier_sweeps": 160},
+            pins=SolverFeatherPGS.Pins(tier_sweeps=160),
             options=SimpleNamespace(pgs_iterations=12),
         )
         budgets, rule, reason = Sweep._parallel_tier_sweeps(probe, tiers)
@@ -1211,8 +1210,9 @@ class TestTierSweeps(unittest.TestCase):
         TestPatchParallelPhysics runs the solver's tiers on the same stance.
         """
         model = sliding_stance("cpu")
-        with patch.dict(SolverFeatherPGS._route_pins, _DENSE):
-            solver = SolverFeatherPGS(model, friction_anchor_beta=0.2, pgs_iterations=2000)
+        solver = SolverFeatherPGS(
+            model, friction_anchor_beta=0.2, pgs_iterations=2000, pins=SolverFeatherPGS.Pins(**_DENSE)
+        )
         _rollout(model, solver, 1)
         case, serial = world_case(solver)
         # Fourteen contact rows: two patch rings of four normals, each ring with one anchor (a pair and a spin row).
@@ -1240,7 +1240,7 @@ class TestTierRule(unittest.TestCase):
         """The tier rule on a class's inputs, allegro's by default (a 16-coordinate hand and a cube, 192 dense rows),
         with the in-kernel response ``response`` (its sizes and why)."""
         inputs = SimpleNamespace(
-            pins={},
+            pins=SolverFeatherPGS.Pins(),
             dense_rows=192,
             forest=SimpleNamespace(
                 world_count=4, max_world_dofs=22, has_free_rigid_bodies=True, has_non_free_articulations=True
@@ -1288,7 +1288,7 @@ class TestTierRule(unittest.TestCase):
                 },
                 "case K4",
             ),
-            ({"pins": {"tiers": 0}}, "tiers=0"),
+            ({"pins": SolverFeatherPGS.Pins(tiers=0)}, "tiers=0"),
             ({"response": (None, "A world has several articulations of size 6.")}, "several"),
         ):
             with self.subTest(changes=sorted(changes)):
@@ -1309,9 +1309,9 @@ class TestTierRule(unittest.TestCase):
             ({"native": True, "eliminates": True}, "pre-elimination"),
             ({"native": False, "eliminates": False}, "written for CUDA"),
         ):
-            general = class_plan.general_reason({}, **data)
+            general = class_plan.general_reason(SolverFeatherPGS.Pins(), **data)
             self.assertIn(phrase, class_plan.plan_class(SimpleNamespace(), general=general).reasons["K4"])
-        general = class_plan.general_reason({"placement": "general"}, native=True, eliminates=False)
+        general = class_plan.general_reason(SolverFeatherPGS.Pins(placement="general"), native=True, eliminates=False)
         self.assertIn("general placement", general)
 
     def test_a_pin_builds_the_tiers_on_a_single_tree(self):
@@ -1319,7 +1319,7 @@ class TestTierRule(unittest.TestCase):
         forest = SimpleNamespace(
             world_count=4, max_world_dofs=22, has_free_rigid_bodies=False, has_non_free_articulations=True
         )
-        choice, _ = self._rule(forest=forest, pins={"tiers": 32})
+        choice, _ = self._rule(forest=forest, pins=SolverFeatherPGS.Pins(tiers=32))
         self.assertEqual((choice.rows, choice.sizes), (32, (16, 6, 0, 16)))
 
 
@@ -1556,8 +1556,7 @@ def _matrix_free_solver(model, *, beta, parallel_rows, pins=_DENSE, sweeps=None,
     settings = {"friction_anchor_beta": beta, "pgs_iterations": 8, "dense_max_constraints": 32}
     settings.update(options)
     tier_pins = {"tiers": parallel_rows, **({"tier_sweeps": sweeps} if sweeps is not None else {})}
-    with patch.dict(SolverFeatherPGS._route_pins, {**pins, **tier_pins}):
-        return SolverFeatherPGS(model, **settings)
+    return SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(**{**pins, **tier_pins}), **settings)
 
 
 def _rollout(model, solver, steps, *, dt=1.0 / 240.0, after_step=None):

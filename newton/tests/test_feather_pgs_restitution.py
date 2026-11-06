@@ -14,7 +14,6 @@ closed-form rather than inferred from a later bounce height.
 """
 
 import unittest
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -114,8 +113,9 @@ def _make_solver(
     restitution_velocity_threshold=0.0,
     pgs_iterations=16,
     pgs_warmstart=False,
+    pins=None,
 ):
-    """Construct a deterministic frictionless FeatherPGS test solver."""
+    """Construct a deterministic frictionless FeatherPGS test solver (with test-only route ``pins``)."""
     kwargs = {
         "angular_damping": 0.0,
         "enable_contact_friction": False,
@@ -128,7 +128,7 @@ def _make_solver(
         kwargs["enable_restitution"] = enable_restitution
     if restitution_velocity_threshold is not None:
         kwargs["restitution_velocity_threshold"] = restitution_velocity_threshold
-    return newton.solvers.SolverFeatherPGS(model, **kwargs)
+    return newton.solvers.SolverFeatherPGS(model, pins=newton.solvers.SolverFeatherPGS.Pins(**(pins or {})), **kwargs)
 
 
 def _reset_state(model, state, vertical_velocity):
@@ -737,8 +737,7 @@ def test_multiworld_restitution_keeps_case_data_isolated(test, device):
             model = scene.finalize(device=device)
             # The solver admits the classifier only at construction.
             pins = {} if resolved == "1" else {"claims": ()}
-            with mock.patch.object(newton.solvers.SolverFeatherPGS, "_route_pins", pins):
-                solver = _make_solver(model)
+            solver = _make_solver(model, pins=pins)
             classified = resolved == "1"
             classifier = solver.get_path_selection()["routes"]["resolved_worlds"]
             test.assertEqual(classifier["enabled"], classified, classifier["reason"])

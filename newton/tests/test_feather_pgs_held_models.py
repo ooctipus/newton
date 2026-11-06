@@ -5,7 +5,6 @@
 without coordinates, models without any, particles, debug rows and the joint kinds roots and descendants may hold."""
 
 import unittest
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -120,8 +119,9 @@ class TestHeldModels(unittest.TestCase):
                 )
                 builder = newton.ModelBuilder()
                 builder.replicate(scene, 2)
-                with mock.patch.dict(SolverFeatherPGS._route_pins, {"storage": "dense", "grouping": "forest"}):
-                    _, _, state = _fall(builder, device, steps=4)
+                _, _, state = _fall(
+                    builder, device, steps=4, pins=SolverFeatherPGS.Pins(storage="dense", grouping="forest")
+                )
                 np.testing.assert_allclose(
                     state.body_q.numpy()[[body, 2 * body + 1], :3], [[2.0, 0.0, 1.0]] * 2, atol=1e-6
                 )

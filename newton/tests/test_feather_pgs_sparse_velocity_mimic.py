@@ -83,21 +83,21 @@ def _case(enabled, offset=0.025, scale=-0.5, error=-0.015, *, friction_anchor_be
     model.joint_velocity_limit.assign(np.tile([0.4, 0.25, 0.2], 2).astype(np.float32))
     # The reference arm runs dense storage.
     pins = {} if enabled else {"storage": "dense"}
-    with mock.patch.dict(SolverFeatherPGS._route_pins, pins):
-        solver = SolverFeatherPGS(
-            model,
-            friction_anchor_beta=friction_anchor_beta,
-            enable_joint_limits=True,
-            enable_joint_velocity_limits=True,
-            pgs_iterations=8,
-            pgs_warmstart=False,
-            pgs_beta=0.07,
-            pgs_cfm=2e-4,
-            dense_max_constraints=32,
-            mf_max_constraints=32,
-            update_mass_matrix_interval=2,
-            restitution_velocity_threshold=0.01,
-        )
+    solver = SolverFeatherPGS(
+        model,
+        pins=SolverFeatherPGS.Pins(**pins),
+        friction_anchor_beta=friction_anchor_beta,
+        enable_joint_limits=True,
+        enable_joint_velocity_limits=True,
+        pgs_iterations=8,
+        pgs_warmstart=False,
+        pgs_beta=0.07,
+        pgs_cfm=2e-4,
+        dense_max_constraints=32,
+        mf_max_constraints=32,
+        update_mass_matrix_interval=2,
+        restitution_velocity_threshold=0.01,
+    )
     state, out, control = model.state(), model.state(), model.control()
     velocity = state.joint_qd.numpy().copy().reshape(2, -1)
     velocity[1] *= -1.0

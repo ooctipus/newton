@@ -94,7 +94,7 @@ class Sweep:
         placement: The placement.
         factor: The tree factor.
         classes: The class plan (:class:`.class_plan.ClassPlan`): the case and its choice, which the owners build.
-        pins: The test-only route pins.
+        pins: The test-only route pins (:class:`.step_plan.Pins`).
     """
 
     def __init__(self, model, options, forest, laws, placement, factor, classes, pins):
@@ -360,7 +360,7 @@ class Sweep:
         at construction. A world stops earlier under the sweeps' exit law. A test pin (``tier_sweeps``) sets every
         tier's budget.
         """
-        pinned = self.pins.get("tier_sweeps")
+        pinned = self.pins.tier_sweeps
         if pinned is not None:
             return [int(pinned)] * len(tiers), "pinned", f"A test pin sets every tier's budget (tier_sweeps={pinned})."
         reason = (
@@ -490,7 +490,7 @@ class Sweep:
         if self.placement.mf_sweeps:
             # A test pin streams the impulses (storage is part of the kernel specialization key); the selection
             # sizes the resident row metadata with its choice.
-            force_stream_mf_impulses = self.pins.get("mf_storage") == "streamed"
+            force_stream_mf_impulses = self.pins.mf_storage == "streamed"
             on_cpu = Place.GLOBAL if force_stream_mf_impulses else Place.SHARED
             storage = _MFGSStorage(
                 sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL, on_cpu),

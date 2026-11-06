@@ -483,7 +483,7 @@ def plan_scalar_branches(solver, *, size: int | None = None) -> tuple[ScalarBran
         size = solver._compact_diagonal_mass_size
     if size is None:
         return None, "No diagonal-mass group shares the sparse-diagonal response."
-    if solver._route_pins.get("star") == "held":
+    if solver.spec.pins.star == "held":
         return None, "A test pin keeps the diagonal-mass group in the held tree (star='held')."
     model = solver.model
     if model.particle_count:

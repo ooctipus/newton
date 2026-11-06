@@ -9,7 +9,7 @@ helper it imports (followed through ``newton.tests``), imports from ``newton._sr
 (:mod:`newton.tests.unittest_utils`) is infrastructure, not the solver, and is not followed.
 
 A new contract module joins :data:`CONTRACT`. The route matrix still selects its routes through the test-only pins
-(``SolverFeatherPGS._route_pins``), which go with the cases.
+(``SolverFeatherPGS.Pins``), which go with the cases.
 """
 
 import ast

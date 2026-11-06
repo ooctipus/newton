@@ -189,8 +189,8 @@ def _over_budget_rows(model) -> int:
     return high
 
 
-def _make_solver(model, sparse, **overrides):
-    """Change only the representation selection between comparison solvers."""
+def _make_solver(model, sparse, *, pins=None, **overrides):
+    """Change only the representation selection between comparison solvers (and the test-only route ``pins``)."""
     options = {
         "pgs_iterations": 32,
         "enable_joint_limits": True,
@@ -200,21 +200,21 @@ def _make_solver(model, sparse, **overrides):
         "update_mass_matrix_interval": 4,
     }
     options.update(overrides)
-    with mock.patch.dict(SolverFeatherPGS._route_pins, {} if sparse else {"storage": "dense"}):
-        return SolverFeatherPGS(model, **options)
+    pins = {**({} if sparse else {"storage": "dense"}), **(pins or {})}
+    return SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(**pins), **options)
 
 
-def _case(sparse, *, robot_count=1, prescribed=False):
+def _case(sparse, *, robot_count=1, prescribed=False, pins=None):
     """Allocate a stable input state for eager and captured cache reuse."""
     model = _build_model(robot_count=robot_count, prescribed=prescribed)
     # Row-level comparisons need every world's rows: the resolved-world classifier, which skips the
     # rows of worlds that all separate, stays off on the dense reference.
-    with mock.patch.dict(SolverFeatherPGS._route_pins, {"claims": ()}):
-        solver = _make_solver(
-            model,
-            sparse,
-            **({"dense_max_constraints": 96, "mf_max_constraints": 64} if robot_count > 1 else {}),
-        )
+    solver = _make_solver(
+        model,
+        sparse,
+        pins={"claims": (), **(pins or {})},
+        **({"dense_max_constraints": 96, "mf_max_constraints": 64} if robot_count > 1 else {}),
+    )
     state, out = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
@@ -243,8 +243,7 @@ def _tree(case, group: int, records: np.ndarray) -> np.ndarray:
 class TestFeatherPGSSparseSolver(unittest.TestCase):
     def test_shared_row_support_matches_explicit_indices(self):
         """Remove per-world indices while preserving contacts, limits and reset behavior."""
-        with mock.patch.dict(SolverFeatherPGS._route_pins, {"row_support": False}):
-            explicit = _case(True)
+        explicit = _case(True, pins={"row_support": False})
         shared = _case(True)
         self.assertFalse(explicit[1].placement.sparse_row_support.enabled)
         self.assertTrue(shared[1].placement.sparse_row_support.enabled)
@@ -416,8 +415,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         either friction law (test_feather_pgs_sparse_patch_rows covers it).
         """
         dense = _case(False, robot_count=2)
-        with mock.patch.dict(SolverFeatherPGS._route_pins, {"active_rows": False}):
-            sparse = _case(True, robot_count=2)
+        sparse = _case(True, robot_count=2, pins={"active_rows": False})
         self.assertFalse(sparse[1].sweep.sparse_active_rows)
         self.assertEqual(sparse[1].placement.sparse_mass_matrix_size, 9)
         self.assertEqual(sparse[1].forest.group_to_art[9].shape[0], 4)

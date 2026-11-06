@@ -824,7 +824,7 @@ def run_route(physics, route, device="cpu", steps=STEPS):
     options.pop("contact_compliance", None)
     with conformance.route_context(route), warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        solver = SolverFeatherPGS(model, **options)
+        solver = SolverFeatherPGS(model, pins=route.solver_pins(), **options)
         capture = Capture(solver)
         state, out, control = model.state(), model.state(), model.control()
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
@@ -2155,7 +2155,7 @@ def _run(physics, reference, device) -> Evaluated:
     # The rows' material law is the sweep's: these contacts hold no per-contact material.
     options.pop("contact_compliance", None)
     with conformance.route_context(reference):
-        solver = SolverFeatherPGS(model, **options)
+        solver = SolverFeatherPGS(model, pins=reference.solver_pins(), **options)
         state, out, control = model.state(), model.state(), model.control()
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
         for step in range(STEPS):
