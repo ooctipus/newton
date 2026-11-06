@@ -107,7 +107,6 @@ def _operands(
     max_world_dofs: int,
     *,
     rows: int,
-    min_rows: int,
     inkernel_response: tuple[int, int, int, int],
     row_inputs,
 ):
@@ -123,8 +122,6 @@ def _operands(
         raise ValueError("inkernel_response needs group sizes within the world DOF count")
     if AM % 4 != 0:
         raise ValueError("rows must be a multiple of 4")
-    if int(min_rows) < 0 or int(min_rows) >= AM:
-        raise ValueError("min_rows must be in [0, rows)")
     operands = row_inputs(NA, NB, OA, OB, D, M_D) if row_inputs is not None else None
     return groups, operands
 
@@ -147,7 +144,6 @@ def parallel_source(
     rows: int,
     sweeps: int,
     inkernel_response: tuple[int, int, int, int],
-    min_rows: int = 0,
     row_inputs=None,
     linked_rows: bool = False,
     velocity_limit_pass: bool = False,
@@ -160,10 +156,11 @@ def parallel_source(
     pitch: int | None = None,
     lanes: int = 32,
 ) -> tuple[str, Staging]:
-    """The native body of a parallel tier: a world's dense rows (at most ``rows``, more than ``min_rows``) under the
-    Jacobi law, a lane per row; under ``torsion`` a contact's spin row steps and projects with its pair. ``lanes`` is
-    the device's (:func:`.execution.device_lanes`): CUDA's lanes are the block's threads, the CPU's one thread runs
-    them as virtual lanes (:class:`.device_preludes.VirtualLanes`), each phase between the block's barriers a loop.
+    """The native body of a parallel tier: a world's dense rows (at most ``rows``: its claim's bucket holds the rest)
+    under the Jacobi law, a lane per row; under ``torsion`` a contact's spin row steps and projects with its pair.
+    ``lanes`` is the device's (:func:`.execution.device_lanes`): CUDA's lanes are the block's threads, the CPU's one
+    thread runs them as virtual lanes (:class:`.device_preludes.VirtualLanes`), each phase between the block's barriers
+    a loop.
 
     The block stages the rows (:class:`.sweep.JacobiRows`) and the velocity, then the rows in the walk's coordinates
     (:class:`.WalkedRows`, the world's trees ``inkernel_response = (NA, NB, OA, OB)``): the keyed rows' operands
@@ -184,7 +181,6 @@ def parallel_source(
         max_constraints,
         max_world_dofs,
         rows=rows,
-        min_rows=min_rows,
         inkernel_response=inkernel_response,
         row_inputs=row_inputs,
     )
@@ -291,7 +287,6 @@ def parallel_kernel(
     rows: int,
     sweeps: int,
     inkernel_response: tuple[int, int, int, int],
-    min_rows: int = 0,
     row_inputs=None,
     linked_rows: bool = False,
     velocity_limit_pass: bool = False,
@@ -318,7 +313,6 @@ def parallel_kernel(
         raise ValueError("material contacts step by their weights: their tiers are weighted")
     options = {
         "rows": rows,
-        "min_rows": min_rows,
         "inkernel_response": inkernel_response,
         "row_inputs": row_inputs,
     }
@@ -348,7 +342,7 @@ def parallel_kernel(
     work = Work(0, lanes=NT, block=NT, registers=REGISTER_LINE, cap=False, shared=staging.bytes)
     name = (
         f"sweep_{'parallel' if row_inputs is None else 'keyed_parallel'}_{max_constraints}_{mf_max_constraints}"
-        f"_{max_world_dofs}_rows{AM}_min{int(min_rows)}_sweeps{int(sweeps)}_nt{NT}_ink{NA}_{NB}_o{OA}_{OB}"
+        f"_{max_world_dofs}_rows{AM}_sweeps{int(sweeps)}_nt{NT}_ink{NA}_{NB}_o{OA}_{OB}"
         + (f"_frame{int(frame[0])}_{int(frame[1])}" if any(frame) else "")
         + ("" if walk_half == WALK_BOTH else f"_half{walk_half}")
         + ("" if pitch is None or pitch == max_constraints else f"_p{int(pitch)}")

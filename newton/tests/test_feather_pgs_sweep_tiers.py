@@ -73,16 +73,16 @@ CALLS = (
         {"rows": 32, "sweeps": 112, **_INK, "row_inputs": _keyed(True), "classes": _CLASSES, "linked_rows": True},
     ),
     ("one_group", (64, 32, 18, "120"), {"rows": 32, "sweeps": 42, "inkernel_response": (18, 0, 0, 0)}),
-    ("rows_64", (96, 32, 18, "120"), {"rows": 64, "min_rows": 32, "sweeps": 60, **_INK}),
+    ("rows_64", (96, 32, 18, "120"), {"rows": 64, "sweeps": 60, **_INK}),
     (
         "rows_96_last_word",
         (96, 32, 18, "120"),
-        {"rows": 96, "min_rows": 64, "sweeps": 73, **_INK, "linked_rows": True, "velocity_limit_pass": True},
+        {"rows": 96, "sweeps": 73, **_INK, "linked_rows": True, "velocity_limit_pass": True},
     ),
     (
         "rows_128",
         (128, 32, 18, "120"),
-        {"rows": 128, "min_rows": 96, "sweeps": 84, **_INK, "linked_rows": True, "velocity_limit_pass": True},
+        {"rows": 128, "sweeps": 84, **_INK, "linked_rows": True, "velocity_limit_pass": True},
     ),
 )
 """``(label, arguments, options)`` of the factory: the conformance routes' tiers and the other variants."""
@@ -121,7 +121,6 @@ class TestParallelTier(unittest.TestCase):
             {"rows": 0, "sweeps": 1, **_INK},
             {"rows": 72, "sweeps": 1, **_INK},
             {"rows": 30, "sweeps": 1, **_INK},
-            {"rows": 32, "sweeps": 1, "min_rows": 32, **_INK},
             {"rows": 32, "sweeps": 1, "inkernel_response": (12, 7, 0, 12)},
         )
         for kwargs in invalid:
@@ -166,7 +165,7 @@ class TestParallelTier(unittest.TestCase):
     def test_several_warps_stop_on_the_block_vote(self):
         one = _source((64, 32, 18, "120"), {"rows": 32, "sweeps": 1, **_INK})
         self.assertIn(_EXIT, one)
-        block = _source((96, 32, 18, "120"), {"rows": 64, "min_rows": 32, "sweeps": 1, **_INK})
+        block = _source((96, 32, 18, "120"), {"rows": 64, "sweeps": 1, **_INK})
         self.assertIn(_BLOCK_EXIT, block)
         self.assertNotIn("BALLOT", block)
 

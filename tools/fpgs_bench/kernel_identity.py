@@ -175,10 +175,9 @@ def factory_calls():
         return factory(*args, classes=keyed_classes(layout), **kwargs)
 
     layout = Named("KeyedLayout(18, 0, 0, 0, 48, False, 0)", KeyedLayout(18, 0, 0, 0, 48, False, 0))
-    for rows, min_rows in ((32, 0), (48, 32)):
+    for rows in (32, 48):
         kwargs = {
             "rows": rows,
-            "min_rows": min_rows,
             "sweeps": 24,
             "inkernel_response": (18, 0, 0, 0),
             "linked_rows": True,
@@ -497,7 +496,7 @@ def walk_calls():
     mf_gs = _unwrapped(sweep_routes.mf_gs_kernel)
     free = {"free_rows": False, "speed_rows": True, "has_dense_velocity_limit_rows": False}
     yield "sweep_routes.mf_gs_kernel", mf_gs, (64, 32, 12, ARCH), free
-    tiers = {"rows": 32, "min_rows": 0, "sweeps": 24, "inkernel_response": (18, 0, 0, 0)}
+    tiers = {"rows": 32, "sweeps": 24, "inkernel_response": (18, 0, 0, 0)}
     yield "sweep_routes_tiers.parallel_kernel", sweep_routes_tiers.parallel_kernel, (64, 32, 18, ARCH), tiers
 
 
@@ -591,10 +590,7 @@ def census_calls():
             sweep_routes_tiers.parallel_kernel,
             ((192, 32, 18, ARCH),),
             (
-                tuple(
-                    {"rows": rows, "min_rows": low, "sweeps": 24, "inkernel_response": (18, 0, 0, 0)}
-                    for rows, low in ((32, 0), (48, 32), (128, 96))
-                ),
+                tuple({"rows": rows, "sweeps": 24, "inkernel_response": (18, 0, 0, 0)} for rows in (32, 48, 128)),
                 _axis("linked_rows"),
                 _axis("velocity_limit_pass"),
             ),
@@ -609,11 +605,10 @@ def census_calls():
                 tuple(
                     {
                         "rows": rows,
-                        "min_rows": low,
                         "sweeps": 24,
                         "inkernel_response": (16, 6, 0, 16),
                     }
-                    for rows, low in ((32, 0), (64, 32), (96, 64), (128, 96))
+                    for rows in (32, 64, 96, 128)
                 ),
                 _axis("linked_rows"),
                 _axis("velocity_limit_pass"),

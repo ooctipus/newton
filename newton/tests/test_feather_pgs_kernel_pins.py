@@ -55,10 +55,9 @@ def _linked_tier_calls():
     Each also with the last-word velocity-limit pass, which the solver builds for linked tiers with joint velocity
     limits.
     """
-    for tier, last_word in itertools.product(((32, 0), (48, 32)), (False, True)):
+    for rows, last_word in itertools.product((32, 48), (False, True)):
         kwargs = {
-            "rows": tier[0],
-            "min_rows": tier[1],
+            "rows": rows,
             "sweeps": 24,
             "inkernel_response": (18, 0, 0, 0),
             "linked_rows": True,
@@ -83,8 +82,8 @@ def _keyed_layout(*, velocity_limits=False):
 
 def _keyed_tier_kwargs(*, linked):
     """Keyed parallel tiers; ``linked`` selects the patch row law and the ring-pooled projection."""
-    for rows, min_rows in ((32, 0), (64, 32), (96, 64), (128, 96)):
-        kwargs = {"rows": rows, "min_rows": min_rows, "sweeps": 24, "inkernel_response": (16, 6, 0, 16)}
+    for rows in (32, 64, 96, 128):
+        kwargs = {"rows": rows, "sweeps": 24, "inkernel_response": (16, 6, 0, 16)}
         if linked:
             kwargs["linked_rows"] = True
         yield kwargs
@@ -352,8 +351,8 @@ def _solver_factory_calls():
         yield "sweep_routes_local.paired_factor_kernel", factory, args, {"contact_units": True, "speed_rows": speed}
 
     # Parallel tiers: one articulation per world, its response formed in-kernel.
-    for tier in ((32, 0), (48, 32)):
-        kwargs = {"rows": tier[0], "min_rows": tier[1], "sweeps": 24, "inkernel_response": (18, 0, 0, 0)}
+    for rows in (32, 48):
+        kwargs = {"rows": rows, "sweeps": 24, "inkernel_response": (18, 0, 0, 0)}
         yield "sweep_routes_tiers.parallel_kernel", sweep_routes_tiers.parallel_kernel, (64, 32, 18, _ARCH), kwargs
     for label, args, kwargs in _linked_tier_calls():
         yield label, sweep_routes_tiers.parallel_kernel, args, kwargs
@@ -404,12 +403,12 @@ def _suite_shape_calls():
     limited = KeyedLayout(16, 6, 0, 16, 128, True, 0xFFFF, 0xFFFF)
     single = KeyedLayout(18, 0, 0, 0, 48, False, 0)
     for layout, shape, tiers in (
-        (limited, (192, 64, 22, _ARCH), ((32, 0), (64, 32), (96, 64), (128, 96))),
-        (single, (72, 32, 18, _ARCH), ((32, 0), (48, 32))),
+        (limited, (192, 64, 22, _ARCH), (32, 64, 96, 128)),
+        (single, (72, 32, 18, _ARCH), (32, 48)),
     ):
         blocks = (layout.primary, layout.secondary, layout.primary_offset, layout.secondary_offset)
-        for rows, min_rows in tiers:
-            kwargs = {"rows": rows, "min_rows": min_rows, "sweeps": 24, "inkernel_response": blocks}
+        for rows in tiers:
+            kwargs = {"rows": rows, "sweeps": 24, "inkernel_response": blocks}
             yield "keyed_rows.get_parallel_factory", parallel, (layout, *shape), kwargs
     yield "keyed_row_layout.prefix_kernel", limit_prefix, (limited,), {}
 

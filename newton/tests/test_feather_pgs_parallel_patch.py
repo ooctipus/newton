@@ -613,7 +613,7 @@ class TestParallelPatchReference(unittest.TestCase):
     def test_linked_factory_pools_only_the_friction_disk(self):
         """Build linked tiers as the point tiers with the golden ring walk; both take the isotropic pair step."""
         for rows, inkernel in itertools.product((32, 64), ((6, 0, 0, 0), (_DOFS, 0, 0, 0))):
-            options = {"rows": rows, "min_rows": 0, "sweeps": 24, "inkernel_response": inkernel}
+            options = {"rows": rows, "sweeps": 24, "inkernel_response": inkernel}
             with self.subTest(**options):
                 point = sweep_routes_tiers.parallel_kernel(_CAPACITY, 32, _DOFS, "120", **options)
                 linked = sweep_routes_tiers.parallel_kernel(_CAPACITY, 32, _DOFS, "120", linked_rows=True, **options)
@@ -1109,9 +1109,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
         for linked in (False, True):
             options = {"inkernel_response": (_DOFS, 0, 0, 0), "linked_rows": linked}
             kernels = [
-                sweep_routes_tiers.parallel_kernel(
-                    _CAPACITY, 32, _DOFS, "120", rows=rows, min_rows=rows - 32, sweeps=sweeps, **options
-                )
+                sweep_routes_tiers.parallel_kernel(_CAPACITY, 32, _DOFS, "120", rows=rows, sweeps=sweeps, **options)
                 for rows, sweeps in ((32, 24), (64, 34))
             ]
             probe = SimpleNamespace(
@@ -1453,7 +1451,6 @@ class TestParallelPatchKernel(unittest.TestCase):
                         _DOFS,
                         arch,
                         rows=rows,
-                        min_rows=min_rows,
                         sweeps=24,
                         inkernel_response=(_DOFS, 0, 0, 0),
                         linked_rows=linked,

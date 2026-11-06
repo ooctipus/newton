@@ -540,7 +540,7 @@ class Sweep:
                 tiers = [(min(first + width, parallel_rows), first) for first in range(0, parallel_rows, width)]
                 self.par_tiers = list(tiers)
                 tier_sweeps, self.par_sweeps_rule, self.par_sweeps_reason = self._parallel_tier_sweeps(tiers)
-                for tier_index, ((rows_, min_rows_), sweeps_) in enumerate(zip(tiers, tier_sweeps, strict=True)):
+                for tier_index, ((rows_, _), sweeps_) in enumerate(zip(tiers, tier_sweeps, strict=True)):
                     tier = self.kernel(
                         "parallel_tier",
                         parallel_factory,
@@ -551,7 +551,6 @@ class Sweep:
                         readout_budget=sweeps_,
                         rows=rows_,
                         sweeps=sweeps_,
-                        min_rows=min_rows_,
                         inkernel_response=self.classes.tiers.sizes,
                         linked_rows=True,
                         velocity_limit_pass=self._parallel_velocity_limit_pass(),
