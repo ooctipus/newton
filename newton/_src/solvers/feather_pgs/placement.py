@@ -29,8 +29,10 @@ from ...core.contact_pool import ContactField, model_contact_pool
 from ...sim import Contacts
 from ...sim.contacts import CAPACITY_BLOCKS_PER_SM, contact_capacity_blocks
 from ...sim.enums import JointType
-from . import host_index, packed_rows
+from . import field_group, host_index, packed_rows
+from .factor.walk import walk_tables
 from .field_group import Field, FieldGroup, SolverArrays, fields_of
+from .route_table import first_failed
 from .row_kernels import RIGID_SPEED_ROWS
 from .row_laws import LINK_ROWS
 from .row_metadata import record_layout
@@ -321,6 +323,7 @@ class Placement:
         """The class plan (:class:`.class_plan.ClassPlan`): the case whose rows this placement holds."""
         self.laws = laws
         self.factor = factor
+        self.support_pin = spec.pins.row_support
         self.arrays = SolverArrays(self, model.device)
         # The line of the row store where each world's rows sit: the dense class's from row 0, the free bodies' from
         # ``body_base``.
@@ -635,11 +638,68 @@ class Placement:
                 self.packed_support, self.packed_dense = self.forest.max_world_dofs, packed_rows.WIDE
             if self.classes.tier_rows and not self.packed_dense:
                 raise RuntimeError("The parallel tiers read their worlds' packed rows at their coordinates")
+            self.place_row_classes()
             sizes = {"world": self.forest.world_count, "row": self.row_pitch, "support": self.packed_support}
         else:
             self.packed_support, self.packed_dense = 1, 0
+            self.row_classes = packed_rows.RowClasses()
+            self.row_classes_reason = "No matrix-free sweep reads packed rows."
             sizes = {"world": 1, "row": 1, "support": 1}
         self.arrays.allocate(packed_rows.PACKED_ROWS, **sizes)
+
+    @property
+    def classed(self) -> bool:
+        return self.row_classes_reason is None
+
+    def place_row_classes(self) -> None:
+        """The rows by their support classes (:func:`.packed_rows.row_classes`, ``row_classes``) where only the general
+        sweep reads them and they take fewer bytes; ``row_classes_reason`` says why not (``None``: they do)."""
+        self.row_classes = packed_rows.RowClasses()
+        model, forest, factor = self.model, self.forest, self.factor
+        self.row_classes_reason = first_failed(
+            (
+                (self.support_pin, "A test pin keeps the rows' sides."),
+                (not self.packed_dense == packed_rows.WIDE, "Bilateral blocks correct rows past their sides."),
+                (not self.classes.tier_rows, "The tiers read their rows at their coordinates."),
+                (self.classes.paired is None, "The paired sweep reads its rows at their coordinates."),
+                (bool(factor.walk_classes), "No tree walks."),
+            )
+        )
+        if self.row_classes_reason is not None:
+            return
+        mimic_dofs = None
+        if self.laws.mimic_count:
+            mimic_dofs = (self.laws._mimic_dof0.numpy(), self.laws._mimic_dof1.numpy())
+        shape_body = model.shape_body.numpy()
+        contact_body = np.zeros(max(int(model.body_count), 1), dtype=bool)
+        contact_body[shape_body[shape_body >= 0]] = True
+        joints = (
+            model.articulation_start.numpy(),
+            forest.articulation_joint_end_host,
+            model.joint_child.numpy(),
+            model.joint_qd_start.numpy(),
+        )
+        table = packed_rows.row_classes(
+            walk_tables(factor.walk_classes),
+            factor.walk_class_host,
+            forest.art_to_world.numpy(),
+            forest.world_count,
+            joints,
+            contact_body,
+            mimic_dofs,
+        )
+        rows = forest.world_count * self.row_pitch
+        if table is None:
+            self.row_classes_reason = "The support classes exceed a row's 16-bit class ids."
+        elif 4 * rows * (table.width + 1) + table.nbytes >= 4 * rows * self.packed_support:
+            self.row_classes_reason = (
+                f"Rows of {table.width} entries by class take no fewer bytes than {self.packed_support} by side."
+            )
+        if self.row_classes_reason is not None:
+            return
+        row_class = wp.full((forest.world_count, self.row_pitch), -1, dtype=wp.int32, device=model.device)
+        self.row_classes = field_group.upload(packed_rows.RowClasses, model.device, table, row_class=row_class)
+        self.packed_support, self.packed_dense = int(table.width), 0
 
     def place_dense_response(self, *, paired_coordinates: bool) -> None:
         """Where the dense rows' response lives (``packed_response`` and ``packed_response_reason``).
@@ -853,7 +913,8 @@ class Placement:
         )
 
     def record(self) -> dict:
-        """The block cap of the launches over the contact capacity (``routes.contact_consumers``, 0: uncapped)."""
+        """The block cap of the launches over the contact capacity (``routes.contact_consumers``, 0: uncapped); the
+        packed rows' width and why they keep their sides (``routes.row_classes``)."""
         blocks = int(self.contact_capacity_blocks)
         reason = (
             "Launches over the contact capacity (force export, warm-start snapshot and gathers, keyed-row key"
@@ -861,7 +922,8 @@ class Placement:
             if blocks
             else "Uncapped: a CPU launch, or a kernel compiled without the grid-stride loop, covers every slot."
         )
-        return {"contact_consumers": {"max_blocks": blocks, "reason": reason}}
+        classes = {"support": int(self.packed_support), "reason": self.row_classes_reason}
+        return {"contact_consumers": {"max_blocks": blocks, "reason": reason}, "row_classes": classes}
 
     def record_watermarks(self, contacts):
         """The row high-water telemetry (``Diagnostics.row_watermark``, staged only under it; behavior-neutral): at the

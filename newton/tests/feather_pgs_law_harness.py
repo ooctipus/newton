@@ -1175,23 +1175,32 @@ def whitened_rows(jacobian, L) -> np.ndarray:
 
 def packed_coordinates(solver) -> np.ndarray:
     """The world coordinate of every packed row entry ``[world, row, entry]`` (-1 past the row's sides), from the
-    rows' sides (:mod:`.packed_rows`: dense rows at their coordinates, else side by side). Every side holds response
+    rows' sides (:mod:`.packed_rows`: dense rows at their coordinates, else side by side, each side its coordinates or,
+    where the rows take support classes, its class's: :func:`.packed_rows.row_classes`). Every side holds response
     coordinates (:func:`.row_records.row_sides`)."""
-    sides, sizes = solver.placement.row_sides.numpy(), solver.forest.articulation_response_dof_count.numpy()
+    placement = solver.placement
+    sides, sizes = placement.row_sides.numpy(), solver.forest.articulation_response_dof_count.numpy()
     offsets = solver.forest.articulation_world_dof_offset.numpy()
-    dof = np.full((*sides.shape[:2], solver.placement.packed_Z.shape[2]), -1, dtype=np.int32)
-    for world, count in enumerate(solver.placement.constraint_count.numpy()):
+    if placement.classed:
+        table = placement.row_classes
+        row_class, class_dof, class_count = (a.numpy() for a in (table.row_class, table.class_dof, table.class_count))
+    dof = np.full((*sides.shape[:2], placement.packed_Z.shape[2]), -1, dtype=np.int32)
+    for world, count in enumerate(placement.constraint_count.numpy()):
         for row in range(min(int(count), sides.shape[1])):
             first = 0
-            for art in sides[world, row]:
+            for side, art in enumerate(sides[world, row]):
                 if art < 0:
                     continue
                 n, offset = int(sizes[art]), int(offsets[art])
                 if n <= 0 or offset < 0:
                     raise AssertionError(f"world {world} row {row}: side {art} holds no response coordinates")
-                at = offset if solver.placement.packed_dense else first
-                dof[world, row, at : at + n] = offset + np.arange(n)
-                first += n
+                coordinates = np.arange(n)
+                if placement.classed:
+                    cls = (int(row_class[world, row]) >> (16 * side)) & 0xFFFF
+                    coordinates = class_dof[cls, : class_count[cls]]
+                at = offset if placement.packed_dense else first
+                dof[world, row, at : at + coordinates.size] = offset + coordinates
+                first += coordinates.size
     return dof
 
 

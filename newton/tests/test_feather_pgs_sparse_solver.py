@@ -364,7 +364,11 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         # The dense route's rows are packed (packed_rows): they move with their row slots.
         packed = ["packed_Z", "row_sides"]
         names += ["sparse_row_dof", "sparse_row_factor"] if sparse else packed
-        arrays = {name: getattr(solver.placement, name).numpy() for name in names}
+        stores = {name: getattr(solver.placement, name) for name in names}
+        if not sparse and solver.placement.classed:
+            # Rows by their support classes (packed_rows.row_classes) carry their classes with them too.
+            stores["row_class"] = solver.placement.row_classes.row_class
+        arrays = {name: store.numpy() for name, store in stores.items()}
         dense_jacobian = None if sparse else unpacked_rows(solver)[0]
         worlds, slots, needed = (
             getattr(solver.placement, name).numpy()
@@ -400,7 +404,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             slots[active] = inverse[slots[active]]
             identities.append([(key, len(rows)) for key, rows in bundles])
         for name, values in arrays.items():
-            getattr(solver.placement, name).assign(values)
+            stores[name].assign(values)
         solver.placement.contact_slot.assign(slots)
         return identities
 

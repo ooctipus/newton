@@ -283,6 +283,14 @@ def _dense_build_calls():
     for args in ((0, False), (8, True)):
         block = (*args, True, tables, walk_rows.WRITER_BLOCK_ROWS)
         yield "walk_rows.walked_rows_kernel", walk_rows.walked_rows_kernel.__wrapped__, block, {}
+    # By the rows' support classes (packed_rows.row_classes): every row, and the topology part.
+    for tail in ((0, True), (walk_rows.WRITER_BLOCK_ROWS, True)):
+        yield (
+            "walk_rows.walked_rows_kernel",
+            walk_rows.walked_rows_kernel.__wrapped__,
+            (0, False, True, tables, *tail),
+            {},
+        )
     # The sparse diagonal's one writer, the star's walker on the same classes.
     yield "walk_rows.slot_rows_kernel", walk_rows.slot_rows_kernel.__wrapped__, (True, tables), {}
     # With velocity-limit rows: a key's joint row is one step to the world, into a slot.
@@ -338,6 +346,10 @@ def _solver_factory_calls():
     factory = built(sweep_routes.GeneralSweep)
     places = {"places": sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL, Place.GLOBAL)}
     yield "sweep_routes.GeneralSweep", factory, (64, 32, 12, _ARCH), places
+    # Rows by their support classes (packed_rows.row_classes), staged and streamed.
+    for places in (sweep_routes.RowPlaces(), sweep_routes.RowPlaces(Place.GLOBAL)):
+        kwargs = {"places": places, "support_classes": True, "max_row_dofs": 7}
+        yield "sweep_routes.GeneralSweep", built(sweep_routes.GeneralSweep), (64, 32, 12, _ARCH), kwargs
     # The colored units' slot staging, under each law (the weights a constant of the plan).
     for weighted in (False, True):
         yield "sweep_units.stage_slots", sweep_units.stage_slots.__wrapped__, (weighted,), {}

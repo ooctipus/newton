@@ -31,7 +31,7 @@ import newton
 from newton._src.solvers.feather_pgs.factor.walk import TreeWalk, local_frames
 from newton._src.solvers.feather_pgs.row_laws import ROW_SPEED
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import walk_class_of
+from newton.tests.feather_pgs_law_harness import packed_coordinates, walk_class_of
 from newton.tests.test_feather_pgs_factor import BOUND, ROUNDING, Capture, catalogue, random_tree, run_route
 from newton.tests.test_feather_pgs_response_diagonal import _build_mixed_response_model
 
@@ -438,7 +438,8 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
     art_world = forest.art_to_world.numpy()
     free = forest.is_free_rigid_host if forest.is_free_rigid is not None else np.zeros(sizes.size, dtype=np.int32)
     slips = factor.walk_view().release.count.numpy()
-    dense = bool(placement.packed_dense)
+    # Each entry's world coordinate, whatever the rows' layout (by side, dense, or by support class).
+    coordinates = packed_coordinates(solver)
     incident = placement.row_incident.numpy().astype(np.float64)
     sides_all = placement.row_sides.numpy()
     counts = placement.constraint_count.numpy()
@@ -471,19 +472,18 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
                 ball[world] |= capture.impulses[line, row] != 0.0
                 continue
             term, scale_z, scale_u, length = 0.0, 0.0, 0.0, 0
-            at = 0
             skip = False
             for art in sides_all[line, row]:
                 if art < 0:
                     continue
                 n, offset = int(sizes[art]), int(offsets[art])
-                entries = slice(offset if dense else at, (offset if dense else at) + n)
-                at += n
+                held = (coordinates[line, row] >= offset) & (coordinates[line, row] < offset + n)
                 if slips[art] or solver.factor.eliminates:
                     skip = True
                     break
                 u_hat = u_hat_of(art)
-                Z = capture.Z_final[line, row, entries]
+                Z = np.zeros(n)
+                Z[coordinates[line, row, held] - offset] = capture.Z_final[line, row, held]
                 term += Z @ u_hat
                 scale_z, scale_u = scale_z + Z @ Z, scale_u + u_hat @ u_hat
                 length = max(length, n)
@@ -527,15 +527,11 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
         line, count = int(first[world]), int(counts[world])
         du = np.zeros(n) + free_du.get(art, 0.0)
         for row in range(count):
-            at = 0
-            for side in sides_all[line, row]:
-                if side < 0:
-                    continue
-                m = int(sizes[side])
-                start = int(offsets[side]) if dense else at
-                at += m
-                if side == art:
-                    du += capture.Z_final[line, row, start : start + m] * capture.impulses[line, row]
+            if art in sides_all[line, row]:
+                held = (coordinates[line, row] >= offsets[art]) & (coordinates[line, row] < offsets[art] + n)
+                du[coordinates[line, row, held] - offsets[art]] += (
+                    capture.Z_final[line, row, held] * capture.impulses[line, row]
+                )
         if not np.any(du):
             continue
         out["free_bodies"] += int(free[art] != 0)

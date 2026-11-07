@@ -19,7 +19,7 @@ from ...core.memory import REGISTERS_PER_THREAD, Buffer, Place, Staging
 from . import kernel_template, sweep_units
 from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude
 from .kernel_template import Dispatch
-from .packed_rows import PACKED_SIDES
+from .packed_rows import CLASS_SIDES, PACKED_SIDES
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_VELOCITY_LIMIT, ROW_SPEED
@@ -202,17 +202,25 @@ FREE_BODY_WALKS = walk_down_prelude((FREE_BODY_WALK,), ahead=0, enter=True)
 prefetch: a one-body walk is no chain whose loads a lane could hold ahead."""
 
 
-def packed_operator(support: int, lanes: Lanes, *, wide: bool = False, rows: WorldRows | None = None) -> SparseFactor:
+def packed_operator(
+    support: int, lanes: Lanes, *, wide: bool = False, rows: WorldRows | None = None, classes: bool = False
+) -> SparseFactor:
     """The dense rows of a matrix-free sweep: packed whitened rows of ``support`` entries (:mod:`.packed_rows`), their
     world coordinates from their sides (``PACKED_COORDINATE``; where ``rows`` stream their records, from the sides
-    their records hold, ``RECORD_COORDINATE``), or with ``wide`` rows every coordinate of the world, and values from the
-    world's first row (``packed_base``), over the factor velocity change the sweep stages (``s_v``)."""
+    their records hold, ``RECORD_COORDINATE``; with ``classes``, by their support classes too, ``CLASS_*``), or with
+    ``wide`` rows every coordinate of the world, and values from the world's first row (``packed_base``), over the
+    factor velocity change the sweep stages (``s_v``)."""
 
     def coordinate(row, entry):
         if wide:
             return f"(world_dof_indices.data[dof_map_base + ({entry})] >= 0 ? ({entry}) : -1)"
         if rows is not None and rows.record:
-            return f"RECORD_COORDINATE({rows.word(row, 0)}, {rows.word(row, 4)}, {entry})"
+            prefix = "CLASS_RECORD" if classes else "RECORD"
+            return f"{prefix}_COORDINATE({rows.word(row, 0)}, {rows.word(row, 4)}, {entry})"
+        if classes:
+            return (
+                f"CLASS_COORDINATE(row_sides.data[off_dense + ({row})], row_classes.data[off_dense + ({row})], {entry})"
+            )
         return f"PACKED_COORDINATE(row_sides.data[off_dense + ({row})], {entry})"
 
     def value(row, entry):
@@ -663,7 +671,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     laws = sweep.laws
     dense = WorldRows(M_D, staging=places.staging, stream=places.dense_impulses is Place.GLOBAL, lanes=row_lanes)
     free = WorldRows(M_MF, staging="record", free=True, stream=places.impulses is Place.GLOBAL, lanes=row_lanes)
-    dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows, rows=dense)
+    dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows, rows=dense, classes=sweep.support_classes)
     free_op = free_body_rows(row_lanes, max_row_dofs)
     staging = mf_gs_staging(
         M_D,
@@ -901,7 +909,8 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         {dense.stores("i")}
     }}{free_stores}
 {end_first_warp}"""
-    return sweep.native(body, lanes=lanes, rows=(PACKED_SIDES,), walks=(FREE_BODY_WALKS,)), staging
+    sides = (PACKED_SIDES, *((CLASS_SIDES,) if sweep.support_classes else ()))
+    return sweep.native(body, lanes=lanes, rows=sides, walks=(FREE_BODY_WALKS,)), staging
 
 
 @dataclasses.dataclass(frozen=True)
@@ -918,9 +927,10 @@ class GeneralSweep(SweepConfig):
       unit builder's rule picks the worlds, :class:`.sweep_units.ColoredRule`);
     - the row record: ``places`` (:class:`RowPlaces`, the plan's storage choice): the dense rows' metadata staged or
       their records streamed; the free rows' records always stream;
-    - the support class: ``max_row_dofs`` (the placement's packed support), ``wide_rows`` (rows over every coordinate,
-      the bilateral block's), and the free bodies' 6 + 6 class: ``free_rows`` their own run, else rows of the line,
-      their ``speed_rows`` the line's last;
+    - the support class: ``max_row_dofs`` (the placement's packed support), ``support_classes`` (each row's sides at
+      their support classes' coordinates, :func:`.packed_rows.row_classes`), ``wide_rows`` (rows over every
+      coordinate, the bilateral block's), and the free bodies' 6 + 6 class: ``free_rows`` their own run, else rows of
+      the line, their ``speed_rows`` the line's last;
     - ``has_dense_velocity_limit_rows``: the velocity limits' last word; ``seeded``: the seed; ``pitch``: the line.
 
     The warp mapping is a warp a world on CUDA and one thread on the CPU (:meth:`work`); the colored one a block of
@@ -937,6 +947,7 @@ class GeneralSweep(SweepConfig):
     has_dense_velocity_limit_rows: bool = True
     seeded: bool = False
     wide_rows: bool = False
+    support_classes: bool = False
     pitch: int | None = None
     free_rows: bool = True
     speed_rows: bool = False
@@ -987,6 +998,7 @@ class GeneralSweep(SweepConfig):
             + ("_material" if self.material else "")
             + ("_seeded" if self.seeded else "")
             + ("_wide" if self.wide_rows else "")
+            + ("_classes" if self.support_classes else "")
             + (f"_p{pitch}" if pitch is not None and pitch != M + MF else "")
             + ("" if self.free_rows else "_line")
             + ("_speed" if self.speed_rows else "")
@@ -1003,6 +1015,16 @@ class GeneralSweep(SweepConfig):
         return (
             # Where spin rows may appear, every friction contact's metric (sweep.friction_metric_stage).
             *((RowArgument("friction_metric", wp.array3d[float], after="omega"),) if self.torsion else ()),
+            # Where the rows are stored by their support classes, the classes' tables and each row's classes.
+            *(
+                (
+                    RowArgument("row_classes", wp.array2d[int], after="omega"),
+                    RowArgument("class_dof", wp.array2d[int], after="omega"),
+                    RowArgument("class_count", wp.array[int], after="omega"),
+                )
+                if self.support_classes
+                else ()
+            ),
             *self.law_operands(),
         )
 

@@ -22,12 +22,15 @@ FLOOR = 1.0e-9
 """Below this a gap [m/s] is the rounding of zero."""
 
 
-def _gaps(scene, device, steps):
-    """Step ``scene`` and yield each step's dense and free-body gaps and terms."""
+def _gaps(scene, device, steps, pins=None, solvers=None):
+    """Step ``scene`` (with the test ``pins``) and yield each step's dense and free-body gaps and terms; ``solvers``
+    collects the solver."""
     model = scene.build(device)
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
-    solver = SolverFeatherPGS(model, **scene.solver_options)
+    solver = SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(**(pins or {})), **scene.solver_options)
+    if solvers is not None:
+        solvers.append(solver)
     state, out, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     for _ in range(steps):
@@ -50,8 +53,75 @@ def test_incident_is_the_whitened_rows_term(test, device):
         test.assertGreater(rows, 0, f"{scene.name} wrote no row")
 
 
+def test_support_classes_hold_the_invariant(test, device):
+    """Rows stored by their support classes (the general placement of a hand of four fingers, a finger's rows on its
+    root path): the invariant holds, each row narrower than its sides."""
+    solvers, rows = [], 0
+    for step, pairs in enumerate(_gaps(scenes.hand(worlds=32), device, 6, {"placement": "general"}, solvers)):
+        gaps, terms = pairs[0]
+        rows += int(np.count_nonzero(terms))
+        test.assertTrue((gaps <= ROUNDING * terms + FLOOR).all(), f"step {step}: worst gap {gaps.max():.3e}")
+    placement = solvers[-1].placement
+    test.assertTrue(placement.classed, placement.row_classes_reason)
+    test.assertLess(placement.packed_support, solvers[-1].forest.max_world_dofs)
+    test.assertGreater(rows, 0, "the hand wrote no row")
+
+
+def _run(scene, device, pins, steps):
+    model = scene.build(device)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    solver = SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(**pins), **scene.solver_options)
+    state, out, control = model.state(), model.state(), model.control()
+    for step in range(steps):
+        state.clear_forces()
+        if scene.control is not None:
+            scene.control(model, control, state, step)
+        pipeline.collide(state, contacts)
+        solver.step(state, out, control, contacts, scene.dt)
+        state, out = out, state
+    return solver, state.body_qd.numpy()
+
+
+def test_support_classes_step_as_sides(test, device):
+    """The rows' support classes reorder no sum on the CPU: a world's entries keep their coordinates' order and drop
+    zeros, so the classes step bit for bit as the rows' sides (the test pin ``row_support=False``); on CUDA the
+    sweep's lanes sum other entries, so a step agrees to rounding (contacts grow it along a trajectory). Scenes:
+    keyboard keys (a key's rows one entry wide, velocity limits), a hand, legs with mimic knees."""
+    cpu = wp.get_device(device).is_cpu
+    for scene in (
+        scenes.keyboard(worlds=32, velocity_limit=0.5),
+        scenes.hand(worlds=32),
+        scenes.legged(worlds=32, mimic=True),
+    ):
+        steps = scene.steps if cpu else 1
+        classes, qd = _run(scene, device, {"placement": "general"}, steps)
+        sides, qd_sides = _run(scene, device, {"placement": "general", "row_support": False}, steps)
+        test.assertTrue(classes.placement.classed, f"{scene.name}: {classes.placement.row_classes_reason}")
+        test.assertFalse(sides.placement.classed)
+        test.assertLess(classes.placement.packed_support, sides.placement.packed_support)
+        if cpu:
+            np.testing.assert_array_equal(qd, qd_sides, err_msg=scene.name)
+        else:
+            np.testing.assert_allclose(qd, qd_sides, rtol=0.0, atol=1e-4 * np.abs(qd_sides).max(), err_msg=scene.name)
+
+
 class TestPlacementInvariants(unittest.TestCase):
     pass
+
+
+add_function_test(
+    TestPlacementInvariants,
+    "test_support_classes_hold_the_invariant",
+    test_support_classes_hold_the_invariant,
+    devices=get_test_devices(),
+)
+add_function_test(
+    TestPlacementInvariants,
+    "test_support_classes_step_as_sides",
+    test_support_classes_step_as_sides,
+    devices=get_test_devices(),
+)
 
 
 add_function_test(

@@ -535,6 +535,15 @@ class SolverFeatherPGS(SolverBase):
         self.placement.allocate_free_body_rows(model)
         self.factor.scatter_armature()
         self.sweep.place_tiers(self.spec.classes.tiers)
+        # The walk is the trees' factor (Z4): the predictor solves every tree of its groups by it, a prescribed tree
+        # beside a responding one in a size group included (the dense factor held it before Z4.2), the placements
+        # that walk read it for their rows and leave, and the border decides a slipping tree's step on it. The held
+        # plan names its trees (held_tree.HeldPlan.walking): the compact diagonal's walk is its inverse (one division a
+        # coordinate, which the star's rows and the sparse diagonal's leave already take), so it takes no walk, in a
+        # held tree group or in the one-coordinate class (coordinate_trees.py). The packed rows' classes read it.
+        walking = self.spec.classes.held.walking
+        if walking.size:
+            self.factor.plan_walk(walking)
         self.placement.allocate_packed_rows()
         # The producer of the tiers' rows (case K4), admitted by its own fit: keyed rows (keyed_rows.create_owner),
         # which write the point and the patch row law.
@@ -567,15 +576,6 @@ class SolverFeatherPGS(SolverBase):
                 "Bilateral blocks are closed in the one writer's block phase (walk_rows): their class must walk, "
                 f"not the {support} placement."
             )
-        # The walk is the trees' factor (Z4): the predictor solves every tree of its groups by it, a prescribed tree
-        # beside a responding one in a size group included (the dense factor held it before Z4.2), the placements
-        # that walk read it for their rows and leave, and the border decides a slipping tree's step on it. The held
-        # plan names its trees (held_tree.HeldPlan.walking): the compact diagonal's walk is its inverse (one division a
-        # coordinate, which the star's rows and the sparse diagonal's leave already take), so it takes no walk, in a
-        # held tree group or in the one-coordinate class (coordinate_trees.py).
-        walking = self.spec.classes.held.walking
-        if walking.size:
-            self.factor.plan_walk(walking)
         if self.placement.walks:
             self.placement.hold_units()
             if support == "factor":

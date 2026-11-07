@@ -31,7 +31,8 @@ from .row_records import DenseRows
 class RowRecords:
     """Where a line's rows' records sit (:func:`.row_metadata.record_layout`: ``record`` from row ``first``, the free
     rows' headers from row ``base`` at word ``free``) and each articulation's first world coordinate and coordinates
-    (``offset``, ``dofs``)."""
+    (``offset``, ``dofs``), or where the rows take support classes (``classed``) each row's word (``classes``,
+    :func:`.packed_rows.row_classes`), which its record holds in place of its sides' widths."""
 
     record: wp.array2d[wp.int32]
     first: int
@@ -39,6 +40,8 @@ class RowRecords:
     free: int
     offset: wp.array[int]
     dofs: wp.array[int]
+    classed: int
+    classes: wp.array2d[int]
 
 
 _RECORD_WORDS, _HEADER_WORDS = wp.constant(RECORD_WORDS), wp.constant(HEADER_WORDS)
@@ -110,10 +113,13 @@ def write_row_record(records: RowRecords, rows: DenseRows, incident: float, line
         if parent >= 0:
             parent = parent - records.base
     else:
-        if sides[0] >= 0:
-            n_a = records.dofs[sides[0]]
-        if sides[1] >= 0:
-            n_b = records.dofs[sides[1]]
+        if records.classed != 0:
+            n_a = records.classes[line, slot]
+        else:
+            if sides[0] >= 0:
+                n_a = records.dofs[sides[0]]
+            if sides[1] >= 0:
+                n_b = records.dofs[sides[1]]
         mu = rows.row_mu[line, slot]
     store_row_record(records.record, at, words, firsts[0], firsts[1], n_a, n_b, diagonal, rhs, kind, parent, mu)
 
@@ -155,4 +161,6 @@ def bind_row_records(placement) -> RowRecords:
     records.free = int(placement.free_records)
     records.offset = placement.forest.articulation_world_dof_offset
     records.dofs = placement.forest.articulation_response_dof_count
+    records.classed = int(placement.classed)
+    records.classes = placement.row_classes.row_class
     return records

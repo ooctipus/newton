@@ -62,6 +62,7 @@ from .field_group import Field
 from .friction_patches import PatchRowLaw
 from .joint_table import FreeBodies
 from .kernel_template import python_kernel
+from .packed_rows import RowClasses, class_rank
 from .projection_laws import friction_ball_metric, friction_pair_metric
 from .row_build import write_contact_row
 from .row_kernels import RIGID_SPEED_ROWS, RowBias, row_bias
@@ -330,7 +331,9 @@ def unit_reader(links: bool, unit_rows: int = 1, contacts: bool = True) -> wp.Fu
 
 
 @cache
-def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tuple, block: int = 0) -> wp.Kernel:
+def walked_rows_kernel(
+    blocks: int, mimic_blocks: bool, side: bool, tables: tuple, block: int = 0, classes: bool = False
+) -> wp.Kernel:
     """The one writer of the general placement, world-major: a world's group of ``lanes`` lanes (:func:`writer_lanes`)
     writes its rows in the block primitive's phases (FL3_design §1.4, W9), the group synchronized between them:
 
@@ -361,6 +364,9 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tupl
     consecutive rows and walks its covector rows (limits, velocity limits, mimics) as one block, each tree's in one
     sweep (:func:`block_walker`), a link row by the unit walker.
 
+    ``classes``: each row stored by its support class (:func:`.packed_rows.row_classes`, :func:`packed_walker`), its
+    classes' word beside it (which its record takes, :func:`.response_builds_rows.write_row_record`).
+
     The worlds: every world, or with ``claimed`` the worlds of the claims' ``walked`` buckets
     (:class:`~newton._src.core.execution.Buckets`, the claim stage's: :func:`.sweep_levels.claim_worlds`), a world a
     lane group of the launch, where the keyed Jacobi tiers walk their own worlds' seeds in their kernels."""
@@ -370,9 +376,9 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tupl
     # A link row is a block row (block_row; links plan blocks, TreeFactor.plan_blocks): the writer reads link rows
     # where it closes blocks. Elsewhere their seeds would hold a second point across every walk.
     read_unit = unit_reader(has_blocks, contacts=not block)
-    walk = packed_walker(1, False, side, tables)
+    walk = packed_walker(1, False, side, tables, classes=classes)
     if block:
-        walk_block = block_walker(block, side, tables)
+        walk_block = block_walker(block, side, tables, classes)
         ints, floats = wp.types.vector(block, int), wp.types.vector(block, float)
 
     def kernel(
@@ -461,6 +467,7 @@ def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tupl
     name = "write_walked_rows" + (f"_blocks{blocks}" if has_blocks else "")
     name += "_mimics" if mimic_blocks else ""
     name += f"_topology{block}" if block else ""
+    name += "_classes" if classes else ""
     return python_kernel(kernel, name, launch_bounds=WRITERS["packed_blocks" if has_blocks else "packed"].bounds)
 
 
@@ -469,12 +476,14 @@ def writer_kernel(solver, part: int = WRITE_ROWS) -> wp.Kernel:
     where bilateral blocks exist (mimics among them under ``enable_bilateral_preelimination``), the records' side
     where a walked joint can have two halves (:attr:`.tree_factor.TreeFactor.walk_side`), and the walking classes'
     paths (:attr:`.tree_factor.TreeFactor.walk_classes`); the topology ``part``'s, its rows walked in blocks of
-    :data:`WRITER_BLOCK_ROWS`."""
+    :data:`WRITER_BLOCK_ROWS`; each row by its support class where the placement stores them so
+    (:attr:`.placement.Placement.classed`)."""
     factor = solver.factor
     blocks = factor.block_capacity if factor.eliminates else 0
     mimics = bool(blocks and solver.options.enable_bilateral_preelimination)
     block = WRITER_BLOCK_ROWS if part == WRITE_TOPOLOGY else 0
-    return walked_rows_kernel(blocks, mimics, factor.walk_side, walk_tables(factor.walk_classes), block)
+    tables = walk_tables(factor.walk_classes)
+    return walked_rows_kernel(blocks, mimics, factor.walk_side, tables, block, solver.placement.classed)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -551,8 +560,8 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
     int count = 0;
     bool reread = false;
 $start    for (int side = 0; side < 2; ++side) {
-        const int art = side == 0 ? art_a : art_b;
-        if (art < 0 || (side == 1 && art == art_a) || RD(sink.response_dofs.data + art) <= 0) continue;
+        const int art = $art;
+        if (art < 0 || (side == 1 && art == $first) || RD(sink.response_dofs.data + art) <= 0) continue;
         const int j0 = RD(walk.joint_start.data + art), d0 = RD(walk.dof_start.data + art);
 $side
         const float* data = walk.data.data + (size_t)d0 * $coordinate;
@@ -795,6 +804,8 @@ def _support_snippet(parent: tuple, first: tuple, node: tuple, rows: int, record
         frame=WALK_FRAME,
         record=record,
         start="",
+        art=_UNIT_ART,
+        first="art_a",
         side=_SUPPORT_SIDE,
         rank="base + POPC(mask & ((1ull << SUPPORT_NODE[c]) - 1ull))",
         below=_SUPPORT_BELOW,
@@ -816,8 +827,9 @@ class RowSink:
     incident velocities and diagonals; the support placement's (case K1, :func:`support_rows_kernel`) support table,
     each body's and coordinate's support mask (factor coordinates), each articulation's first world coordinate, and the
     rows' coordinates and block records; the packed rows' layout, where each side's entries sit in a packed row
-    (:class:`.dense_rows.RowSupport`, :func:`packed_walker`), the star's coordinates (the sparse diagonal's), and the
-    free bodies' first row in the store's line (``base``: their slots count from it). A placement binds what
+    (:class:`.dense_rows.RowSupport`, :func:`packed_walker`), the star's coordinates (the sparse diagonal's), the
+    free bodies' first row in the store's line (``base``: their slots count from it), and the rows' support classes
+    where the packed rows are stored by them (``classes``, :func:`.packed_rows.row_classes`). A placement binds what
     its writer reads."""
 
     walk: WalkTrees
@@ -837,6 +849,7 @@ class RowSink:
     layout: RowSupport
     star: int
     base: int
+    classes: RowClasses
 
 
 @wp.struct
@@ -946,9 +959,59 @@ _PACKED_RELEASE = (
 _CLASS_TREE = """        // The tree's class: its path from the classes' tables in constant memory.
         WALK_TREE(RD(walk.cls.data + art));"""
 
+_UNIT_ART = "side == 0 ? art_a : art_b"
+
+_CLASS_START = """    // The unit's packed rows cleared: each side's walk stores its class's entries, the rest of the row stays zero.
+    for (int r = 0; r < rows; ++r)
+        for (int e = 0; e < S; ++e) ST(Z + r * S + e, 0.0f);
+    // The row's sides in their order (row_records.row_sides): the first side's class's entries, then the second's.
+    const wp::vec2i sides = RD(sink.layout.sides.data + ((size_t)unit.line * sink.layout.sides.shape[1] + unit.slot));
+    int side_class[2] = {-1, -1};
+"""
+
+_CLASS_SIDE = """$tree
+        // The side's support class (packed_rows.row_classes): its seeds' endpoints (their root paths) and their union.
+        int seeds = 0, e0 = -1, e1 = -1;
+        if (covector) {
+            e0 = e1 = RD(sink.classes.limit_class.data + dof0);
+            seeds = 1;
+            if (dof1 >= 0) {
+                e1 = RD(sink.classes.limit_class.data + dof1);
+                seeds = 2;
+            }
+        } else {
+            if (body_a >= 0 && art_a == art) {
+                e0 = e1 = RD(sink.classes.body_class.data + body_a);
+                ++seeds;
+            }
+            if (body_b >= 0 && art_b == art) {
+                e1 = RD(sink.classes.body_class.data + body_b);
+                if (seeds++ == 0) e0 = e1;
+            }
+        }
+        if (seeds == 0) continue;
+        const int cls = CLASS_OF(sink.classes, e0, e1), base = count;
+        count += RD(sink.classes.class_count.data + cls);
+        side_class[side] = cls;
+        int at = -1;
+        // Two seeds on one tree add where their paths meet, then the rows are re-read for their norms.
+        const bool add = seeds > 1;
+        if (add) reread = true;"""
+
+_CLASS_RELEASE = """            WALK_RELEASE_ON(release, art, Z, rows, S, [&](const int c) -> int {
+                const int e = CLASS_RANK(sink.classes, cls, c);
+                return e < 0 ? -1 : base + e;
+            });"""
+
+_CLASS_CLOSE = """    // The row's classes, its first side's then its second's (packed_rows.CLASS_SIDES).
+    for (int r = 0; r < rows; ++r) ST(sink.classes.row_class.data + row0 + r, CLASS_WORD(side_class[0], side_class[1]));
+"""
+
 
 @cache
-def packed_walker(rows: int, spin: bool, side: bool, tables: tuple, star: bool = False) -> wp.Function:
+def packed_walker(
+    rows: int, spin: bool, side: bool, tables: tuple, star: bool = False, classes: bool = False
+) -> wp.Function:
     """The general placement's unit walker (:data:`_SUPPORT`, the support writer's text with the packed rows as its
     sink): a unit's ``rows`` rows walked together through its tree's path, each footprint stored at its coordinate's entry
     in the side's packed row, its diagonal ``|z|^2 + cfm`` and incident ``J v_hat`` from the same walk; ``spin``: the
@@ -956,28 +1019,36 @@ def packed_walker(rows: int, spin: bool, side: bool, tables: tuple, star: bool =
     the arm's side into the row's dense part (its size group's row, ``unit.group``), a key's side left to the writer
     (:func:`star_step`), and the diagonal stored without its slots' squares and ``cfm``, which the writer adds.
     ``tables``: the walking classes' path tables (:func:`.factor.walk.walk_prelude`),
-    fixed at build, each tree's path read from constant memory by its class (one table: every tree's)."""
+    fixed at build, each tree's path read from constant memory by its class (one table: every tree's). With
+    ``classes``, each side's entries are its support class's (:func:`.packed_rows.row_classes`, the sink's
+    ``classes``), the row's sides in their order (:func:`.row_records.row_sides`), and the row's classes stored with
+    it."""
     tree = _CLASS_TREE if len(tables) > 1 else ""
+    if classes:
+        start, side_text = _CLASS_START, substitute(_CLASS_SIDE, tree=tree)
+        rank, release, close = "base + CLASS_NEXT(sink.classes, cls, at, c)", _CLASS_RELEASE, _CLASS_CLOSE
+    else:
+        start, rank, release, close = _PACKED_START, "base + c", _PACKED_RELEASE, ""
+        side_text = substitute(
+            _PACKED_SIDE, skip=_STAR_SKIP if star else "", tree=tree, base="0" if star else _PACKED_BASE
+        )
     body = substitute(
         _SUPPORT,
         rows=rows,
-        release=_PACKED_RELEASE,
+        release=release,
         last=rows - 1,
         coordinate=WALK_COORDINATE,
         link=WALK_LINK,
         frame=WALK_FRAME,
         record="",
-        start=_PACKED_START,
-        side=substitute(
-            _PACKED_SIDE,
-            skip=_STAR_SKIP if star else "",
-            tree=tree,
-            base="0" if star else _PACKED_BASE,
-        ),
-        rank="base + c",
+        start=start,
+        art="sides[side]" if classes else _UNIT_ART,
+        first="sides[0]" if classes else "art_a",
+        side=side_text,
+        rank=rank,
         below="",
         wrench=substitute(_PACKED_WRENCH, spin=int(spin)),
-        close="",
+        close=close,
         entries_end="S",
         zrow="(unit.group * sink.entries.shape[1] + unit.slot)" if star else "row0",
         diag="norm[r]" if star else _HEADER_DIAG,
@@ -988,7 +1059,8 @@ def packed_walker(rows: int, spin: bool, side: bool, tables: tuple, star: bool =
     walk = walk_prelude(tables, rows, half)
     tag = ("_spin" if spin else "") + walk.name.removeprefix(f"walk_{rows}")
     tag += "_star" if star else ""
-    snippet = dual_native(body, preludes=(walk, walk_row_prelude(rows)))
+    tag += "_classes" if classes else ""
+    snippet = dual_native(body, preludes=(walk, walk_row_prelude(rows), *((class_rank(),) if classes else ())))
     return unit_walker(f"packed_walk_{rows}{tag}", snippet)
 
 
@@ -1015,7 +1087,7 @@ _BLOCK = """    // A block of up to $rows covector rows of the packed sink from 
     float* const Z = sink.entries.data + ((size_t)line * sink.entries.shape[1] + slot) * S;
     const int rec0 = line * sink.diag.shape[1] + slot;
     float norm[$rows], incident[$rows];
-    int pending = 0, reread = 0;
+    int pending = 0, reread = 0;$declare
 WALK_UNROLLED
     for (int r = 0; r < $rows; ++r) {
         norm[r] = incident[r] = 0.0f;
@@ -1038,7 +1110,7 @@ WALK_UNROLLED
         const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
 $tree
         // A covector row's one side: its tree's first world coordinate (dense) or entry 0.
-        const int base = sink.layout.dense != 0 ? sink.layout.offset.data[art] : 0;
+        const int base = sink.layout.dense != 0 ? sink.layout.offset.data[art] : 0;$classes
         const float* data = walk.data.data + (size_t)d0 * $coordinate;
         const float* link = walk.link.data + (size_t)j0 * $link;
         const float* vh = sink.v_hat.data + d0;
@@ -1059,7 +1131,7 @@ WALK_UNROLLED
         reread |= adds;
         WALK_SWEEP(data, link, at, body, seed, [&](const int w, const int c, const float z) {
             const int r = w >> 1;
-            float* const entry = Z + r * S + base + c;
+            float* const entry = Z + r * S + $entry;
             if (((adds >> r) & 1) != 0) {
                 ST(entry, RW(entry) + z);
             } else {
@@ -1076,7 +1148,7 @@ WALK_UNROLLED
 WALK_UNROLLED
             for (int r = 0; r < $rows; ++r)
                 if (((mine >> r) & 1) != 0)
-                    WALK_RELEASE_ON(release, art, Z + r * S, 1, S, [&](const int c) -> int { return base + c; });
+                    WALK_RELEASE_ON(release, art, Z + r * S, 1, S, [&](const int c) -> int { return $place; });
         }
     }
 WALK_UNROLLED
@@ -1090,18 +1162,29 @@ WALK_UNROLLED
             }
         }
         ST(sink.diag.data + rec0 + r, norm[r] + sink.cfm);
-        ST(sink.row_incident.data + rec0 + r, incident[r]);
+        ST(sink.row_incident.data + rec0 + r, incident[r]);$close
     }"""
+
+_BLOCK_CLASSES = """
+        // Each row's support class (packed_rows.row_classes): its covectors' endpoints and their union.
+        int cls[$rows];
+WALK_UNROLLED
+        for (int r = 0; r < $rows; ++r) {
+            cls[r] = -1;
+            if (((mine >> r) & 1) == 0) continue;
+            const int e0 = sink.classes.limit_class.data[dof0[r]];
+            cls[r] = row_class[r] = CLASS_OF(sink.classes, e0, dof1[r] >= 0 ? sink.classes.limit_class.data[dof1[r]] : e0);
+        }"""
 
 
 @cache
-def block_walker(rows: int, side: bool, tables: tuple) -> wp.Function:
+def block_walker(rows: int, side: bool, tables: tuple, classes: bool = False) -> wp.Function:
     """The general placement's walker of a block of up to ``rows`` covector rows (:data:`_BLOCK`): a world's rows at
     consecutive slots from ``slot`` (``count`` of them; a row of ``dof0`` -1 is not the block's), each row's seeds its
     ``value0 e_dof0`` and, a mimic's, ``value1 e_dof1`` on articulation ``arts``. Each tree's rows walk one sweep of its
     bodies (``WALK_SWEEP``, the walk with entry points: each seed enters at its coordinate), so a world's rows run as
     independent chains of one sweep, not one chain a lane; each row's footprints, diagonal and incident are the unit
-    walker's (:func:`packed_walker`). ``side`` and ``tables`` as :func:`packed_walker`'s."""
+    walker's (:func:`packed_walker`). ``side``, ``tables`` and ``classes`` as :func:`packed_walker`'s."""
     walk = walk_prelude(tables, 2 * rows, record_half(side))
     body = substitute(
         _BLOCK,
@@ -1109,6 +1192,15 @@ def block_walker(rows: int, side: bool, tables: tuple) -> wp.Function:
         coordinate=WALK_COORDINATE,
         link=WALK_LINK,
         tree="        WALK_TREE(walk.cls.data[art]);" if len(tables) > 1 else "",
+        declare=f"\n    int row_class[{rows}];\n    for (int r = 0; r < {rows}; ++r) row_class[r] = -1;"
+        if classes
+        else "",
+        classes=substitute(_BLOCK_CLASSES, rows=rows) if classes else "",
+        entry="CLASS_RANK(sink.classes, cls[r], c)" if classes else "base + c",
+        place="CLASS_RANK(sink.classes, cls[r], c)" if classes else "base + c",
+        close=(
+            "\n        ST(sink.classes.row_class.data + rec0 + r, CLASS_WORD(row_class[r], -1));" if classes else ""
+        ),
     )
     ints, floats = wp.types.vector(rows, int), wp.types.vector(rows, float)
 
@@ -1126,9 +1218,9 @@ def block_walker(rows: int, side: bool, tables: tuple) -> wp.Function:
         "dof1": ints,
         "value1": floats,
     }
-    name = f"block_walk_{rows}" + walk.name.removeprefix(f"walk_{2 * rows}")
+    name = f"block_walk_{rows}" + walk.name.removeprefix(f"walk_{2 * rows}") + ("_classes" if classes else "")
     native.__name__ = native.__qualname__ = name
-    return wp.func_native(dual_native(body, preludes=(walk,)))(native)
+    return wp.func_native(dual_native(body, preludes=(walk, *((class_rank(),) if classes else ()))))(native)
 
 
 SUPPORT_UNIT_LANES = 16
@@ -1598,6 +1690,7 @@ def packed_sink(solver) -> RowSink:
     placement = solver.placement
     sink = row_sink(solver.factor, solver.forest, placement, solver.v_hat)
     sink.layout = placement.row_support()
+    sink.classes = placement.row_classes
     if solver.spec.classes.support == "diagonal":
         sink.entries = placement.J_by_size[solver.spec.classes.dense_size]
         sink.star = int(solver.spec.classes.diagonal_size)

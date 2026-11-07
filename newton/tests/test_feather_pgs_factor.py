@@ -66,7 +66,13 @@ from newton._src.solvers.feather_pgs.tree_plan import UP_FIRST, UP_SUMS, TreePla
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conformance
-from newton.tests.feather_pgs_law_harness import dense_factor32, free_body_Z, unpacked_rows, walk_inverse
+from newton.tests.feather_pgs_law_harness import (
+    dense_factor32,
+    free_body_Z,
+    packed_coordinates,
+    unpacked_rows,
+    walk_inverse,
+)
 from newton.tests.feather_pgs_mass_reference import MassReference
 from newton.tests.feather_pgs_tree_scan_fixture import (
     MOTION,
@@ -852,12 +858,11 @@ def _seed(walk: TreeWalk, x: np.ndarray):
 def check_rows(solver, joint_q: np.ndarray, capture: Capture, rng) -> RowCheck:
     """F1 on one run: every dense row's sides and every free-body row, then the leave of the step's ``du``."""
     out = RowCheck(operators=tuple(getattr(group.sparse, "kind", "scalar") for group in solver.factor.held.groups))
-    forest, placement = solver.forest, solver.placement
+    forest = solver.forest
     sizes = forest.articulation_response_dof_count.numpy()
     offsets = forest.articulation_world_dof_offset.numpy()
     starts = forest.articulation_dof_start.numpy()
     art_world = forest.art_to_world.numpy()
-    dense = bool(placement.packed_dense)
     walks = {}
 
     def walk_of(art):
@@ -899,6 +904,8 @@ def check_rows(solver, joint_q: np.ndarray, capture: Capture, rng) -> RowCheck:
     # Every stored row's footprints, the one writer's (FL3.3, whose rows form no J).
     if getattr(solver.placement, "walks", False):
         kinds_line = solver.placement.row_type.numpy()
+        # Each entry's world coordinate, whatever the rows' layout (by side, dense, or by support class).
+        coordinates = packed_coordinates(solver)
         for world, count in enumerate(capture.counts):
             line = int(capture.dense_first[world])
             for row in range(int(count)):
@@ -907,16 +914,8 @@ def check_rows(solver, joint_q: np.ndarray, capture: Capture, rng) -> RowCheck:
                     # A speed row of the line: its speed ball's law, not a row (as the free bodies' run's below).
                     ball[world] |= lam != 0.0
                     continue
-                if dense:
-                    du[world, :D] += capture.Z_final[line, row, :D] * lam
-                    continue
-                first = 0
-                for art in capture.sides[line, row]:
-                    if art < 0:
-                        continue
-                    n, offset = int(sizes[art]), int(offsets[art])
-                    du[world, offset : offset + n] += capture.Z_final[line, row, first : first + n] * lam
-                    first += n
+                held = coordinates[line, row] >= 0
+                du[world, coordinates[line, row, held]] += capture.Z_final[line, row, held] * lam
     if capture.mf_final is not None:
         Z_a, Z_b, lam, counts, _, _, dof_a, dof_b, kinds = capture.mf_final
         for world, count in enumerate(counts):

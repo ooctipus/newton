@@ -44,7 +44,7 @@ from .factor.walk import walk_enter_kernel
 from .field_group import Field, FieldGroup, SolverArrays, bind, struct, values
 from .friction_patches import patch_normal_load
 from .kernel_template import KernelTemplate, items
-from .packed_rows import PACKED_SIDES, WIDE
+from .packed_rows import CLASS_SIDES, PACKED_SIDES, WIDE
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_laws import (
     ROW_CONTACT,
@@ -147,6 +147,9 @@ OPERANDS = FieldGroup(
     Field("sparse_row_dof", int, ("line", "row", "entry"), owner="placement", attr="sparse_diagonal_row_dof"),
     Field("sparse_row_z", float, ("line", "row", "entry"), owner="placement", attr="sparse_diagonal_row_z"),
     Field("inverse_mass", float, ("dof",), owner="factor", attr="diagonal_inverse_mass"),
+    Field("row_classes", int, ("line", "row"), owner="class_table", attr="row_class"),
+    Field("class_dof", int, ("class", "entry"), owner="class_table"),
+    Field("class_count", int, ("class",), owner="class_table"),
 )
 """Every operand a support class reads beside the kernel's own, declared once with where the audit finds it."""
 
@@ -212,17 +215,18 @@ def rows_kernel(cls: RowClass) -> wp.Kernel:
     ).kernel()
 
 
-def packed_class(support: int, wide: bool) -> RowClass:
+def packed_class(support: int, wide: bool, classes: bool = False) -> RowClass:
     """The packed rows (:func:`.sweep_routes.packed_operator`): ``Z_i^T u+``, ``u`` the walk's coordinates of ``v+``;
     a world whose rows the tiers form reads ``J_i v+`` (``Z`` there holds ``J``), every other
     ``(J_i v_hat + Z_i^T u+) - Z_i^T u_hat``. A free body's speed row, a row of the line, reads its law's own term,
-    as the free bodies' run's (:func:`free_class`)."""
-    operator = packed_operator(support, ONE, wide=wide)
+    as the free bodies' run's (:func:`free_class`); with ``classes``, by their support classes."""
+    operator = packed_operator(support, ONE, wide=wide, classes=classes)
     at_u = dataclasses.replace(operator, velocity=Velocity("u"))
     at_hat = dataclasses.replace(operator, velocity=Velocity("u_hat"))
     return RowClass(
-        f"packed{support}{'_wide' if wide else ''}",
+        f"packed{support}{'_wide' if wide else ''}{'_classes' if classes else ''}",
         OPERANDS.select(
+            *(("row_classes", "class_dof", "class_count") if classes else ()),
             "row_sides",
             "response_dofs",
             "articulation_world_dof_offset",
@@ -264,7 +268,7 @@ def packed_class(support: int, wide: bool) -> RowClass:
             term = incident.data[(size_t)line * incident.shape[1] + i] + zu - zhat;
         }
         }""",
-        (PACKED_SIDES,),
+        (PACKED_SIDES, *((CLASS_SIDES,) if classes else ())),
     )
 
 
@@ -528,12 +532,19 @@ class Audit:
         if route == "sparse_diagonal":
             size = solver.spec.classes.dense_size
             return slot_class(int(size), int(placement.J_by_size[size].shape[1]))
-        return packed_class(int(placement.packed_support), int(placement.packed_dense) == WIDE)
+        return packed_class(int(placement.packed_support), int(placement.packed_dense) == WIDE, placement.classed)
 
     def _operands_of(self, cls: RowClass, v: wp.array) -> list:
         solver, placement, classes = self.solver, self.solver.placement, self.solver.spec.classes
         owners = {"placement": placement, "forest": solver.forest, "factor": solver.factor, "classes": classes}
-        return values(cls.operands, **owners, audit=self, v=v, dense_Z=placement.J_by_size.get(classes.dense_size))
+        return values(
+            cls.operands,
+            **owners,
+            audit=self,
+            v=v,
+            dense_Z=placement.J_by_size.get(classes.dense_size),
+            class_table=placement.row_classes,
+        )
 
     def launch(self) -> None:
         """Audit the step: after the solve, on the published velocity ``v_out``: each store's velocity terms by the one
