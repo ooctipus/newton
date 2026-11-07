@@ -292,12 +292,12 @@ class TestSlipRelease(unittest.TestCase):
 def release_rows(release, art: int, walk_class, Z: np.ndarray) -> np.ndarray:
     """The release of :func:`.walk_rows.walk_release_kernel` (its device data, by path step) applied to the columns of
     ``Z`` (by tree coordinate), slip by slip as the writer applies it along each slip's root path in the tree's walking
-    class (:meth:`.tree_scan.WalkClass.root_path`): ``u = z - b s``, ``s += a u``, ``z = g u``."""
+    class (:meth:`.tree_scan.WalkClass.steps`): ``u = z - b s``, ``s += a u``, ``z = g u``."""
     Z = Z.astype(np.float64).copy()
     records = release.step.numpy()[art]
     b, a, g = (records[..., k].astype(np.float64) for k in (1, 2, 3))
     for j in range(int(release.count.numpy()[art])):
-        steps = walk_class.root_path(int(release.dof.numpy()[art, j]))
+        steps = [s.c for s in walk_class.steps(False, int(release.dof.numpy()[art, j])) if s.c >= 0]
         s = np.zeros(Z.shape[1])
         for t, c in enumerate(steps):
             u = Z[c] - b[j, t] * s

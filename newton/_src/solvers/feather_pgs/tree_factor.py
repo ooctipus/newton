@@ -880,7 +880,9 @@ class TreeFactor:
         # The release of each tree's slips, which the predictor's border writes (tree_kinetic_state.border_solve): as
         # many slips a tree as it has limited drives (at most RELEASE_SLIPS), each as deep as the deepest root path.
         self.walk_slip_capacity = self.slip_capacity(arts)
-        depth = max([1, *(len(walk.root_path(c)) for walk in classes for c in range(walk.coordinates))])
+        depth = max(
+            [1, *(sum(s.c >= 0 for s in walk.steps(False, c)) for walk in classes for c in range(walk.coordinates))]
+        )
         view.du = wp.zeros(dofs, dtype=wp.float32, device=device)
         view.release = release_view(
             max(int(model.articulation_count), 1),
