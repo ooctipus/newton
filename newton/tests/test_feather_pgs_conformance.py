@@ -1405,12 +1405,13 @@ MF_PARALLEL = Route(
     pins={"tiers": 32, "producer": "walk"},
     expect={"sweep.route": "matrix_free_gs", "sweep.tiers.family": "parallel"},
 )
-# The allegro recipe: the tiers take keyed rows on a model they fit (the legged scene).
+# The allegro recipe: the tiers take keyed rows on a model they fit (the legged scene) where no resolved-world claim
+# runs (allegro's velocity limits decline it; here a pin drops it).
 KEYED_PARALLEL = Route(
     "keyed_parallel",
     "cuda",
     options=_MF,
-    pins={"tiers": 32},
+    pins={"tiers": 32, "claims": ()},
     expect={
         "sweep.route": "matrix_free_gs",
         "sweep.tiers.family": "keyed_parallel",
@@ -1447,25 +1448,21 @@ MF_KINEMATIC = Route(
     options=_MF,
     expect={"sweep.route": "matrix_free_gs", "held_tree.owner": "forest", "held_tree.groups.0.operator": "forest"},
 )
-PAIRED = Route(
-    "paired",
+# The kuka recipes' class, a hub (a hand beside its cube): the Jacobi tiers step its rows at once, by the one writer's
+# rows (the resolved-world claim keeps its worlds whose rows all separate, or the class holds no joint limits).
+HUB = Route(
+    "hub",
     "cuda",
     options=_MF,
-    expect={"paired_response.enabled": True, "paired_response.factor_coordinates": True, "held_tree.owner": "mixed"},
-)
-PAIRED_FOREST = Route(
-    "paired_forest",
-    "cuda",
-    # The kuka recipes' route: the paired factor sweep over one held forest per world, its rows by the one writer.
-    options=_MF,
-    pins={"grouping": "forest"},
     expect={
-        "paired_response.enabled": True,
-        "paired_response.factor_coordinates": True,
-        "held_tree.owner": "forest",
+        "sweep.route": "matrix_free_gs",
+        "sweep.tiers.family": "parallel",
         "contact_rows.producer": "walk",
+        "paired_response.enabled": False,
+        "held_tree.owner": "mixed",
     },
 )
+HUB_FOREST = HUB.but("hub_forest", pins={"grouping": "forest"}, expect={"held_tree.owner": "forest"})
 
 
 # The CPU's route: the held tree and the general row (case K6) at the CPU's lane width, against the CUDA reference's
@@ -1598,12 +1595,12 @@ def cuda_groups() -> list:
                     for route in (SPARSE_DIAGONAL,)
                 ),
             ),
-            Group(_physics(scenes.hand(), law, 16), ref, (PAIRED, PAIRED_FOREST)),
-            # The paired factor sweep's contact units and quads with spin rows, against the general route's.
+            Group(_physics(scenes.hand(), law, 16), ref, (HUB, HUB_FOREST)),
+            # The hub's spin rows on the tiers, against the general route's.
             Group(
                 _physics(scenes.hand(), law, 16, "torsion", contact_torsion=True),
                 ref,
-                (PAIRED.but("paired_torsion", expect={"friction.torsion": True}),),
+                (HUB.but("hub_torsion", expect={"friction.torsion": True}),),
             ),
             # The tiers form the response in-kernel, which bounds an articulation at 32 coordinates: the sprawl (66)
             # and the snake (106) take no tier, even pinned. The held tree's factor runs in global memory.
@@ -1661,11 +1658,11 @@ def cuda_groups() -> list:
                 SPARSE_DIAGONAL_TREE.but("sparse_diagonal_tree_velocity_limits"),
             ),
         ),
-        # The paired factor sweep and its components start from the impulses the warm start carries (case K5).
+        # The hub's tiers start from the impulses the warm start carries.
         Group(
             _physics(scenes.hand(contact_matching="latest"), "patch", 16),
             ref,
-            (PAIRED.but("paired_warm_start", options=_WARM),),
+            (HUB.but("hub_warm_start", options=_WARM),),
         ),
         Group(_physics(scenes.ball_drop(), "patch", 16), ref, (MF_HELD,)),
         Group(_physics(scenes.box_push(), "patch", 16), ref, (MF_HELD,)),
@@ -1721,12 +1718,12 @@ def cuda_groups() -> list:
             ref,
             (SPARSE.but("sparse_kinematic_velocity_limits", expect={"sparse_mass_matrix.velocity_limits": True}),),
         ),
-        # Bilateral pre-elimination on the cases the one writer writes: the paired factor sweep (case K5) and the
-        # Jacobi tiers on its rows (case K4), from the closed blocks' seed.
+        # Bilateral pre-elimination on the cases the one writer writes: the Jacobi tiers on its rows (case K4), the hub's
+        # and the pinned gripper's, from the closed blocks' seed.
         Group(
             _physics(scenes.hand(mimic=True), "patch", 16, "preelimination", enable_bilateral_preelimination=True),
             ref,
-            (PAIRED.but("paired_preelimination", expect={"paired_response.factor_coordinates": True}),),
+            (HUB.but("hub_preelimination"),),
         ),
         Group(
             _physics(scenes.gripper(mimic=True), "patch", 32, "preelimination", enable_bilateral_preelimination=True),
@@ -1736,18 +1733,17 @@ def cuda_groups() -> list:
                 MF_PARALLEL.but("mf_parallel_preelimination"),
             ),
         ),
-        # A mimic row is an articulation row: the paired factor sweep owns the worlds (case K5).
+        # A mimic row is an articulation row: the hub's tiers own the worlds.
         Group(
             _physics(scenes.hand(mimic=True), "patch", 16, "mimic"),
             ref,
-            (PAIRED.but("paired_mimic"),),
+            (HUB.but("hub_mimic"),),
         ),
-        # The paired factor sweep steps velocity-limit rows in place, in slot order, and the general sweep its coupled
-        # worlds' by their last word: a lift whose drive passes its velocity limit (case K5).
+        # The hub's velocity-limit rows: a lift whose drive passes its velocity limit.
         Group(
             _physics(scenes.hand(lift_velocity_limit=0.02), "patch", 16, "velocity_limits", **vlimits),
             ref,
-            (PAIRED.but("paired_velocity_limits"),),
+            (HUB.but("hub_velocity_limits"),),
         ),
     ]
     # The CT benchmark's torsion checks: T1 articulated and free, T3 at every offset (7 mm, where the elliptic cone
@@ -1771,7 +1767,7 @@ def cuda_groups() -> list:
         (scenes.legged(), 32, (SPARSE, MF_HELD, MF_PARALLEL, KEYED_PARALLEL)),
         (scenes.gripper(), 32, (MF_DEFAULT, MF_FOREST)),
         (scenes.keyboard(), 16, (SPARSE_DIAGONAL, SPARSE_DIAGONAL_TREE)),
-        (scenes.hand(), 16, (PAIRED, PAIRED_FOREST)),
+        (scenes.hand(), 16, (HUB, HUB_FOREST)),
     ):
         material = _material(scene)
         groups.append(
@@ -2035,9 +2031,8 @@ OWNERSHIP = (
     (scenes.legged, "patch", 32, SPARSE, ("sparse_pgs",), ("mf_gs",)),
     (scenes.legged, "patch", 32, MF_PARALLEL, (), ("mf_gs",)),
     (scenes.legged, "patch", 32, KEYED_PARALLEL, (), ("mf_gs",)),
-    # The paired factor sweep solves its worlds whole: a lone free body's contacts are rows of the line, so the
-    # matrix-free sweep's free component holds no row.
-    (scenes.hand, "patch", 16, PAIRED, ("paired_factor",), ("mf_gs",)),
+    # The hub's tiers own its worlds; the matrix-free sweep solves none.
+    (scenes.hand, "patch", 16, HUB, (), ("mf_gs",)),
     (scenes.keyboard, "patch", 16, SPARSE_DIAGONAL, ("sparse_diagonal",), ("mf_gs",)),
     # Velocity-limit rows bind on the pushed arm: their last phase counts with the sweep's.
     (

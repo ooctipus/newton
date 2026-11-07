@@ -19,7 +19,7 @@ import warp as wp
 
 from ...core.execution import Buckets, bucket_item
 from ...sim import ModelFlags
-from . import field_group
+from . import field_group, resolved_worlds
 from .contact_input import ContactInput
 from .contact_laws import CONTACT_LAW, CONTACT_SPIN_ROW, contact_friction
 from .factor.walk import WALK_FRAME, WALK_LINK
@@ -470,6 +470,10 @@ def create_owner(solver) -> tuple[KeyedRows | None, str]:
         # Their layout freezes the class's structure: a run-time change the one writer takes (a body made kinematic)
         # asks to reconstruct the solver. Classes without joint limits keep the one writer and that change.
         return None, "Keyed rows take the classes with joint limits; this class keeps the one writer."
+    if resolved_worlds.decline(solver) is None:
+        # The resolved-world claim leaves a world whose every candidate row separates without rows; the keyed prefix
+        # owns its worlds' rows and would make their limit rows live (kuka: 9,956 worlds in the tiers, not 2,151).
+        return None, "The resolved-world claim keeps the worlds whose rows all separate; this class keeps the one writer."
     try:
         return KeyedRows(solver), "Admitted: the in-kernel parallel sweep builds keyed rows for its bounded worlds."
     except ValueError as error:

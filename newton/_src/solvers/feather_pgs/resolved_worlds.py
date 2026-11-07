@@ -658,7 +658,6 @@ def decline(solver) -> str | None:
             # A separating contact carries no load, so its friction and spin rows (contact torsion) carry nothing either:
             # the classifier's normal law decides a world with spin rows as one without.
             (not laws.compliance, "Material contacts are outside the rigid contact law it classifies."),
-            (getattr(solver.placement, "keyed_rows", None) is None, "Keyed rows own the contact rows."),
             (
                 not laws.warm_start
                 and not laws.regularized

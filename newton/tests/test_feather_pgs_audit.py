@@ -317,7 +317,7 @@ class TestAuditCUDA(TestAudit):
             (scenes.box_stack, (conformance.MF_HELD,)),
             (scenes.legged, (conformance.MF_HELD, conformance.SPARSE, conformance.MF_PARALLEL)),
             (scenes.gripper, (conformance.MF_PARALLEL,)),
-            (scenes.hand, (conformance.PAIRED,)),
+            (scenes.hand, (conformance.HUB,)),
             (scenes.keyboard, (conformance.SPARSE_DIAGONAL,)),
         ):
             scene = build()

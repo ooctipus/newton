@@ -513,15 +513,15 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         self.assertLess(float(np.abs(np.diff(q[:, :, 0], axis=0)).max()) / DT, 1.0)
         self._assert_patch_history(plain_solver, owner_solver)
 
-    def test_paired_response_scenes_are_owned(self):
-        """A 17-joint arm with a free box per world (the Kuka scenes' class) selects the paired response and is owned."""
+    def test_hub_scenes_are_owned(self):
+        """A 17-joint arm with a free box per world (the Kuka scenes' class), a hub whose rows the tiers step at once,
+        is owned."""
         model = _build(wp.get_device("cuda:0"), links=17)
         plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False, rows=192, swing_stride=17)
-        self.assertEqual(plain_solver.sweep.paired_response_primary_size, 17)
-        self.assertTrue(plain_solver.sweep.paired_factor_coordinates)
+        self.assertIsNotNone(plain_solver.spec.classes.tiers)
         owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, rows=192, swing_stride=17)
         self.assertIsInstance(owner, HeldTree)
-        self.assertEqual(owner_solver.sweep.paired_response_primary_size, 17)
+        self.assertIsNotNone(owner_solver.spec.classes.tiers)
         self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [6, 17])
         self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
         np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=3.0e-4, rtol=0.0)

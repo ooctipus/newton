@@ -93,8 +93,7 @@ def _add_body(builder, xform, limits):
 
 def _add_arm(builder, joints=1):
     """Add an arm of ``joints`` revolute joints in a chain to the current world, so the world's sweep visits dense rows
-    before its free bodies' speed rows; 17 to 26 joints beside the box make the paired factor sweep's class (case
-    K5)."""
+    before its free bodies' speed rows; 17 joints beside the box make a hub of more coordinates than a hand's."""
     parent, chain = -1, []
     for _ in range(joints):
         link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.1))
@@ -348,13 +347,12 @@ class _FreeBodyVelocityLimitChecks:
         wrenches = [np.concatenate((force, torque)) for _, _, force, torque in PAST]
         predicted = np.array([np.concatenate(world) for world in worlds]) + np.array(wrenches)
         expected = _clamped_magnitudes(predicted)
-        # A 17-joint arm beside the box: on CUDA the paired factor sweep's class (case K5), which sweeps the box's
-        # speed rows on its lanes.
+        # A 17-joint arm beside the box: the tiers' class (a hub), whose worlds with speed rows the general sweep takes.
         for articulated, fraction in ((False, 0.0), (True, 0.0), (False, 0.7), (17, 0.0)):
             with self.subTest(articulated=articulated, fraction=fraction):
                 run = _free_boxes(self.device, worlds, articulated=articulated, wrenches=wrenches, fraction=fraction)
-                if articulated == 17 and wp.get_device(self.device).is_cuda:
-                    self.assertIsNotNone(run.solver.spec.classes.paired)
+                if articulated == 17:
+                    self.assertIsNotNone(run.solver.spec.classes.tiers)
                 velocity = _step(run)
                 self.check_rows_are_velocity_limits(run)
                 _assert_on_limit_scale(velocity, expected)

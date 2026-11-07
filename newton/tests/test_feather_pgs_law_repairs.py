@@ -1204,7 +1204,7 @@ class TestDepenetrationCapOnRoutes(unittest.TestCase):
             (scenes.legged(), conformance.KEYED_PARALLEL, 32),
             (scenes.gripper(), conformance.MF_DEFAULT, 32),
             (scenes.keyboard(), conformance.SPARSE_DIAGONAL, 64),
-            (scenes.hand(), conformance.PAIRED, 16),
+            (scenes.hand(), conformance.HUB, 16),
         )
         for scene, route, iterations in cases:
             for law in ("patch",):

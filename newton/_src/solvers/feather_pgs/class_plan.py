@@ -35,8 +35,6 @@ __all__ = ["RULES", "ClassInputs", "ClassPlan", "general_reason", "plan_class"]
 _CONTACT_JACOBIAN_MAX_DOF = 10
 # A warp's lanes: a world that fits them keeps its velocity change a coordinate a lane in registers (case K5).
 _LANES = 32
-# A hub world of fewer coordinates steps its rows at once (:func:`split_level`).
-_SEQUENTIAL_COORDINATES = 23
 # The largest articulation the tiers hold (case K4): a lane keeps its row's coordinates in registers.
 _INKERNEL_MAX_DOF = 32
 
@@ -499,11 +497,6 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     )
 
 
-def split_level(coordinates: int) -> bool:
-    """Whether a hub world of ``coordinates`` steps its rows at once (the split level) rather than in turn."""
-    return coordinates < _SEQUENTIAL_COORDINATES
-
-
 def _in_turn(forest) -> str | None:
     """Why the rows do not step in turn, `u` in registers (a tree beside one free body, in the lanes), or ``None``."""
     shape = forest.shape
@@ -513,10 +506,7 @@ def _in_turn(forest) -> str | None:
         (
             (shape.sizes[shape.free.index(False)] not in forest.diagonal_mass_sizes, "The tree is a star."),
             (shape.coordinates <= _LANES, f"{shape.coordinates} coordinates a world exceed a warp's {_LANES} lanes."),
-            (
-                tier_response(shape)[0] is None or not split_level(shape.coordinates),
-                f"A hub world of {shape.coordinates} coordinates steps its rows at once.",
-            ),
+            (tier_response(shape)[0] is None, "The tiers form the hub's response: its rows step at once."),
         )
     )
 

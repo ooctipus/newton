@@ -1341,10 +1341,10 @@ class TestClassShape(unittest.TestCase):
     def test_paired(self):
         forest = SimpleNamespace(world_count=4, diagonal_mass_sizes=frozenset())
         for tree, several, groups in (
-            (23, False, [3, 2, 1, 0]),
+            (23, False, None),  # 29 coordinates: a hub whose response the tiers form steps its rows at once
             (23, True, None),
             (27, False, None),  # 33 coordinates exceed the lanes
-            (16, False, None),  # 22 coordinates: a hub that steps its rows at once
+            (16, False, None),
         ):
             with self.subTest(tree=tree, several=several):
                 forest.shape = _shape(tree, several=several)
