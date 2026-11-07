@@ -177,13 +177,11 @@ class TestCollisionOutputCapacity(unittest.TestCase):
         with mock.patch.object(collide_module, "NarrowPhase", wraps=original_factory) as factory:
             bounded = _pipeline(model, pairs, broad_phase_output_max=2, deterministic=True)
         kwargs = factory.call_args.kwargs
-        for key in (
-            "max_candidate_pairs",
-            "candidate_pair_work_estimate",
-            "max_mesh_mesh_pairs",
-            "max_mesh_plane_pairs",
-        ):
+        for key in ("max_candidate_pairs", "candidate_pair_work_estimate"):
             self.assertEqual(kwargs[key], 2)
+        # Without mesh pairs the mesh stages get no budget at all.
+        for key in ("max_mesh_mesh_pairs", "max_mesh_plane_pairs"):
+            self.assertEqual(kwargs[key], 0)
         # The pipeline sorts with its own buffers; the narrow phase allocates no standalone sort buffer.
         self.assertEqual(kwargs["contact_max"], 0)
         self.assertEqual(len(bounded._sort_key_array), bounded.contacts().rigid_contact_max)
