@@ -99,7 +99,8 @@ KINETIC_CACHE = field_group.FieldGroup(
     Field("source_qd", wp.uint64, ("group",), owner="cache"),
     Field("stage_clocks", wp.int64, ("group", "stage"), owner="step"),
 )
-"""The held tree's cache. ``diagonal`` is a compact diagonal's ``H_ii`` (a group without one has none). Geometry, forces
+"""The held tree's cache. ``diagonal`` is a compact diagonal's K-free mass ``H_ii + R_ii`` (a group without one has
+none). Geometry, forces
 and source tags follow factor groups (the cache allocates them);
 current validity follows articulation IDs, shared with the ordinary FK/ID cache (the solver's); the stage clocks
 are the owner's."""
@@ -531,7 +532,7 @@ $CLOCK1    for(int dof=lane;dof<$DOFS;dof+=stride) {
         if(refresh) {
             // The coordinate's diagonal entry of H, S^T (I S) with I its body's subtree moment, is all a group reads of
             // H (the walk refreshes from the step's columns): the drives' K-free mass H_ii + R_ii on their rows (the
-            // saturation decision's inertia), and a compact diagonal's H_ii (_DIAGONAL).
+            // saturation decision's inertia), and a compact diagonal's K-free mass (_DIAGONAL).
             const float* t=s+$MOMENT+13*body,*axis=s+$AXIS+6*dof;
             const wp::vec3 l(axis[0],axis[1],axis[2]),w(axis[3],axis[4],axis[5]),h(t[1],t[2],t[3]);
             const wp::vec3 linear=t[0]*l+wp::cross(w,h);
@@ -554,9 +555,10 @@ $CLOCK2    if(lane==0) {
     }
 """
 
-_DIAGONAL = "            cache.diagonal.data[group*$DOFS+dof]=mass;\n"
-"""A compact diagonal's ``H_ii`` (its refresh adds ``R`` and ``K`` and inverts), for a group whose response reads it
-(:func:`get_helpers`'s ``diagonal``)."""
+_DIAGONAL = "            cache.diagonal.data[group*$DOFS+dof]=mass+data.armature.data[ds+dof];\n"
+"""A compact diagonal's K-free mass ``H_ii + R_ii``, for a group with a diagonal root (:func:`get_helpers`'s
+``diagonal``): its predictor divides by it with the drives' ``K`` (:func:`_diagonal_mass`), its refresh adds ``K`` and
+inverts (the rows' inverse mass)."""
 
 _FORCE = cached_force.ForceOperands(
     q="f.joint_q.data",
@@ -645,6 +647,15 @@ _EXTERNAL_CARRY = r"""    if(nonzero) {
 devices): each body's wrench passes its joint into its parent's at the parent's frame (:data:`.tree_scan.WHITEN`'s joint, ``(f, t
 - d x f)``), ``d`` the parent's frame point less its own (``WALK_READ_LINK``, the step's links)."""
 
+_DIAGONAL_PROJECT = r"""const float* c=reinterpret_cast<const float*>(walk.now.data)+$WALK_NOW*dof;
+            const bool turn=c[3]!=0.0f||c[4]!=0.0f||c[5]!=0.0f;
+            float S[6];for(int k=0;k<6;++k)S[k]=(k<3)!=turn?c[k]:0.0f;
+            const float* w=s+6*body;
+            value+=$DOT;"""
+"""A diagonal coordinate's share of the subtree wrench at its body's frame: its one joint's column there, the half of
+its step column ``WALK_NOW`` its joint moves along (a turn's angular half, else a slide's linear half: the walk's
+record names the same half, :func:`.factor.walk.pack_walk_records`), with no record to read."""
+
 _EXTERNAL_PROJECT = r"""float S[6];
             WALK_READ_COLUMN(WALK_LDG,S,reinterpret_cast<const float*>(walk.now.data)+$WALK_NOW*dof,walk.data.data+$WALK_COORDINATE*dof,$HALF);
             const float* w=s+6*body;
@@ -671,7 +682,7 @@ _RESPONSE_HALF = r"""    const auto MOVE=[&](int bits){RAISE(moved,bits);};
     if(lane==0)moved=0;
 $CLOCK0    for(int i=lane;i<$DOFS;i+=stride) {
         s[$SIX_BODIES+i]=trial.force.data[ds+i];
-        s[$WHITE+i]=trial.response.data[ds+i];
+        s[$WHITE+i]=$RESPONSE;
     }
     SYNC();
 $CLOCK1    $TRIAL
@@ -683,8 +694,9 @@ $CLOCK4    if(moved!=0) {
     // A prescribed (kinematic) free root keeps its given velocity: no transport.
     $TRANSPORT_BLOCK
 $TWIST_BLOCK$CLOCK5"""
-"""The predictor's response half (Z4.2): the force and the walk's response read back into the block, then the trial's
-response (``qdd``, ``v_hat``), the drives' decision and the border's decided step, the root transport and the twists."""
+"""The predictor's response half (Z4.2): the force and the walk's response read back into the block (a diagonal root's
+its one division, :data:`_DIAGONAL_TRIAL`), then the trial's response (``qdd``, ``v_hat``), the drives' decision and
+the border's decided step, the root transport and the twists."""
 
 
 @wp.struct
@@ -830,8 +842,8 @@ def get_helpers(
     """Bind one physical tree evaluation to its storage and its scans' schedules.
 
     ``clocked`` adds the collection (``stage_clocks`` columns 13-14) and body
-    term (16-21) counters; ``diagonal`` has the collection keep ``H_ii`` for a
-    compact diagonal's refresh (:data:`_DIAGONAL`). They change the emitted
+    term (16-21) counters; ``diagonal`` has the collection keep a compact
+    diagonal's K-free mass (:data:`_DIAGONAL`). They change the emitted
     code, so they are arguments (cache-key members), never environment reads.
     """
     wrench_word, moment_word = layout.wrench_offset, layout.moment_offset
@@ -1002,7 +1014,7 @@ def get_state_kernel(
     are the scans' schedules;
     ``clocked`` selects the stage counters (``stage_clocks`` columns 0-7 for
     the stages, 22-24 for motion; see :func:`get_helpers`); ``diagonal`` keeps
-    a compact diagonal's ``H_ii`` (:data:`_DIAGONAL`); ``two_half`` (the group
+    a compact diagonal's K-free mass (:data:`_DIAGONAL`); ``two_half`` (the group
     holds a joint whose step column has two halves at its frame,
     :data:`.tree_scan.WALK_BOTH`) forms the walk's step columns a second time
     at the anchor's rotation, where every other group stores S's halves.
@@ -1819,11 +1831,10 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
 
 
 def _walk_roots(layout: TreeLayout) -> list[tuple[int, int, int]]:
-    """``(root, coordinate offset, family)`` of each root the predictor solves: one tree, or each root of a forest (a
-    prescribed root, family 0, responds with zero)."""
-    if layout.forest:
-        return list(zip(range(len(layout.roots)), layout.root_offsets, layout.root_families, strict=True))
-    return [(0, 0, layout.dofs)]
+    """``(root, coordinate offset, family)`` of each root the predictor solves: one tree, or each root of a forest. A
+    prescribed root (family 0) responds with zero; a diagonal root (a negative family, :func:`_diagonal_roots`) by one
+    division."""
+    return list(zip(range(len(layout.roots)), layout.root_offsets, layout.root_families, strict=True))
 
 
 def _walked(layout: TreeLayout, classes: tuple) -> list[tuple[int, int, int]]:
@@ -1837,6 +1848,45 @@ def _walked(layout: TreeLayout, classes: tuple) -> list[tuple[int, int, int]]:
     return walked
 
 
+def _diagonal_roots(layout: TreeLayout) -> tuple[int, ...]:
+    """The roots whose walk is the compact inverse: a compact diagonal family's (a negative family), one-coordinate
+    trees on a fixed base whose mass matrix is its diagonal. No walk holds them: the predictor answers a force on one by
+    one division by its mass (:func:`_diagonal_mass`), the rows step it by the compact inverse
+    (:func:`.walk_rows.key_step`) and the sweep leaves it by the same."""
+    return tuple(r for r, _, family in _walk_roots(layout) if family < 0)
+
+
+def _on_diagonal(layout: TreeLayout, index: str) -> str:
+    """Native test of whether coordinate ``index`` of the group lies on a diagonal root (:func:`_diagonal_roots`):
+    compiled for one tree, the forest's root of the coordinate against the diagonal roots' mask otherwise."""
+    roots = _diagonal_roots(layout)
+    if not layout.forest:
+        return "true" if roots else "false"
+    return f"((({sum(1 << r for r in roots)})>>{_root(layout).replace('[i]', f'[{index}]')})&1)"
+
+
+def _diagonal_mass(index: str, stiffness: str) -> str:
+    """Native expression of a diagonal coordinate's mass: its K-free mass, which the group's collection keeps
+    (``cache.diagonal``, :data:`_DIAGONAL`), plus the drive stiffness ``stiffness`` (zero without a drive)."""
+    return f"(cache.diagonal.data[group*$DOFS+{index}]+({stiffness}))"
+
+
+_DIAGONAL_TRIAL = (
+    "$ON?trial.force.data[ds+i]/"
+    + _diagonal_mass("i", "f.drive_row.data[ds+i]>=0?f.row_K.data[f.drive_row.data[ds+i]]:0.0f")
+    + ":trial.response.data[ds+i]"
+)
+"""A diagonal coordinate's trial response, its force over its all-``K`` mass (the trial's walk on the compact inverse);
+another reads the walk's solve."""
+
+_DIAGONAL_DECIDED = r"""    for(int i=lane;i<$DOFS;i+=stride)
+        if($ON&&(moved&(2<<$ROOT)))s[$WHITE+i]=s[$SIX_BODIES+i]/$MASS;
+    SYNC();
+"""
+"""A diagonal coordinate's decided step on a root the decision moved: its decided force over its mass with its decided
+``K`` (the drive's kept stiffness, ``s[i]``, zero without a drive), as the border's walk takes a walked root's."""
+
+
 def border_solve(layout: TreeLayout, classes: tuple) -> str:
     """Native statements of the decided step (FL3.9, W9), one text for both devices (:data:`_HELD`). Each changed
     root's segment holds its walk and builds its release (into :class:`.factor.walk.WalkRelease`, from the marks
@@ -1845,11 +1895,21 @@ def border_solve(layout: TreeLayout, classes: tuple) -> str:
     every slip on its lane (``HELD_APPLY``), the walk down. A root whose step its trial already gives (bit ``1 + r`` of
     ``moved`` clear) keeps its trial's response. The releases are built for every root first: the marks of one root
     lie in the states of another's walk. Nothing is added to the block (H8: g1's predictor sits at the RTX PRO 6000's
-    64 KB carveout line): the walks' join states and twists lie in the dead body words."""
+    64 KB carveout line): the walks' join states and twists lie in the dead body words. A diagonal root's decided step
+    is one division a coordinate (:data:`_DIAGONAL_DECIDED`), ahead of the walked roots'."""
 
+    decided = ""
+    if _diagonal_roots(layout):
+        decided = substitute(
+            _DIAGONAL_DECIDED,
+            layout.sizes(),
+            ON=_on_diagonal(layout, "i"),
+            ROOT=_root(layout),
+            MASS=substitute(_diagonal_mass("i", "s[i]"), layout.sizes()),
+        )
     roots = [(r, offset) for r, offset, _ in _walked(layout, classes)]
     if not roots:
-        return ""
+        return decided
     tree = (
         "const int a={art};const int j0=walk.joint_start.data[a],d0=walk.dof_start.data[a],n=walk.dofs.data[a];"
         "const float* const data=walk.data.data+(size_t)d0*$WALK_COORDINATE;"
@@ -1887,7 +1947,8 @@ def border_solve(layout: TreeLayout, classes: tuple) -> str:
         for r, offset in roots
     )
     text = (
-        "    {\n"
+        decided
+        + "    {\n"
         + tables
         + "        "
         + "".join(f"int slips{r}=0;" for r, _ in roots)
@@ -2005,12 +2066,13 @@ def _half_kernel(prefix, schedules, layout, response, classes, flag, body, prelu
 def get_force_kernel(schedules: HeldSchedules, *, layout: TreeLayout = REFERENCE_LAYOUT, response="sparse", classes):
     """The predictor's force half (Z4.2, :data:`_FORCE_HALF`): the force on every coordinate into ``trial.force``; it
     clears each root's slip count for the response half's border. The columns' half is the walked classes'
-    (:func:`.tree_scan.classes_half`). A group none of whose roots is walked holds no walk to read: its force takes no
-    external wrench, which no coordinate of it answers."""
+    (:func:`.tree_scan.classes_half`), a diagonal root's its joint's (:data:`_DIAGONAL_PROJECT`). A group none of whose
+    roots responds (prescribed roots, rest trees) takes no external wrench, which no coordinate of it answers."""
 
     walked = tuple(cls for cls in classes if cls is not None)
+    diagonal = _diagonal_roots(layout)
     external = dict.fromkeys(("FRAME", "CARRY", "PROJECT"), "")
-    if walked:
+    if walked or diagonal:
         names = {
             **layout.sizes(),
             "WALK_COORDINATE": WALK_COORDINATE,
@@ -2019,11 +2081,17 @@ def get_force_kernel(schedules: HeldSchedules, *, layout: TreeLayout = REFERENCE
             "WALK_NOW": WALK_NOW,
         }
         edge = ts.WHITEN.joint(ts.LOADED.lever, "q", into="w")
+        dot = ts.dot(ts.channels("S"), ts.channels("w"))
+        project = [substitute(_DIAGONAL_PROJECT, names, DOT=dot)] if diagonal else []
+        if walked:
+            project.append(substitute(_EXTERNAL_PROJECT, names, HALF=ts.classes_half(walked), DOT=dot))
         external = {
             "FRAME": substitute(_EXTERNAL_FRAME, names),
             "CARRY": substitute(_EXTERNAL_CARRY, names, EDGE=ts.statements(edge, 16)),
-            "PROJECT": substitute(
-                _EXTERNAL_PROJECT, names, HALF=ts.classes_half(walked), DOT=ts.dot(ts.channels("S"), ts.channels("w"))
+            "PROJECT": (
+                project[0]
+                if len(project) == 1
+                else f"if({_on_diagonal(layout, 'i')}){{{project[0]}}}else{{{project[1]}}}"
             ),
         }
     return _half_kernel(
@@ -2057,12 +2125,20 @@ $ROOTS
 """
 
 
+def walk_solves(layout: TreeLayout) -> bool:
+    """Whether a group's predictor launches the walk's solve (:func:`get_walk_solve_kernel`): a root it walks or answers
+    with zero, not only diagonal roots."""
+    return any(family >= 0 for _, _, family in _walk_roots(layout))
+
+
 @functools.cache
 def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
     """The walk's solve of the trial (Z4.2, WALK_MAPPING E5): a thread a tree root, the class's walk compiled into
     straight-line code (:meth:`.tree_scan.WalkClass.walk` up to :data:`.tree_scan.WALK_UNROLL` coordinates), the
     walk up of ``trial.force`` into registers and the walk down into ``trial.response``, ``P^T L^-T L^-1 P f`` on the
-    all-``K`` walk (:func:`.tree_scan.walk_texts`). A prescribed root responds with zero."""
+    all-``K`` walk (:func:`.tree_scan.walk_texts`). A prescribed root responds with zero; a diagonal root holds no walk
+    (the response half's division, :data:`_DIAGONAL_TRIAL`), so a group of diagonal roots alone launches none
+    (:func:`walk_solves`)."""
     from .tree_scan import WALK_UNROLL  # noqa: PLC0415
 
     sizes = {"coordinate": WALK_COORDINATE, "link": WALK_LINK}
@@ -2080,8 +2156,11 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
     hand = "WALK_HAND($X, u[$c], 0.0f)"
     walked = {r: k for r, _, k in _walked(layout, classes)}
     cases = []
-    for r, offset, _family in _walk_roots(layout):
-        if r not in walked:
+    for r, offset, family in _walk_roots(layout):
+        if family < 0:
+            # A diagonal root holds no walk: the response half divides its force by its mass.
+            body = ""
+        elif r not in walked:
             body = (
                 f"const int ds = p.art_dof_start.data[art];"
                 f"for (int k = 0; k < {layout.root_coordinates[r]}; ++k) trial.response.data[ds + {offset} + k] = 0.0f;"
@@ -2161,6 +2240,11 @@ def get_predictor_kernel(
         (walk_loads_prelude(), HELD, memory_words(memory.Place.READ_ONLY)),
         TRIAL=held_lambdas(layout, slips, ts.record_half(side))
         + stage("float value=s[$WHITE+col];", clocks["CLOCK2"] + clocks["CLOCK3"], QUIET_DRIVE),
+        RESPONSE=(
+            substitute(_DIAGONAL_TRIAL, layout.sizes(), ON=_on_diagonal(layout, "i"))
+            if _diagonal_roots(layout)
+            else "trial.response.data[ds+i]"
+        ),
         SATURATE=substitute(SATURATE_DRIVES, layout.sizes(), ROOT=_root(layout)),
         BORDER=border_solve(layout, classes),
         SECOND_RESPONSE=stage(changed + "float value=s[$WHITE+col];"),

@@ -2222,7 +2222,7 @@ def _diagonal(solver, art) -> np.ndarray:
 
 def check_geometry(test, evaluated, reference) -> None:
     """What the finish forms of ``H`` against the float64 mass matrix at the last step's output: each drive's K-free
-    mass ``H_ii + R_ii`` (``row_H``) and a compact diagonal's ``H_ii``."""
+    mass ``H_ii + R_ii`` (``row_H``) and a compact diagonal's (every coordinate's)."""
     solver = evaluated.solver
     forest, factor = solver.forest, solver.factor
     row_H, drive_rows, armature = factor.aug_row_H.numpy(), factor.drive_row_by_dof.numpy(), factor.dof_armature.numpy()
@@ -2242,8 +2242,8 @@ def check_geometry(test, evaluated, reference) -> None:
             error = np.abs(row_H[drive_rows[dofs[driven]]] - mass).max(initial=0.0)
             test.assertLessEqual(error, _bound(H), f"row_H of group {index}, {operator.kind}")
             if kept is not None:
-                error = np.abs(kept[index] - np.diag(H)).max()
-                test.assertLessEqual(error, _bound(H), f"H_ii of group {index}, {operator.kind}")
+                error = np.abs(kept[index] - (np.diag(H) + armature[dofs])).max()
+                test.assertLessEqual(error, _bound(H), f"H_ii + R_ii of group {index}, {operator.kind}")
 
 
 def check_factor(test, evaluated, reference) -> None:

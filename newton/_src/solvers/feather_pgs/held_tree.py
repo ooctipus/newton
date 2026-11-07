@@ -67,21 +67,21 @@ def _diagonal_geometry(
     offset: int,
     geometry_group: wp.array[int],
     diagonal: wp.array2d[float],
-    armature: wp.array[float],
     drive_row: wp.array[int],
     drive_k: wp.array[float],
     n: int,
     inverse: wp.array[float],
 ):
-    """The compact diagonal's inverse mass ``1 / (H_ii + R + K)`` from ``H_ii`` as the collection keeps it (its held
-    group's coordinate ``offset + local``), with the ``K`` the drives hold now."""
+    """The compact diagonal's inverse mass ``1 / (H_ii + R + K)`` from ``H_ii + R`` as the collection keeps it (its held
+    group's coordinate ``offset + local``), with the ``K`` the drives hold now: the rows' step on a key
+    (:func:`.walk_rows.key_step`) and the sweep's leave of it."""
     element = wp.tid()
     group, local = element // n, element % n
     art = group_to_art[group]
     if mask[art] == 0:
         return
     dof = dof_start[art] + local
-    mass = diagonal[geometry_group[group], offset + local] + armature[dof]
+    mass = diagonal[geometry_group[group], offset + local]
     row = drive_row[dof]
     if row >= 0:
         if drive_k[row] > 0.0:
@@ -231,7 +231,16 @@ class HeldGroupPlan:
     response: str = "cholesky"
     """``"sparse"``, ``"cholesky"`` (by the walk), or ``"diagonal"`` (a compact diagonal family, or no response)."""
     root_families: tuple = ()
-    """A forest's family per root: its coordinates, negated for the compact diagonal's, 0 when prescribed."""
+    """Each root's family: its coordinates, negated for the compact diagonal's (its walk is the compact inverse: no walk
+    holds it), 0 when prescribed; a forest's per root, a compact diagonal's tree group's one root, empty for the other
+    groups (each tree walks its coordinates)."""
+
+    @property
+    def diagonal(self) -> np.ndarray:
+        """The articulations of the group's diagonal roots (a negative family), which no walk holds."""
+        trees = self.trees if self.kind == "forest" else self.trees.reshape(-1, 1)
+        roots = [r for r, family in enumerate(self.root_families) if family < 0]
+        return trees[:, roots].reshape(-1).astype(np.int32)
 
 
 @dataclass(frozen=True, eq=False)
@@ -261,7 +270,8 @@ class HeldPlan:
     """The dense groups' coverage (:func:`_coverage`), which the held tree proves on notification; ``None`` for the
     sparse group or no tree."""
     walking: np.ndarray
-    """The articulations the walk holds: every one with coordinates but those a group folds (scalar branches)."""
+    """The articulations the walk holds: every one with coordinates but those a group folds (scalar branches) and the
+    compact diagonal's, whose walk is the compact inverse (:attr:`HeldGroupPlan.diagonal`)."""
     drive_dofs: np.ndarray | None
     """The coordinates whose drives the drive stage prepares, ``None`` for every one: a scalar branch's predict folds
     its own."""
@@ -359,8 +369,13 @@ def _size_groups(inputs, member, compact, scalar) -> list:
             trees, places = _part(forest.group_to_art_host[size][first:last], member, first)
             if trees.size:
                 host = _size_trees(model, forest, size, trees, diagonal=diagonal)
-                response = "diagonal" if diagonal else "cholesky"
-                groups.append(HeldGroupPlan("tree", (2, rank, first), trees, places, host, size, response))
+                if diagonal:
+                    # The compact diagonal family: its trees' walk is the compact inverse (a negative family).
+                    groups.append(
+                        HeldGroupPlan("tree", (2, rank, first), trees, places, host, size, "diagonal", (-size,))
+                    )
+                else:
+                    groups.append(HeldGroupPlan("tree", (2, rank, first), trees, places, host, size))
     trees, places = _part(_prescribed_articulations(forest), member)
     if trees.size:
         host = _fit(model, forest, trees, _FREE_BODY, prescribed=True)
@@ -479,9 +494,8 @@ def plan(inputs, *, packed=None, compact=None, scalar=None) -> HeldPlan:
     except ValueError as error:
         raise ValueError(f"The topology does not fit the held groups: {error}") from error
     groups = compose(classes)
-    folded = [group.trees for group in groups if group.kind == "scalar"]
-    if folded:
-        walking = np.setdiff1d(walking, np.concatenate(folded))
+    folded = [group.trees if group.kind == "scalar" else group.diagonal for group in groups]
+    walking = np.setdiff1d(walking, np.concatenate([walking[:0], *folded]))
     return HeldPlan(classes, groups, compact, coverage, walking, drive_dofs)
 
 
@@ -491,10 +505,11 @@ class HeldGroup:
     (:func:`operator_metadata`), with their response's status.
 
     ``kind`` names what the plan chose: ``"sparse"``, ``"tree"``, ``"prescribed"``, ``"rest"`` or ``"forest"``. Every
-    group responds through the walk, whose refresh is the factor's, or with zero; its collection writes the drives'
-    K-free mass (``row_H``) where it forms ``H_ii``. Its own refresh forms only the inverse mass of its compact diagonal
-    ``families``, each ``(size, offset, group_to_art, geometry_group)``: the articulations of one diagonal size and,
-    per articulation, the group whose collection keeps its ``H_ii`` from coordinate ``offset``.
+    group responds through the walk, whose refresh is the factor's, with zero, or on a diagonal root (the compact
+    diagonal's) by one division by its mass; its collection writes the drives' K-free mass (``row_H``) where it forms
+    ``H_ii``. Its own refresh forms only the inverse mass of its compact diagonal ``families``, each ``(size, offset,
+    group_to_art, geometry_group)``: the articulations of one diagonal size and, per articulation, the group whose
+    collection keeps its K-free mass from coordinate ``offset``.
     """
 
     requires_body_velocity = True
@@ -509,8 +524,8 @@ class HeldGroup:
         self.root_families = group.root_families
         group_to_art = wp.array(group.trees[:, 0].copy() if forest else group.trees, dtype=int, device=device)
         self.plan = bind_group_trees(solver, group.host, group_to_art)
-        self.families = self._families(group, group_to_art)
-        # The compact diagonal's refresh reads H's diagonal, which the collection keeps.
+        self.families = self._families(group)
+        # The compact diagonal's predictor and refresh read its K-free mass, which the collection keeps.
         self.diagonal_mass = bool(self.families)
         count = self.plan.group_to_art.size
         self.data = HeldResponse()
@@ -519,21 +534,19 @@ class HeldGroup:
         self.data.status = wp.zeros(count, dtype=int, device=device)
         self.kinetic_state = None
 
-    def _families(self, group, group_to_art) -> tuple:
-        """The compact diagonal families: a tree group's own, or each diagonal-mass root of a forest's, whose refresh
-        reads its coordinates' ``H_ii`` from the forest's collection, from the root's offset (the coordinates of the
-        world's trees before it)."""
+    def _families(self, group) -> tuple:
+        """The compact diagonal families: each diagonal root's (a negative family: a tree group's one root, or a
+        forest's), whose refresh reads its coordinates' K-free mass from the group's collection, from the root's offset
+        (the coordinates of the world's trees before it)."""
         device = self.solver.model.device
-        if group.kind == "tree" and group.response == "diagonal":
-            geometry = wp.array(np.arange(group.trees.size, dtype=np.int32), dtype=int, device=device)
-            return ((group.size, 0, group_to_art, geometry),)
-        if group.kind != "forest":
+        if not any(family < 0 for family in group.root_families):
             return ()
-        counts = self.solver.forest.articulation_dof_count_host[group.trees[0]]
+        trees = group.trees if group.kind == "forest" else group.trees.reshape(-1, 1)
+        counts = self.solver.forest.articulation_dof_count_host[trees[0]]
         offsets = np.concatenate(([0], np.cumsum(counts)))
-        rows = wp.array(np.arange(group.trees.shape[0], dtype=np.int32), dtype=int, device=device)
+        rows = wp.array(np.arange(trees.shape[0], dtype=np.int32), dtype=int, device=device)
         return tuple(
-            (-family, int(offsets[r]), wp.array(group.trees[:, r].copy(), dtype=int, device=device), rows)
+            (-family, int(offsets[r]), wp.array(trees[:, r].copy(), dtype=int, device=device), rows)
             for r, family in enumerate(group.root_families)
             if family < 0
         )
@@ -552,7 +565,6 @@ class HeldGroup:
                     offset,
                     geometry_group,
                     self.kinetic_state.mass_diagonal,
-                    solver.factor.dof_armature,
                     solver.factor.drive_row_by_dof,
                     solver.factor.aug_row_K,
                     size,

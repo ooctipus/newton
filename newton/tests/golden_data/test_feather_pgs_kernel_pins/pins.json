@@ -34,7 +34,7 @@
   "friction_patches._prepare_frame": "425f1c657bc06e9a9edc09b705e4bb6c0c38628140b6d4e02506fad76bd3c7b0",
   "friction_patches._reset_history": "d1024f6372fbe2dbca2bf4cedf19a137e51b9d00c4a64bc0f6e954e72bbf325e",
   "friction_patches.link_patch_routes": "6819040f44a963cd82d99d33c0d051dc56d6e5aa7f5e815db115a602471d8be3",
-  "held_tree._diagonal_geometry": "03b6c6b941d04681a39a8635ad9fb38eeb15f2fcc0dd33a35d5f5abb4c41b989",
+  "held_tree._diagonal_geometry": "13c3a58ef772d3bf86d108568dad1df54b152469155edd2c622c0f71aa60e92e",
   "keyed_row_layout.prefix_kernel(KeyedLayout(primary=16, secondary=6, primary_offset=0, secondary_offset=16, parallel_rows=128, velocity_limits=True, velocity_mask=65535, position_mask=65535))": "6617ea40589873ba19afb3dd9c06cf7bd79552eb2050bedc0bf60e913bc3476e",
   "keyed_rows.get_parallel_factory(KeyedLayout(primary=16, secondary=6, primary_offset=0, secondary_offset=16, parallel_rows=128, velocity_limits=False, velocity_mask=0, position_mask=None), 128, 32, 22, '120', inkernel_response=(16, 6, 0, 16), linked_rows=True, min_rows=0, rows=32, sweeps=24)": "aaeaefb9f7ccbef9152dcd5285bbd4a64a798af34f5dd30320be25bcc0882a49",
   "keyed_rows.get_parallel_factory(KeyedLayout(primary=16, secondary=6, primary_offset=0, secondary_offset=16, parallel_rows=128, velocity_limits=False, velocity_mask=0, position_mask=None), 128, 32, 22, '120', inkernel_response=(16, 6, 0, 16), linked_rows=True, min_rows=32, rows=64, sweeps=24)": "a6b51bf855cf13e9e83a57e06cd34adbe2828ffd514430a0cb4ab810c26aca72",

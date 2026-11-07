@@ -272,7 +272,9 @@ class TreeKineticState:
         self.force_kernel = native.get_force_kernel(
             self.schedules, layout=layout, response=self._response, classes=classes
         )
-        self.walk_solve_kernel = native.get_walk_solve_kernel(layout=layout, classes=classes)
+        self.walk_solve_kernel = (
+            native.get_walk_solve_kernel(layout=layout, classes=classes) if native.walk_solves(layout) else None
+        )
         self.predictor_kernel = native.get_predictor_kernel(
             self.schedules,
             layout=layout,
@@ -292,15 +294,15 @@ class TreeKineticState:
 
     def _walk_classes(self):
         """Each root's walking class (:class:`.tree_scan.WalkClass`, its path table in the walk the predictor solves
-        by), or ``None`` for a prescribed root (no coordinates to solve); every group's tree of a root has the same
-        table."""
+        by), or ``None`` for a prescribed root (no coordinates to solve) and a diagonal root (a negative family: its walk
+        is the compact inverse, no table); every group's tree of a root has the same table."""
         from .tree_scan import WALK_BOTH, WalkClass  # noqa: PLC0415
 
         factor, layout = self.solver.factor, self.layout
         walking = getattr(factor, "walk_class_host", None)
         classes = []
-        for r, family in enumerate(layout.root_families if layout.forest else (layout.dofs,)):
-            if family == 0:
+        for r, family in enumerate(layout.root_families):
+            if family <= 0:
                 classes.append(None)
                 continue
             arts = self._root_arts[:, r]
@@ -474,17 +476,19 @@ class TreeKineticState:
         walk = solver.factor.walk_view()
         inputs = [self.sparse.plan, self.sparse.data, self.plan, self.data, force, walk, self.trial]
         device = solver.model.device
-        # The force half, the walk's solve (a thread a tree root), the response half (Z4.2).
+        # The force half, the walk's solve (a thread a tree root; none where every root is diagonal), the response
+        # half (Z4.2).
         wp.launch_tiled(
             self.force_kernel, dim=[self.launch_count], inputs=inputs, block_dim=self.block_dim, device=device
         )
-        wp.launch(
-            self.walk_solve_kernel,
-            dim=self.group_count * len(self.layout.roots),
-            inputs=[self.group_count, self.sparse.plan, self.plan, walk, self.trial],
-            block_dim=self._walk_solve.block,
-            device=device,
-        )
+        if self.walk_solve_kernel is not None:
+            wp.launch(
+                self.walk_solve_kernel,
+                dim=self.group_count * len(self.layout.roots),
+                inputs=[self.group_count, self.sparse.plan, self.plan, walk, self.trial],
+                block_dim=self._walk_solve.block,
+                device=device,
+            )
         wp.launch_tiled(
             self.predictor_kernel, dim=[self.launch_count], inputs=inputs, block_dim=self.block_dim, device=device
         )
