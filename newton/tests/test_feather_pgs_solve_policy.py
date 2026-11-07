@@ -49,7 +49,8 @@ from newton._src.solvers.feather_pgs.solve_policy import (
     sweep_exit,
     vote,
 )
-from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
+from newton._src.solvers.feather_pgs.sweep import sweep_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import built
 from newton.tests.test_feather_pgs_kernel_pins import _kernel_hash
@@ -91,11 +92,11 @@ def _factory_calls():
     return (
         (
             "sparse",
-            sparse_kernel.__wrapped__,
+            built(SparseSweep),
             (48, 18, 12),
             {"active_rows": True, "use_support_table": True, "contact_triplets": True},
         ),
-        ("sparse_lanes", sparse_kernel.__wrapped__, (16, 6, 6), {"lanes_per_world": 8}),
+        ("sparse_lanes", built(SparseSweep), (16, 6, 6), {"lanes_per_world": 8}),
         (
             "mf_gs",
             sweep_routes.mf_gs_kernel.__wrapped__,
@@ -137,7 +138,7 @@ def _vote_census():
     specs = (
         (
             "sparse",
-            sparse_kernel.__wrapped__,
+            built(SparseSweep),
             (48, 18, 12),
             (
                 _axis("active_rows"),
@@ -151,7 +152,7 @@ def _vote_census():
         ),
         (
             "sparse_lanes",
-            sparse_kernel.__wrapped__,
+            built(SparseSweep),
             (32, 8, 8),
             (
                 _axis("lanes_per_world", (16, 8)),
@@ -227,10 +228,10 @@ class TestSolvePolicy(unittest.TestCase):
 
     def test_equal_policies_share_cached_kernels(self):
         """Return one cached kernel for equal policies, and another for a different policy."""
-        first = sparse_kernel(16, 6, 4, solve_policy=SolvePolicy(readout="sweeps"))
-        second = sparse_kernel(16, 6, 4, solve_policy=SolvePolicy(readout="sweeps"))
+        first = sweep_kernel(SparseSweep(16, 6, 4, solve_policy=SolvePolicy(readout="sweeps")))
+        second = sweep_kernel(SparseSweep(16, 6, 4, solve_policy=SolvePolicy(readout="sweeps")))
         self.assertIs(first, second)
-        self.assertIsNot(first, sparse_kernel(16, 6, 4))
+        self.assertIsNot(first, sweep_kernel(SparseSweep(16, 6, 4)))
 
     def test_policy_and_readout_options_are_keyword_only(self):
         """Take the policy and the solver's diagnostics (the readout's option) by keyword only; the exit law takes no
@@ -497,15 +498,15 @@ class TestExitLaw(unittest.TestCase):
     def test_active_rows_stop_only_once_every_unvisited_row_is_quiet(self):
         """Stop an active-row sparse sweep only after a scan finds no unvisited zero-impulse row a visit would move
         beyond its floor: the violation times the relaxation factor, in the law and in the trace alike."""
-        kernel = sparse_kernel.__wrapped__(48, 18, 12, active_rows=True)
+        kernel = sweep_kernel.__wrapped__(SparseSweep(48, 18, 12, active_rows=True))
         snippet = _policy_snippet(self, kernel, QUIET_LITERAL)
         self.assertIn("if (sweep_stop) {", snippet)
         self.assertIn("sweep_stop = !sweep_violation_any;", snippet)
         self.assertIn(f"(!(fabsf(excess) <= {bound('s_rhs[row]', 'fabsf(dot)', '0.0f', diagonal='1.0f')}))", snippet)
-        traced = sparse_kernel.__wrapped__(48, 18, 12, active_rows=True, solve_policy=TRACE)
+        traced = sweep_kernel.__wrapped__(SparseSweep(48, 18, 12, active_rows=True, solve_policy=TRACE))
         for text in (snippet, _policy_snippet(self, traced, "solve_trace_sweep(")):
             self.assertTrue("? omega * fmaxf(-residual, 0.0f) :" in text, "the unvisited-row bound ignores omega")
-        full = sparse_kernel.__wrapped__(48, 18, 12)
+        full = sweep_kernel.__wrapped__(SparseSweep(48, 18, 12))
         self.assertNotIn("sweep_violation", _policy_snippet(self, full, QUIET_LITERAL))
 
 

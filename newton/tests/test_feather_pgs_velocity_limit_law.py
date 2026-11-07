@@ -24,9 +24,16 @@ import newton
 from newton._src.core.memory import Place
 from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
-from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import articulation_factor, chain_walk, leave_walk, row_lines, whitened_rows
+from newton.tests.feather_pgs_law_harness import (
+    articulation_factor,
+    built,
+    chain_walk,
+    leave_walk,
+    row_lines,
+    whitened_rows,
+)
 
 # Every serial sweep generator with velocity-limit rows: (factory, arguments, options, law sites).
 # Each site is the law call one visit of a velocity-limit row compiles (projection_laws.velocity_limit_update and
@@ -60,7 +67,7 @@ _GENERATORS = {
         (_DENSE_PASS, _SPEED_PASS),
     ),
     "sparse_limits": (
-        sparse_kernel.__wrapped__,
+        built(SparseSweep),
         (48, 18, 12),
         {"velocity_limits": True},
         (_DENSE_PASS,),

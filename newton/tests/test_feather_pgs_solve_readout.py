@@ -29,7 +29,8 @@ from newton._src.solvers.feather_pgs.solve_policy import (
     SolveTrace,
 )
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
-from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
+from newton._src.solvers.feather_pgs.sweep import sweep_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.tests.feather_pgs_law_harness import row_lines
 
 SWEEPS = SolvePolicy(readout="sweeps")
@@ -139,7 +140,7 @@ class _SparseCase:
 
     def kernel(self, policy=None):
         options = self.options if policy is None else {**self.options, "solve_policy": policy}
-        return sparse_kernel(*self.shape, **options)
+        return sweep_kernel(SparseSweep(*self.shape, **options))
 
     def run(self, kernel, iterations, *extra):
         """Restore the initial impulses and sweep; capturable."""

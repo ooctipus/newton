@@ -3,7 +3,6 @@
 
 """Check the sparse sweep's contact units against physical sparse PGS references."""
 
-import functools
 import os
 import unittest
 from itertools import product
@@ -19,7 +18,8 @@ from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONT
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
-from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel, sparse_staging
+from newton._src.solvers.feather_pgs.sweep import sweep_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.feather_pgs_sparse_scene import equal_dof_trees
@@ -32,14 +32,16 @@ CANDIDATE_OPTIONS = {"contact_triplets": True}
 def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False):
     """Return the sparse sweep of the triplet tests: with contact units (``candidate``) or the ordinary one."""
     options = dict(CANDIDATE_OPTIONS) if candidate else {}
-    return sparse_kernel(
-        capacity,
-        dofs,
-        width,
-        active_rows=active,
-        use_support_table=True,
-        linked_rows=linked,
-        **options,
+    return sweep_kernel(
+        SparseSweep(
+            capacity,
+            dofs,
+            width,
+            active_rows=active,
+            use_support_table=True,
+            linked_rows=linked,
+            **options,
+        )
     )
 
 
@@ -402,16 +404,22 @@ class TestSparseContactTriplets(unittest.TestCase):
         # The largest capacity whose linked contact units fit the device's static budget, and one more row. At such
         # capacities the active-row scan's bitsets no longer fit, and the law's units pool their rings in the full sweep.
         budget = arch_budget(wp.get_device("cuda:0").arch)
-        staging = functools.partial(
-            sparse_staging,
-            max_world_dofs=18,
-            max_row_dofs=12,
-            active_rows=False,
-            use_support_table=True,
-            contact_triplets=True,
-            linked_rows=True,
-            torsion=True,  # The law gives a friction region with a footprint its spin row.
-        )
+
+        def staging(rows, **options):
+            return SparseSweep(
+                rows,
+                18,
+                12,
+                **{
+                    "active_rows": False,
+                    "use_support_table": True,
+                    "contact_triplets": True,
+                    "linked_rows": True,
+                    "torsion": True,  # The law gives a friction region with a footprint its spin row.
+                    **options,
+                },
+            ).staging
+
         low, high = 192, 1 << 16
         while high - low > 1:
             middle = (low + high) // 2
@@ -651,9 +659,9 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
     def test_linked_factory_cpu(self):
         """Admit ring-linked normals to contact units in either sweep, and keep point variants unlinked."""
         options = {"use_support_table": True, "contact_triplets": True}
-        active = sparse_kernel(192, 12, 12, active_rows=True, linked_rows=True, **options)
-        full = sparse_kernel(192, 12, 12, linked_rows=True, **options)
-        point = sparse_kernel(192, 12, 12, active_rows=True, **options)
+        active = sweep_kernel(SparseSweep(192, 12, 12, active_rows=True, linked_rows=True, **options))
+        full = sweep_kernel(SparseSweep(192, 12, 12, linked_rows=True, **options))
+        point = sweep_kernel(SparseSweep(192, 12, 12, active_rows=True, **options))
         self.assertTrue(active.key.endswith("_active_support_table_contact_triplets_linked"))
         self.assertTrue(full.key.endswith("_12_12_support_table_contact_triplets_linked"), full.key)
         self.assertTrue(point.key.endswith("_active_support_table_contact_triplets"))
@@ -662,7 +670,7 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         # Point friction fuses only in the active sweep, and nothing fuses without support tables.
         for unfused in ({"use_support_table": True}, {"active_rows": True, "linked_rows": True}):
             with self.subTest(options=unfused):
-                kernel = sparse_kernel(192, 12, 12, contact_triplets=True, **unfused)
+                kernel = sweep_kernel(SparseSweep(192, 12, 12, contact_triplets=True, **unfused))
                 self.assertNotIn("contact_triplets", kernel.key)
 
     def test_patch_triplet_admission_cpu(self):

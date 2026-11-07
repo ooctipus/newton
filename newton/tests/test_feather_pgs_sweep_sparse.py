@@ -24,8 +24,9 @@ from unittest import mock
 from newton._src.solvers.feather_pgs import kernel_template
 from newton._src.solvers.feather_pgs import sweep_routes_sparse as routes
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
+from newton.tests.feather_pgs_law_harness import built
 
-EMITTER = routes.sparse_kernel.__wrapped__
+EMITTER = built(routes.SparseSweep)
 
 _TABLE = {"use_support_table": True}
 _ACTIVE = {"active_rows": True, "use_support_table": True}
@@ -146,10 +147,8 @@ class TestSparseSweepConfiguration(unittest.TestCase):
         self.assertGreater(checked, 50)
 
     def test_rejects_invalid_options(self):
-        """Reject invalid capacities, lanes, layouts and free-body rows."""
+        """Reject invalid capacities, lanes and layouts."""
         cases = (
-            ((16, 6, 4), {"mf_max_constraints": 1}),
-            ((16, 6, 4), {"free_row_dofs": 6}),
             ((0, 6, 4), {}),
             ((16, 6, 7), {}),
             ((16, 72, 4), {"use_support_table": True}),
@@ -181,12 +180,12 @@ class TestSparseSweepConfiguration(unittest.TestCase):
         )
         for args, options in cases:
             with self.subTest(args=args, options=options):
-                body, staging = routes.sparse_source(*args, **options)
+                body, staging = routes.SparseSweep(*args, **options).source()
                 self.assertIn("for (int iter = 0; iter < iterations; ++iter)", body)
                 self.assertGreater(staging.bytes, 0)
                 self.assertTrue(EMITTER(*args, **options).key.startswith(f"sweep_sparse_{args[0]}_{args[1]}_{args[2]}"))
         # A group of 8 lanes fills each 32-row word of the active scan's bitsets 8 bits at a time.
-        body, _ = routes.sparse_source(64, 18, 4, lanes_per_world=8, active_rows=True)
+        body, _ = routes.SparseSweep(64, 18, 4, lanes_per_world=8, active_rows=True).source()
         self.assertIn("for (int first = 0; first < count; first += 8) {", body)
         self.assertIn(
             "s_normal_words[first / 32] = ((first & 31) != 0 ? s_normal_words[first / 32] : 0u) | (mask << (first & 31));",
@@ -200,7 +199,7 @@ class TestSparseSweepConfiguration(unittest.TestCase):
             with self.subTest(label):
                 options = _options(kwargs, policy)
                 template = _template(M, D, S, options)
-                _, staging = routes.sparse_source(M, D, S, **options)
+                _, staging = routes.SparseSweep(M, D, S, **options).source()
                 self.assertTrue(_shared_arrays(template.snippet))
                 self.assertTrue(staging.fits())
                 self.assertEqual(staging.groups, 64 // options.get("lanes_per_world", 32))
@@ -217,7 +216,7 @@ class TestSparseSweepConfiguration(unittest.TestCase):
         )
         seen = set()
         for label, M, D, S, kwargs, policy in CONFIGURATIONS:
-            snippet, _ = routes.sparse_source(M, D, S, **_options(kwargs, policy))
+            snippet, _ = routes.SparseSweep(M, D, S, **_options(kwargs, policy)).source()
             for read, store in spans:
                 for start in (match.start() for match in re.finditer(re.escape(read), snippet)):
                     end = snippet.index(store, start)

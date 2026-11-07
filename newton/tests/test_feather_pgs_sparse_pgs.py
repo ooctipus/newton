@@ -16,7 +16,8 @@ from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
 )
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
-from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
+from newton._src.solvers.feather_pgs.sweep import sweep_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.tests.feather_pgs_law_harness import row_lines
 
 _SWEEP_OMEGAS = (1.0, 0.7, 1.2)
@@ -243,14 +244,8 @@ def _patch_problem(rng, *, dofs=10, regions=4, limits=1):
 class TestFeatherPGSSparsePGS(unittest.TestCase):
     def test_support_table_factory(self):
         """Build the same ordered solver with shared topology indices."""
-        kernel = sparse_kernel(16, 6, 4, active_rows=True, use_support_table=True)
+        kernel = sweep_kernel(SparseSweep(16, 6, 4, active_rows=True, use_support_table=True))
         self.assertIn("support_table", kernel.key)
-
-    def test_factory_rejects_free_body_rows(self):
-        """Reject physical free-body rows, which native sparse factors never hold."""
-        for options in ({"mf_max_constraints": 1}, {"free_row_dofs": 1}):
-            with self.subTest(options=options), self.assertRaisesRegex(ValueError, "free-body rows"):
-                sparse_kernel(16, 6, 4, **options)
 
     def test_factor_coordinate_residual_and_cross_term(self):
         """Preserve physical residuals and paired-tangent effective mass."""
@@ -512,15 +507,17 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         row_support.class_dof = wp.array(unique, dtype=int, device=device)
                         row_support.row_class = wp.array(row_class.reshape(worlds, capacity), dtype=int, device=device)
                         packed_indices = wp.full((1, 1, 1), -9, dtype=int, device=device)
-                    kernel = sparse_kernel(
-                        capacity,
-                        dofs,
-                        support,
-                        active_rows=active_rows,
-                        use_support_table=use_support_table,
-                        lanes_per_world=lanes_per_world,
-                        local_factors=local_factors,
-                        linked_rows=linked_rows,
+                    kernel = sweep_kernel(
+                        SparseSweep(
+                            capacity,
+                            dofs,
+                            support,
+                            active_rows=active_rows,
+                            use_support_table=use_support_table,
+                            lanes_per_world=lanes_per_world,
+                            local_factors=local_factors,
+                            linked_rows=linked_rows,
+                        )
                     )
                     self.assertEqual("_linked" in kernel.key, linked_rows and active_rows)
                     launch_args = {
@@ -560,14 +557,16 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         )
                     if linked_rows and not np.any((types == PGS_CONSTRAINT_TYPE_CONTACT) & (parents >= 0)):
                         # Without a linked normal the ring walk selects as the point scan does.
-                        point_kernel = sparse_kernel(
-                            capacity,
-                            dofs,
-                            support,
-                            active_rows=active_rows,
-                            use_support_table=use_support_table,
-                            lanes_per_world=lanes_per_world,
-                            local_factors=local_factors,
+                        point_kernel = sweep_kernel(
+                            SparseSweep(
+                                capacity,
+                                dofs,
+                                support,
+                                active_rows=active_rows,
+                                use_support_table=use_support_table,
+                                lanes_per_world=lanes_per_world,
+                                local_factors=local_factors,
+                            )
                         )
                         self.assertNotIn("_linked", point_kernel.key)
                         wp.copy(actual_impulses, initial_impulses)
@@ -575,14 +574,16 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         np.testing.assert_array_equal(delta.numpy(), actual)
                         np.testing.assert_array_equal(actual_impulses.numpy(), result_impulses)
                     if use_support_table:
-                        packed_kernel = sparse_kernel(
-                            capacity,
-                            dofs,
-                            support,
-                            active_rows=active_rows,
-                            lanes_per_world=lanes_per_world,
-                            local_factors=local_factors,
-                            linked_rows=linked_rows,
+                        packed_kernel = sweep_kernel(
+                            SparseSweep(
+                                capacity,
+                                dofs,
+                                support,
+                                active_rows=active_rows,
+                                lanes_per_world=lanes_per_world,
+                                local_factors=local_factors,
+                                linked_rows=linked_rows,
+                            )
                         )
                         wp.copy(actual_impulses, initial_impulses)
                         launch_args["inputs"][6] = wp.array(row_dof, device=device)

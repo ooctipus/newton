@@ -3,7 +3,6 @@
 
 """Select the friction law's rows at sparse sweep entry."""
 
-import functools
 import os
 import unittest
 from types import SimpleNamespace
@@ -58,7 +57,10 @@ class TestFeatherPGSSparsePatchRows(unittest.TestCase):
                 self.subTest(dofs=dofs, rows=rows, environment=environment, slack=slack),
                 mock.patch.dict(os.environ, environment, clear=True),
             ):
-                staging = functools.partial(sweep_routes_sparse.sparse_staging, rows, dofs, dofs)
+
+                def staging(rows=rows, dofs=dofs, **options):
+                    return sweep_routes_sparse.SparseSweep(rows, dofs, dofs, **options).staging
+
                 # A world past 16 DOFs or 64 rows never packs; its budget is moot.
                 packable = dofs <= 16 and rows <= 64
                 packed = staging(lanes_per_world=8 if dofs <= 8 else 16).bytes if packable else 1 << 20
@@ -133,7 +135,10 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         """
         model = equal_dof_trees(4, 3, "cuda:0")
         budget = arch_budget(wp.get_device("cuda:0").arch)
-        staging = functools.partial(sweep_routes_sparse.sparse_staging, max_world_dofs=18, max_row_dofs=18)
+
+        def staging(rows, **options):
+            return sweep_routes_sparse.SparseSweep(rows, 18, 18, **options).staging
+
         low, high = 3, 3 * 4096
         while high - low > 1:
             middle = (low + high) // 2

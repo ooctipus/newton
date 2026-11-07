@@ -170,10 +170,10 @@ def _readout_calls():
 
     readout = {"solve_policy": SolvePolicy(readout="sweeps")}
     triplets = {"active_rows": True, "use_support_table": True, "contact_triplets": True}
-    factory = sweep_routes_sparse.sparse_kernel.__wrapped__
+    factory = built(sweep_routes_sparse.SparseSweep)
     for size in ((112, 18, 12), (128, 25, 16), (256, 18, 12)):
-        yield "sweep_routes_sparse.sparse_kernel", factory, size, {**triplets, **readout}
-        yield "sweep_routes_sparse.sparse_kernel", factory, size, {**triplets, "linked_rows": True, **readout}
+        yield "sweep_routes_sparse.SparseSweep", factory, size, {**triplets, **readout}
+        yield "sweep_routes_sparse.SparseSweep", factory, size, {**triplets, "linked_rows": True, **readout}
     factory = built(sweep_routes_diag.DiagonalSweep)
     kwargs = {"contact_units": True, "speculative_contact_batches": True, **readout}
     yield "sweep_routes_diag.DiagonalSweep", factory, (1024, 114, 6, _ARCH), kwargs
@@ -211,9 +211,9 @@ def _module_kernels():
 def _sparse_sweep_calls():
     """Native sparse sweeps over every flag combination without linked rows (sweep_routes_sparse.py); the law's routes
     build the linked ones (:func:`_linked_sweep_calls`)."""
-    from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep  # noqa: PLC0415
 
-    factory = sparse_kernel.__wrapped__
+    factory = built(SparseSweep)
     for size, flags in itertools.product(((32, 8, 8), (48, 18, 12)), itertools.product((False, True), repeat=6)):
         active, table, triplets, velocity, local, warm = flags
         # The factory folds unsatisfiable requests into another variant; pin each variant once.
@@ -221,9 +221,6 @@ def _sparse_sweep_calls():
             continue
         for lanes in (8, 16, 32):
             kwargs = {
-                # The pins name the free-body capacities, which native sparse factors leave at zero.
-                "mf_max_constraints": 0,
-                "free_row_dofs": 0,
                 "active_rows": active,
                 "use_support_table": table,
                 "contact_triplets": triplets,
@@ -232,17 +229,17 @@ def _sparse_sweep_calls():
                 "local_factors": local,
                 "warm_start": warm,
             }
-            yield "sweep_routes_sparse.sparse_kernel", factory, size, kwargs
+            yield "sweep_routes_sparse.SparseSweep", factory, size, kwargs
 
 
 def _linked_sweep_calls():
     """Native sparse sweeps over linked rows (sweep_routes_sparse.py)."""
-    from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep  # noqa: PLC0415
 
-    factory = sparse_kernel.__wrapped__
+    factory = built(SparseSweep)
     for table, warm in itertools.product((False, True), repeat=2):
         kwargs = {"active_rows": True, "use_support_table": table, "warm_start": warm, "linked_rows": True}
-        yield "sweep_routes_sparse.sparse_kernel", factory, (48, 18, 12), kwargs
+        yield "sweep_routes_sparse.SparseSweep", factory, (48, 18, 12), kwargs
     for active, warm in itertools.product((False, True), repeat=2):
         kwargs = {
             "active_rows": active,
@@ -251,7 +248,7 @@ def _linked_sweep_calls():
             "warm_start": warm,
             "linked_rows": True,
         }
-        yield "sweep_routes_sparse.sparse_kernel", factory, (48, 18, 12), kwargs
+        yield "sweep_routes_sparse.SparseSweep", factory, (48, 18, 12), kwargs
 
 
 def _support_writer_calls():
@@ -385,9 +382,9 @@ def _suite_shape_calls():
         ((72, 32, 18, _ARCH), no_limits),
     ):
         yield "sweep_routes.mf_gs_kernel", factory, args, kwargs
-    factory = sweep_routes_sparse.sparse_kernel.__wrapped__
+    factory = built(sweep_routes_sparse.SparseSweep)
     for size, kwargs in _suite_sparse_sweeps():
-        yield "sweep_routes_sparse.sparse_kernel", factory, size, kwargs
+        yield "sweep_routes_sparse.SparseSweep", factory, size, kwargs
     factory = built(sweep_routes_diag.DiagonalSweep)
     for args, kwargs in _suite_diagonal_sweeps():
         yield "sweep_routes_diag.DiagonalSweep", factory, args, kwargs
@@ -574,7 +571,7 @@ class TestFeatherPGSKernelPins(unittest.TestCase):
         """Reach every factory and variant family the routes build."""
         families = {name.split("(", 1)[0] for name in self.current}
         for family in (
-            "sweep_routes_sparse.sparse_kernel",
+            "sweep_routes_sparse.SparseSweep",
             "walk_rows.support_rows_kernel",
             "sweep_routes_diag.DiagonalSweep",
             "sweep_levels._get_sparse_contact_levels_kernel",

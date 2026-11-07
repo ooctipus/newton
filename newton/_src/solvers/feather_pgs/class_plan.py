@@ -15,7 +15,6 @@ and decide nothing of the case.
 
 from __future__ import annotations
 
-import functools
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -301,7 +300,7 @@ def _small_world_lanes(forest, dense_rows: int, staging, budget: int) -> int:
     Args:
         forest: The forest plan.
         dense_rows: The dense rows a world.
-        staging: The sweep's working set for its options (:func:`.sweep_routes_sparse.sparse_staging`).
+        staging: The sweep's working set for its options (:attr:`.sweep_routes_sparse.SparseSweep.staging`).
         budget: Static shared memory available to one block [B].
     """
     if forest.max_world_dofs > 16 or dense_rows > 64:
@@ -445,19 +444,22 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     body_masks, max_support = row_support(forest, model, plan, articulated, articulated_counts, mimic_dofs)
     if not max_support:
         return None, "Topology has no responsive row support."
-    # The sweep's shared working set (sweep_routes_sparse.sparse_staging) against the device's static budget:
+    # The sweep's shared working set (sweep_routes_sparse.SparseSweep.staging) against the device's static budget:
     # each shared-memory choice below reads its own sweep's working set, and the route is admitted by the working
-    # set of the sweep it launches, which the sweep's factory checks the same way.
+    # set of the sweep it launches, which the one factory checks the same way.
     budget = arch_budget(model.device.arch)
-    staging = functools.partial(
-        sweep_routes_sparse.sparse_staging,
-        dense_rows,
-        forest.max_world_dofs,
-        int(max_support),
-        velocity_limits=velocity_candidate,
-        linked_rows=True,
-        torsion=laws.spin_rows,
-    )
+
+    def staging(**options):
+        return sweep_routes_sparse.SparseSweep(
+            dense_rows,
+            forest.max_world_dofs,
+            int(max_support),
+            velocity_limits=velocity_candidate,
+            linked_rows=True,
+            torsion=bool(laws.spin_rows),
+            **options,
+        ).staging
+
     # Patch friction keeps the packed lanes of small worlds, so size them from the
     # full sweep before the active-row scan claims whole warps.
     small_world_lanes = _small_world_lanes(forest, dense_rows, staging, budget)

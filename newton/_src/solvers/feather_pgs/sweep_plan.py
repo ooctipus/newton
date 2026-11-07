@@ -175,11 +175,8 @@ class Sweep:
             support=max_support,
             world_dof=self.forest.max_world_dofs,
         )
-        # Contact torsion: each friction contact's spin row is the fourth of its unit.
-        torsion = {"torsion": True} if self.laws.spin_rows else {}
-        self.sparse_kernel = self.kernel(
-            "sparse_pgs",
-            sweep_routes_sparse.sparse_kernel,
+        # Contact torsion: each friction contact's spin row is the fourth of its unit (the laws' torsion).
+        self.sparse_sweep = sweep_routes_sparse.SparseSweep(
             self.placement.dense_max_constraints,
             self.forest.max_world_dofs,
             max_support,
@@ -188,8 +185,9 @@ class Sweep:
             warm_start=self.options.pgs_warmstart,
             linked_rows=True,
             device_arch=model.device.arch,
-            **torsion,
+            **self.law_fields,
         )
+        self.sparse_kernel = self.sweep("sparse_pgs", self.sparse_sweep)
 
     def plan_support_walk(self) -> None:
         """Case K1 on the walk (FL3.4): the class's writer, release and leave, once the factor holds the walk
@@ -827,9 +825,7 @@ class Sweep:
     def _solve_packed(self, operands: dict) -> None:
         """Case K1: the sparse sweep in factor coordinates, then its velocity change back onto ``v_out``."""
         placement = self.placement
-        layout = shape(
-            sweep_routes_sparse.sparse_work(self.forest.world_count, self.sparse_solve_lanes), device(self.model.device)
-        )
+        layout = shape(self.sparse_sweep.work(self.forest.world_count), device(self.model.device))
         self._launch(
             self.sparse_kernel,
             operands,

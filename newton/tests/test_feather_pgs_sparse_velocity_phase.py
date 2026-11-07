@@ -10,7 +10,8 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
-from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
+from newton._src.solvers.feather_pgs.sweep import sweep_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplet_tests
 from newton.tests import test_feather_pgs_sparse_velocity_limits as velocity_tests
 
@@ -63,7 +64,9 @@ class TestSparseVelocityPhase(unittest.TestCase):
                         data, factor, initial, expected_velocity, expected_impulses = _padded_problem(sign, iterations)
 
                         def factory(capacity, dofs, width, _table=table, **_kwargs):
-                            return sparse_kernel(capacity, dofs, width, use_support_table=_table, velocity_limits=True)
+                            return sweep_kernel(
+                                SparseSweep(capacity, dofs, width, use_support_table=_table, velocity_limits=True)
+                            )
 
                         with mock.patch.object(triplet_tests, "factory", factory):
                             solve = triplet_tests.DeviceSolve(data, candidate=True)

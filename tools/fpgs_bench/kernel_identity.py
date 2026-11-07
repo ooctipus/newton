@@ -541,7 +541,7 @@ def census_calls():
         sweep_routes_tiers,
     )
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
-    from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep  # noqa: PLC0415
     from newton.tests.feather_pgs_law_harness import built, keyed_classes  # noqa: PLC0415
 
     mf_gs = (
@@ -559,8 +559,8 @@ def census_calls():
             mf_gs,
         ),
         (
-            "sweep_routes_sparse.sparse_kernel",
-            sparse_kernel,
+            "sweep_routes_sparse.SparseSweep",
+            built(SparseSweep),
             ((48, 18, 12), (32, 8, 8)),
             (
                 _axis("active_rows"),

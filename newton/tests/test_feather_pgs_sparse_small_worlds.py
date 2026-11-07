@@ -10,7 +10,8 @@ from unittest import mock
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
+from newton._src.solvers.feather_pgs.sweep import sweep_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.tests import test_feather_pgs_sparse_contact_triplets as fixtures
 from newton.tests import test_feather_pgs_sparse_velocity_limits as velocity
 
@@ -42,14 +43,16 @@ class TestSparseSmallWorlds(unittest.TestCase):
                     data["reference_factor_delta"] = np.zeros((worlds, lanes), np.float32)
 
                     def factory(capacity, dofs, width, *, _table=table, _lanes=lanes, _local=local_factors, **_kwargs):
-                        return sparse_kernel(
-                            capacity,
-                            dofs,
-                            width,
-                            use_support_table=_table,
-                            velocity_limits=True,
-                            lanes_per_world=_lanes,
-                            local_factors=_local,
+                        return sweep_kernel(
+                            SparseSweep(
+                                capacity,
+                                dofs,
+                                width,
+                                use_support_table=_table,
+                                velocity_limits=True,
+                                lanes_per_world=_lanes,
+                                local_factors=_local,
+                            )
                         )
 
                     with mock.patch.object(fixtures, "factory", factory):
@@ -106,15 +109,17 @@ class TestSparseSmallWorlds(unittest.TestCase):
                 warp = fixtures.DeviceSolve(data, candidate=True)
 
                 def factory(capacity, dofs, width, *, _lanes=lanes, _local=local, **_kwargs):
-                    return sparse_kernel(
-                        capacity,
-                        dofs,
-                        width,
-                        active_rows=True,
-                        use_support_table=True,
-                        contact_triplets=True,
-                        lanes_per_world=_lanes,
-                        local_factors=_local,
+                    return sweep_kernel(
+                        SparseSweep(
+                            capacity,
+                            dofs,
+                            width,
+                            active_rows=True,
+                            use_support_table=True,
+                            contact_triplets=True,
+                            lanes_per_world=_lanes,
+                            local_factors=_local,
+                        )
                     )
 
                 with mock.patch.object(fixtures, "factory", factory):
@@ -136,15 +141,17 @@ class TestSparseSmallWorlds(unittest.TestCase):
                 physical = (*physical[:-1], np.zeros_like(physical[-1]))
 
                 def factory(capacity, dofs, width, *, _lanes=lanes, **_kwargs):
-                    return sparse_kernel(
-                        capacity,
-                        dofs,
-                        width,
-                        active_rows=True,
-                        use_support_table=True,
-                        contact_triplets=True,
-                        velocity_limits=True,
-                        lanes_per_world=_lanes,
+                    return sweep_kernel(
+                        SparseSweep(
+                            capacity,
+                            dofs,
+                            width,
+                            active_rows=True,
+                            use_support_table=True,
+                            contact_triplets=True,
+                            velocity_limits=True,
+                            lanes_per_world=_lanes,
+                        )
                     )
 
                 with mock.patch.object(fixtures, "factory", factory):

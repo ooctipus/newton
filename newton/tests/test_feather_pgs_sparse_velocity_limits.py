@@ -15,7 +15,8 @@ from newton._src.solvers.feather_pgs import class_plan
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
-from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
+from newton._src.solvers.feather_pgs.sweep import sweep_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_sparse_scene as sparse_scene
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplet_tests
@@ -271,13 +272,15 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                     physical = (*physical[:-1], np.zeros_like(physical[-1]))
 
                     def factory(capacity, dofs, width, **_kwargs):
-                        return sparse_kernel(
-                            capacity,
-                            dofs,
-                            width,
-                            active_rows=False,
-                            use_support_table=True,
-                            velocity_limits=True,
+                        return sweep_kernel(
+                            SparseSweep(
+                                capacity,
+                                dofs,
+                                width,
+                                active_rows=False,
+                                use_support_table=True,
+                                velocity_limits=True,
+                            )
                         )
 
                     with mock.patch.object(triplet_tests, "factory", factory):

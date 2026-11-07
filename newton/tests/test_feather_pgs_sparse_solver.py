@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Integration checks for the sparse dynamics and contact path."""
 
-import functools
 import unittest
 from unittest import mock
 
@@ -170,17 +169,20 @@ def _tripod_env(free_count, robot_count, prescribed, free_height):
 def _over_budget_rows(model) -> int:
     """The smallest dense row capacity whose sparse sweep outgrows its device's static budget.
 
-    The working set is the one the admission sizes (:func:`.sweep_routes_sparse.sparse_staging`), for the sweep a
-    small capacity admits.
+    The working set is the one the admission sizes (:attr:`.sweep_routes_sparse.SparseSweep.staging`), for the
+    sweep a small capacity admits.
     """
     probe = _make_solver(model, True)
-    staging = functools.partial(
-        sweep_routes_sparse.sparse_staging,
-        max_world_dofs=probe.forest.max_world_dofs,
-        max_row_dofs=probe.spec.classes.packed.max_support,
-        active_rows=probe.sweep.sparse_active_rows,
-        linked_rows=True,
-    )
+
+    def staging(rows):
+        return sweep_routes_sparse.SparseSweep(
+            rows,
+            probe.forest.max_world_dofs,
+            probe.spec.classes.packed.max_support,
+            active_rows=probe.sweep.sparse_active_rows,
+            linked_rows=True,
+        ).staging
+
     budget = arch_budget(model.device.arch)
     low, high = 1, 1 << 16
     while high - low > 1:

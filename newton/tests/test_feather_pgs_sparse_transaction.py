@@ -19,7 +19,8 @@ from newton._src.solvers.feather_pgs import environment_flags
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
-from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
+from newton._src.solvers.feather_pgs.sweep import sweep_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplets
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
@@ -101,7 +102,7 @@ class TestContactUnits(unittest.TestCase):
         for capacity in (256, 192, 128, 96, 48):
             with self.subTest(capacity=capacity):
                 for law in ("patch", "point"):
-                    kernel = sparse_kernel(capacity, 18, 12, linked_rows=law == "patch", **TRIPLETS)
+                    kernel = sweep_kernel(SparseSweep(capacity, 18, 12, linked_rows=law == "patch", **TRIPLETS))
                     linked = "_linked" if law == "patch" else ""
                     self.assertTrue(kernel.key.endswith(f"_contact_triplets{linked}"), kernel.key)
                     # The occupancy its shared memory admits, at most the register budget's 16 blocks.
@@ -113,7 +114,7 @@ class TestContactUnits(unittest.TestCase):
                     names = list(kernel.adj.arg_types)
                     self.assertEqual(names[names.index("omega") + 1], "contact_records")
         with self.assertRaises(TypeError):
-            sparse_kernel(64, 18, 12, **TRIPLETS, contact_transaction="single")
+            sweep_kernel(SparseSweep(64, 18, 12, **TRIPLETS, contact_transaction="single"))
 
     def test_contact_unit_reduces_once_from_records_cpu(self):
         """Reduce a unit's three residuals once, its pair's moved through the record's couplings; no metric cache.
@@ -123,7 +124,7 @@ class TestContactUnits(unittest.TestCase):
         """
         for linked in (False, True):
             with self.subTest(linked=linked):
-                snippet = _snippet(sparse_kernel(256, 18, 12, linked_rows=linked, **TRIPLETS))
+                snippet = _snippet(sweep_kernel(SparseSweep(256, 18, 12, linked_rows=linked, **TRIPLETS)))
                 for text in ("metric_map", "metric_count", "friction_pair_cached(", "contact_metric_slot("):
                     self.assertNotIn(text, snippet)
                 width = CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS * linked
