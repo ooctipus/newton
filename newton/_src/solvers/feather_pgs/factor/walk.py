@@ -1094,12 +1094,16 @@ _WALK_DOWNS = {
 }
 
 
-def _walk_down(classes: tuple[WalkClass, ...], unroll: int, ahead: int | None, combine: ts.WalkCombine) -> str:
+def _walk_down(
+    classes: tuple[WalkClass, ...], unroll: int, ahead: int | tuple[int, ...] | None, combine: ts.WalkCombine
+) -> str:
     """The class emitter's walk down of ``classes`` by ``combine`` (:data:`_WALK_DOWNS`): ``WALK_DOWN``, the leave, or
     ``WALK_ENTER``."""
     description, name, parameters, ends = _WALK_DOWNS[combine]
     texts = ts.walk_texts(combine, source="$X.u", coordinate=WALK_COORDINATE, link=WALK_LINK, **ends)
-    walk = indent_text(ts.by_class([walk.walk(**texts, unroll=unroll, ahead=ahead) for walk in classes]), 8)
+    aheads = ahead if isinstance(ahead, tuple) else (ahead,) * len(classes)
+    walks = [walk.walk(**texts, unroll=unroll, ahead=a) for walk, a in zip(classes, aheads, strict=True)]
+    walk = indent_text(ts.by_class(walks), 8)
     return f"""{description}
     const auto {name} = [&](const int cls, const float* data, const float* link, {parameters}) {{
         (void)cls;
@@ -1111,7 +1115,7 @@ def _walk_down(classes: tuple[WalkClass, ...], unroll: int, ahead: int | None, c
 def walk_down_prelude(
     classes: tuple[WalkClass, ...],
     unroll: int = WALK_UNROLL,
-    ahead: int | None = None,
+    ahead: int | tuple[int, ...] | None = None,
     *,
     down: bool = True,
     enter: bool = False,
@@ -1132,7 +1136,8 @@ def walk_down_prelude(
     Args:
         classes: The walking classes, indexed by ``cls``.
         unroll: Coordinates up to which a class's walk is straight-line code (:data:`WALK_UNROLL`).
-        ahead: Items whose inputs the chain's lane holds in registers ahead of it (:meth:`WalkClass.walk`).
+        ahead: Items whose inputs the chain's lane holds in registers ahead of it (:meth:`WalkClass.walk`), for every
+            class or each class's.
         down: Declare the leave, ``WALK_DOWN``.
         enter: Declare the enter, ``WALK_ENTER``.
     """
@@ -1155,6 +1160,15 @@ def leave_work(trees: int) -> Work:
     return Work(trees, lanes=4)
 
 
+def leave_ahead(walk: WalkClass) -> int:
+    """The leave's loads ahead of a class's chain (:func:`walk_leave_kernel`): its lane group has fetched the tree's
+    changes and velocities into L1, and the walk asks L1 for its records and links :data:`WALK_TOUCH` items ahead, so a
+    tree of joints holds none in registers (a joint's transform between two loads covers an L1 hit: g1's leave 11%
+    faster, PLACE's H1); one body's coordinates chain with no joint between them and keep :data:`WALK_AHEAD` (a free
+    cube's leave 3% slower without). The walk solves, a lane a tree with nothing fetched, keep theirs."""
+    return WALK_AHEAD if len(walk.parent) == 1 else 0
+
+
 _LEAVE = """    const int tree = tid / lanes, lane = tid - tree * lanes;
     if (tree >= arts.shape[0]) return;
     const int art = arts.data[tree];
@@ -1173,7 +1187,7 @@ _LEAVE = """    const int tree = tid / lanes, lane = tid - tree * lanes;
 $classes"""
 
 _LEAVE_CLASS = """    // The group's lanes fetch the tree's changes and velocity into L1; lane 0 prepares the change (ready) and walks the
-    // tree down (WALK_DOWN: its records and links asked of L1 WALK_TOUCH items ahead, loaded WALK_AHEAD items ahead;
+    // tree down (WALK_DOWN: its records and links asked of L1 WALK_TOUCH items ahead, loaded leave_ahead items ahead;
     // a whole tree fetched at the start overflows L1, chain_106's 22 trees an SM hold 230 KB).
     FETCH(change, $span, lane, lanes);
     FETCH(v, n * 4, lane, lanes);
@@ -1311,7 +1325,7 @@ def walk_leave_kernel(
         preludes=(
             memory_words(memory.Place.STREAMED),
             *((walk_release_prelude(),) if release else ()),
-            walk_down_prelude(classes, WALK_UNROLL),
+            walk_down_prelude(classes, WALK_UNROLL, tuple(leave_ahead(walk) for walk in classes)),
         ),
         dual=True,
         native_name="walk_leave_native",
