@@ -1017,90 +1017,13 @@ def channels(state: str) -> tuple[str, ...]:
     return tuple(f"{state}[{k}]" for k in range(6))
 
 
-def _step(
-    direction: Direction,
-    record: Record,
-    state: str,
-    *,
-    source: str = "",
-    value: str | None = None,
-    out: str = "const float z",
-    into: str | None = None,
-    index: str = "k",
-) -> list[str]:
-    """One coordinate's step on a six-float ``state``: its output statement, then its state's update.
-
-    ``UP`` (the whitening, leaf first): ``z = (x + s . p) / ell``, then ``p -= ut z``. ``DOWN`` (root first):
-    ``q = (u - ut . V) / ell``, then ``V += s q``. The output is rounded on its own (``WALK_MUL``), so its operations do
-    not depend on the block its consumer sits in. ``source`` is the step's input ``x`` or ``u`` (none: the state's
-    alone); ``value`` instead names a value that already holds ``source`` and the dot, for a source written as
-    statements. The output is assigned to ``out``; the update is in place, or into ``into`` (``into = state ...``), a
-    loop over ``index`` for a record a loop reads (:attr:`Record.indexed`), six statements for a named one. The
-    caller places its sink: after the output (before the update) or after the update.
-    """
-    up = direction is Direction.UP
-    if direction not in (Direction.UP, Direction.DOWN):
-        raise ValueError(f"a coordinate's step runs up or down, not {direction.value}")
-    if value is None:
-        head = dot(record.s if up else record.ut, channels(state))
-        value = f"{source} {'+' if up else '-'} {head}" if source else head
-    output = f"{out} = WALK_MUL(\n    {value},\n    {record.inverse});"
-    return [output, *_update(up, record, state, out.rsplit(maxsplit=1)[-1], into, index)]
-
-
-def _enter(record: Record, state: str, velocity: str, out: str, *, index: str = "k") -> list[str]:
-    """One coordinate's step of :data:`ENTER`, the walk down inverted (``u = L^T P qd``, root first): ``u = qd / (1 / ell)
-    + ut . V`` into ``out``, then ``V += s qd``, on the coordinate's known ``velocity``."""
-    head = f"{out} = {velocity} / {record.inverse} + {dot(record.ut, channels(state))};"
-    return [head, *_update(False, record, state, velocity, None, index)]
-
-
-def _update(up: bool, record: Record, state: str, name: str, into: str | None, index: str) -> list[str]:
-    """A step's state update by its output ``name``: ``p -= ut z`` up, ``V += s q`` down (:func:`_step`)."""
-    sign, terms = ("-", record.ut) if up else ("+", record.s)
-    if record.indexed is not None:
-        term = (record.indexed[1] if up else record.indexed[0]).format(k=index)
-        target = f"{into}[{index}] = {state}[{index}] {sign}" if into else f"{state}[{index}] {sign}="
-        return [f"for (int {index} = 0; {index} < 6; ++{index}) {target} {term} * {name};"]
-    if into:
-        return [f"{into}[{k}] = {state}[{k}] {sign} {terms[k]} * {name};" for k in range(6)]
-    return [f"{state}[{k}] {sign}= {terms[k]} * {name};" for k in range(6)]
-
-
-def _edge(direction: Direction, lever, state: str, *, into: str | None = None, first: bool = False) -> list[str]:
-    """The statements that pass a joint of lever ``d`` (``lever``, three names).
-
-    ``UP``: a wrench ``(f, t)`` passes to the parent's frame as ``(f, t - d x f)``: in place on ``state``, its force
-    read first, or added into the parent's ``into`` (``first``: assigned, the parent's first child). ``DOWN``: a twist
-    ``(v, w)`` passes to the child's frame as ``(v + d x w, w)``: in place on ``state``, or from the parent's ``state``
-    into the child's ``into``.
-    """
-    if direction is Direction.UP:
-        if into is None:
-            force = ("fx", "fy", "fz")
-            head = f"const float fx = {state}[0], fy = {state}[1], fz = {state}[2];"
-            return [head] + [f"{state}[{3 + k}] -= {cross(lever, force, k)};" for k in range(3)]
-        force, op = channels(state)[:3], "=" if first else "+="
-        return [f"{into}[{k}] {op} {state}[{k}];" for k in range(3)] + [
-            f"{into}[{3 + k}] {op} {state}[{3 + k}] - ({cross(lever, force, k)});" for k in range(3)
-        ]
-    if direction is Direction.DOWN:
-        turn = channels(state)[3:]
-        if into is None:
-            return [f"{state}[{k}] += {cross(lever, turn, k)};" for k in range(3)]
-        return [f"{into}[{k}] = {state}[{k}] + ({cross(lever, turn, k)});" for k in range(3)] + [
-            f"{into}[{3 + k}] = {state}[{3 + k}];" for k in range(3)
-        ]
-    raise ValueError(f"a joint's edge runs up or down, not {direction.value}")
-
-
 @dataclass(frozen=True)
 class WalkCombine:
     """A walk's arithmetic, the one skeleton's combine (``walk(tree, direction, combine, schedule, entries)``, U14): a
-    coordinate's step (:func:`_step`, :func:`_enter`) and a joint's edge (:func:`_edge`), in the walk's direction. Every
-    walk of the factor names one (:data:`WHITEN`, :data:`LEAVE`, :data:`ENTER`); the schedules (the class emitter
-    :meth:`WalkClass.walk`, the held lanes :meth:`WalkClass.held`, the path table's :func:`root_path`) place its
-    statements and hold no arithmetic of their own."""
+    coordinate's step and a joint's edge, in the walk's direction. Every walk of the factor names one (:data:`WHITEN`,
+    :data:`LEAVE`, :data:`ENTER`); the schedules (the class emitter :meth:`WalkClass.walk`, the held lanes
+    :meth:`WalkClass.held`, the path table's :func:`root_path`) place its statements and hold no arithmetic of their
+    own."""
 
     direction: Direction
     inverted: bool = False
@@ -1116,16 +1039,67 @@ class WalkCombine:
         into: str | None = None,
         index: str = "k",
     ) -> list[str]:
-        """A coordinate's step on a six-float ``state``: its output statement, then the state's update
-        (:func:`_step`'s keywords; the enter's ``source`` is the coordinate's known velocity, ``out`` its output)."""
+        """One coordinate's step on a six-float ``state``: its output statement, then its state's update.
+
+        ``UP`` (the whitening, leaf first): ``z = (x + s . p) / ell``, then ``p -= ut z``. ``DOWN`` (root first):
+        ``q = (u - ut . V) / ell``, then ``V += s q``. Inverted (:data:`ENTER`, root first): ``u = qd / (1 / ell) + ut .
+        V`` into ``out``, then ``V += s qd``, ``source`` the coordinate's known velocity ``qd``. The output is rounded on
+        its own (``WALK_MUL``), so its operations do not depend on the block its consumer sits in. ``source`` is the
+        step's input ``x`` or ``u`` (none: the state's alone); ``value`` instead names a value that already holds
+        ``source`` and the dot, for a source written as statements. The output is assigned to ``out``; the update is in
+        place, or into ``into`` (``into = state ...``), a loop over ``index`` for a record a loop reads
+        (:attr:`Record.indexed`), six statements for a named one. The caller places its sink: after the output (before
+        the update) or after the update.
+        """
+        up = self.direction is Direction.UP
+        if self.direction not in (Direction.UP, Direction.DOWN):
+            raise ValueError(f"a coordinate's step runs up or down, not {self.direction.value}")
         if self.inverted:
-            return _enter(record, state, source, out, index=index)
-        return _step(self.direction, record, state, source=source, value=value, out=out, into=into, index=index)
+            head = f"{out} = {source} / {record.inverse} + {dot(record.ut, channels(state))};"
+            return [head, *self._update(record, state, source, None, index)]
+        if value is None:
+            head = dot(record.s if up else record.ut, channels(state))
+            value = f"{source} {'+' if up else '-'} {head}" if source else head
+        output = f"{out} = WALK_MUL(\n    {value},\n    {record.inverse});"
+        return [output, *self._update(record, state, out.rsplit(maxsplit=1)[-1], into, index)]
+
+    def _update(self, record: Record, state: str, name: str, into: str | None, index: str) -> list[str]:
+        """A step's state update by its output ``name``: ``p -= ut z`` up, ``V += s q`` down."""
+        up = self.direction is Direction.UP
+        sign, terms = ("-", record.ut) if up else ("+", record.s)
+        if record.indexed is not None:
+            term = (record.indexed[1] if up else record.indexed[0]).format(k=index)
+            target = f"{into}[{index}] = {state}[{index}] {sign}" if into else f"{state}[{index}] {sign}="
+            return [f"for (int {index} = 0; {index} < 6; ++{index}) {target} {term} * {name};"]
+        if into:
+            return [f"{into}[{k}] = {state}[{k}] {sign} {terms[k]} * {name};" for k in range(6)]
+        return [f"{state}[{k}] {sign}= {terms[k]} * {name};" for k in range(6)]
 
     def joint(self, lever, state: str, *, into: str | None = None, first: bool = False) -> list[str]:
-        """A joint of lever ``lever`` (three names) on ``state``, in place or into ``into`` (:func:`_edge`; ``first``
-        a leaf-first walk's first child of its parent, which assigns)."""
-        return _edge(self.direction, lever, state, into=into, first=first)
+        """The statements that pass a joint of lever ``d`` (``lever``, three names).
+
+        ``UP``: a wrench ``(f, t)`` passes to the parent's frame as ``(f, t - d x f)``: in place on ``state``, its force
+        read first, or added into the parent's ``into`` (``first``: assigned, a leaf-first walk's first child of its
+        parent). ``DOWN``: a twist ``(v, w)`` passes to the child's frame as ``(v + d x w, w)``: in place on ``state``,
+        or from the parent's ``state`` into the child's ``into``.
+        """
+        if self.direction is Direction.UP:
+            if into is None:
+                force = ("fx", "fy", "fz")
+                head = f"const float fx = {state}[0], fy = {state}[1], fz = {state}[2];"
+                return [head] + [f"{state}[{3 + k}] -= {cross(lever, force, k)};" for k in range(3)]
+            force, op = channels(state)[:3], "=" if first else "+="
+            return [f"{into}[{k}] {op} {state}[{k}];" for k in range(3)] + [
+                f"{into}[{3 + k}] {op} {state}[{3 + k}] - ({cross(lever, force, k)});" for k in range(3)
+            ]
+        if self.direction is Direction.DOWN:
+            turn = channels(state)[3:]
+            if into is None:
+                return [f"{state}[{k}] += {cross(lever, turn, k)};" for k in range(3)]
+            return [f"{into}[{k}] = {state}[{k}] + ({cross(lever, turn, k)});" for k in range(3)] + [
+                f"{into}[{3 + k}] = {state}[{3 + k}];" for k in range(3)
+            ]
+        raise ValueError(f"a joint's edge runs up or down, not {self.direction.value}")
 
 
 WHITEN = WalkCombine(Direction.UP)
