@@ -23,7 +23,7 @@ G0 = 9.81
 
 def _box_model(device, *, count=1, mu=0.5, height=None, spacing=0.3, half=0.1, ground=True, gap=0.01):
     """``count`` 1 kg boxes above the ground, in a stack by default; ``height`` overrides the first box's centre."""
-    builder = newton.ModelBuilder(gravity=-G0)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -G0))
     cfg = newton.ModelBuilder.ShapeConfig(mu=mu, density=1000.0, restitution=0.0)
     cfg.gap = gap
     inertia = (1.0 / 6.0) * 4.0 * half * half
@@ -44,7 +44,7 @@ def _box_model(device, *, count=1, mu=0.5, height=None, spacing=0.3, half=0.1, g
 
 def _hinge_model(device, *, limit=0.2):
     """One hinge about y carrying a 1 kg rod, swung into its limit."""
-    builder = newton.ModelBuilder(gravity=-G0)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -G0))
     link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.01))
     joint = builder.add_joint_revolute(
         parent=-1,

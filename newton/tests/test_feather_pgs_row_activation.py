@@ -67,7 +67,7 @@ def _limit_scene(
     enable_joint_velocity_limits=True,
 ):
     """A limited revolute link past its limit and a speed-limited free box on the ground: every row family."""
-    builder = newton.ModelBuilder(gravity=0.0)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     SolverFeatherPGS.register_custom_attributes(builder)
     builder.default_shape_cfg.density = 1000.0
     builder.default_shape_cfg.mu = 0.5

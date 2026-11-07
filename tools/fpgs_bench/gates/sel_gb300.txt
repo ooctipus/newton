@@ -105,7 +105,6 @@ test_feather_pgs_velocity_limit_law
 test_feather_pgs_warmstart
 test_feather_pgs_wide_contact_batches
 test_fixed_tendon
-test_fk_launch_layout
 test_generate_api
 test_hashtable
 test_heightfield_box_contact

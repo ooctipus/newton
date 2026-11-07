@@ -641,7 +641,7 @@ class TestLoopsInScenes(unittest.TestCase):
 
     def test_a_free_rooted_loop_conserves_momentum(self):
         """A floating closed mechanism, each tree on its own free root's origin, keeps its loop and its momentum."""
-        b = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=0.0)
+        b = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, 0.0))
         base = b.add_link(xform=wp.transform(wp.vec3(0.2, 0.0, 1.0), wp.quat_identity()))
         b.add_shape_box(base, hx=0.25, hy=0.05, hz=0.05)
         root = b.add_joint_free(child=base)
@@ -700,7 +700,7 @@ class TestLoopsInScenes(unittest.TestCase):
 
     def _floating_mechanism(self, *velocities):
         """A free-rooted parallelogram closed by a revolute loop joint, with the coordinates' ``velocities``."""
-        b = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=0.0)
+        b = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, 0.0))
         base = b.add_link(xform=wp.transform(wp.vec3(0.2, 0.0, 1.0), wp.quat_identity()))
         b.add_shape_box(base, hx=0.25, hy=0.05, hz=0.05)
         joints, tips = [b.add_joint_free(child=base)], []

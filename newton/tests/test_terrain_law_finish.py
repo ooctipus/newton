@@ -14,7 +14,7 @@ import warp as wp
 
 import newton
 from newton._src.geometry.contact_data import make_contact_sort_key
-from newton._src.geometry.narrow_phase import verify_narrow_phase_buffers
+from newton._src.geometry.narrow_phase import record_narrow_phase_buffers
 from newton._src.geometry.terrain_law import (
     TERRAIN_FEATURE_BITS,
     TERRAIN_FINISH_CANDIDATE_OVERFLOW,
@@ -82,7 +82,7 @@ def _feature_ids(
     p = parts[i]
     ids[i] = terrain_feature_id(p[0], p[1], p[2], p[3], slots[i])
     back[i] = terrain_feature_parts(ids[i])
-    keys[i] = make_contact_sort_key(5, 77, ids[i])
+    keys[i] = make_contact_sort_key(5, 77, ids[i], 20)
 
 
 def _frame(n):
@@ -301,7 +301,7 @@ def test_terrain_report_raises_at_the_capacity_check(test, device):
     zero = wp.zeros(1, dtype=wp.int32, device=device)
     active = wp.zeros(2, dtype=wp.int32, device=device)
     args = [zero, 1, zero, -1, zero, 1, zero, -1, zero, -1, zero, 1, zero, 1, zero, 1, zero, 1, zero, 1, zero, 1]
-    wp.launch(verify_narrow_phase_buffers, dim=1, inputs=[*args, active, 0, zero, 80, status], device=device)
+    wp.launch(record_narrow_phase_buffers, dim=1, inputs=[*args, active, 0, zero, zero, 80, status], device=device)
     test.assertEqual(int(status.numpy()[0]), int(TERRAIN_STATUS_ROWS))
 
 

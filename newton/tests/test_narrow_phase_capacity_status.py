@@ -9,7 +9,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.geometry.narrow_phase import verify_narrow_phase_buffers
+from newton._src.geometry.narrow_phase import record_narrow_phase_buffers
 from newton.tests.unittest_utils import StdOutCapture
 
 VERIFIER_NAMES = (
@@ -26,10 +26,11 @@ VERIFIER_NAMES = (
     "contacts",
     "reduction_hash_load",
     "reduction_hash_insert",
+    "reduction_buffer",
 )
 TERRAIN_NAMES = ("terrain_rows", "terrain_stale", "terrain_jobs")
 """Bits 13 to 15, which the terrain law's kernels set."""
-NAMES = (*VERIFIER_NAMES, *TERRAIN_NAMES, "contact_launches")
+NAMES = (*VERIFIER_NAMES[:-1], *TERRAIN_NAMES, VERIFIER_NAMES[-1], "contact_launches")
 """Every flag of a pipeline's narrow phase: ``contact_launches`` reports the pipeline's captured contact launches."""
 
 
@@ -75,8 +76,9 @@ class TestNarrowPhaseCapacityStatus(unittest.TestCase):
         counts = [wp.zeros(1, dtype=int, device="cpu") for _ in range(11)]
         active = wp.zeros(3, dtype=int, device="cpu")
         failures = wp.zeros(1, dtype=int, device="cpu")
+        overflows = wp.zeros(1, dtype=int, device="cpu")
         inputs = [item for count in counts for item in (count, 2)]
-        inputs += [active, 2, failures, 90, narrow._buffer_capacity_status]
+        inputs += [active, 2, failures, overflows, 90, narrow._buffer_capacity_status]
         capture = StdOutCapture()
         capture.begin()
         try:
@@ -87,15 +89,18 @@ class TestNarrowPhaseCapacityStatus(unittest.TestCase):
                         counts[bit].assign([3])
                     elif bit == 11:
                         active.assign([0, 0, 2])
+                    elif name == "reduction_buffer":
+                        overflows.assign([1])
                     else:
                         failures.assign([1])
-                    wp.launch(verify_narrow_phase_buffers, dim=1, inputs=inputs, device="cpu")
+                    wp.launch(record_narrow_phase_buffers, dim=1, inputs=inputs, device="cpu")
                     self.assertEqual(narrow.buffer_capacity_status(), {key: key == name for key in NAMES})
                     for count in counts:
                         count.zero_()
                     active.zero_()
                     failures.zero_()
-                    wp.launch(verify_narrow_phase_buffers, dim=1, inputs=inputs, device="cpu")
+                    overflows.zero_()
+                    wp.launch(record_narrow_phase_buffers, dim=1, inputs=inputs, device="cpu")
                     self.assertTrue(narrow.buffer_capacity_status()[name])
         finally:
             capture.end()
@@ -121,8 +126,8 @@ class TestNarrowPhaseCapacityStatus(unittest.TestCase):
         excess = wp.array([3], dtype=int, device="cpu")
         inputs = [zero, 2, excess, -1, zero, 2, excess, -1, excess, -1]
         inputs += [item for _ in range(5) for item in (None, 0)]
-        inputs += [zero, 2, zero, 0, excess, 90, narrow._buffer_capacity_status]
-        wp.launch(verify_narrow_phase_buffers, dim=1, inputs=inputs, device="cpu")
+        inputs += [zero, 2, zero, 0, excess, zero, 90, narrow._buffer_capacity_status]
+        wp.launch(record_narrow_phase_buffers, dim=1, inputs=inputs, device="cpu")
         narrow.check_buffer_capacity()
 
     def test_disabled_verification_cannot_report_success(self):
