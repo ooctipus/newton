@@ -20,7 +20,7 @@ import newton
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conformance
-from newton.tests import test_feather_pgs_scalar_branches as branch
+from newton.tests import test_feather_pgs_coordinate_trees as branch
 from newton.tests import test_feather_pgs_sparse_solver as sparse
 
 H = 1.0 / 240.0
@@ -711,8 +711,8 @@ class TestDriveSaturation(unittest.TestCase):
         np.testing.assert_allclose(arms[1], arms[0], rtol=1.0e-4, atol=2.0e-4)
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "scalar branches run on CUDA")
-class TestScalarBranchJointLaws(unittest.TestCase):
+@unittest.skipUnless(wp.is_cuda_available(), "the one-coordinate class runs on CUDA")
+class TestCoordinateTreesJointLaws(unittest.TestCase):
     """PH1c and PH1d on the keys' route: their predict folds ``K`` and refreshes each leaf's inverse mass itself."""
 
     def _leaves(self, *, ke=0.0, kd=0.0, effort=0.0, damping=0.0, v0=0.0, interval=1):
@@ -732,8 +732,8 @@ class TestScalarBranchJointLaws(unittest.TestCase):
         for name in ("joint_limit_lower",):
             getattr(model, name).fill_(-1.0e3)
         model.joint_limit_upper.fill_(1.0e3)
-        solver = branch.recipe_solver(model, scalar=True, angular_damping=0.0, update_mass_matrix_interval=interval)
-        self.assertTrue(solver.get_path_selection()["routes"]["held_tree"]["scalar_branches"]["enabled"])
+        solver = branch.recipe_solver(model, coordinate=True, angular_damping=0.0, update_mass_matrix_interval=interval)
+        self.assertTrue(solver.get_path_selection()["routes"]["held_tree"]["coordinate_trees"]["enabled"])
         state, out = model.state(), model.state()
         state.joint_q.zero_()
         velocity = np.zeros(model.joint_dof_count, dtype=np.float32)
@@ -1124,7 +1124,7 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
         np.testing.assert_allclose(arms[1], arms[0], rtol=0.0, atol=2.0e-2)
 
     def test_a_compact_diagonal_decides_in_its_predictor(self):
-        """A tree group of diagonal mass, the star pin keeping it from scalar branches: its inverse is the coordinate's own,
+        """A tree group of diagonal mass, the star pin keeping it from the one-coordinate class: its inverse is the coordinate's own,
         on a step without a mass update."""
         limit = 0.05
         model = branch.build_branch_model("cuda:0", worlds=2, arm=True)
@@ -1141,7 +1141,7 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
         model.joint_spring_stiffness.zero_()
         model.joint_limit_lower.fill_(-1.0e3)
         model.joint_limit_upper.fill_(1.0e3)
-        solver = branch.recipe_solver(model, scalar=False, angular_damping=0.0, update_mass_matrix_interval=2)
+        solver = branch.recipe_solver(model, coordinate=False, angular_damping=0.0, update_mass_matrix_interval=2)
         self.assertTrue(
             any(getattr(group.sparse, "response", None) == "diagonal" for group in solver.factor.held.groups)
         )

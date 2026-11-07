@@ -7,10 +7,11 @@ The plan (:func:`plan`, held by the class plan) is data: one :class:`HeldClass` 
 plans (:class:`HeldGroupPlan`) whose kind the class's data chooses: the sparse class, when the solver admitted one, makes
 one complete group that walks its pattern (``"sparse"``); otherwise each tree shape is a group that responds by its walk
 or by the compact diagonal (``"tree"``), kinematic free bodies a zero-response group (``"prescribed"``), articulations
-without coordinates a group of none (``"rest"``), the star's scalar branches a group of their own (``"scalar"``), or one
-group per world spans its articulations (``"forest"``). The classes' groups of one key compose into one group: trees of
-one shape share one factor plan, whatever their class. The owner (:class:`HeldTree`) builds each group
-(:class:`~.tree_kinetic_owner.TreeKineticState` over a :class:`HeldGroup`, or the scalar branches' state) and decides
+without coordinates a group of none (``"rest"``), a compact diagonal family whose trees are one body each the
+one-coordinate class (``"coordinate"``, :mod:`.coordinate_trees`), or one group per world spans its articulations
+(``"forest"``). The classes' groups of one key compose into one group: trees of one shape share one factor plan,
+whatever their class. The owner (:class:`HeldTree`) builds each group (:class:`~.tree_kinetic_owner.TreeKineticState`
+over a :class:`HeldGroup`, or the one-coordinate class's :class:`~.coordinate_trees.CoordinateTrees`) and decides
 nothing. Every group's collection writes its drives' K-free mass (``row_H``) where it forms the mass diagonal; the
 compact diagonal's refresh forms its inverse mass. :func:`decline` names why a representation does not fit;
 :func:`install` returns the owner.
@@ -24,7 +25,7 @@ from types import SimpleNamespace
 import numpy as np
 import warp as wp
 
-from . import field_group, host_index
+from . import coordinate_trees, field_group, host_index
 from .device_proof import DeviceProof
 from .tree_kinetic_owner import TreeKineticState, proof_runs
 from .tree_kinetic_plan import make_plan, tree_joints
@@ -217,8 +218,8 @@ class HeldGroupPlan:
     """
 
     kind: str
-    """``"sparse"``, ``"tree"``, ``"prescribed"``, ``"rest"``, ``"forest"`` or ``"scalar"`` (the star's scalar
-    branches, ``scalar_branches.py``)."""
+    """``"sparse"``, ``"tree"``, ``"prescribed"``, ``"rest"``, ``"forest"`` or ``"coordinate"`` (the one-coordinate
+    class, :mod:`.coordinate_trees`)."""
     key: tuple
     """The group's identity across classes, its kind's rank first: composed groups keep the builders' order."""
     trees: np.ndarray
@@ -226,7 +227,7 @@ class HeldGroupPlan:
     order: np.ndarray
     """Each tree's place among the trees of its key in every class (a forest row's: its world)."""
     host: dict | None = None
-    """The pattern's metadata (:func:`operator_metadata`); ``None`` for scalar branches, which hold none."""
+    """The pattern's metadata (:func:`operator_metadata`); ``None`` for the one-coordinate class, which holds none."""
     size: int | None = None
     response: str = "cholesky"
     """``"sparse"``, ``"cholesky"`` (by the walk), or ``"diagonal"`` (a compact diagonal family, or no response)."""
@@ -270,11 +271,15 @@ class HeldPlan:
     """The dense groups' coverage (:func:`_coverage`), which the held tree proves on notification; ``None`` for the
     sparse group or no tree."""
     walking: np.ndarray
-    """The articulations the walk holds: every one with coordinates but those a group folds (scalar branches) and the
-    compact diagonal's, whose walk is the compact inverse (:attr:`HeldGroupPlan.diagonal`)."""
+    """The articulations the walk holds: every one with coordinates but the compact diagonal's, whose walk is the
+    compact inverse (:attr:`HeldGroupPlan.diagonal`, and the one-coordinate class's trees)."""
     drive_dofs: np.ndarray | None
-    """The coordinates whose drives the drive stage prepares, ``None`` for every one: a scalar branch's predict folds
-    its own."""
+    """The coordinates whose drives the drive stage prepares, ``None`` for every one: a one-coordinate tree's predict
+    decides its own."""
+    coordinate: coordinate_trees.CoordinateTreesPlan | None = None
+    """The compact diagonal family as the one-coordinate class (:func:`.coordinate_trees.plan`), or ``None``."""
+    coordinate_reason: str = "No compact diagonal family."
+    """Why the compact diagonal family takes the one-coordinate class or not."""
 
 
 def _forest_families(inputs, worlds, member, compact):
@@ -352,17 +357,17 @@ def _part(arts, member, offset=0):
     return arts[places].astype(np.int32), offset + places
 
 
-def _size_groups(inputs, member, compact, scalar) -> list:
+def _size_groups(inputs, member, compact, coordinate) -> list:
     """The per-size groups of a class's articulations ``member``: a group a tree shape (each size group's topology
-    range, the compact diagonal's with its family), the scalar branches in place of their size's, the prescribed free
+    range, the compact diagonal's with its family), the one-coordinate class in place of its size's, the prescribed free
     bodies and a group a rest topology."""
     model, forest = inputs.model, inputs.forest
     groups = []
     for rank, size in enumerate(forest.size_groups):
-        if scalar is not None and size == scalar.size:
+        if coordinate is not None and size == coordinate.size:
             trees, places = _part(forest.group_to_art_host[size], member)
             if trees.size:
-                groups.append(HeldGroupPlan("scalar", (5,), trees, places, size=size, response="diagonal"))
+                groups.append(HeldGroupPlan("coordinate", (5,), trees, places, None, size, "diagonal", (-size,)))
             continue
         diagonal = size == compact
         for first, last in _topologies(forest, size):
@@ -388,10 +393,11 @@ def _size_groups(inputs, member, compact, scalar) -> list:
     return groups
 
 
-def held_class(inputs, worlds, *, packed=None, compact=None, scalar=None) -> HeldClass:
+def held_class(inputs, worlds, *, packed=None, compact=None, coordinate=None) -> HeldClass:
     """The held plan of the world class of ``worlds``, with the class plan's choices: the native sparse factor
-    (``packed``, :class:`.class_plan.Packed`), the compact diagonal's size (``compact``) and the scalar branches
-    (``scalar``, :class:`.scalar_branches.ScalarBranchPlan`). Raises ValueError where its trees do not fit a group.
+    (``packed``, :class:`.class_plan.Packed`), the compact diagonal's size (``compact``) and its family as the
+    one-coordinate class (``coordinate``, :class:`.coordinate_trees.CoordinateTreesPlan`). Raises ValueError where its
+    trees do not fit a group.
 
     The sparse factor makes one complete group of every class. Otherwise the class takes one group a world (a forest)
     where the test pin ``grouping`` or the default rule (:func:`forest_default`) asks and its layout admits one, else a
@@ -404,7 +410,7 @@ def held_class(inputs, worlds, *, packed=None, compact=None, scalar=None) -> Hel
         group = HeldGroupPlan("sparse", (0,), trees, places, operator_metadata(packed.plan), response="sparse")
         return HeldClass(worlds, "sparse", None, (group,) if trees.size else ())
     override = inputs.pins.grouping
-    forest_layout = None if scalar is not None else _forest_families(inputs, worlds, member, compact)
+    forest_layout = None if coordinate is not None else _forest_families(inputs, worlds, member, compact)
     if override is not None:
         wants = override == "forest"
     else:
@@ -416,8 +422,8 @@ def held_class(inputs, worlds, *, packed=None, compact=None, scalar=None) -> Hel
             else "Default: a prescribed root and no diagonal-mass family make one group per world cheaper."
         )
         return HeldClass(worlds, "forest", reason, (_forest_group(inputs, *forest_layout, compact),))
-    if wants and scalar is not None:
-        reason = "Scalar branches own the diagonal-mass group, so no group spans a world."
+    if wants and coordinate is not None:
+        reason = "The one-coordinate class owns the compact diagonal family, so no group spans a world."
     elif wants:
         reason = "The world layout does not admit one forest group."
     elif override is not None:
@@ -427,7 +433,7 @@ def held_class(inputs, worlds, *, packed=None, compact=None, scalar=None) -> Hel
             "Default: per-size groups (the layout admits no forest, has no prescribed root, or has a "
             "diagonal-mass family the forest applies at a loss)."
         )
-    return HeldClass(worlds, "per_size", reason, tuple(_size_groups(inputs, member, compact, scalar)))
+    return HeldClass(worlds, "per_size", reason, tuple(_size_groups(inputs, member, compact, coordinate)))
 
 
 def forest_default(layout, compact) -> bool:
@@ -461,10 +467,11 @@ def compose(classes) -> tuple[HeldGroupPlan, ...]:
     return tuple(groups)
 
 
-def plan(inputs, *, packed=None, compact=None, scalar=None) -> HeldPlan:
+def plan(inputs, *, packed=None, compact=None) -> HeldPlan:
     """The held tree's plan: one :class:`HeldClass` a world class (:attr:`.forest_plan.ForestPlan.world_classes`) with
-    the class plan's choices (:func:`held_class`), their groups composed, the dense groups' coverage, the walk's trees
-    and the drive stage's coordinates.
+    the class plan's choices (:func:`held_class`) and the compact diagonal family's class (the one-coordinate class
+    where its trees are one body each, :func:`.coordinate_trees.plan`), their groups composed, the dense groups'
+    coverage, the walk's trees and the drive stage's coordinates.
 
     The plan's failure is the held tree's decline of the choices: the sparse diagonal's rule
     (:func:`.class_plan.diagonal_rule`) builds the plan with its compact diagonal and keeps it, or declines with why.
@@ -477,26 +484,26 @@ def plan(inputs, *, packed=None, compact=None, scalar=None) -> HeldPlan:
     reason = decline(forest, inputs.factor, sparse=packed is not None)
     if reason is not None:
         raise ValueError(reason)
+    coordinate, coordinate_reason = coordinate_trees.plan(inputs, size=None if packed is not None else compact)
     drive_dofs = None
-    if scalar is not None:
+    if coordinate is not None:
         other = np.ones(model.joint_dof_count, dtype=bool)
-        other[scalar.dofs[(scalar.dofs >= 0) & (scalar.dofs < model.joint_dof_count)]] = False
+        other[coordinate.dofs[(coordinate.dofs >= 0) & (coordinate.dofs < model.joint_dof_count)]] = False
         drive_dofs = np.flatnonzero(other).astype(np.int32)
     walking = np.flatnonzero(forest.articulation_dof_count_host > 0)
     if not (model.joint_count and model.articulation_count):
-        return HeldPlan((), (), compact, None, walking, drive_dofs)
+        return HeldPlan((), (), compact, None, walking, drive_dofs, coordinate, coordinate_reason)
     try:
         coverage = None if packed is not None else _coverage(model, forest, compact)
         classes = tuple(
-            held_class(inputs, world_class.worlds, packed=packed, compact=compact, scalar=scalar)
+            held_class(inputs, world_class.worlds, packed=packed, compact=compact, coordinate=coordinate)
             for world_class in forest.world_classes
         )
     except ValueError as error:
         raise ValueError(f"The topology does not fit the held groups: {error}") from error
     groups = compose(classes)
-    folded = [group.trees if group.kind == "scalar" else group.diagonal for group in groups]
-    walking = np.setdiff1d(walking, np.concatenate([walking[:0], *folded]))
-    return HeldPlan(classes, groups, compact, coverage, walking, drive_dofs)
+    walking = np.setdiff1d(walking, np.concatenate([walking[:0], *(group.diagonal for group in groups)]))
+    return HeldPlan(classes, groups, compact, coverage, walking, drive_dofs, coordinate, coordinate_reason)
 
 
 class HeldGroup:
@@ -582,9 +589,9 @@ class HeldTree:
         self.solver, self.plan = solver, plan
         # One read of the stage clocks for every group this owner composes.
         self.clocked = solver.options.diagnostics.stage_clocks
-        self.scalar = None
+        self.coordinate_trees = None
         self.coverage = plan.coverage
-        # The drive stage's coordinates: every one (None), or those no scalar branch's predict folds.
+        # The drive stage's coordinates: every one (None), or those no one-coordinate tree's predict decides.
         self.drive_dofs = None
         if plan.drive_dofs is not None and plan.drive_dofs.size:
             self.drive_dofs = wp.array(plan.drive_dofs, dtype=int, device=solver.model.device)
@@ -595,15 +602,12 @@ class HeldTree:
             self._proof = DeviceProof(list(self._coverage_arrays()), solver.model.device)
         self.groups = []
         for group in plan.groups:
-            if group.kind == "scalar":
-                from .scalar_branches import ScalarBranchState  # noqa: PLC0415
-
-                # A tree group's proof holds the model topology, the joint axes and
-                # art_to_world and watches the joint frames, and the coverage proof every
-                # size's group map, so the scalar group needs no proof of its own: the
-                # sparse-diagonal pair always leaves a tree group beside it.
-                self.scalar = ScalarBranchState(solver, group)
-                self.groups.append(self.scalar)
+            if group.kind == "coordinate":
+                # A tree group's proof holds the model topology, the joint axes and art_to_world and watches the joint
+                # frames, and the coverage proof every size's group map, so the one-coordinate class needs no proof of
+                # its own: the sparse-diagonal pair always leaves a tree group beside it.
+                self.coordinate_trees = coordinate_trees.CoordinateTrees(solver, group, plan.coordinate)
+                self.groups.append(self.coordinate_trees)
                 continue
             operator = HeldGroup(solver, group)
             complete = group.kind == "sparse"
@@ -637,9 +641,9 @@ class HeldTree:
 
         Returns:
             Whether every group's proof ran and found its inputs unchanged (see
-            :meth:`TreeKineticState.validate_model`). A scalar group without a
-            proof of its own counts as passed: its tree neighbours prove the
-            same model arrays.
+            :meth:`TreeKineticState.validate_model`). The one-coordinate class,
+            without a proof of its own, counts as passed: its tree neighbours
+            prove the same model arrays.
         """
         if not proof_runs(flags):
             # Numeric notifications cannot change ownership; see TreeKineticState.

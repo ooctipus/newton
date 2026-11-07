@@ -184,7 +184,7 @@ def measurement_selection(solver) -> dict:
 def _held_tree_groups(solver) -> tuple:
     owner = solver.factor.held
     groups = list(owner.groups)
-    # Scalar branch groups hold no tree layout.
+    # The one-coordinate class holds no tree layout.
     if any(getattr(getattr(group, "layout", None), "forest", False) for group in groups):
         return "forest", groups
     return ("tree" if solver._plan.route.case == "K1" else "mixed"), groups
@@ -200,14 +200,14 @@ def _held_tree(solver) -> dict:
             {"worlds": int(held.worlds.size), "grouping": held.grouping, "reason": held.reason}
             for held in owner.plan.classes
         ],
-        # Whether a diagonal-mass group of world-fixed roots over one-coordinate
-        # leaves runs as scalar branches.
-        "scalar_branches": {
-            "enabled": owner.scalar is not None,
-            "reason": solver.spec.classes.scalar[1],
+        # Whether the compact diagonal family takes the one-coordinate class (its trees one body each), and why.
+        "coordinate_trees": {
+            "enabled": owner.coordinate_trees is not None,
+            "reason": owner.plan.coordinate_reason,
         },
         "groups": [
-            _scalar_group(group, owner.drive_dofs) if group is owner.scalar else _tree_group(group) for group in groups
+            _coordinate_group(group, owner.drive_dofs) if group is owner.coordinate_trees else _tree_group(group)
+            for group in groups
         ],
     }
 
@@ -245,15 +245,15 @@ def _tree_group(group) -> dict:
     }
 
 
-def _scalar_group(group, drive_dofs) -> dict:
-    """A scalar branch group (``scalar_branches.py``) in the tree groups' schema.
+def _coordinate_group(group, drive_dofs) -> dict:
+    """The one-coordinate class (:mod:`.coordinate_trees`) in the tree groups' schema.
 
     Its predict and finish run one thread per coordinate (``lanes``) and its
     repair one warp per articulation, so the tree layout's packing fields
     (``trees_per_block``, ``block_dim``) are ``None``. Its repair compares no
     input banks (``input_validation`` is the group's, "identity": the stamp
     alone). ``drive_dofs`` counts the DOFs whose drives the drive kernel
-    still prepares (the held plan's, ``drive_dofs``), since the group's predict evaluates its own.
+    still prepares (the held plan's, ``drive_dofs``), since the class's predict decides its own.
     """
     size = int(group.size)
     return {

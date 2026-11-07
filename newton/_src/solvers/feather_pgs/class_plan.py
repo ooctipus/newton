@@ -27,7 +27,6 @@ from ...core.memory import arch_budget
 from . import held_tree, host_index, sweep_routes_sparse
 from .forest_plan import row_support
 from .route_table import Pins, first_failed
-from .scalar_branches import ScalarBranchPlan, plan_scalar_branches
 from .sweep_routes_sparse import _SPARSE_LOCAL_WORKSPACE_BYTES
 from .sweep_routes_tiers import TIER_MAX_ROWS
 from .tree_plan import TreePlan, local_parents
@@ -88,10 +87,6 @@ class Diagonal:
     contact friction and no row-activation gap)."""
     speculative_batches: bool
     """The contact units run in speculative batches (a dense arm of at most 14 coordinates)."""
-    scalar: ScalarBranchPlan | None
-    """The star's group as scalar branches (:func:`.scalar_branches.plan_scalar_branches`), or ``None``."""
-    scalar_reason: str
-    """Why the star's group runs as scalar branches or not."""
     held: held_tree.HeldPlan
     """The held tree's plan with this compact diagonal, which admitted the case (:func:`.held_tree.plan`)."""
 
@@ -180,14 +175,6 @@ class ClassPlan:
     def tier_rows(self) -> int:
         """The Jacobi tiers' row bound (case K4), or 0 without tiers."""
         return 0 if self.tiers is None else self.tiers.rows
-
-    @property
-    def scalar(self) -> tuple[ScalarBranchPlan | None, str]:
-        """The star's group as scalar branches and why (:attr:`Diagonal.scalar`): none without the sparse
-        diagonal."""
-        if self.diagonal is None:
-            return None, "No diagonal-mass group shares the sparse-diagonal response."
-        return self.diagonal.scalar, self.diagonal.scalar_reason
 
 
 def general_reason(pins) -> str | None:
@@ -287,10 +274,9 @@ def diagonal_rule(inputs: ClassInputs) -> tuple[Diagonal | None, str]:
     if np.any(dense_offsets < 0) or np.any(dense_groups < 0):
         return None, missing
     # Its compact diagonal is the held tree's representation: a candidate only where the held tree takes the dense
-    # groups with it, the diagonal group as scalar branches or a held family.
-    scalar, scalar_reason = plan_scalar_branches(inputs, size=int(diagonal_size[0]))
+    # groups with it, the diagonal group as a held family (the one-coordinate class where its trees are one body each).
     try:
-        held = held_tree.plan(inputs, compact=int(diagonal_size[0]), scalar=scalar)
+        held = held_tree.plan(inputs, compact=int(diagonal_size[0]))
     except ValueError as error:
         return None, f"Only the held tree evaluates the compact diagonal. {error}"
     units = bool(inputs.options.enable_contact_friction and inputs.options.contact_friction_gap_threshold == math.inf)
@@ -304,8 +290,6 @@ def diagonal_rule(inputs: ClassInputs) -> tuple[Diagonal | None, str]:
         fused_mask=fused_mask,
         units=units,
         speculative_batches=units and int(dense_size[0]) + 2 <= 16,
-        scalar=scalar,
-        scalar_reason=scalar_reason,
         held=held,
     )
     return choice, "One diagonal-mass articulation and one compact dense articulation per world share one owner."

@@ -33,7 +33,7 @@ class Pins:
     grouping: str | None = None
     """``"forest"`` or ``"per_size"``: the held families."""
     star: str | None = None
-    """``"held"``: a star's diagonal family in the held tree."""
+    """``"held"``: the compact diagonal family in a held tree group, never the one-coordinate class."""
     producer: str | None = None
     """``"walk"``: no keyed rows."""
     claims: tuple[str, ...] = ("resolved_worlds",)

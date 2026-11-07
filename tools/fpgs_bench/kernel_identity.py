@@ -29,7 +29,7 @@ kernel, builds each kernel as a fresh process would, and runs with
 ``PYTHONHASHSEED=0``.
 
 The inventory is the kernel-pin inventory (every module-level kernel of
-the FeatherPGS package, the held-tree owner's scalar-branch group included, and
+the FeatherPGS package, the held-tree owner's one-coordinate class included, and
 the pinned factory calls), the factory variants those pins do not reach
 (:func:`factory_calls`), a held-tree layout grid of the factory-built tree
 kernels (:func:`held_tree_calls`) and a census of every flag combination of the
@@ -338,9 +338,9 @@ def held_tree_calls():
     outside motion-velocity layouts, whose stamps a copied bank may name, the
     repair that compares input banks. The switched layouts add the stage clocks
     and the repair and finish without body velocity.
-    A scalar-branch group of the held-tree owner has no layout: its repair,
-    predict, finish and listed drive kernels are module-level kernels of
-    ``scalar_branches``, which the pins family records.
+    The held-tree owner's one-coordinate class has no layout: its repairs,
+    predicts and finishes are module-level kernels of ``coordinate_trees``,
+    which the pins family records.
     """
     from newton._src.solvers.feather_pgs import tree_kinetic_state as native  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.factor.walk import RELEASE_SLIPS  # noqa: PLC0415

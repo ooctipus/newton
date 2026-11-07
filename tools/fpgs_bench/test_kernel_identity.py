@@ -185,25 +185,21 @@ class TestKernelIdentity(unittest.TestCase):
         calls = [kwargs for name, _, _, kwargs in identity.census_calls() if name.endswith("sweep_routes.mf_gs_kernel")]
         self.assertTrue(any(kwargs["places"].staging == "resident" for kwargs in calls))
 
-    def test_scalar_branch_kernels_are_recorded_with_the_pins(self):
-        """Record every kernel of the held-tree owner's scalar-branch group in the pins family.
+    def test_coordinate_tree_kernels_are_recorded_with_the_pins(self):
+        """Record every kernel of the held-tree owner's one-coordinate class in the pins family.
 
         They are module-level kernels without a tree layout, so the held-tree
         layout grid builds none of them; the kernel-pin inventory holds
         them, and an identity diff compares their generated code there.
         """
-        from newton._src.solvers.feather_pgs import scalar_branches  # noqa: PLC0415
+        from newton._src.solvers.feather_pgs import coordinate_trees  # noqa: PLC0415
 
-        kernels, rejected = identity.inventory(("pins",), ("scalar_branches.",))
+        kernels, rejected = identity.inventory(("pins",), ("coordinate_trees.",))
         self.assertEqual(rejected, {})
-        names = (
-            "finish_prismatic_branches",
-            "predict_prismatic_branches",
-            "repair_scalar_branches",
-        )
-        self.assertEqual(sorted(kernels), [f"scalar_branches.{name}" for name in names])
+        names = sorted(f"{stage}_{kind}" for stage in ("repair", "predict", "finish") for kind in ("slides", "turns"))
+        self.assertEqual(sorted(kernels), [f"coordinate_trees.{name}" for name in names])
         for name in names:
-            self.assertEqual(kernels[f"scalar_branches.{name}"], ("pins", getattr(scalar_branches, name)))
+            self.assertEqual(kernels[f"coordinate_trees.{name}"], ("pins", getattr(coordinate_trees, name)))
 
     def test_label_names_calls_like_the_pins(self):
         """Label calls with positional values, sorted keywords and named layouts."""

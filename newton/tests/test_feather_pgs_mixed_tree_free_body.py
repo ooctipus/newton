@@ -252,13 +252,13 @@ def _rollout(
     swing_stride=3,
     pgs_iterations=None,
     observe=None,
-    scalar=None,
+    coordinate=None,
 ):
     """Roll out a scene and return the solver, its owner, the body pose trajectory and the final twists.
 
     ``pgs_iterations`` defaults to :data:`PATCH_PARITY_ITERATIONS`. ``observe`` is called after every step with the
-    solver and its contacts. ``scalar=False`` pins the star to the held tree (``star='held'``); otherwise the cabinet's drawers run as scalar branches of
-    the held-tree owner.
+    solver and its contacts. ``coordinate=False`` pins the star to the held tree (``star='held'``); otherwise the
+    cabinet's drawers take the held-tree owner's one-coordinate class.
     """
     if pgs_iterations is None:
         pgs_iterations = PATCH_PARITY_ITERATIONS
@@ -267,7 +267,7 @@ def _rollout(
     forest = getattr(_rollout, "forest", False)
     if forest is not None:
         pins["grouping"] = "forest" if forest else "per_size"
-    if scalar is False:
+    if coordinate is False:
         pins["star"] = "held"
     solver = SolverFeatherPGS(
         model,
@@ -445,15 +445,15 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
     def test_forest_group_carries_a_diagonal_family(self):
         """A world of an arm and a two-drawer cabinet (Franka cabinet's class) is one forest group with a diagonal family.
 
-        The drawers run as scalar branches by default (see
-        :meth:`test_scalar_branches_own_the_cabinet_drawers`), which no forest spans, so the forest
+        The drawers take the one-coordinate class by default (see
+        :meth:`test_coordinate_trees_track_the_cabinet_drawers`), which no forest spans, so the forest
         takes them with the star pinned to the held tree.
         """
         model = _build(wp.get_device("cuda:0"), cabinet=True)
         plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False)
         _rollout.forest = True
         try:
-            owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, scalar=False)
+            owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, coordinate=False)
         finally:
             _rollout.forest = False
         self.assertIsInstance(owner, HeldTree)
@@ -473,17 +473,17 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         self.assertLessEqual(float(q[-1, :, 3:5].max()), 1.0e-3)
         self._assert_patch_history(plain_solver, owner_solver, loaded=False)
 
-    def test_scalar_branches_track_the_cabinet_drawers(self):
-        """Run the cabinet's drawers as scalar branches beside the arm's tree group; track the ordinary route.
+    def test_coordinate_trees_track_the_cabinet_drawers(self):
+        """Run the cabinet's drawers by the one-coordinate class beside the arm's tree group; track the ordinary route.
 
         The drawers hang from a world-fixed root on one-coordinate prismatic joints, the
-        diagonal-mass class the scalar rule admits. Poses and twists stay within the per-size and
+        compact diagonal family whose trees are one body each. Poses and twists stay within the per-size and
         forest owners' bounds of ordinary dynamics; the route probe records the owner's groups.
         """
         model = _build(wp.get_device("cuda:0"), cabinet=True)
-        plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False, scalar=False)
-        owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, scalar=True)
-        self.assertIsNotNone(owner.scalar)
+        plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False, coordinate=False)
+        owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, coordinate=True)
+        self.assertIsNotNone(owner.coordinate_trees)
         self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
         np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
         np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)

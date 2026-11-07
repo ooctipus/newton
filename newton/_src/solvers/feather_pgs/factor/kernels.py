@@ -586,8 +586,8 @@ def clock_advance(clock: wp.array[Clock], dt: float):
 
 @wp.kernel
 def advance_clock(clock: wp.array[Clock], dt: float):
-    """The clock's own launch, where no tree walks (a model of stars alone, :mod:`.scalar_branches`): the walk's
-    refresh advances it everywhere else."""
+    """The clock's own launch, where no tree walks (a model whose trees respond by their compact inverse alone): the
+    walk's refresh advances it everywhere else."""
     clock_advance(clock, dt)
 
 

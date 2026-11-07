@@ -92,8 +92,8 @@ def drive_terms(
     """Explicit force ``u0`` and implicit stiffness ``K`` of a coordinate's augmented drive on ``row``
     (:func:`.spatial_laws.drive_stiffness`, :func:`.spatial_laws.drive_force`): a coordinate without a row or with a
     nonpositive ``K`` holds no drive, ``(0, 0)``, and reads neither its coordinate ``joint_q[q_index]`` nor its target:
-    one law for every drive (the factor's preparation, :func:`.tree_factor.prepare_augmented_drives`, and the scalar
-    branches' predict)."""
+    one law for every drive (the factor's preparation, :func:`.tree_factor.prepare_augmented_drives`, and the
+    one-coordinate class's predict, :mod:`.coordinate_trees`)."""
     u0 = float(0.0)
     stiffness = float(0.0)
     if row >= 0:

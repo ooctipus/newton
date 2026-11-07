@@ -164,25 +164,27 @@ class TestKernelSass(unittest.TestCase):
             else:
                 self.assertIsNone(block)
 
-    def test_scalar_branch_kernels_group_at_their_launch_blocks(self):
-        """Group the scalar-branch kernels at the blocks kernel_sass compiles them at: the repair at its launch block.
+    def test_coordinate_tree_kernels_group_at_their_launch_blocks(self):
+        """Group the one-coordinate class's kernels at the blocks kernel_sass compiles them at: each repair at its
+        launch block.
 
-        The held-tree owner's scalar-branch group has no layout, so its kernels are in the pins family: the
-        repair launches one warp per articulation in blocks of four, the predict, finish and listed drive
-        kernels at Warp's default block. Nothing is compiled here; this checks the grouping a record uses.
+        The held-tree owner's one-coordinate class has no layout, so its kernels are in the pins family: the
+        repairs launch one warp per articulation in blocks of four, the predicts and finishes at Warp's default
+        block. Nothing is compiled here; this checks the grouping a record uses.
         """
-        from newton._src.solvers.feather_pgs import scalar_branches  # noqa: PLC0415
+        from newton._src.solvers.feather_pgs import coordinate_trees  # noqa: PLC0415
 
-        kernels, rejected = sass.identity.inventory(("pins",), ("scalar_branches.",))
+        kernels, rejected = sass.identity.inventory(("pins",), ("coordinate_trees.",))
         self.assertEqual(rejected, {})
         blocks = {
             key: block for keys, block in sass._module_groups(kernels, sass.launch_blocks(("pins",))) for key in keys
         }
-        self.assertEqual(len(blocks), 4)
-        self.assertEqual(blocks.pop("scalar_branches.repair_scalar_branches"), 128)
-        self.assertEqual(scalar_branches._REPAIR_BLOCK_DIM, 128)
+        self.assertEqual(len(blocks), 6)
+        for kind in ("slides", "turns"):
+            self.assertEqual(blocks.pop(f"coordinate_trees.repair_{kind}"), 128)
+            self.assertNotIn(f"coordinate_trees.repair_{kind}", sass.launch_blocks(("held_tree",)))
+        self.assertEqual(coordinate_trees.REPAIR_BLOCK_DIM, 128)
         self.assertEqual(set(blocks.values()), {256})
-        self.assertNotIn("scalar_branches.repair_scalar_branches", sass.launch_blocks(("held_tree",)))
 
     def test_report_fails_kernels_that_lose_resident_blocks_or_spill(self):
         """Exit 2 when a kernel keeps fewer blocks resident or spills more to local memory."""

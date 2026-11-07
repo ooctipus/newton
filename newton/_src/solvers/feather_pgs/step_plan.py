@@ -520,7 +520,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     # clock), then the predictor v_hat and the free roots' corrections.
     stream = factor.dynamics_stream
 
-    # The drives' stage takes the held plan's coordinates: a scalar branch's predict evaluates its own drives.
+    # The drives' stage takes the held plan's coordinates: a one-coordinate tree's predict decides its own drive.
     drive_dofs = factor.held.drive_dofs
 
     def check_call(step):

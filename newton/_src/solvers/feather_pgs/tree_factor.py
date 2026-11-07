@@ -105,8 +105,8 @@ def prepare_augmented_drives(
     rows: DriveRows,
     drive_tau: wp.array[float],
 ):
-    """The augmented drive of each coordinate of ``dofs`` (those no scalar branch's predict folds; without a list, the
-    thread's own), from the immutable DOF-to-row topology: ``u0`` and ``K`` (:func:`.factor.fields.drive_terms`, its
+    """The augmented drive of each coordinate of ``dofs`` (those no one-coordinate tree's predict decides; without a
+    list, the thread's own), from the immutable DOF-to-row topology: ``u0`` and ``K`` (:func:`.factor.fields.drive_terms`, its
     passive damper's with it) held on its row (:func:`.factor.fields.hold_drive_row`), which requests the
     articulation's factor refresh wherever ``K`` changed, a drive whose ``K`` fell to zero included."""
     dof = wp.tid()
@@ -631,8 +631,8 @@ class TreeFactor:
         self, state_in, control, dt: float, v_hat: wp.array, v_out: wp.array, dofs: wp.array | None = None
     ) -> None:
         """Launch the augmented drives of ``dofs`` (:func:`prepare_augmented_drives`; ``None``, every coordinate's
-        without a list), apart from FK/ID; ``v_hat`` and ``v_out`` are last step's. Beside scalar branches, whose
-        predict folds their own, ``dofs`` are the others (:attr:`.held_tree.HeldPlan.drive_dofs`)."""
+        without a list), apart from FK/ID; ``v_hat`` and ``v_out`` are last step's. Beside the one-coordinate class, whose
+        predict decides its own, ``dofs`` are the others (:attr:`.held_tree.HeldPlan.drive_dofs`)."""
         model = self.model
         wp.launch(
             prepare_augmented_drives,

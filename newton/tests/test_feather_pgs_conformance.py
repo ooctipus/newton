@@ -1482,13 +1482,13 @@ CPU = Route("cpu", "cpu", options=_MF, expect={"sweep.route": "matrix_free_gs"})
 
 # The sparse diagonal's one writer walks every row of the star and its dense articulation.
 SPARSE_DIAGONAL = Route(
-    "sparse_diagonal_scalar",
+    "sparse_diagonal_coordinate",
     "cuda",
     options=_MF,
     expect={
         "sweep.route": "sparse_diagonal",
         "contact_rows.producer": "walk",
-        "held_tree.scalar_branches.enabled": True,
+        "held_tree.coordinate_trees.enabled": True,
     },
 )
 SPARSE_DIAGONAL_TREE = Route(
@@ -1500,7 +1500,7 @@ SPARSE_DIAGONAL_TREE = Route(
     expect={
         "sweep.route": "sparse_diagonal",
         "contact_rows.producer": "walk",
-        "held_tree.scalar_branches.enabled": False,
+        "held_tree.coordinate_trees.enabled": False,
         "held_tree.groups.0.operator": "tree",
     },
 )
@@ -1654,9 +1654,9 @@ def cuda_groups() -> list:
             ),
             ref,
             (
-                # Scalar branches keep velocity-limited stars on the held tree's ordinary dynamics.
+                # The one-coordinate class keeps velocity-limited stars on the held tree's ordinary dynamics.
                 SPARSE_DIAGONAL.but(
-                    "sparse_diagonal_velocity_limits", expect={"held_tree.scalar_branches.enabled": False}
+                    "sparse_diagonal_velocity_limits", expect={"held_tree.coordinate_trees.enabled": False}
                 ),
                 SPARSE_DIAGONAL_TREE.but("sparse_diagonal_tree_velocity_limits"),
             ),

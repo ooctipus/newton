@@ -1,14 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Scalar branches: world-fixed roots over one-coordinate prismatic leaves (``scalar_branches.py``).
+"""The one-coordinate class: compact diagonal families whose trees are one body each (``coordinate_trees.py``).
 
-The CPU tests compare the scalar kernels, bound through ``ScalarBranchState``,
-with the held star on the same inputs, at rounding level, and their inverse masses
-with the float64 mass matrix (:mod:`.feather_pgs_mass_reference`). Stars with
-revolute leaves run in the held tree's diagonal-mass group. ``TestGripperContactBound``
-checks the CUDA arm-key press bound on the held star, the law both CUDA routes
-integrate.
+The CPU tests compare the class kernels, bound through ``CoordinateTrees``, with
+the held star on the same inputs, at rounding level, sliding and turning leaves
+alike, and their inverse masses with the float64 mass matrix
+(:mod:`.feather_pgs_mass_reference`). ``TestGripperContactBound`` checks the CUDA
+arm-key press bound on the held star, the law both CUDA routes integrate.
 """
 
 import dataclasses
@@ -20,8 +19,8 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import coordinate_trees as ct
 from newton._src.solvers.feather_pgs import held_tree, path_selection, tree_factor
-from newton._src.solvers.feather_pgs import scalar_branches as sb
 from newton._src.solvers.feather_pgs.device_proof import DeviceProof
 from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
@@ -31,7 +30,7 @@ from newton.tests.test_feather_pgs_cache_validity import _set_clock
 
 DT = 1.0 / 240.0
 GRAVITY = (0.7, -1.2, -9.1)
-# Fields the scalar family stops writing for its bodies; no consumer on its route reads them.
+# Fields the one-coordinate class never writes for its bodies; no consumer on its route reads them.
 DROPPED_FIELDS = ("body_q_com", "body_v_s", "body_a_s", "body_f_s", "body_I_s", "body_inertia_terms")
 # Fields the held owner writes only for free bodies, not for a fixed-base arm (it publishes body_v_s).
 ARM_DROPPED_FIELDS = ("body_q_com", "body_a_s", "body_f_s", "body_I_s", "body_inertia_terms")
@@ -48,7 +47,7 @@ IMPULSE_BOUND = {"rtol": 5.0e-3, "atol": 1.0e-8}
 # The arm moves from ordinary dynamics (every reference here: no cached owner takes these worlds,
 # and cached_dynamics selects only that owner) to the held owner: the same law at the same mass
 # cadence in another float order. It is bounded by the held-solve tests' 1e-5 floor (ae6baadb) plus
-# the scalar route's own run-to-run spread. Their other term, twice the ordinary solver's distance
+# the class's route's own run-to-run spread. Their other term, twice the ordinary solver's distance
 # from a held law, measures this very move, so it cannot bound it.
 ARM_FLOOR = 1.0e-5
 # The arm-key press (_press_key_with_tip, _gripper_switch). The pose floor is the first step's
@@ -68,7 +67,7 @@ GRIPPER_BUDGET_FRACTION = 0.1
 # 1024 and 2048 match it bitwise.
 GRIPPER_REFERENCE_ITERATIONS = 512
 # Coordinates of the fixtures' arm. A star of as many leaves shares the arm's size group, which is
-# then not diagonal: no scalar plan exists.
+# then not diagonal: no one-coordinate class exists.
 ARM_DOFS = 6
 # Leaves of the CUDA owner fixtures: the key presses, the small stars and the keyboard-shaped worlds.
 PRESS_LEAVES = 7
@@ -248,40 +247,41 @@ def branch_articulations(model):
 
 
 def cpu_solver(model, pins=None):
-    """A CPU solver of a branch model: the scalar kernels and the head kernels bind the arrays the CUDA route binds
+    """A CPU solver of a branch model: the class kernels and the head kernels bind the arrays the CUDA route binds
     once its held plan carries the CUDA route's compact diagonal (:func:`held_plan`); ``pins`` its test pins."""
     return SolverFeatherPGS(
         model, pins=pins or SolverFeatherPGS.Pins(), enable_joint_limits=True, update_mass_matrix_interval=2
     )
 
 
-def _inputs(solver):
-    """The class inputs the held plan and the scalar-branch rule read, from a built solver."""
+def _inputs(solver, *, coordinate=True):
+    """The class inputs the held plan and the one-coordinate rule read, from a built solver; without ``coordinate``
+    the test pin ``star="held"`` keeps the compact diagonal family in a held tree group."""
+    pins = solver.spec.pins if coordinate else dataclasses.replace(solver.spec.pins, star="held")
     return SimpleNamespace(
         model=solver.model,
         options=solver.options,
         forest=solver.forest,
         laws=solver.laws,
         factor=solver.factor,
-        pins=solver.spec.pins,
+        pins=pins,
     )
 
 
-def scalar_plan(solver, size):
-    """The scalar-branch plan (and why) of a solver's diagonal-mass group of the compact diagonal size ``size``."""
-    return sb.plan_scalar_branches(_inputs(solver), size=size)
+def coordinate_plan(solver, size):
+    """The one-coordinate plan (and why) of a solver's compact diagonal family of ``size`` coordinates."""
+    return ct.plan(_inputs(solver), size=size)
 
 
-def held_plan(solver, size, *, scalar=True):
-    """The CUDA route's held plan on a CPU solver: the compact diagonal of ``size`` coordinates, as scalar branches
-    unless ``scalar`` is false."""
-    branches = scalar_plan(solver, size)[0] if scalar else None
-    return held_tree.plan(_inputs(solver), compact=size, scalar=branches)
+def held_plan(solver, size, *, coordinate=True):
+    """The CUDA route's held plan on a CPU solver: the compact diagonal of ``size`` coordinates, as the one-coordinate
+    class unless ``coordinate`` is false."""
+    return held_tree.plan(_inputs(solver, coordinate=coordinate), compact=size)
 
 
-def scalar_group(plan):
-    """The scalar branches' group of a held plan."""
-    return next(group for group in plan.groups if group.kind == "scalar")
+def coordinate_group(plan):
+    """The one-coordinate class's group of a held plan."""
+    return next(group for group in plan.groups if group.kind == "coordinate")
 
 
 def branch_size(model):
@@ -297,8 +297,8 @@ def same(test, expected, actual, index, name):
     np.testing.assert_allclose(actual, expected, rtol=ARM_FLOOR, atol=2.0e-6, err_msg=name)
 
 
-def recipe_solver(model, *, scalar, pins=None, **options):
-    """The keyboard recipe's solver, plus scalar branches if asked; ``pins`` are more route pins."""
+def recipe_solver(model, *, coordinate, pins=None, **options):
+    """The keyboard recipe's solver, with the one-coordinate class if asked; ``pins`` are more route pins."""
     arguments = {
         "pgs_iterations": 8,
         "update_mass_matrix_interval": 2,
@@ -307,7 +307,7 @@ def recipe_solver(model, *, scalar, pins=None, **options):
         "mf_max_constraints": 64,
         **options,
     }
-    pins = {**({} if scalar else {"star": "held"}), **(pins or {})}
+    pins = {**({} if coordinate else {"star": "held"}), **(pins or {})}
     return SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(**pins), **arguments)
 
 
@@ -315,11 +315,11 @@ def dense_head(model, *, rows=64, **options):
     """The A/B head: the keyboard recipe on the general placement and dense storage, with the star in the held tree.
 
     ``rows`` is its dense row capacity: every key's limit rows are dense rows there. The general rows are inside
-    the resolved-world classifier's law, the sparse-diagonal rows of the scalar route are not: the head alone leaves
+    the resolved-world classifier's law, the sparse-diagonal rows of the class's route are not: the head alone leaves
     a world whose rows all separate without rows (:func:`_normal_impulses`), which changes the rows the arms keep,
     not their physics (the pusher press: key travel within 5.6e-7 and normal impulses within 3.0e-6 relative).
     """
-    return recipe_solver(model, scalar=False, pins={"placement": "general"}, dense_max_constraints=rows, **options)
+    return recipe_solver(model, coordinate=False, pins={"placement": "general"}, dense_max_constraints=rows, **options)
 
 
 def install_held_contacts(model, state, contacts, pairs):
@@ -353,7 +353,7 @@ def install_held_contacts(model, state, contacts, pairs):
 
 
 class _Layout:
-    """Index sets of a branch model: the scalar family's coordinates, DOFs and bodies, and the arm's."""
+    """Index sets of a branch model: the one-coordinate family's coordinates, DOFs and bodies, and the arm's."""
 
     def __init__(self, model):
         starts = model.articulation_start.numpy()
@@ -375,19 +375,21 @@ class _Layout:
 
 
 class _Pair:
-    """A held-star solver and a scalar-branch solver over one model, each with its own states and inputs."""
+    """A held-star solver and a one-coordinate class solver over one model, each with its own states and inputs."""
 
     def __init__(self, model, *, poison=False):
         size = branch_size(model)
         self.model = model
-        self.head = SolverFeatherPGS(model, enable_joint_limits=True, update_mass_matrix_interval=2)
+        self.head = SolverFeatherPGS(
+            model, pins=SolverFeatherPGS.Pins(star="held"), enable_joint_limits=True, update_mass_matrix_interval=2
+        )
         self.mine = cpu_solver(model)
         self.reference = MassReference(model)
-        self.plan, self.reason = scalar_plan(self.mine, size)
+        self.plan, self.reason = coordinate_plan(self.mine, size)
         if self.plan is None:
             raise AssertionError(self.reason)
         self.held = held_plan(self.mine, size)
-        self.state = sb.ScalarBranchState(self.mine, scalar_group(self.held))
+        self.state = ct.CoordinateTrees(self.mine, coordinate_group(self.held), self.held.coordinate)
         self.drive_dofs = wp.array(self.held.drive_dofs, dtype=int, device=model.device)
         self.states = {name: [model.state(), model.state()] for name in ("head", "mine")}
         self.controls = {name: model.control() for name in ("head", "mine")}
@@ -424,9 +426,9 @@ class _Pair:
             solver.factor.mass_update_mask.assign(values)
 
     def check_inverse_mass(self, test, joint_q, tag):
-        """Hold the scalar inverse masses to the float64 mass matrix, armature and drive stiffness at ``joint_q``."""
+        """Hold the class's inverse masses to the float64 mass matrix, armature and drive stiffness at ``joint_q``."""
         inverse = self.mine.factor.diagonal_inverse_mass.numpy()
-        # The branches' drives stay inside their kernels: the head prepared the same stiffness.
+        # The class's drives stay inside its kernels: the head prepared the same stiffness.
         rows = self.head.factor.drive_row_by_dof.numpy()
         K = self.head.factor.aug_row_K.numpy()
         armature = self.model.joint_armature.numpy()
@@ -483,30 +485,30 @@ class _Pair:
 
 
 def check_owner_launches(test, device):
-    """Launch every kernel of an owner beside scalar branches; each launch must match its kernel's parameters.
+    """Launch every kernel of an owner beside the one-coordinate class; each launch must match its kernel's parameters.
 
     The owner composition of the held-tree launch check (``check_owner_launches`` of the cache-validity
-    tests) that the keyboard class takes: a scalar group beside an arm's tree group, whose repair compares
+    tests) that the keyboard class takes: the class's group beside an arm's tree group, whose repair compares
     input banks. The owner takes two steps, the other DOFs' drive preparation included, and a copy-back begin.
-    Every held-tree and scalar launch is checked before it runs, the scalar kernels' outputs included, and every kernel
-    each group bound must have run: a tree group's by the cache its launches pass, the scalar group's by
+    Every held-tree and class launch is checked before it runs, the class kernels' outputs included, and every kernel
+    each group bound must have run: a tree group's by the cache its launches pass, the class's group's by
     kernel. On CPU the owner is built directly, as ``cached_dynamics`` builds it on CUDA, where the
     recipe's solver installs it (construction's lane timing included).
     """
     from newton.tests.test_feather_pgs_cache_validity import _input_mismatches  # noqa: PLC0415
 
     device = wp.get_device(device)
-    scalar_kernels = {
-        sb.repair_scalar_branches: "repair",
-        sb.predict_prismatic_branches: "predict",
-        sb.finish_prismatic_branches: "finish",
+    class_kernels = {
+        ct.repair_slides: "repair",
+        ct.predict_slides: "predict",
+        ct.finish_slides: "finish",
         tree_factor.prepare_augmented_drives: "drives",
     }
     launched = []
 
     def checked(launch):
         def launch_checked(kernel, *args, **kwargs):
-            if kernel.key.startswith("tree_kinetic_") or kernel in scalar_kernels:
+            if kernel.key.startswith("tree_kinetic_") or kernel in class_kernels:
                 # Checked before the launch: Warp would run a struct passed in another struct's place.
                 inputs = [*kwargs.get("inputs", ()), *kwargs.get("outputs", ())]
                 test.assertEqual(_input_mismatches(kernel, inputs), [], kernel.key)
@@ -522,13 +524,13 @@ def check_owner_launches(test, device):
             owner = HeldTree(solver, held_plan(solver, branch_size(model)))
         else:
             model = build_branch_model(device, worlds=2, leaves=PRESS_LEAVES, shapes=True)
-            solver = recipe_solver(model, scalar=True)
+            solver = recipe_solver(model, coordinate=True)
             owner = solver.factor.held
         test.assertIsInstance(owner, HeldTree)
-        test.assertIsInstance(owner.scalar, sb.ScalarBranchState)
+        test.assertIsInstance(owner.coordinate_trees, ct.CoordinateTrees)
         groups = []
         for group in owner.groups:
-            if group is owner.scalar:
+            if group is owner.coordinate_trees:
                 kernels = {
                     group.repair_kernel: "repair",
                     group.predictor_kernel: "predict",
@@ -543,7 +545,7 @@ def check_owner_launches(test, device):
                     group.predictor_kernel: "predict",
                 }
             groups.append((group, kernels))
-        test.assertEqual(sum(group is owner.scalar for group, _ in groups), 1)
+        test.assertEqual(sum(group is owner.coordinate_trees for group, _ in groups), 1)
         states, control = [model.state(), model.state()], model.control()
         for source, refresh in ((0, True), (1, False)):
             state, output = states[source], states[1 - source]
@@ -559,7 +561,7 @@ def check_owner_launches(test, device):
             _set_clock(solver.factor, refresh, ahead=1)
             owner.finish(state, solver.factor, output, DT)
         # A copy of the bank the last finish published, one coordinate changed: the tree group's repair compares
-        # the banks and repairs, the scalar group's stamp names the other bank.
+        # the banks and repairs, the class's stamp names the other bank.
         states[1].assign(states[0])
         coordinates = states[1].joint_q.numpy()
         coordinates[0] += np.float32(0.01)
@@ -567,7 +569,7 @@ def check_owner_launches(test, device):
         _set_clock(solver.factor, False)
         owner.begin(states[1], solver.factor, states[1].joint_qd, DT, state_out=states[0])
     for group, kernels in groups:
-        if group is owner.scalar:
+        if group is owner.coordinate_trees:
             ran = {kernel for kernel, _ in launched}
         else:
             ran = {kernel for kernel, inputs in launched if any(value is group.data for value in inputs)}
@@ -576,22 +578,22 @@ def check_owner_launches(test, device):
     test.assertTrue(np.isfinite(states[0].joint_q.numpy()).all())
 
 
-class TestScalarBranchRule(unittest.TestCase):
+class TestCoordinateTreesRule(unittest.TestCase):
     def test_world_fixed_one_coordinate_stars_are_admitted(self):
-        """Admit prismatic leaf stars on FIXED and zero-coordinate D6 roots; leave revolute leaves to the held tree."""
-        for kinds in (("revolute",), ("prismatic", "revolute")):
+        """Admit stars of one-coordinate leaves, sliding or turning, on FIXED and zero-coordinate D6 roots."""
+        for kinds, turns in ((("prismatic",), False), (("revolute",), True), (("prismatic", "revolute"), True)):
             with self.subTest(kinds=kinds):
-                plan, reason = scalar_plan(cpu_solver(build_branch_model(kinds=kinds)), 7)
-                self.assertIsNone(plan)
-                self.assertIn("revolute leaves run in the held tree's diagonal-mass group", reason)
+                plan, reason = coordinate_plan(cpu_solver(build_branch_model(kinds=kinds)), 7)
+                self.assertIsNotNone(plan, reason)
+                self.assertEqual(plan.turns, turns)
         for root in ("fixed", "d6"):
             with self.subTest(root=root):
                 model = build_branch_model(root=root)
                 solver = cpu_solver(model)
-                plan, reason = scalar_plan(solver, 7)
+                plan, reason = coordinate_plan(solver, 7)
                 self.assertIsNotNone(plan, reason)
                 self.assertEqual((plan.size, plan.group_count), (7, model.world_count))
-                self.assertIn("run as scalar branches", reason)
+                self.assertIn("hold their trees a thread a coordinate", reason)
                 starts = model.articulation_start.numpy()
                 expected = np.concatenate(
                     [
@@ -609,10 +611,8 @@ class TestScalarBranchRule(unittest.TestCase):
         from newton.tests.test_feather_pgs_star_rows import build_solver_fixture  # noqa: PLC0415
 
         model = build_solver_fixture("cpu")
-        kinds, reason = sb.branch_topology(model, np.array([0, 2]), model.articulation_start.numpy()[1:])
-        self.assertIsNotNone(kinds, reason)
-        self.assertEqual(kinds.shape, (2, 108))
-        self.assertTrue(np.all(kinds == int(newton.JointType.PRISMATIC)))
+        turns, reason = ct.coordinate_topology(model, np.array([0, 2]), model.articulation_start.numpy()[1:])
+        self.assertIs(turns, False, reason)
 
     def test_owner_fixtures_give_the_keys_their_own_group(self):
         """Give the keys of every CUDA owner fixture a diagonal-mass size group apart from the arm's."""
@@ -639,26 +639,26 @@ class TestScalarBranchRule(unittest.TestCase):
             with self.subTest(**variant):
                 model = build_branch_model(worlds=2, **variant)
                 joint_end = model.articulation_start.numpy()[1:]
-                kinds, reason = sb.branch_topology(model, branch_articulations(model), joint_end)
-                self.assertIsNone(kinds)
+                turns, reason = ct.coordinate_topology(model, branch_articulations(model), joint_end)
+                self.assertIsNone(turns)
                 self.assertIn(words, reason)
 
-    def test_tree_groups_beside_scalar_branches_compare_banks(self):
-        """Compare input banks in the tree groups beside scalar branches, as without them, and record it.
+    def test_tree_groups_beside_the_class_compare_banks(self):
+        """Compare input banks in the tree groups beside the one-coordinate class, as without it, and record it.
 
-        The scalar group's cache is stamped with the bank its finish published
+        The class's cache is stamped with the bank its finish published
         into, and its repair compares the stamp alone ("identity"). After a
         finish into ``s1`` a step that reads ``s0`` (a copy of ``s1`` after an
-        odd substep count) launches the arm's comparing repair and the scalar
-        repair. Without scalar branches the same solver's tree groups compare
+        odd substep count) launches the arm's comparing repair and the class's
+        repair. Without the class the same solver's tree groups compare
         that bank too. Launches are recorded, not run.
         """
         model = build_branch_model(worlds=2)
         # The general placement's walk holds every tree, so both owners bind on one solver.
         solver = cpu_solver(model, SolverFeatherPGS.Pins(placement="general"))
         owners = {
-            "scalar": HeldTree(solver, held_plan(solver, 7)),
-            "plain": HeldTree(solver, held_plan(solver, 7, scalar=False)),
+            "class": HeldTree(solver, held_plan(solver, 7)),
+            "plain": HeldTree(solver, held_plan(solver, 7, coordinate=False)),
         }
         s0, s1 = model.state(), model.state()
         kinds = {}
@@ -676,13 +676,13 @@ class TestScalarBranchRule(unittest.TestCase):
                 call()
             return [kinds[kernel] for kernel in launched if kernel in kinds]
 
-        expected = {"scalar": ["compare", "repair"], "plain": ["compare", "compare"]}
+        expected = {"class": ["compare", "repair"], "plain": ["compare", "compare"]}
         for name, owner in owners.items():
             copy_back = expected[name]
             with self.subTest(owner=name):
                 for group in owner.groups:
-                    if group is owner.scalar:
-                        record = path_selection._scalar_group(group, owner.drive_dofs)
+                    if group is owner.coordinate_trees:
+                        record = path_selection._coordinate_group(group, owner.drive_dofs)
                         self.assertEqual(record["input_validation"], "identity")
                         continue
                     record = path_selection._tree_group(group)
@@ -701,7 +701,7 @@ class TestScalarBranchRule(unittest.TestCase):
         model = build_branch_model(worlds=2, kinds=("prismatic", "revolute"), descendant=True)
         solver = cpu_solver(model)
         size = branch_size(model)
-        plan = held_plan(solver, size, scalar=False)
+        plan = held_plan(solver, size, coordinate=False)
         stars = branch_articulations(model)
         diagonal = [group for group in plan.groups if group.root_families == (-size,)]
         self.assertEqual(len(diagonal), 1)
@@ -723,18 +723,18 @@ class TestScalarBranchRule(unittest.TestCase):
         self.assertTrue(np.isfinite(states[0].joint_qd.numpy()).all())
 
     def test_owner_launches_match_their_kernels(self):
-        """Launch every kernel of an owner beside scalar branches with one input of each parameter's type, on CPU.
+        """Launch every kernel of an owner beside the one-coordinate class with one input of each parameter's type, on CPU.
 
         See :func:`check_owner_launches`.
         """
         check_owner_launches(self, "cpu")
 
-    def test_owner_proves_the_scalar_topology_through_its_tree_groups(self):
+    def test_owner_proves_the_class_topology_through_its_tree_groups(self):
         """Validate a notification with the owner's and the arm group's proofs alone, and still refuse new topology.
 
         The arm group's proof holds the model topology, the joint axes and
         art_to_world and watches every joint frame, and the owner's coverage
-        proof every size's group map, so the scalar group holds no proof of its
+        proof every size's group map, so the class's group holds no proof of its
         own: a moved key root is reported through the arm group's proof, so the
         solver invalidates every cache, and a turned key axis or a changed
         parent is refused there.
@@ -748,36 +748,42 @@ class TestScalarBranchRule(unittest.TestCase):
             self.assertTrue(owner.validate_model(joint))
         self.assertEqual(proofs.call_count, 2)
         frames = model.joint_X_p.numpy()
-        frames[model.articulation_start.numpy()[owner.scalar.group_to_art.numpy()[1]], 2] += 0.01
+        frames[model.articulation_start.numpy()[owner.coordinate_trees.group_to_art.numpy()[1]], 2] += 0.01
         model.joint_X_p.assign(frames)
         self.assertFalse(owner.validate_model(joint))
         self.assertTrue(owner.validate_model(joint))
         axes = model.joint_axis.numpy().copy()
         turned = axes.copy()
-        turned[scalar_plan(solver, 7)[0].dofs[0]] = (0.0, 0.0, 1.0)
+        turned[coordinate_plan(solver, 7)[0].dofs[0]] = (0.0, 0.0, 1.0)
         model.joint_axis.assign(turned)
         with self.assertRaisesRegex(RuntimeError, "joint_axis changed"):
             owner.validate_model(joint)
         model.joint_axis.assign(axes)
         self.assertTrue(owner.validate_model(joint))
         parents = model.joint_parent.numpy()
-        parents[model.articulation_start.numpy()[owner.scalar.group_to_art.numpy()[0]] + 2] = -1
+        parents[model.articulation_start.numpy()[owner.coordinate_trees.group_to_art.numpy()[0]] + 2] = -1
         model.joint_parent.assign(parents)
         with self.assertRaisesRegex(RuntimeError, "joint_parent changed"):
             owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
 
 
-class TestScalarBranchKernels(unittest.TestCase):
-    def test_prismatic_branches_match_the_held_star(self):
-        """Match the held star over steps, mass cadence, a masked reset and a re-pose.
+class TestCoordinateTreesKernels(unittest.TestCase):
+    def test_leaves_match_the_held_star(self):
+        """Match the held star over steps, mass cadence, a masked reset and a re-pose, sliding and turning leaves.
 
         Every field the family publishes is compared: input and output poses,
         coordinates, body velocities, motion axes, predictors and the articulation
         origin, and the inverse masses with the float64 mass matrix. The dropped
-        FK/ID fields of the scalar solver hold NaN throughout, so no scalar kernel
+        FK/ID fields of the class's solver hold NaN throughout, so no class kernel
         reads them.
         """
-        pair = _Pair(build_branch_model(), poison=True)
+        for kinds in (("prismatic",), ("prismatic", "revolute")):
+            with self.subTest(kinds=kinds):
+                self._match_the_held_star(kinds)
+
+    def _match_the_held_star(self, kinds):
+        pair = _Pair(build_branch_model(kinds=kinds), poison=True)
+        self.assertEqual(pair.plan.turns, "revolute" in kinds)
         worlds = pair.model.world_count
         for step in range(8):
             pair.inputs()
@@ -855,7 +861,7 @@ class TestScalarBranchKernels(unittest.TestCase):
         mine.factor.prepare_drives(state, control, DT, mine.v_hat, mine.v_out, pair.drive_dofs)
         others = pair.drive_dofs.numpy()
         np.testing.assert_array_equal(np.sort(np.concatenate([others, pair.dofs])), np.arange(model.joint_dof_count))
-        self.assertEqual(path_selection._scalar_group(pair.state, pair.drive_dofs)["drive_dofs"], len(others))
+        self.assertEqual(path_selection._coordinate_group(pair.state, pair.drive_dofs)["drive_dofs"], len(others))
         rows = pair.mine.factor.drive_row_by_dof.numpy()
         np.testing.assert_array_equal(pair.mine.factor.joint_tau.numpy()[others], head.factor.joint_tau.numpy()[others])
         other_rows = rows[others][rows[others] >= 0]
@@ -875,7 +881,7 @@ def _close(test, expected, actual, index, tag, *, rtol, atol):
 
 
 def _arm_within(test, reference, actual, bodies, tag, *, again=None):
-    """Bound the arm bodies' A/B difference by ``ARM_FLOOR`` plus the scalar route's A/A spread ``again``."""
+    """Bound the arm bodies' A/B difference by ``ARM_FLOOR`` plus the class's route's A/A spread ``again``."""
     actual = actual.numpy()[bodies]
     test.assertTrue(np.all(np.isfinite(actual)), tag)
     spread = 0.0 if again is None else _excess(again.numpy()[bodies], actual)
@@ -1079,7 +1085,7 @@ class TestGripperContactBound(unittest.TestCase):
                 values[layout.key_dofs] = 0.0
                 getattr(model, name).assign(values)
         # The bound reads every step's rows: the complete path builds them in a world whose contacts separate too.
-        solver = recipe_solver(model, scalar=False, pgs_iterations=iterations, pins={"claims": ()})
+        solver = recipe_solver(model, coordinate=False, pgs_iterations=iterations, pins={"claims": ()})
         return solver, _press_key_with_tip(self, model, layout, solver, shift=shift)
 
     def _head_and_reference(self):
@@ -1128,7 +1134,7 @@ class TestGripperContactBound(unittest.TestCase):
         """Refuse defects of the keys' response in every world, which holds ``GRIPPER_BUDGET_FRACTION`` below 0.16.
 
         An inverse mass that counts the drive stiffness twice, or keys without drives, stand in for
-        defects of the scalar family: their contact rows' diagonal moves by tens of percent, their
+        defects of the class: their contact rows' diagonal moves by tens of percent, their
         first impulses miss the pose floor by more than tenfold, and every world's impulses miss the
         budget bound, the doubled stiffness's by 1.6 times in the loaded world.
         """
@@ -1142,12 +1148,12 @@ class TestGripperContactBound(unittest.TestCase):
                 self.assertTrue(np.all(switch["switch"] > switch["bound"]), switch)
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "Scalar branches run on the CUDA held-tree owner")
-class TestScalarBranchOwner(unittest.TestCase):
+@unittest.skipUnless(wp.is_cuda_available(), "The one-coordinate class runs on the CUDA held-tree owner")
+class TestCoordinateTreesOwner(unittest.TestCase):
     def _poison(self, solver, layout):
-        """Fill what the scalar owner neither writes nor reads with NaN.
+        """Fill what the class's owner neither writes nor reads with NaN.
 
-        For the keys: the FK/ID fields the scalar family stops writing, and the
+        For the keys: the FK/ID fields the class stops writing, and the
         drive stiffness and forces its predict evaluates itself. For the arm:
         the FK/ID fields the head's serial route writes and the held owner does
         not for a fixed-base tree.
@@ -1166,24 +1172,25 @@ class TestScalarBranchOwner(unittest.TestCase):
         solver.factor.joint_tau.assign(tau)
         solver.factor.aug_row_K.assign(stiffness)
 
-    def _assert_routes(self, head, scalar):
-        """Require the routes an A/B compares: the head's ordinary dynamics and the scalar owner.
+    def _assert_routes(self, head, mine):
+        """Require the routes an A/B compares: the head's ordinary dynamics and the class's owner.
 
         The keys must form their own size group: an arm-sized star would share
         the arm's group, which the recipe cannot run (see
         ``test_owner_fixtures_give_the_keys_their_own_group``).
         """
-        self.assertIsNone(head.factor.held.scalar)
-        owner = scalar.factor.held
+        self.assertIsNone(head.factor.held.coordinate_trees)
+        owner = mine.factor.held
         self.assertIsInstance(owner, HeldTree)
-        self.assertIsInstance(owner.scalar, sb.ScalarBranchState)
-        self.assertIs(owner.scalar.predictor_kernel, sb.predict_prismatic_branches)
-        self.assertNotEqual(owner.scalar.size, ARM_DOFS)
-        self.assertEqual(sorted(group.sparse.size for group in owner.groups), sorted((ARM_DOFS, owner.scalar.size)))
+        self.assertIsInstance(owner.coordinate_trees, ct.CoordinateTrees)
+        self.assertIs(owner.coordinate_trees.predictor_kernel, ct.predict_slides)
+        self.assertNotEqual(owner.coordinate_trees.size, ARM_DOFS)
+        sizes = sorted(group.sparse.size for group in owner.groups)
+        self.assertEqual(sizes, sorted((ARM_DOFS, owner.coordinate_trees.size)))
         return owner
 
     def test_owner_matches_ordinary_dynamics(self):
-        """Own 108-key worlds as scalar branches beside a held arm and track ordinary dynamics.
+        """Own 108-key worlds by the one-coordinate class beside a held arm and track ordinary dynamics.
 
         Keys and their floor-contact impulses stay within the keys' bound of
         ordinary dynamics through the mass cadence, an inertial and drive
@@ -1191,7 +1198,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         state bank copied back into the input (which every cache must repair)
         and captured graphs with masked and full resets. The arm moves to the held owner's float order,
         within the held-solve floor (``ARM_FLOOR``) plus the twin's spread.
-        An eager twin of the scalar route does the captured work step by step:
+        An eager twin of the class's route does the captured work step by step:
         each replay must give what it gives. The FK/ID fields that neither the
         family writes for the keys nor the held owner for the arm hold NaN
         throughout, so nothing on the route reads them.
@@ -1201,16 +1208,16 @@ class TestScalarBranchOwner(unittest.TestCase):
         layout = _Layout(model)
         starts, child = model.articulation_start.numpy(), model.joint_child.numpy()
         floors = [int(child[starts[a] + 1 + k]) for a in layout.branches for k in (0, 17, 53, 107)]
-        # The head, the scalar route (captured below) and the scalar route's eager twin.
+        # The head, the class's route (captured below) and the class's route's eager twin.
         solvers = [
             # Every key's limit rows are dense rows on the head: with the arm's and the contacts', 240 rows a world.
             dense_head(model, rows=256),
-            recipe_solver(model, scalar=True),
-            recipe_solver(model, scalar=True),
+            recipe_solver(model, coordinate=True),
+            recipe_solver(model, coordinate=True),
         ]
-        head, scalar, twin = solvers
-        owners = [self._assert_routes(head, solver) for solver in (scalar, twin)]
-        for solver in (scalar, twin):
+        head, mine, twin = solvers
+        owners = [self._assert_routes(head, solver) for solver in (mine, twin)]
+        for solver in (mine, twin):
             self._poison(solver, layout)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
@@ -1262,12 +1269,12 @@ class TestScalarBranchOwner(unittest.TestCase):
                     f"{tag} arm {name}",
                     again=getattr(states[2][0], name),
                 )
-            _close(self, head.v_hat, scalar.v_hat, layout.key_dofs, f"{tag} v_hat", **KEY_BOUND)
+            _close(self, head.v_hat, mine.v_hat, layout.key_dofs, f"{tag} v_hat", **KEY_BOUND)
             # The floor contacts are key-only rows: their impulses follow the head's within the keys' bound.
             impulses = [_normal_impulses(self, solver, len(floors)) for solver in solvers]
             np.testing.assert_allclose(impulses[1], impulses[0], err_msg=f"{tag} impulses", **IMPULSE_BOUND)
             loads.append(float(impulses[0].max()))
-            # The twin does the scalar route's work eagerly: it must give the same state and impulses.
+            # The twin does the class's route's work eagerly: it must give the same state and impulses.
             for name, index in (("joint_q", layout.key_coordinates), ("joint_qd", layout.key_dofs)):
                 _close(
                     self,
@@ -1341,7 +1348,7 @@ class TestScalarBranchOwner(unittest.TestCase):
             mask.assign(np.asarray(reset, dtype=np.bool_))
             inputs(replay + 11)
             write_coordinates(reset)
-            for solver in (scalar, twin):
+            for solver in (mine, twin):
                 self._poison(solver, layout)
             for graph in graphs:
                 wp.capture_launch(graph)
@@ -1355,7 +1362,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         self.assertGreater(max(loads), 0.0)
 
     def test_cuda_owner_launches_match_their_kernels(self):
-        """Launch every kernel the recipe's owner beside scalar branches binds, construction's included, with matching inputs."""
+        """Launch every kernel the recipe's owner beside the class binds, construction's included, with matching inputs."""
         check_owner_launches(self, "cuda:0")
 
     def test_drive_kernel_covers_only_the_other_dofs(self):
@@ -1366,7 +1373,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         """
         device = wp.get_device("cuda:0")
         model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, shapes=True)
-        solver = recipe_solver(model, scalar=True)
+        solver = recipe_solver(model, coordinate=True)
         states, control = [model.state(), model.state()], model.control()
         contacts = newton.Contacts(1, 0, device=device)
         contacts.rigid_contact_count.zero_()
@@ -1403,7 +1410,10 @@ class TestScalarBranchOwner(unittest.TestCase):
         model.joint_limit_upper.assign(upper)
         model.joint_q.zero_()
         model.joint_qd.zero_()
-        solvers = [recipe_solver(model, scalar=False, pins={"placement": "general"}), recipe_solver(model, scalar=True)]
+        solvers = [
+            recipe_solver(model, coordinate=False, pins={"placement": "general"}),
+            recipe_solver(model, coordinate=True),
+        ]
         self._assert_routes(*solvers)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
@@ -1477,7 +1487,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         mu = model.shape_material_mu.numpy()
         mu[np.isin(model.shape_body.numpy(), layout.key_leaves)] = 0.0
         model.shape_material_mu.assign(mu)
-        solvers = [dense_head(model), recipe_solver(model, scalar=True)]
+        solvers = [dense_head(model), recipe_solver(model, coordinate=True)]
         self._assert_routes(*solvers)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
@@ -1546,14 +1556,14 @@ class TestScalarBranchOwner(unittest.TestCase):
     def test_gripper_contact_matches_ordinary_dynamics(self):
         """Press a key with the arm's tip: travel and impulses stay within the head's pose and budget bounds.
 
-        The scalar route changes two float orders at once: the key's (the scalar kernels instead of
+        The class's route changes two float orders at once: the key's (the class kernels instead of
         ordinary dynamics) and the arm's (the held owner instead of ordinary dynamics). Both
         integrate the same law, so the bound is what that law leaves undetermined at the recipe's
         eight sweeps (``_assert_gripper_switch``):
 
         - The contact response is determined: the normal row's Delassus diagonal ``D``, 29 1/kg,
           is the key's inverse mass along the normal (the upright arm's tip adds under 2e-6 of it on
-          the CPU twin). The head's matches that closed form within 1e-4, and the scalar route's the
+          the CPU twin). The head's matches that closed form within 1e-4, and the class's route's the
           head's within the keys' bound.
         - The first step starts both routes from one state. They differ by the float order of the
           tip's and the key's poses, about one float32 spacing of the contact's world position each,
@@ -1562,7 +1572,7 @@ class TestScalarBranchOwner(unittest.TestCase):
           within the pose floor, that gain's response to four spacings. On the CPU twin the friction
           cone scales the gain by 1.40 and 0.86 while the contact stays penetrating (it starts three
           spacings deep), so the floor admits about three spacings. Measured on CUDA against the
-          linear-state law the scalar kernels follow: 6.8e-8 and 4.2e-8 N s, 0.17 and 0.11 of the floor. The response is linear: on the CPU twin a 3e-8 m
+          linear-state law the class kernels follow: 6.8e-8 and 4.2e-8 N s, 0.17 and 0.11 of the floor. The response is linear: on the CPU twin a 3e-8 m
           shift of the tip's witness (one spacing of 0.3 m) gives 6.9e-8 and 4.2e-8 N s, and
           ``TestGripperContactBound``'s one-spacing shift of the 0.5 m extent (6e-8 m) gives 1.4e-7
           and 8.4e-8 N s (0.35 and 0.21 of the floor).
@@ -1573,7 +1583,7 @@ class TestScalarBranchOwner(unittest.TestCase):
           short of that converged run. The history amplifies the first difference (CUDA: 9.4e-6
           N s, 2% of that error if CUDA's matches; a one-spacing shift on the CPU twin: 0.3%). Every
           step's impulses must agree within ``GRIPPER_BUDGET_FRACTION`` (a tenth) of the head's
-          distance from the converged run plus the pose floor, so the scalar route stays within 1.1
+          distance from the converged run plus the pose floor, so the class's route stays within 1.1
           times the head's distance from that run plus the floor. On the CPU twin an
           ``ARM_FLOOR``-sized difference of the arm's coordinates, the held owner's documented
           distance from ordinary dynamics, moves the loaded world's impulses by up to 1.4e-5 N s,
@@ -1582,7 +1592,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         - The key's travel moves far less (under 7e-8 m for a one-spacing shift on the CPU twin,
           against the budget's 1e-5 m) and keeps a 1e-3 relative bound.
 
-        A defect in the scalar family's response misses these by orders of magnitude: on the CPU
+        A defect in the class's response misses these by orders of magnitude: on the CPU
         twin an inverse mass that counts the drive stiffness twice moves the diagonal by 29%, the
         first impulses by 135 and 620 times the pose floor and the later ones by 1.6 and 620 times
         the bound, and keys without drives carry no load.
@@ -1590,34 +1600,44 @@ class TestScalarBranchOwner(unittest.TestCase):
         device = wp.get_device("cuda:0")
         model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, shapes=True)
         layout = _Layout(model)
-        head = recipe_solver(model, scalar=False, pins={"placement": "general"})
-        scalar = recipe_solver(model, scalar=True)
-        self._assert_routes(head, scalar)
+        head = recipe_solver(model, coordinate=False, pins={"placement": "general"})
+        mine = recipe_solver(model, coordinate=True)
+        self._assert_routes(head, mine)
         # The head route converged: the same solver with many more sweeps.
         reference = recipe_solver(
-            model, scalar=False, pins={"placement": "general"}, pgs_iterations=GRIPPER_REFERENCE_ITERATIONS
+            model, coordinate=False, pins={"placement": "general"}, pgs_iterations=GRIPPER_REFERENCE_ITERATIONS
         )
-        presses = [_press_key_with_tip(self, model, layout, solver) for solver in (head, scalar, reference)]
+        presses = [_press_key_with_tip(self, model, layout, solver) for solver in (head, mine, reference)]
         _assert_gripper_switch(self, *presses, beta=head.options.pgs_beta, dt=DT)
 
-    def test_revolute_leaves_run_in_the_held_diagonal_group(self):
-        """A star with revolute leaves stays out of scalar branches: the held tree's diagonal-mass group owns it."""
+    def test_turning_leaves_take_the_class_kernels(self):
+        """A star with revolute leaves takes the class's turning kernels; pinned (``star="held"``), the held tree's
+        compact diagonal group holds it, whose walk is its inverse; both step finite."""
         device = wp.get_device("cuda:0")
         model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, kinds=("prismatic", "revolute"), shapes=True)
-        solver = recipe_solver(model, scalar=True)
-        plan, reason = solver.spec.classes.scalar
-        self.assertIsNone(plan)
-        self.assertIn("revolute leaves run in the held tree's diagonal-mass group", reason)
-        owner = solver.factor.held
-        self.assertIsNone(owner.scalar)
-        responses = sorted(group._response for group in owner.groups)
+        mine = recipe_solver(model, coordinate=True)
+        owner = mine.factor.held
+        self.assertIsNotNone(owner.plan.coordinate, owner.plan.coordinate_reason)
+        self.assertTrue(owner.plan.coordinate.turns)
+        self.assertIs(owner.coordinate_trees.predictor_kernel, ct.predict_turns)
+        held = recipe_solver(model, coordinate=False)
+        self.assertIsNone(held.factor.held.coordinate_trees)
+        responses = sorted(group._response for group in held.factor.held.groups)
         self.assertEqual(responses, ["cholesky", "diagonal"])
         # The diagonal group's walk is its inverse: the star holds no walk class, its predictor no walk solve.
         stars = branch_articulations(model)
-        np.testing.assert_array_equal(solver.factor.walk_class_host[stars], -1)
-        diagonal = next(group for group in owner.groups if group._response == "diagonal")
+        for solver in (mine, held):
+            np.testing.assert_array_equal(solver.factor.walk_class_host[stars], -1)
+        diagonal = next(group for group in held.factor.held.groups if group._response == "diagonal")
         self.assertEqual(diagonal.layout.root_families, (-STAR_LEAVES,))
         self.assertIsNone(diagonal.walk_solve_kernel)
+        for solver in (mine, held):
+            states = [model.state(), model.state()]
+            newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+            for _step in range(4):
+                solver.step(states[0], states[1], model.control(), None, DT)
+                states.reverse()
+            self.assertTrue(np.isfinite(states[0].joint_q.numpy()).all())
 
 
 if __name__ == "__main__":

@@ -571,9 +571,9 @@ class SolverFeatherPGS(SolverBase):
         # The walk is the trees' factor (Z4): the predictor solves every tree of its groups by it, a prescribed tree
         # beside a responding one in a size group included (the dense factor held it before Z4.2), the placements
         # that walk read it for their rows and leave, and the border decides a slipping tree's step on it. The held
-        # plan names its trees (held_tree.HeldPlan.walking): a scalar branch predicts and decides in its own kernels
-        # (scalar_branches.py), and the compact diagonal's walk is its inverse (one division a coordinate, which the
-        # star's rows and the sparse diagonal's leave already take); neither takes the walk.
+        # plan names its trees (held_tree.HeldPlan.walking): the compact diagonal's walk is its inverse (one division a
+        # coordinate, which the star's rows and the sparse diagonal's leave already take), so it takes no walk, in a
+        # held tree group or in the one-coordinate class (coordinate_trees.py).
         walking = self.spec.classes.held.walking
         if walking.size:
             self.factor.plan_walk(walking)
@@ -668,8 +668,8 @@ class SolverFeatherPGS(SolverBase):
         construction; the applied value is the one in effect after construction's
         gates and clamps, off (``False``, ``0`` or ``"off"``) when the owner, tier
         or stream an option requests was not built.
-        ``routes.held_tree.scalar_branches`` states whether a diagonal-mass group
-        runs as scalar branches, and why.
+        ``routes.held_tree.coordinate_trees`` states whether the compact
+        diagonal family takes the one-coordinate class, and why.
         ``environment`` records the ``FEATHER_PGS_*`` and
         ``IL_NEWTON_FPGS_*`` variables present at construction: ``applied`` maps
         declared names to their values, ``unknown`` lists undeclared names
