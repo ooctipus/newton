@@ -1,32 +1,32 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""FeatherPGS's sweep routes as configurations of the sweep emitter (:mod:`.sweep`).
+"""FeatherPGS's general (matrix-free) sweep as a configuration of the sweep emitter (:mod:`.sweep`).
 
-Each function here builds one route's kernel from the emitter's parts; every kernel's working set fits the static
-budget of the device it is built for (:func:`.memory.arch_budget`).
+:class:`GeneralSweep` is its configuration, which the one factory builds (:func:`.sweep.sweep_kernel`); its working
+set fits the static budget of the device it is built for (:func:`.memory.arch_budget`). The module also holds what
+every claim's sweep shares: the world queue's dispatch (:func:`worlds`), the free bodies' rows and walk.
 """
 
 from __future__ import annotations
 
 import dataclasses
-from functools import cache
 
 import warp as wp
 
-from ...core.execution import Work, device_lanes, shape
-from ...core.memory import REGISTERS_PER_THREAD, Buffer, Place, Staging, arch_budget, built_for
+from ...core.execution import Work, device_lanes
+from ...core.memory import REGISTERS_PER_THREAD, Buffer, Place, Staging
 from . import kernel_template, sweep_units
 from .device_preludes import RING, SHARED_STORAGE, group_native, lane_group
 from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude
-from .kernel_template import KernelTemplate
+from .kernel_template import Dispatch
 from .law_source import law_preludes
 from .packed_rows import PACKED_SIDES
 from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_metadata import _validate_dense_metadata_encoding
-from .solve_policy import DEFAULT_POLICY, QUIET_LITERAL, SolvePolicy, block_argmax, sweep_exit
+from .solve_policy import QUIET_LITERAL, block_argmax, sweep_exit
 from .sweep import (
     CONTACT,
     FRICTION,
@@ -36,6 +36,7 @@ from .sweep import (
     Diagonal,
     RowContext,
     RowLaws,
+    SweepConfig,
     UnitZ,
     WorldRows,
     cached_pair_law,
@@ -266,9 +267,6 @@ visits their colors in order and each color's units at once (:mod:`.sweep_units`
 COLORED_THREADS = 256
 """Threads of a colored world's block: a color's units beyond them run in turns. The largest color measured holds
 237 units (coins) and 139 (hardware), and a unit's staged registers (up to 193) leave room for 256 threads."""
-
-COLORED_WORK = Work(0, lanes=COLORED_THREADS, registers=REGISTERS_PER_THREAD)
-"""What a colored launch declares: a block a world, every register a thread may hold (one block a multiprocessor)."""
 
 COLOR_CHUNK = 256
 """Color offsets a colored block stages at a time: a world's colors are bounded by its units, not by the block."""
@@ -664,26 +662,7 @@ def mf_gs_staging(
     )
 
 
-def mf_gs_source(
-    max_constraints: int,
-    mf_max_constraints: int,
-    max_world_dofs: int,
-    *,
-    max_row_dofs: int | None = None,
-    mapping: str = "warp",
-    places: RowPlaces = STAGED_ROWS,
-    has_dense_velocity_limit_rows: bool = True,
-    contact_torsion: bool = False,
-    solve_policy: SolvePolicy = DEFAULT_POLICY,
-    lanes: int = 32,
-    weighted: bool = False,
-    material: bool = False,
-    seeded: bool = False,
-    wide_rows: bool = False,
-    pitch: int | None = None,
-    free_rows: bool = True,
-    speed_rows: bool = False,
-) -> tuple[str, Staging]:
+def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     """The native body of the matrix-free Gauss-Seidel sweep: a world's dense rows (:func:`packed_operator`, packed
     whitened rows of ``max_row_dofs`` entries, by default as many as the world's coordinates) and its free-body rows
     (:func:`free_body_rows`), then its end-of-sweep passes, on the world's velocity change from the predictor in walk
@@ -711,22 +690,16 @@ def mf_gs_source(
 
     Returns the body and its staging.
     """
-    if mapping not in MAPPINGS:
-        raise ValueError(f"mapping must be one of {MAPPINGS}, got {mapping!r}")
+    mapping, places, solve_policy = sweep.mapping, sweep.places, sweep.solve_policy
+    contact_torsion, seeded, wide_rows = sweep.torsion, sweep.seeded, sweep.wide_rows
+    free_rows, speed_rows, max_row_dofs = sweep.free_rows, sweep.speed_rows, sweep.max_row_dofs
     colored = mapping == "colored"
-    if colored and not free_rows:
-        raise ValueError("the colored mapping sweeps the free bodies' run: it needs free_rows")
-    if lanes not in (1, 32) or (colored and lanes != 32):
-        raise ValueError(f"the warp mapping runs 32 lanes or one thread, the colored mapping 32; got {lanes}")
-    _validate_dense_metadata_encoding(max_constraints)
-    M_D, M_MF, D = max_constraints, mf_max_constraints, max_world_dofs
+    lanes = sweep.lanes
+    M_D, M_MF, D = sweep.max_constraints, sweep.mf_max_constraints, sweep.max_world_dofs
     # The row store's line: the dense rows, then the free bodies' from M_D (:mod:`.row_records`).
-    P = int(M_D + M_MF if pitch is None else pitch)
-    max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
+    P = int(M_D + M_MF if sweep.pitch is None else sweep.pitch)
     row_lanes = Lanes(lanes)
-    if material and not weighted:
-        raise ValueError("material contacts step by their weights: their sweeps are weighted")
-    laws = RowLaws(regularize=weighted, material=material, torsion=contact_torsion, policy=solve_policy)
+    laws = sweep.laws
     dense = WorldRows(M_D, staging=places.staging, lanes=row_lanes)
     free = WorldRows(M_MF, staging="header", stream=places.impulses is Place.GLOBAL, lanes=row_lanes)
     dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows)
@@ -748,7 +721,7 @@ def mf_gs_source(
     mf_store = free.stores("i")
 
     passes = []
-    if has_dense_velocity_limit_rows:
+    if sweep.has_dense_velocity_limit_rows:
         passes.append(velocity_limit_pass(dense, dense_op, laws, pad="        "))
     # The free bodies' speed rows leave and enter by the walk, as their rows were written (walk_rows): the run's, or
     # the line's last rows, each naming its body by its side.
@@ -971,82 +944,115 @@ def mf_gs_source(
     return group_native(body, preludes=preludes, lanes=lanes), staging
 
 
-@cache
-def mf_gs_kernel(
-    max_constraints: int,
-    mf_max_constraints: int,
-    max_world_dofs: int,
-    device_arch: str,
-    *,
-    max_row_dofs: int | None = None,
-    mapping: str = "warp",
-    places: RowPlaces = STAGED_ROWS,
-    has_dense_velocity_limit_rows: bool = True,
-    contact_torsion: bool = False,
-    solve_policy: SolvePolicy = DEFAULT_POLICY,
-    weighted: bool = False,
-    material: bool = False,
-    seeded: bool = False,
-    wide_rows: bool = False,
-    pitch: int | None = None,
-    free_rows: bool = True,
-    speed_rows: bool = False,
-) -> wp.Kernel:
-    """The matrix-free Gauss-Seidel sweep kernel of a thread mapping (:func:`mf_gs_source`): the warp's launches a
-    warp per world item (one thread on the CPU, :func:`.execution.device_lanes`) and takes :data:`MF_GS_ABI`
-    the colored one :data:`COLORED_THREADS` and takes :data:`COLORED_ABI`. Each walks its worlds from a device list
-    (:func:`worlds`): its bucket of the claims' worlds (:func:`.sweep_levels.claim_worlds`), the general sweep's (no
-    Jacobi tier's world, no colored one) or the colored one's (the unit builder's appends)."""
-    max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
-    snippet, staging = mf_gs_source(
-        max_constraints,
-        mf_max_constraints,
-        max_world_dofs,
-        max_row_dofs=max_row_dofs,
-        mapping=mapping,
-        places=places,
-        has_dense_velocity_limit_rows=has_dense_velocity_limit_rows,
-        contact_torsion=contact_torsion,
-        solve_policy=solve_policy,
-        lanes=32 if mapping == "colored" else device_lanes(device_arch),
-        weighted=weighted,
-        material=material,
-        seeded=seeded,
-        wide_rows=wide_rows,
-        pitch=pitch,
-        free_rows=free_rows,
-        speed_rows=speed_rows,
-    )
-    colored = mapping == "colored"
-    staging.check(f"the {mapping} matrix-free sweep", arch_budget(device_arch))
-    name = (
-        f"sweep_mf_{'colored' if colored else 'gs'}_{max_constraints}_{mf_max_constraints}_{max_world_dofs}"
-        f"_s{max_row_dofs}"
-        f"_densevlim{int(has_dense_velocity_limit_rows)}"
-        + places.suffix
-        + ("_torsion" if contact_torsion else "")
-        + ("_weighted" if weighted else "")
-        + ("_material" if material else "")
-        + ("_seeded" if seeded else "")
-        + ("_wide" if wide_rows else "")
-        + (f"_p{pitch}" if pitch is not None and pitch != max_constraints + mf_max_constraints else "")
-        + ("" if free_rows else "_line")
-        + ("_speed" if speed_rows else "")
-        + "_walk"
-        + solve_policy.suffix
-    )
-    return KernelTemplate.from_abi(
-        name,
-        COLORED_ABI if colored else MF_GS_ABI,
-        snippet,
-        worlds(),
-        extra=(
+@dataclasses.dataclass(frozen=True)
+class GeneralSweep(SweepConfig):
+    """The general (matrix-free Gauss-Seidel) sweep's configuration: a world's dense rows (at most
+    ``max_constraints``, packed whitened rows of ``max_row_dofs`` entries, by default as many as the world's
+    ``max_world_dofs`` coordinates) and its free-body rows (at most ``mf_max_constraints``) on the world's velocity
+    change in walk coordinates (:func:`mf_gs_source`).
+
+    Its switches, each the plan's from the class's shape, the placement and the laws (:meth:`.sweep_plan.Sweep.build`):
+
+    - the level's mapping (:data:`MAPPINGS`): ``"warp"``, the world's warp visits its rows in row order; ``"colored"``,
+      a block visits the free bodies' colors in order and a color's units at once (the unit builder's rule picks the
+      worlds, :class:`.sweep_units.ColoredRule`);
+    - the row record: ``places``, where the rows' metadata, kinds and the free bodies' impulses live
+      (:class:`RowPlaces`, staged or streamed, the plan's storage choice);
+    - the support class: ``max_row_dofs`` (the placement's packed support), ``wide_rows`` (rows over every coordinate,
+      the bilateral block's), and the free bodies' 6 + 6 class: ``free_rows`` their own run, else rows of the line,
+      their ``speed_rows`` the line's last;
+    - ``has_dense_velocity_limit_rows``: the velocity limits' last word; ``seeded``: the seed; ``pitch``: the line.
+
+    The warp mapping is a warp a world on CUDA and one thread on the CPU (:meth:`work`); the colored one a block of
+    :data:`COLORED_THREADS`. Each walks its bucket of the claims' worlds (:func:`worlds`).
+    """
+
+    max_constraints: int
+    mf_max_constraints: int
+    max_world_dofs: int
+    device_arch: str
+    _: dataclasses.KW_ONLY
+    max_row_dofs: int | None = None
+    mapping: str = "warp"
+    places: RowPlaces = STAGED_ROWS
+    has_dense_velocity_limit_rows: bool = True
+    seeded: bool = False
+    wide_rows: bool = False
+    pitch: int | None = None
+    free_rows: bool = True
+    speed_rows: bool = False
+
+    def __post_init__(self):
+        if self.mapping not in MAPPINGS:
+            raise ValueError(f"mapping must be one of {MAPPINGS}, got {self.mapping!r}")
+        if self.mapping == "colored" and not self.free_rows:
+            raise ValueError("the colored mapping sweeps the free bodies' run: it needs free_rows")
+        _validate_dense_metadata_encoding(self.max_constraints)
+        if self.material and not self.weighted:
+            raise ValueError("material contacts step by their weights: their sweeps are weighted")
+        dofs = self.max_world_dofs if self.max_row_dofs is None else self.max_row_dofs
+        object.__setattr__(self, "max_row_dofs", int(dofs))
+
+    @property
+    def colored(self) -> bool:
+        return self.mapping == "colored"
+
+    @property
+    def lanes(self) -> int:
+        """A world's lanes: the colored mapping's block of warps, the warp mapping's warp on CUDA and one thread on the
+        CPU (:func:`.execution.device_lanes`), which runs the world on either device."""
+        return 32 if self.colored else device_lanes(self.device_arch)
+
+    @property
+    def ABI(self) -> tuple:
+        return COLORED_ABI if self.colored else MF_GS_ABI
+
+    @property
+    def NATIVE(self) -> str:
+        return "sweep_mf_colored_native" if self.colored else "sweep_mf_gs_native"
+
+    @property
+    def label(self) -> str:
+        return f"the {self.mapping} matrix-free sweep"
+
+    @property
+    def name(self) -> str:
+        M, MF, pitch = self.max_constraints, self.mf_max_constraints, self.pitch
+        return (
+            f"sweep_mf_{'colored' if self.colored else 'gs'}_{M}_{MF}_{self.max_world_dofs}"
+            f"_s{self.max_row_dofs}"
+            f"_densevlim{int(self.has_dense_velocity_limit_rows)}"
+            + self.places.suffix
+            + ("_torsion" if self.torsion else "")
+            + ("_weighted" if self.weighted else "")
+            + ("_material" if self.material else "")
+            + ("_seeded" if self.seeded else "")
+            + ("_wide" if self.wide_rows else "")
+            + (f"_p{pitch}" if pitch is not None and pitch != M + MF else "")
+            + ("" if self.free_rows else "_line")
+            + ("_speed" if self.speed_rows else "")
+            + "_walk"
+            + self.solve_policy.suffix
+        )
+
+    source = mf_gs_source
+
+    def dispatch(self, staging: Staging) -> Dispatch:
+        return worlds()
+
+    def operands(self) -> tuple[RowArgument, ...]:
+        return (
             # Where spin rows may appear, every friction contact's metric (sweep.friction_metric_stage).
-            *((RowArgument("friction_metric", wp.array3d[float], after="omega"),) if contact_torsion else ()),
-            *material_arguments(material),
-            *solve_policy.arguments,
-        ),
-        composed=True,
-        native_name="sweep_mf_colored_native" if colored else "sweep_mf_gs_native",
-        launch_bounds=shape(COLORED_WORK, built_for(device_arch)).bounds if colored else None,
-    ).kernel()
+            *((RowArgument("friction_metric", wp.array3d[float], after="omega"),) if self.torsion else ()),
+            *material_arguments(self.material),
+            *self.solve_policy.arguments,
+        )
+
+    def work(self, items: int = 0, shared: int = 0) -> Work:
+        """The colored mapping: a block a world of :data:`COLORED_THREADS`, every register a thread may hold (one block
+        a multiprocessor). The warp mapping: a warp a world on a persistent grid (a block a world of the bucket's
+        capacity dispatched its exiting blocks behind the bucket's, which held the multiprocessors, and the claims
+        beside it started late: franka's widest tier 14 us later, PRO); no register line, so no launch bound."""
+        if self.colored:
+            return Work(int(items), lanes=COLORED_THREADS, registers=REGISTERS_PER_THREAD, shared=int(shared))
+        return Work(int(items), lanes=32, block=32, persistent=True)

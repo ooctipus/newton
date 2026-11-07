@@ -24,7 +24,7 @@ import functools
 import numpy as np
 import warp as wp
 
-from ...core.execution import Beside, Buckets, Queue, Work, shape
+from ...core.execution import Beside, Buckets, Queue, shape
 from ...core.memory import Place, arch_budget, device
 from . import (
     packed_rows,
@@ -343,24 +343,6 @@ class Sweep:
         )
         return [sweep_routes_tiers.tier_sweeps(rows, self.options.pgs_iterations) for rows, _ in tiers], "auto", reason
 
-    def kernel(self, route: str, factory, *args, readout_budget: int | None = None, **kwargs):
-        """Build a sweep under the solve policy and allocate its readout counters, outside any graph capture.
-
-        Args:
-            route: Owner of the sweep in the records, such as ``"sparse_pgs"``.
-            factory: The sweep factory, which takes the policy as ``solve_policy`` and the laws' constants as
-                ``weighted`` and ``material``, and returns a kernel.
-            *args: Positional arguments of the factory.
-            readout_budget: The sweep budget the kernel compiles in (a parallel tier's), or ``None`` for the
-                solver's iteration counts.
-            **kwargs: Keyword arguments of the factory.
-        """
-        # The laws' constants, compiled into every sweep: weighted rows and material contacts.
-        laws = {"weighted": self.laws.set.weighted, "material": bool(self.options.contact_compliance)}
-        built = factory(*args, solve_policy=self.policy, **laws, **kwargs)
-        self._register(route, built, readout_budget)
-        return built
-
     @property
     def law_fields(self) -> dict:
         """The row laws every sweep configuration compiles (:class:`.sweep.SweepConfig`): the solve policy, weighted
@@ -519,6 +501,22 @@ class Sweep:
                 )
             self.mf_gs_storage = storage
             parallel_rows = self.classes.tier_rows
+            # The general sweep's warp mapping: its places the storage's, its rows the placement's.
+            self.general_sweep = sweep_routes.GeneralSweep(
+                self.placement.dense_max_constraints,
+                self.placement.mf_max_constraints,
+                self.forest.max_world_dofs,
+                device_arch,
+                pitch=self.placement.row_pitch,
+                has_dense_velocity_limit_rows=bool(self.options.enable_joint_velocity_limits),
+                places=storage.places,
+                max_row_dofs=self.placement.packed_support,
+                seeded=self.seeded,
+                wide_rows=self.placement.packed_dense == packed_rows.WIDE,
+                free_rows=bool(self.placement.free_contact_rows),
+                speed_rows=speed_rows,
+                **self.law_fields,
+            )
             # The colored mapping takes the worlds the unit builder's rule picks at every pack
             # (sweep_units.COLORED_RULE), among those whose free bodies and row capacity admit it: built, with a
             # storage slot each, for those worlds only, it runs beside the one-warp mapping. More of them than the
@@ -532,42 +530,16 @@ class Sweep:
                 )
             if model.device.is_cuda and capable.size > 0:
                 found = device(model.device)
-                rule = rule.at_scale(capable.size, shape(sweep_routes.COLORED_WORK, found).blocks_per_sm * found.sms)
+                colored_work = dataclasses.replace(self.general_sweep, mapping="colored").work()
+                rule = rule.at_scale(capable.size, shape(colored_work, found).blocks_per_sm * found.sms)
                 capable = sweep_units.capable_worlds(
                     self.forest.free_rigid_per_world, self.placement.mf_max_constraints, rule
                 )
             colored = bool(model.device.is_cuda and capable.size > 0)
-            mf_gs_options = {
-                "pitch": self.placement.row_pitch,
-                "has_dense_velocity_limit_rows": self.options.enable_joint_velocity_limits,
-                "places": storage.places,
-                "contact_torsion": self.laws.spin_rows,
-                "max_row_dofs": self.placement.packed_support,
-                "seeded": self.seeded,
-                "wide_rows": self.placement.packed_dense == packed_rows.WIDE,
-                "free_rows": self.placement.free_contact_rows,
-                "speed_rows": speed_rows,
-            }
-            mf_gs_shape = (
-                self.placement.dense_max_constraints,
-                self.placement.mf_max_constraints,
-                self.forest.max_world_dofs,
-                device_arch,
-            )
-            self.mf_gs_kernel = self.kernel(
-                "mf_gs",
-                sweep_routes.mf_gs_kernel,
-                *mf_gs_shape,
-                **mf_gs_options,
-            )
+            self.mf_gs_kernel = self.sweep("mf_gs", self.general_sweep)
             if colored:
-                self.mf_colored_kernel = self.kernel(
-                    "mf_colored",
-                    sweep_routes.mf_gs_kernel,
-                    *mf_gs_shape,
-                    mapping="colored",
-                    **mf_gs_options,
-                )
+                self.colored_sweep = dataclasses.replace(self.general_sweep, mapping="colored")
+                self.mf_colored_kernel = self.sweep("mf_colored", self.colored_sweep)
             if parallel_rows > 0:
                 # Under keyed rows each tier walks its rows from their keys in its prologue (the producer's sink).
                 keyed = self.placement.keyed_rows.layout if self.placement.keyed_rows is not None else None
@@ -621,10 +593,8 @@ class Sweep:
                     claims=self.claims,
                     buckets=(self.claim_candidate, self.claim_colored, self.claim_general),
                 )
-            # The general sweep walks its bucket on a persistent grid, a warp a world (the queue's launch): a block a
-            # world of the bucket's capacity dispatched its exiting blocks behind the bucket's, which held the
-            # multiprocessors, and the claims beside it started late (franka's widest tier 14 us later, PRO).
-            self.general_grid = shape(Work(worlds, lanes=32, block=32, persistent=True), device(model.device)).grid
+            # The general sweep walks its bucket on a persistent grid, a warp a world (its work's shape).
+            self.general_shape = shape(self.general_sweep.work(worlds), device(model.device))
         if self.classes.mf_sweeps:
             # No matrix-free sweep enters a world without rows; the readout counts those solves as skipped.
             self.readout.register_skipped(world_count=int(self.forest.world_count), device=model.device)
@@ -927,20 +897,28 @@ class Sweep:
             colored_kernel = self.mf_colored_kernel
             colored = {} if colored_kernel is None else self.colored_units.operands()
             # The general sweep's bucket, on its persistent grid.
-            grid = self.general_grid
-            self._launch(mf_gs_kernel, operands, grid, 32, **walk, **colored, **queued(self.claim_general, grid))
+            general = self.general_shape
+            self._launch(
+                mf_gs_kernel,
+                operands,
+                general.grid,
+                general.block,
+                **walk,
+                **colored,
+                **queued(self.claim_general, general.grid),
+            )
             if colored_kernel is not None:
                 # The colored bucket (the unit builder's rule picked its worlds): a block a world of its capacity, the
                 # colored storage's slots, a color's units at once.
-                grid = self.colored_units.slot_count
+                layout = shape(self.colored_sweep.work(self.colored_units.slot_count), device(self.model.device))
                 self._launch(
                     colored_kernel,
                     operands,
-                    grid,
-                    sweep_routes.COLORED_THREADS,
+                    layout.grid,
+                    layout.block,
                     **walk,
                     **colored,
-                    **queued(self.claim_colored, grid),
+                    **queued(self.claim_colored, layout.grid),
                 )
 
         if not streams:

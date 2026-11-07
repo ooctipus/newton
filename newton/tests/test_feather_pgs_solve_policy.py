@@ -99,7 +99,7 @@ def _factory_calls():
         ("sparse_lanes", built(SparseSweep), (16, 6, 6), {"lanes_per_world": 8}),
         (
             "mf_gs",
-            sweep_routes.mf_gs_kernel.__wrapped__,
+            built(sweep_routes.GeneralSweep),
             (64, 32, 12, "120"),
             {},
         ),
@@ -163,7 +163,7 @@ def _vote_census():
         ),
         (
             "mf_gs",
-            sweep_routes.mf_gs_kernel.__wrapped__,
+            built(sweep_routes.GeneralSweep),
             (64, 32, 12, "120"),
             (
                 _axis("places", sweep_routes.ROW_PLACES),
@@ -244,9 +244,6 @@ class TestSolvePolicy(unittest.TestCase):
         for option in ("pgs_change_tolerance", "pgs_relative_change_tolerance", "pgs_velocity_change_tolerance"):
             self.assertNotIn(option, parameters)
         factories = [(name, factory) for name, factory, _, _ in _factory_calls()]
-        factories += [
-            ("mf_gs_source", sweep_routes.mf_gs_source),
-        ]
         for name, factory in factories:
             with self.subTest(factory=name):
                 parameter = inspect.signature(factory).parameters["solve_policy"]
@@ -480,19 +477,19 @@ class TestExitLaw(unittest.TestCase):
         """Vote a spin row's change (contact torsion) under the exit law and the trace, scaled by its row's diagonal,
         with its friction pair's."""
         torsion = int(row_kernels.PGS_CONSTRAINT_TYPE_TORSION)
-        options = {"contact_torsion": True}
-        traced = sweep_routes.mf_gs_kernel.__wrapped__(64, 32, 12, "120", solve_policy=TRACE, **options)
+        options = {"torsion": True}
+        traced = sweep_kernel.__wrapped__(sweep_routes.GeneralSweep(64, 32, 12, "120", solve_policy=TRACE, **options))
         snippet = _policy_snippet(self, traced, "solve_trace_sweep(")
         self.assertIn(
             f"if (spin_delta != 0.0f) solve_trace_change(fabsf(spin_delta) * (s_diag_dense[spin]), {torsion});",
             snippet,
         )
-        plain = sweep_routes.mf_gs_kernel.__wrapped__(64, 32, 12, "120", **options)
+        plain = sweep_kernel.__wrapped__(sweep_routes.GeneralSweep(64, 32, 12, "120", **options))
         snippet = _policy_snippet(self, plain, "fabsf(spin_delta) * (s_diag_dense[spin]) <=")
         self.assertIn("(!(fabsf(spin_delta) * (s_diag_dense[spin]) <= spin_bound))", snippet)
         self.assertIn("ProjectionLaw::friction_ball(", snippet)
         self.assertIn("ConeLaw::ball(", snippet)
-        kernel = sweep_routes.mf_gs_kernel.__wrapped__(64, 32, 12, "120", solve_policy=SWEEPS, **options)
+        kernel = sweep_kernel.__wrapped__(sweep_routes.GeneralSweep(64, 32, 12, "120", solve_policy=SWEEPS, **options))
         self.assertIs(_readout_arg(kernel).type, SolveReadout)
 
     def test_active_rows_stop_only_once_every_unvisited_row_is_quiet(self):

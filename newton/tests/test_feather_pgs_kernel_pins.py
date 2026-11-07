@@ -176,12 +176,12 @@ def _readout_calls():
     factory = built(sweep_routes_diag.DiagonalSweep)
     kwargs = {"contact_units": True, "speculative_contact_batches": True, **readout}
     yield "sweep_routes_diag.DiagonalSweep", factory, (1024, 114, 6, _ARCH), kwargs
-    factory = sweep_routes.mf_gs_kernel.__wrapped__
+    factory = built(sweep_routes.GeneralSweep)
     for args, kwargs in (
         ((192, 64, 22, _ARCH), {}),
         ((192, 64, 22, _ARCH), {"free_rows": False, "speed_rows": True}),
     ):
-        yield "sweep_routes.mf_gs_kernel", factory, args, {**kwargs, **readout}
+        yield "sweep_routes.GeneralSweep", factory, args, {**kwargs, **readout}
     factory = built(sweep_routes_local.PairedSweep)
     for units in (False, True):
         kwargs = {"contact_units": True, **readout} if units else readout
@@ -323,8 +323,8 @@ def _solver_factory_calls():
             "free_rows": free,
             "speed_rows": speed,
         }
-        factory = sweep_routes.mf_gs_kernel.__wrapped__
-        yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
+        factory = built(sweep_routes.GeneralSweep)
+        yield "sweep_routes.GeneralSweep", factory, (64, 32, 12, _ARCH), kwargs
     # Streamed metadata with the packed row types and parents resident, which single-wave launches
     # of large dense capacities select; limits add the limit scans' global reads.
     for limits in (False, True):
@@ -332,8 +332,8 @@ def _solver_factory_calls():
             "places": sweep_routes.RowPlaces(Place.GLOBAL, Place.SHARED),
             "has_dense_velocity_limit_rows": limits,
         }
-        factory = sweep_routes.mf_gs_kernel.__wrapped__
-        yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
+        factory = built(sweep_routes.GeneralSweep)
+        yield "sweep_routes.GeneralSweep", factory, (64, 32, 12, _ARCH), kwargs
     # The colored units' slot staging, under each law (the weights a constant of the plan).
     for weighted in (False, True):
         yield "sweep_units.stage_slots", sweep_units.stage_slots.__wrapped__, (weighted,), {}
@@ -374,13 +374,13 @@ def _suite_shape_calls():
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
 
     no_limits = {"has_dense_velocity_limit_rows": False}
-    factory = sweep_routes.mf_gs_kernel.__wrapped__
+    factory = built(sweep_routes.GeneralSweep)
     for args, kwargs in (
         ((192, 64, 22, _ARCH), {}),
         ((192, 64, 22, _ARCH), {"free_rows": False, "speed_rows": True}),
         ((72, 32, 18, _ARCH), no_limits),
     ):
-        yield "sweep_routes.mf_gs_kernel", factory, args, kwargs
+        yield "sweep_routes.GeneralSweep", factory, args, kwargs
     factory = built(sweep_routes_sparse.SparseSweep)
     for size, kwargs in _suite_sparse_sweeps():
         yield "sweep_routes_sparse.SparseSweep", factory, size, kwargs

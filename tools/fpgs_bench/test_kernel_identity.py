@@ -168,21 +168,21 @@ class TestKernelIdentity(unittest.TestCase):
 
     def test_census_hashes_admitted_combinations_and_summarizes_rejections(self):
         """Hash every admitted flag combination of a factory, labeled by its non-default flags; count rejections."""
-        rows, rejected = identity.census(("sweep_routes_local.PairedSweep",))
-        self.assertEqual(len(rows), 6)
-        self.assertIn("sweep_routes_local.PairedSweep(192, 29, 23, 6, '120')", rows)
+        rows, rejected = identity.census(("sweep_routes_diag.DiagonalSweep",))
+        self.assertEqual(len(rows), 12)
+        self.assertIn("sweep_routes_diag.DiagonalSweep(64, 10, 9, '120')", rows)
         self.assertTrue(
             all(set(row) == {"family", "key", "hash"} and row["family"] == "census" for row in rows.values())
         )
-        self.assertEqual(list(rejected), ["sweep_routes_local.PairedSweep [census]"])
-        self.assertRegex(next(iter(rejected.values())), r"^2 rejected, labels [0-9a-f]{16}: 2 x ValueError: ")
+        self.assertEqual(list(rejected), ["sweep_routes_diag.DiagonalSweep [census]"])
+        self.assertRegex(next(iter(rejected.values())), r"^4 rejected, labels [0-9a-f]{16}: 4 x ValueError: ")
         # A call another family records keeps its code digests there.
-        skipped, _ = identity.census(("sweep_routes_local.PairedSweep",), skip=rows.keys())
+        skipped, _ = identity.census(("sweep_routes_diag.DiagonalSweep",), skip=rows.keys())
         self.assertEqual(skipped, {})
 
     def test_census_crosses_resident_row_metadata(self):
         """Cross the matrix-free sweep with resident row metadata, which rewrites its row loads."""
-        calls = [kwargs for name, _, _, kwargs in identity.census_calls() if name.endswith("sweep_routes.mf_gs_kernel")]
+        calls = [kwargs for name, _, _, kwargs in identity.census_calls() if name.endswith("sweep_routes.GeneralSweep")]
         self.assertTrue(any(kwargs["places"].staging == "resident" for kwargs in calls))
 
     def test_coordinate_tree_kernels_are_recorded_with_the_pins(self):

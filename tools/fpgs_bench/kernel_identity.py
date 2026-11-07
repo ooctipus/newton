@@ -156,18 +156,18 @@ def factory_calls():
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
     from newton.tests.feather_pgs_law_harness import built, keyed_classes  # noqa: PLC0415
 
-    mf_gs = _unwrapped(sweep_routes.mf_gs_kernel)
+    mf_gs = _unwrapped(built(sweep_routes.GeneralSweep))
     toggles = (
         {},
         {"places": sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL)},
         {"places": sweep_routes.RowPlaces(impulses=Place.GLOBAL)},
-        {"contact_torsion": True},
+        {"torsion": True},
         {"free_rows": False},
         {"free_rows": False, "speed_rows": True},
     )
     for base in ({}, {"has_dense_velocity_limit_rows": False}):
         for change in toggles:
-            yield "sweep_routes.mf_gs_kernel", mf_gs, (64, 32, 12, ARCH), {**base, **change}
+            yield "sweep_routes.GeneralSweep", mf_gs, (64, 32, 12, ARCH), {**base, **change}
 
     def parallel(layout, *args, **kwargs):
         return built(sweep_routes_tiers.TierSweep)(*args, keyed=layout, classes=keyed_classes(layout), **kwargs)
@@ -492,9 +492,9 @@ def walk_calls():
         yield "walk_rows.walked_rows_kernel", _unwrapped(walk_rows.walked_rows_kernel), (8, True, side, table), {}
     pair = Named("(franka, cube)", (tables["franka"], tables["cube"]))
     yield "walk_rows.walked_rows_kernel", _unwrapped(walk_rows.walked_rows_kernel), (0, False, False, pair), {}
-    mf_gs = _unwrapped(sweep_routes.mf_gs_kernel)
+    mf_gs = _unwrapped(built(sweep_routes.GeneralSweep))
     free = {"free_rows": False, "speed_rows": True, "has_dense_velocity_limit_rows": False}
-    yield "sweep_routes.mf_gs_kernel", mf_gs, (64, 32, 12, ARCH), free
+    yield "sweep_routes.GeneralSweep", mf_gs, (64, 32, 12, ARCH), free
     tiers = {"rows": 32, "sweeps": 24, "inkernel_response": (18, 0, 0, 0)}
     yield "sweep_routes_tiers.TierSweep", built(sweep_routes_tiers.TierSweep), (64, 32, 18, ARCH), tiers
 
@@ -545,14 +545,14 @@ def census_calls():
     mf_gs = (
         _axis("places", sweep_routes.ROW_PLACES),
         _axis("has_dense_velocity_limit_rows", (True, False)),
-        _axis("contact_torsion"),
+        _axis("torsion"),
         _axis("speed_rows"),
     )
     keyed = KeyedLayout(16, 6, 0, 16, 128, False, 0)
     specs = (
         (
-            "sweep_routes.mf_gs_kernel",
-            sweep_routes.mf_gs_kernel,
+            "sweep_routes.GeneralSweep",
+            built(sweep_routes.GeneralSweep),
             ((64, 32, 12, ARCH), (192, 64, 40, ARCH)),
             mf_gs,
         ),

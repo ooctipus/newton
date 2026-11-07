@@ -24,6 +24,7 @@ import newton
 from newton._src.core.memory import Place
 from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
+from newton._src.solvers.feather_pgs.sweep import sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import (
@@ -42,26 +43,26 @@ _DENSE_PASS = "ProjectionLaw::velocity_limit_update(old_vlim, residual_vlim / de
 _SPEED_PASS = "ProjectionLaw::speed_row(speed_mf_vlim, __int_as_float(meta.z), mf_diag, old_mf_vlim)"
 _GENERATORS = {
     "mf_gs": (
-        sweep_routes.mf_gs_kernel.__wrapped__,
+        built(sweep_routes.GeneralSweep),
         (64, 32, 12, "120"),
         {},
         # The end-of-iteration dense pass and free-body speed pass.
         (_DENSE_PASS, _SPEED_PASS),
     ),
     "mf_gs_without_dense_limits": (
-        sweep_routes.mf_gs_kernel.__wrapped__,
+        built(sweep_routes.GeneralSweep),
         (64, 32, 12, "120"),
         {"has_dense_velocity_limit_rows": False},
         (_SPEED_PASS,),
     ),
     "mf_gs_streamed": (
-        sweep_routes.mf_gs_kernel.__wrapped__,
+        built(sweep_routes.GeneralSweep),
         (64, 32, 12, "120"),
         {"places": sweep_routes.RowPlaces(impulses=Place.GLOBAL)},
         (_DENSE_PASS, _SPEED_PASS),
     ),
     "mf_gs_global_metadata": (
-        sweep_routes.mf_gs_kernel.__wrapped__,
+        built(sweep_routes.GeneralSweep),
         (64, 32, 12, "120"),
         {"places": sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL)},
         (_DENSE_PASS, _SPEED_PASS),
@@ -102,7 +103,7 @@ class TestVelocityLimitLawSources(unittest.TestCase):
     def test_streamed_impulses_read_the_total_once(self):
         """Read a streamed free-body total through one lane-0 broadcast, never a broadcast inside a broadcast."""
         _, sources = _native_sources(
-            sweep_routes.mf_gs_kernel.__wrapped__,
+            built(sweep_routes.GeneralSweep),
             64,
             32,
             12,
@@ -232,7 +233,7 @@ class TestVelocityLimitLawKernels(unittest.TestCase):
         reference, and reversing the row order moves the result by at most 1e-6.
         """
         device = wp.get_device("cuda:0")
-        kernel = sweep_routes.mf_gs_kernel(4, 1, 2, str(device.arch))
+        kernel = sweep_kernel(sweep_routes.GeneralSweep(4, 1, 2, str(device.arch)))
         velocities = {}
         for order in ((0, 1), (1, 0)):
             values = _dense_row_values(device, order=order, iterations=64)

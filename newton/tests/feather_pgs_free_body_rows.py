@@ -18,6 +18,7 @@ from newton._src.core.memory import Place
 from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.factor.walk import unpack_walk_records
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
+from newton._src.solvers.feather_pgs.sweep import sweep_kernel
 from newton.tests.feather_pgs_law_harness import chain_walk, free_body_Z
 
 
@@ -111,15 +112,17 @@ def sweep_free_body_rows(
         "omega": 1.0,
         "v_out": wp.zeros(6, dtype=wp.float32, device=device),
     }
-    kernel = sweep_routes.mf_gs_kernel(
-        dense,
-        capacity,
-        6,
-        str(wp.get_device(device).arch),
-        has_dense_velocity_limit_rows=False,
-        places=sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL),
-        seeded=True,
-        weighted=regularize,
+    kernel = sweep_kernel(
+        sweep_routes.GeneralSweep(
+            dense,
+            capacity,
+            6,
+            str(wp.get_device(device).arch),
+            has_dense_velocity_limit_rows=False,
+            places=sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL),
+            seeded=True,
+            weighted=regularize,
+        )
     )
     arguments = {arg.label: arg for arg in kernel.adj.args}
     inputs = []
