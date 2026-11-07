@@ -131,22 +131,38 @@ def swept(records: RowRecords, world: int, count: int) -> bool:
 
 
 @wp.func
+def record_firsts(records: RowRecords, sides: wp.vec2i) -> wp.vec2i:
+    """The first world coordinates of a row's ``sides`` as its record holds them (-1 for no side)."""
+    firsts = wp.vec2i(-1, -1)
+    if sides[0] >= 0:
+        firsts[0] = records.offset[sides[0]]
+    if sides[1] >= 0:
+        firsts[1] = records.offset[sides[1]]
+    return firsts
+
+
+@wp.func
 def write_row_record(records: RowRecords, rows: DenseRows, incident: float, line: int, slot: int):
-    """Store row ``slot``'s record (:func:`.row_metadata.pack_row_record`) from the row as its writer left it: its sides'
-    first world coordinates and widths, its diagonal, its residual at ``du = 0`` (rhs plus ``incident``), kind, parent
+    """Store row ``slot``'s record from the row as its writer left it (:func:`store_row_record_of`)."""
+    if record_at(records, line, slot) < 0:
+        return
+    sides = rows.sides[line, slot]
+    store_row_record_of(records, rows, incident, line, slot, sides, record_firsts(records, sides))
+
+
+@wp.func
+def store_row_record_of(
+    records: RowRecords, rows: DenseRows, incident: float, line: int, slot: int, sides: wp.vec2i, firsts: wp.vec2i
+):
+    """Store row ``slot``'s record (:func:`.row_metadata.pack_row_record`), its ``sides`` at ``firsts``
+    (:func:`record_firsts`, which a writer reads once for rows that share their sides), the rest from the row as its
+    writer left it: its sides' widths, its diagonal, its residual at ``du = 0`` (rhs plus ``incident``), kind, parent
     and friction coefficient. A free row's is its header (:func:`.row_metadata.pack_row_header`): its sides' widths are
     its class's, its coefficient the line's; it keeps the inverse of its diagonal, cached for its step's form of the
     law, and its parent from ``base``, as the sweeps stage the free bodies' rows. A row before ``first`` has none."""
     at = record_at(records, line, slot)
     if at < 0:
         return
-    sides = rows.sides[line, slot]
-    dof_a = int(-1)
-    dof_b = int(-1)
-    if sides[0] >= 0:
-        dof_a = records.offset[sides[0]]
-    if sides[1] >= 0:
-        dof_b = records.offset[sides[1]]
     diagonal = rows.diag[line, slot]
     parent = rows.row_parent[line, slot]
     rhs = rows.rhs[line, slot] + incident
@@ -157,7 +173,7 @@ def write_row_record(records: RowRecords, rows: DenseRows, incident: float, line
             inverse = 1.0 / diagonal
         if parent >= 0:
             parent = parent - records.base
-        store_row_header(records.record, at, dof_a, dof_b, inverse, rhs, kind, parent)
+        store_row_header(records.record, at, firsts[0], firsts[1], inverse, rhs, kind, parent)
         return
     n_a = int(0)
     n_b = int(0)
@@ -165,7 +181,9 @@ def write_row_record(records: RowRecords, rows: DenseRows, incident: float, line
         n_a = records.dofs[sides[0]]
     if sides[1] >= 0:
         n_b = records.dofs[sides[1]]
-    store_row_record(records.record, at, dof_a, dof_b, n_a, n_b, diagonal, rhs, kind, parent, rows.row_mu[line, slot])
+    store_row_record(
+        records.record, at, firsts[0], firsts[1], n_a, n_b, diagonal, rhs, kind, parent, rows.row_mu[line, slot]
+    )
 
 
 @wp.func

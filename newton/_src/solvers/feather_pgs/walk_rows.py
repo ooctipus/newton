@@ -63,7 +63,7 @@ from .friction_patches import PatchRowLaw
 from .joint_table import FreeBodies
 from .kernel_template import python_kernel
 from .projection_laws import friction_ball_metric, friction_pair_metric
-from .response_builds_rows import RowRecords, swept, write_row_record
+from .response_builds_rows import RowRecords, record_firsts, store_row_record_of, swept, write_row_record
 from .row_build import write_contact_row
 from .row_kernels import RIGID_SPEED_ROWS, RowBias, row_bias
 from .row_laws import LINK_ROWS
@@ -77,6 +77,7 @@ from .row_records import (
     UNIT_VELOCITY,
     DenseRows,
     RowSupport,
+    row_sides,
     unit_source,
 )
 from .sparse_mass_matrix import _SparseRowSupport
@@ -1658,11 +1659,14 @@ def free_body_contact_rows(
     own unit (:func:`contact_row_unit`), walked by the one unit walker into the free bodies' rows
     (:data:`walk_body_row`; the spin row a torque), with its diagonal ``|z|^2 + cfm``, its incident velocity and its rhs
     by the row law (:func:`.row_kernels.row_bias`), as every writer's, then its record
-    (:func:`.response_builds_rows.write_row_record`)."""
+    (:func:`.response_builds_rows.store_row_record_of`). The contact's rows share their sides
+    (:func:`.row_records.row_sides`), whose first coordinates the records hold: read once, before the rows' stores."""
     slot = data.slot[c]
     if data.path[c] != 1 or slot < 0:
         return
     line = sink.layout.first[data.world[c]]
+    sides = row_sides(data.art0[c], data.art1[c], data.response_dofs)
+    firsts = record_firsts(records, sides)
     # The allocation's extent: recomputing eligibility can cross a floating-point threshold.
     count = int(1)
     if data.slots_needed[c] >= 3:
@@ -1672,7 +1676,7 @@ def free_body_contact_rows(
         walk_body_row(sink, contact_row_unit(data, law, frame, c, row, line, slot + row))
         incident = sink.row_incident[line, slot + row]
         row_bias(rows, bias, line, slot + row, incident)
-        write_row_record(records, rows, incident, line, slot + row)
+        store_row_record_of(records, rows, incident, line, slot + row, sides, firsts)
 
 
 @wp.func
