@@ -41,9 +41,6 @@ class RowRecords:
     dofs: wp.array[int]
 
 
-RECORD_LANES = 32
-"""Lanes a world's rows' records are stored by (:func:`store_row_records`)."""
-_RECORD_LANES = wp.constant(RECORD_LANES)
 _RECORD_WORDS, _HEADER_WORDS = wp.constant(RECORD_WORDS), wp.constant(HEADER_WORDS)
 
 
@@ -125,6 +122,7 @@ def write_row_record(records: RowRecords, rows: DenseRows, incident: float, line
 def store_row_records(
     worlds: Buckets,
     grid: int,
+    lanes: int,
     records: RowRecords,
     rows: DenseRows,
     incident: wp.array2d[float],
@@ -133,16 +131,16 @@ def store_row_records(
 ):
     """Store the records of the rows of ``worlds`` (the claims' worlds the general sweep and the unit builder read,
     :func:`.sweep_levels.claim_worlds`), once their writers and the patch link have left them final: a world's dense
-    rows (``count``) from ``first``, then its free rows (``mf_count``) from ``base``, :data:`RECORD_LANES` lanes a world
+    rows (``count``) from ``first``, then its free rows (``mf_count``) from ``base``, ``lanes`` lanes a world
     and ``grid`` worlds at once."""
     item, lane = wp.tid()
     pitch = rows.rhs.shape[1]
     world = bucket_item(worlds, item)
     while world >= 0:
         line = rows.first[world]
-        for slot in range(records.first + lane, wp.min(count[world], records.base), _RECORD_LANES):
+        for slot in range(records.first + lane, wp.min(count[world], records.base), lanes):
             write_row_record(records, rows, incident[line, slot], line, slot)
-        for slot in range(records.base + lane, wp.min(records.base + mf_count[world], pitch), _RECORD_LANES):
+        for slot in range(records.base + lane, wp.min(records.base + mf_count[world], pitch), lanes):
             write_row_record(records, rows, incident[line, slot], line, slot)
         item += grid
         world = bucket_item(worlds, item)

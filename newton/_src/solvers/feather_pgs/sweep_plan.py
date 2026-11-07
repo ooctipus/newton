@@ -46,7 +46,7 @@ from .execution_plan import _MFGSStorage, _select_mfgs_storage
 from .field_group import Field, FieldGroup
 from .friction_patches import patch_routes
 from .path_selection import json_value, kernel_key
-from .response_builds_rows import RECORD_LANES, bind_row_records, store_row_records
+from .response_builds_rows import bind_row_records, store_row_records
 from .row_records import bind as bind_dense_rows
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF, SolvePolicy, SolveReadoutRecord
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
@@ -501,7 +501,10 @@ class Sweep:
             self.placement.allocate_row_records(
                 sweep_routes.record_first(self.placement.dense_max_constraints, storage.places)
             )
-            self.record_grid = min(self.forest.world_count, max(int(model.device.sm_count), 1) * 16)
+            # The records' pass: a warp of lanes per 256 rows of the line, at most a block, over a wave of the device.
+            self.record_lanes = min(256, 32 * -(-self.placement.row_pitch // 256))
+            threads = max(int(model.device.sm_count), 1) * 512
+            self.record_grid = min(self.forest.world_count, max(threads // self.record_lanes, 1))
             # The general sweep's warp mapping: its places the storage's, its rows the placement's.
             self.general_sweep = sweep_routes.GeneralSweep(
                 self.placement.dense_max_constraints,
@@ -702,16 +705,16 @@ class Sweep:
 
     def store_records(self) -> None:
         """The streamed rows' records of the worlds :meth:`general_claims` lists, once their writers and the patch link
-        left their rows final (:func:`.response_builds_rows.store_row_records`): a lane group a world, a world slot a
-        warp of the device's resident warps."""
+        left their rows final (:func:`.response_builds_rows.store_row_records`), a lane group a world."""
         self.join_claims()
         placement = self.placement
         wp.launch(
             store_row_records,
-            dim=(self.record_grid, RECORD_LANES),
+            dim=(self.record_grid, self.record_lanes),
             inputs=[
                 self.general_claims(),
                 self.record_grid,
+                self.record_lanes,
                 bind_row_records(placement),
                 bind_dense_rows(placement),
                 placement.row_incident,
