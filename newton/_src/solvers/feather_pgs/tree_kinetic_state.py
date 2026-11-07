@@ -823,8 +823,6 @@ def _native_clocks(clocked, owner, *, stages, column):
 
 def _current_valid(layout):
     """Native statement marking the group's articulations current when no stage reported a failure."""
-    if not layout.forest:
-        return "cache.current_valid.data[p.group_to_art.data[group]]=cache.status.data[group]==0;"
     roots = len(layout.roots)
     return (
         f"for(int r=0;r<{roots};++r)"
@@ -1102,16 +1100,14 @@ def get_state_kernel(
         if wp.static(finish):
             refresh = clock[0].cadence
         valid = cache.current_valid[g.art]
-        if wp.static(forest):
-            for root in range(1, wp.static(roots)):
-                valid = wp.min(valid, cache.current_valid[plan.arts[g.group, root]])
+        for root in range(1, wp.static(roots)):
+            valid = wp.min(valid, cache.current_valid[plan.arts[g.group, root]])
         if not wp.static(finish):
             if clock_changed(clock[0], data.dt) != 0:
                 valid = 0
             refresh = int(refresh != 0 or (requests[g.art] & GEOMETRY_REQUEST) != 0)
-            if wp.static(forest):
-                for root in range(1, wp.static(roots)):
-                    refresh = int(refresh != 0 or (requests[plan.arts[g.group, root]] & GEOMETRY_REQUEST) != 0)
+            for root in range(1, wp.static(roots)):
+                refresh = int(refresh != 0 or (requests[plan.arts[g.group, root]] & GEOMETRY_REQUEST) != 0)
             source_matches = _same_source(cache, g.group, data.joint_q, data.joint_qd)
             if wp.static(banked):
                 rebind = int(0)
@@ -1148,9 +1144,8 @@ def get_state_kernel(
         g.refresh = refresh
         if g.lane == 0:
             cache.current_valid[g.art] = 0
-            if wp.static(forest):
-                for root in range(1, wp.static(roots)):
-                    cache.current_valid[plan.arts[g.group, root]] = 0
+            for root in range(1, wp.static(roots)):
+                cache.current_valid[plan.arts[g.group, root]] = 0
         g.admitted = 1
         return g
 
@@ -1983,12 +1978,6 @@ def held_lambdas(layout: TreeLayout, slips: int, half: int = ts.WALK_BOTH) -> st
 
 def _transport_block(layout: TreeLayout) -> str:
     """Native statements of the free roots' transport of the predicted velocity."""
-    if not layout.forest:
-        return (
-            "if($FREE_ROOT&&lane==0&&f.kinematic_joint.data[js]==0) {\n        "
-            + _FORCE.transport("ds", "f.vhat.data[ds+k]")
-            + "\n    }"
-        )
     return (
         "if(lane<$FREE_ROOTS&&f.kinematic_joint.data[js+plan.free_root_local.data[lane]]==0) {\n"
         "        const int rd=ds+plan.free_root_dof.data[lane];\n        "

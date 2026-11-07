@@ -180,7 +180,6 @@ class TreeLayout:
             "FREE_ROOTS": self.free_root_count,
             "WHITE": 6 * self.bodies + self.dofs,
             "PRED_SCRATCH": 6 * self.bodies + 2 * self.dofs,
-            "FREE_ROOT": int(self.free_root),
         }
 
     def render(self, source, **fragments):
