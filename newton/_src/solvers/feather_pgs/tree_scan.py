@@ -584,32 +584,12 @@ def _compose_down(c: _Context) -> str:
         {c.result("value", "node")}"""
 
 
-def _serial_down(c: _Context) -> str:
-    order = "index" if c.order is None else c.order.format(index="index")
-    return f"""    for(int index=0;index<{c.nodes};++index) {{
-        const int node={order};
-        const int parent={c.parent("node")};
-        if(parent<0){{{c.publish_own("node")}continue;}}
-{_compose_down(c)}
-    }}
-"""
-
-
-def _serial_up(c: _Context) -> str:
-    order = "index" if c.order is None else c.order.format(index="index")
-    adds = "".join(
-        _guarded(
-            group,
-            f"for(int k=0;k<{group.channels};++k){c.slot(group, 'parent', 'k')}+={c.slot(group, 'node', 'k')};",
-        )
-        for group in c.combine.groups
-    )
-    return f"""    for(int index={c.nodes}-1;index>=0;--index) {{
-        const int node={order};
-        const int parent={c.parent("node")};
-        if(parent>=0){{{adds}}}
-    }}
-"""
+def _serial(c: _Context, root_first: bool) -> str:
+    """SERIAL: the walk's one step text (:func:`_visit`) on the plan's nodes in the walk's order, a node's state in its
+    own words (:class:`_Block`)."""
+    order = f"int index=0;index<{c.nodes};++index" if root_first else f"int index={c.nodes}-1;index>=0;--index"
+    step = _Step("node", -1, "parent", True, True, "begin<end", False)
+    return f"    for({order}) {{\n{indent_text(chr(10).join(_visit(step, _Block(c, root_first), '')), 8)}\n    }}\n"
 
 
 def _guarded(group: Group, statement: str) -> str:
@@ -835,8 +815,8 @@ def _interval_up(c: _Context) -> str:
 
 
 _SCHEDULES = {
-    (Direction.DOWN, Schedule.SERIAL): _serial_down,
-    (Direction.UP, Schedule.SERIAL): _serial_up,
+    (Direction.DOWN, Schedule.SERIAL): functools.partial(_serial, root_first=True),
+    (Direction.UP, Schedule.SERIAL): functools.partial(_serial, root_first=False),
     (Direction.DOWN, Schedule.LEVEL): _level_down,
     (Direction.UP, Schedule.LEVEL): _level_up,
     (Direction.DOWN, Schedule.JUMP_SMEM): _jump_smem,
@@ -915,7 +895,7 @@ def tree_scan(
         sink=sink,
     )
     cuda = "{\n" + _SCHEDULES[(direction, schedule)](context) + "}\n"
-    serial = "{\n" + (_serial_down if direction is Direction.DOWN else _serial_up)(context) + "}\n" if cpu else ""
+    serial = "{\n" + _serial(context, direction is Direction.DOWN) + "}\n" if cpu else ""
     preludes = combine.preludes()
     return ScanSource(cuda, serial, preludes, schedule)
 
@@ -1545,6 +1525,81 @@ class _Chain(_Placement):
         return [f"const int up = {s.up};", *_when("up >= 0", give)]
 
 
+def _visit(s: _Step, place: _Placement, step: str, begin: str = "", end: str = "") -> list[str]:
+    """The one text of a walk's step on its placement's states and items (:meth:`WalkClass.walk`, :func:`_serial`): a
+    body's first step takes its state and runs ``begin``, every step its coordinate's ``step``, the last runs ``end`` and
+    passes the state on."""
+    state = place.state(s)
+    head = place.enter(s) + ([_fill(begin, b=s.b, V=state, up=s.up)] if begin else [])
+    tail = ([_fill(end, b=s.b, V=state)] if end else []) + place.leave(s)
+    coordinate = [*place.take(("x", s.c)), _fill(step, b=s.b, c=s.c, V=state, **place.names(s))]
+    return [
+        *place.bind(s),
+        *_when(s.first, head),
+        *_when(s.coordinate, coordinate),
+        *_when(s.last, tail),
+        *place.after(s),
+    ]
+
+
+class _Block(_Placement):
+    """A scan's placement (:func:`_serial`): each node's state in its own words (the scan's storage), the steps the
+    plan's nodes read at run time. Root first, a node composes its parent's words with its own value; leaf first, it
+    gathers its children's (the first in the walk's order assigns, the others add, a leaf's zero), then adds its own."""
+
+    def __init__(self, c: "_Context", root_first: bool):
+        self.c, self.root_first = c, root_first
+
+    def bind(self, s: _Step) -> list[str]:
+        order = "index" if self.c.order is None else self.c.order.format(index="index")
+        return [
+            f"const int node={order};",
+            f"const int parent={self.c.parent('node')};",
+            self.c.combine.declare("value"),
+        ]
+
+    def state(self, s: _Step) -> str:
+        return "value"
+
+    def names(self, s: _Step) -> dict:
+        return {}
+
+    def _groups(self, statement) -> list[str]:
+        return [_guarded(g, f"for(int k=0;k<{g.channels};++k){statement(g)}") for g in self.c.combine.groups]
+
+    def enter(self, s: _Step) -> list[str]:
+        c = self.c
+        if self.root_first:
+            compose = [
+                c.combine.declare("up"),
+                c.load("up", "parent"),
+                c.own("value", "node"),
+                c.combine.compose("value", "up"),
+            ]
+            return _when("parent<0", [c.publish_own("node")], compose)
+        access, value = c.access, lambda g: c.combine.channel("value", "k", g)
+        child = access.child.format(entry="e")
+        gather = _when(
+            s.sums,
+            [
+                f"int e=begin;const int first={child};",
+                *self._groups(lambda g: f"{value(g)}={c.slot(g, 'first', 'k')};"),
+                f"for(++e;e<end;++e){{const int child={child};",
+                *self._groups(lambda g: f"{value(g)}+={c.slot(g, 'child', 'k')};"),
+                "}",
+            ],
+            self._groups(lambda g: f"{value(g)}=0.0f;"),
+        )
+        bounds = f"const int begin={access.children_begin.format(node='node')},end={access.children_end.format(node='node')};"
+        return [bounds, *gather, *self._groups(lambda g: f"{value(g)}+={c.slot(g, 'node', 'k')};")]
+
+    def leave(self, s: _Step) -> list[str]:
+        c = self.c
+        if self.root_first:
+            return _when("parent>=0", [c.result("value", "node")])
+        return self._groups(lambda g: f"{c.slot(g, 'node', 'k')}={c.combine.channel('value', 'k', g)};")
+
+
 @dataclass(frozen=True)
 class WalkClass:
     """A walking class: the topology its trees share, each body's parent (-1: the world, every parent before its
@@ -1656,20 +1711,6 @@ class WalkClass:
         if hold and not compiled:
             raise ValueError("a walk holds its items in straight-line code only")
 
-        def visit(s: _Step, place: _Placement) -> list[str]:
-            # The one text of a step, on its placement's states and items.
-            state = place.state(s)
-            head = place.enter(s) + ([_fill(begin, b=s.b, V=state, up=s.up)] if begin else [])
-            tail = ([_fill(end, b=s.b, V=state)] if end else []) + place.leave(s)
-            coordinate = [*place.take(("x", s.c)), _fill(step, b=s.b, c=s.c, V=state, **place.names(s))]
-            return [
-                *place.bind(s),
-                *_when(s.first, head),
-                *_when(s.coordinate, coordinate),
-                *_when(s.last, tail),
-                *place.after(s),
-            ]
-
         # The steps in the walk's order: a coordinate's, or a body's without one, with the body's join bits leaf first
         # (the plan's up flags: a parent's first child in the walk's order, a parent).
         up_flags = TreePlan.build(self.parent).up_flags if not root_first else np.zeros(len(self.parent), np.int32)
@@ -1692,7 +1733,7 @@ class WalkClass:
                 _Step(b, c, self.parent[b], first, last, bool(up_flags[b] & UP_SUMS), bool(up_flags[b] & UP_FIRST))
                 for b, c, first, last in sequence
             ]
-            return "\n".join([*place.prologue(), *(line for s in steps for line in visit(s, place))])
+            return "\n".join([*place.prologue(), *(line for s in steps for line in _visit(s, place, step, begin, end))])
 
         # The loop form: the class's steps in constant memory, each naming its body (16 bits), whether it is the body's
         # first (16) and last (17) step and its body's join bits (18, 19), and its coordinate (-1 for none).
@@ -1719,7 +1760,7 @@ class WalkClass:
         copies = max(place.depth, 1)
         steps = [_Step("b", "c", f"{name}_PARENT[b]", flag(16), flag(17), flag(19), flag(18), j) for j in range(copies)]
         loop = "\n".join(
-            f"if (at0 + {j} < {n}) {{\n    const int at = at0 + {j};\n{indent_text(chr(10).join(visit(s, place)), 4)}\n}}"
+            f"if (at0 + {j} < {n}) {{\n    const int at = at0 + {j};\n{indent_text(chr(10).join(_visit(s, place, step, begin, end)), 4)}\n}}"
             for j, s in enumerate(steps)
         )
         head = f"for (int at0 = 0; at0 < {n}; at0 += {copies}) {{"
