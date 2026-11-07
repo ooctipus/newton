@@ -298,6 +298,10 @@ def _warn_constraint_row_overflow(
             )
 
 
+_WARP = 32
+"""The general sweep's lanes over a row's entries (a warp a world), which the rows' support classes are chosen by."""
+
+
 class Placement:
     """The placement of one solver (see the module docstring); the solver holds it as ``placement``.
 
@@ -652,7 +656,9 @@ class Placement:
 
     def place_row_classes(self) -> None:
         """The rows by their support classes (:func:`.packed_rows.row_classes`, ``row_classes``) where only the general
-        sweep reads them and they take fewer bytes; ``row_classes_reason`` says why not (``None``: they do)."""
+        sweep reads them and a lane of its warp holds fewer of a row's entries (the classes' table loads cost more than
+        narrower rows save at the same entries a lane: measured); ``row_classes_reason`` says why not (``None``: they
+        do)."""
         self.row_classes = packed_rows.RowClasses()
         model, forest, factor = self.model, self.forest, self.factor
         self.row_classes_reason = first_failed(
@@ -687,12 +693,12 @@ class Placement:
             contact_body,
             mimic_dofs,
         )
-        rows = forest.world_count * self.row_pitch
-        if table is None:
-            self.row_classes_reason = "The support classes exceed a row's 16-bit class ids."
-        elif 4 * rows * (table.width + 1) + table.nbytes >= 4 * rows * self.packed_support:
+        if table is None or table.width >= 64:
+            self.row_classes_reason = "The support classes exceed a row word's class ids or first side's entries."
+        elif (table.width - 1) // _WARP >= (self.packed_support - 1) // _WARP:
             self.row_classes_reason = (
-                f"Rows of {table.width} entries by class take no fewer bytes than {self.packed_support} by side."
+                f"Rows of {table.width} entries by class take as many entries a lane of a warp as {self.packed_support}"
+                " by side."
             )
         if self.row_classes_reason is not None:
             return

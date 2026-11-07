@@ -1196,7 +1196,7 @@ def packed_coordinates(solver) -> np.ndarray:
                     raise AssertionError(f"world {world} row {row}: side {art} holds no response coordinates")
                 coordinates = np.arange(n)
                 if placement.classed:
-                    cls = (int(row_class[world, row]) >> (16 * side)) & 0xFFFF
+                    cls = (int(row_class[world, row]) >> (13 * side)) & 0x1FFF
                     coordinates = class_dof[cls, : class_count[cls]]
                 at = offset if placement.packed_dense else first
                 dof[world, row, at : at + coordinates.size] = offset + coordinates

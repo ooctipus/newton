@@ -111,22 +111,25 @@ ROW_CLASSES = (
     Field("row_class", wp.int32, ("world", "row")),
 )
 """The rows' support classes (:func:`row_classes`): each body's and coordinate's endpoint (its root path; a
-coordinate's is its body's), two endpoints' union, each class's tree coordinates (ascending) and count, and each row's
-two classes (16-bit halves, ``0xFFFF`` none)."""
+coordinate's is its body's), two endpoints' union, each class's tree coordinates (ascending, -1 padded) and count, and
+each row's word: its two classes (13 bits each, ``NO_CLASS`` none) and its first side's entries (6 bits)."""
 
 RowClasses = field_group.struct("RowClasses", ROW_CLASSES, __name__)
 
-NO_CLASS = 0xFFFF
+NO_CLASS = 0x1FFF
+"""A row's side without a class, and the bound of the classes' ids; a row's first side holds fewer than 64 entries."""
 
 _CLASS_SIDES = """    // A row by its support classes (packed_rows.row_classes): each side's entries its class's tree coordinates,
-    // ascending, the first side's then the second's. CLASS_ENTRY(off0, off1, classes, e): entry e's world coordinate
-    // (-1 past them) for sides at off0 and off1 whose classes are the 16-bit halves of classes (0xFFFF none).
-    const auto CLASS_ENTRY = [&](const int off0, const int off1, const int classes, const int e) {
-        const int c0 = classes & 0xFFFF, c1 = (classes >> 16) & 0xFFFF;
-        const int n0 = c0 != 0xFFFF ? class_count.data[c0] : 0;
-        if (e < n0) return off0 + class_dof.data[c0 * class_dof.shape[1] + e];
-        const int n1 = c1 != 0xFFFF ? class_count.data[c1] : 0;
-        return e - n0 < n1 ? off1 + class_dof.data[c1 * class_dof.shape[1] + e - n0] : -1;
+    // ascending, the first side's then the second's. CLASS_ENTRY(off0, off1, word, e): entry e's world coordinate (-1
+    // past them) for sides at off0 and off1 and the row's word (its classes, 13 bits each, 0x1FFF none, and its
+    // first side's entries above them): one load of the classes' table an entry.
+    const auto CLASS_ENTRY = [&](const int off0, const int off1, const int word, const int e) {
+        const int W = class_dof.shape[1], c0 = word & 0x1FFF, c1 = (word >> 13) & 0x1FFF, n0 = (word >> 26) & 0x3F;
+        if (e < n0) return off0 + class_dof.data[c0 * W + e];
+        const int k = e - n0;
+        if (c1 == 0x1FFF || k >= W) return -1;
+        const int d = class_dof.data[c1 * W + k];
+        return d >= 0 ? off1 + d : -1;
     };
     // From the row's sides, or from its record's words (its sides' first world coordinates and its classes).
     const auto CLASS_COORDINATE = [&](const wp::vec2i sides, const int classes, const int e) {
@@ -141,8 +144,8 @@ CLASS_SIDES = DevicePrelude("class_sides", _CLASS_SIDES, _CLASS_SIDES)
 
 _CLASS_RANK = """    // The writer's classes: CLASS_OF(classes, e0, e1) the class of a side whose seeds' endpoints are e0 and e1 (e0
     // twice for one seed); CLASS_RANK(classes, cls, c) tree coordinate c's entry in class cls, -1 off it;
-    // CLASS_NEXT(classes, cls, at, c) the same for a walk's coordinates (each seed's in descending order, all in the
-    // class) from the cursor at (-1 to start); CLASS_WORD(c0, c1) a row's two classes (-1 none).
+    // CLASS_NEXT(classes, cls, at, c) the same for coordinates in the class, from the cursor at (-1 to start): one
+    // step a coordinate for a walk's, which descend; CLASS_WORD(classes, c0, c1) a row's word (-1 none).
     const auto CLASS_OF = [](const auto& classes, const int e0, const int e1) -> int {
         return classes.pair_class.data[(size_t)e0 * classes.pair_class.shape[1] + e1];
     };
@@ -165,8 +168,9 @@ _CLASS_RANK = """    // The writer's classes: CLASS_OF(classes, e0, e1) the clas
         while (at > 0 && dofs[at] > c) --at;
         return at;
     };
-    const auto CLASS_WORD = [](const int c0, const int c1) -> int {
-        return (int)((unsigned)(c0 & 0xFFFF) | ((unsigned)(c1 & 0xFFFF) << 16));
+    const auto CLASS_WORD = [](const auto& classes, const int c0, const int c1) -> int {
+        const unsigned n0 = c0 >= 0 ? (unsigned)classes.class_count.data[c0] : 0u;
+        return (int)((unsigned)(c0 & 0x1FFF) | ((unsigned)(c1 & 0x1FFF) << 13) | (n0 << 26));
     };"""
 
 

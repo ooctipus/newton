@@ -54,24 +54,26 @@ def test_incident_is_the_whitened_rows_term(test, device):
 
 
 def test_support_classes_hold_the_invariant(test, device):
-    """Rows stored by their support classes (the general placement of a hand of four fingers, a finger's rows on its
-    root path): the invariant holds, each row narrower than its sides."""
+    """Rows stored by their support classes (the general placement of a sprawl of five four-link limbs, a limb's rows
+    on its root path): the invariant holds, each row narrower than its sides."""
     solvers, rows = [], 0
-    for step, pairs in enumerate(_gaps(scenes.hand(worlds=32), device, 6, {"placement": "general"}, solvers)):
+    for step, pairs in enumerate(_gaps(scenes.sprawl(worlds=16), device, 6, {"placement": "general"}, solvers)):
         gaps, terms = pairs[0]
         rows += int(np.count_nonzero(terms))
         test.assertTrue((gaps <= ROUNDING * terms + FLOOR).all(), f"step {step}: worst gap {gaps.max():.3e}")
     placement = solvers[-1].placement
     test.assertTrue(placement.classed, placement.row_classes_reason)
     test.assertLess(placement.packed_support, solvers[-1].forest.max_world_dofs)
-    test.assertGreater(rows, 0, "the hand wrote no row")
+    test.assertGreater(rows, 0, "the sprawl wrote no row")
 
 
 def _run(scene, device, pins, steps):
     model = scene.build(device)
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
-    solver = SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(**pins), **scene.solver_options)
+    # Every key's limit rows fit a world's rows.
+    options = {**scene.solver_options, "dense_max_constraints": 256}
+    solver = SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(**pins), **options)
     state, out, control = model.state(), model.state(), model.control()
     for step in range(steps):
         state.clear_forces()
@@ -86,13 +88,12 @@ def _run(scene, device, pins, steps):
 def test_support_classes_step_as_sides(test, device):
     """The rows' support classes reorder no sum on the CPU: a world's entries keep their coordinates' order and drop
     zeros, so the classes step bit for bit as the rows' sides (the test pin ``row_support=False``); on CUDA the
-    sweep's lanes sum other entries, so a step agrees to rounding (contacts grow it along a trajectory). Scenes:
-    keyboard keys (a key's rows one entry wide, velocity limits), a hand, legs with mimic knees."""
+    sweep's lanes sum other entries, so a step agrees to rounding (contacts grow it along a trajectory). Scenes whose
+    classes hold fewer entries a lane: keyboard keys (a key's rows one entry wide, their limits), a sprawl of limbs."""
     cpu = wp.get_device(device).is_cpu
     for scene in (
-        scenes.keyboard(worlds=32, velocity_limit=0.5),
-        scenes.hand(worlds=32),
-        scenes.legged(worlds=32, mimic=True),
+        scenes.keyboard(worlds=32, keys=32),
+        scenes.sprawl(worlds=16),
     ):
         steps = scene.steps if cpu else 1
         classes, qd = _run(scene, device, {"placement": "general"}, steps)

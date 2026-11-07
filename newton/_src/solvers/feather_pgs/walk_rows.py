@@ -1000,7 +1000,7 @@ _CLASS_RELEASE = """            WALK_RELEASE_ON(release, art, Z, rows, S, [&](co
             });"""
 
 _CLASS_CLOSE = """    // The row's classes, its first side's then its second's (packed_rows.CLASS_SIDES).
-    for (int r = 0; r < rows; ++r) ST(sink.classes.row_class.data + row0 + r, CLASS_WORD(side_class[0], side_class[1]));
+    for (int r = 0; r < rows; ++r) ST(sink.classes.row_class.data + row0 + r, CLASS_WORD(sink.classes, side_class[0], side_class[1]));
 """
 
 
@@ -1162,10 +1162,10 @@ WALK_UNROLLED
 
 _BLOCK_CLASSES = """
         // Each row's support class (packed_rows.row_classes): its covectors' endpoints and their union.
-        int cls[$rows];
+        int cls[$rows], cursor[$rows];
 WALK_UNROLLED
         for (int r = 0; r < $rows; ++r) {
-            cls[r] = -1;
+            cls[r] = cursor[r] = -1;
             if (((mine >> r) & 1) == 0) continue;
             const int e0 = sink.classes.limit_class.data[dof0[r]];
             cls[r] = row_class[r] = CLASS_OF(sink.classes, e0, dof1[r] >= 0 ? sink.classes.limit_class.data[dof1[r]] : e0);
@@ -1191,10 +1191,12 @@ def block_walker(rows: int, side: bool, tables: tuple, classes: bool = False) ->
         if classes
         else "",
         classes=substitute(_BLOCK_CLASSES, rows=rows) if classes else "",
-        entry="CLASS_RANK(sink.classes, cls[r], c)" if classes else "base + c",
+        entry="CLASS_NEXT(sink.classes, cls[r], cursor[r], c)" if classes else "base + c",
         place="CLASS_RANK(sink.classes, cls[r], c)" if classes else "base + c",
         close=(
-            "\n        ST(sink.classes.row_class.data + rec0 + r, CLASS_WORD(row_class[r], -1));" if classes else ""
+            "\n        ST(sink.classes.row_class.data + rec0 + r, CLASS_WORD(sink.classes, row_class[r], -1));"
+            if classes
+            else ""
         ),
     )
     ints, floats = wp.types.vector(rows, int), wp.types.vector(rows, float)
