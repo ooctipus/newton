@@ -185,14 +185,9 @@ class Example:
         self.grid_x = int(np.ceil(np.sqrt(self.num_per_world)))
         self.grid_y = int(np.ceil(self.num_per_world / self.grid_x))
 
-        # Contact budget per world. MuJoCo's njmax/nconmax are per-world limits
-        # while CollisionPipeline's rigid_contact_max covers every world, so both
-        # derive from this rather than from a fixed whole-scene pool. A threading
-        # assembly peaks near 115 contacts, so this leaves ~9x headroom.
+        # MuJoCo's per-world contact budget (njmax/nconmax); Newton's contact buffers grow with
+        # the demand. A threading assembly peaks near 115 contacts, so this leaves ~9x headroom.
         self.contacts_per_world = 1024 * self.num_per_world
-
-        # Maximum number of rigid contacts to allocate (limits memory usage)
-        self.rigid_contact_max = self.contacts_per_world * self.world_count
 
         # Broad phase mode: NXN (O(N²)), SAP (O(N log N)), EXPLICIT (precomputed pairs)
         self.broad_phase_mode = "sap"
@@ -232,7 +227,6 @@ class Example:
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
             reduce_contacts=True,
-            rigid_contact_max=self.rigid_contact_max,
             broad_phase=self.broad_phase_mode,
             sdf_hydroelastic_config=sdf_hydroelastic_config,
             deterministic=self.deterministic,

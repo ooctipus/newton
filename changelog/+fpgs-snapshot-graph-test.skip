@@ -1,0 +1,1 @@
+Test-only: the snapshot graph test compares its arms on fresh models whose contact pools hold the same fields.

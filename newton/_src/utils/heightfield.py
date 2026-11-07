@@ -473,6 +473,33 @@ def _heightfield_cell_below_query(
 
 
 @wp.func
+def _abs_sum(value: wp.vec3) -> float:
+    return wp.abs(value[0]) + wp.abs(value[1]) + wp.abs(value[2])
+
+
+@wp.func
+def _heightfield_cell_below_query(
+    lower_z: float,
+    padding: float,
+    hfd: HeightfieldData,
+    elevations: wp.array[float],
+    row: int,
+    col: int,
+) -> bool:
+    """Reject only above every current corner; retain the entire downward prism."""
+    i = hfd.data_offset + row * hfd.ncol + col
+    height_range = hfd.max_z - hfd.min_z
+    z00 = hfd.min_z + elevations[i] * height_range
+    z10 = hfd.min_z + elevations[i + 1] * height_range
+    z01 = hfd.min_z + elevations[i + hfd.ncol] * height_range
+    z11 = hfd.min_z + elevations[i + hfd.ncol + 1] * height_range
+    if not (wp.isfinite(z00) and wp.isfinite(z10) and wp.isfinite(z01) and wp.isfinite(z11)):
+        return False
+    top = wp.max(wp.max(z00, z10), wp.max(z01, z11))
+    return lower_z > top + padding + (16.0 * 1.1920928955078125e-7) * wp.abs(top)
+
+
+@wp.func
 def heightfield_vs_convex_midphase(
     hfield_shape: int,
     other_shape: int,

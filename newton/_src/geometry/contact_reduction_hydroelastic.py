@@ -57,6 +57,7 @@ from .contact_reduction_global import (
     is_contact_already_exported,
     make_contact_key,
     reduction_update_slot,
+    reduction_value_index,
     unpack_contact_id,
 )
 
@@ -94,7 +95,7 @@ assert SPECULATIVE_BIN_OFFSET + _NUM_VOXEL_GROUPS <= 256
 FIXED_EXP_NONE = wp.constant(-10000)
 
 # Fixed accumulator slots, laid out slot-major as ``slot * ht_capacity + entry``
-# to match ``ht_values``.
+# in their own arrays (``ht_values`` itself is entry-major).
 FIXED_AGG_FORCE = wp.constant(0)  # 3 components
 FIXED_WEIGHT_SUM = wp.constant(3)
 FIXED_WEIGHTED_POS = wp.constant(4)  # 3 components
@@ -322,7 +323,6 @@ def _register_voxel_contact(
             voxel_local_slot,
             contact_value,
             reducer_data.ht_values,
-            reducer_data.ht_capacity,
         )
     else:
         wp.atomic_add(reducer_data.ht_insert_failures, 0, 1)
@@ -663,8 +663,6 @@ def get_reduce_hydroelastic_contacts_kernel(deterministic: bool = False):
             aabb_lower = shape_collision_aabb_lower[shape_b]
             aabb_upper = shape_collision_aabb_upper[shape_b]
 
-            ht_capacity = reducer_data.ht_capacity
-
             # === Part 1: Normal-binned reduction ===
             bin_id = get_slot(normal)
             key = make_contact_key(shape_a, shape_b, bin_id)
@@ -698,7 +696,7 @@ def get_reduce_hydroelastic_contacts_kernel(deterministic: bool = False):
                             reducer_data.contact_fingerprints[contact_id],
                             contact_id,
                         )
-                        reduction_update_slot(entry_idx, dir_i, value, reducer_data.ht_values, ht_capacity)
+                        reduction_update_slot(entry_idx, dir_i, value, reducer_data.ht_values)
 
                 max_depth_value = wp.static(_make_contact_value_variant(deterministic))(
                     -depth,
@@ -710,7 +708,6 @@ def get_reduce_hydroelastic_contacts_kernel(deterministic: bool = False):
                     wp.static(NUM_SPATIAL_DIRECTIONS),
                     max_depth_value,
                     reducer_data.ht_values,
-                    ht_capacity,
                 )
 
                 if agg_moment_unreduced.shape[0] > 0 and depth < 0.0 and reducer_data.deterministic == 0:
@@ -803,7 +800,7 @@ def _create_accumulate_reduced_depth_kernel(deterministic: bool = False, mantiss
             p1_count = int(0)
 
             for slot in range(wp.static(VALUES_PER_KEY)):
-                value = ht_values[slot * ht_capacity + entry_idx]
+                value = ht_values[reduction_value_index(entry_idx, slot)]
                 if value == wp.uint64(0):
                     continue
                 contact_id = wp.static(_unpack_contact_id_variant(deterministic))(value)
@@ -903,7 +900,7 @@ def _create_accumulate_moments_kernel(
             p2_count = int(0)
 
             for slot in range(wp.static(VALUES_PER_KEY)):
-                value = ht_values[slot * ht_capacity + entry_idx]
+                value = ht_values[reduction_value_index(entry_idx, slot)]
                 if value == wp.uint64(0):
                     continue
                 contact_id = wp.static(_unpack_contact_id_variant(deterministic))(value)
@@ -1101,9 +1098,9 @@ def create_export_hydroelastic_reduced_contacts_kernel(
             shape_a_first = int(0)
             shape_b_first = int(0)
 
-            # Read all value slots for this entry (slot-major layout)
+            # Read all value slots for this entry (one entry-major row)
             for slot in range(wp.static(VALUES_PER_KEY)):
-                value = ht_values[slot * ht_capacity + entry_idx]
+                value = ht_values[reduction_value_index(entry_idx, slot)]
 
                 # Skip empty slots (value = 0)
                 if value == wp.uint64(0):
@@ -1330,7 +1327,7 @@ def create_export_hydroelastic_reduced_contacts_kernel(
                         nbin_anchor_depth = float(0.0)
                         if wp.static(anchor_contact) and nbin_dir_reliable:
                             nbin_max_depth_value = ht_values[
-                                wp.static(NUM_SPATIAL_DIRECTIONS) * ht_capacity + nbin_entry_idx
+                                reduction_value_index(nbin_entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS))
                             ]
                             if nbin_max_depth_value != wp.uint64(0):
                                 nbin_max_depth_contact_id = unpack_contact_id(nbin_max_depth_value, deterministic)

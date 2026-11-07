@@ -5,21 +5,113 @@ import os
 import tempfile
 import unittest
 import warnings
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
 
 import newton
 from newton import Heightfield
+from newton._src.geometry.heightfield_features import HeightfieldFeatureContext, flat_seam_query_allowed
 from newton._src.utils import is_graph_capture_allocation_enabled
+from newton._src.utils.heightfield import HeightfieldData, get_triangle_shape_from_heightfield
 from newton.solvers import SolverMuJoCo
 from newton.tests.unittest_utils import assert_np_equal
 
 _cuda_available = wp.is_cuda_available()
 
 
+def _flat_feature_kernel():
+    """Exercise current feature ownership without requiring a collision rollout."""
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def evaluate(
+        heights: wp.array[HeightfieldData],
+        elevations: wp.array[float],
+        triangles: wp.array[int],
+        points: wp.array[wp.vec3],
+        allowed: wp.array[int],
+    ):
+        i = wp.tid()
+        context = HeightfieldFeatureContext()
+        context.heightfield = heights[0]
+        context.elevations = elevations
+        context.triangle = triangles[i]
+        geom, _ = get_triangle_shape_from_heightfield(heights[0], elevations, wp.transform_identity(), triangles[i])
+        allowed[i] = int(flat_seam_query_allowed(geom, points[i], wp.normalize(wp.vec3(-1.0, 0.0, 1.0)), context))
+
+    return evaluate
+
+
 class TestHeightfield(unittest.TestCase):
     """Test suite for heightfield support."""
+
+    @unittest.skipUnless(
+        os.environ.get("NEWTON_HEIGHTFIELD_WELD_FLAT_SEAMS") == "1", "Experimental current-flat feature gate"
+    )
+    def test_flat_internal_seam_has_no_oblique_contact(self):
+        """A continuous flat top has no lateral obstacle at a triangulation seam."""
+        for finite in (False, True):
+            for reduce in (False, True):
+                with self.subTest(finite=finite, reduce=reduce):
+                    builder = newton.ModelBuilder()
+                    cfg = builder.ShapeConfig(margin=0.0025, gap=0.02)
+                    terrain = Heightfield(np.zeros((21, 21), np.float32), nrow=21, ncol=21, hx=1.2, hy=1.2)
+                    builder.add_shape_heightfield(heightfield=terrain, cfg=cfg)
+                    body = builder.add_body(xform=wp.transform((0.015, 0.0, 0.03), wp.quat_identity()))
+                    builder.add_shape_box(body=body, hx=0.1, hy=0.08, hz=0.025, cfg=cfg)
+                    model = builder.finalize(device="cpu")
+                    with patch.dict(
+                        os.environ,
+                        {
+                            "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
+                            "NEWTON_HEIGHTFIELD_FINITE_QUERY": str(int(finite)),
+                        },
+                    ):
+                        pipeline = newton.CollisionPipeline(
+                            model,
+                            broad_phase="nxn",
+                            reduce_contacts=reduce,
+                            rigid_contact_max=100,
+                            max_triangle_pairs=128,
+                        )
+                    contacts = pipeline.contacts()
+                    pipeline.collide(model.state(), contacts)
+                    pipeline.narrow_phase.check_buffer_capacity()
+                    count = int(contacts.rigid_contact_count.numpy()[0])
+                    self.assertGreater(count, 0)
+                    self.assertLess(count, 100)
+                    normals = contacts.rigid_contact_normal.numpy()[:count]
+                    self.assertGreater(float(normals[:, 2].min()), 0.99999)
+
+    def test_flat_seam_feature_preserves_border_and_current_crease(self):
+        """Only complete flat internal fans/edges disappear; current terrain remains authoritative."""
+        builder = newton.ModelBuilder()
+        terrain = Heightfield(
+            np.zeros((21, 21), np.float32),
+            nrow=21,
+            ncol=21,
+            hx=1.2,
+            hy=1.2,
+            min_z=0.0,
+            max_z=1.0,
+        )
+        builder.add_shape_heightfield(heightfield=terrain)
+        model = builder.finalize(device="cpu")
+        triangles = wp.array([420, 420, 438, 420], dtype=int, device="cpu")
+        points = wp.array(
+            [(0.12, 0.06, 0.0), (0.12, 0.12, 0.0), (0.12, 0.06, 0.0), (0.03, 0.01, 0.0)], dtype=wp.vec3, device="cpu"
+        )
+        allowed = wp.empty(4, dtype=int, device="cpu")
+        kernel = _flat_feature_kernel()
+        inputs = [model.heightfield_data, model.heightfield_elevations, triangles, points, allowed]
+        wp.launch(kernel, dim=4, inputs=inputs, device="cpu")
+        np.testing.assert_array_equal(allowed.numpy(), [0, 0, 1, 1])
+        elevations = model.heightfield_elevations.numpy()
+        elevations[11 * 21 + 12] = 0.1
+        model.heightfield_elevations.assign(elevations)
+        wp.launch(kernel, dim=4, inputs=inputs, device="cpu")
+        np.testing.assert_array_equal(allowed.numpy(), [1, 1, 1, 1])
 
     def test_heightfield_creation(self):
         """Test creating a Heightfield with auto-normalization."""
@@ -834,29 +926,258 @@ class TestHeightfield(unittest.TestCase):
 
         self.assertTrue(np.all(distance >= 0.0), f"penetrating boundary contacts: {distance}")
 
-    def test_heightfield_boundary_ignores_external_lowest_point(self):
-        """Ignore a penetrating support point outside the heightfield footprint."""
+    @staticmethod
+    def _border_box_model():
+        """A box tilted over the border of a flat heightfield: its lowest corner hangs outside the footprint while its
+        part over the footprint sinks below the surface."""
         builder = newton.ModelBuilder()
-        self._add_flat_heightfield(builder)
+        TestHeightfield._add_flat_heightfield(builder)
 
         rotation = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.25 * wp.pi)
         body = builder.add_body(xform=wp.transform((0.95, 0.0, 0.11), rotation))
         builder.add_shape_box(body=body, hx=0.2, hy=0.05, hz=0.05)
+        return builder.finalize()
 
+    def test_heightfield_boundary_ignores_external_lowest_point(self):
+        """Ignore a penetrating support point outside the heightfield footprint.
+
+        The box's lowest corner hangs beyond the border; its contacts lie on the top face over the footprint, as deep as
+        its part there sinks, on the terrain law (the default) and on the terrain route (``NEWTON_TERRAIN_LAW=none``).
+        """
+        model = self._border_box_model()
+        for environ in ({}, {"NEWTON_TERRAIN_LAW": "none"}):
+            for reduce_contacts in (False, True):
+                with self.subTest(environ=environ, reduce_contacts=reduce_contacts):
+                    distance, normal, point0 = self._get_contact_kinematics(
+                        model, model.state(), reduce_contacts=reduce_contacts, environ=environ
+                    )
+
+                    self.assertGreater(len(distance), 0, "no contacts between box and heightfield boundary")
+                    deepest = int(np.argmin(distance))
+                    self.assertLess(float(distance[deepest]), -0.001)
+                    self.assertGreater(float(distance[deepest]), -0.015, f"overestimated penetration: {distance}")
+                    self.assertGreater(float(normal[deepest][2]), 0.999)
+                    self.assertLessEqual(float(point0[deepest][0]), 1.0 + 1.0e-5)
+                    self.assertAlmostEqual(float(point0[deepest][2]), 0.0, places=5)
+
+    def test_heightfield_border_penetration_gets_a_contact_by_default(self):
+        """Give a body that sinks below the surface at the heightfield's border its exact contact by default.
+
+        The terrain law takes the heightfield as a solid block with vertical walls under its border. The box of
+        :meth:`test_heightfield_boundary_ignores_external_lowest_point`, whose lowest corner hangs outside the footprint,
+        gets the top face's contact at its deepest point over the footprint: on the border's edge, as deep as its bottom
+        face crosses the edge (10.71 mm; the terrain route, ``NEWTON_TERRAIN_LAW=none``, gives 5.34 mm, 5 mm inside). A
+        sphere whose centre is 2 cm outside the footprint and 7 cm up gets the edge's contact: the normal from the edge
+        to the centre, as deep as the sphere reaches past the edge (27.20 mm; the terrain route, 27.30 mm).
+        """
+        tilt = np.radians(45.0)
+        # the box's bottom face (local z = -0.05) crosses the edge x = 1 at this height
+        crossing = 0.11 - 0.05 * np.cos(tilt) - (1.0 - 0.95 + 0.05 * np.sin(tilt)) * np.tan(tilt)
+        builder = newton.ModelBuilder()
+        self._add_flat_heightfield(builder)
+        centre = np.array((1.02, 0.0, 0.07))
+        body = builder.add_body(xform=wp.transform(wp.vec3(*centre), wp.quat_identity()))
+        builder.add_shape_sphere(body=body, radius=0.1)
+        edge = np.array((1.0, 0.0, 0.0))
+        cases = (
+            ("box", self._border_box_model(), crossing, np.array((0.0, 0.0, 1.0)), None),
+            (
+                "sphere",
+                builder.finalize(),
+                np.linalg.norm(centre - edge) - 0.1,
+                (centre - edge) / np.linalg.norm(centre - edge),
+                edge,
+            ),
+        )
+        for name, model, depth, expected_normal, expected_point in cases:
+            for reduce_contacts in (False, True):
+                with self.subTest(body=name, reduce_contacts=reduce_contacts):
+                    distance, normal, point0 = self._get_contact_kinematics(
+                        model, model.state(), reduce_contacts=reduce_contacts
+                    )
+                    self.assertGreater(len(distance), 0, "no contacts where the body sinks below the surface")
+                    deepest = int(np.argmin(distance))
+                    self.assertAlmostEqual(float(distance[deepest]), depth, delta=2.0e-5)
+                    np.testing.assert_allclose(normal[deepest], expected_normal, atol=1.0e-5)
+                    self.assertAlmostEqual(float(point0[deepest][0]), 1.0, delta=1.0e-5)
+                    self.assertAlmostEqual(float(point0[deepest][2]), 0.0, delta=1.0e-5)
+                    if expected_point is not None:
+                        np.testing.assert_allclose(point0[deepest], expected_point, atol=1.0e-5)
+
+    def _border_contacts(self, model, *, environ=None):
+        """Return a model's heightfield contacts at rest per partner shape: ``{shape: (distance, normal, point0)}``,
+        each sorted by distance, the pipeline built with the ``environ`` variables set."""
+        with patch.dict(os.environ, environ or {}):
+            pipeline = newton.CollisionPipeline(model)
+        state = model.state()
+        contacts = pipeline.contacts()
+        distance = wp.empty(contacts.rigid_contact_max, dtype=float, device=model.device)
+        point0 = wp.empty(contacts.rigid_contact_max, dtype=wp.vec3, device=model.device)
+        pipeline.collide(state, contacts)
+        newton.eval_rigid_contact_kinematics(model, state, contacts, out_distance=distance, out_point0_world=point0)
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        shape0 = contacts.rigid_contact_shape0.numpy()[:count]
+        shape1 = contacts.rigid_contact_shape1.numpy()[:count]
+        heightfield = model.shape_type.numpy() == int(newton.GeoType.HFIELD)
+        distance, normal, point0 = (
+            distance.numpy()[:count],
+            contacts.rigid_contact_normal.numpy()[:count],
+            point0.numpy()[:count],
+        )
+        out = {}
+        for partner in np.unique(shape1[heightfield[shape0]]):
+            index = np.nonzero(heightfield[shape0] & (shape1 == partner))[0]
+            index = index[np.argsort(distance[index], kind="stable")]
+            out[int(partner)] = (distance[index], normal[index], point0[index])
+        return out
+
+    def _assert_border_contacts(self, model, expected, *, route_tol):
+        """Assert the law's contacts of every partner of ``expected`` (``{shape: [(distance, normal, point0)]}``, an
+        empty list for none): one per expected row within 10 um and 1e-5 rad, no other contact within the expected
+        rows' depth plus 1 mm; and the terrain route's deepest contact within ``route_tol`` of the law's, its normal
+        within 1e-3 rad."""
+        law = self._border_contacts(model)
+        route = self._border_contacts(model, environ={"NEWTON_TERRAIN_LAW": "none"})
+        for shape, rows in expected.items():
+            with self.subTest(shape=shape):
+                distance, normal, point0 = law.get(shape, (np.zeros(0), np.zeros((0, 3)), np.zeros((0, 3))))
+                if not rows:
+                    self.assertTrue(np.all(distance > 0.0), msg=f"penetrating contacts {distance}")
+                    continue
+                near = distance <= max(d for d, _n, _p in rows) + 1.0e-3
+                self.assertEqual(int(np.count_nonzero(near)), len(rows), msg=f"{distance} {point0}")
+                for d, n, p in rows:
+                    match = (
+                        (np.abs(distance - d) <= 1.0e-5)
+                        & (np.linalg.norm(normal - np.asarray(n), axis=1) <= 1.0e-5)
+                        & (np.linalg.norm(point0 - np.asarray(p), axis=1) <= 1.0e-5)
+                    )
+                    self.assertTrue(np.any(match), msg=f"no contact {d} {n} {p} in {distance} {normal} {point0}")
+                route_distance, route_normal, _route_point0 = route[shape]
+                self.assertAlmostEqual(float(route_distance[0]), float(distance[0]), delta=route_tol)
+                self.assertLessEqual(float(np.linalg.norm(route_normal[0] - normal[0])), 1.0e-3)
+
+    def test_heightfield_border_walls_give_lateral_contacts(self):
+        """Give a body beside the heightfield's border its contact with the block's side wall.
+
+        The terrain law takes the heightfield as a solid block whose footprint has vertical walls from the border down
+        1 m (the terrain route's prism extrusion). A sphere 1 cm into each wall, 10 cm below the top, gets one contact on
+        it: the wall's outward normal, 1 cm deep, at the centre's projection onto the wall. A box 5 mm off each wall gets
+        four, at the corners of its face toward the wall. Spheres 1 cm into the walls' planes below their base, or 1 cm
+        off a wall, get no penetrating contact. The terrain route (``NEWTON_TERRAIN_LAW=none``) gives the same deepest
+        contacts within 0.1 mm.
+        """
+        builder = newton.ModelBuilder()
+        self._add_flat_heightfield(builder)
+        expected = {}
+        up = np.array((0.0, 0.0, 1.0))
+        for out in np.array(((1.0, 0.0, 0.0), (-1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, -1.0, 0.0))):
+            along = np.cross(up, out)
+            centre = 1.04 * out + 0.33 * along - 0.1 * up
+            body = builder.add_body(xform=wp.transform(wp.vec3(*centre), wp.quat_identity()))
+            expected[builder.add_shape_sphere(body=body, radius=0.05)] = [(-0.01, out, centre - 0.04 * out)]
+            centre = 1.055 * out - 0.33 * along - 0.1 * up
+            body = builder.add_body(xform=wp.transform(wp.vec3(*centre), wp.quat_identity()))
+            shape = builder.add_shape_box(body=body, hx=0.05, hy=0.05, hz=0.05)
+            face = centre - 0.055 * out
+            expected[shape] = [(0.005, out, face + a * along + b * up) for a in (-0.05, 0.05) for b in (-0.05, 0.05)]
+        for centre in ((1.04, 0.62, -1.06), (0.62, -1.06, -0.5)):
+            body = builder.add_body(xform=wp.transform(wp.vec3(*centre), wp.quat_identity()))
+            expected[builder.add_shape_sphere(body=body, radius=0.05)] = []
+        self._assert_border_contacts(builder.finalize(), expected, route_tol=1.0e-4)
+
+    def test_heightfield_border_corners_give_contacts(self):
+        """Give a body at a corner of the heightfield's block its contact with the corner.
+
+        A sphere over each corner, its centre 2 cm out on both axes and 7 cm up, gets one contact at the corner vertex,
+        its normal from the vertex to the centre, as deep as the sphere reaches past the vertex (24.50 mm). A box beside
+        each corner's vertical line, 5 mm off it diagonally and 10 cm below the top, gets two on the line at the ends of
+        the box's vertical edge, its normal the walls' bisector. The terrain route (``NEWTON_TERRAIN_LAW=none``) gives the
+        same deepest contacts within 0.2 mm.
+        """
+        builder = newton.ModelBuilder()
+        self._add_flat_heightfield(builder)
+        expected = {}
+        for sx in (-1.0, 1.0):
+            for sy in (-1.0, 1.0):
+                corner = np.array((sx, sy, 0.0))
+                centre = corner + np.array((0.02 * sx, 0.02 * sy, 0.07))
+                body = builder.add_body(xform=wp.transform(wp.vec3(*centre), wp.quat_identity()))
+                shape = builder.add_shape_sphere(body=body, radius=0.1)
+                gap = np.linalg.norm(centre - corner)
+                expected[shape] = [(gap - 0.1, (centre - corner) / gap, corner)]
+                out = np.array((sx, sy, 0.0)) / np.sqrt(2.0)
+                centre = corner + np.array((0.055 * sx, 0.055 * sy, -0.1))
+                body = builder.add_body(xform=wp.transform(wp.vec3(*centre), wp.quat_identity()))
+                shape = builder.add_shape_box(body=body, hx=0.05, hy=0.05, hz=0.05)
+                expected[shape] = [
+                    (0.005 * np.sqrt(2.0), out, corner + np.array((0.0, 0.0, z))) for z in (-0.05, -0.15)
+                ]
+        self._assert_border_contacts(builder.finalize(), expected, route_tol=2.0e-4)
+
+    def test_heightfield_border_supports_straddling_bodies(self):
+        """Support a body straddling the border's edge across its supported part, from the inside to the edge.
+
+        Each partner kind sunk 1 cm with its lowest points spanning the edge ``x = 1``: the top face's contacts, 1 cm
+        deep, at its supports over the footprint, the edge's included (the footprint clips a flat bottom at the edge: a
+        box's, a hull's, a cylinder's or a cone's half disc), and none beyond the edge. A sphere and an ellipsoid whose
+        lowest point lies on the edge, and a capsule along it, rest on the edge. The terrain route
+        (``NEWTON_TERRAIN_LAW=none``) gives the same depths within 0.2 mm.
+        """
+        lying_x = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.5 * wp.pi)
+        lying_y = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.5 * wp.pi)
+        builder = newton.ModelBuilder()
+        self._add_flat_heightfield(builder)
+        up = np.array((0.0, 0.0, 1.0))
+        expected = {}
+
+        def add(y, height, rotation=None):
+            xform = wp.transform(
+                wp.vec3(1.0, y, height - 0.01), rotation if rotation is not None else wp.quat_identity()
+            )
+            return builder.add_body(xform=xform)
+
+        def rows(y, points):
+            return [(-0.01, up, np.array((x, y + dy, 0.0))) for x, dy in points]
+
+        expected[builder.add_shape_sphere(body=add(-0.8, 0.05), radius=0.05)] = rows(-0.8, [(1.0, 0.0)])
+        shape = builder.add_shape_capsule(body=add(-0.5, 0.02, lying_x), radius=0.02, half_height=0.1)
+        expected[shape] = rows(-0.5, [(0.9, 0.0), (1.0, 0.0)])
+        shape = builder.add_shape_capsule(body=add(-0.2, 0.02, lying_y), radius=0.02, half_height=0.08)
+        expected[shape] = rows(-0.2, [(1.0, -0.08), (1.0, 0.08)])
+        shape = builder.add_shape_box(body=add(0.1, 0.04), hx=0.1, hy=0.05, hz=0.04)
+        expected[shape] = rows(0.1, [(0.9, -0.05), (0.9, 0.05), (1.0, -0.05), (1.0, 0.05)])
+        mesh = newton.Mesh.create_box(0.06, 0.05, 0.04, duplicate_vertices=False, compute_inertia=False)
+        shape = builder.add_shape_convex_hull(body=add(0.4, 0.04), mesh=mesh)
+        expected[shape] = rows(0.4, [(0.94, -0.05), (0.94, 0.05), (1.0, -0.05), (1.0, 0.05)])
+        shape = builder.add_shape_ellipsoid(body=add(0.65, 0.03), rx=0.07, ry=0.05, rz=0.03)
+        expected[shape] = rows(0.65, [(1.0, 0.0)])
         model = builder.finalize()
-        for reduce_contacts in (False, True):
-            with self.subTest(reduce_contacts=reduce_contacts):
-                distance, normal, point0 = self._get_contact_kinematics(
-                    model, model.state(), reduce_contacts=reduce_contacts
+        self._assert_border_contacts(model, expected, route_tol=2.0e-4)
+        # A cylinder's and a cone's half disc: the chord's ends on the edge, at most four contacts.
+        builder = newton.ModelBuilder()
+        self._add_flat_heightfield(builder)
+        discs = (
+            builder.add_shape_cylinder(body=add(-0.3, 0.04), radius=0.05, half_height=0.04),
+            builder.add_shape_cone(body=add(0.3, 0.045), radius=0.05, half_height=0.045),
+        )
+        model = builder.finalize()
+        law = self._border_contacts(model)
+        route = self._border_contacts(model, environ={"NEWTON_TERRAIN_LAW": "none"})
+        for shape, y in zip(discs, (-0.3, 0.3), strict=True):
+            with self.subTest(shape=shape):
+                distance, normal, point0 = law[shape]
+                support = distance < 0.0
+                self.assertLessEqual(int(np.count_nonzero(support)), 4)
+                np.testing.assert_allclose(distance[support], -0.01, atol=1.0e-5)
+                self.assertTrue(np.all(np.linalg.norm(normal[support] - up, axis=1) <= 1.0e-5))
+                inside = (point0[support, 0] <= 1.0 + 1.0e-5) & (
+                    np.hypot(point0[support, 0] - 1.0, point0[support, 1] - y) <= 0.05 + 1.0e-5
                 )
-
-                self.assertGreater(len(distance), 0, "no contacts between box and heightfield boundary")
-                deepest = int(np.argmin(distance))
-                self.assertLess(float(distance[deepest]), -0.001)
-                self.assertGreater(float(distance[deepest]), -0.015, f"overestimated penetration: {distance}")
-                self.assertGreater(float(normal[deepest][2]), 0.999)
-                self.assertLessEqual(float(point0[deepest][0]), 1.0 + 1.0e-5)
-                self.assertAlmostEqual(float(point0[deepest][2]), 0.0, places=5)
+                self.assertTrue(np.all(inside), msg=point0[support])
+                for end in (y - 0.05, y + 0.05):
+                    self.assertTrue(np.any(np.linalg.norm(point0[support] - (1.0, end, 0.0), axis=1) <= 1.0e-5))
+                self.assertAlmostEqual(float(route[shape][0][0]), -0.01, delta=2.0e-4)
 
     def test_heightfield_native_collision_scaled(self):
         """Per-instance ``scale`` on ``add_shape_heightfield`` is honored by narrow-phase.

@@ -1,0 +1,1 @@
+Accelerate explicit collision-pair admission and work estimation during construction by classifying distinct shape types and counting pairs with bounded array operations; retain the existing routing and collision budgets without configuration changes.

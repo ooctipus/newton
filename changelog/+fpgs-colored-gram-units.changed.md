@@ -1,0 +1,1 @@
+FeatherPGS's colored free-body sweep solves each contact unit on its cached Gram block: the friction pair's residuals are formed beside the normal row's and corrected by the normal row's change, and the unit's three changes are applied in one pass. A rounding change of the colored sweep.

@@ -1,0 +1,1 @@
+FeatherPGS evaluates augmented drives with the joint forces wherever its drive rows have no per-coordinate owner (loop closures), on CUDA as on the CPU. ``get_path_selection()`` no longer reports ``routes.dynamics.async_augmented_drives``, which always equaled ``routes.dynamics.parallel_augmented_drive_topology``.

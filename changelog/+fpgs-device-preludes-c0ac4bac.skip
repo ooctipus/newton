@@ -1,0 +1,1 @@
+Internal FeatherPGS refactor: native sweeps declare their device preludes; every generated kernel is unchanged.

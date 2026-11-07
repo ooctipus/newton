@@ -1,0 +1,1 @@
+Add a staged patch ring's member impulses in `SolverFeatherPGS`'s colored sweep from registers, loading them at once, instead of through a local array one member at a time; results are bitwise unchanged.

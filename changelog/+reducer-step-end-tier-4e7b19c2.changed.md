@@ -1,0 +1,1 @@
+With speculative contacts, mesh contact reduction ranks a normal bin's directional extremes touching-first by the depth a candidate reaches by the end of the step (its closing speed times the step, rotation included) instead of its current depth, so the far side of a support that a rocking body swings onto keeps contact rows instead of landing up to a substep's travel deep.

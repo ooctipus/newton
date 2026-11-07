@@ -1,0 +1,1 @@
+Allow explicitly requested native held-dynamics caching (`cached_dynamics="on"`) for compatible Kuka topologies with persistent patch friction. Reuse patch construction, shared normal loads, and history handling while retaining native factors and the existing point-contact kernels. Automatic selection retains the faster sparse implementation for this patch workload.

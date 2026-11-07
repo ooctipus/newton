@@ -1,0 +1,1 @@
+Add a physics conformance gate for SolverFeatherPGS: shared test scenes and a test that runs them through every admitted route against laws and a converged reference; tests only.

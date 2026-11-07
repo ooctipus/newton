@@ -621,12 +621,8 @@ def build_stacked_cubes_scene(
             buffer_fraction=1.0,
         )
 
-    # Hydroelastic without contact reduction can generate many contacts
-    rigid_contact_max = 6000 if not reduce_contacts else 100
-
     collision_pipeline = newton.CollisionPipeline(
         model,
-        rigid_contact_max=rigid_contact_max,
         broad_phase="explicit",
         sdf_hydroelastic_config=sdf_hydroelastic_config,
         deterministic=deterministic,
@@ -1118,18 +1114,14 @@ def _build_cube_sphere_scene(device, cube_half=0.1, sphere_radius=0.1):
     return model, state, sphere_body, rest_z
 
 
-def _make_pipelines(model, configs, rigid_contact_maxes=None, deterministic=False):
+def _make_pipelines(model, configs, deterministic=False):
     """Create collision pipelines and contacts for a list of HydroelasticSDF.Configs.
 
     Returns list of (pipeline, contacts) tuples.
     """
-    if rigid_contact_maxes is None:
-        rigid_contact_maxes = [500] * len(configs)
     result = []
-    for cfg, rcm in zip(configs, rigid_contact_maxes, strict=True):
-        pipe = newton.CollisionPipeline(
-            model, rigid_contact_max=rcm, sdf_hydroelastic_config=cfg, deterministic=deterministic
-        )
+    for cfg in configs:
+        pipe = newton.CollisionPipeline(model, sdf_hydroelastic_config=cfg, deterministic=deterministic)
         result.append((pipe, pipe.contacts()))
     return result
 
@@ -1185,7 +1177,6 @@ def test_hydroelastic_pre_prune_writes_contact_fingerprints(test, device):
     pipeline = newton.CollisionPipeline(
         model,
         broad_phase="explicit",
-        rigid_contact_max=20000,
         sdf_hydroelastic_config=HydroelasticSDF.Config(
             reduce_contacts=True,
             pre_prune_contacts=True,
@@ -1212,7 +1203,6 @@ def test_deterministic_hydroelastic_speculative_contacts(test, device):
     pipeline = newton.CollisionPipeline(
         model,
         broad_phase="explicit",
-        rigid_contact_max=20000,
         sdf_hydroelastic_config=HydroelasticSDF.Config(
             reduce_contacts=True,
             buffer_fraction=1.0,
@@ -1273,7 +1263,6 @@ def test_hydroelastic_margin_gap_bands(test, device, reduce_contacts):
     pipeline = newton.CollisionPipeline(
         model,
         broad_phase="explicit",
-        rigid_contact_max=20000,
         sdf_hydroelastic_config=config,
     )
     contacts = pipeline.contacts()
@@ -1338,7 +1327,6 @@ def test_hydroelastic_zero_gap_omits_speculative_contacts(test, device, reduce_c
     pipeline = newton.CollisionPipeline(
         model,
         broad_phase="explicit",
-        rigid_contact_max=20000,
         sdf_hydroelastic_config=HydroelasticSDF.Config(
             reduce_contacts=reduce_contacts,
             pre_prune_contacts=reduce_contacts,
@@ -1378,7 +1366,6 @@ def test_hydroelastic_margin_contact_area_is_deprecated(test, device, reduce_con
         newton.CollisionPipeline(
             model,
             broad_phase="explicit",
-            rigid_contact_max=20000,
             sdf_hydroelastic_config=HydroelasticSDF.Config(
                 margin_contact_area=1.0e-2,
                 reduce_contacts=reduce_contacts,
@@ -1392,7 +1379,6 @@ def test_hydroelastic_margin_contact_area_is_deprecated(test, device, reduce_con
         pipeline = newton.CollisionPipeline(
             model,
             broad_phase="explicit",
-            rigid_contact_max=20000,
             sdf_hydroelastic_config=HydroelasticSDF.Config(
                 margin_contact_area=margin_contact_area,
                 reduce_contacts=reduce_contacts,
@@ -1421,7 +1407,6 @@ def test_mujoco_warp_hydroelastic_speculative_activation(test, device):
     pipeline = newton.CollisionPipeline(
         model,
         broad_phase="explicit",
-        rigid_contact_max=20000,
         sdf_hydroelastic_config=HydroelasticSDF.Config(
             reduce_contacts=True,
             buffer_fraction=1.0,
@@ -1526,7 +1511,7 @@ def test_reduced_vs_unreduced_contact_forces(test, device, anchor_contact=False,
         anchor_contact=False,
     )
     (pipe_red, contacts_red), (pipe_unr, contacts_unr) = _make_pipelines(
-        model, [cfg_reduced, cfg_unreduced], [500, 20000], deterministic=deterministic
+        model, [cfg_reduced, cfg_unreduced], deterministic=deterministic
     )
     if deterministic:
         test.assertLessEqual(pipe_red.hydroelastic_sdf.max_num_iso_voxels, _MAX_DETERMINISTIC_ISO_VOXELS)
@@ -1586,7 +1571,7 @@ def test_reduced_vs_unreduced_contact_moments(test, device, deterministic=False)
         anchor_contact=False,
     )
     (pipe_red, contacts_red), (pipe_unr, contacts_unr) = _make_pipelines(
-        model, [cfg_reduced, cfg_unreduced], [500, 20000], deterministic=deterministic
+        model, [cfg_reduced, cfg_unreduced], deterministic=deterministic
     )
     if deterministic:
         test.assertLessEqual(pipe_red.hydroelastic_sdf.max_num_iso_voxels, _MAX_DETERMINISTIC_ISO_VOXELS)
@@ -1715,9 +1700,7 @@ def test_reduced_vs_unreduced_contact_forces_cube_on_cube(test, device):
         reduce_contacts=False,
         anchor_contact=False,
     )
-    (pipe_red, contacts_red), (pipe_unr, contacts_unr) = _make_pipelines(
-        model, [cfg_reduced, cfg_unreduced], [500, 50000]
-    )
+    (pipe_red, contacts_red), (pipe_unr, contacts_unr) = _make_pipelines(model, [cfg_reduced, cfg_unreduced])
 
     for pen in [1e-4, 1e-3, 1e-2]:
         upper_z = rest_z - pen
@@ -1794,7 +1777,7 @@ def test_custom_pressure_func_matches_default_linear(test, device):
         pressure_data=pressure_data,
     )
     (pipe_default, contacts_default), (pipe_callback, contacts_callback) = _make_pipelines(
-        model, [cfg_default, cfg_callback], [50000, 50000]
+        model, [cfg_default, cfg_callback]
     )
 
     for pen in [1e-4, 1e-3, 1e-2]:
@@ -1846,7 +1829,7 @@ def test_custom_pressure_func_matches_default_linear_with_stiffness_ratio(test, 
         pressure_data=pressure_data,
     )
     (pipe_default, contacts_default), (pipe_callback, contacts_callback) = _make_pipelines(
-        model, [cfg_default, cfg_callback], [50000, 50000]
+        model, [cfg_default, cfg_callback]
     )
 
     for pen in [1e-4, 5e-4, 1e-3]:
@@ -1925,7 +1908,7 @@ def test_custom_pressure_func_force_scales_with_pressure_law(test, device):
         pressure_func=_linear_pressure,
         pressure_data=linear_data,
     )
-    (pipe_c, contacts_c), (pipe_l, contacts_l) = _make_pipelines(model, [cfg_cubic, cfg_linear], [50000, 50000])
+    (pipe_c, contacts_c), (pipe_l, contacts_l) = _make_pipelines(model, [cfg_cubic, cfg_linear])
 
     def fz_at(pipe, contacts, pen):
         wp.launch(_set_body_z_kernel, dim=1, inputs=[state.body_q, upper_body, rest_z - pen], device=device)
@@ -1981,7 +1964,7 @@ def test_custom_pressure_func_reduced_matches_unreduced_cubic(test, device):
         pressure_func=_cubic_pressure,
         pressure_data=pressure_data,
     )
-    (pipe_red, contacts_red), (pipe_unr, contacts_unr) = _make_pipelines(model, [cfg_red, cfg_unr], [500, 50000])
+    (pipe_red, contacts_red), (pipe_unr, contacts_unr) = _make_pipelines(model, [cfg_red, cfg_unr])
 
     for pen in [1e-3, 4e-3]:
         upper_z = rest_z - pen
@@ -2073,7 +2056,7 @@ def test_reduction_preserves_force_at_high_kh_decoupled_pressure(test, device):
         reduce_contacts=True, anchor_contact=True, normal_matching=True, moment_matching=True, **common
     )
     cfg_unr = HydroelasticSDF.Config(reduce_contacts=False, anchor_contact=False, **common)
-    (pipe_red, c_red), (pipe_unr, c_unr) = _make_pipelines(model, [cfg_red, cfg_unr], [500, 20000])
+    (pipe_red, c_red), (pipe_unr, c_unr) = _make_pipelines(model, [cfg_red, cfg_unr])
 
     for pen in (2e-3, 5e-3):
         wp.launch(_set_body_z_kernel, dim=1, inputs=[state.body_q, sphere_body, rest_z - pen], device=device)
@@ -2122,9 +2105,7 @@ def test_reduced_vs_unreduced_contact_moments_cube_on_cube(test, device):
         reduce_contacts=False,
         anchor_contact=False,
     )
-    (pipe_red, contacts_red), (pipe_unr, contacts_unr) = _make_pipelines(
-        model, [cfg_reduced, cfg_unreduced], [500, 50000]
-    )
+    (pipe_red, contacts_red), (pipe_unr, contacts_unr) = _make_pipelines(model, [cfg_reduced, cfg_unreduced])
 
     # Filter to the lower-upper cube shape pair (shape 1=lower, shape 2=upper).
     sp = (1, 2)
@@ -2492,7 +2473,6 @@ def test_convex_mesh_hydroelastic_contacts(test, device):
     collision_pipeline = newton.CollisionPipeline(
         model,
         broad_phase="sap",
-        rigid_contact_max=256,
         sdf_hydroelastic_config=HydroelasticSDF.Config(buffer_mult_contact=2),
     )
     contacts = collision_pipeline.contacts()
@@ -2557,7 +2537,6 @@ def test_scalar_sdf_texture_hydroelastic_contacts(test, device):
         collision_pipeline = newton.CollisionPipeline(
             model,
             broad_phase="sap",
-            rigid_contact_max=256,
             sdf_hydroelastic_config=HydroelasticSDF.Config(buffer_mult_contact=2),
         )
         contacts = collision_pipeline.contacts()
@@ -3215,7 +3194,6 @@ def test_no_degenerate_triangles_deep_penetration(test, device):
             )
             collision_pipeline = newton.CollisionPipeline(
                 model,
-                rigid_contact_max=200000,
                 broad_phase="explicit",
                 sdf_hydroelastic_config=hydro_config,
             )
@@ -3306,7 +3284,6 @@ def _build_two_box_hydro_pipeline(device, mc_edge_clamp_min: float):
     )
     pipeline = newton.CollisionPipeline(
         model,
-        rigid_contact_max=100000,
         broad_phase="explicit",
         sdf_hydroelastic_config=hydro_config,
     )
@@ -3464,7 +3441,6 @@ def test_deep_penetration_contact_surface_has_no_central_hole(test, device):
     )
     pipeline = newton.CollisionPipeline(
         model,
-        rigid_contact_max=200000,
         broad_phase="explicit",
         sdf_hydroelastic_config=hydro_config,
     )

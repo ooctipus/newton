@@ -211,7 +211,8 @@ formulation.
 - ``restitution``: :class:`~newton.solvers.SolverSteel` (arithmetic mean of
   the two shapes, for contacts closing faster than ``restitution_velocity_threshold``
   at the start of the step, unless ``enable_restitution=False``),
-  :class:`~newton.solvers.SolverXPBD` when ``enable_restitution=True``, and
+  :class:`~newton.solvers.SolverXPBD` when ``enable_restitution=True``,
+  :class:`~newton.solvers.SolverFeatherPGS`, and
   :class:`~newton.solvers.SolverKamino`.
 - ``mu_torsional`` / ``mu_rolling``: :class:`~newton.solvers.SolverXPBD` and
   :class:`~newton.solvers.SolverMuJoCo`.

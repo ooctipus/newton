@@ -1,0 +1,1 @@
+Add the compact contact boundary, a representation producer for FeatherPGS's admitted dense-six plus independent-diagonal contact-triple path, preserving original allocation, scheduling, RHS, solve budgets, and fallback for other modes.

@@ -1,0 +1,1 @@
+Keep FeatherPGS matrix-free, per-contact and masked point-friction contact rows within the rows reserved by the contact allocator; near the friction-gap threshold these builders could write friction rows over the next contact's rows or leave reserved rows unwritten.

@@ -1,0 +1,1 @@
+Add construction-time selection and fallback reasons to `SolverFeatherPGS.get_path_selection()`, including public and private override precedence, CPU choices, sparse topology and policy admission, cache selection, and shared-memory limits.

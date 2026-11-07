@@ -1,0 +1,1 @@
+Add a typed closed-form capsule-vs-heightfield-cell query (end caps plus the deepest interior axis point) and a per-primitive dispatch table (`ANALYTIC_PRIMITIVE_QUERIES`) for the typed heightfield queries, so each primitive registers one function. `NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES=0` restores the generic GJK/MPR queries.

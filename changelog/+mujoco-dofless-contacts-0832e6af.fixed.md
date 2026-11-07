@@ -1,0 +1,1 @@
+Filter external MuJoCo contacts between bodies with no response DOFs, including articulated fixed and locked-D6 roots exported as mocap bodies, while preserving contacts with dynamic welded ancestors.

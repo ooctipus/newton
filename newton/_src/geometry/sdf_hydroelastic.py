@@ -931,6 +931,7 @@ class HydroelasticSDF:
         shape_pairs_sdf_sdf_count: wp.array[wp.int32],
         writer_data: Any,
         shape_sdf_data_prepared: bool = False,
+        verify_contacts: bool = True,
     ) -> None:
         """Run the full hydroelastic collision pipeline.
 
@@ -951,6 +952,8 @@ class HydroelasticSDF:
             shape_pairs_sdf_sdf_count: Number of valid shape pairs.
             writer_data: Contact data writer for output.
             shape_sdf_data_prepared: Whether finalized per-shape SDF descriptors were cached upstream.
+            verify_contacts: Whether the verifier flags contacts past ``writer_data.contact_max``; a
+                caller that grows its contact rows and reruns the pass on overflow turns it off.
         """
         shape_sdf_data = self._shape_sdf_data
         shape_transform_inverse = self._shape_transform_inverse
@@ -1017,7 +1020,7 @@ class HydroelasticSDF:
                 self.contact_reduction.contact_count,
                 self.max_num_face_contacts,
                 writer_data.contact_count,
-                writer_data.contact_max,
+                writer_data.contact_max if verify_contacts else 2**31 - 1,
                 self.contact_reduction.reducer.ht_insert_failures,
             ],
             device=self.device,
@@ -1032,8 +1035,8 @@ class HydroelasticSDF:
             if hashtable_failures > 0:
                 warnings.warn(
                     "Hydroelastic reduction dropped contacts due to hashtable insert "
-                    f"failures ({hashtable_failures}). Increase rigid_contact_max "
-                    "and/or HydroelasticSDF.Config.contact_reduction_hashtable_size_factor.",
+                    f"failures ({hashtable_failures}). Increase "
+                    "HydroelasticSDF.Config.contact_reduction_hashtable_size_factor.",
                     NewtonWarning,
                     stacklevel=2,
                 )
@@ -2397,7 +2400,7 @@ def verify_collision_step(
         has_overflow = True
     if contact_count[0] > max_contact_count:
         wp.printf(
-            "  [hydroelastic] rigid contact output overflow: %d > %d. Increase rigid_contact_max.\n",
+            "  [hydroelastic] rigid contact output overflow: %d > %d; the contact buffers grow on service.\n",
             contact_count[0],
             max_contact_count,
         )
@@ -2405,7 +2408,7 @@ def verify_collision_step(
     if ht_insert_failures[0] > 0:
         wp.printf(
             "  [hydroelastic] reduction hashtable full: %d insert failures. "
-            "Increase contact_reduction_hashtable_size_factor or rigid_contact_max.\n",
+            "Increase contact_reduction_hashtable_size_factor.\n",
             ht_insert_failures[0],
         )
         has_overflow = True

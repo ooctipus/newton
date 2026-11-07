@@ -1,0 +1,1 @@
+Generalize the retained 9+6 cached dynamics path to topology-derived scalar trees with dynamic and prescribed free roots. Share live publication bindings and complete world-reset ownership with generated tree caches.

@@ -1,0 +1,1 @@
+Add an explicit, source-pinned MJWarp 3.12 benchmark line-search workaround for missing-sign bracket acquisition, exact-zero roots, and exhausted FP32 step resolution, preserving the original iteration budgets, derivative tolerances, and unsupported-model path.

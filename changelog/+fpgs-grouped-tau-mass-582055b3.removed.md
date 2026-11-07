@@ -1,0 +1,1 @@
+Remove the experimental grouped kernels of `SolverFeatherPGS` that fused joint torques with mass-matrix assembly and factorization; the tiled CRBA and Cholesky stages they replaced run as before. Unset `FEATHER_PGS_GROUPED_TAU_MASS` and `FEATHER_PGS_GROUPED_MASS`, which select nothing.

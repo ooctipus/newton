@@ -1,0 +1,1 @@
+Add persistent constraint-capacity overflow reporting to `SolverFeatherPGS` through `constraint_capacity_status()` and the opt-in `check_constraint_capacity()` host check, including when detailed row telemetry is disabled. Query these methods outside graph capture; reconstruct the solver with adequate capacities and recapture after an overflow.

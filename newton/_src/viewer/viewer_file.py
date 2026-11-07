@@ -560,7 +560,9 @@ def _serialize_warp_dtype(dtype) -> dict:
     return result
 
 
-_MODEL_BVH_RECORDING_DEFAULTS = {
+# Model attributes recorded as these values instead of their contents: runtime BVHs, and the
+# private explicit-pair templates (a view of shape_contact_pairs that playback never restores).
+_MODEL_RECORDING_DEFAULTS = {
     "bvh_shapes": None,
     "bvh_shapes_group_roots": None,
     "bvh_shape_enabled": None,
@@ -569,6 +571,7 @@ _MODEL_BVH_RECORDING_DEFAULTS = {
     "bvh_shape_world_transforms": None,
     "bvh_particles": None,
     "bvh_particles_group_roots": None,
+    "_shape_contact_pair_templates": None,
 }
 
 
@@ -576,8 +579,8 @@ def pointer_as_key(obj, format_type: str = "json", cache: ArrayCache | None = No
     def callback(x, path):
         if path.startswith("model."):
             model_attr = path.removeprefix("model.").partition(".")[0]
-            if model_attr in _MODEL_BVH_RECORDING_DEFAULTS:
-                return _MODEL_BVH_RECORDING_DEFAULTS[model_attr]
+            if model_attr in _MODEL_RECORDING_DEFAULTS:
+                return _MODEL_RECORDING_DEFAULTS[model_attr]
 
         if isinstance(x, wp.array):
             # Skip arrays with struct dtypes - they can't be serialized

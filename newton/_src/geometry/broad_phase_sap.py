@@ -19,8 +19,11 @@ import warp as wp
 
 from ..core.types import Devicelike
 from .broad_phase_common import (
+    ShapeForecast,
     binary_search,
     check_aabb_overlap_moving,
+    forecast_count,
+    forecast_flush,
     is_pair_excluded,
     is_shape_pair_immovable_filtered,
     is_shape_pair_same_body_filtered,
@@ -34,6 +37,9 @@ wp.set_module_options({"enable_backward": False})
 
 
 SAPSortMode = Literal["segmented", "tile", "auto"]
+
+_NO_FORECAST = ShapeForecast()
+"""A forecast with no arrays: the pass forecasts nothing."""
 
 
 def _normalize_sort_mode(mode: str) -> SAPSortMode:
@@ -287,19 +293,26 @@ def _process_single_sap_pair(
     shape_body: wp.array[int],
     body_flags: wp.array[int],
     include_static_kinematic_pairs: bool,
-):
+    forecast: ShapeForecast,
+) -> wp.vec2l:
     shape1 = pair[0]
     shape2 = pair[1]
 
-    if is_shape_pair_same_body_filtered(shape1, shape2, shape_body):
-        return
-
-    if is_shape_pair_immovable_filtered(shape1, shape2, shape_body, body_flags, include_static_kinematic_pairs):
-        return
-
     # Skip explicitly excluded pairs (e.g. shape_collision_filter_pairs)
     if num_filter_pairs > 0 and is_pair_excluded(pair, filter_pairs, num_filter_pairs):
-        return
+        return wp.vec2l()
+
+    # The forecast sees the pairs the sweep visits: those whose projections overlap on its axis.
+    forecast_contacts = forecast_count(
+        forecast,
+        shape1,
+        shape2,
+        shape_bounding_box_lower,
+        shape_bounding_box_upper,
+        shape_body,
+        body_flags,
+        include_static_kinematic_pairs,
+    )
 
     # Check if margins are provided (empty array means AABBs are pre-expanded)
     gap1 = 0.0
@@ -311,12 +324,18 @@ def _process_single_sap_pair(
     if check_aabb_overlap_moving(
         shape1, shape2, shape_bounding_box_lower, shape_bounding_box_upper, gap1, gap2, shape_displacement
     ):
+        # Only overlapping pairs gather their bodies for the same-body and immovable tests.
+        if is_shape_pair_same_body_filtered(shape1, shape2, shape_body):
+            return forecast_contacts
+        if is_shape_pair_immovable_filtered(shape1, shape2, shape_body, body_flags, include_static_kinematic_pairs):
+            return forecast_contacts
         write_pair(
             pair,
             candidate_pair,
             candidate_pair_count,
             max_candidate_pair,
         )
+    return forecast_contacts
 
 
 @wp.func
@@ -344,8 +363,9 @@ def _process_sap_work_package(
     candidate_pair: wp.array[wp.vec2i],
     candidate_pair_count: wp.array[int],
     max_candidate_pair: int,
-):
-    """Process one mapped SAP work package."""
+    forecast: ShapeForecast,
+) -> wp.vec2l:
+    """Process one mapped SAP work package; return its pair's forecast contacts."""
     j = flat_id + workid + 1
     if flat_id > 0:
         j -= sap_cumulative_sum_in[flat_id - 1]
@@ -366,16 +386,16 @@ def _process_sap_work_package(
     num_shapes_in_world = world_slice_end - world_slice_start
 
     if i >= num_shapes_in_world or j >= num_shapes_in_world:
-        return
+        return wp.vec2l()
     if i >= j:
-        return
+        return wp.vec2l()
 
     idx_i = world_id * max_shapes_per_world + i
     idx_j = world_id * max_shapes_per_world + j
     local_shape1 = sap_sort_index_in[idx_i]
     local_shape2 = sap_sort_index_in[idx_j]
     if local_shape1 < 0 or local_shape2 < 0:
-        return
+        return wp.vec2l()
 
     shape1_tmp = local_shape1
     shape2_tmp = local_shape2
@@ -383,7 +403,7 @@ def _process_sap_work_package(
         shape1_tmp = world_index_map[world_slice_start + local_shape1]
         shape2_tmp = world_index_map[world_slice_start + local_shape2]
     if shape1_tmp == shape2_tmp:
-        return
+        return wp.vec2l()
 
     shape1 = wp.min(shape1_tmp, shape2_tmp)
     shape2 = wp.max(shape1_tmp, shape2_tmp)
@@ -403,7 +423,7 @@ def _process_sap_work_package(
             process_pair = test_world_and_group_pair(world1, world2, col_group1, col_group2)
 
     if process_pair:
-        _process_single_sap_pair(
+        return _process_single_sap_pair(
             wp.vec2i(shape1, shape2),
             shape_bounding_box_lower,
             shape_bounding_box_upper,
@@ -417,7 +437,9 @@ def _process_sap_work_package(
             shape_body,
             body_flags,
             include_static_kinematic_pairs,
+            forecast,
         )
+    return wp.vec2l()
 
 
 @wp.func
@@ -455,8 +477,10 @@ def _sap_broadphase_kernel(
     candidate_pair: wp.array[wp.vec2i],
     candidate_pair_count: wp.array[int],  # Size one array
     max_candidate_pair: int,
+    forecast: ShapeForecast,
 ):
     tid = wp.tid()
+    forecast_contacts = wp.vec2l()
 
     total_work_packages = sap_cumulative_sum_in[world_count * max_shapes_per_world - 1]
 
@@ -467,7 +491,7 @@ def _sap_broadphase_kernel(
         workid = tid
         while workid < total_work_packages:
             flat_id = binary_search(sap_cumulative_sum_in, workid, 0, total_intervals)
-            _process_sap_work_package(
+            forecast_contacts += _process_sap_work_package(
                 flat_id,
                 workid,
                 shape_bounding_box_lower,
@@ -491,8 +515,10 @@ def _sap_broadphase_kernel(
                 candidate_pair,
                 candidate_pair_count,
                 max_candidate_pair,
+                forecast,
             )
             workid += nsweep_in
+        forecast_flush(forecast, tid, forecast_contacts)
         return
 
     # Reuse interval lookups only when the original threads would loop.
@@ -509,7 +535,7 @@ def _sap_broadphase_kernel(
                 continue
             if sap_cumulative_sum_in[flat_id] <= workid:
                 flat_id = binary_search(sap_cumulative_sum_in, workid, flat_id + 1, total_intervals)
-            _process_sap_work_package(
+            forecast_contacts += _process_sap_work_package(
                 flat_id,
                 workid,
                 shape_bounding_box_lower,
@@ -533,8 +559,10 @@ def _sap_broadphase_kernel(
                 candidate_pair,
                 candidate_pair_count,
                 max_candidate_pair,
+                forecast,
             )
         chunk_base = _advance_sap_chunk_base(chunk_base, chunk_stride, total_work_packages)
+    forecast_flush(forecast, tid, forecast_contacts)
 
 
 class BroadPhaseSAP:
@@ -696,6 +724,7 @@ class BroadPhaseSAP:
         include_static_kinematic_pairs: bool = True,
         shape_displacement: wp.array[wp.vec3] | None = None,
         sort_axis_displacement_limit: float | None = None,
+        forecast: ShapeForecast | None = None,
     ) -> None:
         """Launch the sweep and prune broad phase collision detection with per-world segmented sort.
 
@@ -735,6 +764,8 @@ class BroadPhaseSAP:
                 :ref:`Speculative contacts <speculative-contacts>`. :class:`CollisionPipeline` computes it as the
                 shape-origin velocity, including the angular contribution from its COM offset, times ``dt``; angular
                 travel expands the supplied AABB separately.
+            forecast: The contact forecast a collision pass adds the tested pairs into
+                (:class:`~newton._src.geometry.broad_phase_common.ShapeForecast`); ``None`` forecasts nothing.
             sort_axis_displacement_limit: Optional non-negative cap on each displacement projected onto the SAP sort
                 axis [m]. This cap affects only candidate search; retained pairs are tested using the uncapped
                 displacement. Displacements beyond the cap may cause pairs to be missed.
@@ -891,6 +922,7 @@ class BroadPhaseSAP:
                 candidate_pair,
                 candidate_pair_count,
                 max_candidate_pair,
+                _NO_FORECAST if forecast is None else forecast,
             ],
             device=device,
             record_tape=False,

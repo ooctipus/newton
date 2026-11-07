@@ -1,0 +1,1 @@
+Internal refactor of SolverFeatherPGS's mimic and loop-closure row kernels with no user-facing change.

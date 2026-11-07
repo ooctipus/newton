@@ -1,0 +1,1 @@
+Accelerate `SolverFeatherPGS` construction for models with many worlds: its articulation, mass-matrix schedule, joint-limit, drive-row, world-layout and friction-patch radius tables are built over whole arrays instead of per-articulation, per-joint and per-shape Python loops. Every constructed buffer and selected route is unchanged; no migration is required.

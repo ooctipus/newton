@@ -1,0 +1,1 @@
+Skip the triangle-stream scan of typed heightfield query rows that no current shape pair reaches. A small kernel reads the current pair list, shape types and dimensions every collision pass, so type and dimension edits keep working and contacts are bitwise identical. Set `NEWTON_HEIGHTFIELD_ROW_GATE=0` before constructing the collision pipeline to scan every row as before.

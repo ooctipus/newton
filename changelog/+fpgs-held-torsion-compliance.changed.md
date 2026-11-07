@@ -1,0 +1,1 @@
+FeatherPGS admits contact torsion and compliance to the held tree, which builds no rows of its own: torsion rows read the joint motions and body twists every held group publishes, and compliance reads no dynamics.

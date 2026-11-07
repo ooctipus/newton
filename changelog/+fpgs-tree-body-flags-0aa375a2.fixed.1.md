@@ -1,0 +1,1 @@
+Keep FeatherPGS cached tree dynamics across body-flag changes notified through `SolverFeatherPGS.notify_model_changed` that ordinary dynamics accepts, also for CUDA graphs captured before them, instead of raising "Tree kinetic static body_flags changed"; reject the changes ordinary dynamics rejects with its reconstruction error, on either route, before any solver state changes.

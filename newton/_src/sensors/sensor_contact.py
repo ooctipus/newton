@@ -13,7 +13,7 @@ import warp as wp
 
 from ..exceptions import NewtonDeprecationWarning
 from ..sim import Contacts, Model, State
-from ..sim.contacts import contact_surface_point
+from ..sim.contacts import contact_capacity_blocks, contact_surface_point
 from ..solvers.solver import SolverBase
 from ..utils.selection import match_labels
 
@@ -24,7 +24,7 @@ _SENSING_KIND_BODY = 2
 
 
 @wp.kernel(enable_backward=False)
-def compute_sensing_transforms_kernel(
+def prepare_sensing_rows_kernel(
     indices: wp.array[wp.int32],
     sensing_kinds: wp.array[wp.int32],
     shape_body: wp.array[wp.int32],
@@ -32,18 +32,43 @@ def compute_sensing_transforms_kernel(
     body_q: wp.array[wp.transform],
     # output
     transforms: wp.array[wp.transform],
+    total_force: wp.array[wp.vec3],
+    total_force_friction: wp.array[wp.vec3],
+    force_matrix: wp.array2d[wp.vec3],
+    force_matrix_friction: wp.array2d[wp.vec3],
+    position_matrix: wp.array2d[wp.vec3],
+    position_weight: wp.array2d[float],
 ):
-    tid = wp.tid()
-    index = indices[tid]
-    sensing_kind = sensing_kinds[tid]
+    """Clear one (row, column) entry of every accumulated output; column 0 also prepares its row.
+
+    Column 0 clears the row's totals and, given body transforms, updates the row's sensing transform.
+    One launch over rows x columns replaces a separate clear of each output, and consecutive threads
+    store consecutive columns of a row. Positions are cleared together with forces so that an entry
+    never pairs a fresh force with a stale position.
+    """
+    row, col = wp.tid()
+    if force_matrix:
+        force_matrix[row, col] = wp.vec3(0.0)
+        force_matrix_friction[row, col] = wp.vec3(0.0)
+        position_matrix[row, col] = wp.vec3(0.0)
+        position_weight[row, col] = 0.0
+    if col != 0:
+        return
+    if total_force:
+        total_force[row] = wp.vec3(0.0)
+        total_force_friction[row] = wp.vec3(0.0)
+    if not body_q:
+        return
+    index = indices[row]
+    sensing_kind = sensing_kinds[row]
     if sensing_kind == wp.static(_SENSING_KIND_BODY):
-        transforms[tid] = body_q[index]
+        transforms[row] = body_q[index]
     elif sensing_kind == wp.static(_SENSING_KIND_SHAPE):
         body_index = shape_body[index]
         if body_index >= 0:
-            transforms[tid] = wp.transform_multiply(body_q[body_index], shape_transform[index])
+            transforms[row] = wp.transform_multiply(body_q[body_index], shape_transform[index])
         else:
-            transforms[tid] = shape_transform[index]
+            transforms[row] = shape_transform[index]
 
 
 @wp.kernel(enable_backward=False)
@@ -444,6 +469,8 @@ class SensorContact:
             raise ValueError("At most one of `counterpart_bodies` and `counterpart_shapes` may be specified.")
 
         self.device = model.device
+        # The accumulation launches over the contact capacity; about one wave of blocks covers it.
+        self._capacity_blocks = contact_capacity_blocks(self.device)
         self.verbose = verbose if verbose is not None else wp.config.log_level <= wp.LOG_DEBUG
 
         # Retain an explicit compatibility path during the deprecation period.
@@ -643,6 +670,8 @@ class SensorContact:
             ValueError: If ``observables`` belong to a different model, no contact-force
                 output is available, or ``contact_f`` was produced with a different ``contacts`` instance.
             ValueError: If legacy contacts are on a different device from the sensor.
+
+        A raised error leaves every output unchanged.
         """
         if observables is not None and observables.model is not self._model:
             raise ValueError("Solver observables must belong to the sensor's model.")
@@ -660,44 +689,40 @@ class SensorContact:
                 )
         elif contacts.device != self.device:
             raise ValueError(f"Contacts device ({contacts.device}) does not match sensor device ({self.device}).")
-
-        # update sensing transforms
-        n = len(self._sensing_indices)
-        if n > 0 and state is not None and state.body_q is not None:
-            wp.launch(
-                compute_sensing_transforms_kernel,
-                dim=n,
-                inputs=[
-                    self._sensing_indices,
-                    self._sensing_kinds,
-                    self._model.shape_body,
-                    self._model.shape_transform,
-                    state.body_q,
-                ],
-                outputs=[self.sensing_transforms],
-                device=self.device,
-            )
-
+        # One launch over rows x counterpart columns clears every output and, given body
+        # transforms, updates the sensing transforms.
+        columns = self.force_matrix.shape[1] if self.force_matrix is not None else 1
+        wp.launch(
+            prepare_sensing_rows_kernel,
+            dim=(len(self._sensing_indices), columns),
+            inputs=[
+                self._sensing_indices,
+                self._sensing_kinds,
+                self._model.shape_body,
+                self._model.shape_transform,
+                state.body_q if state is not None else None,
+            ],
+            outputs=[
+                self.sensing_transforms,
+                self.total_force,
+                self.total_force_friction,
+                self.force_matrix,
+                self.force_matrix_friction,
+                self.position_matrix,
+                self._position_weight,
+            ],
+            device=self.device,
+        )
         self._eval_forces(state, contacts, contact_f)
 
     def _eval_forces(self, state: State | None, contacts: Contacts, contact_f: wp.array[wp.spatial_vector]):
-        """Recompute force outputs and, when ``state.body_q`` is available, contact positions."""
-        if self.total_force is not None:
-            self.total_force.zero_()
-            self.total_force_friction.zero_()
-        if self.force_matrix is not None:
-            self.force_matrix.zero_()
-            self.force_matrix_friction.zero_()
-            # reset positions together with forces so entries never pair a fresh force with a stale position
-            self.position_matrix.zero_()
-            self._position_weight.zero_()
+        """Accumulate the outputs :meth:`update` cleared and, when ``state.body_q`` is available, contact positions."""
         update_contact_positions = self.position_matrix is not None and state is not None and state.body_q is not None
-        contact_count = contacts.rigid_contact_max
-        if self.device.is_cpu and not self.device.is_capturing:
-            contact_count = min(contact_count, int(contacts.rigid_contact_count.numpy()[0]))
-        wp.launch(
+        # One thread per contact; in a capture whose contact launches bind, each replay runs the live count.
+        pool = contacts._rigid_contact_pool
+        pool.launch(
             accumulate_contact_forces_kernel,
-            dim=contact_count,
+            pool.launch_rows(),
             inputs=[
                 contacts.rigid_contact_count,
                 contacts.rigid_contact_shape0,
@@ -723,7 +748,8 @@ class SensorContact:
                 self.position_matrix if update_contact_positions else None,
                 self._position_weight if update_contact_positions else None,
             ],
-            device=self.device,
+            extent=contacts.rigid_contact_count,
+            max_blocks=self._capacity_blocks,
         )
         if update_contact_positions:
             wp.launch(

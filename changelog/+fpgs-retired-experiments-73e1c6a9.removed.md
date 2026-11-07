@@ -1,0 +1,1 @@
+Remove the unpromoted body-basis, sparse-packet, paired-sparse-GS, coupled-contact and coupled-Jacobi experiments. Clear their `FEATHER_PGS_*` selectors or set them to `0` to use the retained solver; use the original research checkout to reproduce those experiments.

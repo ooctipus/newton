@@ -1,0 +1,1 @@
+Parallelize FeatherPGS right-hand-side accumulation over rows for non-differentiable CUDA models with one solving articulation per world, preserving each row's degree-of-freedom accumulation order and existing CPU and multi-articulation paths; no migration is required.

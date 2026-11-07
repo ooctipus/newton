@@ -1,0 +1,1 @@
+Run a diagonal-mass group of world-fixed roots over one-coordinate prismatic or revolute leaves as scalar branches of `SolverFeatherPGS`'s held-tree cached dynamics by default, wherever the held-tree owner is admitted, and the owner then also owns the other articulations of its worlds. Set `FEATHER_PGS_SCALAR_BRANCHES=0` to keep the previous routes.

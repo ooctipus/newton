@@ -1,0 +1,1 @@
+Include supported split sweeps, joint velocity limits and grouped dynamics in FeatherPGS automatic sparse-factor selection without private enable flags. `sparse_mass_matrix="off"` retains ordinary factors; `"on"` overrides legacy composition opt-outs while retaining physical and resource checks.

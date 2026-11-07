@@ -1,0 +1,1 @@
+Admit free rigid bodies in the generic mixed-tree cached-dynamics owner (`FEATHER_PGS_MIXED_TREE_KINETIC_STATE=1`): a free rigid body is a one-body tree on a free root that shares the held Cholesky action and the free-root transport, and publishes its spatial inertia and bias wrench for the matrix-free contact path.

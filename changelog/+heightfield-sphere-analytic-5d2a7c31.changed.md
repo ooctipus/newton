@@ -1,0 +1,1 @@
+Evaluate the typed heightfield sphere query (`NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY=1`) in closed form: the distance from the sphere center to the triangle prism replaces MPR, GJK and the prism penetration refiner per (sphere, triangle) pair, keeping the generic query's contact fields. Set `NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES=0` to restore the generic query.

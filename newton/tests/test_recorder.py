@@ -38,6 +38,22 @@ class TestRecorder(unittest.TestCase):
             viewer_file.close()
             self.assertFalse(viewer_file.is_running())
 
+    def test_model_recording_omits_pair_templates(self):
+        """Record the explicit contact pairs, but not the private per-world templates they replay."""
+        robot = newton.ModelBuilder()
+        robot.add_shape_box(robot.add_body(), hx=0.1, hy=0.1, hz=0.1)
+        robot.add_shape_sphere(robot.add_body(), radius=0.1)
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        builder.replicate(robot, 3)
+        model = builder.finalize(device="cpu")
+        self.assertIsNotNone(model._shape_contact_pair_templates)
+        attributes = pointer_as_key({"model": model}, "json")["items"]["model"]["attributes"]
+        self.assertIn("_shape_contact_pair_templates", attributes)
+        self.assertIsNone(attributes["_shape_contact_pair_templates"])
+        self.assertEqual(attributes["shape_contact_pair_count"]["value"], model.shape_contact_pair_count)
+        self.assertIsNotNone(attributes["shape_contact_pairs"])
+
     def test_numpy_scalar_tags_round_trip(self):
         """Round-trip the NumPy scalar classes emitted by recordings."""
 

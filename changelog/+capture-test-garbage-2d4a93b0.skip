@@ -1,0 +1,1 @@
+Free cyclic garbage before the collision tests capture graphs, so plain unittest runs do not destroy Warp textures inside a capture.

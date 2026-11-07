@@ -1,0 +1,1 @@
+FeatherPGS factors every articulation's joint-space mass matrix leaf-first (the coordinates reversed, so a tree's factor has no fill-in), on the held tree and the ordinary path alike: ANYmal is factored one way on flat and rough terrain, and the conditioning floor lifts the leaf-first pivots. A rounding change of every dense response.

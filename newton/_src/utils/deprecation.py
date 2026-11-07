@@ -7,7 +7,7 @@ import inspect
 import warnings
 from collections.abc import Callable
 from functools import wraps
-from typing import Any, ParamSpec, TypeVar, cast
+from typing import Any, ParamSpec, TypeVar, cast, overload
 
 from ..exceptions import NewtonDeprecationWarning
 
@@ -88,8 +88,38 @@ class RemovedAttribute(UnavailableAttribute):
         )
 
 
-def deprecate_nonkeyword_arguments(func: Callable[_P, _R]) -> Callable[_P, _R]:
-    """Warn when keyword-only parameters are supplied positionally."""
+@overload
+def deprecate_nonkeyword_arguments(func: Callable[_P, _R], /) -> Callable[_P, _R]: ...
+
+
+@overload
+def deprecate_nonkeyword_arguments(*, last_positional: str) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]: ...
+
+
+def deprecate_nonkeyword_arguments(
+    func: Callable[_P, _R] | None = None, /, *, last_positional: str | None = None
+) -> Callable[_P, _R] | Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    """Warn when keyword-only parameters are supplied positionally.
+
+    Extra positional values bind to the keyword-only parameters in declaration
+    order, with a :class:`DeprecationWarning` that names them.
+
+    Args:
+        func: Function to wrap. Omit it to pass options, as in
+            ``@deprecate_nonkeyword_arguments(last_positional="name")``.
+        last_positional: Last keyword-only parameter that may still be passed
+            positionally, normally the last one that was positional before the
+            deprecation. More positional values raise :class:`TypeError`, so
+            parameters that were always keyword-only gain no positional slot.
+            ``None`` admits every keyword-only parameter.
+    """
+    if func is None:
+        return lambda function: _wrap_nonkeyword_arguments(function, last_positional)
+    return _wrap_nonkeyword_arguments(func, last_positional)
+
+
+def _wrap_nonkeyword_arguments(func: Callable[_P, _R], last_positional: str | None) -> Callable[_P, _R]:
+    """Return ``func`` wrapped as :func:`deprecate_nonkeyword_arguments` describes."""
     sig = inspect.signature(func)
     params = list(sig.parameters.values())
     positional_count = 0
@@ -106,6 +136,13 @@ def deprecate_nonkeyword_arguments(func: Callable[_P, _R]) -> Callable[_P, _R]:
         elif param.kind == inspect.Parameter.VAR_POSITIONAL:
             raise TypeError(f"{func.__qualname__}() cannot use deprecate_nonkeyword_arguments with *args")
 
+    if last_positional is None:
+        deprecated_count = len(keyword_only_names)
+    elif last_positional in keyword_only_names:
+        deprecated_count = keyword_only_names.index(last_positional) + 1
+    else:
+        raise TypeError(f"{func.__qualname__}() has no keyword-only parameter {last_positional!r}")
+
     if not keyword_only_names:
         return func
 
@@ -115,7 +152,12 @@ def deprecate_nonkeyword_arguments(func: Callable[_P, _R]) -> Callable[_P, _R]:
         if extra_count <= 0:
             return func(*args, **kwargs)
 
-        if extra_count > len(keyword_only_names):
+        if extra_count > deprecated_count:
+            if deprecated_count < len(keyword_only_names):
+                raise TypeError(
+                    f"{func.__qualname__}() takes at most {positional_count + deprecated_count} positional "
+                    f"arguments but {len(args)} were given"
+                )
             try:
                 sig.bind(*args, **kwargs)
             except TypeError as exc:

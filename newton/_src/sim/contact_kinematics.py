@@ -26,8 +26,8 @@ def _validate_output(
         raise TypeError(f"{name} must be a Warp array or None, got {type(output).__name__}.")
     if output.dtype != dtype:
         raise TypeError(f"{name} has dtype {output.dtype}, expected {dtype}.")
-    if output.shape != (contact_max,):
-        raise ValueError(f"{name} has shape {output.shape}, expected ({contact_max},).")
+    if output.ndim != 1 or output.shape[0] < contact_max:
+        raise ValueError(f"{name} has shape {output.shape}, expected (n,) with n >= {contact_max}.")
     if output.device != device:
         raise ValueError(f"{name} is on device {output.device}, expected {device}.")
 
@@ -54,17 +54,21 @@ def eval_rigid_contact_kinematics(
     normal is already available as :attr:`newton.Contacts.rigid_contact_normal`
     and does not need a derived output.
 
+    Each output holds at least ``contacts.rigid_contact_max`` rows; only the
+    rows of live contacts are written. The contacts' rows grow with the demand,
+    so outputs allocated earlier may need to grow with them.
+
     Args:
         model: Model providing the shape-to-body mapping.
         state: State providing body transforms.
         contacts: Populated contacts whose rigid-contact geometry is evaluated.
         out_distance: Optional signed contact distance [m], shape
-            ``(contacts.rigid_contact_max,)``, dtype float. Positive values are
+            ``(n,)``, dtype float. Positive values are
             gaps and negative values are penetrations.
         out_point0_world: Optional world-space support point on shape 0 [m],
-            shape ``(contacts.rigid_contact_max,)``, dtype :class:`wp.vec3`.
+            shape ``(n,)``, dtype :class:`wp.vec3`.
         out_point1_world: Optional world-space support point on shape 1 [m],
-            shape ``(contacts.rigid_contact_max,)``, dtype :class:`wp.vec3`.
+            shape ``(n,)``, dtype :class:`wp.vec3`.
 
     Raises:
         ValueError: If no output is provided or an output has an unexpected
