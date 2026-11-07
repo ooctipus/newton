@@ -1915,7 +1915,13 @@ def both_ways_kernel(table: tuple):
 
     down = walk.walk("$V[0] = $P[0];", "$V[0] += x[$c];\ndown[$c] = $V[0];", begin="$V[0] += w[$b];", width=1)
     up = walk.walk(
-        "$P[0] += $V[0];", "$V[0] += x[$c];", begin="$V[0] += w[$b];", end="up[$b] = $V[0];", root_first=False, width=1
+        "$P[0] += $V[0];",
+        "$V[0] += x[$c];",
+        begin="$V[0] += w[$b];",
+        end="up[$b] = $V[0];",
+        root_first=False,
+        width=1,
+        joint_first="$P[0] = $V[0];",
     )
     text = f"""    const auto WALK_BOTH = [&](const float* w, const float* x, float* down, float* up) {{
         {{

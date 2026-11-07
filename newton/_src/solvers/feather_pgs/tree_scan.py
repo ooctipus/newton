@@ -1264,6 +1264,7 @@ def walk_texts(
     sink = "" if combine.inverted else sink
     texts = {
         "joint": braced(combine.joint(FETCHED.lever, "$V" if up else "$P", into="$P" if up else "$V")),
+        **({"joint_first": braced(combine.joint(FETCHED.lever, "$V", into="$P", first=True))} if up else {}),
         "step": braced([output, *([sink] if sink else []), *update]),
         "end": end,
         "root_first": not up,
@@ -1448,9 +1449,9 @@ class WalkClass:
         """Native statements that walk the class's tree on a state of ``width`` floats a body, in either direction.
 
         Root first, a body's state ``$V`` takes its parent's ``$P`` through ``joint`` (a root's starts at zero), then
-        ``begin``, its coordinates in order (``step``) and ``end``. Leaf first, a body's state starts at zero and
-        gathers what its children pass through ``joint`` (written into ``$P``, the parent's), then ``begin``, its
-        coordinates last first and ``end``; then it passes to its parent.
+        ``begin``, its coordinates in order (``step``) and ``end``. Leaf first, a body's state is its children's in the
+        walk's order (the first assigns ``$P`` by ``joint_first``, the others add by ``joint``; a leaf's is zero), then
+        ``begin``, its coordinates last first and ``end``; then it passes to its parent.
 
         **Loads ahead of the chain.** A walk's inputs do not depend on its chain: ``fetch_joint`` (body ``$b``'s, an
         expression) and ``fetch_step`` (coordinate ``$c``'s) are evaluated :meth:`ahead` items before the joint (as
@@ -1482,9 +1483,11 @@ class WalkClass:
             hold: Every item's line touched, then every item fetched, before the chain (straight-line code only): the
                 inputs held for a second walk over the same items (:meth:`walk_twice`). Touched first: on the RTX PRO
                 6000 the bare fetches of a free cube's records ran 9.2 -> 12.6 us; touched first, 8.3 (hold p2).
-            joint_first: Leaf first, straight-line: the joint of a parent's first child in the walk's order, which
-                assigns the parent's state rather than adding to its zero (none: ``joint`` for every child).
+            joint_first: Leaf first: the joint of a parent's first child in the walk's order, which assigns the
+                parent's state.
         """
+        if not root_first and not joint_first:
+            raise ValueError("a leaf-first walk assigns each parent's first child: give joint_first")
         bodies, coordinates = len(self.parent), self.coordinates
         zero = "{" + ", ".join(["0.0f"] * width) + "}"
         bodies_order = self.bodies_in(root_first)
@@ -1560,13 +1563,13 @@ class WalkClass:
                     lines += body_text(b, f"walk{b}")
                     if up >= 0:
                         lines += take(("l", b))
-                        text = joint_first if joint_first and up not in joined else joint
+                        text = joint if up in joined else joint_first
                         joined.add(up)
                         lines.append(_fill(text, b=b, V=f"walk{b}", P=f"walk{up}", L=f"walk_l{b}"))
             return "\n".join(lines)
 
-        if hold or joint_first:
-            raise ValueError("a walk holds its items, or assigns a first child, in straight-line code only")
+        if hold:
+            raise ValueError("a walk holds its items in straight-line code only")
         # The loop form: the walk's steps as a sequence of slots in the walk's order, a slot per coordinate and one
         # for a body without coordinates, each naming its body, its coordinate (-1 for none) and whether it is the
         # first (the body's joint before it root first, its gathering leaf first) or the last of its body's (the
@@ -1582,7 +1585,10 @@ class WalkClass:
         steps = len(sequence)
         depth = self.ahead(steps, ahead) if fetch_joint or fetch_step else 0
         name = f"WALK_CLASS_{self.tag}"
-        flags = [b | (int(first) << 16) | (int(last) << 17) for b, _, first, last in sequence]
+        # Leaf first, a body's join bits: its parent's first child in the walk's order (18), a parent (19).
+        firsts = {} if root_first else {up: b for b, up in enumerate(self.parent)}
+        join = [(firsts.get(up) == b) << 18 | (b in firsts) << 19 for b, up in enumerate(self.parent)]
+        flags = [b | (int(first) << 16) | (int(last) << 17) | join[b] for b, _, first, last in sequence]
 
         tables = [
             constant_table(f"{name}_PARENT", self.parent),
@@ -1626,13 +1632,12 @@ class WalkClass:
                 )
             state = f"float V[$width], P[$width];{f' float S[{count}][$width];' if count else ''}"
         else:
-            gather = f"{each} {{\n    V[k] = N[k];\n    N[k] = 0.0f;\n}}"
+            # A parent's state is its first child's, the others added (no slot cleared); a leaf's zero.
+            gather = f"{each} V[k] = N[k];"
             if count:
-                gather = (
-                    f"if ({name}_SLOT[b] >= 0) {{\n    {each} {{\n        V[k] = {_fill(slot, at='b')}[k];\n"
-                    f"        {_fill(slot, at='b')}[k] = 0.0f;\n    }}\n}} else {{\n{indent_text(gather, 4)}\n}}"
-                )
-            state = f"float V[$width], N[$width] = {zero};{f' float S[{count}][$width] = {{}};' if count else ''}"
+                gather = f"if ({name}_SLOT[b] >= 0)\n    {each} V[k] = {_fill(slot, at='b')}[k];\nelse\n    {gather}"
+            gather = f"if (({name}_STEP[at] >> 19) & 1) {{\n{indent_text(gather, 4)}\n}} else\n    {each} V[k] = 0.0f;"
+            state = f"float V[$width], N[$width];{f' float S[{count}][$width];' if count else ''}"
 
         def copy(j):
             """The text of slot `at` with ring slot j (or the inputs loaded in place, without a ring)."""
@@ -1656,9 +1661,13 @@ class WalkClass:
             if root_first and count:
                 tail.append(f"if ({name}_SLOT[b] >= 0)\n    {each} {_fill(slot, at='b')}[k] = V[k];")
             if not root_first:
-                give = _fill(joint, b="b", V="V", P="N", **names)
+                # A parent without a slot has one child, the next body: its first.
+                give = _fill(joint_first, b="b", V="V", P="N", **names)
                 if count:
-                    into = _fill(joint, b="b", V="V", P=_fill(slot, at="up"), **names)
+                    into = [_fill(text, b="b", V="V", P=_fill(slot, at="up"), **names) for text in (joint_first, joint)]
+                    into = (
+                        f"if (({name}_STEP[at] >> 18) & 1)\n{indent_text(into[0], 4)}\nelse\n{indent_text(into[1], 4)}"
+                    )
                     give = (
                         f"if ({name}_SLOT[up] >= 0) {{\n{indent_text(into, 4)}\n}} else {{\n{indent_text(give, 4)}\n}}"
                     )
