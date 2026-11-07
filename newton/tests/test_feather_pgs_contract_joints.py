@@ -58,7 +58,7 @@ def _d6_body(builder, parent, angular, inertia):
 
 def _floating_model(device, kind, angular=(2,), inertia=_INERTIA):
     """One body in free flight: on a ``"free"`` joint, on a D6 ``"root"``, or on a D6 ``"child"`` of a fixed body."""
-    builder = newton.ModelBuilder(gravity=0.0)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     if kind == "free":
         builder.add_body(
             xform=wp.transform(wp.vec3(0.0, 0.0, _HEIGHT)),
@@ -321,7 +321,7 @@ def _build_arm_and_box_model(device) -> newton.Model:
     contact impulse into the arm tip is the only thing fighting the velocity
     limit — fully deterministic.
     """
-    builder = newton.ModelBuilder(gravity=0.0)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     builder.default_shape_cfg.density = 1000.0
     builder.default_shape_cfg.ke = 1.0e5
     builder.default_shape_cfg.kd = 1.0e3
@@ -368,7 +368,7 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "joint velocity limits require CUDA")
     def test_one_ratio_scales_the_articulation(self):
-        builder = newton.ModelBuilder(gravity=0.0)
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         for _ in range(2):
             _cartesian_pair(builder)
         model = builder.finalize(device="cuda:0")

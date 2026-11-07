@@ -258,7 +258,7 @@ class TestVelocityLimitLawKernels(unittest.TestCase):
 
 def _pushed_arm(device, limit):
     """One revolute link about z without gravity, its velocity limited to ``limit``."""
-    builder = newton.ModelBuilder(gravity=0.0)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
     builder.add_articulation([builder.add_joint_revolute(-1, body, axis=wp.vec3(0.0, 0.0, 1.0))])
     model = builder.finalize(device=device)
@@ -331,7 +331,7 @@ _HAND_LIMIT = 0.5
 
 def _limited_hand(device):
     """A palm joint carrying three two-link fingers in one plane, every joint limited to ``_HAND_LIMIT``."""
-    builder = newton.ModelBuilder(gravity=0.0)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     axis = wp.vec3(0.0, 0.0, 1.0)
     palm = builder.add_link(mass=0.4, inertia=wp.mat33(np.eye(3) * 2.0e-3))
     joints = [builder.add_joint_revolute(-1, palm, axis=axis)]

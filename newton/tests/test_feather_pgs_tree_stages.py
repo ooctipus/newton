@@ -223,7 +223,7 @@ class TestTreeKineticStages(unittest.TestCase):
 def _keys(device, *, based, worlds=4, keys=8):
     """``worlds`` worlds of ``keys`` one-coordinate trees each, a prismatic key a tree with a drive, limits and armature:
     one body on the world, or (``based``) a fixed base under it, two bodies; random coordinates in and past the limits."""
-    template = newton.ModelBuilder(gravity=-9.81)
+    template = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     for k in range(keys):
         frame = wp.transform(wp.vec3(0.02 * k, 0.0, 0.1), wp.quat_rpy(0.1 * k, -0.2, 0.3))
         key = wp.transform(wp.vec3(0.0, 0.01, 0.01), wp.quat_rpy(0.2, 0.1 * k, 0.0))
@@ -251,7 +251,7 @@ def _keys(device, *, based, worlds=4, keys=8):
             )
         )
         template.add_articulation(joints)
-    builder = newton.ModelBuilder(gravity=-9.81)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     builder.replicate(template, worlds, spacing=(1.0, 0.0, 0.0))
     model = builder.finalize(device=device)
     rng = np.random.default_rng(5)

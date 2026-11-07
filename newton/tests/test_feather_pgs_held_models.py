@@ -172,7 +172,7 @@ class TestHeldModels(unittest.TestCase):
         for device in _devices():
             for name in ("distance root", "free descendant"):
                 with self.subTest(device=device, joint=name):
-                    builder = newton.ModelBuilder(gravity=0.0)
+                    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
                     body = builder.add_link(mass=1.0, inertia=_INERTIA, xform=wp.transform(wp.vec3(0.0, 0.0, 1.0)))
                     tip = builder.add_link(mass=1.0, inertia=_INERTIA, xform=wp.transform(wp.vec3(0.3, 0.0, 1.0)))
                     if name == "distance root":
@@ -193,7 +193,7 @@ class TestHeldModels(unittest.TestCase):
     def test_a_second_root_in_one_articulation_is_its_own_tree(self):
         """The forest splits an articulation of two free roots into two trees, so the second root's body coasts
         where the articulation's one origin would carry it away (a free body at 0.5 m/s once ended at x = 5.85 m)."""
-        builder = newton.ModelBuilder(gravity=0.0)
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         first = builder.add_link(mass=1.0, inertia=_INERTIA, xform=wp.transform(wp.vec3(0.0, 0.0, 1.0)))
         second = builder.add_link(mass=1.0, inertia=_INERTIA, xform=wp.transform(wp.vec3(1.0, 0.0, 1.0)))
         joints = [builder.add_joint_free(first), builder.add_joint_free(second)]
