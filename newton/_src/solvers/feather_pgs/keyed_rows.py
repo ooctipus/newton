@@ -26,6 +26,7 @@ from .contact_input import ContactInput
 from .contact_laws import CONTACT_LAW, CONTACT_SPIN_ROW, contact_friction
 from .factor.walk import WALK_FRAME, WALK_LINK
 from .field_group import Field, FieldGroup, SolverArrays
+from .forest_plan import JOINT_TOPOLOGY, TopologyPin
 from .friction_patches import PatchRowLaw, patch_row_law, patch_spin_row
 from .kernel_template import substitute
 from .keyed_row_layout import prefix_kernel
@@ -37,7 +38,6 @@ from .row_inputs import ParallelRowInputs, RowArgument
 from .row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
 from .row_laws import ROW_LAW
 from .row_records import UNIT_CONTACT, UNIT_LIMIT, unit_source
-from .step_plan import JOINT_TOPOLOGY, TopologyPin
 
 ROW_MAPS = FieldGroup(
     Field("groups", wp.int32, ("world", "size"), owner="maps"),
@@ -398,7 +398,7 @@ class KeyedRows:
         self.law = patch_row_law(solver)
 
     def validate_notification(self, flags=ModelFlags.ALL):
-        """Refuse a structural change the keyed layout does not survive (:class:`.step_plan.TopologyPin`)."""
+        """Refuse a structural change the keyed layout does not survive (:class:`.forest_plan.TopologyPin`)."""
         self._topology.validate(
             self.solver.model, flags, lambda: direct_topology_plan(self.solver)[0] == self.prefix_layout, "Keyed row"
         )

@@ -31,7 +31,6 @@ import warp as wp
 
 from ...core.execution import Beside
 from ...core.memory import L1_LINE_BYTES, Device, device
-from ...sim import ModelFlags
 from . import cached_state_binding
 from .class_plan import ClassPlan
 from .forest_plan import ForestPlan
@@ -46,7 +45,6 @@ __all__ = [
     "Step",
     "StepPlan",
     "StepSpec",
-    "TopologyPin",
     "kernel_key",
 ]
 
@@ -54,40 +52,6 @@ __all__ = [
 def kernel_key(kernel) -> str | None:
     """A kernel's key (a factory's product without one: its type's name), or ``None`` for no kernel."""
     return None if kernel is None else getattr(kernel, "key", type(kernel).__name__)
-
-
-NUMERIC_PROPERTIES = (
-    ModelFlags.JOINT_DOF_PROPERTIES
-    | ModelFlags.BODY_INERTIAL_PROPERTIES
-    | ModelFlags.SHAPE_PROPERTIES
-    | ModelFlags.MODEL_PROPERTIES
-)
-"""The model notifications that change only numbers (coefficients, limits, inertias, shape materials), never a row
-owner's topology."""
-
-JOINT_TOPOLOGY = ("joint_type", "joint_parent", "joint_child", "joint_q_start", "joint_qd_start", "body_flags")
-"""The structural joint and body arrays every row owner's plan reads."""
-
-
-@dataclass(frozen=True)
-class TopologyPin:
-    """The structural model arrays a row owner's plan was built from, read at construction (:meth:`read`)."""
-
-    names: tuple[str, ...]
-    data: tuple[bytes, ...]
-
-    @classmethod
-    def read(cls, model, names) -> TopologyPin:
-        names = tuple(names)
-        return cls(names, tuple(getattr(model, name).numpy().tobytes() for name in names))
-
-    def validate(self, model, flags, holds, owner: str) -> None:
-        """Refuse a notification beyond :data:`NUMERIC_PROPERTIES` that changes a pinned array or after which the
-        owner's own check ``holds()`` fails; a numeric notification reads nothing back."""
-        if flags and not (int(flags) & ~int(NUMERIC_PROPERTIES)):
-            return
-        if TopologyPin.read(model, self.names) != self or not holds():
-            raise RuntimeError(f"{owner} topology changed; reconstruct the solver")
 
 
 @dataclass(frozen=True)
