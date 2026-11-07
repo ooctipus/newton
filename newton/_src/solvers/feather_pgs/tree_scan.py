@@ -76,7 +76,7 @@ from .device_preludes import DevicePrelude, device_branches
 from .field_group import Field
 from .law_source import law_preludes
 from .spatial_laws import SPATIAL
-from .tree_plan import TreePlan
+from .tree_plan import UP_FIRST, UP_SUMS, TreePlan
 
 __all__ = [
     "ENTER",
@@ -1585,9 +1585,9 @@ class WalkClass:
         steps = len(sequence)
         depth = self.ahead(steps, ahead) if fetch_joint or fetch_step else 0
         name = f"WALK_CLASS_{self.tag}"
-        # Leaf first, a body's join bits: its parent's first child in the walk's order (18), a parent (19).
-        firsts = {} if root_first else {up: b for b, up in enumerate(self.parent)}
-        join = [(firsts.get(up) == b) << 18 | (b in firsts) << 19 for b, up in enumerate(self.parent)]
+        # Leaf first, a body's join bits, the plan's up flags: its parent's first child (18), a parent (19).
+        up_flags = TreePlan.build(self.parent).up_flags if not root_first else np.zeros(len(self.parent), np.int32)
+        join = [bool(f & UP_FIRST) << 18 | bool(f & UP_SUMS) << 19 for f in up_flags]
         flags = [b | (int(first) << 16) | (int(last) << 17) | join[b] for b, _, first, last in sequence]
 
         tables = [
