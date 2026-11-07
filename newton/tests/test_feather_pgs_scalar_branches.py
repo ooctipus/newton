@@ -695,6 +695,33 @@ class TestScalarBranchRule(unittest.TestCase):
                     copy_back,
                 )
 
+    def test_compact_diagonal_responds_by_its_inverse(self):
+        """The compact diagonal's walk is its inverse: the family leaves the walk, its root carries a negative family
+        and its predictor launches no walk solve, while the arm beside it walks; a step stays finite."""
+        model = build_branch_model(worlds=2, kinds=("prismatic", "revolute"), descendant=True)
+        solver = cpu_solver(model)
+        size = branch_size(model)
+        plan = held_plan(solver, size, scalar=False)
+        stars = branch_articulations(model)
+        diagonal = [group for group in plan.groups if group.root_families == (-size,)]
+        self.assertEqual(len(diagonal), 1)
+        np.testing.assert_array_equal(np.sort(diagonal[0].diagonal), stars)
+        self.assertFalse(np.isin(stars, plan.walking).any())
+        arms = np.setdiff1d(np.arange(model.articulation_count), stars)
+        np.testing.assert_array_equal(np.intersect1d(arms, plan.walking), arms)
+        owner = HeldTree(solver, plan)
+        layouts = {group.layout.root_families: group for group in owner.groups}
+        self.assertIsNone(layouts[(-size,)].walk_solve_kernel)
+        self.assertIsNotNone(layouts[(ARM_DOFS,)].walk_solve_kernel)
+        solver.factor.held = owner
+        states = [model.state(), model.state()]
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        for _step in range(3):
+            solver.step(states[0], states[1], model.control(), None, DT)
+            states.reverse()
+        self.assertTrue(np.isfinite(states[0].joint_q.numpy()).all())
+        self.assertTrue(np.isfinite(states[0].joint_qd.numpy()).all())
+
     def test_owner_launches_match_their_kernels(self):
         """Launch every kernel of an owner beside scalar branches with one input of each parameter's type, on CPU.
 
@@ -1585,6 +1612,12 @@ class TestScalarBranchOwner(unittest.TestCase):
         self.assertIsNone(owner.scalar)
         responses = sorted(group._response for group in owner.groups)
         self.assertEqual(responses, ["cholesky", "diagonal"])
+        # The diagonal group's walk is its inverse: the star holds no walk class, its predictor no walk solve.
+        stars = branch_articulations(model)
+        np.testing.assert_array_equal(solver.factor.walk_class_host[stars], -1)
+        diagonal = next(group for group in owner.groups if group._response == "diagonal")
+        self.assertEqual(diagonal.layout.root_families, (-STAR_LEAVES,))
+        self.assertIsNone(diagonal.walk_solve_kernel)
 
 
 if __name__ == "__main__":
