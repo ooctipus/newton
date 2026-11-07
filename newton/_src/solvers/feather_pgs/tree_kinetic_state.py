@@ -1628,46 +1628,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
             widest = sk > widest ? sk : widest;
         }
         const int turns = deepest + widest - 1;
-        #pragma unroll
-        for (int m = 0; m < HOLD_SLOTS; ++m) {
-            rs[m] = 0.0f;
-            lead[m] = deepest - len[m] + rank[m];
-        }
-        #pragma unroll 1
-        for (int T = 0; T < turns; ++T) {
-            #pragma unroll
-            for (int m = 0; m < HOLD_SLOTS; ++m) {
-                const int t = T - lead[m];
-                if (mine[m] && t >= 0 && t < len[m]) {
-                    int c;
-                    float b, ar, g;
-                    WALK_STEP(steps[m] + t, c, b, ar, g);
-                    float& r = rs[m];
-                    $apply_r
-                }
-            }
-            WARP_SYNC();
-        }
-        #pragma unroll
-        for (int m = 0; m < HOLD_SLOTS; ++m) {
-            rs[m] = 0.0f;
-            lead[m] = size[m] - 1 - rank[m];
-        }
-        #pragma unroll 1
-        for (int T = 0; T < turns; ++T) {
-            #pragma unroll
-            for (int m = 0; m < HOLD_SLOTS; ++m) {
-                const int t = len[m] - 1 - (T - lead[m]);
-                if (mine[m] && T >= lead[m] && t >= 0) {
-                    int c;
-                    float b, ar, g;
-                    WALK_STEP(steps[m] + t, c, b, ar, g);
-                    float& r = rs[m];
-                    $apply_rt
-                }
-            }
-            WARP_SYNC();
-        }
+$passes
     };
     // HELD_BUILD(h, parent, first, a, n, nb, data, released, kept): the release of the tree's slips, coordinate-major. The slips are
     // its coordinates whose released stiffness is positive, root-most first (ascending), slip j on lane j % WIDTH in
@@ -1977,6 +1938,28 @@ def border_solve(layout: TreeLayout, classes: tuple) -> str:
     return substitute(text, {**layout.sizes(), "WALK_COORDINATE": WALK_COORDINATE, "WALK_LINK": WALK_LINK})
 
 
+_HELD_PASS = """        #pragma unroll
+        for (int m = 0; m < HOLD_SLOTS; ++m) {
+            rs[m] = 0.0f;
+            lead[m] = $lead;
+        }
+        #pragma unroll 1
+        for (int T = 0; T < turns; ++T) {
+            #pragma unroll
+            for (int m = 0; m < HOLD_SLOTS; ++m) {
+                const int t = $t;
+                if (mine[m] && $guard) {
+                    int c;
+                    float b, ar, g;
+                    WALK_STEP(steps[m] + t, c, b, ar, g);
+                    float& r = rs[m];
+                    $step
+                }
+            }
+            WARP_SYNC();
+        }"""
+
+
 def held_lambdas(layout: TreeLayout, slips: int, half: int = ts.WALK_BOTH) -> str:
     """The border's native lambdas (:data:`_HELD`), both devices, declared once ahead of the trial: the segment's words
     a lane hold the layout's coordinates and bodies (and one past the last body). ``slips`` is the class's slip capacity
@@ -1991,8 +1974,19 @@ def held_lambdas(layout: TreeLayout, slips: int, half: int = ts.WALK_BOTH) -> st
         unpacked=WALK_UNPACKED,
         half=half,
         held_step=ts.statements([*_HELD_COLUMN, "root = c;"], 24),
-        apply_r=ts.statements(ts.slip("R", "u[c]", "r", "b", "ar", "g", "u[c] = {};"), 20),
-        apply_rt=ts.statements(ts.slip("RT", "u[c]", "r", "b", "ar", "g", "u[c] = {};"), 20),
+        passes="\n".join(
+            substitute(
+                _HELD_PASS,
+                lead=lead,
+                t=t,
+                guard=guard,
+                step=ts.statements(ts.slip(kind, "u[c]", "r", "b", "ar", "g", "u[c] = {};"), 20),
+            )
+            for kind, lead, t, guard in (
+                ("R", "deepest - len[m] + rank[m]", "T - lead[m]", "t >= 0 && t < len[m]"),
+                ("RT", "size[m] - 1 - rank[m]", "len[m] - 1 - (T - lead[m])", "T >= lead[m] && t >= 0"),
+            )
+        ),
         build_r=ts.statements(ts.slip("R", "z", "pair[k]", "bk", "ak", "gk", "z = {};"), 28),
         edge_p=ts.statements(_EDGE_UP, 24),
     )

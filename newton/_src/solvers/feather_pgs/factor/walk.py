@@ -643,11 +643,11 @@ _WALK_RELEASE = """    // The slips' release of tree art (WalkRelease, written b
     // $batch: the batch's coordinates and coefficients loaded together, then its entries, then the recurrence in
     // registers, then its stores. A path's coordinates are distinct, so no step's load waits on another step's store
     // (one global round trip a batch, not a step).
-    // WALK_SLIP_T(release, at, u): u <- R_j^T u, root first. WALK_SLIP_IT(release, at, u): u <- R_j^-T u, root first.
-    // WALK_RELEASE_ON(release, art, z, rows, stride, place): a row's footprints z <- R z, the first slip first;
-    // WALK_RELEASE(release, art, z, stride) the same on one row whose coordinate c sits at z[c * stride].
-    // WALK_RELEASE_T(release, art, u): the leave's u <- R^T u, the last slip first.
-    // WALK_RELEASE_IT(release, art, u): the audit's coordinates u <- R^-T u, the first slip first.
+    // WALK_SLIPS(release, art, back, slip): slip(at) at each of tree art's slips' records, the first slip first (back:
+    // the last first). WALK_RELEASE_ON(release, art, z, rows, stride, place): a row's footprints z <- R z, the first slip
+    // first; WALK_RELEASE(release, art, z, stride) the same on one row whose coordinate c sits at z[c * stride].
+    // WALK_RELEASE_T(release, art, u): the leave's u <- R^T u, the last slip first, each R_j^T root first.
+    // WALK_RELEASE_IT(release, art, u): the audit's coordinates u <- R^-T u, the first slip first, each R_j^-T root first.
     const auto WALK_SLIP_ON = [&](const auto& release, const size_t at, float* z, const int rows, const int stride,
                                   auto&& place) {
         const int steps = release.step.shape[2];
@@ -691,32 +691,28 @@ _WALK_RELEASE = """    // The slips' release of tree art (WalkRelease, written b
                 if (cq[q] >= 0) u[cq[q]] = x[q];
         }
     };
-    const auto WALK_SLIP_T = [&](const auto& release, const size_t at, float* u) {
-        WALK_SLIP_BACK(release, at, u, [](const float v, float& t, const float b, const float a, const float g) {
-            $slip_t
-        });
-    };
-    const auto WALK_SLIP_IT = [&](const auto& release, const size_t at, float* u) {
-        WALK_SLIP_BACK(release, at, u, [](const float v, float& t, const float b, const float a, const float g) {
-            $slip_it
-        });
+    const auto WALK_SLIPS = [&](const auto& release, const int art, const bool back, auto&& slip) {
+        const int cap = release.step.shape[1], steps = release.step.shape[2];
+        if (back)
+            for (int j = release.count.data[art] - 1; j >= 0; --j) slip(((size_t)art * cap + j) * steps);
+        else
+            for (int j = 0; j < release.count.data[art]; ++j) slip(((size_t)art * cap + j) * steps);
     };
     const auto WALK_RELEASE_ON = [&](const auto& release, const int art, float* z, const int rows, const int stride,
                                      auto&& place) {
-        const int cap = release.step.shape[1], steps = release.step.shape[2];
-        for (int j = 0; j < release.count.data[art]; ++j)
-            WALK_SLIP_ON(release, ((size_t)art * cap + j) * steps, z, rows, stride, place);
+        WALK_SLIPS(release, art, false, [&](const size_t at) { WALK_SLIP_ON(release, at, z, rows, stride, place); });
     };
     const auto WALK_RELEASE = [&](const auto& release, const int art, float* z, const int stride = 1) {
         WALK_RELEASE_ON(release, art, z, 1, 0, [&](const int c) { return c * stride; });
     };
-    const auto WALK_RELEASE_T = [&](const auto& release, const int art, float* u) {
-        const int cap = release.step.shape[1], steps = release.step.shape[2];
-        for (int j = release.count.data[art] - 1; j >= 0; --j) WALK_SLIP_T(release, ((size_t)art * cap + j) * steps, u);
-    };
-    const auto WALK_RELEASE_IT = [&](const auto& release, const int art, float* u) {
-        const int cap = release.step.shape[1], steps = release.step.shape[2];
-        for (int j = 0; j < release.count.data[art]; ++j) WALK_SLIP_IT(release, ((size_t)art * cap + j) * steps, u);
+$back"""
+
+_RELEASE_BACK = """    const auto $name = [&](const auto& release, const int art, float* u) {
+        WALK_SLIPS(release, art, $back, [&](const size_t at) {
+            WALK_SLIP_BACK(release, at, u, [](const float v, float& t, const float b, const float a, const float g) {
+                $step
+            });
+        });
     };"""
 
 
@@ -766,8 +762,10 @@ def _release_text(rows: int) -> str:
         rows=rows,
         batch=WALK_SLIP_BATCH,
         slip_on=ts.statements(ts.slip("R", "z[e + r * stride]", "s[r]", "b", "a", "g", "z[e + r * stride] = {};"), 16),
-        slip_t=ts.statements(ts.slip("RT", "v", "t", "b", "a", "g", "return {};"), 12),
-        slip_it=ts.statements(ts.slip("RIT", "v", "t", "b", "a", "g", "return {};"), 12),
+        back="\n".join(
+            substitute(_RELEASE_BACK, name=name, back=back, step=ts.statements(ts.slip(kind, "v", "t", "b", "a", "g", "return {};"), 16))
+            for name, back, kind in (("WALK_RELEASE_T", "true", "RT"), ("WALK_RELEASE_IT", "false", "RIT"))
+        ),
     )
 
 
