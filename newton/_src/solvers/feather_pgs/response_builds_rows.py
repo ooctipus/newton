@@ -29,9 +29,9 @@ from .row_records import DenseRows
 @wp.struct
 class RowRecords:
     """Where a line's rows' records sit (:func:`.row_metadata.record_layout`: ``record`` from row ``first``, the free
-    rows' headers from row ``base`` at word ``free``), which worlds' a sweep reads (:func:`swept`: ``skip_rows``,
-    ``speed``, ``speed_first``, ``mf_count``) and each articulation's first world coordinate and coordinates
-    (``offset``, ``dofs``)."""
+    rows' headers from row ``base`` at word ``free``), which worlds' a sweep reads (:func:`swept`: ``count``,
+    ``skip_rows``, ``speed``, ``speed_first``, ``mf_count``) and each articulation's first world coordinate and
+    coordinates (``offset``, ``dofs``)."""
 
     record: wp.array2d[wp.int32]
     first: int
@@ -39,6 +39,7 @@ class RowRecords:
     free: int
     skip_rows: int
     speed: int
+    count: wp.array[int]
     mf_count: wp.array[int]
     speed_first: wp.array[int]
     offset: wp.array[int]
@@ -108,11 +109,12 @@ def record_at(records: RowRecords, line: int, slot: int) -> int:
 
 
 @wp.func
-def swept(records: RowRecords, world: int, count: int) -> bool:
-    """Whether the matrix-free sweep visits ``world`` (``count`` dense rows): every world but the tiers'
-    (:func:`.sweep_levels.claim_worlds`' predicate)."""
+def swept(records: RowRecords, world: int) -> bool:
+    """Whether the matrix-free sweep visits ``world``: every world but the tiers' (:func:`.sweep_levels.claim_worlds`'
+    predicate)."""
     if records.mf_count[world] > 0:
         return True
+    count = records.count[world]
     if wp.min(count, records.base) > records.skip_rows:
         return True
     return records.speed != 0 and count > records.speed_first[world]
@@ -172,11 +174,13 @@ def store_row_record_of(
 
 
 @wp.func
-def store_record_parent(records: RowRecords, line: int, slot: int, parent: int):
-    """Store row ``slot``'s linked ``parent`` (a line row) in its record's kind and parent word, where it has a record:
-    the patch link's, after the row's writer stored the rest."""
+def store_record_parent(records: RowRecords, world: int, line: int, slot: int, parent: int):
+    """Store row ``slot``'s linked ``parent`` (a line row) in its record's kind and parent word, where it has a record
+    a sweep reads (:func:`swept`): the patch link's, after the row's writer stored the rest."""
     at = record_at(records, line, slot)
     if at < 0:
+        return
+    if not swept(records, world):
         return
     stored = parent
     if slot >= records.base:
@@ -201,6 +205,7 @@ def bind_row_records(placement) -> RowRecords:
     records.free = int(placement.free_records)
     records.skip_rows = int(placement.record_skip_rows)
     records.speed = int(placement.record_speed_rows)
+    records.count = placement.constraint_count
     records.mf_count = placement.mf_constraint_count
     records.speed_first = placement.speed_first
     records.offset = placement.forest.articulation_world_dof_offset

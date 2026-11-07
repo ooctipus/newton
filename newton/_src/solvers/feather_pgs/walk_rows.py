@@ -415,7 +415,7 @@ def walked_rows_kernel(
         # Whether this launch stores the world's records, read before the rows (its loads overlap the walk).
         stores = bool(False)
         if wp.static(records):
-            stores = part != WRITE_TOPOLOGY and swept(row_records, world, counts[world])
+            stores = part != WRITE_TOPOLOGY and swept(row_records, world)
         # The part's rows: the topology's below the family bound (the count is not final before the contact pass),
         # the rest above it.
         first = int(0)

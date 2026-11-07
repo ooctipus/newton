@@ -1764,7 +1764,7 @@ def _link_contact(
         row = patches.next_contact[row]
     line = first[world[c]]
     parents[line, slot[c]] = next_slot
-    store_record_parent(records, line, slot[c], next_slot)
+    store_record_parent(records, world[c], line, slot[c], next_slot)
 
 
 @wp.kernel(enable_backward=False)
