@@ -70,7 +70,7 @@
   "row_kernels.write_link_rows": "f5ce719eb927f9c265440aea7e841d164186b8c073c3f26192c0e05f20b63b1a",
   "row_slots.allocate_world_contact_slots": "9d469410adbe6a41a5370724a8dea9e58e2ea765a7d5d5e23db47272f1a99faf",
   "row_slots.finalize_constraint_counts_with_status": "8f04d6eaacfb824d56e65b10d1f9db92df86ff8d88c0f69cc8f7994ab39ef9b6",
-  "row_slots.place_world_contact_runs": "d0b206b9cc2cccbff8d81be83d24e98c646e9b889c27adfaa0dacd052f9fc440",
+  "row_slots.place_world_contact_runs": "87a2fc7585a9d66ea38184fbaeda03bf7a9c715d82550d3988ce0306081fa7fe",
   "row_slots.record_world_contact_runs": "fdf713511e987e2a8f21bd6a993b3ab15a2d19df464fd689a7cc77e1c0dee333",
   "row_slots.snapshot_dense_phase_bound": "fb7998263b6ce69d3852805b4c71192e395e6f0492d6bf53106087b4437d9529",
   "solve_policy.count_skipped_solves": "a16b7c113814e0d314a65dd57ba2d16081cba4fafaff15514498b8746eb4d0b9",

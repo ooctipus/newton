@@ -9,7 +9,7 @@ import warp as wp
 from .contact_filters import contact_normal_gap_limit
 from .contact_input import ContactInput
 from .contact_laws import contact_endpoints, contact_points, contact_responds
-from .device_preludes import dual_native, lane_group, reserve, reserved_count, warp_scan, warp_sum, warp_sync
+from .device_preludes import dual_native, lane_group, lane_scan, lane_sum, lane_sync, reserve, reserved_count
 from .friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, patch_spin_rows
 from .row_records import UNIT_CONTACT, unit_source
 
@@ -458,8 +458,8 @@ def place_world_contact_runs(
                         dense = needed
                     if (path == 1 or free) and place_mf:
                         mf = needed
-            dense_below = warp_scan(dense)
-            mf_below = warp_scan(mf)
+            dense_below = lane_scan(dense, 32)
+            mf_below = lane_scan(mf, 32)
             if dense > 0:
                 contact_slot[c] = next_dense + dense_below
                 if units.shape[0] > 0:
@@ -470,10 +470,10 @@ def place_world_contact_runs(
                 if free_line != 0 and units.shape[0] > 0:
                     for r in range(mf):
                         units[dense_first[world], next_mf + mf_below + r] = unit_source(UNIT_CONTACT, 4 * c + r)
-            next_dense += warp_sum(dense)
-            next_mf += warp_sum(mf)
+            next_dense += lane_sum(dense, 32)
+            next_mf += lane_sum(mf, 32)
     # Every lane has read the records before any is reset.
-    warp_sync()
+    lane_sync(32)
     for block in range(lane, blocks, lanes):
         run_first[world, block] = _CONTACT_RUN_EMPTY
         run_last[world, block] = -1
