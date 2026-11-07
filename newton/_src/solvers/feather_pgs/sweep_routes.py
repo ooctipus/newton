@@ -280,11 +280,8 @@ def free_body_rows(lanes: Lanes, support: int | str = 12) -> SparseFactor:
     )
 
 
-BLOCK_WARPS = 2
-"""Warps of the warp mapping's block where their worlds' working sets fit (:attr:`GeneralSweep.block_warps`)."""
-
-WARP_LINE = 64
-"""Its register line then: the sparse sweeps' (:data:`.sweep_routes_sparse.REGISTER_LINE`), 32 warps resident."""
+BLOCK_WARPS, WARP_LINE = 2, 64
+"""The warp mapping's block where its worlds' stages fit, and its register line then (the sparse sweeps')."""
 
 COLORED_THREADS = 256
 """Threads of a colored world's block: a color's units beyond them run in turns."""
@@ -661,9 +658,8 @@ def _colored_metrics(units: int, *, torsion: bool = False) -> str:
 
 
 def world_lanes(support: int, *, free_rows: bool) -> int:
-    """The warp mapping's lanes a world (switch 2): the power of two over its rows' widest ``support``, 8 at least, and
-    16 with the free bodies' run (a free row's 6 + 6 entries a lane each), so several worlds share a warp; a lane holds
-    at most one entry of a row up to a warp's 32."""
+    """A world's lanes (switch 2): the power of two over its rows' widest ``support``, 8 at least, 16 with the free
+    bodies' run (6 + 6 entries a row), up to a warp's 32: a lane holds at most one entry of a row."""
     lanes = 8 if support <= 8 else 16 if support <= 16 else 32
     return max(lanes, 16) if free_rows else lanes
 
@@ -710,18 +706,11 @@ def mf_gs_staging(
 
 
 def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
-    """The native body of the matrix-free Gauss-Seidel sweep: a world's dense rows (:func:`packed_operator`, packed
-    whitened rows of ``max_row_dofs`` entries, by default as many as the world's coordinates) and its free-body rows
-    (:func:`free_body_rows`), then its end-of-sweep passes, on the world's velocity change from the predictor in walk
-    coordinates (:class:`FreeBodyCoordinates`), from zero, or with ``seeded`` from the response of the impulses the
-    rows carry (:func:`.sweep.impulse_seed`). The launch adds it to the walk's ``du`` (:attr:`.factor.walk.WalkTrees.du`),
-    which the step's one leave walks down onto ``v_out`` (:func:`.factor.walk.walk_leave_kernel`); a free body's speed
-    row reads the body's velocity through its walk (:class:`FreeBodyCoordinates`).
-
-    Every switch is the configuration's (:class:`GeneralSweep`).
-
-    Returns the body and its staging.
-    """
+    """The native body of the matrix-free Gauss-Seidel sweep and its staging: a world's dense rows
+    (:func:`packed_operator`) and free-body rows (:func:`free_body_rows`), then its end-of-sweep passes, on the world's
+    velocity change in walk coordinates (:class:`FreeBodyCoordinates`), from zero or ``seeded``
+    (:func:`.sweep.impulse_seed`), added to the walk's ``du`` for the step's one leave. Every switch is the
+    configuration's (:class:`GeneralSweep`)."""
     places, solve_policy = sweep.places, sweep.solve_policy
     contact_torsion, seeded, wide_rows = sweep.torsion, sweep.seeded, sweep.wide_rows
     free_rows, speed_rows, max_row_dofs = sweep.free_rows, sweep.speed_rows, sweep.max_row_dofs
@@ -1009,21 +998,18 @@ class GeneralSweep(SweepConfig):
 
     Its switches, each the plan's from the class's shape, the placement and the laws (:meth:`.sweep_plan.Sweep.build`):
 
-    - the free bodies' level law (``levels``, :class:`.sweep.LevelLaw`): sequential, the world's warp visits its rows
-      in row order; exact (colored), a block visits the free bodies' colors in order and a color's units at once (the
-      unit builder's rule picks the worlds, :class:`.sweep_units.ColoredRule`);
+    - the free bodies' level law (``levels``): sequential, or exact (colored: a block a world, a color's units at once,
+      the worlds :class:`.sweep_units.ColoredRule` picks);
     - the row record: ``places`` (:class:`RowPlaces`, the plan's storage choice): the dense rows' metadata staged or
       their records streamed; the free rows' records always stream;
-    - the enumeration: ``active_rows``, the dense rows a sweep visits selected at its entry (the warp mapping's,
-      :func:`.sweep.active_scan`), else every row in slot order;
+    - the enumeration: ``active_rows`` (:func:`.sweep.active_scan`), else every row in slot order;
     - the support class: ``max_row_dofs`` (the placement's packed support), ``support_classes`` (the rows' sides by
       their classes, :func:`.packed_rows.row_classes`), ``wide_rows`` (the bilateral block's), and the free bodies' 6 +
       6 class: ``free_rows`` their own run, else rows of the line, their ``speed_rows`` the line's last;
     - ``has_dense_velocity_limit_rows``: the velocity limits' last word; ``seeded``: the seed; ``pitch``: the line.
 
-    The warp mapping is ``lanes_per_world`` lanes a world in blocks of ``block_warps`` warps on CUDA and one thread on
-    the CPU (:meth:`work`); the colored one a block of :data:`COLORED_THREADS`. Each walks its bucket of the claims'
-    worlds (:func:`worlds`).
+    The warp mapping: ``lanes_per_world`` lanes a world in blocks of ``block_warps`` warps (one thread on the CPU); the
+    colored one a block of :data:`COLORED_THREADS`. Each walks its claim's bucket (:func:`worlds`).
     """
 
     max_constraints: int

@@ -72,7 +72,7 @@ _COLORED = {
     "lanes_per_world": 32,
     "block_warps": 1,
 }
-"""The colored mapping's fields over the warp mapping's: every dense row in turn, a world a block of whole warps."""
+"""The colored mapping's fields over the warp mapping's."""
 
 SPARSE_ROWS = FieldGroup(
     Field("sparse_row_dof", wp.int32, ("index_world", "index_row", "index_support"), fill=None, owner="placement"),
@@ -469,11 +469,8 @@ class Sweep:
             self.record_lanes = min(256, 32 * -(-self.placement.row_pitch // 256))
             threads = max(int(model.device.sm_count), 1) * 512
             self.record_grid = min(self.forest.world_count, max(threads // self.record_lanes, 1))
-            # The general sweep's warp mapping: its places the storage's, its rows the placement's; a world's lanes
-            # from its rows' widest support (sweep_routes.world_lanes) where a warp's worlds' stages fit, two warps a
-            # block where theirs do; the native sparse sweep's rule for the enumeration and the contact units (small
-            # worlds keep the full ordered sweep of ordinary updates at their packed lanes; others select their rows
-            # at sweep entry where the bitsets fit and visit a contact's rows as one unit).
+            # The warp mapping: the storage's places, the placement's rows, lanes by the rows' support where a warp's
+            # stages fit (two warps a block where theirs do), the sparse sweep's rule for the enumeration and units.
             budget = arch_budget(device_arch)
             staging = functools.partial(
                 sweep_routes.mf_gs_staging,
