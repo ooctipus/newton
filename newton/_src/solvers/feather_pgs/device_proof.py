@@ -21,6 +21,7 @@ keep them across later notifications that change nothing.
 
 import hashlib
 
+import numpy as np
 import warp as wp
 
 
@@ -96,6 +97,9 @@ class DeviceProof:
             self._sums = wp.zeros(2 * len(views), dtype=wp.uint32, device=device)
             self._sizes = wp.array([view.shape[0] for view in views], dtype=int, device=device)
             self._threads = -(-max(view.shape[0] for view in views) // _WORDS_PER_THREAD)
+            # Each view's address, uploaded again only when an array moved (a notification allocates nothing).
+            self._addresses = [view.ptr for view in views]
+            self._words_at = wp.array(self._addresses, dtype=wp.uint64, device=device)
             self._frozen = self._checksums(views)
 
     @staticmethod
@@ -111,12 +115,15 @@ class DeviceProof:
 
     def _checksums(self, views):
         """One launch over every view on the caller's stream, then one readback."""
-        words = wp.array([view.ptr for view in views], dtype=wp.uint64, device=self.device)
+        addresses = [view.ptr for view in views]
+        if addresses != self._addresses:
+            self._addresses = addresses
+            self._words_at.assign(np.array(addresses, dtype=np.uint64))
         self._sums.zero_()
         wp.launch(
             _checksum_words,
             dim=self._threads,
-            inputs=[words, self._sizes, self._threads, self._sums],
+            inputs=[self._words_at, self._sizes, self._threads, self._sums],
             device=self.device,
         )
         return self._sums.numpy().tolist()
