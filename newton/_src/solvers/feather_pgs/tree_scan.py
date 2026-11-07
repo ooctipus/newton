@@ -4,10 +4,10 @@
 """One scan skeleton for every tree pass: ``tree_scan(plan, combine, direction, schedule)``.
 
 Every dynamics pass walks a joint forest the same way: root to leaf
-composing a parent's value with a node's own (poses, twists), leaf to root
-summing a subtree's values (wrenches, composite inertia), or from a node up
-its root path. The passes differ in three things, which are this module's
-arguments; the plan (:class:`.tree_plan.TreePlan`) supplies the rest:
+composing a parent's value with a node's own (poses, twists), or leaf to
+root summing a subtree's values (wrenches, composite inertia). The passes
+differ in three things, which are this module's arguments; the plan
+(:class:`.tree_plan.TreePlan`) supplies the rest:
 
 ``combine`` (:class:`Combine`)
     The associative operator and the node value it acts on:
@@ -20,16 +20,14 @@ arguments; the plan (:class:`.tree_plan.TreePlan`) supplies the rest:
     ``DOWN``: every node's value becomes ``combine(parent's result, node's
     own)``, an inclusive prefix along its root path. ``UP`` (additive
     combines): every node's value becomes its own plus its children's results,
-    the subtree sum. ``PATH``: a loop over a node's root path, root first,
-    whose body the pass writes (Jacobian columns, inertia entries); ancestry
-    is a depth-first interval test, not a parent-pointer walk.
+    the subtree sum.
 ``schedule`` (:class:`Schedule`)
     How the lanes of one tree's group share the work:
 
     ============  ======================================================  ==========
     schedule      mapping                                                 direction
     ============  ======================================================  ==========
-    SERIAL        one thread, parent-first order (reversed for UP)        all
+    SERIAL        one thread, parent-first order (reversed for UP)        DOWN, UP
     LEVEL         lanes stride each depth level, a barrier per level      DOWN, UP
     JUMP_SMEM     a lane per node, pointer jumping through memory         DOWN
     JUMP_SHFL     a lane per node, pointer jumping through shuffles       DOWN
@@ -140,8 +138,6 @@ class Direction(enum.Enum):
     """Root to leaf: each node's result composes its parent's result with its own value."""
     UP = "up"
     """Leaf to root: each node's result adds its children's results to its own value."""
-    PATH = "path"
-    """A node's root path, the node first: a loop whose body the pass writes."""
 
 
 class Schedule(enum.Enum):
@@ -158,7 +154,6 @@ class Schedule(enum.Enum):
 _DIRECTIONS = {
     Direction.DOWN: (Schedule.SERIAL, Schedule.LEVEL, Schedule.JUMP_SMEM, Schedule.JUMP_SHFL, Schedule.HEAVY_CHAIN),
     Direction.UP: (Schedule.SERIAL, Schedule.LEVEL, Schedule.HEAVY_CHAIN, Schedule.DFS_INTERVAL),
-    Direction.PATH: (Schedule.SERIAL,),
 }
 
 
@@ -288,7 +283,6 @@ class PlanAccess:
     level_node: str | None = "plan.level_nodes.data[{entry}]"
     dfs_node: str = "plan.dfs_order.data[{position}]"
     dfs_end: str = "plan.dfs_end.data[{position}]"
-    dfs_position: str = "plan.dfs_position.data[{node}]"
     chain_meta: str = "plan.chain_meta.data[5*{lane}+{field}]"
     light_begin: str = "plan.light_offsets.data[{node}]"
     light_end: str = "plan.light_offsets.data[{node}+1]"
@@ -481,7 +475,7 @@ def choose_schedule(
         raise ValueError(f"Unknown direction {direction}")
     if direction is Direction.UP and not combine.additive:
         raise ValueError("A leaf-to-root scan sums its values: it takes an additive combine")
-    if not cuda or direction is Direction.PATH or plan.max_depth == 0:
+    if not cuda or plan.max_depth == 0:
         return Schedule.SERIAL
     costs = schedule_costs(plan, direction, combine, lanes=lanes, chains=chains)
     return min(costs, key=costs.get)
@@ -845,18 +839,6 @@ def _interval_up(c: _Context) -> str:
 """
 
 
-def _path(c: _Context, visit: str) -> str:
-    # The depth-first positions up to the node's, root first: an ancestor's subtree interval holds the node's
-    # position. Independent loads where a parent-pointer walk waits on each.
-    return f"""    const int here={c.access.dfs_position.format(node="node")};
-    for(int position=0;position<=here;++position) {{
-        if(here>={c.access.dfs_end.format(position="position")})continue;
-        const int ancestor={c.access.dfs_node.format(position="position")};
-{visit}
-    }}
-"""
-
-
 _SCHEDULES = {
     (Direction.DOWN, Schedule.SERIAL): _serial_down,
     (Direction.UP, Schedule.SERIAL): _serial_up,
@@ -884,7 +866,6 @@ def tree_scan(
     channel_lanes: bool = False,
     source: str | None = None,
     sink: str | None = None,
-    visit: str | None = None,
     cpu: bool = True,
 ) -> ScanSource:
     """Generate the native scan of ``combine`` over ``plan`` in ``direction`` on ``schedule``.
@@ -892,7 +873,7 @@ def tree_scan(
     Args:
         plan: The tree; its sizes become literals unless ``sizes`` names them.
         combine: The operator and its value's channel groups.
-        direction: ``DOWN``, ``UP`` or ``PATH``.
+        direction: ``DOWN`` or ``UP``.
         schedule: The CUDA schedule; the CPU twin is always SERIAL.
         storage: Slots of the node values (every schedule but a register one with a source and a sink).
         access: Plan array expressions (default: a :class:`ScanPlan` named ``plan``).
@@ -907,7 +888,6 @@ def tree_scan(
             nodes in order, no barrier: a lane owns the same channels of every node).
         source: A register schedule's own-value fragment (``{value}``, ``{node}``) in place of a load.
         sink: A register schedule's result fragment (``{value}``, ``{node}``) in place of a store.
-        visit: PATH only: the loop body, with ``ancestor`` the visited node and ``node`` the start.
         cpu: Emit the serial CPU twin; ``False`` leaves the CPU branch empty (a CUDA-only scan).
 
     Returns:
@@ -945,11 +925,6 @@ def tree_scan(
         sink=sink,
         channel_lanes=channel_lanes,
     )
-    if direction is Direction.PATH:
-        if visit is None:
-            raise ValueError("A path scan takes the visit of each ancestor")
-        text = "{\n" + _path(context, visit) + "}\n"
-        return ScanSource(text, text, (), schedule)
     cuda = "{\n" + _SCHEDULES[(direction, schedule)](context) + "}\n"
     serial = "{\n" + (_serial_down if direction is Direction.DOWN else _serial_up)(context) + "}\n" if cpu else ""
     preludes = combine.preludes()

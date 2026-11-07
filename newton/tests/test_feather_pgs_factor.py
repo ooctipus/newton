@@ -43,7 +43,7 @@ from newton._src.core import memory
 from newton._src.sim.enums import JointType
 from newton._src.solvers.feather_pgs import field_group, tree_kinetic_plan, tree_kinetic_state
 from newton._src.solvers.feather_pgs import tree_scan as ts
-from newton._src.solvers.feather_pgs.device_preludes import DevicePrelude, dual_native, lane_group, substitute
+from newton._src.solvers.feather_pgs.device_preludes import DevicePrelude, substitute
 from newton._src.solvers.feather_pgs.device_proof import _WORDS_PER_THREAD, DeviceProof
 from newton._src.solvers.feather_pgs.factor import kernels as factor_kernels
 from newton._src.solvers.feather_pgs.factor import walk as factor_walk
@@ -532,54 +532,7 @@ class TestScheduleRule(unittest.TestCase):
             ts.tree_scan(plan, ts.TRANSFORM, ts.Direction.DOWN, ts.Schedule.DFS_INTERVAL)
 
 
-# ---------------------------------------------------------------------------------------------------------------------
-# The root path
-# ---------------------------------------------------------------------------------------------------------------------
-
-
-def check_path(test, device):
-    """A PATH visits a node's ancestors and the node, root first (parent-first plans and others), against the
-    parent pointers."""
-    for shape in ("random24", "binary31", "star32", "chain32", "humanoid44", "random60"):
-        parent = np.asarray(SHAPES[shape])
-        # The same tree with its nodes renumbered so that children precede parents.
-        reverse = np.where(parent[::-1] >= 0, parent.size - 1 - parent[::-1], -1)
-        for label, parents in (("parent-first", parent), ("children first", reverse)):
-            plan = TreePlan.build(parents)
-            n = plan.count
-            expected = np.zeros((n, n), np.int32)
-            for node in range(n):
-                path, a = [], node
-                while a >= 0:
-                    path.append(a)
-                    a = parents[a]
-                expected[node, path[::-1]] = np.arange(1, len(path) + 1)
-            scan = ts.tree_scan(
-                plan,
-                ts.add(ts.Group("v", 1)),
-                ts.Direction.PATH,
-                ts.Schedule.SERIAL,
-                visit="        visits.data[node*count+ancestor]=++rank;",
-            )
-
-            @wp.func_native("    int rank=0;\n" + dual_native(scan.text, preludes=(lane_group(1), *scan.preludes)))
-            def native_path(plan: ts.ScanPlan, node: int, count: int, visits: wp.array[int]): ...
-
-            def run(plan: ts.ScanPlan, count: int, visits: wp.array[int]):
-                native_path(plan, wp.tid(), count, visits)
-
-            visits = wp.zeros(n * n, dtype=int, device=device)
-            kernel = wp.kernel(enable_backward=False, module="unique")(run)
-            wp.launch(kernel, n, inputs=[ts.device_plan(plan, device), n, visits], device=device)
-            np.testing.assert_array_equal(visits.numpy().reshape(n, n), expected, err_msg=f"native {shape} {label}")
-
-
-class TestPath(unittest.TestCase):
-    pass
-
-
 add_function_test(TestHeldTreePasses, "test_held_passes", check_held_passes, devices=get_test_devices())
-add_function_test(TestPath, "test_path", check_path, devices=get_test_devices())
 
 
 # =====================================================================================================================
