@@ -513,7 +513,6 @@ class _Context:
     level_csr: bool
     source: str | None
     sink: str | None
-    channel_lanes: bool = False
 
     def slot(self, group: Group, node: str, k: int | str) -> str:
         if self.storage is None:
@@ -598,12 +597,10 @@ def _serial_down(c: _Context) -> str:
 
 def _serial_up(c: _Context) -> str:
     order = "index" if c.order is None else c.order.format(index="index")
-    # With channel lanes, each lane owns the same channels of every node: no lane waits for another.
-    first, step = ("LANE", "k+=STRIDE") if c.channel_lanes else ("0", "++k")
     adds = "".join(
         _guarded(
             group,
-            f"for(int k={first};k<{group.channels};{step}){c.slot(group, 'parent', 'k')}+={c.slot(group, 'node', 'k')};",
+            f"for(int k=0;k<{group.channels};++k){c.slot(group, 'parent', 'k')}+={c.slot(group, 'node', 'k')};",
         )
         for group in c.combine.groups
     )
@@ -861,7 +858,6 @@ def tree_scan(
     lanes: int | str = 32,
     sizes: dict[str, str] | None = None,
     level_csr: bool | None = None,
-    channel_lanes: bool = False,
     source: str | None = None,
     sink: str | None = None,
     cpu: bool = True,
@@ -882,8 +878,6 @@ def tree_scan(
             load per lane and level instead of three dependent ones: measured 1-24% faster on the 13 trees of
             up to 32 nodes and 3-8% on 40- and 64-joint chains, where the CSR measured up to 13% faster on
             bushy trees of 44-63 nodes over two warps (RTX PRO 6000).
-        channel_lanes: SERIAL UP only: the lane group strides an additive value's channels (one tree per group,
-            nodes in order, no barrier: a lane owns the same channels of every node).
         source: A register schedule's own-value fragment (``{value}``, ``{node}``) in place of a load.
         sink: A register schedule's result fragment (``{value}``, ``{node}``) in place of a store.
         cpu: Emit the serial CPU twin; ``False`` leaves the CPU branch empty (a CUDA-only scan).
@@ -898,8 +892,6 @@ def tree_scan(
         raise ValueError("A leaf-to-root scan sums its values: it takes an additive combine")
     if combine.additive and (combine.zero_acceleration):
         raise ValueError("An additive combine has no bias acceleration")
-    if channel_lanes and not (combine.additive and schedule is Schedule.SERIAL and direction is Direction.UP):
-        raise ValueError("Lanes over channels serve the serial sum of an additive combine")
     sizes = dict(sizes or {})
     nodes = sizes.get("nodes", str(plan.count))
     if level_csr is None:
@@ -921,7 +913,6 @@ def tree_scan(
         level_csr=level_csr,
         source=source,
         sink=sink,
-        channel_lanes=channel_lanes,
     )
     cuda = "{\n" + _SCHEDULES[(direction, schedule)](context) + "}\n"
     serial = "{\n" + (_serial_down if direction is Direction.DOWN else _serial_up)(context) + "}\n" if cpu else ""
