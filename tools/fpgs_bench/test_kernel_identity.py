@@ -81,6 +81,26 @@ class TestKernelIdentity(unittest.TestCase):
             self.assertEqual(identity.report(parent, _record(b=("1", "c", "p"))), 1)
         self.assertIn("changed (hash only, generated code identical): a", output.getvalue())
 
+    def test_records_by_key_match_renamed_calls(self):
+        """Match a factory's renamed calls by the kernels they build: one row a kernel key, rejections by summary."""
+
+        def row(key, digest):
+            return {"key": key, "hash": digest}
+
+        parent = {
+            "kernels": {"old(1)": row("k", "1"), "old(2)": row("k", "1"), "pin": row("p", "2")},
+            "rejected": {"old [census]": "2 rejected, labels 0123: 2 x ValueError: a"},
+        }
+        child = {
+            "kernels": {"New(1)": row("k", "1"), "pin": row("p", "2")},
+            "rejected": {"New [census]": "2 rejected, labels 4567: 2 x ValueError: a"},
+        }
+        self.assertEqual(identity.by_key(parent)["kernels"], {"k": row("k", "1"), "p": row("p", "2")})
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(identity.report(identity.by_key(parent), identity.by_key(child), ("hash",)), 0)
+            moved = {**child, "kernels": {"New(1)": row("k", "3"), "pin": row("p", "2")}}
+            self.assertEqual(identity.report(identity.by_key(parent), identity.by_key(moved), ("hash",)), 1)
+
     def test_report_claims_identical_code_only_when_compared(self):
         """Name a hash change of records without code digests as not compared, not as identical code."""
         parent, child = {"kernels": {"a": {"hash": "1"}}}, {"kernels": {"a": {"hash": "2"}}}

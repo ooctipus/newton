@@ -45,7 +45,8 @@ Run from the root of a Newton checkout with the import-time switches
     python tools/fpgs_bench/kernel_identity.py record parent.json --root /path/to/parent
     python tools/fpgs_bench/kernel_identity.py diff parent.json child.json
 
-``--root`` imports Newton from another checkout, for example a ``git archive``
+``diff --by key`` matches the two records' kernels by kernel key (name) instead of call label, for a refactor that
+renames the factories or their arguments but builds the same kernels. ``--root`` imports Newton from another checkout, for example a ``git archive``
 of the parent commit, so one copy of this script records both sides.
 """
 
@@ -824,6 +825,26 @@ def compare(parent, child, columns=COLUMNS):
     }
 
 
+def by_key(record):
+    """The record with its kernels keyed by the kernel's key (its name) in place of the call's label, and its
+    rejections by their summary without the labels' digest: a refactor that renames factories or their arguments
+    (the calls) but builds the same kernels compares equal. Calls that build one kernel (one content hash) collapse
+    into one row, the first label's; a key two calls build with different hashes keeps both, the second as
+    ``key#2``."""
+    kernels = {}
+    for label in sorted(record["kernels"]):
+        row = record["kernels"][label]
+        key, index = row["key"], 1
+        while key in kernels and kernels[key]["hash"] != row["hash"]:
+            index += 1
+            key = f"{row['key']}#{index}"
+        kernels[key] = row
+    rejected = collections.Counter(
+        re.sub(r", labels [0-9a-f]+:", ":", text) for text in record.get("rejected", {}).values()
+    )
+    return {**record, "kernels": kernels, "rejected": {f"{text} [x{count}]": text for text, count in rejected.items()}}
+
+
 def report(parent, child, columns=COLUMNS):
     """Print the comparison; return 1 when a shared kernel changed or went uncompared, or a kernel disappeared."""
     for field in ("warp", "hash_seed", "switches", "families", "select", "codegen"):
@@ -872,6 +893,12 @@ def main(argv=None):
     diff_parser.add_argument("parent")
     diff_parser.add_argument("child")
     diff_parser.add_argument(
+        "--by",
+        choices=("label", "key"),
+        default="label",
+        help="match the records' kernels by call label (default) or by kernel key, which a factory rename keeps",
+    )
+    diff_parser.add_argument(
         "--columns",
         default=",".join(COLUMNS),
         help="columns that must match: 'hash,cuda,cpu' (default) or 'cuda,cpu' for generated-code identity",
@@ -894,6 +921,8 @@ def main(argv=None):
     if not columns or any(column not in COLUMNS for column in columns):
         parser.error(f"--columns takes a comma-separated subset of {', '.join(COLUMNS)}")
     parent, child = (json.loads(Path(path).read_text(encoding="utf-8")) for path in (arguments.parent, arguments.child))
+    if arguments.by == "key":
+        parent, child = by_key(parent), by_key(child)
     return report(parent, child, columns)
 
 
