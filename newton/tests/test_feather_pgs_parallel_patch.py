@@ -47,7 +47,7 @@ from newton._src.solvers.feather_pgs.row_kernels import (
 from newton._src.solvers.feather_pgs.row_records import DenseRows
 from newton._src.solvers.feather_pgs.rows import RowLaws, velocity_prescale_launch
 from newton._src.solvers.feather_pgs.sweep import sweep_kernel
-from newton._src.solvers.feather_pgs.sweep_plan import Sweep, SweepTier
+from newton._src.solvers.feather_pgs.sweep_plan import Sweep, SweepLaunch
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import (
     bias_rows,
@@ -1114,7 +1114,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 sweep_routes_tiers.TierSweep(_CAPACITY, 32, _DOFS, "120", rows=rows, sweeps=sweeps, **options)
                 for rows, sweeps in ((32, 24), (64, 34))
             ]
-            kernels = [SweepTier(config, sweep_kernel(config), index, 0) for index, config in enumerate(configs)]
+            kernels = [SweepLaunch(config, sweep_kernel(config), 0, config.threads, dict) for config in configs]
             probe = SimpleNamespace(
                 sweep=SimpleNamespace(
                     tiers=kernels,

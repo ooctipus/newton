@@ -5,12 +5,14 @@
 
 :class:`Sweep` owns the solve of one step:
 
-- the owners that sweep their own worlds, built from the class plan's case (:mod:`.class_plan`), with their kernels
-  and streams (:meth:`Sweep.build`, :meth:`Sweep.open_streams`);
-- the claims: the worlds the row pass left to each owner (:meth:`Sweep.claim`), and the resolved worlds;
+- the sweeps that own their worlds, each a configuration (:class:`.sweep.SweepConfig`) the plan binds from the class
+  plan's choices, the laws and the placement, built by the one factory (:func:`.sweep.sweep_kernel`), and their streams
+  (:meth:`Sweep.build`, :meth:`Sweep.open_streams`);
+- the claims: the worlds the row pass left to each owner (:meth:`Sweep.claim_worlds`), and the resolved worlds;
 - the warm start: the normal impulses gathered by contact identity (:meth:`Sweep.warm_start`), and what a step
   carries to the next (:meth:`Sweep.carry`);
-- the launches, the claims in order and then the overflow row (:meth:`Sweep.solve`);
+- the launches, one bound launch a sweep (:class:`SweepLaunch`), in line or on the claims' streams
+  (:meth:`Sweep.solve`): the step holds no case;
 - the contact forces the impulses export (:meth:`Sweep.forces`).
 
 The sweeps' mathematics lives in :mod:`.sweep` and the route modules; the schedule of case K2 in :mod:`.sweep_levels`.
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+from collections.abc import Callable
 
 import numpy as np
 import warp as wp
@@ -82,14 +85,17 @@ __all__ = ["Sweep"]
 
 
 @dataclasses.dataclass(frozen=True)
-class SweepTier:
-    """A Jacobi tier's launch: its configuration and kernel, its bucket among the claims' (:attr:`Sweep.claims`) and
-    its grid on its own list (the layer's shape of its work over the worlds)."""
+class SweepLaunch:
+    """One sweep's launch, bound once by the plan (:meth:`Sweep.build`): its configuration and kernel, the layer's
+    shape of its work over its worlds (``grid`` blocks of ``block`` threads), and the operands it takes beside the
+    step's (:meth:`Sweep._operands`), read at each launch (``named``): its claim's bucket, its placement's arrays, the
+    walk."""
 
-    config: sweep_routes_tiers.TierSweep
+    config: SweepConfig
     kernel: wp.Kernel
-    tier: int
     grid: int
+    block: int
+    named: Callable[[], dict]
 
 
 class Sweep:
@@ -102,7 +108,7 @@ class Sweep:
         laws: The row laws.
         placement: The placement.
         factor: The tree factor.
-        classes: The class plan (:class:`.class_plan.ClassPlan`): the case and its choice, which the owners build.
+        classes: The class plan (:class:`.class_plan.ClassPlan`): its choices, from which the plan binds the sweeps.
         pins: The test-only route pins (:class:`.route_table.Pins`).
     """
 
@@ -114,8 +120,6 @@ class Sweep:
         self.placement = placement
         self.factor = factor
         self.classes = classes
-        self.case = classes.case
-        """The class's case (:attr:`.class_plan.ClassPlan.case`)."""
         self.pins = pins
         # Every sweep compiles the exit law and the policy's readout.
         self.policy = SolvePolicy(readout=options.diagnostics.solve_readout)
@@ -150,6 +154,7 @@ class Sweep:
         # The admitted contact units' block records.
         self.placement.sparse_contact_records = None
         self.placement.friction_metric = None
+        self.sparse_sweep = self.sparse_kernel = None
         if choice is None:
             return
         sweep, max_support = dict(choice.sweep), choice.max_support
@@ -466,7 +471,7 @@ class Sweep:
         self.colored_units = None
         # Storage classes of the MF-GS kernel (_MFGSStorage); recorded by get_path_selection().
         self.mf_gs_storage = None
-        # The Jacobi tiers ahead of the matrix-free sweep (SweepTier), and their keyed rows' release.
+        # The Jacobi tiers ahead of the matrix-free sweep (their SweepLaunch each).
         self.tiers = []
         self.par_tiers = []
         # The claims' worlds (sweep_levels.claim_worlds): a bucket a tier, then the general sweep's.
@@ -565,9 +570,11 @@ class Sweep:
                         **self.law_fields,
                     )
                     kernel = self.sweep("parallel_tier", config, readout_budget=sweeps_)
-                    # On its own list, a tier takes a block a world of the list's capacity (its work's shape).
-                    grid = shape(config.work(self.forest.world_count), device(model.device))
-                    self.tiers.append(SweepTier(config, kernel, tier_index, grid.grid))
+                    # On its own list, a tier takes a block a world of the list's capacity (its work's shape); it
+                    # grid-strides over its bucket.
+                    layout = shape(config.work(self.forest.world_count), device(model.device))
+                    named = functools.partial(self._tier_operands, config, tier_index, layout.grid)
+                    self.tiers.append(SweepLaunch(config, kernel, layout.grid, layout.block, named))
             # Each sweep walks its bucket of the claims' worlds (claim_worlds), a bucket of every world's slots: a tier's,
             # the general sweep's, and with the colored mapping its candidates' (which the unit builder walks) and the
             # colored worlds' (which it appends).
@@ -593,8 +600,29 @@ class Sweep:
                     claims=self.claims,
                     buckets=(self.claim_candidate, self.claim_colored, self.claim_general),
                 )
-            # The general sweep walks its bucket on a persistent grid, a warp a world (its work's shape).
-            self.general_shape = shape(self.general_sweep.work(worlds), device(model.device))
+            # The general sweep walks its bucket on a persistent grid, a warp a world (its work's shape); the colored
+            # bucket a block a world of its slots, a color's units at once.
+            general = self._claim_launch(self.general_sweep, self.mf_gs_kernel, worlds, self.claim_general)
+            mapped = (general,)
+            if colored:
+                slots = self.colored_units.slot_count
+                mapped += (self._claim_launch(self.colored_sweep, self.mf_colored_kernel, slots, self.claim_colored),)
+            # In line, the tiers and then the general sweep; on the claims' streams (open_streams) the first tier in
+            # line and the general sweep and the other tiers beside it: a fork's first kernel started about 18 us
+            # after the fork a solve, and on franka the first tier (rows32) is the solve's critical path (PRO).
+            self.launches = (*self.tiers, *mapped)
+            self.claim_groups = (*((tier,) for tier in self.tiers[:1]), mapped, *((tier,) for tier in self.tiers[1:]))
+        else:
+            # A class whose one sweep owns every world (K1, K2, K5): one launch over the worlds, in line.
+            single = (
+                (self.sparse_sweep, self.sparse_kernel, self._sparse_operands),
+                (self.diagonal_sweep, self.sparse_diagonal_kernel, self._diagonal_operands),
+                (self.paired_sweep, self.paired_factor_kernel, self._paired_operands),
+            )
+            self.launches = tuple(
+                self._world_launch(config, kernel, named) for config, kernel, named in single if config is not None
+            )
+            self.claim_groups = ()
         if self.classes.mf_sweeps:
             # No matrix-free sweep enters a world without rows; the readout counts those solves as skipped.
             self.readout.register_skipped(world_count=int(self.forest.world_count), device=model.device)
@@ -760,183 +788,143 @@ class Sweep:
             "v_out": v_out,
         }
 
-    def _launch(self, kernel, operands: dict, dim: int, block_dim: int, *, stream=None, **named) -> None:
-        """Launch a sweep with each of its parameters read by name: ``named`` first, then ``operands``."""
+    def _world_launch(self, config: SweepConfig, kernel: wp.Kernel, named: Callable[[], dict]) -> SweepLaunch:
+        """The launch of a sweep over every world (the layer's shape of its work over them)."""
+        layout = shape(config.work(self.forest.world_count), device(self.model.device))
+        return SweepLaunch(config, kernel, layout.grid, layout.block, named)
+
+    def _claim_launch(self, config: SweepConfig, kernel: wp.Kernel, items: int, bucket: int) -> SweepLaunch:
+        """The launch of a matrix-free mapping over its claim's ``bucket``, its grid the layer's shape of its work over
+        ``items`` (the bucket's capacity)."""
+        layout = shape(config.work(items), device(self.model.device))
+        return SweepLaunch(
+            config, kernel, layout.grid, layout.block, functools.partial(self._mapped_operands, bucket, layout.grid)
+        )
+
+    def _walk(self) -> dict:
+        """The walk's view, where the sweeps leave by the walk and find a free body's tree in it."""
+        return {} if self.factor.walk_arts is None else {"walk": self.factor.walk_view()}
+
+    def _queued(self, bucket: int, grid: int) -> dict:
+        """The world queue of the claims' ``bucket`` (claim_worlds, the step's claim stage), walked at ``grid``'s
+        stride."""
+        count, worlds = self.claims.bucket(bucket)
+        return {"general_world_count": count, "general_worlds": worlds, "general_world_grid_stride": grid}
+
+    def _tier_operands(self, config, bucket: int, grid: int) -> dict:
+        """A Jacobi tier's operands: its bucket, the in-kernel response's trees and, under keyed rows, their operands."""
+        named = dict(self._walk(), **self._queued(bucket, grid))
+        named.update(self.placement.inkernel_response_inputs())
+        if config.keyed is not None:
+            keyed = self.placement.keyed_rows.parallel_arguments()
+            named.update(zip(("kinetic_rows", "patch_law"), keyed, strict=False))
+        return named
+
+    def _mapped_operands(self, bucket: int, grid: int) -> dict:
+        """A matrix-free mapping's operands: its bucket and the colored storage's units."""
+        colored = {} if self.mf_colored_kernel is None else self.colored_units.operands()
+        return {**self._walk(), **colored, **self._queued(bucket, grid)}
+
+    def _sparse_operands(self) -> dict:
+        """Case K1's operands: its rows' factor entries, coordinates and records, and its change in factor
+        coordinates."""
+        placement = self.placement
+        return {
+            "world_count": self.forest.world_count,
+            "row_dof": placement.sparse_row_dof,
+            "row_factor": placement.sparse_row_factor,
+            "factor_velocity_delta": placement.sparse_factor_velocity_delta,
+            "support": placement.sparse_row_support,
+            "contact_records": placement.sparse_contact_records,
+        }
+
+    def _diagonal_operands(self) -> dict:
+        """Case K2's operands: its schedule (:meth:`schedule_diagonal`), its rows' slots, its fused limits."""
+        placement = self.placement
+        return {
+            "sparse_contact_level_count": placement.sparse_contact_level_count,
+            "sparse_contact_level_offsets": placement.sparse_contact_level_offsets,
+            "sparse_contact_level_units": placement.sparse_contact_level_units,
+            "sparse_contact_serial_count": placement.sparse_contact_serial_count,
+            "sparse_contact_serial_normals": placement.sparse_contact_serial_normals,
+            "dense_offsets": placement.sparse_diagonal_dense_offsets,
+            "dense_groups": placement.sparse_diagonal_dense_groups,
+            "walk": self.factor.walk_view(),
+            "dense_Z": placement.J_by_size[self.classes.dense_size],
+            "sparse_row_dof": placement.sparse_diagonal_row_dof,
+            "sparse_row_z": placement.sparse_diagonal_row_z,
+            "fused_limit_active": placement.fused_diagonal_limit_active,
+            "fused_limit_lower_rhs": placement.fused_diagonal_limit_lower_rhs,
+            "fused_limit_upper_rhs": placement.fused_diagonal_limit_upper_rhs,
+            "diagonal_inverse_mass": self.factor.diagonal_inverse_mass,
+            "fused_limit_cfm": self.options.pgs_cfm,
+            "fused_limit_lower_lambda": placement.fused_diagonal_limit_lower_lambda,
+            "fused_limit_upper_lambda": placement.fused_diagonal_limit_upper_lambda,
+        }
+
+    def _paired_operands(self) -> dict:
+        """Case K5's operands: its rows in factor coordinates (the packed rows at their world coordinates) and each
+        world's free body's first coordinate."""
+        walked = {"walk": self.factor.walk_view()} if self.placement.walks else {}
+        return {
+            "world_count": self.forest.world_count,
+            "factor_rows": self.placement.packed_Z,
+            "secondary_offset_by_world": self.paired_factor_secondary_offsets_by_world,
+            **walked,
+        }
+
+    def _launch(self, launch: SweepLaunch, operands: dict, stream=None) -> None:
+        """Launch a sweep with each of its parameters read by name: its own operands first, then the step's."""
+        kernel, named = launch.kernel, launch.named()
         named.update(zip(("readout",), self.readout.operands(kernel), strict=False))
         wp.launch_tiled(
             kernel,
-            dim=[dim],
+            dim=[launch.grid],
             inputs=[named[arg.label] if arg.label in named else operands[arg.label] for arg in kernel.adj.args],
-            block_dim=block_dim,
+            block_dim=launch.block,
             device=self.model.device,
             stream=stream,
         )
 
     def solve(self, v_hat: wp.array, v_out: wp.array) -> None:
-        """Launch the step's sweeps from the predictor ``v_hat`` into ``v_out``: the claims in order, then the rest."""
+        """Launch the step's sweeps from the predictor ``v_hat`` into ``v_out``: each claim's sweep over its worlds,
+        in line, or on the claims' streams where they are open (:meth:`open_streams`), then the step's one leave."""
         self.join_claims()
         if self.options.pgs_iterations <= 0 and not self.seeded:
             return
         operands = self._operands(v_hat, v_out)
-        if self.leaves and self.case != "K1":
-            # The sweeps add their change into the walk's du from zero.
+        # The sweeps' change: into the walk's du, from zero, or (the support placement's sparse sweep) its own in factor
+        # coordinates at each tree's offset (support_du_base).
+        factor_change = self.support_du_base is not None
+        if self.leaves and not factor_change:
             self.factor.walk_view().du.zero_()
-        if self.case == "K1":
-            self._solve_packed(operands)
-        elif self.case == "K2":
-            self._solve_diagonal(operands)
-        elif self.case == "K5":
-            self._solve_paired(operands)
-        elif self.forest.max_world_dofs:
-            self._solve_claims(operands)
+        # Under a readout, count the worlds without rows of any family, which no sweep enters.
+        self.readout.count_skipped(self.placement.constraint_count, self.placement.mf_constraint_count)
+        streams = self.claim_streams
+        if not streams:
+            for launch in self.launches:
+                self._launch(launch, operands)
+        else:
+            main = wp.get_stream(self.model.device)
+            main.record_event(self.claims_ready)
+            first, *beside = self.claim_groups
+            for launch in first:
+                self._launch(launch, operands)
+            for stream, group, done in zip(streams, beside, self.claims_done, strict=True):
+                stream.wait_event(self.claims_ready)
+                with wp.ScopedStream(stream, sync_enter=False):
+                    for launch in group:
+                        self._launch(launch, operands)
+                stream.record_event(done)
+                main.wait_event(done)
         if self.leaves:
             # The step's one leave: every walking tree's change in the walk's coordinates (the sparse sweep's in its
             # factor coordinates).
-            if self.case == "K1":
+            if factor_change:
                 delta = self.placement.sparse_factor_velocity_delta
                 self.factor.leave(v_out, delta.reshape((delta.size,)), self.support_du_base)
             else:
                 self.factor.leave(v_out)
-
-    def _solve_packed(self, operands: dict) -> None:
-        """Case K1: the sparse sweep in factor coordinates, then its velocity change back onto ``v_out``."""
-        placement = self.placement
-        layout = shape(self.sparse_sweep.work(self.forest.world_count), device(self.model.device))
-        self._launch(
-            self.sparse_kernel,
-            operands,
-            layout.grid,
-            layout.block,
-            world_count=self.forest.world_count,
-            row_dof=placement.sparse_row_dof,
-            row_factor=placement.sparse_row_factor,
-            factor_velocity_delta=placement.sparse_factor_velocity_delta,
-            support=placement.sparse_row_support,
-            contact_records=placement.sparse_contact_records,
-        )
-
-    def _solve_diagonal(self, operands: dict) -> None:
-        """Case K2: the sparse-diagonal sweep over the schedule of :meth:`claim`."""
-        placement, dense_size = self.placement, self.classes.dense_size
-        layout = shape(self.diagonal_sweep.work(self.forest.world_count), device(self.model.device))
-        self._launch(
-            self.sparse_diagonal_kernel,
-            operands,
-            layout.grid,
-            layout.block,
-            sparse_contact_level_count=placement.sparse_contact_level_count,
-            sparse_contact_level_offsets=placement.sparse_contact_level_offsets,
-            sparse_contact_level_units=placement.sparse_contact_level_units,
-            sparse_contact_serial_count=placement.sparse_contact_serial_count,
-            sparse_contact_serial_normals=placement.sparse_contact_serial_normals,
-            dense_offsets=placement.sparse_diagonal_dense_offsets,
-            dense_groups=placement.sparse_diagonal_dense_groups,
-            walk=self.factor.walk_view(),
-            dense_Z=placement.J_by_size[dense_size],
-            sparse_row_dof=placement.sparse_diagonal_row_dof,
-            sparse_row_z=placement.sparse_diagonal_row_z,
-            fused_limit_active=placement.fused_diagonal_limit_active,
-            fused_limit_lower_rhs=placement.fused_diagonal_limit_lower_rhs,
-            fused_limit_upper_rhs=placement.fused_diagonal_limit_upper_rhs,
-            diagonal_inverse_mass=self.factor.diagonal_inverse_mass,
-            fused_limit_cfm=self.options.pgs_cfm,
-            fused_limit_lower_lambda=placement.fused_diagonal_limit_lower_lambda,
-            fused_limit_upper_lambda=placement.fused_diagonal_limit_upper_lambda,
-        )
-
-    def _solve_paired(self, operands: dict) -> None:
-        """Case K5: the paired factor sweep, which owns every row of its worlds (its free body's are rows of the
-        line)."""
-        self.readout.count_skipped(self.placement.constraint_count, self.placement.mf_constraint_count)
-        walked = {"walk": self.factor.walk_view()} if self.placement.walks else {}
-        layout = shape(self.paired_sweep.work(self.forest.world_count), device(self.model.device))
-        self._launch(
-            self.paired_factor_kernel,
-            operands,
-            layout.grid,
-            layout.block,
-            world_count=self.forest.world_count,
-            # The factor rows: the packed rows at their world coordinates.
-            factor_rows=self.placement.packed_Z,
-            secondary_offset_by_world=self.paired_factor_secondary_offsets_by_world,
-            **walked,
-        )
-
-    def _solve_claims(self, operands: dict) -> None:
-        """The general cases: the claims that own their worlds (the Jacobi tiers'), on the claims' streams where they
-        are open (:meth:`open_streams`), beside the matrix-free sweep of the rest."""
-        mf_gs_kernel = self.mf_gs_kernel
-        if mf_gs_kernel is None:
-            raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")
-
-        # Under a readout, count the worlds without rows of any family, which no sweep enters.
-        self.readout.count_skipped(self.placement.constraint_count, self.placement.mf_constraint_count)
-        streams = self.claim_streams
-        main = wp.get_stream(self.model.device) if streams else None
-
-        # The sweeps leave by the walk (sweep_routes.leave_all) and find a free body's tree in it.
-        walk = {} if self.factor.walk_arts is None else {"walk": self.factor.walk_view()}
-
-        # Each sweep walks its claim's bucket (claim_worlds, the step's claim stage).
-        claims = self.claims
-
-        def queued(bucket, grid):
-            count, worlds = claims.bucket(bucket)
-            return {"general_world_count": count, "general_worlds": worlds, "general_world_grid_stride": grid}
-
-        def launch_tier(tier):
-            # A tier grid-strides over its bucket.
-            named = dict(walk, **queued(tier.tier, tier.grid))
-            named.update(self.placement.inkernel_response_inputs())
-            if tier.config.keyed is not None:
-                keyed = self.placement.keyed_rows.parallel_arguments()
-                named.update(zip(("kinetic_rows", "patch_law"), keyed, strict=False))
-            self._launch(tier.kernel, operands, tier.grid, tier.config.threads, **named)
-
-        def launch_general():
-            colored_kernel = self.mf_colored_kernel
-            colored = {} if colored_kernel is None else self.colored_units.operands()
-            # The general sweep's bucket, on its persistent grid.
-            general = self.general_shape
-            self._launch(
-                mf_gs_kernel,
-                operands,
-                general.grid,
-                general.block,
-                **walk,
-                **colored,
-                **queued(self.claim_general, general.grid),
-            )
-            if colored_kernel is not None:
-                # The colored bucket (the unit builder's rule picked its worlds): a block a world of its capacity, the
-                # colored storage's slots, a color's units at once.
-                layout = shape(self.colored_sweep.work(self.colored_units.slot_count), device(self.model.device))
-                self._launch(
-                    colored_kernel,
-                    operands,
-                    layout.grid,
-                    layout.block,
-                    **walk,
-                    **colored,
-                    **queued(self.claim_colored, layout.grid),
-                )
-
-        if not streams:
-            for tier in self.tiers:
-                launch_tier(tier)
-            launch_general()
-            return
-        # The first tier runs in line, the general sweep and the other tiers beside it: a fork's first kernel started
-        # about 18 us after the fork a solve, and on franka the first tier (rows32) is the solve's critical path (PRO).
-        main.record_event(self.claims_ready)
-        launch_tier(self.tiers[0])
-        beside = (launch_general, *(functools.partial(launch_tier, tier) for tier in self.tiers[1:]))
-        for stream, launch, done in zip(streams, beside, self.claims_done, strict=True):
-            stream.wait_event(self.claims_ready)
-            with wp.ScopedStream(stream, sync_enter=False):
-                launch()
-            stream.record_event(done)
-            main.wait_event(done)
 
     @staticmethod
     def patch_frame_built(contacts):

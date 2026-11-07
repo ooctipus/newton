@@ -84,7 +84,6 @@ def install_cpu_keyed_rows(solver):
     solver.spec = dataclasses.replace(solver.spec, classes=classes)
     solver.placement.classes = solver.sweep.classes = classes
     solver.placement.walks = True
-    solver.sweep.case = "K4"
     route = dataclasses.replace(solver._plan.route, case="K4", producer="keyed_rows")
     solver.placement.keyed_rows = keyed_rows.KeyedRows(solver)
     # The step's stages are chosen from the class at construction: the keyed class stages its own.
