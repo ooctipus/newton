@@ -47,7 +47,7 @@ from newton._src.solvers.feather_pgs.solve_policy import (
     sweep_exit,
     vote,
 )
-from newton._src.solvers.feather_pgs.sweep import EXACT, LevelLaw, sweep_kernel
+from newton._src.solvers.feather_pgs.sweep import EXACT, LevelLaw, WorldRows, sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import built
@@ -481,6 +481,30 @@ class TestExitLaw(unittest.TestCase):
             self.assertTrue("? omega * fmaxf(-residual, 0.0f) :" in text, "the unvisited-row bound ignores omega")
         full = sweep_kernel.__wrapped__(SparseSweep(48, 18, 12))
         self.assertNotIn("sweep_violation", _policy_snippet(self, full, QUIET_LITERAL))
+
+    def test_general_sweep_takes_the_one_active_scan_and_the_contact_unit(self):
+        """The general sweep's enumeration and contact unit are switches of its configuration: the active scan the
+        sparse sweep runs, on the general sweep's own row store (its friction pair selected while its spin row holds
+        impulse too), the exit law's bound on the rows it leaves unvisited, and a contact's normal and pair visited as
+        one unit on their Gram block; the colored mapping keeps every row in turn."""
+        rhs = WorldRows(64).rhs_of("row")
+        for units in (False, True):
+            config = sweep_routes.GeneralSweep(64, 32, 12, "120", torsion=True, active_rows=True, contact_units=units)
+            self.assertIn("_active_units_" if units else "_active_", config.name)
+            kernel = sweep_kernel.__wrapped__(config)
+            snippet = _policy_snippet(self, kernel, QUIET_LITERAL)
+            self.assertIn("sweep_stop = !sweep_violation_any;", snippet)
+            self.assertIn(f"(!(fabsf(excess) <= {bound(rhs, 'fabsf(dot)', '0.0f', diagonal='1.0f')}))", snippet)
+            self.assertIn("unsigned pending = s_selected_words[word];", snippet)
+            self.assertIn("(spin >= 0 && s_lam_dense[spin] != 0.0f)", snippet)
+            self.assertEqual("SUM(unit_jv0, unit_jv1, unit_jv2, gram_n1, gram_n2, unit_cross);" in snippet, units)
+        plain = sweep_routes.GeneralSweep(64, 32, 12, "120", torsion=True)
+        body, _ = plain.source()
+        self.assertNotIn("s_selected_words", body)
+        self.assertNotIn("consumed_tangent", body)
+        for switch in ("active_rows", "contact_units"):
+            with self.subTest(switch=switch), self.assertRaises(ValueError):
+                sweep_routes.GeneralSweep(64, 32, 12, "120", levels=LevelLaw(EXACT), **{switch: True})
 
 
 class TestSolveReadoutRecord(unittest.TestCase):
