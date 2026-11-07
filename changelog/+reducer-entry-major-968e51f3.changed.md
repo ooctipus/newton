@@ -1,0 +1,1 @@
+Store the global contact reducer's winner slots entry-major: each hashtable key keeps its seven slots in one 64-byte row instead of seven planes a whole table apart, so reduction and export touch two memory sectors per key. Contact selection and output order are unchanged; the value array grows from seven to eight 8-byte words per hashtable entry.

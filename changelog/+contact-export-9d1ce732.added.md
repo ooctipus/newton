@@ -1,0 +1,1 @@
+Add experimental `CollisionPipeline(contact_export="auto" | "tiled" | "compact")` selection, using compact workers for supported CUDA mesh/heightfield contact reducers and retaining explicit control over the export mapping.

@@ -14,9 +14,11 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 import warp as wp
 
+from ...core.contact_pool import ContactField, ContactPool, ContactRows
 from ...core.reset import reset_world_selected as _reset_world_selected
 from ...geometry import ParticleFlags, ShapeFlags
 from ...sim import JointType, Model, ModelFlags, StateFlags
+from ...sim.contacts import note_contact_frame_write
 from ..solver import SolverBase
 from .interface import (
     CouplingEndpointKind,
@@ -612,7 +614,8 @@ class SolverCoupled(SolverBase, CouplingInterface):
         self._entry_soft_contact_generation: dict[str, wp.array] = {}
         self._entry_rigid_contact_update: dict[str, wp.array] = {}
         self._entry_soft_contact_update: dict[str, wp.array] = {}
-        self._entry_rigid_contact_src_to_dst: dict[str, wp.array] = {}
+        # Per source rigid contact row, its row in the entry's buffer; grows with the source's rows.
+        self._entry_rigid_contact_src_to_dst: dict[str, ContactRows] = {}
         self._entry_soft_contact_src_to_dst: dict[str, wp.array] = {}
         self._active_observables: SolverCoupled.Observables | None = None
         self._entry_output_state_valid = False
@@ -3068,7 +3071,12 @@ class SolverCoupled(SolverBase, CouplingInterface):
                 )
 
     def prepare_contacts(self, contacts: Contacts | None) -> None:
-        """Preallocate entry-local filtered contact buffers for graph capture."""
+        """Preallocate entry-local filtered contact buffers before graph capture.
+
+        The entry buffers follow ``contacts``' rigid rows as they grow. Buffers that
+        a step creates during capture instead are ordinary arrays, allocated in the
+        graph's memory pool.
+        """
         if contacts is None:
             return
         for entry in self._entries.values():
@@ -3581,6 +3589,9 @@ class SolverCoupled(SolverBase, CouplingInterface):
         contact_update_dim = max(
             contacts.rigid_contact_max, contacts.soft_contact_max, filtered.contact_counters.shape[0]
         )
+        # The filter rewrites the entry's frame whenever its source advanced, which
+        # only the device knows; the host notes every filter pass.
+        note_contact_frame_write(filtered.contact_generation)
         if contact_update_dim > 0:
             wp.launch(
                 _prepare_filtered_contact_update_kernel,
@@ -3595,7 +3606,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
                     contacts.contact_counters,
                     filtered.contact_counters,
                     min(contacts.contact_counters.shape[0], filtered.contact_counters.shape[0]),
-                    self._entry_rigid_contact_src_to_dst[entry.name],
+                    self._entry_rigid_contact_src_to_dst[entry.name].views["src_to_dst"],
                     contacts.rigid_contact_max,
                     self._entry_soft_contact_src_to_dst[entry.name],
                     contacts.soft_contact_max,
@@ -3605,7 +3616,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
             )
 
         if contacts.rigid_contact_max > 0:
-            rigid_src_to_dst = self._entry_rigid_contact_src_to_dst[entry.name]
+            rigid_src_to_dst = self._entry_rigid_contact_src_to_dst[entry.name].views["src_to_dst"]
             wp.launch(
                 _filter_rigid_contacts_global_shape_ids_kernel,
                 dim=contacts.rigid_contact_max,
@@ -3749,9 +3760,12 @@ class SolverCoupled(SolverBase, CouplingInterface):
         if filtered is None or not self._entry_contact_buffer_matches(filtered, contacts):
             from ...sim import Contacts  # noqa: PLC0415
 
+            # The entry's rigid rows follow the source's, which may grow with its pipeline.
+            source_pool = contacts._rigid_contact_pool
+            pool = ContactPool(device=contacts.device, rows=source_pool.ready)
             requested = {"force"} if contacts.force is not None else None
             filtered = Contacts(
-                contacts.rigid_contact_max,
+                pool.ready,
                 contacts.soft_contact_max,
                 requires_grad=contacts.requires_grad,
                 device=contacts.device,
@@ -3759,6 +3773,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
                 requested_attributes=requested,
                 contact_matching=contacts.rigid_contact_match_index is not None,
                 rigid_contact_surface_velocity=contacts.rigid_contact_surface_velocity is not None,
+                rigid_contact_pool=pool,
             )
             self._entry_contact_buffers[entry.name] = filtered
             self._entry_contact_sources[entry.name] = contacts
@@ -3784,12 +3799,8 @@ class SolverCoupled(SolverBase, CouplingInterface):
                 dtype=wp.int32,
                 device=contacts.device,
             )
-            self._entry_rigid_contact_src_to_dst[entry.name] = wp.full(
-                contacts.rigid_contact_max,
-                -1,
-                dtype=wp.int32,
-                device=contacts.device,
-            )
+            self._entry_rigid_contact_src_to_dst[entry.name] = pool.rows((ContactField("src_to_dst", wp.int32, -1),))
+            source_pool.follow(pool)
             self._entry_soft_contact_src_to_dst[entry.name] = wp.full(
                 contacts.soft_contact_max,
                 -1,

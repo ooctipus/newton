@@ -1,0 +1,1 @@
+Add the keyword-only `max_heightfield_pairs` sizing hint to `NarrowPhase`: an upper bound on routed heightfield pairs, half of which the CUDA lane midphase can store for its lane pass (at most 65536 pairs when no bound is given). Pairs beyond the storage are processed in the first pass, with the same triangles.

@@ -1,0 +1,1 @@
+Reduce sparse FPGS contact preparation traffic by reusing topology-owned support indices and avoiding unused metadata writes and dynamically indexed geometry temporaries. Eligible single-articulation worlds retain ordinary ordered PGS; unsupported scenes keep explicit row indices. No configuration changes are required.

@@ -128,9 +128,9 @@ class Example:
         self.grid_x = int(np.ceil(np.sqrt(self.num_per_world)))
         self.grid_y = int(np.ceil(self.num_per_world / self.grid_x))
 
-        # Maximum number of rigid contacts to allocate (limits memory usage).
-        # Use a per-world budget so the batched defaults scale appropriately.
-        self.rigid_contact_max = 500 * self.world_count
+        # MuJoCo's per-world contact budget (njmax/nconmax); Newton's contact buffers grow
+        # with the demand.
+        self.contacts_per_world = 500
 
         # Broad phase mode: NXN (O(N²)), SAP (O(N log N)), EXPLICIT (precomputed pairs)
         self.broad_phase = "sap"
@@ -154,13 +154,9 @@ class Example:
 
         self.model = main_scene.finalize()
 
-        # Keep model and pipeline contact capacities aligned.
-        self.model.rigid_contact_max = self.rigid_contact_max
-
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
             reduce_contacts=True,
-            rigid_contact_max=self.rigid_contact_max,
             broad_phase=self.broad_phase,
         )
 
@@ -172,7 +168,7 @@ class Example:
                 rigid_contact_relaxation=self.xpbd_contact_relaxation,
             )
         elif self.solver_type == "mujoco":
-            num_per_world = self.collision_pipeline.rigid_contact_max // self.world_count
+            num_per_world = self.contacts_per_world
             self.solver = newton.solvers.SolverMuJoCo(
                 self.model,
                 use_mujoco_contacts=False,

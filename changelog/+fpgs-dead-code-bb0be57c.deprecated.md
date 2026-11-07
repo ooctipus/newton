@@ -1,0 +1,1 @@
+Deprecate the `propagation` flag of `SolverFeatherPGS.constraint_capacity_status()` and the `propagation_*` fields of `SolverFeatherPGS.constraint_row_watermarks()`. No route builds propagation rows, so they are always `False` and `0`; stop reading them.

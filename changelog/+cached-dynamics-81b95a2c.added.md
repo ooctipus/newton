@@ -1,0 +1,1 @@
+Add experimental `SolverFeatherPGS.cached_dynamics` choices for automatic, required or disabled paired cached prediction and publication, with explicit choices overriding legacy cache environment settings.

@@ -1,0 +1,1 @@
+Give the terrain law barrel cylinders and finite planes on bodies: a barrel cylinder's heightfield contacts follow its curved side (its lowest point, with the cylinder's tripod on a cap within 22.5 deg of upright), and a plane of finite width and length is a box of no thickness, so that the law writes the heightfield contacts of every convex partner by default.

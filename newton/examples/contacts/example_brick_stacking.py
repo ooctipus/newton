@@ -446,13 +446,12 @@ class Example:
 
         self.model = scene.finalize()
 
+        # MuJoCo's contact and constraint rows; Newton's contact buffers grow with the demand.
         contact_max = 16384
-        self.model.rigid_contact_max = contact_max
 
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
             reduce_contacts=True,
-            rigid_contact_max=contact_max,
             broad_phase="nxn",
         )
 

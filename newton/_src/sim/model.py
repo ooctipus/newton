@@ -46,6 +46,7 @@ _COLLISION_EDGE_DEPRECATION_MSG = (
 
 if TYPE_CHECKING:
     from ..actuators.actuator import Actuator
+    from ..geometry.broad_phase_nxn import ShapePairTemplates
     from ..utils.heightfield import HeightfieldData
     from .collide import CollisionPipeline
 
@@ -1099,6 +1100,12 @@ class Model:
         """Finalized collision topology for lazy pair construction and statistics."""
         self._shape_contact_pair_count: int = 0
         self._shape_contact_pair_counts: dict[bytes | tuple[bytes, int | None] | None, np.ndarray] = {}
+        self._shape_contact_pair_templates: ShapePairTemplates | None = None
+        """Per-world templates that :meth:`ModelBuilder.finalize` replayed into :attr:`shape_contact_pairs`.
+
+        ``None`` when the list was built otherwise; the collision pipeline tests the
+        templates instead of streaming the list while they still describe it.
+        """
         self.shape_world: wp.array[wp.int32] | None = None
         """World index for each shape, shape [shape_count], int. -1 for global."""
         self.shape_world_start: wp.array[wp.int32] | None = None
@@ -1180,6 +1187,21 @@ class Model:
         collision applies :attr:`shape_scale` when reading them. Component ``w``
         is a unitless internal endpoint-ownership code.
         """
+        self._mesh_edge_order: wp.array[wp.int32] | None = None
+        """Packed collision-edge indices in cluster order, shape [total_edge_count].
+
+        Within a shape's edge range, cluster ``q`` holds the shape-local edge indices at positions
+        ``[q * EDGE_CLUSTER_SIZE, (q + 1) * EDGE_CLUSTER_SIZE)``.
+        """
+        self._mesh_edge_clusters: wp.array[wp.vec4] | None = None
+        """Packed collision-edge cluster bounds, shape [total_edge_count, 4] [m].
+
+        At a shape's edge offset plus the cluster index: the cluster center ``xyz`` in unscaled
+        mesh coordinates (kernels apply the live shape scale) and, in ``w``, the largest distance
+        from it to a member edge's center, also unscaled.
+        """
+        self._mesh_edge_cluster_reach: wp.array[wp.float32] | None = None
+        """Packed largest member edge radius per cluster, shape [total_edge_count] [m]."""
         self._shape_edge_range: wp.array[wp.vec2i] | None = None
         """Per-shape (start, count) into mesh edge arrays, shape [shape_count]. (-1,0) if no edges."""
         self._shape_mesh_properties: wp.array[wp.int32] | None = None
@@ -1553,6 +1575,12 @@ class Model:
         """
         self.joint_damping: wp.array[wp.float32] | None = None
         """Passive velocity damping [N·s/m or N·m·s/rad, depending on joint type] always active on the joint, shape [joint_dof_count], float."""
+        self.joint_spring_stiffness: wp.array[wp.float32] | None = None
+        """Passive spring stiffness [N/m or N·m/rad, depending on joint type] always active on the joint,
+        applying ``k * (joint_spring_ref - q)``; 0 disables the spring. Shape [joint_dof_count], float."""
+        self.joint_spring_ref: wp.array[wp.float32] | None = None
+        """Passive spring reference (rest) position [m or rad, depending on joint type]. May lie outside the
+        joint limits to preload the joint against a limit, shape [joint_dof_count], float."""
         self.joint_effort_limit: wp.array[wp.float32] | None = None
         """Joint effort (force/torque) limits [N or N·m, depending on joint type], shape [joint_dof_count], float."""
         self.joint_velocity_limit: wp.array[wp.float32] | None = None
@@ -1941,6 +1969,8 @@ class Model:
     def shape_contact_pairs(self, pairs: wp.array[wp.vec2i] | None) -> None:
         self._shape_contact_pairs = pairs
         self._shape_contact_pair_data = None
+        # Replaced pairs are no longer the replay of finalize's per-world templates.
+        self._shape_contact_pair_templates = None
         self._shape_contact_pair_count = len(pairs) if pairs is not None else 0
         self._shape_contact_pair_counts.clear()
 

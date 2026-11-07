@@ -368,6 +368,7 @@ PN = "PN"
 pnd = "pnd"
 
 [tool.typos.default.extend-identifiers]
+fpgs_optins = "fpgs_optins"  # Frozen benchmark evidence field.
 PNGs = "PNGs"
 Haa = "Haa"
 iy = "iy"

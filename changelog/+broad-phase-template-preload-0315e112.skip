@@ -1,0 +1,1 @@
+Load the world-template broad-phase kernel when the pipeline verifies its templates, so a first collide() captured on a driver older than CUDA 12.3 loads no module; this completes the unreleased change in +broad-phase-world-templates-f722a247.changed.md.

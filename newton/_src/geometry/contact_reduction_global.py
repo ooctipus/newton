@@ -53,6 +53,7 @@ See Also:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cache
 from typing import Any
 
 import warp as wp
@@ -83,12 +84,24 @@ from .contact_reduction import (
     get_spatial_direction_2d,
     project_point_to_plane,
 )
+from .heightfield_features import WELD_FLAT_SEAMS, HeightfieldFeatureContext, flat_seam_query_allowed
+from .heightfield_primitive_contact import (
+    ANALYTIC_PRIMITIVE_QUERIES,
+    analytic_convex_default,
+    analytic_primitives_default,
+)
 from .support_function import (
     AcceleratedSupportMapDataProvider,
+    SupportMapDataProvider,
     closest_point_on_triangle,
     create_triangle_prism_penetration_refiner,
     extract_shape_data,
+    support_map,
     support_map_accelerated,
+    support_map_heightfield_box,
+    support_map_heightfield_capsule,
+    support_map_heightfield_cylinder,
+    support_map_heightfield_sphere,
 )
 from .types import GeoType
 
@@ -98,6 +111,13 @@ from .types import GeoType
 BETA_THRESHOLD = 0.0001  # 0.1mm
 
 VALUES_PER_KEY = NUM_SPATIAL_DIRECTIONS + 1
+# Values are stored entry-major: each key owns one row of VALUES_STRIDE words,
+# of which the first VALUES_PER_KEY hold its winners. The last word only pads
+# the row: no writer addresses it, so it stays zero. Eight uint64 words make a
+# 64-byte row, so reading or retiring a key touches two sectors instead of one
+# sector in each of seven slot planes ``capacity`` entries apart.
+VALUES_STRIDE = 8
+assert VALUES_STRIDE >= VALUES_PER_KEY
 # Normal bins occupy 0..19 and 15 voxel groups occupy 20..34. Reserve
 # bin 35 for a pair-level predictive manifold without changing the regular
 # seven-slot value layout: six fingerprint-sharded clearance contacts and one
@@ -109,8 +129,8 @@ PAIRS_PER_KEY = VALUES_PER_KEY * (VALUES_PER_KEY - 1) // 2
 EXPORT_REDUCED_CONTACTS_BLOCK_DIM = 32
 EXPORT_REDUCED_CONTACTS_THREAD_BUDGET_MULTIPLIER = 4
 
-# Preserve slot-level parallelism below one full clear launch; larger active
-# sets have enough entry-level work to favor coalesced slot-major stores.
+# Preserve slot-level parallelism for small active sets; larger sets
+# assign one thread to each entry's value row.
 CLEAR_ACTIVE_ENTRY_PARALLEL_THRESHOLD = 1024
 
 # Open-addressed linear probing gets expensive at high load and failed inserts
@@ -206,9 +226,29 @@ def compute_effective_radius(shape_type: int, shape_scale: wp.vec4) -> float:
 # =============================================================================
 # Reduction slot functions (specific to contact reduction)
 # =============================================================================
-# These functions handle the slot-major value storage used for contact reduction.
-# Memory layout is slot-major (SoA) for coalesced GPU access:
-# [slot0_entry0, slot0_entry1, ..., slot0_entryN, slot1_entry0, ...]
+# These functions handle the entry-major value storage used for contact
+# reduction. Each hashtable entry owns one row of VALUES_STRIDE values:
+# [entry0_slot0, ..., entry0_slot7, entry1_slot0, ..., entry1_slot7, ...]
+# Slots 0 to VALUES_PER_KEY - 1 hold winners; slot 7 is padding that stays
+# zero. Every access addresses a value through reduction_value_index (device)
+# or reduction_value_index_np (host).
+
+
+@wp.func
+def reduction_value_index(entry_idx: int, slot_id: int) -> int:
+    """Return the position of one entry's value slot in the entry-major values array.
+
+    Args:
+        entry_idx: Entry index from hashtable_find_or_insert()
+        slot_id: Winner slot within the entry's row (0 to ``VALUES_PER_KEY - 1``),
+            or the padding slot ``VALUES_STRIDE - 1`` when clearing the whole row
+    """
+    return entry_idx * wp.static(VALUES_STRIDE) + slot_id
+
+
+def reduction_value_index_np(entry_idx, slot_id):
+    """Host counterpart of :func:`reduction_value_index` for integers and NumPy index arrays."""
+    return entry_idx * VALUES_STRIDE + slot_id
 
 
 @wp.func
@@ -217,7 +257,6 @@ def reduction_update_slot(
     slot_id: int,
     value: wp.uint64,
     values: wp.array[wp.uint64],
-    capacity: int,
 ):
     """Update a reduction slot using atomic max.
 
@@ -226,12 +265,11 @@ def reduction_update_slot(
 
     Args:
         entry_idx: Entry index from hashtable_find_or_insert()
-        slot_id: Which value slot to write to (0 to values_per_key-1)
+        slot_id: Which value slot to write to (0 to ``VALUES_PER_KEY - 1``)
         value: The uint64 value to max with existing value
-        values: Values array in slot-major layout
-        capacity: Hashtable capacity (number of entries)
+        values: Values array in entry-major layout
     """
-    value_idx = slot_id * capacity + entry_idx
+    value_idx = reduction_value_index(entry_idx, slot_id)
     # Check before atomic to reduce contention
     if values[value_idx] < value:
         wp.atomic_max(values, value_idx, value)
@@ -243,10 +281,9 @@ def reduction_try_update_slot(
     slot_id: int,
     value: wp.uint64,
     values: wp.array[wp.uint64],
-    capacity: int,
 ) -> wp.uint64:
     """Atomically update a slot and return the value that occupied it."""
-    value_idx = slot_id * capacity + entry_idx
+    value_idx = reduction_value_index(entry_idx, slot_id)
     previous_value = values[value_idx]
     if previous_value >= value:
         return previous_value
@@ -260,10 +297,9 @@ def reduction_rollback_slot(
     provisional_value: wp.uint64,
     previous_value: wp.uint64,
     values: wp.array[wp.uint64],
-    capacity: int,
 ):
     """Restore a displaced value without overwriting a newer winner."""
-    value_idx = slot_id * capacity + entry_idx
+    value_idx = reduction_value_index(entry_idx, slot_id)
     wp.atomic_cas(values, value_idx, provisional_value, previous_value)
 
 
@@ -274,10 +310,9 @@ def reduction_finalize_slot(
     provisional_value: wp.uint64,
     final_value: wp.uint64,
     values: wp.array[wp.uint64],
-    capacity: int,
 ) -> bool:
     """Atomically transfer a provisional slot claim to its materialized contact."""
-    value_idx = slot_id * capacity + entry_idx
+    value_idx = reduction_value_index(entry_idx, slot_id)
     return wp.atomic_cas(values, value_idx, provisional_value, final_value) == provisional_value
 
 
@@ -298,20 +333,19 @@ def reduction_insert_slot(
 
     Args:
         key: The uint64 key to insert
-        slot_id: Which value slot to write to (0 to values_per_key-1)
+        slot_id: Which value slot to write to (0 to ``VALUES_PER_KEY - 1``)
         value: The uint64 value to insert or max with
         keys: The hash table keys array (length must be power of two)
-        values: Values array in slot-major layout
+        values: Values array in entry-major layout, ``VALUES_STRIDE`` values per key
         active_slots: Array of size (capacity + 1) tracking active entry indices.
 
     Returns:
         True if insertion/update succeeded, False if the table is full
     """
-    capacity = keys.shape[0]
     entry_idx = hashtable_find_or_insert(key, keys, active_slots)
     if entry_idx < 0:
         return False
-    reduction_update_slot(entry_idx, slot_id, value, values, capacity)
+    reduction_update_slot(entry_idx, slot_id, value, values)
     return True
 
 
@@ -793,16 +827,15 @@ def _clear_active_kernel(
     ht_insert_failures: wp.array[wp.int32],
     buffer_overflows: wp.array[wp.int32],
     ht_capacity: int,
-    values_per_key: int,
-    entry_major: int,
+    values_stride: int,
     num_threads: int,
 ):
     """Clear active hashtable entries, values, hydroelastic aggregates, and counters.
 
-    Small active sets assign one thread per value slot to expose enough work for
-    the GPU. Large active sets assign one thread per entry so adjacent threads
-    write adjacent elements of each slot-major value array. The active count is
-    shared by the launch, so every thread follows the same branch.
+    Small active sets assign one thread per value of each entry's row to expose
+    enough work for the GPU. Large active sets assign one thread per entry, which
+    clears that entry's whole row. The active count is shared by the launch, so
+    every thread follows the same branch.
 
     Thread 0 also zeros contact_count, ht_insert_failures and buffer_overflows (no other thread in this
     kernel reads them, so there is no race). The active-slots count stored at
@@ -810,8 +843,8 @@ def _clear_active_kernel(
     at the top of the kernel and we have no cross-block barrier, so a follow-up
     kernel launch (``_zero_active_count_kernel``) is used to zero it safely.
 
-    Memory layout for values is slot-major (SoA):
-    [slot0_entry0, slot0_entry1, ..., slot0_entryN, slot1_entry0, ...]
+    Memory layout for values is entry-major, ``values_stride`` values per entry:
+    [entry0_slot0, ..., entry0_slot7, entry1_slot0, ...] for the shape-pair layout.
     """
     tid = wp.tid()
 
@@ -827,11 +860,11 @@ def _clear_active_kernel(
     count = ht_active_slots[ht_capacity]
 
     if count < wp.static(CLEAR_ACTIVE_ENTRY_PARALLEL_THRESHOLD):
-        total_work = count * values_per_key
+        total_work = count * values_stride
         i = tid
         while i < total_work:
-            active_idx = i / values_per_key
-            local_idx = i % values_per_key
+            active_idx = i / values_stride
+            local_idx = i % values_stride
             entry_idx = ht_active_slots[active_idx]
 
             if local_idx == 0:
@@ -848,10 +881,7 @@ def _clear_active_kernel(
                         agg_moment_reduced[entry_idx] = 0.0
                         agg_moment2_reduced[entry_idx] = 0.0
 
-            value_idx = local_idx * ht_capacity + entry_idx
-            if entry_major != 0:
-                value_idx = entry_idx * values_per_key + local_idx
-            ht_values[value_idx] = wp.uint64(0)
+            ht_values[entry_idx * values_stride + local_idx] = wp.uint64(0)
             i += num_threads
     else:
         active_idx = tid
@@ -871,11 +901,8 @@ def _clear_active_kernel(
                     agg_moment_reduced[entry_idx] = 0.0
                     agg_moment2_reduced[entry_idx] = 0.0
 
-            for local_idx in range(values_per_key):
-                value_idx = local_idx * ht_capacity + entry_idx
-                if entry_major != 0:
-                    value_idx = entry_idx * values_per_key + local_idx
-                ht_values[value_idx] = wp.uint64(0)
+            for local_idx in range(values_stride):
+                ht_values[entry_idx * values_stride + local_idx] = wp.uint64(0)
 
             active_idx += num_threads
 
@@ -916,6 +943,21 @@ class GroupReductionConfig:
     cell_size: float
     hashtable_capacity: int
     staging_capacity: int
+
+
+@wp.kernel(enable_backward=False)
+def _reset_after_export_kernel(
+    ht_active_slots: wp.array[wp.int32],
+    ht_capacity: int,
+    contact_count: wp.array[wp.int32],
+    ht_insert_failures: wp.array[wp.int32],
+    buffer_overflows: wp.array[wp.int32],
+):
+    """Reset counters after the preceding export retired all active entries."""
+    ht_active_slots[ht_capacity] = 0
+    contact_count[0] = 0
+    ht_insert_failures[0] = 0
+    buffer_overflows[0] = 0
 
 
 class GlobalContactReducer:
@@ -959,6 +1001,7 @@ class GlobalContactReducer:
     Attributes:
         capacity: Maximum number of contacts that can be stored
         values_per_key: Number of value slots per hashtable entry (``NUM_SPATIAL_DIRECTIONS + 1``)
+        values_stride: Length of each entry's row in ``ht_values`` (``VALUES_STRIDE``)
         position_depth: vec4 array storing position.xyz and depth
         normal: vec2 array storing octahedral-encoded contact normal
         shape_pairs: vec2i array storing (shape_a, shape_b) per contact
@@ -967,7 +1010,8 @@ class GlobalContactReducer:
         contact_pressure: float array storing current face pressure per contact (for hydroelastic)
         contact_count: Atomic counter for allocated contacts
         hashtable: HashTable for tracking best contacts (keys only)
-        ht_values: Values array for hashtable (managed here, not by HashTable)
+        ht_values: Values array for hashtable (managed here, not by HashTable),
+            entry-major: see :func:`reduction_value_index`
     """
 
     def __init__(
@@ -1030,6 +1074,9 @@ class GlobalContactReducer:
         self.group_reduction = group_reduction
         self._empty_shape_gap = wp.zeros(0, dtype=float, device=device)
         self.values_per_key = NUM_SPATIAL_DIRECTIONS + 1 if group_reduction is None else GROUP_VALUES_PER_KEY
+        # Entry-major rows: VALUES_STRIDE words for the shape-pair layout (one padding word), or the
+        # group mode's GROUP_VALUES_PER_KEY slots.
+        self.values_stride = VALUES_STRIDE if group_reduction is None else GROUP_VALUES_PER_KEY
 
         # Contact buffer (struct of arrays)
         # ID zero is reserved for provisional winners; real contacts use the
@@ -1080,9 +1127,10 @@ class GlobalContactReducer:
         self.hashtable = HashTable(hashtable_size, device=device)
 
         # Values array for hashtable - managed here, not by HashTable
-        # This is contact-reduction-specific (slot-major layout with values_per_key slots)
+        # This is contact-reduction-specific (entry-major rows of values_stride
+        # values, the first values_per_key of which hold slots)
         self.ht_values = wp.zeros(
-            self.hashtable.capacity * self.values_per_key if enable_reduction else 0,
+            self.hashtable.capacity * self.values_stride if enable_reduction else 0,
             dtype=wp.uint64,
             device=device,
         )
@@ -1184,8 +1232,7 @@ class GlobalContactReducer:
                 self.ht_insert_failures,
                 self.buffer_overflows,
                 self.hashtable.capacity,
-                self.values_per_key,
-                int(self.group_reduction is not None),
+                self.values_stride,
                 num_threads,
             ],
             device=self.device,
@@ -1198,6 +1245,31 @@ class GlobalContactReducer:
             _zero_active_count_kernel,
             dim=1,
             inputs=[self.hashtable.active_slots, self.hashtable.capacity],
+            device=self.device,
+            record_tape=False,
+        )
+
+    def reset_after_export(self):
+        """Reset counters after an explicitly destructive export.
+
+        Every active key and winner slot must already have been retired by
+        ``create_export_reduced_contacts_kernel(clear_after_export=True)``.
+        Call at the next collision boundary, after consumers have inspected the
+        previous active count and overflow evidence. Raw payload and exported
+        flags remain untouched; the next contact allocations initialize flags.
+        """
+        if self.store_hydroelastic_data or self.enable_contact_reclamation:
+            raise ValueError("Counter-only reset requires a non-hydroelastic reducer without contact reclamation")
+        wp.launch(
+            _reset_after_export_kernel,
+            dim=1,
+            inputs=[
+                self.hashtable.active_slots,
+                self.hashtable.capacity,
+                self.contact_count,
+                self.ht_insert_failures,
+                self.buffer_overflows,
+            ],
             device=self.device,
             record_tape=False,
         )
@@ -1396,8 +1468,6 @@ def reduce_contact_in_hashtable(
     aabb_lower = shape_collision_aabb_lower[shape_a]
     aabb_upper = shape_collision_aabb_upper[shape_a]
 
-    ht_capacity = reducer_data.ht_capacity
-
     # === Part 1: Normal-binned reduction (spatial extremes + max-depth per bin) ===
     # Get normal bin from polyhedron face matching
     bin_id = get_slot(normal)
@@ -1418,12 +1488,10 @@ def reduce_contact_in_hashtable(
                 score = wp.dot(pos_2d, dir_2d)
                 value = make_contact_value(score, fingerprint, contact_id, reducer_data.deterministic)
                 slot_id = dir_i
-                reduction_update_slot(entry_idx, slot_id, value, reducer_data.ht_values, ht_capacity)
+                reduction_update_slot(entry_idx, slot_id, value, reducer_data.ht_values)
 
         max_depth_value = make_contact_value(-depth, fingerprint, contact_id, reducer_data.deterministic)
-        reduction_update_slot(
-            entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS), max_depth_value, reducer_data.ht_values, ht_capacity
-        )
+        reduction_update_slot(entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS), max_depth_value, reducer_data.ht_values)
     else:
         wp.atomic_add(reducer_data.ht_insert_failures, 0, 1)
 
@@ -1451,7 +1519,7 @@ def reduce_contact_in_hashtable(
     if voxel_entry_idx >= 0:
         # Use -depth so atomic_max selects most penetrating (most negative depth)
         voxel_value = make_contact_value(-depth, fingerprint, contact_id, reducer_data.deterministic)
-        reduction_update_slot(voxel_entry_idx, voxel_local_slot, voxel_value, reducer_data.ht_values, ht_capacity)
+        reduction_update_slot(voxel_entry_idx, voxel_local_slot, voxel_value, reducer_data.ht_values)
     else:
         wp.atomic_add(reducer_data.ht_insert_failures, 0, 1)
 
@@ -1530,7 +1598,6 @@ def export_and_reduce_contact_centered(
         voxel_res: Voxel grid resolution
         reducer_data: Global reducer data
     """
-    ht_capacity = reducer_data.ht_capacity
     use_beta = depth < wp.static(BETA_THRESHOLD)
 
     # === Normal bin: find/create hashtable entry ===
@@ -1551,7 +1618,10 @@ def export_and_reduce_contact_centered(
             max_depth_probe = _make_preprune_probe_det(-depth, fingerprint)
         else:
             max_depth_probe = _make_contact_value_fast(-depth, 0, 0)
-        if reducer_data.ht_values[wp.static(NUM_SPATIAL_DIRECTIONS) * ht_capacity + entry_idx] < max_depth_probe:
+        if (
+            reducer_data.ht_values[reduction_value_index(entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS))]
+            < max_depth_probe
+        ):
             might_win = True
 
         if not might_win and use_beta:
@@ -1563,7 +1633,7 @@ def export_and_reduce_contact_centered(
                         probe = _make_preprune_probe_det(score, fingerprint)
                     else:
                         probe = _make_contact_value_fast(score, 0, 0)
-                    if reducer_data.ht_values[dir_i * ht_capacity + entry_idx] < probe:
+                    if reducer_data.ht_values[reduction_value_index(entry_idx, dir_i)] < probe:
                         might_win = True
 
     # === Voxel bin: only look up if normal bin didn't already show a win ===
@@ -1585,7 +1655,7 @@ def export_and_reduce_contact_centered(
                 voxel_probe = _make_preprune_probe_det(-depth, fingerprint)
             else:
                 voxel_probe = _make_contact_value_fast(-depth, 0, 0)
-            if reducer_data.ht_values[voxel_local_slot * ht_capacity + voxel_entry_idx] < voxel_probe:
+            if reducer_data.ht_values[reduction_value_index(voxel_entry_idx, voxel_local_slot)] < voxel_probe:
                 might_win = True
 
     if not might_win:
@@ -1603,12 +1673,10 @@ def export_and_reduce_contact_centered(
                 dir_2d = get_spatial_direction_2d(dir_i)
                 score = wp.dot(pos_2d, dir_2d)
                 value = make_contact_value(score, fingerprint, contact_id, reducer_data.deterministic)
-                reduction_update_slot(entry_idx, dir_i, value, reducer_data.ht_values, ht_capacity)
+                reduction_update_slot(entry_idx, dir_i, value, reducer_data.ht_values)
 
         max_depth_value = make_contact_value(-depth, fingerprint, contact_id, reducer_data.deterministic)
-        reduction_update_slot(
-            entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS), max_depth_value, reducer_data.ht_values, ht_capacity
-        )
+        reduction_update_slot(entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS), max_depth_value, reducer_data.ht_values)
     else:
         wp.atomic_add(reducer_data.ht_insert_failures, 0, 1)
 
@@ -1617,7 +1685,7 @@ def export_and_reduce_contact_centered(
         voxel_entry_idx = hashtable_find_or_insert(voxel_key, reducer_data.ht_keys, reducer_data.ht_active_slots)
     if voxel_entry_idx >= 0:
         voxel_value = make_contact_value(-depth, fingerprint, contact_id, reducer_data.deterministic)
-        reduction_update_slot(voxel_entry_idx, voxel_local_slot, voxel_value, reducer_data.ht_values, ht_capacity)
+        reduction_update_slot(voxel_entry_idx, voxel_local_slot, voxel_value, reducer_data.ht_values)
     else:
         wp.atomic_add(reducer_data.ht_insert_failures, 0, 1)
 
@@ -1631,6 +1699,7 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
     position: wp.vec3,
     normal: wp.vec3,
     depth: float,
+    step_end_depth: float,
     fingerprint: int,
     centered_position: wp.vec3,
     inner_spatial_depth: float,
@@ -1642,14 +1711,19 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
     reducer_data: GlobalContactReducerData,
     deterministic: int,
 ) -> int:
-    """Export contact with inner-preferred spatial winners.
+    """Export contact with touching-first spatial winners.
 
     Directional slots accept contacts out to ``outer_spatial_depth``, but
-    contacts inside ``inner_spatial_depth`` always outrank outer contacts.
-    Within the same inner/outer tier, the furthest spatial projection wins.
+    candidates that touch by the end of the step, ``step_end_depth`` inside
+    ``inner_spatial_depth``, outrank the others. ``step_end_depth`` is the
+    depth less the candidate's closing speed times the step (its current
+    ``depth`` when the motion is unknown), so the far side of a support that
+    a rocking body swings onto this step keeps rows. Within a tier the
+    furthest spatial projection wins; the max-depth and voxel slots take
+    contacts touching now (``depth`` inside ``inner_spatial_depth``) only.
     """
-    ht_capacity = reducer_data.ht_capacity
     use_inner = depth < inner_spatial_depth
+    step_end_inner = step_end_depth < inner_spatial_depth
     use_outer = depth < outer_spatial_depth
 
     if not use_outer:
@@ -1684,10 +1758,10 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
         # Read every slot before comparing so the loads issue back to back.
         slot_values = replaced_values_vec_type()
         for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS + 1)):
-            slot_values[dir_i] = reducer_data.ht_values[dir_i * ht_capacity + entry_idx]
+            slot_values[dir_i] = reducer_data.ht_values[reduction_value_index(entry_idx, dir_i)]
         voxel_slot_value = wp.uint64(0)
         if voxel_entry_idx >= 0:
-            voxel_slot_value = reducer_data.ht_values[voxel_local_slot * ht_capacity + voxel_entry_idx]
+            voxel_slot_value = reducer_data.ht_values[reduction_value_index(voxel_entry_idx, voxel_local_slot)]
 
         if use_inner:
             if deterministic != 0:
@@ -1704,7 +1778,7 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
         for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
             dir_2d = get_spatial_direction_2d(dir_i)
             score = wp.dot(pos_2d, dir_2d)
-            probe = make_spatial_preprune_probe(score, use_inner, fingerprint, deterministic)
+            probe = make_spatial_preprune_probe(score, step_end_inner, fingerprint, deterministic)
             if slot_values[dir_i] < probe:
                 might_win = True
     else:
@@ -1714,7 +1788,7 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
                 voxel_probe = _make_preprune_probe_det(-depth, fingerprint)
             else:
                 voxel_probe = _make_contact_value_fast(-depth, 0, 0)
-            if reducer_data.ht_values[voxel_local_slot * ht_capacity + voxel_entry_idx] < voxel_probe:
+            if reducer_data.ht_values[reduction_value_index(voxel_entry_idx, voxel_local_slot)] < voxel_probe:
                 might_win = True
 
     if not might_win:
@@ -1722,45 +1796,32 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
 
     won_mask = int(0)
     replaced_values = replaced_values_vec_type()
-    if use_inner and entry_idx >= 0:
+    if entry_idx >= 0:
         for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
             dir_2d = get_spatial_direction_2d(dir_i)
             score = wp.dot(pos_2d, dir_2d)
-            provisional_value = make_spatial_contact_value(score, True, fingerprint, 0, deterministic)
-            previous_value = reduction_try_update_slot(
-                entry_idx, dir_i, provisional_value, reducer_data.ht_values, ht_capacity
-            )
+            provisional_value = make_spatial_contact_value(score, step_end_inner, fingerprint, 0, deterministic)
+            previous_value = reduction_try_update_slot(entry_idx, dir_i, provisional_value, reducer_data.ht_values)
             if previous_value < provisional_value:
                 won_mask |= 1 << dir_i
                 replaced_values[dir_i] = previous_value
 
-        provisional_value = make_contact_value(-depth, fingerprint, 0, deterministic)
-        previous_value = reduction_try_update_slot(
-            entry_idx,
-            wp.static(NUM_SPATIAL_DIRECTIONS),
-            provisional_value,
-            reducer_data.ht_values,
-            ht_capacity,
-        )
-        if previous_value < provisional_value:
-            won_mask |= 1 << wp.static(NUM_SPATIAL_DIRECTIONS)
-            replaced_values[wp.static(NUM_SPATIAL_DIRECTIONS)] = previous_value
-    elif entry_idx >= 0:
-        for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
-            dir_2d = get_spatial_direction_2d(dir_i)
-            score = wp.dot(pos_2d, dir_2d)
-            provisional_value = make_spatial_contact_value(score, False, fingerprint, 0, deterministic)
+        if use_inner:
+            provisional_value = make_contact_value(-depth, fingerprint, 0, deterministic)
             previous_value = reduction_try_update_slot(
-                entry_idx, dir_i, provisional_value, reducer_data.ht_values, ht_capacity
+                entry_idx,
+                wp.static(NUM_SPATIAL_DIRECTIONS),
+                provisional_value,
+                reducer_data.ht_values,
             )
             if previous_value < provisional_value:
-                won_mask |= 1 << dir_i
-                replaced_values[dir_i] = previous_value
+                won_mask |= 1 << wp.static(NUM_SPATIAL_DIRECTIONS)
+                replaced_values[wp.static(NUM_SPATIAL_DIRECTIONS)] = previous_value
 
     if use_inner and voxel_entry_idx >= 0:
         provisional_value = make_contact_value(-depth, fingerprint, 0, deterministic)
         previous_value = reduction_try_update_slot(
-            voxel_entry_idx, voxel_local_slot, provisional_value, reducer_data.ht_values, ht_capacity
+            voxel_entry_idx, voxel_local_slot, provisional_value, reducer_data.ht_values
         )
         if previous_value < provisional_value:
             won_mask |= 1 << wp.static(NUM_SPATIAL_DIRECTIONS + 1)
@@ -1777,13 +1838,13 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
             if not still_wins and (won_mask & (1 << dir_i)) != 0:
                 dir_2d = get_spatial_direction_2d(dir_i)
                 score = wp.dot(pos_2d, dir_2d)
-                provisional_value = make_spatial_contact_value(score, use_inner, fingerprint, 0, deterministic)
-                if reducer_data.ht_values[dir_i * ht_capacity + entry_idx] == provisional_value:
+                provisional_value = make_spatial_contact_value(score, step_end_inner, fingerprint, 0, deterministic)
+                if reducer_data.ht_values[reduction_value_index(entry_idx, dir_i)] == provisional_value:
                     still_wins = True
 
         if not still_wins and use_inner and (won_mask & (1 << wp.static(NUM_SPATIAL_DIRECTIONS))) != 0:
             provisional_value = make_contact_value(-depth, fingerprint, 0, deterministic)
-            if reducer_data.ht_values[wp.static(NUM_SPATIAL_DIRECTIONS) * ht_capacity + entry_idx] == provisional_value:
+            if reducer_data.ht_values[reduction_value_index(entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS))] == provisional_value:
                 still_wins = True
 
     if (
@@ -1793,7 +1854,7 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
         and (won_mask & (1 << wp.static(NUM_SPATIAL_DIRECTIONS + 1))) != 0
     ):
         provisional_value = make_contact_value(-depth, fingerprint, 0, deterministic)
-        if reducer_data.ht_values[voxel_local_slot * ht_capacity + voxel_entry_idx] == provisional_value:
+        if reducer_data.ht_values[reduction_value_index(voxel_entry_idx, voxel_local_slot)] == provisional_value:
             still_wins = True
 
     # Without a surviving slot win, a contact may still claim the voxel slot of
@@ -1809,14 +1870,13 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
                 if (won_mask & (1 << dir_i)) != 0:
                     dir_2d = get_spatial_direction_2d(dir_i)
                     score = wp.dot(pos_2d, dir_2d)
-                    provisional_value = make_spatial_contact_value(score, use_inner, fingerprint, 0, deterministic)
+                    provisional_value = make_spatial_contact_value(score, step_end_inner, fingerprint, 0, deterministic)
                     reduction_rollback_slot(
                         entry_idx,
                         dir_i,
                         provisional_value,
                         replaced_values[dir_i],
-                        reducer_data.ht_values,
-                        ht_capacity,
+                        reducer_data.ht_values
                     )
             if use_inner and (won_mask & (1 << wp.static(NUM_SPATIAL_DIRECTIONS))) != 0:
                 provisional_value = make_contact_value(-depth, fingerprint, 0, deterministic)
@@ -1825,8 +1885,7 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
                     wp.static(NUM_SPATIAL_DIRECTIONS),
                     provisional_value,
                     replaced_values[wp.static(NUM_SPATIAL_DIRECTIONS)],
-                    reducer_data.ht_values,
-                    ht_capacity,
+                    reducer_data.ht_values
                 )
         if use_inner and voxel_entry_idx >= 0 and (won_mask & (1 << wp.static(NUM_SPATIAL_DIRECTIONS + 1))) != 0:
             provisional_value = make_contact_value(-depth, fingerprint, 0, deterministic)
@@ -1835,28 +1894,20 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
                 voxel_local_slot,
                 provisional_value,
                 replaced_values[wp.static(NUM_SPATIAL_DIRECTIONS + 1)],
-                reducer_data.ht_values,
-                ht_capacity,
+                reducer_data.ht_values
             )
         return -1
 
-    if use_inner and entry_idx >= 0:
+    if entry_idx >= 0:
         for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
             dir_2d = get_spatial_direction_2d(dir_i)
             score = wp.dot(pos_2d, dir_2d)
-            value = make_spatial_contact_value(score, True, fingerprint, contact_id, deterministic)
-            reduction_update_slot(entry_idx, dir_i, value, reducer_data.ht_values, ht_capacity)
+            value = make_spatial_contact_value(score, step_end_inner, fingerprint, contact_id, deterministic)
+            reduction_update_slot(entry_idx, dir_i, value, reducer_data.ht_values)
 
-        max_depth_value = make_contact_value(-depth, fingerprint, contact_id, deterministic)
-        reduction_update_slot(
-            entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS), max_depth_value, reducer_data.ht_values, ht_capacity
-        )
-    elif entry_idx >= 0:
-        for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
-            dir_2d = get_spatial_direction_2d(dir_i)
-            score = wp.dot(pos_2d, dir_2d)
-            value = make_spatial_contact_value(score, False, fingerprint, contact_id, deterministic)
-            reduction_update_slot(entry_idx, dir_i, value, reducer_data.ht_values, ht_capacity)
+        if use_inner:
+            max_depth_value = make_contact_value(-depth, fingerprint, contact_id, deterministic)
+            reduction_update_slot(entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS), max_depth_value, reducer_data.ht_values)
 
     if use_inner:
         if voxel_entry_idx < 0:
@@ -1868,8 +1919,7 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
                     voxel_entry_idx,
                     voxel_local_slot,
                     voxel_value,
-                    reducer_data.ht_values,
-                    ht_capacity,
+                    reducer_data.ht_values
                 )
                 if previous_value >= voxel_value:
                     reclaim_contact_id(contact_id, reducer_data)
@@ -1879,8 +1929,7 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
                     voxel_entry_idx,
                     voxel_local_slot,
                     voxel_value,
-                    reducer_data.ht_values,
-                    ht_capacity,
+                    reducer_data.ht_values
                 )
         else:
             wp.atomic_add(reducer_data.ht_insert_failures, 0, 1)
@@ -1898,6 +1947,7 @@ def export_and_reduce_contact_centered_two_spatial_depths(
     position: wp.vec3,
     normal: wp.vec3,
     depth: float,
+    step_end_depth: float,
     fingerprint: int,
     centered_position: wp.vec3,
     inner_spatial_depth: float,
@@ -1915,6 +1965,7 @@ def export_and_reduce_contact_centered_two_spatial_depths(
         position,
         normal,
         depth,
+        step_end_depth,
         fingerprint,
         centered_position,
         inner_spatial_depth,
@@ -1953,7 +2004,9 @@ def export_and_reduce_predictive_contact(
         shape_a: First shape index.
         shape_b: Second shape index.
         position: Contact midpoint in world space [m].
-        normal: Contact normal from the first shape to the second.
+        normal: Contact normal from the first shape to the second. A record this call buffers stores it as given,
+            the bits the regular export stores for the same candidate (:func:`export_contact_to_buffer`): which of
+            the two buffers a candidate depends on the slot races, so its data must not.
         depth: Centerline contact distance [m].
         surface_offset_sum: Combined collision margins [m].
         radius_eff_a: Effective radius of the first shape [m].
@@ -2003,9 +2056,8 @@ def export_and_reduce_predictive_contact(
     shard_hash = shard_hash * ((wp.uint32(0x846C) << wp.uint32(16)) | wp.uint32(0xA68B))
     shard_hash = shard_hash ^ (shard_hash >> wp.uint32(16))
     clearance_slot = int(shard_hash % wp.uint32(wp.static(NUM_SPATIAL_DIRECTIONS)))
-    ht_capacity = reducer_data.ht_capacity
-    clearance_idx = clearance_slot * ht_capacity + entry_idx
-    impact_time_idx = wp.static(NUM_SPATIAL_DIRECTIONS) * ht_capacity + entry_idx
+    clearance_idx = reduction_value_index(entry_idx, clearance_slot)
+    impact_time_idx = reduction_value_index(entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS))
 
     # ID zero is reserved so provisional winners can be claimed atomically
     # before allocating buffer storage.
@@ -2013,13 +2065,12 @@ def export_and_reduce_predictive_contact(
     if contact_id >= 0:
         clearance_value = make_contact_value(clearance_score, fingerprint, contact_id, reducer_data.deterministic)
         impact_time_value = make_contact_value(impact_time_score, fingerprint, contact_id, reducer_data.deterministic)
-        reduction_update_slot(entry_idx, clearance_slot, clearance_value, reducer_data.ht_values, ht_capacity)
+        reduction_update_slot(entry_idx, clearance_slot, clearance_value, reducer_data.ht_values)
         reduction_update_slot(
             entry_idx,
             wp.static(NUM_SPATIAL_DIRECTIONS),
             impact_time_value,
             reducer_data.ht_values,
-            ht_capacity,
         )
         if (
             reducer_data.ht_values[clearance_idx] == clearance_value
@@ -2031,14 +2082,13 @@ def export_and_reduce_predictive_contact(
     provisional_clearance_value = make_contact_value(clearance_score, fingerprint, 0, reducer_data.deterministic)
     provisional_impact_time_value = make_contact_value(impact_time_score, fingerprint, 0, reducer_data.deterministic)
     previous_clearance_value = reduction_try_update_slot(
-        entry_idx, clearance_slot, provisional_clearance_value, reducer_data.ht_values, ht_capacity
+        entry_idx, clearance_slot, provisional_clearance_value, reducer_data.ht_values
     )
     previous_impact_time_value = reduction_try_update_slot(
         entry_idx,
         wp.static(NUM_SPATIAL_DIRECTIONS),
         provisional_impact_time_value,
         reducer_data.ht_values,
-        ht_capacity,
     )
     clearance_won = previous_clearance_value < provisional_clearance_value
     impact_time_won = previous_impact_time_value < provisional_impact_time_value
@@ -2049,7 +2099,7 @@ def export_and_reduce_predictive_contact(
     if not clearance_won and not impact_time_won:
         return -1
 
-    contact_id = export_contact_to_buffer(shape_a, shape_b, position, contact_normal, depth, fingerprint, reducer_data)
+    contact_id = export_contact_to_buffer(shape_a, shape_b, position, normal, depth, fingerprint, reducer_data)
     if contact_id < 0:
         if clearance_won:
             reduction_rollback_slot(
@@ -2058,7 +2108,6 @@ def export_and_reduce_predictive_contact(
                 provisional_clearance_value,
                 previous_clearance_value,
                 reducer_data.ht_values,
-                ht_capacity,
             )
         if impact_time_won:
             reduction_rollback_slot(
@@ -2067,7 +2116,6 @@ def export_and_reduce_predictive_contact(
                 provisional_impact_time_value,
                 previous_impact_time_value,
                 reducer_data.ht_values,
-                ht_capacity,
             )
         return -1
 
@@ -2080,7 +2128,6 @@ def export_and_reduce_predictive_contact(
             provisional_clearance_value,
             clearance_value,
             reducer_data.ht_values,
-            ht_capacity,
         ):
             retained = True
     if impact_time_won:
@@ -2091,7 +2138,6 @@ def export_and_reduce_predictive_contact(
             provisional_impact_time_value,
             impact_time_value,
             reducer_data.ht_values,
-            ht_capacity,
         ):
             retained = True
     if retained:
@@ -2238,7 +2284,7 @@ def write_contact_to_reducer(
     reducer_data: GlobalContactReducerData,
     output_index: int,  # Unused, kept for API compatibility with write_contact_simple
 ):
-    """Writer function that stores contacts in GlobalContactReducer for reduction.
+    """Store contacts within the query gap in GlobalContactReducer for reduction.
 
     This follows the same signature as write_contact_simple in narrow_phase.py,
     so it can be used with create_compute_gjk_mpr_contacts and other contact
@@ -2252,6 +2298,28 @@ def write_contact_to_reducer(
         reducer_data: GlobalContactReducerData struct with all reducer arrays
         output_index: Unused, kept for API compatibility
     """
+    # The final writer subtracts the two reconstructed world points to test
+    # this same separation. Retain its near-threshold inputs, including normal
+    # packing and world-coordinate roundoff, but avoid allocating clearly far
+    # witnesses. The query's gap includes any speculative search extension.
+    separation = contact_data.contact_distance - contact_data.margin_a - contact_data.margin_b
+    excess = separation - contact_data.gap_sum
+    if excess > 0.0:
+        center = contact_data.contact_point_center
+        scale = (
+            1.0
+            + wp.max(wp.abs(center[0]), wp.max(wp.abs(center[1]), wp.abs(center[2])))
+            + wp.abs(contact_data.contact_distance)
+            + wp.abs(contact_data.radius_eff_a)
+            + wp.abs(contact_data.radius_eff_b)
+            + wp.abs(contact_data.margin_a)
+            + wp.abs(contact_data.margin_b)
+            + wp.abs(contact_data.gap_sum)
+        )
+        # A conservative 32-float-epsilon allowance; the final writer still checks admission.
+        if excess > 3.814697265625e-6 * scale and wp.length_sq(contact_data.contact_normal_a_to_b) > 0.0:
+            return
+
     # Extract contact info from ContactData
     position = contact_data.contact_point_center
     normal = contact_data.contact_normal_a_to_b
@@ -2724,32 +2792,24 @@ def finish_group_frame_kernel(
 
 
 @wp.func
-def _roundoff_duplicate_bit_for_slot_pair(
-    pair_idx: int,
-    entry_idx: int,
-    ht_capacity: int,
-    ht_values: wp.array[wp.uint64],
+def _duplicate_bit_for_winners(
+    slot_a: int,
+    slot_b: int,
+    value_a: wp.uint64,
+    value_b: wp.uint64,
     position_depth: wp.array[wp.vec4],
     normal: wp.array[wp.vec2],
     contact_fingerprints: wp.array[wp.int32],
     deterministic: int,
 ) -> int:
-    """Return the slot bit to suppress for one pair, or zero."""
-    slot_b = int(1)
-    while pair_idx >= slot_b:
-        pair_idx = pair_idx - slot_b
-        slot_b = slot_b + 1
-    slot_a = pair_idx
-
-    value_a = ht_values[slot_a * ht_capacity + entry_idx]
-    value_b = ht_values[slot_b * ht_capacity + entry_idx]
+    """Suppress a repeated ID or the existing roundoff-equivalent loser."""
     if value_a == wp.uint64(0) or value_b == wp.uint64(0):
         return 0
 
     contact_a = unpack_contact_id(value_a, deterministic)
     contact_b = unpack_contact_id(value_b, deterministic)
     if contact_a == contact_b:
-        return 0
+        return 1 << slot_b
     if not _contacts_are_numerically_equivalent(contact_a, contact_b, position_depth, normal):
         return 0
 
@@ -2758,7 +2818,34 @@ def _roundoff_duplicate_bit_for_slot_pair(
     return 1 << slot_b
 
 
-def create_export_reduced_contacts_kernel(writer_func: Any):
+@wp.func
+def _roundoff_duplicate_bit_for_slot_pair(
+    pair_idx: int,
+    entry_idx: int,
+    ht_values: wp.array[wp.uint64],
+    position_depth: wp.array[wp.vec4],
+    normal: wp.array[wp.vec2],
+    contact_fingerprints: wp.array[wp.int32],
+    deterministic: int,
+) -> int:
+    """Return the suppression bit for one triangularly indexed slot pair."""
+    slot_b = int(1)
+    while pair_idx >= slot_b:
+        pair_idx = pair_idx - slot_b
+        slot_b = slot_b + 1
+    return _duplicate_bit_for_winners(
+        pair_idx,
+        slot_b,
+        ht_values[reduction_value_index(entry_idx, pair_idx)],
+        ht_values[reduction_value_index(entry_idx, slot_b)],
+        position_depth,
+        normal,
+        contact_fingerprints,
+        deterministic,
+    )
+
+
+def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_export: bool = False, compact: bool = False):
     """Create a tiled kernel that exports globally reduced contacts.
 
     One thread block processes each active hashtable entry. Its first 21 lanes
@@ -2766,8 +2853,23 @@ def create_export_reduced_contacts_kernel(writer_func: Any):
     lower-fingerprint representative for roundoff-equivalent geometry. CUDA
     lanes export the seven surviving slots concurrently in fast mode; CPU and
     deterministic paths stream them serially from lane zero.
+
+    Args:
+        writer_func: Writer for contacts selected by the reducer.
+        clear_after_export: Explicitly retire consumed keys and winner slots.
+            This destructive option preserves raw payload, active indices/count
+            and failure counters until the next collision resets them. Callers
+            must finish reduction before export and must not reuse its winners.
+            Standalone export remains nondestructive by default.
+        compact: Use one ordinary thread per active key, reusing its seven
+            winners locally. This experimental mapping requires ``wp.launch``
+            and a thread count in place of the tiled mapping's block count.
     """
     _module = f"export_reduced_contacts_{writer_func.__name__}"
+    if clear_after_export:
+        _module += "_cleanup"
+    if compact:
+        _module += "_compact"
 
     @wp.func
     def export_contact_id(
@@ -2810,6 +2912,81 @@ def create_export_reduced_contacts_kernel(writer_func: Any):
         contact_data.sort_sub_key = contact_fingerprints[contact_id]
         writer_func(contact_data, writer_data, -1)
 
+    if compact:
+        winner_values = wp.types.vector(length=VALUES_PER_KEY, dtype=wp.uint64)
+
+        @wp.kernel(enable_backward=False, module=_module)
+        def export_compact_contacts_kernel(
+            ht_keys: wp.array[wp.uint64],
+            ht_values: wp.array[wp.uint64],
+            ht_active_slots: wp.array[wp.int32],
+            position_depth: wp.array[wp.vec4],
+            normal: wp.array[wp.vec2],
+            shape_pairs: wp.array[wp.vec2i],
+            contact_fingerprints: wp.array[wp.int32],
+            exported_flags: wp.array[wp.int32],
+            shape_types: wp.array[int],
+            shape_data: wp.array[wp.vec4],
+            shape_gap: wp.array[float],
+            writer_data: Any,
+            total_num_threads: int,
+            parallel_pairs: int,
+            deterministic: int,
+        ):
+            tid = wp.tid()
+            ht_capacity = ht_keys.shape[0]
+            num_active = ht_active_slots[ht_capacity]
+            for active_idx in range(tid, num_active, total_num_threads):
+                entry_idx = ht_active_slots[active_idx]
+                values = winner_values()
+                for slot in range(wp.static(VALUES_PER_KEY)):
+                    values[slot] = ht_values[reduction_value_index(entry_idx, slot)]
+
+                duplicate_mask = int(0)
+                for slot_b in range(1, wp.static(VALUES_PER_KEY)):
+                    # An early continue keeps this fixed loop dynamic in Warp,
+                    # forcing the winner vector into local memory.
+                    if values[slot_b] != wp.uint64(0):
+                        for slot_a in range(slot_b):
+                            duplicate_mask = duplicate_mask | _duplicate_bit_for_winners(
+                                slot_a,
+                                slot_b,
+                                values[slot_a],
+                                values[slot_b],
+                                position_depth,
+                                normal,
+                                contact_fingerprints,
+                                deterministic,
+                            )
+
+                for slot in range(wp.static(VALUES_PER_KEY)):
+                    value = values[slot]
+                    if value != wp.uint64(0) and duplicate_mask & (1 << slot) == 0:
+                        contact_id = unpack_contact_id(value, deterministic)
+                        if contact_id != 0:
+                            export_contact_id(
+                                contact_id,
+                                position_depth,
+                                normal,
+                                shape_pairs,
+                                contact_fingerprints,
+                                exported_flags,
+                                shape_types,
+                                shape_data,
+                                shape_gap,
+                                writer_data,
+                            )
+
+                if wp.static(clear_after_export):
+                    # Active keys are unique; this thread has finished all
+                    # winner reads. Cross-key claims retain their raw payload.
+                    for slot in range(wp.static(VALUES_PER_KEY)):
+                        if values[slot] != wp.uint64(0):
+                            ht_values[reduction_value_index(entry_idx, slot)] = wp.uint64(0)
+                    ht_keys[entry_idx] = HASHTABLE_EMPTY_KEY
+
+        return export_compact_contacts_kernel
+
     @wp.kernel(enable_backward=False, module=_module)
     def export_reduced_contacts_kernel(
         ht_keys: wp.array[wp.uint64],
@@ -2842,7 +3019,6 @@ def create_export_reduced_contacts_kernel(writer_func: Any):
                     duplicate_bit = _roundoff_duplicate_bit_for_slot_pair(
                         lane,
                         entry_idx,
-                        ht_capacity,
                         ht_values,
                         position_depth,
                         normal,
@@ -2854,7 +3030,6 @@ def create_export_reduced_contacts_kernel(writer_func: Any):
                     duplicate_bit = duplicate_bit | _roundoff_duplicate_bit_for_slot_pair(
                         pair_idx,
                         entry_idx,
-                        ht_capacity,
                         ht_values,
                         position_depth,
                         normal,
@@ -2867,7 +3042,7 @@ def create_export_reduced_contacts_kernel(writer_func: Any):
 
             if parallel_pairs != 0 and deterministic == 0:
                 if lane < wp.static(VALUES_PER_KEY) and duplicate_mask & (1 << lane) == 0:
-                    value = ht_values[lane * ht_capacity + entry_idx]
+                    value = ht_values[reduction_value_index(entry_idx, lane)]
                     if value != wp.uint64(0):
                         contact_id = unpack_contact_id(value, deterministic)
                         if contact_id != 0:
@@ -2887,7 +3062,7 @@ def create_export_reduced_contacts_kernel(writer_func: Any):
                 for slot in range(wp.static(VALUES_PER_KEY)):
                     if duplicate_mask & (1 << slot) != 0:
                         continue
-                    value = ht_values[slot * ht_capacity + entry_idx]
+                    value = ht_values[reduction_value_index(entry_idx, slot)]
                     if value == wp.uint64(0):
                         continue
 
@@ -2913,159 +3088,376 @@ def create_export_reduced_contacts_kernel(writer_func: Any):
             # can reuse the shared tile for the next active entry.
             wp.tile_scatter_masked(duplicate_bits, lane, int(0), True)
 
+            if wp.static(clear_after_export):
+                # The tile barrier above finishes all reads of this entry.
+                # Other entries deduplicate through raw payload/flags, which
+                # remain live. Keep counts and failures for later inspection.
+                if parallel_pairs != 0:
+                    if lane < wp.static(VALUES_PER_KEY):
+                        value_idx = reduction_value_index(entry_idx, lane)
+                        if ht_values[value_idx] != wp.uint64(0):
+                            ht_values[value_idx] = wp.uint64(0)
+                elif lane == 0:
+                    for slot in range(wp.static(VALUES_PER_KEY)):
+                        value_idx = reduction_value_index(entry_idx, slot)
+                        if ht_values[value_idx] != wp.uint64(0):
+                            ht_values[value_idx] = wp.uint64(0)
+                if lane == 0:
+                    ht_keys[entry_idx] = HASHTABLE_EMPTY_KEY
+
     return export_reduced_contacts_kernel
 
 
-@wp.kernel(enable_backward=False, module="unique")
-def mesh_triangle_contacts_to_reducer_kernel(
-    shape_types: wp.array[int],
-    shape_data: wp.array[wp.vec4],
-    shape_transform: wp.array[wp.transform],
-    shape_source: wp.array[wp.uint64],
-    shape_support_data: wp.array[wp.vec4i],
-    support_lut: wp.array[int],
-    support_vertex_offsets: wp.array[int],
-    support_neighbors: wp.array[int],
-    shape_interior_point: wp.array[wp.vec3],
-    shape_gap: wp.array[float],
-    shape_heightfield_index: wp.array[wp.int32],
-    heightfield_data: wp.array[HeightfieldData],
-    heightfield_elevations: wp.array[wp.float32],
-    triangle_pairs: wp.array[wp.vec3i],
-    triangle_pairs_count: wp.array[int],
-    reducer_data: GlobalContactReducerData,
-    total_num_threads: int,
+def create_mesh_triangle_contacts_to_reducer_kernel(
+    primitive_type: int = 0,
+    exclude_primitives: bool = False,
+    *,
+    skip_marked: bool = False,
+    writer_func=write_contact_to_reducer,
+    writer_binding=None,
+    writer_data_type=GlobalContactReducerData,
+    kernel_name=None,
+    analytic: bool | None = None,
 ):
-    """Process mesh/heightfield-triangle contacts and store them in GlobalContactReducer.
+    """Create the original query or a filtered heightfield primitive variant.
 
-    This kernel processes triangle pairs (mesh-or-hfield shape, convex-shape, triangle_index)
-    and computes contacts using exact sphere-triangle geometry or GJK/MPR, storing results
-    in the GlobalContactReducer for subsequent reduction and export.
-
-    Uses grid stride loop over triangle pairs.
+    Args:
+        analytic: Use the closed-form cell contact of ``ANALYTIC_PRIMITIVE_QUERIES``
+            for a typed primitive query that has one, or, in the generic
+            fallback that still serves heightfield convex pairs, for those
+            pairs inside the same kernel (every typed kernel is one more scan
+            of the whole candidate list, so convex hulls do not get their own).
+            ``None`` reads ``NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES`` (default on)
+            and, for the convex row, ``NEWTON_HEIGHTFIELD_ANALYTIC_CONVEX``
+            (default off); an explicit ``True`` enables both.
     """
-    tid = wp.tid()
+    analytic_convex = analytic if analytic is not None else analytic_convex_default()
+    if analytic is None:
+        analytic = analytic_primitives_default()
+    analytic = bool(analytic)
+    convex_in_fallback = exclude_primitives
+    return _create_mesh_triangle_contacts_to_reducer_kernel(
+        primitive_type,
+        exclude_primitives,
+        skip_marked=skip_marked,
+        writer_func=writer_func,
+        writer_binding=writer_binding,
+        writer_data_type=writer_data_type,
+        kernel_name=kernel_name,
+        analytic=analytic and primitive_type in ANALYTIC_PRIMITIVE_QUERIES,
+        analytic_convex=bool(analytic_convex)
+        and convex_in_fallback
+        and int(GeoType.CONVEX_MESH) in ANALYTIC_PRIMITIVE_QUERIES,
+    )
 
-    num_triangle_pairs = triangle_pairs_count[0]
 
-    for i in range(tid, num_triangle_pairs, total_num_threads):
-        if i >= triangle_pairs.shape[0]:
-            break
+HEIGHTFIELD_PRIMITIVE_SUPPORTS = {
+    int(GeoType.SPHERE): support_map_heightfield_sphere,
+    int(GeoType.CAPSULE): support_map_heightfield_capsule,
+    int(GeoType.CYLINDER): support_map_heightfield_cylinder,
+    int(GeoType.BOX): support_map_heightfield_box,
+    int(GeoType.CONVEX_MESH): support_map,
+}
+"""Typed heightfield primitive queries: each type owns a reduced support dispatch."""
 
-        triple = triangle_pairs[i]
-        shape_a = triple[0]  # Mesh or heightfield shape
-        shape_b = triple[1]  # Convex shape
-        tri_idx = triple[2]
 
-        type_a = shape_types[shape_a]
+@wp.func
+def heightfield_typed_primitive(shape_type: int, shape_scale: wp.vec4) -> bool:
+    """Whether a heightfield pair with this convex shape is owned by a typed primitive query."""
+    if shape_type == GeoType.SPHERE or shape_type == GeoType.CAPSULE or shape_type == GeoType.BOX:
+        return True
+    return shape_type == GeoType.CYLINDER and shape_scale[2] == 0.0
 
-        if type_a == GeoType.HFIELD:
-            # Heightfield triangle
-            hfd = heightfield_data[shape_heightfield_index[shape_a]]
-            X_ws_a = shape_transform[shape_a]
-            shape_data_a, v0_world = get_triangle_shape_from_heightfield(hfd, heightfield_elevations, X_ws_a, tri_idx)
-        else:
-            # Mesh triangle (mesh_id already validated by midphase)
-            mesh_id_a = shape_source[shape_a]
-            scale_data_a = shape_data[shape_a]
-            mesh_scale_a = wp.vec3(scale_data_a[0], scale_data_a[1], scale_data_a[2])
-            X_ws_a = shape_transform[shape_a]
-            shape_data_a, v0_world = get_triangle_shape_from_mesh(mesh_id_a, mesh_scale_a, X_ws_a, tri_idx)
 
-        # Extract shape B data
-        pos_b, quat_b, shape_data_b, _scale_b, margin_offset_b = extract_shape_data(
-            shape_b,
-            shape_transform,
-            shape_types,
-            shape_data,
-            shape_source,
+@cache
+def _create_mesh_triangle_contacts_to_reducer_kernel(
+    primitive_type: int = 0,
+    exclude_primitives: bool = False,
+    *,
+    skip_marked: bool = False,
+    writer_func=write_contact_to_reducer,
+    writer_binding=None,
+    writer_data_type=GlobalContactReducerData,
+    kernel_name=None,
+    analytic: bool = False,
+    analytic_convex: bool = False,
+):
+    if primitive_type not in (0, *HEIGHTFIELD_PRIMITIVE_SUPPORTS):
+        raise ValueError("Only sphere, capsule, cylinder, box and convex-mesh heightfield queries can be specialized")
+    if primitive_type and exclude_primitives:
+        raise ValueError("A typed query cannot also exclude primitive pairs")
+    # Convex hulls take the cooked accelerated support (directional seeds and vertex adjacency);
+    # the typed primitive queries keep their reduced support dispatch.
+    accelerated = primitive_type in (0, int(GeoType.CONVEX_MESH))
+    query_support = support_map_accelerated if accelerated else HEIGHTFIELD_PRIMITIVE_SUPPORTS[primitive_type]
+    query_filter = flat_seam_query_allowed if WELD_FLAT_SEAMS else None
+    if analytic:
+        pair_query = ANALYTIC_PRIMITIVE_QUERIES[primitive_type](writer_func, query_filter=query_filter)
+    else:
+        pair_query = create_compute_gjk_mpr_contacts(
+            writer_func,
+            support_func=query_support,
+            use_precomputed_center=True,
+            penetration_refiner=create_triangle_prism_penetration_refiner(query_support),
+            query_filter=query_filter,
         )
-        if shape_data_b.shape_type == GeoType.CONVEX_MESH:
-            # MPR/GJK need an interior seed. A hull's AABB center can lie
-            # outside it and flip the contact against thin triangles.
-            shape_data_b.center = shape_interior_point[shape_b]
+    # The fallback keeps heightfield convex pairs in its own scan; with the
+    # closed-form row on, those pairs take the row here instead of GJK/MPR.
+    convex_query = (
+        ANALYTIC_PRIMITIVE_QUERIES[int(GeoType.CONVEX_MESH)](writer_func, query_filter=query_filter)
+        if analytic_convex
+        else pair_query
+    )
 
-        # Triangle position is vertex A in world space.
-        # For heightfield prisms, edges are in heightfield-local space
-        # so we pass the heightfield rotation to let MPR/GJK work in
-        # that frame (where -Z is always the down axis).
-        pos_a = v0_world
-        if type_a == GeoType.HFIELD:
-            quat_a = wp.transform_get_rotation(shape_transform[shape_a])
-        else:
-            quat_a = wp.quat_identity()
+    def mesh_triangle_contacts_to_reducer_kernel(
+        shape_types: wp.array[int],
+        shape_data: wp.array[wp.vec4],
+        shape_transform: wp.array[wp.transform],
+        shape_source: wp.array[wp.uint64],
+        shape_gap: wp.array[float],
+        shape_heightfield_index: wp.array[wp.int32],
+        heightfield_data: wp.array[HeightfieldData],
+        heightfield_elevations: wp.array[wp.float32],
+        triangle_pairs: wp.array[wp.vec3i],
+        triangle_pairs_count: wp.array[int],
+        reducer_data: writer_data_type,
+        total_num_threads: int,
+        # Convex-hull support acceleration and interior seeds (MESH_TRIANGLE_SUPPORT_INPUTS order).
+        shape_support_data: wp.array[wp.vec4i],
+        support_lut: wp.array[int],
+        support_vertex_offsets: wp.array[int],
+        support_neighbors: wp.array[int],
+        shape_interior_point: wp.array[wp.vec3],
+    ):
+        """Process mesh/heightfield-triangle contacts and store them in GlobalContactReducer.
 
-        # Mesh triangles were back-face culled in the midphase against an
-        # interior point of the convex shape. TRIANGLE_PRISM (heightfields)
-        # stays one-sided through its extruded support function.
+        This kernel processes triangle pairs (mesh-or-hfield shape, convex-shape, triangle_index)
+        and computes contacts using exact sphere-triangle geometry or GJK/MPR, storing results
+        in the GlobalContactReducer for subsequent reduction and export.
 
-        # Extract margin offset for shape A (signed distance padding)
-        margin_offset_a = shape_data[shape_a][3]
+        Uses grid stride loop over triangle pairs.
+        """
+        tid = wp.tid()
 
-        # Use additive per-shape contact gap for detection threshold
-        gap_a = shape_gap[shape_a]
-        gap_b = shape_gap[shape_b]
-        gap_sum = gap_a + gap_b
+        num_triangle_pairs = triangle_pairs_count[0]
 
-        # Heightfields use extruded triangle prisms to keep contacts one-sided near
-        # cell boundaries, so their sphere contacts must retain the generic path.
-        if shape_data_b.shape_type == GeoType.SPHERE and type_a != GeoType.HFIELD:
-            tri_a = pos_a
-            tri_b = pos_a + shape_data_a.scale
-            tri_c = pos_a + shape_data_a.auxiliary
-            surface_normal = wp.cross(tri_b - tri_a, tri_c - tri_a)
-            normal_length_sq = wp.length_sq(surface_normal)
-            closest = closest_point_on_triangle(pos_b, tri_a, tri_b, tri_c)
-            sphere_radius = shape_data_b.scale[0]
+        for i in range(tid, num_triangle_pairs, total_num_threads):
+            if i >= triangle_pairs.shape[0]:
+                break
 
-            contact_distance, contact_position, contact_normal = collide_sphere_sphere(
-                closest, 0.0, pos_b, sphere_radius
+            # Preserve the original argument in the unbound specialization.
+            if wp.static(writer_binding is not None):
+                reducer_data = wp.static(writer_binding)(reducer_data, i)
+            triple = triangle_pairs[i]
+            shape_a = triple[0]  # Mesh or heightfield shape
+            shape_b = triple[1]  # Convex shape
+            tri_idx = triple[2]
+            if wp.static(skip_marked):
+                if tri_idx < 0:
+                    continue
+
+            type_a = shape_types[shape_a]
+            if wp.static(primitive_type != 0):
+                if type_a != GeoType.HFIELD or shape_types[shape_b] != primitive_type:
+                    continue
+                if wp.static(primitive_type == int(GeoType.CYLINDER)):
+                    if shape_data[shape_b][2] != 0.0:
+                        continue
+                type_a = wp.static(int(GeoType.HFIELD))
+            elif wp.static(exclude_primitives):
+                if type_a == GeoType.HFIELD and heightfield_typed_primitive(shape_types[shape_b], shape_data[shape_b]):
+                    continue
+
+            if wp.static(primitive_type != 0):
+                hfd = heightfield_data[shape_heightfield_index[shape_a]]
+                X_ws_a = shape_transform[shape_a]
+                shape_data_a, v0_world = get_triangle_shape_from_heightfield(
+                    hfd, heightfield_elevations, X_ws_a, tri_idx
+                )
+            elif type_a == GeoType.HFIELD:
+                # Heightfield triangle
+                hfd = heightfield_data[shape_heightfield_index[shape_a]]
+                X_ws_a = shape_transform[shape_a]
+                shape_data_a, v0_world = get_triangle_shape_from_heightfield(
+                    hfd, heightfield_elevations, X_ws_a, tri_idx
+                )
+            else:
+                # Mesh triangle (mesh_id already validated by midphase)
+                mesh_id_a = shape_source[shape_a]
+                scale_data_a = shape_data[shape_a]
+                mesh_scale_a = wp.vec3(scale_data_a[0], scale_data_a[1], scale_data_a[2])
+                X_ws_a = shape_transform[shape_a]
+                shape_data_a, v0_world = get_triangle_shape_from_mesh(mesh_id_a, mesh_scale_a, X_ws_a, tri_idx)
+
+            # Extract shape B data
+            pos_b, quat_b, shape_data_b, _scale_b, margin_offset_b = extract_shape_data(
+                shape_b,
+                shape_transform,
+                shape_types,
+                shape_data,
+                shape_source,
             )
-            if wp.length_sq(pos_b - closest) < 1.0e-24 and normal_length_sq > 1.0e-24:
-                contact_normal = surface_normal / wp.sqrt(normal_length_sq)
-                contact_position = pos_b - 0.5 * sphere_radius * contact_normal
+            if wp.static(primitive_type != 0):
+                # The current pair passed the exact type filter above. Keep
+                # that fact visible when compiling the shared query math.
+                shape_data_b.shape_type = wp.static(primitive_type)
+            if shape_data_b.shape_type == GeoType.CONVEX_MESH:
+                # MPR/GJK need an interior seed. A hull's AABB center can lie
+                # outside it and flip the contact against thin triangles.
+                shape_data_b.center = shape_interior_point[shape_b]
 
-            if contact_distance < gap_sum + margin_offset_a + margin_offset_b:
-                contact_data = ContactData()
-                contact_data.contact_point_center = contact_position
-                contact_data.contact_normal_a_to_b = contact_normal
-                contact_data.contact_distance = contact_distance
-                contact_data.radius_eff_a = 0.0
-                contact_data.radius_eff_b = sphere_radius
-                contact_data.margin_a = margin_offset_a
-                contact_data.margin_b = margin_offset_b
-                contact_data.shape_a = shape_a
-                contact_data.shape_b = shape_b
-                contact_data.gap_sum = gap_sum
-                contact_data.sort_sub_key = (tri_idx << 1) | 1
-                write_contact_to_reducer(contact_data, reducer_data, -1)
-            continue
+            # Triangle position is vertex A in world space.
+            # For heightfield prisms, edges are in heightfield-local space
+            # so we pass the heightfield rotation to let MPR/GJK work in
+            # that frame (where -Z is always the down axis).
+            pos_a = v0_world
+            if type_a == GeoType.HFIELD:
+                quat_a = wp.transform_get_rotation(shape_transform[shape_a])
+            else:
+                quat_a = wp.quat_identity()
 
-        data_provider = AcceleratedSupportMapDataProvider()
-        data_provider.shape_support_data = shape_support_data
-        data_provider.support_neighbors = support_neighbors
-        data_provider.support_lut = support_lut
-        data_provider.support_vertex_offsets = support_vertex_offsets
-        wp.static(
-            create_compute_gjk_mpr_contacts(
-                write_contact_to_reducer,
-                support_func=support_map_accelerated,
-                use_precomputed_center=True,
-                penetration_refiner=create_triangle_prism_penetration_refiner(support_map_accelerated),
-            )
-        )(
-            shape_data_a,
-            shape_data_b,
-            quat_a,
-            quat_b,
-            pos_a,
-            pos_b,
-            gap_sum,
-            shape_a,
-            shape_b,
-            margin_offset_a,
-            margin_offset_b,
-            data_provider,
-            reducer_data,
-            (tri_idx << 1) | 1,
-        )
+            # Mesh midphase already applies topology-aware back-face admission.
+            # Repeating a center-only test would discard closed-surface overlaps.
+
+            # Extract margin offset for shape A (signed distance padding)
+            margin_offset_a = shape_data[shape_a][3]
+
+            # Use additive per-shape contact gap for detection threshold
+            gap_a = shape_gap[shape_a]
+            gap_b = shape_gap[shape_b]
+            gap_sum = gap_a + gap_b
+
+            if wp.static(primitive_type == 0):
+                # Heightfields use extruded triangle prisms to keep contacts one-sided near
+                # cell boundaries, so their sphere contacts must retain the generic path.
+                if shape_data_b.shape_type == GeoType.SPHERE and type_a != GeoType.HFIELD:
+                    tri_a = pos_a
+                    tri_b = pos_a + shape_data_a.scale
+                    tri_c = pos_a + shape_data_a.auxiliary
+                    surface_normal = wp.cross(tri_b - tri_a, tri_c - tri_a)
+                    normal_length_sq = wp.length_sq(surface_normal)
+                    closest = closest_point_on_triangle(pos_b, tri_a, tri_b, tri_c)
+                    sphere_radius = shape_data_b.scale[0]
+
+                    contact_distance, contact_position, contact_normal = collide_sphere_sphere(
+                        closest, 0.0, pos_b, sphere_radius
+                    )
+                    if wp.length_sq(pos_b - closest) < 1.0e-24 and normal_length_sq > 1.0e-24:
+                        contact_normal = surface_normal / wp.sqrt(normal_length_sq)
+                        contact_position = pos_b - 0.5 * sphere_radius * contact_normal
+
+                    if contact_distance < gap_sum + margin_offset_a + margin_offset_b:
+                        contact_data = ContactData()
+                        contact_data.contact_point_center = contact_position
+                        contact_data.contact_normal_a_to_b = contact_normal
+                        contact_data.contact_distance = contact_distance
+                        contact_data.radius_eff_a = 0.0
+                        contact_data.radius_eff_b = sphere_radius
+                        contact_data.margin_a = margin_offset_a
+                        contact_data.margin_b = margin_offset_b
+                        contact_data.shape_a = shape_a
+                        contact_data.shape_b = shape_b
+                        contact_data.gap_sum = gap_sum
+                        contact_data.sort_sub_key = (tri_idx << 1) | 1
+                        writer_func(contact_data, reducer_data, -1)
+                    continue
+
+            if wp.static(accelerated):
+                data_provider = AcceleratedSupportMapDataProvider()
+                data_provider.shape_support_data = shape_support_data
+                data_provider.support_neighbors = support_neighbors
+                data_provider.support_lut = support_lut
+                data_provider.support_vertex_offsets = support_vertex_offsets
+            else:
+                data_provider = SupportMapDataProvider()
+
+            feature_context = HeightfieldFeatureContext()
+            if wp.static(WELD_FLAT_SEAMS):
+                feature_context.elevations = heightfield_elevations
+                feature_context.triangle = tri_idx
+                if type_a == GeoType.HFIELD:
+                    feature_context.heightfield = heightfield_data[shape_heightfield_index[shape_a]]
+
+            if wp.static(analytic_convex):
+                if type_a == GeoType.HFIELD and shape_data_b.shape_type == GeoType.CONVEX_MESH:
+                    # The closed-form convex row only exists for heightfields; this branch compiles
+                    # when it is on, and it takes no support provider.
+                    wp.static(convex_query)(
+                        shape_data_a,
+                        shape_data_b,
+                        quat_a,
+                        quat_b,
+                        pos_a,
+                        pos_b,
+                        gap_sum,
+                        shape_a,
+                        shape_b,
+                        margin_offset_a,
+                        margin_offset_b,
+                        reducer_data,
+                        (tri_idx << 1) | 1,
+                        feature_context,
+                    )
+                    continue
+            if wp.static(analytic):
+                wp.static(pair_query)(
+                    shape_data_a,
+                    shape_data_b,
+                    quat_a,
+                    quat_b,
+                    pos_a,
+                    pos_b,
+                    gap_sum,
+                    shape_a,
+                    shape_b,
+                    margin_offset_a,
+                    margin_offset_b,
+                    reducer_data,
+                    (tri_idx << 1) | 1,
+                    feature_context,
+                )
+            else:
+                wp.static(pair_query)(
+                    shape_data_a,
+                    shape_data_b,
+                    quat_a,
+                    quat_b,
+                    pos_a,
+                    pos_b,
+                    gap_sum,
+                    shape_a,
+                    shape_b,
+                    margin_offset_a,
+                    margin_offset_b,
+                    data_provider,
+                    reducer_data,
+                    (tri_idx << 1) | 1,
+                    feature_context,
+                )
+
+    if primitive_type == int(GeoType.SPHERE):
+        mesh_triangle_contacts_to_reducer_kernel.__name__ = "heightfield_sphere_contacts_to_reducer_kernel"
+    elif primitive_type == int(GeoType.CAPSULE):
+        mesh_triangle_contacts_to_reducer_kernel.__name__ = "heightfield_capsule_contacts_to_reducer_kernel"
+    elif primitive_type == int(GeoType.CYLINDER):
+        mesh_triangle_contacts_to_reducer_kernel.__name__ = "heightfield_cylinder_contacts_to_reducer_kernel"
+    elif primitive_type == int(GeoType.BOX):
+        mesh_triangle_contacts_to_reducer_kernel.__name__ = "heightfield_box_contacts_to_reducer_kernel"
+    elif primitive_type == int(GeoType.CONVEX_MESH):
+        mesh_triangle_contacts_to_reducer_kernel.__name__ = "heightfield_convex_contacts_to_reducer_kernel"
+    if analytic:
+        mesh_triangle_contacts_to_reducer_kernel.__name__ += "_analytic"
+    elif exclude_primitives:
+        mesh_triangle_contacts_to_reducer_kernel.__name__ = "mesh_triangle_contacts_to_reducer_fallback_kernel"
+    if analytic_convex:
+        mesh_triangle_contacts_to_reducer_kernel.__name__ += "_analytic_convex"
+    if skip_marked:
+        mesh_triangle_contacts_to_reducer_kernel.__name__ += "_finite_fallback"
+    if kernel_name is not None:
+        mesh_triangle_contacts_to_reducer_kernel.__name__ = kernel_name
+    mesh_triangle_contacts_to_reducer_kernel.__qualname__ = mesh_triangle_contacts_to_reducer_kernel.__name__
+    mesh_triangle_contacts_to_reducer_kernel.__annotations__["reducer_data"] = writer_data_type
+    return wp.kernel(mesh_triangle_contacts_to_reducer_kernel, enable_backward=False, module="unique")
+
+
+mesh_triangle_contacts_to_reducer_kernel = create_mesh_triangle_contacts_to_reducer_kernel()

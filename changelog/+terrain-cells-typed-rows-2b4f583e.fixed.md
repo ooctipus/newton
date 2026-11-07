@@ -1,0 +1,1 @@
+Keep box and capsule heightfield contacts when the terrain convex-cells owner is installed (`convex_collision="auto"` on CUDA, `convex_collision="convex_cells"` or `NEWTON_HEIGHTFIELD_CONVEX_CELLS=1`); the owner dropped the typed capsule and box rows, so those shapes fell through the terrain.

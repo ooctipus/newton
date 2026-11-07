@@ -5,6 +5,7 @@ import contextlib
 import ctypes
 import ctypes.util
 import dataclasses
+import gc
 import importlib.util
 import io
 import linecache
@@ -19,6 +20,7 @@ import unittest
 import warnings
 import xml.etree.ElementTree as ET
 from typing import Any
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -167,6 +169,42 @@ def import_pyglet_window(*, shadow_window: bool = True):
     finally:
         pyglet.options["shadow_window"] = saved_shadow_window
     return pyglet
+@contextlib.contextmanager
+def assert_host_only():
+    """Fail on any Warp kernel launch, copy, synchronization or array read or write inside the block.
+
+    ``wp.array.list()`` and ``str()`` read through ``numpy()``, and ``clone()`` copies through
+    :func:`warp.copy`, so the patched entry points cover them.
+    """
+    targets = [
+        *(("wp", wp, name) for name in ("launch", "launch_tiled", "copy")),
+        *(("wp", wp, name) for name in ("synchronize", "synchronize_device", "synchronize_stream")),
+        *(("wp.array", wp.array, name) for name in ("numpy", "assign", "zero_", "fill_")),
+    ]
+    with contextlib.ExitStack() as stack:
+        for label, owner, name in targets:
+            error = AssertionError(f"unexpected device access: {label}.{name}")
+            stack.enter_context(mock.patch.object(owner, name, side_effect=error))
+        yield
+
+
+@contextlib.contextmanager
+def scoped_capture_after_gc(*args, **kwargs):
+    """:class:`warp.ScopedCapture` that first frees the garbage earlier tests left in reference cycles.
+
+    ``wp.func`` holds its own frame in a local, a reference cycle whose ``f_back`` chain keeps the
+    locals of every caller alive, so a model built in one test can outlive it until the cyclic
+    collector runs. A collection inside a CUDA capture that destroys a Warp texture, such as a mesh
+    SDF's, is refused (error 900) and invalidates the capture (901). The ``newton.tests`` runner
+    collects after every test; plain ``python -m unittest`` does not.
+
+    Args:
+        *args: Positional arguments of :class:`warp.ScopedCapture`.
+        **kwargs: Keyword arguments of :class:`warp.ScopedCapture`.
+    """
+    gc.collect()
+    with wp.ScopedCapture(*args, **kwargs) as capture:
+        yield capture
 
 
 try:

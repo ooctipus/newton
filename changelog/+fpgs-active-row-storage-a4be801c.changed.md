@@ -1,0 +1,1 @@
+Use smaller temporary row storage for large CUDA FeatherPGS batches with 128-row capacity while retaining the full-capacity fallback and solver allowance. Set `FEATHER_PGS_DENSE_ROW_BUDGETS=0` before construction to retain the previous storage selection.

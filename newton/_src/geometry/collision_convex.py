@@ -153,6 +153,7 @@ def create_solve_convex_multi_contact(
     post_process_contact: Any,
     use_precomputed_center: bool = False,
     penetration_refiner: Any = None,
+    query_filter: Any = None,
 ):
     """Create a fused MPR/GJK multi-contact solver.
 
@@ -162,6 +163,7 @@ def create_solve_convex_multi_contact(
         post_process_contact: Function that post-processes generated contacts.
         use_precomputed_center: Whether the geometry data supplies a cached center.
         penetration_refiner: Optional physical-proxy result refinement function.
+        query_filter: Optional current-feature predicate, before separated-contact publication.
 
     Returns:
         The specialized contact solver.
@@ -174,6 +176,7 @@ def create_solve_convex_multi_contact(
     )
     solve_gjk = create_solve_closest_distance(support_func, _support_funcs=support_funcs)
     has_penetration_refiner = penetration_refiner is not None
+    has_query_filter = query_filter is not None
 
     @wp.func
     def solve_convex_multi_contact(
@@ -188,6 +191,7 @@ def create_solve_convex_multi_contact(
         skip_multi_contact: bool,
         writer_data: Any,
         contact_template: ContactData,
+        query_context: Any = 0,
     ) -> int:
         # Shared relative-frame transform (computed once for both algorithms).
         relative_orientation_b = wp.quat_inverse(orientation_a) * orientation_b
@@ -254,6 +258,10 @@ def create_solve_convex_multi_contact(
                 max_dist=gjk_separation_cutoff(contact_threshold, position_a, position_b),
             )
 
+        if wp.static(has_query_filter):
+            if signed_distance >= 0.0 and not query_filter(geom_a, point_a, normal, query_context):
+                return 0
+
         if skip_multi_contact or signed_distance > contact_threshold:
             # Transform to world space only for the single-contact early-out.
             point = 0.5 * (point_a + point_b)
@@ -301,6 +309,7 @@ def create_solve_convex_single_contact(
     post_process_contact: Any,
     use_precomputed_center: bool = False,
     penetration_refiner: Any = None,
+    query_filter: Any = None,
 ):
     """Create a fused MPR/GJK single-contact solver.
 
@@ -310,6 +319,7 @@ def create_solve_convex_single_contact(
         post_process_contact: Function that post-processes generated contacts.
         use_precomputed_center: Whether the geometry data supplies a cached center.
         penetration_refiner: Optional physical-proxy result refinement function.
+        query_filter: Optional current-feature predicate, before separated-contact publication.
 
     Returns:
         The specialized contact solver.
@@ -322,6 +332,7 @@ def create_solve_convex_single_contact(
     )
     solve_gjk = create_solve_closest_distance(support_func, _support_funcs=support_funcs)
     has_penetration_refiner = penetration_refiner is not None
+    has_query_filter = query_filter is not None
 
     @wp.func
     def solve_convex_single_contact(
@@ -335,6 +346,7 @@ def create_solve_convex_single_contact(
         contact_threshold: float,
         writer_data: Any,
         contact_template: ContactData,
+        query_context: Any = 0,
     ) -> int:
         # Shared relative-frame transform (computed once for both algorithms).
         relative_orientation_b = wp.quat_inverse(orientation_a) * orientation_b
@@ -392,6 +404,10 @@ def create_solve_convex_single_contact(
                 data_provider,
                 max_dist=gjk_separation_cutoff(contact_threshold, position_a, position_b),
             )
+
+        if wp.static(has_query_filter):
+            if signed_distance >= 0.0 and not query_filter(geom_a, point_a, normal, query_context):
+                return 0
 
         # Transform results back to world space (once).
         point = 0.5 * (point_a + point_b)

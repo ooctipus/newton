@@ -33,6 +33,7 @@ from ..math import normalize_with_norm, safe_div
 
 # Local type definitions for use within kernels
 _vec8f = wp.types.vector(8, wp.float32)
+_vec8i = wp.types.vector(8, wp.int32)
 _mat23f = wp.types.matrix((2, 3), wp.float32)
 _mat43f = wp.types.matrix((4, 3), wp.float32)
 _mat83f = wp.types.matrix((8, 3), wp.float32)
@@ -764,7 +765,7 @@ def _compute_rotmore(face_idx: int) -> wp.mat33:
 
 
 @wp.func
-def collide_box_box(
+def collide_box_box_features(
     # In:
     box1_pos: wp.vec3,
     box1_rot: wp.mat33,
@@ -773,8 +774,9 @@ def collide_box_box(
     box2_rot: wp.mat33,
     box2_size: wp.vec3,
     margin: float = 0.0,
-) -> tuple[wp.types.vector(8, wp.float32), wp.types.matrix((8, 3), wp.float32), wp.types.matrix((8, 3), wp.float32)]:
-    """Core contact geometry calculation for box-box collision.
+):
+    """Core contact geometry calculation for box-box collision, with a
+    stable per-contact feature id.
 
     Args:
       box1_pos: Center position of the first box
@@ -791,14 +793,27 @@ def collide_box_box(
         contact_dist: Vector of contact distances (MAXVAL for unpopulated contacts)
         contact_pos: Matrix of contact positions (one per row)
         contact_normals: Matrix of contact normal vectors (one per row)
+        contact_features: Vector of feature ids (-1 for unpopulated contacts):
+            ``axis_code * 64 + family * 16 + index``, assigned at candidate
+            generation in the SAT reference frame, so an id names the same
+            geometric feature every frame regardless of how the output slots
+            compact. ``axis_code`` is the separating-axis identity (0..11 =
+            face of box 1/2 incl. sign, 12..20 = edge pair); family 0 = an
+            incident edge clipped against a reference-face boundary (index =
+            line * 4 + boundary axis * 2 + side), family 1 = reference-face
+            corner inside the incident face (index = corner), family 2 =
+            incident-face corner inside the reference face (index = corner).
     """
 
     # Initialize output matrices
     contact_dist = _vec8f()
+    contact_features = _vec8i()
     for i in range(8):
         contact_dist[i] = MAXVAL
+        contact_features[i] = -1
     contact_pos = _mat83f()
     contact_normals = _mat83f()
+    feats = _vec8i()
 
     # Compute transforms between box's frames
     pos21 = wp.transpose(box1_rot) @ (box2_pos - box1_pos)
@@ -827,7 +842,7 @@ def collide_box_box(
         c2 = -wp.abs(pos12[i]) + box2_size[i] + plen1[i]
 
         if c1 < -margin or c2 < -margin:
-            return contact_dist, contact_pos, contact_normals
+            return contact_dist, contact_pos, contact_normals, contact_features
 
         if c1 < separation:
             separation = c1
@@ -872,7 +887,7 @@ def collide_box_box(
 
             # Early exit: no collision if separated along this axis
             if c3 < -margin:
-                return contact_dist, contact_pos, contact_normals
+                return contact_dist, contact_pos, contact_normals, contact_features
 
             # Track minimum separation and which edge-edge pair it occurs on
             if c3 < separation - edge_bias:
@@ -894,7 +909,7 @@ def collide_box_box(
 
     # No axis with separation < margin found
     if axis_code == -1:
-        return contact_dist, contact_pos, contact_normals
+        return contact_dist, contact_pos, contact_normals, contact_features
 
     points = _mat83f()
     depth = _vec8f()
@@ -978,6 +993,7 @@ def collide_box_box(
                                     ):
                                         if n < 8:
                                             points[n] = cand
+                                            feats[n] = i * 4 + q * 2 + wp.where(j > 0, 1, 0)  # family 0
                                             n += 1
                                         else:
                                             overflow = True
@@ -1006,6 +1022,7 @@ def collide_box_box(
                                 ):
                                     if n < 8:
                                         points[n] = cand
+                                        feats[n] = 16 + i  # family 1
                                         n += 1
                                     else:
                                         overflow = True
@@ -1019,6 +1036,7 @@ def collide_box_box(
                             ):
                                 if n < 8:
                                     points[n] = cand
+                                    feats[n] = 32 + i  # family 2
                                     n += 1
                                 else:
                                     overflow = True
@@ -1092,7 +1110,7 @@ def collide_box_box(
 
         # Check if contact normal is valid
         if wp.abs(rnorm[2]) < MINVAL:
-            return contact_dist, contact_pos, contact_normals  # Shouldn't happen
+            return contact_dist, contact_pos, contact_normals, contact_features  # Shouldn't happen
 
         # Calculate inverse normal for projection
         innorm = wp.where(inv, -1.0, 1.0) / rnorm[2]
@@ -1141,6 +1159,7 @@ def collide_box_box(
                         points[n, q] += 0.5 * l
                         points[n, 1 - q] += 0.5 * c2
                         depth[n] = points[n, 2] * innorm * 2.0
+                        feats[n] = i * 4 + q * 2 + wp.where(j > 0, 1, 0)  # family 0
                         n += 1
 
         nl = n
@@ -1184,6 +1203,7 @@ def collide_box_box(
             points[n] = 0.5 * (points[n] + vtmp)
 
             depth[n] = wp.sqrt(tc1) * wp.where(vtmp[2] < 0, -1.0, 1.0)
+            feats[n] = 16 + i  # family 1
             n += 1
 
         nf = n
@@ -1224,6 +1244,7 @@ def collide_box_box(
             points[n] = tmp_p * 0.5
 
             depth[n] = wp.sqrt(c1) * wp.where(pu[i, 2] < 0, -1.0, 1.0)
+            feats[n] = 32 + i  # family 2
             n += 1
 
         # Set up contact data for all points
@@ -1240,7 +1261,33 @@ def collide_box_box(
         contact_dist[i] = depth[i]
         contact_pos[i] = pos
         contact_normals[i] = normal
+        contact_features[i] = axis_code * 64 + feats[i]
 
+    return contact_dist, contact_pos, contact_normals, contact_features
+
+
+@wp.func
+def collide_box_box(
+    # In:
+    box1_pos: wp.vec3,
+    box1_rot: wp.mat33,
+    box1_size: wp.vec3,
+    box2_pos: wp.vec3,
+    box2_rot: wp.mat33,
+    box2_size: wp.vec3,
+    margin: float = 0.0,
+) -> tuple[wp.types.vector(8, wp.float32), wp.types.matrix((8, 3), wp.float32), wp.types.matrix((8, 3), wp.float32)]:
+    """Box-box contact geometry (see :func:`collide_box_box_features`);
+    identical results without the per-contact feature ids."""
+    contact_dist, contact_pos, contact_normals, _features = collide_box_box_features(
+        box1_pos,
+        box1_rot,
+        box1_size,
+        box2_pos,
+        box2_rot,
+        box2_size,
+        margin,
+    )
     return contact_dist, contact_pos, contact_normals
 
 

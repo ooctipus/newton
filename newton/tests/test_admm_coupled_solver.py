@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import inspect
 import math
+import os
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -1517,6 +1519,48 @@ class TestAdmmCollisionDetection(unittest.TestCase):
         np.testing.assert_array_equal(after_lambda[selected], 0.0)
         np.testing.assert_array_equal(after_u[~selected], u_before[active][~selected])
         np.testing.assert_array_equal(after_lambda[~selected], lambda_before[active][~selected])
+
+    def test_contact_pipeline_keeps_pairs_of_welded_bodies(self):
+        """Keep every listed pair in the ADMM contact pipeline and forward model notifications to it.
+
+        ADMM couples cross-solver joints through compliant attachments, so a body that the
+        model welds to the world through one can move, and the pipeline's default immobile-pair
+        filter does not apply.
+        """
+        builder = newton.ModelBuilder()
+        builder.default_shape_cfg.density = 1000.0
+        bodies = []
+        for x in (0.0, 0.09):
+            pose = wp.transform(wp.vec3(x, 0.0, 0.5), wp.quat_identity())
+            body = builder.add_link(xform=pose)
+            builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
+            builder.add_articulation([builder.add_joint_fixed(-1, body, parent_xform=pose)])
+            bodies.append(body)
+        model = builder.finalize(device="cpu")
+        with patch.dict(os.environ):
+            os.environ.pop("NEWTON_BROAD_PHASE_IMMOBILE_FILTER", None)
+            solver = SolverCoupledADMM(
+                model=model,
+                entries=[
+                    SolverCoupled.Entry(
+                        name=name,
+                        solver=lambda v: SolverSemiImplicit(model=v, enable_tri_contact=False),
+                        bodies=[body],
+                    )
+                    for name, body in zip(("a", "b"), bodies, strict=True)
+                ],
+                coupling=SolverCoupledADMM.Config(
+                    contact_pairs=[SolverCoupledADMM.ContactPair(source="a", destination="b")],
+                ),
+            )
+        pipeline = solver._admm_collision_pipeline
+        record = pipeline.get_collision_selection()["immobile_pairs"]
+        self.assertEqual(record["listed_pairs"], 1)
+        self.assertFalse(record["enabled"])
+        self.assertEqual(record["excluded_pairs"], 0)
+        with patch.object(pipeline, "notify_model_changed", wraps=pipeline.notify_model_changed) as notify:
+            solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+        notify.assert_called_once_with(newton.ModelFlags.JOINT_PROPERTIES)
 
     def test_rigid_contact_detection_rejects_cross_world_pairs(self):
         builder = newton.ModelBuilder()

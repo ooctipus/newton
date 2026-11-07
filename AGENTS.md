@@ -15,6 +15,38 @@ uv sync --extra examples
 uv run -m newton.examples basic_pendulum
 ```
 
+## Collab-fork solver branches (skild workstream)
+
+This fork's solver work is consumed as a **git submodule of `skild-ai/skild-IL-solver`**,
+whose production branch (`fpgs-main`) pins exact commits of the branches below. That
+changes the branch rules:
+
+- Lineage (full map: `reports/vishal/robotiq/branches.md` in skild-IL-solver):
+  base `3ee2ff96` → `vishal/fpgs-mimic-rows` (FPGS mimic/connect rows, passive joint
+  springs, CRBA loop-joint indexing fix) → `vishal/fpgs-preelim` (bilateral
+  pre-elimination). `vishal/kamino-robotiq` is a pinned workspace at the mimic-rows tip.
+  New solver features branch off the current validated tip (`<username>/<feature-desc>`
+  per the rule above).
+- **Push before pointer.** Push the newton-collab branch to origin *before* committing
+  the parent-repo submodule pointer that references it — otherwise fresh parent
+  checkouts fail at submodule init.
+- **Never force-push or rewrite a branch whose commits a parent pointer references.**
+  Remote GC can prune orphaned SHAs and break every parent checkout pinned to them.
+  When splitting history for upstream PRs (`git rebase --onto origin/main 3ee2ff96`),
+  create *new* branches and leave the referenced ones intact.
+- **Validation gates before a tip may become a parent pointer**: the FPGS test modules
+  pass (`uv run --extra dev python -m unittest newton.tests.test_feather_pgs_mimic
+  newton.tests.test_feather_pgs_connect newton.tests.test_feather_pgs_contract_joints
+  newton.tests.test_feather_pgs_preelim`), regression-first discipline holds (tests
+  verified failing without the change), and solver changes that affect grasp behavior
+  pass the parent repo's P25 sustained-squeeze gate
+  (`P25_FPGS_PREELIM=1 P25_FPGS_ITERS=64 ... p25_curling_grasp.py --solver feather_pgs
+  --object pinch --headless --steps 300 --close-at 60 --rigid-gap 0.005` must hold the
+  cube).
+- **Warp kernel cache when bisecting generated-source edits** (e.g. the FPGS sweep-phase
+  filters): stale caches in `~/.cache/warp` silently run the old kernels — clear the
+  cache between bisection steps.
+
 ## Tests
 
 Follow the canonical [test organization and runtime guidelines](CODING_GUIDELINES.rst#test-organization-and-runtime) when changing or reviewing tests.
@@ -36,6 +68,25 @@ uvx --with virtualenv asv run --launch-method spawn main^!
 - If opening a pull request on GitHub, use the template in `.github/PULL_REQUEST_TEMPLATE.md`.
 - Follow `changelog/README.md`: add a Towncrier fragment for user-facing changes instead of editing `CHANGELOG.md` directly. A `.skip` reason is optional for changes without user-facing impact.
 - Preview fragments with `uvx --from towncrier==25.8.0 towncrier build --draft --version X.Y.Z --date YYYY-MM-DD`.
+
+## FPGS large-gain workstream
+
+For the ongoing FPGS optimization study, preserve the inherited handoff and
+fixed per-task performance references.
+
+- Benchmark representative tasks before specializing the architecture. RTX PRO
+  6000 is primary; run paired RTX/GB300 batches with one job per device.
+- Leave Isaac Lab code and task timestep/substep/iteration allowances unchanged.
+  Newton solver algorithms and representations may change.
+- Prioritize structural whole-physics savings. Count screening, conversion,
+  fallback and publication costs; do not substitute component speedups or
+  resolved-world percentages for task-level progress.
+- Validate numerical convergence and physical behavior, not bit identity,
+  unchanged contact counts or unnecessary per-operation formal certificates.
+- Timebox a theory-versus-measurement mismatch, diagnose its cause, and allow a
+  targeted corrective experiment. Do not reject an algorithm solely because
+  its first mapping is slow, or repeatedly tune a failed mapping without new
+  evidence. Record measured gain, diagnosed loss and unvalidated ideas separately.
 
 ## Examples
 

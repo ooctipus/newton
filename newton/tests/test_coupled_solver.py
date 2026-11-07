@@ -12,6 +12,9 @@ import warp as wp
 
 import newton
 from newton._src.geometry.flags import ParticleFlags, ShapeFlags
+from newton._src.sim.contacts import contact_frame_write, note_contact_frame_write
+from newton._src.solvers.coupled import interface as interface_module
+from newton._src.solvers.coupled import solver_coupled_proxy as proxy_module
 from newton._src.solvers.coupled.interface import CouplingEndpointKind, CouplingInterface
 from newton._src.solvers.coupled.solver_coupled import _filter_soft_contacts_global_shape_ids_kernel
 from newton._src.solvers.mujoco.equality import _add_equality_constraint
@@ -1450,6 +1453,75 @@ class TestSolverCoupledBasic(unittest.TestCase):
             reused = coupled.entry_contacts("A", contacts)
             self.assertIs(reused, filtered)
             self.assertEqual(reused.contact_matching_mode, mode)
+
+    def test_entry_filter_notes_a_frame_write_of_the_entry_buffer(self):
+        """Note a frame write of the entry's buffer on every filter pass, and none for the source or a pass-through."""
+        coupled = SolverCoupled(
+            model=self.model,
+            entries=[SolverCoupled.Entry(name="A", solver=SolverSemiImplicit, bodies=[0], shapes=[0])],
+        )
+        pipeline = newton.CollisionPipeline(self.model, broad_phase="nxn")
+        contacts = pipeline.contacts()
+        pipeline.collide(self.model.state(), contacts)
+        source = contact_frame_write(contacts.contact_generation)
+        filtered = coupled.entry_contacts("A", contacts)
+        first = contact_frame_write(filtered.contact_generation)
+        self.assertIsNotNone(first)
+        self.assertIsNone(first.scope)
+        self.assertGreater(first.tick, source.tick)
+        self.assertIs(coupled.entry_contacts("A", contacts), filtered)
+        second = contact_frame_write(filtered.contact_generation)
+        self.assertGreater(second.tick, first.tick, "every filter pass may rewrite the entry's frame")
+        self.assertIs(coupled.entry_contacts("A", filtered), filtered)
+        self.assertEqual(contact_frame_write(filtered.contact_generation), second, "an entry buffer passes through")
+        self.assertEqual(contact_frame_write(contacts.contact_generation), source, "the filter only reads the source")
+
+    def test_proxy_contact_filter_notes_its_encode_and_restore(self):
+        """Note frame writes of the source contacts when proxy filtering encodes their shapes and restores them."""
+        _StepCountingCopySolver.instances.clear()
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        ground_shape = builder.add_ground_plane()
+        src_body = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        src_shape = builder.add_shape_sphere(body=src_body, radius=0.1)
+        dst_body = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        dst_shape = builder.add_shape_sphere(body=dst_body, radius=0.1)
+        model = builder.finalize(device="cpu")
+        coupled = SolverCoupledProxy(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[src_body], shapes=[src_shape]),
+                SolverCoupled.Entry(
+                    name="dst", solver=_ContactRecordingCopySolver, bodies=[dst_body], shapes=[ground_shape, dst_shape]
+                ),
+            ],
+            coupling=SolverCoupledProxy.Config(
+                proxies=[SolverCoupledProxy.Proxy(source="src", destination="dst", bodies=[src_body])],
+            ),
+        )
+        contacts = newton.Contacts(2, 0, device=model.device)
+        contacts.rigid_contact_count.assign(np.array([2], dtype=np.int32))
+        contacts.rigid_contact_shape0.assign(np.array([ground_shape, src_shape], dtype=np.int32))
+        contacts.rigid_contact_shape1.assign(np.array([dst_shape, dst_shape], dtype=np.int32))
+        noted = []
+
+        def note(generation):
+            noted.append(generation)
+            return note_contact_frame_write(generation)
+
+        with (
+            mock.patch.object(interface_module, "note_contact_frame_write", side_effect=note),
+            mock.patch.object(proxy_module, "note_contact_frame_write", side_effect=note),
+        ):
+            coupled.step(model.state(), model.state(), control=None, contacts=contacts, dt=1.0 / 60.0)
+        self.assertEqual(len(noted), 2)
+        self.assertTrue(all(generation is contacts.contact_generation for generation in noted))
+        stepped = _ContactRecordingCopySolver.instances["dst"].step_contacts
+        self.assertEqual(len(stepped), 1)
+        self.assertIsNot(stepped[0], contacts)
+        entry = contact_frame_write(stepped[0].contact_generation)
+        restored = contact_frame_write(contacts.contact_generation)
+        self.assertLess(entry.tick, restored.tick, "the restore follows the entry's filter")
+        np.testing.assert_array_equal(contacts.rigid_contact_shape0.numpy(), [ground_shape, src_shape])
 
     def test_configure_view_applies_after_compaction(self):
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))

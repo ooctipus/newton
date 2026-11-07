@@ -1,0 +1,1 @@
+Add `terrain_rows` and `terrain_stale` to `NarrowPhase.buffer_capacity_status()`, so that `check_buffer_capacity()` raises when a terrain-law pair overflows its rows or reads terrain features older than the heights; no route sets them yet.

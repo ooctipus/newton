@@ -1,0 +1,1 @@
+Remove the opt-in one-launch publication of `SolverFeatherPGS` general-route articulations; the separate impulse, integration and publication launches it matched bit for bit run as before. Unset `FEATHER_PGS_FUSED_PUBLISH`, which selects nothing; `get_path_selection()["routes"]["publication"]` no longer has a `fused_general` entry.

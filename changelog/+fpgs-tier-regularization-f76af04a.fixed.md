@@ -1,0 +1,1 @@
+Keep `SolverFeatherPGS`'s parallel matrix-free tiers (`mf_gs_parallel_rows`) off when `pgs_contact_regularization` regularizes contacts: the tiers solved the unregularized contact law in the worlds they owned while the serial sweeps applied the regularizer. `get_path_selection()` reports the reason under `routes.friction.parallel_rows`.

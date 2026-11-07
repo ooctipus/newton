@@ -8,7 +8,13 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.geometry.contact_reduction_global import GlobalContactReducer, reduction_insert_slot
+from newton._src.geometry.contact_reduction_global import (
+    VALUES_PER_KEY,
+    VALUES_STRIDE,
+    GlobalContactReducer,
+    reduction_insert_slot,
+    reduction_value_index_np,
+)
 from newton._src.geometry.hashtable import HashTable
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -66,7 +72,6 @@ def test_global_reducer_hashtable_scales_with_contact_capacity(test, device):
 
 def test_insert_single_slot(test, device):
     """Test inserting values into different slots of the same key."""
-    values_per_key = 13
 
     @wp.kernel(module="unique")
     def insert_test_kernel(
@@ -78,12 +83,12 @@ def test_insert_single_slot(test, device):
         reduction_insert_slot(wp.uint64(123), 0, wp.uint64(100), keys, values, active_slots)
         # Insert into slot 5
         reduction_insert_slot(wp.uint64(123), 5, wp.uint64(200), keys, values, active_slots)
-        # Insert into slot 12
-        reduction_insert_slot(wp.uint64(123), 12, wp.uint64(300), keys, values, active_slots)
+        # Insert into the entry's last winner slot
+        reduction_insert_slot(wp.uint64(123), wp.static(VALUES_PER_KEY - 1), wp.uint64(300), keys, values, active_slots)
 
     ht = HashTable(capacity=64, device=device)
     # Allocate values array externally (caller-managed)
-    values = wp.zeros(ht.capacity * values_per_key, dtype=wp.uint64, device=device)
+    values = wp.zeros(ht.capacity * VALUES_STRIDE, dtype=wp.uint64, device=device)
 
     wp.launch(
         insert_test_kernel,
@@ -100,15 +105,16 @@ def test_insert_single_slot(test, device):
     test.assertEqual(len(entry_idx), 1)
     idx = entry_idx[0]
 
-    # Check values at each slot (slot-major layout: slot * capacity + entry_idx)
-    test.assertEqual(values_np[0 * ht.capacity + idx], 100)
-    test.assertEqual(values_np[5 * ht.capacity + idx], 200)
-    test.assertEqual(values_np[12 * ht.capacity + idx], 300)
+    # Check values at each slot of the entry's row
+    test.assertEqual(values_np[reduction_value_index_np(idx, 0)], 100)
+    test.assertEqual(values_np[reduction_value_index_np(idx, 5)], 200)
+    test.assertEqual(values_np[reduction_value_index_np(idx, VALUES_PER_KEY - 1)], 300)
+    # Nothing else is written, including the padding slot that ends the row.
+    test.assertEqual(np.count_nonzero(values_np), 3)
 
 
 def test_atomic_max_behavior(test, device):
     """Test that atomic max correctly keeps the maximum value."""
-    values_per_key = 13
 
     @wp.kernel(module="unique")
     def atomic_max_test_kernel(
@@ -122,7 +128,7 @@ def test_atomic_max_behavior(test, device):
         reduction_insert_slot(wp.uint64(999), 0, wp.uint64(tid + 1), keys, values, active_slots)
 
     ht = HashTable(capacity=64, device=device)
-    values = wp.zeros(ht.capacity * values_per_key, dtype=wp.uint64, device=device)
+    values = wp.zeros(ht.capacity * VALUES_STRIDE, dtype=wp.uint64, device=device)
 
     wp.launch(
         atomic_max_test_kernel,
@@ -139,13 +145,12 @@ def test_atomic_max_behavior(test, device):
     test.assertEqual(len(entry_idx), 1)
     idx = entry_idx[0]
 
-    # The maximum value should be 100 (slot-major layout)
-    test.assertEqual(values_np[0 * ht.capacity + idx], 100)
+    # The maximum value should be 100
+    test.assertEqual(values_np[reduction_value_index_np(idx, 0)], 100)
 
 
 def test_multiple_keys(test, device):
     """Test inserting multiple different keys."""
-    values_per_key = 1
 
     @wp.kernel(module="unique")
     def multi_key_kernel(
@@ -159,7 +164,7 @@ def test_multiple_keys(test, device):
         reduction_insert_slot(key, 0, value, keys, values, active_slots)
 
     ht = HashTable(capacity=256, device=device)
-    values = wp.zeros(ht.capacity * values_per_key, dtype=wp.uint64, device=device)
+    values = wp.zeros(ht.capacity * VALUES_STRIDE, dtype=wp.uint64, device=device)
 
     wp.launch(
         multi_key_kernel,
@@ -180,7 +185,6 @@ def test_multiple_keys(test, device):
 
 def test_clear(test, device):
     """Test clearing the hash table."""
-    values_per_key = 13
 
     @wp.kernel(module="unique")
     def insert_kernel(
@@ -192,7 +196,7 @@ def test_clear(test, device):
         reduction_insert_slot(wp.uint64(tid + 1), 0, wp.uint64(tid * 10), keys, values, active_slots)
 
     ht = HashTable(capacity=64, device=device)
-    values = wp.zeros(ht.capacity * values_per_key, dtype=wp.uint64, device=device)
+    values = wp.zeros(ht.capacity * VALUES_STRIDE, dtype=wp.uint64, device=device)
 
     # Insert some data
     wp.launch(
@@ -220,7 +224,6 @@ def test_clear(test, device):
 
 def test_clear_active(test, device):
     """Test clearing only active entries (keys only, not values)."""
-    values_per_key = 13
 
     @wp.kernel(module="unique")
     def insert_kernel(
@@ -232,7 +235,7 @@ def test_clear_active(test, device):
         reduction_insert_slot(wp.uint64(tid + 1), 0, wp.uint64(tid * 10), keys, values, active_slots)
 
     ht = HashTable(capacity=256, device=device)
-    values = wp.zeros(ht.capacity * values_per_key, dtype=wp.uint64, device=device)
+    values = wp.zeros(ht.capacity * VALUES_STRIDE, dtype=wp.uint64, device=device)
 
     # Insert some data (sparse - only 20 entries in a 256-capacity table)
     wp.launch(
@@ -264,7 +267,6 @@ def test_clear_active(test, device):
 
 def test_high_collision(test, device):
     """Test with many threads competing for same keys."""
-    values_per_key = 13
 
     @wp.kernel(module="unique")
     def collision_kernel(
@@ -275,12 +277,12 @@ def test_high_collision(test, device):
         tid = wp.tid()
         # Only 10 unique keys, but 1000 threads
         key = wp.uint64(tid % 10)
-        slot = tid % 13
+        slot = tid % wp.static(VALUES_PER_KEY)
         value = wp.uint64(tid)
         reduction_insert_slot(key, slot, value, keys, values, active_slots)
 
     ht = HashTable(capacity=64, device=device)
-    values = wp.zeros(ht.capacity * values_per_key, dtype=wp.uint64, device=device)
+    values = wp.zeros(ht.capacity * VALUES_STRIDE, dtype=wp.uint64, device=device)
 
     wp.launch(
         collision_kernel,
@@ -305,7 +307,6 @@ def test_early_exit_optimization(test, device):
     When a smaller value tries to update a slot that already has a larger value,
     it should skip the atomic operation but still return True.
     """
-    values_per_key = 13
 
     @wp.kernel(module="unique")
     def insert_descending_kernel(
@@ -319,7 +320,7 @@ def test_early_exit_optimization(test, device):
         reduction_insert_slot(wp.uint64(1), 0, value, keys, values, active_slots)
 
     ht = HashTable(capacity=64, device=device)
-    values = wp.zeros(ht.capacity * values_per_key, dtype=wp.uint64, device=device)
+    values = wp.zeros(ht.capacity * VALUES_STRIDE, dtype=wp.uint64, device=device)
 
     wp.launch(
         insert_descending_kernel,
@@ -336,8 +337,8 @@ def test_early_exit_optimization(test, device):
     test.assertEqual(len(entry_idx), 1)
     idx = entry_idx[0]
 
-    # The maximum value should be 999 (first insertion), slot-major layout
-    test.assertEqual(values_np[0 * ht.capacity + idx], 999)
+    # The maximum value should be 999 (first insertion)
+    test.assertEqual(values_np[reduction_value_index_np(idx, 0)], 999)
 
 
 # =============================================================================

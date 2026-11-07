@@ -1,0 +1,1 @@
+Require boundary warning and capacity checks by default in the FPGS/MJWarp benchmark driver; retain `--check-overflow` for existing commands and require explicit `--allow-unchecked` for labeled legacy diagnosis. Keep numerical line-search corrections separately opt-in and reject their use, or broad-output overrides, with unchecked captures.

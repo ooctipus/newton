@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import dataclasses
 import unittest
 
 import numpy as np
@@ -223,8 +224,28 @@ class TestKinematicLinks(unittest.TestCase):
                         model,
                         broad_phase=broad_phase,
                         include_static_kinematic_pairs=True,
+                        include_immobile_pairs=True,
                     )
                     if shape_a == "static" and shape_b == "static":
+                        self.assertEqual(count, 0)
+                    else:
+                        self.assertGreater(count, 0)
+
+                with self.subTest(
+                    shape_a=shape_a,
+                    shape_b=shape_b,
+                    broad_phase=broad_phase,
+                    include_static_kinematic_pairs=True,
+                    include_immobile_pairs=False,
+                ):
+                    # Two static shapes are structurally immobile; kinematic bodies can move.
+                    count = _rigid_contact_count(
+                        model,
+                        broad_phase=broad_phase,
+                        include_static_kinematic_pairs=True,
+                        include_immobile_pairs=False,
+                    )
+                    if shape_a == shape_b == "static":
                         self.assertEqual(count, 0)
                     else:
                         self.assertGreater(count, 0)
@@ -323,40 +344,80 @@ def _rigid_contact_count(
     *,
     broad_phase: str = "explicit",
     include_static_kinematic_pairs: bool = True,
+    include_immobile_pairs: bool | None = None,
 ) -> int:
     pipeline = newton.CollisionPipeline(
         model,
         broad_phase=broad_phase,
         include_static_kinematic_pairs=include_static_kinematic_pairs,
+        include_immobile_pairs=include_immobile_pairs,
     )
     contacts = pipeline.contacts()
     pipeline.collide(model.state(), contacts)
     return int(contacts.rigid_contact_count.numpy()[0])
 
 
-def _build_free_root_scene(device):
+def _build_free_root_scene(device, *, kinematic_first: bool = True):
+    builder = ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    _configure_contact_defaults(builder)
+
+    def add_kinematic_body() -> int:
+        body = builder.add_body(
+            xform=wp.transform(wp.vec3(-0.3, 0.0, 0.0), wp.quat_identity()),
+            mass=1.0,
+            is_kinematic=True,
+            label="kinematic_free",
+        )
+        builder.add_shape_box(body, hx=0.25, hy=0.15, hz=0.15)
+        return body
+
+    def add_probe_body() -> int:
+        body = builder.add_body(
+            xform=wp.transform(wp.vec3(0.45, 0.0, 0.0), wp.quat_identity()),
+            mass=1.0,
+            label="probe",
+        )
+        builder.add_shape_sphere(body, radius=0.1)
+        return body
+
+    if kinematic_first:
+        kinematic_body = add_kinematic_body()
+        probe_body = add_probe_body()
+    else:
+        probe_body = add_probe_body()
+        kinematic_body = add_kinematic_body()
+
+    builder.color()
+    model = builder.finalize(device=device)
+    kinematic_joint = _find_joint_for_child(model, kinematic_body)
+    return model, kinematic_body, probe_body, kinematic_joint
+
+
+def _build_free_root_to_prismatic_scene(device):
     builder = ModelBuilder(gravity=(0.0, 0.0, 0.0))
     _configure_contact_defaults(builder)
 
     kinematic_body = builder.add_body(
-        xform=wp.transform(wp.vec3(-0.3, 0.0, 0.0), wp.quat_identity()),
+        xform=wp.transform(wp.vec3(-0.2, 0.0, 0.0), wp.quat_identity()),
         mass=1.0,
         is_kinematic=True,
         label="kinematic_free",
     )
     builder.add_shape_box(kinematic_body, hx=0.25, hy=0.15, hz=0.15)
 
-    probe_body = builder.add_body(
-        xform=wp.transform(wp.vec3(0.45, 0.0, 0.0), wp.quat_identity()),
-        mass=1.0,
-        label="probe",
-    )
+    probe_body = builder.add_link(mass=1.0, label="prismatic_probe")
     builder.add_shape_sphere(probe_body, radius=0.1)
+    probe_joint = builder.add_joint_prismatic(
+        parent=-1,
+        child=probe_body,
+        axis=newton.Axis.X,
+        parent_xform=wp.transform(wp.vec3(0.45, 0.0, 0.0), wp.quat_identity()),
+    )
+    builder.add_articulation([probe_joint])
 
     builder.color()
     model = builder.finalize(device=device)
-    kinematic_joint = _find_joint_for_child(model, kinematic_body)
-    return model, kinematic_body, probe_body, kinematic_joint
+    return model, kinematic_body, probe_body, _find_joint_for_child(model, kinematic_body), probe_joint
 
 
 def _build_revolute_root_pendulum_scene(device):
@@ -434,15 +495,36 @@ def test_kinematic_free_base_prescribed_motion(
     test: TestKinematicLinksCanonical,
     device,
     solver_fn,
+    check_reversed_order=False,
 ):
     sim_dt = 1.0 / 240.0
     steps = 100
     x0 = -0.3
     vx = 1.0
 
-    def run_once(apply_force: bool):
-        model, kinematic_body, probe_body, kinematic_joint = _build_free_root_scene(device)
+    def run_once(apply_force: bool, *, kinematic_first: bool):
+        model, kinematic_body, probe_body, kinematic_joint = _build_free_root_scene(
+            device, kinematic_first=kinematic_first
+        )
         solver = solver_fn(model)
+        if isinstance(solver, newton.solvers.SolverFeatherPGS):
+            body_to_articulation = solver.forest.body_to_articulation.numpy()
+            kinematic_articulation = int(body_to_articulation[kinematic_body])
+            probe_articulation = int(body_to_articulation[probe_body])
+            physical_dof_count = solver.forest.articulation_dof_count.numpy()
+            response_dof_count = solver.forest.articulation_response_dof_count.numpy()
+            test.assertEqual(int(physical_dof_count[kinematic_articulation]), 6)
+            test.assertEqual(int(physical_dof_count[probe_articulation]), 6)
+            test.assertEqual(int(response_dof_count[kinematic_articulation]), 0)
+            test.assertEqual(int(response_dof_count[probe_articulation]), 6)
+            test.assertEqual(solver.forest.max_world_dofs, 6)
+            test.assertEqual(solver.forest.free_rigid_body_count, 1)
+            test.assertEqual(int(solver.forest.free_rigid_body_indices.numpy()[0]), probe_body)
+            world = int(solver.forest.art_to_world.numpy()[probe_articulation])
+            probe_start = int(solver.forest.articulation_dof_start.numpy()[probe_articulation])
+            np.testing.assert_array_equal(
+                solver.forest.world_dof_indices.numpy()[world], np.arange(probe_start, probe_start + 6)
+            )
         collision_pipeline, contacts = _create_contacts(model, solver)
         state_0, state_1 = model.state(), model.state()
 
@@ -450,6 +532,7 @@ def test_kinematic_free_base_prescribed_motion(
         qd_start = int(model.joint_qd_start.numpy()[kinematic_joint])
 
         max_probe_speed = 0.0
+        max_probe_x_velocity = 0.0
         initial_probe_pos = state_0.body_q.numpy()[probe_body, :3].copy()
 
         for step_idx in range(steps):
@@ -475,8 +558,9 @@ def test_kinematic_free_base_prescribed_motion(
             solver.step(state_0, state_1, None, contacts, sim_dt)
             state_0, state_1 = state_1, state_0
 
-            probe_speed = float(np.linalg.norm(state_0.body_qd.numpy()[probe_body, :3]))
-            max_probe_speed = max(max_probe_speed, probe_speed)
+            probe_velocity = state_0.body_qd.numpy()[probe_body, :3]
+            max_probe_speed = max(max_probe_speed, float(np.linalg.norm(probe_velocity)))
+            max_probe_x_velocity = max(max_probe_x_velocity, float(probe_velocity[0]))
 
         body_q = state_0.body_q.numpy()
         body_qd = state_0.body_qd.numpy()
@@ -487,16 +571,22 @@ def test_kinematic_free_base_prescribed_motion(
             "probe_pos": body_q[probe_body, :3].copy(),
             "probe_qd": body_qd[probe_body].copy(),
             "probe_max_speed": max_probe_speed,
+            "probe_max_x_velocity": max_probe_x_velocity,
             "probe_displacement": float(np.linalg.norm(body_q[probe_body, :3] - initial_probe_pos)),
         }
 
-    no_force = run_once(apply_force=False)
-    with_force = run_once(apply_force=True)
+    no_force = run_once(apply_force=False, kinematic_first=True)
+    if check_reversed_order:
+        reversed_order = run_once(apply_force=False, kinematic_first=False)
+    else:
+        reversed_order = no_force
+    with_force = run_once(apply_force=True, kinematic_first=True)
 
     expected_final_x = x0 + vx * (steps - 1) * sim_dt
 
-    # Prescribed motion should drive the kinematic body along +x.
+    # Prescribed motion should drive the kinematic body along +x in either articulation order.
     test.assertAlmostEqual(no_force["kin_pos"][0], expected_final_x, delta=4e-2)
+    test.assertAlmostEqual(reversed_order["kin_pos"][0], expected_final_x, delta=4e-2)
     test.assertLess(abs(float(no_force["kin_pos"][1])), 2e-2)
     test.assertLess(abs(float(no_force["kin_pos"][2])), 2e-2)
     test.assertGreater(float(no_force["kin_qd"][0]), 2e-1)
@@ -508,10 +598,48 @@ def test_kinematic_free_base_prescribed_motion(
 
     # Collision with dynamic body should happen and update velocity.
     test.assertGreater(no_force["probe_max_speed"], 3e-2)
+    test.assertGreater(no_force["probe_max_x_velocity"], 3e-2)
+    test.assertGreater(reversed_order["probe_max_speed"], 3e-2)
+    test.assertGreater(reversed_order["probe_max_x_velocity"], 3e-2)
     test.assertTrue(
         float(np.linalg.norm(no_force["probe_qd"][:3])) > 5e-3 or no_force["probe_displacement"] > 1e-3,
         "Probe should show collision-driven velocity/displacement update",
     )
+
+
+def test_kinematic_free_base_drives_dense_articulation(
+    test: TestKinematicLinksCanonical,
+    device,
+    solver_fn,
+):
+    model, _kinematic_body, _probe_body, kinematic_joint, probe_joint = _build_free_root_to_prismatic_scene(device)
+    solver = solver_fn(model)
+    _collision_pipeline, contacts = _create_contacts(model, solver)
+    state_0, state_1 = model.state(), model.state()
+    q_start = int(model.joint_q_start.numpy()[kinematic_joint])
+    qd_start = int(model.joint_qd_start.numpy()[kinematic_joint])
+    probe_qd_start = int(model.joint_qd_start.numpy()[probe_joint])
+    sim_dt = 1.0 / 240.0
+    max_probe_velocity = 0.0
+
+    for step in range(120):
+        joint_q = state_0.joint_q.numpy()
+        joint_qd = state_0.joint_qd.numpy()
+        joint_q[q_start : q_start + 7] = np.array(
+            [-0.2 + step * sim_dt, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32
+        )
+        joint_qd[qd_start : qd_start + 6] = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        state_0.joint_q.assign(joint_q)
+        state_0.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0, body_flag_filter=newton.BodyFlags.KINEMATIC)
+        state_0.clear_forces()
+        model.collide(state_0, contacts)
+        solver.step(state_0, state_1, None, contacts, sim_dt)
+        state_0, state_1 = state_1, state_0
+        max_probe_velocity = max(max_probe_velocity, float(state_0.joint_qd.numpy()[probe_qd_start]))
+
+    test.assertEqual(int(solver.forest.articulation_response_dof_count.numpy()[0]), 0)
+    test.assertGreater(max_probe_velocity, 3.0e-2)
 
 
 def test_kinematic_revolute_root_pendulum_prescribed_motion(
@@ -691,6 +819,10 @@ def test_kinematic_runtime_toggle(
     builder.color()
     model = builder.finalize(device=device)
     solver = solver_fn(model)
+    if isinstance(solver, newton.solvers.SolverFeatherPGS):
+        solver.options = solver.laws.options = solver.factor.options = solver.placement.options = (
+            solver.sweep.options
+        ) = dataclasses.replace(solver.options, update_mass_matrix_interval=100)
     collision_pipeline, contacts = _create_contacts(model, solver)
 
     state_0, state_1 = model.state(), model.state()
@@ -766,6 +898,18 @@ def test_kinematic_prescribed_response_lifetime(
     model.body_flags.assign(flags)
     solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
     test.assertEqual(int(solver._articulation_response_dof_count.numpy()[probe_articulation]), 6)
+    model, kinematic_body, probe_body, _kinematic_joint = _build_free_root_scene(device)
+    solver = solver_fn(model)
+    body_to_articulation = solver.forest.body_to_articulation.numpy()
+    kinematic_articulation = int(body_to_articulation[kinematic_body])
+    probe_articulation = int(body_to_articulation[probe_body])
+    test.assertEqual(int(solver.forest.articulation_response_dof_count.numpy()[kinematic_articulation]), 0)
+
+    flags = model.body_flags.numpy()
+    flags[probe_body] = int(BodyFlags.KINEMATIC)
+    model.body_flags.assign(flags)
+    solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+    test.assertEqual(int(solver.forest.articulation_response_dof_count.numpy()[probe_articulation]), 6)
 
     flags = model.body_flags.numpy()
     flags[kinematic_body] = int(BodyFlags.DYNAMIC)
@@ -782,6 +926,7 @@ solvers = {
     "steel_colored": lambda model: newton.solvers.SolverSteel(
         model, solve_mode="colored", articulated_contact_response="propagation"
     ),
+    "feather_pgs": lambda model: newton.solvers.SolverFeatherPGS(model, angular_damping=0.0),
     "mujoco_cpu": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=True),
     "mujoco_warp": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=False),
     "xpbd": lambda model: newton.solvers.SolverXPBD(model, iterations=5, angular_damping=0.0),
@@ -806,12 +951,21 @@ for device in devices:
             test_kinematic_free_base_prescribed_motion,
             devices=[device],
             solver_fn=solver_fn,
+            check_reversed_order=solver_name == "feather_pgs",
         )
-        if solver_name.startswith("steel"):
+        if solver_name.startswith("steel") or solver_name == "feather_pgs":
             add_function_test(
                 TestKinematicLinksCanonical,
                 f"test_kinematic_prescribed_response_lifetime_{solver_name}",
                 test_kinematic_prescribed_response_lifetime,
+                devices=[device],
+                solver_fn=solver_fn,
+            )
+        if solver_name == "feather_pgs":
+            add_function_test(
+                TestKinematicLinksCanonical,
+                "test_kinematic_free_base_drives_dense_articulation_feather_pgs",
+                test_kinematic_free_base_drives_dense_articulation,
                 devices=[device],
                 solver_fn=solver_fn,
             )

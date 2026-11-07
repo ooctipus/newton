@@ -1,0 +1,1 @@
+Accelerate `ModelBuilder.finalize()` for large replicated scenes by converting builder lists to arrays in bulk, sharing index conversions between passes, and visiting only the shapes each pass needs; the finalized `Model` is unchanged and no migration is required.

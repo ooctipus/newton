@@ -1,0 +1,1 @@
+Extend experimental `CollisionPipeline(convex_collision="auto")` to supported reduced heightfield/convex queries using sampled support work and independent hardware costs. Keep `convex_collision="ordinary"` for forced vertex scans and use `"convex_cells"` to force admitted direction cells; retain the existing terrain contact law and geometry invalidation contract.

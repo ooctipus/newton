@@ -1,0 +1,1 @@
+Add the `terrain_jobs` flag to `NarrowPhase.buffer_capacity_status()`: the terrain law's solid job lists had no room for some pair's work, which their reserve then took with the pair's rows unchanged (or, past the reserve, the pair kept no row). `NarrowPhase.check_buffer_capacity()` raises on it; raise `NEWTON_TERRAIN_LAW_SHADOW_JOBS`.

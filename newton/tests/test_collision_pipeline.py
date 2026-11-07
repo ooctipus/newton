@@ -1,13 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
+import ctypes
 import gc
 import itertools
 import math
+import os
 import unittest
 import warnings
 from collections import Counter
 from enum import IntFlag, auto
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -41,8 +45,12 @@ from newton._src.geometry.soft_contacts_sdf import (
     optimize_edge_sdf,
     optimize_face_sdf,
 )
+from newton._src.sim import contacts as contacts_module
 from newton._src.sim.collide import (
     _GENERIC_CONVEX_PAIR_LOOKUP,
+    _CONVEX_PAIR_MAX_CONTACTS,
+    _HYDRO_PAIR_MAX_CONTACTS,
+    _MESH_PAIR_MAX_CONTACTS,
     _SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD,
     _TRIANGLE_PAIR_NEIGHBORS_PER_SHAPE,
     _TRIANGLE_PAIRS_MIN_CAPACITY,
@@ -58,6 +66,7 @@ from newton._src.sim.collide import (
     _estimate_rigid_contact_max,
     write_contact,
 )
+from newton._src.sim.contacts import capture_scope, contact_frame_write
 from newton._src.utils.heightfield import HeightfieldData
 from newton.examples import test_body_state
 from newton.geometry import BroadPhaseAllPairs, BroadPhaseExplicit, NarrowPhase
@@ -68,6 +77,7 @@ from newton.tests.unittest_utils import (
     get_cuda_test_devices,
     get_test_devices,
     warp_version_at_least,
+    scoped_capture_after_gc,
 )
 from newton.tests.utils.soft_contacts import evaluate_soft_contact_force_mask
 
@@ -530,6 +540,127 @@ class TestCollisionPipeline(unittest.TestCase):
         self.assertEqual(int(disabled_contacts.soft_contact_count.numpy()[0]), 0)
 
 
+def _sphere_over_ground(device):
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05)))
+    builder.add_shape_sphere(body, radius=0.1)
+    return builder.finalize(device=device)
+
+
+def _frame_tick(contacts):
+    write = contact_frame_write(contacts.contact_generation)
+    return None if write is None else write.tick
+
+
+class TestContactFrameLedger(unittest.TestCase):
+    def test_collide_notes_a_write_of_its_contacts_only(self):
+        """Advance the frame-write tick of the collided buffer on every pass, eagerly without a scope."""
+        model = _sphere_over_ground("cpu")
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+        collided, other = pipeline.contacts(), pipeline.contacts()
+        state = model.state()
+        self.assertIsNone(contact_frame_write(collided.contact_generation))
+        ticks = []
+        for _ in range(2):
+            pipeline.collide(state, collided)
+            write = contact_frame_write(collided.contact_generation)
+            self.assertIsNone(write.scope)
+            ticks.append(write.tick)
+        self.assertLess(ticks[0], ticks[1])
+        self.assertIsNone(contact_frame_write(other.contact_generation), "another buffer was not written")
+        self.assertGreater(int(collided.rigid_contact_count.numpy()[0]), 0)
+
+    def test_clear_notes_a_write_with_or_without_a_new_generation(self):
+        """Advance the frame-write tick on every clear(), which zeroes the counts either way."""
+        contacts = newton.Contacts(8, 0, device="cpu")
+        ticks = [_frame_tick(contacts)]
+        for bump in (True, False):
+            contacts.clear(bump_generation=bump)
+            ticks.append(_frame_tick(contacts))
+            self.assertIsNone(contact_frame_write(contacts.contact_generation).scope)
+        self.assertIsNone(ticks[0])
+        self.assertLess(ticks[1], ticks[2])
+        np.testing.assert_array_equal(contacts.contact_generation.numpy(), [1])
+
+    def test_capture_scope_names_each_graph_and_conditional_body(self):
+        """Name a capture by its graph's serial and the raw graph it records into; eager launches have none.
+
+        The registry is mocked on a stand-in CUDA device: Warp registers the graph
+        recording each stream, and swaps the graph's raw handle while it records a
+        conditional body.
+        """
+        stream = object()
+        device = SimpleNamespace(is_cuda=True, captures={})
+        with mock.patch.object(wp, "get_stream", return_value=stream):
+            self.assertIsNone(capture_scope(device), "an eager launch has no scope")
+            graph = SimpleNamespace(graph=None)
+            device.captures[stream] = graph
+            main = capture_scope(device)
+            self.assertEqual(main, capture_scope(device))
+            graph.graph = ctypes.c_void_p(0x1000)
+            body = capture_scope(device)
+            self.assertEqual(body[0], main[0])
+            self.assertNotEqual(body, main)
+            graph.graph = ctypes.c_void_p(0x2000)
+            self.assertNotEqual(capture_scope(device), body, "the resumed main graph is not the body")
+            # A new graph is a new capture, even when it reuses a freed graph's handle.
+            device.captures[stream] = SimpleNamespace(graph=ctypes.c_void_p(0x1000))
+            self.assertNotEqual(capture_scope(device)[0], main[0])
+        self.assertIsNone(capture_scope(SimpleNamespace(is_cuda=False)))
+
+    def test_noted_writes_carry_the_current_scope(self):
+        """Record the capture scope current at the write."""
+        contacts = newton.Contacts(8, 0, device="cpu")
+        with mock.patch.object(contacts_module, "capture_scope", return_value=(7, None)) as scope:
+            contacts.clear()
+        scope.assert_called_once_with(contacts.contact_generation.device)
+        self.assertEqual(contact_frame_write(contacts.contact_generation).scope, (7, None))
+
+
+def test_captured_frame_writes_carry_their_scope(test, device):
+    """Record captured writes in their graph's scope, a conditional body in its own, eager ones in none."""
+    model = _sphere_over_ground(device)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+    contacts = pipeline.contacts()
+    state = model.state()
+    pipeline.collide(state, contacts)
+    condition = wp.ones(1, dtype=wp.int32, device=device)
+    scopes = {}
+    with wp.ScopedCapture(device=device) as capture:
+        scopes["main"] = capture_scope(wp.get_device(device))
+        pipeline.collide(state, contacts)
+        scopes["collide"] = contact_frame_write(contacts.contact_generation).scope
+        if wp.is_conditional_graph_supported():
+
+            def body():
+                scopes["body"] = capture_scope(wp.get_device(device))
+                contacts.clear()
+                scopes["clear"] = contact_frame_write(contacts.contact_generation).scope
+
+            wp.capture_if(condition, on_true=body)
+    with wp.ScopedCapture(device=device):
+        scopes["other"] = capture_scope(wp.get_device(device))
+    test.assertIsNotNone(scopes["main"])
+    test.assertEqual(scopes["collide"], scopes["main"])
+    test.assertNotEqual(scopes["other"][0], scopes["main"][0], "each capture has its own serial")
+    if "body" in scopes:
+        test.assertEqual(scopes["clear"], scopes["body"])
+        test.assertEqual(scopes["body"][0], scopes["main"][0])
+        test.assertNotEqual(scopes["body"], scopes["main"])
+    wp.capture_launch(capture.graph)
+    pipeline.collide(state, contacts)
+    test.assertIsNone(contact_frame_write(contacts.contact_generation).scope)
+
+
+add_function_test(
+    TestContactFrameLedger,
+    "test_captured_frame_writes_carry_their_scope",
+    test_captured_frame_writes_carry_their_scope,
+    devices=get_cuda_test_devices(mode="basic"),
+)
+
+
 def test_collision_pipeline_first_call_capture(test, device):
     builder = newton.ModelBuilder()
     builder.add_ground_plane()
@@ -540,7 +671,7 @@ def test_collision_pipeline_first_call_capture(test, device):
     contacts = pipeline.contacts()
     state = model.state()
 
-    with wp.ScopedCapture(device=device) as capture:
+    with scoped_capture_after_gc(device=device) as capture:
         pipeline.collide(state, contacts)
 
     wp.capture_launch(capture.graph)
@@ -551,6 +682,92 @@ add_function_test(
     TestCollisionPipeline,
     "test_collision_pipeline_first_call_capture",
     test_collision_pipeline_first_call_capture,
+    devices=get_cuda_test_devices(mode="basic"),
+)
+
+
+@contextlib.contextmanager
+def _automatic_collection_disabled():
+    """Keep the allocator from collecting on its own, so only explicit collections free garbage."""
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+
+
+class _CaptureProbe:
+    """Garbage in a reference cycle that records whether its device was capturing when it was freed."""
+
+    def __init__(self, device, capturing: list[bool]):
+        self.device = device
+        self.capturing = capturing
+        self.cycle = self
+
+    def __del__(self):
+        self.capturing.append(self.device.is_capturing)
+
+
+def test_capture_frees_pending_garbage_first(test, device):
+    """Free garbage that earlier tests left in reference cycles before a capture begins, not inside it."""
+    device = wp.get_device(device)
+    capturing = []
+    marker = wp.zeros(1, dtype=wp.int32, device=device)
+    with _automatic_collection_disabled():
+        _CaptureProbe(device, capturing)
+        with scoped_capture_after_gc(device=device) as capture:
+            # A collection the allocator could start inside the capture.
+            gc.collect()
+            marker.fill_(1)
+    test.assertEqual(capturing, [False])
+    wp.capture_launch(capture.graph)
+    test.assertEqual(int(marker.numpy()[0]), 1)
+
+
+def test_setup_capture_survives_texture_garbage(test, device):
+    """Capture and run a collision setup while an earlier test's texture waits for the cyclic collector.
+
+    CUDA rejects a texture destroyed inside a capture and invalidates the capture, so a collection
+    inside it (forced here) must find no texture left to free.
+    """
+    simulate = CollisionSetup.simulate
+
+    def collect_then_simulate(setup):
+        gc.collect()
+        simulate(setup)
+
+    with _automatic_collection_disabled():
+        garbage = {"texture": wp.Texture3D(np.zeros((2, 2, 2), dtype=np.float32), device=device)}
+        garbage["cycle"] = garbage
+        del garbage
+        with mock.patch.object(CollisionSetup, "simulate", collect_then_simulate):
+            setup = CollisionSetup(
+                viewer=newton.viewer.ViewerNull(),
+                device=device,
+                solver_fn=newton.solvers.SolverXPBD,
+                sim_substeps=10,
+                shape_type_a=GeoType.BOX,
+                shape_type_b=GeoType.BOX,
+            )
+    test.assertIsNotNone(setup.graph)
+    for _ in range(100):
+        setup.step()
+    setup.test(TestLevel.VELOCITY_YZ, 0)
+    setup.test(TestLevel.VELOCITY_LINEAR, 1)
+
+
+add_function_test(
+    TestCollisionPipeline,
+    "test_capture_frees_pending_garbage_first",
+    test_capture_frees_pending_garbage_first,
+    devices=get_test_devices(mode="basic"),
+)
+add_function_test(
+    TestCollisionPipeline,
+    "test_setup_capture_survives_texture_garbage",
+    test_setup_capture_survives_texture_garbage,
     devices=get_cuda_test_devices(mode="basic"),
 )
 
@@ -2771,6 +2988,145 @@ class TestContactCountEstimator(unittest.TestCase):
             estimate = _estimate_rigid_contact_max(model)
         self.assertEqual(estimate, 1500)
 
+    # ------------------------------------------------------------------
+    # Pair-aware estimator tests (builder-based scenes, CPU)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cube_mesh(hs: float = 0.1) -> newton.Mesh:
+        vertices = np.array(
+            [
+                [-hs, -hs, -hs],
+                [hs, -hs, -hs],
+                [hs, hs, -hs],
+                [-hs, hs, -hs],
+                [-hs, -hs, hs],
+                [hs, -hs, hs],
+                [hs, hs, hs],
+                [-hs, hs, hs],
+            ],
+            dtype=np.float32,
+        )
+        # fmt: off
+        indices = np.array(
+            [
+                0, 3, 2, 0, 2, 1,  # -z
+                4, 5, 6, 4, 6, 7,  # +z
+                0, 1, 5, 0, 5, 4,  # -y
+                2, 3, 7, 2, 7, 6,  # +y
+                0, 4, 7, 0, 7, 3,  # -x
+                1, 2, 6, 1, 6, 5,  # +x
+            ],
+            dtype=np.int32,
+        )
+        # fmt: on
+        return newton.Mesh(vertices, indices)
+
+    @classmethod
+    def _build_multi_world_scene(
+        cls, num_worlds: int, boxes_per_world: int, mesh_per_world: bool = False
+    ) -> newton.Model:
+        """Global ground plane + ``num_worlds`` worlds of free-body boxes (and optionally one colliding mesh)."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        for _ in range(num_worlds):
+            builder.begin_world()
+            for i in range(boxes_per_world):
+                b = builder.add_body(xform=wp.transform(wp.vec3(0.5 * float(i), 0.0, 0.5), wp.quat_identity()))
+                builder.add_shape_box(body=b, hx=0.1, hy=0.1, hz=0.1)
+            if mesh_per_world:
+                b = builder.add_body(xform=wp.transform(wp.vec3(-1.0, 0.0, 0.5), wp.quat_identity()))
+                builder.add_shape_mesh(body=b, mesh=cls._cube_mesh())
+            builder.end_world()
+        return builder.finalize(device="cpu")
+
+    @classmethod
+    def _build_box_scene(cls, num_boxes: int, mesh_mode: str | None = None) -> newton.Model:
+        """Ground plane + ``num_boxes`` free-body boxes, optionally plus a mesh shape.
+
+        mesh_mode:
+            None         -- no mesh shape
+            "colliding"  -- mesh shape that participates in collision
+            "visual"     -- mesh shape with has_shape_collision=False (render-only)
+        """
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        for i in range(num_boxes):
+            b = builder.add_body(xform=wp.transform(wp.vec3(0.5 * float(i), 0.0, 0.5), wp.quat_identity()))
+            builder.add_shape_box(body=b, hx=0.1, hy=0.1, hz=0.1)
+        if mesh_mode is not None:
+            cfg = None
+            if mesh_mode == "visual":
+                cfg = newton.ModelBuilder.ShapeConfig(has_shape_collision=False)
+            b = builder.add_body(xform=wp.transform(wp.vec3(-1.0, 0.0, 0.5), wp.quat_identity()))
+            builder.add_shape_mesh(body=b, mesh=cls._cube_mesh(), cfg=cfg)
+        return builder.finalize(device="cpu")
+
+    def test_pair_aware_sum_of_budgets(self):
+        """For sparse multi-world scenes the estimate is the exact per-pair budget sum."""
+        model = self._build_multi_world_scene(num_worlds=100, boxes_per_world=2)
+        # Per world: 1 box-box + 2 plane-box pairs = 3 pairs, all convex.
+        self.assertEqual(model.shape_contact_pair_count, 300)
+        # Locality cap (plane pairs full + 200 boxes * 20 neighbors * 5 // 2)
+        # is far larger, so the provable pair sum binds.
+        self.assertEqual(_estimate_rigid_contact_max(model), 300 * _CONVEX_PAIR_MAX_CONTACTS)
+
+    def test_pair_aware_mesh_pair_budget(self):
+        """Mesh-involved pairs are budgeted with the contact-reduction per-pair cap."""
+        model = self._build_multi_world_scene(num_worlds=50, boxes_per_world=2, mesh_per_world=True)
+        # Per world: 1 box-box + 2 plane-box (convex) + 2 mesh-box + 1 plane-mesh (mesh) = 6 pairs.
+        self.assertEqual(model.shape_contact_pair_count, 300)
+        expected = 50 * (3 * _CONVEX_PAIR_MAX_CONTACTS + 3 * _MESH_PAIR_MAX_CONTACTS)
+        self.assertEqual(_estimate_rigid_contact_max(model), expected)
+
+    def test_locality_cap_binds_for_dense_single_world(self):
+        """Dense single-world pair graphs are capped by the spatial-locality estimate."""
+        model = self._build_box_scene(num_boxes=25)
+        # Pair sum: C(25,2)=300 box-box + 25 plane-box = 325 pairs * 5 = 1625.
+        self.assertEqual(model.shape_contact_pair_count, 325)
+        # Locality cap: plane pairs keep their budget (25 * 5) and the 25 boxes
+        # are budgeted for 20 simultaneous neighbors each (halved per pair):
+        # 125 + 25 * 5 * 20 // 2 = 1375 < 1625, so the cap binds.
+        plane_term = 25 * _CONVEX_PAIR_MAX_CONTACTS
+        locality = 25 * _CONVEX_PAIR_MAX_CONTACTS * 20 // 2
+        self.assertEqual(_estimate_rigid_contact_max(model), plane_term + locality)
+
+    def test_visual_mesh_does_not_inflate_estimate(self):
+        """A non-colliding (visual-only) mesh shape must not change the estimate."""
+        model_plain = self._build_box_scene(num_boxes=25)
+        model_visual = self._build_box_scene(num_boxes=25, mesh_mode="visual")
+        # The visual mesh adds a shape but no contact pairs.
+        self.assertEqual(model_visual.shape_count, model_plain.shape_count + 1)
+        self.assertEqual(model_visual.shape_contact_pair_count, model_plain.shape_contact_pair_count)
+        self.assertEqual(
+            _estimate_rigid_contact_max(model_visual),
+            _estimate_rigid_contact_max(model_plain),
+        )
+
+    def test_hydroelastic_pair_budget(self):
+        """Hydro-hydro pairs get the anchor-augmented per-pair budget."""
+        model = self._build_multi_world_scene(num_worlds=50, boxes_per_world=2)
+        flags = model.shape_flags.numpy()
+        flags |= int(ShapeFlags.HYDROELASTIC)
+        model.shape_flags = wp.array(flags, dtype=wp.int32, device=model.device)
+        # All 150 pairs become hydro-hydro: budgeted at MAX_CONTACTS_PER_PAIR
+        # plus one anchor contact per normal bin; the locality cap (which also
+        # uses the hydro budget per shape) stays larger, so the sum binds.
+        self.assertEqual(_estimate_rigid_contact_max(model), 150 * _HYDRO_PAIR_MAX_CONTACTS)
+
+    def test_explicit_rigid_contact_max_override_wins(self):
+        """An explicit model.rigid_contact_max (>0) bypasses the estimator."""
+        model = self._build_box_scene(num_boxes=4)
+        model.rigid_contact_max = 777777
+        pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
+        self.assertEqual(pipeline.rigid_contact_max, 777777)
+
+    def test_minimum_allocation_floor(self):
+        """Small pair sums are floored at the 1000-contact minimum allocation."""
+        model = self._build_box_scene(num_boxes=2)
+        # 2 boxes + plane: 3 pairs * 5 = 15 -> floored to 1000.
+        self.assertEqual(_estimate_rigid_contact_max(model), 1000)
+
 
 def _flat_mesh(cells: int = 2) -> newton.Mesh:
     xs, ys = np.meshgrid(np.linspace(-1.0, 1.0, cells + 1), np.linspace(-1.0, 1.0, cells + 1))
@@ -3330,11 +3686,13 @@ class TestShapePairsMaxScaling(unittest.TestCase):
 
         for reduce_contacts in (False, True):
             with self.subTest(reduce_contacts=reduce_contacts):
+                # Both meshes are static, so the pair is immobile; keep it to exercise the mesh stage.
                 pipeline = newton.CollisionPipeline(
                     model,
                     broad_phase="explicit",
                     shape_pairs_filtered=shape_pairs,
                     reduce_contacts=reduce_contacts,
+                    include_immobile_pairs=True,
                 )
                 contacts = pipeline.contacts()
 
@@ -3366,6 +3724,7 @@ class TestShapePairsMaxScaling(unittest.TestCase):
             model,
             broad_phase="explicit",
             shape_pairs_filtered=shape_pairs,
+            include_immobile_pairs=True,
         )
         contacts = pipeline.contacts()
 
@@ -4227,6 +4586,11 @@ def test_convex_convex_with_sdf_routes_to_sdf_contact(test, device):
 
 
 def test_heightfield_convex_midphase_queries_margin_shell_at_lateral_edge(test, device):
+    """Query the margin shell at a heightfield's lateral edge: a sphere beside the border gets a lateral contact.
+
+    The terrain law (the default) gives it one contact on the border's edge, its normal the wall's; the terrain route
+    (``NEWTON_TERRAIN_LAW=none``) queries the edge in its convex midphase.
+    """
     margin = 0.02
     gap = 0.005
     radius = 0.1
@@ -4257,12 +4621,16 @@ def test_heightfield_convex_midphase_queries_margin_shell_at_lateral_edge(test, 
     state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
 
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
-    contacts = pipeline.contacts()
-    pipeline.collide(state, contacts)
+    for environ in ({}, {"NEWTON_TERRAIN_LAW": "none"}):
+        with mock.patch.dict(os.environ, environ):
+            pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
 
-    contact_count = int(contacts.rigid_contact_count.numpy()[0])
-    test.assertGreater(contact_count, 0)
+        contact_count = int(contacts.rigid_contact_count.numpy()[0])
+        test.assertGreater(contact_count, 0)
+        normal = contacts.rigid_contact_normal.numpy()[:contact_count]
+        test.assertTrue(np.all(normal[:, 0] > 0.999), msg=f"{environ}: {normal}")
 
 
 def _build_deterministic_scene(device):
@@ -4486,7 +4854,7 @@ def test_deterministic_pipeline_500_steps(test, device):
         # ``example_basic_pendulum``).
         _frame()
 
-        with wp.ScopedCapture(device=device) as capture:
+        with scoped_capture_after_gc(device=device) as capture:
             _frame()
         graph = capture.graph
 
@@ -4563,7 +4931,7 @@ def test_static_empty_gjk_specialization_under_graph_capture(test, device, broad
     state = model.state()
     contacts = specialized.contacts()
     reference_contacts = reference.contacts()
-    with wp.ScopedCapture(device=device) as capture:
+    with scoped_capture_after_gc(device=device) as capture:
         specialized.collide(state, contacts)
         reference.collide(state, reference_contacts)
     for _ in range(2):
@@ -4711,7 +5079,7 @@ def test_split_gjk_mpr_matches_fused_under_graph_capture(test, device):
     fused_contacts = fused.contacts()
     split.collide(state, split_contacts)
     fused.collide(state, fused_contacts)
-    with wp.ScopedCapture(device=device) as capture:
+    with scoped_capture_after_gc(device=device) as capture:
         split.collide(state, split_contacts)
         fused.collide(state, fused_contacts)
     wp.capture_launch(capture.graph)
@@ -5220,7 +5588,7 @@ def test_deterministic_pipeline_sticky_500_steps(test, device):
         # the same warm-up state).
         _frame()
 
-        with wp.ScopedCapture(device=device) as capture:
+        with scoped_capture_after_gc(device=device) as capture:
             _frame()
         graph = capture.graph
 
@@ -7442,7 +7810,7 @@ def test_graph_capture_stable(test, device):
     contact_multiset0 = _soft_ef_contact_multiset(contacts)
 
     # Capture the flag-on collide and replay it; counts must be stable across replays.
-    with wp.ScopedCapture(device) as capture:
+    with scoped_capture_after_gc(device) as capture:
         pipeline.collide(state, contacts)
     for _ in range(3):
         wp.capture_launch(capture.graph)
@@ -7814,6 +8182,68 @@ add_function_test(
     test_plane_convex_support,
     devices=get_test_devices(),
 )
+def _expert_mesh_box_model(device):
+    """Static mesh cube overlapping a box on a body, for expert-component construction."""
+    builder = newton.ModelBuilder()
+    mesh = newton.Mesh.create_box(
+        0.25, 0.25, 0.25, duplicate_vertices=False, compute_normals=False, compute_uvs=False, compute_inertia=False
+    )
+    builder.add_shape_mesh(body=-1, xform=wp.transform(wp.vec3(0.0, 0.0, 0.24), wp.quat_identity()), mesh=mesh)
+    body = builder.add_body(xform=wp.transform_identity())
+    builder.add_shape_box(
+        body, xform=wp.transform(wp.vec3(0.0, 0.0, -0.25), wp.quat_identity()), hx=2.0, hy=2.0, hz=0.25
+    )
+    return builder.finalize(device=device)
+
+
+def test_expert_narrow_phase_voxel_resolution(test, device):
+    """The pipeline binds the model's voxel-resolution table to a hand-built narrow phase.
+
+    The mesh contact kernels index that table per shape, so an expert narrow phase built
+    without one previously faulted inside them. A supplied table must match the model.
+    """
+    model = _expert_mesh_box_model(device)
+    state = model.state()
+    broad_phase = BroadPhaseAllPairs(model.shape_world, model.shape_flags, device=device)
+
+    def make_narrow_phase(**kwargs):
+        return NarrowPhase(
+            max_candidate_pairs=64,
+            max_triangle_pairs=100000,
+            device=device,
+            shape_aabb_lower=wp.zeros(model.shape_count, dtype=wp.vec3, device=device),
+            shape_aabb_upper=wp.zeros(model.shape_count, dtype=wp.vec3, device=device),
+            contact_writer_warp_func=write_contact,
+            **kwargs,
+        )
+
+    narrow_phase = make_narrow_phase()
+    test.assertIsNone(narrow_phase.shape_voxel_resolution)
+    pipeline = CollisionPipeline(model, broad_phase=broad_phase, narrow_phase=narrow_phase, rigid_contact_max=1024)
+    test.assertIs(pipeline.narrow_phase.shape_voxel_resolution, model._shape_voxel_resolution)
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+    test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+
+    wrong_length = make_narrow_phase(
+        shape_voxel_resolution=wp.zeros(model.shape_count + 1, dtype=wp.vec3i, device=device)
+    )
+    with test.assertRaisesRegex(ValueError, "shape_voxel_resolution"):
+        CollisionPipeline(model, broad_phase=broad_phase, narrow_phase=wrong_length, rigid_contact_max=1024)
+
+
+add_function_test(
+    TestCollisionPipeline,
+    "test_expert_narrow_phase_voxel_resolution",
+    test_expert_narrow_phase_voxel_resolution,
+    devices=get_test_devices(),
+)
+
+
+def tearDownModule():
+    # Free the SDF textures these tests left in reference cycles before a later module captures
+    # a graph in the same process (see scoped_capture_after_gc).
+    gc.collect()
 
 
 if __name__ == "__main__":

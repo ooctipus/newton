@@ -80,6 +80,7 @@ from newton.tests.unittest_utils import (
     add_function_test,
     configure_sdf_for_collision_shapes,
     get_test_devices,
+    scoped_capture_after_gc,
 )
 
 devices = get_test_devices()
@@ -1653,61 +1654,66 @@ def _rigid_contact_history_soft_restores_penalty_only(test, device):
 
 
 def _rigid_contact_history_capture_requires_preallocation(test, device):
-    """Contact history must be allocated before CUDA graph recording."""
+    """Allocate contact history before CUDA graph recording: at construction, and grown outside capture."""
 
-    def make_scene(pipeline_first, rigid_contact_max=4):
+    def make_scene():
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -10.0))
         builder.add_ground_plane()
         body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.2), wp.quat_identity()))
         builder.add_shape_box(body, hx=0.2, hy=0.2, hz=0.2)
         builder.color()
         model = builder.finalize(device=device)
-
-        pipeline = contacts = None
-        if pipeline_first:
-            pipeline = newton.CollisionPipeline(model, rigid_contact_max=rigid_contact_max, contact_matching="latest")
-            contacts = pipeline.contacts()
-
         solver = newton.solvers.SolverVBD(
             model,
             iterations=1,
             rigid_contact_history=True,
             rigid_compliant_alm=True,
         )
-
-        if not pipeline_first:
-            pipeline = newton.CollisionPipeline(model, rigid_contact_max=rigid_contact_max, contact_matching="latest")
-            contacts = pipeline.contacts()
-
+        pipeline = newton.CollisionPipeline(model, contact_matching="latest")
+        contacts = pipeline.contacts()
         state_in = model.state()
         state_out = model.state()
         control = model.control()
-        if rigid_contact_max > 0:
-            pipeline.collide(state_in, contacts)
+        pipeline.collide(state_in, contacts)
         return pipeline, solver, contacts, state_in, state_out, control
 
-    pipeline, solver, contacts, state_in, state_out, control = make_scene(pipeline_first=False)
-    with test.assertRaisesRegex(RuntimeError, "contact history must be allocated before graph capture"):
-        with wp.ScopedCapture(device=device):
+    # The history exists from construction, before the solver meets any contacts. Each capture keeps
+    # its own name: dropping an earlier graph during a later capture would invalidate that capture.
+    _pipeline, solver, contacts, state_in, state_out, control = make_scene()
+    test.assertIsNotNone(solver._prev_contact_lambda)
+    with scoped_capture_after_gc(device=device) as first:
+        solver.step(state_in, state_out, control, contacts, 1.0e-3)
+    test.assertIsNotNone(first.graph)
+
+    # The model's contacts and the solver share the model's rows: a reservation grows the history at once.
+    _pipeline, solver, contacts, state_in, state_out, control = make_scene()
+    rows = solver._prev_contact_lambda.shape[0]
+    # No graph captured the rows yet, so the reservation asks for no recapture; it grows the rows at once.
+    contacts.reserve_rigid_contacts(2 * rows)
+    test.assertGreaterEqual(contacts.rigid_contact_max, 2 * rows)
+    test.assertEqual(solver._prev_contact_lambda.shape[0], contacts.rigid_contact_max)
+    with scoped_capture_after_gc(device=device) as shared:
+        solver.step(state_in, state_out, control, contacts, 1.0e-3)
+    test.assertIsNotNone(shared.graph)
+
+    # Contacts of another model's pipeline that outgrew the history cannot grow it during capture: one uncaptured
+    # step grows it.
+    _, solver, _, state_in, state_out, control = make_scene()
+    other, _, contacts, _, _, _ = make_scene()
+    rows = solver._prev_contact_lambda.shape[0]
+    contacts.reserve_rigid_contacts(2 * rows)
+    test.assertGreaterEqual(contacts.rigid_contact_max, 2 * rows)
+    other.collide(state_in, contacts)
+    with test.assertRaisesRegex(RuntimeError, "during CUDA graph capture"):
+        with scoped_capture_after_gc(device=device):
             solver.step(state_in, state_out, control, contacts, 1.0e-3)
-
-    pipeline, solver, contacts, state_in, state_out, control = make_scene(pipeline_first=True)
-    with wp.ScopedCapture(device=device) as capture:
-        solver.step(state_in, state_out, control, contacts, 1.0e-3)
-    test.assertIsNotNone(capture.graph)
-
-    pipeline, solver, contacts, state_in, state_out, control = make_scene(pipeline_first=True, rigid_contact_max=0)
-    with wp.ScopedCapture(device=device) as capture:
-        solver.step(state_in, state_out, control, contacts, 1.0e-3)
-    test.assertIsNotNone(capture.graph)
-    test.assertIsNone(solver._prev_contact_lambda)
-
-    pipeline, solver, contacts, state_in, state_out, control = make_scene(pipeline_first=False)
     solver.step(state_in, state_out, control, contacts, 1.0e-3)
-    pipeline.collide(state_out, contacts)
-    with wp.ScopedCapture(device=device) as capture:
+    # The solver's own pool follows the other pool's rows, rounded up to its mapped pages.
+    test.assertGreaterEqual(solver._prev_contact_lambda.shape[0], contacts.rigid_contact_max)
+    other.collide(state_out, contacts)
+    with scoped_capture_after_gc(device=device) as grown:
         solver.step(state_out, state_in, control, contacts, 1.0e-3)
-    test.assertIsNotNone(capture.graph)
+    test.assertIsNotNone(grown.graph)
 
 
 def _rigid_compliant_alm_defaults_to_compliant(test, device):

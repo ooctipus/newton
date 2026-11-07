@@ -84,23 +84,25 @@ def _triangle_mpr_kernel(
 def _box_mpr_kernel(
     shape_b_position: wp.array[wp.vec3],
     shape_b_orientation: wp.array[wp.quat],
+    half_extent: float,
+    extend: float,
     collision_out: wp.array[int],
     point_a_out: wp.array[wp.vec3],
     point_b_out: wp.array[wp.vec3],
     normal_out: wp.array[wp.vec3],
     penetration_out: wp.array[float],
 ):
-    """Run MPR directly for two unit boxes."""
+    """Run MPR directly for two cubes of ``half_extent``, inflated by ``extend`` as the narrow phase does."""
     i = wp.tid()
 
     shape_a = GenericShapeData()
     shape_a.shape_type = int(GeoType.BOX)
-    shape_a.scale = wp.vec3(0.5)
+    shape_a.scale = wp.vec3(half_extent)
     shape_a.auxiliary = wp.vec3(0.0)
 
     shape_b = GenericShapeData()
     shape_b.shape_type = int(GeoType.BOX)
-    shape_b.scale = wp.vec3(0.5)
+    shape_b.scale = wp.vec3(half_extent)
     shape_b.auxiliary = wp.vec3(0.0)
 
     data_provider = SupportMapDataProvider()
@@ -109,7 +111,7 @@ def _box_mpr_kernel(
         shape_b,
         shape_b_orientation[i],
         shape_b_position[i],
-        0.0,
+        extend,
         data_provider,
     )
 
@@ -171,7 +173,7 @@ def _run_triangle_mpr(
     )
 
 
-def _run_box_mpr(shape_positions, shape_orientations):
+def _run_box_mpr(shape_positions, shape_orientations, half_extent=0.5, extend=0.0):
     """Run direct box-vs-box MPR cases on CPU and return NumPy outputs."""
     device = "cpu"
     count = len(shape_positions)
@@ -187,12 +189,23 @@ def _run_box_mpr(shape_positions, shape_orientations):
     wp.launch(
         _box_mpr_kernel,
         dim=count,
-        inputs=[shape_positions_wp, shape_orientations_wp],
+        inputs=[shape_positions_wp, shape_orientations_wp, float(half_extent), float(extend)],
         outputs=[collision, point_a, point_b, normal, penetration],
         device=device,
     )
 
     return collision.numpy(), point_a.numpy(), point_b.numpy(), normal.numpy(), penetration.numpy()
+
+
+@wp.kernel
+def _relative_pose_kernel(
+    poses: wp.array[wp.transform], position_out: wp.array[wp.vec3], orientation_out: wp.array[wp.quat]
+):
+    """Shape B's pose in shape A's frame, as the narrow phase forms it (float32)."""
+    pa, qa = wp.transform_get_translation(poses[0]), wp.transform_get_rotation(poses[0])
+    pb, qb = wp.transform_get_translation(poses[1]), wp.transform_get_rotation(poses[1])
+    orientation_out[0] = wp.quat_inverse(qa) * qb
+    position_out[0] = wp.quat_rotate_inv(qa, pb - pa)
 
 
 class TestMPRBoxSupportTie(unittest.TestCase):
@@ -216,6 +229,115 @@ class TestMPRBoxSupportTie(unittest.TestCase):
         np.testing.assert_allclose(normals, np.tile([0.0, 1.0, 0.0], (len(angles), 1)), atol=1.0e-5)
         np.testing.assert_allclose(penetrations, expected_penetrations, atol=2.0e-5)
         np.testing.assert_allclose(witness_separations, -penetrations, atol=1.0e-6)
+
+
+class TestMPRPortalSliver(unittest.TestCase):
+    """The refinement never returns a sliver portal, whose vertices lie on one edge of the Minkowski difference."""
+
+    def test_stacked_cubes_keep_their_face_normal(self):
+        """Two 0.1 m cubes stacked face to face, 1.1e-4 m into each other and turned by about 1e-5 rad (a compliant
+        stack's settling pose), inflated by the narrow phase's 1e-4 m: the support points of the top face's corners
+        from different directions differ by the inflate, the region test meets a tie on the face diagonal and the
+        portal collapses onto one edge of the face, whose plane its next support point also lies in. The sliver's
+        normal tilted 18 degrees with a 0.031 m penetration (one contact, which threw the stack apart); the face
+        normal and the 2.1e-4 m inflated overlap hold."""
+        poses = np.array(
+            [
+                [-3.9629060e-07, 5.2373551e-08, 0.14960562, -1.3033934e-06, -4.4859153e-06, 2.6716860e-08, 1.0],
+                [-1.4703926e-06, 3.6858987e-07, 0.24949512, -2.6275686e-06, -5.5330815e-06, -1.8647762e-07, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        position = wp.zeros(1, dtype=wp.vec3, device="cpu")
+        orientation = wp.zeros(1, dtype=wp.quat, device="cpu")
+        wp.launch(
+            _relative_pose_kernel,
+            dim=1,
+            inputs=[wp.array(poses, dtype=wp.transform, device="cpu")],
+            outputs=[position, orientation],
+            device="cpu",
+        )
+
+        collision, _points_a, _points_b, normals, penetrations = _run_box_mpr(
+            position.numpy(), orientation.numpy(), half_extent=0.05, extend=1.0e-4
+        )
+
+        self.assertEqual(int(collision[0]), 1)
+        self.assertGreater(float(normals[0, 2]), 1.0 - 1.0e-6, f"normal {normals[0]}")
+        self.assertAlmostEqual(float(penetrations[0]), 2.1e-4, delta=5.0e-5)
+
+
+def _box_overlap(positions, orientations, half_extent):
+    """The exact overlap of two cubes of ``half_extent`` (B at ``positions``, ``orientations`` in A's frame) in
+    float64: per pose the smallest overlap over the 15 separating axes and its unit axis, from A towards B."""
+    x, y, z, w = (orientations[:, k].astype(np.float64) for k in range(4))
+    rotation = np.stack(
+        [
+            np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], axis=1),
+            np.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], axis=1),
+            np.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], axis=1),
+        ],
+        axis=1,
+    )
+    positions = positions.astype(np.float64)
+    count = len(positions)
+    faces = [np.tile(np.eye(3)[i], (count, 1)) for i in range(3)]
+    axes = faces + [rotation[:, :, j] for j in range(3)]
+    axes += [np.cross(faces[i], rotation[:, :, j]) for i in range(3) for j in range(3)]
+    depth, normal = np.full(count, np.inf), np.zeros((count, 3))
+    for axis in axes:
+        length = np.linalg.norm(axis, axis=1)
+        valid = length > 1.0e-6
+        unit = axis / np.where(valid, length, 1.0)[:, None]
+        center = np.einsum("ni,ni->n", unit, positions)
+        radii = np.abs(unit).sum(axis=1) + np.abs(np.einsum("ni,nij->nj", unit, rotation)).sum(axis=1)
+        overlap = half_extent * radii - np.abs(center)
+        smaller = valid & (overlap < depth)
+        depth = np.where(smaller, overlap, depth)
+        normal = np.where(smaller[:, None], unit * np.where(center < 0.0, -1.0, 1.0)[:, None], normal)
+    return depth, normal
+
+
+class TestMPRStackedCubes(unittest.TestCase):
+    """MPR on stacked, nearly aligned cubes, inflated as the narrow phase inflates them, against their exact overlap."""
+
+    def test_nearly_aligned_stacks_hold_the_face_normal(self):
+        """Stack two 0.1 m cubes on a random face of the lower one, nearly centred (lateral offsets 1e-9..1e-6 m) and
+        turned 1e-7..1e-5 rad about random axes, 0..1.5e-4 m into each other, inflated by 1e-4 m: the regime where the
+        support points of one corner differ by the inflate and the portal can collapse onto an edge. Each contact holds
+        the exact face normal within 0.1 degree and the exact overlap plus the inflate within the inflate; a sliver
+        portal tilted the normal 18 degrees with a 0.031 m depth in 12 of these 40000 poses."""
+        rng = np.random.default_rng(3)
+        count, half_extent, inflate = 40000, 0.05, 1.0e-4
+        axis = rng.normal(size=(count, 3))
+        axis /= np.linalg.norm(axis, axis=1, keepdims=True)
+        angle = 10.0 ** rng.uniform(-7.0, -5.0, count)
+        orientations = np.column_stack([axis * np.sin(0.5 * angle)[:, None], np.cos(0.5 * angle)])
+        stacked = np.column_stack(
+            [
+                10.0 ** rng.uniform(-9.0, -6.0, (count, 2)) * np.where(rng.random((count, 2)) < 0.5, -1.0, 1.0),
+                2.0 * half_extent - rng.uniform(0.0, 1.5e-4, count),
+            ]
+        )
+        # Onto a random face of the lower cube: the stacking axis and its sign.
+        face = rng.integers(0, 6, count)
+        positions = np.zeros_like(stacked)
+        for k in range(count):
+            stack_axis = face[k] // 2
+            positions[k, [(stack_axis + 1) % 3, (stack_axis + 2) % 3, stack_axis]] = stacked[k]
+            positions[k, stack_axis] *= 1.0 if face[k] % 2 == 0 else -1.0
+
+        collision, _points_a, _points_b, normals, penetrations = _run_box_mpr(
+            positions, orientations, half_extent=half_extent, extend=inflate
+        )
+        depth, normal = _box_overlap(positions.astype(np.float32), orientations.astype(np.float32), half_extent)
+
+        np.testing.assert_array_equal(collision, np.ones(count, dtype=np.int32))
+        cosine = np.einsum("ni,ni->n", normals.astype(np.float64), normal)
+        self.assertGreater(float(cosine.min()), np.cos(np.radians(0.1)), f"pose {int(np.argmin(cosine))}")
+        excess = penetrations - (depth + inflate)
+        self.assertLess(float(excess.max()), inflate, f"pose {int(np.argmax(excess))}")
+        self.assertGreater(float(excess.min()), -1.0e-6, f"pose {int(np.argmin(excess))}")
 
 
 class TestMPRTriangleInitialization(unittest.TestCase):

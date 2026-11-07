@@ -22,7 +22,9 @@ from newton._src.geometry.sdf_texture import (
     QuantizationMode,
     TextureSDFData,
     _texture_read_voxel_corners_paired,
+    _locate_cell_coords,
     _texture_sample_sdf_grad_hw_impl,
+    _texture_sample_sdf_hw_clamped,
     build_sparse_sdf_from_primitive,
     compute_isomesh_from_texture_sdf,
     create_empty_texture_sdf_data,
@@ -951,6 +953,59 @@ def test_texture_sdf_in_model(test, device):
     test.assertEqual(len(model._texture_sdf_subgrid_textures), 2)
 
 
+@wp.kernel(enable_backward=False)
+def _cell_lower_margin_kernel(sdf: TextureSDFData, points: wp.array[wp.vec3], margin: wp.array[float]):
+    tid = wp.tid()
+    clamped = wp.min(wp.max(points[tid], sdf.sdf_box_lower), sdf.sdf_box_upper)
+    value = _texture_sample_sdf_hw_clamped(sdf, clamped, 0.0)
+    loc = _locate_cell_coords(sdf, wp.cw_mul(clamped - sdf.sdf_box_lower, sdf.inv_sdf_dx))
+    margin[tid] = value - sdf.cell_lower[0, loc.x_base, loc.y_base, loc.z_base]
+
+
+def test_texture_sdf_cell_lower_bounds_hardware_samples(test, device):
+    """The cell lower bounds never exceed a hardware-filtered sample, and level k covers k cells."""
+    rng = np.random.default_rng(11)
+    for mesh, mode in (
+        (_create_box_mesh(half_extents=(0.4, 0.25, 0.1)), QuantizationMode.UINT16),
+        (_create_sphere_mesh(radius=0.3, subdivisions=3), QuantizationMode.UINT8),
+        (_create_box_mesh(half_extents=(0.2, 0.3, 0.05)), QuantizationMode.FLOAT32),
+    ):
+        wp_mesh = wp.Mesh(
+            points=wp.array(mesh.vertices, dtype=wp.vec3, device=device),
+            indices=wp.array(mesh.indices.flatten(), dtype=wp.int32, device=device),
+            support_winding_number=True,
+        )
+        sdf, _coarse, _subgrid = create_texture_sdf_from_mesh(
+            wp_mesh,
+            margin=0.05,
+            narrow_band_range=(-0.04, 0.04),
+            max_resolution=64,
+            quantization_mode=mode,
+            device=device,
+        )
+        lower = np.array(sdf.sdf_box_lower)
+        upper = np.array(sdf.sdf_box_upper)
+        points = rng.uniform(lower - 0.05, upper + 0.05, size=(200000, 3)).astype(np.float32)
+        margin = wp.zeros(len(points), dtype=float, device=device)
+        wp.launch(
+            _cell_lower_margin_kernel,
+            dim=len(points),
+            inputs=[sdf, wp.array(points, dtype=wp.vec3, device=device)],
+            outputs=[margin],
+            device=device,
+        )
+        test.assertGreaterEqual(float(margin.numpy().min()), 0.0, f"mode {mode}")
+
+        table = sdf.cell_lower.numpy()
+        levels, nx, ny, nz = table.shape
+        cells = rng.integers(0, (nx, ny, nz), size=(5000, 3))
+        for k in range(1, levels):
+            offsets = rng.integers(-k, k + 1, size=cells.shape)
+            other = np.clip(cells + offsets, 0, np.array((nx, ny, nz)) - 1)
+            test.assertTrue(np.all(table[k][tuple(cells.T)] <= table[0][tuple(other.T)]), f"mode {mode} level {k}")
+        test.assertEqual(sdf.cell_lower_floor, float(table[0].min()))
+
+
 def test_empty_texture_sdf_data(test, device):
     """Verify create_empty_texture_sdf_data returns a valid empty struct."""
     empty = create_empty_texture_sdf_data()
@@ -1845,6 +1900,12 @@ def test_texture_sdf_sign_mode_normal_open_mesh(test, device):
 # Register tests for CUDA devices
 devices = get_cuda_test_devices()
 add_function_test(TestTextureSDF, "test_texture_sdf_construction", test_texture_sdf_construction, devices=devices)
+add_function_test(
+    TestTextureSDF,
+    "test_texture_sdf_cell_lower_bounds_hardware_samples",
+    test_texture_sdf_cell_lower_bounds_hardware_samples,
+    devices=devices,
+)
 add_function_test(
     TestTextureSDF,
     "test_texture_sdf_integer_voxel_sampling",

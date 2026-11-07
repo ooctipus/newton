@@ -160,6 +160,85 @@ class TextureSDFData:
     # Whether shape_scale was baked into the SDF
     scale_baked: wp.bool
 
+    # Lower bounds of the hardware-filtered SDF, shape (levels, coarse x, coarse y, coarse z):
+    # ``cell_lower[k, x, y, z]`` bounds every value the filtered samplers return at a point whose
+    # coarse cell is within ``k`` cells of ``(x, y, z)`` along each axis. ``cell_lower_floor`` bounds
+    # the whole box. See :func:`texture_sdf_cell_lower_bounds`.
+    cell_lower: wp.array4d[float]
+    cell_lower_floor: float
+
+
+# Dilation levels of :attr:`TextureSDFData.cell_lower`; level ``k`` covers ``k`` coarse cells around a cell.
+CELL_LOWER_LEVELS = 8
+
+# Relative slack under the texels that a hardware-filtered sample can return. CUDA's LINEAR filter
+# returns a convex combination of the addressed texels (9-bit fixed-point weights that sum to one,
+# CUDA C Programming Guide, "Texture Fetching"), so only its arithmetic rounding can leave the texel
+# range: about 2^-23 of the largest texel for 32-bit float texels and 2^-16 of the normalized range
+# for 16-bit ones. 2^-12 covers both with margin.
+_FILTER_SLACK = 2.0**-12
+
+
+def texture_sdf_cell_lower_bounds(sparse_data: dict, levels: int = CELL_LOWER_LEVELS) -> tuple[np.ndarray, float]:
+    """Bound the filtered SDF from below per coarse cell, dilated by up to ``levels - 1`` cells.
+
+    A point of a coarse cell samples either the cell's subgrid block or, for an empty or linear cell,
+    the eight coarse texels at the cell's corners, through the hardware filter. The filter's result
+    lies in the range of the texels it reads (up to :data:`_FILTER_SLACK`), so the smallest texel of
+    that set, dequantized, bounds every sample in the cell. Level ``k`` is the minimum of level zero
+    over the cells within ``k`` cells along each axis.
+
+    Args:
+        sparse_data: Dictionary produced by a sparse SDF builder (or loaded from the SDF cache).
+        levels: Number of dilation levels to tabulate.
+
+    Returns:
+        ``(bounds, floor)``: ``bounds`` [m] of shape ``(levels, cells x, cells y, cells z)``, and the
+        minimum over all cells [m].
+    """
+    w, h, d = (int(v) for v in sparse_data["coarse_dims"])
+    coarse = np.asarray(sparse_data["coarse_sdf"], dtype=np.float64)  # [z, y, x]
+    corners = np.stack(
+        [coarse[dz : dz + d, dy : dy + h, dx : dx + w] for dz in (0, 1) for dy in (0, 1) for dx in (0, 1)]
+    )
+    bound = corners.min(axis=0) - _FILTER_SLACK * np.abs(corners).max(axis=0)  # [z, y, x]
+
+    slots = np.asarray(sparse_data["subgrid_start_slots"])  # [x, y, z]
+    occupied = slots < np.uint32(SLOT_LINEAR)
+    if np.any(occupied):
+        xs, ys, zs = np.nonzero(occupied)
+        slot = slots[occupied].astype(np.int64)
+        samples = int(sparse_data["subgrid_size"]) + 1
+        texels = np.asarray(sparse_data["subgrid_data"])  # [z, y, x]
+        blocks = texels.shape[0] // samples
+        texels = texels.reshape(blocks, samples, blocks, samples, blocks, samples)
+        bx, by, bz = slot & 0x3FF, (slot >> 10) & 0x3FF, (slot >> 20) & 0x3FF
+        raw_min = texels.min(axis=(1, 3, 5))[bz, by, bx].astype(np.float64)
+        raw_max = texels.max(axis=(1, 3, 5))[bz, by, bx].astype(np.float64)
+        value_min = float(sparse_data["subgrids_min_sdf_value"])
+        value_range = float(sparse_data["subgrids_sdf_value_range"])
+        if np.issubdtype(texels.dtype, np.integer):
+            # Normalized reads: texel / max code, then ``raw * range + min`` in the samplers.
+            scale = float(np.iinfo(texels.dtype).max)
+            cell = (raw_min / scale - _FILTER_SLACK) * value_range + value_min
+        else:
+            raw_slack = _FILTER_SLACK * np.maximum(np.abs(raw_min), np.abs(raw_max))
+            cell = (raw_min - raw_slack) * value_range + value_min
+        bound[zs, ys, xs] = cell - _FILTER_SLACK * abs(value_min)
+
+    table = np.empty((levels, w, h, d), dtype=np.float32)
+    level = bound.transpose(2, 1, 0)  # [x, y, z]
+    for k in range(levels):
+        if k > 0:
+            for axis in range(3):
+                n = level.shape[axis]
+                padded = np.concatenate((np.take(level, [0], axis), level, np.take(level, [n - 1], axis)), axis)
+                level = np.minimum.reduce([np.take(padded, range(i, i + n), axis) for i in range(3)])
+        # Round down, so the float32 table never exceeds the float64 bound.
+        rounded = level.astype(np.float32)
+        table[k] = np.where(rounded > level, np.nextafter(rounded, np.float32(-np.inf)), rounded)
+    return table, float(table[0].min())
+
 
 # ============================================================================
 # Sparse SDF Construction Kernels
@@ -2496,6 +2575,8 @@ def create_sparse_sdf_textures(
     sdf_params.subgrids_sdf_value_range = sparse_data["subgrids_sdf_value_range"]
     sdf_params.paired_samples = paired_samples
     sdf_params.scale_baked = False
+    cell_lower, sdf_params.cell_lower_floor = texture_sdf_cell_lower_bounds(sparse_data)
+    sdf_params.cell_lower = wp.array(cell_lower, dtype=float, device=device)
 
     return sdf_params, coarse_tex, subgrid_tex
 

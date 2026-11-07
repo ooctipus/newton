@@ -1,0 +1,1 @@
+FeatherPGS ordinary dynamics on CUDA evaluate augmented drives with the joint forces in one pass and add their stiffness after the mass assembly, as on the CPU. ``get_path_selection()`` reports ``routes.dynamics.parallel_augmented_drive_topology`` true only where the held tree, the native sparse factor or the compact diagonal reads the per-coordinate drive rows.

@@ -1,0 +1,286 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""The sparse-diagonal, tiled-row and split free-body sweeps as configurations of the sweep emitter (CPU checks).
+
+Each configuration raises for the options it does not admit, declares its staging and generates a balanced body; the
+operators' lane layouts emit the arithmetic order of the sweeps. With ``ptxas`` on ``PATH`` the kernels are also
+assembled offline.
+"""
+
+import itertools
+import re
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+import warp as wp
+
+from newton._src.solvers.feather_pgs import sweep_routes_diag as routes
+from newton._src.solvers.feather_pgs.response_operator import Lanes, Velocity
+from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
+from newton._src.solvers.feather_pgs.sweep import EXACT, LevelLaw, RowLaws, row_sums, speed_row
+from newton._src.solvers.feather_pgs.sweep_routes import free_body_rows
+from newton.tests.feather_pgs_law_harness import built
+
+_POLICIES = (SolvePolicy(), SolvePolicy(readout="sweeps"), SolvePolicy(readout="trace"))
+_SCHEDULES = (
+    {},
+    {"levels": LevelLaw(EXACT)},
+    {"levels": LevelLaw(EXACT), "speculative_contact_batches": True},
+)
+
+
+def _balanced(test, text):
+    test.assertEqual(text.count("{"), text.count("}"))
+    test.assertEqual(text.count("("), text.count(")"))
+    test.assertNotIn("$", text)
+
+
+class TestSweepRoutesDiagOptions(unittest.TestCase):
+    """The configurations refuse the options they do not admit."""
+
+    def test_invalid_options_raise(self):
+        cases = [
+            (built(routes.DiagonalSweep), (32, 14, 6, "sm_120"), {"speculative_contact_batches": True}),
+            (
+                built(routes.DiagonalSweep),
+                (32, 30, 15, "sm_120"),
+                {"levels": LevelLaw(EXACT), "speculative_contact_batches": True},
+            ),
+        ]
+        for factory, args, kwargs in cases:
+            with self.subTest(factory=factory.__name__, kwargs=kwargs), self.assertRaises(ValueError):
+                factory(*args, **kwargs)
+
+
+class TestSweepRoutesDiagSources(unittest.TestCase):
+    """Every option combination generates a body; the stagings are the declared working sets."""
+
+    def test_sparse_diagonal_sources(self):
+        for schedule, policy, (rows, dofs, dense) in itertools.product(
+            _SCHEDULES, _POLICIES, ((32, 14, 6), (64, 40, 10), (128, 70, 14))
+        ):
+            with self.subTest(schedule=schedule, policy=policy, rows=rows, dofs=dofs, dense=dense):
+                text, staging = routes.DiagonalSweep(rows, dofs, dense, "120", solve_policy=policy, **schedule).source()
+                _balanced(self, text)
+                self.assertEqual(staging.bytes, 4 * (dofs + 5 * rows) + 4 * 32)
+                # The coupled rows: every lane stores what it computes; the warp synchronizes after the apply only.
+                self.assertIn("s_lam_dense[i] = new_impulse;", text)
+                self.assertNotIn("if (lane == 0) s_lam_dense", text)
+                # The sweep runs on the velocity change from the predictor, and nothing enters factor coordinates.
+                self.assertIn(f"for (int d = lane; d < {dofs}; d += 32) s_v[d] = 0.0f;", text)
+
+    def test_sparse_diagonal_schedules(self):
+        units, _ = routes.DiagonalSweep(
+            32, 14, 6, "120", levels=LevelLaw(EXACT), speculative_contact_batches=True
+        ).source()
+        plain, _ = routes.DiagonalSweep(32, 14, 6, "120").source()
+        # A batch tests one contact per segment of eight lanes (P + 2 = 8 response entries).
+        self.assertIn("SEGMENT_SUM(8, candidate_velocity);", units)
+        self.assertIn("sparse_contact_serial_normals.data[world * 32 + candidate_index]", units)
+        # The phase bound is clamped to the world's rows; the plain schedule has no contact segment.
+        self.assertIn("const int contact_start = min(dense_phase_bounds.data[world * 2 + 1], row_count);", units)
+        self.assertIn("const int contact_start = row_count;", plain)
+        self.assertNotIn("sparse_contact_level_count", plain)
+        # Independent contacts: a row of one entry, on the contact's coordinate: one product, added to zero.
+        self.assertIn("const int index = scalar_coord;", units)
+        # A level visits a contact's normal and its pair's first tangent with their kinds (and the pair's parent) known,
+        # so no visit reads row metadata; the second tangent is only zeroed while friction waits. A unit has a pair
+        # only when it owns an anchor.
+        for text in (units,):
+            self.assertRegex(text, r"const int i = head;\s+int row_type = 0;")
+            self.assertRegex(text, r"const int i = head \+ 1;\s+int row_type = 2;")
+            self.assertIn("parent = head;", text)
+            self.assertNotIn("pair_visits", text)
+        self.assertIn("if (head + 2 < row_count", units)
+        # A first tangent reduces its pair's terms with its own residual, on the support's one load; the pair's apply
+        # reuses the entries the residual kept, the sibling's change first.
+        for text in (units,):
+            self.assertIn("SUM(jv, sibling_jv, pair_coupling);", text)
+            self.assertIn("if (sib_delta != 0.0f) value += z_sib[q] * sib_delta;", text)
+        # Every schedule solves a loaded coupled contact unit by the unit law in the warp's layout, before the row visits
+        # an unloaded unit falls through to: the unit's three rows on a lane's coordinate, their velocity terms and the
+        # pair's couplings in one ladder, the rows by the row law, one apply, the loop past the unit. A level's contacts
+        # keep their row visits (one lane per contact: a unit branch there would split the warp's lanes).
+        loaded = "if (s_lam_dense[i] != 0.0f || s_lam_dense[i + 1] != 0.0f || s_lam_dense[i + 2] != 0.0f) {"
+        for text in (plain, units):
+            self.assertEqual(text.count("SUM(unit_jv0, unit_jv1, unit_jv2, gram_n1, gram_n2, unit_cross);"), 1)
+            self.assertEqual(text.count(loaded), 1)
+            self.assertIn("float jv = r == 0 ? unit_jv0 : unit_jv1 + gram_n1 * unit_dn;", text)
+            self.assertIn(
+                "s_v[indices[q]] = velocities[q] + ((z_normal[q] * unit_dn + z_tangent1[q] * unit_dt1) + "
+                "z_tangent2[q] * unit_dt2);",
+                text,
+            )
+            self.assertLess(text.index(loaded), text.rindex("int row_type = (s_rec_dense["))
+        for text in (units,):
+            start = text.index("const int levels = sparse_contact_level_count")
+            levels = text[start : text.index("SYNC();", start)]
+            self.assertNotIn("unit_jv", levels)
+            self.assertIn("const int index = scalar_coord;", levels)
+        # The plain schedule has no level phase: a contact the marker marks keeps its row visits there too, so every
+        # schedule solves the same rows by the same law (the CUDA twins compare the schedules bit for bit).
+        marked = "!(sparse_row_dof.data[(row_base + i) * 2] < -1 || sparse_row_dof.data[(row_base + i) * 2 + 1] < -1)"
+        self.assertLess(plain.index(marked), plain.index(loaded))
+        # The rows act in factor coordinates on the velocity change: the dense articulation's goes to the step's one
+        # leave in the walk's coordinates (the walk down in its rows' frame), a diagonal coordinate scaled by its m^-1/2
+        # onto the predictor.
+        for text in (plain, units):
+            self.assertIn("rhs_bias.data[off_dense + (i)] + row_incident.data[off_dense + (i)]", text)
+            self.assertIn("v_out.data[global_dof] += diagonal_scale > 0.0f ? s_v[d] * diagonal_scale : s_v[d];", text)
+            self.assertIn("sqrtf(diagonal_inverse_mass.data[global_dof])", text)
+            self.assertLess(text.index("for (int iter = 0;"), text.index("walk.du.data[global_dof] += s_v[d];"))
+            self.assertNotIn("WALK_DOWN", text)
+
+
+class _Walk:
+    """A free body's walk as named native calls."""
+
+    @staticmethod
+    def walk_leave(first, values):
+        return f"WALK_LEAVE_OF({first}, {values});"
+
+    @staticmethod
+    def walk_enter(first, velocity, out):
+        return f"WALK_ENTER_OF({first}, {velocity}, {out});"
+
+
+def _speed_row(lanes, velocity):
+    return speed_row(
+        _Walk,
+        RowLaws(),
+        velocity=velocity,
+        load="lam",
+        store="",
+        lanes=lanes,
+        rhs="b",
+        inverse="inv",
+        body="f",
+        axis="axis",
+        pad="",
+    )
+
+
+class TestSweepRoutesDiagOperators(unittest.TestCase):
+    """The operators' layouts emit the order of the sweeps they replace."""
+
+    def test_free_body_one_thread(self):
+        op = free_body_rows(Lanes(1))
+        residual = row_sums(op, "jv", "")
+        # One thread sums the twelve entries in order, a's six then b's, from zero; the visited row is read at i.
+        self.assertIn("float jv = 0.0f;", residual)
+        self.assertIn("const int entry = q;", residual)
+        self.assertIn("for (int q = 0; q < 12; ++q) {", residual)
+        self.assertIn("jv += packed_Z.data[free_base + i * 12 + entry] * velocity;", residual)
+        self.assertIn(
+            "((entry < 6 ? dof_a : dof_b) < 0 ? -1 : (entry < 6 ? dof_a + entry : dof_b + entry - 6))", residual
+        )
+        self.assertNotIn("SUM", residual)
+        # The sibling residual sums its velocity term, then adds its right-hand side.
+        sibling = op.dot((("sibling_residual", "sib", None),), {"sib": "sib"}, "", rhs={"sibling_residual": "rhs[sib]"})
+        self.assertIn("sibling_residual += packed_Z.data[free_base + sib * 12 + entry] * velocity;", sibling)
+        self.assertLess(sibling.index("* velocity;"), sibling.index("sibling_residual += rhs[sib];"))
+        coupling = op.dot((("cross", "row", "sib"),), {"row": "i", "sib": "sib"}, "")
+        self.assertIn(
+            "cross += packed_Z.data[free_base + i * 12 + entry] * packed_Z.data[free_base + sib * 12 + entry];",
+            coupling,
+        )
+        # A speed row reads the body's physical velocity v = L^-T u by its walk, then pushes u by L^T dv the same way.
+        speed = _speed_row(Lanes(1), Velocity("s_vel"))
+        self.assertIn("speed_v[k] = s_vel[f + k];", speed)
+        self.assertIn("WALK_LEAVE_OF(f, speed_v);", speed)
+        self.assertIn("sqrtf((speed_v[axis] * speed_v[axis] + speed_v[axis + 1] * speed_v[axis + 1])", speed)
+        self.assertIn("WALK_ENTER_OF(f, speed_dv, speed_du);", speed)
+        self.assertIn("s_vel[f + k] += speed_du[k];", speed)
+
+    def test_free_body_lanes(self):
+        op = free_body_rows(Lanes(32))
+        # A lane an entry: the visited row's is the loop's pipelined register, every other row's is read at its index.
+        residual = row_sums(op, "jv", "")
+        self.assertIn("jv += cur_z * velocity;", residual)
+        self.assertIn("const int index = entry < 12 ?", residual)
+        self.assertIn("SUM(jv);", residual)
+        # A friction pair's terms reduce in one ladder, the right-hand side added after.
+        pair = op.dot(
+            (("sibling_residual", "sib", None), ("cross", "row", "sib")),
+            {"row": "i", "sib": "sib"},
+            "",
+            rhs={"sibling_residual": "rhs[sib]"},
+        )
+        self.assertIn("SUM(sibling_residual, cross);\nsibling_residual += rhs[sib];", pair)
+        self.assertIn("cross += cur_z * packed_Z.data[free_base + sib * 12 + entry];", pair)
+        # The second tangent applies on its own, read at its index.
+        self.assertFalse(op.fused_pair_apply)
+        self.assertIn(
+            "s_v[index] += packed_Z.data[free_base + sib * 12 + entry] * d;", op.axpy((("sib", "d"),), "", row="sib")
+        )
+        self.assertIn("s_v[index] += cur_z * d;", op.axpy((("row", "d"),), ""))
+        # The lanes push the speed row's change from their first lane.
+        self.assertIn("if (lane == 0) {", _speed_row(Lanes(32), Velocity("s_v")))
+
+    def test_slot_row_layouts(self):
+        """The sparse diagonal's rows are packed rows of a dense group and two slots: a lane an entry."""
+        warp = routes.slot_rows(6, 32, Lanes(32))
+        residual = row_sums(warp, "jv", "")
+        self.assertIn("SUM(jv);", residual)
+        # One whitened entry per lane: the dense part's Z, or a slot's Z_s, at the entry's coordinate.
+        self.assertIn("dense_Z.data[(dense_group * 32 + i) * 6 + entry]", residual)
+        self.assertIn("sparse_row_z.data[(row_base + i) * 2 + entry - 6]", residual)
+        self.assertIn("sparse_row_dof.data[(row_base + i) * 2 + entry - 6]", residual)
+        # W = Z^T Z: a first tangent reduces its pair's terms with its own, on the shared support.
+        paired = row_sums(warp, "jv", "", sibling="parent + 2", paired="row_type == 2")
+        self.assertIn("SUM(jv, sibling_jv, pair_coupling);", paired)
+        segment = routes.slot_rows(6, 32, Lanes(8, "batch_lane", segment=True))
+        velocity = segment.dot((("v", "row", None),), {"row": "c"}, "", exists={"row": "valid"})
+        self.assertIn("SEGMENT_SUM(8, v);", velocity)
+        self.assertIn("const int index = valid && entry < 8 ?", velocity)
+        scalar = row_sums(routes.SCALAR_ROWS, "jv", "")
+        self.assertIn("const int index = scalar_coord;", scalar)
+        self.assertNotIn("SUM", scalar)
+
+
+def _assemble(kernel, arch: int = 120) -> dict:
+    """Assemble a kernel's module offline (Warp's PTX, then ``ptxas``) and return its entry's resources."""
+    with tempfile.TemporaryDirectory() as directory:
+        options = kernel.module.resolve_options(wp.config, block_dim=32)
+        kernel.module._compile(None, directory, output_arch=arch, use_ptx=True, options=options)
+        ptx = sorted(Path(directory).rglob("*.ptx"))[0]
+        source = Path(directory) / "module.ptx"
+        source.write_bytes(ptx.read_bytes().rstrip(b"\0"))
+        result = subprocess.run(
+            ["ptxas", f"-arch=sm_{arch}", "-v", str(source), "-o", str(Path(directory) / "module.cubin")],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    log = result.stderr
+    entry = log[log.index("_cuda_kernel_forward") :]
+    return {
+        "registers": int(re.search(r"Used (\d+) registers", entry).group(1)),
+        "shared": int(re.search(r"(\d+) bytes smem", entry).group(1)),
+        "spills": int(re.search(r"(\d+) bytes spill stores", entry).group(1)),
+    }
+
+
+@unittest.skipUnless(shutil.which("ptxas"), "ptxas is not on PATH")
+class TestSweepRoutesDiagAssembly(unittest.TestCase):
+    """The kernels assemble offline without spills."""
+
+    def test_kernels_assemble(self):
+        cases = [
+            (
+                built(routes.DiagonalSweep),
+                (32, 14, 6, "sm_120"),
+                {"levels": LevelLaw(EXACT), "speculative_contact_batches": True},
+            ),
+        ]
+        for factory, args, kwargs in cases:
+            with self.subTest(factory=factory.__name__, kwargs=kwargs):
+                self.assertEqual(_assemble(factory(*args, **kwargs))["spills"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

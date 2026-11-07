@@ -1,0 +1,1 @@
+Link one-contact persistent patch-friction regions of `SolverFeatherPGS` (`friction_anchor_beta > 0`) without walking their ring or rewriting their friction budget, which shortens the patch link on scenes with many single-contact regions and leaves results unchanged.

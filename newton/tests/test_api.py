@@ -196,6 +196,25 @@ class TestApi(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "multiple values for argument 'option'"):
             func(1, 2, option=3)
 
+    def test_keyword_only_deprecation_shim_caps_legacy_positions(self):
+        """Bind deprecated positions only up to last_positional and reject later keyword-only parameters."""
+        from newton._src.utils.deprecation import deprecate_nonkeyword_arguments  # noqa: PLC0415
+
+        def options(first, *, legacy=1, last_legacy=2, keyword_only=3):
+            return first, legacy, last_legacy, keyword_only
+
+        capped = deprecate_nonkeyword_arguments(last_positional="last_legacy")(options)
+        with self.assertWarnsRegex(DeprecationWarning, "Passing 'legacy', 'last_legacy' positionally"):
+            self.assertEqual(capped(0, 10, 20), (0, 10, 20, 3))
+        with self.assertRaisesRegex(TypeError, r"options\(\) takes at most 3 positional arguments but 4 were given$"):
+            capped(0, 10, 20, 30)
+        self.assertEqual(capped(0, keyword_only=30), (0, 1, 2, 30))
+        # Without a cap, every keyword-only parameter keeps a deprecated position.
+        with self.assertWarnsRegex(DeprecationWarning, "'keyword_only' positionally"):
+            self.assertEqual(deprecate_nonkeyword_arguments(options)(0, 10, 20, 30), (0, 10, 20, 30))
+        with self.assertRaisesRegex(TypeError, "has no keyword-only parameter 'first'"):
+            deprecate_nonkeyword_arguments(last_positional="first")(options)
+
     def test_keyword_only_api_signatures(self):
         """Expose mature optional API arguments as keyword-only."""
         import newton  # noqa: PLC0415
@@ -203,10 +222,12 @@ class TestApi(unittest.TestCase):
         body_sig = inspect.signature(newton.ModelBuilder.add_body)
         link_sig = inspect.signature(newton.ModelBuilder.add_link)
         solver_sig = inspect.signature(newton.solvers.SolverSemiImplicit.__init__)
+        feather_pgs_sig = inspect.signature(newton.solvers.SolverFeatherPGS.__init__)
 
         self.assertEqual(body_sig.parameters["xform"].kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertEqual(link_sig.parameters["xform"].kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertEqual(solver_sig.parameters["angular_damping"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertEqual(feather_pgs_sig.parameters["angular_damping"].kind, inspect.Parameter.KEYWORD_ONLY)
 
     def test_shape_opacity_follows_color(self):
         """Keep shape display arguments adjacent and keyword-only."""

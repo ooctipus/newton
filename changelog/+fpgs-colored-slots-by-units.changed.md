@@ -1,0 +1,1 @@
+FeatherPGS's colored free-body sweep sizes each world's slot by its contact units (a third of its free-body row capacity) instead of its row capacity, about a third of the colored storage; a world with more units keeps the one-warp sweep and sets `ColoredUnits.capacity_status()`. Bitwise the same sweep.

@@ -6,12 +6,16 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
 from newton.tests.unittest_utils import add_function_test, get_test_devices
+
+_SENTINEL = np.float32(-7.25)
+"""Stale buffer value that no Jacobian or mass-matrix entry of the fixtures takes."""
 
 
 def _build_translated_prismatic_chain(device):
@@ -137,6 +141,218 @@ def _build_d6_three_angular(device):
     builder.add_articulation([j], label="d6_three_angular")
 
     return builder.finalize(device=device), child
+
+
+def _offset(x, y, z):
+    """Return a translation-only transform."""
+    return wp.transform(wp.vec3(x, y, z), wp.quat_identity())
+
+
+def _build_mixed_articulations(device, world_count=3):
+    """Build replicated worlds of three articulations whose Jacobian blocks all carry padding.
+
+    Each world holds a fixed-base chain (4 links, 6 DOFs: revolute, prismatic, ball,
+    revolute), a fan of six one-DOF leaves on a fixed root (7 links, 6 DOFs) and a
+    floating chain (2 links, 7 DOFs). The fan sets the link count and the floating chain
+    the DOF count, so every articulation's block has padded rows or columns. Joint
+    coordinates are moved away from the reference pose before forward kinematics.
+
+    Args:
+        device: Device on which to finalize the model.
+        world_count: Number of replicated worlds.
+
+    Returns:
+        Tuple containing the finalized model and the posed state.
+    """
+    inertia = wp.mat33(np.eye(3, dtype=np.float32) * 0.01)
+    world = newton.ModelBuilder()
+
+    links = [world.add_link(mass=1.0 + 0.2 * i, com=wp.vec3(0.05 * i, -0.03, 0.02), inertia=inertia) for i in range(4)]
+    chain = [
+        world.add_joint_revolute(-1, links[0], axis=newton.Axis.Z, parent_xform=_offset(0.1, 0.0, 0.2)),
+        world.add_joint_prismatic(links[0], links[1], axis=newton.Axis.X, parent_xform=_offset(0.3, 0.0, 0.0)),
+        world.add_joint_ball(links[1], links[2], parent_xform=_offset(0.0, 0.25, 0.0)),
+        world.add_joint_revolute(links[2], links[3], axis=newton.Axis.Y, parent_xform=_offset(0.2, 0.0, 0.1)),
+    ]
+    world.add_articulation(chain, label="chain")
+
+    root = world.add_link(mass=2.0, inertia=inertia)
+    fan = [world.add_joint_fixed(-1, root, parent_xform=_offset(1.0, 0.0, 0.0))]
+    for i in range(6):
+        leaf = world.add_link(mass=0.3, com=wp.vec3(0.0, 0.01 * i, 0.02), inertia=inertia)
+        add_joint, axis = (
+            (world.add_joint_prismatic, newton.Axis.Z) if i % 2 == 0 else (world.add_joint_revolute, newton.Axis.X)
+        )
+        fan.append(add_joint(root, leaf, axis=axis, parent_xform=_offset(0.1 * i, 0.05, 0.0)))
+    world.add_articulation(fan, label="fan")
+
+    base = world.add_link(mass=1.5, com=wp.vec3(0.02, 0.0, -0.01), inertia=inertia)
+    tip = world.add_link(mass=0.7, com=wp.vec3(0.1, 0.0, 0.0), inertia=inertia)
+    floater = [
+        world.add_joint_free(base, parent_xform=_offset(0.0, 1.0, 0.5)),
+        world.add_joint_revolute(base, tip, axis=newton.Axis.Y, parent_xform=_offset(0.2, 0.0, 0.0)),
+    ]
+    world.add_articulation(floater, label="floater")
+
+    scene = newton.ModelBuilder()
+    scene.replicate(world, world_count=world_count)
+    model = scene.finalize(device=device)
+
+    state = model.state()
+    q = state.joint_q.numpy()
+    q_start = model.joint_q_start.numpy()
+    rng = np.random.default_rng(7)
+    for joint, joint_type in enumerate(model.joint_type.numpy()):
+        start = q_start[joint]
+        if joint_type in (newton.JointType.REVOLUTE, newton.JointType.PRISMATIC):
+            q[start] = rng.uniform(-0.8, 0.8)
+        elif joint_type in (newton.JointType.BALL, newton.JointType.FREE):
+            if joint_type == newton.JointType.FREE:
+                q[start : start + 3] = rng.uniform(-0.5, 0.5, 3)
+                start += 3
+            quat = rng.normal(size=4)
+            q[start : start + 4] = quat / np.linalg.norm(quat)
+    state.joint_q.assign(q)
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    return model, state
+
+
+def _build_fans(device, leaf_count, world_count=4):
+    """Build replicated worlds of one fan of one-DOF leaves on a fixed root.
+
+    The leaves alternate between prismatic and revolute joints. Each Jacobian block
+    holds ``6 * (leaf_count + 1) * leaf_count`` entries.
+
+    Args:
+        device: Device on which to finalize the model.
+        leaf_count: Number of leaves.
+        world_count: Number of replicated worlds.
+
+    Returns:
+        Tuple containing the finalized model and the state after forward kinematics.
+    """
+    inertia = wp.mat33(np.eye(3, dtype=np.float32) * 0.01)
+    world = newton.ModelBuilder()
+    root = world.add_link(mass=2.0, inertia=inertia)
+    fan = [world.add_joint_fixed(-1, root)]
+    for i in range(leaf_count):
+        leaf = world.add_link(mass=0.3, com=wp.vec3(0.0, 0.01 * i, 0.02), inertia=inertia)
+        add_joint, axis = (
+            (world.add_joint_prismatic, newton.Axis.Z) if i % 2 == 0 else (world.add_joint_revolute, newton.Axis.X)
+        )
+        fan.append(add_joint(root, leaf, axis=axis, parent_xform=_offset(0.1 * i, 0.05, 0.0)))
+    world.add_articulation(fan, label="fan")
+
+    scene = newton.ModelBuilder()
+    scene.replicate(world, world_count=world_count)
+    model = scene.finalize(device=device)
+    state = model.state()
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    return model, state
+
+
+def _mixed_selections(model):
+    """Return named articulation selections over :func:`_build_mixed_articulations` as boolean arrays."""
+    labels = np.asarray(model.articulation_label)
+    world = model.articulation_world.numpy()
+    return {
+        "fan": labels == "fan",
+        "mixed": ((labels == "chain") & (world == 0)) | ((labels != "chain") & (world == 1)),
+        "none": np.zeros(model.articulation_count, dtype=bool),
+        "all": np.ones(model.articulation_count, dtype=bool),
+    }
+
+
+def _jacobian_shape(model):
+    """Return the model-wide padded Jacobian shape."""
+    return (model.articulation_count, model.max_joints_per_articulation * 6, model.max_dofs_per_articulation)
+
+
+def _filled(shape, value, device):
+    """Return a float array of ``shape`` holding ``value`` everywhere."""
+    return wp.array(np.full(shape, value, dtype=np.float32), dtype=float, device=device)
+
+
+def _jacobian_extents(model):
+    """Return each articulation's Jacobian extent within its block: (6 times its joint count, its DOF count)."""
+    start = model.articulation_start.numpy()
+    end = model.articulation_end.numpy()
+    qd_start = model.joint_qd_start.numpy()
+    return [(6 * (end[i] - start[i]), qd_start[end[i]] - qd_start[start[i]]) for i in range(model.articulation_count)]
+
+
+def _jacobian_entries(model, selected, shape):
+    """Return a Boolean array of ``shape`` that marks the Jacobian entries of the selected articulations."""
+    entries = np.zeros(shape, dtype=bool)
+    for i, (rows, cols) in enumerate(_jacobian_extents(model)):
+        if selected[i]:
+            entries[i, :rows, :cols] = True
+    return entries
+
+
+def _bits(array):
+    """Return the float32 bit patterns of ``array``, so that comparisons tell ``-0.0`` from ``0.0``."""
+    return np.ascontiguousarray(array, dtype=np.float32).view(np.uint32)
+
+
+def _assert_bits_equal(actual, expected):
+    """Assert that two float32 arrays hold the same bits, so that ``-0.0`` does not pass for ``0.0``."""
+    np.testing.assert_array_equal(_bits(actual), _bits(expected))
+
+
+def _assert_masked_jacobian(actual, expected, before, entries):
+    """Assert what an eval_jacobian guarantees for a buffer that held ``before``.
+
+    The selected articulations' Jacobians, the ``entries``, equal the unmasked result
+    ``expected`` bitwise, and every other entry still holds ``before``, bit for bit.
+
+    Args:
+        actual: Jacobian after the call, shape [articulation_count, rows, columns].
+        expected: Unmasked Jacobian of the same state.
+        before: Buffer contents before the call, broadcastable to ``actual``.
+        entries: Boolean array of ``actual``'s shape marking the selected Jacobians.
+    """
+    _assert_bits_equal(actual[entries], expected[entries])
+    before = np.broadcast_to(np.asarray(before, dtype=np.float32), actual.shape)
+    _assert_bits_equal(actual[~entries], before[~entries])
+
+
+def _record_clears():
+    """Patch whole-array clears and return the patches and the list of cleared array pointers.
+
+    ``wp.zeros`` clears through :meth:`warp.array.zero_`, so zero-initialized
+    allocations are recorded as well.
+    """
+    cleared = []
+    zero_, fill_ = wp.array.zero_, wp.array.fill_
+
+    def record_zero(array):
+        cleared.append((array.ptr, array.shape, array.dtype))
+        zero_(array)
+
+    def record_fill(array, value):
+        cleared.append((array.ptr, array.shape, array.dtype))
+        fill_(array, value)
+
+    patches = (mock.patch.object(wp.array, "zero_", record_zero), mock.patch.object(wp.array, "fill_", record_fill))
+    return patches, cleared
+
+
+def _nan_filled_float_allocations():
+    """Return a patch under which every float array from ``wp.empty`` starts as NaN.
+
+    Uninitialized memory may hold anything; NaN makes any read of an entry that was
+    never written show up in the results.
+    """
+    empty = wp.empty
+
+    def nan_empty(*args, **kwargs):
+        array = empty(*args, **kwargs)
+        if array.dtype == wp.float32:
+            array.fill_(np.nan)
+        return array
+
+    return mock.patch.object(wp, "empty", nan_empty)
 
 
 def _diagonal_inertia(ix, iy, iz):
@@ -632,7 +848,8 @@ def test_jacobian_with_mask(test, device):
     # First articulation should have non-zero Jacobian
     test.assertNotEqual(np.abs(J_np[0]).max(), 0.0)
 
-    # Second articulation should be zero (masked out)
+    # The second articulation is masked out: a masked eval_jacobian leaves its block
+    # unchanged, and the buffer was zero-initialized.
     test.assertEqual(np.abs(J_np[1]).max(), 0.0)
 
 
@@ -681,6 +898,331 @@ def test_mass_matrix_with_mask(test, device):
 
     # Second articulation should have non-zero mass matrix
     test.assertNotEqual(H_np[1, 0, 0], 0.0)
+
+
+def test_jacobian_writes_only_selected_jacobians(test, device):
+    """Overwrite each selected articulation's Jacobian, links by DOFs, and nothing else in ``J``.
+
+    Every selected Jacobian, zeros of DOFs that do not move a link included, must equal
+    the unmasked result bitwise whatever the buffer held before. The rows and columns
+    past each articulation's links and DOFs, and the blocks of unselected articulations,
+    keep the caller's values. Without a mask every articulation is selected.
+    """
+    model, state = _build_mixed_articulations(device)
+    J_ref = newton.eval_jacobian(model, state).numpy()
+    masks = {name: wp.array(selected, dtype=bool, device=device) for name, selected in _mixed_selections(model).items()}
+    masks["no mask"] = None
+
+    for name, mask in masks.items():
+        with test.subTest(selection=name):
+            J = _filled(J_ref.shape, _SENTINEL, device)
+            test.assertIs(newton.eval_jacobian(model, state, J, mask=mask), J)
+
+            selected = np.ones(model.articulation_count, dtype=bool) if mask is None else mask.numpy()
+            _assert_masked_jacobian(J.numpy(), J_ref, _SENTINEL, _jacobian_entries(model, selected, J_ref.shape))
+
+
+def test_jacobian_mask_without_buffer_zeroes_unselected(test, device):
+    """Return zero blocks for unselected articulations when eval_jacobian allocates J."""
+    model, state = _build_mixed_articulations(device)
+    J_ref = newton.eval_jacobian(model, state).numpy()
+    selected = _mixed_selections(model)["mixed"]
+
+    J = newton.eval_jacobian(model, state, mask=wp.array(selected, dtype=bool, device=device)).numpy()
+
+    _assert_bits_equal(J[selected], J_ref[selected])
+    _assert_bits_equal(J[~selected], np.zeros_like(J_ref[~selected]))
+
+
+def _view_slots(view):
+    """Return the Model articulation index of each slot of ``view``'s view-shaped outputs (world-major)."""
+    return view.articulation_ids.numpy().reshape(-1)
+
+
+def _view_selections():
+    """Return named per-world masks of the 3-world mixed model: every world, and world 1 only."""
+    return {"view": None, "world 1": np.array([False, True, False])}
+
+
+def test_articulation_view_jacobian_writes_view_slots(test, device):
+    """Write each selected view articulation's Jacobian into its slot of a view-shaped J, and nothing else.
+
+    Slot ``i`` holds the Jacobian of the view's ``i``-th articulation, bitwise the entries of the
+    model-level result for it. Slots outside a per-world mask, and entries past an articulation's links
+    and DOFs (a view of every articulation pads to its largest), keep the caller's values.
+    """
+    model, state = _build_mixed_articulations(device)
+    J_ref = newton.eval_jacobian(model, state).numpy()
+    extents = _jacobian_extents(model)
+
+    for pattern in ("fan", "*"):
+        view = newton.selection.ArticulationView(model, pattern, verbose=False)
+        shape = (view.count, 6 * view.max_joints_per_articulation, view.max_dofs_per_articulation)
+        for name, world_mask in _view_selections().items():
+            with test.subTest(pattern=pattern, selection=name):
+                J = _filled(shape, _SENTINEL, device)
+                view_mask = None if world_mask is None else wp.array(world_mask, dtype=bool, device=device)
+                test.assertIs(view.eval_jacobian(state, J, mask=view_mask), J)
+
+                selected = view.get_model_articulation_mask(mask=view_mask).numpy()
+                expected = np.full(shape, _SENTINEL, dtype=np.float32)
+                for slot, articulation in enumerate(_view_slots(view)):
+                    if selected[articulation]:
+                        rows, cols = extents[articulation]
+                        expected[slot, :rows, :cols] = J_ref[articulation, :rows, :cols]
+                _assert_bits_equal(J.numpy(), expected)
+
+
+def test_articulation_view_mass_matrix_writes_view_slots(test, device):
+    """Write each selected view articulation's mass matrix into its slot of a view-shaped H, each entry once.
+
+    Slot ``i`` holds the mass matrix of the view's ``i``-th articulation, bitwise the model-level result
+    for it, with the Jacobian computed internally or supplied from :meth:`eval_jacobian`. Slots outside
+    a per-world mask and entries past an articulation's DOFs keep the caller's values: nothing is cleared.
+    """
+    model, state = _build_mixed_articulations(device)
+    H_ref = newton.eval_mass_matrix(model, state).numpy()
+    extents = _jacobian_extents(model)
+
+    for pattern in ("fan", "*"):
+        view = newton.selection.ArticulationView(model, pattern, verbose=False)
+        shape = (view.count, view.max_dofs_per_articulation, view.max_dofs_per_articulation)
+        for name, world_mask in _view_selections().items():
+            view_mask = None if world_mask is None else wp.array(world_mask, dtype=bool, device=device)
+            J = view.eval_jacobian(state, mask=view_mask)
+            for source, supplied in (("internal", None), ("supplied", J)):
+                with test.subTest(pattern=pattern, selection=name, jacobian=source):
+                    H = _filled(shape, _SENTINEL, device)
+                    test.assertIs(view.eval_mass_matrix(state, H, J=supplied, mask=view_mask), H)
+
+                    selected = view.get_model_articulation_mask(mask=view_mask).numpy()
+                    expected = np.full(shape, _SENTINEL, dtype=np.float32)
+                    for slot, articulation in enumerate(_view_slots(view)):
+                        if selected[articulation]:
+                            dofs = extents[articulation][1]
+                            expected[slot, :dofs, :dofs] = H_ref[articulation, :dofs, :dofs]
+                    _assert_bits_equal(H.numpy(), expected)
+
+
+def test_articulation_view_rejects_other_shapes(test, device):
+    """Refuse outputs and scratch that do not have the view's shapes, such as a model-wide Jacobian."""
+    model, state = _build_mixed_articulations(device)
+    view = newton.selection.ArticulationView(model, "fan", verbose=False)
+    joints, dofs = view.max_joints_per_articulation, view.max_dofs_per_articulation
+    with test.assertRaises(ValueError):
+        view.eval_jacobian(state, wp.zeros(_jacobian_shape(model), dtype=float, device=device))
+    with test.assertRaises(ValueError):
+        view.eval_mass_matrix(state, wp.zeros((view.count, dofs + 1, dofs + 1), dtype=float, device=device))
+    with test.assertRaises(ValueError):
+        view.eval_mass_matrix(state, body_I_s=wp.zeros(view.count * joints, dtype=wp.spatial_matrix, device=device))
+
+
+def test_articulation_view_of_every_articulation_matches_unmasked(test, device):
+    """Evaluate a view of every articulation like the unmasked functions, without clearing a Jacobian.
+
+    Without a mask such a view selects everything, so the unmasked paths give the same
+    values. The caller's Jacobian and the internal one of eval_mass_matrix are written,
+    never cleared. A mask still restricts the selection.
+    """
+    model, state = _build_mixed_articulations(device)
+    view = newton.selection.ArticulationView(model, "*", verbose=False)
+    test.assertEqual(view.count, model.articulation_count)
+    J_ref = newton.eval_jacobian(model, state).numpy()
+    H_ref = newton.eval_mass_matrix(model, state).numpy()
+    J = _filled(J_ref.shape, _SENTINEL, device)
+
+    patches, cleared = _record_clears()
+    with patches[0], patches[1]:
+        test.assertIs(view.eval_jacobian(state, J), J)
+        H = view.eval_mass_matrix(state)
+
+    test.assertFalse([ptr for ptr, shape, _dtype in cleared if shape == J_ref.shape])
+    every = np.ones(model.articulation_count, dtype=bool)
+    _assert_masked_jacobian(J.numpy(), J_ref, _SENTINEL, _jacobian_entries(model, every, J_ref.shape))
+    _assert_bits_equal(H.numpy(), H_ref)
+
+    J = _filled(J_ref.shape, _SENTINEL, device)
+    view.eval_jacobian(state, J, mask=wp.array([False, True, False], dtype=bool, device=device))
+    selected = model.articulation_world.numpy() == 1
+    _assert_masked_jacobian(J.numpy(), J_ref, _SENTINEL, _jacobian_entries(model, selected, J_ref.shape))
+
+
+def test_mass_matrix_mask_zeroes_unselected_articulations(test, device):
+    """Return exact selected blocks and zeros elsewhere from a masked eval_mass_matrix.
+
+    This is the mask convention that eval_inverse_dynamics_passive documents as
+    mirroring eval_mass_matrix. It must hold when H holds stale values and the
+    supplied Jacobian, evaluated into a NaN-filled buffer, carries NaN everywhere
+    outside the selected articulations' Jacobians.
+    """
+    model, state = _build_mixed_articulations(device)
+    H_ref = newton.eval_mass_matrix(model, state).numpy()
+
+    for name, selected in _mixed_selections(model).items():
+        mask = wp.array(selected, dtype=bool, device=device)
+        J = _filled(_jacobian_shape(model), np.nan, device)
+        newton.eval_jacobian(model, state, J, mask=mask)
+        for source, supplied in (("supplied", J), ("internal", None)):
+            with test.subTest(selection=name, jacobian=source):
+                H = _filled(H_ref.shape, _SENTINEL, device)
+                test.assertIs(newton.eval_mass_matrix(model, state, H, J=supplied, mask=mask), H)
+
+                H_np = H.numpy()
+                _assert_bits_equal(H_np[selected], H_ref[selected])
+                _assert_bits_equal(H_np[~selected], np.zeros_like(H_ref[~selected]))
+
+
+def test_mass_matrix_scratch_skips_redundant_clears(test, device):
+    """Clear eval_mass_matrix's internal scratch only where its kernels read it.
+
+    The internal Jacobian is never cleared: eval_jacobian writes every entry that the
+    mass-matrix kernel reads. The spatial-inertia scratch is fully overwritten and
+    never zero-filled. H keeps its single clear, which the documented zeros of
+    unselected articulations need.
+    """
+    model, state = _build_mixed_articulations(device)
+    mask = wp.array(_mixed_selections(model)["fan"], dtype=bool, device=device)
+    J_shape = _jacobian_shape(model)
+    H_shape = (model.articulation_count, model.max_dofs_per_articulation, model.max_dofs_per_articulation)
+
+    for name, call_mask in (("masked", mask), ("unmasked", None)):
+        patches, cleared = _record_clears()
+        with patches[0], patches[1]:
+            newton.eval_mass_matrix(model, state, mask=call_mask)
+
+        with test.subTest(call=name):
+            test.assertEqual(sum(shape == J_shape for _ptr, shape, _dtype in cleared), 0)
+            test.assertEqual(sum(shape == H_shape for _ptr, shape, _dtype in cleared), 1)
+            test.assertFalse([dtype for _ptr, _shape, dtype in cleared if dtype == wp.spatial_matrix])
+
+
+def test_jacobian_mask_accepts_masks_the_launch_converts(test, device):
+    """Select the same articulations from masks that only the kernel launch accepts as from an exact mask.
+
+    The launch reads the first ``articulation_count`` entries of a longer Warp mask
+    and, on the CPU, takes a NumPy Boolean mask through its array interface. The
+    masked mass matrix, whose internal Jacobian goes through the same launch, must
+    agree as well.
+    """
+    model, state = _build_mixed_articulations(device)
+    selected = _mixed_selections(model)["mixed"]
+    exact = wp.array(selected, dtype=bool, device=device)
+    masks = {"longer Warp mask": wp.array(np.append(selected, [True, False]), dtype=bool, device=device)}
+    if device.is_cpu:
+        masks["NumPy mask"] = selected
+
+    J_ref = _filled(_jacobian_shape(model), _SENTINEL, device)
+    newton.eval_jacobian(model, state, J_ref, mask=exact)
+    H_ref = newton.eval_mass_matrix(model, state, mask=exact).numpy()
+    for name, mask in masks.items():
+        with test.subTest(mask=name):
+            J = _filled(_jacobian_shape(model), _SENTINEL, device)
+            newton.eval_jacobian(model, state, J, mask=mask)
+            _assert_bits_equal(J.numpy(), J_ref.numpy())
+            _assert_bits_equal(newton.eval_mass_matrix(model, state, mask=mask).numpy(), H_ref)
+
+
+def test_jacobian_mask_graph_replay_matches_eager(test, device):
+    """Write the Jacobians that the mask selects when a captured masked evaluation replays.
+
+    Each replay starts from a reset buffer and a new mask: the selected Jacobians must
+    equal the eager unmasked result, and every other entry keeps the reset value.
+    """
+    model, state = _build_mixed_articulations(device)
+    J_ref = newton.eval_jacobian(model, state).numpy()
+    selections = _mixed_selections(model)
+    mask = wp.array(selections["mixed"], dtype=bool, device=device)
+    joint_S_s = wp.zeros(model.joint_dof_count, dtype=wp.spatial_vector, device=device)
+    J = _filled(J_ref.shape, _SENTINEL, device)
+
+    # Load the modules eagerly; a capture cannot compile them.
+    newton.eval_jacobian(model, state, J, joint_S_s=joint_S_s, mask=mask)
+    with wp.ScopedCapture(device) as capture:
+        newton.eval_jacobian(model, state, J, joint_S_s=joint_S_s, mask=mask)
+
+    for name in ("mixed", "fan", "all"):
+        with test.subTest(selection=name):
+            selected = selections[name]
+            mask.assign(selected)
+            J.assign(np.full(J_ref.shape, _SENTINEL, dtype=np.float32))
+            wp.capture_launch(capture.graph)
+
+            _assert_masked_jacobian(J.numpy(), J_ref, _SENTINEL, _jacobian_entries(model, selected, J_ref.shape))
+
+
+def test_jacobian_mask_graph_replay_fills_strided_view(test, device):
+    """Capture a masked eval_jacobian into a non-contiguous view and replay it.
+
+    Warp's APIC capture, which every CPU capture uses and a CUDA capture with
+    ``apic=True`` adds, cannot record a fill of a non-contiguous array, and the
+    evaluation records none. Each replay starts from a reset buffer and a new mask: the
+    selected blocks must equal the eager unmasked result bitwise, the unselected ones
+    keep the reset values, and nothing outside the view is written.
+    """
+    captures = {"default": {}}
+    if device.is_cuda:
+        captures["apic"] = {"apic": True}
+    selections = {"some": np.array([True, False, False, True]), "others": np.array([False, True, True, False])}
+    for leaf_count in (6, 18):  # blocks of 252 and 2052 entries, every entry an articulation's Jacobian
+        model, state = _build_fans(device, leaf_count)
+        J_ref = newton.eval_jacobian(model, state).numpy()
+        count, rows, cols = J_ref.shape
+        whole = _filled((count, rows + 2, cols + 3), _SENTINEL, device)
+        window = (slice(None), slice(1, 1 + rows), slice(2, 2 + cols))
+        J = whole[window]
+        test.assertFalse(J.is_contiguous)
+        mask = wp.array(selections["some"], dtype=bool, device=device)
+        joint_S_s = wp.zeros(model.joint_dof_count, dtype=wp.spatial_vector, device=device)
+        # Load the modules eagerly; a capture cannot compile them.
+        newton.eval_jacobian(model, state, J, joint_S_s=joint_S_s, mask=mask)
+
+        for capture_name, options in captures.items():
+            with test.subTest(leaves=leaf_count, capture=capture_name):
+                with wp.ScopedCapture(device, **options) as capture:
+                    newton.eval_jacobian(model, state, J, joint_S_s=joint_S_s, mask=mask)
+
+                for name, selected in selections.items():
+                    with test.subTest(selection=name):
+                        mask.assign(selected)
+                        whole.assign(np.full(whole.shape, _SENTINEL, dtype=np.float32))
+                        wp.capture_launch(capture.graph)
+
+                        expected = np.full(whole.shape, _SENTINEL, dtype=np.float32)
+                        expected[window][selected] = J_ref[selected]
+                        _assert_bits_equal(whole.numpy(), expected)
+
+
+def test_mass_matrix_mask_graph_replay_matches_eager(test, device):
+    """Replay a captured masked eval_mass_matrix whose internal Jacobian is allocated during the capture.
+
+    New float allocations start as NaN, as reused memory may hold anything, so a
+    replay must write every Jacobian entry that the mass-matrix kernel reads.
+    """
+    if device.is_cuda and not wp.is_mempool_enabled(device):
+        test.skipTest("Allocating during CUDA graph capture requires the memory pool")
+    model, state = _build_mixed_articulations(device)
+    H_ref = newton.eval_mass_matrix(model, state).numpy()
+    selections = _mixed_selections(model)
+    mask = wp.array(selections["mixed"], dtype=bool, device=device)
+    H = _filled(H_ref.shape, _SENTINEL, device)
+    body_I_s = wp.empty(model.body_count, dtype=wp.spatial_matrix, device=device)
+    joint_S_s = wp.zeros(model.joint_dof_count, dtype=wp.spatial_vector, device=device)
+
+    # Load the modules eagerly; a capture cannot compile them.
+    newton.eval_mass_matrix(model, state, H, body_I_s=body_I_s, joint_S_s=joint_S_s, mask=mask)
+    with _nan_filled_float_allocations(), wp.ScopedCapture(device) as capture:
+        newton.eval_mass_matrix(model, state, H, body_I_s=body_I_s, joint_S_s=joint_S_s, mask=mask)
+
+    for name in ("mixed", "fan"):
+        with test.subTest(selection=name):
+            selected = selections[name]
+            mask.assign(selected)
+            H.assign(np.full(H_ref.shape, _SENTINEL, dtype=np.float32))
+            wp.capture_launch(capture.graph)
+
+            H_np = H.numpy()
+            _assert_bits_equal(H_np[selected], H_ref[selected])
+            _assert_bits_equal(H_np[~selected], np.zeros_like(H_ref[~selected]))
 
 
 def test_prismatic_joint_jacobian(test, device):
@@ -758,61 +1300,42 @@ def test_articulation_view_api(test, device):
 
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
 
-    # Create ArticulationView for just robot_a
+    J_model = newton.eval_jacobian(model, state).numpy()
+    H_model = newton.eval_mass_matrix(model, state).numpy()
+
+    # Create ArticulationView for just robot_a: one pendulum, one joint and one DOF
     view_a = newton.selection.ArticulationView(model, pattern="robot_a")
+    test.assertEqual((view_a.max_joints_per_articulation, view_a.max_dofs_per_articulation), (1, 1))
 
-    # Test eval_jacobian via ArticulationView (convenience pattern)
+    # Test eval_jacobian via ArticulationView (convenience pattern): view-shaped, robot_a only
     J = view_a.eval_jacobian(state)
-    test.assertIsNotNone(J)
-    test.assertEqual(J.shape[0], model.articulation_count)
-
-    J_np = J.numpy()
-    # robot_a (index 0) should have non-zero Jacobian
-    test.assertNotEqual(np.abs(J_np[0]).max(), 0.0)
-    # robot_b (index 1) should be zero (not in view)
-    test.assertEqual(np.abs(J_np[1]).max(), 0.0)
+    test.assertEqual(J.shape, (1, 6, 1))
+    _assert_bits_equal(J.numpy()[0], J_model[0, :6, :1])
+    test.assertNotEqual(np.abs(J.numpy()).max(), 0.0)
 
     # Test eval_mass_matrix via ArticulationView (convenience pattern)
     H = view_a.eval_mass_matrix(state)
-    test.assertIsNotNone(H)
-    test.assertEqual(H.shape[0], model.articulation_count)
+    test.assertEqual(H.shape, (1, 1, 1))
+    _assert_bits_equal(H.numpy()[0], H_model[0, :1, :1])
+    test.assertNotEqual(H.numpy()[0, 0, 0], 0.0)
 
-    H_np = H.numpy()
-    # robot_a should have non-zero mass matrix
-    test.assertNotEqual(H_np[0, 0, 0], 0.0)
-    # robot_b should be zero
-    test.assertEqual(H_np[1, 0, 0], 0.0)
-
-    # Test with pre-allocated buffers (performance pattern)
+    # Test with pre-allocated view-shaped buffers (performance pattern), for robot_b
+    view_b = newton.selection.ArticulationView(model, pattern="robot_b")
     J2 = wp.zeros(
-        (model.articulation_count, model.max_joints_per_articulation * 6, model.max_dofs_per_articulation),
+        (view_b.count, 6 * view_b.max_joints_per_articulation, view_b.max_dofs_per_articulation),
         dtype=float,
         device=device,
     )
     H2 = wp.zeros(
-        (model.articulation_count, model.max_dofs_per_articulation, model.max_dofs_per_articulation),
+        (view_b.count, view_b.max_dofs_per_articulation, view_b.max_dofs_per_articulation),
         dtype=float,
         device=device,
     )
 
-    # Create view for robot_b
-    view_b = newton.selection.ArticulationView(model, pattern="robot_b")
-
-    J2_returned = view_b.eval_jacobian(state, J2)
-    H2_returned = view_b.eval_mass_matrix(state, H2)
-
-    test.assertIs(J2_returned, J2)
-    test.assertIs(H2_returned, H2)
-
-    J2_np = J2.numpy()
-    H2_np = H2.numpy()
-
-    # robot_a should be zero (not in view_b)
-    test.assertEqual(np.abs(J2_np[0]).max(), 0.0)
-    test.assertEqual(H2_np[0, 0, 0], 0.0)
-    # robot_b should have values
-    test.assertNotEqual(np.abs(J2_np[1]).max(), 0.0)
-    test.assertNotEqual(H2_np[1, 0, 0], 0.0)
+    test.assertIs(view_b.eval_jacobian(state, J2), J2)
+    test.assertIs(view_b.eval_mass_matrix(state, H2), H2)
+    _assert_bits_equal(J2.numpy()[0], J_model[1, :6, :1])
+    _assert_bits_equal(H2.numpy()[0], H_model[1, :1, :1])
 
 
 def test_floating_base_jacobian(test, device):
@@ -1163,6 +1686,78 @@ add_function_test(
 )
 add_function_test(TestJacobianMassMatrix, "test_jacobian_with_mask", test_jacobian_with_mask, devices=devices)
 add_function_test(TestJacobianMassMatrix, "test_mass_matrix_with_mask", test_mass_matrix_with_mask, devices=devices)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_jacobian_writes_only_selected_jacobians",
+    test_jacobian_writes_only_selected_jacobians,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_jacobian_mask_without_buffer_zeroes_unselected",
+    test_jacobian_mask_without_buffer_zeroes_unselected,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_articulation_view_jacobian_writes_view_slots",
+    test_articulation_view_jacobian_writes_view_slots,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_articulation_view_mass_matrix_writes_view_slots",
+    test_articulation_view_mass_matrix_writes_view_slots,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_articulation_view_rejects_other_shapes",
+    test_articulation_view_rejects_other_shapes,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_articulation_view_of_every_articulation_matches_unmasked",
+    test_articulation_view_of_every_articulation_matches_unmasked,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_mass_matrix_mask_zeroes_unselected_articulations",
+    test_mass_matrix_mask_zeroes_unselected_articulations,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_mass_matrix_scratch_skips_redundant_clears",
+    test_mass_matrix_scratch_skips_redundant_clears,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_jacobian_mask_accepts_masks_the_launch_converts",
+    test_jacobian_mask_accepts_masks_the_launch_converts,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_jacobian_mask_graph_replay_matches_eager",
+    test_jacobian_mask_graph_replay_matches_eager,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_jacobian_mask_graph_replay_fills_strided_view",
+    test_jacobian_mask_graph_replay_fills_strided_view,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_mass_matrix_mask_graph_replay_matches_eager",
+    test_mass_matrix_mask_graph_replay_matches_eager,
+    devices=devices,
+)
 add_function_test(
     TestJacobianMassMatrix, "test_prismatic_joint_jacobian", test_prismatic_joint_jacobian, devices=devices
 )

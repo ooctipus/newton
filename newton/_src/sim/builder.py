@@ -10,8 +10,10 @@ import ctypes
 import functools
 import gc
 import hashlib
+import itertools
 import logging
 import math
+import operator
 import warnings
 import weakref
 from bisect import bisect_left
@@ -588,6 +590,83 @@ def _build_fk_level_topology(
     return articulation_level_start, level_joint_start, level_joints, level_parent_pos
 
 
+def _array_data(values: Any, dtype: Any) -> Any:
+    """Prepare builder list data for ``wp.array(data, dtype=dtype)``.
+
+    NumPy coerces a list of Warp vectors, matrices or transforms (ctypes arrays),
+    of tuples, or of scalars other than plain ``int``/``float`` (integer enums,
+    Warp scalars) one element at a time, which dominates
+    :meth:`ModelBuilder.finalize` for large replicated scenes. Such a non-empty
+    list is converted in bulk for a ``float32`` or ``int32`` based ``dtype``, with
+    the same per-element conversion; any other input is returned unchanged for
+    ``wp.array`` to convert.
+
+    Args:
+        values: Builder list data.
+        dtype: Warp dtype of the target array.
+
+    Returns:
+        A NumPy array with the same contents ``wp.array`` would produce from
+        ``values``, or ``values`` itself.
+    """
+    if not isinstance(values, list) or not values:
+        return values
+    scalar_type = getattr(dtype, "_wp_scalar_type_", dtype)
+    if scalar_type is wp.float32:
+        np_dtype = np.float32
+        plain_type = float
+        is_scalar_type = wp.types.type_is_float
+    elif scalar_type is wp.int32:
+        np_dtype = np.int32
+        plain_type = int
+        is_scalar_type = wp.types.type_is_int
+    else:
+        return values
+    # Lists of plain numbers already convert quickly; skip scanning them.
+    if type(values[0]) in (int, float):
+        return values
+    value_types = set(map(type, values))
+    count = len(values)
+    try:
+        if len(value_types) == 1:
+            (value_type,) = value_types
+            if issubclass(value_type, ctypes.Array):
+                # Warp vector and matrix values store their scalars contiguously.
+                if value_type._type_ is not scalar_type._type_:
+                    return values
+                return np.frombuffer(b"".join(values), dtype=np_dtype).reshape(count, value_type._length_)
+            if value_type is tuple or value_type is list:
+                widths = set(map(len, values))
+                if len(widths) != 1:
+                    return values
+                (width,) = widths
+                flat = np.fromiter(itertools.chain.from_iterable(values), dtype=np_dtype, count=count * width)
+                return flat.reshape(count, width)
+        if value_types != {plain_type} and all(
+            issubclass(value_type, plain_type) or is_scalar_type(value_type) for value_type in value_types
+        ):
+            return np.fromiter(values, dtype=np_dtype, count=count)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return values
+
+
+_NUMPY_SCALAR_TYPES = {
+    wp.bool: np.bool_,
+    wp.int8: np.int8,
+    wp.uint8: np.uint8,
+    wp.int16: np.int16,
+    wp.uint16: np.uint16,
+    wp.int32: np.int32,
+    wp.uint32: np.uint32,
+    wp.int64: np.int64,
+    wp.uint64: np.uint64,
+    wp.float32: np.float32,
+    wp.float64: np.float64,
+}
+"""NumPy scalar type ``wp.array`` converts data of a Warp scalar type to."""
+
+
 @dataclass(frozen=True)
 class _ShapeCollisionFilterBlock:
     """Compact replicated collision-filter block."""
@@ -1048,6 +1127,12 @@ class ModelBuilder:
         exceeds its ``restitution_velocity_threshold``.
         Non-finite contact material values on colliding shapes are rejected by
         :meth:`ModelBuilder.finalize` unless shape validation is disabled.
+        :class:`~newton.solvers.SolverFeatherPGS` applies this field inside the
+        ordinary normal contact row in ``dense``, ``split``, and
+        ``matrix_free`` modes without any implicit velocity iterations.
+        FeatherPGS clamps finite coefficients to ``[0, 1]``, treats non-finite
+        values as zero, and uses the arithmetic mean of the two contacting
+        shapes.
         """
         mu_torsional: float = 0.005
         """The coefficient of torsional friction [m] (resistance to spinning at contact point)."""
@@ -1665,7 +1750,9 @@ class ModelBuilder:
 
             if isinstance(self.default, (list, tuple, np.ndarray)):
                 arr = [self.default] * count
-                return wp.array(arr, dtype=self.dtype, requires_grad=requires_grad, device=device)
+                return wp.array(
+                    _array_data(arr, self.dtype), dtype=self.dtype, requires_grad=requires_grad, device=device
+                )
 
             # Empty numeric custom attributes are common for registered solver
             # defaults. Let Warp fill the array directly instead of first
@@ -1689,9 +1776,18 @@ class ModelBuilder:
                 return self._build_default_array(count, device=device, requires_grad=requires_grad)
             elif self.is_custom_frequency:
                 # Custom frequency: vals is a list, replace None with defaults and pad/truncate as needed
-                arr = [val if val is not None else self.default for val in self.values]
+                arr = list(self.values[:count])  # Truncate if needed
+                if any(map(operator.is_, arr, itertools.repeat(None))):
+                    arr = [val if val is not None else self.default for val in arr]
                 arr = arr + [self.default] * max(0, count - len(arr))
-                arr = arr[:count]  # Truncate if needed
+            elif set(map(type, self.values)) == {int}:
+                # Enum frequency: vals is a dict keyed by entity index; fill gaps with defaults
+                arr = self._scatter_indexed_values(count) if self.dtype is not str else None
+                if arr is None:
+                    arr = [self.default] * count
+                    for i, val in self.values.items():
+                        if 0 <= i < count:
+                            arr[i] = val
             else:
                 # Enum frequency: vals is a dict, use get() to fill gaps with defaults
                 arr = [self.values.get(i, self.default) for i in range(count)]
@@ -1700,7 +1796,34 @@ class ModelBuilder:
             if self.dtype is str:
                 return arr
 
-            return wp.array(arr, dtype=self.dtype, requires_grad=requires_grad, device=device)
+            return wp.array(_array_data(arr, self.dtype), dtype=self.dtype, requires_grad=requires_grad, device=device)
+
+        def _scatter_indexed_values(self, count: int) -> np.ndarray | None:
+            """Convert dict values keyed by entity index into an array with defaults in the gaps.
+
+            Only the stored values and the default are converted, instead of a list
+            of ``count`` entries, with the same per-element conversion. Returns
+            ``None`` unless the dtype has a common NumPy scalar type and the values
+            and default convert to the same element shape.
+            """
+            np_dtype = _NUMPY_SCALAR_TYPES.get(getattr(self.dtype, "_wp_scalar_type_", self.dtype))
+            if np_dtype is None:
+                return None
+            indices = np.fromiter(self.values.keys(), dtype=np.int64, count=len(self.values))
+            in_range = (indices >= 0) & (indices < count)
+            values = list(itertools.compress(self.values.values(), in_range))
+            try:
+                values = np.asarray(_array_data(values, self.dtype), dtype=np_dtype)
+                default = np.asarray(_array_data([self.default], self.dtype), dtype=np_dtype)
+            except (TypeError, ValueError, OverflowError):
+                # Let wp.array report the conversion error of the full list.
+                return None
+            if values.shape[1:] != default.shape[1:]:
+                return None
+            data = np.empty((count, *default.shape[1:]), dtype=np_dtype)
+            data[:] = default
+            data[indices[in_range]] = values
+            return data
 
     @dataclass
     class CustomFrequency:
@@ -2465,7 +2588,9 @@ class ModelBuilder:
         propagated to :attr:`Model.shape_gap`."""
 
         self.num_rigid_contacts_per_world: int | None = None
-        """Optional per-world rigid-contact allocation budget used to set :attr:`Model.rigid_contact_max`."""
+        """Optional per-world rigid-contact allocation budget, kept for compatibility with Newton main.
+
+        Contact buffers grow on demand and are not sized by it."""
 
         # deprecated sparse mimic constraints
         self.constraint_mimic_joint0: list[int] = []
@@ -4788,6 +4913,7 @@ class ModelBuilder:
         force_position_velocity_actuation: bool = False,
         convert_mjc_equality_constraints: bool = True,
         override_root_xform: bool = False,
+        physx_missing_inertia_fallback: bool = False,
         legacy_margin_gap: bool = False,
         return_deformable_results: bool = False,
         allow_unsafe_torch_checkpoints: bool = False,
@@ -4927,6 +5053,9 @@ class ModelBuilder:
                 :attr:`~newton.JointTargetMode.POSITION` if stiffness > 0, :attr:`~newton.JointTargetMode.VELOCITY` if only
                 damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
                 (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
+            physx_missing_inertia_fallback: If True, bodies with authored positive mass but no authored diagonal
+                inertia use PhysX's 0.1 m small-sphere inertia fallback instead of shape-derived inertia. This is
+                intended for IsaacLab/PhysX parity when PhysX reports the "possibly invalid inertia tensor" fallback.
             legacy_margin_gap: If True, restore pre-MuJoCo-3.9 import behavior
                 where ``shape_margin`` is computed as ``mjc_margin - mjc_gap``.
                 Use for USD files authored against MuJoCo <= 3.8. Defaults to
@@ -5094,6 +5223,7 @@ class ModelBuilder:
             force_position_velocity_actuation=force_position_velocity_actuation,
             convert_mjc_equality_constraints=convert_mjc_equality_constraints,
             override_root_xform=override_root_xform,
+            physx_missing_inertia_fallback=physx_missing_inertia_fallback,
             legacy_margin_gap=legacy_margin_gap,
             return_deformable_results=return_deformable_results,
             allow_unsafe_torch_checkpoints=allow_unsafe_torch_checkpoints,
@@ -9861,7 +9991,7 @@ class ModelBuilder:
         raise_on_failure: bool = False,
         keep_visual_shapes: bool = False,
         *,
-        cache_dir: str | os.PathLike[str] | None = None,
+        cache_dir: str | PathLike[str] | None = None,
         **remeshing_kwargs: dict[str, Any],
     ) -> set[int]:
         """Approximates the mesh shapes of the model.
@@ -15894,6 +16024,11 @@ class ModelBuilder:
             edge_chunks = []
             edge_center_chunks = []
             edge_half_chunks = []
+            from ..geometry.sdf_contact import build_mesh_edge_clusters  # noqa: PLC0415
+
+            edge_order_chunks = []
+            edge_cluster_chunks = []
+            edge_reach_chunks = []
             edge_offset = 0
             edge_cache = {}  # mesh python id → (start, count)
 
@@ -15949,6 +16084,17 @@ class ModelBuilder:
                             edge_half_chunks.append(
                                 np.ascontiguousarray(np.concatenate((edge_halves, corner_ownership), axis=1))
                             )
+                            # Clusters live at the shape's edge offset, ahead of unused slots.
+                            order, cluster_bounds, cluster_reach = build_mesh_edge_clusters(
+                                edge_centers, edge_radii[:, 0]
+                            )
+                            clusters = np.zeros((count, 4), dtype=np.float32)
+                            clusters[: len(cluster_bounds)] = cluster_bounds
+                            reach = np.zeros(count, dtype=np.float32)
+                            reach[: len(cluster_reach)] = cluster_reach
+                            edge_order_chunks.append(order)
+                            edge_cluster_chunks.append(clusters)
+                            edge_reach_chunks.append(reach)
                         edge_offset += count
                         entry = (start, count)
                         edge_cache[mesh_key] = entry
@@ -15975,6 +16121,21 @@ class ModelBuilder:
                 wp.array(np.concatenate(edge_half_chunks), dtype=wp.vec4, device=device)
                 if edge_offset > 0
                 else wp.zeros(1, dtype=wp.vec4, device=device)
+            )
+            m._mesh_edge_order = (
+                wp.array(np.concatenate(edge_order_chunks), dtype=wp.int32, device=device)
+                if edge_offset > 0
+                else wp.zeros(1, dtype=wp.int32, device=device)
+            )
+            m._mesh_edge_clusters = (
+                wp.array(np.concatenate(edge_cluster_chunks), dtype=wp.vec4, device=device)
+                if edge_offset > 0
+                else wp.zeros(1, dtype=wp.vec4, device=device)
+            )
+            m._mesh_edge_cluster_reach = (
+                wp.array(np.concatenate(edge_reach_chunks), dtype=wp.float32, device=device)
+                if edge_offset > 0
+                else wp.zeros(1, dtype=wp.float32, device=device)
             )
 
             # Variant shape rows got their collision data above like shapes; move them to the variant
@@ -16565,40 +16726,51 @@ class ModelBuilder:
         """
         filter_pairs = self._shape_collision_filter_pairs
         chunks: list[np.ndarray] = []
+
+        def pack(pairs: Sequence[tuple[int, int]]) -> np.ndarray:
+            pairs = np.asarray(pairs, dtype=np.int64).reshape((-1, 2))
+            return _pack_shape_pair_codes(pairs[:, 0], pairs[:, 1])
+
+        def sorted_unique(codes: np.ndarray) -> np.ndarray:
+            # Sort + mask instead of np.unique: NumPy's hash-based unique for 1-D
+            # integers degrades badly on packed pair codes, and searchsorted needs
+            # the sorted order anyway. The stable sort (timsort) merges presorted
+            # runs, such as replayed templates, in near-linear time.
+            codes.sort(kind="stable")
+            if codes.shape[0] > 1:
+                distinct = codes[1:] != codes[:-1]
+                if not distinct.all():
+                    codes = codes[np.concatenate(([True], distinct))]
+            return codes
+
         if isinstance(filter_pairs, _BuilderShapeCollisionFilterPairs):
             explicit_pairs = tuple(self._iter_validated_shape_collision_filter_pairs(filter_pairs.explicit_pairs))
             if explicit_pairs:
-                chunks.append(np.asarray(explicit_pairs, dtype=np.int64).reshape((-1, 2)))
+                chunks.append(pack(explicit_pairs))
             blocks = filter_pairs.blocks
             self._validate_compact_shape_collision_filter_blocks(blocks)
-            # Replicated blocks share one local-pair template; replay each
-            # group of blocks as a single broadcast offset add.
+            # Replicated blocks share one local-pair template; pack each template
+            # once and replay each group of blocks as a single broadcast offset add.
+            # Offsetting both shapes of a pair by ``start`` adds
+            # ``start * (2**32 + 1)`` to its packed code.
             starts_by_template: dict[int, tuple[np.ndarray, list[int]]] = {}
             for block in blocks:
                 entry = starts_by_template.get(id(block.local_pairs))
                 if entry is None:
-                    template = np.asarray(block.local_pairs, dtype=np.int64).reshape((-1, 2))
-                    starts_by_template[id(block.local_pairs)] = (template, [block.shape_start])
+                    template_codes = sorted_unique(pack(block.local_pairs))
+                    starts_by_template[id(block.local_pairs)] = (template_codes, [block.shape_start])
                 else:
                     entry[1].append(block.shape_start)
-            for template, starts in starts_by_template.values():
-                offsets = np.asarray(starts, dtype=np.int64)
-                chunks.append((template[None, :, :] + offsets[:, None, None]).reshape((-1, 2)))
+            for template_codes, starts in starts_by_template.values():
+                offsets = np.asarray(starts, dtype=np.int64) * ((1 << 32) + 1)
+                chunks.append((offsets[:, None] + template_codes[None, :]).reshape(-1))
         else:
             pairs = tuple(self._iter_validated_shape_collision_filter_pairs(filter_pairs))
             if pairs:
-                chunks.append(np.asarray(pairs, dtype=np.int64).reshape((-1, 2)))
+                chunks.append(pack(pairs))
         if not chunks:
             return np.empty(0, dtype=np.int64)
-        all_pairs = np.concatenate(chunks, axis=0)
-        codes = _pack_shape_pair_codes(all_pairs[:, 0], all_pairs[:, 1])
-        # Sort + mask instead of np.unique: NumPy's hash-based unique for 1-D
-        # integers degrades badly on packed pair codes, and searchsorted needs
-        # the sorted order anyway.
-        codes.sort()
-        if codes.shape[0] > 1:
-            codes = codes[np.concatenate(([True], codes[1:] != codes[:-1]))]
-        return codes
+        return sorted_unique(np.concatenate(chunks))
 
     def _validate_compact_shape_collision_filter_blocks(self, compact_filter_blocks) -> None:
         shape_count = len(self.shape_type)

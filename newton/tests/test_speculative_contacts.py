@@ -22,6 +22,7 @@ from newton._src.geometry.contact_reduction_global import (
     reclaim_contact_id,
     reduce_buffered_contacts_speculative_kernel,
     reduction_finalize_slot,
+    reduction_value_index,
 )
 from newton._src.geometry.narrow_phase import (
     ContactWriterData,
@@ -99,6 +100,7 @@ def _register_regular_and_predictive_contact(
         position,
         normal,
         0.05,
+        0.05,
         17,
         position,
         0.0,
@@ -164,6 +166,7 @@ def _register_inner_and_rotating_leading_contact(
         inner_position,
         normal,
         -0.01,
+        -0.01,
         11,
         inner_position,
         0.01,
@@ -181,6 +184,7 @@ def _register_inner_and_rotating_leading_contact(
         1,
         leading_position,
         normal,
+        0.05,
         0.05,
         23,
         leading_position,
@@ -309,6 +313,42 @@ def _register_predictive_clearance_candidates_contended(
 
 
 @wp.kernel
+def _buffer_predictive_and_regular_records(
+    reducer_data: GlobalContactReducerData,
+    normals: wp.array[wp.vec3],
+    shape_transform: wp.array[wp.transform],
+    shape_linear_velocity: wp.array[wp.vec3],
+    shape_angular_velocity: wp.array[wp.vec3],
+    predictive_ids: wp.array[wp.int32],
+    regular_ids: wp.array[wp.int32],
+):
+    """Case ``i`` (shapes ``2i``, ``2i + 1``): a predictive candidate the regular export did not buffer, and the
+    regular export's record of the same candidate (same position, normal, depth and fingerprint)."""
+    i = wp.tid()
+    normal = normals[i]
+    position = wp.vec3(0.0, 10.0 * float(i), 0.0)
+    predictive_ids[i] = export_and_reduce_predictive_contact(
+        2 * i,
+        2 * i + 1,
+        position,
+        normal,
+        0.05,
+        0.0,
+        0.0,
+        0.0,
+        5,
+        shape_transform,
+        shape_linear_velocity,
+        shape_angular_velocity,
+        0.1,
+        0.1,
+        -1,
+        reducer_data,
+    )
+    regular_ids[i] = export_contact_to_buffer(2 * i, 2 * i + 1, position, normal, 0.05, 5, reducer_data)
+
+
+@wp.kernel
 def _buffer_one_contact(reducer_data: GlobalContactReducerData):
     export_contact_to_buffer(
         0,
@@ -404,8 +444,8 @@ def _replace_validated_predictive_claims(
     fingerprint = int(7)
     provisional_clearance = make_contact_value(-0.1, fingerprint, 0, reducer_data.deterministic)
     provisional_impact = make_contact_value(0.1, fingerprint, 0, reducer_data.deterministic)
-    clearance_idx = clearance_slot * reducer_data.ht_capacity + entry_idx
-    impact_idx = impact_slot * reducer_data.ht_capacity + entry_idx
+    clearance_idx = reduction_value_index(entry_idx, clearance_slot)
+    impact_idx = reduction_value_index(entry_idx, impact_slot)
     reducer_data.ht_values[clearance_idx] = provisional_clearance
     reducer_data.ht_values[impact_idx] = provisional_impact
 
@@ -430,7 +470,6 @@ def _replace_validated_predictive_claims(
         provisional_clearance,
         clearance_final,
         reducer_data.ht_values,
-        reducer_data.ht_capacity,
     )
     if reduction_finalize_slot(
         entry_idx,
@@ -438,7 +477,6 @@ def _replace_validated_predictive_claims(
         provisional_impact,
         impact_final,
         reducer_data.ht_values,
-        reducer_data.ht_capacity,
     ):
         retained = True
     if not retained:
@@ -1414,6 +1452,54 @@ def test_predictive_reducer_reuses_regular_contact(test, device, deterministic):
     test.assertEqual(exported_count, 1)
 
 
+def test_predictive_record_stores_the_regular_normal(test, device, deterministic):
+    """A predictive candidate the regular export did not buffer stores the normal bits the regular export stores.
+
+    The mesh-SDF kernel offers each candidate to the regular export, then to the predictive manifold, which buffers
+    its own record only when the regular export did not; which happens depends on the slot races, so both records
+    of one fingerprint must hold the same data for the reduction's winner to be deterministic. The normals are mesh
+    SDF normals (unit to rounding), among them one a hardware run exported both ways.
+    """
+    normals_np = np.array(
+        [
+            [5.0695398e-06, 2.0673426e-02, 9.9978632e-01],
+            [-9.7364456e-05, 1.0825610e-01, 9.9412304e-01],
+            [0.6, 0.8, 1.0e-7],
+            [0.26726124, 0.5345225, 0.8017837],
+        ],
+        dtype=np.float32,
+    )
+    cases = len(normals_np)
+    reducer = GlobalContactReducer(capacity=4 * cases, device=device, deterministic=deterministic)
+    shape_transform = wp.array([wp.transform_identity()] * (2 * cases), dtype=wp.transform, device=device)
+    # Shape 2i approaches shape 2i + 1 along its normal at 1 m/s: 0.05 m of clearance closes within dt = 0.1 s.
+    velocity = np.zeros((2 * cases, 3), dtype=np.float32)
+    velocity[0::2] = normals_np
+    shape_linear_velocity = wp.array(velocity, dtype=wp.vec3, device=device)
+    shape_angular_velocity = wp.zeros(2 * cases, dtype=wp.vec3, device=device)
+    predictive_ids = wp.zeros(cases, dtype=wp.int32, device=device)
+    regular_ids = wp.zeros(cases, dtype=wp.int32, device=device)
+    wp.launch(
+        _buffer_predictive_and_regular_records,
+        dim=cases,
+        inputs=[
+            reducer.get_data_struct(),
+            wp.array(normals_np, dtype=wp.vec3, device=device),
+            shape_transform,
+            shape_linear_velocity,
+            shape_angular_velocity,
+            predictive_ids,
+            regular_ids,
+        ],
+        device=device,
+    )
+    predictive, regular = predictive_ids.numpy(), regular_ids.numpy()
+    test.assertTrue(np.all(predictive > 0), predictive)
+    test.assertTrue(np.all(regular > 0), regular)
+    stored = reducer.normal.numpy()
+    np.testing.assert_array_equal(stored[predictive], stored[regular])
+
+
 def test_speculative_buffered_reducer_uses_one_based_ids(test, device, deterministic):
     """Verify buffered speculative reduction processes every real contact and skips reserved ID zero."""
     reducer = GlobalContactReducer(capacity=8, device=device, deterministic=deterministic)
@@ -1764,6 +1850,13 @@ for _deterministic in (False, True):
         TestSpeculativeContacts,
         f"test_predictive_reducer_reuses_regular_contact_{_suffix}",
         test_predictive_reducer_reuses_regular_contact,
+        devices=get_test_devices(),
+        deterministic=_deterministic,
+    )
+    add_function_test(
+        TestSpeculativeContacts,
+        f"test_predictive_record_stores_the_regular_normal_{_suffix}",
+        test_predictive_record_stores_the_regular_normal,
         devices=get_test_devices(),
         deterministic=_deterministic,
     )

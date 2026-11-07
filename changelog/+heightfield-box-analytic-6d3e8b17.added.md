@@ -1,0 +1,1 @@
+Add the box row to the closed-form heightfield cell queries: the box face most opposed to the cell normal is clipped to the cell footprint and each clipped vertex is resolved against the prism, giving the flat, edge and corner manifolds and keeping contacts for faces that cover small cells. `NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES=0` restores the generic query.

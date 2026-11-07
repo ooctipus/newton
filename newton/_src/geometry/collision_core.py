@@ -17,10 +17,12 @@ from .collision_convex import (
     create_write_convex_query_result,
 )
 from .contact_data import ContactData
+from .flags import MeshProperties
 from .support_function import (
     GenericShapeData,
     GeoTypeEx,
     SupportMapDataProvider,
+    closest_point_on_triangle,
     pack_mesh_ptr,
     support_map,
     support_map_lean,
@@ -293,6 +295,7 @@ def create_compute_gjk_mpr_contacts(
     support_func: Any = None,
     use_precomputed_center: bool = False,
     penetration_refiner: Any = None,
+    query_filter: Any = None,
 ):
     """
     Factory function to create a compute_gjk_mpr_contacts function with a specific writer function.
@@ -303,6 +306,7 @@ def create_compute_gjk_mpr_contacts(
         support_func: Support mapping function (defaults to support_map)
         use_precomputed_center: Whether the geometry data supplies a cached center.
         penetration_refiner: Optional physical-proxy result refinement function.
+        query_filter: Optional predicate for nonnegative-distance query witnesses.
 
     Returns:
         A compute_gjk_mpr_contacts function with the writer function baked in
@@ -326,6 +330,7 @@ def create_compute_gjk_mpr_contacts(
         data_provider: Any,
         writer_data: Any,
         sort_sub_key: int = 0,
+        query_context: Any = 0,
     ):
         """
         Compute contacts between two shapes using GJK/MPR algorithm and write them.
@@ -347,7 +352,39 @@ def create_compute_gjk_mpr_contacts(
                 directional seeds and vertex adjacency.
             writer_data: Data structure for contact writer
             sort_sub_key: Sub-key for deterministic contact sorting (e.g. triangle/edge index)
+            query_context: Current geometry metadata for the optional query filter.
         """
+        if shape_a_data.shape_type == int(GeoTypeEx.TRIANGLE):
+            face_normal = wp.quat_rotate(rot_a, wp.cross(shape_a_data.scale, shape_a_data.auxiliary))
+            face_length = wp.length(face_normal)
+            if face_length > 1.0e-12:
+                face_normal /= face_length
+                if wp.dot(pos_b_adjusted - pos_a_adjusted, face_normal) < 0.0:
+                    # Only watertight nearest-face overlaps survive midphase with
+                    # the center behind a triangle. GJK would reverse the normal;
+                    # retain the authored outward face and its physical depth.
+                    support_b = support_func(shape_b_data, wp.quat_rotate_inv(rot_b, -face_normal), data_provider)
+                    point_b = wp.quat_rotate(rot_b, support_b) + pos_b_adjusted
+                    distance = wp.dot(point_b - pos_a_adjusted, face_normal)
+                    point_a = point_b - distance * face_normal
+                    projection = wp.quat_rotate_inv(rot_a, point_a - pos_a_adjusted)
+                    closest = closest_point_on_triangle(
+                        projection, wp.vec3(0.0), shape_a_data.scale, shape_a_data.auxiliary
+                    )
+                    if wp.length_sq(projection - closest) < 1.0e-10:
+                        contact = ContactData()
+                        contact.contact_point_center = 0.5 * (point_a + point_b)
+                        contact.contact_normal_a_to_b = face_normal
+                        contact.contact_distance = distance
+                        contact.margin_a = margin_a
+                        contact.margin_b = margin_b
+                        contact.shape_a = shape_a
+                        contact.shape_b = shape_b
+                        contact.gap_sum = rigid_gap
+                        contact.sort_sub_key = sort_sub_key
+                        writer_func(contact, writer_data, -1)
+                    return
+
         radius_eff_a = float(0.0)
         radius_eff_b = float(0.0)
 
@@ -383,6 +420,7 @@ def create_compute_gjk_mpr_contacts(
                     post_process_contact,
                     use_precomputed_center,
                     penetration_refiner,
+                    query_filter,
                 )
             )(
                 shape_a_data,
@@ -399,6 +437,7 @@ def create_compute_gjk_mpr_contacts(
                 or type_b == GeoType.ELLIPSOID,
                 writer_data,
                 contact_template,
+                query_context,
             )
         else:
             wp.static(
@@ -408,6 +447,7 @@ def create_compute_gjk_mpr_contacts(
                     post_process_contact,
                     use_precomputed_center,
                     penetration_refiner,
+                    query_filter,
                 )
             )(
                 shape_a_data,
@@ -420,6 +460,7 @@ def create_compute_gjk_mpr_contacts(
                 rigid_gap + radius_eff_a + radius_eff_b + margin_a + margin_b,
                 writer_data,
                 contact_template,
+                query_context,
             )
 
     return compute_gjk_mpr_contacts
@@ -1112,8 +1153,12 @@ def _mesh_triangle_is_front_facing_local(
     mesh_id: wp.uint64,
     center_in_bvh: wp.vec3,
     tri_idx: int,
+    watertight: bool,
+    convex: GenericShapeData,
+    convex_in_mesh: wp.transform,
+    mesh_scale: wp.vec3,
 ) -> bool:
-    """Check triangle winding against a point in unscaled mesh-local space."""
+    """Preserve one-sided sheets; recover straddling nearest faces of closed meshes."""
     mesh = wp.mesh_get(mesh_id)
     idx0 = mesh.indices[tri_idx * 3 + 0]
     idx1 = mesh.indices[tri_idx * 3 + 1]
@@ -1124,7 +1169,36 @@ def _mesh_triangle_is_front_facing_local(
     v2 = mesh.points[idx2]
     face_normal = wp.cross(v1 - v0, v2 - v0)
     center_dist = wp.dot(face_normal, center_in_bvh - v0)
-    return not (center_dist < 0.0)
+    if center_dist >= 0.0:
+        return True
+    if not watertight:
+        return False
+
+    # Reject wholly embedded supports before the more expensive inside query.
+    # Mesh scaling transforms normals by its inverse, including reflections.
+    scaled_normal = wp.cw_div(face_normal, mesh_scale)
+    direction = wp.transform_vector(wp.transform_inverse(convex_in_mesh), scaled_normal)
+    support = support_map(convex, direction, SupportMapDataProvider())
+    support_in_bvh = wp.cw_div(wp.transform_point(convex_in_mesh, support), mesh_scale)
+    if wp.dot(face_normal, support_in_bvh - v0) <= 0.0:
+        return False
+
+    # An exterior center must not acquire contacts on the opposite side of a
+    # thin shell. For an interior center, only its nearest surface is eligible,
+    # avoiding opposing constraints when a convex spans both shell faces.
+    nearest = wp.mesh_query_point_sign_parity(mesh_id, center_in_bvh, 1.0e6)
+    if not nearest.result or nearest.sign >= 0.0:
+        return False
+    nearest_point = wp.mesh_eval_position(mesh_id, nearest.face, nearest.u, nearest.v)
+    nearest_normal = wp.mesh_eval_face_normal(mesh_id, nearest.face)
+    normal_length = wp.length(face_normal)
+    if (
+        wp.dot(face_normal, nearest_normal) < 0.9999 * normal_length
+        or wp.abs(wp.dot(face_normal, nearest_point - v0)) > 1.0e-6 * normal_length
+    ):
+        return False
+
+    return True
 
 
 @wp.func
@@ -1178,6 +1252,7 @@ def mesh_vs_convex_midphase(
     shape_type: wp.array[int],
     shape_data: wp.array[wp.vec4],
     shape_source_ptr: wp.array[wp.uint64],
+    shape_mesh_properties: wp.array[wp.int32],
     contact_threshold: float,
     non_mesh_center: wp.vec3,
     triangle_pairs: wp.array[wp.vec3i],
@@ -1200,6 +1275,7 @@ def mesh_vs_convex_midphase(
         shape_type: Array of shape types
         shape_data: Array of shape data (vec4: scale.xyz, margin.w)
         shape_source_ptr: Array of mesh/SDF source pointers
+        shape_mesh_properties: Per-shape watertightness metadata
         contact_threshold: Contact candidate distance [m], including margin and gap
         non_mesh_center: Interior point of the convex shape in its scaled local frame [m]
         triangle_pairs: Output array for triangle pairs (mesh_shape, non_mesh_shape, tri_index)
@@ -1208,6 +1284,16 @@ def mesh_vs_convex_midphase(
     aabb_lower = wp.vec3(0.0)
     aabb_upper = wp.vec3(0.0)
     center_in_bvh = wp.vec3(0.0)
+    watertight = (shape_mesh_properties[mesh_shape] & MeshProperties.WATERTIGHT) != 0
+    convex = GenericShapeData()
+    convex.shape_type = shape_type[non_mesh_shape]
+    convex_scale = shape_data[non_mesh_shape]
+    convex.scale = wp.vec3(convex_scale[0], convex_scale[1], convex_scale[2])
+    if convex.shape_type == int(GeoType.CONVEX_MESH):
+        convex.auxiliary = pack_mesh_ptr(shape_source_ptr[non_mesh_shape])
+    convex_in_mesh = wp.transform_multiply(wp.transform_inverse(X_mesh_ws), X_ws)
+    mesh_data = shape_data[mesh_shape]
+    mesh_scale = wp.vec3(mesh_data[0], mesh_data[1], mesh_data[2])
     if shape_type[non_mesh_shape] == GeoType.CONVEX_MESH:
         # A hull's bounds scan every vertex; split that scan across the block.
         aabb_lower, aabb_upper, center_in_bvh = _compute_mesh_vs_hull_query_aabb_tiled(
@@ -1259,7 +1345,9 @@ def mesh_vs_convex_midphase(
     while wp.tile_query_valid(query):
         result_tile = wp.tile_mesh_query_aabb_next(query)
         tri_index = wp.untile(result_tile)
-        if tri_index >= 0 and not _mesh_triangle_is_front_facing_local(mesh_id, center_in_bvh, tri_index):
+        if tri_index >= 0 and not _mesh_triangle_is_front_facing_local(
+            mesh_id, center_in_bvh, tri_index, watertight, convex, convex_in_mesh, mesh_scale
+        ):
             tri_index = -1
 
         # Pair order is unconstrained; append without a block-wide scan and broadcast.

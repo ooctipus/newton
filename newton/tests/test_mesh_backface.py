@@ -10,11 +10,12 @@ Inverted normals trap shapes inside the mesh and cause solver divergence
 
 These tests verify that:
 1. Front-face contacts produce correct normals (mesh pushes convex outward).
-2. Back-face contacts are culled (no contact generated).
+2. Open-mesh back-face contacts are culled (no contact generated).
 3. Various convex types (sphere, box, capsule, ellipsoid, convex mesh)
    all behave correctly.
 4. Edge cases like shapes in a valley between two triangles are handled.
 5. A multi-step simulation on rough terrain does not produce NaN.
+6. Closed-mesh support overlaps retain outward contacts after center crossing.
 """
 
 import unittest
@@ -78,7 +79,16 @@ def _make_box_ground_mesh(size=5.0, thickness=0.2, z=0.0):
     return newton.Mesh(verts, mesh.indices, compute_inertia=False)
 
 
-def _build_collision_only(mesh, shape_type, shape_pos, shape_scale=None, shape_rot=None, reduce_contacts=True):
+def _build_collision_only(
+    mesh,
+    shape_type,
+    shape_pos,
+    shape_scale=None,
+    shape_rot=None,
+    reduce_contacts=True,
+    mesh_scale=(1.0, 1.0, 1.0),
+    mesh_xform=None,
+):
     """Build a scene and return (model, collision_pipeline, state).
 
     No solver needed -- tests only inspect contacts.
@@ -88,7 +98,12 @@ def _build_collision_only(mesh, shape_type, shape_pos, shape_scale=None, shape_r
     builder.default_shape_cfg.margin = 0.0
     builder.default_shape_cfg.gap = 0.0
 
-    builder.add_shape_mesh(body=-1, mesh=mesh, xform=wp.transform_identity())
+    builder.add_shape_mesh(
+        body=-1,
+        mesh=mesh,
+        scale=mesh_scale,
+        xform=wp.transform_identity() if mesh_xform is None else mesh_xform,
+    )
 
     body = builder.add_body(
         xform=wp.transform(
@@ -107,6 +122,9 @@ def _build_collision_only(mesh, shape_type, shape_pos, shape_scale=None, shape_r
         radius = shape_scale[0] if shape_scale else 0.1
         half_height = shape_scale[1] if shape_scale else 0.2
         builder.add_shape_capsule(body, radius=radius, half_height=half_height)
+    elif shape_type == GeoType.CYLINDER:
+        radius, half_height = shape_scale
+        builder.add_shape_cylinder(body, radius=radius, half_height=half_height)
     elif shape_type == GeoType.ELLIPSOID:
         sx, sy, sz = shape_scale if shape_scale else (0.1, 0.15, 0.08)
         builder.add_shape_ellipsoid(body, rx=sx, ry=sy, rz=sz)
@@ -344,6 +362,123 @@ class TestMeshBackfaceCulling(unittest.TestCase):
                     contacts = _collide(model, cp, state)
                     count = int(contacts.rigid_contact_count.numpy()[0])
                     self.assertEqual(count, 0)
+
+    def test_closed_mesh_cylinder_crosses_face_center(self):
+        """Keep outward contacts while a cylinder straddles a closed mesh face."""
+        mesh = _make_box_ground_mesh(size=0.1, thickness=0.0025, z=0.005)
+        self.assertTrue(mesh.is_watertight)
+        for reduce_contacts in (False, True):
+            for height, expected_normal, expected_depth in ((0.0049, 1.0, 0.0015), (0.0001, -1.0, 0.0015)):
+                with self.subTest(reduce_contacts=reduce_contacts, height=height):
+                    model, cp, state = _build_collision_only(
+                        mesh,
+                        GeoType.CYLINDER,
+                        shape_pos=(0.03, -0.02, height),
+                        shape_scale=(0.0125, 0.0014),
+                        reduce_contacts=reduce_contacts,
+                    )
+                    contacts = _collide(model, cp, state)
+                    normals = _get_contact_normals(contacts)
+                    self.assertGreater(len(normals), 0)
+                    np.testing.assert_allclose(normals[:, 2], expected_normal, atol=1e-5)
+                    points0 = contacts.rigid_contact_point0.numpy()[: len(normals)]
+                    points1 = contacts.rigid_contact_point1.numpy()[: len(normals)]
+                    points1 += np.asarray((0.03, -0.02, height))
+                    separation = np.einsum("ij,ij->i", points1 - points0, normals)
+                    np.testing.assert_allclose(separation, -expected_depth, atol=2e-5)
+
+    def test_closed_mesh_recovery_rejects_other_faces(self):
+        """Avoid inward faces and fully embedded contacts on a thin closed shell."""
+        for reduce_contacts in (False, True):
+            for thickness, height, expected_normal in (
+                (0.005, 0.0025, None),  # Coin wholly embedded: no invented exit direction.
+                (0.005, -0.001, -1.0),  # Outside below: only the outward bottom face.
+                (0.001, 0.0008, 1.0),  # Spans both sides: recover through the nearest face only.
+            ):
+                with self.subTest(reduce_contacts=reduce_contacts, thickness=thickness, height=height):
+                    mesh = _make_box_ground_mesh(size=0.1, thickness=thickness / 2, z=thickness)
+                    model, cp, state = _build_collision_only(
+                        mesh,
+                        GeoType.CYLINDER,
+                        shape_pos=(0.03, -0.02, height),
+                        shape_scale=(0.0125, 0.0014),
+                        reduce_contacts=reduce_contacts,
+                    )
+                    normals = _get_contact_normals(_collide(model, cp, state))
+                    if expected_normal is None:
+                        self.assertEqual(len(normals), 0)
+                    else:
+                        self.assertGreater(len(normals), 0)
+                        np.testing.assert_allclose(normals[:, 2], expected_normal, atol=1e-5)
+
+    def test_closed_mesh_recovery_transforms(self):
+        """Recover a tilted cylinder with rotated, nonuniform and mirrored mesh scaling."""
+        mesh = _make_box_ground_mesh(size=0.1, thickness=0.0025, z=0.005)
+        mesh_rot = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.27)
+        mesh_xform = wp.transform(wp.vec3(0.2, -0.1, 0.3), mesh_rot)
+        cylinder_tilt = 0.17
+        shape_rot = wp.mul(mesh_rot, wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), cylinder_tilt))
+        shape_pos = tuple(wp.transform_point(mesh_xform, wp.vec3(0.03, -0.02, 0.0099)))
+        expected_normal = np.asarray(wp.quat_rotate(mesh_rot, wp.vec3(0.0, 0.0, 1.0)))
+        expected_depth = 0.0001 + 0.0125 * np.sin(cylinder_tilt) + 0.0014 * np.cos(cylinder_tilt)
+        for reduce_contacts in (False, True):
+            for mesh_scale in ((1.0, 1.5, 2.0), (-1.0, 1.5, 2.0)):
+                with self.subTest(reduce_contacts=reduce_contacts, mesh_scale=mesh_scale):
+                    model, cp, state = _build_collision_only(
+                        mesh,
+                        GeoType.CYLINDER,
+                        shape_pos=shape_pos,
+                        shape_rot=shape_rot,
+                        shape_scale=(0.0125, 0.0014),
+                        reduce_contacts=reduce_contacts,
+                        mesh_scale=mesh_scale,
+                        mesh_xform=mesh_xform,
+                    )
+                    contacts = _collide(model, cp, state)
+                    normals = _get_contact_normals(contacts)
+                    self.assertGreater(len(normals), 0)
+                    np.testing.assert_allclose(normals, np.tile(expected_normal, (len(normals), 1)), atol=1e-5)
+                    points0 = contacts.rigid_contact_point0.numpy()[: len(normals)]
+                    points1 = contacts.rigid_contact_point1.numpy()[: len(normals)]
+                    body_pose = wp.transform(wp.vec3(*shape_pos), shape_rot)
+                    points1 = np.asarray([wp.transform_point(body_pose, wp.vec3(*point)) for point in points1])
+                    separation = np.einsum("ij,ij->i", points1 - points0, normals)
+                    np.testing.assert_allclose(separation, -expected_depth, atol=2e-5)
+
+    def test_closed_mesh_recovery_convex_types(self):
+        """The support-overlap policy is shared by all supported convex primitives."""
+        mesh = _make_box_ground_mesh(size=0.4, thickness=0.1)
+        for shape_type, shape_scale in (
+            (GeoType.SPHERE, (0.03,)),
+            (GeoType.BOX, (0.03, 0.04, 0.02)),
+            (GeoType.CAPSULE, (0.01, 0.025)),
+            (GeoType.ELLIPSOID, (0.03, 0.02, 0.035)),
+            (GeoType.CONVEX_MESH, None),
+        ):
+            for reduce_contacts in (False, True):
+                with self.subTest(shape_type=shape_type, reduce_contacts=reduce_contacts):
+                    model, cp, state = _build_collision_only(
+                        mesh,
+                        shape_type,
+                        shape_pos=(0.03, -0.02, -0.005),
+                        shape_scale=shape_scale,
+                        reduce_contacts=reduce_contacts,
+                    )
+                    normals = _get_contact_normals(_collide(model, cp, state))
+                    self.assertGreater(len(normals), 0)
+                    np.testing.assert_allclose(normals[:, 2], 1.0, atol=1e-5)
+
+    def test_open_mesh_cylinder_keeps_one_sided_policy(self):
+        """Support overlap must not change the center-based policy for open sheets."""
+        for reduce_contacts in (False, True):
+            model, cp, state = _build_collision_only(
+                _make_flat_ground_mesh(size=0.1),
+                GeoType.CYLINDER,
+                shape_pos=(0.03, -0.02, -0.0001),
+                shape_scale=(0.0125, 0.0014),
+                reduce_contacts=reduce_contacts,
+            )
+            self.assertEqual(len(_get_contact_normals(_collide(model, cp, state))), 0)
 
     # ------------------------------------------------------------------
     # Rotated convex shapes on back side

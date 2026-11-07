@@ -793,7 +793,6 @@ class TestGeometryContactConversions(NewtonTestCase):
         newton.eval_fk(model, model.joint_q, model.joint_qd, state)
         collision_pipeline = newton.CollisionPipeline(
             model,
-            rigid_contact_max=_NEWTON_CONTACT_CAPACITY,
         )
         contacts = collision_pipeline.contacts()
         collision_pipeline.collide(state, contacts)
@@ -1281,7 +1280,7 @@ class TestGeometryContactConversions(NewtonTestCase):
         state = model.state()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state)
         capacity_per_world = [9 + 10, 9 + 10, 4 + 10]
-        collision_pipeline = newton.CollisionPipeline(model, rigid_contact_max=sum(capacity_per_world))
+        collision_pipeline = newton.CollisionPipeline(model)
         contacts = collision_pipeline.contacts()
         collision_pipeline.collide(state, contacts)
         nc_orig = int(contacts.rigid_contact_count.numpy()[0])
@@ -1378,7 +1377,7 @@ class TestGeometryContactConversions(NewtonTestCase):
 
                 state = model.state()
                 newton.eval_fk(model, model.joint_q, model.joint_qd, state)
-                collision_pipeline = newton.CollisionPipeline(model, rigid_contact_max=2)
+                collision_pipeline = newton.CollisionPipeline(model)
                 contacts = collision_pipeline.contacts()
                 collision_pipeline.collide(state, contacts)
                 contact_count = int(contacts.rigid_contact_count.numpy()[0])
@@ -1513,12 +1512,9 @@ class TestGeometryContactConversions(NewtonTestCase):
         small_capacity = max(1, nc // 3)
         self.assertLess(small_capacity, nc)
         kamino_small = ContactsKamino(capacity=small_capacity, device=self.default_device)
-        with self.assertLogs(level="WARNING") as logs:
-            convert_contacts_newton_to_kamino(model, state, contacts, kamino_small)
-        self.assertTrue(
-            any("active contacts may be truncated" in message for message in logs.output),
-            "An undersized Kamino contact buffer must warn about possible truncation",
-        )
+        # Newton's rows grow with its demand and are no capacity to compare against: the conversion
+        # flags the contacts it truncates on the device (asserted below).
+        convert_contacts_newton_to_kamino(model, state, contacts, kamino_small)
         nc_small = int(kamino_small.model_active_contacts.numpy()[0])
         self.assertLessEqual(
             nc_small,
@@ -1531,8 +1527,7 @@ class TestGeometryContactConversions(NewtonTestCase):
             convert_contacts_newton_to_kamino(model_nc, state_nc, contacts_nc, kamino_small)
         self.assertEqual(int(kamino_small._data._contact_overflow_warning_emitted.numpy()[0]), 0)
 
-        with self.assertLogs(level="WARNING"):
-            convert_contacts_newton_to_kamino(model, state, contacts, kamino_small)
+        convert_contacts_newton_to_kamino(model, state, contacts, kamino_small)
         self.assertEqual(int(kamino_small._data._contact_overflow_warning_emitted.numpy()[0]), 1)
         # Geometry must be sound for whatever was kept.
         bid_AB = kamino_small.bid_AB.numpy()[:nc_small]
@@ -1610,7 +1605,6 @@ class TestGeometryContactConversions(NewtonTestCase):
         newton.eval_fk(model, model.joint_q, model.joint_qd, state)
         collision_pipeline = newton.CollisionPipeline(
             model,
-            rigid_contact_max=_NEWTON_CONTACT_CAPACITY,
         )
         contacts = collision_pipeline.contacts()
         collision_pipeline.collide(state, contacts)
@@ -1619,11 +1613,11 @@ class TestGeometryContactConversions(NewtonTestCase):
         self.assertGreater(input_count, 2)
 
         kamino = ContactsKamino(capacity=[1, 1], device=self.default_device)
-        with self.assertLogs(level="WARNING") as logs:
-            convert_contacts_newton_to_kamino(model, state, contacts, kamino)
-        self.assertTrue(
-            any("active contacts may be truncated" in message for message in logs.output),
-            "An undersized per-world contact buffer must warn about possible truncation",
+        convert_contacts_newton_to_kamino(model, state, contacts, kamino)
+        self.assertEqual(
+            int(kamino._data._contact_overflow_warning_emitted.numpy()[0]),
+            1,
+            "An undersized per-world contact buffer must flag the contacts it truncates",
         )
 
         np.testing.assert_array_equal(kamino.world_active_contacts.numpy(), [1, 1])
@@ -1647,7 +1641,7 @@ class TestGeometryContactConversions(NewtonTestCase):
                 scene = build_box_on_plane_scene(box_z, margin=margin, gap=gap, half_extent=half_extent)
                 model = scene.finalize(self.default_device)
                 state = model.state()
-                collision_pipeline = newton.CollisionPipeline(model, rigid_contact_max=_NEWTON_CONTACT_CAPACITY)
+                collision_pipeline = newton.CollisionPipeline(model)
                 contacts = collision_pipeline.contacts()
                 collision_pipeline.collide(state, contacts)
                 nc = int(contacts.rigid_contact_count.numpy()[0])
@@ -1688,7 +1682,7 @@ class TestGeometryContactConversions(NewtonTestCase):
                 scene = build_box_on_plane_scene(box_z, margin=margin, gap=gap, half_extent=half_extent)
                 model = scene.finalize(self.default_device)
                 state = model.state()
-                collision_pipeline = newton.CollisionPipeline(model, rigid_contact_max=_NEWTON_CONTACT_CAPACITY)
+                collision_pipeline = newton.CollisionPipeline(model)
                 contacts = collision_pipeline.contacts()
                 collision_pipeline.collide(state, contacts)
                 nc = int(contacts.rigid_contact_count.numpy()[0])
@@ -1716,7 +1710,7 @@ class TestGeometryContactConversions(NewtonTestCase):
             scene.request_contact_attributes("force")
         model = scene.finalize(self.default_device)
         state = model.state()
-        collision_pipeline = newton.CollisionPipeline(model, rigid_contact_max=_NEWTON_CONTACT_CAPACITY)
+        collision_pipeline = newton.CollisionPipeline(model)
         contacts = collision_pipeline.contacts()
         collision_pipeline.collide(state, contacts)
         nc = int(contacts.rigid_contact_count.numpy()[0])

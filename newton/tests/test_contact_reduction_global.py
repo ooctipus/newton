@@ -14,7 +14,7 @@ from newton._src.geometry.contact_data import (
     make_contact_sort_key,
     make_contact_sort_key_with_bits,
 )
-from newton._src.geometry.contact_reduction import float_flip
+from newton._src.geometry.contact_reduction import NUM_NORMAL_BINS, NUM_SPATIAL_DIRECTIONS, float_flip
 from newton._src.geometry.contact_reduction_global import (
     CLEAR_ACTIVE_ENTRY_PARALLEL_THRESHOLD,
     EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
@@ -34,6 +34,8 @@ from newton._src.geometry.contact_reduction_global import (
     export_and_reduce_contact_centered_two_spatial_depths,
     export_contact_to_buffer,
     make_contact_key,
+    reduction_value_index,
+    reduction_value_index_np,
 )
 from newton._src.geometry.hashtable import hashtable_find_or_insert
 from newton._src.geometry.narrow_phase import ContactWriterData
@@ -69,12 +71,11 @@ def get_winning_contacts(reducer: GlobalContactReducer) -> list[int]:
 
     for i in range(count):
         entry_idx = active_slots_np[i]
-        # Slot-major layout: slot * capacity + entry_idx
         for slot in range(values_per_key):
-            val = values[slot * capacity + entry_idx]
+            val = values[reduction_value_index_np(entry_idx, slot)]
             if val != 0:
-                contact_id = val & contact_id_mask
-                contact_ids.add(int(contact_id))
+                contact_id = int(val) & contact_id_mask
+                contact_ids.add(contact_id)
 
     return sorted(contact_ids)
 
@@ -584,8 +585,9 @@ def test_clear_active_coalesced(test, device):
                 reducer.hashtable.keys.numpy()[active_entries],
                 np.full(active_count, np.iinfo(np.uint64).max, dtype=np.uint64),
             )
-            cleared_values = reducer.ht_values.numpy().reshape(reducer.values_per_key, ht_capacity)[:, active_entries]
-            np.testing.assert_array_equal(cleared_values, 0)
+            # Clearing retires each active entry's whole entry-major row.
+            rows = reduction_value_index_np(active_entries[:, None], np.arange(reducer.values_stride))
+            np.testing.assert_array_equal(reducer.ht_values.numpy()[rows], 0)
             for values in entry_arrays:
                 np.testing.assert_array_equal(values.numpy()[active_entries], 0.0)
 
@@ -687,15 +689,15 @@ def test_export_reduced_contacts_kernel(test, device):
         entry_idx = hashtable_find_or_insert(
             make_contact_key(10, 110, 0), reducer_data.ht_keys, reducer_data.ht_active_slots
         )
-        reducer_data.ht_values[entry_idx] = _make_contact_value_fast(1.0, 30, contact_a)
+        reducer_data.ht_values[reduction_value_index(entry_idx, 0)] = _make_contact_value_fast(1.0, 30, contact_a)
 
         sentinel_entry_idx = hashtable_find_or_insert(
             make_contact_key(11, 111, 0), reducer_data.ht_keys, reducer_data.ht_active_slots
         )
-        reducer_data.ht_values[sentinel_entry_idx] = _make_contact_value_fast(2.0, 0, 0)
-        reducer_data.ht_values[reducer_data.ht_capacity + entry_idx] = _make_contact_value_fast(1.0, 20, contact_b)
-        reducer_data.ht_values[2 * reducer_data.ht_capacity + entry_idx] = _make_contact_value_fast(1.0, 10, contact_c)
-        reducer_data.ht_values[3 * reducer_data.ht_capacity + entry_idx] = _make_contact_value_fast(1.0, 30, contact_a)
+        reducer_data.ht_values[reduction_value_index(sentinel_entry_idx, 0)] = _make_contact_value_fast(2.0, 0, 0)
+        reducer_data.ht_values[reduction_value_index(entry_idx, 1)] = _make_contact_value_fast(1.0, 20, contact_b)
+        reducer_data.ht_values[reduction_value_index(entry_idx, 2)] = _make_contact_value_fast(1.0, 10, contact_c)
+        reducer_data.ht_values[reduction_value_index(entry_idx, 3)] = _make_contact_value_fast(1.0, 30, contact_a)
 
         distinct_entry_idx = hashtable_find_or_insert(
             make_contact_key(12, 112, 0), reducer_data.ht_keys, reducer_data.ht_active_slots
@@ -710,7 +712,7 @@ def test_export_reduced_contacts_kernel(test, device):
                 fingerprint=100 + slot,
                 reducer_data=reducer_data,
             )
-            reducer_data.ht_values[slot * reducer_data.ht_capacity + distinct_entry_idx] = _make_contact_value_fast(
+            reducer_data.ht_values[reduction_value_index(distinct_entry_idx, slot)] = _make_contact_value_fast(
                 1.0, 100 + slot, contact_id
             )
 
@@ -922,6 +924,7 @@ def test_centered_two_spatial_depths_prefers_inner_then_outer(test, device):
             position=position,
             normal=normal,
             depth=depth,
+            step_end_depth=depth,
             fingerprint=fingerprint,
             centered_position=position,
             inner_spatial_depth=0.0,
@@ -994,6 +997,7 @@ def test_centered_two_spatial_depths_voxel_only_claim(test, device):
             position=wp.vec3(0.0),
             normal=wp.vec3(0.0, 1.0, 0.0),
             depth=-0.01,
+            step_end_depth=-0.01,
             fingerprint=fingerprint,
             centered_position=wp.vec3(0.0),
             inner_spatial_depth=0.0,
@@ -1079,6 +1083,51 @@ def test_centered_two_spatial_depths_full_buffer_does_not_publish_voxel_key(test
     test.assertEqual(get_active_slot_count(reducer), 1)
     test.assertEqual(int(reducer.ht_insert_failures.numpy()[0]), 0)
     test.assertEqual(get_winning_contacts(reducer), [])
+def test_centered_two_spatial_depths_closing_far_side_keeps_its_extremes(test, device):
+    """A separated candidate that closes within the step competes as touching for the directional slots."""
+
+    @wp.kernel
+    def store_step_end_contact_kernel(
+        reducer_data: GlobalContactReducerData,
+        x: float,
+        depth: float,
+        step_end_depth: float,
+        fingerprint: int,
+    ):
+        position = wp.vec3(x, 0.0, 0.0)
+        export_and_reduce_contact_centered_two_spatial_depths(
+            shape_a=0,
+            shape_b=1,
+            position=position,
+            normal=wp.vec3(0.0, 1.0, 0.0),
+            depth=depth,
+            step_end_depth=step_end_depth,
+            fingerprint=fingerprint,
+            centered_position=position,
+            inner_spatial_depth=0.0,
+            outer_spatial_depth=0.1,
+            position_local=position,
+            aabb_lower_voxel=wp.vec3(-1.0, -1.0, -1.0),
+            aabb_upper_voxel=wp.vec3(1.0, 1.0, 1.0),
+            voxel_res=wp.vec3i(1, 1, 1),
+            reducer_data=reducer_data,
+        )
+
+    # A body touching at x = 0 and rocking onto its far side at x = 0.1, 1 mm away and closing faster than 1 mm a
+    # step: the far side must keep a row, or it lands a substep's travel deep. Without closing it stays separated
+    # and the touching side holds every extreme.
+    for deterministic in (False, True):
+        for closing, expected in ((True, {1, 2}), (False, {1})):
+            reducer = GlobalContactReducer(capacity=200, device=device, deterministic=deterministic)
+            reducer_data = reducer.get_data_struct()
+            wp.launch(store_step_end_contact_kernel, dim=1, inputs=[reducer_data, 0.0, -0.01, -0.01, 1], device=device)
+            step_end = -0.0005 if closing else 0.001
+            wp.launch(
+                store_step_end_contact_kernel, dim=1, inputs=[reducer_data, 0.1, 0.001, step_end, 2], device=device
+            )
+            winners = get_winning_contacts(reducer)
+            fingerprints = {int(reducer.contact_fingerprints.numpy()[cid]) for cid in winners}
+            test.assertEqual(fingerprints, expected, f"closing far side: {closing}, deterministic: {deterministic}")
 
 
 def test_centered_different_pairs_independent(test, device):
@@ -1246,6 +1295,98 @@ def test_centered_pre_pruning_reduces_buffer_usage(test, device):
         total_dominated,
         f"Pre-pruning should skip some dominated contacts, but {new_allocations}/{total_dominated} were allocated",
     )
+
+
+@wp.kernel(enable_backward=False)
+def _store_probed_contact_kernel(reducer_data: GlobalContactReducerData, two_tier: int, depth: float):
+    """Offer one contact to a centered writer, which probes its rows before allocating."""
+    position = wp.vec3(0.3, 0.0, 0.2)
+    normal = wp.vec3(0.0, 1.0, 0.0)
+    aabb_lower = wp.vec3(-1.0, -1.0, -1.0)
+    aabb_upper = wp.vec3(1.0, 1.0, 1.0)
+    if two_tier != 0:
+        export_and_reduce_contact_centered_two_spatial_depths(
+            shape_a=3,
+            shape_b=7,
+            position=position,
+            normal=normal,
+            depth=depth,
+            step_end_depth=depth,
+            fingerprint=5,
+            centered_position=position,
+            inner_spatial_depth=0.0,
+            outer_spatial_depth=0.1,
+            position_local=position,
+            aabb_lower_voxel=aabb_lower,
+            aabb_upper_voxel=aabb_upper,
+            voxel_res=wp.vec3i(4, 4, 4),
+            reducer_data=reducer_data,
+        )
+    else:
+        export_and_reduce_contact_centered(
+            shape_a=3,
+            shape_b=7,
+            position=position,
+            normal=normal,
+            depth=depth,
+            fingerprint=5,
+            centered_position=position,
+            X_ws_voxel_shape=wp.transform_identity(),
+            aabb_lower_voxel=aabb_lower,
+            aabb_upper_voxel=aabb_upper,
+            voxel_res=wp.vec3i(4, 4, 4),
+            reducer_data=reducer_data,
+        )
+
+
+def test_centered_pre_prune_probes_read_their_own_rows(test, device):
+    """Admit a contact whose own slots are weak while every other value is a strong winner.
+
+    Each pre-prune probe of the single-tier and two-tier centered writers reads
+    the contact's own normal-bin or voxel row before allocating a buffer slot. A
+    probe that read any other value would see a strong winner and prune it.
+    """
+    strong = np.iinfo(np.uint64).max
+    # (two_tier, depth, probed slots): depth -0.01 is inside both writers' inner
+    # tier, 0.05 only inside the two-tier writer's outer, directional tier.
+    cases = (
+        (0, -0.01, "max_depth"),
+        (0, -0.01, "spatial"),
+        (0, -0.01, "voxel"),
+        (1, -0.01, "max_depth"),
+        (1, -0.01, "spatial"),
+        (1, 0.05, "spatial"),
+        (1, -0.01, "voxel"),
+    )
+    for deterministic in (False, True):
+        for two_tier, depth, probe in cases:
+            with test.subTest(deterministic=deterministic, two_tier=two_tier, depth=depth, probe=probe):
+                reducer = GlobalContactReducer(capacity=64, device=device, deterministic=deterministic)
+                inputs = [reducer.get_data_struct(), two_tier, depth]
+                # An empty table admits the contact and inserts its keys.
+                wp.launch(_store_probed_contact_kernel, dim=1, inputs=inputs, device=device)
+                test.assertEqual(get_contact_count(reducer), 1)
+                active = reducer.hashtable.active_slots.numpy()
+                entries = active[: active[reducer.hashtable.capacity]]
+                bins = (reducer.hashtable.keys.numpy()[entries] >> np.uint64(55)) & np.uint64(0xFF)
+                normal_entries = entries[bins < NUM_NORMAL_BINS]
+                voxel_entries = entries[bins >= NUM_NORMAL_BINS]
+                test.assertEqual(len(normal_entries), 1)
+                if probe == "max_depth":
+                    weak = reduction_value_index_np(normal_entries, NUM_SPATIAL_DIRECTIONS)
+                elif probe == "spatial":
+                    weak = reduction_value_index_np(normal_entries[:, None], np.arange(NUM_SPATIAL_DIRECTIONS))
+                else:
+                    test.assertEqual(len(voxel_entries), 1)
+                    weak = reduction_value_index_np(voxel_entries[:, None], np.arange(VALUES_PER_KEY))
+                for admitted in (False, True):
+                    values = np.full(reducer.ht_values.shape[0], strong, dtype=np.uint64)
+                    if admitted:
+                        values[weak] = 0
+                    reducer.ht_values.assign(values)
+                    reducer.contact_count.zero_()
+                    wp.launch(_store_probed_contact_kernel, dim=1, inputs=inputs, device=device)
+                    test.assertEqual(get_contact_count(reducer), int(admitted))
 
 
 # =============================================================================
@@ -1645,10 +1786,11 @@ def test_deterministic_identical_across_runs(test, device):
 
     num_runs = 5
     all_contact_sets = []
+    reducer = GlobalContactReducer(capacity=500, device=device, deterministic=True)
+    reducer_data = reducer.get_data_struct()
 
     for _ in range(num_runs):
-        reducer = GlobalContactReducer(capacity=500, device=device, deterministic=True)
-        reducer_data = reducer.get_data_struct()
+        reducer.clear_active()
 
         @wp.kernel(enable_backward=False, module="unique")
         def store_contacts_det_kernel(reducer_data: GlobalContactReducerData):
@@ -1689,9 +1831,9 @@ def test_deterministic_identical_across_runs(test, device):
         for i in range(count):
             entry_idx = active_slots_np[i]
             for slot in range(reducer.values_per_key):
-                val = values[slot * capacity + entry_idx]
+                val = values[reduction_value_index_np(entry_idx, slot)]
                 if val != 0:
-                    contact_id = int(val & ((1 << 20) - 1))
+                    contact_id = int(val) & ((1 << 20) - 1)
                     if contact_id not in seen_ids:
                         seen_ids.add(contact_id)
                         pd = pd_np[contact_id]
@@ -1765,6 +1907,12 @@ add_function_test(
 )
 add_function_test(
     TestGlobalContactReducer,
+    "test_centered_two_spatial_depths_closing_far_side_keeps_its_extremes",
+    test_centered_two_spatial_depths_closing_far_side_keeps_its_extremes,
+    devices=devices,
+)
+add_function_test(
+    TestGlobalContactReducer,
     "test_centered_different_pairs_independent",
     test_centered_different_pairs_independent,
     devices=devices,
@@ -1779,6 +1927,12 @@ add_function_test(
     TestGlobalContactReducer,
     "test_centered_pre_pruning_reduces_buffer_usage",
     test_centered_pre_pruning_reduces_buffer_usage,
+    devices=devices,
+)
+add_function_test(
+    TestGlobalContactReducer,
+    "test_centered_pre_prune_probes_read_their_own_rows",
+    test_centered_pre_prune_probes_read_their_own_rows,
     devices=devices,
 )
 add_function_test(TestKeyConstruction, "test_key_uniqueness", test_key_uniqueness, devices=devices)

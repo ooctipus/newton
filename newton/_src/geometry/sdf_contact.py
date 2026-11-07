@@ -6,9 +6,15 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from ..geometry.contact_data import SHAPE_PAIR_HFIELD_BIT, SHAPE_PAIR_INDEX_MASK, ContactData
+from ..geometry.contact_data import (
+    SHAPE_PAIR_HFIELD_BIT,
+    SHAPE_PAIR_INDEX_MASK,
+    ContactData,
+    compute_contact_approach_speed,
+)
 from ..geometry.sdf_texture import (
     TextureSDFData,
+    _locate_cell_coords,
     _texture_sample_sdf_hw_clamped,
     _texture_sample_sdf_hw_pair,
     texture_sample_sdf_grad_only_hw,
@@ -66,6 +72,105 @@ MESH_SDF_BLOCK_DIM = 128
 # stack completely (inner ``while count > 0`` pop loop) before the next
 # outer iteration runs.
 STACK_CAPACITY = 2 * MESH_SDF_BLOCK_DIM
+
+# Collision edges per cluster. A cluster is tested once against the SDF's cell lower bounds; only the
+# edges of clusters that may reach the contact threshold are culled one by one.
+EDGE_CLUSTER_SIZE = 16
+
+
+def build_mesh_edge_clusters(
+    centers: np.ndarray, radii: np.ndarray, size: int = EDGE_CLUSTER_SIZE
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Group one mesh's collision edges into spatially compact clusters of ``size`` edges.
+
+    A cluster's cull threshold grows with its longest edge, so the longest edges (more than four
+    times the median radius, rounded up to whole clusters) are clustered apart from the rest. Each
+    group is split at the median along the longest axis of its edge centers, at multiples of
+    ``size``, so every cluster is full except the last.
+
+    Args:
+        centers: Edge centers [m], shape ``[count, 3]``.
+        radii: Edge half-lengths [m], shape ``[count]``.
+        size: Edges per cluster.
+
+    Returns:
+        ``(order, bounds, reach)``: the edge indices in cluster order (cluster ``q`` holds
+        ``order[q * size : (q + 1) * size]``); per cluster its center and the largest distance from
+        it to a member's center, rounded up to float32 [m]; and the largest member radius [m].
+    """
+    centers = np.asarray(centers, dtype=np.float32)
+    radii = np.asarray(radii, dtype=np.float32)
+    by_length = np.argsort(-radii, kind="stable")
+    long_count = int(np.count_nonzero(radii > 4.0 * np.median(radii))) if len(radii) else 0
+    long_count = min(len(radii), -(-long_count // size) * size)
+    leaves = []
+    # Groups pop last-in first: the long edges' full clusters come first, the one partial cluster last.
+    pending = [by_length[long_count:], by_length[:long_count]]
+    while pending:
+        members = pending.pop()
+        if len(members) == 0:
+            continue
+        if len(members) <= size:
+            leaves.append(members)
+            continue
+        points = centers[members]
+        axis = int(np.argmax(points.max(axis=0) - points.min(axis=0)))
+        members = members[np.argsort(points[:, axis], kind="stable")]
+        split = size * (-(-len(members) // size) // 2)
+        # Depth first, left before right: the one partial cluster stays last.
+        pending.extend((members[split:], members[:split]))
+    order = np.concatenate(leaves).astype(np.int32) if leaves else np.zeros(0, dtype=np.int32)
+    bounds = np.zeros((len(leaves), 4), dtype=np.float32)
+    reach = np.zeros(len(leaves), dtype=np.float32)
+    for q, members in enumerate(leaves):
+        points = centers[members].astype(np.float64)
+        center = ((points.min(axis=0) + points.max(axis=0)) * 0.5).astype(np.float32)
+        spread = float(np.linalg.norm(points - center.astype(np.float64), axis=1).max())
+        spread32 = np.float32(spread)
+        bounds[q, :3] = center
+        bounds[q, 3] = spread32 if float(spread32) >= spread else np.nextafter(spread32, np.float32(np.inf))
+        reach[q] = radii[members].max()
+    return order, bounds, reach
+
+
+@wp.func
+def texture_sdf_cluster_may_contact(
+    sdf: TextureSDFData,
+    center_local: wp.vec3,
+    spread_local: float,
+    reach_local: float,
+    X_mesh_to_sdf: wp.transform,
+    inv_sdf_scale: wp.vec3,
+    radius_scale: float,
+    contact_threshold_unscaled: float,
+) -> bool:
+    """Return False only if no edge of a cluster can pass the texture-SDF edge cull.
+
+    An edge passes when the filtered SDF at its center, plus the center's distance outside the SDF
+    box, is at most its radius plus the contact threshold. Every member center lies within
+    ``spread_local`` of ``center_local``, so its coarse cell lies within ``k`` cells of the cluster
+    center's (the samplers' own cell lookup is monotone), and :attr:`TextureSDFData.cell_lower` at
+    level ``k`` bounds its sample. The members' box distances are at least the center's minus the
+    spread. The slacks cover float32 rounding of the transforms, cell lookups and sums.
+    """
+    levels = sdf.cell_lower.shape[0]
+    if levels == 0:
+        return True
+    center = wp.cw_mul(wp.transform_point(X_mesh_to_sdf, center_local), inv_sdf_scale)
+    spread = spread_local * radius_scale
+    spread += 1.0e-5 * (wp.length(center) + radius_scale * (wp.length(center_local) + spread_local))
+    threshold = reach_local * radius_scale + contact_threshold_unscaled
+    threshold += 1.0e-5 * wp.abs(threshold)
+
+    clamped = wp.min(wp.max(center, sdf.sdf_box_lower), sdf.sdf_box_upper)
+    outside = wp.length(center - clamped) * (1.0 - 1.0e-5) - spread
+    inv_dx = sdf.inv_sdf_dx
+    cells = spread * wp.max(wp.max(inv_dx[0], inv_dx[1]), inv_dx[2]) * sdf.fine_to_coarse + 0.01
+    lower = sdf.cell_lower_floor
+    if cells < float(levels - 1):
+        loc = _locate_cell_coords(sdf, wp.cw_mul(clamped - sdf.sdf_box_lower, inv_dx))
+        lower = sdf.cell_lower[int(cells) + 1, loc.x_base, loc.y_base, loc.z_base]
+    return lower + wp.max(outside, 0.0) <= threshold
 
 
 @wp.func_native("""
@@ -1368,6 +1473,9 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
         mesh_edge_indices: wp.array[wp.vec2i],
         mesh_edge_centers: wp.array[wp.vec4],
         mesh_edge_halves: wp.array[wp.vec4],
+        mesh_edge_order: wp.array[wp.int32],
+        mesh_edge_clusters: wp.array[wp.vec4],
+        mesh_edge_cluster_reach: wp.array[float],
         shape_edge_range: wp.array[wp.vec2i],
         writer_data: Any,
         total_num_blocks: int,
@@ -1383,6 +1491,10 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
         # each thread ``t`` evaluates ``progress[0] + t`` and the counter
         # advances by ``wp.block_dim()`` per pass.
         progress = wp.tile_zeros(shape=1, dtype=int, storage="shared")
+        # Edge clusters kept by the cluster cull of the current pass, and the next cluster to test.
+        cluster_stack = wp.tile_stack(capacity=MESH_SDF_BLOCK_DIM, dtype=int)
+        kept_clusters = wp.tile_zeros(shape=MESH_SDF_BLOCK_DIM, dtype=int, storage="shared")
+        cluster_progress = wp.tile_zeros(shape=1, dtype=int, storage="shared")
 
         # Strided loop over pairs
         for pair_idx in range(block_id, pair_count, total_num_blocks):
@@ -1398,7 +1510,9 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
             gap_sum = shape_gap[shape_a] + shape_gap[shape_b]
             base_gap_sum = shape_base_gap[shape_a] + shape_base_gap[shape_b]
 
-            for mode in range(2):
+            # A dynamic loop: Warp >= 1.19 unrolls a constant range holding ``continue``, which
+            # doubles this body and spills the kernel (Warp GH-1552).
+            for mode in range(wp.int32(2)):
                 tri_shape = shape_a if mode == 0 else shape_b
                 sdf_shape = shape_b if mode == 0 else shape_a
 
@@ -1502,20 +1616,29 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
 
                 edge_range_tri = shape_edge_range[tri_shape]
                 num_edges = get_edge_count(tri_type, edge_range_tri, hfd_tri)
+                edge_end = num_edges
+                # Mesh edges against a texture SDF are culled by cluster first and visited in cluster order;
+                # other edges keep every cluster and their own order.
+                cull_clusters = False
+                if wp.static(use_precomputed_edge_data):
+                    cull_clusters = use_texture_sdf_for_search and not tri_is_hfield
 
-                # Required barrier before the reset: a warp still evaluating the
-                # previous pass's exit test would otherwise read the new value,
-                # re-enter that loop, and spin, because only thread 0 advances
-                # ``progress``.
-                wp.tile_stack_clear(edge_stack)
-                wp.tile_scatter_masked(progress, 0, 0, t == 0)
+                # ``tile_scatter_masked`` writes before its barrier: wait until every thread has read the
+                # previous loop's exit condition before thread 0 resets the counter.
+                wp.tile_stack_clear(cluster_stack)
+                wp.tile_scatter_masked(cluster_progress, 0, 0, t == 0)
 
                 sdf_is_heightfield = sdf_is_hfield
                 sdf_aabb_lower = texture_sdf.sdf_box_lower
                 sdf_aabb_upper = texture_sdf.sdf_box_upper
 
-                # Cooperative edge-culling + processing. Each outer
-                # iteration (a) fills the tile stack with up to
+                # Cooperative culling + processing. Each cluster pass
+                # tests up to ``block_dim`` edge clusters against the
+                # SDF's cell lower bounds (an exact cull: a dropped
+                # cluster has no edge that passes the edge cull below)
+                # and compacts the kept ones; their edges then run the
+                # edge loop. Each edge iteration
+                # (a) fills the tile stack with up to
                 # ``block_dim`` accepted edges via cooperative pushes,
                 # (b) fully drains the stack, processing every accepted
                 # edge through ``do_edge_sdf_collision``, and
@@ -1535,23 +1658,71 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                 # This block is duplicated in
                 # ``mesh_sdf_collision_global_reduce_kernel`` (different
                 # edge range and contact writer) — keep the two in sync.
-                while wp.tile_extract(progress, 0) < num_edges:
-                    capacity = wp.block_dim()
-                    while wp.tile_extract(progress, 0) < num_edges and wp.tile_stack_count(edge_stack) < capacity:
-                        base_edge_idx = wp.tile_extract(progress, 0)
-                        edge_idx = base_edge_idx + t
-                        add_edge = False
-                        midpoint_sdf = float(0.0)
+                while wp.tile_extract(cluster_progress, 0) < edge_end:
+                    # Cluster pass: each thread takes the next EDGE_CLUSTER_SIZE edge slots; the first slots
+                    # of the kept clusters are compacted into ``kept_clusters`` and their edges culled below.
+                    first_slot = wp.tile_extract(cluster_progress, 0)
+                    cluster_slot = first_slot + t * EDGE_CLUSTER_SIZE
+                    keep_cluster = cluster_slot < edge_end
+                    if keep_cluster and cull_clusters:
+                        cluster = edge_range_tri[0] + cluster_slot // EDGE_CLUSTER_SIZE
+                        cluster_bounds = mesh_edge_clusters[cluster]
+                        keep_cluster = texture_sdf_cluster_may_contact(
+                            texture_sdf,
+                            # Clusters are built from unscaled edges, as the edges themselves are.
+                            wp.cw_mul(wp.vec3(cluster_bounds[0], cluster_bounds[1], cluster_bounds[2]), mesh_scale_tri),
+                            cluster_bounds[3],
+                            mesh_edge_cluster_reach[cluster],
+                            X_mesh_to_sdf,
+                            inv_sdf_scale,
+                            edge_radius_scale,
+                            contact_threshold_unscaled,
+                        )
+                    kept_slot = wp.tile_stack_push(cluster_stack, cluster_slot, keep_cluster)
+                    wp.tile_scatter_masked(kept_clusters, wp.max(kept_slot, 0), cluster_slot, kept_slot >= 0)
+                    kept_edges = wp.tile_stack_count(cluster_stack) * EDGE_CLUSTER_SIZE
+                    wp.tile_stack_clear(cluster_stack)
+                    wp.tile_scatter_masked(cluster_progress, 0, first_slot + wp.block_dim() * EDGE_CLUSTER_SIZE, t == 0)
+                    wp.tile_scatter_masked(progress, 0, 0, t == 0)
 
-                        if edge_idx < num_edges:
-                            if wp.static(enable_heightfields):
-                                if tri_type == GeoType.HFIELD:
-                                    v0_scaled, v1_scaled = get_edge_from_heightfield(
-                                        hfd_tri, heightfield_elevations, X_mesh_to_sdf, edge_idx
-                                    )
-                                    v0_cull = wp.cw_mul(v0_scaled, inv_sdf_scale)
-                                    v1_cull = wp.cw_mul(v1_scaled, inv_sdf_scale)
-                                    bsphere_center, bsphere_radius = get_edge_bounding_sphere(v0_cull, v1_cull)
+                    while wp.tile_extract(progress, 0) < kept_edges:
+                        capacity = wp.block_dim()
+                        while wp.tile_extract(progress, 0) < kept_edges and wp.tile_stack_count(edge_stack) < capacity:
+                            base_kept = wp.tile_extract(progress, 0)
+                            kept = base_kept + t
+                            edge_idx = int(-1)
+                            if kept < kept_edges:
+                                edge_idx = (
+                                    wp.tile_extract(kept_clusters, kept // EDGE_CLUSTER_SIZE) + kept % EDGE_CLUSTER_SIZE
+                                )
+                                if edge_idx >= edge_end:
+                                    edge_idx = -1
+                                elif cull_clusters:
+                                    edge_idx = mesh_edge_order[edge_range_tri[0] + edge_idx]
+                            add_edge = False
+                            midpoint_sdf = float(0.0)
+
+                            if edge_idx >= 0:
+                                if wp.static(enable_heightfields):
+                                    if tri_type == GeoType.HFIELD:
+                                        v0_scaled, v1_scaled = get_edge_from_heightfield(
+                                            hfd_tri, heightfield_elevations, X_mesh_to_sdf, edge_idx
+                                        )
+                                        v0_cull = wp.cw_mul(v0_scaled, inv_sdf_scale)
+                                        v1_cull = wp.cw_mul(v1_scaled, inv_sdf_scale)
+                                        bsphere_center, bsphere_radius = get_edge_bounding_sphere(v0_cull, v1_cull)
+                                    else:
+                                        bsphere_center, bsphere_radius = get_mesh_edge_bounding_sphere_specialized(
+                                            mesh_id_tri,
+                                            mesh_edge_indices,
+                                            mesh_edge_centers,
+                                            edge_range_tri,
+                                            mesh_scale_tri,
+                                            X_mesh_to_sdf,
+                                            inv_sdf_scale,
+                                            edge_radius_scale,
+                                            edge_idx,
+                                        )
                                 else:
                                     bsphere_center, bsphere_radius = get_mesh_edge_bounding_sphere_specialized(
                                         mesh_id_tri,
@@ -1564,77 +1735,78 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                                         edge_radius_scale,
                                         edge_idx,
                                     )
-                            else:
-                                bsphere_center, bsphere_radius = get_mesh_edge_bounding_sphere_specialized(
-                                    mesh_id_tri,
-                                    mesh_edge_indices,
-                                    mesh_edge_centers,
-                                    edge_range_tri,
-                                    mesh_scale_tri,
-                                    X_mesh_to_sdf,
-                                    inv_sdf_scale,
-                                    edge_radius_scale,
-                                    edge_idx,
-                                )
 
-                            threshold = bsphere_radius + contact_threshold_unscaled
+                                threshold = bsphere_radius + contact_threshold_unscaled
 
-                            if wp.static(enable_heightfields) and sdf_is_heightfield:
-                                midpoint_sdf = sample_sdf_heightfield(hfd_sdf, heightfield_elevations, bsphere_center)
-                                add_edge = midpoint_sdf <= threshold
-                            elif wp.static(not use_texture_sdf_only) and use_bvh_for_sdf:
-                                midpoint_sdf = sample_sdf_using_mesh(
-                                    mesh_id_sdf,
-                                    bsphere_center,
-                                    _SDF_QUERY_RADIUS_SLACK * threshold,
-                                    sdf_mesh_query_type,
-                                    mesh_boundary_flags,
-                                    sdf_boundary_start,
-                                )
-                                add_edge = midpoint_sdf <= threshold
-                            else:
-                                culling_radius = threshold
-                                clamped = wp.min(wp.max(bsphere_center, sdf_aabb_lower), sdf_aabb_upper)
-                                aabb_dist_sq = wp.length_sq(bsphere_center - clamped)
-                                if aabb_dist_sq > culling_radius * culling_radius:
-                                    add_edge = False
-                                else:
-                                    diff_mag = float(0.0)
-                                    if aabb_dist_sq > 0.0:
-                                        diff_mag = wp.sqrt(aabb_dist_sq)
-                                    midpoint_sdf = wp.static(sample_clamped)(texture_sdf, clamped, diff_mag)
-                                    add_edge = midpoint_sdf <= culling_radius
-
-                        cull_result = EdgeCullResult()
-                        cull_result.edge_idx = edge_idx
-                        cull_result.midpoint_sdf = midpoint_sdf
-                        wp.tile_stack_push(edge_stack, cull_result, add_edge)
-                        wp.tile_scatter_masked(progress, 0, base_edge_idx + capacity, t == 0)
-
-                    # Drain the stack completely. ``tile_stack_pop`` only
-                    # removes up to ``block_dim`` items per call, so we
-                    # loop until empty — a single pop followed by
-                    # ``tile_stack_clear`` would silently discard any
-                    # accepted edges that overflowed the prior push. The
-                    # trailing ``tile_stack_clear`` (after this drain) then
-                    # acts only as a barrier; see the comment block above
-                    # the outer ``while``.
-                    while wp.tile_stack_count(edge_stack) > 0:
-                        popped, edge_slot = wp.tile_stack_pop(edge_stack)
-                        my_edge_idx = popped.edge_idx
-                        cached_sdf_val = popped.midpoint_sdf
-                        has_edge = edge_slot >= 0
-
-                        if has_edge:
-                            corner_ownership = int(0)
-                            if wp.static(enable_heightfields):
-                                if tri_type == GeoType.HFIELD:
-                                    v0s, v1s = get_edge_from_heightfield(
-                                        hfd_tri,
-                                        heightfield_elevations,
-                                        X_mesh_to_sdf,
-                                        my_edge_idx,
+                                if wp.static(enable_heightfields) and sdf_is_heightfield:
+                                    midpoint_sdf = sample_sdf_heightfield(
+                                        hfd_sdf, heightfield_elevations, bsphere_center
                                     )
+                                    add_edge = midpoint_sdf <= threshold
+                                elif wp.static(not use_texture_sdf_only) and use_bvh_for_sdf:
+                                    midpoint_sdf = sample_sdf_using_mesh(
+                                        mesh_id_sdf,
+                                        bsphere_center,
+                                        _SDF_QUERY_RADIUS_SLACK * threshold,
+                                        sdf_mesh_query_type,
+                                        mesh_boundary_flags,
+                                        sdf_boundary_start,
+                                    )
+                                    add_edge = midpoint_sdf <= threshold
+                                else:
+                                    culling_radius = threshold
+                                    clamped = wp.min(wp.max(bsphere_center, sdf_aabb_lower), sdf_aabb_upper)
+                                    aabb_dist_sq = wp.length_sq(bsphere_center - clamped)
+                                    if aabb_dist_sq > culling_radius * culling_radius:
+                                        add_edge = False
+                                    else:
+                                        diff_mag = float(0.0)
+                                        if aabb_dist_sq > 0.0:
+                                            diff_mag = wp.sqrt(aabb_dist_sq)
+                                        midpoint_sdf = wp.static(sample_clamped)(texture_sdf, clamped, diff_mag)
+                                        add_edge = midpoint_sdf <= culling_radius
+
+                            cull_result = EdgeCullResult()
+                            cull_result.edge_idx = edge_idx
+                            cull_result.midpoint_sdf = midpoint_sdf
+                            wp.tile_stack_push(edge_stack, cull_result, add_edge)
+                            wp.tile_scatter_masked(progress, 0, base_kept + capacity, t == 0)
+
+                        # Drain the stack completely. ``tile_stack_pop`` only
+                        # removes up to ``block_dim`` items per call, so we
+                        # loop until empty — a single pop followed by
+                        # ``tile_stack_clear`` would silently discard any
+                        # accepted edges that overflowed the prior push. The
+                        # trailing ``tile_stack_clear`` (after this drain) is
+                        # a defensive no-op barrier; see the comment block
+                        # above the outer ``while``.
+                        while wp.tile_stack_count(edge_stack) > 0:
+                            popped, edge_slot = wp.tile_stack_pop(edge_stack)
+                            my_edge_idx = popped.edge_idx
+                            cached_sdf_val = popped.midpoint_sdf
+                            has_edge = edge_slot >= 0
+
+                            if has_edge:
+                                corner_ownership = int(0)
+                                if wp.static(enable_heightfields):
+                                    if tri_type == GeoType.HFIELD:
+                                        v0s, v1s = get_edge_from_heightfield(
+                                            hfd_tri,
+                                            heightfield_elevations,
+                                            X_mesh_to_sdf,
+                                            my_edge_idx,
+                                        )
+                                    else:
+                                        v0s, v1s, corner_ownership = get_mesh_edge_specialized(
+                                            mesh_id_tri,
+                                            mesh_edge_indices,
+                                            mesh_edge_centers,
+                                            mesh_edge_halves,
+                                            edge_range_tri,
+                                            mesh_scale_tri,
+                                            X_mesh_to_sdf,
+                                            my_edge_idx,
+                                        )
                                 else:
                                     v0s, v1s, corner_ownership = get_mesh_edge_specialized(
                                         mesh_id_tri,
@@ -1646,151 +1818,141 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                                         X_mesh_to_sdf,
                                         my_edge_idx,
                                     )
-                            else:
-                                v0s, v1s, corner_ownership = get_mesh_edge_specialized(
-                                    mesh_id_tri,
-                                    mesh_edge_indices,
-                                    mesh_edge_centers,
-                                    mesh_edge_halves,
-                                    edge_range_tri,
-                                    mesh_scale_tri,
-                                    X_mesh_to_sdf,
-                                    my_edge_idx,
+                                v0 = wp.cw_mul(v0s, inv_sdf_scale)
+                                v1 = wp.cw_mul(v1s, inv_sdf_scale)
+
+                                dist_unscaled, point_unscaled, best_endpoint = do_edge_sdf_collision(
+                                    texture_sdf,
+                                    mesh_id_sdf,
+                                    v0,
+                                    v1,
+                                    cached_sdf_val,
+                                    use_bvh_for_sdf,
+                                    sdf_mesh_query_type,
+                                    mesh_boundary_flags,
+                                    sdf_boundary_start,
+                                    sdf_is_hfield,
+                                    hfd_sdf,
+                                    heightfield_elevations,
+                                    search_precision_unscaled,
                                 )
-                            v0 = wp.cw_mul(v0s, inv_sdf_scale)
-                            v1 = wp.cw_mul(v1s, inv_sdf_scale)
 
-                            dist_unscaled, point_unscaled, best_endpoint = do_edge_sdf_collision(
-                                texture_sdf,
-                                mesh_id_sdf,
-                                v0,
-                                v1,
-                                cached_sdf_val,
-                                use_bvh_for_sdf,
-                                sdf_mesh_query_type,
-                                mesh_boundary_flags,
-                                sdf_boundary_start,
-                                sdf_is_hfield,
-                                hfd_sdf,
-                                heightfield_elevations,
-                                search_precision_unscaled,
-                            )
-
-                            # Gap may widen the edge cull enough to find
-                            # SDF minima that the inner contact shell would
-                            # not have considered. Those rows are useful as
-                            # separated detections, but an alleged inner
-                            # contact must still pass the inner cull implied
-                            # by a 1-Lipschitz signed distance field.
-                            dist_approx = dist_unscaled * min_sdf_scale
-                            bsphere_center_inner, bsphere_radius_inner = get_edge_bounding_sphere(v0, v1)
-                            inner_cull_consistent = mesh_sdf_contact_passes_inner_cull_consistency(
-                                dist_approx,
-                                triangle_mesh_margin + sdf_mesh_margin,
-                                cached_sdf_val,
-                                bsphere_center_inner,
-                                bsphere_radius_inner,
-                                sdf_aabb_lower,
-                                sdf_aabb_upper,
-                                min_sdf_scale,
-                                use_texture_sdf_for_search,
-                            )
-                            owns_endpoint = (
-                                best_endpoint == 0 or corner_ownership == 0 or (corner_ownership & best_endpoint) != 0
-                            )
-                            if dist_approx < contact_threshold and inner_cull_consistent and owns_endpoint:
-                                if wp.static(enable_heightfields):
-                                    if sdf_is_hfield:
-                                        dist_unscaled, direction_unscaled = sample_sdf_grad_heightfield(
-                                            hfd_sdf, heightfield_elevations, point_unscaled
-                                        )
-                                    elif wp.static(not use_texture_sdf_only) and use_bvh_for_sdf:
-                                        dist_unscaled, direction_unscaled = sample_sdf_grad_using_mesh(
-                                            mesh_id_sdf,
-                                            point_unscaled,
-                                            _MESH_QUERY_MAX_DIST,
-                                            sdf_mesh_query_type,
-                                            mesh_boundary_flags,
-                                            sdf_boundary_start,
-                                        )
+                                # Gap may widen the edge cull enough to find
+                                # SDF minima that the inner contact shell would
+                                # not have considered. Those rows are useful as
+                                # separated detections, but an alleged inner
+                                # contact must still pass the inner cull implied
+                                # by a 1-Lipschitz signed distance field.
+                                dist_approx = dist_unscaled * min_sdf_scale
+                                bsphere_center_inner, bsphere_radius_inner = get_edge_bounding_sphere(v0, v1)
+                                inner_cull_consistent = mesh_sdf_contact_passes_inner_cull_consistency(
+                                    dist_approx,
+                                    triangle_mesh_margin + sdf_mesh_margin,
+                                    cached_sdf_val,
+                                    bsphere_center_inner,
+                                    bsphere_radius_inner,
+                                    sdf_aabb_lower,
+                                    sdf_aabb_upper,
+                                    min_sdf_scale,
+                                    use_texture_sdf_for_search,
+                                )
+                                owns_endpoint = (
+                                    best_endpoint == 0
+                                    or corner_ownership == 0
+                                    or (corner_ownership & best_endpoint) != 0
+                                )
+                                if dist_approx < contact_threshold and inner_cull_consistent and owns_endpoint:
+                                    if wp.static(enable_heightfields):
+                                        if sdf_is_hfield:
+                                            dist_unscaled, direction_unscaled = sample_sdf_grad_heightfield(
+                                                hfd_sdf, heightfield_elevations, point_unscaled
+                                            )
+                                        elif wp.static(not use_texture_sdf_only) and use_bvh_for_sdf:
+                                            dist_unscaled, direction_unscaled = sample_sdf_grad_using_mesh(
+                                                mesh_id_sdf,
+                                                point_unscaled,
+                                                _MESH_QUERY_MAX_DIST,
+                                                sdf_mesh_query_type,
+                                                mesh_boundary_flags,
+                                                sdf_boundary_start,
+                                            )
+                                        else:
+                                            # Brent already produced the SDF value at
+                                            # ``point_unscaled``; skip the redundant value
+                                            # sample inside the gradient call and reuse
+                                            # ``dist_unscaled`` from Brent.
+                                            direction_unscaled = wp.static(sample_grad)(texture_sdf, point_unscaled)
                                     else:
-                                        # Brent already produced the SDF value at
-                                        # ``point_unscaled``; skip the redundant value
-                                        # sample inside the gradient call and reuse
-                                        # ``dist_unscaled`` from Brent.
-                                        direction_unscaled = wp.static(sample_grad)(texture_sdf, point_unscaled)
-                                else:
-                                    if wp.static(not use_texture_sdf_only) and use_bvh_for_sdf:
-                                        dist_unscaled, direction_unscaled = sample_sdf_grad_using_mesh(
-                                            mesh_id_sdf,
-                                            point_unscaled,
-                                            _MESH_QUERY_MAX_DIST,
-                                            sdf_mesh_query_type,
-                                            mesh_boundary_flags,
-                                            sdf_boundary_start,
+                                        if wp.static(not use_texture_sdf_only) and use_bvh_for_sdf:
+                                            dist_unscaled, direction_unscaled = sample_sdf_grad_using_mesh(
+                                                mesh_id_sdf,
+                                                point_unscaled,
+                                                _MESH_QUERY_MAX_DIST,
+                                                sdf_mesh_query_type,
+                                                mesh_boundary_flags,
+                                                sdf_boundary_start,
+                                            )
+                                        else:
+                                            # Brent already produced the SDF value at
+                                            # ``point_unscaled``; skip the redundant value
+                                            # sample inside the gradient call and reuse
+                                            # ``dist_unscaled`` from Brent.
+                                            direction_unscaled = wp.static(sample_grad)(texture_sdf, point_unscaled)
+
+                                    if wp.static(use_identity_sdf_scale):
+                                        dist = dist_unscaled
+                                        direction = direction_unscaled
+                                        point = point_unscaled
+                                    else:
+                                        dist, direction = scale_sdf_result_to_world(
+                                            dist_unscaled, direction_unscaled, sdf_scale, inv_sdf_scale, min_sdf_scale
                                         )
+                                        point = wp.cw_mul(point_unscaled, sdf_scale)
+                                    point_world = wp.transform_point(X_sdf_ws, point)
+
+                                    direction_world = wp.transform_vector(X_sdf_ws, direction)
+                                    direction_len_sq = wp.length_sq(direction_world)
+                                    if direction_len_sq > 0.0:
+                                        direction_world = direction_world * _sdf_rsqrt_rn(direction_len_sq)
                                     else:
-                                        # Brent already produced the SDF value at
-                                        # ``point_unscaled``; skip the redundant value
-                                        # sample inside the gradient call and reuse
-                                        # ``dist_unscaled`` from Brent.
-                                        direction_unscaled = wp.static(sample_grad)(texture_sdf, point_unscaled)
+                                        fallback_dir = point_world - wp.transform_get_translation(X_sdf_ws)
+                                        fallback_len_sq = wp.length_sq(fallback_dir)
+                                        if fallback_len_sq > 0.0:
+                                            direction_world = fallback_dir * _sdf_rsqrt_rn(fallback_len_sq)
+                                        else:
+                                            direction_world = wp.vec3(0.0, 1.0, 0.0)
 
-                                if wp.static(use_identity_sdf_scale):
-                                    dist = dist_unscaled
-                                    direction = direction_unscaled
-                                    point = point_unscaled
-                                else:
-                                    dist, direction = scale_sdf_result_to_world(
-                                        dist_unscaled, direction_unscaled, sdf_scale, inv_sdf_scale, min_sdf_scale
-                                    )
-                                    point = wp.cw_mul(point_unscaled, sdf_scale)
-                                point_world = wp.transform_point(X_sdf_ws, point)
+                                    contact_normal = -direction_world if mode == 0 else direction_world
+                                    triangle_mesh_margin = shape_data[shape_a][3]
+                                    sdf_mesh_margin = shape_data[shape_b][3]
 
-                                direction_world = wp.transform_vector(X_sdf_ws, direction)
-                                direction_len_sq = wp.length_sq(direction_world)
-                                if direction_len_sq > 0.0:
-                                    direction_world = direction_world * _sdf_rsqrt_rn(direction_len_sq)
-                                else:
-                                    fallback_dir = point_world - wp.transform_get_translation(X_sdf_ws)
-                                    fallback_len_sq = wp.length_sq(fallback_dir)
-                                    if fallback_len_sq > 0.0:
-                                        direction_world = fallback_dir * _sdf_rsqrt_rn(fallback_len_sq)
+                                    contact_data = ContactData()
+                                    contact_data.contact_point_center = point_world
+                                    contact_data.contact_normal_a_to_b = contact_normal
+                                    contact_data.contact_distance = dist
+                                    contact_data.radius_eff_a = 0.0
+                                    contact_data.radius_eff_b = 0.0
+                                    contact_data.margin_a = triangle_mesh_margin
+                                    contact_data.margin_b = sdf_mesh_margin
+                                    contact_data.shape_a = shape_a
+                                    contact_data.shape_b = shape_b
+                                    if wp.static(speculative):
+                                        contact_data.gap_sum = base_gap_sum
                                     else:
-                                        direction_world = wp.vec3(0.0, 1.0, 0.0)
+                                        contact_data.gap_sum = gap_sum
+                                    contact_data.sort_sub_key = (my_edge_idx << 2) | (mode << 1)
 
-                                contact_normal = -direction_world if mode == 0 else direction_world
-                                triangle_mesh_margin = shape_data[shape_a][3]
-                                sdf_mesh_margin = shape_data[shape_b][3]
+                                    writer_func(contact_data, writer_data, -1)
 
-                                contact_data = ContactData()
-                                contact_data.contact_point_center = point_world
-                                contact_data.contact_normal_a_to_b = contact_normal
-                                contact_data.contact_distance = dist
-                                contact_data.radius_eff_a = 0.0
-                                contact_data.radius_eff_b = 0.0
-                                contact_data.margin_a = triangle_mesh_margin
-                                contact_data.margin_b = sdf_mesh_margin
-                                contact_data.shape_a = shape_a
-                                contact_data.shape_b = shape_b
-                                if wp.static(speculative):
-                                    contact_data.gap_sum = base_gap_sum
-                                else:
-                                    contact_data.gap_sum = gap_sum
-                                contact_data.sort_sub_key = (my_edge_idx << 2) | (mode << 1)
-
-                                writer_func(contact_data, writer_data, -1)
-
-                    # Cooperative reset before the next outer iteration.
-                    # The drain loop above already left the stack empty,
-                    # so this serves as a uniformly-called barrier that
-                    # pairs with the inner push loop and matches the
-                    # original ``push -> pop -> clear`` pattern that
-                    # empirically avoided a deadlock in deterministic
-                    # mesh-mesh scenes (see
-                    # ``example_basic_shapes6_determinism``). The reset of
-                    # ``progress`` relies on the barrier before it.
-                    wp.tile_stack_clear(edge_stack)
+                        # Defensive cooperative reset before the next outer
+                        # iteration. The drain loop above already left the
+                        # stack empty, so this is logically a no-op, but it
+                        # is a uniformly-called barrier that pairs cleanly
+                        # with the inner push loop and matches the original
+                        # ``push -> pop -> clear`` pattern that empirically
+                        # avoided a deadlock in deterministic mesh-mesh
+                        # scenes (see ``example_basic_shapes6_determinism``).
+                        wp.tile_stack_clear(edge_stack)
 
     # Return early if contact reduction is disabled
     if not reduce_contacts:
@@ -1831,6 +1993,9 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
         mesh_edge_indices: wp.array[wp.vec2i],
         mesh_edge_centers: wp.array[wp.vec4],
         mesh_edge_halves: wp.array[wp.vec4],
+        mesh_edge_order: wp.array[wp.int32],
+        mesh_edge_clusters: wp.array[wp.vec4],
+        mesh_edge_cluster_reach: wp.array[float],
         shape_edge_range: wp.array[wp.vec2i],
         block_offsets: wp.array[wp.int32],
         reducer_data: GlobalContactReducerData,
@@ -1856,6 +2021,10 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
         # each thread ``t`` evaluates ``progress[0] + t`` and the counter
         # advances by ``wp.block_dim()`` per pass.
         progress = wp.tile_zeros(shape=1, dtype=int, storage="shared")
+        # Edge clusters kept by the cluster cull of the current pass, and the next cluster to test.
+        cluster_stack = wp.tile_stack(capacity=MESH_SDF_BLOCK_DIM, dtype=int)
+        kept_clusters = wp.tile_zeros(shape=MESH_SDF_BLOCK_DIM, dtype=int, storage="shared")
+        cluster_progress = wp.tile_zeros(shape=1, dtype=int, storage="shared")
 
         for combo_idx in range(block_id, total_combos, total_num_blocks):
             lo = int(0)
@@ -1882,7 +2051,9 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
             gap_sum = shape_gap[shape_a] + shape_gap[shape_b]
             base_gap_sum = shape_base_gap[shape_a] + shape_base_gap[shape_b]
 
-            for mode in range(2):
+            # A dynamic loop: Warp >= 1.19 unrolls a constant range holding ``continue``, which
+            # doubles this body and spills the kernel (Warp GH-1552).
+            for mode in range(wp.int32(2)):
                 tri_shape = shape_a if mode == 0 else shape_b
                 sdf_shape = shape_b if mode == 0 else shape_a
 
@@ -1983,13 +2154,22 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
 
                 edge_range_tri = shape_edge_range[tri_shape]
                 num_edges = get_edge_count(tri_type, edge_range_tri, hfd_tri)
+                # Mesh edges against a texture SDF are culled by cluster first and visited in cluster order;
+                # other edges keep every cluster and their own order.
+                cull_clusters = False
+                if wp.static(use_precomputed_edge_data):
+                    cull_clusters = use_texture_sdf_for_search and not tri_is_hfield
                 chunk_size = (num_edges + blocks_for_pair - 1) // blocks_for_pair
+                if cull_clusters:
+                    # A culled chunk starts on a cluster boundary.
+                    chunk_size = (chunk_size + EDGE_CLUSTER_SIZE - 1) // EDGE_CLUSTER_SIZE * EDGE_CLUSTER_SIZE
                 edge_start = block_in_pair * chunk_size
                 edge_end = wp.min(edge_start + chunk_size, num_edges)
 
-                # Barrier before the reset; see ``mesh_sdf_collision_kernel``.
-                wp.tile_stack_clear(edge_stack)
-                wp.tile_scatter_masked(progress, 0, edge_start, t == 0)
+                # ``tile_scatter_masked`` writes before its barrier: wait until every thread has read the
+                # previous loop's exit condition before thread 0 resets the counter.
+                wp.tile_stack_clear(cluster_stack)
+                wp.tile_scatter_masked(cluster_progress, 0, edge_start, t == 0)
 
                 sdf_is_heightfield = sdf_is_hfield
                 sdf_aabb_lower = texture_sdf.sdf_box_lower
@@ -2000,23 +2180,71 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                 # discussion; the drain-until-empty pop is essential so
                 # that edges overflowing the prior push are not silently
                 # dropped. Keep this block in sync with its twin.
-                while wp.tile_extract(progress, 0) < edge_end:
-                    capacity = wp.block_dim()
-                    while wp.tile_extract(progress, 0) < edge_end and wp.tile_stack_count(edge_stack) < capacity:
-                        base_edge_idx = wp.tile_extract(progress, 0)
-                        edge_idx = base_edge_idx + t
-                        add_edge = False
-                        midpoint_sdf = float(0.0)
+                while wp.tile_extract(cluster_progress, 0) < edge_end:
+                    # Cluster pass: each thread takes the next EDGE_CLUSTER_SIZE edge slots; the first slots
+                    # of the kept clusters are compacted into ``kept_clusters`` and their edges culled below.
+                    first_slot = wp.tile_extract(cluster_progress, 0)
+                    cluster_slot = first_slot + t * EDGE_CLUSTER_SIZE
+                    keep_cluster = cluster_slot < edge_end
+                    if keep_cluster and cull_clusters:
+                        cluster = edge_range_tri[0] + cluster_slot // EDGE_CLUSTER_SIZE
+                        cluster_bounds = mesh_edge_clusters[cluster]
+                        keep_cluster = texture_sdf_cluster_may_contact(
+                            texture_sdf,
+                            # Clusters are built from unscaled edges, as the edges themselves are.
+                            wp.cw_mul(wp.vec3(cluster_bounds[0], cluster_bounds[1], cluster_bounds[2]), mesh_scale_tri),
+                            cluster_bounds[3],
+                            mesh_edge_cluster_reach[cluster],
+                            X_mesh_to_sdf,
+                            inv_sdf_scale,
+                            edge_radius_scale,
+                            contact_threshold_unscaled,
+                        )
+                    kept_slot = wp.tile_stack_push(cluster_stack, cluster_slot, keep_cluster)
+                    wp.tile_scatter_masked(kept_clusters, wp.max(kept_slot, 0), cluster_slot, kept_slot >= 0)
+                    kept_edges = wp.tile_stack_count(cluster_stack) * EDGE_CLUSTER_SIZE
+                    wp.tile_stack_clear(cluster_stack)
+                    wp.tile_scatter_masked(cluster_progress, 0, first_slot + wp.block_dim() * EDGE_CLUSTER_SIZE, t == 0)
+                    wp.tile_scatter_masked(progress, 0, 0, t == 0)
 
-                        if edge_idx < edge_end:
-                            if wp.static(enable_heightfields):
-                                if tri_type == GeoType.HFIELD:
-                                    v0_scaled, v1_scaled = get_edge_from_heightfield(
-                                        hfd_tri, heightfield_elevations, X_mesh_to_sdf, edge_idx
-                                    )
-                                    v0_cull = wp.cw_mul(v0_scaled, inv_sdf_scale)
-                                    v1_cull = wp.cw_mul(v1_scaled, inv_sdf_scale)
-                                    bsphere_center, bsphere_radius = get_edge_bounding_sphere(v0_cull, v1_cull)
+                    while wp.tile_extract(progress, 0) < kept_edges:
+                        capacity = wp.block_dim()
+                        while wp.tile_extract(progress, 0) < kept_edges and wp.tile_stack_count(edge_stack) < capacity:
+                            base_kept = wp.tile_extract(progress, 0)
+                            kept = base_kept + t
+                            edge_idx = int(-1)
+                            if kept < kept_edges:
+                                edge_idx = (
+                                    wp.tile_extract(kept_clusters, kept // EDGE_CLUSTER_SIZE) + kept % EDGE_CLUSTER_SIZE
+                                )
+                                if edge_idx >= edge_end:
+                                    edge_idx = -1
+                                elif cull_clusters:
+                                    edge_idx = mesh_edge_order[edge_range_tri[0] + edge_idx]
+                            add_edge = False
+                            midpoint_sdf = float(0.0)
+
+                            if edge_idx >= 0:
+                                if wp.static(enable_heightfields):
+                                    if tri_type == GeoType.HFIELD:
+                                        v0_scaled, v1_scaled = get_edge_from_heightfield(
+                                            hfd_tri, heightfield_elevations, X_mesh_to_sdf, edge_idx
+                                        )
+                                        v0_cull = wp.cw_mul(v0_scaled, inv_sdf_scale)
+                                        v1_cull = wp.cw_mul(v1_scaled, inv_sdf_scale)
+                                        bsphere_center, bsphere_radius = get_edge_bounding_sphere(v0_cull, v1_cull)
+                                    else:
+                                        bsphere_center, bsphere_radius = get_mesh_edge_bounding_sphere_specialized(
+                                            mesh_id_tri,
+                                            mesh_edge_indices,
+                                            mesh_edge_centers,
+                                            edge_range_tri,
+                                            mesh_scale_tri,
+                                            X_mesh_to_sdf,
+                                            inv_sdf_scale,
+                                            edge_radius_scale,
+                                            edge_idx,
+                                        )
                                 else:
                                     bsphere_center, bsphere_radius = get_mesh_edge_bounding_sphere_specialized(
                                         mesh_id_tri,
@@ -2029,74 +2257,75 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                                         edge_radius_scale,
                                         edge_idx,
                                     )
-                            else:
-                                bsphere_center, bsphere_radius = get_mesh_edge_bounding_sphere_specialized(
-                                    mesh_id_tri,
-                                    mesh_edge_indices,
-                                    mesh_edge_centers,
-                                    edge_range_tri,
-                                    mesh_scale_tri,
-                                    X_mesh_to_sdf,
-                                    inv_sdf_scale,
-                                    edge_radius_scale,
-                                    edge_idx,
-                                )
 
-                            threshold = bsphere_radius + contact_threshold_unscaled
+                                threshold = bsphere_radius + contact_threshold_unscaled
 
-                            if wp.static(enable_heightfields) and sdf_is_heightfield:
-                                midpoint_sdf = sample_sdf_heightfield(hfd_sdf, heightfield_elevations, bsphere_center)
-                                add_edge = midpoint_sdf <= threshold
-                            elif wp.static(not use_texture_sdf_only) and use_bvh_for_sdf:
-                                midpoint_sdf = sample_sdf_using_mesh(
-                                    mesh_id_sdf,
-                                    bsphere_center,
-                                    _SDF_QUERY_RADIUS_SLACK * threshold,
-                                    sdf_mesh_query_type,
-                                    mesh_boundary_flags,
-                                    sdf_boundary_start,
-                                )
-                                add_edge = midpoint_sdf <= threshold
-                            else:
-                                culling_radius = threshold
-                                clamped = wp.min(wp.max(bsphere_center, sdf_aabb_lower), sdf_aabb_upper)
-                                aabb_dist_sq = wp.length_sq(bsphere_center - clamped)
-                                if aabb_dist_sq > culling_radius * culling_radius:
-                                    add_edge = False
-                                else:
-                                    diff_mag = float(0.0)
-                                    if aabb_dist_sq > 0.0:
-                                        diff_mag = wp.sqrt(aabb_dist_sq)
-                                    midpoint_sdf = wp.static(sample_clamped)(texture_sdf, clamped, diff_mag)
-                                    add_edge = midpoint_sdf <= culling_radius
-
-                        cull_result = EdgeCullResult()
-                        cull_result.edge_idx = edge_idx
-                        cull_result.midpoint_sdf = midpoint_sdf
-                        wp.tile_stack_push(edge_stack, cull_result, add_edge)
-                        wp.tile_scatter_masked(progress, 0, base_edge_idx + capacity, t == 0)
-
-                    # Drain the stack completely — see the matching loop
-                    # in ``mesh_sdf_collision_kernel`` for why a single
-                    # pop would silently drop overflowed accepted edges.
-                    # The trailing ``tile_stack_clear`` then acts only as
-                    # a barrier (see that same comment block).
-                    while wp.tile_stack_count(edge_stack) > 0:
-                        popped, edge_slot = wp.tile_stack_pop(edge_stack)
-                        my_edge_idx = popped.edge_idx
-                        cached_sdf_val = popped.midpoint_sdf
-                        has_edge = edge_slot >= 0
-
-                        if has_edge:
-                            corner_ownership = int(0)
-                            if wp.static(enable_heightfields):
-                                if tri_type == GeoType.HFIELD:
-                                    v0s, v1s = get_edge_from_heightfield(
-                                        hfd_tri,
-                                        heightfield_elevations,
-                                        X_mesh_to_sdf,
-                                        my_edge_idx,
+                                if wp.static(enable_heightfields) and sdf_is_heightfield:
+                                    midpoint_sdf = sample_sdf_heightfield(
+                                        hfd_sdf, heightfield_elevations, bsphere_center
                                     )
+                                    add_edge = midpoint_sdf <= threshold
+                                elif wp.static(not use_texture_sdf_only) and use_bvh_for_sdf:
+                                    midpoint_sdf = sample_sdf_using_mesh(
+                                        mesh_id_sdf,
+                                        bsphere_center,
+                                        _SDF_QUERY_RADIUS_SLACK * threshold,
+                                        sdf_mesh_query_type,
+                                        mesh_boundary_flags,
+                                        sdf_boundary_start,
+                                    )
+                                    add_edge = midpoint_sdf <= threshold
+                                else:
+                                    culling_radius = threshold
+                                    clamped = wp.min(wp.max(bsphere_center, sdf_aabb_lower), sdf_aabb_upper)
+                                    aabb_dist_sq = wp.length_sq(bsphere_center - clamped)
+                                    if aabb_dist_sq > culling_radius * culling_radius:
+                                        add_edge = False
+                                    else:
+                                        diff_mag = float(0.0)
+                                        if aabb_dist_sq > 0.0:
+                                            diff_mag = wp.sqrt(aabb_dist_sq)
+                                        midpoint_sdf = wp.static(sample_clamped)(texture_sdf, clamped, diff_mag)
+                                        add_edge = midpoint_sdf <= culling_radius
+
+                            cull_result = EdgeCullResult()
+                            cull_result.edge_idx = edge_idx
+                            cull_result.midpoint_sdf = midpoint_sdf
+                            wp.tile_stack_push(edge_stack, cull_result, add_edge)
+                            wp.tile_scatter_masked(progress, 0, base_kept + capacity, t == 0)
+
+                        # Drain the stack completely — see the matching loop
+                        # in ``mesh_sdf_collision_kernel`` for why a single
+                        # pop would silently drop overflowed accepted edges.
+                        # The trailing ``tile_stack_clear`` is a defensive
+                        # no-op barrier (see that same comment block).
+                        while wp.tile_stack_count(edge_stack) > 0:
+                            popped, edge_slot = wp.tile_stack_pop(edge_stack)
+                            my_edge_idx = popped.edge_idx
+                            cached_sdf_val = popped.midpoint_sdf
+                            has_edge = edge_slot >= 0
+
+                            if has_edge:
+                                corner_ownership = int(0)
+                                if wp.static(enable_heightfields):
+                                    if tri_type == GeoType.HFIELD:
+                                        v0s, v1s = get_edge_from_heightfield(
+                                            hfd_tri,
+                                            heightfield_elevations,
+                                            X_mesh_to_sdf,
+                                            my_edge_idx,
+                                        )
+                                    else:
+                                        v0s, v1s, corner_ownership = get_mesh_edge_specialized(
+                                            mesh_id_tri,
+                                            mesh_edge_indices,
+                                            mesh_edge_centers,
+                                            mesh_edge_halves,
+                                            edge_range_tri,
+                                            mesh_scale_tri,
+                                            X_mesh_to_sdf,
+                                            my_edge_idx,
+                                        )
                                 else:
                                     v0s, v1s, corner_ownership = get_mesh_edge_specialized(
                                         mesh_id_tri,
@@ -2108,182 +2337,193 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                                         X_mesh_to_sdf,
                                         my_edge_idx,
                                     )
-                            else:
-                                v0s, v1s, corner_ownership = get_mesh_edge_specialized(
-                                    mesh_id_tri,
-                                    mesh_edge_indices,
-                                    mesh_edge_centers,
-                                    mesh_edge_halves,
-                                    edge_range_tri,
-                                    mesh_scale_tri,
-                                    X_mesh_to_sdf,
-                                    my_edge_idx,
+                                v0 = wp.cw_mul(v0s, inv_sdf_scale)
+                                v1 = wp.cw_mul(v1s, inv_sdf_scale)
+
+                                dist_unscaled, point_unscaled, best_endpoint = do_edge_sdf_collision(
+                                    texture_sdf,
+                                    mesh_id_sdf,
+                                    v0,
+                                    v1,
+                                    cached_sdf_val,
+                                    use_bvh_for_sdf,
+                                    sdf_mesh_query_type,
+                                    mesh_boundary_flags,
+                                    sdf_boundary_start,
+                                    sdf_is_hfield,
+                                    hfd_sdf,
+                                    heightfield_elevations,
+                                    search_precision_unscaled,
                                 )
-                            v0 = wp.cw_mul(v0s, inv_sdf_scale)
-                            v1 = wp.cw_mul(v1s, inv_sdf_scale)
 
-                            dist_unscaled, point_unscaled, best_endpoint = do_edge_sdf_collision(
-                                texture_sdf,
-                                mesh_id_sdf,
-                                v0,
-                                v1,
-                                cached_sdf_val,
-                                use_bvh_for_sdf,
-                                sdf_mesh_query_type,
-                                mesh_boundary_flags,
-                                sdf_boundary_start,
-                                sdf_is_hfield,
-                                hfd_sdf,
-                                heightfield_elevations,
-                                search_precision_unscaled,
-                            )
-
-                            # Gap may widen the edge cull enough to find
-                            # SDF minima that the inner contact shell would
-                            # not have considered. Those rows are useful as
-                            # separated detections, but an alleged inner
-                            # contact must still pass the inner cull implied
-                            # by a 1-Lipschitz signed distance field.
-                            dist_approx = dist_unscaled * min_sdf_scale
-                            bsphere_center_inner, bsphere_radius_inner = get_edge_bounding_sphere(v0, v1)
-                            inner_cull_consistent = mesh_sdf_contact_passes_inner_cull_consistency(
-                                dist_approx,
-                                triangle_mesh_margin + sdf_mesh_margin,
-                                cached_sdf_val,
-                                bsphere_center_inner,
-                                bsphere_radius_inner,
-                                sdf_aabb_lower,
-                                sdf_aabb_upper,
-                                min_sdf_scale,
-                                use_texture_sdf_for_search,
-                            )
-                            owns_endpoint = (
-                                best_endpoint == 0 or corner_ownership == 0 or (corner_ownership & best_endpoint) != 0
-                            )
-                            if dist_approx < contact_threshold and inner_cull_consistent and owns_endpoint:
-                                if wp.static(enable_heightfields):
-                                    if sdf_is_hfield:
-                                        dist_unscaled, direction_unscaled = sample_sdf_grad_heightfield(
-                                            hfd_sdf, heightfield_elevations, point_unscaled
-                                        )
-                                    elif wp.static(not use_texture_sdf_only) and use_bvh_for_sdf:
-                                        dist_unscaled, direction_unscaled = sample_sdf_grad_using_mesh(
-                                            mesh_id_sdf,
-                                            point_unscaled,
-                                            _MESH_QUERY_MAX_DIST,
-                                            sdf_mesh_query_type,
-                                            mesh_boundary_flags,
-                                            sdf_boundary_start,
-                                        )
+                                # Gap may widen the edge cull enough to find
+                                # SDF minima that the inner contact shell would
+                                # not have considered. Those rows are useful as
+                                # separated detections, but an alleged inner
+                                # contact must still pass the inner cull implied
+                                # by a 1-Lipschitz signed distance field.
+                                dist_approx = dist_unscaled * min_sdf_scale
+                                bsphere_center_inner, bsphere_radius_inner = get_edge_bounding_sphere(v0, v1)
+                                inner_cull_consistent = mesh_sdf_contact_passes_inner_cull_consistency(
+                                    dist_approx,
+                                    triangle_mesh_margin + sdf_mesh_margin,
+                                    cached_sdf_val,
+                                    bsphere_center_inner,
+                                    bsphere_radius_inner,
+                                    sdf_aabb_lower,
+                                    sdf_aabb_upper,
+                                    min_sdf_scale,
+                                    use_texture_sdf_for_search,
+                                )
+                                owns_endpoint = (
+                                    best_endpoint == 0
+                                    or corner_ownership == 0
+                                    or (corner_ownership & best_endpoint) != 0
+                                )
+                                if dist_approx < contact_threshold and inner_cull_consistent and owns_endpoint:
+                                    if wp.static(enable_heightfields):
+                                        if sdf_is_hfield:
+                                            dist_unscaled, direction_unscaled = sample_sdf_grad_heightfield(
+                                                hfd_sdf, heightfield_elevations, point_unscaled
+                                            )
+                                        elif wp.static(not use_texture_sdf_only) and use_bvh_for_sdf:
+                                            dist_unscaled, direction_unscaled = sample_sdf_grad_using_mesh(
+                                                mesh_id_sdf,
+                                                point_unscaled,
+                                                _MESH_QUERY_MAX_DIST,
+                                                sdf_mesh_query_type,
+                                                mesh_boundary_flags,
+                                                sdf_boundary_start,
+                                            )
+                                        else:
+                                            # Brent already produced the SDF value at
+                                            # ``point_unscaled``; skip the redundant value
+                                            # sample inside the gradient call and reuse
+                                            # ``dist_unscaled`` from Brent.
+                                            direction_unscaled = wp.static(sample_grad)(texture_sdf, point_unscaled)
                                     else:
-                                        # Brent already produced the SDF value at
-                                        # ``point_unscaled``; skip the redundant value
-                                        # sample inside the gradient call and reuse
-                                        # ``dist_unscaled`` from Brent.
-                                        direction_unscaled = wp.static(sample_grad)(texture_sdf, point_unscaled)
-                                else:
-                                    if wp.static(not use_texture_sdf_only) and use_bvh_for_sdf:
-                                        dist_unscaled, direction_unscaled = sample_sdf_grad_using_mesh(
-                                            mesh_id_sdf,
-                                            point_unscaled,
-                                            _MESH_QUERY_MAX_DIST,
-                                            sdf_mesh_query_type,
-                                            mesh_boundary_flags,
-                                            sdf_boundary_start,
-                                        )
-                                    else:
-                                        # Brent already produced the SDF value at
-                                        # ``point_unscaled``; skip the redundant value
-                                        # sample inside the gradient call and reuse
-                                        # ``dist_unscaled`` from Brent.
-                                        direction_unscaled = wp.static(sample_grad)(texture_sdf, point_unscaled)
+                                        if wp.static(not use_texture_sdf_only) and use_bvh_for_sdf:
+                                            dist_unscaled, direction_unscaled = sample_sdf_grad_using_mesh(
+                                                mesh_id_sdf,
+                                                point_unscaled,
+                                                _MESH_QUERY_MAX_DIST,
+                                                sdf_mesh_query_type,
+                                                mesh_boundary_flags,
+                                                sdf_boundary_start,
+                                            )
+                                        else:
+                                            # Brent already produced the SDF value at
+                                            # ``point_unscaled``; skip the redundant value
+                                            # sample inside the gradient call and reuse
+                                            # ``dist_unscaled`` from Brent.
+                                            direction_unscaled = wp.static(sample_grad)(texture_sdf, point_unscaled)
 
-                                if wp.static(use_identity_sdf_scale):
-                                    dist = dist_unscaled
-                                    direction = direction_unscaled
-                                    point = point_unscaled
-                                else:
-                                    dist, direction = scale_sdf_result_to_world(
-                                        dist_unscaled, direction_unscaled, sdf_scale, inv_sdf_scale, min_sdf_scale
+                                    if wp.static(use_identity_sdf_scale):
+                                        dist = dist_unscaled
+                                        direction = direction_unscaled
+                                        point = point_unscaled
+                                    else:
+                                        dist, direction = scale_sdf_result_to_world(
+                                            dist_unscaled, direction_unscaled, sdf_scale, inv_sdf_scale, min_sdf_scale
+                                        )
+                                        point = wp.cw_mul(point_unscaled, sdf_scale)
+                                    X_tri_ws = shape_transform[tri_shape]
+                                    X_sdf_ws = shape_transform[sdf_shape]
+                                    point_world = wp.transform_point(X_sdf_ws, point)
+
+                                    direction_world = wp.transform_vector(X_sdf_ws, direction)
+                                    direction_len_sq = wp.length_sq(direction_world)
+                                    if direction_len_sq > 0.0:
+                                        direction_world = direction_world * _sdf_rsqrt_rn(direction_len_sq)
+                                    else:
+                                        fallback_dir = point_world - wp.transform_get_translation(X_sdf_ws)
+                                        fallback_len_sq = wp.length_sq(fallback_dir)
+                                        if fallback_len_sq > 0.0:
+                                            direction_world = fallback_dir * _sdf_rsqrt_rn(fallback_len_sq)
+                                        else:
+                                            direction_world = wp.vec3(0.0, 1.0, 0.0)
+
+                                    contact_normal = -direction_world if mode == 0 else direction_world
+                                    position_local_tri = wp.quat_rotate_inv(
+                                        wp.transform_get_rotation(X_tri_ws),
+                                        point_world - wp.transform_get_translation(X_tri_ws),
                                     )
-                                    point = wp.cw_mul(point_unscaled, sdf_scale)
-                                X_tri_ws = shape_transform[tri_shape]
-                                X_sdf_ws = shape_transform[sdf_shape]
-                                point_world = wp.transform_point(X_sdf_ws, point)
-
-                                direction_world = wp.transform_vector(X_sdf_ws, direction)
-                                direction_len_sq = wp.length_sq(direction_world)
-                                if direction_len_sq > 0.0:
-                                    direction_world = direction_world * _sdf_rsqrt_rn(direction_len_sq)
-                                else:
-                                    fallback_dir = point_world - wp.transform_get_translation(X_sdf_ws)
-                                    fallback_len_sq = wp.length_sq(fallback_dir)
-                                    if fallback_len_sq > 0.0:
-                                        direction_world = fallback_dir * _sdf_rsqrt_rn(fallback_len_sq)
-                                    else:
-                                        direction_world = wp.vec3(0.0, 1.0, 0.0)
-
-                                contact_normal = -direction_world if mode == 0 else direction_world
-                                position_local_tri = wp.quat_rotate_inv(
-                                    wp.transform_get_rotation(X_tri_ws),
-                                    point_world - wp.transform_get_translation(X_tri_ws),
-                                )
-                                aabb_lower_tri = shape_collision_aabb_lower[tri_shape]
-                                aabb_upper_tri = shape_collision_aabb_upper[tri_shape]
-                                voxel_res_tri = shape_voxel_resolution[tri_shape]
-                                margin_sum = triangle_mesh_margin + sdf_mesh_margin
-                                midpoint = (
-                                    wp.transform_get_translation(X_tri_ws) + wp.transform_get_translation(X_sdf_ws)
-                                ) * 0.5
-                                inner_spatial_depth = margin_sum
-                                if use_texture_sdf_for_search:
-                                    inner_spatial_depth += wp.min(texture_voxel_radius * min_sdf_scale, base_gap_sum)
-                                outer_spatial_depth = margin_sum + gap_sum
-                                if wp.static(speculative):
-                                    # Keep velocity-expanded search candidates out of the regular
-                                    # normal bins so the predictive pair manifold remains bounded.
-                                    outer_spatial_depth = margin_sum + base_gap_sum
-                                contact_id = _export_and_reduce_contact_centered_two_spatial_depths(
-                                    shape_a,
-                                    shape_b,
-                                    point_world,
-                                    contact_normal,
-                                    dist,
-                                    (my_edge_idx << 2) | (mode << 1),
-                                    point_world - midpoint,
-                                    inner_spatial_depth,
-                                    outer_spatial_depth,
-                                    position_local_tri,
-                                    aabb_lower_tri,
-                                    aabb_upper_tri,
-                                    voxel_res_tri,
-                                    reducer_data,
-                                    wp.static(reducer_deterministic),
-                                )
-                                if wp.static(speculative):
-                                    if dist >= inner_spatial_depth:
-                                        export_and_reduce_predictive_contact(
+                                    aabb_lower_tri = shape_collision_aabb_lower[tri_shape]
+                                    aabb_upper_tri = shape_collision_aabb_upper[tri_shape]
+                                    voxel_res_tri = shape_voxel_resolution[tri_shape]
+                                    margin_sum = triangle_mesh_margin + sdf_mesh_margin
+                                    midpoint = (
+                                        wp.transform_get_translation(X_tri_ws) + wp.transform_get_translation(X_sdf_ws)
+                                    ) * 0.5
+                                    inner_spatial_depth = margin_sum
+                                    if use_texture_sdf_for_search:
+                                        inner_spatial_depth += wp.min(
+                                            texture_voxel_radius * min_sdf_scale, base_gap_sum
+                                        )
+                                    outer_spatial_depth = margin_sum + gap_sum
+                                    # The depth the contact reaches by the end of the step: the shapes' motion is known
+                                    # with speculation, so a candidate its points' closing speed (rotation included)
+                                    # carries into contact this step competes as touching for the bin's extremes.
+                                    step_end_depth = dist
+                                    if wp.static(speculative):
+                                        # Keep velocity-expanded search candidates out of the regular
+                                        # normal bins so the predictive pair manifold remains bounded.
+                                        outer_spatial_depth = margin_sum + base_gap_sum
+                                        unit_normal = wp.normalize(contact_normal)
+                                        closing_speed = compute_contact_approach_speed(
                                             shape_a,
                                             shape_b,
-                                            point_world,
-                                            contact_normal,
-                                            dist,
-                                            margin_sum,
-                                            0.0,
-                                            0.0,
-                                            (my_edge_idx << 2) | (mode << 1),
+                                            point_world - unit_normal * (0.5 * dist),
+                                            point_world + unit_normal * (0.5 * dist),
+                                            unit_normal,
                                             shape_transform,
                                             shape_linear_velocity,
                                             shape_angular_velocity,
-                                            collision_update_dt,
-                                            max_speculative_extension,
-                                            contact_id,
-                                            reducer_data,
                                         )
+                                        step_end_depth = dist - closing_speed * collision_update_dt
+                                    contact_id = _export_and_reduce_contact_centered_two_spatial_depths(
+                                        shape_a,
+                                        shape_b,
+                                        point_world,
+                                        contact_normal,
+                                        dist,
+                                        step_end_depth,
+                                        (my_edge_idx << 2) | (mode << 1),
+                                        point_world - midpoint,
+                                        inner_spatial_depth,
+                                        outer_spatial_depth,
+                                        position_local_tri,
+                                        aabb_lower_tri,
+                                        aabb_upper_tri,
+                                        voxel_res_tri,
+                                        reducer_data,
+                                        wp.static(reducer_deterministic),
+                                    )
+                                    if wp.static(speculative):
+                                        if dist >= inner_spatial_depth:
+                                            export_and_reduce_predictive_contact(
+                                                shape_a,
+                                                shape_b,
+                                                point_world,
+                                                contact_normal,
+                                                dist,
+                                                margin_sum,
+                                                0.0,
+                                                0.0,
+                                                (my_edge_idx << 2) | (mode << 1),
+                                                shape_transform,
+                                                shape_linear_velocity,
+                                                shape_angular_velocity,
+                                                collision_update_dt,
+                                                max_speculative_extension,
+                                                contact_id,
+                                                reducer_data,
+                                            )
 
-                    # Cooperative reset before the next outer iteration —
-                    # see the matching ``tile_stack_clear`` call in
-                    # ``mesh_sdf_collision_kernel``.
-                    wp.tile_stack_clear(edge_stack)
+                        # Defensive cooperative reset before the next outer
+                        # iteration — see the matching ``tile_stack_clear``
+                        # call in ``mesh_sdf_collision_kernel`` for
+                        # rationale.
+                        wp.tile_stack_clear(edge_stack)
 
     return mesh_sdf_collision_global_reduce_kernel

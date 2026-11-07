@@ -1,0 +1,1 @@
+Internal FeatherPGS test and instrumentation switches: the held-tree owners read FEATHER_PGS_TREE_REFERENCE and FEATHER_PGS_STAGE_CLOCKS once and pass them to the kernel factories as cache-key arguments.

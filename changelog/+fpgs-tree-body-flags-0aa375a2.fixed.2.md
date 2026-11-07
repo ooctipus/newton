@@ -1,0 +1,1 @@
+Keep the contact rows of a moving kinematic body under FeatherPGS cached tree dynamics with point friction in matrix-free mode, as ordinary dynamics does; the resolved-world classifier took a free body made kinematic at runtime, or a kinematic articulation root with dynamic links, as still and skipped the first step of its contact with a dynamic body.

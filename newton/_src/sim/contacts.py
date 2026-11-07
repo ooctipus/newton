@@ -3,17 +3,96 @@
 
 from __future__ import annotations
 
+import itertools
 import warnings
-from typing import Literal
+import weakref
+from typing import Any, Literal, NamedTuple
 
 import warp as wp
 from warp import DeviceLike as Devicelike
 
+from ..core.contact_pool import ContactField, ContactPool, ContactRows
 from ..exceptions import NewtonDeprecationWarning
 from ..geometry.tri_mesh_collision import TriMeshCollisionInfo, build_tri_mesh_collision_info
 
 GENERATION_SENTINEL = -1
 """Value reserved as an impossible generation; the increment kernel skips it."""
+
+
+class ContactFrameWrite(NamedTuple):
+    """The last write of a contact stream's frame that the host issued (:func:`note_contact_frame_write`)."""
+
+    tick: int
+    """Position of the write in host program order; ticks are never reused."""
+    scope: tuple[int, int | None] | None
+    """Capture scope the write's launches were recorded in (:func:`capture_scope`); ``None`` when eager."""
+
+
+_FRAME_TICKS = itertools.count(1)
+_CAPTURE_SERIALS = itertools.count(1)
+# Keyed by a contact stream's generation counter, the array that names the
+# stream for its consumers; an entry dies with its counter.
+_FRAME_WRITES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _registered_capture(device):
+    """Return the Warp graph recording ``device``'s current CUDA stream, if any."""
+    if not device.is_cuda:
+        return None
+    # Warp registers wp.capture_begin/ScopedCapture graphs here, including
+    # external captures introduced with capture_begin(external=True).
+    # Reading the registry avoids a CUDA driver is-capturing query on every
+    # ordinary solver step.
+    return getattr(device, "captures", {}).get(wp.get_stream(device))
+
+
+def capture_scope(device) -> tuple[int, int | None] | None:
+    """Return the scope that launches on ``device``'s current stream are captured in, or ``None`` when eager.
+
+    A scope is one Warp graph capture, named by a serial attached to its
+    :class:`warp.Graph` that is never reused, together with the raw graph its
+    launches go to. Warp swaps that raw graph while it records the body of a
+    conditional node (:func:`warp.capture_if`, :func:`warp.capture_while`), so
+    each body is a scope of its own; the main graph's handle reads ``None``
+    until the capture first pauses. CPU captures and captures Warp does not
+    know about count as eager.
+    """
+    graph = _registered_capture(device)
+    if graph is None:
+        return None
+    serial = getattr(graph, "_newton_capture_serial", None)
+    if serial is None:
+        serial = graph._newton_capture_serial = next(_CAPTURE_SERIALS)
+    handle = getattr(graph, "graph", None)
+    return serial, getattr(handle, "value", handle)
+
+
+def note_contact_frame_write(generation: wp.array) -> ContactFrameWrite:
+    """Record that launches issued now rewrite the contact frame counted by ``generation``.
+
+    Every Newton writer of a contact stream notes its writes here, keyed by the
+    stream's ``contact_generation`` array: :meth:`newton.CollisionPipeline.collide`,
+    :meth:`Contacts.clear` (also where a converter such as Kamino's clears its
+    output first), :meth:`newton.solvers.SolverMuJoCo.update_contacts` and the
+    contact filters of the coupled solvers. Code outside Newton that rewrites a
+    contact stream in place notes nothing; it calls :meth:`Contacts.clear` first.
+    Consumers that reuse work derived from one frame across captured steps
+    (FeatherPGS patch friction) compare ticks to learn whether the host issued
+    a write since. Captured writes repeat on every replay, so a tick says only
+    that the host issued one; the scope says where it was recorded.
+
+    Args:
+        generation: The contact stream's ``contact_generation`` array.
+    """
+    write = ContactFrameWrite(next(_FRAME_TICKS), capture_scope(generation.device))
+    _FRAME_WRITES[generation] = write
+    return write
+
+
+def contact_frame_write(generation: wp.array) -> ContactFrameWrite | None:
+    """Return the last write noted for the contact stream counted by ``generation``, or ``None``."""
+    return _FRAME_WRITES.get(generation)
+
 
 _RIGID_CONTACT_DIFF_REPLACEMENTS = {
     "rigid_contact_diff_distance": (
@@ -46,6 +125,27 @@ def _increment_contact_generation(generation: wp.array[wp.int32]):
     else:
         g = g + 1
     generation[0] = g
+
+
+@wp.kernel(enable_backward=False)
+def _fill_rows(rows: wp.array[wp.int32], values: wp.array[Any], value: Any):
+    """Fill every ready row of a per-contact array."""
+    i = wp.tid()
+    if i < rows[0]:
+        values[i] = value
+
+
+@wp.kernel(enable_backward=False)
+def _fill_past_rows(rows: wp.array[wp.int32], values: wp.array[Any], value: Any):
+    """Fill the rows a per-contact array holds past its ready rows (e.g. soft contacts' forces)."""
+    values[rows[0] + wp.tid()] = value
+
+
+# Declared with the module, so a first debug clear adds no overload to a loaded module.
+for _dtype in (wp.int32, wp.float32, wp.vec3, wp.spatial_vector):
+    for _kernel in (_fill_rows, _fill_past_rows):
+        wp.overload(_kernel, {"rows": wp.array[wp.int32], "values": wp.array[_dtype], "value": _dtype})
+del _dtype, _kernel
 
 
 @wp.kernel(enable_backward=False)
@@ -116,6 +216,36 @@ def contact_surface_point(
     return wp.transform_point(X_wb, point_local + offset_local)
 
 
+CAPACITY_BLOCKS_PER_SM = 8
+"""256-thread blocks per SM of a capped launch over a contact buffer's capacity.
+
+8 x 256 = 2,048 threads, the most one SM holds, so the capped grid fills every SM at least
+once: one wave on 2,048-thread SMs, about 1.33 on 1,536-thread SMs such as sm_86, sm_89 and
+sm_120, and more where registers limit residency. A busy buffer keeps full occupancy, and a
+mostly empty one schedules about a wave instead of a block per 256 slots.
+"""
+
+
+def contact_capacity_blocks(device: wp.Device) -> int:
+    """Block count for a launch over a contact buffer's capacity whose threads exit past the live count.
+
+    A grid-stride kernel visits every slot whatever its block count, so a grid of
+    :data:`CAPACITY_BLOCKS_PER_SM` blocks per SM, about one wave, replaces one block per 256
+    slots. A lean kernel, compiled without the grid-stride loop, cannot take a block cap.
+
+    Args:
+        device: The launch device.
+
+    Returns:
+        The ``max_blocks`` of :func:`warp.launch`: :data:`CAPACITY_BLOCKS_PER_SM` per SM on CUDA;
+        0 (uncapped) on CPU and while ``warp.config.default_grid_stride`` is off, under which Warp
+        compiles the consumers lean. Callers read it at construction.
+    """
+    if not device.is_cuda or not getattr(wp.config, "default_grid_stride", True):
+        return 0
+    return CAPACITY_BLOCKS_PER_SM * int(device.sm_count)
+
+
 class Contacts:
     """
     Stores contact information for rigid and soft body collisions, to be consumed by a solver.
@@ -123,6 +253,22 @@ class Contacts:
     This class manages buffers for contact data such as positions, normals, margins, and shape indices
     for both rigid-rigid and soft-rigid contacts. The buffers are allocated on the specified device and can
     optionally require gradients for differentiable simulation.
+
+    Every rigid contact array holds :attr:`rigid_contact_max` rows, the rows the buffer holds
+    now. A :meth:`newton.CollisionPipeline.contacts` buffer holds its model's contact rows, which
+    start at a few thousand and grow from the measured and forecast demand, limited only by the
+    device memory: a collision pass outside graph capture grows them as it needs, and
+    :meth:`newton.CollisionPipeline.service_capacity` grows them between graph replays; a solver
+    writing contacts of its own declares them with
+    :meth:`reserve_rigid_contacts`. Growth and trims replace the array attributes with other views
+    (on CUDA, of the same memory), so read them from this object rather than keeping them. After a collision pass :attr:`rigid_contact_count` never
+    exceeds the rows: the pass drops the contacts past them and flags its capacity status.
+
+    On CUDA with ``gpu_components``, graphs whose contact launches follow the rows (the collision
+    pipeline's and :class:`~newton.solvers.SolverFeatherPGS`'s) keep working after growth without a
+    recapture. A capture that reads :attr:`rigid_contact_max`, as other consumers do to size their
+    launches, must be recaptured after growth, which
+    :meth:`newton.CollisionPipeline.service_capacity` reports.
 
     .. experimental::
 
@@ -182,12 +328,17 @@ class Contacts:
         soft_self_contact_vertex_buffer_pre_alloc: int = 16,
         soft_self_contact_edge_buffer_pre_alloc: int = 32,
         soft_self_contact_record_triangle_vertices: bool = False,
+        rigid_contact_pool: ContactPool | None = None,
     ):
         """
         Initialize Contacts storage.
 
         Args:
-            rigid_contact_max: Maximum number of rigid contacts
+            rigid_contact_max: Initial rows of the rigid arrays of a buffer built directly, which
+                grow as needed: the sizing input for code that builds its own ``Contacts`` (for
+                example to hold a solver's own contacts, see :meth:`reserve_rigid_contacts`).
+                Ignored when ``rigid_contact_pool`` is given: the arrays then hold the pool's ready
+                rows, as for :meth:`newton.CollisionPipeline.contacts`.
             soft_contact_max: Maximum number of soft contacts
             soft_contact_tids_size: Length of the internal per-thread replay-index array
                 (``soft_contact_tids``) used for differentiable backward. Defaults to
@@ -233,6 +384,10 @@ class Contacts:
                 pairs beyond it are silently dropped during detection.
             soft_self_contact_record_triangle_vertices: Also record per-triangle
                 contacting vertices.
+            rigid_contact_pool: Internal: the rigid contact rows of the
+                :class:`newton.CollisionPipeline` that creates this buffer
+                (:meth:`newton.CollisionPipeline.contacts`). The rigid arrays then
+                hold the pool's ready rows and grow with it.
 
         .. experimental::
 
@@ -270,19 +425,58 @@ class Contacts:
             Solvers can compare this against a cached value to detect whether the
             contact set changed since the last conversion pass."""
 
-            # rigid contacts — never requires_grad (narrow phase has enable_backward=False)
-            self.rigid_contact_point_id = wp.zeros(rigid_contact_max, dtype=wp.int32)
-            self.rigid_contact_shape0 = wp.full(rigid_contact_max, -1, dtype=wp.int32)
-            self.rigid_contact_shape1 = wp.full(rigid_contact_max, -1, dtype=wp.int32)
-            self.rigid_contact_point0 = wp.zeros(rigid_contact_max, dtype=wp.vec3)
+            # Rigid contact arrays -- never requires_grad (narrow phase has enable_backward=False).
+            # They are views of a contact pool's ready rows: rigid_contact_max always equals
+            # their length, and they grow with the pool (see newton._src.core.contact_pool).
+            if rigid_contact_pool is None:
+                rigid_contact_pool = ContactPool(device=wp.get_device(), rows=rigid_contact_max)
+            self._rigid_contact_pool = rigid_contact_pool
+            rigid_contact_max = rigid_contact_pool.ready
+            rigid_fields = [
+                ContactField("rigid_contact_point_id", wp.int32),
+                ContactField("rigid_contact_shape0", wp.int32, -1),
+                ContactField("rigid_contact_shape1", wp.int32, -1),
+                ContactField("rigid_contact_point0", wp.vec3),
+                ContactField("rigid_contact_point1", wp.vec3),
+                ContactField("rigid_contact_offset0", wp.vec3),
+                ContactField("rigid_contact_offset1", wp.vec3),
+                ContactField("rigid_contact_normal", wp.vec3),
+                ContactField("rigid_contact_margin0", wp.float32),
+                ContactField("rigid_contact_margin1", wp.float32),
+                ContactField("rigid_contact_tids", wp.int32, -1),
+                ContactField("rigid_contact_force", wp.vec3),
+            ]
+            if per_contact_shape_properties:
+                rigid_fields += [
+                    ContactField(name, wp.float32)
+                    for name in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction")
+                ]
+            if rigid_contact_surface_velocity:
+                rigid_fields.append(ContactField("rigid_contact_surface_velocity", wp.vec3))
+            else:
+                self.rigid_contact_surface_velocity = None
+            if contact_matching:
+                rigid_fields.append(ContactField("rigid_contact_match_index", wp.int32, -1))
+            if contact_report:
+                rigid_fields += [
+                    ContactField("rigid_contact_new_indices", wp.int32),
+                    ContactField("rigid_contact_broken_indices", wp.int32),
+                ]
+            if requested_attributes and "force" in requested_attributes:
+                # Soft contact forces follow the rigid ones, in scratch rows past the rigid rows.
+                rigid_fields.append(
+                    ContactField("force", wp.spatial_vector, extra=soft_contact_max, requires_grad=requires_grad)
+                )
+            self.rigid_contact_point_id: wp.array[wp.int32]
+            self.rigid_contact_shape0: wp.array[wp.int32]
+            self.rigid_contact_shape1: wp.array[wp.int32]
+            self.rigid_contact_point0: wp.array[wp.vec3]
             """Body-frame contact point on shape 0 [m], shape (rigid_contact_max,), dtype :class:`vec3`."""
-            self.rigid_contact_point1 = wp.zeros(rigid_contact_max, dtype=wp.vec3)
+            self.rigid_contact_point1: wp.array[wp.vec3]
             """Body-frame contact point on shape 1 [m], shape (rigid_contact_max,), dtype :class:`vec3`."""
-            self.rigid_contact_surface_velocity = (
-                wp.zeros(rigid_contact_max, dtype=wp.vec3) if rigid_contact_surface_velocity else None
-            )
+            self.rigid_contact_surface_velocity: wp.array[wp.vec3] | None
             """World-space surface velocity of shape 1 relative to shape 0 [m/s], or None when disabled."""
-            self.rigid_contact_offset0 = wp.zeros(rigid_contact_max, dtype=wp.vec3)
+            self.rigid_contact_offset0: wp.array[wp.vec3]
             """Body-frame friction anchor offset for shape 0 [m], shape (rigid_contact_max,), dtype :class:`vec3`.
 
             Equal to the contact normal scaled by ``effective_radius + margin`` and
@@ -290,7 +484,7 @@ class Contacts:
             ``rigid_contact_point0`` to form a shifted friction anchor that accounts
             for rotational effects of finite contact thickness in tangential friction
             calculations."""
-            self.rigid_contact_offset1 = wp.zeros(rigid_contact_max, dtype=wp.vec3)
+            self.rigid_contact_offset1: wp.array[wp.vec3]
             """Body-frame friction anchor offset for shape 1 [m], shape (rigid_contact_max,), dtype :class:`vec3`.
 
             Equal to the contact normal scaled by ``effective_radius + margin`` and
@@ -298,25 +492,79 @@ class Contacts:
             ``rigid_contact_point1`` to form a shifted friction anchor that accounts
             for rotational effects of finite contact thickness in tangential friction
             calculations."""
-            self.rigid_contact_normal = wp.zeros(rigid_contact_max, dtype=wp.vec3)
+            self.rigid_contact_normal: wp.array[wp.vec3]
             """Contact normal pointing from shape 0 toward shape 1 (A-to-B) [unitless], shape (rigid_contact_max,), dtype :class:`vec3`."""
-            self.rigid_contact_margin0 = wp.zeros(rigid_contact_max, dtype=wp.float32)
+            self.rigid_contact_margin0: wp.array[wp.float32]
             """Surface thickness for shape 0: effective radius + margin [m], shape (rigid_contact_max,), dtype float."""
-            self.rigid_contact_margin1 = wp.zeros(rigid_contact_max, dtype=wp.float32)
+            self.rigid_contact_margin1: wp.array[wp.float32]
             """Surface thickness for shape 1: effective radius + margin [m], shape (rigid_contact_max,), dtype float."""
-            self.rigid_contact_tids = wp.full(rigid_contact_max, -1, dtype=wp.int32)
+            self.rigid_contact_tids: wp.array[wp.int32]
             # to be filled by the solver (currently unused)
-            self.rigid_contact_force = wp.zeros(rigid_contact_max, dtype=wp.vec3)
+            self.rigid_contact_force: wp.array[wp.vec3]
             """Contact force [N], shape (rigid_contact_max,), dtype :class:`vec3`."""
+            # Optional rigid arrays default to None; the rows below assign the allocated ones.
+            self.rigid_contact_stiffness = None
+            """Per-contact stiffness [N/m], shape (rigid_contact_max,), dtype float."""
+            self.rigid_contact_damping = None
+            """Per-contact damping [N·s/m], shape (rigid_contact_max,), dtype float."""
+            self.rigid_contact_friction = None
+            """Per-contact friction coefficient [dimensionless], shape (rigid_contact_max,), dtype float."""
+            self.rigid_contact_match_index = None
+            """Per-contact match index from frame-to-frame matching.
 
-            # Deprecated compatibility outputs, retained for one deprecation cycle.
+            Non-negative elements index matching contacts in the previous sorted contact buffer.
+            Negative elements indicate new or broken contacts.
+            Shape (rigid_contact_max,), dtype int32."""
+            self.rigid_contact_new_indices = None
+            """Indices of new contacts in the current sorted buffer.
+
+            Valid after the collision pipeline runs.
+            Shape (rigid_contact_max,), dtype int32."""
+            self.rigid_contact_broken_indices = None
+            """Indices of broken contacts in the previous frame's sorted buffer.
+
+            Valid after the collision pipeline runs.
+            Shape (rigid_contact_max,), dtype int32."""
+            self.force: wp.array | None = None
+            """Contact forces (spatial) [N, N·m], shape (rigid_contact_max + soft_contact_max,), dtype :class:`spatial_vector`.
+            Force and torque exerted on body0 by body1, referenced to the center of mass (COM) of body0, and in world frame, where body0 and body1 are the bodies of shape0 and shape1.
+            First three entries: linear force [N]; last three entries: torque (moment) [N·m].
+            When both rigid and soft contacts are present, soft contact forces follow rigid contact forces.
+
+            Rigid contact ``i`` occupies row ``i``; soft contact ``i`` occupies row ``rigid_contact_max + i``.
+
+            For a soft contact the contacted shape (:attr:`soft_contact_shape`) takes the role of shape0 and the
+            soft feature -- particle, edge, or face -- the role of shape1: the row holds the force exerted on the
+            shape's body by the soft feature, applied at the shape-side contact point (:attr:`soft_contact_body_pos`
+            in world space), and its torque about that body's COM, or about the world origin when the shape is
+            static. Negating the force gives the force on the soft contact point. Which rows a solver populates
+            is documented by its ``update_contacts`` method; unpopulated rows are left unwritten.
+            :meth:`newton.solvers.SolverFeatherPGS.update_contacts` exports only the linear components and
+            leaves torque zero.
+
+            .. deprecated:: 1.7
+                Request :attr:`newton.solvers.SolverBase.ObservableKind.CONTACT_F` and read
+                :attr:`newton.solvers.SolverBase.Observables.contact_f` instead.
+            """
+            self._rigid_rows: ContactRows = rigid_contact_pool.rows(rigid_fields, on_rows=self._on_rigid_rows)
+
+            # Deprecated compatibility outputs, retained for one deprecation cycle. They grow with
+            # the rigid rows, as arrays with gradients that growth reallocates.
             if requires_grad:
-                self._rigid_contact_diff_distance = wp.zeros(rigid_contact_max, dtype=wp.float32, requires_grad=True)
+                self._rigid_contact_diff_distance: wp.array[wp.float32]
                 """Differentiable signed distance [m], shape (rigid_contact_max,), dtype float."""
-                self._rigid_contact_diff_point0_world = wp.zeros(rigid_contact_max, dtype=wp.vec3, requires_grad=True)
+                self._rigid_contact_diff_point0_world: wp.array[wp.vec3]
                 """World-space contact point on shape 0 [m], shape (rigid_contact_max,), dtype :class:`vec3`."""
-                self._rigid_contact_diff_point1_world = wp.zeros(rigid_contact_max, dtype=wp.vec3, requires_grad=True)
+                self._rigid_contact_diff_point1_world: wp.array[wp.vec3]
                 """World-space contact point on shape 1 [m], shape (rigid_contact_max,), dtype :class:`vec3`."""
+                self._rigid_diff_rows: ContactRows = rigid_contact_pool.rows(
+                    (
+                        ContactField("_rigid_contact_diff_distance", wp.float32, requires_grad=True),
+                        ContactField("_rigid_contact_diff_point0_world", wp.vec3, requires_grad=True),
+                        ContactField("_rigid_contact_diff_point1_world", wp.vec3, requires_grad=True),
+                    ),
+                    on_rows=self._on_diff_rows,
+                )
             else:
                 self._rigid_contact_diff_distance = None
                 """Differentiable signed distance [m], shape (rigid_contact_max,), dtype float."""
@@ -328,33 +576,9 @@ class Contacts:
             # default; retain a separate array only if a caller assigns one.
             self._rigid_contact_diff_normal_override = None
 
-            # contact stiffness/damping/friction (only allocated if per_contact_shape_properties is enabled)
-            if self.per_contact_shape_properties:
-                self.rigid_contact_stiffness = wp.zeros(rigid_contact_max, dtype=wp.float32)
-                """Per-contact stiffness [N/m], shape (rigid_contact_max,), dtype float."""
-                self.rigid_contact_damping = wp.zeros(rigid_contact_max, dtype=wp.float32)
-                """Per-contact damping [N·s/m], shape (rigid_contact_max,), dtype float."""
-                self.rigid_contact_friction = wp.zeros(rigid_contact_max, dtype=wp.float32)
-                """Per-contact friction coefficient [dimensionless], shape (rigid_contact_max,), dtype float."""
-            else:
-                self.rigid_contact_stiffness = None
-                """Per-contact stiffness [N/m], shape (rigid_contact_max,), dtype float."""
-                self.rigid_contact_damping = None
-                """Per-contact damping [N·s/m], shape (rigid_contact_max,), dtype float."""
-                self.rigid_contact_friction = None
-                """Per-contact friction coefficient [dimensionless], shape (rigid_contact_max,), dtype float."""
-
-            # Contact matching index — filled by the collision pipeline when
-            # contact_matching is enabled.
             self.contact_matching = contact_matching
             self.contact_report = contact_report
             if contact_matching:
-                self.rigid_contact_match_index = wp.full(rigid_contact_max, -1, dtype=wp.int32)
-                """Per-contact match index from frame-to-frame matching.
-
-                Non-negative elements index matching contacts in the previous sorted contact buffer.
-                Negative elements indicate new or broken contacts.
-                Shape (rigid_contact_max,), dtype int32."""
                 self.rigid_contact_match_generation = wp.full(1, GENERATION_SENTINEL, dtype=wp.int32)
                 """:attr:`contact_generation` of this buffer's contact set that
                 :attr:`rigid_contact_match_index` refers to.
@@ -365,28 +589,15 @@ class Contacts:
                 per-contact state across frames can compare it with the generation they
                 saved. Shape (1,), dtype int32."""
             else:
-                self.rigid_contact_match_index = None
                 self.rigid_contact_match_generation = None
 
             if contact_report:
-                self.rigid_contact_new_indices = wp.zeros(rigid_contact_max, dtype=wp.int32)
-                """Indices of new contacts in the current sorted buffer.
-
-                Valid after the collision pipeline runs.
-                Shape (rigid_contact_max,), dtype int32."""
                 self.rigid_contact_new_count = wp.zeros(1, dtype=wp.int32)
                 """Device-side count of new contacts (single-element int32)."""
-                self.rigid_contact_broken_indices = wp.zeros(rigid_contact_max, dtype=wp.int32)
-                """Indices of broken contacts in the previous frame's sorted buffer.
-
-                Valid after the collision pipeline runs.
-                Shape (rigid_contact_max,), dtype int32."""
                 self.rigid_contact_broken_count = wp.zeros(1, dtype=wp.int32)
                 """Device-side count of broken contacts (single-element int32)."""
             else:
-                self.rigid_contact_new_indices = None
                 self.rigid_contact_new_count = None
-                self.rigid_contact_broken_indices = None
                 self.rigid_contact_broken_count = None
 
             # requires_grad flows through the soft-contact arrays below for differentiable simulation.
@@ -468,28 +679,6 @@ class Contacts:
             # lives at the consuming solver. Kept private to avoid a public API/deprecation surface.
             self._enable_rigid_soft_full_surface_contact = False
 
-            # Deprecated contact attributes (optional compatibility allocation)
-            self.force: wp.array | None = None
-            """Contact forces (spatial) [N, N·m], shape (rigid_contact_max + soft_contact_max,), dtype :class:`spatial_vector`.
-            Force and torque exerted on body0 by body1, referenced to the center of mass (COM) of body0, and in world frame, where body0 and body1 are the bodies of shape0 and shape1.
-            First three entries: linear force [N]; last three entries: torque (moment) [N·m].
-            Rigid contact ``i`` occupies row ``i``; soft contact ``i`` occupies row ``rigid_contact_max + i``.
-
-            For a soft contact the contacted shape (:attr:`soft_contact_shape`) takes the role of shape0 and the
-            soft feature -- particle, edge, or face -- the role of shape1: the row holds the force exerted on the
-            shape's body by the soft feature, applied at the shape-side contact point (:attr:`soft_contact_body_pos`
-            in world space), and its torque about that body's COM, or about the world origin when the shape is
-            static. Negating the force gives the force on the soft contact point. Which rows a solver populates
-            is documented by its ``update_contacts`` method; unpopulated rows are left unwritten.
-
-            .. deprecated:: 1.7
-                Request :attr:`newton.solvers.SolverBase.ObservableKind.CONTACT_F` and read
-                :attr:`newton.solvers.SolverBase.Observables.contact_f` instead.
-            """
-            if requested_attributes and "force" in requested_attributes:
-                total_contacts = rigid_contact_max + soft_contact_max
-                self.force = wp.zeros(total_contacts, dtype=wp.spatial_vector, requires_grad=requires_grad)
-
         self.soft_self_contact_data: TriMeshCollisionInfo | None = None
         """Tri-mesh self-contact results owned by this container, written by the
         collision pipeline's tri-mesh collision detector; ``None`` unless
@@ -522,9 +711,36 @@ class Contacts:
 
         self.requires_grad = requires_grad
 
-        self.rigid_contact_max = rigid_contact_max
         self.soft_contact_max = soft_contact_max
         self._rigid_contact_body_pair_reduced = False
+
+        self.rigid_contacts_pair_sorted = False
+        """Provenance: whether the pipeline that last wrote this buffer sorts
+        contacts into contiguous same-shape-pair runs (deterministic sort or
+        any contact-matching mode). Consumers whose kernels assume pair-run
+        contiguity (e.g. FeatherPGS friction anchors) must check this."""
+
+
+    def _on_rigid_rows(self, rows: ContactRows) -> None:
+        """Assign the rigid arrays at the pool's ready rows, on creation and after each growth."""
+        rows.publish(self)
+        self._rigid_contact_rows = rows.rows
+
+    @property
+    def rigid_contact_max(self) -> int:
+        """Rigid contact rows the arrays hold now: the ready rows of the buffer's contact pool.
+
+        Reading it during a CUDA graph capture sizes work there by today's rows,
+        so the capture is noted as one to recapture after the rows grow
+        (:meth:`newton.CollisionPipeline.service_capacity` reports it). Launches
+        that follow growth size themselves through the pool instead.
+        """
+        if _registered_capture(self.rigid_contact_count.device) is not None:
+            self._rigid_contact_pool.note_unbound()
+        return self._rigid_contact_rows
+
+    def _on_diff_rows(self, rows: ContactRows) -> None:
+        rows.publish(self)
 
     def clear(self, bump_generation: bool = True):
         """
@@ -544,6 +760,8 @@ class Contacts:
                 generation via another fused kernel (e.g. :func:`compute_shape_aabbs`) can pass
                 ``False`` to avoid an unnecessary double-bump per collision pass.
         """
+        # Zeroing the counts rewrites the frame whether or not the generation advances.
+        note_contact_frame_write(self.contact_generation)
         # Clear all counters and (optionally) bump generation in a single kernel launch.
         num_counters = self.contact_counters.shape[0]
         wp.launch(
@@ -557,13 +775,14 @@ class Contacts:
         if self.clear_buffers:
             # Conservative path: clear all buffers with sentinel values and zeros.
             # Slower than the fast path but may be useful for debugging or special cases.
-            self.rigid_contact_shape0.fill_(-1)
-            self.rigid_contact_shape1.fill_(-1)
-            self.rigid_contact_tids.fill_(-1)
-            self.rigid_contact_force.zero_()
+            self._fill_rigid_rows(self.rigid_contact_shape0, -1)
+            self._fill_rigid_rows(self.rigid_contact_shape1, -1)
+            self._fill_rigid_rows(self.rigid_contact_tids, -1)
+            self._fill_rigid_rows(self.rigid_contact_force, wp.vec3(0.0))
 
             if self.force is not None:
-                self.force.zero_()
+                # The rigid rows, then the soft contacts' rows past them.
+                self._fill_rigid_rows(self.force, wp.spatial_vector(), past=self.soft_contact_max)
 
             if self._rigid_contact_diff_distance is not None:
                 self._rigid_contact_diff_distance.zero_()
@@ -573,12 +792,12 @@ class Contacts:
                 self._rigid_contact_diff_normal_override.zero_()
 
             if self.per_contact_shape_properties:
-                self.rigid_contact_stiffness.zero_()
-                self.rigid_contact_damping.zero_()
-                self.rigid_contact_friction.zero_()
+                self._fill_rigid_rows(self.rigid_contact_stiffness, 0.0)
+                self._fill_rigid_rows(self.rigid_contact_damping, 0.0)
+                self._fill_rigid_rows(self.rigid_contact_friction, 0.0)
 
             if self.rigid_contact_match_index is not None:
-                self.rigid_contact_match_index.fill_(-1)
+                self._fill_rigid_rows(self.rigid_contact_match_index, -1)
                 self.rigid_contact_match_generation.fill_(GENERATION_SENTINEL)
 
             self.soft_contact_indices.fill_(wp.vec3i(-1, -1, -1))
@@ -591,6 +810,23 @@ class Contacts:
         # else: Optimized path (default) - only counter clear needed
         #   Collision detection overwrites all active contacts [0, contact_count)
         #   Solvers only read [0, contact_count), so stale data is never accessed
+
+    def _fill_rigid_rows(self, values: wp.array, value, *, past: int = 0) -> None:
+        """Fill the ready rows of a per-contact array, and ``past`` rows after them, following the rows.
+
+        In a capture whose contact launches bind, each replay fills the rows
+        ready then (:meth:`ContactPool.launch`).
+        """
+        pool = self._rigid_contact_pool
+        rows = pool.ready_rows
+        if rows is None:
+            # A pool created during capture holds its rows until a recapture.
+            pool.note_unbound()
+            values.fill_(value)
+            return
+        pool.launch(_fill_rows, pool.launch_rows(), inputs=[rows, values, value], extent=rows)
+        if past:
+            wp.launch(_fill_past_rows, dim=past, inputs=[rows, values, value], device=values.device)
 
     @property
     def rigid_contact_body_pair_reduced(self) -> bool:
@@ -612,6 +848,30 @@ class Contacts:
         Returns the device on which the contact buffers are allocated.
         """
         return self.rigid_contact_count.device
+
+    def reserve_rigid_contacts(self, count: int) -> bool:
+        """Hold at least ``count`` rigid contact rows from now on, for a solver that writes contacts of its own.
+
+        A solver that writes contacts into this buffer (e.g.
+        :meth:`newton.solvers.SolverMuJoCo.update_contacts` with MuJoCo's collision)
+        declares the most contacts it writes. Outside CUDA graph capture the rigid
+        arrays grow now, keeping their contents. During capture the growth waits,
+        with a warning, for :meth:`newton.CollisionPipeline.service_capacity` or the
+        next reservation outside capture; until then the writer drops the rows past
+        :attr:`rigid_contact_max`, holds :attr:`rigid_contact_count` at the rows kept
+        (a stream's count never exceeds its rows) and flags the drop.
+
+        Args:
+            count: Most rigid contacts the writer produces.
+
+        Returns:
+            Whether the arrays grew now and CUDA graphs that captured them must be
+            recaptured (see :meth:`~newton.CollisionPipeline.service_capacity`).
+
+        Raises:
+            MemoryError: If the device cannot back ``count`` rows of these buffers.
+        """
+        return self._rigid_contact_pool.reserve(count)
 
     @property
     def rigid_contact_diff_distance(self) -> wp.array[float] | None:

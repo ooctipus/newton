@@ -1,0 +1,1 @@
+Compile each row copy of a colored unit in `SolverFeatherPGS`'s colored sweep for its row kind (the contact, then its friction pair), as the unit builder forms units, instead of for every kind; results are bitwise unchanged.

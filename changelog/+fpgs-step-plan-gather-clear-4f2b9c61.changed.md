@@ -1,0 +1,1 @@
+Plan the matrix-free J/Y gather and the double buffer's Jacobian clear of `SolverFeatherPGS` per size at construction as well (`routes.stages.gather_dofs` and `routes.stages.jacobian_clear_dofs` of `get_path_selection()`), and dispatch the sweep launch on the plan's solve route.

@@ -1,0 +1,1 @@
+Form each friction pair's metric (its block's eigenbasis) once per colored-sweep launch of `SolverFeatherPGS`, for every staged friction unit at once, instead of with its coupling at every visit; the visits read it and solve the pair from it, so results are bitwise unchanged.

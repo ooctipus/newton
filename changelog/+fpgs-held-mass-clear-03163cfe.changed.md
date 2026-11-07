@@ -1,0 +1,1 @@
+Skip `SolverFeatherPGS`'s end-of-step clear of the double-buffered dense mass matrix for the articulation sizes whose factors the cached dynamics refresh from their own geometry, since no stage reads that matrix; `get_path_selection()["routes"]["dynamics"]["double_buffer_mass_matrix_clear_dofs"]` lists the sizes still cleared.

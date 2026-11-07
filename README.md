@@ -339,6 +339,49 @@ python -m newton.examples --describe robot_omniwheel
     </td>
   </tr>
   <tr>
+    <td colspan="3"><a href="#procedural-franka-clutter">Procedural Franka clutter: scenes and options</a> (initial views; hardware is settled at t=3 s)</td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="newton/examples/robot/example_robot_clutter.py">
+        <img width="320" src="docs/images/examples/example_robot_clutter_hardware.jpg" alt="Franka with 256 CAD hardware parts: settled capture at t=3 s">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="newton/examples/robot/example_robot_clutter.py">
+        <img width="320" src="docs/images/examples/example_robot_clutter_coins.jpg" alt="Franka above the initial coin bed and ring tower">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="newton/examples/robot/example_robot_clutter.py">
+        <img width="320" src="docs/images/examples/example_robot_clutter_dishes.jpg" alt="Franka above the initial dish rack and cutlery">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples robot_clutter --scene hardware</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples robot_clutter --scene coins</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples robot_clutter --scene dishes</code>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="newton/examples/robot/example_robot_clutter.py">
+        <img width="320" src="docs/images/examples/example_robot_clutter_cube.jpg" alt="Franka above the initial 26-cubie retained cube">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples robot_clutter --scene cube</code>
+    </td>
+  </tr>
+  <tr>
     <td colspan="3"><h3>Cable Examples</h3></td>
   </tr>
   <tr>
@@ -1194,6 +1237,98 @@ python -m newton.examples basic_urdf --device cuda:0
 # Combine options
 python -m newton.examples basic_viewer --viewer gl --num-frames 500 --device cpu
 ```
+
+### Procedural Franka clutter
+
+`robot_clutter` provides four experimental contact scenes with one Franka and
+low-polygon CAD meshes cooked to shared SDFs. All gallery images show current
+geometry except the coin image, which still shows the earlier 256-coin tower.
+Hardware is a settled capture at t=3 s; the other images show initial
+configurations, not successful manipulation outcomes.
+
+| Scene | Default objects | Construction |
+| --- | ---: | --- |
+| `hardware` | 256 | Factory M12/M16 threaded nuts/bolts, authored involute gears and bevelled washers, in a movable 240 × 160 × 55 mm bin. |
+| `coins` | 520 | A 64-coin bed and 38 complete staggered ring layers in a movable, bevelled tray with a physical loop handle. Coin size and tray footprint are unchanged. |
+| `dishes` | 40 | Curved plates/bowls, concave spoons, four-tine forks, knives and chopsticks in a movable wire rack. |
+| `cube` | 26 | A 57 mm MuJoCo-inspired contact-coupled cube: chamfered cubies, tight seams and 54 rounded facelets. |
+
+The controller solves inverse kinematics at setup, then interpolates joint
+targets with `s(u) = 6u^5 - 15u^4 + 10u^3`. After a settling interval, the arm
+grasps the bin/tray/rack handle, slides it back and forth, releases and retracts.
+The default container motion makes four cycles over a 12 cm span, with 0.40 s
+between extrema. Analytic joint-velocity targets accompany the position
+targets; gains, effort limits, contact materials and solver budgets are unchanged.
+The cube script instead grasps the top layer and rotates the wrist. These are
+open-loop scripts, not trained policies: no container welds, object pose writes,
+or prescribed cubie rotations are used at runtime.
+
+```bash
+python -m newton.examples robot_clutter --scene hardware --object-count 256 --seed 42 --solver fpgs --world-count 1 --num-frames 780
+python -m newton.examples robot_clutter --scene coins --solver fpgs --world-count 1
+python -m newton.examples robot_clutter --scene dishes --viewer null --num-frames 720 --report clutter.json
+```
+
+`--object-count` changes the loose-object count; the complete cube requires 26.
+`--world-count` replicates independent scenes. Choose `fpgs` or `mjwarp` with
+`--solver`. A two-world FPGS correctness smoke passed for coins and hardware
+with eight objects per world, independent robot targets and no capacity drops;
+this is not a full-count agitation or performance qualification.
+`--settle-seconds` defaults to 3 seconds for hardware and 2 otherwise;
+`--period` defaults to 10 seconds. `--no-motion` keeps the initial joint targets.
+`--shake-amplitude` is the half-span [m], default 0.06; `--shake-cycles` defaults
+to 4. More cycles at fixed period shorten each stroke and increase requested
+acceleration; actual motion remains limited by the physical grasp and actuators.
+`--shake-axis` defaults to Y for hardware and X for the lighter tray/rack.
+`--grasp-tilt` defaults to 30 degrees for hardware and zero otherwise; aligning
+the heavy bin's pull with its front handle reduces sideways yaw. These settings
+do not increase actuator efforts or change the contact materials.
+The old primitive-scene smoke results do not qualify the new CAD scenes.
+
+Nuts and bolts are downloaded from pinned NVIDIA Factory assets (BSD-3-Clause),
+repaired at export seams and decimated to at most 3,200 triangles **before** SDF
+construction. Gears, washers, containers and dishes are original parametric CAD.
+SDF resolution is chosen separately to preserve threads, bores, fork gaps and
+thin ceramic shells. Identical objects share meshes and SDF grids; unchanged
+cooks use Newton's content-addressed disk cache.
+
+FPGS solves every scene matrix-free on CUDA.
+
+Only FPGS hardware enables body-pair contact reduction by default, using 0.04 m
+spatial cells and zero hysteresis. `--body-pair-reduction` and
+`--no-body-pair-reduction` override that choice. MJWarp does not support this
+reduction, so the default hardware configurations are not a backend-matched
+benchmark.
+
+The MJWarp option is experimental: the previous primitive hardware scene was
+unstable with external contacts, including with only four pieces and the
+required MuJoCo/MJWarp 3.11 versions. The new CAD scenes are not qualified
+backend comparisons either.
+
+`--contacts-per-world` sizes the raw collision buffer before body-pair reduction;
+`--triangle-pairs-per-world` sizes mesh candidate storage; `--mf-rows`
+independently sizes FPGS matrix-free constraint-row storage. Reducing
+solver rows does not reduce the raw contact storage requirement. `--report`
+records the selected mode, contact and row capacities, capacity flags, and
+reduction statistics when enabled, plus source-mesh triangle counts and SDF
+voxel pitches. Test runs also report actual container travel.
+
+The cube follows the [official MuJoCo cube model](https://github.com/google-deepmind/mujoco/blob/5ceb72b1bbe87612a2859304d2c22a15cd3c180d/model/cube/cube_3x3x3.xml):
+six center hinges and twenty core-centered ball joints, coupled through tight
+cubie contacts. It is a surrogate, not commercial internal tracks. Geometry
+tests check successive face turns and resistance to isolated-piece drift;
+those tests alone do not establish a successful contact-driven robot turn.
+For isolated force/torque testing before robot integration, run:
+
+```bash
+python -m newton.examples.robot._clutter_cube_probe --device cuda:1 --mode couple --amplitudes 0 0.001 0.005 --report cube_probe.json
+```
+
+These load levels are diagnostic, not real-cube specifications. The default
+probe removes added joint inertia and damping; the scene's reference-stabilized
+settings are not physically calibrated. The probe's `--collision convex` option
+compares the same cubie geometry without SDF cooking; it also changes contact
+generation and is not an accepted mechanical fix.
 
 ## Research using Newton
 

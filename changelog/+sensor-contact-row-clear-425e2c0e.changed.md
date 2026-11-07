@@ -1,0 +1,1 @@
+Clear `SensorContact`'s accumulated outputs in the launch that updates the sensing transforms, one thread per output entry, instead of with up to six separate clears per `update()`; the readings are unchanged. `update()` now checks its contacts before writing any output, so a call it rejects also leaves `sensing_transforms` unchanged.

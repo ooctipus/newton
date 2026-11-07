@@ -1,0 +1,1 @@
+Compile the terrain law's cylinder kernels without the barrel cylinders' paths unless a barrel cylinder meets a heightfield (internal: the same rows, faster).

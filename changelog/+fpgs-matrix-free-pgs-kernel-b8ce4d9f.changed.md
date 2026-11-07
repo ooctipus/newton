@@ -1,0 +1,1 @@
+Warn about and ignore an explicit `pgs_kernel` in `SolverFeatherPGS` matrix-free mode instead of raising `ValueError`; matrix-free mode owns its sweep kernels, and the solver equals the one built with `pgs_kernel="auto"`. Omit `pgs_kernel` (or use `pgs_mode="split"`) to silence the warning; an explicit `delassus_kernel` in matrix-free mode still raises.

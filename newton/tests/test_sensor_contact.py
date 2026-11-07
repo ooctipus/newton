@@ -5,11 +5,14 @@ import inspect
 import types
 import unittest
 import warnings
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.sensors.sensor_contact import accumulate_contact_forces_kernel, prepare_sensing_rows_kernel
+from newton._src.sim.contacts import contact_capacity_blocks
 from newton._src.solvers.kamino._src.geometry import ContactAggregation
 from newton._src.utils import is_graph_capture_allocation_enabled
 from newton.sensors import SensorContact
@@ -35,6 +38,19 @@ def _make_two_world_model(device=None, include_ground=False):
     builder.end_world()
     if include_ground:
         builder.add_shape_box(body=-1, hx=0.1, hy=0.1, hz=0.1, label="ground")
+    return builder.finalize(device=device)
+
+
+def _make_wide_model(device, counterparts):
+    """Bodies A (world 0) and B (world 1), one shape each, beside ``counterparts`` global shapes ``g*``."""
+    builder = newton.ModelBuilder()
+    for world, label in enumerate(("A", "B")):
+        builder.begin_world()
+        body = builder.add_body(label=label)
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1, label=f"s{world}")
+        builder.end_world()
+    for column in range(counterparts):
+        builder.add_shape_box(body=-1, hx=0.1, hy=0.1, hz=0.1, label=f"g{column}")
     return builder.finalize(device=device)
 
 
@@ -780,6 +796,220 @@ class TestSensorContact(unittest.TestCase):
         np.testing.assert_allclose(friction[0], expected_friction, atol=1e-5)
         # Verify orthogonality
         self.assertAlmostEqual(np.dot(friction[0], n), 0.0, places=5)
+
+    def test_accumulation_matches_on_a_capped_grid(self):
+        """Accumulate over the capacity on a capped grid exactly as on the full grid.
+
+        The forces, normals and points are small integers along the axes, so every sum is exact
+        in any order: one block, which loops over all the contacts, must reproduce the full grid
+        bit for bit. CPU launches ignore the block count.
+        """
+        device = wp.get_device()
+        model = _make_two_world_model(device=device, include_ground=True)
+        contacts = _exact_contacts(device, capacity=3000, count=2600)
+        state = types.SimpleNamespace(
+            body_q=wp.array(
+                [wp.transform(wp.vec3(1.0, 2.0, 3.0), wp.quat_identity()), wp.transform_identity()],
+                dtype=wp.transform,
+                device=device,
+            )
+        )
+        outputs, blocks = [], []
+        for capped in (False, True):
+            sensor = SensorContact(model, sensing_bodies="*", counterpart_shapes="*")
+            self.assertEqual(sensor._capacity_blocks, contact_capacity_blocks(model.device))
+            if capped:
+                sensor._capacity_blocks = 1
+            launch = wp.launch
+
+            def record(kernel, *args, launch=launch, **kwargs):
+                if kernel is accumulate_contact_forces_kernel:
+                    blocks.append(kwargs.get("max_blocks", 0))
+                return launch(kernel, *args, **kwargs)
+
+            with patch.object(wp, "launch", record):
+                sensor.update(state, contacts)
+            outputs.append(
+                [
+                    getattr(sensor, name).numpy()
+                    for name in (
+                        "total_force",
+                        "total_force_friction",
+                        "force_matrix",
+                        "force_matrix_friction",
+                        "position_matrix",
+                    )
+                ]
+            )
+        self.assertEqual(blocks, [contact_capacity_blocks(model.device), 1])
+        self.assertGreater(np.abs(outputs[0][0]).sum(), 0.0)
+        self.assertGreater(np.abs(outputs[0][1]).sum(), 0.0)
+        self.assertGreater(np.abs(outputs[0][4]).sum(), 0.0)
+        for full, capped in zip(*outputs, strict=True):
+            np.testing.assert_array_equal(capped, full)
+
+    def test_update_clears_every_output_in_its_row_launch(self):
+        """Clear every accumulated output in the per-row launch, so stale readings never survive an update.
+
+        For each output layout (totals, counterparts, both) and each kind of state (body transforms,
+        no state, no transforms), a sensor whose outputs hold stale and poisoned values reads
+        bitwise what a fresh sensor reads. An update issues no separate clear: one per-row launch,
+        the accumulation, and the position normalization when positions are measured.
+        """
+        device = wp.get_device()
+        model = _make_two_world_model(device=device, include_ground=True)
+        contacts = _exact_contacts(device, capacity=400, count=300)
+        stale = _exact_contacts(device, capacity=400, count=400)
+        body_q = wp.array(
+            [wp.transform(wp.vec3(1.0, 2.0, 3.0), wp.quat_identity()), wp.transform_identity()],
+            dtype=wp.transform,
+            device=device,
+        )
+        outputs = ("total_force", "total_force_friction", "force_matrix", "force_matrix_friction", "position_matrix")
+        layouts = (
+            {"measure_total": True},
+            {"measure_total": True, "counterpart_shapes": "*"},
+            {"measure_total": False, "counterpart_shapes": "*"},
+        )
+        states = (("transforms", types.SimpleNamespace(body_q=body_q)), ("none", None))
+        states += (("no_transforms", types.SimpleNamespace(body_q=None)),)
+        for layout in layouts:
+            for label, state in states:
+                with self.subTest(**layout, state=label):
+                    fresh = SensorContact(model, sensing_bodies="*", **layout)
+                    fresh.update(state, contacts)
+                    reused = SensorContact(model, sensing_bodies="*", **layout)
+                    reused.update(types.SimpleNamespace(body_q=body_q), stale)
+                    for name in outputs:
+                        if getattr(reused, name) is not None:
+                            getattr(reused, name).fill_(99.0)
+                    launched, zeroed, launch = [], [], wp.launch
+
+                    def record(kernel, *args, launched=launched, launch=launch, **kwargs):
+                        launched.append(kernel.key)
+                        return launch(kernel, *args, **kwargs)
+
+                    def clear(array, zeroed=zeroed):
+                        zeroed.append(array)
+
+                    with patch.object(wp, "launch", record), patch.object(wp.array, "zero_", clear):
+                        reused.update(state, contacts)
+                    self.assertEqual(zeroed, [])
+                    positions = fresh.position_matrix is not None and state is not None and state.body_q is not None
+                    expected = ["prepare_sensing_rows_kernel", "accumulate_contact_forces_kernel"]
+                    self.assertEqual(launched, expected + (["normalize_contact_positions_kernel"] if positions else []))
+                    for name in outputs:
+                        if getattr(fresh, name) is None:
+                            self.assertIsNone(getattr(reused, name))
+                            continue
+                        np.testing.assert_array_equal(getattr(reused, name).numpy(), getattr(fresh, name).numpy())
+                    if state is not None and state.body_q is not None:
+                        np.testing.assert_array_equal(
+                            reused.sensing_transforms.numpy(), fresh.sensing_transforms.numpy()
+                        )
+
+    def test_row_launch_spans_every_counterpart_column(self):
+        """Prepare a wide sensor with one thread per (row, column) entry and clear every column's stale value.
+
+        Consecutive threads store consecutive columns of a row, where one thread per row would loop
+        over all forty; a sensor without counterparts launches one column. Stale, poisoned outputs
+        then read bitwise as a fresh sensor's.
+        """
+        device = wp.get_device()
+        columns = 40
+        model = _make_wide_model(device, columns)
+        pairs = [(sensing, 2 + column) for sensing in (0, 1) for column in range(columns)]
+        pairs += [(b, a) for a, b in pairs]
+        contacts = _exact_contacts(device, capacity=300, count=200, pairs=pairs)
+        stale = _exact_contacts(device, capacity=300, count=300, pairs=pairs[::-1])
+        state = types.SimpleNamespace(
+            body_q=wp.array(
+                [wp.transform(wp.vec3(1.0, 2.0, 3.0), wp.quat_identity()), wp.transform_identity()],
+                dtype=wp.transform,
+                device=device,
+            )
+        )
+        outputs = ("total_force", "total_force_friction", "force_matrix", "force_matrix_friction", "position_matrix")
+        for layout, shape in (({"counterpart_shapes": "g*"}, (2, columns)), ({}, (2, 1))):
+            with self.subTest(**layout):
+                fresh = SensorContact(model, sensing_bodies="*", **layout)
+                fresh.update(state, contacts)
+                reused = SensorContact(model, sensing_bodies="*", **layout)
+                reused.update(state, stale)
+                for name in outputs:
+                    if getattr(reused, name) is not None:
+                        getattr(reused, name).fill_(99.0)
+                dims, launch = [], wp.launch
+
+                def record(kernel, *args, dims=dims, launch=launch, **kwargs):
+                    if kernel is prepare_sensing_rows_kernel:
+                        dims.append(tuple(np.atleast_1d(kwargs["dim"])))
+                    return launch(kernel, *args, **kwargs)
+
+                with patch.object(wp, "launch", record):
+                    reused.update(state, contacts)
+                self.assertEqual(dims, [shape])
+                self.assertGreater(np.abs(fresh.total_force.numpy()).sum(), 0.0)
+                if fresh.force_matrix is not None:
+                    self.assertEqual(fresh.force_matrix.shape, shape)
+                    self.assertGreater(int((np.abs(fresh.force_matrix.numpy()).sum(axis=2) > 0).sum()), columns)
+                for name in outputs:
+                    if getattr(fresh, name) is None:
+                        self.assertIsNone(getattr(reused, name))
+                        continue
+                    np.testing.assert_array_equal(getattr(reused, name).numpy(), getattr(fresh, name).numpy(), name)
+
+    def test_rejected_update_changes_no_output(self):
+        """Reject contacts without forces before any output, the sensing transforms included, changes."""
+        device = wp.get_device()
+        model = _make_two_world_model(device=device, include_ground=True)
+        sensor = SensorContact(model, sensing_bodies="*", counterpart_shapes="*")
+        state = types.SimpleNamespace(
+            body_q=wp.array(
+                [wp.transform(wp.vec3(1.0, 2.0, 3.0), wp.quat_identity())] * 2, dtype=wp.transform, device=device
+            )
+        )
+        sensor.update(state, _exact_contacts(device, capacity=40, count=30))
+        before = {
+            name: getattr(sensor, name).numpy().copy()
+            for name in ("sensing_transforms", "total_force", "force_matrix", "position_matrix")
+        }
+        moved = types.SimpleNamespace(
+            body_q=wp.array(
+                [wp.transform(wp.vec3(-4.0, 5.0, 6.0), wp.quat_identity())] * 2, dtype=wp.transform, device=device
+            )
+        )
+        without_forces = newton.Contacts(4, 0, device=device)
+        with self.assertRaisesRegex(ValueError, "force"):
+            sensor.update(moved, without_forces)
+        for name, values in before.items():
+            np.testing.assert_array_equal(getattr(sensor, name).numpy(), values, err_msg=name)
+
+
+def _exact_contacts(device, *, capacity, count, pairs=((0, 2), (2, 0), (1, 2), (2, 1))):
+    """Contacts between shape ``pairs`` with exactly summable data.
+
+    The default pairs are the two bodies' shapes and the ground of :func:`_make_two_world_model`.
+    Forces are integer multiples of an axis, normals are signed axes and points are integers,
+    so friction components, force magnitudes and weighted midpoints are exact in float32.
+    """
+    rng = np.random.default_rng(7)
+    pairs = np.asarray(pairs, dtype=np.int32)[rng.integers(0, len(pairs), capacity)]
+    axes = np.eye(3, dtype=np.float32)
+    force = axes[rng.integers(0, 3, capacity)] * rng.integers(1, 4, (capacity, 1)).astype(np.float32)
+    normal = axes[rng.integers(0, 3, capacity)] * rng.choice([-1.0, 1.0], (capacity, 1)).astype(np.float32)
+    contacts = newton.Contacts(capacity, 0, device=device, requested_attributes={"force"})
+    with wp.ScopedDevice(device):
+        contacts.rigid_contact_shape0 = wp.array(pairs[:, 0], dtype=wp.int32)
+        contacts.rigid_contact_shape1 = wp.array(pairs[:, 1], dtype=wp.int32)
+        contacts.rigid_contact_normal = wp.array(normal, dtype=wp.vec3)
+        contacts.rigid_contact_point0 = wp.array(rng.integers(-5, 6, (capacity, 3)).astype(np.float32), dtype=wp.vec3)
+        contacts.rigid_contact_point1 = wp.array(rng.integers(-5, 6, (capacity, 3)).astype(np.float32), dtype=wp.vec3)
+        contacts.rigid_contact_offset0 = wp.zeros(capacity, dtype=wp.vec3)
+        contacts.rigid_contact_offset1 = wp.zeros(capacity, dtype=wp.vec3)
+        contacts.rigid_contact_count = wp.array([count], dtype=wp.int32)
+        contacts.force = wp.array(np.hstack([force, np.zeros_like(force)]), dtype=wp.spatial_vector)
+    return contacts
 
 
 class TestSensorContactMuJoCo(unittest.TestCase):

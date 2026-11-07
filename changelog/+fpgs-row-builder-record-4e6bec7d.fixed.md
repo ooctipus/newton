@@ -1,0 +1,1 @@
+Report the per-contact builder in `general_method_by_dof` of `SolverFeatherPGS.get_path_selection()` under the debug `FEATHER_PGS_CHECK_ROWS=1`, where it writes the rows the solve uses; the checked masked or native builder, which writes copies for the comparison, is named in `row_check_by_dof`.
