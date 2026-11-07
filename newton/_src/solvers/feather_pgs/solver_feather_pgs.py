@@ -530,7 +530,7 @@ class SolverFeatherPGS(SolverBase):
         # group's Jacobian.
         self._allocate_buffers(model)
         self.placement.allocate_world_rows(model)
-        self.sweep.place_paired(self.spec.classes.paired, self.spec.classes.reasons["K5"])
+        self.sweep.place_paired(self.spec.classes.paired)
         self.placement.allocate_sparse_diagonal_rows()
         self.placement.allocate_free_body_rows(model)
         self.factor.scatter_armature()

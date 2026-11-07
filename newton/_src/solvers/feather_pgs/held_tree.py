@@ -626,6 +626,32 @@ class HeldTree:
         """Each world class's grouping and why (:attr:`HeldClass.reason`)."""
         return tuple(held.reason for held in self.plan.classes)
 
+    def record(self, case: str) -> dict:
+        """The held tree's route records: ``routes.held_tree`` and ``routes.publication``."""
+        forest = any(getattr(getattr(group, "layout", None), "forest", False) for group in self.groups)
+        return {
+            "held_tree": {
+                "owner": "forest" if forest else "tree" if case == "K1" else "mixed",
+                "classes": [
+                    {"worlds": int(held.worlds.size), "grouping": held.grouping, "reason": held.reason}
+                    for held in self.plan.classes
+                ],
+                "coordinate_trees": {
+                    "enabled": self.coordinate_trees is not None,
+                    "reason": self.plan.coordinate_reason,
+                },
+                "groups": [
+                    group.record(self.drive_dofs) if group is self.coordinate_trees else group.record()
+                    for group in self.groups
+                ],
+            },
+            "publication": {
+                "owner": "cached",
+                "reason": "The held-tree owner publishes next-step state.",
+                "fk_id_cache": "in_place",
+            },
+        }
+
     def _coverage_arrays(self):
         solver, model = self.solver, self.solver.model
         for size in solver.forest.size_groups:

@@ -47,6 +47,7 @@ from .friction_patches import patch_row_law
 from .joint_table import FreeBodies, bind_free_bodies
 from .joint_table import bind as bind_joint_table
 from .kernel_template import KernelTemplate, items, params
+from .path_selection import json_value, kernel_key
 from .response_builds_rows import bind_row_records
 from .route_table import Laws
 from .row_kernels import (
@@ -256,6 +257,12 @@ def mimic_warp_kernel(size: int, groups: int, mimics: int) -> wp.Kernel:
     """The one writer's mimic rows, at most ``mimics`` an articulation, one warp per articulation
     (:func:`_prefix_warp_kernel`)."""
     return _prefix_warp_kernel(size, groups, "mimics", mimics)
+
+
+_BETA_REASONS = {
+    "default": "friction_anchor_beta omitted: persistent patch friction at the 0.2 default.",
+    "argument": "friction_anchor_beta passed explicitly.",
+}
 
 
 class RowLaws:
@@ -1167,3 +1174,87 @@ class RowLaws:
                 solver.sweep.patch_routes(),
                 bind_row_records(solver.placement),
             )
+
+    def record(self, solver) -> dict:
+        """The row laws' route records: ``routes.contact_rows``, ``routes.velocity_limits`` and ``routes.friction``."""
+        producer = solver._plan.route.producer
+        # The route's producer writes every contact row (the row pass, write_contacts, takes it from the plan).
+        sizes = solver.forest.size_groups if producer != "none" else ()
+        if not self.options.enable_joint_velocity_limits:
+            joint, reason = "off", "enable_joint_velocity_limits is False."
+        elif solver.sweep.sparse_velocity_limits:
+            joint, reason = (
+                "sparse_factor_rows",
+                "Native sparse factors solve velocity-limit rows in factor coordinates.",
+            )
+        else:
+            joint, reason = "rows", "Dedicated velocity-limit rows."
+        limits = bool(self.has_rigid_body_velocity_limits)
+        model = self.model
+        prescale = self.options.enable_joint_velocity_limits and model.joint_count > 0 and model.articulation_count > 0
+        return {
+            "contact_rows": {
+                "producer": producer,
+                # Every producer, every size: the builder method, its kernels in launch order and the law they write,
+                # for the dense contact rows built outside the sweep (_row_builder names the rows built elsewhere).
+                "builder_by_dof": {str(int(size)): self._row_builder(solver, producer, size) for size in sizes},
+                "keyed_rows": {"enabled": producer == "keyed_rows", "reason": solver.placement.keyed_rows_reason},
+            },
+            "velocity_limits": {
+                "joint": joint,
+                "reason": reason,
+                # Lanes per articulation of the pre-solve PhysX velocity prescale; 0 when it launches no kernel.
+                "prescale_lanes": int(self.velocity_prescale_lanes) if prescale else 0,
+                "activation_fraction": json_value(self.options.velocity_limit_activation_fraction),
+                "rigid_body_limits": limits,
+                # Mirrors Placement.allocate_free_body_rows and the row allocation of write_contacts (both modes). At an
+                # infinite activation fraction the allocator still launches but reserves no row.
+                "free_body_rows": bool(limits and self.forest.free_rigid_body_count > 0),
+            },
+            "friction": {
+                "friction_anchor_beta": json_value(self.friction_anchor_beta),
+                "anchor_beta_source": self.friction_anchor_beta_source,
+                "torsion": bool(self.spin_rows),
+                "compliance": bool(self.options.contact_compliance),
+                "reason": _BETA_REASONS[self.friction_anchor_beta_source],
+                "frame_reuse": {"enabled": self.friction_patches.reuse_frames, "reason": self.patch_frame_reuse_reason},
+                "pair_sort": self.friction_patches.record(),
+            },
+        }
+
+    @staticmethod
+    def _row_builder(solver, method, size) -> dict:
+        """Name the kernels that build one DOF size's dense contact rows outside the sweep, in launch order (a launch
+        shared by several sizes under each). Not named: the keyed rows' direct rows, which the tiers build in the sweep
+        (``direct_rows``), and the free bodies' rows (walk_rows.write_free_body_rows, routes.free_rigid_bodies)."""
+        marker = ()
+        if size == solver.spec.classes.diagonal_size:
+            # The sparse diagonal's marker encodes schedule links into the slots its writer just wrote.
+            marker = () if solver.sweep.sparse_contact_marker is None else (solver.sweep.sparse_contact_marker,)
+        if method == "walk":
+            # The allocator writes the contact rows' unit sources; the one writer writes every contact row's records and
+            # walks every row (walk_rows): the general placement's into its packed rows, the support placement's (K1)
+            # into its support sink, the sparse diagonal's (K2) into its slots sink.
+            if solver._plan.route.case == "K1":
+                writers = (solver.sweep.support_units_kernel, solver.sweep.support_rows)
+            elif solver._plan.route.case == "K2":
+                writers = (walk_rows.slot_writer(solver),)
+            else:
+                # The general placement's rows in two parts: the topology's, walked in blocks, and the rest.
+                writers = (walk_rows.writer_kernel(solver, walk_rows.WRITE_TOPOLOGY), walk_rows.writer_kernel(solver))
+            kernels = (*writers, *marker)
+        elif method == "keyed_rows":
+            from . import keyed_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
+
+            # The parallel tiers (routes.sweep.tiers) build the direct rows in the sweep; the one writer walks the rows
+            # of every other world (keyed_general_units hands them over).
+            kernels = (keyed_rows.scatter_contact_keys, keyed_rows.keyed_general_units, walk_rows.writer_kernel(solver))
+        else:
+            raise ValueError(f"No contact-row builder kernels are known for the method {method!r}.")
+        entry = {
+            "method": method,
+            "kernels": [kernel if isinstance(kernel, str) else kernel_key(kernel) for kernel in kernels],
+        }
+        if method == "keyed_rows":
+            entry["direct_rows"] = "routes.sweep.tiers"
+        return entry

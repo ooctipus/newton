@@ -29,7 +29,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import class_plan, field_group, path_selection, sweep_routes_tiers
+from newton._src.solvers.feather_pgs import class_plan, field_group, sweep_routes_tiers
 from newton._src.solvers.feather_pgs import sweep as emitter
 from newton._src.solvers.feather_pgs.device_preludes import RING
 from newton._src.solvers.feather_pgs.factor.kernels import prescale_joint_velocity_limits
@@ -1131,7 +1131,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 ),
             )
             with self.subTest(linked=linked):
-                tiers = path_selection._tiers(probe)
+                tiers = Sweep._record_tiers(probe.sweep, probe._plan.route)
                 self.assertEqual(tiers["linked_rows"], linked)
                 self.assertEqual(_law_key(tiers["tiers"][0]["kernel"]).endswith("_linked"), linked)
                 self.assertEqual("_linked" in tiers["tiers"][0]["kernel"], linked)

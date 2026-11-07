@@ -52,6 +52,7 @@ from . import cached_state_binding
 from .factor.fields import drive_terms
 from .factor.kernels import Clock, clock_changed
 from .kernel_template import python_kernel
+from .path_selection import kernel_key
 from .spatial_laws import (
     axis_transform,
     coordinate_force,
@@ -719,6 +720,45 @@ class CoordinateTrees:
             topology.weld_joint_offset if welded else np.zeros(1, np.int32), dtype=int, device=device
         )
         self._plan_dimensions = self._dimensions()
+
+    def record(self, drive_dofs) -> dict:
+        """The class's record in the tree groups' schema (``routes.held_tree.groups``).
+
+        Its predict and finish run one thread per coordinate (``lanes``) and its
+        repair one warp per articulation, so the tree layout's packing fields
+        (``trees_per_block``, ``block_dim``) are ``None``. Its repair compares no
+        input banks (``input_validation`` is the group's, "identity": the stamp
+        alone). ``drive_dofs`` counts the DOFs whose drives the drive kernel
+        still prepares (the held plan's, ``drive_dofs``), since the class's predict decides its own.
+        """
+        size = int(self.size)
+        return {
+            "operator": type(self).__name__,
+            "size": size,
+            "group_count": int(self.group_count),
+            # The root, a body a leaf and the leaves' welded bodies.
+            "bodies": size + 1 + int(self.topology.weld_joint_offset.size),
+            "dofs": size,
+            "lanes": size,
+            "trees_per_block": None,
+            "block_dim": None,
+            "roots": [0],
+            "root_coordinates": [0],
+            "free_roots": [False],
+            # A diagonal-mass family, negated as for the tree groups.
+            "root_families": [-size],
+            "schedules": None,
+            "response": "diagonal",
+            "input_validation": "content" if self.bank_compare else "identity",
+            "motion_velocity": bool(self.motion_velocity),
+            "publishes_twists": False,
+            "drive_dofs": 0 if drive_dofs is None else int(drive_dofs.shape[0]),
+            "kernels": {
+                "repair": kernel_key(self.repair_kernel),
+                "finish": kernel_key(self.finish_kernel),
+                "predict": kernel_key(self.predictor_kernel),
+            },
+        }
 
     def _dimensions(self):
         model = self.solver.model

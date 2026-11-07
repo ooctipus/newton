@@ -21,7 +21,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import coordinate_trees as ct
-from newton._src.solvers.feather_pgs import held_tree, path_selection, tree_factor
+from newton._src.solvers.feather_pgs import held_tree, tree_factor
 from newton._src.solvers.feather_pgs.device_proof import DeviceProof
 from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
@@ -690,10 +690,10 @@ class TestCoordinateTreesRule(unittest.TestCase):
             with self.subTest(owner=name):
                 for group in owner.groups:
                     if group is owner.coordinate_trees:
-                        record = path_selection._coordinate_group(group, owner.drive_dofs)
+                        record = group.record(owner.drive_dofs)
                         self.assertEqual(record["input_validation"], "identity")
                         continue
-                    record = path_selection._tree_group(group)
+                    record = group.record()
                     self.assertEqual(record["input_validation"], "content")
                     self.assertTrue(group.bank_compare)
                     self.assertIn("_banked", record["kernels"]["repair"])
@@ -873,7 +873,7 @@ class TestCoordinateTreesKernels(unittest.TestCase):
         mine.factor.prepare_drives(state, control, DT, mine.v_hat, mine.v_out, pair.drive_dofs)
         others = pair.drive_dofs.numpy()
         np.testing.assert_array_equal(np.sort(np.concatenate([others, pair.dofs])), np.arange(model.joint_dof_count))
-        self.assertEqual(path_selection._coordinate_group(pair.state, pair.drive_dofs)["drive_dofs"], len(others))
+        self.assertEqual(pair.state.record(pair.drive_dofs)["drive_dofs"], len(others))
         rows = pair.mine.factor.drive_row_by_dof.numpy()
         np.testing.assert_array_equal(pair.mine.factor.joint_tau.numpy()[others], head.factor.joint_tau.numpy()[others])
         other_rows = rows[others][rows[others] >= 0]

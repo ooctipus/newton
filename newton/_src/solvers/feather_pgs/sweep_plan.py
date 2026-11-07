@@ -45,7 +45,8 @@ from .contact_input import bind_routes as bind_contact_routes
 from .execution_plan import _MFGSStorage, _select_mfgs_storage
 from .field_group import Field, FieldGroup
 from .friction_patches import patch_routes
-from .solve_policy import SolvePolicy, SolveReadoutRecord
+from .path_selection import json_value, kernel_key
+from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF, SolvePolicy, SolveReadoutRecord
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport, row_supports
 from .sweep import FRICTION_METRIC_FLOATS, SweepConfig, sweep_kernel
@@ -280,11 +281,10 @@ class Sweep:
             self.support_threads = walk_rows.support_threads(worlds * capacity, self.model.device)
         return self._support_sink
 
-    def place_paired(self, choice, reason: str | None) -> None:
+    def place_paired(self, choice) -> None:
         """Case K5, a tree beside one free body: the paired response and its factor coordinates, from the class plan's
-        choice (:class:`.class_plan.Paired`, ``None`` where the class is another case, ``reason`` saying why)."""
+        choice (:class:`.class_plan.Paired`, ``None`` where the class is another case)."""
         model, forest = self.model, self.forest
-        self.paired_response_reason = reason
         self.paired_factor_coordinates = choice is not None
         self.paired_response_primary_size = choice.primary if choice is not None else None
         self.paired_response_secondary_size = choice.secondary if choice is not None else None
@@ -1075,3 +1075,200 @@ class Sweep:
                 extent=contacts.rigid_contact_count,
                 max_blocks=self.placement.contact_capacity_blocks,
             )
+
+    def record(self, plan) -> dict:
+        """The sweep's route records, from the step's plan (:class:`.step_plan.StepPlan`)."""
+        row, classes, forest = plan.route, self.classes, self.forest
+        primary = self.paired_response_primary_size
+        if primary is None:
+            paired = {"enabled": False, "reason": row.reasons["K5"]}
+        else:
+            factor = row.case == "K5"
+            paired = {
+                "enabled": True,
+                "primary_dofs": int(primary),
+                "secondary_dofs": int(self.paired_response_secondary_size),
+                "factor_coordinates": factor,
+                # Why the paired response keeps its register inverse instead of factor coordinates (None when admitted).
+                "factor_coordinates_reason": row.reasons["K5"],
+                "contact_units": bool(self.factor_coordinate_contact_units),
+                "reason": "One articulation factor and one free body per world share one response"
+                + (" in factor coordinates." if factor else " with a register inverse."),
+            }
+        diagonal = classes.diagonal
+        size = row.sizes["packed"]
+        sparse = {
+            "size": json_value(size),
+            "reason": row.reasons["K1"],
+            "velocity_limits": bool(self.sparse_velocity_limits),
+            "active_rows": bool(self.sparse_active_rows),
+            "active_rows_reason": self.sparse_active_rows_reason,
+            "support_table": bool(self.placement.sparse_row_support.enabled),
+            "contact_triplets": bool(self.sparse_contact_triplets),
+            "contact_triplets_reason": self.sparse_contact_triplets_reason,
+        }
+        if size is not None:
+            sparse.update(
+                {
+                    "max_row_support": json_value(classes.packed.max_support),
+                    "solve_lanes": int(self.sparse_solve_lanes),
+                    "local_factors": bool(self.sparse_local_factors),
+                    "units_kernel": kernel_key(self.support_units_kernel),
+                    "writer_kernel": kernel_key(self.support_rows),
+                    "leave_kernel": kernel_key(self.factor.walk_leave),
+                    "sweep_kernel": kernel_key(self.sparse_kernel),
+                    # The sweep's launch bounds from its shared memory and register budget (threads, minimum blocks).
+                    "launch_bounds": json_value(self.sparse_kernel.options.get("launch_bounds")),
+                }
+            )
+        owner = self.resolved_worlds_owner
+        published = bool(owner is not None and owner.published)
+        if owner is None:
+            twists = None
+        elif published:
+            twists = "The held-tree predictor publishes body twists for every responding articulation."
+        else:
+            twists = "The classifier builds body twists itself: a responding articulation has no twist-publishing tree."
+        count = int(forest.free_rigid_body_count)
+        owners = []
+        if count:
+            if row.case == "K1":
+                owners.append("sparse_free_rows")
+            if primary is not None:
+                owners.append("paired_factor" if row.case == "K5" else "paired_response")
+            owners.append("matrix_free_rows")
+        return {
+            "paired_response": paired,
+            "sparse_diagonal": {
+                "enabled": row.case == "K2",
+                "response_dofs": json_value(row.sizes["diagonal"]),
+                "dense_dofs": int(row.sizes["dense"] or 0),
+                "contact_units": bool(diagonal is not None and diagonal.units),
+                "speculative_contact_batches": bool(diagonal is not None and diagonal.speculative_batches),
+                "fused_joint_limits": bool(classes.fused_sizes),
+                "reason": row.reasons["K2"],
+            },
+            "sparse_mass_matrix": sparse,
+            "sweep": self._record_sweep(plan),
+            "resolved_worlds": {
+                "enabled": owner is not None,
+                "reason": self.resolved_worlds_reason,
+                "publishes_predicted_twists": published,
+                "twists_reason": twists,
+            },
+            "free_rigid_bodies": {
+                "count": count,
+                "mixed_worlds": bool(forest.has_mixed_contacts),
+                # Whether their contacts keep a run of their own (the colored worlds'), or are rows of the line.
+                "contact_run": bool(self.placement.free_contact_rows),
+                "owners": owners,
+                "reason": "No free rigid bodies."
+                if not count
+                else "Owners that can solve free-body rows, in claim order; contacts are routed per world at run time.",
+            },
+        }
+
+    def _record_sweep(self, plan) -> dict:
+        """``routes.sweep``: its kernels, the readout's counted kernels and the exit law (:mod:`.solve_policy`)."""
+        placement = self.placement
+        counted = self.readout.kernels
+        readout = self.options.diagnostics.solve_readout
+        return {
+            "route": plan.solve.route.name,
+            "reason": plan.solve.route.reason,
+            "iterations": int(self.options.pgs_iterations),
+            # The streamed rows' records, which the rows' writers store where a sweep streams a row.
+            "row_records": {
+                "written": bool(placement.writes_records),
+                "first": int(placement.record_first),
+                "reason": "The rows' writers store the streamed rows' records."
+                if placement.writes_records
+                else "Skipped: no sweep streams a row's metadata.",
+            },
+            **{name: plan.kernels[name] for name in ("sparse", "sparse_diagonal", "paired_factor", "mf_gs")},
+            "mf_gs_storage": self._record_storage(),
+            "mf_colored": self._record_colored(plan),
+            "tiers": self._record_tiers(plan.route),
+            "readout": {
+                "mode": readout if counted else "off",
+                "counted": dict(sorted(counted.items())),
+                # Whether the solves of worlds without rows, which the matrix-free sweeps do not enter, count as skipped.
+                "counts_skipped": bool(counted) and self.readout.counts_skipped,
+                "reason": "The solve readout is off."
+                if readout == "off"
+                else "Each launch of a counted kernel solves its worlds.",
+            },
+            "exit_law": {
+                "law": "rounding_floor",
+                "quiet_units": QUIET_UNITS,
+                "unit_roundoff": json_value(UNIT_ROUNDOFF),
+                "reason": (
+                    "Every sweep stops a world once each row update's change of its own velocity, |dlambda| A_ii, is "
+                    f"within {QUIET_UNITS} rounding units of the magnitude its update combines: the right-hand side, the "
+                    "terms of its velocity sum and its own impulse times A_ii."
+                ),
+            },
+        }
+
+    def _record_storage(self) -> dict | None:
+        """The storage classes of the general sweep, chosen by :func:`.execution_plan._select_mfgs_storage`."""
+        storage = self.mf_gs_storage
+        if storage is None:
+            return None
+        places = storage.places
+        names = {"metadata": places.metadata, "mf_impulses": places.impulses, "dense_impulses": places.dense_impulses}
+        record = {name: "resident" if place is Place.SHARED else "streamed" for name, place in names.items()}
+        return {**record, "reason": storage.reason}
+
+    def _record_colored(self, plan) -> dict | None:
+        """The colored mapping of the matrix-free sweep: its kernel and the worlds it takes, or ``None`` unbuilt."""
+        if self.mf_colored_kernel is None:
+            return None
+        units = self.colored_units
+        rule = units.rule
+        return {
+            "kernel": plan.kernels["mf_colored"],
+            "min_units": int(rule.min_units),
+            "parallelism": json_value(rule.parallelism),
+            # The waves the capable worlds take on the device's SMs, which multiply the units per color a world needs.
+            "waves": int(rule.waves),
+            "units_per_color": json_value(rule.units_per_color),
+            # The worlds whose free bodies admit the rule, each with a storage slot, and that storage's bytes.
+            "capable_worlds": int(units.slot_count),
+            "storage_bytes": int(units.nbytes),
+            "reason": (
+                f"At every pack the unit builder gives the colored mapping each capable world (at least "
+                f"{rule.units_per_color:g} free bodies: a world's units per color are at most its free bodies) of at "
+                f"least {rule.min_units} contact units and {rule.units_per_color:g} units per color: it sweeps a color's "
+                "units at once, a block each; the others keep the one-warp mapping (the measured crossover of their "
+                f"solve times, {rule.parallelism:g} units per color in one wave of colored worlds on the device, here "
+                f"{rule.waves})."
+            ),
+        }
+
+    def _record_tiers(self, row) -> dict | None:
+        tiers = list(self.tiers)
+        if not tiers:
+            return None
+        return {
+            "family": "keyed_parallel" if row.producer == "keyed_rows" else "parallel",
+            # Why the class takes the tiers (case K4: the in-kernel response's shape).
+            "inkernel_response_reason": row.reasons["K4"],
+            # Every built tier projects each friction pair on its patch ring's pooled normal load (patch friction).
+            "linked_rows": all(tier.config.linked_rows for tier in tiers),
+            # The last-word velocity-limit pass after the final sweep (linked tiers with joint velocity limits).
+            "velocity_limit_pass": all(tier.config.velocity_limit_pass for tier in tiers),
+            # The largest tier budget; each tier records its own (the equal-accuracy rule "auto", or "pinned").
+            "sweeps": max(tier.config.sweeps for tier in tiers),
+            "sweeps_rule": self.par_sweeps_rule,
+            "sweeps_reason": self.par_sweeps_reason,
+            "tiers": [
+                {
+                    "rows": int(rows),
+                    "min_rows": int(min_rows),
+                    "sweeps": tier.config.sweeps,
+                    "kernel": kernel_key(tier.kernel),
+                }
+                for (rows, min_rows), tier in zip(self.par_tiers, tiers, strict=True)
+            ],
+        }

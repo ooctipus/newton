@@ -34,6 +34,7 @@ from ...core.memory import L1_LINE_BYTES, Device, device
 from . import cached_state_binding
 from .class_plan import ClassPlan
 from .forest_plan import ForestPlan
+from .path_selection import kernel_key
 from .route_table import Laws, Pins, RouteRow
 from .walk_rows import WRITE_REST, WRITE_TOPOLOGY
 
@@ -45,13 +46,7 @@ __all__ = [
     "Step",
     "StepPlan",
     "StepSpec",
-    "kernel_key",
 ]
-
-
-def kernel_key(kernel) -> str | None:
-    """A kernel's key (a factory's product without one: its type's name), or ``None`` for no kernel."""
-    return None if kernel is None else getattr(kernel, "key", type(kernel).__name__)
 
 
 @dataclass(frozen=True)

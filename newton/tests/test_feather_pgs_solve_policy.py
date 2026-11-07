@@ -24,7 +24,6 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import (
     kernel_template,
-    path_selection,
     row_kernels,
     sweep_routes,
     sweep_routes_diag,
@@ -723,58 +722,22 @@ class TestSolverReadoutOption(unittest.TestCase):
                 self.assertGreaterEqual(slot["mean_sweeps"], 2.0)
 
 
-def _sweep_record(**fields):
-    """A matrix-free ``routes.sweep`` record naming only its matrix-free Gauss-Seidel kernel, with ``fields`` set."""
-    record = dict.fromkeys(
-        (
-            "sparse",
-            "sparse_diagonal",
-            "paired_factor",
-            "mf_colored",
-            "tiers",
-        )
-    )
-    record.update(route="matrix_free_gs", mf_gs="mf_gs_kernel")
-    record.update(fields)
-    return record
-
-
-def _policy_solver(*, readout="sweeps", skipped=True, **attributes):
-    """The solver attributes the sweep records read, counting the matrix-free kernel and its skipped solves."""
-    return SimpleNamespace(
-        sweep=SimpleNamespace(
-            policy=SolvePolicy(readout=readout),
-            readout=SimpleNamespace(kernels={"mf_gs_kernel": "mf_gs"}, counts_skipped=skipped),
-        ),
-        **attributes,
-        options=SimpleNamespace(diagnostics=SolverFeatherPGS.Diagnostics(solve_readout=readout)),
-    )
-
-
 class TestSweepPolicyRecords(unittest.TestCase):
     """The readout and exit-law records of a route's sweeps."""
 
-    def test_a_sweep_records_the_one_law(self):
-        """Record the exit law, and that a launch solves its worlds, so a solve counts once."""
-        solver, record = _policy_solver(), _sweep_record()
-        sweep = {
-            "readout": path_selection._readout(solver, record),
-            "exit_law": path_selection._exit_law(solver, record),
-        }
-        self.assertEqual(sweep["exit_law"]["law"], "rounding_floor")
-        self.assertIn("solves its worlds", sweep["readout"]["reason"])
-        json.dumps(sweep, allow_nan=False)
-
     def test_records_say_whether_skipped_solves_count(self):
-        """Say whether the solves of worlds without rows count as skipped, and not without counted sweeps."""
-        record = _sweep_record()
-        for skipped in (False, True):
-            with self.subTest(skipped=skipped):
-                readout = path_selection._readout(_policy_solver(skipped=skipped), record)
-                self.assertEqual(readout["counts_skipped"], skipped)
-        solver = _policy_solver()
-        solver.sweep.readout = SimpleNamespace(kernels={}, counts_skipped=True)
-        self.assertFalse(path_selection._readout(solver, record)["counts_skipped"])
+        """Say that a launch solves its worlds, whether the solves of worlds without rows count as skipped, and not
+        without counted sweeps."""
+        diagnostics = SolverFeatherPGS.Diagnostics(solve_readout="sweeps")
+        solver = SolverFeatherPGS(TestSolverReadoutOption._model(), diagnostics=diagnostics)
+        sweep = solver.sweep
+        self.assertIn("solves its worlds", sweep.record(solver._plan)["sweep"]["readout"]["reason"])
+        for kernels, skipped in (({"mf_gs_kernel": "mf_gs"}, False), ({"mf_gs_kernel": "mf_gs"}, True), ({}, True)):
+            with self.subTest(kernels=kernels, skipped=skipped):
+                sweep.readout = SimpleNamespace(kernels=kernels, counts_skipped=skipped)
+                readout = sweep.record(solver._plan)["sweep"]["readout"]
+                self.assertEqual(readout["counts_skipped"], bool(kernels) and skipped)
+                json.dumps(readout, allow_nan=False)
 
 
 if __name__ == "__main__":

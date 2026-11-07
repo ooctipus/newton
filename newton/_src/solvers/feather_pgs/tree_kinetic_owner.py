@@ -15,6 +15,7 @@ from . import cached_state_binding, field_group
 from . import tree_scan as ts
 from .device_proof import DeviceProof, fingerprint
 from .host_index import expand
+from .path_selection import json_value, kernel_key
 from .publication_data import PLAN_FIELDS
 from .tree_kinetic_plan import make_plan
 from .tree_plan import TreePlan
@@ -240,6 +241,39 @@ class TreeKineticState:
             device,
             watched=_FRAME_FIELDS,
         )
+
+    def record(self) -> dict:
+        """The group's record in the held tree's (``routes.held_tree.groups``)."""
+        layout, operator = self.layout, self.sparse
+        return {
+            "operator": operator.kind,
+            "size": json_value(getattr(operator, "size", None)),
+            "group_count": int(self.group_count),
+            "bodies": int(layout.bodies),
+            "dofs": int(layout.dofs),
+            "lanes": int(layout.lanes),
+            "trees_per_block": int(layout.pack),
+            "block_dim": int(self.block_dim),
+            "roots": json_value(layout.roots),
+            "root_coordinates": json_value(layout.root_coordinates),
+            # Per root, whether it stands on a free joint (a joint root's coordinates are a descendant's).
+            "free_roots": json_value(layout.free_roots),
+            # Factor family per root: its coordinate count, negated for a diagonal-mass family, 0 when prescribed.
+            "root_families": json_value(layout.root_families),
+            # The scans' schedules, chosen from the tree's data with its lanes (tree_kinetic_state.held_schedules).
+            "schedules": {name: getattr(self.schedules, name).value for name in ("pose", "motion", "reduce")},
+            "response": self._response,
+            # "content": a repair whose input bank is not the bank the cache was published into compares the two banks
+            # word for word; "identity": the bank's pointers alone.
+            "input_validation": "content" if self.bank_compare else "identity",
+            "motion_velocity": bool(self.motion_velocity),
+            "publishes_twists": bool(self.publishes_twists),
+            "kernels": {
+                "repair": kernel_key(self.repair_kernel),
+                "finish": kernel_key(self.finish_kernel),
+                "predict": kernel_key(self.predictor_kernel),
+            },
+        }
 
     def _bind_kernels(self):
         from . import tree_kinetic_state as native  # noqa: PLC0415

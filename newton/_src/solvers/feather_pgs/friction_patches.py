@@ -48,7 +48,15 @@ import numpy as np
 import warp as wp
 
 from ...core.contact_pool import ContactField, ContactPool
-from ...core.live_sort import EXTENT_SIZE, SORT_CHUNK, launch_live_sort, publish_sort_extent, slot_keys_fit, sort_grid
+from ...core.live_sort import (
+    EXTENT_SIZE,
+    SLOT_BITS,
+    SORT_CHUNK,
+    launch_live_sort,
+    publish_sort_extent,
+    slot_keys_fit,
+    sort_grid,
+)
 from ...sim.contacts import GENERATION_SENTINEL, capture_scope, contact_frame_write
 from . import field_group
 from .contact_filters import contact_normal_gap_limit
@@ -1185,6 +1193,22 @@ class _FrictionPatchState:
         self.build_block_dim = _BUILD_BLOCK_DIM
         self.live_sort = _uses_live_sort(self.key_bits)
         self._grids(capacity)
+
+    def record(self) -> dict:
+        """The pair sort's record (``routes.friction.pair_sort``): the live slots' sort, or the radix sort's."""
+        if self.live_sort:
+            reason = "The pair sort orders only the live slots, so its cost follows the live contacts."
+        else:
+            reason = (
+                f"{self.key_bits}-bit pair keys leave no room for the live sort's {SLOT_BITS} slot bits: the "
+                "radix sort orders the whole capacity."
+            )
+        return {
+            "live": bool(self.live_sort),
+            "capacity": int(self.capacity),
+            "key_bits": int(self.key_bits),
+            "reason": reason,
+        }
 
     def _grids(self, rows):
         """Size the grids for ``rows`` slots: the ready rows, or the bound of a capture whose launches bind.

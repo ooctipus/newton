@@ -71,6 +71,7 @@ from .factor.walk import (
 )
 from .field_group import SolverArrays
 from .joint_table import JointTable
+from .path_selection import json_value
 from .row_laws import LINK_ROWS
 from .spatial_laws import spring_damper_stiffness
 from .tree_scan import (
@@ -522,6 +523,31 @@ class TreeFactor:
         self.held = held_tree.install(solver)
         model = self.model
         self.dynamics_stream = wp.Stream(model.device) if self.parallel_drives and model.device.is_cuda else None
+
+    def record(self, classes, placement) -> dict:
+        """The dynamics' route record (``routes.dynamics``), the packed rows ``placement``'s."""
+        forest, laws = self.forest, self.laws
+        return {
+            "dynamics": {
+                "compact_diagonal_mass_dofs": json_value(classes.diagonal_size),
+                "diagonal_mass_dofs": sorted(int(size) for size in forest.diagonal_mass_sizes),
+                # The rows' graph's vertices: how many coordinate trees hold each number of coordinates.
+                "tree_sizes": {str(size): int(n) for size, n in enumerate(np.bincount(forest.tree_size)) if n},
+                # The matrix-free sweeps' dense rows packed by support (packed_rows), and whether they serve the step
+                # alone.
+                "packed_rows": {
+                    "support": int(placement.packed_support) if classes.mf_sweeps else None,
+                    "dense": bool(placement.packed_dense),
+                    "response_only": bool(placement.packed_response),
+                    "reason": placement.packed_response_reason,
+                },
+                "parallel_augmented_drive_topology": bool(self.parallel_drives),
+                "preelimination": bool(self.eliminates),
+                "mimic_rows": int(laws.mimic_count or 0),
+                "link_rows": int(laws.link_count or 0),
+                "prescribed_response": bool(forest.has_prescribed_response),
+            }
+        }
 
     # ---------------------------------------------------------------------------------------------------------------
     # Notifications

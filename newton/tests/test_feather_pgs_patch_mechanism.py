@@ -56,7 +56,7 @@ from newton._src.core.live_sort import MAX_MERGES, SORT_CHUNK
 from newton._src.sim import contacts as contacts_module
 from newton._src.sim.contacts import note_contact_frame_write
 from newton._src.solvers.feather_pgs import environment_flags as fpgs_flags
-from newton._src.solvers.feather_pgs import friction_patches, path_selection
+from newton._src.solvers.feather_pgs import friction_patches
 from newton._src.solvers.feather_pgs.friction_patches import (
     _BUILD_FIELDS,
     FrictionPatches,
@@ -2660,7 +2660,7 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
             with self.subTest(capacity=capacity, key_bits=key_bits):
                 patches = SimpleNamespace(live_sort=live, capacity=capacity, key_bits=key_bits)
                 self.assertEqual(friction_patches._uses_live_sort(key_bits), live)
-                record = path_selection._pair_sort(patches)
+                record = friction_patches._FrictionPatchState.record(patches)
                 self.assertEqual(
                     {name: record[name] for name in ("live", "capacity", "key_bits")},
                     {"live": live, "capacity": capacity, "key_bits": key_bits},

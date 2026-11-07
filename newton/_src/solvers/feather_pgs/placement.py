@@ -27,7 +27,7 @@ import warp as wp
 
 from ...core.contact_pool import ContactField, model_contact_pool
 from ...sim import Contacts
-from ...sim.contacts import contact_capacity_blocks
+from ...sim.contacts import CAPACITY_BLOCKS_PER_SM, contact_capacity_blocks
 from ...sim.enums import JointType
 from . import host_index, packed_rows
 from .field_group import Field, FieldGroup, SolverArrays, fields_of
@@ -863,6 +863,17 @@ class Placement:
             inputs=[world_mask, self.forest.art_to_world, self.factor.mass_update_requested, self.constraint_overflow],
             device=self.model.device,
         )
+
+    def record(self) -> dict:
+        """The block cap of the launches over the contact capacity (``routes.contact_consumers``, 0: uncapped)."""
+        blocks = int(self.contact_capacity_blocks)
+        reason = (
+            "Launches over the contact capacity (force export, warm-start snapshot and gathers, keyed-row key"
+            f" scatters) grid-stride over {CAPACITY_BLOCKS_PER_SM} blocks of 256 threads per SM, about one wave."
+            if blocks
+            else "Uncapped: a CPU launch, or a kernel compiled without the grid-stride loop, covers every slot."
+        )
+        return {"contact_consumers": {"max_blocks": blocks, "reason": reason}}
 
     def record_watermarks(self, contacts):
         """The row high-water telemetry (``Diagnostics.row_watermark``, staged only under it; behavior-neutral): at the
