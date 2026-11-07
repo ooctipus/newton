@@ -78,8 +78,9 @@ def store_row_record(
 
 
 @wp.func_native(
-    """    int* const word = &record.data[at + 3];
-    *word = static_cast<int>((static_cast<unsigned int>(*word) & 0xFFFFu) | (static_cast<unsigned int>(parent) << 16));
+    """    // The kind and parent word's high half (pack_mf_header: the parent above the kind), stored alone: no read of
+    // the kind, which the row's writer stored (little-endian on both devices).
+    reinterpret_cast<unsigned short*>(&record.data[at + 3])[1] = static_cast<unsigned short>(parent);
 """
 )
 def store_parent_word(record: wp.array2d[wp.int32], at: int, parent: int): ...
