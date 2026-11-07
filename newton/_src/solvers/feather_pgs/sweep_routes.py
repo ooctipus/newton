@@ -29,6 +29,7 @@ from .sweep import (
     EXACT,
     ITERATION,
     SEQUENTIAL,
+    UNIT_HELD,
     Diagonal,
     Levels,
     RowContext,
@@ -52,6 +53,7 @@ from .sweep import (
     level_loop,
     rows_block,
     speed_rows_pass,
+    unit_held_loads,
     velocity_limit_pass,
 )
 
@@ -510,6 +512,85 @@ const float mf_diag = __int_as_float(meta.y);"""
     return f"{ring_sum}\n{COLORS.wrap(visit, ' ' * 12)}"
 
 
+def dense_units(dense: WorldRows, op: SparseFactor, laws: RowLaws, *, active: bool, pad: str) -> str:
+    """The contact unit on the dense rows (:func:`.sweep.contact_unit`): a contact normal ``i`` and its friction pair on
+    their Gram block, one visit of the row loop that consumes the pair's first tangent (``consumed_tangent``).
+
+    The three rows share their sides, so one load group gathers their entries on the normal's support, and one
+    reduction gives their velocity terms with the block's couplings ``Z_n . Z_t1``, ``Z_n . Z_t2`` and ``Z_t1 . Z_t2``
+    (:class:`.sweep.UnitZ`, uncached: the pair's law forms its metric from them as the pair's visit does). The rows run
+    the row law with their staged values held in registers, the normal by its stored diagonal, the pair at the
+    normal's new load (its patch ring walked from it), and their changes apply once. A friction triple (the contact's
+    spin row after the pair, :meth:`.sweep.WorldRows.spin_of`) is declined: the row step solves it. Under the active
+    enumeration the unit runs where the scan selected its first tangent."""
+    unit_rows = {"normal": "i", "tangent": "tangent", "sibling": "sibling"}
+    sums = (
+        ("unit_jv0", "normal", None),
+        ("unit_jv1", "tangent", None),
+        ("unit_jv2", "sibling", None),
+        ("gram_n1", "normal", "tangent"),
+        ("gram_n2", "normal", "sibling"),
+        ("unit_cross", "tangent", "sibling"),
+    )
+    gather = op.dot(sums, unit_rows, "        ", keep_velocity=True, reduce=False)
+    changes = (("normal", "unit_dn"), ("tangent", "unit_dt1"), ("sibling", "unit_dt2"))
+    apply = op.axpy(changes, "            ", kept=True, block=True)
+    ctx = RowContext(
+        row="i",
+        kind="row_type",
+        operator=UnitZ(fused_pair_apply=op.fused_pair_apply),
+        diagonal=Diagonal(dense.diag),
+        load=dense.load,
+        store=dense.store,
+        rhs=dense.rhs_of,
+        mu=lambda row: "mu",
+        weight=dense.weight,
+        eps=dense.eps,
+        parent="parent",
+        ring_load=dense.ring_load,
+        lanes=dense.lanes,
+    )
+    declare = f"""const int i = head + r;
+const int row_type = r == 0 ? {ROW_CONTACT} : {ROW_FRICTION};"""
+    rows_text = contact_unit(
+        ctx,
+        dataclasses.replace(laws, torsion=False),
+        rows="3",
+        declare=declare,
+        parent="head",
+        check=None,
+        held=True,
+        pad="        ",
+    )
+    held = "\n".join(unit_held_loads(ctx, name, "head", "        ") for name in UNIT_HELD)
+    selected = "\n        & (((s_selected_words[(i + 1) / 32] >> ((i + 1) & 31)) & 1u) != 0u)" if active else ""
+    entry_guard = "select_active && " if active else ""
+    triple = f" && {dense.spin_of('i', 'm_dense')} < 0" if laws.torsion else ""
+    kind = dense.kind
+    text = f"""if (i == consumed_tangent) continue;
+// A contact normal with its two tangents: the unit's guards from the staged metadata.
+if ({entry_guard}i + 2 < m_dense
+    && (({kind("i")} == {ROW_CONTACT}) & ({kind("i + 1")} == {ROW_FRICTION}) & ({kind("i + 2")} == {ROW_FRICTION})
+        & (isfinite({dense.diag("i")}) != 0) & ({dense.diag("i")} > 0.0f){selected})) {{
+    const int head = i, tangent = i + 1, sibling = i + 2;
+    if ({dense.parent("tangent")} == i && {dense.parent("sibling")} == i{triple}) {{
+        const float mu = {dense.mu("tangent")};
+        float unit_jv0 = 0.0f, unit_jv1 = 0.0f, unit_jv2 = 0.0f, gram_n1 = 0.0f, gram_n2 = 0.0f, unit_cross = 0.0f;
+{gather}
+{held}
+        SUM(unit_jv0, unit_jv1, unit_jv2, gram_n1, gram_n2, unit_cross);
+{rows_text}
+        if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f) {{
+{apply}
+        }}
+        consumed_tangent = tangent;
+        SYNC();
+        continue;
+    }}
+}}"""
+    return indent(text, pad)
+
+
 def _colored_diagonal(r: int) -> str:
     """A colored unit's row ``r``'s diagonal ``A_rr`` from its stored inverse (``W[3 r]``; zero for a zero one)."""
     return f"(__int_as_float(W[{3 * r}]) > 0.0f ? 1.0f / __int_as_float(W[{3 * r}]) : 0.0f)"
@@ -846,9 +927,19 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         if ({"!__syncthreads_or(velocity_moved != 0)" if colored else "BALLOT(velocity_moved != 0) == 0u"}) iteration_changed = 0;
 """
     admission = _LINE_ADMISSION if speed_rows else _DENSE_ADMISSION
+    units = dense_units(dense, dense_op, laws, active=sweep.active_rows, pad="") if sweep.contact_units else ""
     dense_phase = rows_block(
-        dense, dense_op, laws, admission=admission, metric=dense_metric, selected=sweep.active_rows, pad="        "
+        dense,
+        dense_op,
+        laws,
+        admission=admission,
+        metric=dense_metric,
+        selected=sweep.active_rows,
+        unit=units,
+        pad="        ",
     )
+    if units:
+        dense_phase = f"        int consumed_tangent = -1;\n{dense_phase}"
     if sweep.active_rows:
         # The active enumeration: each sweep's scan selects the dense rows it visits, after the last sweep's stores.
         spin = (lambda parent: dense.spin_of(parent, "m_dense")) if contact_torsion else None
@@ -968,6 +1059,7 @@ class GeneralSweep(SweepConfig):
     seeded: bool = False
     wide_rows: bool = False
     support_classes: bool = False
+    contact_units: bool = False
     pitch: int | None = None
     free_rows: bool = True
     speed_rows: bool = False
@@ -980,8 +1072,8 @@ class GeneralSweep(SweepConfig):
         validate_record_coordinates(self.max_world_dofs)
         if self.material and not self.weighted:
             raise ValueError("material contacts step by their weights: their sweeps are weighted")
-        if self.colored and self.active_rows:
-            raise ValueError("the colored mapping visits every dense row: its exit votes over the block")
+        if self.colored and (self.active_rows or self.contact_units):
+            raise ValueError("the colored mapping visits every dense row in turn: its exit votes over the block")
         dofs = self.max_world_dofs if self.max_row_dofs is None else self.max_row_dofs
         object.__setattr__(self, "max_row_dofs", int(dofs))
 
@@ -1022,6 +1114,7 @@ class GeneralSweep(SweepConfig):
             + ("_wide" if self.wide_rows else "")
             + ("_classes" if self.support_classes else "")
             + ("_active" if self.active_rows else "")
+            + ("_units" if self.contact_units else "")
             + (f"_p{pitch}" if pitch is not None and pitch != M + MF else "")
             + ("" if self.free_rows else "_line")
             + ("_speed" if self.speed_rows else "")

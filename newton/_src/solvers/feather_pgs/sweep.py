@@ -1919,6 +1919,7 @@ def rows_block(
     end: str | None = None,
     metric: str | None = None,
     selected: bool = False,
+    unit: str = "",
     pad: str = "        ",
 ) -> str:
     """The Gauss-Seidel loop over a world's rows of one class ``[0, end)`` in slot order (:class:`WorldRows`): the
@@ -1941,15 +1942,17 @@ def rows_block(
     inner = pad + "    "
     if end is None:
         end = "mf_contact_end" if rows.free else "m_dense"
+    if (selected or unit) and rows.free:
+        raise ValueError("the active enumeration and the contact unit visit the dense rows")
     if selected:
-        if rows.free:
-            raise ValueError("the active enumeration selects the dense rows")
         order = SelectedRows(end)
         inner = order.inner(pad)
         visit = row_step(rows, op, laws, end=end, admission=admission, metric=metric, pad=inner)
+        visit = f"{indent(unit, inner)}\n{visit}" if unit else visit
         return order.wrap(indent(rows.visit("i"), inner) + "\n" + visit if rows.record else visit, pad)
     if not rows.free:
         visit = row_step(rows, op, laws, end=end, admission=admission, metric=metric, pad=inner)
+        visit = f"{indent(unit, inner)}\n{visit}" if unit else visit
         if rows.record:
             return f"{pad}{{\n{_record_pipeline(rows, op, end).wrap(visit, pad)}\n{pad}}}"
         return SlotOrder(end).wrap(visit, pad)
