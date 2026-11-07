@@ -30,6 +30,7 @@ import warp as wp
 from ...core.execution import Beside, Buckets, Queue, shape
 from ...core.memory import Place, arch_budget, device
 from . import (
+    class_plan,
     packed_rows,
     sweep_levels,
     sweep_routes,
@@ -64,8 +65,14 @@ from .warm_start import (
     reset_world_impulses,
 )
 
-_COLORED = {"levels": LevelLaw(EXACT), "lanes_per_world": 32, "block_warps": 1}
-"""The colored mapping's fields over the warp mapping's: a world a block of whole warps."""
+_COLORED = {
+    "levels": LevelLaw(EXACT),
+    "active_rows": False,
+    "contact_units": False,
+    "lanes_per_world": 32,
+    "block_warps": 1,
+}
+"""The colored mapping's fields over the warp mapping's: every dense row in turn, a world a block of whole warps."""
 
 SPARSE_ROWS = FieldGroup(
     Field("sparse_row_dof", wp.int32, ("index_world", "index_row", "index_support"), fill=None, owner="placement"),
@@ -418,6 +425,7 @@ class Sweep:
         self.colored_units = None
         # Storage classes of the MF-GS kernel (_MFGSStorage); recorded by get_path_selection().
         self.mf_gs_storage = None
+        self.general_active_reason = None
         # The Jacobi tiers ahead of the matrix-free sweep (their SweepLaunch each).
         self.tiers = []
         self.par_tiers = []
@@ -463,7 +471,9 @@ class Sweep:
             self.record_grid = min(self.forest.world_count, max(threads // self.record_lanes, 1))
             # The general sweep's warp mapping: its places the storage's, its rows the placement's; a world's lanes
             # from its rows' widest support (sweep_routes.world_lanes) where a warp's worlds' stages fit, two warps a
-            # block where theirs do.
+            # block where theirs do; the native sparse sweep's rule for the enumeration and the contact units (small
+            # worlds keep the full ordered sweep of ordinary updates at their packed lanes; others select their rows
+            # at sweep entry where the bitsets fit and visit a contact's rows as one unit).
             budget = arch_budget(device_arch)
             staging = functools.partial(
                 sweep_routes.mf_gs_staging,
@@ -477,6 +487,11 @@ class Sweep:
             support_lanes = sweep_routes.world_lanes(
                 self.placement.packed_support, free_rows=bool(self.placement.free_contact_rows)
             )
+            small = support_lanes if support_lanes < 32 else 0
+            active_rows, self.general_active_reason = class_plan.active_rows_rule(
+                self.pins, small_world_lanes=small, fits=lambda: staging(active_rows=True).fits(budget)
+            )
+            staging = functools.partial(staging, active_rows=active_rows)
             lanes, block_warps = 32, 1
             if model.device.is_cuda:
                 if staging(lanes=support_lanes, groups=32 // support_lanes).fits(budget):
@@ -496,6 +511,8 @@ class Sweep:
                 seeded=self.seeded,
                 wide_rows=self.placement.packed_dense == packed_rows.WIDE,
                 support_classes=self.placement.classed,
+                active_rows=active_rows,
+                contact_units=self.pins.contact_units == "triplets" and not small,
                 lanes_per_world=lanes,
                 block_warps=block_warps,
                 free_rows=bool(self.placement.free_contact_rows),
@@ -1163,6 +1180,7 @@ class Sweep:
             },
             **{name: plan.kernels[name] for name in ("sparse", "sparse_diagonal", "mf_gs")},
             "mf_gs_storage": self._record_storage(),
+            "mf_gs_active_reason": self.general_active_reason,
             "mf_colored": self._record_colored(plan),
             "tiers": self._record_tiers(plan.route),
             "readout": {
