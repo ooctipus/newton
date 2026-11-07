@@ -268,6 +268,10 @@ class TreeKineticState:
             diagonal=self.diagonal_mass,
             two_half=self.two_half,
         )
+        # A rest tree (no coordinates) predicts nothing: no force, solve or response launch.
+        self.force_kernel = self.walk_solve_kernel = self.predictor_kernel = None
+        if not layout.dofs:
+            return
         classes = self._walk_classes()
         self.force_kernel = native.get_force_kernel(
             self.schedules, layout=layout, response=self._response, classes=classes
@@ -470,7 +474,9 @@ class TreeKineticState:
         )
 
     def predict(self, state_in, state_aug, control, stage3_qd, dt):
-        """Apply live force buckets through held W with original root transport."""
+        """Apply live force buckets through held W with original root transport (a rest tree has none)."""
+        if self.predictor_kernel is None:
+            return
         solver = self.solver
         force = self._force_input(state_in, state_aug, control, stage3_qd, dt)
         walk = solver.factor.walk_view()

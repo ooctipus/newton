@@ -425,12 +425,14 @@ def held_lanes(tree: TreePlan, groups: int, device: Device) -> int:
     repair of 4096 trees at each lane width, and the construction-time timings the replaced lane choice recorded in
     the gate's tasks): this width ran within 3% of the fastest width of every tree of up to 32 bodies. The
     coordinates do not set it: the 13-body, 21-coordinate Franka forest runs 27% slower at 32 lanes than at 16, a
-    one-body tree 8% slower at 4 lanes than at 8. On the CPU each tree takes a block of its own (32 lanes, two warps
+    one-body tree 8% slower at 4 lanes than at 8. A one-body rest tree (no coordinates: its finish publishes a pose)
+    takes one lane, bitwise with eight (`79e9e7b9`). On the CPU each tree takes a block of its own (32 lanes, two warps
     past 32 bodies): one thread runs it serially.
     """
     if not device.cuda:
         return 64 if tree.count > 32 else 32
-    lanes = shape(Work(groups, Use.SCAN, width=tree.count, least=8, most=64), device).lanes
+    least = 1 if tree.count == 1 and int(tree.dof_start[-1]) == 0 else 8
+    lanes = shape(Work(groups, Use.SCAN, width=tree.count, least=least, most=64), device).lanes
     while lanes < 32 and groups % (32 // lanes):
         lanes *= 2
     return lanes
@@ -853,7 +855,8 @@ def get_helpers(
     collect_source = layout.native(
         _COLLECT,
         preludes=(STATUS_CLOCK,),
-        REDUCE=reduction,
+        # A rest tree (no coordinates) collects nothing: no bias, no H_ii.
+        REDUCE=reduction if layout.dofs else "",
         CURRENT_VALID=_current_valid(layout),
         DIAGONAL=_DIAGONAL if diagonal else "",
         **_native_clocks(clocked, "cache", stages=2, column=13),
@@ -1000,7 +1003,8 @@ def get_state_kernel(
     joints. Both store relative joint poses; scan poses and publish
     articulation origins; store joint axes and relative velocities and scan
     motion; publish bodies with their bias wrenches and moments; and collect
-    bias, geometry and validity.
+    bias, geometry and validity. A rest tree (no coordinates) publishes its
+    poses, a zero twist, its origin and its validity alone.
 
     Every finish and repair takes one launch ABI, which keeps each stage one
     call below the kernel: after the six common arguments, the alternate
@@ -1035,6 +1039,9 @@ def get_state_kernel(
     axis_word, origin_word = layout.axis_offset, layout.origin_offset
     bodies, dofs, pack, free_root = layout.bodies, layout.dofs, layout.pack, layout.free_root
     roots, free_roots, forest, own_bias = len(layout.roots), layout.free_root_count, layout.forest, layout.own_bias
+    # A rest tree (no coordinates: a body or a weld chain on the world) publishes its poses, a zero twist and its
+    # validity; it integrates nothing, has no motion and collects nothing (no bias, no H_ii, no walk geometry).
+    rest = dofs == 0
     from .spatial_laws import store_columns  # noqa: PLC0415
 
     @wp.func
@@ -1370,18 +1377,23 @@ def get_state_kernel(
             data.body_q[body] = wp.transform(
                 wp.transform_get_translation(pose) + shift, wp.transform_get_rotation(pose)
             )
-            body_terms(
-                g,
-                body,
-                local,
-                pose,
-                pose * data.body_X_com[body],
-                origin,
-                load_words(g.address, wp.static(motion_word) + 6 * local, wp.spatial_vector()),
-                load_words(g.address, wp.static(bias_word) + 6 * local, wp.spatial_vector()),
-                data,
-                cache,
-            )
+            if wp.static(rest):
+                data.body_qd[body] = wp.spatial_vector()
+                if wp.static(body_velocity):
+                    data.body_v_s[body] = wp.spatial_vector()
+            else:
+                body_terms(
+                    g,
+                    body,
+                    local,
+                    pose,
+                    pose * data.body_X_com[body],
+                    origin,
+                    load_words(g.address, wp.static(motion_word) + 6 * local, wp.spatial_vector()),
+                    load_words(g.address, wp.static(bias_word) + 6 * local, wp.spatial_vector()),
+                    data,
+                    cache,
+                )
         _sync()
 
     @wp.func
@@ -1444,13 +1456,16 @@ def get_state_kernel(
         q = data.joint_q
         qd = data.joint_qd
         if wp.static(finish):
-            accelerations(g, data)
+            if wp.static(not rest):
+                accelerations(g, data)
             if wp.static(clocked):
                 clock_i1 = _clock()
-            transport(g, plan, data)
+            if wp.static(not rest):
+                transport(g, plan, data)
             if wp.static(clocked):
                 clock_i2 = _clock()
-            integrate(g, data)
+            if wp.static(not rest):
+                integrate(g, data)
             q = data.joint_q_new
             qd = data.joint_qd_new
         if wp.static(clocked):
@@ -1468,7 +1483,8 @@ def get_state_kernel(
             qd = motion_qd
         if wp.static(clocked):
             clock_3 = _clock()
-        motion(g, origin, shift, plan, data, q, qd)
+        if wp.static(not rest):
+            motion(g, origin, shift, plan, data, q, qd)
         if wp.static(clocked):
             clock_4 = _clock()
         publish(g, origin, shift, plan, data, cache)

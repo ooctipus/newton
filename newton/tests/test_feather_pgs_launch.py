@@ -89,14 +89,20 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
                         self.assertEqual((got.lanes, got.block), (walk_group(bodies, joins, trees, device.sms), 64))
 
     def test_held_lanes_are_a_scan(self):
+        def tree(bodies, dofs):
+            return types.SimpleNamespace(count=bodies, dof_start=np.array([0, dofs]))
+
         for device in (PRO, GB300):
             for bodies, groups, lanes in ((1, 16384, 8), (3, 16384, 8), (13, 16384, 16), (30, 16384, 32), (40, 3, 64)):
                 with self.subTest(arch=device.arch, bodies=bodies):
-                    tree = types.SimpleNamespace(count=bodies)
-                    self.assertEqual(tree_kinetic_state.held_lanes(tree, groups, device), lanes)
+                    self.assertEqual(tree_kinetic_state.held_lanes(tree(bodies, bodies), groups, device), lanes)
+            # A one-body rest tree (no coordinates) takes one lane; a two-body one scans its weld at eight.
+            self.assertEqual(tree_kinetic_state.held_lanes(tree(1, 0), 16384, device), 1)
+            self.assertEqual(tree_kinetic_state.held_lanes(tree(2, 0), 16384, device), 8)
             # Whole 32-thread blocks: three one-body trees take a warp each.
-            self.assertEqual(tree_kinetic_state.held_lanes(types.SimpleNamespace(count=1), 3, device), 32)
-        self.assertEqual(tree_kinetic_state.held_lanes(types.SimpleNamespace(count=1), 3, CPU), 32)
+            self.assertEqual(tree_kinetic_state.held_lanes(tree(1, 1), 3, device), 32)
+            self.assertEqual(tree_kinetic_state.held_lanes(tree(1, 0), 3, device), 32)
+        self.assertEqual(tree_kinetic_state.held_lanes(tree(1, 1), 3, CPU), 32)
 
     def test_support_walkers_are_two_waves_of_their_line(self):
         for device in (PRO, GB300):
