@@ -604,7 +604,7 @@ class TestLoopJointTypes(unittest.TestCase):
         b.add_articulation(joints)
         loop = b.add_joint_revolute(bodies[0], bodies[1], axis=wp.vec3(0.0, 1.0, 0.0))
         b.joint_qd[0] = 8.0
-        b.gravity = 0.0
+        b.gravity = (0.0, 0.0, 0.0)
         model = b.finalize()
         model.set_gravity((0.0, 0.0, 0.0))
         _, state = _simulate(model, steps=240)

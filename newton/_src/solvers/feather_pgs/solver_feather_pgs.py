@@ -151,6 +151,7 @@ class SolverFeatherPGS(SolverBase):
     # contact buffers (test_contact_reduction_body_pairs). Warm-start modes have
     # stricter contact-identity requirements and reject those buffers in step().
     supports_body_pair_reduced_contacts: bool = True
+    SUPPORTED_OBSERVABLES = frozenset({SolverBase.ObservableKind.CONTACT_F})
 
     joint_qd_public_convention: bool = True
     """Whether free-joint ``joint_qd`` uses Newton's public twist convention.
@@ -899,11 +900,23 @@ class SolverFeatherPGS(SolverBase):
         contacts: Contacts,
         dt: float,
         collide_done_event=None,
+        *,
+        observables: SolverBase.Observables | None = None,
     ):
+        """Advance one step; with :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F` requested in
+        ``observables``, also write each contact's solved force into ``observables.contact_f``.
+
+        The contact force is linear only: its torque half is zero, not a solved wrench about body0's center of
+        mass. With persistent patches, normal and friction rows can act at different points, so crossing the
+        contact point with the combined force does not recover the solved torque.
+        """
         # The call's checks come first, before any state is read; then the plan's stages (step_plan.StepPlan.stages).
         if state_in.requires_grad or state_out.requires_grad:
             raise ValueError("FeatherPGS has no gradients: step states built with requires_grad=False.")
+        self.validate_observables(observables, contacts)
         self._plan.run(Step(state_in, state_out, control, contacts, dt, collide_done_event, self._step))
+        if observables is not None and observables.is_requested(SolverBase.ObservableKind.CONTACT_F):
+            self.sweep.forces(contacts, observables.contact_f)
         return state_out
 
     def constraint_capacity_status(self, *, clear: bool = False) -> dict[str, bool]:
@@ -982,18 +995,6 @@ class SolverFeatherPGS(SolverBase):
         return self.placement.row_watermarks()
 
     @override
-    def update_contacts(self, contacts: Contacts) -> None:
-        """Populate linear contact forces from the last FeatherPGS solve.
-
-        This path reports linear force only: the torque components of
-        ``contacts.force`` are zero placeholders, not a solved wrench about
-        body0's center of mass. With persistent patches, normal and friction
-        rows can act at different points, so crossing the current contact point
-        with the combined force does not recover the solved torque. This export
-        is not suitable for contact-wrench sensing.
-        """
-        self.sweep.forces(contacts)
-
     def _eval_particle_forces(self, state_in: State, control: Control, contacts: Contacts):
         model = self.model
 

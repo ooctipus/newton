@@ -44,9 +44,9 @@ Scenes and features
 
 Metrics
     Computed on the host from the model, the states before and after each
-    step, the step's contacts and the forces
-    :meth:`~newton.solvers.SolverFeatherPGS.update_contacts` exports into
-    ``Contacts.rigid_contact_force``, never from route-private buffers. Contact
+    step, the step's contacts and the forces a step with the ``CONTACT_F``
+    observable requested exports into ``Contacts.rigid_contact_force``, never
+    from route-private buffers. Contact
     laws use the step's post-solve velocities at its pre-step pose, the pose its
     rows linearize:
 
@@ -326,6 +326,8 @@ def simulate(
         control = model.control()
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
         initial = {name: getattr(state, name).numpy().copy() for name in STATE_FIELDS}
+        # The step writes the solve's contact forces (contacts.rigid_contact_force) with CONTACT_F requested.
+        observables = solver.observables(contacts=contacts, kinds={solver.ObservableKind.CONTACT_F})
 
         def step_arrays():
             arrays = {name: getattr(contacts, name)[:recorded] for name in CONTACT_FIELDS}
@@ -356,8 +358,7 @@ def simulate(
             if recorder is None:
                 recorder = _Recorder(step_arrays(), steps, model.device)
             recorder.record(step, pre)
-            solver.step(state, out, control, contacts, scene.dt)
-            solver.update_contacts(contacts)
+            solver.step(state, out, control, contacts, scene.dt, observables=observables)
             newton.eval_fk(model, state.joint_q, out.joint_qd, scratch)
             for name in STATE_FIELDS:
                 wp.copy(getattr(state, name), getattr(out, name))

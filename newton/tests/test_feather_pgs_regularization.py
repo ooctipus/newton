@@ -239,12 +239,12 @@ def test_regularization_indeterminate_split(test: unittest.TestCase, device):
         s0, s1 = model.state(), model.state()
         control = model.control()
         newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
+        observables = solver.observables(contacts=contacts, kinds={solver.ObservableKind.CONTACT_F})
         for _k in range(120):
             pipeline.collide(s0, contacts)
             s0.clear_forces()
-            solver.step(s0, s1, control, contacts, DT)
+            solver.step(s0, s1, control, contacts, DT, observables=observables)
             s0, s1 = s1, s0
-        solver.update_contacts(contacts)
 
         count = int(contacts.rigid_contact_count.numpy()[0])
         shape0 = contacts.rigid_contact_shape0.numpy()[:count]

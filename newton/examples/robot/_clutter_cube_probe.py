@@ -213,6 +213,8 @@ class Example:
             mf_max_constraints=256,
             diagnostics=newton.solvers.SolverFeatherPGS.Diagnostics(row_watermark=True),
         )
+        # Every step writes the solve's contact forces, which measure() reads.
+        self.observables = self.solver.observables(contacts=self.contacts, kinds={self.solver.ObservableKind.CONTACT_F})
         self.current, self.next = self.model.state(), self.model.state()
         self.control = self.model.control()
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.current)
@@ -296,7 +298,9 @@ class Example:
                 ],
             )
             self.pipeline.collide(self.current, self.contacts)
-            self.solver.step(self.current, self.next, self.control, self.contacts, self.dt)
+            self.solver.step(
+                self.current, self.next, self.control, self.contacts, self.dt, observables=self.observables
+            )
             self.current, self.next = self.next, self.current
 
     def envelope(self):
@@ -334,7 +338,6 @@ class Example:
         center = np.asarray(self.data["cube_center"])
         loads = self.measured_load.numpy()
         stopped = self.stop_reason.numpy()
-        self.solver.update_contacts(self.contacts)
         count = int(self.contacts.rigid_contact_count.numpy()[0])
         body_a = self.shape_body[self.contacts.rigid_contact_shape0.numpy()[:count]]
         body_b = self.shape_body[self.contacts.rigid_contact_shape1.numpy()[:count]]

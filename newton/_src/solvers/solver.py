@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
+import weakref
 from copy import copy
 from dataclasses import Field, dataclass, fields
 from dataclasses import field as dataclass_field
@@ -14,6 +15,7 @@ from typing import Any, ClassVar
 
 import warp as wp
 
+from ..core.contact_pool import ContactField
 from ..core.reset import normalize_reset_world_mask
 from ..geometry import ParticleFlags
 from ..sim import BodyFlags, CollisionPipeline, Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
@@ -233,6 +235,27 @@ def _contact_row_count(frequency: Model.AttributeFrequency, contacts: Contacts) 
     return contacts.rigid_contact_max + contacts.soft_contact_max
 
 
+def _observable_rows_publisher(observables):
+    """Return the callback that assigns a growing contact-indexed array to every container sharing it.
+
+    The containers are held weakly, so the rows (which the source keeps) do not keep them alive.
+    """
+    sharing = observables._sharing
+
+    def publish(rows):
+        for ref in list(sharing):
+            container = ref()
+            if container is None:
+                sharing.remove(ref)
+                continue
+            for name, view in rows.views.items():
+                # A selection that omitted the field keeps it None.
+                if container is observables or getattr(container, name) is not None:
+                    setattr(container, name, view)
+
+    return publish
+
+
 class SolverBase:
     """Generic base class for solvers.
 
@@ -384,6 +407,10 @@ class SolverBase:
         # Selections share this mapping, so a step through any subset updates
         # the source and its siblings for exactly the arrays it wrote.
         _contact_layouts: dict[str, Contacts] = dataclass_field(default_factory=dict, init=False, repr=False)
+        # Contact-indexed arrays that follow their contacts' rigid rows, keyed by kind (kept alive here), and the
+        # containers sharing them (the source and its selections, weakly), which each growth publishes to.
+        _contact_rows: dict[str, Any] = dataclass_field(default_factory=dict, init=False, repr=False)
+        _sharing: list = dataclass_field(default_factory=list, init=False, repr=False)
 
         @classmethod
         def _observable_fields(cls) -> Mapping[str, tuple[str, _ObservableField]]:
@@ -479,6 +506,7 @@ class SolverBase:
             for kind in self.kinds.difference(requested):
                 name, _ = declarations[kind]
                 setattr(selected, name, None)
+            self._sharing.append(weakref.ref(selected))
             return selected
 
         def _contact_fields(self) -> dict[str, tuple[str, _ObservableField]]:
@@ -851,6 +879,7 @@ class SolverBase:
         observables = self.Observables()
         observables._kinds = requested
         observables._solver = self
+        observables._sharing.append(weakref.ref(observables))
         if requires_grad is None:
             requires_grad = self.model.requires_grad
         contact_fields = observables._contact_fields()
@@ -864,6 +893,13 @@ class SolverBase:
         # Declaration order makes allocation deterministic even for unordered requests.
         for kind, (name, spec) in declarations.items():
             if kind not in requested:
+                continue
+            pool = getattr(contacts, "_rigid_contact_pool", None) if kind in contact_fields else None
+            if pool is not None and spec.frequency != Model.AttributeFrequency.CONTACT_SOFT:
+                # The rigid rows grow with the contacts' pool; the soft rows follow them.
+                soft = contacts.soft_contact_max if spec.frequency == Model.AttributeFrequency.CONTACT else 0
+                field = ContactField(name, spec.dtype, extra=soft, requires_grad=requires_grad)
+                observables._contact_rows[kind] = pool.rows([field], on_rows=_observable_rows_publisher(observables))
                 continue
             if kind in contact_fields:
                 count = _contact_row_count(spec.frequency, contacts)

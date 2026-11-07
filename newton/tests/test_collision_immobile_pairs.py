@@ -187,9 +187,11 @@ def test_broad_phases_drop_only_immobile_pairs(test, device):
                 dropped = {tuple(sorted((world[a], world[b]))) for a, b in (
                     ("ground", "base"),  # welded to the world, on a static shape
                     ("ground", "mount"),  # welded through a chain of two fixed joints
-                    ("ground", "table"),  # two static shapes of different builders
                     ("base", "post"),  # two welded bodies
                 )}  # fmt: skip
+                # Two static shapes of different builders never pair: every broad phase drops static pairs.
+                static = tuple(sorted((world["ground"], world["table"])))
+                test.assertNotIn(static, set(unfiltered))
                 retained = {tuple(sorted((world[a], world[b]))) for a, b in (
                     ("ground", "kinematic"),  # a kinematic body can move
                     ("kinematic", "free"),
