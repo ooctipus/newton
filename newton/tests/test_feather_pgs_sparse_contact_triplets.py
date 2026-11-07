@@ -760,12 +760,12 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
                 # contact carries a spin row and the sweep is the plain variant (RowLaw.SPIN).
                 self.assertFalse(solver.laws.spin_rows)
                 self.assertTrue(key.endswith(suffix), key)
-                self.assertEqual(solver.sweep.sparse_contact_triplets, "contact_triplets" in suffix)
+                self.assertEqual(solver.spec.classes.packed.sweep["contact_triplets"], "contact_triplets" in suffix)
         with mock.patch.dict(os.environ, {}, clear=True):
             packed = _make_solver(_build_model(), True)
-        self.assertEqual(packed.sweep.sparse_solve_lanes, 16)
-        self.assertFalse(packed.sweep.sparse_contact_triplets)
-        self.assertIn("16-lane", packed.sweep.sparse_contact_triplets_reason)
+        self.assertEqual(packed.spec.classes.packed.sweep["lanes_per_world"], 16)
+        self.assertFalse(packed.spec.classes.packed.sweep["contact_triplets"])
+        self.assertIn("16-lane", packed.spec.classes.packed.contact_triplets_reason)
 
 
 def check_frozen_payload(path, *, device="cuda:0"):

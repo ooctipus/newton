@@ -147,11 +147,6 @@ class Sweep:
         self.support_du_base = None
         self.leaves = False
         self.placement.sparse_row_support = _SparseRowSupport()
-        self.sparse_contact_triplets = False
-        # Route details for get_path_selection(), set where the sparse owner is admitted.
-        self.sparse_active_rows = False
-        self.sparse_active_rows_reason = "Native sparse factors are not selected."
-        self.sparse_contact_triplets_reason = "Native sparse factors are not selected."
         # The admitted contact units' block records.
         self.placement.sparse_contact_records = None
         self.placement.friction_metric = None
@@ -159,12 +154,6 @@ class Sweep:
         if choice is None:
             return
         sweep, max_support = dict(choice.sweep), choice.max_support
-        self.sparse_active_rows = sweep["active_rows"]
-        self.sparse_active_rows_reason = choice.active_rows_reason
-        self.sparse_contact_triplets = sweep["contact_triplets"]
-        self.sparse_contact_triplets_reason = choice.contact_triplets_reason
-        self.sparse_solve_lanes = sweep["lanes_per_world"]
-        self.sparse_local_factors = sweep["local_factors"]
         self.sparse_velocity_limits = choice.velocity_limits
         self.factor.allocate_sparse(choice.plan)
         self.placement.sparse_body_dof_mask = wp.array(choice.body_masks, dtype=wp.uint64, device=model.device)
@@ -172,7 +161,7 @@ class Sweep:
             self.placement.sparse_row_support = row_supports(
                 choice.support_classes, self.forest.world_count, self.placement.dense_max_constraints, model.device
             )
-        if self.sparse_contact_triplets or self.laws.spin_rows:
+        if sweep["contact_triplets"] or self.laws.spin_rows:
             # Static storage for graph capture: the builder writes the block records of each step's
             # contact units, every friction triple's metric among them where spin rows may appear; linked sweeps add
             # each anchor's ring members once per call.
@@ -1095,24 +1084,25 @@ class Sweep:
                 "reason": "One articulation factor and one free body per world share one response"
                 + (" in factor coordinates." if factor else " with a register inverse."),
             }
-        diagonal = classes.diagonal
-        size = row.sizes["packed"]
+        diagonal, packed = classes.diagonal, classes.packed
+        # The class plan's choice holds native sparse factors' options and their reasons (class_plan.Packed).
+        options, unselected = dict(packed.sweep) if packed else {}, "Native sparse factors are not selected."
         sparse = {
-            "size": json_value(size),
+            "size": json_value(row.sizes["packed"]),
             "reason": row.reasons["K1"],
             "velocity_limits": bool(self.sparse_velocity_limits),
-            "active_rows": bool(self.sparse_active_rows),
-            "active_rows_reason": self.sparse_active_rows_reason,
+            "active_rows": bool(options.get("active_rows")),
+            "active_rows_reason": packed.active_rows_reason if packed else unselected,
             "support_table": bool(self.placement.sparse_row_support.enabled),
-            "contact_triplets": bool(self.sparse_contact_triplets),
-            "contact_triplets_reason": self.sparse_contact_triplets_reason,
+            "contact_triplets": bool(options.get("contact_triplets")),
+            "contact_triplets_reason": packed.contact_triplets_reason if packed else unselected,
         }
-        if size is not None:
+        if packed:
             sparse.update(
                 {
-                    "max_row_support": json_value(classes.packed.max_support),
-                    "solve_lanes": int(self.sparse_solve_lanes),
-                    "local_factors": bool(self.sparse_local_factors),
+                    "max_row_support": json_value(packed.max_support),
+                    "solve_lanes": int(options["lanes_per_world"]),
+                    "local_factors": bool(options["local_factors"]),
                     "units_kernel": kernel_key(self.support_units_kernel),
                     "writer_kernel": kernel_key(self.support_rows),
                     "leave_kernel": kernel_key(self.factor.walk_leave),

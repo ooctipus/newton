@@ -154,8 +154,8 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
             with self.subTest(law=name):
                 solver = SolverFeatherPGS(model, **law, **options)
                 self.assertEqual(solver.spec.classes.packed_size, 18)
-                self.assertFalse(solver.sweep.sparse_active_rows)
-                self.assertIn("bitsets exceed shared memory", solver.sweep.sparse_active_rows_reason)
+                self.assertFalse(solver.spec.classes.packed.sweep["active_rows"])
+                self.assertIn("bitsets exceed shared memory", solver.spec.classes.packed.active_rows_reason)
                 self.assertNotIn("_active", solver.sweep.sparse_kernel.key)
                 self.assertIn(f"{full.bytes}/{budget}", solver._plan.route.reasons["K1"])
 
@@ -165,11 +165,11 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         solvers = {"on": _make_solver(model, True)}
         solvers["off"] = _make_solver(model, True, pins={"active_rows": False})
         for solver in solvers.values():
-            self.assertEqual(solver.sweep.sparse_solve_lanes, 16)
-            self.assertFalse(solver.sweep.sparse_active_rows)
+            self.assertEqual(solver.spec.classes.packed.sweep["lanes_per_world"], 16)
+            self.assertFalse(solver.spec.classes.packed.sweep["active_rows"])
             self.assertIn("_lanes16", solver.sweep.sparse_kernel.key)
         self.assertIs(solvers["on"].sweep.sparse_kernel, solvers["off"].sweep.sparse_kernel)
-        self.assertIn("16-lane", solvers["on"].sweep.sparse_active_rows_reason)
+        self.assertIn("16-lane", solvers["on"].spec.classes.packed.active_rows_reason)
         runs = {name: _rollout(solver, model, steps=24) for name, solver in solvers.items()}
         np.testing.assert_array_equal(runs["on"][0], runs["off"][0])
         self.assertGreater(runs["on"][1].min(), 0)
@@ -199,7 +199,7 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         # spin rows (``_torsion``).
         self.assertRegex(solvers["1"].sweep.sparse_kernel.key, r"_\d+_support_table_contact_triplets_linked_torsion$")
         self.assertRegex(solvers["0"].sweep.sparse_kernel.key, r"_\d+_support_table_torsion$")
-        self.assertFalse(solvers["1"].sweep.sparse_active_rows)
+        self.assertFalse(solvers["1"].spec.classes.packed.sweep["active_rows"])
         runs = {name: _rollout(solver, model, steps=120, slide_world=1, speed=0.6) for name, solver in solvers.items()}
         anchors, ordinary_anchors = runs["1"][0], runs["0"][0]
         self.assertTrue(np.any(ordinary_anchors[:, 1] < 4), "The sliding world must release anchors")
@@ -241,8 +241,8 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         options = {"dense_max_constraints": 96, "pgs_iterations": 8, "enable_joint_limits": False}
         solvers = {"active": _make_solver(model, True, pins=_UNFUSED, **options)}
         solvers["full"] = _make_solver(model, True, pins={**_UNFUSED, "active_rows": False}, **options)
-        self.assertTrue(solvers["active"].sweep.sparse_active_rows)
-        self.assertFalse(solvers["full"].sweep.sparse_active_rows)
+        self.assertTrue(solvers["active"].spec.classes.packed.sweep["active_rows"])
+        self.assertFalse(solvers["full"].spec.classes.packed.sweep["active_rows"])
         runs = {name: _rollout(solver, model, steps=240, slide_world=1, speed=0.6) for name, solver in solvers.items()}
         anchors, full_anchors = runs["active"][0], runs["full"][0]
         np.testing.assert_array_equal(runs["active"][1], runs["full"][1])

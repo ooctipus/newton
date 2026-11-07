@@ -179,7 +179,7 @@ def _over_budget_rows(model) -> int:
             rows,
             probe.forest.max_world_dofs,
             probe.spec.classes.packed.max_support,
-            active_rows=probe.sweep.sparse_active_rows,
+            active_rows=probe.spec.classes.packed.sweep["active_rows"],
             linked_rows=True,
         ).staging
 
@@ -418,7 +418,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         """
         dense = _case(False, robot_count=2)
         sparse = _case(True, robot_count=2, pins={"active_rows": False})
-        self.assertFalse(sparse[1].sweep.sparse_active_rows)
+        self.assertFalse(sparse[1].spec.classes.packed.sweep["active_rows"])
         self.assertEqual(sparse[1].spec.classes.packed_size, 9)
         self.assertEqual(sparse[1].forest.group_to_art[9].shape[0], 4)
         self.assertEqual(sparse[1].forest.world_count, 2)
