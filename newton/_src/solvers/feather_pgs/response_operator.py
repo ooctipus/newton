@@ -24,6 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from ...core.memory import Buffer
+from .device_preludes import BLOCK_THREADS, VirtualLanes
 from .factor.walk import WALK_COORDINATE, WALK_LINK
 from .solve_policy import terms_bound
 
@@ -172,7 +173,6 @@ def _push_prologue(response: Callable[[str, str], str], lanes: Lanes, dofs: int,
         f"    for (int j = 0; j < {rows}; ++j) acc += {response('j', 'd')} * s_x[j];",
         "    s_dv[d] = acc;",
         "}",
-        "SYNC();",
     ]
 
 
@@ -334,6 +334,8 @@ class TransposedResponse(ResponseOperator):
     walked: WalkedRows
     lanes: Lanes = Lanes()
     rows: str = "n_rows"
+    group: VirtualLanes = BLOCK_THREADS
+    """The block's lanes: CUDA's threads, or the CPU's virtual lanes, each with its row's registers ``Jr``."""
 
     def __post_init__(self):
         if self.walked is None:
@@ -360,9 +362,13 @@ class TransposedResponse(ResponseOperator):
             buffers.append(Buffer("s_dvp", "float", self.chunks * D))
         return tuple(buffers)
 
-    def registers(self, indent: str) -> str:
-        """Declare each lane's row registers ``Jr``, which the stage fills (:meth:`WalkedRows.stage`)."""
-        return f"{indent}float Jr[{self.dofs}];"
+    def registers(self) -> tuple[tuple[str, str], ...]:
+        """Each lane's row registers ``Jr``, which the stage fills (:meth:`WalkedRows.stage`)."""
+        return (("float", f"Jr[{self.dofs}]"),)
+
+    def declarations(self, indent: str) -> str:
+        """Declare the lanes' registers ahead of the phases: on CUDA ``Jr`` (the phases declare the rows' own)."""
+        return self.group.declarations(indent, f"{indent}float Jr[{self.dofs}];")
 
     def jacobi_stage(
         self,
@@ -378,37 +384,53 @@ class TransposedResponse(ResponseOperator):
         zero impulse; ``padding`` pads the rows' impulses.
         """
         lane, width, D, AM, rows = self.lanes.lane, self.lanes.width, self.dofs, self.capacity, self.rows
-        stage = [self.walked.stage("s_Yt", indent=indent)]
-        lines = [
+        group = self.group
+        stage = self.walked.stage("s_Yt", indent=indent)
+        zero = [
             f"for (int e = {lane}; e < {D} * 4; e += {width}) {{",
             "    const int d = e >> 2;",
             f"    const int j = {rows} + (e & 3);",
             f"    if (j < {AM}) {self._yt('j', 'd')} = 0.0f;",
             "}",
             idle,
-            "SYNC();",
-            *self._jacobi_steps(scale, counted),
-            padding,
-            "SYNC();",
         ]
-        return "\n".join([*stage, _lines(lines, indent)])
+        return "\n".join(
+            [
+                group.phase(stage + "\n" + _lines(zero, indent)),
+                group.barrier(indent),
+                self._steps(scale, counted, indent, last=padding),
+            ]
+        )
 
-    def jacobi_steps(self, scale: Callable[[str, str, str], str], indent: str, *, counted: Callable[[str], str]) -> str:
-        """Set each admitted row's step from the column-sum bound over the counted rows; synchronized."""
-        return _lines([*self._jacobi_steps(scale, counted), "SYNC();"], indent)
+    def jacobi_steps(
+        self, scale: Callable[[str, str, str], str], indent: str, *, counted: Callable[[str], str], first: str = ""
+    ) -> str:
+        """Set each admitted row's step from the column-sum bound over the counted rows (after the lanes' ``first``
+        statements); synchronized."""
+        return self._steps(scale, counted, indent, first=first)
 
-    def _jacobi_steps(self, scale: Callable[[str, str, str], str], counted: Callable[[str], str]) -> list[str]:
+    def _steps(
+        self,
+        scale: Callable[[str, str, str], str],
+        counted: Callable[[str], str],
+        indent: str,
+        *,
+        first: str = "",
+        last: str = "",
+    ) -> str:
         """The column sums over the counted rows, then each admitted row's ``A_ii``, bound and step (lane ``i``'s row
-        in its registers)."""
-        lane, width, D, rows = self.lanes.lane, self.lanes.width, self.dofs, self.rows
-        return [
+        in its registers), each a phase, the lanes' ``first`` and ``last`` statements in the first and the last."""
+        lane, width, D, rows, group = self.lanes.lane, self.lanes.width, self.dofs, self.rows, self.group
+        sums = [
+            *([first] if first else []),
             f"for (int d = {lane}; d < {D}; d += {width}) {{",
             "    float csum = 0.0f;",
             f"    for (int j = 0; j < {rows}; ++j)",
             f"        if ({counted('j')}) csum += fabsf({self._yt('j', 'd')});",
             "    s_colsum[d] = csum;",
             "}",
-            "SYNC();",
+        ]
+        steps = [
             f"for (int i = {lane}; i < {rows}; i += {width}) {{",
             "    const float* Ji = Jr;",
             "    if (s_kind[i] >= 0) {",
@@ -421,17 +443,30 @@ class TransposedResponse(ResponseOperator):
             scale("aii", "bound", "        "),
             "    }",
             "}",
+            *([last] if last else []),
         ]
+        return "\n".join(
+            [
+                group.phase(_lines(sums, indent)),
+                group.barrier(indent),
+                group.phase(_lines(steps, indent)),
+                group.barrier(indent),
+            ]
+        )
 
     def gather(self, indent: str) -> str:
         """``w = Y^T y`` (``s_dv``): a lane per coordinate and chunk of float4 row groups, four accumulators joined
         pairwise, the chunks' partial sums (``s_dvp``) added in chunk order; synchronized."""
         lane, width, D, chunks = self.lanes.lane, self.lanes.width, self.dofs, self.chunks
         store = "s_dv[d]" if chunks == 1 else f"s_dvp[ch * {D} + d]"
-        lines = [
+        group = self.group
+        # On the CPU the virtual lanes take the coordinates and chunks CUDA's do: the same sums in the same order.
+        head = [
             "{",
             f"    const int n4 = ({self.rows} + 3) >> 2;",
             f"    const int per = (n4 + {chunks - 1}) / {chunks};",
+        ]
+        lines = [
             f"    if ({lane} < {chunks * D}) {{",
             f"        const int d = {lane} % {D};",
             f"        const int ch = {lane} / {D};",
@@ -446,20 +481,20 @@ class TransposedResponse(ResponseOperator):
             "        }",
             f"        {store} = (a0 + a1) + (a2 + a3);",
             "    }",
-            "    SYNC();",
         ]
+        parts = [_lines(head, indent), group.phase(_lines(lines, indent)), group.barrier(indent + "    ")]
         if chunks > 1:
-            lines += [
+            join = [
                 f"    for (int d = {lane}; d < {D}; d += {width}) {{",
                 "        float acc = 0.0f;",
                 "        #pragma unroll",
                 f"        for (int ch = 0; ch < {chunks}; ++ch) acc += s_dvp[ch * {D} + d];",
                 "        s_dv[d] = acc;",
                 "    }",
-                "    SYNC();",
             ]
-        lines.append("}")
-        return _lines(lines, indent)
+            parts += [group.phase(_lines(join, indent)), group.barrier(indent + "    ")]
+        parts.append(_lines(["}"], indent))
+        return "\n".join(parts)
 
     def jacobi_residual(self, out: str, indent: str) -> str:
         """``float out = b'_i + J_i w``, in coordinate order from ``b'_i``."""
@@ -476,8 +511,9 @@ class TransposedResponse(ResponseOperator):
         return self.walked.publish(lambda row: self._yt(row, "d"), applied, indent)
 
     def push_prologue(self, indent: str) -> str:
-        """``w = Y^T x`` before the pushes of the last word."""
-        return _lines(_push_prologue(self._yt, self.lanes, self.dofs, self.rows), indent)
+        """``w = Y^T x`` before the pushes of the last word; synchronized."""
+        lines = _push_prologue(self._yt, self.lanes, self.dofs, self.rows)
+        return self.group.phase(_lines(lines, indent)) + "\n" + self.group.barrier(indent)
 
     def staged(self, lanes: Lanes) -> "SparseFactor":
         """The staged rows (``s_Yt``) on ``w`` (``s_dv``), the walked support class: the last word's row actions

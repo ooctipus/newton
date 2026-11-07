@@ -469,7 +469,8 @@ CPU_WORDS = DevicePrelude(
     "cpu_words",
     "    // CUDA's integer minimum and maximum and vector types: the device's own.",
     """    // CUDA's words the case bodies read on the CPU beyond CPU_MATH: the integer minimum and maximum, float4,
-    // make_int4 (CPU_MATH's int4) and the one thread's atomicMin.
+    // make_int4 (CPU_MATH's int4), the one thread's atomicMin and a declaration's alignment.
+    #define __align__(n) alignas(n)
     const auto min = [](auto a, auto b) { return b < a ? b : a; };
     const auto max = [](auto a, auto b) { return a < b ? b : a; };
     struct float4 { float x, y, z, w; };
@@ -480,9 +481,9 @@ CPU_WORDS = DevicePrelude(
         return old;
     };""",
 )
-"""CUDA's ``min``, ``max``, ``float4``, ``make_int4`` and ``atomicMin`` on the CPU, after :data:`CPU_MATH` (its
-``int4``), for the case bodies a lane group of one lane runs (:func:`group_native`): ``atomicMin`` is the one thread's
-plain minimum. CUDA has its own."""
+"""CUDA's ``min``, ``max``, ``float4``, ``make_int4``, ``atomicMin`` and ``__align__`` on the CPU, after :data:`CPU_MATH`
+(its ``int4``), for the case bodies a lane group of one lane runs (:func:`group_native`): ``atomicMin`` is the one
+thread's plain minimum, ``__align__`` C++'s ``alignas``. CUDA has its own."""
 
 
 def group_native(body: str, *, preludes: tuple[DevicePrelude, ...], lanes: int) -> str:
@@ -500,6 +501,80 @@ def group_native(body: str, *, preludes: tuple[DevicePrelude, ...], lanes: int) 
     if lanes == 1:
         return dual_native(body, preludes=(*preludes, CPU_MATH, CPU_WORDS))
     return cuda_native(body + "#endif\n", preludes=preludes)
+
+
+@dataclass(frozen=True)
+class VirtualLanes:
+    """A block group whose every lane runs a row (or unit) of its own between the block's barriers, on the device that
+    builds the body: the Jacobi tiers' and the colored mapping's group.
+
+    On CUDA the lanes are the block's threads: a phase (the statements between two barriers) is its own text, a
+    barrier ``SYNC()``, and a lane's register is declared where a phase first sets it. On the CPU (``serial``) one
+    thread runs the ``lanes`` lanes in turn: each lane's ``registers`` are an array over the lanes
+    (``<name>_lanes``), each phase a loop over the lanes that binds the lane's registers by their names, so a phase's
+    text is the same on both devices; a barrier is the loop's end and a register's declaration its assignment. The
+    statements every lane runs alike (a sweep's frame and exit, a reduction's result) stand outside the phases: once.
+
+    Args:
+        lanes: The group's lanes (whole warps on CUDA).
+        serial: One thread runs the lanes (the CPU, :func:`.execution.device_lanes` of one lane).
+        registers: Each lane's registers as ``(type, declarator)`` pairs, such as ``("float", "x_new")`` or
+            ``("float", "Jr[20]")``.
+    """
+
+    lanes: int
+    serial: bool = False
+    registers: tuple[tuple[str, str], ...] = ()
+
+    def declarations(self, pad: str, cuda: str = "") -> str:
+        """The registers' declarations ahead of the phases: on CUDA ``cuda`` (a body's registers that no phase
+        declares), on the CPU every register's array over the lanes."""
+        if not self.serial:
+            return cuda
+        lines = []
+        for kind, declarator in self.registers:
+            name, bracket, extent = declarator.partition("[")
+            lines.append(f"{pad}{kind} {name}_lanes[{self.lanes}]{bracket}{extent};")
+        return "\n".join(lines)
+
+    def _binds(self) -> str:
+        names = (declarator.partition("[")[0] for _, declarator in self.registers)
+        return " ".join(f"auto& {name} = {name}_lanes[lane];" for name in names)
+
+    def phase(self, text: str) -> str:
+        """A phase's statements (no barrier among them), each lane's: on the CPU a loop over the lanes at the text's
+        own indentation, the lane's registers bound by name."""
+        if not self.serial:
+            return text
+        if "SYNC()" in text:
+            raise ValueError("a phase of virtual lanes holds no barrier")
+        first = next((line for line in text.split("\n") if line.strip()), "")
+        pad = first[: len(first) - len(first.lstrip(" "))]
+        body = "\n".join("    " + line if line.strip() else line for line in text.split("\n"))
+        binds = f"{pad}    {self._binds()}\n" if self.registers else ""
+        return f"{pad}for (int lane = 0; lane < {self.lanes}; ++lane) {{\n{binds}{body}\n{pad}}}"
+
+    def barrier(self, pad: str) -> str:
+        """The block's barrier between two phases: ``SYNC()`` on CUDA, the phase loop's end (nothing) on the CPU."""
+        return "" if self.serial else f"{pad}SYNC();"
+
+    def declare(self, kind: str, *values: tuple[str, str]) -> str:
+        """Declare registers of type ``kind`` with their first ``(name, value)`` in a phase: CUDA's declaration, the
+        CPU's assignments to the lane's bound registers."""
+        if self.serial:
+            return " ".join(f"{name} = {value};" for name, value in values)
+        return f"{kind} {', '.join(f'{name} = {value}' for name, value in values)};"
+
+    def sum(self, out: str, term: str, pad: str) -> str:
+        """``float out``, the sum over the lanes of each lane's ``term`` in lane order: the CPU's form of the group's
+        ``SUM`` (CUDA's is the group's own ladder)."""
+        if not self.serial:
+            raise ValueError("a block's sum on CUDA is its lanes' ladder")
+        return f"{pad}float {out} = 0.0f;\n" + self.phase(f"{pad}{out} += {term};")
+
+
+BLOCK_THREADS = VirtualLanes(0)
+"""CUDA's block group: its lanes are the block's threads (no register arrays, no phase loops)."""
 
 
 # ---------------------------------------------------------------------------------------------------------------------

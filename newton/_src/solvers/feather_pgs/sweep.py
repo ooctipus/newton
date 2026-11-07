@@ -42,6 +42,7 @@ from typing import ClassVar, Protocol
 import warp as wp
 
 from ...core.memory import Buffer
+from .device_preludes import BLOCK_THREADS, VirtualLanes
 from .response_operator import Lanes, LaneVelocity, ResponseOperator, Velocity
 from .row_inputs import RowArgument
 from .row_kernels import (
@@ -2186,6 +2187,35 @@ class JacobiRows:
     types: bool = False
     weighted: bool = False
     torsion: bool = False
+    group: VirtualLanes = BLOCK_THREADS
+    """The block's lanes: CUDA's threads, or the CPU's virtual lanes (:meth:`registers`)."""
+
+    def registers(self) -> tuple[tuple[str, str], ...]:
+        """Each lane's registers of its row: its diagonal, frozen flag and weight, its residual at zero impulse and
+        step, and a sweep's update (:func:`jacobi_sweeps`)."""
+        weighted = (("int", "row_contact"), ("float", "row_w")) if self.weighted else ()
+        floats = (
+            "row_diag",
+            "row_rhs",
+            "row_step",
+            "row_inv_step",
+            "row_share",
+            "x_new",
+            "x_old",
+            "x_from",
+            "row_bound",
+        )
+        return (
+            *(("float", name) for name in floats),
+            ("int", "frozen"),
+            ("int", "row_joins"),
+            *weighted,
+        )
+
+    @property
+    def warp(self) -> bool:
+        """Whether the rows' lanes are one warp's threads, which exchange values by shuffle."""
+        return self.threads == 32 and not self.group.serial
 
     def buffers(self) -> tuple[Buffer, ...]:
         """The rows' state and metadata."""
@@ -2233,16 +2263,17 @@ class JacobiRows:
             f"    row_contact = row_type == {CONTACT};" if self.weighted else "",
             "}",
         ]
-        lines.insert(0, "int frozen = 0;")
+        group = self.group
+        lines.insert(0, group.declare("int", ("frozen", "0")))
         if self.weighted:
-            lines.insert(0, "int row_contact = 0;")
+            lines.insert(0, group.declare("int", ("row_contact", "0")))
         # The lane's own row's diagonal (a row each: the loop runs at most once per lane).
-        lines.insert(0, "float row_diag = 0.0f;")
+        lines.insert(0, group.declare("float", ("row_diag", "0.0f")))
         return indent("\n".join(line for line in lines if line), pad)
 
     def freeze(self, pad: str = "    ") -> str:
         """Freeze the rows whose formed diagonal is not positive, after the staging's barrier; synchronized."""
-        return f"{pad}if (frozen) s_kind[lane] = {JACOBI_FROZEN};\n{pad}SYNC();"
+        return self.group.phase(f"{pad}if (frozen) s_kind[lane] = {JACOBI_FROZEN};") + "\n" + self.group.barrier(pad)
 
     def idle(self, pad: str = "") -> str:
         """Mark each unilateral row at zero impulse with a non-negative residual at zero impulse idle, once the staging
@@ -2368,9 +2399,8 @@ def isotropic_friction_step(rows: JacobiRows, pad: str = "    ") -> str:
         "        }",
         "    }",
         "}",
-        "SYNC();",
     ]
-    return indent("\n".join(lines), pad)
+    return rows.group.phase(indent("\n".join(lines), pad)) + "\n" + rows.group.barrier(pad)
 
 
 def _jacobi_join(rows: JacobiRows, op, scale, pad: str) -> str:
@@ -2380,17 +2410,20 @@ def _jacobi_join(rows: JacobiRows, op, scale, pad: str) -> str:
     (:meth:`~.TransposedResponse.jacobi_steps`, then the friction blocks' isotropy), the extrapolation is dropped and the
     momentum restarts in the new metric, so the row moves from the next sweep under a bound that counts it: no row ever
     moves outside the bound. Out of the sweep loop, the join costs the sweeps nothing until it runs."""
-    lines = [
-        "SYNC();",
-        "if (lane == 0) s_joined[0] = 0;",
-        op.jacobi_steps(scale, "", counted=rows.counted),
-        isotropic_friction_step(rows, ""),
+    group = rows.group
+    restep = [
         f"row_step = lane < {rows.rows} ? s_step[lane] : 0.0f;",
         "row_inv_step = row_step > 0.0f ? 1.0f / row_step : 0.0f;",
         "row_share = row_diag * row_step;",
         f"if (lane < {rows.rows}) s_y[lane] = s_x[lane];",
+    ]
+    lines = [
+        group.barrier(""),
+        op.jacobi_steps(scale, "", counted=rows.counted, first="if (lane == 0) s_joined[0] = 0;"),
+        isotropic_friction_step(rows, ""),
+        group.phase("\n".join(restep)),
         "t_k = 1.0f;",
-        "SYNC();",
+        group.barrier(""),
     ]
     return indent("\n".join(lines), pad)
 
@@ -2415,9 +2448,10 @@ def _jacobi_step(rows: JacobiRows, op, laws: RowLaws, pad: str) -> str:
         f"    value = xi; row_joins = 1; s_kind[i] = {JACOBI_UNILATERAL}; s_joined[0] = 1;",
         "}",
     ]
+    group = rows.group
     lines = [
-        "float x_new = 0.0f, x_old = 0.0f, x_from = 0.0f, row_bound = 0.0f;",
-        "int row_joins = 0;",
+        group.declare("float", *((name, "0.0f") for name in ("x_new", "x_old", "x_from", "row_bound"))),
+        group.declare("int", ("row_joins", "0")),
         "{",
         "    const int i = lane;",
         f"    if (i < {rows.rows}) {{",
@@ -2435,7 +2469,7 @@ def _jacobi_step(rows: JacobiRows, op, laws: RowLaws, pad: str) -> str:
         "    }",
         "}",
     ]
-    return indent("\n".join(lines), pad)
+    return group.phase(indent("\n".join(lines), pad))
 
 
 def _jacobi_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> str:
@@ -2452,7 +2486,7 @@ def _jacobi_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> str:
         return _jacobi_triple_projection(rows, pooled=pooled, pad=pad)
     F, n = JACOBI_FRICTION, rows.rows
     disk = "radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2({first}, {second}), radius)[0]"
-    if rows.threads == 32:
+    if rows.warp:
         load = "xp"
         lines = [
             "{",
@@ -2489,10 +2523,7 @@ def _jacobi_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> str:
     if pooled:
         ring = [indent(f"const float load = {rows.ring_load('p')};", "        ")]
         load = "load"
-    lines = [
-        "SYNC();",
-        f"if (lane < {n}) s_x[lane] = x_new;",
-        "SYNC();",
+    project = [
         "{",
         "    const int i = lane;",
         f"    if (i < {n} && s_kind[i] == {F}) {{",
@@ -2503,7 +2534,20 @@ def _jacobi_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> str:
         f"        x_new = {disk.format(first='s_x[i]', second='s_x[sib]')};",
         "    }",
         "}",
-        "SYNC();",
+    ]
+    return _staged_projection(rows, project, pad)
+
+
+def _staged_projection(rows: JacobiRows, project: list[str], pad: str) -> str:
+    """Stage every row's fresh update in ``s_x``, then run each lane's ``project`` lines on the staged updates: the
+    projection of a block of several warps, or of the CPU's virtual lanes."""
+    group = rows.group
+    lines = [
+        group.barrier(""),
+        group.phase(f"if (lane < {rows.rows}) s_x[lane] = x_new;"),
+        group.barrier(""),
+        group.phase("\n".join(project)),
+        group.barrier(""),
     ]
     return indent("\n".join(lines), pad)
 
@@ -2522,7 +2566,7 @@ def _jacobi_triple_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> st
         "                                              spun ? s_mu[p + 3] : 0.0f, radius_load);",
         "        x_new = triple[i - p - 1];",
     ]
-    if rows.threads == 32:
+    if rows.warp:
         lines = [
             "{",
             "    const int i = lane;",
@@ -2545,9 +2589,6 @@ def _jacobi_triple_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> st
         return indent("\n".join(line for line in lines if line), pad)
     ring = [indent(f"const float load = {rows.ring_load('p')};", "        ")] if pooled else []
     lines = [
-        "SYNC();",
-        f"if (lane < {n}) s_x[lane] = x_new;",
-        "SYNC();",
         "{",
         "    const int i = lane;",
         f"    if (i < {n} && s_kind[i] == {F}) {{",
@@ -2560,9 +2601,8 @@ def _jacobi_triple_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> st
         ),
         "    }",
         "}",
-        "SYNC();",
     ]
-    return indent("\n".join(lines), pad)
+    return _staged_projection(rows, lines, pad)
 
 
 def _jacobi_momentum(rows: JacobiRows, *, pad: str) -> str:
@@ -2575,12 +2615,19 @@ def _jacobi_momentum(rows: JacobiRows, *, pad: str) -> str:
     lines = [
         "const float t_next = 0.5f * (1.0f + sqrtf(1.0f + 4.0f * t_k * t_k));",
         "const float beta_next = (t_k - 1.0f) / t_next;",
-        "float dot_local = 0.0f;",
-        f"if (lane < {rows.rows}) dot_local = (s_y[lane] - x_new) * (x_new - x_old);",
-        "float dot = dot_local;",
-        "SUM(dot);",
     ]
-    if rows.threads > 32:
+    term = "(s_y[lane] - x_new) * (x_new - x_old)"
+    if rows.group.serial:
+        lines.append(rows.group.sum("dot", f"lane < {rows.rows} ? {term} : 0.0f", ""))
+    else:
+        lines += [
+            "float dot_local = 0.0f;",
+            f"if (lane < {rows.rows}) dot_local = {term};",
+            "float dot = dot_local;",
+            "SUM(dot);",
+        ]
+    block = rows.threads > 32 and not rows.group.serial
+    if block:
         lines += [
             "if ((lane & 31) == 0) s_dot[lane >> 5] = dot;",
             "SYNC();",
@@ -2593,7 +2640,7 @@ def _jacobi_momentum(rows: JacobiRows, *, pad: str) -> str:
         "const float beta = restart ? 0.0f : beta_next;",
         "t_k = restart ? 0.5f * (1.0f + sqrtf(5.0f)) : t_next;",
     ]
-    if rows.threads > 32:
+    if block:
         lines.append("SYNC();")
     return indent("\n".join(lines), pad)
 
@@ -2622,6 +2669,7 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
         raise ValueError("the weighted Jacobi law reads the weights of the contact rows its store marks")
     if laws.torsion != rows.torsion:
         raise ValueError("the Jacobi rows' friction blocks follow the laws' torsion")
+    group = rows.group
     weight = ""
     if laws.regularize:
         # The lane's row's weight, fixed through the sweeps: a contact's stored one, or a material contact's from the
@@ -2629,11 +2677,12 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
         stored = "world_row_w.data[off_dense + lane]"
         if laws.material:
             stored = row_weight(stored, "world_row_eps.data[off_dense + lane]", "row_diag")
-        weight = f"{pad}const float row_w = row_contact ? {stored} : 1.0f;"
+        weight = f"{pad}{group.declare('const float', ('row_w', f'row_contact ? {stored} : 1.0f'))}"
     inner = pad + "    "
     hot = inner + "    "
     change = Change("x_new - x_from", "row_bound", "s_type[i]" if rows.types else "-1", "row_inv_step")
-    block = rows.threads > 32
+    # A block of several warps votes and reduces the trace through the block; the CPU's one thread holds them all.
+    block = rows.threads > 32 and not group.serial
     budget = str(int(sweeps))
     # A sweep: every row's step from the extrapolated impulses, the blocks' projection and the momentum, then each
     # row's store and vote.
@@ -2649,8 +2698,8 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
         f"{hot}        }}",
         f"{hot}    }}",
         f"{hot}}}",
-        f"{hot}SYNC();",
     ]
+    vote = [group.phase("\n".join(vote)), group.barrier(hot)]
     phases = (
         op.gather(hot),
         _jacobi_step(rows, op, laws, hot),
@@ -2666,17 +2715,20 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
         ).rstrip("\n")
         + f"\n{hot}if (s_joined[0]) {{ ++sweep; break; }}"
     )
+    # The lane's row: its residual at zero impulse, fixed through the sweeps, and its step size, set again when a row
+    # joins the steps' bound; the step's share of a Gauss-Seidel step (omega w_i): the bound's impulse term in the
+    # step's units.
+    row = [
+        f"{pad}{group.declare('const float', ('row_rhs', f'lane < {rows.rows} ? s_rhs[lane] : 0.0f'))}",
+        f"{pad}{group.declare('float', ('row_step', f'lane < {rows.rows} ? s_step[lane] : 0.0f'))}",
+        f"{pad}{group.declare('float', ('row_inv_step', 'row_step > 0.0f ? 1.0f / row_step : 0.0f'))}",
+        f"{pad}{group.declare('float', ('row_share', 'row_diag * row_step'))}",
+        weight,
+    ]
     lines = [
         rows.freeze(pad),
         isotropic_friction_step(rows, pad),
-        # The lane's row: its residual at zero impulse, fixed through the sweeps, and its step size, set again when a
-        # row joins the steps' bound.
-        f"{pad}const float row_rhs = lane < {rows.rows} ? s_rhs[lane] : 0.0f;",
-        f"{pad}float row_step = lane < {rows.rows} ? s_step[lane] : 0.0f;",
-        f"{pad}float row_inv_step = row_step > 0.0f ? 1.0f / row_step : 0.0f;",
-        # The step's share of a Gauss-Seidel step (omega w_i): the bound's impulse term in the step's units.
-        f"{pad}float row_share = row_diag * row_step;",
-        weight,
+        group.phase("\n".join(line for line in row if line)),
         f"{pad}float t_k = 1.0f;",
         # The sweeps run in epochs of one metric (level_loop's resumed counter).
         f"{pad}int sweep = 0;",
@@ -2702,13 +2754,16 @@ def jacobi_limit_pass(rows: JacobiRows, op, *, pad: str = "    ") -> str:
     """
     if not rows.limits:
         raise ValueError("the last word pushes the velocity-limit rows the rows stage")
-    pushed = op.staged(Lanes(32))
+    # The first warp pushes; on the CPU the one thread is the group's every lane.
+    group = rows.group
+    warp = 1 if group.serial else 32
+    pushed = op.staged(Lanes(warp))
     body = "            "
     lines = [
         "{",
-        "    SYNC();",
+        group.barrier("    "),
         op.push_prologue("    "),
-        "    if (lane < 32) {",
+        f"    if (lane < {warp}) {{",
         f"        for (int i = 0; i < {rows.rows}; ++i) {{",
         f"            if (!{rows.clamps('i')} || s_vlim[i] == 0) continue;",
         pushed.dot((("part", "row", None), ("zz", "row", "row")), {"row": "i"}, body),
@@ -2723,7 +2778,7 @@ def jacobi_limit_pass(rows: JacobiRows, op, *, pad: str = "    ") -> str:
         "            WARP_SYNC();",
         "        }",
         "    }",
-        "    SYNC();",
+        group.barrier("    "),
         "}",
     ]
     return indent("\n".join(line for line in lines if line), pad)

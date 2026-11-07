@@ -15,16 +15,17 @@ and staged transposed (:class:`.response_operator.TransposedResponse`), and leav
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from fractions import Fraction
 from functools import cache
 
 import warp as wp
 
-from ...core.execution import Work, shape
+from ...core.execution import Work, device_lanes, shape
 from ...core.memory import Buffer, Staging, arch_budget, built_for
 from . import kernel_template
-from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
+from .device_preludes import RING, SHARED_STORAGE, VirtualLanes, group_native, lane_group
 from .factor.walk import walk_prelude, walk_row_prelude, walk_tables
 from .kernel_template import KernelTemplate, SweepTier
 from .law_source import law_preludes
@@ -157,9 +158,12 @@ def parallel_source(
     frame: tuple[int, int] = (0, 0),
     classes: tuple[WalkClass, ...] = (),
     pitch: int | None = None,
+    lanes: int = 32,
 ) -> tuple[str, Staging]:
     """The native body of a parallel tier: a world's dense rows (at most ``rows``, more than ``min_rows``) under the
-    Jacobi law, a thread per row; under ``torsion`` a contact's spin row steps and projects with its pair.
+    Jacobi law, a lane per row; under ``torsion`` a contact's spin row steps and projects with its pair. ``lanes`` is
+    the device's (:func:`.execution.device_lanes`): CUDA's lanes are the block's threads, the CPU's one thread runs
+    them as virtual lanes (:class:`.device_preludes.VirtualLanes`), each phase between the block's barriers a loop.
 
     The block stages the rows (:class:`.sweep.JacobiRows`) and the velocity, then the rows in the walk's coordinates
     (:class:`.WalkedRows`, the world's trees ``inkernel_response = (NA, NB, OA, OB)``): the keyed rows' operands
@@ -186,12 +190,15 @@ def parallel_source(
     )
     M_D, D, AM = max_constraints, max_world_dofs, int(rows)
     NT = 32 * ((AM + 31) // 32)
-    lanes = Lanes(NT)
+    if lanes not in (1, 32):
+        raise ValueError(f"a tier runs its rows on a block's warps or the CPU's one thread, got {lanes} lanes")
+    serial = lanes == 1
     velocity_limit_pass = bool(velocity_limit_pass)
     laws = RowLaws(regularize=bool(weighted), material=bool(material), torsion=torsion, policy=solve_policy)
     store = JacobiRows(
         AM, NT, limits=velocity_limit_pass, types=solve_policy.traces, weighted=bool(weighted), torsion=torsion
     )
+    row_lanes = Lanes(NT)
     walked = WalkedRows(
         NA,
         NB,
@@ -199,17 +206,21 @@ def parallel_source(
         OB,
         D,
         AM + 4,
-        lanes,
+        row_lanes,
         read=operands.read if operands is not None else _stored_row(M_D if pitch is None else int(pitch), D),
         walked=operands is not None,
         frame=tuple(int(cap) for cap in frame),
         classes=len(classes),
     )
-    op = TransposedResponse(D, AM, walked, lanes)
-    dot = (Buffer("s_dot", "float", NT // 32),) if NT > 32 else ()
+    op = TransposedResponse(D, AM, walked, row_lanes)
+    # Each lane's row registers; on the CPU arrays over the virtual lanes.
+    group = VirtualLanes(NT, serial, (*op.registers(), *store.registers()))
+    store = dataclasses.replace(store, group=group)
+    op = dataclasses.replace(op, group=group)
+    dot = (Buffer("s_dot", "float", NT // 32),) if NT > 32 and not serial else ()
     # A block of several warps reduces the trace's largest change over its warps.
     trace_reduction, trace = "", ()
-    if solve_policy.traces and NT > 32:
+    if solve_policy.traces and NT > 32 and not serial:
         trace_reduction, trace = block_argmax(NT // 32, warp="WARP", lane="(int)(threadIdx.x & 31)")
     staging = Staging(
         (Buffer("s_v", "float", D), *store.buffers(), *op.buffers(AM), *dot, *trace),
@@ -230,29 +241,28 @@ def parallel_source(
 
     # The velocity limits' last word closes the sweeps: none without a sweep, as the serial sweeps' at no iterations.
     last_word = jacobi_limit_pass(store, op) if velocity_limit_pass and sweeps else ""
+    velocity = f"""    for (int d = lane; d < {D}; d += {NT}) {{
+        const int global_dof = world_dof_indices.data[dof_map_base + d];
+        s_v[d] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;
+    }}"""
+    publish = op.publish(indent="    ", applied=lambda row: f"s_x[{row}]") + "\n" + store.stores()
     body = f"""    const int lane = LANE;
 {dense_tier_world(AM, int(min_rows), D, M_D, rows="n_rows", support=D, pitch=M_D if pitch is None else int(pitch))}
 
 {staging.declarations("    ")}{trace_reduction}
-{op.registers("    ")}
+{op.declarations("    ")}
 
-{loads}
-    for (int d = lane; d < {D}; d += {NT}) {{
-        const int global_dof = world_dof_indices.data[dof_map_base + d];
-        s_v[d] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;
-    }}
-    SYNC();
+{group.phase(loads + chr(10) + velocity)}
+{group.barrier("    ")}
 
 {op.jacobi_stage(store.padding(), scale, "    ", idle=store.idle(), counted=store.counted)}
 
 {jacobi_sweeps(store, op, laws, sweeps=int(sweeps), pooled=bool(linked_rows), scale=scale)}
 
 {last_word}
-{op.publish(indent="    ", applied=lambda row: f"s_x[{row}]")}
-{store.stores()}
+{group.phase(publish)}
     // The world queue's next world restages the shared rows: every lane has read this world's.
-    SYNC();
-#endif
+{group.barrier("    ")}
 """
     row_preludes = operands.preludes if operands is not None else ()
     walk = ()
@@ -268,7 +278,7 @@ def parallel_source(
         *row_preludes,
         *law_preludes(PROJECTION_LAW, *((CONE_LAW,) if torsion else ())),
     )
-    return cuda_native(body, preludes=(*preludes, *solve_policy.preludes, *walk)), staging
+    return group_native(body, preludes=(*preludes, *solve_policy.preludes, *walk), lanes=lanes), staging
 
 
 @cache
@@ -327,6 +337,7 @@ def parallel_kernel(
         frame=frame,
         classes=classes,
         pitch=pitch,
+        lanes=device_lanes(device_arch),
     )
     staging.check("the parallel tier", arch_budget(device_arch))
     (NA, NB, OA, OB), operands = _operands(max_constraints, max_world_dofs, **options)

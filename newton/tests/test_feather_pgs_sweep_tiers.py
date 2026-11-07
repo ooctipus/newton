@@ -11,6 +11,7 @@ compiles offline next to the legacy kernel.
 import contextlib
 import functools
 import importlib.util
+import re
 import shutil
 import sys
 import unittest
@@ -138,6 +139,19 @@ class TestParallelTier(unittest.TestCase):
                 # The CUDA body ends at the CPU branch, which fails a CPU build (device_preludes.CUDA_ONLY).
                 body = source[: source.rindex("#else\n")]
                 self.assertTrue(body.rstrip().endswith("SYNC();"), body[-200:])
+
+    def test_the_cpu_runs_the_lanes_in_turn(self):
+        """On the CPU one thread runs the block's lanes as virtual lanes: each phase a loop over the lanes with their
+        registers bound by name, no block barrier, the body on both devices (no CUDA-only branch)."""
+        for label, args, kwargs in CALLS:
+            with self.subTest(label):
+                lanes = 32 * ((kwargs["rows"] + 31) // 32)
+                source = _source((*args[:3], "0"), kwargs)
+                self.assertIsNone(re.search(r"(?<!WARP_)SYNC\(\)", source))
+                self.assertNotIn("#error", source)
+                self.assertIn(f"float x_new_lanes[{lanes}];", source)
+                self.assertIn(f"for (int lane = 0; lane < {lanes}; ++lane) {{", source)
+                self.assertIn("auto& Jr = Jr_lanes[lane];", source)
 
     def test_formed_diagonals_freeze_their_rows_after_the_staging(self):
         """A row the formed diagonal freezes changes its kind only once every lane has read the kinds; a friction row
