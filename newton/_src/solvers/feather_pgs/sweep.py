@@ -44,8 +44,10 @@ import warp as wp
 
 from ...core.execution import Work, shape
 from ...core.memory import Buffer, Staging, arch_budget, built_for
-from .device_preludes import BLOCK_THREADS, VirtualLanes
+from .device_preludes import BLOCK_THREADS, RING, SHARED_STORAGE, DevicePrelude, VirtualLanes, group_native, lane_group
 from .kernel_template import Dispatch, KernelTemplate
+from .law_source import law_preludes
+from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import Lanes, LaneVelocity, ResponseOperator, Velocity
 from .row_inputs import RowArgument
 from .row_kernels import (
@@ -2831,6 +2833,45 @@ class SweepConfig:
     def label(self) -> str:
         """What the working set's budget check calls the sweep."""
         return self.LABEL
+
+    def native(
+        self,
+        body: str,
+        *,
+        lanes: int,
+        group: int | None = None,
+        ring: bool = True,
+        rows: tuple[DevicePrelude, ...] = (),
+        walks: tuple[DevicePrelude, ...] = (),
+    ) -> str:
+        """The sweep's native function: ``body`` after the frame's preludes, composed for a world of ``lanes`` lanes
+        (the CPU's one thread runs them in turn, :func:`.device_preludes.group_native`).
+
+        The preludes, in order: the lane group of ``group`` lanes (by default ``lanes``), the shared stage's storage,
+        the patch ring's walks (``ring``), the rows' own preludes (``rows``), the row laws (the projections, and the
+        cone's where spin rows may appear), the solve policy's, then the walks the sweep compiles (``walks``).
+        """
+        laws = law_preludes(PROJECTION_LAW, *((CONE_LAW,) if self.torsion else ()))
+        preludes = (
+            lane_group(lanes if group is None else group),
+            SHARED_STORAGE,
+            *((RING,) if ring else ()),
+            *rows,
+            *laws,
+            *self.solve_policy.preludes,
+            *walks,
+        )
+        return group_native(body, preludes=preludes, lanes=lanes)
+
+    def law_operands(self) -> tuple[RowArgument, ...]:
+        """The operands the row laws add beyond the ABI: the rows' weights where the laws are weighted and the ABI
+        holds none, material contacts' compliance, and the solve policy's readout."""
+        holds_weights = any(name == "world_row_w" for name, _ in self.ABI)
+        return (
+            *weight_arguments(self.weighted and not holds_weights),
+            *material_arguments(self.material),
+            *self.solve_policy.arguments,
+        )
 
     def source(self) -> tuple[str, Staging]:
         """The native body and its working set."""

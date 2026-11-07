@@ -23,11 +23,8 @@ import warp as wp
 from ...core.execution import Work, device_lanes
 from ...core.memory import Buffer, Staging
 from . import kernel_template
-from .device_preludes import RING, SHARED_STORAGE, group_native, lane_group
 from .factor.walk import WalkTrees
 from .kernel_template import Dispatch
-from .law_source import law_preludes
-from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import Lanes, ResponseOperator, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_metadata import _validate_dense_metadata_encoding
@@ -52,11 +49,9 @@ from .sweep import (
     impulse_seed,
     indent,
     level_loop,
-    material_arguments,
     row_step,
     row_update,
     velocity_limit_pass,
-    weight_arguments,
 )
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -642,15 +637,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     }}
 {limit_stores}
 """
-    cone = (CONE_LAW,) if torsion else ()
-    preludes = (
-        lane_group(L),
-        SHARED_STORAGE,
-        RING,
-        *law_preludes(PROJECTION_LAW, *cone),
-        *solve_policy.preludes,
-    )
-    return group_native(body, preludes=preludes, lanes=L), staging
+    return sweep.native(body, lanes=L), staging
 
 
 @dataclasses.dataclass(frozen=True)
@@ -723,9 +710,7 @@ class DiagonalSweep(SweepConfig):
         return (
             # Where spin rows may appear, every friction triple's metric (sweep.friction_metric_stage).
             *((RowArgument("friction_metric", wp.array3d[float], after="omega"),) if self.torsion else ()),
-            *weight_arguments(self.weighted),
-            *material_arguments(self.material),
-            *self.solve_policy.arguments,
+            *self.law_operands(),
         )
 
     def work(self, items: int = 0, shared: int = 0) -> Work:

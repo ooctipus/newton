@@ -19,11 +19,8 @@ import warp as wp
 from ...core.execution import Work, device_lanes
 from ...core.memory import Buffer, Staging
 from . import kernel_template
-from .device_preludes import RING, SHARED_STORAGE, group_native, lane_group
 from .factor.walk import WalkTrees
 from .kernel_template import Dispatch
-from .law_source import law_preludes
-from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import Lanes, LaneVelocity, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .sweep import (
@@ -47,7 +44,6 @@ from .sweep import (
     impulse_seed,
     indent,
     level_loop,
-    material_arguments,
     pair_radius,
     pair_update,
     row_step,
@@ -55,7 +51,6 @@ from .sweep import (
     row_update,
     speed_rows_pass,
     unit_held_loads,
-    weight_arguments,
 )
 from .sweep_routes import FREE_BODY_COORDINATES, FREE_BODY_WALKS
 
@@ -280,16 +275,7 @@ def paired_factor_source(sweep: PairedSweep) -> tuple[str, Staging]:
 {leave}
 {staging.undefine()}
 """
-    cone = (CONE_LAW,) if torsion else ()
-    preludes = (
-        lane_group(lanes.width),
-        SHARED_STORAGE,
-        RING,
-        *law_preludes(PROJECTION_LAW, *cone),
-        *solve_policy.preludes,
-        *((FREE_BODY_WALKS,) if speed_rows else ()),
-    )
-    return group_native(body, preludes=preludes, lanes=lanes.width), staging
+    return sweep.native(body, lanes=lanes.width, walks=(FREE_BODY_WALKS,) if speed_rows else ()), staging
 
 
 def _paired_rows(rows: StagedRows, op: SparseFactor, laws: RowLaws, end: str, metric: str | None) -> str:
@@ -539,9 +525,7 @@ class PairedSweep(SweepConfig):
         return (
             # Where spin rows may appear, every friction triple's metric (sweep.friction_metric_stage).
             *((RowArgument("friction_metric", wp.array3d[float], after="omega"),) if self.torsion else ()),
-            *weight_arguments(self.weighted),
-            *material_arguments(self.material),
-            *self.solve_policy.arguments,
+            *self.law_operands(),
             RowArgument("walk", WalkTrees),
         )
 

@@ -17,12 +17,9 @@ import warp as wp
 from ...core.execution import Work, device_lanes
 from ...core.memory import REGISTERS_PER_THREAD, Buffer, Place, Staging
 from . import kernel_template, sweep_units
-from .device_preludes import RING, SHARED_STORAGE, group_native, lane_group
 from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude
 from .kernel_template import Dispatch
-from .law_source import law_preludes
 from .packed_rows import PACKED_SIDES
-from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_metadata import _validate_dense_metadata_encoding
@@ -49,7 +46,6 @@ from .sweep import (
     impulse_seed,
     indent,
     level_loop,
-    material_arguments,
     rows_block,
     speed_rows_pass,
     velocity_limit_pass,
@@ -932,16 +928,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         {dense.stores("i")}
     }}{free_stores}
 {end_first_warp}"""
-    preludes = (
-        lane_group(lanes),
-        SHARED_STORAGE,
-        RING,
-        PACKED_SIDES,
-        *law_preludes(PROJECTION_LAW, *((CONE_LAW,) if contact_torsion else ())),
-        *solve_policy.preludes,
-        FREE_BODY_WALKS,
-    )
-    return group_native(body, preludes=preludes, lanes=lanes), staging
+    return sweep.native(body, lanes=lanes, rows=(PACKED_SIDES,), walks=(FREE_BODY_WALKS,)), staging
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1044,8 +1031,7 @@ class GeneralSweep(SweepConfig):
         return (
             # Where spin rows may appear, every friction contact's metric (sweep.friction_metric_stage).
             *((RowArgument("friction_metric", wp.array3d[float], after="omega"),) if self.torsion else ()),
-            *material_arguments(self.material),
-            *self.solve_policy.arguments,
+            *self.law_operands(),
         )
 
     def work(self, items: int = 0, shared: int = 0) -> Work:

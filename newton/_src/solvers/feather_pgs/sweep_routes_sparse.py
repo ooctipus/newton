@@ -40,10 +40,7 @@ import warp as wp
 from ...core.execution import Work, device_lanes
 from ...core.memory import Buffer, Staging
 from . import kernel_template
-from .device_preludes import RING, SHARED_STORAGE, group_native, lane_group
 from .kernel_template import Dispatch
-from .law_source import law_preludes
-from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import Lanes, SparseFactor
 from .row_inputs import RowArgument
 from .solve_policy import Change, bound
@@ -73,11 +70,9 @@ from .sweep import (
     impulse_seed,
     indent,
     level_loop,
-    material_arguments,
     row_step,
     unit_held_loads,
     velocity_limit_pass,
-    weight_arguments,
 )
 
 _SPARSE_LOCAL_WORKSPACE_BYTES = 8 * 1024
@@ -241,11 +236,12 @@ class SparseSweep(SweepConfig):
         return kernel_template.items("world", groups=self.groups, lanes=self.lanes, guard="world_count")
 
     def operands(self) -> tuple[RowArgument, ...]:
-        extra = (*weight_arguments(self.weighted), *material_arguments(self.material), *self.solve_policy.arguments)
-        if self.contact_triplets or self.torsion:
-            # Contact units read their records; where spin rows may appear every triple reads its metric there.
-            extra = (RowArgument("contact_records", wp.array3d[float], after="omega"), *extra)
-        return extra
+        # Contact units read their records; where spin rows may appear every triple reads its metric there.
+        records = self.contact_triplets or self.torsion
+        return (
+            *((RowArgument("contact_records", wp.array3d[float], after="omega"),) if records else ()),
+            *self.law_operands(),
+        )
 
     def work(self, items: int = 0, shared: int = 0) -> Work:
         """``lanes_per_world`` lanes a world in blocks of :data:`THREADS` (one thread a world on the CPU), at the
@@ -754,6 +750,4 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     for (int d = lane; d < {D}; d += {L}) factor_velocity_delta.data[world * {D} + d] = s_delta[d];
 {rows.stores("    ")}
 """
-    cone = (CONE_LAW,) if sweep.torsion else ()
-    preludes = (lane_group(L), SHARED_STORAGE, RING, *law_preludes(PROJECTION_LAW, *cone), *sweep.solve_policy.preludes)
-    return group_native(body, preludes=preludes, lanes=L), staging
+    return sweep.native(body, lanes=L), staging

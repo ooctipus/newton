@@ -25,13 +25,11 @@ import warp as wp
 from ...core.execution import Work, device_lanes
 from ...core.memory import Buffer, Staging
 from . import kernel_template
-from .device_preludes import RING, SHARED_STORAGE, VirtualLanes, group_native, lane_group
+from .device_preludes import VirtualLanes
 from .factor.walk import walk_prelude, walk_row_prelude, walk_tables
 from .kernel_template import Dispatch
 from .keyed_row_layout import KeyedLayout
 from .keyed_rows import get_direct_parallel_inputs
-from .law_source import law_preludes
-from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import Lanes, TransposedResponse, WalkedRows
 from .row_inputs import RowArgument
 from .row_metadata import _validate_dense_metadata_encoding
@@ -46,7 +44,6 @@ from .sweep import (
     jacobi_limit_pass,
     jacobi_scale,
     jacobi_sweeps,
-    material_arguments,
 )
 from .sweep_routes import MF_GS_ABI, worlds
 from .tree_scan import WALK_BOTH, WalkClass, classes_half
@@ -220,16 +217,8 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
     if operands is not None:
         # The walk last, as the general sweep declares it (sweep_routes.mf_gs_source).
         walk = (walk_prelude(walk_tables(classes), 1, classes_half(classes)), walk_row_prelude(1))
-    preludes = (
-        lane_group(NT),
-        SHARED_STORAGE,
-        *((RING,) if linked_rows else ()),
-        *row_preludes,
-        *law_preludes(PROJECTION_LAW, *((CONE_LAW,) if torsion else ())),
-    )
-    return group_native(
-        body, preludes=(*preludes, *solve_policy.preludes, *walk), lanes=device_lanes(tier.device_arch)
-    ), staging
+    lanes = device_lanes(tier.device_arch)
+    return tier.native(body, lanes=lanes, group=NT, ring=bool(linked_rows), rows=row_preludes, walks=walk), staging
 
 
 @dataclasses.dataclass(frozen=True)
@@ -338,11 +327,7 @@ class TierSweep(SweepConfig):
 
     def operands(self) -> tuple[RowArgument, ...]:
         inputs = self.row_inputs
-        return (
-            *(inputs.arguments if inputs is not None else ()),
-            *material_arguments(self.material),
-            *self.solve_policy.arguments,
-        )
+        return (*(inputs.arguments if inputs is not None else ()), *self.law_operands())
 
     def work(self, items: int = 0, shared: int = 0) -> Work:
         """A block a world, a thread a row. Not persistent: an uncapped line does not fix the tier's residency, and a
