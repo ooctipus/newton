@@ -421,6 +421,11 @@ def walked_rows_kernel(
         dense_rows = support.units.shape[1]
         count = wp.min(counts[world], dense_rows)
         line = rows.first[world]
+        # Whether this launch stores the world's records, read before the rows: its loads overlap the walk, and a
+        # world the sweep does not visit (every world of the tiers') pays a predicate at the end, not a load.
+        stores = bool(False)
+        if wp.static(records):
+            stores = part != WRITE_TOPOLOGY and swept(row_records, world, counts[world])
         # The part's rows: the topology's below the family bound (the count is not final before the contact pass),
         # the rest above it.
         first = int(0)
@@ -478,7 +483,7 @@ def walked_rows_kernel(
         if wp.static(records):
             # The records, once every row of the world is final: the launch that writes the last of them stores them,
             # in the worlds the sweep visits.
-            if part != WRITE_TOPOLOGY and swept(row_records, world, counts[world]):
+            if stores:
                 world_sync(lanes)
                 for slot in range(lane, count, lanes):
                     write_row_record(row_records, rows, sink.row_incident[line, slot], line, slot)
