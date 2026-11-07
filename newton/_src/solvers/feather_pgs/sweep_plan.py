@@ -670,31 +670,29 @@ class Sweep:
         general = self.claim_general
         return self.claims.span(general, general + (1 if self.colored_units is None else 2)), 1
 
-    def claim(self) -> None:
-        """Publish the schedule of the rows the row pass wrote and each owner's worlds (run after every producer)."""
-        model = self.model
-        if self.sparse_contact_schedule is not None:
-            # Unit heads come from the row types; a world's warp a block (its levels' shared working set).
-            wp.launch_tiled(
-                self.sparse_contact_schedule,
-                dim=[self.forest.world_count],
-                inputs=[
-                    self.placement.constraint_count,
-                    self.placement.dense_first,
-                    self.placement.dense_phase_bounds,
-                    self.placement.row_type,
-                ],
-                outputs=[
-                    self.placement.sparse_diagonal_row_dof,
-                    self.placement.sparse_contact_level_count,
-                    self.placement.sparse_contact_level_offsets,
-                    self.placement.sparse_contact_level_units,
-                    self.placement.sparse_contact_serial_count,
-                    self.placement.sparse_contact_serial_normals,
-                ],
-                block_dim=32,
-                device=model.device,
-            )
+    def schedule_diagonal(self) -> None:
+        """Case K2: publish the sparse diagonal's schedule of the rows the row pass wrote (run after every producer):
+        unit heads from the row types, a world's warp a block (its levels' shared working set)."""
+        wp.launch_tiled(
+            self.sparse_contact_schedule,
+            dim=[self.forest.world_count],
+            inputs=[
+                self.placement.constraint_count,
+                self.placement.dense_first,
+                self.placement.dense_phase_bounds,
+                self.placement.row_type,
+            ],
+            outputs=[
+                self.placement.sparse_diagonal_row_dof,
+                self.placement.sparse_contact_level_count,
+                self.placement.sparse_contact_level_offsets,
+                self.placement.sparse_contact_level_units,
+                self.placement.sparse_contact_serial_count,
+                self.placement.sparse_contact_serial_normals,
+            ],
+            block_dim=32,
+            device=self.model.device,
+        )
 
     def warm_start(self, contacts) -> None:
         """Gather the previous step's normal impulses by contact identity into both row classes' normal rows, one launch
