@@ -616,8 +616,7 @@ class SparseFactor(ResponseOperator):
         it (:meth:`terms`). Without ``reduce`` the sums accumulate this lane's entries into ``out``, declared before,
         in order. A sum of ``rhs`` adds its right-hand side after the ladder (``out += rhs``); a sum of ``reduced`` was
         reduced by an earlier ladder under another name (``out`` -> that name), which it is declared from, after the
-        ladder, its right-hand side added beside it. The sums ``apart`` names reduce in a ladder of their own, under
-        its condition (``(condition, names)``: a row that has the terms, whose loads joined the one load group).
+        ladder, its right-hand side added beside it; ``apart`` (``(condition, names)``) reduces those sums on their own.
         """
         exists, rhs, reduced = exists or {}, rhs or {}, reduced or {}
         later = []

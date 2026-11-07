@@ -880,9 +880,8 @@ def _pair_terms(ctx: RowContext, *, own: bool) -> str:
 
 
 def _spin_terms(ctx: RowContext) -> str:
-    """Declare a friction triple's spin terms (contact torsion), after :func:`_pair_terms`: ``spin_residual``
-    (``Z_p . u + rhs_p``) and its couplings with the tangents, ``spin_cross`` (``Z_t . Z_p``) and
-    ``spin_cross_sibling`` (``Z_s . Z_p``), in one ladder on the support and entries the pair's kept."""
+    """Declare a friction triple's spin terms after :func:`_pair_terms`: ``spin_residual`` (``Z_p . u + rhs_p``),
+    ``spin_cross`` and ``spin_cross_sibling``, the visit's sums (:func:`row_sums`) or a ladder of their own."""
     sums = (("spin_residual", "spin", None), ("spin_cross", "row", "spin"), ("spin_cross_sibling", "sib", "spin"))
     rows = {"row": ctx.row, "sib": "sib", "spin": "spin"}
     reduced = None
@@ -1053,9 +1052,8 @@ def row_sums(
 
     With ``sibling`` a ``paired`` row (a first tangent) also reduces its pair's terms in the same ladder,
     ``sibling_jv = Z_sibling . u`` and ``pair_coupling = Z_row . Z_sibling``, on the support's one load (rows in
-    memory: :attr:`.ResponseOperator.pair_with_visit`), the sibling's entries kept for the pair's apply; with ``spin``
-    its contact's spin row's too (``spin_jv``, ``spin_coupling``, ``spin_coupling_sibling``, where ``spin >= 0``), its
-    entries in the one load group and its sums in a ladder of their own, which only a triple runs.
+    memory: :attr:`.ResponseOperator.pair_with_visit`), the sibling's entries kept for the pair's apply; ``spin`` adds
+    the spin row's (``spin_jv``, ``spin_coupling``, ``spin_coupling_sibling``), reduced only by a triple.
     """
     if sibling is None:
         return op.dot(((out, "row", None),), {"row": row}, pad)
