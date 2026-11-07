@@ -705,9 +705,11 @@ class TestCoordinateTreesRule(unittest.TestCase):
 
     def test_compact_diagonal_responds_by_its_inverse(self):
         """The compact diagonal's walk is its inverse: the family leaves the walk, its root carries a negative family
-        and its predictor launches no walk solve, while the arm beside it walks; a step stays finite."""
+        and its predictor launches no walk solve, while the arm beside it walks; a step stays finite. The solver is
+        pinned to the held compact group (``star="held"``) so that the steps it plans (its drive stage's coordinates)
+        are the swapped owner's: unpinned, the one-coordinate class would hold this welded star."""
         model = build_branch_model(worlds=2, kinds=("prismatic", "revolute"), descendant=True)
-        solver = cpu_solver(model)
+        solver = cpu_solver(model, SolverFeatherPGS.Pins(star="held"))
         size = branch_size(model)
         plan = held_plan(solver, size, coordinate=False)
         stars = branch_articulations(model)
