@@ -1284,15 +1284,13 @@ WALK_TOUCH = 16
 so the loads :data:`WALK_AHEAD` items ahead find their lines in L1."""
 
 WALK_UNROLL = REGISTERS_PER_THREAD // 4
-"""Coordinates of a class up to which :meth:`WalkClass.walk` emits its walk as straight-line code; a larger class takes
-the loop form. From the registers: a straight-line walk holds a class's states and values as named registers, about
-three a coordinate with its loads ahead (g1's 43-coordinate walk solve 141 registers, no stack), so up to a quarter of
-:data:`~newton._src.core.memory.REGISTERS_PER_THREAD` (a lane's registers without a launch bound) coordinates
-fit with room for the chain; past it (chain_106's 112) the loop form's ring keeps
-:data:`WALK_AHEAD` items in flight. The loop form indexes its states on the stack (g1's walk solve: 272 B, 41 local
-loads and 43 stores): straight-line, g1's walk solve runs 78.0 -> 58.1 us a launch and its leave 47.1 -> 40.0 (RTX PRO
-6000, 16,384 worlds; ZP5, ZV). An earlier bench (ZE: the loop form faster on g1, 41.6 against 51.9 us) predates the
-record's vector loads and the touches."""
+"""Coordinates of a class up to which :meth:`WalkClass.walk` places its states in named registers (straight-line code);
+a larger class takes the chain (the loop form). A straight-line walk holds about three registers a coordinate with its
+loads ahead (g1's 43-coordinate walk solve 141, no stack), so a quarter of
+:data:`~newton._src.core.memory.REGISTERS_PER_THREAD` coordinates fit with room for the chain (chain_106's 112 do not).
+The chain indexes its states on the stack (g1's walk solve: 272 B, 41 local loads and 43 stores): straight-line, g1's
+walk solve runs 78.0 -> 58.1 us a launch and its leave 47.1 -> 40.0 (RTX PRO 6000, 16,384 worlds; ZP5, ZV; RETWALK2's
+P1: 12 of the walk family's 41 kernels lose blocks or gain stack on the chain)."""
 
 
 def held_fits(words: int, registers: int) -> bool:
@@ -1351,6 +1349,211 @@ def indent_text(text: str, spaces: int) -> str:
     """``text`` with every non-empty line indented by ``spaces``."""
     pad = " " * spaces
     return "\n".join(pad + line if line.strip() else line for line in text.splitlines())
+
+
+def _when(condition, then, otherwise=()) -> list[str]:
+    """Statements under a condition known as the walk is emitted (a ``bool``) or read at run time (an ``if``)."""
+    then, otherwise = list(then), list(otherwise)
+    if isinstance(condition, bool):
+        return then if condition else otherwise
+    if not (then or otherwise):
+        return []
+    text = f"if ({condition}) {{\n{indent_text(chr(10).join(then), 4)}\n}}"
+    return [text + (f" else {{\n{indent_text(chr(10).join(otherwise), 4)}\n}}" if otherwise else "")]
+
+
+@dataclass(frozen=True)
+class _Step:
+    """A walk's step: coordinate ``c`` (-1: none) of body ``b``, its parent, the body's first and last step, its join bits
+    (:attr:`.tree_plan.TreePlan.up_flags`), each a constant or a table read; the loop's copy of it, its ring slot."""
+
+    b: int | str
+    c: int | str
+    up: int | str
+    first: bool | str
+    last: bool | str
+    sums: bool | str
+    leading: bool | str
+    ring: int = 0
+
+    @property
+    def coordinate(self) -> bool | str:
+        return self.c >= 0 if isinstance(self.c, int) else f"{self.c} >= 0"
+
+
+class _Placement:
+    """Where a walk's states and items live (:meth:`WalkClass.walk`): a body's ``enter`` takes its state (from its
+    parent's root first, its children's leaf first), its ``leave`` keeps it for its children or joins it into its
+    parent's; an item (``("l", b)`` body ``b``'s joint input, ``("x", c)`` coordinate ``c``'s step input) is fetched and
+    touched ahead of the step that reads it (``take`` before it, or ``after`` the step before)."""
+
+    def __init__(self, root_first: bool, width: int, joint: str, joint_first: str, texts: dict):
+        self.root_first = root_first
+        self.width = width
+        self.joint = joint
+        self.joint_first = joint_first
+        self.texts = texts
+
+    def items(self, entries, named=None) -> list[str]:
+        out = []
+        for kind, index in entries:
+            if kind == "l":
+                text = _fill(self.texts["fetch_joint" if named else "touch_joint"], b=index, up=self.up(index))
+            else:
+                text = _fill(self.texts["fetch_step" if named else "touch_step"], c=index, half=self.half(index))
+            out += [f"{named(kind, index)} = {text};" if named else text] if text else []
+        return out
+
+    def edge(self, s: _Step, parent: str, first: bool = False) -> str:
+        return _fill(self.joint_first if first else self.joint, b=s.b, V=self.state(s), P=parent, **self.names(s))
+
+    def take(self, item) -> list[str]:
+        return []
+
+    def after(self, s: _Step) -> list[str]:
+        return []
+
+
+class _Registers(_Placement):
+    """Each body's state a named register array ``walk{b}`` and each item a named register in the walk's order, fetched
+    ``depth`` and touched ``early`` items ahead, every index a constant: straight-line code."""
+
+    def __init__(
+        self, walk: "WalkClass", root_first: bool, width: int, joint: str, joint_first: str, texts, depth, early
+    ):
+        super().__init__(root_first, width, joint, joint_first, texts)
+        self.bodies, self.up, self.half = len(walk.parent), walk.parent.__getitem__, walk.half_of
+        self.zero = "{" + ", ".join(["0.0f"] * width) + "}"
+        # A body's joint input where it has a parent (root first before its coordinates, leaf first after them), each
+        # coordinate's step input.
+        joints, steps = texts["fetch_joint"] or texts["touch_joint"], texts["fetch_step"] or texts["touch_step"]
+        self.order = []
+        for b in walk.bodies_in(root_first):
+            if root_first and joints and walk.parent[b] >= 0:
+                self.order.append(("l", b))
+            if steps:
+                self.order += [("x", c) for c in walk.coordinates_in(b, root_first)]
+            if not root_first and joints and walk.parent[b] >= 0:
+                self.order.append(("l", b))
+        self.depth, self.early = depth(len(self.order)), early(len(self.order))
+        self.position = {item: k for k, item in enumerate(self.order)}
+
+    def fetched(self, item) -> list[str]:
+        return self.items([item], "const auto walk_{}{}".format)
+
+    def prologue(self) -> list[str]:
+        out = [line for item in self.order[: self.early] for line in self.items([item])]
+        out += [line for item in self.order[: self.depth] for line in self.fetched(item)]
+        if self.root_first:
+            return out
+        return [*out, f"float {', '.join(f'walk{b}[{self.width}] = {self.zero}' for b in range(self.bodies))};"]
+
+    def bind(self, s: _Step) -> list[str]:
+        return []
+
+    def state(self, s: _Step) -> str:
+        return f"walk{s.b}"
+
+    def names(self, s: _Step) -> dict:
+        return {"L": f"walk_l{s.b}", "X": f"walk_x{s.c}"}
+
+    def take(self, item) -> list[str]:
+        k = self.position.get(item, -1)
+        if k < 0:
+            return []
+        out = self.items([self.order[k + self.early]]) if k + self.early < len(self.order) else []
+        return out + (self.fetched(self.order[k + self.depth]) if k + self.depth < len(self.order) else [])
+
+    def enter(self, s: _Step) -> list[str]:
+        if not self.root_first:
+            return []
+        if s.up < 0:
+            return [f"float walk{s.b}[{self.width}] = {self.zero};"]
+        return [f"float walk{s.b}[{self.width}];", *self.take(("l", s.b)), self.edge(s, f"walk{s.up}")]
+
+    def leave(self, s: _Step) -> list[str]:
+        if self.root_first or s.up < 0:
+            return []
+        return [*self.take(("l", s.b)), self.edge(s, f"walk{s.up}", s.leading)]
+
+
+class _Chain(_Placement):
+    """The loop form's chain: the body walked in ``V``, its parent's ``P`` (or children's ``N``) beside it, a join's in a
+    slot ``S`` indexed at run time (:func:`_walk_slots`); a step's two items in a ring of ``depth`` registers, the loop
+    body a copy of the step a slot (copy ``j``, :attr:`_Step.ring`, reads slot ``j`` and refills it ``depth`` steps on), or
+    loaded in place without a ring; each step's lines touched ``early`` steps ahead."""
+
+    def __init__(
+        self, walk: "WalkClass", root_first: bool, width: int, joint: str, joint_first: str, texts, name, half, ring
+    ):
+        super().__init__(root_first, width, joint, joint_first, texts)
+        self.name, self.half, (self.steps, self.depth, self.early) = name, half, ring
+        self.up = f"{name}_PARENT[{{}}]".format
+        self.count = walk.slots[1]
+        self.each = f"for (int k = 0; k < {width}; ++k)"
+
+    def slot(self, body: str) -> str:
+        return f"S[{self.name}_SLOT[{body}]]"
+
+    def entries(self, at) -> list:
+        coordinate = f"{self.name}_COORDINATE[{at}]"
+        return [("l", f"({self.name}_STEP[{at}] & 0xffff)"), ("x", f"(({coordinate}) < 0 ? 0 : {coordinate})")]
+
+    def fetched(self, j: int, at) -> list[str]:
+        return self.items(self.entries(at), lambda kind, _: f"walk_{kind}{j}")
+
+    def prologue(self) -> list[str]:
+        out = [f"auto {line}" for j in range(self.depth) for line in self.fetched(j, min(j, self.steps - 1))]
+        if self.early:
+            touched = chr(10).join(self.items(self.entries("at")))
+            out.append(f"for (int at = 0; at < {self.early}; ++at) {{\n{indent_text(touched, 4)}\n}}")
+        slots = f" float S[{self.count}][{self.width}];" if self.count else ""
+        return [*out, f"float V[{self.width}], {'P' if self.root_first else 'N'}[{self.width}];{slots}"]
+
+    def bind(self, s: _Step) -> list[str]:
+        out = [f"const int b = {self.name}_STEP[at] & 0xffff, c = {self.name}_COORDINATE[at];"]
+        if self.depth:
+            return out
+        return out + self.items([("l", "b"), ("x", "(c < 0 ? 0 : c)")], lambda kind, _: f"const auto walk_{kind}")
+
+    def state(self, s: _Step) -> str:
+        return "V"
+
+    def names(self, s: _Step) -> dict:
+        return {"L": f"walk_l{s.ring}", "X": f"walk_x{s.ring}"} if self.depth else {"L": "walk_l", "X": "walk_x"}
+
+    def after(self, s: _Step) -> list[str]:
+        at = f"(at + {self.depth} < {self.steps} ? at + {self.depth} : {self.steps - 1})"
+        out = self.fetched(s.ring, at) if self.depth else []
+        early = f"at + {self.early}"
+        return out + (_when(f"{early} < {self.steps}", self.items(self.entries(early))) if self.early else [])
+
+    def enter(self, s: _Step) -> list[str]:
+        each = self.each
+        if self.root_first:
+            parent = [f"{each} P[k] = V[k];"]
+            if self.count:
+                parent = _when("up == b - 1", parent, [f"{each} P[k] = {self.slot('up')}[k];"])
+            zero = [f"{each} V[k] = 0.0f;"]
+            return [f"const int up = {s.up};", *_when("up < 0", zero, [*parent, self.edge(s, "P")])]
+        # A parent's state is its first child's, the others added (no slot cleared); a leaf's zero.
+        gather = [f"{each} V[k] = N[k];"]
+        if self.count:
+            gather = _when(f"{self.name}_SLOT[b] >= 0", [f"{each} V[k] = {self.slot('b')}[k];"], gather)
+        return _when(s.sums, gather, [f"{each} V[k] = 0.0f;"])
+
+    def leave(self, s: _Step) -> list[str]:
+        if self.root_first:
+            keep = [f"{self.each} {self.slot('b')}[k] = V[k];"]
+            return _when(f"{self.name}_SLOT[b] >= 0", keep) if self.count else []
+        # A parent without a slot has one child, the next body: its first.
+        give = [self.edge(s, "N", True)]
+        if self.count:
+            slot = self.slot("up")
+            give = _when(
+                f"{self.name}_SLOT[up] >= 0", _when(s.leading, [self.edge(s, slot, True)], [self.edge(s, slot)]), give
+            )
+        return [f"const int up = {s.up};", *_when("up >= 0", give)]
 
 
 @dataclass(frozen=True)
@@ -1423,20 +1626,15 @@ class WalkClass:
     ) -> str:
         """Native statements that walk the class's tree on a state of ``width`` floats a body, in either direction.
 
-        Root first, a body's state ``$V`` takes its parent's ``$P`` through ``joint`` (a root's starts at zero), then
-        ``begin``, its coordinates in order (``step``) and ``end``. Leaf first, a body's state is its children's in the
-        walk's order (the first assigns ``$P`` by ``joint_first``, the others add by ``joint``; a leaf's is zero), then
-        ``begin``, its coordinates last first and ``end``; then it passes to its parent.
+        Root first, a body's state ``$V`` takes its parent's ``$P`` through ``joint`` (a root's zero), then ``begin``, its
+        coordinates in order (``step``) and ``end``. Leaf first, a body's state is its children's (the first assigns by
+        ``joint_first``, the others add; a leaf's zero), then ``begin``, its coordinates last first, ``end``, its joint.
 
-        **Loads ahead of the chain.** A walk's inputs do not depend on its chain: ``fetch_joint`` (body ``$b``'s, an
-        expression) and ``fetch_step`` (coordinate ``$c``'s) are evaluated :meth:`ahead` items before the joint (as
-        ``$L``) and the step (as ``$X``) that read them, in the walk's order, so each load is in flight while the chain
-        computes the items before it, and no store of the chain stands between a load and its issue.
-
-        Up to ``unroll`` coordinates the walk is straight-line code: each body's state an array of constant indices
-        (registers), each fetched value a named register. Past it, the loop form over the class's table in constant
-        memory: a chain's state in registers, a join's in a slot (:func:`_walk_slots`), the fetched values in two
-        register rings (bodies and coordinates), each :meth:`ahead` deep.
+        One text of the walk's steps (``visit``) on a placement of its states and items, chosen by the class's size
+        against the registers: up to ``unroll`` coordinates :class:`_Registers` and :class:`_NamedItems` (straight-line
+        code), past it :class:`_Chain` and :class:`_RingItems` (a loop over the class's table in constant memory). A
+        walk's inputs do not depend on its chain: ``fetch_joint`` (body ``$b``'s) and ``fetch_step`` (coordinate
+        ``$c``'s) are evaluated :meth:`ahead` items before the joint (as ``$L``) and the step (as ``$X``) that read them.
 
         Args:
             joint: Body ``$b``'s joint to its parent: ``$V`` from ``$P`` root first, ``$V`` into ``$P`` leaf first.
@@ -1446,128 +1644,75 @@ class WalkClass:
             root_first: The walk's direction.
             width: Floats of a body's state.
             unroll: Coordinates up to which the walk is straight-line code (:data:`WALK_UNROLL`).
-            fetch_joint: Body ``$b``'s joint inputs (an expression; ``$up`` its parent), read by ``joint`` as ``$L``; none
-                if empty.
+            fetch_joint: Body ``$b``'s joint inputs (an expression; ``$up`` its parent); none if empty.
             fetch_step: Coordinate ``$c``'s step inputs (an expression; ``$half`` its column half, :meth:`half_of`, a
-                constant in straight-line code, :data:`WALK_BOTH` in the loop form), read by ``step`` as ``$X``; none
-                if empty.
+                constant in straight-line code, :data:`WALK_BOTH` in the loop form); none if empty.
             touch_joint: Body ``$b``'s statement asking L1 for its joint inputs' lines (a hint, no register).
             touch_step: Coordinate ``$c``'s statement asking L1 for its step inputs' lines.
-            ahead: Items whose inputs a lane holds in registers ahead of the chain (:data:`WALK_AHEAD` by default; a
-                kernel whose launch bound has no room for them takes 0 and keeps the touches).
-            hold: Every item's line touched, then every item fetched, before the chain (straight-line code only): the
-                inputs held for a second walk over the same items (:meth:`walk_twice`). Touched first: on the RTX PRO
-                6000 the bare fetches of a free cube's records ran 9.2 -> 12.6 us; touched first, 8.3 (hold p2).
-            joint_first: Leaf first: the joint of a parent's first child in the walk's order, which assigns the
-                parent's state.
+            ahead: Items whose inputs a lane holds in registers ahead of the chain (:data:`WALK_AHEAD` by default).
+            hold: Every item touched, then fetched, before the chain (straight-line only), held for a second walk
+                (:meth:`walk_twice`; touched first, a free cube's fetches 12.6 -> 8.3 us on the RTX PRO 6000).
+            joint_first: Leaf first: the joint of a parent's first child in the walk's order (it assigns).
         """
         if not root_first and not joint_first:
             raise ValueError("a leaf-first walk assigns each parent's first child: give joint_first")
-        bodies, coordinates = len(self.parent), self.coordinates
-        zero = "{" + ", ".join(["0.0f"] * width) + "}"
-        bodies_order = self.bodies_in(root_first)
-
-        def coordinates_of(b):
-            return self.coordinates_in(b, root_first)
-
-        def items(entries, up, half, named=None):
-            # Each entry's fetch (`named` its register) or touch: ("l", b) body b's joint input, ("x", c) coordinate
-            # c's step input; b and c constants (straight-line) or table reads (the loop form), `up` and `half` their
-            # parent and column half.
-            out = []
-            for kind, index in entries:
-                if kind == "l":
-                    text = _fill(fetch_joint if named else touch_joint, b=index, up=up(index))
-                else:
-                    text = _fill(fetch_step if named else touch_step, c=index, half=half(index))
-                out += [f"{named(kind, index)} = {text};" if named else text] if text else []
-            return out
-
-        if coordinates <= unroll:
-            # The fetched items in the walk's order: a body's joint input where it has a parent (root first before its
-            # coordinates, leaf first after them), each coordinate's step input.
-            order = []
-            for b in bodies_order:
-                if root_first and (fetch_joint or touch_joint) and self.parent[b] >= 0:
-                    order.append(("l", b))
-                if fetch_step or touch_step:
-                    order += [("x", c) for c in coordinates_of(b)]
-                if not root_first and (fetch_joint or touch_joint) and self.parent[b] >= 0:
-                    order.append(("l", b))
-            depth = len(order) if hold else self.ahead(len(order), ahead) if fetch_joint or fetch_step else 0
-            early = len(order) if hold else self.touch(len(order)) if touch_joint or touch_step else 0
-            position = {item: k for k, item in enumerate(order)}
-
-            def fetch(item):
-                return items([item], self.parent.__getitem__, self.half_of, "const auto walk_{}{}".format)
-
-            def touched(item):
-                return items([item], self.parent.__getitem__, self.half_of)
-
-            def take(item):
-                k = position.get(item, -1)
-                if k < 0:
-                    return []
-                out = touched(order[k + early]) if k + early < len(order) else []
-                return out + (fetch(order[k + depth]) if k + depth < len(order) else [])
-
-            def body_text(b, state):
-                out = [_fill(begin, b=b, V=state, up=self.parent[b])] if begin else []
-                for c in coordinates_of(b):
-                    out += take(("x", c))
-                    out.append(_fill(step, b=b, c=c, V=state, X=f"walk_x{c}"))
-                out += [_fill(end, b=b, V=state)] if end else []
-                return out
-
-            lines = [line for item in order[:early] for line in touched(item)]
-            lines += [line for item in order[:depth] for line in fetch(item)]
-            if root_first:
-                for b, up in enumerate(self.parent):
-                    state = f"walk{b}"
-                    if up < 0:
-                        lines.append(f"float {state}[{width}] = {zero};")
-                    else:
-                        lines += [f"float {state}[{width}];", *take(("l", b))]
-                        lines.append(_fill(joint, b=b, V=state, P=f"walk{up}", L=f"walk_l{b}"))
-                    lines += body_text(b, state)
-            else:
-                lines.append(f"float {', '.join(f'walk{b}[{width}] = {zero}' for b in range(bodies))};")
-                joined = set()
-                for b in bodies_order:
-                    up = self.parent[b]
-                    lines += body_text(b, f"walk{b}")
-                    if up >= 0:
-                        lines += take(("l", b))
-                        text = joint if up in joined else joint_first
-                        joined.add(up)
-                        lines.append(_fill(text, b=b, V=f"walk{b}", P=f"walk{up}", L=f"walk_l{b}"))
-            return "\n".join(lines)
-
-        if hold:
+        texts = {
+            "fetch_joint": fetch_joint,
+            "fetch_step": fetch_step,
+            "touch_joint": touch_joint,
+            "touch_step": touch_step,
+        }
+        fetches, touches = bool(fetch_joint or fetch_step), bool(touch_joint or touch_step)
+        compiled = self.coordinates <= unroll
+        if hold and not compiled:
             raise ValueError("a walk holds its items in straight-line code only")
-        # The loop form: the walk's steps as a sequence of slots in the walk's order, a slot per coordinate and one
-        # for a body without coordinates, each naming its body, its coordinate (-1 for none) and whether it is the
-        # first (the body's joint before it root first, its gathering leaf first) or the last of its body's (the
-        # body's end after it, and leaf first its joint). The fetched inputs sit in a register ring of `ahead`
-        # slots: the loop body is that many copies of the slot's text, so copy j reads ring slot j and refills it
-        # with the inputs `ahead` slots on, which no later copy reads before the next pass: each load has the whole
-        # pass to arrive, and no copy of an arriving value stands in its way.
-        slots, count = _walk_slots(self.parent)
-        sequence = []
-        for b in bodies_order:
-            span = list(coordinates_of(b)) or [-1]
-            sequence += [(b, c, k == 0, k == len(span) - 1) for k, c in enumerate(span)]
-        steps = len(sequence)
-        depth = self.ahead(steps, ahead) if fetch_joint or fetch_step else 0
-        name = f"WALK_CLASS_{self.tag}"
-        # Leaf first, a body's join bits, the plan's up flags: its parent's first child (18), a parent (19).
-        up_flags = TreePlan.build(self.parent).up_flags if not root_first else np.zeros(len(self.parent), np.int32)
-        join = [bool(f & UP_FIRST) << 18 | bool(f & UP_SUMS) << 19 for f in up_flags]
-        flags = [b | (int(first) << 16) | (int(last) << 17) | join[b] for b, _, first, last in sequence]
 
+        def visit(s: _Step, place: _Placement) -> list[str]:
+            # The one text of a step, on its placement's states and items.
+            state = place.state(s)
+            head = place.enter(s) + ([_fill(begin, b=s.b, V=state, up=s.up)] if begin else [])
+            tail = ([_fill(end, b=s.b, V=state)] if end else []) + place.leave(s)
+            coordinate = [*place.take(("x", s.c)), _fill(step, b=s.b, c=s.c, V=state, **place.names(s))]
+            return [
+                *place.bind(s),
+                *_when(s.first, head),
+                *_when(s.coordinate, coordinate),
+                *_when(s.last, tail),
+                *place.after(s),
+            ]
+
+        # The steps in the walk's order: a coordinate's, or a body's without one, with the body's join bits leaf first
+        # (the plan's up flags: a parent's first child in the walk's order, a parent).
+        up_flags = TreePlan.build(self.parent).up_flags if not root_first else np.zeros(len(self.parent), np.int32)
+        sequence = []
+        for b in self.bodies_in(root_first):
+            span = list(self.coordinates_in(b, root_first)) or [-1]
+            sequence += [(b, c, k == 0, k == len(span) - 1) for k, c in enumerate(span)]
+        if compiled:
+            place = _Registers(
+                self,
+                root_first,
+                width,
+                joint,
+                joint_first,
+                texts,
+                depth=lambda n: n if hold else self.ahead(n, ahead) if fetches else 0,
+                early=lambda n: n if hold else self.touch(n) if touches else 0,
+            )
+            steps = [
+                _Step(b, c, self.parent[b], first, last, bool(up_flags[b] & UP_SUMS), bool(up_flags[b] & UP_FIRST))
+                for b, c, first, last in sequence
+            ]
+            return "\n".join([*place.prologue(), *(line for s in steps for line in visit(s, place))])
+
+        # The loop form: the class's steps in constant memory, each naming its body (16 bits), whether it is the body's
+        # first (16) and last (17) step and its body's join bits (18, 19), and its coordinate (-1 for none).
+        name = f"WALK_CLASS_{self.tag}"
+        join = [bool(f & UP_FIRST) << 18 | bool(f & UP_SUMS) << 19 for f in up_flags]
+        slots, count = self.slots
         tables = [
             constant_table(f"{name}_PARENT", self.parent),
-            constant_table(f"{name}_STEP", flags),
+            constant_table(f"{name}_STEP", [b | first << 16 | last << 17 | join[b] for b, _, first, last in sequence]),
             constant_table(f"{name}_COORDINATE", [c for _, c, _, _ in sequence]),
         ]
         # The class's column halves (half_of): a table where none has both, so the walk's fetch takes no side; else
@@ -1577,97 +1722,19 @@ class WalkClass:
             tables.append(constant_table(f"{name}_HALF", self.half))
         if count:
             tables.append(constant_table(f"{name}_SLOT", slots))
-        each = "for (int k = 0; k < $width; ++k)"
-        slot = f"S[{name}_SLOT[$at]]"
-
-        up = f"{name}_PARENT[{{}}]".format
+        n = len(sequence)
         half = f"({name}_HALF[{{}}] & 1)".format if one_half else lambda c: WALK_BOTH
-
-        def entries(at):
-            coordinate = f"{name}_COORDINATE[{at}]"
-            return [("l", f"({name}_STEP[{at}] & 0xffff)"), ("x", f"(({coordinate}) < 0 ? 0 : {coordinate})")]
-
-        def fetched(j, at):
-            return items(entries(at), up, half, lambda kind, _: f"walk_{kind}{j}")
-
-        ring = [f"auto {line}" for j in range(depth) for line in fetched(j, min(j, steps - 1))]
-        early = self.touch(steps) if touch_joint or touch_step else 0
-
-        def touched(at):
-            return items(entries(at), up, half)
-
-        if early:
-            ring.append(f"for (int at = 0; at < {early}; ++at) {{\n{indent_text(chr(10).join(touched('at')), 4)}\n}}")
-        if root_first:
-            parent_state = f"{each} P[k] = V[k];"
-            if count:
-                parent_state = (
-                    f"if (up == b - 1) {{\n    {each} P[k] = V[k];\n}} else {{\n"
-                    f"    {each} P[k] = {_fill(slot, at='up')}[k];\n}}"
-                )
-            state = f"float V[$width], P[$width];{f' float S[{count}][$width];' if count else ''}"
-        else:
-            # A parent's state is its first child's, the others added (no slot cleared); a leaf's zero.
-            gather = f"{each} V[k] = N[k];"
-            if count:
-                gather = f"if ({name}_SLOT[b] >= 0)\n    {each} V[k] = {_fill(slot, at='b')}[k];\nelse\n    {gather}"
-            gather = f"if (({name}_STEP[at] >> 19) & 1) {{\n{indent_text(gather, 4)}\n}} else\n    {each} V[k] = 0.0f;"
-            state = f"float V[$width], N[$width];{f' float S[{count}][$width];' if count else ''}"
-
-        def copy(j):
-            """The text of slot `at` with ring slot j (or the inputs loaded in place, without a ring)."""
-            lines = [f"const int b = {name}_STEP[at] & 0xffff, c = {name}_COORDINATE[at];"]
-            names = {"L": f"walk_l{j}", "X": f"walk_x{j}"}
-            if not depth:
-                names = {"L": "walk_l", "X": "walk_x"}
-                lines += items(
-                    [("l", "b"), ("x", "(c < 0 ? 0 : c)")], up, half, lambda kind, _: f"const auto walk_{kind}"
-                )
-            if root_first:
-                head = [f"const int up = {name}_PARENT[b];", f"if (up < 0) {{\n    {each} V[k] = 0.0f;\n}} else {{"]
-                head += [indent_text(parent_state, 4), indent_text(_fill(joint, b="b", V="V", P="P", **names), 4), "}"]
-            else:
-                head = [gather]
-            if begin:
-                head.append(_fill(begin, b="b", V="V", up=f"{name}_PARENT[b]"))
-            lines.append(f"if (({name}_STEP[at] >> 16) & 1) {{\n{indent_text(chr(10).join(head), 4)}\n}}")
-            lines.append(f"if (c >= 0) {{\n{indent_text(_fill(step, b='b', c='c', V='V', **names), 4)}\n}}")
-            tail = [_fill(end, b="b", V="V")] if end else []
-            if root_first and count:
-                tail.append(f"if ({name}_SLOT[b] >= 0)\n    {each} {_fill(slot, at='b')}[k] = V[k];")
-            if not root_first:
-                # A parent without a slot has one child, the next body: its first.
-                give = _fill(joint_first, b="b", V="V", P="N", **names)
-                if count:
-                    into = [_fill(text, b="b", V="V", P=_fill(slot, at="up"), **names) for text in (joint_first, joint)]
-                    into = (
-                        f"if (({name}_STEP[at] >> 18) & 1)\n{indent_text(into[0], 4)}\nelse\n{indent_text(into[1], 4)}"
-                    )
-                    give = (
-                        f"if ({name}_SLOT[up] >= 0) {{\n{indent_text(into, 4)}\n}} else {{\n{indent_text(give, 4)}\n}}"
-                    )
-                tail.append(f"const int up = {name}_PARENT[b];\nif (up >= 0) {{\n{indent_text(give, 4)}\n}}")
-            if tail:
-                lines.append(f"if (({name}_STEP[at] >> 17) & 1) {{\n{indent_text(chr(10).join(tail), 4)}\n}}")
-            if depth:
-                lines += fetched(j, f"(at + {depth} < {steps} ? at + {depth} : {steps - 1})")
-            if early:
-                lines.append(
-                    f"if (at + {early} < {steps}) {{\n{indent_text(chr(10).join(touched(f'at + {early}')), 4)}\n}}"
-                )
-            return "\n".join(lines)
-
-        width_of_pass = max(depth, 1)
-        copies = "\n".join(
-            f"if (at0 + {j} < {steps}) {{\n    const int at = at0 + {j};\n{indent_text(copy(j), 4)}\n}}"
-            for j in range(width_of_pass)
+        ring = (n, self.ahead(n, ahead) if fetches else 0, self.touch(n) if touches else 0)
+        place = _Chain(self, root_first, width, joint, joint_first, texts, name, half, ring)
+        flag = f"({name}_STEP[at] >> {{}}) & 1".format
+        copies = max(place.depth, 1)
+        steps = [_Step("b", "c", f"{name}_PARENT[b]", flag(16), flag(17), flag(19), flag(18), j) for j in range(copies)]
+        loop = "\n".join(
+            f"if (at0 + {j} < {n}) {{\n    const int at = at0 + {j};\n{indent_text(chr(10).join(visit(s, place)), 4)}\n}}"
+            for j, s in enumerate(steps)
         )
-        loop = f"""{state}
-{chr(10).join(ring)}
-for (int at0 = 0; at0 < {steps}; at0 += {width_of_pass}) {{
-{indent_text(copies, 4)}
-}}"""
-        return "\n".join(tables) + "\n" + Template(loop).substitute(width=width)
+        head = f"for (int at0 = 0; at0 < {n}; at0 += {copies}) {{"
+        return "\n".join([*tables, *place.prologue(), head, indent_text(loop, 4), "}"])
 
     def bodies_in(self, root_first: bool) -> range:
         """The class's bodies in a walk's order: parents first (root first), or children first (leaf first)."""
