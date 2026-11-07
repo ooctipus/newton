@@ -1064,29 +1064,32 @@ def braced(lines) -> str:
     return "{\n" + "\n".join("    " + line for line in "\n".join(lines).split("\n")) + "\n}"
 
 
-def root_path(body: str, c: str, *, begin=(), joint=(), count: str = "") -> tuple[str, str]:
+def root_path(body: str, c: str, *, begin=(), joint=(), count: str = "", rows: str = "") -> tuple[str, str]:
     """The path table's walk of a root path (``WALK_PARENT_OF``, ``WALK_FIRST_OF``), leaf first: coordinate ``c`` of
-    ``body`` down to its body's first, then each ancestor's coordinates, last first. Returns the statements before and
-    after a coordinate's visit (``c`` and the body ``b`` in scope), both loops rolled: ``begin`` opens a body (before
-    its coordinates), ``joint`` passes it to its parent ``up`` (the edge); ``count`` advances with ``c``."""
-    head = [
-        "#pragma unroll 1",
-        f"for (int b = {body}, c = {c}; b >= 0;) {{",
-        *_indented(begin, 4),
-        "    #pragma unroll 1",
-        f"    for (; c >= WALK_FIRST_OF(b); --c{', ' + count if count else ''}) {{",
-    ]
-    tail = [
-        "    }",
-        "    const int up = WALK_PARENT_OF(b);",
-        "    if (up >= 0) {",
-        *_indented(joint, 8),
-        "        c = WALK_FIRST_OF(up + 1) - 1;",
-        "    }",
-        "    b = up;",
-        "}",
-    ]
-    return "\n".join(head), "\n".join(tail)
+    ``body`` down to its body's first, then each ancestor's coordinates, last first (:meth:`WalkClass.steps` with the
+    table compiled). Returns the statements before and after a coordinate's visit (``c`` and the body ``b`` in scope),
+    both loops rolled: ``begin`` opens a body (before its coordinates), ``joint`` passes it to its parent ``up`` (the
+    edge); ``count`` advances with ``c``. With ``rows``, the walk with entry points: walk ``r`` enters at coordinate
+    ``c[r]`` of ``body[r]`` (-1: none), the union of their root paths deepest body first, each body from its deepest
+    entry, ``joint`` for each walk ``r`` on it."""
+    last = "WALK_FIRST_OF(up + 1) - 1"
+    if rows:
+        each = f"WALK_UNROLLED\n    for (int r = 0; r < {rows}; ++r)"
+        opening = ["for (;;) {", "    int b = -1, c = -1;", f"{each} b = {body}[r] > b ? {body}[r] : b;"]
+        opening += ["    if (b < 0) break;", f"{each} c = {body}[r] == b && {c}[r] > c ? {c}[r] : c;"]
+        passing = [
+            f"{each} {{",
+            f"        if ({body}[r] != b) continue;",
+            "        if (up >= 0) {",
+            *_indented(joint, 12),
+        ]
+        passing += ["        }", f"        {body}[r] = up;", f"        {c}[r] = up >= 0 ? {last} : -1;", "    }"]
+    else:
+        opening = [f"for (int b = {body}, c = {c}; b >= 0;) {{"]
+        passing = ["    if (up >= 0) {", *_indented(joint, 8), f"        c = {last};", "    }", "    b = up;"]
+    head = ["#pragma unroll 1", *opening, *_indented(begin, 4), "    #pragma unroll 1"]
+    head.append(f"    for (; c >= WALK_FIRST_OF(b); --c{', ' + count if count else ''}) {{")
+    return "\n".join(head), "\n".join(["    }", "    const int up = WALK_PARENT_OF(b);", *passing, "}"])
 
 
 def by_class(texts: list[str]) -> str:
@@ -1621,16 +1624,24 @@ class WalkClass:
         if self.half and len(self.half) != self.first[-1]:
             raise ValueError("a walk's class names a half for every coordinate or for none")
 
-    def root_path(self, c: int) -> list[int]:
-        """Coordinate ``c``'s root path, leaf first: ``c`` down to its body's first, then each ancestor's coordinates
-        last first (the release's path, :class:`.factor.walk.WalkRelease`): :func:`root_path` with the table compiled."""
-        body = max(b for b in range(len(self.parent)) if self.first[b] <= c < self.first[b + 1])
-        path = []
-        while body >= 0:
-            path += list(range(c, self.first[body] - 1, -1))
-            body = self.parent[body]
-            c = self.first[body + 1] - 1 if body >= 0 else -1
-        return path
+    def steps(self, root_first: bool, entry: int | None = None) -> list[_Step]:
+        """The class's steps in a walk's order, every field a constant: each body's coordinates, or the body alone
+        without one. The whole tree, each body's join bits leaf first (the plan's up flags: a parent's first child in
+        the walk's order, a parent); or coordinate ``entry``'s root path, which joins nothing (:func:`root_path` with
+        the table compiled): ``entry`` down to its body's first, then each ancestor's coordinates, last first."""
+        flags = TreePlan.build(self.parent).up_flags if entry is None and not root_first else [0] * len(self.parent)
+        bodies = list(self.bodies_in(root_first))
+        if entry is not None:
+            b, bodies = max(b for b in bodies if self.first[b] <= entry), []
+            while b >= 0:
+                bodies, b = [*bodies, b], self.parent[b]
+            bodies = bodies[::-1] if root_first else bodies
+        out = []
+        for b in bodies:
+            span = [c for c in self.coordinates_in(b, root_first) if entry is None or c <= entry] or [-1]
+            bits = (self.parent[b], bool(flags[b] & UP_SUMS), bool(flags[b] & UP_FIRST))
+            out += [_Step(b, c, bits[0], k == 0, k == len(span) - 1, *bits[1:]) for k, c in enumerate(span)]
+        return out
 
     def half_of(self, c: int) -> int:
         """Coordinate ``c``'s column half as the class's walk compiles it (:data:`WALK_BOTH`: read from the record)."""
@@ -1711,13 +1722,7 @@ class WalkClass:
         if hold and not compiled:
             raise ValueError("a walk holds its items in straight-line code only")
 
-        # The steps in the walk's order: a coordinate's, or a body's without one, with the body's join bits leaf first
-        # (the plan's up flags: a parent's first child in the walk's order, a parent).
-        up_flags = TreePlan.build(self.parent).up_flags if not root_first else np.zeros(len(self.parent), np.int32)
-        sequence = []
-        for b in self.bodies_in(root_first):
-            span = list(self.coordinates_in(b, root_first)) or [-1]
-            sequence += [(b, c, k == 0, k == len(span) - 1) for k, c in enumerate(span)]
+        steps = self.steps(root_first)
         if compiled:
             place = _Registers(
                 self,
@@ -1729,21 +1734,18 @@ class WalkClass:
                 depth=lambda n: n if hold else self.ahead(n, ahead) if fetches else 0,
                 early=lambda n: n if hold else self.touch(n) if touches else 0,
             )
-            steps = [
-                _Step(b, c, self.parent[b], first, last, bool(up_flags[b] & UP_SUMS), bool(up_flags[b] & UP_FIRST))
-                for b, c, first, last in sequence
-            ]
             return "\n".join([*place.prologue(), *(line for s in steps for line in _visit(s, place, step, begin, end))])
 
         # The loop form: the class's steps in constant memory, each naming its body (16 bits), whether it is the body's
         # first (16) and last (17) step and its body's join bits (18, 19), and its coordinate (-1 for none).
         name = f"WALK_CLASS_{self.tag}"
-        join = [bool(f & UP_FIRST) << 18 | bool(f & UP_SUMS) << 19 for f in up_flags]
         slots, count = self.slots
         tables = [
             constant_table(f"{name}_PARENT", self.parent),
-            constant_table(f"{name}_STEP", [b | first << 16 | last << 17 | join[b] for b, _, first, last in sequence]),
-            constant_table(f"{name}_COORDINATE", [c for _, c, _, _ in sequence]),
+            constant_table(
+                f"{name}_STEP", [s.b | s.first << 16 | s.last << 17 | s.leading << 18 | s.sums << 19 for s in steps]
+            ),
+            constant_table(f"{name}_COORDINATE", [s.c for s in steps]),
         ]
         # The class's column halves (half_of): a table where none has both, so the walk's fetch takes no side; else
         # each record's own.
@@ -1752,16 +1754,18 @@ class WalkClass:
             tables.append(constant_table(f"{name}_HALF", self.half))
         if count:
             tables.append(constant_table(f"{name}_SLOT", slots))
-        n = len(sequence)
+        n = len(steps)
         half = f"({name}_HALF[{{}}] & 1)".format if one_half else lambda c: WALK_BOTH
         ring = (n, self.ahead(n, ahead) if fetches else 0, self.touch(n) if touches else 0)
         place = _Chain(self, root_first, width, joint, joint_first, texts, name, half, ring)
         flag = f"({name}_STEP[at] >> {{}}) & 1".format
         copies = max(place.depth, 1)
-        steps = [_Step("b", "c", f"{name}_PARENT[b]", flag(16), flag(17), flag(19), flag(18), j) for j in range(copies)]
+        copied = [
+            _Step("b", "c", f"{name}_PARENT[b]", flag(16), flag(17), flag(19), flag(18), j) for j in range(copies)
+        ]
         loop = "\n".join(
             f"if (at0 + {j} < {n}) {{\n    const int at = at0 + {j};\n{indent_text(chr(10).join(_visit(s, place, step, begin, end)), 4)}\n}}"
-            for j, s in enumerate(steps)
+            for j, s in enumerate(copied)
         )
         head = f"for (int at0 = 0; at0 < {n}; at0 += {copies}) {{"
         return "\n".join([*tables, *place.prologue(), head, indent_text(loop, 4), "}"])

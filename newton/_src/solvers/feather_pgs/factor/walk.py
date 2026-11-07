@@ -591,17 +591,7 @@ WALK_UNROLLED
             top[r] = at[r];
             for (int k = 0; k < 6; ++k) p[6 * r + k] = 0.0f;
         }
-#pragma unroll 1
-        for (;;) {
-            int b = -1, c = -1;
-WALK_UNROLLED
-            for (int r = 0; r < $rows; ++r) b = body[r] > b ? body[r] : b;
-            if (b < 0) break;
-WALK_UNROLLED
-            for (int r = 0; r < $rows; ++r) c = body[r] == b && top[r] > c ? top[r] : c;
-            $link_b
-#pragma unroll 1
-            for (; c >= WALK_FIRST_OF(b); --c) {
+$sweep_head
 $record_c
 WALK_UNROLLED
                 for (int r = 0; r < $rows; ++r) {
@@ -616,19 +606,7 @@ WALK_UNROLLED
                         sink(r, c, z);
                     }
                 }
-            }
-            const int up = WALK_PARENT_OF(b);
-WALK_UNROLLED
-            for (int r = 0; r < $rows; ++r) {
-                if (body[r] != b) continue;
-                if (up >= 0) {
-                    float* q = p + 6 * r;
-                    $sweep_edge
-                }
-                body[r] = up;
-                top[r] = up >= 0 ? WALK_FIRST_OF(up + 1) - 1 : -1;
-            }
-        }
+$sweep_tail
     };"""
 
 _WALK_RELEASE = """    // The slips' release of tree art (WalkRelease, written by the predictor's border; W9's verdict: R = L_F^-1 L_K,
@@ -733,9 +711,17 @@ _UP_HEAD, _UP_TAIL = ts.root_path(
         "}",
     ],
 )
-_WALK = Template(_WALK).safe_substitute(up_head=ts.indent_text(_UP_HEAD, 8), up_tail=ts.indent_text(_UP_TAIL, 8))
-"""``WALK_UP``'s root path, leaf first (:func:`.tree_scan.root_path`): each body's link where the path opens it, its
-coordinates, the rows' and the seed wrenches' joint to its parent."""
+_SWEEP_HEAD, _SWEEP_TAIL = ts.root_path(
+    "body", "top", begin=["$link_b"], joint=["float* q = p + 6 * r;", "$sweep_edge"], rows="$rows"
+)
+_WALK = Template(_WALK).safe_substitute(
+    up_head=ts.indent_text(_UP_HEAD, 8),
+    up_tail=ts.indent_text(_UP_TAIL, 8),
+    sweep_head=ts.indent_text(_SWEEP_HEAD, 8),
+    sweep_tail=ts.indent_text(_SWEEP_TAIL, 8),
+)
+"""``WALK_UP``'s root path and ``WALK_SWEEP``'s with entry points, leaf first (:func:`.tree_scan.root_path`): each
+body's link where the path opens it, its coordinates, the rows' and the seed wrenches' joint to its parent."""
 
 _POSE = ("(e0 - d[0])", "(e1 - d[1])", "(e2 - d[2])", "(S[3] - d[3])", "(S[4] - d[4])", "(S[5] - d[5])")
 _WALK_TEXTS = {
@@ -1239,7 +1225,7 @@ def _leave_class(k: int, walk: WalkClass, node: tuple[int, ...] | None, release:
         # coordinate), so the copy stays in registers.
         steps = []
         for c in range(n):
-            path = walk.root_path(c)
+            path = [s.c for s in walk.steps(False, c) if s.c >= 0]
             # Step t's record (WALK_STEP); step 0's arrived with the slip's coordinate.
             body = " ".join(
                 "{ "
