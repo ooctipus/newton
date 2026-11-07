@@ -749,6 +749,8 @@ def _compute_pair_shape_aabbs(
     shape_gap: wp.array[float],
     shape_collision_aabb_lower: wp.array[wp.vec3],
     shape_collision_aabb_upper: wp.array[wp.vec3],
+    shape_flags: wp.array[wp.int32],
+    shape_variant_row: wp.array[wp.bool],
     # Fused counter arrays — zeroed by thread 0 to avoid separate kernel launches.
     contact_counters: wp.array[wp.int32],
     contact_generation: wp.array[wp.int32],
@@ -788,6 +790,14 @@ def _compute_pair_shape_aabbs(
     if work_id >= shape_indices.shape[0]:
         return
     shape_id = shape_indices[work_id]
+
+    # Empty variant rows have their collision flags cleared; give them an empty AABB because broad
+    # phases include every row that could hold a colliding variant shape.
+    if shape_variant_row.shape[0] > 0 and shape_variant_row[shape_id]:
+        if (shape_flags[shape_id] & (ShapeFlags.COLLIDE_SHAPES | ShapeFlags.COLLIDE_PARTICLES)) == 0:
+            aabb_lower[shape_id] = wp.vec3(_EMPTY_AABB_EXTENT)
+            aabb_upper[shape_id] = wp.vec3(-_EMPTY_AABB_EXTENT)
+            return
 
     rigid_id = shape_body[shape_id]
     geo_type = shape_type[shape_id]

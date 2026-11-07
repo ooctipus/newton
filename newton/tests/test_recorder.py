@@ -47,6 +47,8 @@ class TestRecorder(unittest.TestCase):
         builder.add_ground_plane()
         builder.replicate(robot, 3)
         model = builder.finalize(device="cpu")
+        # The list, and the templates it replays, are built on first access.
+        self.assertIsNotNone(model.shape_contact_pairs)
         self.assertIsNotNone(model._shape_contact_pair_templates)
         attributes = pointer_as_key({"model": model}, "json")["items"]["model"]["attributes"]
         self.assertIn("_shape_contact_pair_templates", attributes)

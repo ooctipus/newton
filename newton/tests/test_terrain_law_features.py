@@ -19,7 +19,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.geometry import terrain_contacts
-from newton._src.geometry.narrow_phase import verify_narrow_phase_buffers
+from newton._src.geometry.narrow_phase import record_narrow_phase_buffers
 from newton._src.geometry.terrain_contacts import TerrainFeatures
 from newton._src.geometry.terrain_law import (
     TERRAIN_EDGE_BORDER,
@@ -495,11 +495,11 @@ def test_stale_features_are_reported(test, device):
     features.mark_elevations_changed(shape)
     wp.launch(_stale_check, dim=1, inputs=[features.data(), 0, status, overflow], device=device)
     test.assertEqual(int(status.numpy()[0]), int(TERRAIN_STATUS_STALE))
-    # verify_narrow_phase_buffers starts from the status word and keeps the bit.
+    # record_narrow_phase_buffers starts from the status word and keeps the bit.
     zero = wp.zeros(1, dtype=wp.int32, device=device)
     active = wp.zeros(2, dtype=wp.int32, device=device)
     args = [zero, 1, zero, -1, zero, 1, zero, -1, zero, -1, zero, 1, zero, 1, zero, 1, zero, 1, zero, 1, zero, 1]
-    wp.launch(verify_narrow_phase_buffers, dim=1, inputs=[*args, active, 0, zero, 80, status], device=device)
+    wp.launch(record_narrow_phase_buffers, dim=1, inputs=[*args, active, 0, zero, zero, 80, status], device=device)
     test.assertEqual(int(status.numpy()[0]), int(TERRAIN_STATUS_STALE))
     features.rebuild_terrain_features(shape)
     status.zero_()
