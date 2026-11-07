@@ -891,40 +891,42 @@ class Sweep:
                 named.update(zip(("kinetic_rows", "patch_law"), keyed, strict=False))
             self._launch(tier.kernel, operands, tier.grid, tier.work.block, **named)
 
-        if streams:
-            # The claims are queued first, ahead of the general sweep: on franka the widest tier (rows32) is the
-            # solve's critical path once the general bucket holds few worlds, and queued behind the general sweep's
-            # grid it started 8 us later a solve (PRO).
-            main.record_event(self.claims_ready)
-            for stream, tier in zip(streams, self.tiers, strict=True):
-                stream.wait_event(self.claims_ready)
-                with wp.ScopedStream(stream, sync_enter=False):
-                    launch_tier(tier)
-        else:
+        def launch_general():
+            colored_kernel = self.mf_colored_kernel
+            colored = {} if colored_kernel is None else self.colored_units.operands()
+            # The general sweep's bucket, on its persistent grid.
+            grid = self.general_grid
+            self._launch(mf_gs_kernel, operands, grid, 32, **walk, **colored, **queued(self.claim_general, grid))
+            if colored_kernel is not None:
+                # The colored bucket (the unit builder's rule picked its worlds): a block a world of its capacity, the
+                # colored storage's slots, a color's units at once.
+                grid = self.colored_units.slot_count
+                self._launch(
+                    colored_kernel,
+                    operands,
+                    grid,
+                    sweep_routes.COLORED_THREADS,
+                    **walk,
+                    **colored,
+                    **queued(self.claim_colored, grid),
+                )
+
+        if not streams:
             for tier in self.tiers:
                 launch_tier(tier)
-        colored_kernel = self.mf_colored_kernel
-        colored = {} if colored_kernel is None else self.colored_units.operands()
-        # The general sweep's bucket, on its persistent grid.
-        grid = self.general_grid
-        self._launch(mf_gs_kernel, operands, grid, 32, **walk, **colored, **queued(self.claim_general, grid))
-        if colored_kernel is not None:
-            # The colored bucket (the unit builder's rule picked its worlds): a block a world of its capacity, the
-            # colored storage's slots, a color's units at once.
-            grid = self.colored_units.slot_count
-            self._launch(
-                colored_kernel,
-                operands,
-                grid,
-                sweep_routes.COLORED_THREADS,
-                **walk,
-                **colored,
-                **queued(self.claim_colored, grid),
-            )
-        if streams:
-            for stream, done in zip(streams, self.claims_done, strict=True):
-                stream.record_event(done)
-                main.wait_event(done)
+            launch_general()
+            return
+        # The first tier runs in line, the general sweep and the other tiers beside it: a fork's first kernel started
+        # about 18 us after the fork a solve, and on franka the first tier (rows32) is the solve's critical path (PRO).
+        main.record_event(self.claims_ready)
+        launch_tier(self.tiers[0])
+        beside = (launch_general, *(functools.partial(launch_tier, tier) for tier in self.tiers[1:]))
+        for stream, launch, done in zip(streams, beside, self.claims_done, strict=True):
+            stream.wait_event(self.claims_ready)
+            with wp.ScopedStream(stream, sync_enter=False):
+                launch()
+            stream.record_event(done)
+            main.wait_event(done)
 
     @staticmethod
     def patch_frame_built(contacts):
