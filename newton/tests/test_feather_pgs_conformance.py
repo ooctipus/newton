@@ -1373,6 +1373,9 @@ def reference(physics: Physics, route: Route, device) -> Reference:
 _MF = {}
 # Dense storage: the route of the general placement's reference.
 _DENSE = {"storage": "dense"}
+# The references' sweep: the full ordered sweep of ordinary updates, whatever enumeration and units a placement's rule
+# selects, so an oracle never moves with a law under test.
+_FULL_SWEEP = {"active_rows": False, "contact_units": None}
 
 
 REFERENCE_CUDA = Route(
@@ -1382,7 +1385,7 @@ REFERENCE_CUDA = Route(
     # tiers and the sparse-diagonal owner, and every world is solved (no resolved-world claim). The tree factor itself
     # answers to the float64 mass matrix (test_feather_pgs_factor).
     options=_MF,
-    pins={**_DENSE, "placement": "general", "claims": ()},
+    pins={**_DENSE, **_FULL_SWEEP, "placement": "general", "claims": ()},
     expect={
         "sweep.route": "matrix_free_gs",
         "sweep.tiers": None,
@@ -1479,7 +1482,7 @@ REFERENCE_CPU = Route(
     "reference_cpu",
     "cpu",
     options=_MF,
-    pins={**_DENSE, "placement": "general", "claims": ()},
+    pins={**_DENSE, **_FULL_SWEEP, "placement": "general", "claims": ()},
     expect={"sweep.route": "matrix_free_gs", "held_tree.owner": "mixed"},
 )
 CPU = Route("cpu", "cpu", options=_MF, expect={"sweep.route": "matrix_free_gs"})
