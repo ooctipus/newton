@@ -658,7 +658,7 @@ def test_superseded_rows_live_while_a_graph_captured_before_lives(test, device):
 def test_rows_fall_back_without_gpu_components(test, device):
     """Hold CUDA rows in ordinary arrays without ``gpu_components``: growth reallocates, copies and replaces the views."""
     with _without_gpu_components():
-        with test.assertLogs("newton._src.core.contact_pool", level="INFO") as logs:
+        with test.assertLogs("newton._src.core.contact_pool", level="DEBUG") as logs:
             pool = ContactPool(device=device, rows=64)
             target = type("Target", (), {})()
             rows = pool.rows((ContactField("value", wp.int32, -1),), on_rows=lambda rows: rows.publish(target))
