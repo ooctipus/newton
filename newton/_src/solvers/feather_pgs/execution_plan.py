@@ -31,6 +31,7 @@ def _select_mfgs_storage(
     budget: int,
     *,
     force_stream_mf_impulses: bool = False,
+    force_stream_line: bool = False,
 ) -> _MFGSStorage:
     """Place the sweep's row operands without changing row capacity or order.
 
@@ -41,8 +42,10 @@ def _select_mfgs_storage(
     The rows' metadata is shared when it takes at most :data:`_MFGS_RESIDENT_METADATA_MAX_BYTES` and the block fits;
     otherwise the rows' records stream, a row ahead (:class:`.sweep.WorldRows`). The free bodies' impulses are global
     only when they cannot fit alongside the world velocity and the dense state (a capacity choice, not a claim that
-    global storage is faster), or on ``force_stream_mf_impulses`` (the solver's test pin ``mf_storage='streamed'``).
-    Both places hold identical values, so results are bitwise identical.
+    global storage is faster), or on ``force_stream_mf_impulses`` (the solver's test pin ``mf_storage='streamed'``);
+    the dense rows' impulses, the line's, only when they cannot fit beside the world velocity either (a line past the
+    stage is read and written in place), or on ``force_stream_line`` (the test pin ``mf_storage='line'``). Both places
+    hold identical values, so results are bitwise identical.
     """
     SHARED, GLOBAL = Place.SHARED, Place.GLOBAL
     resident = staging(places=RowPlaces())
@@ -60,11 +63,17 @@ def _select_mfgs_storage(
             f"memory; the device's budget is {budget}."
         )
     fixed = staging(places=RowPlaces(metadata, GLOBAL))
+    if force_stream_line:
+        return _MFGSStorage(RowPlaces(metadata, GLOBAL, GLOBAL), reason + " Every impulse streams on request.")
     if not fixed.fits(budget):
-        raise ValueError(
-            f"MF-GS world velocity and dense state require {fixed.bytes} bytes of static shared memory even with "
-            f"streamed MF impulses, but the device's budget is {budget} bytes"
-        )
+        line = staging(places=RowPlaces(metadata, GLOBAL, GLOBAL))
+        if not line.fits(budget):
+            raise ValueError(
+                f"MF-GS world velocity requires {line.bytes} bytes of static shared memory even with every impulse "
+                f"in place, but the device's budget is {budget} bytes"
+            )
+        reason += f" Every impulse streams: the dense state takes {fixed.bytes} bytes of the device's {budget}."
+        return _MFGSStorage(RowPlaces(metadata, GLOBAL, GLOBAL), reason)
     with_impulses = staging(places=RowPlaces(metadata))
     impulses = SHARED
     if not with_impulses.fits(budget):

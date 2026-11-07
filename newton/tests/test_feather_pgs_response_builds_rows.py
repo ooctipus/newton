@@ -10,6 +10,7 @@ import unittest
 import numpy as np
 import warp as wp
 
+from newton._src.core.memory import Place
 from newton._src.solvers.feather_pgs.row_metadata import (
     RECORD_WORDS,
     _validate_mf_metadata_encoding,
@@ -135,6 +136,48 @@ class TestFreeBodyRowsBuild(unittest.TestCase):
         J = unpacked_rows(solver)[0][0, :rows]
         expected = np.einsum("ri,ij,rj->r", J, np.linalg.inv(H), J) + solver.options.pgs_cfm
         np.testing.assert_allclose(solver.placement.diag.numpy()[0, :rows], expected, rtol=1e-5)
+
+
+def _box_run(device, pins=None, steps: int = 12):
+    """A tilted box on the ground (its lowest edge 5 mm into it), ``steps`` steps: the most rows of the line a step
+    held, the solver and the box's state."""
+    import newton  # noqa: PLC0415
+    from newton.solvers import SolverFeatherPGS  # noqa: PLC0415
+
+    builder = newton.ModelBuilder()
+    rotation = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.3)
+    body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.12), rotation))
+    builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    solver = SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(**(pins or {})))
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state, out = model.state(), model.state()
+    rows = 0
+    for _ in range(steps):
+        pipeline.collide(state, contacts)
+        solver.step(state, out, model.control(), contacts, 1.0 / 240.0)
+        rows = max(rows, int(solver.placement.constraint_count.numpy()[0]))
+        state, out = out, state
+    return rows, solver, state.body_q.numpy(), state.body_qd.numpy()
+
+
+class TestLineImpulses(unittest.TestCase):
+    """The line's impulses read and written in place, where the line is past the sweep's stage."""
+
+    def test_line_impulses_in_place_hold_the_staged_values(self):
+        """Every impulse in place (the test pin ``mf_storage='line'``) steps bit for bit as staged ones: both places
+        hold the same values."""
+        devices = ["cpu"] + (["cuda:0"] if wp.get_cuda_device_count() > 0 else [])
+        for device in devices:
+            with self.subTest(device=device):
+                _, solver, q, qd = _box_run(device, {"mf_storage": "line"})
+                self.assertIs(solver.sweep.mf_gs_storage.places.dense_impulses, Place.GLOBAL)
+                rows, _, q0, qd0 = _box_run(device)
+                self.assertGreater(rows, 0, "the box must touch the ground")
+                np.testing.assert_array_equal(q, q0)
+                np.testing.assert_array_equal(qd, qd0)
 
 
 if __name__ == "__main__":

@@ -93,6 +93,7 @@
   "sweep_routes.GeneralSweep(64, 32, 12, '120', free_rows=True, has_dense_velocity_limit_rows=True, speed_rows=True)": "0823ce8b875eb6fbf2d5abc8c7d24dbee6fd984d6a7815351ff6e605616f7e66",
   "sweep_routes.GeneralSweep(64, 32, 12, '120', has_dense_velocity_limit_rows=False, places=RowPlaces(GLOBAL, SHARED))": "d6e0e7b1a92e36c1a1674f4d5659e472ba974a54cffa67bbd92b2d811f385888",
   "sweep_routes.GeneralSweep(64, 32, 12, '120', has_dense_velocity_limit_rows=True, places=RowPlaces(GLOBAL, SHARED))": "611aab557a858d28f01dfe491f38eeba8c7cfe150270f2bfef1c8b9e85c64e00",
+  "sweep_routes.GeneralSweep(64, 32, 12, '120', places=RowPlaces(GLOBAL, GLOBAL, GLOBAL))": "180e665eafbc33d4910813e1d579773dad53b7fcea78437e33de136c804e10b8",
   "sweep_routes.GeneralSweep(72, 32, 18, '120', has_dense_velocity_limit_rows=False)": "97d7b3166738ab8d3a8554fc50194615a0a2248a2d4bcd68122677790d039dbf",
   "sweep_routes_diag.DiagonalSweep(1024, 114, 6, '120', contact_units=True, solve_policy=SolvePolicy(readout='sweeps'), speculative_contact_batches=True)": "282fd95d12ab3c45c02d71ee66f070f693e15b1a878bc91cecaaed8d4bb72fbf",
   "sweep_routes_diag.DiagonalSweep(1024, 114, 6, '120', contact_units=True, speculative_contact_batches=True)": "6ce18a55c47943bcc4918ec689359599f674c7b7eeb6e4224d2e8efeb881bc44",

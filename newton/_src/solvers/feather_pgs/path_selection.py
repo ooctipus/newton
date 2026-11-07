@@ -522,6 +522,7 @@ def _mf_gs_storage(solver) -> dict | None:
     return {
         "metadata": storage_class(places.metadata),
         "mf_impulses": storage_class(places.impulses),
+        "dense_impulses": storage_class(places.dense_impulses),
         "reason": storage.reason,
     }
 

@@ -105,10 +105,11 @@ class WorldRows:
       stream, and their records keep the inverse of their diagonal, which their step multiplies by; the dense rows'
       keep ``A_ii``, which a step divides by.
 
-    Impulses are staged (``s_lam_dense``, ``s_lam_mf``) or, with ``stream`` (the free bodies' rows), read and written
-    in place (``g_lam_mf``). A dense row's impulse is owned by the row's first lane, whose value every lane takes by
-    broadcast; a staged free row's every lane stores what it computed, and so does every row's with ``every_lane``
-    (the sparse-diagonal sweep's: each lane reads its own stores). Staged and streamed reads hold identical values.
+    Impulses are staged (``s_lam_dense``, ``s_lam_mf``) or, with ``stream``, read and written in place (``g_lam_dense``,
+    ``g_lam_mf``): a class's line past the stage streams them. A dense row's impulse is owned by the row's first lane,
+    whose value every lane takes by broadcast, staged or in place; a staged free row's every lane stores what it
+    computed, and so does every row's with ``every_lane`` (the sparse-diagonal sweep's: each lane reads its own
+    stores). Staged and streamed reads hold identical values.
     """
 
     capacity: int
@@ -133,8 +134,8 @@ class WorldRows:
             raise ValueError(f"staging must be one of {self.STAGINGS}, got {self.staging!r}")
         if self.free and self.staging != "record":
             raise ValueError("the free bodies' rows stream their records")
-        if self.stream and not self.free:
-            raise ValueError("only the free bodies' rows stream their impulses")
+        if self.stream and self.every_lane:
+            raise ValueError("a class whose every lane reads its own stores stages its impulses")
 
     @property
     def record(self) -> bool:
@@ -164,7 +165,7 @@ class WorldRows:
     @property
     def impulses(self) -> str:
         """The staged impulses (or, with ``stream``, the world's in place)."""
-        return "g_lam_mf" if self.stream else "s_lam_mf" if self.free else "s_lam_dense"
+        return f"{'g' if self.stream else 's'}_lam_{'mf' if self.free else 'dense'}"
 
     def word(self, row: str, word: int) -> str:
         """Word ``word`` of row ``row``'s record: the visited row's from its registers."""
@@ -276,7 +277,7 @@ class WorldRows:
         return (
             f"RING_LOAD({load or self.peek(parent)}, {parent}, {self.capacity},\n"
             f"    [&](int patch_row) {{ return {self.parent('patch_row', enclosed=True)}; }},\n"
-            f"    [&](int patch_row) {{ return s_lam_dense[patch_row]; }})"
+            f"    [&](int patch_row) {{ return {self.peek('patch_row')}; }})"
         )
 
     # -- staging ---------------------------------------------------------------------------------------------------
@@ -285,12 +286,13 @@ class WorldRows:
         return (["s_rhs_dense", "s_diag_dense"], ["s_mu_dense"]) if self.staging == "shared" else ([], [])
 
     def buffers(self) -> tuple[Buffer, ...]:
+        impulses = () if self.stream else (Buffer(self.impulses, "float", self.capacity),)
         if self.free:
-            return () if self.stream else (Buffer("s_lam_mf", "float", self.capacity),)
+            return impulses
         head, tail = self.staged_names()
         packed = [Buffer("s_meta_dense", "int", self.capacity)] if self.staging == "shared" else []
         return (
-            Buffer("s_lam_dense", "float", self.capacity),
+            *impulses,
             *(Buffer(name, "float", self.capacity) for name in head),
             *packed,
             *(Buffer(name, "float", self.capacity) for name in tail),
@@ -299,16 +301,14 @@ class WorldRows:
     def declaration(self) -> str:
         """The streamed impulses' view of the world's line."""
         if self.stream:
-            return "    volatile float* g_lam_mf = (volatile float*)(&world_impulses.data[off_mf]);"
+            return f"    volatile float* {self.impulses} = (volatile float*)(&world_impulses.data[{self.base}]);"
         return ""
 
     def loads(self, row: str = "i") -> str:
         """Stage row ``row``'s impulse and metadata."""
-        if self.stream:
-            return ""
-        lines = [f"{self.impulses}[{row}] = world_impulses.data[{self.base} + {row}];"]
+        lines = [] if self.stream else [f"{self.impulses}[{row}] = world_impulses.data[{self.base} + {row}];"]
         if self.record:
-            return lines[0]
+            return "\n".join(lines)
         head, tail = self.staged_names()
         lines += [f"{name}[{row}] = {self._stored(name, row)};" for name in head]
         lines += [

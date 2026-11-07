@@ -112,17 +112,21 @@ class RowPlaces:
         metadata: The dense rows' right-hand sides, diagonals, friction coefficients, kinds and parents: staged, or
             their records streamed a row ahead (:class:`.sweep.WorldRows`).
         impulses: The free bodies' impulses.
+        dense_impulses: The dense rows' impulses (the line's): staged, or read and written in place where the line is
+            past the stage.
     """
 
     metadata: Place = Place.SHARED
     impulses: Place = Place.SHARED
+    dense_impulses: Place = Place.SHARED
 
     def __post_init__(self):
-        if {self.metadata, self.impulses} - {Place.SHARED, Place.GLOBAL}:
+        if {self.metadata, self.impulses, self.dense_impulses} - {Place.SHARED, Place.GLOBAL}:
             raise ValueError(f"row operands live in shared or global memory: {self}")
 
     def __repr__(self) -> str:
-        return f"RowPlaces({self.metadata.name}, {self.impulses.name})"
+        dense = f", {self.dense_impulses.name}" if self.dense_impulses is not Place.SHARED else ""
+        return f"RowPlaces({self.metadata.name}, {self.impulses.name}{dense})"
 
     @property
     def staging(self) -> str:
@@ -132,8 +136,10 @@ class RowPlaces:
     @property
     def suffix(self) -> str:
         """The places' part of a kernel's name."""
-        return ("" if self.metadata is Place.SHARED else "_gmeta") + (
-            "" if self.impulses is Place.SHARED else "_glambda"
+        return (
+            ("" if self.metadata is Place.SHARED else "_gmeta")
+            + ("" if self.impulses is Place.SHARED else "_glambda")
+            + ("" if self.dense_impulses is Place.SHARED else "_gline")
         )
 
 
@@ -152,6 +158,7 @@ ROW_PLACES = (
     RowPlaces(impulses=Place.GLOBAL),
     RowPlaces(Place.GLOBAL),
     RowPlaces(Place.GLOBAL, Place.GLOBAL),
+    RowPlaces(Place.GLOBAL, Place.GLOBAL, Place.GLOBAL),
 )
 """Every placement of the sweep's row operands (the census's axis)."""
 
@@ -645,7 +652,7 @@ def mf_gs_staging(
     """The shared working set of a world's matrix-free sweep block (:func:`mf_gs_source` declares it): the world's
     velocity, its dense rows' impulses and staged metadata, the free bodies' run's impulses (``free_rows``) unless they
     stream, and the colored mapping's color offsets (and its trace's warp maxima)."""
-    dense = WorldRows(max_constraints, staging=places.staging)
+    dense = WorldRows(max_constraints, staging=places.staging, stream=places.dense_impulses is Place.GLOBAL)
     free = WorldRows(
         mf_max_constraints, staging="record", free=True, stream=places.impulses is Place.GLOBAL or not free_rows
     )
@@ -705,7 +712,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     P = int(M_D + M_MF if sweep.pitch is None else sweep.pitch)
     row_lanes = Lanes(lanes)
     laws = sweep.laws
-    dense = WorldRows(M_D, staging=places.staging, lanes=row_lanes)
+    dense = WorldRows(M_D, staging=places.staging, stream=places.dense_impulses is Place.GLOBAL, lanes=row_lanes)
     free = WorldRows(M_MF, staging="record", free=True, stream=places.impulses is Place.GLOBAL, lanes=row_lanes)
     if dense.record:
         _validate_mf_metadata_encoding(M_D)
@@ -908,6 +915,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     }}"""
     if speed_rows:
         dense_count += "\n    const int speed_start = speed_first.data[world];"
+    dense_view = dense.declaration() + "\n" if dense.stream else ""
     body = f"""{head}
 
     {dense_count}
@@ -928,7 +936,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     const size_t free_base = packed_base + {M_D * int(max_row_dofs)};{offsets}
 
 {staging.declarations("    ")}
-{free_view}{trace_reduction}
+{dense_view}{free_view}{trace_reduction}
 {friction_laws}
 {first_warp}    for (int i = lane; i < m_dense; i += STRIDE) {{
 {dense_loads}

@@ -337,6 +337,10 @@ def _solver_factory_calls():
         }
         factory = built(sweep_routes.GeneralSweep)
         yield "sweep_routes.GeneralSweep", factory, (64, 32, 12, _ARCH), kwargs
+    # A line past the stage: every impulse read and written in place.
+    factory = built(sweep_routes.GeneralSweep)
+    places = {"places": sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL, Place.GLOBAL)}
+    yield "sweep_routes.GeneralSweep", factory, (64, 32, 12, _ARCH), places
     # The colored units' slot staging, under each law (the weights a constant of the plan).
     for weighted in (False, True):
         yield "sweep_units.stage_slots", sweep_units.stage_slots.__wrapped__, (weighted,), {}

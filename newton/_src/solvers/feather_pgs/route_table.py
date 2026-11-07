@@ -43,7 +43,7 @@ class Pins:
     contact_units: str | None = "triplets"
     """``None``: unfused sparse contact triplets."""
     mf_storage: str | None = None
-    """``"streamed"``: streamed matrix-free impulses."""
+    """``"streamed"``: streamed matrix-free impulses, the free bodies'; ``"line"``: every row's, the line's too."""
     predicted_twists: bool = True
     """``False``: the held tree's predictor without the twists' publication."""
     row_support: bool = True

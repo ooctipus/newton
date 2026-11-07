@@ -67,6 +67,12 @@ _GENERATORS = {
         {"places": sweep_routes.RowPlaces(Place.GLOBAL)},
         (_DENSE_PASS, _SPEED_PASS),
     ),
+    "mf_gs_line_impulses": (
+        built(sweep_routes.GeneralSweep),
+        (64, 32, 12, "120"),
+        {"places": sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL, Place.GLOBAL)},
+        (_DENSE_PASS, _SPEED_PASS),
+    ),
     "sparse_limits": (
         built(SparseSweep),
         (48, 18, 12),

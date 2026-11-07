@@ -482,12 +482,13 @@ class Sweep:
         self.every_world.items = self.every_world.count = wp.zeros(1, dtype=int, device=self.model.device)
         self.every_world.region = self.every_world.first = self.every_world.last = 0
         if self.classes.mf_sweeps and self.paired_factor_kernel is None:
-            # A test pin streams the impulses (storage is part of the kernel specialization key); the selection
-            # sizes the resident row metadata with its choice.
-            force_stream_mf_impulses = self.pins.mf_storage == "streamed"
+            # A test pin streams the impulses, the free bodies' or every row's (storage is part of the kernel
+            # specialization key); the selection sizes the resident row metadata with its choice.
+            stream_line = self.pins.mf_storage == "line"
+            force_stream_mf_impulses = stream_line or self.pins.mf_storage == "streamed"
             on_cpu = Place.GLOBAL if force_stream_mf_impulses else Place.SHARED
             storage = _MFGSStorage(
-                sweep_routes.RowPlaces(Place.GLOBAL, on_cpu),
+                sweep_routes.RowPlaces(Place.GLOBAL, on_cpu, Place.GLOBAL if stream_line else Place.SHARED),
                 "Without CUDA no shared-memory storage applies.",
             )
             if model.device.is_cuda:
@@ -501,6 +502,7 @@ class Sweep:
                     ),
                     arch_budget(device_arch),
                     force_stream_mf_impulses=force_stream_mf_impulses,
+                    force_stream_line=stream_line,
                 )
             self.mf_gs_storage = storage
             parallel_rows = self.classes.tier_rows

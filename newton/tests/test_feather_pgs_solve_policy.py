@@ -445,13 +445,14 @@ class TestExitLaw(unittest.TestCase):
             checked[name] += 1
         # The admitted combinations per factory: a factory gate that starts refusing some must not shrink the census.
         # The sparse sweep composes velocity limits with the active scan and units, and a lane group with any of them;
-        # the general sweep composes the line's speed rows with dense velocity-limit rows and the tiers' skip.
+        # the general sweep composes the line's speed rows with dense velocity-limit rows and the tiers' skip, in each
+        # of the five row places (the line's impulses in place among them).
         self.assertEqual(
             checked,
             {
                 "sparse": 128,
                 "sparse_lanes": 16,
-                "mf_gs": 16,
+                "mf_gs": 20,
                 "paired": 4,
                 "sparse_diagonal": 12,
             },
