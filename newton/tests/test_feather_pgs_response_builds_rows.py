@@ -12,10 +12,11 @@ import warp as wp
 
 from newton._src.core.memory import Place
 from newton._src.solvers.feather_pgs.row_metadata import (
-    _validate_mf_metadata_encoding,
-    pack_mf_header,
+    HEADER_WORDS,
+    pack_row_record,
     record_views,
     unpack_mf_header,
+    validate_record_rows,
 )
 from newton.tests.feather_pgs_law_harness import unpacked_rows, walk_inverse
 
@@ -27,15 +28,15 @@ class TestFreeBodyRowsBuild(unittest.TestCase):
 
     def test_meta_word_is_the_consumed_word(self):
         """The packed word's fields are the ones the sweeps' row loop decodes."""
-        word = pack_mf_header("w", "a", "b", "inv", "rhs", "kind", "parent", "")
-        self.assertIn("w.x = (a << 16) | (b & 0xFFFF);", word)
-        self.assertIn("w.y = __float_as_int(inv);", word)
+        word = pack_row_record("w", HEADER_WORDS, dof_a="a", dof_b="b", diagonal="inv", indent="")
+        self.assertIn("record_a.x = (a << 16) | (b & 0xFFFF);", word)
+        self.assertIn("record_a.y = __float_as_int(inv);", word)
         consume = unpack_mf_header("w", "")
         self.assertIn("int dof_a = packed_dofs >> 16;", consume)
         self.assertIn("int dof_b = (packed_dofs << 16) >> 16;", consume)
         self.assertIn("float mf_diag = __int_as_float(w.y);", consume)
         with self.assertRaises(ValueError):
-            _validate_mf_metadata_encoding(70000)
+            validate_record_rows(70000)
 
     def _box_step(self, armature: float = 0.0):
         """A 1 kg, 0.2 m box resting tilted on the ground (its lowest edge 5 mm into it), one step: the solver."""

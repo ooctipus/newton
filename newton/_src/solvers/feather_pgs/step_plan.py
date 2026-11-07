@@ -77,11 +77,9 @@ class Capacities:
         rows, and the free-body rows hold none."""
         from . import sweep_units  # noqa: PLC0415
         from .row_kernels import RIGID_SPEED_ROWS  # noqa: PLC0415
-        from .row_metadata import _validate_mf_metadata_encoding  # noqa: PLC0415
 
         dense = int(options.dense_max_constraints) + int(link_rows)
         free = int(options.mf_max_constraints)
-        _validate_mf_metadata_encoding(free)
         free_bodies = forest.has_free_rigid_bodies
         # The production rule decides the run (the rows' layout); a test that relaxes the rule changes only which of
         # the run's worlds the colored mapping takes.

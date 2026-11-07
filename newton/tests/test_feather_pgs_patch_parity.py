@@ -85,7 +85,7 @@ def _ring_pool_dropped(solver):
                     record_views(records, placement.free_records), (first, max(first, base)), strict=True
                 ):
                     cut_rows = normals[: words.shape[0], start : start + words.shape[1]]
-                    # The kind in the low half, no parent (0xFFFF) in the high half (row_metadata.pack_mf_header).
+                    # The kind in the low half, no parent (0xFFFF) in the high half (row_metadata.record_kind).
                     words[..., 3][cut_rows] = (words[..., 3][cut_rows] & 0xFFFF) | np.int32(-0x10000)
                 placement.row_record.assign(records)
         return result

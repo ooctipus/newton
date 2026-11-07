@@ -33,7 +33,7 @@ from . import host_index, packed_rows
 from .field_group import Field, FieldGroup, SolverArrays, fields_of
 from .row_kernels import RIGID_SPEED_ROWS
 from .row_laws import LINK_ROWS
-from .row_metadata import _validate_mf_metadata_encoding, record_layout
+from .row_metadata import record_layout
 from .row_records import DENSE_ROWS, ROW_RECORDS, RowSupport
 from .row_slots import place_world_contact_runs, record_world_contact_runs
 from .warm_start import ContactCarry, prepare_world_impulses
@@ -333,7 +333,6 @@ class Placement:
         # world's contacts.
         self.dense_max_constraints = spec.capacities.dense_rows
         self.mf_max_constraints = spec.capacities.free_body_rows
-        _validate_mf_metadata_encoding(self.mf_max_constraints)
         # A free body is a one-node tree: its contacts and speed rows keep a run of their own (the free bodies' rows
         # from ``body_base``) only where a world can take the colored mapping; elsewhere they are rows of the line,
         # the speed rows its last (``speed_rows`` a world), and the free bodies' rows hold none (the spec's
@@ -692,8 +691,6 @@ class Placement:
         rows = self.row_pitch - self.record_first
         free_rows = self.mf_max_constraints if self.free_contact_rows else 0
         self.writes_records = bool(rows > 0 and (self.record_first < self.body_base or free_rows > 0))
-        if self.writes_records:
-            _validate_mf_metadata_encoding(max(free_rows, self.body_base if self.record_first < self.body_base else 0))
         self.record_skip_rows, self.record_speed_rows = int(skip_rows), bool(speed_rows)
         self.free_records, words = record_layout(self.record_first, self.body_base, self.row_pitch)
         self.arrays.allocate(ROW_RECORDS, world=self.forest.world_count, record=max(words, 1))

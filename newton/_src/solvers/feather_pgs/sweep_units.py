@@ -47,7 +47,7 @@ from .device_preludes import SHARED_STORAGE, cuda_native, lane_group
 from .field_group import Field, FieldGroup
 from .kernel_template import KernelTemplate
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_TORSION
-from .row_metadata import HEADER_WORDS, _mf_parent_expression
+from .row_metadata import HEADER_WORDS, record_parent
 
 BUILD_WARPS = 8
 """Warps of a world's unit builder block: they share the parallel passes; the first levels the units."""
@@ -131,7 +131,7 @@ class SlotLayout(NamedTuple):
     ``fields`` floats: each row ``r``'s twelve ``Z`` entries at ``r * 12 + side * 6 + k`` (its packed row), then the first
     tangent's friction coefficient (at ``mu``), the normal row's regularization weight (``weight``) and a spin row's
     torsional coefficient (``spin_mu``). ``words`` words: each row ``r``'s bits of its stored inverse diagonal, of its
-    right-hand side, and its type and parent word (its header's words 1 to 3, :func:`.row_metadata.pack_row_header`) at ``r * 3``, then from
+    right-hand side, and its type and parent word (its header's words 1 to 3, :func:`.row_metadata.pack_row_record`) at ``r * 3``, then from
     ``ring`` a friction unit's patch ring: the other normal rows of its ring in ring order (two 16-bit rows a word,
     0xFFFF past the last), then their count (-1 for a ring larger than :data:`RING_MEMBERS`). ``metric`` floats: a
     friction unit's cached metric and Gram couplings (:func:`.sweep_routes._colored_metrics`)."""
@@ -338,7 +338,7 @@ SHARED_DECLARATIONS
     const int end = min(mf_contact_rows_end.data[world], m_mf);
     const int mf_line = mf_first.data[world];
     __builtin_assume(mf_line >= 0);
-    // The free bodies' records (row_metadata.pack_row_header), from the line's word free_records.
+    // The free bodies' records (row_metadata.pack_row_record), from the line's word free_records.
     const int off_meta = mf_line * row_record.shape[1] + free_records;
     // The world's slot (a candidate's: the claim stage's) holds its units and colors; a world with fewer contact rows
     // than the rule's units keeps the one-warp sweep: no units, the general bucket.
@@ -541,7 +541,7 @@ def build_units_kernel(
     """
     staging = build_staging(dofs)
     staging.check("the unit builder", static_bytes)
-    parent = _mf_parent_expression("packed", mf_rows).replace("packed", "PACKED_WORD")
+    parent = record_parent("PACKED_WORD", mf_rows)
     words = (dofs + 31) // 32
     body = _BUILD_SOURCE
     if torsion:

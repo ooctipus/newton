@@ -5,59 +5,33 @@
 
 from .row_laws import ROW_KINDS
 
-_DENSE_META_ROW_TYPE_BITS = 3
-_DENSE_META_ROW_TYPE_MASK = (1 << _DENSE_META_ROW_TYPE_BITS) - 1
-_DENSE_META_MAX_PARENT = ((2**31 - 1) >> _DENSE_META_ROW_TYPE_BITS) - 1
-_MF_META_MAX_CAPACITY = 65535  # Parent values 0..65534; 0xffff encodes no parent.
+_RECORD_MAX_ROWS = 65535  # Parent values 0..65534; 0xffff encodes no parent.
 
 
-def _validate_dense_metadata_encoding(max_constraints: int) -> None:
-    """Validate packed dense-row metadata against its signed 32-bit layout."""
-    if ROW_KINDS > _DENSE_META_ROW_TYPE_MASK + 1:
-        raise RuntimeError("Dense row metadata does not have enough row-type bits")
-    if max_constraints - 1 > _DENSE_META_MAX_PARENT:
-        raise ValueError(
-            f"dense_max_constraints={max_constraints} exceeds packed parent capacity {_DENSE_META_MAX_PARENT + 1}"
-        )
-
-
-def _validate_mf_metadata_encoding(max_constraints: int) -> None:
-    """Reject capacities that alias the packed MF parent sentinel."""
-    if not 0 <= max_constraints <= _MF_META_MAX_CAPACITY:
-        raise ValueError(f"mf_max_constraints must be in [0, {_MF_META_MAX_CAPACITY}] for packed MF metadata")
+def validate_record_rows(rows: int) -> None:
+    """Reject a line of ``rows`` rows whose parents a record's 16-bit half cannot hold (0xFFFF is none)."""
+    if not 0 <= rows <= _RECORD_MAX_ROWS:
+        raise ValueError(f"mf_max_constraints or dense_max_constraints past a record's {_RECORD_MAX_ROWS} rows: {rows}")
     if ROW_KINDS > 65536:
-        raise RuntimeError("MF metadata does not have enough row-type bits")
+        raise RuntimeError("a row's record does not have enough row-type bits")
 
 
-def _mf_parent_expression(packed: str, max_constraints: int) -> str:
-    """Decode unsigned 16-bit parents plus -1, preserving smaller-capacity kernels."""
-    _validate_mf_metadata_encoding(max_constraints)
-    if max_constraints <= 32768:
-        return f"{packed} >> 16"
+def record_parent(word: str, rows: int) -> str:
+    """A row's parent (-1 for none) from its record's kind and parent word ``word``, in a line of ``rows`` rows."""
+    if rows <= 32768:
+        return f"{word} >> 16"
     # Adding one modulo 2^16 maps the 0xffff sentinel to zero before signed
     # subtraction; valid high parent indices never undergo sign extension.
-    return f"static_cast<int>(((static_cast<unsigned int>({packed}) >> 16) + 1u) & 0xffffu) - 1"
+    return f"static_cast<int>(((static_cast<unsigned int>({word}) >> 16) + 1u) & 0xffffu) - 1"
 
 
-def pack_mf_header(word: str, dof_a: str, dof_b: str, inverse: str, rhs: str, kind: str, parent: str, indent: str):
-    """Declare ``int4 word``, a free-body row's packed header word as :func:`unpack_mf_header` decodes it.
-
-    ``x``: the bodies' first world coordinates, ``dof_a`` in the high and ``dof_b`` in the low 16 bits (-1 for
-    none); ``y`` and ``z``: the bits of the stored inverse diagonal and of the right-hand side; ``w``: the row
-    type in the low and the parent (0xFFFF for none) in the high 16 bits.
-    """
-    return (
-        f"{indent}int4 {word};\n"
-        f"{indent}{word}.x = ({dof_a} << 16) | ({dof_b} & 0xFFFF);\n"
-        f"{indent}{word}.y = __float_as_int({inverse});\n"
-        f"{indent}{word}.z = __float_as_int({rhs});\n"
-        f"{indent}{word}.w = static_cast<int>(static_cast<unsigned int>({kind}) | "
-        f"(static_cast<unsigned int>({parent}) << 16));"
-    )
+def record_kind(kind: str, parent: str) -> str:
+    """A record's kind and parent word: the row type in the low and the parent (0xFFFF for none) in the high half."""
+    return f"static_cast<int>(static_cast<unsigned int>({kind}) | (static_cast<unsigned int>({parent}) << 16))"
 
 
 def unpack_mf_header(word: str, indent: str) -> str:
-    """Declare a free-body row's fields from its packed header word ``word`` (:func:`pack_mf_header`): ``dof_a``,
+    """Declare a free-body row's fields from its record's header ``word`` (:func:`pack_row_record`): ``dof_a``,
     ``dof_b``, ``mf_diag`` (the stored inverse diagonal), ``packed_tp`` and ``mf_rt`` (the row type)."""
     return (
         f"{indent}int packed_dofs = {word}.x;\n"
@@ -73,7 +47,7 @@ RECORD_WORDS = 8
 """Words of a dense row's record (:func:`pack_row_record`): two ``int4``, which a row loop loads a row ahead."""
 
 HEADER_WORDS = 4
-"""Words of a free row's record: its header alone (:func:`pack_mf_header`), one ``int4``: its sides' widths are its
+"""Words of a free row's record: its header alone (:func:`pack_row_record`), one ``int4``: its sides' widths are its
 class's, its friction coefficient the line's (``row_mu``)."""
 
 
@@ -89,6 +63,7 @@ def record_layout(first: int, base: int, pitch: int) -> tuple[int, int]:
     first, base, pitch = int(first), int(base), int(pitch)
     dense = max(min(base, pitch) - first, 0)
     free = max(pitch - max(first, base), 0)
+    validate_record_rows(max(base if dense else 0, free))
     return dense * RECORD_WORDS, dense * RECORD_WORDS + free * HEADER_WORDS
 
 
@@ -109,38 +84,43 @@ def validate_record_coordinates(max_world_dofs: int) -> None:
 
 def pack_row_record(
     record: str,
-    dof_a: str,
-    dof_b: str,
-    n_a: str,
-    n_b: str,
-    diagonal: str,
-    rhs: str,
-    kind: str,
-    parent: str,
-    mu: str,
-    indent: str,
+    words: int,
+    *,
+    dof_a: str = "dof_a",
+    dof_b: str = "dof_b",
+    diagonal: str = "diagonal",
+    rhs: str = "rhs",
+    kind: str = "kind",
+    parent: str = "parent",
+    n_a: str = "n_a",
+    n_b: str = "n_b",
+    mu: str = "mu",
+    indent: str = "    ",
 ) -> str:
-    """Store a dense row's record at the ``int`` pointer ``record``, two ``int4`` (:data:`RECORD_WORDS`): the header
-    (:func:`pack_mf_header`: its sides' first world coordinates ``dof_a``, ``dof_b``, -1 for none, its stored
-    ``diagonal``, its ``rhs`` at ``du = 0``, ``kind`` and ``parent``, 0xFFFF for none), then its sides' widths ``n_a``
-    and ``n_b`` (two 16-bit halves), its friction coefficient ``mu`` and two zero words."""
-    return (
-        pack_mf_header("record_a", dof_a, dof_b, diagonal, rhs, kind, parent, indent) + f"\n{indent}int4 record_b;\n"
+    """Store a row's record of ``words`` words (:func:`record_words`) at the ``int`` pointer ``record``: its header, its
+    sides' first world coordinates ``dof_a`` and ``dof_b`` (16-bit halves, -1 for none), the bits of its stored
+    ``diagonal`` (a free row's inverse) and of its ``rhs`` at ``du = 0``, and its kind and parent word
+    (:func:`record_kind`); a dense row's then its sides' widths ``n_a`` and ``n_b`` (two 16-bit halves), its friction
+    coefficient ``mu`` and two zero words. Each field is a native expression, by default the local of its name."""
+    if words not in (HEADER_WORDS, RECORD_WORDS):
+        raise ValueError(f"a record holds {HEADER_WORDS} or {RECORD_WORDS} words, not {words}")
+    text = (
+        f"{indent}int4 record_a;\n"
+        f"{indent}record_a.x = ({dof_a} << 16) | ({dof_b} & 0xFFFF);\n"
+        f"{indent}record_a.y = __float_as_int({diagonal});\n"
+        f"{indent}record_a.z = __float_as_int({rhs});\n"
+        f"{indent}record_a.w = {record_kind(kind, parent)};"
+    )
+    if words == HEADER_WORDS:
+        return text + f"\n{indent}*reinterpret_cast<int4*>({record}) = record_a;"
+    return text + (
+        f"\n{indent}int4 record_b;\n"
         f"{indent}record_b.x = {n_a} | ({n_b} << 16);\n"
         f"{indent}record_b.y = __float_as_int({mu});\n"
         f"{indent}record_b.z = 0;\n"
         f"{indent}record_b.w = 0;\n"
         f"{indent}*reinterpret_cast<int4*>({record}) = record_a;\n"
         f"{indent}*reinterpret_cast<int4*>({record} + 4) = record_b;"
-    )
-
-
-def pack_row_header(record: str, dof_a: str, dof_b: str, diagonal: str, rhs: str, kind: str, parent: str, indent: str):
-    """Store a free row's record at the ``int`` pointer ``record``: its header alone (:data:`HEADER_WORDS`,
-    :func:`pack_mf_header`)."""
-    return (
-        pack_mf_header("record_a", dof_a, dof_b, diagonal, rhs, kind, parent, indent)
-        + f"\n{indent}*reinterpret_cast<int4*>({record}) = record_a;"
     )
 
 

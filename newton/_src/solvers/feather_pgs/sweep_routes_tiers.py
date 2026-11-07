@@ -33,7 +33,6 @@ from .keyed_rows import get_direct_parallel_inputs
 from .response_operator import Lanes, TransposedResponse, WalkedRows
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT
-from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import block_argmax
 from .sweep import JacobiRows, SweepConfig, dense_tier_world, jacobi_limit_pass, jacobi_scale, jacobi_sweeps
 from .sweep_routes import MF_GS_ABI, worlds
@@ -258,7 +257,6 @@ class TierSweep(SweepConfig):
     def __post_init__(self):
         if self.material and not self.weighted:
             raise ValueError("material contacts step by their weights: their tiers are weighted")
-        _validate_dense_metadata_encoding(self.max_constraints)
         M_D, D, AM = self.max_constraints, self.max_world_dofs, int(self.rows)
         if AM <= 0 or AM > M_D or AM > TIER_MAX_ROWS:
             raise ValueError(f"rows must be in [1, min(max_constraints, {TIER_MAX_ROWS})]")

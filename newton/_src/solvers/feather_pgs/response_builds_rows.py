@@ -11,7 +11,7 @@ from __future__ import annotations
 import warp as wp
 
 from .device_preludes import CPU_MATH, dual_native
-from .row_metadata import HEADER_WORDS, RECORD_WORDS, pack_row_header, pack_row_record
+from .row_metadata import HEADER_WORDS, RECORD_WORDS, pack_row_record
 from .row_records import DenseRows
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -48,9 +48,7 @@ class RowRecords:
 
 @wp.func_native(
     dual_native(
-        pack_row_record(
-            "&record.data[at]", "dof_a", "dof_b", "n_a", "n_b", "diagonal", "rhs", "kind", "parent", "mu", "    "
-        ),
+        pack_row_record("&record.data[at]", RECORD_WORDS),
         preludes=(CPU_MATH,),
     )
 )
@@ -71,7 +69,7 @@ def store_row_record(
 
 @wp.func_native(
     dual_native(
-        pack_row_header("&record.data[at]", "dof_a", "dof_b", "inverse", "rhs", "kind", "parent", "    "),
+        pack_row_record("&record.data[at]", HEADER_WORDS, diagonal="inverse"),
         preludes=(CPU_MATH,),
     )
 )
@@ -88,7 +86,7 @@ def store_row_header(
 
 
 @wp.func_native(
-    """    // The kind and parent word's high half (pack_mf_header: the parent above the kind), stored alone: no read of
+    """    // The kind and parent word's high half (record_kind: the parent above the kind), stored alone: no read of
     // the kind, which the row's writer stored (little-endian on both devices).
     reinterpret_cast<unsigned short*>(&record.data[at + 3])[1] = static_cast<unsigned short>(parent);
 """
@@ -146,7 +144,7 @@ def store_row_record_of(
 ):
     """Store row ``slot``'s record (:func:`.row_metadata.pack_row_record`), its ``sides`` at ``firsts``
     (:func:`record_firsts`), the rest from the row as its writer left it (its rhs plus ``incident``). A free row's is its
-    header (:func:`.row_metadata.pack_row_header`), with its diagonal's inverse and its parent from ``base``."""
+    header, with its diagonal's inverse and its parent from ``base``."""
     at = record_at(records, line, slot)
     if at < 0:
         return

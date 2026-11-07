@@ -67,7 +67,7 @@ _SCALED_VOTES = {
     "sparse_lanes": ("fabsf(delta_impulse) * (denom)", "fabsf(sib_delta) * (s_diag[sib])"),
     "mf_gs": (
         "fabsf(delta_impulse) * (denom)",
-        "fabsf(sib_delta) * (s_diag_dense[sib])",
+        "fabsf(sib_delta) * (__int_as_float(s_rec_dense[64 + (sib)]))",
         "fabsf(delta_impulse) * (mf_diag > 0.0f ? 1.0f / mf_diag : 0.0f)",
         "fabsf(delta_impulse_vlim) * (denom)",
         "fabsf(speed_row[1]) * (1.0f / mf_diag)",
@@ -80,7 +80,7 @@ _SCALED_VOTES = {
     ),
     "sparse_diagonal": (
         "fabsf(delta_impulse) * (denom)",
-        "fabsf(sib_delta) * (s_diag_dense[sib])",
+        "fabsf(sib_delta) * (__int_as_float(s_rec_dense[64 + (sib)]))",
         "fabsf(delta_impulse) * (limit_denom)",
     ),
 }
@@ -413,7 +413,7 @@ class TestExitLaw(unittest.TestCase):
             body = max(_native_snippets(plain), key=len)
             law_sites = len(_LAW_SITE.findall(body))
             places = kwargs.get("places")
-            if places is not None and places.staging == "record" and "s_meta_dense" in body:
+            if places is not None and places.staging == "record" and "s_rec_dense" in body:
                 self.fail(f"{plain.key} {kwargs}: streamed rows stage their metadata")
             for policy in (DEFAULT_POLICY, SWEEPS, TRACE):
                 kernel = factory(*args, solve_policy=policy, **kwargs)
@@ -423,8 +423,8 @@ class TestExitLaw(unittest.TestCase):
                     labels, _with_readout(name, [argument.label for argument in plain.adj.args], policy.counts)
                 )
                 snippet = max(_native_snippets(kernel), key=len)
-                if len(_LAW_SITE.findall(snippet)) != law_sites or ("s_meta_dense" in snippet) != (
-                    "s_meta_dense" in body
+                if len(_LAW_SITE.findall(snippet)) != law_sites or ("s_rec_dense" in snippet) != (
+                    "s_rec_dense" in body
                 ):
                     self.fail(f"{kernel.key} {kwargs}: the policy rewrote the law or the row metadata")
                 snippets = {snippet for snippet in _native_snippets(kernel) if QUIET_LITERAL in snippet}
@@ -477,12 +477,12 @@ class TestExitLaw(unittest.TestCase):
         traced = sweep_kernel.__wrapped__(sweep_routes.GeneralSweep(64, 32, 12, "120", solve_policy=TRACE, **options))
         snippet = _policy_snippet(self, traced, "solve_trace_sweep(")
         self.assertIn(
-            f"if (spin_delta != 0.0f) solve_trace_change(fabsf(spin_delta) * (s_diag_dense[spin]), {torsion});",
+            f"if (spin_delta != 0.0f) solve_trace_change(fabsf(spin_delta) * (__int_as_float(s_rec_dense[64 + (spin)])), {torsion});",
             snippet,
         )
         plain = sweep_kernel.__wrapped__(sweep_routes.GeneralSweep(64, 32, 12, "120", **options))
-        snippet = _policy_snippet(self, plain, "fabsf(spin_delta) * (s_diag_dense[spin]) <=")
-        self.assertIn("(!(fabsf(spin_delta) * (s_diag_dense[spin]) <= spin_bound))", snippet)
+        snippet = _policy_snippet(self, plain, "fabsf(spin_delta) * (__int_as_float(s_rec_dense[64 + (spin)])) <=")
+        self.assertIn("(!(fabsf(spin_delta) * (__int_as_float(s_rec_dense[64 + (spin)])) <= spin_bound))", snippet)
         self.assertIn("ProjectionLaw::friction_ball(", snippet)
         self.assertIn("ConeLaw::ball(", snippet)
         kernel = sweep_kernel.__wrapped__(sweep_routes.GeneralSweep(64, 32, 12, "120", solve_policy=SWEEPS, **options))

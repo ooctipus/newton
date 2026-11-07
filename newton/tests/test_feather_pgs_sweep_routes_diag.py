@@ -113,7 +113,7 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
                 "z_tangent2[q] * unit_dt2);",
                 text,
             )
-            self.assertLess(text.index(loaded), text.rindex("int row_type = s_meta_dense[i]"))
+            self.assertLess(text.index(loaded), text.rindex("int row_type = (s_rec_dense["))
         for text in (units,):
             start = text.index("const int scalar_levels")
             levels = text[start : text.index("SYNC();", start)]

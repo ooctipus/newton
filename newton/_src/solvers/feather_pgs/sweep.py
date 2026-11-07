@@ -52,13 +52,13 @@ from .response_operator import Lanes, LaneVelocity, ResponseOperator, Velocity
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_SPEED, ROW_TORSION
 from .row_metadata import (
-    _DENSE_META_ROW_TYPE_BITS,
-    _DENSE_META_ROW_TYPE_MASK,
-    _mf_parent_expression,
     load_row_record,
+    record_kind,
+    record_parent,
     record_word,
     record_words,
     unpack_mf_header,
+    validate_record_rows,
 )
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound, sweep_exit, terms_bound, vote
 
@@ -78,16 +78,17 @@ class WorldRows:
     """A world's rows of one class in the row store's line: the dense class's from ``off_dense``, the free bodies'
     (``free``) from ``off_mf``, ``capacity`` slots each, read by the class's staging policy.
 
-    ``staging`` says where a row's metadata come from:
+    ``staging`` says where a row's record (:func:`.row_metadata.pack_row_record`) is read:
 
-    - ``"shared"``: the right-hand side (the law's bias plus the row's incident velocity ``row_incident``: the row's
-      residual at ``du = 0``), diagonal and friction coefficient are staged in shared memory, and the kind and parent
-      as one packed word per row (``s_meta_dense``: the kind in the low bits, the parent plus one above);
+    - ``"shared"``: the record's words a staged row reads are staged in shared memory, word-major (``s_rec_dense``,
+      :data:`STAGED_WORDS`): its right-hand side (the law's bias plus the row's incident velocity ``row_incident``: its
+      residual at ``du = 0``), its diagonal, its kind and parent word and its friction coefficient; its sides are the
+      row store's (``row_sides``);
     - ``"record"``: the rows' records stream (``row_record``, :func:`.row_metadata.pack_row_record`), the class's from
       ``off_rec_dense`` or ``off_rec_mf``. A row loop loads the visited row's record a row ahead into registers
       (``rec_a``, ``rec_b``: :func:`rows_block`, or :meth:`visit`), which every read of row ``i`` takes; any other
       row's read takes its record's word. The free rows always stream their headers (``rec_a``,
-      :func:`.row_metadata.pack_row_header`), with their diagonal's inverse; the dense rows' records keep ``A_ii``.
+      :func:`.row_metadata.pack_row_record`), with their diagonal's inverse; the dense rows' records keep ``A_ii``.
 
     Impulses are staged (``s_lam_dense``, ``s_lam_mf``) or, with ``stream``, in place (``g_lam_dense``, ``g_lam_mf``).
     A dense row's impulse is owned by its first lane, which every lane reads by broadcast; a staged free row's every
@@ -98,20 +99,18 @@ class WorldRows:
     staging: str = "shared"
     free: bool = False
     stream: bool = False
-    rhs: str = "rhs_bias"
     lanes: Lanes = dataclasses.field(default_factory=Lanes)
     every_lane: bool = False
 
     STAGINGS: ClassVar[tuple[str, ...]] = ("shared", "record")
-    STAGED: ClassVar[dict[str, str]] = {
-        "s_rhs_dense": "rhs",
-        "s_diag_dense": "world_diag",
-        "s_mu_dense": "world_row_mu",
-    }
+    STAGED_WORDS: ClassVar[tuple[int, ...]] = (2, 1, 3, 5)
+    """The record words a staged row reads, in their stage's order: right-hand side, diagonal, kind and parent,
+    friction coefficient."""
     VISITED: ClassVar[str] = "i"
     """The row a row loop visits, whose record the loop holds in registers."""
 
     def __post_init__(self):
+        validate_record_rows(self.capacity)
         if self.staging not in self.STAGINGS:
             raise ValueError(f"staging must be one of {self.STAGINGS}, got {self.staging!r}")
         if self.free and self.staging != "record":
@@ -160,7 +159,9 @@ class WorldRows:
         return ("rec_a",) if self.free else ("rec_a", "rec_b")
 
     def word(self, row: str, word: int) -> str:
-        """Word ``word`` of row ``row``'s record: the visited row's from its registers."""
+        """Word ``word`` of row ``row``'s record: a staged row's from the stage, the visited row's from its registers."""
+        if not self.record:
+            return f"s_rec_dense[{self.STAGED_WORDS.index(word) * self.capacity} + ({row})]"
         if row == self.VISITED:
             if word >= self.words:
                 raise ValueError(f"a record of {self.words} words has no word {word}")
@@ -177,28 +178,11 @@ class WorldRows:
             return ""
         return f"int4 {', '.join(self.registers)};\n" + self.load_record(self.registers, row, "")
 
-    def _source(self, name: str) -> str:
-        source = self.STAGED[name]
-        return self.rhs if source == "rhs" else source
-
-    def _stored(self, name: str, row: str) -> str:
-        """Row ``row``'s value of the staged array ``name`` where it is stored."""
-        value = f"{self._source(name)}.data[off_dense + ({row})]"
-        return f"({value} + row_incident.data[off_dense + ({row})])" if name == "s_rhs_dense" else value
-
-    def staged(self, name: str, row: str) -> str:
-        """Row ``row``'s value of the staged array ``name``."""
-        return f"{name}[{row}]"
-
     def rhs_of(self, row: str) -> str:
-        if self.record:
-            return f"__int_as_float({self.word(row, 2)})"
-        return self.staged("s_rhs_dense", row)
+        return f"__int_as_float({self.word(row, 2)})"
 
     def diag(self, row: str) -> str:
-        if self.record:
-            return f"__int_as_float({self.word(row, 1)})"
-        return self.staged("s_diag_dense", row)
+        return f"__int_as_float({self.word(row, 1)})"
 
     def inverse(self, row: str) -> str:
         """A free row's stored inverse diagonal."""
@@ -214,9 +198,7 @@ class WorldRows:
     def mu(self, row: str) -> str:
         if self.free:
             return f"world_row_mu.data[off_mf + {row}]"
-        if self.record:
-            return f"__int_as_float({self.word(row, 5)})"
-        return self.staged("s_mu_dense", row)
+        return f"__int_as_float({self.word(row, 5)})"
 
     def weight(self, row: str) -> str:
         return f"world_row_w.data[{self.base} + {row}]"
@@ -225,21 +207,15 @@ class WorldRows:
         return f"world_row_eps.data[{self.base} + {row}]"
 
     def kind(self, row: str, *, scan: bool = False) -> str:
-        if self.record:
-            return f"({self.word(row, 3)} & 0xFFFF)"
-        return f"s_meta_dense[{row}] & {_DENSE_META_ROW_TYPE_MASK}"
+        return f"({self.word(row, 3)} & 0xFFFF)"
 
     def parent(self, row: str, *, enclosed: bool = False) -> str:
-        decoded = (
-            self.parent_of(self.word(row, 3))
-            if self.record
-            else f"(s_meta_dense[{row}] >> {_DENSE_META_ROW_TYPE_BITS}) - 1"
-        )
+        decoded = self.parent_of(self.word(row, 3))
         return f"({decoded})" if enclosed else decoded
 
     def parent_of(self, packed: str) -> str:
         """A row's parent from its record's packed ``kind | parent << 16`` word."""
-        return _mf_parent_expression(packed, self.capacity)
+        return record_parent(packed, self.capacity)
 
     def scan(self) -> tuple[Callable[[str], str], Callable[[str], str]]:
         """A row's kind and parent as a scan over the rows reads them (:func:`friction_metric_stage`)."""
@@ -282,21 +258,10 @@ class WorldRows:
 
     # -- staging ---------------------------------------------------------------------------------------------------
 
-    def staged_names(self) -> tuple[list[str], list[str]]:
-        return (["s_rhs_dense", "s_diag_dense"], ["s_mu_dense"]) if self.staging == "shared" else ([], [])
-
     def buffers(self) -> tuple[Buffer, ...]:
         impulses = () if self.stream else (Buffer(self.impulses, "float", self.capacity),)
-        if self.free:
-            return impulses
-        head, tail = self.staged_names()
-        packed = [Buffer("s_meta_dense", "int", self.capacity)] if self.staging == "shared" else []
-        return (
-            *impulses,
-            *(Buffer(name, "float", self.capacity) for name in head),
-            *packed,
-            *(Buffer(name, "float", self.capacity) for name in tail),
-        )
+        staged = len(self.STAGED_WORDS) * self.capacity
+        return impulses if self.record else (*impulses, Buffer("s_rec_dense", "int", staged))
 
     def declaration(self) -> str:
         """The streamed impulses' view of the world's line."""
@@ -307,17 +272,16 @@ class WorldRows:
     def loads(self, row: str = "i") -> str:
         """Stage row ``row``'s impulse and metadata."""
         lines = [] if self.stream else [f"{self.impulses}[{row}] = world_impulses.data[{self.base} + {row}];"]
-        if self.record:
-            return "\n".join(lines)
-        head, tail = self.staged_names()
-        lines += [f"{name}[{row}] = {self._stored(name, row)};" for name in head]
-        lines += [
-            f"int row_type = world_row_type.data[off_dense + {row}];",
-            f"int row_parent = world_row_parent.data[off_dense + {row}];",
-            f"s_meta_dense[{row}] = (row_type & {_DENSE_META_ROW_TYPE_MASK}) | "
-            f"((row_parent + 1) << {_DENSE_META_ROW_TYPE_BITS});",
-        ]
-        lines += [f"{name}[{row}] = {self._stored(name, row)};" for name in tail]
+        if not self.record:
+            at = f"off_dense + ({row})"
+            kind = record_kind(f"world_row_type.data[{at}]", f"world_row_parent.data[{at}]")
+            words = {
+                1: f"__float_as_int(world_diag.data[{at}])",
+                2: f"__float_as_int(rhs_bias.data[{at}] + row_incident.data[{at}])",
+                3: kind,
+                5: f"__float_as_int(world_row_mu.data[{at}])",
+            }
+            lines += [f"{self.word(row, word)} = {words[word]};" for word in self.STAGED_WORDS]
         return "\n".join(lines)
 
     def stores(self, row: str = "i") -> str:
@@ -2296,7 +2260,7 @@ class JacobiRows:
             "    const float l0 = world_impulses.data[off_dense + i];",
             "    s_x[i] = l0; s_y[i] = l0;",
             f"    s_rhs[i] = {rhs};",
-            f"    const int row_type = {row_type} & {_DENSE_META_ROW_TYPE_MASK};",
+            f"    const int row_type = {row_type};",
             f"    s_parent[i] = {parent};",
             f"    s_mu[i] = {mu};",
             f"    s_vlim[i] = row_type == {ROW_JOINT_VELOCITY_LIMIT} ? 1 : 0;" if self.limits else "",

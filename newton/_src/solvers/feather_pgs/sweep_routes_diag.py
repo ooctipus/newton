@@ -28,7 +28,6 @@ from .kernel_template import Dispatch
 from .response_operator import Lanes, ResponseOperator, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT
-from .row_metadata import _validate_dense_metadata_encoding
 from .sweep import (
     ITERATION,
     Diagonal,
@@ -677,7 +676,6 @@ class DiagonalSweep(SweepConfig):
     def __post_init__(self):
         if self.speculative_contact_batches and (not self.contact_units or int(self.dense_dofs) + 2 > 16):
             raise ValueError("speculative contact batches require contact units with at most 16 response entries")
-        _validate_dense_metadata_encoding(int(self.max_constraints))
 
     @property
     def lanes(self) -> int:

@@ -23,12 +23,7 @@ from .packed_rows import PACKED_SIDES, RECORD_SIDES
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_VELOCITY_LIMIT, ROW_SPEED
-from .row_metadata import (
-    _validate_dense_metadata_encoding,
-    _validate_mf_metadata_encoding,
-    record_layout,
-    validate_record_coordinates,
-)
+from .row_metadata import record_layout, validate_record_coordinates
 from .solve_policy import QUIET_LITERAL, block_argmax, sweep_exit
 from .sweep import (
     ITERATION,
@@ -692,8 +687,6 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     laws = sweep.laws
     dense = WorldRows(M_D, staging=places.staging, stream=places.dense_impulses is Place.GLOBAL, lanes=row_lanes)
     free = WorldRows(M_MF, staging="record", free=True, stream=places.impulses is Place.GLOBAL, lanes=row_lanes)
-    if dense.record:
-        _validate_mf_metadata_encoding(M_D)
     dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows, rows=dense)
     free_op = free_body_rows(row_lanes, max_row_dofs)
     staging = mf_gs_staging(
@@ -978,7 +971,6 @@ class GeneralSweep(SweepConfig):
             raise ValueError(f"mapping must be one of {MAPPINGS}, got {self.mapping!r}")
         if self.mapping == "colored" and not self.free_rows:
             raise ValueError("the colored mapping sweeps the free bodies' run: it needs free_rows")
-        _validate_dense_metadata_encoding(self.max_constraints)
         validate_record_coordinates(self.max_world_dofs)
         if self.material and not self.weighted:
             raise ValueError("material contacts step by their weights: their sweeps are weighted")
