@@ -14,6 +14,7 @@ plan (:class:`ClassPlan`) and decide nothing of it.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -106,6 +107,8 @@ class Packed:
     contact_triplets_reason: str
     triplet_capacity: int
     index_shape: tuple[int, int, int]
+    held: held_tree.HeldPlan | None = None
+    """The held tree's plan with these factors, which admitted the case (:func:`.held_tree.plan`)."""
 
 
 @dataclass(frozen=True, eq=False)
@@ -384,11 +387,6 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     # serial chain; this owner does not require zeros in the mass factor.
     if plan.dof_count != size or (not velocity_candidate and plan.nonzero_count >= size * (size + 1) // 2):
         return None, "Topology has no usable sparse factor layout for this row policy."
-    # Native sparse factors are the held tree's representation: a candidate only where it takes their group.
-    held = held_tree.sparse_decline(inputs, size, plan)
-    if held is not None:
-        return None, f"Only the held tree evaluates native sparse factors. {held}"
-
     mimic_dofs = None
     if laws.mimic_count:
         mimic_indices = laws._mimic_art_list.numpy()
@@ -490,6 +488,11 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
         triplet_capacity=triplet_capacity,
         index_shape=(1, 1, 1) if use_support_table else index_shape,
     )
+    # Native sparse factors are the held tree's representation: a candidate only where it takes their group.
+    try:
+        choice = dataclasses.replace(choice, held=held_tree.plan(inputs, packed=choice))
+    except ValueError as error:
+        return None, f"Only the held tree evaluates native sparse factors. {error}"
     return choice, (
         f"Automatic sparse selection: {size}-DOF topology and row policy admitted; "
         f"solve uses {solve.bytes}/{budget} bytes of shared memory."
@@ -603,8 +606,8 @@ holds keeps the general placement."""
 
 def plan_class(inputs: ClassInputs, *, general: str | None) -> ClassPlan:
     """The class's plan: the choice whose rule of :data:`RULES` holds the class, and every rule's reason (``general``,
-    :func:`general_reason`, when given). The held tree's plan follows from the choice: the sparse diagonal's admitted
-    it (:attr:`Diagonal.held`), else it is built here (:func:`.held_tree.plan`, which raises ValueError for a model it
+    :func:`general_reason`, when given). The held tree's plan follows from the choice: the sparse diagonal's or native
+    sparse factors' admitted it (``held``), else it is built here (:func:`.held_tree.plan`, which raises ValueError for a model it
     does not hold)."""
     forest = inputs.forest
     reasons, choices = {}, {}
@@ -615,12 +618,10 @@ def plan_class(inputs: ClassInputs, *, general: str | None) -> ClassPlan:
     if len(choices) > 1:
         raise RuntimeError(f"FeatherPGS: the placement rules {sorted(choices)} both hold one class.")
     mf_sweeps = not ({"packed", "diagonal"} & choices.keys()) and forest.world_count > 0 and forest.max_world_dofs > 0
-    diagonal = choices.get("diagonal")
-    if diagonal is not None:
-        held = diagonal.held
-    else:
+    held = next((choice.held for choice in choices.values() if isinstance(choice, Diagonal | Packed)), None)
+    if held is None:
         try:
-            held = held_tree.plan(inputs, packed=choices.get("packed"))
+            held = held_tree.plan(inputs)
         except ValueError as error:
             raise ValueError(f"FeatherPGS cannot hold this model: {error}") from error
     return ClassPlan(reasons=MappingProxyType(reasons), mf_sweeps=mf_sweeps, held=held, **choices)

@@ -188,23 +188,6 @@ def _size_trees(model, forest, size, trees, *, diagonal):
     return _fit(model, forest, trees, mass)
 
 
-def sparse_decline(inputs, size, plan) -> str | None:
-    """Why the held tree would not take a native sparse factor of ``size`` coordinates and pattern ``plan``, or
-    ``None``: :func:`decline` of the candidate, then its one complete group's fit.
-
-    Only the held tree evaluates native sparse factors, so their rule (:func:`.class_plan.packed_rule`) reads this,
-    with the class's ``inputs`` (:class:`.class_plan.ClassInputs`), before choosing one.
-    """
-    reason = decline(inputs.forest, inputs.factor, sparse=True)
-    if reason is not None:
-        return reason
-    try:
-        _fit(inputs.model, inputs.forest, inputs.forest.group_to_art_host[size], plan, complete=True)
-    except ValueError as error:
-        return f"The topology does not fit the held groups: {error}"
-    return None
-
-
 _FREE_BODY = TreePlan.build([-1], [6]).factor
 """The mass pattern of a prescribed free body: one body of six coordinates."""
 
@@ -473,8 +456,8 @@ def plan(inputs, *, packed=None, compact=None) -> HeldPlan:
     where its trees are rigid below their leaves, :func:`.coordinate_trees.plan`), their groups composed, the dense
     groups' coverage, the walk's trees and the drive stage's coordinates.
 
-    The plan's failure is the held tree's decline of the choices: the sparse diagonal's rule
-    (:func:`.class_plan.diagonal_rule`) builds the plan with its compact diagonal and keeps it, or declines with why.
+    The plan's failure is the held tree's decline of the choices: the sparse diagonal's and native sparse factors' rules
+    (:mod:`.class_plan`) build the plan with their candidate and keep it, or decline with why.
 
     Raises:
         ValueError: For a model the held tree does not hold, naming why (:func:`decline`, or the group that does not
@@ -494,6 +477,9 @@ def plan(inputs, *, packed=None, compact=None) -> HeldPlan:
     if not (model.joint_count and model.articulation_count):
         return HeldPlan((), (), compact, None, walking, drive_dofs, coordinate, coordinate_reason)
     try:
+        if packed is not None:
+            # The sparse factor's one complete group: every tree of its size on its pattern.
+            _fit(model, forest, forest.group_to_art_host[packed.size], packed.plan, complete=True)
         coverage = None if packed is not None else _coverage(model, forest, compact)
         classes = tuple(
             held_class(inputs, world_class.worlds, packed=packed, compact=compact, coordinate=coordinate)
