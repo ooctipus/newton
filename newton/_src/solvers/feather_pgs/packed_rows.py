@@ -35,7 +35,7 @@ import warp as wp
 from .device_preludes import DevicePrelude
 from .field_group import Field, FieldGroup
 
-__all__ = ["PACKED_ROWS", "PACKED_SIDES", "RECORD_SIDES", "WIDE", "support_width"]
+__all__ = ["PACKED_ROWS", "PACKED_SIDES", "WIDE", "support_width"]
 
 WIDE = 2
 """The ``dense`` layout of rows that bilateral elimination corrected: every entry is a world coordinate's, sides or
@@ -45,16 +45,25 @@ PACKED_ROWS = FieldGroup(Field("packed_Z", wp.float32, ("world", "row", "support
 """Each dense row's packed entries: its whitened value."""
 
 
-_PACKED_SIDES = """    // A packed row's entries (packed_rows): PACKED_COORDINATE(sides, e) is the world coordinate of entry e of the
-    // row with these sides, -1 past them. Dense: entry e is coordinate e, held inside a side's coordinates; else the
-    // first side's entries, then the second's.
+_PACKED_SIDES = """    // A packed row's entries (packed_rows): SIDES_COORDINATE(off0, n0, off1, n1, e) is the world coordinate of entry
+    // e of a row whose sides start at world coordinates off0 and off1 and hold n0 and n1 coordinates, -1 past them.
+    // Dense: entry e is coordinate e, held inside a side's coordinates; else the first side's entries, then the second's.
+    const auto SIDES_COORDINATE = [&](const int off0, const int n0, const int off1, const int n1, const int e) {
+        if (packed_dense != 0) return ((e >= off0 && e < off0 + n0) || (e >= off1 && e < off1 + n1)) ? e : -1;
+        return e < n0 ? off0 + e : (e < n0 + n1 ? off1 + e - n0 : -1);
+    };
+    // PACKED_COORDINATE(sides, e): from the row's sides (-1 for none).
     const auto PACKED_COORDINATE = [&](const wp::vec2i sides, const int e) {
         const int a0 = sides[0], a1 = sides[1];
         const int n0 = a0 >= 0 ? response_dofs.data[a0] : 0, n1 = a1 >= 0 ? response_dofs.data[a1] : 0;
         const int off0 = a0 >= 0 ? articulation_world_dof_offset.data[a0] : 0;
         const int off1 = a1 >= 0 ? articulation_world_dof_offset.data[a1] : 0;
-        if (packed_dense != 0) return ((e >= off0 && e < off0 + n0) || (e >= off1 && e < off1 + n1)) ? e : -1;
-        return e < n0 ? off0 + e : (e < n0 + n1 ? off1 + e - n0 : -1);
+        return SIDES_COORDINATE(off0, n0, off1, n1, e);
+    };
+    // RECORD_COORDINATE(firsts, widths, e): from the words of a streamed row's record that hold its sides
+    // (row_metadata.pack_row_record: their first world coordinates and widths, 16-bit halves).
+    const auto RECORD_COORDINATE = [&](const int firsts, const int widths, const int e) {
+        return SIDES_COORDINATE(firsts >> 16, widths & 0xFFFF, (firsts << 16) >> 16, (widths >> 16) & 0xFFFF, e);
     };
     // PACKED_FIRST(sides, art): the entry where articulation art's side of a row with these sides starts, -1 when it
     // is not one of them (dense_rows.jacobian_row).
@@ -65,23 +74,9 @@ _PACKED_SIDES = """    // A packed row's entries (packed_rows): PACKED_COORDINAT
     };"""
 
 PACKED_SIDES = DevicePrelude("packed_sides", _PACKED_SIDES, _PACKED_SIDES)
-
-_RECORD_SIDES = """    // A streamed row's entries from its record (row_metadata.pack_row_record): RECORD_COORDINATE(firsts, widths, e)
-    // is PACKED_COORDINATE of the row's sides from their first world coordinates (16-bit halves, -1 for none) and
-    // widths, which the record holds.
-    const auto RECORD_COORDINATE = [&](const int firsts, const int widths, const int e) {
-        const int off0 = firsts >> 16, off1 = (firsts << 16) >> 16;
-        const int n0 = widths & 0xFFFF, n1 = (widths >> 16) & 0xFFFF;
-        if (packed_dense != 0) return ((e >= off0 && e < off0 + n0) || (e >= off1 && e < off1 + n1)) ? e : -1;
-        return e < n0 ? off0 + e : (e < n0 + n1 ? off1 + e - n0 : -1);
-    };"""
-
-RECORD_SIDES = DevicePrelude("record_sides", _RECORD_SIDES, _RECORD_SIDES)
-"""``RECORD_COORDINATE(firsts, widths, e)``: a packed row's coordinates from the words of its record that hold its
-sides (:func:`.row_metadata.pack_row_record`), for native sources that take ``packed_dense``."""
-"""``PACKED_COORDINATE(sides, e)`` and ``PACKED_FIRST(sides, art)`` for native sources that take ``response_dofs``,
-``articulation_world_dof_offset`` and ``packed_dense``: a packed row's coordinates and sides from its sides (no stored
-coordinates)."""
+"""``PACKED_COORDINATE(sides, e)``, ``RECORD_COORDINATE(firsts, widths, e)`` and ``PACKED_FIRST(sides, art)`` for native
+sources that take ``response_dofs``, ``articulation_world_dof_offset`` and ``packed_dense``: a packed row's coordinates
+from its sides or from its record's words (no stored coordinates), and where a side starts."""
 
 
 def support_width(response_dofs: np.ndarray, art_to_world: np.ndarray, world_count: int) -> int:

@@ -11,7 +11,7 @@ from __future__ import annotations
 import warp as wp
 
 from ...core.execution import Buckets, bucket_item
-from .device_preludes import CPU_MATH, dual_native
+from .device_preludes import CPU_MATH, CPU_WORDS, dual_native
 from .row_metadata import HEADER_WORDS, RECORD_WORDS, pack_row_record
 from .row_records import DenseRows
 
@@ -41,15 +41,17 @@ class RowRecords:
     dofs: wp.array[int]
 
 
-@wp.func_native(
-    dual_native(
-        pack_row_record("&record.data[at]", RECORD_WORDS),
-        preludes=(CPU_MATH,),
-    )
-)
+RECORD_LANES = 32
+"""Lanes a world's rows' records are stored by (:func:`store_row_records`)."""
+_RECORD_LANES = wp.constant(RECORD_LANES)
+_RECORD_WORDS, _HEADER_WORDS = wp.constant(RECORD_WORDS), wp.constant(HEADER_WORDS)
+
+
+@wp.func_native(dual_native(pack_row_record("&record.data[at]"), preludes=(CPU_MATH, CPU_WORDS)))
 def store_row_record(
     record: wp.array2d[wp.int32],
     at: int,
+    words: int,
     dof_a: int,
     dof_b: int,
     n_a: int,
@@ -59,24 +61,6 @@ def store_row_record(
     kind: int,
     parent: int,
     mu: float,
-): ...
-
-
-@wp.func_native(
-    dual_native(
-        pack_row_record("&record.data[at]", HEADER_WORDS, diagonal="inverse"),
-        preludes=(CPU_MATH,),
-    )
-)
-def store_row_header(
-    record: wp.array2d[wp.int32],
-    at: int,
-    dof_a: int,
-    dof_b: int,
-    inverse: float,
-    rhs: float,
-    kind: int,
-    parent: int,
 ): ...
 
 
@@ -116,28 +100,25 @@ def write_row_record(records: RowRecords, rows: DenseRows, incident: float, line
     kind = rows.row_type[line, slot]
     sides = rows.sides[line, slot]
     firsts = record_firsts(records, sides)
+    words = int(_RECORD_WORDS)
+    n_a = int(0)
+    n_b = int(0)
+    mu = float(0.0)
     if slot >= records.base:
+        words = _HEADER_WORDS
         inverse = float(0.0)
         if diagonal > 0.0:
             inverse = 1.0 / diagonal
+        diagonal = inverse
         if parent >= 0:
             parent = parent - records.base
-        store_row_header(records.record, at, firsts[0], firsts[1], inverse, rhs, kind, parent)
-        return
-    n_a = int(0)
-    n_b = int(0)
-    if sides[0] >= 0:
-        n_a = records.dofs[sides[0]]
-    if sides[1] >= 0:
-        n_b = records.dofs[sides[1]]
-    store_row_record(
-        records.record, at, firsts[0], firsts[1], n_a, n_b, diagonal, rhs, kind, parent, rows.row_mu[line, slot]
-    )
-
-
-RECORD_LANES = 32
-"""Lanes a world's rows' records are stored by (:func:`store_row_records`)."""
-_RECORD_LANES = wp.constant(RECORD_LANES)
+    else:
+        if sides[0] >= 0:
+            n_a = records.dofs[sides[0]]
+        if sides[1] >= 0:
+            n_b = records.dofs[sides[1]]
+        mu = rows.row_mu[line, slot]
+    store_row_record(records.record, at, words, firsts[0], firsts[1], n_a, n_b, diagonal, rhs, kind, parent, mu)
 
 
 @wp.kernel(enable_backward=False)

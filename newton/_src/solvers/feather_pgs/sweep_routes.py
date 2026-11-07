@@ -19,7 +19,7 @@ from ...core.memory import REGISTERS_PER_THREAD, Buffer, Place, Staging
 from . import kernel_template, sweep_units
 from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude
 from .kernel_template import Dispatch
-from .packed_rows import PACKED_SIDES, RECORD_SIDES
+from .packed_rows import PACKED_SIDES
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_VELOCITY_LIMIT, ROW_SPEED
@@ -925,7 +925,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         {dense.stores("i")}
     }}{free_stores}
 {end_first_warp}"""
-    return sweep.native(body, lanes=lanes, rows=(PACKED_SIDES, RECORD_SIDES), walks=(FREE_BODY_WALKS,)), staging
+    return sweep.native(body, lanes=lanes, rows=(PACKED_SIDES,), walks=(FREE_BODY_WALKS,)), staging
 
 
 @dataclasses.dataclass(frozen=True)
