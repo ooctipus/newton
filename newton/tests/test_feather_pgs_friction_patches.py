@@ -48,11 +48,14 @@ def _ground_box(device, **solver_kwargs):
     states = [model.state(), model.state()]
     control = model.control()
 
+    # Every step writes the solve's contact forces.
+    observables = solver.observables(contacts=contacts, kinds={solver.ObservableKind.CONTACT_F})
+
     def step():
         s0, s1 = states
         s0.clear_forces()
         pipeline.collide(s0, contacts)
-        solver.step(s0, s1, control, contacts, 0.005)
+        solver.step(s0, s1, control, contacts, 0.005, observables=observables)
         states.reverse()
 
     return model, solver, contacts, step
@@ -983,7 +986,8 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         contacts.rigid_contact_point1.assign(points)
         # The x force and z torque correspond to an off-centre tangential load.
         s1.body_f.assign([[1, 0, 0, 0, 0, 0.05]])
-        solver.step(s1, s0, model.control(), contacts, dt)
+        observables = solver.observables(contacts=contacts, kinds={solver.ObservableKind.CONTACT_F})
+        solver.step(s1, s0, model.control(), contacts, dt, observables=observables)
         self.assertGreater(np.count_nonzero(solver.laws.friction_patches.current.source.numpy() >= 0), 0)
         # A free body is a one-node tree: its contacts are rows of the line, at the world's six coordinates.
         count = int(solver.placement.constraint_count.numpy()[0])
@@ -991,7 +995,6 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         J = unpacked_rows(solver)[0]
         solved = np.einsum("ij,i->j", J[0, :count], solver.placement.impulses.numpy()[0, :count]) / dt
         self.assertGreater(np.linalg.norm(solved[3:]), 0.01, "fixture must exercise a nonzero contact moment")
-        solver.update_contacts(contacts)
         reported = contacts.force.numpy().sum(axis=0)
         np.testing.assert_allclose(reported[:3], solved[:3], atol=1.0e-4)
         # Torque is explicitly unsupported by this export, including on the base
@@ -1279,7 +1282,6 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             model, solver, contacts, step = _ground_box(device)
             for _ in range(100):
                 step()
-            solver.update_contacts(contacts)
             count = int(contacts.rigid_contact_count.numpy()[0])
             forces = contacts.rigid_contact_force.numpy()[:count]
         weight = float(model.body_mass.numpy()[0]) * 9.81

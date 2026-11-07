@@ -4744,12 +4744,22 @@ class CollisionPipeline:
         self._immobile_shape_body = None
         self._no_body_flags = None
         self._immobile_inputs = None
-        # Only an explicit list is scanned: nxn and sap pipelines never enumerate the model's pairs.
+        # An explicit list is scanned; nxn and sap pipelines count the model's pairs by shape mask instead, never
+        # enumerating them (_shape_contact_pair_count_for_mask).
         pairs = self.shape_pairs_filtered if self.broad_phase_mode == "explicit" else None
+        self._immobile_pair_counts = pairs is None and model.shape_contact_pair_count > 0
         # Topology alone bounds the immobile shapes over every body-flag and joint-enable state.
         reachable = topology.immobile_shapes(topology.welded_bodies(None, None))
         weldable = None if self.include_static_kinematic_pairs else reachable & (topology.shape_body >= 0)
-        if pairs is None:
+        if self._immobile_pair_counts:
+            self._immobile_pair_candidates = None
+            if weldable is None:
+                possible = _shape_contact_pair_count_for_mask(model, reachable) > 0
+            else:
+                every = np.ones(len(weldable), dtype=bool)
+                unweldable = _shape_contact_pair_count_for_mask(model, ~weldable)
+                possible = _shape_contact_pair_count_for_mask(model, every) > unweldable
+        elif pairs is None:
             self._immobile_pair_candidates = None
             colliding = self._colliding_shapes
             if weldable is None:
@@ -4820,7 +4830,15 @@ class CollisionPipeline:
             self._immobile_shape_body.assign(np.where(immobile, -1, topology.shape_body).astype(np.int32))
         pairs = self._immobile_pair_candidates
         listed = excluded = None
-        if pairs is not None:
+        if self._immobile_pair_counts:
+            listed = excluded = _shape_contact_pair_count_for_mask(self.model, immobile)
+            if not self.include_static_kinematic_pairs:
+                # The test drops static and kinematic pairs anyway; welded shapes join them.
+                immovable = (topology.shape_body < 0) | topology.kinematic_shapes(flags)
+                excluded = _shape_contact_pair_count_for_mask(
+                    self.model, immovable | immobile
+                ) - _shape_contact_pair_count_for_mask(self.model, immovable)
+        elif pairs is not None:
             first, second = pairs[:, 0], pairs[:, 1]
             listed = excluded = int(np.count_nonzero(immobile[first] & immobile[second]))
             if not self.include_static_kinematic_pairs:

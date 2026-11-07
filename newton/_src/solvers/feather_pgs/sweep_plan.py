@@ -1042,8 +1042,11 @@ class Sweep:
             extent=pool.ready_rows,
         )
 
-    def forces(self, contacts) -> None:
-        """Export the linear contact forces of the last solve (:meth:`.SolverFeatherPGS.update_contacts`)."""
+    def forces(self, contacts, contact_f) -> None:
+        """Write the linear contact forces of the step's solve into ``contacts.rigid_contact_force`` and the spatial
+        ``contact_f`` (the ``CONTACT_F`` observable; rows past the contacts and soft rows zero), and into the
+        deprecated ``contacts.force`` when allocated."""
+        contact_f.zero_()
         if contacts is None or contacts.rigid_contact_count is None:
             return
 
@@ -1071,7 +1074,9 @@ class Sweep:
             max_blocks=self.placement.contact_capacity_blocks,
         )
 
-        if contacts.force is not None:
+        for output in (contact_f, contacts.force):
+            if output is None or (output is contacts.force and output.ptr == contact_f.ptr):
+                continue
             pool.launch(
                 pack_contact_linear_force_as_spatial,
                 rows,
@@ -1079,7 +1084,7 @@ class Sweep:
                     contacts.rigid_contact_count,
                     contacts.rigid_contact_force,
                 ],
-                outputs=[contacts.force],
+                outputs=[output],
                 extent=contacts.rigid_contact_count,
                 max_blocks=self.placement.contact_capacity_blocks,
             )

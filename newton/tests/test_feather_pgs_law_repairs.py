@@ -815,10 +815,12 @@ def _press(targets, *, stop: bool = False, gap: float = 0.0005, device="cpu"):
         state.clear_forces()
         if pipeline is not None:
             pipeline.collide(state, contacts)
-        solver.step(state, out, control, contacts, _FINGER["dt"])
+        observables = (
+            None if pipeline is None else solver.observables(contacts=contacts, kinds={solver.ObservableKind.CONTACT_F})
+        )
+        solver.step(state, out, control, contacts, _FINGER["dt"], observables=observables)
         moment = float("nan")
         if pipeline is not None:
-            solver.update_contacts(contacts)
             force = contacts.rigid_contact_force.numpy()[: int(contacts.rigid_contact_count.numpy()[0])]
             moment = float(np.abs(force[:, 2]).sum()) * _FINGER["lever"]
         drive = float(solver.factor.joint_tau.numpy()[0])

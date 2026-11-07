@@ -192,11 +192,11 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
             contacts.rigid_contact_point1.assign(ground_points)
             contacts.rigid_contact_normal.assign(np.tile([0.0, 0.0, -1.0], (count, 1)).astype(np.float32))
             history = []
+            observables = solver.observables(contacts=contacts, kinds={solver.ObservableKind.CONTACT_F})
             for _ in range(3):
                 old_velocity = float(state_in.joint_qd.numpy()[0])
                 old_position = float(state_in.joint_q.numpy()[0])
-                solver.step(state_in, state_out, model.control(), contacts, dt)
-                solver.update_contacts(contacts)
+                solver.step(state_in, state_out, model.control(), contacts, dt, observables=observables)
                 velocity = float(state_out.joint_qd.numpy()[0])
                 forces = contacts.rigid_contact_force.numpy()
                 self.assertTrue(np.isfinite(forces).all())

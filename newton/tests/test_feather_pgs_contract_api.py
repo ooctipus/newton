@@ -203,8 +203,42 @@ class TestFeatherPGSDiagnostics(unittest.TestCase):
             SolverFeatherPGS(_scene("cpu"), diagnostics={"audit": True})
 
 
+def test_contact_sensor_reads_the_solved_forces(test, device):
+    """Sense a resting box's weight through the CONTACT_F observable, also after its contacts outgrow their rows.
+
+    The pipeline starts its contact rows at one, below the box's four corner contacts: the rows grow and the
+    observable's array follows them, so the sensor reads every contact the step solved.
+    """
+    from newton.sensors import SensorContact  # noqa: PLC0415
+
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()), label="box")
+    builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=1)
+    contacts = pipeline.contacts()
+    solver = SolverFeatherPGS(model, pgs_iterations=16)
+    test.assertIn(solver.ObservableKind.CONTACT_F, solver.supported_observables)
+    observables = solver.observables(contacts=contacts, kinds={solver.ObservableKind.CONTACT_F})
+    sensor = SensorContact(model, sensing_bodies="box", request_contact_attributes=False)
+    state, out, control = model.state(), model.state(), model.control()
+    for _ in range(60):
+        state.clear_forces()
+        pipeline.collide(state, contacts)
+        solver.step(state, out, control, contacts, 1.0 / 240.0, observables=observables)
+        state, out = out, state
+    test.assertGreater(contacts.rigid_contact_max, 1)
+    test.assertEqual(observables.contact_f.shape[0], contacts.rigid_contact_max + contacts.soft_contact_max)
+    sensor.update(state, contacts, observables=observables)
+    weight = float(model.body_mass.numpy()[body]) * 9.81
+    force = sensor.total_force.numpy()[0]
+    np.testing.assert_allclose(np.abs(force), [0.0, 0.0, weight], rtol=0.05, atol=0.05 * weight)
+
+
 devices = get_test_devices()
 for _test in (
+    test_contact_sensor_reads_the_solved_forces,
     test_diagnostics_change_no_published_state,
     test_snapshots_hold_the_step_by_name,
     test_readouts_answer_only_when_asked,

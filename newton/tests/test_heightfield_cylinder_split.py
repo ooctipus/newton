@@ -123,7 +123,9 @@ class TestHeightfieldCylinderSplit(unittest.TestCase):
             reference.collide(state, reference.contacts())
         self.assertEqual(len(captured), 1)
         common = captured[0]
-        common[-1] = 128
+        # The row kernel takes the hull support inputs after its thread count; the split kernels take neither.
+        support_inputs = 5
+        common[-1 - support_inputs] = 128
         owner = actual.narrow_phase
         checker = primitive.TestHeightfieldPrimitiveQuery()
         seen_mpr = seen_gjk = seen_far = False
@@ -161,7 +163,7 @@ class TestHeightfieldCylinderSplit(unittest.TestCase):
                     owner._heightfield_cylinder_gjk_count.zero_()
                     common[10] = owner.global_contact_reducer.get_data_struct()
                     inputs = [
-                        *common,
+                        *common[:-support_inputs],
                         owner._heightfield_cylinder_query_results,
                         owner._heightfield_cylinder_gjk_indices,
                         owner._heightfield_cylinder_gjk_count,

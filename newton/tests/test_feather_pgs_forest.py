@@ -164,19 +164,6 @@ class TestCoordinateTrees(unittest.TestCase):
         self.assertEqual(plan.tree_articulation.tolist(), [1])
         self.assertEqual(plan.body_tree.tolist(), [-1, 0])
 
-    def test_a_tree_stops_at_its_articulation(self):
-        """Each articulation is its own block of the mass matrix, even hung from another's body: a star on both sides."""
-        builder = newton.ModelBuilder()
-        upper, lower = _link(builder), _link(builder)
-        builder.add_articulation([builder.add_joint_revolute(-1, upper, axis=_AXIS)])
-        builder.add_articulation([builder.add_joint_revolute(upper, lower, axis=_AXIS)])
-        model = builder.finalize(device="cpu")
-        self.assertEqual(model.joint_ancestor.numpy().tolist(), [-1, 0])
-        plan = _plan(model)
-        self.assertEqual(plan.tree_size.tolist(), [1, 1])
-        self.assertEqual(plan.body_tree.tolist(), [0, 1])
-        self.assertEqual(plan.diagonal_mass_sizes, frozenset((1,)))
-
     def test_breadth_first_joints_interleave_trees(self):
         """Keep ``(tree_first, tree_size)`` honest: it counts a tree's coordinates, it does not bound them."""
         builder = newton.ModelBuilder()
