@@ -8,7 +8,7 @@ from functools import cache
 import warp as wp
 
 from ..utils.heightfield import HeightfieldData, get_triangle_shape_from_heightfield
-from .collision_convex import ConvexQueryResult, create_write_convex_query_result
+from .collision_convex import ConvexQueryResult, create_write_convex_query_result, gjk_separation_cutoff
 from .collision_core import ENABLE_MULTI_CONTACT, post_process_axial_on_discrete_contact
 from .contact_data import ContactData
 from .contact_reduction_global import GlobalContactReducerData, write_contact_to_reducer
@@ -234,7 +234,7 @@ def create_heightfield_split_kernels(shape_type, support_func, data_type, *, pre
                 query.relative_position_b,
                 0.0,
                 provider,
-                query.contact_threshold,
+                max_dist=gjk_separation_cutoff(query.contact_threshold, query.position_a, query.position_b),
             )
             result = ConvexQueryResult()
             result.point_a = point_a

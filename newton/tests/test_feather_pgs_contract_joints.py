@@ -207,8 +207,8 @@ def _build_hinge(spring_k: float, spring_ref: float, damping: float, limit_upper
     )
     b.add_articulation([j], label="hinge")
     dof = b.joint_qd_start[j]
-    b.joint_spring_stiffness[dof] = spring_k
-    b.joint_spring_ref[dof] = spring_ref
+    b.joint_stiffness[dof] = spring_k
+    b.joint_rest_q[b.joint_q_start[j]] = spring_ref
     b.joint_damping[dof] = damping
     return b
 

@@ -1269,6 +1269,9 @@ def eval_joint_motion_subspace(
         joint_qd_start[j],
         joint_S_s,
     )
+
+
+@wp.func
 def write_joint_jacobian_columns(
     j: int,
     out: int,

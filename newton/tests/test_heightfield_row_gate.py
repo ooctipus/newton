@@ -26,7 +26,6 @@ ROW_NAMES = ("sphere", "cylinder", "capsule", "box", "fallback")
 
 
 def _cube_mesh():
-    # Unit-L1 vertex coordinates also admit the hull to the terrain convex-cells owner.
     vertices = np.array([(x, y, z) for x in (-0.25, 0.25) for y in (-0.25, 0.25) for z in (-0.25, 0.25)], np.float32)
     faces = np.array(
         [
@@ -302,7 +301,7 @@ class TestHeightfieldRowGate(unittest.TestCase):
         self.check_rows_follow_current_pairs("cuda:0")
 
     def check_mixed_scene(self, device):
-        """Keep every reached row, the closed-form hull row and the convex-cells owner exact."""
+        """Keep every reached row and the closed-form hull row exact."""
         kinds = ("sphere", "capsule", "box", "cylinder", "barrel", "hull", "wedge", "ellipsoid", "airborne", "big_box")
         model = rough_terrain_model(device, kinds, per_kind=2, terrain_yaw=0.3)
         state = model.state()
@@ -323,20 +322,14 @@ class TestHeightfieldRowGate(unittest.TestCase):
 
         hulls = rough_terrain_model(device, ("hull",), per_kind=3)
         state = hulls.state()
-        for choice, fallback in (("auto", True), ("convex_cells", False)):
-            if choice == "auto" and wp.get_device(device).is_cuda:
-                # Automatic terrain cells are installed on CUDA; "convex_cells" covers that owner below.
-                continue
-            with self.subTest(device=device, convex_collision=choice):
-                gated = pipeline(hulls, True, convex_collision=choice)
-                reference = pipeline(hulls, False, convex_collision=choice)
-                self.assertEqual(gated.narrow_phase._heightfield_fallback_excludes_convex, not fallback)
-                self.collide_pair(gated, reference, state, reached={"fallback"} if fallback else set())
-                triangles = int(gated.narrow_phase.triangle_pairs_count.numpy()[0])
-                self.assertGreater(triangles, 0)
-                self.assertGreater(int(gated.narrow_phase.global_contact_reducer.contact_count.numpy()[0]), 0)
-                expected = {**dict.fromkeys(ROW_NAMES, 0), "fallback": triangles if fallback else 0}
-                self.assertEqual(self.row_lengths(gated), expected)
+        with self.subTest(device=device, convex_collision="auto"):
+            gated = pipeline(hulls, True, convex_collision="auto")
+            reference = pipeline(hulls, False, convex_collision="auto")
+            self.collide_pair(gated, reference, state, reached={"fallback"})
+            triangles = int(gated.narrow_phase.triangle_pairs_count.numpy()[0])
+            self.assertGreater(triangles, 0)
+            self.assertGreater(int(gated.narrow_phase.global_contact_reducer.contact_count.numpy()[0]), 0)
+            self.assertEqual(self.row_lengths(gated), {**dict.fromkeys(ROW_NAMES, 0), "fallback": triangles})
 
     def test_mixed_scene_cpu(self):
         """Gate a mixed terrain scene and the convex-hull routes on CPU."""

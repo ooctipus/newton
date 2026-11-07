@@ -42,7 +42,6 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Callable
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -114,12 +113,6 @@ def _builder() -> newton.ModelBuilder:
     return builder
 
 
-def _finalize(builder: newton.ModelBuilder, device) -> newton.Model:
-    """Finalize with joint targets in the coordinate layout, the only layout of future releases."""
-    with mock.patch.object(newton, "use_coord_layout_targets", True):
-        return builder.finalize(device=device)
-
-
 def _replicate(template: newton.ModelBuilder, worlds: int, ground: newton.ModelBuilder.ShapeConfig | None):
     """Copy a one-world template into ``worlds`` worlds 1 m apart, beside a global ground plane if ``ground``."""
     builder = _builder()
@@ -188,7 +181,7 @@ def box_drop(*, mu: float = 0.5) -> Scene:
         )
         _free_box(builder, (0.05, -0.02, 0.01 + 0.1 * (math.cos(tilt) + math.sin(tilt))), rotation, mu=mu)
         builder.end_world()
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     return Scene("box_drop", build, dt=1.0 / 240.0, steps=120, params={"mu": [mu, mu]}, passive=True)
 
@@ -201,7 +194,7 @@ def box_stack(*, mu: float = 0.6, contact_matching: str | None = None) -> Scene:
         builder.add_ground_plane(cfg=_cfg(mu=mu))
         for level, offset in enumerate((0.0, 0.02, 0.0)):
             _free_box(builder, (offset, 0.0, 0.101 + 0.201 * level), mu=mu)
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     name = "box_stack" if contact_matching is None else f"box_stack_{contact_matching}"
     return Scene(
@@ -232,7 +225,7 @@ def incline(*, angle: float = 0.35, mus: tuple[float, ...] = (0.6, 0.15)) -> Sce
             builder.add_shape_plane(xform=wp.transform(wp.vec3(0.0), rotation), width=0.0, length=0.0, cfg=_cfg(mu=mu))
             _free_box(builder, tuple(normal * 0.102), rotation, mu=mu)
             builder.end_world()
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     downhill = (math.cos(angle), 0.0, -math.sin(angle))
     return Scene(
@@ -260,7 +253,7 @@ def ball_drop(*, restitutions: tuple[float, ...] = (0.5, 0.0), height: float = 0
             )
             builder.add_shape_sphere(body, radius=0.1, cfg=_cfg(mu=0.5, density=0.0, restitution=restitution, gap=0.05))
             builder.end_world()
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     return Scene(
         "ball_drop",
@@ -298,7 +291,7 @@ def heightfield(*, mu: float = 0.6) -> Scene:
         )
         builder.add_shape_heightfield(heightfield=field, cfg=_cfg(mu=mu))
         _free_box(builder, (-0.25, 0.0, 0.09), mu=mu)
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     return Scene(
         "heightfield",
@@ -343,7 +336,7 @@ def box_push(*, speed_limit: float = 0.5, force: float = 20.0) -> Scene:
             )
             builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1, cfg=_cfg(mu=0.0, density=0.0))
             builder.end_world()
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     def control(model, control, state, step):
         forces = np.zeros((model.body_count, 6), dtype=np.float32)
@@ -422,7 +415,7 @@ def chain(*, links: int = 3) -> Scene:
             )
             parent = body
         builder.add_articulation(joints)
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     def control(model, control, state, step):
         if step == 0:
@@ -489,7 +482,7 @@ def four_bar(*, crank_target: float = 0.6, loop: str = "ball") -> Scene:
     driven."""
 
     def build(device):
-        return _finalize(_four_bar_builder(loop=loop), device)
+        return _four_bar_builder(loop=loop).finalize(device=device)
 
     def control(model, control, state, step):
         if step == 0:
@@ -513,7 +506,7 @@ def loaded_four_bar(*, crank_target: float = 0.6) -> Scene:
     def build(device):
         builder = _four_bar_builder()
         builder.add_shape_box(-1, xform=wp.transform(wp.vec3(0.36, 0.0, 0.55)), hx=0.02, hy=0.1, hz=0.1, cfg=_cfg())
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     def control(model, control, state, step):
         if step == 0:
@@ -591,7 +584,7 @@ def five_bar_leg(*, trunk_mass: float = 2.0, radius: float = 0.01) -> Scene:
             parent_xform=wp.transform(wp.vec3(*shins[0][1])),
             child_xform=wp.transform(wp.vec3(*shins[1][1])),
         )
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     return Scene(
         "five_bar_leg",
@@ -684,7 +677,7 @@ def stewart_platform(*, platform_mass: float = 2.0, push: float = 0.03) -> Scene
                 parent_xform=wp.transform(wp.vec3(*parent_anchor)),
                 child_xform=wp.transform(wp.vec3(*child_anchor)),
             )
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     def control(model, control, state, step):
         if step == 0:
@@ -728,7 +721,7 @@ def mimic_pair(*, coef0: float = 0.1, coef1: float = -0.5, leader_target: float 
         )
         builder.add_articulation([root, leader, follower])
         builder.add_constraint_mimic(joint0=follower, joint1=leader, coef0=coef0, coef1=coef1)
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     def control(model, control, state, step):
         if step == 0:
@@ -763,13 +756,13 @@ def spring_hinge(*, stiffness: float = 2.0, damping: float = 0.02, start: float 
             axis=newton.Axis.Z,
             parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5)),
             child_xform=wp.transform(wp.vec3(-half, 0.0, 0.0)),
-            spring_stiffness=stiffness,
-            spring_ref=0.0,
+            stiffness=stiffness,
+            rest_q=0.0,
             damping=damping,
         )
         builder.add_articulation([root, joint])
         builder.joint_q[0] = start
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     inertia = mass * (half * half + 0.03 * 0.03) / 3.0 + mass * half * half
     return Scene(
@@ -808,7 +801,7 @@ def pushed_arm(*, velocity_limit: float = 1.0, torque: float = 2.0) -> Scene:
             )
             parent = body
         builder.add_articulation(joints)
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     def control(model, control, state, step):
         if step == 0:
@@ -914,7 +907,7 @@ def legged(
         builder = _builder()
         builder.add_ground_plane(cfg=_cfg(mu=mu))
         builder.replicate(template, worlds, spacing=(2.0, 0.0, 0.0))
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     pose = [hip, knee] * legs if knees else [hip] * legs
 
@@ -1012,7 +1005,7 @@ def gripper(
             )
             builder.add_shape_box(top, hx=0.15, hy=0.15, hz=0.01, cfg=_cfg(mu=mu, density=0.0))
         _free_box(builder, (0.0, 0.0, half + 0.001), half=half, mass=0.2, mu=mu)
-        return _finalize(_replicate(builder, worlds, None if table else _cfg(mu=mu)), device)
+        return _replicate(builder, worlds, None if table else _cfg(mu=mu)).finalize(device=device)
 
     def control(model, control, state, step):
         # Per world: the base weld, the lift, the two fingers, then the box's free joint.
@@ -1112,7 +1105,7 @@ def keyboard(
             parent = body
         builder.add_shape_sphere(parent, radius=tip, cfg=_cfg(mu=0.5, density=0.0, gap=0.004, group=SELF - 1))
         builder.add_articulation(arm_joints)
-        return _finalize(_replicate(builder, worlds, None), device)
+        return _replicate(builder, worlds, None).finalize(device=device)
 
     def control(model, control, state, step):
         if step == 0:
@@ -1213,7 +1206,7 @@ def hand(
         start = replicated.joint_q_start[-1]
         replicated.joint_q[start] += 0.3
         replicated.joint_q[start + 2] = cube + 0.001
-        return _finalize(replicated, device)
+        return replicated.finalize(device=device)
 
     def control(model, control, state, step):
         if step == 0:
@@ -1364,7 +1357,7 @@ def sprawl(*, mu: float = 0.8, fingers: int = 5, finger_links: int = 4, worlds: 
             builder, torso, wp.vec3(0.2, 0.0, 0.0), 0.0, links=2, length=0.08, radius=radius, mass=0.2, mu=mu
         )
         builder.add_articulation(joints + neck)
-        return _finalize(_replicate(builder, worlds, None) if worlds > 1 else builder, device)
+        return (_replicate(builder, worlds, None) if worlds > 1 else builder).finalize(device=device)
 
     return Scene(
         "sprawl",
@@ -1433,7 +1426,7 @@ def long_chain(*, links: int = 100, mu: float = 0.6, pull: float = 0.0, armature
         coordinates = np.array(builder.joint_q, dtype=np.float64)
         coordinates[7:] = 0.02
         builder.joint_q = coordinates.tolist()
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     def control(model, control, state, step):
         forces = np.zeros((model.body_count, 6), dtype=np.float32)
@@ -1501,7 +1494,7 @@ def spin_decay(*, free: bool = False, omega: float = 10.0) -> Scene:
         builder = _builder()
         builder.add_ground_plane(cfg=_cfg(mu=SPIN["mu"]))
         _spin_sphere(builder, free=free, omega=omega)
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     params = {**SPIN, "mu": [SPIN["mu"]], "omega": omega}
     name = "spin_decay_free" if free else "spin_decay"
@@ -1521,7 +1514,7 @@ def twist_threshold(*, fractions: tuple[float, ...] = (0.5, 0.9, 1.1, 2.0)) -> S
             builder.begin_world()
             _spin_sphere(builder)
             builder.end_world()
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     def control(model, control, state, step):
         if step == 0:
@@ -1586,7 +1579,7 @@ def pinch_twist(*, offsets: tuple[float, ...] = (0.004, 0.007, 0.011, 0.02), spi
     params = {**p, "mu": [p["mu"]] * len(offsets), "offsets": offsets, "spin_radius": spin_radius, "inertia": inertia}
     return Scene(
         "pinch_twist",
-        lambda device: _finalize(_pinch(offsets, pads=False), device),
+        lambda device: _pinch(offsets, pads=False).finalize(device=device),
         dt=1.0 / 240.0,
         steps=72,
         params=params,
@@ -1623,7 +1616,7 @@ def slide_spin(*, speed: float = 1.0, omega: float = 20.0) -> Scene:
         builder.add_articulation(joints)
         builder.add_shape_sphere(body, radius=SPIN["radius"], cfg=_cfg(mu=SPIN["mu"], density=0.0))
         builder.joint_qd[0], builder.joint_qd[3] = speed, omega
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     params = {**SPIN, "mu": [SPIN["mu"]], "speed": speed, "omega": omega, "body": 3}
     return Scene("slide_spin", build, dt=1.0 / 240.0, steps=168, params=params, tags=frozenset({"torsion"}))
@@ -1650,7 +1643,7 @@ def compliant_drop(*, dampings: tuple[float, ...] = (0.0, 2.0, 20.0), stiffness:
             )
             builder.add_shape_sphere(body, radius=radius, cfg=_cfg(mu=0.5, density=0.0))
             builder.end_world()
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     return Scene(
         "compliant_drop",
@@ -1688,7 +1681,7 @@ def compliant_plate(*, stiffness: float = 2.0e4, damping: float = 200.0, contact
             inertia=_box_inertia(mass, *half),
         )
         builder.add_shape_box(body, hx=half[0], hy=half[1], hz=half[2], cfg=_cfg(mu=0.0, density=0.0))
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     return Scene(
         "compliant_plate" if contact_matching is None else f"compliant_plate_{contact_matching}",
@@ -1717,7 +1710,7 @@ def compliant_stack(
         builder.add_ground_plane(cfg=_cfg(mu=0.5))
         for level in range(count):
             _free_box(builder, (0.0, 0.0, half * (2 * level + 1) + 0.0005 * (level + 1)), half=half, mass=mass)
-        return _finalize(builder, device)
+        return builder.finalize(device=device)
 
     return Scene(
         "compliant_stack" if contact_matching is None else f"compliant_stack_{contact_matching}",
@@ -1738,7 +1731,7 @@ def compliant_pinch(*, stiffness: float = 5.0e3, damping: float = 20.0) -> Scene
     ``F / (n k)`` together (0.25 mm with four), and friction ``2 mu F`` = 10 N holds the 4.9 N bar."""
     return Scene(
         "compliant_pinch",
-        lambda device: _finalize(_pinch((0.0,), pads=True), device),
+        lambda device: _pinch((0.0,), pads=True).finalize(device=device),
         dt=1.0 / 240.0,
         steps=120,
         params={**PINCH, "mu": [PINCH["mu"]], "stiffness": stiffness},

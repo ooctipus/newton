@@ -242,7 +242,7 @@ class TestTerrainLawContacts(unittest.TestCase):
             _pipeline(
                 model,
                 {"NEWTON_TERRAIN_LAW": "point"},
-                speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(),
+                speculative_contact_gap_max=0.1,
                 **PIPELINE,
             )
         pipeline = _pipeline(model, {"NEWTON_TERRAIN_LAW": " point "}, **PIPELINE)
@@ -305,7 +305,7 @@ class TestTerrainLawContacts(unittest.TestCase):
         """
         model, terrain = _mixed_scene(wp.get_device("cpu"))
         state = model.state()
-        speculative = {"speculative_config": newton.CollisionPipeline.SpeculativeContactConfig(), **PIPELINE}
+        speculative = {"speculative_contact_gap_max": 0.1, **PIPELINE}
         cases = (
             ("speculative", {}, speculative, {"dt": 0.01}, "Speculative contacts: the terrain law does not write"),
             ("shadow", {"NEWTON_TERRAIN_LAW_SHADOW": "all"}, PIPELINE, {}, "NEWTON_TERRAIN_LAW_SHADOW runs the law"),

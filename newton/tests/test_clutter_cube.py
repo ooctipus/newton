@@ -4,7 +4,6 @@
 """Check tight-fit cube CAD, mass properties, and contact-compatible face turns."""
 
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -157,8 +156,7 @@ class TestClutterCube(unittest.TestCase):
         """Apply equal opposite pad forces with zero net force and the requested torque."""
         builder = newton.ModelBuilder()
         scene = build_cube(builder, armature=0.0, damping=0.0)
-        with patch.object(newton, "use_coord_layout_targets", True):
-            model = builder.finalize(device="cpu")
+        model = builder.finalize(device="cpu")
         state = model.state()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state)
         data = scene["metadata"]
@@ -196,8 +194,7 @@ class TestClutterCube(unittest.TestCase):
         """A force at a corner COM has no local moment but has a core-referenced moment."""
         builder = newton.ModelBuilder()
         scene = build_cube(builder, armature=0.0, damping=0.0)
-        with patch.object(newton, "use_coord_layout_targets", True):
-            model = builder.finalize(device="cpu")
+        model = builder.finalize(device="cpu")
         state = model.state()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state)
         data = scene["metadata"]
@@ -230,8 +227,7 @@ class TestClutterCube(unittest.TestCase):
         """Use actual forward kinematics to permute each face's nine cubies."""
         builder = newton.ModelBuilder()
         scene = build_cube(builder)
-        with patch.object(newton, "use_coord_layout_targets", True):
-            model = builder.finalize(device="cpu")
+        model = builder.finalize(device="cpu")
         state = model.state()
         data = scene["metadata"]
         lattice = np.asarray(data["lattice"], dtype=np.float32)

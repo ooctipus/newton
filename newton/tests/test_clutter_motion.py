@@ -131,29 +131,25 @@ class TestClutterMotion(unittest.TestCase):
 
     def test_container_velocity_actuators_do_not_change_cube_modes(self):
         """MJWarp must install velocity actuators; the cube's baseline stays unchanged."""
-        with patch.object(newton, "use_coord_layout_targets", True):
-            container, _ = build_franka(container_grasp=True)
-            cube, _ = build_franka(cube_grasp=True)
+        container, _ = build_franka(container_grasp=True)
+        cube, _ = build_franka(cube_grasp=True)
         np.testing.assert_array_equal(container.joint_target_mode[:9], newton.JointTargetMode.POSITION_VELOCITY)
         np.testing.assert_array_equal(cube.joint_target_mode[:9], newton.JointTargetMode.POSITION)
         self.assertEqual(len(interaction_path("cube", (0.5, 0, 0.08))), len(interaction_times("cube")))
 
     def test_arm_stiffness_scale_preserves_fingers_and_physical_limits(self):
         """Scale only arm PD gains, never actuator authority or robot mass properties."""
-        with patch.object(newton, "use_coord_layout_targets", True):
-            baseline, _ = build_franka(container_grasp=True, arm_stiffness_scale=1.0)
-            scaled, _ = build_franka(container_grasp=True, arm_stiffness_scale=2.0)
-            np.testing.assert_allclose(scaled.joint_target_ke[:7], 2 * np.asarray(baseline.joint_target_ke[:7]))
-            np.testing.assert_allclose(
-                scaled.joint_target_kd[:7], np.sqrt(2) * np.asarray(baseline.joint_target_kd[:7])
-            )
-            np.testing.assert_array_equal(scaled.joint_target_ke[7:], baseline.joint_target_ke[7:])
-            np.testing.assert_array_equal(scaled.joint_target_kd[7:], baseline.joint_target_kd[7:])
-            for attribute in ("joint_effort_limit", "joint_armature", "body_mass", "body_inertia"):
-                np.testing.assert_array_equal(getattr(scaled, attribute), getattr(baseline, attribute))
-            for invalid in (0.0, -1.0, float("nan"), float("inf"), -float("inf")):
-                with self.subTest(scale=invalid), self.assertRaisesRegex(ValueError, "finite and positive"):
-                    build_franka(container_grasp=True, arm_stiffness_scale=invalid)
+        baseline, _ = build_franka(container_grasp=True, arm_stiffness_scale=1.0)
+        scaled, _ = build_franka(container_grasp=True, arm_stiffness_scale=2.0)
+        np.testing.assert_allclose(scaled.joint_target_ke[:7], 2 * np.asarray(baseline.joint_target_ke[:7]))
+        np.testing.assert_allclose(scaled.joint_target_kd[:7], np.sqrt(2) * np.asarray(baseline.joint_target_kd[:7]))
+        np.testing.assert_array_equal(scaled.joint_target_ke[7:], baseline.joint_target_ke[7:])
+        np.testing.assert_array_equal(scaled.joint_target_kd[7:], baseline.joint_target_kd[7:])
+        for attribute in ("joint_effort_limit", "joint_armature", "body_mass", "body_inertia"):
+            np.testing.assert_array_equal(getattr(scaled, attribute), getattr(baseline, attribute))
+        for invalid in (0.0, -1.0, float("nan"), float("inf"), -float("inf")):
+            with self.subTest(scale=invalid), self.assertRaisesRegex(ValueError, "finite and positive"):
+                build_franka(container_grasp=True, arm_stiffness_scale=invalid)
 
     def test_scene_specific_cli_defaults_and_explicit_overrides(self):
         """Resolve hardware-only changes before loading assets; preserve other scenes."""
@@ -172,7 +168,6 @@ class TestClutterMotion(unittest.TestCase):
                 args = create_parser().parse_args(command)
                 example = Example.__new__(Example)
                 with (
-                    patch.object(newton, "use_coord_layout_targets", False),
                     patch(
                         "newton.examples.robot.example_robot_clutter.build_franka",
                         side_effect=RuntimeError("Stop before asset construction"),
@@ -186,9 +181,8 @@ class TestClutterMotion(unittest.TestCase):
 
     def test_tilted_hardware_waypoints_have_requested_tcp_orientation(self):
         """Check CPU FK after setup IK; this does not qualify contact or grasp forces."""
-        with patch.object(newton, "use_coord_layout_targets", True):
-            builder, tcp = build_franka(container_grasp=True)
-            model = builder.finalize(device="cpu")
+        builder, tcp = build_franka(container_grasp=True)
+        model = builder.finalize(device="cpu")
         waypoints = interaction_path("hardware", (0.5, -0.145, 0.0496), shake_cycles=1, shake_axis="y")
         tilt = np.deg2rad(30.0)
         solved = solve_waypoints(model, tcp, waypoints, grasp_tilt=tilt)
@@ -214,7 +208,6 @@ class TestClutterMotion(unittest.TestCase):
         """Accept replicated scenes after the solver's target-layout correction."""
         args = create_parser().parse_args(["--solver", "fpgs", "--world-count", "2"])
         with (
-            patch.object(newton, "use_coord_layout_targets", False),
             patch(
                 "newton.examples.robot.example_robot_clutter.build_franka",
                 side_effect=RuntimeError("Stop before asset construction"),

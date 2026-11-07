@@ -179,7 +179,6 @@ class Example:
             raise ValueError("Substeps, iterations, and capacities must be positive")
         if min(args.max_speed, args.max_error, args.max_angle) <= 0:
             raise ValueError("Diagnostic speed and coherence limits must be positive")
-        newton.use_coord_layout_targets = True
         wp.set_device(args.device)
         self.args, self.frame = args, 0
         self.time, self.dt = 0.0, 1.0 / (60 * args.substeps)

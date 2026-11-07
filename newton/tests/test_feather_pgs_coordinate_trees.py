@@ -139,8 +139,8 @@ def build_branch_model(
             "target_kd": 1.5,
             "armature": 1.0e-4,
             "damping": 0.02 + 0.001 * index,
-            "spring_stiffness": 0.4,
-            "spring_ref": -0.001,
+            "stiffness": 0.4,
+            "rest_q": -0.001,
         }
         if multi and index == leaves - 1:
             axis = newton.ModelBuilder.JointDofConfig
@@ -945,8 +945,11 @@ def _key_law(model, leaves, dofs, axes, q, qd, steps, push=None):
     m = model.body_mass.numpy()[leaves].astype(np.float64)
     ke = model.joint_target_ke.numpy()[dofs].astype(np.float64)
     kd = model.joint_target_kd.numpy()[dofs].astype(np.float64)
-    spring = model.joint_spring_stiffness.numpy()[dofs].astype(np.float64)
-    reference = model.joint_spring_ref.numpy()[dofs].astype(np.float64)
+    spring = model.joint_stiffness.numpy()[dofs].astype(np.float64)
+    qd_start = model.joint_qd_start.numpy()
+    joints = np.searchsorted(qd_start, dofs, side="right") - 1
+    coords = model.joint_q_start.numpy()[joints] + (np.asarray(dofs) - qd_start[joints])
+    reference = model.joint_rest_q.numpy()[coords].astype(np.float64)
     damping = model.joint_damping.numpy()[dofs].astype(np.float64)
     inertia = _key_inertia(model, leaves, dofs, axes)
     weight = m * (axes @ model.gravity.numpy()[0].astype(np.float64))

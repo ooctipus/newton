@@ -16,7 +16,7 @@ from newton.tests.test_contact_reduction_body_pairs import _cylinder_foot
 class TestFeatherPGSPersistentContacts(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "requires CUDA graph capture")
     def test_combined_history_reset_replays_with_changed_world_mask(self):
-        """Capture reduction, matching and solver resets with a live device mask."""
+        """Capture matching and solver resets of body-pair reduced contacts with a live device mask."""
         template = newton.ModelBuilder()
         _cylinder_foot(template, wp.vec3(0.0, 0.0, 0.015))
         builder = newton.ModelBuilder()
@@ -26,10 +26,7 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         pipeline = newton.CollisionPipeline(
             model,
             contact_matching="latest",
-            reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(
-                body_pairs=True,
-                body_pair_hysteresis=0.001,
-            ),
+            body_pair_reduction=newton.CollisionPipeline.BodyPairReductionConfig(),
         )
         solver = SolverFeatherPGS(model, pgs_warmstart=True)
         state, output = model.state(), model.state()
@@ -148,14 +145,18 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         pipeline = newton.CollisionPipeline(
             model,
             contact_matching="latest",
-            reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(body_pairs=True),
+            body_pair_reduction=newton.CollisionPipeline.BodyPairReductionConfig(),
         )
+        unreduced = newton.CollisionPipeline(model)
+        unreduced_contacts = unreduced.contacts()
+        unreduced.collide(model.state(), unreduced_contacts)
         contacts = pipeline.contacts()
         state_in, state_out = model.state(), model.state()
-        matched = 0
+        matched, counts = 0, []
         for _ in range(40):
             pipeline.collide(state_in, contacts)
             count = int(contacts.rigid_contact_count.numpy()[0])
+            counts.append(count)
             indices = contacts.rigid_contact_match_index.numpy()[:count]
             valid = indices[indices >= 0]
             self.assertEqual(len(valid), len(np.unique(valid)), "a cached impulse was assigned more than once")
@@ -164,14 +165,13 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
             state_in.clear_forces()
             solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
             state_in, state_out = state_out, state_in
-        stats = pipeline.body_pair_reduction_stats()
-        self.assertGreater(stats["sum_contacts_in"], stats["sum_contacts_kept"])
+        self.assertGreater(int(unreduced_contacts.rigid_contact_count.numpy()[0]), counts[0])
         self.assertGreater(matched, 20)
         self.assertTrue(np.isfinite(state_in.body_q.numpy()).all())
         self.assertGreater(float(state_in.body_q.numpy()[0, 2]), 0.012)
 
-    def test_matching_reset_also_invalidates_reduction_history(self):
-        """Partial resets preserve other worlds; material changes start cold."""
+    def test_matching_reset_preserves_other_worlds_under_reduction(self):
+        """A partial matching reset of body-pair reduced contacts cold-starts only the selected world."""
         template = newton.ModelBuilder()
         _cylinder_foot(template, wp.vec3(0.0, 0.0, 0.015))
         builder = newton.ModelBuilder()
@@ -181,19 +181,12 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         pipeline = newton.CollisionPipeline(
             model,
             contact_matching="latest",
-            reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(
-                body_pairs=True,
-                body_pair_hysteresis=0.001,
-            ),
+            body_pair_reduction=newton.CollisionPipeline.BodyPairReductionConfig(),
         )
         state, contacts = model.state(), pipeline.contacts()
         pipeline.collide(state, contacts)
         pipeline.collide(state, contacts)
-        generations = pipeline._body_pair_reducer.history_generation.numpy().copy()
         pipeline.reset_contact_matching(wp.array([True, False, False], dtype=wp.bool, device=model.device))
-        after = pipeline._body_pair_reducer.history_generation.numpy()
-        self.assertGreater(after[0], generations[0])
-        self.assertEqual(after[1], generations[1])
         pipeline.collide(state, contacts)
         count = int(contacts.rigid_contact_count.numpy()[0])
         shape0 = contacts.rigid_contact_shape0.numpy()[:count]
@@ -203,11 +196,6 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         self.assertTrue(np.any(worlds == 0) and np.any(worlds == 1))
         self.assertTrue(np.all(matches[worlds == 0] < 0))
         self.assertTrue(np.all(matches[worlds == 1] >= 0))
-        model.shape_material_mu.fill_(0.1)
-        pipeline.refresh_body_pair_reduction_groups()
-        pipeline.collide(state, contacts)
-        count = int(contacts.rigid_contact_count.numpy()[0])
-        self.assertTrue(np.all(contacts.rigid_contact_match_index.numpy()[:count] < 0))
 
 
 if __name__ == "__main__":

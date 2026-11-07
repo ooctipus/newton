@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     import warp as wp
     from numpy.typing import ArrayLike
 
+    from ..geometry.broad_phase_nxn import ShapePairTemplates
+
     from ..solvers.coupled.model_view import ModelView
     from . import Model
 
@@ -281,10 +283,47 @@ class _ShapeContactPairs:
 
     def build_pairs(self, shape_mask: np.ndarray | None = None) -> np.ndarray:
         """Build only the requested pairs, reusing homogeneous world templates."""
+        return self._build_pairs(shape_mask)[0]
+
+    def build_pair_templates(self) -> tuple[np.ndarray, ShapePairTemplates]:
+        """Build every pair and the per-world templates the list replays.
+
+        Returns:
+            The pairs of :meth:`build_pairs`, and the templates that replay into them, which
+            :class:`~newton.CollisionPipeline` tests per world instead of streaming the list.
+        """
+        return self._build_pairs(None)
+
+    def _build_pairs(self, shape_mask: np.ndarray | None) -> tuple[np.ndarray, ShapePairTemplates]:
+        """Build the pairs and record the templates and runs of worlds they replay from."""
+        from ..geometry.broad_phase_nxn import ShapePairTemplates  # noqa: PLC0415
+
         counts = self.counts if shape_mask is None else self.count_pairs(shape_mask)
         pairs = np.empty((int(counts.sum()), 2), dtype=np.int32)
+
+        def record(templates=(), runs=()) -> ShapePairTemplates:
+            # A template stores its global-local pairs as (absolute global id, world-local id) and its local
+            # pairs world-locally; ids are relative to the first active shape of the template's world.
+            index = {id(template): position for position, template in enumerate(templates)}
+            stored = []
+            for origin, template, global_count in templates:
+                mixed = template[:global_count]
+                is_global = self.shape_world[mixed] == -1
+                global_local = np.column_stack(
+                    (
+                        np.where(is_global[:, 0], mixed[:, 0], mixed[:, 1]),
+                        np.where(is_global[:, 0], mixed[:, 1], mixed[:, 0]) - origin,
+                    )
+                )
+                stored.append((global_local.astype(np.int32), (template[global_count:] - origin).astype(np.int32)))
+            return ShapePairTemplates(
+                global_pairs=pairs[: counts[0]].copy(),
+                templates=tuple(stored),
+                runs=tuple((index[id(template)], np.asarray(starts, dtype=np.int32)) for template, starts, _ in runs),
+            )
+
         if not len(pairs):
-            return pairs
+            return pairs, record()
         active = self._active(shape_mask)
         indices = np.flatnonzero(active).astype(np.int32)
         indices = indices[np.argsort(self.shape_world[indices], kind="stable")]
@@ -299,7 +338,7 @@ class _ShapeContactPairs:
 
         written = self._write_pairs(pairs[: counts[0]], globals_, globals_, triangular=True) if counts[0] else 0
         if written == len(pairs):
-            return pairs
+            return pairs, record()
         # Normalize all world signatures together. Per-world NumPy operations
         # otherwise dominate setup for thousands of small replicated worlds.
         world_slot = self.shape_world + 1
@@ -356,7 +395,7 @@ class _ShapeContactPairs:
                 local_count = self._write_pairs(target[global_count:], local, local, triangular=True)
                 if global_count + local_count != count:
                     raise RuntimeError("Shape contact-pair count disagrees with enumeration")
-                template = (start, target)
+                template = (start, target, global_count)
                 templates[key] = template
             if runs and runs[-1][0] is template:
                 runs[-1][1].append(start)
@@ -364,7 +403,9 @@ class _ShapeContactPairs:
                 runs.append((template, [start], written))
             written += count
 
-        for (origin, template), run_starts, run_offset in runs:
+        # Each template is still its first world's rows; record them before the replay.
+        recorded = record(tuple(templates.values()), runs)
+        for (origin, template, _), run_starts, run_offset in runs:
             count = len(template)
             # Templates are views into the final allocation. Skip writing the
             # original template back onto itself while replaying its run.
@@ -386,7 +427,7 @@ class _ShapeContactPairs:
                 offset = end
         if written != len(pairs):
             raise RuntimeError("Shape contact-pair count disagrees with enumeration")
-        return pairs
+        return pairs, recorded
 
 
 def _shape_contact_pair_counts(model: Model | ModelView, *, shape_mask: np.ndarray | None = None) -> np.ndarray:

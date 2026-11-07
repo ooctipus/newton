@@ -182,8 +182,8 @@ def _hinges(inertias, *, damping=(0.0,), stiffness=(0.0,), device="cpu"):
                 child=link,
                 axis=(0.0, 0.0, 1.0),
                 damping=damping[index % len(damping)],
-                spring_stiffness=stiffness[index % len(stiffness)],
-                spring_ref=0.0,
+                stiffness=stiffness[index % len(stiffness)],
+                rest_q=0.0,
                 armature=0.0,
                 limit_lower=-1.0e6,
                 limit_upper=1.0e6,
@@ -727,8 +727,7 @@ class TestCoordinateTreesJointLaws(unittest.TestCase):
             values = array.numpy()
             values[dofs] = value
             array.assign(values)
-        for name in ("joint_spring_stiffness",):
-            getattr(model, name).zero_()
+        model.joint_stiffness.zero_()
         for name in ("joint_limit_lower",):
             getattr(model, name).fill_(-1.0e3)
         model.joint_limit_upper.fill_(1.0e3)
@@ -1138,7 +1137,7 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
             values = array.numpy()
             values[dofs] = value
             array.assign(values)
-        model.joint_spring_stiffness.zero_()
+        model.joint_stiffness.zero_()
         model.joint_limit_lower.fill_(-1.0e3)
         model.joint_limit_upper.fill_(1.0e3)
         solver = branch.recipe_solver(model, coordinate=False, angular_damping=0.0, update_mass_matrix_interval=2)

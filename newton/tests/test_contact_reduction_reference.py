@@ -406,7 +406,7 @@ class TestContactReductionReference(unittest.TestCase):
                     )
 
     def test_terrain_routes(self):
-        """Reproduce the terrain routes: typed rows, generic and finite queries, cleanup, determinism, cells."""
+        """Reproduce the terrain routes: typed rows, generic and finite queries, cleanup and determinism."""
         model = _terrain_model()
         options = {"max_triangle_pairs": 8192}
         out = {}
@@ -422,8 +422,6 @@ class TestContactReductionReference(unittest.TestCase):
         pipeline = _run_passes(self, out, "cleanup", model, {**typed, "NEWTON_REDUCER_EXPORT_CLEANUP": "1"}, **options)
         self.assertTrue(pipeline.narrow_phase._reducer_export_cleanup)
         _run_passes(self, out, "deterministic", model, typed, deterministic=True, **options)
-        pipeline = _run_passes(self, out, "cells", model, typed, convex_collision="convex_cells", **options)
-        self.assertIsNotNone(pipeline._heightfield_convex_cells)
         _run_passes(self, out, "finite", model, {**_TERRAIN_FLAGS, "NEWTON_HEIGHTFIELD_FINITE_QUERY": "1"}, **options)
         self._check("terrain", out)
 
@@ -448,7 +446,7 @@ class TestContactReductionReference(unittest.TestCase):
             {**_TERRAIN_FLAGS, "NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "1"},
             dt=0.02,
             max_triangle_pairs=16384,
-            speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(max_speculative_extension=0.25),
+            speculative_contact_gap_max=0.25,
         )
         # The last pass repeats the first; its keys include predictive manifolds.
         reducer = pipeline.narrow_phase.global_contact_reducer

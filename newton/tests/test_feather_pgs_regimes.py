@@ -93,8 +93,8 @@ def _hinge(
         armature=armature,
         limit_lower=-1.0e6,
         limit_upper=1.0e6,
-        spring_stiffness=stiffness,
-        spring_ref=0.0,
+        stiffness=stiffness,
+        rest_q=0.0,
         damping=damping,
     )
     builder.add_articulation([joint])
@@ -753,7 +753,7 @@ class TestQ19Wall(unittest.TestCase):
         pipeline = newton.CollisionPipeline(
             model,
             broad_phase="sap",
-            speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(),
+            speculative_contact_gap_max=0.1,
             rigid_contact_max=48 * model.body_count,
         )
         contacts = pipeline.contacts()

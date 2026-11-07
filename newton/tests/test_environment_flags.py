@@ -194,6 +194,14 @@ def _scan_tree():
         reads |= source_reads
         cited |= source_cited
         unresolved += source_unresolved
+    # The public modules beside _src read a few names too, such as newton.config.
+    for path in sorted(_SRC.parent.glob("*.py")):
+        source_reads, source_cited, source_unresolved = _scan_source(
+            path.read_text(encoding="utf-8"), f"newton.{path.stem}"
+        )
+        reads |= source_reads
+        cited |= source_cited
+        unresolved += source_unresolved
     return reads, cited, unresolved
 
 
@@ -265,7 +273,12 @@ class TestEnvironmentFlagRegistry(unittest.TestCase):
                         if flag.owner == "isaac_lab":
                             self.assertTrue(reader.startswith("isaaclab"), reader)
                         else:
-                            self.assertTrue((_SRC / Path(*reader.split("."))).with_suffix(".py").is_file(), reader)
+                            root, parts = (
+                                (_SRC.parent, reader.split(".")[1:])
+                                if reader.startswith("newton.")
+                                else (_SRC, reader.split("."))
+                            )
+                            self.assertTrue((root / Path(*parts)).with_suffix(".py").is_file(), reader)
         self.assertEqual([name for name, flag in fpgs_flags.FLAGS.items() if flag.kind == "retired"], [])
 
     def test_solver_declarations_are_in_name_order(self):
@@ -510,7 +523,6 @@ class TestSelectionEnvironment(unittest.TestCase):
         flags = {
             # Invalid on their own: an explicit argument replaces them before validation.
             "NEWTON_NARROW_PHASE_COHERENT_CONVEX": "not_a_mode",
-            "NEWTON_NARROW_PHASE_CONVEX_CELLS": "maybe",
             "NEWTON_REDUCER_COMPACT_EXPORT": "1",
             "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
         }
@@ -522,7 +534,6 @@ class TestSelectionEnvironment(unittest.TestCase):
             selected["environment"]["overridden"],
             {
                 "NEWTON_NARROW_PHASE_COHERENT_CONVEX": "not_a_mode",
-                "NEWTON_NARROW_PHASE_CONVEX_CELLS": "maybe",
                 "NEWTON_REDUCER_COMPACT_EXPORT": "1",
             },
         )

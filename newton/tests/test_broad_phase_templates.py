@@ -300,7 +300,10 @@ def test_layout_shapes_match_flat_kernel(test, device):
 
 
 def test_static_pairs_filtered_without_body_flags(test, device):
-    """Drop static-static pairs when shape bodies are given without body flags, as the flat kernel does."""
+    """Drop static-static pairs when shape bodies are given without body flags, as the flat kernel does.
+
+    The flat kernel drops them with and without static-kinematic pairs.
+    """
     record, shape_count = _synthetic(11, worlds=6, world_shapes=20, template_specs=((3, 60), (2, 30)), global_pairs=3)
     pairs = wp.array(record.replay(), dtype=wp.vec2i, device=device)
     layout = BroadPhaseExplicitTemplates(record, device=device)
@@ -314,11 +317,8 @@ def test_static_pairs_filtered_without_body_flags(test, device):
     for include in (True, False):
         with test.subTest(include=include):
             flat, template = _launch_both(pairs, layout, lower, upper, shape_body=shape_body, include=include)
-            if include:
-                test.assertEqual(flat[1], pairs.shape[0])
-            else:
-                # Not vacuous: the static-static rule drops pairs without body flags.
-                test.assertLess(flat[1], pairs.shape[0])
+            # Not vacuous: the static-static rule drops pairs without body flags.
+            test.assertLess(flat[1], pairs.shape[0])
             _assert_same_candidates(test, device, flat, template, pairs.shape[0])
 
 
@@ -427,9 +427,12 @@ def _replicated_builder(worlds=11, *, global_pair=True, residual=True, mixed=Tru
 
 
 def _finalize(builder, device):
+    """Finalize and build the explicit pair list, which records its world templates."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
-        return builder.finalize(device=device)
+        model = builder.finalize(device=device)
+    _ = model.shape_contact_pairs
+    return model
 
 
 class TestShapePairTemplateRecord(unittest.TestCase):
@@ -457,8 +460,8 @@ class TestShapePairTemplateRecord(unittest.TestCase):
                 self.assertEqual(_global_second_count(record) > 0, order != "first")
         model = _finalize(_replicated_builder(), "cpu")
         record = model._shape_contact_pair_templates
-        # Robot, variant, filtered and pair-free worlds use four templates.
-        self.assertEqual(len(record.templates), 4)
+        # Robot, variant and filtered worlds use three templates; pair-free worlds replay nothing.
+        self.assertEqual(len(record.templates), 3)
         self.assertGreater(len(record.runs), len(record.templates))
 
     def test_replicate_uses_one_template(self):
@@ -474,17 +477,14 @@ class TestShapePairTemplateRecord(unittest.TestCase):
         np.testing.assert_array_equal(record.replay(), model.shape_contact_pairs.numpy())
 
     def test_general_pair_lists_drop_the_record(self):
-        """Keep no record for lists the builder does not replay from templates."""
-        builder = _replicated_builder()
-        # The public list form of the filters disables the template path.
-        builder.shape_collision_filter_pairs.append((0, builder.first_shape[2]))
-        self.assertIsNone(_finalize(builder, "cpu")._shape_contact_pair_templates)
-
-        builder = _replicated_builder()
-        model = _finalize(builder, "cpu")
+        """Keep no record before the list is built or after it is replaced."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            model = _replicated_builder().finalize(device="cpu")
+        self.assertIsNone(model._shape_contact_pair_templates)
+        pairs = model.shape_contact_pairs
         self.assertIsNotNone(model._shape_contact_pair_templates)
-        with self.assertWarns(DeprecationWarning):
-            builder.find_shape_contact_pairs(model)
+        model.shape_contact_pairs = wp.clone(pairs)
         self.assertIsNone(model._shape_contact_pair_templates)
 
     def test_record_identity_is_the_bound_array(self):
@@ -732,7 +732,7 @@ class TestBroadPhaseTemplateSelection(unittest.TestCase):
             "user pairs": ("1", {"shape_pairs_filtered": wp.clone(model.shape_contact_pairs)}, "not the model-built"),
             "speculative": (
                 "1",
-                {"speculative_config": newton.CollisionPipeline.SpeculativeContactConfig()},
+                {"speculative_contact_gap_max": 0.1},
                 "Speculative",
             ),
         }
@@ -846,10 +846,10 @@ class TestBroadPhaseTemplateSelection(unittest.TestCase):
         self.assertIn("no longer match", record["reason"])
 
     def test_general_list_keeps_the_flat_kernel(self):
-        """Keep the flat kernel for a list without world templates."""
-        builder = _replicated_builder()
-        builder.shape_collision_filter_pairs.append((0, builder.first_shape[2]))
-        record = _kernel_record(_pipeline(_finalize(builder, "cpu"), "1"))
+        """Keep the flat kernel for an assigned list, which has no world templates."""
+        model = _finalize(_replicated_builder(), "cpu")
+        model.shape_contact_pairs = wp.clone(model.shape_contact_pairs)
+        record = _kernel_record(_pipeline(model, "1"))
         self.assertEqual(record["kernel"], "flat_pairs")
         self.assertIn("not the model-built", record["reason"])
 

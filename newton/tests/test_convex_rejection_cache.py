@@ -24,7 +24,7 @@ from newton._src.geometry.support_function import GenericShapeData, pack_mesh_pt
 from newton._src.geometry.types import GeoType
 from newton._src.sim.collide import (
     _SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD,
-    _compute_generic_convex_pair_work_estimate,
+    _compute_generic_convex_pair_stats,
 )
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -264,12 +264,13 @@ def test_pipeline_world_epoch_reset(test, device):
     builder.add_world(world)
     builder.add_world(world, xform=wp.transform(wp.vec3(2.0, 0.0, 0.0)))
     model = builder.finalize(device=device)
-    estimate = _compute_generic_convex_pair_work_estimate(
+    has_generic, estimate = _compute_generic_convex_pair_stats(
         model,
         broad_phase_mode="explicit",
         shape_pairs_filtered=model.shape_contact_pairs,
         candidate_pair_work_estimate=model.shape_contact_pairs.shape[0],
     )
+    test.assertTrue(has_generic)
     test.assertEqual(estimate, 28_056)
     test.assertGreaterEqual(estimate, _SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD)
     with patch.dict(

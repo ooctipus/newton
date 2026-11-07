@@ -5,7 +5,6 @@
 
 import importlib.util
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -42,7 +41,7 @@ class TestClutterHardware(unittest.TestCase):
         """Verify a filled movable bin with disjoint initial pieces and shared meshes."""
         from newton.examples.robot._clutter_hardware import build_hardware  # noqa: PLC0415
 
-        with wp.ScopedDevice("cpu"), patch.object(newton, "use_coord_layout_targets", True):
+        with wp.ScopedDevice("cpu"):
             builder = newton.ModelBuilder()
             scene = build_hardware(builder)
             model = builder.finalize()
