@@ -308,24 +308,12 @@ def _record(width: int | str, row: str) -> str:
 
 
 def contact_units(sweep: SparseSweep, rows: StagedRows, op: SparseFactor, laws: RowLaws, pad: str) -> tuple[str, str]:
-    """The contact unit on the triplet's Gram block (:func:`.sweep.contact_unit`): its setup (linked: the rings'
-    records), and its visit of row ``i``.
-
-    A contact normal followed by its two tangents in the staged metadata loads in one group: the three rows'
-    entries (every stored entry, then masked by its coordinate), the triplet's block record (``contact_records``:
-    the Gram couplings ``W_nt1, W_nt2, W_t1t2``, ``1/W_nn`` and the pair's eigenvalues and eigenbasis) and its
-    friction coefficient; one reduction gives the three rows' velocity terms. The rows then run the
-    row law (:class:`.sweep.UnitZ`): the normal steps with the record's ``1/W_nn``, the pair solves at the new load from
-    the record's metric, its residuals moved by the normal change through ``W_nt`` (in exact arithmetic the sequential
-    sweep); each coordinate takes the sum of the normal's, the first tangent's and the second tangent's changes, added
-    once. With ``linked`` a pass at entry stores each anchor's other ring members, at most three, behind
-    its record in the order the pair update pools them (-1: a longer ring, which keeps the walk). A row the guards
-    decline keeps the row step (:func:`.sweep.row_step`).
-
-    Under contact torsion a contact with a spin row is a friction triple, its pair staged as spin rows
-    (:class:`.sweep.StagedRows`): the guards decline it, its normal takes the row step and the triple phase its pair
-    and spin row (:func:`triple_phase`). With ``linked`` the entry pass stores a triple's ring members too, which its
-    visit pools.
+    """The contact unit (:func:`.sweep.unit_visit`) on the triplet's block record (``contact_records``: the Gram
+    couplings ``W_nt1, W_nt2, W_t1t2``, ``1/W_nn``, by which the normal steps, and the pair's eigenvalues and
+    eigenbasis): its setup and its visit of row ``i``. With ``linked`` a pass at entry stores each anchor's other ring
+    members, at most three, behind its record in the order the pair update pools them (-1: a longer ring, which keeps
+    the walk). Under contact torsion a friction triple (its pair staged as spin rows) is declined: its normal takes the
+    row step and the triple phase its pair and spin row (:func:`triple_phase`).
     """
     width = CONTACT_RECORD_FLOATS + (CONTACT_RING_FLOATS if sweep.linked_rows else 0)
     pair_rows = f"s_type[normal + 1] != {ROW_FRICTION} || s_type[normal + 2] != {ROW_FRICTION}"

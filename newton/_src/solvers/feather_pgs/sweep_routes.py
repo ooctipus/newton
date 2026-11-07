@@ -512,10 +512,8 @@ const float mf_diag = __int_as_float(meta.y);"""
 
 
 def dense_units(dense: WorldRows, op: SparseFactor, laws: RowLaws, *, active: bool, pad: str) -> str:
-    """The contact unit on the dense rows (:func:`.sweep.unit_visit`): a contact normal and its friction pair on their
-    Gram block, their couplings from the unit's own reduction, the normal by its stored diagonal, the pair at the
-    normal's new load (its patch ring walked from it). A friction triple (the contact's spin row after the pair,
-    :meth:`.sweep.WorldRows.spin_of`) is declined: the row step solves it."""
+    """The contact unit on the dense rows (:func:`.sweep.unit_visit`), its couplings its own reduction's; a friction
+    triple declined (the row step solves it)."""
     ctx = RowContext(
         row="i",
         kind="row_type",
@@ -665,8 +663,7 @@ def mf_gs_staging(
 ) -> Staging:
     """The shared working set of a world's matrix-free sweep block (:func:`mf_gs_source` declares it): the world's
     velocity, its dense rows' impulses and staged metadata, the free bodies' run's impulses (``free_rows``) unless they
-    stream, ``colored`` the colors' staged offsets (and its trace's warp maxima), and ``active_rows`` the active
-    enumeration's bitsets (:func:`.sweep.active_words`)."""
+    stream, ``colored`` the colors' staged offsets (and its trace's warp maxima), ``active_rows`` the active bitsets."""
     dense = WorldRows(max_constraints, staging=places.staging, stream=places.dense_impulses is Place.GLOBAL)
     free = WorldRows(
         mf_max_constraints, staging="record", free=True, stream=places.impulses is Place.GLOBAL or not free_rows

@@ -349,8 +349,7 @@ class RowStore(Protocol):
     def ring_load(self, parent: str, load: str | None = None) -> str:
         """The pooled normal load of the patch ring of normal row ``parent``, from ``load`` (its impulse)."""
 
-    def ring_any(self, first: str, predicate: str) -> str:
-        """Whether ``predicate(row)`` holds for a normal of the patch ring that row ``first``'s parent word links."""
+    def ring_any(self, first: str, predicate: str) -> str: ...
 
     def spin_of(self, parent: str, end: str) -> str:
         """The spin row of the contact whose normal is row ``parent``, of rows ``[0, end)`` (:func:`spin_row`)."""
@@ -1391,7 +1390,6 @@ _UNIT_GRAM_SUMS = (
     ("gram_n2", "normal", "sibling"),
     ("unit_cross", "tangent", "sibling"),
 )
-"""The Gram couplings a contact unit's own reduction gives where no record holds them (:func:`unit_visit`)."""
 
 
 def unit_visit(
@@ -1407,17 +1405,11 @@ def unit_visit(
     record: tuple[str, str] = ("", ""),
     pad: str,
 ) -> str:
-    """A contact unit's visit of row ``i`` in a row loop over ``count`` rows (:func:`contact_unit`), which consumes its
-    pair's first tangent (``consumed_tangent``): a contact normal followed by its two tangents in the store's metadata,
-    with a positive diagonal (with ``active``, the first tangent selected too, :func:`active_scan`), and the placement's
-    own ``guard`` (its loads after the unit's head, and its condition).
-
-    The three rows share their support, so one load group gathers their entries and one reduction gives their
-    velocity terms (``unit_jv0..2``), the rows' staged values held in registers (:data:`UNIT_HELD`); the unit's Gram
-    couplings and pair metric come from a ``record`` (its loads before the friction coefficient ``mu``, and its
-    couplings and metric after the reduction: the native sparse sweep's writer's), or, without one, from the same
-    reduction (``gram_n1``, ``gram_n2``, ``unit_cross``: the pair's law forms its metric from them as the pair's
-    visit does). The rows run the row law in ``ctx`` (its operator :class:`UnitZ`), and their changes apply once.
+    """A contact unit's visit of row ``i`` of a row loop over ``count`` rows (:func:`contact_unit`): a contact normal
+    and its two tangents (``active``: the first tangent selected too) past the placement's ``guard`` (its loads, its
+    condition), one load group and one reduction of their terms, their staged values held, one apply; it consumes the
+    pair (``consumed_tangent``). The Gram couplings and pair metric are a ``record``'s (its loads, then its couplings
+    after the reduction), else the same reduction's (``gram_n1``, ``gram_n2``, ``unit_cross``).
     """
     unit_rows = {"normal": "i", "tangent": "tangent", "sibling": "sibling"}
     loads, after = record
@@ -1551,7 +1543,6 @@ class SelectedRows:
 
 
 ACTIVE_WORDS = ("s_normal_words", "s_selected_words")
-"""The active enumeration's bitsets (:func:`active_scan`): the normal and limit rows selected, then every row."""
 
 
 def active_words(capacity: int) -> tuple[Buffer, ...]:
@@ -1585,15 +1576,11 @@ def active_scan(
     spin: Callable[[str], str] | None = None,
     pad: str,
 ) -> str:
-    """The active enumeration's scan at a sweep's entry: select the rows the sweep visits, one lane per row, into the
-    bitsets ``s_normal_words`` and ``s_selected_words`` (:func:`active_words`), which :class:`SelectedRows` pops.
-
-    A contact normal or joint limit is selected when it holds impulse or its residual at sweep entry is negative (or
-    not finite), every other non-friction row always. A first tangent is selected while its normal is selected or its
-    pair (with ``spin``, its contact's spin row, :meth:`RowStore.spin_of`, too) holds impulse, a patch pair
-    (``linked``) while any normal of its ring is. A row a sweep's earlier updates violate waits for the next sweep.
-    Spin rows (``torsion``) are never selected: their pair's visit solves them, or a triple phase. The velocity is zero
-    at the first sweep unless the sweep was ``seeded``.
+    """The active enumeration's scan at a sweep's entry into the bitsets :data:`ACTIVE_WORDS`, one lane per row: a
+    contact normal or joint limit holding impulse or violated (or not finite), every other non-friction row; a first
+    tangent while its normal is selected or its pair (``spin``: its spin row too) holds impulse, a patch pair
+    (``linked``) while any normal of its ring is. A row a sweep's earlier updates violate waits for the next sweep; spin
+    rows (``torsion``) never. The velocity is zero at the first sweep unless ``seeded``.
     """
     held = f"{rows.peek('parent + 2')} != 0.0f"
     spun = ""
@@ -2022,8 +2009,8 @@ def rows_block(
     only ever reads its own stores.
 
     With ``metric`` (the law :func:`friction_metric_law` declared) every friction triple forms its metric once per
-    launch, at its first loaded visit (:func:`friction_metric_stage`). With ``selected`` the dense rows' enumeration
-    is the active one (:class:`SelectedRows`, after :func:`active_scan`): a selected row's record loads at its visit.
+    launch, at its first loaded visit (:func:`friction_metric_stage`). ``selected``: the active enumeration's rows
+    (:class:`SelectedRows`), each record loaded at its visit; ``unit``: a contact unit's visit (:func:`unit_visit`).
     """
     inner = pad + "    "
     if end is None:
@@ -3057,8 +3044,7 @@ class SweepConfig:
         material: Material contacts step by their compliance's weights (they are weighted).
         torsion: Spin rows may follow friction pairs.
         levels: The law of the configuration's leveled rows (:class:`LevelLaw`).
-        active_rows: The enumeration of its Gauss-Seidel rows: every row in slot order, or the rows selected at
-            sweep entry (:func:`active_scan`, :class:`SelectedRows`).
+        active_rows: The enumeration: every row in slot order, or those selected at sweep entry (:func:`active_scan`).
     """
 
     solve_policy: SolvePolicy = DEFAULT_POLICY
