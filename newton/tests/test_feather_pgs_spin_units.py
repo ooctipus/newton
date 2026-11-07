@@ -19,12 +19,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import sweep_routes_local
-from newton._src.solvers.feather_pgs.row_kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_FRICTION,
-    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
-    PGS_CONSTRAINT_TYPE_TORSION,
-)
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_TORSION
 from newton._src.solvers.feather_pgs.sweep import FRICTION_METRIC_FLOATS, sweep_kernel
 from newton.tests.feather_pgs_law_harness import diagonal_walk, leave_walk, row_lines
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices
@@ -39,12 +34,12 @@ def _fixture(rng):
     """Random worlds of a joint-limit prefix row and ``CONTACTS`` contact quads (normal, tangents, spin) over the
     factor rows ``Z`` (identity factors, so the rows are the Jacobians), with friction and torsional coefficients over
     a decade and start impulses some of which lie outside their cones."""
-    types = [PGS_CONSTRAINT_TYPE_JOINT_LIMIT]
+    types = [ROW_JOINT_LIMIT]
     parents = [-1]
     for contact in range(CONTACTS):
         head = 1 + 4 * contact
-        types += [PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION]
-        types.append(PGS_CONSTRAINT_TYPE_TORSION)
+        types += [ROW_CONTACT, ROW_FRICTION, ROW_FRICTION]
+        types.append(ROW_TORSION)
         parents += [-1, head, head, head]
     rows = rng.normal(size=(WORLDS, CAPACITY, DOFS)).astype(np.float32)
     mu = np.zeros((WORLDS, CAPACITY), np.float32)

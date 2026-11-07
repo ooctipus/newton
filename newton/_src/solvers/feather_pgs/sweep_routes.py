@@ -22,6 +22,7 @@ from .kernel_template import Dispatch
 from .packed_rows import PACKED_SIDES, RECORD_SIDES
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
+from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_VELOCITY_LIMIT, ROW_SPEED
 from .row_metadata import (
     _validate_dense_metadata_encoding,
     _validate_mf_metadata_encoding,
@@ -30,11 +31,7 @@ from .row_metadata import (
 )
 from .solve_policy import QUIET_LITERAL, block_argmax, sweep_exit
 from .sweep import (
-    CONTACT,
-    FRICTION,
     ITERATION,
-    SPEED,
-    VELOCITY_LIMIT,
     Diagonal,
     RowContext,
     RowLaws,
@@ -57,9 +54,9 @@ from .sweep import (
 )
 
 # The row loops leave the velocity-limit and speed rows to the passes at the end of every sweep (the last word).
-_DENSE_ADMISSION = f"if (row_type == {VELOCITY_LIMIT}) continue;"
-_LINE_ADMISSION = f"if (row_type == {VELOCITY_LIMIT} || row_type == {SPEED}) continue;"
-_MF_ADMISSION = f"if (mf_rt == {SPEED}) continue;"
+_DENSE_ADMISSION = f"if (row_type == {ROW_JOINT_VELOCITY_LIMIT}) continue;"
+_LINE_ADMISSION = f"if (row_type == {ROW_JOINT_VELOCITY_LIMIT} || row_type == {ROW_SPEED}) continue;"
+_MF_ADMISSION = f"if (mf_rt == {ROW_SPEED}) continue;"
 
 
 def worlds() -> kernel_template.Dispatch:
@@ -454,7 +451,7 @@ def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str
         parent="parent",
         ring_load=ring_load,
         lanes=Lanes(1),
-        contact_kinds=(CONTACT,),
+        contact_kinds=(ROW_CONTACT,),
         pair_law="FRICTION_PAIR_CACHED(p, ",
         triple_law="FRICTION_TRIPLE_CACHED(p, ",
     )
@@ -497,7 +494,7 @@ meta.z = W[r * 3 + 1];
 meta.w = W[r * 3 + 2];
 const int packed_tp = meta.w;
 // The unit builder's rows: a contact, then its friction pair (each copy knows its kind).
-const int mf_rt = r == 0 ? {CONTACT} : {FRICTION};
+const int mf_rt = r == 0 ? {ROW_CONTACT} : {ROW_FRICTION};
 const float mf_diag = __int_as_float(meta.y);"""
     unit = contact_unit(
         unit_ctx,
@@ -830,7 +827,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
                     free.kind("i"),
                     free_op.axpy((("row", "seed"),), "        ", row="i"),
                     row_lanes.sync(),
-                    skip=SPEED,
+                    skip=ROW_SPEED,
                     declare=(
                         *free.visit("i").split("\n"),
                         "const int packed_dofs = rec_a.x;",

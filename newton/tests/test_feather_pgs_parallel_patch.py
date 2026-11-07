@@ -38,12 +38,12 @@ from newton._src.solvers.feather_pgs.forest_plan import ClassShape
 from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.placement import Placement
-from newton._src.solvers.feather_pgs.row_kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_FRICTION,
-    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
-    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
-    PGS_CONSTRAINT_TYPE_TORSION,
+from newton._src.solvers.feather_pgs.row_laws import (
+    ROW_CONTACT,
+    ROW_FRICTION,
+    ROW_JOINT_LIMIT,
+    ROW_JOINT_VELOCITY_LIMIT,
+    ROW_TORSION,
 )
 from newton._src.solvers.feather_pgs.row_records import DenseRows
 from newton._src.solvers.feather_pgs.rows import RowLaws, velocity_prescale_launch
@@ -237,7 +237,7 @@ def parallel_sweep_reference(
             t, y = 1.0, x.copy()
     if velocity_limit_pass:
         x = x.copy()
-        for row in np.flatnonzero((kinds == 0) & (case["types"] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)):
+        for row in np.flatnonzero((kinds == 0) & (case["types"] == ROW_JOINT_VELOCITY_LIMIT)):
             residual = b[row] + A[row] @ x
             if residual < 0.0 and diag[row] > 0.0:
                 x[row] -= residual / diag[row]
@@ -257,13 +257,13 @@ def _box_contact_rows(rng, ring_base, *, linked):
 
     def contact(point, tangents, mu):
         first = ring_base + len(rows)
-        rows.append((up, point, 0, PGS_CONSTRAINT_TYPE_CONTACT, -1, 0.9))
+        rows.append((up, point, 0, ROW_CONTACT, -1, 0.9))
         if tangents:
             for direction in (x_axis, y_axis):
-                rows.append((direction, point, 1, PGS_CONSTRAINT_TYPE_FRICTION, first, mu))
+                rows.append((direction, point, 1, ROW_FRICTION, first, mu))
         return first
 
-    rows.append((None, None, 0, PGS_CONSTRAINT_TYPE_JOINT_LIMIT, -1, 0.0))
+    rows.append((None, None, 0, ROW_JOINT_LIMIT, -1, 0.0))
     corners = [
         np.array((sx * 0.1, sy * 0.08, -0.05)) + rng.normal(0.0, 0.004, 3)
         for sx, sy in itertools.product((-1, 1), repeat=2)
@@ -283,7 +283,7 @@ def _box_contact_rows(rng, ring_base, *, linked):
         for k, normal in enumerate(patch):
             parents[normal - ring_base] = patch[(k + 1) % len(patch)]
         parents[single - ring_base] = single
-    rhs = np.where(types == PGS_CONSTRAINT_TYPE_CONTACT, rng.uniform(-0.02, 0.0, len(rows)), 0.0)
+    rhs = np.where(types == ROW_CONTACT, rng.uniform(-0.02, 0.0, len(rows)), 0.0)
     rhs[0] = -0.05
     return directions, points, kinds, types, parents, mu, rhs
 
@@ -320,7 +320,7 @@ def parallel_case(seed, *, faces=1, linked=True, warm=False):
     count = len(J)
     impulses = np.zeros(count)
     if warm:
-        impulses = np.where(np.array(types) == PGS_CONSTRAINT_TYPE_FRICTION, rng.uniform(-0.01, 0.01, count), 0.02)
+        impulses = np.where(np.array(types) == ROW_FRICTION, rng.uniform(-0.01, 0.01, count), 0.02)
     Y = np.linalg.solve(H, J.T).T
     cfm = 1.0e-5
     return {
@@ -352,7 +352,7 @@ def spread_rows(case, seed):
     blocks, row = [], 0
     while row < len(types):
         size = 1
-        while row + size < len(types) and types[row + size] == PGS_CONSTRAINT_TYPE_FRICTION:
+        while row + size < len(types) and types[row + size] == ROW_FRICTION:
             size += 1
         blocks.append(np.arange(row, row + size))
         row += size
@@ -392,7 +392,7 @@ def sliding_pair_case(*, masses=(4.0, 1.0), sliding=(1.0, 1.0), live_tangents=2)
         "cfm": cfm,
         "diag": np.einsum("ij,ij->i", J, Y) + cfm,
         "kinds": np.array((0, 1, 1), np.int32),
-        "types": np.array((PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION)),
+        "types": np.array((ROW_CONTACT, ROW_FRICTION, ROW_FRICTION)),
         "parents": np.array((0, 0, 0), np.int32),
         "mu": np.array((0.0, 0.5, 0.5)),
         "rhs": np.zeros(3),
@@ -424,7 +424,7 @@ def limited_contact_case(limit=0.5):
         "cfm": cfm,
         "diag": np.einsum("ij,ij->i", J, Y) + cfm,
         "kinds": np.array((0, 0), np.int32),
-        "types": np.array((PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT), np.int32),
+        "types": np.array((ROW_CONTACT, ROW_JOINT_VELOCITY_LIMIT), np.int32),
         "parents": np.array((-1, -1), np.int32),
         "mu": np.zeros(2),
         "rhs": np.array((0.0, limit)),
@@ -460,11 +460,11 @@ def world_case(solver, world=0):
     unmodelled = sorted(
         set(types.tolist())
         - {
-            PGS_CONSTRAINT_TYPE_CONTACT,
-            PGS_CONSTRAINT_TYPE_FRICTION,
-            PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
-            PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
-            PGS_CONSTRAINT_TYPE_TORSION,
+            ROW_CONTACT,
+            ROW_FRICTION,
+            ROW_JOINT_LIMIT,
+            ROW_JOINT_VELOCITY_LIMIT,
+            ROW_TORSION,
         }
     )
     if unmodelled:
@@ -486,9 +486,7 @@ def world_case(solver, world=0):
         "L": None,
         "cfm": cfm,
         "diag": np.einsum("ij,ij->i", J, Y) + cfm,
-        "kinds": np.where(np.isin(types, (PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION)), 1, 0).astype(
-            np.int32
-        ),
+        "kinds": np.where(np.isin(types, (ROW_FRICTION, ROW_TORSION)), 1, 0).astype(np.int32),
         "types": types,
         "parents": solver.placement.row_parent.numpy()[world, :count].astype(np.int32),
         "mu": solver.placement.row_mu.numpy()[world, :count].astype(np.float64),
@@ -543,9 +541,7 @@ def with_velocity_limit_rows(case, mass_matrix, limits, cfm):
     limited["cfm"] = np.concatenate((np.broadcast_to(case["cfm"], len(case["J"])), np.full(count, cfm)))
     limited["diag"] = np.einsum("ij,ij->i", limited["J"], limited["Y"]) + limited["cfm"]
     limited["kinds"] = np.concatenate((case["kinds"], np.zeros(count, np.int32)))
-    limited["types"] = np.concatenate(
-        (case["types"], np.full(count, PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT, np.int32))
-    )
+    limited["types"] = np.concatenate((case["types"], np.full(count, ROW_JOINT_VELOCITY_LIMIT, np.int32)))
     limited["parents"] = np.concatenate((case["parents"], np.full(count, -1, np.int32)))
     limited["mu"] = np.concatenate((case["mu"], np.zeros(count)))
     limited["rhs"] = np.concatenate((case["rhs"], np.repeat(np.asarray(limits, np.float64), 2)))
@@ -571,7 +567,7 @@ def ring_rows(parents, normal):
 def assert_pooled_coulomb(test, case, impulses, *, linked, atol=1.0e-6):
     """Bound every tangent pair by its coefficient times its ring's (or its own) normal impulse."""
     pairs = 0
-    for row in np.flatnonzero(case["types"] == PGS_CONSTRAINT_TYPE_FRICTION):
+    for row in np.flatnonzero(case["types"] == ROW_FRICTION):
         parent = int(case["parents"][row])
         if row != parent + 1:
             continue
@@ -680,14 +676,14 @@ class TestParallelPatchReference(unittest.TestCase):
         parents = spread["parents"]
         rings = {
             tuple(sorted(ring_rows(parents, int(n))))
-            for n in np.flatnonzero(spread["types"] == PGS_CONSTRAINT_TYPE_CONTACT)
+            for n in np.flatnonzero(spread["types"] == ROW_CONTACT)
             if parents[n] >= 0 and parents[n] != n
         }
         self.assertEqual(len(rings), 3)
         self.assertTrue(all(min(ring) < 32 <= max(ring) for ring in rings), rings)
         crossing = [
             row
-            for row in np.flatnonzero(spread["types"] == PGS_CONSTRAINT_TYPE_FRICTION)
+            for row in np.flatnonzero(spread["types"] == ROW_FRICTION)
             if row == parents[row] + 1
             and any((member >= 32) != (row >= 32) for member in ring_rows(parents, int(parents[row])))
         ]
@@ -1221,11 +1217,11 @@ class TestTierSweeps(unittest.TestCase):
         # Fourteen contact rows: two patch rings of four normals, each ring with one anchor (a pair and a spin row).
         rings = {
             tuple(sorted(ring_rows(case["parents"], int(normal))))
-            for normal in np.flatnonzero(case["types"] == PGS_CONSTRAINT_TYPE_CONTACT)
+            for normal in np.flatnonzero(case["types"] == ROW_CONTACT)
         }
         self.assertEqual(sorted(len(ring) for ring in rings), [4, 4])
-        self.assertEqual(int(np.count_nonzero(case["types"] == PGS_CONSTRAINT_TYPE_FRICTION)), 4)
-        self.assertEqual(int(np.count_nonzero(case["types"] == PGS_CONSTRAINT_TYPE_TORSION)), 2)
+        self.assertEqual(int(np.count_nonzero(case["types"] == ROW_FRICTION)), 4)
+        self.assertEqual(int(np.count_nonzero(case["types"] == ROW_TORSION)), 2)
         self.assertEqual(len(case["types"]), 14)
         options = {"matrix_free": True, "inkernel": False, "exact": False, "nesterov": True, "tol": 0.0, "linked": True}
         gaps = {}
@@ -1735,7 +1731,7 @@ def _friction_pairs(solver, world):
     parents = solver.placement.row_parent.numpy()[world, :count]
     mu, impulses = solver.placement.row_mu.numpy()[world, :count], solver.placement.impulses.numpy()[world, :count]
     pairs = []
-    for row in np.flatnonzero(kinds == PGS_CONSTRAINT_TYPE_FRICTION):
+    for row in np.flatnonzero(kinds == ROW_FRICTION):
         parent = int(parents[row])
         if row == parent + 1:
             budget = float(mu[row]) * ring_load(parents, impulses.astype(np.float64), parent)

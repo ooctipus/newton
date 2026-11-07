@@ -59,7 +59,7 @@ from newton._src.solvers.feather_pgs.factor.walk import (
 )
 from newton._src.solvers.feather_pgs.kernel_template import KernelTemplate, items, params
 from newton._src.solvers.feather_pgs.placement import Placement
-from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
+from newton._src.solvers.feather_pgs.row_laws import ROW_SPEED
 from newton._src.solvers.feather_pgs.tree_factor import prepare_augmented_drives
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_plan import UP_FIRST, UP_SUMS, TreePlan, local_parents
@@ -950,7 +950,7 @@ def check_rows(solver, joint_q: np.ndarray, capture: Capture, rng) -> RowCheck:
             line = int(capture.dense_first[world])
             for row in range(int(count)):
                 lam = capture.impulses[line, row]
-                if kinds_line[line, row] == PGS_CONSTRAINT_TYPE_SPEED:
+                if kinds_line[line, row] == ROW_SPEED:
                     # A speed row of the line: its speed ball's law, not a row (as the free bodies' run's below).
                     ball[world] |= lam != 0.0
                     continue
@@ -969,7 +969,7 @@ def check_rows(solver, joint_q: np.ndarray, capture: Capture, rng) -> RowCheck:
         for world, count in enumerate(counts):
             line = int(capture.mf_first[world])
             for row in range(int(count)):
-                if kinds[line, row] == PGS_CONSTRAINT_TYPE_SPEED:
+                if kinds[line, row] == ROW_SPEED:
                     # A free body's speed row is its speed ball's: a magnitude against the body's velocity as each
                     # visit finds it, a law and not a row, so its world's du is not sum Z lambda.
                     ball[world] |= lam[line, row] != 0.0

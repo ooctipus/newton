@@ -10,7 +10,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import field_group
-from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT
 from newton._src.solvers.feather_pgs.row_records import DenseRows
 from newton.tests.feather_pgs_free_body_rows import sweep_free_body_rows
 from newton.tests.feather_pgs_law_harness import bias_rows, row_bias, row_lines
@@ -82,7 +82,7 @@ def _solve_rows(device, n_rows, g, iterations=300):
         device,
         Z,
         np.full(n_rows, -1.0),
-        np.full(n_rows, PGS_CONSTRAINT_TYPE_CONTACT),
+        np.full(n_rows, ROW_CONTACT),
         np.full(n_rows, -1),
         np.zeros(n_rows),
         weights=np.full(n_rows, 1.0 / (1.0 + g)),
@@ -291,7 +291,7 @@ def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
             device,
             phi=[[0.0]],
             row_beta=[[0.2]],
-            row_type=[[PGS_CONSTRAINT_TYPE_CONTACT]],
+            row_type=[[ROW_CONTACT]],
             target=[[0.0]],
             restitution=[[0.0]],
             rhs=[[0.0]],

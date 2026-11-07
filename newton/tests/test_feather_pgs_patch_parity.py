@@ -13,11 +13,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.friction_patches import link_patch_routes
-from newton._src.solvers.feather_pgs.row_kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_FRICTION,
-    PGS_CONSTRAINT_TYPE_TORSION,
-)
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION, ROW_TORSION
 from newton._src.solvers.feather_pgs.row_metadata import record_views
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_sparse_scene as sparse_scene
@@ -78,7 +74,7 @@ def _ring_pool_dropped(solver):
         if kernel is link_patch_routes:
             placement = solver.placement
             kinds, parents = placement.row_type.numpy(), placement.row_parent.numpy()
-            normals = kinds == PGS_CONSTRAINT_TYPE_CONTACT
+            normals = kinds == ROW_CONTACT
             parents[normals] = -1
             placement.row_parent.assign(parents)
             if placement.writes_records:
@@ -153,14 +149,14 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
                 step()
             # A free body is a one-node tree: its contacts are rows of the line (route 0).
             rows = contact_rows(solver, contacts, route=0)
-        normals = [c for c, record in rows.items() if record["types"][0] == PGS_CONSTRAINT_TYPE_CONTACT]
+        normals = [c for c, record in rows.items() if record["types"][0] == ROW_CONTACT]
         anchors = [c for c, record in rows.items() if len(record["types"]) >= 3]
         # A resting box face: four ring-linked normals, friction rows only on its one anchor, a pair and a spin row.
         self.assertEqual(len(normals), 4)
         self.assertEqual(len(anchors), 1)
         self.assertTrue(all(rows[c]["parents"][0] not in (-1, c) for c in normals))
         for c in anchors:
-            np.testing.assert_array_equal(rows[c]["types"][1:3], [PGS_CONSTRAINT_TYPE_FRICTION] * 2)
+            np.testing.assert_array_equal(rows[c]["types"][1:3], [ROW_FRICTION] * 2)
             np.testing.assert_array_equal(rows[c]["parents"][1:3], [c, c])
             self.assertGreater(rows[c]["patch"][0], 0.0)
         self.assertEqual(assert_ring_coulomb(solver, route=0), 1)
@@ -377,12 +373,12 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
                 sparse_scene.step(case)
         self.assertEqual(len(starts), 4)
         for impulses, types in starts:
-            friction = (types == PGS_CONSTRAINT_TYPE_FRICTION) | (types == PGS_CONSTRAINT_TYPE_TORSION)
+            friction = (types == ROW_FRICTION) | (types == ROW_TORSION)
             self.assertTrue(np.any(friction))
             np.testing.assert_array_equal(impulses[friction], 0.0)
         # The stance's normals carry from the second step on.
         for impulses, types in starts[1:]:
-            self.assertGreater(float(impulses[types == PGS_CONSTRAINT_TYPE_CONTACT].sum()), 0.0)
+            self.assertGreater(float(impulses[types == ROW_CONTACT].sum()), 0.0)
 
     def test_sparse_rows_must_carry_their_impulses(self):
         """Reject a factor delta without a seeded row's response, a stale incident and an undecoded velocity.

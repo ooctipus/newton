@@ -9,7 +9,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 
 GRAVITY = 9.81
@@ -91,7 +91,7 @@ class TestFeatherPGSSparseWarmstart(unittest.TestCase):
             rows = solver.placement.row_type.numpy()
             lam = solver.placement.impulses.numpy()
             for world in range(model.world_count):
-                active = rows[world, : counts[world]] == PGS_CONSTRAINT_TYPE_CONTACT
+                active = rows[world, : counts[world]] == ROW_CONTACT
                 impulse_sums[i, world] = lam[world, : counts[world]][active].sum()
         wp.synchronize_device(device)
         body_q = states[0].body_q.numpy()

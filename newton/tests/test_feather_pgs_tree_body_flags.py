@@ -20,10 +20,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import joint_table
 from newton._src.solvers.feather_pgs.held_tree import HeldTree, operator_metadata
-from newton._src.solvers.feather_pgs.row_kernels import (
-    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
-    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
-)
+from newton._src.solvers.feather_pgs.row_laws import ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT
 from newton._src.solvers.feather_pgs.tree_kinetic_plan import make_plan
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
@@ -569,15 +566,15 @@ class TestPrescribedCoordinateRows(unittest.TestCase):
                 states = [model.state(), model.state()]
                 states[0].joint_q.assign(np.full(3, 0.8, np.float32))
                 model.joint_velocity_limit.assign(np.full(3, 2.0, np.float32))
-                self.assertEqual(_rows_of_kind(solver, model, states, PGS_CONSTRAINT_TYPE_JOINT_LIMIT), 4)
+                self.assertEqual(_rows_of_kind(solver, model, states, ROW_JOINT_LIMIT), 4)
                 if velocity_limits:
-                    self.assertEqual(_rows_of_kind(solver, model, states, PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT), 4)
+                    self.assertEqual(_rows_of_kind(solver, model, states, ROW_JOINT_VELOCITY_LIMIT), 4)
                 model.joint_limit_lower.assign(np.asarray([-0.5, -0.5, -np.inf], np.float32))
                 model.joint_limit_upper.assign(np.asarray([0.5, 0.5, np.inf], np.float32))
                 model.joint_velocity_limit.assign(np.asarray([1.0, 1.0, 0.0], np.float32))
-                self.assertEqual(_rows_of_kind(solver, model, states, PGS_CONSTRAINT_TYPE_JOINT_LIMIT), 2)
+                self.assertEqual(_rows_of_kind(solver, model, states, ROW_JOINT_LIMIT), 2)
                 if velocity_limits:
-                    self.assertEqual(_rows_of_kind(solver, model, states, PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT), 2)
+                    self.assertEqual(_rows_of_kind(solver, model, states, ROW_JOINT_VELOCITY_LIMIT), 2)
 
 
 class TestTreePlanKinematicBodies(unittest.TestCase):

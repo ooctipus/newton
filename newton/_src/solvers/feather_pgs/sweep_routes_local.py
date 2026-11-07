@@ -23,10 +23,9 @@ from .factor.walk import WalkTrees
 from .kernel_template import Dispatch
 from .response_operator import Lanes, LaneVelocity, SparseFactor, Velocity
 from .row_inputs import RowArgument
+from .row_laws import ROW_FRICTION, ROW_TORSION
 from .sweep import (
-    FRICTION,
     ITERATION,
-    TORSION,
     UNIT_HELD,
     Diagonal,
     Pipelined,
@@ -282,10 +281,10 @@ def _paired_rows(rows: StagedRows, op: SparseFactor, laws: RowLaws, end: str, me
     """Rows ``[0, end)`` one at a time in slot order by the row step (:func:`.sweep.row_step`), velocity limits in
     place, each row's factor row pipelined; a friction pair at its first tangent, its sibling's factor row loaded with
     the pair."""
-    sibling = _hold(op, "sibling_z", "parent + 2", f"row_type == {FRICTION}") + "\n"
+    sibling = _hold(op, "sibling_z", "parent + 2", f"row_type == {ROW_FRICTION}") + "\n"
     if laws.torsion:
         # The pair's contact's spin row if it has one (the visit's ``spin``), solved with it (the friction triple).
-        sibling += _hold(op, "spin_z", "spin", f"row_type == {FRICTION} && spin >= 0") + "\n"
+        sibling += _hold(op, "spin_z", "spin", f"row_type == {ROW_FRICTION} && spin >= 0") + "\n"
     # A warp's lanes load each row's entries a row ahead; the one lane loads its row at the visit.
     prologue = f"float pre_z = {_load(op, '0')};" if op.lanes.parallel else ""
     order = Pipelined(end, lambda pad: f"{pad}{prologue}", lambda row, pad: _consume(op, row, end, pad))
@@ -325,9 +324,7 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
         sums, {"row": "head", "tangent1": "head + 1", "tangent2": "head + 2"}, "    ", magnitudes=("gram_n1", "gram_n2")
     )
     rows = dataclasses.replace(ctx, kind="unit_type", mu=lambda row: mu, inline_velocity_limit=False)
-    declare = (
-        f"const int i = head + r;\nconst int unit_type = r == 0 ? {kind} : {FRICTION};\nconst float denom = s_diag[i];"
-    )
+    declare = f"const int i = head + r;\nconst int unit_type = r == 0 ? {kind} : {ROW_FRICTION};\nconst float denom = s_diag[i];"
     # The unit is a normal and its pair: its rows' laws see no spin row.
     pair_laws = dataclasses.replace(laws, torsion=False)
     # The unit's ladder also reduces the pair's coupling and the rows' terms' magnitudes, so a moved tangent votes on a
@@ -387,7 +384,7 @@ def _pair_unit(ctx: RowContext, laws: RowLaws, mu: str, *, spin: str | None = No
     pair = dataclasses.replace(
         ctx,
         row="tangent1",
-        kind=str(FRICTION),
+        kind=str(ROW_FRICTION),
         operator=dataclasses.replace(
             op, factor=_registers(op.lanes, row="tangent1_z", sib="tangent2_z", spin="spin_z")
         ),
@@ -435,10 +432,10 @@ def _paired_units(ctx: RowContext, laws: RowLaws, end: str = "m") -> str:
     lines = [
         "    const int row_type = static_cast<int>(s_type[i]);",
         "    step = 1;",
-        *((f"    if (row_type == {TORSION}) continue;",) if laws.torsion else ()),
-        f"    if (row_type == {FRICTION}) continue;",
+        *((f"    if (row_type == {ROW_TORSION}) continue;",) if laws.torsion else ()),
+        f"    if (row_type == {ROW_FRICTION}) continue;",
         "    const int tangent1 = i + 1;",
-        f"    const bool owns_tangents = i + 2 < {end} && static_cast<int>(s_type[tangent1]) == {FRICTION}",
+        f"    const bool owns_tangents = i + 2 < {end} && static_cast<int>(s_type[tangent1]) == {ROW_FRICTION}",
         "        && world_row_parent.data[off + tangent1] == i;",
         "    if (!owns_tangents) {",
         indent(_unit_row(ctx, laws, "row_type"), "        "),

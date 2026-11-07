@@ -17,7 +17,7 @@ import warp as wp
 from newton._src.core.memory import Place
 from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.factor.walk import unpack_walk_records
-from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
+from newton._src.solvers.feather_pgs.row_laws import ROW_SPEED
 from newton._src.solvers.feather_pgs.row_metadata import HEADER_WORDS, record_layout
 from newton._src.solvers.feather_pgs.sweep import sweep_kernel
 from newton.tests.feather_pgs_law_harness import chain_walk, free_body_Z
@@ -48,9 +48,7 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
     jacobians = []
     for Z, arts in ((Z_a, sides[..., 0]), (Z_b, sides[..., 1])):
         J = Z.astype(np.float64).copy()
-        worlds, rows = np.nonzero(
-            (arts[:, : Z.shape[1]] >= 0) & (row_type[:, : Z.shape[1]] != PGS_CONSTRAINT_TYPE_SPEED)
-        )
+        worlds, rows = np.nonzero((arts[:, : Z.shape[1]] >= 0) & (row_type[:, : Z.shape[1]] != ROW_SPEED))
         for world, row in zip(worlds, rows, strict=True):
             J[world, row] = physical(arts[world, row], J[world, row])
         jacobians.append(J)

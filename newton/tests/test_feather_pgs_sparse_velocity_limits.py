@@ -12,9 +12,9 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import class_plan
-from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
-from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
-from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT as CONTACT
+from newton._src.solvers.feather_pgs.row_laws import ROW_FRICTION as FRICTION
+from newton._src.solvers.feather_pgs.row_laws import ROW_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
 from newton._src.solvers.feather_pgs.sweep import sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.solvers import SolverFeatherPGS

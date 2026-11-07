@@ -46,7 +46,7 @@ from . import kernel_template, sweep_levels
 from .device_preludes import SHARED_STORAGE, cuda_native, lane_group
 from .field_group import Field, FieldGroup
 from .kernel_template import KernelTemplate
-from .row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
+from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_TORSION
 from .row_metadata import HEADER_WORDS, _mf_parent_expression
 
 BUILD_WARPS = 8
@@ -545,13 +545,13 @@ def build_units_kernel(
     words = (dofs + 31) // 32
     body = _BUILD_SOURCE
     if torsion:
-        body = f"#define TORSION {int(PGS_CONSTRAINT_TYPE_TORSION)}\n" + body.replace(_UNIT_ROWS, _SPIN_UNIT_ROWS)
+        body = f"#define TORSION {int(ROW_TORSION)}\n" + body.replace(_UNIT_ROWS, _SPIN_UNIT_ROWS)
         body = body.replace("#endif", "#undef TORSION\n#endif")
     source = (
         f"#define MF_ROWS {mf_rows}\n#define HEADER_WORDS {HEADER_WORDS}\n#define UNITS {int(units)}\n#define MIN_UNITS {int(rule.min_units)}\n"
         f"#define WARPS {BUILD_WARPS}\n#define COLORED(N_UNITS, N_COLORS) {rule.condition('(N_UNITS)', '(N_COLORS)')}\n"
         f"#define THREADS {32 * BUILD_WARPS}\n#define NODES {dofs // 6 + 1}\n#define WORDS {words}\n"
-        f"#define CONTACT {int(PGS_CONSTRAINT_TYPE_CONTACT)}\n#define FRICTION {int(PGS_CONSTRAINT_TYPE_FRICTION)}\n"
+        f"#define CONTACT {int(ROW_CONTACT)}\n#define FRICTION {int(ROW_FRICTION)}\n"
         f"#define PARENT(PACKED_WORD) ({parent})\n"
         + body.replace("SHARED_DECLARATIONS", staging.declarations())
         .replace("LEVEL_PASS", _LEVEL_PASS)

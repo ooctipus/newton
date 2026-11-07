@@ -7,10 +7,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import field_group, row_records
-from newton._src.solvers.feather_pgs.row_kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_FRICTION,
-)
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION
 from newton.tests.feather_pgs_law_harness import bias_rows, row_bias, row_lines
 
 
@@ -26,7 +23,7 @@ class TestSparseContacts(unittest.TestCase):
     def test_restitution_selects_impacts_from_the_incident_projection(self):
         """Select impacts and subtract targets with the matrix-free incident-projection law."""
         row_count = 7
-        kinds = _array([[PGS_CONSTRAINT_TYPE_CONTACT] * 5 + [PGS_CONSTRAINT_TYPE_FRICTION] * 2], int)
+        kinds = _array([[ROW_CONTACT] * 5 + [ROW_FRICTION] * 2], int)
         phi = _array([[-0.01, 0.01, 0.5, -0.01, -0.01, -0.01, -0.01]])
         incident = _array([[-2.0, -2.0, -2.0, -0.05, 0.5, -3.0, -4.0]])
         target = _array([[0.0, 0.2, 0.0, 0.0, 1.0, 0.0, 0.0]])

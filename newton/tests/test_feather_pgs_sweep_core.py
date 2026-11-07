@@ -11,9 +11,9 @@ import re
 import unittest
 
 from newton._src.solvers.feather_pgs.response_operator import Lanes, ResponseOperator, SparseFactor
+from newton._src.solvers.feather_pgs.row_laws import ROW_FRICTION
 from newton._src.solvers.feather_pgs.solve_policy import Change, SolvePolicy, bound
 from newton._src.solvers.feather_pgs.sweep import (
-    FRICTION,
     UNIT_HELD,
     Diagonal,
     RowContext,
@@ -163,7 +163,7 @@ class TestRowVisit(unittest.TestCase):
     def test_admitted_rows_set_the_disk_at_admission(self):
         ctx = _context(_Rows())
         visit = row_visit(ctx, RowLaws(regularize=False), parent="p[i]", check=None, pad="")
-        admission = visit[visit.index(f"if (row_type == {FRICTION}) {{") : visit.index("float jv")]
+        admission = visit[visit.index(f"if (row_type == {ROW_FRICTION}) {{") : visit.index("float jv")]
         self.assertIn("if (i != parent + 1) continue;\n    const float lambda_n = RING_LOAD(lam[parent]);", admission)
         self.assertEqual(admission.count("{"), admission.count("}"))
         self.assertNotIn("<= 0.0f && row_type", visit)
@@ -185,7 +185,7 @@ class TestRowVisit(unittest.TestCase):
         self.assertIn("if (radius == 0.0f && lam[i] == 0.0f && pair_impulse == 0.0f) continue;", visit)
         self.assertEqual(
             friction_radius("k", "L", "m", "a", "b", "", keep_next="h"),
-            f"if (k == {FRICTION}) {{\n    const float lambda_n = L;\n    radius = fmaxf(m * lambda_n, 0.0f);\n"
+            f"if (k == {ROW_FRICTION}) {{\n    const float lambda_n = L;\n    radius = fmaxf(m * lambda_n, 0.0f);\n"
             "    h = b;\n    if (radius == 0.0f && a == 0.0f && h == 0.0f) continue;\n}",
         )
 

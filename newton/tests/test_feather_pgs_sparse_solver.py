@@ -11,11 +11,7 @@ import warp as wp
 import newton
 from newton._src.core.memory import arch_budget
 from newton._src.solvers.feather_pgs import sweep_routes_sparse
-from newton._src.solvers.feather_pgs.row_kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
-    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
-)
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import unpacked_rows, walk_inverse
 
@@ -305,7 +301,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             self.assertLessEqual(count, solver.placement.dense_max_constraints)
             self.assertTrue(np.isfinite(impulses[world, :count]).all())
             kinds = solver.placement.row_type.numpy()[world, :count]
-            unilateral = (kinds == PGS_CONSTRAINT_TYPE_CONTACT) | (kinds == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
+            unilateral = (kinds == ROW_CONTACT) | (kinds == ROW_JOINT_LIMIT)
             self.assertTrue(np.all(impulses[world, :count][unilateral] >= -1.0e-7))
             z, physical_j = self._sparse_rows_physical(solver, world, count)
             velocity = solver.forest.world_dof_indices.numpy()[world]
@@ -381,7 +377,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             bundles = []
             prefix = np.isin(
                 arrays["row_type"][world, :count],
-                [PGS_CONSTRAINT_TYPE_JOINT_LIMIT, PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT],
+                [ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT],
             )
             for row in np.flatnonzero(prefix):
                 dof = int(np.argmax(np.abs(jacobian[row])))
@@ -462,7 +458,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             for case in (dense, sparse):
                 _step(case)
             contact_seen |= bool(sparse[-1].rigid_contact_count.numpy()[0])
-            limit_seen |= bool(np.any(sparse[1].placement.row_type.numpy() == PGS_CONSTRAINT_TYPE_JOINT_LIMIT))
+            limit_seen |= bool(np.any(sparse[1].placement.row_type.numpy() == ROW_JOINT_LIMIT))
             self.assert_states_close(dense[2], sparse[2])
         self.assertTrue(contact_seen and limit_seen, "Fixture must exercise contacts and joint limits")
         self.assert_sparse_state(sparse)

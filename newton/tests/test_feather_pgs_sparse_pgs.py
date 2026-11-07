@@ -10,11 +10,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs.projection_laws import friction_pair
-from newton._src.solvers.feather_pgs.row_kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_FRICTION,
-    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
-)
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.sweep import sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
@@ -63,25 +59,25 @@ def _sweep(
         active_rows
         and np.isfinite(omega)
         and omega >= 0
-        and (linked_rows or not np.any((types == PGS_CONSTRAINT_TYPE_CONTACT) & (parents >= 0)))
+        and (linked_rows or not np.any((types == ROW_CONTACT) & (parents >= 0)))
     )
     for _ in range(iterations):
         selected = np.ones(len(types), dtype=bool)
         if active_rows:
-            unilateral = np.isin(types, (PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_JOINT_LIMIT))
+            unilateral = np.isin(types, (ROW_CONTACT, ROW_JOINT_LIMIT))
             selected[unilateral] = (impulses[unilateral] != 0) | ((jacobian @ velocity + bias)[unilateral] < 0)
-            for row in np.flatnonzero((types == PGS_CONSTRAINT_TYPE_FRICTION) & select_friction):
+            for row in np.flatnonzero((types == ROW_FRICTION) & select_friction):
                 parent = parents[row]
                 ring = _ring(parents, parent) if linked_rows else [parent]
                 selected[row] = np.any(selected[ring]) or np.any(impulses[parent + 1 : parent + 3] != 0)
         for row, kind in enumerate(types):
             if not selected[row]:
                 continue
-            if kind == PGS_CONSTRAINT_TYPE_FRICTION and row != parents[row] + 1:
+            if kind == ROW_FRICTION and row != parents[row] + 1:
                 continue
             residual = jacobian[row] @ velocity + bias[row]
             old = impulses[row]
-            if kind == PGS_CONSTRAINT_TYPE_FRICTION:
+            if kind == ROW_FRICTION:
                 parent, sibling = parents[row], row + 1
                 load = impulses[parent]
                 next_row = parents[parent]
@@ -107,7 +103,7 @@ def _sweep(
                 value = pair[0]
             else:
                 value = old - omega * residual / diagonal[row]
-                if kind in (PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_JOINT_LIMIT):
+                if kind in (ROW_CONTACT, ROW_JOINT_LIMIT):
                     value = max(value, 0.0)
             velocity += response[row] * (value - old)
             impulses[row] = value
@@ -126,14 +122,14 @@ def _problem(dofs=43, support=18, seeded=False, *, contact_activity=None):
     bias = np.array((-0.2, -0.1, 0.04, -0.03, -0.12, -0.15, 0.02, 0.04))
     types = np.array(
         (
-            PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
-            PGS_CONSTRAINT_TYPE_CONTACT,
-            PGS_CONSTRAINT_TYPE_FRICTION,
-            PGS_CONSTRAINT_TYPE_FRICTION,
-            PGS_CONSTRAINT_TYPE_CONTACT,
-            PGS_CONSTRAINT_TYPE_CONTACT,
-            PGS_CONSTRAINT_TYPE_FRICTION,
-            PGS_CONSTRAINT_TYPE_FRICTION,
+            ROW_JOINT_LIMIT,
+            ROW_CONTACT,
+            ROW_FRICTION,
+            ROW_FRICTION,
+            ROW_CONTACT,
+            ROW_CONTACT,
+            ROW_FRICTION,
+            ROW_FRICTION,
         ),
         dtype=np.int32,
     )
@@ -147,8 +143,8 @@ def _problem(dofs=43, support=18, seeded=False, *, contact_activity=None):
         initial.fill(0.0)
         bias.fill(0.0)
         bias[:3] = (0.25, 1.0, -0.25)
-        types[:] = PGS_CONSTRAINT_TYPE_CONTACT
-        types[1:3] = PGS_CONSTRAINT_TYPE_FRICTION
+        types[:] = ROW_CONTACT
+        types[1:3] = ROW_FRICTION
         parents.fill(-1)
         parents[1:3] = 0
         mu.fill(0.0)
@@ -216,16 +212,16 @@ def _patch_problem(rng, *, dofs=10, regions=4, limits=1):
         anchors = rng.choice(contacts, size=int(rng.integers(0, min(contacts, 2) + 1)), replace=False)
         units += [(region, contact in anchors) for contact in range(contacts)]
     rng.shuffle(units)
-    types = [PGS_CONSTRAINT_TYPE_JOINT_LIMIT] * limits
+    types = [ROW_JOINT_LIMIT] * limits
     parents, mu, members = [-1] * limits, [0.0] * limits, [[] for _ in range(regions)]
     for region, anchor in units:
         normal = len(types)
         members[region].append(normal)
-        types.append(PGS_CONSTRAINT_TYPE_CONTACT)
+        types.append(ROW_CONTACT)
         parents.append(-1)
         mu.append(0.0)
         if anchor:
-            types += [PGS_CONSTRAINT_TYPE_FRICTION] * 2
+            types += [ROW_FRICTION] * 2
             parents += [normal] * 2
             mu += [rng.uniform(0.2, 0.8)] * 2
     types, parents, mu = np.array(types, np.int32), np.array(parents, np.int32), np.array(mu)
@@ -235,7 +231,7 @@ def _patch_problem(rng, *, dofs=10, regions=4, limits=1):
     rows = rng.normal(scale=0.5, size=(len(types), dofs))
     bias = rng.uniform(-0.3, 0.3, size=len(types))
     impulses = np.where(rng.random(len(types)) < 0.3, rng.uniform(0.0, 0.2, size=len(types)), 0.0)
-    friction = types == PGS_CONSTRAINT_TYPE_FRICTION
+    friction = types == ROW_FRICTION
     impulses[friction] = np.where(rng.random(friction.sum()) < 0.2, rng.normal(scale=0.02, size=friction.sum()), 0.0)
     diagonal = np.sum(rows * rows, axis=1) + 1.0e-6
     return rows, bias, diagonal, types, parents, mu, impulses
@@ -342,7 +338,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                 np.testing.assert_array_equal(selected[0], every_pair[0])
                 np.testing.assert_array_equal(selected[1], every_pair[1])
             entry = (impulses != 0) | (bias < 0)
-            for row in np.flatnonzero(types == PGS_CONSTRAINT_TYPE_FRICTION):
+            for row in np.flatnonzero(types == ROW_FRICTION):
                 parent = parents[row]
                 ring_loaded += row == parent + 1 and not entry[parent] and bool(np.any(entry[_ring(parents, parent)]))
         self.assertGreater(ring_loaded, 20)
@@ -441,14 +437,14 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         dofs, support, seeded, contact_activity=contact_activity
                     )
                     if active_rows and contact_activity is None and not linked_rows:
-                        parents[types == PGS_CONSTRAINT_TYPE_CONTACT] = -1
+                        parents[types == ROW_CONTACT] = -1
                     offset = 30 if active_rows and (dofs == 75 or (use_support_table and dofs == 43)) else 0
                     if offset:
                         # Cross a bitset word boundary and retain an incomplete final word.
                         rows = np.pad(rows, ((offset, 0), (0, 0)))
                         bias, incident = np.pad(bias, (offset, 0), constant_values=1.0), np.pad(incident, (offset, 0))
                         diag, impulses = np.pad(diag, (offset, 0), constant_values=1.0), np.pad(impulses, (offset, 0))
-                        types = np.pad(types, (offset, 0), constant_values=PGS_CONSTRAINT_TYPE_CONTACT)
+                        types = np.pad(types, (offset, 0), constant_values=ROW_CONTACT)
                         parents = np.pad(np.where(parents >= 0, parents + offset, -1), (offset, 0), constant_values=-1)
                         mu = np.pad(mu, (offset, 0))
                     count = len(types)
@@ -555,7 +551,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         np.testing.assert_allclose(
                             result_impulses[world, :count], expected_impulses, atol=2.0e-5, rtol=2.0e-4
                         )
-                    if linked_rows and not np.any((types == PGS_CONSTRAINT_TYPE_CONTACT) & (parents >= 0)):
+                    if linked_rows and not np.any((types == ROW_CONTACT) & (parents >= 0)):
                         # Without a linked normal the ring walk selects as the point scan does.
                         point_kernel = sweep_kernel(
                             SparseSweep(

@@ -16,8 +16,8 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import environment_flags
-from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
-from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT as CONTACT
+from newton._src.solvers.feather_pgs.row_laws import ROW_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from newton._src.solvers.feather_pgs.sweep import sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep

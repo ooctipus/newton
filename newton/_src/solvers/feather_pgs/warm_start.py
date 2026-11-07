@@ -19,7 +19,7 @@ from . import field_group
 from .contact_input import ContactRoutes
 from .factor.kernels import Clock, clock_dt_ratio
 from .field_group import Field
-from .row_kernels import PGS_CONSTRAINT_TYPE_CONTACT
+from .row_laws import ROW_CONTACT
 
 
 @wp.kernel
@@ -92,7 +92,7 @@ def carry_contacts(
         slot = routes.slot[c]
         if slot >= 0:
             line = first[routes.world[c]]
-            if row_type[line, slot] == PGS_CONSTRAINT_TYPE_CONTACT:
+            if row_type[line, slot] == ROW_CONTACT:
                 impulse = impulses[line, slot]
     carry.impulse[c] = impulse
 
@@ -163,6 +163,6 @@ def gather_carried_normals(
     if slot < 0 or mi < 0:
         return
     line = first[routes.world[c]]
-    if row_type[line, slot] == PGS_CONSTRAINT_TYPE_CONTACT:
+    if row_type[line, slot] == ROW_CONTACT:
         impulse = decay * clock_dt_ratio(clock[0]) * carry.impulse[mi]
         impulses[line, slot] = carried_normal(impulse, routes.normal[c], carry.normal[mi])

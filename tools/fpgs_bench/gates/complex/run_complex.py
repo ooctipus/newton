@@ -416,8 +416,8 @@ def snapshot(scene, metric_worlds, sim_time, model_np, metrics, kernels, metric_
         t = types.numpy()[:metric_worlds]
         c = counts.numpy()[:metric_worlds]
         live = np.arange(t.shape[1])[None, :] < c[:, None]
-        normal = int(np.count_nonzero(live & (t == kernels.PGS_CONSTRAINT_TYPE_CONTACT)))
-        friction = int(np.count_nonzero(live & (t == kernels.PGS_CONSTRAINT_TYPE_FRICTION)))
+        normal = int(np.count_nonzero(live & (t == kernels.ROW_CONTACT)))
+        friction = int(np.count_nonzero(live & (t == kernels.ROW_FRICTION)))
         census[name] = {"rows": int(c.sum()), "normal": normal, "friction": friction}
     out["census"] = census
     patches = solver.laws.friction_patches
@@ -604,10 +604,10 @@ def main(argv=None):
 
     wp.config.log_level = wp.LOG_WARNING
     wp.init()
-    import newton  # noqa: PLC0415
     import importlib  # noqa: PLC0415
     import pkgutil  # noqa: PLC0415
 
+    import newton  # noqa: PLC0415
     import newton._src.solvers.feather_pgs as fpgs  # noqa: PLC0415
 
     # The row-type codes live in whichever solver module defines them; their owner moves as the solver is restructured.
@@ -616,7 +616,7 @@ def main(argv=None):
         for module in (
             importlib.import_module(f"{fpgs.__name__}.{m.name}") for m in pkgutil.iter_modules(fpgs.__path__)
         )
-        if hasattr(module, "PGS_CONSTRAINT_TYPE_CONTACT")
+        if hasattr(module, "ROW_CONTACT")
     )
 
     newton_file = Path(newton.__file__).resolve()

@@ -11,11 +11,11 @@ import newton
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
 from newton._src.solvers.feather_pgs.projection_laws import friction_pair
-from newton._src.solvers.feather_pgs.row_kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_FRICTION,
-    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
-    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+from newton._src.solvers.feather_pgs.row_laws import (
+    ROW_CONTACT,
+    ROW_FRICTION,
+    ROW_JOINT_LIMIT,
+    ROW_JOINT_VELOCITY_LIMIT,
 )
 from newton._src.solvers.feather_pgs.sweep import sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_levels import (
@@ -306,7 +306,7 @@ def _patch_unit_rows(seed, *, worlds=3, capacity=40, prefix=2, contacts=10, diag
         values = rng.uniform(0.3, 1.0, (count, 2)) * rng.choice((-1.0, 1.0), (count, 2))
         for k in range(count):
             index = row + k
-            rows["row_type"][w, index] = PGS_CONSTRAINT_TYPE_CONTACT if k == 0 else PGS_CONSTRAINT_TYPE_FRICTION
+            rows["row_type"][w, index] = ROW_CONTACT if k == 0 else ROW_FRICTION
             if k == 0:
                 # Separating normals stay unloaded, so speculative batches find no-op units.
                 rows["rhs"][w, index] = rng.uniform(-0.3, 0.0) if rng.random() < 0.5 else rng.uniform(0.0, 0.3)
@@ -327,7 +327,7 @@ def _patch_unit_rows(seed, *, worlds=3, capacity=40, prefix=2, contacts=10, diag
 
     for w in range(worlds):
         inverse = rows["inverse_mass"][w * dofs : (w + 1) * dofs]
-        rows["row_type"][w, :prefix] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+        rows["row_type"][w, :prefix] = ROW_JOINT_LIMIT
         rows["dense_J"][w, :prefix] = rng.normal(0.0, 0.5, (prefix, dense))
         rows["rhs"][w, :prefix] = rng.uniform(-0.2, 0.1, prefix)
         rows["bounds"][w] = prefix
@@ -472,7 +472,7 @@ def _unit_schedule_oracle(rows, marked):
     serial = []
     for w in range(rows["worlds"]):
         start, end = int(rows["bounds"][w, 1]), int(rows["row_count"][w])
-        heads = [row for row in range(start, end) if rows["row_type"][w, row] != PGS_CONSTRAINT_TYPE_FRICTION]
+        heads = [row for row in range(start, end) if rows["row_type"][w, row] != ROW_FRICTION]
         candidates = [row for row in heads if np.any(marked[w, row] < -1)]
         reserved = {int(c) for row in heads if row not in candidates for c in marked[w, row] if c >= 0}
         levels, placed = [], {}
@@ -503,7 +503,7 @@ def _unit_rows(rows, world, head):
     """The rows of the unit ``head`` heads: its normal row, then the two tangent rows it owns, if any."""
     owns_tangents = (
         head + 2 < rows["row_count"][world]
-        and rows["row_type"][world, head + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+        and rows["row_type"][world, head + 1] == ROW_FRICTION
         and rows["row_parent"][world, head + 1] == head
     )
     return [head, head + 1, head + 2] if owns_tangents else [head]
@@ -561,14 +561,14 @@ def _ring_pooled_serial_reference(rows, *, iterations, schedule=None, omega=1.0)
                         changed |= lambdas[w, coord] != old
             for row in order:
                 kind, parent, denominator = rows["row_type"][w, row], parents[row], rows["diag"][w, row]
-                if kind == PGS_CONSTRAINT_TYPE_FRICTION and row != parent + 1:
+                if kind == ROW_FRICTION and row != parent + 1:
                     continue
-                if denominator <= 0.0 and kind != PGS_CONSTRAINT_TYPE_FRICTION:
+                if denominator <= 0.0 and kind != ROW_FRICTION:
                     continue
                 residual = J[row] @ v + rows["rhs"][w, row]
                 old = lam[row]
                 new = old - omega * residual / denominator if denominator > 0.0 else old
-                if kind != PGS_CONSTRAINT_TYPE_FRICTION:
+                if kind != ROW_FRICTION:
                     new = max(new, 0.0)
                 else:
                     sibling = parent + 2
@@ -630,9 +630,9 @@ def _paired_unit_rows(seed, *, worlds=6, capacity=64, primary=23, secondary=6):
     }
     for w in range(worlds):
         prefix = int(rng.integers(0, 4))
-        rows["row_type"][w, :prefix] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+        rows["row_type"][w, :prefix] = ROW_JOINT_LIMIT
         if w == 1:
-            rows["row_type"][w, prefix] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+            rows["row_type"][w, prefix] = ROW_JOINT_VELOCITY_LIMIT
             prefix += 1
         rows["rhs"][w, :prefix] = rng.uniform(-0.2, 0.1, prefix)
         rows["bounds"][w] = prefix
@@ -649,14 +649,14 @@ def _paired_unit_rows(seed, *, worlds=6, capacity=64, primary=23, secondary=6):
             if row + count > capacity:
                 continue
             heads[ring].append(row)
-            rows["row_type"][w, row] = PGS_CONSTRAINT_TYPE_CONTACT
+            rows["row_type"][w, row] = ROW_CONTACT
             closing = rng.random() < 0.5
             rows["rhs"][w, row] = rng.uniform(-0.3, 0.0) if closing else rng.uniform(0.0, 0.3)
             if rng.random() < 0.4:
                 rows["impulses"][w, row] = rng.uniform(0.0, 0.2)
             if count == 3:
                 rows["anchors"] += 1
-                rows["row_type"][w, row + 1 : row + 3] = PGS_CONSTRAINT_TYPE_FRICTION
+                rows["row_type"][w, row + 1 : row + 3] = ROW_FRICTION
                 rows["row_parent"][w, row + 1 : row + 3] = row
                 rows["row_mu"][w, row + 1 : row + 3] = rng.uniform(0.2, 0.9)
                 rows["rhs"][w, row + 1 : row + 3] = rng.uniform(-0.15, 0.15, 2)
@@ -678,7 +678,7 @@ def _paired_unit_rows(seed, *, worlds=6, capacity=64, primary=23, secondary=6):
         rows["factor_rows"][w, :row] = rng.normal(0.0, 0.3, (row, dofs))
         rows["diag"][w, :row] = np.sum(rows["factor_rows"][w, :row] ** 2, axis=1) + np.float32(0.01)
     # A normal row without response is skipped by both schedules.
-    first_normal = int(np.flatnonzero(rows["row_type"][0] == PGS_CONSTRAINT_TYPE_CONTACT)[0])
+    first_normal = int(np.flatnonzero(rows["row_type"][0] == ROW_CONTACT)[0])
     rows["diag"][0, first_normal] = 0.0
     return rows
 
@@ -782,7 +782,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             )
             with self.subTest(capacity=capacity, iterations=iterations, omega=omega):
                 self.assertFalse(np.array_equal(general[0], rows["impulses"]), "the sweep changed no impulse")
-                tangents = rows["row_type"] == PGS_CONSTRAINT_TYPE_FRICTION
+                tangents = rows["row_type"] == ROW_FRICTION
                 self.assertTrue(np.any(general[0][tangents] != 0.0), "no tangent row was loaded")
                 for unit_values, general_values in zip(units, general, strict=True):
                     scale = float(np.max(np.abs(general_values)))
@@ -801,7 +801,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 for kernel in kernels
             )
             with self.subTest("cold", capacity=capacity, omega=omega):
-                tangents = cold["row_type"] == PGS_CONSTRAINT_TYPE_FRICTION
+                tangents = cold["row_type"] == ROW_FRICTION
                 self.assertTrue(np.any(general[0][tangents] != 0.0), "no tangent row was loaded")
                 for unit_values, general_values in zip(units, general, strict=True):
                     np.testing.assert_array_equal(unit_values.view(np.uint32), general_values.view(np.uint32))
@@ -824,7 +824,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         diag = np.zeros_like(rhs)
         diag[0, :3] = np.sum(jacobian * response, axis=1) + cfm
         row_type = np.zeros((1, max_constraints), dtype=np.int32)
-        row_type[0, :3] = (PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION)
+        row_type[0, :3] = (ROW_CONTACT, ROW_FRICTION, ROW_FRICTION)
         row_parent = np.full((1, max_constraints), -1, dtype=np.int32)
         row_parent[0, 1:3] = 0
         row_mu = np.zeros((1, max_constraints), dtype=np.float32)
@@ -955,8 +955,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         diag = np.zeros_like(rhs)
         normal_rows = np.array((0, 3, 6, 9), dtype=np.int32)
         diag[0, normal_rows] = np.sum(jacobian[normal_rows] * response[normal_rows], axis=1) + cfm
-        row_type = np.full((1, max_constraints), PGS_CONSTRAINT_TYPE_FRICTION, dtype=np.int32)
-        row_type[0, normal_rows] = PGS_CONSTRAINT_TYPE_CONTACT
+        row_type = np.full((1, max_constraints), ROW_FRICTION, dtype=np.int32)
+        row_type[0, normal_rows] = ROW_CONTACT
         row_parent = np.full((1, max_constraints), -1, dtype=np.int32)
         for normal in normal_rows:
             row_parent[0, normal + 1 : normal + 3] = normal
@@ -1094,8 +1094,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         )
         # Four three-row contact units: a normal heading its tangent pair, which names it as parent.
         heads = np.arange(0, max_constraints, 3)
-        row_type = np.full((1, max_constraints), PGS_CONSTRAINT_TYPE_FRICTION, dtype=np.int32)
-        row_type[0, heads] = PGS_CONSTRAINT_TYPE_CONTACT
+        row_type = np.full((1, max_constraints), ROW_FRICTION, dtype=np.int32)
+        row_type[0, heads] = ROW_CONTACT
         dim, block = levels_launch(1, max_world_dofs, device.arch)
         wp.launch(
             schedule,
@@ -1409,7 +1409,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         self.assertIn("_units", paired_solver.sweep.paired_factor_kernel.key)
         self.assertGreater(reference[0][0], 0, "mixed scene generated no dense constraint rows")
         self.assertTrue(
-            any(np.any(sample[5] == PGS_CONSTRAINT_TYPE_FRICTION) for sample in paired),
+            any(np.any(sample[5] == ROW_FRICTION) for sample in paired),
             "mixed scene generated no friction rows",
         )
         for step, (expected, actual) in enumerate(zip(reference, paired, strict=True)):

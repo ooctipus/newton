@@ -24,7 +24,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.friction_patches import PatchRowLaw
-from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION
 from newton.tests.feather_pgs_free_body_rows import free_body_jacobians
 from newton.tests.feather_pgs_law_harness import unpacked_rows
 
@@ -201,9 +201,9 @@ def assert_ring_coulomb(solver, route=0, *, atol=2e-5):
     for w, count in enumerate(arrays["count"]):
         kinds, parents = arrays["type"][w, :count], arrays["parent"][w, :count]
         mu, impulses = arrays["mu"][w, :count], arrays["impulse"][w, :count]
-        for row in np.flatnonzero(kinds == PGS_CONSTRAINT_TYPE_FRICTION):
+        for row in np.flatnonzero(kinds == ROW_FRICTION):
             parent = int(parents[row])
-            if row != parent + 1 or kinds[parent] != PGS_CONSTRAINT_TYPE_CONTACT:
+            if row != parent + 1 or kinds[parent] != ROW_CONTACT:
                 continue
             pairs += 1
             budget = float(mu[row]) * ring_load(parents, impulses, parent)
@@ -597,9 +597,9 @@ def ring_budget_ratios(solver, route=0):
     for w, count in enumerate(arrays["count"]):
         kinds, parents = arrays["type"][w, :count], arrays["parent"][w, :count]
         mu, impulses = arrays["mu"][w, :count], arrays["impulse"][w, :count]
-        for row in np.flatnonzero(kinds == PGS_CONSTRAINT_TYPE_FRICTION):
+        for row in np.flatnonzero(kinds == ROW_FRICTION):
             parent = int(parents[row])
-            if row != parent + 1 or kinds[parent] != PGS_CONSTRAINT_TYPE_CONTACT:
+            if row != parent + 1 or kinds[parent] != ROW_CONTACT:
                 continue
             budget = float(mu[row]) * ring_load(parents, impulses, parent)
             if budget > 0.0:

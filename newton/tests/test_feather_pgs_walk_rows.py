@@ -29,7 +29,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.factor.walk import TreeWalk, local_frames
-from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
+from newton._src.solvers.feather_pgs.row_laws import ROW_SPEED
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import walk_class_of
 from newton.tests.test_feather_pgs_factor import BOUND, ROUNDING, Capture, catalogue, random_tree, run_route
@@ -466,7 +466,7 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
         if count == 0:
             continue
         for row in range(count):
-            if kinds_all[line, row] == PGS_CONSTRAINT_TYPE_SPEED:
+            if kinds_all[line, row] == ROW_SPEED:
                 # A speed row keeps its unwhitened axis: its law reads the body's velocity, not a row.
                 ball[world] |= capture.impulses[line, row] != 0.0
                 continue
@@ -501,7 +501,7 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
         for world, count in enumerate(mf_counts):
             line = int(capture.mf_first[world])
             for row in range(int(count)):
-                if kinds[line, row] == PGS_CONSTRAINT_TYPE_SPEED:
+                if kinds[line, row] == ROW_SPEED:
                     ball[world] |= lam[line, row] != 0.0
                     continue
                 term, scale_z, scale_u = 0.0, 0.0, 0.0

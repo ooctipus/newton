@@ -3,7 +3,7 @@
 
 """Shared packed dense and matrix-free row metadata contracts, and the row record the sweeps stream."""
 
-from .row_kernels import PGS_CONSTRAINT_TYPE_COUNT
+from .row_laws import ROW_KINDS
 
 _DENSE_META_ROW_TYPE_BITS = 3
 _DENSE_META_ROW_TYPE_MASK = (1 << _DENSE_META_ROW_TYPE_BITS) - 1
@@ -13,7 +13,7 @@ _MF_META_MAX_CAPACITY = 65535  # Parent values 0..65534; 0xffff encodes no paren
 
 def _validate_dense_metadata_encoding(max_constraints: int) -> None:
     """Validate packed dense-row metadata against its signed 32-bit layout."""
-    if PGS_CONSTRAINT_TYPE_COUNT > _DENSE_META_ROW_TYPE_MASK + 1:
+    if ROW_KINDS > _DENSE_META_ROW_TYPE_MASK + 1:
         raise RuntimeError("Dense row metadata does not have enough row-type bits")
     if max_constraints - 1 > _DENSE_META_MAX_PARENT:
         raise ValueError(
@@ -25,7 +25,7 @@ def _validate_mf_metadata_encoding(max_constraints: int) -> None:
     """Reject capacities that alias the packed MF parent sentinel."""
     if not 0 <= max_constraints <= _MF_META_MAX_CAPACITY:
         raise ValueError(f"mf_max_constraints must be in [0, {_MF_META_MAX_CAPACITY}] for packed MF metadata")
-    if PGS_CONSTRAINT_TYPE_COUNT > 65536:
+    if ROW_KINDS > 65536:
         raise RuntimeError("MF metadata does not have enough row-type bits")
 
 

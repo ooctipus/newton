@@ -11,11 +11,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.row_kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_LINK,
-    PGS_CONSTRAINT_TYPE_MIMIC,
-)
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_LINK, ROW_MIMIC
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests.test_feather_pgs_contract_loops import (
     _LOOP_FRAMES,
@@ -76,7 +72,7 @@ def _run_scene(scene: scenes.Scene, iterations: int):
         state_0, state_1 = state_1, state_0
         positions.append(state_0.body_q.numpy()[:, :3].astype(np.float64))
         count = int(solver.placement.constraint_count.numpy()[0])
-        contact_rows = solver.placement.row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_CONTACT
+        contact_rows = solver.placement.row_type.numpy()[0, :count] == ROW_CONTACT
         if contact_rows.any():
             loaded = max(loaded, float(np.max(solver.placement.impulses.numpy()[0, :count][contact_rows])))
     return solver, np.array(positions), loaded
@@ -112,8 +108,8 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         count = int(solver.factor._preelim_nB.numpy()[0])
         slots = solver.factor._preelim_slots.numpy()[:count]
         selected_types = solver.placement.row_type.numpy()[0, slots]
-        self.assertEqual(int(np.count_nonzero(selected_types == PGS_CONSTRAINT_TYPE_MIMIC)), 1)
-        self.assertGreater(int(np.count_nonzero(selected_types == PGS_CONSTRAINT_TYPE_LINK)), 0)
+        self.assertEqual(int(np.count_nonzero(selected_types == ROW_MIMIC)), 1)
+        self.assertGreater(int(np.count_nonzero(selected_types == ROW_LINK)), 0)
 
     def test_blocks_are_sized_from_the_model(self):
         """A block takes every bilateral row of its trees, however many: a link's six rows and six mimics (twelve
@@ -132,8 +128,8 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         self.assertTrue(np.isfinite(state_0.body_q.numpy()).all())
         count = int(solver.factor._preelim_nB.numpy()[0])
         kept = solver.placement.row_type.numpy()[0, solver.factor._preelim_slots.numpy()[:count]]
-        self.assertEqual(int(np.count_nonzero(kept == PGS_CONSTRAINT_TYPE_MIMIC)), 1)
-        self.assertGreater(int(np.count_nonzero(kept == PGS_CONSTRAINT_TYPE_LINK)), 0)
+        self.assertEqual(int(np.count_nonzero(kept == ROW_MIMIC)), 1)
+        self.assertGreater(int(np.count_nonzero(kept == ROW_LINK)), 0)
 
     def test_prescribed_parent_closures_are_eliminated(self):
         """A load pinned to a moving kinematic carrier by three ball closures (nine rows, the carrier's velocity in
@@ -215,7 +211,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             state_0, state_1 = state_1, state_0
 
         count = int(solver.placement.constraint_count.numpy()[0])
-        contact_rows = solver.placement.row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_CONTACT
+        contact_rows = solver.placement.row_type.numpy()[0, :count] == ROW_CONTACT
         self.assertTrue(contact_rows.any())
         cache_peak = np.max(solver.placement.impulses.numpy()[0, :count][contact_rows])
         self.assertGreater(cache_peak, 1.0e-4, "loaded contact cache stayed empty")
@@ -270,7 +266,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             state_0, state_1 = state_1, state_0
             worst = max(worst, _loop_anchor_gap(model, state_0))
             count = int(solver.placement.constraint_count.numpy()[0])
-            contact_rows = solver.placement.row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_CONTACT
+            contact_rows = solver.placement.row_type.numpy()[0, :count] == ROW_CONTACT
             if contact_rows.any():
                 loaded = max(loaded, float(np.max(solver.placement.impulses.numpy()[0, :count][contact_rows])))
         self.assertTrue(solver.factor.eliminates)

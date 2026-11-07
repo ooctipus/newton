@@ -21,8 +21,7 @@ target and its stabilization. Every row builder and sweep that forms a row's
 * :func:`joint_limit_side`, :func:`velocity_limit_active` and :func:`mimic_phi`
   are the candidates of the prefix families.
 
-The row kinds are the solver's constraint types (:data:`ROW_CONTACT` ...,
-equal to ``row_kernels.PGS_CONSTRAINT_TYPE_*``).
+The row kinds are the solver's constraint types (:data:`ROW_CONTACT` ...).
 """
 
 import warp as wp
@@ -34,13 +33,22 @@ ROW_LAW = LawFamily("RowLaw")
 
 # Row kinds (the solver's constraint types).
 ROW_CONTACT = wp.constant(0)
+# A free rigid body's speed row: it bounds the magnitude of the body's linear or angular velocity (type 1 was the
+# PhysX drive row; drives fold into the mass matrix).
 ROW_SPEED = wp.constant(1)
 ROW_FRICTION = wp.constant(2)
 ROW_JOINT_LIMIT = wp.constant(3)
+# Joint velocity-limit row. Mirrors the PhysX per-DOF velocity clamp: finite limits create two unilateral rows every
+# step, one lower bound row and one upper bound row, with no Baumgarte bias.
 ROW_JOINT_VELOCITY_LIMIT = wp.constant(4)
+# Mimic (joint coupling) row: the bilateral equality ``q_follower - coef1 * q_leader - coef0 = 0`` between two 1-DoF
+# joints of one articulation, from ``Model.constraint_mimic_*``; lambda unbounded, Baumgarte drift correction.
 ROW_MIMIC = wp.constant(5)
+# Link row: one of the six bilateral rows that tie a body's shadow to its primary piece (:mod:`.body_cut`), unbounded
+# lambda, Baumgarte drift correction.
 ROW_LINK = wp.constant(6)
 ROW_TORSION = wp.constant(7)
+ROW_KINDS = 8
 
 LINK_ROWS = wp.constant(6)
 """A link's rows: three linear and three angular, whatever joint made it."""

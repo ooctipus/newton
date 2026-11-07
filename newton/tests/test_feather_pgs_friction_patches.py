@@ -14,7 +14,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.friction_patches import _FrictionPatchState, _pose_motion, patch_routes
-from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION
 from newton.tests.feather_pgs_law_harness import line_rows, row_lines, unpacked_rows
 from newton.tests.feather_pgs_patch_reference import store_frame
 from newton.tests.test_feather_pgs_friction_anchors import _SQUEEZE_SOLVER, _build_v_jaws
@@ -1085,7 +1085,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 solver.step(model.state(), model.state(), model.control(), contacts, 0.005)
                 # A free body's contacts are rows of the line.
                 rows = solver.placement.row_type.numpy()[0, line_rows(solver, 0)]
-                self.assertEqual(np.count_nonzero(rows == PGS_CONSTRAINT_TYPE_FRICTION), 2)
+                self.assertEqual(np.count_nonzero(rows == ROW_FRICTION), 2)
                 np.testing.assert_allclose(solver.laws.friction_patches.view.weight.numpy()[:3], [0, 1, 0])
 
     def test_shape_updates_refresh_geometry_and_keep_history(self):
@@ -1267,8 +1267,8 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                     ],
                 ]
             )
-            normals = int(np.count_nonzero(rows == PGS_CONSTRAINT_TYPE_CONTACT))
-            friction = int(np.count_nonzero(rows == PGS_CONSTRAINT_TYPE_FRICTION))
+            normals = int(np.count_nonzero(rows == ROW_CONTACT))
+            friction = int(np.count_nonzero(rows == ROW_FRICTION))
             self.assertEqual(normals, 4)
             self.assertEqual(friction, 2)
 

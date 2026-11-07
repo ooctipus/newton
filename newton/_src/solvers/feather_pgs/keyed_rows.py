@@ -33,8 +33,7 @@ from .law_source import law_preludes
 from .prefix_rows import LAW, VELOCITY_LAW
 from .row_build import contact_torsion_mu
 from .row_inputs import ParallelRowInputs, RowArgument
-from .row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
-from .row_laws import ROW_LAW
+from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_LAW, ROW_TORSION
 from .row_records import UNIT_CONTACT, UNIT_LIMIT, unit_source
 
 ROW_MAPS = FieldGroup(
@@ -97,16 +96,16 @@ def scatter_contact_keys(data: ContactInput, z: KineticRows, law: PatchRowLaw):
             for direction in range(data.slots_needed[contact]):
                 row = slot + direction
                 if direction == 0:
-                    data.row_type[line, row] = PGS_CONSTRAINT_TYPE_CONTACT
+                    data.row_type[line, row] = ROW_CONTACT
                     data.row_parent[line, row] = -1
                     data.row_mu[line, row] = mu
                 elif direction == CONTACT_SPIN_ROW:
                     _phi, _beta, spin_mu = patch_spin_row(law, contact, friction, contact_torsion_mu(data, contact))
-                    data.row_type[line, row] = PGS_CONSTRAINT_TYPE_TORSION
+                    data.row_type[line, row] = ROW_TORSION
                     data.row_parent[line, row] = slot
                     data.row_mu[line, row] = spin_mu
                 else:
-                    data.row_type[line, row] = PGS_CONSTRAINT_TYPE_FRICTION
+                    data.row_type[line, row] = ROW_FRICTION
                     data.row_parent[line, row] = slot
                     data.row_mu[line, row] = friction
 
@@ -137,7 +136,7 @@ def _row_source(*, layout, weighted=False, torsion=False):
     kind = "r == 0 ? 0 : 2"
     target = "ContactLaw::prescribed_target(ba, aa, bb, ab, row_point, direction, c.prescribed, c.origin, c.body_v)"
     if torsion:
-        kind = f"r == 0 ? 0 : (r == 3 ? {int(PGS_CONSTRAINT_TYPE_TORSION)} : 2)"
+        kind = f"r == 0 ? 0 : (r == 3 ? {int(ROW_TORSION)} : 2)"
         target = f"r == 3 ? ContactLaw::prescribed_spin_target(ba, aa, bb, ab, normal, c.prescribed, c.body_v)\n            : {target}"
     prefix = f"""
         const int token = ~key, d = token / 2;
@@ -306,7 +305,7 @@ def _key_kind(key: str, torsion: bool) -> str:
     """The row type of a contact row from its key's direction: the normal's, a tangent's or, under contact torsion,
     the spin row's."""
     if torsion:
-        return f"({key} & 3) == 0 ? 0 : (({key} & 3) == 3 ? {int(PGS_CONSTRAINT_TYPE_TORSION)} : 2)"
+        return f"({key} & 3) == 0 ? 0 : (({key} & 3) == 3 ? {int(ROW_TORSION)} : 2)"
     return f"({key} & 3) == 0 ? 0 : 2"
 
 

@@ -14,7 +14,7 @@ import newton
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.contact_input import ContactRoutes
 from newton._src.solvers.feather_pgs.factor.kernels import Clock
-from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION
 from newton._src.solvers.feather_pgs.warm_start import (
     ContactCarry,
     carry_contacts,
@@ -91,7 +91,7 @@ def _run_press(
         counts = solver.placement.constraint_count.numpy()
         rows = solver.placement.row_type.numpy()[0, : counts[0]]
         lam = solver.placement.impulses.numpy()[0, : counts[0]]
-        impulse_sums[i] = np.abs(lam[rows == PGS_CONSTRAINT_TYPE_CONTACT]).sum()
+        impulse_sums[i] = np.abs(lam[rows == ROW_CONTACT]).sum()
         speeds[i] = np.abs(state_0.joint_qd.numpy()[0])
     return impulse_sums, speeds, state_0
 
@@ -189,7 +189,7 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
     def test_only_normals_carry(self):
         """The gather seeds each matched contact's normal row; every friction row starts cold, also where the contact
         held the same pair last step, and no neighbour's tangent lands in another contact's span."""
-        c, f = PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
+        c, f = ROW_CONTACT, ROW_FRICTION
 
         # Both contacts keep their spans (3 rows each): the normals carry, the pairs do not.
         got = gather_rows(
@@ -228,7 +228,7 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
 
     def test_slot_churn_uses_identity_and_scales_dt(self):
         """Contact-order and slot churn follows match identity, not row index."""
-        c, dead = PGS_CONSTRAINT_TYPE_CONTACT, -1
+        c, dead = ROW_CONTACT, -1
         got = gather_rows(
             prev_impulses=[55.0, 0.0, 0.0, 0.0, 11.0],
             prev_types=[c, dead, dead, dead, c],

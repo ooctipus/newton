@@ -8,7 +8,7 @@ import warp as wp
 
 from .contact_input import ContactRoutes
 from .contact_laws import contact_tangent_basis
-from .row_kernels import PGS_CONSTRAINT_TYPE_FRICTION
+from .row_laws import ROW_FRICTION
 
 
 @wp.func
@@ -55,9 +55,9 @@ def _contact_linear_force(
         if (
             enable_friction != 0
             and slot + 2 < end
-            and world_row_type[line, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+            and world_row_type[line, slot + 1] == ROW_FRICTION
             and world_row_parent[line, slot + 1] == slot
-            and world_row_type[line, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
+            and world_row_type[line, slot + 2] == ROW_FRICTION
             and world_row_parent[line, slot + 2] == slot
         ):
             lam_t0 = world_impulses[line, slot + 1]

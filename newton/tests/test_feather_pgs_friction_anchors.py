@@ -7,10 +7,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import field_group
-from newton._src.solvers.feather_pgs.row_kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_FRICTION,
-)
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION
 from newton._src.solvers.feather_pgs.row_records import DenseRows
 from newton.tests.feather_pgs_law_harness import bias_rows, row_bias, row_lines
 
@@ -257,7 +254,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
                     solver.placement.phi.numpy()[0],
                     solver.placement.row_beta.numpy()[0],
                 )
-                if rt[slot[c] + 1] != PGS_CONSTRAINT_TYPE_FRICTION:
+                if rt[slot[c] + 1] != ROW_FRICTION:
                     continue
                 np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], fa[c], rtol=1.0e-6, atol=1.0e-9)
                 np.testing.assert_allclose(rb[slot[c] + 1 : slot[c] + 3], beta)
@@ -306,7 +303,7 @@ def _rhs(*, phi, row_beta, dt, device="cpu"):
     """RHS of one world with rows [CONTACT, FRICTION, FRICTION] by the row law every writer applies (the free bodies'
     among them), from the records every row builder stores: the raw separation ``phi`` and the row law's
     ``row_beta``."""
-    contact, friction = PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
+    contact, friction = ROW_CONTACT, ROW_FRICTION
     zeros = lambda: wp.zeros((1, 3), dtype=wp.float32, device=device)  # noqa: E731
     rhs = zeros()
     rows = field_group.upload(

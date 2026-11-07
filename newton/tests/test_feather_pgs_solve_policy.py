@@ -24,7 +24,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import (
     kernel_template,
-    row_kernels,
+    row_laws,
     sweep_routes,
     sweep_routes_diag,
     sweep_routes_local,
@@ -472,7 +472,7 @@ class TestExitLaw(unittest.TestCase):
     def test_torsion_votes_under_every_policy(self):
         """Vote a spin row's change (contact torsion) under the exit law and the trace, scaled by its row's diagonal,
         with its friction pair's."""
-        torsion = int(row_kernels.PGS_CONSTRAINT_TYPE_TORSION)
+        torsion = int(row_laws.ROW_TORSION)
         options = {"torsion": True}
         traced = sweep_kernel.__wrapped__(sweep_routes.GeneralSweep(64, 32, 12, "120", solve_policy=TRACE, **options))
         snippet = _policy_snippet(self, traced, "solve_trace_sweep(")
@@ -652,17 +652,17 @@ class TestSolveReadoutRecord(unittest.TestCase):
     def test_trace_kinds_name_every_constraint_type(self):
         """Name every constraint type at its own index of the trace's kinds, followed by the kind of no change."""
         names = {
-            row_kernels.PGS_CONSTRAINT_TYPE_CONTACT: "contact",
-            row_kernels.PGS_CONSTRAINT_TYPE_SPEED: "speed",
-            row_kernels.PGS_CONSTRAINT_TYPE_FRICTION: "friction",
-            row_kernels.PGS_CONSTRAINT_TYPE_JOINT_LIMIT: "joint_limit",
-            row_kernels.PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT: "velocity_limit",
-            row_kernels.PGS_CONSTRAINT_TYPE_MIMIC: "mimic",
-            row_kernels.PGS_CONSTRAINT_TYPE_LINK: "link",
-            row_kernels.PGS_CONSTRAINT_TYPE_TORSION: "torsion",
+            row_laws.ROW_CONTACT: "contact",
+            row_laws.ROW_SPEED: "speed",
+            row_laws.ROW_FRICTION: "friction",
+            row_laws.ROW_JOINT_LIMIT: "joint_limit",
+            row_laws.ROW_JOINT_VELOCITY_LIMIT: "velocity_limit",
+            row_laws.ROW_MIMIC: "mimic",
+            row_laws.ROW_LINK: "link",
+            row_laws.ROW_TORSION: "torsion",
         }
-        self.assertEqual(len(names), row_kernels.PGS_CONSTRAINT_TYPE_COUNT)
-        self.assertEqual(TRACE_KINDS, (*(names[kind] for kind in range(row_kernels.PGS_CONSTRAINT_TYPE_COUNT)), "none"))
+        self.assertEqual(len(names), row_laws.ROW_KINDS)
+        self.assertEqual(TRACE_KINDS, (*(names[kind] for kind in range(row_laws.ROW_KINDS)), "none"))
 
 
 class TestSolverReadoutOption(unittest.TestCase):

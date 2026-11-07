@@ -18,10 +18,8 @@ from newton._src.core.types import MAXVAL
 from newton._src.sim.enums import BodyFlags, JointType
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.joint_table import FreeBodies
-from newton._src.solvers.feather_pgs.row_kernels import (
-    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
-    allocate_rigid_velocity_limit_slots,
-)
+from newton._src.solvers.feather_pgs.row_kernels import allocate_rigid_velocity_limit_slots
+from newton._src.solvers.feather_pgs.row_laws import ROW_JOINT_LIMIT
 from newton._src.solvers.feather_pgs.row_records import DenseRows
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import PREFIX_RECORDS, prefix_warp_rows
@@ -139,7 +137,7 @@ def _run_joint_limit_trajectory():
         solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
         dense_count = int(solver.placement.constraint_count.numpy()[0])
         row_type = solver.placement.row_type.numpy()[0, :dense_count]
-        limit_rows = np.flatnonzero(row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
+        limit_rows = np.flatnonzero(row_type == ROW_JOINT_LIMIT)
         samples.append(
             {
                 "phi": solver.placement.phi.numpy()[0, limit_rows].tolist(),

@@ -19,19 +19,13 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import sweep_levels
-from newton._src.solvers.feather_pgs.row_kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_COUNT,
-    PGS_CONSTRAINT_TYPE_FRICTION,
-    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
-    PGS_CONSTRAINT_TYPE_TORSION,
-)
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_KINDS, ROW_TORSION
 from newton._src.solvers.feather_pgs.sweep_levels import _get_sparse_contact_levels_kernel
 from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.test_feather_pgs_star_rows import build_solver_fixture, install_patch_contacts
 
-_FRICTION = PGS_CONSTRAINT_TYPE_FRICTION
-_TORSION = PGS_CONSTRAINT_TYPE_TORSION
+_FRICTION = ROW_FRICTION
+_TORSION = ROW_TORSION
 # Initial content of every output, so that entries a builder must not write are checked too.
 _UNWRITTEN = -7
 _OUTPUTS = ("sparse_row_dof", "level_count", "level_offsets", "level_units", "serial_count", "serial")
@@ -110,7 +104,7 @@ def _empty_rows(worlds, capacity, serial_capacity):
         "row_count": np.zeros(worlds, np.int32),
         "bounds": np.zeros((worlds, 2), np.int32),
         # Rows outside the segments hold a type no row family uses.
-        "row_type": np.full((worlds, capacity), PGS_CONSTRAINT_TYPE_COUNT, np.int32),
+        "row_type": np.full((worlds, capacity), ROW_KINDS, np.int32),
         "row_parent": np.full((worlds, capacity), -1, np.int32),
         "sparse_row_dof": np.full((worlds, capacity, 2), -1, np.int32),
         "level_count": np.full(worlds, _UNWRITTEN, np.int32),
@@ -154,7 +148,7 @@ def _unit_worlds(seed, *, worlds, capacity, dofs):
     for w in range(worlds):
         layout = layouts[w % len(layouts)]
         start = 0 if layout in ("chain", "spread", "full") else int(rng.integers(1, 4))
-        rows["row_type"][w, :start] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+        rows["row_type"][w, :start] = ROW_JOINT_LIMIT
         hot = rng.integers(0, dofs, size=3)
         row = start
         while layout not in ("empty", "inverted") and row < capacity:
@@ -166,7 +160,7 @@ def _unit_worlds(seed, *, worlds, capacity, dofs):
                 count = 3 if row + 3 <= capacity and rng.random() < 0.5 else 1
                 if rng.random() < 0.08:
                     break
-            rows["row_type"][w, row] = PGS_CONSTRAINT_TYPE_CONTACT
+            rows["row_type"][w, row] = ROW_CONTACT
             rows["row_parent"][w, row] = row
             rows["row_type"][w, row + 1 : row + count] = _FRICTION
             rows["row_parent"][w, row + 1 : row + count] = row

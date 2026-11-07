@@ -43,17 +43,13 @@ from . import kernel_template
 from .kernel_template import Dispatch
 from .response_operator import Lanes, SparseFactor
 from .row_inputs import RowArgument
+from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_TORSION
 from .solve_policy import Change, bound
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport
 from .sweep import (
-    CONTACT,
-    FRICTION,
     ITERATION,
-    JOINT_LIMIT,
-    TORSION,
     UNIT_HELD,
-    VELOCITY_LIMIT,
     BallotHeads,
     Diagonal,
     RowContext,
@@ -292,7 +288,7 @@ def active_selection(sweep: SparseSweep, pad: str) -> str:
     lines = [
         "bool linked = false;",
         f"for (int row = lane; row < count; row += {sweep.lanes})",
-        f"    if (s_type[row] == {CONTACT} && world_row_parent.data[offset + row] >= 0) linked = true;",
+        f"    if (s_type[row] == {ROW_CONTACT} && world_row_parent.data[offset + row] >= 0) linked = true;",
         f"const bool select_active = BALLOT(linked) == 0u && {finite};",
     ]
     return indent("\n".join(lines), pad)
@@ -337,9 +333,9 @@ def active_scan(sweep: SparseSweep, op: SparseFactor, pad: str) -> str:
             kept = f"((first & 31) != 0 ? {words}[first / 32] : 0u)"
             return f"{words}[first / 32] = {kept} | (mask << (first & 31));"
 
-    select = f"!select_active || (kind != {CONTACT} && kind != {JOINT_LIMIT}) || s_impulse[row] != 0.0f"
+    select = f"!select_active || (kind != {ROW_CONTACT} && kind != {ROW_JOINT_LIMIT}) || s_impulse[row] != 0.0f"
     # A triple's rows are the triple phase's: never selected.
-    rowed = f"kind != {FRICTION} && kind != {TORSION}" if sweep.torsion else f"kind != {FRICTION}"
+    rowed = f"kind != {ROW_FRICTION} && kind != {ROW_TORSION}" if sweep.torsion else f"kind != {ROW_FRICTION}"
     text = f"""for (int first = 0; first < count; first += {L}) {{
     const int row = first + lane;
     bool selected = false;
@@ -364,7 +360,7 @@ for (int first = 0; first < count; first += {L}) {{
     bool selected = false;
     if (row < count) {{
         selected = !select_active || ((s_normal_words[first / 32] >> {bit}) & 1u) != 0u;
-        if (select_active && s_type[row] == {FRICTION}) {{
+        if (select_active && s_type[row] == {ROW_FRICTION}) {{
             const int parent = world_row_parent.data[offset + row];
 {indent(tangent, "            ")}
         }}
@@ -389,7 +385,7 @@ int sweep_violation_loud = 0;
 for (int first = 0; first < count; first += {sweep.lanes}) {{
     const int row = first + lane;
     const int kind = row < count ? static_cast<int>(s_type[row]) : -1;
-    if ((kind == {CONTACT} || kind == {JOINT_LIMIT}) && s_impulse[row] == 0.0f && s_diag[row] > 0.0f) {{
+    if ((kind == {ROW_CONTACT} || kind == {ROW_JOINT_LIMIT}) && s_impulse[row] == 0.0f && s_diag[row] > 0.0f) {{
         float dot = 0.0f;
 {serial.dot((("dot", "row", None),), {"row": "row"}, "        ", reduce=False)}
         const float residual = dot + s_rhs[row];
@@ -455,16 +451,16 @@ def contact_units(sweep: SparseSweep, rows: StagedRows, op: SparseFactor, laws: 
     visit pools.
     """
     width = CONTACT_RECORD_FLOATS + (CONTACT_RING_FLOATS if sweep.linked_rows else 0)
-    pair_rows = f"s_type[normal + 1] != {FRICTION} || s_type[normal + 2] != {FRICTION}"
+    pair_rows = f"s_type[normal + 1] != {ROW_FRICTION} || s_type[normal + 2] != {ROW_FRICTION}"
     if laws.torsion:
         # A triple's pair is staged as spin rows (StagedRows' triples).
-        pair_rows = f"s_type[normal + 1] != s_type[normal + 2] || (s_type[normal + 1] != {FRICTION} && s_type[normal + 1] != {TORSION})"
+        pair_rows = f"s_type[normal + 1] != s_type[normal + 2] || (s_type[normal + 1] != {ROW_FRICTION} && s_type[normal + 1] != {ROW_TORSION})"
     setup = ""
     if sweep.linked_rows:
         setup = f"""// Each anchor's other ring members, at most three, in the order the pair update pools them; -1 marks a
 // longer ring, which keeps the walk. Visits read them with the record.
 for (int normal = lane; normal + 2 < count; normal += {sweep.lanes}) {{
-    if (s_type[normal] != {CONTACT} || {pair_rows}) continue;
+    if (s_type[normal] != {ROW_CONTACT} || {pair_rows}) continue;
     const int first = world_row_parent.data[offset + normal];
     int second = -1, third = -1, others = 0;
     if (first >= 0 && first != normal) {{
@@ -543,7 +539,7 @@ SYNC();"""
             pair_law="UNIT_PAIR(0, ",
         )
         declare = f"""const int i = head + r;
-const int row_type = r == 0 ? {CONTACT} : {FRICTION};"""
+const int row_type = r == 0 ? {ROW_CONTACT} : {ROW_FRICTION};"""
         # The guards admitted the normal (a positive diagonal); the rows read the unit's staged values as it loaded
         # them.
         unit_laws = dataclasses.replace(laws, torsion=False)
@@ -581,7 +577,7 @@ const int row_type = r == 0 ? {CONTACT} : {FRICTION};"""
     update = f"""if (i == consumed_tangent) continue;
 // The staged metadata first, read together: a contact normal with its two tangents.
 if ({entry_guard}i + 2 < count
-    && ((s_type[i] == {CONTACT}) & (s_type[i + 1] == {FRICTION}) & (s_type[i + 2] == {FRICTION})
+    && ((s_type[i] == {ROW_CONTACT}) & (s_type[i + 1] == {ROW_FRICTION}) & (s_type[i + 2] == {ROW_FRICTION})
         & (isfinite(s_diag[i]) != 0) & (s_diag[i] > 0.0f){selected})) {{
     const int head = i, tangent = i + 1, sibling = i + 2;
     // The guards load together; the rows, the record and the coordinates then load together.
@@ -642,7 +638,7 @@ def triple_phase(sweep: SparseSweep, rows: StagedRows, op: SparseFactor, laws: R
     )
     ctx = RowContext(
         row="tangent",
-        kind=str(FRICTION),
+        kind=str(ROW_FRICTION),
         operator=op,
         diagonal=Diagonal(rows.diag),
         load=rows.load,
@@ -659,7 +655,9 @@ def triple_phase(sweep: SparseSweep, rows: StagedRows, op: SparseFactor, laws: R
     heads = BallotHeads(
         "count",
         rows.lanes,
-        lambda row: f"{row} + 1 < count && {rows.kind(row)} == {CONTACT} && {rows.kind(f'{row} + 1')} == {TORSION}",
+        lambda row: (
+            f"{row} + 1 < count && {rows.kind(row)} == {ROW_CONTACT} && {rows.kind(f'{row} + 1')} == {ROW_TORSION}"
+        ),
         guard="world_triples",
     )
     visit = friction_triple_visit(
@@ -719,7 +717,7 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     if sweep.contact_triplets:
         scan.append("        int consumed_tangent = -1;")
     # Velocity-limit rows wait for the last-word pass; under contact torsion the triples are the triple phase's.
-    admission = f"if (row_type == {VELOCITY_LIMIT}) continue;" if sweep.velocity_limits else ""
+    admission = f"if (row_type == {ROW_JOINT_VELOCITY_LIMIT}) continue;" if sweep.velocity_limits else ""
     update = row_step(
         rows, op, laws, end="count", admission=admission, held=True, triple_phase=sweep.torsion, pad=body_pad
     )

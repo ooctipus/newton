@@ -30,11 +30,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import sweep_units
-from newton._src.solvers.feather_pgs.row_kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_FRICTION,
-    PGS_CONSTRAINT_TYPE_TORSION,
-)
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION, ROW_TORSION
 from newton._src.solvers.feather_pgs.row_metadata import HEADER_WORDS, record_views
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
@@ -104,13 +100,13 @@ def reference_units(meta, count: int, end: int) -> dict:
     parent = [_signed(word >> 16, 16) for word in packed]
     units = []
     for row in range(end):
-        if kind[row] != PGS_CONSTRAINT_TYPE_CONTACT:
+        if kind[row] != ROW_CONTACT:
             continue
         rows = 1
         # Its friction pair, then its spin row where it has one.
         while row + rows < end and rows < 4:
             r = row + rows
-            want = PGS_CONSTRAINT_TYPE_FRICTION if rows < 3 else PGS_CONSTRAINT_TYPE_TORSION
+            want = ROW_FRICTION if rows < 3 else ROW_TORSION
             if kind[r] != want or parent[r] != row:
                 break
             rows += 1
@@ -187,9 +183,9 @@ class TestStageSlots(unittest.TestCase):
             for p, (row, rows) in enumerate(world_units):
                 records[world, p] = (row, rows, 2 * p, 2 * p + 1)
                 # A normal row links no patch ring (0xFFFF); its friction pair's (and spin row's) parent is the normal.
-                meta[world, row, 3] = PGS_CONSTRAINT_TYPE_CONTACT | (0xFFFF << 16)
+                meta[world, row, 3] = ROW_CONTACT | (0xFFFF << 16)
                 for r in range(row + 1, row + rows):
-                    kind = PGS_CONSTRAINT_TYPE_TORSION if r == row + 3 else PGS_CONSTRAINT_TYPE_FRICTION
+                    kind = ROW_TORSION if r == row + 3 else ROW_FRICTION
                     meta[world, r, 3] = kind | (row << 16)
         meta = meta.astype(np.uint32).view(np.int32).reshape(self.WORLDS, HEADER_WORDS * self.ROWS)
         mu = rng.uniform(0.1, 1.0, (self.WORLDS, self.ROWS)).astype(np.float32)

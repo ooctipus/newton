@@ -23,7 +23,7 @@ import warp as wp
 import newton
 from newton._src.core.memory import Place
 from newton._src.solvers.feather_pgs import sweep_routes
-from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
+from newton._src.solvers.feather_pgs.row_laws import ROW_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
 from newton._src.solvers.feather_pgs.sweep import sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.solvers import SolverFeatherPGS

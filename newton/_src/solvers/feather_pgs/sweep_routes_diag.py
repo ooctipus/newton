@@ -27,13 +27,10 @@ from .factor.walk import WalkTrees
 from .kernel_template import Dispatch
 from .response_operator import Lanes, ResponseOperator, SparseFactor, Velocity
 from .row_inputs import RowArgument
+from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT
 from .row_metadata import _validate_dense_metadata_encoding
 from .sweep import (
-    CONTACT,
-    FRICTION,
     ITERATION,
-    JOINT_LIMIT,
-    VELOCITY_LIMIT,
     Diagonal,
     RowContext,
     RowLaws,
@@ -147,7 +144,7 @@ class LimitRows:
         row of a known kind (:data:`.sweep.JOINT_LIMIT`) on :class:`LimitZ`."""
         return RowContext(
             row=row,
-            kind=str(JOINT_LIMIT),
+            kind=str(ROW_JOINT_LIMIT),
             operator=LimitZ(coordinate, f"limit_scale_{self.k}", upper=row == "upper"),
             diagonal=Diagonal(lambda _: "limit_denom"),
             load=self.load,
@@ -376,7 +373,7 @@ def sparse_diagonal_source(sweep: DiagonalSweep) -> tuple[str, Staging]:
         store = dataclasses.replace(rows, lanes=lanes)
         op = SCALAR_ROWS if scalar else slot_rows(P, M, lanes)
         # Velocity-limit rows wait for the last word.
-        admission = f"if (row_type == {VELOCITY_LIMIT}) continue;" if velocity_limits and kind is None else ""
+        admission = f"if (row_type == {ROW_JOINT_VELOCITY_LIMIT}) continue;" if velocity_limits and kind is None else ""
         return row_step(
             store, op, laws, end="row_count", kind=kind, parent=parent, admission=admission, metric=cached, pad=pad
         )
@@ -413,7 +410,7 @@ def sparse_diagonal_source(sweep: DiagonalSweep) -> tuple[str, Staging]:
         RowContext.of(rows, UnitZ(), end="row_count", metric=cached),
         dataclasses.replace(laws, torsion=False),
         rows="unit_rows",
-        declare=f"const int i = head + r;\nconst int row_type = r == 0 ? {CONTACT} : {FRICTION};\n"
+        declare=f"const int i = head + r;\nconst int row_type = r == 0 ? {ROW_CONTACT} : {ROW_FRICTION};\n"
         f"const float denom = {rows.diag('i')};",
         parent="head",
         check="denom",
@@ -448,7 +445,7 @@ def sparse_diagonal_source(sweep: DiagonalSweep) -> tuple[str, Staging]:
         """Whether unit head ``head`` owns a tangent pair: the row after it is a tangent naming it as parent."""
         return (
             f"{head} + 2 < row_count\n"
-            f"{pad}&& ({rows.kind(f'{head} + 1')}) == {FRICTION}\n"
+            f"{pad}&& ({rows.kind(f'{head} + 1')}) == {ROW_FRICTION}\n"
             f"{pad}&& {rows.parent(f'{head} + 1', enclosed=True)} == {head}"
         )
 
@@ -478,12 +475,12 @@ def sparse_diagonal_source(sweep: DiagonalSweep) -> tuple[str, Staging]:
         pad = " " * 16
         tangents = f"""{pad}do {{
 {pad}    const int i = head + 1;
-{visit(pad + "    ", scalar=True, kind=FRICTION, parent="head")}
+{visit(pad + "    ", scalar=True, kind=ROW_FRICTION, parent="head")}
 {pad}}} while (false);"""
         tangents = f"{pad}if ({owns_tangents('head', pad + '    ')}) {{\n{indent(tangents, '    ')}\n{pad}}}"
         normal = f"""                do {{
                     const int i = head;
-{visit(pad + "    ", scalar=True, kind=CONTACT)}
+{visit(pad + "    ", scalar=True, kind=ROW_CONTACT)}
                 }} while (false);
 {tangents}"""
         independent_phase = "\n" + Levels(M, L).wrap(normal, "        ") + "\n"
@@ -531,18 +528,20 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     if not scheduled:
         # The rows hold no schedule: a normal row owning the tangent pair after it heads a contact unit, unless a
         # mark makes it a scalar contact (its rows keep their visits, as a scheduled sweep's level phase visits them).
-        head = f"({rows.kind('i')}) == {CONTACT} && {owns_tangents('i', ' ' * 16)}\n{' ' * 16}&& !({independent('i')})"
+        head = (
+            f"({rows.kind('i')}) == {ROW_CONTACT} && {owns_tangents('i', ' ' * 16)}\n{' ' * 16}&& !({independent('i')})"
+        )
         serial = SlotOrder("row_count").wrap(f"{coupled(head)}\n{row}", "        ")
     elif not speculative_contact_batches:
         serial = SlotOrder("row_count").wrap(
             f"""            if (i >= contact_start) {{
                 // A tangent row's parent is its unit's head.
-                const int unit_head = ({rows.kind("i")}) == {FRICTION} ? {rows.parent("i")} : i;
+                const int unit_head = ({rows.kind("i")}) == {ROW_FRICTION} ? {rows.parent("i")} : i;
                 if ({independent("unit_head")}) continue;
             }}
-{coupled(f"i >= contact_start && ({rows.kind('i')}) == {CONTACT} && {owns_tangents('i', ' ' * 16)}")}
+{coupled(f"i >= contact_start && ({rows.kind('i')}) == {ROW_CONTACT} && {owns_tangents('i', ' ' * 16)}")}
 {row}
-{inactive_pair(f"i >= contact_start && ({rows.kind('i')}) == {CONTACT} && {owns_tangents('i', ' ' * 16)}", "i")}""",
+{inactive_pair(f"i >= contact_start && ({rows.kind('i')}) == {ROW_CONTACT} && {owns_tangents('i', ' ' * 16)}", "i")}""",
             "        ",
         )
     else:

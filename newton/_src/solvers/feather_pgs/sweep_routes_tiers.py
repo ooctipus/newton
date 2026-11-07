@@ -32,19 +32,10 @@ from .keyed_row_layout import KeyedLayout
 from .keyed_rows import get_direct_parallel_inputs
 from .response_operator import Lanes, TransposedResponse, WalkedRows
 from .row_inputs import RowArgument
+from .row_laws import ROW_CONTACT, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT
 from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import block_argmax
-from .sweep import (
-    CONTACT,
-    JOINT_LIMIT,
-    VELOCITY_LIMIT,
-    JacobiRows,
-    SweepConfig,
-    dense_tier_world,
-    jacobi_limit_pass,
-    jacobi_scale,
-    jacobi_sweeps,
-)
+from .sweep import JacobiRows, SweepConfig, dense_tier_world, jacobi_limit_pass, jacobi_scale, jacobi_sweeps
 from .sweep_routes import MF_GS_ABI, worlds
 from .tree_scan import WALK_BOTH, WalkClass, classes_half
 
@@ -182,7 +173,7 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
     }
     if operands is not None:
         metadata = {name: getattr(operands, name) for name in metadata}
-    loads = store.loads(**metadata, unilateral=(CONTACT, JOINT_LIMIT, VELOCITY_LIMIT))
+    loads = store.loads(**metadata, unilateral=(ROW_CONTACT, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT))
 
     def scale(aii, bound, pad):
         return jacobi_scale(aii, bound, cfm="cfm", pad=pad)

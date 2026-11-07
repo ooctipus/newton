@@ -50,14 +50,7 @@ from .law_source import law_preludes
 from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import Lanes, LaneVelocity, ResponseOperator, Velocity
 from .row_inputs import RowArgument
-from .row_kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_FRICTION,
-    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
-    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
-    PGS_CONSTRAINT_TYPE_SPEED,
-    PGS_CONSTRAINT_TYPE_TORSION,
-)
+from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_SPEED, ROW_TORSION
 from .row_metadata import (
     _DENSE_META_ROW_TYPE_BITS,
     _DENSE_META_ROW_TYPE_MASK,
@@ -68,13 +61,6 @@ from .row_metadata import (
     unpack_mf_header,
 )
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound, sweep_exit, terms_bound, vote
-
-CONTACT = int(PGS_CONSTRAINT_TYPE_CONTACT)
-FRICTION = int(PGS_CONSTRAINT_TYPE_FRICTION)
-JOINT_LIMIT = int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
-VELOCITY_LIMIT = int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
-SPEED = int(PGS_CONSTRAINT_TYPE_SPEED)
-TORSION = int(PGS_CONSTRAINT_TYPE_TORSION)
 
 
 def indent(text: str, prefix: str) -> str:
@@ -339,7 +325,7 @@ class WorldRows:
         return "" if self.stream else f"world_impulses.data[{self.base} + {row}] = {self.impulses}[{row}];"
 
 
-def spin_row(parent: str, end: str, kind: Callable[[str], str], *, spin: str = str(TORSION)) -> str:
+def spin_row(parent: str, end: str, kind: Callable[[str], str], *, spin: str = str(ROW_TORSION)) -> str:
     """The rows of a contact, read from the data: the spin row of the contact whose normal is row ``parent``, or -1.
 
     A friction contact's rows are its normal, its pair and, where its region has a footprint or contact torsion gives
@@ -511,11 +497,11 @@ class StagedRows:
             spin = spin_row("parent", count, lambda row: f"world_row_type.data[{line} + {row}]")
             triple = (
                 f"{pad}    int kind = world_row_type.data[{line} + i];\n"
-                f"{pad}    if (kind == {FRICTION}) {{\n"
+                f"{pad}    if (kind == {ROW_FRICTION}) {{\n"
                 f"{pad}        const int parent = world_row_parent.data[{line} + i];\n"
-                f"{pad}        if ({spin} >= 0) kind = {TORSION};\n"
+                f"{pad}        if ({spin} >= 0) kind = {ROW_TORSION};\n"
                 f"{pad}    }}\n"
-                f"{pad}    if (kind == {TORSION}) staged_triples = true;\n"
+                f"{pad}    if (kind == {ROW_TORSION}) staged_triples = true;\n"
             )
         diagonal = f"{pad}    s_diag[i] = world_diag.data[{line} + i];\n"
         if self.reciprocal:
@@ -667,7 +653,7 @@ class RowContext:
     impulse, ``ring_load(parent, load)`` from ``load`` (a contact unit's normal in a register, :func:`contact_unit`)."""
     eps: Callable[[str], str] | None = None
     """A row's compliance, where the laws have material contacts (:attr:`RowLaws.material`)."""
-    contact_kinds: tuple[int, ...] = (CONTACT, JOINT_LIMIT)
+    contact_kinds: tuple[int, ...] = (ROW_CONTACT, ROW_JOINT_LIMIT)
     inline_velocity_limit: bool = False
     """Velocity-limit rows the row loop visits take the velocity-limit law in place (a velocity-limit row phase)."""
     record: Callable[[str, str], str] | None = None
@@ -764,7 +750,7 @@ def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> st
             weight = row_weight(weight, ctx.eps(row), diag.value(row))
         lines += [
             f"float delta = {step};",
-            f"if ({kind} == {CONTACT})",
+            f"if ({kind} == {ROW_CONTACT})",
             f"    delta = ProjectionLaw::regularized_delta(delta, {weight}, old_impulse);",
             "float new_impulse = ProjectionLaw::relaxed_step(old_impulse, delta, omega);",
         ]
@@ -780,7 +766,7 @@ def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> st
     if ctx.inline_velocity_limit:
         branches.append(
             (
-                f"{kind} == {VELOCITY_LIMIT}",
+                f"{kind} == {ROW_JOINT_VELOCITY_LIMIT}",
                 f"const auto vlim = ProjectionLaw::velocity_limit_update(old_impulse, {diag.scale('residual', row)});\n"
                 "new_impulse = vlim.v0;\n"
                 "delta_impulse = vlim.v1;",
@@ -816,7 +802,7 @@ def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> st
                 )
                 if line
             )
-        branches.append((f"{kind} == {FRICTION}", pair + "\ndelta_impulse = new_impulse - old_impulse;"))
+        branches.append((f"{kind} == {ROW_FRICTION}", pair + "\ndelta_impulse = new_impulse - old_impulse;"))
     for index, (condition, body) in enumerate(branches):
         head = "if" if index == 0 else "} else if"
         lines.append(f"{head} ({condition}) {{")
@@ -839,12 +825,12 @@ def _row_bound(ctx: RowContext, terms: str) -> str:
 
 def _sibling_change(ctx: RowContext) -> Change:
     """The friction pair's second-tangent change as the exit law reads it (``sib_bound``: :func:`friction_pair`)."""
-    return ctx.diagonal.change("sib_delta", "sib_bound", str(FRICTION), "sib")
+    return ctx.diagonal.change("sib_delta", "sib_bound", str(ROW_FRICTION), "sib")
 
 
 def _spin_change(ctx: RowContext) -> Change:
     """The spin row's change as the exit law reads it (``spin_bound``: :func:`friction_pair` under torsion)."""
-    return ctx.diagonal.change("spin_delta", "spin_bound", str(TORSION), "spin")
+    return ctx.diagonal.change("spin_delta", "spin_bound", str(ROW_TORSION), "spin")
 
 
 def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
@@ -1061,7 +1047,7 @@ def admit_pair(
         "int parent = -1;",
         "int spin = -1;" if torsion else "",
         "float radius = 0.0f, load = 0.0f;" if torsion else "float radius = 0.0f;",
-        f"if ({kind} == {FRICTION}) {{",
+        f"if ({kind} == {ROW_FRICTION}) {{",
         f"    parent = {parent};",
         "    if (i != parent + 1) continue;",
         f"    spin = {spin};" if torsion else "",
@@ -1114,7 +1100,7 @@ def friction_radius(
 ) -> str:
     """:func:`pair_radius` for a friction row of the row loop (one of kind ``kind``)."""
     radius = pair_radius(ring_load, mu, load_row, load_next, pad + "    ", keep_next=keep_next, load_spin=load_spin)
-    return f"{pad}if ({kind} == {FRICTION}) {{\n{radius}\n{pad}}}"
+    return f"{pad}if ({kind} == {ROW_FRICTION}) {{\n{radius}\n{pad}}}"
 
 
 def row_sums(op, out: str, pad: str, *, row: str = "i", sibling: str | None = None, paired: str = "false") -> str:
@@ -1157,7 +1143,7 @@ def row_visit(
     pairs = ctx.friction
     between = [indent(declare, pad) if declare else ""]
     if check is not None:
-        exempt = f" && {kind} != {FRICTION}" if pairs else ""
+        exempt = f" && {kind} != {ROW_FRICTION}" if pairs else ""
         between.append(f"{pad}if ({check} <= 0.0f{exempt}) continue;")
     between.append(indent(hold, pad) if hold else "")
     lines = []
@@ -1174,7 +1160,7 @@ def row_visit(
             *between,
             friction_radius(kind, *disk, pad, keep_next=keep_next, **spin) if pairs else "",
         ]
-    pair = {"sibling": "parent + 2", "paired": f"{kind} == {FRICTION}"} if pairs and op.pair_with_visit else {}
+    pair = {"sibling": "parent + 2", "paired": f"{kind} == {ROW_FRICTION}"} if pairs and op.pair_with_visit else {}
     lines += [row_sums(op, "jv", pad, **pair), row_update(ctx, laws, residual="jv", pad=pad)]
     return "\n".join(line for line in lines if line)
 
@@ -1678,7 +1664,7 @@ def friction_metric_stage(
     Formed at the first visit, not here: a triple the sweeps never load forms none."""
     lines = [
         "const int row = first + LANE;",
-        f"if (row < {end} && {kind('row')} == {FRICTION}) {{",
+        f"if (row < {end} && {kind('row')} == {ROW_FRICTION}) {{",
         f"    const int parent = {parent('row')};",
         f"    if (row == parent + 1 && {spin('parent')} >= 0) {record('parent')}[0] = -1.0f;",
         "}",
@@ -1777,7 +1763,7 @@ def row_step(
         op,
         end=end,
         metric=metric,
-        friction=kind in (None, FRICTION),
+        friction=kind in (None, ROW_FRICTION),
         inline_velocity_limit=inline_velocity_limit,
     )
     hold = {}
@@ -1788,7 +1774,7 @@ def row_step(
     head = [
         f"int row_type = {rows.kind('i') if kind is None else kind};",
         # A spin row is solved with its friction pair (torsion).
-        f"if (row_type == {TORSION}) continue;" if laws.torsion and kind is None else "",
+        f"if (row_type == {ROW_TORSION}) continue;" if laws.torsion and kind is None else "",
         admission,
     ]
     visit = row_visit(
@@ -1854,13 +1840,13 @@ def rows_block(
         lanes=rows.lanes,
         eps=rows.eps,
         spin_row=lambda contact: rows.spin_of(contact, end),
-        contact_kinds=(CONTACT,),
+        contact_kinds=(ROW_CONTACT,),
         owned=False,
         **cached,
     )
     body = [
         # A spin row is solved with its friction pair (torsion).
-        f"{inner}if (mf_rt == {TORSION}) continue;" if laws.torsion else "",
+        f"{inner}if (mf_rt == {ROW_TORSION}) continue;" if laws.torsion else "",
         indent(admission, inner) if admission else "",
         row_visit(ctx, laws, parent=rows.parent_of("packed_tp"), check="mf_diag", declare="", pad=inner),
     ]
@@ -1886,7 +1872,7 @@ def friction_triple_visit(
     names = (("tangent", "first"), ("sibling", "second"), ("spin", "spin"))
     rhs = {name: ctx.rhs(row) for row, name in names}
     changes = tuple(
-        diag.change(f"{name}_delta", f"{name}_bound", str(TORSION if name == "spin" else FRICTION), row)
+        diag.change(f"{name}_delta", f"{name}_bound", str(ROW_TORSION if name == "spin" else ROW_FRICTION), row)
         for row, name in names
     )
     lines = [
@@ -1940,7 +1926,7 @@ def impulse_seed(
     apply: str,
     sync: str,
     *,
-    skip: int = VELOCITY_LIMIT,
+    skip: int = ROW_JOINT_VELOCITY_LIMIT,
     declare: tuple[str, ...] = (),
     pad: str = "    ",
 ) -> str:
@@ -1990,7 +1976,7 @@ def velocity_limit_pass(rows: WorldRows, op, laws: RowLaws, *, end: str = "m_den
     lines = [
         f"for (int i = 0; i < {end}; i++) {{",
         *((indent(visit, "    "),) if visit else ()),
-        f"    if (({rows.kind('i', scan=True)}) != {VELOCITY_LIMIT}) continue;",
+        f"    if (({rows.kind('i', scan=True)}) != {ROW_JOINT_VELOCITY_LIMIT}) continue;",
         f"    float denom = {rows.diag('i')};",
         "    if (denom <= 0.0f) continue;",
         "",
@@ -2004,7 +1990,7 @@ def velocity_limit_pass(rows: WorldRows, op, laws: RowLaws, *, end: str = "m_den
         "    const float delta_impulse_vlim = vlim.v1;",
         f"    {lanes.sync()}",
     ]
-    change = Change("delta_impulse_vlim", "bound_vlim", str(VELOCITY_LIMIT), "denom", scaled=True)
+    change = Change("delta_impulse_vlim", "bound_vlim", str(ROW_JOINT_VELOCITY_LIMIT), "denom", scaled=True)
     lines += [
         f"    {rows.store('i', 'vlim.v0')}",
         "",
@@ -2044,7 +2030,7 @@ def speed_rows_pass(
             f"for (int i = {start}; i < {end}; i++) {{",
             visit,
             unpack_mf_header("rec_a", "    "),
-            f"    if (mf_rt != {SPEED}) continue;",
+            f"    if (mf_rt != {ROW_SPEED}) continue;",
             "    if (mf_diag <= 0.0f || dof_a < 0) continue;",
             "",
             f"    const int speed_axis = {op.element('i', '3')} != 0.0f ? 3 : 0;",
@@ -2153,7 +2139,7 @@ def speed_row(
         f"{pad}if (speed_row[2] != 0.0f) {{",
         change_vote(
             laws,
-            (Change("speed_row[1]", "bound_speed", str(SPEED), f"1.0f / {inverse}"),),
+            (Change("speed_row[1]", "bound_speed", str(ROW_SPEED), f"1.0f / {inverse}"),),
             pad + "    ",
         ),
         "\n".join(pad + "    " + line for line in push.split("\n")),
@@ -2296,7 +2282,11 @@ class JacobiRows:
         ``i``) and its kind, its diagonal formed later (:func:`jacobi_scale`). ``unilateral`` lists the row types that
         clamp at zero; under torsion a contact's spin row is of its friction pair's kind (stepped and projected with
         it)."""
-        friction = f"row_type == {FRICTION} || row_type == {TORSION}" if self.torsion else f"row_type == {FRICTION}"
+        friction = (
+            f"row_type == {ROW_FRICTION} || row_type == {ROW_TORSION}"
+            if self.torsion
+            else f"row_type == {ROW_FRICTION}"
+        )
         decode = [
             f"if ({' || '.join(f'row_type == {kind}' for kind in unilateral)}) kind = {JACOBI_UNILATERAL};",
             f"else if ({friction}) kind = {JACOBI_FRICTION};",
@@ -2309,13 +2299,13 @@ class JacobiRows:
             f"    const int row_type = {row_type} & {_DENSE_META_ROW_TYPE_MASK};",
             f"    s_parent[i] = {parent};",
             f"    s_mu[i] = {mu};",
-            f"    s_vlim[i] = row_type == {VELOCITY_LIMIT} ? 1 : 0;" if self.limits else "",
+            f"    s_vlim[i] = row_type == {ROW_JOINT_VELOCITY_LIMIT} ? 1 : 0;" if self.limits else "",
             f"    int kind = {JACOBI_BILATERAL};",
             *("    " + line for line in decode),
             "    s_kind[i] = kind;",
             "    s_step[i] = 1.0f;",
             "    s_type[i] = row_type;" if self.types else "",
-            f"    row_contact = row_type == {CONTACT};" if self.weighted else "",
+            f"    row_contact = row_type == {ROW_CONTACT};" if self.weighted else "",
             "}",
         ]
         group = self.group

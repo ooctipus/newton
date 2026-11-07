@@ -16,7 +16,17 @@ from . import field_group
 from .device_preludes import reserve
 from .field_group import Field, FieldGroup
 from .joint_table import FreeBodies, JointTable
-from .row_laws import LINK_ROWS, contact_restitution_rhs, joint_limit_side, limit_rhs, row_rhs, velocity_limit_active
+from .row_laws import (
+    LINK_ROWS,
+    ROW_CONTACT,
+    ROW_LINK,
+    ROW_SPEED,
+    contact_restitution_rhs,
+    joint_limit_side,
+    limit_rhs,
+    row_rhs,
+    velocity_limit_active,
+)
 from .row_records import UNIT_LINK, UNIT_SPEED, DenseRows, RowSupport, row_sides, unit_source
 
 LINK_PLAN = FieldGroup(
@@ -38,30 +48,6 @@ Links = field_group.struct(
     __name__,
 )
 """The links' tables (:data:`LINK_PLAN`) and their dense slots."""
-
-
-PGS_CONSTRAINT_TYPE_CONTACT = 0
-# A free rigid body's speed row: it bounds the magnitude of the body's linear or angular velocity (type 1 was the
-# PhysX drive row; drives fold into the mass matrix).
-PGS_CONSTRAINT_TYPE_SPEED = 1
-PGS_CONSTRAINT_TYPE_FRICTION = 2
-PGS_CONSTRAINT_TYPE_JOINT_LIMIT = 3
-# Joint velocity-limit row. Mirrors the PhysX per-DOF velocity clamp (see
-# ``notes/investigations/velocity-spike/physx-deep-dive.md`` §4, math
-# appendix). Finite limits create two unilateral rows every step: one lower
-# bound row and one upper bound row. No Baumgarte / ERP bias.
-PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT = 4
-# Mimic (joint coupling) row: the bilateral equality
-# ``q_follower - coef1 * q_leader - coef0 = 0`` between two 1-DoF joints of the
-# same articulation, from ``Model.constraint_mimic_*``. Jacobian has two
-# entries (+1 on the follower DOF, -coef1 on the leader DOF); lambda is
-# unbounded; drift is removed with the standard Baumgarte ``pgs_beta`` bias.
-PGS_CONSTRAINT_TYPE_MIMIC = 5
-# Link row: one of the six bilateral rows that tie a body's shadow to its primary piece (:mod:`.body_cut`), unbounded
-# lambda, Baumgarte drift correction.
-PGS_CONSTRAINT_TYPE_LINK = 6
-PGS_CONSTRAINT_TYPE_TORSION = 7
-PGS_CONSTRAINT_TYPE_COUNT = 8
 
 # Keep launch-geometry-specific kernels out of the large general kernel module: Warp compiles one whole module variant
 # per block dimension.
@@ -181,7 +167,7 @@ def write_link_rows(
     line = rows.first[links.world[k]]
     slot = base + row
     support.units[line, slot] = unit_source(UNIT_LINK, i)
-    rows.row_type[line, slot] = PGS_CONSTRAINT_TYPE_LINK
+    rows.row_type[line, slot] = ROW_LINK
     rows.sides[line, slot] = row_sides(body_to_articulation[primary], body_to_articulation[shadow], support.dofs)
     rows.row_parent[line, slot] = -1
     rows.row_mu[line, slot] = 0.0
@@ -218,7 +204,7 @@ def row_bias(rows: DenseRows, bias: RowBias, line: int, i: int, incident: float)
     weight 1); a material contact (its writer stored its rhs and compliance) keeps its rhs. ``weighted`` rows store
     their regularization weight."""
     kind = rows.row_type[line, i]
-    if bias.material != 0 and kind == PGS_CONSTRAINT_TYPE_CONTACT:
+    if bias.material != 0 and kind == ROW_CONTACT:
         if rows.row_eps[line, i] > 0.0:
             return
     inv_dt = 1.0 / bias.dt
@@ -227,7 +213,7 @@ def row_bias(rows: DenseRows, bias: RowBias, line: int, i: int, incident: float)
     rhs, row_w = row_rhs(
         kind, phi, rows.row_beta[line, i], target, inv_dt, 1.0, bias.speculative_scale, 1.0, bias.contact_w
     )
-    if kind == PGS_CONSTRAINT_TYPE_CONTACT:
+    if kind == ROW_CONTACT:
         restitution = rows.restitution[line, i]
         if restitution > 0.0:
             fires, bounce = contact_restitution_rhs(
@@ -326,7 +312,7 @@ def allocate_rigid_velocity_limit_slots(
         if row < units.shape[1]:
             units[line, row] = unit_source(UNIT_SPEED, 2 * root_dof)
         rows.sides[line, row] = wp.vec2i(art, -1)
-        rows.row_type[line, row] = PGS_CONSTRAINT_TYPE_SPEED
+        rows.row_type[line, row] = ROW_SPEED
         rows.row_parent[line, row] = -1
         rows.row_mu[line, row] = 0.0
         # The speed law's bias is its limit: the row's target is ``-limit``, as a joint velocity limit's, and its rhs

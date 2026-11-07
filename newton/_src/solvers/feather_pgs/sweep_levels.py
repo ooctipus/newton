@@ -32,7 +32,7 @@ from . import kernel_template
 from .contact_input import ContactInput
 from .device_preludes import LANE_WORDS, SHARED_STORAGE, group_native, lane_group
 from .kernel_template import KernelTemplate, items, python_kernel
-from .row_kernels import PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
+from .row_laws import ROW_FRICTION, ROW_TORSION
 
 
 def level_pass(*, units: str, resources: str, counts: str, store: str, lanes: int = 32) -> str:
@@ -341,7 +341,7 @@ def _sparse_contact_levels_kernel(
     L = lanes
     if M >= 1 << 15:
         raise ValueError(f"a world's contact schedule packs a unit's level and rank in 16 bits each: {M} rows")
-    friction, spin = int(PGS_CONSTRAINT_TYPE_FRICTION), int(PGS_CONSTRAINT_TYPE_TORSION)
+    friction, spin = int(ROW_FRICTION), int(ROW_TORSION)
     kind = "world_row_type.data[row_base + normal]"
     # A unit's members (a tangent, or a spin row) follow its head; every other row of the segment heads a unit.
     unit_head = f"({kind} != {friction} && {kind} != {spin})" if torsion else f"{kind} != {friction}"
