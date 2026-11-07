@@ -1008,9 +1008,9 @@ class RowLaws:
             if contacts is not None
             else ContactInput()
         )
-        if solver.spec.classes.case == "K1":
+        if solver.spec.classes.support == "factor":
             self.write_support(solver, state_in, contact_input, dt)
-        elif solver.spec.classes.case == "K2":
+        elif solver.spec.classes.support == "diagonal":
             self.write_slot_rows(solver, contacts, contact_input, dt)
         else:
             self.write_general(solver, state_in, contact_input, dt, part)
@@ -1230,9 +1230,9 @@ class RowLaws:
             # The allocator writes the contact rows' unit sources; the one writer writes every contact row's records and
             # walks every row (walk_rows): the general placement's into its packed rows, the support placement's (K1)
             # into its support sink, the sparse diagonal's (K2) into its slots sink.
-            if solver._plan.route.case == "K1":
+            if solver._plan.route.support == "factor":
                 writers = (solver.sweep.support_units_kernel, solver.sweep.support_rows)
-            elif solver._plan.route.case == "K2":
+            elif solver._plan.route.support == "diagonal":
                 writers = (walk_rows.slot_writer(solver),)
             else:
                 # The general placement's rows in two parts: the topology's, walked in blocks, and the rest.

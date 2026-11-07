@@ -626,12 +626,12 @@ class HeldTree:
         """Each world class's grouping and why (:attr:`HeldClass.reason`)."""
         return tuple(held.reason for held in self.plan.classes)
 
-    def record(self, case: str) -> dict:
+    def record(self, support: str) -> dict:
         """The held tree's route records: ``routes.held_tree`` and ``routes.publication``."""
         forest = any(getattr(getattr(group, "layout", None), "forest", False) for group in self.groups)
         return {
             "held_tree": {
-                "owner": "forest" if forest else "tree" if case == "K1" else "mixed",
+                "owner": "forest" if forest else "tree" if support == "factor" else "mixed",
                 "classes": [
                     {"worlds": int(held.worlds.size), "grouping": held.grouping, "reason": held.reason}
                     for held in self.plan.classes

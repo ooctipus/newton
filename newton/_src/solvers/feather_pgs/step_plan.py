@@ -245,7 +245,7 @@ class StepPlan:
             route=route,
             kernels=MappingProxyType(
                 {
-                    "sparse": kernel_key(sweep.sparse_kernel) if route.case == "K1" else None,
+                    "sparse": kernel_key(sweep.sparse_kernel) if route.support == "factor" else None,
                     "sparse_diagonal": kernel_key(sweep.sparse_diagonal_kernel),
                     "paired_factor": kernel_key(sweep.paired_factor_kernel),
                     "mf_gs": kernel_key(sweep.mf_gs_kernel),
@@ -287,9 +287,9 @@ def _response(row: RouteRow, forest) -> dict[int, Route]:
     diagonal (case K2's pair) or in the packed rows' build (every other class)."""
     routes = {}
     for size in forest.size_groups:
-        if row.case == "K1":
+        if row.support == "factor":
             routes[size] = Route("owner", "Native sparse factors' writer whitens every row into its support.")
-        elif row.case == "K2" and size in (row.sizes["diagonal"], row.sizes["dense"]):
+        elif row.support == "diagonal" and size in (row.sizes["diagonal"], row.sizes["dense"]):
             routes[size] = Route(
                 "sparse_diagonal", "The sparse-diagonal owner whitens its rows in place: no size builds a response."
             )
@@ -303,9 +303,9 @@ def _response(row: RouteRow, forest) -> dict[int, Route]:
 
 
 def _solve(row: RouteRow) -> SolveRoute:
-    if row.case == "K1":
+    if row.support == "factor":
         route = Route("sparse_pgs", "Native sparse factors own the sweep.")
-    elif row.case == "K2":
+    elif row.support == "diagonal":
         route = Route("sparse_diagonal", "The diagonal-mass contact owner owns the sweep.")
     else:
         route = Route("matrix_free_gs", "Matrix-free Gauss-Seidel; paired and tiered owners claim their worlds first.")
@@ -625,7 +625,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     # contacts: where the family bound holds them and the one writer walks the general placement's rows, it walks them
     # beside the contact pass (Beside) and the rest after it, the two parts joined before the rest. Their diagonals
     # start from zero before them.
-    topology = Beside(model.device) if holds and bounds and route.case not in ("K1", "K2") else None
+    topology = Beside(model.device) if holds and bounds and route.support == "dense" else None
 
     def write_topology_rows(step):
         if placement.clears_diagonals:

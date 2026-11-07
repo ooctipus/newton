@@ -122,8 +122,8 @@ class RouteRow:
 
     laws: Laws
     """Axis 2: the row laws."""
-    case: str
-    """Axis 3: the placement case (:data:`.class_plan.RULES`, or ``"K6"`` general)."""
+    support: str
+    """Axis 3: where a row's entries live (:attr:`.class_plan.ClassPlan.support`)."""
     producer: str
     """Axis 3: the producer of the contact rows, decided once at construction: ``walk`` (the one writer), ``keyed_rows``
     (the tiers' in-kernel rows) or ``none`` (a class without a responding coordinate admits no contact)."""
@@ -134,7 +134,7 @@ class RouteRow:
     sizes: dict[str, int | None]
     """The case owners' sizes: ``"packed"`` (K1's factored size), ``"diagonal"`` and ``"dense"`` (K2's pair)."""
     reasons: dict[str, str | None]
-    """Why each case holds the class or does not (:attr:`.class_plan.ClassPlan.reasons`)."""
+    """Why each placement rule holds the class or does not (:attr:`.class_plan.ClassPlan.reasons`)."""
 
     def record(self) -> dict:
         """The row's axes and each case's reason as a JSON-compliant record (``routes.row``; the laws are

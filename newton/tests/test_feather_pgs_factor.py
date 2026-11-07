@@ -1307,8 +1307,8 @@ class TestWalkF1(unittest.TestCase):
                 self.check(check_rows(solver, joint_q, capture, np.random.default_rng(7)))
 
 
-_OWN_ROW_LAYOUTS = ("K1", "K2")
-"""The cases whose rows live in their own layouts, not the packed store F1 reads: K1's support rows in factor
+_OWN_ROW_LAYOUTS = ("factor", "diagonal")
+"""The supports whose rows live in their own layouts, not the packed store F1 reads: K1's support rows in factor
 coordinates, K2's slot rows (their sweeps' tests read them)."""
 
 
@@ -1317,8 +1317,8 @@ def _add_f1_tests():
 
         def test(self, physics=physics, route=route):
             solver, joint_q, capture = run_route(physics, route)
-            if solver.spec.classes.case in _OWN_ROW_LAYOUTS:
-                self.skipTest(f"case {solver.spec.classes.case} writes its rows in its own layout")
+            if solver.spec.classes.support in _OWN_ROW_LAYOUTS:
+                self.skipTest(f"the {solver.spec.classes.support} support writes its rows in its own layout")
             self.check(check_rows(solver, joint_q, capture, np.random.default_rng(7)))
 
         test.__doc__ = f"F1 on {physics.name} through {route.name}."
@@ -1865,7 +1865,7 @@ def placement_frames(solver, joint_q: np.ndarray, capture) -> dict:
     world of the support placement, case K1 (``unstored``: its rows are :class:`TestSupportPlacement`'s)."""
     forest, placement = solver.forest, solver.placement
     out = {"rows": 0.0, "leave": 0.0, "general": 0, "unstored": 0}
-    if not getattr(placement, "walks", False) or solver.spec.classes.case == "K1":
+    if not getattr(placement, "walks", False) or solver.spec.classes.support == "factor":
         out["unstored"] = int(forest.world_count)
         return out
     # The one writer of the general placement (FL3.3) and of the sparse diagonal (FL3.5): its rows are walked from

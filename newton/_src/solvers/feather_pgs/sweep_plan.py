@@ -1099,16 +1099,16 @@ class Sweep:
         row, classes, forest = plan.route, self.classes, self.forest
         primary = self.paired_response_primary_size
         if primary is None:
-            paired = {"enabled": False, "reason": row.reasons["K5"]}
+            paired = {"enabled": False, "reason": row.reasons["paired"]}
         else:
-            factor = row.case == "K5"
+            factor = classes.paired is not None
             paired = {
                 "enabled": True,
                 "primary_dofs": int(primary),
                 "secondary_dofs": int(self.paired_response_secondary_size),
                 "factor_coordinates": factor,
                 # Why the paired response keeps its register inverse instead of factor coordinates (None when admitted).
-                "factor_coordinates_reason": row.reasons["K5"],
+                "factor_coordinates_reason": row.reasons["paired"],
                 "contact_units": bool(self.factor_coordinate_contact_units),
                 "reason": "One articulation factor and one free body per world share one response"
                 + (" in factor coordinates." if factor else " with a register inverse."),
@@ -1118,7 +1118,7 @@ class Sweep:
         options, unselected = dict(packed.sweep) if packed else {}, "Native sparse factors are not selected."
         sparse = {
             "size": json_value(row.sizes["packed"]),
-            "reason": row.reasons["K1"],
+            "reason": row.reasons["packed"],
             "velocity_limits": bool(self.sparse_velocity_limits),
             "active_rows": bool(options.get("active_rows")),
             "active_rows_reason": packed.active_rows_reason if packed else unselected,
@@ -1151,21 +1151,21 @@ class Sweep:
         count = int(forest.free_rigid_body_count)
         owners = []
         if count:
-            if row.case == "K1":
+            if row.support == "factor":
                 owners.append("sparse_free_rows")
             if primary is not None:
-                owners.append("paired_factor" if row.case == "K5" else "paired_response")
+                owners.append("paired_factor" if classes.paired is not None else "paired_response")
             owners.append("matrix_free_rows")
         return {
             "paired_response": paired,
             "sparse_diagonal": {
-                "enabled": row.case == "K2",
+                "enabled": row.support == "diagonal",
                 "response_dofs": json_value(row.sizes["diagonal"]),
                 "dense_dofs": int(row.sizes["dense"] or 0),
                 "contact_units": bool(diagonal is not None and diagonal.units),
                 "speculative_contact_batches": bool(diagonal is not None and diagonal.speculative_batches),
                 "fused_joint_limits": bool(classes.fused_sizes),
-                "reason": row.reasons["K2"],
+                "reason": row.reasons["diagonal"],
             },
             "sparse_mass_matrix": sparse,
             "sweep": self._record_sweep(plan),
@@ -1272,7 +1272,7 @@ class Sweep:
         return {
             "family": "keyed_parallel" if row.producer == "keyed_rows" else "parallel",
             # Why the class takes the tiers (case K4: the in-kernel response's shape).
-            "inkernel_response_reason": row.reasons["K4"],
+            "inkernel_response_reason": row.reasons["tiers"],
             # Every built tier projects each friction pair on its patch ring's pooled normal load (patch friction).
             "linked_rows": all(tier.config.linked_rows for tier in tiers),
             # The last-word velocity-limit pass after the final sweep (linked tiers with joint velocity limits).

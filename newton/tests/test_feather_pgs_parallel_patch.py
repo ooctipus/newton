@@ -1122,7 +1122,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 _plan=SimpleNamespace(
                     route=SimpleNamespace(
                         producer="walk",
-                        reasons={"K4": "The parallel tiers form the response of sizes [12] in-kernel."},
+                        reasons={"tiers": "The parallel tiers form the response of sizes [12] in-kernel."},
                     )
                 ),
             )
@@ -1243,12 +1243,16 @@ def _plan_class(inputs, *, general):
 
 
 class TestTierRule(unittest.TestCase):
-    """Build the Jacobi tiers for case K4, a tree beside a free body, where no earlier case claims the class."""
+    """Build the Jacobi tiers for case K4, a tree beside a free body, where its rows do not step in turn."""
 
     @staticmethod
-    def _rule(response=((16, 6, 0, 16), "The parallel tiers form the response in-kernel."), **changes):
+    def _rule(
+        response=((16, 6, 0, 16), "The parallel tiers form the response in-kernel."),
+        in_turn="A hub world of 22 coordinates steps its rows at once.",
+        **changes,
+    ):
         """The tier rule on a class's inputs, allegro's by default (a 16-coordinate hand and a cube, 192 dense rows),
-        with the in-kernel response ``response`` (its sizes and why)."""
+        with the in-kernel response ``response`` (its sizes and why) and why its rows do not step in turn."""
         inputs = SimpleNamespace(
             pins=SolverFeatherPGS.Pins(),
             dense_rows=192,
@@ -1258,7 +1262,10 @@ class TestTierRule(unittest.TestCase):
             setattr(inputs, name, value)
         sizes, reason = response
         meta = None if sizes is None else np.zeros((4, 4), np.int32)
-        with patch.object(class_plan, "tier_response", lambda shape: (sizes, meta, reason)):
+        with (
+            patch.object(class_plan, "tier_response", lambda shape: (sizes, meta, reason)),
+            patch.object(class_plan, "_in_turn", lambda forest: in_turn),
+        ):
             return class_plan.tier_rule(inputs)
 
     def test_a_tree_beside_a_body_takes_the_tiers(self):
@@ -1279,8 +1286,10 @@ class TestTierRule(unittest.TestCase):
             # No world holds a free body beside a tree: no hub.
             (
                 {"forest": SimpleNamespace(world_count=4, max_world_dofs=22, shape=SimpleNamespace(beside=False))},
-                "case K4",
+                "a free body beside a tree",
             ),
+            # A world whose `u` fits the lanes and whose rows step in turn (case K5).
+            ({"in_turn": None}, "in turn"),
             ({"pins": SolverFeatherPGS.Pins(tiers=0)}, "tiers=0"),
             ({"response": (None, "A world has several articulations of size 6.")}, "several"),
         ):
@@ -1289,18 +1298,15 @@ class TestTierRule(unittest.TestCase):
                 self.assertIsNone(choice)
                 self.assertIn(reason, why)
 
-    def test_an_earlier_case_or_the_general_data_keep_the_class(self):
-        """Give the class to an earlier case that fits, and keep every class general under a pin."""
-        tiers = next(rule for name, _, rule in class_plan.RULES if name == "K4")
-        rules = (("K5", "factor coordinates of a tree beside one free body", lambda inputs: (object(), None)),)
-        with patch.object(class_plan, "RULES", (*rules, ("K4", "the Jacobi tiers", tiers))):
-            plan = _plan_class(_class_inputs(), general=None)
-        self.assertEqual(plan.case, "K5")
-        self.assertIn("case K5", plan.reasons["K4"])
+    def test_one_rule_or_the_general_data_holds_the_class(self):
+        """Refuse a class two exclusive rules both hold, and keep every class general under a pin."""
+        rules = {"paired": lambda inputs: (object(), None), "tiers": lambda inputs: (object(), None)}
+        with patch.object(class_plan, "RULES", rules), self.assertRaises(RuntimeError):
+            _plan_class(_class_inputs(), general=None)
         self.assertIsNone(class_plan.general_reason(SolverFeatherPGS.Pins()))
         general = class_plan.general_reason(SolverFeatherPGS.Pins(placement="general"))
         self.assertIn("general placement", general)
-        self.assertIn("general placement", _plan_class(_class_inputs(), general=general).reasons["K4"])
+        self.assertIn("general placement", _plan_class(_class_inputs(), general=general).reasons["tiers"])
 
     def test_a_pin_builds_the_tiers_on_a_single_tree(self):
         """Build the tiers a test pin asks for on a class whose response they form, at the pinned bound."""

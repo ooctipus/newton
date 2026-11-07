@@ -464,7 +464,7 @@ class KeyedRows:
 def create_owner(solver) -> tuple[KeyedRows | None, str]:
     """The keyed rows of the in-kernel parallel tiers' class (case K4) where their layout keys its topology
     (:func:`.keyed_row_layout.topology_plan`), and why or why not."""
-    if solver.spec.classes.case != "K4":
+    if solver.spec.classes.tiers is None:
         return None, "Keyed rows need the Jacobi tiers (routes.sweep.tiers)."
     if not solver.options.enable_joint_limits:
         # Their layout freezes the class's structure: a run-time change the one writer takes (a body made kinematic)

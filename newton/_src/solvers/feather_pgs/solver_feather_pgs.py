@@ -506,8 +506,8 @@ class SolverFeatherPGS(SolverBase):
         self.spec = StepSpec.build(model, options, self.cut, self.forest, laws, pins, capacities, classes)
         # The placement: where the rows live, their capacities and status.
         self.placement = Placement(self.spec, model, options, self.laws, self.factor)
-        case = classes.case
-        # The sweep: its owners build the class's case.
+        support = classes.support
+        # The sweep: its owners build the class's choice.
         self.sweep = Sweep(
             model,
             options,
@@ -551,22 +551,21 @@ class SolverFeatherPGS(SolverBase):
         # read it. The Jacobi tiers (case K4, FL3.7) read the one writer's rows, or walk their keyed rows in the kernel,
         # and leave by the walk; the keyed rows' general worlds are the one writer's (keyed_rows.keyed_general_units).
         # The support placement (case K1, FL3.4) whitens and leaves its rows by the walk too, into its support sink.
-        general = case == "K1" or bool(
-            case in ("K6", "K5", "K4") and self.spec.classes.mf_sweeps and np.any(self.forest.response_dof_count > 0)
+        general = support == "factor" or bool(
+            support == "dense" and self.spec.classes.mf_sweeps and np.any(self.forest.response_dof_count > 0)
         )
         # The sparse diagonal (case K2, FL3.5) walks each world's dense arm into its rows' dense parts and leaves it
         # by the walk; a key of the star is one step to the world (walk_rows.star_step) and holds no walk data.
-        diagonal = case == "K2"
-        self.placement.walks = general or diagonal
+        self.placement.walks = general or support == "diagonal"
         # Free bodies' rows are written by the walk only (walk_rows.write_free_body_rows). A responding free body gives
         # every case a walking class: K1 and K2 never hold free bodies, and K4-K6 sweep matrix-free (a world with the
         # body's six coordinates).
         if self.forest.has_free_rigid_bodies and not self.placement.walks:
-            raise RuntimeError(f"Free bodies' rows are written by the walk: case {case} must walk.")
+            raise RuntimeError(f"Free bodies' rows are written by the walk: the {support} placement must walk.")
         if self.factor.eliminates and not self.placement.walks:
             raise RuntimeError(
                 "Bilateral blocks are closed in the one writer's block phase (walk_rows): their class must walk, "
-                f"not case {case}."
+                f"not the {support} placement."
             )
         # The walk is the trees' factor (Z4): the predictor solves every tree of its groups by it, a prescribed tree
         # beside a responding one in a size group included (the dense factor held it before Z4.2), the placements
@@ -579,7 +578,7 @@ class SolverFeatherPGS(SolverBase):
             self.factor.plan_walk(walking)
         if self.placement.walks:
             self.placement.hold_units()
-            if case == "K1":
+            if support == "factor":
                 self.sweep.plan_support_walk()
         self.sweep.build()
         self.sweep.open_streams(overlap=self.options.diagnostics.sync_timings is None)
@@ -606,10 +605,9 @@ class SolverFeatherPGS(SolverBase):
         # producer writes every contact row, decided once from the owners' admissions: keyed rows (the tiers' in-kernel
         # sink, case K4), else the one writer where the class walks its rows, else none (no responding coordinate: no
         # contact is admitted).
-        diagonal = case == "K2"
         route = RouteRow(
             laws=self.laws.set,
-            case=case,
+            support=support,
             reasons=dict(self.spec.classes.reasons),
             producer=(
                 "keyed_rows" if self.placement.keyed_rows is not None else "walk" if self.placement.walks else "none"
@@ -619,7 +617,7 @@ class SolverFeatherPGS(SolverBase):
             sizes={
                 "packed": self.spec.classes.packed_size,
                 "diagonal": self.spec.classes.diagonal_size,
-                "dense": self.spec.classes.dense_size if diagonal else None,
+                "dense": self.spec.classes.dense_size if support == "diagonal" else None,
             },
         )
         # The step: its stages bound to the owners above from the spec and the route, the sweep's kernels and streams,
@@ -683,12 +681,12 @@ class SolverFeatherPGS(SolverBase):
         floats are strings).
         """
         selection = {
-            "sparse_mass_matrix": "on" if self._plan.route.case == "K1" else "off",
+            "sparse_mass_matrix": "on" if self._plan.route.support == "factor" else "off",
             "cached_dynamics": "on",
             "publication": "cached",
             "cached_prediction": "tree",
             "reasons": {
-                "sparse_mass_matrix": self._plan.route.reasons["K1"],
+                "sparse_mass_matrix": self._plan.route.reasons["packed"],
                 "publication": "Paired cache owns next-state publication.",
             },
         }

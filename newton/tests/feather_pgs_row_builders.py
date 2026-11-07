@@ -81,11 +81,11 @@ def install_cpu_keyed_rows(solver):
     # Case K4's tiers of four rows; its class walks: the tiers walk their keyed rows in the kernel, the one writer the
     # general worlds' rows.
     sizes, meta, _ = class_plan.tier_response(solver.forest.shape)
-    classes = dataclasses.replace(solver.spec.classes, case="K4", tiers=class_plan.Tiers(sizes, meta, rows=4))
+    classes = dataclasses.replace(solver.spec.classes, tiers=class_plan.Tiers(sizes, meta, rows=4))
     solver.spec = dataclasses.replace(solver.spec, classes=classes)
     solver.placement.classes = solver.sweep.classes = classes
     solver.placement.walks = True
-    route = dataclasses.replace(solver._plan.route, case="K4", producer="keyed_rows")
+    route = dataclasses.replace(solver._plan.route, support="dense", producer="keyed_rows")
     solver.placement.keyed_rows = keyed_rows.KeyedRows(solver)
     # The step's stages are chosen from the class at construction: the keyed class stages its own.
     solver._plan = StepPlan.build(solver.spec, route, solver)

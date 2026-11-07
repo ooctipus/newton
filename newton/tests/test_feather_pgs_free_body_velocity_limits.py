@@ -354,7 +354,7 @@ class _FreeBodyVelocityLimitChecks:
             with self.subTest(articulated=articulated, fraction=fraction):
                 run = _free_boxes(self.device, worlds, articulated=articulated, wrenches=wrenches, fraction=fraction)
                 if articulated == 17 and wp.get_device(self.device).is_cuda:
-                    self.assertEqual(run.solver.spec.classes.case, "K5")
+                    self.assertIsNotNone(run.solver.spec.classes.paired)
                 velocity = _step(run)
                 self.check_rows_are_velocity_limits(run)
                 _assert_on_limit_scale(velocity, expected)

@@ -1,16 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The class plan: the placement case of the solver's class, decided by rules over data before any of its owners.
+"""The class plan: the placement of the solver's class, decided by predicates over data before any of its owners.
 
-Each case's rule (:data:`RULES`, in precedence order) reads only data known before the owners: the forest, the row
-laws, the options, the row capacity, the device's shared budget, the test pins, the factor's drive plan and the held
-tree's admission of the representation the case needs. It returns the case's choice (what its owner builds) or why the
-class does not fit. :func:`plan_class` applies the rules in order: the first that fits gives the class its case, and
-every later case says which case holds the class. One datum keeps every class general: a test pin
-(:func:`general_reason`). Each case's body runs on both devices, the CPU's one thread a lane group (the Jacobi tiers'
-block group as virtual lanes), so the device decides no case. The owners then build from the plan (:class:`ClassPlan`)
-and decide nothing of the case.
+Each choice's rule (:data:`RULES`) is a predicate on the class shape (:class:`.forest_plan.ClassShape`) and data known
+before the owners: the row laws, the options, the row capacity, the device's shared budget, the test pins, the
+factor's drive plan and the held tree's admission of the representation the choice needs. It returns the choice (what
+its owner builds) or why the class does not fit. The predicates exclude one another, so at most one holds the class
+and none outranks another. One datum keeps every class general: a test pin (:func:`general_reason`). Each body runs
+on both devices, the CPU's one thread a lane group, so the device decides nothing. The owners then build from the
+plan (:class:`ClassPlan`) and decide nothing of it.
 """
 
 from __future__ import annotations
@@ -130,13 +129,11 @@ class Tiers:
 
 @dataclass(frozen=True, eq=False)
 class ClassPlan:
-    """The class's case and each case's reason, decided by :func:`plan_class`, with the choice of the case that holds
-    the class (the others are ``None``)."""
+    """The choice that holds the class (the others are ``None``; none for the general placement) and each rule's reason,
+    decided by :func:`plan_class`."""
 
-    case: str
-    """``"K1"``, ``"K2"``, ``"K4"``, ``"K5"``, or ``"K6"`` (general) where no rule fits."""
     reasons: Mapping[str, str | None]
-    """Why each case holds the class or does not."""
+    """Why each rule of :data:`RULES` holds the class or does not."""
     mf_sweeps: bool
     """The matrix-free sweeps run and read the dense rows packed (:mod:`.packed_rows`): every class but native sparse
     factors (case K1) and the sparse diagonal (case K2), where a world has coordinates."""
@@ -146,6 +143,11 @@ class ClassPlan:
     packed: Packed | None = None
     paired: Paired | None = None
     tiers: Tiers | None = None
+
+    @property
+    def support(self) -> str:
+        """Where a row's entries live: on its native sparse factor's support, the sparse diagonal's, or dense."""
+        return "factor" if self.packed else "diagonal" if self.diagonal else "dense"
 
     @property
     def diagonal_size(self) -> int | None:
@@ -225,6 +227,8 @@ def diagonal_rule(inputs: ClassInputs) -> tuple[Diagonal | None, str]:
     dense component per world, of the same two sizes in every world, whose compact diagonal the held tree takes."""
     forest, shape = inputs.forest, inputs.forest.shape
     missing = "No world pairs a diagonal-mass articulation with fused limits and one compact dense articulation."
+    if inputs.pins.tiers:
+        return None, "A test pin builds the Jacobi tiers (tiers) on dense storage."
     blocks = _star_beside(inputs)
     if blocks is None:
         return None, missing
@@ -497,24 +501,30 @@ def split_level(coordinates: int) -> bool:
     return coordinates < _SEQUENTIAL_COORDINATES
 
 
-def paired_rule(inputs: ClassInputs) -> tuple[Paired | None, str]:
-    """Case K5, `u` in registers: a tree beside one free body in every world, in the lanes, its rows in turn."""
-    forest, shape = inputs.forest, inputs.forest.shape
+def _in_turn(forest) -> str | None:
+    """Why the rows do not step in turn, `u` in registers (a tree beside one free body, in the lanes), or ``None``."""
+    shape = forest.shape
     if not (shape.blocks == 2 and shape.present(0) and shape.present(1) and shape.free.count(True) == 1):
-        return None, "No world class pairs one tree with exactly one free body in every world."
-    tree, body = shape.free.index(False), shape.free.index(True)
-    reason = first_failed(
+        return "No world class pairs one tree with exactly one free body in every world."
+    return first_failed(
         (
-            (shape.sizes[tree] not in forest.diagonal_mass_sizes, "The tree is a star."),
+            (shape.sizes[shape.free.index(False)] not in forest.diagonal_mass_sizes, "The tree is a star."),
             (shape.coordinates <= _LANES, f"{shape.coordinates} coordinates a world exceed a warp's {_LANES} lanes."),
             (
                 tier_response(shape)[0] is None or not split_level(shape.coordinates),
-                f"A hub world of {shape.coordinates} coordinates steps its rows at once (case K4).",
+                f"A hub world of {shape.coordinates} coordinates steps its rows at once.",
             ),
         )
     )
+
+
+def paired_rule(inputs: ClassInputs) -> tuple[Paired | None, str]:
+    """Case K5, `u` in registers: a tree beside one free body in every world, in the lanes, its rows in turn."""
+    forest, shape = inputs.forest, inputs.forest.shape
+    reason = _in_turn(forest)
     if reason is not None:
         return None, reason
+    tree, body = shape.free.index(False), shape.free.index(True)
     # Each tree's free body's group, by the tree's group.
     groups = np.empty(forest.world_count, dtype=np.int32)
     groups[shape.groups[:, tree]] = shape.groups[:, body]
@@ -570,10 +580,8 @@ def tier_rule(inputs: ClassInputs) -> tuple[Tiers | None, str]:
                 "No matrix-free sweep runs whose dense rows the tiers could take.",
             ),
             (pinned is None or bool(pinned), "A test pin builds no tier (tiers=0)."),
-            (
-                bool(pinned) or forest.shape.beside,
-                "The tiers serve a hub: a free body beside a tree in one world (case K4).",
-            ),
+            (bool(pinned) or forest.shape.beside, "The tiers serve a hub: a free body beside a tree in one world."),
+            (_in_turn(forest) is not None, "A world's rows step in turn, `u` in registers."),
         )
     )
     if reason is not None:
@@ -588,37 +596,25 @@ def tier_rule(inputs: ClassInputs) -> tuple[Tiers | None, str]:
     return Tiers(sizes, meta, rows), reason
 
 
-RULES = (
-    ("K2", "the sparse diagonal of a tree beside a star", diagonal_rule),
-    ("K1", "native sparse factors of a single tree", packed_rule),
-    ("K5", "factor coordinates of a tree beside one free body", paired_rule),
-    ("K4", "the Jacobi tiers of dense trees beside a free body", tier_rule),
-)
-"""The specialized cases (placement and producer by class shape) in precedence order, each with its rule: the first
-whose rule fits claims the class. A class no rule claims keeps the general placement, case K6."""
-
-_CHOICE = {"K2": "diagonal", "K1": "packed", "K5": "paired", "K4": "tiers"}
+RULES = MappingProxyType({"diagonal": diagonal_rule, "packed": packed_rule, "paired": paired_rule, "tiers": tier_rule})
+"""Each choice's rule, by the :class:`ClassPlan` field it fills. Their predicates exclude one another; a class none
+holds keeps the general placement."""
 
 
 def plan_class(inputs: ClassInputs, *, general: str | None) -> ClassPlan:
-    """The class's plan: each rule of :data:`RULES` in order until one fits; every case after it says which case
-    holds the class, and ``general`` (:func:`general_reason`), when given, is every case's reason. The held tree's plan
-    follows from the case's choice: the sparse diagonal's admitted it (:attr:`Diagonal.held`), else it is built here
-    (:func:`.held_tree.plan`, which raises ValueError for a model it does not hold)."""
-    descriptions = {name: description for name, description, _ in RULES}
+    """The class's plan: the choice whose rule of :data:`RULES` holds the class, and every rule's reason (``general``,
+    :func:`general_reason`, when given). The held tree's plan follows from the choice: the sparse diagonal's admitted
+    it (:attr:`Diagonal.held`), else it is built here (:func:`.held_tree.plan`, which raises ValueError for a model it
+    does not hold)."""
     forest = inputs.forest
-    case, reasons, choices = "K6", {}, {}
-    for name, _, rule in RULES:
-        if general is not None:
-            reasons[name] = general
-            continue
-        if case != "K6":
-            reasons[name] = f"The class is case {case}: {descriptions[case]}."
-            continue
-        choice, reasons[name] = rule(inputs)
+    reasons, choices = {}, {}
+    for name, rule in RULES.items():
+        choice, reasons[name] = (None, general) if general is not None else rule(inputs)
         if choice is not None:
-            case, choices[_CHOICE[name]] = name, choice
-    mf_sweeps = case not in ("K1", "K2") and forest.world_count > 0 and forest.max_world_dofs > 0
+            choices[name] = choice
+    if len(choices) > 1:
+        raise RuntimeError(f"FeatherPGS: the placement rules {sorted(choices)} both hold one class.")
+    mf_sweeps = not ({"packed", "diagonal"} & choices.keys()) and forest.world_count > 0 and forest.max_world_dofs > 0
     diagonal = choices.get("diagonal")
     if diagonal is not None:
         held = diagonal.held
@@ -627,4 +623,4 @@ def plan_class(inputs: ClassInputs, *, general: str | None) -> ClassPlan:
             held = held_tree.plan(inputs, packed=choices.get("packed"))
         except ValueError as error:
             raise ValueError(f"FeatherPGS cannot hold this model: {error}") from error
-    return ClassPlan(case=case, reasons=MappingProxyType(reasons), mf_sweeps=mf_sweeps, held=held, **choices)
+    return ClassPlan(reasons=MappingProxyType(reasons), mf_sweeps=mf_sweeps, held=held, **choices)

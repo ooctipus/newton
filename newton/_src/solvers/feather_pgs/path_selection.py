@@ -143,7 +143,7 @@ def route_selection(solver) -> dict:
         "laws": solver.spec.laws.record(),
         # The per-stage dispatch tables step() launches through, the sweep's kernels and streams (step_plan.StepPlan).
         "stages": plan.record(),
-        **solver.factor.held.record(plan.route.case),
+        **solver.factor.held.record(plan.route.support),
         **solver.laws.record(solver),
         **solver.placement.record(),
         **solver.sweep.record(plan),
