@@ -1631,6 +1631,12 @@ $lift
     const auto AT = [&](int slot) -> int { return HELD > 1 ? slot : 0; };
     float h[21];
     for (int k = 0; k < 21; ++k) h[k] = 0.0f;
+    // h += a join slot's sum, the slot cleared.
+    const auto TAKE = [&](int slot) {
+        for (int k = 0; k < 21; ++k) h[k] += READ(held[AT(slot)][k], slot);
+        if (OWNS(slot))
+            for (int k = 0; k < 21; ++k) held[AT(slot)][k] = 0.0f;
+    };
     bool carrying = false;
     // A body as the feed hands it to the chain: BODY's words, its last coordinate's column (s 6, R, R + K), and as
     // bits its parent, coordinates [lo, hi), its own join slot and its parent's.
@@ -1664,12 +1670,10 @@ $lift
             for (int k = 0; k < 8; ++k) s[k] = r.w[RECORD + k];
             const int b_up = __float_as_int(r.w[UP]), b_lo = __float_as_int(r.w[LO]), b_hi = __float_as_int(r.w[HI]);
             const int b_slot = __float_as_int(r.w[SLOT]), b_into = __float_as_int(r.w[INTO]);
+            // The join order: the children's sum (the sides', then the chain's, taken where the chain left it), then
+            // the body's own; a join without its chain its own and its sides'.
             ADD(h, r.w, carrying);
-            if (b_slot >= 0) {
-                for (int k = 0; k < 21; ++k) h[k] += READ(held[AT(b_slot)][k], b_slot);
-                if (OWNS(b_slot))
-                    for (int k = 0; k < 21; ++k) held[AT(b_slot)][k] = 0.0f;
-            }
+            if (b_slot >= 0 && !carrying) TAKE(b_slot);
             for (int dof = b_hi - 1; dof >= b_lo; --dof) {
                 // The next coordinate's column, loaded before this one stores (a body with several coordinates).
                 float next[8];
@@ -1683,6 +1687,8 @@ $lift
                 LIFT(h, r.w + OFFSET);
                 if (b_up == b - j0 - 1) {
                     carrying = true;
+                    // The parent's sides are all in its slot: its other children come before its chain.
+                    if (b_into >= 0) TAKE(b_into);
                 } else if (OWNS(b_into)) {
                     for (int k = 0; k < 21; ++k) held[AT(b_into)][k] += h[k];
                 }
