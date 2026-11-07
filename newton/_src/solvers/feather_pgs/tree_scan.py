@@ -1492,6 +1492,19 @@ class WalkClass:
         def coordinates_of(b):
             return self.coordinates_in(b, root_first)
 
+        def items(entries, up, half, named=None):
+            # Each entry's fetch (`named` its register) or touch: ("l", b) body b's joint input, ("x", c) coordinate
+            # c's step input; b and c constants (straight-line) or table reads (the loop form), `up` and `half` their
+            # parent and column half.
+            out = []
+            for kind, index in entries:
+                if kind == "l":
+                    text = _fill(fetch_joint if named else touch_joint, b=index, up=up(index))
+                else:
+                    text = _fill(fetch_step if named else touch_step, c=index, half=half(index))
+                out += [f"{named(kind, index)} = {text};" if named else text] if text else []
+            return out
+
         if coordinates <= unroll:
             # The fetched items in the walk's order: a body's joint input where it has a parent (root first before its
             # coordinates, leaf first after them), each coordinate's step input.
@@ -1508,18 +1521,10 @@ class WalkClass:
             position = {item: k for k, item in enumerate(order)}
 
             def fetch(item):
-                kind, index = item
-                text = (
-                    _fill(fetch_joint, b=index, up=self.parent[index])
-                    if kind == "l"
-                    else _fill(fetch_step, c=index, half=self.half_of(index))
-                )
-                return [f"const auto walk_{kind}{index} = {text};"] if text else []
+                return items([item], self.parent.__getitem__, self.half_of, "const auto walk_{}{}".format)
 
             def touched(item):
-                kind, index = item
-                text = _fill(touch_joint, b=index, up=self.parent[index]) if kind == "l" else _fill(touch_step, c=index)
-                return [text] if text else []
+                return items([item], self.parent.__getitem__, self.half_of)
 
             def take(item):
                 k = position.get(item, -1)
@@ -1594,29 +1599,21 @@ class WalkClass:
         each = "for (int k = 0; k < $width; ++k)"
         slot = f"S[{name}_SLOT[$at]]"
 
+        up = f"{name}_PARENT[{{}}]".format
+        half = f"({name}_HALF[{{}}] & 1)".format if one_half else lambda c: WALK_BOTH
+
+        def entries(at):
+            coordinate = f"{name}_COORDINATE[{at}]"
+            return [("l", f"({name}_STEP[{at}] & 0xffff)"), ("x", f"(({coordinate}) < 0 ? 0 : {coordinate})")]
+
         def fetched(j, at):
-            out = []
-            if fetch_joint:
-                body = f"({name}_STEP[{at}] & 0xffff)"
-                out.append(f"walk_l{j} = {_fill(fetch_joint, b=body, up=f'{name}_PARENT[{body}]')};")
-            if fetch_step:
-                coordinate = f"(({name}_COORDINATE[{at}]) < 0 ? 0 : {name}_COORDINATE[{at}])"
-                out.append(
-                    f"walk_x{j} = {_fill(fetch_step, c=coordinate, half=f'({name}_HALF[{coordinate}] & 1)' if one_half else WALK_BOTH)};"
-                )
-            return out
+            return items(entries(at), up, half, lambda kind, _: f"walk_{kind}{j}")
 
         ring = [f"auto {line}" for j in range(depth) for line in fetched(j, min(j, steps - 1))]
         early = self.touch(steps) if touch_joint or touch_step else 0
 
         def touched(at):
-            out = []
-            if touch_joint:
-                body = f"({name}_STEP[{at}] & 0xffff)"
-                out.append(_fill(touch_joint, b=body, up=f"{name}_PARENT[{body}]"))
-            if touch_step:
-                out.append(_fill(touch_step, c=f"(({name}_COORDINATE[{at}]) < 0 ? 0 : {name}_COORDINATE[{at}])"))
-            return out
+            return items(entries(at), up, half)
 
         if early:
             ring.append(f"for (int at = 0; at < {early}; ++at) {{\n{indent_text(chr(10).join(touched('at')), 4)}\n}}")
@@ -1643,11 +1640,9 @@ class WalkClass:
             names = {"L": f"walk_l{j}", "X": f"walk_x{j}"}
             if not depth:
                 names = {"L": "walk_l", "X": "walk_x"}
-                if fetch_joint:
-                    lines.append(f"const auto walk_l = {_fill(fetch_joint, b='b', up=f'{name}_PARENT[b]')};")
-                if fetch_step:
-                    half = f"({name}_HALF[c < 0 ? 0 : c] & 1)" if one_half else WALK_BOTH
-                    lines.append(f"const auto walk_x = {_fill(fetch_step, c='(c < 0 ? 0 : c)', half=half)};")
+                lines += items(
+                    [("l", "b"), ("x", "(c < 0 ? 0 : c)")], up, half, lambda kind, _: f"const auto walk_{kind}"
+                )
             if root_first:
                 head = [f"const int up = {name}_PARENT[b];", f"if (up < 0) {{\n    {each} V[k] = 0.0f;\n}} else {{"]
                 head += [indent_text(parent_state, 4), indent_text(_fill(joint, b="b", V="V", P="P", **names), 4), "}"]
