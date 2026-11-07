@@ -1256,13 +1256,7 @@ class TestTierRule(unittest.TestCase):
         inputs = SimpleNamespace(
             pins=SolverFeatherPGS.Pins(),
             dense_rows=192,
-            forest=SimpleNamespace(
-                world_count=4,
-                max_world_dofs=22,
-                has_free_rigid_bodies=True,
-                has_non_free_articulations=True,
-                shape=None,
-            ),
+            forest=SimpleNamespace(world_count=4, max_world_dofs=22, shape=SimpleNamespace(beside=True)),
         )
         for name, value in changes.items():
             setattr(inputs, name, value)
@@ -1283,39 +1277,12 @@ class TestTierRule(unittest.TestCase):
         for changes, reason in (
             # A class with no coordinate a world leaves no matrix-free sweep.
             (
-                {
-                    "forest": SimpleNamespace(
-                        world_count=4,
-                        max_world_dofs=0,
-                        has_free_rigid_bodies=True,
-                        has_non_free_articulations=True,
-                        shape=None,
-                    )
-                },
+                {"forest": SimpleNamespace(world_count=4, max_world_dofs=0, shape=SimpleNamespace(beside=True))},
                 "No matrix-free sweep",
             ),
+            # No world holds a free body beside a tree: no hub.
             (
-                {
-                    "forest": SimpleNamespace(
-                        world_count=4,
-                        max_world_dofs=22,
-                        has_free_rigid_bodies=False,
-                        has_non_free_articulations=True,
-                        shape=None,
-                    )
-                },
-                "case K4",
-            ),
-            (
-                {
-                    "forest": SimpleNamespace(
-                        world_count=4,
-                        max_world_dofs=22,
-                        has_free_rigid_bodies=True,
-                        has_non_free_articulations=False,
-                        shape=None,
-                    )
-                },
+                {"forest": SimpleNamespace(world_count=4, max_world_dofs=22, shape=SimpleNamespace(beside=False))},
                 "case K4",
             ),
             ({"pins": SolverFeatherPGS.Pins(tiers=0)}, "tiers=0"),
@@ -1341,9 +1308,7 @@ class TestTierRule(unittest.TestCase):
 
     def test_a_pin_builds_the_tiers_on_a_single_tree(self):
         """Build the tiers a test pin asks for on a class whose response they form, at the pinned bound."""
-        forest = SimpleNamespace(
-            world_count=4, max_world_dofs=22, has_free_rigid_bodies=False, has_non_free_articulations=True, shape=None
-        )
+        forest = SimpleNamespace(world_count=4, max_world_dofs=22, shape=SimpleNamespace(beside=False))
         choice, _ = self._rule(forest=forest, pins=SolverFeatherPGS.Pins(tiers=32))
         self.assertEqual((choice.rows, choice.sizes), (32, (16, 6, 0, 16)))
 
@@ -1366,7 +1331,12 @@ class TestClassShape(unittest.TestCase):
 
     def test_paired(self):
         forest = SimpleNamespace(world_count=4, diagonal_mass_sizes=frozenset())
-        for tree, several, groups in ((23, False, [3, 2, 1, 0]), (23, True, None), (27, False, None)):
+        for tree, several, groups in (
+            (23, False, [3, 2, 1, 0]),
+            (23, True, None),
+            (27, False, None),  # 33 coordinates exceed the lanes
+            (16, False, None),  # 22 coordinates: a hub that steps its rows at once
+        ):
             with self.subTest(tree=tree, several=several):
                 forest.shape = _shape(tree, several=several)
                 choice, _ = class_plan.paired_rule(SimpleNamespace(forest=forest, dense_rows=192))

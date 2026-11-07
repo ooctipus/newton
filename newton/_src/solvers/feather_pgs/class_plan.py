@@ -33,13 +33,10 @@ from .tree_plan import TreePlan, local_parents
 __all__ = ["RULES", "ClassInputs", "ClassPlan", "general_reason", "plan_class"]
 
 _CONTACT_JACOBIAN_MAX_DOF = 10
-# The paired response pairs a tree of _PAIRED_MIN_DOF to (32 - 6) coordinates, no star, with one free body, in a class
-# of more than _PAIRED_MIN_ROWS rows a world. The rows bound is the retired tiled H^-1 J^T plan's (execution_plan
-# before 0.4): it admitted a size whose 32-row chunk was below dense_max_constraints. Its footprint at 26 coordinates
-# and 32 rows, 26 * 26 * 4 + 3 * 26 * 32 * 4 + 64 * 4 = 12,944 B, fits every CUDA device (at least 48 KiB a block), so
-# the chunk was min(32, dense_max_constraints) and the test was dense_max_constraints > 32.
-_PAIRED_MIN_DOF = 17
-_PAIRED_MIN_ROWS = 32
+# A warp's lanes: a world that fits them keeps its velocity change a coordinate a lane in registers (case K5).
+_LANES = 32
+# A hub world of fewer coordinates steps its rows at once (:func:`split_level`).
+_SEQUENTIAL_COORDINATES = 23
 # The largest articulation the tiers hold (case K4): a lane keeps its row's coordinates in registers.
 _INKERNEL_MAX_DOF = 32
 
@@ -536,23 +533,33 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     )
 
 
+def split_level(coordinates: int) -> bool:
+    """Whether a hub world of ``coordinates`` steps its rows at once (the split level) rather than in turn."""
+    return coordinates < _SEQUENTIAL_COORDINATES
+
+
 def paired_rule(inputs: ClassInputs) -> tuple[Paired | None, str]:
-    """Case K5, a tree beside one free body: every world pairs one tree of :data:`_PAIRED_MIN_DOF` to 26 coordinates
-    and no star with one free body, in a class of more than :data:`_PAIRED_MIN_ROWS` rows."""
+    """Case K5, `u` in registers: a tree beside one free body in every world, in the lanes, its rows in turn."""
     forest, shape = inputs.forest, inputs.forest.shape
-    missing = f"No world pairs one tree of {_PAIRED_MIN_DOF} to 26 coordinates with exactly one free body."
     if not (shape.blocks == 2 and shape.present(0) and shape.present(1) and shape.free.count(True) == 1):
-        return None, missing
+        return None, "No world class pairs one tree with exactly one free body in every world."
     tree, body = shape.free.index(False), shape.free.index(True)
-    size = shape.sizes[tree]
-    if size < _PAIRED_MIN_DOF or shape.coordinates > 32 or size in forest.diagonal_mass_sizes:
-        return None, missing
-    if inputs.dense_rows <= _PAIRED_MIN_ROWS:
-        return None, missing
+    reason = first_failed(
+        (
+            (shape.sizes[tree] not in forest.diagonal_mass_sizes, "The tree is a star."),
+            (shape.coordinates <= _LANES, f"{shape.coordinates} coordinates a world exceed a warp's {_LANES} lanes."),
+            (
+                tier_response(shape)[0] is None or not split_level(shape.coordinates),
+                f"A hub world of {shape.coordinates} coordinates steps its rows at once (case K4).",
+            ),
+        )
+    )
+    if reason is not None:
+        return None, reason
     # Each tree's free body's group, by the tree's group.
     groups = np.empty(forest.world_count, dtype=np.int32)
     groups[shape.groups[:, tree]] = shape.groups[:, body]
-    return Paired(size, shape.sizes[body], groups), None
+    return Paired(shape.sizes[tree], shape.sizes[body], groups), None
 
 
 def tier_response(shape) -> tuple[tuple[int, int, int, int] | None, np.ndarray | None, str]:
@@ -584,7 +591,7 @@ def tier_response(shape) -> tuple[tuple[int, int, int, int] | None, np.ndarray |
 
 
 def tier_rule(inputs: ClassInputs) -> tuple[Tiers | None, str]:
-    """Case K4, the Jacobi tiers of the dense rows of a tree beside a free body.
+    """Case K4, the Jacobi tiers of the dense rows of a hub: a free body beside a tree in one world.
 
     They form each world's response in the kernel, which bounds the class (:func:`tier_response`: one articulation of
     each of one or two sizes per world, at most :data:`_INKERNEL_MAX_DOF` coordinates each), under the contact laws
@@ -605,8 +612,8 @@ def tier_rule(inputs: ClassInputs) -> tuple[Tiers | None, str]:
             ),
             (pinned is None or bool(pinned), "A test pin builds no tier (tiers=0)."),
             (
-                bool(pinned) or (forest.has_free_rigid_bodies and forest.has_non_free_articulations),
-                "The tiers serve a tree beside a free body (case K4).",
+                bool(pinned) or forest.shape.beside,
+                "The tiers serve a hub: a free body beside a tree in one world (case K4).",
             ),
         )
     )
