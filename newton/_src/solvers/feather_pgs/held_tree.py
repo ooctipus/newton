@@ -311,9 +311,9 @@ def _forest_families(inputs, worlds, member, compact):
         # The class's trees of the size are one topology: one range of the size group.
         if np.unique(np.searchsorted(forest.size_topologies[size], places, side="right")).size > 1:
             return None
-        if size != compact and (not 1 <= size <= 32 or (model.device.is_cuda and size in forest.diagonal_mass_sizes)):
-            # A star's group other than the compact diagonal's: on CUDA the retired dense response plan kept it out of
-            # the held family (its diagonal generalized inertia); the CPU's held family takes it.
+        if size != compact and (not 1 <= size <= 32 or size in forest.diagonal_mass_sizes):
+            # A star's group other than the compact diagonal's keeps a group of its own, on every device: the CPU plans
+            # the held family as CUDA does.
             return None
         if places.size != worlds.size or not np.array_equal(art_world[group[places]], worlds):
             return None
