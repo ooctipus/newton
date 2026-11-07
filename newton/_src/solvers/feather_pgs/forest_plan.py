@@ -899,7 +899,7 @@ def _class_shape(plan):
 
 
 def row_support(
-    forest: ForestPlan, model: Model, factor, articulated: np.ndarray, articulated_counts: np.ndarray, mimic_dofs=None
+    forest: ForestPlan, model: Model, factor, articulated: np.ndarray, several: bool, mimic_dofs=None
 ) -> tuple[np.ndarray, int]:
     """Each body's support and the widest row's on the native sparse factors of one articulated size.
 
@@ -911,7 +911,7 @@ def row_support(
         model: The model.
         factor: The size's fill-free factor pattern (:meth:`.tree_plan.TreePlan.factor`).
         articulated: The articulated (not free-body) responding articulations.
-        articulated_counts: Articulated responding articulations per world.
+        several: Whether a world holds several of them.
         mimic_dofs: Each mimic's two coordinates, local to its articulation, or ``None`` without mimic rows.
 
     Returns:
@@ -938,7 +938,7 @@ def row_support(
         first_dofs, second_dofs = mimic_dofs
         masks = factor.ancestor_mask[first_dofs] | factor.ancestor_mask[second_dofs]
         max_support = max(max_support, max((int(mask).bit_count() for mask in masks), default=0))
-    if np.any(articulated_counts > 1):
+    if several:
         # Different articulations have disjoint coordinate blocks, even
         # when they share the same topology and local ancestor indices.
         max_support = max(max_support, 2 * max(int(mask).bit_count() for mask in joint_masks))

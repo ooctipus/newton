@@ -183,100 +183,74 @@ def general_reason(pins) -> str | None:
     )
 
 
-def _world_diagonal_pairs(shape, diagonal_sizes: frozenset[int]) -> tuple[np.ndarray, np.ndarray] | None:
-    """Each world's articulation whose size is in ``diagonal_sizes`` and its other one, or ``None`` unless every world
-    holds exactly two, one of them diagonal."""
-    if shape.arts is None:
-        return None
-    held, diagonal = shape.arts >= 0, np.isin(shape.sizes, list(diagonal_sizes))
-    if np.any(held.sum(axis=1) != 2) or np.any((held & diagonal).sum(axis=1) != 1):
-        return None
-    worlds = np.arange(shape.arts.shape[0])
-    return shape.arts[worlds, (held & diagonal).argmax(axis=1)], shape.arts[worlds, (held & ~diagonal).argmax(axis=1)]
-
-
-def _fused_diagonal_limits(inputs: ClassInputs) -> tuple[frozenset[int], np.ndarray]:
-    """The star sizes whose independent position limits can remain outside the dense row system, and each
-    coordinate's fused limit."""
+def _star_beside(inputs: ClassInputs) -> tuple[int, int] | None:
+    """The class shape's star block and tree block, or ``None``: one of each in every world, a limited star, a tree a
+    contact Jacobian wide, no free body, and the laws the fused limits leave out (friction, no mimic or link row)."""
     model, options, forest, laws = inputs.model, inputs.options, inputs.forest, inputs.laws
-    mask = np.zeros(model.joint_dof_count, dtype=np.int32)
-    supported = bool(
+    shape = forest.shape
+    if not (
         model.joint_dof_count > 0
         and options.enable_joint_limits
         and options.enable_contact_friction
         and not forest.has_free_rigid_bodies
         and laws.mimic_count == 0
         and laws.link_count == 0
-    )
-    if not supported:
-        return frozenset(), mask
-    candidate_sizes = forest.diagonal_mass_sizes.intersection(laws.joint_limit_sizes)
-    if not candidate_sizes:
-        return frozenset(), mask
-    response_dof_count = forest.response_dof_count
-    pairs = _world_diagonal_pairs(forest.shape, candidate_sizes)
-    if pairs is None:
-        return frozenset(), mask
-    diagonal_articulations, dense_articulations = pairs
-    dense_size = response_dof_count[dense_articulations]
-    if np.any((dense_size <= 0) | (dense_size > _CONTACT_JACOBIAN_MAX_DOF)):
-        return frozenset(), mask
-    # The diagonal articulations with a limited DOF fuse all their DOFs' limits.
-    diagonal_size = response_dof_count[diagonal_articulations]
-    art, local_dof = host_index.expand(diagonal_size)
-    dof = forest.articulation_dof_start_host[diagonal_articulations][art] + local_dof
-    valid = laws.joint_limit_q_index_host[dof] >= 0
-    limited = np.bincount(art[valid], minlength=diagonal_articulations.size) > 0
+        and shape.blocks == 2
+        and shape.present(0)
+        and shape.present(1)
+    ):
+        return None
+    stars = [b for b, size in enumerate(shape.sizes) if size in forest.diagonal_mass_sizes & laws.joint_limit_sizes]
+    if len(stars) != 1 or not 0 < shape.sizes[1 - stars[0]] <= _CONTACT_JACOBIAN_MAX_DOF:
+        return None
+    return stars[0], 1 - stars[0]
+
+
+def _fused_diagonal_limits(inputs: ClassInputs, star: int) -> tuple[frozenset[int], np.ndarray]:
+    """The star sizes whose independent position limits remain outside the dense row system, and each coordinate's
+    fused limit: every coordinate of a star tree that holds a limit."""
+    forest, shape = inputs.forest, inputs.forest.shape
+    mask = np.zeros(inputs.model.joint_dof_count, dtype=np.int32)
+    arts, size = shape.arts[:, star], shape.sizes[star]
+    art, local_dof = host_index.expand(np.full(arts.size, size))
+    dof = forest.articulation_dof_start_host[arts][art] + local_dof
+    valid = inputs.laws.joint_limit_q_index_host[dof] >= 0
+    limited = np.bincount(art[valid], minlength=arts.size) > 0
     mask[dof[limited[art]]] = valid[limited[art]]
-    # Add each size where a world first has it, as the per-world set did.
-    return frozenset(int(size) for size in host_index.ordered_unique(diagonal_size[limited])), mask
+    return frozenset((size,) if limited.any() else ()), mask
 
 
 def diagonal_rule(inputs: ClassInputs) -> tuple[Diagonal | None, str]:
     """Case K2, a tree beside a star: one independent wide component (the star, its limits fused) plus one compact
     dense component per world, of the same two sizes in every world, whose compact diagonal the held tree takes."""
-    forest = inputs.forest
-    fused_sizes, fused_mask = _fused_diagonal_limits(inputs)
+    forest, shape = inputs.forest, inputs.forest.shape
     missing = "No world pairs a diagonal-mass articulation with fused limits and one compact dense articulation."
+    blocks = _star_beside(inputs)
+    if blocks is None:
+        return None, missing
+    star, dense = blocks
+    fused_sizes, fused_mask = _fused_diagonal_limits(inputs, star)
     if not fused_sizes:
         return None, missing
-    response_dofs = forest.response_dof_count
-    is_free_rigid = forest.is_free_rigid_host
-    pairs = _world_diagonal_pairs(forest.shape, fused_sizes)
-    if pairs is None or forest.world_count == 0:
-        return None, missing
-    diagonal_arts, dense_arts = pairs
-    if np.any(is_free_rigid[diagonal_arts] != 0) or np.any(is_free_rigid[dense_arts] != 0):
-        return None, missing
-    # Every world pairs the same two sizes.
-    diagonal_size = response_dofs[diagonal_arts]
-    dense_size = response_dofs[dense_arts]
-    if np.any((dense_size <= 0) | (dense_size > _CONTACT_JACOBIAN_MAX_DOF)):
-        return None, missing
-    if np.any(diagonal_size != diagonal_size[0]) or np.any(dense_size != dense_size[0]):
-        return None, missing
-    dense_offsets = forest.articulation_world_dof_offset.numpy()[dense_arts].astype(np.int32)
-    dense_groups = forest.art_group_idx.numpy()[dense_arts].astype(np.int32)
-    if np.any(dense_offsets < 0) or np.any(dense_groups < 0):
-        return None, missing
+    dense_arts = shape.arts[:, dense]
     # Its compact diagonal is the held tree's representation: a candidate only where the held tree takes the dense
     # groups with it, the diagonal group as a held family (the one-coordinate class where its trees are rigid below
     # their leaves).
     try:
-        held = held_tree.plan(inputs, compact=int(diagonal_size[0]))
+        held = held_tree.plan(inputs, compact=shape.sizes[star])
     except ValueError as error:
         return None, f"Only the held tree evaluates the compact diagonal. {error}"
     units = bool(inputs.options.enable_contact_friction and inputs.options.contact_friction_gap_threshold == math.inf)
     choice = Diagonal(
-        size=int(diagonal_size[0]),
-        dense_size=int(dense_size[0]),
-        dense_offsets=dense_offsets,
-        dense_groups=dense_groups,
+        size=shape.sizes[star],
+        dense_size=shape.sizes[dense],
+        dense_offsets=forest.articulation_world_dof_offset.numpy()[dense_arts].astype(np.int32),
+        dense_groups=shape.groups[:, dense].astype(np.int32),
         dense_arts=dense_arts.astype(np.int32),
         fused_sizes=fused_sizes,
         fused_mask=fused_mask,
         units=units,
-        speculative_batches=units and int(dense_size[0]) + 2 <= 16,
+        speculative_batches=units and shape.sizes[dense] + 2 <= 16,
         held=held,
     )
     return choice, "One diagonal-mass articulation and one compact dense articulation per world share one owner."
@@ -358,7 +332,7 @@ def contact_triplets_rule(
 
 
 def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
-    """Case K1, a single tree: native sparse factors with independent rigid-body response blocks."""
+    """Case K1, a single tree: native sparse factors of the class's one block, a tree shape without a free body."""
     model, options, forest, laws, factor, pins = (
         inputs.model,
         inputs.options,
@@ -367,8 +341,8 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
         inputs.factor,
         inputs.pins,
     )
-    dense_rows = inputs.dense_rows
-    velocity_candidate = options.enable_joint_velocity_limits and not forest.has_free_rigid_bodies
+    dense_rows, shape = inputs.dense_rows, inputs.forest.shape
+    velocity_candidate = options.enable_joint_velocity_limits
     declined = first_failed(
         (
             (pins.storage != "dense", "A test pin keeps dense storage (storage='dense')."),
@@ -383,30 +357,21 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     )
     if declined is not None:
         return None, declined
-    if forest.has_free_rigid_bodies:
-        # A world that pairs an articulation with free rigid bodies is served
-        # by the held-tree owner and the paired response on the dense route
-        # (measured: Kuka lift 12.7 ms there against 15.5 on sparse factors).
-        # Both friction laws: patch friction walks contact units in the paired
-        # sweep and keeps the resolved-world classifier. Native sparse factors never serve free rigid bodies.
+    if any(shape.free):
+        # A free body beside a tree is the paired response's (measured: Kuka lift 12.7 ms there against 15.5 on sparse
+        # factors).
         return None, "Worlds with free rigid bodies keep the dense route for the held-tree owner and paired response."
-    response_dofs = forest.response_dof_count
-    free_rigid = forest.is_free_rigid_host != 0
-    articulated = np.flatnonzero((response_dofs > 0) & ~free_rigid)
-    sizes = np.unique(response_dofs[articulated])
-    if len(sizes) != 1:
+    if shape.blocks != 1:
         return None, "Native sparse factors require one articulated response DOF size."
-    size = int(sizes[0])
+    size = shape.sizes[0]
     # The endpoint support uses one 64-bit ancestry mask, not a robot-specific DOF limit.
     if size > 64 or size not in forest.crba_dof_joint_offset_by_size or size in forest.diagonal_mass_sizes:
         return None, "Articulated topology needs at most 64 response DOFs, a CRBA mapping and non-diagonal inertia."
-    articulated_counts = np.bincount(forest.articulation_world[articulated], minlength=forest.world_count)
-    articulation_start = model.articulation_start.numpy()
+    articulated = forest.group_to_art_host[size]
     joint_ancestor = model.joint_ancestor.numpy()
     joint_qd_start = model.joint_qd_start.numpy()
-    art = int(forest.group_to_art[size].numpy()[0])
-    start = int(articulation_start[art])
-    end = int(forest.articulation_joint_end_host[art])
+    start = int(model.articulation_start.numpy()[articulated[0]])
+    end = int(forest.articulation_joint_end_host[articulated[0]])
     tree = TreePlan.build(
         local_parents(joint_ancestor, [start], end - start)[0], np.diff(joint_qd_start[start : end + 1])
     )
@@ -429,7 +394,7 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
             laws._mimic_dof0.numpy()[mimic_indices] - starts,
             laws._mimic_dof1.numpy()[mimic_indices] - starts,
         )
-    body_masks, max_support = row_support(forest, model, plan, articulated, articulated_counts, mimic_dofs)
+    body_masks, max_support = row_support(forest, model, plan, articulated, shape.arts is None, mimic_dofs)
     if not max_support:
         return None, "Topology has no responsive row support."
     # The sweep's shared working set (sweep_routes_sparse.SparseSweep.staging) against the device's static budget:
@@ -456,16 +421,10 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
         small_world_lanes=small_world_lanes,
         fits=lambda: staging(active_rows=True).fits(budget),
     )
-    shape = (forest.world_count, dense_rows, max_support)
-    offsets = forest.articulation_world_dof_offset.numpy()
+    index_shape = (forest.world_count, dense_rows, max_support)
     support_classes = None
-    if (
-        pins.row_support
-        and not laws.mimic_count
-        and np.all(articulated_counts == 1)
-        and size == forest.max_world_dofs
-        and np.all(offsets[articulated] == 0)
-    ):
+    # A world of the one tree alone: its coordinates are the tree's.
+    if pins.row_support and not laws.mimic_count and shape.present(0):
         # The classes of the bodies a contact can name (those with shapes; the row width is theirs too): a
         # shape-less body takes the empty class.
         contact_bodies = np.zeros(body_masks.shape[0], dtype=bool)
@@ -478,7 +437,7 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
             )
             table_bytes += 4 * forest.world_count * dense_rows
             # Small batches with many support patterns can favor direct indices.
-            if table_bytes < 4 * int(np.prod(shape)):
+            if table_bytes < 4 * int(np.prod(index_shape)):
                 support_classes = classes
     # Unsupported mixed worlds retain explicit row indices and their existing kernels.
     use_support_table = support_classes is not None
@@ -525,7 +484,7 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
         active_rows_reason=active_rows_reason,
         contact_triplets_reason=contact_triplets_reason,
         triplet_capacity=triplet_capacity,
-        index_shape=(1, 1, 1) if use_support_table else shape,
+        index_shape=(1, 1, 1) if use_support_table else index_shape,
     )
     return choice, (
         f"Automatic sparse selection: {size}-DOF topology and row policy admitted; "

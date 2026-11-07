@@ -80,7 +80,8 @@ def install_cpu_keyed_rows(solver):
     solver.placement.mf_constraint_count = wp.zeros(solver.forest.world_count, dtype=int, device=model.device)
     # Case K4's tiers of four rows; its class walks: the tiers walk their keyed rows in the kernel, the one writer the
     # general worlds' rows.
-    classes = dataclasses.replace(solver.spec.classes, case="K4", tiers=class_plan.Tiers(sizes=None, meta=None, rows=4))
+    sizes, meta, _ = class_plan.tier_response(solver.forest.shape)
+    classes = dataclasses.replace(solver.spec.classes, case="K4", tiers=class_plan.Tiers(sizes, meta, rows=4))
     solver.spec = dataclasses.replace(solver.spec, classes=classes)
     solver.placement.classes = solver.sweep.classes = classes
     solver.placement.walks = True

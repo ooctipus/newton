@@ -54,68 +54,52 @@ class KeyedLayout:
 
 
 def topology_plan(solver):
-    """Derive uniform block offsets and supported velocity DOFs from the class shape: the layout, then each world's
-    group index, first coordinate and articulation of each block."""
+    """The tiers' blocks (:attr:`.class_plan.ClassPlan.tiers`) keyed where every world holds each and they are its
+    coordinates: the layout, then each world's group index, first coordinate and articulation of each block."""
     if solver.factor.eliminates:
         # The tiers walk keyed rows anew, without the one writer's closure of the bilateral blocks.
         raise ValueError("keyed rows take no bilateral pre-elimination")
-    shape = solver.forest.shape
-    if not 1 <= shape.blocks <= 2 or sum(shape.sizes) != shape.coordinates:
+    shape, tiers, model = solver.forest.shape, solver.spec.classes.tiers, solver.model
+    if sum(shape.sizes) != shape.coordinates:
         raise ValueError("keyed rows require at most two complete uniform size groups")
     if solver.laws.mimic_count:
         # The prefix keys a coordinate's limit rows; a mimic row spans two coordinates (the one writer's mimic family).
         raise ValueError("keyed rows key no mimic row")
-    starts = solver.forest.articulation_dof_start_host
     groups = np.zeros((solver.forest.world_count, 2), dtype=np.int32)
     dof_starts = np.zeros_like(groups)
     arts_by_world = np.full_like(groups, -1)
-    block_offsets = [0, 0]
-    model = solver.model
-    art_joint = model.articulation_start.numpy()
-    joint_dof = model.joint_qd_start.numpy()
-    joint_type = model.joint_type.numpy()
+    joint_type = model.joint_type.numpy()[
+        np.repeat(np.arange(model.joint_count), np.diff(model.joint_qd_start.numpy()))
+    ]
     velocity_mask, position_mask = 0, 0
-    q_index = solver.laws.joint_limit_q_index_host
     for column, size in enumerate(shape.sizes):
         if not shape.present(column):
             raise ValueError("keyed rows require exactly one articulation of each size per world")
-        if shape.offsets[column] is None:
-            raise ValueError("keyed rows require uniform coordinate offsets")
-        arts = shape.arts[:, column]
-        block_offsets[column] = shape.offsets[column]
-        groups[:, column] = shape.groups[:, column]
-        dof_starts[:, column] = starts[arts]
-        arts_by_world[:, column] = arts
-        masks, position_masks = set(), set()
-        for art in arts:
-            position_masks.add(
-                sum(
-                    1 << (int(d) + block_offsets[column])
-                    for d in np.flatnonzero(q_index[starts[art] : starts[art] + size] >= 0)
-                )
-            )
-            mask = 0
-            for joint in range(art_joint[art], art_joint[art + 1]):
-                if joint_type[joint] in (JointType.PRISMATIC, JointType.REVOLUTE, JointType.D6):
-                    for dof in range(joint_dof[joint], joint_dof[joint + 1]):
-                        mask |= 1 << (int(dof - starts[art]) + block_offsets[column])
-                elif solver.options.enable_joint_velocity_limits and joint_type[joint] not in (
-                    JointType.FIXED,
-                    JointType.FREE,
-                ):
-                    raise ValueError("unsupported moving joint velocity-limit law")
-            masks.add(mask)
-        if len(masks) != 1:
+        arts, offset = shape.arts[:, column], tiers.sizes[2 + column]
+        groups[:, column], dof_starts[:, column], arts_by_world[:, column] = (
+            shape.groups[:, column],
+            solver.forest.articulation_dof_start_host[arts],
+            arts,
+        )
+        dofs = dof_starts[:, column, None] + np.arange(size)
+        kinds = joint_type[dofs]
+        moving = np.isin(kinds, (JointType.PRISMATIC, JointType.REVOLUTE, JointType.D6))
+        if solver.options.enable_joint_velocity_limits and np.any(
+            ~moving & ~np.isin(kinds, (JointType.FIXED, JointType.FREE))
+        ):
+            raise ValueError("unsupported moving joint velocity-limit law")
+        positions = solver.laws.joint_limit_q_index_host[dofs] >= 0
+        if np.any(moving != moving[0]):
             raise ValueError("keyed rows require uniform velocity-limit eligibility")
-        if len(position_masks) != 1:
+        if np.any(positions != positions[0]):
             raise ValueError("keyed rows require uniform position-limit eligibility")
-        velocity_mask |= masks.pop()
-        position_mask |= position_masks.pop()
+        velocity_mask |= sum(1 << (int(d) + offset) for d in np.flatnonzero(moving[0]))
+        position_mask |= sum(1 << (int(d) + offset) for d in np.flatnonzero(positions[0]))
     layout = KeyedLayout(
         shape.sizes[0],
         shape.sizes[1] if shape.blocks == 2 else 0,
-        *block_offsets,
-        solver.spec.classes.tier_rows,
+        *tiers.sizes[2:],
+        tiers.rows,
         solver.options.enable_joint_velocity_limits,
         velocity_mask,
         # Without joint limits no coordinate holds a position-limit row (the one writer's limit family, step_plan).

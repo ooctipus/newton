@@ -129,11 +129,22 @@ class TopologyReached(Exception):
     """Raised by :class:`ForestProbe` once the sparse admission reaches topology planning."""
 
 
-class ForestProbe(SimpleNamespace):
+class ShapeProbe:
+    """A class shape whose free blocks are known and whose blocks stop the admission."""
+
+    def __init__(self, free: bool):
+        self.free = (free,)
+
     @property
-    def response_dof_count(self):
+    def blocks(self):
         # Stop after admission, before any factor planning or device allocation.
         raise TopologyReached
+
+
+class ForestProbe(SimpleNamespace):
+    @property
+    def shape(self):
+        return ShapeProbe(self.has_free_rigid_bodies)
 
 
 def eligible_inputs():
