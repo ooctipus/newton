@@ -19,11 +19,14 @@ from unittest import mock
 
 from newton._src.core.execution import Work, shape
 from newton._src.core.memory import Buffer, Staging, built_for
-from newton._src.solvers.feather_pgs import kernel_template, sweep_routes_tiers
+from newton._src.solvers.feather_pgs import kernel_template, sweep_routes, sweep_routes_tiers
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.response_operator import Lanes, TransposedResponse, WalkedRows
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy, bound
 from newton._src.solvers.feather_pgs.sweep import (
+    EXACT,
+    SEQUENTIAL,
+    SPLIT,
     JacobiRows,
     LevelLaw,
     RowLaws,
@@ -32,6 +35,7 @@ from newton._src.solvers.feather_pgs.sweep import (
     jacobi_sweeps,
     sweep_kernel,
 )
+from newton._src.solvers.feather_pgs.sweep_routes_diag import DiagonalSweep
 from newton.tests.feather_pgs_law_harness import built, keyed_classes
 
 _TIER = built(sweep_routes_tiers.TierSweep)
@@ -117,6 +121,9 @@ class TestParallelTier(unittest.TestCase):
             {"rows": 72, "levels": LevelLaw.split(1), **_INK},
             {"rows": 30, "levels": LevelLaw.split(1), **_INK},
             {"rows": 32, "levels": LevelLaw.split(1), "inkernel_response": (12, 7, 0, 12)},
+            # A tier steps its world's rows by the split law alone.
+            {"rows": 32, "levels": LevelLaw(), **_INK},
+            {"rows": 32, "levels": LevelLaw(EXACT), **_INK},
         )
         for kwargs in invalid:
             with self.subTest(kwargs=kwargs):
@@ -124,6 +131,19 @@ class TestParallelTier(unittest.TestCase):
                     _tier(_TIER, args, kwargs)
         with self.assertRaisesRegex(ValueError, "rows must be in"):
             _tier(_TIER, (256, 32, 18, "120"), {"rows": 132, "levels": LevelLaw.split(1), **_INK})
+
+    def test_level_laws(self):
+        """One level law for every sweep: only the split law takes a budget; the general and the sparse-diagonal sweeps
+        level their units exactly (the colored units, the scalar contacts), never split."""
+        self.assertEqual(LevelLaw.split(7), LevelLaw(SPLIT, 7))
+        for law, budget in (("jacobi", 0), (SEQUENTIAL, 3), (EXACT, 1), (SPLIT, -1)):
+            with self.subTest(law=law, budget=budget), self.assertRaises(ValueError):
+                LevelLaw(law, budget)
+        for config, args in ((sweep_routes.GeneralSweep, (64, 32, 12, "120")), (DiagonalSweep, (64, 10, 9, "120"))):
+            with self.subTest(config=config.__name__):
+                self.assertTrue(config(*args, levels=LevelLaw(EXACT)).name)
+                with self.assertRaises(ValueError):
+                    config(*args, levels=LevelLaw.split(4))
 
     def test_every_world_ends_with_a_barrier(self):
         """The world queue's next world restages the shared rows only after every lane has read this world's."""
