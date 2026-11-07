@@ -2832,6 +2832,8 @@ class CollisionPipeline:
         contact_writer = write_contact_speculative if self._speculative_enabled else write_contact
 
         unit_scale_sdf_shapes = None
+        # Host copy of the explicit pair list, read at most once during setup.
+        explicit_pairs_host = None
         if using_expert_components:
             if broad_phase_instance is None or narrow_phase is None:
                 raise ValueError("Provide both broad_phase and narrow_phase for expert component construction")
@@ -2894,8 +2896,6 @@ class CollisionPipeline:
             self.hydroelastic_sdf = self.narrow_phase.hydroelastic_sdf
         else:
             self.broad_phase_mode = mode_from_broad_phase if mode_from_broad_phase is not None else "explicit"
-            # Host copy of the explicit pair list, read at most once during setup.
-            explicit_pairs_host = None
 
             if self.broad_phase_mode == "explicit":
                 if shape_pairs_filtered is None:
@@ -3394,7 +3394,9 @@ class CollisionPipeline:
                 )
             # The explicit-pair constructor contract already prohibits pair mutation.
             # Do not intersect with shape flags: explicit pairs are authoritative.
-            pair_indices = np.unique(self.shape_pairs_filtered.numpy().reshape(-1))
+            if explicit_pairs_host is None:
+                explicit_pairs_host = self.shape_pairs_filtered.numpy().reshape(-1, 2)
+            pair_indices = np.unique(explicit_pairs_host.reshape(-1))
             if np.any(pair_indices < 0) or np.any(pair_indices >= shape_count):
                 raise ValueError("Explicit pair shape IDs must be within model.shape_count")
             self.prepared_shape_indices = wp.array(pair_indices, dtype=wp.int32, device=device)
@@ -3422,7 +3424,9 @@ class CollisionPipeline:
                     coherent_convex = "0"
                 else:
                     types = model.shape_type.numpy()
-                    pairs = self.shape_pairs_filtered.numpy()
+                    if explicit_pairs_host is None:
+                        explicit_pairs_host = self.shape_pairs_filtered.numpy().reshape(-1, 2)
+                    pairs = explicit_pairs_host
                     supported = np.isin(types, (int(GeoType.BOX), int(GeoType.CONVEX_MESH)))
                     eligible = int(np.count_nonzero(supported[pairs[:, 0]] & supported[pairs[:, 1]]))
                     if eligible == 0:
@@ -3440,8 +3444,10 @@ class CollisionPipeline:
             from ..geometry.coherent_convex import _ConvexQueryCache  # noqa: PLC0415
             from ..geometry.coherent_convex_rejection import _create_rejection_query_kernels  # noqa: PLC0415
 
+            if explicit_pairs_host is None:
+                explicit_pairs_host = self.shape_pairs_filtered.numpy().reshape(-1, 2)
             self.narrow_phase._coherent_cache = _ConvexQueryCache(
-                pairs=self.shape_pairs_filtered.numpy(),
+                pairs=explicit_pairs_host,
                 shape_types=model.shape_type.numpy(),
                 shape_world=model.shape_world.numpy(),
                 world_count=model.world_count,
@@ -3461,7 +3467,12 @@ class CollisionPipeline:
         # The terrain law, writing its partners' heightfield contacts (by default) or in shadow: decided and built once
         # here, outside capture; collide() launches it after the narrow phase.
         self._build_terrain_law(
-            model, terrain_law_request, terrain_law_value, terrain_law_classes, terrain_shadow_classes
+            model,
+            terrain_law_request,
+            terrain_law_value,
+            terrain_law_classes,
+            terrain_shadow_classes,
+            explicit_pairs_host if self.broad_phase_mode == "explicit" else None,
         )
 
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
@@ -3680,6 +3691,14 @@ class CollisionPipeline:
             )
         return None
 
+    def _law_pairs(self, explicit_pairs_host: np.ndarray | None) -> np.ndarray | None:
+        """The explicit pairs the terrain law takes, from the setup's one host copy; ``None`` without a list."""
+        if self.broad_phase_mode != "explicit":
+            return None
+        if explicit_pairs_host is None:
+            return self.shape_pairs_filtered.numpy().reshape(-1, 2)
+        return explicit_pairs_host
+
     def _build_terrain_law(
         self,
         model: Model,
@@ -3687,6 +3706,7 @@ class CollisionPipeline:
         value: str,
         classes: tuple[int, ...],
         shadow_classes: tuple[int, ...],
+        explicit_pairs_host: np.ndarray | None,
     ) -> None:
         """Decide whether the terrain law writes the heightfield contacts, and build it where its kernels run.
 
@@ -3700,6 +3720,7 @@ class CollisionPipeline:
             value: The ``NEWTON_TERRAIN_LAW`` value, for the record and the errors.
             classes: The partner classes ``NEWTON_TERRAIN_LAW`` lists (empty but for an explicit request).
             shadow_classes: The partner classes ``NEWTON_TERRAIN_LAW_SHADOW`` lists.
+            explicit_pairs_host: The setup's host copy of the explicit pair list, when it read one.
 
         Raises:
             ValueError: When ``NEWTON_TERRAIN_LAW`` requests the law for a configuration it does not support yet, or a
@@ -3752,7 +3773,7 @@ class CollisionPipeline:
         law = TerrainLawShadow(
             model,
             (classes if request == "explicit" else tuple(sorted(TERRAIN_LAW_KERNELS))) if writes else shadow_classes,
-            pairs=self.shape_pairs_filtered if self.broad_phase_mode == "explicit" else None,
+            pairs=self._law_pairs(explicit_pairs_host),
             status=narrow._buffer_capacity_status,
             # The rows of its scene-level spill region (default: TerrainLawShadow.default_spill_rows()).
             spill_rows=parse_terrain_law_shadow_rows(os.environ.get("NEWTON_TERRAIN_LAW_SHADOW_ROWS", "")),
@@ -4743,9 +4764,8 @@ class CollisionPipeline:
         self._immobile_shape_body = None
         self._no_body_flags = None
         self._immobile_inputs = None
-        pairs = self.shape_pairs_filtered
-        if self.broad_phase_mode != "explicit":
-            pairs = getattr(model, "shape_contact_pairs", None)
+        # Only an explicit list is scanned: nxn and sap pipelines never enumerate the model's pairs.
+        pairs = self.shape_pairs_filtered if self.broad_phase_mode == "explicit" else None
         # Topology alone bounds the immobile shapes over every body-flag and joint-enable state.
         reachable = topology.immobile_shapes(topology.welded_bodies(None, None))
         weldable = None if self.include_static_kinematic_pairs else reachable & (topology.shape_body >= 0)
@@ -5046,6 +5066,8 @@ class CollisionPipeline:
         # Run broad phase (AABBs are already expanded by effective gaps, so pass None). Every
         # broad phase applies one immovable-pair test, which drops structurally immobile pairs.
         pair_filter = self._broad_phase_pair_filter(model)
+        # Expert broad phases of earlier releases take no displacement: pass it only to a speculative pass.
+        speculative_kwargs = {"shape_displacement": self._shape_displacement} if speculative_active else {}
         if isinstance(self.broad_phase, BroadPhaseAllPairs):
             self.broad_phase.launch(
                 self.narrow_phase.shape_aabb_lower,
@@ -5061,7 +5083,7 @@ class CollisionPipeline:
                 filter_pairs=self.shape_pairs_excluded,
                 num_filter_pairs=self.shape_pairs_excluded_count,
                 skip_count_zero=True,  # Already zeroed by compute_shape_aabbs
-                shape_displacement=self._shape_displacement if speculative_active else None,
+                **speculative_kwargs,
                 forecast=forecast,
             )
         elif isinstance(self.broad_phase, BroadPhaseSAP):
@@ -5079,8 +5101,8 @@ class CollisionPipeline:
                 filter_pairs=self.shape_pairs_excluded,
                 num_filter_pairs=self.shape_pairs_excluded_count,
                 skip_count_zero=True,  # Already zeroed by compute_shape_aabbs
-                shape_displacement=self._shape_displacement if speculative_active else None,
-                sort_axis_displacement_limit=max_speculative_extension if speculative_active else None,
+                **speculative_kwargs,
+                **({"sort_axis_displacement_limit": max_speculative_extension} if speculative_active else {}),
                 forecast=forecast,
             )
         elif self._pair_templates is not None:

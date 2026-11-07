@@ -1353,7 +1353,7 @@ def write_joint_jacobian_columns(
 
 
 @wp.kernel
-def eval_articulation_jacobian(
+def eval_joint_jacobian(
     joint_articulation: wp.array[int],
     articulation_start: wp.array[int],
     articulation_end: wp.array[int],
@@ -1377,7 +1377,8 @@ def eval_articulation_jacobian(
     """Write one joint's columns of its articulation's spatial Jacobian into ``J[articulation]``.
 
     One thread per model joint, so the selected articulations' Jacobians, links by DOFs, are
-    written in full and nothing else in ``J`` is (:func:`write_joint_jacobian_columns`).
+    written in full and nothing else in ``J`` is (:func:`write_joint_jacobian_columns`). A slice of the
+    model's articulations, as for one picked articulation, takes :func:`eval_articulation_jacobian`.
     """
     j = wp.tid()
     art_idx = joint_articulation[j]
@@ -1414,6 +1415,64 @@ def eval_articulation_jacobian(
         J,
         joint_S_s,
     )
+
+
+@wp.kernel
+def eval_articulation_jacobian(
+    articulation_start: wp.array[int],
+    articulation_end: wp.array[int],
+    articulation_count: int,
+    articulation_mask: wp.array[bool],
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_ancestor: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_q: wp.array[float],
+    joint_dof_dim: wp.array2d[int],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    # outputs
+    J: wp.array3d[float],
+    joint_S_s: wp.array[wp.spatial_vector],
+):
+    """Write articulation ``tid``'s spatial Jacobian into ``J[tid]``, one thread per articulation.
+
+    The articulation ranges may be a slice of the model's, as for one picked articulation;
+    :func:`eval_joint_jacobian` spreads the model's articulations over their joints.
+    """
+    art_idx = wp.tid()
+    if art_idx >= articulation_count:
+        return
+    if articulation_mask:
+        if not articulation_mask[art_idx]:
+            return
+    joint_start = articulation_start[art_idx]
+    joint_end = articulation_end[art_idx]
+    for j in range(joint_start, joint_end):
+        write_joint_jacobian_columns(
+            j,
+            art_idx,
+            joint_start,
+            joint_end,
+            joint_type,
+            joint_parent,
+            joint_child,
+            joint_ancestor,
+            joint_q_start,
+            joint_qd_start,
+            joint_X_p,
+            joint_axis,
+            joint_q,
+            joint_dof_dim,
+            body_q,
+            body_com,
+            J,
+            joint_S_s,
+        )
 
 
 def eval_jacobian(
@@ -1475,7 +1534,7 @@ def eval_jacobian(
         )
 
     wp.launch(
-        kernel=eval_articulation_jacobian,
+        kernel=eval_joint_jacobian,
         dim=model.joint_count,
         inputs=[
             model.joint_articulation,

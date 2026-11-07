@@ -730,13 +730,15 @@ class TestHeightfield(unittest.TestCase):
         self.assertEqual(triangle_count, 8)
         self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
 
-    def _get_contact_kinematics(self, model, state, *, reduce_contacts=True, requires_grad=False):
-        """Return contact distances, normals, and heightfield points for a model state."""
-        pipeline = newton.CollisionPipeline(
-            model,
-            reduce_contacts=reduce_contacts,
-            requires_grad=requires_grad,
-        )
+    def _get_contact_kinematics(self, model, state, *, reduce_contacts=True, requires_grad=False, environ=None):
+        """Return contact distances, normals, and heightfield points for a model state, the pipeline built with the
+        ``environ`` variables set."""
+        with patch.dict(os.environ, environ or {}):
+            pipeline = newton.CollisionPipeline(
+                model,
+                reduce_contacts=reduce_contacts,
+                requires_grad=requires_grad,
+            )
         contacts = pipeline.contacts()
         distance = wp.empty(contacts.rigid_contact_max, dtype=float, device=model.device)
         point0 = wp.empty(contacts.rigid_contact_max, dtype=wp.vec3, device=model.device)

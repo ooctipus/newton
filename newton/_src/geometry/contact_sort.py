@@ -239,15 +239,19 @@ class ContactSorter:
                 ContactField("_sort_indices", wp.int32, per_contact=2, extra=int(SORT_CHUNK)),
                 ContactField("_sort_keys_copy", wp.int64, SORT_KEY_SENTINEL, per_contact=2, extra=int(SORT_CHUNK)),
             ]
+            # Scratch buffers for the simple gather (NarrowPhase.launch path), empty when not provisioned.
+            simple = (
+                ("_simple_pair_buf", wp.vec2i),
+                ("_simple_position_buf", wp.vec3),
+                ("_simple_normal_buf", wp.vec3),
+                ("_simple_penetration_buf", wp.float32),
+                ("_simple_tangent_buf", wp.vec3),
+            )
             if allocate_simple_scratch:
-                # Scratch buffers for the simple gather (NarrowPhase.launch path).
-                fields += [
-                    ContactField("_simple_pair_buf", wp.vec2i),
-                    ContactField("_simple_position_buf", wp.vec3),
-                    ContactField("_simple_normal_buf", wp.vec3),
-                    ContactField("_simple_penetration_buf", wp.float32),
-                    ContactField("_simple_tangent_buf", wp.vec3),
-                ]
+                fields += [ContactField(name, dtype) for name, dtype in simple]
+            else:
+                for name, dtype in simple:
+                    setattr(self, name, wp.zeros(0, dtype=dtype))
             # Scratch buffers for the full gather (CollisionPipeline.collide path).
             fields += [
                 ContactField("_full_shape0_buf", wp.int32),

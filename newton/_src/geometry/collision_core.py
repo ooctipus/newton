@@ -359,7 +359,11 @@ def create_compute_gjk_mpr_contacts(
             face_length = wp.length(face_normal)
             if face_length > 1.0e-12:
                 face_normal /= face_length
-                if wp.dot(pos_b_adjusted - pos_a_adjusted, face_normal) < 0.0:
+                # Shape B's interior point: a cached center (a hull's interior point), else its origin.
+                center_b = pos_b_adjusted
+                if wp.static(use_precomputed_center):
+                    center_b = pos_b_adjusted + wp.quat_rotate(rot_b, shape_b_data.center)
+                if wp.dot(center_b - pos_a_adjusted, face_normal) < 0.0:
                     # Only watertight nearest-face overlaps survive midphase with
                     # the center behind a triangle. GJK would reverse the normal;
                     # retain the authored outward face and its physical depth.

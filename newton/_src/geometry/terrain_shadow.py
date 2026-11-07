@@ -485,7 +485,7 @@ def terrain_law_spill_check(
 _CONTACT_KERNELS = {}
 
 _CONTACTS_OVERFLOWED = wp.constant(1024)
-"""The ``contacts`` bit of the narrow phase's buffer status word (``verify_narrow_phase_buffers``), which checks the
+"""The ``contacts`` bit of the narrow phase's buffer status word (``record_narrow_phase_buffers``), which checks the
 contact buffer before the law writes."""
 
 
