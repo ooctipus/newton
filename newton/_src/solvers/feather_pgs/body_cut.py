@@ -399,6 +399,13 @@ class BodyCut:
         forest.joint_q_start, forest.joint_qd_start = indices(q_start), indices(qd_start)
         forest.articulation_start = indices(np.append(bounds[:-1], source.joint_count))
         forest.articulation_end = indices(bounds[1:])
+        # The model's cached forward-kinematics schedules (a serial joint order, the levels of the tiled kernel)
+        # describe the source's joints; the forest's joints are parent-first within each tree, so its forward
+        # kinematics take the serial path in joint order.
+        forest._fk_joint_order = None
+        forest._fk_articulation_level_start = forest._fk_level_joint_start = None
+        forest._fk_level_joints = forest._fk_level_parent_pos = None
+        forest._fk_level_capacity = 0
         forest.max_joints_per_articulation = int(np.diff(bounds).max())
         forest.max_dofs_per_articulation = int(
             np.bincount(np.repeat(topology.tree, np.diff(qd_start)), minlength=topology.trees)[: topology.trees].max()
