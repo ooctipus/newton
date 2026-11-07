@@ -666,7 +666,6 @@ class Placement:
                 (self.support_pin, "A test pin keeps the rows' sides."),
                 (not self.packed_dense == packed_rows.WIDE, "Bilateral blocks correct rows past their sides."),
                 (not self.classes.tier_rows, "The tiers read their rows at their coordinates."),
-                (self.classes.paired is None, "The paired sweep reads its rows at their coordinates."),
                 (bool(factor.walk_classes), "No tree walks."),
             )
         )
@@ -706,19 +705,11 @@ class Placement:
         self.row_classes = field_group.upload(packed_rows.RowClasses, model.device, table, row_class=row_class)
         self.packed_support, self.packed_dense = int(table.width), 0
 
-    def place_dense_response(self, *, paired_coordinates: bool) -> None:
+    def place_dense_response(self) -> None:
         """Where the dense rows' response lives (``packed_response``, ``packed_response_reason``): the packed rows
         (:mod:`.packed_rows`) wherever a matrix-free sweep reads them."""
         self.packed_response_reason = None if self.classes.mf_sweeps else "No matrix-free sweep reads packed rows."
         self.packed_response = self.packed_response_reason is None
-        if not self.packed_response:
-            if paired_coordinates:
-                raise RuntimeError(
-                    f"The paired factor-coordinate sweep reads packed rows: {self.packed_response_reason}"
-                )
-            return
-        if paired_coordinates and not self.packed_dense:
-            raise RuntimeError("The paired factor-coordinate sweep reads packed rows at their world coordinates")
 
     def allocate_status(self):
         """The capacity status, the overflow warning and the row telemetry."""

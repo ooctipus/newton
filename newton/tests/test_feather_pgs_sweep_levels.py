@@ -8,7 +8,7 @@ share one. The tests check, on the CPU:
 
 - that a Gauss-Seidel sweep run by the builder's levels (each level's units in any order), by its scalar contacts'
   levels (case K2: the levels of the one-coordinate contacts on coordinates no coupled contact holds, each level's
-  contacts side by side, then the rest in row order) or by its components (case K5: a world's two trees apart) gives
+  contacts side by side, then the rest in row order) or by its components (a world's two trees apart) gives
   the row order's iterate bit for bit, and that an order putting one conflicting pair out of row order does not;
 - that the level pass's rounds (:func:`.sweep_levels.level_pass`: a batch of 32 units, a unit committing once it owns
   both its resources) give the row-order levels (:func:`levels`, the rule the colored units' CUDA test compares the
@@ -199,7 +199,7 @@ class TestLevelsAreTheRowOrder(unittest.TestCase):
                 _same(self, world.sweep(order), reference)
 
     def test_components_sweep_the_row_order(self):
-        """Case K5: a world whose rows each hold its articulation or its free body splits into the two."""
+        """A world whose rows each hold its articulation or its free body splits into the two."""
         rng = np.random.default_rng(6)
         resources = [(int(rng.integers(2)),) for _ in range(50)]
         world = World(rng, resources, dofs=6)

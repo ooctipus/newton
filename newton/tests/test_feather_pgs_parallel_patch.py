@@ -1250,16 +1250,15 @@ def _plan_class(inputs, *, general):
 
 
 class TestTierRule(unittest.TestCase):
-    """Build the Jacobi tiers for case K4, a tree beside a free body, where its rows do not step in turn."""
+    """Build the Jacobi tiers for case K4, a tree beside a free body (a hub)."""
 
     @staticmethod
     def _rule(
         response=((16, 6, 0, 16), "The parallel tiers form the response in-kernel."),
-        in_turn="A hub world of 22 coordinates steps its rows at once.",
         **changes,
     ):
         """The tier rule on a class's inputs, allegro's by default (a 16-coordinate hand and a cube, 192 dense rows),
-        with the in-kernel response ``response`` (its sizes and why) and why its rows do not step in turn."""
+        with the in-kernel response ``response`` (its sizes and why)."""
         inputs = SimpleNamespace(
             pins=SolverFeatherPGS.Pins(),
             dense_rows=192,
@@ -1269,10 +1268,7 @@ class TestTierRule(unittest.TestCase):
             setattr(inputs, name, value)
         sizes, reason = response
         meta = None if sizes is None else np.zeros((4, 4), np.int32)
-        with (
-            patch.object(class_plan, "tier_response", lambda shape: (sizes, meta, reason)),
-            patch.object(class_plan, "_in_turn", lambda forest: in_turn),
-        ):
+        with patch.object(class_plan, "tier_response", lambda shape: (sizes, meta, reason)):
             return class_plan.tier_rule(inputs)
 
     def test_a_tree_beside_a_body_takes_the_tiers(self):
@@ -1295,8 +1291,6 @@ class TestTierRule(unittest.TestCase):
                 {"forest": SimpleNamespace(world_count=4, max_world_dofs=22, shape=SimpleNamespace(beside=False))},
                 "a free body beside a tree",
             ),
-            # A world whose `u` fits the lanes and whose rows step in turn (case K5).
-            ({"in_turn": None}, "in turn"),
             ({"pins": SolverFeatherPGS.Pins(tiers=0)}, "tiers=0"),
             ({"response": (None, "A world has several articulations of size 6.")}, "several"),
         ):
@@ -1307,7 +1301,7 @@ class TestTierRule(unittest.TestCase):
 
     def test_one_rule_or_the_general_data_holds_the_class(self):
         """Refuse a class two exclusive rules both hold, and keep every class general under a pin."""
-        rules = {"paired": lambda inputs: (object(), None), "tiers": lambda inputs: (object(), None)}
+        rules = {"diagonal": lambda inputs: (object(), None), "tiers": lambda inputs: (object(), None)}
         with patch.object(class_plan, "RULES", rules), self.assertRaises(RuntimeError):
             _plan_class(_class_inputs(), general=None)
         self.assertIsNone(class_plan.general_reason(SolverFeatherPGS.Pins()))
@@ -1337,22 +1331,6 @@ class TestClassShape(unittest.TestCase):
         self.assertEqual(sizes, (16, 6, 0, 16))
         np.testing.assert_array_equal(meta, np.stack((np.arange(4), [0] * 4, 4 + np.arange(4), [16] * 4), axis=1))
         self.assertIsNone(class_plan.tier_response(_shape(16, several=True))[0])
-
-    def test_paired(self):
-        forest = SimpleNamespace(world_count=4, diagonal_mass_sizes=frozenset())
-        for tree, several, groups in (
-            (23, False, None),  # 29 coordinates: a hub whose response the tiers form steps its rows at once
-            (23, True, None),
-            (27, False, None),  # 33 coordinates exceed the lanes
-            (16, False, None),
-        ):
-            with self.subTest(tree=tree, several=several):
-                forest.shape = _shape(tree, several=several)
-                choice, _ = class_plan.paired_rule(SimpleNamespace(forest=forest, dense_rows=192))
-                if groups is None:
-                    self.assertIsNone(choice)
-                else:
-                    np.testing.assert_array_equal(choice.groups, groups)
 
 
 def _dummy(arg):

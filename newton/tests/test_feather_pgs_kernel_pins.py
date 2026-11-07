@@ -157,13 +157,12 @@ def _audit_calls():
 def _readout_calls():
     """Opt-in sweep readouts of the suite's counted sweeps: ``(name, factory, args, kwargs)``.
 
-    ``Diagnostics(solve_readout="sweeps")`` builds these variants of the sparse, sparse-diagonal,
-    matrix-free Gauss-Seidel and paired factor sweeps.
+    ``Diagnostics(solve_readout="sweeps")`` builds these variants of the sparse, sparse-diagonal and
+    matrix-free Gauss-Seidel sweeps.
     """
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
         sweep_routes,
         sweep_routes_diag,
-        sweep_routes_local,
         sweep_routes_sparse,
     )
     from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy  # noqa: PLC0415
@@ -183,15 +182,6 @@ def _readout_calls():
         ((192, 64, 22, _ARCH), {"free_rows": False, "speed_rows": True}),
     ):
         yield "sweep_routes.GeneralSweep", factory, args, {**kwargs, **readout}
-    factory = built(sweep_routes_local.PairedSweep)
-    for units in (False, True):
-        kwargs = {"contact_units": True, **readout} if units else readout
-        yield (
-            "sweep_routes_local.PairedSweep",
-            factory,
-            (192, 29, 23, 6, _ARCH),
-            {**kwargs, "speed_rows": True},
-        )
 
 
 def _module_kernels():
@@ -303,7 +293,6 @@ def _solver_factory_calls():
         sweep_levels,
         sweep_routes,
         sweep_routes_diag,
-        sweep_routes_local,
         sweep_routes_tiers,
         sweep_units,
     )
@@ -353,14 +342,6 @@ def _solver_factory_calls():
     # The colored units' slot staging, under each law (the weights a constant of the plan).
     for weighted in (False, True):
         yield "sweep_units.stage_slots", sweep_units.stage_slots.__wrapped__, (weighted,), {}
-    for speed in (False, True):
-        factory = built(sweep_routes_local.PairedSweep)
-        yield "sweep_routes_local.PairedSweep", factory, (192, 29, 23, 6, _ARCH), {"speed_rows": speed}
-    # The unit walks of the same factory.
-    for speed in (False, True):
-        factory = built(sweep_routes_local.PairedSweep)
-        args = (192, 29, 23, 6, _ARCH)
-        yield "sweep_routes_local.PairedSweep", factory, args, {"contact_units": True, "speed_rows": speed}
 
     # Parallel tiers: one articulation per world, its response formed in-kernel.
     for rows in (32, 48):
@@ -589,7 +570,6 @@ class TestFeatherPGSKernelPins(unittest.TestCase):
             "sweep_levels._get_sparse_contact_levels_kernel",
             "sweep_levels._get_mark_independent_sparse_contact_candidates_kernel",
             "sweep_routes_tiers.TierSweep",
-            "sweep_routes_local.PairedSweep",
             "sweep_routes_tiers.TierSweep[keyed]",
             "row_slots.allocate_world_contact_slots",
             "walk_rows.slot_rows_kernel",

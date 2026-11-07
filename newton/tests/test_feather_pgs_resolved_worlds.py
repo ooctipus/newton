@@ -688,7 +688,7 @@ class TestResolvedWorldsDevice(unittest.TestCase):
         """Persistent patch friction: resolved worlds step identically and release the same anchors.
 
         Boxes stick on the ground, rise (their worlds resolve and their anchors release), and land
-        again; arms of three links run the general sweep, arms of seventeen the paired factor sweep.
+        again; arms of three links run the general sweep, arms of seventeen the tiers (a hub).
         """
         # The seventeen-link arm has 34 position limits: keep its rows within capacity as Kuka's recipe does.
         for links, solver_kwargs in ((3, {}), (17, {"dense_max_constraints": 128, "joint_limit_activation_gap": 0.1})):

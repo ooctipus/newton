@@ -530,7 +530,6 @@ class SolverFeatherPGS(SolverBase):
         # group's Jacobian.
         self._allocate_buffers(model)
         self.placement.allocate_world_rows(model)
-        self.sweep.place_paired(self.spec.classes.paired)
         self.placement.allocate_sparse_diagonal_rows()
         self.placement.allocate_free_body_rows(model)
         self.factor.scatter_armature()
@@ -554,10 +553,9 @@ class SolverFeatherPGS(SolverBase):
             from .keyed_rows import create_owner as create_kinetic_rows_owner  # noqa: PLC0415
 
             self.placement.keyed_rows, self.placement.keyed_rows_reason = create_kinetic_rows_owner(self)
-        # The general placement (case K6) and the paired factor coordinates (case K5, a tree beside one free body)
-        # whiten and leave their rows by the walk (FL3.3): the factor holds the walk's data for every responding tree, a
-        # free rigid body's six coordinates included, and the one writer, the free bodies' writer and the sweeps' leaves
-        # read it. The Jacobi tiers (case K4, FL3.7) read the one writer's rows, or walk their keyed rows in the kernel,
+        # The general placement (case K6) whitens and leaves its rows by the walk (FL3.3): the factor holds the walk's
+        # data for every responding tree, a free rigid body's six coordinates included, and the one writer, the free
+        # bodies' writer and the sweeps' leaves read it. The Jacobi tiers (case K4, FL3.7) read the one writer's rows, or walk their keyed rows in the kernel,
         # and leave by the walk; the keyed rows' general worlds are the one writer's (keyed_rows.keyed_general_units).
         # The support placement (case K1, FL3.4) whitens and leaves its rows by the walk too, into its support sink.
         general = support == "factor" or bool(
@@ -600,7 +598,7 @@ class SolverFeatherPGS(SolverBase):
         self.sweep.resolved_worlds = classifier.resolved
         self.sweep.resolved_worlds_reason = classifier.reason
 
-        self.placement.place_dense_response(paired_coordinates=self.sweep.paired_factor_coordinates)
+        self.placement.place_dense_response()
         # The route: the row of the route table the class takes. The step plan and the route record read it. Its
         # producer writes every contact row, decided once from the owners' admissions: keyed rows (the tiers' in-kernel
         # sink, case K4), else the one writer where the class walks its rows, else none (no responding coordinate: no
@@ -645,7 +643,7 @@ class SolverFeatherPGS(SolverBase):
         each with its reason (the kernel choice, the size's resource rule), the
         held-tree owner and its lane layouts, the contact-row
         producer with each DOF size's row-builder kernels and friction law (from
-        the plan the row build dispatches on), paired and sparse responses,
+        the plan the row build dispatches on), the sparse responses,
         the sweep kernels per route and tier, what drives them and the matrix-free
         sweep's shared-memory storage (``sweep.mf_gs_storage``), resolved worlds,
         publication, velocity limits and the lane width of their prescale, free

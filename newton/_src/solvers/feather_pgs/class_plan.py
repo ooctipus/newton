@@ -33,8 +33,6 @@ from .tree_plan import TreePlan, local_parents
 __all__ = ["RULES", "ClassInputs", "ClassPlan", "general_reason", "plan_class"]
 
 _CONTACT_JACOBIAN_MAX_DOF = 10
-# A warp's lanes: a world that fits them keeps its velocity change a coordinate a lane in registers (case K5).
-_LANES = 32
 # The largest articulation the tiers hold (case K4): a lane keeps its row's coordinates in registers.
 _INKERNEL_MAX_DOF = 32
 
@@ -110,15 +108,6 @@ class Packed:
 
 
 @dataclass(frozen=True, eq=False)
-class Paired:
-    """Case K5's choice, a tree beside one free body: the tree's size, the body's, and each tree's body's group."""
-
-    primary: int
-    secondary: int
-    groups: np.ndarray
-
-
-@dataclass(frozen=True, eq=False)
 class Tiers:
     """Case K4's choice, the Jacobi tiers: their in-kernel response's sizes and offsets ``(NA, NB, OA, OB)``, each
     world's trees (``meta``: each size's articulation and first world coordinate, ``-1`` for none) and the row bound."""
@@ -142,7 +131,6 @@ class ClassPlan:
     """The held tree's plan: one held plan a world class, from the case's choice (:func:`.held_tree.plan`)."""
     diagonal: Diagonal | None = None
     packed: Packed | None = None
-    paired: Paired | None = None
     tiers: Tiers | None = None
 
     @property
@@ -363,9 +351,9 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     if declined is not None:
         return None, declined
     if any(shape.free):
-        # A free body beside a tree is the paired response's (measured: Kuka lift 12.7 ms there against 15.5 on sparse
-        # factors).
-        return None, "Worlds with free rigid bodies keep the dense route for the held-tree owner and paired response."
+        # A free body beside a tree is a hub, the tiers' (measured: Kuka lift 12.7 ms on the paired response, since
+        # retired for the tiers, against 15.5 on sparse factors).
+        return None, "Worlds with free rigid bodies keep the dense route for the held-tree owner and the tiers."
     if shape.blocks != 1:
         return None, "Native sparse factors require one articulated response DOF size."
     size = shape.sizes[0]
@@ -497,33 +485,6 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     )
 
 
-def _in_turn(forest) -> str | None:
-    """Why the rows do not step in turn, `u` in registers (a tree beside one free body, in the lanes), or ``None``."""
-    shape = forest.shape
-    if not (shape.blocks == 2 and shape.present(0) and shape.present(1) and shape.free.count(True) == 1):
-        return "No world class pairs one tree with exactly one free body in every world."
-    return first_failed(
-        (
-            (shape.sizes[shape.free.index(False)] not in forest.diagonal_mass_sizes, "The tree is a star."),
-            (shape.coordinates <= _LANES, f"{shape.coordinates} coordinates a world exceed a warp's {_LANES} lanes."),
-            (tier_response(shape)[0] is None, "The tiers form the hub's response: its rows step at once."),
-        )
-    )
-
-
-def paired_rule(inputs: ClassInputs) -> tuple[Paired | None, str]:
-    """Case K5, `u` in registers: a tree beside one free body in every world, in the lanes, its rows in turn."""
-    forest, shape = inputs.forest, inputs.forest.shape
-    reason = _in_turn(forest)
-    if reason is not None:
-        return None, reason
-    tree, body = shape.free.index(False), shape.free.index(True)
-    # Each tree's free body's group, by the tree's group.
-    groups = np.empty(forest.world_count, dtype=np.int32)
-    groups[shape.groups[:, tree]] = shape.groups[:, body]
-    return Paired(shape.sizes[tree], shape.sizes[body], groups), None
-
-
 def tier_response(shape) -> tuple[tuple[int, int, int, int] | None, np.ndarray | None, str]:
     """The in-kernel response's group sizes and offsets ``(NA, NB, OA, OB)`` and each world's trees, or ``None``,
     and why.
@@ -574,7 +535,6 @@ def tier_rule(inputs: ClassInputs) -> tuple[Tiers | None, str]:
             ),
             (pinned is None or bool(pinned), "A test pin builds no tier (tiers=0)."),
             (bool(pinned) or forest.shape.beside, "The tiers serve a hub: a free body beside a tree in one world."),
-            (_in_turn(forest) is not None, "A world's rows step in turn, `u` in registers."),
         )
     )
     if reason is not None:
@@ -589,7 +549,7 @@ def tier_rule(inputs: ClassInputs) -> tuple[Tiers | None, str]:
     return Tiers(sizes, meta, rows), reason
 
 
-RULES = MappingProxyType({"diagonal": diagonal_rule, "packed": packed_rule, "paired": paired_rule, "tiers": tier_rule})
+RULES = MappingProxyType({"diagonal": diagonal_rule, "packed": packed_rule, "tiers": tier_rule})
 """Each choice's rule, by the :class:`ClassPlan` field it fills. Their predicates exclude one another; a class none
 holds keeps the general placement."""
 

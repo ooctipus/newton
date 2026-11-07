@@ -27,7 +27,6 @@ from newton._src.solvers.feather_pgs import (
     row_laws,
     sweep_routes,
     sweep_routes_diag,
-    sweep_routes_local,
 )
 from newton._src.solvers.feather_pgs.device_preludes import ARCHITECTURE_GUARD
 from newton._src.solvers.feather_pgs.kernel_template import KernelTemplate
@@ -72,12 +71,6 @@ _SCALED_VOTES = {
         "fabsf(delta_impulse_vlim) * (denom)",
         "fabsf(speed_row[1]) * (1.0f / mf_diag)",
     ),
-    "paired": (
-        "fabsf(delta_impulse) * (s_diag[i])",
-        "fabsf(delta_impulse) * ((r == 0 ? unit_diag0 : unit_diag1))",
-        "fabsf(sib_delta) * (unit_diag2)",
-        "fabsf(sib_delta) * (s_diag[sib])",
-    ),
     "sparse_diagonal": (
         "fabsf(delta_impulse) * (denom)",
         "fabsf(sib_delta) * (__int_as_float(s_rec_dense[64 + (sib)]))",
@@ -101,12 +94,6 @@ def _factory_calls():
             built(sweep_routes.GeneralSweep),
             (64, 32, 12, "120"),
             {},
-        ),
-        (
-            "paired",
-            built(sweep_routes_local.PairedSweep),
-            (192, 29, 23, 6, "120"),
-            {"contact_units": True, "speed_rows": True},
         ),
         (
             "sparse_diagonal",
@@ -171,12 +158,6 @@ def _vote_census():
             ),
         ),
         (
-            "paired",
-            built(sweep_routes_local.PairedSweep),
-            (192, 29, 23, 6, "120"),
-            (_axis("speed_rows"), _axis("contact_units")),
-        ),
-        (
             "sparse_diagonal",
             built(sweep_routes_diag.DiagonalSweep),
             (64, 10, 9, "120"),
@@ -196,11 +177,8 @@ def _vote_census():
             yield name, factory, args, kwargs
 
 
-def _with_readout(name: str, labels: list[str], count: int) -> list[str]:
-    """Factory ``name``'s labels with ``count`` readout operands appended: last, but before the paired sweep's walk,
-    which it takes after them."""
-    if name == "paired":
-        return labels[:-1] + ["readout"] * count + labels[-1:]
+def _with_readout(labels: list[str], count: int) -> list[str]:
+    """A factory's labels with ``count`` readout operands appended, last."""
     return labels + ["readout"] * count
 
 
@@ -266,7 +244,7 @@ class TestSolvePolicy(unittest.TestCase):
                 self.assertNotIn("solve_readout_sweeps", "".join(_native_snippets(kernel)))
 
     def test_readout_appends_one_operand_prelude_and_exit_record(self):
-        """Append the readout operand last (the paired sweep's walk follows it), declare its prelude after the law
+        """Append the readout operand last, declare its prelude after the law
         and record every solve once."""
         for name, factory, args, kwargs in _factory_calls():
             with self.subTest(factory=name):
@@ -274,7 +252,7 @@ class TestSolvePolicy(unittest.TestCase):
                 kernel = factory(*args, solve_policy=SWEEPS, **kwargs)
                 self.assertEqual(kernel.key, exact.key + "_sweeps")
                 labels = [argument.label for argument in kernel.adj.args]
-                self.assertEqual(labels, _with_readout(name, [argument.label for argument in exact.adj.args], 1))
+                self.assertEqual(labels, _with_readout([argument.label for argument in exact.adj.args], 1))
                 self.assertIs(_readout_arg(kernel).type, SolveReadout)
                 snippets = {snippet for snippet in _native_snippets(kernel) if "solve_readout_sweeps" in snippet}
                 self.assertEqual(len(snippets), 1)
@@ -424,9 +402,7 @@ class TestExitLaw(unittest.TestCase):
                 kernel = factory(*args, solve_policy=policy, **kwargs)
                 self.assertEqual(kernel.key, plain.key + policy.suffix, kwargs)
                 labels = [argument.label for argument in kernel.adj.args]
-                self.assertEqual(
-                    labels, _with_readout(name, [argument.label for argument in plain.adj.args], policy.counts)
-                )
+                self.assertEqual(labels, _with_readout([argument.label for argument in plain.adj.args], policy.counts))
                 snippet = max(_native_snippets(kernel), key=len)
                 if len(_LAW_SITE.findall(snippet)) != law_sites or ("s_rec_dense" in snippet) != (
                     "s_rec_dense" in body
@@ -457,7 +433,6 @@ class TestExitLaw(unittest.TestCase):
                 "sparse": 128,
                 "sparse_lanes": 16,
                 "mf_gs": 20,
-                "paired": 4,
                 "sparse_diagonal": 12,
             },
         )
@@ -518,7 +493,7 @@ class TestSolveReadoutRecord(unittest.TestCase):
         plain = SimpleNamespace(key="plain_kernel")
         record.register(counted, "sparse_pgs", readout="sweeps", world_count=3, budget=4, device="cpu")
         record.register(plain, "mf_gs", readout=None, world_count=3, budget=4, device="cpu")
-        record.register(None, "paired_factor", readout="sweeps", world_count=3, budget=4, device="cpu")
+        record.register(None, "sparse_diagonal", readout="sweeps", world_count=3, budget=4, device="cpu")
         self.assertEqual(record.kernels, {"counted_kernel": "sparse_pgs"})
         self.assertEqual(record.operands(plain), [])
         (operand,) = record.operands(counted)

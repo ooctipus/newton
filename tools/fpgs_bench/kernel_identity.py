@@ -534,14 +534,13 @@ def census_calls():
     each flag alone and still change a combination of flags. The census takes
     the product of each factory's flags at fixed shapes: matrix-free
     Gauss-Seidel (one shape within a warp's width of coordinates, one beyond
-    it), sparse (one shape small enough for subwarp sweeps), paired factor,
+    it), sparse (one shape small enough for subwarp sweeps),
     sparse diagonal, parallel and keyed parallel tiers. The matrix-free Gauss-Seidel sweep is crossed with
     resident row metadata.
     """
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
         sweep_routes,
         sweep_routes_diag,
-        sweep_routes_local,
         sweep_routes_tiers,
     )
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
@@ -577,12 +576,6 @@ def census_calls():
                 _axis("warm_start"),
                 _axis("linked_rows"),
             ),
-        ),
-        (
-            "sweep_routes_local.PairedSweep",
-            built(sweep_routes_local.PairedSweep),
-            ((192, 29, 23, 6, ARCH),),
-            (_axis("speed_rows"), _axis("contact_units")),
         ),
         (
             "sweep_routes_diag.DiagonalSweep",

@@ -15,8 +15,7 @@ A sweep is a configuration ``Sweep(mapping, staging, blocks, update, laws, exit,
   ring's pooled load (:func:`friction_radius`), then the operator's residual;
 - the **row law** is one function, :func:`row_update`: step, regularization, the projection of each row kind
   (unilateral, friction pair, velocity limit, bilateral), the change vote (:func:`change_vote`) and the
-  apply. Every block of every sweep runs it; a friction pair solved as one unit runs its pair law and tail
-  (:func:`pair_update`);
+  apply. Every block of every sweep runs it;
 - the **contact unit** is a contact normal and its friction pair visited by the row law on the unit's Gram block
   (:func:`contact_unit`, :class:`UnitZ`): the placement reduces the unit's terms once and applies its changes
   once, the pair's terms moved by the normal's change;
@@ -48,7 +47,7 @@ from .device_preludes import BLOCK_THREADS, RING, SHARED_STORAGE, DevicePrelude,
 from .kernel_template import Dispatch, KernelTemplate
 from .law_source import law_preludes
 from .projection_laws import CONE_LAW, PROJECTION_LAW
-from .response_operator import Lanes, LaneVelocity, ResponseOperator, Velocity
+from .response_operator import Lanes, ResponseOperator, Velocity
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_SPEED, ROW_TORSION
 from .row_metadata import (
@@ -308,7 +307,7 @@ class RowStore(Protocol):
     """Where a world's rows live, as the row law and a sweep's phases read them: every accessor is native text at a
     row index. Two stores answer it: :class:`WorldRows` (a class's rows in the row store's line, staged or streamed by
     the class's policy: the matrix-free and sparse-diagonal sweeps) and :class:`StagedRows` (a world's rows staged
-    whole: the sparse and paired factor sweeps)."""
+    whole: the sparse sweep)."""
 
     lanes: Lanes
     owned: bool
@@ -357,7 +356,7 @@ class RowStore(Protocol):
 
 @dataclasses.dataclass(frozen=True)
 class StagedRows:
-    """A world's rows staged whole (the sparse and paired factor sweeps' store).
+    """A world's rows staged whole (the sparse sweep's store).
 
     Impulses, right-hand sides (``rhs_bias + row_incident``), diagonals and kinds are staged per world (``s_impulse``,
     ``s_rhs``, ``s_diag``, ``s_type``); every lane reads them and the first lane stores the impulses. With
@@ -618,8 +617,6 @@ class RowContext:
     eps: Callable[[str], str] | None = None
     """A row's compliance, where the laws have material contacts (:attr:`RowLaws.material`)."""
     contact_kinds: tuple[int, ...] = (ROW_CONTACT, ROW_JOINT_LIMIT)
-    inline_velocity_limit: bool = False
-    """Velocity-limit rows the row loop visits take the velocity-limit law in place (a velocity-limit row phase)."""
     record: Callable[[str, str], str] | None = None
     """An impulse-space operator's record of the impulse a row applied (``s_app[row] += delta``)."""
     friction: bool = True
@@ -727,15 +724,6 @@ def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> st
             # The contact's spin row (``spin``, -1 for none) is the visit's (:func:`admit_pair`).
             lines += ["float spin_new = 0.0f, spin_delta = 0.0f, spin_bound = 0.0f;"]
     branches = []
-    if ctx.inline_velocity_limit:
-        branches.append(
-            (
-                f"{kind} == {ROW_JOINT_VELOCITY_LIMIT}",
-                f"const auto vlim = ProjectionLaw::velocity_limit_update(old_impulse, {diag.scale('residual', row)});\n"
-                "new_impulse = vlim.v0;\n"
-                "delta_impulse = vlim.v1;",
-            )
-        )
     unilateral = " || ".join(f"{kind} == {k}" for k in ctx.contact_kinds)
     branches.append(
         (
@@ -854,36 +842,6 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
         ]
     lines.append(ctx.sync() if ctx.synced else "")
     return lines
-
-
-def pair_update(ctx: RowContext, laws: RowLaws, *, pad: str) -> str:
-    """The Gauss-Seidel update of a friction pair visited as one unit, at its first tangent ``ctx.row``.
-
-    A unit schedule solves a contact's tangent pair right after its normal
-    row ``ctx.parent``, on the disk of ``radius`` (declared by the block): the
-    operator reduces the first tangent's residual with the pair's terms
-    (:func:`_pair_terms`), the pair is projected as in
-    :func:`row_update`, and the same tail stores, votes and applies.
-    """
-    lines = [
-        f"const float old_impulse = {ctx.load(ctx.row)};",
-        "float new_impulse = old_impulse;",
-        "float delta_impulse = 0.0f;",
-        "int sib = -1;",
-        "float sib_new = 0.0f, sib_delta = 0.0f, row_bound = 0.0f, sib_bound = 0.0f;",
-        *(
-            (
-                f"const int spin = {ctx.spin_row(ctx.parent)};",
-                "float spin_new = 0.0f, spin_delta = 0.0f, spin_bound = 0.0f;",
-            )
-            if laws.torsion
-            else ()
-        ),
-        friction_pair(ctx, laws, own=True),
-        "delta_impulse = new_impulse - old_impulse;",
-        *_row_tail(ctx, laws),
-    ]
-    return indent("\n".join(line for line in lines if line != ""), pad)
 
 
 def _sibling_bound(ctx: RowContext) -> str:
@@ -1499,7 +1457,7 @@ class SelectedRows:
 class Pipelined:
     """A phase's rows ``[0, end)`` in slot order with what a row's visit reads first loaded a row ahead: ``prologue``
     loads row 0's before the loop, ``consume(row, indent)`` takes row ``row``'s and loads the next's (the free
-    bodies' header words and ``Z`` entries, :func:`rows_block`; the paired factor sweep's factor rows)."""
+    bodies' header words and ``Z`` entries, :func:`rows_block`)."""
 
     end: str
     prologue: Callable[[str], str]
@@ -1542,20 +1500,6 @@ class BallotHeads:
             f"{pad}    }}\n"
             f"{pad}}}"
         )
-
-
-@dataclasses.dataclass(frozen=True)
-class UnitStride:
-    """A phase's rows ``[0, end)`` in slot order a unit at a time: the visit sets ``step`` to its unit's rows (one, or a
-    contact's three or four: the paired factor sweep's contact units)."""
-
-    end: str
-
-    def inner(self, pad: str) -> str:
-        return pad + "    "
-
-    def wrap(self, visit: str, pad: str) -> str:
-        return f"{pad}for (int i = 0, step = 1; i < {self.end}; i += step) {{\n{visit}\n{pad}}}"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1750,17 +1694,15 @@ def row_step(
     kind: int | None = None,
     parent: str | None = None,
     admission: str = "",
-    loads: str = "",
     held: bool = False,
     triple_phase: bool = False,
-    inline_velocity_limit: bool = False,
     metric: str | None = None,
     pad: str = "            ",
 ) -> str:
     """Row ``i``'s step in a row loop over a store's rows ``[0, end)``: its kind read from the store, the schedule's
     skips, then the shared visit (:func:`row_visit`): admission, residual and row law, in the store's context
-    (:meth:`RowContext.of`: who owns a row's stores is the store's). Every row loop of the sparse, matrix-free,
-    sparse-diagonal and paired factor sweeps runs this text; its data choices are all that differ:
+    (:meth:`RowContext.of`: who owns a row's stores is the store's). Every row loop of the sparse, matrix-free
+    and sparse-diagonal sweeps runs this text; its data choices are all that differ:
 
     - ``held``: the row's and its pair's impulses are read at admission into registers (``row_impulse``,
       ``pair_impulse``) and the law reads them there (the sparse sweep's rows);
@@ -1771,10 +1713,6 @@ def row_step(
       otherwise a spin row is solved with its friction pair in the loop (the store's :meth:`RowStore.spin_of`), its
       metric cached for the launch with ``metric`` (the law :func:`friction_metric_law` declared,
       :func:`friction_metric_stage`);
-    - ``inline_velocity_limit``: velocity-limit rows take their law in place, in slot order (the paired factor
-      sweep), instead of the last word (:func:`velocity_limit_pass`), which ``admission`` then skips them for;
-    - ``loads``: what the operator reads of the row and its pair in registers, loaded after the admission (the paired
-      factor sweep's ``sibling_z`` and ``spin_z``);
     - a row known where the step is emitted (``kind``, and a friction row's ``parent``) replaces its metadata, so the
       step compiles to that kind's law: a known kind is no spin row, and one other than friction admits no pair (the
       sparse-diagonal sweep's chains).
@@ -1788,7 +1726,6 @@ def row_step(
         end=end,
         metric=metric,
         friction=kind in (None, ROW_FRICTION),
-        inline_velocity_limit=inline_velocity_limit,
     )
     hold = {}
     if held:
@@ -1806,7 +1743,7 @@ def row_step(
         dataclasses.replace(laws, torsion=False) if triple_phase else laws,
         parent=rows.parent("i") if parent is None else parent,
         check="denom",
-        declare=f"{loads}float denom = {rows.diag('i')};",
+        declare=f"float denom = {rows.diag('i')};",
         keep_next="pair_impulse" if held else None,
         pad=pad,
         **hold,
@@ -2114,19 +2051,9 @@ def speed_row(
     the squares added in coordinate order; the lanes then synchronize. The row's law (:func:`.projection_laws.speed_row`)
     gives its stored value (``store`` stores ``speed_row[0]``, the total of the row's impulse ``load``) and the scale
     that pushes the velocity back along itself, ``u += L^T dv`` by the walk in (``walk.walk_enter(first, velocity,
-    out)``), one thread or the first lane. Where each lane holds its own coordinate in a register
-    (:class:`.response_operator.LaneVelocity`), the body's six lanes stage theirs in the world's ``s_speed`` first and
-    take them back after. ``inverse`` is the row's inverse diagonal.
+    out)``), one thread or the first lane. ``inverse`` is the row's inverse diagonal.
     """
-    registers = isinstance(velocity, LaneVelocity)
-    stage = take = ""
-    if registers:
-        held = f"{lanes.lane} >= {body} && {lanes.lane} < {body} + 6"
-        stage = f"{pad}if ({held}) s_speed[{lanes.lane} - ({body})] = {velocity.array};\n{pad}{lanes.sync()}"
-        take = f"{pad}if ({held}) {velocity.array} = s_speed[{lanes.lane} - ({body})];"
-        v = "s_speed[k]"
-    else:
-        v = velocity.at(f"{body} + k")
+    v = velocity.at(f"{body} + k")
     speed = [
         "float speed_v[6];",
         f"for (int k = 0; k < 6; ++k) speed_v[k] = {v};",
@@ -2149,7 +2076,6 @@ def speed_row(
     if lanes.parallel:
         push = f"if ({lanes.lane} == 0) {{\n{push}\n}}"
     lines = [
-        *((stage,) if stage else ()),
         "\n".join(pad + line for line in "\n".join(speed).split("\n")),
         f"{pad}const float old_mf_vlim = {load};",
         f"{pad}const float bound_speed = {bound(rhs, 'speed_mf_vlim', 'old_mf_vlim', step=inverse)};",
@@ -2171,8 +2097,6 @@ def speed_row(
     ]
     if lanes.sync():
         lines.append(f"{pad}{lanes.sync()}")
-    if take:
-        lines.append(take)
     return "\n".join(lines)
 
 

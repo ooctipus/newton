@@ -739,7 +739,7 @@ class TestWalkedPlacement(unittest.TestCase):
     """Every walked row of the CPU catalogue's general worlds against its physical ``J``, and the leave in its frame.
 
     The general placement's rows (case K6): each problem's reference route runs it, and a default route the CPU gives
-    another case (K1, K2, K5 write their rows in their own layouts) is left to that case's own tests."""
+    another case (K1, K2 and the tiers write their rows in their own layouts) is left to that case's own tests."""
 
     def test_one_frame_on_the_cpu_catalogue(self):
         worst = {"rows": 0.0, "free_rows": 0.0, "leave": 0.0}
@@ -747,7 +747,7 @@ class TestWalkedPlacement(unittest.TestCase):
         for physics, route in catalogue():
             solver, joint_q, capture = run_route(physics, route, device="cpu", steps=4)
             classes = solver.spec.classes
-            if not solver.placement.walks or any((classes.packed, classes.diagonal, classes.paired, classes.tiers)):
+            if not solver.placement.walks or any((classes.packed, classes.diagonal, classes.tiers)):
                 continue
             result = walked_frames(solver, joint_q, capture)
             worlds += result["worlds"]
@@ -763,8 +763,8 @@ class TestWalkedPlacement(unittest.TestCase):
         self.assertLess(worst["leave"], BOUND, worst)
 
 
-def paired_arm_and_box(device, drives: bool):
-    """Two worlds of a 23-DOF arm and a free box sliding down onto it (case K5 on CUDA: the paired factor sweep), with
+def hub_arm_and_box(device, drives: bool):
+    """Two worlds of a 23-DOF arm and a free box sliding down onto it (a hub: the Jacobi tiers on the one writer's rows), with
     ``drives`` stiff PD drives on the arm held past their effort limits, so they slip."""
     model = _build_mixed_response_model(device, world_count=2, dof_count=23, friction=0.7)
     qd = model.joint_qd.numpy()
@@ -786,14 +786,14 @@ def paired_arm_and_box(device, drives: bool):
     return model, control
 
 
-class TestPairedPlacement(unittest.TestCase):
-    """Case K5 walks (FL3.3 stage two C): its rows by the one writer, the paired factor sweep's leave by the walk."""
+class TestHubPlacement(unittest.TestCase):
+    """A hub walks: its rows by the one writer, the tiers' leave by the walk."""
 
-    @unittest.skipUnless(wp.is_cuda_available(), "The paired factor sweep requires CUDA")
-    def test_one_frame_on_the_paired_class(self):
+    @unittest.skipUnless(wp.is_cuda_available(), "The hub's frame is checked on CUDA")
+    def test_one_frame_on_the_hub_class(self):
         for drives in (False, True):
             with self.subTest(drives=drives):
-                model, control = paired_arm_and_box("cuda:0", drives)
+                model, control = hub_arm_and_box("cuda:0", drives)
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     solver = SolverFeatherPGS(
@@ -803,9 +803,9 @@ class TestPairedPlacement(unittest.TestCase):
                         dense_max_constraints=96,
                         mf_max_constraints=32,
                     )
-                self.assertIsNotNone(solver.spec.classes.paired)
+                self.assertIsNotNone(solver.spec.classes.tiers)
                 self.assertTrue(solver.placement.walks)
-                self.assertIsNotNone(solver.sweep.paired_factor_kernel)
+                self.assertIsNone(solver.placement.keyed_rows)
                 capture = Capture(solver)
                 pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, deterministic=True)
                 contacts = pipeline.contacts()
@@ -826,7 +826,7 @@ class TestPairedPlacement(unittest.TestCase):
                     for key in ("free_bodies", "slipping"):
                         seen[key] += result[key]
                     state, out = out, state
-                self.assertGreater(seen["rows"], 0, "no row reached the paired sweep")
+                self.assertGreater(seen["rows"], 0, "no row reached the sweep")
                 self.assertGreater(seen["free_bodies"], 0)
                 if drives:
                     self.assertGreater(seen["slipping"], 0, "no drive slipped")

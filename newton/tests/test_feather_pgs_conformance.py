@@ -15,10 +15,10 @@ Routes
     ``get_path_selection()["routes"]`` before its first step and asserts the
     record the route expects, so a test cannot silently run another route.
     Owners that claim worlds at run time (sparse factors, the parallel tiers,
-    the paired and sparse-diagonal sweeps) also get an ownership
+    the sparse-diagonal sweep) also get an ownership
     test that reads the solve readout. Covered on CUDA: native sparse factors
     (with contact triplets), the matrix-free Gauss-Seidel sweep with its
-    parallel and keyed-parallel tiers, the paired factor sweep
+    parallel and keyed-parallel tiers
     and the sparse-diagonal sweep (its slot rows); on CPU, the general row of the matrix-free sweep, one thread per
     world. Dynamics owners: the held groups (sparse, tree and forest), scalar
     branches and ordinary dynamics. Contact-row producers: the one writer (into the general, the support and the
@@ -1369,14 +1369,13 @@ REFERENCE_CUDA = Route(
     "reference",
     "cuda",
     # The plain matrix-free Gauss-Seidel sweep over the held tree and rows: the general placement declines the
-    # paired and sparse-diagonal owners, and every world is solved (no resolved-world claim). The tree factor itself
+    # tiers and the sparse-diagonal owner, and every world is solved (no resolved-world claim). The tree factor itself
     # answers to the float64 mass matrix (test_feather_pgs_factor).
     options=_MF,
     pins={**_DENSE, "placement": "general", "claims": ()},
     expect={
         "sweep.route": "matrix_free_gs",
         "sweep.tiers": None,
-        "paired_response.enabled": False,
         "sparse_diagonal.enabled": False,
         "held_tree.owner": "mixed",
         "resolved_worlds.enabled": False,
@@ -1458,7 +1457,6 @@ HUB = Route(
         "sweep.route": "matrix_free_gs",
         "sweep.tiers.family": "parallel",
         "contact_rows.producer": "walk",
-        "paired_response.enabled": False,
         "held_tree.owner": "mixed",
     },
 )

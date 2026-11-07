@@ -107,15 +107,6 @@ class Velocity:
         return f"{self.array}[{index}]"
 
 
-@dataclass(frozen=True)
-class LaneVelocity(Velocity):
-    """The velocity in a register a lane: lane ``l`` holds coordinate ``l`` (dense rows, whose entry ``l`` is at
-    coordinate ``l``), so a lane reads and updates its own entry's coordinate in its register ``array``."""
-
-    def at(self, index: str) -> str:
-        return self.array
-
-
 class ResponseOperator:
     """A row response representation, which the row law (:mod:`.sweep`) acts through by two actions: ``dot``, sums
     ``Z_row . u`` and Gram entries ``Z_row . Z_other`` reduced in one ladder, and ``axpy``, ``u += sum_k Z_k d_k``.

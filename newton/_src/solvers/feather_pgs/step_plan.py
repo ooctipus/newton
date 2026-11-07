@@ -221,7 +221,7 @@ class StepPlan:
     route: RouteRow
     """The route: the class's row of the route table (the placement case, its producer and its sizes)."""
     kernels: Mapping[str, str | None]
-    """The sweep's kernel keys by route: ``sparse``, ``sparse_diagonal``, ``paired_factor``, ``mf_gs`` and
+    """The sweep's kernel keys by route: ``sparse``, ``sparse_diagonal``, ``mf_gs`` and
     ``mf_colored`` (``None`` where the class builds none)."""
     streams: tuple[str, ...]
     """The side streams the step forks onto, by owner."""
@@ -247,7 +247,6 @@ class StepPlan:
                 {
                     "sparse": kernel_key(sweep.sparse_kernel) if route.support == "factor" else None,
                     "sparse_diagonal": kernel_key(sweep.sparse_diagonal_kernel),
-                    "paired_factor": kernel_key(sweep.paired_factor_kernel),
                     "mf_gs": kernel_key(sweep.mf_gs_kernel),
                     "mf_colored": kernel_key(sweep.mf_colored_kernel),
                 }
@@ -308,7 +307,7 @@ def _solve(row: RouteRow) -> SolveRoute:
     elif row.support == "diagonal":
         route = Route("sparse_diagonal", "The diagonal-mass contact owner owns the sweep.")
     else:
-        route = Route("matrix_free_gs", "Matrix-free Gauss-Seidel; paired and tiered owners claim their worlds first.")
+        route = Route("matrix_free_gs", "Matrix-free Gauss-Seidel; the tiers claim their worlds first.")
     return SolveRoute(route=route)
 
 

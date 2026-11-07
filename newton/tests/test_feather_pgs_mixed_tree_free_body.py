@@ -127,8 +127,8 @@ def _build(
     two-drawer cabinet (independent prismatic coordinates: the solver's
     diagonal-mass response class) replaces the box. ``speed_limit`` bounds
     every arm joint's velocity (the hand recipes' joint velocity limits).
-    ``links`` is the arm's joint count (17 or more with the free box selects
-    the solver's paired response, the Kuka scenes' class). ``pads`` replaces
+    ``links`` is the arm's joint count (17 with the free box is the Kuka
+    scenes' class, a hub on the tiers). ``pads`` replaces
     the arm's capsule with a row of sphere pads that touch the box's side when
     the first joint is at ``pads`` rad: one contact region, whose end pads own
     its two friction anchors and whose inner pads are normal-only units.

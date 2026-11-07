@@ -34,7 +34,6 @@ from . import (
     sweep_levels,
     sweep_routes,
     sweep_routes_diag,
-    sweep_routes_local,
     sweep_routes_sparse,
     sweep_routes_tiers,
     sweep_units,
@@ -80,7 +79,7 @@ SPARSE_CONTACT_RECORDS = FieldGroup(
 
 FRICTION_METRIC = FieldGroup(Field("friction_metric", wp.float32, ("world", "contact", "metric"), owner="placement"))
 """Where spin rows may appear, each friction triple's metric, formed once per launch by the sweeps that visit a triple's
-rows one by one, the matrix-free, the sparse-diagonal and the paired factor sweeps (:func:`.sweep.friction_metric_stage`):
+rows one by one, the matrix-free and the sparse-diagonal sweeps (:func:`.sweep.friction_metric_stage`):
 a slot per four rows of the row store's line, a triple's rows."""
 
 
@@ -272,31 +271,6 @@ class Sweep:
             self.support_threads = walk_rows.support_threads(worlds * capacity, self.model.device)
         return self._support_sink
 
-    def place_paired(self, choice) -> None:
-        """Case K5, a tree beside one free body: the paired response and its factor coordinates, from the class plan's
-        choice (:class:`.class_plan.Paired`, ``None`` where the class is another case)."""
-        model, forest = self.model, self.forest
-        self.paired_factor_coordinates = choice is not None
-        self.paired_response_primary_size = choice.primary if choice is not None else None
-        self.paired_response_secondary_size = choice.secondary if choice is not None else None
-        # Patch contacts are units of one row, or three (four with a spin row) when they own an anchor;
-        # the factor sweep walks them with the generic path's row order and
-        # arithmetic, solving each tangent pair once.
-        self.factor_coordinate_contact_units = bool(self.paired_factor_coordinates and not self.laws.set.compliance)
-        self.paired_factor_secondary_offsets_by_world = None
-        if choice is None:
-            return
-        primary_arts = forest.group_to_art_host[choice.primary]
-        secondary_arts = forest.group_to_art_host[choice.secondary]
-        # Each world's free body's first world coordinate, where its speed rows read its velocity.
-        secondary_offsets = np.empty(forest.world_count, dtype=np.int32)
-        dof_start = forest.articulation_dof_start_host
-        for primary_group, primary_art in enumerate(primary_arts):
-            world = int(forest.articulation_world[primary_art])
-            secondary_art = int(secondary_arts[int(choice.groups[primary_group])])
-            secondary_offsets[world] = choice.primary if dof_start[primary_art] < dof_start[secondary_art] else 0
-        self.paired_factor_secondary_offsets_by_world = wp.array(secondary_offsets, dtype=wp.int32, device=model.device)
-
     def place_tiers(self, choice) -> None:
         """Case K4, the Jacobi tiers: their in-kernel response's trees, from the class plan's choice
         (:class:`.class_plan.Tiers`, ``None`` where the class is another case)."""
@@ -377,7 +351,7 @@ class Sweep:
         )
 
     def build(self) -> None:
-        """Build the paired response and the sweeps."""
+        """Build the sweeps."""
         model = self.model
         device_arch = model.device.arch
 
@@ -385,27 +359,6 @@ class Sweep:
         self.seeded = bool(self.options.pgs_warmstart or self.factor.eliminates)
         # The line's speed rows (step_plan.Capacities.speed_rows), where a free body's rows are the line's.
         speed_rows = self.placement.speed_rows > 0
-        # Case K5 owns every row of its worlds, its free body's contacts and speed rows among them (rows of the line).
-        self.paired_sweep = (
-            sweep_routes_local.PairedSweep(
-                self.placement.dense_max_constraints,
-                self.forest.max_world_dofs,
-                self.paired_response_primary_size,
-                self.paired_response_secondary_size,
-                device_arch,
-                contact_units=self.factor_coordinate_contact_units,
-                pitch=self.placement.row_pitch,
-                seeded=self.seeded,
-                speed_rows=speed_rows,
-                **self.law_fields,
-            )
-            if self.paired_factor_coordinates
-            else None
-        )
-        self.paired_factor_kernel = (
-            self.sweep("paired_factor", self.paired_sweep) if self.paired_sweep is not None else None
-        )
-
         diagonal = self.classes.diagonal
         sparse_contact_schedule = diagonal is not None and diagonal.units
         self.sparse_contact_marker = (
@@ -446,7 +399,7 @@ class Sweep:
         self.sparse_diagonal_kernel = (
             self.sweep("sparse_diagonal", self.diagonal_sweep) if self.diagonal_sweep is not None else None
         )
-        row_by_row = self.sparse_diagonal_kernel is not None or self.paired_factor_kernel is not None
+        row_by_row = self.sparse_diagonal_kernel is not None
         if self.laws.spin_rows and (self.classes.mf_sweeps or row_by_row):
             # Static storage for graph capture: the friction triples' metrics, formed per launch by the sweeps that
             # visit a triple's rows one by one (sweep.friction_metric_stage).
@@ -472,7 +425,7 @@ class Sweep:
         self.every_world = Buckets()
         self.every_world.items = self.every_world.count = wp.zeros(1, dtype=int, device=self.model.device)
         self.every_world.region = self.every_world.first = self.every_world.last = 0
-        if self.classes.mf_sweeps and self.paired_factor_kernel is None:
+        if self.classes.mf_sweeps:
             # A test pin streams the impulses, the free bodies' or every row's (storage is part of the kernel
             # specialization key); the selection sizes the resident row metadata with its choice.
             stream_line = self.pins.mf_storage == "line"
@@ -613,11 +566,10 @@ class Sweep:
             self.launches = (*self.tiers, *mapped)
             self.claim_groups = (*((tier,) for tier in self.tiers[:1]), mapped, *((tier,) for tier in self.tiers[1:]))
         else:
-            # A class whose one sweep owns every world (K1, K2, K5): one launch over the worlds, in line.
+            # A class whose one sweep owns every world (K1, K2): one launch over the worlds, in line.
             single = (
                 (self.sparse_sweep, self.sparse_kernel, self._sparse_operands),
                 (self.diagonal_sweep, self.sparse_diagonal_kernel, self._diagonal_operands),
-                (self.paired_sweep, self.paired_factor_kernel, self._paired_operands),
             )
             self.launches = tuple(
                 self._world_launch(config, kernel, named) for config, kernel, named in single if config is not None
@@ -889,17 +841,6 @@ class Sweep:
             "fused_limit_upper_lambda": placement.fused_diagonal_limit_upper_lambda,
         }
 
-    def _paired_operands(self) -> dict:
-        """Case K5's operands: its rows in factor coordinates (the packed rows at their world coordinates) and each
-        world's free body's first coordinate."""
-        walked = {"walk": self.factor.walk_view()} if self.placement.walks else {}
-        return {
-            "world_count": self.forest.world_count,
-            "factor_rows": self.placement.packed_Z,
-            "secondary_offset_by_world": self.paired_factor_secondary_offsets_by_world,
-            **walked,
-        }
-
     def _launch(self, launch: SweepLaunch, operands: dict, stream=None) -> None:
         """Launch a sweep with each of its parameters read by name: its own operands first, then the step's."""
         kernel, named = launch.kernel, launch.named()
@@ -1101,22 +1042,6 @@ class Sweep:
     def record(self, plan) -> dict:
         """The sweep's route records, from the step's plan (:class:`.step_plan.StepPlan`)."""
         row, classes, forest = plan.route, self.classes, self.forest
-        primary = self.paired_response_primary_size
-        if primary is None:
-            paired = {"enabled": False, "reason": row.reasons["paired"]}
-        else:
-            factor = classes.paired is not None
-            paired = {
-                "enabled": True,
-                "primary_dofs": int(primary),
-                "secondary_dofs": int(self.paired_response_secondary_size),
-                "factor_coordinates": factor,
-                # Why the paired response keeps its register inverse instead of factor coordinates (None when admitted).
-                "factor_coordinates_reason": row.reasons["paired"],
-                "contact_units": bool(self.factor_coordinate_contact_units),
-                "reason": "One articulation factor and one free body per world share one response"
-                + (" in factor coordinates." if factor else " with a register inverse."),
-            }
         diagonal, packed = classes.diagonal, classes.packed
         # The class plan's choice holds native sparse factors' options and their reasons (class_plan.Packed).
         options, unselected = dict(packed.sweep) if packed else {}, "Native sparse factors are not selected."
@@ -1157,11 +1082,8 @@ class Sweep:
         if count:
             if row.support == "factor":
                 owners.append("sparse_free_rows")
-            if primary is not None:
-                owners.append("paired_factor" if classes.paired is not None else "paired_response")
             owners.append("matrix_free_rows")
         return {
-            "paired_response": paired,
             "sparse_diagonal": {
                 "enabled": row.support == "diagonal",
                 "response_dofs": json_value(row.sizes["diagonal"]),
@@ -1208,7 +1130,7 @@ class Sweep:
                 if placement.writes_records
                 else "Skipped: no sweep streams a row's metadata.",
             },
-            **{name: plan.kernels[name] for name in ("sparse", "sparse_diagonal", "paired_factor", "mf_gs")},
+            **{name: plan.kernels[name] for name in ("sparse", "sparse_diagonal", "mf_gs")},
             "mf_gs_storage": self._record_storage(),
             "mf_colored": self._record_colored(plan),
             "tiers": self._record_tiers(plan.route),
