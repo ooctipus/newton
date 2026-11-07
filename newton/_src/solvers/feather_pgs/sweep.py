@@ -822,7 +822,9 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
         lines += [
             "if (spin_delta != 0.0f) {",
             change_vote(laws, (_spin_change(ctx),), "    "),
-            indent(op.axpy((("spin", "spin_delta"),), "", row="spin").lstrip("\n"), "    "),
+            indent(
+                op.axpy((("spin", "spin_delta"),), "", row=None if op.pair_with_visit else "spin").lstrip("\n"), "    "
+            ),
             "}",
         ]
     row_change = ctx.diagonal.change("delta_impulse", "row_bound", kind, row)
@@ -883,7 +885,16 @@ def _spin_terms(ctx: RowContext) -> str:
     ``spin_cross_sibling`` (``Z_s . Z_p``), in one ladder on the support and entries the pair's kept."""
     sums = (("spin_residual", "spin", None), ("spin_cross", "row", "spin"), ("spin_cross_sibling", "sib", "spin"))
     rows = {"row": ctx.row, "sib": "sib", "spin": "spin"}
-    return ctx.operator.dot(sums, rows, "    ", kept=("row", "sib"), rhs={"spin_residual": ctx.rhs("spin")})
+    reduced = None
+    if ctx.operator.pair_with_visit:
+        reduced = {
+            "spin_residual": "spin_jv",
+            "spin_cross": "spin_coupling",
+            "spin_cross_sibling": "spin_coupling_sibling",
+        }
+    return ctx.operator.dot(
+        sums, rows, "    ", kept=("row", "sib"), rhs={"spin_residual": ctx.rhs("spin")}, reduced=reduced
+    )
 
 
 def friction_pair(ctx: RowContext, laws: RowLaws, *, own: bool = False) -> str:
@@ -1035,17 +1046,30 @@ def friction_radius(
     return f"{pad}if ({kind} == {ROW_FRICTION}) {{\n{radius}\n{pad}}}"
 
 
-def row_sums(op, out: str, pad: str, *, row: str = "i", sibling: str | None = None, paired: str = "false") -> str:
+def row_sums(
+    op, out: str, pad: str, *, row: str = "i", sibling: str | None = None, paired: str = "false", spin: bool = False
+) -> str:
     """``float out = Z_row . u``, the visited row's velocity term (every lane holds it), by the operator's ``dot``.
 
     With ``sibling`` a ``paired`` row (a first tangent) also reduces its pair's terms in the same ladder,
     ``sibling_jv = Z_sibling . u`` and ``pair_coupling = Z_row . Z_sibling``, on the support's one load (rows in
-    memory: :attr:`.ResponseOperator.pair_with_visit`), the sibling's entries kept for the pair's apply.
+    memory: :attr:`.ResponseOperator.pair_with_visit`), the sibling's entries kept for the pair's apply; with ``spin``
+    its contact's spin row's too (``spin_jv``, ``spin_coupling``, ``spin_coupling_sibling``, where ``spin >= 0``), its
+    entries in the one load group and its sums in a ladder of their own, which only a triple runs.
     """
     if sibling is None:
         return op.dot(((out, "row", None),), {"row": row}, pad)
     sums = ((out, "row", None), ("sibling_jv", "sib", None), ("pair_coupling", "row", "sib"))
-    return op.dot(sums, {"row": row, "sib": sibling}, pad, exists={"sib": paired})
+    rows, exists, apart = {"row": row, "sib": sibling}, {"sib": paired}, None
+    if spin:
+        spun = ("spin_jv", "spin_coupling", "spin_coupling_sibling")
+        sums += ((spun[0], "spin", None), (spun[1], "row", "spin"), (spun[2], "sib", "spin"))
+        rows, exists, apart = (
+            {**rows, "spin": "spin"},
+            {**exists, "spin": f"{paired} && spin >= 0"},
+            ("spin >= 0", spun),
+        )
+    return op.dot(sums, rows, pad, exists=exists, apart=apart)
 
 
 def row_visit(
@@ -1093,6 +1117,8 @@ def row_visit(
             friction_radius(kind, *disk, pad, keep_next=keep_next, **spin) if pairs else "",
         ]
     pair = {"sibling": "parent + 2", "paired": f"{kind} == {ROW_FRICTION}"} if pairs and op.pair_with_visit else {}
+    if pair and laws.torsion:
+        pair["spin"] = True
     lines += [row_sums(op, "jv", pad, **pair), row_update(ctx, laws, residual="jv", pad=pad)]
     return "\n".join(line for line in lines if line)
 

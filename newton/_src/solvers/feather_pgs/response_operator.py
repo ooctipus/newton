@@ -602,6 +602,7 @@ class SparseFactor(ResponseOperator):
         reduce: bool = True,
         rhs: dict[str, str] | None = None,
         reduced: dict[str, str] | None = None,
+        apart: tuple[str, tuple[str, ...]] | None = None,
     ) -> str:
         """``float out = Z_row . other`` for each ``(out, row, other)`` of ``sums`` (``other`` ``None`` for the velocity,
         else a row: a Gram entry), over the rows' shared support, reduced in one ladder (every lane holds them).
@@ -615,7 +616,8 @@ class SparseFactor(ResponseOperator):
         it (:meth:`terms`). Without ``reduce`` the sums accumulate this lane's entries into ``out``, declared before,
         in order. A sum of ``rhs`` adds its right-hand side after the ladder (``out += rhs``); a sum of ``reduced`` was
         reduced by an earlier ladder under another name (``out`` -> that name), which it is declared from, after the
-        ladder, its right-hand side added beside it.
+        ladder, its right-hand side added beside it. The sums ``apart`` names reduce in a ladder of their own, under
+        its condition (``(condition, names)``: a row that has the terms, whose loads joined the one load group).
         """
         exists, rhs, reduced = exists or {}, rhs or {}, reduced or {}
         later = []
@@ -670,7 +672,9 @@ class SparseFactor(ResponseOperator):
                 guarded.append(f"{out}_terms += fabsf({product});")
         body += ["if (index >= 0) {", *("    " + line for line in guarded), "}"]
         text = "\n".join(indent + line for line in lines) + "\n" + self.entries_loop("\n".join(body), indent)
-        ladder = self.lanes.reduce(*outs) if reduce else ""
+        ladder = self.lanes.reduce(*(o for o in outs if not apart or o not in apart[1])) if reduce else ""
+        if reduce and apart and self.lanes.parallel:
+            ladder += f"\nif ({apart[0]}) {self.lanes.reduce(*(o for o in outs if o in apart[1]))}"
         return text + "".join(f"\n{indent}{line}" for line in ladder.split("\n") if line) + tail
 
     def axpy(
