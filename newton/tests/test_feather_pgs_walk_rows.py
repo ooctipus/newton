@@ -392,8 +392,9 @@ class TestTierSlipFrame(unittest.TestCase):
         self.assertEqual(int(general.factor.walk_view().release.count.numpy()[0]), 3)
         scale = float(np.linalg.norm(reference))
         for producer in (None, "walk"):
-            # The conformance routes' pins: the tiers on any class whose rows they hold (keyed_parallel, mf_parallel).
-            pins = {"tiers": 32, **({"producer": producer} if producer else {})}
+            # The conformance routes' pins: the tiers on any class whose rows they hold (keyed_parallel, without the
+            # resolved-world claim; mf_parallel).
+            pins = {"tiers": 32, **({"producer": producer} if producer else {"claims": ()})}
             with self.subTest(producer=producer or "keyed"):
                 solver, qd = _hinges_step(pins)
                 self.assertTrue(solver.sweep.tiers)

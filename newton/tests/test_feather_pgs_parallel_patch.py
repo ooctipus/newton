@@ -1554,6 +1554,8 @@ class TestParallelPatchKernel(unittest.TestCase):
 _STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
 # Dense storage (a test-only route pin).
 _DENSE = {"storage": "dense"}
+# Keyed rows: no resolved-world claim, which keyed rows would otherwise decline for (keyed_rows.create_owner).
+_KEYED = {**_DENSE, "claims": ()}
 # Float-order tolerances of an exact route change (assert_states_close of the sparse solver tests).
 _STATE_FLOOR = {"joint_q": 2.0e-4, "body_q": 2.0e-4, "joint_qd": 2.0e-3, "body_qd": 2.0e-3}
 
@@ -1765,7 +1767,10 @@ class TestPatchParallelRoutes(unittest.TestCase):
         with patch.dict(os.environ):
             for law, beta in (("patch", 0.2),):
                 with self.subTest(law=law):
-                    solver = _matrix_free_solver(model, beta=beta, parallel_rows=32, enable_joint_limits=True)
+                    # No resolved-world claim (a pin), whose worlds the keyed prefix would make live: the tiers take keyed rows.
+                    solver = _matrix_free_solver(
+                        model, beta=beta, parallel_rows=32, pins=_KEYED, enable_joint_limits=True
+                    )
                     routes = solver.get_path_selection()["routes"]
                     record = routes["contact_rows"]
                     self.assertTrue(record["keyed_rows"]["enabled"], record["keyed_rows"]["reason"])
@@ -1802,7 +1807,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 os.environ.pop("FEATHER_PGS_PATCH_FRAME_REUSE", None)
                 if reuse is not None:
                     os.environ["FEATHER_PGS_PATCH_FRAME_REUSE"] = reuse
-                solver = _matrix_free_solver(model, beta=0.2, parallel_rows=32, enable_joint_limits=True)
+                solver = _matrix_free_solver(model, beta=0.2, parallel_rows=32, pins=_KEYED, enable_joint_limits=True)
                 self.assertIsNotNone(solver.placement.keyed_rows, solver.get_path_selection()["routes"]["contact_rows"])
                 tiers = solver.get_path_selection()["routes"]["sweep"]["tiers"]
                 self.assertEqual((tiers["family"], tiers["linked_rows"]), ("keyed_parallel", True))
