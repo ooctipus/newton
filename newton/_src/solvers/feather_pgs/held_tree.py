@@ -599,7 +599,6 @@ class HeldTree:
             complete = group.kind == "sparse"
             state = TreeKineticState(
                 operator,
-                chains=complete,
                 complete=complete,
                 response=operator.response,
                 clocked=self.clocked,

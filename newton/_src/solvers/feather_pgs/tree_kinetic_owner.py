@@ -79,7 +79,6 @@ class TreeKineticState:
         self,
         sparse_owner,
         *,
-        chains=True,
         complete=True,
         response="sparse",
         clocked=None,
@@ -137,10 +136,12 @@ class TreeKineticState:
         if np.any(coordinates != coordinates[0]):
             raise ValueError("Tree kinetic state requires one coordinate count per group")
         self.bank_coordinates = int(coordinates[0])
-        # The launch: lanes per tree and the scans' schedules, from the tree's data (forests keep their trees in
-        # lane groups: no chain schedules).
-        self.chains = bool(chains) and not self.layout.forest
+        # The launch: lanes per tree and the scans' schedules, from the tree's data. Forests keep their trees in lane
+        # groups: no chain schedules. A tree past a warp takes its own block and them, whatever its response; within a
+        # warp a tree group keeps the warp scans, whose predictor publishes the predicted twists (anymald's chains
+        # there: the publication's own kernel, 1 to 2% of the span), and the sparse group its measured chains.
         lanes = native.held_lanes(tree, self.group_count, memory.device(device))
+        self.chains = not self.layout.forest and (complete or lanes > 32)
         self.layout = dataclasses.replace(self.layout, lanes=lanes)
         self.schedules = native.held_schedules(tree, lanes, chains=self.chains)
         if self.group_count % self.layout.pack:
