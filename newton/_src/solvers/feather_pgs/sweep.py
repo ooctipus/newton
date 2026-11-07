@@ -1386,6 +1386,92 @@ def contact_unit(
 # The exit: the end of every sweep
 # ---------------------------------------------------------------------------------------------------------------------
 
+_UNIT_GRAM_SUMS = (
+    ("gram_n1", "normal", "tangent"),
+    ("gram_n2", "normal", "sibling"),
+    ("unit_cross", "tangent", "sibling"),
+)
+"""The Gram couplings a contact unit's own reduction gives where no record holds them (:func:`unit_visit`)."""
+
+
+def unit_visit(
+    rows: RowStore,
+    op,
+    laws: RowLaws,
+    ctx: RowContext,
+    *,
+    count: str,
+    active: bool,
+    mu: str,
+    guard: tuple[str, str],
+    record: tuple[str, str] = ("", ""),
+    pad: str,
+) -> str:
+    """A contact unit's visit of row ``i`` in a row loop over ``count`` rows (:func:`contact_unit`), which consumes its
+    pair's first tangent (``consumed_tangent``): a contact normal followed by its two tangents in the store's metadata,
+    with a positive diagonal (with ``active``, the first tangent selected too, :func:`active_scan`), and the placement's
+    own ``guard`` (its loads after the unit's head, and its condition).
+
+    The three rows share their support, so one load group gathers their entries and one reduction gives their
+    velocity terms (``unit_jv0..2``), the rows' staged values held in registers (:data:`UNIT_HELD`); the unit's Gram
+    couplings and pair metric come from a ``record`` (its loads before the friction coefficient ``mu``, and its
+    couplings and metric after the reduction: the native sparse sweep's writer's), or, without one, from the same
+    reduction (``gram_n1``, ``gram_n2``, ``unit_cross``: the pair's law forms its metric from them as the pair's
+    visit does). The rows run the row law in ``ctx`` (its operator :class:`UnitZ`), and their changes apply once.
+    """
+    unit_rows = {"normal": "i", "tangent": "tangent", "sibling": "sibling"}
+    loads, after = record
+    sums = (("unit_jv0", "normal", None), ("unit_jv1", "tangent", None), ("unit_jv2", "sibling", None))
+    if not (loads or after):
+        sums += _UNIT_GRAM_SUMS
+    outs = [out for out, _, _ in sums]
+    gather = op.dot(sums, unit_rows, "        ", keep_velocity=True, reduce=False)
+    changes = (("normal", "unit_dn"), ("tangent", "unit_dt1"), ("sibling", "unit_dt2"))
+    apply = op.axpy(changes, "            ", kept=True, block=True)
+    declare = f"""const int i = head + r;
+const int row_type = r == 0 ? {ROW_CONTACT} : {ROW_FRICTION};"""
+    # The guards admitted the normal (a positive diagonal); the rows read the unit's staged values as it loaded them.
+    rows_text = contact_unit(
+        ctx,
+        dataclasses.replace(laws, torsion=False),
+        rows="3",
+        declare=declare,
+        parent="head",
+        check=None,
+        held=True,
+        pad="        ",
+    )
+    held = "\n".join(unit_held_loads(ctx, name, "head", "        ") for name in UNIT_HELD)
+    units = f"""{loads}        const float mu = {mu};
+        float {", ".join(f"{out} = 0.0f" for out in outs)};
+{gather}
+        // The unit's staged values load with its rows, off the reduction's chain; the rows' law reads them.
+{held}
+        SUM({", ".join(outs)});{after}
+{rows_text}
+        if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f) {{
+{apply}
+        }}"""
+    entry_guard = "select_active && " if active else ""
+    selected = "\n        & (((s_selected_words[(i + 1) / 32] >> ((i + 1) & 31)) & 1u) != 0u)" if active else ""
+    loaded, condition = guard
+    kind, diag = rows.kind, rows.diag
+    update = f"""if (i == consumed_tangent) continue;
+// The staged metadata first, read together: a contact normal with its two tangents.
+if ({entry_guard}i + 2 < {count}
+    && (({kind("i")} == {ROW_CONTACT}) & ({kind("i + 1")} == {ROW_FRICTION}) & ({kind("i + 2")} == {ROW_FRICTION})
+        & (isfinite({diag("i")}) != 0) & ({diag("i")} > 0.0f){selected})) {{
+    const int head = i, tangent = i + 1, sibling = i + 2;{loaded}
+    if ({condition}) {{
+{units}
+        consumed_tangent = tangent;
+        SYNC();
+        continue;
+    }}
+}}"""
+    return indent(update, pad)
+
+
 QUIET = "BALLOT(iteration_changed != 0) == 0u"
 """No lane of the sweep's group voted a loud change."""
 

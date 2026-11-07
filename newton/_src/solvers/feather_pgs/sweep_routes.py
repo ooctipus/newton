@@ -29,7 +29,6 @@ from .sweep import (
     EXACT,
     ITERATION,
     SEQUENTIAL,
-    UNIT_HELD,
     Diagonal,
     Levels,
     RowContext,
@@ -53,7 +52,7 @@ from .sweep import (
     level_loop,
     rows_block,
     speed_rows_pass,
-    unit_held_loads,
+    unit_visit,
     velocity_limit_pass,
 )
 
@@ -513,28 +512,10 @@ const float mf_diag = __int_as_float(meta.y);"""
 
 
 def dense_units(dense: WorldRows, op: SparseFactor, laws: RowLaws, *, active: bool, pad: str) -> str:
-    """The contact unit on the dense rows (:func:`.sweep.contact_unit`): a contact normal ``i`` and its friction pair on
-    their Gram block, one visit of the row loop that consumes the pair's first tangent (``consumed_tangent``).
-
-    The three rows share their sides, so one load group gathers their entries on the normal's support, and one
-    reduction gives their velocity terms with the block's couplings ``Z_n . Z_t1``, ``Z_n . Z_t2`` and ``Z_t1 . Z_t2``
-    (:class:`.sweep.UnitZ`, uncached: the pair's law forms its metric from them as the pair's visit does). The rows run
-    the row law with their staged values held in registers, the normal by its stored diagonal, the pair at the
-    normal's new load (its patch ring walked from it), and their changes apply once. A friction triple (the contact's
-    spin row after the pair, :meth:`.sweep.WorldRows.spin_of`) is declined: the row step solves it. Under the active
-    enumeration the unit runs where the scan selected its first tangent."""
-    unit_rows = {"normal": "i", "tangent": "tangent", "sibling": "sibling"}
-    sums = (
-        ("unit_jv0", "normal", None),
-        ("unit_jv1", "tangent", None),
-        ("unit_jv2", "sibling", None),
-        ("gram_n1", "normal", "tangent"),
-        ("gram_n2", "normal", "sibling"),
-        ("unit_cross", "tangent", "sibling"),
-    )
-    gather = op.dot(sums, unit_rows, "        ", keep_velocity=True, reduce=False)
-    changes = (("normal", "unit_dn"), ("tangent", "unit_dt1"), ("sibling", "unit_dt2"))
-    apply = op.axpy(changes, "            ", kept=True, block=True)
+    """The contact unit on the dense rows (:func:`.sweep.unit_visit`): a contact normal and its friction pair on their
+    Gram block, their couplings from the unit's own reduction, the normal by its stored diagonal, the pair at the
+    normal's new load (its patch ring walked from it). A friction triple (the contact's spin row after the pair,
+    :meth:`.sweep.WorldRows.spin_of`) is declined: the row step solves it."""
     ctx = RowContext(
         row="i",
         kind="row_type",
@@ -550,45 +531,19 @@ def dense_units(dense: WorldRows, op: SparseFactor, laws: RowLaws, *, active: bo
         ring_load=dense.ring_load,
         lanes=dense.lanes,
     )
-    declare = f"""const int i = head + r;
-const int row_type = r == 0 ? {ROW_CONTACT} : {ROW_FRICTION};"""
-    rows_text = contact_unit(
-        ctx,
-        dataclasses.replace(laws, torsion=False),
-        rows="3",
-        declare=declare,
-        parent="head",
-        check=None,
-        held=True,
-        pad="        ",
-    )
-    held = "\n".join(unit_held_loads(ctx, name, "head", "        ") for name in UNIT_HELD)
-    selected = "\n        & (((s_selected_words[(i + 1) / 32] >> ((i + 1) & 31)) & 1u) != 0u)" if active else ""
-    entry_guard = "select_active && " if active else ""
     triple = f" && {dense.spin_of('i', 'm_dense')} < 0" if laws.torsion else ""
-    kind = dense.kind
-    text = f"""if (i == consumed_tangent) continue;
-// A contact normal with its two tangents: the unit's guards from the staged metadata.
-if ({entry_guard}i + 2 < m_dense
-    && (({kind("i")} == {ROW_CONTACT}) & ({kind("i + 1")} == {ROW_FRICTION}) & ({kind("i + 2")} == {ROW_FRICTION})
-        & (isfinite({dense.diag("i")}) != 0) & ({dense.diag("i")} > 0.0f){selected})) {{
-    const int head = i, tangent = i + 1, sibling = i + 2;
-    if ({dense.parent("tangent")} == i && {dense.parent("sibling")} == i{triple}) {{
-        const float mu = {dense.mu("tangent")};
-        float unit_jv0 = 0.0f, unit_jv1 = 0.0f, unit_jv2 = 0.0f, gram_n1 = 0.0f, gram_n2 = 0.0f, unit_cross = 0.0f;
-{gather}
-{held}
-        SUM(unit_jv0, unit_jv1, unit_jv2, gram_n1, gram_n2, unit_cross);
-{rows_text}
-        if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f) {{
-{apply}
-        }}
-        consumed_tangent = tangent;
-        SYNC();
-        continue;
-    }}
-}}"""
-    return indent(text, pad)
+    condition = f"{dense.parent('tangent')} == i && {dense.parent('sibling')} == i{triple}"
+    return unit_visit(
+        dense,
+        op,
+        laws,
+        ctx,
+        count="m_dense",
+        active=active,
+        mu=dense.mu("tangent"),
+        guard=("", condition),
+        pad=pad,
+    )
 
 
 def _colored_diagonal(r: int) -> str:

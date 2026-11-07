@@ -48,7 +48,6 @@ from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport
 from .sweep import (
     ITERATION,
-    UNIT_HELD,
     BallotHeads,
     Diagonal,
     RowContext,
@@ -63,14 +62,13 @@ from .sweep import (
     active_violation,
     active_words,
     cached_pair_law,
-    contact_unit,
     end_sweep,
     friction_triple_visit,
     impulse_seed,
     indent,
     level_loop,
     row_step,
-    unit_held_loads,
+    unit_visit,
     velocity_limit_pass,
 )
 
@@ -358,10 +356,6 @@ for (int normal = lane; normal + 2 < count; normal += {sweep.lanes}) {{
         = make_int4(first, second, third, others);
 }}
 SYNC();"""
-    entry_guard = "select_active && " if sweep.active_rows else ""
-    selected = (
-        "\n        & (((s_selected_words[(i + 1) / 32] >> ((i + 1) & 31)) & 1u) != 0u)" if sweep.active_rows else ""
-    )
     normal_parent = "" if sweep.linked_rows else "\n    const int normal_parent = world_row_parent.data[offset + i];"
     point_guard = "" if sweep.linked_rows else " && normal_parent < 0"
     ring_read = (
@@ -389,91 +383,58 @@ SYNC();"""
         def ring_load(parent: str, load: str) -> str:
             return f"unit_ring_load({load})"
 
-    def body() -> str:
-        """The unit's rows, loads, reduction and apply."""
-        # The unit's three rows share the normal's support: one reduction of their velocity terms, the support, the
-        # velocity there and their entries kept for the apply.
-        unit_rows = {"normal": "i", "tangent": "tangent", "sibling": "sibling"}
-        sums = (("unit_jv0", "normal", None), ("unit_jv1", "tangent", None), ("unit_jv2", "sibling", None))
-        gather = op.dot(sums, unit_rows, "        ", keep_velocity=True, reduce=False)
-        # Per coordinate the unit's changes summed in its rows' order, then added.
-        changes = (("normal", "unit_dn"), ("tangent", "unit_dt1"), ("sibling", "unit_dt2"))
-        apply = op.axpy(changes, "            ", kept=True, block=True)
-        ctx = RowContext(
-            row="i",
-            kind="row_type",
-            # The unit's one reduction gathers the three rows' entries; its Gram couplings and the pair's metric are
-            # the triplet's block record.
-            operator=UnitZ(cached=True, fused_pair_apply=op.fused_pair_apply),
-            diagonal=_UnitDiagonal(rows.diag),
-            load=rows.load,
-            store=rows.store,
-            rhs=rows.rhs_of,
-            mu=lambda row: "mu",
-            weight=rows.weight,
-            eps=rows.eps,
-            parent="parent",
-            ring_load=ring_load,
-            lanes=rows.lanes,
-            pair_law="UNIT_PAIR(0, ",
-        )
-        declare = f"""const int i = head + r;
-const int row_type = r == 0 ? {ROW_CONTACT} : {ROW_FRICTION};"""
-        # The guards admitted the normal (a positive diagonal); the rows read the unit's staged values as it loaded
-        # them.
-        unit_laws = dataclasses.replace(laws, torsion=False)
-        rows_text = contact_unit(
-            ctx,
-            unit_laws,
-            rows="3",
-            declare=declare,
-            parent="head",
-            check=None,
-            held=True,
-            pad="        ",
-        )
-        held = "\n".join(unit_held_loads(ctx, name, "head", "        ") for name in UNIT_HELD)
-        # The record's second half holds the pair's metric: its eigenvalues and the larger's axis.
-        tail = "\n        const float4 basis = *reinterpret_cast<const float4*>(record + 4);"
-        metric = cached_pair_law("UNIT_PAIR", "basis.x", "basis.y", ("basis.z", "basis.w"), "        ")
-        return f"""        const float* record = {_record(width, "i")};
+    ctx = RowContext(
+        row="i",
+        kind="row_type",
+        # The unit's one reduction gathers the three rows' entries; its Gram couplings and the pair's metric are the
+        # triplet's block record.
+        operator=UnitZ(cached=True, fused_pair_apply=op.fused_pair_apply),
+        diagonal=_UnitDiagonal(rows.diag),
+        load=rows.load,
+        store=rows.store,
+        rhs=rows.rhs_of,
+        mu=lambda row: "mu",
+        weight=rows.weight,
+        eps=rows.eps,
+        parent="parent",
+        ring_load=ring_load,
+        lanes=rows.lanes,
+        pair_law="UNIT_PAIR(0, ",
+    )
+    # The record's second half holds the pair's metric: its eigenvalues and the larger's axis.
+    tail = "\n        const float4 basis = *reinterpret_cast<const float4*>(record + 4);"
+    metric = cached_pair_law("UNIT_PAIR", "basis.x", "basis.y", ("basis.z", "basis.w"), "        ")
+    loads = f"""        const float* record = {_record(width, "i")};
         const float4 coupling = *reinterpret_cast<const float4*>(record);{tail}{ring_read}
-        const float mu = world_row_mu.data[offset + tangent];
-        float unit_jv0 = 0.0f, unit_jv1 = 0.0f, unit_jv2 = 0.0f;
-{gather}
-        // The unit's staged values load with its rows, off the reduction's chain; the rows' law reads them.
-{held}
-        SUM(unit_jv0, unit_jv1, unit_jv2);
+"""
+    after = f"""
         // W_nt moves the tangent residuals by the normal change; the record's 1/W_nn steps the normal.
         const float gram_n1 = coupling.x, gram_n2 = coupling.y, unit_inverse = coupling.w;
-{metric}{ring}
-{rows_text}
-        if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f) {{
-{apply}
-        }}"""
-
-    units = body()
-    update = f"""if (i == consumed_tangent) continue;
-// The staged metadata first, read together: a contact normal with its two tangents.
-if ({entry_guard}i + 2 < count
-    && ((s_type[i] == {ROW_CONTACT}) & (s_type[i + 1] == {ROW_FRICTION}) & (s_type[i + 2] == {ROW_FRICTION})
-        & (isfinite(s_diag[i]) != 0) & (s_diag[i] > 0.0f){selected})) {{
-    const int head = i, tangent = i + 1, sibling = i + 2;
+{metric}{ring}"""
+    guard = (
+        f"""
     // The guards load together; the rows, the record and the coordinates then load together.
     const int row_class = support.row_class.data[offset + i];
     const int tangent_class = support.row_class.data[offset + tangent];
     const int sibling_class = support.row_class.data[offset + sibling];
     const int tangent_parent = world_row_parent.data[offset + tangent];
-    const int sibling_parent = world_row_parent.data[offset + sibling];{normal_parent}
-    if (tangent_parent == i && sibling_parent == i && tangent_class == sibling_class
-        && row_class == tangent_class{point_guard}) {{
-{units}
-        consumed_tangent = tangent;
-        SYNC();
-        continue;
-    }}
-}}"""
-    return indent(setup, "    ") if setup else "", indent(update, pad)
+    const int sibling_parent = world_row_parent.data[offset + sibling];{normal_parent}""",
+        f"""tangent_parent == i && sibling_parent == i && tangent_class == sibling_class
+        && row_class == tangent_class{point_guard}""",
+    )
+    update = unit_visit(
+        rows,
+        op,
+        laws,
+        ctx,
+        count="count",
+        active=sweep.active_rows,
+        mu="world_row_mu.data[offset + tangent]",
+        guard=guard,
+        record=(loads, after),
+        pad=pad,
+    )
+    return indent(setup, "    ") if setup else "", update
 
 
 # ---------------------------------------------------------------------------------------------------------------------
