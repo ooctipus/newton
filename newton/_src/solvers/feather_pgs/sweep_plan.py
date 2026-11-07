@@ -503,11 +503,14 @@ class Sweep:
                     force_stream_mf_impulses=force_stream_mf_impulses,
                 )
             self.mf_gs_storage = storage
-            # The streamed rows' records: the dense rows' too where their metadata streams.
-            self.placement.allocate_row_records(
-                sweep_routes.record_first(self.placement.dense_max_constraints, storage.places)
-            )
             parallel_rows = self.classes.tier_rows
+            # The streamed rows' records: the dense rows' too where their metadata streams, in the worlds the sweep
+            # visits (not the tiers').
+            self.placement.allocate_row_records(
+                sweep_routes.record_first(self.placement.dense_max_constraints, storage.places),
+                skip_rows=parallel_rows,
+                speed_rows=speed_rows,
+            )
             # The general sweep's warp mapping: its places the storage's, its rows the placement's.
             self.general_sweep = sweep_routes.GeneralSweep(
                 self.placement.dense_max_constraints,

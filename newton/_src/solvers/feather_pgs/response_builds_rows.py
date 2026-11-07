@@ -61,7 +61,17 @@ def _pack_rows(count: str, first: str, base: int, inverse: bool, pad: str) -> st
 
 
 @cache
-def row_record_kernel(pitch: int, first: int, base: int, mf_rows: int, lanes: int, device_arch: str) -> wp.Kernel:
+def row_record_kernel(
+    pitch: int,
+    first: int,
+    base: int,
+    mf_rows: int,
+    lanes: int,
+    device_arch: str,
+    *,
+    skip_rows: int = 0,
+    speed_rows: bool = False,
+) -> wp.Kernel:
     """Pack each world's streamed rows into their records, which the sweeps' row loops load a row ahead
     (:func:`.row_metadata.pack_row_record`): the line's rows from ``first`` (``pitch`` rows a line), the dense rows'
     from 0 where a sweep streams them (``first`` 0), then the free bodies' from ``base``.
@@ -72,23 +82,38 @@ def row_record_kernel(pitch: int, first: int, base: int, mf_rows: int, lanes: in
     their step's form of the law; the dense rows' ``A_ii``), its right-hand side (the law's plus the row's incident
     velocity: its residual at ``du = 0``), kind, parent (counted from its class's first row, as the sweeps stage the
     class's rows) and friction coefficient. ``mf_rows`` and ``device_arch`` key the variant.
+
+    Only the worlds the matrix-free sweep visits are packed: it returns for a world the tiers own (no free body's
+    row, at most ``skip_rows`` rows of the line and, with the line's ``speed_rows``, none from ``speed_first``:
+    :func:`.sweep_routes.mf_gs_source`'s skip), whose records no loop reads.
     """
     _validate_mf_metadata_encoding(max(int(mf_rows), int(base) if first < base else 0))
     dense = _pack_rows(f"(m_dense < {base} ? m_dense : {base})", first, 0, False, "    ") if first < base else ""
     free = _pack_rows("mf_constraint_count.data[world]", first, base, True, "    ") if mf_rows else ""
+    skip = ""
+    if skip_rows > 0:
+        # The matrix-free sweep's skip of the tiers' worlds, on the row counts it clamps.
+        speed = " && m_dense <= speed_first.data[world]" if speed_rows else ""
+        skip = (
+            f"    if (mf_constraint_count.data[world] == 0 && (m_dense < {base} ? m_dense : {base}) <= {int(skip_rows)}"
+            f"{speed}) return;\n"
+        )
     body = f"""    const int line = dense_first.data[world];
     __builtin_assume(line >= 0);
     const int off_line = line * {pitch};
     const int off_rec = line * {(pitch - first) * RECORD_WORDS};
     const int m_dense = world_constraint_count.data[world];
-{dense}
+{skip}{dense}
 {free}
 """
     return KernelTemplate(
-        f"row_record_{pitch}_{first}_{base}_{mf_rows}_{lanes}",
+        f"row_record_{pitch}_{first}_{base}_{mf_rows}_{lanes}"
+        + (f"_skip{int(skip_rows)}" if skip_rows > 0 else "")
+        + ("_speed" if skip_rows > 0 and speed_rows else ""),
         kernel_template.params(
             ("world_constraint_count", wp.array[int]),
             ("mf_constraint_count", wp.array[int]),
+            ("speed_first", wp.array[int]),
             ("dense_first", wp.array[int]),
             ("world_dof_offset", wp.array[int]),
             ("response_dofs", wp.array[int]),

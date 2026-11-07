@@ -688,11 +688,12 @@ class Placement:
         else:
             self.arrays.release(ROW_WATERMARKS)
 
-    def allocate_row_records(self, first: int) -> None:
+    def allocate_row_records(self, first: int, *, skip_rows: int = 0, speed_rows: bool = False) -> None:
         """Allocate the streamed rows' records (:data:`.row_records.ROW_RECORDS`) from the line's row ``first``, which
         the sweep's plan decides (``Sweep.build``: the dense rows' first where the sweep streams their metadata, else
         the free bodies'), and the step's pack of them (:func:`.response_builds_rows.row_record_kernel`): a world's
-        lanes a warp, or a block when few worlds would idle the device."""
+        lanes a warp, or a block when few worlds would idle the device; the worlds the tiers own (``skip_rows``, with
+        the line's ``speed_rows``: the sweep's skip) keep no packed record."""
         self.record_first = int(first)
         rows = self.row_pitch - self.record_first
         free_rows = self.mf_max_constraints if self.free_contact_rows else 0
@@ -706,6 +707,8 @@ class Placement:
                 free_rows,
                 self.record_lanes,
                 self.model.device.arch,
+                skip_rows=skip_rows,
+                speed_rows=speed_rows,
             )
         self.arrays.allocate(ROW_RECORDS, world=self.forest.world_count, record=RECORD_WORDS * max(rows, 1))
 
@@ -1041,6 +1044,7 @@ class Placement:
             inputs=[
                 self.constraint_count,
                 self.mf_constraint_count,
+                self.speed_first,
                 self.dense_first,
                 self.forest.articulation_world_dof_offset,
                 self.forest.articulation_response_dof_count,
