@@ -1977,12 +1977,11 @@ def held_lambdas(layout: TreeLayout, slips: int, half: int = ts.WALK_BOTH) -> st
 
 
 def _transport_block(layout: TreeLayout) -> str:
-    """Native statements of the free roots' transport of the predicted velocity."""
+    """Native statements of the free roots' transport of the predicted velocity (a single tree's root compiled)."""
+    local, dof = ("plan.free_root_local.data[lane]", "plan.free_root_dof.data[lane]") if layout.forest else ("0", "0")
     return (
-        "if(lane<$FREE_ROOTS&&f.kinematic_joint.data[js+plan.free_root_local.data[lane]]==0) {\n"
-        "        const int rd=ds+plan.free_root_dof.data[lane];\n        "
-        + _FORCE.transport("rd", "f.vhat.data[rd+k]")
-        + "\n    }"
+        f"if(lane<$FREE_ROOTS&&f.kinematic_joint.data[js+{local}]==0) {{\n"
+        f"        const int rd=ds+{dof};\n        " + _FORCE.transport("rd", "f.vhat.data[rd+k]") + "\n    }"
     )
 
 
