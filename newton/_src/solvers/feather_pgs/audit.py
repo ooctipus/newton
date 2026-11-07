@@ -57,6 +57,7 @@ from .row_laws import (
 from .row_records import DenseRows
 from .row_records import bind as bind_dense_rows
 from .sparse_mass_matrix import _SparseRowSupport
+from .sweep_levels import tier_world
 from .sweep_routes import free_body_rows, packed_operator
 from .sweep_routes_diag import slot_rows
 
@@ -85,7 +86,7 @@ AuditRows = struct(
         Field("counts", int, ("line",), owner="placement", attr="constraint_count"),
         Field("mf_counts", int, ("line",), owner="placement", attr="mf_constraint_count"),
         Field("speed_first", int, ("line",), owner="placement"),
-        Field("skip_rows_le", int, owner="classes", attr="tier_rows"),
+        Field("tier_rows", int, owner="classes"),
         Field("keyed", int, owner="step"),
         Field("weighted", int, owner="step"),
         Field("material", int, owner="options", attr="contact_compliance"),
@@ -94,7 +95,7 @@ AuditRows = struct(
     __name__,
 )
 """What the law reads: the row store's records and impulses, the dense and free-body counts, whether the tiers form
-the rows of their worlds in their kernel (:func:`.packed_rows._skipped`) and keyed rows hold them, and the laws in
+the rows of their worlds in their kernel (:func:`.sweep_levels.tier_world`) and keyed rows hold them, and the laws in
 play."""
 
 
@@ -105,13 +106,6 @@ def contact_compliance(weight: float, eps: float, diagonal: float) -> float:
     if eps > 0.0:
         return eps
     return (1.0 / weight - 1.0) * diagonal
-
-
-@wp.func
-def tier_world(a: AuditRows, world: int) -> bool:
-    """Whether the parallel tiers form ``world``'s rows in their kernel (:func:`.sweep_levels.list_worlds`)."""
-    count = a.counts[world]
-    return a.skip_rows_le > 0 and count <= a.skip_rows_le and a.mf_counts[world] == 0 and count <= a.speed_first[world]
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -453,7 +447,8 @@ def audit_world(
     """One thread per world: the row laws of both stores over the rows' velocity terms, into :data:`AUDIT_SLOTS`; the
     free bodies' rows from ``base`` of the world's line."""
     world = wp.tid()
-    if tier_world(a, world) and a.keyed != 0:
+    # A keyed tier's world: its rows live only inside its sweep.
+    if a.keyed != 0 and tier_world(a.counts[world], a.mf_counts[world], a.speed_first, world, a.tier_rows):
         readout[world, 0] = wp.nan
         readout[world, 1] = wp.nan
         readout[world, 2] = wp.nan

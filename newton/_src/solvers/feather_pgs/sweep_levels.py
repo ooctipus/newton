@@ -139,6 +139,15 @@ def level_offsets(*, levels: str, counts: str, lanes: int = 32, sync: str = "__s
     }}"""
 
 
+@wp.func
+def tier_world(rows: int, free_body_rows: int, speed_first: wp.array[int], world: int, bound: int) -> bool:
+    """Whether a world of ``rows`` dense rows is a Jacobi tier's (the tiers form its rows' response in their kernel):
+    its rows are dense only, no free body's (``free_body_rows``, the free bodies' run, or a speed row of the line,
+    from ``speed_first``), and at most the tiers' ``bound``. The claims (:func:`claim_worlds`) and the audit read this
+    one predicate."""
+    return free_body_rows == 0 and rows <= bound and rows <= speed_first[world]
+
+
 @wp.kernel
 def claim_worlds(
     rows: wp.array[int],
@@ -173,7 +182,7 @@ def claim_worlds(
     if m <= 0 and mf <= 0:
         return
     bucket = general
-    if mf == 0 and m <= bound and m <= speed_first[world]:
+    if tier_world(m, mf, speed_first, world, bound):
         bucket = (m - 1) // width
     elif candidate >= 0:
         if slot[world] >= 0:

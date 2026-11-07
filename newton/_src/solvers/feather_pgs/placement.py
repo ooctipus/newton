@@ -1044,10 +1044,6 @@ class Placement:
         support.units = self.unit_source if self.walks else self.dummy_units
         return support
 
-    def ink_skip_rows(self) -> int:
-        """The dense rows of the worlds the tiers own, whose response they form in-kernel (0 without tiers)."""
-        return self.classes.tier_rows
-
     def inkernel_response_inputs(self) -> dict:
         """The parallel tiers' operands beside the walk: the worlds' trees (``ink_meta``) and the rows' law's cfm."""
         return {"ink_meta": self.ink_meta, "cfm": self.options.pgs_cfm}
