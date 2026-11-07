@@ -35,6 +35,7 @@ import unittest
 import warp as wp
 
 from newton._src.solvers.feather_pgs import environment_flags
+from newton._src.solvers.feather_pgs.sweep import EXACT, LevelLaw
 from newton.tests.feather_pgs_law_harness import built, keyed_classes
 
 _PINS = os.path.join(os.path.dirname(__file__), "golden_data", "test_feather_pgs_kernel_pins", "pins.json")
@@ -57,7 +58,7 @@ def _linked_tier_calls():
     for rows, last_word in itertools.product((32, 48), (False, True)):
         kwargs = {
             "rows": rows,
-            "sweeps": 24,
+            "levels": LevelLaw.split(24),
             "inkernel_response": (18, 0, 0, 0),
             "linked_rows": True,
         }
@@ -82,7 +83,7 @@ def _keyed_layout(*, velocity_limits=False):
 def _keyed_tier_kwargs(*, linked):
     """Keyed parallel tiers; ``linked`` selects the patch row law and the ring-pooled projection."""
     for rows in (32, 64, 96, 128):
-        kwargs = {"rows": rows, "sweeps": 24, "inkernel_response": (16, 6, 0, 16)}
+        kwargs = {"rows": rows, "levels": LevelLaw.split(24), "inkernel_response": (16, 6, 0, 16)}
         if linked:
             kwargs["linked_rows"] = True
         yield kwargs
@@ -125,7 +126,7 @@ def _suite_sparse_sweeps():
 def _suite_diagonal_sweeps():
     """Sparse-diagonal sweeps at the suite's shapes: ``(args, kwargs)``, over contact units."""
     for shape in ((1024, 114, 6, _ARCH), (256, 13, 9, _ARCH)):
-        yield shape, {"speculative_contact_batches": True, "contact_units": True}
+        yield shape, {"speculative_contact_batches": True, "levels": LevelLaw(EXACT)}
 
 
 def _keyed_last_word_calls():
@@ -174,7 +175,7 @@ def _readout_calls():
         yield "sweep_routes_sparse.SparseSweep", factory, size, {**triplets, **readout}
         yield "sweep_routes_sparse.SparseSweep", factory, size, {**triplets, "linked_rows": True, **readout}
     factory = built(sweep_routes_diag.DiagonalSweep)
-    kwargs = {"contact_units": True, "speculative_contact_batches": True, **readout}
+    kwargs = {"levels": LevelLaw(EXACT), "speculative_contact_batches": True, **readout}
     yield "sweep_routes_diag.DiagonalSweep", factory, (1024, 114, 6, _ARCH), kwargs
     factory = built(sweep_routes.GeneralSweep)
     for args, kwargs in (
@@ -311,7 +312,7 @@ def _solver_factory_calls():
         yield name + "_get_mark_independent_sparse_contact_candidates_kernel", factory, (dofs, _ARCH), {}
     # The unit schedules of the sparse diagonal.
     for batches in (False, True):
-        kwargs = {"contact_units": True, "speculative_contact_batches": batches}
+        kwargs = {"levels": LevelLaw(EXACT), "speculative_contact_batches": batches}
         factory = built(sweep_routes_diag.DiagonalSweep)
         yield "sweep_routes_diag.DiagonalSweep", factory, (64, 10, 9, _ARCH), kwargs
         # The velocity-limit rows' last word.
@@ -351,7 +352,7 @@ def _solver_factory_calls():
 
     # Parallel tiers: one articulation per world, its response formed in-kernel.
     for rows in (32, 48):
-        kwargs = {"rows": rows, "sweeps": 24, "inkernel_response": (18, 0, 0, 0)}
+        kwargs = {"rows": rows, "levels": LevelLaw.split(24), "inkernel_response": (18, 0, 0, 0)}
         yield "sweep_routes_tiers.TierSweep", built(sweep_routes_tiers.TierSweep), (64, 32, 18, _ARCH), kwargs
     for label, args, kwargs in _linked_tier_calls():
         yield label, built(sweep_routes_tiers.TierSweep), args, kwargs
@@ -406,7 +407,7 @@ def _suite_shape_calls():
     ):
         blocks = (layout.primary, layout.secondary, layout.primary_offset, layout.secondary_offset)
         for rows in tiers:
-            kwargs = {"rows": rows, "sweeps": 24, "inkernel_response": blocks}
+            kwargs = {"rows": rows, "levels": LevelLaw.split(24), "inkernel_response": blocks}
             yield "sweep_routes_tiers.TierSweep[keyed]", parallel, (layout, *shape), kwargs
     yield "keyed_row_layout.prefix_kernel", limit_prefix, (limited,), {}
 

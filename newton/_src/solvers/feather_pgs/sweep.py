@@ -1558,6 +1558,66 @@ class UnitStride:
         return f"{pad}for (int i = 0, step = 1; i < {self.end}; i += step) {{\n{visit}\n{pad}}}"
 
 
+@dataclasses.dataclass(frozen=True)
+class Levels:
+    """A phase's units by level (the exact law, :class:`LevelLaw`): a level at a time, its units at once, a thread a
+    unit (``place``), synchronized after each level. ``count`` is the world's levels, ``offsets(level)`` a level's first
+    place (level ``count``'s: the end), ``unit`` what a visit declares of its unit. A warp strides by ``stride``; with
+    ``chunk`` a block's warps share each level's offsets, staged ``chunk`` levels at a time (:meth:`buffers`)."""
+
+    count: str
+    offsets: Callable[[str], str]
+    unit: str = ""
+    stride: int = 32
+    chunk: int = 0
+
+    def buffers(self) -> tuple[Buffer, ...]:
+        return (Buffer("s_level_offset", "int", self.chunk + 1),) if self.chunk else ()
+
+    def wrap(self, visit: str, pad: str) -> str:
+        first, end = self.offsets("level"), self.offsets("level + 1")
+        stage, thread, stride, sync = "", "lane", self.stride, "SYNC();"
+        if self.chunk:
+            first, end, thread, stride = "s_level_offset[chunk]", "s_level_offset[chunk + 1]", "tid", "blockDim.x"
+            sync = "__syncthreads();"
+            stage = f"""    // The offsets of the next chunk of levels (the barrier after the last level freed the previous one).
+    const int chunk = level % {self.chunk};
+    if (chunk == 0) {{
+        for (int c = tid; c <= {self.chunk} && level + c <= levels; c += blockDim.x)
+            s_level_offset[c] = {self.offsets("level + c")};
+        __syncthreads();
+    }}
+"""
+        unit = "\n" + indent(self.unit, "        ") if self.unit else ""
+        text = f"""const int levels = {self.count};
+for (int level = 0; level < levels; ++level) {{
+{stage}    const int level_end = {end};
+    for (int place = {first} + {thread}; place < level_end; place += {stride}) {{{unit}"""
+        return indent(text, pad) + f"\n{visit}\n{pad}    }}\n{pad}    {sync}\n{pad}}}"
+
+
+SEQUENTIAL, EXACT, SPLIT = "sequential", "exact", "split"
+
+
+@dataclasses.dataclass(frozen=True)
+class LevelLaw:
+    """How a sweep steps a level's rows (rows on disjoint supports commute): ``SEQUENTIAL`` in order; ``EXACT`` at
+    once, its units sharing no coordinate, each by its row law (:class:`Levels`: the colored units, K2's scalar
+    contacts); ``SPLIT`` at once where they all couple (a hub), each scaled by its share of the coupling (Gershgorin,
+    :func:`jacobi_scale`), with momentum and restart, at most ``budget`` sweeps (:func:`jacobi_sweeps`: the tiers)."""
+
+    law: str = SEQUENTIAL
+    budget: int = 0
+
+    def __post_init__(self):
+        if self.law not in (SEQUENTIAL, EXACT, SPLIT) or int(self.budget) < 0 or (self.budget and self.law != SPLIT):
+            raise ValueError(f"a level law is {SEQUENTIAL}, {EXACT} or {SPLIT} (budgeted), got {self!r}")
+
+    @classmethod
+    def split(cls, budget: int) -> LevelLaw:
+        return cls(SPLIT, int(budget))
+
+
 ITERATION = "iter"
 """The sweep counter of :func:`level_loop`, as the exit law reads it (:func:`end_sweep`'s ``iteration``)."""
 
@@ -2815,12 +2875,14 @@ class SweepConfig:
         weighted: Contact rows step by their regularization weights.
         material: Material contacts step by their compliance's weights (they are weighted).
         torsion: Spin rows may follow friction pairs.
+        levels: The law of the configuration's leveled rows (:class:`LevelLaw`).
     """
 
     solve_policy: SolvePolicy = DEFAULT_POLICY
     weighted: bool = False
     material: bool = False
     torsion: bool = False
+    levels: LevelLaw = LevelLaw()
 
     ABI: ClassVar[tuple]
     """The native ABI (:func:`.kernel_template.params`)."""

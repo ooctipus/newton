@@ -29,8 +29,11 @@ from .response_operator import Lanes, ResponseOperator, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT
 from .sweep import (
+    EXACT,
     ITERATION,
+    SEQUENTIAL,
     Diagonal,
+    Levels,
     RowContext,
     RowLaws,
     SlotOrder,
@@ -251,30 +254,6 @@ that holds it (the other is marked); its dense part is empty."""
 
 
 @dataclasses.dataclass(frozen=True)
-class Levels:
-    """The independent scalar contacts by level (:func:`.sweep_levels._sparse_contact_levels_kernel`), a level at a
-    time and a lane a contact of it (``head``), each level's contacts in row order: a level holds at most one contact a
-    coordinate, and a coordinate's contacts lie in successive levels in row order, so the lanes synchronize after each
-    level. A contact's coordinate (``scalar_coord``) is its unmarked slot's."""
-
-    capacity: int
-    lanes: int = 32
-
-    def wrap(self, visit: str, pad: str) -> str:
-        offsets = f"sparse_contact_level_offsets.data[world * {self.capacity + 1} + scalar_level"
-        text = f"""const int scalar_levels = sparse_contact_level_count.data[world];
-for (int scalar_level = 0; scalar_level < scalar_levels; ++scalar_level) {{
-    const int level_end = {offsets} + 1];
-    for (int place = {offsets}] + lane; place < level_end; place += {self.lanes}) {{
-        const int head = sparse_contact_level_units.data[world * {self.capacity} + place];
-        const int normal_coord_0 = sparse_row_dof.data[(row_base + head) * 2];
-        const int normal_coord_1 = sparse_row_dof.data[(row_base + head) * 2 + 1];
-        const int scalar_coord = normal_coord_0 >= 0 ? normal_coord_0 : normal_coord_1;
-"""
-        return indent(text, pad) + f"{visit}\n{pad}    }}\n{pad}    SYNC();\n{pad}}}"
-
-
-@dataclasses.dataclass(frozen=True)
 class SpeculativeUnits:
     """The serial contact units in their schedule's order (``sparse_contact_serial_normals``), each entered at its head
     and walked row by row, ``i`` at a time: a batch of ``contacts`` units is tested together (``test``, a lane segment a
@@ -330,7 +309,7 @@ def sparse_diagonal_source(sweep: DiagonalSweep) -> tuple[str, Staging]:
     the coupled rows, and its one-product residual rounds as the warp's sum of it does), then the coupled rows in row order with
     :func:`slot_rows`' warp layout, all on the velocity change in factor coordinates, from zero, or with ``seeded``
     from the response of the impulses the rows carry (:func:`.sweep.impulse_seed`: the warm start's; the fused limits
-    start from zero), left once before it is added to the predictor. ``contact_units`` schedules the contacts (a normal, and its
+    start from zero), left once before it is added to the predictor. The exact level law (``levels``) schedules the contacts (a normal, and its
     tangent pair only when it owns an anchor): it skips an independent contact in the serial order and a pair whose patch carries no load. Every schedule, the plain
     one at a normal row that owns the tangent pair after it, solves a loaded coupled contact unit by the unit law
     (:func:`.sweep.contact_unit`) and visits an unloaded one, and a level's contacts, row by row: a level runs one lane
@@ -354,7 +333,7 @@ def sparse_diagonal_source(sweep: DiagonalSweep) -> tuple[str, Staging]:
     batch_lanes = min(8 if P + 2 <= 8 else 16, L)
     batch_shift = batch_lanes.bit_length() - 1
     batch_contacts = L // batch_lanes
-    scheduled = sweep.contact_units
+    scheduled = sweep.levels.law == EXACT
 
     warp = Lanes(L)
     laws = sweep.laws
@@ -482,7 +461,18 @@ def sparse_diagonal_source(sweep: DiagonalSweep) -> tuple[str, Staging]:
 {visit(pad + "    ", scalar=True, kind=ROW_CONTACT)}
                 }} while (false);
 {tangents}"""
-        independent_phase = "\n" + Levels(M, L).wrap(normal, "        ") + "\n"
+        # A level holds at most one contact a coordinate, and a coordinate's contacts lie in successive levels in row
+        # order; a contact's coordinate (scalar_coord) is its unmarked slot's.
+        levels = Levels(
+            "sparse_contact_level_count.data[world]",
+            lambda level: f"sparse_contact_level_offsets.data[world * {M + 1} + {level}]",
+            f"""const int head = sparse_contact_level_units.data[world * {M} + place];
+const int normal_coord_0 = sparse_row_dof.data[(row_base + head) * 2];
+const int normal_coord_1 = sparse_row_dof.data[(row_base + head) * 2 + 1];
+const int scalar_coord = normal_coord_0 >= 0 ? normal_coord_0 : normal_coord_1;""",
+            stride=L,
+        )
+        independent_phase = "\n" + levels.wrap(normal, "        ") + "\n"
 
     def batch(index: str, count: str) -> str:
         """Test the batch of serial contacts from ``index``: one contact per segment of ``batch_lanes`` lanes, its
@@ -648,8 +638,8 @@ class DiagonalSweep(SweepConfig):
 
     - the support classes: the arm's rows on its dense group and two one-coordinate slots, a key's rows one entry
       (the class plan's diagonal rule);
-    - the levels: with ``contact_units`` the independent scalar contacts a level at a time, a lane a contact, and a
-      coupled contact's rows on their Gram block (the diagonal choice's ``units``); with
+    - the levels: under the exact law (``levels``, :class:`.sweep.LevelLaw`) the independent scalar contacts a level
+      at a time, a lane a contact (the diagonal choice's ``units``); with
       ``speculative_contact_batches`` its serial contacts tested a batch at a time (at most 16 response entries);
     - the fused limits: each diagonal coordinate's joint limits, a lane a coordinate, exact;
     - ``seeded``: the first sweep starts from the response of the impulses the rows carry;
@@ -665,7 +655,6 @@ class DiagonalSweep(SweepConfig):
     device_arch: str
     _: dataclasses.KW_ONLY
     speculative_contact_batches: bool = False
-    contact_units: bool = False
     seeded: bool = False
     velocity_limits: bool = False
 
@@ -674,8 +663,10 @@ class DiagonalSweep(SweepConfig):
     LABEL: ClassVar[str] = "the sparse-diagonal sweep"
 
     def __post_init__(self):
-        if self.speculative_contact_batches and (not self.contact_units or int(self.dense_dofs) + 2 > 16):
-            raise ValueError("speculative contact batches require contact units with at most 16 response entries")
+        if self.levels.law not in (SEQUENTIAL, EXACT):
+            raise ValueError("the sparse diagonal's contacts step in order or by exact levels")
+        if self.speculative_contact_batches and (self.levels.law != EXACT or int(self.dense_dofs) + 2 > 16):
+            raise ValueError("speculative contact batches require exact levels with at most 16 response entries")
 
     @property
     def lanes(self) -> int:
@@ -688,7 +679,7 @@ class DiagonalSweep(SweepConfig):
         return (
             f"sweep_sparse_diagonal_{int(self.max_constraints)}_{int(self.max_world_dofs)}_{int(self.dense_dofs)}"
             + ("_speculative_batches" if self.speculative_contact_batches else "")
-            + ("_units" if self.contact_units else "")
+            + ("_units" if self.levels.law == EXACT else "")
             + ("_weighted" if self.weighted else "")
             + ("_material" if self.material else "")
             + ("_torsion" if self.torsion else "")

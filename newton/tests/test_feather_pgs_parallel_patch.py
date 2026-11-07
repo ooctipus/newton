@@ -47,7 +47,7 @@ from newton._src.solvers.feather_pgs.row_laws import (
 )
 from newton._src.solvers.feather_pgs.row_records import DenseRows
 from newton._src.solvers.feather_pgs.rows import RowLaws, velocity_prescale_launch
-from newton._src.solvers.feather_pgs.sweep import sweep_kernel
+from newton._src.solvers.feather_pgs.sweep import LevelLaw, sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep, SweepLaunch
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import (
@@ -612,7 +612,7 @@ class TestParallelPatchReference(unittest.TestCase):
     def test_linked_factory_pools_only_the_friction_disk(self):
         """Build linked tiers as the point tiers with the golden ring walk; both take the isotropic pair step."""
         for rows, inkernel in itertools.product((32, 64), ((6, 0, 0, 0), (_DOFS, 0, 0, 0))):
-            options = {"rows": rows, "sweeps": 24, "inkernel_response": inkernel}
+            options = {"rows": rows, "levels": LevelLaw.split(24), "inkernel_response": inkernel}
             with self.subTest(**options):
                 point = sweep_routes_tiers.TierSweep(_CAPACITY, 32, _DOFS, "120", **options)
                 linked = sweep_routes_tiers.TierSweep(_CAPACITY, 32, _DOFS, "120", linked_rows=True, **options)
@@ -719,7 +719,7 @@ class TestParallelPatchReference(unittest.TestCase):
         ):
             for linked in (False, True):
                 with self.subTest(shape=shape, linked=linked, **extra):
-                    tier = factory(*shape, rows=32, sweeps=24, linked_rows=linked, **extra)
+                    tier = factory(*shape, rows=32, levels=LevelLaw.split(24), linked_rows=linked, **extra)
                     self.assertEqual(sweep_kernel(tier).key.endswith("_linked"), linked, tier.name)
                     self.assertEqual(_source(tier).count(_tier_texts(32)[2]), 1)
         self.assertNotIn("pair_step", inspect.signature(sweep_routes_tiers.TierSweep).parameters)
@@ -774,7 +774,7 @@ class TestParallelPatchReference(unittest.TestCase):
         }
         for name, ((factory, args), options) in variants.items():
             with self.subTest(variant=name):
-                settings = {"rows": 32, "sweeps": 24, "linked_rows": True, **options}
+                settings = {"rows": 32, "levels": LevelLaw.split(24), "linked_rows": True, **options}
                 plain = factory(*args, **settings)
                 last_word = factory(*args, velocity_limit_pass=True, **settings)
                 self.assertEqual(sweep_kernel(last_word).key, sweep_kernel(plain).key + "_lw")
@@ -1063,7 +1063,12 @@ class TestKeyedPatchRows(unittest.TestCase):
     def test_keyed_factory_reads_linked_parents(self):
         """Read every row's parent and coefficient in the keyed patch tiers instead of building them."""
         layout = KeyedLayout(16, 6, 0, 16, 128, False, 0)
-        options = {"rows": 32, "sweeps": 24, "inkernel_response": (16, 6, 0, 16), "classes": keyed_classes(layout)}
+        options = {
+            "rows": 32,
+            "levels": LevelLaw.split(24),
+            "inkernel_response": (16, 6, 0, 16),
+            "classes": keyed_classes(layout),
+        }
         linked = sweep_routes_tiers.TierSweep(128, 32, 22, "120", keyed=layout, linked_rows=True, **options)
         kernel = sweep_kernel(linked)
         self.assertTrue(kernel.key.startswith("sweep_keyed_parallel_"))
@@ -1108,7 +1113,9 @@ class TestPatchParallelAdmission(unittest.TestCase):
         for linked in (False, True):
             options = {"inkernel_response": (_DOFS, 0, 0, 0), "linked_rows": linked}
             configs = [
-                sweep_routes_tiers.TierSweep(_CAPACITY, 32, _DOFS, "120", rows=rows, sweeps=sweeps, **options)
+                sweep_routes_tiers.TierSweep(
+                    _CAPACITY, 32, _DOFS, "120", rows=rows, levels=LevelLaw.split(sweeps), **options
+                )
                 for rows, sweeps in ((32, 24), (64, 34))
             ]
             kernels = [SweepLaunch(config, sweep_kernel(config), 0, config.threads, dict) for config in configs]
@@ -1471,7 +1478,7 @@ class TestParallelPatchKernel(unittest.TestCase):
                         _DOFS,
                         arch,
                         rows=rows,
-                        sweeps=24,
+                        levels=LevelLaw.split(24),
                         inkernel_response=(_DOFS, 0, 0, 0),
                         linked_rows=linked,
                     )
@@ -1508,7 +1515,7 @@ class TestParallelPatchKernel(unittest.TestCase):
                     _DOFS,
                     arch,
                     rows=32,
-                    sweeps=2000,
+                    levels=LevelLaw.split(2000),
                     inkernel_response=(_DOFS, 0, 0, 0),
                     linked_rows=True,
                 )
@@ -1546,7 +1553,7 @@ class TestParallelPatchKernel(unittest.TestCase):
                         _DOFS,
                         arch,
                         rows=32,
-                        sweeps=sweeps,
+                        levels=LevelLaw.split(sweeps),
                         inkernel_response=(_DOFS, 0, 0, 0),
                         linked_rows=True,
                         velocity_limit_pass=last_word,

@@ -25,6 +25,7 @@ from newton._src.solvers.feather_pgs.response_operator import Lanes, TransposedR
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy, bound
 from newton._src.solvers.feather_pgs.sweep import (
     JacobiRows,
+    LevelLaw,
     RowLaws,
     end_sweep,
     jacobi_scale,
@@ -54,29 +55,29 @@ _INK = {"inkernel_response": (12, 6, 0, 12)}
 
 CALLS = (
     # The conformance routes' configurations (32 rows, one warp), then the wider tiers and the other variants.
-    ("whitened", (64, 32, 18, "120"), {"rows": 32, "sweeps": 112, **_INK}),
-    ("whitened_linked", (64, 32, 18, "120"), {"rows": 32, "sweeps": 112, **_INK, "linked_rows": True}),
+    ("whitened", (64, 32, 18, "120"), {"rows": 32, "levels": LevelLaw.split(112), **_INK}),
+    ("whitened_linked", (64, 32, 18, "120"), {"rows": 32, "levels": LevelLaw.split(112), **_INK, "linked_rows": True}),
     (
         "keyed",
         (64, 32, 18, "120"),
-        {"rows": 32, "sweeps": 112, **_INK, "keyed": _LAYOUT, "classes": _CLASSES},
+        {"rows": 32, "levels": LevelLaw.split(112), **_INK, "keyed": _LAYOUT, "classes": _CLASSES},
     ),
     (
         "keyed_linked",
         (64, 32, 18, "120"),
-        {"rows": 32, "sweeps": 112, **_INK, "keyed": _LAYOUT, "classes": _CLASSES, "linked_rows": True},
+        {"rows": 32, "levels": LevelLaw.split(112), **_INK, "keyed": _LAYOUT, "classes": _CLASSES, "linked_rows": True},
     ),
-    ("one_group", (64, 32, 18, "120"), {"rows": 32, "sweeps": 42, "inkernel_response": (18, 0, 0, 0)}),
-    ("rows_64", (96, 32, 18, "120"), {"rows": 64, "sweeps": 60, **_INK}),
+    ("one_group", (64, 32, 18, "120"), {"rows": 32, "levels": LevelLaw.split(42), "inkernel_response": (18, 0, 0, 0)}),
+    ("rows_64", (96, 32, 18, "120"), {"rows": 64, "levels": LevelLaw.split(60), **_INK}),
     (
         "rows_96_last_word",
         (96, 32, 18, "120"),
-        {"rows": 96, "sweeps": 73, **_INK, "linked_rows": True, "velocity_limit_pass": True},
+        {"rows": 96, "levels": LevelLaw.split(73), **_INK, "linked_rows": True, "velocity_limit_pass": True},
     ),
     (
         "rows_128",
         (128, 32, 18, "120"),
-        {"rows": 128, "sweeps": 84, **_INK, "linked_rows": True, "velocity_limit_pass": True},
+        {"rows": 128, "levels": LevelLaw.split(84), **_INK, "linked_rows": True, "velocity_limit_pass": True},
     ),
 )
 """``(label, arguments, options)`` of the factory: the conformance routes' tiers and the other variants."""
@@ -112,17 +113,17 @@ class TestParallelTier(unittest.TestCase):
     def test_invalid_options_raise(self):
         args = (64, 32, 18, "120")
         invalid = (
-            {"rows": 0, "sweeps": 1, **_INK},
-            {"rows": 72, "sweeps": 1, **_INK},
-            {"rows": 30, "sweeps": 1, **_INK},
-            {"rows": 32, "sweeps": 1, "inkernel_response": (12, 7, 0, 12)},
+            {"rows": 0, "levels": LevelLaw.split(1), **_INK},
+            {"rows": 72, "levels": LevelLaw.split(1), **_INK},
+            {"rows": 30, "levels": LevelLaw.split(1), **_INK},
+            {"rows": 32, "levels": LevelLaw.split(1), "inkernel_response": (12, 7, 0, 12)},
         )
         for kwargs in invalid:
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(ValueError):
                     _tier(_TIER, args, kwargs)
         with self.assertRaisesRegex(ValueError, "rows must be in"):
-            _tier(_TIER, (256, 32, 18, "120"), {"rows": 132, "sweeps": 1, **_INK})
+            _tier(_TIER, (256, 32, 18, "120"), {"rows": 132, "levels": LevelLaw.split(1), **_INK})
 
     def test_every_world_ends_with_a_barrier(self):
         """The world queue's next world restages the shared rows only after every lane has read this world's."""
@@ -149,7 +150,7 @@ class TestParallelTier(unittest.TestCase):
     def test_formed_diagonals_freeze_their_rows_after_the_staging(self):
         """A row the formed diagonal freezes changes its kind only once every lane has read the kinds; a friction row
         is never frozen: it takes its block's step."""
-        source = _source((64, 32, 18, "120"), {"rows": 32, "sweeps": 1, **_INK})
+        source = _source((64, 32, 18, "120"), {"rows": 32, "levels": LevelLaw.split(1), **_INK})
         self.assertIn("else { s_step[i] = 0.0f; frozen = s_kind[i] != 1; }", source)
         self.assertNotIn("s_kind[i] = -1", source)
         freeze = source.index("if (frozen) s_kind[lane] = -1;\n    SYNC();")
@@ -157,9 +158,9 @@ class TestParallelTier(unittest.TestCase):
         self.assertLess(freeze, source.index("float step_block = step_a > 0.0f ? step_a : step_b;"))
 
     def test_several_warps_stop_on_the_block_vote(self):
-        one = _source((64, 32, 18, "120"), {"rows": 32, "sweeps": 1, **_INK})
+        one = _source((64, 32, 18, "120"), {"rows": 32, "levels": LevelLaw.split(1), **_INK})
         self.assertIn(_EXIT, one)
-        block = _source((96, 32, 18, "120"), {"rows": 64, "sweeps": 1, **_INK})
+        block = _source((96, 32, 18, "120"), {"rows": 64, "levels": LevelLaw.split(1), **_INK})
         self.assertIn(_BLOCK_EXIT, block)
         self.assertNotIn("BALLOT", block)
 
@@ -216,10 +217,10 @@ class TestJacobiLaw(unittest.TestCase):
         self.assertIn("solve_readout_sweeps(world, sweep + 1, sweep_stop);", counted)
 
     def test_a_pooled_pair_reads_its_ring_from_the_staged_impulses(self):
-        source = _source((64, 32, 18, "120"), {"rows": 32, "sweeps": 1, **_INK, "linked_rows": True})
+        source = _source((64, 32, 18, "120"), {"rows": 32, "levels": LevelLaw.split(1), **_INK, "linked_rows": True})
         self.assertIn("RING_LOAD(s_x[p], p, n_rows,", source)
         self.assertIn("return next < n_rows ? next : -1;", source)
-        point = _source((64, 32, 18, "120"), {"rows": 32, "sweeps": 1, **_INK})
+        point = _source((64, 32, 18, "120"), {"rows": 32, "levels": LevelLaw.split(1), **_INK})
         self.assertIn("const float xp = READ(x_new, p & 31);", point)
         self.assertNotIn("RING_LOAD", point)
 

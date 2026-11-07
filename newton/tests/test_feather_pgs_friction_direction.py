@@ -12,6 +12,7 @@ import newton
 from newton._src.solvers.feather_pgs import sweep_routes_tiers
 from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION
 from newton._src.solvers.feather_pgs.solve_policy import QUIET
+from newton._src.solvers.feather_pgs.sweep import LevelLaw
 from newton.tests.feather_pgs_free_body_rows import sweep_free_body_rows
 from newton.tests.test_feather_pgs_parallel_patch import _launch_parallel
 
@@ -224,7 +225,14 @@ class TestFeatherPGSFrictionDirection(unittest.TestCase):
         """Hold ``cases`` through the Jacobi tiers: rows formed in the kernel, linked, 2000 sweeps, tolerance 0."""
         device = wp.get_device("cuda:0")
         kernel = sweep_routes_tiers.TierSweep(
-            64, 32, 6, str(device.arch), rows=32, sweeps=2000, inkernel_response=(6, 0, 0, 0), linked_rows=True
+            64,
+            32,
+            6,
+            str(device.arch),
+            rows=32,
+            levels=LevelLaw.split(2000),
+            inkernel_response=(6, 0, 0, 0),
+            linked_rows=True,
         )
         for case in cases:
             with self.subTest(case=case["name"]):

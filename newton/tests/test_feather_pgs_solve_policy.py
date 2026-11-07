@@ -48,7 +48,7 @@ from newton._src.solvers.feather_pgs.solve_policy import (
     sweep_exit,
     vote,
 )
-from newton._src.solvers.feather_pgs.sweep import sweep_kernel
+from newton._src.solvers.feather_pgs.sweep import EXACT, LevelLaw, sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import built
@@ -112,7 +112,7 @@ def _factory_calls():
             "sparse_diagonal",
             built(sweep_routes_diag.DiagonalSweep),
             (64, 10, 9, "120"),
-            {"speculative_contact_batches": True, "contact_units": True},
+            {"speculative_contact_batches": True, "levels": LevelLaw(EXACT)},
         ),
     )
 
@@ -180,7 +180,12 @@ def _vote_census():
             "sparse_diagonal",
             built(sweep_routes_diag.DiagonalSweep),
             (64, 10, 9, "120"),
-            (_axis("speculative_contact_batches"), _axis("contact_units"), _axis("seeded"), _axis("velocity_limits")),
+            (
+                _axis("speculative_contact_batches"),
+                _axis("levels", (LevelLaw(), LevelLaw(EXACT))),
+                _axis("seeded"),
+                _axis("velocity_limits"),
+            ),
         ),
     )
     for name, factory, args, axes in specs:

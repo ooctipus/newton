@@ -34,7 +34,7 @@ from .response_operator import Lanes, TransposedResponse, WalkedRows
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT
 from .solve_policy import block_argmax
-from .sweep import JacobiRows, SweepConfig, dense_tier_world, jacobi_limit_pass, jacobi_scale, jacobi_sweeps
+from .sweep import SPLIT, JacobiRows, SweepConfig, dense_tier_world, jacobi_limit_pass, jacobi_scale, jacobi_sweeps
 from .sweep_routes import MF_GS_ABI, worlds
 from .tree_scan import WALK_BOTH, WalkClass, classes_half
 
@@ -128,7 +128,7 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
     NA, NB, OA, OB = tier.inkernel_response
     operands = tier.row_inputs
     M_D, D, AM, NT = tier.max_constraints, tier.max_world_dofs, tier.rows, tier.threads
-    pitch, frame, classes, sweeps = tier.pitch, tier.frame, tier.classes, tier.sweeps
+    pitch, frame, classes, sweeps = tier.pitch, tier.frame, tier.classes, tier.levels.budget
     torsion, solve_policy, linked_rows = tier.torsion, tier.solve_policy, tier.linked_rows
     serial = device_lanes(tier.device_arch) == 1
     velocity_limit_pass = tier.velocity_limit_pass
@@ -213,13 +213,12 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
 
 @dataclasses.dataclass(frozen=True)
 class TierSweep(SweepConfig):
-    """A parallel tier's configuration (case K4): a world's dense rows (at most ``rows``, its claim's bucket) under the
-    Jacobi law, a lane a row, ``sweeps`` sweeps at most (:func:`parallel_source`).
+    """A parallel tier's configuration (case K4): a world's dense rows (at most ``rows``, its claim's bucket) one split
+    level, a lane a row (:func:`parallel_source`).
 
     Its switches, each the plan's from the class's shape and the laws (:meth:`.sweep_plan.Sweep.build`):
 
-    - the level law: a world's rows one split (Jacobi) level, stepped at once in the Gershgorin metric with momentum,
-      ``sweeps`` its budget (:func:`tier_sweeps` of its row bound); ``rows`` the bucket's bound;
+    - the level law: split (:class:`.sweep.LevelLaw`), its budget :func:`tier_sweeps` of the bucket's bound ``rows``;
     - the producer's sink: with a ``keyed`` layout (:class:`.keyed_row_layout.KeyedLayout`) the rows are walked from
       their keys in the kernel's prologue (:func:`.keyed_rows.get_direct_parallel_inputs`), else read as the one writer
       stored them (``pitch`` rows a world's line);
@@ -241,7 +240,6 @@ class TierSweep(SweepConfig):
     device_arch: str
     _: dataclasses.KW_ONLY
     rows: int
-    sweeps: int
     inkernel_response: tuple[int, int, int, int]
     keyed: KeyedLayout | None = None
     linked_rows: bool = False
@@ -257,6 +255,8 @@ class TierSweep(SweepConfig):
     def __post_init__(self):
         if self.material and not self.weighted:
             raise ValueError("material contacts step by their weights: their tiers are weighted")
+        if self.levels.law != SPLIT:
+            raise ValueError("a tier steps its world's rows by the split level law")
         M_D, D, AM = self.max_constraints, self.max_world_dofs, int(self.rows)
         if AM <= 0 or AM > M_D or AM > TIER_MAX_ROWS:
             raise ValueError(f"rows must be in [1, min(max_constraints, {TIER_MAX_ROWS})]")
@@ -296,7 +296,7 @@ class TierSweep(SweepConfig):
         frame, pitch = self.frame, self.pitch
         return (
             f"sweep_{'parallel' if self.keyed is None else 'keyed_parallel'}_{self.max_constraints}_"
-            f"{self.mf_max_constraints}_{self.max_world_dofs}_rows{int(self.rows)}_sweeps{int(self.sweeps)}"
+            f"{self.mf_max_constraints}_{self.max_world_dofs}_rows{int(self.rows)}_sweeps{int(self.levels.budget)}"
             f"_nt{self.threads}_ink{NA}_{NB}_o{OA}_{OB}"
             + (f"_frame{int(frame[0])}_{int(frame[1])}" if any(frame) else "")
             + ("" if walk_half == WALK_BOTH else f"_half{walk_half}")

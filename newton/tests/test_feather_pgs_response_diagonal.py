@@ -17,7 +17,7 @@ from newton._src.solvers.feather_pgs.row_laws import (
     ROW_JOINT_LIMIT,
     ROW_JOINT_VELOCITY_LIMIT,
 )
-from newton._src.solvers.feather_pgs.sweep import sweep_kernel
+from newton._src.solvers.feather_pgs.sweep import EXACT, LevelLaw, sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_levels import (
     _get_mark_independent_sparse_contact_candidates_kernel,
     _get_sparse_contact_levels_kernel,
@@ -882,7 +882,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         upper_lambda = wp.zeros_like(lower_lambda)
         velocity = wp.array(initial_velocity, dtype=wp.float32, device=device)
         kernel = sweep_kernel(
-            DiagonalSweep(max_constraints, world_dofs, dense_dofs, str(device.arch), contact_units=True)
+            DiagonalSweep(max_constraints, world_dofs, dense_dofs, str(device.arch), levels=LevelLaw(EXACT))
         )
         walk = diagonal_walk(inverse_mass[None, :dense_dofs], device, world_dofs)
         wp.launch_tiled(
@@ -989,7 +989,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 world_dofs,
                 dense_dofs,
                 str(device.arch),
-                contact_units=True,
+                levels=LevelLaw(EXACT),
                 speculative_contact_batches=True,
             )
         )
@@ -1170,13 +1170,15 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
 
     def test_unit_schedule_factories_name_and_reject_layouts(self):
         """Name the unit variants and keep speculative batches within sixteen response lanes."""
-        solve = sweep_kernel(DiagonalSweep(24, 12, 9, "120", contact_units=True))
-        batched = sweep_kernel(DiagonalSweep(24, 12, 9, "120", contact_units=True, speculative_contact_batches=True))
+        solve = sweep_kernel(DiagonalSweep(24, 12, 9, "120", levels=LevelLaw(EXACT)))
+        batched = sweep_kernel(
+            DiagonalSweep(24, 12, 9, "120", levels=LevelLaw(EXACT), speculative_contact_batches=True)
+        )
         builder = _get_sparse_contact_levels_kernel(24, 12, "120", build_serial_contacts=True)
         self.assertEqual(solve.key, "sweep_sparse_diagonal_24_12_9_units")
         self.assertEqual(batched.key, "sweep_sparse_diagonal_24_12_9_speculative_batches_units")
         self.assertEqual(builder.key, "sparse_contact_levels_24_12_serial_contacts_units")
-        for kwargs in ({"contact_units": True, "speculative_contact_batches": True, "dense_dofs": 15},):
+        for kwargs in ({"levels": LevelLaw(EXACT), "speculative_contact_batches": True, "dense_dofs": 15},):
             dense_dofs = kwargs.pop("dense_dofs", 9)
             with self.subTest(**kwargs), self.assertRaises(ValueError):
                 sweep_kernel(DiagonalSweep(24, dense_dofs + 3, dense_dofs, "120", **kwargs))
@@ -1299,7 +1301,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                             dofs,
                             dense,
                             str(device.arch),
-                            contact_units=units,
+                            levels=LevelLaw(EXACT) if units else LevelLaw(),
                             speculative_contact_batches=batches,
                         )
                     )

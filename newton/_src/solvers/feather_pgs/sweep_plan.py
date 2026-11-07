@@ -51,7 +51,7 @@ from .row_records import bind as bind_dense_rows
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF, SolvePolicy, SolveReadoutRecord
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport, row_supports
-from .sweep import FRICTION_METRIC_FLOATS, SweepConfig, sweep_kernel
+from .sweep import EXACT, FRICTION_METRIC_FLOATS, LevelLaw, SweepConfig, sweep_kernel
 from .sweep_levels import (
     _get_mark_independent_sparse_contact_candidates_kernel,
     _get_sparse_contact_levels_kernel,
@@ -435,7 +435,7 @@ class Sweep:
                 diagonal.dense_size,
                 device_arch,
                 speculative_contact_batches=diagonal.speculative_batches,
-                contact_units=diagonal.units,
+                levels=LevelLaw(EXACT) if diagonal.units else LevelLaw(),
                 seeded=self.seeded,
                 velocity_limits=bool(self.options.enable_joint_velocity_limits),
                 **self.law_fields,
@@ -534,7 +534,7 @@ class Sweep:
                 )
             if model.device.is_cuda and capable.size > 0:
                 found = device(model.device)
-                colored_work = dataclasses.replace(self.general_sweep, mapping="colored").work()
+                colored_work = dataclasses.replace(self.general_sweep, levels=LevelLaw(EXACT)).work()
                 rule = rule.at_scale(capable.size, shape(colored_work, found).blocks_per_sm * found.sms)
                 capable = sweep_units.capable_worlds(
                     self.forest.free_rigid_per_world, self.placement.mf_max_constraints, rule
@@ -542,7 +542,7 @@ class Sweep:
             colored = bool(model.device.is_cuda and capable.size > 0)
             self.mf_gs_kernel = self.sweep("mf_gs", self.general_sweep)
             if colored:
-                self.colored_sweep = dataclasses.replace(self.general_sweep, mapping="colored")
+                self.colored_sweep = dataclasses.replace(self.general_sweep, levels=LevelLaw(EXACT))
                 self.mf_colored_kernel = self.sweep("mf_colored", self.colored_sweep)
             if parallel_rows > 0:
                 # Under keyed rows each tier walks its rows from their keys in its prologue (the producer's sink).
@@ -558,7 +558,7 @@ class Sweep:
                         self.forest.max_world_dofs,
                         device_arch,
                         rows=rows_,
-                        sweeps=sweeps_,
+                        levels=LevelLaw.split(sweeps_),
                         inkernel_response=self.classes.tiers.sizes,
                         keyed=keyed,
                         linked_rows=True,
@@ -1278,14 +1278,14 @@ class Sweep:
             # The last-word velocity-limit pass after the final sweep (linked tiers with joint velocity limits).
             "velocity_limit_pass": all(tier.config.velocity_limit_pass for tier in tiers),
             # The largest tier budget; each tier records its own (the equal-accuracy rule "auto", or "pinned").
-            "sweeps": max(tier.config.sweeps for tier in tiers),
+            "sweeps": max(tier.config.levels.budget for tier in tiers),
             "sweeps_rule": self.par_sweeps_rule,
             "sweeps_reason": self.par_sweeps_reason,
             "tiers": [
                 {
                     "rows": int(rows),
                     "min_rows": int(min_rows),
-                    "sweeps": tier.config.sweeps,
+                    "sweeps": tier.config.levels.budget,
                     "kernel": kernel_key(tier.kernel),
                 }
                 for (rows, min_rows), tier in zip(self.par_tiers, tiers, strict=True)

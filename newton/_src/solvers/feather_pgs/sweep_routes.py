@@ -26,8 +26,11 @@ from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_VELOCITY_LIMIT, ROW_S
 from .row_metadata import record_layout, validate_record_coordinates
 from .solve_policy import QUIET_LITERAL, block_argmax, sweep_exit
 from .sweep import (
+    EXACT,
     ITERATION,
+    SEQUENTIAL,
     Diagonal,
+    Levels,
     RowContext,
     RowLaws,
     SweepConfig,
@@ -259,15 +262,12 @@ def free_body_rows(lanes: Lanes, support: int | str = 12) -> SparseFactor:
     )
 
 
-MAPPINGS = ("warp", "colored")
-"""The matrix-free sweep's thread mappings of a world's free-body rows: one warp visits them in row order, or a block
-visits their colors in order and each color's units at once (:mod:`.sweep_units`)."""
-
 COLORED_THREADS = 256
 """Threads of a colored world's block: a color's units beyond them run in turns."""
 
-COLOR_CHUNK = 256
-"""Color offsets a colored block stages at a time: a world's colors are bounded by its units, not by the block."""
+COLORS = Levels("color_count.data[world]", lambda color: f"color_offset.data[off_color + {color}]", chunk=256)
+"""A colored world's free-body units by color (the exact level law, :mod:`.sweep_units`), a thread a unit of the block:
+256 colors' offsets staged at a time, since a world's colors are bounded by its units, not by the block."""
 
 COLORED_ABI = kernel_template.params(
     *MF_GS_ABI[:-1],
@@ -381,29 +381,6 @@ def _unit_apply(pad: str, *, torsion: bool = False) -> str:
     return indent("\n".join(lines), pad)
 
 
-@dataclasses.dataclass(frozen=True)
-class Colours:
-    """A colored world's units by colour, a thread a unit at block stride, unit ``p`` at a time: each colour's units are
-    the range of ``color_offset`` (``chunk`` colours' offsets staged at a time), and the block synchronizes after each
-    colour (no two units of a colour share a body)."""
-
-    chunk: int
-
-    def wrap(self, visit: str, pad: str) -> str:
-        head = f"""const int colors = color_count.data[world];
-for (int color = 0; color < colors; ++color) {{
-    // The offsets of the next chunk of colors (the barrier after the last color freed the previous one).
-    const int chunk = color % {self.chunk};
-    if (chunk == 0) {{
-        for (int c = tid; c <= {self.chunk} && color + c <= colors; c += blockDim.x)
-            s_color_offset[c] = color_offset.data[off_color + color + c];
-        __syncthreads();
-    }}
-    const int end_unit = s_color_offset[chunk + 1];
-    for (int p = s_color_offset[chunk] + tid; p < end_unit; p += blockDim.x) {{"""
-        return indent(head, pad) + f"\n{visit}\n{pad}    }}\n{pad}    __syncthreads();\n{pad}}}"
-
-
 def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str:
     """A color's units, one thread each, at block stride: each loads its slot's fields at once
     (:data:`.sweep_units.SLOT_FIELDS`, field by field across the color's ``units`` slots) and runs the free-body row
@@ -447,8 +424,8 @@ def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str
         ring_load=ring_load,
         lanes=Lanes(1),
         contact_kinds=(ROW_CONTACT,),
-        pair_law="FRICTION_PAIR_CACHED(p, ",
-        triple_law="FRICTION_TRIPLE_CACHED(p, ",
+        pair_law="FRICTION_PAIR_CACHED(place, ",
+        triple_law="FRICTION_TRIPLE_CACHED(place, ",
     )
     lam = unit_rows.load
     ring_sum = "\n".join(
@@ -500,10 +477,10 @@ const float mf_diag = __int_as_float(meta.y);"""
         check="mf_diag",
         pad=" " * 20,
     )
-    visit = f"""                    const int4 slot = __ldg(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + p) * 4]));
+    visit = f"""                    const int4 slot = __ldg(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + place) * 4]));
                     const int unit_row = slot.x, rows = slot.y, dof_a = slot.z, dof_b = slot.w;
-                    const int slot_base = unit_slot * {fields * units} + p;
-                    const int word_base = unit_slot * {words * units} + p;
+                    const int slot_base = unit_slot * {fields * units} + place;
+                    const int word_base = unit_slot * {words * units} + place;
                     // Every field of the slot and its metric at once, beside the slot's own load: one round of
                     // memory latency per unit. A unit without a friction pair never reads its pair's fields.
                     float E[{fields}];
@@ -514,11 +491,11 @@ const float mf_diag = __int_as_float(meta.y);"""
                     for (int f = 0; f < {words}; ++f) W[f] = slot_words.data[word_base + f * {units}];
 #pragma unroll
                     for (int f = 0; f < {layout.metric}; ++f)
-                        metric[f] = slot_metric.data[unit_slot * {layout.metric * units} + p + f * {units}];
+                        metric[f] = slot_metric.data[unit_slot * {layout.metric * units} + place + f * {units}];
 {_unit_terms(" " * 20, torsion=torsion)}
 {unit}
 {_unit_apply(" " * 20, torsion=torsion)}"""
-    return f"{ring_sum}\n{Colours(COLOR_CHUNK).wrap(visit, ' ' * 12)}"
+    return f"{ring_sum}\n{COLORS.wrap(visit, ' ' * 12)}"
 
 
 def _colored_diagonal(r: int) -> str:
@@ -631,7 +608,7 @@ def mf_gs_staging(
     mf_max_constraints: int,
     max_world_dofs: int,
     *,
-    mapping: str = "warp",
+    colored: bool = False,
     places: RowPlaces = STAGED_ROWS,
     traces: bool = False,
     wide_rows: bool = False,
@@ -639,26 +616,25 @@ def mf_gs_staging(
 ) -> Staging:
     """The shared working set of a world's matrix-free sweep block (:func:`mf_gs_source` declares it): the world's
     velocity, its dense rows' impulses and staged metadata, the free bodies' run's impulses (``free_rows``) unless they
-    stream, and the colored mapping's color offsets (and its trace's warp maxima)."""
+    stream, and ``colored`` the colors' staged offsets (and its trace's warp maxima)."""
     dense = WorldRows(max_constraints, staging=places.staging, stream=places.dense_impulses is Place.GLOBAL)
     free = WorldRows(
         mf_max_constraints, staging="record", free=True, stream=places.impulses is Place.GLOBAL or not free_rows
     )
-    colored = ()
-    if mapping == "colored":
-        warps = COLORED_THREADS // 32
-        colored = (Buffer("s_color_offset", "int", COLOR_CHUNK + 1),)
+    levels = ()
+    if colored:
+        levels = COLORS.buffers()
         if traces:
-            colored += block_argmax(warps, warp="warp", lane="lane")[1]
+            levels += block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[1]
     return Staging(
         (
             Buffer("s_v", "float", max_world_dofs),
             *((Buffer("s_sweep_v", "float", max_world_dofs),) if wide_rows else ()),
             *dense.buffers(),
             *free.buffers(),
-            *colored,
+            *levels,
         ),
-        threads=COLORED_THREADS if mapping == "colored" else 32,
+        threads=COLORED_THREADS if colored else 32,
     )
 
 
@@ -675,10 +651,10 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
 
     Returns the body and its staging.
     """
-    mapping, places, solve_policy = sweep.mapping, sweep.places, sweep.solve_policy
+    places, solve_policy = sweep.places, sweep.solve_policy
     contact_torsion, seeded, wide_rows = sweep.torsion, sweep.seeded, sweep.wide_rows
     free_rows, speed_rows, max_row_dofs = sweep.free_rows, sweep.speed_rows, sweep.max_row_dofs
-    colored = mapping == "colored"
+    colored = sweep.colored
     lanes = sweep.lanes
     M_D, M_MF, D = sweep.max_constraints, sweep.mf_max_constraints, sweep.max_world_dofs
     # The row store's line: the dense rows, then the free bodies' from M_D (:mod:`.row_records`).
@@ -693,7 +669,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         M_D,
         M_MF,
         D,
-        mapping=mapping,
+        colored=colored,
         places=places,
         traces=solve_policy.traces,
         wide_rows=wide_rows,
@@ -937,9 +913,9 @@ class GeneralSweep(SweepConfig):
 
     Its switches, each the plan's from the class's shape, the placement and the laws (:meth:`.sweep_plan.Sweep.build`):
 
-    - the level's mapping (:data:`MAPPINGS`): ``"warp"``, the world's warp visits its rows in row order; ``"colored"``,
-      a block visits the free bodies' colors in order and a color's units at once (the unit builder's rule picks the
-      worlds, :class:`.sweep_units.ColoredRule`);
+    - the free bodies' level law (``levels``, :class:`.sweep.LevelLaw`): sequential, the world's warp visits its rows
+      in row order; exact (colored), a block visits the free bodies' colors in order and a color's units at once (the
+      unit builder's rule picks the worlds, :class:`.sweep_units.ColoredRule`);
     - the row record: ``places`` (:class:`RowPlaces`, the plan's storage choice): the dense rows' metadata staged or
       their records streamed; the free rows' records always stream;
     - the support class: ``max_row_dofs`` (the placement's packed support), ``wide_rows`` (rows over every coordinate,
@@ -957,7 +933,6 @@ class GeneralSweep(SweepConfig):
     device_arch: str
     _: dataclasses.KW_ONLY
     max_row_dofs: int | None = None
-    mapping: str = "warp"
     places: RowPlaces = STAGED_ROWS
     has_dense_velocity_limit_rows: bool = True
     seeded: bool = False
@@ -967,9 +942,9 @@ class GeneralSweep(SweepConfig):
     speed_rows: bool = False
 
     def __post_init__(self):
-        if self.mapping not in MAPPINGS:
-            raise ValueError(f"mapping must be one of {MAPPINGS}, got {self.mapping!r}")
-        if self.mapping == "colored" and not self.free_rows:
+        if self.levels.law not in (SEQUENTIAL, EXACT):
+            raise ValueError("the general sweep's free bodies step in order or by exact levels (colored)")
+        if self.colored and not self.free_rows:
             raise ValueError("the colored mapping sweeps the free bodies' run: it needs free_rows")
         validate_record_coordinates(self.max_world_dofs)
         if self.material and not self.weighted:
@@ -979,7 +954,7 @@ class GeneralSweep(SweepConfig):
 
     @property
     def colored(self) -> bool:
-        return self.mapping == "colored"
+        return self.levels.law == EXACT
 
     @property
     def lanes(self) -> int:
@@ -997,7 +972,7 @@ class GeneralSweep(SweepConfig):
 
     @property
     def label(self) -> str:
-        return f"the {self.mapping} matrix-free sweep"
+        return f"the {'colored' if self.colored else 'warp'} matrix-free sweep"
 
     @property
     def name(self) -> str:

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The colored mapping of FeatherPGS's matrix-free sweep (:mod:`.sweep_units`, ``GeneralSweep(mapping="colored")``).
+"""The colored mapping of FeatherPGS's matrix-free sweep (:mod:`.sweep_units`, ``GeneralSweep(levels=LevelLaw(EXACT))``).
 
 A world's contacts become units (a normal row and its friction pair) and each unit's color is its level in row
 order (one past the latest color of an earlier unit on its bodies), so no two units of a color share a body and

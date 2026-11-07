@@ -145,7 +145,7 @@ def factory_calls():
     """Yield ``(name, factory, args, kwargs)`` for factory variants the kernel pins do not reach.
 
     Each matrix-free Gauss-Seidel flag is toggled alone on two bases (the pins
-    hold the suite's shapes); the fallback and linked parallel tiers of a
+    hold the suite's shapes), the colored mapping among them; the fallback and linked parallel tiers of a
     second keyed-row coordinate layout (one articulation, no secondary block)
     follow. Calls a factory rejects are recorded as rejected.
     """
@@ -155,6 +155,7 @@ def factory_calls():
         sweep_routes_tiers,
     )
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.sweep import EXACT, LevelLaw  # noqa: PLC0415
     from newton.tests.feather_pgs_law_harness import built, keyed_classes  # noqa: PLC0415
 
     mf_gs = _unwrapped(built(sweep_routes.GeneralSweep))
@@ -165,6 +166,9 @@ def factory_calls():
         {"torsion": True},
         {"free_rows": False},
         {"free_rows": False, "speed_rows": True},
+        # The colored mapping: the free bodies' exact levels.
+        {"levels": LevelLaw(EXACT)},
+        {"levels": LevelLaw(EXACT), "torsion": True},
     )
     for base in ({}, {"has_dense_velocity_limit_rows": False}):
         for change in toggles:
@@ -177,7 +181,7 @@ def factory_calls():
     for rows in (32, 48):
         kwargs = {
             "rows": rows,
-            "sweeps": 24,
+            "levels": LevelLaw.split(24),
             "inkernel_response": (18, 0, 0, 0),
             "linked_rows": True,
         }
@@ -435,6 +439,7 @@ def walk_calls():
     from newton._src.solvers.feather_pgs import sweep_routes, sweep_routes_tiers, walk_rows  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import tree_kinetic_state as native  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.factor import walk as factor_walk  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.sweep import LevelLaw  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout  # noqa: PLC0415
     from newton.tests.feather_pgs_law_harness import built  # noqa: PLC0415
 
@@ -496,7 +501,7 @@ def walk_calls():
     mf_gs = _unwrapped(built(sweep_routes.GeneralSweep))
     free = {"free_rows": False, "speed_rows": True, "has_dense_velocity_limit_rows": False}
     yield "sweep_routes.GeneralSweep", mf_gs, (64, 32, 12, ARCH), free
-    tiers = {"rows": 32, "sweeps": 24, "inkernel_response": (18, 0, 0, 0)}
+    tiers = {"rows": 32, "levels": LevelLaw.split(24), "inkernel_response": (18, 0, 0, 0)}
     yield "sweep_routes_tiers.TierSweep", built(sweep_routes_tiers.TierSweep), (64, 32, 18, ARCH), tiers
 
 
@@ -540,6 +545,7 @@ def census_calls():
         sweep_routes_tiers,
     )
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.sweep import EXACT, LevelLaw  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep  # noqa: PLC0415
     from newton.tests.feather_pgs_law_harness import built, keyed_classes  # noqa: PLC0415
 
@@ -582,14 +588,22 @@ def census_calls():
             "sweep_routes_diag.DiagonalSweep",
             built(sweep_routes_diag.DiagonalSweep),
             ((64, 10, 9, ARCH),),
-            (_axis("speculative_contact_batches"), _axis("contact_units"), _axis("seeded"), _axis("velocity_limits")),
+            (
+                _axis("speculative_contact_batches"),
+                _axis("levels", (LevelLaw(), LevelLaw(EXACT))),
+                _axis("seeded"),
+                _axis("velocity_limits"),
+            ),
         ),
         (
             "sweep_routes_tiers.TierSweep",
             built(sweep_routes_tiers.TierSweep),
             ((192, 32, 18, ARCH),),
             (
-                tuple({"rows": rows, "sweeps": 24, "inkernel_response": (18, 0, 0, 0)} for rows in (32, 48, 128)),
+                tuple(
+                    {"rows": rows, "levels": LevelLaw.split(24), "inkernel_response": (18, 0, 0, 0)}
+                    for rows in (32, 48, 128)
+                ),
                 _axis("linked_rows"),
                 _axis("velocity_limit_pass"),
             ),
@@ -602,7 +616,7 @@ def census_calls():
                 tuple(
                     {
                         "rows": rows,
-                        "sweeps": 24,
+                        "levels": LevelLaw.split(24),
                         "inkernel_response": (16, 6, 0, 16),
                     }
                     for rows in (32, 64, 96, 128)

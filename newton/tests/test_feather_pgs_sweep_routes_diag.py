@@ -21,15 +21,15 @@ import warp as wp
 from newton._src.solvers.feather_pgs import sweep_routes_diag as routes
 from newton._src.solvers.feather_pgs.response_operator import Lanes, Velocity
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
-from newton._src.solvers.feather_pgs.sweep import RowLaws, row_sums, speed_row
+from newton._src.solvers.feather_pgs.sweep import EXACT, LevelLaw, RowLaws, row_sums, speed_row
 from newton._src.solvers.feather_pgs.sweep_routes import free_body_rows
 from newton.tests.feather_pgs_law_harness import built
 
 _POLICIES = (SolvePolicy(), SolvePolicy(readout="sweeps"), SolvePolicy(readout="trace"))
 _SCHEDULES = (
     {},
-    {"contact_units": True},
-    {"contact_units": True, "speculative_contact_batches": True},
+    {"levels": LevelLaw(EXACT)},
+    {"levels": LevelLaw(EXACT), "speculative_contact_batches": True},
 )
 
 
@@ -48,7 +48,7 @@ class TestSweepRoutesDiagOptions(unittest.TestCase):
             (
                 built(routes.DiagonalSweep),
                 (32, 30, 15, "sm_120"),
-                {"contact_units": True, "speculative_contact_batches": True},
+                {"levels": LevelLaw(EXACT), "speculative_contact_batches": True},
             ),
         ]
         for factory, args, kwargs in cases:
@@ -74,7 +74,9 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
                 self.assertIn(f"for (int d = lane; d < {dofs}; d += 32) s_v[d] = 0.0f;", text)
 
     def test_sparse_diagonal_schedules(self):
-        units, _ = routes.DiagonalSweep(32, 14, 6, "120", contact_units=True, speculative_contact_batches=True).source()
+        units, _ = routes.DiagonalSweep(
+            32, 14, 6, "120", levels=LevelLaw(EXACT), speculative_contact_batches=True
+        ).source()
         plain, _ = routes.DiagonalSweep(32, 14, 6, "120").source()
         # A batch tests one contact per segment of eight lanes (P + 2 = 8 response entries).
         self.assertIn("SEGMENT_SUM(8, candidate_velocity);", units)
@@ -82,7 +84,7 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
         # The phase bound is clamped to the world's rows; the plain schedule has no contact segment.
         self.assertIn("const int contact_start = min(dense_phase_bounds.data[world * 2 + 1], row_count);", units)
         self.assertIn("const int contact_start = row_count;", plain)
-        self.assertNotIn("scalar_levels", plain)
+        self.assertNotIn("sparse_contact_level_count", plain)
         # Independent contacts: a row of one entry, on the contact's coordinate: one product, added to zero.
         self.assertIn("const int index = scalar_coord;", units)
         # A level visits a contact's normal and its pair's first tangent with their kinds (and the pair's parent) known,
@@ -115,7 +117,7 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
             )
             self.assertLess(text.index(loaded), text.rindex("int row_type = (s_rec_dense["))
         for text in (units,):
-            start = text.index("const int scalar_levels")
+            start = text.index("const int levels = sparse_contact_level_count")
             levels = text[start : text.index("SYNC();", start)]
             self.assertNotIn("unit_jv", levels)
             self.assertIn("const int index = scalar_coord;", levels)
@@ -272,7 +274,7 @@ class TestSweepRoutesDiagAssembly(unittest.TestCase):
             (
                 built(routes.DiagonalSweep),
                 (32, 14, 6, "sm_120"),
-                {"contact_units": True, "speculative_contact_batches": True},
+                {"levels": LevelLaw(EXACT), "speculative_contact_batches": True},
             ),
         ]
         for factory, args, kwargs in cases:
