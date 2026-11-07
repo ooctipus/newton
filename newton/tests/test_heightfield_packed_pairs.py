@@ -13,7 +13,7 @@ import warp as wp
 import newton
 from newton._src.geometry.heightfield_cells import heightfield_cell_overlaps_kernel
 from newton._src.geometry.narrow_phase import NarrowPhase
-from newton.tests.test_heightfield_cell_reject import make_model
+from newton.tests.test_heightfield_cell_reject_routes import make_model
 
 
 def create_pipeline(model, packed):

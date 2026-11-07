@@ -22,7 +22,6 @@ from newton.tests.unittest_utils import add_function_test, assert_host_only, get
 # developer's shell cannot change the expected routes.
 _TERRAIN_ENVIRONMENT = {
     "NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "0",
-    "NEWTON_HEIGHTFIELD_CONVEX_CELLS": "0",
     "NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES": "1",
     "NEWTON_HEIGHTFIELD_ANALYTIC_CONVEX": "1",
     "NEWTON_HEIGHTFIELD_CYLINDER_SPLIT": "0",
@@ -187,31 +186,6 @@ def test_dense_pipeline_uses_ordinary(test, device):
 
 
 class TestAutoConvexSelection(unittest.TestCase):
-    def test_cell_cost_ignores_shared_output_overhead(self):
-        """Preserve the predicted method difference when both primitives share fixed work."""
-        from newton._src.geometry.convex_cell_cost import _fit_support_cost  # noqa: PLC0415
-
-        records = []
-        for calls in (1, 8, 32):
-            for vertices in (8, 32, 64):
-                candidates = calls * (1 + vertices / 16)
-                records.append(
-                    {
-                        "calls": calls,
-                        "vertices": vertices,
-                        "candidates": candidates,
-                        "scan_ns": 10 + calls + 2 * calls * vertices,
-                        "cell_ns": 12 + 3 * calls + candidates,
-                    }
-                )
-        costs, _ = _fit_support_cost(records)
-        for row in records:
-            row["scan_ns"] += 100
-            row["cell_ns"] += 100
-        shifted, _ = _fit_support_cost(records)
-        np.testing.assert_allclose(costs, [1, 2, 3, 1, 2], atol=1e-10)
-        np.testing.assert_allclose(shifted, costs, atol=1e-10)
-
     def test_public_collision_choice_overrides_environment(self):
         """Keep explicit instance choices independent of legacy process settings."""
         builder = newton.ModelBuilder()
@@ -219,9 +193,7 @@ class TestAutoConvexSelection(unittest.TestCase):
         builder.add_shape_box(body=body, hx=0.5, hy=0.5, hz=0.5)
         builder.add_ground_plane()
         model = builder.finalize(device="cpu")
-        with patch.dict(
-            os.environ, {"NEWTON_NARROW_PHASE_COHERENT_CONVEX": "reject_only", "NEWTON_NARROW_PHASE_CONVEX_CELLS": "1"}
-        ):
+        with patch.dict(os.environ, {"NEWTON_NARROW_PHASE_COHERENT_CONVEX": "reject_only"}):
             ordinary = newton.CollisionPipeline(model, convex_collision="ordinary")
             automatic = newton.CollisionPipeline(model, convex_collision="auto")
         self.assertEqual(ordinary.get_collision_selection()["method"], "ordinary")
@@ -252,7 +224,6 @@ class TestAutoConvexSelection(unittest.TestCase):
             ("auto", {}, "closed_form_hull_row", True),
             ("ordinary", {}, "generic_gjk", False),
             ("ordinary", {"NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "1"}, "closed_form_hull_row", True),
-            ("convex_cells", {}, "terrain_cells_gjk", True),
             ("ordinary", geometric, "pair_csr", False),
         )
         for choice, environment, hull, table in cases:
@@ -282,17 +253,6 @@ class TestAutoConvexSelection(unittest.TestCase):
             [(row["row"], row.get("closed_form", row.get("hull"))) for row in automatic["primitive_query"]["rows"]],
             [("sphere", True), ("cylinder", True), ("capsule", True), ("box", True), ("fallback", "closed_form")],
         )
-        self.assertIsNone(automatic["convex_cells"]["owner"])
-        self.assertIn("CUDA", automatic["convex_cells"]["reason"])
-        forced = _terrain_pipeline(model, "convex_cells").get_collision_selection()
-        self.assertEqual(forced["heightfield"]["convex_cells"]["owner"], "fixed")
-        self.assertEqual(forced["heightfield"]["convex_cells"]["query"], "gjk_mpr")
-        self.assertIn("convex_cells", forced["heightfield"]["convex_cells"]["reason"])
-        # The cells owner replaces only the fallback; every typed row stays.
-        forced_rows = forced["heightfield"]["primitive_query"]["rows"]
-        self.assertEqual([row["row"] for row in forced_rows], ["sphere", "cylinder", "capsule", "box", "fallback"])
-        self.assertEqual(forced_rows[-1]["hull"], "excluded")
-        self.assertEqual(forced["narrow_phase"]["coherent_convex"]["reason"], "terrain_cells_only")
         environment = {"NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "1", "NEWTON_HEIGHTFIELD_CYLINDER_SPLIT": "1"}
         split_selection = _terrain_pipeline(model, "ordinary", environment).get_collision_selection()
         # "ordinary" requests no typed table, so the environment's value is the one applied.
@@ -309,23 +269,18 @@ class TestAutoConvexSelection(unittest.TestCase):
         self.assertTrue(pair["finite_query"]["enabled"] and pair["geometric_cull"]["enabled"])
         self.assertIn("NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY is not 1", pair["primitive_query"]["reason"])
 
-    @unittest.skipUnless(wp.is_cuda_available(), "Automatic terrain cells require CUDA")
-    def test_collision_record_reports_automatic_terrain_cells_cuda(self):
-        """Report that automatic terrain cells send hulls through GJK/MPR, not the closed-form hull row."""
+    @unittest.skipUnless(wp.is_cuda_available(), "requires CUDA")
+    def test_collision_record_reports_automatic_terrain_routes_cuda(self):
+        """Send hulls through the closed-form hull row on CUDA too, with every typed row of the CPU record."""
         model = _terrain_model("cuda:0")
         pipeline = _terrain_pipeline(model, "auto")
-        # The sampled chooser's describe() reads the device by design; the route sections must not.
         with assert_host_only():
             pipeline._narrow_phase_selection()
             pipeline._heightfield_selection()
         automatic = pipeline.get_collision_selection()
         json.dumps(automatic, allow_nan=False)
         terrain = automatic["heightfield"]
-        self.assertEqual(terrain["hull_route"], "terrain_cells_gjk")
-        self.assertEqual(terrain["convex_cells"]["owner"], "sampled_chooser")
-        self.assertEqual(terrain["convex_cells"]["query"], "gjk_mpr")
-        self.assertIn("auto", terrain["convex_cells"]["reason"])
-        self.assertIsNotNone(terrain["convex_cells"]["schedule_reason"])
+        self.assertEqual(terrain["hull_route"], "closed_form_hull_row")
         self.assertEqual(
             [row["kernel"] for row in terrain["primitive_query"]["rows"]],
             [kernel.key for kernel in pipeline.narrow_phase._heightfield_primitive_kernels],

@@ -2611,7 +2611,6 @@ class TestModelJoints(unittest.TestCase):
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
         assert_np_equal(state.body_q.numpy()[child], np.array(child_body_xform), tol=1.0e-5)
 
-    @mock.patch("newton.use_coord_layout_targets", True)
     def test_joint_target_q_qd_shape_with_free_and_ball_joints(self):
         """Match position targets to coordinates and velocity targets to DOFs.
 

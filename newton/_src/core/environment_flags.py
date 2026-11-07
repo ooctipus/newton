@@ -147,7 +147,7 @@ NEWTON_FLAGS = declare(
     EnvironmentFlag(
         "NEWTON_CACHE_PATH",
         "policy",
-        ("utils.download_assets",),
+        ("newton.config",),
         "Directory for downloaded assets (default: the user cache directory).",
     ),
     EnvironmentFlag(
@@ -173,18 +173,6 @@ NEWTON_FLAGS = declare(
         "policy",
         _NARROW,
         "=0 keeps the unculled tiled heightfield midphase (default 1).",
-    ),
-    EnvironmentFlag(
-        "NEWTON_HEIGHTFIELD_CONVEX_CELLS",
-        "experiment",
-        _NARROW,
-        "=1 requests the terrain convex-cells owner; requires the typed primitive query.",
-    ),
-    EnvironmentFlag(
-        "NEWTON_HEIGHTFIELD_CONVEX_SPLIT",
-        "policy",
-        (*_NARROW, *_COLLIDE),
-        "Staged convex terrain queries: 1 on, 0 off; unset lets the collision pipeline decide.",
     ),
     EnvironmentFlag(
         "NEWTON_HEIGHTFIELD_CYLINDER_SPLIT",
@@ -260,12 +248,6 @@ NEWTON_FLAGS = declare(
         "=1 compiles diagnostic counters into the coherent convex filter.",
     ),
     EnvironmentFlag(
-        "NEWTON_NARROW_PHASE_CONVEX_CELLS",
-        "experiment",
-        _COLLIDE,
-        "=1 replaces rejection-route support scans with direction cells; convex_collision overrides it.",
-    ),
-    EnvironmentFlag(
         "NEWTON_NARROW_PHASE_PACKED_HEIGHTFIELD_PAIRS",
         "policy",
         _NARROW,
@@ -280,8 +262,8 @@ NEWTON_FLAGS = declare(
     EnvironmentFlag(
         "NEWTON_PROFILE",
         "diagnostic",
-        ("sensors.sensor_tiled_camera", "viewer.viewer_rtx"),
-        "Values other than 0 enable renderer profiling output.",
+        ("sensors.sensor_camera", "sensors.sensor_tiled_camera", "solvers.steel.solver_steel", "viewer.viewer_rtx"),
+        "Values other than 0 enable renderer and SolverSteel profiling ranges.",
     ),
     EnvironmentFlag(
         "NEWTON_REDUCER_COMPACT_EXPORT",

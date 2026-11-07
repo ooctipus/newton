@@ -1101,9 +1101,9 @@ class Model:
         self._shape_contact_pair_count: int = 0
         self._shape_contact_pair_counts: dict[bytes | tuple[bytes, int | None] | None, np.ndarray] = {}
         self._shape_contact_pair_templates: ShapePairTemplates | None = None
-        """Per-world templates that :meth:`ModelBuilder.finalize` replayed into :attr:`shape_contact_pairs`.
+        """Per-world templates that the first access of :attr:`shape_contact_pairs` replayed into the list.
 
-        ``None`` when the list was built otherwise; the collision pipeline tests the
+        ``None`` while the list is unbuilt or was assigned; the collision pipeline tests the
         templates instead of streaming the list while they still describe it.
         """
         self.shape_world: wp.array[wp.int32] | None = None
@@ -1575,12 +1575,6 @@ class Model:
         """
         self.joint_damping: wp.array[wp.float32] | None = None
         """Passive velocity damping [N·s/m or N·m·s/rad, depending on joint type] always active on the joint, shape [joint_dof_count], float."""
-        self.joint_spring_stiffness: wp.array[wp.float32] | None = None
-        """Passive spring stiffness [N/m or N·m/rad, depending on joint type] always active on the joint,
-        applying ``k * (joint_spring_ref - q)``; 0 disables the spring. Shape [joint_dof_count], float."""
-        self.joint_spring_ref: wp.array[wp.float32] | None = None
-        """Passive spring reference (rest) position [m or rad, depending on joint type]. May lie outside the
-        joint limits to preload the joint against a limit, shape [joint_dof_count], float."""
         self.joint_effort_limit: wp.array[wp.float32] | None = None
         """Joint effort (force/torque) limits [N or N·m, depending on joint type], shape [joint_dof_count], float."""
         self.joint_velocity_limit: wp.array[wp.float32] | None = None
@@ -1961,8 +1955,10 @@ class Model:
                     "Initialize model.shape_contact_pairs before CUDA graph capture, "
                     "for example by constructing the explicit CollisionPipeline before capture."
                 )
-            pairs = wp.array(topology.build_pairs(), dtype=wp.vec2i, device=self.device, copy=False)
+            pair_list, templates = topology.build_pair_templates()
+            pairs = wp.array(pair_list, dtype=wp.vec2i, device=self.device, copy=False)
             self._shape_contact_pairs = pairs
+            self._shape_contact_pair_templates = templates.bind(pairs)
         return pairs
 
     @shape_contact_pairs.setter

@@ -38,7 +38,6 @@ test_contact_reduction_overflow
 test_contact_reduction_reference
 test_control_force
 test_controllers_joint_impedance
-test_convex_cells
 test_convex_rejection_cache
 test_coupled_solver
 test_edge_redundancy
@@ -80,7 +79,7 @@ test_gjk_small_simplex
 test_heightfield
 test_heightfield_capsule_contact
 test_heightfield_cell_reject
-test_heightfield_convex_cells
+test_heightfield_cell_reject_routes
 test_heightfield_cylinder_split
 test_heightfield_geometric_cull
 test_heightfield_lane_midphase

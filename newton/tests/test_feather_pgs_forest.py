@@ -932,10 +932,11 @@ class TestLiveArrays(unittest.TestCase):
             ("joint_effort_limit", 11.0),
             ("joint_velocity_limit", 12.0),
             ("joint_damping", 13.0),
-            ("joint_spring_stiffness", 14.0),
-            ("joint_spring_ref", 15.0),
+            ("joint_stiffness", 14.0),
+            ("joint_rest_q", 15.0),
         )
-        dofs = cut._orders[newton.Model.AttributeFrequency.JOINT_DOF]
+        frequency = newton.Model.AttributeFrequency
+        orders = {"joint_rest_q": cut._orders[frequency.JOINT_COORD]}
         for name, value in cases:
             values = getattr(model, name).numpy()
             values[:] = np.arange(values.size) + value
@@ -943,7 +944,8 @@ class TestLiveArrays(unittest.TestCase):
         self._entered(model, cut)
         for name, _ in cases:
             with self.subTest(name=name):
-                np.testing.assert_array_equal(getattr(cut.model, name).numpy(), getattr(model, name).numpy()[dofs])
+                order = orders.get(name, cut._orders[frequency.JOINT_DOF])
+                np.testing.assert_array_equal(getattr(cut.model, name).numpy(), getattr(model, name).numpy()[order])
 
     def test_a_frame_reaches_the_forest_at_the_next_step(self):
         builder, loop = _two_roots()

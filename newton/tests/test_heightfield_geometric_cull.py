@@ -18,7 +18,7 @@ from newton._src.geometry import heightfield_geometric as geometric
 from newton._src.geometry.contact_reduction_global import BETA_THRESHOLD
 from newton._src.geometry.narrow_phase import NarrowPhase, write_contact_simple
 from newton._src.utils.heightfield import HeightfieldData
-from newton.tests.test_heightfield_cell_reject import make_model
+from newton.tests.test_heightfield_cell_reject_routes import make_model
 from newton.tests.test_heightfield_packed_pairs import logical
 
 # Recorded G1 terrain geometry (96 stratified pairs per GPU arm); the saved-current check skips without it.

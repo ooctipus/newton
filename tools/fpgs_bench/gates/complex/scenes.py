@@ -80,7 +80,6 @@ class Scene:
     info: dict = field(default_factory=dict)
     law_record: dict = field(default_factory=dict)
     end_report: Callable[[], dict] | None = None
-    after_perturb: Callable[[], None] | None = None  # re-run construction steps that read the initial state
 
 
 def plain(value):
@@ -244,16 +243,7 @@ def build_clutter(name, law, world_count, *, cpu_smoke=False, object_count=None,
     focus = FOCUS_GROUP[name] if FOCUS_GROUP[name] in groups or FOCUS_GROUP[name] == "objects" else "objects"
 
     def end_report():
-        out = {"collision_buffers": ex.pipeline.narrow_phase.buffer_capacity_status()}
-        if ex.body_pair_reduction:
-            out["body_pair_reduction"] = plain(ex.pipeline.body_pair_reduction_stats())
-        return out
-
-    def after_perturb():
-        # Example.__init__ primes the body-pair reduction with one collide of the initial state. dt is the time to the
-        # next collide (one substep); a speculative pipeline requires it, the others ignore it.
-        if ex.body_pair_reduction:
-            ex.pipeline.collide(ex.state_0, ex.contacts, dt=ex.sim_dt)
+        return {"collision_buffers": ex.pipeline.narrow_phase.buffer_capacity_status()}
 
     return Scene(
         case=name,
@@ -301,7 +291,6 @@ def build_clutter(name, law, world_count, *, cpu_smoke=False, object_count=None,
         },
         law_record=record,
         end_report=end_report,
-        after_perturb=after_perturb,
     )
 
 
@@ -338,7 +327,6 @@ def build_pyramid(
     import newton  # noqa: PLC0415
     from newton.examples.contacts import example_pyramid as P  # noqa: PLC0415
 
-    newton.use_coord_layout_targets = True
     start = time.perf_counter()
     tilt = math.radians(tilt_deg)
     gravity = (9.81 * math.sin(tilt), 0.0, -9.81 * math.cos(tilt))
@@ -508,8 +496,6 @@ def perturb_initial_poses(scene: Scene, *, seed: int, xy_mm: float, lift_mm: flo
     error = max(float(np.abs(after[b, :3] - expected[b][:3]).max()) for b in moved)
     if error > 1e-5:
         raise RuntimeError(f"forward kinematics did not reproduce the perturbed poses (error {error:.2e} m)")
-    if scene.after_perturb is not None:
-        scene.after_perturb()
     shift = np.linalg.norm(after[moved, :3] - body_q[moved, :3], axis=1) * 1e3
     return {
         **record,

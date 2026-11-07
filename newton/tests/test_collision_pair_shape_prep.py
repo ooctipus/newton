@@ -129,7 +129,7 @@ class TestCollisionPairShapePrep(unittest.TestCase):
     def test_reject_speculative(self):
         """Reject speculative preprocessing that writes all shape AABBs."""
         with self.assertRaisesRegex(ValueError, "requires internal explicit"):
-            self._pipeline(self._model(), speculative_config=newton.CollisionPipeline.SpeculativeContactConfig())
+            self._pipeline(self._model(), speculative_contact_gap_max=0.1)
 
     def test_reject_gradients(self):
         """Reject gradients from the initial experimental preparation mode."""

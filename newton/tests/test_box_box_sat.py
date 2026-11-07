@@ -206,7 +206,7 @@ def test_box_box_sat_speculative_approach(test: unittest.TestCase, device):
             deterministic=True,
             contact_matching="latest",
             box_box_sat=True,
-            speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(),
+            speculative_contact_gap_max=0.1,
         )
         contacts = pipeline.contacts()
         solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8, pgs_warmstart=True)

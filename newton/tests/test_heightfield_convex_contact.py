@@ -70,6 +70,7 @@ def _compare_pairs(
             1,
             0.0,
             0.0,
+            support.SupportMapDataProvider(),
             generic,
             tid,
             0,
@@ -277,7 +278,7 @@ class TestHeightfieldConvexContact(unittest.TestCase):
         self.check_random_pairs("cuda:0")
 
     def test_kernel_selection(self):
-        """Convex hulls get a typed analytic query; the convex-cells owner keeps them when requested."""
+        """Convex hulls get a typed analytic query inside the fallback scan, or the generic query by default."""
         analytic = create_mesh_triangle_contacts_to_reducer_kernel(int(newton.GeoType.CONVEX_MESH), analytic=True)
         generic = create_mesh_triangle_contacts_to_reducer_kernel(int(newton.GeoType.CONVEX_MESH), analytic=False)
         self.assertIsNot(analytic, generic)
@@ -292,10 +293,6 @@ class TestHeightfieldConvexContact(unittest.TestCase):
         with patch.dict(os.environ, {"NEWTON_HEIGHTFIELD_ANALYTIC_CONVEX": "1"}):
             enabled = create_mesh_triangle_contacts_to_reducer_kernel(exclude_primitives=True)
         self.assertIs(enabled, fallback)
-        without = create_mesh_triangle_contacts_to_reducer_kernel(
-            exclude_primitives=True, exclude_heightfield_convex=True, analytic=True
-        )
-        self.assertTrue(without.key.endswith("fallback_kernel_without_hfield_convex"))
 
     def check_resting(self, device):
         """A foot hull settles sole-down at the same height and place through both queries, also over small cells."""

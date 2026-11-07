@@ -433,7 +433,6 @@ class BodyCut:
         self._body_map = mapped(bodies.size, indices(bodies), identity)
         self._dof_map = mapped(dofs.shape[0], dofs, identity)
         self._coord_map = mapped(coords.shape[0], coords, identity)
-        self._target_map = self._coord_map if source.use_coord_layout_targets else self._dof_map
         self._publish_q = mapped(q_start[bounds[-1]], identity, coords)
         self._publish_qd = mapped(qd_start[bounds[-1]], identity, dofs)
         self._seat_map = mapped(loops.size, indices(self.primary), indices(self.shadow), self._seated_links)
@@ -593,7 +592,7 @@ class BodyCut:
             self._controls[control] = mirror
         for name, map_ in (
             ("joint_f", self._dof_map),
-            ("joint_target_q", self._target_map),
+            ("joint_target_q", self._coord_map),
             ("joint_target_qd", self._dof_map),
             ("joint_act", self._dof_map),
         ):

@@ -184,6 +184,23 @@ def _immovable(shape: str) -> str:
     )
 
 
+def _body_code(shape: str) -> str:
+    """C++ for a shape's body code, ``2 * body + immovable`` (-1 for a static shape); read only with shape bodies.
+
+    Two shapes' codes are equal exactly when they share a body or are both static, the pairs
+    ``is_shape_pair_same_body_filtered`` and ``is_shape_pair_immovable_filtered`` always drop; the low bit is
+    the immovable test the latter adds without static-kinematic pairs.
+    """
+    return f"(2 * shape_body.data[{shape}] + ({_immovable(shape)} ? 1 : 0))"
+
+
+# The flat kernel's rules on an overlapping pair of body codes ``fa`` and ``fb``: the write path drops a pair of one
+# body (both static included) and, without static-kinematic pairs, a pair of immovable shapes; the forecast
+# (forecast_count) applies only is_shape_pair_immovable_filtered: both static, or both immovable without them.
+_KEEP = "(fa != fb && !(immovable_filter && (fa & fb & 1) != 0))"
+_FORECAST_DROP = "((fa < 0 && fb < 0) || (immovable_filter && (fa & fb & 1) != 0))"
+
+
 # The global-global pairs, tested from the explicit list itself: the leading
 # global_blocks blocks take global_chunk consecutive pairs each, so a long
 # global list spreads over the GPU as in the flat kernel. Blocks run in
@@ -207,7 +224,11 @@ _TEMPLATE_GLOBAL = f"""
                 const wp::vec3 ub = upper.data[b];
                 hit = la[0] <= ub[0] && ua[0] >= lb[0] && la[1] <= ub[1] && ua[1] >= lb[1] && la[2] <= ub[2]
                     && ua[2] >= lb[2];
-                if (hit && immovable_filter) hit = !({_immovable("a")} && {_immovable("b")});FORECAST_GLOBAL
+                if (hit && bodies) {{
+                    const int fa = {_body_code("a")};
+                    const int fb = {_body_code("b")};
+                    hit = {_KEEP};
+                }}FORECAST_GLOBAL
             }}
 APPEND
         }}FLUSH
@@ -231,7 +252,7 @@ _TEMPLATE_WORLD = """
         const int base = group * SLOTS;
 """
 
-# Stage the world's referenced AABBs, shape ids and immovable flags once.
+# Stage the world's referenced AABBs, shape ids and body codes once.
 _TEMPLATE_STAGE = f"""
         for (int i = LANE; i < stage_count; i += STEP) {{
             const int code = data.stage.data[stage_begin + i];
@@ -245,37 +266,39 @@ _TEMPLATE_STAGE = f"""
             s_uy[base + i] = hi[1];
             s_uz[base + i] = hi[2];
             s_shape[base + i] = shape;
-            s_fixed[base + i] = immovable_filter && {_immovable("shape")};FORECAST_STAGE
+            s_fixed[base + i] = bodies ? {_body_code("shape")} : 0;FORECAST_STAGE
         }}
 """
 
 # Test the template's entries in explicit-list order. The overlap test is
 # check_aabb_overlap's with zero gaps (x + 0 compares like x) and is symmetric
 # in its two boxes; the pair is written as (min, max), as the list stores it.
-_TEMPLATE_TEST = """
-        for (int e0 = 0; e0 < entry_count; e0 += STEP) {
+_TEMPLATE_TEST = f"""
+        for (int e0 = 0; e0 < entry_count; e0 += STEP) {{
             const int e = e0 + LANE;
             bool hit = false;
             int a = 0, b = 0;
-            if (e < entry_count) {
+            if (e < entry_count) {{
                 const unsigned int packed = (unsigned int)data.entries.data[entry_begin + e];
                 const int ia = base + (int)(packed & 0xffffu);
                 const int ib = base + (int)(packed >> 16);
                 hit = s_lx[ia] <= s_ux[ib] && s_ux[ia] >= s_lx[ib] && s_ly[ia] <= s_uy[ib] && s_uy[ia] >= s_ly[ib]
                     && s_lz[ia] <= s_uz[ib] && s_uz[ia] >= s_lz[ib];
-                if (hit && immovable_filter) hit = !(s_fixed[ia] && s_fixed[ib]);FORECAST_TEST
-                if (hit) {
+                const int fa = s_fixed[ia];
+                const int fb = s_fixed[ib];
+                if (hit && bodies) hit = {_KEEP};FORECAST_TEST
+                if (hit) {{
                     a = s_shape[ia];
                     b = s_shape[ib];
-                    if (a > b) {
+                    if (a > b) {{
                         const int swap = a;
                         a = b;
                         b = swap;
-                    }
-                }
-            }
+                    }}
+                }}
+            }}
 APPEND
-        }
+        }}
 """
 
 # write_pair's contract with one atomic per warp: the count advances by every
@@ -361,7 +384,11 @@ _FORECAST_GLOBAL = f"""
                     int contacts = fc_pair(a, b, forecast.word.data[a], forecast.word.data[b],
                         forecast.reach.data[a] + forecast.reach.data[b], la[0], la[1], la[2], ua[0], ua[1], ua[2],
                         lb[0], lb[1], lb[2], ub[0], ub[1], ub[2]);
-                    if (contacts != 0 && immovable_filter && {_immovable("a")} && {_immovable("b")}) contacts = 0;
+                    if (contacts != 0 && bodies) {{
+                        const int fa = {_body_code("a")};
+                        const int fb = {_body_code("b")};
+                        if {_FORECAST_DROP} contacts = 0;
+                    }}
                     fc_add(contacts);
                 }}"""
 
@@ -371,14 +398,14 @@ _FORECAST_STAGE = """
                 s_fv[base + i] = forecast.reach.data[shape];
             }"""
 
-_FORECAST_TEST = """
-                if (fc_on) {
+_FORECAST_TEST = f"""
+                if (fc_on) {{
                     int contacts = fc_pair(s_shape[ia], s_shape[ib], s_fw[ia], s_fw[ib], s_fv[ia] + s_fv[ib], s_lx[ia],
                         s_ly[ia], s_lz[ia], s_ux[ia], s_uy[ia], s_uz[ia], s_lx[ib], s_ly[ib], s_lz[ib], s_ux[ib],
                         s_uy[ib], s_uz[ib]);
-                    if (contacts != 0 && immovable_filter && s_fixed[ia] && s_fixed[ib]) contacts = 0;
+                    if (contacts != 0 && bodies && {_FORECAST_DROP}) contacts = 0;
                     fc_add(contacts);
-                }"""
+                }}"""
 
 # A warp adds each of its lanes' two forecast sums in one atomic, into its counter in that sum's half (the pairs within
 # reach in the first, those whose boxes overlap now in the second); on CPU the block adds its own.
@@ -425,6 +452,7 @@ def _pair_template_source(slots: int, threads: int, worlds: int, forecast: bool 
         names = ("s_lx", "s_ly", "s_lz", "s_ux", "s_uy", "s_uz") + (("s_fv",) if forecast else ())
         lines = [f"    {qualifier}float {name}[{capacity}];" for name in names]
         lines += [f"    {qualifier}int s_shape[{capacity}];", f"    {qualifier}int s_fixed[{capacity}];"]
+        lines += ["    const bool bodies = shape_body.shape[0] > 0;"]
         if forecast:
             lines += [f"    {qualifier}int s_fw[{capacity}];"]
         return "\n".join(lines) + "\n" + (_FORECAST_PAIR if forecast else "")
@@ -1181,8 +1209,8 @@ def replay_shape_pair_templates(
 class ShapePairTemplates:
     """Per-world pair templates that replay into an explicit pair list.
 
-    :meth:`~newton.ModelBuilder.finalize` keeps them on the model next to the
-    ``shape_contact_pairs`` array it replayed them into, so
+    The model keeps them next to the ``shape_contact_pairs`` array its first
+    access built from them, so
     :class:`~newton.CollisionPipeline` can test the templates instead of
     streaming that array.
     """
@@ -1256,7 +1284,7 @@ class BroadPhaseExplicitTemplates:
     not streamed. The global-global pairs that lead the list are read from it, a
     chunk per leading block. Built from :class:`ShapePairTemplates` and verified
     against the list they replay into, it tests exactly that list's pairs with the
-    overlap and immovable-pair rules of :class:`BroadPhaseExplicit` and writes them
+    overlap, same-body and immovable-pair rules of :class:`BroadPhaseExplicit` and writes them
     as the list stores them. Only the order of the output differs on CUDA, where it
     is set by atomics in both kernels; on CPU the output equals
     :class:`BroadPhaseExplicit`'s. AABBs must be pre-expanded: per-shape gaps and

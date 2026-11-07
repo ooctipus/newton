@@ -110,7 +110,6 @@ test_generate_api
 test_hashtable
 test_heightfield_box_contact
 test_heightfield_convex_contact
-test_heightfield_convex_split
 test_heightfield_cylinder_contact
 test_heightfield_primitive_query
 test_heightfield_query_factories

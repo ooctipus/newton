@@ -2292,17 +2292,16 @@ _add_tests(TestTreeInvariantsCUDA)
 # =====================================================================================================================
 
 
-def _mixed_target_model(coord_layout, device):
+def _mixed_target_model(device):
     """Place scalar drives before and after free/ball joints in two worlds."""
-    with mock.patch.object(newton, "use_coord_layout_targets", coord_layout):
-        scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-        for joint_kind in ("revolute", "free", "ball", "revolute"):
-            body = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
-            joint = getattr(scene, f"add_joint_{joint_kind}")(parent=-1, child=body)
-            scene.add_articulation([joint])
-        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-        builder.replicate(scene, 2)
-        model = builder.finalize(device=device)
+    scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    for joint_kind in ("revolute", "free", "ball", "revolute"):
+        body = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        joint = getattr(scene, f"add_joint_{joint_kind}")(parent=-1, child=body)
+        scene.add_articulation([joint])
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.replicate(scene, 2)
+    model = builder.finalize(device=device)
     joints = np.flatnonzero(model.joint_type.numpy() == int(JointType.REVOLUTE))
     dofs = model.joint_qd_start.numpy()[joints]
     coords = model.joint_q_start.numpy()[joints]
@@ -2339,78 +2338,64 @@ def _drive_rows(row_K, articulations, dofs, device):
 
 
 class TestFeatherPGSAugmentedDrives(unittest.TestCase):
-    def test_mixed_joint_target_layout_trajectories(self):
-        """Match public solver trajectories across both target layouts."""
-        trajectories = []
-        for coord_layout in (False, True):
-            model, state, control, _joints, dofs, coords, targets = _mixed_target_model(coord_layout, wp.get_device())
-            solver = newton.solvers.SolverFeatherPGS(
-                model,
-                enable_joint_limits=False,
-                dense_max_constraints=16,
-                mf_max_constraints=16,
-                pgs_iterations=8,
-            )
-            initial_qd = state.joint_qd.numpy()[dofs].copy()
-            position_error = control.joint_target_q.numpy()[targets] - state.joint_q.numpy()[coords]
-            following = model.state()
-            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-            history = []
-            for step in range(3):
-                state.clear_forces()
-                solver.step(state, following, control, None, 0.01)
-                state, following = following, state
-                q, qd = state.joint_q.numpy(), state.joint_qd.numpy()
-                if step == 0:
-                    self.assertTrue(np.all((qd[dofs] - initial_qd) * position_error > 0.0))
-                history.append(np.concatenate((q, qd)))
-            trajectories.append(history)
-        np.testing.assert_allclose(trajectories[0], trajectories[1], rtol=0.0, atol=2e-6)
+    def test_mixed_joint_targets_drive_toward_their_coordinates(self):
+        """Drive each scalar joint toward its own coordinate target after free and ball coordinates."""
+        model, state, control, _joints, dofs, coords, targets = _mixed_target_model(wp.get_device())
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            enable_joint_limits=False,
+            dense_max_constraints=16,
+            mf_max_constraints=16,
+            pgs_iterations=8,
+        )
+        initial_qd = state.joint_qd.numpy()[dofs].copy()
+        position_error = control.joint_target_q.numpy()[targets] - state.joint_q.numpy()[coords]
+        following = model.state()
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        state.clear_forces()
+        solver.step(state, following, control, None, 0.01)
+        self.assertTrue(np.all((following.joint_qd.numpy()[dofs] - initial_qd) * position_error > 0.0))
 
-    def test_mixed_joint_position_target_layouts(self):
+    def test_mixed_joint_position_targets(self):
         """Keep distinct world targets aligned after free and ball coordinates."""
         device, dt = wp.get_device(), 0.01
-        for coord_layout in (False, True):
-            model, state, control, joints, dofs, coords, targets = _mixed_target_model(coord_layout, device)
-            max_dofs = 6
-            row_count = model.articulation_count * max_dofs
-            expected = np.zeros(model.joint_dof_count)
-            expected[dofs] = 20.0 * (
-                control.joint_target_q.numpy()[targets]
-                - state.joint_q.numpy()[coords]
-                - dt * state.joint_qd.numpy()[dofs]
-            ) + 3.0 * (control.joint_target_qd.numpy()[dofs] - state.joint_qd.numpy()[dofs])
-            with self.subTest(coord_layout=coord_layout):
-                row_K = wp.zeros(row_count, dtype=float, device=device)
-                tau = wp.zeros(model.joint_dof_count, dtype=float, device=device)
-                rows = np.full(model.joint_dof_count, -1, dtype=np.int32)
-                q_indices = np.zeros(model.joint_dof_count, dtype=np.int32)
-                target_indices = np.zeros(model.joint_dof_count, dtype=np.int32)
-                rows[dofs], q_indices[dofs] = joints * max_dofs, coords
-                target_indices[dofs] = targets
-                wp.launch(
-                    prepare_augmented_drives,
-                    dim=model.joint_dof_count,
-                    inputs=[
-                        wp.array(np.arange(model.joint_dof_count, dtype=np.int32), dtype=int, device=device),
-                        wp.array(rows, dtype=int, device=device),
-                        wp.array(q_indices, dtype=int, device=device),
-                        wp.array(target_indices, dtype=int, device=device),
-                        state.joint_q,
-                        state.joint_qd,
-                        model.joint_target_ke,
-                        model.joint_target_kd,
-                        control.joint_target_q,
-                        control.joint_target_qd,
-                        model.joint_effort_limit,
-                        wp.zeros(model.joint_dof_count, dtype=float, device=device),
-                        max_dofs,
-                        dt,
-                    ],
-                    outputs=[_drive_rows(row_K, model.articulation_count, model.joint_dof_count, device), tau],
-                    device=device,
-                )
-                np.testing.assert_allclose(tau.numpy(), expected, rtol=0, atol=2e-6)
+        model, state, control, joints, dofs, coords, targets = _mixed_target_model(device)
+        max_dofs = 6
+        row_count = model.articulation_count * max_dofs
+        expected = np.zeros(model.joint_dof_count)
+        expected[dofs] = 20.0 * (
+            control.joint_target_q.numpy()[targets] - state.joint_q.numpy()[coords] - dt * state.joint_qd.numpy()[dofs]
+        ) + 3.0 * (control.joint_target_qd.numpy()[dofs] - state.joint_qd.numpy()[dofs])
+        row_K = wp.zeros(row_count, dtype=float, device=device)
+        tau = wp.zeros(model.joint_dof_count, dtype=float, device=device)
+        rows = np.full(model.joint_dof_count, -1, dtype=np.int32)
+        q_indices = np.zeros(model.joint_dof_count, dtype=np.int32)
+        target_indices = np.zeros(model.joint_dof_count, dtype=np.int32)
+        rows[dofs], q_indices[dofs] = joints * max_dofs, coords
+        target_indices[dofs] = targets
+        wp.launch(
+            prepare_augmented_drives,
+            dim=model.joint_dof_count,
+            inputs=[
+                wp.array(np.arange(model.joint_dof_count, dtype=np.int32), dtype=int, device=device),
+                wp.array(rows, dtype=int, device=device),
+                wp.array(q_indices, dtype=int, device=device),
+                wp.array(target_indices, dtype=int, device=device),
+                state.joint_q,
+                state.joint_qd,
+                model.joint_target_ke,
+                model.joint_target_kd,
+                control.joint_target_q,
+                control.joint_target_qd,
+                model.joint_effort_limit,
+                wp.zeros(model.joint_dof_count, dtype=float, device=device),
+                max_dofs,
+                dt,
+            ],
+            outputs=[_drive_rows(row_K, model.articulation_count, model.joint_dof_count, device), tau],
+            device=device,
+        )
+        np.testing.assert_allclose(tau.numpy(), expected, rtol=0, atol=2e-6)
 
     def test_per_coordinate_drives(self):
         """Write each coordinate's K and clamped force from its row, clear both without gains, and request a factor
