@@ -502,9 +502,28 @@ class TestExitLaw(unittest.TestCase):
         body, _ = plain.source()
         self.assertNotIn("s_selected_words", body)
         self.assertNotIn("consumed_tangent", body)
-        for switch in ("active_rows", "contact_units"):
+        for switch, value in (("active_rows", True), ("contact_units", True), ("block_worlds", 2)):
             with self.subTest(switch=switch), self.assertRaises(ValueError):
-                sweep_routes.GeneralSweep(64, 32, 12, "120", levels=LevelLaw(EXACT), **{switch: True})
+                sweep_routes.GeneralSweep(64, 32, 12, "120", levels=LevelLaw(EXACT), **{switch: value})
+
+    def test_general_sweep_holds_two_worlds_a_block(self):
+        """Two worlds a block of the warp mapping (``block_worlds``): a warp each with its own copy of the stage, the
+        dispatch's lane groups walking the claim's queue, at the sparse sweeps' register line; one thread a world on
+        the CPU, whose kernel is the one-world block's."""
+        one = sweep_routes.GeneralSweep(64, 32, 12, "120", torsion=True)
+        two = dataclasses.replace(one, block_worlds=sweep_routes.BLOCK_WORLDS)
+        self.assertEqual(two.name, one.name.replace("_torsion_", "_torsion_w2_"))
+        work = two.work(0)
+        self.assertEqual((work.block, work.registers, two.groups), (64, sweep_routes.WARP_LINE, 2))
+        body, staging = two.source()
+        self.assertEqual((staging.groups, staging.threads), (2, 64))
+        self.assertIn("float* s_v = s_v_storage + SUB * 12;", body)
+        self.assertIn("world_at = block * 2 + lane // 32", two.dispatch(staging).body)
+        cpu = (dataclasses.replace(one, device_arch="0"), dataclasses.replace(two, device_arch="0"))
+        self.assertEqual(cpu[1].groups, 1)
+        self.assertEqual(cpu[0].source()[0], cpu[1].source()[0])
+        with self.assertRaises(ValueError):
+            dataclasses.replace(one, block_worlds=3)
 
 
 class TestSolveReadoutRecord(unittest.TestCase):

@@ -62,10 +62,15 @@ _LINE_ADMISSION = f"if (row_type == {ROW_JOINT_VELOCITY_LIMIT} || row_type == {R
 _MF_ADMISSION = f"if (mf_rt == {ROW_SPEED}) continue;"
 
 
-def worlds() -> kernel_template.Dispatch:
+def worlds(groups: int | None = None, lanes: int | None = None) -> kernel_template.Dispatch:
     """The worlds a sweep launch covers: its claim's bucket of the claims' worlds (:func:`.sweep_levels.claim_worlds`),
-    a device list (``general_worlds``, its count first) walked with the grid's stride."""
-    return kernel_template.items("world", queue=("general_world_count", "general_world_grid_stride", "general_worlds"))
+    a device list (``general_worlds``, its count first) walked with the grid's stride (``groups`` worlds a block)."""
+    return kernel_template.items(
+        "world",
+        groups=groups,
+        lanes=lanes,
+        queue=("general_world_count", "general_world_grid_stride", "general_worlds"),
+    )
 
 
 MF_GS_ABI = kernel_template.params(
@@ -274,6 +279,12 @@ def free_body_rows(lanes: Lanes, support: int | str = 12) -> SparseFactor:
         fused_pair_apply=False,
     )
 
+
+BLOCK_WORLDS = 2
+"""Worlds of the warp mapping's block where their working sets fit (:attr:`GeneralSweep.block_worlds`), a warp each."""
+
+WARP_LINE = 64
+"""Its register line then: the sparse sweeps' (:data:`.sweep_routes_sparse.REGISTER_LINE`), 32 warps resident."""
 
 COLORED_THREADS = 256
 """Threads of a colored world's block: a color's units beyond them run in turns."""
@@ -660,10 +671,12 @@ def mf_gs_staging(
     wide_rows: bool = False,
     free_rows: bool = True,
     active_rows: bool = False,
+    groups: int = 1,
 ) -> Staging:
     """The shared working set of a world's matrix-free sweep block (:func:`mf_gs_source` declares it): the world's
     velocity, its dense rows' impulses and staged metadata, the free bodies' run's impulses (``free_rows``) unless they
-    stream, ``colored`` the colors' staged offsets (and its trace's warp maxima), ``active_rows`` the active bitsets."""
+    stream, ``colored`` the colors' staged offsets (and its trace's warp maxima), ``active_rows`` the active
+    enumeration's bitsets, for ``groups`` worlds a block."""
     dense = WorldRows(max_constraints, staging=places.staging, stream=places.dense_impulses is Place.GLOBAL)
     free = WorldRows(
         mf_max_constraints, staging="record", free=True, stream=places.impulses is Place.GLOBAL or not free_rows
@@ -682,7 +695,8 @@ def mf_gs_staging(
             *levels,
             *(active_words(max_constraints) if active_rows else ()),
         ),
-        threads=COLORED_THREADS if colored else 32,
+        **({"threads": COLORED_THREADS} if colored else {"threads": 32 * groups}),
+        **({"groups": groups, "layout": "arrays"} if groups > 1 else {}),
     )
 
 
@@ -723,6 +737,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         wide_rows=wide_rows,
         free_rows=free_rows,
         active_rows=sweep.active_rows,
+        groups=sweep.groups,
     )
 
     dense_count = "int m_dense = world_constraint_count.data[world];"
@@ -996,8 +1011,8 @@ class GeneralSweep(SweepConfig):
       6 class: ``free_rows`` their own run, else rows of the line, their ``speed_rows`` the line's last;
     - ``has_dense_velocity_limit_rows``: the velocity limits' last word; ``seeded``: the seed; ``pitch``: the line.
 
-    The warp mapping is a warp a world on CUDA and one thread on the CPU (:meth:`work`); the colored one a block of
-    :data:`COLORED_THREADS`. Each walks its bucket of the claims' worlds (:func:`worlds`).
+    The warp mapping is a warp a world on CUDA (``block_worlds`` a block) and one thread on the CPU (:meth:`work`); the
+    colored one a block of :data:`COLORED_THREADS`. Each walks its bucket of the claims' worlds (:func:`worlds`).
     """
 
     max_constraints: int
@@ -1012,6 +1027,7 @@ class GeneralSweep(SweepConfig):
     wide_rows: bool = False
     support_classes: bool = False
     contact_units: bool = False
+    block_worlds: int = 1
     pitch: int | None = None
     free_rows: bool = True
     speed_rows: bool = False
@@ -1024,8 +1040,12 @@ class GeneralSweep(SweepConfig):
         validate_record_coordinates(self.max_world_dofs)
         if self.material and not self.weighted:
             raise ValueError("material contacts step by their weights: their sweeps are weighted")
-        if self.colored and (self.active_rows or self.contact_units):
-            raise ValueError("the colored mapping visits every dense row in turn: its exit votes over the block")
+        if self.colored and (self.active_rows or self.contact_units or self.block_worlds != 1):
+            raise ValueError(
+                "the colored mapping visits every dense row in turn, a world a block: its exit votes over it"
+            )
+        if self.block_worlds not in (1, BLOCK_WORLDS):
+            raise ValueError(f"the warp mapping's block holds 1 or {BLOCK_WORLDS} worlds, got {self.block_worlds}")
         dofs = self.max_world_dofs if self.max_row_dofs is None else self.max_row_dofs
         object.__setattr__(self, "max_row_dofs", int(dofs))
 
@@ -1038,6 +1058,11 @@ class GeneralSweep(SweepConfig):
         """A world's lanes: the colored mapping's block of warps, the warp mapping's warp on CUDA and one thread on the
         CPU (:func:`.execution.device_lanes`), which runs the world on either device."""
         return 32 if self.colored else device_lanes(self.device_arch)
+
+    @property
+    def groups(self) -> int:
+        """Worlds a block on the device: ``block_worlds`` on CUDA, one on the CPU (:func:`.execution.device_lanes`)."""
+        return device_lanes(self.device_arch, self.block_worlds)
 
     @property
     def ABI(self) -> tuple:
@@ -1067,6 +1092,7 @@ class GeneralSweep(SweepConfig):
             + ("_classes" if self.support_classes else "")
             + ("_active" if self.active_rows else "")
             + ("_units" if self.contact_units else "")
+            + (f"_w{self.block_worlds}" if self.block_worlds > 1 else "")
             + (f"_p{pitch}" if pitch is not None and pitch != M + MF else "")
             + ("" if self.free_rows else "_line")
             + ("_speed" if self.speed_rows else "")
@@ -1077,7 +1103,7 @@ class GeneralSweep(SweepConfig):
     source = mf_gs_source
 
     def dispatch(self, staging: Staging) -> Dispatch:
-        return worlds()
+        return worlds(self.groups, self.lanes) if self.groups > 1 else worlds()
 
     def operands(self) -> tuple[RowArgument, ...]:
         return (
@@ -1101,4 +1127,7 @@ class GeneralSweep(SweepConfig):
         a multiprocessor). The warp mapping: a warp a world on a persistent grid; no register line."""
         if self.colored:
             return Work(int(items), lanes=COLORED_THREADS, registers=REGISTERS_PER_THREAD, shared=int(shared))
+        if self.block_worlds > 1:
+            block = 32 * self.block_worlds
+            return Work(int(items), lanes=32, block=block, registers=WARP_LINE, persistent=True, shared=int(shared))
         return Work(int(items), lanes=32, block=32, persistent=True)

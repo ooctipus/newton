@@ -458,7 +458,19 @@ class Sweep:
             self.record_lanes = min(256, 32 * -(-self.placement.row_pitch // 256))
             threads = max(int(model.device.sm_count), 1) * 512
             self.record_grid = min(self.forest.world_count, max(threads // self.record_lanes, 1))
-            # The general sweep's warp mapping: its places the storage's, its rows the placement's.
+            # The general sweep's warp mapping: its places the storage's, its rows the placement's, two worlds a block.
+            staging = functools.partial(
+                sweep_routes.mf_gs_staging,
+                self.placement.dense_max_constraints,
+                self.placement.mf_max_constraints,
+                self.forest.max_world_dofs,
+                places=storage.places,
+                free_rows=self.placement.free_contact_rows,
+                wide_rows=self.placement.packed_dense == packed_rows.WIDE,
+            )
+            block_worlds = 1
+            if model.device.is_cuda and staging(groups=sweep_routes.BLOCK_WORLDS).fits(arch_budget(device_arch)):
+                block_worlds = sweep_routes.BLOCK_WORLDS
             self.general_sweep = sweep_routes.GeneralSweep(
                 self.placement.dense_max_constraints,
                 self.placement.mf_max_constraints,
@@ -471,6 +483,7 @@ class Sweep:
                 seeded=self.seeded,
                 wide_rows=self.placement.packed_dense == packed_rows.WIDE,
                 support_classes=self.placement.classed,
+                block_worlds=block_worlds,
                 free_rows=bool(self.placement.free_contact_rows),
                 speed_rows=speed_rows,
                 **self.law_fields,
@@ -488,7 +501,7 @@ class Sweep:
                 )
             if model.device.is_cuda and capable.size > 0:
                 found = device(model.device)
-                colored_work = dataclasses.replace(self.general_sweep, levels=LevelLaw(EXACT)).work()
+                colored_work = dataclasses.replace(self.general_sweep, levels=LevelLaw(EXACT), block_worlds=1).work()
                 rule = rule.at_scale(capable.size, shape(colored_work, found).blocks_per_sm * found.sms)
                 capable = sweep_units.capable_worlds(
                     self.forest.free_rigid_per_world, self.placement.mf_max_constraints, rule
@@ -496,7 +509,7 @@ class Sweep:
             colored = bool(model.device.is_cuda and capable.size > 0)
             self.mf_gs_kernel = self.sweep("mf_gs", self.general_sweep)
             if colored:
-                self.colored_sweep = dataclasses.replace(self.general_sweep, levels=LevelLaw(EXACT))
+                self.colored_sweep = dataclasses.replace(self.general_sweep, levels=LevelLaw(EXACT), block_worlds=1)
                 self.mf_colored_kernel = self.sweep("mf_colored", self.colored_sweep)
             if parallel_rows > 0:
                 # Under keyed rows each tier walks its rows from their keys in its prologue (the producer's sink).
@@ -777,7 +790,11 @@ class Sweep:
         ``items`` (the bucket's capacity)."""
         layout = shape(config.work(items), device(self.model.device))
         return SweepLaunch(
-            config, kernel, layout.grid, layout.block, functools.partial(self._mapped_operands, bucket, layout.grid)
+            config,
+            kernel,
+            layout.grid,
+            layout.block,
+            functools.partial(self._mapped_operands, bucket, layout.grid * layout.groups),
         )
 
     def _walk(self) -> dict:
@@ -786,7 +803,7 @@ class Sweep:
 
     def _queued(self, bucket: int, grid: int) -> dict:
         """The world queue of the claims' ``bucket`` (claim_worlds, the step's claim stage), walked at ``grid``'s
-        stride."""
+        stride (the launch's lane groups)."""
         count, worlds = self.claims.bucket(bucket)
         return {"general_world_count": count, "general_worlds": worlds, "general_world_grid_stride": grid}
 
