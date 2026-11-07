@@ -411,12 +411,12 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
     def test_two_articulations_share_contact_solve(self):
         """Distinguish factor groups from worlds when two branched robots contact each other.
 
-        The dense route sweeps every row, so the sparse arm keeps patch friction's
-        full ordered sweep and the comparison isolates the representation. On this
-        fixture the active-row law alone moves joint velocities by up to 0.07 for
-        either friction law (test_feather_pgs_sparse_patch_rows covers it).
+        Both arms keep patch friction's full ordered sweep, so the comparison isolates
+        the representation. On this fixture the active-row law alone moves joint
+        velocities by up to 0.07 for either friction law (test_feather_pgs_sparse_patch_rows
+        covers it).
         """
-        dense = _case(False, robot_count=2)
+        dense = _case(False, robot_count=2, pins={"active_rows": False})
         sparse = _case(True, robot_count=2, pins={"active_rows": False})
         self.assertFalse(sparse[1].spec.classes.packed.sweep["active_rows"])
         self.assertEqual(sparse[1].spec.classes.packed_size, 9)
