@@ -41,7 +41,7 @@ import warp as wp
 
 from .device_preludes import substitute
 from .factor.walk import walk_enter_kernel
-from .field_group import Field, FieldGroup, SolverArrays
+from .field_group import Field, FieldGroup, SolverArrays, bind, struct, values
 from .friction_patches import patch_normal_load
 from .kernel_template import KernelTemplate, items
 from .packed_rows import PACKED_SIDES, WIDE
@@ -77,22 +77,25 @@ AUDIT_FIELDS = FieldGroup(
 eps_i lambda_i``, and the ``(G, D, W)`` of the rows no store holds, the sparse diagonal's fused limits."""
 
 
-@wp.struct
-class AuditRows:
-    """What the law reads: the row store's records and impulses, the dense and free-body counts, whether the tiers form
-    the rows of their worlds in their kernel (:func:`.packed_rows._skipped`) and keyed rows hold them, and the laws in
-    play."""
-
-    rows: DenseRows
-    impulses: wp.array2d[float]
-    counts: wp.array[int]
-    mf_counts: wp.array[int]
-    speed_first: wp.array[int]
-    skip_rows_le: int
-    keyed: int
-    weighted: int
-    material: int
-    capacity: int
+AuditRows = struct(
+    "AuditRows",
+    (
+        Field("rows", DenseRows, owner="step"),
+        Field("impulses", float, ("line", "row"), owner="placement"),
+        Field("counts", int, ("line",), owner="placement", attr="constraint_count"),
+        Field("mf_counts", int, ("line",), owner="placement", attr="mf_constraint_count"),
+        Field("speed_first", int, ("line",), owner="placement"),
+        Field("skip_rows_le", int, owner="classes", attr="tier_rows"),
+        Field("keyed", int, owner="step"),
+        Field("weighted", int, owner="step"),
+        Field("material", int, owner="options", attr="contact_compliance"),
+        Field("capacity", int, owner="placement", attr="dense_max_constraints"),
+    ),
+    __name__,
+)
+"""What the law reads: the row store's records and impulses, the dense and free-body counts, whether the tiers form
+the rows of their worlds in their kernel (:func:`.packed_rows._skipped`) and keyed rows hold them, and the laws in
+play."""
 
 
 @wp.func
@@ -115,6 +118,38 @@ def tier_world(a: AuditRows, world: int) -> bool:
 # The rows' velocity terms: one kernel over the one Z operator's dot, a support class its data
 # ---------------------------------------------------------------------------------------------------------------------
 
+OPERANDS = FieldGroup(
+    Field("row_sides", wp.vec2i, ("line", "row"), owner="placement"),
+    Field("response_dofs", int, ("art",), owner="forest", attr="articulation_response_dof_count"),
+    Field("articulation_world_dof_offset", int, ("art",), owner="forest"),
+    Field("world_offset", int, ("art",), owner="forest", attr="articulation_world_dof_offset"),
+    Field("packed_dense", int, owner="placement"),
+    Field("world_dof_indices", int, ("world", "world_dof"), owner="forest"),
+    Field("packed_Z", float, ("line", "row", "entry"), owner="placement"),
+    Field("coordinates", float, ("world", "world_dof"), owner="audit"),
+    Field("hat", float, ("world", "world_dof"), owner="audit", attr="coordinates_hat"),
+    Field("incident", float, ("line", "row"), owner="placement", attr="row_incident"),
+    Field("row_incident", float, ("line", "row"), owner="placement"),
+    Field("mf_counts", int, ("world",), owner="placement", attr="mf_constraint_count"),
+    Field("speed_first", int, ("world",), owner="placement"),
+    Field("tier_rows", int, owner="classes"),
+    Field("row_type", int, ("line", "row"), owner="placement"),
+    Field("dof_start", int, ("art",), owner="forest", attr="articulation_dof_start"),
+    Field("base", int, owner="placement", attr="body_base"),
+    Field("v", float, ("dof",), owner="step"),
+    Field("support", _SparseRowSupport, owner="placement", attr="sparse_row_support"),
+    Field("row_dof", int, ("line", "row", "support"), owner="placement", attr="sparse_row_dof"),
+    Field("row_factor", float, ("line", "row", "support"), owner="placement", attr="sparse_row_factor"),
+    Field("delta", float, ("world", "world_dof"), owner="placement", attr="sparse_factor_velocity_delta"),
+    Field("dense_offsets", int, ("world",), owner="placement", attr="sparse_diagonal_dense_offsets"),
+    Field("dense_groups", int, ("world",), owner="placement", attr="sparse_diagonal_dense_groups"),
+    Field("dense_Z", float, ("line", "row", "dof"), owner="step"),
+    Field("sparse_row_dof", int, ("line", "row", "entry"), owner="placement", attr="sparse_diagonal_row_dof"),
+    Field("sparse_row_z", float, ("line", "row", "entry"), owner="placement", attr="sparse_diagonal_row_z"),
+    Field("inverse_mass", float, ("dof",), owner="factor", attr="diagonal_inverse_mass"),
+)
+"""Every operand a support class reads beside the kernel's own, declared once with where the audit finds it."""
+
 ONE = Lanes(1, "0")
 """The audit's lanes: one thread a world, each row's entries summed in order (:class:`.response_operator.Lanes`)."""
 
@@ -136,8 +171,8 @@ def _sum(operator: SparseFactor, out: str, start: str) -> str:
 
 @dataclasses.dataclass(frozen=True)
 class RowClass:
-    """A support class whose rows the audit reads: the operands beside the kernel's own, a world's names (``prologue``,
-    after ``line`` and ``count``) and row ``i``'s statements that declare its velocity term ``term``."""
+    """A support class whose rows the audit reads: its :data:`OPERANDS` beside the kernel's own, a world's names
+    (``prologue``, after ``line`` and ``count``) and row ``i``'s statements that declare its velocity term ``term``."""
 
     name: str
     operands: tuple
@@ -168,7 +203,7 @@ def rows_kernel(cls: RowClass) -> wp.Kernel:
     )
     return KernelTemplate(
         f"audit_rows_{cls.name}",
-        (*common, *cls.operands),
+        (*common, *((field.name, field.annotation) for field in cls.operands)),
         substitute(_ROWS, prologue=cls.prologue, row=cls.row),
         items("world", flat=True),
         preludes=cls.preludes,
@@ -187,22 +222,22 @@ def packed_class(support: int, wide: bool) -> RowClass:
     at_hat = dataclasses.replace(operator, velocity=Velocity("u_hat"))
     return RowClass(
         f"packed{support}{'_wide' if wide else ''}",
-        (
-            ("row_sides", wp.array2d[wp.vec2i]),
-            ("response_dofs", wp.array[int]),
-            ("articulation_world_dof_offset", wp.array[int]),
-            ("packed_dense", int),
-            ("world_dof_indices", wp.array2d[int]),
-            ("packed_Z", wp.array3d[float]),
-            ("coordinates", wp.array2d[float]),
-            ("hat", wp.array2d[float]),
-            ("incident", wp.array2d[float]),
-            ("mf_counts", wp.array[int]),
-            ("speed_first", wp.array[int]),
-            ("tier_rows", int),
-            ("row_type", wp.array2d[int]),
-            ("dof_start", wp.array[int]),
-            ("v", wp.array[float]),
+        OPERANDS.select(
+            "row_sides",
+            "response_dofs",
+            "articulation_world_dof_offset",
+            "packed_dense",
+            "world_dof_indices",
+            "packed_Z",
+            "coordinates",
+            "hat",
+            "incident",
+            "mf_counts",
+            "speed_first",
+            "tier_rows",
+            "row_type",
+            "dof_start",
+            "v",
         ),
         """    const int off_dense = line * row_sides.shape[1];
     const int packed_base = line * packed_Z.shape[1] * packed_Z.shape[2];
@@ -248,13 +283,7 @@ def sparse_class(support: int, table: bool) -> RowClass:
     operator = SparseFactor(support, index, factor, ONE, velocity=Velocity("du"))
     return RowClass(
         f"sparse{support}{'_table' if table else ''}",
-        (
-            ("support", _SparseRowSupport),
-            ("row_dof", wp.array3d[int]),
-            ("row_factor", wp.array3d[float]),
-            ("row_incident", wp.array2d[float]),
-            ("delta", wp.array2d[float]),
-        ),
+        OPERANDS.select("support", "row_dof", "row_factor", "row_incident", "delta"),
         """    const int offset = line * support.row_class.shape[1];
     const int row_base = line * row_factor.shape[1] * row_factor.shape[2];
     const float* du = delta.data + (size_t)world * delta.shape[1];""",
@@ -269,16 +298,16 @@ def slot_class(dense: int, rows: int) -> RowClass:
     operator = dataclasses.replace(slot_rows(dense, rows, ONE), velocity=Called("U"))
     return RowClass(
         f"slots{dense}_{rows}",
-        (
-            ("world_dof_indices", wp.array2d[int]),
-            ("dense_offsets", wp.array[int]),
-            ("dense_groups", wp.array[int]),
-            ("coordinates", wp.array2d[float]),
-            ("dense_Z", wp.array3d[float]),
-            ("sparse_row_dof", wp.array3d[int]),
-            ("sparse_row_z", wp.array3d[float]),
-            ("inverse_mass", wp.array[float]),
-            ("v", wp.array[float]),
+        OPERANDS.select(
+            "world_dof_indices",
+            "dense_offsets",
+            "dense_groups",
+            "coordinates",
+            "dense_Z",
+            "sparse_row_dof",
+            "sparse_row_z",
+            "inverse_mass",
+            "v",
         ),
         f"""    const int dense_offset = dense_offsets.data[world], dense_group = dense_groups.data[world];
     const int row_base = line * sparse_row_dof.shape[1];
@@ -304,16 +333,7 @@ def free_class() -> RowClass:
     operator = dataclasses.replace(free_body_rows(ONE, "S"), velocity=Velocity("u"))
     return RowClass(
         "free",
-        (
-            ("row_type", wp.array2d[int]),
-            ("row_sides", wp.array2d[wp.vec2i]),
-            ("base", int),
-            ("packed_Z", wp.array3d[float]),
-            ("dof_start", wp.array[int]),
-            ("world_offset", wp.array[int]),
-            ("v", wp.array[float]),
-            ("coordinates", wp.array2d[float]),
-        ),
+        OPERANDS.select("row_type", "row_sides", "base", "packed_Z", "dof_start", "world_offset", "v", "coordinates"),
         """    const int records = line * row_type.shape[1] + base;
     const int S = packed_Z.shape[2];
     const size_t free_base = ((size_t)line * packed_Z.shape[1] + base) * S;
@@ -472,20 +492,11 @@ class Audit:
             reason = "Reads NaN in keyed rows' worlds: no store holds their rows after the sweep."
         return {"enabled": True, "slots": list(AUDIT_SLOTS), "reason": reason}
 
-    def _operands(self) -> AuditRows:
-        solver = self.solver
-        a = AuditRows()
-        a.rows = bind_dense_rows(solver.placement)
-        a.impulses = solver.placement.impulses
-        a.counts = solver.placement.constraint_count
-        a.mf_counts = solver.placement.mf_constraint_count
-        a.speed_first = solver.placement.speed_first
-        a.skip_rows_le = int(solver.placement.ink_skip_rows())
-        a.keyed = int(solver.placement.keyed_rows is not None)
-        a.weighted = int(solver.laws.set.weighted)
-        a.material = int(solver.options.contact_compliance)
-        a.capacity = solver.placement.dense_max_constraints
-        return a
+    def _operands(self):
+        solver, placement = self.solver, self.solver.placement
+        owners = {"placement": placement, "classes": solver.spec.classes, "options": solver.options}
+        keyed, weighted = placement.keyed_rows is not None, solver.laws.set.weighted
+        return bind(AuditRows, rows=bind_dense_rows(placement), keyed=keyed, weighted=weighted, **owners)
 
     def _walk_coordinates(self, velocity: wp.array, coordinates: wp.array) -> None:
         """The walked trees' coordinates of ``velocity`` in the walk's frame, at their world coordinates
@@ -519,54 +530,10 @@ class Audit:
             return slot_class(int(size), int(placement.J_by_size[size].shape[1]))
         return packed_class(int(placement.packed_support), int(placement.packed_dense) == WIDE)
 
-    def _dense_operands(self, v: wp.array) -> list:
-        """The dense class's operands this step; the walk's coordinates of ``v`` (and ``v_hat``) where its rows read
-        them."""
-        solver, forest, placement = self.solver, self.solver.forest, self.solver.placement
-        route = solver._plan.solve.route.name
-        if route == "sparse_pgs":
-            return [
-                placement.sparse_row_support,
-                placement.sparse_row_dof,
-                placement.sparse_row_factor,
-                placement.row_incident,
-                placement.sparse_factor_velocity_delta,
-            ]
-        # The walked rows (walk_rows) are in the walk's coordinates: their trees' coordinates are the walk's too.
-        if route == "sparse_diagonal":
-            size = solver.spec.classes.dense_size
-            self._walk_coordinates(v, self.coordinates)
-            return [
-                forest.world_dof_indices,
-                placement.sparse_diagonal_dense_offsets,
-                placement.sparse_diagonal_dense_groups,
-                self.coordinates,
-                placement.J_by_size[size],
-                placement.sparse_diagonal_row_dof,
-                placement.sparse_diagonal_row_z,
-                solver.factor.diagonal_inverse_mass,
-                v,
-            ]
-        if placement.walks:
-            self._walk_coordinates(v, self.coordinates)
-            self._walk_coordinates(solver.v_hat, self.coordinates_hat)
-        return [
-            placement.row_sides,
-            forest.articulation_response_dof_count,
-            forest.articulation_world_dof_offset,
-            int(placement.packed_dense),
-            forest.world_dof_indices,
-            placement.packed_Z,
-            self.coordinates,
-            self.coordinates_hat,
-            placement.row_incident,
-            placement.mf_constraint_count,
-            placement.speed_first,
-            int(placement.ink_skip_rows()),
-            placement.row_type,
-            forest.articulation_dof_start,
-            v,
-        ]
+    def _operands_of(self, cls: RowClass, v: wp.array) -> list:
+        solver, placement, classes = self.solver, self.solver.placement, self.solver.spec.classes
+        owners = {"placement": placement, "forest": solver.forest, "factor": solver.factor, "classes": classes}
+        return values(cls.operands, **owners, audit=self, v=v, dense_Z=placement.J_by_size.get(classes.dense_size))
 
     def launch(self) -> None:
         """Audit the step: after the solve, on the published velocity ``v_out``: each store's velocity terms by the one
@@ -574,13 +541,20 @@ class Audit:
         solver, forest, placement = self.solver, self.solver.forest, self.solver.placement
         device, worlds, v = solver.model.device, forest.world_count, solver.v_out
         first, capacity = placement.dense_first, placement.dense_max_constraints
+        # The walked rows (walk_rows) are in the walk's coordinates: their trees' coordinates are the walk's too.
+        route = solver._plan.solve.route.name
+        if route != "sparse_pgs" and placement.walks:
+            self._walk_coordinates(v, self.coordinates)
+            if route != "sparse_diagonal":
+                self._walk_coordinates(solver.v_hat, self.coordinates_hat)
+        operands = self._operands_of(self.dense_class, v)
         wp.launch(
             rows_kernel(self.dense_class),
             dim=worlds,
-            inputs=[first, placement.constraint_count, capacity, self.velocity, *self._dense_operands(v)],
+            inputs=[first, placement.constraint_count, capacity, self.velocity, *operands],
             device=device,
         )
-        if solver._plan.solve.route.name == "sparse_diagonal":
+        if route == "sparse_diagonal":
             limits = [
                 placement.fused_diagonal_limit_active,
                 placement.fused_diagonal_limit_lower_rhs,
@@ -592,17 +566,8 @@ class Audit:
             ]
             wp.launch(fused_limits, dim=worlds, inputs=limits, outputs=[self.fused], device=device)
         if forest.has_free_rigid_bodies:
-            free = [
-                placement.row_type,
-                placement.row_sides,
-                int(placement.body_base),
-                placement.packed_Z,
-                solver.factor.walk_view().dof_start,
-                forest.articulation_world_dof_offset,
-                v,
-                self.coordinates,
-            ]
             mf = [first, placement.mf_constraint_count, placement.mf_max_constraints, self.mf_velocity]
+            free = self._operands_of(free_class(), v)
             wp.launch(rows_kernel(free_class()), dim=worlds, inputs=[*mf, *free], device=device)
         inputs = [self._operands(), int(placement.body_base), self.velocity, self.mf_velocity, self.fused]
         wp.launch(audit_world, dim=worlds, inputs=inputs, outputs=[self.readout], device=device)

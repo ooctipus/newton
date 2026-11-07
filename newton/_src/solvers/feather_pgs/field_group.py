@@ -35,7 +35,7 @@ from typing import Any
 
 import warp as wp
 
-__all__ = ["Field", "FieldGroup", "SolverArrays", "bind", "fields_of", "replace", "struct", "upload"]
+__all__ = ["Field", "FieldGroup", "SolverArrays", "bind", "fields_of", "replace", "struct", "upload", "values"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -217,6 +217,15 @@ def fields_of(struct_type) -> tuple[Field, ...]:
     return _STRUCT_FIELDS[struct_type]
 
 
+def values(fields, /, **owners) -> list:
+    """Each of ``fields``' values, found as :func:`bind` finds them."""
+    found = []
+    for field in fields:
+        value = owners[field.name] if field.name in owners else getattr(owners[field.owner], field.attr or field.name)
+        found.append(value if field.dims else _scalar(field.dtype, value))
+    return found
+
+
 def bind(struct_type, instance=None, /, **owners):
     """Fill an instance of a generated struct from the objects that hold its fields.
 
@@ -230,13 +239,8 @@ def bind(struct_type, instance=None, /, **owners):
         owners: The owner objects by role, and direct field values by field name.
     """
     data = struct_type() if instance is None else instance
-    for field in _STRUCT_FIELDS[struct_type]:
-        if field.name in owners:
-            value = owners[field.name]
-        else:
-            value = getattr(owners[field.owner], field.attr or field.name)
-        if not field.dims:
-            value = _scalar(field.dtype, value)
+    fields = _STRUCT_FIELDS[struct_type]
+    for field, value in zip(fields, values(fields, **owners), strict=True):
         setattr(data, field.name, value)
     return data
 
