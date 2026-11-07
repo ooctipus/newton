@@ -149,9 +149,6 @@ OVERFLOW_WARNING = FieldGroup(Field("row_overflow_warning_emitted", wp.int32, (2
 
 __all__ = ["Placement"]
 
-# Per-world preset of the first rejected row slot: no reservation was rejected.
-_ROW_SLOT_UNBOUNDED = ROW_SLOT_UNBOUNDED
-
 
 @wp.kernel
 def _accumulate_row_watermark(
@@ -213,7 +210,7 @@ def _clear_dense_row_state(
     if column == 0:
         for row_class in range(2):
             slot_counter[row_class, world] = 0
-            first_rejected[row_class, world] = _ROW_SLOT_UNBOUNDED
+            first_rejected[row_class, world] = ROW_SLOT_UNBOUNDED
             dropped[row_class, world] = 0
         count[1, world] = 0
     if has_free_rigid != 0:

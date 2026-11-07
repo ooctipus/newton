@@ -13,7 +13,7 @@ from ...core.execution import Work
 from ...sim import ModelFlags
 from . import cached_state_binding, field_group
 from . import tree_scan as ts
-from .device_proof import DeviceProof, fingerprint
+from .device_proof import DeviceProof
 from .host_index import expand
 from .path_selection import json_value, kernel_key
 from .publication_data import PLAN_FIELDS
@@ -37,8 +37,6 @@ _PLAN_FIELDS = (
 # fixed roots this way on resets) invalidates the caches instead of raising.
 _FRAME_FIELDS = ("joint_X_p", "joint_X_c")
 _MAPPING_FIELDS = ("group_to_art", "art_to_world", "art_dof_start", "free_root_joint_indices")
-
-_fingerprint = fingerprint
 
 
 def proof_runs(flags) -> bool:

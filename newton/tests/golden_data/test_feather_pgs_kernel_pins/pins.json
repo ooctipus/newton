@@ -53,7 +53,7 @@
   "placement._accumulate_row_capacity_telemetry": "d909544ecf9669c05bf97c1de0396fe39ff5195c068c12a899905c12588a4e3e",
   "placement._accumulate_row_watermark": "91493d15a468654d25833fca1813f2964674ac21cd8ba8e300163344143cc7e3",
   "placement._clear_dense_diagonals": "591b631eb09f159c46e5a41b92debdc3122ac56be48823a3cfeee7cb0da38148",
-  "placement._clear_dense_row_state": "22049f1daa5fc5fe5e4d647edf4105da949e9ca66ed9dfbd9aee6e771265823d",
+  "placement._clear_dense_row_state": "f45d82b63fd7e699e81e27993ba36714b93ca9b185ba01dc45617e436da1708b",
   "placement._finalize_constraint_status": "ee00b31da9bbbd149b178915293da07ce8dd22f4f5e81491f05aa0aacdccafd7",
   "placement._reset_solver_status": "a2bfd6fce4d63742a7c71580d2eeb7074556a08745adfd37ad154fa181ae1066",
   "placement._warn_constraint_row_overflow": "cc85f6e2758d45d7336f0e78311e5930d5dde574ae23ba62ddfd712f9f7c4517",
