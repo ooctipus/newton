@@ -502,16 +502,21 @@ class TestExitLaw(unittest.TestCase):
         body, _ = plain.source()
         self.assertNotIn("s_selected_words", body)
         self.assertNotIn("consumed_tangent", body)
-        for switch, value in (("active_rows", True), ("contact_units", True), ("block_worlds", 2)):
+        for switch, value in (
+            ("active_rows", True),
+            ("contact_units", True),
+            ("block_warps", 2),
+            ("lanes_per_world", 16),
+        ):
             with self.subTest(switch=switch), self.assertRaises(ValueError):
                 sweep_routes.GeneralSweep(64, 32, 12, "120", levels=LevelLaw(EXACT), **{switch: value})
 
     def test_general_sweep_holds_two_worlds_a_block(self):
-        """Two worlds a block of the warp mapping (``block_worlds``): a warp each with its own copy of the stage, the
+        """Two warps a block of the warp mapping (``block_warps``): a world each with its own copy of the stage, the
         dispatch's lane groups walking the claim's queue, at the sparse sweeps' register line; one thread a world on
         the CPU, whose kernel is the one-world block's."""
         one = sweep_routes.GeneralSweep(64, 32, 12, "120", torsion=True)
-        two = dataclasses.replace(one, block_worlds=sweep_routes.BLOCK_WORLDS)
+        two = dataclasses.replace(one, block_warps=sweep_routes.BLOCK_WARPS)
         self.assertEqual(two.name, one.name.replace("_torsion_", "_torsion_w2_"))
         work = two.work(0)
         self.assertEqual((work.block, work.registers, two.groups), (64, sweep_routes.WARP_LINE, 2))
@@ -523,7 +528,27 @@ class TestExitLaw(unittest.TestCase):
         self.assertEqual(cpu[1].groups, 1)
         self.assertEqual(cpu[0].source()[0], cpu[1].source()[0])
         with self.assertRaises(ValueError):
-            dataclasses.replace(one, block_worlds=3)
+            dataclasses.replace(one, block_warps=3)
+
+    def test_general_sweep_lanes_follow_the_support(self):
+        """A world's lanes are the power of two over its rows' widest support (16 at least with the free bodies' run),
+        several worlds a warp: the block's lane groups and stages are the worlds'; the CPU's one thread a world."""
+        self.assertEqual(
+            [sweep_routes.world_lanes(s, free_rows=False) for s in (2, 9, 16, 17, 43)], [8, 16, 16, 32, 32]
+        )
+        self.assertEqual(sweep_routes.world_lanes(2, free_rows=True), 16)
+        narrow = sweep_routes.GeneralSweep(
+            64, 32, 9, "120", torsion=True, free_rows=False, lanes_per_world=16, block_warps=sweep_routes.BLOCK_WARPS
+        )
+        self.assertIn("_l16_w2", narrow.name)
+        self.assertEqual((narrow.lanes, narrow.groups, narrow.work(0).block), (16, 4, 64))
+        body, staging = narrow.source()
+        self.assertEqual((staging.groups, staging.threads), (4, 64))
+        self.assertIn("float* s_v = s_v_storage + SUB * 9;", body)
+        self.assertIn("world_at = block * 4 + lane // 16", narrow.dispatch(staging).body)
+        self.assertEqual(dataclasses.replace(narrow, device_arch="0").groups, 1)
+        with self.assertRaises(ValueError):
+            sweep_routes.GeneralSweep(64, 32, 9, "120", torsion=True, lanes_per_world=8)
 
 
 class TestSolveReadoutRecord(unittest.TestCase):

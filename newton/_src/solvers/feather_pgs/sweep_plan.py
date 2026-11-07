@@ -64,6 +64,9 @@ from .warm_start import (
     reset_world_impulses,
 )
 
+_COLORED = {"levels": LevelLaw(EXACT), "lanes_per_world": 32, "block_warps": 1}
+"""The colored mapping's fields over the warp mapping's: a world a block of whole warps."""
+
 SPARSE_ROWS = FieldGroup(
     Field("sparse_row_dof", wp.int32, ("index_world", "index_row", "index_support"), fill=None, owner="placement"),
     Field("sparse_row_factor", wp.float32, ("world", "row", "support"), fill=None, owner="placement"),
@@ -458,7 +461,10 @@ class Sweep:
             self.record_lanes = min(256, 32 * -(-self.placement.row_pitch // 256))
             threads = max(int(model.device.sm_count), 1) * 512
             self.record_grid = min(self.forest.world_count, max(threads // self.record_lanes, 1))
-            # The general sweep's warp mapping: its places the storage's, its rows the placement's, two worlds a block.
+            # The general sweep's warp mapping: its places the storage's, its rows the placement's; a world's lanes
+            # from its rows' widest support (sweep_routes.world_lanes) where a warp's worlds' stages fit, two warps a
+            # block where theirs do.
+            budget = arch_budget(device_arch)
             staging = functools.partial(
                 sweep_routes.mf_gs_staging,
                 self.placement.dense_max_constraints,
@@ -468,9 +474,16 @@ class Sweep:
                 free_rows=self.placement.free_contact_rows,
                 wide_rows=self.placement.packed_dense == packed_rows.WIDE,
             )
-            block_worlds = 1
-            if model.device.is_cuda and staging(groups=sweep_routes.BLOCK_WORLDS).fits(arch_budget(device_arch)):
-                block_worlds = sweep_routes.BLOCK_WORLDS
+            support_lanes = sweep_routes.world_lanes(
+                self.placement.packed_support, free_rows=bool(self.placement.free_contact_rows)
+            )
+            lanes, block_warps = 32, 1
+            if model.device.is_cuda:
+                if staging(lanes=support_lanes, groups=32 // support_lanes).fits(budget):
+                    lanes = support_lanes
+                staging = functools.partial(staging, lanes=lanes)
+                if staging(groups=32 * sweep_routes.BLOCK_WARPS // lanes).fits(budget):
+                    block_warps = sweep_routes.BLOCK_WARPS
             self.general_sweep = sweep_routes.GeneralSweep(
                 self.placement.dense_max_constraints,
                 self.placement.mf_max_constraints,
@@ -483,7 +496,8 @@ class Sweep:
                 seeded=self.seeded,
                 wide_rows=self.placement.packed_dense == packed_rows.WIDE,
                 support_classes=self.placement.classed,
-                block_worlds=block_worlds,
+                lanes_per_world=lanes,
+                block_warps=block_warps,
                 free_rows=bool(self.placement.free_contact_rows),
                 speed_rows=speed_rows,
                 **self.law_fields,
@@ -501,7 +515,7 @@ class Sweep:
                 )
             if model.device.is_cuda and capable.size > 0:
                 found = device(model.device)
-                colored_work = dataclasses.replace(self.general_sweep, levels=LevelLaw(EXACT), block_worlds=1).work()
+                colored_work = dataclasses.replace(self.general_sweep, **_COLORED).work()
                 rule = rule.at_scale(capable.size, shape(colored_work, found).blocks_per_sm * found.sms)
                 capable = sweep_units.capable_worlds(
                     self.forest.free_rigid_per_world, self.placement.mf_max_constraints, rule
@@ -509,7 +523,7 @@ class Sweep:
             colored = bool(model.device.is_cuda and capable.size > 0)
             self.mf_gs_kernel = self.sweep("mf_gs", self.general_sweep)
             if colored:
-                self.colored_sweep = dataclasses.replace(self.general_sweep, levels=LevelLaw(EXACT), block_worlds=1)
+                self.colored_sweep = dataclasses.replace(self.general_sweep, **_COLORED)
                 self.mf_colored_kernel = self.sweep("mf_colored", self.colored_sweep)
             if parallel_rows > 0:
                 # Under keyed rows each tier walks its rows from their keys in its prologue (the producer's sink).
