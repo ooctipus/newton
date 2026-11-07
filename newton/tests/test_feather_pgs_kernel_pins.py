@@ -278,6 +278,10 @@ def _dense_build_calls():
     tables = (((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11)), ((-1,), (0, 6)))
     for args in ((0, False), (8, False), (8, True)):
         yield "walk_rows.walked_rows_kernel", walk_rows.walked_rows_kernel.__wrapped__, (*args, True, tables), {}
+    # Storing the dense rows' records where a sweep streams them: plain and with blocks.
+    for args in ((0, False), (8, True)):
+        records = (*args, True, tables, 0, True)
+        yield "walk_rows.walked_rows_kernel", walk_rows.walked_rows_kernel.__wrapped__, records, {}
     # Its topology part, the rows walked in blocks: plain and with blocks.
     for args in ((0, False), (8, True)):
         block = (*args, True, tables, walk_rows.WRITER_BLOCK_ROWS)

@@ -724,13 +724,11 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         # The sweeps add their velocity change to the predictor; a world without rows keeps it.
         wp.copy(solver.v_out, solver.v_hat)
 
-    def pack_row_records(step):
-        placement.pack_row_records()
-
     colored = sweep.colored_units
 
     def build_colored_units(step):
-        # The colored worlds' units and colors follow the rows the pack just published, over the claims' candidates.
+        # The colored worlds' units and colors follow the rows and records their writers published, over the claims'
+        # candidates.
         sweep.join_claims()
         colored.build(
             placement.mf_constraint_count,
@@ -751,7 +749,6 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     add(
         *((seed_blocks,) if spec.laws.preelimination else ()),
         start_velocity,
-        *((pack_row_records,) if placement.row_record_kernel is not None else ()),
         *((build_colored_units,) if colored is not None else ()),
         nvtx="S5_GatherJY",
     )

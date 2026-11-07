@@ -54,6 +54,7 @@ from . import field_group
 from .contact_filters import contact_normal_gap_limit
 from .contact_laws import contact_bodies, contact_point, contact_points, contact_tangent_basis
 from .field_group import Field
+from .response_builds_rows import RowRecords, store_record_parent
 from .spatial_laws import point_velocity
 
 # Grids are fixed at construction so CUDA graphs replay them. Their sizes count
@@ -1572,13 +1573,14 @@ class _FrictionPatchState:
             slot_keys=True,
         )
 
-    def link(self, world, slot, path, slots_needed, routes):
-        """Link the normal rows of each patch and share its Coulomb budget on the enabled routes."""
+    def link(self, world, slot, path, slots_needed, routes, records):
+        """Link the normal rows of each patch and share its Coulomb budget on the enabled routes; a linked row's
+        record (``records``, :class:`.response_builds_rows.RowRecords`) takes its parent too."""
         self._grids(self.pool.launch_rows())
         self.pool.launch(
             link_patch_routes,
             self.threads,
-            inputs=[self.extent, self.view, world, slot, path, slots_needed, routes, self.threads],
+            inputs=[self.extent, self.view, world, slot, path, slots_needed, routes, self.threads, records],
             extent=self.extent[1:2],
             clamp=True,
         )
@@ -1751,8 +1753,10 @@ def _link_contact(
     route: int,
     parents: wp.array2d[int],
     first: wp.array[int],
+    records: RowRecords,
 ):
-    """Link contact ``c``'s normal row into its region's ring: its parent is the next member's row on the route.
+    """Link contact ``c``'s normal row into its region's ring: its parent is the next member's row on the route, in
+    the row store and in the row's record where it has one (:func:`.response_builds_rows.store_record_parent`).
 
     A region has one anchor, so its friction rows' coefficients are whole: the pooled normal load of the ring bounds
     them once.
@@ -1766,7 +1770,9 @@ def _link_contact(
             next_slot = slot[row]
             break
         row = patches.next_contact[row]
-    parents[first[world[c]], slot[c]] = next_slot
+    line = first[world[c]]
+    parents[line, slot[c]] = next_slot
+    store_record_parent(records, line, slot[c], next_slot)
 
 
 @wp.kernel(enable_backward=False)
@@ -1779,6 +1785,7 @@ def link_patch_routes(
     slots_needed: wp.array[int],
     routes: _PatchRoutes,
     threads: int,
+    records: RowRecords,
 ):
     """Link the rows of every enabled route in one launch over the live contacts.
 
@@ -1791,7 +1798,7 @@ def link_patch_routes(
         if route >= 0:
             parents = _route_parents(routes, route)
             first = _route_first(routes, route)
-            _link_contact(c, patches, world, slot, path, route, parents, first)
+            _link_contact(c, patches, world, slot, path, route, parents, first, records)
 
 
 @wp.func

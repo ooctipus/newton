@@ -422,14 +422,13 @@ def _sparse_mass_matrix(solver) -> dict:
 def _sweep(solver) -> dict:
     solve = solver._plan.solve
     route = solve.route.name
-    # The streamed rows' records: the pack kernel is built where a sweep streams a row.
-    packed = solver.placement.row_record_kernel is not None
-    record_pack = {
-        "launched": packed,
-        "kernel": _key(solver.placement.row_record_kernel),
-        "first": int(solver.placement.record_first),
-        "reason": "The streamed rows pack their records each step."
-        if packed
+    # The streamed rows' records, which the rows' writers store where a sweep streams a row.
+    placement = solver.placement
+    records = {
+        "written": bool(placement.writes_records),
+        "first": int(placement.record_first),
+        "reason": "The rows' writers store the streamed rows' records."
+        if placement.writes_records
         else "Skipped: no sweep streams a row's metadata.",
     }
     kernels = solver._plan.kernels
@@ -437,7 +436,7 @@ def _sweep(solver) -> dict:
         "route": route,
         "reason": solve.route.reason,
         "iterations": int(solver.options.pgs_iterations),
-        "row_record_pack": record_pack,
+        "row_records": records,
         "sparse": kernels["sparse"],
         "sparse_diagonal": kernels["sparse_diagonal"],
         "paired_factor": kernels["paired_factor"],

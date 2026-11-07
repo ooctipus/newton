@@ -14,7 +14,7 @@
 
 A step calls :meth:`Placement.begin` (clear the allocation state), then the row pass writes into its slots
 (:meth:`Placement.place_sorted_contact_rows`, :meth:`Placement.latch_status`, :meth:`Placement.warn_overflow`),
-:meth:`Placement.diagonals`, :meth:`Placement.prepare_impulses` and :meth:`Placement.pack_row_records`.
+:meth:`Placement.diagonals` and :meth:`Placement.prepare_impulses`; the rows' writers store their records.
 
 It also holds which placement the class takes: the native sparse size, the sparse-diagonal pair and the row producers.
 The row pass and the sweeps read its fields.
@@ -26,11 +26,10 @@ import numpy as np
 import warp as wp
 
 from ...core.contact_pool import ContactField, model_contact_pool
-from ...core.execution import fill_lanes
 from ...sim import Contacts
 from ...sim.contacts import contact_capacity_blocks
 from ...sim.enums import JointType
-from . import host_index, packed_rows, response_builds_rows
+from . import host_index, packed_rows
 from .field_group import Field, FieldGroup, SolverArrays, fields_of
 from .row_kernels import RIGID_SPEED_ROWS
 from .row_laws import LINK_ROWS
@@ -595,7 +594,7 @@ class Placement:
         ``m_mf == 0`` and no element is ever read or written. The rows' records
         follow the sweep's plan (:meth:`allocate_row_records`).
         """
-        self.row_record = self.row_record_kernel = None
+        self.row_record, self.writes_records = None, False
 
         if not self.forest.has_free_rigid_bodies:
             # Only the ``is not None`` checks observe this on the inactive
@@ -691,26 +690,21 @@ class Placement:
     def allocate_row_records(self, first: int, *, skip_rows: int = 0, speed_rows: bool = False) -> None:
         """Allocate the streamed rows' records (:data:`.row_records.ROW_RECORDS`) from the line's row ``first``, which
         the sweep's plan decides (``Sweep.build``: the dense rows' first where the sweep streams their metadata, else
-        the free bodies'), and the step's pack of them (:func:`.response_builds_rows.row_record_kernel`): a world's
-        lanes a warp, or a block when few worlds would idle the device; the worlds the tiers own (``skip_rows``, with
-        the line's ``speed_rows``: the sweep's skip) keep no packed record."""
+        the free bodies'). The rows' writers store them (:func:`.response_builds_rows.write_row_record`) in the worlds
+        the sweep visits: not those the tiers own (``skip_rows``, with the line's ``speed_rows``: the sweep's skip)."""
         self.record_first = int(first)
         rows = self.row_pitch - self.record_first
         free_rows = self.mf_max_constraints if self.free_contact_rows else 0
-        self.row_record_kernel = None
-        if rows > 0 and (self.record_first < self.body_base or free_rows > 0):
-            self.record_lanes = fill_lanes(self.forest.world_count, self.model.device)
-            self.row_record_kernel = response_builds_rows.row_record_kernel(
-                self.row_pitch,
-                self.record_first,
-                self.body_base,
-                free_rows,
-                self.record_lanes,
-                self.model.device.arch,
-                skip_rows=skip_rows,
-                speed_rows=speed_rows,
-            )
+        self.writes_records = bool(rows > 0 and (self.record_first < self.body_base or free_rows > 0))
+        if self.writes_records:
+            _validate_mf_metadata_encoding(max(free_rows, self.body_base if self.record_first < self.body_base else 0))
+        self.record_skip_rows, self.record_speed_rows = int(skip_rows), bool(speed_rows)
         self.arrays.allocate(ROW_RECORDS, world=self.forest.world_count, record=RECORD_WORDS * max(rows, 1))
+
+    @property
+    def writes_dense_records(self) -> bool:
+        """Whether the one writer stores the dense rows' records (:meth:`allocate_row_records`)."""
+        return self.writes_records and self.record_first < self.body_base
 
     @property
     def record_base(self) -> int:
@@ -1034,32 +1028,6 @@ class Placement:
         """Whether the dense rows' diagonals start from zero each step (:meth:`diagonals`): the packed rows hold the
         response."""
         return bool(self.packed_response)
-
-    def pack_row_records(self) -> None:
-        """Pack the streamed rows' records for the matrix-free sweeps (staged where a sweep streams a row:
-        :meth:`allocate_row_records`)."""
-        wp.launch_tiled(
-            self.row_record_kernel,
-            dim=[self.forest.world_count],
-            inputs=[
-                self.constraint_count,
-                self.mf_constraint_count,
-                self.speed_first,
-                self.dense_first,
-                self.forest.articulation_world_dof_offset,
-                self.forest.articulation_response_dof_count,
-                self.row_sides,
-                self.diag,
-                self.rhs,
-                self.row_incident,
-                self.row_type,
-                self.row_parent,
-                self.row_mu,
-            ],
-            outputs=[self.row_record],
-            block_dim=self.record_lanes,
-            device=self.model.device,
-        )
 
     def prepare_impulses(self):
         warmstart_flag = 1 if self.options.pgs_warmstart else 0

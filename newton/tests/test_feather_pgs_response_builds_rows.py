@@ -1,23 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The free-body row build of the response operators on its own: the free-body row word the sweeps decode, and (with
-``ptxas`` on ``PATH``) the native build's offline CUDA assembly without spills.
+"""The free-body row build of the response operators on its own: the row word the sweeps decode, the rows' whitening
+by the dynamics' mass matrix, and the records the rows' writers store.
 """
 
-import re
-import shutil
-import subprocess
-import tempfile
 import unittest
-from pathlib import Path
 
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import response_builds_rows
-from newton._src.solvers.feather_pgs.factor.walk import WALK_COORDINATE
-from newton._src.solvers.feather_pgs.row_metadata import pack_mf_header, unpack_mf_header
+from newton._src.solvers.feather_pgs.row_metadata import (
+    RECORD_WORDS,
+    _validate_mf_metadata_encoding,
+    pack_mf_header,
+    unpack_mf_header,
+)
 from newton.tests.feather_pgs_law_harness import unpacked_rows, walk_inverse
 
 DEVICE = "cpu"
@@ -36,7 +34,61 @@ class TestFreeBodyRowsBuild(unittest.TestCase):
         self.assertIn("int dof_b = (packed_dofs << 16) >> 16;", consume)
         self.assertIn("float mf_diag = __int_as_float(w.y);", consume)
         with self.assertRaises(ValueError):
-            response_builds_rows.row_record_kernel(8 + 70000, 8, 8, 70000, 32, "sm_120")
+            _validate_mf_metadata_encoding(70000)
+
+    def _box_step(self, armature: float = 0.0):
+        """A 1 kg, 0.2 m box resting tilted on the ground (its lowest edge 5 mm into it), one step: the solver."""
+        import newton  # noqa: PLC0415
+
+        mass, half = 1.0, 0.1
+        builder = newton.ModelBuilder()
+        rotation = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.3)
+        principal = 2.0 * mass * half * half / 3.0
+        body = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, 0.12), rotation),
+            mass=mass,
+            inertia=wp.mat33(principal, 0.0, 0.0, 0.0, principal, 0.0, 0.0, 0.0, principal),
+        )
+        builder.add_shape_box(body, hx=half, hy=half, hz=half, cfg=newton.ModelBuilder.ShapeConfig(density=0.0))
+        builder.joint_armature[-6:] = [armature] * 6
+        builder.add_ground_plane()
+        model = builder.finalize(device=DEVICE)
+        solver = newton.solvers.SolverFeatherPGS(model)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        state, out = model.state(), model.state()
+        pipeline.collide(state, contacts)
+        solver.step(state, out, model.control(), contacts, 1.0 / 240.0)
+        return solver
+
+    def test_writers_store_the_rows_records(self):
+        """Every streamed row's record (:func:`.row_metadata.pack_row_record`), which the one writer stores, holds the
+        row as the step left it: its sides' first coordinates and widths, its diagonal, its residual at ``du = 0``, its
+        kind, parent and friction coefficient. The CPU streams the dense rows' metadata, so every row has one."""
+        solver = self._box_step()
+        p = solver.placement
+        self.assertTrue(p.writes_dense_records)
+        rows = int(p.constraint_count.numpy()[0])
+        self.assertGreater(rows, 0, "the box must touch the ground")
+        line = int(p.dense_first.numpy()[0])
+        record = p.row_record.numpy()[line].reshape(-1, RECORD_WORDS)[: rows - p.record_first]
+        offset = p.forest.articulation_world_dof_offset.numpy()
+        dofs = p.forest.articulation_response_dof_count.numpy()
+        sides = p.row_sides.numpy()[line, p.record_first : rows]
+        first_a = np.where(sides[:, 0] >= 0, offset[np.maximum(sides[:, 0], 0)], -1)
+        first_b = np.where(sides[:, 1] >= 0, offset[np.maximum(sides[:, 1], 0)], -1)
+        width_a = np.where(sides[:, 0] >= 0, dofs[np.maximum(sides[:, 0], 0)], 0)
+        width_b = np.where(sides[:, 1] >= 0, dofs[np.maximum(sides[:, 1], 0)], 0)
+        np.testing.assert_array_equal(record[:, 0] >> 16, first_a)
+        np.testing.assert_array_equal((record[:, 0] << 16) >> 16, first_b)
+        np.testing.assert_array_equal(record[:, 4], width_a | (width_b << 16))
+        rows_at = slice(p.record_first, rows)
+        np.testing.assert_array_equal(record[:, 1].view(np.float32), p.diag.numpy()[line, rows_at])
+        residual = p.rhs.numpy()[line, rows_at] + p.row_incident.numpy()[line, rows_at]
+        np.testing.assert_array_equal(record[:, 2].view(np.float32), residual)
+        np.testing.assert_array_equal(record[:, 3] & 0xFFFF, p.row_type.numpy()[line, rows_at])
+        np.testing.assert_array_equal(record[:, 3] >> 16, p.row_parent.numpy()[line, rows_at])
+        np.testing.assert_array_equal(record[:, 5].view(np.float32), p.row_mu.numpy()[line, rows_at])
 
     def test_rows_see_the_dynamics_mass_matrix(self):
         """Whiten a free box's contact rows by the factor of its dynamics' mass matrix, armature included.
@@ -83,47 +135,6 @@ class TestFreeBodyRowsBuild(unittest.TestCase):
         J = unpacked_rows(solver)[0][0, :rows]
         expected = np.einsum("ri,ij,rj->r", J, np.linalg.inv(H), J) + solver.options.pgs_cfm
         np.testing.assert_allclose(solver.placement.diag.numpy()[0, :rows], expected, rtol=1e-5)
-
-
-def _walk_records(rng, trees, size):
-    """The walk's records (:data:`.factor.walk.WALK_COORDINATE` floats a coordinate) of ``trees`` trees of ``size``
-    coordinates, one after another: finite and bounded, the qualification's read of each primary tree's factor."""
-    return (rng.normal(size=(trees * size, WALK_COORDINATE)) * 0.3).astype(np.float32)
-
-
-def _assemble(kernel, arch: int = 120) -> dict:
-    """Assemble a kernel's module offline (Warp's PTX, then ``ptxas``) and return its entry's resources."""
-    with tempfile.TemporaryDirectory() as directory:
-        options = kernel.module.resolve_options(wp.config, block_dim=128)
-        kernel.module._compile(None, directory, output_arch=arch, use_ptx=True, options=options)
-        ptx = sorted(Path(directory).rglob("*.ptx"))[0]
-        source = Path(directory) / "module.ptx"
-        source.write_bytes(ptx.read_bytes().rstrip(b"\0"))
-        result = subprocess.run(
-            ["ptxas", f"-arch=sm_{arch}", "-v", str(source), "-o", str(Path(directory) / "module.cubin")],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    name = f"{kernel.get_mangled_name()}_cuda_kernel_forward"
-    entry = result.stderr[result.stderr.index(name) :]
-    return {
-        "registers": int(re.search(r"Used (\d+) registers", entry).group(1)),
-        "spills": int(re.search(r"(\d+) bytes spill stores", entry).group(1)),
-    }
-
-
-@unittest.skipUnless(shutil.which("ptxas"), "ptxas is not on PATH")
-class TestNativeBuildsAssemble(unittest.TestCase):
-    """The native builds assemble for CUDA without spills."""
-
-    def test_native_builds_assemble_without_spills(self):
-        builds = {
-            "row records": lambda: response_builds_rows.row_record_kernel(8 + 64, 0, 8, 64, 32, "sm_120"),
-        }
-        for name, build in builds.items():
-            with self.subTest(build=name):
-                self.assertEqual(_assemble(build())["spills"], 0)
 
 
 if __name__ == "__main__":

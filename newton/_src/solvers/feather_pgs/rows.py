@@ -47,6 +47,7 @@ from .friction_patches import patch_row_law
 from .joint_table import FreeBodies, bind_free_bodies
 from .joint_table import bind as bind_joint_table
 from .kernel_template import KernelTemplate, items, params
+from .response_builds_rows import bind_row_records
 from .route_table import Laws
 from .row_kernels import (
     LINK_PLAN,
@@ -956,6 +957,7 @@ class RowLaws:
                 speed_bodies,
                 threads,
                 self.bias(solver.options, dt),
+                bind_row_records(placement),
             ],
             block_dim=walk_rows.WRITERS["free_body"].block,
             device=model.device,
@@ -1058,6 +1060,7 @@ class RowLaws:
             self.bias(solver.options, dt),
             placement.dense_phase_bounds,
             int(part),
+            bind_row_records(placement),
         ]
         wp.launch(
             walk_rows.writer_kernel(solver, part),
@@ -1155,8 +1158,9 @@ class RowLaws:
             )
 
     def link_patches(self, solver, contacts):
-        """Link the patches' shared normal loads once every contact row's records are written, before any consumer packs
-        row metadata: after the row pass, or after the one writer where it writes them (the stage list's order)."""
+        """Link the patches' shared normal loads once every contact row's records are written, before any consumer reads
+        them: after the row pass, or after the one writer where it writes them (the stage list's order); a linked
+        row's streamed record takes its parent too (:func:`.response_builds_rows.store_record_parent`)."""
         if solver.sweep.patch_frame_built(contacts):
             self.friction_patches.link(
                 solver.placement.contact_world,
@@ -1164,4 +1168,5 @@ class RowLaws:
                 solver.placement.contact_path,
                 solver.placement.contact_slots_needed,
                 solver.sweep.patch_routes(),
+                bind_row_records(solver.placement),
             )
