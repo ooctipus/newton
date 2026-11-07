@@ -36,6 +36,10 @@ from .sweep import (
     SweepConfig,
     UnitZ,
     WorldRows,
+    active_scan,
+    active_selection,
+    active_violation,
+    active_words,
     cached_pair_law,
     cached_triple_law,
     contact_unit,
@@ -621,10 +625,12 @@ def mf_gs_staging(
     traces: bool = False,
     wide_rows: bool = False,
     free_rows: bool = True,
+    active_rows: bool = False,
 ) -> Staging:
     """The shared working set of a world's matrix-free sweep block (:func:`mf_gs_source` declares it): the world's
     velocity, its dense rows' impulses and staged metadata, the free bodies' run's impulses (``free_rows``) unless they
-    stream, and ``colored`` the colors' staged offsets (and its trace's warp maxima)."""
+    stream, ``colored`` the colors' staged offsets (and its trace's warp maxima), and ``active_rows`` the active
+    enumeration's bitsets (:func:`.sweep.active_words`)."""
     dense = WorldRows(max_constraints, staging=places.staging, stream=places.dense_impulses is Place.GLOBAL)
     free = WorldRows(
         mf_max_constraints, staging="record", free=True, stream=places.impulses is Place.GLOBAL or not free_rows
@@ -641,6 +647,7 @@ def mf_gs_staging(
             *dense.buffers(),
             *free.buffers(),
             *levels,
+            *(active_words(max_constraints) if active_rows else ()),
         ),
         threads=COLORED_THREADS if colored else 32,
     )
@@ -682,6 +689,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         traces=solve_policy.traces,
         wide_rows=wide_rows,
         free_rows=free_rows,
+        active_rows=sweep.active_rows,
     )
 
     dense_count = "int m_dense = world_constraint_count.data[world];"
@@ -773,7 +781,8 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             f"\n    const int off_color = unit_slot * {units + 1};"
         )
     else:
-        sweep_end = end_sweep(solve_policy, iteration=ITERATION)
+        violation = active_violation(dense, dense_op, count="m_dense") if sweep.active_rows else None
+        sweep_end = end_sweep(solve_policy, iteration=ITERATION, violation=violation)
         head = "    const int lane = LANE;"
         first_warp = end_first_warp = ""
         barrier = "SYNC();"
@@ -837,7 +846,17 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         if ({"!__syncthreads_or(velocity_moved != 0)" if colored else "BALLOT(velocity_moved != 0) == 0u"}) iteration_changed = 0;
 """
     admission = _LINE_ADMISSION if speed_rows else _DENSE_ADMISSION
-    dense_phase = rows_block(dense, dense_op, laws, admission=admission, metric=dense_metric, pad="        ")
+    dense_phase = rows_block(
+        dense, dense_op, laws, admission=admission, metric=dense_metric, selected=sweep.active_rows, pad="        "
+    )
+    if sweep.active_rows:
+        # The active enumeration: each sweep's scan selects the dense rows it visits, after the last sweep's stores.
+        spin = (lambda parent: dense.spin_of(parent, "m_dense")) if contact_torsion else None
+        scan = active_scan(
+            dense, dense_op, count="m_dense", seeded=seeded, linked=True, torsion=contact_torsion, spin=spin, pad=""
+        )
+        dense_phase = f"        SYNC();\n{indent(scan, '        ')}\n{dense_phase}"
+        metric_build += "\n" + active_selection(dense, count="m_dense", linked=True, pad="    ")
     sweeps = level_loop(
         (
             f"{first_warp}{dense_phase}\n{end_first_warp}" + ("        __syncthreads();" if colored else ""),
@@ -927,6 +946,8 @@ class GeneralSweep(SweepConfig):
       unit builder's rule picks the worlds, :class:`.sweep_units.ColoredRule`);
     - the row record: ``places`` (:class:`RowPlaces`, the plan's storage choice): the dense rows' metadata staged or
       their records streamed; the free rows' records always stream;
+    - the enumeration: ``active_rows``, the dense rows a sweep visits selected at its entry (the warp mapping's,
+      :func:`.sweep.active_scan`), else every row in slot order;
     - the support class: ``max_row_dofs`` (the placement's packed support), ``support_classes`` (the rows' sides by
       their classes, :func:`.packed_rows.row_classes`), ``wide_rows`` (the bilateral block's), and the free bodies' 6 +
       6 class: ``free_rows`` their own run, else rows of the line, their ``speed_rows`` the line's last;
@@ -959,6 +980,8 @@ class GeneralSweep(SweepConfig):
         validate_record_coordinates(self.max_world_dofs)
         if self.material and not self.weighted:
             raise ValueError("material contacts step by their weights: their sweeps are weighted")
+        if self.colored and self.active_rows:
+            raise ValueError("the colored mapping visits every dense row: its exit votes over the block")
         dofs = self.max_world_dofs if self.max_row_dofs is None else self.max_row_dofs
         object.__setattr__(self, "max_row_dofs", int(dofs))
 
@@ -998,6 +1021,7 @@ class GeneralSweep(SweepConfig):
             + ("_seeded" if self.seeded else "")
             + ("_wide" if self.wide_rows else "")
             + ("_classes" if self.support_classes else "")
+            + ("_active" if self.active_rows else "")
             + (f"_p{pitch}" if pitch is not None and pitch != M + MF else "")
             + ("" if self.free_rows else "_line")
             + ("_speed" if self.speed_rows else "")

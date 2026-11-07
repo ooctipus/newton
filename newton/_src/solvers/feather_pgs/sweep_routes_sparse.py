@@ -14,7 +14,7 @@ acts on is the factor-coordinate delta from ``v_hat``, staged per world and publ
 - the **operator's layout**: packed rows read through explicit row indices (``row_dof``) or the shared support
   table, or (``local_factors``) packed rows expanded once per call into dense rows in shared memory;
 - the **schedule**: every row in slot order, or (``active_rows``) the rows selected at sweep entry, popped from
-  a bitset (:func:`active_scan`); patch rings (``linked_rows``) select their friction pairs through the ring; under
+  a bitset (:func:`.sweep.active_scan`); patch rings (``linked_rows``) select their friction pairs through the ring; under
   contact ``torsion`` the friction triples (a contact's pair and its spin row) in a phase of their own after each
   sweep's rows (:func:`triple_phase`), so the row loop carries none of their code;
 - the **contact unit** (``contact_triplets``): a contact normal and its friction pair in one visit on their Gram
@@ -43,8 +43,7 @@ from . import kernel_template
 from .kernel_template import Dispatch
 from .response_operator import Lanes, SparseFactor
 from .row_inputs import RowArgument
-from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_TORSION
-from .solve_policy import Change, bound
+from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_VELOCITY_LIMIT, ROW_TORSION
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport
 from .sweep import (
@@ -59,6 +58,10 @@ from .sweep import (
     StagedRows,
     SweepConfig,
     UnitZ,
+    active_scan,
+    active_selection,
+    active_violation,
+    active_words,
     cached_pair_law,
     contact_unit,
     end_sweep,
@@ -126,7 +129,7 @@ class SparseSweep(SweepConfig):
       shared memory once a call;
     - lanes: ``lanes_per_world`` (8, 16 or 32) a world, ``64 / lanes`` worlds a block (the device's: one thread on the
       CPU, :attr:`lanes`);
-    - the enumeration: ``active_rows`` visits the rows selected at sweep entry (:func:`active_scan`);
+    - the enumeration: ``active_rows`` visits the rows selected at sweep entry (:func:`.sweep.active_scan`);
     - the contact unit: ``contact_triplets``, a contact normal and its friction pair on their Gram block, with the
       support table and the active scan or linked rows, three rows (four with torsion) at least; ``linked_rows``
       (patch rings) take part only in an active scan or a contact unit;
@@ -139,7 +142,6 @@ class SparseSweep(SweepConfig):
     max_world_dofs: int
     max_row_dofs: int
     _: dataclasses.KW_ONLY
-    active_rows: bool = False
     use_support_table: bool = False
     contact_triplets: bool = False
     velocity_limits: bool = False
@@ -277,129 +279,6 @@ def factor_operator(sweep: SparseSweep) -> SparseFactor:
 # ---------------------------------------------------------------------------------------------------------------------
 # Schedules
 # ---------------------------------------------------------------------------------------------------------------------
-
-
-def active_selection(sweep: SparseSweep, pad: str) -> str:
-    """Whether the sweep selects rows at entry: a valid relaxation and, for point contacts, no linked normal
-    (a world with patch rings keeps every row)."""
-    finite = "isfinite(omega) && omega >= 0.0f"
-    if sweep.linked_rows:
-        return f"{pad}const bool select_active = {finite};"
-    lines = [
-        "bool linked = false;",
-        f"for (int row = lane; row < count; row += {sweep.lanes})",
-        f"    if (s_type[row] == {ROW_CONTACT} && world_row_parent.data[offset + row] >= 0) linked = true;",
-        f"const bool select_active = BALLOT(linked) == 0u && {finite};",
-    ]
-    return indent("\n".join(lines), pad)
-
-
-def active_scan(sweep: SparseSweep, op: SparseFactor, pad: str) -> str:
-    """Select the rows a sweep visits, one lane per row, into the bitsets ``s_normal_words`` and ``s_selected_words``.
-
-    A contact normal or joint limit is selected when it holds impulse or its residual at sweep entry is
-    negative (or not finite), every other non-friction row always. A first tangent is selected while its normal is
-    selected or its pair holds impulse, a patch pair while any normal of its ring is. A row a sweep's earlier updates
-    violate waits for the next sweep. Under contact torsion the rows of a friction triple, staged as spin rows
-    (:class:`.sweep.StagedRows`), are never selected: the triple phase solves them.
-    """
-    held = "s_impulse[parent + 2] != 0.0f"
-    serial = dataclasses.replace(op, lanes=Lanes(1, "0"))
-    # The delta is zero at the first sweep unless warm starting seeded it.
-    dot = serial.dot((("dot", "row", None),), {"row": "row"}, "", reduce=False)
-    if not sweep.warm_start:
-        dot = "if (iter != 0) {\n" + indent(dot, "    ") + "\n}"
-    if sweep.linked_rows:
-        tangent = (
-            "const auto normal_selected = [&](int r) { return ((s_normal_words[r / 32] >> (r & 31)) & 1u) != 0u; };\n"
-            f"selected = row == parent + 1 && (s_impulse[row] != 0.0f || {held}\n"
-            "    || (parent >= 0 && (normal_selected(parent)\n"
-            "        || RING_ANY(parent, count, ring_parent, normal_selected))));"
-        )
-    else:
-        tangent = (
-            "selected = row == parent + 1 && (\n"
-            "    ((s_normal_words[parent / 32] >> (parent & 31)) & 1u) != 0u\n"
-            f"    || s_impulse[row] != 0.0f || {held});"
-        )
-    lane_zero, L = op.lanes.first, sweep.lanes
-    # A word holds 32 rows' bits; a group of fewer lanes fills it L bits at a time, from its first lane.
-    if L == 32:
-        bit, fill = "lane", lambda words: f"{words}[first / 32] = mask;"
-    else:
-        bit = "((first & 31) + lane)"
-
-        def fill(words: str) -> str:
-            kept = f"((first & 31) != 0 ? {words}[first / 32] : 0u)"
-            return f"{words}[first / 32] = {kept} | (mask << (first & 31));"
-
-    select = f"!select_active || (kind != {ROW_CONTACT} && kind != {ROW_JOINT_LIMIT}) || s_impulse[row] != 0.0f"
-    # A triple's rows are the triple phase's: never selected.
-    rowed = f"kind != {ROW_FRICTION} && kind != {ROW_TORSION}" if sweep.torsion else f"kind != {ROW_FRICTION}"
-    text = f"""for (int first = 0; first < count; first += {L}) {{
-    const int row = first + lane;
-    bool selected = false;
-    if (row < count) {{
-        const int kind = s_type[row];
-        if ({rowed}) {{
-            selected = {select};
-            if (!selected && s_diag[row] > 0.0f) {{
-                float dot = 0.0f;
-{indent(dot, "                ")}
-                const float residual = dot + s_rhs[row];
-                selected = residual < 0.0f || !isfinite(residual);
-            }}
-        }}
-    }}
-    const unsigned mask = BALLOT(selected);
-    {lane_zero(fill("s_normal_words"))}
-}}
-SYNC();
-for (int first = 0; first < count; first += {L}) {{
-    const int row = first + lane;
-    bool selected = false;
-    if (row < count) {{
-        selected = !select_active || ((s_normal_words[first / 32] >> {bit}) & 1u) != 0u;
-        if (select_active && s_type[row] == {ROW_FRICTION}) {{
-            const int parent = world_row_parent.data[offset + row];
-{indent(tangent, "            ")}
-        }}
-    }}
-    const unsigned mask = BALLOT(selected);
-    {lane_zero(fill("s_selected_words"))}
-}}
-SYNC();"""
-    return indent(text, pad)
-
-
-def active_violation(sweep: SparseSweep, op: SparseFactor) -> tuple[str, str, str, str]:
-    """The exit law on the rows an active sweep leaves unvisited (:func:`.solve_policy.sweep_exit`): whether a visit
-    of some zero-impulse unilateral row would make a loud change (its violation times ``omega``, as the row's own
-    update would), and the largest such change with its row's kind."""
-    serial = dataclasses.replace(op, lanes=Lanes(1, "0"))
-    # A visit would change the row's own velocity by its excess, at a zero impulse: velocity units on both sides.
-    visit = Change("excess", bound("s_rhs[row]", "fabsf(dot)", "0.0f", diagonal="1.0f"), "kind", "1.0f")
-    code = f"""float sweep_violation = 0.0f;
-int sweep_violation_kind = -1;
-int sweep_violation_loud = 0;
-for (int first = 0; first < count; first += {sweep.lanes}) {{
-    const int row = first + lane;
-    const int kind = row < count ? static_cast<int>(s_type[row]) : -1;
-    if ((kind == {ROW_CONTACT} || kind == {ROW_JOINT_LIMIT}) && s_impulse[row] == 0.0f && s_diag[row] > 0.0f) {{
-        float dot = 0.0f;
-{serial.dot((("dot", "row", None),), {"row": "row"}, "        ", reduce=False)}
-        const float residual = dot + s_rhs[row];
-        const float excess = isfinite(residual) ? omega * fmaxf(-residual, 0.0f) : __int_as_float(0x7f800000);
-        if (excess != 0.0f && ({visit.loud})) sweep_violation_loud = 1;
-        if (excess > sweep_violation) {{
-            sweep_violation = excess;
-            sweep_violation_kind = kind;
-        }}
-    }}
-}}
-ARGMAX(sweep_violation, sweep_violation_kind);
-const bool sweep_violation_any = BALLOT(sweep_violation_loud != 0) != 0u;"""
-    return code, "sweep_violation_any", "sweep_violation", "sweep_violation_kind"
 
 
 def warm_start_seed(op: SparseFactor, pad: str) -> str:
@@ -676,8 +555,7 @@ def _staging(sweep: SparseSweep, rows: StagedRows, op: SparseFactor) -> Staging:
     ``local_factors``, one array per buffer for the block's worlds."""
     buffers = [Buffer("s_delta", "float", sweep.max_world_dofs), *rows.buffers()]
     if sweep.active_rows:
-        words = (sweep.max_constraints + 31) // 32
-        buffers += [Buffer("s_normal_words", "unsigned", words), Buffer("s_selected_words", "unsigned", words)]
+        buffers += active_words(sweep.max_constraints)
     if op.dense:
         buffers.append(Buffer(op.local, "float", sweep.max_constraints * op.dense))
     return Staging(tuple(buffers), groups=sweep.groups, threads=sweep.threads, layout="arrays")
@@ -699,7 +577,7 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
         setup.append(op.expand("count", "    "))
     setup.append("    SYNC();")
     if sweep.active_rows:
-        setup.append(active_selection(sweep, "    "))
+        setup.append(active_selection(rows, count="count", linked=sweep.linked_rows, pad="    "))
     if sweep.warm_start:
         setup.append(warm_start_seed(op, "    "))
     # The row loop's enumeration: the rows the active scan selected, or every row.
@@ -713,7 +591,17 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
 
     scan = []
     if sweep.active_rows:
-        scan.append(active_scan(sweep, op, "        "))
+        scan.append(
+            active_scan(
+                rows,
+                op,
+                count="count",
+                seeded=sweep.warm_start,
+                linked=sweep.linked_rows,
+                torsion=sweep.torsion,
+                pad="        ",
+            )
+        )
     if sweep.contact_triplets:
         scan.append("        int consumed_tangent = -1;")
     # Velocity-limit rows wait for the last-word pass; under contact torsion the triples are the triple phase's.
@@ -727,7 +615,9 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     if sweep.velocity_limits:
         passes = velocity_limit_pass(rows, op, laws, end="count", pad="        ")
     exit_ = end_sweep(
-        sweep.solve_policy, iteration=ITERATION, violation=active_violation(sweep, op) if sweep.active_rows else None
+        sweep.solve_policy,
+        iteration=ITERATION,
+        violation=active_violation(rows, op, count="count") if sweep.active_rows else None,
     )
     sweeps = level_loop((*scan, row_loop, triples), (passes,), exit=exit_)
     body = f"""    const int lane = LANE;

@@ -255,6 +255,11 @@ class WorldRows:
             f"    [&](int patch_row) {{ return {self.peek('patch_row')}; }})"
         )
 
+    def ring_any(self, first: str, predicate: str) -> str:
+        """Whether ``predicate(row)`` holds for a normal of the patch ring that row ``first``'s parent word links."""
+        parent = self.parent("patch_row", enclosed=True)
+        return f"RING_ANY({first}, {self.capacity}, [&](int patch_row) {{ return {parent}; }}, {predicate})"
+
     # -- staging ---------------------------------------------------------------------------------------------------
 
     def buffers(self) -> tuple[Buffer, ...]:
@@ -344,6 +349,9 @@ class RowStore(Protocol):
     def ring_load(self, parent: str, load: str | None = None) -> str:
         """The pooled normal load of the patch ring of normal row ``parent``, from ``load`` (its impulse)."""
 
+    def ring_any(self, first: str, predicate: str) -> str:
+        """Whether ``predicate(row)`` holds for a normal of the patch ring that row ``first``'s parent word links."""
+
     def spin_of(self, parent: str, end: str) -> str:
         """The spin row of the contact whose normal is row ``parent``, of rows ``[0, end)`` (:func:`spin_row`)."""
 
@@ -419,6 +427,9 @@ class StagedRows:
 
     def ring_load(self, parent: str, load: str | None = None) -> str:
         return f"RING_LOAD({load or self.load(parent)}, {parent}, {self.count}, ring_parent, ring_impulse)"
+
+    def ring_any(self, first: str, predicate: str) -> str:
+        return f"RING_ANY({first}, {self.count}, ring_parent, {predicate})"
 
     def visit(self, row: str = "i") -> str:
         return ""
@@ -1431,8 +1442,8 @@ class SlotOrder:
 
 @dataclasses.dataclass(frozen=True)
 class SelectedRows:
-    """The rows a scan at the sweep's entry selected into the bitset ``words`` (the sparse sweep's active subword,
-    :func:`.sweep_routes_sparse.active_scan`), popped in slot order, row ``i`` at a time."""
+    """The rows a scan at the sweep's entry selected into the bitset ``words`` (the active enumeration,
+    :func:`active_scan`), popped in slot order, row ``i`` at a time."""
 
     count: str
     words: str = "s_selected_words"
@@ -1451,6 +1462,154 @@ class SelectedRows:
             f"{pad}    }}\n"
             f"{pad}}}"
         )
+
+
+ACTIVE_WORDS = ("s_normal_words", "s_selected_words")
+"""The active enumeration's bitsets (:func:`active_scan`): the normal and limit rows selected, then every row."""
+
+
+def active_words(capacity: int) -> tuple[Buffer, ...]:
+    """The active enumeration's bitsets of a world of ``capacity`` rows, a bit a row."""
+    return tuple(Buffer(name, "unsigned", (int(capacity) + 31) // 32) for name in ACTIVE_WORDS)
+
+
+def active_selection(rows: RowStore, *, count: str, linked: bool, pad: str) -> str:
+    """Whether the sweep selects rows at entry (``select_active``): a valid relaxation and, for point contacts, no
+    linked normal (a world with patch rings keeps every row); ``linked`` selects a patch pair through its ring."""
+    finite = "isfinite(omega) && omega >= 0.0f"
+    if linked:
+        return f"{pad}const bool select_active = {finite};"
+    lines = [
+        "bool linked = false;",
+        f"for (int row = lane; row < {count}; row += {rows.lanes.width})",
+        f"    if ({rows.kind('row')} == {ROW_CONTACT} && {rows.parent('row')} >= 0) linked = true;",
+        f"const bool select_active = BALLOT(linked) == 0u && {finite};",
+    ]
+    return indent("\n".join(lines), pad)
+
+
+def active_scan(
+    rows: RowStore,
+    op,
+    *,
+    count: str,
+    seeded: bool,
+    linked: bool,
+    torsion: bool,
+    spin: Callable[[str], str] | None = None,
+    pad: str,
+) -> str:
+    """The active enumeration's scan at a sweep's entry: select the rows the sweep visits, one lane per row, into the
+    bitsets ``s_normal_words`` and ``s_selected_words`` (:func:`active_words`), which :class:`SelectedRows` pops.
+
+    A contact normal or joint limit is selected when it holds impulse or its residual at sweep entry is negative (or
+    not finite), every other non-friction row always. A first tangent is selected while its normal is selected or its
+    pair (with ``spin``, its contact's spin row, :meth:`RowStore.spin_of`, too) holds impulse, a patch pair
+    (``linked``) while any normal of its ring is. A row a sweep's earlier updates violate waits for the next sweep.
+    Spin rows (``torsion``) are never selected: their pair's visit solves them, or a triple phase. The velocity is zero
+    at the first sweep unless the sweep was ``seeded``.
+    """
+    held = f"{rows.peek('parent + 2')} != 0.0f"
+    spun = ""
+    if spin is not None:
+        spun = f"const int spin = {spin('parent')};\n"
+        held += f" || (spin >= 0 && {rows.peek('spin')} != 0.0f)"
+    serial = dataclasses.replace(op, lanes=Lanes(1, "0"))
+    # The velocity is zero at the first sweep unless a seed gave it the impulses' response.
+    dot = serial.dot((("dot", "row", None),), {"row": "row"}, "", reduce=False)
+    if not seeded:
+        dot = "if (iter != 0) {\n" + indent(dot, "    ") + "\n}"
+    if linked:
+        tangent = (
+            "const auto normal_selected = [&](int r) { return ((s_normal_words[r / 32] >> (r & 31)) & 1u) != 0u; };\n"
+            f"{spun}selected = row == parent + 1 && ({rows.peek('row')} != 0.0f || {held}\n"
+            "    || (parent >= 0 && (normal_selected(parent)\n"
+            f"        || {rows.ring_any('parent', 'normal_selected')})));"
+        )
+    else:
+        tangent = (
+            f"{spun}selected = row == parent + 1 && (\n"
+            "    ((s_normal_words[parent / 32] >> (parent & 31)) & 1u) != 0u\n"
+            f"    || {rows.peek('row')} != 0.0f || {held});"
+        )
+    lane_zero, L = op.lanes.first, op.lanes.width
+    # A word holds 32 rows' bits; a group of fewer lanes fills it L bits at a time, from its first lane.
+    if L == 32:
+        bit, fill = "lane", lambda words: f"{words}[first / 32] = mask;"
+    else:
+        bit = "((first & 31) + lane)"
+
+        def fill(words: str) -> str:
+            kept = f"((first & 31) != 0 ? {words}[first / 32] : 0u)"
+            return f"{words}[first / 32] = {kept} | (mask << (first & 31));"
+
+    select = f"!select_active || (kind != {ROW_CONTACT} && kind != {ROW_JOINT_LIMIT}) || {rows.peek('row')} != 0.0f"
+    # Spin rows are their pair's (or a triple phase's): never selected.
+    rowed = f"kind != {ROW_FRICTION} && kind != {ROW_TORSION}" if torsion else f"kind != {ROW_FRICTION}"
+    text = f"""for (int first = 0; first < {count}; first += {L}) {{
+    const int row = first + lane;
+    bool selected = false;
+    if (row < {count}) {{
+        const int kind = {rows.kind("row")};
+        if ({rowed}) {{
+            selected = {select};
+            if (!selected && {rows.diag("row")} > 0.0f) {{
+                float dot = 0.0f;
+{indent(dot, "                ")}
+                const float residual = dot + {rows.rhs_of("row")};
+                selected = residual < 0.0f || !isfinite(residual);
+            }}
+        }}
+    }}
+    const unsigned mask = BALLOT(selected);
+    {lane_zero(fill("s_normal_words"))}
+}}
+SYNC();
+for (int first = 0; first < {count}; first += {L}) {{
+    const int row = first + lane;
+    bool selected = false;
+    if (row < {count}) {{
+        selected = !select_active || ((s_normal_words[first / 32] >> {bit}) & 1u) != 0u;
+        if (select_active && {rows.kind("row")} == {ROW_FRICTION}) {{
+            const int parent = {rows.parent("row")};
+{indent(tangent, "            ")}
+        }}
+    }}
+    const unsigned mask = BALLOT(selected);
+    {lane_zero(fill("s_selected_words"))}
+}}
+SYNC();"""
+    return indent(text, pad)
+
+
+def active_violation(rows: RowStore, op, *, count: str) -> tuple[str, str, str, str]:
+    """The exit law on the rows an active sweep leaves unvisited (:func:`.solve_policy.sweep_exit`): whether a visit
+    of some zero-impulse unilateral row would make a loud change (its violation times ``omega``, as the row's own
+    update would), and the largest such change with its row's kind."""
+    serial = dataclasses.replace(op, lanes=Lanes(1, "0"))
+    # A visit would change the row's own velocity by its excess, at a zero impulse: velocity units on both sides.
+    visit = Change("excess", bound(rows.rhs_of("row"), "fabsf(dot)", "0.0f", diagonal="1.0f"), "kind", "1.0f")
+    code = f"""float sweep_violation = 0.0f;
+int sweep_violation_kind = -1;
+int sweep_violation_loud = 0;
+for (int first = 0; first < {count}; first += {op.lanes.width}) {{
+    const int row = first + lane;
+    const int kind = row < {count} ? static_cast<int>({rows.kind("row")}) : -1;
+    if ((kind == {ROW_CONTACT} || kind == {ROW_JOINT_LIMIT}) && {rows.peek("row")} == 0.0f && {rows.diag("row")} > 0.0f) {{
+        float dot = 0.0f;
+{serial.dot((("dot", "row", None),), {"row": "row"}, "        ", reduce=False)}
+        const float residual = dot + {rows.rhs_of("row")};
+        const float excess = isfinite(residual) ? omega * fmaxf(-residual, 0.0f) : __int_as_float(0x7f800000);
+        if (excess != 0.0f && ({visit.loud})) sweep_violation_loud = 1;
+        if (excess > sweep_violation) {{
+            sweep_violation = excess;
+            sweep_violation_kind = kind;
+        }}
+    }}
+}}
+ARGMAX(sweep_violation, sweep_violation_kind);
+const bool sweep_violation_any = BALLOT(sweep_violation_loud != 0) != 0u;"""
+    return code, "sweep_violation_any", "sweep_violation", "sweep_violation_kind"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1759,6 +1918,7 @@ def rows_block(
     admission: str = "",
     end: str | None = None,
     metric: str | None = None,
+    selected: bool = False,
     pad: str = "        ",
 ) -> str:
     """The Gauss-Seidel loop over a world's rows of one class ``[0, end)`` in slot order (:class:`WorldRows`): the
@@ -1775,11 +1935,19 @@ def rows_block(
     only ever reads its own stores.
 
     With ``metric`` (the law :func:`friction_metric_law` declared) every friction triple forms its metric once per
-    launch, at its first loaded visit (:func:`friction_metric_stage`).
+    launch, at its first loaded visit (:func:`friction_metric_stage`). With ``selected`` the dense rows' enumeration
+    is the active one (:class:`SelectedRows`, after :func:`active_scan`): a selected row's record loads at its visit.
     """
     inner = pad + "    "
     if end is None:
         end = "mf_contact_end" if rows.free else "m_dense"
+    if selected:
+        if rows.free:
+            raise ValueError("the active enumeration selects the dense rows")
+        order = SelectedRows(end)
+        inner = order.inner(pad)
+        visit = row_step(rows, op, laws, end=end, admission=admission, metric=metric, pad=inner)
+        return order.wrap(indent(rows.visit("i"), inner) + "\n" + visit if rows.record else visit, pad)
     if not rows.free:
         visit = row_step(rows, op, laws, end=end, admission=admission, metric=metric, pad=inner)
         if rows.record:
@@ -2800,6 +2968,8 @@ class SweepConfig:
         material: Material contacts step by their compliance's weights (they are weighted).
         torsion: Spin rows may follow friction pairs.
         levels: The law of the configuration's leveled rows (:class:`LevelLaw`).
+        active_rows: The enumeration of its Gauss-Seidel rows: every row in slot order, or the rows selected at
+            sweep entry (:func:`active_scan`, :class:`SelectedRows`).
     """
 
     solve_policy: SolvePolicy = DEFAULT_POLICY
@@ -2807,6 +2977,7 @@ class SweepConfig:
     material: bool = False
     torsion: bool = False
     levels: LevelLaw = LevelLaw()
+    active_rows: bool = False
 
     ABI: ClassVar[tuple]
     """The native ABI (:func:`.kernel_template.params`)."""
