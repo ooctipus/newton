@@ -223,7 +223,7 @@ class TestFeatherPGSFrictionDirection(unittest.TestCase):
     def _solve_on_the_tiers(self, cases):
         """Hold ``cases`` through the Jacobi tiers: rows formed in the kernel, linked, 2000 sweeps, tolerance 0."""
         device = wp.get_device("cuda:0")
-        kernel = sweep_routes_tiers.parallel_kernel(
+        kernel = sweep_routes_tiers.TierSweep(
             64, 32, 6, str(device.arch), rows=32, sweeps=2000, inkernel_response=(6, 0, 0, 0), linked_rows=True
         )
         for case in cases:

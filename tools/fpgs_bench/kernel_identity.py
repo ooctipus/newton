@@ -150,12 +150,11 @@ def factory_calls():
     """
     from newton._src.core.memory import Place  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
-        keyed_rows,
         sweep_routes,
         sweep_routes_tiers,
     )
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
-    from newton.tests.feather_pgs_law_harness import keyed_classes  # noqa: PLC0415
+    from newton.tests.feather_pgs_law_harness import built, keyed_classes  # noqa: PLC0415
 
     mf_gs = _unwrapped(sweep_routes.mf_gs_kernel)
     toggles = (
@@ -171,8 +170,7 @@ def factory_calls():
             yield "sweep_routes.mf_gs_kernel", mf_gs, (64, 32, 12, ARCH), {**base, **change}
 
     def parallel(layout, *args, **kwargs):
-        factory = keyed_rows.get_parallel_factory.__wrapped__(sweep_routes_tiers.parallel_kernel, layout)
-        return factory(*args, classes=keyed_classes(layout), **kwargs)
+        return built(sweep_routes_tiers.TierSweep)(*args, keyed=layout, classes=keyed_classes(layout), **kwargs)
 
     layout = Named("KeyedLayout(18, 0, 0, 0, 48, False, 0)", KeyedLayout(18, 0, 0, 0, 48, False, 0))
     for rows in (32, 48):
@@ -182,7 +180,7 @@ def factory_calls():
             "inkernel_response": (18, 0, 0, 0),
             "linked_rows": True,
         }
-        yield "keyed_rows.get_parallel_factory", parallel, (layout, 72, 32, 18, ARCH), kwargs
+        yield "sweep_routes_tiers.TierSweep[keyed]", parallel, (layout, 72, 32, 18, ARCH), kwargs
 
 
 def _schedules(layout, chain):
@@ -437,6 +435,7 @@ def walk_calls():
     from newton._src.solvers.feather_pgs import tree_kinetic_state as native  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.factor import walk as factor_walk  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout  # noqa: PLC0415
+    from newton.tests.feather_pgs_law_harness import built  # noqa: PLC0415
 
     classes = walk_classes_of_the_suite()
     named = {name: Named(f"({name},)", (cls,)) for name, cls in classes.items()}
@@ -497,7 +496,7 @@ def walk_calls():
     free = {"free_rows": False, "speed_rows": True, "has_dense_velocity_limit_rows": False}
     yield "sweep_routes.mf_gs_kernel", mf_gs, (64, 32, 12, ARCH), free
     tiers = {"rows": 32, "sweeps": 24, "inkernel_response": (18, 0, 0, 0)}
-    yield "sweep_routes_tiers.parallel_kernel", sweep_routes_tiers.parallel_kernel, (64, 32, 18, ARCH), tiers
+    yield "sweep_routes_tiers.TierSweep", built(sweep_routes_tiers.TierSweep), (64, 32, 18, ARCH), tiers
 
 
 def _depth(parent, body):
@@ -534,7 +533,6 @@ def census_calls():
     resident row metadata.
     """
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
-        keyed_rows,
         sweep_routes,
         sweep_routes_diag,
         sweep_routes_local,
@@ -586,8 +584,8 @@ def census_calls():
             (_axis("speculative_contact_batches"), _axis("contact_units"), _axis("seeded"), _axis("velocity_limits")),
         ),
         (
-            "sweep_routes_tiers.parallel_kernel",
-            sweep_routes_tiers.parallel_kernel,
+            "sweep_routes_tiers.TierSweep",
+            built(sweep_routes_tiers.TierSweep),
             ((192, 32, 18, ARCH),),
             (
                 tuple({"rows": rows, "sweeps": 24, "inkernel_response": (18, 0, 0, 0)} for rows in (32, 48, 128)),
@@ -596,10 +594,8 @@ def census_calls():
             ),
         ),
         (
-            f"keyed_rows.get_parallel_factory({keyed!r})",
-            keyed_rows.get_parallel_factory.__wrapped__(
-                functools.partial(sweep_routes_tiers.parallel_kernel, classes=keyed_classes(keyed)), keyed
-            ),
+            f"sweep_routes_tiers.TierSweep[keyed={keyed!r}]",
+            functools.partial(built(sweep_routes_tiers.TierSweep), keyed=keyed, classes=keyed_classes(keyed)),
             ((128, 32, 22, ARCH),),
             (
                 tuple(

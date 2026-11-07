@@ -13,10 +13,10 @@ Every generated kernel is a :class:`KernelTemplate`:
   generated struct's fields (:func:`params`). The native function's ABI and the Warp kernel's signature are both
   derived from them, with the :class:`Dispatch` that maps the launch's threads to native calls, one declaration of
   the one dispatch :func:`items` (a thread's item directly, behind a tail guard, or from a device queue);
-- :meth:`KernelTemplate.kernel` builds the Warp kernel. What a launch site needs to know about a kernel travels
-  with it in a typed descriptor (:class:`SweepTier` for the matrix-free tiers: block size, the operands it takes
-  besides its signature's, its velocity-limit law), and a solve readout is registered with the kernel by
-  :meth:`.solve_policy.SolveReadoutRecord.register`, in place of attributes set on the kernel.
+- :meth:`KernelTemplate.kernel` builds the Warp kernel. What a launch site needs to know about a sweep travels with
+  its configuration (:class:`.sweep.SweepConfig`: its work, its operands besides its signature's), and a solve readout
+  is registered with the kernel by :meth:`.solve_policy.SolveReadoutRecord.register`, in place of attributes set on the
+  kernel.
 
 A Python body is a ``wp.func`` under the same dispatch (:attr:`KernelTemplate.function`); a Python kernel not yet
 split into one is a function renamed per variant: :func:`python_kernel`.
@@ -32,14 +32,12 @@ from typing import Any
 
 import warp as wp
 
-from ...core.execution import Work
 from . import field_group
 from .device_preludes import DevicePrelude, cuda_native, dual_native, substitute
 
 __all__ = [
     "Dispatch",
     "KernelTemplate",
-    "SweepTier",
     "items",
     "operands",
     "params",
@@ -305,32 +303,3 @@ def python_kernel(function, name: str, **options) -> wp.Kernel:
     """
     function.__name__ = function.__qualname__ = name
     return wp.kernel(**{"enable_backward": False, **options}, module="unique")(function)
-
-
-@dataclasses.dataclass(frozen=True)
-class SweepTier:
-    """A tier sweep of the matrix-free solve: its kernel and what its launches and the route record read.
-
-    The typed launch descriptor of a tier, in place of attributes set on its kernel.
-
-    Args:
-        kernel: The tier's Warp kernel.
-        work: What its launches declare (:class:`~newton._src.core.execution.Work`, its items left to the plan): a
-            block a world, its register line and its shared memory. Its kernel's bound and its launches' grid are
-            the layer's shape of it.
-        tier: Its index among the parallel tiers' world lists, or ``None`` for a tier on the general queue.
-        grid: Blocks of its launches on its own list (the layer's shape of :attr:`work` over the worlds).
-        kinetic_rows: It reads the keyed rows' operands after those.
-        linked_rows: It projects each friction pair on its patch ring's pooled normal load.
-        velocity_limit_pass: It runs the last-word velocity-limit pass after its final sweep.
-        sweeps: Its sweep budget (0 for an incremental tier).
-    """
-
-    kernel: wp.Kernel
-    work: Work
-    tier: int | None = None
-    grid: int = 0
-    kinetic_rows: bool = False
-    linked_rows: bool = False
-    velocity_limit_pass: bool = False
-    sweeps: int = 0

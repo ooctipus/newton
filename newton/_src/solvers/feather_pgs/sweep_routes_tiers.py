@@ -3,8 +3,8 @@
 
 """The parallel (Jacobi) tiers as configurations of the sweep emitter (:mod:`.sweep`).
 
-:func:`parallel_kernel` builds a tier's kernel (:data:`PARALLEL_ABI`, the world queue) and returns its launch
-descriptor (:class:`.kernel_template.SweepTier`).
+:class:`TierSweep` is a tier's configuration, which the one factory builds (:func:`.sweep.sweep_kernel`:
+:data:`PARALLEL_ABI`, the world queue).
 
 A tier owns each world without free-body rows whose dense rows it bounds: one block per world and a lane per row
 (:class:`.sweep.JacobiRows`). The rows are the walk's (:class:`.response_operator.WalkedRows`): the keyed rows walk their
@@ -18,27 +18,30 @@ from __future__ import annotations
 import dataclasses
 import math
 from fractions import Fraction
-from functools import cache
+from typing import ClassVar
 
 import warp as wp
 
-from ...core.execution import Work, device_lanes, shape
-from ...core.memory import Buffer, Staging, arch_budget, built_for
+from ...core.execution import Work, device_lanes
+from ...core.memory import Buffer, Staging
 from . import kernel_template
 from .device_preludes import RING, SHARED_STORAGE, VirtualLanes, group_native, lane_group
 from .factor.walk import walk_prelude, walk_row_prelude, walk_tables
-from .kernel_template import KernelTemplate, SweepTier
+from .kernel_template import Dispatch
+from .keyed_row_layout import KeyedLayout
+from .keyed_rows import get_direct_parallel_inputs
 from .law_source import law_preludes
 from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import Lanes, TransposedResponse, WalkedRows
+from .row_inputs import RowArgument
 from .row_metadata import _validate_dense_metadata_encoding
-from .solve_policy import DEFAULT_POLICY, SolvePolicy, block_argmax
+from .solve_policy import block_argmax
 from .sweep import (
     CONTACT,
     JOINT_LIMIT,
     VELOCITY_LIMIT,
     JacobiRows,
-    RowLaws,
+    SweepConfig,
     dense_tier_world,
     jacobi_limit_pass,
     jacobi_scale,
@@ -102,30 +105,6 @@ def tier_sweeps(rows: int, iterations: int) -> int:
     return min(raw, TIER_SWEEPS_CAP)
 
 
-def _operands(
-    max_constraints: int,
-    max_world_dofs: int,
-    *,
-    rows: int,
-    inkernel_response: tuple[int, int, int, int],
-    row_inputs,
-):
-    """Validate the tier's options; return the worlds' tree sizes and offsets and the keyed rows' operands (``None``
-    without)."""
-    _validate_dense_metadata_encoding(max_constraints)
-    M_D, D, AM = max_constraints, max_world_dofs, int(rows)
-    if AM <= 0 or AM > M_D or AM > TIER_MAX_ROWS:
-        raise ValueError(f"rows must be in [1, min(max_constraints, {TIER_MAX_ROWS})]")
-    groups = tuple(int(v) for v in inkernel_response)
-    NA, NB, OA, OB = groups
-    if NA <= 0 or NB < 0 or OA + NA > D or (NB > 0 and OB + NB > D):
-        raise ValueError("inkernel_response needs group sizes within the world DOF count")
-    if AM % 4 != 0:
-        raise ValueError("rows must be a multiple of 4")
-    operands = row_inputs(NA, NB, OA, OB, D, M_D) if row_inputs is not None else None
-    return groups, operands
-
-
 def _stored_row(pitch: int, dofs: int) -> str:
     """Read the lane's row as the one writer stored it (:mod:`.walk_rows`: the packed sink at its world coordinates, the
     slips' frame applied; ``pitch`` rows a world's line) and its incident velocity ``J v_hat`` (``row_incident``)."""
@@ -137,34 +116,16 @@ def _stored_row(pitch: int, dofs: int) -> str:
     )
 
 
-def parallel_source(
-    max_constraints: int,
-    max_world_dofs: int,
-    *,
-    rows: int,
-    sweeps: int,
-    inkernel_response: tuple[int, int, int, int],
-    row_inputs=None,
-    linked_rows: bool = False,
-    velocity_limit_pass: bool = False,
-    torsion: bool = False,
-    solve_policy: SolvePolicy = DEFAULT_POLICY,
-    weighted: bool = False,
-    material: bool = False,
-    frame: tuple[int, int] = (0, 0),
-    classes: tuple[WalkClass, ...] = (),
-    pitch: int | None = None,
-    lanes: int = 32,
-) -> tuple[str, Staging]:
+def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
     """The native body of a parallel tier: a world's dense rows (at most ``rows``: its claim's bucket holds the rest)
-    under the Jacobi law, a lane per row; under ``torsion`` a contact's spin row steps and projects with its pair.
-    ``lanes`` is the device's (:func:`.execution.device_lanes`): CUDA's lanes are the block's threads, the CPU's one
+    under the Jacobi law, a lane per row (``tier``, :class:`TierSweep`'s source); under ``torsion`` a contact's spin
+    row steps and projects with its pair. The lanes are the device's (:func:`.execution.device_lanes`): CUDA's lanes are the block's threads, the CPU's one
     thread runs them as virtual lanes (:class:`.device_preludes.VirtualLanes`), each phase between the block's barriers
     a loop.
 
     The block stages the rows (:class:`.sweep.JacobiRows`) and the velocity, then the rows in the walk's coordinates
     (:class:`.WalkedRows`, the world's trees ``inkernel_response = (NA, NB, OA, OB)``): the keyed rows' operands
-    (``row_inputs``: their metadata, their walked rows and arguments) walk their seeds in the kernel, with the release
+    (:attr:`TierSweep.row_inputs`: their metadata, their walked rows and arguments) walk their seeds in the kernel, with the release
     of each tree that can slip (``frame``: the class's slip capacity of each tree; FL3.4's release ``R``, the leave
     ``R^T``); the other rows are the one writer's stored ``Z``, its frame ``F`` included (the leave ``F^T``). They form the matrix-free response (:class:`.TransposedResponse`: ``Z`` in
     registers and staged transposed, its step scale bounded by the column sums). It runs at most ``sweeps`` Jacobi
@@ -177,22 +138,16 @@ def parallel_source(
 
     Returns the body and its staging.
     """
-    (NA, NB, OA, OB), operands = _operands(
-        max_constraints,
-        max_world_dofs,
-        rows=rows,
-        inkernel_response=inkernel_response,
-        row_inputs=row_inputs,
-    )
-    M_D, D, AM = max_constraints, max_world_dofs, int(rows)
-    NT = 32 * ((AM + 31) // 32)
-    if lanes not in (1, 32):
-        raise ValueError(f"a tier runs its rows on a block's warps or the CPU's one thread, got {lanes} lanes")
-    serial = lanes == 1
-    velocity_limit_pass = bool(velocity_limit_pass)
-    laws = RowLaws(regularize=bool(weighted), material=bool(material), torsion=torsion, policy=solve_policy)
+    NA, NB, OA, OB = tier.inkernel_response
+    operands = tier.row_inputs
+    M_D, D, AM, NT = tier.max_constraints, tier.max_world_dofs, tier.rows, tier.threads
+    pitch, frame, classes, sweeps = tier.pitch, tier.frame, tier.classes, tier.sweeps
+    torsion, solve_policy, linked_rows = tier.torsion, tier.solve_policy, tier.linked_rows
+    serial = device_lanes(tier.device_arch) == 1
+    velocity_limit_pass = tier.velocity_limit_pass
+    laws = tier.laws
     store = JacobiRows(
-        AM, NT, limits=velocity_limit_pass, types=solve_policy.traces, weighted=bool(weighted), torsion=torsion
+        AM, NT, limits=velocity_limit_pass, types=solve_policy.traces, weighted=tier.weighted, torsion=torsion
     )
     row_lanes = Lanes(NT)
     walked = WalkedRows(
@@ -263,8 +218,6 @@ def parallel_source(
     row_preludes = operands.preludes if operands is not None else ()
     walk = ()
     if operands is not None:
-        if not classes:
-            raise ValueError("a tier that walks its rows walks the classes of their trees")
         # The walk last, as the general sweep declares it (sweep_routes.mf_gs_source).
         walk = (walk_prelude(walk_tables(classes), 1, classes_half(classes)), walk_row_prelude(1))
     preludes = (
@@ -274,104 +227,126 @@ def parallel_source(
         *row_preludes,
         *law_preludes(PROJECTION_LAW, *((CONE_LAW,) if torsion else ())),
     )
-    return group_native(body, preludes=(*preludes, *solve_policy.preludes, *walk), lanes=lanes), staging
+    return group_native(
+        body, preludes=(*preludes, *solve_policy.preludes, *walk), lanes=device_lanes(tier.device_arch)
+    ), staging
 
 
-@cache
-def parallel_kernel(
-    max_constraints: int,
-    mf_max_constraints: int,
-    max_world_dofs: int,
-    device_arch: str,
-    *,
-    rows: int,
-    sweeps: int,
-    inkernel_response: tuple[int, int, int, int],
-    row_inputs=None,
-    linked_rows: bool = False,
-    velocity_limit_pass: bool = False,
-    torsion: bool = False,
-    solve_policy: SolvePolicy = DEFAULT_POLICY,
-    weighted: bool = False,
-    material: bool = False,
-    frame: tuple[int, int] = (0, 0),
-    classes: tuple[WalkClass, ...] = (),
-    pitch: int | None = None,
-) -> SweepTier:
-    """A parallel tier: its kernel (:data:`PARALLEL_ABI`) and its launch descriptor.
+@dataclasses.dataclass(frozen=True)
+class TierSweep(SweepConfig):
+    """A parallel tier's configuration (case K4): a world's dense rows (at most ``rows``, its claim's bucket) under the
+    Jacobi law, a lane a row, ``sweeps`` sweeps at most (:func:`parallel_source`).
 
-    A thread per row: the block's threads cover ``rows`` in whole warps, and its working set fits the static budget
-    of ``device_arch`` (:func:`.memory.arch_budget`). The tier owns no world with free-body rows (its kernel's name
-    carries the solver's free-body capacity ``mf_max_constraints``) and admits its velocity-limit rows as unilateral
-    rows. Its worlds' stored rows (:mod:`.walk_rows`) lie at their coordinates, ``max_world_dofs`` entries a row.
-    With ``weighted`` its contact rows step by their weights, ``material`` contacts' from their compliance; ``frame``
-    is each tree's slip capacity (:class:`.WalkedRows`); ``classes`` the walking classes whose trees its keyed rows
-    walk (:attr:`.tree_factor.TreeFactor.walk_classes`). It walks its bucket of the claims' worlds
-    (:func:`.sweep_routes.worlds`, :func:`.sweep_levels.claim_worlds`), which holds its worlds only.
+    Its switches, each the plan's from the class's shape and the laws (:meth:`.sweep_plan.Sweep.build`):
+
+    - the level law: a world's rows one split (Jacobi) level, stepped at once in the Gershgorin metric with momentum,
+      ``sweeps`` its budget (:func:`tier_sweeps` of its row bound); ``rows`` the bucket's bound;
+    - the producer's sink: with a ``keyed`` layout (:class:`.keyed_row_layout.KeyedLayout`) the rows are walked from
+      their keys in the kernel's prologue (:func:`.keyed_rows.get_direct_parallel_inputs`), else read as the one writer
+      stored them (``pitch`` rows a world's line);
+    - the rows' trees: ``inkernel_response`` ``(NA, NB, OA, OB)``, their slip capacities ``frame`` and walking
+      ``classes``;
+    - ``linked_rows``: pairs project on their patch ring's pooled load; ``velocity_limit_pass``: the velocity limits'
+      last word.
+
+    A tier owns no world with free-body rows (its kernel's name carries the solver's free-body capacity
+    ``mf_max_constraints``) and admits its velocity-limit rows as unilateral rows. Its worlds' stored rows
+    (:mod:`.walk_rows`) lie at their coordinates, ``max_world_dofs`` entries a row. A block a world, a thread a row
+    (the CPU's one thread runs them as virtual lanes); its working set fits the static budget of ``device_arch``. It
+    walks its bucket of the claims' worlds (:func:`.sweep_routes.worlds`, :func:`.sweep_levels.claim_worlds`).
     """
-    if material and not weighted:
-        raise ValueError("material contacts step by their weights: their tiers are weighted")
-    options = {
-        "rows": rows,
-        "inkernel_response": inkernel_response,
-        "row_inputs": row_inputs,
-    }
-    snippet, staging = parallel_source(
-        max_constraints,
-        max_world_dofs,
-        **options,
-        sweeps=sweeps,
-        linked_rows=linked_rows,
-        velocity_limit_pass=velocity_limit_pass,
-        torsion=torsion,
-        solve_policy=solve_policy,
-        weighted=weighted,
-        material=material,
-        frame=frame,
-        classes=classes,
-        pitch=pitch,
-        lanes=device_lanes(device_arch),
-    )
-    staging.check("the parallel tier", arch_budget(device_arch))
-    (NA, NB, OA, OB), operands = _operands(max_constraints, max_world_dofs, **options)
-    AM = int(rows)
-    NT = 32 * ((AM + 31) // 32)
-    walk_half = classes_half(classes) if classes else WALK_BOTH
-    # A block a world, a thread a row. Not persistent: an uncapped line does not fix the tier's residency, and a grid
-    # of one wave by the line is 1.2 waves at a keyed tier's 96 registers (allegro's 64-row tier 5% slower, PRO).
-    work = Work(0, lanes=NT, block=NT, registers=REGISTER_LINE, cap=False, shared=staging.bytes)
-    name = (
-        f"sweep_{'parallel' if row_inputs is None else 'keyed_parallel'}_{max_constraints}_{mf_max_constraints}"
-        f"_{max_world_dofs}_rows{AM}_sweeps{int(sweeps)}_nt{NT}_ink{NA}_{NB}_o{OA}_{OB}"
-        + (f"_frame{int(frame[0])}_{int(frame[1])}" if any(frame) else "")
-        + ("" if walk_half == WALK_BOTH else f"_half{walk_half}")
-        + ("" if pitch is None or pitch == max_constraints else f"_p{int(pitch)}")
-        + ("_linked" if linked_rows else "")
-        + ("_lw" if velocity_limit_pass else "")
-        + ("_weighted" if weighted else "")
-        + ("_material" if material else "")
-        + ("_torsion" if torsion else "")
-        + solve_policy.suffix
-    )
-    kernel = KernelTemplate.from_abi(
-        name,
-        PARALLEL_ABI,
-        snippet,
-        worlds(),
-        extra=(
-            *(operands.arguments if operands is not None else ()),
-            *material_arguments(material),
-            *solve_policy.arguments,
-        ),
-        composed=True,
-        native_name="sweep_parallel_native",
-        launch_bounds=shape(work, built_for(device_arch)).bounds,
-    ).kernel()
-    return SweepTier(
-        kernel,
-        work,
-        kinetic_rows=row_inputs is not None,
-        linked_rows=bool(linked_rows),
-        velocity_limit_pass=bool(velocity_limit_pass),
-        sweeps=int(sweeps),
-    )
+
+    max_constraints: int
+    mf_max_constraints: int
+    max_world_dofs: int
+    device_arch: str
+    _: dataclasses.KW_ONLY
+    rows: int
+    sweeps: int
+    inkernel_response: tuple[int, int, int, int]
+    keyed: KeyedLayout | None = None
+    linked_rows: bool = False
+    velocity_limit_pass: bool = False
+    frame: tuple[int, int] = (0, 0)
+    classes: tuple[WalkClass, ...] = ()
+    pitch: int | None = None
+
+    ABI: ClassVar[tuple] = PARALLEL_ABI
+    NATIVE: ClassVar[str] = "sweep_parallel_native"
+    LABEL: ClassVar[str] = "the parallel tier"
+
+    def __post_init__(self):
+        if self.material and not self.weighted:
+            raise ValueError("material contacts step by their weights: their tiers are weighted")
+        _validate_dense_metadata_encoding(self.max_constraints)
+        M_D, D, AM = self.max_constraints, self.max_world_dofs, int(self.rows)
+        if AM <= 0 or AM > M_D or AM > TIER_MAX_ROWS:
+            raise ValueError(f"rows must be in [1, min(max_constraints, {TIER_MAX_ROWS})]")
+        NA, NB, OA, OB = (int(v) for v in self.inkernel_response)
+        if NA <= 0 or NB < 0 or OA + NA > D or (NB > 0 and OB + NB > D):
+            raise ValueError("inkernel_response needs group sizes within the world DOF count")
+        if AM % 4 != 0:
+            raise ValueError("rows must be a multiple of 4")
+        if self.keyed is not None and not self.classes:
+            raise ValueError("a tier that walks its rows walks the classes of their trees")
+        object.__setattr__(self, "inkernel_response", (NA, NB, OA, OB))
+        object.__setattr__(self, "frame", tuple(int(cap) for cap in self.frame))
+
+    @property
+    def threads(self) -> int:
+        """A block's threads: the rows in whole warps."""
+        return 32 * ((int(self.rows) + 31) // 32)
+
+    @property
+    def row_inputs(self):
+        """The keyed rows' operands (:class:`.row_inputs.ParallelRowInputs`), ``None`` for stored rows."""
+        if self.keyed is None:
+            return None
+        return get_direct_parallel_inputs(
+            self.keyed,
+            *self.inkernel_response,
+            self.max_world_dofs,
+            self.max_constraints,
+            weighted=self.weighted,
+            torsion=self.torsion,
+        )
+
+    @property
+    def name(self) -> str:
+        NA, NB, OA, OB = self.inkernel_response
+        walk_half = classes_half(self.classes) if self.classes else WALK_BOTH
+        frame, pitch = self.frame, self.pitch
+        return (
+            f"sweep_{'parallel' if self.keyed is None else 'keyed_parallel'}_{self.max_constraints}_"
+            f"{self.mf_max_constraints}_{self.max_world_dofs}_rows{int(self.rows)}_sweeps{int(self.sweeps)}"
+            f"_nt{self.threads}_ink{NA}_{NB}_o{OA}_{OB}"
+            + (f"_frame{int(frame[0])}_{int(frame[1])}" if any(frame) else "")
+            + ("" if walk_half == WALK_BOTH else f"_half{walk_half}")
+            + ("" if pitch is None or pitch == self.max_constraints else f"_p{int(pitch)}")
+            + ("_linked" if self.linked_rows else "")
+            + ("_lw" if self.velocity_limit_pass else "")
+            + ("_weighted" if self.weighted else "")
+            + ("_material" if self.material else "")
+            + ("_torsion" if self.torsion else "")
+            + self.solve_policy.suffix
+        )
+
+    source = parallel_source
+
+    def dispatch(self, staging: Staging) -> Dispatch:
+        return worlds()
+
+    def operands(self) -> tuple[RowArgument, ...]:
+        inputs = self.row_inputs
+        return (
+            *(inputs.arguments if inputs is not None else ()),
+            *material_arguments(self.material),
+            *self.solve_policy.arguments,
+        )
+
+    def work(self, items: int = 0, shared: int = 0) -> Work:
+        """A block a world, a thread a row. Not persistent: an uncapped line does not fix the tier's residency, and a
+        grid of one wave by the line is 1.2 waves at a keyed tier's 96 registers (allegro's 64-row tier 5% slower,
+        PRO)."""
+        NT = self.threads
+        return Work(int(items), lanes=NT, block=NT, registers=REGISTER_LINE, cap=False, shared=int(shared))

@@ -536,18 +536,18 @@ def _tiers(solver) -> dict | None:
         # Why the class takes the tiers (case K4: the in-kernel response's shape).
         "inkernel_response_reason": row.reasons["K4"],
         # Every built tier projects each friction pair on its patch ring's pooled normal load (patch friction).
-        "linked_rows": all(tier.linked_rows for tier in tiers),
+        "linked_rows": all(tier.config.linked_rows for tier in tiers),
         # The last-word velocity-limit pass after the final sweep (linked tiers with joint velocity limits).
-        "velocity_limit_pass": all(tier.velocity_limit_pass for tier in tiers),
+        "velocity_limit_pass": all(tier.config.velocity_limit_pass for tier in tiers),
         # The largest tier budget; each tier records its own (the equal-accuracy rule "auto", or "pinned").
-        "sweeps": max(tier.sweeps for tier in tiers),
+        "sweeps": max(tier.config.sweeps for tier in tiers),
         "sweeps_rule": solver.sweep.par_sweeps_rule,
         "sweeps_reason": solver.sweep.par_sweeps_reason,
         "tiers": [
             {
                 "rows": int(rows),
                 "min_rows": int(min_rows),
-                "sweeps": tier.sweeps,
+                "sweeps": tier.config.sweeps,
                 "kernel": _key(tier.kernel),
             }
             for (rows, min_rows), tier in zip(solver.sweep.par_tiers, tiers, strict=True)

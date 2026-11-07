@@ -15,8 +15,6 @@ divides the tangent coefficients. The row sources then write the patch row law
 them, so the links survive until the sweep and the patch finish read them.
 """
 
-from functools import cache, partial
-
 import warp as wp
 
 from ...core.execution import Buckets, bucket_item
@@ -354,21 +352,6 @@ def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, weight
         parent=parent,
         mu=mu,
     )
-
-
-@cache
-def get_parallel_factory(original, layout):
-    """Use the shared parallel policy with the layout's physical row operands.
-
-    The rows carry the patch row law, and the policy projects each friction pair on its ring's pooled load.
-    """
-
-    def factory(*args, weighted=False, **kwargs):
-        torsion = kwargs.get("torsion", False)
-        inputs = partial(get_direct_parallel_inputs, layout, weighted=weighted, torsion=torsion)
-        return original(*args, row_inputs=inputs, weighted=weighted, **kwargs)
-
-    return factory
 
 
 TOPOLOGY = (*JOINT_TOPOLOGY, "joint_dof_dim", "articulation_start", "body_world")

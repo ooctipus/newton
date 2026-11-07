@@ -968,7 +968,7 @@ def built(config):
 
 def keyed_classes(layout) -> tuple[WalkClass, ...]:
     """The walking classes of a keyed layout's trees (:class:`.keyed_row_layout.KeyedLayout`), chains of its primary
-    and secondary sizes: what a keyed tier's walks read (:func:`.sweep_routes_tiers.parallel_kernel`'s ``classes``)."""
+    and secondary sizes: what a keyed tier's walks read (:attr:`.sweep_routes_tiers.TierSweep.classes`)."""
     return tuple(chain_class(n) for n in (layout.primary, layout.secondary) if n)
 
 

@@ -15,6 +15,7 @@ patch row law themselves; the CPU fallback checks it against the general
 producer and the patch link.
 """
 
+import functools
 import inspect
 import itertools
 import math
@@ -28,7 +29,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import class_plan, field_group, keyed_rows, path_selection, sweep_routes_tiers
+from newton._src.solvers.feather_pgs import class_plan, field_group, path_selection, sweep_routes_tiers
 from newton._src.solvers.feather_pgs import sweep as emitter
 from newton._src.solvers.feather_pgs.device_preludes import RING
 from newton._src.solvers.feather_pgs.factor.kernels import prescale_joint_velocity_limits
@@ -45,7 +46,8 @@ from newton._src.solvers.feather_pgs.row_kernels import (
 )
 from newton._src.solvers.feather_pgs.row_records import DenseRows
 from newton._src.solvers.feather_pgs.rows import RowLaws, velocity_prescale_launch
-from newton._src.solvers.feather_pgs.sweep_plan import Sweep
+from newton._src.solvers.feather_pgs.sweep import sweep_kernel
+from newton._src.solvers.feather_pgs.sweep_plan import Sweep, SweepTier
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import (
     bias_rows,
@@ -72,8 +74,8 @@ from newton.tests.test_feather_pgs_velocity_limit_law import _HAND_LIMIT, _limit
 
 
 def _source(tier):
-    """A parallel tier's native sweep source (its kernel's longest native snippet)."""
-    return max(_native_snippets(tier.kernel), key=len)
+    """A parallel tier's native sweep source (its kernel's longest native snippet), ``tier`` its configuration."""
+    return max(_native_snippets(sweep_kernel(tier)), key=len)
 
 
 _DOFS = 6
@@ -615,10 +617,10 @@ class TestParallelPatchReference(unittest.TestCase):
         for rows, inkernel in itertools.product((32, 64), ((6, 0, 0, 0), (_DOFS, 0, 0, 0))):
             options = {"rows": rows, "sweeps": 24, "inkernel_response": inkernel}
             with self.subTest(**options):
-                point = sweep_routes_tiers.parallel_kernel(_CAPACITY, 32, _DOFS, "120", **options)
-                linked = sweep_routes_tiers.parallel_kernel(_CAPACITY, 32, _DOFS, "120", linked_rows=True, **options)
-                self.assertFalse(point.kernel.key.endswith("_linked"), point.kernel.key)
-                self.assertEqual(linked.kernel.key, point.kernel.key + "_linked")
+                point = sweep_routes_tiers.TierSweep(_CAPACITY, 32, _DOFS, "120", **options)
+                linked = sweep_routes_tiers.TierSweep(_CAPACITY, 32, _DOFS, "120", linked_rows=True, **options)
+                self.assertFalse(point.name.endswith("_linked"), point.name)
+                self.assertEqual(sweep_kernel(linked).key, sweep_kernel(point).key + "_linked")
                 point_source = _source(point)
                 linked_source = _source(linked)
                 projection, pooled, isotropic = _tier_texts(rows)
@@ -633,7 +635,7 @@ class TestParallelPatchReference(unittest.TestCase):
                 self.assertEqual(linked_source.count(RING.source), 1)
                 restored = linked_source.replace(RING.source + "\n", "").replace(pooled, projection)
                 self.assertEqual(restored, point_source)
-                self.assertEqual(linked.work, point.work)
+                self.assertEqual(linked.work(), point.work())
 
     def test_reference_holds_pooled_cones_and_restores_point_rings(self):
         """Keep each pair inside its pooled ring disk, and reduce to point friction without ring links."""
@@ -709,10 +711,10 @@ class TestParallelPatchReference(unittest.TestCase):
     def test_every_tier_steps_pairs_isotropically(self):
         """Give every tier variant, point and linked, the isotropic pair step once; no per-row variant remains."""
         layout = KeyedLayout(16, 6, 0, 16, 128, False, 0)
-        keyed = keyed_rows.get_parallel_factory(sweep_routes_tiers.parallel_kernel, layout)
+        keyed = functools.partial(sweep_routes_tiers.TierSweep, keyed=layout)
         for factory, shape, extra in (
             (
-                sweep_routes_tiers.parallel_kernel,
+                sweep_routes_tiers.TierSweep,
                 (_CAPACITY, 32, _DOFS, "120"),
                 {"inkernel_response": (_DOFS, 0, 0, 0)},
             ),
@@ -721,9 +723,9 @@ class TestParallelPatchReference(unittest.TestCase):
             for linked in (False, True):
                 with self.subTest(shape=shape, linked=linked, **extra):
                     tier = factory(*shape, rows=32, sweeps=24, linked_rows=linked, **extra)
-                    self.assertEqual(tier.kernel.key.endswith("_linked"), linked, tier.kernel.key)
+                    self.assertEqual(sweep_kernel(tier).key.endswith("_linked"), linked, tier.name)
                     self.assertEqual(_source(tier).count(_tier_texts(32)[2]), 1)
-        self.assertNotIn("pair_step", inspect.signature(sweep_routes_tiers.parallel_kernel).parameters)
+        self.assertNotIn("pair_step", inspect.signature(sweep_routes_tiers.TierSweep).parameters)
 
     def test_isotropic_pairs_slide_with_maximal_dissipation(self):
         """Slide a pair with fourfold unequal tangent masses against its velocity, as the serial pair solve does.
@@ -763,10 +765,10 @@ class TestParallelPatchReference(unittest.TestCase):
         The keyed-row tiers read their rows from a layout that plans joint velocity
         limits, as a solver with ``enable_joint_velocity_limits`` builds them.
         """
-        plain_tiers = (sweep_routes_tiers.parallel_kernel, (_CAPACITY, 32, _DOFS, "120"))
+        plain_tiers = (sweep_routes_tiers.TierSweep, (_CAPACITY, 32, _DOFS, "120"))
         layout = KeyedLayout(16, 6, 0, 16, 128, True, (1 << 16) - 1)
         keyed_tiers = (
-            keyed_rows.get_parallel_factory(sweep_routes_tiers.parallel_kernel, layout),
+            functools.partial(sweep_routes_tiers.TierSweep, keyed=layout),
             (128, 32, 22, "120"),
         )
         variants = {
@@ -778,7 +780,7 @@ class TestParallelPatchReference(unittest.TestCase):
                 settings = {"rows": 32, "sweeps": 24, "linked_rows": True, **options}
                 plain = factory(*args, **settings)
                 last_word = factory(*args, velocity_limit_pass=True, **settings)
-                self.assertEqual(last_word.kernel.key, plain.kernel.key + "_lw")
+                self.assertEqual(sweep_kernel(last_word).key, sweep_kernel(plain).key + "_lw")
                 self.assertEqual((plain.velocity_limit_pass, last_word.velocity_limit_pass), (False, True))
                 text = _source(last_word)
                 self.assertNotIn("s_vlim", _source(plain))
@@ -1064,12 +1066,12 @@ class TestKeyedPatchRows(unittest.TestCase):
     def test_keyed_factory_reads_linked_parents(self):
         """Read every row's parent and coefficient in the keyed patch tiers instead of building them."""
         layout = KeyedLayout(16, 6, 0, 16, 128, False, 0)
-        factory = keyed_rows.get_parallel_factory(sweep_routes_tiers.parallel_kernel, layout)
         options = {"rows": 32, "sweeps": 24, "inkernel_response": (16, 6, 0, 16), "classes": keyed_classes(layout)}
-        linked = factory(128, 32, 22, "120", linked_rows=True, **options)
-        self.assertTrue(linked.kernel.key.startswith("sweep_keyed_parallel_"))
-        self.assertTrue(linked.kernel.key.endswith("_linked"))
-        self.assertIn("patch_law", inspect.signature(linked.kernel.func).parameters)
+        linked = sweep_routes_tiers.TierSweep(128, 32, 22, "120", keyed=layout, linked_rows=True, **options)
+        kernel = sweep_kernel(linked)
+        self.assertTrue(kernel.key.startswith("sweep_keyed_parallel_"))
+        self.assertTrue(kernel.key.endswith("_linked"))
+        self.assertIn("patch_law", inspect.signature(kernel.func).parameters)
         text = _source(linked)
         self.assertIn("s_parent[i] = world_row_parent.data[off_dense + i];", text)
         self.assertIn("s_mu[i] = world_row_mu.data[off_dense + i];", text)
@@ -1108,10 +1110,11 @@ class TestPatchParallelAdmission(unittest.TestCase):
         """Record the tiers' ring-pooled projection and sweep budgets from the kernels built, not the law."""
         for linked in (False, True):
             options = {"inkernel_response": (_DOFS, 0, 0, 0), "linked_rows": linked}
-            kernels = [
-                sweep_routes_tiers.parallel_kernel(_CAPACITY, 32, _DOFS, "120", rows=rows, sweeps=sweeps, **options)
+            configs = [
+                sweep_routes_tiers.TierSweep(_CAPACITY, 32, _DOFS, "120", rows=rows, sweeps=sweeps, **options)
                 for rows, sweeps in ((32, 24), (64, 34))
             ]
+            kernels = [SweepTier(config, sweep_kernel(config), index, 0) for index, config in enumerate(configs)]
             probe = SimpleNamespace(
                 sweep=SimpleNamespace(
                     tiers=kernels,
@@ -1368,7 +1371,7 @@ def _launch_parallel(tier, case, *, device):
     The tier reads the one writer's stored rows and leaves by the walk. The case is posed in its factor's coordinates
     so the walk is the identity: the rows are ``Z = L^-1 P J^T``, the velocity ``u = M^-1 v`` with ``M = P^T L^-T P``
     (``dv = M Z^T lambda``), the incident velocity ``J v_hat``; the published velocity maps back by ``M``."""
-    kernel = tier.kernel
+    kernel = sweep_kernel(tier)
     count = len(case["J"])
     padded = np.zeros((1, _CAPACITY))
     L = case["L"]
@@ -1417,7 +1420,7 @@ def _launch_parallel(tier, case, *, device):
         values[name] if name in values else _dummy(arguments[name])
         for name in inspect.signature(kernel.func).parameters
     ]
-    wp.launch_tiled(kernel, dim=[1], inputs=inputs, block_dim=tier.work.block, device=device)
+    wp.launch_tiled(kernel, dim=[1], inputs=inputs, block_dim=tier.threads, device=device)
     leave_walk(values["walk"], values["v_out"], device)
     u = values["v_out"].numpy().astype(np.float64)
     return values["world_impulses"].numpy()[0, :count], np.linalg.solve(L.T, u[::-1])[::-1]
@@ -1445,7 +1448,7 @@ class TestParallelPatchKernel(unittest.TestCase):
                     if spread:
                         case, _ = spread_rows(case, _SPREAD_SEED)
                     self.assertGreater(len(case["J"]), min_rows)
-                    kernel = sweep_routes_tiers.parallel_kernel(
+                    kernel = sweep_routes_tiers.TierSweep(
                         _CAPACITY,
                         32,
                         _DOFS,
@@ -1482,7 +1485,7 @@ class TestParallelPatchKernel(unittest.TestCase):
         for name, case in cases.items():
             options = {"matrix_free": True, "inkernel": True, "exact": False, "nesterov": True}
             with self.subTest(case=name):
-                kernel = sweep_routes_tiers.parallel_kernel(
+                kernel = sweep_routes_tiers.TierSweep(
                     _CAPACITY,
                     32,
                     _DOFS,
@@ -1520,7 +1523,7 @@ class TestParallelPatchKernel(unittest.TestCase):
             with self.subTest(sweeps=sweeps):
                 results = {}
                 for last_word in (False, True):
-                    kernel = sweep_routes_tiers.parallel_kernel(
+                    kernel = sweep_routes_tiers.TierSweep(
                         _CAPACITY,
                         32,
                         _DOFS,

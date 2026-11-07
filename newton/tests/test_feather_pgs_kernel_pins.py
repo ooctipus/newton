@@ -35,7 +35,6 @@ import unittest
 import warp as wp
 
 from newton._src.solvers.feather_pgs import environment_flags
-from newton._src.solvers.feather_pgs.kernel_template import SweepTier
 from newton.tests.feather_pgs_law_harness import built, keyed_classes
 
 _PINS = os.path.join(os.path.dirname(__file__), "golden_data", "test_feather_pgs_kernel_pins", "pins.json")
@@ -64,7 +63,7 @@ def _linked_tier_calls():
         }
         if last_word:
             kwargs["velocity_limit_pass"] = True
-        yield "sweep_routes_tiers.parallel_kernel", (64, 32, 18, _ARCH), kwargs
+        yield "sweep_routes_tiers.TierSweep", (64, 32, 18, _ARCH), kwargs
 
 
 def _keyed_layout(*, velocity_limits=False):
@@ -350,9 +349,9 @@ def _solver_factory_calls():
     # Parallel tiers: one articulation per world, its response formed in-kernel.
     for rows in (32, 48):
         kwargs = {"rows": rows, "sweeps": 24, "inkernel_response": (18, 0, 0, 0)}
-        yield "sweep_routes_tiers.parallel_kernel", sweep_routes_tiers.parallel_kernel, (64, 32, 18, _ARCH), kwargs
+        yield "sweep_routes_tiers.TierSweep", built(sweep_routes_tiers.TierSweep), (64, 32, 18, _ARCH), kwargs
     for label, args, kwargs in _linked_tier_calls():
-        yield label, sweep_routes_tiers.parallel_kernel, args, kwargs
+        yield label, built(sweep_routes_tiers.TierSweep), args, kwargs
 
 
 def _suite_shape_calls():
@@ -390,8 +389,7 @@ def _suite_shape_calls():
         yield "sweep_routes_diag.DiagonalSweep", factory, args, kwargs
 
     def parallel(layout, *args, **kwargs):
-        factory = keyed_rows.get_parallel_factory.__wrapped__(sweep_routes_tiers.parallel_kernel, layout)
-        return factory(*args, classes=keyed_classes(layout), **kwargs)
+        return built(sweep_routes_tiers.TierSweep)(*args, keyed=layout, classes=keyed_classes(layout), **kwargs)
 
     def limit_prefix(layout):
         return keyed_row_layout.prefix_kernel.__wrapped__(layout, keyed_rows.PrefixInput, keyed_rows.KineticRows)
@@ -406,26 +404,25 @@ def _suite_shape_calls():
         blocks = (layout.primary, layout.secondary, layout.primary_offset, layout.secondary_offset)
         for rows in tiers:
             kwargs = {"rows": rows, "sweeps": 24, "inkernel_response": blocks}
-            yield "keyed_rows.get_parallel_factory", parallel, (layout, *shape), kwargs
+            yield "sweep_routes_tiers.TierSweep[keyed]", parallel, (layout, *shape), kwargs
     yield "keyed_row_layout.prefix_kernel", limit_prefix, (limited,), {}
 
 
 def _keyed_row_calls():
     """Keyed rows of a 16+6 coordinate world (keyed_rows.py), including their parallel tiers."""
-    from newton._src.solvers.feather_pgs import keyed_rows, sweep_routes_tiers  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import sweep_routes_tiers  # noqa: PLC0415
 
     def parallel(layout, *args, **kwargs):
-        factory = keyed_rows.get_parallel_factory.__wrapped__(sweep_routes_tiers.parallel_kernel, layout)
-        return factory(*args, classes=keyed_classes(layout), **kwargs)
+        return built(sweep_routes_tiers.TierSweep)(*args, keyed=layout, classes=keyed_classes(layout), **kwargs)
 
     layout = _keyed_layout()
     for kwargs in _keyed_tier_kwargs(linked=False):
-        yield "keyed_rows.get_parallel_factory", parallel, (layout, 128, 32, 22, _ARCH), kwargs
+        yield "sweep_routes_tiers.TierSweep[keyed]", parallel, (layout, 128, 32, 22, _ARCH), kwargs
     # The same rows linked into their patch rings.
     for kwargs in _keyed_tier_kwargs(linked=True):
-        yield "keyed_rows.get_parallel_factory", parallel, (layout, 128, 32, 22, _ARCH), kwargs
+        yield "sweep_routes_tiers.TierSweep[keyed]", parallel, (layout, 128, 32, 22, _ARCH), kwargs
     for args, kwargs in _keyed_last_word_calls():
-        yield "keyed_rows.get_parallel_factory", parallel, args, kwargs
+        yield "sweep_routes_tiers.TierSweep[keyed]", parallel, args, kwargs
 
 
 def _factory_kernels():
@@ -446,8 +443,7 @@ def _factory_kernels():
             kernel = factory(*args, **kwargs)
         except ValueError:
             continue  # The factory rejects this combination.
-        # A tier factory returns the tier's launch descriptor.
-        kernels[_label(name, args, kwargs)] = kernel.kernel if isinstance(kernel, SweepTier) else kernel
+        kernels[_label(name, args, kwargs)] = kernel
     return kernels
 
 
@@ -576,9 +572,9 @@ class TestFeatherPGSKernelPins(unittest.TestCase):
             "sweep_routes_diag.DiagonalSweep",
             "sweep_levels._get_sparse_contact_levels_kernel",
             "sweep_levels._get_mark_independent_sparse_contact_candidates_kernel",
-            "sweep_routes_tiers.parallel_kernel",
+            "sweep_routes_tiers.TierSweep",
             "sweep_routes_local.PairedSweep",
-            "keyed_rows.get_parallel_factory",
+            "sweep_routes_tiers.TierSweep[keyed]",
             "row_slots.allocate_world_contact_slots",
             "walk_rows.slot_rows_kernel",
             "walk_rows.walked_rows_kernel",
@@ -603,7 +599,7 @@ class TestFeatherPGSKernelPins(unittest.TestCase):
         self.assertTrue(linked)
         # Their last-word velocity-limit pass, in the plain and the keyed-row tiers.
         last_word = {name.split("(", 1)[0] for name in linked if "velocity_limit_pass=True" in name}
-        self.assertEqual(last_word, {"sweep_routes_tiers.parallel_kernel", "keyed_rows.get_parallel_factory"})
+        self.assertEqual(last_word, {"sweep_routes_tiers.TierSweep", "sweep_routes_tiers.TierSweep[keyed]"})
 
     def test_inventory_builds_the_suite_shapes(self):
         """Build every factory call at the suite's shapes; the suite's routes build them, so none may be rejected."""

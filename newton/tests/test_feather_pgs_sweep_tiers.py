@@ -9,7 +9,6 @@ compiles offline next to the legacy kernel.
 """
 
 import contextlib
-import functools
 import importlib.util
 import re
 import shutil
@@ -22,7 +21,6 @@ from newton._src.core.execution import Work, shape
 from newton._src.core.memory import Buffer, Staging, built_for
 from newton._src.solvers.feather_pgs import kernel_template, sweep_routes_tiers
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
-from newton._src.solvers.feather_pgs.keyed_rows import get_direct_parallel_inputs
 from newton._src.solvers.feather_pgs.response_operator import Lanes, TransposedResponse, WalkedRows
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy, bound
 from newton._src.solvers.feather_pgs.sweep import (
@@ -31,10 +29,11 @@ from newton._src.solvers.feather_pgs.sweep import (
     end_sweep,
     jacobi_scale,
     jacobi_sweeps,
+    sweep_kernel,
 )
-from newton.tests.feather_pgs_law_harness import keyed_classes
+from newton.tests.feather_pgs_law_harness import built, keyed_classes
 
-_TIER = sweep_routes_tiers.parallel_kernel.__wrapped__
+_TIER = built(sweep_routes_tiers.TierSweep)
 
 
 def _scale(aii, bound, pad):
@@ -51,11 +50,6 @@ _LAYOUT = KeyedLayout(12, 6, 0, 12, 32, False, 0, None)
 _CLASSES = keyed_classes(_LAYOUT)
 
 
-def _keyed(linked: bool):
-    """The keyed rows' operands as the solver's keyed parallel factory binds them."""
-    return functools.partial(get_direct_parallel_inputs, _LAYOUT)
-
-
 _INK = {"inkernel_response": (12, 6, 0, 12)}
 
 CALLS = (
@@ -65,12 +59,12 @@ CALLS = (
     (
         "keyed",
         (64, 32, 18, "120"),
-        {"rows": 32, "sweeps": 112, **_INK, "row_inputs": _keyed(False), "classes": _CLASSES},
+        {"rows": 32, "sweeps": 112, **_INK, "keyed": _LAYOUT, "classes": _CLASSES},
     ),
     (
         "keyed_linked",
         (64, 32, 18, "120"),
-        {"rows": 32, "sweeps": 112, **_INK, "row_inputs": _keyed(True), "classes": _CLASSES, "linked_rows": True},
+        {"rows": 32, "sweeps": 112, **_INK, "keyed": _LAYOUT, "classes": _CLASSES, "linked_rows": True},
     ),
     ("one_group", (64, 32, 18, "120"), {"rows": 32, "sweeps": 42, "inkernel_response": (18, 0, 0, 0)}),
     ("rows_64", (96, 32, 18, "120"), {"rows": 64, "sweeps": 60, **_INK}),
@@ -102,7 +96,7 @@ def _tier(factory, args, kwargs):
 
 def _source(args, kwargs) -> str:
     """The tier's native body, after its preludes."""
-    snippet = _tier(_TIER, args, kwargs).kernel.snippet
+    snippet = _tier(_TIER, args, kwargs).snippet
     return snippet[snippet.index("    const int lane = LANE;\n") :]
 
 
@@ -242,7 +236,7 @@ class TestResponseOperators(unittest.TestCase):
                 # keyed rows walk their seeds, the others read the one writer's.
                 self.assertIn("if (global_dof >= 0) walk.du.data[global_dof] += u;", source)
                 self.assertNotIn("WALK_DOWN", source)
-                keyed = "row_inputs" in kwargs
+                keyed = "keyed" in kwargs
                 self.assertEqual("TIER_WALK(" in source, keyed)
                 self.assertEqual("incident = row_incident.data[off_dense + i];" in source, not keyed)
                 self.assertIn("s_rhs[i] += incident;", source)
@@ -256,7 +250,7 @@ class TestResponseOperators(unittest.TestCase):
                 self.assertNotIn("WALK_RELEASE(walk.release", _source(args, kwargs))
                 framed = _source(args, {**kwargs, "frame": (4, 0)})
                 self.assertNotIn("WALK_RELEASE_T(", framed)
-                keyed = "row_inputs" in kwargs
+                keyed = "keyed" in kwargs
                 self.assertEqual(framed.count("WALK_RELEASE(walk.release, art_a"), 1 if keyed else 0)
 
 
@@ -284,7 +278,7 @@ class TestOfflineCompile(unittest.TestCase):
         """Bound each tier by the blocks its shared memory keeps; a staging that leaves no registers to spare has none."""
         for label, args, kwargs in CALLS:
             with self.subTest(tier=label):
-                threads, blocks = _tier(_TIER, args, kwargs).kernel.launch_bounds
+                threads, blocks = _tier(_TIER, args, kwargs).launch_bounds
                 self.assertEqual(threads, 32 * ((kwargs["rows"] + 31) // 32))
                 self.assertLessEqual(blocks * threads // 32, 24)  # 24 warps at a line of 80 registers
 
@@ -301,8 +295,8 @@ class TestOfflineCompile(unittest.TestCase):
         sass = _kernel_sass()
         for label, args, kwargs in CALLS[:5]:
             with self.subTest(label):
-                tier = sweep_routes_tiers.parallel_kernel(*args, **kwargs)
-                new = sass.compile_kernel(tier.kernel, arch=120, block_dim=tier.work.block)
+                config = sweep_routes_tiers.TierSweep(*args, **kwargs)
+                new = sass.compile_kernel(sweep_kernel(config), arch=120, block_dim=config.threads)
                 self.assertEqual(new["stack"], 0)
                 self.assertEqual(new["local"], 0)
 

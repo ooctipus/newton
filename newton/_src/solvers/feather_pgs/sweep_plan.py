@@ -42,7 +42,6 @@ from .contact_input import bind_routes as bind_contact_routes
 from .execution_plan import _MFGSStorage, _select_mfgs_storage
 from .field_group import Field, FieldGroup
 from .friction_patches import patch_routes
-from .kernel_template import SweepTier
 from .solve_policy import SolvePolicy, SolveReadoutRecord
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport, row_supports
@@ -80,6 +79,17 @@ a slot per four rows of the row store's line, a triple's rows."""
 
 
 __all__ = ["Sweep"]
+
+
+@dataclasses.dataclass(frozen=True)
+class SweepTier:
+    """A Jacobi tier's launch: its configuration and kernel, its bucket among the claims' (:attr:`Sweep.claims`) and
+    its grid on its own list (the layer's shape of its work over the worlds)."""
+
+    config: sweep_routes_tiers.TierSweep
+    kernel: wp.Kernel
+    tier: int
+    grid: int
 
 
 class Sweep:
@@ -339,7 +349,7 @@ class Sweep:
         Args:
             route: Owner of the sweep in the records, such as ``"sparse_pgs"``.
             factory: The sweep factory, which takes the policy as ``solve_policy`` and the laws' constants as
-                ``weighted`` and ``material``, and returns a kernel or a :class:`SweepTier`.
+                ``weighted`` and ``material``, and returns a kernel.
             *args: Positional arguments of the factory.
             readout_budget: The sweep budget the kernel compiles in (a parallel tier's), or ``None`` for the
                 solver's iteration counts.
@@ -348,7 +358,7 @@ class Sweep:
         # The laws' constants, compiled into every sweep: weighted rows and material contacts.
         laws = {"weighted": self.laws.set.weighted, "material": bool(self.options.contact_compliance)}
         built = factory(*args, solve_policy=self.policy, **laws, **kwargs)
-        self._register(route, built.kernel if isinstance(built, SweepTier) else built, readout_budget)
+        self._register(route, built, readout_budget)
         return built
 
     @property
@@ -559,37 +569,33 @@ class Sweep:
                     **mf_gs_options,
                 )
             if parallel_rows > 0:
-                parallel_factory = sweep_routes_tiers.parallel_kernel
-                if self.placement.keyed_rows is not None:
-                    from .keyed_rows import get_parallel_factory  # noqa: PLC0415
-
-                    parallel_factory = get_parallel_factory(parallel_factory, self.placement.keyed_rows.layout)
+                # Under keyed rows each tier walks its rows from their keys in its prologue (the producer's sink).
+                keyed = self.placement.keyed_rows.layout if self.placement.keyed_rows is not None else None
                 width = sweep_routes_tiers.TIER_ROWS
                 tiers = [(min(first + width, parallel_rows), first) for first in range(0, parallel_rows, width)]
                 self.par_tiers = list(tiers)
                 tier_sweeps, self.par_sweeps_rule, self.par_sweeps_reason = self._parallel_tier_sweeps(tiers)
                 for tier_index, ((rows_, _), sweeps_) in enumerate(zip(tiers, tier_sweeps, strict=True)):
-                    tier = self.kernel(
-                        "parallel_tier",
-                        parallel_factory,
+                    config = sweep_routes_tiers.TierSweep(
                         self.placement.dense_max_constraints,
                         self.placement.mf_max_constraints,
                         self.forest.max_world_dofs,
                         device_arch,
-                        readout_budget=sweeps_,
                         rows=rows_,
                         sweeps=sweeps_,
                         inkernel_response=self.classes.tiers.sizes,
+                        keyed=keyed,
                         linked_rows=True,
                         velocity_limit_pass=self._parallel_velocity_limit_pass(),
                         frame=self._tier_frame(),
                         classes=self.factor.walk_classes,
                         pitch=self.placement.row_pitch,
-                        **({"torsion": True} if self.laws.spin_rows else {}),
+                        **self.law_fields,
                     )
+                    kernel = self.sweep("parallel_tier", config, readout_budget=sweeps_)
                     # On its own list, a tier takes a block a world of the list's capacity (its work's shape).
-                    grid = shape(dataclasses.replace(tier.work, items=self.forest.world_count), device(model.device))
-                    self.tiers.append(dataclasses.replace(tier, tier=tier_index, grid=grid.grid))
+                    grid = shape(config.work(self.forest.world_count), device(model.device))
+                    self.tiers.append(SweepTier(config, kernel, tier_index, grid.grid))
             # Each sweep walks its bucket of the claims' worlds (claim_worlds), a bucket of every world's slots: a tier's,
             # the general sweep's, and with the colored mapping its candidates' (which the unit builder walks) and the
             # colored worlds' (which it appends).
@@ -912,10 +918,10 @@ class Sweep:
             # A tier grid-strides over its bucket.
             named = dict(walk, **queued(tier.tier, tier.grid))
             named.update(self.placement.inkernel_response_inputs())
-            if tier.kinetic_rows:
+            if tier.config.keyed is not None:
                 keyed = self.placement.keyed_rows.parallel_arguments()
                 named.update(zip(("kinetic_rows", "patch_law"), keyed, strict=False))
-            self._launch(tier.kernel, operands, tier.grid, tier.work.block, **named)
+            self._launch(tier.kernel, operands, tier.grid, tier.config.threads, **named)
 
         def launch_general():
             colored_kernel = self.mf_colored_kernel
