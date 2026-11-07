@@ -179,8 +179,8 @@ class TestKernelSass(unittest.TestCase):
         blocks = {
             key: block for keys, block in sass._module_groups(kernels, sass.launch_blocks(("pins",))) for key in keys
         }
-        self.assertEqual(len(blocks), 6)
-        for kind in ("slides", "turns"):
+        self.assertEqual(len(blocks), 12)
+        for kind in ("slides", "turns", "welded_slides", "welded_turns"):
             self.assertEqual(blocks.pop(f"coordinate_trees.repair_{kind}"), 128)
             self.assertNotIn(f"coordinate_trees.repair_{kind}", sass.launch_blocks(("held_tree",)))
         self.assertEqual(coordinate_trees.REPAIR_BLOCK_DIM, 128)

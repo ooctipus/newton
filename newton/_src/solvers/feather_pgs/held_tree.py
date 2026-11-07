@@ -7,7 +7,7 @@ The plan (:func:`plan`, held by the class plan) is data: one :class:`HeldClass` 
 plans (:class:`HeldGroupPlan`) whose kind the class's data chooses: the sparse class, when the solver admitted one, makes
 one complete group that walks its pattern (``"sparse"``); otherwise each tree shape is a group that responds by its walk
 or by the compact diagonal (``"tree"``), kinematic free bodies a zero-response group (``"prescribed"``), articulations
-without coordinates a group of none (``"rest"``), a compact diagonal family whose trees are one body each the
+without coordinates a group of none (``"rest"``), a compact diagonal family of trees rigid below their leaves the
 one-coordinate class (``"coordinate"``, :mod:`.coordinate_trees`), or one group per world spans its articulations
 (``"forest"``). The classes' groups of one key compose into one group: trees of one shape share one factor plan,
 whatever their class. The owner (:class:`HeldTree`) builds each group (:class:`~.tree_kinetic_owner.TreeKineticState`
@@ -470,8 +470,8 @@ def compose(classes) -> tuple[HeldGroupPlan, ...]:
 def plan(inputs, *, packed=None, compact=None) -> HeldPlan:
     """The held tree's plan: one :class:`HeldClass` a world class (:attr:`.forest_plan.ForestPlan.world_classes`) with
     the class plan's choices (:func:`held_class`) and the compact diagonal family's class (the one-coordinate class
-    where its trees are one body each, :func:`.coordinate_trees.plan`), their groups composed, the dense groups'
-    coverage, the walk's trees and the drive stage's coordinates.
+    where its trees are rigid below their leaves, :func:`.coordinate_trees.plan`), their groups composed, the dense
+    groups' coverage, the walk's trees and the drive stage's coordinates.
 
     The plan's failure is the held tree's decline of the choices: the sparse diagonal's rule
     (:func:`.class_plan.diagonal_rule`) builds the plan with its compact diagonal and keeps it, or declines with why.

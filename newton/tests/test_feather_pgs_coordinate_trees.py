@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The one-coordinate class: compact diagonal families whose trees are one body each (``coordinate_trees.py``).
+"""The one-coordinate class: compact diagonal families whose trees are one coordinate each (``coordinate_trees.py``).
 
 The CPU tests compare the class kernels, bound through ``CoordinateTrees``, with
 the held star on the same inputs, at rounding level, sliding and turning leaves
@@ -11,6 +11,7 @@ arm-key press bound on the held star, the law both CUDA routes integrate.
 """
 
 import dataclasses
+import itertools
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -585,7 +586,13 @@ class TestCoordinateTreesRule(unittest.TestCase):
             with self.subTest(kinds=kinds):
                 plan, reason = coordinate_plan(cpu_solver(build_branch_model(kinds=kinds)), 7)
                 self.assertIsNotNone(plan, reason)
-                self.assertEqual(plan.turns, turns)
+                self.assertEqual(plan.topology.turns, turns)
+        # A leaf's welded body rides in its coordinate's thread.
+        plan, reason = coordinate_plan(cpu_solver(build_branch_model(descendant=True)), 7)
+        self.assertIsNotNone(plan, reason)
+        np.testing.assert_array_equal(plan.topology.weld_start, [0] + [1] * 7)
+        self.assertEqual(plan.topology.weld_joint_offset.size, 1)
+        self.assertIn("with 1 welded bodies", reason)
         for root in ("fixed", "d6"):
             with self.subTest(root=root):
                 model = build_branch_model(root=root)
@@ -611,8 +618,10 @@ class TestCoordinateTreesRule(unittest.TestCase):
         from newton.tests.test_feather_pgs_star_rows import build_solver_fixture  # noqa: PLC0415
 
         model = build_solver_fixture("cpu")
-        turns, reason = ct.coordinate_topology(model, np.array([0, 2]), model.articulation_start.numpy()[1:])
-        self.assertIs(turns, False, reason)
+        topology, reason = ct.coordinate_topology(model, np.array([0, 2]), model.articulation_start.numpy()[1:])
+        self.assertIsNotNone(topology, reason)
+        np.testing.assert_array_equal(topology.leaves, np.arange(1, 109))
+        self.assertEqual((topology.turns, topology.weld_joint_offset.size), (False, 0))
 
     def test_owner_fixtures_give_the_keys_their_own_group(self):
         """Give the keys of every CUDA owner fixture a diagonal-mass size group apart from the arm's."""
@@ -628,10 +637,9 @@ class TestCoordinateTreesRule(unittest.TestCase):
         self.assertEqual((solver.forest.size_groups, set(solver.forest.diagonal_mass_sizes)), ([ARM_DOFS], set()))
 
     def test_other_topologies_are_declined(self):
-        """Decline chains, multi-coordinate leaves, welded descendants and roots that move."""
+        """Decline chains, multi-coordinate leaves and roots that move."""
         for variant, words in (
             ({"chain": True}, "hang from the root body"),
-            ({"descendant": True}, "hang from the root body"),
             ({"multi": True}, "one-coordinate"),
             ({"root": "revolute"}, "FIXED or zero-coordinate D6 root"),
             ({"root": "free"}, "FIXED or zero-coordinate D6 root"),
@@ -639,8 +647,8 @@ class TestCoordinateTreesRule(unittest.TestCase):
             with self.subTest(**variant):
                 model = build_branch_model(worlds=2, **variant)
                 joint_end = model.articulation_start.numpy()[1:]
-                turns, reason = ct.coordinate_topology(model, branch_articulations(model), joint_end)
-                self.assertIsNone(turns)
+                topology, reason = ct.coordinate_topology(model, branch_articulations(model), joint_end)
+                self.assertIsNone(topology)
                 self.assertIn(words, reason)
 
     def test_tree_groups_beside_the_class_compare_banks(self):
@@ -769,7 +777,8 @@ class TestCoordinateTreesRule(unittest.TestCase):
 
 class TestCoordinateTreesKernels(unittest.TestCase):
     def test_leaves_match_the_held_star(self):
-        """Match the held star over steps, mass cadence, a masked reset and a re-pose, sliding and turning leaves.
+        """Match the held star over steps, mass cadence, a masked reset and a re-pose: sliding and turning leaves, with
+        and without a welded body.
 
         Every field the family publishes is compared: input and output poses,
         coordinates, body velocities, motion axes, predictors and the articulation
@@ -777,13 +786,14 @@ class TestCoordinateTreesKernels(unittest.TestCase):
         FK/ID fields of the class's solver hold NaN throughout, so no class kernel
         reads them.
         """
-        for kinds in (("prismatic",), ("prismatic", "revolute")):
-            with self.subTest(kinds=kinds):
-                self._match_the_held_star(kinds)
+        for kinds, descendant in itertools.product((("prismatic",), ("prismatic", "revolute")), (False, True)):
+            with self.subTest(kinds=kinds, descendant=descendant):
+                self._match_the_held_star(kinds, descendant)
 
-    def _match_the_held_star(self, kinds):
-        pair = _Pair(build_branch_model(kinds=kinds), poison=True)
-        self.assertEqual(pair.plan.turns, "revolute" in kinds)
+    def _match_the_held_star(self, kinds, descendant):
+        pair = _Pair(build_branch_model(kinds=kinds, descendant=descendant), poison=True)
+        self.assertEqual(pair.plan.topology.turns, "revolute" in kinds)
+        self.assertEqual(pair.plan.topology.weld_joint_offset.size, int(descendant))
         worlds = pair.model.world_count
         for step in range(8):
             pair.inputs()
@@ -1618,7 +1628,7 @@ class TestCoordinateTreesOwner(unittest.TestCase):
         mine = recipe_solver(model, coordinate=True)
         owner = mine.factor.held
         self.assertIsNotNone(owner.plan.coordinate, owner.plan.coordinate_reason)
-        self.assertTrue(owner.plan.coordinate.turns)
+        self.assertTrue(owner.plan.coordinate.topology.turns)
         self.assertIs(owner.coordinate_trees.predictor_kernel, ct.predict_turns)
         held = recipe_solver(model, coordinate=False)
         self.assertIsNone(held.factor.held.coordinate_trees)

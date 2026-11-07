@@ -216,7 +216,8 @@ class TestKernelIdentity(unittest.TestCase):
 
         kernels, rejected = identity.inventory(("pins",), ("coordinate_trees.",))
         self.assertEqual(rejected, {})
-        names = sorted(f"{stage}_{kind}" for stage in ("repair", "predict", "finish") for kind in ("slides", "turns"))
+        kinds = ("slides", "turns", "welded_slides", "welded_turns")
+        names = sorted(f"{stage}_{kind}" for stage in ("repair", "predict", "finish") for kind in kinds)
         self.assertEqual(sorted(kernels), [f"coordinate_trees.{name}" for name in names])
         for name in names:
             self.assertEqual(kernels[f"coordinate_trees.{name}"], ("pins", getattr(coordinate_trees, name)))

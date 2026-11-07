@@ -313,7 +313,8 @@ def coordinate_tree_blocks() -> dict:
         from newton._src.solvers.feather_pgs import coordinate_trees  # noqa: PLC0415
     except ImportError:
         return {}
-    return {f"coordinate_trees.repair_{kind}": coordinate_trees.REPAIR_BLOCK_DIM for kind in ("slides", "turns")}
+    blocks = coordinate_trees.REPAIR_BLOCK_DIM
+    return {f"coordinate_trees.{repair.key}": blocks for repair, _, _ in coordinate_trees.KERNELS.values()}
 
 
 def launch_blocks(families):

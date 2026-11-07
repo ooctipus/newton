@@ -1,37 +1,39 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The held tree's one-coordinate class: a compact diagonal family whose trees are one body and one coordinate each.
+"""The held tree's one-coordinate class: a compact diagonal family whose trees are one coordinate each.
 
-A world-fixed root (a FIXED, or zero-coordinate D6, joint to the world) whose children are one-body leaves of one
-coordinate each (prismatic, revolute or a one-axis D6) is a compact diagonal family whose trees are each one body: every
-leaf is its own one-coordinate tree on the root's fixed frame. Such a tree's mass ``H_ii = S^T I S`` is constant (a slide
-along its own axis leaves ``m |S|^2``, a turn about its own axis leaves ``S^T I S``), its bias is gravity's and the
-external wrench's projection (a one-coordinate tree has no velocity product: ``S^T (S qd x* I S qd) = 0``), and its walk
-is one division (the compact inverse). So the class's kernels hold a thread a coordinate across every articulation of
+A world-fixed root (a FIXED, or zero-coordinate D6, joint to the world) whose children are leaves of one coordinate each
+(prismatic, revolute or a one-axis D6), each with the bodies welded below it (a drawer's handle), is a compact diagonal
+family whose trees are rigid: every leaf and its welded bodies are one one-coordinate tree on the root's fixed frame.
+Such a tree's mass ``H_ii = S^T I S`` (its bodies' inertia summed) is constant (a slide along its own axis leaves
+``M |S|^2``, a turn about its own axis leaves ``S^T I S``), its bias is gravity's and the external wrenches' projection
+(a one-coordinate tree has no velocity product: ``S^T (S qd x* I S qd) = 0``), and its walk is one division (the
+compact inverse). So the class's kernels hold a thread a coordinate across every articulation of
 the group, with no tree block, no scan and no collection, composed from the held tree's own laws
 (:func:`.spatial_laws.joint_frame_pose`, :func:`.spatial_laws.axis_transform` and :func:`.spatial_laws.motion_axis`,
 the one-axis cases of ``joint_transform`` and ``joint_motion``, :func:`.spatial_laws.coordinate_force`, the drive laws):
 
 * ``repair`` publishes the input state of articulations whose cache is invalid: the root pose, the articulation origin,
-  and each leaf's pose and motion column.
+  each leaf's pose and motion column and its welded bodies' poses.
 * ``predict`` forms each leaf's generalized force (augmented drive, passive spring and damping, control force, gravity
   and external wrench), refreshes the inverse mass of articulations the mass mask selects, decides its drive's
   saturation and writes the acceleration and the velocity predictor.
-* ``finish`` converts the solved velocity, integrates, and publishes the next state: coordinates, root and leaf poses,
-  motion columns, body velocities and the articulation origin.
+* ``finish`` converts the solved velocity, integrates, and publishes the next state: coordinates, root, leaf and welded
+  poses, motion columns, body velocities and the articulation origin.
 
 The kernels are generated from the family's data (:func:`class_kernels`): a family whose leaves all slide reads no pose
-in its predict (a slide's column has no turn, so the moment arms of gravity and the external wrench drop out and its
-mass is ``m |S|^2``); a family with turning leaves reads each leaf's kind from its joint's angular axis count and forms
-the moments about the articulation origin and ``S^T I S`` from the body's inertia there. Validity is a word an
-articulation: one launch holds every coordinate of an articulation, the repair reads it, the finish sets it. The class
-never writes ``body_q_com``, ``body_v_s``, ``body_a_s``, ``body_f_s``, ``body_I_s`` or the compact inertia terms of its
-bodies, which no consumer on its route reads.
+in its predict (a slide's column has no turn, so the moment arms of gravity and the external wrenches drop out and its
+mass is ``M |S|^2``); a family with turning leaves reads each leaf's kind from its joint's angular axis count and forms
+the moments about the articulation origin and ``S^T I S`` from each body's inertia there; a family with welded bodies
+walks each leaf's welds (a CSR of the template's joints, :class:`CoordinateTopology`) in its coordinate's thread.
+Validity is a word an articulation: one launch holds every coordinate of an articulation, the repair reads it, the
+finish sets it. The class never writes ``body_q_com``, ``body_v_s``, ``body_a_s``, ``body_f_s``, ``body_I_s`` or the
+compact inertia terms of its bodies, which no consumer on its route reads.
 
 A leaf's inverse mass, ``1 / (H_ii + armature + K)``, depends on the inertial values, the armature and the drive's
-``K = ke dt^2 + kd dt``, never on the pose, so a root re-pose leaves it unchanged. It refreshes wherever the solver's mass
-mask selects (the update cadence plus the requests that resets and inertial, DOF and body notifications raise), and
+``K = ke dt^2 + kd dt``, never on the pose, so a root re-pose leaves it unchanged. It refreshes wherever the solver's
+mass mask selects (the update cadence plus the requests that resets and inertial, DOF and body notifications raise), and
 wherever a leaf's ``K`` changed: a one-coordinate tree decides its drive in its predict, one more division, so the drive
 stage takes the other coordinates (:attr:`.held_tree.HeldPlan.drive_dofs`). M6 timed prototype predict and finish
 kernels at 489 us per substep with this cadence over 16384 keyboard-sized worlds, against 500 us with a refresh on every
@@ -108,6 +110,37 @@ def _external_at_origin(
 
 
 @wp.func
+def _weld_pose(X_parent: wp.transform, X_p: wp.transform, X_c: wp.transform):
+    """A welded body's pose: its fixed joint's frames composed with its parent's pose, as the pose scan composes it."""
+    return transform_compose(X_parent, joint_frame_pose(X_p, wp.transform_identity(), X_c))
+
+
+@wp.func
+def _turning_load(
+    body: int,
+    motion: wp.spatial_vector,
+    origin: wp.vec3,
+    gravity: wp.vec3,
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_mass: wp.array[float],
+    body_inertia: wp.array[wp.mat33],
+    body_f: wp.array[wp.spatial_vector],
+    body_flags: wp.array[int],
+):
+    """One body's load on a turning column ``motion``: its weight and external wrench at the articulation ``origin``,
+    negated (the inverse-dynamics wrench at rest), and its inertia there applied to the column, ``S^T I_b S``."""
+    pose = body_q[body]
+    mass = body_mass[body]
+    radius = wp.transform_point(pose, body_com[body]) - origin
+    wrench = -wrench_shift(wp.spatial_vector(mass * gravity, wp.vec3()), radius) - _external_at_origin(
+        body, radius, body_f, body_flags
+    )
+    total, moment, rotational = inertia_at(mass, body_inertia[body], wp.transform_get_rotation(pose), radius)
+    return wrench, wp.dot(motion, inertia_apply(total, moment, rotational, motion))
+
+
+@wp.func
 def _publish_root(
     art: int,
     root_joint: int,
@@ -127,15 +160,16 @@ def _publish_root(
     current_valid[art] = 1
 
 
-def class_kernels(turns: bool) -> tuple[wp.Kernel, wp.Kernel, wp.Kernel]:
+def class_kernels(turns: bool, welded: bool) -> tuple[wp.Kernel, wp.Kernel, wp.Kernel]:
     """The class's repair, predict and finish for a family whose leaves all slide (``turns`` false) or of any
-    one-coordinate kind (``turns``: a leaf turns where its joint has an angular axis).
+    one-coordinate kind (``turns``: a leaf turns where its joint has an angular axis), with bodies welded below its
+    leaves (``welded``: each leaf's welds, ``weld_start`` and ``weld_joint_offset``, in its coordinate's thread) or
+    none.
 
     A slide's column has no turn: the slides' predict reads no pose (the moment arms of gravity and the external
-    wrench drop out, ``H_ii = m |S|^2``) and their finish takes the column about the world's origin, the same column
+    wrenches drop out, ``H_ii = M |S|^2``) and their finish takes the column about the world's origin, the same column
     about every point. With turning leaves every column, moment and velocity is taken about the articulation origin, and
-    ``H_ii`` is the body's inertia there applied to the column (:func:`.spatial_laws.inertia_at`,
-    :func:`.spatial_laws.inertia_apply`).
+    ``H_ii`` is each body's inertia there applied to the column (:func:`_turning_load`).
     """
 
     def repair(
@@ -150,11 +184,14 @@ def class_kernels(turns: bool) -> tuple[wp.Kernel, wp.Kernel, wp.Kernel]:
         clock: wp.array[Clock],
         dt: float,
         joint_child: wp.array[int],
+        joint_parent: wp.array[int],
         joint_q_start: wp.array[int],
         joint_dof_dim: wp.array2d[int],
         joint_X_p: wp.array[wp.transform],
         joint_X_c: wp.array[wp.transform],
         joint_axis: wp.array[wp.vec3],
+        weld_start: wp.array[int],
+        weld_joint_offset: wp.array[int],
         body_com: wp.array[wp.vec3],
         joint_q: wp.array[float],
         # outputs
@@ -195,6 +232,10 @@ def class_kernels(turns: bool) -> tuple[wp.Kernel, wp.Kernel, wp.Kernel]:
                 angular = joint_dof_dim[joint, 1] != 0
             body_q[child] = _leaf_pose(X_root, joint_X_p[joint], angular, axis, q, joint_X_c[joint])
             joint_S_s[dof] = _leaf_motion(X_wpj, origin, angular, axis)
+            if wp.static(welded):
+                for k in range(weld_start[local], weld_start[local + 1]):
+                    weld = root_joint + weld_joint_offset[k]
+                    body_q[joint_child[weld]] = _weld_pose(body_q[joint_parent[weld]], joint_X_p[weld], joint_X_c[weld])
 
     def predict(
         n: int,
@@ -204,6 +245,8 @@ def class_kernels(turns: bool) -> tuple[wp.Kernel, wp.Kernel, wp.Kernel]:
         articulation_dof_start: wp.array[int],
         joint_child: wp.array[int],
         joint_q_start: wp.array[int],
+        weld_start: wp.array[int],
+        weld_joint_offset: wp.array[int],
         joint_S_s: wp.array[wp.spatial_vector],
         body_q: wp.array[wp.transform],
         body_com: wp.array[wp.vec3],
@@ -253,23 +296,44 @@ def class_kernels(turns: bool) -> tuple[wp.Kernel, wp.Kernel, wp.Kernel]:
         dof = articulation_dof_start[art] + local
         child = joint_child[joint]
         motion = joint_S_s[dof]
-        mass = body_mass[child]
-        force = mass * gravity[0]
         body_force = wp.spatial_vector()
         leaf_inertia = float(0.0)
         if wp.static(turns):
-            # The moments about the articulation origin, from the leaf's pose.
-            pose = body_q[child]
-            radius = wp.transform_point(pose, body_com[child]) - articulation_origin[art]
-            body_force = -wrench_shift(wp.spatial_vector(force, wp.vec3()), radius) - _external_at_origin(
-                child, radius, body_f, body_flags
+            # The moments about the articulation origin, from each body's pose.
+            origin = articulation_origin[art]
+            body_force, tree_inertia = _turning_load(
+                child, motion, origin, gravity[0], body_q, body_com, body_mass, body_inertia, body_f, body_flags
             )
-            total, moment, rotational = inertia_at(mass, body_inertia[child], wp.transform_get_rotation(pose), radius)
-            leaf_inertia = wp.dot(motion, inertia_apply(total, moment, rotational, motion)) + armature[dof]
+            if wp.static(welded):
+                for k in range(weld_start[local], weld_start[local + 1]):
+                    wrench, inertia = _turning_load(
+                        joint_child[root_joint + weld_joint_offset[k]],
+                        motion,
+                        origin,
+                        gravity[0],
+                        body_q,
+                        body_com,
+                        body_mass,
+                        body_inertia,
+                        body_f,
+                        body_flags,
+                    )
+                    body_force += wrench
+                    tree_inertia += inertia
+            leaf_inertia = tree_inertia + armature[dof]
         else:
+            mass = body_mass[child]
+            if wp.static(welded):
+                for k in range(weld_start[local], weld_start[local + 1]):
+                    mass += body_mass[joint_child[root_joint + weld_joint_offset[k]]]
+            force = mass * gravity[0]
             body_force = -wp.spatial_vector(force, wp.vec3()) - _external_at_origin(
                 child, wp.vec3(), body_f, body_flags
             )
+            if wp.static(welded):
+                for k in range(weld_start[local], weld_start[local + 1]):
+                    body = joint_child[root_joint + weld_joint_offset[k]]
+                    body_force -= _external_at_origin(body, wp.vec3(), body_f, body_flags)
             linear = wp.spatial_top(motion)
             leaf_inertia = mass * wp.dot(linear, linear) + armature[dof]
         q = joint_q[joint_q_start[root_joint] + local]
@@ -333,11 +397,14 @@ def class_kernels(turns: bool) -> tuple[wp.Kernel, wp.Kernel, wp.Kernel]:
         articulation_start: wp.array[int],
         articulation_dof_start: wp.array[int],
         joint_child: wp.array[int],
+        joint_parent: wp.array[int],
         joint_q_start: wp.array[int],
         joint_dof_dim: wp.array2d[int],
         joint_X_p: wp.array[wp.transform],
         joint_X_c: wp.array[wp.transform],
         joint_axis: wp.array[wp.vec3],
+        weld_start: wp.array[int],
+        weld_joint_offset: wp.array[int],
         body_com: wp.array[wp.vec3],
         kinematic_dof_mask: wp.array[int],
         kinematic_joint_mask: wp.array[int],
@@ -397,19 +464,32 @@ def class_kernels(turns: bool) -> tuple[wp.Kernel, wp.Kernel, wp.Kernel]:
         body_q[child] = pose
         motion = _leaf_motion(X_wpj, origin, angular, axis)
         joint_S_s[dof] = motion
-        velocity = motion * qd_new
+        twist = motion * qd_new
+        velocity = twist
         if wp.static(turns):
             # The centre of mass's velocity: the twist about the origin at the body's centre of mass.
             radius = wp.transform_point(pose, body_com[child]) - origin
-            velocity = wp.spatial_vector(point_velocity(velocity, radius), wp.spatial_bottom(velocity))
+            velocity = wp.spatial_vector(point_velocity(twist, radius), wp.spatial_bottom(twist))
         body_qd[child] = velocity
+        if wp.static(welded):
+            # The welded bodies ride on the leaf's twist.
+            for k in range(weld_start[local], weld_start[local + 1]):
+                weld = root_joint + weld_joint_offset[k]
+                body = joint_child[weld]
+                welded_pose = _weld_pose(body_q[joint_parent[weld]], joint_X_p[weld], joint_X_c[weld])
+                body_q[body] = welded_pose
+                if wp.static(turns):
+                    radius = wp.transform_point(welded_pose, body_com[body]) - origin
+                    body_qd[body] = wp.spatial_vector(point_velocity(twist, radius), wp.spatial_bottom(twist))
+                else:
+                    body_qd[body] = twist
         if local == 0:
             _publish_root(
                 art, root_joint, X_root, joint_child, body_com, body_q, body_qd, articulation_origin, current_valid
             )
             source[group] = bank
 
-    kind = "turns" if turns else "slides"
+    kind = ("welded_" if welded else "") + ("turns" if turns else "slides")
     return (
         python_kernel(repair, f"repair_{kind}"),
         python_kernel(predict, f"predict_{kind}"),
@@ -417,20 +497,48 @@ def class_kernels(turns: bool) -> tuple[wp.Kernel, wp.Kernel, wp.Kernel]:
     )
 
 
-repair_slides, predict_slides, finish_slides = class_kernels(False)
-repair_turns, predict_turns, finish_turns = class_kernels(True)
+repair_slides, predict_slides, finish_slides = class_kernels(False, False)
+repair_turns, predict_turns, finish_turns = class_kernels(True, False)
+repair_welded_slides, predict_welded_slides, finish_welded_slides = class_kernels(False, True)
+repair_welded_turns, predict_welded_turns, finish_welded_turns = class_kernels(True, True)
+KERNELS = {
+    (False, False): (repair_slides, predict_slides, finish_slides),
+    (True, False): (repair_turns, predict_turns, finish_turns),
+    (False, True): (repair_welded_slides, predict_welded_slides, finish_welded_slides),
+    (True, True): (repair_welded_turns, predict_welded_turns, finish_welded_turns),
+}
+"""The class's (repair, predict, finish) by the family's data: whether a leaf turns, whether a leaf carries welds."""
+
+
+@dataclass(frozen=True, eq=False)
+class CoordinateTopology:
+    """The template of a family of one-coordinate trees (:func:`coordinate_topology`): its leaves and their welds.
+
+    Topologies compare and hash by identity: they hold arrays.
+    """
+
+    leaves: np.ndarray
+    """Each leaf's joint, its offset from the root's (one a coordinate, in coordinate order)."""
+    weld_start: np.ndarray
+    """Each leaf's first weld (CSR over ``weld_joint_offset``, one more entry than leaves)."""
+    weld_joint_offset: np.ndarray
+    """Each weld's joint, its offset from the root's: a leaf's welds in joint order, each after its parent."""
+    turns: bool
+    """Whether a leaf turns (its joint has an angular axis)."""
 
 
 def coordinate_topology(model, articulations: np.ndarray, articulation_joint_end: np.ndarray) -> tuple:
-    """Check that every articulation is a world-fixed root over one-body leaves of one coordinate each.
+    """Check that every articulation is a world-fixed root over one-coordinate leaves, each with the bodies welded below
+    it, all of one template.
 
-    Every articulation must hold the same number ``n`` of leaves, laid out as joints ``start + 1 .. start + n`` whose
-    coordinates and DOFs follow the root's in leaf order: a FIXED or zero-coordinate D6 root joint to the world, and
-    leaves of one coordinate (prismatic, revolute or a one-axis D6) whose parent is the root body and whose body is no
-    joint's parent.
+    The root joint is FIXED or a zero-coordinate D6 joint to the world; every other joint is a leaf of one coordinate
+    (prismatic, revolute or a one-axis D6) whose parent is the root body, or a weld (a FIXED or zero-coordinate D6
+    joint) below a leaf or another weld. The leaves' coordinates and DOFs follow the root's in joint order, and every
+    articulation has the first one's joint kinds and local parents.
 
     Returns:
-        ``(turns, reason)``: ``turns`` is whether a leaf turns (``None`` with the reason the topology is declined).
+        ``(topology, reason)``: the template (:class:`CoordinateTopology`), or ``None`` with the reason the topology is
+        declined.
     """
     articulations = np.asarray(articulations, dtype=np.int64)
     if articulations.size == 0:
@@ -440,53 +548,75 @@ def coordinate_topology(model, articulations: np.ndarray, articulation_joint_end
     if np.any(ends[articulations] != starts[articulations + 1]):
         return None, "Joints outside every tree keep their articulations on the tree route."
     joint_counts = starts[articulations + 1] - starts[articulations]
-    n = int(joint_counts[0]) - 1
-    if n < 1 or np.any(joint_counts != n + 1):
-        return None, "One-coordinate trees require the same number of leaves on every root."
-    types = model.joint_type.numpy()
-    parents = model.joint_parent.numpy()
-    children = model.joint_child.numpy()
-    dims = model.joint_dof_dim.numpy()
+    count = int(joint_counts[0])
+    if count < 2 or np.any(joint_counts != count):
+        return None, "One-coordinate trees require the same joints on every root."
+    joints = starts[articulations][:, None] + np.arange(count)[None, :]
+    types = model.joint_type.numpy()[joints]
+    dims = model.joint_dof_dim.numpy()[joints]
+    parents = model.joint_parent.numpy()[joints]
+    children = model.joint_child.numpy()[joints]
     q_start = model.joint_q_start.numpy().astype(np.int64)
     qd_start = model.joint_qd_start.numpy().astype(np.int64)
-    roots = starts[articulations]
-    root_bodies = children[roots]
-    fixed = types[roots] == int(JointType.FIXED)
-    locked = (types[roots] == int(JointType.D6)) & np.all(dims[roots] == 0, axis=1)
+    roots = joints[:, 0]
+    rigid = (types == int(JointType.FIXED)) | ((types == int(JointType.D6)) & (dims.sum(axis=-1) == 0))
     if (
-        not np.all(fixed | locked)
-        or np.any(parents[roots] != -1)
-        or np.any(root_bodies < 0)
+        not np.all(rigid[:, 0])
+        or np.any(parents[:, 0] != -1)
+        or np.any(children[:, 0] < 0)
         or np.any(q_start[roots + 1] != q_start[roots])
         or np.any(qd_start[roots + 1] != qd_start[roots])
     ):
         return None, "One-coordinate trees require a FIXED or zero-coordinate D6 root joint to the world."
-    leaves = roots[:, None] + 1 + np.arange(n)[None, :]
-    leaf_bodies = children[leaves]
-    if np.any(leaf_bodies < 0) or np.any(parents[leaves] != root_bodies[:, None]):
-        return None, (
-            "One-coordinate trees require every joint below the root to hang from the root body "
-            "(chains and composite trees are not admitted)."
-        )
-    kinds = types[leaves]
-    one_axis = (kinds == int(JointType.PRISMATIC)) | (kinds == int(JointType.REVOLUTE)) | (kinds == int(JointType.D6))
-    if not np.all(one_axis & (dims[leaves].sum(axis=-1) == 1)):
+    if np.any(children < 0):
+        return None, "One-coordinate trees require every joint to move a body."
+    owners = np.bincount(children.reshape(-1), minlength=model.body_count)
+    if np.any(owners[children] != 1):
+        return None, "One-coordinate trees require every body to be one joint's."
+    # Each joint's parent as a local joint (-1: the world), one template for every articulation.
+    local = np.full(model.body_count, -1, np.int64)
+    local[children] = np.arange(count)[None, :]
+    local_parents = np.where(parents >= 0, local[np.maximum(parents, 0)], -1)
+    if np.any(types != types[0]) or np.any(dims != dims[0]) or np.any(local_parents != local_parents[0]):
+        return None, "One-coordinate trees require one template of joints on every root."
+    types, dims, rigid, local_parents = types[0], dims[0], rigid[0], local_parents[0]
+    one_axis = (types == int(JointType.PRISMATIC)) | (types == int(JointType.REVOLUTE)) | (types == int(JointType.D6))
+    coordinate = one_axis & (dims.sum(axis=-1) == 1)
+    if not np.all((coordinate | rigid)[1:]):
         return None, "One-coordinate trees require one-coordinate leaves (prismatic, revolute or a one-axis D6)."
-    owners = np.bincount(children[children >= 0], minlength=model.body_count)
-    descendants = np.bincount(parents[parents >= 0], minlength=model.body_count)
-    if np.any(owners[root_bodies] != 1) or np.any(owners[leaf_bodies] != 1) or np.any(descendants[leaf_bodies] != 0):
-        return None, "One-coordinate trees require leaves without descendants (composite trees are not admitted)."
-    offsets = np.arange(n)[None, :]
-    if np.any(q_start[leaves] != q_start[roots][:, None] + offsets) or np.any(
-        qd_start[leaves] != qd_start[roots][:, None] + offsets
+    leaves = np.flatnonzero(coordinate)
+    if np.any(local_parents[leaves] != 0):
+        return None, (
+            "One-coordinate trees require every coordinate's joint to hang from the root body "
+            "(chains are not admitted)."
+        )
+    # Each weld's leaf, up its welded parents; a weld on the root body is the root's, not a coordinate's.
+    leaf_of = np.full(count, -1, np.int64)
+    leaf_of[leaves] = np.arange(leaves.size)
+    welds = np.flatnonzero(rigid[1:]) + 1
+    for weld in welds:
+        parent = local_parents[weld]
+        if parent <= 0 or parent > weld or leaf_of[parent] < 0:
+            return None, "One-coordinate trees require every weld to hang from a coordinate's body (none on the root)."
+        leaf_of[weld] = leaf_of[parent]
+    offsets = np.arange(leaves.size)[None, :]
+    if np.any(q_start[roots[:, None] + leaves] != q_start[roots][:, None] + offsets) or np.any(
+        qd_start[roots[:, None] + leaves] != qd_start[roots][:, None] + offsets
     ):
-        return None, "One-coordinate trees require leaf coordinates in leaf order."
-    return bool(np.any(dims[leaves][..., 1] != 0)), ""
+        return None, "One-coordinate trees require leaf coordinates in joint order."
+    order = np.argsort(leaf_of[welds], kind="stable")
+    topology = CoordinateTopology(
+        leaves=leaves.astype(np.int32),
+        weld_start=np.searchsorted(leaf_of[welds][order], np.arange(leaves.size + 1)).astype(np.int32),
+        weld_joint_offset=welds[order].astype(np.int32),
+        turns=bool(np.any(dims[leaves, 1] != 0)),
+    )
+    return topology, ""
 
 
 @dataclass(frozen=True, eq=False)
 class CoordinateTreesPlan:
-    """A compact diagonal family whose trees are one body and one coordinate each (the class's one-body test).
+    """A compact diagonal family whose trees are one coordinate each (the class's test): its articulations' template.
 
     Plans compare and hash by identity: ``dofs`` is an array.
     """
@@ -497,16 +627,16 @@ class CoordinateTreesPlan:
     """Articulations in the group."""
     dofs: np.ndarray
     """The group's DOFs, sorted."""
-    turns: bool
-    """Whether a leaf turns: the family's kernels (:func:`class_kernels`)."""
+    topology: CoordinateTopology
+    """The trees' template: the family's kernels (:data:`KERNELS`) and their welds."""
 
 
 def plan(inputs, *, size: int | None) -> tuple[CoordinateTreesPlan | None, str]:
     """Decide whether the compact diagonal family of ``size`` coordinates takes the one-coordinate class's kernels.
 
-    The rule is topology: the family must be the compact diagonal's (``size``, ``None`` without one), each of its
-    coordinates must move one body, and each articulation must pass :func:`coordinate_topology`. The held plan
-    (:func:`.held_tree.plan`) reads it with the class's ``inputs`` (:class:`.class_plan.ClassInputs`).
+    The rule is topology: the family must be the compact diagonal's (``size``, ``None`` without one) and each
+    articulation must pass :func:`coordinate_topology`. The held plan (:func:`.held_tree.plan`) reads it with the
+    class's ``inputs`` (:class:`.class_plan.ClassInputs`).
 
     Returns:
         ``(plan, reason)``; ``plan`` is ``None`` when the family stays a held tree group.
@@ -520,14 +650,11 @@ def plan(inputs, *, size: int | None) -> tuple[CoordinateTreesPlan | None, str]:
         return None, "One-coordinate trees exclude particles."
     if inputs.options.enable_joint_velocity_limits:
         return None, "Joint velocity limits keep the compact diagonal family in a held tree group (motion velocity)."
-    if size not in forest.direct_diagonal_inertia_sizes:
-        return None, "The compact diagonal family has coordinates that do not each move one body."
     articulations = forest.group_to_art[size].numpy()
-    turns, reason = coordinate_topology(model, articulations, forest.articulation_joint_end.numpy())
-    if turns is None:
+    topology, reason = coordinate_topology(model, articulations, forest.articulation_joint_end.numpy())
+    if topology is None:
         return None, reason
-    offsets = forest.crba_dof_joint_offset_by_size[size].numpy()
-    if not np.array_equal(offsets, np.arange(1, size + 1)):
+    if not np.array_equal(forest.crba_dof_joint_offset_by_size[size].numpy(), topology.leaves):
         return None, "The compact diagonal family's coordinates do not follow its leaves."
     if not factor.parallel_drives:
         return None, "One-coordinate trees evaluate the augmented drives of the owned drive-row topology."
@@ -543,12 +670,13 @@ def plan(inputs, *, size: int | None) -> tuple[CoordinateTreesPlan | None, str]:
         size=int(size),
         group_count=len(articulations),
         dofs=np.sort(dofs.reshape(-1)).astype(np.int32),
-        turns=turns,
+        topology=topology,
     )
-    kind = "turning and sliding" if turns else "sliding"
+    kind = "turning and sliding" if topology.turns else "sliding"
+    welds = f" with {topology.weld_joint_offset.size} welded bodies" if topology.weld_joint_offset.size else ""
     reason = (
-        f"Admitted: {chosen.group_count} world-fixed roots of {chosen.size} {kind} one-body leaves hold their trees "
-        "a thread a coordinate."
+        f"Admitted: {chosen.group_count} world-fixed roots of {chosen.size} {kind} leaves{welds} hold their trees a "
+        "thread a coordinate."
     )
     return chosen, reason
 
@@ -558,8 +686,8 @@ class CoordinateTrees:
 
     The owner calls ``begin`` before any factor or force consumer, ``refresh`` at the mass cadence, ``predict`` at
     stage 3, and ``finish`` to integrate and publish; ``invalidate`` and ``validate_model`` follow resets and model
-    notifications. ``sparse`` is the group itself: the inverse-mass refresh runs inside ``predict``, where the mass mask,
-    the drive stiffness and the motion columns of this substep are all at hand.
+    notifications. ``sparse`` is the group itself: the inverse-mass refresh runs inside ``predict``, where the mass
+    mask, the drive stiffness and the motion columns of this substep are all at hand.
     """
 
     # The cache is stamped with the bank the finish published into; a repair compares the stamp, never the words.
@@ -582,10 +710,13 @@ class CoordinateTrees:
         self._geometry_valid = wp.zeros(self.group_count, dtype=int, device=device)
         # Each articulation's stamp: the address of the coordinates its cache was published into (0: none).
         self._source = wp.zeros(self.group_count, dtype=wp.uint64, device=device)
-        self.repair_kernel, self.predictor_kernel, self.finish_kernel = (
-            (repair_turns, predict_turns, finish_turns)
-            if family.turns
-            else (repair_slides, predict_slides, finish_slides)
+        self.topology = topology = family.topology
+        welded = topology.weld_joint_offset.size > 0
+        self.repair_kernel, self.predictor_kernel, self.finish_kernel = KERNELS[topology.turns, welded]
+        # Each leaf's welds (a CSR over the template's joints); an empty list for a family without welds.
+        self.weld_start = wp.array(topology.weld_start, dtype=int, device=device)
+        self.weld_joint_offset = wp.array(
+            topology.weld_joint_offset if welded else np.zeros(1, np.int32), dtype=int, device=device
         )
         self._plan_dimensions = self._dimensions()
 
@@ -652,11 +783,14 @@ class CoordinateTrees:
                 solver.factor.clock,
                 dt,
                 model.joint_child,
+                model.joint_parent,
                 model.joint_q_start,
                 model.joint_dof_dim,
                 model.joint_X_p,
                 model.joint_X_c,
                 model.joint_axis,
+                self.weld_start,
+                self.weld_joint_offset,
                 model.body_com,
                 state_in.joint_q,
             ],
@@ -679,6 +813,8 @@ class CoordinateTrees:
             solver.forest.articulation_dof_start,
             model.joint_child,
             model.joint_q_start,
+            self.weld_start,
+            self.weld_joint_offset,
             state_aug.joint_S_s,
             state_in.body_q,
             model.body_com,
@@ -728,11 +864,14 @@ class CoordinateTrees:
             model.articulation_start,
             solver.forest.articulation_dof_start,
             model.joint_child,
+            model.joint_parent,
             model.joint_q_start,
             model.joint_dof_dim,
             model.joint_X_p,
             model.joint_X_c,
             model.joint_axis,
+            self.weld_start,
+            self.weld_joint_offset,
             model.body_com,
             solver.factor.kinematic_dof_mask,
             solver.factor.kinematic_joint_mask,

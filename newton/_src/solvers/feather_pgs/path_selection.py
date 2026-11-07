@@ -200,7 +200,7 @@ def _held_tree(solver) -> dict:
             {"worlds": int(held.worlds.size), "grouping": held.grouping, "reason": held.reason}
             for held in owner.plan.classes
         ],
-        # Whether the compact diagonal family takes the one-coordinate class (its trees one body each), and why.
+        # Whether the compact diagonal family takes the one-coordinate class (its trees rigid below each leaf), and why.
         "coordinate_trees": {
             "enabled": owner.coordinate_trees is not None,
             "reason": owner.plan.coordinate_reason,
@@ -260,7 +260,8 @@ def _coordinate_group(group, drive_dofs) -> dict:
         "operator": type(group).__name__,
         "size": size,
         "group_count": int(group.group_count),
-        "bodies": size + 1,
+        # The root, a body a leaf and the leaves' welded bodies.
+        "bodies": size + 1 + int(group.topology.weld_joint_offset.size),
         "dofs": size,
         "lanes": size,
         "trees_per_block": None,

@@ -273,7 +273,8 @@ def diagonal_rule(inputs: ClassInputs) -> tuple[Diagonal | None, str]:
     if np.any(dense_offsets < 0) or np.any(dense_groups < 0):
         return None, missing
     # Its compact diagonal is the held tree's representation: a candidate only where the held tree takes the dense
-    # groups with it, the diagonal group as a held family (the one-coordinate class where its trees are one body each).
+    # groups with it, the diagonal group as a held family (the one-coordinate class where its trees are rigid below
+    # their leaves).
     try:
         held = held_tree.plan(inputs, compact=int(diagonal_size[0]))
     except ValueError as error:
