@@ -69,7 +69,8 @@ class TestFreeBodyRowsBuild(unittest.TestCase):
         kind, parent and friction coefficient. The CPU streams the dense rows' metadata, so every row has one."""
         solver = self._box_step()
         p = solver.placement
-        self.assertTrue(p.writes_dense_records)
+        self.assertTrue(p.writes_records)
+        self.assertEqual(p.record_first, 0)
         rows = int(p.constraint_count.numpy()[0])
         self.assertGreater(rows, 0, "the box must touch the ground")
         line = int(p.dense_first.numpy()[0])

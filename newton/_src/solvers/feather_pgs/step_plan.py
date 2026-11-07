@@ -663,6 +663,9 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     def link_patches(step):
         laws.link_patches(solver, step.contacts)
 
+    def store_records(step):
+        sweep.store_records()
+
     def latch_status(step):
         placement.latch_status(step.contacts)
 
@@ -682,8 +685,9 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         topology.join()
         laws.write_walked(solver, step.state_in, step.contacts, step.dt, WRITE_REST)
 
-    # The one writer writes its contact rows' records after the row pass, so the patches link after it; the sparse
-    # diagonal's schedule reads the rows it wrote and the marks of their slots.
+    # The one writer writes its contact rows' records after the row pass, so the patches link after it, and the
+    # streamed rows' records follow the linked rows; the sparse diagonal's schedule reads the rows it wrote and the
+    # marks of their slots.
     add(
         *((classify_resolved_worlds,) if resolved is not None else ()),
         *write_rows,
@@ -695,6 +699,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         *((diagonals,) if placement.clears_diagonals and topology is None else ()),
         *((write_walked,) if holds else ()),
         link_patches,
+        *((store_records,) if placement.writes_records else ()),
         *((schedule_diagonal,) if sweep.sparse_contact_schedule is not None else ()),
         nvtx="S4_HinvJt_Diag_RHS",
     )

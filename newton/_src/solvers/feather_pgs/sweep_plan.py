@@ -46,6 +46,8 @@ from .execution_plan import _MFGSStorage, _select_mfgs_storage
 from .field_group import Field, FieldGroup
 from .friction_patches import patch_routes
 from .path_selection import json_value, kernel_key
+from .response_builds_rows import RECORD_LANES, bind_row_records, store_row_records
+from .row_records import bind as bind_dense_rows
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF, SolvePolicy, SolveReadoutRecord
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport, row_supports
@@ -495,12 +497,11 @@ class Sweep:
                 )
             self.mf_gs_storage = storage
             parallel_rows = self.classes.tier_rows
-            # The streamed rows' records, in the worlds the general sweep visits.
+            # The streamed rows' records, in the worlds the general sweep and the unit builder read.
             self.placement.allocate_row_records(
-                sweep_routes.record_first(self.placement.dense_max_constraints, storage.places),
-                skip_rows=parallel_rows,
-                speed_rows=speed_rows,
+                sweep_routes.record_first(self.placement.dense_max_constraints, storage.places)
             )
+            self.record_grid = min(self.forest.world_count, max(int(model.device.sm_count), 1) * 16)
             # The general sweep's warp mapping: its places the storage's, its rows the placement's.
             self.general_sweep = sweep_routes.GeneralSweep(
                 self.placement.dense_max_constraints,
@@ -685,15 +686,40 @@ class Sweep:
             device=self.model.device,
         )
 
+    def general_claims(self) -> Buckets:
+        """The claims' worlds the general sweep and the unit builder read: the general bucket and the candidates'
+        (consecutive), which the unit builder splits."""
+        general = self.claim_general
+        return self.claims.span(general, general + (1 if self.colored_units is None else 2))
+
     def walked_claims(self) -> tuple[Buckets, int]:
         """The one writer's worlds (:func:`.walk_rows.walked_rows_kernel`): a list of the claims' buckets, and whether it
         walks it or every world. Under keyed rows the tiers walk their worlds' seeds in their kernels, so the writer
-        walks the other claims' worlds: the general bucket and the candidates' (consecutive), which the unit builder
-        splits after the writer."""
+        walks the other claims' worlds (:meth:`general_claims`)."""
         if self.placement.keyed_rows is None:
             return self.every_world, 0
-        general = self.claim_general
-        return self.claims.span(general, general + (1 if self.colored_units is None else 2)), 1
+        return self.general_claims(), 1
+
+    def store_records(self) -> None:
+        """The streamed rows' records of the worlds :meth:`general_claims` lists, once their writers and the patch link
+        left their rows final (:func:`.response_builds_rows.store_row_records`): a lane group a world, a world slot a
+        warp of the device's resident warps."""
+        self.join_claims()
+        placement = self.placement
+        wp.launch(
+            store_row_records,
+            dim=(self.record_grid, RECORD_LANES),
+            inputs=[
+                self.general_claims(),
+                self.record_grid,
+                bind_row_records(placement),
+                bind_dense_rows(placement),
+                placement.row_incident,
+                placement.constraint_count,
+                placement.mf_constraint_count,
+            ],
+            device=self.model.device,
+        )
 
     def schedule_diagonal(self) -> None:
         """Case K2: publish the sparse diagonal's schedule of the rows the row pass wrote (run after every producer):

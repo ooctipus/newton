@@ -2,14 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The streamed rows' records (:func:`.row_metadata.pack_row_record`), which the sweeps' row loops load a row ahead:
-each row's writer stores its record once the row is final (:func:`write_row_record`), the patch link the parent it
-links (:func:`store_record_parent`).
+one pass stores the records of the worlds the general sweep and the unit builder read, once their rows are final
+(:func:`store_row_records`).
 """
 
 from __future__ import annotations
 
 import warp as wp
 
+from ...core.execution import Buckets, bucket_item
 from .device_preludes import CPU_MATH, dual_native
 from .row_metadata import HEADER_WORDS, RECORD_WORDS, pack_row_record
 from .row_records import DenseRows
@@ -29,19 +30,13 @@ from .row_records import DenseRows
 @wp.struct
 class RowRecords:
     """Where a line's rows' records sit (:func:`.row_metadata.record_layout`: ``record`` from row ``first``, the free
-    rows' headers from row ``base`` at word ``free``), which worlds' a sweep reads (:func:`swept`: ``count``,
-    ``skip_rows``, ``speed``, ``speed_first``, ``mf_count``) and each articulation's first world coordinate and
-    coordinates (``offset``, ``dofs``)."""
+    rows' headers from row ``base`` at word ``free``) and each articulation's first world coordinate and coordinates
+    (``offset``, ``dofs``)."""
 
     record: wp.array2d[wp.int32]
     first: int
     base: int
     free: int
-    skip_rows: int
-    speed: int
-    count: wp.array[int]
-    mf_count: wp.array[int]
-    speed_first: wp.array[int]
     offset: wp.array[int]
     dofs: wp.array[int]
 
@@ -85,15 +80,6 @@ def store_row_header(
 ): ...
 
 
-@wp.func_native(
-    """    // The kind and parent word's high half (record_kind: the parent above the kind), stored alone: no read of
-    // the kind, which the row's writer stored (little-endian on both devices).
-    reinterpret_cast<unsigned short*>(&record.data[at + 3])[1] = static_cast<unsigned short>(parent);
-"""
-)
-def store_parent_word(record: wp.array2d[wp.int32], at: int, parent: int): ...
-
-
 @wp.func
 def record_at(records: RowRecords, line: int, slot: int) -> int:
     """The flat index of row ``slot``'s record in line ``line``'s records (-1 for a row without one): a dense row's of
@@ -104,18 +90,6 @@ def record_at(records: RowRecords, line: int, slot: int) -> int:
     if slot >= records.base:
         return at + records.free + (slot - records.base) * HEADER_WORDS
     return at + (slot - records.first) * RECORD_WORDS
-
-
-@wp.func
-def swept(records: RowRecords, world: int) -> bool:
-    """Whether the matrix-free sweep visits ``world``: every world but the tiers' (:func:`.sweep_levels.claim_worlds`'
-    predicate)."""
-    if records.mf_count[world] > 0:
-        return True
-    count = records.count[world]
-    if wp.min(count, records.base) > records.skip_rows:
-        return True
-    return records.speed != 0 and count > records.speed_first[world]
 
 
 @wp.func
@@ -131,20 +105,8 @@ def record_firsts(records: RowRecords, sides: wp.vec2i) -> wp.vec2i:
 
 @wp.func
 def write_row_record(records: RowRecords, rows: DenseRows, incident: float, line: int, slot: int):
-    """Store row ``slot``'s record from the row as its writer left it (:func:`store_row_record_of`)."""
-    if record_at(records, line, slot) < 0:
-        return
-    sides = rows.sides[line, slot]
-    store_row_record_of(records, rows, incident, line, slot, sides, record_firsts(records, sides))
-
-
-@wp.func
-def store_row_record_of(
-    records: RowRecords, rows: DenseRows, incident: float, line: int, slot: int, sides: wp.vec2i, firsts: wp.vec2i
-):
-    """Store row ``slot``'s record (:func:`.row_metadata.pack_row_record`), its ``sides`` at ``firsts``
-    (:func:`record_firsts`), the rest from the row as its writer left it (its rhs plus ``incident``). A free row's is its
-    header, with its diagonal's inverse and its parent from ``base``."""
+    """Store row ``slot``'s record (:func:`.row_metadata.pack_row_record`) from the row as its writers left it (its rhs
+    plus ``incident``). A free row's is its header, with its diagonal's inverse and its parent from ``base``."""
     at = record_at(records, line, slot)
     if at < 0:
         return
@@ -152,6 +114,8 @@ def store_row_record_of(
     parent = rows.row_parent[line, slot]
     rhs = rows.rhs[line, slot] + incident
     kind = rows.row_type[line, slot]
+    sides = rows.sides[line, slot]
+    firsts = record_firsts(records, sides)
     if slot >= records.base:
         inverse = float(0.0)
         if diagonal > 0.0:
@@ -171,41 +135,45 @@ def store_row_record_of(
     )
 
 
-@wp.func
-def store_record_parent(records: RowRecords, world: int, line: int, slot: int, parent: int):
-    """Store row ``slot``'s linked ``parent`` (a line row) in its record's kind and parent word, where it has a record
-    a sweep reads (:func:`swept`): the patch link's, after the row's writer stored the rest."""
-    at = record_at(records, line, slot)
-    if at < 0:
-        return
-    if not swept(records, world):
-        return
-    stored = parent
-    if slot >= records.base:
-        stored = parent - records.base
-    store_parent_word(records.record, at, stored)
+RECORD_LANES = 32
+"""Lanes a world's rows' records are stored by (:func:`store_row_records`)."""
+_RECORD_LANES = wp.constant(RECORD_LANES)
 
 
-def no_row_records() -> RowRecords:
-    """Records of a store that has none: no row is past ``first`` (a link outside a solver's step)."""
-    records = RowRecords()
-    records.first = 1 << 30
-    records.base = 1 << 30
-    return records
+@wp.kernel(enable_backward=False)
+def store_row_records(
+    worlds: Buckets,
+    grid: int,
+    records: RowRecords,
+    rows: DenseRows,
+    incident: wp.array2d[float],
+    count: wp.array[int],
+    mf_count: wp.array[int],
+):
+    """Store the records of the rows of ``worlds`` (the claims' worlds the general sweep and the unit builder read,
+    :func:`.sweep_levels.claim_worlds`), once their writers and the patch link have left them final: a world's dense
+    rows (``count``) from ``first``, then its free rows (``mf_count``) from ``base``, :data:`RECORD_LANES` lanes a world
+    and ``grid`` worlds at once."""
+    item, lane = wp.tid()
+    pitch = rows.rhs.shape[1]
+    world = bucket_item(worlds, item)
+    while world >= 0:
+        line = rows.first[world]
+        for slot in range(records.first + lane, wp.min(count[world], records.base), _RECORD_LANES):
+            write_row_record(records, rows, incident[line, slot], line, slot)
+        for slot in range(records.base + lane, wp.min(records.base + mf_count[world], pitch), _RECORD_LANES):
+            write_row_record(records, rows, incident[line, slot], line, slot)
+        item += grid
+        world = bucket_item(worlds, item)
 
 
 def bind_row_records(placement) -> RowRecords:
-    """The placement's records (:meth:`.placement.Placement.allocate_row_records`) as their writers take them."""
+    """The placement's records (:meth:`.placement.Placement.allocate_row_records`) as their pass takes them."""
     records = RowRecords()
     records.record = placement.row_record
     records.first = int(placement.record_first) if placement.writes_records else int(placement.row_pitch)
     records.base = int(placement.body_base)
     records.free = int(placement.free_records)
-    records.skip_rows = int(placement.record_skip_rows)
-    records.speed = int(placement.record_speed_rows)
-    records.count = placement.constraint_count
-    records.mf_count = placement.mf_constraint_count
-    records.speed_first = placement.speed_first
     records.offset = placement.forest.articulation_world_dof_offset
     records.dofs = placement.forest.articulation_response_dof_count
     return records

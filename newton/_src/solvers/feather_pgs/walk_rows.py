@@ -63,7 +63,6 @@ from .friction_patches import PatchRowLaw
 from .joint_table import FreeBodies
 from .kernel_template import python_kernel
 from .projection_laws import friction_ball_metric, friction_pair_metric
-from .response_builds_rows import RowRecords, record_firsts, store_row_record_of, swept, write_row_record
 from .row_build import write_contact_row
 from .row_kernels import RIGID_SPEED_ROWS, RowBias, row_bias
 from .row_laws import LINK_ROWS
@@ -77,7 +76,6 @@ from .row_records import (
     UNIT_VELOCITY,
     DenseRows,
     RowSupport,
-    row_sides,
     unit_source,
 )
 from .sparse_mass_matrix import _SparseRowSupport
@@ -332,9 +330,7 @@ def unit_reader(links: bool, unit_rows: int = 1, contacts: bool = True) -> wp.Fu
 
 
 @cache
-def walked_rows_kernel(
-    blocks: int, mimic_blocks: bool, side: bool, tables: tuple, block: int = 0, records: bool = False
-) -> wp.Kernel:
+def walked_rows_kernel(blocks: int, mimic_blocks: bool, side: bool, tables: tuple, block: int = 0) -> wp.Kernel:
     """The one writer of the general placement, world-major: a world's group of ``lanes`` lanes (:func:`writer_lanes`)
     writes its rows in the block primitive's phases (FL3_design §1.4, W9), the group synchronized between them:
 
@@ -348,10 +344,6 @@ def walked_rows_kernel(
        blocks (:func:`.factor.closure.close_block`; its rows are the links', and the mimics' with
        ``mimic_blocks``), then correct every other row on the blocks its sides touch
        (:func:`.factor.closure.close_row`).
-
-    3. *records* (``records``: a sweep streams the dense rows' metadata): in a world that sweep visits
-       (:func:`.response_builds_rows.swept`), the lanes store every row's record once the row is final
-       (:func:`.response_builds_rows.write_row_record`), so no pass over the rows packs them.
 
     The closure's seed stays a launch after the warm start's gather (:meth:`.tree_factor.TreeFactor.seed_blocks`).
 
@@ -400,7 +392,6 @@ def walked_rows_kernel(
         bias: RowBias,
         bounds: wp.array2d[int],
         part: int,
-        row_records: RowRecords,
     ):
         world, lane = wp.tid()
         if claimed != 0:
@@ -412,10 +403,6 @@ def walked_rows_kernel(
         dense_rows = support.units.shape[1]
         count = wp.min(counts[world], dense_rows)
         line = rows.first[world]
-        # Whether this launch stores the world's records, read before the rows (its loads overlap the walk).
-        stores = bool(False)
-        if wp.static(records):
-            stores = part != WRITE_TOPOLOGY and swept(row_records, world)
         # The part's rows: the topology's below the family bound (the count is not final before the contact pass),
         # the rest above it.
         first = int(0)
@@ -470,17 +457,10 @@ def walked_rows_kernel(
                             line, slot, rows.sides[line, slot], wp.static(capacity), preelim, rows.cfm, sink.entries,
                             rows.rhs, rows.diag,
                         )  # fmt: skip
-        if wp.static(records):
-            # The records, once every row of the world is final.
-            if stores:
-                world_sync(lanes)
-                for slot in range(lane, count, lanes):
-                    write_row_record(row_records, rows, sink.row_incident[line, slot], line, slot)
 
     name = "write_walked_rows" + (f"_blocks{blocks}" if has_blocks else "")
     name += "_mimics" if mimic_blocks else ""
     name += f"_topology{block}" if block else ""
-    name += "_records" if records else ""
     return python_kernel(kernel, name, launch_bounds=WRITERS["packed_blocks" if has_blocks else "packed"].bounds)
 
 
@@ -489,13 +469,12 @@ def writer_kernel(solver, part: int = WRITE_ROWS) -> wp.Kernel:
     where bilateral blocks exist (mimics among them under ``enable_bilateral_preelimination``), the records' side
     where a walked joint can have two halves (:attr:`.tree_factor.TreeFactor.walk_side`), and the walking classes'
     paths (:attr:`.tree_factor.TreeFactor.walk_classes`); the topology ``part``'s, its rows walked in blocks of
-    :data:`WRITER_BLOCK_ROWS`; the dense rows' records where a sweep streams them (the other parts')."""
+    :data:`WRITER_BLOCK_ROWS`."""
     factor = solver.factor
     blocks = factor.block_capacity if factor.eliminates else 0
     mimics = bool(blocks and solver.options.enable_bilateral_preelimination)
     block = WRITER_BLOCK_ROWS if part == WRITE_TOPOLOGY else 0
-    records = solver.placement.writes_dense_records and not block
-    return walked_rows_kernel(blocks, mimics, factor.walk_side, walk_tables(factor.walk_classes), block, records)
+    return walked_rows_kernel(blocks, mimics, factor.walk_side, walk_tables(factor.walk_classes), block)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1637,22 +1616,16 @@ a row's sides in its ``a``/``b`` order, six entries each."""
 
 
 @wp.func
-def free_body_contact_rows(
-    sink: RowSink, rows: DenseRows, data: ContactInput, law: PatchRowLaw, bias: RowBias, records: RowRecords, c: int
-):
+def free_body_contact_rows(sink: RowSink, rows: DenseRows, data: ContactInput, law: PatchRowLaw, bias: RowBias, c: int):
     """Contact ``c``'s rows where the allocation routed it to the free bodies (``path`` 1): the contact's front end
     formed once (:func:`.contact_input.contact_frame`), then each row's records by the contact law and the row as its
     own unit (:func:`contact_row_unit`), walked by the one unit walker into the free bodies' rows
     (:data:`walk_body_row`; the spin row a torque), with its diagonal ``|z|^2 + cfm``, its incident velocity and its rhs
-    by the row law (:func:`.row_kernels.row_bias`), as every writer's, then its record
-    (:func:`.response_builds_rows.store_row_record_of`). The contact's rows share their sides
-    (:func:`.row_records.row_sides`), whose first coordinates the records hold: read once, before the rows' stores."""
+    by the row law (:func:`.row_kernels.row_bias`), as every writer's."""
     slot = data.slot[c]
     if data.path[c] != 1 or slot < 0:
         return
     line = sink.layout.first[data.world[c]]
-    sides = row_sides(data.art0[c], data.art1[c], data.response_dofs)
-    firsts = record_firsts(records, sides)
     # The allocation's extent: recomputing eligibility can cross a floating-point threshold.
     count = int(1)
     if data.slots_needed[c] >= 3:
@@ -1660,9 +1633,7 @@ def free_body_contact_rows(
     frame = contact_frame(data, law, c)
     for row in range(count):
         walk_body_row(sink, contact_row_unit(data, law, frame, c, row, line, slot + row))
-        incident = sink.row_incident[line, slot + row]
-        row_bias(rows, bias, line, slot + row, incident)
-        store_row_record_of(records, rows, incident, line, slot + row, sides, firsts)
+        row_bias(rows, bias, line, slot + row, sink.row_incident[line, slot + row])
 
 
 @wp.func
@@ -1686,19 +1657,12 @@ def speed_axis(sink: RowSink, line: int, slot: int, art: int, dof: int) -> float
 
 @wp.func
 def free_body_speed_rows(
-    bodies: FreeBodies,
-    rows: DenseRows,
-    sink: RowSink,
-    speed_slot: wp.array[int],
-    bias: RowBias,
-    records: RowRecords,
-    candidate: int,
+    bodies: FreeBodies, rows: DenseRows, sink: RowSink, speed_slot: wp.array[int], bias: RowBias, candidate: int
 ):
     """Free rigid body ``candidate``'s speed rows in the free bodies' run, in the slots and with the records and unit
     sources their allocation wrote (:func:`.row_kernels.allocate_rigid_velocity_limit_slots`): each the seed of the
     axis it bounds at the body's root, walked (:data:`read_row_unit`, :data:`walk_body_row`), then its axis
-    (:func:`speed_axis`) and its rhs by the row law (:func:`.row_kernels.row_bias`), as the one writer's, then its
-    record (:func:`.response_builds_rows.write_row_record`)."""
+    (:func:`speed_axis`) and its rhs by the row law (:func:`.row_kernels.row_bias`), as the one writer's."""
     body = bodies.free_rigid_body_indices[candidate]
     art = bodies.body_to_articulation[body]
     if art < 0:
@@ -1715,9 +1679,7 @@ def free_body_speed_rows(
         source = unit_source(UNIT_SPEED, 2 * (sink.walk.dof_start[art] + 3 * k))
         unit = read_row_unit(rows, ContactInput(), PatchRowLaw(), JointSeeds(), line, row, source)
         walk_body_row(sink, unit)
-        incident = speed_axis(sink, line, row, art, unit.dof0)
-        row_bias(rows, bias, line, row, incident)
-        write_row_record(records, rows, incident, line, row)
+        row_bias(rows, bias, line, row, speed_axis(sink, line, row, art, unit.dof0))
 
 
 @wp.kernel(enable_backward=False, launch_bounds=WRITERS["free_body"].bounds)
@@ -1731,7 +1693,6 @@ def write_free_body_rows(
     speed_bodies: int,
     threads: int,
     bias: RowBias,
-    records: RowRecords,
 ):
     """The free bodies' rows (the line's packed rows from ``body_base``), once their families' slots are reserved:
     ``threads`` lanes stride over their units, the step's contacts (:func:`free_body_contact_rows`, those the
@@ -1741,9 +1702,9 @@ def write_free_body_rows(
     contacts = data.count[0]
     for item in range(wp.tid(), contacts + speed_bodies, threads):
         if item < contacts:
-            free_body_contact_rows(sink, rows, data, law, bias, records, item)
+            free_body_contact_rows(sink, rows, data, law, bias, item)
         else:
-            free_body_speed_rows(bodies, rows, sink, speed_slot, bias, records, item - contacts)
+            free_body_speed_rows(bodies, rows, sink, speed_slot, bias, item - contacts)
 
 
 def free_body_sink(solver) -> RowSink:

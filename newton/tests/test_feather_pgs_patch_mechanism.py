@@ -65,7 +65,6 @@ from newton._src.solvers.feather_pgs.friction_patches import (
     link_patch_routes,
     patch_routes,
 )
-from newton._src.solvers.feather_pgs.response_builds_rows import no_row_records
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.feather_pgs_patch_reference import SENTINEL, ReferencePatches, pair_codes, store_frame
@@ -798,7 +797,7 @@ def run_reference_differential(
         mine = [rows.arrays() for _ in live_states]
         their_maps, their_routes = rows.arrays()
         for state, (maps, routes) in zip(live_states, mine, strict=True):
-            state.link(*maps, patch_routes(routes), no_row_records())
+            state.link(*maps, patch_routes(routes))
         reference.link(scene.contacts, *their_maps, their_routes)
         _assert_live_rows(mine, their_routes, f"{context} link")
         out, com = _solved_state(scene, rng)
@@ -1022,7 +1021,7 @@ def run_graph_replay(device, *, worlds=32, contacts=1536, capacity=2048, live_so
 
     def step():
         patches.build(scene.model, scene.state, scene.contacts)
-        patches.link(*maps, linked, no_row_records())
+        patches.link(*maps, linked)
         patches.finish(scene.state, out, com, *maps, linked, dt)
 
     def reference_step():
@@ -1037,7 +1036,7 @@ def run_graph_replay(device, *, worlds=32, contacts=1536, capacity=2048, live_so
             return
         twin_maps, twin_routes = rows.arrays()
         twin.build(scene.model, scene.state, scene.contacts)
-        twin.link(*twin_maps, patch_routes(twin_routes), no_row_records())
+        twin.link(*twin_maps, patch_routes(twin_routes))
         twin.finish(scene.state, out, com, *twin_maps, patch_routes(twin_routes), dt)
         _assert_same_rows(twin_routes, routes, f"{context} twin")
 
@@ -1518,7 +1517,7 @@ def run_launch_shapes(
             arrays = [rows.arrays() for _ in states]
             routes = [row for _, row in arrays]
             for state, (maps, row) in zip(states, arrays, strict=True):
-                state.link(*maps, patch_routes(row), no_row_records())
+                state.link(*maps, patch_routes(row))
             check("link", f"{stage} link", routes)
             out, com = _solved_state(scene, rng)
             for state, (maps, row) in zip(states, arrays, strict=True):
@@ -1809,14 +1808,7 @@ def run_ring_links(test, device, seed):
         wp.launch(
             link_patch_routes,
             dim=threads,
-            inputs=[
-                wp.array([live, live], dtype=int, device=device),
-                view,
-                *maps,
-                patch_routes(joint),
-                threads,
-                no_row_records(),
-            ],
+            inputs=[wp.array([live, live], dtype=int, device=device), view, *maps, patch_routes(joint), threads],
             device=device,
         )
         assert_rows(joint, f"link_patch_routes on {threads} threads")

@@ -683,22 +683,16 @@ class Placement:
         else:
             self.arrays.release(ROW_WATERMARKS)
 
-    def allocate_row_records(self, first: int, *, skip_rows: int = 0, speed_rows: bool = False) -> None:
+    def allocate_row_records(self, first: int) -> None:
         """Allocate the streamed rows' records (:data:`.row_records.ROW_RECORDS`, :func:`.row_metadata.record_layout`)
-        from the line's row ``first``; their writers store them in the worlds the general sweep visits, not the tiers'
-        (``skip_rows``, with the line's ``speed_rows``)."""
+        from the line's row ``first``; their pass stores them in the worlds the general sweep and the unit builder read
+        (:func:`.response_builds_rows.store_row_records`)."""
         self.record_first = int(first)
         rows = self.row_pitch - self.record_first
         free_rows = self.mf_max_constraints if self.free_contact_rows else 0
         self.writes_records = bool(rows > 0 and (self.record_first < self.body_base or free_rows > 0))
-        self.record_skip_rows, self.record_speed_rows = int(skip_rows), bool(speed_rows)
         self.free_records, words = record_layout(self.record_first, self.body_base, self.row_pitch)
         self.arrays.allocate(ROW_RECORDS, world=self.forest.world_count, record=max(words, 1))
-
-    @property
-    def writes_dense_records(self) -> bool:
-        """Whether the one writer stores the dense rows' records (:meth:`allocate_row_records`)."""
-        return self.writes_records and self.record_first < self.body_base
 
     def allocate_placeholders(self):
         """The operands of the features that are off."""
