@@ -17,13 +17,14 @@ from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
+from newton._src.solvers.feather_pgs.sweep import sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_levels import (
     _get_mark_independent_sparse_contact_candidates_kernel,
     _get_sparse_contact_levels_kernel,
     levels_launch,
 )
 from newton._src.solvers.feather_pgs.sweep_routes_diag import sparse_diagonal_kernel
-from newton._src.solvers.feather_pgs.sweep_routes_local import paired_factor_kernel, paired_factor_source
+from newton._src.solvers.feather_pgs.sweep_routes_local import PairedSweep
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import diagonal_walk, free_body_Z, leave_walk, row_lines, row_velocity
 
@@ -730,8 +731,8 @@ def _launch_paired_factor_solve(kernel, rows, device, *, primary, iterations, om
 class TestPairedFactorUnitSource(unittest.TestCase):
     def test_unit_walk_replaces_the_runtime_layout_test(self):
         """Walk units from each row's type and parent; neither schedule tests a layout."""
-        units = paired_factor_source(192, 29, 23, 6, contact_units=True)[0]
-        general = paired_factor_source(192, 29, 23, 6)[0]
+        units = PairedSweep(192, 29, 23, 6, "120", contact_units=True).source()[0]
+        general = PairedSweep(192, 29, 23, 6, "120").source()[0]
         # A unit owns tangent rows only when the next row is a tangent naming it as parent; three
         # normal-only units must not read as one triple, so the walk needs no stride-3 layout test.
         self.assertIn("world_row_parent.data[off + tangent1] == i", units)
@@ -739,9 +740,8 @@ class TestPairedFactorUnitSource(unittest.TestCase):
         for text in ("triple_layout", "s_contact_mu", "% 3"):
             self.assertNotIn(text, units)
         self.assertNotIn("triple_layout", general)
-        factory = paired_factor_kernel.__wrapped__
         self.assertEqual(
-            factory(192, 29, 23, 6, "120", contact_units=True).key,
+            sweep_kernel.__wrapped__(PairedSweep(192, 29, 23, 6, "120", contact_units=True)).key,
             "sweep_paired_factor_192_29_23_6_units_walk",
         )
 
@@ -766,7 +766,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             self.assertGreater(rows["loaded_rings"], 0)
             dofs = primary + secondary
             kernels = [
-                paired_factor_kernel(capacity, dofs, primary, secondary, str(device.arch), **kwargs)
+                sweep_kernel(PairedSweep(capacity, dofs, primary, secondary, str(device.arch), **kwargs))
                 for kwargs in ({}, {"contact_units": True})
             ]
             general, units = (

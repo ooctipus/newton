@@ -542,7 +542,7 @@ def census_calls():
     )
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel  # noqa: PLC0415
-    from newton.tests.feather_pgs_law_harness import keyed_classes  # noqa: PLC0415
+    from newton.tests.feather_pgs_law_harness import built, keyed_classes  # noqa: PLC0415
 
     mf_gs = (
         _axis("places", sweep_routes.ROW_PLACES),
@@ -574,8 +574,8 @@ def census_calls():
             ),
         ),
         (
-            "sweep_routes_local.paired_factor_kernel",
-            sweep_routes_local.paired_factor_kernel,
+            "sweep_routes_local.PairedSweep",
+            built(sweep_routes_local.PairedSweep),
             ((192, 29, 23, 6, ARCH),),
             (_axis("speed_rows"), _axis("contact_units")),
         ),

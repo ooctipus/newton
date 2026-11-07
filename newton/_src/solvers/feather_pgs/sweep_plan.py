@@ -46,7 +46,7 @@ from .kernel_template import SweepTier
 from .solve_policy import SolvePolicy, SolveReadoutRecord
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport, row_supports
-from .sweep import FRICTION_METRIC_FLOATS
+from .sweep import FRICTION_METRIC_FLOATS, SweepConfig, sweep_kernel
 from .sweep_levels import (
     _get_mark_independent_sparse_contact_candidates_kernel,
     _get_sparse_contact_levels_kernel,
@@ -347,11 +347,39 @@ class Sweep:
                 solver's iteration counts.
             **kwargs: Keyword arguments of the factory.
         """
-        policy = self.policy
         # The laws' constants, compiled into every sweep: weighted rows and material contacts.
         laws = {"weighted": self.laws.set.weighted, "material": bool(self.options.contact_compliance)}
-        built = factory(*args, solve_policy=policy, **laws, **kwargs)
-        kernel = built.kernel if isinstance(built, SweepTier) else built
+        built = factory(*args, solve_policy=self.policy, **laws, **kwargs)
+        self._register(route, built.kernel if isinstance(built, SweepTier) else built, readout_budget)
+        return built
+
+    @property
+    def law_fields(self) -> dict:
+        """The row laws every sweep configuration compiles (:class:`.sweep.SweepConfig`): the solve policy, weighted
+        rows, material contacts and spin rows."""
+        return {
+            "solve_policy": self.policy,
+            "weighted": bool(self.laws.set.weighted),
+            "material": bool(self.options.contact_compliance),
+            "torsion": bool(self.laws.spin_rows),
+        }
+
+    def sweep(self, route: str, config: SweepConfig, readout_budget: int | None = None) -> wp.Kernel:
+        """Build the sweep of ``config`` (:func:`.sweep.sweep_kernel`) and allocate its readout counters, outside any
+        graph capture.
+
+        Args:
+            route: Owner of the sweep in the records, such as ``"sparse_pgs"``.
+            config: The sweep's configuration, its laws :attr:`law_fields`.
+            readout_budget: The sweep budget the kernel compiles in (a parallel tier's), or ``None`` for the
+                solver's iteration counts.
+        """
+        kernel = sweep_kernel(config)
+        self._register(route, kernel, readout_budget)
+        return kernel
+
+    def _register(self, route: str, kernel: wp.Kernel, readout_budget: int | None) -> None:
+        policy = self.policy
         budget = int(self.options.pgs_iterations if readout_budget is None else readout_budget)
         self.readout.register(
             kernel,
@@ -361,7 +389,6 @@ class Sweep:
             budget=max(budget, 1),
             device=self.model.device,
         )
-        return built
 
     def build(self) -> None:
         """Build the paired response and the sweeps."""
@@ -373,23 +400,24 @@ class Sweep:
         # The line's speed rows (step_plan.Capacities.speed_rows), where a free body's rows are the line's.
         speed_rows = self.placement.speed_rows > 0
         # Case K5 owns every row of its worlds, its free body's contacts and speed rows among them (rows of the line).
-        self.paired_factor_kernel = (
-            self.kernel(
-                "paired_factor",
-                sweep_routes_local.paired_factor_kernel,
+        self.paired_sweep = (
+            sweep_routes_local.PairedSweep(
                 self.placement.dense_max_constraints,
                 self.forest.max_world_dofs,
                 self.paired_response_primary_size,
                 self.paired_response_secondary_size,
                 device_arch,
                 contact_units=self.factor_coordinate_contact_units,
-                torsion=self.laws.spin_rows,
                 pitch=self.placement.row_pitch,
                 seeded=self.seeded,
                 speed_rows=speed_rows,
+                **self.law_fields,
             )
             if self.paired_factor_coordinates
             else None
+        )
+        self.paired_factor_kernel = (
+            self.sweep("paired_factor", self.paired_sweep) if self.paired_sweep is not None else None
         )
 
         diagonal = self.classes.diagonal
@@ -847,7 +875,7 @@ class Sweep:
         line)."""
         self.readout.count_skipped(self.placement.constraint_count, self.placement.mf_constraint_count)
         walked = {"walk": self.factor.walk_view()} if self.placement.walks else {}
-        layout = shape(sweep_routes_local.paired_work(self.forest.world_count), device(self.model.device))
+        layout = shape(self.paired_sweep.work(self.forest.world_count), device(self.model.device))
         self._launch(
             self.paired_factor_kernel,
             operands,

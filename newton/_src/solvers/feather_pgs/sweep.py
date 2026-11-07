@@ -36,13 +36,16 @@ sweep's operator and layout reproduces its results.
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Callable, Sequence
 from typing import ClassVar, Protocol
 
 import warp as wp
 
-from ...core.memory import Buffer
+from ...core.execution import Work, shape
+from ...core.memory import Buffer, Staging, arch_budget, built_for
 from .device_preludes import BLOCK_THREADS, VirtualLanes
+from .kernel_template import Dispatch, KernelTemplate
 from .response_operator import Lanes, LaneVelocity, ResponseOperator, Velocity
 from .row_inputs import RowArgument
 from .row_kernels import (
@@ -2776,3 +2779,95 @@ def jacobi_limit_pass(rows: JacobiRows, op, *, pad: str = "    ") -> str:
         "}",
     ]
     return indent("\n".join(line for line in lines if line), pad)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The configurations and the one factory
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class SweepConfig:
+    """A sweep kernel's configuration: the switches a class's sweep is built from, frozen, so equal configurations
+    are one kernel (:func:`sweep_kernel`).
+
+    Every configuration carries the row laws in force (:attr:`laws`: the solve policy, weighted rows, material
+    contacts and spin rows, from the options and the model, never from a route); each class's configuration adds
+    its own switches. A configuration declares what the factory reads of it: its native ABI (:attr:`ABI`, its
+    first parameters the dispatch's), its native function's name (:attr:`NATIVE`), the kernel's name rendered from
+    its fields (:attr:`name`), its body and working set (:meth:`source`), the wrapper's dispatch (:meth:`dispatch`),
+    its operands beyond the ABI (:meth:`operands`) and its launch (:meth:`work`).
+
+    Args:
+        solve_policy: The solve policy: the readout beside the exit law.
+        weighted: Contact rows step by their regularization weights.
+        material: Material contacts step by their compliance's weights (they are weighted).
+        torsion: Spin rows may follow friction pairs.
+    """
+
+    solve_policy: SolvePolicy = DEFAULT_POLICY
+    weighted: bool = False
+    material: bool = False
+    torsion: bool = False
+
+    ABI: ClassVar[tuple]
+    """The native ABI (:func:`.kernel_template.params`)."""
+    NATIVE: ClassVar[str]
+    """The native function's name."""
+    LABEL: ClassVar[str]
+    """What the working set's budget check calls the sweep."""
+
+    @property
+    def laws(self) -> RowLaws:
+        """The row laws the configuration compiles."""
+        return RowLaws(regularize=self.weighted, material=self.material, torsion=self.torsion, policy=self.solve_policy)
+
+    @property
+    def name(self) -> str:
+        """The kernel's name, rendered from the configuration's fields."""
+        raise NotImplementedError
+
+    @property
+    def label(self) -> str:
+        """What the working set's budget check calls the sweep."""
+        return self.LABEL
+
+    def source(self) -> tuple[str, Staging]:
+        """The native body and its working set."""
+        raise NotImplementedError
+
+    def dispatch(self, staging: Staging) -> Dispatch:
+        """How the kernel's threads reach their worlds (:func:`.kernel_template.items`)."""
+        raise NotImplementedError
+
+    def operands(self) -> tuple[RowArgument, ...]:
+        """The operands beyond the ABI (:func:`.kernel_template.operands`)."""
+        return ()
+
+    def work(self, items: int = 0, shared: int = 0) -> Work:
+        """What the kernel's launches over ``items`` worlds declare (:class:`~newton._src.core.execution.Work`), its
+        block's working set ``shared``: its launch bound is the layer's shape of it at no items."""
+        raise NotImplementedError
+
+
+@functools.cache
+def sweep_kernel(config: SweepConfig) -> wp.Kernel:
+    """The one sweep factory: the kernel of ``config`` (:class:`SweepConfig`).
+
+    The configuration's body and working set, the working set checked against the static budget of the device it is
+    built for (:func:`.memory.arch_budget`), the launch bound the layer's shape of its work there
+    (:func:`~newton._src.core.execution.shape`), the kernel its native ABI under its dispatch.
+    """
+    snippet, staging = config.source()
+    staging.check(config.label, arch_budget(config.device_arch))
+    bounds = shape(config.work(0, staging.bytes), built_for(config.device_arch)).bounds
+    return KernelTemplate.from_abi(
+        config.name,
+        config.ABI,
+        snippet,
+        config.dispatch(staging),
+        extra=config.operands(),
+        composed=True,
+        native_name=config.NATIVE,
+        launch_bounds=bounds,
+    ).kernel()

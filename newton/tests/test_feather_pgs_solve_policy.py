@@ -51,6 +51,7 @@ from newton._src.solvers.feather_pgs.solve_policy import (
 )
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import built
 from newton.tests.test_feather_pgs_kernel_pins import _kernel_hash
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
 
@@ -103,7 +104,7 @@ def _factory_calls():
         ),
         (
             "paired",
-            sweep_routes_local.paired_factor_kernel.__wrapped__,
+            built(sweep_routes_local.PairedSweep),
             (192, 29, 23, 6, "120"),
             {"contact_units": True, "speed_rows": True},
         ),
@@ -171,7 +172,7 @@ def _vote_census():
         ),
         (
             "paired",
-            sweep_routes_local.paired_factor_kernel.__wrapped__,
+            built(sweep_routes_local.PairedSweep),
             (192, 29, 23, 6, "120"),
             (_axis("speed_rows"), _axis("contact_units")),
         ),
@@ -244,7 +245,6 @@ class TestSolvePolicy(unittest.TestCase):
         factories = [(name, factory) for name, factory, _, _ in _factory_calls()]
         factories += [
             ("mf_gs_source", sweep_routes.mf_gs_source),
-            ("paired_source", sweep_routes_local.paired_factor_source),
         ]
         for name, factory in factories:
             with self.subTest(factory=name):

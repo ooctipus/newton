@@ -953,6 +953,19 @@ def chain_class(bodies: int, coordinates: int | None = None) -> WalkClass:
     return WalkClass(tuple(range(-1, bodies - 1)), (*range(bodies), coordinates))
 
 
+def built(config):
+    """A sweep configuration class (:class:`.sweep.SweepConfig`) as a factory of its kernels, each call's
+    configuration built anew (:func:`.sweep.sweep_kernel` uncached); the factory's signature is the class's."""
+    from newton._src.solvers.feather_pgs.sweep import sweep_kernel  # noqa: PLC0415
+
+    def factory(*args, **kwargs):
+        return sweep_kernel.__wrapped__(config(*args, **kwargs))
+
+    factory.__signature__ = inspect.signature(config)
+    factory.__name__ = factory.__qualname__ = config.__name__
+    return factory
+
+
 def keyed_classes(layout) -> tuple[WalkClass, ...]:
     """The walking classes of a keyed layout's trees (:class:`.keyed_row_layout.KeyedLayout`), chains of its primary
     and secondary sizes: what a keyed tier's walks read (:func:`.sweep_routes_tiers.parallel_kernel`'s ``classes``)."""

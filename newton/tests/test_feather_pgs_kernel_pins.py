@@ -36,7 +36,7 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs import environment_flags
 from newton._src.solvers.feather_pgs.kernel_template import SweepTier
-from newton.tests.feather_pgs_law_harness import keyed_classes
+from newton.tests.feather_pgs_law_harness import built, keyed_classes
 
 _PINS = os.path.join(os.path.dirname(__file__), "golden_data", "test_feather_pgs_kernel_pins", "pins.json")
 _PACKAGE = "newton._src.solvers.feather_pgs"
@@ -183,11 +183,11 @@ def _readout_calls():
         ((192, 64, 22, _ARCH), {"free_rows": False, "speed_rows": True}),
     ):
         yield "sweep_routes.mf_gs_kernel", factory, args, {**kwargs, **readout}
-    factory = sweep_routes_local.paired_factor_kernel.__wrapped__
+    factory = built(sweep_routes_local.PairedSweep)
     for units in (False, True):
         kwargs = {"contact_units": True, **readout} if units else readout
         yield (
-            "sweep_routes_local.paired_factor_kernel",
+            "sweep_routes_local.PairedSweep",
             factory,
             (192, 29, 23, 6, _ARCH),
             {**kwargs, "speed_rows": True},
@@ -342,13 +342,13 @@ def _solver_factory_calls():
     for weighted in (False, True):
         yield "sweep_units.stage_slots", sweep_units.stage_slots.__wrapped__, (weighted,), {}
     for speed in (False, True):
-        factory = sweep_routes_local.paired_factor_kernel.__wrapped__
-        yield "sweep_routes_local.paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH), {"speed_rows": speed}
+        factory = built(sweep_routes_local.PairedSweep)
+        yield "sweep_routes_local.PairedSweep", factory, (192, 29, 23, 6, _ARCH), {"speed_rows": speed}
     # The unit walks of the same factory.
     for speed in (False, True):
-        factory = sweep_routes_local.paired_factor_kernel.__wrapped__
+        factory = built(sweep_routes_local.PairedSweep)
         args = (192, 29, 23, 6, _ARCH)
-        yield "sweep_routes_local.paired_factor_kernel", factory, args, {"contact_units": True, "speed_rows": speed}
+        yield "sweep_routes_local.PairedSweep", factory, args, {"contact_units": True, "speed_rows": speed}
 
     # Parallel tiers: one articulation per world, its response formed in-kernel.
     for rows in (32, 48):
@@ -580,7 +580,7 @@ class TestFeatherPGSKernelPins(unittest.TestCase):
             "sweep_levels._get_sparse_contact_levels_kernel",
             "sweep_levels._get_mark_independent_sparse_contact_candidates_kernel",
             "sweep_routes_tiers.parallel_kernel",
-            "sweep_routes_local.paired_factor_kernel",
+            "sweep_routes_local.PairedSweep",
             "keyed_rows.get_parallel_factory",
             "row_slots.allocate_world_contact_slots",
             "walk_rows.slot_rows_kernel",

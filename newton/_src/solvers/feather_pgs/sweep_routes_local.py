@@ -3,31 +3,29 @@
 
 """The paired factor sweep (case K5) as a configuration of the sweep emitter (:mod:`.sweep`).
 
-:func:`paired_factor_kernel`: one warp per world of an articulation and a free body, rows in factor coordinates
-(:class:`.response_operator.SparseFactor`, dense, in registers) on the velocity change from the predictor, which leaves
-per component, under
-one of two schedules: row by row, or contact units. Its working set fits the static
-budget of the device it is built for (:func:`.memory.arch_budget`).
+:class:`PairedSweep`, built by the one factory (:func:`.sweep.sweep_kernel`): one warp per world of an articulation and
+a free body, rows in factor coordinates (:class:`.response_operator.SparseFactor`, dense, in registers) on the velocity
+change from the predictor, which leaves per component, under one of two schedules: row by row, or contact units. Its
+working set fits the static budget of the device it is built for (:func:`.memory.arch_budget`).
 """
 
 from __future__ import annotations
 
 import dataclasses
-from functools import cache
+from typing import ClassVar
 
 import warp as wp
 
-from ...core.execution import Work, device_lanes, shape
-from ...core.memory import Buffer, Staging, arch_budget, built_for
+from ...core.execution import Work, device_lanes
+from ...core.memory import Buffer, Staging
 from . import kernel_template
 from .device_preludes import RING, SHARED_STORAGE, group_native, lane_group
 from .factor.walk import WalkTrees
-from .kernel_template import KernelTemplate
+from .kernel_template import Dispatch
 from .law_source import law_preludes
 from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import Lanes, LaneVelocity, SparseFactor, Velocity
 from .row_inputs import RowArgument
-from .solve_policy import DEFAULT_POLICY, SolvePolicy
 from .sweep import (
     FRICTION,
     ITERATION,
@@ -38,6 +36,7 @@ from .sweep import (
     RowContext,
     RowLaws,
     StagedRows,
+    SweepConfig,
     UnitStride,
     UnitZ,
     contact_unit,
@@ -94,21 +93,6 @@ PAIRED_REGISTER_LINE = 80
 ``Work.cap``): the sweep is bound only where its shared memory keeps no more blocks than the line, as the tiers are,
 which the line's speed rows need: unbounded, kuka's sweep with them compiles at 96 registers (10 blocks of the 11 its
 shared memory keeps on sm_120), within the line at 80 with the same 24-byte stack."""
-
-
-def paired_work(worlds: int, shared: int = 0) -> Work:
-    """The paired factor sweep's launch over ``worlds``: a warp a world, :data:`_PAIRED_WORLDS_PER_BLOCK` a block
-    (:func:`~newton._src.core.execution.shape` gives the device's: one thread a world on the CPU), at the register
-    line :data:`PAIRED_REGISTER_LINE`, which bounds the kernel where its block's ``shared`` memory keeps no more
-    blocks than the line."""
-    return Work(
-        int(worlds),
-        lanes=32,
-        block=32 * _PAIRED_WORLDS_PER_BLOCK,
-        registers=PAIRED_REGISTER_LINE,
-        cap=False,
-        shared=int(shared),
-    )
 
 
 _ROWS = "factor_rows"
@@ -170,24 +154,9 @@ def _consume(op: SparseFactor, row: str, end: str, indent: str) -> str:
     )
 
 
-def paired_factor_source(
-    max_constraints: int,
-    max_world_dofs: int,
-    primary_dofs: int,
-    secondary_dofs: int,
-    *,
-    contact_units: bool = False,
-    torsion: bool = False,
-    solve_policy: SolvePolicy = DEFAULT_POLICY,
-    weighted: bool = False,
-    material: bool = False,
-    pitch: int | None = None,
-    seeded: bool = False,
-    speed_rows: bool = False,
-    lanes: int = 32,
-) -> tuple[str, Staging]:
-    """The native body of the paired factor sweep: a world's rows in the factor coordinates of its articulation and
-    free body, a warp per world, the velocity change from the predictor, ``u = L^T dv``, from zero in a register per
+def paired_factor_source(sweep: PairedSweep) -> tuple[str, Staging]:
+    """The native body of the paired factor sweep ``sweep`` (:class:`PairedSweep`'s source): a world's rows in the
+    factor coordinates of its articulation and free body, a warp per world, the velocity change from the predictor, ``u = L^T dv``, from zero in a register per
     lane, or with ``seeded`` from the response of the impulses the rows carry (:func:`.sweep.impulse_seed`: the warm
     start's and the closed loop's): dense rows of ``Z = L^-1 J^T`` (:class:`.SparseFactor`, entry ``l`` at coordinate ``l``), lane ``l`` holding
     coordinate ``l`` of ``u`` and of the rows it acts on, which the schedule loads into registers (:func:`_load`, or
@@ -207,23 +176,19 @@ def paired_factor_source(
     leave (:attr:`.factor.walk.WalkTrees.du`, :func:`.factor.walk.walk_leave_kernel`), which walks each component's
     tree down in the rows' frame.
 
-    ``lanes`` is the world's lane group (:func:`.execution.device_lanes`): a warp on CUDA, or the CPU's one thread,
+    The world's lane group is the device's (:attr:`PairedSweep.lanes`): a warp on CUDA, or the CPU's one thread,
     which holds each register's every entry (:func:`_hold`).
 
     Returns the body and its staging.
     """
-    M, D, P, S = int(max_constraints), int(max_world_dofs), int(primary_dofs), int(secondary_dofs)
+    M, D = int(sweep.max_constraints), int(sweep.max_world_dofs)
     # The row store's line (its dense rows, then the free bodies'), the packed rows' too.
-    pitch = M if pitch is None else int(pitch)
-    if M <= 0:
-        raise ValueError("max_constraints must be positive")
-    if P <= 0 or S <= 0 or P + S != D or D > 32:
-        raise ValueError("paired factor PGS requires two positive components spanning at most 32 world DOFs")
-    if lanes not in (1, 32):
-        raise ValueError(f"the paired factor sweep runs a warp or one thread a world, got {lanes}")
+    pitch = M if sweep.pitch is None else int(sweep.pitch)
+    torsion, speed_rows, solve_policy = sweep.torsion, sweep.speed_rows, sweep.solve_policy
+    lanes = sweep.lanes
     threads = lanes * _PAIRED_WORLDS_PER_BLOCK if lanes > 1 else 1
     lanes = Lanes(lanes)
-    laws = RowLaws(regularize=weighted, material=material, torsion=torsion, policy=solve_policy)
+    laws = sweep.laws
     op = _rows(D, lanes)
     # The world's rows staged whole; a step divides by the diagonal.
     rows = StagedRows(M, lanes, line="off", count="m", reciprocal=False)
@@ -239,7 +204,7 @@ def paired_factor_source(
     # The schedule's rows: the line's every row but its speed rows, its last.
     end = "m_rows" if speed_rows else "m"
     ctx = RowContext.of(rows, op, end=end, metric=cached, inline_velocity_limit=True)
-    schedule = _paired_units(ctx, laws, end) if contact_units else _paired_rows(rows, op, laws, end, cached)
+    schedule = _paired_units(ctx, laws, end) if sweep.contact_units else _paired_rows(rows, op, laws, end, cached)
     last_word = ()
     world_rows = "if (m == 0) return;"
     if speed_rows:
@@ -268,7 +233,7 @@ def paired_factor_source(
         )
     # The impulses the rows carry into the first sweep, row by row in slot order (the general sweep's seed).
     seed = ""
-    if seeded:
+    if sweep.seeded:
         apply = op.axpy((("row", "seed"),), "        ")
         row = (_hold(op, "row_z", "i"),)
         seed = impulse_seed("m", rows.load("i"), rows.kind("i"), apply, op.lanes.sync(), declare=row) + "\n"
@@ -500,71 +465,95 @@ def _paired_units(ctx: RowContext, laws: RowLaws, end: str = "m") -> str:
     return UnitStride(end).wrap("\n".join(lines), "")
 
 
-@cache
-def paired_factor_kernel(
-    max_constraints: int,
-    max_world_dofs: int,
-    primary_dofs: int,
-    secondary_dofs: int,
-    device_arch: str,
-    *,
-    contact_units: bool = False,
-    torsion: bool = False,
-    solve_policy: SolvePolicy = DEFAULT_POLICY,
-    weighted: bool = False,
-    material: bool = False,
-    pitch: int | None = None,
-    seeded: bool = False,
-    speed_rows: bool = False,
-) -> wp.Kernel:
-    """The paired factor sweep kernel; weighted rows' and material contacts' operands (:func:`.sweep.weight_arguments`,
-    :func:`.sweep.material_arguments`), a readout's operand and the walk's view follow ``v_out``. A world is a warp on
-    CUDA and one thread on the CPU (:func:`paired_work`)."""
-    lanes = device_lanes(device_arch, 32)
-    snippet, staging = paired_factor_source(
-        max_constraints,
-        max_world_dofs,
-        primary_dofs,
-        secondary_dofs,
-        contact_units=contact_units,
-        torsion=torsion,
-        solve_policy=solve_policy,
-        weighted=weighted,
-        material=material,
-        pitch=pitch,
-        seeded=seeded,
-        speed_rows=speed_rows,
-        lanes=lanes,
-    )
-    staging.check("the paired factor sweep", arch_budget(device_arch))
-    name = (
-        f"sweep_paired_factor_{max_constraints}_{max_world_dofs}_{primary_dofs}_{secondary_dofs}"
-        + ("_units" if contact_units else "")
-        + ("_weighted" if weighted else "")
-        + ("_material" if material else "")
-        + ("_torsion" if torsion else "")
-        + ("" if pitch is None or pitch == max_constraints else f"_p{int(pitch)}")
-        + ("_seeded" if seeded else "")
-        + ("_speed" if speed_rows else "")
-        + "_walk"
-        + ("" if lanes == 32 else f"_lanes{lanes}")
-        + solve_policy.suffix
-    )
-    walked = (RowArgument("walk", WalkTrees),)
-    return KernelTemplate.from_abi(
-        name,
-        PAIRED_FACTOR_ABI,
-        snippet,
-        kernel_template.items("world", groups=staging.groups, lanes=lanes, guard="world_count"),
-        extra=(
+@dataclasses.dataclass(frozen=True)
+class PairedSweep(SweepConfig):
+    """The paired factor sweep's configuration (case K5): a world of an articulation of ``primary_dofs`` coordinates
+    and a free body of ``secondary_dofs``, ``max_world_dofs`` in all, its rows (at most ``max_constraints``) in factor
+    coordinates, ``u`` a coordinate a lane in registers (:func:`paired_factor_source`).
+
+    Its switches, each the plan's from the class's shape and the laws (:meth:`.sweep_plan.Sweep.build`):
+
+    - ``u``'s place: in registers, a coordinate a lane, since the world's coordinates fit the lanes (the class plan's
+      paired rule);
+    - the enumeration: rows in slot order, or with ``contact_units`` a contact's rows on its Gram block (no
+      compliance);
+    - ``seeded``: the first sweep starts from the response of the impulses the rows carry (the warm start, the
+      closed loop);
+    - ``speed_rows``: the free body's speed rows are the line's last, the last word of each sweep;
+    - ``pitch``: the row store's line, by default ``max_constraints`` rows.
+
+    A world is a warp on CUDA and one thread on the CPU (:meth:`work`); weighted rows' and material contacts'
+    operands (:func:`.sweep.weight_arguments`, :func:`.sweep.material_arguments`), a readout's operand and the walk's
+    view follow ``v_out``.
+    """
+
+    max_constraints: int
+    max_world_dofs: int
+    primary_dofs: int
+    secondary_dofs: int
+    device_arch: str
+    _: dataclasses.KW_ONLY
+    contact_units: bool = False
+    pitch: int | None = None
+    seeded: bool = False
+    speed_rows: bool = False
+
+    ABI: ClassVar[tuple] = PAIRED_FACTOR_ABI
+    NATIVE: ClassVar[str] = "sweep_paired_factor_native"
+    LABEL: ClassVar[str] = "the paired factor sweep"
+
+    def __post_init__(self):
+        M, D, P, S = self.max_constraints, self.max_world_dofs, self.primary_dofs, self.secondary_dofs
+        if M <= 0:
+            raise ValueError("max_constraints must be positive")
+        if P <= 0 or S <= 0 or P + S != D or D > 32:
+            raise ValueError("paired factor PGS requires two positive components spanning at most 32 world DOFs")
+
+    @property
+    def lanes(self) -> int:
+        """A world's lanes: a warp on CUDA, the CPU's one thread (:func:`.execution.device_lanes`)."""
+        return device_lanes(self.device_arch, 32)
+
+    @property
+    def name(self) -> str:
+        return (
+            f"sweep_paired_factor_{self.max_constraints}_{self.max_world_dofs}_{self.primary_dofs}_{self.secondary_dofs}"
+            + ("_units" if self.contact_units else "")
+            + ("_weighted" if self.weighted else "")
+            + ("_material" if self.material else "")
+            + ("_torsion" if self.torsion else "")
+            + ("" if self.pitch is None or self.pitch == self.max_constraints else f"_p{int(self.pitch)}")
+            + ("_seeded" if self.seeded else "")
+            + ("_speed" if self.speed_rows else "")
+            + "_walk"
+            + ("" if self.lanes == 32 else f"_lanes{self.lanes}")
+            + self.solve_policy.suffix
+        )
+
+    source = paired_factor_source
+
+    def dispatch(self, staging: Staging) -> Dispatch:
+        return kernel_template.items("world", groups=staging.groups, lanes=self.lanes, guard="world_count")
+
+    def operands(self) -> tuple[RowArgument, ...]:
+        return (
             # Where spin rows may appear, every friction triple's metric (sweep.friction_metric_stage).
-            *((RowArgument("friction_metric", wp.array3d[float], after="omega"),) if torsion else ()),
-            *weight_arguments(weighted),
-            *material_arguments(material),
-            *solve_policy.arguments,
-            *walked,
-        ),
-        composed=True,
-        native_name="sweep_paired_factor_native",
-        launch_bounds=shape(paired_work(0, staging.bytes), built_for(device_arch)).bounds,
-    ).kernel()
+            *((RowArgument("friction_metric", wp.array3d[float], after="omega"),) if self.torsion else ()),
+            *weight_arguments(self.weighted),
+            *material_arguments(self.material),
+            *self.solve_policy.arguments,
+            RowArgument("walk", WalkTrees),
+        )
+
+    def work(self, items: int = 0, shared: int = 0) -> Work:
+        """A warp a world, :data:`_PAIRED_WORLDS_PER_BLOCK` a block (one thread a world on the CPU), at the register
+        line :data:`PAIRED_REGISTER_LINE`, which bounds the kernel where its block's ``shared`` memory keeps no more
+        blocks than the line."""
+        return Work(
+            int(items),
+            lanes=32,
+            block=32 * _PAIRED_WORLDS_PER_BLOCK,
+            registers=PAIRED_REGISTER_LINE,
+            cap=False,
+            shared=int(shared),
+        )

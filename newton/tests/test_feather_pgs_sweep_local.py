@@ -18,8 +18,12 @@ from pathlib import Path
 from newton._src.solvers.feather_pgs import sweep_routes_local
 from newton._src.solvers.feather_pgs.response_operator import Lanes
 from newton._src.solvers.feather_pgs.solve_policy import DEFAULT_POLICY, SolvePolicy
+from newton._src.solvers.feather_pgs.sweep import sweep_kernel
 
-_PAIRED = sweep_routes_local.paired_factor_kernel.__wrapped__
+
+def _PAIRED(*args, **kwargs):
+    return sweep_kernel.__wrapped__(sweep_routes_local.PairedSweep(*args, **kwargs))
+
 
 PAIRED_SCHEDULES = ({}, {"contact_units": True})
 
@@ -44,7 +48,7 @@ def _block(body: str, head: str) -> str:
 
 
 class TestPairedFactorRoute(unittest.TestCase):
-    """The paired factor sweep (``sweep_routes_local.paired_factor_kernel``)."""
+    """The paired factor sweep (``sweep_routes_local.PairedSweep``)."""
 
     def test_variants_build(self):
         """Every schedule builds, with and without the line's speed rows and with a counted readout."""
@@ -75,7 +79,7 @@ class TestPairedFactorRoute(unittest.TestCase):
             "gram_n2, gram_n2_terms, unit_cross);"
         )
         for schedule in PAIRED_SCHEDULES[1:]:
-            body, _ = sweep_routes_local.paired_factor_source(64, 23, 17, 6, **schedule)
+            body, _ = sweep_routes_local.PairedSweep(64, 23, 17, 6, "120", **schedule).source()
             held = "const float unit_lam0 = s_impulse[head], unit_lam1 = s_impulse[head + 1], unit_lam2 = s_impulse[head + 2];"
             self.assertIn(held, body)
             units = _block(body, "if (unit_lam0 != 0.0f || unit_lam1 != 0.0f || unit_lam2 != 0.0f) {")
@@ -104,7 +108,7 @@ class TestPairedFactorRoute(unittest.TestCase):
             self.assertIn("SUM(jv, jv_terms);", unloaded)
             self.assertIn("SUM(residual, residual_terms, sibling_residual, sibling_residual_terms, cross);", unloaded)
             self.assertNotIn("unit_jv", unloaded)
-        body, _ = sweep_routes_local.paired_factor_source(64, 23, 17, 6)
+        body, _ = sweep_routes_local.PairedSweep(64, 23, 17, 6, "120").source()
         self.assertIn("SUM(sibling_residual, sibling_residual_terms, cross);", body)
         self.assertNotIn(unit, body)
 

@@ -168,16 +168,16 @@ class TestKernelIdentity(unittest.TestCase):
 
     def test_census_hashes_admitted_combinations_and_summarizes_rejections(self):
         """Hash every admitted flag combination of a factory, labeled by its non-default flags; count rejections."""
-        rows, rejected = identity.census(("sweep_routes_local.paired_factor_kernel",))
+        rows, rejected = identity.census(("sweep_routes_local.PairedSweep",))
         self.assertEqual(len(rows), 6)
-        self.assertIn("sweep_routes_local.paired_factor_kernel(192, 29, 23, 6, '120')", rows)
+        self.assertIn("sweep_routes_local.PairedSweep(192, 29, 23, 6, '120')", rows)
         self.assertTrue(
             all(set(row) == {"family", "key", "hash"} and row["family"] == "census" for row in rows.values())
         )
-        self.assertEqual(list(rejected), ["sweep_routes_local.paired_factor_kernel [census]"])
+        self.assertEqual(list(rejected), ["sweep_routes_local.PairedSweep [census]"])
         self.assertRegex(next(iter(rejected.values())), r"^2 rejected, labels [0-9a-f]{16}: 2 x ValueError: ")
         # A call another family records keeps its code digests there.
-        skipped, _ = identity.census(("sweep_routes_local.paired_factor_kernel",), skip=rows.keys())
+        skipped, _ = identity.census(("sweep_routes_local.PairedSweep",), skip=rows.keys())
         self.assertEqual(skipped, {})
 
     def test_census_crosses_resident_row_metadata(self):
