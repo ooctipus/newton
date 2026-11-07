@@ -22,6 +22,9 @@ from .types import GeoType
 class _WorkCounter:
     values: wp.array2d[float]
     row: int
+    # A support provider's hull data (SupportMapDataProvider), left empty: the counted queries use no hull topology.
+    shape_support_data: wp.array[wp.vec4i]
+    support_neighbors: wp.array[int]
 
 
 @wp.func
@@ -372,6 +375,7 @@ def _create_work_sampler():
                 )
                 if bound.valid != 0 and bound.lower > query.contact_threshold:
                     work[row, 2] = 1.0
+
     return sample
 
 

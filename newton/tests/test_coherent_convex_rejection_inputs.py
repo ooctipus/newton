@@ -12,7 +12,7 @@ import warp as wp
 import newton
 from newton._src.geometry.coherent_convex import _ConvexQueryCache
 from newton._src.geometry.coherent_convex_rejection import _create_rejection_query_kernels
-from newton.tests.test_coherent_convex_rejection import _accepted, _box_inputs, _buffers, _original
+from newton.tests.test_coherent_convex_rejection import _accepted, _box_inputs, _buffers, _original, _original_values
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
@@ -53,12 +53,16 @@ def test_current_vertices_scale_and_identity(test, device):
         wp.launch(
             original[0],
             dim=threads,
-            inputs=[pair_array, count, *values, threads, *baseline],
+            inputs=[pair_array, count, *_original_values(values, device), threads, *baseline],
             device=device,
             block_dim=128,
         )
         wp.launch(
-            original[1], dim=threads, inputs=[pair_array, *values, threads, *baseline], device=device, block_dim=128
+            original[1],
+            dim=threads,
+            inputs=[pair_array, *_original_values(values, device), threads, *baseline],
+            device=device,
+            block_dim=128,
         )
 
     def run_candidate():

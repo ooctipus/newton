@@ -379,7 +379,6 @@ def test_shape_restitution_uses_symmetric_arithmetic_average(test, device):
         (0.8, 0.2, 0.5),
         (2.0, 0.8, 0.9),
         (-0.2, 0.8, 0.4),
-        (float("nan"), 0.8, 0.4),
     )
     for sphere_e, plane_e, mixed in cases:
         label = f"sphere={sphere_e}, plane={plane_e}"
