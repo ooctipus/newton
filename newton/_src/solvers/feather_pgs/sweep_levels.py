@@ -27,7 +27,7 @@ from functools import cache
 import warp as wp
 
 from ...core.execution import append, device_lanes
-from ...core.memory import Buffer, Staging
+from ...core.memory import STATIC_SHARED_BYTES, Buffer, Staging
 from . import kernel_template
 from .contact_input import ContactInput
 from .device_preludes import LANE_WORDS, SHARED_STORAGE, group_native, lane_group
@@ -111,15 +111,16 @@ def level_pass(*, units: str, resources: str, counts: str, store: str, lanes: in
         MAXIMUM(levels);"""
 
 
-def level_offsets(*, levels: str, counts: str, lanes: int = 32) -> str:
+def level_offsets(*, levels: str, counts: str, lanes: int = 32, sync: str = "__syncthreads()") -> str:
     """Return CUDA source that turns the units of each of ``levels`` levels into each level's first place, in place:
-    an exclusive scan by the block, a block of levels at a time; place ``levels`` is the unit count.
+    an exclusive scan by the group, a group of levels at a time; place ``levels`` is the unit count.
 
-    ``counts`` formats an index into the counts (``levels + 1`` of them). The fragment runs on every thread of a block
-    of ``THREADS`` threads in ``WARPS`` warps, and uses the lane group, ``tid``, ``lane``, ``warp`` and a shared
-    ``warp_count`` of a word a warp. ``lanes`` is a warp's lanes, or the CPU's one thread, which runs the block.
+    ``counts`` formats an index into the counts (``levels + 1`` of them). The fragment runs on every thread of a group
+    of ``THREADS`` threads in ``WARPS`` warps that ``sync`` synchronizes (a block's ``__syncthreads()``, or the lane
+    group's ``SYNC()`` for a group of one warp or the CPU's one thread), and uses the lane group, ``tid``, ``lane``,
+    ``warp`` and a shared ``warp_count`` of a word a warp. ``lanes`` is a warp's lanes, or the CPU's one thread.
     """
-    last, barrier = ("31", "__syncthreads();") if lanes == 32 else (f"{lanes - 1}", "SYNC();")
+    last, barrier = f"{lanes - 1}", f"{sync};"
     return f"""    int carry = 0;
     for (int base = 0; base <= {levels}; base += THREADS) {{
         const int c = base + tid;
@@ -285,19 +286,31 @@ def _list_serial_contacts_source(*, count: str, stride: int, head: str, serial_c
 """
 
 
+LEVELS_WORLDS = 8
+"""Worlds a block of the sparse-diagonal contact schedule holds at most, a warp each: one warp a block held a
+multiprocessor at its block limit (24 warps on sm_120, half its 48)."""
+
+
 @cache
-def levels_staging(max_constraints: int, max_world_dofs: int, lanes: int = 32) -> Staging:
-    """The contact schedule's shared working set, a world's warp: its coordinates' owner and level
-    (:func:`level_pass`), each contact position's packed level and rank, and the offsets' warp sum."""
-    return Staging(
-        (
-            Buffer("node_owner", "int", max_world_dofs),
-            Buffer("node_level", "int", max_world_dofs),
-            Buffer("unit_place", "int", max_constraints),
-            Buffer("warp_count", "int", 1),
-        ),
-        threads=lanes,
+def levels_staging(max_world_dofs: int, lanes: int = 32) -> Staging:
+    """The contact schedule's shared working set: a world's lane group's coordinates' owner and level
+    (:func:`level_pass`) and the offsets' warp sum; on CUDA as many worlds a block, a warp each and up to
+    :data:`LEVELS_WORLDS`, as the static shared budget holds (the CPU's one thread runs one). Each contact position's
+    packed level and rank are its lane's (:func:`_sparse_contact_levels_kernel`), not shared."""
+    buffers = (
+        Buffer("node_owner", "int", max_world_dofs),
+        Buffer("node_level", "int", max_world_dofs),
+        Buffer("warp_count", "int", 1),
     )
+    groups = max(1, min(LEVELS_WORLDS, STATIC_SHARED_BYTES // Staging(buffers).group_bytes)) if lanes > 1 else 1
+    return Staging(buffers, groups=groups, layout="arrays")
+
+
+def levels_launch(world_count: int, max_world_dofs: int, device_arch) -> tuple[int, int]:
+    """The contact schedule's launch, ``(dim, block_dim)``: a world's lane group (a warp, or the CPU's one thread,
+    :func:`.execution.device_lanes`), :func:`levels_staging`'s groups a block."""
+    lanes = device_lanes(device_arch, 32)
+    return int(world_count) * lanes, lanes * levels_staging(int(max_world_dofs), lanes).groups
 
 
 def _sparse_contact_levels_kernel(
@@ -319,8 +332,11 @@ def _sparse_contact_levels_kernel(
     ``level_units[world, level_offsets[world, l]:level_offsets[world, l + 1]]``. The serial list
     (:func:`_list_serial_contacts_source`) holds the other unit heads in row order.
 
-    One warp a world, a block each: launch ``dim=[worlds]`` tiled with ``block_dim=32``; on the CPU (``lanes`` 1) one
-    thread a world.
+    A contact position's packed level and rank wait for the offsets in its lane's own words (``unit_place``, a word a
+    batch of the group's positions: local memory, cached), so the shared working set is the coordinates' only.
+
+    One warp a world, :func:`levels_staging`'s ``groups`` worlds a block; on the CPU (``lanes`` 1) one thread a world:
+    launch flat by :func:`levels_launch`.
     """
     L = lanes
     if M >= 1 << 15:
@@ -329,7 +345,7 @@ def _sparse_contact_levels_kernel(
     kind = "world_row_type.data[row_base + normal]"
     # A unit's members (a tangent, or a spin row) follow its head; every other row of the segment heads a unit.
     unit_head = f"({kind} != {friction} && {kind} != {spin})" if torsion else f"{kind} != {friction}"
-    staging = levels_staging(M, D, L)
+    staging = levels_staging(D, L)
     staging.check("the sparse-diagonal contact schedule")
     resources = f"""            const int normal = contact_start + unit;
             int node_a = -1;
@@ -349,16 +365,16 @@ def _sparse_contact_levels_kernel(
                     }}
                 }}
             }}
-            if (unit < units) unit_place[unit] = -1;"""
+            unit_place[base / {L}] = -1;"""
     counts = f"level_offsets.data[world * {M + 1} + {{}}]"
     level = level_pass(
         units="units",
         resources=resources,
         counts=counts,
-        store="unit_place[unit] = (level << 16) | rank;",
+        store=f"unit_place[base / {L}] = (level << 16) | rank;",
         lanes=L,
     )
-    offsets = level_offsets(levels="levels", counts=counts, lanes=L)
+    offsets = level_offsets(levels="levels", counts=counts, lanes=L, sync="SYNC()")
     serial = (
         _list_serial_contacts_source(count="units", stride=1, head=unit_head, serial_capacity=M, lanes=L)
         if build_serial_contacts
@@ -374,6 +390,7 @@ def _sparse_contact_levels_kernel(
     const int row_base = line * {M};
     const int sparse_world_base = line * {M} * 2;
 {staging.declarations("    ")}
+    int unit_place[{-(-M // L)}];
     for (int coordinate = lane; coordinate < {D}; coordinate += {L}) {{
         node_owner[coordinate] = 32;
         node_level[coordinate] = -1;
@@ -396,7 +413,7 @@ def _sparse_contact_levels_kernel(
     SYNC();
 {offsets}
     for (int unit = lane; unit < units; unit += {L}) {{
-        const int place = unit_place[unit];
+        const int place = unit_place[unit / {L}];
         if (place >= 0)
             level_units.data[world * {M} + {counts.format("(place >> 16)")} + (place & 0xFFFF)] = contact_start + unit;
     }}
@@ -423,7 +440,7 @@ def _sparse_contact_levels_kernel(
             ("serial_normals", wp.array2d[int]),
         ),
         group_native(source, preludes=(lane_group(L), SHARED_STORAGE, *(() if L == 32 else (LANE_WORDS,))), lanes=L),
-        dispatch=items("world"),
+        dispatch=items("world", lanes=L, flat=True),
         composed=True,
         native_name="sparse_contact_levels_native",
     ).kernel()

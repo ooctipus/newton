@@ -18,6 +18,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import sweep_levels
 from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_COUNT,
@@ -231,7 +232,8 @@ def _launch_builder(rows, device, *, serial_contacts, dofs):
     worlds, capacity = rows["row_type"].shape
     kernel = _get_sparse_contact_levels_kernel(capacity, dofs, str(device.arch), build_serial_contacts=serial_contacts)
     inputs, outputs = _builder_arrays(rows, device)
-    wp.launch_tiled(kernel, dim=[worlds], inputs=inputs, outputs=list(outputs.values()), block_dim=32, device=device)
+    dim, block = sweep_levels.levels_launch(worlds, dofs, device.arch)
+    wp.launch(kernel, dim=dim, inputs=inputs, outputs=list(outputs.values()), block_dim=block, device=device)
     return {name: array.numpy() for name, array in outputs.items()}
 
 
@@ -260,7 +262,7 @@ def _record_schedules(model, device, *, steps=6):
     )
     names = ("row_count", "first", "bounds", "row_type", *_OUTPUTS)
     records = []
-    launch = wp.launch_tiled
+    launch = wp.launch
 
     def recording_launch(kernel, *args, **kwargs):
         if kernel is not solver.sweep.sparse_contact_schedule:
@@ -277,7 +279,7 @@ def _record_schedules(model, device, *, steps=6):
     contacts = newton.Contacts(24, 0, device=device)
     newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
     install_patch_contacts(model, states[0], contacts)
-    with mock.patch.object(wp, "launch_tiled", recording_launch):
+    with mock.patch.object(wp, "launch", recording_launch):
         for _ in range(steps):
             solver.step(states[0], states[1], control, contacts, 1 / 240)
             states.reverse()
@@ -328,9 +330,8 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
 
         def build(kernel=kernel, inputs=inputs, outputs=outputs, marked=marked, worlds=worlds):
             wp.copy(outputs["sparse_row_dof"], marked)
-            wp.launch_tiled(
-                kernel, dim=[worlds], inputs=inputs, outputs=list(outputs.values()), block_dim=32, device=device
-            )
+            dim, block = sweep_levels.levels_launch(worlds, 33, device.arch)
+            wp.launch(kernel, dim=dim, inputs=inputs, outputs=list(outputs.values()), block_dim=block, device=device)
 
         build()
         with wp.ScopedCapture(device=device) as capture:

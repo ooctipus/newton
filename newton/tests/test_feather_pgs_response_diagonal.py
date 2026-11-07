@@ -20,6 +20,7 @@ from newton._src.solvers.feather_pgs.row_kernels import (
 from newton._src.solvers.feather_pgs.sweep_levels import (
     _get_mark_independent_sparse_contact_candidates_kernel,
     _get_sparse_contact_levels_kernel,
+    levels_launch,
 )
 from newton._src.solvers.feather_pgs.sweep_routes_diag import sparse_diagonal_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_local import paired_factor_kernel, paired_factor_source
@@ -1091,9 +1092,10 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         heads = np.arange(0, max_constraints, 3)
         row_type = np.full((1, max_constraints), PGS_CONSTRAINT_TYPE_FRICTION, dtype=np.int32)
         row_type[0, heads] = PGS_CONSTRAINT_TYPE_CONTACT
-        wp.launch_tiled(
+        dim, block = levels_launch(1, max_world_dofs, device.arch)
+        wp.launch(
             schedule,
-            dim=[1],
+            dim=dim,
             inputs=[
                 wp.array((max_constraints,), dtype=wp.int32, device=device),
                 row_lines(device),
@@ -1101,7 +1103,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 wp.array(row_type, device=device),
             ],
             outputs=[sparse_row_dof, level_count, level_offsets, level_units, serial_count, serial_normals],
-            block_dim=32,
+            block_dim=block,
             device=device,
         )
         wp.synchronize_device(device)
@@ -1230,9 +1232,10 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     schedule = _get_sparse_contact_levels_kernel(
                         capacity, dofs, str(device.arch), build_serial_contacts=serial_contacts
                     )
-                    wp.launch_tiled(
+                    dim, block = levels_launch(worlds, dofs, device.arch)
+                    wp.launch(
                         schedule,
-                        dim=[worlds],
+                        dim=dim,
                         inputs=[
                             wp.array(rows["row_count"], device=device),
                             row_lines(device),
@@ -1240,7 +1243,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                             wp.array(rows["row_type"], device=device),
                         ],
                         outputs=[sparse_row_dof, level_count, level_offsets, level_units, serial_count, serial_heads],
-                        block_dim=32,
+                        block_dim=block,
                         device=device,
                     )
                     np.testing.assert_array_equal(sparse_row_dof.numpy(), expected["sparse_row_dof"])

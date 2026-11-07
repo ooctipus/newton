@@ -672,10 +672,13 @@ class Sweep:
 
     def schedule_diagonal(self) -> None:
         """Case K2: publish the sparse diagonal's schedule of the rows the row pass wrote (run after every producer):
-        unit heads from the row types, a world's warp a block (its levels' shared working set)."""
-        wp.launch_tiled(
+        unit heads from the row types, a world's warp, several a block (their levels' shared working set)."""
+        dim, block = sweep_levels.levels_launch(
+            self.forest.world_count, self.forest.max_world_dofs, self.model.device.arch
+        )
+        wp.launch(
             self.sparse_contact_schedule,
-            dim=[self.forest.world_count],
+            dim=dim,
             inputs=[
                 self.placement.constraint_count,
                 self.placement.dense_first,
@@ -690,7 +693,7 @@ class Sweep:
                 self.placement.sparse_contact_serial_count,
                 self.placement.sparse_contact_serial_normals,
             ],
-            block_dim=32,
+            block_dim=block,
             device=self.model.device,
         )
 
