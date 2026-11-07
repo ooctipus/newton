@@ -23,7 +23,7 @@ from newton._src.solvers.feather_pgs.sweep_levels import (
     _get_sparse_contact_levels_kernel,
     levels_launch,
 )
-from newton._src.solvers.feather_pgs.sweep_routes_diag import sparse_diagonal_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_diag import DiagonalSweep
 from newton._src.solvers.feather_pgs.sweep_routes_local import PairedSweep
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import diagonal_walk, free_body_Z, leave_walk, row_lines, row_velocity
@@ -881,7 +881,9 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         lower_lambda = wp.zeros((1, world_dofs), dtype=wp.float32, device=device)
         upper_lambda = wp.zeros_like(lower_lambda)
         velocity = wp.array(initial_velocity, dtype=wp.float32, device=device)
-        kernel = sparse_diagonal_kernel(max_constraints, world_dofs, dense_dofs, str(device.arch), contact_units=True)
+        kernel = sweep_kernel(
+            DiagonalSweep(max_constraints, world_dofs, dense_dofs, str(device.arch), contact_units=True)
+        )
         walk = diagonal_walk(inverse_mass[None, :dense_dofs], device, world_dofs)
         wp.launch_tiled(
             kernel,
@@ -981,13 +983,15 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
 
         impulses = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
         velocity = wp.array(initial_velocity, dtype=wp.float32, device=device)
-        kernel = sparse_diagonal_kernel(
-            max_constraints,
-            world_dofs,
-            dense_dofs,
-            str(device.arch),
-            contact_units=True,
-            speculative_contact_batches=True,
+        kernel = sweep_kernel(
+            DiagonalSweep(
+                max_constraints,
+                world_dofs,
+                dense_dofs,
+                str(device.arch),
+                contact_units=True,
+                speculative_contact_batches=True,
+            )
         )
         walk = diagonal_walk(inverse_mass[None, :dense_dofs], device, world_dofs)
         wp.launch_tiled(
@@ -1166,8 +1170,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
 
     def test_unit_schedule_factories_name_and_reject_layouts(self):
         """Name the unit variants and keep speculative batches within sixteen response lanes."""
-        solve = sparse_diagonal_kernel(24, 12, 9, "120", contact_units=True)
-        batched = sparse_diagonal_kernel(24, 12, 9, "120", contact_units=True, speculative_contact_batches=True)
+        solve = sweep_kernel(DiagonalSweep(24, 12, 9, "120", contact_units=True))
+        batched = sweep_kernel(DiagonalSweep(24, 12, 9, "120", contact_units=True, speculative_contact_batches=True))
         builder = _get_sparse_contact_levels_kernel(24, 12, "120", build_serial_contacts=True)
         self.assertEqual(solve.key, "sweep_sparse_diagonal_24_12_9_units")
         self.assertEqual(batched.key, "sweep_sparse_diagonal_24_12_9_speculative_batches_units")
@@ -1175,7 +1179,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         for kwargs in ({"contact_units": True, "speculative_contact_batches": True, "dense_dofs": 15},):
             dense_dofs = kwargs.pop("dense_dofs", 9)
             with self.subTest(**kwargs), self.assertRaises(ValueError):
-                sparse_diagonal_kernel(24, dense_dofs + 3, dense_dofs, "120", **kwargs)
+                sweep_kernel(DiagonalSweep(24, dense_dofs + 3, dense_dofs, "120", **kwargs))
 
     def test_unit_schedule_reorders_only_commuting_rows(self):
         """Keep GS order on every coordinate when sweeping in the unit schedule's order.
@@ -1289,13 +1293,15 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     lower = wp.zeros((worlds, dofs), dtype=wp.float32, device=device)
                     upper = wp.zeros((worlds, dofs), dtype=wp.float32, device=device)
                     velocity = wp.array(rows["velocity"], device=device)
-                    kernel = sparse_diagonal_kernel(
-                        capacity,
-                        dofs,
-                        dense,
-                        str(device.arch),
-                        contact_units=units,
-                        speculative_contact_batches=batches,
+                    kernel = sweep_kernel(
+                        DiagonalSweep(
+                            capacity,
+                            dofs,
+                            dense,
+                            str(device.arch),
+                            contact_units=units,
+                            speculative_contact_batches=batches,
+                        )
                     )
                     walk = diagonal_walk(rows["dense_inverse"], device, dofs, rows["dense_offsets"])
                     wp.launch_tiled(

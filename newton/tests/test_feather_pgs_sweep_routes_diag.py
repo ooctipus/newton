@@ -23,6 +23,7 @@ from newton._src.solvers.feather_pgs.response_operator import Lanes, Velocity
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
 from newton._src.solvers.feather_pgs.sweep import RowLaws, row_sums, speed_row
 from newton._src.solvers.feather_pgs.sweep_routes import free_body_rows
+from newton.tests.feather_pgs_law_harness import built
 
 _POLICIES = (SolvePolicy(), SolvePolicy(readout="sweeps"), SolvePolicy(readout="trace"))
 _SCHEDULES = (
@@ -43,9 +44,9 @@ class TestSweepRoutesDiagOptions(unittest.TestCase):
 
     def test_invalid_options_raise(self):
         cases = [
-            (routes.sparse_diagonal_kernel, (32, 14, 6, "sm_120"), {"speculative_contact_batches": True}),
+            (built(routes.DiagonalSweep), (32, 14, 6, "sm_120"), {"speculative_contact_batches": True}),
             (
-                routes.sparse_diagonal_kernel,
+                built(routes.DiagonalSweep),
                 (32, 30, 15, "sm_120"),
                 {"contact_units": True, "speculative_contact_batches": True},
             ),
@@ -63,7 +64,7 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
             _SCHEDULES, _POLICIES, ((32, 14, 6), (64, 40, 10), (128, 70, 14))
         ):
             with self.subTest(schedule=schedule, policy=policy, rows=rows, dofs=dofs, dense=dense):
-                text, staging = routes.sparse_diagonal_source(rows, dofs, dense, solve_policy=policy, **schedule)
+                text, staging = routes.DiagonalSweep(rows, dofs, dense, "120", solve_policy=policy, **schedule).source()
                 _balanced(self, text)
                 self.assertEqual(staging.bytes, 4 * (dofs + 5 * rows) + 4 * 32)
                 # The coupled rows: every lane stores what it computes; the warp synchronizes after the apply only.
@@ -73,8 +74,8 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
                 self.assertIn(f"for (int d = lane; d < {dofs}; d += 32) s_v[d] = 0.0f;", text)
 
     def test_sparse_diagonal_schedules(self):
-        units, _ = routes.sparse_diagonal_source(32, 14, 6, contact_units=True, speculative_contact_batches=True)
-        plain, _ = routes.sparse_diagonal_source(32, 14, 6)
+        units, _ = routes.DiagonalSweep(32, 14, 6, "120", contact_units=True, speculative_contact_batches=True).source()
+        plain, _ = routes.DiagonalSweep(32, 14, 6, "120").source()
         # A batch tests one contact per segment of eight lanes (P + 2 = 8 response entries).
         self.assertIn("SEGMENT_SUM(8, candidate_velocity);", units)
         self.assertIn("sparse_contact_serial_normals.data[world * 32 + candidate_index]", units)
@@ -269,7 +270,7 @@ class TestSweepRoutesDiagAssembly(unittest.TestCase):
     def test_kernels_assemble(self):
         cases = [
             (
-                routes.sparse_diagonal_kernel,
+                built(routes.DiagonalSweep),
                 (32, 14, 6, "sm_120"),
                 {"contact_units": True, "speculative_contact_batches": True},
             ),

@@ -110,7 +110,7 @@ def _factory_calls():
         ),
         (
             "sparse_diagonal",
-            sweep_routes_diag.sparse_diagonal_kernel.__wrapped__,
+            built(sweep_routes_diag.DiagonalSweep),
             (64, 10, 9, "120"),
             {"speculative_contact_batches": True, "contact_units": True},
         ),
@@ -178,7 +178,7 @@ def _vote_census():
         ),
         (
             "sparse_diagonal",
-            sweep_routes_diag.sparse_diagonal_kernel.__wrapped__,
+            built(sweep_routes_diag.DiagonalSweep),
             (64, 10, 9, "120"),
             (_axis("speculative_contact_batches"), _axis("contact_units"), _axis("seeded"), _axis("velocity_limits")),
         ),

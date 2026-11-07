@@ -580,8 +580,8 @@ def census_calls():
             (_axis("speed_rows"), _axis("contact_units")),
         ),
         (
-            "sweep_routes_diag.sparse_diagonal_kernel",
-            sweep_routes_diag.sparse_diagonal_kernel,
+            "sweep_routes_diag.DiagonalSweep",
+            built(sweep_routes_diag.DiagonalSweep),
             ((64, 10, 9, ARCH),),
             (_axis("speculative_contact_batches"), _axis("contact_units"), _axis("seeded"), _axis("velocity_limits")),
         ),

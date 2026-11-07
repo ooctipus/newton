@@ -3,7 +3,8 @@
 
 """The sparse-diagonal sweep as a configuration of the sweep emitter (:mod:`.sweep`).
 
-:func:`sparse_diagonal_kernel`: a world's dense group plus diagonal-mass coordinates as whitened rows
+:class:`DiagonalSweep`, built by the one factory (:func:`.sweep.sweep_kernel`): a world's dense group plus diagonal-mass
+coordinates as whitened rows
 (:func:`slot_rows`, a :class:`.SparseFactor`), one warp per world, on the velocity change from the predictor in factor coordinates, from zero:
 ``du = R^-T L^T P dv`` on the dense articulation (the walk's factor and its slips' release, the frame its rows were whitened
 in) and ``du = sqrt(m) dv`` on a diagonal coordinate, left once and added to the predictor. Each sweep runs its coordinates' fused joint limits, its independent scalar contacts a level at a time, a lane a contact, then its
@@ -15,23 +16,21 @@ budget of the device it is built for (:func:`.memory.arch_budget`).
 from __future__ import annotations
 
 import dataclasses
-from functools import cache
 from typing import ClassVar
 
 import warp as wp
 
-from ...core.execution import device_lanes
-from ...core.memory import Buffer, Staging, arch_budget
+from ...core.execution import Work, device_lanes
+from ...core.memory import Buffer, Staging
 from . import kernel_template
 from .device_preludes import RING, SHARED_STORAGE, group_native, lane_group
 from .factor.walk import WalkTrees
-from .kernel_template import KernelTemplate
+from .kernel_template import Dispatch
 from .law_source import law_preludes
 from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import Lanes, ResponseOperator, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_metadata import _validate_dense_metadata_encoding
-from .solve_policy import DEFAULT_POLICY, SolvePolicy
 from .sweep import (
     CONTACT,
     FRICTION,
@@ -42,6 +41,7 @@ from .sweep import (
     RowContext,
     RowLaws,
     SlotOrder,
+    SweepConfig,
     UnitZ,
     WorldRows,
     contact_unit,
@@ -64,6 +64,7 @@ from .sweep import (
 # ---------------------------------------------------------------------------------------------------------------------
 
 SPARSE_DIAGONAL_ABI = kernel_template.params(
+    ("world", int),
     ("world_constraint_count", wp.array[int]),
     ("dense_first", wp.array[int]),
     ("world_dof_indices", wp.array2d[int]),
@@ -97,7 +98,7 @@ SPARSE_DIAGONAL_ABI = kernel_template.params(
     ("fused_limit_upper_lambda", wp.array2d[float]),
     ("v_out", wp.array[float]),
 )
-"""The sparse-diagonal sweep's operands (one world per launch item; a readout follows ``v_out``)."""
+"""The sparse-diagonal sweep's native ABI (one world per launch item; a readout follows ``v_out``)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -329,23 +330,9 @@ for (int i = 0; i < row_count; ++i) {{
         return indent(head, pad) + f"\n{visit}\n{pad}}}"
 
 
-def sparse_diagonal_source(
-    max_constraints: int,
-    max_world_dofs: int,
-    dense_dofs: int,
-    *,
-    speculative_contact_batches: bool = False,
-    contact_units: bool = False,
-    torsion: bool = False,
-    solve_policy: SolvePolicy = DEFAULT_POLICY,
-    weighted: bool = False,
-    material: bool = False,
-    seeded: bool = False,
-    velocity_limits: bool = False,
-    lanes: int = 32,
-) -> tuple[str, Staging]:
-    """The native body of the sparse-diagonal Gauss-Seidel sweep: one warp per world (``lanes``: or the CPU's one
-    thread, :func:`.execution.device_lanes`, whose batches hold one contact).
+def sparse_diagonal_source(sweep: DiagonalSweep) -> tuple[str, Staging]:
+    """The native body of the sparse-diagonal Gauss-Seidel sweep ``sweep`` (:class:`DiagonalSweep`'s source): one warp
+    per world (or the CPU's one thread, :attr:`DiagonalSweep.lanes`, whose batches hold one contact).
 
     Every sweep runs the world's fused diagonal joint limits (one lane per coordinate), then its independent scalar
     contacts (a level at a time, one lane per contact: a contact whose coordinate no coupled row touches commutes with
@@ -369,20 +356,17 @@ def sparse_diagonal_source(
 
     Returns the body and its staging.
     """
-    M, D, P = int(max_constraints), int(max_world_dofs), int(dense_dofs)
-    if speculative_contact_batches and (not contact_units or P + 2 > 16):
-        raise ValueError("speculative contact batches require contact units with at most 16 response entries")
-    _validate_dense_metadata_encoding(M)
-    if lanes not in (1, 32):
-        raise ValueError(f"the sparse-diagonal sweep runs a warp or one thread a world, got {lanes}")
-    L = lanes
+    M, D, P = int(sweep.max_constraints), int(sweep.max_world_dofs), int(sweep.dense_dofs)
+    torsion, solve_policy = sweep.torsion, sweep.solve_policy
+    speculative_contact_batches, velocity_limits = sweep.speculative_contact_batches, sweep.velocity_limits
+    L = sweep.lanes
     batch_lanes = min(8 if P + 2 <= 8 else 16, L)
     batch_shift = batch_lanes.bit_length() - 1
     batch_contacts = L // batch_lanes
-    scheduled = contact_units
+    scheduled = sweep.contact_units
 
     warp = Lanes(L)
-    laws = RowLaws(regularize=weighted, material=material, policy=solve_policy, torsion=torsion)
+    laws = sweep.laws
     # Every lane (or a scalar contact's one thread) stores what it computed and reads its own stores.
     rows = WorldRows(M, lanes=warp, every_lane=True)
     staging = Staging((Buffer("s_v", "float", D), *rows.buffers()), threads=L)
@@ -612,7 +596,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     # The impulses the rows carry into the first sweep, row by row in slot order through both slots and the dense part
     # (a marked slot names no coordinate), as the general sweep's seed.
     seed = ""
-    if seeded:
+    if sweep.seeded:
         apply = pair_op.axpy((("row", "seed"),), "        ", row="i")
         seed = impulse_seed("row_count", rows.peek("i"), f"({rows.kind('i', scan=True)})", apply, warp.sync()) + "\n"
     last_word = velocity_limit_pass(rows, pair_op, laws, end="row_count", pad="        ") if velocity_limits else ""
@@ -669,65 +653,81 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     return group_native(body, preludes=preludes, lanes=L), staging
 
 
-@cache
-def sparse_diagonal_kernel(
-    max_constraints: int,
-    max_world_dofs: int,
-    dense_dofs: int,
-    device_arch: str,
-    *,
-    speculative_contact_batches: bool = False,
-    contact_units: bool = False,
-    torsion: bool = False,
-    solve_policy: SolvePolicy = DEFAULT_POLICY,
-    weighted: bool = False,
-    material: bool = False,
-    seeded: bool = False,
-    velocity_limits: bool = False,
-) -> wp.Kernel:
-    """The sparse-diagonal sweep kernel; weighted rows (:func:`.sweep.weight_arguments`) and material contacts
-    (:func:`.sweep.material_arguments`) add their operands. A world is a warp on CUDA and one thread on the CPU
-    (:func:`.execution.device_lanes`)."""
-    lanes = device_lanes(device_arch, 32)
-    snippet, staging = sparse_diagonal_source(
-        max_constraints,
-        max_world_dofs,
-        dense_dofs,
-        speculative_contact_batches=speculative_contact_batches,
-        contact_units=contact_units,
-        torsion=torsion,
-        solve_policy=solve_policy,
-        weighted=weighted,
-        material=material,
-        seeded=seeded,
-        velocity_limits=velocity_limits,
-        lanes=lanes,
-    )
-    staging.check("the sparse-diagonal sweep", arch_budget(device_arch))
-    name = (
-        f"sweep_sparse_diagonal_{int(max_constraints)}_{int(max_world_dofs)}_{int(dense_dofs)}"
-        + ("_speculative_batches" if speculative_contact_batches else "")
-        + ("_units" if contact_units else "")
-        + ("_weighted" if weighted else "")
-        + ("_material" if material else "")
-        + ("_torsion" if torsion else "")
-        + ("_seeded" if seeded else "")
-        + ("_velocity_limits" if velocity_limits else "")
-        + ("" if lanes == 32 else f"_lanes{lanes}")
-        + solve_policy.suffix
-    )
-    extra = (
-        # Where spin rows may appear, every friction triple's metric (sweep.friction_metric_stage).
-        *((RowArgument("friction_metric", wp.array3d[float], after="omega"),) if torsion else ()),
-        *weight_arguments(weighted),
-        *material_arguments(material),
-        *solve_policy.arguments,
-    )
-    return KernelTemplate(
-        name,
-        kernel_template.operands(SPARSE_DIAGONAL_ABI, extra),
-        snippet,
-        kernel_template.items("world"),
-        composed=True,
-        native_name="sweep_sparse_diagonal_native",
-    ).kernel()
+@dataclasses.dataclass(frozen=True)
+class DiagonalSweep(SweepConfig):
+    """The sparse-diagonal sweep's configuration (case K2): a world of a dense articulation of ``dense_dofs``
+    coordinates beside one-coordinate trees on a fixed frame, ``max_world_dofs`` in all, at most ``max_constraints``
+    rows (:func:`sparse_diagonal_source`).
+
+    Its switches, each the plan's from the class's shape and the laws (:meth:`.sweep_plan.Sweep.build`):
+
+    - the support classes: the arm's rows on its dense group and two one-coordinate slots, a key's rows one entry
+      (the class plan's diagonal rule);
+    - the levels: with ``contact_units`` the independent scalar contacts a level at a time, a lane a contact, and a
+      coupled contact's rows on their Gram block (the diagonal choice's ``units``); with
+      ``speculative_contact_batches`` its serial contacts tested a batch at a time (at most 16 response entries);
+    - the fused limits: each diagonal coordinate's joint limits, a lane a coordinate, exact;
+    - ``seeded``: the first sweep starts from the response of the impulses the rows carry;
+    - ``velocity_limits``: the velocity-limit rows take the last word of every sweep.
+
+    A world is a warp on CUDA and one thread on the CPU (:meth:`work`); weighted rows
+    (:func:`.sweep.weight_arguments`) and material contacts (:func:`.sweep.material_arguments`) add their operands.
+    """
+
+    max_constraints: int
+    max_world_dofs: int
+    dense_dofs: int
+    device_arch: str
+    _: dataclasses.KW_ONLY
+    speculative_contact_batches: bool = False
+    contact_units: bool = False
+    seeded: bool = False
+    velocity_limits: bool = False
+
+    ABI: ClassVar[tuple] = SPARSE_DIAGONAL_ABI
+    NATIVE: ClassVar[str] = "sweep_sparse_diagonal_native"
+    LABEL: ClassVar[str] = "the sparse-diagonal sweep"
+
+    def __post_init__(self):
+        if self.speculative_contact_batches and (not self.contact_units or int(self.dense_dofs) + 2 > 16):
+            raise ValueError("speculative contact batches require contact units with at most 16 response entries")
+        _validate_dense_metadata_encoding(int(self.max_constraints))
+
+    @property
+    def lanes(self) -> int:
+        """A world's lanes: a warp on CUDA, the CPU's one thread (:func:`.execution.device_lanes`), whose batches hold
+        one contact."""
+        return device_lanes(self.device_arch, 32)
+
+    @property
+    def name(self) -> str:
+        return (
+            f"sweep_sparse_diagonal_{int(self.max_constraints)}_{int(self.max_world_dofs)}_{int(self.dense_dofs)}"
+            + ("_speculative_batches" if self.speculative_contact_batches else "")
+            + ("_units" if self.contact_units else "")
+            + ("_weighted" if self.weighted else "")
+            + ("_material" if self.material else "")
+            + ("_torsion" if self.torsion else "")
+            + ("_seeded" if self.seeded else "")
+            + ("_velocity_limits" if self.velocity_limits else "")
+            + ("" if self.lanes == 32 else f"_lanes{self.lanes}")
+            + self.solve_policy.suffix
+        )
+
+    source = sparse_diagonal_source
+
+    def dispatch(self, staging: Staging) -> Dispatch:
+        return kernel_template.items("world")
+
+    def operands(self) -> tuple[RowArgument, ...]:
+        return (
+            # Where spin rows may appear, every friction triple's metric (sweep.friction_metric_stage).
+            *((RowArgument("friction_metric", wp.array3d[float], after="omega"),) if self.torsion else ()),
+            *weight_arguments(self.weighted),
+            *material_arguments(self.material),
+            *self.solve_policy.arguments,
+        )
+
+    def work(self, items: int = 0, shared: int = 0) -> Work:
+        """A block a world, a warp (one thread a world on the CPU); no register line, so no launch bound."""
+        return Work(int(items), lanes=32, block=32, shared=int(shared))

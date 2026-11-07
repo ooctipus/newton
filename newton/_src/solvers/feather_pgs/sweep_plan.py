@@ -442,22 +442,23 @@ class Sweep:
             if sparse_contact_schedule
             else None
         )
-        self.sparse_diagonal_kernel = (
-            self.kernel(
-                "sparse_diagonal",
-                sweep_routes_diag.sparse_diagonal_kernel,
+        self.diagonal_sweep = (
+            sweep_routes_diag.DiagonalSweep(
                 self.placement.dense_max_constraints,
                 self.forest.max_world_dofs,
                 diagonal.dense_size,
                 device_arch,
                 speculative_contact_batches=diagonal.speculative_batches,
                 contact_units=diagonal.units,
-                torsion=self.laws.spin_rows,
                 seeded=self.seeded,
                 velocity_limits=bool(self.options.enable_joint_velocity_limits),
+                **self.law_fields,
             )
             if diagonal is not None
             else None
+        )
+        self.sparse_diagonal_kernel = (
+            self.sweep("sparse_diagonal", self.diagonal_sweep) if self.diagonal_sweep is not None else None
         )
         row_by_row = self.sparse_diagonal_kernel is not None or self.paired_factor_kernel is not None
         if self.laws.spin_rows and (self.classes.mf_sweeps or row_by_row):
@@ -845,11 +846,12 @@ class Sweep:
     def _solve_diagonal(self, operands: dict) -> None:
         """Case K2: the sparse-diagonal sweep over the schedule of :meth:`claim`."""
         placement, dense_size = self.placement, self.classes.dense_size
+        layout = shape(self.diagonal_sweep.work(self.forest.world_count), device(self.model.device))
         self._launch(
             self.sparse_diagonal_kernel,
             operands,
-            self.forest.world_count,
-            32,
+            layout.grid,
+            layout.block,
             sparse_contact_level_count=placement.sparse_contact_level_count,
             sparse_contact_level_offsets=placement.sparse_contact_level_offsets,
             sparse_contact_level_units=placement.sparse_contact_level_units,

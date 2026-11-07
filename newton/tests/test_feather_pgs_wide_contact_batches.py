@@ -6,7 +6,8 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs.sweep_routes_diag import sparse_diagonal_kernel
+from newton._src.solvers.feather_pgs.sweep import sweep_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_diag import DiagonalSweep
 from newton.tests.feather_pgs_law_harness import diagonal_walk, leave_walk, row_velocity
 
 
@@ -22,8 +23,8 @@ class TestWideContactBatches(unittest.TestCase):
         """Reject response widths beyond sixteen lanes and schedules without contact units."""
         for width, units in ((15, True), (9, False)):
             with self.subTest(dense_dofs=width, contact_units=units), self.assertRaises(ValueError):
-                sparse_diagonal_kernel(
-                    24, width + 2, width, "120", contact_units=units, speculative_contact_batches=True
+                sweep_kernel(
+                    DiagonalSweep(24, width + 2, width, "120", contact_units=units, speculative_contact_batches=True)
                 )
 
     def _check_width(self, width):
@@ -123,8 +124,10 @@ class TestWideContactBatches(unittest.TestCase):
                     arrays.append(wp.array(value, dtype=dtype, device=device))
                 else:
                     arrays.append(value)
-            kernel = sparse_diagonal_kernel(
-                capacity, dofs, width, str(device.arch), contact_units=True, speculative_contact_batches=batch
+            kernel = sweep_kernel(
+                DiagonalSweep(
+                    capacity, dofs, width, str(device.arch), contact_units=True, speculative_contact_batches=batch
+                )
             )
             wp.launch_tiled(kernel, dim=[worlds], inputs=arrays[:29], outputs=arrays[29:], block_dim=32, device=device)
             leave_walk(walk, arrays[31], device)

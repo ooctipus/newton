@@ -174,9 +174,9 @@ def _readout_calls():
     for size in ((112, 18, 12), (128, 25, 16), (256, 18, 12)):
         yield "sweep_routes_sparse.sparse_kernel", factory, size, {**triplets, **readout}
         yield "sweep_routes_sparse.sparse_kernel", factory, size, {**triplets, "linked_rows": True, **readout}
-    factory = sweep_routes_diag.sparse_diagonal_kernel.__wrapped__
+    factory = built(sweep_routes_diag.DiagonalSweep)
     kwargs = {"contact_units": True, "speculative_contact_batches": True, **readout}
-    yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (1024, 114, 6, _ARCH), kwargs
+    yield "sweep_routes_diag.DiagonalSweep", factory, (1024, 114, 6, _ARCH), kwargs
     factory = sweep_routes.mf_gs_kernel.__wrapped__
     for args, kwargs in (
         ((192, 64, 22, _ARCH), {}),
@@ -304,8 +304,8 @@ def _solver_factory_calls():
     )
 
     name = "sweep_levels."
-    factory = sweep_routes_diag.sparse_diagonal_kernel.__wrapped__
-    yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (64, 10, 9, _ARCH), {}
+    factory = built(sweep_routes_diag.DiagonalSweep)
+    yield "sweep_routes_diag.DiagonalSweep", factory, (64, 10, 9, _ARCH), {}
     for serial in (False, True):
         factory = sweep_levels._get_sparse_contact_levels_kernel.__wrapped__
         kwargs = {"build_serial_contacts": serial}
@@ -316,11 +316,11 @@ def _solver_factory_calls():
     # The unit schedules of the sparse diagonal.
     for batches in (False, True):
         kwargs = {"contact_units": True, "speculative_contact_batches": batches}
-        factory = sweep_routes_diag.sparse_diagonal_kernel.__wrapped__
-        yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (64, 10, 9, _ARCH), kwargs
+        factory = built(sweep_routes_diag.DiagonalSweep)
+        yield "sweep_routes_diag.DiagonalSweep", factory, (64, 10, 9, _ARCH), kwargs
         # The velocity-limit rows' last word.
         kwargs = {**kwargs, "velocity_limits": True}
-        yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (64, 10, 9, _ARCH), kwargs
+        yield "sweep_routes_diag.DiagonalSweep", factory, (64, 10, 9, _ARCH), kwargs
     for limits, free, speed in itertools.product(*([(False, True)] * 3)):
         kwargs = {
             "has_dense_velocity_limit_rows": limits,
@@ -388,9 +388,9 @@ def _suite_shape_calls():
     factory = sweep_routes_sparse.sparse_kernel.__wrapped__
     for size, kwargs in _suite_sparse_sweeps():
         yield "sweep_routes_sparse.sparse_kernel", factory, size, kwargs
-    factory = sweep_routes_diag.sparse_diagonal_kernel.__wrapped__
+    factory = built(sweep_routes_diag.DiagonalSweep)
     for args, kwargs in _suite_diagonal_sweeps():
-        yield "sweep_routes_diag.sparse_diagonal_kernel", factory, args, kwargs
+        yield "sweep_routes_diag.DiagonalSweep", factory, args, kwargs
 
     def parallel(layout, *args, **kwargs):
         factory = keyed_rows.get_parallel_factory.__wrapped__(sweep_routes_tiers.parallel_kernel, layout)
@@ -576,7 +576,7 @@ class TestFeatherPGSKernelPins(unittest.TestCase):
         for family in (
             "sweep_routes_sparse.sparse_kernel",
             "walk_rows.support_rows_kernel",
-            "sweep_routes_diag.sparse_diagonal_kernel",
+            "sweep_routes_diag.DiagonalSweep",
             "sweep_levels._get_sparse_contact_levels_kernel",
             "sweep_levels._get_mark_independent_sparse_contact_candidates_kernel",
             "sweep_routes_tiers.parallel_kernel",
