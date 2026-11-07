@@ -1065,13 +1065,10 @@ def braced(lines) -> str:
 
 
 def root_path(body: str, c: str, *, begin=(), joint=(), count: str = "", rows: str = "") -> tuple[str, str]:
-    """The path table's walk of a root path (``WALK_PARENT_OF``, ``WALK_FIRST_OF``), leaf first: coordinate ``c`` of
-    ``body`` down to its body's first, then each ancestor's coordinates, last first (:meth:`WalkClass.steps` with the
-    table compiled). Returns the statements before and after a coordinate's visit (``c`` and the body ``b`` in scope),
-    both loops rolled: ``begin`` opens a body (before its coordinates), ``joint`` passes it to its parent ``up`` (the
-    edge); ``count`` advances with ``c``. With ``rows``, the walk with entry points: walk ``r`` enters at coordinate
-    ``c[r]`` of ``body[r]`` (-1: none), the union of their root paths deepest body first, each body from its deepest
-    entry, ``joint`` for each walk ``r`` on it."""
+    """The path table's walk of a root path (``WALK_PARENT_OF``, ``WALK_FIRST_OF``), leaf first (:meth:`WalkClass.steps`
+    compiled): the statements before and after a coordinate's visit (``c``, the body ``b``), both loops rolled; ``begin``
+    opens a body, ``joint`` passes it to its parent ``up``, ``count`` advances with ``c``. ``rows``: the walk with entry
+    points, walk ``r`` at coordinate ``c[r]`` of ``body[r]`` (-1: none), deepest body first, ``joint`` for each ``r``."""
     last = "WALK_FIRST_OF(up + 1) - 1"
     if rows:
         each = f"WALK_UNROLLED\n    for (int r = 0; r < {rows}; ++r)"
@@ -1625,10 +1622,8 @@ class WalkClass:
             raise ValueError("a walk's class names a half for every coordinate or for none")
 
     def steps(self, root_first: bool, entry: int | None = None) -> list[_Step]:
-        """The class's steps in a walk's order, every field a constant: each body's coordinates, or the body alone
-        without one. The whole tree, each body's join bits leaf first (the plan's up flags: a parent's first child in
-        the walk's order, a parent); or coordinate ``entry``'s root path, which joins nothing (:func:`root_path` with
-        the table compiled): ``entry`` down to its body's first, then each ancestor's coordinates, last first."""
+        """The class's steps in a walk's order, constants, each body's join bits leaf first (the plan's up flags); or
+        coordinate ``entry``'s root path, joining nothing (:func:`root_path` compiled): its body's, then each ancestor's."""
         flags = TreePlan.build(self.parent).up_flags if entry is None and not root_first else [0] * len(self.parent)
         bodies = list(self.bodies_in(root_first))
         if entry is not None:
