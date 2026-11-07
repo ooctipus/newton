@@ -1252,7 +1252,6 @@ class TestTierRule(unittest.TestCase):
         """The tier rule on a class's inputs, allegro's by default (a 16-coordinate hand and a cube, 192 dense rows),
         with the in-kernel response ``response`` (its sizes and why)."""
         inputs = SimpleNamespace(
-            model=SimpleNamespace(device=SimpleNamespace(is_cuda=True)),
             pins=SolverFeatherPGS.Pins(),
             dense_rows=192,
             forest=SimpleNamespace(
@@ -1303,8 +1302,6 @@ class TestTierRule(unittest.TestCase):
             ),
             ({"pins": SolverFeatherPGS.Pins(tiers=0)}, "tiers=0"),
             ({"response": (None, "A world has several articulations of size 6.")}, "several"),
-            # Their body runs a lane a row: the CPU's one thread runs no tier.
-            ({"model": SimpleNamespace(device=SimpleNamespace(is_cuda=False))}, "lane a row"),
         ):
             with self.subTest(changes=sorted(changes)):
                 choice, why = self._rule(**changes)

@@ -1798,20 +1798,19 @@ def cpu_groups() -> list:
 
 
 def cpu_placements() -> list:
-    """The CUDA matrix on the CPU: each problem through every route of it the CPU takes, against the CPU reference.
+    """The CUDA matrix on the CPU: each problem through every route of it, against the CPU reference.
 
-    The CPU runs each case's body at one lane, so it takes every placement but the Jacobi tiers' (their body runs a lane
-    a row of a block, CUDA's only: :func:`.class_plan.tier_rule`)."""
-    groups = []
-    for group in cuda_groups():
-        routes = tuple(
-            dataclasses.replace(route, device="cpu")
-            for route in group.routes
-            if "sweep.tiers.family" not in route.expect
+    The CPU runs each case's body at one lane, the Jacobi tiers' block group as virtual lanes, so it takes every
+    placement."""
+    return [
+        dataclasses.replace(
+            group,
+            reference=REFERENCE_CPU,
+            routes=tuple(dataclasses.replace(route, device="cpu") for route in group.routes),
+            findings=(),
         )
-        if routes:
-            groups.append(dataclasses.replace(group, reference=REFERENCE_CPU, routes=routes, findings=()))
-    return groups
+        for group in cuda_groups()
+    ]
 
 
 def _material(scene: scenes.Scene, stiffness: float = 2.0e4, damping: float = 100.0) -> scenes.Scene:

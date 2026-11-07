@@ -8,9 +8,9 @@ laws, the options, the row capacity, the device's shared budget, the test pins, 
 tree's admission of the representation the case needs. It returns the case's choice (what its owner builds) or why the
 class does not fit. :func:`plan_class` applies the rules in order: the first that fits gives the class its case, and
 every later case says which case holds the class. One datum keeps every class general: a test pin
-(:func:`general_reason`). Each case's body runs on both devices, the CPU's one thread a lane group, so the device
-decides no case but K4's, whose Jacobi tiers run a lane a row (:func:`tier_rule`). The owners then build from the
-plan (:class:`ClassPlan`) and decide nothing of the case.
+(:func:`general_reason`). Each case's body runs on both devices, the CPU's one thread a lane group (the Jacobi tiers'
+block group as virtual lanes), so the device decides no case. The owners then build from the plan (:class:`ClassPlan`)
+and decide nothing of the case.
 """
 
 from __future__ import annotations
@@ -657,16 +657,12 @@ def tier_rule(inputs: ClassInputs) -> tuple[Tiers | None, str]:
     body-velocity RMS by 0.4-0.9% on two contact-rich patch workloads, and left point tiers 3.9 times the serial
     sweep's p90 error from its fixed point on anymal-D's 33-48-row worlds). Their row bound is the dense row capacity,
     at most :data:`.sweep_routes_tiers.TIER_MAX_ROWS`, in whole quads; a test pin (``tiers``) sets it on any class
-    whose response they form. They run on CUDA only: a lane a row of a block's group, whose one-lane form is not built.
+    whose response they form. A lane a row of a block's group: the CPU's one thread runs the lanes in turn
+    (:class:`.device_preludes.VirtualLanes`).
     """
     forest, pinned = inputs.forest, inputs.pins.tiers
     reason = first_failed(
         (
-            (
-                inputs.model.device.is_cuda,
-                "The tiers run a lane a row of a block's group: their body is CUDA's (its one-lane form is designed, "
-                "U18).",
-            ),
             (
                 forest.world_count > 0 and forest.max_world_dofs > 0,
                 "No matrix-free sweep runs whose dense rows the tiers could take.",

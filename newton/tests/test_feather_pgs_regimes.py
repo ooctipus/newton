@@ -1630,9 +1630,15 @@ def check_regular(case, prepared, seed, *, audit=True):
     case.assertLess(problem.drift, TestQ18Manufactured.DRIFT)
     case.assertLess(point, TestQ18Manufactured.TOLERANCE)
     if audit:
+        # The audit reads every world a store holds the rows of: all but the keyed rows' worlds, whose rows exist only
+        # inside the Jacobi tiers' sweep (:mod:`.audit`); those answer to the solution above alone.
         reading = solver.read_audit()
-        case.assertLess(float(np.nanmax(reading["gap"])), 1.0e-6)
-        case.assertLess(float(np.nanmax(reading["violation"])), 1.0e-4)
+        read = ~np.isnan(reading["gap"])
+        if solver.placement.keyed_rows is None:
+            case.assertTrue(read.all())
+        if read.any():
+            case.assertLess(float(np.nanmax(reading["gap"])), 1.0e-6)
+            case.assertLess(float(np.nanmax(reading["violation"])), 1.0e-4)
 
 
 def check_regular_scenes(case, entries, route, device, *, spin=False, count=3):
@@ -1710,12 +1716,14 @@ class TestQ18Manufactured(unittest.TestCase):
         """A pattern that is not regular leaves the impulses open (coplanar loaded normals, redundant sticks) and can
         admit a second solution: sliding friction on an open split, or another status. It is judged on what any solution
         must hold, never on ``lambda``: the step's ``v+`` with its stored impulses solves the stated rows, and those
-        impulses through the stated rows are the total force that moved it (:meth:`Manufactured.residual`)."""
+        impulses through the stated rows are the total force that moved it (:meth:`Manufactured.residual`). It reads
+        the rows a store holds after the step: no Jacobi tier, whose keyed rows live inside its sweep (``tiers=0``)."""
+        stored = conformance.CPU.but("cpu_stored", pins={"tiers": 0})
         for build, settle, spins in self.IRREGULAR_SCENES:
             scene = build()
             for spin in spins:
                 with wp.ScopedDevice(DEVICE):
-                    prepared = ManufacturedScene(scene, conformance.CPU, DEVICE, settle=settle, spin=spin)
+                    prepared = ManufacturedScene(scene, stored, DEVICE, settle=settle, spin=spin)
                     seeds = prepared.seeds(2, regular=False)
                 with self.subTest(scene=scene.name, spin=spin):
                     self.assertEqual(len(seeds), 2, f"{len(seeds)} irregular seeds of {SCAN}")
@@ -1729,9 +1737,9 @@ class TestQ18Manufactured(unittest.TestCase):
 
 
 class TestQ18Placements(unittest.TestCase):
-    """Q18 on every placement the CPU takes: each case's body runs there at one lane, and must return the solution
-    the core returns, on seeds its own settled pose makes regular. The Jacobi tiers run on CUDA only
-    (:class:`TestQ18ManufacturedCUDA`)."""
+    """Q18 on every placement: each case's body runs on the CPU at one lane (the Jacobi tiers' block group as virtual
+    lanes), and must return the solution the core returns, on seeds its own settled pose makes regular; the tiers are
+    read apart (:meth:`test_tiers_return_the_solution`)."""
 
     DEVICE = DEVICE
     PLACEMENTS = (
@@ -1742,28 +1750,23 @@ class TestQ18Placements(unittest.TestCase):
         (scenes.hand, 30, 2.0 / 3.0, ("PAIRED", "PAIRED_FOREST")),
     )
     """``(build, settle, loaded, routes)``, as :attr:`TestQ18Manufactured.SCENES`."""
+    TIERS = ("MF_PARALLEL", "KEYED_PARALLEL")
+    """The Jacobi tiers (K4), on legged."""
+
+    def _route(self, name):
+        return dataclasses.replace(getattr(conformance, name), device=self.DEVICE.split(":")[0])
 
     def _placements(self, spin, count):
         for build, settle, loaded, names in self.PLACEMENTS:
             entry = (build, settle, min(loaded, SPARSE) if spin else loaded)
             for name in names:
-                route = dataclasses.replace(getattr(conformance, name), device=self.DEVICE.split(":")[0])
-                check_regular_scenes(self, (entry,), route, self.DEVICE, spin=spin, count=count)
+                check_regular_scenes(self, (entry,), self._route(name), self.DEVICE, spin=spin, count=count)
 
     def test_every_placement_returns_the_solution(self):
         self._placements(False, 3)
 
     def test_every_placement_holds_spin_rows(self):
         self._placements(True, 1)
-
-
-@unittest.skipUnless(wp.is_cuda_available(), "needs CUDA")
-class TestQ18ManufacturedCUDA(TestQ18Placements):
-    """Q18 on every CUDA placement, the Jacobi tiers among them, read apart (:meth:`test_tiers_return_the_solution`)."""
-
-    DEVICE = "cuda:0"
-    TIERS = ("MF_PARALLEL", "KEYED_PARALLEL")
-    """The Jacobi tiers (K4), on legged."""
 
     @known_failure(
         "E2: the Jacobi tiers' momentum on a sliding Coulomb face (K4)",
@@ -1780,16 +1783,21 @@ class TestQ18ManufacturedCUDA(TestQ18Placements):
         build, settle, loaded, _names = self.PLACEMENTS[1]
         wrong = {}
         for name in self.TIERS:
-            with wp.ScopedDevice("cuda:0"):
-                prepared = ManufacturedScene(
-                    build(), getattr(conformance, name), "cuda:0", settle=settle, loaded=loaded
-                )
+            with wp.ScopedDevice(self.DEVICE):
+                prepared = ManufacturedScene(build(), self._route(name), self.DEVICE, settle=settle, loaded=loaded)
                 for seed in prepared.seeds(4):
                     problem, solver = prepared.solve(seed)
                     point = problem.error(solver.v_out.numpy(), problem.offsets)[0]
                     if point >= TestQ18Manufactured.TOLERANCE:
                         wrong[name, seed] = point
         self.assertEqual(wrong, {})
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "needs CUDA")
+class TestQ18ManufacturedCUDA(TestQ18Placements):
+    """Q18 on every CUDA placement, the Jacobi tiers among them."""
+
+    DEVICE = "cuda:0"
 
 
 FAR = (158.75, 158.75, 0.0)
