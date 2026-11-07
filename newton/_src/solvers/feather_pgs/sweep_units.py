@@ -49,7 +49,7 @@ from .device_preludes import SHARED_STORAGE, cuda_native, lane_group
 from .field_group import Field, FieldGroup
 from .kernel_template import KernelTemplate
 from .row_kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
-from .row_metadata import RECORD_WORDS, _mf_parent_expression
+from .row_metadata import HEADER_WORDS, _mf_parent_expression
 
 BUILD_WARPS = 8
 """Warps of a world's unit builder block: they share the parallel passes; the first levels the units."""
@@ -136,7 +136,7 @@ class SlotLayout(NamedTuple):
     ``fields`` floats: each row ``r``'s twelve ``Z`` entries at ``r * 12 + side * 6 + k`` (its packed row), then the first
     tangent's friction coefficient (at ``mu``), the normal row's regularization weight (``weight``) and a spin row's
     torsional coefficient (``spin_mu``). ``words`` words: each row ``r``'s bits of its stored inverse diagonal, of its
-    right-hand side, and its type and parent word (its record's words 1 to 3, :func:`.row_metadata.pack_row_record`) at ``r * 3``, then from
+    right-hand side, and its type and parent word (its header's words 1 to 3, :func:`.row_metadata.pack_row_header`) at ``r * 3``, then from
     ``ring`` a friction unit's patch ring: the other normal rows of its ring in ring order (two 16-bit rows a word,
     0xFFFF past the last), then their count (-1 for a ring larger than :data:`RING_MEMBERS`). ``metric`` floats: a
     friction unit's cached metric and Gram couplings (:func:`.sweep_routes._colored_metrics`)."""
@@ -161,7 +161,7 @@ def slot_layout(torsion: bool) -> SlotLayout:
 
 
 _RING_MEMBERS = wp.constant(RING_MEMBERS)
-_RECORD_WORDS = wp.constant(RECORD_WORDS)
+_HEADER_WORDS = wp.constant(HEADER_WORDS)
 
 SLOT_FIELDS = FieldGroup(
     # Slot-major: field f of unit p at [slot, f, p], so a warp's units read each field in one transaction.
@@ -189,7 +189,7 @@ def stage_slots(weighted: bool) -> wp.Kernel:
         unit_count: wp.array[wp.int32],
         color_slot: wp.array3d[wp.int32],
         row_record: wp.array2d[wp.int32],
-        record_base: int,
+        free_records: int,
         packed_Z: wp.array3d[float],
         mf_row_mu: wp.array2d[float],
         mf_row_w: wp.array2d[float],
@@ -223,7 +223,7 @@ def stage_slots(weighted: bool) -> wp.Kernel:
             if r < rows:
                 for k in range(12):
                     slot_data[slot, r * 12 + k, p] = packed_Z[mf_line, body_base + row + r, k]
-                record = (record_base + row + r) * _RECORD_WORDS
+                record = free_records + (row + r) * _HEADER_WORDS
                 slot_words[slot, r * 3, p] = row_record[mf_line, record + 1]
                 slot_words[slot, r * 3 + 1, p] = row_record[mf_line, record + 2]
                 slot_words[slot, r * 3 + 2, p] = row_record[mf_line, record + 3]
@@ -252,8 +252,8 @@ def stage_slots(weighted: bool) -> wp.Kernel:
             words = wp.vec4i(-1, -1, -1, -1)
             members = int(0)
             hop = int(0)
-            rows_cap = row_record.shape[1] // _RECORD_WORDS - record_base
-            link = (row_record[mf_line, (record_base + row) * _RECORD_WORDS + 3] >> 16) & 0xFFFF
+            rows_cap = (row_record.shape[1] - free_records) // _HEADER_WORDS
+            link = (row_record[mf_line, free_records + row * _HEADER_WORDS + 3] >> 16) & 0xFFFF
             r = wp.where(link == 0xFFFF, -1, link)
             while r >= 0 and r != row and hop < rows_cap:
                 if members == _RING_MEMBERS:
@@ -266,7 +266,7 @@ def stage_slots(weighted: bool) -> wp.Kernel:
                     words[members // 2] = (words[members // 2] & 0xFFFF) | (r << 16)
                 members += 1
                 hop += 1
-                link = (row_record[mf_line, (record_base + r) * _RECORD_WORDS + 3] >> 16) & 0xFFFF
+                link = (row_record[mf_line, free_records + r * _HEADER_WORDS + 3] >> 16) & 0xFFFF
                 r = wp.where(link == 0xFFFF, -1, link)
             ring = layout_rows * 3
             for k in range(_RING_MEMBERS // 2):
@@ -344,8 +344,8 @@ SHARED_DECLARATIONS
     const int end = min(mf_contact_rows_end.data[world], m_mf);
     const int mf_line = mf_first.data[world];
     __builtin_assume(mf_line >= 0);
-    // The free bodies' records (row_metadata.pack_row_record), from record_base in the line's records.
-    const int off_meta = mf_line * row_record.shape[1] + record_base * RECORD_WORDS;
+    // The free bodies' records (row_metadata.pack_row_header), from the line's word free_records.
+    const int off_meta = mf_line * row_record.shape[1] + free_records;
     // The world's slot (a candidate's: the claim stage's) holds its units and colors; a world with fewer contact rows
     // than the rule's units keeps the one-warp sweep: no units, the general bucket.
     const int slot = world_slot.data[world];
@@ -373,7 +373,7 @@ SHARED_DECLARATIONS
     for (int base = 0; base < end; base += THREADS) {
         const int row = base + tid;
         bool head = false;
-        if (row < end) head = (row_record.data[off_meta + row * RECORD_WORDS + 3] & 0xFFFF) == CONTACT;
+        if (row < end) head = (row_record.data[off_meta + row * HEADER_WORDS + 3] & 0xFFFF) == CONTACT;
         int counted = 0;
         const int rank = ORDERED(counted, head);
         if (lane == 0) warp_count[warp] = counted;
@@ -388,11 +388,11 @@ SHARED_DECLARATIONS
             const int unit = first + rank;
             int rows = 1;
             while (row + rows < end && rows < 3) {
-                const int packed = row_record.data[off_meta + (row + rows) * RECORD_WORDS + 3];
+                const int packed = row_record.data[off_meta + (row + rows) * HEADER_WORDS + 3];
                 if ((packed & 0xFFFF) != FRICTION || (PARENT(packed)) != row) break;
                 ++rows;
             }
-            const int dofs = row_record.data[off_meta + row * RECORD_WORDS];
+            const int dofs = row_record.data[off_meta + row * HEADER_WORDS];
             unit_row.data[off_mf + unit] = row;
             unit_rows.data[off_mf + unit] = rows;
             unit_dofs.data[off_mf + unit] = dofs;
@@ -502,12 +502,12 @@ def build_staging(dofs: int) -> Staging:
 
 
 _UNIT_ROWS = """            while (row + rows < end && rows < 3) {
-                const int packed = row_record.data[off_meta + (row + rows) * RECORD_WORDS + 3];
+                const int packed = row_record.data[off_meta + (row + rows) * HEADER_WORDS + 3];
                 if ((packed & 0xFFFF) != FRICTION || (PARENT(packed)) != row) break;"""
 """The unit builder's rows of a unit after its normal: its friction pair."""
 
 _SPIN_UNIT_ROWS = """            while (row + rows < end && rows < 4) {
-                const int packed = row_record.data[off_meta + (row + rows) * RECORD_WORDS + 3];
+                const int packed = row_record.data[off_meta + (row + rows) * HEADER_WORDS + 3];
                 if ((packed & 0xFFFF) != (rows < 3 ? FRICTION : TORSION) || (PARENT(packed)) != row) break;"""
 """Under contact torsion: its friction pair, then its spin row."""
 
@@ -538,11 +538,12 @@ def build_units_kernel(
     One block of :data:`BUILD_WARPS` warps per world of the claims' candidate bucket (a world with a slot,
     :func:`.sweep_levels.claim_worlds`): launch tiled over the bucket's capacity, the slots, with ``block_dim=32 *
     BUILD_WARPS``. Inputs: ``mf_constraint_count``, ``mf_contact_rows_end`` and the free bodies' records
-    (``row_record`` from ``record_base``); outputs: :data:`WORLD_FIELDS` (``world_slot`` is read) and its slot's
-    :data:`UNIT_FIELDS`, and each world appended to the claims' colored bucket or their general one by ``rule``
-    (:func:`~newton._src.core.execution.append`'s statements). A world with fewer contact rows than the rule's units
-    takes no units, and a world of more units than its slot holds sets ``unit_status``: the one-warp sweep keeps both.
-    Its shared working set (:func:`build_staging`) must fit ``static_bytes`` (a device's :func:`.memory.static_budget`).
+    (``row_record`` from the line's word ``free_records``, :func:`.row_metadata.record_layout`); outputs:
+    :data:`WORLD_FIELDS` (``world_slot`` is read) and its slot's :data:`UNIT_FIELDS`, and each world appended to the
+    claims' colored bucket or their general one by ``rule`` (:func:`~newton._src.core.execution.append`'s
+    statements). A world with fewer contact rows than the rule's units takes no units, and a world of more units than
+    its slot holds sets ``unit_status``: the one-warp sweep keeps both. Its shared working set (:func:`build_staging`)
+    must fit ``static_bytes`` (a device's :func:`.memory.static_budget`).
     """
     staging = build_staging(dofs)
     staging.check("the unit builder", static_bytes)
@@ -553,7 +554,7 @@ def build_units_kernel(
         body = f"#define TORSION {int(PGS_CONSTRAINT_TYPE_TORSION)}\n" + body.replace(_UNIT_ROWS, _SPIN_UNIT_ROWS)
         body = body.replace("#endif", "#undef TORSION\n#endif")
     source = (
-        f"#define MF_ROWS {mf_rows}\n#define RECORD_WORDS {RECORD_WORDS}\n#define UNITS {int(units)}\n#define MIN_UNITS {int(rule.min_units)}\n"
+        f"#define MF_ROWS {mf_rows}\n#define HEADER_WORDS {HEADER_WORDS}\n#define UNITS {int(units)}\n#define MIN_UNITS {int(rule.min_units)}\n"
         f"#define WARPS {BUILD_WARPS}\n#define COLORED(N_UNITS, N_COLORS) {rule.condition('(N_UNITS)', '(N_COLORS)')}\n"
         f"#define THREADS {32 * BUILD_WARPS}\n#define NODES {dofs // 6 + 1}\n#define WORDS {words}\n"
         f"#define CONTACT {int(PGS_CONSTRAINT_TYPE_CONTACT)}\n#define FRICTION {int(PGS_CONSTRAINT_TYPE_FRICTION)}\n"
@@ -563,7 +564,7 @@ def build_units_kernel(
         .replace("LEVEL_OFFSETS", _LEVEL_OFFSETS)
         .replace(
             "#endif",
-            "#undef MF_ROWS\n#undef RECORD_WORDS\n#undef UNITS\n#undef MIN_UNITS\n#undef COLORED\n#undef WARPS\n#undef THREADS\n#undef NODES\n"
+            "#undef MF_ROWS\n#undef HEADER_WORDS\n#undef UNITS\n#undef MIN_UNITS\n#undef COLORED\n#undef WARPS\n#undef THREADS\n#undef NODES\n"
             "#undef WORDS\n"
             "#undef CONTACT\n#undef FRICTION\n#undef PARENT\n#endif",
         )
@@ -575,7 +576,7 @@ def build_units_kernel(
         ("mf_first", wp.array[int]),
         ("mf_contact_rows_end", wp.array[int]),
         ("row_record", wp.array2d[int]),
-        ("record_base", int),
+        ("free_records", int),
         *WORLD_FIELDS,
         *UNIT_FIELDS,
         ("unit_status", wp.array[int]),
@@ -676,7 +677,7 @@ class ColoredUnits:
         mf_first,
         mf_contact_rows_end,
         row_record,
-        record_base: int,
+        free_records: int,
         packed_Z,
         mf_row_mu,
         mf_row_w,
@@ -699,7 +700,7 @@ class ColoredUnits:
                 mf_first,
                 mf_contact_rows_end,
                 row_record,
-                int(record_base),
+                int(free_records),
             ],
             outputs=[
                 *(units[field.name] for field in (*WORLD_FIELDS, *UNIT_FIELDS)),
@@ -724,7 +725,7 @@ class ColoredUnits:
                 units["unit_count"],
                 units["color_slot"],
                 row_record,
-                int(record_base),
+                int(free_records),
                 packed_Z,
                 mf_row_mu,
                 mf_row_w,

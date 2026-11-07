@@ -64,6 +64,7 @@ from .row_metadata import (
     _mf_parent_expression,
     load_row_record,
     record_word,
+    record_words,
     unpack_mf_header,
 )
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound, sweep_exit, terms_bound, vote
@@ -102,8 +103,9 @@ class WorldRows:
       ``off_rec_dense`` or ``off_rec_mf``. A row loop loads the visited row's record a row ahead into registers
       (``rec_a``, ``rec_b``: :func:`rows_block`; a loop that does not pipeline declares them, :meth:`visit`), which
       every read of row ``i`` takes; any other row's read takes its record's word. The free bodies' rows always
-      stream, and their records keep the inverse of their diagonal, which their step multiplies by; the dense rows'
-      keep ``A_ii``, which a step divides by.
+      stream, and their records are the header alone (``rec_a``, :func:`.row_metadata.pack_row_header`: their sides'
+      widths are their class's, their friction coefficient the line's ``world_row_mu``); they keep the inverse of
+      their diagonal, which their step multiplies by; the dense rows' keep ``A_ii``, which a step divides by.
 
     Impulses are staged (``s_lam_dense``, ``s_lam_mf``) or, with ``stream``, read and written in place (``g_lam_dense``,
     ``g_lam_mf``): a class's line past the stage streams them. A dense row's impulse is owned by the row's first lane,
@@ -167,17 +169,33 @@ class WorldRows:
         """The staged impulses (or, with ``stream``, the world's in place)."""
         return f"{'g' if self.stream else 's'}_lam_{'mf' if self.free else 'dense'}"
 
+    @property
+    def words(self) -> int:
+        """Words of a row's record (:func:`.row_metadata.record_words`): a free row's header, a dense row's two."""
+        return record_words(self.free)
+
+    @property
+    def registers(self) -> tuple[str, ...]:
+        """The visited row's record registers: ``rec_a`` (the header), and ``rec_b`` past it."""
+        return ("rec_a",) if self.free else ("rec_a", "rec_b")
+
     def word(self, row: str, word: int) -> str:
         """Word ``word`` of row ``row``'s record: the visited row's from its registers."""
         if row == self.VISITED:
+            if word >= self.words:
+                raise ValueError(f"a record of {self.words} words has no word {word}")
             return f"rec_{'ab'[word // 4]}.{'xyzw'[word % 4]}"
-        return record_word(row, word, self.records)
+        return record_word(row, word, self.records, self.words)
+
+    def load_record(self, names: tuple[str, ...], row: str, indent: str) -> str:
+        """Load row ``row``'s record into the ``int4`` locals ``names`` (one a header's, two a dense record's)."""
+        return load_row_record(names[0], names[1] if len(names) > 1 else None, row, self.records, indent, self.words)
 
     def visit(self, row: str = "i") -> str:
         """Declare the visited row's record registers for a loop that does not load them a row ahead."""
         if not self.record:
             return ""
-        return "int4 rec_a, rec_b;\n" + load_row_record("rec_a", "rec_b", row, self.records, "")
+        return f"int4 {', '.join(self.registers)};\n" + self.load_record(self.registers, row, "")
 
     def _source(self, name: str) -> str:
         source = self.STAGED[name]
@@ -214,6 +232,8 @@ class WorldRows:
         return Diagonal(lambda row: own if row == "i" else self.diag(row))
 
     def mu(self, row: str) -> str:
+        if self.free:
+            return f"world_row_mu.data[off_mf + {row}]"
         if self.record:
             return f"__int_as_float({self.word(row, 5)})"
         return self.staged("s_mu_dense", row)
@@ -1684,7 +1704,7 @@ def _record_load(rows: WorldRows, op, row: str, indent: str) -> str:
     """Load row ``row``'s record into the row loop's pipeline registers (``pre_a``, ``pre_b``), and, where the
     operator keeps the visited row's entries in registers (the free bodies'), this lane's entry of its ``Z``
     (``pre_z``)."""
-    text = load_row_record("pre_a", "pre_b", row, rows.records, indent)
+    text = rows.load_record(tuple(f"pre_{name[-1]}" for name in rows.registers), row, indent)
     if op.registers:
         text += f"\n{indent}if ({op.lanes.lane} < {op.width}) pre_z = {op.element(row, op.lanes.lane)};"
     return text
@@ -1694,7 +1714,7 @@ def _record_consume(rows: WorldRows, op, row: str, end: str, indent: str) -> str
     """Take row ``row``'s record (``rec_a``, ``rec_b``) and entry (``cur_z``) from the pipeline and load row
     ``row + 1``'s (before ``end``); a free row's header word decodes into its sides' coordinates and its fields
     (:func:`.row_metadata.unpack_mf_header`)."""
-    lines = [f"{indent}const int4 rec_a = pre_a;", f"{indent}const int4 rec_b = pre_b;"]
+    lines = [f"{indent}const int4 {name} = pre_{name[-1]};" for name in rows.registers]
     if op.registers:
         lines.append(f"{indent}float cur_z = pre_z;")
     lines += [
@@ -1714,7 +1734,7 @@ def _record_pipeline(rows: WorldRows, op, end: str) -> Pipelined:
     return Pipelined(
         end,
         lambda pad: (
-            f"{pad}int4 pre_a, pre_b;\n{pad}{z.format(pad=pad)}"
+            f"{pad}int4 {', '.join(f'pre_{name[-1]}' for name in rows.registers)};\n{pad}{z.format(pad=pad)}"
             f"if ({end} > 0) {{\n{_record_load(rows, op, '0', pad + '    ')}\n{pad}}}"
         ),
         lambda row, pad: _record_consume(rows, op, row, end, pad),

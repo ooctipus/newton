@@ -33,7 +33,7 @@ from . import host_index, packed_rows
 from .field_group import Field, FieldGroup, SolverArrays, fields_of
 from .row_kernels import RIGID_SPEED_ROWS
 from .row_laws import LINK_ROWS
-from .row_metadata import RECORD_WORDS, _validate_mf_metadata_encoding
+from .row_metadata import _validate_mf_metadata_encoding, record_layout
 from .row_records import DENSE_ROWS, ROW_RECORDS, RowSupport
 from .row_slots import place_world_contact_runs, record_world_contact_runs
 from .warm_start import ContactCarry, prepare_world_impulses
@@ -690,8 +690,9 @@ class Placement:
     def allocate_row_records(self, first: int, *, skip_rows: int = 0, speed_rows: bool = False) -> None:
         """Allocate the streamed rows' records (:data:`.row_records.ROW_RECORDS`) from the line's row ``first``, which
         the sweep's plan decides (``Sweep.build``: the dense rows' first where the sweep streams their metadata, else
-        the free bodies'). The rows' writers store them (:func:`.response_builds_rows.write_row_record`) in the worlds
-        the sweep visits: not those the tiers own (``skip_rows``, with the line's ``speed_rows``: the sweep's skip)."""
+        the free bodies'). A dense row's record is two ``int4``, a free row's its header (:func:`.row_metadata.record_layout`).
+        The rows' writers store them (:func:`.response_builds_rows.write_row_record`) in the worlds the sweep visits: not
+        those the tiers own (``skip_rows``, with the line's ``speed_rows``: the sweep's skip)."""
         self.record_first = int(first)
         rows = self.row_pitch - self.record_first
         free_rows = self.mf_max_constraints if self.free_contact_rows else 0
@@ -699,17 +700,13 @@ class Placement:
         if self.writes_records:
             _validate_mf_metadata_encoding(max(free_rows, self.body_base if self.record_first < self.body_base else 0))
         self.record_skip_rows, self.record_speed_rows = int(skip_rows), bool(speed_rows)
-        self.arrays.allocate(ROW_RECORDS, world=self.forest.world_count, record=RECORD_WORDS * max(rows, 1))
+        self.free_records, words = record_layout(self.record_first, self.body_base, self.row_pitch)
+        self.arrays.allocate(ROW_RECORDS, world=self.forest.world_count, record=max(words, 1))
 
     @property
     def writes_dense_records(self) -> bool:
         """Whether the one writer stores the dense rows' records (:meth:`allocate_row_records`)."""
         return self.writes_records and self.record_first < self.body_base
-
-    @property
-    def record_base(self) -> int:
-        """The free bodies' first record in a line's records (:meth:`allocate_row_records`)."""
-        return self.body_base - self.record_first
 
     def allocate_placeholders(self):
         """The operands of the features that are off."""

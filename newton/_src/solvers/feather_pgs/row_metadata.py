@@ -70,7 +70,37 @@ def unpack_mf_header(word: str, indent: str) -> str:
 
 
 RECORD_WORDS = 8
-"""Words of a row's record (:func:`pack_row_record`): two ``int4``, which a row loop loads a row ahead."""
+"""Words of a dense row's record (:func:`pack_row_record`): two ``int4``, which a row loop loads a row ahead."""
+
+HEADER_WORDS = 4
+"""Words of a free row's record: its header alone (:func:`pack_mf_header`), one ``int4``. A free row's sides are free
+bodies, six coordinates each by their class, so its record holds no widths; its friction coefficient is the line's
+(``row_mu``), which only its friction rows read."""
+
+
+def record_words(free: bool) -> int:
+    """Words of a row's record by its class: the header alone for a free row (:data:`HEADER_WORDS`), the header and its
+    sides' widths and friction coefficient for a dense one (:data:`RECORD_WORDS`)."""
+    return HEADER_WORDS if free else RECORD_WORDS
+
+
+def record_layout(first: int, base: int, pitch: int) -> tuple[int, int]:
+    """A line's records from its row ``first`` (the dense rows' first where their metadata streams, ``base`` where only
+    the free rows' stream, ``pitch`` where none): the free rows' first word (the dense rows' records before them,
+    :data:`RECORD_WORDS` each) and the line's words (then the free rows' records, :data:`HEADER_WORDS` each)."""
+    first, base, pitch = int(first), int(base), int(pitch)
+    dense = max(min(base, pitch) - first, 0)
+    free = max(pitch - max(first, base), 0)
+    return dense * RECORD_WORDS, dense * RECORD_WORDS + free * HEADER_WORDS
+
+
+def record_views(records, free_first: int):
+    """A host array of lines' records (``[lines, words]``) as the dense rows' (``[lines, rows, RECORD_WORDS]``) and the
+    free rows' (``[lines, rows, HEADER_WORDS]``) from the free rows' first word ``free_first`` (:func:`record_layout`)."""
+    lines = records.shape[0]
+    dense = records[:, :free_first].reshape(lines, -1, RECORD_WORDS)
+    free = records[:, free_first:].reshape(lines, -1, HEADER_WORDS)
+    return dense, free
 
 
 def validate_record_coordinates(max_world_dofs: int) -> None:
@@ -92,14 +122,15 @@ def pack_row_record(
     mu: str,
     indent: str,
 ) -> str:
-    """Store a row's record at the ``int`` pointer ``record``: everything a row loop reads of the row but its ``Z``
-    and its impulse, in two ``int4`` (:data:`RECORD_WORDS`).
+    """Store a dense row's record at the ``int`` pointer ``record``: everything a row loop reads of the row but its
+    ``Z`` and its impulse, in two ``int4`` (:data:`RECORD_WORDS`).
 
     The first is the header (:func:`pack_mf_header`): the first world coordinates of the row's sides ``dof_a`` and
     ``dof_b`` (-1 for no side), the bits of its stored diagonal (the class's form: the free bodies' inverse, the dense
     rows' ``A_ii``), of its right-hand side (the law's plus its incident velocity: its residual at ``du = 0``), and its
     kind and parent (0xFFFF for none). The second holds the sides' widths ``n_a`` and ``n_b`` (two 16-bit halves), the
-    bits of the row's friction coefficient and two zero words.
+    bits of the row's friction coefficient and two zero words. A free row's record is the first alone
+    (:func:`pack_row_header`).
     """
     return (
         pack_mf_header("record_a", dof_a, dof_b, diagonal, rhs, kind, parent, indent) + f"\n{indent}int4 record_b;\n"
@@ -112,14 +143,30 @@ def pack_row_record(
     )
 
 
-def record_word(row: str, word: int, base: str) -> str:
-    """Word ``word`` of row ``row``'s record, the records of its class from ``base`` (a native ``int`` offset)."""
-    return f"row_record.data[{base} + ({row}) * {RECORD_WORDS} + {word}]"
-
-
-def load_row_record(a: str, b: str, row: str, base: str, indent: str) -> str:
-    """Load row ``row``'s record into the ``int4`` locals ``a`` and ``b`` (the class's records from ``base``)."""
-    at = f"&row_record.data[{base} + ({row}) * {RECORD_WORDS}]"
+def pack_row_header(record: str, dof_a: str, dof_b: str, diagonal: str, rhs: str, kind: str, parent: str, indent: str):
+    """Store a free row's record at the ``int`` pointer ``record``: its header alone (:data:`HEADER_WORDS`,
+    :func:`pack_mf_header`)."""
     return (
-        f"{indent}{a} = *reinterpret_cast<const int4*>({at});\n{indent}{b} = *reinterpret_cast<const int4*>({at} + 4);"
+        pack_mf_header("record_a", dof_a, dof_b, diagonal, rhs, kind, parent, indent)
+        + f"\n{indent}*reinterpret_cast<int4*>({record}) = record_a;"
     )
+
+
+def record_word(row: str, word: int, base: str, words: int = RECORD_WORDS) -> str:
+    """Word ``word`` of row ``row``'s record, the records of its class (``words`` each) from ``base`` (a native ``int``
+    offset)."""
+    if not 0 <= word < words:
+        raise ValueError(f"a record of {words} words has no word {word}")
+    return f"row_record.data[{base} + ({row}) * {words} + {word}]"
+
+
+def load_row_record(a: str, b: str | None, row: str, base: str, indent: str, words: int = RECORD_WORDS) -> str:
+    """Load row ``row``'s record into the ``int4`` locals ``a`` and ``b`` (the class's records, ``words`` each, from
+    ``base``): a header's (``b`` None) into ``a`` alone."""
+    at = f"&row_record.data[{base} + ({row}) * {words}]"
+    text = f"{indent}{a} = *reinterpret_cast<const int4*>({at});"
+    if b is None:
+        if words != HEADER_WORDS:
+            raise ValueError("a record past its header loads both its words")
+        return text
+    return text + f"\n{indent}{b} = *reinterpret_cast<const int4*>({at} + 4);"

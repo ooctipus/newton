@@ -13,12 +13,12 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.friction_patches import link_patch_routes
-from newton._src.solvers.feather_pgs.row_metadata import RECORD_WORDS
 from newton._src.solvers.feather_pgs.row_kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_TORSION,
 )
+from newton._src.solvers.feather_pgs.row_metadata import record_views
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_sparse_scene as sparse_scene
 from newton.tests.feather_pgs_patch_parity import (
@@ -83,11 +83,15 @@ def _ring_pool_dropped(solver):
             placement.row_parent.assign(parents)
             if placement.writes_records:
                 records = placement.row_record.numpy()
-                words = records.reshape(records.shape[0], -1, RECORD_WORDS)
-                cut_rows = normals[: words.shape[0], placement.record_first : placement.record_first + words.shape[1]]
-                # The kind in the low half, no parent (0xFFFF) in the high half (row_metadata.pack_mf_header).
-                words[..., 3][cut_rows] = (words[..., 3][cut_rows] & 0xFFFF) | np.int32(-0x10000)
-                placement.row_record.assign(words.reshape(records.shape))
+                # The dense rows' records from record_first, the free rows' headers from body_base (record_layout).
+                first, base = placement.record_first, placement.body_base
+                for words, start in zip(
+                    record_views(records, placement.free_records), (first, max(first, base)), strict=True
+                ):
+                    cut_rows = normals[: words.shape[0], start : start + words.shape[1]]
+                    # The kind in the low half, no parent (0xFFFF) in the high half (row_metadata.pack_mf_header).
+                    words[..., 3][cut_rows] = (words[..., 3][cut_rows] & 0xFFFF) | np.int32(-0x10000)
+                placement.row_record.assign(records)
         return result
 
     with mock.patch.object(wp, "launch", cut):

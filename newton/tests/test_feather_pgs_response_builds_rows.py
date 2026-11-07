@@ -12,9 +12,9 @@ import warp as wp
 
 from newton._src.core.memory import Place
 from newton._src.solvers.feather_pgs.row_metadata import (
-    RECORD_WORDS,
     _validate_mf_metadata_encoding,
     pack_mf_header,
+    record_views,
     unpack_mf_header,
 )
 from newton.tests.feather_pgs_law_harness import unpacked_rows, walk_inverse
@@ -72,7 +72,7 @@ class TestFreeBodyRowsBuild(unittest.TestCase):
         rows = int(p.constraint_count.numpy()[0])
         self.assertGreater(rows, 0, "the box must touch the ground")
         line = int(p.dense_first.numpy()[0])
-        record = p.row_record.numpy()[line].reshape(-1, RECORD_WORDS)[: rows - p.record_first]
+        record = record_views(p.row_record.numpy(), p.free_records)[0][line][: rows - p.record_first]
         offset = p.forest.articulation_world_dof_offset.numpy()
         dofs = p.forest.articulation_response_dof_count.numpy()
         sides = p.row_sides.numpy()[line, p.record_first : rows]

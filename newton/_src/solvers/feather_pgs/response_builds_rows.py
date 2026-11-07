@@ -19,7 +19,7 @@ from __future__ import annotations
 import warp as wp
 
 from .device_preludes import CPU_MATH, dual_native
-from .row_metadata import RECORD_WORDS, pack_row_record
+from .row_metadata import HEADER_WORDS, RECORD_WORDS, pack_row_header, pack_row_record
 from .row_records import DenseRows
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -38,7 +38,8 @@ from .row_records import DenseRows
 class RowRecords:
     """Where a line's rows' records sit (:data:`.row_records.ROW_RECORDS`) and which worlds' a sweep reads: the records
     (``record``, a line's from its row ``first``; ``first`` the line's pitch where no row has one), the free bodies'
-    first row (``base``: their records keep the inverse of their diagonal and count their parents from it), the
+    first row (``base``: their records are headers from the line's word ``free``, keep the inverse of their diagonal
+    and count their parents from it, :func:`.row_metadata.record_layout`), the
     sweep's skip of the tiers' worlds (``skip_rows``, with the line's ``speed`` rows from ``speed_first``, and each
     world's free bodies' rows ``mf_count``: :func:`swept`), and each articulation's first world coordinate and response
     coordinates (``offset``, ``dofs``: a row's sides as the record holds them)."""
@@ -46,6 +47,7 @@ class RowRecords:
     record: wp.array2d[wp.int32]
     first: int
     base: int
+    free: int
     skip_rows: int
     speed: int
     mf_count: wp.array[int]
@@ -78,6 +80,24 @@ def store_row_record(
 
 
 @wp.func_native(
+    dual_native(
+        pack_row_header("&record.data[at]", "dof_a", "dof_b", "inverse", "rhs", "kind", "parent", "    "),
+        preludes=(CPU_MATH,),
+    )
+)
+def store_row_header(
+    record: wp.array2d[wp.int32],
+    at: int,
+    dof_a: int,
+    dof_b: int,
+    inverse: float,
+    rhs: float,
+    kind: int,
+    parent: int,
+): ...
+
+
+@wp.func_native(
     """    // The kind and parent word's high half (pack_mf_header: the parent above the kind), stored alone: no read of
     // the kind, which the row's writer stored (little-endian on both devices).
     reinterpret_cast<unsigned short*>(&record.data[at + 3])[1] = static_cast<unsigned short>(parent);
@@ -88,10 +108,14 @@ def store_parent_word(record: wp.array2d[wp.int32], at: int, parent: int): ...
 
 @wp.func
 def record_at(records: RowRecords, line: int, slot: int) -> int:
-    """The flat index of row ``slot``'s record in line ``line``'s records (-1 for a row without one)."""
+    """The flat index of row ``slot``'s record in line ``line``'s records (-1 for a row without one): a dense row's of
+    :data:`.row_metadata.RECORD_WORDS` words, a free row's header from ``free``."""
     if slot < records.first:
         return -1
-    return line * records.record.shape[1] + (slot - records.first) * RECORD_WORDS
+    at = line * records.record.shape[1]
+    if slot >= records.base:
+        return at + records.free + (slot - records.base) * HEADER_WORDS
+    return at + (slot - records.first) * RECORD_WORDS
 
 
 @wp.func
@@ -109,36 +133,39 @@ def swept(records: RowRecords, world: int, count: int) -> bool:
 @wp.func
 def write_row_record(records: RowRecords, rows: DenseRows, incident: float, line: int, slot: int):
     """Store row ``slot``'s record (:func:`.row_metadata.pack_row_record`) from the row as its writer left it: its sides'
-    first world coordinates and widths, its diagonal (a free body's row its inverse, cached for its step's form of the
-    law), its residual at ``du = 0`` (rhs plus ``incident``), kind, parent (a free body's row's from ``base``, as the
-    sweeps stage the free bodies' rows) and friction coefficient. A row before ``first`` has none."""
+    first world coordinates and widths, its diagonal, its residual at ``du = 0`` (rhs plus ``incident``), kind, parent
+    and friction coefficient. A free row's is its header (:func:`.row_metadata.pack_row_header`): its sides' widths are
+    its class's, its coefficient the line's; it keeps the inverse of its diagonal, cached for its step's form of the
+    law, and its parent from ``base``, as the sweeps stage the free bodies' rows. A row before ``first`` has none."""
     at = record_at(records, line, slot)
     if at < 0:
         return
     sides = rows.sides[line, slot]
     dof_a = int(-1)
     dof_b = int(-1)
-    n_a = int(0)
-    n_b = int(0)
     if sides[0] >= 0:
         dof_a = records.offset[sides[0]]
-        n_a = records.dofs[sides[0]]
     if sides[1] >= 0:
         dof_b = records.offset[sides[1]]
-        n_b = records.dofs[sides[1]]
     diagonal = rows.diag[line, slot]
     parent = rows.row_parent[line, slot]
+    rhs = rows.rhs[line, slot] + incident
+    kind = rows.row_type[line, slot]
     if slot >= records.base:
         inverse = float(0.0)
         if diagonal > 0.0:
             inverse = 1.0 / diagonal
-        diagonal = inverse
         if parent >= 0:
             parent = parent - records.base
-    store_row_record(
-        records.record, at, dof_a, dof_b, n_a, n_b, diagonal, rows.rhs[line, slot] + incident,
-        rows.row_type[line, slot], parent, rows.row_mu[line, slot],
-    )  # fmt: skip
+        store_row_header(records.record, at, dof_a, dof_b, inverse, rhs, kind, parent)
+        return
+    n_a = int(0)
+    n_b = int(0)
+    if sides[0] >= 0:
+        n_a = records.dofs[sides[0]]
+    if sides[1] >= 0:
+        n_b = records.dofs[sides[1]]
+    store_row_record(records.record, at, dof_a, dof_b, n_a, n_b, diagonal, rhs, kind, parent, rows.row_mu[line, slot])
 
 
 @wp.func
@@ -158,6 +185,7 @@ def no_row_records() -> RowRecords:
     """Records of a store that has none: no row is past ``first`` (a link outside a solver's step)."""
     records = RowRecords()
     records.first = 1 << 30
+    records.base = 1 << 30
     return records
 
 
@@ -167,6 +195,7 @@ def bind_row_records(placement) -> RowRecords:
     records.record = placement.row_record
     records.first = int(placement.record_first) if placement.writes_records else int(placement.row_pitch)
     records.base = int(placement.body_base)
+    records.free = int(placement.free_records)
     records.skip_rows = int(placement.record_skip_rows)
     records.speed = int(placement.record_speed_rows)
     records.mf_count = placement.mf_constraint_count

@@ -18,7 +18,7 @@ from newton._src.core.memory import Place
 from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.factor.walk import unpack_walk_records
 from newton._src.solvers.feather_pgs.row_kernels import PGS_CONSTRAINT_TYPE_SPEED
-from newton._src.solvers.feather_pgs.row_metadata import RECORD_WORDS
+from newton._src.solvers.feather_pgs.row_metadata import HEADER_WORDS, record_layout
 from newton._src.solvers.feather_pgs.sweep import sweep_kernel
 from newton.tests.feather_pgs_law_harness import chain_walk, free_body_Z
 
@@ -57,13 +57,12 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
     return tuple(jacobians)
 
 
-def _pack(dof_a: int, inverse: float, rhs: float, kind: int, parent: int, mu: float) -> tuple[int, ...]:
-    """A free-body row's record (:func:`.row_metadata.pack_row_record`): its body's first coordinate (``dof_b`` none), the
-    bits of its stored inverse diagonal and right-hand side, its type and its parent (0xFFFF for none), its sides'
-    widths (six, none) and the bits of its friction coefficient."""
+def _pack(dof_a: int, inverse: float, rhs: float, kind: int, parent: int) -> tuple[int, ...]:
+    """A free-body row's record (:func:`.row_metadata.pack_row_header`): its body's first coordinate (``dof_b`` none), the
+    bits of its stored inverse diagonal and right-hand side, its type and its parent (0xFFFF for none)."""
     word = np.uint32(((int(parent) & 0xFFFF) << 16) | int(kind)).view(np.int32)
-    as_int = np.array((inverse, rhs, mu), np.float32).view(np.int32)
-    return (dof_a << 16) | 0xFFFF, int(as_int[0]), int(as_int[1]), int(word), 6, int(as_int[2]), 0, 0
+    as_int = np.array((inverse, rhs), np.float32).view(np.int32)
+    return (dof_a << 16) | 0xFFFF, int(as_int[0]), int(as_int[1]), int(word)
 
 
 def sweep_free_body_rows(
@@ -84,11 +83,11 @@ def sweep_free_body_rows(
     diag = np.sum(Z.astype(np.float64) ** 2, axis=1)
     inverse = np.where(diag > 0.0, 1.0 / np.where(diag > 0.0, diag, 1.0), 0.0)
     # The line's records from row 0 (the dense rows' metadata streams), the free bodies' from the dense capacity.
-    words = RECORD_WORDS
-    records = np.zeros((1, (dense + capacity) * words), np.int32)
+    free, words = record_layout(0, dense, dense + capacity)
+    records = np.zeros((1, words), np.int32)
     for row in range(rows):
-        at = (dense + row) * words
-        records[0, at : at + words] = _pack(0, inverse[row], rhs[row], types[row], parents[row], mu[row])
+        at = free + row * HEADER_WORDS
+        records[0, at : at + HEADER_WORDS] = _pack(0, inverse[row], rhs[row], types[row], parents[row])
     # The line's packed rows (six entries: the body's coordinates), the free bodies' from the dense capacity.
     packed = np.zeros((1, dense + capacity, 6), np.float32)
     packed[0, dense : dense + rows] = Z

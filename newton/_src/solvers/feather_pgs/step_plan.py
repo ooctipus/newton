@@ -735,7 +735,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
             placement.dense_first,
             placement.mf_contact_rows_end,
             placement.row_record,
-            placement.body_base - placement.record_first,
+            placement.free_records,
             placement.packed_Z,
             placement.row_mu,
             placement.row_w,

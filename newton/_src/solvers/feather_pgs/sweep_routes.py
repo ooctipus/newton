@@ -23,9 +23,9 @@ from .packed_rows import PACKED_SIDES, RECORD_SIDES
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_metadata import (
-    RECORD_WORDS,
     _validate_dense_metadata_encoding,
     _validate_mf_metadata_encoding,
+    record_layout,
     validate_record_coordinates,
 )
 from .solve_policy import QUIET_LITERAL, block_argmax, sweep_exit
@@ -893,11 +893,10 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     )
     # The streamed rows' records (row_record): the line's from its first streamed row, the dense rows' where theirs
     # stream, then the free bodies' (Sweep.build allocates them alike, Placement.allocate_row_records).
-    first_record = record_first(M_D, places)
-    line_records, free_records = (P - first_record) * RECORD_WORDS, (M_D - first_record) * RECORD_WORDS
+    free_records, line_records = record_layout(record_first(M_D, places), M_D, P)
     records = f"    const int off_rec_mf = line * {line_records} + {free_records};"
     if dense.record:
-        records = f"    const int off_rec_dense = line * {P * RECORD_WORDS};\n" + records
+        records = f"    const int off_rec_dense = line * {line_records};\n" + records
     # The way back after the sweeps: the change in the walk's coordinates to the step's one leave (WalkTrees.du,
     # factor.walk.walk_leave_kernel).
     # The free bodies' run's rows (free_rows): their count, impulses' staging and publication.
