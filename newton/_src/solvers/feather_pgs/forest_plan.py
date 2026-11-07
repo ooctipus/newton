@@ -51,7 +51,7 @@ BODY_MAPS = FieldGroup(
 """Each body's tree joint, articulation, response presence, low-32 response support and single response DOF."""
 
 
-__all__ = ["ForestPlan", "RowLaw", "TopologyPin", "WorldClass", "joint_forest", "row_support"]
+__all__ = ["ClassShape", "ForestPlan", "RowLaw", "TopologyPin", "WorldClass", "joint_forest", "row_support"]
 
 
 NUMERIC_PROPERTIES = (
@@ -124,6 +124,27 @@ class WorldClass:
     """The row laws present in each member world."""
     worlds: np.ndarray
     """The member worlds, ascending."""
+
+
+@dataclass(frozen=True, eq=False)
+class ClassShape:
+    """Each world's responding articulations as blocks, a block a size group (descending), one articulation a world."""
+
+    sizes: tuple[int, ...]
+    free: tuple[bool, ...]
+    arts: np.ndarray | None
+    """``(world, block)``: each world's articulation, ``-1`` for none; ``None`` where a world holds two of one size."""
+    groups: np.ndarray | None
+    offsets: tuple[int | None, ...]
+    """Each block's first world coordinate, ``None`` where its articulations differ."""
+    coordinates: int
+
+    @property
+    def blocks(self) -> int:
+        return len(self.sizes)
+
+    def present(self, block: int) -> bool:
+        return self.arts is not None and bool(np.all(self.arts[:, block] >= 0))
 
 
 def joint_forest(model: Model) -> TreePlan:
@@ -228,6 +249,7 @@ class ForestPlan:
     """Each world's class among :attr:`world_classes`."""
     world_classes: tuple[WorldClass, ...]
     """The world classes, by their first world."""
+    shape: ClassShape
 
     # Size groups.
     size_groups: list
@@ -304,6 +326,7 @@ class ForestPlan:
         _mass_schedules(plan, model)
         _world_size_groups(plan, model)
         _world_response_mapping(plan, model)
+        _class_shape(plan)
         return cls(**vars(plan))
 
 
@@ -850,6 +873,22 @@ def _world_response_mapping(plan, model):
     plan.articulation_world_dof_offset = wp.array(articulation_world_dof_offset, dtype=wp.int32, device=model.device)
     plan.world_dof_count = wp.array(world_dof_count, dtype=wp.int32, device=model.device)
     plan.world_dof_indices = wp.array(padded_indices, dtype=wp.int32, device=model.device)
+
+
+def _class_shape(plan):
+    sizes = tuple(int(size) for size in plan.size_groups)
+    arts = np.full((plan.world_count, len(sizes)), -1, dtype=np.int32)
+    groups, offsets, world_offset = arts.copy(), [], plan.articulation_world_dof_offset.numpy()
+    for block, size in enumerate(sizes):
+        members = plan.group_to_art_host[size]
+        worlds, offset = plan.articulation_world[members], world_offset[members]
+        if np.unique(worlds).size != worlds.size:
+            arts = groups = None
+        if arts is not None:
+            arts[worlds, block], groups[worlds, block] = members, np.arange(members.size)
+        offsets.append(int(offset[0]) if np.all(offset == offset[0]) else None)
+    free = tuple(size in plan.free_body_inertia_sizes for size in sizes)
+    plan.shape = ClassShape(sizes, free, arts, groups, tuple(offsets), int(plan.max_world_dofs))
 
 
 def row_support(

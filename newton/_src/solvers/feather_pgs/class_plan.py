@@ -186,26 +186,16 @@ def general_reason(pins) -> str | None:
     )
 
 
-def _world_diagonal_pairs(
-    articulation_world: np.ndarray, response_dof_count: np.ndarray, world_count: int, diagonal_sizes: frozenset[int]
-) -> tuple[np.ndarray, np.ndarray] | None:
-    """Split each world's two response articulations into the one whose size is in ``diagonal_sizes`` and the other.
-
-    Returns:
-        ``(diagonal, dense)`` articulation indices per world, or ``None`` unless every
-        world has exactly two response articulations, exactly one of them diagonal.
-    """
-    articulations = np.flatnonzero(response_dof_count > 0)
-    bounds, order = host_index.group_by(articulation_world[articulations], world_count)
-    if np.any(np.diff(bounds) != 2):
+def _world_diagonal_pairs(shape, diagonal_sizes: frozenset[int]) -> tuple[np.ndarray, np.ndarray] | None:
+    """Each world's articulation whose size is in ``diagonal_sizes`` and its other one, or ``None`` unless every world
+    holds exactly two, one of them diagonal."""
+    if shape.arts is None:
         return None
-    # Each world's pair, in ascending articulation order.
-    pairs = articulations[order].reshape(world_count, 2)
-    diagonal = np.isin(response_dof_count[pairs], list(diagonal_sizes))
-    if np.any(diagonal.sum(axis=1) != 1):
+    held, diagonal = shape.arts >= 0, np.isin(shape.sizes, list(diagonal_sizes))
+    if np.any(held.sum(axis=1) != 2) or np.any((held & diagonal).sum(axis=1) != 1):
         return None
-    first_diagonal = diagonal[:, 0]
-    return np.where(first_diagonal, pairs[:, 0], pairs[:, 1]), np.where(first_diagonal, pairs[:, 1], pairs[:, 0])
+    worlds = np.arange(shape.arts.shape[0])
+    return shape.arts[worlds, (held & diagonal).argmax(axis=1)], shape.arts[worlds, (held & ~diagonal).argmax(axis=1)]
 
 
 def _fused_diagonal_limits(inputs: ClassInputs) -> tuple[frozenset[int], np.ndarray]:
@@ -227,7 +217,7 @@ def _fused_diagonal_limits(inputs: ClassInputs) -> tuple[frozenset[int], np.ndar
     if not candidate_sizes:
         return frozenset(), mask
     response_dof_count = forest.response_dof_count
-    pairs = _world_diagonal_pairs(forest.articulation_world, response_dof_count, forest.world_count, candidate_sizes)
+    pairs = _world_diagonal_pairs(forest.shape, candidate_sizes)
     if pairs is None:
         return frozenset(), mask
     diagonal_articulations, dense_articulations = pairs
@@ -255,7 +245,7 @@ def diagonal_rule(inputs: ClassInputs) -> tuple[Diagonal | None, str]:
         return None, missing
     response_dofs = forest.response_dof_count
     is_free_rigid = forest.is_free_rigid_host
-    pairs = _world_diagonal_pairs(forest.articulation_world, response_dofs, forest.world_count, fused_sizes)
+    pairs = _world_diagonal_pairs(forest.shape, fused_sizes)
     if pairs is None or forest.world_count == 0:
         return None, missing
     diagonal_arts, dense_arts = pairs
@@ -547,91 +537,50 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
 
 
 def paired_rule(inputs: ClassInputs) -> tuple[Paired | None, str]:
-    """Case K5, a tree beside one free body: one complete robot/free-body response pair per world, the tree of
-    :data:`_PAIRED_MIN_DOF` to 26 coordinates and no star, in a class of more than :data:`_PAIRED_MIN_ROWS` rows."""
-    forest = inputs.forest
+    """Case K5, a tree beside one free body: every world pairs one tree of :data:`_PAIRED_MIN_DOF` to 26 coordinates
+    and no star with one free body, in a class of more than :data:`_PAIRED_MIN_ROWS` rows."""
+    forest, shape = inputs.forest, inputs.forest.shape
     missing = f"No world pairs one tree of {_PAIRED_MIN_DOF} to 26 coordinates with exactly one free body."
-    if 6 not in forest.size_groups:
+    if not (shape.blocks == 2 and shape.present(0) and shape.present(1) and shape.free.count(True) == 1):
         return None, missing
-    candidate_sizes = frozenset(
-        size
-        for size in forest.size_groups
-        if size >= _PAIRED_MIN_DOF
-        and size + 6 <= 32
-        and size not in forest.diagonal_mass_sizes
-        and inputs.dense_rows > _PAIRED_MIN_ROWS
-    )
-    response_dofs = forest.response_dof_count
-    articulation_world = forest.articulation_world
-    is_free_rigid = forest.is_free_rigid_host
-    # Each world's response articulations, in ascending order.
-    responding = np.flatnonzero(response_dofs > 0)
-    world_bounds, order = host_index.group_by(articulation_world[responding], forest.world_count)
-    responding = responding[order].tolist()
-    response_by_world = [responding[world_bounds[w] : world_bounds[w + 1]] for w in range(forest.world_count)]
-
-    secondary_group_arts = forest.group_to_art_host[6]
-    secondary_group_index = {int(art): group for group, art in enumerate(secondary_group_arts)}
-    for primary_size in sorted(candidate_sizes, reverse=True):
-        primary_arts = forest.group_to_art_host.get(primary_size, ())
-        if len(primary_arts) != forest.world_count:
-            continue
-        paired_groups: list[int] = []
-        paired_arts: list[int] = []
-        for primary_art in primary_arts:
-            world_arts = response_by_world[int(articulation_world[primary_art])]
-            secondaries = [
-                art for art in world_arts if art != primary_art and response_dofs[art] == 6 and is_free_rigid[art] != 0
-            ]
-            if len(world_arts) != 2 or len(secondaries) != 1:
-                break
-            secondary_art = secondaries[0]
-            paired_arts.append(secondary_art)
-            paired_groups.append(secondary_group_index[secondary_art])
-        else:
-            if len(set(paired_arts)) == len(secondary_group_arts) and set(paired_arts) == set(secondary_group_arts):
-                return Paired(primary_size, 6, np.asarray(paired_groups, dtype=np.int32)), None
-    return None, missing
+    tree, body = shape.free.index(False), shape.free.index(True)
+    size = shape.sizes[tree]
+    if size < _PAIRED_MIN_DOF or shape.coordinates > 32 or size in forest.diagonal_mass_sizes:
+        return None, missing
+    if inputs.dense_rows <= _PAIRED_MIN_ROWS:
+        return None, missing
+    # Each tree's free body's group, by the tree's group.
+    groups = np.empty(forest.world_count, dtype=np.int32)
+    groups[shape.groups[:, tree]] = shape.groups[:, body]
+    return Paired(size, shape.sizes[body], groups), None
 
 
-def tier_response(forest) -> tuple[tuple[int, int, int, int] | None, np.ndarray | None, str]:
+def tier_response(shape) -> tuple[tuple[int, int, int, int] | None, np.ndarray | None, str]:
     """The in-kernel response's group sizes and offsets ``(NA, NB, OA, OB)`` and each world's trees, or ``None``,
     and why.
 
-    The parallel tiers walk the rows of up to two size groups, one articulation of each size per world with a
-    primary in every world, at one world DOF offset per size when the response is written in world layout: the meta
-    holds each world's articulation of each size and its first world coordinate (``-1`` for none).
+    The parallel tiers walk the rows of up to two blocks of the class shape, one articulation of each per world with a
+    primary in every world, at one world DOF offset per block when the response is written in world layout: the meta
+    holds each world's articulation of each block and its first world coordinate (``-1`` for none).
     """
-    if forest.art_to_world is None:
-        return None, None, "No articulation->world map."
-    if not (1 <= len(forest.size_groups) <= 2):
-        return None, None, f"{len(forest.size_groups)} size groups; the in-kernel response takes one or two."
-    sizes = sorted((int(s) for s in forest.size_groups), reverse=True)
-    if sizes[0] > _INKERNEL_MAX_DOF:
-        return None, None, f"Size {sizes[0]} exceeds the tiers' {_INKERNEL_MAX_DOF} coordinates a row."
-    art_to_world = forest.art_to_world.numpy()
-    dof_off = forest.articulation_world_dof_offset.numpy()
-    meta = -np.ones((forest.world_count, 4), dtype=np.int32)
-    offsets = [0, 0]
-    for col, size in enumerate(sizes):
-        g2a = forest.group_to_art[size].numpy()
-        worlds = art_to_world[g2a]
-        if np.unique(worlds).size != worlds.size:
-            return None, None, f"A world has several articulations of size {size}."
-        # The rows lie at their world coordinates (the packed rows' dense layout).
-        off = dof_off[g2a]
-        if off.size and np.any(off != off[0]):
-            # The register rows use compile-time offsets.
-            return None, None, f"The world DOF offsets of size {size} differ."
-        offsets[col] = int(off[0]) if off.size else 0
-        meta[worlds, 2 * col] = g2a
-        meta[worlds, 2 * col + 1] = off
-    if np.any(meta[:, 0] < 0):
+    if not 1 <= shape.blocks <= 2:
+        return None, None, f"{shape.blocks} size groups; the in-kernel response takes one or two."
+    if shape.sizes[0] > _INKERNEL_MAX_DOF:
+        return None, None, f"Size {shape.sizes[0]} exceeds the tiers' {_INKERNEL_MAX_DOF} coordinates a row."
+    if shape.arts is None:
+        return None, None, "A world has several articulations of one size."
+    if None in shape.offsets:
+        # The register rows use compile-time offsets.
+        return None, None, "The world DOF offsets of a size differ."
+    if not shape.present(0):
         return None, None, "A world has no primary articulation."
-    nb = sizes[1] if len(sizes) > 1 else 0
-    if offsets[0] + sizes[0] > forest.max_world_dofs or (nb and offsets[1] + nb > forest.max_world_dofs):
+    (na, nb), (oa, ob) = (*shape.sizes, 0)[:2], (*shape.offsets, 0)[:2]
+    if oa + na > shape.coordinates or (nb and ob + nb > shape.coordinates):
         return None, None, "The group DOFs exceed the world DOF count."
-    return (sizes[0], nb, offsets[0], offsets[1]), meta, f"The parallel tiers walk the rows of sizes {sizes}."
+    meta = -np.ones((shape.arts.shape[0], 4), dtype=np.int32)
+    meta[:, 0 : 2 * shape.blocks : 2] = shape.arts
+    meta[:, 1 : 2 * shape.blocks : 2] = np.where(shape.arts >= 0, shape.offsets, -1)
+    return (na, nb, oa, ob), meta, f"The parallel tiers walk the rows of sizes {list(shape.sizes)}."
 
 
 def tier_rule(inputs: ClassInputs) -> tuple[Tiers | None, str]:
@@ -663,7 +612,7 @@ def tier_rule(inputs: ClassInputs) -> tuple[Tiers | None, str]:
     )
     if reason is not None:
         return None, reason
-    sizes, meta, reason = tier_response(forest)
+    sizes, meta, reason = tier_response(forest.shape)
     if sizes is None:
         return None, reason
     rows = min(int(inputs.dense_rows), int(pinned or TIER_MAX_ROWS))

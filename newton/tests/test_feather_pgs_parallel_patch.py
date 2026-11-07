@@ -34,6 +34,7 @@ from newton._src.solvers.feather_pgs import sweep as emitter
 from newton._src.solvers.feather_pgs.device_preludes import RING
 from newton._src.solvers.feather_pgs.factor.kernels import prescale_joint_velocity_limits
 from newton._src.solvers.feather_pgs.factor.walk import WALK_LINK, WalkTrees, pack_walk_records, release_view
+from newton._src.solvers.feather_pgs.forest_plan import ClassShape
 from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.placement import Placement
@@ -1256,14 +1257,18 @@ class TestTierRule(unittest.TestCase):
             pins=SolverFeatherPGS.Pins(),
             dense_rows=192,
             forest=SimpleNamespace(
-                world_count=4, max_world_dofs=22, has_free_rigid_bodies=True, has_non_free_articulations=True
+                world_count=4,
+                max_world_dofs=22,
+                has_free_rigid_bodies=True,
+                has_non_free_articulations=True,
+                shape=None,
             ),
         )
         for name, value in changes.items():
             setattr(inputs, name, value)
         sizes, reason = response
         meta = None if sizes is None else np.zeros((4, 4), np.int32)
-        with patch.object(class_plan, "tier_response", lambda forest: (sizes, meta, reason)):
+        with patch.object(class_plan, "tier_response", lambda shape: (sizes, meta, reason)):
             return class_plan.tier_rule(inputs)
 
     def test_a_tree_beside_a_body_takes_the_tiers(self):
@@ -1280,7 +1285,11 @@ class TestTierRule(unittest.TestCase):
             (
                 {
                     "forest": SimpleNamespace(
-                        world_count=4, max_world_dofs=0, has_free_rigid_bodies=True, has_non_free_articulations=True
+                        world_count=4,
+                        max_world_dofs=0,
+                        has_free_rigid_bodies=True,
+                        has_non_free_articulations=True,
+                        shape=None,
                     )
                 },
                 "No matrix-free sweep",
@@ -1288,7 +1297,11 @@ class TestTierRule(unittest.TestCase):
             (
                 {
                     "forest": SimpleNamespace(
-                        world_count=4, max_world_dofs=22, has_free_rigid_bodies=False, has_non_free_articulations=True
+                        world_count=4,
+                        max_world_dofs=22,
+                        has_free_rigid_bodies=False,
+                        has_non_free_articulations=True,
+                        shape=None,
                     )
                 },
                 "case K4",
@@ -1296,7 +1309,11 @@ class TestTierRule(unittest.TestCase):
             (
                 {
                     "forest": SimpleNamespace(
-                        world_count=4, max_world_dofs=22, has_free_rigid_bodies=True, has_non_free_articulations=False
+                        world_count=4,
+                        max_world_dofs=22,
+                        has_free_rigid_bodies=True,
+                        has_non_free_articulations=False,
+                        shape=None,
                     )
                 },
                 "case K4",
@@ -1325,10 +1342,38 @@ class TestTierRule(unittest.TestCase):
     def test_a_pin_builds_the_tiers_on_a_single_tree(self):
         """Build the tiers a test pin asks for on a class whose response they form, at the pinned bound."""
         forest = SimpleNamespace(
-            world_count=4, max_world_dofs=22, has_free_rigid_bodies=False, has_non_free_articulations=True
+            world_count=4, max_world_dofs=22, has_free_rigid_bodies=False, has_non_free_articulations=True, shape=None
         )
         choice, _ = self._rule(forest=forest, pins=SolverFeatherPGS.Pins(tiers=32))
         self.assertEqual((choice.rows, choice.sizes), (32, (16, 6, 0, 16)))
+
+
+# Four worlds, each a ``tree``-coordinate tree (groups in reverse world order) beside one free body.
+def _shape(tree, *, several=False):
+    arts = np.stack((np.arange(4), 4 + np.arange(4)), axis=1).astype(np.int32)
+    groups = np.stack((np.arange(4)[::-1], np.arange(4)), axis=1).astype(np.int32)
+    return ClassShape((tree, 6), (False, True), *((None, None) if several else (arts, groups)), (0, tree), tree + 6)
+
+
+class TestClassShape(unittest.TestCase):
+    """Read the class rules' trees of one shape from the forest's class shape."""
+
+    def test_tier_response(self):
+        sizes, meta, _ = class_plan.tier_response(_shape(16))
+        self.assertEqual(sizes, (16, 6, 0, 16))
+        np.testing.assert_array_equal(meta, np.stack((np.arange(4), [0] * 4, 4 + np.arange(4), [16] * 4), axis=1))
+        self.assertIsNone(class_plan.tier_response(_shape(16, several=True))[0])
+
+    def test_paired(self):
+        forest = SimpleNamespace(world_count=4, diagonal_mass_sizes=frozenset())
+        for tree, several, groups in ((23, False, [3, 2, 1, 0]), (23, True, None), (27, False, None)):
+            with self.subTest(tree=tree, several=several):
+                forest.shape = _shape(tree, several=several)
+                choice, _ = class_plan.paired_rule(SimpleNamespace(forest=forest, dense_rows=192))
+                if groups is None:
+                    self.assertIsNone(choice)
+                else:
+                    np.testing.assert_array_equal(choice.groups, groups)
 
 
 def _dummy(arg):

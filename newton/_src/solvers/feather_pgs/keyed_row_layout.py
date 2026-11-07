@@ -54,17 +54,18 @@ class KeyedLayout:
 
 
 def topology_plan(solver):
-    """Derive uniform block offsets and supported velocity DOFs from the model: the layout, then each world's group
-    index, first coordinate and articulation of each size."""
+    """Derive uniform block offsets and supported velocity DOFs from the class shape: the layout, then each world's
+    group index, first coordinate and articulation of each block."""
     if solver.factor.eliminates:
         # The tiers walk keyed rows anew, without the one writer's closure of the bilateral blocks.
         raise ValueError("keyed rows take no bilateral pre-elimination")
-    sizes = sorted((int(n) for n in solver.forest.size_groups), reverse=True)
-    if not 1 <= len(sizes) <= 2 or sum(sizes) != solver.forest.max_world_dofs:
+    shape = solver.forest.shape
+    if not 1 <= shape.blocks <= 2 or sum(shape.sizes) != shape.coordinates:
         raise ValueError("keyed rows require at most two complete uniform size groups")
-    worlds = solver.forest.art_to_world.numpy()
-    offsets = solver.forest.articulation_world_dof_offset.numpy()
-    starts = solver.forest.articulation_dof_start.numpy()
+    if solver.laws.mimic_count:
+        # The prefix keys a coordinate's limit rows; a mimic row spans two coordinates (the one writer's mimic family).
+        raise ValueError("keyed rows key no mimic row")
+    starts = solver.forest.articulation_dof_start_host
     groups = np.zeros((solver.forest.world_count, 2), dtype=np.int32)
     dof_starts = np.zeros_like(groups)
     arts_by_world = np.full_like(groups, -1)
@@ -73,23 +74,18 @@ def topology_plan(solver):
     art_joint = model.articulation_start.numpy()
     joint_dof = model.joint_qd_start.numpy()
     joint_type = model.joint_type.numpy()
-    if solver.laws.mimic_count:
-        # The prefix keys a coordinate's limit rows; a mimic row spans two coordinates (the one writer's mimic family).
-        raise ValueError("keyed rows key no mimic row")
     velocity_mask, position_mask = 0, 0
     q_index = solver.laws.joint_limit_q_index_host
-    for column, size in enumerate(sizes):
-        arts = solver.forest.group_to_art[size].numpy()
-        if len(arts) != solver.forest.world_count or not np.array_equal(
-            np.sort(worlds[arts]), np.arange(solver.forest.world_count)
-        ):
+    for column, size in enumerate(shape.sizes):
+        if not shape.present(column):
             raise ValueError("keyed rows require exactly one articulation of each size per world")
-        if np.any(offsets[arts] != offsets[arts[0]]):
+        if shape.offsets[column] is None:
             raise ValueError("keyed rows require uniform coordinate offsets")
-        block_offsets[column] = int(offsets[arts[0]])
-        groups[worlds[arts], column] = np.arange(len(arts), dtype=np.int32)
-        dof_starts[worlds[arts], column] = starts[arts]
-        arts_by_world[worlds[arts], column] = arts
+        arts = shape.arts[:, column]
+        block_offsets[column] = shape.offsets[column]
+        groups[:, column] = shape.groups[:, column]
+        dof_starts[:, column] = starts[arts]
+        arts_by_world[:, column] = arts
         masks, position_masks = set(), set()
         for art in arts:
             position_masks.add(
@@ -116,8 +112,8 @@ def topology_plan(solver):
         velocity_mask |= masks.pop()
         position_mask |= position_masks.pop()
     layout = KeyedLayout(
-        sizes[0],
-        sizes[1] if len(sizes) == 2 else 0,
+        shape.sizes[0],
+        shape.sizes[1] if shape.blocks == 2 else 0,
         *block_offsets,
         solver.spec.classes.tier_rows,
         solver.options.enable_joint_velocity_limits,
