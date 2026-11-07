@@ -773,8 +773,7 @@ def _release_text(rows: int) -> str:
 def walk_release_prelude() -> DevicePrelude:
     """The slips' release alone (:func:`_release_text`, ``WALK_RELEASE_T`` and the rest), after the walk's one access,
     for both devices: a reader that releases without walking a path (the leave)."""
-    text = {cuda: _walk_loads_text(cuda) + "\n" + _release_text(1) for cuda in (True, False)}
-    return DevicePrelude("walk_release", text[True], cpu=text[False])
+    return _walk_package("walk_release", _release_text(1))
 
 
 _WALK_LOADS = """#ifndef WALK_READ
@@ -918,17 +917,18 @@ WALK_LINK_FRAME = 3
 its parent's frame."""
 
 
-def _walk_loads_text(cuda: bool) -> str:
-    """The walk's one access (:data:`_WALK_LOADS`) and the step's pin ``WALK_MUL`` at the device layout, for a device,
-    under its one guard: every walk prelude carries it."""
-    return substitute(_WALK_LOADS, link=WALK_LINK, device=_WALK_DEVICE[cuda])
+def _walk_package(name: str, *texts: str) -> DevicePrelude:
+    """A walk prelude ``name`` for both devices: the walk's one access (:data:`_WALK_LOADS`) and the step's pin
+    ``WALK_MUL`` at the device layout, under its one guard, then ``texts``: every walk prelude carries it."""
+    text = {cuda: substitute(_WALK_LOADS, link=WALK_LINK, device=_WALK_DEVICE[cuda]) for cuda in (True, False)}
+    return DevicePrelude(name, "\n".join((text[True], *texts)), cpu="\n".join((text[False], *texts)))
 
 
 @functools.cache
 def walk_loads_prelude() -> DevicePrelude:
-    """The walk's one access alone (:func:`_walk_loads_text`), for both devices: a reader of the records without a
+    """The walk's one access alone (:func:`_walk_package`), for both devices: a reader of the records without a
     walk (the predictor's border) declares it."""
-    return DevicePrelude("walk_loads", _walk_loads_text(True), cpu=_walk_loads_text(False))
+    return _walk_package("walk_loads")
 
 
 @functools.cache
@@ -986,8 +986,7 @@ def walk_prelude(
         ),
     )
     walk += "\n" + _release_text(rows)
-    text = {cuda: _walk_loads_text(cuda) + "\n" + table + "\n" + walk for cuda in (True, False)}
-    return DevicePrelude(name, text[True], cpu=text[False])
+    return _walk_package(name, table, walk)
 
 
 _WALK_ROW = """    // WALK_WRENCH(q, sign, d, at, origin, o, torque): a row's seed at a body's frame (the native twin of
@@ -1145,11 +1144,8 @@ def walk_down_prelude(
         repr((classes, unroll, WALK_AHEAD if ahead is None else ahead, WALK_TOUCH)).encode()
     ).hexdigest()[:8]
     walks = [_walk_down(classes, unroll, ahead, combine) for combine, on in ((ts.LEAVE, down), (ts.ENTER, enter)) if on]
-    # The loads package carries the step's pin (WALK_MUL), under its one guard.
-    walk = "\n".join((substitute(_WALK_ACCESS, unpacked=WALK_UNPACKED), *walks))
-    texts = {cuda: _walk_loads_text(cuda) + "\n" + walk for cuda in (True, False)}
     kind = "_".join(name for name, on in (("down", down), ("enter", enter)) if on)
-    return DevicePrelude(f"walk_{kind}_{tag}", texts[True], cpu=texts[False])
+    return _walk_package(f"walk_{kind}_{tag}", "\n".join((substitute(_WALK_ACCESS, unpacked=WALK_UNPACKED), *walks)))
 
 
 def leave_work(trees: int) -> Work:

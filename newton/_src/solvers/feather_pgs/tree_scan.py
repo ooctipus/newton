@@ -585,18 +585,21 @@ class _Context:
         return f"for(int node=LANE;node<{self.nodes};node+=STRIDE)if({depth}=={level}){{\n{body}\n}}"
 
 
+def _compose_down(c: _Context) -> str:
+    return f"""        {c.combine.declare("value")}{c.combine.declare("up")}
+        {c.load("up", "parent")}
+        {c.own("value", "node")}
+        {c.combine.compose("value", "up")}
+        {c.result("value", "node")}"""
+
+
 def _serial_down(c: _Context) -> str:
-    value, up = "value", "up"
     order = "index" if c.order is None else c.order.format(index="index")
     return f"""    for(int index=0;index<{c.nodes};++index) {{
         const int node={order};
         const int parent={c.parent("node")};
         if(parent<0){{{c.publish_own("node")}continue;}}
-        {c.combine.declare(value)}{c.combine.declare(up)}
-        {c.load(up, "parent")}
-        {c.own(value, "node")}
-        {c.combine.compose(value, up)}
-        {c.result(value, "node")}
+{_compose_down(c)}
     }}
 """
 
@@ -625,15 +628,10 @@ def _guarded(group: Group, statement: str) -> str:
 
 
 def _level_down(c: _Context) -> str:
-    value, up = "value", "up"
     publish = c.publish_own("node")
     prepare = f"    for(int node=LANE;node<{c.nodes};node+=STRIDE){{{publish}}}\n    SYNC();\n" if publish else ""
     body = f"""        const int parent={c.parent("node")};
-        {c.combine.declare(value)}{c.combine.declare(up)}
-        {c.load(up, "parent")}
-        {c.own(value, "node")}
-        {c.combine.compose(value, up)}
-        {c.result(value, "node")}"""
+{_compose_down(c)}"""
     return (
         prepare
         + f"""    for(int level=1;level<={c.max_depth};++level) {{
