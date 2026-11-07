@@ -73,14 +73,12 @@ RECORD_WORDS = 8
 """Words of a dense row's record (:func:`pack_row_record`): two ``int4``, which a row loop loads a row ahead."""
 
 HEADER_WORDS = 4
-"""Words of a free row's record: its header alone (:func:`pack_mf_header`), one ``int4``. A free row's sides are free
-bodies, six coordinates each by their class, so its record holds no widths; its friction coefficient is the line's
-(``row_mu``), which only its friction rows read."""
+"""Words of a free row's record: its header alone (:func:`pack_mf_header`), one ``int4``: its sides' widths are its
+class's, its friction coefficient the line's (``row_mu``)."""
 
 
 def record_words(free: bool) -> int:
-    """Words of a row's record by its class: the header alone for a free row (:data:`HEADER_WORDS`), the header and its
-    sides' widths and friction coefficient for a dense one (:data:`RECORD_WORDS`)."""
+    """Words of a row's record by its class: :data:`HEADER_WORDS` a free row, :data:`RECORD_WORDS` a dense one."""
     return HEADER_WORDS if free else RECORD_WORDS
 
 
@@ -122,16 +120,10 @@ def pack_row_record(
     mu: str,
     indent: str,
 ) -> str:
-    """Store a dense row's record at the ``int`` pointer ``record``: everything a row loop reads of the row but its
-    ``Z`` and its impulse, in two ``int4`` (:data:`RECORD_WORDS`).
-
-    The first is the header (:func:`pack_mf_header`): the first world coordinates of the row's sides ``dof_a`` and
-    ``dof_b`` (-1 for no side), the bits of its stored diagonal (the class's form: the free bodies' inverse, the dense
-    rows' ``A_ii``), of its right-hand side (the law's plus its incident velocity: its residual at ``du = 0``), and its
-    kind and parent (0xFFFF for none). The second holds the sides' widths ``n_a`` and ``n_b`` (two 16-bit halves), the
-    bits of the row's friction coefficient and two zero words. A free row's record is the first alone
-    (:func:`pack_row_header`).
-    """
+    """Store a dense row's record at the ``int`` pointer ``record``, two ``int4`` (:data:`RECORD_WORDS`): the header
+    (:func:`pack_mf_header`: its sides' first world coordinates ``dof_a``, ``dof_b``, -1 for none, its stored
+    ``diagonal``, its ``rhs`` at ``du = 0``, ``kind`` and ``parent``, 0xFFFF for none), then its sides' widths ``n_a``
+    and ``n_b`` (two 16-bit halves), its friction coefficient ``mu`` and two zero words."""
     return (
         pack_mf_header("record_a", dof_a, dof_b, diagonal, rhs, kind, parent, indent) + f"\n{indent}int4 record_b;\n"
         f"{indent}record_b.x = {n_a} | ({n_b} << 16);\n"

@@ -95,9 +95,8 @@ class Capacities:
         if free_bodies and not run:
             speed_rows = RIGID_SPEED_ROWS * int(np.max(forest.free_rigid_per_world, initial=0)) if speed_limits else 0
             dense += free + speed_rows
-            # The line ends on a whole L1 line, so every world's line starts on one (a line of 258 rows split each
-            # world's writes across lines: allegro's keyed limit prefix ran 2x): the free bodies' (empty) rows fill
-            # it, one at least.
+            # The line ends on a whole L1 line, so every world's line starts on one: the free bodies' (empty) rows
+            # fill it, one at least.
             line = L1_LINE_BYTES // 4
             free = -(-(dense + 1) // line) * line - dense
         return cls(

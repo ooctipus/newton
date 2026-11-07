@@ -15,10 +15,8 @@ Gauss-Seidel sweep itself. The row order is a physics parameter (the iterate a
 budget of sweeps reaches depends on it), and the colors keep it.
 
 A body with many contacts (a tray under a coin tower) holds a unit in as many
-colors as it has contacts, so the busiest body sets about how many colors a
-world takes (measured: the coins' tray, 336 units, 347 colors; the hardware's
-bin, 491 units, 495 colors). Its units per color are at most its free bodies,
-so only the worlds with enough free bodies for the rule (:func:`capable_worlds`)
+colors as it has contacts. Its units per color are at most its free bodies, so
+only the worlds with enough free bodies for the rule (:func:`capable_worlds`)
 hold that storage, a slot each; the others keep the one-warp mapping and hold
 none. A slot's capacity is sized from the units a world takes
 (:func:`unit_capacity`), not from its row capacity; a world with more units
@@ -93,11 +91,8 @@ class ColoredRule:
 
 
 COLORED_RULE = ColoredRule(min_units=32, parallelism=1.75)
-"""The measured crossover of the two mappings (RTX PRO 6000, patch box pyramids of 2 to 14 rows, ms per frame): one
-wave of worlds (1 and 64) ties at 1.25 to 1.6 units per color (20 to 49 units: 1.02, 0.97, 1.02x) and gains from 1.9
-(1.20x) through 2.1 to 2.8 (1.17 to 1.40x) and 6.4 to 6.9 (2.5 to 2.8x) to 15 (5.2x); the coins and hardware
-clutter, about 12 units per color, gain 5.7 and 2.4x at 128 worlds. At 1024 worlds, six waves, the colored worlds
-lose at 2.3 and 6.6 units per color (0.35 and 0.62x), as :meth:`ColoredRule.at_scale` requires."""
+"""The crossover of the two mappings: a world takes the colored one from 32 units at 1.75 units a color, scaled with
+the waves of worlds (:meth:`ColoredRule.at_scale`)."""
 
 WORLD_FIELDS = FieldGroup(
     # The world's storage slot, -1 for a world that cannot take the colored mapping (:func:`capable_worlds`).
@@ -283,9 +278,8 @@ friction pair."""
 
 def unit_capacity(mf_rows: int) -> int:
     """Units a slot holds for worlds of ``mf_rows`` free-body rows: one per :data:`UNIT_ROWS` rows, every unit a
-    contact with its friction pair (measured, 128 worlds: coins 4,446 units, 4,704 at most, of 5,328 a slot; the parts
-    bin 5,075, 5,553 at most, of 7,509). A world with more keeps the one-warp mapping, and the build sets the units'
-    capacity status."""
+    contact with its friction pair. A world with more keeps the one-warp mapping, and the build sets the units' capacity
+    status."""
     return max(int(mf_rows) // UNIT_ROWS, 1)
 
 

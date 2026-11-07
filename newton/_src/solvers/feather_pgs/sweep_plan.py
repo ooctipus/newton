@@ -506,8 +506,7 @@ class Sweep:
                 )
             self.mf_gs_storage = storage
             parallel_rows = self.classes.tier_rows
-            # The streamed rows' records: the dense rows' too where their metadata streams, in the worlds the sweep
-            # visits (not the tiers').
+            # The streamed rows' records, in the worlds the general sweep visits.
             self.placement.allocate_row_records(
                 sweep_routes.record_first(self.placement.dense_max_constraints, storage.places),
                 skip_rows=parallel_rows,
@@ -616,8 +615,7 @@ class Sweep:
                 slots = self.colored_units.slot_count
                 mapped += (self._claim_launch(self.colored_sweep, self.mf_colored_kernel, slots, self.claim_colored),)
             # In line, the tiers and then the general sweep; on the claims' streams (open_streams) the first tier in
-            # line and the general sweep and the other tiers beside it: a fork's first kernel started about 18 us
-            # after the fork a solve, and on franka the first tier (rows32) is the solve's critical path (PRO).
+            # line and the general sweep and the other tiers beside it.
             self.launches = (*self.tiers, *mapped)
             self.claim_groups = (*((tier,) for tier in self.tiers[:1]), mapped, *((tier,) for tier in self.tiers[1:]))
         else:
@@ -665,8 +663,7 @@ class Sweep:
         rows, inside the tiers' row bound), the colored candidates' (a world with a colored storage slot) or the
         general sweep's. The one writer, the unit builder and every sweep read their buckets.
 
-        Without keyed rows its first reader is the unit builder or the sweep: it runs beside the stage's stream (its
-        count reset and its launch, about 10 us a step's solve on franka's critical path, PRO) until
+        Without keyed rows its first reader is the unit builder or the sweep: it runs beside the stage's stream until
         :meth:`join_claims`."""
         if self.claims_beside is not None:
             self.claims_beside.start(self._claim_worlds)

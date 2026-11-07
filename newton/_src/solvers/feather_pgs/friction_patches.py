@@ -64,18 +64,13 @@ _BLOCK_THREADS = 256
 # The light launches (prepare, link, finish and store, reset) handle one
 # slot per loop iteration at 40 to 48 registers, which fit five or six blocks
 # per SM, and their reads through slots and rings wait on memory; blocks past
-# the live slots only read the counts. Measured on a 188-SM GPU against two
-# blocks per SM: the finish 0.88x, the link 0.80x and a reused frame's prepare
-# 0.77x per call with 512k live contacts, the link 0.67x with 346k, a new
-# frame's prepare 0.98x to 1.05x, and no change with 1.6k.
+# the live slots only read the counts.
 _LIGHT_BLOCKS_PER_SM = 6
 # A _build thread walks one body pair's run, a chain of dependent loads at 96
 # registers. One-warp blocks fit 21 warps per SM instead of two 256-thread
 # blocks' 16, free each warp's slot when it finishes rather than with its
 # slowest block-mate, and spread a short frame's runs over every SM; the wider
-# grid leaves no thread a second run below 8 * SMs * 256 live slots. Measured
-# on a 188-SM GPU: 0.82x the time per build with 512k live contacts, 0.85x
-# with 346k, 0.81x with 1.6k of a 4M capacity.
+# grid leaves no thread a second run below 8 * SMs * 256 live slots.
 _BUILD_BLOCK_DIM = 32
 _BUILD_BLOCKS_PER_SM = 8
 # The patch extent: the slots to visit, then the live sort's extent (live_sort.publish_sort_extent).
@@ -1077,10 +1072,7 @@ def _uses_live_sort(key_bits):
     stays below the pad bit (pair keys up to 51 bits: about 47 million bodies
     and shapes); wider keys take the radix sort of the whole capacity. Both sorts
     leave the unique (key, slot) order. The live sort's cost follows the live
-    contacts, the radix sort's the capacity: on the 21-task suite (16,384
-    worlds, patch friction) the live sort was never slower and up to 4.4%
-    faster per step (franka, whose 1M-slot capacity had taken the radix sort
-    for about 1,900 live contacts).
+    contacts, the radix sort's the capacity.
     """
     return slot_keys_fit(key_bits)
 

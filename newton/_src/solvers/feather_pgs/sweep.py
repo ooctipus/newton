@@ -89,29 +89,23 @@ def indent(text: str, prefix: str) -> str:
 
 @dataclasses.dataclass(frozen=True)
 class WorldRows:
-    """A world's rows of one class in the row store's line (the ``world_*`` records): the dense class's from
-    ``off_dense``, the free bodies' (``free``) from ``off_mf``, ``capacity`` slots each, read by the class's staging
-    policy.
+    """A world's rows of one class in the row store's line: the dense class's from ``off_dense``, the free bodies'
+    (``free``) from ``off_mf``, ``capacity`` slots each, read by the class's staging policy.
 
     ``staging`` says where a row's metadata come from:
 
     - ``"shared"``: the right-hand side (the law's bias plus the row's incident velocity ``row_incident``: the row's
       residual at ``du = 0``), diagonal and friction coefficient are staged in shared memory, and the kind and parent
       as one packed word per row (``s_meta_dense``: the kind in the low bits, the parent plus one above);
-    - ``"record"``: the rows' records stream (``row_record``, :func:`.row_metadata.pack_row_record`: a row's sides,
-      stored diagonal, right-hand side, kind, parent and friction coefficient in two ``int4``), the class's from
+    - ``"record"``: the rows' records stream (``row_record``, :func:`.row_metadata.pack_row_record`), the class's from
       ``off_rec_dense`` or ``off_rec_mf``. A row loop loads the visited row's record a row ahead into registers
-      (``rec_a``, ``rec_b``: :func:`rows_block`; a loop that does not pipeline declares them, :meth:`visit`), which
-      every read of row ``i`` takes; any other row's read takes its record's word. The free bodies' rows always
-      stream, and their records are the header alone (``rec_a``, :func:`.row_metadata.pack_row_header`: their sides'
-      widths are their class's, their friction coefficient the line's ``world_row_mu``); they keep the inverse of
-      their diagonal, which their step multiplies by; the dense rows' keep ``A_ii``, which a step divides by.
+      (``rec_a``, ``rec_b``: :func:`rows_block`, or :meth:`visit`), which every read of row ``i`` takes; any other
+      row's read takes its record's word. The free rows always stream their headers (``rec_a``,
+      :func:`.row_metadata.pack_row_header`), with their diagonal's inverse; the dense rows' records keep ``A_ii``.
 
-    Impulses are staged (``s_lam_dense``, ``s_lam_mf``) or, with ``stream``, read and written in place (``g_lam_dense``,
-    ``g_lam_mf``): a class's line past the stage streams them. A dense row's impulse is owned by the row's first lane,
-    whose value every lane takes by broadcast, staged or in place; a staged free row's every lane stores what it
-    computed, and so does every row's with ``every_lane`` (the sparse-diagonal sweep's: each lane reads its own
-    stores). Staged and streamed reads hold identical values.
+    Impulses are staged (``s_lam_dense``, ``s_lam_mf``) or, with ``stream``, in place (``g_lam_dense``, ``g_lam_mf``).
+    A dense row's impulse is owned by its first lane, which every lane reads by broadcast; a staged free row's every
+    lane, and every row's with ``every_lane``, stores what it computed and reads its own stores.
     """
 
     capacity: int
@@ -1681,9 +1675,7 @@ def friction_metric_stage(
     triple's first loaded visit of the launch forms its metric and stores it, and every later visit only projects
     (:func:`cached_triple_law` with ``basis``): its block is fixed across the launch's sweeps.
 
-    Formed at the first visit, not here: a triple the sweeps never load forms none. Every triple formed here, before
-    the sweeps, measured kuka's matrix-free sweep 9% slower than forming it at every visit (241 against 263 us a
-    launch): most of its triples carry no load."""
+    Formed at the first visit, not here: a triple the sweeps never load forms none."""
     lines = [
         "const int row = first + LANE;",
         f"if (row < {end} && {kind('row')} == {FRICTION}) {{",
@@ -1701,9 +1693,8 @@ def _block(lines: list[str], pad: str) -> str:
 
 
 def _record_load(rows: WorldRows, op, row: str, indent: str) -> str:
-    """Load row ``row``'s record into the row loop's pipeline registers (``pre_a``, ``pre_b``), and, where the
-    operator keeps the visited row's entries in registers (the free bodies'), this lane's entry of its ``Z``
-    (``pre_z``)."""
+    """Load row ``row``'s record into the row loop's pipeline registers (``pre_a``, ``pre_b``), and where the operator
+    keeps the visited row's entries in registers, this lane's entry of its ``Z`` (``pre_z``)."""
     text = rows.load_record(tuple(f"pre_{name[-1]}" for name in rows.registers), row, indent)
     if op.registers:
         text += f"\n{indent}if ({op.lanes.lane} < {op.width}) pre_z = {op.element(row, op.lanes.lane)};"
@@ -1728,8 +1719,7 @@ def _record_consume(rows: WorldRows, op, row: str, end: str, indent: str) -> str
 
 
 def _record_pipeline(rows: WorldRows, op, end: str) -> Pipelined:
-    """A record store's rows ``[0, end)`` in slot order, each row's record loaded a row ahead (the pipeline's
-    registers in a block of their own: a sweep pipelines each of its classes)."""
+    """A record store's rows ``[0, end)`` in slot order, each row's record loaded a row ahead."""
     z = "float pre_z = 0.0f;\n{pad}" if op.registers else ""
     return Pipelined(
         end,

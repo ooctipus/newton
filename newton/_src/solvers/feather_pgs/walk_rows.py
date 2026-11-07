@@ -183,9 +183,7 @@ def writer_lanes(rows: int, capacity: int, device) -> int:
     (``rows``: links, mimics and limits; contacts stride over it), at most the row capacity and a warp, so a world's
     lanes synchronize within their warp (:func:`world_sync`); one thread on the CPU.
 
-    A world's release and closure run serially on one of its lanes, so lanes beyond its rows idle there. Measured
-    (FL33D, GB300, 4,096 worlds of 6 or 12 bilateral rows, or 6 limit rows with three slips): groups of 8 and 16 ran
-    the writer's phases 31-37% under the separate launches, groups of 32 and 64 (the capacity) at par to 42% over."""
+    A world's release and closure run serially on one of its lanes, so lanes beyond its rows idle there."""
     if not wp.get_device(device).is_cuda:
         return 1
     lanes = max(min(int(rows), int(capacity), 32), 1)
@@ -197,14 +195,11 @@ WRITE_ROWS, WRITE_TOPOLOGY, WRITE_REST = wp.constant(0), wp.constant(1), wp.cons
 rest with the closure."""
 
 WRITER_BLOCK_ROWS = 1
-"""The rows a lane of the topology part walks as one block (:func:`block_walker`): one, its seeds in one sweep. A lane
-already walks beside its warp's others for free; more rows a lane serialize them into its instruction stream, and the
-writer turns issue-bound (ZK7, franka at 16,384 worlds: the part 39 us at one row a lane, 55 at two, 58 at four)."""
+"""The rows a lane of the topology part walks as one block (:func:`block_walker`): one, its seeds in one sweep."""
 
 WALKER_LINE = 80
 """The one walker's register line: a world-lane writer of the packed rows or the star's slots holds its walk at 80
-registers, 24 warps a multiprocessor, for a latency-bound walk whose speed follows its resident warps. Unbound, the
-class tables' walk takes 84-86 registers, past the granule: 16 warps (franka-cabinet 7% slower, gate_fast)."""
+registers, 24 warps a multiprocessor, for a latency-bound walk whose speed follows its resident warps."""
 
 
 class WriterShape(NamedTuple):
@@ -244,15 +239,11 @@ WRITERS = MappingProxyType(
 - **World lanes**, a world's lane group striding over its rows, a row a lane: the general writer's packed rows
   (:func:`walked_rows_kernel`; a group of :func:`writer_lanes`, whole groups a block of 128) at the walker's line; with
   bilateral blocks (``packed_blocks``) at 96, since its link rows hold a second point across the walk and its closure
-  follows it (97 unbound; at the walker's line it spilled 88 B a thread, sm_120); the star's slots
-  (:func:`slot_rows_kernel`, a block a world) at the walker's line; the support placement's unit lister
-  (:func:`support_units_kernel`) at 64, where its third kind's reservation would lift it to 66 (sm_120, ptxas), a
-  granule that would cost it a block.
+  follows it; the star's slots (:func:`slot_rows_kernel`, a block a world) at the walker's line; the support
+  placement's unit lister (:func:`support_units_kernel`) at 64.
 - **The step's unit list**, two waves of the line over the GPU (:func:`support_threads`): the support writer
-  (:func:`support_rows_kernel`) at 168, where its four-row walker and the friction triple's metric hold 164 with no
-  spill (sm_120, ur10-reach's class); at 128 they spilled 144 B a lane and loaded 412 B back, every unit's walk paid
-  the spills' local-memory traffic, and the kinetic finish two launches later paid its L2 lines. Measured
-  (``SP/core/FL/zwr8``, L5): franka-reach 4.3%, ant 1.3%, anymald 1.1% and ur10-reach 0.4% faster on the PRO.
+  (:func:`support_rows_kernel`) at 168, where its four-row walker and the friction triple's metric hold without
+  spilling.
 - **The free bodies' units**, their contacts then their speed rows, a unit a thread, two waves of the line: the
   free-body writer (:func:`write_free_body_rows`) at 128.
 """
@@ -363,7 +354,6 @@ def walked_rows_kernel(
        (:func:`.response_builds_rows.write_row_record`), so no pass over the rows packs them.
 
     The closure's seed stays a launch after the warm start's gather (:meth:`.tree_factor.TreeFactor.seed_blocks`).
-    One launch with group barriers, not a second launch for the block phase: FL33D's measurement (``fl33d/``).
 
     ``part`` (:data:`WRITE_ROWS`, :data:`WRITE_TOPOLOGY`, :data:`WRITE_REST`): the rows a world's topology fixes (its
     links, mimics, limits and velocity limits, the slots below its family bound ``bounds[world, 1]``,
@@ -422,8 +412,7 @@ def walked_rows_kernel(
         dense_rows = support.units.shape[1]
         count = wp.min(counts[world], dense_rows)
         line = rows.first[world]
-        # Whether this launch stores the world's records, read before the rows: its loads overlap the walk, and a
-        # world the sweep does not visit (every world of the tiers') pays a predicate at the end, not a load.
+        # Whether this launch stores the world's records, read before the rows (its loads overlap the walk).
         stores = bool(False)
         if wp.static(records):
             stores = part != WRITE_TOPOLOGY and swept(row_records, world, counts[world])
@@ -482,8 +471,7 @@ def walked_rows_kernel(
                             rows.rhs, rows.diag,
                         )  # fmt: skip
         if wp.static(records):
-            # The records, once every row of the world is final: the launch that writes the last of them stores them,
-            # in the worlds the sweep visits.
+            # The records, once every row of the world is final.
             if stores:
                 world_sync(lanes)
                 for slot in range(lane, count, lanes):
@@ -766,9 +754,7 @@ SUPPORT_REGISTERS = WRITERS["support"].registers
 """The support writer's register budget a thread, from its launch bound: what a unit's held side must fit
 (:func:`.tree_scan.held_fits`, :data:`_RELEASE_HELD`).
 
-The held side is a unit's at most four rows over its class's coordinates. Measured (``SP/core/FL/HANDOFF_ZK.md``
-§17): franka-reach's 36 words held, its writer 16% faster (GB300); g1's 172 words held, 3% slower (GB300), so g1's
-release runs in place."""
+The held side is a unit's at most four rows over its class's coordinates."""
 
 
 _SUPPORT_SIDE = """        unsigned long long mask = 0ull;
@@ -1016,7 +1002,7 @@ def packed_walker(rows: int, spin: bool, side: bool, tables: tuple, star: bool =
         entries_end="S",
         zrow="(unit.group * sink.entries.shape[1] + unit.slot)" if star else "row0",
         diag="norm[r]" if star else _HEADER_DIAG,
-        # RD a plain load here, not the support writer's non-coherent __ldg: the K2 writer ran 1.4% faster on sm_120.
+        # RD a plain load here, not the support writer's non-coherent __ldg.
         rd="*p",
     )
     half = record_half(side)
@@ -1308,8 +1294,8 @@ def support_rows_kernel(
 ) -> wp.Kernel:
     """The support placement's walkers (case K1, the writer's second launch): ``threads`` lanes, sized to the GPU,
     striding over the step's :class:`UnitList` (:func:`support_units_kernel`) kind by kind, units of four rows, of
-    three, then of one, so a warp runs one walker. A lane walks a unit: a contact's rows from its first, a joint row alone. The generator form (Gamma per body,
-    ``z = Gamma w``) measured slower on g1 than this direct walk, so the writer walks each unit.
+    three, then of one, so a warp runs one walker. A lane walks a unit: a contact's rows from its first, a joint row
+    alone.
 
     The class's tree (``parent``, ``first``: :func:`.factor.walk.walk_prelude`'s table) and each coordinate's factor
     coordinate ``node`` (the support masks' bit) are baked into constant memory. A contact unit of three rows (four

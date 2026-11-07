@@ -37,16 +37,11 @@ incident velocity ``J v_hat``, written where its walk sums it: the one writer (:
 writer (:func:`.walk_rows.write_free_body_rows`)."""
 
 ROW_RECORDS = FieldGroup(Field("row_record", wp.int32, ("world", "record"), owner="placement"))
-"""The streamed rows' records, which the sweeps' row loops load a row ahead, packed each step from the row store
-by the rows' writers (:func:`.response_builds_rows.write_row_record`): the line's rows from the plan's first streamed
-row (the dense rows' where a sweep streams their metadata, eight ints a row, :func:`.row_metadata.pack_row_record`),
-then the free bodies' from ``body_base``, which always stream, four ints a row (their header,
-:func:`.row_metadata.pack_row_header`; :func:`.row_metadata.record_layout`). A free row's record keeps the inverse of
-its effective mass ``A_ii``; its
-rows themselves are the line's: their records the row store's (:data:`DENSE_ROWS`, from ``body_base``), their sides
-their responding bodies' articulations in the rows' ``a``/``b`` order (-1 for none), and their whitened
-``Z = L^-1 J^T`` (``L`` the body's held factor: two one-node trees of six) the packed rows'
-(:data:`.packed_rows.PACKED_ROWS`, the line's rows at the world's support)."""
+"""The streamed rows' records, which the sweeps' row loops load a row ahead, stored by the rows' writers
+(:func:`.response_builds_rows.write_row_record`): the dense rows' from the plan's first streamed row, then the free
+rows' headers from ``body_base`` (:func:`.row_metadata.record_layout`). The free rows themselves are the line's: their
+records the row store's (:data:`DENSE_ROWS`), their whitened ``Z = L^-1 J^T`` the packed rows'
+(:data:`.packed_rows.PACKED_ROWS`)."""
 
 
 RECORDS = (

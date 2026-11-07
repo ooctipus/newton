@@ -104,16 +104,14 @@ where the line's speed rows start."""
 
 @dataclasses.dataclass(frozen=True)
 class RowPlaces:
-    """Where the matrix-free sweep's row operands live, places of the memory toolkit chosen once in the plan
-    (:func:`.execution_plan._select_mfgs_storage`): each in the block's shared stage or read from global memory. Both
-    places hold identical values, so the sweep's results are the same.
+    """Where the matrix-free sweep's row operands live, chosen once in the plan
+    (:func:`.execution_plan._select_mfgs_storage`): each in the block's shared stage or global memory, with identical
+    values.
 
     Args:
-        metadata: The dense rows' right-hand sides, diagonals, friction coefficients, kinds and parents: staged, or
-            their records streamed a row ahead (:class:`.sweep.WorldRows`).
+        metadata: The dense rows' metadata: staged, or their records streamed (:class:`.sweep.WorldRows`).
         impulses: The free bodies' impulses.
-        dense_impulses: The dense rows' impulses (the line's): staged, or read and written in place where the line is
-            past the stage.
+        dense_impulses: The dense rows' impulses (the line's): staged, or in place.
     """
 
     metadata: Place = Place.SHARED
@@ -205,9 +203,8 @@ FREE_BODY_COORDINATES = FreeBodyCoordinates()
 """The free bodies' way into and out of walk coordinates in a matrix-free sweep (:class:`FreeBodyCoordinates`)."""
 
 FREE_BODY_WALKS = walk_down_prelude((FREE_BODY_WALK,), ahead=0, enter=True)
-"""The leave and the enter of :data:`FREE_BODY_COORDINATES`, compiled into a sweep that visits speed rows: a one-body
-walk is no chain whose loads a lane could hold ahead, and the default prefetch held the paired factor sweep at 116
-registers a lane against 80 without it (sm_120, ptxas)."""
+"""The leave and the enter of :data:`FREE_BODY_COORDINATES`, compiled into a sweep that visits speed rows, without
+prefetch: a one-body walk is no chain whose loads a lane could hold ahead."""
 
 
 def packed_operator(support: int, lanes: Lanes, *, wide: bool = False, rows: WorldRows | None = None) -> SparseFactor:
@@ -275,8 +272,7 @@ MAPPINGS = ("warp", "colored")
 visits their colors in order and each color's units at once (:mod:`.sweep_units`)."""
 
 COLORED_THREADS = 256
-"""Threads of a colored world's block: a color's units beyond them run in turns. The largest color measured holds
-237 units (coins) and 139 (hardware), and a unit's staged registers (up to 193) leave room for 256 threads."""
+"""Threads of a colored world's block: a color's units beyond them run in turns."""
 
 COLOR_CHUNK = 256
 """Color offsets a colored block stages at a time: a world's colors are bounded by its units, not by the block."""
@@ -683,22 +679,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     which the step's one leave walks down onto ``v_out`` (:func:`.factor.walk.walk_leave_kernel`); a free body's speed
     row reads the body's velocity through its walk (:class:`FreeBodyCoordinates`).
 
-    ``mapping`` places the free-body rows on threads (:data:`MAPPINGS`): ``"warp"``, the world's warp visits them in
-    row order; ``"colored"``, a block of :data:`COLORED_THREADS` visits their colors in order and a color's units at
-    once, the world's first warp running everything else. Both are the same row-order Gauss-Seidel sweep. Each walks
-    its claim's bucket (:func:`worlds`): the unit builder's rule (:class:`.sweep_units.ColoredRule`) appends a world to
-    the colored bucket or the general one.
-
-    With ``weighted`` contact rows step by their regularization weights, ``material`` contacts' from their compliance
-    (:class:`.sweep.RowLaws`, a constant of the step's laws).
-
-    A free body's rows are the free bodies' run's where its world can take the colored mapping (``free_rows``: the
-    free phase and its speed rows), else rows of the line (:attr:`.step_plan.Capacities.free_contact_rows`): its
-    contacts the dense rows', its speed rows (``speed_rows``) the line's last, from ``speed_first``, which the dense
-    rows' last word visits after the velocity limits (:func:`.sweep.speed_rows_pass`).
-
-    ``lanes`` is the warp mapping's lane group (:func:`.execution.device_lanes`): a warp on CUDA, or one thread, which
-    runs the world on either device (the CPU's mapping), so that body composes for both (:func:`.dual_native`).
+    Every switch is the configuration's (:class:`GeneralSweep`).
 
     Returns the body and its staging.
     """
@@ -891,8 +872,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         (f"{first_warp}{chr(10).join(passes)}\n{end_first_warp}",),
         exit=sweep_vote + sweep_end,
     )
-    # The streamed rows' records (row_record): the line's from its first streamed row, the dense rows' where theirs
-    # stream, then the free bodies' (Sweep.build allocates them alike, Placement.allocate_row_records).
+    # The streamed rows' records (row_record, row_metadata.record_layout).
     free_records, line_records = record_layout(record_first(M_D, places), M_D, P)
     records = f"    const int off_rec_mf = line * {line_records} + {free_records};"
     if dense.record:
@@ -970,9 +950,8 @@ class GeneralSweep(SweepConfig):
     - the level's mapping (:data:`MAPPINGS`): ``"warp"``, the world's warp visits its rows in row order; ``"colored"``,
       a block visits the free bodies' colors in order and a color's units at once (the unit builder's rule picks the
       worlds, :class:`.sweep_units.ColoredRule`);
-    - the row record: ``places``, where the rows' metadata and the free bodies' impulses live (:class:`RowPlaces`, the
-      plan's storage choice): the dense rows' metadata staged, or their records streamed a row ahead
-      (:class:`.sweep.WorldRows`' ``"record"`` staging); the free rows always stream their records;
+    - the row record: ``places`` (:class:`RowPlaces`, the plan's storage choice): the dense rows' metadata staged or
+      their records streamed; the free rows' records always stream;
     - the support class: ``max_row_dofs`` (the placement's packed support), ``wide_rows`` (rows over every coordinate,
       the bilateral block's), and the free bodies' 6 + 6 class: ``free_rows`` their own run, else rows of the line,
       their ``speed_rows`` the line's last;
@@ -1065,9 +1044,7 @@ class GeneralSweep(SweepConfig):
 
     def work(self, items: int = 0, shared: int = 0) -> Work:
         """The colored mapping: a block a world of :data:`COLORED_THREADS`, every register a thread may hold (one block
-        a multiprocessor). The warp mapping: a warp a world on a persistent grid (a block a world of the bucket's
-        capacity dispatched its exiting blocks behind the bucket's, which held the multiprocessors, and the claims
-        beside it started late: franka's widest tier 14 us later, PRO); no register line, so no launch bound."""
+        a multiprocessor). The warp mapping: a warp a world on a persistent grid; no register line."""
         if self.colored:
             return Work(int(items), lanes=COLORED_THREADS, registers=REGISTERS_PER_THREAD, shared=int(shared))
         return Work(int(items), lanes=32, block=32, persistent=True)

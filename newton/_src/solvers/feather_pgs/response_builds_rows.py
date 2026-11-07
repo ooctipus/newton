@@ -1,17 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The streamed rows' records: what the sweeps' row loops load a row ahead, written by the rows' writers.
-
-The rows are the walk's (:mod:`.walk_rows`: the one writer walks every row's seeds into its whitened form ``Z``). Every
-row whose metadata a sweep streams has a record (:func:`.row_metadata.pack_row_record`, which the sweeps' row loop
-decodes: its sides' coordinates and widths, its stored diagonal, right-hand side, kind, parent and friction
-coefficient), which the writer of the row stores once the row is final (:func:`write_row_record`): the one writer
-after its closure (:func:`.walk_rows.walked_rows_kernel`), the free bodies' writer as it writes theirs
-(:func:`.walk_rows.write_free_body_rows`), and the patch link the parent it links (:func:`store_record_parent`). The
-records are the dense rows' where a world's line holds more of them than the sweep stages, and the free bodies' rows
-(:func:`.sweep_routes.free_body_rows`, rows over at most two free bodies; their ``A_ii`` is the walk's). The bilateral
-closure is the factor's (:mod:`.factor.closure`).
+"""The streamed rows' records (:func:`.row_metadata.pack_row_record`), which the sweeps' row loops load a row ahead:
+each row's writer stores its record once the row is final (:func:`write_row_record`), the patch link the parent it
+links (:func:`store_record_parent`).
 """
 
 from __future__ import annotations
@@ -36,13 +28,10 @@ from .row_records import DenseRows
 
 @wp.struct
 class RowRecords:
-    """Where a line's rows' records sit (:data:`.row_records.ROW_RECORDS`) and which worlds' a sweep reads: the records
-    (``record``, a line's from its row ``first``; ``first`` the line's pitch where no row has one), the free bodies'
-    first row (``base``: their records are headers from the line's word ``free``, keep the inverse of their diagonal
-    and count their parents from it, :func:`.row_metadata.record_layout`), the
-    sweep's skip of the tiers' worlds (``skip_rows``, with the line's ``speed`` rows from ``speed_first``, and each
-    world's free bodies' rows ``mf_count``: :func:`swept`), and each articulation's first world coordinate and response
-    coordinates (``offset``, ``dofs``: a row's sides as the record holds them)."""
+    """Where a line's rows' records sit (:func:`.row_metadata.record_layout`: ``record`` from row ``first``, the free
+    rows' headers from row ``base`` at word ``free``), which worlds' a sweep reads (:func:`swept`: ``skip_rows``,
+    ``speed``, ``speed_first``, ``mf_count``) and each articulation's first world coordinate and coordinates
+    (``offset``, ``dofs``)."""
 
     record: wp.array2d[wp.int32]
     first: int
@@ -120,9 +109,8 @@ def record_at(records: RowRecords, line: int, slot: int) -> int:
 
 @wp.func
 def swept(records: RowRecords, world: int, count: int) -> bool:
-    """Whether the matrix-free sweep visits ``world`` (``count`` dense rows), so its rows' records are read: every
-    world but those the tiers own (no free body's row, at most ``skip_rows`` dense rows and, with the line's speed rows,
-    none from ``speed_first``: :func:`.sweep_routes.mf_gs_source`'s skip)."""
+    """Whether the matrix-free sweep visits ``world`` (``count`` dense rows): every world but the tiers'
+    (:func:`.sweep_levels.claim_worlds`' predicate)."""
     if records.mf_count[world] > 0:
         return True
     if wp.min(count, records.base) > records.skip_rows:
@@ -155,11 +143,8 @@ def store_row_record_of(
     records: RowRecords, rows: DenseRows, incident: float, line: int, slot: int, sides: wp.vec2i, firsts: wp.vec2i
 ):
     """Store row ``slot``'s record (:func:`.row_metadata.pack_row_record`), its ``sides`` at ``firsts``
-    (:func:`record_firsts`, which a writer reads once for rows that share their sides), the rest from the row as its
-    writer left it: its sides' widths, its diagonal, its residual at ``du = 0`` (rhs plus ``incident``), kind, parent
-    and friction coefficient. A free row's is its header (:func:`.row_metadata.pack_row_header`): its sides' widths are
-    its class's, its coefficient the line's; it keeps the inverse of its diagonal, cached for its step's form of the
-    law, and its parent from ``base``, as the sweeps stage the free bodies' rows. A row before ``first`` has none."""
+    (:func:`record_firsts`), the rest from the row as its writer left it (its rhs plus ``incident``). A free row's is its
+    header (:func:`.row_metadata.pack_row_header`), with its diagonal's inverse and its parent from ``base``."""
     at = record_at(records, line, slot)
     if at < 0:
         return

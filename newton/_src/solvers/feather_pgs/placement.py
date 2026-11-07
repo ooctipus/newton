@@ -688,11 +688,9 @@ class Placement:
             self.arrays.release(ROW_WATERMARKS)
 
     def allocate_row_records(self, first: int, *, skip_rows: int = 0, speed_rows: bool = False) -> None:
-        """Allocate the streamed rows' records (:data:`.row_records.ROW_RECORDS`) from the line's row ``first``, which
-        the sweep's plan decides (``Sweep.build``: the dense rows' first where the sweep streams their metadata, else
-        the free bodies'). A dense row's record is two ``int4``, a free row's its header (:func:`.row_metadata.record_layout`).
-        The rows' writers store them (:func:`.response_builds_rows.write_row_record`) in the worlds the sweep visits: not
-        those the tiers own (``skip_rows``, with the line's ``speed_rows``: the sweep's skip)."""
+        """Allocate the streamed rows' records (:data:`.row_records.ROW_RECORDS`, :func:`.row_metadata.record_layout`)
+        from the line's row ``first``; their writers store them in the worlds the general sweep visits, not the tiers'
+        (``skip_rows``, with the line's ``speed_rows``)."""
         self.record_first = int(first)
         rows = self.row_pitch - self.record_first
         free_rows = self.mf_max_constraints if self.free_contact_rows else 0

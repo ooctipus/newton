@@ -39,13 +39,11 @@ def _select_mfgs_storage(
     device's static shared memory per block (:func:`.memory.static_budget`): every choice below is a fit of the
     declared working set, not a mirrored count.
 
-    The rows' metadata is shared when it takes at most :data:`_MFGS_RESIDENT_METADATA_MAX_BYTES` and the block fits;
-    otherwise the rows' records stream, a row ahead (:class:`.sweep.WorldRows`). The free bodies' impulses are global
-    only when they cannot fit alongside the world velocity and the dense state (a capacity choice, not a claim that
-    global storage is faster), or on ``force_stream_mf_impulses`` (the solver's test pin ``mf_storage='streamed'``);
-    the dense rows' impulses, the line's, only when they cannot fit beside the world velocity either (a line past the
-    stage is read and written in place), or on ``force_stream_line`` (the test pin ``mf_storage='line'``). Both places
-    hold identical values, so results are bitwise identical.
+    The rows' metadata is shared when it takes at most :data:`_MFGS_RESIDENT_METADATA_MAX_BYTES` and the block fits,
+    else the rows' records stream. The free bodies' impulses are global only when they cannot fit beside the world
+    velocity and the dense state, or on ``force_stream_mf_impulses`` (the test pin ``mf_storage='streamed'``); the
+    line's impulses too when the dense state does not fit, or on ``force_stream_line`` (``mf_storage='line'``). Both
+    places hold identical values.
     """
     SHARED, GLOBAL = Place.SHARED, Place.GLOBAL
     resident = staging(places=RowPlaces())
