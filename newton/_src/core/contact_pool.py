@@ -11,7 +11,8 @@ shares the model's pool (:func:`model_contact_pool`), so a pipeline and the
 solvers that consume its contacts grow together from the moment they exist.
 
 Sizing: rows are mapped for demand that was measured or forecast, never for an
-estimate of the model. A pool starts at :data:`MIN_READY_ROWS`. A pass outside
+estimate of the model. A pool starts at :data:`MIN_READY_ROWS`, or at the capacity its model's pipeline resolved
+when that is smaller (:func:`model_contact_pool`). A pass outside
 capture grows its rows before anything reads them, so it drops nothing
 (:meth:`ContactPool.fit`). A graph replay cannot map, and the service reads what
 replays already wrote, so demand that rises faster than the service's lag would
@@ -132,7 +133,8 @@ import warp as wp
 logger = logging.getLogger(__name__)
 
 MIN_READY_ROWS = 4096
-"""The fewest ready rows a pool holds: a pool no pipeline planned starts here, and a trim stops here.
+"""The fewest ready rows a pool holds: a pool no pipeline planned starts here, and a trim stops here (or at a
+smaller model capacity, :attr:`ContactPool.floor`).
 
 On the 21-task Isaac Lab suite (16,384 worlds) a floor of one 2 MiB granule's
 rows (131,072) maps no more memory with CUDA virtual memory but slows the
@@ -488,7 +490,7 @@ def _virtual_memory():
             from gpu_components.graph_data import KernelParameterBinding  # noqa: PLC0415
         except ImportError:
             _VIRTUAL_MEMORY.append(None)
-            logger.info(
+            logger.debug(
                 "gpu_components is not installed: rigid contact rows on CUDA are ordinary arrays that growth "
                 "reallocates and copies, as on the CPU, instead of CUDA virtual memory"
             )
@@ -881,7 +883,8 @@ class ContactPool:
 
     Args:
         device: The device of the buffers.
-        rows: Initial ready rows; defaults to :data:`MIN_READY_ROWS`.
+        rows: Initial ready rows; defaults to :data:`MIN_READY_ROWS`. Fewer rows also lower the floor a trim
+            stops at to them: a model whose pairs can make fewer contacts holds no more.
         worlds: The worlds whose contacts the rows hold, each with a status of the contacts it dropped
             (:meth:`drops`); contacts of no world, or between two global shapes, share one more.
     """
@@ -891,6 +894,8 @@ class ContactPool:
         self.world_count = max(int(worlds), 0)
         """The worlds whose dropped contacts :meth:`drops` reports one by one."""
         self.ready = MIN_READY_ROWS if rows is None else max(int(rows), 0)
+        self.floor = min(MIN_READY_ROWS, self.ready)
+        """The fewest ready rows a trim keeps: :data:`MIN_READY_ROWS`, or the initial rows when fewer."""
         # Queried once: the bound is recomputed when members are added, possibly during capture.
         self._device_memory = int(self.device.total_memory) if self.device.is_cuda else 0
         self._members: list[weakref.ReferenceType] = []
@@ -1018,7 +1023,7 @@ class ContactPool:
                     errors=self._update_status,
                 )
             except Exception as error:  # No toolkit or bridge: launches stay unbound.
-                logger.info("Rigid contact launches are not bound to graph updates: %s", error)
+                logger.debug("Rigid contact launches are not bound to graph updates: %s", error)
             else:
                 self._graph_ops = (graph_ops, vm[4])
 
@@ -1502,7 +1507,7 @@ class ContactPool:
         :data:`TRIM_BAND` of where it stood :data:`TRIM_AFTER_PASSES` recorded
         passes earlier; a mark that creeps past the band later is the headroom's.
         Whenever the mark holds still, without a growth, the service trims the rows to :data:`HEADROOM`
-        rows per contact of the mark, at least :data:`MIN_READY_ROWS`, a
+        rows per contact of the mark, at least :attr:`floor`, a
         reservation and the rows of any graph that sized work by the host's
         rows, in whole granules. While the demand is in transit it trims to the
         forecast as well, once the share of the worst case the forecast measures
@@ -1588,7 +1593,7 @@ class ContactPool:
 
     def _kept_rows(self, high_water: int) -> int:
         """Return the fewest rows a trim keeps: the demand's headroom, the floor, a reservation, unbound graphs."""
-        rows = max(MIN_READY_ROWS, _round_up(HEADROOM * max(int(high_water), 0), ROW_QUANTUM))
+        rows = max(self.floor, _round_up(HEADROOM * max(int(high_water), 0), ROW_QUANTUM))
         if self._reserved:
             rows = max(rows, reserved_rows(self._reserved, self.bound))
         return max(rows, *self._unbound_captures.values(), 0)
@@ -1683,7 +1688,7 @@ class ContactPool:
                 backing_ops.trim(owner)
         self._trim = None
         self.trim_count += 1
-        logger.info(
+        logger.debug(
             "Rigid contact pool trimmed from %d to %d rows (contact high-water mark %d): %.1f -> %.1f MiB",
             previous,
             rows,
@@ -1696,7 +1701,7 @@ class ContactPool:
         previous = self.ready
         before = self.mapped_bytes()
         recapture = self.grow(target)
-        logger.info(
+        logger.debug(
             "Rigid contact pool grew from %d to %d rows (demand %d, reserved %d, device bound %d): %.1f -> %.1f MiB",
             previous,
             target,
@@ -1917,7 +1922,7 @@ _MODEL_POOLS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 """Each model's shared pools, by device alias."""
 
 
-def model_contact_pool(model, device=None) -> ContactPool:
+def model_contact_pool(model, device=None, capacity: int | None = None) -> ContactPool:
     """Return the pool that every rigid contact buffer of ``model`` on ``device`` shares.
 
     The model's collision pipelines with their :class:`~newton.Contacts` and the
@@ -1927,14 +1932,19 @@ def model_contact_pool(model, device=None) -> ContactPool:
     Args:
         model: The model whose rigid contacts the buffers hold.
         device: The device of the buffers; defaults to the model's.
+        capacity: The rigid contact capacity the creating pipeline resolved (``model.rigid_contact_max``). A new
+            pool starts at :data:`MIN_READY_ROWS` rows, or at this capacity when it is smaller, so a consumer that
+            sized its per-contact scratch by the capacity, as :class:`~newton.solvers.SolverSteel` does, receives
+            no more rows than it holds until the demand itself needs them.
     """
     device = wp.get_device(device if device is not None else model.device)
+    rows = None if capacity is None else min(MIN_READY_ROWS, max(int(capacity), 0))
     try:
         pools = _MODEL_POOLS.setdefault(model, {})
     except TypeError:
         # A model that cannot be weakly referenced keeps a pool per owner.
-        return ContactPool(device=device, worlds=getattr(model, "world_count", 0))
+        return ContactPool(device=device, rows=rows, worlds=getattr(model, "world_count", 0))
     pool = pools.get(device.alias)
     if pool is None:
-        pool = pools[device.alias] = ContactPool(device=device, worlds=getattr(model, "world_count", 0))
+        pool = pools[device.alias] = ContactPool(device=device, rows=rows, worlds=getattr(model, "world_count", 0))
     return pool

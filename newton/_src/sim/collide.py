@@ -2783,7 +2783,7 @@ class CollisionPipeline:
             requires_grad = model.requires_grad
         # Every per-contact buffer of this pipeline, its Contacts and the solvers that step the model
         # holds the model's pool's ready rows, sized from measured and forecast demand.
-        self._contact_pool = model_contact_pool(model, device)
+        self._contact_pool = model_contact_pool(model, device, rigid_contact_max)
         # The pool's generation the last service_capacity() reported.
         self._service_generation = self._contact_pool.generation
         # The writers' row limit for a buffer whose pool was created during a capture (see _detect_rigid_contacts).
@@ -3230,9 +3230,7 @@ class CollisionPipeline:
                 _group_reduction=group_reduction,
                 contact_export=contact_export,
                 heightfield_primitive_query=True
-                if convex_collision == "auto"
-                and has_heightfields
-                and int(GeoType.CONVEX_MESH) in route_shape_types
+                if convex_collision == "auto" and has_heightfields and int(GeoType.CONVEX_MESH) in route_shape_types
                 else None,
             )
             self.hydroelastic_sdf = self.narrow_phase.hydroelastic_sdf
@@ -3304,7 +3302,6 @@ class CollisionPipeline:
         # the effective state separately from the released requested-policy
         # ``reduce_contacts`` attribute.
         self.mesh_contact_reduction_enabled = bool(self.narrow_phase.reduce_contacts)
-
 
         self._hydro_shape_sdf_data_prepared = self.hydroelastic_sdf is not None
         if self.hydroelastic_sdf is not None:
@@ -4255,7 +4252,7 @@ class CollisionPipeline:
             pool.restart_transit()
             demand = self._measure_rigid_contacts(state, dt=dt)
             pool.size(max(demand, pool.high_water))
-            logger.info(
+            logger.debug(
                 "Measured %d rigid contacts in a state, %d forecast; the contact buffers hold %d rows",
                 demand,
                 pool.forecast,

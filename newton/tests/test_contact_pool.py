@@ -119,16 +119,23 @@ def _records(contacts, *extra):
 
 
 class TestContactPoolPolicy(unittest.TestCase):
-    def test_pipelines_map_no_estimate_and_no_budget(self):
-        """A pipeline leaves the pool at its floor: rows follow demand, not the shape pairs or a budget."""
+    def test_pipelines_map_no_estimate(self):
+        """A pipeline leaves the pool at its floor, not at the shape pairs' estimate; a smaller capacity lowers it.
+
+        A consumer that sized its per-contact scratch by the capacity, as SolverSteel does, then receives no more
+        rows than it holds until the demand itself needs them.
+        """
         self.assertEqual(contact_pool.MIN_READY_ROWS, 4096)
         self.assertEqual(ContactPool(device="cpu").ready, 4096)
         model = _build_boxes("cpu", worlds=4096, boxes=8)
         self.assertGreater(_estimate_rigid_contact_max(model), contact_pool.MIN_READY_ROWS)
-        model.rigid_contact_max = 7
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=5)
+        self.assertEqual(newton.CollisionPipeline(model).contacts().rigid_contact_max, contact_pool.MIN_READY_ROWS)
+        small = _build_boxes("cpu", worlds=4096, boxes=8)
+        small.rigid_contact_max = 7
+        pipeline = newton.CollisionPipeline(small, rigid_contact_max=5)
         self.assertEqual(pipeline.rigid_contact_max, 5)
-        self.assertEqual(pipeline.contacts().rigid_contact_max, contact_pool.MIN_READY_ROWS)
+        self.assertEqual(pipeline.contacts().rigid_contact_max, 5)
+        self.assertEqual(pipeline._contact_pool.floor, 5)
 
     def test_forecast_reads_the_pairs_within_reach(self):
         """Count a pair's worst case when the reaches of its shapes close the gap of their boxes and capsules, and again
@@ -712,8 +719,9 @@ def test_pool_follower_grows_with_its_leader(test, device):
     test.assertTrue(np.all(target.value.numpy() == 1.0))
 
 
-def test_compatibility_budgets_are_silent_and_size_nothing(test, device):
-    """Accept Newton main's rigid contact budget silently, resolved as on main; it changes no pool's rows or bound.
+def test_compatibility_budgets_are_silent_and_start_the_pool(test, device):
+    """Accept Newton main's rigid contact budget silently, resolved as on main; a budget below the floor starts the
+    pool's rows, which grow on demand, and changes no bound.
 
     ``CollisionPipeline(rigid_contact_max=...)``, ``CollisionPipeline.rigid_contact_max``,
     ``Model.rigid_contact_max`` and ``ModelBuilder.num_rigid_contacts_per_world`` keep Newton main's behavior.
@@ -733,23 +741,21 @@ def test_compatibility_budgets_are_silent_and_size_nothing(test, device):
         reference_contacts = reference.contacts()
 
         model = _build_boxes(device)
-        test.assertEqual(model.rigid_contact_max, 0)
+        test.assertIsNone(model.rigid_contact_max)
         pipeline = newton.CollisionPipeline(model, rigid_contact_max=5)
         test.assertEqual(pipeline.rigid_contact_max, 5)
         test.assertEqual(model.rigid_contact_max, 5)
         contacts = pipeline.contacts()
         pool = contacts._rigid_contact_pool
-        rows = contacts.rigid_contact_max
-        test.assertGreaterEqual(rows, contact_pool.MIN_READY_ROWS)
-        test.assertEqual(pool.ready, reference_contacts._rigid_contact_pool.ready)
+        test.assertEqual(contacts.rigid_contact_max, 5)
         test.assertEqual(pool.bound, reference_contacts._rigid_contact_pool.bound)
         model.rigid_contact_max = 7
         later = newton.CollisionPipeline(model)
         test.assertEqual(later.rigid_contact_max, 7, "the model's value without an argument")
-        test.assertEqual(later.contacts().rigid_contact_max, contacts.rigid_contact_max)
+        test.assertEqual(later.contacts().rigid_contact_max, contacts.rigid_contact_max, "the model's one pool")
         pipeline.collide(model.state(), contacts)
     test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), CONTACTS)
-    test.assertEqual(contacts.rigid_contact_max, rows, "a budget of 5 holds all 48 contacts")
+    test.assertGreaterEqual(contacts.rigid_contact_max, CONTACTS, "a budget of 5 grows to hold all 48 contacts")
 
 
 def test_collide_outside_capture_grows_before_reading(test, device):
@@ -2061,8 +2067,8 @@ for name, function, check_output in (
     ("test_pool_bound_is_the_hardware_limit", test_pool_bound_is_the_hardware_limit, True),
     ("test_pool_follower_grows_with_its_leader", test_pool_follower_grows_with_its_leader, True),
     (
-        "test_compatibility_budgets_are_silent_and_size_nothing",
-        test_compatibility_budgets_are_silent_and_size_nothing,
+        "test_compatibility_budgets_are_silent_and_start_the_pool",
+        test_compatibility_budgets_are_silent_and_start_the_pool,
         True,
     ),
     ("test_collide_outside_capture_grows_before_reading", test_collide_outside_capture_grows_before_reading, True),
