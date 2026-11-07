@@ -2132,7 +2132,6 @@ def _create_find_mesh_triangle_overlaps_kernel(narrow_ratio: int):
 narrow_phase_find_mesh_triangle_overlaps_kernel = _create_find_mesh_triangle_overlaps_kernel(0)
 
 
-
 def create_narrow_phase_process_mesh_triangle_contacts_kernel(
     writer_func: Any,
     convex_support_acceleration: bool = False,
@@ -2607,8 +2606,8 @@ def create_narrow_phase_process_mesh_plane_contacts_kernel(
 # =============================================================================
 
 
-@wp.kernel(enable_backward=False)
-def verify_narrow_phase_buffers(
+@wp.func
+def _check_narrow_phase_buffers(
     broad_phase_count: wp.array[int],
     max_broad_phase: int,
     split_query_count: wp.array[int],
@@ -2636,10 +2635,9 @@ def verify_narrow_phase_buffers(
     reduction_ht_insert_failures: wp.array[int],
     reduction_buffer_overflows: wp.array[int],
     reduction_ht_warn_load_percent: int,
-    capacity_status: wp.array[int],
-):
-    """Check buffers and retain warning history across subsequent collision calls."""
-    flags = capacity_status[0]
+    flags: int,
+) -> int:
+    """Print each buffer that overflowed; return ``flags`` with the status bit of each set."""
     if broad_phase_count[0] > max_broad_phase:
         flags = flags | 1
         wp.printf(
@@ -2754,7 +2752,134 @@ def verify_narrow_phase_buffers(
                 "Increase max_triangle_pairs.\n",
                 reduction_buffer_overflows[0],
             )
-    capacity_status[0] = flags
+    return flags
+
+
+@wp.kernel(enable_backward=False)
+def verify_narrow_phase_buffers(
+    broad_phase_count: wp.array[int],
+    max_broad_phase: int,
+    split_query_count: wp.array[int],
+    max_split_query: int,
+    gjk_count: wp.array[int],
+    max_gjk: int,
+    split_gjk_count: wp.array[int],
+    max_split_gjk: int,
+    split_manifold_count: wp.array[int],
+    max_split_manifold: int,
+    mesh_count: wp.array[int],
+    max_mesh: int,
+    triangle_count: wp.array[int],
+    max_triangle: int,
+    mesh_plane_count: wp.array[int],
+    max_mesh_plane: int,
+    mesh_mesh_count: wp.array[int],
+    max_mesh_mesh: int,
+    sdf_sdf_count: wp.array[int],
+    max_sdf_sdf: int,
+    contact_count: wp.array[int],
+    max_contacts: int,
+    reduction_ht_active_slots: wp.array[int],
+    reduction_ht_capacity: int,
+    reduction_ht_insert_failures: wp.array[int],
+    reduction_buffer_overflows: wp.array[int],
+    reduction_ht_warn_load_percent: int,
+):
+    """Check for buffer overflows in the collision pipeline."""
+    _check_narrow_phase_buffers(
+        broad_phase_count,
+        max_broad_phase,
+        split_query_count,
+        max_split_query,
+        gjk_count,
+        max_gjk,
+        split_gjk_count,
+        max_split_gjk,
+        split_manifold_count,
+        max_split_manifold,
+        mesh_count,
+        max_mesh,
+        triangle_count,
+        max_triangle,
+        mesh_plane_count,
+        max_mesh_plane,
+        mesh_mesh_count,
+        max_mesh_mesh,
+        sdf_sdf_count,
+        max_sdf_sdf,
+        contact_count,
+        max_contacts,
+        reduction_ht_active_slots,
+        reduction_ht_capacity,
+        reduction_ht_insert_failures,
+        reduction_buffer_overflows,
+        reduction_ht_warn_load_percent,
+        0,
+    )
+
+
+@wp.kernel(enable_backward=False)
+def record_narrow_phase_buffers(
+    broad_phase_count: wp.array[int],
+    max_broad_phase: int,
+    split_query_count: wp.array[int],
+    max_split_query: int,
+    gjk_count: wp.array[int],
+    max_gjk: int,
+    split_gjk_count: wp.array[int],
+    max_split_gjk: int,
+    split_manifold_count: wp.array[int],
+    max_split_manifold: int,
+    mesh_count: wp.array[int],
+    max_mesh: int,
+    triangle_count: wp.array[int],
+    max_triangle: int,
+    mesh_plane_count: wp.array[int],
+    max_mesh_plane: int,
+    mesh_mesh_count: wp.array[int],
+    max_mesh_mesh: int,
+    sdf_sdf_count: wp.array[int],
+    max_sdf_sdf: int,
+    contact_count: wp.array[int],
+    max_contacts: int,
+    reduction_ht_active_slots: wp.array[int],
+    reduction_ht_capacity: int,
+    reduction_ht_insert_failures: wp.array[int],
+    reduction_buffer_overflows: wp.array[int],
+    reduction_ht_warn_load_percent: int,
+    capacity_status: wp.array[int],
+):
+    """Check buffers and retain warning history across subsequent collision calls."""
+    capacity_status[0] = _check_narrow_phase_buffers(
+        broad_phase_count,
+        max_broad_phase,
+        split_query_count,
+        max_split_query,
+        gjk_count,
+        max_gjk,
+        split_gjk_count,
+        max_split_gjk,
+        split_manifold_count,
+        max_split_manifold,
+        mesh_count,
+        max_mesh,
+        triangle_count,
+        max_triangle,
+        mesh_plane_count,
+        max_mesh_plane,
+        mesh_mesh_count,
+        max_mesh_mesh,
+        sdf_sdf_count,
+        max_sdf_sdf,
+        contact_count,
+        max_contacts,
+        reduction_ht_active_slots,
+        reduction_ht_capacity,
+        reduction_ht_insert_failures,
+        reduction_buffer_overflows,
+        reduction_ht_warn_load_percent,
+        capacity_status[0],
+    )
 
 
 class NarrowPhase:
@@ -2946,7 +3071,7 @@ class NarrowPhase:
                 primitive multi-contact paths). ``0`` allocates no sort buffer, for
                 callers that only use :meth:`launch_custom_write` and sort themselves.
             verify_buffers: When True (the default), launch a ``dim=[1]``
-                diagnostic kernel (:func:`verify_narrow_phase_buffers`) at the
+                diagnostic kernel (:func:`record_narrow_phase_buffers`) at the
                 end of :meth:`launch` that compares each public counter on this
                 class (``gjk_candidate_pairs_count``, ``split_gjk_work_count``,
                 ``split_manifold_work_count``, ``shape_pairs_mesh_count``,
@@ -3596,11 +3721,8 @@ class NarrowPhase:
             det_capacity = contact_max if contact_max is not None else max_candidate_pairs
             if deterministic and det_capacity > 0:
                 self._sort_key_array = wp.zeros(det_capacity, dtype=wp.int64, device=device)
-                self._contact_sorter = ContactSorter(
-                    det_capacity,
-                    key_bit_count=self._contact_sort_sub_key_bits + 2 * self._contact_sort_shape_index_bits,
-                    device=device,
-                )
+                # The live sort compares whole keys; it has no radix passes for a key width to limit.
+                self._contact_sorter = ContactSorter(det_capacity, device=device)
             else:
                 self._sort_key_array = wp.zeros(0, dtype=wp.int64, device=device)
                 self._contact_sorter = None
@@ -4965,7 +5087,7 @@ class NarrowPhase:
                 max_split_query = -1
 
             wp.launch(
-                kernel=verify_narrow_phase_buffers,
+                kernel=record_narrow_phase_buffers,
                 dim=[1],
                 inputs=[
                     candidate_pair_count,
@@ -5013,7 +5135,7 @@ class NarrowPhase:
         later clean calls and graph replays. Clearing acknowledges prior warnings;
         it does not repair results, resize buffers, or recapture graphs.
 
-        This covers :func:`verify_narrow_phase_buffers` and the optional pair-CSR
+        This covers :func:`record_narrow_phase_buffers` and the optional pair-CSR
         raw-witness/membership guard: not soft contacts, hydroelastic internal
         storage, or post-narrow-phase owners such as body pair reduction/contact
         matching. ``reduction_hash_load`` is a load warning,

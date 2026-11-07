@@ -63,7 +63,7 @@ candidate a pair's window can give, :class:`TerrainFinishScratch`; a block's lan
 same rows, bit for bit. A pair's rows live in its walk slots, or when they are more, in a spill
 region sized at the scene level (:class:`TerrainLawRows`). A spill region too small for a collide's rows, or a window
 larger than the one its pair's shape data gave at construction, sets a sticky bit of the narrow phase's buffer status
-word, which ``verify_narrow_phase_buffers`` keeps and ``NarrowPhase.check_buffer_capacity`` raises on
+word, which ``record_narrow_phase_buffers`` keeps and ``NarrowPhase.check_buffer_capacity`` raises on
 (``terrain_rows``; stale features: ``terrain_stale``; a solid class's job lists without room for a pair's work:
 ``terrain_jobs``).
 """

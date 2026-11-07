@@ -45,6 +45,7 @@ from collections.abc import Callable
 import numpy as np
 import warp as wp
 
+from ..sim.shape_contact_pairs import _shape_contact_pairs_host
 from .terrain_law import (
     TERRAIN_FINE_CELLS,
     TERRAIN_FLAT_EPS,
@@ -1471,7 +1472,7 @@ class TerrainPairTable:
         from .flags import ShapeFlags  # noqa: PLC0415
 
         colliding = (flags & int(ShapeFlags.COLLIDE_SHAPES)) != 0
-        listed = getattr(model, "shape_contact_pairs", None)
+        listed = _shape_contact_pairs_host(model) if count else None
         explicit = pairs
         if not count:
             pairs = np.zeros((0, 2), np.int32)
@@ -1479,8 +1480,7 @@ class TerrainPairTable:
             explicit = explicit.numpy() if hasattr(explicit, "numpy") else np.asarray(explicit)
             pairs = heightfield_pair_table(types, worlds, colliding, explicit_pairs=explicit.reshape(-1, 2))
         elif listed is not None:
-            explicit = listed.numpy().reshape(-1, 2)[: int(model.shape_contact_pair_count)]
-            pairs = heightfield_pair_table(types, worlds, colliding, explicit_pairs=explicit)
+            pairs = heightfield_pair_table(types, worlds, colliding, explicit_pairs=listed)
         else:
             pairs = heightfield_pair_table(
                 types,

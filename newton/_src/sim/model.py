@@ -1955,10 +1955,9 @@ class Model:
                     "Initialize model.shape_contact_pairs before CUDA graph capture, "
                     "for example by constructing the explicit CollisionPipeline before capture."
                 )
-            pair_list, templates = topology.build_pair_templates()
-            pairs = wp.array(pair_list, dtype=wp.vec2i, device=self.device, copy=False)
+            pairs = wp.array(topology.build_pairs(), dtype=wp.vec2i, device=self.device, copy=False)
             self._shape_contact_pairs = pairs
-            self._shape_contact_pair_templates = templates.bind(pairs)
+            self._shape_contact_pair_templates = topology.pair_templates.bind(pairs)
         return pairs
 
     @shape_contact_pairs.setter

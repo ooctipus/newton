@@ -164,6 +164,7 @@ def parse_usd(
     force_position_velocity_actuation: bool = False,
     convert_mjc_equality_constraints: bool = True,
     override_root_xform: bool = False,
+    physx_missing_inertia_fallback: bool = False,
     legacy_margin_gap: bool = False,
     return_deformable_results: bool = False,
     allow_unsafe_torch_checkpoints: bool = False,
@@ -304,6 +305,9 @@ def parse_usd(
             :attr:`~newton.JointTargetMode.POSITION` if stiffness > 0, :attr:`~newton.JointTargetMode.VELOCITY` if only
             damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
             (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
+        physx_missing_inertia_fallback: If True, bodies with authored positive mass but no authored diagonal
+            inertia use PhysX's 0.1 m small-sphere inertia fallback instead of shape-derived inertia. This is
+            intended for IsaacLab/PhysX parity when PhysX reports the "possibly invalid inertia tensor" fallback.
         legacy_margin_gap: If True, restore pre-MuJoCo-3.9 import behavior
             where ``shape_margin`` is computed as ``mjc_margin - mjc_gap``.
             Use for USD files authored against MuJoCo <= 3.8. Defaults to
@@ -2113,8 +2117,14 @@ def parse_usd(
                         stacklevel=2,
                     )
                 # When mass is authored but inertia is not, scale the accumulated
-                # inertia to be consistent with the authored mass.
-                if not has_effective_inertia and shape_accumulated_mass > 0.0 and mass > 0.0:
+                # inertia to be consistent with the authored mass, or take PhysX's
+                # small-sphere fallback when asked.
+                if not has_effective_inertia and mass > 0.0 and physx_missing_inertia_fallback:
+                    radius = 0.1 / linear_unit if linear_unit > 0.0 else 0.1
+                    inertia = wp.mat33(np.eye(3, dtype=np.float32) * (0.4 * mass * radius * radius))
+                    builder.body_inertia[body_id] = inertia
+                    builder.body_inv_inertia[body_id] = wp.inverse(inertia)
+                elif not has_effective_inertia and shape_accumulated_mass > 0.0 and mass > 0.0:
                     scale = mass / shape_accumulated_mass
                     builder.body_inertia[body_id] = wp.mat33(np.array(builder.body_inertia[body_id]) * scale)
                     builder.body_inv_inertia[body_id] = wp.inverse(builder.body_inertia[body_id])

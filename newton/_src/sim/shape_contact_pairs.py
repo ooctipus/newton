@@ -43,6 +43,8 @@ class _ShapeContactPairs:
         self.shape_flags = np.array(shape_flags, dtype=np.int32, copy=True)
         self.filter_pairs = np.asarray(filter_pairs, dtype=np.int64)
         self.world_count = world_count
+        self.pair_templates: ShapePairTemplates | None = None
+        """The per-world templates of the last full :meth:`build_pairs`."""
         for array in (self.shape_body, self.shape_world, self.shape_group, self.shape_flags, self.filter_pairs):
             array.setflags(write=False)
 
@@ -282,17 +284,16 @@ class _ShapeContactPairs:
         return count
 
     def build_pairs(self, shape_mask: np.ndarray | None = None) -> np.ndarray:
-        """Build only the requested pairs, reusing homogeneous world templates."""
-        return self._build_pairs(shape_mask)[0]
+        """Build only the requested pairs, reusing homogeneous world templates.
 
-    def build_pair_templates(self) -> tuple[np.ndarray, ShapePairTemplates]:
-        """Build every pair and the per-world templates the list replays.
-
-        Returns:
-            The pairs of :meth:`build_pairs`, and the templates that replay into them, which
-            :class:`~newton.CollisionPipeline` tests per world instead of streaming the list.
+        Building every pair (no ``shape_mask``) also keeps the per-world templates the list replays in
+        :attr:`pair_templates`, which :class:`~newton.CollisionPipeline` tests per world instead of
+        streaming the list.
         """
-        return self._build_pairs(None)
+        pairs, templates = self._build_pairs(shape_mask)
+        if shape_mask is None:
+            self.pair_templates = templates
+        return pairs
 
     def _build_pairs(self, shape_mask: np.ndarray | None) -> tuple[np.ndarray, ShapePairTemplates]:
         """Build the pairs and record the templates and runs of worlds they replay from."""
@@ -495,6 +496,28 @@ def _shape_contact_pairs_for_mask(
         return np.empty((0, 2), dtype=np.int32)
     pairs = pairs.numpy().reshape((-1, 2))
     return pairs[shape_mask[pairs[:, 0]] & shape_mask[pairs[:, 1]]]
+
+
+def _shape_contact_pairs_host(model: Model | ModelView) -> np.ndarray | None:
+    """The model's pairs on the host without building its device pair array, or ``None`` when it has none."""
+    supplied, pairs = _shape_contact_pair_override(model)
+    if supplied:
+        return None if pairs is None else pairs.numpy().reshape((-1, 2))
+    return _shape_contact_pair_topology(model).build_pairs()
+
+
+def _shape_contact_pair_weight_sum(model: Model | ModelView, categories: np.ndarray, weights: np.ndarray) -> int | None:
+    """Sum symmetric category weights over the model's pairs without enumerating its default pairs.
+
+    Returns ``None`` when the model has neither pair topology nor a pair array.
+    """
+    supplied, pairs = _shape_contact_pair_override(model)
+    if not supplied:
+        return int(_shape_contact_pair_topology(model).count_pairs(categories=categories, weights=weights).sum())
+    if pairs is None:
+        return None
+    pairs = pairs.numpy().reshape((-1, 2))
+    return int(weights[categories[pairs[:, 0]], categories[pairs[:, 1]]].sum())
 
 
 def _shape_contact_pair_count_for_mask(
