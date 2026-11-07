@@ -1037,12 +1037,31 @@ def get_state_kernel(
     # (6 each), the axes (6 a coordinate) and each root's origin and shift (3 each).
     motion_word, bias_word = 7 * layout.bodies, 13 * layout.bodies
     axis_word, origin_word = layout.axis_offset, layout.origin_offset
-    bodies, dofs, pack, free_root = layout.bodies, layout.dofs, layout.pack, layout.free_root
+    bodies, dofs, pack = layout.bodies, layout.dofs, layout.pack
     roots, free_roots, forest, own_bias = len(layout.roots), layout.free_root_count, layout.forest, layout.own_bias
     # A rest tree (no coordinates: a body or a weld chain on the world) publishes its poses, a zero twist and its
     # validity; it integrates nothing, has no motion and collects nothing (no bias, no H_ii, no walk geometry).
     rest = dofs == 0
     from .spatial_laws import store_columns  # noqa: PLC0415
+
+    # The root slot: a single tree is a forest of one root (root 0 at body 0, the group's articulation), compiled.
+    @wp.func
+    def root_of(plan: HeldPlan, local: int) -> int:
+        if wp.static(forest):
+            return plan.root_of[local]
+        return 0
+
+    @wp.func
+    def root_local(plan: HeldPlan, root: int) -> int:
+        if wp.static(forest):
+            return plan.root_local[root]
+        return 0
+
+    @wp.func
+    def root_art(g: TreeGroup, plan: HeldPlan, root: int) -> int:
+        if wp.static(forest):
+            return plan.arts[g.group, root]
+        return g.art
 
     @wp.func
     def admit(
@@ -1153,26 +1172,15 @@ def get_state_kernel(
     @wp.func
     def transport(g: TreeGroup, plan: HeldPlan, data: PublicationData):
         """Remove the free roots' velocity transport from their accelerations."""
-        if wp.static(not forest):
-            if wp.static(free_root) and g.lane == 0:
-                kernels._light_remove_free_root_transport_from_qdd(
-                    plan.root_slot[g.group],
-                    data.free_root_joint_indices,
-                    data.joint_qd_start,
-                    data.kinematic_joint_mask,
-                    data.joint_qd,
-                    data.joint_qdd,
-                )
-        else:
-            if g.lane < wp.static(free_roots):
-                kernels._light_remove_free_root_transport_from_qdd(
-                    plan.root_slot[g.group * wp.static(free_roots) + g.lane],
-                    data.free_root_joint_indices,
-                    data.joint_qd_start,
-                    data.kinematic_joint_mask,
-                    data.joint_qd,
-                    data.joint_qdd,
-                )
+        if g.lane < wp.static(free_roots):
+            kernels._light_remove_free_root_transport_from_qdd(
+                plan.root_slot[g.group * wp.static(free_roots) + g.lane],
+                data.free_root_joint_indices,
+                data.joint_qd_start,
+                data.kinematic_joint_mask,
+                data.joint_qd,
+                data.joint_qdd,
+            )
         _sync()
 
     @wp.func
@@ -1215,18 +1223,13 @@ def get_state_kernel(
                 data.joint_q_start[joint],
             )
             relative = joint_frame_pose(data.joint_X_p[joint], transform, data.joint_X_c[joint])
-            if wp.static(not forest):
-                if local == 0:
-                    store_words(g.address, wp.static(origin_word + 3), wp.transform_get_translation(relative))
-                    relative = wp.transform(wp.vec3(), wp.transform_get_rotation(relative))
-            else:
-                if plan.parent[local] < 0:
-                    store_words(
-                        g.address,
-                        wp.static(origin_word) + 3 * (2 * plan.root_of[local] + 1),
-                        wp.transform_get_translation(relative),
-                    )
-                    relative = wp.transform(wp.vec3(), wp.transform_get_rotation(relative))
+            if plan.parent[local] < 0:
+                store_words(
+                    g.address,
+                    wp.static(origin_word + 3) + 6 * root_of(plan, local),
+                    wp.transform_get_translation(relative),
+                )
+                relative = wp.transform(wp.vec3(), wp.transform_get_rotation(relative))
             store_words(g.address, 7 * local, relative)
         _sync()
 
@@ -1234,30 +1237,20 @@ def get_state_kernel(
     def poses(g: TreeGroup, plan: HeldPlan, data: PublicationData):
         """Complete the pose scan and publish each articulation's origin."""
         scan_poses(g.address, plan)
-        if wp.static(not forest):
-            if g.lane == 0:
-                root_body = data.joint_child[g.js]
-                origin = wp.transform_point(load_words(g.address, 0, wp.transform()), data.body_com[root_body])
-                store_words(g.address, wp.static(origin_word), origin)
-                data.articulation_origin[g.art] = origin + load_words(g.address, wp.static(origin_word + 3), wp.vec3())
-        else:
-            for root in range(g.lane, wp.static(roots), g.stride):
-                root_local = plan.root_local[root]
-                root_body = data.joint_child[g.js + root_local]
-                origin = wp.transform_point(
-                    load_words(g.address, 7 * root_local, wp.transform()), data.body_com[root_body]
-                )
-                store_words(g.address, wp.static(origin_word) + 3 * (2 * root), origin)
-                data.articulation_origin[plan.arts[g.group, root]] = origin + load_words(
-                    g.address, wp.static(origin_word) + 3 * (2 * root + 1), wp.vec3()
-                )
+        for root in range(g.lane, wp.static(roots), g.stride):
+            local = root_local(plan, root)
+            origin = wp.transform_point(
+                load_words(g.address, 7 * local, wp.transform()), data.body_com[data.joint_child[g.js + local]]
+            )
+            store_words(g.address, wp.static(origin_word) + 6 * root, origin)
+            data.articulation_origin[root_art(g, plan, root)] = origin + load_words(
+                g.address, wp.static(origin_word + 3) + 6 * root, wp.vec3()
+            )
         _sync()
 
     @wp.func
     def motion(
         g: TreeGroup,
-        origin: wp.vec3,
-        shift: wp.vec3,
         plan: HeldPlan,
         data: PublicationData,
         q: wp.array[float],
@@ -1274,9 +1267,9 @@ def get_state_kernel(
                 clock_m0 = _clock()
             joint = g.js + local
             parent = plan.parent[local]
-            if wp.static(forest):
-                origin = load_words(g.address, wp.static(origin_word) + 3 * (2 * plan.root_of[local]), wp.vec3())
-                shift = load_words(g.address, wp.static(origin_word) + 3 * (2 * plan.root_of[local] + 1), wp.vec3())
+            word = wp.static(origin_word) + 6 * root_of(plan, local)
+            origin = load_words(g.address, word, wp.vec3())
+            shift = load_words(g.address, word + 3, wp.vec3())
             anchor = data.joint_X_p[joint]
             if parent >= 0:
                 anchor = load_words(g.address, 7 * parent, wp.transform()) * anchor
@@ -1364,15 +1357,13 @@ def get_state_kernel(
         scan_motion(g.address, plan)
 
     @wp.func
-    def publish(
-        g: TreeGroup, origin: wp.vec3, shift: wp.vec3, plan: HeldPlan, data: PublicationData, cache: KineticData
-    ):
+    def publish(g: TreeGroup, plan: HeldPlan, data: PublicationData, cache: KineticData):
         """Publish each body's pose and twist with its bias wrench and moments."""
         for local in range(g.lane, bodies, g.stride):
             body = data.joint_child[g.js + local]
-            if wp.static(forest):
-                origin = load_words(g.address, wp.static(origin_word) + 3 * (2 * plan.root_of[local]), wp.vec3())
-                shift = load_words(g.address, wp.static(origin_word) + 3 * (2 * plan.root_of[local] + 1), wp.vec3())
+            word = wp.static(origin_word) + 6 * root_of(plan, local)
+            origin = load_words(g.address, word, wp.vec3())
+            shift = load_words(g.address, word + 3, wp.vec3())
             pose = load_words(g.address, 7 * local, wp.transform())
             data.body_q[body] = wp.transform(
                 wp.transform_get_translation(pose) + shift, wp.transform_get_rotation(pose)
@@ -1477,17 +1468,15 @@ def get_state_kernel(
         if wp.static(clocked):
             clock_2 = _clock()
         poses(g, plan, data)
-        origin = load_words(g.address, wp.static(origin_word), wp.vec3())
-        shift = load_words(g.address, wp.static(origin_word + 3), wp.vec3())
         if wp.static(motion_velocity):
             qd = motion_qd
         if wp.static(clocked):
             clock_3 = _clock()
         if wp.static(not rest):
-            motion(g, origin, shift, plan, data, q, qd)
+            motion(g, plan, data, q, qd)
         if wp.static(clocked):
             clock_4 = _clock()
-        publish(g, origin, shift, plan, data, cache)
+        publish(g, plan, data, cache)
         if wp.static(clocked):
             clock_5 = _clock()
         close(g, p, plan, data, cache, q, qd)
