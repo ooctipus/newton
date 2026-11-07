@@ -1063,6 +1063,7 @@ def test_centered_two_spatial_depths_full_buffer_does_not_publish_voxel_key(test
             position=wp.vec3(0.0),
             normal=wp.vec3(0.0, 1.0, 0.0),
             depth=-0.01,
+            step_end_depth=-0.01,
             fingerprint=2,
             centered_position=wp.vec3(0.0),
             inner_spatial_depth=0.0,
@@ -1083,6 +1084,8 @@ def test_centered_two_spatial_depths_full_buffer_does_not_publish_voxel_key(test
     test.assertEqual(get_active_slot_count(reducer), 1)
     test.assertEqual(int(reducer.ht_insert_failures.numpy()[0]), 0)
     test.assertEqual(get_winning_contacts(reducer), [])
+
+
 def test_centered_two_spatial_depths_closing_far_side_keeps_its_extremes(test, device):
     """A separated candidate that closes within the step competes as touching for the directional slots."""
 

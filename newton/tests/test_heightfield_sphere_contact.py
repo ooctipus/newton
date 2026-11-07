@@ -95,6 +95,7 @@ def _compare_pairs(
         1,
         margin[0],
         margin[1],
+        support.SupportMapDataProvider(),
         generic,
         tid,
         0,

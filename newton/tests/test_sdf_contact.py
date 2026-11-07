@@ -131,7 +131,7 @@ class TestSDFContact(unittest.TestCase):
                     body = builder.add_body(xform=wp.transform(wp.vec3(0.1 * k, 0.0, 0.0), wp.quat_identity()))
                     builder.add_shape_mesh(body, mesh=mesh)
                 model = builder.finalize(device=device)
-                edge_range = wp.vec2i(*model.shape_edge_range.numpy()[0])
+                edge_range = wp.vec2i(*model._shape_edge_range.numpy()[0])
                 sdf_index = int(model._shape_sdf_index.numpy()[1])
                 num_edges = int(edge_range[1])
                 num_clusters = -(-num_edges // EDGE_CLUSTER_SIZE)
@@ -162,11 +162,11 @@ class TestSDFContact(unittest.TestCase):
                         inputs=[
                             model._texture_sdf_data,
                             sdf_index,
-                            model.mesh_edge_indices,
-                            model.mesh_edge_centers,
-                            model.mesh_edge_order,
-                            model.mesh_edge_clusters,
-                            model.mesh_edge_cluster_reach,
+                            model._mesh_edge_indices,
+                            model._mesh_edge_centers,
+                            model._mesh_edge_order,
+                            model._mesh_edge_clusters,
+                            model._mesh_edge_cluster_reach,
                             edge_range,
                             transforms,
                             contact_threshold,
@@ -176,7 +176,7 @@ class TestSDFContact(unittest.TestCase):
                         device=device,
                     )
                     may_np, passes_np = may.numpy(), passes.numpy()
-                    order = model.mesh_edge_order.numpy()[edge_range[0] : edge_range[0] + num_edges]
+                    order = model._mesh_edge_order.numpy()[edge_range[0] : edge_range[0] + num_edges]
                     self.assertTrue(np.all(may_np >= 0) and np.all(passes_np >= 0))
                     member_passes = np.zeros((count, num_clusters), dtype=bool)
                     for q in range(num_clusters):

@@ -15,7 +15,14 @@ import newton
 from newton._src.geometry.coherent_convex import _ConvexQueryCache
 from newton._src.geometry.coherent_convex_rejection import _create_rejection_query_kernels
 from newton._src.geometry.convex_query_cost import _ConvexMethodChoice, _nonnegative_fit, _QueryCostModel
-from newton.tests.test_coherent_convex_rejection import _accepted, _box_inputs, _buffers, _original, _selector_model
+from newton.tests.test_coherent_convex_rejection import (
+    _accepted,
+    _box_inputs,
+    _buffers,
+    _original,
+    _original_values,
+    _selector_model,
+)
 from newton.tests.unittest_utils import add_function_test, assert_host_only, get_test_devices
 
 # Terrain route flags the cases flip; every other NEWTON_ variable is cleared, so a
@@ -97,11 +104,23 @@ def test_graph_choice_preserves_queries(test, device):
         wp.launch(
             original[0],
             threads,
-            [pair_array, count if query_count is None else query_count, *values, threads, *buffers],
+            [
+                pair_array,
+                count if query_count is None else query_count,
+                *_original_values(values, device),
+                threads,
+                *buffers,
+            ],
             device=device,
             block_dim=128,
         )
-        wp.launch(original[1], threads, [pair_array, *values, threads, *buffers], device=device, block_dim=128)
+        wp.launch(
+            original[1],
+            threads,
+            [pair_array, *_original_values(values, device), threads, *buffers],
+            device=device,
+            block_dim=128,
+        )
 
     def rejection(query_count, gjk_count):
         cache.begin()

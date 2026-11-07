@@ -29,6 +29,15 @@ def _original():
     )
 
 
+def _original_values(values, device):
+    """The split kernels' shape inputs: the pair inputs with the hull support arrays, empty, after the sources."""
+    support = [
+        wp.zeros(0, dtype=wp.vec4i, device=device),
+        *(wp.zeros(0, dtype=int, device=device) for _ in range(3)),
+    ]
+    return [*values[:4], *support, *values[4:]]
+
+
 def _buffers(n, device):
     return [
         wp.zeros(n, dtype=ConvexQueryResult, device=device),
@@ -79,12 +88,16 @@ def test_rejection_queries(test, device):
     wp.launch(
         original[0],
         dim=threads,
-        inputs=[pair_array, count, *values, threads, *original_buffers],
+        inputs=[pair_array, count, *_original_values(values, device), threads, *original_buffers],
         device=device,
         block_dim=128,
     )
     wp.launch(
-        original[1], dim=threads, inputs=[pair_array, *values, threads, *original_buffers], device=device, block_dim=128
+        original[1],
+        dim=threads,
+        inputs=[pair_array, *_original_values(values, device), threads, *original_buffers],
+        device=device,
+        block_dim=128,
     )
     original_ids, original_results = _accepted(original_buffers)
     test.assertEqual(len(original_ids), 88)
@@ -182,12 +195,16 @@ def test_current_motion_and_query_graph(test, device):
         wp.launch(
             original[0],
             dim=threads,
-            inputs=[pair_array, count, *values, threads, *baseline],
+            inputs=[pair_array, count, *_original_values(values, device), threads, *baseline],
             device=device,
             block_dim=128,
         )
         wp.launch(
-            original[1], dim=threads, inputs=[pair_array, *values, threads, *baseline], device=device, block_dim=128
+            original[1],
+            dim=threads,
+            inputs=[pair_array, *_original_values(values, device), threads, *baseline],
+            device=device,
+            block_dim=128,
         )
 
     def run_candidate():

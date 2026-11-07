@@ -1844,7 +1844,10 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
 
         if not still_wins and use_inner and (won_mask & (1 << wp.static(NUM_SPATIAL_DIRECTIONS))) != 0:
             provisional_value = make_contact_value(-depth, fingerprint, 0, deterministic)
-            if reducer_data.ht_values[reduction_value_index(entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS))] == provisional_value:
+            if (
+                reducer_data.ht_values[reduction_value_index(entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS))]
+                == provisional_value
+            ):
                 still_wins = True
 
     if (
@@ -1872,11 +1875,7 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
                     score = wp.dot(pos_2d, dir_2d)
                     provisional_value = make_spatial_contact_value(score, step_end_inner, fingerprint, 0, deterministic)
                     reduction_rollback_slot(
-                        entry_idx,
-                        dir_i,
-                        provisional_value,
-                        replaced_values[dir_i],
-                        reducer_data.ht_values
+                        entry_idx, dir_i, provisional_value, replaced_values[dir_i], reducer_data.ht_values
                     )
             if use_inner and (won_mask & (1 << wp.static(NUM_SPATIAL_DIRECTIONS))) != 0:
                 provisional_value = make_contact_value(-depth, fingerprint, 0, deterministic)
@@ -1885,7 +1884,7 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
                     wp.static(NUM_SPATIAL_DIRECTIONS),
                     provisional_value,
                     replaced_values[wp.static(NUM_SPATIAL_DIRECTIONS)],
-                    reducer_data.ht_values
+                    reducer_data.ht_values,
                 )
         if use_inner and voxel_entry_idx >= 0 and (won_mask & (1 << wp.static(NUM_SPATIAL_DIRECTIONS + 1))) != 0:
             provisional_value = make_contact_value(-depth, fingerprint, 0, deterministic)
@@ -1894,7 +1893,7 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
                 voxel_local_slot,
                 provisional_value,
                 replaced_values[wp.static(NUM_SPATIAL_DIRECTIONS + 1)],
-                reducer_data.ht_values
+                reducer_data.ht_values,
             )
         return -1
 
@@ -1916,21 +1915,13 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
             voxel_value = make_contact_value(-depth, fingerprint, contact_id, deterministic)
             if voxel_only:
                 previous_value = reduction_try_update_slot(
-                    voxel_entry_idx,
-                    voxel_local_slot,
-                    voxel_value,
-                    reducer_data.ht_values
+                    voxel_entry_idx, voxel_local_slot, voxel_value, reducer_data.ht_values
                 )
                 if previous_value >= voxel_value:
                     reclaim_contact_id(contact_id, reducer_data)
                     return -1
             else:
-                reduction_update_slot(
-                    voxel_entry_idx,
-                    voxel_local_slot,
-                    voxel_value,
-                    reducer_data.ht_values
-                )
+                reduction_update_slot(voxel_entry_idx, voxel_local_slot, voxel_value, reducer_data.ht_values)
         else:
             wp.atomic_add(reducer_data.ht_insert_failures, 0, 1)
             if voxel_only:
@@ -3329,12 +3320,18 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
 
             if wp.static(primitive_type == 0):
                 # Heightfields use extruded triangle prisms to keep contacts one-sided near
-                # cell boundaries, so their sphere contacts must retain the generic path.
-                if shape_data_b.shape_type == GeoType.SPHERE and type_a != GeoType.HFIELD:
-                    tri_a = pos_a
-                    tri_b = pos_a + shape_data_a.scale
-                    tri_c = pos_a + shape_data_a.auxiliary
-                    surface_normal = wp.cross(tri_b - tri_a, tri_c - tri_a)
+                # cell boundaries, so their sphere contacts must retain the generic path. So
+                # does a sphere whose center is behind its triangle: only a closed mesh's
+                # nearest face admits it, and the generic path keeps that face's outward normal.
+                tri_a = pos_a
+                tri_b = pos_a + shape_data_a.scale
+                tri_c = pos_a + shape_data_a.auxiliary
+                surface_normal = wp.cross(tri_b - tri_a, tri_c - tri_a)
+                if (
+                    shape_data_b.shape_type == GeoType.SPHERE
+                    and type_a != GeoType.HFIELD
+                    and wp.dot(pos_b - tri_a, surface_normal) >= 0.0
+                ):
                     normal_length_sq = wp.length_sq(surface_normal)
                     closest = closest_point_on_triangle(pos_b, tri_a, tri_b, tri_c)
                     sphere_radius = shape_data_b.scale[0]

@@ -178,7 +178,6 @@ def test_pair_table_without_a_pair_list(test, device):
     model, heightfield, kinds, excluded = _scene(device)
     with_list = TerrainPairTable(model)
     model.shape_contact_pairs = None
-    model.shape_contact_pair_count = 0
     without = TerrainPairTable(model)
     np.testing.assert_array_equal(without.pairs_host, with_list.pairs_host)
     test.assertEqual({tuple(p) for p in without.pairs_host.tolist()}, {(heightfield, s) for s in kinds})
