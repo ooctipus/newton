@@ -8,24 +8,20 @@ rows walked together from its first (1, 3, or 4 under contact torsion), or a joi
 (:func:`unit_reader`); its seeds, a wrench at a body's frame or a covector at a coordinate (``WALK_WRENCH``,
 :func:`joint_seeds`), walk up their root paths (``WALK_ROW``) into the placement's sink:
 
-- **the support placement** (case K1, FL3.4): each footprint at its rank in the row's support (factor coordinates)
-  and the unit's Gram for its block record, through the class's path table in constant memory; the step's units are
-  listed first (:func:`support_units_kernel`, :class:`UnitList`) and the walkers stride over the list
-  (:func:`support_rows_kernel`), the work sized by the step's units, not by the rows' capacity;
-- **the general placement** (case K6, FL3.3): each side's entries in the packed rows, through each tree's class's path
-  table (:func:`packed_walker`), world-major with the bilateral blocks' closure (:func:`walked_rows_kernel`);
+- **the support placement** (case K1, FL3.4): each footprint at its rank in the row's support and the unit's Gram for
+  its block record; the walkers stride over the step's unit list (:func:`support_units_kernel`,
+  :func:`support_rows_kernel`);
+- **the general placement** (case K6, FL3.3): each side's entries in the packed rows, at its coordinates or its
+  support class's (:func:`packed_walker`), world-major with the bilateral blocks' closure (:func:`walked_rows_kernel`);
 - **the sparse diagonal** (case K2, FL3.5): the arm's side into the row's dense part, a key of the star one step to
   the row's slot (:func:`slot_rows_kernel`, :func:`slot_header`);
-- **the free bodies' rows** (the packed rows of the line from ``body_base``, each side six entries): a
-  contact row, or a speed row's axis, a covector at the body's root, for its diagonal, one writer over both
-  (:func:`write_free_body_rows`), through the packed walker (:func:`packed_walker`).
+- **the free bodies' rows** (the packed rows of the line from ``body_base``, six entries a side): their contact and
+  speed rows (:func:`write_free_body_rows`).
 
-Each row's header is its diagonal ``|z|^2 + cfm`` (the walk's sums of squares, re-read where two seeds share a side or
-a side slips), its incident velocity ``J v_hat`` (the step's ``J`` entries each walk passes) and its rhs by the row law
-(:func:`.row_kernels.row_bias`). A wrench enters as the step's ``J`` (the step's columns the finish published, shifted to
-the walk's frames, :attr:`.factor.walk.WalkTrees.now`), so a step between refreshes whitens the step's ``J`` by the
-held factor. A slipping drive's ``K`` leaves the rows by its release along its path (``R``, the predictor's border,
-:func:`.tree_kinetic_state.border_solve`), which keeps every row inside its support.
+Each row's header is its diagonal ``|z|^2 + cfm`` (re-read where two seeds share a side or a side slips), its incident
+velocity ``J v_hat`` and its rhs by the row law (:func:`.row_kernels.row_bias`). A wrench enters as the step's ``J``
+(:attr:`.factor.walk.WalkTrees.now`, at the walk's frames). A slipping drive's ``K`` leaves the rows by its release
+along its path (``R``, :func:`.tree_kinetic_state.border_solve`), which keeps every row inside its support.
 
 No ``J`` is formed. The rows and the sweeps' leave share the walk's one frame (FL3_design §1.2); the sweeps' change
 goes to the step's one leave (:func:`.factor.walk.walk_leave_kernel`).
@@ -1020,9 +1016,8 @@ def packed_walker(
     (:func:`star_step`), and the diagonal stored without its slots' squares and ``cfm``, which the writer adds.
     ``tables``: the walking classes' path tables (:func:`.factor.walk.walk_prelude`),
     fixed at build, each tree's path read from constant memory by its class (one table: every tree's). With
-    ``classes``, each side's entries are its support class's (:func:`.packed_rows.row_classes`, the sink's
-    ``classes``), the row's sides in their order (:func:`.row_records.row_sides`), and the row's classes stored with
-    it."""
+    ``classes``, each side's entries are its support class's (:func:`.packed_rows.row_classes`), sides in row order,
+    and the row's classes stored with it."""
     tree = _CLASS_TREE if len(tables) > 1 else ""
     if classes:
         start, side_text = _CLASS_START, substitute(_CLASS_SIDE, tree=tree)

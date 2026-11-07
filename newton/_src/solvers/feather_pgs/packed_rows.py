@@ -88,14 +88,8 @@ from its sides or from its record's words (no stored coordinates), and where a s
 
 
 def support_width(response_dofs: np.ndarray, art_to_world: np.ndarray, world_count: int) -> int:
-    """The packed rows' width: the most coordinates two articulations of one world hold (one, in a world of one);
-    the rows are ``dense`` where this is the widest world's coordinates.
-
-    Args:
-        response_dofs: Each articulation's coordinates.
-        art_to_world: Each articulation's world (-1 for none).
-        world_count: The worlds.
-    """
+    """The most ``response_dofs`` (each articulation's coordinates, or any width a side takes) two articulations of one
+    world hold (``art_to_world``, -1 for none), at least one: the packed rows' width by side or two contact paths'."""
     largest = np.zeros((max(int(world_count), 1), 2), dtype=np.int64)
     for size, world in zip(np.asarray(response_dofs).tolist(), np.asarray(art_to_world).tolist(), strict=True):
         if world < 0:

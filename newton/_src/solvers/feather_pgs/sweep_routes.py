@@ -927,10 +927,9 @@ class GeneralSweep(SweepConfig):
       unit builder's rule picks the worlds, :class:`.sweep_units.ColoredRule`);
     - the row record: ``places`` (:class:`RowPlaces`, the plan's storage choice): the dense rows' metadata staged or
       their records streamed; the free rows' records always stream;
-    - the support class: ``max_row_dofs`` (the placement's packed support), ``support_classes`` (each row's sides at
-      their support classes' coordinates, :func:`.packed_rows.row_classes`), ``wide_rows`` (rows over every
-      coordinate, the bilateral block's), and the free bodies' 6 + 6 class: ``free_rows`` their own run, else rows of
-      the line, their ``speed_rows`` the line's last;
+    - the support class: ``max_row_dofs`` (the placement's packed support), ``support_classes`` (the rows' sides by
+      their classes, :func:`.packed_rows.row_classes`), ``wide_rows`` (the bilateral block's), and the free bodies' 6 +
+      6 class: ``free_rows`` their own run, else rows of the line, their ``speed_rows`` the line's last;
     - ``has_dense_velocity_limit_rows``: the velocity limits' last word; ``seeded``: the seed; ``pitch``: the line.
 
     The warp mapping is a warp a world on CUDA and one thread on the CPU (:meth:`work`); the colored one a block of

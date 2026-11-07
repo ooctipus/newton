@@ -617,9 +617,8 @@ class Placement:
             self.rigid_velocity_limit_slot = None
 
     def allocate_packed_rows(self) -> None:
-        """The matrix-free sweeps' rows, packed by support (:mod:`.packed_rows`): every row of the world's line, the
-        free bodies' included (their two one-node trees of six are two sides like any other), each row as wide as two
-        of its world's articulations hold; a placeholder without those sweeps."""
+        """The matrix-free sweeps' rows, packed (:mod:`.packed_rows`): every row of the world's line, by side or by
+        support class; a placeholder without those sweeps."""
         if self.classes.mf_sweeps:
             sizes, worlds = self.forest.articulation_response_dof_count.numpy(), self.forest.art_to_world.numpy()
             offsets = self.forest.articulation_world_dof_offset.numpy()
@@ -702,11 +701,8 @@ class Placement:
         self.packed_support, self.packed_dense = int(table.width), 0
 
     def place_dense_response(self, *, paired_coordinates: bool) -> None:
-        """Where the dense rows' response lives (``packed_response`` and ``packed_response_reason``).
-
-        The matrix-free sweeps, and every route beside them, read the dense rows packed by support
-        (:mod:`.packed_rows`): the packed build alone serves the step.
-        """
+        """Where the dense rows' response lives (``packed_response``, ``packed_response_reason``): the packed rows
+        (:mod:`.packed_rows`) wherever a matrix-free sweep reads them."""
         self.packed_response_reason = None if self.classes.mf_sweeps else "No matrix-free sweep reads packed rows."
         self.packed_response = self.packed_response_reason is None
         if not self.packed_response:
@@ -1038,10 +1034,8 @@ class Placement:
 
     def row_support(self) -> RowSupport:
         """Where the dense rows' entries sit and the seeds the one writer walks (:class:`.row_records.RowSupport`): the
-        rows' sides, the articulations' coordinates and first world coordinates, the layout, and the unit sources.
-        Without the matrix-free sweeps there are no packed rows: the articulations' offsets are a one-entry
-        placeholder. A class that walks no rows holds none (:func:`.step_plan._stages`): its unit sources are a
-        placeholder."""
+        rows' sides, the articulations' coordinates and first world coordinates, the layout, and the unit sources
+        (placeholders without packed rows or without a walk, :func:`.step_plan._stages`)."""
         support = RowSupport()
         support.sides = self.row_sides
         support.dofs = self.forest.articulation_response_dof_count
