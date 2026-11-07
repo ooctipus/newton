@@ -403,8 +403,8 @@ WALK_UNPACKED = 14
 
 WALK_LINK = 4
 """Floats per body of the device walk's data: its frame's world point and a pad, one aligned ``float4``. A walk forms a
-body's offset to its parent's frame from the two frame points (``WALK_READ_LINK``, ``WALK_LINK_IN``), the float32
-difference the refresh takes (``WALK_OFFSET``); the step's links (:attr:`WalkTrees.now_link`) take the same layout."""
+body's offset to its parent's frame from the two frame points (``WALK_READ_LINK``, ``WALK_LINK_IN``, the refresh's
+too), one float32 difference; the step's links (:attr:`WalkTrees.now_link`) take the same layout."""
 
 WALK_PIVOT = 13
 """Where a coordinate's unpacked record holds its pivot without ``K`` (:data:`WALK_UNPACKED`)."""
@@ -808,6 +808,20 @@ _WALK_LOADS = """#ifndef WALK_READ
         d[6] = walk_b_.x; d[7] = walk_b_.y; d[8] = walk_b_.z; d[9] = walk_b_.w; d[10] = walk_e_.x;             \
         d[11] = walk_e_.y; d[12] = WALK_ABS(walk_a_.w); d[13] = walk_e_.z;                                     \
     }
+// WALK_WRITE(o, s, inv, ut, pivot, side): a coordinate's record at o as WALK_READ reads it, the refresh's: the column
+// s's non-zero half (the angular one where it turns, 1 / ell's sign bit set), ut, P0 and the side offset; a column of
+// two halves keeps its linear half in the side quad, side floats on (0: the records keep no side).
+#define WALK_WRITE(o, s, inv, ut, pivot, side)                                                                 \
+    {                                                                                                          \
+        float* walk_o_ = (o);                                                                                  \
+        const bool walk_t_ = s[3] != 0.0f || s[4] != 0.0f || s[5] != 0.0f;                                     \
+        const int walk_s_ = (side) != 0 && walk_t_ && (s[0] != 0.0f || s[1] != 0.0f || s[2] != 0.0f) ? (side) : 0; \
+        WALK_STORE(walk_o_, walk_t_ ? s[3] : s[0], walk_t_ ? s[4] : s[1], walk_t_ ? s[5] : s[2],              \
+                   walk_t_ ? -(inv) : (inv));                                                                  \
+        WALK_STORE(walk_o_ + 4, ut[0], ut[1], ut[2], ut[3]);                                                   \
+        WALK_STORE(walk_o_ + 8, ut[4], ut[5], pivot, WALK_FLOAT(walk_s_));                                     \
+        if (walk_s_ != 0) WALK_STORE(walk_o_ + walk_s_, s[0], s[1], s[2], 0.0f);                               \
+    }
 // WALK_READ_COLUMN(load, S, p, r, half): a coordinate's step column at its body's frame as six floats S, from its row p
 // of the step's columns (WALK_NOW: S's own, or the finish's at the frame) and its record r: the half WALK_READ's names
 // (its pair loads, load_PAIR), the other zero; with WALK_BOTH a column of two halves (the record's side) whole.
@@ -825,8 +839,7 @@ _WALK_LOADS = """#ifndef WALK_READ
         S[3] = walk_t_ ? walk_y_.y : 0.0f; S[4] = walk_t_ ? walk_z_.x : 0.0f; S[5] = walk_t_ ? walk_z_.y : 0.0f; \
     }
 // WALK_READ_LINK(load, l, p, b, up): body b's link as l, its offset to its parent up's frame (zero at a root, up < 0),
-// the difference of the two frame points, the refresh's WALK_OFFSET, the same float32 subtraction; then its frame
-// point.
+// the difference of the two frame points (every walk's, the refresh's too); then its frame point.
 #define WALK_READ_LINK(load, l, p, b, up)                                                                       \
     {                                                                                                          \
         const WALK_QUAD walk_f_ = load((p) + $link * (b));                                                     \
@@ -868,6 +881,7 @@ _WALK_DEVICE = {
 #define WALK_PLAIN(p) (*reinterpret_cast<const float4*>(p))
 #define WALK_LDG_PAIR(p) __ldg(reinterpret_cast<const float2*>(p))
 #define WALK_PLAIN_PAIR(p) (*reinterpret_cast<const float2*>(p))
+#define WALK_STORE(p, a, b, c, d) (*reinterpret_cast<float4*>(p) = make_float4((a), (b), (c), (d)))
 #define WALK_LOAD_PIVOT(p) __ldg((p) + 10)
 #define WALK_BITS(x) __float_as_int(x)
 #define WALK_FLOAT(i) __int_as_float(i)
@@ -885,6 +899,7 @@ _WALK_DEVICE = {
 #define WALK_PLAIN(p) WALK_LDG(p)
 #define WALK_LDG_PAIR(p) (wp::quatf((p)[0], (p)[1], 0.0f, 0.0f))
 #define WALK_PLAIN_PAIR(p) WALK_LDG_PAIR(p)
+#define WALK_STORE(p, a, b, c, d) ((p)[0] = (a), (p)[1] = (b), (p)[2] = (c), (p)[3] = (d))
 #define WALK_LOAD_PIVOT(p) ((p)[10])
 #define WALK_BITS(x) __builtin_bit_cast(int, x)
 #define WALK_FLOAT(i) __builtin_bit_cast(float, i)
@@ -1491,9 +1506,8 @@ _INWARD = """    // The refresh by the tree's lane group (walk_group): the lane 
     // symmetric (A 00 01 02 11 12 22, B row-major 3x3, D 00 01 02 11 12 22), in registers.
     //   BODY(j, up, r): body j's inertia at its frame [m 1, -m X; m X, R I R^T - m X X] (X the skew of c, its centre of
     //     mass less its frame, both as the finish published them in now_com and now_link) as words m, m c, rot, and
-    //     its link offset d
-    //     (WALK_OFFSET from its parent's frame point, up's, and its own); its frame point becomes the factor's link
-    //     (every walk forms d from the two points). Nothing here reads a world position: the frame points are the
+    //     its link offset d (WALK_READ_LINK from its parent's frame point, up's, and its own); its frame point becomes
+    //     the factor's link (every walk forms d from the two points). Nothing here reads a world position: the frame points are the
     //     articulation's, relative to its origin.
     //   ADD(h, r): h += body r's inertia.
     //   STEP(h, s, c): coordinate c of column s (s 6, R, R + K) eliminated (tree_scan.inward_step); its record
@@ -1549,16 +1563,12 @@ _INWARD = """    // The refresh by the tree's lane group (walk_group): the lane 
         WALK_TOUCH(Lk + $link * j);
         WALK_TOUCH(Lc + 3 * j);
     };
-    // WALK_OFFSET(p, f, d): a body's link offset d, its parent's frame point p (null at a root) less its own f: the
-    // one place a walk forms it from the frame points the finish published.
-    const auto WALK_OFFSET = [](const float* p, const float* f, float* d) {
-        for (int k = 0; k < 3; ++k) d[k] = p != nullptr ? p[k] - f[k] : 0.0f;
-    };
     const auto BODY = [&](int j, int up, float* r) {
         const float* Lr = Lk + $link * j;
-        float offset[3];
-        WALK_OFFSET(up >= 0 ? Lk + $link * up + $frame : nullptr, Lr + $frame, offset);
-        for (int k = 0; k < 3; ++k) r[OFFSET + k] = offset[k];
+        // The link's offset from its parent's frame point and its own frame point (WALK_READ_LINK).
+        float l[6];
+        WALK_READ_LINK(WALK_PLAIN, l, Lk, j, up);
+        for (int k = 0; k < 3; ++k) r[OFFSET + k] = l[k];
         *reinterpret_cast<WALK_QUAD*>(Lo + $link * j) = WALK_PLAIN(Lr);
         const int b = Ct[j];
         const float* q = Qb + 7 * b;
@@ -1571,7 +1581,7 @@ _INWARD = """    // The refresh by the tree's lane group (walk_group): the lane 
             {2.0f * (x * y + z * w), 1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z - x * w)},
             {2.0f * (x * z - y * w), 2.0f * (y * z + x * w), 1.0f - 2.0f * (x * x + y * y)}};
         float c[3], mc[3];
-        for (int a = 0; a < 3; ++a) c[a] = Lc[3 * j + a] - Lr[$frame + a];
+        for (int a = 0; a < 3; ++a) c[a] = Lc[3 * j + a] - l[$link_frame + a];
         for (int a = 0; a < 3; ++a) mc[a] = m * c[a];
         // R I R^T - m X X, X the skew of c: -m X X = m (|c|^2 1 - c c^T).
         float RI[3][3];
@@ -1597,30 +1607,7 @@ _INWARD = """    // The refresh by the tree's lane group (walk_group): the lane 
     const auto STEP = [&](float* h, const float* s, int dof) {
 $step_head
         if (LANE == 0) {
-            // The record (WALK_COORDINATE): the column's non-zero half (the angular one where it turns, 1 / ell's
-            // sign bit set), and a column of two halves its linear half in the side float4 (WALK_SIDE floats on).
-            float* o = Dt + $coordinate * dof;
-            const bool turns = s[3] != 0.0f || s[4] != 0.0f || s[5] != 0.0f;
-            const bool both = WALK_SIDE != 0 && turns && (s[0] != 0.0f || s[1] != 0.0f || s[2] != 0.0f);
-            const int side = both ? WALK_SIDE : 0;
-            const float half[3] = {turns ? s[3] : s[0], turns ? s[4] : s[1], turns ? s[5] : s[2]};
-#if defined(__CUDA_ARCH__)
-            float4* o4 = reinterpret_cast<float4*>(o);
-            o4[0] = make_float4(half[0], half[1], half[2], turns ? -inv : inv);
-            o4[1] = make_float4(ut[0], ut[1], ut[2], ut[3]);
-            o4[2] = make_float4(ut[4], ut[5], own + s[6], __int_as_float(side));
-            if (both) reinterpret_cast<float4*>(o + side)[0] = make_float4(s[0], s[1], s[2], 0.0f);
-#else
-            for (int k = 0; k < 3; ++k) o[k] = half[k];
-            o[3] = turns ? -inv : inv;
-            for (int k = 0; k < 6; ++k) o[4 + k] = ut[k];
-            o[10] = own + s[6];
-            o[11] = __builtin_bit_cast(float, side);
-            if (both) {
-                for (int k = 0; k < 3; ++k) o[side + k] = s[k];
-                o[side + 3] = 0.0f;
-            }
-#endif
+            WALK_WRITE(Dt + $coordinate * dof, s, inv, ut, own + s[6], WALK_SIDE);
         }
 $step_update
     };
@@ -1719,7 +1706,7 @@ def _walk_inward_snippet(classes: tuple[WalkClass, ...]) -> str:
             coordinate=WALK_COORDINATE,
             link=WALK_LINK,
             now=WALK_NOW,
-            frame=WALK_FRAME,
+            link_frame=WALK_LINK_FRAME,
             slots=WALK_JOIN_SLOTS,
         ),
         preludes=(walk_loads_prelude(), tables, lane_group("lanes"), CPU_MATH, LANE_FEED),
