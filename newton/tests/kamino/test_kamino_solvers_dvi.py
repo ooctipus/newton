@@ -3253,9 +3253,8 @@ class TestDVISolver(NewtonTestCase):
 
         expected_capacity = 72 * world_count
         self.assertEqual(example.model.rigid_contact_max, expected_capacity)
+        self.assertEqual(example.contacts.rigid_contact_max, expected_capacity)
         self.assertEqual(example.collision_pipeline.rigid_contact_max, expected_capacity)
-        # Kamino's fixed container holds it; Newton's contact buffers grow on demand instead.
-        self.assertEqual(example.solver._contacts_kamino.model_max_contacts_host, expected_capacity)
 
     def test_09_dr_legs_dvi_first_contact_remains_finite(self):
         if not self.device.is_cuda:
