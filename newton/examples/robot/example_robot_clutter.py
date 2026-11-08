@@ -311,7 +311,9 @@ class Example:
             self.model,
             broad_phase="sap",
             body_pair_reduction=(
-                newton.CollisionPipeline.BodyPairReductionConfig(cell_size=0.04) if self.body_pair_reduction else None
+                newton.CollisionPipeline.BodyPairReductionConfig(cell_size=0.04, hysteresis=0.0, verify=args.test)
+                if self.body_pair_reduction
+                else None
             ),
             speculative_contact_gap_max=0.1 if args.solver == "fpgs" else None,
             rigid_contact_max=self.contact_capacity * args.world_count,
@@ -357,6 +359,8 @@ class Example:
         self.viewer.set_world_offsets((1.5, 1.2, 0.0))
         self.viewer.set_camera(wp.vec3(1.23, -1.55, 1.10), pitch=-26.3, yaw=121.8)
         self.graph = None
+        if self.body_pair_reduction:
+            self.pipeline.collide(self.state_0, self.contacts, dt=self.sim_dt)
         # Even substep counts leave the same state buffer at frame boundaries.
         if args.cuda_graph and self.model.device.is_cuda and self.sim_substeps % 2 == 0:
             with wp.ScopedCapture(device=self.model.device) as capture:
@@ -404,6 +408,10 @@ class Example:
     def check_capacity(self):
         """Fail on omitted constraints instead of silently accepting truncated physics."""
         self.pipeline.narrow_phase.check_buffer_capacity()
+        if self.body_pair_reduction:
+            stats = self.pipeline.body_pair_reduction_stats()
+            if stats["invariant_violations"] or stats["outranked_discards"] or stats["input_overflow_frames"]:
+                raise RuntimeError(f"Body-pair contact reduction failed: {stats}")
         if self.args.solver == "fpgs":
             self.solver.check_constraint_capacity()
         else:
@@ -481,6 +489,8 @@ class Example:
             result["mf_row_capacity_per_world"] = self.mf_rows
             result["rows"] = self.solver.constraint_row_watermarks()
         result["body_pair_reduction"] = self.body_pair_reduction
+        if self.body_pair_reduction:
+            result["reduction"] = self.pipeline.body_pair_reduction_stats()
         return result
 
 

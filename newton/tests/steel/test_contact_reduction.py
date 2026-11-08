@@ -13,17 +13,81 @@ from newton.tests.test_contact_reduction_body_pairs import (
     DT,
     _cylinder_foot,
     _free_jointed_foot,
-    _group_pos_key_kernel,
     _make_pipeline,
     _prismatic_jointed_foot,
-    _same_articulation_scissor,
     _speculative_ring_body,
-    _two_cluster_body,
-    _undamped,
 )
 
 STEEL_PROPAGATION_PATH = 2
 RUN_TO_RUN = wp.DeterministicMode.RUN_TO_RUN
+
+
+def _same_articulation_scissor(builder):
+    """Build two overlapping sibling links in one non-free articulation."""
+    no_collision = builder.default_shape_cfg.copy()
+    no_collision.has_shape_collision = False
+    no_collision.collision_group = 0
+
+    base = builder.add_link()
+    builder.add_shape_box(base, hx=0.04, hy=0.04, hz=0.04, cfg=no_collision)
+    joints = [
+        builder.add_joint_revolute(
+            parent=-1,
+            child=base,
+            axis=newton.Axis.Z,
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
+            child_xform=wp.transform_identity(),
+        )
+    ]
+    for side in (-1.0, 1.0):
+        link = builder.add_link()
+        # The siblings overlap. Three slightly overlapping boxes on each link
+        # make several box-box manifolds for one body pair, guaranteeing that
+        # body-pair reduction has more than one manifold's worth of real work.
+        for x in (-0.06, 0.0, 0.06):
+            builder.add_shape_box(
+                link,
+                xform=wp.transform(wp.vec3(x, 0.0, 0.0), wp.quat_identity()),
+                hx=0.05,
+                hy=0.04,
+                hz=0.04,
+            )
+        joints.append(
+            builder.add_joint_revolute(
+                parent=base,
+                child=link,
+                axis=newton.Axis.Z,
+                parent_xform=wp.transform(wp.vec3(0.06, side * 0.02, 0.0), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(-0.12, 0.0, 0.0), wp.quat_identity()),
+                collision_filter_parent=False,
+            )
+        )
+    builder.add_articulation(joints)
+    return base
+
+
+def _two_cluster_body(builder, spread=1.0):
+    """One rigid body with two 9-sphere feet ``spread`` apart on the same plane.
+
+    Nine contacts per cluster exceed the 7-slot budget, so each cluster is
+    both fully represented (deepest + extremes) AND strictly reduced --
+    the plank settle test asserts the latter to stay non-vacuous.
+    """
+    body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0095), wp.quat_identity()), mass=2.0)
+    for end in (-spread / 2.0, spread / 2.0):
+        for i, j in ((0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (2, 1), (0, 2), (1, 2), (2, 2)):
+            builder.add_shape_sphere(
+                body,
+                xform=wp.transform(wp.vec3(end + 0.03 * i, 0.03 * j, 0.0), wp.quat_identity()),
+                radius=0.01,
+            )
+    return body
+
+
+def _undamped(solver):
+    """Turn off the default angular damping of the free roots."""
+    solver._rigid_body_angular_damping.zero_()
+    return solver
 
 
 def _foot_model(pos=(0.0, 0.0, 0.020)):
@@ -39,23 +103,6 @@ def _ring_model(device, penetration):
     body = _speculative_ring_body(builder, (0.0, 0.0, 0.0015 - penetration))
     builder.add_ground_plane()
     return builder.finalize(device=device), body
-
-
-def _staged_contacts_kept(reducer, entries, pos):
-    """Whether each staged contact holds a slot of its group, by its quantized position key."""
-    device = reducer.ht_values.device
-    points = wp.array(pos, dtype=wp.vec2, device=device)
-    keys = wp.zeros(len(pos), dtype=wp.uint64, device=device)
-    wp.launch(_group_pos_key_kernel, dim=len(pos), inputs=[points, reducer.cell_size, keys], device=device)
-    pos_key = keys.numpy()
-    values = reducer.ht_values.numpy()
-    slot_count = reducer.values_per_key
-    kept = np.zeros(len(entries), dtype=np.int32)
-    for i, entry in enumerate(entries):
-        if entry >= 0:
-            slot_keys = {int(values[entry * slot_count + slot]) & 0x7FFFFFFF for slot in range(slot_count)}
-            kept[i] = int(int(pos_key[i]) in slot_keys)
-    return kept
 
 
 class TestSteelBodyPairReductionGate(unittest.TestCase):
@@ -332,119 +379,6 @@ class TestSteelBodyPairReductionConformance(unittest.TestCase):
                 int(body_art[body1]),
                 "the path assertion did not cover a same-articulation contact",
             )
-
-    def test_mixed_separation_tilted_patch(self):
-        """Settle a tilted patch whose contacts mix penetrating and speculative.
-
-        This is also the adversarial topology that prevents an XPBD-wide
-        compatibility claim: footprint slots may be won by speculative
-        endpoints while other contacts become active after XPBD predicts its
-        body poses. The probe characterizes that reducer input, while dynamics
-        are checked only with the solver that declares compatibility.
-        """
-        pitch = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.06)
-
-        def build(b):
-            body = b.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.026), pitch), mass=1.0)
-            for i in range(7):
-                b.add_shape_cylinder(
-                    body,
-                    xform=wp.transform(wp.vec3((i - 3.0) * 0.044, 0.0, 0.0), wp.quat_identity()),
-                    radius=0.02,
-                    half_height=0.015,
-                )
-            return body
-
-        def build_jointed(b):
-            link = b.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.026), pitch))
-            for i in range(7):
-                b.add_shape_cylinder(
-                    link,
-                    xform=wp.transform(wp.vec3((i - 3.0) * 0.044, 0.0, 0.0), wp.quat_identity()),
-                    radius=0.02,
-                    half_height=0.015,
-                )
-            b.add_articulation([b.add_joint_free(parent=-1, child=link)])
-            return link
-
-        # prove the scene actually generates the adversarial topology at some
-        # point of the settle, in the reducer's OWN competition terms: within
-        # a single reduction group (one contact_entry), several LOAD-BEARING
-        # candidates (within 1 mm of the group's deepest) coexist with a far
-        # SHALLOWER candidate (> 5 mm above the deepest) that WINS one of the
-        # six real scan-direction slots (0/60/../300 degrees on the face
-        # plane) and SURVIVES a strictly reducing compaction, while the
-        # group's deepest survives too.  Note the canonical surface separation
-        # of cylinder-plane witnesses saturates at >= 0 under penetration (the
-        # solver derives depth from body poses at solve time), so
-        # deep/shallow is a gap-band split, not a signed-depth split; the
-        # dynamic equivalence itself is pinned by the settle comparisons
-        # below.
-        probe_builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-        probe_body = build(probe_builder)
-        probe_builder.add_ground_plane()
-        probe_model = probe_builder.finalize(device=wp.get_device())
-        ps0, ps1 = probe_model.state(), probe_model.state()
-        probe_control = probe_model.control()
-        probe_pipe = _make_pipeline(probe_model, True)
-        probe_contacts = probe_pipe.contacts()
-        probe_solver = newton.solvers.SolverXPBD(probe_model, iterations=8)
-        reducer = probe_pipe.narrow_phase.group_contact_reducer
-        raw_pipe = _make_pipeline(probe_model, False)
-        raw_contacts = raw_pipe.contacts()
-        scan_dirs = [
-            (float(np.cos(k * np.pi / 3.0)), float(np.sin(k * np.pi / 3.0)))
-            for k in range(6)  # NUM_SPATIAL_DIRECTIONS
-        ]
-        topology_seen = False
-        _ = probe_body
-        for _k in range(60):
-            raw_pipe.collide(ps0, raw_contacts)
-            n_raw = int(raw_contacts.rigid_contact_count.numpy()[0])
-            probe_pipe.collide(ps0, probe_contacts)
-            n_red = int(probe_contacts.rigid_contact_count.numpy()[0])
-            if n_raw > 2 and n_red < n_raw and not topology_seen:
-                # Staged contacts sit at IDs 1..n; read the reducer's own grouping of them.
-                n_staged = int(reducer.contact_count.numpy()[0])
-                entries = reducer.group_contact_entry.numpy()[1 : n_staged + 1]
-                gaps = reducer.group_contact_gap.numpy()[1 : n_staged + 1]
-                pos = reducer.group_contact_pos2d.numpy()[1 : n_staged + 1]
-                kept = _staged_contacts_kept(reducer, entries, pos)
-                for e in np.unique(entries[entries >= 0]):
-                    members = np.where(entries == e)[0]
-                    if members.size < 3:
-                        continue
-                    g0 = float(gaps[members].min())
-                    deep = members[gaps[members] < g0 + 0.001]
-                    shallow = members[gaps[members] > g0 + 0.005]
-                    if deep.size < 2 or shallow.size == 0:
-                        continue
-                    deepest = members[int(np.argmin(gaps[members]))]
-                    for dx, dy in scan_dirs:
-                        proj = pos[members, 0] * dx + pos[members, 1] * dy
-                        winner = members[int(np.argmax(proj))]
-                        if winner in shallow and kept[winner] == 1 and kept[deepest] == 1:
-                            topology_seen = True
-                            break
-                    if topology_seen:
-                        break
-            ps0.clear_forces()
-            # Advance using the unreduced buffer. XPBD's activity decision is
-            # made after this prediction, later than the reducer competition.
-            probe_solver.step(ps0, ps1, probe_control, raw_contacts, DT)
-            ps0, ps1 = ps1, ps0
-        self.assertTrue(
-            topology_seen,
-            "settle never produced a strictly reduced group whose kept set holds both the deepest "
-            "candidate and a shallow scan-direction slot winner",
-        )
-
-        self._compare(
-            build_jointed,
-            lambda m: _undamped(newton.solvers.SolverSteel(m, friction_anchor_beta=0.0)),
-            tol=1e-3,
-            w_tol=0.15,
-        )
 
 
 class TestSteelBodyPairReductionSettling(unittest.TestCase):

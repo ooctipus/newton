@@ -155,6 +155,8 @@ def run(worlds, objects, kind, warm, reduced, iterations):
         else None,
         "warp": wp.__version__,
     }
+    if reduced:
+        result["reduction"] = pipeline.body_pair_reduction_stats()
     if warm:
         count = result["final_contacts"]
         result["final_matched_fraction"] = (

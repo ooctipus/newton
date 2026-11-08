@@ -1345,9 +1345,9 @@ only this producer stage.
 Bodies built from many colliders (a foot made of several spheres or capsules, a
 hand of boxes) produce one manifold per shape pair, so a single physical patch
 can reach the solver as dozens of near-redundant contacts. Optional body-pair
-reduction reduces primitive and convex contacts per body pair in a group mode
-of the global contact reducer, before they are written. Enable it with
-``body_pair_reduction``:
+reduction compacts the written contacts per body pair after the narrow phase
+(and after the deterministic sort), so ``rigid_contact_count`` itself drops.
+Enable it with ``body_pair_reduction``:
 
 .. testcode:: body-pair-reduction
 
@@ -1366,13 +1366,15 @@ of the global contact reducer, before they are written. Enable it with
 Contacts are grouped by body pair, material class, normal bin and spatial cell.
 Each group keeps one depth representative, up to six sampled footprint extremes
 over all its contacts and up to six more over its touching contacts only, so
-speculative contacts cannot displace the support polygon. Mesh and
-heightfield contacts keep their per-shape-pair reduction. Only the kept
-contacts are written, and if a group cannot be registered in the table, the
-frame keeps every primitive and convex contact. It is an
-approximation: support is sampled, not exact, and keeping
-rim points can strengthen torsional friction. Selection is memoryless, so on
-curved or mesh supports the kept set can change between steps.
+speculative contacts cannot displace the support polygon. If a group cannot be
+registered in the table, the frame keeps every contact. It is an approximation:
+support is sampled, not exact, and keeping rim points can strengthen torsional
+friction. With ``BodyPairReductionConfig.hysteresis`` (1 mm by default) the
+previous step's winners keep their slots while they trail the instantaneous
+winner by at most that margin, so on curved or mesh supports the kept set stops
+churning between near-symmetric contacts; ``0`` gives memoryless selection.
+:meth:`~CollisionPipeline.reset_contact_matching` also clears this history, and
+:meth:`~CollisionPipeline.body_pair_reduction_stats` reports what was kept.
 
 Shapes on one body share a group only when their ``shape_material_*`` values
 and their per-shape custom attributes match;
@@ -1382,14 +1384,15 @@ the attributes that count. Call
 them at runtime.
 
 Buffers from the pipeline's :meth:`~CollisionPipeline.contacts` are stamped
-:attr:`~Contacts.rigid_contact_body_pair_reduced` when the scene has primitive
-or convex contact pairs; a scene of only meshes and heightfields reduces nothing
-by body pair and keeps unstamped buffers. Only a pipeline that stamps its buffers
-collides into a stamped buffer, and a solver accepts one only
-if it declares :attr:`~solvers.SolverBase.supports_body_pair_reduced_contacts`;
+:attr:`~Contacts.rigid_contact_body_pair_reduced`, and a reducing pipeline
+collides only into the buffers it allocated. A solver accepts a stamped buffer
+only if it declares :attr:`~solvers.SolverBase.supports_body_pair_reduced_contacts`;
 the others raise in ``step()``, also during CUDA graph capture.
 :class:`~solvers.SolverSteel` supports it, except with ``contact_compliance``, and so does
-:class:`~solvers.SolverFeatherPGS`.
+:class:`~solvers.SolverFeatherPGS`. The reduction's history belongs to one
+buffer: collide a buffer that replaces the pipeline's first one once outside
+CUDA graph capture before capturing it, so the history reset stays out of the
+graph.
 Body-pair reduction doesn't support ``contact_matching="sticky"`` or
 hydroelastic contacts. Keep it off when it doesn't reduce the end-to-end step time.
 To check, compare the step time and :attr:`~Contacts.rigid_contact_count` with it
