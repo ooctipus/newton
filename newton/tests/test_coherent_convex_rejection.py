@@ -89,7 +89,8 @@ def _box_inputs(n, device):
         wp.full(2 * n, wp.vec3(0.5), dtype=wp.vec3, device=device),
     ]
     data = _PairInputs()
-    for name, value in zip(data._cls.__annotations__, values, strict=True):
+    # The pair inputs are the split queue's shape inputs: the values with the (empty) hull support arrays.
+    for name, value in zip(data._cls.__annotations__, _original_values(values, device), strict=True):
         setattr(data, name, value)
     return pairs, wp.array(pairs, dtype=wp.vec2i, device=device), values, data
 

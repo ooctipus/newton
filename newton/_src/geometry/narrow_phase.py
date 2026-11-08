@@ -3970,6 +3970,10 @@ class NarrowPhase:
             pair_inputs.shape_data = shape_data
             pair_inputs.shape_transform = shape_transform
             pair_inputs.shape_source = shape_source
+            pair_inputs.shape_support_data = shape_support_data
+            pair_inputs.support_lut = support_lut
+            pair_inputs.support_vertex_offsets = support_vertex_offsets
+            pair_inputs.support_neighbors = support_neighbors
             pair_inputs.shape_gap = shape_gap
             pair_inputs.shape_collision_radius = shape_collision_radius
             pair_inputs.shape_aabb_lower = self.shape_aabb_lower

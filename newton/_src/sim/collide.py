@@ -3465,8 +3465,9 @@ class CollisionPipeline:
                 query_capacity=self.narrow_phase.split_query_results.shape[0],
                 device=device,
             )
+            # The split queue's lean support: accelerated when the model has cooked hull support data.
             self.narrow_phase._coherent_query_kernels = _create_rejection_query_kernels(
-                diagnostics=coherent_stats == "1"
+                model._convex_support_lut.shape[0] > 1, diagnostics=coherent_stats == "1"
             )
             self._convex_selection_reason = "explicit_rejection"
             if coherent_convex == "auto":
