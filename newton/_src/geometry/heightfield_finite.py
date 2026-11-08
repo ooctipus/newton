@@ -268,8 +268,10 @@ def create_query_kernel(
         for i in range(wp.tid(), triangle_pairs_count[0], total_num_threads):
             if i >= triangle_pairs.shape[0]:
                 break
+            # A plain closure call: wp.static(None) would leave an unresolvable static (see
+            # the mesh-triangle reducer kernel).
             if wp.static(writer_binding is not None):
-                writer_data = wp.static(writer_binding)(writer_data, i)
+                writer_data = writer_binding(writer_data, i)
             triple = triangle_pairs[i]
             a, b, tri_idx = triple[0], triple[1], triple[2]
             if tri_idx < 0 or shape_types[a] != GeoType.HFIELD:
