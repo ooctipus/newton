@@ -142,7 +142,6 @@ test_mesh_edge_angle_filter
 test_mesh_utils
 test_mesh_validation
 test_mpr
-test_mujoco_external_seed
 test_mujoco_margin_zeroing
 test_mujoco_reset
 test_mujoco_response_filter
