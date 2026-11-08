@@ -24,7 +24,9 @@ from .mesh_cells import (
     MeshCellSlot,
     MeshQueryBound,
     mesh_cells_box_in_cell,
+    mesh_cells_box_meets_slabs,
     mesh_cells_candidate,
+    mesh_cells_entry_box,
     mesh_cells_entry_first_in_range,
     mesh_cells_entry_overlaps,
     mesh_cells_find,
@@ -32,6 +34,7 @@ from .mesh_cells import (
     mesh_cells_key,
     mesh_cells_key_cell,
     mesh_cells_range,
+    mesh_cells_slot_box,
     mesh_cells_slot_overlaps,
     mesh_query_bound_box,
     mesh_query_bound_meets_triangle,
@@ -1276,14 +1279,34 @@ def mesh_vs_convex_query_box(
         convex, non_mesh_shape, shape_collision_aabb_lower, shape_collision_aabb_upper
     )
     bound = _mesh_query_bound(convex, local_lower, local_upper, convex_in_mesh, contact_threshold)
-    lower, upper = mesh_query_bound_box(bound)
     mesh_data = shape_data[mesh_shape]
-    mesh_scale = wp.vec3(mesh_data[0], mesh_data[1], mesh_data[2])
+    return mesh_query_bound_unscaled_box(bound, wp.vec3(mesh_data[0], mesh_data[1], mesh_data[2]))
+
+
+@wp.func
+def mesh_query_bound_unscaled_box(bound: MeshQueryBound, mesh_scale: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
+    """The bound's box (:func:`mesh_query_bound_box`) in the mesh's unscaled frame.
+
+    Padded past the float32 rounding of the cell coordinates (relative to the coordinates' size).
+    """
+    lower, upper = mesh_query_bound_box(bound)
     lower_bvh, upper_bvh, _inv_scale = aabb_to_unscaled(lower, upper, mesh_scale)
     reach = wp.max(wp.max(wp.abs(lower_bvh[0]), wp.abs(lower_bvh[1])), wp.abs(lower_bvh[2]))
     reach = wp.max(reach, wp.max(wp.max(wp.abs(upper_bvh[0]), wp.abs(upper_bvh[1])), wp.abs(upper_bvh[2])))
     pad = 1.0e-5 * (reach + (upper_bvh[0] - lower_bvh[0]) + 1.0e-3)
     return lower_bvh - wp.vec3(pad), upper_bvh + wp.vec3(pad)
+
+
+@wp.func
+def mesh_query_bound_slab(bound: MeshQueryBound, k: int, mesh_scale: wp.vec3) -> wp.vec4:
+    """The bound's box as its ``k``-th slab in the mesh's unscaled frame: ``(n, d)`` with ``|n . x - d| <= half[k]``.
+
+    A point ``x`` of the unscaled frame is ``scale * x`` in the bound's; so ``n = scale * axis_k``, ``d = axis_k .
+    center``.
+    """
+    axis = wp.vec3(bound.axes[0, k], bound.axes[1, k], bound.axes[2, k])
+    normal = wp.cw_mul(axis, mesh_scale)
+    return wp.vec4(normal[0], normal[1], normal[2], wp.dot(axis, bound.center))
 
 
 @wp.func
@@ -1298,6 +1321,31 @@ def mesh_vs_convex_query_range(
 
 
 @wp.func
+def mesh_cells_entry_is_candidate(
+    entry: wp.vec4i,
+    cell: wp.vec3i,
+    qlo: wp.vec3i,
+    qhi: wp.vec3i,
+    box_lo: wp.vec3i,
+    box_hi: wp.vec3i,
+    cell_lower: wp.vec3,
+    size: float,
+    slab0: wp.vec4,
+    slab1: wp.vec4,
+    slab2: wp.vec4,
+    slab_half: wp.vec3,
+) -> bool:
+    """Whether a cell's entry is a candidate: its box meets the query box (``box_lo..box_hi`` on the cell's lattice) and
+    the bound's oriented box (its slabs), and, for a small triangle, this is its first registered cell in range."""
+    if not (
+        mesh_cells_entry_overlaps(entry, box_lo, box_hi) and mesh_cells_entry_first_in_range(entry, cell, qlo, qhi)
+    ):
+        return False
+    tri_lo, tri_hi, tri_bounded = mesh_cells_entry_box(entry, cell_lower, size)
+    return not tri_bounded or mesh_cells_box_meets_slabs(tri_lo, tri_hi, slab0, slab1, slab2, slab_half)
+
+
+@wp.func
 def mesh_vs_convex_cell_candidates(
     lane: int,
     lanes: int,
@@ -1307,6 +1355,10 @@ def mesh_vs_convex_cell_candidates(
     query_upper: wp.vec3,
     lo0: wp.vec3i,
     hi0: wp.vec3i,
+    slab0: wp.vec4,
+    slab1: wp.vec4,
+    slab2: wp.vec4,
+    slab_half: wp.vec3,
     mesh_cells: MeshCells,
     candidates: wp.array[wp.vec4i],
     candidate_count: wp.array[int],
@@ -1315,8 +1367,10 @@ def mesh_vs_convex_cell_candidates(
 
     At every occupied level of the mesh's index, the cells of the level-0 range ``[lo0, hi0]`` are looked up, or the
     level's occupied cells walked when they are fewer. A cell whose triangles' box misses the query box
-    ``[query_lower, query_upper]`` (unscaled mesh frame) is skipped whole; a triangle is a candidate when its own box
-    overlaps the query box. A small triangle (box of at most two cells per axis) met in several cells is a candidate in
+    ``[query_lower, query_upper]`` (unscaled mesh frame), or the bound's oriented box (its three slabs, ``slab0``..
+    ``slab2`` with half-widths ``slab_half``, :func:`mesh_query_bound_slab`), is skipped whole; a triangle is a
+    candidate when its own box meets both. The oriented box test is the exact pass's own necessary condition (a
+    triangle that meets the oriented box has a box that meets it), so it drops nothing the exact pass keeps. A small triangle (box of at most two cells per axis) met in several cells is a candidate in
     its first one only (by its entry); a larger one is a candidate in each, and the exact pass keeps its first.
     ``lanes`` threads share the pair; each takes every ``lanes``-th cell.
     """
@@ -1362,16 +1416,43 @@ def mesh_vs_convex_cell_candidates(
                 slot = mesh_cells_find(mesh_cells, grid, mesh_cells_key(level, cell[0], cell[1], cell[2]))
             if slot.count > 0:
                 cell_lower = grid.origin + size * wp.vec3(float(cell[0]), float(cell[1]), float(cell[2]))
-                if mesh_cells_slot_overlaps(slot, query_lower, query_upper, cell_lower, inv_size):
+                union_lo, union_hi, union_bounded = mesh_cells_slot_box(slot, cell_lower, size)
+                if mesh_cells_slot_overlaps(slot, query_lower, query_upper, cell_lower, inv_size) and (
+                    not union_bounded or mesh_cells_box_meets_slabs(union_lo, union_hi, slab0, slab1, slab2, slab_half)
+                ):
                     box_lo, box_hi = mesh_cells_box_in_cell(query_lower, query_upper, cell_lower, inv_size)
-                    for e in range(slot.start, slot.start + slot.count):
-                        entry = mesh_cells.entries[e]
-                        if mesh_cells_entry_overlaps(entry, box_lo, box_hi) and mesh_cells_entry_first_in_range(
-                            entry, cell, qlo, qhi
-                        ):
-                            out = wp.atomic_add(candidate_count, 0, 1)
-                            if out < candidates.shape[0]:
-                                candidates[out] = mesh_cells_candidate(pair_index, entry[0], level, cell)
+                    # A cell's candidates take one reservation, 32 entries at a time (marked, then written): one
+                    # append per candidate costs one atomic on the shared count, and those atomics were most of the
+                    # cell pass's appends.
+                    for chunk in range(slot.start, slot.start + slot.count, 32):
+                        marks = int(0)
+                        found = int(0)
+                        for e in range(chunk, wp.min(chunk + 32, slot.start + slot.count)):
+                            if mesh_cells_entry_is_candidate(
+                                mesh_cells.entries[e],
+                                cell,
+                                qlo,
+                                qhi,
+                                box_lo,
+                                box_hi,
+                                cell_lower,
+                                size,
+                                slab0,
+                                slab1,
+                                slab2,
+                                slab_half,
+                            ):
+                                marks = marks | (1 << (e - chunk))
+                                found += 1
+                        if found > 0:
+                            out = wp.atomic_add(candidate_count, 0, found)
+                            for j in range(32):
+                                if (marks >> j) & 1 != 0:
+                                    if out < candidates.shape[0]:
+                                        candidates[out] = mesh_cells_candidate(
+                                            pair_index, mesh_cells.entries[chunk + j][0], level, cell
+                                        )
+                                    out += 1
             k += lanes
         visited += n
 

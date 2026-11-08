@@ -253,6 +253,70 @@ def mesh_cells_entry_overlaps(entry: wp.vec4i, lo: wp.vec3i, hi: wp.vec3i) -> bo
 
 
 @wp.func
+def _slab_misses(slab: wp.vec4, half: float, center: wp.vec3, extent: wp.vec3) -> bool:
+    """Whether the box ``center +- extent`` lies outside the slab ``|n . x - d| <= half`` (``slab = (n, d)``).
+
+    Padded past the float32 rounding of both sides (relative to their size), so it never drops a box that meets it.
+    """
+    an = wp.vec3(wp.abs(slab[0]), wp.abs(slab[1]), wp.abs(slab[2]))
+    distance = slab[0] * center[0] + slab[1] * center[1] + slab[2] * center[2] - slab[3]
+    reach = wp.dot(an, extent)
+    pad = 1.0e-5 * (wp.dot(an, wp.vec3(wp.abs(center[0]), wp.abs(center[1]), wp.abs(center[2])) + extent))
+    pad = pad + 1.0e-5 * (wp.abs(slab[3]) + half)
+    return wp.abs(distance) > half + reach + pad
+
+
+@wp.func
+def mesh_cells_box_meets_slabs(
+    lower: wp.vec3, upper: wp.vec3, slab0: wp.vec4, slab1: wp.vec4, slab2: wp.vec4, slab_half: wp.vec3
+) -> bool:
+    """Whether the box ``[lower, upper]`` meets all three slabs of a bound (its oriented box, mesh frame)."""
+    center = 0.5 * (lower + upper)
+    extent = 0.5 * (upper - lower)
+    if _slab_misses(slab0, slab_half[0], center, extent):
+        return False
+    if _slab_misses(slab1, slab_half[1], center, extent):
+        return False
+    return not _slab_misses(slab2, slab_half[2], center, extent)
+
+
+@wp.func
+def mesh_cells_entry_box(entry: wp.vec4i, cell_lower: wp.vec3, size: float) -> tuple[wp.vec3, wp.vec3, bool]:
+    """An entry's triangle box (rounded outward on the cell's lattice), and whether no side was clamped at the lattice's
+    window (a clamped box is not the triangle's)."""
+    step = size / MESH_CELLS_BOX_STEPS
+    raw_lo = wp.vec3i(entry[1] & 0x3FFF, (entry[1] >> 14) & 0x3FFF, entry[2] & 0x3FFF)
+    raw_hi = wp.vec3i((entry[2] >> 14) & 0x3FFF, entry[3] & 0x3FFF, (entry[3] >> 14) & 0x3FFF)
+    lo = cell_lower + step * wp.vec3(float(raw_lo[0] - 8192), float(raw_lo[1] - 8192), float(raw_lo[2] - 8192))
+    hi = cell_lower + step * wp.vec3(float(raw_hi[0] - 8192), float(raw_hi[1] - 8192), float(raw_hi[2] - 8192))
+    bounded = (
+        wp.min(wp.min(raw_lo[0], raw_lo[1]), raw_lo[2]) > 0 and wp.max(wp.max(raw_hi[0], raw_hi[1]), raw_hi[2]) < 0x3FFF
+    )
+    return lo, hi, bounded
+
+
+@wp.func
+def mesh_cells_slot_box(slot: MeshCellSlot, cell_lower: wp.vec3, size: float) -> tuple[wp.vec3, wp.vec3, bool]:
+    """A cell's union of triangle boxes (rounded outward), and whether no side was clamped, as
+    :func:`mesh_cells_entry_box`."""
+    step = size / 32.0
+    lo = cell_lower + step * wp.vec3(
+        float((slot.box_lo & 255) - 128),
+        float(((slot.box_lo >> 8) & 255) - 128),
+        float(((slot.box_lo >> 16) & 255) - 128),
+    )
+    hi = cell_lower + step * wp.vec3(
+        float((slot.box_hi & 255) - 128),
+        float(((slot.box_hi >> 8) & 255) - 128),
+        float(((slot.box_hi >> 16) & 255) - 128),
+    )
+    bounded = (slot.box_lo & 255) > 0 and ((slot.box_lo >> 8) & 255) > 0 and ((slot.box_lo >> 16) & 255) > 0
+    bounded = bounded and (slot.box_hi & 255) < 255 and ((slot.box_hi >> 8) & 255) < 255
+    bounded = bounded and ((slot.box_hi >> 16) & 255) < 255
+    return lo, hi, bounded
+
+
+@wp.func
 def mesh_cells_entry_first_in_range(entry: wp.vec4i, cell: wp.vec3i, qlo: wp.vec3i, qhi: wp.vec3i) -> bool:
     """For a triangle whose box spans at most two cells per axis, :func:`mesh_cells_first_in_range` from the entry.
 
