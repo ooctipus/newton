@@ -1,14 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Terrain surface normals for heightfield prism queries.
+"""Terrain surface witnesses for heightfield prism queries.
 
 Each cell triangle is queried on its own, so its boundary edges and vertices
-answer with the normal of a lone triangle: toward a partner beside the
-triangle, an oblique edge normal, and under a tilted flat partner, the
-partner's face normal. Where the terrain continues past that boundary, the
-surface's normal there is a neighbouring face's: :func:`seam_surface_normal`
-gives a separated witness the terrain's normal at its feature.
+answer as a lone triangle would: toward a partner beside the triangle with an
+oblique edge normal, and under a tilted flat partner with the partner's face
+normal. Where the terrain continues past that boundary beneath the partner,
+the surface there is the neighbouring face's: :func:`seam_surface_witness`
+gives such a separated witness the contact of the face beneath the partner.
 """
 
 import warp as wp
@@ -53,61 +53,77 @@ def _faces_witness(
 
 
 @wp.func
-def _cell_normal(context: HeightfieldFeatureContext, row: int, col: int, sub: int) -> wp.vec3:
-    """Upward unit normal of cell ``(row, col)``'s triangle ``sub``: (p00, p10, p11) or (p00, p11, p01)."""
+def _owner_face(context: HeightfieldFeatureContext, point: wp.vec3) -> tuple[int, wp.vec3, wp.vec3]:
+    """Cell triangle under a heightfield-local point: its index (-1 off the grid), a vertex and its upward normal."""
+    h = context.heightfield
+    cols = h.ncol - 1
+    rows = h.nrow - 1
+    dx = 2.0 * h.hx / wp.float32(cols)
+    dy = 2.0 * h.hy / wp.float32(rows)
+    fx = (point[0] + h.hx) / dx
+    fy = (point[1] + h.hy) / dy
+    if not (wp.isfinite(fx) and wp.isfinite(fy)):
+        return -1, wp.vec3(0.0), wp.vec3(0.0)
+    col = int(wp.floor(fx))
+    row = int(wp.floor(fy))
+    if col < 0 or col >= cols or row < 0 or row >= rows:
+        return -1, wp.vec3(0.0), wp.vec3(0.0)
     p00 = _vertex(context, row, col)
     p11 = _vertex(context, row + 1, col + 1)
-    if sub == 0:
-        return wp.normalize(wp.cross(_vertex(context, row, col + 1) - p00, p11 - p00))
-    return wp.normalize(wp.cross(p11 - p00, _vertex(context, row + 1, col) - p00))
+    # Sub 0 is (p00, p10, p11), below the p00--p11 diagonal; sub 1 is (p00, p11, p01).
+    sub = int(fy - wp.float32(row) > fx - wp.float32(col))
+    face = wp.cross(_vertex(context, row, col + 1) - p00, p11 - p00)
+    if sub == 1:
+        face = wp.cross(p11 - p00, _vertex(context, row + 1, col) - p00)
+    return (row * cols + col) * 2 + sub, p00, wp.normalize(face)
 
 
 @wp.func
-def seam_surface_normal(
+def seam_surface_witness(
     triangle: GenericShapeData,
     point: wp.vec3,
     normal: wp.vec3,
     distance: float,
     context: HeightfieldFeatureContext,
-) -> tuple[wp.vec3, float]:
-    """The terrain's normal at a separated witness, and the partner's distance along it.
+) -> tuple[wp.vec3, wp.vec3, float]:
+    """The terrain's contact for a separated witness: unchanged, or the face beneath the partner.
 
     The point (on the triangle) and the normal are in the triangle-origin heightfield-local frame;
-    the partner's witness point is ``point + distance * normal``. The terrain's normals at a
-    boundary edge or vertex span the incident faces' normals, and a normal lies among them exactly
-    when no terrain vertex adjacent to the feature lies in front of the witness plane (the
-    neighbour's opposite vertex for an edge, the six incident grid vertices for a vertex). Such a
-    witness, a face witness, a witness off the top face and non-heightfield triangles keep their
-    normal. Otherwise the normal leaves the terrain toward a neighbour and becomes that
-    neighbour's face normal (for a vertex, the incident face normal nearest to it); the distance
-    is the partner point's along it.
+    the partner's witness point is ``point + distance * normal``. A face witness keeps its contact,
+    and so does a boundary edge or vertex whose normal lies among the terrain's normals there:
+    exactly when no terrain vertex adjacent to the feature lies in front of the witness plane (the
+    neighbour's opposite vertex for an edge, the six incident grid vertices for a vertex). Otherwise
+    the terrain continues past the boundary toward the partner, and the contact is the one of the
+    cell triangle beneath the partner point: its upward normal, the partner's distance from its
+    plane and the partner's foot on it. Witnesses off the top face, partners off the grid or over
+    the triangle itself, and non-heightfield triangles keep theirs.
 
     Returns:
-        ``(normal, distance)``: unchanged for a terrain-surface normal.
+        ``(point, normal, distance)``: unchanged unless the face beneath the partner owns the contact.
     """
     h = context.heightfield
     if triangle.shape_type != int(GeoTypeEx.TRIANGLE_PRISM) or h.nrow < 2 or h.ncol < 2:
-        return normal, distance
+        return point, normal, distance
     if not (wp.isfinite(point[0]) and wp.isfinite(point[1]) and wp.isfinite(point[2])):
-        return normal, distance
+        return point, normal, distance
     if not (wp.isfinite(normal[0]) and wp.isfinite(normal[1]) and wp.isfinite(normal[2])):
-        return normal, distance
+        return point, normal, distance
     e1, e2 = triangle.scale, triangle.auxiliary
     face = wp.cross(e1, e2)
     scale = wp.max(wp.length(e1), wp.length(e2))
     tolerance = 2.0e-6 * scale
     # Witnesses on the extruded walls or bottom lie off the top face; only its boundary has neighbours.
     if wp.abs(wp.dot(point, face)) > tolerance * wp.length(face):
-        return normal, distance
+        return point, normal, distance
     determinant = e1[0] * e2[1] - e1[1] * e2[0]
     if determinant <= 0.0:
-        return normal, distance
+        return point, normal, distance
     u = (point[0] * e2[1] - point[1] * e2[0]) / determinant
     v = (e1[0] * point[1] - e1[1] * point[0]) / determinant
     bary = wp.vec3(1.0 - u - v, u, v)
     epsilon = float(2.0e-6)
     if wp.min(bary) < -epsilon or wp.max(bary) > 1.0 + epsilon:
-        return normal, distance
+        return point, normal, distance
     zeros = int(0)
     largest = int(0)
     opposite = int(0)
@@ -118,14 +134,12 @@ def seam_surface_normal(
         if bary[k] > bary[largest]:
             largest = k
     if zeros == 0:
-        return normal, distance
+        return point, normal, distance
     cols = h.ncol - 1
-    rows = h.nrow - 1
     cell, sub = context.triangle // 2, context.triangle % 2
     row, col = cell // cols, cell % cols
     # Both triangle variants start at p00 = (row, col); the others are p10, p11 (sub 0) and p11, p01 (sub 1).
     origin = _vertex(context, row, col)
-    surface = wp.vec3(normal)
     if zeros >= 2:
         vr, vc = row, col
         if largest > 0:
@@ -139,40 +153,29 @@ def seam_surface_normal(
                     if _faces_witness(context, vr + dr, vc + dc, origin, point, normal):
                         ghost = True
         if not ghost:
-            return normal, distance
-        # Its six faces: both triangles of cells (vr, vc) and (vr - 1, vc - 1), sub 0 of (vr, vc - 1)
-        # and sub 1 of (vr - 1, vc).
-        alignment = float(-2.0)
-        for k in range(6):
-            rr = vr - int(k >= 3)
-            cc = vc - int(k == 2 or k >= 4)
-            s = int(k == 1 or k == 3 or k == 5)
-            if rr >= 0 and rr < rows and cc >= 0 and cc < cols:
-                candidate = _cell_normal(context, rr, cc, s)
-                if wp.dot(candidate, normal) > alignment:
-                    alignment = wp.dot(candidate, normal)
-                    surface = candidate
+            return point, normal, distance
     else:
-        # bary[k] == 0 is the edge opposite vertex k: the neighbour across it (cell nr, nc, triangle ns)
-        # has one vertex (or, oc) off that edge.
-        nr, nc, ns, orow, ocol = row, col, 1 - sub, row, col
+        # bary[k] == 0 is the edge opposite vertex k; the neighbour across it has one vertex off that edge.
+        orow, ocol = row, col
         if sub == 0:
             if opposite == 0:
-                nr, nc, orow, ocol = row, col + 1, row + 1, col + 2
+                orow, ocol = row + 1, col + 2
             elif opposite == 1:
                 orow, ocol = row + 1, col
             else:
-                nr, nc, orow, ocol = row - 1, col, row - 1, col
+                orow, ocol = row - 1, col
         else:
             if opposite == 0:
-                nr, nc, orow, ocol = row + 1, col, row + 2, col + 1
+                orow, ocol = row + 2, col + 1
             elif opposite == 1:
-                nr, nc, orow, ocol = row, col - 1, row, col - 1
+                orow, ocol = row, col - 1
             else:
                 orow, ocol = row, col + 1
-        if nr < 0 or nr >= rows or nc < 0 or nc >= cols:
-            return normal, distance
         if not _faces_witness(context, orow, ocol, origin, point, normal):
-            return normal, distance
-        surface = _cell_normal(context, nr, nc, ns)
-    return surface, wp.dot(distance * normal, surface)
+            return point, normal, distance
+    partner = origin + point + distance * normal
+    owner, owner_vertex, owner_normal = _owner_face(context, partner)
+    if owner < 0 or owner == context.triangle:
+        return point, normal, distance
+    owner_distance = wp.dot(partner - owner_vertex, owner_normal)
+    return partner - origin - owner_distance * owner_normal, owner_normal, owner_distance

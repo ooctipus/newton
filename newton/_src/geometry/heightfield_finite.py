@@ -17,7 +17,7 @@ import warp as wp
 
 from ..utils.heightfield import HeightfieldData, get_triangle_shape_from_heightfield
 from .contact_data import ContactData
-from .heightfield_features import HeightfieldFeatureContext, seam_surface_normal
+from .heightfield_features import HeightfieldFeatureContext, seam_surface_witness
 from .types import GeoType
 
 QueryResult = wp.types.vector(length=24, dtype=wp.float32)
@@ -327,24 +327,23 @@ def create_query_kernel(
             feature_context.elevations = heightfield_elevations
             feature_context.triangle = tri_idx
             for k in range(count):
+                contact_center = wp.vec3(value[4 + 4 * k], value[5 + 4 * k], value[6 + 4 * k])
                 contact_normal = local_normal
                 contact_distance = value[7 + 4 * k]
                 if contact_distance >= 0.0:
-                    # Each contact is its own witness: the surface's normal there, and the distance along it.
-                    terrain_point = wp.vec3(value[4 + 4 * k], value[5 + 4 * k], value[6 + 4 * k])
-                    terrain_point -= 0.5 * contact_distance * local_normal
-                    contact_normal, contact_distance = seam_surface_normal(
+                    # Each contact is its own witness: the surface's own contact for it.
+                    terrain_point = contact_center - 0.5 * contact_distance * local_normal
+                    terrain_point, contact_normal, contact_distance = seam_surface_witness(
                         geom, terrain_point, local_normal, contact_distance, feature_context
                     )
+                    contact_center = terrain_point + 0.5 * contact_distance * contact_normal
                 contact = ContactData()
                 contact.shape_a = a
                 contact.shape_b = b
                 contact.margin_a = margin_a
                 contact.margin_b = margin_b
                 contact.gap_sum = gap
-                contact.contact_point_center = origin + wp.quat_rotate(
-                    qa, wp.vec3(value[4 + 4 * k], value[5 + 4 * k], value[6 + 4 * k])
-                )
+                contact.contact_point_center = origin + wp.quat_rotate(qa, contact_center)
                 contact.contact_normal_a_to_b = wp.quat_rotate(qa, contact_normal)
                 contact.contact_distance = contact_distance
                 contact.sort_sub_key = (((tri_idx << 1) | 1) << 3) | k

@@ -84,7 +84,7 @@ from .contact_reduction import (
     get_spatial_direction_2d,
     project_point_to_plane,
 )
-from .heightfield_features import HeightfieldFeatureContext, seam_surface_normal
+from .heightfield_features import HeightfieldFeatureContext, seam_surface_witness
 from .heightfield_primitive_contact import (
     ANALYTIC_PRIMITIVE_QUERIES,
     analytic_convex_default,
@@ -3181,7 +3181,7 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
     # the typed primitive queries keep their reduced support dispatch.
     accelerated = primitive_type in (0, int(GeoType.CONVEX_MESH))
     query_support = support_map_accelerated if accelerated else HEIGHTFIELD_PRIMITIVE_SUPPORTS[primitive_type]
-    query_filter = seam_surface_normal
+    query_filter = seam_surface_witness
     if analytic:
         pair_query = ANALYTIC_PRIMITIVE_QUERIES[primitive_type](writer_func, query_filter=query_filter)
     else:

@@ -12,7 +12,7 @@ import warp as wp
 
 import newton
 from newton import Heightfield
-from newton._src.geometry.heightfield_features import HeightfieldFeatureContext, seam_surface_normal
+from newton._src.geometry.heightfield_features import HeightfieldFeatureContext, seam_surface_witness
 from newton._src.utils import is_graph_capture_allocation_enabled
 from newton._src.utils.heightfield import HeightfieldData, get_triangle_shape_from_heightfield
 from newton.solvers import SolverMuJoCo
@@ -38,7 +38,9 @@ def _seam_feature_kernel():
         context.elevations = elevations
         context.triangle = triangles[i]
         geom, _ = get_triangle_shape_from_heightfield(heights[0], elevations, wp.transform_identity(), triangles[i])
-        normal, _distance = seam_surface_normal(geom, points[i], wp.normalize(wp.vec3(1.0, 0.0, 1.0)), 0.01, context)
+        _point, normal, _distance = seam_surface_witness(
+            geom, points[i], wp.normalize(wp.vec3(1.0, 0.2, 1.0)), 0.01, context
+        )
         normals[i] = normal
 
     return evaluate
@@ -84,7 +86,10 @@ class TestHeightfield(unittest.TestCase):
                     self.assertGreater(float(normals[:, 2].min()), 0.99999)
 
     def test_seam_feature_preserves_border_and_current_crease(self):
-        """A seam witness leaning toward a continuing neighbour takes its face normal; borders, faces and ridges keep theirs."""
+        """A seam witness leaning toward a continuing neighbour becomes the contact of the face beneath its partner.
+
+        Borders, faces and ridges keep their witnesses.
+        """
         builder = newton.ModelBuilder()
         terrain = Heightfield(
             np.zeros((21, 21), np.float32),
@@ -98,7 +103,8 @@ class TestHeightfield(unittest.TestCase):
         builder.add_shape_heightfield(heightfield=terrain)
         model = builder.finalize(device="cpu")
         # Witnesses of cell (10, 10)'s lower triangle on its +x edge and its p11 corner, of the
-        # border cell (10, 19) on the +x border edge, and inside the face; each normal leans toward +x.
+        # border cell (10, 19) on the +x border edge, and inside the face; each normal leans toward +x,
+        # its partner 1 cm away.
         triangles = wp.array([420, 420, 438, 420], dtype=int, device="cpu")
         points = wp.array(
             [(0.12, 0.06, 0.0), (0.12, 0.12, 0.0), (0.12, 0.06, 0.0), (0.03, 0.01, 0.0)], dtype=wp.vec3, device="cpu"
@@ -106,24 +112,27 @@ class TestHeightfield(unittest.TestCase):
         normals = wp.empty(4, dtype=wp.vec3, device="cpu")
         kernel = _seam_feature_kernel()
         inputs = [model.heightfield_data, model.heightfield_elevations, triangles, points, normals]
-        leaning = np.array([1.0, 0.0, 1.0]) / np.sqrt(2.0)
+        leaning = np.array([1.0, 0.2, 1.0]) / np.linalg.norm([1.0, 0.2, 1.0])
         up = np.array([0.0, 0.0, 1.0])
+
+        def unit(v):
+            return np.asarray(v) / np.linalg.norm(v)
+
         elevations = np.full(21 * 21, 0.5, dtype=np.float32)
         model.heightfield_elevations.assign(elevations)
         wp.launch(kernel, dim=4, inputs=inputs, device="cpu")
         # Flat: the neighbours beyond the edge and the corner continue beneath the partner.
         np.testing.assert_allclose(normals.numpy(), [up, up, leaning, leaning], atol=1.0e-6)
-        # A neighbour that rises toward the partner lends its own face normal to the edge; the corner
-        # takes the incident face nearest to the witness normal, a flat one.
+        # A neighbour that rises toward the partner: the partners lie over cell (10, 11)'s upper
+        # triangle, (0.12, 0, 0), (0.24, 0.12, 0.1), (0.12, 0.12, 0), and over cell (11, 11)'s lower
+        # one, (0.12, 0.12, 0), (0.24, 0.12, 0.1), (0.24, 0.24, 0), from cell (10, 10)'s origin.
         elevations[11 * 21 + 12] = 0.6
         model.heightfield_elevations.assign(elevations)
         wp.launch(kernel, dim=4, inputs=inputs, device="cpu")
-        # Cell (10, 11)'s upper triangle: (0.12, 0, 0), (0.24, 0.12, 0.1), (0.12, 0.12, 0) from its origin.
-        rising = np.cross([0.12, 0.12, 0.1], [0.0, 0.12, 0.0])
-        np.testing.assert_allclose(
-            normals.numpy(), [rising / np.linalg.norm(rising), up, leaning, leaning], atol=1.0e-6
-        )
-        # A ridge: every vertex beyond the edge and the corner falls away, so both normals are the surface's.
+        edge = unit(np.cross([0.12, 0.12, 0.1], [0.0, 0.12, 0.0]))
+        corner = unit(np.cross([0.12, 0.0, 0.1], [0.12, 0.12, 0.0]))
+        np.testing.assert_allclose(normals.numpy(), [edge, corner, leaning, leaning], atol=1.0e-6)
+        # A ridge: every vertex beyond the edge and the corner falls away, so both are surface witnesses.
         for row, col in ((11, 12), (12, 12), (10, 12), (12, 11)):
             elevations[row * 21 + col] = 0.2
         model.heightfield_elevations.assign(elevations)
