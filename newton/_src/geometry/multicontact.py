@@ -714,7 +714,13 @@ def add_avoid_duplicates_vec2(arr: wp.array[wp.vec2], arr_count: int, vec: wp.ve
     return arr_count + 1, True
 
 
-def create_build_manifold(support_func: Any, writer_func: Any, post_process_contact: Any, _support_funcs: Any = None):
+def create_build_manifold(
+    support_func: Any,
+    writer_func: Any,
+    post_process_contact: Any,
+    _support_funcs: Any = None,
+    point_filter: Any = None,
+):
     """
     Factory function to create manifold generation functions with a specific support mapping function.
 
@@ -727,11 +733,24 @@ def create_build_manifold(support_func: Any, writer_func: Any, post_process_cont
                      (geometry, direction, data_provider) and returns a support point
         writer_func: Function to write contact data (signature: (ContactData, writer_data) -> None)
         post_process_contact: Function to post-process contact data
+        point_filter: Optional admission of each contact, ``(ContactData, query_context) -> bool``,
+            evaluated after post-processing and before the writer.
 
     Returns:
         build_manifold function that generates up to 5 contact points between two shapes
         using perturbed support mapping and polygon clipping.
     """
+
+    has_point_filter = point_filter is not None
+
+    @wp.func
+    def write_contact(contact_data: ContactData, writer_data: Any, query_context: Any):
+        """Write one contact, if the optional point filter admits it."""
+        if wp.static(has_point_filter):
+            if point_filter(contact_data, query_context):
+                writer_func(contact_data, writer_data, -1)
+        else:
+            writer_func(contact_data, writer_data, -1)
 
     @wp.func
     def contact_plane_is_supporting(geom: Any, direction: wp.vec3, plane_d: float, provider: Any) -> bool:
@@ -810,6 +829,7 @@ def create_build_manifold(support_func: Any, writer_func: Any, post_process_cont
         position_b: wp.vec3,
         quaternion_a: wp.quat,
         quaternion_b: wp.quat,
+        query_context: Any,
     ) -> tuple[int, float]:
         """
         Extract up to 4 contact points from two convex contact polygons and write them immediately.
@@ -895,7 +915,7 @@ def create_build_manifold(support_func: Any, writer_func: Any, post_process_cont
                 contact_data = post_process_contact(
                     contact_data, geom_a, position_a, quaternion_a, geom_b, position_b, quaternion_b
                 )
-                writer_func(contact_data, writer_data, -1)
+                write_contact(contact_data, writer_data, query_context)
         else:
             normal_dot = 0.0
             loop_count = 0
@@ -944,6 +964,7 @@ def create_build_manifold(support_func: Any, writer_func: Any, post_process_cont
         position_b: wp.vec3,
         quaternion_a: wp.quat,
         quaternion_b: wp.quat,
+        query_context: Any,
     ) -> int:
         """
         Write contacts between the sampled support points of a non-planar feature and a verified face.
@@ -1018,7 +1039,7 @@ def create_build_manifold(support_func: Any, writer_func: Any, post_process_cont
                 contact_data = post_process_contact(
                     contact_data, geom_a, position_a, quaternion_a, geom_b, position_b, quaternion_b
                 )
-                writer_func(contact_data, writer_data, -1)
+                write_contact(contact_data, writer_data, query_context)
                 written += 1
         return written
 
@@ -1036,6 +1057,7 @@ def create_build_manifold(support_func: Any, writer_func: Any, post_process_cont
         data_provider: Any,
         writer_data: Any,
         contact_template: ContactData,
+        query_context: Any = 0,
     ) -> int:
         """
         Build a contact manifold between two convex shapes and write contacts directly.
@@ -1247,6 +1269,7 @@ def create_build_manifold(support_func: Any, writer_func: Any, post_process_cont
                             position_b_ws,
                             quaternion_a_ws,
                             quaternion_b_ws,
+                            query_context,
                         )
         else:
             projector_a, projector_b = create_body_projectors(plane_tracker_a, p_a, plane_tracker_b, p_b, normal)
@@ -1298,6 +1321,7 @@ def create_build_manifold(support_func: Any, writer_func: Any, post_process_cont
                     position_b_ws,
                     quaternion_a_ws,
                     quaternion_b_ws,
+                    query_context,
                 )
                 count_out = wp.min(num_manifold_points, 4)
 
@@ -1316,7 +1340,7 @@ def create_build_manifold(support_func: Any, writer_func: Any, post_process_cont
             contact_data = post_process_contact(
                 contact_data, geom_a, position_a_ws, quaternion_a_ws, geom_b, position_b_ws, quaternion_b_ws
             )
-            writer_func(contact_data, writer_data, -1)
+            write_contact(contact_data, writer_data, query_context)
 
             count_out += 1
 

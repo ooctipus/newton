@@ -41,6 +41,18 @@ def _vertex(context: HeightfieldFeatureContext, row: int, col: int) -> wp.vec3:
 
 
 @wp.func
+def faces_witness(toward: wp.vec3, normal: wp.vec3) -> bool:
+    """The feature rule's test: whether a surface vertex at offset ``toward`` from a witness lies in front of it.
+
+    A witness on an edge or vertex of a surface triangle is a local minimum of the distance to the surface only
+    if no vertex adjacent to the feature lies in front of the plane through the witness with the witness normal
+    (by more than ``SEAM_DIRECTION_TOLERANCE``, the witness normals' rounding). Heightfield triangles
+    (:func:`seam_surface_witness`) and mesh triangles (``mesh_topology.mesh_contact_filter``) apply this one test.
+    """
+    return wp.dot(normal, toward) > SEAM_DIRECTION_TOLERANCE * wp.length(toward)
+
+
+@wp.func
 def _faces_witness(
     context: HeightfieldFeatureContext, row: int, col: int, origin: wp.vec3, point: wp.vec3, normal: wp.vec3
 ) -> bool:
@@ -48,8 +60,7 @@ def _faces_witness(
     h = context.heightfield
     if row < 0 or row >= h.nrow or col < 0 or col >= h.ncol:
         return False
-    toward = _vertex(context, row, col) - origin - point
-    return wp.dot(normal, toward) > SEAM_DIRECTION_TOLERANCE * wp.length(toward)
+    return faces_witness(_vertex(context, row, col) - origin - point, normal)
 
 
 @wp.func

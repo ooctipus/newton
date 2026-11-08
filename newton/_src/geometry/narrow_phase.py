@@ -21,7 +21,6 @@ from ..geometry.collision_core import (
     convex_mesh_interior_point,
     create_compute_gjk_mpr_contacts,
     create_find_contacts,
-    get_triangle_shape_from_mesh,
     mesh_vs_convex_cell_candidates,
     mesh_vs_convex_midphase,
     mesh_vs_convex_pair_shapes,
@@ -60,6 +59,8 @@ from ..geometry.contact_reduction_global import (
     EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
     EXPORT_REDUCED_CONTACTS_THREAD_BUDGET_MULTIPLIER,
     HASHTABLE_WARN_LOAD_PERCENT,
+    MESH_ROUND_NONE,
+    MESH_ROUND_ONLY,
     GlobalContactReducer,
     create_export_reduced_contacts_kernel,
     create_mesh_triangle_contacts_to_reducer_kernel,
@@ -72,10 +73,24 @@ from ..geometry.contact_sort import ContactSorter
 from ..geometry.flags import ShapeFlags
 from ..geometry.heightfield_cells import heightfield_cell_overlaps_kernel
 from ..geometry.heightfield_cylinder import create_heightfield_cylinder_split_kernels
-from ..geometry.heightfield_features import HeightfieldFeatureContext, seam_surface_witness
+from ..geometry.heightfield_features import HeightfieldFeatureContext
 from ..geometry.heightfield_primitive_contact import ANALYTIC_PRIMITIVE_QUERIES, analytic_primitives_default
 from ..geometry.heightfield_row_gate import HEIGHTFIELD_ROW_COUNT, HEIGHTFIELD_TYPED_ROWS, heightfield_row_gate_kernel
 from ..geometry.mesh_cells import MeshCells, build_mesh_cells
+from ..geometry.mesh_topology import (
+    MeshTopologyData,
+    create_mesh_capsule_contacts,
+    create_mesh_sphere_contact,
+    create_surface_penetration_refiner,
+    empty_mesh_topology,
+    mesh_contact_filter,
+    mesh_manifold_triangle,
+    mesh_surface_context,
+    mesh_triangle_corners,
+    surface_query_filter,
+    triangle_plane_clears,
+    triangle_shape_from_corners,
+)
 from ..geometry.mpr import create_solve_mpr, create_support_map_function
 from ..geometry.sdf_contact import (
     MESH_SDF_BLOCK_DIM,
@@ -90,7 +105,6 @@ from ..geometry.support_function import (
     AcceleratedSupportMapDataProvider,
     GenericShapeData,
     SupportMapDataProvider,
-    create_triangle_prism_penetration_refiner,
     extract_shape_data,
     support_map,
     support_map_accelerated,
@@ -2022,9 +2036,13 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(
         writer_func,
         support_func=support_func,
         use_precomputed_center=True,
-        penetration_refiner=create_triangle_prism_penetration_refiner(support_func),
-        query_filter=seam_surface_witness,
+        penetration_refiner=create_surface_penetration_refiner(support_func),
+        query_filter=surface_query_filter,
+        point_filter=mesh_contact_filter,
+        manifold_shape=mesh_manifold_triangle,
     )
+    mesh_sphere_contact = create_mesh_sphere_contact(writer_func)
+    mesh_capsule_contacts = create_mesh_capsule_contacts(writer_func)
 
     def narrow_phase_process_mesh_triangle_contacts_kernel(
         shape_types: wp.array[int],
@@ -2045,9 +2063,11 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(
         support_vertex_offsets: wp.array[int],
         support_neighbors: wp.array[int],
         shape_interior_point: wp.array[wp.vec3],
+        mesh_topology: MeshTopologyData,
     ):
         """
-        Process triangle pairs to generate contacts using GJK/MPR.
+        Process triangle pairs to generate contacts: GJK/MPR, spheres on mesh triangles in closed form,
+        and the surface's feature rule on every mesh contact.
         """
         tid = wp.tid()
 
@@ -2067,6 +2087,9 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(
 
             type_a = shape_types[shape_a]
 
+            corner_0 = wp.vec3(0.0)
+            corner_1 = wp.vec3(0.0)
+            corner_2 = wp.vec3(0.0)
             if type_a == GeoType.HFIELD:
                 # Heightfield triangle
                 hfd = heightfield_data[shape_heightfield_index[shape_a]]
@@ -2080,7 +2103,9 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(
                 scale_data_a = shape_data[shape_a]
                 mesh_scale_a = wp.vec3(scale_data_a[0], scale_data_a[1], scale_data_a[2])
                 X_ws_a = shape_transform[shape_a]
-                shape_data_a, v0_world = get_triangle_shape_from_mesh(mesh_id_a, mesh_scale_a, X_ws_a, tri_idx)
+                corner_0, corner_1, corner_2 = mesh_triangle_corners(mesh_id_a, mesh_scale_a, X_ws_a, tri_idx)
+                shape_data_a = triangle_shape_from_corners(corner_0, corner_1, corner_2, mesh_scale_a)
+                v0_world = corner_0
 
             # Extract shape B data
             pos_b, quat_b, shape_data_b, _scale_b, margin_offset_b = extract_shape_data(
@@ -2125,6 +2150,74 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(
             if wp.static(convex_support_acceleration):
                 data_provider.support_lut = support_lut
                 data_provider.support_vertex_offsets = support_vertex_offsets
+
+            # Heightfield triangles have no mesh: their context reads no mesh data.
+            surface_mesh = wp.uint64(0)
+            if type_a == GeoType.MESH:
+                surface_mesh = shape_source[shape_a]
+            if type_a == GeoType.MESH and shape_data_b.shape_type != GeoType.SPHERE:
+                if shape_data_b.shape_type != GeoType.CAPSULE:
+                    # Skip a triangle whose plane the shape clears by more than the contact threshold, before
+                    # anything else is read (spheres and capsules have their own exits).
+                    face = wp.cross(shape_data_a.scale, shape_data_a.auxiliary)
+                    support_b = wp.static(support_func)(shape_data_b, wp.quat_rotate_inv(quat_b, -face), data_provider)
+                    if triangle_plane_clears(
+                        shape_data_a,
+                        pos_a,
+                        wp.quat_rotate(quat_b, support_b) + pos_b,
+                        gap_sum + margin_offset_a + margin_offset_b,
+                    ):
+                        continue
+            surface = mesh_surface_context(
+                mesh_topology,
+                shape_a,
+                tri_idx,
+                surface_mesh,
+                wp.vec3(shape_data[shape_a][0], shape_data[shape_a][1], shape_data[shape_a][2]),
+                X_ws_a,
+                corner_0,
+                corner_1,
+                corner_2,
+                pos_b + wp.quat_rotate(quat_b, shape_data_b.center),
+                shape_b,
+            )
+            surface.heightfield = feature_context
+            if type_a != GeoType.HFIELD:
+                # Mesh triangles: spheres and capsules in closed form; other shapes skip a triangle whose plane the
+                # shape clears by more than the contact threshold.
+                threshold = gap_sum + margin_offset_a + margin_offset_b
+                if shape_data_b.shape_type == GeoType.SPHERE:
+                    mesh_sphere_contact(
+                        surface,
+                        pos_b,
+                        shape_data_b.scale[0],
+                        threshold,
+                        margin_offset_a,
+                        margin_offset_b,
+                        shape_a,
+                        shape_b,
+                        gap_sum,
+                        (tri_idx << 1) | 1,
+                        writer_data,
+                    )
+                    continue
+                if shape_data_b.shape_type == GeoType.CAPSULE:
+                    core = wp.quat_rotate(quat_b, wp.vec3(0.0, 0.0, shape_data_b.scale[1]))
+                    mesh_capsule_contacts(
+                        surface,
+                        pos_b - core,
+                        pos_b + core,
+                        shape_data_b.scale[0],
+                        threshold,
+                        margin_offset_a,
+                        margin_offset_b,
+                        shape_a,
+                        shape_b,
+                        gap_sum,
+                        (tri_idx << 1) | 1,
+                        writer_data,
+                    )
+                    continue
             wp.static(compute_contacts)(
                 shape_data_a,
                 shape_data_b,
@@ -2140,7 +2233,7 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(
                 data_provider,
                 writer_data,
                 (tri_idx << 1) | 1,
-                feature_context,
+                surface,
             )
 
     name = "narrow_phase_process_mesh_triangle_contacts_kernel" + suffix
@@ -2996,6 +3089,9 @@ class NarrowPhase:
             max_candidate_pairs if max_heightfield_pairs is None else max_heightfield_pairs,
         )
         self.device = device
+        # The welded topology of the meshes (see mesh_topology.py). The collision pipeline binds the model's;
+        # a narrow phase given none reads every mesh as a triangle soup.
+        self.mesh_topology = empty_mesh_topology(device)
         self.reduce_contacts = reduce_contacts
         self.has_meshes = has_meshes
         self._empty_mesh_cells = None
@@ -3338,6 +3434,20 @@ class NarrowPhase:
             self.narrow_phase_mpr_kernel = None
             self.narrow_phase_gjk_kernel = None
             self.narrow_phase_manifold_kernel = None
+        # Mesh triangles against spheres and capsules take their closed form in a lean kernel of their own; the
+        # generic reducing query (or the heightfield primitive route's fallback) takes every other pair.
+        self._mesh_round_kernel = None
+        self._mesh_generic_kernel = mesh_triangle_contacts_to_reducer_kernel
+        if has_meshes and self.reduce_contacts:
+            self._mesh_round_kernel = create_mesh_triangle_contacts_to_reducer_kernel(mesh_round=MESH_ROUND_ONLY)
+            self._mesh_generic_kernel = create_mesh_triangle_contacts_to_reducer_kernel(mesh_round=MESH_ROUND_NONE)
+            if self._heightfield_primitive_kernels:
+                self._heightfield_primitive_kernels = (
+                    *self._heightfield_primitive_kernels[:-1],
+                    create_mesh_triangle_contacts_to_reducer_kernel(
+                        exclude_primitives=True, mesh_round=MESH_ROUND_NONE
+                    ),
+                )
         # Create triangle contacts kernel when meshes or heightfields are present
         if has_meshes or has_heightfields:
             self.mesh_triangle_contacts_kernel = create_narrow_phase_process_mesh_triangle_contacts_kernel(
@@ -4453,6 +4563,7 @@ class NarrowPhase:
                 support_vertex_offsets,
                 support_neighbors,
                 shape_interior_point,
+                self.mesh_topology,
             ]
 
             # Launch contact processing for triangle pairs
@@ -4530,6 +4641,17 @@ class NarrowPhase:
                         block_dim=self.mesh_triangle_block_dim,
                         record_tape=False,
                     )
+                if self._mesh_round_kernel is not None and not (
+                    self._heightfield_pair_csr or self._heightfield_finite_query
+                ):
+                    wp.launch(
+                        kernel=self._mesh_round_kernel,
+                        dim=self.total_num_threads,
+                        inputs=[*triangle_inputs, *support_inputs],
+                        device=device,
+                        block_dim=self.mesh_triangle_block_dim,
+                        record_tape=False,
+                    )
                 if self._heightfield_primitive_query:
                     if self._heightfield_row_gate:
                         wp.launch(
@@ -4582,7 +4704,7 @@ class NarrowPhase:
                         if self._heightfield_pair_csr
                         else self._finite_reducer_fallback
                         if self._heightfield_finite_query
-                        else mesh_triangle_contacts_to_reducer_kernel,
+                        else self._mesh_generic_kernel,
                         dim=self.total_num_threads,
                         inputs=[*triangle_inputs, *support_inputs],
                         device=device,

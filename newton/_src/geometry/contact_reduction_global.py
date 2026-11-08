@@ -67,9 +67,7 @@ from newton._src.geometry.hashtable import (
 from ..utils.heightfield import HeightfieldData, get_triangle_shape_from_heightfield
 from .collision_core import (
     create_compute_gjk_mpr_contacts,
-    get_triangle_shape_from_mesh,
 )
-from .collision_primitive import collide_sphere_sphere
 from .contact_data import ContactData, compute_contact_approach_speed
 from .contact_reduction import (
     MAX_CONTACTS_PER_PAIR,
@@ -88,10 +86,22 @@ from .heightfield_primitive_contact import (
     analytic_convex_default,
     analytic_primitives_default,
 )
+from .mesh_topology import (
+    MeshTopologyData,
+    create_mesh_capsule_contacts,
+    create_mesh_sphere_contact,
+    create_surface_penetration_refiner,
+    mesh_contact_filter,
+    mesh_manifold_triangle,
+    mesh_surface_context,
+    mesh_triangle_corners,
+    surface_query_filter,
+    triangle_plane_clears,
+    triangle_shape_from_corners,
+)
 from .support_function import (
     AcceleratedSupportMapDataProvider,
     SupportMapDataProvider,
-    closest_point_on_triangle,
     create_triangle_prism_penetration_refiner,
     extract_shape_data,
     support_map,
@@ -2579,6 +2589,11 @@ def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_expor
     return export_reduced_contacts_kernel
 
 
+MESH_ROUND_ALL = 0
+MESH_ROUND_ONLY = 1
+MESH_ROUND_NONE = 2
+
+
 def create_mesh_triangle_contacts_to_reducer_kernel(
     primitive_type: int = 0,
     exclude_primitives: bool = False,
@@ -2589,10 +2604,15 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
     writer_data_type=GlobalContactReducerData,
     kernel_name=None,
     analytic: bool | None = None,
+    mesh_round: int = MESH_ROUND_ALL,
 ):
     """Create the original query or a filtered heightfield primitive variant.
 
     Args:
+        mesh_round: Which mesh-triangle pairs the generic query takes: all (``MESH_ROUND_ALL``), only those
+            with a sphere or capsule (``MESH_ROUND_ONLY``: their closed form, in a lean kernel), or all but those
+            (``MESH_ROUND_NONE``: GJK/MPR, beside the lean kernel). Heightfield pairs are in every generic
+            variant but the lean one.
         analytic: Use the closed-form cell contact of ``ANALYTIC_PRIMITIVE_QUERIES``
             for a typed primitive query that has one, or, in the generic
             fallback that still serves heightfield convex pairs, for those
@@ -2619,6 +2639,7 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
         analytic_convex=bool(analytic_convex)
         and convex_in_fallback
         and int(GeoType.CONVEX_MESH) in ANALYTIC_PRIMITIVE_QUERIES,
+        mesh_round=mesh_round,
     )
 
 
@@ -2652,7 +2673,10 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
     kernel_name=None,
     analytic: bool = False,
     analytic_convex: bool = False,
+    mesh_round: int = MESH_ROUND_ALL,
 ):
+    if mesh_round != MESH_ROUND_ALL and (primitive_type != 0 or analytic):
+        raise ValueError("Only the generic query splits its mesh round-shape pairs")
     if primitive_type not in (0, *HEIGHTFIELD_PRIMITIVE_SUPPORTS):
         raise ValueError("Only sphere, capsule, cylinder, box and convex-mesh heightfield queries can be specialized")
     if primitive_type and exclude_primitives:
@@ -2664,6 +2688,17 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
     query_filter = seam_surface_witness
     if analytic:
         pair_query = ANALYTIC_PRIMITIVE_QUERIES[primitive_type](writer_func, query_filter=query_filter)
+    elif primitive_type == 0:
+        # Mesh and heightfield triangles: the surface's feature rule on every mesh contact.
+        pair_query = create_compute_gjk_mpr_contacts(
+            writer_func,
+            support_func=query_support,
+            use_precomputed_center=True,
+            penetration_refiner=create_surface_penetration_refiner(query_support),
+            query_filter=surface_query_filter,
+            point_filter=mesh_contact_filter,
+            manifold_shape=mesh_manifold_triangle,
+        )
     else:
         pair_query = create_compute_gjk_mpr_contacts(
             writer_func,
@@ -2672,6 +2707,8 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
             penetration_refiner=create_triangle_prism_penetration_refiner(query_support),
             query_filter=query_filter,
         )
+    mesh_sphere_contact = create_mesh_sphere_contact(writer_func)
+    mesh_capsule_contacts = create_mesh_capsule_contacts(writer_func)
     # The fallback keeps heightfield convex pairs in its own scan; with the
     # closed-form row on, those pairs take the row here instead of GJK/MPR.
     convex_query = (
@@ -2699,6 +2736,7 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
         support_vertex_offsets: wp.array[int],
         support_neighbors: wp.array[int],
         shape_interior_point: wp.array[wp.vec3],
+        mesh_topology: MeshTopologyData,
     ):
         """Process mesh/heightfield-triangle contacts and store them in GlobalContactReducer.
 
@@ -2731,6 +2769,15 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
                     continue
 
             type_a = shape_types[shape_a]
+            if wp.static(mesh_round != MESH_ROUND_ALL):
+                round_pair = type_a == GeoType.MESH and (
+                    shape_types[shape_b] == GeoType.SPHERE or shape_types[shape_b] == GeoType.CAPSULE
+                )
+                if wp.static(mesh_round == MESH_ROUND_ONLY):
+                    if not round_pair:
+                        continue
+                elif round_pair:
+                    continue
             if wp.static(primitive_type != 0):
                 if type_a != GeoType.HFIELD or shape_types[shape_b] != primitive_type:
                     continue
@@ -2742,6 +2789,9 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
                 if type_a == GeoType.HFIELD and heightfield_typed_primitive(shape_types[shape_b], shape_data[shape_b]):
                     continue
 
+            corner_0 = wp.vec3(0.0)
+            corner_1 = wp.vec3(0.0)
+            corner_2 = wp.vec3(0.0)
             if wp.static(primitive_type != 0):
                 hfd = heightfield_data[shape_heightfield_index[shape_a]]
                 X_ws_a = shape_transform[shape_a]
@@ -2761,7 +2811,9 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
                 scale_data_a = shape_data[shape_a]
                 mesh_scale_a = wp.vec3(scale_data_a[0], scale_data_a[1], scale_data_a[2])
                 X_ws_a = shape_transform[shape_a]
-                shape_data_a, v0_world = get_triangle_shape_from_mesh(mesh_id_a, mesh_scale_a, X_ws_a, tri_idx)
+                corner_0, corner_1, corner_2 = mesh_triangle_corners(mesh_id_a, mesh_scale_a, X_ws_a, tri_idx)
+                shape_data_a = triangle_shape_from_corners(corner_0, corner_1, corner_2, mesh_scale_a)
+                v0_world = corner_0
 
             # Extract shape B data
             pos_b, quat_b, shape_data_b, _scale_b, margin_offset_b = extract_shape_data(
@@ -2801,47 +2853,6 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
             gap_b = shape_gap[shape_b]
             gap_sum = gap_a + gap_b
 
-            if wp.static(primitive_type == 0):
-                # Heightfields use extruded triangle prisms to keep contacts one-sided near
-                # cell boundaries, so their sphere contacts must retain the generic path. So
-                # does a sphere whose center is behind its triangle: only a closed mesh's
-                # nearest face admits it, and the generic path keeps that face's outward normal.
-                tri_a = pos_a
-                tri_b = pos_a + shape_data_a.scale
-                tri_c = pos_a + shape_data_a.auxiliary
-                surface_normal = wp.cross(tri_b - tri_a, tri_c - tri_a)
-                if (
-                    shape_data_b.shape_type == GeoType.SPHERE
-                    and type_a != GeoType.HFIELD
-                    and wp.dot(pos_b - tri_a, surface_normal) >= 0.0
-                ):
-                    normal_length_sq = wp.length_sq(surface_normal)
-                    closest = closest_point_on_triangle(pos_b, tri_a, tri_b, tri_c)
-                    sphere_radius = shape_data_b.scale[0]
-
-                    contact_distance, contact_position, contact_normal = collide_sphere_sphere(
-                        closest, 0.0, pos_b, sphere_radius
-                    )
-                    if wp.length_sq(pos_b - closest) < 1.0e-24 and normal_length_sq > 1.0e-24:
-                        contact_normal = surface_normal / wp.sqrt(normal_length_sq)
-                        contact_position = pos_b - 0.5 * sphere_radius * contact_normal
-
-                    if contact_distance < gap_sum + margin_offset_a + margin_offset_b:
-                        contact_data = ContactData()
-                        contact_data.contact_point_center = contact_position
-                        contact_data.contact_normal_a_to_b = contact_normal
-                        contact_data.contact_distance = contact_distance
-                        contact_data.radius_eff_a = 0.0
-                        contact_data.radius_eff_b = sphere_radius
-                        contact_data.margin_a = margin_offset_a
-                        contact_data.margin_b = margin_offset_b
-                        contact_data.shape_a = shape_a
-                        contact_data.shape_b = shape_b
-                        contact_data.gap_sum = gap_sum
-                        contact_data.sort_sub_key = (tri_idx << 1) | 1
-                        writer_func(contact_data, reducer_data, -1)
-                    continue
-
             if wp.static(accelerated):
                 data_provider = AcceleratedSupportMapDataProvider()
                 data_provider.shape_support_data = shape_support_data
@@ -2857,11 +2868,105 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
                 feature_context.triangle = tri_idx
                 feature_context.heightfield = heightfield_data[shape_heightfield_index[shape_a]]
 
-            if wp.static(analytic_convex):
-                if type_a == GeoType.HFIELD and shape_data_b.shape_type == GeoType.CONVEX_MESH:
-                    # The closed-form convex row only exists for heightfields; this branch compiles
-                    # when it is on, and it takes no support provider.
-                    wp.static(convex_query)(
+            if wp.static(primitive_type == 0 and mesh_round != MESH_ROUND_ONLY):
+                # Mesh triangles against other shapes: skip a triangle whose plane the shape clears by more than the
+                # contact threshold, before anything else is read (spheres and capsules have their own exits).
+                if type_a == GeoType.MESH and shape_data_b.shape_type != GeoType.SPHERE:
+                    if shape_data_b.shape_type != GeoType.CAPSULE:
+                        face = wp.cross(shape_data_a.scale, shape_data_a.auxiliary)
+                        support_b = wp.static(query_support)(
+                            shape_data_b, wp.quat_rotate_inv(quat_b, -face), data_provider
+                        )
+                        if triangle_plane_clears(
+                            shape_data_a,
+                            pos_a,
+                            wp.quat_rotate(quat_b, support_b) + pos_b,
+                            gap_sum + margin_offset_a + margin_offset_b,
+                        ):
+                            continue
+
+            if wp.static(primitive_type == 0):
+                # Heightfield triangles have no mesh: their context reads no mesh data.
+                surface_mesh = wp.uint64(0)
+                if type_a == GeoType.MESH:
+                    surface_mesh = shape_source[shape_a]
+                surface = mesh_surface_context(
+                    mesh_topology,
+                    shape_a,
+                    tri_idx,
+                    surface_mesh,
+                    wp.vec3(shape_data[shape_a][0], shape_data[shape_a][1], shape_data[shape_a][2]),
+                    shape_transform[shape_a],
+                    corner_0,
+                    corner_1,
+                    corner_2,
+                    pos_b + wp.quat_rotate(quat_b, shape_data_b.center),
+                    shape_b,
+                )
+                surface.heightfield = feature_context
+                if type_a != GeoType.HFIELD:
+                    # Mesh triangles: spheres and capsules in closed form.
+                    threshold = gap_sum + margin_offset_a + margin_offset_b
+                    if wp.static(mesh_round != MESH_ROUND_NONE):
+                        if shape_data_b.shape_type == GeoType.SPHERE:
+                            mesh_sphere_contact(
+                                surface,
+                                pos_b,
+                                shape_data_b.scale[0],
+                                threshold,
+                                margin_offset_a,
+                                margin_offset_b,
+                                shape_a,
+                                shape_b,
+                                gap_sum,
+                                (tri_idx << 1) | 1,
+                                reducer_data,
+                            )
+                            continue
+                        if shape_data_b.shape_type == GeoType.CAPSULE:
+                            core = wp.quat_rotate(quat_b, wp.vec3(0.0, 0.0, shape_data_b.scale[1]))
+                            mesh_capsule_contacts(
+                                surface,
+                                pos_b - core,
+                                pos_b + core,
+                                shape_data_b.scale[0],
+                                threshold,
+                                margin_offset_a,
+                                margin_offset_b,
+                                shape_a,
+                                shape_b,
+                                gap_sum,
+                                (tri_idx << 1) | 1,
+                                reducer_data,
+                            )
+                            continue
+                    if wp.static(mesh_round == MESH_ROUND_ONLY):
+                        continue
+
+            if wp.static(mesh_round != MESH_ROUND_ONLY):
+                if wp.static(analytic_convex):
+                    if type_a == GeoType.HFIELD and shape_data_b.shape_type == GeoType.CONVEX_MESH:
+                        # The closed-form convex row only exists for heightfields; this branch compiles
+                        # when it is on, and it takes no support provider.
+                        wp.static(convex_query)(
+                            shape_data_a,
+                            shape_data_b,
+                            quat_a,
+                            quat_b,
+                            pos_a,
+                            pos_b,
+                            gap_sum,
+                            shape_a,
+                            shape_b,
+                            margin_offset_a,
+                            margin_offset_b,
+                            reducer_data,
+                            (tri_idx << 1) | 1,
+                            feature_context,
+                        )
+                        continue
+                if wp.static(analytic):
+                    wp.static(pair_query)(
                         shape_data_a,
                         shape_data_b,
                         quat_a,
@@ -2877,42 +2982,42 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
                         (tri_idx << 1) | 1,
                         feature_context,
                     )
-                    continue
-            if wp.static(analytic):
-                wp.static(pair_query)(
-                    shape_data_a,
-                    shape_data_b,
-                    quat_a,
-                    quat_b,
-                    pos_a,
-                    pos_b,
-                    gap_sum,
-                    shape_a,
-                    shape_b,
-                    margin_offset_a,
-                    margin_offset_b,
-                    reducer_data,
-                    (tri_idx << 1) | 1,
-                    feature_context,
-                )
-            else:
-                wp.static(pair_query)(
-                    shape_data_a,
-                    shape_data_b,
-                    quat_a,
-                    quat_b,
-                    pos_a,
-                    pos_b,
-                    gap_sum,
-                    shape_a,
-                    shape_b,
-                    margin_offset_a,
-                    margin_offset_b,
-                    data_provider,
-                    reducer_data,
-                    (tri_idx << 1) | 1,
-                    feature_context,
-                )
+                elif wp.static(primitive_type == 0):
+                    wp.static(pair_query)(
+                        shape_data_a,
+                        shape_data_b,
+                        quat_a,
+                        quat_b,
+                        pos_a,
+                        pos_b,
+                        gap_sum,
+                        shape_a,
+                        shape_b,
+                        margin_offset_a,
+                        margin_offset_b,
+                        data_provider,
+                        reducer_data,
+                        (tri_idx << 1) | 1,
+                        surface,
+                    )
+                else:
+                    wp.static(pair_query)(
+                        shape_data_a,
+                        shape_data_b,
+                        quat_a,
+                        quat_b,
+                        pos_a,
+                        pos_b,
+                        gap_sum,
+                        shape_a,
+                        shape_b,
+                        margin_offset_a,
+                        margin_offset_b,
+                        data_provider,
+                        reducer_data,
+                        (tri_idx << 1) | 1,
+                        feature_context,
+                    )
 
     if primitive_type == int(GeoType.SPHERE):
         mesh_triangle_contacts_to_reducer_kernel.__name__ = "heightfield_sphere_contacts_to_reducer_kernel"
@@ -2932,6 +3037,10 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
         mesh_triangle_contacts_to_reducer_kernel.__name__ += "_analytic_convex"
     if skip_marked:
         mesh_triangle_contacts_to_reducer_kernel.__name__ += "_finite_fallback"
+    if mesh_round == MESH_ROUND_ONLY:
+        mesh_triangle_contacts_to_reducer_kernel.__name__ = "mesh_round_contacts_to_reducer_kernel"
+    elif mesh_round == MESH_ROUND_NONE:
+        mesh_triangle_contacts_to_reducer_kernel.__name__ += "_without_mesh_round"
     if kernel_name is not None:
         mesh_triangle_contacts_to_reducer_kernel.__name__ = kernel_name
     mesh_triangle_contacts_to_reducer_kernel.__qualname__ = mesh_triangle_contacts_to_reducer_kernel.__name__
