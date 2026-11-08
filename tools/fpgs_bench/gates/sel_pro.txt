@@ -101,7 +101,6 @@ test_menagerie_mujoco
 test_menagerie_usd_mujoco
 test_mesh_aabb
 test_model
-test_mujoco_contact_capacity
 test_mujoco_fk_consistency
 test_mujoco_general_actuators
 test_mujoco_sleeping

@@ -448,7 +448,7 @@ class TestSelectionEnvironment(unittest.TestCase):
         with _environment(recipe), warnings.catch_warnings(record=True) as seen:
             warnings.simplefilter("always")
             solver = newton.solvers.SolverFeatherPGS(model)
-            pipeline = newton.CollisionPipeline(model)
+            pipeline = newton.CollisionPipeline(model, growable_contacts=True)
         self.assertEqual([str(item.message) for item in seen], [])
         self.assertEqual(
             solver.get_path_selection()["environment"]["unknown"],
@@ -470,7 +470,7 @@ class TestSelectionEnvironment(unittest.TestCase):
         }
         model = _cpu_model()
         with _environment(flags):
-            pipeline = newton.CollisionPipeline(model)
+            pipeline = newton.CollisionPipeline(model, growable_contacts=True)
         expected = {
             "applied": {"NEWTON_HEIGHTFIELD_CELL_REJECT": "1"},
             "unknown": ["NEWTON_UNDECLARED_EXAMPLE"],
@@ -499,15 +499,15 @@ class TestSelectionEnvironment(unittest.TestCase):
                     r"^Ignoring retired environment variables that select nothing: NEWTON_TERRAIN_LAW_RULE_X\.",
                 ) as caught,
             ):
-                first = newton.CollisionPipeline(model)
+                first = newton.CollisionPipeline(model, growable_contacts=True)
             self.assertEqual(os.path.basename(caught.filename), os.path.basename(__file__))
             with (
                 _environment({"NEWTON_TERRAIN_LAW_RULE_X": "0", "NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD": "0"}),
                 warnings.catch_warnings(record=True) as seen,
             ):
                 warnings.simplefilter("always")
-                second = newton.CollisionPipeline(model)
-                third = newton.CollisionPipeline(model)
+                second = newton.CollisionPipeline(model, growable_contacts=True)
+                third = newton.CollisionPipeline(model, growable_contacts=True)
         self.assertEqual(
             [str(item.message).split(": ")[1].split(".")[0] for item in seen], ["NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD"]
         )
@@ -527,7 +527,9 @@ class TestSelectionEnvironment(unittest.TestCase):
             "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
         }
         with _environment(flags):
-            pipeline = newton.CollisionPipeline(_cpu_model(), convex_collision="auto", contact_export="auto")
+            pipeline = newton.CollisionPipeline(
+                _cpu_model(), convex_collision="auto", contact_export="auto", growable_contacts=True
+            )
         selected = pipeline.get_collision_selection()
         self.assertEqual(selected["environment"]["applied"], {"NEWTON_HEIGHTFIELD_CELL_REJECT": "1"})
         self.assertEqual(
@@ -539,7 +541,9 @@ class TestSelectionEnvironment(unittest.TestCase):
         )
         self.assertEqual(selected["narrow_phase"]["coherent_convex"]["source"], "argument")
         with _environment({"NEWTON_NARROW_PHASE_COHERENT_CONVEX": "0", "NEWTON_REDUCER_COMPACT_EXPORT": "0"}):
-            environment = newton.CollisionPipeline(_cpu_model()).get_collision_selection()["environment"]
+            environment = newton.CollisionPipeline(_cpu_model(), growable_contacts=True).get_collision_selection()[
+                "environment"
+            ]
         self.assertEqual(
             environment["applied"], {"NEWTON_NARROW_PHASE_COHERENT_CONVEX": "0", "NEWTON_REDUCER_COMPACT_EXPORT": "0"}
         )

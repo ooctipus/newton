@@ -204,6 +204,7 @@ class Example:
             broad_phase="sap",
             rigid_contact_max=args.contacts * len(args.amplitudes),
             max_triangle_pairs=32768 * len(args.amplitudes),
+            growable_contacts=True,
         )
         self.contacts = self.pipeline.contacts()
         self.solver = newton.solvers.SolverFeatherPGS(

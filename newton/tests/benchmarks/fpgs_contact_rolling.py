@@ -90,6 +90,7 @@ def run(worlds, objects, kind, warm, reduced, iterations):
         model,
         contact_matching="latest" if warm else "disabled",
         body_pair_reduction=newton.CollisionPipeline.BodyPairReductionConfig() if reduced else None,
+        growable_contacts=True,
     )
     contacts, control = pipeline.contacts(), model.control()
 

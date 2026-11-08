@@ -27,6 +27,7 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
             model,
             contact_matching="latest",
             body_pair_reduction=newton.CollisionPipeline.BodyPairReductionConfig(),
+            growable_contacts=True,
         )
         solver = SolverFeatherPGS(model, pgs_warmstart=True)
         state, output = model.state(), model.state()
@@ -74,7 +75,7 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         model = builder.finalize(device=device)
         model.shape_material_mu.fill_(1.0)
         solver = SolverFeatherPGS(model, pgs_warmstart=True, pgs_iterations=0)
-        pipeline = newton.CollisionPipeline(model, contact_matching="latest")
+        pipeline = newton.CollisionPipeline(model, contact_matching="latest", growable_contacts=True)
         contacts = pipeline.contacts()
         state_in, state_out = model.state(), model.state()
         newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
@@ -123,7 +124,7 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
             builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
         model = builder.finalize(device="cpu")
         state = model.state()
-        pipeline = newton.CollisionPipeline(model, contact_matching="latest")
+        pipeline = newton.CollisionPipeline(model, contact_matching="latest", growable_contacts=True)
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
         count = int(contacts.rigid_contact_count.numpy()[0])
@@ -146,8 +147,9 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
             model,
             contact_matching="latest",
             body_pair_reduction=newton.CollisionPipeline.BodyPairReductionConfig(),
+            growable_contacts=True,
         )
-        unreduced = newton.CollisionPipeline(model)
+        unreduced = newton.CollisionPipeline(model, growable_contacts=True)
         unreduced_contacts = unreduced.contacts()
         unreduced.collide(model.state(), unreduced_contacts)
         contacts = pipeline.contacts()
@@ -182,6 +184,7 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
             model,
             contact_matching="latest",
             body_pair_reduction=newton.CollisionPipeline.BodyPairReductionConfig(),
+            growable_contacts=True,
         )
         state, contacts = model.state(), pipeline.contacts()
         pipeline.collide(state, contacts)

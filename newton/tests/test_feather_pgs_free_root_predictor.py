@@ -128,7 +128,7 @@ def _slide_heights(model, omega_y):
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
 
     solver = SolverFeatherPGS(model, angular_damping=0.0)
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", growable_contacts=True)
     contacts = pipeline.contacts()
     control = model.control()
     heights = wp.empty(STEPS, dtype=wp.float32, device=model.device)
@@ -356,7 +356,7 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         state_0.joint_qd.assign(joint_qd)
         newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
         solver = SolverFeatherPGS(model, angular_damping=0.0)
-        pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", growable_contacts=True)
         contacts = pipeline.contacts()
         control = model.control()
 

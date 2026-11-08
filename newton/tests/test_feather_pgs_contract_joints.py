@@ -165,7 +165,7 @@ class TestFeatherPGSD6Law(unittest.TestCase):
                 builder.add_articulation([joint])
                 model = builder.finalize(device=device)
                 solver = SolverFeatherPGS(model, pgs_iterations=32, angular_damping=0.0)
-                pipeline = newton.CollisionPipeline(model)
+                pipeline = newton.CollisionPipeline(model, growable_contacts=True)
                 contacts = pipeline.contacts()
                 state, other, control = model.state(), model.state(), model.control()
                 state.joint_qd.assign(np.array((1.0, 0.0, 0.0, 20.0), np.float32))

@@ -808,7 +808,9 @@ class TestHubPlacement(unittest.TestCase):
                 self.assertTrue(solver.placement.walks)
                 self.assertIsNone(solver.placement.keyed_rows)
                 capture = Capture(solver)
-                pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, deterministic=True)
+                pipeline = newton.CollisionPipeline(
+                    model, broad_phase="nxn", reduce_contacts=False, deterministic=True, growable_contacts=True
+                )
                 contacts = pipeline.contacts()
                 state, out = model.state(), model.state()
                 newton.eval_fk(model, state.joint_q, state.joint_qd, state)

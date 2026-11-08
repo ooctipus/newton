@@ -194,7 +194,7 @@ def _case(
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     control.joint_f.assign(np.linspace(-0.08, 0.11, model.joint_dof_count, dtype=np.float32))
     # Sorted contacts: both arms see the same contact order, which the by-contact patch checks key on.
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32, deterministic=True)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32, deterministic=True, growable_contacts=True)
     return model, solver, state, out, control, pipeline, pipeline.contacts()
 
 

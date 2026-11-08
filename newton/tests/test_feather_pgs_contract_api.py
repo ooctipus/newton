@@ -92,7 +92,7 @@ def _scene(device):
 def _rollout(model, diagnostics, steps=STEPS):
     """Step ``model`` from rest; return the solver and the published states, one per step."""
     solver = SolverFeatherPGS(model, enable_joint_limits=True, pgs_iterations=16, diagnostics=diagnostics)
-    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    pipeline = newton.CollisionPipeline(model, deterministic=True, growable_contacts=True)
     contacts = pipeline.contacts()
     state_0, state_1, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
@@ -216,7 +216,7 @@ def test_contact_sensor_reads_the_solved_forces(test, device):
     body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()), label="box")
     builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
     model = builder.finalize(device=device)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=1)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=1, growable_contacts=True)
     contacts = pipeline.contacts()
     solver = SolverFeatherPGS(model, pgs_iterations=16)
     test.assertIn(solver.ObservableKind.CONTACT_F, solver.supported_observables)
@@ -333,7 +333,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         model = builder.finalize(device="cpu")
         # A free body's contacts are rows of the line: one row of each capacity cannot hold the box's.
         solver = SolverFeatherPGS(model, dense_max_constraints=1, mf_max_constraints=1)
-        pipeline = newton.CollisionPipeline(model)
+        pipeline = newton.CollisionPipeline(model, growable_contacts=True)
         contacts = pipeline.contacts()
         state_in, state_out = model.state(), model.state()
         pipeline.collide(state_in, contacts)
@@ -427,7 +427,9 @@ class _Run:
     def __init__(self, model, state, **options):
         self.model = model
         self.solver = SolverFeatherPGS(model, pgs_warmstart=True, pgs_iterations=16, **options)
-        self.pipeline = newton.CollisionPipeline(model, contact_matching="latest", deterministic=True)
+        self.pipeline = newton.CollisionPipeline(
+            model, contact_matching="latest", deterministic=True, growable_contacts=True
+        )
         self.contacts = self.pipeline.contacts()
         self.state, self.out = model.state(), model.state()
         self.state.assign(state)
@@ -579,7 +581,7 @@ class TestFeatherPGSReset(unittest.TestCase):
         # Two rows a world (a free body's contacts are rows of the line) cannot hold a box's contacts: the failure stays
         # latched through a model change.
         solver = SolverFeatherPGS(model, dense_max_constraints=1, mf_max_constraints=1)
-        pipeline = newton.CollisionPipeline(model)
+        pipeline = newton.CollisionPipeline(model, growable_contacts=True)
         contacts = pipeline.contacts()
         pipeline.collide(start, contacts)
         solver.step(start, model.state(), model.control(), contacts, DT)

@@ -285,7 +285,7 @@ def _rollout(
     # contact and row allocations. The arms are then compared, not two schedules: resting boxes and feet are
     # statically indeterminate supports, on which the order alone moves an 8-iteration rollout by up to 2.4e-4
     # (the quadruped scene). Patch rollouts also compare anchor history by contact index (assert_history_close).
-    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    pipeline = newton.CollisionPipeline(model, deterministic=True, growable_contacts=True)
     contacts = pipeline.contacts()
     states = [model.state() for _ in range(2)]
     newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])

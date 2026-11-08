@@ -27,7 +27,9 @@ class _Scene:
         self.model, self.solver = model, solver
         self.state, self.out, self.control = model.state(), model.state(), model.control()
         newton.eval_fk(model, self.state.joint_q, self.state.joint_qd, self.state)
-        self.pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
+        self.pipeline = newton.CollisionPipeline(
+            model, rigid_contact_max=64, deterministic=True, growable_contacts=True
+        )
         self.contacts = self.pipeline.contacts()
 
     def step(self):

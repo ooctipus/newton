@@ -132,7 +132,7 @@ def _run(builder, device, bodies, *, velocities=None, wrenches=None, **options):
         scale = np.array([MASS] * 3 + [INERTIA] * 3) / DT
         body_f = np.zeros((model.body_count, 6), dtype=np.float32)
         body_f[bodies] = np.array(wrenches) * scale
-    pipeline = newton.CollisionPipeline(model)
+    pipeline = newton.CollisionPipeline(model, growable_contacts=True)
     return SimpleNamespace(
         model=model,
         solver=solver,
@@ -375,7 +375,7 @@ class _FreeBodyVelocityLimitChecks:
         scene = scenes.box_push()
         model = scene.build(self.device)
         solver = SolverFeatherPGS(model, angular_damping=0.0)
-        pipeline = newton.CollisionPipeline(model)
+        pipeline = newton.CollisionPipeline(model, growable_contacts=True)
         contacts = pipeline.contacts()
         state_0, state_1 = model.state(), model.state()
         control = model.control()

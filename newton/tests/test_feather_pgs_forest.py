@@ -1173,7 +1173,9 @@ class TestEveryLiveArrayIsListed(unittest.TestCase):
                     for name, value in vars(forest).items()
                     if isinstance(value, wp.array) and value.ptr and getattr(model, name, None) is not value
                 }
-                pipeline = newton.CollisionPipeline(model, contact_matching=scene.contact_matching or "latest")
+                pipeline = newton.CollisionPipeline(
+                    model, contact_matching=scene.contact_matching or "latest", growable_contacts=True
+                )
                 contacts = pipeline.contacts()
                 state_0, state_1, control = model.state(), model.state(), model.control()
                 newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)

@@ -166,6 +166,7 @@ def test_box_box_corner_manifold_preserved(test: unittest.TestCase, device):
             deterministic=True,
             contact_matching="latest",
             box_box_sat=True,
+            growable_contacts=True,
         )
         contacts = pipeline.contacts()
         solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8, pgs_warmstart=True)
@@ -207,6 +208,7 @@ def test_box_box_sat_speculative_approach(test: unittest.TestCase, device):
             contact_matching="latest",
             box_box_sat=True,
             speculative_contact_gap_max=0.1,
+            growable_contacts=True,
         )
         contacts = pipeline.contacts()
         solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8, pgs_warmstart=True)
@@ -262,6 +264,7 @@ def test_box_box_sat_honors_shape_margin(test: unittest.TestCase, device):
             deterministic=True,
             contact_matching="latest",
             box_box_sat=True,
+            growable_contacts=True,
         )
         contacts = pipeline.contacts()
         state = model.state()
@@ -295,6 +298,7 @@ def test_box_box_aligned_manifold_distinct_corners(test: unittest.TestCase, devi
                 deterministic=True,
                 contact_matching="latest",
                 box_box_sat=True,
+                growable_contacts=True,
             )
             contacts = pipeline.contacts()
             state = model.state()

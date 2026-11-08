@@ -42,7 +42,7 @@ def _flag(value):
 def _pipeline(model, flag=None, **kwargs):
     """Construct a collision pipeline with the immobile-pair flag set to ``flag``, or unset for ``None``."""
     with _flag(flag):
-        return newton.CollisionPipeline(model, **kwargs)
+        return newton.CollisionPipeline(model, **kwargs, growable_contacts=True)
 
 
 def _box(builder, body, x, y, z=0.05, half=0.05):
@@ -214,7 +214,7 @@ def test_opt_out_keeps_the_unfiltered_broad_phase(test, device):
         for label, flag, argument in (("environment", "0", None), ("argument", None, True), ("both", "1", True)):
             with test.subTest(broad_phase=mode, opt_out=label), _flag(flag):
                 options = {} if argument is None else {"include_immobile_pairs": argument}
-                pipeline = newton.CollisionPipeline(model, broad_phase=mode, **options)
+                pipeline = newton.CollisionPipeline(model, broad_phase=mode, **options, growable_contacts=True)
                 pairs, _ = _candidate_pairs(pipeline, model)
                 test.assertEqual(
                     _ordered(pairs, device), _ordered(_unfiltered_candidates(pipeline, model, mode), device)
@@ -262,7 +262,9 @@ def test_static_kinematic_composition_ignores_unrelated_pairs(test, device):
         model, welded_kinematic = _welded_against_kinematic(device, ground=ground)
         for mode in _MODES:
             with test.subTest(ground=ground, broad_phase=mode), _flag(None):
-                pipeline = newton.CollisionPipeline(model, broad_phase=mode, include_static_kinematic_pairs=False)
+                pipeline = newton.CollisionPipeline(
+                    model, broad_phase=mode, include_static_kinematic_pairs=False, growable_contacts=True
+                )
                 pairs, _ = _candidate_pairs(pipeline, model)
                 test.assertFalse(set(welded_kinematic) & set(pairs))
                 record = pipeline.get_collision_selection()["immobile_pairs"]
@@ -272,7 +274,11 @@ def test_static_kinematic_composition_ignores_unrelated_pairs(test, device):
                 test.assertEqual(record["listed_pairs"], _WORLDS if ground else 0)
                 test.assertEqual(record["excluded_pairs"], (2 if ground else 1) * _WORLDS)
                 kept = newton.CollisionPipeline(
-                    model, broad_phase=mode, include_static_kinematic_pairs=False, include_immobile_pairs=True
+                    model,
+                    broad_phase=mode,
+                    include_static_kinematic_pairs=False,
+                    include_immobile_pairs=True,
+                    growable_contacts=True,
                 )
                 test.assertLessEqual(set(welded_kinematic), set(_candidate_pairs(kept, model)[0]))
 
@@ -297,7 +303,9 @@ def test_record_reports_excluded_pairs(test, device):
         ):
             subtest = test.subTest(broad_phase=mode, flag=flag, argument=argument, **environment)
             with subtest, patch.dict(os.environ, environment), _flag(flag):
-                pipeline = newton.CollisionPipeline(model, broad_phase=mode, include_immobile_pairs=argument)
+                pipeline = newton.CollisionPipeline(
+                    model, broad_phase=mode, include_immobile_pairs=argument, growable_contacts=True
+                )
                 # The launch agrees with the record: overlapping immobile pairs reach it only when off.
                 candidates, _ = _candidate_pairs(pipeline, model)
                 joined = [
@@ -334,8 +342,10 @@ def test_long_explicit_lists_count_every_block(test, device):
     for include_static_kinematic_pairs in (True, False):
         with test.subTest(include_static_kinematic_pairs=include_static_kinematic_pairs), _flag(None):
             options = {"include_static_kinematic_pairs": include_static_kinematic_pairs}
-            single = newton.CollisionPipeline(model, **options).get_collision_selection()["immobile_pairs"]
-            pipeline = newton.CollisionPipeline(model, shape_pairs_filtered=tiled, **options)
+            single = newton.CollisionPipeline(model, **options, growable_contacts=True).get_collision_selection()[
+                "immobile_pairs"
+            ]
+            pipeline = newton.CollisionPipeline(model, shape_pairs_filtered=tiled, **options, growable_contacts=True)
             record = pipeline.get_collision_selection()["immobile_pairs"]
             test.assertGreater(single["excluded_pairs"], 0)
             test.assertEqual(record["listed_pairs"], tiles * single["listed_pairs"])
@@ -354,7 +364,7 @@ def test_models_without_immobile_pairs_keep_unfiltered_arguments(test, device):
     model = builder.finalize(device=device)
     for mode in _MODES:
         with test.subTest(broad_phase=mode), _flag(None):
-            pipeline = newton.CollisionPipeline(model, broad_phase=mode)
+            pipeline = newton.CollisionPipeline(model, broad_phase=mode, growable_contacts=True)
             record = pipeline.get_collision_selection()["immobile_pairs"]
             test.assertFalse(record["enabled"])
             test.assertEqual(record["listed_pairs"], 0)
@@ -385,7 +395,7 @@ def test_every_parent_joint_must_weld(test, device):
         ground_base = {(ground, shape_start + world * proto.shape_count + base_shape) for world in range(_WORLDS)}
         for mode in _MODES:
             with test.subTest(loop=loop, broad_phase=mode), _flag(None):
-                pipeline = newton.CollisionPipeline(model, broad_phase=mode)
+                pipeline = newton.CollisionPipeline(model, broad_phase=mode, growable_contacts=True)
                 pairs, _ = _candidate_pairs(pipeline, model)
                 record = pipeline.get_collision_selection()["immobile_pairs"]
                 if loop:
@@ -414,8 +424,8 @@ def test_joints_without_freedom_weld_whatever_their_type(test, device):
     ground_base = {tuple(sorted((world["ground"], world["base"]))) for world in worlds}
     for mode, environment in _LAUNCHES:
         with test.subTest(broad_phase=mode, **environment), patch.dict(os.environ, environment), _flag(None):
-            expected = newton.CollisionPipeline(fixed, broad_phase=mode)
-            pipeline = newton.CollisionPipeline(locked, broad_phase=mode)
+            expected = newton.CollisionPipeline(fixed, broad_phase=mode, growable_contacts=True)
+            pipeline = newton.CollisionPipeline(locked, broad_phase=mode, growable_contacts=True)
             kept, _ = _candidate_pairs(pipeline, locked)
             test.assertEqual(_ordered(kept, device), _ordered(_candidate_pairs(expected, fixed)[0], device))
             record = pipeline.get_collision_selection()["immobile_pairs"]
@@ -604,7 +614,7 @@ def test_notifications_refresh_the_immobile_set(test, device):
     loose_joint = int(np.flatnonzero(model.joint_child.numpy() == model.shape_body.numpy()[world["loose"]])[0])
     for mode in _MODES:
         with test.subTest(broad_phase=mode), _flag(None):
-            pipeline = newton.CollisionPipeline(model, broad_phase=mode)
+            pipeline = newton.CollisionPipeline(model, broad_phase=mode, growable_contacts=True)
             # numpy() aliases a CPU array; keep copies to restore from.
             flags = model.body_flags.numpy().copy()
             enabled = model.joint_enabled.numpy().copy()
@@ -649,7 +659,7 @@ def test_unchanged_notifications_skip_the_refresh(test, device):
     base_body = int(model.shape_body.numpy()[worlds[0]["base"]])
     flags = model.body_flags.numpy().copy()
     with _flag(None):
-        pipeline = newton.CollisionPipeline(model)
+        pipeline = newton.CollisionPipeline(model, growable_contacts=True)
     mask = pipeline._immobile_shape_body
     try:
         with patch.object(mask, "assign", wraps=mask.assign) as assign:
@@ -677,7 +687,7 @@ def test_captured_collide_reads_notified_set(test, device):
     base_body = int(model.shape_body.numpy()[world["base"]])
     flags = model.body_flags.numpy().copy()
     with _flag(None):
-        pipeline = newton.CollisionPipeline(model)
+        pipeline = newton.CollisionPipeline(model, growable_contacts=True)
     state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
     contacts = pipeline.contacts()
@@ -707,15 +717,17 @@ def test_environment_flag_values(test, device):
     """Reject flag values other than 0 and 1, unless include_immobile_pairs supersedes the flag."""
     model, _ = _pair_scene(device)
     with _flag("2"), test.assertRaisesRegex(ValueError, _FLAG):
-        newton.CollisionPipeline(model)
+        newton.CollisionPipeline(model, growable_contacts=True)
     for argument in (True, False):
         with test.subTest(argument=argument), _flag("2"):
-            selection = newton.CollisionPipeline(model, include_immobile_pairs=argument).get_collision_selection()
+            selection = newton.CollisionPipeline(
+                model, include_immobile_pairs=argument, growable_contacts=True
+            ).get_collision_selection()
             test.assertEqual(selection["environment"]["overridden"].get(_FLAG), "2")
             test.assertNotIn(_FLAG, selection["environment"]["applied"])
             test.assertEqual(selection["immobile_pairs"]["enabled"], not argument)
     with _flag("1"):
-        selection = newton.CollisionPipeline(model).get_collision_selection()
+        selection = newton.CollisionPipeline(model, growable_contacts=True).get_collision_selection()
         test.assertEqual(selection["environment"]["applied"].get(_FLAG), "1")
         test.assertNotIn(_FLAG, selection["environment"]["overridden"])
 

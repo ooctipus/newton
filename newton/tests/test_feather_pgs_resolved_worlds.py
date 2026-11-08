@@ -471,7 +471,7 @@ class TestResolvedWorlds(unittest.TestCase):
     def test_classify_bounds_worlds_by_the_solver_capacities(self):
         """The decision gets the solver's dense and matrix-free row capacities."""
         model = _build("cpu", worlds=2)
-        pipeline = newton.CollisionPipeline(model)
+        pipeline = newton.CollisionPipeline(model, growable_contacts=True)
         contacts = pipeline.contacts()
         state = model.state()
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
@@ -559,7 +559,7 @@ def _rollout(
         friction_anchor_beta=friction_anchor_beta,
         **(solver_kwargs or {}),
     )
-    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    pipeline = newton.CollisionPipeline(model, deterministic=True, growable_contacts=True)
     contacts = pipeline.contacts()
     states = [model.state() for _ in range(2)]
     newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
@@ -818,7 +818,7 @@ class TestResolvedWorldsSparseRoute(unittest.TestCase):
         self.assertEqual(routes["sweep"]["route"], "sparse_pgs")
         self.assertIsNone(solver.sweep.resolved_worlds_owner)
         self.assertEqual(solver.sweep.resolved_worlds.shape, (0,))
-        pipeline = newton.CollisionPipeline(model)
+        pipeline = newton.CollisionPipeline(model, growable_contacts=True)
         contacts = pipeline.contacts()
         states = [model.state() for _ in range(2)]
         newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])

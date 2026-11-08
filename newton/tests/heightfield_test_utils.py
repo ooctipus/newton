@@ -210,6 +210,7 @@ def build_scene(case, enabled, device, *, reduce=True, make_solver=True, hull_sc
             broad_phase="nxn",
             reduce_contacts=reduce,
             max_triangle_pairs=128,
+            growable_contacts=True,
         )
     contacts = pipeline.contacts()
     states = (model.state(), model.state())

@@ -152,7 +152,7 @@ def _sparse_case(cached, *, kinematic_body=None, **options):
     state, out, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     control.joint_f.assign(np.linspace(-0.08, 0.11, model.joint_dof_count, dtype=np.float32))
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32, growable_contacts=True)
     return model, solver, state, out, control, pipeline, pipeline.contacts()
 
 
@@ -183,7 +183,7 @@ class _Rollout:
 
     def __init__(self, model, solver, body, wrench, *, graph=False):
         self.model, self.solver = model, solver
-        self.pipeline = newton.CollisionPipeline(model)
+        self.pipeline = newton.CollisionPipeline(model, growable_contacts=True)
         self.contacts = self.pipeline.contacts()
         self.control = model.control()
         self.state, self.next_state = model.state(), model.state()

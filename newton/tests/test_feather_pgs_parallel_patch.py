@@ -1003,7 +1003,7 @@ class TestKeyedPatchRows(unittest.TestCase):
         velocity[0], velocity[11] = 0.05, -0.04
         state.joint_qd.assign(velocity)
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True, growable_contacts=True)
         contacts = pipeline.contacts()
         for _ in range(6):
             pipeline.collide(state, contacts)
@@ -1574,7 +1574,7 @@ def _rollout(model, solver, steps, *, dt=1.0 / 240.0, after_step=None):
     """Step through the collision pipeline; return the final state and the contacts of the last step."""
     state, out, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True, growable_contacts=True)
     contacts = pipeline.contacts()
     for step in range(steps):
         state.clear_forces()
@@ -1814,7 +1814,9 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 self.assertEqual(solver.laws.friction_patches.reuse_frames, reuse is None)
                 states, control = [model.state(), model.state()], model.control()
                 newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
-                pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
+                pipeline = newton.CollisionPipeline(
+                    model, rigid_contact_max=64, deterministic=True, growable_contacts=True
+                )
                 contacts = pipeline.contacts()
 
                 def pair(states=states, solver=solver, pipeline=pipeline, contacts=contacts, control=control):

@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
-import weakref
 from copy import copy
 from dataclasses import Field, dataclass, fields
 from dataclasses import field as dataclass_field
@@ -895,8 +895,8 @@ class SolverBase:
             if kind not in requested:
                 continue
             pool = getattr(contacts, "_rigid_contact_pool", None) if kind in contact_fields else None
-            if pool is not None and spec.frequency != Model.AttributeFrequency.CONTACT_SOFT:
-                # The rigid rows grow with the contacts' pool; the soft rows follow them.
+            if pool is not None and not pool.fixed and spec.frequency != Model.AttributeFrequency.CONTACT_SOFT:
+                # The rigid rows grow with the contacts' growable pool; the soft rows follow them.
                 soft = contacts.soft_contact_max if spec.frequency == Model.AttributeFrequency.CONTACT else 0
                 field = ContactField(name, spec.dtype, extra=soft, requires_grad=requires_grad)
                 observables._contact_rows[kind] = pool.rows([field], on_rows=_observable_rows_publisher(observables))

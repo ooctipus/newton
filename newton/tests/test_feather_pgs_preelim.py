@@ -57,7 +57,9 @@ def _run_scene(scene: scenes.Scene, iterations: int):
         pgs_beta=0.1,
         dense_max_constraints=128,
     )
-    pipeline = newton.CollisionPipeline(model, contact_matching=scene.contact_matching or "latest")
+    pipeline = newton.CollisionPipeline(
+        model, contact_matching=scene.contact_matching or "latest", growable_contacts=True
+    )
     contacts = pipeline.contacts()
     state_0, state_1 = model.state(), model.state()
     control = model.control()
@@ -197,7 +199,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             enable_bilateral_preelimination=True,
             pgs_warmstart=True,
         )
-        pipeline = newton.CollisionPipeline(model, contact_matching="latest")
+        pipeline = newton.CollisionPipeline(model, contact_matching="latest", growable_contacts=True)
         contacts = pipeline.contacts()
         state_0, state_1 = model.state(), model.state()
         control = model.control()
@@ -251,7 +253,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             dense_max_constraints=128,
             enable_bilateral_preelimination=True,
         )
-        pipeline = newton.CollisionPipeline(model, contact_matching="latest")
+        pipeline = newton.CollisionPipeline(model, contact_matching="latest", growable_contacts=True)
         contacts = pipeline.contacts()
         state_0, state_1 = model.state(), model.state()
         control = model.control()
@@ -348,7 +350,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             diagnostics=newton.solvers.SolverFeatherPGS.Diagnostics(solve_readout="sweeps"),
             pgs_warmstart=warm,
         )
-        pipeline = newton.CollisionPipeline(model, contact_matching="latest")
+        pipeline = newton.CollisionPipeline(model, contact_matching="latest", growable_contacts=True)
         contacts = pipeline.contacts()
         state_0, state_1, control = model.state(), model.state(), model.control()
         targets = model.joint_target_q.numpy().copy()
@@ -389,7 +391,9 @@ class TestFeatherPGSPreeliminationCPU(unittest.TestCase):
                     dense_max_constraints=128,
                     diagnostics=newton.solvers.SolverFeatherPGS.Diagnostics(solve_readout="sweeps"),
                 )
-                pipeline = newton.CollisionPipeline(model, contact_matching=scene.contact_matching or "latest")
+                pipeline = newton.CollisionPipeline(
+                    model, contact_matching=scene.contact_matching or "latest", growable_contacts=True
+                )
                 contacts = pipeline.contacts()
                 state_0, state_1, control = model.state(), model.state(), model.control()
                 newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
