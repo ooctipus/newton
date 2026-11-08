@@ -720,6 +720,7 @@ def create_build_manifold(
     post_process_contact: Any,
     _support_funcs: Any = None,
     point_filter: Any = None,
+    deepest_once: Any = None,
 ):
     """
     Factory function to create manifold generation functions with a specific support mapping function.
@@ -735,6 +736,8 @@ def create_build_manifold(
         post_process_contact: Function to post-process contact data
         point_filter: Optional admission of each contact, ``(ContactData, query_context) -> bool``,
             evaluated after post-processing and before the writer.
+        deepest_once: Optional ``(query_context) -> bool``: when it holds, the added deepest point is not written
+            where it equals (within ``EPS``) a manifold point already written, which it then duplicates.
 
     Returns:
         build_manifold function that generates up to 5 contact points between two shapes
@@ -742,6 +745,7 @@ def create_build_manifold(
     """
 
     has_point_filter = point_filter is not None
+    has_deepest_once = deepest_once is not None
 
     @wp.func
     def write_contact(contact_data: ContactData, writer_data: Any, query_context: Any):
@@ -830,7 +834,7 @@ def create_build_manifold(
         quaternion_a: wp.quat,
         quaternion_b: wp.quat,
         query_context: Any,
-    ) -> tuple[int, float]:
+    ) -> tuple[int, float, float]:
         """
         Extract up to 4 contact points from two convex contact polygons and write them immediately.
 
@@ -861,9 +865,11 @@ def create_build_manifold(
             quaternion_b: Orientation of shape B (for post_process_contact).
 
         Returns:
-            Tuple of (loop_count, normal_dot) where:
+            Tuple of (loop_count, normal_dot, anchor_sq) where:
             - loop_count: Number of valid contact points written (0-4)
             - normal_dot: Absolute dot product of polygon normals
+            - anchor_sq: With ``deepest_once``, the least squared distance [m^2] from a written point to
+              ``center_local`` (the anchor's contact point); else 1e30
         """
 
         normal_dot = wp.abs(wp.dot(projector_a.normal, projector_b.normal))
@@ -880,6 +886,7 @@ def create_build_manifold(
             MAX_CLIP_VERTEX_MERGE_DISTANCE,
         )
 
+        anchor_sq = float(1.0e30)
         loop_count = trim_all_in_place(m_a, m_a_count, m_b, m_b_count)
 
         loop_count = remove_zero_length_edges(m_b, loop_count, merge_distance)
@@ -902,6 +909,8 @@ def create_build_manifold(
                 b = body_projector_project(projector_b, p_local, normal_local)
                 contact_point_local = 0.5 * (a + b)
                 signed_distance = wp.dot(b - a, normal_local)
+                if wp.static(has_deepest_once):
+                    anchor_sq = wp.min(anchor_sq, wp.length_sq(contact_point_local - center_local))
 
                 # Transform from A-local to world space
                 contact_point_world = wp.quat_rotate(orientation_a, contact_point_local) + position_a_world
@@ -920,7 +929,7 @@ def create_build_manifold(
             normal_dot = 0.0
             loop_count = 0
 
-        return loop_count, normal_dot
+        return loop_count, normal_dot, anchor_sq
 
     @wp.func
     def point_in_contact_polygon(
@@ -1195,6 +1204,7 @@ def create_build_manifold(
 
         feature_a_flat = not planar_a or contact_feature_supports_anchor(plane_tracker_a, p_a)
         feature_b_flat = not planar_b or contact_feature_supports_anchor(plane_tracker_b, p_b)
+        anchor_sq = float(1.0e30)
         if a_count < 2 or b_count < 2 or not feature_a_flat or not feature_b_flat:
             count_out = 0
             normal_dot = 0.0
@@ -1299,7 +1309,7 @@ def create_build_manifold(
                 count_out = 0
                 normal_dot = 0.0
             else:
-                num_manifold_points, normal_dot = extract_4_point_contact_manifolds(
+                num_manifold_points, normal_dot, anchor_sq = extract_4_point_contact_manifolds(
                     a_buffer,
                     a_count,
                     b_buffer,
@@ -1325,7 +1335,12 @@ def create_build_manifold(
                 )
                 count_out = wp.min(num_manifold_points, 4)
 
-        if should_include_deepest_contact(normal_dot) or count_out == 0:
+        write_deepest = should_include_deepest_contact(normal_dot) or count_out == 0
+        if wp.static(has_deepest_once):
+            # The deepest point equal to a written manifold point would duplicate it.
+            if count_out > 0 and anchor_sq <= EPS * EPS and deepest_once(query_context):
+                write_deepest = False
+        if write_deepest:
             deepest_center_local = 0.5 * (p_a + p_b)
             deepest_signed_distance = wp.dot(p_b - p_a, normal)
 

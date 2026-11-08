@@ -323,6 +323,7 @@ def create_compute_gjk_mpr_contacts(
     query_filter: Any = None,
     point_filter: Any = None,
     manifold_shape: Any = None,
+    deepest_once: Any = None,
 ):
     """
     Factory function to create a compute_gjk_mpr_contacts function with a specific writer function.
@@ -337,6 +338,8 @@ def create_compute_gjk_mpr_contacts(
             :func:`create_solve_convex_multi_contact`).
         point_filter: Optional admission of each written contact, ``(ContactData, query_context) -> bool``.
         manifold_shape: Optional manifold geometry of shape A (see :func:`create_solve_convex_multi_contact`).
+        deepest_once: Optional ``(context) -> bool``: the manifold's deepest point is not written twice (see
+            :func:`create_solve_convex_multi_contact`).
 
     Returns:
         A compute_gjk_mpr_contacts function with the writer function baked in
@@ -462,6 +465,7 @@ def create_compute_gjk_mpr_contacts(
                     query_filter,
                     point_filter,
                     manifold_shape,
+                    deepest_once,
                 )
             )(
                 shape_a_data,
@@ -575,6 +579,7 @@ def create_compute_face_contacts(
     point_filter: Any,
     manifold_shape: Any,
     post_process_contact: Any = post_process_axial_on_discrete_contact,
+    deepest_once: Any = None,
 ):
     """Create the face case of a mesh triangle and a convex shape: the face-normal manifold, without GJK/MPR.
 
@@ -589,10 +594,16 @@ def create_compute_face_contacts(
         point_filter: Admission of each written contact, ``(ContactData, context) -> bool``.
         manifold_shape: The manifold's triangle, ``(geom_a, point_a, normal, context) -> (geom, origin, moved)``.
         post_process_contact: Function that post-processes generated contacts.
+        deepest_once: Optional ``(context) -> bool``: the manifold's deepest point is not written twice.
     """
     support_funcs = create_support_map_function(support_func, True)
     build_manifold = create_build_manifold(
-        support_func, writer_func, post_process_contact, _support_funcs=support_funcs, point_filter=point_filter
+        support_func,
+        writer_func,
+        post_process_contact,
+        _support_funcs=support_funcs,
+        point_filter=point_filter,
+        deepest_once=deepest_once,
     )
 
     @wp.func

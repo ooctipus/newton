@@ -155,6 +155,7 @@ def create_solve_convex_multi_contact(
     query_filter: Any = None,
     point_filter: Any = None,
     manifold_shape: Any = None,
+    deepest_once: Any = None,
 ):
     """Create a fused MPR/GJK multi-contact solver.
 
@@ -169,6 +170,8 @@ def create_solve_convex_multi_contact(
         point_filter: Optional admission of each written contact, ``(ContactData, context) -> bool``.
         manifold_shape: Optional shape A for the manifold, ``(geom_a, point_a, normal, context) -> (geom, origin,
             moved)``: the geometry the manifold clips against, its origin in A's frame, and whether it differs.
+        deepest_once: Optional ``(context) -> bool``: the manifold's added deepest point is not written over a
+            manifold point it equals (see :func:`create_build_manifold`).
 
     Returns:
         The specialized contact solver.
@@ -308,7 +311,12 @@ def create_solve_convex_multi_contact(
                 manifold_point_b = point_b - shift
         count = wp.static(
             create_build_manifold(
-                support_func, writer_func, post_process_contact, _support_funcs=support_funcs, point_filter=point_filter
+                support_func,
+                writer_func,
+                post_process_contact,
+                _support_funcs=support_funcs,
+                point_filter=point_filter,
+                deepest_once=deepest_once,
             )
         )(
             manifold_a,

@@ -93,6 +93,7 @@ from ..geometry.mesh_topology import (
     create_surface_penetration_refiner,
     empty_mesh_topology,
     mesh_contact_filter,
+    mesh_deepest_once,
     mesh_manifold_triangle,
     mesh_surface_context,
     mesh_surface_planes,
@@ -2118,6 +2119,7 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(
         query_filter=surface_query_filter,
         point_filter=mesh_contact_filter,
         manifold_shape=mesh_manifold_triangle,
+        deepest_once=mesh_deepest_once,
     )
     mesh_sphere_contact = create_mesh_sphere_contact(writer_func)
     mesh_capsule_contacts = create_mesh_capsule_contacts(writer_func)
