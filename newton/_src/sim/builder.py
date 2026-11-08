@@ -81,7 +81,11 @@ from ..geometry.inertia import (
 )
 from ..geometry.rest_shape import _dihedral_angles, _tet_rest_geometry, _triangle_rest_geometry
 from ..geometry.sdf_utils import _resolve_paired_samples_flag
-from ..geometry.support_function import _CONVEX_HULL_VALID
+from ..geometry.support_function import (
+    _CONVEX_HULL_VALID,
+    _CONVEX_SUPPORT_CELLS,
+    CONVEX_SUPPORT_CELL_MAX_VERTICES,
+)
 from ..geometry.types import Heightfield, _normalize_texture_input
 from ..geometry.utils import RemeshingMethod, compute_inertia_obb, remesh_convex_hull, remesh_mesh
 from ..math import quat_between_vectors_robust
@@ -443,6 +447,31 @@ def _build_convex_support_acceleration(
         neighbors.extend(sorted(values))
         offsets[vertex + 1] = len(neighbors)
     return lut, offsets, np.asarray(neighbors, dtype=np.int32)
+
+
+def _build_convex_support_cells(source: Mesh) -> np.ndarray | None:
+    """Build a small convex hull's direction-cell candidate masks, as int32 word pairs, or ``None``.
+
+    Each of the 6 x 16 x 16 direction cells holds every vertex that can be the
+    float32 support of a direction in it (exact normal cones, relaxed for
+    rounding), so a support query scans only those candidates and returns the
+    full scan's vertex. Hulls the exact validation rejects keep the full scan.
+    """
+    from ..geometry.convex_cells_build import build_masks  # noqa: PLC0415
+
+    vertices = np.asarray(source.vertices, dtype=np.float32).reshape(-1, 3)
+    if (
+        not 4 <= len(vertices) <= CONVEX_SUPPORT_CELL_MAX_VERTICES
+        or not np.isfinite(vertices).all()
+        or np.any((vertices != 0) & (np.abs(vertices) < np.finfo(np.float32).tiny))
+    ):
+        return None
+    try:
+        masks, _details = build_masks(vertices, np.asarray(source.indices, dtype=np.int64).reshape(-1, 3))
+    except (ValueError, OverflowError):
+        return None
+    # face * 256 + x * 16 + y, each mask as its low then high 32-bit word.
+    return np.ascontiguousarray(masks.reshape(-1).astype("<u8")).view("<i4")
 
 
 def _build_joint_ancestor(
@@ -15429,6 +15458,12 @@ class ModelBuilder:
                         cached = (-1, -1, neighbor_offset if len(edge_block) else -1, hull_flag)
                         acceleration = _build_convex_support_acceleration(source, adjacency=adjacent)
                         neighbors = np.zeros(0, dtype=np.int32)
+                        # Small hulls take direction-cell candidates as their directional table.
+                        cells = _build_convex_support_cells(source) if acceleration is None else None
+                        if cells is not None:
+                            cached = (lut_offset, -1, cached[2], _CONVEX_SUPPORT_CELLS | hull_flag)
+                            support_lut_chunks.append(cells)
+                            lut_offset += len(cells)
                         if acceleration is not None:
                             lut, offsets, neighbors = acceleration
                             cached = (

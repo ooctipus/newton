@@ -64,6 +64,7 @@ from ..geometry.soft_contacts_mesh import (
 )
 from ..geometry.soft_contacts_sdf import _SDF_COMPACTION_MIN_PAIRS, _SDF_SPECIALIZED_GEO_TYPES, launch_soft_ef_contacts
 from ..geometry.support_function import (
+    _CONVEX_SUPPORT_RESOLUTION_MASK,
     GenericShapeData,
     SupportMapDataProvider,
     pack_mesh_ptr,
@@ -102,6 +103,19 @@ def _reduction_reset_mask_from_matching(
     world = wp.tid()
     # A changed global collider may participate in every world's patches.
     reduction_mask[world] = int(mask[world_count] or (world < world_count and mask[world]))
+
+
+def _has_convex_support_walk(model: Model) -> bool:
+    """Whether some hull's directional table is an octahedral walk seed (large hulls).
+
+    The split and fused queues take the table-driven support only for the walk:
+    small hulls' direction cells cost their throughput-bound kernels more
+    registers than the scan saves (keyboard-so101's split MPR, 128 to 168).
+    """
+    data = model._shape_support_data
+    if data is None or data.shape[0] == 0:
+        return False
+    return bool(np.any((data.numpy()[:, 3] & int(_CONVEX_SUPPORT_RESOLUTION_MASK)) > 0))
 
 
 def _shape_collide_mask(model: Model, shape_count: int | None = None) -> np.ndarray:
@@ -3280,7 +3294,7 @@ class CollisionPipeline:
                 has_meshes=has_meshes,
                 has_heightfields=has_heightfields,
                 use_lean_gjk_mpr=use_lean_gjk_mpr,
-                convex_support_acceleration=model._convex_support_lut.shape[0] > 1,
+                convex_support_acceleration=_has_convex_support_walk(model),
                 box_box_sat=box_box_sat,
                 has_generic_convex_pairs=has_generic_convex_pairs,
                 split_gjk_mpr=split_gjk_mpr,
@@ -3506,7 +3520,8 @@ class CollisionPipeline:
                 query_capacity=self.narrow_phase.split_query_results.shape[0],
                 device=device,
             )
-            # The split queue's lean support: accelerated when the model has cooked hull support data.
+            # The coherent route's cold queries are latency-bound support queries: they take the table-driven
+            # support (direction cells, walk) whenever some hull has a directional table.
             self.narrow_phase._coherent_query_kernels = _create_rejection_query_kernels(
                 model._convex_support_lut.shape[0] > 1, diagnostics=coherent_stats == "1"
             )
