@@ -123,8 +123,9 @@ class TestHeightfieldCylinderSplit(unittest.TestCase):
             reference.collide(state, reference.contacts())
         self.assertEqual(len(captured), 1)
         common = captured[0]
-        # The row kernel takes the hull support inputs after its thread count; the split kernels take neither.
-        support_inputs = 5
+        # The row kernel takes the hull support inputs and the mesh topology after its thread count; the split
+        # kernels take neither.
+        support_inputs = 6
         common[-1 - support_inputs] = 128
         owner = actual.narrow_phase
         checker = primitive.TestHeightfieldPrimitiveQuery()
