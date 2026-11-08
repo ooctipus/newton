@@ -2365,6 +2365,7 @@ class CollisionPipeline:
         dynamic_shape_scale: bool = False,
         publish_capacity: bool = True,
         growable_contacts: bool = False,
+        terrain_meshes: bool = False,
         convex_collision: Literal["auto", "ordinary", "rejection"] | None = None,
         contact_export: Literal["auto", "tiled", "compact"] | None = None,
     ):
@@ -2656,6 +2657,12 @@ class CollisionPipeline:
                 (fewer when ``rigid_contact_max`` is smaller), grow before anything reads them in a
                 :meth:`collide` outside graph capture and between graph replays in
                 :meth:`service_capacity`, and trim once the demand settles.
+            terrain_meshes: Whether the terrain law also reads static triangle meshes as surfaces, each one whose
+                structure qualifies (:class:`~newton._src.geometry.terrain_contacts.TerrainSurfaces`: today a height
+                sheet on a lattice, a heightfield in triangle form), and writes its partners' contacts with them as it
+                writes their heightfield contacts. For a solver that takes the law's contacts
+                (:class:`~newton.solvers.SolverFeatherPGS`). With ``False`` (the default) every mesh keeps the mesh
+                path, as other solvers expect.
 
         .. experimental::
 
@@ -3519,6 +3526,7 @@ class CollisionPipeline:
             terrain_law_classes,
             terrain_shadow_classes,
             explicit_pairs_host if self.broad_phase_mode == "explicit" else None,
+            terrain_meshes,
         )
 
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
@@ -3837,6 +3845,7 @@ class CollisionPipeline:
         classes: tuple[int, ...],
         shadow_classes: tuple[int, ...],
         explicit_pairs_host: np.ndarray | None,
+        terrain_meshes: bool,
     ) -> None:
         """Decide whether the terrain law writes the heightfield contacts, and build it where its kernels run.
 
@@ -3851,6 +3860,7 @@ class CollisionPipeline:
             classes: The partner classes ``NEWTON_TERRAIN_LAW`` lists (empty but for an explicit request).
             shadow_classes: The partner classes ``NEWTON_TERRAIN_LAW_SHADOW`` lists.
             explicit_pairs_host: The setup's host copy of the explicit pair list, when it read one.
+            terrain_meshes: Whether the law also reads the static meshes that qualify as surfaces.
 
         Raises:
             ValueError: When ``NEWTON_TERRAIN_LAW`` requests the law for a configuration it does not support yet, or a
@@ -3860,7 +3870,13 @@ class CollisionPipeline:
         # A prebuilt narrow phase may still drop the pairs another pipeline gave the law: this pipeline decides.
         narrow.set_terrain_law_roles(None)
         self._terrain_law_shadow_reason = "Off: NEWTON_TERRAIN_LAW_SHADOW lists no partner class."
-        if not narrow.has_heightfields and not _has_static_meshes(model):
+        surfaces = None
+        if narrow.has_heightfields or (terrain_meshes and _has_static_meshes(model)):
+            # The law's surfaces (TerrainSurfaces): the heightfields, and with the opt-in the static meshes that qualify.
+            from ..geometry.terrain_contacts import TerrainSurfaces  # noqa: PLC0415
+
+            surfaces = TerrainSurfaces(model, meshes=terrain_meshes)
+        if surfaces is None or surfaces.count == 0:
             self._terrain_law_decision = None
             self._terrain_law_reason = "No heightfield pair."
             if shadow_classes:
@@ -3904,6 +3920,7 @@ class CollisionPipeline:
             model,
             (classes if request == "explicit" else tuple(sorted(TERRAIN_LAW_KERNELS))) if writes else shadow_classes,
             pairs=self._law_pairs(explicit_pairs_host),
+            surfaces=surfaces,
             status=narrow._buffer_capacity_status,
             # The rows of its scene-level spill region (default: TerrainLawShadow.default_spill_rows()).
             spill_rows=parse_terrain_law_shadow_rows(os.environ.get("NEWTON_TERRAIN_LAW_SHADOW_ROWS", "")),

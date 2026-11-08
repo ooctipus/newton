@@ -3,8 +3,9 @@
 
 """Check that the terrain law reads a static mesh's cell table as its one surface type.
 
-A static triangle mesh whose cell table the law reads whole (:func:`terrain_mesh_surface`) is a surface like a
-heightfield: the law writes its partners' contacts and the narrow phase drops those pairs. The same surface given as a
+With the pipeline's opt-in (``terrain_meshes``, which FeatherPGS's pipeline passes), a static triangle mesh whose cell
+table the law reads whole (:func:`terrain_mesh_surface`) is a surface like a heightfield: the law writes its partners'
+contacts and the narrow phase drops those pairs. Without it every mesh keeps the mesh path. The same surface given as a
 heightfield and as its triangle mesh must give the same rows, within the float32 rounding of the lattice the mesh's
 float32 vertices give (the mesh table's origin and cell size are fitted in float64 from them). A mesh the law cannot
 read whole (risers, no lattice) keeps the generic mesh path, and its reason is recorded.
@@ -20,7 +21,7 @@ from newton._src.geometry.narrow_phase import TERRAIN_LAW_MESH_SURFACE, TERRAIN_
 from newton._src.geometry.terrain_contacts import TerrainFeatures, TerrainSurfaces
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
-PIPELINE = {"rigid_contact_max": 1 << 14, "max_triangle_pairs": 1 << 16}
+PIPELINE = {"rigid_contact_max": 1 << 14, "max_triangle_pairs": 1 << 16, "terrain_meshes": True}
 N = 33
 HX = 1.6
 
@@ -105,8 +106,8 @@ def _scene(device, *, mesh: bool, heights=None, surface=None, seed=6):
     return builder.finalize(device=device), terrain
 
 
-def _law_rows(model):
-    pipeline = newton.CollisionPipeline(model, **PIPELINE)
+def _law_rows(model, **kwargs):
+    pipeline = newton.CollisionPipeline(model, **{**PIPELINE, **kwargs})
     contacts = pipeline.contacts()
     pipeline.collide(model.state(), contacts)
     law = pipeline._terrain_law_shadow
@@ -144,6 +145,18 @@ def test_mesh_surface_rows_match_heightfield(test, device):
     test.assertTrue(np.all(role[np.arange(model_m.shape_count) != terrain] == int(TERRAIN_LAW_PARTNER)))
 
 
+def test_meshes_need_the_opt_in(test, device):
+    """Without the pipeline's opt-in a qualifying sheet keeps the mesh path: other solvers see upstream's contacts."""
+    model, terrain = _scene(device, mesh=True)
+    pipeline, contacts, _rows = _law_rows(model, terrain_meshes=False)
+    test.assertFalse(pipeline._terrain_law_writes)
+    test.assertIsNone(pipeline._terrain_law_decision)
+    test.assertEqual(pipeline.narrow_phase._terrain_law_role.shape[0], 0)
+    test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+    test.assertEqual(TerrainSurfaces(model, meshes=False).count, 0)
+    test.assertEqual(TerrainSurfaces(model).mesh_shapes, [terrain])
+
+
 def test_mesh_with_risers_keeps_mesh_path(test, device):
     """A mesh with a riser inside its table is not a law surface yet: its pairs keep the generic mesh path."""
     model, terrain = _scene(device, mesh=True, surface=_stairs_mesh())
@@ -154,6 +167,10 @@ def test_mesh_with_risers_keeps_mesh_path(test, device):
     pipeline, contacts, _rows = _law_rows(model)
     test.assertFalse(pipeline._terrain_law_writes)
     test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+    # A model with no surface keeps the decision of one without heightfields (its route record has no heightfield part).
+    test.assertIsNone(pipeline._terrain_law_decision)
+    test.assertEqual(pipeline._terrain_law_reason, "No heightfield pair.")
+    test.assertIsNone(pipeline.get_collision_selection()["heightfield"])
 
 
 def test_closed_box_keeps_mesh_path(test, device):
@@ -200,6 +217,7 @@ add_function_test(
 add_function_test(
     TestTerrainLawMesh, "test_mesh_with_risers_keeps_mesh_path", test_mesh_with_risers_keeps_mesh_path, devices=devices
 )
+add_function_test(TestTerrainLawMesh, "test_meshes_need_the_opt_in", test_meshes_need_the_opt_in, devices=devices)
 add_function_test(
     TestTerrainLawMesh, "test_closed_box_keeps_mesh_path", test_closed_box_keeps_mesh_path, devices=devices
 )

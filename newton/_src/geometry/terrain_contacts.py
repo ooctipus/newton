@@ -846,19 +846,22 @@ class TerrainSurfaces:
     heights in the shape's frame.
 
     * Every heightfield shape: surface ``h``, its heightfield index.
-    * Every static triangle mesh (on no body, colliding with shapes) whose cell table the law reads whole
-      (:func:`~newton._src.geometry.terrain_cells_mesh.terrain_mesh_surface`: the qualifying rule and
+    * With ``meshes``, every static triangle mesh (on no body, colliding with shapes) whose cell table the law reads
+      whole (:func:`~newton._src.geometry.terrain_cells_mesh.terrain_mesh_surface`: the qualifying rule and
       :func:`~newton._src.geometry.terrain_cells_mesh.terrain_mesh_cells_law_surface`), after the heightfields in shape
       order. The data choose, never a task: a mesh that fails keeps the generic mesh path unchanged, and its reason is
       kept in :attr:`mesh_reasons`.
 
     The tables are built on the model's device at the law's construction (the model and other solvers never see them).
+    A collision pipeline reads meshes only when its owner opts in (``CollisionPipeline(terrain_meshes=True)``, which a
+    solver that takes the law's contacts passes): other solvers keep the mesh path.
 
     Args:
         model: A finalized model.
+        meshes: Whether static meshes are considered as surfaces.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, *, meshes: bool = True):
         count = model.shape_count
         types = model.shape_type.numpy() if count else np.zeros(0, np.int32)
         index = model.shape_heightfield_index.numpy() if count else np.zeros(0, np.int32)
@@ -874,7 +877,7 @@ class TerrainSurfaces:
         """Their cell tables (:class:`~newton._src.geometry.terrain_cells_mesh.TerrainMeshCells`, host arrays)."""
         self.mesh_reasons = {}
         """Per static mesh shape considered: why the law reads it, or why it keeps the generic path."""
-        if count:
+        if count and meshes:
             from .flags import ShapeFlags  # noqa: PLC0415
             from .terrain_cells_mesh import terrain_mesh_surface  # noqa: PLC0415
 
