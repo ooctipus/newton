@@ -1072,7 +1072,7 @@ def _pair_setup(inputs: TerrainPairInputs, data: TerrainFeatureData, pair: int):
     shapes = inputs.pairs[pair]
     hfield = shapes[0]
     partner = shapes[1]
-    heightfield = int(inputs.shape_heightfield_index[hfield])
+    heightfield = int(inputs.shape_surface[hfield])
     frame = inputs.shape_transform[hfield]
     cells = wp.vec4i(0, -1, 0, -1)
     a = wp.vec3(0.0)

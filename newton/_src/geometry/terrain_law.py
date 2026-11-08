@@ -25,10 +25,11 @@ Surface model:
   several cells is bit-identical in all of them (the narrow phase's per-cell frame ``x1 = x0 + dx`` leaves cracks
   of up to 9.5 um on a 200 m terrain). The window's origin is the exact grid position in float64 and a core
   point enters the frame rounded once, so its position against the grid is exact to a float32 rounding of a
-  window-sized number (a float32 origin rounds by up to 4 um 100 m out). Heights are decoded as the narrow
-  phase decodes them on the CPU (float32 ``min_z + e * (max_z - min_z)``, each operation rounded once), on
-  every device and in every kernel (:func:`terrain_decode` uses explicitly rounded operations, which no
-  floating-point contraction fuses).
+  window-sized number (a float32 origin rounds by up to 4 um 100 m out). The law reads one surface type, vertex
+  heights in float32 on a lattice (:attr:`TerrainFeatureData.heights`): a heightfield's are decoded once at build as
+  the narrow phase decodes them on the CPU (float32 ``min_z + e * (max_z - min_z)``, each operation rounded once, on
+  every device: :func:`terrain_decode` uses explicitly rounded operations, which no floating-point contraction
+  fuses), a static mesh's cell table holds its own (:mod:`~newton._src.geometry.terrain_cells_mesh`).
 * Canonical edge functions. The face test of a triangle at an edge and the edge's own test read one value
   ``s = (k - v0) . m`` (``m`` the triangle's in-plane outward normal at the edge, ``v0`` the edge's lower vertex),
   and the edge's slab test and the vertex's Voronoi test read one value ``(k - v) . (w - v)``. Both sides of every
@@ -274,31 +275,40 @@ answer of a block's lanes is the first candidate any lane has."""
 
 @wp.struct
 class TerrainSurfaceInfo:
-    """One heightfield's layout in the law's static arrays."""
+    """One surface's layout in the law's static arrays: a heightfield, or a static mesh's cell table
+    (:mod:`~newton._src.geometry.terrain_cells_mesh`), both a lattice of vertex heights in the shape's frame."""
 
     data_offset: int
-    """First elevation of the heightfield in the model's concatenated elevations."""
+    """First vertex height of the surface in :attr:`TerrainFeatureData.heights`."""
     nrow: int
     """Vertex rows."""
     ncol: int
     """Vertex columns."""
-    hx: float
-    """Half-extent along x [m], scale applied."""
-    hy: float
-    """Half-extent along y [m], scale applied."""
+    x0: float
+    """Position of vertex column 0 along x [m] in the shape's frame (a heightfield's ``-hx``), float32: the cell
+    lookup's (:func:`terrain_box_cells`)."""
+    y0: float
+    """Position of vertex row 0 along y [m] (a heightfield's ``-hy``), float32."""
+    x0_64: wp.float64
+    """:attr:`x0` in float64, exact (the window origin's: a mesh lattice's fitted origin, a heightfield's float32
+    ``-hx``)."""
+    y0_64: wp.float64
+    """:attr:`y0` in float64, exact."""
     min_z: float
-    """Height of elevation 0 [m], scale applied."""
+    """Lowest height the surface's vertices can take [m] (a heightfield's height of elevation 0), the scale of the
+    static crease classes' rounding bound."""
     max_z: float
-    """Height of elevation 1 [m], scale applied."""
+    """Highest height the surface's vertices can take [m] (a heightfield's height of elevation 1)."""
     dx: float
-    """Cell size along x [m] (float32 ``2 hx / (ncol - 1)``, as the narrow phase computes it)."""
+    """Cell size along x [m] (float32; a heightfield's ``2 hx / (ncol - 1)``, as the narrow phase computes it)."""
     dy: float
     """Cell size along y [m]."""
     dx64: wp.float64
-    """Cell size along x [m] in float64: ``2 hx / (ncol - 1)`` from the float32 ``hx`` (the window origin's and the
-    cluster planes' grid step, computed once on the host, bit for bit the device's float64 division)."""
+    """Cell size along x [m] in float64: the window origin's and the cluster planes' grid step (a heightfield's
+    ``2 hx / (ncol - 1)`` from the float32 ``hx``, computed once on the host, bit for bit the device's float64
+    division; a mesh lattice's fitted size)."""
     dy64: wp.float64
-    """Cell size along y [m] in float64: ``2 hy / (nrow - 1)`` from the float32 ``hy``."""
+    """Cell size along y [m] in float64."""
     triangle_offset: int
     """First cluster id of the heightfield."""
     plane_offset: int
@@ -331,18 +341,19 @@ class TerrainClusterPlane:
 class TerrainFeatureData:
     """Everything the law's kernels read about the terrain (all heightfields of a model)."""
 
-    elevations: wp.array[wp.float32]
-    """The model's concatenated normalized elevations."""
+    heights: wp.array[wp.float32]
+    """Every surface's vertex heights [m], concatenated: a heightfield's elevations decoded once at build
+    (:func:`terrain_decode`, the narrow phase's CPU decode), a mesh table's ``vertex_z``."""
     clusters: wp.array[wp.int32]
     """Per triangle: the dense index of its cluster's plane record, or ``-(1 + local triangle id)`` alone."""
     planes: wp.array[TerrainClusterPlane]
     """Plane records of the clusters of several triangles."""
     tile_max: wp.array[wp.float32]
-    """Per tile of 8 x 8 cells: the largest decoded height of its vertices [m]."""
+    """Per tile of 8 x 8 cells: the largest height of its vertices [m]."""
     fine_max: wp.array[wp.float32]
-    """Per block of 2 x 2 cells: the largest decoded height of its vertices [m]."""
+    """Per block of 2 x 2 cells: the largest height of its vertices [m]."""
     vertex_bits: wp.array[wp.uint8]
-    """Per vertex, indexed as the elevations: the kinds of the three edges it owns and whether it is a vertex feature
+    """Per vertex, indexed as the heights: the kinds of the three edges it owns and whether it is a vertex feature
     (:func:`terrain_vertex_bits_of_clusters`), static data of the clusters and heights read by
     :func:`terrain_edge_kind` and :func:`terrain_vertex_feature`."""
     surfaces: wp.array[TerrainSurfaceInfo]
@@ -426,8 +437,8 @@ class TerrainPairInputs:
     """Per shape: scale ``xyz`` (sphere and capsule radius in ``x``, capsule half-height in ``y``) and margin ``w``."""
     shape_gap: wp.array[float]
     """Contact gap of every shape [m]."""
-    shape_heightfield_index: wp.array[wp.int32]
-    """Heightfield index of every heightfield shape."""
+    shape_surface: wp.array[wp.int32]
+    """Surface index of every surface shape (:class:`~newton._src.geometry.terrain_contacts.TerrainSurfaces`)."""
     shape_body: wp.array[int]
     """The broad phase's immovable-pair test: body of every shape (immobile shapes as static)."""
     body_flags: wp.array[int]
@@ -706,9 +717,8 @@ def terrain_decode(min_z: float, max_z: float, elevation: float) -> float:
 
 @wp.func
 def terrain_height(data: TerrainFeatureData, surface: TerrainSurfaceInfo, r: int, c: int) -> float:
-    """Return the decoded height of vertex ``(r, c)`` [m] (heightfield-local)."""
-    e = data.elevations[surface.data_offset + r * surface.ncol + c]
-    return terrain_decode(surface.min_z, surface.max_z, e)
+    """Return the height of vertex ``(r, c)`` [m] (surface-local)."""
+    return data.heights[surface.data_offset + r * surface.ncol + c]
 
 
 @wp.func
@@ -725,7 +735,7 @@ def terrain_eps(extent: float) -> float:
 def terrain_window(data: TerrainFeatureData, heightfield: int, r0: int, c0: int) -> TerrainWindow:
     """Return the window frame of reference vertex ``(r0, c0)`` of a heightfield (band unset, see :func:`terrain_eps`).
 
-    The origin is the exact grid position ``(-hx + c0 dx, -hy + r0 dy)`` in float64: in float32 it would round
+    The origin is the exact grid position ``(x0 + c0 dx, y0 + r0 dy)`` in float64: in float32 it would round
     by up to 4 um on a 200 m terrain and shift every core point against the grid by as much.
     """
     window = TerrainWindow()
@@ -735,11 +745,9 @@ def terrain_window(data: TerrainFeatureData, heightfield: int, r0: int, c0: int)
     window.r0 = r0
     window.c0 = c0
     window.z_ref = terrain_height(data, surface, r0, c0)
-    hx = wp.float64(surface.hx)
-    hy = wp.float64(surface.hy)
     window.origin = wp.vec3d(
-        -hx + wp.float64(c0) * surface.dx64,
-        -hy + wp.float64(r0) * surface.dy64,
+        surface.x0_64 + wp.float64(c0) * surface.dx64,
+        surface.y0_64 + wp.float64(r0) * surface.dy64,
         wp.float64(window.z_ref),
     )
     window.eps = 0.0
@@ -1314,9 +1322,7 @@ def _vertex_feature_of_planes(data: TerrainFeatureData, window: TerrainWindow, r
 @wp.func
 def _grid_point64(surface: TerrainSurfaceInfo, z: float, r: int, c: int) -> wp.vec3d:
     """Vertex ``(r, c)`` at height ``z`` on the exact grid (heightfield-local, float64)."""
-    dx = wp.float64(2.0) * wp.float64(surface.hx) / wp.float64(surface.ncol - 1)
-    dy = wp.float64(2.0) * wp.float64(surface.hy) / wp.float64(surface.nrow - 1)
-    return wp.vec3d(wp.float64(c) * dx, wp.float64(r) * dy, wp.float64(z))
+    return wp.vec3d(wp.float64(c) * surface.dx64, wp.float64(r) * surface.dy64, wp.float64(z))
 
 
 @wp.func
@@ -1722,10 +1728,10 @@ def terrain_box_cells(surface: TerrainSurfaceInfo, x0: float, y0: float, x1: flo
     """
     cols = float(surface.ncol - 1)
     rows = float(surface.nrow - 1)
-    u0 = wp.clamp((x0 + surface.hx) / surface.dx - _CELL_WIDEN, -1.0, cols + 1.0)
-    u1 = wp.clamp((x1 + surface.hx) / surface.dx + _CELL_WIDEN, -1.0, cols + 1.0)
-    v0 = wp.clamp((y0 + surface.hy) / surface.dy - _CELL_WIDEN, -1.0, rows + 1.0)
-    v1 = wp.clamp((y1 + surface.hy) / surface.dy + _CELL_WIDEN, -1.0, rows + 1.0)
+    u0 = wp.clamp((x0 - surface.x0) / surface.dx - _CELL_WIDEN, -1.0, cols + 1.0)
+    u1 = wp.clamp((x1 - surface.x0) / surface.dx + _CELL_WIDEN, -1.0, cols + 1.0)
+    v0 = wp.clamp((y0 - surface.y0) / surface.dy - _CELL_WIDEN, -1.0, rows + 1.0)
+    v1 = wp.clamp((y1 - surface.y0) / surface.dy + _CELL_WIDEN, -1.0, rows + 1.0)
     c0 = wp.max(int(wp.floor(u0)), 0)
     c1 = wp.min(int(wp.floor(u1)), surface.ncol - 2)
     r0 = wp.max(int(wp.floor(v0)), 0)

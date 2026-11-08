@@ -1773,7 +1773,7 @@ def _pair_inputs(model, pipeline) -> TerrainPairInputs:
     inputs.shape_transform = pipeline.geom_transform
     inputs.shape_data = pipeline.geom_data
     inputs.shape_gap = model.shape_gap
-    inputs.shape_heightfield_index = model.shape_heightfield_index
+    inputs.shape_surface = pipeline._terrain_law_shadow.shape_surface
     inputs.shape_body = model.shape_body
     inputs.body_flags = model.body_flags
     inputs.include_static_kinematic_pairs = 1
@@ -2467,7 +2467,6 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
                 pipeline.geom_data,
                 shape_type=model.shape_type,
                 shape_gap=model.shape_gap,
-                shape_heightfield_index=model.shape_heightfield_index,
                 **pipeline._broad_phase_pair_filter(model),
             )
     finally:

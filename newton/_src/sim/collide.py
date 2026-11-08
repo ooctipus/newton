@@ -1142,6 +1142,13 @@ class _ForecastTerrain:
     """The highest height of each tile [m]."""
 
 
+def _has_static_meshes(model: Model) -> bool:
+    """Whether the model has a triangle mesh on no body: a surface the terrain law may read (its cell table)."""
+    if not model.shape_count:
+        return False
+    return bool(np.any((model.shape_type.numpy() == int(GeoType.MESH)) & (model.shape_body.numpy() < 0)))
+
+
 def _forecast_terrain(model: Model) -> _ForecastTerrain:
     """Return the tiles of the model's upright heightfields and the shapes they belong to."""
     types = model.shape_type.numpy()
@@ -3851,9 +3858,9 @@ class CollisionPipeline:
         """
         narrow = self.narrow_phase
         # A prebuilt narrow phase may still drop the pairs another pipeline gave the law: this pipeline decides.
-        narrow.set_terrain_law_partners(None)
+        narrow.set_terrain_law_roles(None)
         self._terrain_law_shadow_reason = "Off: NEWTON_TERRAIN_LAW_SHADOW lists no partner class."
-        if not narrow.has_heightfields:
+        if not narrow.has_heightfields and not _has_static_meshes(model):
             self._terrain_law_decision = None
             self._terrain_law_reason = "No heightfield pair."
             if shadow_classes:
@@ -3923,7 +3930,7 @@ class CollisionPipeline:
         self._terrain_law_shadow = law
         self._terrain_law_writes = True
         self._terrain_law_listed = wp.array(written, dtype=wp.int32, device=model.device)
-        narrow.set_terrain_law_partners(wp.array(partner, dtype=wp.int32, device=model.device))
+        narrow.set_terrain_law_roles(wp.array(partner, dtype=wp.int32, device=model.device))
         self._terrain_law_decision = decision
         writer = (
             "Default: the terrain law writes the contacts of every heightfield pair whose partner it has a core for "
@@ -5383,7 +5390,6 @@ class CollisionPipeline:
                 self.geom_data,
                 shape_type=model.shape_type,
                 shape_gap=model.shape_gap,
-                shape_heightfield_index=model.shape_heightfield_index,
                 **pair_filter,
             )
             if self._terrain_law_writes:

@@ -735,7 +735,7 @@ def _pair_inputs(shadow, model, pipeline):
     inputs.shape_transform = pipeline.geom_transform
     inputs.shape_data = pipeline.geom_data
     inputs.shape_gap = model.shape_gap
-    inputs.shape_heightfield_index = model.shape_heightfield_index
+    inputs.shape_surface = shadow.shape_surface
     inputs.shape_body = model.shape_body
     inputs.body_flags = model.body_flags
     inputs.include_static_kinematic_pairs = 1
@@ -883,7 +883,6 @@ def _production_rows(shadow, model, pipeline) -> dict:
         pipeline.geom_data,
         shape_type=model.shape_type,
         shape_gap=model.shape_gap,
-        shape_heightfield_index=model.shape_heightfield_index,
         **pipeline._broad_phase_pair_filter(model),
     )
     rows = _host_rows(shadow._out)

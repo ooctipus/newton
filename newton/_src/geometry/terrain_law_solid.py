@@ -1404,7 +1404,7 @@ def solid_pair_read(inputs: TerrainPairInputs, data: TerrainFeatureData, pair: i
     shapes = inputs.pairs[pair]
     hfield = shapes[0]
     partner = shapes[1]
-    heightfield = int(inputs.shape_heightfield_index[hfield])
+    heightfield = int(inputs.shape_surface[hfield])
     frame = inputs.shape_transform[hfield]
     local = wp.transform_identity()
     size = wp.vec4(0.0)

@@ -3,11 +3,13 @@
 
 """Static data of the per-pair terrain contact law: surface features and the terrain pair table.
 
-:class:`TerrainFeatures` builds, for every heightfield of a model, the per-triangle plane clusters (with the
-plane records of clusters of several triangles), the tile-max mip and the version stamps; the law's kernels read
-them through :class:`~newton._src.geometry.terrain_law.TerrainFeatureData`. :class:`TerrainPairTable` lists every
-(heightfield, convex partner) pair the collision filter admits, grouped into one contiguous segment per partner
-class and lane class. Nothing routes contacts through the law yet: building either object changes no contact.
+The law reads one surface type, a lattice of vertex heights in a shape's frame (:class:`TerrainSurfaces`): every
+heightfield, and every static triangle mesh whose cell table the law reads whole
+(:mod:`~newton._src.geometry.terrain_cells_mesh`). :class:`TerrainFeatures` builds, for every surface, its heights (a
+heightfield's decoded once), the per-triangle plane clusters (with the plane records of clusters of several
+triangles), the tile-max mip and the version stamps; the law's kernels read them through
+:class:`~newton._src.geometry.terrain_law.TerrainFeatureData`. :class:`TerrainPairTable` lists every (surface, convex
+partner) pair the collision filter admits, grouped into one contiguous segment per partner class and lane class.
 
 Plane clusters are built by Warp kernels on the model's device, round by round over the triangles not yet
 assigned:
@@ -133,19 +135,17 @@ _FLOAT_MAX = wp.constant(3.402823466e38)
 
 @wp.struct
 class _Grid:
-    elevations: wp.array[wp.float32]
+    heights: wp.array[wp.float32]
     data_offset: int
     nrow: int
     ncol: int
-    min_z: float
-    max_z: float
     dx: wp.float64
     dy: wp.float64
 
 
 @wp.func
 def _z(grid: _Grid, vertex: int) -> wp.float64:
-    return wp.float64(terrain_decode(grid.min_z, grid.max_z, grid.elevations[grid.data_offset + vertex]))
+    return wp.float64(grid.heights[grid.data_offset + vertex])
 
 
 @wp.func
@@ -753,7 +753,7 @@ def _cluster_write(
 def _block_max(
     grid: _Grid, side: int, block_r0: int, block_c0: int, block_cols: int, block_offset: int, out: wp.array[wp.float32]
 ):
-    """The largest decoded height of the vertices of every block of ``side`` x ``side`` cells (a mip level)."""
+    """The largest height of the vertices of every block of ``side`` x ``side`` cells (a mip level)."""
     i, j = wp.tid()
     br = block_r0 + i
     bc = block_c0 + j
@@ -762,9 +762,22 @@ def _block_max(
     value = float(-_FLOAT_MAX)
     for r in range(br * side, r_end + 1):
         for c in range(bc * side, c_end + 1):
-            e = grid.elevations[grid.data_offset + r * grid.ncol + c]
-            value = wp.max(value, terrain_decode(grid.min_z, grid.max_z, e))
+            value = wp.max(value, grid.heights[grid.data_offset + r * grid.ncol + c])
     out[block_offset + br * block_cols + bc] = value
+
+
+@wp.kernel(enable_backward=False)
+def _decode_heights(
+    elevations: wp.array[wp.float32],
+    source: int,
+    min_z: float,
+    max_z: float,
+    heights: wp.array[wp.float32],
+    target: int,
+):
+    """A heightfield's vertex heights from its normalized elevations, decoded as the narrow phase's CPU decode."""
+    i = wp.tid()
+    heights[target + i] = terrain_decode(min_z, max_z, elevations[source + i])
 
 
 @wp.kernel(enable_backward=False)
@@ -828,48 +841,162 @@ def _merge_regions(a, b):
     return (min(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), max(a[3], b[3]))
 
 
-class TerrainFeatures:
-    """Plane clusters, tile-max mip and version stamps of every heightfield of a model.
+class TerrainSurfaces:
+    """Every shape the terrain law reads as a surface, and its surface index: one surface type, a lattice of vertex
+    heights in the shape's frame.
 
-    Built on the model's device by Warp kernels, deterministically. The law's kernels read the arrays through
-    :meth:`data`. Edited heights are reported with :meth:`mark_elevations_changed` and absorbed by
-    :meth:`rebuild_terrain_features`; until then the version stamps differ and a kernel that checks them
-    (:func:`~newton._src.geometry.terrain_law.terrain_features_current`) reports stale data instead of
-    reading it. So does a kernel given a struct from :meth:`data` that predates a rebuild which reallocated the
-    plane records.
+    * Every heightfield shape: surface ``h``, its heightfield index.
+    * Every static triangle mesh (on no body, colliding with shapes) whose cell table the law reads whole
+      (:func:`~newton._src.geometry.terrain_cells_mesh.terrain_mesh_surface`: the qualifying rule and
+      :func:`~newton._src.geometry.terrain_cells_mesh.terrain_mesh_cells_law_surface`), after the heightfields in shape
+      order. The data choose, never a task: a mesh that fails keeps the generic mesh path unchanged, and its reason is
+      kept in :attr:`mesh_reasons`.
+
+    The tables are built on the model's device at the law's construction (the model and other solvers never see them).
 
     Args:
-        model: A finalized model. Its heightfield elevations are read in place, never copied.
+        model: A finalized model.
     """
 
     def __init__(self, model):
+        count = model.shape_count
+        types = model.shape_type.numpy() if count else np.zeros(0, np.int32)
+        index = model.shape_heightfield_index.numpy() if count else np.zeros(0, np.int32)
+        self.heightfield_shapes = [int(s) for s in np.flatnonzero(types == int(GeoType.HFIELD)) if index[s] >= 0]
+        """Heightfield shapes, in shape order."""
+        self.heightfield_count = len(self.heightfield_shapes)
+        surface = np.full(count, -1, np.int32)
+        for s in self.heightfield_shapes:
+            surface[s] = index[s]
+        self.mesh_shapes = []
+        """Static mesh shapes the law reads, in shape order (surface ``heightfield_count + j``)."""
+        self.tables = []
+        """Their cell tables (:class:`~newton._src.geometry.terrain_cells_mesh.TerrainMeshCells`, host arrays)."""
+        self.mesh_reasons = {}
+        """Per static mesh shape considered: why the law reads it, or why it keeps the generic path."""
+        if count:
+            from .flags import ShapeFlags  # noqa: PLC0415
+            from .terrain_cells_mesh import terrain_mesh_surface  # noqa: PLC0415
+
+            flags = model.shape_flags.numpy()
+            body = model.shape_body.numpy()
+            scale = model.shape_scale.numpy()
+            static = (types == int(GeoType.MESH)) & (body < 0) & ((flags & int(ShapeFlags.COLLIDE_SHAPES)) != 0)
+            for s in np.flatnonzero(static):
+                mesh = model.shape_source[int(s)]
+                if mesh is None:
+                    continue
+                vertices = np.asarray(mesh.vertices, dtype=np.float32).reshape(-1, 3) * scale[s].astype(np.float32)
+                table, reason = terrain_mesh_surface(vertices, np.asarray(mesh.indices), device=model.device)
+                self.mesh_reasons[int(s)] = reason
+                if table is not None:
+                    surface[s] = self.heightfield_count + len(self.tables)
+                    self.mesh_shapes.append(int(s))
+                    self.tables.append(table)
+        self.shape_surface = surface
+        """Per shape: its surface index, or -1 (int32, host)."""
+        self.count = self.heightfield_count + len(self.tables)
+        """Surfaces: heightfields, then mesh tables."""
+        nrow = np.zeros(self.count, np.int64)
+        ncol = np.zeros(self.count, np.int64)
+        dx = np.zeros(self.count, np.float64)
+        dy = np.zeros(self.count, np.float64)
+        if self.heightfield_count:
+            layout = model.heightfield_data.numpy()[: self.heightfield_count]
+            nrow[: self.heightfield_count] = layout["nrow"]
+            ncol[: self.heightfield_count] = layout["ncol"]
+            dx[: self.heightfield_count] = 2.0 * layout["hx"].astype(np.float64) / (ncol[: self.heightfield_count] - 1)
+            dy[: self.heightfield_count] = 2.0 * layout["hy"].astype(np.float64) / (nrow[: self.heightfield_count] - 1)
+        for j, table in enumerate(self.tables):
+            h = self.heightfield_count + j
+            nrow[h], ncol[h] = table.shape[0] + 1, table.shape[1] + 1
+            dx[h], dy[h] = table.cell_size
+        self.nrow, self.ncol, self.dx, self.dy = nrow, ncol, dx, dy
+        """Per surface: vertex rows and columns, cell sizes [m] (host)."""
+
+
+class TerrainFeatures:
+    """Vertex heights, plane clusters, tile-max mip and version stamps of every surface the law reads
+    (:class:`TerrainSurfaces`): heightfields and static mesh tables.
+
+    Built on the model's device by Warp kernels, deterministically. The law's kernels read the arrays through
+    :meth:`data`. A heightfield's elevations are decoded once into the heights the law reads; edited elevations are
+    reported with :meth:`mark_elevations_changed` and absorbed by :meth:`rebuild_terrain_features`, which decodes them
+    again; until then the version stamps differ and a kernel that checks them
+    (:func:`~newton._src.geometry.terrain_law.terrain_features_current`) reports stale data instead of
+    reading it. So does a kernel given a struct from :meth:`data` that predates a rebuild which reallocated the
+    plane records. A mesh table is static.
+
+    Args:
+        model: A finalized model.
+        surfaces: The surfaces to build (:class:`TerrainSurfaces` of ``model`` when omitted).
+    """
+
+    def __init__(self, model, surfaces: TerrainSurfaces | None = None):
         self.model = model
         self.device = model.device
-        types = model.shape_type.numpy() if model.shape_count else np.zeros(0, np.int32)
-        index = model.shape_heightfield_index.numpy() if model.shape_count else np.zeros(0, np.int32)
-        self.heightfield_shapes = [int(s) for s in np.flatnonzero(types == int(GeoType.HFIELD)) if index[s] >= 0]
-        self.heightfield_of_shape = {s: int(index[s]) for s in self.heightfield_shapes}
-        count = len(self.heightfield_shapes)
-        self.heightfield_count = count
-        layouts = model.heightfield_data.numpy() if count else None
+        surfaces = TerrainSurfaces(model) if surfaces is None else surfaces
+        self.surfaces = surfaces
+        self.heightfield_shapes = surfaces.heightfield_shapes
+        self.heightfield_of_shape = {s: int(surfaces.shape_surface[s]) for s in self.heightfield_shapes}
+        self.surface_of_shape = {
+            int(s): int(surfaces.shape_surface[s]) for s in np.flatnonzero(surfaces.shape_surface >= 0)
+        }
+        count = surfaces.count
+        self.heightfield_count = surfaces.heightfield_count
+        self.surface_count = count
+        layouts = model.heightfield_data.numpy() if self.heightfield_count else None
         self._grids = []
         infos = []
         triangle_offset = 0
         tile_offset = 0
         fine_offset = 0
+        # heightfields keep the model's elevation layout; the mesh tables' heights follow it
+        data_offset = int(model.heightfield_elevations.shape[0]) if self.heightfield_count else 0
         self._tiles = []
         self._fines = []
+        self._decode = []
+        heights_host = []
         for h in range(count):
-            row = layouts[h]
-            nrow, ncol = int(row["nrow"]), int(row["ncol"])
-            hx, hy = float(row["hx"]), float(row["hy"])
+            info = TerrainSurfaceInfo()
+            if h < self.heightfield_count:
+                row = layouts[h]
+                nrow, ncol = int(row["nrow"]), int(row["ncol"])
+                hx, hy = np.float32(row["hx"]), np.float32(row["hy"])
+                min_z, max_z = float(row["min_z"]), float(row["max_z"])
+                info.x0, info.y0 = float(-hx), float(-hy)
+                # a heightfield's float32 -hx widens exactly: the window origin's x0 + c0 dx is its -hx + c0 dx
+                info.x0_64, info.y0_64 = float(-hx), float(-hy)
+                offset = int(row["data_offset"])
+                info.dx = float(np.float32(np.float32(2.0) * hx / np.float32(ncol - 1)))
+                info.dy = float(np.float32(np.float32(2.0) * hy / np.float32(nrow - 1)))
+                # the device's float64 steps of the float32 half extents, bit for bit (IEEE float64 on both)
+                info.dx64 = float(np.float64(2.0) * np.float64(hx) / np.float64(ncol - 1))
+                info.dy64 = float(np.float64(2.0) * np.float64(hy) / np.float64(nrow - 1))
+                self._decode.append((min_z, max_z))
+                heights_host.append(None)
+            else:
+                table = surfaces.tables[h - self.heightfield_count]
+                rows, cols = table.shape
+                nrow, ncol = rows + 1, cols + 1
+                vz = np.ascontiguousarray(table.vertex_z, dtype=np.float32).reshape(-1)
+                min_z, max_z = float(vz.min()), float(vz.max())
+                info.x0, info.y0 = float(np.float32(table.origin[0])), float(np.float32(table.origin[1]))
+                info.x0_64, info.y0_64 = float(table.origin[0]), float(table.origin[1])
+                offset = data_offset
+                data_offset += nrow * ncol
+                info.dx = float(np.float32(table.cell_size[0]))
+                info.dy = float(np.float32(table.cell_size[1]))
+                info.dx64, info.dy64 = float(table.cell_size[0]), float(table.cell_size[1])
+                self._decode.append(None)
+                heights_host.append(vz)
+            info.data_offset = offset
+            info.nrow, info.ncol = nrow, ncol
+            info.min_z, info.max_z = min_z, max_z
             grid = _Grid()
-            grid.elevations = model.heightfield_elevations
-            grid.data_offset = int(row["data_offset"])
+            grid.data_offset = offset
             grid.nrow, grid.ncol = nrow, ncol
-            grid.min_z, grid.max_z = float(row["min_z"]), float(row["max_z"])
-            grid.dx = 2.0 * hx / (ncol - 1)
-            grid.dy = 2.0 * hy / (nrow - 1)
+            grid.dx, grid.dy = info.dx64, info.dy64
             self._grids.append(grid)
             tile_rows = -(-(nrow - 1) // TERRAIN_TILE_CELLS)
             tile_cols = -(-(ncol - 1) // TERRAIN_TILE_CELLS)
@@ -877,16 +1004,6 @@ class TerrainFeatures:
             fine_rows = -(-(nrow - 1) // TERRAIN_FINE_CELLS)
             fine_cols = -(-(ncol - 1) // TERRAIN_FINE_CELLS)
             self._fines.append((fine_rows, fine_cols))
-            info = TerrainSurfaceInfo()
-            info.data_offset = grid.data_offset
-            info.nrow, info.ncol = nrow, ncol
-            info.hx, info.hy = hx, hy
-            info.min_z, info.max_z = grid.min_z, grid.max_z
-            info.dx = float(np.float32(np.float32(2.0) * np.float32(hx) / np.float32(ncol - 1)))
-            info.dy = float(np.float32(np.float32(2.0) * np.float32(hy) / np.float32(nrow - 1)))
-            # the device's float64 steps of the float32 half extents, bit for bit (IEEE float64 on both)
-            info.dx64 = float(np.float64(2.0) * np.float64(np.float32(hx)) / np.float64(ncol - 1))
-            info.dy64 = float(np.float64(2.0) * np.float64(np.float32(hy)) / np.float64(nrow - 1))
             info.triangle_offset = triangle_offset
             info.plane_offset = 0
             info.tile_offset = tile_offset
@@ -898,12 +1015,19 @@ class TerrainFeatures:
             tile_offset += tile_rows * tile_cols
             fine_offset += fine_rows * fine_cols
         self._infos = infos
+        self.heights = wp.zeros(max(data_offset, 1), dtype=wp.float32, device=self.device)
+        """Every surface's vertex heights [m] (:attr:`~newton._src.geometry.terrain_law.TerrainFeatureData.heights`)."""
+        for h, vz in enumerate(heights_host):
+            if vz is not None:
+                wp.copy(
+                    self.heights, wp.array(vz, dtype=wp.float32, device=self.device), dest_offset=infos[h].data_offset
+                )
+        for g in self._grids:
+            g.heights = self.heights
         self.clusters = wp.zeros(max(triangle_offset, 1), dtype=wp.int32, device=self.device)
         self.tile_max = wp.zeros(max(tile_offset, 1), dtype=wp.float32, device=self.device)
         self.fine_max = wp.zeros(max(fine_offset, 1), dtype=wp.float32, device=self.device)
-        self.vertex_bits = wp.zeros(
-            max(model.heightfield_elevations.shape[0] if count else 0, 1), dtype=wp.uint8, device=self.device
-        )
+        self.vertex_bits = wp.zeros(max(data_offset, 1), dtype=wp.uint8, device=self.device)
         self.elevation_version = wp.zeros(max(count, 1), dtype=wp.int32, device=self.device)
         self.feature_version = wp.zeros(max(count, 1), dtype=wp.int32, device=self.device)
         self._dirty = [None] * count
@@ -920,6 +1044,8 @@ class TerrainFeatures:
         """Host time spent building clusters so far [s] (device synchronized)."""
         self.cluster_scratch_bytes = 0
         """Largest device scratch of one cluster build [bytes]."""
+        for h in range(self.heightfield_count):
+            self._decode_heights(h)
         built = [self._build_clusters(h) for h in range(count)]
         self._place_planes(built)
         for h in range(count):
@@ -937,7 +1063,7 @@ class TerrainFeatures:
         reading them. Fetch the struct again, and capture again, after such a rebuild.
         """
         data = TerrainFeatureData()
-        data.elevations = self.model.heightfield_elevations
+        data.heights = self.heights
         data.clusters = self.clusters
         data.planes = self.planes
         data.tile_max = self.tile_max
@@ -951,16 +1077,17 @@ class TerrainFeatures:
         return data
 
     def surface(self, shape: int) -> TerrainSurfaceInfo:
-        """Return the layout of a heightfield shape."""
-        return self._infos[self._heightfield(shape)]
+        """Return the layout of a surface shape (a heightfield or a static mesh the law reads)."""
+        return self._infos[self._surface(shape)]
 
     def plane_count(self, shape: int) -> int:
-        """Return the number of plane records (clusters of several triangles) of a heightfield shape."""
-        return self._plane_counts[self._heightfield(shape)]
+        """Return the number of plane records (clusters of several triangles) of a surface shape."""
+        return self._plane_counts[self._surface(shape)]
 
     def memory_bytes(self) -> dict[str, int]:
         """Return the device bytes the features hold, by array."""
         return {
+            "heights": self.heights.capacity,
             "clusters": self.clusters.capacity,
             "planes": self.planes.capacity,
             "tile_max": self.tile_max.capacity,
@@ -1014,7 +1141,8 @@ class TerrainFeatures:
         region = _merge_regions(self._dirty[h], None if region is None else self._region(h, region))
         if region is None:
             region = self._region(h, None)
-        built = [None] * self.heightfield_count
+        self._decode_heights(h)
+        built = [None] * self.surface_count
         built[h] = self._build_clusters(h)
         self._place_planes(built)
         # every cluster may have changed: every vertex's bits
@@ -1047,6 +1175,23 @@ class TerrainFeatures:
             raise ValueError(f"Shape {shape} is not a heightfield")
         return self.heightfield_of_shape[shape]
 
+    def _surface(self, shape: int) -> int:
+        if shape not in self.surface_of_shape:
+            raise ValueError(f"Shape {shape} is not a surface of the terrain law")
+        return self.surface_of_shape[shape]
+
+    def _decode_heights(self, h: int) -> None:
+        """Decode heightfield h's elevations into the heights the law reads."""
+        info = self._infos[h]
+        min_z, max_z = self._decode[h]
+        wp.launch(
+            _decode_heights,
+            dim=info.nrow * info.ncol,
+            inputs=[self.model.heightfield_elevations, info.data_offset, min_z, max_z, self.heights, info.data_offset],
+            device=self.device,
+            record_tape=False,
+        )
+
     def _region(self, h: int, region):
         info = self._infos[h]
         if region is None:
@@ -1057,7 +1202,7 @@ class TerrainFeatures:
         return (r0, r1, c0, c1)
 
     def _build_clusters(self, h: int):
-        """Build heightfield h's clusters into ``self.clusters``; return its plane records (device) and their count."""
+        """Build surface h's clusters into ``self.clusters``; return its plane records (device) and their count."""
         started = time.perf_counter()
         grid = self._grids[h]
         info = self._infos[h]
@@ -1204,18 +1349,18 @@ class TerrainFeatures:
         return planes, records_count
 
     def _place_planes(self, built) -> None:
-        """Lay the plane records of every heightfield out in ``self.planes`` (reusing the array when they fit)."""
+        """Lay the plane records of every surface out in ``self.planes`` (reusing the array when they fit)."""
         counts = list(self._plane_counts)
         for h, item in enumerate(built):
             if item is not None:
                 counts[h] = item[1]
-        fits = all(counts[h] <= self._plane_capacity[h] for h in range(self.heightfield_count))
+        fits = all(counts[h] <= self._plane_capacity[h] for h in range(self.surface_count))
         if not fits:
             capacity = [max(c + max(c // 4, 64), self._plane_capacity[h]) for h, c in enumerate(counts)]
             old_planes, old_offsets = self.planes, [i.plane_offset for i in self._infos]
             self.planes = wp.zeros(max(sum(capacity), 1), dtype=TerrainClusterPlane, device=self.device)
             offset = 0
-            for h in range(self.heightfield_count):
+            for h in range(self.surface_count):
                 if built[h] is None and counts[h]:
                     wp.copy(self.planes, old_planes, dest_offset=offset, src_offset=old_offsets[h], count=counts[h])
                 self._infos[h].plane_offset = offset
@@ -1228,7 +1373,7 @@ class TerrainFeatures:
             if item is not None and item[1]:
                 wp.copy(self.planes, item[0], dest_offset=self._infos[h].plane_offset, count=item[1])
         self._plane_counts = counts
-        if self.heightfield_count:
+        if self.surface_count:
             self._surfaces.assign(wp.array(self._infos, dtype=TerrainSurfaceInfo, device="cpu"))
 
     def _build_vertex_bits(self, h: int) -> None:
@@ -1271,20 +1416,22 @@ class TerrainFeatures:
 # ----------------------------------------------------------------------------------------------------------------
 
 
-def heightfield_pair_table(
+def terrain_surface_pairs(
     shape_types: np.ndarray,
     shape_world: np.ndarray | None,
     colliding: np.ndarray,
     *,
+    surface: np.ndarray | None = None,
     explicit_pairs: np.ndarray | None = None,
     shape_collision_group: np.ndarray | None = None,
     filter_mask: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> np.ndarray:
-    """Return every ``(heightfield, partner)`` shape pair the collision filter admits, once.
+    """Return every ``(surface, partner)`` shape pair the collision filter admits, once.
 
-    The pairs are those of exactly one heightfield and a partner other than a triangle mesh. With an explicit
+    The pairs are those of exactly one surface shape (a heightfield, or a static mesh the law reads,
+    :class:`TerrainSurfaces`) and a partner that is neither a triangle mesh nor a heightfield. With an explicit
     pair list (an empty one included) they are its pairs of that kind, in either order. Otherwise the filter is
-    applied here as the model builder applies it: every colliding heightfield with every colliding partner of a
+    applied here as the model builder applies it: every colliding surface with every colliding partner of a
     compatible world (the same world, or either shape global) whose collision groups interact and that no filter
     pair excludes.
 
@@ -1292,6 +1439,7 @@ def heightfield_pair_table(
         shape_types: Geometry type of every shape.
         shape_world: World of every shape (-1 for global shapes), or ``None`` for a single world.
         colliding: Whether every shape takes part in shape-shape collision.
+        surface: Whether every shape is a surface of the law, or ``None`` for the heightfields.
         explicit_pairs: The model's admitted shape pairs, or ``None`` to apply the filter here.
         shape_collision_group: Collision group of every shape, or ``None`` when every group interacts. Unused
             with ``explicit_pairs``.
@@ -1300,27 +1448,29 @@ def heightfield_pair_table(
             ``explicit_pairs``.
 
     Returns:
-        Unique ``(heightfield, partner)`` rows, sorted.
+        Unique ``(surface, partner)`` rows, sorted.
     """
     shape_types = np.asarray(shape_types)
     hfield, mesh = int(GeoType.HFIELD), int(GeoType.MESH)
+    surface = shape_types == hfield if surface is None else np.asarray(surface, dtype=bool)
+    other = (shape_types != hfield) & (shape_types != mesh) & ~surface
     if explicit_pairs is not None:
         pairs = np.asarray(explicit_pairs, dtype=np.int64).reshape(-1, 2)
         pairs = pairs[np.all((pairs >= 0) & (pairs < len(shape_types)), axis=1)]
-        first, second = shape_types[pairs[:, 0]], shape_types[pairs[:, 1]]
-        partner = np.where(first == hfield, second, first)
-        pairs = pairs[((first == hfield) != (second == hfield)) & (partner != mesh)]
-        swap = shape_types[pairs[:, 0]] != hfield
+        first, second = surface[pairs[:, 0]], surface[pairs[:, 1]]
+        partner = np.where(first, pairs[:, 1], pairs[:, 0])
+        pairs = pairs[(first != second) & other[partner]]
+        swap = ~surface[pairs[:, 0]]
         table = np.where(swap[:, None], pairs[:, ::-1], pairs)
     else:
         colliding = np.asarray(colliding, dtype=bool)
-        heightfields = np.flatnonzero(colliding & (shape_types == hfield))
-        partners = np.flatnonzero(colliding & (shape_types != hfield) & (shape_types != mesh))
+        heightfields = np.flatnonzero(colliding & surface)
+        partners = np.flatnonzero(colliding & other)
         world = np.full(len(shape_types), -1, np.int64) if shape_world is None else np.asarray(shape_world)
         pieces = [_cross(heightfields[world[heightfields] < 0], partners)]
         local = heightfields[world[heightfields] >= 0]
         pieces.append(_cross(local, partners[world[partners] < 0]))
-        # Each world's heightfields with the partners of the same world.
+        # Each world's surfaces with the partners of the same world.
         order = np.argsort(world[partners], kind="stable")
         sorted_partners, sorted_worlds = partners[order], world[partners][order]
         begin = np.searchsorted(sorted_worlds, world[local], side="left")
@@ -1448,7 +1598,7 @@ def terrain_pair_candidates(shape_type, vertices, sides=None) -> np.ndarray:
 
 
 class TerrainPairTable:
-    """The static (heightfield, partner) pairs of the terrain law, one contiguous segment per partner and lane class.
+    """The static (surface, partner) pairs of the terrain law, one contiguous segment per partner and lane class.
 
     Pairs are exactly those the model's collision filter admits, since the law's pairs bypass the broad phase:
     the model's pair list (:attr:`~newton.Model.shape_contact_pairs`; an empty list gives an empty table) or,
@@ -1460,11 +1610,14 @@ class TerrainPairTable:
     Args:
         model: A finalized model.
         pairs: Shape pairs to take instead of the model's list (a collision pipeline's explicit pairs), as an
-            array of ``(shape, shape)`` rows or a Warp array of ``vec2i``; the heightfield pairs among them are kept.
+            array of ``(shape, shape)`` rows or a Warp array of ``vec2i``; the surface pairs among them are kept.
+        surfaces: The law's surfaces (:class:`TerrainSurfaces` of ``model`` when omitted).
     """
 
-    def __init__(self, model, *, pairs=None):
+    def __init__(self, model, *, pairs=None, surfaces: TerrainSurfaces | None = None):
         self.device = model.device
+        surfaces = TerrainSurfaces(model) if surfaces is None else surfaces
+        is_surface = surfaces.shape_surface >= 0
         count = model.shape_count
         types = model.shape_type.numpy() if count else np.zeros(0, np.int32)
         worlds = model.shape_world.numpy() if count else np.zeros(0, np.int32)
@@ -1478,14 +1631,17 @@ class TerrainPairTable:
             pairs = np.zeros((0, 2), np.int32)
         elif explicit is not None:
             explicit = explicit.numpy() if hasattr(explicit, "numpy") else np.asarray(explicit)
-            pairs = heightfield_pair_table(types, worlds, colliding, explicit_pairs=explicit.reshape(-1, 2))
+            pairs = terrain_surface_pairs(
+                types, worlds, colliding, surface=is_surface, explicit_pairs=explicit.reshape(-1, 2)
+            )
         elif listed is not None:
-            pairs = heightfield_pair_table(types, worlds, colliding, explicit_pairs=listed)
+            pairs = terrain_surface_pairs(types, worlds, colliding, surface=is_surface, explicit_pairs=listed)
         else:
-            pairs = heightfield_pair_table(
+            pairs = terrain_surface_pairs(
                 types,
                 worlds,
                 colliding,
+                surface=is_surface,
                 shape_collision_group=model.shape_collision_group.numpy(),
                 filter_mask=model.shape_collision_filter_mask,
             )
@@ -1516,10 +1672,9 @@ class TerrainPairTable:
             first, second = pairs[:, 0], pairs[:, 1]
             margin = model.shape_margin.numpy()
             gap = model.shape_gap.numpy()
-            layout = model.heightfield_data.numpy()[model.shape_heightfield_index.numpy()[first]]
-            nrow, ncol = layout["nrow"].astype(np.int64), layout["ncol"].astype(np.int64)
-            dx = 2.0 * layout["hx"].astype(np.float64) / (ncol - 1)
-            dy = 2.0 * layout["hy"].astype(np.float64) / (nrow - 1)
+            index = surfaces.shape_surface[first]
+            nrow, ncol = surfaces.nrow[index], surfaces.ncol[index]
+            dx, dy = surfaces.dx[index], surfaces.dy[index]
             reach = margin[first] + margin[second] + gap[first] + gap[second]
             radius = model.shape_collision_radius.numpy()[second]
             cells = terrain_window_cells(radius, reach, dx, dy)
