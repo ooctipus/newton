@@ -330,8 +330,8 @@ def create_query_kernel(
                 contact_center = wp.vec3(value[4 + 4 * k], value[5 + 4 * k], value[6 + 4 * k])
                 contact_normal = local_normal
                 contact_distance = value[7 + 4 * k]
-                if contact_distance >= 0.0:
-                    # Each contact is its own witness: the surface's own contact for it.
+                if contact_distance >= 0.0 and contact_distance <= gap + margin_a + margin_b:
+                    # Each contact is its own witness: the surface's own contact for one within reach.
                     terrain_point = contact_center - 0.5 * contact_distance * local_normal
                     terrain_point, contact_normal, contact_distance = seam_surface_witness(
                         geom, terrain_point, local_normal, contact_distance, feature_context

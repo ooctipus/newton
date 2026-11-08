@@ -282,7 +282,9 @@ class TestTerrainLawContacts(unittest.TestCase):
         self.assertEqual(route.get_collision_selection()["environment"]["applied"]["NEWTON_TERRAIN_LAW"], "none")
         contacts = _collide(route, state)
         expected = _arrays(contacts)
-        self.assertEqual(sum(len(r) for r in tu.contact_rows(model, state, contacts, terrain).values()), 114)
+        # 83 rows: the route's seam witnesses take the face beneath their partner, which retires 31 oblique rows
+        # of 114 and keeps every partner's deepest row.
+        self.assertEqual(sum(len(r) for r in tu.contact_rows(model, state, contacts, terrain).values()), 83)
         law = _pipeline(model, {}, **PIPELINE)
         self.assertTrue(_law_record(law)["writes"])
         expert = _pipeline(
