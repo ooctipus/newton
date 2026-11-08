@@ -3236,9 +3236,12 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
             if i >= triangle_pairs.shape[0]:
                 break
 
-            # Preserve the original argument in the unbound specialization.
+            # Preserve the original argument in the unbound specialization. The
+            # binding is a plain closure call: the dead branch is never compiled,
+            # while wp.static(None) would be unresolvable, and Warp builds a kernel
+            # with an unresolvable static at declaration (at import, for this one).
             if wp.static(writer_binding is not None):
-                reducer_data = wp.static(writer_binding)(reducer_data, i)
+                reducer_data = writer_binding(reducer_data, i)
             triple = triangle_pairs[i]
             shape_a = triple[0]  # Mesh or heightfield shape
             shape_b = triple[1]  # Convex shape
