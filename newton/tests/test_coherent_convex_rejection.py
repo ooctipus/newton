@@ -39,20 +39,19 @@ def _original_values(values, device):
 
 
 def _buffers(n, device):
-    """Query results, the distance queue with its two counters (front distance queries, back overlap
-    refinements), and the manifold queue with its counter."""
+    """Query results, the distance queue with its counter, and the manifold queue with its counter."""
     return [
         wp.zeros(n, dtype=ConvexQueryResult, device=device),
         wp.zeros(n, dtype=int, device=device),
-        wp.zeros(2, dtype=int, device=device),
+        wp.zeros(1, dtype=int, device=device),
         wp.zeros(n, dtype=int, device=device),
         wp.zeros(1, dtype=int, device=device),
     ]
 
 
 def _run_original(original, pair_array, count, values, device, threads, buffers):
-    """The split queue's three query passes: MPR, then separated distance queries (front) and overlap
-    refinements (back). The manifold queue is complete only after both distance passes."""
+    """The split queue's two query passes: MPR, then distance queries for the pairs it finds separated. The
+    manifold queue is complete after the distance pass."""
     shape_values = _original_values(values, device)
     wp.launch(
         original[0],
@@ -61,14 +60,13 @@ def _run_original(original, pair_array, count, values, device, threads, buffers)
         device=device,
         block_dim=128,
     )
-    for kernel in original[1:3]:
-        wp.launch(
-            kernel,
-            dim=threads,
-            inputs=[pair_array, *shape_values, threads, *buffers],
-            device=device,
-            block_dim=128,
-        )
+    wp.launch(
+        original[1],
+        dim=threads,
+        inputs=[pair_array, *shape_values, threads, *buffers],
+        device=device,
+        block_dim=128,
+    )
 
 
 def _box_inputs(n, device):
@@ -111,10 +109,10 @@ def test_rejection_queries(test, device):
     original = _original()
     _run_original(original, pair_array, count, values, device, threads, original_buffers)
     original_ids, original_results = _accepted(original_buffers)
-    # The queue accepts every overlap (x = 0.8, 44 back refinements) and every pair 2 mm apart
-    # (x = 1.002, 44 front distance queries); the 43 pairs 0.2 m apart lie beyond the 10 mm gap.
+    # The queue accepts every overlap (x = 0.8, 44 MPR contacts) and every pair 2 mm apart (x = 1.002, 44 of the
+    # 87 distance queries); the 43 pairs 0.2 m apart lie beyond the 10 mm gap.
     test.assertEqual(len(original_ids), 88)
-    test.assertEqual(original_buffers[2].numpy().tolist(), [87, 44])
+    test.assertEqual(original_buffers[2].numpy().tolist(), [87])
     cache = _ConvexQueryCache(
         pairs=pairs,
         shape_types=values[0].numpy(),
