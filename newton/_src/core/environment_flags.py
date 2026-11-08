@@ -178,8 +178,8 @@ NEWTON_FLAGS = declare(
         "NEWTON_HEIGHTFIELD_CONVEX_CELLS",
         "retired",
         ("core.environment_flags",),
-        "Retired terrain convex-cells owner (hull support keeps the vertex scan below 256 vertices and the "
-        "octahedral walk above); ignored, and the collision pipeline warns once per process.",
+        "Retired terrain convex-cells owner: small hulls' direction cells are model data that the table-driven "
+        "support reads; ignored, and the collision pipeline warns once per process.",
     ),
     EnvironmentFlag(
         "NEWTON_HEIGHTFIELD_CYLINDER_SPLIT",
@@ -252,8 +252,8 @@ NEWTON_FLAGS = declare(
         "NEWTON_NARROW_PHASE_CONVEX_CELLS",
         "retired",
         ("core.environment_flags",),
-        "Retired convex-cells owner (hull support keeps the vertex scan below 256 vertices and the octahedral "
-        "walk above); ignored, and the collision pipeline warns once per process.",
+        "Retired convex-cells owner: small hulls' direction cells are model data that the table-driven support "
+        "reads; ignored, and the collision pipeline warns once per process.",
     ),
     EnvironmentFlag(
         "NEWTON_NARROW_PHASE_PACKED_HEIGHTFIELD_PAIRS",

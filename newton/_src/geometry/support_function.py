@@ -42,6 +42,13 @@ _CENTERED_BOX_SUPPORT_TIE_EPSILON = 1.0e-6
 # Hull certification is independent of the support-walk lookup-table resolution.
 _CONVEX_HULL_VALID = wp.constant(1 << 16)
 _CONVEX_SUPPORT_RESOLUTION_MASK = wp.constant((1 << 16) - 1)
+# A hull whose directional table is the direction cells' candidate masks (see
+# :func:`_cell_support_index`) rather than an octahedral walk seed.
+_CONVEX_SUPPORT_CELLS = wp.constant(1 << 17)
+# Direction cells: six cube faces of 16 x 16 cells, each holding a 64-bit
+# candidate mask as two int32 words of the hull's directional table.
+CONVEX_SUPPORT_CELL_COUNT = 6 * 16 * 16
+CONVEX_SUPPORT_CELL_MAX_VERTICES = 64
 
 TRIANGLE_PRISM_EXTRUSION = 1.0
 """Depth [m] a triangle is extruded along -Z to give a heightfield cell volume."""
@@ -187,6 +194,78 @@ def _hull_edge_block(geom: Any, provider: Any) -> int:
     return start
 
 
+@wp.func_native("""
+float absolute[3] = {::fabsf(direction[0]), ::fabsf(direction[1]), ::fabsf(direction[2])};
+if (!::isfinite(absolute[0]) || !::isfinite(absolute[1]) || !::isfinite(absolute[2])) return -1;
+int axis = absolute[1] > absolute[0] ? 1 : 0;
+if (absolute[2] > absolute[axis]) axis = 2;
+float magnitude = absolute[axis];
+if (!(magnitude >= 0x1p-60f && magnitude <= 0x1p60f)) return -1;
+int first = axis == 0 ? 1 : 0;
+int second = axis == 2 ? 1 : 2;
+#if defined(__CUDA_ARCH__)
+float x = __fmul_rn(__fadd_rn(__fdiv_rn(direction[first], magnitude), 1.0f), 8.0f);
+float y = __fmul_rn(__fadd_rn(__fdiv_rn(direction[second], magnitude), 1.0f), 8.0f);
+#else
+volatile float qx = direction[first] / magnitude, qy = direction[second] / magnitude;
+volatile float sx = qx + 1.0f, sy = qy + 1.0f;
+float x = sx * 8.0f, y = sy * 8.0f;
+#endif
+int ix = static_cast<int>(x), iy = static_cast<int>(y);
+ix = ix < 0 ? 0 : (ix > 15 ? 15 : ix);
+iy = iy < 0 ? 0 : (iy > 15 ? 15 : iy);
+int face = 2*axis + (direction[axis] < 0.0f ? 1 : 0);
+return face*256 + ix*16 + iy;
+""")
+def _direction_cell(direction: wp.vec3) -> int:
+    """Return the direction's cube-face cell, with explicitly rounded normalization, or -1 outside coverage."""
+    ...
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+return __ffsll(mask)-1;
+#else
+return __builtin_ctzll(mask);
+#endif
+""")
+def _first_bit(mask: wp.uint64) -> int:
+    """Return the lowest set bit of a nonempty mask."""
+    ...
+
+
+@wp.func
+def _cell_support_index(geom: Any, points: wp.array[wp.vec3], scaled_dir: wp.vec3, provider: Any) -> int:
+    """Return the first maximal vertex among a cell hull's candidates for ``scaled_dir``, or -1.
+
+    The candidates of a direction cell are every vertex that can be the float32
+    support of some direction in it (conservative masks over exact normal
+    cones), scanned in vertex order: the result is the full scan's.
+    """
+    winner = int(-1)
+    if geom.shape_index >= 0 and geom.shape_index < provider.shape_support_data.shape[0]:
+        support_data = provider.shape_support_data[geom.shape_index]
+        if support_data[3] > 0 and (support_data[3] & _CONVEX_SUPPORT_CELLS) != 0:
+            cell = _direction_cell(scaled_dir)
+            word = support_data[0] + 2 * cell
+            if cell >= 0 and word + 1 < provider.support_lut.shape[0]:
+                mask = wp.uint64(wp.uint32(provider.support_lut[word])) | (
+                    wp.uint64(wp.uint32(provider.support_lut[word + 1])) << wp.uint64(32)
+                )
+                score = float(0.0)
+                while mask != wp.uint64(0):
+                    index = _first_bit(mask)
+                    value = wp.dot(points[index], scaled_dir)
+                    if winner < 0 or value > score:
+                        winner = index
+                        score = value
+                    mask = mask & (mask - wp.uint64(1))
+                # The scan starts below -1e10; keep its answer for such directions.
+                if score <= -1.0e10:
+                    winner = -1
+    return winner
+
+
 @wp.func
 def _octahedral_support_seed(direction: wp.vec3, resolution: int, lut_start: int, lut: wp.array[int]) -> int:
     """Return a directional seed vertex from an octahedral lookup table."""
@@ -205,21 +284,36 @@ def _octahedral_support_seed(direction: wp.vec3, resolution: int, lut_start: int
 
 
 @wp.func
+def _scan_support_index(points: wp.array[wp.vec3], scaled_dir: wp.vec3) -> int:
+    """Return the first maximal vertex of a full scan."""
+    best_idx = int(0)
+    max_dot = float(-1.0e10)
+    for i in range(points.shape[0]):
+        dot_val = wp.dot(points[i], scaled_dir)
+        if dot_val > max_dot:
+            max_dot = dot_val
+            best_idx = i
+    return best_idx
+
+
+@wp.func
 def _support_map_convex_mesh(
     geom: GenericShapeData, direction: wp.vec3, data_provider: AcceleratedSupportMapDataProvider
 ) -> wp.vec3:
-    """Return convex-mesh support, using an edge walk when acceleration data is available."""
+    """Return convex-mesh support through the hull's directional table.
+
+    Small hulls take their direction cells' candidates, large ones an
+    octahedral seed and an edge walk; other hulls scan every vertex.
+    """
     mesh = wp.mesh_get(unpack_mesh_ptr(geom.auxiliary))
     scaled_dir = wp.cw_mul(direction, geom.scale)
-    best_idx = int(0)
+    best_idx = _cell_support_index(geom, mesh.points, scaled_dir, data_provider)
 
-    accelerated = geom.shape_index >= 0 and data_provider.shape_support_data.shape[0] > geom.shape_index
-    if accelerated:
+    if best_idx < 0 and geom.shape_index >= 0 and data_provider.shape_support_data.shape[0] > geom.shape_index:
         support_data = data_provider.shape_support_data[geom.shape_index]
         packed = support_data[3]
         resolution = packed & _CONVEX_SUPPORT_RESOLUTION_MASK
-        accelerated = packed > 0 and resolution > 0
-        if accelerated:
+        if packed > 0 and resolution > 0:
             best_idx = _octahedral_support_seed(scaled_dir, resolution, support_data[0], data_provider.support_lut)
             best_dot = wp.dot(mesh.points[best_idx], scaled_dir)
             improved = int(1)
@@ -242,13 +336,8 @@ def _support_map_convex_mesh(
                     improved = 1
                 iteration += 1
 
-    if not accelerated:
-        max_dot = float(-1.0e10)
-        for i in range(mesh.points.shape[0]):
-            dot_val = wp.dot(mesh.points[i], scaled_dir)
-            if dot_val > max_dot:
-                max_dot = dot_val
-                best_idx = i
+    if best_idx < 0:
+        best_idx = _scan_support_index(mesh.points, scaled_dir)
 
     return wp.cw_mul(mesh.points[best_idx], geom.scale)
 
@@ -258,14 +347,7 @@ def _support_map_convex_mesh_exhaustive(geom: GenericShapeData, direction: wp.ve
     """Return convex-mesh support by scanning all vertices."""
     mesh = wp.mesh_get(unpack_mesh_ptr(geom.auxiliary))
     scaled_dir = wp.cw_mul(direction, geom.scale)
-    best_idx = int(0)
-    max_dot = float(-1.0e10)
-    for i in range(mesh.points.shape[0]):
-        dot_val = wp.dot(mesh.points[i], scaled_dir)
-        if dot_val > max_dot:
-            max_dot = dot_val
-            best_idx = i
-    return wp.cw_mul(mesh.points[best_idx], geom.scale)
+    return wp.cw_mul(mesh.points[_scan_support_index(mesh.points, scaled_dir)], geom.scale)
 
 
 @wp.func
@@ -518,9 +600,7 @@ def support_map(geom: GenericShapeData, direction: wp.vec3, data_provider: Any) 
 
 
 @wp.func
-def support_map_heightfield_sphere(
-    geom: GenericShapeData, direction: wp.vec3, data_provider: Any
-) -> wp.vec3:
+def support_map_heightfield_sphere(geom: GenericShapeData, direction: wp.vec3, data_provider: Any) -> wp.vec3:
     """Restrict support dispatch to an admitted heightfield prism/sphere pair."""
     result = wp.vec3(0.0, 0.0, 0.0)
     if geom.shape_type == GeoTypeEx.TRIANGLE_PRISM:
@@ -531,9 +611,7 @@ def support_map_heightfield_sphere(
 
 
 @wp.func
-def support_map_heightfield_capsule(
-    geom: GenericShapeData, direction: wp.vec3, data_provider: Any
-) -> wp.vec3:
+def support_map_heightfield_capsule(geom: GenericShapeData, direction: wp.vec3, data_provider: Any) -> wp.vec3:
     """Restrict support dispatch to an admitted heightfield prism/capsule pair."""
     result = wp.vec3(0.0, 0.0, 0.0)
     if geom.shape_type == GeoTypeEx.TRIANGLE_PRISM:
@@ -544,9 +622,7 @@ def support_map_heightfield_capsule(
 
 
 @wp.func
-def support_map_heightfield_box(
-    geom: GenericShapeData, direction: wp.vec3, data_provider: Any
-) -> wp.vec3:
+def support_map_heightfield_box(geom: GenericShapeData, direction: wp.vec3, data_provider: Any) -> wp.vec3:
     """Restrict support dispatch to an admitted heightfield prism/box pair."""
     result = wp.vec3(0.0, 0.0, 0.0)
     if geom.shape_type == GeoTypeEx.TRIANGLE_PRISM:
@@ -557,9 +633,7 @@ def support_map_heightfield_box(
 
 
 @wp.func
-def support_map_heightfield_cylinder(
-    geom: GenericShapeData, direction: wp.vec3, data_provider: Any
-) -> wp.vec3:
+def support_map_heightfield_cylinder(geom: GenericShapeData, direction: wp.vec3, data_provider: Any) -> wp.vec3:
     """Restrict support dispatch to an admitted heightfield prism/cylinder pair."""
     result = wp.vec3(0.0, 0.0, 0.0)
     if geom.shape_type == GeoTypeEx.TRIANGLE_PRISM:
