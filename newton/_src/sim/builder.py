@@ -15425,7 +15425,6 @@ class ModelBuilder:
                 shape_mesh_boundary_start if shape_mesh_boundary_start else [-1], dtype=wp.int32, device=device
             )
 
-
             # Compact convex support data (one copy per shared geometry).
             shape_support_data = []
             support_lut_chunks = []

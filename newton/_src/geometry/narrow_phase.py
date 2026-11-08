@@ -30,7 +30,6 @@ from ..geometry.collision_core import (
     post_process_axial_on_discrete_contact,
     post_process_minkowski_only,
 )
-from ..geometry.mesh_cells import MeshCells, build_mesh_cells
 from ..geometry.collision_primitive import (
     _collide_capsule_cylinder_barrel,
     _collide_plane_capsule_contacts,
@@ -76,6 +75,7 @@ from ..geometry.heightfield_cylinder import create_heightfield_cylinder_split_ke
 from ..geometry.heightfield_features import HeightfieldFeatureContext, seam_surface_witness
 from ..geometry.heightfield_primitive_contact import ANALYTIC_PRIMITIVE_QUERIES, analytic_primitives_default
 from ..geometry.heightfield_row_gate import HEIGHTFIELD_ROW_COUNT, HEIGHTFIELD_TYPED_ROWS, heightfield_row_gate_kernel
+from ..geometry.mesh_cells import MeshCells, build_mesh_cells
 from ..geometry.mpr import create_solve_mpr, create_support_map_function
 from ..geometry.sdf_contact import (
     MESH_SDF_BLOCK_DIM,
@@ -198,8 +198,6 @@ class ConvexPairQueryData:
     rigid_gap: float
     contact_threshold: float
     enlarge: float
-
-
 
 
 def create_prepare_convex_pair(external_aabb: bool, speculative: bool = False):
