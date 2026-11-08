@@ -1214,6 +1214,9 @@ class Model:
         Bit ``i`` marks the edge opposite face vertex ``i`` and bit ``3 + i`` marks vertex ``i``."""
         self._shape_mesh_boundary_start: wp.array[wp.int32] | None = None
         """Per-shape start into :attr:`_mesh_boundary_flags`, or -1 without boundary bits, shape [shape_count]."""
+        self._mesh_cells = None
+        """The cell index of each collision mesh (:class:`~newton._src.geometry.mesh_cells.MeshCells`), read by the
+        mesh-vs-convex midphase."""
 
         # SDF storage (compact table + per-shape index indirection).
         # All SDF arrays are private; the public attribute names are exposed

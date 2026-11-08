@@ -15425,6 +15425,11 @@ class ModelBuilder:
                 shape_mesh_boundary_start if shape_mesh_boundary_start else [-1], dtype=wp.int32, device=device
             )
 
+            # The cell index of each distinct collision mesh, read by the mesh-vs-convex midphase.
+            from ..geometry.mesh_cells import build_mesh_cells  # noqa: PLC0415
+
+            m._mesh_cells = build_mesh_cells(self.shape_type, geo_sources, device, shape_flags=shape_flags_list)
+
             # Compact convex support data (one copy per shared geometry).
             shape_support_data = []
             support_lut_chunks = []

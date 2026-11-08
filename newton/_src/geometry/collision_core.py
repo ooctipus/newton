@@ -18,6 +18,22 @@ from .collision_convex import (
 )
 from .contact_data import ContactData
 from .flags import MeshProperties
+from .mesh_cells import (
+    MeshCells,
+    MeshCellSlot,
+    MeshQueryBound,
+    mesh_cells_candidate,
+    mesh_cells_slot_overlaps,
+    mesh_cells_box_in_cell,
+    mesh_cells_entry_overlaps,
+    mesh_cells_find,
+    mesh_cells_first_in_range,
+    mesh_cells_key,
+    mesh_cells_key_cell,
+    mesh_cells_range,
+    mesh_query_bound_box,
+    mesh_query_bound_meets_triangle,
+)
 from .support_function import (
     GenericShapeData,
     GeoTypeEx,
@@ -1085,93 +1101,67 @@ def convex_mesh_interior_point(mesh_id: wp.uint64, scale: wp.vec3) -> wp.vec3:
 
 
 @wp.func
-def _query_aabb_to_bvh(
-    lower: wp.vec3,
-    upper: wp.vec3,
+def _mesh_query_bound(
+    convex: GenericShapeData,
     X_mesh_shape: wp.transform,
-    mesh_data: wp.vec4,
     contact_threshold: float,
-    center: wp.vec3,
-) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
-    """Convert scaled mesh-local query bounds to the unscaled mesh-BVH frame.
+) -> MeshQueryBound:
+    """The convex shape's bound in the scaled mesh frame, inflated by ``contact_threshold``.
 
-    Pads the bounds by the world-space contact threshold and maps the shape's
-    interior point ``center`` into the same frame for back-face culling. Both
-    midphase bound builders use this so their query boxes stay identical.
+    The box is the shape's own local box (support extremes along its axes) placed in the mesh frame. Shapes with a
+    symmetry axis also carry the segment-plus-radius that contains them: a sphere's center, a capsule's core, and the
+    axis of a cylinder or cone with its largest radius. A contact needs a triangle within the threshold of the shape,
+    hence inside both. A small relative pad covers float32 rounding; it only admits more triangles.
     """
-    mesh_scale = wp.vec3(mesh_data[0], mesh_data[1], mesh_data[2])
-    lower_bvh, upper_bvh, inv_scale = aabb_to_unscaled(lower, upper, mesh_scale)
-    margin_vec = wp.vec3(
-        contact_threshold / wp.max(wp.abs(mesh_scale[0]), 1.0e-12),
-        contact_threshold / wp.max(wp.abs(mesh_scale[1]), 1.0e-12),
-        contact_threshold / wp.max(wp.abs(mesh_scale[2]), 1.0e-12),
+    local_lower, local_upper = compute_tight_aabb_from_support(
+        convex, wp.quat_identity(), wp.vec3(0.0), SupportMapDataProvider()
     )
-    # Cull against an interior point. A hull's origin and AABB center can
-    # both lie outside it, which discards triangles touching the hull.
-    center_in_bvh = wp.cw_mul(wp.transform_point(X_mesh_shape, center), inv_scale)
-    return lower_bvh - margin_vec, upper_bvh + margin_vec, center_in_bvh
+    rot = wp.quat_to_matrix(wp.transform_get_rotation(X_mesh_shape))
+    pos = wp.transform_get_translation(X_mesh_shape)
+    local_center = 0.5 * (local_lower + local_upper)
+    local_half = 0.5 * (local_upper - local_lower)
+    size = wp.max(wp.max(local_half[0], local_half[1]), local_half[2])
+    reach = wp.max(wp.max(wp.abs(pos[0]), wp.abs(pos[1])), wp.abs(pos[2])) + size + contact_threshold
+    pad = contact_threshold + 4.0e-6 * reach
 
-
-@wp.func
-def _compute_mesh_vs_convex_query_aabb(
-    mesh_shape: int,
-    non_mesh_shape: int,
-    X_mesh_ws: wp.transform,
-    X_ws: wp.transform,
-    shape_type: wp.array[int],
-    shape_data: wp.array[wp.vec4],
-    shape_source_ptr: wp.array[wp.uint64],
-    contact_threshold: float,
-    non_mesh_center: wp.vec3,
-) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
-    """Compute unscaled mesh-BVH bounds for a convex shape."""
-    X_mesh_sw = wp.transform_inverse(X_mesh_ws)
-    X_mesh_shape = wp.transform_multiply(X_mesh_sw, X_ws)
-    pos_in_mesh = wp.transform_get_translation(X_mesh_shape)
-    orientation_in_mesh = wp.transform_get_rotation(X_mesh_shape)
-
-    geo_type = shape_type[non_mesh_shape]
-    data_vec4 = shape_data[non_mesh_shape]
-    scale = wp.vec3(data_vec4[0], data_vec4[1], data_vec4[2])
-
-    generic_shape_data = GenericShapeData()
-    generic_shape_data.shape_type = geo_type
-    generic_shape_data.scale = scale
-    generic_shape_data.auxiliary = wp.vec3(0.0, 0.0, 0.0)
-    generic_shape_data.center = wp.vec3(0.0, 0.0, 0.0)
-    if geo_type == GeoType.CONVEX_MESH:
-        generic_shape_data.auxiliary = pack_mesh_ptr(shape_source_ptr[non_mesh_shape])
-
-    data_provider = SupportMapDataProvider()
-    # Support bounds use the scaled mesh-local frame.
-    aabb_lower, aabb_upper = compute_tight_aabb_from_support(
-        generic_shape_data, orientation_in_mesh, pos_in_mesh, data_provider
-    )
-
-    return _query_aabb_to_bvh(
-        aabb_lower, aabb_upper, X_mesh_shape, shape_data[mesh_shape], contact_threshold, non_mesh_center
-    )
+    bound = MeshQueryBound()
+    bound.center = pos + rot * local_center
+    bound.axes = rot
+    bound.half = local_half + wp.vec3(pad)
+    bound.has_segment = False
+    shape = convex.shape_type
+    if shape == GeoType.SPHERE or shape == GeoType.CAPSULE or shape == GeoType.CYLINDER or shape == GeoType.CONE:
+        half_length = float(0.0)
+        radius = local_half[0]
+        if shape == GeoType.CAPSULE:
+            half_length = convex.scale[1]
+            radius = convex.scale[0]
+        elif shape != GeoType.SPHERE:
+            half_length = local_half[2]
+        axis = wp.vec3(rot[0, 2], rot[1, 2], rot[2, 2])
+        bound.seg_a = bound.center - half_length * axis
+        bound.seg_b = bound.center + half_length * axis
+        bound.radius = radius + pad
+        bound.has_segment = True
+    return bound
 
 
 @wp.func
 def _mesh_triangle_is_front_facing_local(
     mesh_id: wp.uint64,
     center_in_bvh: wp.vec3,
-    tri_idx: int,
+    v0: wp.vec3,
+    v1: wp.vec3,
+    v2: wp.vec3,
     watertight: bool,
     convex: GenericShapeData,
     convex_in_mesh: wp.transform,
     mesh_scale: wp.vec3,
 ) -> bool:
-    """Preserve one-sided sheets; recover straddling nearest faces of closed meshes."""
-    mesh = wp.mesh_get(mesh_id)
-    idx0 = mesh.indices[tri_idx * 3 + 0]
-    idx1 = mesh.indices[tri_idx * 3 + 1]
-    idx2 = mesh.indices[tri_idx * 3 + 2]
+    """Preserve one-sided sheets; recover straddling nearest faces of closed meshes.
 
-    v0 = mesh.points[idx0]
-    v1 = mesh.points[idx1]
-    v2 = mesh.points[idx2]
+    ``v0``, ``v1``, ``v2`` are the triangle's vertices in the unscaled mesh frame (the mesh's own points).
+    """
     face_normal = wp.cross(v1 - v0, v2 - v0)
     center_dist = wp.dot(face_normal, center_in_bvh - v0)
     if center_dist >= 0.0:
@@ -1207,50 +1197,153 @@ def _mesh_triangle_is_front_facing_local(
 
 
 @wp.func
-def _compute_mesh_vs_hull_query_aabb_tiled(
+def mesh_vs_convex_pair_shapes(pair: wp.vec2i, shape_type: wp.array[int]) -> tuple[int, int]:
+    """The ``(mesh, convex)`` shapes of a mesh-like pair, or ``(-1, -1)`` when it is not mesh-vs-convex."""
+    type_a = shape_type[pair[0]]
+    type_b = shape_type[pair[1]]
+    if type_a == GeoType.MESH and type_b != GeoType.MESH:
+        return pair[0], pair[1]
+    if type_b == GeoType.MESH and type_a != GeoType.MESH:
+        return pair[1], pair[0]
+    return -1, -1
+
+
+@wp.func
+def _mesh_vs_convex_shape_data(
+    non_mesh_shape: int,
+    shape_type: wp.array[int],
+    shape_data: wp.array[wp.vec4],
+    shape_source_ptr: wp.array[wp.uint64],
+) -> GenericShapeData:
+    convex = GenericShapeData()
+    convex.shape_type = shape_type[non_mesh_shape]
+    convex_scale = shape_data[non_mesh_shape]
+    convex.scale = wp.vec3(convex_scale[0], convex_scale[1], convex_scale[2])
+    if convex.shape_type == int(GeoType.CONVEX_MESH):
+        convex.auxiliary = pack_mesh_ptr(shape_source_ptr[non_mesh_shape])
+    return convex
+
+
+@wp.func
+def mesh_vs_convex_query_box(
     mesh_shape: int,
-    hull_shape: int,
+    non_mesh_shape: int,
     X_mesh_ws: wp.transform,
     X_ws: wp.transform,
+    shape_type: wp.array[int],
     shape_data: wp.array[wp.vec4],
     shape_source_ptr: wp.array[wp.uint64],
     contact_threshold: float,
-    hull_center: wp.vec3,
-    lane: int,
-) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
-    """Compute :func:`_compute_mesh_vs_convex_query_aabb` bounds for a hull with all block threads.
+) -> tuple[wp.vec3, wp.vec3]:
+    """The box, in the mesh's unscaled frame, of the convex shape's midphase bound (:func:`_mesh_query_bound`).
 
-    Every thread of the block must call this for the same pair. Min and max
-    reductions are order independent, so the bounds match the serial scan.
+    Padded past the float32 rounding of the cell coordinates (relative to the coordinates' size).
     """
-    X_mesh_shape = wp.transform_multiply(wp.transform_inverse(X_mesh_ws), X_ws)
-    pos_in_mesh = wp.transform_get_translation(X_mesh_shape)
-    rot_mat_t = wp.transpose(wp.quat_to_matrix(wp.transform_get_rotation(X_mesh_shape)))
-    data_vec4 = shape_data[hull_shape]
-    scale = wp.vec3(data_vec4[0], data_vec4[1], data_vec4[2])
-    # Pre-scale axes: dot(local_axis, scale*v) == dot(scale*local_axis, v)
-    scaled_x = wp.cw_mul(wp.vec3(rot_mat_t[0, 0], rot_mat_t[1, 0], rot_mat_t[2, 0]), scale)
-    scaled_y = wp.cw_mul(wp.vec3(rot_mat_t[0, 1], rot_mat_t[1, 1], rot_mat_t[2, 1]), scale)
-    scaled_z = wp.cw_mul(wp.vec3(rot_mat_t[0, 2], rot_mat_t[1, 2], rot_mat_t[2, 2]), scale)
-    mesh = wp.mesh_get(shape_source_ptr[hull_shape])
-    lower = wp.vec3(1.0e10)
-    upper = wp.vec3(-1.0e10)
-    for i in range(lane, mesh.points.shape[0], wp.block_dim()):
-        p = mesh.points[i]
-        projection = wp.vec3(wp.dot(p, scaled_x), wp.dot(p, scaled_y), wp.dot(p, scaled_z))
-        lower = wp.min(lower, projection)
-        upper = wp.max(upper, projection)
-    lower = wp.tile_reduce(wp.min, wp.tile(lower, preserve_type=True))[0] + pos_in_mesh
-    upper = wp.tile_reduce(wp.max, wp.tile(upper, preserve_type=True))[0] + pos_in_mesh
+    convex = _mesh_vs_convex_shape_data(non_mesh_shape, shape_type, shape_data, shape_source_ptr)
+    convex_in_mesh = wp.transform_multiply(wp.transform_inverse(X_mesh_ws), X_ws)
+    bound = _mesh_query_bound(convex, convex_in_mesh, contact_threshold)
+    lower, upper = mesh_query_bound_box(bound)
+    mesh_data = shape_data[mesh_shape]
+    lower_bvh, upper_bvh, _inv_scale = aabb_to_unscaled(lower, upper, wp.vec3(mesh_data[0], mesh_data[1], mesh_data[2]))
+    reach = wp.max(wp.max(wp.abs(lower_bvh[0]), wp.abs(lower_bvh[1])), wp.abs(lower_bvh[2]))
+    reach = wp.max(reach, wp.max(wp.max(wp.abs(upper_bvh[0]), wp.abs(upper_bvh[1])), wp.abs(upper_bvh[2])))
+    pad = wp.vec3(1.0e-5 * (reach + (upper_bvh[0] - lower_bvh[0]) + 1.0e-3))
+    return lower_bvh - pad, upper_bvh + pad
 
-    return _query_aabb_to_bvh(lower, upper, X_mesh_shape, shape_data[mesh_shape], contact_threshold, hull_center)
+
+@wp.func
+def mesh_vs_convex_query_range(
+    mesh_cells: MeshCells, grid_index: int, query_lower: wp.vec3, query_upper: wp.vec3
+) -> tuple[wp.vec3i, wp.vec3i, bool]:
+    """The level-0 cell range under a query box (:func:`mesh_cells_range`), padded for the grid origin's rounding."""
+    grid = mesh_cells.grids[grid_index]
+    origin_size = wp.max(wp.max(wp.abs(grid.origin[0]), wp.abs(grid.origin[1])), wp.abs(grid.origin[2]))
+    pad = wp.vec3(1.0e-5 * (origin_size + grid.cell))
+    return mesh_cells_range(grid, query_lower - pad, query_upper + pad)
+
+
+@wp.func
+def mesh_vs_convex_cell_candidates(
+    lane: int,
+    lanes: int,
+    pair_index: int,
+    grid_index: int,
+    query_lower: wp.vec3,
+    query_upper: wp.vec3,
+    lo0: wp.vec3i,
+    hi0: wp.vec3i,
+    mesh_cells: MeshCells,
+    candidates: wp.array[wp.vec4i],
+    candidate_count: wp.array[int],
+):
+    """Append a candidate (:func:`mesh_cells_candidate`) for each triangle met in the cells of the query's range.
+
+    At every occupied level of the mesh's index, the cells of the level-0 range ``[lo0, hi0]`` are looked up, or the
+    level's occupied cells walked when they are fewer. A cell whose triangles' box misses the query box
+    ``[query_lower, query_upper]`` (unscaled mesh frame) is skipped whole; a triangle is a candidate when its own box
+    overlaps the query box. A triangle met in several cells is a candidate in each; the exact pass keeps its first.
+    ``lanes`` threads share the pair; each takes every ``lanes``-th cell.
+    """
+    grid = mesh_cells.grids[grid_index]
+    visited = int(0)
+    for level in range(16):
+        if (grid.levels >> level) & 1 == 0:
+            continue
+        qlo = wp.vec3i(lo0[0] >> level, lo0[1] >> level, lo0[2] >> level)
+        qhi = wp.vec3i(hi0[0] >> level, hi0[1] >> level, hi0[2] >> level)
+        nx = qhi[0] - qlo[0] + 1
+        ny = qhi[1] - qlo[1] + 1
+        nz = qhi[2] - qlo[2] + 1
+        list_start = mesh_cells.level_start[grid.level_start + level]
+        list_count = mesh_cells.level_start[grid.level_start + level + 1] - list_start
+        # Look the range's cells up, or walk the level's occupied cells when they are fewer.
+        by_list = float(nx) * float(ny) * float(nz) > float(list_count)
+        n = list_count
+        if not by_list:
+            n = nx * ny * nz
+        size = grid.cell * float(1 << level)
+        inv_size = grid.inv_cell / float(1 << level)
+        k = ((lane - visited) % lanes + lanes) % lanes
+        while k < n:
+            cell = wp.vec3i(0)
+            slot = MeshCellSlot()
+            slot.count = 0
+            if by_list:
+                slot = mesh_cells.sorted_slots[list_start + k]
+                cell = mesh_cells_key_cell(slot.key)
+                if (
+                    cell[0] < qlo[0]
+                    or cell[0] > qhi[0]
+                    or cell[1] < qlo[1]
+                    or cell[1] > qhi[1]
+                    or cell[2] < qlo[2]
+                    or cell[2] > qhi[2]
+                ):
+                    slot.count = 0
+            else:
+                cell = wp.vec3i(qlo[0] + k % nx, qlo[1] + (k // nx) % ny, qlo[2] + k // (nx * ny))
+                slot = mesh_cells_find(mesh_cells, grid, mesh_cells_key(level, cell[0], cell[1], cell[2]))
+            if slot.count > 0:
+                cell_lower = grid.origin + size * wp.vec3(float(cell[0]), float(cell[1]), float(cell[2]))
+                if mesh_cells_slot_overlaps(slot, query_lower, query_upper, cell_lower, inv_size):
+                    box_lo, box_hi = mesh_cells_box_in_cell(query_lower, query_upper, cell_lower, inv_size)
+                    for e in range(slot.start, slot.start + slot.count):
+                        entry = mesh_cells.entries[e]
+                        if mesh_cells_entry_overlaps(entry, box_lo, box_hi):
+                            out = wp.atomic_add(candidate_count, 0, 1)
+                            if out < candidates.shape[0]:
+                                candidates[out] = mesh_cells_candidate(pair_index, entry[0], level, cell)
+            k += lanes
+        visited += n
 
 
 @wp.func
 def mesh_vs_convex_midphase(
-    idx_in_thread_block: int,
     mesh_shape: int,
     non_mesh_shape: int,
+    candidate: wp.vec4i,
+    lo0: wp.vec3i,
+    hi0: wp.vec3i,
     X_mesh_ws: wp.transform,
     X_ws: wp.transform,
     mesh_id: wp.uint64,
@@ -1260,106 +1353,79 @@ def mesh_vs_convex_midphase(
     shape_mesh_properties: wp.array[wp.int32],
     contact_threshold: float,
     non_mesh_center: wp.vec3,
+    mesh_cells: MeshCells,
     triangle_pairs: wp.array[wp.vec3i],
     triangle_pairs_count: wp.array[int],
 ):
     """
-    Perform mesh vs convex shape midphase collision detection.
+    Finish the mesh vs convex shape midphase for one candidate triangle of a pair.
 
-    This function finds all mesh triangles that overlap with the convex shape's AABB
-    by querying the mesh BVH. The results are output as triangle pairs for further
-    narrow-phase collision detection.
+    The candidates come from the mesh's cell index (:func:`mesh_vs_convex_cell_candidates`): every triangle whose
+    box overlaps the shape's bound box, in each cell of the query's range it was met in. A candidate is kept from the
+    triangle's first registered cell in that range only (the reference-cell rule), when it meets the shape's bound
+    exactly (an oriented box, and a segment plus a radius for spheres, capsules, cylinders and cones, all inflated by
+    the threshold) and faces the shape. Kept triangles are appended to the triangle pairs of the triangle narrow
+    phase.
 
     Args:
-        idx_in_thread_block: Lane index within the mesh-query thread block
         mesh_shape: Index of the mesh shape
         non_mesh_shape: Index of the non-mesh (convex) shape
+        candidate: The candidate (:func:`mesh_cells_candidate`)
+        lo0: The pair's level-0 cell range, lower corner
+        hi0: The pair's level-0 cell range, upper corner
         X_mesh_ws: Mesh world-space transform
         X_ws: Non-mesh shape world-space transform
-        mesh_id: Mesh BVH ID
+        mesh_id: Mesh ID
         shape_type: Array of shape types
         shape_data: Array of shape data (vec4: scale.xyz, margin.w)
         shape_source_ptr: Array of mesh/SDF source pointers
         shape_mesh_properties: Per-shape watertightness metadata
         contact_threshold: Contact candidate distance [m], including margin and gap
         non_mesh_center: Interior point of the convex shape in its scaled local frame [m]
+        mesh_cells: The scene's mesh cell indices
         triangle_pairs: Output array for triangle pairs (mesh_shape, non_mesh_shape, tri_index)
         triangle_pairs_count: Counter for triangle pairs
     """
-    aabb_lower = wp.vec3(0.0)
-    aabb_upper = wp.vec3(0.0)
-    center_in_bvh = wp.vec3(0.0)
+    grid = mesh_cells.grids[mesh_cells.shape_grid[mesh_shape]]
+    tri_index = candidate[1]
+    triangle = mesh_cells.triangles[grid.triangle_start + tri_index]
+    level = candidate[3] >> 15
+    cell = wp.vec3i(candidate[2] & 0x7FFF, (candidate[2] >> 15) & 0x7FFF, candidate[3] & 0x7FFF)
+    qlo = wp.vec3i(lo0[0] >> level, lo0[1] >> level, lo0[2] >> level)
+    qhi = wp.vec3i(hi0[0] >> level, hi0[1] >> level, hi0[2] >> level)
+    if not mesh_cells_first_in_range(triangle.registration, cell, qlo, qhi):
+        return
     watertight = (shape_mesh_properties[mesh_shape] & MeshProperties.WATERTIGHT) != 0
-    convex = GenericShapeData()
-    convex.shape_type = shape_type[non_mesh_shape]
-    convex_scale = shape_data[non_mesh_shape]
-    convex.scale = wp.vec3(convex_scale[0], convex_scale[1], convex_scale[2])
-    if convex.shape_type == int(GeoType.CONVEX_MESH):
-        convex.auxiliary = pack_mesh_ptr(shape_source_ptr[non_mesh_shape])
+    convex = _mesh_vs_convex_shape_data(non_mesh_shape, shape_type, shape_data, shape_source_ptr)
     convex_in_mesh = wp.transform_multiply(wp.transform_inverse(X_mesh_ws), X_ws)
     mesh_data = shape_data[mesh_shape]
     mesh_scale = wp.vec3(mesh_data[0], mesh_data[1], mesh_data[2])
-    if shape_type[non_mesh_shape] == GeoType.CONVEX_MESH:
-        # A hull's bounds scan every vertex; split that scan across the block.
-        aabb_lower, aabb_upper, center_in_bvh = _compute_mesh_vs_hull_query_aabb_tiled(
-            mesh_shape,
-            non_mesh_shape,
-            X_mesh_ws,
-            X_ws,
-            shape_data,
-            shape_source_ptr,
-            contact_threshold,
-            non_mesh_center,
-            idx_in_thread_block,
-        )
-    else:
-        # All lanes query the same pair, so compute the bounds once per block.
-        if idx_in_thread_block == 0:
-            aabb_lower, aabb_upper, center_in_bvh = _compute_mesh_vs_convex_query_aabb(
-                mesh_shape,
-                non_mesh_shape,
-                X_mesh_ws,
-                X_ws,
-                shape_type,
-                shape_data,
-                shape_source_ptr,
-                contact_threshold,
-                non_mesh_center,
-            )
-        bounds = wp.mat33(
-            aabb_lower[0],
-            aabb_lower[1],
-            aabb_lower[2],
-            aabb_upper[0],
-            aabb_upper[1],
-            aabb_upper[2],
-            center_in_bvh[0],
-            center_in_bvh[1],
-            center_in_bvh[2],
-        )
-        bounds_tile = wp.tile_zeros(shape=(1,), dtype=wp.mat33, storage="shared")
-        wp.tile_scatter_masked(bounds_tile, 0, bounds, idx_in_thread_block == 0)
-        bounds = wp.tile_extract(bounds_tile, 0)
-        aabb_lower = wp.vec3(bounds[0, 0], bounds[0, 1], bounds[0, 2])
-        aabb_upper = wp.vec3(bounds[1, 0], bounds[1, 1], bounds[1, 2])
-        center_in_bvh = wp.vec3(bounds[2, 0], bounds[2, 1], bounds[2, 2])
-
-    # Query mesh BVH for overlapping triangles in mesh local space using tiled version
-    query = wp.tile_mesh_query_aabb(mesh_id, aabb_lower, aabb_upper)
-
-    while wp.tile_query_valid(query):
-        result_tile = wp.tile_mesh_query_aabb_next(query)
-        tri_index = wp.untile(result_tile)
-        if tri_index >= 0 and not _mesh_triangle_is_front_facing_local(
-            mesh_id, center_in_bvh, tri_index, watertight, convex, convex_in_mesh, mesh_scale
-        ):
-            tri_index = -1
-
-        # Pair order is unconstrained; append without a block-wide scan and broadcast.
-        if tri_index >= 0:
-            out_idx = wp.atomic_add(triangle_pairs_count, 0, 1)
-            if out_idx < triangle_pairs.shape[0]:
-                triangle_pairs[out_idx] = wp.vec3i(mesh_shape, non_mesh_shape, tri_index)
+    bound = _mesh_query_bound(convex, convex_in_mesh, contact_threshold)
+    if not mesh_query_bound_meets_triangle(
+        bound,
+        wp.cw_mul(triangle.v0, mesh_scale),
+        wp.cw_mul(triangle.v1, mesh_scale),
+        wp.cw_mul(triangle.v2, mesh_scale),
+    ):
+        return
+    _lower, _upper, inv_scale = aabb_to_unscaled(wp.vec3(0.0), wp.vec3(0.0), mesh_scale)
+    center_in_bvh = wp.cw_mul(wp.transform_point(convex_in_mesh, non_mesh_center), inv_scale)
+    if not _mesh_triangle_is_front_facing_local(
+        mesh_id,
+        center_in_bvh,
+        triangle.v0,
+        triangle.v1,
+        triangle.v2,
+        watertight,
+        convex,
+        convex_in_mesh,
+        mesh_scale,
+    ):
+        return
+    # Pair order is unconstrained; append without a scan.
+    out_idx = wp.atomic_add(triangle_pairs_count, 0, 1)
+    if out_idx < triangle_pairs.shape[0]:
+        triangle_pairs[out_idx] = wp.vec3i(mesh_shape, non_mesh_shape, tri_index)
 
 
 @wp.func

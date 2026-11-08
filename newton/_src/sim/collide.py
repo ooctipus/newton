@@ -5408,6 +5408,7 @@ class CollisionPipeline:
             heightfield_elevations=model.heightfield_elevations,
             mesh_edge_indices=model._mesh_edge_indices,
             shape_edge_range=model._shape_edge_range,
+            mesh_cells=model._mesh_cells,
             writer_data=writer_data,
             device=self.device,
             **narrow_phase_extension_kwargs,

@@ -2289,6 +2289,7 @@ def convert_geometries(
         interior_point=model._shape_interior_point,
         mesh_boundary_flags=model._mesh_boundary_flags,
         mesh_boundary_start=model._shape_mesh_boundary_start,
+        mesh_cells=model._mesh_cells,
         voxel_resolution=model._shape_voxel_resolution,
         collision_radius=model.shape_collision_radius,
     )

@@ -224,6 +224,9 @@ class GeometriesModel:
     mesh_boundary_start: wp.array[wp.int32] | None = None
     """Per-shape start into :attr:`mesh_boundary_flags`, or ``-1`` without boundary bits."""
 
+    mesh_cells: object | None = None
+    """The collision meshes' cell index (:class:`~newton._src.geometry.mesh_cells.MeshCells`) for the midphase."""
+
     collision_radius: wp.array[wp.float32] | None = None
     """Per-shape bounding-sphere radius for broadphase AABB computation."""
 
