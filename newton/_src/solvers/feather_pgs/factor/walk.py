@@ -1593,16 +1593,20 @@ _INWARD = """    // The refresh by the tree's lane group (walk_group): the lane 
         float c[3], mc[3];
         for (int a = 0; a < 3; ++a) c[a] = Lc[3 * j + a] - l[$link_frame + a];
         for (int a = 0; a < 3; ++a) mc[a] = m * c[a];
-        // R I R^T - m X X, X the skew of c: -m X X = m (|c|^2 1 - c c^T).
+        // R I R^T - m X X, X the skew of c: -m X X = m (|c|^2 1 - c c^T), its diagonal taken as the other two axes'
+        // squares, m (c_b^2 + c_c^2). Formed as |c|^2 - c_a^2, it cancels along the lever and rounds away a moment
+        // under half an ulp of m |c|^2: a thin body's axial pivot, which the walk keeps positive, would read zero.
         float RI[3][3];
         for (int a = 0; a < 3; ++a)
             for (int e = 0; e < 3; ++e) RI[a][e] = R[a][0] * I[e] + R[a][1] * I[3 + e] + R[a][2] * I[6 + e];
-        const float cc = c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
         r[M] = m;
         for (int a = 0; a < 3; ++a) r[MC + a] = mc[a];
         for (int a = 0; a < 3; ++a)
-            for (int e = a; e < 3; ++e)
-                r[ROT + SYM(a, e)] = (RI[a][0] * R[e][0] + RI[a][1] * R[e][1] + RI[a][2] * R[e][2]) + mc[a] * -c[e] + (a == e ? m * cc : 0.0f);
+            for (int e = a; e < 3; ++e) {
+                const float shift = a == e ? m * (c[(a + 1) % 3] * c[(a + 1) % 3] + c[(a + 2) % 3] * c[(a + 2) % 3])
+                                           : mc[a] * -c[e];
+                r[ROT + SYM(a, e)] = (RI[a][0] * R[e][0] + RI[a][1] * R[e][1] + RI[a][2] * R[e][2]) + shift;
+            }
     };
     // h = body + h (carrying) or h = body.
     const auto ADD = [&](float* h, const float* r, bool carrying) {
