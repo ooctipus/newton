@@ -885,17 +885,21 @@ class ContactPool:
         device: The device of the buffers.
         rows: Initial ready rows; defaults to :data:`MIN_READY_ROWS`. Fewer rows also lower the floor a trim
             stops at to them: a model whose pairs can make fewer contacts holds no more.
+        capacity: The rows consumers sized their per-contact scratch by (``model.rigid_contact_max``), or ``None``.
+            :meth:`settle` publishes no rows past it; only demand grows the rows further.
         worlds: The worlds whose contacts the rows hold, each with a status of the contacts it dropped
             (:meth:`drops`); contacts of no world, or between two global shapes, share one more.
     """
 
-    def __init__(self, *, device, rows: int | None = None, worlds: int = 0):
+    def __init__(self, *, device, rows: int | None = None, capacity: int | None = None, worlds: int = 0):
         self.device = wp.get_device(device)
         self.world_count = max(int(worlds), 0)
         """The worlds whose dropped contacts :meth:`drops` reports one by one."""
         self.ready = MIN_READY_ROWS if rows is None else max(int(rows), 0)
         self.floor = min(MIN_READY_ROWS, self.ready)
         """The fewest ready rows a trim keeps: :data:`MIN_READY_ROWS`, or the initial rows when fewer."""
+        self.capacity = None if capacity is None else max(int(capacity), 0)
+        """The rows consumers sized their scratch by; :meth:`settle` publishes no rows past it."""
         # Queried once: the bound is recomputed when members are added, possibly during capture.
         self._device_memory = int(self.device.total_memory) if self.device.is_cuda else 0
         self._members: list[weakref.ReferenceType] = []
@@ -1087,12 +1091,16 @@ class ContactPool:
         instead of dropping contacts. Owners call this once their members exist
         (:meth:`newton.CollisionPipeline.contacts`, :meth:`service`); a member
         created later maps as many rows. A buffer sized explicitly keeps its
-        rows until it grows. Followers follow.
+        rows until it grows, and no rows past :attr:`capacity` are published, so a
+        consumer sized by it receives more only when the demand needs them.
+        Followers follow.
         """
         members = self._live_members()
         if not members or capturing(self.device):
             return
         covered = min(member.covered_rows() for member in members)
+        if self.capacity is not None:
+            covered = min(covered, max(self.capacity, self.ready))
         if covered <= self.ready:
             return
         for member in members:
@@ -1935,7 +1943,8 @@ def model_contact_pool(model, device=None, capacity: int | None = None) -> Conta
         capacity: The rigid contact capacity the creating pipeline resolved (``model.rigid_contact_max``). A new
             pool starts at :data:`MIN_READY_ROWS` rows, or at this capacity when it is smaller, so a consumer that
             sized its per-contact scratch by the capacity, as :class:`~newton.solvers.SolverSteel` does, receives
-            no more rows than it holds until the demand itself needs them.
+            no more rows than it holds until the demand itself needs them, also where CUDA virtual memory maps
+            whole granules (:meth:`ContactPool.settle`).
     """
     device = wp.get_device(device if device is not None else model.device)
     rows = None if capacity is None else min(MIN_READY_ROWS, max(int(capacity), 0))
@@ -1943,8 +1952,10 @@ def model_contact_pool(model, device=None, capacity: int | None = None) -> Conta
         pools = _MODEL_POOLS.setdefault(model, {})
     except TypeError:
         # A model that cannot be weakly referenced keeps a pool per owner.
-        return ContactPool(device=device, rows=rows, worlds=getattr(model, "world_count", 0))
+        return ContactPool(device=device, rows=rows, capacity=capacity, worlds=getattr(model, "world_count", 0))
     pool = pools.get(device.alias)
     if pool is None:
-        pool = pools[device.alias] = ContactPool(device=device, rows=rows, worlds=getattr(model, "world_count", 0))
+        pool = pools[device.alias] = ContactPool(
+            device=device, rows=rows, capacity=capacity, worlds=getattr(model, "world_count", 0)
+        )
     return pool
