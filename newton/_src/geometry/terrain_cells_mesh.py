@@ -1186,6 +1186,31 @@ def _classify_cells(
                 gext[g, e] = wp.min(gext[g, e], inc_ext[i][e])
             else:
                 gext[g, e] = wp.max(gext[g, e], inc_ext[i][e])
+    # A group's corner at a mesh vertex takes that vertex's height bit for bit (the first member in triangle order with
+    # a vertex there): its plane evaluated there rounds (a height of 0 becomes 5.6e-17, a float32 height its neighbour).
+    grouped = plane
+    exact = int(0)
+    for p in range(i0, i1):
+        i = order[p]
+        if inc_kind[i] != _INC_FACE or tri_class[inc_tri[i]] != _UP or buried[i] == 1:
+            continue
+        g = _group_of(grouped, nplanes, inc_corner[i])
+        if g < 0:
+            continue
+        tv = triangles[inc_tri[i]]
+        for j in range(3):
+            v = vs[tv[j]]
+            for q in range(4):
+                cx = bx0
+                cy = by0
+                if q == 1 or q == 3:
+                    cx = bx0 + lat.dx
+                if q >= 2:
+                    cy = by0 + lat.dy
+                bit = 1 << (4 * g + q)
+                if (exact & bit) == 0 and wp.abs(v[0] - cx) <= tol and wp.abs(v[1] - cy) <= tol:
+                    exact = exact | bit
+                    plane[g, q] = v[2]
     kind = int(_EMPTY)
     diag = int(0)
     z = wp.vec4d()
@@ -2225,3 +2250,4 @@ def terrain_mesh_cells_qualify(table: TerrainMeshCells, triangle_count: int) -> 
         f"lattice share {share:.1%}, table {size / 2**20:.1f} MiB <= BVH {bvh / 2**20:.1f} MiB; "
         f"law cells {law / ncell:.2%}, mixed {counts['mixed'] / ncell:.2%}"
     )
+

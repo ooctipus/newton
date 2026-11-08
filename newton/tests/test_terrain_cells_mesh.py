@@ -113,6 +113,22 @@ class TestTerrainCellsMesh(unittest.TestCase):
         self.assertEqual(report["reproduced"], f.shape[0])
         self.assertLessEqual(report["max_height_error_ulp"], 4.0)
 
+    def test_planar_cells_copy_their_vertex_heights(self):
+        """Quantized heights (exact zeros, planar cells, ramps): every corner is its mesh vertex's height bit for bit.
+
+        A planar cell's plane evaluated at a corner of its other triangle rounds (a height of 0 became 5.6e-17, a
+        float32 height its neighbour), which gave a heightfield's cells records of their own.
+        """
+        rng = np.random.default_rng(6)
+        heights = (np.round(rng.uniform(0.0, 0.1, (12, 9)) / 0.005) * 0.005).astype(np.float32)
+        heights[:4, :4] = 0.0
+        heights[6:, :] = (0.0137 * np.arange(9, dtype=np.float32))[None, :] + np.float32(0.03)
+        v, f = _heightfield_mesh(heights, origin=(-1.6, -1.6))
+        table, report = self._verified(v, f)
+        np.testing.assert_array_equal(table.vertex_z, heights.T)
+        self.assertEqual(table.record_z.shape[0], 0)
+        self.assertLessEqual(report["max_height_error_ulp"], 2.0)
+
     def test_other_diagonal(self):
         rng = np.random.default_rng(3)
         v, f = _heightfield_mesh(rng.uniform(0.0, 0.3, (5, 5)).astype(np.float32), diagonal=1)
