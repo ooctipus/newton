@@ -3,10 +3,9 @@
 
 """Closed-form sphere-vs-heightfield-prism contact.
 
-The typed heightfield sphere query shrank the sphere to a 0.1 mm proxy and
-ran MPR, GJK, the prism penetration refiner and the single-contact writer for
-every (sphere, triangle) pair. For a sphere all of that reduces to the distance
-from its center to the triangle prism, which this module evaluates directly:
+For a sphere the generic MPR/GJK query, the prism penetration refiner and the
+single-contact writer reduce to the distance from its center to the triangle
+prism, which this module evaluates directly:
 
 * center above the triangle plane: the nearest point on the prism, which is
   the nearest point on the triangle when the center projects onto its face
@@ -15,9 +14,10 @@ from its center to the triangle prism, which this module evaluates directly:
 * center inside the prism: the top-face normal with the plane depth, exactly
   the result of the triangle-prism penetration refiner.
 
-The emitted :class:`ContactData` keeps the proxy radius so that every field,
-including the 0.1 mm witness bias of the generic query, is reproduced and the
-reducer, export and solver see the same contacts.
+The emitted :class:`ContactData` is the generic query's for the true sphere
+surface: the generic query's core sphere (``MINKOWSKI_CORE_RADIUS``) cancels
+from its distance, witness midpoint and normal, so the reducer, export and
+solver see the same contacts.
 """
 
 from __future__ import annotations
@@ -32,9 +32,6 @@ from .support_function import (
     GenericShapeData,
     closest_point_on_triangle,
 )
-
-PROXY_RADIUS = 1.0e-4
-"""Sphere proxy radius of the generic query (``small_radius`` in ``create_compute_gjk_mpr_contacts``)."""
 
 _ADMISSION_SLACK = 1.0e-4
 """Separation beyond the query threshold at which a pair is dropped without consulting the writer."""
@@ -132,6 +129,59 @@ def point_prism_query(c: wp.vec3, e1: wp.vec3, e2: wp.vec3, n: wp.vec3, reach: f
     return best, direction, d
 
 
+def create_point_prism_writer(writer_func: Any, query_filter: Any = None):
+    """Create the writer of one sphere-swept point's contact from its prism query.
+
+    The point ``p`` carries a sphere of ``radius``; ``point_a``, the outward ``normal``
+    and the signed distance ``d`` of ``p`` are :func:`point_prism_query`'s. Sphere
+    rows write their center and capsule rows each axis point through it.
+    """
+    has_query_filter = query_filter is not None
+
+    @wp.func
+    def write_point_contact(
+        p: wp.vec3,
+        point_a: wp.vec3,
+        normal: wp.vec3,
+        d: float,
+        threshold: float,
+        radius: float,
+        rot_a: wp.quat,
+        pos_a: wp.vec3,
+        prism: GenericShapeData,
+        margin_a: float,
+        margin_b: float,
+        shape_a: int,
+        shape_b: int,
+        rigid_gap: float,
+        sort_sub_key: int,
+        writer_data: Any,
+        query_context: Any,
+    ):
+        if d > threshold + _ADMISSION_SLACK:
+            return
+        if wp.static(has_query_filter):
+            if d >= 0.0 and not query_filter(prism, point_a, normal, query_context):
+                return
+        normal_ws = wp.quat_rotate(rot_a, normal)
+        contact = ContactData()
+        contact.radius_eff_a = 0.0
+        contact.radius_eff_b = radius
+        contact.margin_a = margin_a
+        contact.margin_b = margin_b
+        contact.shape_a = shape_a
+        contact.shape_b = shape_b
+        contact.gap_sum = rigid_gap
+        contact.sort_sub_key = sort_sub_key
+        # The midpoint of the prism point and the sphere surface point.
+        contact.contact_point_center = wp.quat_rotate(rot_a, 0.5 * (point_a + p)) + pos_a - normal_ws * (radius * 0.5)
+        contact.contact_normal_a_to_b = normal_ws
+        contact.contact_distance = d - radius
+        writer_func(contact, writer_data, -1)
+
+    return write_point_contact
+
+
 def create_sphere_prism_contacts(writer_func: Any, query_filter: Any = None):
     """Create the closed-form sphere-vs-prism query with the signature of ``compute_gjk_mpr_contacts``.
 
@@ -140,7 +190,7 @@ def create_sphere_prism_contacts(writer_func: Any, query_filter: Any = None):
         query_filter: Optional predicate for nonnegative-distance witnesses, as
             accepted by :func:`create_compute_gjk_mpr_contacts`.
     """
-    has_query_filter = query_filter is not None
+    write_point_contact = create_point_prism_writer(writer_func, query_filter)
 
     @wp.func
     def sphere_prism_contacts(
@@ -169,32 +219,25 @@ def create_sphere_prism_contacts(writer_func: Any, query_filter: Any = None):
         threshold = rigid_gap + radius + margin_a + margin_b
         # Sphere center in the triangle-origin heightfield-local frame.
         c = wp.quat_rotate_inv(rot_a, pos_b_adjusted - pos_a_adjusted)
-        point_a, normal, d = point_prism_query(c, e1, e2, n, threshold + PROXY_RADIUS + _ADMISSION_SLACK)
-        point_b = c - normal * PROXY_RADIUS
-        signed_distance = d - PROXY_RADIUS
-
-        if signed_distance > threshold + _ADMISSION_SLACK:
-            return
-        if wp.static(has_query_filter):
-            if signed_distance >= 0.0 and not query_filter(shape_a_data, point_a, normal, query_context):
-                return
-
-        normal_ws = wp.quat_rotate(rot_a, normal)
-        point = wp.quat_rotate(rot_a, 0.5 * (point_a + point_b)) + pos_a_adjusted
-
-        contact = ContactData()
-        contact.radius_eff_a = 0.0
-        contact.radius_eff_b = radius
-        contact.margin_a = margin_a
-        contact.margin_b = margin_b
-        contact.shape_a = shape_a
-        contact.shape_b = shape_b
-        contact.gap_sum = rigid_gap
-        contact.sort_sub_key = sort_sub_key << 3
-        # Minkowski post-processing of the sphere proxy (post_process_axial_on_discrete_contact).
-        contact.contact_point_center = point - normal_ws * (radius * 0.5)
-        contact.contact_normal_a_to_b = normal_ws
-        contact.contact_distance = signed_distance - radius
-        writer_func(contact, writer_data, -1)
+        point_a, normal, d = point_prism_query(c, e1, e2, n, threshold + _ADMISSION_SLACK)
+        write_point_contact(
+            c,
+            point_a,
+            normal,
+            d,
+            threshold,
+            radius,
+            rot_a,
+            pos_a_adjusted,
+            shape_a_data,
+            margin_a,
+            margin_b,
+            shape_a,
+            shape_b,
+            rigid_gap,
+            sort_sub_key << 3,
+            writer_data,
+            query_context,
+        )
 
     return sphere_prism_contacts

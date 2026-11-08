@@ -27,8 +27,8 @@ import warp as wp
 from .contact_data import ContactData
 from .heightfield_sphere_contact import (
     _ADMISSION_SLACK,
-    PROXY_RADIUS,
     _xy_inside_triangle,
+    create_point_prism_writer,
     create_sphere_prism_contacts,
     point_prism_query,
     prism_normal,
@@ -211,51 +211,7 @@ def _segment_prism_inside(p0: wp.vec3, p1: wp.vec3, e1: wp.vec3, e2: wp.vec3, n:
 
 def create_capsule_prism_contacts(writer_func: Any, query_filter: Any = None):
     """Create the closed-form capsule-vs-prism query with the signature of ``compute_gjk_mpr_contacts``."""
-    has_query_filter = query_filter is not None
-
-    @wp.func
-    def write_point(
-        p: wp.vec3,
-        point_a: wp.vec3,
-        normal: wp.vec3,
-        d: float,
-        threshold: float,
-        radius: float,
-        rot_a: wp.quat,
-        pos_a: wp.vec3,
-        prism: GenericShapeData,
-        margin_a: float,
-        margin_b: float,
-        shape_a: int,
-        shape_b: int,
-        rigid_gap: float,
-        sort_sub_key: int,
-        writer_data: Any,
-        query_context: Any,
-    ):
-        """Write one axis point's contact from its prism query (``point_a``, outward ``normal``, signed ``d``)."""
-        point_b = p - normal * PROXY_RADIUS
-        signed_distance = d - PROXY_RADIUS
-        if signed_distance > threshold + _ADMISSION_SLACK:
-            return
-        if wp.static(has_query_filter):
-            if signed_distance >= 0.0 and not query_filter(prism, point_a, normal, query_context):
-                return
-        normal_ws = wp.quat_rotate(rot_a, normal)
-        point = wp.quat_rotate(rot_a, 0.5 * (point_a + point_b)) + pos_a
-        contact = ContactData()
-        contact.radius_eff_a = 0.0
-        contact.radius_eff_b = radius
-        contact.margin_a = margin_a
-        contact.margin_b = margin_b
-        contact.shape_a = shape_a
-        contact.shape_b = shape_b
-        contact.gap_sum = rigid_gap
-        contact.sort_sub_key = sort_sub_key
-        contact.contact_point_center = point - normal_ws * (radius * 0.5)
-        contact.contact_normal_a_to_b = normal_ws
-        contact.contact_distance = signed_distance - radius
-        writer_func(contact, writer_data, -1)
+    write_point = create_point_prism_writer(writer_func, query_filter)
 
     @wp.func
     def capsule_prism_contacts(
@@ -282,7 +238,7 @@ def create_capsule_prism_contacts(writer_func: Any, query_filter: Any = None):
         radius = shape_b_data.scale[0]
         half_height = shape_b_data.scale[1]
         threshold = rigid_gap + radius + margin_a + margin_b
-        reach = threshold + PROXY_RADIUS + _ADMISSION_SLACK
+        reach = threshold + _ADMISSION_SLACK
         # Capsule segment in the triangle-origin heightfield-local frame.
         c = wp.quat_rotate_inv(rot_a, pos_b_adjusted - pos_a_adjusted)
         axis = wp.quat_rotate_inv(rot_a, wp.quat_rotate(rot_b, wp.vec3(0.0, 0.0, half_height)))
