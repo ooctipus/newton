@@ -35,7 +35,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.body_cut import BodyCut
-from newton._src.solvers.feather_pgs.factor.walk import TreeWalk, local_frames
+from newton._src.solvers.feather_pgs.factor.walk import WALK_PIVOT, TreeWalk, local_frames, unpack_walk_records
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests.feather_pgs_law_harness import dense_factor32
@@ -294,6 +294,33 @@ def floor_cases() -> list:
     ]
 
 
+def refresh_pivots(model) -> float:
+    """The solver's refresh of every tree of ``model`` (its first step's) against the float64 walk at the same
+    coordinates: the worst pivot ``P0``'s error relative to that pivot itself, so a thin axis's pivot counts as much as
+    the tree's largest; a non-finite record is infinitely far."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        solver = SolverFeatherPGS(model, pgs_iterations=4, pgs_beta=0.1)
+    state_0, state_1, control = model.state(), model.state(), model.control()
+    solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+    factor = solver.factor
+    forest = factor.model
+    joint_q = forest.joint_q.numpy().astype(np.float64)
+    starts = forest.articulation_start.numpy()
+    qd_start = forest.joint_qd_start.numpy()
+    records = unpack_walk_records(factor.walk_data.numpy(), int(forest.joint_dof_count)).astype(np.float64)
+    worst = 0.0
+    for art in range(int(forest.articulation_count)):
+        d0, d1 = int(qd_start[starts[art]]), int(qd_start[starts[art + 1]])
+        if d1 == d0:
+            continue
+        walk = factor.walk(joint_q, art)
+        pivots = walk.own_pivots + factor.armature[d0:d1]
+        error = np.abs(records[d0:d1, WALK_PIVOT] - pivots) / pivots
+        worst = max(worst, float(np.max(error)) if np.all(np.isfinite(error)) else np.inf)
+    return worst
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------------------------------------------------
@@ -359,6 +386,22 @@ class TestAssemblyFloorOnTheWalk(unittest.TestCase):
                 self.assertTrue(worst["pivots_positive"], f"{worst}")
                 for where in ("host", *devices()):
                     self.assertLess(worst[str(where)], WALK_TOLERANCE, f"{where}: {worst}")
+
+    def test_the_refresh_forms_every_pivot_of_a_floor_case(self):
+        """The solver's refresh forms each pivot within float32 of the float64 walk, a thin axis's too: a body's inertia
+        at its frame takes the parallel-axis shift along each axis from the other two axes, so the lever's own axis
+        keeps the body's moment (formed as ``|c|^2 - c_a^2`` it cancelled, and the thin ball's axial pivot read zero
+        under half an ulp of ``m |c|^2``)."""
+        for name, model in (
+            *(
+                (f"thin ball loop, rocker {inertia:.0e}", TestStepsWithoutArmature.rocker(inertia))
+                for inertia in FLOOR_INERTIAS
+            ),
+            ("thin ball 2 m out, pure tree", thin_ball_far_out()),
+            ("thin hinges 2 and 2.5 m out", thin_hinges()),
+        ):
+            with self.subTest(case=name):
+                self.assertLess(refresh_pivots(model), 1.0e-5)
 
 
 class TestStepsWithoutArmature(unittest.TestCase):
