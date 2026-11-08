@@ -11,7 +11,7 @@ from typing import Any, Literal
 import warp as wp
 
 from ..core.types import MAXVAL, Devicelike
-from ..geometry.collision_convex import ConvexQueryResult, create_write_convex_query_result
+from ..geometry.collision_convex import ConvexQueryResult, create_write_convex_query_result, gjk_separation_cutoff
 from ..geometry.collision_core import (
     MINKOWSKI_CORE_RADIUS,
     check_infinite_plane_bsphere_overlap,
@@ -1627,6 +1627,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                 if wp.static(accelerated_support):
                     provider.support_lut = support_lut
                     provider.support_vertex_offsets = support_vertex_offsets
+                # Pairs whose support-plane bound clears the contact threshold stop early; no contact is kept.
                 _separated, point_a, point_b, normal, signed_distance = wp.static(solve_gjk.core)(
                     query.geom_a,
                     query.geom_b,
@@ -1634,6 +1635,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                     query.relative_position_b,
                     0.0,
                     provider,
+                    max_dist=gjk_separation_cutoff(query.contact_threshold, query.position_a, query.position_b),
                 )
                 if signed_distance <= query.contact_threshold:
                     result = ConvexQueryResult()
