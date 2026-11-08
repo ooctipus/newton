@@ -11,9 +11,11 @@ box that its surface meets (an exact, closed triangle-box test in float64). Ever
 1 m wall and a 0.1 m lattice face each take a few. A long, thin stair tread stays in cells about its width, not its
 length. Floors, ceilings, walls and rooms are cells like any other: nothing assumes a height function.
 
-Only occupied cells are stored. Their keys ``(level, x, y, z)`` sit in an open-addressing hash table (linear probing,
-load at most two thirds), each slot holding the key, the cell's ``(start, count)`` into a CSR of entries and the box of
-the cell's triangles. An entry is a triangle id with the triangle's bounding box relative to the cell (fixed point,
+Only occupied cells are stored, each with its key ``(level, x, y, z)``, its ``(start, count)`` into a CSR of entries
+and the box of its triangles, ordered by level, 4x4x4 block and bit in the block. The occupied blocks sit in an
+open-addressing hash table (linear probing, load at most two thirds), each slot holding the block's key, the 64-bit
+mask of its occupied cells and its first cell: a cell's slot is that first plus the occupied cells below its bit, so
+one probe answers all of a block's cells. An entry is a triangle id with the triangle's bounding box relative to the cell (fixed point,
 rounded outward), so a query rejects most entries without touching the triangle. Each triangle keeps its
 *registration*: its box's base cell and spans and a mask of the box cells it registered in. A query that meets a
 triangle in several cells emits it from the first registered one inside the query's cell range only (the
@@ -23,7 +25,7 @@ A query visits, at every occupied level, the cells under its bound's box (level-
 ``2 l``: ``floor(x / (h 4^l)) = floor(floor(x / h) / 4^l)``, the same identity the build uses). A point of the bound
 that lies on a triangle lies in a visited cell where that triangle is registered, so no triangle that meets the bound
 is missed. The box is padded by more than the float32 rounding of the cell coordinates. A level whose occupied cells
-are fewer than the cells of the range walks those cells instead of looking the range up.
+are fewer than the blocks of the range walks those cells instead of looking the range's blocks up.
 
 The index is built once on the host from the mesh's own vertex buffers (:func:`build_mesh_cells`) and never changes:
 it is the rigid mesh's, in the mesh's own frame, like its vertices.
@@ -87,7 +89,7 @@ class MeshGrid:
     dims: wp.vec3i
     """Level-0 cell count per axis."""
     table_start: int
-    """Start of this mesh's hash slots in :attr:`MeshCells.slots`."""
+    """Start of this mesh's hash slots in :attr:`MeshCells.block_keys` and :attr:`MeshCells.blocks`."""
     table_mask: int
     """Slot count minus one (a power of two minus one)."""
     triangle_start: int
@@ -102,10 +104,10 @@ class MeshGrid:
 
 @wp.struct
 class MeshCellSlot:
-    """A hash slot (or a sorted cell): the cell's key, its entries and the box of their triangles."""
+    """An occupied cell: its key, its entries and the box of their triangles."""
 
     key: wp.uint64
-    """The cell key, or :data:`MESH_CELLS_EMPTY_KEY` for an empty slot."""
+    """The cell key."""
     start: int
     """The cell's first entry in :attr:`MeshCells.entries`."""
     count: int
@@ -128,6 +130,16 @@ class MeshCellTriangle:
 
 
 @wp.struct
+class MeshCellBlock:
+    """A block of 4x4x4 cells of one level: its occupied cells and the first of their slots."""
+
+    mask: wp.uint64
+    """Bit ``(x & 3) + 4 (y & 3) + 16 (z & 3)`` set for each occupied cell ``(x, y, z)`` of the block."""
+    first: int
+    """The block's first occupied cell in :attr:`MeshCells.sorted_slots`; its others follow in bit order."""
+
+
+@wp.struct
 class MeshCells:
     """The cell indices of every collision mesh of a scene, packed, and the shape-to-index map."""
 
@@ -135,12 +147,12 @@ class MeshCells:
     """One per indexed mesh."""
     shape_grid: wp.array[wp.int32]
     """Per shape: its mesh's index in :attr:`grids`, or -1."""
-    slots: wp.array[MeshCellSlot]
-    """The hash slots of every mesh."""
-    slot_keys: wp.array[wp.uint64]
-    """The slots' keys alone, for probing."""
+    block_keys: wp.array[wp.uint64]
+    """The hash slots of every mesh's occupied blocks (4x4x4 cells of one level): their keys, for probing."""
+    blocks: wp.array[MeshCellBlock]
+    """The hash slots' blocks: which of their cells are occupied, and where their cells' slots start."""
     filter: wp.array[wp.int32]
-    """Every mesh's occupancy filter: bit ``(hash >> 32) & filter_mask`` is set for each occupied cell's key."""
+    """Every mesh's occupancy filter: bit ``(hash >> 32) & filter_mask`` is set for each occupied block's key."""
     entries: wp.array[wp.vec4i]
     """Per cell, by ascending triangle: ``(triangle, lo_x | lo_y << 14 | b0 << 28, lo_z | hi_x << 14 | b1 << 28,
     hi_y | hi_z << 14 | b2 << 28)``: the triangle id (local to the mesh), its box relative to the cell's lower corner
@@ -149,7 +161,7 @@ class MeshCells:
     triangles: wp.array[MeshCellTriangle]
     """Per triangle, by mesh: its registration."""
     sorted_slots: wp.array[MeshCellSlot]
-    """Every mesh's occupied cells, by ascending key (so grouped by level)."""
+    """Every mesh's occupied cells, by level, block key and bit in the block: a block's cells are contiguous."""
     level_start: wp.array[wp.int32]
     """Per mesh, 17 offsets: level ``l``'s cells are ``sorted_slots[level_start[g + l] : level_start[g + l + 1]]``."""
 
@@ -187,27 +199,59 @@ def _mesh_cells_hash(key: wp.uint64) -> wp.uint64:
 
 
 @wp.func
-def mesh_cells_find(cells: MeshCells, grid: MeshGrid, key: wp.uint64) -> MeshCellSlot:
-    """Cell ``key``'s slot in ``grid``; its ``count`` is zero when the cell is empty.
+def mesh_cells_block_key(level: int, x: int, y: int, z: int) -> wp.uint64:
+    """The key of block ``(x, y, z)`` (4x4x4 cells) of ``level``: the cell key layout, on block coordinates."""
+    return mesh_cells_key(level, x, y, z)
 
-    The occupancy filter answers most empty cells with one bit; the others probe the slots' keys.
+
+@wp.func
+def mesh_cells_find_block(cells: MeshCells, grid: MeshGrid, key: wp.uint64) -> MeshCellBlock:
+    """Block ``key``'s occupied cells and first slot in ``grid``; its ``mask`` is zero when no cell of it is occupied.
+
+    The occupancy filter answers most empty blocks with one bit; the others probe the blocks' keys.
     """
     mask = grid.table_mask
     h = _mesh_cells_hash(key)
-    empty = MeshCellSlot()
-    empty.count = 0
+    empty = MeshCellBlock()
+    empty.mask = wp.uint64(0)
     bit = int((h >> wp.uint64(32)) & wp.uint64(grid.filter_mask))
     if (cells.filter[grid.filter_start + (bit >> 5)] >> (bit & 31)) & 1 == 0:
         return empty
     slot = int(h & wp.uint64(mask))
     for _probe in range(mask + 1):
-        stored = cells.slot_keys[grid.table_start + slot]
+        stored = cells.block_keys[grid.table_start + slot]
         if stored == key:
-            return cells.slots[grid.table_start + slot]
+            return cells.blocks[grid.table_start + slot]
         if stored == MESH_CELLS_EMPTY_KEY:
             return empty
         slot = (slot + 1) & mask
     return empty
+
+
+@wp.func
+def mesh_cells_popcount(x: wp.uint64) -> int:
+    """Set bits of ``x``."""
+    x = x - ((x >> wp.uint64(1)) & wp.uint64(0x5555555555555555))
+    x = (x & wp.uint64(0x3333333333333333)) + ((x >> wp.uint64(2)) & wp.uint64(0x3333333333333333))
+    x = (x + (x >> wp.uint64(4))) & wp.uint64(0x0F0F0F0F0F0F0F0F)
+    return int((x * wp.uint64(0x0101010101010101)) >> wp.uint64(56))
+
+
+@wp.func
+def mesh_cells_block_range(block: wp.vec3i, qlo: wp.vec3i, qhi: wp.vec3i) -> wp.uint64:
+    """The bits of block ``block``'s cells inside the cell range ``[qlo, qhi]``, which the block meets."""
+    lo = wp.vec3i(wp.max(qlo[0] - 4 * block[0], 0), wp.max(qlo[1] - 4 * block[1], 0), wp.max(qlo[2] - 4 * block[2], 0))
+    hi = wp.vec3i(wp.min(qhi[0] - 4 * block[0], 3), wp.min(qhi[1] - 4 * block[1], 3), wp.min(qhi[2] - 4 * block[2], 3))
+    # The x-run of one row, repeated on the rows (4 bits apart) and planes (16 bits apart) of the range.
+    run = ((wp.uint64(1) << wp.uint64(hi[0] - lo[0] + 1)) - wp.uint64(1)) << wp.uint64(lo[0])
+    rows = (
+        wp.uint64(0x1111)
+        & (wp.uint64(0xFFFF) >> wp.uint64(12 - 4 * hi[1]))
+        & (wp.uint64(0xFFFF) << wp.uint64(4 * lo[1]))
+    )
+    every = ~wp.uint64(0)
+    planes = wp.uint64(0x0001000100010001) & (every >> wp.uint64(48 - 16 * hi[2])) & (every << wp.uint64(16 * lo[2]))
+    return run * rows * planes
 
 
 @wp.func
@@ -624,11 +668,9 @@ def _triangles_meet_boxes(a, b, c, center, half) -> np.ndarray:
     return hit
 
 
-def _slots(keys, starts, counts, box_lo=None, box_hi=None) -> np.ndarray:
+def _slots(keys, starts, counts, box_lo, box_hi) -> np.ndarray:
     out = np.zeros(keys.size, dtype=MeshCellSlot.numpy_dtype())
-    out["key"], out["start"], out["count"] = keys, starts, counts
-    out["box_lo"] = 0 if box_lo is None else box_lo
-    out["box_hi"] = 0xFFFFFF if box_hi is None else box_hi
+    out["key"], out["start"], out["count"], out["box_lo"], out["box_hi"] = keys, starts, counts, box_lo, box_hi
     return out
 
 
@@ -645,6 +687,18 @@ def default_cell_size(points: np.ndarray, indices: np.ndarray) -> float:
     span = (v.max(axis=1) - v.min(axis=1)).max(axis=1)
     h = 2.0 * float(np.median(span))
     return h if h > 0.0 else 1.0
+
+
+def _slot_order(keys: np.ndarray) -> np.ndarray:
+    """Cell keys to keys that sort by level, 4x4x4 block and bit ``(x & 3) + 4 (y & 3) + 16 (z & 3)`` in the block."""
+    x, y, z = ((keys >> np.uint64(s)) & np.uint64(0xFFFFF) for s in (40, 20, 0))
+    bit = (x & np.uint64(3)) + np.uint64(4) * (y & np.uint64(3)) + np.uint64(16) * (z & np.uint64(3))
+    blocks = (
+        ((x >> np.uint64(2)) << np.uint64(42))
+        | ((y >> np.uint64(2)) << np.uint64(24))
+        | ((z >> np.uint64(2)) << np.uint64(6))
+    )
+    return (keys & (np.uint64(0xF) << np.uint64(60))) | blocks | bit
 
 
 def build_mesh_grid(points: np.ndarray, indices: np.ndarray, cell: float | None = None) -> dict:
@@ -670,7 +724,9 @@ def build_mesh_grid(points: np.ndarray, indices: np.ndarray, cell: float | None 
             "cell": np.float32(1.0),
             "levels": 0,
             "dims": np.ones(3, dtype=np.int32),
-            "slots": _slots(np.full(1, 0xFFFFFFFFFFFFFFFF, dtype=np.uint64), np.zeros(1), np.zeros(1)),
+            "block_keys": np.full(1, 0xFFFFFFFFFFFFFFFF, dtype=np.uint64),
+            "blocks": np.zeros(1, dtype=MeshCellBlock.numpy_dtype()),
+            "occupied_blocks": np.zeros(0, dtype=np.uint64),
             "entries": np.zeros((0, 4), dtype=np.int32),
             "triangles": np.zeros(0, dtype=MeshCellTriangle.numpy_dtype()),
             "sorted_slots": np.zeros(0, dtype=MeshCellSlot.numpy_dtype()),
@@ -744,8 +800,10 @@ def build_mesh_grid(points: np.ndarray, indices: np.ndarray, cell: float | None 
 
     keys = np.concatenate(keys_chunks)
     tris = np.concatenate(tri_chunks)
-    order = np.lexsort((tris, keys))
-    keys, tris, block = keys[order], tris[order], block[order]
+    # Entries by cell in the slots' order (level, 4x4x4 block, bit in the block), then by triangle.
+    slot_order = _slot_order(keys)
+    order = np.lexsort((tris, slot_order))
+    keys, tris, block, slot_order = keys[order], tris[order], block[order], slot_order[order]
     # Each entry's triangle box relative to its cell, rounded outward by a step.
     entry_level = (keys >> np.uint64(60)).astype(np.int64)
     entry_cell = np.stack([((keys >> np.uint64(s)) & np.uint64(0xFFFFF)).astype(np.int64) for s in (40, 20, 0)], axis=1)
@@ -773,33 +831,41 @@ def build_mesh_grid(points: np.ndarray, indices: np.ndarray, cell: float | None 
         axis=1,
     )
 
-    cell_keys, starts, counts = np.unique(keys, return_index=True, return_counts=True)
+    # A block's occupied cells are contiguous, so a cell's slot is its block's first plus the occupied cells below its
+    # bit.
+    slot_order, starts, counts = np.unique(slot_order, return_index=True, return_counts=True)
+    cell_keys = keys[starts]
     ncell = cell_keys.size
     c_lo = np.minimum.reduceat(u_lo, starts, axis=0) + 128
     c_hi = np.maximum.reduceat(u_hi, starts, axis=0) + 128
     cell_box_lo = c_lo[:, 0] | (c_lo[:, 1] << 8) | (c_lo[:, 2] << 16)
     cell_box_hi = c_hi[:, 0] | (c_hi[:, 1] << 8) | (c_hi[:, 2] << 16)
+    _, block_first = np.unique(slot_order >> np.uint64(6), return_index=True)
+    block_mask = np.bitwise_or.reduceat(np.left_shift(np.uint64(1), slot_order & np.uint64(63)), block_first)
+    # A block's key is the cell key layout on block coordinates (the cell's, shifted right by two).
+    first_keys = cell_keys[block_first]
+    block_keys = (first_keys & (np.uint64(0xF) << np.uint64(60))) | (
+        (first_keys >> np.uint64(2)) & np.uint64((0x3FFFF << 40) | (0x3FFFF << 20) | 0x3FFFF)
+    )
+    nblock = block_keys.size
     capacity = 1
-    while capacity < ncell + ncell // 2:
+    while capacity < nblock + nblock // 2:
         capacity <<= 1
     table_mask = capacity - 1
     table_keys = np.full(capacity, 0xFFFFFFFFFFFFFFFF, dtype=np.uint64)
-    table_cells = np.zeros((capacity, 4), dtype=np.int64)
-    table_cells[:, 3] = 0xFFFFFF
-    slot = (_hash_np(cell_keys) & np.uint64(table_mask)).astype(np.int64)
-    pending = np.arange(ncell)
+    table_blocks = np.zeros(capacity, dtype=MeshCellBlock.numpy_dtype())
+    slot = (_hash_np(block_keys) & np.uint64(table_mask)).astype(np.int64)
+    pending = np.arange(nblock)
     while pending.size:
         s = slot[pending]
         free = table_keys[s] == np.uint64(0xFFFFFFFFFFFFFFFF)
         cand, cs = pending[free], s[free]
         _, first = np.unique(cs, return_index=True)
         win = cand[first]
-        table_keys[slot[win]] = cell_keys[win]
-        table_cells[slot[win], 0] = starts[win]
-        table_cells[slot[win], 1] = counts[win]
-        table_cells[slot[win], 2] = cell_box_lo[win]
-        table_cells[slot[win], 3] = cell_box_hi[win]
-        placed = np.zeros(ncell, dtype=bool)
+        table_keys[slot[win]] = block_keys[win]
+        table_blocks["mask"][slot[win]] = block_mask[win]
+        table_blocks["first"][slot[win]] = block_first[win]
+        placed = np.zeros(nblock, dtype=bool)
         placed[win] = True
         pending = pending[~placed[pending]]
         slot[pending] = (slot[pending] + 1) & table_mask
@@ -816,7 +882,9 @@ def build_mesh_grid(points: np.ndarray, indices: np.ndarray, cell: float | None 
         "cell": np.float32(h),
         "levels": levels,
         "dims": dims,
-        "slots": _slots(table_keys, table_cells[:, 0], table_cells[:, 1], table_cells[:, 2], table_cells[:, 3]),
+        "block_keys": table_keys,
+        "blocks": table_blocks,
+        "occupied_blocks": block_keys,
         "entries": entries,
         "triangles": records,
         "sorted_slots": _slots(cell_keys, starts, counts, cell_box_lo, cell_box_hi),
@@ -827,6 +895,7 @@ def build_mesh_grid(points: np.ndarray, indices: np.ndarray, cell: float | None 
             "triangles": int(nt),
             "cells": int(ncell),
             "entries": int(entries.shape[0]),
+            "blocks": int(nblock),
             "slots": int(capacity),
             "levels": level_counts,
             "entries_per_cell_mean": float(counts.mean()),
@@ -937,7 +1006,7 @@ def build_mesh_cells(
             mesh_ids.append(mid)
         shape_grid[s] = grid_of[mid]
 
-    names = ("slots", "slot_keys", "entries", "triangles", "sorted_slots", "level_start", "filter")
+    names = ("block_keys", "blocks", "entries", "triangles", "sorted_slots", "level_start", "filter")
     chunks: dict[str, list] = {name: [] for name in names}
     grids = []
     table_offset = entry_offset = triangle_offset = sorted_offset = filter_offset = 0
@@ -959,11 +1028,11 @@ def build_mesh_cells(
         info.levels = int(g["levels"])
         info.dims = wp.vec3i(*[int(x) for x in g["dims"]])
         info.table_start = table_offset
-        info.table_mask = int(g["slots"].size - 1)
+        info.table_mask = int(g["block_keys"].size - 1)
         info.triangle_start = triangle_offset
         info.level_start = len(grids) * (_MAX_LEVEL + 2)
-        # The occupancy filter: 16 bits a cell or more, one bit set per occupied cell (from the key's hash).
-        occupied = g["sorted_slots"]["key"]
+        # The occupancy filter: 16 bits a block or more, one bit set per occupied block (from the key's hash).
+        occupied = g["occupied_blocks"]
         bits = 32
         while bits < 16 * occupied.size:
             bits <<= 1
@@ -975,35 +1044,34 @@ def build_mesh_cells(
         chunks["filter"].append(words.view(np.int32))
         filter_offset += words.size
         grids.append(info)
-        slots = g["slots"].copy()
-        slots["start"] += entry_offset
+        blocks = g["blocks"].copy()
+        blocks["first"] += sorted_offset
         sorted_slots = g["sorted_slots"].copy()
         sorted_slots["start"] += entry_offset
-        chunks["slots"].append(slots)
-        chunks["slot_keys"].append(np.ascontiguousarray(slots["key"]))
+        chunks["block_keys"].append(np.ascontiguousarray(g["block_keys"]))
+        chunks["blocks"].append(blocks)
         chunks["sorted_slots"].append(sorted_slots)
         chunks["level_start"].append(g["level_start"] + sorted_offset)
         chunks["entries"].append(g["entries"])
         chunks["triangles"].append(g["triangles"])
-        table_offset += g["slots"].size
+        table_offset += g["block_keys"].size
         entry_offset += g["entries"].shape[0]
         triangle_offset += g["triangles"].shape[0]
         sorted_offset += g["sorted_slots"].size
+
+    structs = (MeshCellTriangle, MeshCellSlot, MeshCellBlock)
 
     def packed(name, dtype, width=None):
         parts = [x for x in chunks[name] if len(x)]
         if parts:
             data = np.concatenate(parts)
-            if dtype in (MeshCellTriangle, MeshCellSlot):
+            if dtype in structs:
                 # Concatenation packs structured fields; restore the struct's aligned layout.
                 data = data.astype(np.dtype(dtype.numpy_dtype()))
             return wp.array(data, dtype=dtype, device=device)
-        if dtype in (MeshCellTriangle, MeshCellSlot):
-            empty = np.zeros(1, dtype=dtype.numpy_dtype())
-            if dtype == MeshCellSlot:
-                empty["key"] = 0xFFFFFFFFFFFFFFFF
-            return wp.array(empty, dtype=dtype, device=device)
-        if name == "slot_keys":
+        if dtype in structs:
+            return wp.array(np.zeros(1, dtype=dtype.numpy_dtype()), dtype=dtype, device=device)
+        if name == "block_keys":
             return wp.array(np.full(1, 0xFFFFFFFFFFFFFFFF, dtype=np.uint64), dtype=dtype, device=device)
         shape = (1,) if width is None else (1, width)
         return wp.array(np.zeros(shape, dtype=np.int64), dtype=dtype, device=device)
@@ -1011,8 +1079,8 @@ def build_mesh_cells(
     result = MeshCells()
     result.grids = wp.array(grids if grids else [MeshGrid()], dtype=MeshGrid, device=device)
     result.shape_grid = wp.array(shape_grid, dtype=wp.int32, device=device)
-    result.slots = packed("slots", MeshCellSlot)
-    result.slot_keys = packed("slot_keys", wp.uint64)
+    result.block_keys = packed("block_keys", wp.uint64)
+    result.blocks = packed("blocks", MeshCellBlock)
     result.entries = packed("entries", wp.vec4i, 4)
     result.triangles = packed("triangles", MeshCellTriangle)
     result.sorted_slots = packed("sorted_slots", MeshCellSlot)
