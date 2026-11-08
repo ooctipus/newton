@@ -38,6 +38,7 @@ import warp as wp
 from .support_function import (
     create_shape_center_function,
     create_shape_support_function,
+    enclosing_half_extents,
 )
 
 PORTAL_HEIGHT_RTOL = wp.constant(1.0e-6)
@@ -69,6 +70,34 @@ def portal_sliver(a: wp.vec3, b: wp.vec3, c: wp.vec3, extend: float) -> bool:
     longest_sq = wp.max(wp.length_sq(ab), wp.max(wp.length_sq(ac), wp.length_sq(c - b)))
     height = 2.0 * extend + PORTAL_HEIGHT_RTOL * wp.sqrt(longest_sq)
     return wp.length_sq(wp.cross(ab, ac)) < height * height * longest_sq
+
+
+@wp.func
+def enclosing_box_depth(
+    half_a: wp.vec3, half_b: wp.vec3, rotation: wp.quat, position: wp.vec3
+) -> tuple[wp.vec3, float]:
+    """The shallowest overlap [m] of two enclosing boxes along their six face normals, and that normal (A to B).
+
+    ``position`` is B's box center in A's box frame and ``rotation`` B's orientation there. The overlap of the
+    shapes along that normal is at most the boxes' (:func:`create_solve_mpr`).
+    """
+    axes_b = wp.quat_to_matrix(rotation)
+    normal = wp.vec3(1.0, 0.0, 0.0)
+    depth = float(1.0e30)
+    for index in range(3):
+        axis_a = wp.vec3(0.0)
+        axis_a[index] = 1.0
+        overlap_a = half_a[index] + wp.dot(wp.abs(axes_b[index]), half_b) - wp.abs(position[index])
+        if overlap_a < depth:
+            depth = overlap_a
+            normal = axis_a if position[index] >= 0.0 else -axis_a
+        axis_b = axes_b * axis_a
+        offset_b = wp.dot(axis_b, position)
+        overlap_b = half_b[index] + wp.dot(wp.abs(axis_b), half_a) - wp.abs(offset_b)
+        if overlap_b < depth:
+            depth = overlap_b
+            normal = axis_b if offset_b >= 0.0 else -axis_b
+    return normal, depth
 
 
 def create_support_map_function(support_func: Any, use_precomputed_center: bool = False):
@@ -201,15 +230,15 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
     _, mpr_support, _ = create_support_map_function(shape_support)
 
     @wp.func
-    def solve_mpr_core(
+    def solve_mpr_portal(
         geom_a: Any,
         geom_b: Any,
         orientation_b: wp.quat,
         position_b: wp.vec3,
         extend: float,
         data_provider: Any,
-        MAX_ITER: int = 30,
-        COLLIDE_EPSILON: float = 1e-5,
+        MAX_ITER: int,
+        COLLIDE_EPSILON: float,
     ) -> tuple[bool, wp.vec3, wp.vec3, wp.vec3, float]:
         """
         Core MPR algorithm implementation.
@@ -445,6 +474,51 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
             else:
                 v3 = v4
             sliver = next_sliver
+
+    @wp.func
+    def solve_mpr_core(
+        geom_a: Any,
+        geom_b: Any,
+        orientation_b: wp.quat,
+        position_b: wp.vec3,
+        extend: float,
+        data_provider: Any,
+        MAX_ITER: int = 30,
+        COLLIDE_EPSILON: float = 1e-5,
+    ) -> tuple[bool, wp.vec3, wp.vec3, wp.vec3, float]:
+        """MPR's portal, held to the shapes' enclosing boxes.
+
+        The portal lies where the ray from the shapes' center difference through the origin leaves the Minkowski
+        difference. Near the end of a long shape that ray can leave through a distant face, deeper than the
+        enclosing boxes overlap along their shallowest face normal. Then the shapes' own support planes along that
+        normal give the overlap (at most the portal's) and the contact: B's deepest point and its partner on A's
+        support plane, so the smaller shape (B or A swapped) keeps the witness inside the overlap.
+        """
+        collision, point_a, point_b, normal, penetration = solve_mpr_portal(
+            geom_a, geom_b, orientation_b, position_b, extend, data_provider, MAX_ITER, COLLIDE_EPSILON
+        )
+        if collision:
+            half_a = enclosing_half_extents(geom_a)
+            half_b = enclosing_half_extents(geom_b)
+            if wp.min(half_a) > 0.0 and wp.min(half_b) > 0.0:
+                offset = position_b + wp.quat_rotate(orientation_b, geom_b.center) - geom_a.center
+                bound_normal, bound_depth = enclosing_box_depth(half_a, half_b, orientation_b, offset)
+                if penetration > bound_depth + extend + COLLIDE_EPSILON:
+                    support = mpr_support(
+                        geom_a, geom_b, bound_normal, orientation_b, position_b, extend, data_provider
+                    )
+                    depth = wp.dot(support.BtoA, bound_normal)
+                    if depth < penetration:
+                        normal = bound_normal
+                        penetration = depth
+                        # The smaller shape's deepest point, and its partner on the other's support plane.
+                        if wp.length_sq(half_b) <= wp.length_sq(half_a):
+                            point_b = support.B
+                            point_a = point_b + depth * normal
+                        else:
+                            point_a = vert_a(support)
+                            point_b = point_a - depth * normal
+        return collision, point_a, point_b, normal, penetration
 
     @wp.func
     def solve_mpr(

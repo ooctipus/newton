@@ -228,8 +228,10 @@ def create_prepare_convex_pair(external_aabb: bool, speculative: bool = False):
         )
         if type_a == GeoType.CONVEX_MESH:
             geom_a.center = 0.5 * (shape_collision_aabb_lower[shape_a] + shape_collision_aabb_upper[shape_a])
+            geom_a.bounds_half = 0.5 * (shape_collision_aabb_upper[shape_a] - shape_collision_aabb_lower[shape_a])
         if type_b == GeoType.CONVEX_MESH:
             geom_b.center = 0.5 * (shape_collision_aabb_lower[shape_b] + shape_collision_aabb_upper[shape_b])
+            geom_b.bounds_half = 0.5 * (shape_collision_aabb_upper[shape_b] - shape_collision_aabb_lower[shape_b])
 
         is_infinite_plane_a = (type_a == GeoType.PLANE) and (geom_a.scale[0] == 0.0 and geom_a.scale[1] == 0.0)
         is_infinite_plane_b = (type_b == GeoType.PLANE) and (geom_b.scale[0] == 0.0 and geom_b.scale[1] == 0.0)
@@ -1322,8 +1324,14 @@ def create_narrow_phase_kernel_gjk_mpr(
             )
             if type_a == GeoType.CONVEX_MESH:
                 shape_data_a.center = 0.5 * (shape_collision_aabb_lower[shape_a] + shape_collision_aabb_upper[shape_a])
+                shape_data_a.bounds_half = 0.5 * (
+                    shape_collision_aabb_upper[shape_a] - shape_collision_aabb_lower[shape_a]
+                )
             if type_b == GeoType.CONVEX_MESH:
                 shape_data_b.center = 0.5 * (shape_collision_aabb_lower[shape_b] + shape_collision_aabb_upper[shape_b])
+                shape_data_b.bounds_half = 0.5 * (
+                    shape_collision_aabb_upper[shape_b] - shape_collision_aabb_lower[shape_b]
+                )
             data_provider = provider_type()
             data_provider.shape_support_data = shape_support_data
             data_provider.support_neighbors = support_neighbors
