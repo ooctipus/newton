@@ -120,7 +120,9 @@ class TestHeightfield(unittest.TestCase):
         wp.launch(kernel, dim=4, inputs=inputs, device="cpu")
         # Cell (10, 11)'s upper triangle: (0.12, 0, 0), (0.24, 0.12, 0.1), (0.12, 0.12, 0) from its origin.
         rising = np.cross([0.12, 0.12, 0.1], [0.0, 0.12, 0.0])
-        np.testing.assert_allclose(normals.numpy(), [rising / np.linalg.norm(rising), up, leaning, leaning], atol=1.0e-6)
+        np.testing.assert_allclose(
+            normals.numpy(), [rising / np.linalg.norm(rising), up, leaning, leaning], atol=1.0e-6
+        )
         # A ridge: every vertex beyond the edge and the corner falls away, so both normals are the surface's.
         for row, col in ((11, 12), (12, 12), (10, 12), (12, 11)):
             elevations[row * 21 + col] = 0.2

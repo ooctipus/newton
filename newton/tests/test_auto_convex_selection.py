@@ -20,7 +20,7 @@ from newton.tests.test_coherent_convex_rejection import (
     _box_inputs,
     _buffers,
     _original,
-    _original_values,
+    _run_original,
     _selector_model,
 )
 from newton.tests.unittest_utils import add_function_test, assert_host_only, get_test_devices
@@ -101,26 +101,8 @@ def test_graph_choice_preserves_queries(test, device):
     owner.period = 2
 
     def ordinary(buffers, query_count=None):
-        wp.launch(
-            original[0],
-            threads,
-            [
-                pair_array,
-                count if query_count is None else query_count,
-                *_original_values(values, device),
-                threads,
-                *buffers,
-            ],
-            device=device,
-            block_dim=128,
-        )
-        wp.launch(
-            original[1],
-            threads,
-            [pair_array, *_original_values(values, device), threads, *buffers],
-            device=device,
-            block_dim=128,
-        )
+        query_count = count if query_count is None else query_count
+        _run_original(original, pair_array, query_count, values, device, threads, buffers)
 
     def rejection(query_count, gjk_count):
         cache.begin()
