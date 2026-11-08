@@ -22,6 +22,7 @@ from .mesh_cells import (
     MESH_CELLS_LEVEL_SHIFT,
     MeshCells,
     MeshCellSlot,
+    MeshGrid,
     MeshQueryBound,
     mesh_cells_box_in_cell,
     mesh_cells_box_meets_slabs,
@@ -1346,7 +1347,7 @@ def mesh_cells_entry_is_candidate(
 
 
 @wp.func
-def mesh_vs_convex_cell_candidates(
+def mesh_vs_convex_cell_hits(
     lane: int,
     lanes: int,
     pair_index: int,
@@ -1360,19 +1361,18 @@ def mesh_vs_convex_cell_candidates(
     slab2: wp.vec4,
     slab_half: wp.vec3,
     mesh_cells: MeshCells,
-    candidates: wp.array[wp.vec4i],
-    candidate_count: wp.array[int],
+    hit_head: wp.array[wp.vec4i],
+    hit_span: wp.array[wp.vec2i],
+    hit_count: wp.array[int],
 ):
-    """Append a candidate (:func:`mesh_cells_candidate`) for each triangle met in the cells of the query's range.
+    """Append a hit for each occupied cell of the query's range whose triangles may meet the bound.
 
     At every occupied level of the mesh's index, the cells of the level-0 range ``[lo0, hi0]`` are looked up, or the
-    level's occupied cells walked when they are fewer. A cell whose triangles' box misses the query box
-    ``[query_lower, query_upper]`` (unscaled mesh frame), or the bound's oriented box (its three slabs, ``slab0``..
-    ``slab2`` with half-widths ``slab_half``, :func:`mesh_query_bound_slab`), is skipped whole; a triangle is a
-    candidate when its own box meets both. The oriented box test is the exact pass's own necessary condition (a
-    triangle that meets the oriented box has a box that meets it), so it drops nothing the exact pass keeps. A small triangle (box of at most two cells per axis) met in several cells is a candidate in
-    its first one only (by its entry); a larger one is a candidate in each, and the exact pass keeps its first.
-    ``lanes`` threads share the pair; each takes every ``lanes``-th cell.
+    level's occupied cells walked when they are fewer. A cell is a hit unless its triangles' box misses the query box
+    ``[query_lower, query_upper]`` (unscaled mesh frame) or the bound's oriented box (its three slabs, ``slab0``..
+    ``slab2`` with half-widths ``slab_half``, :func:`mesh_query_bound_slab`). A hit is ``(pair, level, x | y << 15, z)``
+    with its entries ``(start, count)``; :func:`mesh_vs_convex_hit_candidates` scans them, one thread a hit. ``lanes``
+    threads share the pair; each takes every ``lanes``-th cell.
     """
     grid = mesh_cells.grids[grid_index]
     visited = int(0)
@@ -1420,41 +1420,88 @@ def mesh_vs_convex_cell_candidates(
                 if mesh_cells_slot_overlaps(slot, query_lower, query_upper, cell_lower, inv_size) and (
                     not union_bounded or mesh_cells_box_meets_slabs(union_lo, union_hi, slab0, slab1, slab2, slab_half)
                 ):
-                    box_lo, box_hi = mesh_cells_box_in_cell(query_lower, query_upper, cell_lower, inv_size)
-                    # A cell's candidates take one reservation, 32 entries at a time (marked, then written): one
-                    # append per candidate costs one atomic on the shared count, and those atomics were most of the
-                    # cell pass's appends.
-                    for chunk in range(slot.start, slot.start + slot.count, 32):
-                        marks = int(0)
-                        found = int(0)
-                        for e in range(chunk, wp.min(chunk + 32, slot.start + slot.count)):
-                            if mesh_cells_entry_is_candidate(
-                                mesh_cells.entries[e],
-                                cell,
-                                qlo,
-                                qhi,
-                                box_lo,
-                                box_hi,
-                                cell_lower,
-                                size,
-                                slab0,
-                                slab1,
-                                slab2,
-                                slab_half,
-                            ):
-                                marks = marks | (1 << (e - chunk))
-                                found += 1
-                        if found > 0:
-                            out = wp.atomic_add(candidate_count, 0, found)
-                            for j in range(32):
-                                if (marks >> j) & 1 != 0:
-                                    if out < candidates.shape[0]:
-                                        candidates[out] = mesh_cells_candidate(
-                                            pair_index, mesh_cells.entries[chunk + j][0], level, cell
-                                        )
-                                    out += 1
+                    out = wp.atomic_add(hit_count, 0, 1)
+                    if out < hit_head.shape[0]:
+                        hit_head[out] = wp.vec4i(pair_index, level, cell[0] | (cell[1] << 15), cell[2])
+                        hit_span[out] = wp.vec2i(slot.start, slot.count)
             k += lanes
         visited += n
+
+
+@wp.func
+def mesh_vs_convex_hit_candidates(
+    head: wp.vec4i,
+    span: wp.vec2i,
+    query_lower: wp.vec3,
+    query_upper: wp.vec3,
+    lo0: wp.vec3i,
+    hi0: wp.vec3i,
+    slab0: wp.vec4,
+    slab1: wp.vec4,
+    slab2: wp.vec4,
+    slab_half: wp.vec3,
+    grid: MeshGrid,
+    mesh_cells: MeshCells,
+    candidates: wp.array[wp.vec4i],
+    candidate_count: wp.array[int],
+):
+    """Append a candidate (:func:`mesh_cells_candidate`) for each triangle of a hit cell
+    (:func:`mesh_vs_convex_cell_hits`) whose own box meets the query box and the bound's oriented box, from the
+    triangle's first registered cell in the query's range only.
+
+    The oriented box test is the exact pass's own necessary condition (a triangle that meets the oriented box has a
+    box that meets it), so it drops nothing the exact pass keeps. A small triangle (box of at most two cells per axis)
+    is tested for its first cell by its entry's block bits; a larger one by its registration
+    (:func:`mesh_cells_first_in_range`), loaded only for entries that passed the box tests.
+    """
+    pair_index = head[0]
+    level = head[1]
+    cell = wp.vec3i(head[2] & 0x7FFF, head[2] >> 15, head[3])
+    shift = MESH_CELLS_LEVEL_SHIFT * level
+    qlo = wp.vec3i(lo0[0] >> shift, lo0[1] >> shift, lo0[2] >> shift)
+    qhi = wp.vec3i(hi0[0] >> shift, hi0[1] >> shift, hi0[2] >> shift)
+    size = grid.cell * float(1 << shift)
+    inv_size = grid.inv_cell / float(1 << shift)
+    cell_lower = grid.origin + size * wp.vec3(float(cell[0]), float(cell[1]), float(cell[2]))
+    box_lo, box_hi = mesh_cells_box_in_cell(query_lower, query_upper, cell_lower, inv_size)
+    # A cell's candidates take one reservation, 32 entries at a time (marked, then written): one append per candidate
+    # costs one atomic on the shared count.
+    for chunk in range(span[0], span[0] + span[1], 32):
+        marks = int(0)
+        found = int(0)
+        for e in range(chunk, wp.min(chunk + 32, span[0] + span[1])):
+            if mesh_cells_entry_is_candidate(
+                mesh_cells.entries[e],
+                cell,
+                qlo,
+                qhi,
+                box_lo,
+                box_hi,
+                cell_lower,
+                size,
+                slab0,
+                slab1,
+                slab2,
+                slab_half,
+            ):
+                entry = mesh_cells.entries[e]
+                first = bool(True)
+                if (entry[3] >> 31) & 1 == 0:
+                    # A larger triangle: this cell must be its first registered cell in range (its registration).
+                    registration = mesh_cells.triangles[grid.triangle_start + entry[0]]
+                    first = mesh_cells_first_in_range(registration.cells_mask, registration.cells_box, cell, qlo, qhi)
+                if first:
+                    marks = marks | (1 << (e - chunk))
+                    found += 1
+        if found > 0:
+            out = wp.atomic_add(candidate_count, 0, found)
+            for j in range(32):
+                if (marks >> j) & 1 != 0:
+                    if out < candidates.shape[0]:
+                        candidates[out] = mesh_cells_candidate(
+                            pair_index, mesh_cells.entries[chunk + j][0], level, cell
+                        )
+                    out += 1
 
 
 @wp.func
@@ -1464,8 +1511,6 @@ def mesh_vs_convex_midphase(
     candidate: wp.vec4i,
     query_lower: wp.vec3,
     query_upper: wp.vec3,
-    lo0: wp.vec3i,
-    hi0: wp.vec3i,
     X_mesh_ws: wp.transform,
     X_ws: wp.transform,
     mesh_id: wp.uint64,
@@ -1477,16 +1522,15 @@ def mesh_vs_convex_midphase(
     shape_collision_aabb_upper: wp.array[wp.vec3],
     contact_threshold: float,
     non_mesh_center: wp.vec3,
-    mesh_cells: MeshCells,
     triangle_pairs: wp.array[wp.vec3i],
     triangle_pairs_count: wp.array[int],
 ):
     """
     Finish the mesh vs convex shape midphase for one candidate triangle of a pair.
 
-    The candidates come from the mesh's cell index (:func:`mesh_vs_convex_cell_candidates`): every triangle whose
-    box overlaps the shape's bound box, in each cell of the query's range it was met in. A candidate is kept from the
-    triangle's first registered cell in that range only (the reference-cell rule), when it meets the shape's bound
+    The candidates come from the mesh's cell index (:func:`mesh_vs_convex_hit_candidates`): every triangle whose
+    box meets the shape's query box and oriented box, once, from its first registered cell in the query's range (the
+    reference-cell rule, applied there). A candidate is kept when it meets the shape's bound
     exactly (an oriented box, and a segment plus a radius for spheres, capsules, cylinders and cones, all inflated by
     the threshold) and faces the shape. Kept triangles are appended to the triangle pairs of the triangle narrow
     phase.
@@ -1497,8 +1541,6 @@ def mesh_vs_convex_midphase(
         candidate: The candidate (:func:`mesh_cells_candidate`)
         query_lower: The pair's query box (:func:`mesh_vs_convex_query_box`), lower corner [m]
         query_upper: The pair's query box, upper corner [m]
-        lo0: The pair's level-0 cell range, lower corner
-        hi0: The pair's level-0 cell range, upper corner
         X_mesh_ws: Mesh world-space transform
         X_ws: Non-mesh shape world-space transform
         mesh_id: Mesh ID
@@ -1510,20 +1552,10 @@ def mesh_vs_convex_midphase(
         shape_collision_aabb_upper: Per-shape local AABB upper bounds
         contact_threshold: Contact candidate distance [m], including margin and gap
         non_mesh_center: Interior point of the convex shape in its scaled local frame [m]
-        mesh_cells: The scene's mesh cell indices
         triangle_pairs: Output array for triangle pairs (mesh_shape, non_mesh_shape, tri_index)
         triangle_pairs_count: Counter for triangle pairs
     """
-    grid = mesh_cells.grids[mesh_cells.shape_grid[mesh_shape]]
     tri_index = candidate[1]
-    registration = mesh_cells.triangles[grid.triangle_start + tri_index]
-    level = candidate[3] >> 15
-    cell = wp.vec3i(candidate[2] & 0x7FFF, (candidate[2] >> 15) & 0x7FFF, candidate[3] & 0x7FFF)
-    shift = MESH_CELLS_LEVEL_SHIFT * level
-    qlo = wp.vec3i(lo0[0] >> shift, lo0[1] >> shift, lo0[2] >> shift)
-    qhi = wp.vec3i(hi0[0] >> shift, hi0[1] >> shift, hi0[2] >> shift)
-    if not mesh_cells_first_in_range(registration.cells_mask, registration.cells_box, cell, qlo, qhi):
-        return
     mesh = wp.mesh_get(mesh_id)
     v0 = mesh.points[mesh.indices[3 * tri_index + 0]]
     v1 = mesh.points[mesh.indices[3 * tri_index + 1]]
