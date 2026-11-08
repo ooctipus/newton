@@ -429,8 +429,8 @@ class TestTerrainLawContacts(unittest.TestCase):
         with wp.ScopedCapture(device=model.device) as capture:
             pipeline.collide(state, contacts)
         wp.capture_launch(capture.graph)
-        # The pass keeps the rows the buffer holds and clamps its count to them.
-        self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 60)
+        # The pass keeps the rows the fixed buffer holds; its count keeps every contact found, as Newton's buffers do.
+        self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 60)
         self.assertEqual(contacts.rigid_contact_max, 60)
         self.assertTrue(pipeline.narrow_phase.buffer_capacity_status()["contacts"])
         roomy = _pipeline(model, {}, verify_buffers=True, **PIPELINE)
