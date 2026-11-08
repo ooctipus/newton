@@ -816,6 +816,7 @@ class CollisionPipelineUnifiedKamino:
             mesh_boundary_flags=self._model.geoms.mesh_boundary_flags,
             shape_mesh_boundary_start=self._model.geoms.mesh_boundary_start,
             mesh_cells=self._model.geoms.mesh_cells,
+            mesh_topology=self._model.geoms.mesh_topology,
             shape_heightfield_index=self.heightfield_index,
             heightfield_data=self.heightfield_data,
             heightfield_elevations=self.heightfield_elevations,

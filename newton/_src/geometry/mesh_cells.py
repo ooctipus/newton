@@ -812,6 +812,23 @@ def _read_meshes(mesh_ids: list[int], device) -> list[tuple[np.ndarray, np.ndarr
     return out
 
 
+def read_mesh_buffers(shape_type, shape_source_ptr, device=None) -> tuple[np.ndarray, np.ndarray, dict]:
+    """The host buffers of every triangle mesh shape, read back from the device by mesh id.
+
+    For a narrow phase given only device mesh ids (a standalone :class:`NarrowPhase`), so that its cells and topology
+    are built from the same buffers the collision kernels read.
+
+    Returns:
+        The shapes' types and source pointers on the host, and ``{mesh id: (points, indices)}``.
+    """
+    types = np.asarray(shape_type.numpy() if hasattr(shape_type, "numpy") else shape_type, dtype=np.int64).reshape(-1)
+    sources = np.asarray(
+        shape_source_ptr.numpy() if hasattr(shape_source_ptr, "numpy") else shape_source_ptr, dtype=np.uint64
+    ).reshape(-1)
+    mesh_ids = sorted({int(sources[s]) for s in range(types.size) if types[s] == int(GeoType.MESH) and sources[s]})
+    return types, sources, dict(zip(mesh_ids, _read_meshes(mesh_ids, device), strict=True))
+
+
 def build_mesh_cells(
     shape_type,
     shape_source_ptr,
