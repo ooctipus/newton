@@ -969,8 +969,9 @@ def test_first_captured_collide_matches_eager(test, device):
             kernel.module.unload()
             state = model.state()
             newton.eval_fk(model, model.joint_q, model.joint_qd, state)
-            captured = _pipeline(model, setting, broad_phase=broad_phase)
-            eager = _pipeline(model, setting, broad_phase=broad_phase)
+            # Growable contacts: their passes forecast, so a capture holds the forecasting variant as well.
+            captured = _pipeline(model, setting, broad_phase=broad_phase, growable_contacts=True)
+            eager = _pipeline(model, setting, broad_phase=broad_phase, growable_contacts=True)
             templated = broad_phase == "explicit" and setting == "1"
             record = _kernel_record(captured)
             if broad_phase == "explicit":
