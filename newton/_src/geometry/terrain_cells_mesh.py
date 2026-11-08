@@ -2255,14 +2255,20 @@ def terrain_mesh_cells_qualify(table: TerrainMeshCells, triangle_count: int) -> 
 def terrain_mesh_cells_law_surface(table: TerrainMeshCells) -> tuple[bool, str]:
     """Whether the terrain law reads the whole table as its one surface type, a lattice of vertex heights.
 
-    The law reads ``vertex_z`` as it reads a heightfield's heights: every cell must be a grid cell on the heightfield's
+    The law reads ``vertex_z`` as it reads a heightfield's heights, and its solid is a heightfield's: ``z <= h`` inside
+    the footprint, with walls :data:`~newton._src.geometry.terrain_law.TERRAIN_WALL_DEPTH` deep at the border. The mesh
+    must therefore be a height sheet: no wall and no bottom (a closed mesh's bottom bounds free space below it, which
+    the law's solid would fill: a static box under which bodies pass), every cell a grid cell on the heightfield's
     diagonal ``(0, 0)-(1, 1)`` whose corners are the shared vertex heights (no record), with no riser on an edge inside
-    the table (edge bits only on the table's border, where the law's border walls stand). Step cells, risers on cell
-    edges, the other diagonal, mixed and empty cells are what the law's riser features and the cell CSR add; until then
-    a table with any of them keeps its mesh on the generic path.
+    the table. Walls, bottoms (the law's floor), step cells, risers on cell edges, the other diagonal, mixed and empty
+    cells are what the law's riser features, its floor and the cell CSR add; until then a table with any of them keeps
+    its mesh on the generic path.
     """
     flags = table.cell_flags
     rows, cols = table.shape
+    walls, bottoms = table.stats.get("walls", 0), table.stats.get("down", 0)
+    if walls or bottoms:
+        return False, f"not a height sheet: {walls} wall and {bottoms} down-facing triangles"
     counts = table.counts()
     if counts["grid"] != rows * cols:
         return False, f"cells the law does not read yet: {counts['step']} step, {counts['mixed']} mixed, " + (
@@ -2289,10 +2295,12 @@ def terrain_mesh_surface(
 ) -> tuple[TerrainMeshCells | None, str]:
     """A static mesh's cell table when the terrain law takes the mesh as a surface, else ``None``; and why.
 
-    The data decide, never the task: the lattice must hold the mesh's structure (:func:`terrain_mesh_cells_qualify`'s
-    first test, checked on the lattice before anything is built), the table's size bound by the BVH it retires (checked
-    on the lattice's extent first, so that a chance lattice of a mesh without one allocates nothing), the rule itself on
-    the built table, and the law must read every cell (:func:`terrain_mesh_cells_law_surface`).
+    The data decide, never the task. From the device's one pass over the triangles (their classes and the lattice),
+    before anything is built: the mesh must be a height sheet (no wall, no down-facing triangle, as
+    :func:`terrain_mesh_cells_law_surface` requires: a closed terrain mesh keeps its path without paying for a table),
+    the lattice must hold the mesh's structure (:func:`terrain_mesh_cells_qualify`'s first test) and the table's size
+    must stay within the BVH it retires (on the lattice's extent, so that a chance lattice allocates nothing). Then the
+    rule itself on the built table, and the law must read every cell (:func:`terrain_mesh_cells_law_surface`).
 
     Args:
         vertices: Vertex positions [m] in the shape's (scaled) frame, shape ``(N, 3)``.
@@ -2304,7 +2312,13 @@ def terrain_mesh_surface(
     m = len(triangles)
     if m == 0 or len(vertices) == 0:
         return None, "no triangles"
-    lattice = terrain_mesh_lattice(vertices, triangles, device=device)
+    device = wp.get_device(device)
+    lattice, tri_class = _lattice_device(
+        wp.array(vertices, dtype=wp.vec3, device=device), wp.array(triangles, dtype=wp.vec3i, device=device), device
+    )
+    cls = np.bincount(tri_class.numpy(), minlength=4)
+    if cls[int(_WALL)] or cls[int(_DOWN)]:
+        return None, f"not a height sheet: {int(cls[int(_WALL)])} wall and {int(cls[int(_DOWN)])} down-facing triangles"
     share = min(lattice["x"]["vertex_share"], lattice["y"]["vertex_share"])
     dx, dy = lattice["x"]["size"], lattice["y"]["size"]
     if dx <= 0.0 or dy <= 0.0 or share < TERRAIN_CELL_MIN_LATTICE_SHARE:
