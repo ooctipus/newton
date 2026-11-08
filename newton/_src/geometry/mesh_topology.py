@@ -643,6 +643,17 @@ def mesh_point_feature(
 
 
 @wp.func
+def mesh_deepest_once(context: SurfaceFeatureContext) -> bool:
+    """Whether a mesh triangle's manifold writes its added deepest point only where it is a new point.
+
+    The manifold adds its deepest point beside the clipped polygon; where that point is a polygon vertex it would be
+    written twice, a duplicate row of one contact. Triangles with a topology (exact contacts) write it once;
+    heightfield triangles and soups keep the manifold as it is.
+    """
+    return context.row >= 0
+
+
+@wp.func
 def mesh_contact_filter(contact: ContactData, context: SurfaceFeatureContext) -> bool:
     """The feature rule for one GJK/MPR contact (manifold point) of a mesh triangle.
 

@@ -94,6 +94,7 @@ from .mesh_topology import (
     create_mesh_sphere_contact,
     create_surface_penetration_refiner,
     mesh_contact_filter,
+    mesh_deepest_once,
     mesh_manifold_triangle,
     mesh_surface_context,
     mesh_surface_planes,
@@ -2715,6 +2716,7 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
             query_filter=surface_query_filter,
             point_filter=mesh_contact_filter,
             manifold_shape=mesh_manifold_triangle,
+            deepest_once=mesh_deepest_once,
         )
     else:
         pair_query = create_compute_gjk_mpr_contacts(
@@ -3108,7 +3110,11 @@ def create_mesh_face_contacts_kernel(
     heightfield pairs are left to a query of their own.
     """
     face_contacts = create_compute_face_contacts(
-        writer_func, support_map_accelerated, mesh_contact_filter, mesh_manifold_triangle
+        writer_func,
+        support_map_accelerated,
+        mesh_contact_filter,
+        mesh_manifold_triangle,
+        deepest_once=mesh_deepest_once,
     )
 
     def mesh_face_contacts_kernel(
