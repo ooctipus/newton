@@ -1217,6 +1217,9 @@ class Model:
         self._mesh_cells = None
         """The cell index of each collision mesh (:class:`~newton._src.geometry.mesh_cells.MeshCells`), read by the
         mesh-vs-convex midphase."""
+        self._mesh_topology = None
+        """The welded topology of each collision mesh (:class:`~newton._src.geometry.mesh_topology.MeshTopology`),
+        read by the triangle contact law. Built with :attr:`_mesh_cells`, at finalize."""
 
         # SDF storage (compact table + per-shape index indirection).
         # All SDF arrays are private; the public attribute names are exposed

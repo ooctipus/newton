@@ -76,8 +76,9 @@ from ..geometry.heightfield_cylinder import create_heightfield_cylinder_split_ke
 from ..geometry.heightfield_features import HeightfieldFeatureContext
 from ..geometry.heightfield_primitive_contact import ANALYTIC_PRIMITIVE_QUERIES, analytic_primitives_default
 from ..geometry.heightfield_row_gate import HEIGHTFIELD_ROW_COUNT, HEIGHTFIELD_TYPED_ROWS, heightfield_row_gate_kernel
-from ..geometry.mesh_cells import MeshCells, build_mesh_cells
+from ..geometry.mesh_cells import MeshCells, build_mesh_cells, read_mesh_buffers
 from ..geometry.mesh_topology import (
+    MeshTopology,
     MeshTopologyData,
     create_mesh_capsule_contacts,
     create_mesh_sphere_contact,
@@ -2848,6 +2849,14 @@ def record_narrow_phase_buffers(
     )
 
 
+class _HostMesh:
+    """A mesh's host buffers, in the form :class:`MeshTopology` reads (``vertices``, ``indices``)."""
+
+    def __init__(self, vertices, indices):
+        self.vertices = vertices
+        self.indices = indices
+
+
 class NarrowPhase:
     """Resolve broad-phase shape pairs into simulation contacts.
 
@@ -3089,12 +3098,14 @@ class NarrowPhase:
             max_candidate_pairs if max_heightfield_pairs is None else max_heightfield_pairs,
         )
         self.device = device
-        # The welded topology of the meshes (see mesh_topology.py). The collision pipeline binds the model's;
-        # a narrow phase given none reads every mesh as a triangle soup.
+        # The welded topology of the meshes (see mesh_topology.py), set by each launch: the model's, passed by the
+        # pipelines, or this narrow phase's own (see :meth:`_own_mesh_data`).
         self.mesh_topology = empty_mesh_topology(device)
         self.reduce_contacts = reduce_contacts
         self.has_meshes = has_meshes
         self._empty_mesh_cells = None
+        self._own_mesh_key = None
+        self._own_mesh_data_value = None
         self.has_heightfields = has_heightfields
         # Mixed mesh/heightfield scenes retain the original full midphase;
         # heightfield-only rejection adds no buffers or cached geometry.
@@ -4101,6 +4112,29 @@ class NarrowPhase:
                 record_tape=False,
             )
 
+    def _own_mesh_data(self, shape_types, shape_source, shape_collision_radius, device):
+        """The cells and topology of the meshes in ``shape_source``, for a narrow phase not given its model's.
+
+        Built once from the device meshes' buffers (one read for both) and kept for launches with the same
+        ``shape_source`` array; a launch with another array builds them for it. The topology reads the launch's
+        ``shape_collision_radius`` in place, as a model's reads the model's.
+        """
+        key = (shape_source.ptr, shape_source.shape[0], shape_types.ptr)
+        if self._own_mesh_key != key:
+            types, sources, buffers = read_mesh_buffers(shape_types, shape_source, device)
+            cells = build_mesh_cells(types, sources, device, meshes=buffers)
+            meshes = {mid: _HostMesh(points, indices) for mid, (points, indices) in buffers.items()}
+            shape_meshes = [
+                meshes.get(int(source)) if t == int(GeoType.MESH) else None
+                for t, source in zip(types, sources, strict=True)
+            ]
+            topology = MeshTopology(types, shape_meshes, device, shape_collision_radius).data
+            self._own_mesh_data_value = (cells, topology)
+            self._own_mesh_key = key
+        cells, topology = self._own_mesh_data_value
+        topology.shape_radius = shape_collision_radius
+        return cells, topology
+
     def launch_custom_write(
         self,
         *,
@@ -4138,6 +4172,7 @@ class NarrowPhase:
         mesh_edge_cluster_reach: wp.array[wp.float32] | None = None,
         shape_edge_range: wp.array[wp.vec2i] | None = None,
         mesh_cells: MeshCells | None = None,
+        mesh_topology: MeshTopologyData | None = None,
         hydroelastic_shape_sdf_data_prepared: bool = False,
         shape_linear_velocity: wp.array[wp.vec3] | None = None,
         shape_angular_velocity: wp.array[wp.vec3] | None = None,
@@ -4216,9 +4251,13 @@ class NarrowPhase:
                 Required with ``mesh_edge_indices`` for mesh edge contacts.
             mesh_cells: The cell indices of the triangle meshes in ``shape_source``
                 (:func:`~newton._src.geometry.mesh_cells.build_mesh_cells`), which the mesh-vs-convex midphase
-                reads. Pipelines pass the one their model built. When omitted, they are built from
-                ``shape_types`` and ``shape_source`` for this call, which reads those arrays on the host (not
-                inside a CUDA graph capture).
+                reads. Pipelines pass the one their model built at finalize.
+            mesh_topology: The welded topology of the same meshes
+                (:class:`~newton._src.geometry.mesh_topology.MeshTopology`'s ``data``), which the triangle contact
+                law reads; it becomes :attr:`mesh_topology`. Pipelines pass the one their model built with the cells.
+                A narrow phase given neither builds both once, from the meshes of ``shape_source`` read on the host
+                (not inside a CUDA graph capture), and keeps them for later launches with the same ``shape_source``
+                array.
             hydroelastic_shape_sdf_data_prepared: Whether finalized hydroelastic SDF descriptors were cached upstream.
             shape_linear_velocity: Shape-origin linear velocities [m/s]. Required in speculative mode.
             shape_angular_velocity: Shape angular velocities [rad/s]. Required in speculative mode.
@@ -4259,13 +4298,16 @@ class NarrowPhase:
             shape_edge_range = self._empty_edge_range
         # The triangle pair count the buffer check reads (the mesh midphase's report when it runs).
         mesh_buffer_report = self.triangle_pairs_count
+        if self.has_meshes and (mesh_cells is None or mesh_topology is None):
+            own_cells, own_topology = self._own_mesh_data(shape_types, shape_source, shape_collision_radius, device)
+            mesh_cells = own_cells if mesh_cells is None else mesh_cells
+            mesh_topology = own_topology if mesh_topology is None else mesh_topology
+        if mesh_topology is not None:
+            self.mesh_topology = mesh_topology
         if mesh_cells is None:
-            if self.has_meshes:
-                mesh_cells = build_mesh_cells(shape_types, shape_source, device)
-            else:
-                if self._empty_mesh_cells is None:
-                    self._empty_mesh_cells = build_mesh_cells([], [], device)
-                mesh_cells = self._empty_mesh_cells
+            if self._empty_mesh_cells is None:
+                self._empty_mesh_cells = build_mesh_cells([], [], device)
+            mesh_cells = self._empty_mesh_cells
         if self.speculative and shape_base_gap is None:
             raise ValueError("Speculative NarrowPhase requires the authored shape_base_gap array")
         if shape_base_gap is None:
@@ -5312,6 +5354,7 @@ class NarrowPhase:
         mesh_edge_cluster_reach = kwargs.pop("mesh_edge_cluster_reach", None)
         shape_edge_range = kwargs.pop("shape_edge_range", None)
         mesh_cells = kwargs.pop("mesh_cells", None)
+        mesh_topology = kwargs.pop("mesh_topology", None)
         if kwargs:
             unknown_keys = sorted(kwargs.keys())
             if len(unknown_keys) == 1:
@@ -5414,6 +5457,7 @@ class NarrowPhase:
             mesh_edge_cluster_reach=mesh_edge_cluster_reach,
             shape_edge_range=shape_edge_range,
             mesh_cells=mesh_cells,
+            mesh_topology=mesh_topology,
             shape_linear_velocity=shape_linear_velocity,
             shape_angular_velocity=shape_angular_velocity,
             collision_update_dt=collision_update_dt,

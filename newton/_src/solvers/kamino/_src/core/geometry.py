@@ -227,6 +227,10 @@ class GeometriesModel:
     mesh_cells: object | None = None
     """The collision meshes' cell index (:class:`~newton._src.geometry.mesh_cells.MeshCells`) for the midphase."""
 
+    mesh_topology: object | None = None
+    """The collision meshes' welded topology (:class:`~newton._src.geometry.mesh_topology.MeshTopologyData`) for the
+    triangle contact law."""
+
     collision_radius: wp.array[wp.float32] | None = None
     """Per-shape bounding-sphere radius for broadphase AABB computation."""
 

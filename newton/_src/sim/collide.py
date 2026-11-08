@@ -54,7 +54,6 @@ from ..geometry.contact_sort import ContactSorter
 from ..geometry.differentiable_contacts import launch_differentiable_contact_augment
 from ..geometry.flags import MeshProperties, ShapeFlags
 from ..geometry.kernels import create_soft_contacts
-from ..geometry.mesh_topology import MeshTopology
 from ..geometry.narrow_phase import NarrowPhase
 from ..geometry.sdf_hydroelastic import HydroelasticSDF
 from ..geometry.soft_contacts_heightfield import _HEIGHTFIELD_CELLS_PER_TASK, launch_soft_heightfield_contacts
@@ -3385,12 +3384,9 @@ class CollisionPipeline:
         # ``reduce_contacts`` attribute.
         self.mesh_contact_reduction_enabled = bool(self.narrow_phase.reduce_contacts)
 
-        # The meshes' welded topology for the triangle queries' feature rule: built once, here, where the
-        # pipeline's collision data is built (see geometry/mesh_topology.py).
-        self.mesh_topology = None
-        if getattr(self.narrow_phase, "has_meshes", False):
-            self.mesh_topology = MeshTopology.from_model(model, device)
-            self.narrow_phase.mesh_topology = self.mesh_topology.data
+        # The meshes' welded topology for the triangle queries' feature rule: the model's, built at finalize with
+        # the meshes' cells (see geometry/mesh_topology.py); each collide passes both to the narrow phase.
+        self.mesh_topology = model._mesh_topology
 
         self._hydro_shape_sdf_data_prepared = self.hydroelastic_sdf is not None
         if self.hydroelastic_sdf is not None:
@@ -5417,6 +5413,7 @@ class CollisionPipeline:
             mesh_edge_indices=model._mesh_edge_indices,
             shape_edge_range=model._shape_edge_range,
             mesh_cells=model._mesh_cells,
+            mesh_topology=None if model._mesh_topology is None else model._mesh_topology.data,
             writer_data=writer_data,
             device=self.device,
             **narrow_phase_extension_kwargs,

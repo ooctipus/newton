@@ -15717,6 +15717,18 @@ class ModelBuilder:
                 meshes=mesh_buffers,
                 query_size=float(np.median(query_extents)) if query_extents else None,
             )
+            # The welded topology of the same meshes, read by the triangle contact law: one block per finalized mesh
+            # (shapes whose meshes finalized to one Warp mesh share its block).
+            from ..geometry.mesh_topology import MeshTopology  # noqa: PLC0415
+
+            first_mesh_of_source = {}
+            topology_sources = [
+                first_mesh_of_source.setdefault(int(source), geo)
+                if shape_type == GeoType.MESH and isinstance(geo, Mesh) and source
+                else None
+                for shape_type, geo, source in zip(self.shape_type, generated_shape_sources, geo_sources, strict=True)
+            ]
+            m._mesh_topology = MeshTopology(self.shape_type, topology_sources, device, m.shape_collision_radius)
 
             # ---------------------
             # Compute and compact texture SDF resources (shared table + per-shape index indirection)
