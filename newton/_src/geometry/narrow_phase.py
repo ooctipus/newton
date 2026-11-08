@@ -98,7 +98,6 @@ from ..utils.heightfield import (
     get_triangle_shape_from_heightfield,
     heightfield_vs_convex_midphase,
 )
-from .penetration import create_solve_box_penetration
 
 _SPARSE_GJK_PAIR_CAPACITY_THRESHOLD = 1_000_000
 # CUDA lane midphase: pairs with more cells than this move to the lane pass, which
@@ -126,15 +125,10 @@ def _append_work_index_compacted(
     value: int,
     work_items: wp.array[int],
     work_count: wp.array[int],
-    reverse: bool = False,
 ):
-    """Append to the front queue, or the back queue using counter one."""
-    index = int(-1)
-    if predicate:
-        index = wp.atomic_add(work_count, int(reverse), 1)
+    """Append one selected work item to a compacted queue."""
+    index = _reserve_compacted_slot(int(predicate), work_count)
     if index >= 0 and index < work_items.shape[0]:
-        if reverse:
-            index = work_items.shape[0] - 1 - index
         work_items[index] = value
 
 
@@ -196,39 +190,8 @@ class ConvexPairQueryData:
     enlarge: float
 
 
-@wp.func
-def _penetration_bounds_half(
-    shape: int,
-    shape_type: int,
-    shape_data: wp.array[wp.vec4],
-    lower: wp.array[wp.vec3],
-    upper: wp.array[wp.vec3],
-) -> wp.vec3:
-    """Use current primitive dimensions and cached hull bounds for penetration checks."""
-    data = shape_data[shape]
-    scale = wp.vec3(data[0], data[1], data[2])
-    half = wp.vec3(0.0)
-    if shape_type == GeoType.BOX or shape_type == GeoType.ELLIPSOID:
-        half = scale
-    elif shape_type == GeoType.SPHERE:
-        half = wp.vec3(scale[0])
-    elif shape_type == GeoType.CAPSULE:
-        half = wp.vec3(scale[0], scale[0], scale[0] + scale[1])
-    elif shape_type == GeoType.CYLINDER or shape_type == GeoType.CONE:
-        radius = scale[0]
-        if shape_type == GeoType.CYLINDER and scale[2] > 0.0 and scale[2] >= scale[1]:
-            radius += scale[1] * scale[1] / (scale[2] + wp.sqrt(scale[2] * scale[2] - scale[1] * scale[1]))
-        half = wp.vec3(radius, radius, scale[1])
-    elif shape_type == GeoType.CONVEX_MESH and lower.shape[0] > 0:
-        half = 0.5 * (upper[shape] - lower[shape])
-    return half
-
-
 # Threads per mesh-convex midphase query when there are many queries.
 _MIDPHASE_NARROW_TILE_SIZE = wp.constant(32)
-
-# Threads that share one overlap refinement's box-hull certificate.
-_REFINE_BLOCK_DIM = 32
 
 
 def create_prepare_convex_pair(external_aabb: bool, speculative: bool = False):
@@ -1364,13 +1327,6 @@ def create_narrow_phase_kernel_gjk_mpr(
             data_provider = provider_type()
             data_provider.shape_support_data = shape_support_data
             data_provider.support_neighbors = support_neighbors
-            if type_a != GeoType.PLANE and type_b != GeoType.PLANE:
-                shape_data_a.bounds_half = _penetration_bounds_half(
-                    shape_a, type_a, shape_data, shape_collision_aabb_lower, shape_collision_aabb_upper
-                )
-                shape_data_b.bounds_half = _penetration_bounds_half(
-                    shape_b, type_b, shape_data, shape_collision_aabb_lower, shape_collision_aabb_upper
-                )
             if wp.static(accelerated_support):
                 data_provider.support_lut = support_lut
                 data_provider.support_vertex_offsets = support_vertex_offsets
@@ -1495,16 +1451,14 @@ def create_narrow_phase_kernels_gjk_mpr_split(
     post_process_contact: Any = None,
     speculative: bool = False,
 ):
-    """Create graph-capturable MPR, GJK/refinement, and manifold work-queue kernels."""
+    """Create graph-capturable MPR, GJK, and manifold work-queue kernels."""
     if support_func is None:
         support_func = support_map
     if post_process_contact is None:
         post_process_contact = post_process_axial_on_discrete_contact
 
     support_funcs = create_support_map_function(support_func, use_precomputed_center=True)
-    solve_mpr = create_solve_mpr(
-        support_func, _support_funcs=support_funcs, depth_certificate=create_solve_box_penetration
-    )
+    solve_mpr = create_solve_mpr(support_func, _support_funcs=support_funcs)
     solve_gjk = create_solve_closest_distance(support_func, _support_funcs=support_funcs)
     prepare_pair = create_prepare_convex_pair(external_aabb, speculative)
     write_result = create_write_convex_query_result(
@@ -1570,8 +1524,6 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                 )
 
             needs_gjk = False
-            needs_refine = False
-            refine_item = pair_index
             needs_manifold = False
             if valid:
                 provider = provider_type()
@@ -1580,62 +1532,15 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                 if wp.static(accelerated_support):
                     provider.support_lut = support_lut
                     provider.support_vertex_offsets = support_vertex_offsets
-                collision, point_a, point_b, normal, penetration, seed, witnesses_valid = wp.static(
-                    solve_mpr.portal_core
-                )(
+                collision, point_a, point_b, normal, penetration = wp.static(solve_mpr.core)(
                     query.geom_a,
                     query.geom_b,
                     query.relative_orientation_b,
                     query.relative_position_b,
                     query.enlarge,
                     provider,
-                    wp.vec3(0.0),
                 )
-                refine_portal = False
                 if collision:
-                    if query.type_a != GeoType.PLANE and query.type_b != GeoType.PLANE:
-                        query.geom_a.bounds_half = _penetration_bounds_half(
-                            query.shape_a,
-                            query.type_a,
-                            shape_data,
-                            shape_collision_aabb_lower,
-                            shape_collision_aabb_upper,
-                        )
-                        query.geom_b.bounds_half = _penetration_bounds_half(
-                            query.shape_b,
-                            query.type_b,
-                            shape_data,
-                            shape_collision_aabb_lower,
-                            shape_collision_aabb_upper,
-                        )
-                    refine_portal = wp.static(solve_mpr.needs_refine)(
-                        query.geom_a,
-                        query.geom_b,
-                        query.relative_orientation_b,
-                        query.relative_position_b,
-                        query.enlarge,
-                        penetration,
-                        witnesses_valid,
-                    )
-                if collision and (not witnesses_valid or refine_portal):
-                    # Queue confirmed overlaps from the back of the same array,
-                    # keeping both passes compact without another work buffer.
-                    result = ConvexQueryResult()
-                    # Provisional fields carry the portal result, or the retry
-                    # seed when its witnesses are invalid; refinement overwrites
-                    # them before the manifold pass.
-                    result.point_a = point_a
-                    result.point_b = point_b
-                    if not witnesses_valid:
-                        result.point_a = seed
-                    result.normal = normal
-                    result.signed_distance = penetration
-                    query_results[pair_index] = result
-                    needs_refine = True
-                    # Negative entries mark valid witnesses awaiting certification.
-                    if witnesses_valid:
-                        refine_item = -1 - pair_index
-                elif collision:
                     signed_distance = -penetration + query.enlarge
                     if signed_distance <= query.contact_threshold:
                         half_enlarge = 0.5 * query.enlarge
@@ -1650,188 +1555,74 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                     needs_gjk = True
 
             _append_work_index_compacted(needs_gjk, pair_index, gjk_work_items, gjk_work_count)
-            _append_work_index_compacted(needs_refine, refine_item, gjk_work_items, gjk_work_count, True)
             _append_work_index_compacted(needs_manifold, pair_index, manifold_work_items, manifold_work_count)
 
-    def create_distance_kernel(refine_overlap: bool):
-        # Compile refinement separately: its retries and raycast would raise
-        # register pressure for every ordinary separated GJK query.
-        @wp.kernel(enable_backward=False, module=f"narrow_phase_gjk_{suffix}_{refine_overlap}")
-        def narrow_phase_gjk_kernel(
-            candidate_pair: wp.array[wp.vec2i],
-            shape_types: wp.array[int],
-            shape_data: wp.array[wp.vec4],
-            shape_transform: wp.array[wp.transform],
-            shape_source: wp.array[wp.uint64],
-            shape_support_data: wp.array[wp.vec4i],
-            support_lut: wp.array[int],
-            support_vertex_offsets: wp.array[int],
-            support_neighbors: wp.array[int],
-            shape_gap: wp.array[float],
-            shape_collision_radius: wp.array[float],
-            shape_aabb_lower: wp.array[wp.vec3],
-            shape_aabb_upper: wp.array[wp.vec3],
-            shape_collision_aabb_lower: wp.array[wp.vec3],
-            shape_collision_aabb_upper: wp.array[wp.vec3],
-            total_num_threads: int,
-            query_results: wp.array[ConvexQueryResult],
-            gjk_work_items: wp.array[int],
-            gjk_work_count: wp.array[int],
-            manifold_work_items: wp.array[int],
-            manifold_work_count: wp.array[int],
-        ):
-            tid = wp.tid()
-            # Separated queries fill the front of the queue and overlap
-            # refinements the back.
-            num_distance = wp.min(gjk_work_items.shape[0], gjk_work_count[0])
-            num_work_items = num_distance
-            # Large accelerated hulls benefit from a cooperative certificate.
-            # Keep small exhaustive-support pairs independent across lanes so
-            # dense refinement queues retain their full pair parallelism.
-            lane = int(0)
-            first = tid
-            stride = total_num_threads
-            if wp.static(refine_overlap):
-                num_work_items = wp.min(gjk_work_items.shape[0] - num_distance, gjk_work_count[1])
+    @wp.kernel(enable_backward=False, module=f"narrow_phase_gjk_{suffix}")
+    def narrow_phase_gjk_kernel(
+        candidate_pair: wp.array[wp.vec2i],
+        shape_types: wp.array[int],
+        shape_data: wp.array[wp.vec4],
+        shape_transform: wp.array[wp.transform],
+        shape_source: wp.array[wp.uint64],
+        shape_support_data: wp.array[wp.vec4i],
+        support_lut: wp.array[int],
+        support_vertex_offsets: wp.array[int],
+        support_neighbors: wp.array[int],
+        shape_gap: wp.array[float],
+        shape_collision_radius: wp.array[float],
+        shape_aabb_lower: wp.array[wp.vec3],
+        shape_aabb_upper: wp.array[wp.vec3],
+        shape_collision_aabb_lower: wp.array[wp.vec3],
+        shape_collision_aabb_upper: wp.array[wp.vec3],
+        total_num_threads: int,
+        query_results: wp.array[ConvexQueryResult],
+        gjk_work_items: wp.array[int],
+        gjk_work_count: wp.array[int],
+        manifold_work_items: wp.array[int],
+        manifold_work_count: wp.array[int],
+    ):
+        tid = wp.tid()
+        num_work_items = wp.min(gjk_work_items.shape[0], gjk_work_count[0])
+        for work_index in range(tid, num_work_items, total_num_threads):
+            pair_index = gjk_work_items[work_index]
+            valid, query = wp.static(prepare_pair)(
+                candidate_pair[pair_index],
+                shape_types,
+                shape_data,
+                shape_transform,
+                shape_source,
+                shape_gap,
+                shape_collision_radius,
+                shape_aabb_lower,
+                shape_aabb_upper,
+                shape_collision_aabb_lower,
+                shape_collision_aabb_upper,
+            )
+            needs_manifold = False
+            if valid:
+                provider = provider_type()
+                provider.shape_support_data = shape_support_data
+                provider.support_neighbors = support_neighbors
                 if wp.static(accelerated_support):
-                    lane = tid % wp.block_dim()
-                    first = tid / wp.block_dim()
-                    stride = total_num_threads / wp.block_dim()
-            for work_index in range(first, num_work_items, stride):
-                pair_index = gjk_work_items[work_index]
-                witnesses_valid = False
-                if wp.static(refine_overlap):
-                    pair_index = gjk_work_items[gjk_work_items.shape[0] - 1 - work_index]
-                    # Negative entries mark valid witnesses awaiting certification.
-                    if pair_index < 0:
-                        pair_index = -1 - pair_index
-                        witnesses_valid = True
-                valid, query = wp.static(prepare_pair)(
-                    candidate_pair[pair_index],
-                    shape_types,
-                    shape_data,
-                    shape_transform,
-                    shape_source,
-                    shape_gap,
-                    shape_collision_radius,
-                    shape_aabb_lower,
-                    shape_aabb_upper,
-                    shape_collision_aabb_lower,
-                    shape_collision_aabb_upper,
+                    provider.support_lut = support_lut
+                    provider.support_vertex_offsets = support_vertex_offsets
+                _separated, point_a, point_b, normal, signed_distance = wp.static(solve_gjk.core)(
+                    query.geom_a,
+                    query.geom_b,
+                    query.relative_orientation_b,
+                    query.relative_position_b,
+                    0.0,
+                    provider,
                 )
-                needs_manifold = False
-                if valid:
-                    provider = provider_type()
-                    provider.shape_support_data = shape_support_data
-                    provider.support_neighbors = support_neighbors
-                    if query.type_a != GeoType.PLANE and query.type_b != GeoType.PLANE:
-                        query.geom_a.bounds_half = _penetration_bounds_half(
-                            query.shape_a,
-                            query.type_a,
-                            shape_data,
-                            shape_collision_aabb_lower,
-                            shape_collision_aabb_upper,
-                        )
-                        query.geom_b.bounds_half = _penetration_bounds_half(
-                            query.shape_b,
-                            query.type_b,
-                            shape_data,
-                            shape_collision_aabb_lower,
-                            shape_collision_aabb_upper,
-                        )
-                    if wp.static(accelerated_support):
-                        provider.support_lut = support_lut
-                        provider.support_vertex_offsets = support_vertex_offsets
-                    resolved = False
-                    point_a = wp.vec3(0.0)
-                    point_b = wp.vec3(0.0)
-                    normal = wp.vec3(0.0)
-                    signed_distance = float(0.0)
-                    if wp.static(refine_overlap):
-                        pending = query_results[pair_index]
-                        # Try a distance query for a near-touching invalid portal
-                        # before the heavier overlap recovery.
-                        separated_pair = not witnesses_valid and pending.signed_distance <= query.enlarge
-                        certificate_ready = False
-                        certificate_normal = wp.vec3(0.0)
-                        certificate_depth = float(0.0)
-                        if wp.static(accelerated_support):
-                            if not separated_pair:
-                                certificate_ready, certificate_normal, certificate_depth = wp.static(
-                                    solve_mpr.cooperative_certificate
-                                )(
-                                    query.geom_a,
-                                    query.geom_b,
-                                    query.relative_orientation_b,
-                                    query.relative_position_b,
-                                    provider,
-                                    pending.normal,
-                                    lane,
-                                    wp.block_dim(),
-                                )
-                        if lane == 0:
-                            penetration = float(0.0)
-                            if separated_pair:
-                                resolved, point_a, point_b, normal, penetration = wp.static(solve_mpr.separated_core)(
-                                    query.geom_a,
-                                    query.geom_b,
-                                    query.relative_orientation_b,
-                                    query.relative_position_b,
-                                    query.enlarge,
-                                    provider,
-                                )
-                            if not resolved:
-                                seed = pending.point_a
-                                if witnesses_valid:
-                                    seed = wp.vec3(0.0)
-                                point_a, point_b, normal, penetration, resolved = wp.static(solve_mpr.refine_core)(
-                                    query.geom_a,
-                                    query.geom_b,
-                                    query.relative_orientation_b,
-                                    query.relative_position_b,
-                                    query.enlarge,
-                                    provider,
-                                    seed,
-                                    pending.point_a,
-                                    pending.point_b,
-                                    pending.normal,
-                                    pending.signed_distance,
-                                    witnesses_valid,
-                                    certificate_ready,
-                                    certificate_normal,
-                                    certificate_depth,
-                                )
-                            point_a -= normal * (0.5 * query.enlarge)
-                            point_b += normal * (0.5 * query.enlarge)
-                            signed_distance = -penetration + query.enlarge
-                        else:
-                            resolved = True
-                            signed_distance = 1.0e30
-                    # Unresolved refinements follow the ordinary distance query.
-                    if not resolved:
-                        resolved = True
-                        _separated, point_a, point_b, normal, signed_distance = wp.static(solve_gjk.core)(
-                            query.geom_a,
-                            query.geom_b,
-                            query.relative_orientation_b,
-                            query.relative_position_b,
-                            0.0,
-                            provider,
-                        )
-                    if resolved and signed_distance <= query.contact_threshold:
-                        result = ConvexQueryResult()
-                        result.point_a = point_a
-                        result.point_b = point_b
-                        result.normal = normal
-                        result.signed_distance = signed_distance
-                        query_results[pair_index] = result
-                        needs_manifold = True
-                _append_work_index_compacted(needs_manifold, pair_index, manifold_work_items, manifold_work_count)
-
-        return narrow_phase_gjk_kernel
-
-    narrow_phase_gjk_kernel = create_distance_kernel(False)
-    narrow_phase_refine_kernel = create_distance_kernel(True)
+                if signed_distance <= query.contact_threshold:
+                    result = ConvexQueryResult()
+                    result.point_a = point_a
+                    result.point_b = point_b
+                    result.normal = normal
+                    result.signed_distance = signed_distance
+                    query_results[pair_index] = result
+                    needs_manifold = True
+            _append_work_index_compacted(needs_manifold, pair_index, manifold_work_items, manifold_work_count)
 
     @wp.kernel(enable_backward=False, module=f"narrow_phase_manifold_{suffix}")
     def narrow_phase_manifold_kernel(
@@ -1913,7 +1704,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                 contact_template,
             )
 
-    return narrow_phase_mpr_kernel, narrow_phase_gjk_kernel, narrow_phase_refine_kernel, narrow_phase_manifold_kernel
+    return narrow_phase_mpr_kernel, narrow_phase_gjk_kernel, narrow_phase_manifold_kernel
 
 
 @wp.kernel(enable_backward=False)
@@ -2655,8 +2446,6 @@ def _check_narrow_phase_buffers(
         )
     if max_split_gjk >= 0:
         split_count = split_gjk_count[0]
-        if split_gjk_count.shape[0] > 1:
-            split_count += split_gjk_count[1]
         if split_count > max_split_gjk:
             flags = flags | 8
             wp.printf(
@@ -3446,7 +3235,6 @@ class NarrowPhase:
             (
                 self.narrow_phase_mpr_kernel,
                 self.narrow_phase_gjk_kernel,
-                self.narrow_phase_refine_kernel,
                 self.narrow_phase_manifold_kernel,
             ) = create_narrow_phase_kernels_gjk_mpr_split(
                 self.external_aabb,
@@ -3458,7 +3246,6 @@ class NarrowPhase:
         else:
             self.narrow_phase_mpr_kernel = None
             self.narrow_phase_gjk_kernel = None
-            self.narrow_phase_refine_kernel = None
             self.narrow_phase_manifold_kernel = None
         # Create triangle contacts kernel when meshes or heightfields are present
         if has_meshes or has_heightfields:
@@ -3566,7 +3353,7 @@ class NarrowPhase:
             gjk_idx = n
             n += 1
             split_gjk_idx = n if self.split_gjk_mpr else None
-            n += 3 if self.split_gjk_mpr else 0
+            n += 2 if self.split_gjk_mpr else 0
             cylinder_gjk_idx = n if self._heightfield_cylinder_split else None
             n += 1 if self._heightfield_cylinder_split else 0
             sdf_sdf_idx = n
@@ -3587,15 +3374,8 @@ class NarrowPhase:
             self._buffer_capacity_status = wp.zeros(1, dtype=wp.int32, device=device)
 
             self.gjk_candidate_pairs_count = c[gjk_idx : gjk_idx + 1]
-            # Separated queries grow from the front; overlap refinements grow
-            # from the back. Each candidate enters at most one of these queues.
-            self.split_gjk_work_count = c[split_gjk_idx : split_gjk_idx + 2] if self.split_gjk_mpr else None
-            """Distance-query and overlap-refinement counts, shape [2], or None when unsplit.
-
-            Entry 0 counts distance queries; entry 1 counts overlap refinements.
-            Their sum is the shared queue occupancy. Both reset on each collision pass.
-            """
-            self.split_manifold_work_count = c[split_gjk_idx + 2 : split_gjk_idx + 3] if self.split_gjk_mpr else None
+            self.split_gjk_work_count = c[split_gjk_idx : split_gjk_idx + 1] if self.split_gjk_mpr else None
+            self.split_manifold_work_count = c[split_gjk_idx + 1 : split_gjk_idx + 2] if self.split_gjk_mpr else None
             self._heightfield_cylinder_gjk_count = (
                 c[cylinder_gjk_idx : cylinder_gjk_idx + 1] if self._heightfield_cylinder_split else None
             )
@@ -3646,10 +3426,6 @@ class NarrowPhase:
             self.split_manifold_work_items = (
                 wp.zeros(candidate_pair_work_estimate, dtype=wp.int32, device=device) if self.split_gjk_mpr else None
             )
-            # Overlap refinement runs beside separated distance queries; the
-            # events fork it from and join it back to the caller's stream.
-            self._split_refine_stream = wp.Stream(device) if self.split_gjk_mpr else None
-            self._split_refine_events = (wp.Event(device), wp.Event(device)) if self.split_gjk_mpr else None
             # Generic convex pairs run beside mesh and SDF stages when the scene has them.
             overlap_convex = (
                 wp.get_device(device).is_cuda
@@ -3904,39 +3680,23 @@ class NarrowPhase:
                 block_dim=self.split_convex_block_dim,
                 record_tape=False,
             )
-            distance_inputs = [
-                convex_pairs,
-                *common_inputs,
-                self.split_convex_total_num_threads,
-                self.split_query_results,
-                self.split_gjk_work_items,
-                self.split_gjk_work_count,
-                self.split_manifold_work_items,
-                self.split_manifold_work_count,
-            ]
-            # Refinements and separated queries use disjoint queue segments
-            # and results, so their latency tails overlap on two streams.
-            main_stream = wp.get_stream(device)
-            fork_event, join_event = self._split_refine_events
-            self._split_refine_stream.wait_event(main_stream.record_event(fork_event))
-            wp.launch(
-                kernel=self.narrow_phase_refine_kernel,
-                dim=self.split_convex_total_num_threads,
-                inputs=distance_inputs,
-                device=device,
-                stream=self._split_refine_stream,
-                block_dim=_REFINE_BLOCK_DIM,
-                record_tape=False,
-            )
             wp.launch(
                 kernel=self.narrow_phase_gjk_kernel,
                 dim=self.split_convex_total_num_threads,
-                inputs=distance_inputs,
+                inputs=[
+                    convex_pairs,
+                    *common_inputs,
+                    self.split_convex_total_num_threads,
+                    self.split_query_results,
+                    self.split_gjk_work_items,
+                    self.split_gjk_work_count,
+                    self.split_manifold_work_items,
+                    self.split_manifold_work_count,
+                ],
                 device=device,
                 block_dim=self.split_convex_block_dim,
                 record_tape=False,
             )
-            main_stream.wait_event(self._split_refine_stream.record_event(join_event))
 
         pair_inputs = None
         if self._coherent_cache is not None:

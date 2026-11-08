@@ -8,7 +8,6 @@ import warp as wp
 from .coherent_convex import _CacheData, _find_slot, _finite_vector, _plane_lower_bound
 from .collision_convex import ConvexQueryResult
 from .mpr import create_solve_mpr, create_support_map_function
-from .penetration import create_solve_box_penetration
 from .simplex_solver import create_solve_closest_distance
 from .support_function import (
     AcceleratedSupportMapDataProvider,
@@ -16,7 +15,6 @@ from .support_function import (
     support_map_lean,
     support_map_lean_accelerated,
 )
-from .types import GeoType
 
 
 @wp.struct
@@ -25,8 +23,7 @@ class _PairInputs:
     shape_data: wp.array[wp.vec4]
     shape_transform: wp.array[wp.transform]
     shape_source: wp.array[wp.uint64]
-    # The split queue's hull support inputs: acceleration data and the verified topology that
-    # certifies a box-hull minimum depth.
+    # The split queue's hull support inputs: its acceleration data and hull topology.
     shape_support_data: wp.array[wp.vec4i]
     support_lut: wp.array[int]
     support_vertex_offsets: wp.array[int]
@@ -54,22 +51,18 @@ def _store_state(cache: _CacheData, slot: int, pair: wp.vec2i, inputs: _PairInpu
 def _create_rejection_query_kernels(accelerated=False, *, diagnostics=False):
     """Create a certificate filter and the original cold MPR/GJK queue owners.
 
-    The cold queries are the lean split queue's: its support (``accelerated`` when the model has
-    cooked hull support data), its box-hull depth certificate over the model's hull topology, and
-    its penetration bounds. No cached witness, simplex or warm solver can produce a retained
-    result. The existing manifold kernel owns all contact publication afterward.
+    The cold queries are the lean split queue's: its MPR and GJK over its support (``accelerated``
+    when the model has cooked hull support data) and the model's hull support data, so both routes
+    answer a pair with the same bits. No cached witness, simplex or warm solver can produce a
+    retained result. The existing manifold kernel owns all contact publication afterward.
     """
-    from .narrow_phase import (  # noqa: PLC0415
-        _append_work_index_compacted,
-        _penetration_bounds_half,
-        create_prepare_convex_pair,
-    )
+    from .narrow_phase import _append_work_index_compacted, create_prepare_convex_pair  # noqa: PLC0415
 
     support = support_map_lean_accelerated if accelerated else support_map_lean
     provider_type = AcceleratedSupportMapDataProvider if accelerated else SupportMapDataProvider
     prepare = create_prepare_convex_pair(True, False)
     maps = create_support_map_function(support, use_precomputed_center=True)
-    solve_mpr = create_solve_mpr(support, _support_funcs=maps, depth_certificate=create_solve_box_penetration).core
+    solve_mpr = create_solve_mpr(support, _support_funcs=maps).core
     solve_gjk = create_solve_closest_distance(support, _support_funcs=maps).core
 
     @wp.func
@@ -194,21 +187,6 @@ def _create_rejection_query_kernels(accelerated=False, *, diagnostics=False):
                 if wp.static(diagnostics):
                     wp.atomic_add(cache.stats, 7, 1)
                 provider = query_provider(inputs)
-                if query.type_a != GeoType.PLANE and query.type_b != GeoType.PLANE:
-                    query.geom_a.bounds_half = _penetration_bounds_half(
-                        query.shape_a,
-                        query.type_a,
-                        inputs.shape_data,
-                        inputs.shape_collision_aabb_lower,
-                        inputs.shape_collision_aabb_upper,
-                    )
-                    query.geom_b.bounds_half = _penetration_bounds_half(
-                        query.shape_b,
-                        query.type_b,
-                        inputs.shape_data,
-                        inputs.shape_collision_aabb_lower,
-                        inputs.shape_collision_aabb_upper,
-                    )
                 collision, point_a, point_b, normal, penetration = solve_mpr(
                     query.geom_a,
                     query.geom_b,
