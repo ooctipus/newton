@@ -299,9 +299,12 @@ def test_topology_build(test, device):
 
 
 def test_flat_lattice_shapes(test, device):
-    """Capsules, boxes and cylinders on a fine lattice get the contacts they get on two big triangles."""
+    """Capsules, boxes and cylinders on a fine flat lattice get the plane's contacts: no seam point, no ghost.
+
+    Under the shapes every lattice vertex is a flat vertex, so the manifold is the partner's own: a capsule's two
+    ends, a box face's four corners, a cylinder's rim samples, each reported once, at the plane depth.
+    """
     fine = _soup(*_lattice(16, 0.8))
-    coarse = _soup(*_lattice(1, 0.8))
     shapes = (
         ("capsule", {"radius": 0.03, "half_height": 0.12}, 0.031, wp.quat_from_axis_angle(wp.vec3(0, 1, 0), 1.5707964)),
         ("box", {"hx": 0.13, "hy": 0.07, "hz": 0.05}, 0.051, wp.quat_identity()),
@@ -310,20 +313,27 @@ def test_flat_lattice_shapes(test, device):
     for kind, args, z, rot in shapes:
         for x, y in ((0.0, 0.0), (0.05, 0.0), (0.033, 0.017)):
             xform = wp.transform(wp.vec3(x, y, z), rot)
-            for reduce in (False, True):
-                want = _collide(device, *coarse, (kind, args), xform, reduce=reduce)
-                got = _collide(device, *fine, (kind, args), xform, reduce=reduce)
-                test.assertTrue(np.all(np.abs(got[1][:, 2]) > 1.0 - 1e-5), f"{kind}: a ghost normal")
-                depth_want = np.sort(want[3])
-                depth_got = np.sort(got[3])
-                test.assertEqual(got[0], want[0], f"{kind} at {(x, y)} reduce={reduce}")
-                np.testing.assert_allclose(depth_got, depth_want, atol=2e-5)
-                if not reduce:
-                    # No seam points: every contact lies under the partner's own corners or ends, as on the plane.
-                    # (The reducer may keep a different subset of equally deep points.)
-                    np.testing.assert_allclose(
-                        np.sort(got[2][:, :2].round(5), axis=0), np.sort(want[2][:, :2].round(5), axis=0), atol=2e-5
-                    )
+            got = _collide(device, *fine, (kind, args), xform)
+            test.assertTrue(np.all(np.abs(got[1][:, 2]) > 1.0 - 1e-5), f"{kind}: a ghost normal")
+            np.testing.assert_allclose(got[3], np.full(got[0], 0.001), atol=2e-5)
+            local = got[2][:, :2] - np.array([x, y])
+            if kind == "capsule":
+                want = np.array([[-0.12, 0.0], [0.12, 0.0]])
+            elif kind == "box":
+                want = np.array([[sx * 0.13, sy * 0.07] for sx in (-1, 1) for sy in (-1, 1)])
+            else:
+                want = None
+            if want is None:
+                # Rim samples of the disc (the manifold keeps four).
+                test.assertEqual(got[0], 4)
+                np.testing.assert_allclose(np.linalg.norm(local, axis=1), 0.06, atol=2e-5)
+            else:
+                test.assertEqual(got[0], want.shape[0], f"{kind} at {(x, y)}")
+                np.testing.assert_allclose(np.sort(local, axis=0), np.sort(want, axis=0), atol=2e-5)
+            # The reducer keeps a subset of the same points.
+            reduced = _collide(device, *fine, (kind, args), xform, reduce=True)
+            test.assertTrue(np.all(np.abs(reduced[1][:, 2]) > 1.0 - 1e-5))
+            test.assertLessEqual(reduced[0], got[0])
 
 
 def test_capsule_over_ridge(test, device):
@@ -344,20 +354,38 @@ def test_capsule_over_ridge(test, device):
 
 
 def test_box_on_stair_nose(test, device):
-    """A box resting across a stair nose: its manifold on the tread, cut at the nose, with no ghost normal."""
+    """A box resting across a stair nose: its patch on the tread, cut at the nose, with no ghost normal.
+
+    The patch's corners are the box's two corners over the tread and the two crossings of its edges with the nose;
+    each is reported once. The tread's coplanar edges ending at the nose (a facet corner line) keep their seam
+    points; every contact lies in the patch.
+    """
     tread = _quad((-0.4, -0.4, 0.0), (0.0, -0.4, 0.0), (0.0, 0.4, 0.0), (-0.4, 0.4, 0.0), 8)
     riser = _quad((0.0, -0.4, -0.3), (0.0, 0.4, -0.3), (0.0, 0.4, 0.0), (0.0, -0.4, 0.0), 8)
-    fine = _soup(*_merge(tread, riser))
-    coarse = _soup(*_merge(_quad((-0.4, -0.4, 0.0), (0.0, -0.4, 0.0), (0.0, 0.4, 0.0), (-0.4, 0.4, 0.0), 1), riser))
     xform = wp.transform(wp.vec3(-0.05, 0.013, 0.051), wp.quat_identity())
-    shape = ("box", {"hx": 0.13, "hy": 0.07, "hz": 0.05})
-    want = _collide(device, *coarse, shape, xform)
-    got = _collide(device, *fine, shape, xform)
-    test.assertTrue(np.all(got[1][:, 2] > 1.0 - 1e-5))
-    test.assertEqual(got[0], want[0])
-    np.testing.assert_allclose(
-        np.sort(got[2][:, :2].round(5), axis=0), np.sort(want[2][:, :2].round(5), axis=0), atol=2e-5
+    count, normal, p0, separation = _collide(
+        device, *_soup(*_merge(tread, riser)), ("box", {"hx": 0.13, "hy": 0.07, "hz": 0.05}), xform
     )
+    test.assertTrue(np.all(normal[:, 2] > 1.0 - 1e-5))
+    np.testing.assert_allclose(separation, np.full(count, 0.001), atol=2e-5)
+    xy = p0[:, :2]
+    for corner in ((-0.18, -0.057), (-0.18, 0.083), (0.0, -0.057), (0.0, 0.083)):
+        test.assertEqual(int(np.sum(np.linalg.norm(xy - np.array(corner), axis=1) < 2e-5)), 1, f"corner {corner}")
+    test.assertTrue(np.all((xy[:, 0] > -0.18 - 2e-5) & (xy[:, 0] < 2e-5)))
+    test.assertTrue(np.all((xy[:, 1] > -0.057 - 2e-5) & (xy[:, 1] < 0.083 + 2e-5)))
+
+
+def test_small_facet_keeps_its_corners(test, device):
+    """A box covering a small two-triangle pad (a finger pad) rests on the pad's four corners."""
+    v = np.array([[-0.02, -0.01, 0.0], [0.02, -0.01, 0.0], [0.02, 0.01, 0.0], [-0.02, 0.01, 0.0]], np.float32)
+    v, f = _soup(v, np.array([[0, 1, 2], [0, 2, 3]]))
+    for reduce in (False, True):
+        xform = wp.transform(wp.vec3(0.003, 0.002, 0.0199), wp.quat_identity())
+        count, _normal, p0, _separation = _collide(
+            device, v, f, ("box", {"hx": 0.05, "hy": 0.05, "hz": 0.02}), xform, reduce=reduce
+        )
+        test.assertEqual(count, 4)
+        np.testing.assert_allclose(np.sort(np.abs(p0[:, :2]), axis=0), np.full((4, 2), (0.02, 0.01)), atol=1e-6)
 
 
 class TestMeshFeatures(unittest.TestCase):
@@ -375,6 +403,7 @@ for _name, _fn in (
     ("test_flat_lattice_shapes", test_flat_lattice_shapes),
     ("test_capsule_over_ridge", test_capsule_over_ridge),
     ("test_box_on_stair_nose", test_box_on_stair_nose),
+    ("test_small_facet_keeps_its_corners", test_small_facet_keeps_its_corners),
 ):
     add_function_test(TestMeshFeatures, _name, _fn, devices=devices)
 add_function_test(TestMeshFeatures, "test_topology_build", test_topology_build, devices=["cpu"])
