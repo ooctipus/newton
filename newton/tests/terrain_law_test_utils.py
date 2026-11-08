@@ -178,10 +178,10 @@ def _window_cells(data: TerrainFeatureData, heightfield: int, p: wp.vec3, reach:
     surface = data.surfaces[heightfield]
     cols = surface.ncol - 1
     rows = surface.nrow - 1
-    c0 = wp.clamp(int(wp.floor((p[0] - reach + surface.hx) / surface.dx)), 0, cols - 1)
-    c1 = wp.clamp(int(wp.floor((p[0] + reach + surface.hx) / surface.dx)), 0, cols - 1)
-    r0 = wp.clamp(int(wp.floor((p[1] - reach + surface.hy) / surface.dy)), 0, rows - 1)
-    r1 = wp.clamp(int(wp.floor((p[1] + reach + surface.hy) / surface.dy)), 0, rows - 1)
+    c0 = wp.clamp(int(wp.floor((p[0] - reach - surface.x0) / surface.dx)), 0, cols - 1)
+    c1 = wp.clamp(int(wp.floor((p[0] + reach - surface.x0) / surface.dx)), 0, cols - 1)
+    r0 = wp.clamp(int(wp.floor((p[1] - reach - surface.y0) / surface.dy)), 0, rows - 1)
+    r1 = wp.clamp(int(wp.floor((p[1] + reach - surface.y0) / surface.dy)), 0, rows - 1)
     return wp.vec4i(r0, r1, c0, c1)
 
 

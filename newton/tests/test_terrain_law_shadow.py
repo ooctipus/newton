@@ -192,7 +192,6 @@ def test_shadow_runs_under_graph_capture(test, device):
                 pipeline.geom_data,
                 shape_type=model.shape_type,
                 shape_gap=model.shape_gap,
-                shape_heightfield_index=model.shape_heightfield_index,
                 **pipeline._broad_phase_pair_filter(model),
             )
     finally:

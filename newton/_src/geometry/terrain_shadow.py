@@ -124,6 +124,7 @@ from .terrain_contacts import (
     TERRAIN_PARTNER_WALK_SLOTS,
     TerrainFeatures,
     TerrainPairTable,
+    TerrainSurfaces,
 )
 from .terrain_law import (
     TERRAIN_FINISH_ROW_BYTES,
@@ -655,8 +656,16 @@ class TerrainLawShadow:
             raise ValueError(f"The terrain law has no kernel for partner classes {missing}")
         if job_scale is not None and not (np.isfinite(float(job_scale)) and float(job_scale) > 0.0):
             raise ValueError(f"The terrain law's job capacities need a positive finite factor, not {job_scale!r}")
-        self.table = TerrainPairTable(model, pairs=pairs)
-        """The static (heightfield, partner) pair table."""
+        self.surfaces = TerrainSurfaces(model)
+        """The shapes the law reads as surfaces: heightfields and the static meshes it reads whole."""
+        self.shape_surface = wp.array(
+            self.surfaces.shape_surface if model.shape_count else np.full(1, -1, np.int32),
+            dtype=wp.int32,
+            device=model.device,
+        )
+        """Per shape: its surface index, or -1 (the pair inputs' :attr:`TerrainPairInputs.shape_surface`)."""
+        self.table = TerrainPairTable(model, pairs=pairs, surfaces=self.surfaces)
+        """The static (surface, partner) pair table."""
         self.job_scale = 1.0 if job_scale is None else float(job_scale)
         """Factor on every solid class's job capacities."""
         self._launches = []
@@ -788,8 +797,8 @@ class TerrainLawShadow:
             slot += walk * (end - begin)
         self.slot_count = slot
         """Walk slots of the side buffer: every listed pair times its class's walk slots."""
-        self.features = TerrainFeatures(model) if self._launches else None
-        """The heightfields' terrain features (``None`` without a listed pair); report height edits to it and rebuild
+        self.features = TerrainFeatures(model, self.surfaces) if self._launches else None
+        """The surfaces' terrain features (``None`` without a listed pair); report heightfield edits to it and rebuild
         outside capture."""
         self._slot_first = slot_first
         self._listed = np.flatnonzero(slot_first >= 0)
@@ -819,17 +828,21 @@ class TerrainLawShadow:
         """Host time of the construction [s]: features, pair table, kernel modules imported and buffers."""
 
     def written_pairs(self, model) -> tuple[np.ndarray, np.ndarray]:
-        """Return what the law writes when it feeds the solver (the default; see ``NEWTON_TERRAIN_LAW``): per shape, 1
-        for a partner whose heightfield pairs it writes (else 0), and the table indices of those pairs: every listed
-        pair (every partner of a listed class has a core).
+        """Return what the law writes when it feeds the solver (the default; see ``NEWTON_TERRAIN_LAW``): per shape its
+        role (:meth:`~newton._src.geometry.narrow_phase.NarrowPhase.set_terrain_law_roles`: 1 for a partner whose surface
+        pairs it writes, 2 for a static mesh it reads as a surface, else 0), and the table indices of those pairs: every
+        listed pair (every partner of a listed class has a core).
 
         Args:
             model: The finalized model the law was built for.
         """
+        from .narrow_phase import TERRAIN_LAW_MESH_SURFACE, TERRAIN_LAW_PARTNER  # noqa: PLC0415
+
         listed = self._listed
-        partner = np.zeros(model.shape_count, np.int32)
-        partner[self.table.pairs_host[listed, 1].astype(np.int64)] = 1
-        return partner, listed.astype(np.int32)
+        role = np.zeros(model.shape_count, np.int32)
+        role[np.asarray(self.surfaces.mesh_shapes, np.int64)] = int(TERRAIN_LAW_MESH_SURFACE)
+        role[self.table.pairs_host[listed, 1].astype(np.int64)] = int(TERRAIN_LAW_PARTNER)
+        return role, listed.astype(np.int32)
 
     def default_spill_rows(self) -> int:
         """Return the spill region's rows by default, from the listed pairs' own bounds on their rows
@@ -852,7 +865,6 @@ class TerrainLawShadow:
         *,
         shape_type: wp.array,
         shape_gap: wp.array,
-        shape_heightfield_index: wp.array,
         shape_body: wp.array,
         body_flags: wp.array | None,
         include_static_kinematic_pairs: bool,
@@ -864,7 +876,6 @@ class TerrainLawShadow:
             shape_data: Per shape, scale ``xyz`` and margin ``w``, current for this collide.
             shape_type: Geometry type of every shape.
             shape_gap: Contact gap of every shape [m].
-            shape_heightfield_index: Heightfield index of every shape.
             shape_body: The broad phase's immovable-pair test: body of every shape.
             body_flags: The broad phase's immovable-pair test: body flags, or ``None``.
             include_static_kinematic_pairs: The broad phase's immovable-pair test: keep pairs of two immovable
@@ -878,7 +889,7 @@ class TerrainLawShadow:
         inputs.shape_transform = shape_transform
         inputs.shape_data = shape_data
         inputs.shape_gap = shape_gap
-        inputs.shape_heightfield_index = shape_heightfield_index
+        inputs.shape_surface = self.shape_surface
         inputs.shape_body = shape_body
         inputs.body_flags = body_flags if body_flags is not None else self._no_body_flags
         inputs.include_static_kinematic_pairs = int(bool(include_static_kinematic_pairs))

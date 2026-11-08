@@ -2251,3 +2251,75 @@ def terrain_mesh_cells_qualify(table: TerrainMeshCells, triangle_count: int) -> 
         f"law cells {law / ncell:.2%}, mixed {counts['mixed'] / ncell:.2%}"
     )
 
+
+def terrain_mesh_cells_law_surface(table: TerrainMeshCells) -> tuple[bool, str]:
+    """Whether the terrain law reads the whole table as its one surface type, a lattice of vertex heights.
+
+    The law reads ``vertex_z`` as it reads a heightfield's heights: every cell must be a grid cell on the heightfield's
+    diagonal ``(0, 0)-(1, 1)`` whose corners are the shared vertex heights (no record), with no riser on an edge inside
+    the table (edge bits only on the table's border, where the law's border walls stand). Step cells, risers on cell
+    edges, the other diagonal, mixed and empty cells are what the law's riser features and the cell CSR add; until then
+    a table with any of them keeps its mesh on the generic path.
+    """
+    flags = table.cell_flags
+    rows, cols = table.shape
+    counts = table.counts()
+    if counts["grid"] != rows * cols:
+        return False, f"cells the law does not read yet: {counts['step']} step, {counts['mixed']} mixed, " + (
+            f"{counts['empty']} empty"
+        )
+    if np.any((flags & TERRAIN_CELL_DIAGONAL) != 0):
+        return False, f"{int(np.count_nonzero(flags & TERRAIN_CELL_DIAGONAL))} grid cells on the diagonal (1, 0)-(0, 1)"
+    if np.any((flags & TERRAIN_CELL_RECORD) != 0):
+        return False, f"{int(np.count_nonzero(flags & TERRAIN_CELL_RECORD))} cells with corners of their own (risers)"
+    grid = flags.reshape(rows, cols)
+    inner = (
+        np.count_nonzero(grid[:, 1:] & TERRAIN_CELL_EDGE_X0)
+        + np.count_nonzero(grid[:, :-1] & TERRAIN_CELL_EDGE_X1)
+        + np.count_nonzero(grid[1:, :] & TERRAIN_CELL_EDGE_Y0)
+        + np.count_nonzero(grid[:-1, :] & TERRAIN_CELL_EDGE_Y1)
+    )
+    if inner:
+        return False, f"{inner} cell edges with a riser inside the table"
+    return True, f"{rows} x {cols} grid cells, the heightfield's diagonal, no riser"
+
+
+def terrain_mesh_surface(
+    vertices: np.ndarray, triangles: np.ndarray, device=None
+) -> tuple[TerrainMeshCells | None, str]:
+    """A static mesh's cell table when the terrain law takes the mesh as a surface, else ``None``; and why.
+
+    The data decide, never the task: the lattice must hold the mesh's structure (:func:`terrain_mesh_cells_qualify`'s
+    first test, checked on the lattice before anything is built), the table's size bound by the BVH it retires (checked
+    on the lattice's extent first, so that a chance lattice of a mesh without one allocates nothing), the rule itself on
+    the built table, and the law must read every cell (:func:`terrain_mesh_cells_law_surface`).
+
+    Args:
+        vertices: Vertex positions [m] in the shape's (scaled) frame, shape ``(N, 3)``.
+        triangles: Vertex indices, shape ``(M, 3)`` or ``(3 M,)``.
+        device: The Warp device to build on (the model's).
+    """
+    vertices = np.asarray(vertices, dtype=np.float32).reshape(-1, 3)
+    triangles = np.asarray(triangles, dtype=np.int32).reshape(-1, 3)
+    m = len(triangles)
+    if m == 0 or len(vertices) == 0:
+        return None, "no triangles"
+    lattice = terrain_mesh_lattice(vertices, triangles, device=device)
+    share = min(lattice["x"]["vertex_share"], lattice["y"]["vertex_share"])
+    dx, dy = lattice["x"]["size"], lattice["y"]["size"]
+    if dx <= 0.0 or dy <= 0.0 or share < TERRAIN_CELL_MIN_LATTICE_SHARE:
+        return None, f"the lattice holds {share:.1%} of the up-facing vertices (< {TERRAIN_CELL_MIN_LATTICE_SHARE:.0%})"
+    lo = vertices[:, :2].min(axis=0).astype(np.float64)
+    hi = vertices[:, :2].max(axis=0).astype(np.float64)
+    cells = (np.floor((hi[0] - lo[0]) / dx) + 2.0) * (np.floor((hi[1] - lo[1]) / dy) + 2.0)
+    bvh = TERRAIN_CELL_BVH_BYTES_PER_TRIANGLE * m
+    if 8.0 * cells > bvh:
+        return None, f"the lattice's {cells:.0f} cells outweigh the BVH they would retire ({bvh / 2**20:.1f} MiB)"
+    table = build_terrain_mesh_cells(vertices, triangles, device=device)
+    ok, reason = terrain_mesh_cells_qualify(table, m)
+    if not ok:
+        return None, reason
+    law, why = terrain_mesh_cells_law_surface(table)
+    if not law:
+        return None, f"{reason}; the law does not read it whole: {why}"
+    return table, f"{reason}; {why}"
