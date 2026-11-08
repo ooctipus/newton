@@ -1868,6 +1868,8 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
             shape_types,
             shape_data,
             shape_source,
+            shape_collision_aabb_lower,
+            shape_collision_aabb_upper,
             contact_threshold,
         )
         grid = mesh_cells.shape_grid[mesh_shape]
@@ -1931,6 +1933,8 @@ def narrow_phase_mesh_triangle_candidates_kernel(
     shape_mesh_properties: wp.array[wp.int32],
     shape_gap: wp.array[float],
     shape_data: wp.array[wp.vec4],
+    shape_collision_aabb_lower: wp.array[wp.vec3],
+    shape_collision_aabb_upper: wp.array[wp.vec3],
     shape_interior_point: wp.array[wp.vec3],  # Local interior points for back-face culling
     shape_pairs_mesh: wp.array[wp.vec2i],
     query_lower: wp.array[wp.vec3],
@@ -1971,6 +1975,8 @@ def narrow_phase_mesh_triangle_candidates_kernel(
             shape_data,
             shape_source,
             shape_mesh_properties,
+            shape_collision_aabb_lower,
+            shape_collision_aabb_upper,
             contact_threshold,
             shape_interior_point[non_mesh_shape],
             mesh_cells,
@@ -4294,7 +4300,7 @@ class NarrowPhase:
 
             # Launch midphase: finds overlapping triangles for both mesh and heightfield pairs.
             # Heightfield-only scenes take the cell-rejection terrain routes; scenes with meshes
-            # take the tiled BVH midphase.
+            # take the mesh cell midphase (three passes).
             if self._heightfield_cell_reject:
                 second_dim = 1 if self._heightfield_packed_pairs else self.tile_size_mesh_convex
                 midphase_workers = self.total_num_threads if self._heightfield_packed_pairs else self.num_tile_blocks
@@ -4409,6 +4415,8 @@ class NarrowPhase:
                             shape_mesh_properties,
                             shape_gap,
                             shape_data,
+                            shape_collision_aabb_lower,
+                            shape_collision_aabb_upper,
                             shape_interior_point,
                             self.shape_pairs_mesh,
                             self._mesh_query_lower,

@@ -21,6 +21,7 @@ from newton._src.geometry.collision_core import (
     _mesh_triangle_is_front_facing_local,
     aabb_to_unscaled,
     mesh_query_bound_meets_triangle,
+    mesh_vs_convex_local_box,
     mesh_vs_convex_query_box,
 )
 from newton._src.geometry.flags import ShapeFlags
@@ -123,7 +124,7 @@ SHAPES = (
     (GeoType.CYLINDER, (0.04, 0.1, 0.0)),
     (GeoType.CONE, (0.06, 0.08, 0.0)),
     (GeoType.ELLIPSOID, (0.1, 0.05, 0.04)),
-    (GeoType.CONVEX_MESH, (1.0, 1.0, 1.0)),
+    (GeoType.CONVEX_MESH, (1.5, 0.8, 1.2)),
     (GeoType.PLANE, (0.1, 0.07, 0.0)),
 )
 
@@ -151,6 +152,8 @@ def mesh_query_box_kernel_helper(
     shape_type: wp.array[int],
     shape_data: wp.array[wp.vec4],
     shape_source: wp.array[wp.uint64],
+    shape_lower: wp.array[wp.vec3],
+    shape_upper: wp.array[wp.vec3],
     thr: float,
 ) -> tuple[wp.vec3, wp.vec3]:
     return mesh_vs_convex_query_box(
@@ -161,6 +164,8 @@ def mesh_query_box_kernel_helper(
         shape_type,
         shape_data,
         shape_source,
+        shape_lower,
+        shape_upper,
         thr,
     )
 
@@ -173,6 +178,8 @@ def _dense_kernel(
     shape_transform: wp.array[wp.transform],
     shape_source: wp.array[wp.uint64],
     shape_gap: wp.array[float],
+    shape_lower: wp.array[wp.vec3],
+    shape_upper: wp.array[wp.vec3],
     shape_interior: wp.array[wp.vec3],
     watertight: int,
     out: wp.array2d[wp.int32],
@@ -190,12 +197,15 @@ def _dense_kernel(
     md = shape_data[mesh_shape]
     scale = wp.vec3(md[0], md[1], md[2])
     thr = shape_gap[other] + shape_gap[mesh_shape] + d[3] + md[3]
-    bound = _mesh_query_bound(convex, rel, thr)
+    local_lower, local_upper = mesh_vs_convex_local_box(convex, other, shape_lower, shape_upper)
+    bound = _mesh_query_bound(convex, local_lower, local_upper, rel, thr)
     v0 = mesh.points[mesh.indices[3 * t + 0]]
     v1 = mesh.points[mesh.indices[3 * t + 1]]
     v2 = mesh.points[mesh.indices[3 * t + 2]]
     hit = mesh_query_bound_meets_triangle(bound, wp.cw_mul(v0, scale), wp.cw_mul(v1, scale), wp.cw_mul(v2, scale))
-    lo, hi = mesh_query_box_kernel_helper(mesh_shape, other, shape_transform, shape_type, shape_data, shape_source, thr)
+    lo, hi = mesh_query_box_kernel_helper(
+        mesh_shape, other, shape_transform, shape_type, shape_data, shape_source, shape_lower, shape_upper, thr
+    )
     center_box = 0.5 * (lo + hi)
     hit = hit and triangle_meets_box(v0 - center_box, v1 - center_box, v2 - center_box, 0.5 * (hi - lo))
     if hit:
@@ -318,7 +328,9 @@ def _run(test, device, name, seed, mesh_scale=(1.0, 1.0, 1.0), mesh_pose=None, c
     upper = np.zeros((n, 3))
     for i in range(1, n):
         if types[i] == GeoType.CONVEX_MESH:
-            lower[i], upper[i] = hull.vertices.min(0), hull.vertices.max(0)
+            # The model's local box of a scaled hull (as the builder computes it).
+            lo, hi = hull.vertices.min(0) * datas[i][:3], hull.vertices.max(0) * datas[i][:3]
+            lower[i], upper[i] = np.minimum(lo, hi), np.maximum(lo, hi)
     arr = lambda x, t: wp.array(x, dtype=t, device=device)  # noqa: E731
     xf = arr([wp.transform(wp.vec3(*p), wp.quat(*q)) for p, q in poses], wp.transform)
     kw = {
@@ -368,6 +380,8 @@ def _run(test, device, name, seed, mesh_scale=(1.0, 1.0, 1.0), mesh_pose=None, c
             xf,
             kw["shape_source"],
             kw["shape_gap"],
+            kw["shape_collision_aabb_lower"],
+            kw["shape_collision_aabb_upper"],
             kw["shape_interior_point"],
             watertight,
         ],
@@ -396,7 +410,13 @@ def _run(test, device, name, seed, mesh_scale=(1.0, 1.0, 1.0), mesh_pose=None, c
                 local = (rot.T @ (_sampled_points(a, b, c) - p).T).T
                 d = float(
                     np.min(
-                        _local_distance(kind, (0.06, 0.04, 0.03) if kind == GeoType.CONVEX_MESH else shape_scale, local)
+                        _local_distance(
+                            kind,
+                            np.multiply((0.06, 0.04, 0.03), shape_scale)
+                            if kind == GeoType.CONVEX_MESH
+                            else shape_scale,
+                            local,
+                        )
                     )
                 )
             if d > thr - 1.0e-4:
