@@ -41,6 +41,8 @@ from .mesh_cells import (
     mesh_query_bound_meets_triangle,
     triangle_meets_box,
 )
+from .mpr import create_support_map_function
+from .multicontact import create_build_manifold
 from .support_function import (
     GenericShapeData,
     GeoTypeEx,
@@ -504,6 +506,152 @@ def create_compute_gjk_mpr_contacts(
             )
 
     return compute_gjk_mpr_contacts
+
+
+FACE_CASE_BAND = 4.0e-6
+"""Relative band [-] by which a support point's foot must lie inside its triangle for the closed-form face case.
+
+A foot within the band of an edge, or on it, goes to GJK/MPR, which decides edge contacts with the feature rule
+(as the rule's own classification of manifold points does, with the same world-coordinate rounding allowance).
+"""
+
+
+@wp.func
+def triangle_face_case(
+    triangle: GenericShapeData,
+    origin: wp.vec3,
+    support_point: wp.vec3,
+    center: wp.vec3,
+    threshold: float,
+) -> tuple[bool, wp.vec3, float]:
+    """Whether a convex shape's contact with a mesh triangle is the face's, decided in closed form.
+
+    ``support_point`` is the shape's world support point s along minus the face normal n, ``origin`` the triangle's
+    first world corner p0 and d = n . (s - p0). With s's foot inside the triangle at in-plane distance delta from its
+    edges:
+
+    - separated (d >= 0): dist(shape, triangle) = d and (s, its foot) is a closest pair, since every point x of the
+      shape has n . (x - p0) >= d and |x - y| >= n . (x - y) for every point y of the plane;
+    - penetrating (d < 0) with delta >= |d|: |d| along n is the prism's minimum translation (any separating
+      translation must move s out of the prism, which takes at least min(|d|, delta), and |d| n separates).
+
+    Everything else is not decided here: a foot outside the triangle or within ``FACE_CASE_BAND`` of an edge (an edge
+    or vertex witness), a deep thin overlap (delta < |d|), a distance beyond ``threshold``, and a shape whose
+    interior point lies behind the face (the GJK/MPR query's own one-sided case).
+
+    Returns:
+        ``(face, unit, distance)``: whether the face case holds, the outward unit face normal and d.
+    """
+    face = wp.cross(triangle.scale, triangle.auxiliary)
+    length = wp.length(face)
+    if length <= 1.0e-30:
+        return False, wp.vec3(0.0), 0.0
+    unit = face / length
+    distance = wp.dot(support_point - origin, unit)
+    if distance > threshold:
+        return False, unit, distance
+    if wp.dot(center - origin, unit) < 0.0:
+        return False, unit, distance
+    foot = support_point - distance * unit - origin
+    band = FACE_CASE_BAND * (
+        1.0 + wp.max(wp.abs(support_point[0]), wp.max(wp.abs(support_point[1]), wp.abs(support_point[2])))
+    )
+    c1 = triangle.scale
+    c2 = triangle.auxiliary
+    # Inward in-plane distances to the edges p0p1, p1p2 and p2p0 (the corners run counterclockwise about n).
+    delta = wp.dot(foot, wp.normalize(wp.cross(unit, c1)))
+    delta = wp.min(delta, wp.dot(foot - c1, wp.normalize(wp.cross(unit, c2 - c1))))
+    delta = wp.min(delta, wp.dot(foot - c2, wp.normalize(wp.cross(unit, -c2))))
+    if delta <= band:
+        return False, unit, distance
+    if distance < 0.0 and delta < -distance:
+        return False, unit, distance
+    return True, unit, distance
+
+
+def create_compute_face_contacts(
+    writer_func: Any,
+    support_func: Any,
+    point_filter: Any,
+    manifold_shape: Any,
+    post_process_contact: Any = post_process_axial_on_discrete_contact,
+):
+    """Create the face case of a mesh triangle and a convex shape: the face-normal manifold, without GJK/MPR.
+
+    Where :func:`triangle_face_case` holds, GJK/MPR's witness is the support point and its foot, along the face
+    normal (up to rounding), so the manifold built here is the one the GJK/MPR query builds after it: the shape's
+    support feature clipped against the triangle (grown across coplanar edges by ``manifold_shape``), each point
+    admitted by ``point_filter`` (a face contact needs no cone test: the triangle containing the point owns it).
+
+    Args:
+        writer_func: Function that writes generated contacts.
+        support_func: Support mapping function (as the GJK/MPR query's).
+        point_filter: Admission of each written contact, ``(ContactData, context) -> bool``.
+        manifold_shape: The manifold's triangle, ``(geom_a, point_a, normal, context) -> (geom, origin, moved)``.
+        post_process_contact: Function that post-processes generated contacts.
+    """
+    support_funcs = create_support_map_function(support_func, True)
+    build_manifold = create_build_manifold(
+        support_func, writer_func, post_process_contact, _support_funcs=support_funcs, point_filter=point_filter
+    )
+
+    @wp.func
+    def compute_face_contacts(
+        triangle: GenericShapeData,
+        geom_b: GenericShapeData,
+        rot_b: wp.quat,
+        pos_a: wp.vec3,
+        pos_b: wp.vec3,
+        unit: wp.vec3,
+        support_point: wp.vec3,
+        distance: float,
+        rigid_gap: float,
+        shape_a: int,
+        shape_b: int,
+        margin_a: float,
+        margin_b: float,
+        data_provider: Any,
+        writer_data: Any,
+        sort_sub_key: int,
+        query_context: Any,
+    ) -> int:
+        """Write the face case's manifold: ``triangle`` in the world's orientation with its first corner at ``pos_a``."""
+        template = ContactData()
+        template.margin_a = margin_a
+        template.margin_b = margin_b
+        template.shape_a = shape_a
+        template.shape_b = shape_b
+        template.gap_sum = rigid_gap
+        template.sort_sub_key = sort_sub_key
+        relative_b = pos_b - pos_a
+        point_b = support_point - pos_a
+        point_a = point_b - distance * unit
+        manifold_a = triangle
+        manifold_origin = pos_a
+        grown, shift, moved = manifold_shape(triangle, point_a, unit, query_context)
+        if moved:
+            manifold_a = grown
+            manifold_origin = pos_a + shift
+            relative_b = relative_b - shift
+            point_a = point_a - shift
+            point_b = point_b - shift
+        return build_manifold(
+            manifold_a,
+            geom_b,
+            wp.quat_identity(),
+            manifold_origin,
+            rot_b,
+            relative_b,
+            point_a,
+            point_b,
+            unit,
+            data_provider,
+            writer_data,
+            template,
+            query_context,
+        )
+
+    return compute_face_contacts
 
 
 @wp.func

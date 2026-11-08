@@ -66,8 +66,11 @@ from ..geometry.contact_reduction_global import (
     HASHTABLE_WARN_LOAD_PERCENT,
     MESH_ROUND_NONE,
     MESH_ROUND_ONLY,
+    SURFACES_HEIGHTFIELD,
+    SURFACES_MESH,
     GlobalContactReducer,
     create_export_reduced_contacts_kernel,
+    create_mesh_face_contacts_kernel,
     create_mesh_triangle_contacts_to_reducer_kernel,
     mesh_triangle_contacts_to_reducer_kernel,
     reduce_buffered_contacts_kernel,
@@ -92,6 +95,7 @@ from ..geometry.mesh_topology import (
     mesh_contact_filter,
     mesh_manifold_triangle,
     mesh_surface_context,
+    mesh_surface_planes,
     mesh_triangle_corners,
     surface_query_filter,
     triangle_plane_clears,
@@ -2097,8 +2101,12 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(
     convex_support_acceleration: bool = False,
     *,
     skip_marked: bool = False,
+    heightfields_only: bool = False,
 ):
     suffix = "_finite_fallback" if skip_marked else ""
+    if heightfields_only:
+        # Heightfield triangles only, beside the mesh triangles' own kernels.
+        suffix += "_heightfields"
     _module = f"narrow_phase_mesh_tri_{writer_func.__name__}_{convex_support_acceleration}{suffix}"
     support_func = support_map_accelerated if convex_support_acceleration else support_map
     provider_type = AcceleratedSupportMapDataProvider if convex_support_acceleration else SupportMapDataProvider
@@ -2156,6 +2164,9 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(
                     continue
 
             type_a = shape_types[shape_a]
+            if wp.static(heightfields_only):
+                if type_a != GeoType.HFIELD:
+                    continue
 
             corner_0 = wp.vec3(0.0)
             corner_1 = wp.vec3(0.0)
@@ -2288,6 +2299,7 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(
                         writer_data,
                     )
                     continue
+            surface = mesh_surface_planes(surface)
             wp.static(compute_contacts)(
                 shape_data_a,
                 shape_data_b,
@@ -3518,9 +3530,19 @@ class NarrowPhase:
         # generic reducing query (or the heightfield primitive route's fallback) takes every other pair.
         self._mesh_round_kernel = None
         self._mesh_generic_kernel = mesh_triangle_contacts_to_reducer_kernel
+        # The generic route's other pairs: a first pass with the plane cull and the closed-form face case, which
+        # compacts the rest into a queue for GJK/MPR (the generic query without its cull).
+        self._mesh_face_kernel = None
+        self._mesh_queued_kernel = None
+        self._mesh_queued_pairs = None
+        self._mesh_queued_count = None
         if has_meshes and self.reduce_contacts:
             self._mesh_round_kernel = create_mesh_triangle_contacts_to_reducer_kernel(mesh_round=MESH_ROUND_ONLY)
             self._mesh_generic_kernel = create_mesh_triangle_contacts_to_reducer_kernel(mesh_round=MESH_ROUND_NONE)
+            self._mesh_face_kernel = create_mesh_face_contacts_kernel()
+            self._mesh_queued_kernel = create_mesh_triangle_contacts_to_reducer_kernel(
+                mesh_round=MESH_ROUND_NONE, plane_cull=False
+            )
             if self._heightfield_primitive_kernels:
                 self._heightfield_primitive_kernels = (
                     *self._heightfield_primitive_kernels[:-1],
@@ -3528,6 +3550,43 @@ class NarrowPhase:
                         exclude_primitives=True, mesh_round=MESH_ROUND_NONE
                     ),
                 )
+        # Mesh triangles that write their contacts directly (the reducer is for soups): the same three passes with
+        # the narrow phase's writer, and heightfield triangles in a query of their own beside them.
+        self._mesh_round_direct = None
+        self._mesh_face_direct = None
+        self._mesh_queued_direct = None
+        self._heightfield_triangle_kernel = None
+        self._heightfield_reducer_kernel = None
+        if has_meshes:
+            self._mesh_round_direct = create_mesh_triangle_contacts_to_reducer_kernel(
+                mesh_round=MESH_ROUND_ONLY,
+                writer_func=writer_func,
+                writer_data_type=Any,
+                kernel_name="mesh_round_contacts_kernel",
+            )
+            self._mesh_face_direct = create_mesh_face_contacts_kernel(
+                writer_func, Any, queue_heightfields=False, kernel_name="mesh_face_contacts_direct_kernel"
+            )
+            self._mesh_queued_direct = create_mesh_triangle_contacts_to_reducer_kernel(
+                mesh_round=MESH_ROUND_NONE,
+                plane_cull=False,
+                surfaces=SURFACES_MESH,
+                writer_func=writer_func,
+                writer_data_type=Any,
+                kernel_name="mesh_triangle_contacts_queued_kernel",
+            )
+            if has_heightfields:
+                self._heightfield_triangle_kernel = create_narrow_phase_process_mesh_triangle_contacts_kernel(
+                    writer_func, convex_support_acceleration=convex_support_acceleration, heightfields_only=True
+                )
+                if self.reduce_contacts:
+                    self._heightfield_reducer_kernel = create_mesh_triangle_contacts_to_reducer_kernel(
+                        exclude_primitives=bool(self._heightfield_primitive_kernels),
+                        mesh_round=MESH_ROUND_NONE,
+                        surfaces=SURFACES_HEIGHTFIELD,
+                    )
+            self._mesh_queued_pairs = wp.empty(max_triangle_pairs, dtype=wp.vec3i, device=device)
+            self._mesh_queued_count = wp.zeros(1, dtype=int, device=device)
         # Create triangle contacts kernel when meshes or heightfields are present
         if has_meshes or has_heightfields:
             self.mesh_triangle_contacts_kernel = create_narrow_phase_process_mesh_triangle_contacts_kernel(
@@ -4711,6 +4770,33 @@ class NarrowPhase:
                 self.mesh_topology,
             ]
 
+            # Mesh triangles that publish directly (see _mesh_triangles_direct): spheres and capsules in closed form,
+            # the face case in closed form, then GJK/MPR on the compacted rest.
+            direct_meshes = self._mesh_triangles_direct()
+            if direct_meshes:
+                direct_inputs = [
+                    shape_types,
+                    shape_data,
+                    shape_transform,
+                    shape_source,
+                    shape_gap,
+                    shape_heightfield_index,
+                    heightfield_data,
+                    heightfield_elevations,
+                    self.triangle_pairs,
+                    self.triangle_pairs_count,
+                    writer_data,
+                    self.total_num_threads,
+                ]
+                self._launch_mesh_triangle_passes(
+                    self._mesh_round_direct,
+                    self._mesh_face_direct,
+                    self._mesh_queued_direct,
+                    direct_inputs,
+                    support_inputs,
+                    device,
+                )
+
             # Launch contact processing for triangle pairs
             if self.reduce_contacts:
                 # Unified global reduction for all mesh contact types.
@@ -4786,8 +4872,10 @@ class NarrowPhase:
                         block_dim=self.mesh_triangle_block_dim,
                         record_tape=False,
                     )
-                if self._mesh_round_kernel is not None and not (
-                    self._heightfield_pair_csr or self._heightfield_finite_query
+                if (
+                    self._mesh_round_kernel is not None
+                    and not direct_meshes
+                    and not (self._heightfield_pair_csr or self._heightfield_finite_query)
                 ):
                     wp.launch(
                         kernel=self._mesh_round_kernel,
@@ -4815,7 +4903,11 @@ class NarrowPhase:
                             block_dim=self.block_dim,
                             record_tape=False,
                         )
-                    for primitive_index, primitive_kernel in enumerate(self._heightfield_primitive_kernels):
+                    primitive_kernels = self._heightfield_primitive_kernels
+                    if direct_meshes:
+                        # Mesh pairs published directly: the fallback takes the heightfield pairs only.
+                        primitive_kernels = (*primitive_kernels[:-1], self._heightfield_reducer_kernel)
+                    for primitive_index, primitive_kernel in enumerate(primitive_kernels):
                         row_inputs = triangle_inputs
                         if self._heightfield_row_gate:
                             # The same row kernel reads its gated stream length as triangle_pairs_count.
@@ -4843,6 +4935,22 @@ class NarrowPhase:
                                 block_dim=self.mesh_triangle_block_dim,
                                 record_tape=False,
                             )
+                elif direct_meshes:
+                    if self._heightfield_reducer_kernel is not None:
+                        wp.launch(
+                            kernel=self._heightfield_reducer_kernel,
+                            dim=self.total_num_threads,
+                            inputs=[*triangle_inputs, *support_inputs],
+                            device=device,
+                            block_dim=self.mesh_triangle_block_dim,
+                            record_tape=False,
+                        )
+                elif self._mesh_face_kernel is not None and not (
+                    self._heightfield_pair_csr or self._heightfield_finite_query
+                ):
+                    self._launch_mesh_triangle_passes(
+                        None, self._mesh_face_kernel, self._mesh_queued_kernel, triangle_inputs, support_inputs, device
+                    )
                 else:
                     wp.launch(
                         kernel=self._pair_csr.generic
@@ -4883,16 +4991,22 @@ class NarrowPhase:
                         block_dim=self.mesh_triangle_block_dim,
                         record_tape=False,
                     )
-                wp.launch(
-                    kernel=self._finite_direct_fallback
+                triangle_kernel = (
+                    self._finite_direct_fallback
                     if self._heightfield_finite_query
-                    else self.mesh_triangle_contacts_kernel,
-                    dim=self.total_num_threads,
-                    inputs=[*triangle_inputs, *support_inputs],
-                    device=device,
-                    block_dim=self.mesh_triangle_block_dim,
-                    record_tape=False,
+                    else self._heightfield_triangle_kernel
+                    if direct_meshes
+                    else self.mesh_triangle_contacts_kernel
                 )
+                if triangle_kernel is not None:
+                    wp.launch(
+                        kernel=triangle_kernel,
+                        dim=self.total_num_threads,
+                        inputs=[*triangle_inputs, *support_inputs],
+                        device=device,
+                        block_dim=self.mesh_triangle_block_dim,
+                        record_tape=False,
+                    )
 
             # Register mesh-plane/mesh-triangle contacts in hashtable BEFORE mesh-mesh.
             # Mesh-mesh does inline hashtable registration in its kernel.
@@ -5303,6 +5417,37 @@ class NarrowPhase:
             if self._heightfield_pair_csr:
                 self._pair_csr.status.zero_()
         return result
+
+    def _mesh_triangles_direct(self) -> bool:
+        """Whether mesh triangle pairs publish their contacts directly, without the global reducer.
+
+        Without reduction they always do. The heightfield pair-CSR and finite routes keep their own mesh passes.
+        """
+        if self._mesh_face_direct is None or self._heightfield_pair_csr or self._heightfield_finite_query:
+            return False
+        return not self.reduce_contacts
+
+    def _launch_mesh_triangle_passes(self, round_kernel, face_kernel, queued_kernel, inputs, support_inputs, device):
+        """Launch the mesh triangle passes over ``inputs`` (the triangle query's): the round-shape kernel (if any),
+        the face kernel, which compacts the rest into the queue, and the GJK/MPR kernel over the queue."""
+        launches = []
+        if round_kernel is not None:
+            launches.append((round_kernel, [*inputs, *support_inputs]))
+        launches.append((face_kernel, [*inputs, *support_inputs, self._mesh_queued_pairs, self._mesh_queued_count]))
+        queued_inputs = [*inputs]
+        queued_inputs[8] = self._mesh_queued_pairs
+        queued_inputs[9] = self._mesh_queued_count
+        launches.append((queued_kernel, [*queued_inputs, *support_inputs]))
+        self._mesh_queued_count.zero_()
+        for kernel, kernel_inputs in launches:
+            wp.launch(
+                kernel=kernel,
+                dim=self.total_num_threads,
+                inputs=kernel_inputs,
+                device=device,
+                block_dim=self.mesh_triangle_block_dim,
+                record_tape=False,
+            )
 
     def set_terrain_law_roles(self, role: wp.array | None) -> None:
         """Leave the surface pairs of some partner shapes to the terrain law, which writes their contacts.
