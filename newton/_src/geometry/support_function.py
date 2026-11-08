@@ -128,7 +128,34 @@ class GenericShapeData:
     scale: wp.vec3
     auxiliary: wp.vec3
     center: wp.vec3  # Precomputed local AABB center for convex seed initialization.
+    bounds_half: wp.vec3  # A hull's local AABB half-extents about ``center``, beside it; zero when unset.
     shape_index: int  # Index for optional model-owned support-map acceleration data.
+
+
+@wp.func
+def enclosing_half_extents(geom: Any) -> wp.vec3:
+    """Half-extents [m] of the shape's local box about ``geom.center``, or zero when it has none.
+
+    Primitives derive theirs from ``geom.scale`` (a sphere or capsule as the core the narrow phase
+    hands GJK/MPR); a convex hull carries its AABB in ``geom.bounds_half``. Planes, triangles and
+    shapes without a stored box return zero.
+    """
+    scale = geom.scale
+    half = wp.vec3(0.0)
+    if geom.shape_type == GeoType.BOX or geom.shape_type == GeoType.ELLIPSOID:
+        half = scale
+    elif geom.shape_type == GeoType.SPHERE:
+        half = wp.vec3(scale[0])
+    elif geom.shape_type == GeoType.CAPSULE:
+        half = wp.vec3(scale[0], scale[0], scale[0] + scale[1])
+    elif geom.shape_type == GeoType.CYLINDER or geom.shape_type == GeoType.CONE:
+        radius = scale[0]
+        if geom.shape_type == GeoType.CYLINDER and scale[2] > 0.0 and scale[2] >= scale[1]:
+            radius += scale[1] * scale[1] / (scale[2] + wp.sqrt(scale[2] * scale[2] - scale[1] * scale[1]))
+        half = wp.vec3(radius, radius, scale[1])
+    elif geom.shape_type == GeoType.CONVEX_MESH:
+        half = geom.bounds_half
+    return half
 
 
 @wp.func
