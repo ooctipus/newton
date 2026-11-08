@@ -73,7 +73,7 @@ from ..geometry.contact_sort import ContactSorter
 from ..geometry.flags import ShapeFlags
 from ..geometry.heightfield_cells import heightfield_cell_overlaps_kernel
 from ..geometry.heightfield_cylinder import create_heightfield_cylinder_split_kernels
-from ..geometry.heightfield_features import WELD_FLAT_SEAMS, HeightfieldFeatureContext, flat_seam_query_allowed
+from ..geometry.heightfield_features import HeightfieldFeatureContext, seam_surface_normal
 from ..geometry.heightfield_primitive_contact import ANALYTIC_PRIMITIVE_QUERIES, analytic_primitives_default
 from ..geometry.heightfield_row_gate import HEIGHTFIELD_ROW_COUNT, HEIGHTFIELD_TYPED_ROWS, heightfield_row_gate_kernel
 from ..geometry.mpr import create_solve_mpr, create_support_map_function
@@ -2147,7 +2147,7 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(
         support_func=support_func,
         use_precomputed_center=True,
         penetration_refiner=create_triangle_prism_penetration_refiner(support_func),
-        query_filter=flat_seam_query_allowed if WELD_FLAT_SEAMS else None,
+        query_filter=seam_surface_normal,
     )
 
     def narrow_phase_process_mesh_triangle_contacts_kernel(
@@ -2238,11 +2238,10 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(
             gap_sum = gap_a + gap_b
 
             feature_context = HeightfieldFeatureContext()
-            if wp.static(WELD_FLAT_SEAMS):
+            if type_a == GeoType.HFIELD:
                 feature_context.elevations = heightfield_elevations
                 feature_context.triangle = tri_idx
-                if type_a == GeoType.HFIELD:
-                    feature_context.heightfield = heightfield_data[shape_heightfield_index[shape_a]]
+                feature_context.heightfield = heightfield_data[shape_heightfield_index[shape_a]]
 
             data_provider = provider_type()
             data_provider.shape_support_data = shape_support_data

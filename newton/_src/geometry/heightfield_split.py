@@ -12,7 +12,7 @@ from .collision_convex import ConvexQueryResult, create_write_convex_query_resul
 from .collision_core import ENABLE_MULTI_CONTACT, post_process_axial_on_discrete_contact
 from .contact_data import ContactData
 from .contact_reduction_global import GlobalContactReducerData, write_contact_to_reducer
-from .heightfield_features import WELD_FLAT_SEAMS, HeightfieldFeatureContext, flat_seam_query_allowed
+from .heightfield_features import HeightfieldFeatureContext, seam_surface_normal
 from .mpr import create_solve_mpr, create_support_map_function
 from .simplex_solver import create_solve_closest_distance
 from .support_function import (
@@ -279,15 +279,15 @@ def create_heightfield_split_kernels(shape_type, support_func, data_type, *, pre
                 heightfield_elevations,
             )
             result = query_results[i]
-            if wp.static(WELD_FLAT_SEAMS):
-                context = HeightfieldFeatureContext()
-                context.elevations = heightfield_elevations
-                context.triangle = triple[2]
-                context.heightfield = heightfield_data[shape_heightfield_index[triple[0]]]
-                if result.signed_distance >= 0.0 and not flat_seam_query_allowed(
-                    query.geom_a, result.point_a, result.normal, context
-                ):
-                    continue
+            context = HeightfieldFeatureContext()
+            context.elevations = heightfield_elevations
+            context.triangle = triple[2]
+            context.heightfield = heightfield_data[shape_heightfield_index[triple[0]]]
+            if result.signed_distance >= 0.0:
+                # The surface's own normal at this witness, and the distance along it.
+                result.normal, result.signed_distance = seam_surface_normal(
+                    query.geom_a, result.point_a, result.normal, result.signed_distance, context
+                )
 
             # Preserve the shared single-witness callback. The raw writer screens
             # clearly separated contacts before allocating reducer storage.

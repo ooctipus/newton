@@ -17,7 +17,7 @@ import warp as wp
 
 from ..utils.heightfield import HeightfieldData, get_triangle_shape_from_heightfield
 from .contact_data import ContactData
-from .heightfield_features import WELD_FLAT_SEAMS, HeightfieldFeatureContext, flat_seam_query_allowed
+from .heightfield_features import HeightfieldFeatureContext, seam_surface_normal
 from .types import GeoType
 
 QueryResult = wp.types.vector(length=24, dtype=wp.float32)
@@ -323,19 +323,19 @@ def create_query_kernel(
                 continue
             local_normal = wp.vec3(value[1], value[2], value[3])
             feature_context = HeightfieldFeatureContext()
-            if wp.static(WELD_FLAT_SEAMS):
-                feature_context.heightfield = heightfield_data[shape_heightfield_index[a]]
-                feature_context.elevations = heightfield_elevations
-                feature_context.triangle = tri_idx
-            normal = wp.quat_rotate(qa, wp.vec3(value[1], value[2], value[3]))
+            feature_context.heightfield = heightfield_data[shape_heightfield_index[a]]
+            feature_context.elevations = heightfield_elevations
+            feature_context.triangle = tri_idx
             for k in range(count):
-                if wp.static(WELD_FLAT_SEAMS):
+                contact_normal = local_normal
+                contact_distance = value[7 + 4 * k]
+                if contact_distance >= 0.0:
+                    # Each contact is its own witness: the surface's normal there, and the distance along it.
                     terrain_point = wp.vec3(value[4 + 4 * k], value[5 + 4 * k], value[6 + 4 * k])
-                    terrain_point -= 0.5 * value[7 + 4 * k] * local_normal
-                    if value[7 + 4 * k] >= 0.0 and not flat_seam_query_allowed(
-                        geom, terrain_point, local_normal, feature_context
-                    ):
-                        continue
+                    terrain_point -= 0.5 * contact_distance * local_normal
+                    contact_normal, contact_distance = seam_surface_normal(
+                        geom, terrain_point, local_normal, contact_distance, feature_context
+                    )
                 contact = ContactData()
                 contact.shape_a = a
                 contact.shape_b = b
@@ -345,8 +345,8 @@ def create_query_kernel(
                 contact.contact_point_center = origin + wp.quat_rotate(
                     qa, wp.vec3(value[4 + 4 * k], value[5 + 4 * k], value[6 + 4 * k])
                 )
-                contact.contact_normal_a_to_b = normal
-                contact.contact_distance = value[7 + 4 * k]
+                contact.contact_normal_a_to_b = wp.quat_rotate(qa, contact_normal)
+                contact.contact_distance = contact_distance
                 contact.sort_sub_key = (((tri_idx << 1) | 1) << 3) | k
                 # Axial/Minkowski postprocessing is identity for this admitted
                 # HFIELD + BOX/CONVEX family; both effective radii remain zero.
