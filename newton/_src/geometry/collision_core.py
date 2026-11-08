@@ -19,6 +19,7 @@ from .collision_convex import (
 from .contact_data import ContactData
 from .flags import MeshProperties
 from .mesh_cells import (
+    MESH_CELLS_LEVEL_SHIFT,
     MeshCells,
     MeshCellSlot,
     MeshQueryBound,
@@ -33,6 +34,7 @@ from .mesh_cells import (
     mesh_cells_range,
     mesh_query_bound_box,
     mesh_query_bound_meets_triangle,
+    triangle_meets_box,
 )
 from .support_function import (
     GenericShapeData,
@@ -1289,8 +1291,9 @@ def mesh_vs_convex_cell_candidates(
     for level in range(16):
         if (grid.levels >> level) & 1 == 0:
             continue
-        qlo = wp.vec3i(lo0[0] >> level, lo0[1] >> level, lo0[2] >> level)
-        qhi = wp.vec3i(hi0[0] >> level, hi0[1] >> level, hi0[2] >> level)
+        shift = MESH_CELLS_LEVEL_SHIFT * level
+        qlo = wp.vec3i(lo0[0] >> shift, lo0[1] >> shift, lo0[2] >> shift)
+        qhi = wp.vec3i(hi0[0] >> shift, hi0[1] >> shift, hi0[2] >> shift)
         nx = qhi[0] - qlo[0] + 1
         ny = qhi[1] - qlo[1] + 1
         nz = qhi[2] - qlo[2] + 1
@@ -1301,8 +1304,8 @@ def mesh_vs_convex_cell_candidates(
         n = list_count
         if not by_list:
             n = nx * ny * nz
-        size = grid.cell * float(1 << level)
-        inv_size = grid.inv_cell / float(1 << level)
+        size = grid.cell * float(1 << shift)
+        inv_size = grid.inv_cell / float(1 << shift)
         k = ((lane - visited) % lanes + lanes) % lanes
         while k < n:
             cell = wp.vec3i(0)
@@ -1342,6 +1345,8 @@ def mesh_vs_convex_midphase(
     mesh_shape: int,
     non_mesh_shape: int,
     candidate: wp.vec4i,
+    query_lower: wp.vec3,
+    query_upper: wp.vec3,
     lo0: wp.vec3i,
     hi0: wp.vec3i,
     X_mesh_ws: wp.transform,
@@ -1371,6 +1376,8 @@ def mesh_vs_convex_midphase(
         mesh_shape: Index of the mesh shape
         non_mesh_shape: Index of the non-mesh (convex) shape
         candidate: The candidate (:func:`mesh_cells_candidate`)
+        query_lower: The pair's query box (:func:`mesh_vs_convex_query_box`), lower corner [m]
+        query_upper: The pair's query box, upper corner [m]
         lo0: The pair's level-0 cell range, lower corner
         hi0: The pair's level-0 cell range, upper corner
         X_mesh_ws: Mesh world-space transform
@@ -1391,9 +1398,16 @@ def mesh_vs_convex_midphase(
     triangle = mesh_cells.triangles[grid.triangle_start + tri_index]
     level = candidate[3] >> 15
     cell = wp.vec3i(candidate[2] & 0x7FFF, (candidate[2] >> 15) & 0x7FFF, candidate[3] & 0x7FFF)
-    qlo = wp.vec3i(lo0[0] >> level, lo0[1] >> level, lo0[2] >> level)
-    qhi = wp.vec3i(hi0[0] >> level, hi0[1] >> level, hi0[2] >> level)
-    if not mesh_cells_first_in_range(triangle.registration, cell, qlo, qhi):
+    shift = MESH_CELLS_LEVEL_SHIFT * level
+    qlo = wp.vec3i(lo0[0] >> shift, lo0[1] >> shift, lo0[2] >> shift)
+    qhi = wp.vec3i(hi0[0] >> shift, hi0[1] >> shift, hi0[2] >> shift)
+    if not mesh_cells_first_in_range(triangle.cells_mask, triangle.cells_box, cell, qlo, qhi):
+        return
+    # The triangle meets the query box (which holds the bound), so it is met in a cell of the query's range.
+    query_center = 0.5 * (query_lower + query_upper)
+    if not triangle_meets_box(
+        triangle.v0 - query_center, triangle.v1 - query_center, triangle.v2 - query_center, 0.5 * (query_upper - query_lower)
+    ):
         return
     watertight = (shape_mesh_properties[mesh_shape] & MeshProperties.WATERTIGHT) != 0
     convex = _mesh_vs_convex_shape_data(non_mesh_shape, shape_type, shape_data, shape_source_ptr)
