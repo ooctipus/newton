@@ -453,11 +453,12 @@ class TestFeatherPGSVelocityLimitOrdering(unittest.TestCase):
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _build_two_revolute_chain(coef0: float, coef1: float):
+def _build_two_revolute_chain(coef0: float, coef1: float, *, constraint: bool = True, joint_owned: bool = False):
     """Build a fixed-base chain of two revolute Z-joints with a mimic between them.
 
     The leader joint is position-driven; the follower joint has no drive and no spring,
-    so any tracking it does comes from the mimic constraint alone.
+    so any tracking it does comes from the mimic constraint alone. The mimic is a constraint mimic
+    (``add_constraint_mimic``), a joint-owned one (``set_joint_mimic``, as the URDF and USD importers write), or both.
     """
     b = newton.ModelBuilder(up_axis=newton.Axis.Z)
     # add_link (not add_body): add_body eagerly wraps each body in its own
@@ -486,7 +487,10 @@ def _build_two_revolute_chain(coef0: float, coef1: float):
     b.joint_target_kd[0] = 5.0
     b.joint_target_mode[0] = int(newton.JointTargetMode.POSITION)
     # follower: q_follower = coef0 + coef1 * q_leader
-    b.add_constraint_mimic(joint0=j_follower, joint1=j_leader, coef0=coef0, coef1=coef1)
+    if constraint:
+        b.add_constraint_mimic(joint0=j_follower, joint1=j_leader, coef0=coef0, coef1=coef1)
+    if joint_owned:
+        b.set_joint_mimic(j_follower, j_leader, coeffs=(coef0, coef1))
     return b, j_leader, j_follower
 
 
@@ -535,6 +539,76 @@ class TestFeatherPGSMimic(unittest.TestCase):
         self.assertAlmostEqual(q[0], 0.5, delta=0.05)
         # The undriven follower swings free under gravity; it must NOT sit at the leader angle.
         self.assertNotAlmostEqual(q[1], q[0], delta=0.02)
+
+
+def _replicated_chain_states(device: str, steps: int = 120, **mimic):
+    """Every step's joint coordinates and velocities of two replicated mimic chains, on ``device``."""
+    chain, _, _ = _build_two_revolute_chain(**mimic)
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    builder.replicate(chain, copy_count=2)
+    model = builder.finalize(device=device)
+    solver = SolverFeatherPGS(model, pgs_iterations=16, pgs_beta=0.1)
+    state_0, state_1, control = model.state(), model.state(), model.control()
+    control.joint_target_q.assign(np.array([0.5, 0.0, -0.3, 0.0], dtype=np.float32))
+    trajectory = []
+    for _ in range(steps):
+        state_0.clear_forces()
+        solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+        trajectory.append((state_0.joint_q.numpy().copy(), state_0.joint_qd.numpy().copy()))
+    return trajectory
+
+
+class TestFeatherPGSMimicRepresentations(unittest.TestCase):
+    """A mimic is one law whichever of the model's two representations holds it."""
+
+    def test_joint_owned_mimic_is_the_constraint_mimic(self):
+        """Step a joint-owned mimic (the importers') bitwise as the same relation authored as a constraint mimic."""
+        for device in _devices():
+            with self.subTest(device=device):
+                constraint = _replicated_chain_states(device, coef0=0.1, coef1=-0.5)
+                owned = _replicated_chain_states(device, coef0=0.1, coef1=-0.5, constraint=False, joint_owned=True)
+                for (q, qd), (q_owned, qd_owned) in zip(constraint, owned, strict=True):
+                    np.testing.assert_array_equal(q_owned, q)
+                    np.testing.assert_array_equal(qd_owned, qd)
+                q = constraint[-1][0].reshape(2, 2)
+                np.testing.assert_allclose(q[:, 1], 0.1 - 0.5 * q[:, 0], atol=0.02)
+
+    def test_a_follower_of_both_representations_follows_its_constraint_mimic(self):
+        """Step a follower that both representations name as its constraint mimic alone: one relation, no second."""
+        for device in _devices():
+            with self.subTest(device=device):
+                constraint = _replicated_chain_states(device, coef0=0.1, coef1=-0.5)
+                both = _replicated_chain_states(device, coef0=0.1, coef1=-0.5, joint_owned=True)
+                for (q, qd), (q_both, qd_both) in zip(constraint, both, strict=True):
+                    np.testing.assert_array_equal(q_both, q)
+                    np.testing.assert_array_equal(qd_both, qd)
+
+    def test_joint_owned_d6_mimic_is_componentwise(self):
+        """Hold every coordinate of a two-axis D6 follower to its reference's, as ``set_joint_mimic`` defines."""
+        axes = [newton.ModelBuilder.JointDofConfig.create_unlimited(axis) for axis in (newton.Axis.X, newton.Axis.Y)]
+        for device in _devices():
+            with self.subTest(device=device):
+                builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, 0.0))
+                reference_body, follower_body = builder.add_link(), builder.add_link()
+                builder.add_shape_box(reference_body, hx=0.1, hy=0.1, hz=0.1)
+                builder.add_shape_box(follower_body, hx=0.1, hy=0.1, hz=0.1)
+                reference = builder.add_joint_d6(-1, reference_body, linear_axes=axes)
+                follower = builder.add_joint_d6(reference_body, follower_body, linear_axes=axes)
+                builder.add_articulation([reference, follower])
+                builder.set_joint_mimic(follower, reference, coeffs=(0.1, -1.5))
+                model = builder.finalize(device=device)
+                state_0, state_1 = model.state(), model.state()
+                state_0.joint_q.assign(np.array([0.2, -0.1, 0.0, 0.0], dtype=np.float32))
+                state_0.joint_qd.assign(np.array([0.3, 0.2, 0.0, 0.0], dtype=np.float32))
+                newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+                solver = SolverFeatherPGS(model, pgs_iterations=16, pgs_beta=0.2)
+                for _ in range(240):
+                    solver.step(state_0, state_1, None, None, 1.0 / 240.0)
+                    state_0, state_1 = state_1, state_0
+                q, qd = state_0.joint_q.numpy(), state_0.joint_qd.numpy()
+                np.testing.assert_allclose(q[2:], 0.1 - 1.5 * q[:2], atol=2.0e-3)
+                np.testing.assert_allclose(qd[2:], -1.5 * qd[:2], atol=2.0e-3)
 
 
 class TestFeatherPGSGlobalMimic(unittest.TestCase):

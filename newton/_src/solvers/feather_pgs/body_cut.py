@@ -24,8 +24,9 @@ joint's coordinates are real state: they integrate like any joint's and are publ
 notification. So the arrays a step reads and the layout moves (:data:`_LIVE`) are gathered at every
 :meth:`BodyCut.enter`, and at every notification, whose handlers read them too, by one gather that needs no notice of
 what changed. The rest of the model's arrays a step reads keep their layout
-and are the same arrays: gravity, the shapes, the mimic coefficients, and the speed limits, which a step reads only for
-contact and free bodies, primaries all. The model's topology is derived once, and a notification that finds it changed
+and are the same arrays: gravity, the shapes, the constraint mimics' coefficients, and the speed limits, which a step
+reads only for contact and free bodies, primaries all. The mimics' coefficients are read at a notification only, so the
+joint-owned ones are gathered there. The model's topology is derived once, and a notification that finds it changed
 raises, as the held tree's proof does on a pure forest.
 
 **Seating.** A caller writes a tree's coordinates and not the loop joints' (a reset, a teleport), and a model's
@@ -413,6 +414,8 @@ class BodyCut:
         if source.constraint_mimic_count:
             forest.constraint_mimic_joint0 = indices(position[source.constraint_mimic_joint0.numpy()])
             forest.constraint_mimic_joint1 = indices(position[source.constraint_mimic_joint1.numpy()])
+        reference = source.joint_mimic_joint.numpy()[order]
+        forest.joint_mimic_joint = indices(np.where(reference >= 0, position[reference], -1))
         self.model = forest
         self._topology = {name: getattr(source, name).numpy().copy() for name in _TOPOLOGY}
 
@@ -523,6 +526,8 @@ class BodyCut:
             if not np.array_equal(getattr(self.source, name).numpy(), value):
                 raise RuntimeError(f"The model's {name} changed under the body cut; reconstruct the solver.")
         self._gather_model()
+        # The mimic coefficients are read at a notification only (:class:`.forest_plan.MimicRelations`).
+        self._joint_map.move(self.source.joint_mimic_coeffs, self.model.joint_mimic_coeffs)
 
     # --- the links, by the model's joints -----------------------------------------------------------------------
     def link(self, joint: int) -> int:

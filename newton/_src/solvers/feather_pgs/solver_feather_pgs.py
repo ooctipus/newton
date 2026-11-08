@@ -702,7 +702,9 @@ class SolverFeatherPGS(SolverBase):
         With patch friction enabled, shape-property notifications copy geometry
         to the host and synchronize with the device; issue them outside CUDA graph
         capture. Ordinary simulation steps do not perform those host copies.
-        Material-equivalence changes also require
+        Mimic coefficients and enable bits (constraint and joint-owned) are
+        read at a :attr:`~newton.ModelFlags.CONSTRAINT_PROPERTIES`
+        notification, by a host copy as well. Material-equivalence changes also require
         :meth:`newton.CollisionPipeline.refresh_body_pair_reduction_groups` when
         body-pair reduction is enabled. Capacity failures remain latched until
         an explicit episode reset. Body flags that make a DOF of a
@@ -740,6 +742,9 @@ class SolverFeatherPGS(SolverBase):
             # Geometry edits retire affected material points; unrelated shape
             # properties keep their history and live materials are checked per step.
             self.laws.friction_patches.update_geometry(self.model)
+        if flags & ModelFlags.CONSTRAINT_PROPERTIES:
+            # The mimics' coefficients and enable bits, of both representations (forest_plan.MimicRelations).
+            self.laws.refresh_mimics(self.model)
         if self.placement.keyed_rows is not None:
             self.placement.keyed_rows.validate_notification(flags)
         self.factor.notify_model_changed(flags, kinematic)

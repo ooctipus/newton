@@ -19,7 +19,8 @@ import newton
 from newton._src.solvers.feather_pgs import body_cut, host_index
 from newton._src.solvers.feather_pgs.body_cut import BodyCut
 from newton._src.solvers.feather_pgs.body_mapping import build_body_maps
-from newton._src.solvers.feather_pgs.forest_plan import RowLaw
+from newton._src.solvers.feather_pgs.forest_plan import MimicRelations, RowLaw
+from newton._src.solvers.feather_pgs.row_laws import ROW_MIMIC
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
@@ -803,10 +804,14 @@ class TestForestLayout(unittest.TestCase):
     def test_mimic_joints_follow_the_layout(self):
         builder, _ = _two_roots()
         builder.add_constraint_mimic(joint0=1, joint1=0, coef0=0.0, coef1=1.0)
+        builder.set_joint_mimic(1, 0, coeffs=(0.5, 2.0))
         model = builder.finalize(device="cpu")
         forest = BodyCut.of(model).model
         self.assertEqual(forest.constraint_mimic_joint0.numpy().tolist(), [2])
         self.assertEqual(forest.constraint_mimic_joint1.numpy().tolist(), [0])
+        # A joint-owned mimic's reference is an index too: the follower's (forest joint 2) names forest joint 0.
+        self.assertEqual(forest.joint_mimic_joint.numpy().tolist(), [-1, -1, 0])
+        np.testing.assert_array_equal(forest.joint_mimic_coeffs.numpy()[2], [0.5, 2.0])
 
     def test_shapes_stay_on_the_primary(self):
         builder, _ = _two_roots()
@@ -1184,6 +1189,142 @@ class TestEveryLiveArrayIsListed(unittest.TestCase):
                     solver.step(state_0, state_1, control, contacts, scene.dt)
         self.assertFalse(read - allowed, "arrays a step reads that no gather refreshes")
         self.assertTrue(read & {"joint_target_ke", "joint_X_p", "body_mass"}, "the census saw nothing")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# mimic relations
+#
+# MimicRelations: the model's two mimic representations, one relation a record, and the rows they give.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _mimic_chain(world_count: int = 2, **representations):
+    """Replicated fixed-base chains of a driven revolute leader and an undriven follower, coupled by ``q_follower = 0.1
+    - 0.5 q_leader`` in each representation named: ``constraint`` (``add_constraint_mimic``) and/or ``joint``
+    (``set_joint_mimic``), each a ``(coef0, coef1)``."""
+    chain = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    leader_body, leader = _revolute_chain(chain)
+    _, follower = _revolute_chain(chain, parent=leader_body, x=0.2)
+    chain.add_articulation([leader, follower])
+    chain.joint_target_ke[0], chain.joint_target_kd[0] = 50.0, 5.0
+    chain.joint_target_mode[0] = int(newton.JointTargetMode.POSITION)
+    if "constraint" in representations:
+        coef0, coef1 = representations["constraint"]
+        chain.add_constraint_mimic(joint0=follower, joint1=leader, coef0=coef0, coef1=coef1)
+    if "joint" in representations:
+        chain.set_joint_mimic(follower, leader, coeffs=representations["joint"])
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    builder.replicate(chain, copy_count=world_count)
+    return builder.finalize(device="cpu")
+
+
+_ROW_ARRAYS = ("constraint_count", "row_type", "phi", "rhs", "diag", "impulses", "row_sides")
+
+
+def _rows_and_states(model, steps=40, change=None):
+    """Each step's rows (:data:`_ROW_ARRAYS`) and joint state; ``change(model, solver)`` runs before the second half."""
+    solver = SolverFeatherPGS(model, pgs_iterations=8, pgs_beta=0.1)
+    state_0, state_1, control = model.state(), model.state(), model.control()
+    targets = model.joint_target_q.numpy().copy()
+    targets[0::2] = 0.4
+    control.joint_target_q.assign(targets)
+    out = []
+    for step in range(steps):
+        if change is not None and step == steps // 2:
+            change(model, solver)
+        solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+        rows = [getattr(solver.placement, name).numpy().copy() for name in _ROW_ARRAYS]
+        out.append((*rows, state_0.joint_q.numpy().copy(), state_0.joint_qd.numpy().copy()))
+    return solver, out
+
+
+class TestMimicRelations(unittest.TestCase):
+    def test_records_resolve_both_representations(self):
+        """A constraint mimic is a record in its order, a joint-owned one a record per coordinate after them, and a
+        follower named by both keeps its constraint mimic only."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        axes = [newton.ModelBuilder.JointDofConfig.create_unlimited(axis) for axis in (newton.Axis.X, newton.Axis.Y)]
+        bodies = [builder.add_link() for _ in range(5)]
+        joints = [builder.add_joint_revolute(-1, bodies[0], axis=newton.Axis.Z)]
+        joints.append(builder.add_joint_revolute(bodies[0], bodies[1], axis=newton.Axis.Z))
+        joints.append(builder.add_joint_revolute(bodies[1], bodies[2], axis=newton.Axis.Z))
+        joints.append(builder.add_joint_d6(bodies[2], bodies[3], linear_axes=axes))
+        joints.append(builder.add_joint_d6(bodies[3], bodies[4], linear_axes=axes))
+        builder.add_articulation(joints)
+        builder.add_constraint_mimic(joint0=1, joint1=0, coef0=0.1, coef1=-0.5)
+        builder.set_joint_mimic(1, 0, coeffs=(0.7, 3.0))
+        builder.set_joint_mimic(2, 0, coeffs=(0.2, 2.0))
+        builder.set_joint_mimic(4, 3, coeffs=(0.3, -1.5))
+        model = builder.finalize(device="cpu")
+        mimics = MimicRelations.of(model)
+        self.assertEqual(mimics.constraints, 1)
+        self.assertEqual(mimics.follower.tolist(), [1, 2, 4, 4])
+        self.assertEqual(mimics.reference.tolist(), [0, 0, 3, 3])
+        self.assertEqual(mimics.component.tolist(), [0, 0, 0, 1])
+        self.assertTrue(mimics.supported.all())
+        coef0, coef1, enabled = mimics.coefficients(model)
+        np.testing.assert_allclose(coef0, [0.1, 0.2, 0.3, 0.3])
+        np.testing.assert_allclose(coef1, [-0.5, 2.0, -1.5, -1.5])
+        self.assertTrue(enabled.all())
+
+        solver = SolverFeatherPGS(model, pgs_iterations=2)
+        laws = solver.laws
+        self.assertEqual(laws.mimic_count, 4)
+        self.assertEqual(laws._mimic_dof0.numpy().tolist(), [1, 2, 5, 6])
+        self.assertEqual(laws._mimic_dof1.numpy().tolist(), [0, 0, 3, 4])
+
+    def test_a_constraint_mimic_on_a_d6_is_unsupported(self):
+        """A constraint mimic is one relation, not componentwise: it couples one-coordinate joints only."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        axes = [newton.ModelBuilder.JointDofConfig.create_unlimited(axis) for axis in (newton.Axis.X, newton.Axis.Y)]
+        first, second = builder.add_link(), builder.add_link()
+        joints = [
+            builder.add_joint_d6(-1, first, linear_axes=axes),
+            builder.add_joint_d6(first, second, linear_axes=axes),
+        ]
+        builder.add_articulation(joints)
+        builder.add_constraint_mimic(joint0=1, joint1=0)
+        model = builder.finalize(device="cpu")
+        self.assertEqual(MimicRelations.of(model).supported.tolist(), [False])
+        with self.assertWarnsRegex(UserWarning, "non-1-DoF"):
+            solver = SolverFeatherPGS(model, pgs_iterations=2)
+        self.assertEqual(solver.laws.mimic_valid_np.tolist(), [0])
+
+    def test_joint_owned_rows_are_the_constraint_rows(self):
+        """Give a joint-owned mimic the constraint mimic's rows and states bitwise, a follower of both the constraint
+        mimic's alone, through a coefficient change a constraint notification carries."""
+
+        def change(constraint):
+            def apply(model, solver):
+                if constraint:
+                    model.constraint_mimic_coef0.fill_(-0.05)
+                    model.constraint_mimic_coef1.fill_(1.2)
+                else:
+                    model.joint_mimic_coeffs.assign(
+                        np.where(
+                            model.joint_mimic_joint.numpy()[:, None] >= 0,
+                            np.array([[-0.05, 1.2]], dtype=np.float32),
+                            model.joint_mimic_coeffs.numpy(),
+                        )
+                    )
+                solver.notify_model_changed(newton.ModelFlags.CONSTRAINT_PROPERTIES)
+
+            return apply
+
+        solver, reference = _rows_and_states(_mimic_chain(constraint=(0.1, -0.5)), change=change(True))
+        self.assertEqual(solver.laws.mimic_count, 2)
+        self.assertTrue(np.any(reference[0][1] == ROW_MIMIC))
+        for name, model, constraint in (
+            ("joint", _mimic_chain(joint=(0.1, -0.5)), False),
+            ("both", _mimic_chain(constraint=(0.1, -0.5), joint=(0.7, 3.0)), True),
+        ):
+            with self.subTest(representation=name):
+                solver, candidate = _rows_and_states(model, change=change(constraint))
+                self.assertEqual(solver.laws.mimic_count, 2)
+                for step, (expected, actual) in enumerate(zip(reference, candidate, strict=True)):
+                    for label, a, b in zip((*_ROW_ARRAYS, "joint_q", "joint_qd"), expected, actual, strict=True):
+                        np.testing.assert_array_equal(b, a, err_msg=f"step {step} {label}")
 
 
 if __name__ == "__main__":

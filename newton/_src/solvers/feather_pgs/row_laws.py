@@ -41,8 +41,9 @@ ROW_JOINT_LIMIT = wp.constant(3)
 # Joint velocity-limit row. Mirrors the PhysX per-DOF velocity clamp: finite limits create two unilateral rows every
 # step, one lower bound row and one upper bound row, with no Baumgarte bias.
 ROW_JOINT_VELOCITY_LIMIT = wp.constant(4)
-# Mimic (joint coupling) row: the bilateral equality ``q_follower - coef1 * q_leader - coef0 = 0`` between two 1-DoF
-# joints of one articulation, from ``Model.constraint_mimic_*``; lambda unbounded, Baumgarte drift correction.
+# Mimic (joint coupling) row: the bilateral equality ``q_follower - coef1 * q_leader - coef0 = 0`` between two
+# coordinates of one articulation, from either of the model's mimic representations
+# (:class:`.forest_plan.MimicRelations`); lambda unbounded, Baumgarte drift correction.
 ROW_MIMIC = wp.constant(5)
 # Link row: one of the six bilateral rows that tie a body's shadow to its primary piece (:mod:`.body_cut`), unbounded
 # lambda, Baumgarte drift correction.
