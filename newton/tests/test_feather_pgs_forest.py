@@ -806,12 +806,19 @@ class TestForestLayout(unittest.TestCase):
         builder.add_constraint_mimic(joint0=1, joint1=0, coef0=0.0, coef1=1.0)
         builder.set_joint_mimic(1, 0, coeffs=(0.5, 2.0))
         model = builder.finalize(device="cpu")
-        forest = BodyCut.of(model).model
+        cut = BodyCut.of(model)
+        forest = cut.model
         self.assertEqual(forest.constraint_mimic_joint0.numpy().tolist(), [2])
         self.assertEqual(forest.constraint_mimic_joint1.numpy().tolist(), [0])
         # A joint-owned mimic's reference is an index too: the follower's (forest joint 2) names forest joint 0.
         self.assertEqual(forest.joint_mimic_joint.numpy().tolist(), [-1, -1, 0])
         np.testing.assert_array_equal(forest.joint_mimic_coeffs.numpy()[2], [0.5, 2.0])
+        # Its coefficients reach the forest at a notification.
+        coeffs = model.joint_mimic_coeffs.numpy()
+        coeffs[1] = (-0.25, 0.75)
+        model.joint_mimic_coeffs.assign(coeffs)
+        cut.refresh()
+        np.testing.assert_array_equal(forest.joint_mimic_coeffs.numpy()[2], [-0.25, 0.75])
 
     def test_shapes_stay_on_the_primary(self):
         builder, _ = _two_roots()

@@ -845,15 +845,24 @@ def joint_data(model) -> dict:
     parent, child = model.joint_parent.numpy(), model.joint_child.numpy()
     x_p, x_c = model.joint_X_p.numpy().astype(np.float64), model.joint_X_c.numpy().astype(np.float64)
     loops = [(int(parent[j]), int(child[j]), x_p[j], x_c[j]) for j in range(model.joint_count) if articulation[j] < 0]
-    mimics = []
-    if getattr(model, "constraint_mimic_count", 0):
-        q_start = model.joint_q_start.numpy()
+    # Both mimic representations: a constraint mimic, then each other joint-owned follower's coordinates.
+    q_start, mimics, followers = model.joint_q_start.numpy(), [], set()
+    if model.constraint_mimic_count:
         follower, leader = model.constraint_mimic_joint0.numpy(), model.constraint_mimic_joint1.numpy()
         coef0, coef1 = model.constraint_mimic_coef0.numpy(), model.constraint_mimic_coef1.numpy()
+        followers = {int(j) for j in follower}
         mimics = [
             (int(q_start[follower[i]]), int(q_start[leader[i]]), float(coef0[i]), float(coef1[i]))
             for i in range(model.constraint_mimic_count)
         ]
+    reference, coeffs = model.joint_mimic_joint.numpy(), model.joint_mimic_coeffs.numpy()
+    for joint in np.flatnonzero(reference >= 0):
+        if int(joint) not in followers:
+            leader = int(reference[joint])
+            mimics += [
+                (int(q_start[joint]) + k, int(q_start[leader]) + k, float(coeffs[joint, 0]), float(coeffs[joint, 1]))
+                for k in range(int(q_start[joint + 1] - q_start[joint]))
+            ]
     return {"loop_joints": loops, "mimics": mimics}
 
 
