@@ -53,7 +53,8 @@ from .support_function import (
 from .types import GeoType
 
 ROW = 13
-"""Ints per triangle row: neighbour (3), opposite vertex (3), welded vertex (3), face-corner owner (3), flat edges."""
+"""Ints per triangle row: neighbour (3), opposite vertex (3), welded vertex (3), face-corner owner (3), and the
+flat bits (bit k: edge k joins a coplanar triangle; bit 3 + k: corner k is a flat vertex)."""
 
 COPLANAR_COSINE = 1.0 - 1.0e-6
 """Cosine [-] above which two face normals are one plane: their contacts at a shared edge or vertex coincide."""
@@ -173,6 +174,20 @@ def build_mesh_topology(vertices: np.ndarray, indices: np.ndarray) -> dict[str, 
         has = other >= 0
         dots = np.einsum("ij,ij->i", normal, normal[np.maximum(other, 0)])
         flat |= np.where(has & (dots >= COPLANAR_COSINE), 1 << k, 0)
+    # A flat vertex: every incident triangle in one plane and no boundary (or non-manifold) edge at it. A facet's
+    # corner is not flat, so growing a triangle across a coplanar edge never moves a corner of the facet.
+    if m:
+        boundary = np.zeros(count, dtype=bool)
+        for k in range(3):
+            open_edge = neighbor[:, k] < 0
+            boundary[welded[open_edge, (k + 1) % 3]] = True
+            boundary[welded[open_edge, (k + 2) % 3]] = True
+        first = normal[vertex_triangles[vertex_start[:-1]]]
+        aligned = np.einsum("ij,ij->i", normal[vertex_triangles], np.repeat(first, np.diff(vertex_start), axis=0))
+        coplanar = np.minimum.reduceat(aligned, vertex_start[:-1]) >= COPLANAR_COSINE if count else np.zeros(0, bool)
+        flat_vertex = coplanar & ~boundary
+        for k in range(3):
+            flat |= np.where(flat_vertex[welded[:, k]], 1 << (3 + k), 0)
     owner = _corner_owners(welded, normal, vertex_start, vertex_triangles)
     return {
         "neighbor": neighbor.astype(np.int32),
@@ -324,7 +339,7 @@ class SurfaceFeatureContext:
     edge_band: wp.vec3
     """Component k: the edge's own rounding band [m] (relative to its length)."""
     flat: int
-    """Bit k: edge k joins a coplanar triangle (the row's flat-edge bits)."""
+    """The row's flat bits (bit k: edge k joins a coplanar triangle; bit 3 + k: corner k is a flat vertex)."""
 
 
 @wp.func
@@ -632,7 +647,7 @@ def mesh_contact_filter(contact: ContactData, context: SurfaceFeatureContext) ->
         return True
     normal = contact.contact_normal_a_to_b
     face_contact = wp.dot(normal, unit) >= FACE_NORMAL_COSINE
-    if face_contact and context.flat == 0:
+    if face_contact and (context.flat & 7) == 0:
         # A face contact of a triangle with no coplanar neighbour: the manifold was clipped to the triangle itself.
         return True
     point = contact.contact_point_center - 0.5 * contact.contact_distance * normal
@@ -721,10 +736,11 @@ def mesh_manifold_triangle(
     """The triangle a face contact's manifold clips against: this one grown across its coplanar edges.
 
     Across an edge shared with a coplanar triangle the surface is one plane, so the contact patch is not cut
-    there: each coplanar edge moves outward past the partner's reach, and :func:`mesh_contact_filter` keeps the
-    points this triangle contains (on a shared edge or corner, the lowest coplanar triangle). Every point of the
-    patch is then reported once, by the triangle under it, with no seam points. Tilted contacts, triangles
-    without topology and heightfields keep the triangle.
+    there: each such edge whose ends are both flat vertices moves outward past the partner's reach, and
+    :func:`mesh_contact_filter` keeps the points this triangle contains (on a shared edge or corner, the lowest
+    coplanar triangle). Every point of the patch is then reported once, by the triangle under it, with no seam
+    points inside the facet. An edge ending at a facet corner does not grow, so no corner of the facet is lost (a
+    seam point there stays, once). Tilted contacts, triangles without topology and heightfields keep the triangle.
 
     Returns:
         ``(triangle, origin, moved)``: the manifold's triangle, its first corner in the triangle's frame, and
@@ -733,7 +749,12 @@ def mesh_manifold_triangle(
     if context.row < 0:
         return triangle, wp.vec3(0.0), False
     flat = context.topology[context.row + 12]
-    if flat == 0:
+    # An edge grows only if it is coplanar and both its ends are flat vertices (no facet corner moves).
+    grow = int(0)
+    for k in range(3):
+        if (flat >> k) & 1 != 0 and (flat >> (3 + (k + 1) % 3)) & 1 != 0 and (flat >> (3 + (k + 2) % 3)) & 1 != 0:
+            grow = grow | (1 << k)
+    if grow == 0:
         return triangle, wp.vec3(0.0), False
     if wp.dot(normal, context.unit) < FACE_NORMAL_COSINE:
         return triangle, wp.vec3(0.0), False
@@ -758,7 +779,7 @@ def mesh_manifold_triangle(
         if context.mirror != 0 and s > 0:
             k = 3 - s
         outward[s] = context.edge_normal[k]
-        if (flat >> k) & 1 != 0:
+        if (grow >> k) & 1 != 0:
             offsets[s] = reach
     moved = wp.mat33(0.0)
     for s in range(3):
