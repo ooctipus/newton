@@ -15428,7 +15428,13 @@ class ModelBuilder:
             # The cell index of each distinct collision mesh, read by the mesh-vs-convex midphase.
             from ..geometry.mesh_cells import build_mesh_cells  # noqa: PLC0415
 
-            m._mesh_cells = build_mesh_cells(self.shape_type, geo_sources, device)
+            # The host buffers each mesh was built from, so the build reads no device memory.
+            mesh_buffers = {
+                int(source): (geo.vertices, geo.indices)
+                for shape_type, geo, source in zip(self.shape_type, generated_shape_sources, geo_sources, strict=True)
+                if shape_type == GeoType.MESH and isinstance(geo, Mesh) and source
+            }
+            m._mesh_cells = build_mesh_cells(self.shape_type, geo_sources, device, meshes=mesh_buffers)
 
             # Compact convex support data (one copy per shared geometry).
             shape_support_data = []

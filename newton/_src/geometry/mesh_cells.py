@@ -810,6 +810,7 @@ def build_mesh_cells(
     shape_source_ptr,
     device=None,
     *,
+    meshes: dict | None = None,
     cell: float | None = None,
 ) -> MeshCells:
     """Build the cell index of every triangle mesh shape (``GeoType.MESH``), one per distinct mesh.
@@ -820,6 +821,8 @@ def build_mesh_cells(
         shape_type: Per-shape :class:`GeoType` values (host sequence or array).
         shape_source_ptr: Per-shape source pointers; a mesh shape's is its ``wp.Mesh`` id.
         device: Device of the returned arrays (and of the meshes).
+        meshes: Optional host buffers ``{mesh id: (points, indices)}``, the same the meshes were built from; a mesh
+            without them is read from the device by its id.
         cell: Level-0 cell edge for every mesh [m]; chosen per mesh from its triangles when ``None``.
 
     Returns:
@@ -846,7 +849,11 @@ def build_mesh_cells(
     chunks: dict[str, list] = {name: [] for name in names}
     grids = []
     table_offset = entry_offset = triangle_offset = sorted_offset = 0
-    for points, indices in _read_meshes(mesh_ids, device):
+    meshes = meshes or {}
+    unread = [mid for mid in mesh_ids if mid not in meshes]
+    read = dict(zip(unread, _read_meshes(unread, device), strict=True))
+    for mid in mesh_ids:
+        points, indices = meshes[mid] if mid in meshes else read[mid]
         g = build_mesh_grid(points, indices, cell)
         info = MeshGrid()
         info.origin = wp.vec3(*[float(x) for x in g["origin"]])
