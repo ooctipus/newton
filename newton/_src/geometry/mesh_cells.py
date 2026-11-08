@@ -64,9 +64,11 @@ _ORIGIN_OFFSET = 0.3183098861837907
 # Relative padding of the build's closed cell boxes (float64 rounding only).
 _BUILD_PAD = 1.0e-9
 
-# Entry boxes: 16-bit coordinates relative to the cell's lower corner, in cell / 256 (a triangle's box spans at most
-# MAX_BOX_CELLS = 64 cells, inside the +-128 cells they reach).
-_BOX_STEPS = 256.0
+# Entry boxes: 14-bit coordinates relative to the cell's lower corner, in cell / 2048, clamped to +-4 cells. Clamping
+# both an entry's box and the query's box to the same window keeps every overlap (it is monotone per axis), so the
+# test stays conservative while the lattice stays fine.
+_BOX_STEPS = 2048.0
+_BOX_BIAS = 8192
 MESH_CELLS_BOX_STEPS = wp.constant(_BOX_STEPS)
 
 
@@ -138,8 +140,10 @@ class MeshCells:
     slots: wp.array[MeshCellSlot]
     """The hash slots of every mesh."""
     entries: wp.array[wp.vec4i]
-    """Per cell, by ascending triangle: ``(triangle, lo_x | lo_y << 16, lo_z | hi_x << 16, hi_y | hi_z << 16)``, the
-    triangle id (local to the mesh) and its box relative to the cell's lower corner, each ``32768 + 256 x / edge``."""
+    """Per cell, by ascending triangle: ``(triangle, lo_x | lo_y << 14 | b0 << 28, lo_z | hi_x << 14 | b1 << 28,
+    hi_y | hi_z << 14 | b2 << 28)``: the triangle id (local to the mesh), its box relative to the cell's lower corner
+    (each ``8192 + 2048 x / edge``, clamped) and, in the nibbles ``b0 | b1 << 4 | b2 << 8``, its block registration when its box
+    spans at most two cells per axis (:func:`mesh_cells_entry_first_in_range`)."""
     triangles: wp.array[MeshCellTriangle]
     """Per triangle, by mesh: its vertices and registration."""
     sorted_slots: wp.array[MeshCellSlot]
@@ -219,23 +223,47 @@ def mesh_cells_candidate(pair: int, triangle: int, level: int, cell: wp.vec3i) -
 def mesh_cells_box_in_cell(
     lower: wp.vec3, upper: wp.vec3, cell_lower: wp.vec3, inv_size: float
 ) -> tuple[wp.vec3i, wp.vec3i]:
-    """A box on a cell's entry-box lattice (clamped to its 16-bit range)."""
+    """A box on a cell's entry-box lattice (clamped to its window)."""
     lo = wp.vec3i(0)
     hi = wp.vec3i(0)
     for k in range(3):
-        lo[k] = wp.clamp(int(wp.floor((lower[k] - cell_lower[k]) * inv_size * MESH_CELLS_BOX_STEPS)), -32768, 32767)
-        hi[k] = wp.clamp(int(wp.floor((upper[k] - cell_lower[k]) * inv_size * MESH_CELLS_BOX_STEPS)), -32768, 32767)
+        lo[k] = wp.clamp(int(wp.floor((lower[k] - cell_lower[k]) * inv_size * MESH_CELLS_BOX_STEPS)), -8192, 8191)
+        hi[k] = wp.clamp(int(wp.floor((upper[k] - cell_lower[k]) * inv_size * MESH_CELLS_BOX_STEPS)), -8192, 8191)
     return lo, hi
 
 
 @wp.func
 def mesh_cells_entry_overlaps(entry: wp.vec4i, lo: wp.vec3i, hi: wp.vec3i) -> bool:
     """Whether an entry's box overlaps the query box ``[lo, hi]`` on the cell's lattice."""
-    if hi[0] < (entry[1] & 0xFFFF) - 32768 or lo[0] > ((entry[2] >> 16) & 0xFFFF) - 32768:
+    if hi[0] < (entry[1] & 0x3FFF) - 8192 or lo[0] > ((entry[2] >> 14) & 0x3FFF) - 8192:
         return False
-    if hi[1] < ((entry[1] >> 16) & 0xFFFF) - 32768 or lo[1] > (entry[3] & 0xFFFF) - 32768:
+    if hi[1] < ((entry[1] >> 14) & 0x3FFF) - 8192 or lo[1] > (entry[3] & 0x3FFF) - 8192:
         return False
-    return hi[2] >= (entry[2] & 0xFFFF) - 32768 and lo[2] <= ((entry[3] >> 16) & 0xFFFF) - 32768
+    return hi[2] >= (entry[2] & 0x3FFF) - 8192 and lo[2] <= ((entry[3] >> 14) & 0x3FFF) - 8192
+
+
+@wp.func
+def mesh_cells_entry_first_in_range(entry: wp.vec4i, cell: wp.vec3i, qlo: wp.vec3i, qhi: wp.vec3i) -> bool:
+    """For a triangle whose box spans at most two cells per axis, :func:`mesh_cells_first_in_range` from the entry.
+
+    The entry's 12 block bits are the triangle's registered cells in its 2x2x2 block (bits 0-7, ``dx + 2 dy + 4 dz``),
+    this cell's place in the block (bits 8-10) and a flag (bit 11); without the flag the answer is ``True`` and the
+    triangle's own registration decides later.
+    """
+    block = ((entry[1] >> 28) & 15) | (((entry[2] >> 28) & 15) << 4) | (((entry[3] >> 28) & 15) << 8)
+    if (block >> 11) & 1 == 0:
+        return True
+    bit = (block >> 8) & 7
+    below = block & ((1 << bit) - 1)
+    first = bool(True)
+    for b in range(bit):
+        if (below >> b) & 1 != 0:
+            cx = cell[0] - (bit & 1) + (b & 1)
+            cy = cell[1] - ((bit >> 1) & 1) + ((b >> 1) & 1)
+            cz = cell[2] - ((bit >> 2) & 1) + ((b >> 2) & 1)
+            if cx >= qlo[0] and cx <= qhi[0] and cy >= qlo[1] and cy <= qhi[1] and cz >= qlo[2] and cz <= qhi[2]:
+                first = False
+    return first
 
 
 @wp.func
@@ -602,60 +630,47 @@ def build_mesh_grid(points: np.ndarray, indices: np.ndarray, cell: float | None 
     base = lo0 >> shift
     span = (hi0 >> shift) - base  # per axis, cells - 1
     mask = np.zeros(nt, dtype=np.uint64)
-    keys_chunks, tri_chunks = [], []
     level_counts = {int(lv): int(cnt) for lv, cnt in zip(*np.unique(level, return_counts=True), strict=True)}
-    # Every box offset (dx, dy, dz) a triangle's box can hold.
-    offsets = [
-        (dx, dy, dz)
-        for dz in range(MAX_BOX_CELLS)
-        for dy in range(MAX_BOX_CELLS)
-        for dx in range(MAX_BOX_CELLS)
-        if (dx + 1) * (dy + 1) * (dz + 1) <= MAX_BOX_CELLS
-    ]
-    for dx, dy, dz in offsets:
-        d = np.array([dx, dy, dz], dtype=np.int64)
-        t = np.flatnonzero(np.all(span >= d, axis=1))
-        if t.size == 0:
-            continue
-        k = base[t] + d
+    # Every (triangle, box cell) pair, the box cells numbered x fastest: the cell's number is its mask bit.
+    nbox = (span + 1).prod(axis=1)
+    rows = np.repeat(np.arange(nt), nbox)
+    bit = np.arange(rows.size) - np.repeat(np.cumsum(nbox) - nbox, nbox)
+    nx, ny = span[rows, 0] + 1, span[rows, 1] + 1
+    k = base[rows] + np.stack([bit % nx, (bit // nx) % ny, bit // (nx * ny)], axis=1)
+    hit = np.zeros(rows.size, dtype=bool)
+    for c0 in range(0, rows.size, 1 << 20):
+        c1 = min(c0 + (1 << 20), rows.size)
+        t = rows[c0:c1]
         size = h * np.left_shift(1, _LEVEL_SHIFT * level[t]).astype(np.float64)
-        center = o + (k + 0.5) * size[:, None]
+        center = o + (k[c0:c1] + 0.5) * size[:, None]
         half = np.repeat((0.5 * size * (1.0 + _BUILD_PAD))[:, None], 3, axis=1)
-        hit = _triangles_meet_boxes(a[t], b[t], c[t], center, half)
-        t, k = t[hit], k[hit]
-        bit = dx + (span[t, 0] + 1) * (dy + (span[t, 1] + 1) * dz)
-        mask[t] |= np.left_shift(np.uint64(1), bit.astype(np.uint64))
-        keys_chunks.append(
-            (level[t].astype(np.uint64) << np.uint64(60))
-            | (k[:, 0].astype(np.uint64) << np.uint64(40))
-            | (k[:, 1].astype(np.uint64) << np.uint64(20))
-            | k[:, 2].astype(np.uint64)
-        )
-        tri_chunks.append(t)
+        hit[c0:c1] = _triangles_meet_boxes(a[t], b[t], c[t], center, half)
     # Rounding can only lose a touching cell; a triangle that met none keeps every cell of its box.
-    lost = np.flatnonzero(mask == 0)
-    for dx, dy, dz in offsets:
-        if lost.size == 0:
-            break
-        d = np.array([dx, dy, dz], dtype=np.int64)
-        t = lost[np.all(span[lost] >= d, axis=1)]
-        if t.size == 0:
-            continue
-        k = base[t] + d
-        bit = dx + (span[t, 0] + 1) * (dy + (span[t, 1] + 1) * dz)
-        mask[t] |= np.left_shift(np.uint64(1), bit.astype(np.uint64))
-        keys_chunks.append(
-            (level[t].astype(np.uint64) << np.uint64(60))
-            | (k[:, 0].astype(np.uint64) << np.uint64(40))
-            | (k[:, 1].astype(np.uint64) << np.uint64(20))
-            | k[:, 2].astype(np.uint64)
-        )
-        tri_chunks.append(t)
+    met = np.zeros(nt, dtype=bool)
+    met[rows[hit]] = True
+    hit |= ~met[rows]
+    rows, bit, k = rows[hit], bit[hit], k[hit]
+    np.bitwise_or.at(mask, rows, np.left_shift(np.uint64(1), bit.astype(np.uint64)))
+    keys_chunks = [
+        (level[rows].astype(np.uint64) << np.uint64(60))
+        | (k[:, 0].astype(np.uint64) << np.uint64(40))
+        | (k[:, 1].astype(np.uint64) << np.uint64(20))
+        | k[:, 2].astype(np.uint64)
+    ]
+    tri_chunks = [rows]
+
+    # Block registration of triangles whose box spans at most two cells per axis (bit dx + 2 dy + 4 dz).
+    small = np.all(span <= 1, axis=1)
+    d = k - base[rows]
+    block_bit = d[:, 0] + 2 * d[:, 1] + 4 * d[:, 2]
+    block_mask = np.zeros(nt, dtype=np.int64)
+    np.bitwise_or.at(block_mask, rows, np.left_shift(1, block_bit))
+    block = np.where(small[rows], block_mask[rows] | (block_bit << 8) | (1 << 11), 0)
 
     keys = np.concatenate(keys_chunks)
     tris = np.concatenate(tri_chunks)
     order = np.lexsort((tris, keys))
-    keys, tris = keys[order], tris[order]
+    keys, tris, block = keys[order], tris[order], block[order]
     # Each entry's triangle box relative to its cell, rounded outward by a step.
     entry_level = (keys >> np.uint64(60)).astype(np.int64)
     entry_cell = np.stack(
@@ -665,18 +680,23 @@ def build_mesh_grid(points: np.ndarray, indices: np.ndarray, cell: float | None 
     cell_lo = o + entry_cell * entry_size[:, None]
     q_lo = np.floor((tmin[tris] - cell_lo) / entry_size[:, None] * _BOX_STEPS) - 1
     q_hi = np.ceil((tmax[tris] - cell_lo) / entry_size[:, None] * _BOX_STEPS) + 1
-    q_lo = (np.clip(q_lo, -32768, 32767) + 32768).astype(np.int64)
-    q_hi = (np.clip(q_hi, -32768, 32767) + 32768).astype(np.int64)
+    q_lo = (np.clip(q_lo, -_BOX_BIAS, _BOX_BIAS - 1) + _BOX_BIAS).astype(np.int64)
+    q_hi = (np.clip(q_hi, -_BOX_BIAS, _BOX_BIAS - 1) + _BOX_BIAS).astype(np.int64)
 
-    def pack(a_, b_):
-        return (a_ | (b_ << 16)).astype(np.uint32).view(np.int32)
+    def pack(a_, b_, nibble):
+        return (a_ | (b_ << 14) | (nibble << 28)).astype(np.uint32).view(np.int32)
 
     # Each cell's union of triangle boxes, in cell / 32 (saturating), for the slot.
     u_lo = np.clip(np.floor((tmin[tris] - cell_lo) / entry_size[:, None] * 32.0) - 1, -128, 127).astype(np.int64)
     u_hi = np.clip(np.ceil((tmax[tris] - cell_lo) / entry_size[:, None] * 32.0) + 1, -128, 127).astype(np.int64)
 
     entries = np.stack(
-        [tris.astype(np.int32), pack(q_lo[:, 0], q_lo[:, 1]), pack(q_lo[:, 2], q_hi[:, 0]), pack(q_hi[:, 1], q_hi[:, 2])],
+        [
+            tris.astype(np.int32),
+            pack(q_lo[:, 0], q_lo[:, 1], block & 15),
+            pack(q_lo[:, 2], q_hi[:, 0], (block >> 4) & 15),
+            pack(q_hi[:, 1], q_hi[:, 2], (block >> 8) & 15),
+        ],
         axis=1,
     )
 

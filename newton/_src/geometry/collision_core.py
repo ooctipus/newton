@@ -26,6 +26,7 @@ from .mesh_cells import (
     mesh_cells_candidate,
     mesh_cells_slot_overlaps,
     mesh_cells_box_in_cell,
+    mesh_cells_entry_first_in_range,
     mesh_cells_entry_overlaps,
     mesh_cells_find,
     mesh_cells_first_in_range,
@@ -1246,11 +1247,12 @@ def mesh_vs_convex_query_box(
     bound = _mesh_query_bound(convex, convex_in_mesh, contact_threshold)
     lower, upper = mesh_query_bound_box(bound)
     mesh_data = shape_data[mesh_shape]
-    lower_bvh, upper_bvh, _inv_scale = aabb_to_unscaled(lower, upper, wp.vec3(mesh_data[0], mesh_data[1], mesh_data[2]))
+    mesh_scale = wp.vec3(mesh_data[0], mesh_data[1], mesh_data[2])
+    lower_bvh, upper_bvh, _inv_scale = aabb_to_unscaled(lower, upper, mesh_scale)
     reach = wp.max(wp.max(wp.abs(lower_bvh[0]), wp.abs(lower_bvh[1])), wp.abs(lower_bvh[2]))
     reach = wp.max(reach, wp.max(wp.max(wp.abs(upper_bvh[0]), wp.abs(upper_bvh[1])), wp.abs(upper_bvh[2])))
-    pad = wp.vec3(1.0e-5 * (reach + (upper_bvh[0] - lower_bvh[0]) + 1.0e-3))
-    return lower_bvh - pad, upper_bvh + pad
+    pad = 1.0e-5 * (reach + (upper_bvh[0] - lower_bvh[0]) + 1.0e-3)
+    return lower_bvh - wp.vec3(pad), upper_bvh + wp.vec3(pad)
 
 
 @wp.func
@@ -1283,7 +1285,8 @@ def mesh_vs_convex_cell_candidates(
     At every occupied level of the mesh's index, the cells of the level-0 range ``[lo0, hi0]`` are looked up, or the
     level's occupied cells walked when they are fewer. A cell whose triangles' box misses the query box
     ``[query_lower, query_upper]`` (unscaled mesh frame) is skipped whole; a triangle is a candidate when its own box
-    overlaps the query box. A triangle met in several cells is a candidate in each; the exact pass keeps its first.
+    overlaps the query box. A small triangle (box of at most two cells per axis) met in several cells is a candidate in
+    its first one only (by its entry); a larger one is a candidate in each, and the exact pass keeps its first.
     ``lanes`` threads share the pair; each takes every ``lanes``-th cell.
     """
     grid = mesh_cells.grids[grid_index]
@@ -1332,7 +1335,9 @@ def mesh_vs_convex_cell_candidates(
                     box_lo, box_hi = mesh_cells_box_in_cell(query_lower, query_upper, cell_lower, inv_size)
                     for e in range(slot.start, slot.start + slot.count):
                         entry = mesh_cells.entries[e]
-                        if mesh_cells_entry_overlaps(entry, box_lo, box_hi):
+                        if mesh_cells_entry_overlaps(entry, box_lo, box_hi) and mesh_cells_entry_first_in_range(
+                            entry, cell, qlo, qhi
+                        ):
                             out = wp.atomic_add(candidate_count, 0, 1)
                             if out < candidates.shape[0]:
                                 candidates[out] = mesh_cells_candidate(pair_index, entry[0], level, cell)
