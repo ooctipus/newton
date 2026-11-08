@@ -118,6 +118,10 @@ def _classification_primitive(device, count, launch_ns):
     inputs.shape_transform = wp.array(poses, dtype=wp.transform, device=device)
     # Preparation packs the source pointer without dereferencing it.
     inputs.shape_source = wp.zeros(2 * count, dtype=wp.uint64, device=device)
+    inputs.shape_support_data = wp.zeros(0, dtype=wp.vec4i, device=device)
+    inputs.support_lut = wp.zeros(0, dtype=int, device=device)
+    inputs.support_vertex_offsets = wp.zeros(0, dtype=int, device=device)
+    inputs.support_neighbors = wp.zeros(0, dtype=int, device=device)
     inputs.shape_gap = wp.full(2 * count, 0.01, dtype=float, device=device)
     inputs.shape_collision_radius = wp.full(2 * count, 2.0, dtype=float, device=device)
     inputs.shape_aabb_lower = wp.full(2 * count, wp.vec3(-3.0), dtype=wp.vec3, device=device)
