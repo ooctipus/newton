@@ -512,16 +512,16 @@ def _nonnegative_portal_kernel(position: wp.array[wp.vec3], valid: wp.array[int]
     box = GenericShapeData()
     box.shape_type = int(GeoType.BOX)
     box.scale = wp.vec3(0.03, 0.009, 0.013)
-    hit, point_a, point_b, _normal, _depth, _seed, accepted = wp.static(create_solve_mpr(support_map).portal_core)(
-        triangle, box, wp.quat_identity(), position[0], 0.0, SupportMapDataProvider(), wp.vec3(0.0)
+    hit, point_a, point_b, _normal, _depth = wp.static(create_solve_mpr(support_map).core)(
+        triangle, box, wp.quat_identity(), position[0], 0.0, SupportMapDataProvider()
     )
-    valid[0] = int(hit and accepted)
+    valid[0] = int(hit)
     points[0] = point_a
     points[1] = point_b
 
 
 def test_mpr_nonnegative_portal(test, device):
-    """Accept an interior portal without renormalizing its nonnegative weights."""
+    """Report a box resting in a large triangle's interior with witnesses on both surfaces."""
     position = np.array([13.282333, 156.9778, 0.009500497], dtype=np.float32)
     position_wp = wp.array([position], dtype=wp.vec3, device=device)
     valid = wp.zeros(1, dtype=int, device=device)
