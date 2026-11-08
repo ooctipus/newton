@@ -175,6 +175,13 @@ NEWTON_FLAGS = declare(
         "=0 keeps the unculled tiled heightfield midphase (default 1).",
     ),
     EnvironmentFlag(
+        "NEWTON_HEIGHTFIELD_CONVEX_CELLS",
+        "retired",
+        ("core.environment_flags",),
+        "Retired terrain convex-cells owner (hull support keeps the vertex scan below 256 vertices and the "
+        "octahedral walk above); ignored, and the collision pipeline warns once per process.",
+    ),
+    EnvironmentFlag(
         "NEWTON_HEIGHTFIELD_CYLINDER_SPLIT",
         "experiment",
         _NARROW,
@@ -240,6 +247,13 @@ NEWTON_FLAGS = declare(
         "diagnostic",
         _COLLIDE,
         "=1 compiles diagnostic counters into the coherent convex filter.",
+    ),
+    EnvironmentFlag(
+        "NEWTON_NARROW_PHASE_CONVEX_CELLS",
+        "retired",
+        ("core.environment_flags",),
+        "Retired convex-cells owner (hull support keeps the vertex scan below 256 vertices and the octahedral "
+        "walk above); ignored, and the collision pipeline warns once per process.",
     ),
     EnvironmentFlag(
         "NEWTON_NARROW_PHASE_PACKED_HEIGHTFIELD_PAIRS",
