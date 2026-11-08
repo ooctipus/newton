@@ -15,7 +15,8 @@ pass. Measured on this tree with the shadow unset (today's terrain route as the 
   the cylinder query's exact LP reference) get none as deep as theirs (the shadow rows: none without a row, and 1 and
   0 short, within the law's known limit for penetrating solids);
 * exact geometry: random poses of every solid kind on rough, pitted and stepped terrain get a deepest row other than
-  their exact separation (34 of 126 poses) or rows with normals outside the surface's normal cone (25 ghost rows).
+  their exact separation (34 of 126 poses). Since seam witnesses take the face beneath their partner, no row has a
+  normal outside the surface's normal cone (there were 25 such ghost rows).
 
 The float32 rows equal the float64 law's (:mod:`newton.tests.terrain_law_reference`) on seam-adversarial placements
 up to 100 m out, but for rows the other side implies (:func:`~newton.tests.terrain_law_solid_utils.compare_solid_rows`).
@@ -2752,8 +2753,9 @@ class TestTerrainLawSolid(unittest.TestCase):
         self.assertTrue(all(v > 5 for v in counts.values()), msg=counts)
 
     def test_today_route_misses_solid_supports_cpu(self):
-        """Miss supports today: rows shallower than the exact separation or with normals outside the surface's cone,
-        cylinders through an exposed cell left without their depth, buried lying cylinders without a contact."""
+        """Miss supports today: rows shallower than the exact separation, cylinders through an exposed cell left
+        without their depth, buried lying cylinders without a contact. No row's normal leaves the surface's cone: a
+        seam witness takes the face beneath its partner."""
         found = {}
         for name, hf, model, hfield, shapes, bodies in _exact_scenes("cpu", 6):
             _pipeline, contacts, state = _collide(model, shadow=False)
@@ -2775,7 +2777,7 @@ class TestTerrainLawSolid(unittest.TestCase):
         self.assertGreater(found["buried rowless"], 5, msg=found)
         self.assertGreater(found["buried short"], 2 * BURIED_SHORT, msg=found)
         self.assertGreater(sum(v for k, v in found.items() if k.endswith("incomplete")), 5, msg=found)
-        self.assertGreater(sum(v for k, v in found.items() if k.endswith("ghosts")), 5, msg=found)
+        self.assertEqual(sum(v for k, v in found.items() if k.endswith("ghosts")), 0, msg=found)
 
     def test_today_route_fails_thin_rods_and_creases_cpu(self):
         """Lose thin rods' and crease bodies' supports today, and add ghost normals and duplicates there."""
