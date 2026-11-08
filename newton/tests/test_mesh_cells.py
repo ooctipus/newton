@@ -531,7 +531,68 @@ def test_non_finite_pose_meets_nothing(test, device):
     test.assertTrue(np.all(narrow._mesh_query_grid.numpy()[:2] == -1))
 
 
+def test_mesh_data_built_once(test, device):
+    """The model builds each mesh's cells and topology at finalize; a narrow phase given neither builds both once.
+
+    The topology a narrow phase builds from its device meshes is the model's (no triangle soup), and later launches
+    on the same shapes reuse it.
+    """
+    verts, faces = two_storey_room()
+    builder = newton.ModelBuilder()
+    builder.add_shape_mesh(-1, mesh=newton.Mesh(verts, faces, compute_inertia=False))
+    body = builder.add_body()
+    builder.add_shape_sphere(body, radius=0.2)
+    model = builder.finalize(device=device)
+    test.assertIsNotNone(model._mesh_cells)
+    test.assertEqual(model._mesh_topology.mesh_count, 1)
+
+    shape_type = model.shape_type.numpy()
+    arr = lambda x, t: wp.array(x, dtype=t, device=device)  # noqa: E731
+    narrow = NarrowPhase(max_candidate_pairs=1, max_triangle_pairs=1000, device=device, reduce_contacts=False)
+    m = 64
+    kw = {
+        "candidate_pair": arr([[0, 1]], wp.vec2i),
+        "candidate_pair_count": arr([1], wp.int32),
+        "shape_types": model.shape_type,
+        "shape_data": arr([[1.0, 1.0, 1.0, 0.0], [0.2, 0.0, 0.0, 0.0]], wp.vec4),
+        "shape_transform": arr(
+            [wp.transform_identity(), wp.transform(wp.vec3(1.0, 1.0, 0.15), wp.quat_identity())], wp.transform
+        ),
+        "shape_source": model.shape_source_ptr,
+        "shape_sdf_index": arr(np.full(2, -1), wp.int32),
+        "shape_gap": arr(np.full(2, 0.01), wp.float32),
+        "shape_collision_radius": model.shape_collision_radius,
+        "shape_flags": arr(np.full(2, int(ShapeFlags.COLLIDE_SHAPES)), wp.int32),
+        "shape_collision_aabb_lower": model.shape_collision_aabb_lower,
+        "shape_collision_aabb_upper": model.shape_collision_aabb_upper,
+        "shape_voxel_resolution": arr(np.full((2, 3), 4), wp.vec3i),
+        "shape_interior_point": arr(np.zeros((2, 3)), wp.vec3),
+        "contact_pair": wp.zeros(m, dtype=wp.vec2i, device=device),
+        "contact_position": wp.zeros(m, dtype=wp.vec3, device=device),
+        "contact_normal": wp.zeros(m, dtype=wp.vec3, device=device),
+        "contact_penetration": wp.zeros(m, dtype=float, device=device),
+        "contact_count": wp.zeros(1, dtype=int, device=device),
+    }
+    test.assertEqual(int(shape_type[0]), int(GeoType.MESH))
+    kw["contact_count"].zero_()
+    narrow.launch(**kw)
+    own = narrow._own_mesh_data_value
+    test.assertIsNotNone(own)
+    np.testing.assert_array_equal(narrow.mesh_topology.topology.numpy(), model._mesh_topology.data.topology.numpy())
+    contacts = int(kw["contact_count"].numpy()[0])
+    test.assertGreater(contacts, 0)
+    kw["contact_count"].zero_()
+    narrow.launch(**kw)
+    test.assertIs(narrow._own_mesh_data_value, own)
+    # The model's data, passed in, is what the launch uses.
+    kw["contact_count"].zero_()
+    narrow.launch(**kw, mesh_cells=model._mesh_cells, mesh_topology=model._mesh_topology.data)
+    test.assertIs(narrow.mesh_topology, model._mesh_topology.data)
+    test.assertEqual(int(kw["contact_count"].numpy()[0]), contacts)
+
+
 for _test in (
+    test_mesh_data_built_once,
     test_non_finite_pose_meets_nothing,
     test_build_registers_surface_cells,
     test_two_triangle_ground_is_small,
