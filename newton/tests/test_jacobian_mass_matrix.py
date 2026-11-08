@@ -1219,6 +1219,58 @@ def test_articulation_view_api(test, device):
     test.assertNotEqual(H2_np[1, 0, 0], 0.0)
 
 
+def test_articulation_view_blocks_match_model_rows(test, device):
+    """A view's own Jacobian and mass-matrix blocks hold the model-wide rows of its articulations, bit for bit.
+
+    Each label of the mixed worlds is a view whose largest articulation is smaller than
+    the model's in links or DOFs. Both mass-matrix paths are held: the composite rigid
+    body path without ``J`` and ``J^T M J`` from the view's Jacobian. A view-local mask
+    leaves the Jacobian block of an unselected world as it was and zeroes its mass matrix.
+    """
+    model, state = _build_mixed_articulations(device)
+    J_model = newton.eval_jacobian(model, state)
+    J_rows = J_model.numpy()
+    H_rows = newton.eval_mass_matrix(model, state).numpy()
+    H_jacobian_rows = newton.eval_mass_matrix(model, state, J=J_model).numpy()
+    extents = _jacobian_extents(model)
+
+    for label in ("chain", "fan", "floater"):
+        with test.subTest(label=label):
+            view = newton.selection.ArticulationView(model, label, verbose=False)
+            ids = view.articulation_ids.numpy().reshape(-1)
+            rows, dofs = 6 * view.max_joints_per_articulation, view.max_dofs_per_articulation
+            test.assertEqual((rows, dofs), tuple(int(n) for n in np.max([extents[i] for i in ids], axis=0)))
+            test.assertLess(rows * dofs, J_rows.shape[1] * J_rows.shape[2])
+
+            J = _filled((view.count, rows, dofs), _SENTINEL, device)
+            test.assertIs(view.eval_jacobian(state, J), J)
+            _assert_bits_equal(J.numpy(), J_rows[ids, :rows, :dofs])
+
+            H = _filled((view.count, dofs, dofs), _SENTINEL, device)
+            test.assertIs(view.eval_mass_matrix(state, H), H)
+            _assert_bits_equal(H.numpy(), H_rows[ids, :dofs, :dofs])
+            H.fill_(_SENTINEL)
+            view.eval_mass_matrix(state, H, J=J)
+            _assert_bits_equal(H.numpy(), H_jacobian_rows[ids, :dofs, :dofs])
+
+            world_mask = wp.array([True, False, True], dtype=bool, device=device)
+            J.fill_(_SENTINEL)
+            view.eval_jacobian(state, J, mask=world_mask)
+            view.eval_mass_matrix(state, H, mask=world_mask)
+            J_masked, H_masked = J.numpy(), H.numpy()
+            _assert_bits_equal(J_masked[[0, 2]], J_rows[ids[[0, 2]], :rows, :dofs])
+            _assert_bits_equal(J_masked[1], np.full((rows, dofs), _SENTINEL))
+            _assert_bits_equal(H_masked[[0, 2]], H_rows[ids[[0, 2]], :dofs, :dofs])
+            _assert_bits_equal(H_masked[1], np.zeros((dofs, dofs)))
+
+            with test.assertRaises(ValueError):
+                view.eval_jacobian(state, wp.zeros((view.count + 1, rows, dofs), dtype=float, device=device))
+            with test.assertRaises(ValueError):
+                view.eval_jacobian(state, wp.zeros((view.count, rows - 6, dofs), dtype=float, device=device))
+            with test.assertRaises(ValueError):
+                view.eval_mass_matrix(state, H, J=J_model)
+
+
 def test_floating_base_jacobian(test, device):
     """Test Jacobian for a floating base articulation (FREE joint at root)."""
     builder = newton.ModelBuilder()
@@ -1614,6 +1666,12 @@ add_function_test(
 )
 add_function_test(TestJacobianMassMatrix, "test_empty_model", test_empty_model, devices=devices)
 add_function_test(TestJacobianMassMatrix, "test_articulation_view_api", test_articulation_view_api, devices=devices)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_articulation_view_blocks_match_model_rows",
+    test_articulation_view_blocks_match_model_rows,
+    devices=devices,
+)
 add_function_test(TestJacobianMassMatrix, "test_floating_base_jacobian", test_floating_base_jacobian, devices=devices)
 add_function_test(
     TestJacobianMassMatrix, "test_jacobian_matches_body_qd_com", test_jacobian_matches_body_qd_com, devices=devices

@@ -1358,6 +1358,7 @@ def eval_joint_jacobian(
     articulation_start: wp.array[int],
     articulation_end: wp.array[int],
     articulation_mask: wp.array[bool],
+    articulation_slot: wp.array[int],
     joint_type: wp.array[int],
     joint_parent: wp.array[int],
     joint_child: wp.array[int],
@@ -1379,6 +1380,7 @@ def eval_joint_jacobian(
     One thread per model joint, so the selected articulations' Jacobians, links by DOFs, are
     written in full and nothing else in ``J`` is (:func:`write_joint_jacobian_columns`). A slice of the
     model's articulations, as for one picked articulation, takes :func:`eval_articulation_jacobian`.
+    With ``articulation_slot``, an articulation's block of ``J`` is its slot, and a slot of -1 skips it.
     """
     j = wp.tid()
     art_idx = joint_articulation[j]
@@ -1389,6 +1391,12 @@ def eval_joint_jacobian(
         if not articulation_mask[art_idx]:
             return
 
+    out = art_idx
+    if articulation_slot:
+        out = articulation_slot[art_idx]
+        if out < 0:
+            return
+
     joint_start = articulation_start[art_idx]
     joint_end = articulation_end[art_idx]
     # Loop-closing joints past the tree joints have no columns.
@@ -1397,7 +1405,7 @@ def eval_joint_jacobian(
 
     write_joint_jacobian_columns(
         j,
-        art_idx,
+        out,
         joint_start,
         joint_end,
         joint_type,
@@ -1481,6 +1489,8 @@ def eval_jacobian(
     J: wp.array | None = None,
     joint_S_s: wp.array | None = None,
     mask: wp.array[bool] | None = None,
+    *,
+    articulation_slot: wp.array[int] | None = None,
 ) -> wp.array | None:
     """Evaluate spatial Jacobian for articulations.
 
@@ -1509,14 +1519,23 @@ def eval_jacobian(
         mask: Optional one-dimensional mask of shape (articulation_count,) selecting
               which articulations to compute. If None, computes for all articulations.
               Two-dimensional per-world masks are not supported.
+        articulation_slot: Optional map of shape (articulation_count,) from each
+              articulation to its block of ``J``; -1 leaves the articulation out. A
+              selection writes its articulations into an array of its own size this way, as
+              :meth:`~newton.selection.ArticulationView.eval_jacobian` does. It requires ``J``.
 
     Returns:
         The Jacobian array J, or None if the model has no articulations.
+
+    Raises:
+        ValueError: If ``articulation_slot`` is given without ``J``.
     """
     if model.articulation_count == 0:
         return None
 
     if J is None:
+        if articulation_slot is not None:
+            raise ValueError("eval_jacobian: articulation_slot requires J, sized by the slots")
         max_links = model.max_joints_per_articulation
         max_dofs = model.max_dofs_per_articulation
         J = wp.zeros(
@@ -1541,6 +1560,7 @@ def eval_jacobian(
             model.articulation_start,
             model.articulation_end,
             mask,
+            articulation_slot,
             model.joint_type,
             model.joint_parent,
             model.joint_child,
@@ -1650,6 +1670,7 @@ def eval_articulation_mass_matrix(
     articulation_end: wp.array[int],
     articulation_count: int,
     articulation_mask: wp.array[bool],
+    articulation_slot: wp.array[int],
     joint_child: wp.array[int],
     joint_qd_start: wp.array[int],
     body_I_s: wp.array[wp.spatial_matrix],
@@ -1662,7 +1683,8 @@ def eval_articulation_mass_matrix(
 
     The mass matrix H relates joint accelerations to joint forces/torques.
     If ``joint_armature`` is provided, it is added to the diagonal.
-    Output shape: (articulation_count, max_dofs, max_dofs)
+    Output shape: (articulation_count, max_dofs, max_dofs). With ``articulation_slot``,
+    an articulation's blocks of ``J`` and ``H`` are its slot, and a slot of -1 skips it.
     """
     art_idx = wp.tid()
 
@@ -1671,6 +1693,12 @@ def eval_articulation_mass_matrix(
 
     if articulation_mask:
         if not articulation_mask[art_idx]:
+            return
+
+    out = art_idx
+    if articulation_slot:
+        out = articulation_slot[art_idx]
+        if out < 0:
             return
 
     joint_start = articulation_start[art_idx]
@@ -1695,12 +1723,12 @@ def eval_articulation_mass_matrix(
         # Compute contribution from this link: H += J_i^T * I_i * J_i
         for dof_i in range(articulation_dof_count):
             for dof_j in range(articulation_dof_count):
-                sum_val = link_mass_matrix_term(J, art_idx, row_start, dof_i, dof_j, I_s)
-                H[art_idx, dof_i, dof_j] = H[art_idx, dof_i, dof_j] + sum_val
+                sum_val = link_mass_matrix_term(J, out, row_start, dof_i, dof_j, I_s)
+                H[out, dof_i, dof_j] = H[out, dof_i, dof_j] + sum_val
 
     if joint_armature:
         for dof in range(articulation_dof_count):
-            H[art_idx, dof, dof] = H[art_idx, dof, dof] + joint_armature[articulation_dof_start + dof]
+            H[out, dof, dof] = H[out, dof, dof] + joint_armature[articulation_dof_start + dof]
 
 
 @wp.kernel(enable_backward=False)
@@ -1830,6 +1858,7 @@ def eval_articulation_mass_matrix_crba(
     articulation_start: wp.array[int],
     articulation_end: wp.array[int],
     articulation_mask: wp.array[bool],
+    articulation_slot: wp.array[int],
     joint_child: wp.array[int],
     joint_ancestor: wp.array[int],
     joint_qd_start: wp.array[int],
@@ -1847,11 +1876,18 @@ def eval_articulation_mass_matrix_crba(
     ancestors; entries between different branches stay zero. Motion subspaces
     and composite inertias are both taken about the root body origin. Each
     entry pair is written by one thread: c writes rows of strict ancestors and
-    rows ``r <= c`` of its own joint.
+    rows ``r <= c`` of its own joint. With ``articulation_slot``, an articulation's
+    block of ``H`` is its slot, and a slot of -1 skips it.
     """
     art_idx, col = wp.tid()
     if articulation_mask:
         if not articulation_mask[art_idx]:
+            return
+
+    out = art_idx
+    if articulation_slot:
+        out = articulation_slot[art_idx]
+        if out < 0:
             return
 
     joint_start = articulation_start[art_idx]
@@ -1881,8 +1917,8 @@ def eval_articulation_mass_matrix_crba(
                     if dof_r == dof_c:
                         h += joint_armature[dof_c]
                 row = dof_r - articulation_dof_start
-                H[art_idx, row, col] = h
-                H[art_idx, col, row] = h
+                H[out, row, col] = h
+                H[out, col, row] = h
         a = joint_ancestor[a]
 
 
@@ -2116,6 +2152,7 @@ def eval_mass_matrix(
     mask: wp.array[bool] | None = None,
     *,
     include_armature: bool = True,
+    articulation_slot: wp.array[int] | None = None,
 ) -> wp.array | None:
     """Evaluate generalized mass matrix for articulations.
 
@@ -2158,9 +2195,16 @@ def eval_mass_matrix(
               False returns the rigid-body matrix and emits a
               :class:`DeprecationWarning`. This argument will be removed in a
               future minor release.
+        articulation_slot: Optional map of shape (articulation_count,) from each
+              articulation to its block of ``H`` and of ``J``, as in
+              :func:`~newton.eval_jacobian`; -1 leaves the articulation out. It
+              requires ``H``, and a given ``J`` has the same blocks.
 
     Returns:
         The mass matrix array H, or None if the model has no articulations.
+
+    Raises:
+        ValueError: If ``articulation_slot`` is given without ``H``.
     """
     if not include_armature:
         warnings.warn(
@@ -2177,6 +2221,7 @@ def eval_mass_matrix(
         joint_S_s=joint_S_s,
         mask=mask,
         include_armature=include_armature,
+        articulation_slot=articulation_slot,
     )
 
 
@@ -2191,6 +2236,7 @@ def _eval_mass_matrix(
     *,
     include_armature: bool = True,
     requires_grad: bool | None = None,
+    articulation_slot: wp.array[int] | None = None,
 ) -> wp.array | None:
     """Implement :func:`eval_mass_matrix` without the deprecation warning.
 
@@ -2202,6 +2248,8 @@ def _eval_mass_matrix(
 
     # Allocate output if not provided
     if H is None:
+        if articulation_slot is not None:
+            raise ValueError("eval_mass_matrix: articulation_slot requires H, sized by the slots")
         max_dofs = model.max_dofs_per_articulation
         H = wp.empty(
             (model.articulation_count, max_dofs, max_dofs),
@@ -2295,6 +2343,7 @@ def _eval_mass_matrix(
                 model.articulation_start,
                 model.articulation_end,
                 mask,
+                articulation_slot,
                 model.joint_child,
                 model.joint_ancestor,
                 model.joint_qd_start,
@@ -2324,14 +2373,12 @@ def _eval_mass_matrix(
     # Compute Jacobian if not provided. eval_jacobian writes every entry that the
     # mass-matrix kernel reads, so the scratch needs no clear.
     if J is None:
-        max_links = model.max_joints_per_articulation
-        max_dofs = model.max_dofs_per_articulation
         J = wp.empty(
-            (model.articulation_count, max_links * 6, max_dofs),
+            (H.shape[0], model.max_joints_per_articulation * 6, H.shape[2]),
             dtype=float,
             device=model.device,
         )
-        eval_jacobian(model, state, J, joint_S_s=joint_S_s, mask=mask)
+        eval_jacobian(model, state, J, joint_S_s=joint_S_s, mask=mask, articulation_slot=articulation_slot)
 
     wp.launch(
         kernel=eval_articulation_mass_matrix,
@@ -2341,6 +2388,7 @@ def _eval_mass_matrix(
             model.articulation_end,
             model.articulation_count,
             mask,
+            articulation_slot,
             model.joint_child,
             model.joint_qd_start,
             body_I_s,

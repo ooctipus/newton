@@ -1553,6 +1553,22 @@ class ArticulationView:
             device=self.device,
         )
 
+        # The view's own blocks of the Jacobian and mass matrix: slot ``i`` belongs to the view's ``i``-th
+        # articulation in world-major order, and the blocks are sized by the view's largest articulation.
+        view_articulations = articulation_id_grid.reshape(-1)
+        articulation_slot = np.full(model.articulation_count, -1, dtype=np.int32)
+        articulation_slot[view_articulations] = np.arange(view_articulations.size, dtype=np.int32)
+        #: Slot of each model articulation in this view's Jacobian and mass matrix, -1 outside the view.
+        self.articulation_slot: wp.array[int] = wp.array(articulation_slot, dtype=int, device=self.device)
+        tree_joint_start = model_articulation_start[view_articulations]
+        tree_joint_end = model_articulation_end[view_articulations]
+        #: Tree joints of the view's largest articulation: its Jacobian blocks have ``6 *`` this many rows.
+        self.max_joints_per_articulation: int = int(np.max(tree_joint_end - tree_joint_start))
+        #: DOFs of the view's largest articulation: the columns of its Jacobian and mass-matrix blocks.
+        self.max_dofs_per_articulation: int = int(
+            np.max(model_joint_qd_start[tree_joint_end] - model_joint_qd_start[tree_joint_start])
+        )
+
         if verbose:
             lines = [
                 f"Articulation '{pattern}': {self.count}",
@@ -2277,6 +2293,27 @@ class ArticulationView:
         articulation_mask = self.get_model_articulation_mask(mask=mask)
         eval_fk(self.model, target.joint_q, target.joint_qd, target, mask=articulation_mask, joint_mask=joint_mask)
 
+    def _articulation_slot(self, out: wp.array | None, name: str, min_shape: tuple[int, int]) -> wp.array[int] | None:
+        """Return the slot map that writes ``out`` in this view's own blocks, or None for a model-wide ``out``.
+
+        ``out`` holds the view's blocks when it has :attr:`count` blocks and the model does not have as many
+        articulations; its other two axes must then hold the view's largest articulation, ``min_shape``.
+
+        Raises:
+            ValueError: If ``out`` has neither the model's nor this view's articulation count of blocks, or its
+                blocks are smaller than ``min_shape``.
+        """
+        if out is None or out.shape[0] == self.model.articulation_count:
+            return None
+        if out.shape[0] != self.count:
+            raise ValueError(
+                f"{name} has {out.shape[0]} blocks: expected the model's {self.model.articulation_count} "
+                f"articulations or this view's {self.count}"
+            )
+        if out.shape[1] < min_shape[0] or out.shape[2] < min_shape[1]:
+            raise ValueError(f"{name} blocks {tuple(out.shape[1:])} are smaller than this view's {min_shape}")
+        return self.articulation_slot
+
     def eval_jacobian(self, state: State, J=None, joint_S_s=None, mask=None):
         """Evaluate spatial Jacobian for articulations in this view.
 
@@ -2284,18 +2321,35 @@ class ArticulationView:
         velocities of each link in world frame, matching ``state.body_qd`` under
         Newton's public COM/world body-twist convention.
 
+        ``J`` is model-wide, as in :func:`~newton.eval_jacobian`, or holds this view's own
+        blocks: with :attr:`count` blocks of at least ``6 * max_joints_per_articulation``
+        rows and :attr:`max_dofs_per_articulation` columns, block ``i`` belongs to the
+        view's ``i``-th articulation in world-major order (the flattened
+        :attr:`articulation_ids`). A model with as many articulations as the view takes
+        the model-wide layout.
+
         Args:
             state: The state containing body transforms (body_q).
-            J: Optional output array for the Jacobian, shape (articulation_count, max_links*6, max_dofs).
-               If None, allocates internally.
+            J: Optional output array for the Jacobian, model-wide of shape
+               (model.articulation_count, model.max_joints_per_articulation*6, model.max_dofs_per_articulation)
+               or this view's, shape (count, 6*max_joints_per_articulation, max_dofs_per_articulation).
+               If None, allocates a model-wide array.
             joint_S_s: Optional pre-allocated temp array for motion subspaces.
             mask: Optional mask of articulations in this ArticulationView (all by default).
 
         Returns:
             The Jacobian array J, or None if the model has no articulations.
+
+        Raises:
+            ValueError: If ``J`` is neither model-wide nor this view's.
         """
+        articulation_slot = self._articulation_slot(
+            J, "J", (6 * self.max_joints_per_articulation, self.max_dofs_per_articulation)
+        )
         articulation_mask = self.get_model_articulation_mask(mask=mask)
-        return eval_jacobian(self.model, state, J, joint_S_s=joint_S_s, mask=articulation_mask)
+        return eval_jacobian(
+            self.model, state, J, joint_S_s=joint_S_s, mask=articulation_mask, articulation_slot=articulation_slot
+        )
 
     def eval_mass_matrix(
         self, state: State, H=None, J=None, body_I_s=None, joint_S_s=None, mask=None, *, include_armature=True
@@ -2308,12 +2362,19 @@ class ArticulationView:
         body twists. :attr:`~newton.Model.joint_armature` is added to the
         diagonal. See :func:`~newton.eval_mass_matrix`.
 
+        ``H`` is model-wide or holds this view's own blocks, as ``J`` in :meth:`eval_jacobian`:
+        :attr:`count` blocks of at least :attr:`max_dofs_per_articulation` rows and columns.
+        A given ``J`` has the same blocks as ``H``.
+
         Args:
             state: The state containing body transforms (body_q).
-            H: Optional output array for mass matrix, shape (articulation_count, max_dofs, max_dofs).
-               If None, allocates internally.
-            J: Optional pre-computed Jacobian. If None, see :func:`~newton.eval_mass_matrix`.
-            body_I_s: Optional pre-allocated temp array for spatial inertias.
+            H: Optional output array for mass matrix, model-wide of shape
+               (model.articulation_count, model.max_dofs_per_articulation, model.max_dofs_per_articulation)
+               or this view's, shape (count, max_dofs_per_articulation, max_dofs_per_articulation).
+               If None, allocates a model-wide array.
+            J: Optional pre-computed Jacobian, from :meth:`eval_jacobian` with the same blocks as ``H``.
+               If None, see :func:`~newton.eval_mass_matrix`.
+            body_I_s: Optional pre-allocated temp array for spatial inertias, shape (model.body_count,).
             joint_S_s: Optional pre-allocated temp array for motion subspaces.
             mask: Optional mask of articulations in this ArticulationView (all by default).
             include_armature: Deprecated in Newton 1.8. If True (default), add
@@ -2324,6 +2385,9 @@ class ArticulationView:
 
         Returns:
             The mass matrix array H, or None if the model has no articulations.
+
+        Raises:
+            ValueError: If ``H`` is neither model-wide nor this view's, or ``J`` has other blocks than ``H``.
         """
         if not include_armature:
             warnings.warn(
@@ -2331,6 +2395,12 @@ class ArticulationView:
                 NewtonDeprecationWarning,
                 stacklevel=2,
             )
+        dofs = self.max_dofs_per_articulation
+        articulation_slot = self._articulation_slot(H, "H", (dofs, dofs))
+        if J is not None:
+            J_slot = self._articulation_slot(J, "J", (6 * self.max_joints_per_articulation, dofs))
+            if J_slot is not articulation_slot:
+                raise ValueError("J and H must both be model-wide or both this view's")
         articulation_mask = self.get_model_articulation_mask(mask=mask)
         return _eval_mass_matrix(
             self.model,
@@ -2341,6 +2411,7 @@ class ArticulationView:
             joint_S_s=joint_S_s,
             mask=articulation_mask,
             include_armature=include_armature,
+            articulation_slot=articulation_slot,
         )
 
     def eval_inverse_dynamics_passive(
