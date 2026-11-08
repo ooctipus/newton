@@ -809,36 +809,31 @@ def build_mesh_cells(
     shape_source_ptr,
     device=None,
     *,
-    shape_flags=None,
     cell: float | None = None,
 ) -> MeshCells:
     """Build the cell index of every triangle mesh shape (``GeoType.MESH``), one per distinct mesh.
+
+    Every mesh shape is indexed, whatever its flags: an explicit pair list can collide any shape.
 
     Args:
         shape_type: Per-shape :class:`GeoType` values (host sequence or array).
         shape_source_ptr: Per-shape source pointers; a mesh shape's is its ``wp.Mesh`` id.
         device: Device of the returned arrays (and of the meshes).
-        shape_flags: Optional per-shape flags; when given, only shapes that collide with shapes are indexed.
         cell: Level-0 cell edge for every mesh [m]; chosen per mesh from its triangles when ``None``.
 
     Returns:
         The packed :class:`MeshCells`.
     """
-    from .flags import ShapeFlags  # noqa: PLC0415
-
     def host(values, dtype):
         return np.asarray(values.numpy() if hasattr(values, "numpy") else values, dtype=dtype).reshape(-1)
 
     types = host(shape_type, np.int64)
     sources = host(shape_source_ptr, np.uint64)
-    flags = host(shape_flags, np.int64) if shape_flags is not None else None
     shape_grid = np.full(max(types.size, 1), -1, dtype=np.int32)
     mesh_ids: list[int] = []
     grid_of: dict[int, int] = {}
     for s in range(types.size):
         if types[s] != int(GeoType.MESH) or sources[s] == 0:
-            continue
-        if flags is not None and not flags[s] & int(ShapeFlags.COLLIDE_SHAPES):
             continue
         mid = int(sources[s])
         if mid not in grid_of:

@@ -4147,7 +4147,7 @@ class NarrowPhase:
         mesh_buffer_report = self.triangle_pairs_count
         if mesh_cells is None:
             if self.has_meshes:
-                mesh_cells = build_mesh_cells(shape_types, shape_source, device, shape_flags=shape_flags)
+                mesh_cells = build_mesh_cells(shape_types, shape_source, device)
             else:
                 if self._empty_mesh_cells is None:
                     self._empty_mesh_cells = build_mesh_cells([], [], device)

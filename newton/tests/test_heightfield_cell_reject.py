@@ -11,6 +11,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.geometry.mesh_cells import MeshCells
 from newton._src.geometry.narrow_phase import NarrowPhase
 from newton._src.utils.heightfield import (
     HeightfieldData,
@@ -23,6 +24,7 @@ from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices
 def _create_heightfield_midphase(*, upstream_default):
     """Exercise the upstream call contract or an unculled reference at the launch boundary."""
 
+    # The signature of the midphase's first pass (``narrow_phase_find_mesh_triangle_overlaps_kernel``).
     @wp.kernel(enable_backward=False, module="unique")
     def midphase(
         shape_types: wp.array[int],
@@ -30,22 +32,23 @@ def _create_heightfield_midphase(*, upstream_default):
         shape_source: wp.array[wp.uint64],
         shape_gap: wp.array[float],
         shape_data: wp.array[wp.vec4],
-        shape_collision_radius: wp.array[float],
         shape_collision_aabb_lower: wp.array[wp.vec3],
         shape_collision_aabb_upper: wp.array[wp.vec3],
-        shape_interior_point: wp.array[wp.vec3],
         shape_heightfield_index: wp.array[wp.int32],
         heightfield_data: wp.array[HeightfieldData],
         heightfield_elevations: wp.array[wp.float32],
         shape_pairs_mesh: wp.array[wp.vec2i],
         shape_pairs_mesh_count: wp.array[int],
+        mesh_cells: MeshCells,
         total_num_threads: int,
+        query_lower: wp.array[wp.vec3],
+        query_upper: wp.array[wp.vec3],
+        query_range: wp.array2d[wp.vec3i],
+        query_grid: wp.array[wp.int32],
         triangle_pairs: wp.array[wp.vec3i],
         triangle_pairs_count: wp.array[int],
     ):
-        tid, lane = wp.tid()
-        if lane != 0:
-            return
+        tid = wp.tid()
         for i in range(tid, shape_pairs_mesh_count[0], total_num_threads):
             pair = shape_pairs_mesh[i]
             hfd = heightfield_data[shape_heightfield_index[pair[0]]]
