@@ -79,8 +79,12 @@ MIMIC_PLAN = FieldGroup(
     Field("_mimic_dof1", wp.int32, ("mimic",), owner="laws"),
     Field("_mimic_q0", wp.int32, ("mimic",), owner="laws"),
     Field("_mimic_q1", wp.int32, ("mimic",), owner="laws"),
+    Field("_mimic_coef0", wp.float32, ("mimic",), owner="laws"),
+    Field("_mimic_coef1", wp.float32, ("mimic",), owner="laws"),
+    Field("_mimic_enabled", wp.bool, ("mimic",), owner="laws"),
 )
-"""The static per-mimic lookup tables: each articulation's valid mimics (CSR) and each mimic's DOFs and coordinates."""
+"""The per-mimic tables: each articulation's valid mimics (CSR), each mimic's DOFs and coordinates (static), and its
+coefficients and enable bit (read again at a constraint notification)."""
 
 MIMIC_SLOTS = FieldGroup(Field("mimic_slot", wp.int32, ("mimic",), fill=-1, owner="laws"))
 
@@ -443,13 +447,12 @@ class RowLaws:
     def _mimic_plan(self, model) -> None:
         """Precompute the static per-mimic lookup tables for the MIMIC row family.
 
-        Resolves ``Model.constraint_mimic_*`` joint indices into articulation / DOF /
-        coordinate indices and validates the supported subset: both joints 1-DoF
-        (REVOLUTE or PRISMATIC), both in the same articulation, distinct DOFs — matching
-        SolverMuJoCo's own restriction. Invalid entries are warned about and masked off;
-        ``coef0``/``coef1``/``enabled`` stay live reads from the model arrays so runtime
-        mutation needs no re-initialization. All buffers are allocated here, once, so the
-        per-step launches are CUDA-graph-safe.
+        Every record of the model's mimics (:class:`.forest_plan.MimicRelations`: constraint and joint-owned, one
+        relation a record) is resolved into articulation / DOF / coordinate indices, and the supported subset kept:
+        both joints in one articulation, distinct DOFs, the record's joints admitting it. Invalid records are warned
+        about and masked off. ``coef0``/``coef1``/``enabled`` are the records' own copies, read again at a
+        constraint notification (:meth:`refresh_mimics`). All buffers are allocated here, once, so the per-step
+        launches are CUDA-graph-safe.
         """
         self.mimic_count = 0
         self.mimic_valid_np = None
@@ -460,49 +463,43 @@ class RowLaws:
         self.mimic_sizes = frozenset()
         self.mimic_slot = None
         self.mimic_warp_kernels = {}
-        n = int(getattr(model, "constraint_mimic_count", 0) or 0)
+        mimics = self.forest.mimics
+        n = mimics.count
         if n == 0 or not model.articulation_count or self.forest.art_to_world is None:
             return
 
-        j0 = model.constraint_mimic_joint0.numpy().astype(np.int32, copy=False)
-        j1 = model.constraint_mimic_joint1.numpy().astype(np.int32, copy=False)
+        j0, j1, component = mimics.follower, mimics.reference, mimics.component
         articulation_start = model.articulation_start.numpy().astype(np.int64, copy=False)
-        joint_type = model.joint_type.numpy().astype(np.int32, copy=False)
         joint_qd_start = model.joint_qd_start.numpy().astype(np.int32, copy=False)
         joint_q_start = model.joint_q_start.numpy().astype(np.int32, copy=False)
         labels = list(getattr(model, "constraint_mimic_label", []) or [])
 
-        one_dof = (int(JointType.REVOLUTE), int(JointType.PRISMATIC))
         articulation_bounds = articulation_start[: model.articulation_count + 1]
         a0, a1 = host_index.lookup(articulation_bounds, j0), host_index.lookup(articulation_bounds, j1)
         spans = (a0 < 0) | (a1 < 0) | (a0 != a1)
-        # Joint checks apply to the constraints within one articulation, in order.
-        within = np.flatnonzero(~spans)
-        one_dof_pair = np.zeros(n, dtype=bool)
-        one_dof_pair[within] = np.isin(joint_type[j0[within]], one_dof) & np.isin(joint_type[j1[within]], one_dof)
-        self_coupled = np.zeros(n, dtype=bool)
-        self_coupled[within] = joint_qd_start[j0[within]] == joint_qd_start[j1[within]]
-        valid = (~spans & one_dof_pair & ~self_coupled).astype(np.int32)
+        dof0, dof1 = joint_qd_start[j0] + component, joint_qd_start[j1] + component
+        self_coupled = ~spans & (dof0 == dof1)
+        valid = (~spans & mimics.supported & ~self_coupled).astype(np.int32)
         art = np.where(valid != 0, a0, -1).astype(np.int32)
         for k in np.flatnonzero(valid == 0):
-            name = labels[k] if k < len(labels) else f"mimic_{k}"
+            if k < mimics.constraints:
+                what = f"mimic constraint '{labels[k] if k < len(labels) else f'mimic_{k}'}'"
+            else:
+                what = f"joint {int(j0[k])}'s mimic"
             if spans[k]:
                 warnings.warn(
-                    f"SolverFeatherPGS: mimic constraint '{name}' spans articulations "
-                    f"({int(a0[k])} vs {int(a1[k])}); cross-articulation mimic is unsupported and the "
-                    "constraint is ignored.",
+                    f"SolverFeatherPGS: {what} spans articulations ({int(a0[k])} vs {int(a1[k])}); "
+                    "cross-articulation mimic is unsupported and the constraint is ignored.",
                     stacklevel=2,
                 )
-            elif not one_dof_pair[k]:
+            elif not mimics.supported[k]:
                 warnings.warn(
-                    f"SolverFeatherPGS: mimic constraint '{name}' references a non-1-DoF "
+                    f"SolverFeatherPGS: {what} references a non-1-DoF "
                     "joint (only REVOLUTE/PRISMATIC are supported); the constraint is ignored.",
                     stacklevel=2,
                 )
             else:
-                warnings.warn(
-                    f"SolverFeatherPGS: mimic constraint '{name}' couples a DOF to itself; ignored.", stacklevel=2
-                )
+                warnings.warn(f"SolverFeatherPGS: {what} couples a DOF to itself; ignored.", stacklevel=2)
 
         valid_indices = np.flatnonzero(valid).astype(np.int32, copy=False)
         art_start, order = host_index.group_by(art[valid_indices], model.articulation_count)
@@ -521,16 +518,20 @@ class RowLaws:
             for a in np.unique(art[valid_indices])
             if self.forest.response_dof_count[a] > 0
         )
+        coef0, coef1, enabled = mimics.coefficients(model)
         self._arrays.upload(
             MIMIC_PLAN,
             _mimic_art_start=art_start,
             _mimic_art_list=order,
             _mimic_valid=valid,
             _mimic_world=mimic_world,
-            _mimic_dof0=joint_qd_start[j0],
-            _mimic_dof1=joint_qd_start[j1],
-            _mimic_q0=joint_q_start[j0],
-            _mimic_q1=joint_q_start[j1],
+            _mimic_dof0=dof0,
+            _mimic_dof1=dof1,
+            _mimic_q0=joint_q_start[j0] + component,
+            _mimic_q1=joint_q_start[j1] + component,
+            _mimic_coef0=coef0,
+            _mimic_coef1=coef1,
+            _mimic_enabled=enabled,
         )
         self._arrays.allocate(MIMIC_SLOTS, mimic=n)
         self.mimic_count = n
@@ -542,6 +543,14 @@ class RowLaws:
             size: mimic_warp_kernel(size, prefix_shape(1, model.device).groups, int(per_art[sizes == size].max()))
             for size in self.mimic_sizes
         }
+
+    def refresh_mimics(self, model) -> None:
+        """Read the mimics' coefficients and enable bits again (a constraint notification), into the same arrays."""
+        if self.mimic_count:
+            for name, value in zip(
+                ("_mimic_coef0", "_mimic_coef1", "_mimic_enabled"), self.forest.mimics.coefficients(model), strict=True
+            ):
+                getattr(self, name).assign(value)
 
     def _link_plan(self) -> None:
         """The links' rows (:mod:`.body_cut`): six bilateral rows per enabled link, whatever joint made them. Their
@@ -690,7 +699,7 @@ class RowLaws:
     def write_mimics(self, solver, state_in: State, dt: float) -> None:
         """The mimic (joint coupling) equality rows, a static count per model: one warp per articulation reserves,
         writes and publishes them, as the joint limits (:mod:`.prefix_rows`)."""
-        law = self._prefix_law(solver, prefix_rows.PrefixMimicLaw, state_in, dt, mimics=self, mimic_model=solver.model)
+        law = self._prefix_law(solver, prefix_rows.PrefixMimicLaw, state_in, dt, mimics=self)
         support = solver.placement.row_support()
         for size, warp_kernel in self.mimic_warp_kernels.items():
             self._launch_prefix_warp(solver, warp_kernel, size, law, support)
@@ -1026,7 +1035,7 @@ class RowLaws:
         seeds.body_to_articulation = solver.forest.body_to_articulation
         seeds.mimic_dof0 = self._mimic_dof0 if mimics else dummy_int
         seeds.mimic_dof1 = self._mimic_dof1 if mimics else dummy_int
-        seeds.mimic_coef1 = model.constraint_mimic_coef1 if mimics else dummy_float
+        seeds.mimic_coef1 = self._mimic_coef1 if mimics else dummy_float
         seeds.link_primary = self._link_primary if links else dummy_int
         seeds.link_shadow = self._link_shadow if links else dummy_int
         seeds.body_q = state_in.body_q

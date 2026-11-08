@@ -51,7 +51,16 @@ BODY_MAPS = FieldGroup(
 """Each body's tree joint, articulation, response presence, low-32 response support and single response DOF."""
 
 
-__all__ = ["ClassShape", "ForestPlan", "RowLaw", "TopologyPin", "WorldClass", "joint_forest", "row_support"]
+__all__ = [
+    "ClassShape",
+    "ForestPlan",
+    "MimicRelations",
+    "RowLaw",
+    "TopologyPin",
+    "WorldClass",
+    "joint_forest",
+    "row_support",
+]
 
 
 NUMERIC_PROPERTIES = (
@@ -98,7 +107,7 @@ class RowLaw(enum.IntFlag):
     VELOCITY_LIMIT = 4
     """A joint axis with a positive velocity limit."""
     MIMIC = 8
-    """A mimic constraint on a tree's joint."""
+    """A mimic on a tree's joint, of either representation (:class:`MimicRelations`)."""
     LINK = 16
     """A link of the body cut."""
     SPIN = 32
@@ -154,6 +163,87 @@ class ClassShape:
         return bool(np.any(held[:, free].any(axis=1) & held[:, ~free].any(axis=1)))
 
 
+_SCALAR_JOINTS = (int(JointType.PRISMATIC), int(JointType.REVOLUTE))
+"""The joints of one coordinate, the only ones a constraint mimic (one relation, not componentwise) can couple."""
+
+
+@dataclass(frozen=True, eq=False)
+class MimicRelations:
+    """The model's mimics, both of its representations resolved into one relation a record: ``q_follower = coef0 +
+    coef1 q_reference`` between coordinate ``component`` of two joints, its velocity ``coef1`` times the reference's.
+
+    - A constraint mimic (``Model.constraint_mimic_*``, ``add_constraint_mimic``) is one record, in its order, from the
+      first: ``joint0`` follows ``joint1``. It couples two one-coordinate joints (as SolverMuJoCo's ``mjEQ_JOINT``),
+      else it is kept and marked unsupported.
+    - A joint-owned mimic (``Model.joint_mimic_joint`` / ``joint_mimic_coeffs``, ``set_joint_mimic``, which the URDF and
+      USD importers call) is one record per coordinate after them: the joint follows ``joint_mimic_joint``,
+      componentwise, as every upstream solver reads it, and it is always enabled.
+    - A follower that has a constraint mimic keeps that one only: no second row for one joint (SolverMuJoCo's rule).
+
+    A record's coefficients and enable bit are the model's (:meth:`coefficients`); its joints and coordinate are
+    static.
+    """
+
+    follower: np.ndarray
+    """Each record's follower joint."""
+    reference: np.ndarray
+    """Each record's reference joint."""
+    component: np.ndarray
+    """Each record's coordinate within both joints."""
+    supported: np.ndarray
+    """Whether each record's joints admit it (a constraint mimic between joints of one coordinate)."""
+    constraints: int
+    """The records from constraint mimics: the first ones."""
+
+    @property
+    def count(self) -> int:
+        return int(self.follower.size)
+
+    @classmethod
+    def of(cls, model: Model) -> MimicRelations:
+        """The model's mimics (both representations), resolved once."""
+        none = np.zeros(0, dtype=np.int32)
+        constraints = int(model.constraint_mimic_count or 0)
+        follower = model.constraint_mimic_joint0.numpy() if constraints else none
+        reference = model.constraint_mimic_joint1.numpy() if constraints else none
+        owned, owned_reference, component = none, none, none
+        supported = np.zeros(constraints, dtype=bool)
+        if model.joint_count:
+            joint_type, references = model.joint_type.numpy(), model.joint_mimic_joint.numpy()
+            valid = (follower >= 0) & (reference >= 0)
+            supported[valid] = np.isin(joint_type[follower[valid]], _SCALAR_JOINTS) & np.isin(
+                joint_type[reference[valid]], _SCALAR_JOINTS
+            )
+            owned = np.flatnonzero(references >= 0)
+            owned = owned[~np.isin(owned, follower)]
+            joint, component = host_index.expand(model.joint_dof_dim.numpy()[owned].sum(axis=1))
+            owned = owned[joint]
+            owned_reference = references[owned]
+        return cls(
+            follower=np.concatenate((follower, owned)).astype(np.int32),
+            reference=np.concatenate((reference, owned_reference)).astype(np.int32),
+            component=np.concatenate((np.zeros(constraints, dtype=np.int32), component)).astype(np.int32),
+            supported=np.concatenate((supported, np.ones(owned.size, dtype=bool))),
+            constraints=constraints,
+        )
+
+    def coefficients(self, model: Model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Each record's ``coef0``, ``coef1`` and enable bit, as the model holds them now."""
+        owned = self.follower[self.constraints :]
+        coeffs = model.joint_mimic_coeffs.numpy()[owned] if owned.size else np.zeros((0, 2), dtype=np.float32)
+        if self.constraints:
+            coef0, coef1 = model.constraint_mimic_coef0.numpy(), model.constraint_mimic_coef1.numpy()
+            enabled = model.constraint_mimic_enabled.numpy()
+        else:
+            coef0 = coef1 = np.zeros(0, dtype=np.float32)
+            enabled = np.zeros(0, dtype=bool)
+        return (
+            np.concatenate((coef0, coeffs[:, 0])).astype(np.float32),
+            np.concatenate((coef1, coeffs[:, 1])).astype(np.float32),
+            np.concatenate((enabled, np.ones(owned.size, dtype=bool))),
+        )
+
+
 def joint_forest(model: Model) -> TreePlan:
     """The forest of the model's articulation joints by their ancestry (``Model.joint_ancestor``); a joint
     outside every articulation stands alone."""
@@ -176,6 +266,8 @@ class ForestPlan:
     """The model's joint forest (:func:`joint_forest`)."""
     world_count: int
     """Worlds that hold an articulation (the largest articulation world plus one)."""
+    mimics: MimicRelations
+    """The model's mimics, both representations, one relation a record (:class:`MimicRelations`)."""
 
     # Articulations (host).
     articulation_dof_count_host: np.ndarray
@@ -311,7 +403,7 @@ class ForestPlan:
             kinematic_dof_mask: Each coordinate the body flags make kinematic, at construction.
         """
         model = cut.model
-        plan = SimpleNamespace(cut=cut, joint_forest=joint_forest)
+        plan = SimpleNamespace(cut=cut, joint_forest=joint_forest, mimics=MimicRelations.of(model))
         free_root = None
         if model.joint_count:
             # The one root rule: a FREE or DISTANCE joint without a parent roots a free tree.
@@ -728,9 +820,8 @@ def _world_classes(plan, model):
         finite = np.isfinite(model.joint_limit_lower.numpy()[dof]) | np.isfinite(model.joint_limit_upper.numpy()[dof])
         present(RowLaw.LIMIT, trees[finite])
         present(RowLaw.VELOCITY_LIMIT, trees[model.joint_velocity_limit.numpy()[dof] > 0.0])
-        if model.constraint_mimic_count:
-            for joints in (model.constraint_mimic_joint0.numpy(), model.constraint_mimic_joint1.numpy()):
-                present(RowLaw.MIMIC, joint_tree[joints[joints >= 0]])
+        for joints in (plan.mimics.follower, plan.mimics.reference):
+            present(RowLaw.MIMIC, joint_tree[joints[joints >= 0]])
     if plan.cut.tree_primary.size:
         np.bitwise_or.at(laws, plan.articulation_world[plan.cut.tree_primary], int(RowLaw.LINK))
 
