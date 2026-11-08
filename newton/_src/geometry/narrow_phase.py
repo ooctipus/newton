@@ -1946,14 +1946,9 @@ def narrow_phase_mesh_triangle_candidates_kernel(
     triangle_pairs: wp.array[wp.vec3i],  # (shape_a, shape_b, triangle_idx)
     triangle_pairs_count: wp.array[int],
 ):
-    """Midphase pass 3 of 3, one thread per candidate: exact bound and back-face tests (:func:`mesh_vs_convex_midphase`).
-
-    A candidate overflow pushes the triangle pair count past its capacity, so the buffer check reports it.
-    """
+    """Midphase pass 3 of 3, one thread per candidate: exact bound and back-face tests (:func:`mesh_vs_convex_midphase`)."""
     tid = wp.tid()
     count = candidate_count[0]
-    if tid == 0 and count > candidates.shape[0]:
-        wp.atomic_add(triangle_pairs_count, 0, triangle_pairs.shape[0] + 1)
     for c in range(tid, wp.min(count, candidates.shape[0]), total_num_threads):
         candidate = candidates[c]
         mesh_shape, non_mesh_shape = mesh_vs_convex_pair_shapes(shape_pairs_mesh[candidate[0]], shape_types)
@@ -1984,6 +1979,22 @@ def narrow_phase_mesh_triangle_candidates_kernel(
             triangle_pairs,
             triangle_pairs_count,
         )
+
+
+@wp.kernel(enable_backward=False)
+def narrow_phase_mesh_buffer_report_kernel(
+    triangle_pairs_count: wp.array[int],
+    max_triangle_pairs: int,
+    candidate_count: wp.array[int],
+    max_candidates: int,
+    report: wp.array[int],
+):
+    """The triangle pair count the buffer check reads: past capacity when the mesh midphase's candidates were too."""
+    count = triangle_pairs_count[0]
+    if candidate_count[0] > max_candidates:
+        wp.printf("Warning: Mesh midphase candidate buffer overflowed %d > %d.\n", candidate_count[0], max_candidates)
+        count = wp.max(count, max_triangle_pairs + 1)
+    report[0] = count
 
 
 # Threads that share one mesh pair's cells on CUDA.
@@ -3523,7 +3534,9 @@ class NarrowPhase:
             self._mesh_query_upper = wp.empty(pair_rows, dtype=wp.vec3, device=device)
             self._mesh_query_range = wp.empty((pair_rows, 2), dtype=wp.vec3i, device=device)
             self._mesh_query_grid = wp.empty(pair_rows, dtype=wp.int32, device=device)
-            self._mesh_candidates = wp.empty(max_triangle_pairs if has_meshes else 0, dtype=wp.vec4i, device=device)
+            # Candidates include triangles the exact pass drops: twice the triangle pairs' room.
+            self._mesh_candidates = wp.empty(2 * max_triangle_pairs if has_meshes else 0, dtype=wp.vec4i, device=device)
+            self._mesh_buffer_report = wp.zeros(1, dtype=wp.int32, device=device)
             # Every current admitted slot is written by MPR or GJK before the
             # write pass. Full input capacity bounds both arrays without clears.
             self._heightfield_cylinder_query_results = (
@@ -4130,6 +4143,8 @@ class NarrowPhase:
             support_neighbors = self._empty_support_neighbors
         if shape_edge_range is None:
             shape_edge_range = self._empty_edge_range
+        # The triangle pair count the buffer check reads (the mesh midphase's report when it runs).
+        mesh_buffer_report = self.triangle_pairs_count
         if mesh_cells is None:
             if self.has_meshes:
                 mesh_cells = build_mesh_cells(shape_types, shape_source, device, shape_flags=shape_flags)
@@ -4410,6 +4425,20 @@ class NarrowPhase:
                         device=device,
                         record_tape=False,
                     )
+                    wp.launch(
+                        kernel=narrow_phase_mesh_buffer_report_kernel,
+                        dim=1,
+                        inputs=[
+                            self.triangle_pairs_count,
+                            self.triangle_pairs.shape[0],
+                            self._mesh_candidate_count,
+                            self._mesh_candidates.shape[0],
+                        ],
+                        outputs=[self._mesh_buffer_report],
+                        device=device,
+                        record_tape=False,
+                    )
+                    mesh_buffer_report = self._mesh_buffer_report
 
             # Hull support acceleration and interior seeds, appended to every triangle query's inputs.
             support_inputs = [
@@ -4914,7 +4943,7 @@ class NarrowPhase:
                     self.split_manifold_work_items.shape[0] if self.split_manifold_work_items is not None else -1,
                     self.shape_pairs_mesh_count,
                     self.shape_pairs_mesh.shape[0] if self.shape_pairs_mesh is not None else 0,
-                    self.triangle_pairs_count,
+                    mesh_buffer_report,
                     self.triangle_pairs.shape[0] if self.triangle_pairs is not None else 0,
                     self.shape_pairs_mesh_plane_count,
                     self.shape_pairs_mesh_plane.shape[0] if self.shape_pairs_mesh_plane is not None else 0,
