@@ -294,6 +294,14 @@ front-facing triangles first, so that rounding at the plane cannot hand a contac
 FACE_NORMAL_COSINE = 1.0 - 2.0e-6
 """Cosine [-] above which a GJK/MPR contact normal is its triangle's face normal (2 mrad, above their rounding)."""
 
+REFINE_COSINE = 0.7071067811865476
+"""Cosine [-] of the largest tilt (45 degrees) at which a penetrating MPR direction on a mesh triangle is the face's.
+
+A lone triangle's MPR tilts toward an edge where the partner would leave it sideways (a few degrees for a ball on a
+seam); such a result is the face's. A direction far from the face is a contact of another kind (a partner across a
+thin feature such as a brick's rim, or an edge contact) and keeps MPR's own normal and depth.
+"""
+
 SEGMENT_STRICT_COSINE = 1.0e-5
 """Direction cosine [-] by which a capsule core's interior minimum must clear its feature's faces.
 
@@ -669,6 +677,10 @@ def mesh_contact_filter(contact: ContactData, context: SurfaceFeatureContext) ->
         # A face contact's manifold spans the coplanar facet (mesh_manifold_triangle): the triangle under it owns it.
         return False
     if edges == 0:
+        return True
+    if not face_contact and contact.contact_distance < 0.0:
+        # A penetrating tilted contact is MPR's own (see create_surface_penetration_refiner): no witness of a
+        # distance minimum, so no ghost test; each triangle keeps its own, as the triangle path always did.
         return True
     return _contact_feature_rule(context, point, normal, face_contact, on_edge, edges, edge)
 
@@ -1249,9 +1261,11 @@ def create_surface_penetration_refiner(support_func: Any):
     A lone triangle is a convex body to MPR, so a penetration's direction may tilt off the face toward an edge,
     where the partner would leave the lone triangle sideways; the surface goes on there. As the heightfield's
     triangle prism refiner does (``create_triangle_prism_penetration_refiner``, which this calls for prisms),
-    a penetrating mesh-triangle result is the face's: its outward normal, the partner's support depth along it,
-    and the partner's deepest point when it lies over the face (else MPR's witness on the partner). The feature
-    rule's ghost test is then for separated witnesses only, as on heightfields.
+    a penetrating mesh-triangle result tilted less than ``REFINE_COSINE`` (45 degrees) from the face is the face's:
+    its outward normal, the partner's support depth along it, and the partner's deepest point when it lies over the
+    face (else MPR's witness on the partner). A direction farther from the face keeps MPR's result: mapping it to the
+    face would push a partner across a thin feature (a brick's rim) along the feature's face. The feature rule's
+    ghost test is for separated witnesses only, as on heightfields.
     """
     prism_refiner = create_triangle_prism_penetration_refiner(support_func)
     shape_support = create_shape_support_function(support_func, center_ties=True)
@@ -1280,6 +1294,9 @@ def create_surface_penetration_refiner(support_func: Any):
         if length_sq < 1.0e-24:
             return point_a, point_b, normal, penetration
         unit = face / wp.sqrt(length_sq)
+        if wp.dot(normal, unit) < REFINE_COSINE:
+            # A direction far from the face (a partner across a thin feature, an edge contact): MPR's own.
+            return point_a, point_b, normal, penetration
         surface_point_b = (
             wp.quat_rotate(
                 orientation_b, shape_support(geom_b, wp.quat_rotate_inv(orientation_b, -unit), data_provider)
