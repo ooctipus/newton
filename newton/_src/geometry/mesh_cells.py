@@ -94,6 +94,10 @@ class MeshGrid:
     """Start of this mesh's triangles in the per-triangle arrays."""
     level_start: int
     """Start of this mesh's 17 level offsets in :attr:`MeshCells.level_start`."""
+    filter_start: int
+    """Start of this mesh's occupancy filter words in :attr:`MeshCells.filter`."""
+    filter_mask: int
+    """Filter bit count minus one (a power of two minus one)."""
 
 
 @wp.struct
@@ -133,6 +137,10 @@ class MeshCells:
     """Per shape: its mesh's index in :attr:`grids`, or -1."""
     slots: wp.array[MeshCellSlot]
     """The hash slots of every mesh."""
+    slot_keys: wp.array[wp.uint64]
+    """The slots' keys alone, for probing."""
+    filter: wp.array[wp.int32]
+    """Every mesh's occupancy filter: bit ``(hash >> 32) & filter_mask`` is set for each occupied cell's key."""
     entries: wp.array[wp.vec4i]
     """Per cell, by ascending triangle: ``(triangle, lo_x | lo_y << 14 | b0 << 28, lo_z | hi_x << 14 | b1 << 28,
     hi_y | hi_z << 14 | b2 << 28)``: the triangle id (local to the mesh), its box relative to the cell's lower corner
@@ -180,16 +188,23 @@ def _mesh_cells_hash(key: wp.uint64) -> wp.uint64:
 
 @wp.func
 def mesh_cells_find(cells: MeshCells, grid: MeshGrid, key: wp.uint64) -> MeshCellSlot:
-    """Cell ``key``'s slot in ``grid``; its ``count`` is zero when the cell is empty."""
+    """Cell ``key``'s slot in ``grid``; its ``count`` is zero when the cell is empty.
+
+    The occupancy filter answers most empty cells with one bit; the others probe the slots' keys.
+    """
     mask = grid.table_mask
-    slot = int(_mesh_cells_hash(key) & wp.uint64(mask))
+    h = _mesh_cells_hash(key)
     empty = MeshCellSlot()
     empty.count = 0
+    bit = int((h >> wp.uint64(32)) & wp.uint64(grid.filter_mask))
+    if (cells.filter[grid.filter_start + (bit >> 5)] >> (bit & 31)) & 1 == 0:
+        return empty
+    slot = int(h & wp.uint64(mask))
     for _probe in range(mask + 1):
-        stored = cells.slots[grid.table_start + slot]
-        if stored.key == key:
-            return stored
-        if stored.key == MESH_CELLS_EMPTY_KEY:
+        stored = cells.slot_keys[grid.table_start + slot]
+        if stored == key:
+            return cells.slots[grid.table_start + slot]
+        if stored == MESH_CELLS_EMPTY_KEY:
             return empty
         slot = (slot + 1) & mask
     return empty
@@ -841,10 +856,10 @@ def build_mesh_cells(
             mesh_ids.append(mid)
         shape_grid[s] = grid_of[mid]
 
-    names = ("slots", "entries", "triangles", "sorted_slots", "level_start")
+    names = ("slots", "slot_keys", "entries", "triangles", "sorted_slots", "level_start", "filter")
     chunks: dict[str, list] = {name: [] for name in names}
     grids = []
-    table_offset = entry_offset = triangle_offset = sorted_offset = 0
+    table_offset = entry_offset = triangle_offset = sorted_offset = filter_offset = 0
     meshes = meshes or {}
     unread = [mid for mid in mesh_ids if mid not in meshes]
     read = dict(zip(unread, _read_meshes(unread, device), strict=True))
@@ -866,12 +881,25 @@ def build_mesh_cells(
         info.table_mask = int(g["slots"].size - 1)
         info.triangle_start = triangle_offset
         info.level_start = len(grids) * (_MAX_LEVEL + 2)
+        # The occupancy filter: 16 bits a cell or more, one bit set per occupied cell (from the key's hash).
+        occupied = g["sorted_slots"]["key"]
+        bits = 32
+        while bits < 16 * occupied.size:
+            bits <<= 1
+        words = np.zeros(bits // 32, dtype=np.uint32)
+        bit = ((_hash_np(occupied) >> np.uint64(32)) & np.uint64(bits - 1)).astype(np.int64)
+        np.bitwise_or.at(words, bit >> 5, np.left_shift(np.uint32(1), (bit & 31).astype(np.uint32)))
+        info.filter_start = filter_offset
+        info.filter_mask = bits - 1
+        chunks["filter"].append(words.view(np.int32))
+        filter_offset += words.size
         grids.append(info)
         slots = g["slots"].copy()
         slots["start"] += entry_offset
         sorted_slots = g["sorted_slots"].copy()
         sorted_slots["start"] += entry_offset
         chunks["slots"].append(slots)
+        chunks["slot_keys"].append(np.ascontiguousarray(slots["key"]))
         chunks["sorted_slots"].append(sorted_slots)
         chunks["level_start"].append(g["level_start"] + sorted_offset)
         chunks["entries"].append(g["entries"])
@@ -894,6 +922,8 @@ def build_mesh_cells(
             if dtype == MeshCellSlot:
                 empty["key"] = 0xFFFFFFFFFFFFFFFF
             return wp.array(empty, dtype=dtype, device=device)
+        if name == "slot_keys":
+            return wp.array(np.full(1, 0xFFFFFFFFFFFFFFFF, dtype=np.uint64), dtype=dtype, device=device)
         shape = (1,) if width is None else (1, width)
         return wp.array(np.zeros(shape, dtype=np.int64), dtype=dtype, device=device)
 
@@ -901,8 +931,10 @@ def build_mesh_cells(
     result.grids = wp.array(grids if grids else [MeshGrid()], dtype=MeshGrid, device=device)
     result.shape_grid = wp.array(shape_grid, dtype=wp.int32, device=device)
     result.slots = packed("slots", MeshCellSlot)
+    result.slot_keys = packed("slot_keys", wp.uint64)
     result.entries = packed("entries", wp.vec4i, 4)
     result.triangles = packed("triangles", MeshCellTriangle)
     result.sorted_slots = packed("sorted_slots", MeshCellSlot)
     result.level_start = packed("level_start", wp.int32)
+    result.filter = packed("filter", wp.int32)
     return result

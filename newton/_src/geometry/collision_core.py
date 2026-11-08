@@ -1106,19 +1106,19 @@ def convex_mesh_interior_point(mesh_id: wp.uint64, scale: wp.vec3) -> wp.vec3:
 @wp.func
 def _mesh_query_bound(
     convex: GenericShapeData,
+    local_lower: wp.vec3,
+    local_upper: wp.vec3,
     X_mesh_shape: wp.transform,
     contact_threshold: float,
 ) -> MeshQueryBound:
     """The convex shape's bound in the scaled mesh frame, inflated by ``contact_threshold``.
 
-    The box is the shape's own local box (support extremes along its axes) placed in the mesh frame. Shapes with a
+    The box is the shape's own local box ``[local_lower, local_upper]`` (:func:`mesh_vs_convex_local_box`) placed in
+    the mesh frame. Shapes with a
     symmetry axis also carry the segment-plus-radius that contains them: a sphere's center, a capsule's core, and the
     axis of a cylinder or cone with its largest radius. A contact needs a triangle within the threshold of the shape,
     hence inside both. A small relative pad covers float32 rounding; it only admits more triangles.
     """
-    local_lower, local_upper = compute_tight_aabb_from_support(
-        convex, wp.quat_identity(), wp.vec3(0.0), SupportMapDataProvider()
-    )
     rot = wp.quat_to_matrix(wp.transform_get_rotation(X_mesh_shape))
     pos = wp.transform_get_translation(X_mesh_shape)
     local_center = 0.5 * (local_lower + local_upper)
@@ -1147,6 +1147,20 @@ def _mesh_query_bound(
         bound.radius = radius + pad
         bound.has_segment = True
     return bound
+
+
+@wp.func
+def mesh_vs_convex_local_box(
+    convex: GenericShapeData,
+    shape: int,
+    shape_collision_aabb_lower: wp.array[wp.vec3],
+    shape_collision_aabb_upper: wp.array[wp.vec3],
+) -> tuple[wp.vec3, wp.vec3]:
+    """The convex shape's local box: a hull's stored local AABB (as the narrow phase reads it for hulls), a
+    primitive's support extremes along its axes."""
+    if convex.shape_type == int(GeoType.CONVEX_MESH):
+        return shape_collision_aabb_lower[shape], shape_collision_aabb_upper[shape]
+    return compute_tight_aabb_from_support(convex, wp.quat_identity(), wp.vec3(0.0), SupportMapDataProvider())
 
 
 @wp.func
@@ -1236,6 +1250,8 @@ def mesh_vs_convex_query_box(
     shape_type: wp.array[int],
     shape_data: wp.array[wp.vec4],
     shape_source_ptr: wp.array[wp.uint64],
+    shape_collision_aabb_lower: wp.array[wp.vec3],
+    shape_collision_aabb_upper: wp.array[wp.vec3],
     contact_threshold: float,
 ) -> tuple[wp.vec3, wp.vec3]:
     """The box, in the mesh's unscaled frame, of the convex shape's midphase bound (:func:`_mesh_query_bound`).
@@ -1244,7 +1260,10 @@ def mesh_vs_convex_query_box(
     """
     convex = _mesh_vs_convex_shape_data(non_mesh_shape, shape_type, shape_data, shape_source_ptr)
     convex_in_mesh = wp.transform_multiply(wp.transform_inverse(X_mesh_ws), X_ws)
-    bound = _mesh_query_bound(convex, convex_in_mesh, contact_threshold)
+    local_lower, local_upper = mesh_vs_convex_local_box(
+        convex, non_mesh_shape, shape_collision_aabb_lower, shape_collision_aabb_upper
+    )
+    bound = _mesh_query_bound(convex, local_lower, local_upper, convex_in_mesh, contact_threshold)
     lower, upper = mesh_query_bound_box(bound)
     mesh_data = shape_data[mesh_shape]
     mesh_scale = wp.vec3(mesh_data[0], mesh_data[1], mesh_data[2])
@@ -1361,6 +1380,8 @@ def mesh_vs_convex_midphase(
     shape_data: wp.array[wp.vec4],
     shape_source_ptr: wp.array[wp.uint64],
     shape_mesh_properties: wp.array[wp.int32],
+    shape_collision_aabb_lower: wp.array[wp.vec3],
+    shape_collision_aabb_upper: wp.array[wp.vec3],
     contact_threshold: float,
     non_mesh_center: wp.vec3,
     mesh_cells: MeshCells,
@@ -1392,6 +1413,8 @@ def mesh_vs_convex_midphase(
         shape_data: Array of shape data (vec4: scale.xyz, margin.w)
         shape_source_ptr: Array of mesh/SDF source pointers
         shape_mesh_properties: Per-shape watertightness metadata
+        shape_collision_aabb_lower: Per-shape local AABB lower bounds (a hull's local box)
+        shape_collision_aabb_upper: Per-shape local AABB upper bounds
         contact_threshold: Contact candidate distance [m], including margin and gap
         non_mesh_center: Interior point of the convex shape in its scaled local frame [m]
         mesh_cells: The scene's mesh cell indices
@@ -1423,7 +1446,10 @@ def mesh_vs_convex_midphase(
     convex_in_mesh = wp.transform_multiply(wp.transform_inverse(X_mesh_ws), X_ws)
     mesh_data = shape_data[mesh_shape]
     mesh_scale = wp.vec3(mesh_data[0], mesh_data[1], mesh_data[2])
-    bound = _mesh_query_bound(convex, convex_in_mesh, contact_threshold)
+    local_lower, local_upper = mesh_vs_convex_local_box(
+        convex, non_mesh_shape, shape_collision_aabb_lower, shape_collision_aabb_upper
+    )
+    bound = _mesh_query_bound(convex, local_lower, local_upper, convex_in_mesh, contact_threshold)
     if not mesh_query_bound_meets_triangle(
         bound,
         wp.cw_mul(v0, mesh_scale),
