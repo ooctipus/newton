@@ -14,6 +14,8 @@ from ..core.types import MAXVAL, Devicelike
 from ..geometry.collision_convex import ConvexQueryResult, create_write_convex_query_result, gjk_separation_cutoff
 from ..geometry.collision_core import (
     MINKOWSKI_CORE_RADIUS,
+    _mesh_query_bound,
+    _mesh_vs_convex_shape_data,
     check_infinite_plane_bsphere_overlap,
     compute_bounding_sphere_from_aabb,
     compute_tight_aabb_from_support,
@@ -21,10 +23,12 @@ from ..geometry.collision_core import (
     convex_mesh_interior_point,
     create_compute_gjk_mpr_contacts,
     create_find_contacts,
+    mesh_query_bound_slab,
+    mesh_query_bound_unscaled_box,
     mesh_vs_convex_cell_candidates,
+    mesh_vs_convex_local_box,
     mesh_vs_convex_midphase,
     mesh_vs_convex_pair_shapes,
-    mesh_vs_convex_query_box,
     mesh_vs_convex_query_range,
     post_process_axial_on_discrete_contact,
     post_process_minkowski_only,
@@ -1833,6 +1837,10 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
     query_upper: wp.array[wp.vec3],
     query_range: wp.array2d[wp.vec3i],
     query_grid: wp.array[wp.int32],
+    query_slab0: wp.array[wp.vec4],
+    query_slab1: wp.array[wp.vec4],
+    query_slab2: wp.array[wp.vec4],
+    query_slab_half: wp.array[wp.vec3],
     triangle_pairs: wp.array[wp.vec3i],  # (shape_a, shape_b, triangle_idx)
     triangle_pairs_count: wp.array[int],
 ):
@@ -1840,7 +1848,8 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
 
     A heightfield pair projects the convex shape's bounding sphere onto the heightfield grid and emits its triangle
     pairs here. A mesh-vs-convex pair stores its bound's box in the mesh frame (:func:`mesh_vs_convex_query_box`),
-    its level-0 cell range and its mesh's cell index; other pairs, and pairs whose box misses the mesh, store -1.
+    the bound's oriented box as three slabs (:func:`mesh_query_bound_slab`), its level-0 cell range and its mesh's
+    cell index; other pairs, and pairs whose box misses the mesh, store -1.
     """
     for i in range(wp.tid(), shape_pairs_mesh_count[0], total_num_threads):
         pair = shape_pairs_mesh[i]
@@ -1875,23 +1884,26 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
             + shape_data[non_mesh_shape][3]
             + shape_data[mesh_shape][3]
         )
-        lower, upper = mesh_vs_convex_query_box(
-            mesh_shape,
-            non_mesh_shape,
-            shape_transform[mesh_shape],
-            shape_transform[non_mesh_shape],
-            shape_types,
-            shape_data,
-            shape_source,
-            shape_collision_aabb_lower,
-            shape_collision_aabb_upper,
-            contact_threshold,
-        )
         grid = mesh_cells.shape_grid[mesh_shape]
         if grid < 0:
             continue
+        convex = _mesh_vs_convex_shape_data(non_mesh_shape, shape_types, shape_data, shape_source)
+        convex_in_mesh = wp.transform_multiply(
+            wp.transform_inverse(shape_transform[mesh_shape]), shape_transform[non_mesh_shape]
+        )
+        local_lower, local_upper = mesh_vs_convex_local_box(
+            convex, non_mesh_shape, shape_collision_aabb_lower, shape_collision_aabb_upper
+        )
+        bound = _mesh_query_bound(convex, local_lower, local_upper, convex_in_mesh, contact_threshold)
+        mesh_data = shape_data[mesh_shape]
+        mesh_scale = wp.vec3(mesh_data[0], mesh_data[1], mesh_data[2])
+        lower, upper = mesh_query_bound_unscaled_box(bound, mesh_scale)
         lo0, hi0, inside = mesh_vs_convex_query_range(mesh_cells, grid, lower, upper)
         if inside:
+            query_slab0[i] = mesh_query_bound_slab(bound, 0, mesh_scale)
+            query_slab1[i] = mesh_query_bound_slab(bound, 1, mesh_scale)
+            query_slab2[i] = mesh_query_bound_slab(bound, 2, mesh_scale)
+            query_slab_half[i] = bound.half
             query_lower[i] = lower
             query_upper[i] = upper
             query_range[i, 0] = lo0
@@ -1902,13 +1914,18 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
 def _create_mesh_cell_candidates_kernel(lanes: int):
     """Midphase pass 2 of 3: ``lanes`` threads per mesh pair walk its cells (launch ``[blocks, block_dim]``)."""
 
-    @wp.kernel(enable_backward=False, module=f"narrow_phase_mesh_cell_candidates_{lanes}")
+    # The pass is bound by its loads' latency: 64 registers (from 108 uncapped) keep more warps in flight.
+    @wp.kernel(enable_backward=False, module=f"narrow_phase_mesh_cell_candidates_{lanes}", cuda_max_registers=64)
     def narrow_phase_mesh_cell_candidates_kernel(
         shape_pairs_mesh_count: wp.array[int],
         query_lower: wp.array[wp.vec3],
         query_upper: wp.array[wp.vec3],
         query_range: wp.array2d[wp.vec3i],
         query_grid: wp.array[wp.int32],
+        query_slab0: wp.array[wp.vec4],
+        query_slab1: wp.array[wp.vec4],
+        query_slab2: wp.array[wp.vec4],
+        query_slab_half: wp.array[wp.vec3],
         mesh_cells: MeshCells,
         total_num_threads: int,
         # outputs
@@ -1932,6 +1949,10 @@ def _create_mesh_cell_candidates_kernel(lanes: int):
                     query_upper[i],
                     query_range[i, 0],
                     query_range[i, 1],
+                    query_slab0[i],
+                    query_slab1[i],
+                    query_slab2[i],
+                    query_slab_half[i],
                     mesh_cells,
                     candidates,
                     candidate_count,
@@ -2016,8 +2037,8 @@ def narrow_phase_mesh_buffer_report_kernel(
     report[0] = count
 
 
-# Threads that share one mesh pair's cells on CUDA.
-_MESH_MIDPHASE_LANES = 2
+# Threads that share one mesh pair's cells on CUDA (4 balances the real states' large ranges; 2 and 8 measured).
+_MESH_MIDPHASE_LANES = 4
 
 narrow_phase_mesh_cell_candidates_kernel = _create_mesh_cell_candidates_kernel(_MESH_MIDPHASE_LANES)
 narrow_phase_mesh_cell_candidates_kernel_cpu = _create_mesh_cell_candidates_kernel(1)
@@ -3659,6 +3680,10 @@ class NarrowPhase:
             self._mesh_query_upper = wp.empty(pair_rows, dtype=wp.vec3, device=device)
             self._mesh_query_range = wp.empty((pair_rows, 2), dtype=wp.vec3i, device=device)
             self._mesh_query_grid = wp.empty(pair_rows, dtype=wp.int32, device=device)
+            self._mesh_query_slab0 = wp.empty(pair_rows, dtype=wp.vec4, device=device)
+            self._mesh_query_slab1 = wp.empty(pair_rows, dtype=wp.vec4, device=device)
+            self._mesh_query_slab2 = wp.empty(pair_rows, dtype=wp.vec4, device=device)
+            self._mesh_query_slab_half = wp.empty(pair_rows, dtype=wp.vec3, device=device)
             # Candidates include triangles the exact pass drops: twice the triangle pairs' room.
             self._mesh_candidates = wp.empty(2 * max_triangle_pairs if has_meshes else 0, dtype=wp.vec4i, device=device)
             self._mesh_buffer_report = wp.zeros(1, dtype=wp.int32, device=device)
@@ -4533,6 +4558,10 @@ class NarrowPhase:
                         self._mesh_query_upper,
                         self._mesh_query_range,
                         self._mesh_query_grid,
+                        self._mesh_query_slab0,
+                        self._mesh_query_slab1,
+                        self._mesh_query_slab2,
+                        self._mesh_query_slab_half,
                         self.triangle_pairs,
                         self.triangle_pairs_count,
                     ],
@@ -4549,6 +4578,10 @@ class NarrowPhase:
                             self._mesh_query_upper,
                             self._mesh_query_range,
                             self._mesh_query_grid,
+                            self._mesh_query_slab0,
+                            self._mesh_query_slab1,
+                            self._mesh_query_slab2,
+                            self._mesh_query_slab_half,
                             mesh_cells,
                             self._mesh_midphase_blocks * self._mesh_midphase_block_dim,
                         ],

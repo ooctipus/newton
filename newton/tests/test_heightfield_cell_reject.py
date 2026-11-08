@@ -45,6 +45,10 @@ def _create_heightfield_midphase(*, upstream_default):
         query_upper: wp.array[wp.vec3],
         query_range: wp.array2d[wp.vec3i],
         query_grid: wp.array[wp.int32],
+        query_slab0: wp.array[wp.vec4],
+        query_slab1: wp.array[wp.vec4],
+        query_slab2: wp.array[wp.vec4],
+        query_slab_half: wp.array[wp.vec3],
         triangle_pairs: wp.array[wp.vec3i],
         triangle_pairs_count: wp.array[int],
     ):
