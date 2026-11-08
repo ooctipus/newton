@@ -446,7 +446,47 @@ def test_midphase_cell_sizes(test, device):
     test.assertEqual(len(sizes), 1)
 
 
+def test_non_finite_pose_meets_nothing(test, device):
+    """A shape with a non-finite pose gets no triangles (and its query stays in bounds)."""
+    verts, faces = terrain_mesh(np.random.default_rng(5))
+    mesh = newton.Mesh(verts, faces, compute_inertia=False)
+    with wp.ScopedDevice(device):
+        mesh_id = mesh.finalize()
+    arr = lambda x, t: wp.array(x, dtype=t, device=device)  # noqa: E731
+    shape_type = np.array([int(GeoType.MESH), int(GeoType.SPHERE), int(GeoType.SPHERE)], dtype=np.int32)
+    shape_source = np.array([mesh_id, 0, 0], dtype=np.uint64)
+    poses = [(0.0, 0.0, 0.0), (np.nan, 0.0, 0.0), (0.0, 0.0, np.inf)]
+    narrow = NarrowPhase(max_candidate_pairs=2, max_triangle_pairs=1000, device=device, reduce_contacts=False)
+    m = 64
+    narrow.launch(
+        candidate_pair=arr([[0, 1], [0, 2]], wp.vec2i),
+        candidate_pair_count=arr([2], wp.int32),
+        shape_types=arr(shape_type, wp.int32),
+        shape_data=arr([[1.0, 1.0, 1.0, 0.0], [0.1, 0.0, 0.0, 0.0], [0.1, 0.0, 0.0, 0.0]], wp.vec4),
+        shape_transform=arr([wp.transform(wp.vec3(*p), wp.quat_identity()) for p in poses], wp.transform),
+        shape_source=arr(shape_source, wp.uint64),
+        shape_sdf_index=arr(np.full(3, -1), wp.int32),
+        shape_gap=arr(np.full(3, 0.01), wp.float32),
+        shape_collision_radius=arr(np.ones(3), wp.float32),
+        shape_flags=arr(np.full(3, int(ShapeFlags.COLLIDE_SHAPES)), wp.int32),
+        shape_collision_aabb_lower=arr(np.zeros((3, 3)), wp.vec3),
+        shape_collision_aabb_upper=arr(np.zeros((3, 3)), wp.vec3),
+        shape_voxel_resolution=arr(np.full((3, 3), 4), wp.vec3i),
+        shape_interior_point=arr(np.zeros((3, 3)), wp.vec3),
+        mesh_cells=build_mesh_cells(shape_type, shape_source, device),
+        contact_pair=wp.zeros(m, dtype=wp.vec2i, device=device),
+        contact_position=wp.zeros(m, dtype=wp.vec3, device=device),
+        contact_normal=wp.zeros(m, dtype=wp.vec3, device=device),
+        contact_penetration=wp.zeros(m, dtype=float, device=device),
+        contact_count=wp.zeros(1, dtype=int, device=device),
+    )
+    test.assertEqual(int(narrow.shape_pairs_mesh_count.numpy()[0]), 2)
+    test.assertEqual(int(narrow.triangle_pairs_count.numpy()[0]), 0)
+    test.assertTrue(np.all(narrow._mesh_query_grid.numpy()[:2] == -1))
+
+
 for _test in (
+    test_non_finite_pose_meets_nothing,
     test_build_registers_surface_cells,
     test_two_triangle_ground_is_small,
     test_midphase_matches_brute_force,
