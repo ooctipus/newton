@@ -213,6 +213,7 @@ def mesh_cells_candidate(pair: int, triangle: int, level: int, cell: wp.vec3i) -
     """A midphase candidate: the pair, the triangle and the cell it was met in."""
     return wp.vec4i(pair, triangle, cell[0] | (cell[1] << 15), cell[2] | (level << 15))
 
+
 @wp.func
 def mesh_cells_box_in_cell(
     lower: wp.vec3, upper: wp.vec3, cell_lower: wp.vec3, inv_size: float
@@ -668,9 +669,7 @@ def build_mesh_grid(points: np.ndarray, indices: np.ndarray, cell: float | None 
     keys, tris, block = keys[order], tris[order], block[order]
     # Each entry's triangle box relative to its cell, rounded outward by a step.
     entry_level = (keys >> np.uint64(60)).astype(np.int64)
-    entry_cell = np.stack(
-        [((keys >> np.uint64(s)) & np.uint64(0xFFFFF)).astype(np.int64) for s in (40, 20, 0)], axis=1
-    )
+    entry_cell = np.stack([((keys >> np.uint64(s)) & np.uint64(0xFFFFF)).astype(np.int64) for s in (40, 20, 0)], axis=1)
     entry_size = h * np.left_shift(1, _LEVEL_SHIFT * entry_level).astype(np.float64)
     cell_lo = o + entry_cell * entry_size[:, None]
     q_lo = np.floor((tmin[tris] - cell_lo) / entry_size[:, None] * _BOX_STEPS) - 1
@@ -824,6 +823,7 @@ def build_mesh_cells(
     Returns:
         The packed :class:`MeshCells`.
     """
+
     def host(values, dtype):
         return np.asarray(values.numpy() if hasattr(values, "numpy") else values, dtype=dtype).reshape(-1)
 

@@ -52,9 +52,8 @@ def _box_faces(lo, hi, inward=False):
     )
     quads = [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]
     tris = []
-    for q in quads:
-        q = q[::-1] if inward else q
-        tris += _quad(*q)
+    for quad in quads:
+        tris += _quad(*(quad[::-1] if inward else quad))
     return v, np.array(tris)
 
 
@@ -73,7 +72,12 @@ def terrain_mesh(rng, n=24, step=0.1):
     parts = []
     for i in range(n):
         for j in range(n):
-            p = [[xs[i], xs[j], z[i, j]], [xs[i + 1], xs[j], z[i + 1, j]], [xs[i + 1], xs[j + 1], z[i + 1, j + 1]], [xs[i], xs[j + 1], z[i, j + 1]]]
+            p = [
+                [xs[i], xs[j], z[i, j]],
+                [xs[i + 1], xs[j], z[i + 1, j]],
+                [xs[i + 1], xs[j + 1], z[i + 1, j + 1]],
+                [xs[i], xs[j + 1], z[i, j + 1]],
+            ]
             parts.append((p, [0, 1, 2, 0, 2, 3]))
     parts.append(_box_faces((0.3, -0.6, -0.5), (0.9, 0.2, 0.25)))
     for k in range(5):
@@ -150,7 +154,14 @@ def mesh_query_box_kernel_helper(
     thr: float,
 ) -> tuple[wp.vec3, wp.vec3]:
     return mesh_vs_convex_query_box(
-        mesh_shape, other, shape_transform[mesh_shape], shape_transform[other], shape_type, shape_data, shape_source, thr
+        mesh_shape,
+        other,
+        shape_transform[mesh_shape],
+        shape_transform[other],
+        shape_type,
+        shape_data,
+        shape_source,
+        thr,
     )
 
 
@@ -184,9 +195,7 @@ def _dense_kernel(
     v1 = mesh.points[mesh.indices[3 * t + 1]]
     v2 = mesh.points[mesh.indices[3 * t + 2]]
     hit = mesh_query_bound_meets_triangle(bound, wp.cw_mul(v0, scale), wp.cw_mul(v1, scale), wp.cw_mul(v2, scale))
-    lo, hi = mesh_query_box_kernel_helper(
-        mesh_shape, other, shape_transform, shape_type, shape_data, shape_source, thr
-    )
+    lo, hi = mesh_query_box_kernel_helper(mesh_shape, other, shape_transform, shape_type, shape_data, shape_source, thr)
     center_box = 0.5 * (lo + hi)
     hit = hit and triangle_meets_box(v0 - center_box, v1 - center_box, v2 - center_box, 0.5 * (hi - lo))
     if hit:
@@ -257,7 +266,9 @@ def _local_distance(kind, scale, pts):
         inside = (np.abs(pts[:, 2]) <= hh) & (np.linalg.norm(pts[:, :2], axis=1) <= r * frac)
         return np.where(inside, 0.0, np.inf)
     if kind == GeoType.PLANE:
-        q = np.stack([np.maximum(np.abs(pts[:, 0]) - scale[0], 0), np.maximum(np.abs(pts[:, 1]) - scale[1], 0), pts[:, 2]], 1)
+        q = np.stack(
+            [np.maximum(np.abs(pts[:, 0]) - scale[0], 0), np.maximum(np.abs(pts[:, 1]) - scale[1], 0), pts[:, 2]], 1
+        )
         return np.linalg.norm(q, axis=1)
     raise AssertionError(kind)
 
@@ -350,7 +361,16 @@ def _run(test, device, name, seed, mesh_scale=(1.0, 1.0, 1.0), mesh_pose=None, c
     wp.launch(
         _dense_kernel,
         dim=(n - 1, tri.shape[0]),
-        inputs=[0, kw["shape_types"], kw["shape_data"], xf, kw["shape_source"], kw["shape_gap"], kw["shape_interior_point"], watertight],
+        inputs=[
+            0,
+            kw["shape_types"],
+            kw["shape_data"],
+            xf,
+            kw["shape_source"],
+            kw["shape_gap"],
+            kw["shape_interior_point"],
+            watertight,
+        ],
         outputs=[dense],
         device=device,
     )
@@ -374,7 +394,11 @@ def _run(test, device, name, seed, mesh_scale=(1.0, 1.0, 1.0), mesh_pose=None, c
                 d = _segment_triangle_distance_np(p - axis, p + axis, a, b, c) - shape_scale[0]
             else:
                 local = (rot.T @ (_sampled_points(a, b, c) - p).T).T
-                d = float(np.min(_local_distance(kind, (0.06, 0.04, 0.03) if kind == GeoType.CONVEX_MESH else shape_scale, local)))
+                d = float(
+                    np.min(
+                        _local_distance(kind, (0.06, 0.04, 0.03) if kind == GeoType.CONVEX_MESH else shape_scale, local)
+                    )
+                )
             if d > thr - 1.0e-4:
                 continue
             # The back-face rule for open meshes, in the unscaled mesh frame: the shape's center in front.
@@ -410,7 +434,9 @@ def test_build_registers_surface_cells(test, device):
         # The cell keys of the entries meet their triangles.
         slots = g["sorted_slots"]
         level = (slots["key"] >> np.uint64(60)).astype(np.int64)
-        cells = np.stack([((slots["key"] >> np.uint64(s)) & np.uint64(0xFFFFF)).astype(np.int64) for s in (40, 20, 0)], 1)
+        cells = np.stack(
+            [((slots["key"] >> np.uint64(s)) & np.uint64(0xFFFFF)).astype(np.int64) for s in (40, 20, 0)], 1
+        )
         owner = np.repeat(np.arange(slots.size), slots["count"])
         t = g["entries"][:, 0]
         size = float(g["cell"]) * np.left_shift(1, 2 * level[owner]).astype(np.float64)
