@@ -1935,8 +1935,7 @@ def _create_mesh_cell_hits_kernel(lanes: int):
         mesh_cells: MeshCells,
         total_num_threads: int,
         # outputs
-        hit_head: wp.array[wp.vec4i],  # (mesh pair, level, cell)
-        hit_span: wp.array[wp.vec2i],  # (first entry, entries)
+        hits: wp.array[wp.vec2i],  # (mesh pair, cell in mesh_cells.sorted_slots)
         hit_count: wp.array[int],
     ):
         """Append each pair's hit cells (:func:`mesh_vs_convex_cell_hits`)."""
@@ -1961,8 +1960,7 @@ def _create_mesh_cell_hits_kernel(lanes: int):
                     query_slab2[i],
                     query_slab_half[i],
                     mesh_cells,
-                    hit_head,
-                    hit_span,
+                    hits,
                     hit_count,
                 )
 
@@ -1971,8 +1969,7 @@ def _create_mesh_cell_hits_kernel(lanes: int):
 
 @wp.kernel(enable_backward=False, cuda_max_registers=64)
 def narrow_phase_mesh_hit_candidates_kernel(
-    hit_head: wp.array[wp.vec4i],
-    hit_span: wp.array[wp.vec2i],
+    hits: wp.array[wp.vec2i],
     hit_count: wp.array[int],
     query_lower: wp.array[wp.vec3],
     query_upper: wp.array[wp.vec3],
@@ -1992,12 +1989,11 @@ def narrow_phase_mesh_hit_candidates_kernel(
 
     A pair's cells run on as many threads as it has hits, so a pair with many entries no longer holds its lanes."""
     tid = wp.tid()
-    for h in range(tid, wp.min(hit_count[0], hit_head.shape[0]), total_num_threads):
-        head = hit_head[h]
-        i = head[0]
+    for h in range(tid, wp.min(hit_count[0], hits.shape[0]), total_num_threads):
+        i = hits[h][0]
         mesh_vs_convex_hit_candidates(
-            head,
-            hit_span[h],
+            i,
+            mesh_cells.sorted_slots[hits[h][1]],
             query_lower[i],
             query_upper[i],
             query_range[i, 0],
@@ -2090,8 +2086,8 @@ def narrow_phase_mesh_buffer_report_kernel(
     report[0] = count
 
 
-# Threads that share one mesh pair's cell lookups on CUDA (4 balances the real states' large ranges; 2 and 8 measured).
-_MESH_MIDPHASE_LANES = 4
+# Threads that share one mesh pair's block lookups on CUDA (2 on the real states; 1 and 4 measured).
+_MESH_MIDPHASE_LANES = 2
 
 narrow_phase_mesh_cell_hits_kernel = _create_mesh_cell_hits_kernel(_MESH_MIDPHASE_LANES)
 narrow_phase_mesh_cell_hits_kernel_cpu = _create_mesh_cell_hits_kernel(1)
@@ -3796,9 +3792,10 @@ class NarrowPhase:
             self._mesh_query_slab_half = wp.empty(pair_rows, dtype=wp.vec3, device=device)
             # Candidates include triangles the exact pass drops: twice the triangle pairs' room.
             self._mesh_candidates = wp.empty(2 * max_triangle_pairs if has_meshes else 0, dtype=wp.vec4i, device=device)
-            # The cells whose triangles may meet a pair's bound (fewer than its candidates on the rough tasks).
-            self._mesh_hit_head = wp.empty(2 * max_triangle_pairs if has_meshes else 0, dtype=wp.vec4i, device=device)
-            self._mesh_hit_span = wp.empty(2 * max_triangle_pairs if has_meshes else 0, dtype=wp.vec2i, device=device)
+            # The cells whose triangles may meet a pair's bound, as (pair, cell). A hit can yield no candidate, so the
+            # hits are not bounded by the candidates; they get the candidates' room (0.6-0.67 hits a candidate on the
+            # rough tasks' states).
+            self._mesh_hits = wp.empty(2 * max_triangle_pairs if has_meshes else 0, dtype=wp.vec2i, device=device)
             self._mesh_buffer_report = wp.zeros(1, dtype=wp.int32, device=device)
             # Every current admitted slot is written by MPR or GJK before the
             # write pass. Full input capacity bounds both arrays without clears.
@@ -4701,7 +4698,7 @@ class NarrowPhase:
                             mesh_cells,
                             self._mesh_midphase_blocks * self._mesh_midphase_block_dim,
                         ],
-                        outputs=[self._mesh_hit_head, self._mesh_hit_span, self._mesh_hit_count],
+                        outputs=[self._mesh_hits, self._mesh_hit_count],
                         device=device,
                         block_dim=self._mesh_midphase_block_dim,
                         record_tape=False,
@@ -4710,8 +4707,7 @@ class NarrowPhase:
                         kernel=narrow_phase_mesh_hit_candidates_kernel,
                         dim=self._mesh_pair_threads,
                         inputs=[
-                            self._mesh_hit_head,
-                            self._mesh_hit_span,
+                            self._mesh_hits,
                             self._mesh_hit_count,
                             *query_arrays,
                             mesh_cells,
@@ -4754,7 +4750,7 @@ class NarrowPhase:
                             self._mesh_candidate_count,
                             self._mesh_candidates.shape[0],
                             self._mesh_hit_count,
-                            self._mesh_hit_head.shape[0],
+                            self._mesh_hits.shape[0],
                         ],
                         outputs=[self._mesh_buffer_report],
                         device=device,

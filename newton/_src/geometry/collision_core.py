@@ -24,16 +24,18 @@ from .mesh_cells import (
     MeshCellSlot,
     MeshGrid,
     MeshQueryBound,
+    mesh_cells_block_key,
+    mesh_cells_block_range,
     mesh_cells_box_in_cell,
     mesh_cells_box_meets_slabs,
     mesh_cells_candidate,
     mesh_cells_entry_box,
     mesh_cells_entry_first_in_range,
     mesh_cells_entry_overlaps,
-    mesh_cells_find,
+    mesh_cells_find_block,
     mesh_cells_first_in_range,
-    mesh_cells_key,
     mesh_cells_key_cell,
+    mesh_cells_popcount,
     mesh_cells_range,
     mesh_cells_slot_box,
     mesh_cells_slot_overlaps,
@@ -1520,18 +1522,18 @@ def mesh_vs_convex_cell_hits(
     slab2: wp.vec4,
     slab_half: wp.vec3,
     mesh_cells: MeshCells,
-    hit_head: wp.array[wp.vec4i],
-    hit_span: wp.array[wp.vec2i],
+    hits: wp.array[wp.vec2i],
     hit_count: wp.array[int],
 ):
     """Append a hit for each occupied cell of the query's range whose triangles may meet the bound.
 
-    At every occupied level of the mesh's index, the cells of the level-0 range ``[lo0, hi0]`` are looked up, or the
-    level's occupied cells walked when they are fewer. A cell is a hit unless its triangles' box misses the query box
+    At every occupied level of the mesh's index, the 4x4x4 blocks of the level-0 range ``[lo0, hi0]`` are looked up
+    (one probe a block, its occupied cells in the range by its mask), or the level's occupied cells walked when they
+    are fewer. A cell is a hit unless its triangles' box misses the query box
     ``[query_lower, query_upper]`` (unscaled mesh frame) or the bound's oriented box (its three slabs, ``slab0``..
-    ``slab2`` with half-widths ``slab_half``, :func:`mesh_query_bound_slab`). A hit is ``(pair, level, x | y << 15, z)``
-    with its entries ``(start, count)``; :func:`mesh_vs_convex_hit_candidates` scans them, one thread a hit. ``lanes``
-    threads share the pair; each takes every ``lanes``-th cell.
+    ``slab2`` with half-widths ``slab_half``, :func:`mesh_query_bound_slab`). A hit is ``(pair, cell)``, the cell's
+    index in :attr:`MeshCells.sorted_slots`; :func:`mesh_vs_convex_hit_candidates` scans them, one thread a hit. ``lanes``
+    threads share the pair; each takes every ``lanes``-th block (or walked cell).
     """
     grid = mesh_cells.grids[grid_index]
     visited = int(0)
@@ -1541,56 +1543,68 @@ def mesh_vs_convex_cell_hits(
         shift = MESH_CELLS_LEVEL_SHIFT * level
         qlo = wp.vec3i(lo0[0] >> shift, lo0[1] >> shift, lo0[2] >> shift)
         qhi = wp.vec3i(hi0[0] >> shift, hi0[1] >> shift, hi0[2] >> shift)
-        nx = qhi[0] - qlo[0] + 1
-        ny = qhi[1] - qlo[1] + 1
-        nz = qhi[2] - qlo[2] + 1
         list_start = mesh_cells.level_start[grid.level_start + level]
         list_count = mesh_cells.level_start[grid.level_start + level + 1] - list_start
-        # Look the range's cells up, or walk the level's occupied cells when they are fewer.
-        by_list = float(nx) * float(ny) * float(nz) > float(list_count)
-        n = list_count
-        if not by_list:
-            n = nx * ny * nz
+        blo = wp.vec3i(qlo[0] >> 2, qlo[1] >> 2, qlo[2] >> 2)
+        nbx = (qhi[0] >> 2) - blo[0] + 1
+        nby = (qhi[1] >> 2) - blo[1] + 1
+        # Look the range's blocks up, or walk the level's occupied cells when they are fewer.
+        n = nbx * nby * ((qhi[2] >> 2) - blo[2] + 1)
+        by_list = n > list_count
+        if by_list:
+            n = list_count
         size = grid.cell * float(1 << shift)
         inv_size = grid.inv_cell / float(1 << shift)
         k = ((lane - visited) % lanes + lanes) % lanes
         while k < n:
-            cell = wp.vec3i(0)
-            slot = MeshCellSlot()
-            slot.count = 0
+            # Item k's occupied cells (bits of a block) and its first cell's slot: a block of the range, or the
+            # level's k-th occupied cell alone. A cell's slot is the first plus the occupied cells below its bit.
+            b = wp.vec3i(blo[0] + k % nbx, blo[1] + (k // nbx) % nby, blo[2] + k // (nbx * nby))
+            mask = wp.uint64(0)
+            first = list_start + k
+            bits = wp.uint64(0)
             if by_list:
-                slot = mesh_cells.sorted_slots[list_start + k]
-                cell = mesh_cells_key_cell(slot.key)
+                cell = mesh_cells_key_cell(mesh_cells.sorted_slots[first].key)
+                b = wp.vec3i(cell[0] >> 2, cell[1] >> 2, cell[2] >> 2)
+                mask = wp.uint64(1) << wp.uint64((cell[0] & 3) + 4 * (cell[1] & 3) + 16 * (cell[2] & 3))
                 if (
-                    cell[0] < qlo[0]
-                    or cell[0] > qhi[0]
-                    or cell[1] < qlo[1]
-                    or cell[1] > qhi[1]
-                    or cell[2] < qlo[2]
-                    or cell[2] > qhi[2]
+                    cell[0] >= qlo[0]
+                    and cell[0] <= qhi[0]
+                    and cell[1] >= qlo[1]
+                    and cell[1] <= qhi[1]
+                    and cell[2] >= qlo[2]
+                    and cell[2] <= qhi[2]
                 ):
-                    slot.count = 0
+                    bits = mask
             else:
-                cell = wp.vec3i(qlo[0] + k % nx, qlo[1] + (k // nx) % ny, qlo[2] + k // (nx * ny))
-                slot = mesh_cells_find(mesh_cells, grid, mesh_cells_key(level, cell[0], cell[1], cell[2]))
-            if slot.count > 0:
-                cell_lower = grid.origin + size * wp.vec3(float(cell[0]), float(cell[1]), float(cell[2]))
+                block = mesh_cells_find_block(mesh_cells, grid, mesh_cells_block_key(level, b[0], b[1], b[2]))
+                mask = block.mask
+                first = block.first
+                bits = mask & mesh_cells_block_range(b, qlo, qhi)
+            while bits != wp.uint64(0):
+                below = (bits & (~bits + wp.uint64(1))) - wp.uint64(1)
+                bit = mesh_cells_popcount(below)
+                slot_index = first + mesh_cells_popcount(mask & below)
+                slot = mesh_cells.sorted_slots[slot_index]
+                cell_lower = grid.origin + size * wp.vec3(
+                    float(4 * b[0] + (bit & 3)), float(4 * b[1] + ((bit >> 2) & 3)), float(4 * b[2] + (bit >> 4))
+                )
                 union_lo, union_hi, union_bounded = mesh_cells_slot_box(slot, cell_lower, size)
                 if mesh_cells_slot_overlaps(slot, query_lower, query_upper, cell_lower, inv_size) and (
                     not union_bounded or mesh_cells_box_meets_slabs(union_lo, union_hi, slab0, slab1, slab2, slab_half)
                 ):
                     out = wp.atomic_add(hit_count, 0, 1)
-                    if out < hit_head.shape[0]:
-                        hit_head[out] = wp.vec4i(pair_index, level, cell[0] | (cell[1] << 15), cell[2])
-                        hit_span[out] = wp.vec2i(slot.start, slot.count)
+                    if out < hits.shape[0]:
+                        hits[out] = wp.vec2i(pair_index, slot_index)
+                bits = bits & (bits - wp.uint64(1))
             k += lanes
         visited += n
 
 
 @wp.func
 def mesh_vs_convex_hit_candidates(
-    head: wp.vec4i,
-    span: wp.vec2i,
+    pair_index: int,
+    slot: MeshCellSlot,
     query_lower: wp.vec3,
     query_upper: wp.vec3,
     lo0: wp.vec3i,
@@ -1613,9 +1627,8 @@ def mesh_vs_convex_hit_candidates(
     is tested for its first cell by its entry's block bits; a larger one by its registration
     (:func:`mesh_cells_first_in_range`), loaded only for entries that passed the box tests.
     """
-    pair_index = head[0]
-    level = head[1]
-    cell = wp.vec3i(head[2] & 0x7FFF, head[2] >> 15, head[3])
+    level = int(slot.key >> wp.uint64(60))
+    cell = mesh_cells_key_cell(slot.key)
     shift = MESH_CELLS_LEVEL_SHIFT * level
     qlo = wp.vec3i(lo0[0] >> shift, lo0[1] >> shift, lo0[2] >> shift)
     qhi = wp.vec3i(hi0[0] >> shift, hi0[1] >> shift, hi0[2] >> shift)
@@ -1625,10 +1638,10 @@ def mesh_vs_convex_hit_candidates(
     box_lo, box_hi = mesh_cells_box_in_cell(query_lower, query_upper, cell_lower, inv_size)
     # A cell's candidates take one reservation, 32 entries at a time (marked, then written): one append per candidate
     # costs one atomic on the shared count.
-    for chunk in range(span[0], span[0] + span[1], 32):
+    for chunk in range(slot.start, slot.start + slot.count, 32):
         marks = int(0)
         found = int(0)
-        for e in range(chunk, wp.min(chunk + 32, span[0] + span[1])):
+        for e in range(chunk, wp.min(chunk + 32, slot.start + slot.count)):
             if mesh_cells_entry_is_candidate(
                 mesh_cells.entries[e],
                 cell,
