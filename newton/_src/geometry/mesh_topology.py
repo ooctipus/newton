@@ -874,8 +874,24 @@ def mesh_surface_context(
     context.p0 = p0
     context.p1 = p1
     context.p2 = p2
+    context.partner_center = partner_center
+    context.partner_radius = 0.0
+    if partner < topology.shape_radius.shape[0]:
+        context.partner_radius = topology.shape_radius[partner]
+    return context
+
+
+@wp.func
+def mesh_surface_planes(context: SurfaceFeatureContext) -> SurfaceFeatureContext:
+    """The context with its triangle's unit normal and edge planes, which the per-point rule and the grown facet read.
+
+    Once per query, so that each manifold point's feature costs three dot products; the closed-form sphere and capsule
+    contacts read neither.
+    """
     if context.row >= 0:
-        # Per-query edge planes, so that each manifold point's feature costs three dot products.
+        p0 = context.p0
+        p1 = context.p1
+        p2 = context.p2
         face = wp.cross(p1 - p0, p2 - p0)
         if context.mirror != 0:
             face = -face
@@ -903,10 +919,6 @@ def mesh_surface_context(
             context.edge_normal = normals
             context.edge_offset = offsets
             context.edge_band = bands
-    context.partner_center = partner_center
-    context.partner_radius = 0.0
-    if partner < topology.shape_radius.shape[0]:
-        context.partner_radius = topology.shape_radius[partner]
     return context
 
 

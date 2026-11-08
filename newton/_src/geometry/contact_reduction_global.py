@@ -66,7 +66,9 @@ from newton._src.geometry.hashtable import (
 
 from ..utils.heightfield import HeightfieldData, get_triangle_shape_from_heightfield
 from .collision_core import (
+    create_compute_face_contacts,
     create_compute_gjk_mpr_contacts,
+    triangle_face_case,
 )
 from .contact_data import ContactData, compute_contact_approach_speed
 from .contact_reduction import (
@@ -94,6 +96,7 @@ from .mesh_topology import (
     mesh_contact_filter,
     mesh_manifold_triangle,
     mesh_surface_context,
+    mesh_surface_planes,
     mesh_triangle_corners,
     surface_query_filter,
     triangle_plane_clears,
@@ -2593,6 +2596,10 @@ MESH_ROUND_ALL = 0
 MESH_ROUND_ONLY = 1
 MESH_ROUND_NONE = 2
 
+SURFACES_ALL = 0
+SURFACES_MESH = 1
+SURFACES_HEIGHTFIELD = 2
+
 
 def create_mesh_triangle_contacts_to_reducer_kernel(
     primitive_type: int = 0,
@@ -2605,10 +2612,16 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
     kernel_name=None,
     analytic: bool | None = None,
     mesh_round: int = MESH_ROUND_ALL,
+    plane_cull: bool = True,
+    surfaces: int = SURFACES_ALL,
 ):
     """Create the original query or a filtered heightfield primitive variant.
 
     Args:
+        surfaces: Which surfaces' triangle pairs the query takes: all (``SURFACES_ALL``), meshes only
+            (``SURFACES_MESH``) or heightfields only (``SURFACES_HEIGHTFIELD``).
+        plane_cull: Skip a mesh triangle whose plane the partner clears (off for the queue the face kernel already
+            culled, :func:`create_mesh_face_contacts_kernel`).
         mesh_round: Which mesh-triangle pairs the generic query takes: all (``MESH_ROUND_ALL``), only those
             with a sphere or capsule (``MESH_ROUND_ONLY``: their closed form, in a lean kernel), or all but those
             (``MESH_ROUND_NONE``: GJK/MPR, beside the lean kernel). Heightfield pairs are in every generic
@@ -2640,6 +2653,8 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
         and convex_in_fallback
         and int(GeoType.CONVEX_MESH) in ANALYTIC_PRIMITIVE_QUERIES,
         mesh_round=mesh_round,
+        plane_cull=plane_cull,
+        surfaces=surfaces,
     )
 
 
@@ -2674,6 +2689,8 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
     analytic: bool = False,
     analytic_convex: bool = False,
     mesh_round: int = MESH_ROUND_ALL,
+    plane_cull: bool = True,
+    surfaces: int = SURFACES_ALL,
 ):
     if mesh_round != MESH_ROUND_ALL and (primitive_type != 0 or analytic):
         raise ValueError("Only the generic query splits its mesh round-shape pairs")
@@ -2769,6 +2786,12 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
                     continue
 
             type_a = shape_types[shape_a]
+            if wp.static(surfaces == SURFACES_MESH):
+                if type_a != GeoType.MESH:
+                    continue
+            elif wp.static(surfaces == SURFACES_HEIGHTFIELD):
+                if type_a != GeoType.HFIELD:
+                    continue
             if wp.static(mesh_round != MESH_ROUND_ALL):
                 round_pair = type_a == GeoType.MESH and (
                     shape_types[shape_b] == GeoType.SPHERE or shape_types[shape_b] == GeoType.CAPSULE
@@ -2868,7 +2891,7 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
                 feature_context.triangle = tri_idx
                 feature_context.heightfield = heightfield_data[shape_heightfield_index[shape_a]]
 
-            if wp.static(primitive_type == 0 and mesh_round != MESH_ROUND_ONLY):
+            if wp.static(primitive_type == 0 and mesh_round != MESH_ROUND_ONLY and plane_cull):
                 # Mesh triangles against other shapes: skip a triangle whose plane the shape clears by more than the
                 # contact threshold, before anything else is read (spheres and capsules have their own exits).
                 if type_a == GeoType.MESH and shape_data_b.shape_type != GeoType.SPHERE:
@@ -2983,6 +3006,7 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
                         feature_context,
                     )
                 elif wp.static(primitive_type == 0):
+                    surface = mesh_surface_planes(surface)
                     wp.static(pair_query)(
                         shape_data_a,
                         shape_data_b,
@@ -3041,6 +3065,12 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
         mesh_triangle_contacts_to_reducer_kernel.__name__ = "mesh_round_contacts_to_reducer_kernel"
     elif mesh_round == MESH_ROUND_NONE:
         mesh_triangle_contacts_to_reducer_kernel.__name__ += "_without_mesh_round"
+    if not plane_cull:
+        mesh_triangle_contacts_to_reducer_kernel.__name__ += "_queued"
+    if surfaces == SURFACES_MESH:
+        mesh_triangle_contacts_to_reducer_kernel.__name__ += "_meshes"
+    elif surfaces == SURFACES_HEIGHTFIELD:
+        mesh_triangle_contacts_to_reducer_kernel.__name__ += "_heightfields"
     if kernel_name is not None:
         mesh_triangle_contacts_to_reducer_kernel.__name__ = kernel_name
     mesh_triangle_contacts_to_reducer_kernel.__qualname__ = mesh_triangle_contacts_to_reducer_kernel.__name__
@@ -3049,3 +3079,146 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
 
 
 mesh_triangle_contacts_to_reducer_kernel = create_mesh_triangle_contacts_to_reducer_kernel()
+
+
+FACE_CASE_TYPES = (int(GeoType.BOX), int(GeoType.CYLINDER), int(GeoType.CONVEX_MESH))
+"""Partners whose mesh-triangle contacts the face kernel decides in closed form where the face case holds."""
+
+
+@wp.func
+def face_case_partner(shape_type: int) -> bool:
+    """Whether the face kernel takes this partner's mesh-triangle pairs (see ``FACE_CASE_TYPES``)."""
+    return shape_type == GeoType.BOX or shape_type == GeoType.CYLINDER or shape_type == GeoType.CONVEX_MESH
+
+
+@cache
+def create_mesh_face_contacts_kernel(
+    writer_func=write_contact_to_reducer,
+    writer_data_type=GlobalContactReducerData,
+    queue_heightfields: bool = True,
+    kernel_name: str = "mesh_face_contacts_kernel",
+):
+    """Create the first pass over mesh triangle pairs: the plane cull and the closed-form face case.
+
+    A box, cylinder or convex hull whose support point along minus the face normal has its foot inside the
+    triangle (:func:`triangle_face_case`) gets the face-normal manifold here, as GJK/MPR would give it. Every
+    other pair that survives the cull, and every heightfield pair, is compacted into ``queued_pairs`` for the
+    GJK/MPR kernel (the generic query with ``plane_cull=False``), so the closed-form majority does not wait on
+    GJK/MPR in a warp. Sphere and capsule pairs are the lean round-shape kernel's. With ``queue_heightfields`` off,
+    heightfield pairs are left to a query of their own.
+    """
+    face_contacts = create_compute_face_contacts(
+        writer_func, support_map_accelerated, mesh_contact_filter, mesh_manifold_triangle
+    )
+
+    def mesh_face_contacts_kernel(
+        shape_types: wp.array[int],
+        shape_data: wp.array[wp.vec4],
+        shape_transform: wp.array[wp.transform],
+        shape_source: wp.array[wp.uint64],
+        shape_gap: wp.array[float],
+        shape_heightfield_index: wp.array[wp.int32],
+        heightfield_data: wp.array[HeightfieldData],
+        heightfield_elevations: wp.array[wp.float32],
+        triangle_pairs: wp.array[wp.vec3i],
+        triangle_pairs_count: wp.array[int],
+        writer_data: writer_data_type,
+        total_num_threads: int,
+        shape_support_data: wp.array[wp.vec4i],
+        support_lut: wp.array[int],
+        support_vertex_offsets: wp.array[int],
+        support_neighbors: wp.array[int],
+        shape_interior_point: wp.array[wp.vec3],
+        mesh_topology: MeshTopologyData,
+        queued_pairs: wp.array[wp.vec3i],
+        queued_count: wp.array[int],
+    ):
+        tid = wp.tid()
+        num_triangle_pairs = triangle_pairs_count[0]
+        for i in range(tid, num_triangle_pairs, total_num_threads):
+            if i >= triangle_pairs.shape[0]:
+                break
+            triple = triangle_pairs[i]
+            shape_a = triple[0]
+            shape_b = triple[1]
+            tri_idx = triple[2]
+            type_b = shape_types[shape_b]
+            if shape_types[shape_a] == GeoType.MESH:
+                if type_b == GeoType.SPHERE or type_b == GeoType.CAPSULE:
+                    continue
+                scale_data_a = shape_data[shape_a]
+                mesh_scale_a = wp.vec3(scale_data_a[0], scale_data_a[1], scale_data_a[2])
+                X_ws_a = shape_transform[shape_a]
+                corner_0, corner_1, corner_2 = mesh_triangle_corners(
+                    shape_source[shape_a], mesh_scale_a, X_ws_a, tri_idx
+                )
+                triangle = triangle_shape_from_corners(corner_0, corner_1, corner_2, mesh_scale_a)
+                pos_b, quat_b, geom_b, _scale_b, margin_b = extract_shape_data(
+                    shape_b, shape_transform, shape_types, shape_data, shape_source
+                )
+                if geom_b.shape_type == GeoType.CONVEX_MESH:
+                    geom_b.center = shape_interior_point[shape_b]
+                margin_a = scale_data_a[3]
+                gap_sum = shape_gap[shape_a] + shape_gap[shape_b]
+                threshold = gap_sum + margin_a + margin_b
+                provider = AcceleratedSupportMapDataProvider()
+                provider.shape_support_data = shape_support_data
+                provider.support_neighbors = support_neighbors
+                provider.support_lut = support_lut
+                provider.support_vertex_offsets = support_vertex_offsets
+                face = wp.cross(triangle.scale, triangle.auxiliary)
+                support_point = (
+                    wp.quat_rotate(quat_b, support_map_accelerated(geom_b, wp.quat_rotate_inv(quat_b, -face), provider))
+                    + pos_b
+                )
+                if triangle_plane_clears(triangle, corner_0, support_point, threshold):
+                    continue
+                if face_case_partner(type_b):
+                    center = pos_b + wp.quat_rotate(quat_b, geom_b.center)
+                    is_face, unit, distance = triangle_face_case(triangle, corner_0, support_point, center, threshold)
+                    if is_face:
+                        surface = mesh_surface_planes(
+                            mesh_surface_context(
+                                mesh_topology,
+                                shape_a,
+                                tri_idx,
+                                shape_source[shape_a],
+                                mesh_scale_a,
+                                X_ws_a,
+                                corner_0,
+                                corner_1,
+                                corner_2,
+                                center,
+                                shape_b,
+                            )
+                        )
+                        face_contacts(
+                            triangle,
+                            geom_b,
+                            quat_b,
+                            corner_0,
+                            pos_b,
+                            unit,
+                            support_point,
+                            distance,
+                            gap_sum,
+                            shape_a,
+                            shape_b,
+                            margin_a,
+                            margin_b,
+                            provider,
+                            writer_data,
+                            (tri_idx << 1) | 1,
+                            surface,
+                        )
+                        continue
+            elif wp.static(not queue_heightfields):
+                continue
+            slot = wp.atomic_add(queued_count, 0, 1)
+            if slot < queued_pairs.shape[0]:
+                queued_pairs[slot] = triple
+
+    mesh_face_contacts_kernel.__name__ = kernel_name
+    mesh_face_contacts_kernel.__qualname__ = kernel_name
+    mesh_face_contacts_kernel.__annotations__["writer_data"] = writer_data_type
+    return wp.kernel(mesh_face_contacts_kernel, enable_backward=False, module="unique")
