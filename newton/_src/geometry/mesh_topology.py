@@ -77,6 +77,9 @@ class MeshTopologyData:
 def weld_mesh(vertices: np.ndarray, indices: np.ndarray) -> tuple[np.ndarray, int]:
     """Weld a vertex soup by bit-equal positions.
 
+    Only vertices that a triangle references are welded, so every welded vertex has an incident triangle; vertices
+    no triangle uses (common in asset files) get no welded id.
+
     Args:
         vertices: ``(n, 3)`` float32 mesh-local positions, as the device mesh stores them.
         indices: ``(m, 3)`` triangle corner indices.
@@ -84,12 +87,16 @@ def weld_mesh(vertices: np.ndarray, indices: np.ndarray) -> tuple[np.ndarray, in
     Returns:
         ``(welded, count)``: the welded id of each triangle corner and the number of welded vertices.
     """
+    corners = np.asarray(indices, dtype=np.int64).reshape(-1, 3)
     points = np.ascontiguousarray(np.asarray(vertices, dtype=np.float32).reshape(-1, 3) + np.float32(0.0))
     keys = points.view(np.dtype((np.void, 12))).ravel()
-    _, inverse = np.unique(keys, return_inverse=True)
+    used = np.unique(corners)
+    _, inverse = np.unique(keys[used], return_inverse=True)
     inverse = inverse.reshape(-1).astype(np.int64)
     count = int(inverse.max()) + 1 if inverse.size else 0
-    return inverse[np.asarray(indices, dtype=np.int64).reshape(-1, 3)], count
+    lookup = np.full(keys.shape[0], -1, dtype=np.int64)
+    lookup[used] = inverse
+    return lookup[corners], count
 
 
 def _corner_owners(welded: np.ndarray, normals: np.ndarray, start: np.ndarray, incident: np.ndarray) -> np.ndarray:

@@ -298,6 +298,33 @@ def test_topology_build(test, device):
     test.assertTrue((topo2["neighbor"] < 0).all())
 
 
+def test_unreferenced_vertices(test, device):
+    """Vertices no triangle uses (first, inside, last, one at a used position) change neither topology nor contacts."""
+    heights = 0.005 * np.sin(np.arange(25, dtype=np.float32)).reshape(5, 5)
+    v, f = _lattice(4, 0.4, heights=heights)
+    spare = np.array([[9.0, 9.0, 9.0], [-7.0, 3.0, 1.0], v[6], [5.0, -5.0, 2.0]], np.float32)
+    # Spare vertices before, between and after the used ones, the last vertex among them.
+    padded = np.concatenate([spare[:1], v[:10], spare[1:3], v[10:], spare[3:]])
+    remap = np.r_[np.arange(10) + 1, np.arange(10, v.shape[0]) + 3]
+    clean, loose = build_mesh_topology(v, f), build_mesh_topology(padded, remap[f])
+    test.assertEqual(loose["vertex_start"].shape, clean["vertex_start"].shape)
+    for key in ("neighbor", "welded", "owner", "flat", "normal", "vertex_start", "vertex_triangles"):
+        np.testing.assert_array_equal(loose[key], clean[key], err_msg=key)
+    np.testing.assert_array_equal(loose["opposite"], np.where(clean["opposite"] >= 0, remap[clean["opposite"]], -1))
+    shapes = (
+        ("sphere", {"radius": RADIUS}, wp.quat_identity()),
+        ("box", {"hx": 0.13, "hy": 0.07, "hz": 0.05}, wp.quat_from_axis_angle(wp.vec3(1, 1, 0), 0.2)),
+    )
+    for kind, args, rot in shapes:
+        xform = wp.transform(wp.vec3(0.03, -0.02, RADIUS + 0.006), rot)
+        want, got = _collide(device, v, f, (kind, args), xform), _collide(device, padded, remap[f], (kind, args), xform)
+        test.assertEqual(got[0], want[0], kind)
+        test.assertGreater(want[0], 0, kind)
+        for a, b in zip(got[1:], want[1:], strict=True):
+            order_a, order_b = np.lexsort(np.asarray(got[2]).T), np.lexsort(np.asarray(want[2]).T)
+            np.testing.assert_allclose(np.asarray(a)[order_a], np.asarray(b)[order_b], atol=1e-6, err_msg=kind)
+
+
 def test_flat_lattice_shapes(test, device):
     """Capsules, boxes and cylinders on a fine flat lattice get the plane's contacts: no seam point, no ghost.
 
@@ -404,6 +431,7 @@ for _name, _fn in (
     ("test_capsule_over_ridge", test_capsule_over_ridge),
     ("test_box_on_stair_nose", test_box_on_stair_nose),
     ("test_small_facet_keeps_its_corners", test_small_facet_keeps_its_corners),
+    ("test_unreferenced_vertices", test_unreferenced_vertices),
 ):
     add_function_test(TestMeshFeatures, _name, _fn, devices=devices)
 add_function_test(TestMeshFeatures, "test_topology_build", test_topology_build, devices=["cpu"])
