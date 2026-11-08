@@ -84,7 +84,7 @@ from .contact_reduction import (
     get_spatial_direction_2d,
     project_point_to_plane,
 )
-from .heightfield_features import WELD_FLAT_SEAMS, HeightfieldFeatureContext, flat_seam_query_allowed
+from .heightfield_features import HeightfieldFeatureContext, seam_surface_normal
 from .heightfield_primitive_contact import (
     ANALYTIC_PRIMITIVE_QUERIES,
     analytic_convex_default,
@@ -3181,7 +3181,7 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
     # the typed primitive queries keep their reduced support dispatch.
     accelerated = primitive_type in (0, int(GeoType.CONVEX_MESH))
     query_support = support_map_accelerated if accelerated else HEIGHTFIELD_PRIMITIVE_SUPPORTS[primitive_type]
-    query_filter = flat_seam_query_allowed if WELD_FLAT_SEAMS else None
+    query_filter = seam_surface_normal
     if analytic:
         pair_query = ANALYTIC_PRIMITIVE_QUERIES[primitive_type](writer_func, query_filter=query_filter)
     else:
@@ -3372,11 +3372,10 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
                 data_provider = SupportMapDataProvider()
 
             feature_context = HeightfieldFeatureContext()
-            if wp.static(WELD_FLAT_SEAMS):
+            if type_a == GeoType.HFIELD:
                 feature_context.elevations = heightfield_elevations
                 feature_context.triangle = tri_idx
-                if type_a == GeoType.HFIELD:
-                    feature_context.heightfield = heightfield_data[shape_heightfield_index[shape_a]]
+                feature_context.heightfield = heightfield_data[shape_heightfield_index[shape_a]]
 
             if wp.static(analytic_convex):
                 if type_a == GeoType.HFIELD and shape_data_b.shape_type == GeoType.CONVEX_MESH:

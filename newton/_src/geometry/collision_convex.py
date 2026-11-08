@@ -163,7 +163,8 @@ def create_solve_convex_multi_contact(
         post_process_contact: Function that post-processes generated contacts.
         use_precomputed_center: Whether the geometry data supplies a cached center.
         penetration_refiner: Optional physical-proxy result refinement function.
-        query_filter: Optional current-feature predicate, before separated-contact publication.
+        query_filter: Optional surface normal of separated witnesses, ``(geom_a, point_a, normal,
+            signed_distance, context) -> (normal, signed_distance)``, applied before the manifold.
 
     Returns:
         The specialized contact solver.
@@ -259,8 +260,9 @@ def create_solve_convex_multi_contact(
             )
 
         if wp.static(has_query_filter):
-            if signed_distance >= 0.0 and not query_filter(geom_a, point_a, normal, query_context):
-                return 0
+            if signed_distance >= 0.0:
+                # The surface's own normal at this witness, and the distance along it.
+                normal, signed_distance = query_filter(geom_a, point_a, normal, signed_distance, query_context)
 
         if skip_multi_contact or signed_distance > contact_threshold:
             # Transform to world space only for the single-contact early-out.
@@ -319,7 +321,8 @@ def create_solve_convex_single_contact(
         post_process_contact: Function that post-processes generated contacts.
         use_precomputed_center: Whether the geometry data supplies a cached center.
         penetration_refiner: Optional physical-proxy result refinement function.
-        query_filter: Optional current-feature predicate, before separated-contact publication.
+        query_filter: Optional surface normal of separated witnesses, ``(geom_a, point_a, normal,
+            signed_distance, context) -> (normal, signed_distance)``, applied before the manifold.
 
     Returns:
         The specialized contact solver.
@@ -406,8 +409,8 @@ def create_solve_convex_single_contact(
             )
 
         if wp.static(has_query_filter):
-            if signed_distance >= 0.0 and not query_filter(geom_a, point_a, normal, query_context):
-                return 0
+            if signed_distance >= 0.0:
+                normal, signed_distance = query_filter(geom_a, point_a, normal, signed_distance, query_context)
 
         # Transform results back to world space (once).
         point = 0.5 * (point_a + point_b)

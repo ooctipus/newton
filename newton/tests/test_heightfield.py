@@ -12,7 +12,7 @@ import warp as wp
 
 import newton
 from newton import Heightfield
-from newton._src.geometry.heightfield_features import HeightfieldFeatureContext, flat_seam_query_allowed
+from newton._src.geometry.heightfield_features import HeightfieldFeatureContext, seam_surface_normal
 from newton._src.utils import is_graph_capture_allocation_enabled
 from newton._src.utils.heightfield import HeightfieldData, get_triangle_shape_from_heightfield
 from newton.solvers import SolverMuJoCo
@@ -21,8 +21,8 @@ from newton.tests.unittest_utils import assert_np_equal
 _cuda_available = wp.is_cuda_available()
 
 
-def _flat_feature_kernel():
-    """Exercise current feature ownership without requiring a collision rollout."""
+def _seam_feature_kernel():
+    """Exercise the terrain's normal at a witness without requiring a collision rollout."""
 
     @wp.kernel(enable_backward=False, module="unique")
     def evaluate(
@@ -30,7 +30,7 @@ def _flat_feature_kernel():
         elevations: wp.array[float],
         triangles: wp.array[int],
         points: wp.array[wp.vec3],
-        allowed: wp.array[int],
+        normals: wp.array[wp.vec3],
     ):
         i = wp.tid()
         context = HeightfieldFeatureContext()
@@ -38,7 +38,8 @@ def _flat_feature_kernel():
         context.elevations = elevations
         context.triangle = triangles[i]
         geom, _ = get_triangle_shape_from_heightfield(heights[0], elevations, wp.transform_identity(), triangles[i])
-        allowed[i] = int(flat_seam_query_allowed(geom, points[i], wp.normalize(wp.vec3(-1.0, 0.0, 1.0)), context))
+        normal, _distance = seam_surface_normal(geom, points[i], wp.normalize(wp.vec3(1.0, 0.0, 1.0)), 0.01, context)
+        normals[i] = normal
 
     return evaluate
 
@@ -46,11 +47,8 @@ def _flat_feature_kernel():
 class TestHeightfield(unittest.TestCase):
     """Test suite for heightfield support."""
 
-    @unittest.skipUnless(
-        os.environ.get("NEWTON_HEIGHTFIELD_WELD_FLAT_SEAMS") == "1", "Experimental current-flat feature gate"
-    )
     def test_flat_internal_seam_has_no_oblique_contact(self):
-        """A continuous flat top has no lateral obstacle at a triangulation seam."""
+        """A continuous flat top has no lateral obstacle at a triangulation seam (terrain route)."""
         for finite in (False, True):
             for reduce in (False, True):
                 with self.subTest(finite=finite, reduce=reduce):
@@ -66,6 +64,7 @@ class TestHeightfield(unittest.TestCase):
                         {
                             "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
                             "NEWTON_HEIGHTFIELD_FINITE_QUERY": str(int(finite)),
+                            "NEWTON_TERRAIN_LAW": "none",
                         },
                     ):
                         pipeline = newton.CollisionPipeline(
@@ -84,8 +83,8 @@ class TestHeightfield(unittest.TestCase):
                     normals = contacts.rigid_contact_normal.numpy()[:count]
                     self.assertGreater(float(normals[:, 2].min()), 0.99999)
 
-    def test_flat_seam_feature_preserves_border_and_current_crease(self):
-        """Only complete flat internal fans/edges disappear; current terrain remains authoritative."""
+    def test_seam_feature_preserves_border_and_current_crease(self):
+        """A seam witness leaning toward a continuing neighbour takes its face normal; borders, faces and ridges keep theirs."""
         builder = newton.ModelBuilder()
         terrain = Heightfield(
             np.zeros((21, 21), np.float32),
@@ -98,20 +97,36 @@ class TestHeightfield(unittest.TestCase):
         )
         builder.add_shape_heightfield(heightfield=terrain)
         model = builder.finalize(device="cpu")
+        # Witnesses of cell (10, 10)'s lower triangle on its +x edge and its p11 corner, of the
+        # border cell (10, 19) on the +x border edge, and inside the face; each normal leans toward +x.
         triangles = wp.array([420, 420, 438, 420], dtype=int, device="cpu")
         points = wp.array(
             [(0.12, 0.06, 0.0), (0.12, 0.12, 0.0), (0.12, 0.06, 0.0), (0.03, 0.01, 0.0)], dtype=wp.vec3, device="cpu"
         )
-        allowed = wp.empty(4, dtype=int, device="cpu")
-        kernel = _flat_feature_kernel()
-        inputs = [model.heightfield_data, model.heightfield_elevations, triangles, points, allowed]
-        wp.launch(kernel, dim=4, inputs=inputs, device="cpu")
-        np.testing.assert_array_equal(allowed.numpy(), [0, 0, 1, 1])
-        elevations = model.heightfield_elevations.numpy()
-        elevations[11 * 21 + 12] = 0.1
+        normals = wp.empty(4, dtype=wp.vec3, device="cpu")
+        kernel = _seam_feature_kernel()
+        inputs = [model.heightfield_data, model.heightfield_elevations, triangles, points, normals]
+        leaning = np.array([1.0, 0.0, 1.0]) / np.sqrt(2.0)
+        up = np.array([0.0, 0.0, 1.0])
+        elevations = np.full(21 * 21, 0.5, dtype=np.float32)
         model.heightfield_elevations.assign(elevations)
         wp.launch(kernel, dim=4, inputs=inputs, device="cpu")
-        np.testing.assert_array_equal(allowed.numpy(), [1, 1, 1, 1])
+        # Flat: the neighbours beyond the edge and the corner continue beneath the partner.
+        np.testing.assert_allclose(normals.numpy(), [up, up, leaning, leaning], atol=1.0e-6)
+        # A neighbour that rises toward the partner lends its own face normal to the edge; the corner
+        # takes the incident face nearest to the witness normal, a flat one.
+        elevations[11 * 21 + 12] = 0.6
+        model.heightfield_elevations.assign(elevations)
+        wp.launch(kernel, dim=4, inputs=inputs, device="cpu")
+        # Cell (10, 11)'s upper triangle: (0.12, 0, 0), (0.24, 0.12, 0.1), (0.12, 0.12, 0) from its origin.
+        rising = np.cross([0.12, 0.12, 0.1], [0.0, 0.12, 0.0])
+        np.testing.assert_allclose(normals.numpy(), [rising / np.linalg.norm(rising), up, leaning, leaning], atol=1.0e-6)
+        # A ridge: every vertex beyond the edge and the corner falls away, so both normals are the surface's.
+        for row, col in ((11, 12), (12, 12), (10, 12), (12, 11)):
+            elevations[row * 21 + col] = 0.2
+        model.heightfield_elevations.assign(elevations)
+        wp.launch(kernel, dim=4, inputs=inputs, device="cpu")
+        np.testing.assert_allclose(normals.numpy(), [leaning] * 4, atol=1.0e-6)
 
     def test_heightfield_creation(self):
         """Test creating a Heightfield with auto-normalization."""

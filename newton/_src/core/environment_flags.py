@@ -224,12 +224,6 @@ NEWTON_FLAGS = declare(
         "=0 scans the whole terrain triangle stream in every typed row, even rows no current pair reaches (default 1).",
     ),
     EnvironmentFlag(
-        "NEWTON_HEIGHTFIELD_WELD_FLAT_SEAMS",
-        "experiment",
-        ("geometry.heightfield_features",),
-        "=1 ignores interior triangulation seams on flat terrain.",
-    ),
-    EnvironmentFlag(
         "NEWTON_KAMINO_DISABLE_TILE_TRANSPOSE_UPDATE",
         "policy",
         ("solvers.kamino._src.linalg.factorize._tile_builtins",),
