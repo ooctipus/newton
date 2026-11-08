@@ -12,11 +12,10 @@ import warp as wp
 
 import newton
 from newton._src.geometry import support_function as support
-from newton._src.geometry.collision_core import create_compute_gjk_mpr_contacts
+from newton._src.geometry.collision_core import MINKOWSKI_CORE_RADIUS, create_compute_gjk_mpr_contacts
 from newton._src.geometry.contact_data import ContactData
 from newton._src.geometry.contact_reduction_global import create_mesh_triangle_contacts_to_reducer_kernel
 from newton._src.geometry.heightfield_sphere_contact import (
-    PROXY_RADIUS,
     _closest_point_on_prism_sides,
     _xy_inside_triangle,
     create_sphere_prism_contacts,
@@ -136,7 +135,7 @@ def _compare_pairs(
             case = CASE_INSIDE_OFF_FACE
     else:
         _best, best_sq = _closest_point_on_prism_sides(c, e1, e2, top, wp.length_sq(c - top), 1.0e6)
-        if best_sq < 16.0 * PROXY_RADIUS * PROXY_RADIUS:
+        if best_sq < 16.0 * MINKOWSKI_CORE_RADIUS * MINKOWSKI_CORE_RADIUS:
             case = CASE_NEAR_SURFACE
     cases[tid] = case
     plane_depth[tid] = s
@@ -355,8 +354,9 @@ class TestHeightfieldSphereContact(unittest.TestCase):
         self.assertLess(float(center_error[resting].max()), 3.0e-5)
         self.assertLess(float(normal_error[resting].max()), 1.0e-3)
         # Separated: GJK converges to COLLIDE_EPSILON = 1e-4, so the generic query may stop
-        # before resolving the 0.1 mm proxy radius and its witness direction is accurate to
-        # about COLLIDE_EPSILON / distance. The closed form matches a float64 reference.
+        # before resolving its 0.1 mm core radius and its witness direction is accurate to
+        # about COLLIDE_EPSILON / distance. The closed form matches a float64 reference of the
+        # true sphere surface.
         exact_distance = np.zeros(count)
         exact_center = np.zeros((count, 3))
         exact_normal = np.zeros((count, 3))
@@ -366,9 +366,8 @@ class TestHeightfieldSphereContact(unittest.TestCase):
             c = rotation.T @ (pos_b[i] - pos_a[i])
             q, d = closest_point_on_prism_np(c, e1, e2)
             normal = (c - q) / d
-            point_b = c - normal * PROXY_RADIUS
-            center = 0.5 * (q + point_b) - normal * (radii[i] * 0.5)
-            exact_distance[i] = d - PROXY_RADIUS - radii[i]
+            center = 0.5 * (q + c) - normal * (radii[i] * 0.5)
+            exact_distance[i] = d - radii[i]
             exact_center[i] = rotation @ center + pos_a[i]
             exact_normal[i] = rotation @ normal
         analytic_distance_error = np.abs(a_distance - exact_distance)
@@ -378,7 +377,7 @@ class TestHeightfieldSphereContact(unittest.TestCase):
         self.assertLess(float(analytic_center_error[separated].max()), 3.0e-5)
         # Direction accuracy is bounded by float32 roundoff of the 20 m poses over the
         # separation (about 4e-6 / d).
-        separation = np.maximum(exact_distance + PROXY_RADIUS + radii, 1.0e-6)
+        separation = np.maximum(exact_distance + radii, 1.0e-6)
         normal_bound = 1.0e-4 + 8.0e-6 / separation
         self.assertTrue(bool(np.all(analytic_normal_error[separated] < normal_bound[separated])))
         generic_distance_error = np.abs(g_distance - exact_distance)
@@ -389,11 +388,11 @@ class TestHeightfieldSphereContact(unittest.TestCase):
         self.assertLess(float(center_error[separated].max()), 1.0e-3)
 
         # Inside the prism off the face both queries use the top-face normal and the plane
-        # depth; the generic witness differs by the 0.1 mm proxy. MPR occasionally fails to
+        # depth; the generic witness differs by its 0.1 mm core. MPR occasionally fails to
         # detect a deep interior center and the generic query then publishes a zero-depth
         # contact; the closed form never does.
         inside = both & (cases == CASE_INSIDE_OFF_FACE)
-        truth = plane_depth - PROXY_RADIUS - radii
+        truth = plane_depth - radii
         self.assertGreater(int(inside.sum()), 0)
         np.testing.assert_allclose(a_distance[inside], truth[inside], atol=1.0e-5, rtol=0.0)
         generic_failed = inside & (np.abs(g_distance - truth) > 1.0e-3)
@@ -403,7 +402,7 @@ class TestHeightfieldSphereContact(unittest.TestCase):
         self.assertLess(float(center_error[relaxed].max()), 4.0e-4)
         self.assertLess(float(normal_error[relaxed].max()), 1.0e-3)
 
-        # Within 0.4 mm outside the prism the proxy sphere still overlaps it and the generic
+        # Within 0.4 mm outside the prism the core sphere still overlaps it and the generic
         # query reports a top-face penetration of arbitrary depth; the closed form reports
         # the surface distance. The band is measure-small and must stay rare in the sample.
         band = both & (cases == CASE_NEAR_SURFACE)
