@@ -11,6 +11,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.geometry.penetration import _box_triangle_depth
 from newton._src.geometry.support_function import _CONVEX_HULL_VALID
 from newton.tests.test_convex_contact_witness import (
     _create_witness_kernel,
@@ -537,6 +538,44 @@ class TestConvexRefinementRegressions(unittest.TestCase):
     pass
 
 
+@wp.kernel
+def _one_sided_box_triangle_depth(
+    half: wp.vec3, triangles: wp.array[wp.mat33], depth: wp.array[float], direction: wp.array[wp.vec3]
+):
+    i = wp.tid()
+    t = triangles[i]
+    d, n = _box_triangle_depth(half, t[0], t[1], t[2], True)
+    depth[i] = d
+    direction[i] = n
+
+
+def test_refinement_near_vertical_face_on_box(test, device):
+    """Resolve a near-vertical one-sided face at the box's top by its true depth, touching or apart.
+
+    The face's front tilts 0.36 degrees up, so the box's top axis is nearly in the
+    face's plane: neither of its directions crosses the sheet. Without that, the
+    shallow direction is excluded and the face resolves through the box's height.
+    """
+    half = wp.vec3(0.65, 0.4, 0.025)
+    tilt = 0.0063
+    rows = []
+    for top in (0.025 - 0.00024, 0.025 + 0.005):  # 0.24 mm into the box's top face, then 5 mm above it
+        # Counterclockwise about a front of (0, -1, tilt): a face rising from z = top.
+        a = np.array([0.30, 0.0, top])
+        b = np.array([0.32, 0.0, top])
+        c = np.array([0.31, tilt * 0.01, top + 0.01])
+        rows.append(np.stack([a, b, c]))
+    triangles = wp.array(np.asarray(rows, np.float32), dtype=wp.mat33, device=device)
+    front = np.cross(rows[0][1] - rows[0][0], rows[0][2] - rows[0][0])
+    test.assertGreater(front[2] / np.linalg.norm(front), 0.0)
+    depth = wp.zeros(2, dtype=float, device=device)
+    direction = wp.zeros(2, dtype=wp.vec3, device=device)
+    wp.launch(_one_sided_box_triangle_depth, dim=2, inputs=[half, triangles, depth, direction], device=device)
+    depth, direction = depth.numpy(), direction.numpy()
+    np.testing.assert_allclose(depth, [0.00024, -0.005], atol=1.0e-6)
+    np.testing.assert_allclose(direction, [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]], atol=1.0e-6)
+
+
 for function in (
     test_refinement_signed_separation,
     test_refinement_source_topology,
@@ -544,6 +583,7 @@ for function in (
     test_refinement_unconverged_query_separation,
     test_refinement_triangle_box_depth,
     test_refinement_triangle_box_seam,
+    test_refinement_near_vertical_face_on_box,
     test_refinement_triangle_above_wide_ground,
     test_refinement_resting_box_stack,
     test_refinement_box_hull_depth,

@@ -71,13 +71,21 @@ def _box_triangle_depth(
 
     The triangle may degenerate to a segment or a point. The returned unit
     direction moves the triangle out of the box by the returned depth.
-    For a one-sided mesh triangle, directions must not move the box behind
-    the triangle's front side. Partner-point certificates remain
-    two-sided so their depths still bound the full Minkowski body from below.
+    For a one-sided mesh triangle, penetration directions must not move the box
+    behind the triangle's front side: an axis is excluded in the direction that
+    points mostly against the front (beyond 45 degrees from the triangle's
+    plane). An axis near the plane neither enters nor leaves the sheet, so
+    both of its directions stay eligible, as does any separating axis: a
+    near-vertical face whose front tilts slightly up otherwise resolves a
+    touch, or a gap, by moving the box its whole height. Partner-point
+    certificates remain two-sided so their depths still bound the full
+    Minkowski body from below.
     """
     front = wp.vec3(0.0)
     if one_sided:
         front = wp.cross(second - first, third - first)
+    # An axis points against (along) the front past 45 degrees from the plane.
+    against = 0.7071067811865476 * wp.length(front)
     depth = float(1.0e30)
     direction = wp.vec3(1.0, 0.0, 0.0)
     for index in range(13):
@@ -92,10 +100,10 @@ def _box_triangle_depth(
             positive = radius - wp.min(d0, wp.min(d1, d2))
             negative = radius + wp.max(d0, wp.max(d1, d2))
             side = wp.dot(axis, front)
-            if positive < depth and side <= 0.0:
+            if positive < depth and (side <= against or positive < 0.0):
                 depth = positive
                 direction = axis
-            if negative < depth and side >= 0.0:
+            if negative < depth and (side >= -against or negative < 0.0):
                 depth = negative
                 direction = -axis
     return depth, direction
