@@ -153,8 +153,8 @@ class TestTerrainCellsMesh(unittest.TestCase):
                 self.assertEqual(counts["step"], 4, counts)
                 self.assertEqual(counts["mixed"], 0, counts)
                 step = np.flatnonzero(table.kind == tcm.TERRAIN_CELL_STEP)
-                np.testing.assert_allclose(table.step_offset()[step], 0.25, atol=1e-6)
-                self.assertEqual(bool(table.cell_flags[step[0]] & tcm.TERRAIN_CELL_STEP_Y), axis == 1)
+                expect = [0.25, 0.0] if axis == 0 else [0.0, 0.25]
+                np.testing.assert_allclose(table.offsets()[step], np.tile(expect, (4, 1)), atol=1e-6)
                 z = table.cell_z[step[0]]
                 np.testing.assert_array_equal(z[0], np.float32(0.1))
                 np.testing.assert_array_equal(z[3], np.float32(0.2))
@@ -175,25 +175,49 @@ class TestTerrainCellsMesh(unittest.TestCase):
         self.assertEqual(table.counts()["step"], 4)
         self.assertLessEqual(report["max_lattice_snap"], 1.0e-5)
 
-    def test_two_risers_in_one_cell_are_mixed(self):
-        """A box corner inside a cell: two risers meet, the cell keeps the mesh's triangles."""
-        v, f = _merge(_ground(4, 4, origin=(-0.2, -0.2)), _box(0.025, 0.4, 0.025, 0.4, -0.5, 0.1))
+    def test_two_crossing_risers_are_a_step(self):
+        """Four boxes meeting inside a cell (a box grid's corner): two risers cross, four quadrant levels."""
+        v, f = _merge(
+            _box(-0.1, 0.025, -0.1, 0.075, -1.0, 0.0),
+            _box(0.025, 0.2, -0.1, 0.075, -1.0, 0.05),
+            _box(-0.1, 0.025, 0.075, 0.2, -1.0, 0.02),
+            _box(0.025, 0.2, 0.075, 0.2, -1.0, 0.1),
+        )
+        table, report = self._verified(v, f, cell_size=(H, H), origin=(0.0, 0.0))
+        corner = _cell(table, 0.03, 0.08)
+        self.assertEqual(table.kind[corner], tcm.TERRAIN_CELL_STEP)
+        np.testing.assert_allclose(table.offsets()[corner], [0.25, 0.75], atol=1e-6)
+        np.testing.assert_array_equal(table.cell_z[corner], np.float32([0.0, 0.05, 0.02, 0.1]))
+        zs, _ = table.surface_z(np.array([0.01, 0.05, 0.01, 0.05, 0.025]), np.array([0.05, 0.05, 0.09, 0.09, 0.05]))
+        np.testing.assert_array_equal(zs, np.float32([0.0, 0.05, 0.02, 0.1, 0.05]))
+        self.assertEqual(table.counts()["mixed"], 0)
+        self.assertEqual(report["in_mixed"], 0)
+        self.assertGreater(table.stats["wall_checks"]["interior_riser"], 0)
+
+    def test_box_over_ground_buries_it(self):
+        """Ground under a box's whole cells is inside the box: buried, the box top is the surface."""
+        v, f = _merge(_ground(4, 4, origin=(-0.2, -0.2)), _box(0.0, 0.3, 0.0, 0.3, -0.5, 0.1))
         table, report = self._verified(v, f)
-        corner = _cell(table, 0.03, 0.03)
-        self.assertEqual(table.kind[corner], tcm.TERRAIN_CELL_MIXED)
-        k = int(table.cell_flags[corner] >> tcm.TERRAIN_CELL_PAYLOAD_SHIFT)
-        self.assertEqual(table.mixed_cell[k], corner)
+        self.assertEqual(report["buried_up_facing"], 8)
+        np.testing.assert_array_equal(table.cell_z[_cell(table, 0.15, 0.15)], np.float32(0.1))
+        self.assertEqual(table.counts()["mixed"], 0)
+
+    def test_two_parallel_risers_in_one_cell_are_mixed(self):
+        """Three levels across one cell: the cell keeps the mesh's triangles."""
+        v, f = _merge(
+            _box(0.0, 0.02, 0.0, 0.1, -1.0, 0.1),
+            _box(0.02, 0.05, 0.0, 0.1, -1.0, 0.2),
+            _box(0.05, 0.1, 0.0, 0.1, -1.0, 0.3),
+        )
+        table, report = self._verified(v, f, cell_size=(H, H), origin=(0.0, 0.0))
+        self.assertEqual(table.kind[0], tcm.TERRAIN_CELL_MIXED)
+        k = int(table.cell_flags[0] >> tcm.TERRAIN_CELL_PAYLOAD_SHIFT)
         tris = table.mixed_triangles[table.mixed_start[k] : table.mixed_start[k + 1]]
-        a, b, c = v[f[tris, 0]], v[f[tris, 1]], v[f[tris, 2]]
-        nz = np.cross(b - a, c - a)[:, 2]
-        self.assertTrue(np.any(nz > 0) and np.any(nz == 0))
-        np.testing.assert_array_equal(table.cell_z[corner], np.float32(0.1))
-        self.assertLessEqual(table.mixed_z[k, 0], -0.5 + 1e-6)
-        self.assertEqual(table.mixed_z[k, 1], np.float32(0.1))
-        self.assertGreater(report["in_mixed"], 0)
-        # the ground under the box's full cells is inside the box: buried, the box top is the surface
-        self.assertEqual(report["buried_up_facing"], 2)
-        self.assertEqual(table.cell_z[_cell(table, 0.15, 0.15)][0], np.float32(0.1))
+        self.assertEqual(tris.size, f.shape[0])  # with the side walls on its edges, beside a mixed cell
+        np.testing.assert_array_equal(table.cell_z[0], np.float32(0.3))
+        self.assertEqual(table.mixed_z[k, 1], np.float32(0.3))
+        self.assertLessEqual(table.mixed_z[k, 0], -1.0 + 1e-6)
+        self.assertEqual(report["in_mixed"], f.shape[0])
 
     def test_overhang_and_fin_are_mixed(self):
         """A plate floating over the ground (two surfaces over a column) and a wall standing above both sides."""

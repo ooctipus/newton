@@ -9,25 +9,29 @@ structure from the triangles alone, never from the task, and writes it as a cell
 it reads a :class:`~newton.Heightfield` today:
 
 * **The lattice.** The cell size of each axis is the most frequent length of the up-facing triangles' axis-aligned
-  edges, and the origin the most frequent vertex coordinate modulo that size (:func:`terrain_mesh_lattice`).
+  edges, refined with the origin by a least-squares fit of the coordinates on it (:func:`terrain_mesh_lattice`).
+  Coordinates within the float32 tolerance of a lattice line are moved onto it, and other coordinates within it of
+  each other are welded (two boxes' shared side, rounded one ulp apart).
 * **Cells.** Cell ``(r, c)`` covers ``[x0 + c dx, x0 + (c + 1) dx] x [y0 + r dy, y0 + (r + 1) dy]`` in the mesh frame,
   row-major like a heightfield's cells. Every cell is one of:
 
   - **grid**: the up-facing surface over the cell is one plane, or two half-cell planes meeting along a diagonal
     (``(0, 0)-(1, 1)`` as in a :class:`~newton.Heightfield`, or ``(1, 0)-(0, 1)``, bit
     :data:`TERRAIN_CELL_DIAGONAL`); its four corner heights give the surface exactly;
-  - **step**: two horizontal levels split by one axis-aligned riser at the cell-local offset ``s`` (the line
-    ``x = s dx``, or ``y = s dy`` with :data:`TERRAIN_CELL_STEP_Y`); its corners hold each side's level, ``s`` is a
-    24-bit fraction of the cell in the payload;
-  - **mixed**: anything else (a corner where two risers meet, a sloped piece beside a riser, a wall standing above
+  - **step**: horizontal levels on a 2 x 2 split by axis-aligned risers at the cell-local offsets ``(s, t)``: the
+    riser ``x = s dx``, the riser ``y = t dy``, or both crossing (a box corner); an offset of 0 is no riser. Its
+    corners hold the quadrants' levels (``z00`` for ``u < s, v < t``, ``z10`` for ``u > s, v < t`` ...), its record
+    in ``step_offsets`` the offsets;
+  - **mixed**: anything else (two parallel risers in one cell, a sloped piece beside a riser, a wall standing above
     both sides, an overhang, a partly covered cell); it keeps the mesh's own triangles as a CSR list with their
     z-range, for the triangle narrow phase without a BVH;
   - **empty**: no up-facing surface over the cell.
 
   Grid and step cells are the law's cells. The terrain is a solid under them, ``z <= h(x, y)``: a vertical triangle
-  in a law cell must lie on its riser or on a cell edge and not reach above the surface beside it, and a down-facing
-  triangle must lie below the cell's lowest corner (a box's bottom). Faces inside the solid (buried walls, bottoms)
-  are reproduced by the solid itself.
+  in a law cell must not reach above the solid's top along its line (on a riser, the higher side), and a down-facing
+  triangle must lie below the cell's lowest corner (a box's bottom). An up-facing piece under a cell's one top plane
+  with every down-facing piece lower still is inside the solid (overlapping boxes). Faces inside the solid (buried
+  walls and tops, bottoms) are reproduced by the solid itself.
 * **Risers on cell edges.** Each cell holds its own four corners, so a riser on a lattice line (a stair's riser) is
   the difference between two neighbours' corners along their shared edge. The four edge bits
   (:data:`TERRAIN_CELL_EDGE_X0` ...) mark the edges whose neighbour's surface differs by more than
@@ -41,8 +45,9 @@ The table (:class:`TerrainMeshCells`):
 
 * ``cell_z``: float32 ``(cells, 4)``, the corners ``z00, z10, z01, z11`` (``z10`` at ``x + dx``); a mixed cell's four
   corners all hold its top, so the largest corner bounds every cell from above;
-* ``cell_flags``: uint32 per cell, the kind (bits 0-1), the diagonal (bit 2), the step axis (bit 3), the edge bits
-  (bits 4-7) and the payload (bits 8-31: a step's offset ``round(s 2^24)``, a mixed cell's index);
+* ``cell_flags``: uint32 per cell, the kind (bits 0-1), the diagonal (bit 2), the edge bits (bits 4-7) and the payload
+  (bits 8-31: a step's record, a mixed cell's index);
+* ``step_offsets``: float32 ``(steps, 2)``, each step's ``(s, t)``;
 * ``mixed_cell``, ``mixed_start``, ``mixed_triangles``, ``mixed_z``: the mixed cells' cell ids, CSR offsets, triangle
   ids and z-ranges ``(lowest, highest)`` of their triangles clipped to the cell.
 
@@ -60,7 +65,8 @@ import numpy as np
 TERRAIN_CELL_GRID = 0
 """Cell kind: one plane, or two half-cell planes, given by the four corners."""
 TERRAIN_CELL_STEP = 1
-"""Cell kind: two horizontal levels split by one axis-aligned riser at the payload's offset."""
+"""Cell kind: horizontal levels on a 2 x 2 split by axis-aligned risers at the cell-local offsets ``(s, t)`` of the
+step's record (one riser, or two crossing)."""
 TERRAIN_CELL_MIXED = 2
 """Cell kind: the mesh's own triangles (CSR list), for the triangle narrow phase."""
 TERRAIN_CELL_EMPTY = 3
@@ -68,8 +74,6 @@ TERRAIN_CELL_EMPTY = 3
 TERRAIN_CELL_KIND_MASK = 0x3
 TERRAIN_CELL_DIAGONAL = 0x4
 """Grid cell: the halves meet on the diagonal ``(1, 0)-(0, 1)`` instead of the heightfield's ``(0, 0)-(1, 1)``."""
-TERRAIN_CELL_STEP_Y = 0x8
-"""Step cell: the riser is the line ``y = s dy`` (normal along y); without it, the line ``x = s dx``."""
 TERRAIN_CELL_EDGE_X0 = 0x10
 """Riser on the cell's edge ``x = 0`` (shared with column ``c - 1``)."""
 TERRAIN_CELL_EDGE_X1 = 0x20
@@ -79,14 +83,14 @@ TERRAIN_CELL_EDGE_Y0 = 0x40
 TERRAIN_CELL_EDGE_Y1 = 0x80
 """Riser on the cell's edge ``y = dy`` (shared with row ``r + 1``)."""
 TERRAIN_CELL_PAYLOAD_SHIFT = 8
-TERRAIN_CELL_STEP_ONE = 1 << 24
-"""A step's offset ``s`` is stored as ``round(s * TERRAIN_CELL_STEP_ONE)``, ``0 < s < 1`` of the cell."""
+"""The payload (bits 8-31): a step cell's record index in ``step_offsets``, a mixed cell's index in the mixed CSR."""
 TERRAIN_CELL_RISER_EPS = 1.0e-6
 """Height difference [m] along a shared edge above which the edge is a riser (the law's flatness tolerance)."""
 
 _EPS32 = float(np.finfo(np.float32).eps)
 _PLANE_TOL = 1.0e-6  # [m] two pieces are one plane when they agree at the cell corners within this (the law's 1 um)
 _MAX_POLY = 8  # a triangle clipped by four half-planes keeps at most 7 vertices
+_MAX_LEVELS = 4  # planes per cell a grid or step cell can hold (a step's four quadrants)
 _CHUNK = 1 << 20  # incidences per clipping batch
 
 _KIND_NAMES = ("grid", "step", "mixed", "empty")
@@ -108,6 +112,8 @@ class TerrainMeshCells:
     mixed_start: np.ndarray
     mixed_triangles: np.ndarray
     mixed_z: np.ndarray
+    step_offsets: np.ndarray
+    """float32 ``(steps, 2)``: each step cell's riser offsets ``(s, t)`` in cell units, 0 where it has no riser."""
     stats: dict = field(default_factory=dict)
     """Build counters: mixed reasons, wall and bottom checks, lattice shares (diagnostics, not read by the law)."""
 
@@ -129,13 +135,17 @@ class TerrainMeshCells:
             "mixed_start": self.mixed_start.nbytes,
             "mixed_triangles": self.mixed_triangles.nbytes,
             "mixed_z": self.mixed_z.nbytes,
+            "step_offsets": self.step_offsets.nbytes,
         }
         out["total"] = sum(out.values())
         return out
 
-    def step_offset(self) -> np.ndarray:
-        """Each cell's step offset ``s`` as a fraction of the cell (meaningful for step cells only)."""
-        return (self.cell_flags >> TERRAIN_CELL_PAYLOAD_SHIFT).astype(np.float64) / TERRAIN_CELL_STEP_ONE
+    def offsets(self) -> np.ndarray:
+        """Each cell's riser offsets ``(s, t)`` in cell units (float32; zeros for a cell that is no step)."""
+        out = np.zeros((self.cell_flags.size, 2), dtype=np.float32)
+        step = self.kind == TERRAIN_CELL_STEP
+        out[step] = self.step_offsets[(self.cell_flags[step] >> TERRAIN_CELL_PAYLOAD_SHIFT).astype(np.int64)]
+        return out
 
     def surface_z(self, x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Reference decode: the surface height at mesh-frame points, and each point's cell kind.
@@ -169,13 +179,27 @@ class TerrainMeshCells:
         hi_d1 = z11 + (z11 - z01) * (u - one) + (z11 - z10) * (v - one)
         g1 = np.where(u + v <= one, lo_d1, hi_d1)
         grid = np.where((flags & TERRAIN_CELL_DIAGONAL) != 0, g1, g0)
-        s = self.step_offset()[cell].astype(np.float32)
-        along = np.where((flags & TERRAIN_CELL_STEP_Y) != 0, v, u)
-        far = np.where((flags & TERRAIN_CELL_STEP_Y) != 0, z01, z10)
-        step = np.where(along < s, z00, np.where(along > s, far, np.maximum(z00, far)))
+        off = self.offsets()[cell]
+        step = _step_levels(z, off[:, 0], off[:, 1], u, v, np.float32(0.0))
         out = np.where(kind == TERRAIN_CELL_GRID, grid, np.where(kind == TERRAIN_CELL_STEP, step, np.float32(np.nan)))
         out = np.where(inside, out, np.float32(np.nan))
         return out, np.where(inside, kind, -1)
+
+
+def _step_levels(z, s, t, u, v, band):
+    """A step cell's level at cell-local ``(u, v)``: the quadrant's corner, the higher side on a riser line (within
+    ``band``); an offset of 0 is no riser."""
+    hi_u = u > s + band
+    on_u = (s > 0) & (np.abs(u - s) <= band)
+    hi_v = v > t + band
+    on_v = (t > 0) & (np.abs(v - t) <= band)
+    out = None
+    for iu in (0, 1):
+        for iv in (0, 1):
+            takes = ((hi_u == bool(iu)) | on_u) & ((hi_v == bool(iv)) | on_v)
+            zq = np.where(takes, z[:, iu + 2 * iv], -np.inf)
+            out = zq if out is None else np.maximum(out, zq)
+    return out.astype(z.dtype)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -515,83 +539,122 @@ def build_terrain_mesh_cells(
         stats["stacked_cells"] = {"cells": int(top.shape[0]), "one_top_plane_over_buried": int(ok.sum())}
     stats["buried_pieces"] = int(buried.sum())
 
-    # --- per cell: the up-facing planes ---------------------------------------------------------------------------
+    # --- per cell: the up-facing planes (up to four, largest first) ----------------------------------------------
     upi = np.flatnonzero(inc_up & ~buried)
     order = upi[np.lexsort((-inc_area[upi], inc_cell[upi]))]
     oc = inc_cell[order]
     first = np.r_[True, oc[1:] != oc[:-1]] if oc.size else np.zeros(0, bool)
     head = np.flatnonzero(first)
     seg = np.cumsum(first) - 1
-    plane_a = inc_corner[order[head]][seg]
-    in_a = np.max(np.abs(inc_corner[order] - plane_a), axis=1) <= _PLANE_TOL
-    # plane B: the largest piece not on plane A
-    cand = np.where(~in_a, np.arange(order.size), order.size)
-    first_b = np.full(head.size, order.size, dtype=np.int64)
-    np.minimum.at(first_b, seg, cand)
-    has_b = first_b < order.size
-    plane_b = np.where(has_b[:, None], inc_corner[order[np.minimum(first_b, order.size - 1)]], np.nan)[seg]
-    in_b = ~in_a & (np.max(np.abs(inc_corner[order] - plane_b), axis=1) <= _PLANE_TOL)
-    third = ~(in_a | in_b)
-
-    cells = oc[head]
     nseg = head.size
-    area_up = np.zeros(nseg)
-    np.add.at(area_up, seg, inc_area[order])
-    area_a = np.zeros(nseg)
-    np.add.at(area_a, seg[in_a], inc_area[order][in_a])
-    n_third = np.bincount(seg[third], minlength=nseg)
+    cells = oc[head]
+    pc = inc_corner[order]
+    group = np.full(order.size, -1, dtype=np.int64)
+    planes = np.full((nseg, _MAX_LEVELS, 4), np.nan)
+    for k in range(_MAX_LEVELS):
+        cand = np.where(group < 0, np.arange(order.size), order.size)
+        lead = np.full(nseg, order.size, dtype=np.int64)
+        np.minimum.at(lead, seg, cand)
+        has = lead < order.size
+        planes[has, k] = pc[lead[has]]
+        on = (group < 0) & has[seg] & (np.max(np.abs(pc - planes[seg, k]), axis=1) <= _PLANE_TOL)
+        group[on] = k
+    n_planes = np.sum(~np.isnan(planes[:, :, 0]), axis=1)
+    extra = np.bincount(seg[group < 0], minlength=nseg)  # pieces of a fifth plane or more
+    area_up = np.bincount(seg, weights=inc_area[order], minlength=nseg)
     ext = inc_ext[order]
-
-    def group_ext(mask, col, op, fill):
-        return _segment_reduce(seg[mask], ext[mask, col], nseg, op, fill)
-
-    ea = [
-        group_ext(in_a, k, np.minimum if k % 2 == 0 else np.maximum, np.inf if k % 2 == 0 else -np.inf)
-        for k in range(8)
-    ]
-    eb = [
-        group_ext(in_b, k, np.minimum if k % 2 == 0 else np.maximum, np.inf if k % 2 == 0 else -np.inf)
-        for k in range(8)
-    ]
-    za = plane_a[head]
-    zb = plane_b[head]
-    flat_a = (za.max(1) - za.min(1)) <= _PLANE_TOL
-    flat_b = (zb.max(1) - zb.min(1)) <= _PLANE_TOL
+    gid = seg * _MAX_LEVELS + np.maximum(group, 0)
+    gmask = group >= 0
+    gext = np.stack(
+        [
+            _segment_reduce(
+                gid[gmask],
+                ext[gmask, col],
+                nseg * _MAX_LEVELS,
+                np.minimum if col % 2 == 0 else np.maximum,
+                np.inf if col % 2 == 0 else -np.inf,
+            )
+            for col in range(8)
+        ],
+        1,
+    ).reshape(nseg, _MAX_LEVELS, 8)
+    garea = np.bincount(gid[gmask], weights=inc_area[order][gmask], minlength=nseg * _MAX_LEVELS)
+    garea = garea.reshape(nseg, _MAX_LEVELS) / cell_area
     tu = tol / min(dx, dy)
+    covered = (np.abs(area_up - cell_area) <= area_tol) & (extra == 0)
+    za, zb = planes[:, 0], planes[:, 1]
+    ea, eb = gext[:, 0].T, gext[:, 1].T
 
-    covered = np.abs(area_up - cell_area) <= area_tol
-    one_plane = covered & ~has_b
-    two = covered & has_b & (n_third == 0)
-
-    def near(x, y):
-        return np.abs(x - y) <= tu
-
-    # two half-cell planes on diagonal (0,0)-(1,1): one group in u >= v, the other in u <= v, continuous at 00 and 11
-    a_lr = ea[4] >= -tu
-    b_ul = eb[5] <= tu
-    a_ul = ea[5] <= tu
-    b_lr = eb[4] >= -tu
+    # grid: one plane, or two half-cell planes on a diagonal, continuous at its ends
+    one_plane = covered & (n_planes == 1)
+    two = covered & (n_planes == 2)
+    a_lr, b_ul, a_ul, b_lr = ea[4] >= -tu, eb[5] <= tu, ea[5] <= tu, eb[4] >= -tu
     cont0 = (np.abs(za[:, 0] - zb[:, 0]) <= _PLANE_TOL) & (np.abs(za[:, 3] - zb[:, 3]) <= _PLANE_TOL)
     diag0 = two & cont0 & ((a_lr & b_ul) | (a_ul & b_lr))
-    # diagonal (1,0)-(0,1): one group in u + v <= 1, the other in u + v >= 1, continuous at 10 and 01
-    a_ll = ea[7] <= 1.0 + tu
-    b_ur = eb[6] >= 1.0 - tu
-    a_ur = ea[6] >= 1.0 - tu
-    b_ll = eb[7] <= 1.0 + tu
+    a_ll, b_ur, a_ur, b_ll = ea[7] <= 1.0 + tu, eb[6] >= 1.0 - tu, ea[6] >= 1.0 - tu, eb[7] <= 1.0 + tu
     cont1 = (np.abs(za[:, 1] - zb[:, 1]) <= _PLANE_TOL) & (np.abs(za[:, 2] - zb[:, 2]) <= _PLANE_TOL)
     diag1 = two & ~diag0 & cont1 & ((a_ll & b_ur) | (a_ur & b_ll))
-    # step: two horizontal levels split by a line u = s or v = s
-    levels = two & ~diag0 & ~diag1 & flat_a & flat_b
-    sx_ab = levels & near(ea[0], 0.0) & near(ea[1], eb[0]) & near(eb[1], 1.0)
-    sx_ba = levels & near(eb[0], 0.0) & near(eb[1], ea[0]) & near(ea[1], 1.0)
-    sy_ab = levels & ~(sx_ab | sx_ba) & near(ea[2], 0.0) & near(ea[3], eb[2]) & near(eb[3], 1.0)
-    sy_ba = levels & ~(sx_ab | sx_ba | sy_ab) & near(eb[2], 0.0) & near(eb[3], ea[2]) & near(ea[3], 1.0)
-    s_val = np.select([sx_ab, sx_ba, sy_ab, sy_ba], [ea[1], eb[1], ea[3], eb[3]], default=0.0)
-    is_step = (sx_ab | sx_ba | sy_ab | sy_ba) & (s_val > tu) & (s_val < 1.0 - tu)
+
+    # step: horizontal levels on a 2 x 2 split at (s, t): the levels' extents leave at most one interior cut per
+    # axis, and each level covers whole quadrants (its area is the sum of the quadrants its extent spans)
+    filled = np.nan_to_num(planes)  # an absent plane reads as a flat one
+    flat = np.all(filled.max(axis=2) - filled.min(axis=2) <= _PLANE_TOL, axis=1)
+    levels_ok = covered & ~one_plane & ~diag0 & ~diag1 & flat & (n_planes >= 2)
+    present = ~np.isnan(planes[:, :, 0])
+    cuts = []
+    for lo_col, hi_col in ((0, 1), (2, 3)):
+        lo_e = np.where(present, gext[:, :, lo_col], 0.0)
+        hi_e = np.where(present, gext[:, :, hi_col], 1.0)
+        inner = np.concatenate([lo_e, hi_e], 1)
+        inside = (inner > tu) & (inner < 1.0 - tu)
+        cut = np.where(inside, inner, np.nan)
+        c_min = np.nanmin(np.where(inside, cut, np.inf), axis=1)
+        c_max = np.nanmax(np.where(inside, cut, -np.inf), axis=1)
+        single = ~inside.any(1) | (c_max - c_min <= tu)
+        cuts.append((np.where(inside.any(1), c_min, 0.0), single))
+    (s_cut, s_one), (t_cut, t_one) = cuts
+    levels_ok &= s_one & t_one & ((s_cut > 0.0) | (t_cut > 0.0))
+    # the quadrants each piece's extent overlaps take its level; a quadrant two levels claim is no step, and each
+    # level's quadrants must add up to its area (then its pieces fill exactly those quadrants)
+    su = np.where(s_cut > 0.0, s_cut, 1.0)
+    tv = np.where(t_cut > 0.0, t_cut, 1.0)
+    bounds_q = (
+        (0.0 * su, su, 0.0 * tv, tv),
+        (su, 0.0 * su + 1.0, 0.0 * tv, tv),
+        (0.0 * su, su, tv, 0.0 * tv + 1.0),
+        (su, 0.0 * su + 1.0, tv, 0.0 * tv + 1.0),
+    )
+    q_lo = np.full((nseg, 4), _MAX_LEVELS, dtype=np.int64)
+    q_hi = np.full((nseg, 4), -1, dtype=np.int64)
+    qarea = np.zeros((nseg, 4))
+    qlev = np.full(
+        (nseg, 4), -np.inf
+    )  # each quadrant's own level: two boxes' tops within the plane tolerance stay apart
+    for q, (u0, u1, v0, v1) in enumerate(bounds_q):
+        qarea[:, q] = (u1 - u0) * (v1 - v0)
+        over = gmask & (np.minimum(ext[:, 1], u1[seg]) - np.maximum(ext[:, 0], u0[seg]) > tu)
+        over &= np.minimum(ext[:, 3], v1[seg]) - np.maximum(ext[:, 2], v0[seg]) > tu
+        np.minimum.at(q_lo[:, q], seg[over], group[over])
+        np.maximum.at(q_hi[:, q], seg[over], group[over])
+        np.maximum.at(qlev[:, q], seg[over], pc[over, 0])
+    q_real = qarea > tu
+    level_area_ok = np.all(~q_real | ((q_lo == q_hi) & (q_hi >= 0)), axis=1)
+    quad = np.where(q_real, np.clip(q_lo, 0, _MAX_LEVELS - 1), -1)
+    for k in range(_MAX_LEVELS):
+        held = np.sum(np.where(quad == k, qarea, 0.0), axis=1)
+        level_area_ok &= ~present[:, k] | (np.abs(held - garea[:, k]) <= 1.0e-6)
+    qz = np.where(np.isfinite(qlev), qlev, 0.0)
+    is_step = levels_ok & level_area_ok
+    # the level at each quadrant; an absent cut repeats its neighbour (z00 = z10 without a riser across x)
+    qz[:, 1] = np.where(s_cut > 0.0, qz[:, 1], qz[:, 0])
+    qz[:, 3] = np.where(s_cut > 0.0, qz[:, 3], qz[:, 2])
+    qz[:, 2] = np.where(t_cut > 0.0, qz[:, 2], qz[:, 0])
+    qz[:, 3] = np.where(t_cut > 0.0, qz[:, 3], qz[:, 1])
 
     kind = np.full(ncell, TERRAIN_CELL_EMPTY, dtype=np.int64)
     flags = np.zeros(ncell, dtype=np.uint64)
     corners = np.zeros((ncell, 4), dtype=np.float64)
+    offsets = np.zeros((ncell, 2), dtype=np.float64)  # a step's (s, t) in cell units, 0 where it has no riser
     seg_kind = np.full(nseg, TERRAIN_CELL_MIXED, dtype=np.int64)
     seg_kind[one_plane | diag0 | diag1] = TERRAIN_CELL_GRID
     seg_kind[is_step] = TERRAIN_CELL_STEP
@@ -602,29 +665,19 @@ def build_terrain_mesh_cells(
     ll_is_a = a_ll & b_ur
     seg_corner[diag1, 0] = np.where(ll_is_a, za[:, 0], zb[:, 0])[diag1]
     seg_corner[diag1, 3] = np.where(ll_is_a, zb[:, 3], za[:, 3])[diag1]
-    # step corners: each side's level (z00 holds the side below s)
-    low_a = sx_ab | sy_ab
-    lev_lo = np.where(low_a, za[:, 0], zb[:, 0])
-    lev_hi = np.where(low_a, zb[:, 0], za[:, 0])
-    on_x = sx_ab | sx_ba
-    st = is_step
-    seg_corner[st, 0] = lev_lo[st]
-    seg_corner[st, 1] = np.where(on_x, lev_hi, lev_lo)[st]
-    seg_corner[st, 2] = np.where(on_x, lev_lo, lev_hi)[st]
-    seg_corner[st, 3] = lev_hi[st]
+    seg_corner[is_step] = qz[is_step]
     seg_flags = np.zeros(nseg, dtype=np.uint64)
     seg_flags[diag1] |= TERRAIN_CELL_DIAGONAL
-    seg_flags[st & ~on_x] |= TERRAIN_CELL_STEP_Y
-    payload = np.clip(np.round(s_val * TERRAIN_CELL_STEP_ONE), 1, TERRAIN_CELL_STEP_ONE - 1).astype(np.uint64)
-    seg_flags[st] |= payload[st] << np.uint64(TERRAIN_CELL_PAYLOAD_SHIFT)
     kind[cells] = seg_kind
     flags[cells] = seg_flags
     corners[cells] = seg_corner
+    offsets[cells[is_step], 0] = s_cut[is_step]
+    offsets[cells[is_step], 1] = t_cut[is_step]
 
     reasons = {
-        "partial_or_stacked_cover": int((~covered).sum()),
-        "three_or_more_planes": int((covered & has_b & (n_third > 0)).sum()),
-        "two_planes_not_halves_or_step": int((two & ~diag0 & ~diag1 & ~is_step).sum()),
+        "partial_or_stacked_cover": int((np.abs(area_up - cell_area) > area_tol).sum()),
+        "more_than_four_planes": int((extra > 0).sum()),
+        "planes_not_grid_or_step": int((covered & ~one_plane & ~diag0 & ~diag1 & ~is_step).sum()),
     }
 
     # vertices on corners: copy their float32 heights where they lie on the cell's surface plane
@@ -677,13 +730,14 @@ def build_terrain_mesh_cells(
             mixed_extra.append((cl, np.full(cl.size, widx[gi[k]], dtype=np.int64)))
     reasons["general_wall"] = int(general.sum())
 
-    wall_checks = {"interior_ok": 0, "interior_bad": 0, "edge_ok": 0, "edge_bad": 0, "edge_beside_mixed": 0}
+    wall_checks = dict.fromkeys(("interior_riser", "interior_buried", "interior_bad", "edge_ok", "edge_bad"), 0)
+    wall_checks["edge_beside_mixed"] = 0
     pieces = [
         _wall_pieces(wx, wy, wz, widx, mask, line_axis, x0, y0, dx, dy, rows, cols, tol, tu)
         for mask, line_axis in ((along_y, 0), (along_x, 1))
     ]
-    # interior walls first (they can only demote cells): the cell must be a step whose riser is this line, and the
-    # wall must not reach above its high level
+    # interior walls first (they can only demote cells): the wall must not reach above the solid's top along its
+    # line inside the cell (on a step's riser line the higher side): a step's riser, or a wall buried in the solid
     for line_axis, p in enumerate(pieces):
         if p is None:
             continue
@@ -691,18 +745,14 @@ def build_terrain_mesh_cells(
         ci = np.floor(p["line"][ii]).astype(np.int64)
         s_in = p["line"][ii] - ci
         cell_i = p["run"][ii] * cols + ci if line_axis == 0 else ci * cols + p["run"][ii]
-        fl = flags[cell_i]
-        axis_ok = (kind[cell_i] == TERRAIN_CELL_STEP) & (((fl & TERRAIN_CELL_STEP_Y) != 0) == (line_axis == 1))
-        s_cell = (fl >> np.uint64(TERRAIN_CELL_PAYLOAD_SHIFT)).astype(np.float64) / TERRAIN_CELL_STEP_ONE
-        high = corners[cell_i].max(axis=1)
-        riser = axis_ok & (np.abs(s_cell - s_in) <= tu) & (p["top"][ii] <= high + _PLANE_TOL)
         lawi = (kind[cell_i] == TERRAIN_CELL_GRID) | (kind[cell_i] == TERRAIN_CELL_STEP)
-        inside = _line_min(corners[cell_i], flags[cell_i], kind[cell_i], line_axis, s_in, p["t0"][ii], p["t1"][ii])
-        good = riser | (
-            lawi & ~riser & (p["top"][ii] <= inside + _PLANE_TOL) & ~(axis_ok & (np.abs(s_cell - s_in) <= tu))
+        top_line = _line_min(
+            corners[cell_i], kind[cell_i], flags[cell_i], offsets[cell_i], line_axis, s_in, p["t0"][ii], p["t1"][ii], tu
         )
-        wall_checks["interior_buried"] = wall_checks.get("interior_buried", 0) + int((good & ~riser).sum())
-        wall_checks["interior_ok"] += int(good.sum())
+        good = lawi & (p["top"][ii] <= top_line + _PLANE_TOL)
+        on_riser = good & (kind[cell_i] == TERRAIN_CELL_STEP) & (np.abs(offsets[cell_i, line_axis] - s_in) <= tu)
+        wall_checks["interior_riser"] += int(on_riser.sum())
+        wall_checks["interior_buried"] += int((good & ~on_riser).sum())
         wall_checks["interior_bad"] += int((~good).sum())
         kind[np.unique(cell_i[~good])] = TERRAIN_CELL_MIXED
         mixed_extra.append((cell_i, p["tri"][ii]))
@@ -725,7 +775,7 @@ def build_terrain_mesh_cells(
             exists = (ce >= 0) & (ce < (cols if line_axis == 0 else rows))
             ce = np.clip(ce, 0, (cols if line_axis == 0 else rows) - 1)
             cell_e = run * cols + ce if line_axis == 0 else ce * cols + run
-            low = _edge_min(corners[cell_e], flags[cell_e], kind[cell_e], line_axis, high, t0, t1)
+            low = _edge_min(corners[cell_e], kind[cell_e], offsets[cell_e], line_axis, high, t0, t1)
             floor_z = np.maximum(floor_z, np.where(exists & law[cell_e], low, -np.inf))
             beside_mixed |= exists & ~law[cell_e]
             sides.append((cell_e, exists))
@@ -772,6 +822,8 @@ def build_terrain_mesh_cells(
     np.maximum.at(mz_hi, mi, ent_hi[sel])
     corners[mixed] = mz_hi[:, None]
     flags[mixed] = mixed_index[mixed].astype(np.uint64) << np.uint64(TERRAIN_CELL_PAYLOAD_SHIFT)
+    steps = np.flatnonzero(kind == TERRAIN_CELL_STEP)
+    flags[steps] = np.arange(steps.size, dtype=np.uint64) << np.uint64(TERRAIN_CELL_PAYLOAD_SHIFT)
     flags[kind == TERRAIN_CELL_EMPTY] = 0
     flags[kind == TERRAIN_CELL_GRID] &= np.uint64(TERRAIN_CELL_DIAGONAL)
     flags |= kind.astype(np.uint64)
@@ -787,6 +839,7 @@ def build_terrain_mesh_cells(
         mixed_start=mixed_start.astype(np.int32),
         mixed_triangles=t_of.astype(np.int32),
         mixed_z=np.stack([mz_lo, mz_hi], 1).astype(np.float32),
+        step_offsets=offsets[steps].astype(np.float32),
         stats=stats,
     )
     _write_edge_bits(table)
@@ -840,68 +893,58 @@ def _wall_pieces(wx, wy, wz, widx, mask, line_axis, x0, y0, dx, dy, rows, cols, 
     }
 
 
-def _surface64(z: np.ndarray, flags: np.ndarray, kind: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
-    """Float64 surface of law cells at cell-local ``(u, v)`` in cell units (a riser line takes the higher side)."""
+def _surface64(z, kind, flags, off, u, v, band) -> np.ndarray:
+    """Float64 surface of law cells at cell-local ``(u, v)`` (cell units); on a step's riser line the higher side."""
     z00, z10, z01, z11 = z[:, 0], z[:, 1], z[:, 2], z[:, 3]
     g0 = np.where(u >= v, z00 + (z10 - z00) * u + (z11 - z10) * v, z00 + (z11 - z01) * u + (z01 - z00) * v)
     g1 = np.where(
         u + v <= 1.0, z00 + (z10 - z00) * u + (z01 - z00) * v, z11 + (z11 - z01) * (u - 1.0) + (z11 - z10) * (v - 1.0)
     )
     grid = np.where((flags & TERRAIN_CELL_DIAGONAL) != 0, g1, g0)
-    s = (flags >> np.uint64(TERRAIN_CELL_PAYLOAD_SHIFT)).astype(np.float64) / TERRAIN_CELL_STEP_ONE
-    ry = (flags & TERRAIN_CELL_STEP_Y) != 0
-    along = np.where(ry, v, u)
-    far = np.where(ry, z01, z10)
-    step = np.where(along < s, z00, np.where(along > s, far, np.maximum(z00, far)))
-    return np.where(kind == TERRAIN_CELL_STEP, step, grid)
+    return np.where(kind == TERRAIN_CELL_STEP, _step_levels(z, off[:, 0], off[:, 1], u, v, band), grid)
 
 
-def _line_min(z, flags, kind, line_axis: int, s_line, t0, t1) -> np.ndarray:
-    """Lowest surface of a law cell along the line ``u = s_line`` (``line_axis`` 0) or ``v = s_line`` over the run
-    ``[t0, t1]``: the surface is linear between the run's ends, the diagonal and a riser, so those points bound it."""
-    s = (flags >> np.uint64(TERRAIN_CELL_PAYLOAD_SHIFT)).astype(np.float64) / TERRAIN_CELL_STEP_ONE
+def _line_min(z, kind, flags, off, line_axis: int, s_line, t0, t1, band) -> np.ndarray:
+    """Lowest solid top of a law cell along the line ``u = s_line`` (``line_axis`` 0) or ``v = s_line`` over the run
+    ``[t0, t1]``: the surface is linear between the run's ends, the diagonal and the risers, so those points bound
+    it (each riser crossing sampled on both sides)."""
     diag = np.where((flags & TERRAIN_CELL_DIAGONAL) != 0, 1.0 - s_line, s_line)
-    eps = 1.0e-9
-    samples = [t0, t1, np.clip(diag, t0, t1), np.clip(s - eps, t0, t1), np.clip(s + eps, t0, t1)]
+    cross = off[:, 1 - line_axis].astype(np.float64)
+    gap = 2.0 * band
+    samples = [t0, t1, np.clip(diag, t0, t1), np.clip(cross - gap, t0, t1), np.clip(cross + gap, t0, t1)]
     out = np.full(t0.shape, np.inf)
     for t in samples:
-        u, v = (s_line, t) if line_axis == 0 else (t, s_line)
-        out = np.minimum(out, _surface64(z, flags, kind, np.broadcast_to(u, t.shape), np.broadcast_to(v, t.shape)))
+        u, v = (np.broadcast_to(s_line, t.shape), t) if line_axis == 0 else (t, np.broadcast_to(s_line, t.shape))
+        out = np.minimum(out, _surface64(z, kind, flags, off, u, v, band))
     return out
 
 
-def _edge_profile(z: np.ndarray, flags: np.ndarray, kind: np.ndarray, line_axis: int, high: bool):
-    """A cell's surface along one of its edges: values at the edge's two ends and a breakpoint (a step crossing it).
+def _edge_profile(z: np.ndarray, kind: np.ndarray, off: np.ndarray, line_axis: int, high: bool):
+    """A cell's surface along one of its edges: values at the edge's two ends and a breakpoint (a riser crossing it).
 
     ``line_axis`` 0 is an edge ``x = const`` (running along y), 1 an edge ``y = const``; ``high`` the edge at ``x = dx``
-    (or ``y = dy``). Returns ``(z_start, z_end, s)`` with ``s`` NaN where the profile is linear, else the run
+    (or ``y = dy``). Returns ``(z_start, z_end, b)`` with ``b`` NaN where the profile is linear, else the run
     parameter where it jumps from ``z_start`` to ``z_end``.
     """
     if line_axis == 0:
-        zs = np.where(high, z[:, 1], z[:, 0])
-        ze = np.where(high, z[:, 3], z[:, 2])
+        zs = z[:, 1] if high else z[:, 0]
+        ze = z[:, 3] if high else z[:, 2]
     else:
-        zs = np.where(high, z[:, 2], z[:, 0])
-        ze = np.where(high, z[:, 3], z[:, 1])
-    step = kind == TERRAIN_CELL_STEP
-    riser_y = (flags & TERRAIN_CELL_STEP_Y) != 0
-    # the step crosses edges parallel to its riser's normal: a riser x = s crosses the edges y = const
-    crosses = step & (riser_y == (line_axis == 0))
-    s = (flags >> np.uint64(TERRAIN_CELL_PAYLOAD_SHIFT)).astype(np.float64) / TERRAIN_CELL_STEP_ONE
-    return zs, ze, np.where(crosses, s, np.nan)
+        zs = z[:, 2] if high else z[:, 0]
+        ze = z[:, 3] if high else z[:, 1]
+    b = off[:, 1 - line_axis].astype(np.float64)
+    return zs, ze, np.where((kind == TERRAIN_CELL_STEP) & (b > 0.0), b, np.nan)
 
 
-def _edge_min(z, flags, kind, line_axis: int, high: bool, t0, t1):
+def _edge_min(z, kind, off, line_axis: int, high: bool, t0, t1):
     """Lowest surface height along a cell's edge over the run ``[t0, t1]`` (cell units)."""
-    zs, ze, s = _edge_profile(z, flags, kind, line_axis, high)
-    lin0 = zs + (ze - zs) * t0
-    lin1 = zs + (ze - zs) * t1
-    linear = np.isnan(s)
-    # stepped: the side below s holds zs, beyond holds ze
-    has_lo = t0 < np.where(linear, 0.0, s)
-    has_hi = t1 > np.where(linear, 1.0, s)
+    zs, ze, b = _edge_profile(z, kind, off, line_axis, high)
+    linear = np.isnan(b)
+    lin = np.minimum(zs + (ze - zs) * t0, zs + (ze - zs) * t1)
+    has_lo = t0 < np.where(linear, 0.0, b)
+    has_hi = t1 > np.where(linear, 1.0, b)
     stepped = np.minimum(np.where(has_lo, zs, np.inf), np.where(has_hi, ze, np.inf))
-    return np.where(linear, np.minimum(lin0, lin1), stepped)
+    return np.where(linear, lin, stepped)
 
 
 def _write_edge_bits(table: TerrainMeshCells) -> None:
@@ -910,6 +953,7 @@ def _write_edge_bits(table: TerrainMeshCells) -> None:
     kind = table.kind.reshape(rows, cols)
     flags = table.cell_flags.reshape(rows, cols).astype(np.uint64)
     z = table.cell_z.astype(np.float64).reshape(rows, cols, 4)
+    off = table.offsets().reshape(rows, cols, 2)
     law = (kind == TERRAIN_CELL_GRID) | (kind == TERRAIN_CELL_STEP)
     bits = np.zeros((rows, cols), dtype=np.uint64)
     for line_axis, bit_lo, bit_hi in (
@@ -917,29 +961,25 @@ def _write_edge_bits(table: TerrainMeshCells) -> None:
         (1, TERRAIN_CELL_EDGE_Y0, TERRAIN_CELL_EDGE_Y1),
     ):
         # pairs (left/lower cell A, right/upper cell B) across every interior lattice line of this axis
-        if line_axis == 0:
-            za, fa, ka, la = z[:, :-1].reshape(-1, 4), flags[:, :-1].ravel(), kind[:, :-1].ravel(), law[:, :-1].ravel()
-            zb, fb, kb, lb = z[:, 1:].reshape(-1, 4), flags[:, 1:].ravel(), kind[:, 1:].ravel(), law[:, 1:].ravel()
-        else:
-            za, fa, ka, la = z[:-1].reshape(-1, 4), flags[:-1].ravel(), kind[:-1].ravel(), law[:-1].ravel()
-            zb, fb, kb, lb = z[1:].reshape(-1, 4), flags[1:].ravel(), kind[1:].ravel(), law[1:].ravel()
-        sa0, sa1, ssa = _edge_profile(za, fa, ka, line_axis, True)
-        sb0, sb1, ssb = _edge_profile(zb, fb, kb, line_axis, False)
-        same_shape = (np.isnan(ssa) & np.isnan(ssb)) | (
-            np.abs(np.nan_to_num(ssa, nan=-9.0) - np.nan_to_num(ssb, nan=-9.0)) <= 1.0 / TERRAIN_CELL_STEP_ONE
+        sa, sb = (
+            ((slice(None), slice(None, -1)), (slice(None), slice(1, None)))
+            if line_axis == 0
+            else (
+                (slice(None, -1), slice(None)),
+                (slice(1, None), slice(None)),
+            )
         )
+        za0, za1, ba = _edge_profile(z[sa].reshape(-1, 4), kind[sa].ravel(), off[sa].reshape(-1, 2), line_axis, True)
+        zb0, zb1, bb = _edge_profile(z[sb].reshape(-1, 4), kind[sb].ravel(), off[sb].reshape(-1, 2), line_axis, False)
+        same_break = (np.isnan(ba) & np.isnan(bb)) | (np.abs(ba - bb) <= 1.0e-6)
         same = (
-            same_shape & (np.abs(sa0 - sb0) <= TERRAIN_CELL_RISER_EPS) & (np.abs(sa1 - sb1) <= TERRAIN_CELL_RISER_EPS)
+            same_break & (np.abs(za0 - zb0) <= TERRAIN_CELL_RISER_EPS) & (np.abs(za1 - zb1) <= TERRAIN_CELL_RISER_EPS)
         )
-        riser = ~(same & la & lb)
-        if line_axis == 0:
-            r = riser.reshape(rows, cols - 1)
-            bits[:, :-1] |= np.where(r, np.uint64(bit_hi), np.uint64(0))
-            bits[:, 1:] |= np.where(r, np.uint64(bit_lo), np.uint64(0))
-        else:
-            r = riser.reshape(rows - 1, cols)
-            bits[:-1, :] |= np.where(r, np.uint64(bit_hi), np.uint64(0))
-            bits[1:, :] |= np.where(r, np.uint64(bit_lo), np.uint64(0))
+        riser = ~(same & law[sa].ravel() & law[sb].ravel())
+        shape = law[sa].shape
+        r = riser.reshape(shape)
+        bits[sa] |= np.where(r, np.uint64(bit_hi), np.uint64(0))
+        bits[sb] |= np.where(r, np.uint64(bit_lo), np.uint64(0))
     # the table's outer border is a riser of its own (the block's walls)
     bits[:, 0] |= np.uint64(TERRAIN_CELL_EDGE_X0)
     bits[:, -1] |= np.uint64(TERRAIN_CELL_EDGE_X1)
