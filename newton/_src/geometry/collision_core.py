@@ -1509,8 +1509,6 @@ def mesh_cells_entry_is_candidate(
 
 @wp.func
 def mesh_vs_convex_cell_hits(
-    lane: int,
-    lanes: int,
     pair_index: int,
     grid_index: int,
     query_lower: wp.vec3,
@@ -1532,11 +1530,9 @@ def mesh_vs_convex_cell_hits(
     are fewer. A cell is a hit unless its triangles' box misses the query box
     ``[query_lower, query_upper]`` (unscaled mesh frame) or the bound's oriented box (its three slabs, ``slab0``..
     ``slab2`` with half-widths ``slab_half``, :func:`mesh_query_bound_slab`). A hit is ``(pair, cell)``, the cell's
-    index in :attr:`MeshCells.sorted_slots`; :func:`mesh_vs_convex_hit_candidates` scans them, one thread a hit. ``lanes``
-    threads share the pair; each takes every ``lanes``-th block (or walked cell).
+    index in :attr:`MeshCells.sorted_slots`; :func:`mesh_vs_convex_hit_candidates` scans them, one thread a hit.
     """
     grid = mesh_cells.grids[grid_index]
-    visited = int(0)
     for level in range(16):
         if (grid.levels >> level) & 1 == 0:
             continue
@@ -1555,8 +1551,7 @@ def mesh_vs_convex_cell_hits(
             n = list_count
         size = grid.cell * float(1 << shift)
         inv_size = grid.inv_cell / float(1 << shift)
-        k = ((lane - visited) % lanes + lanes) % lanes
-        while k < n:
+        for k in range(n):
             # Item k's occupied cells (bits of a block) and its first cell's slot: a block of the range, or the
             # level's k-th occupied cell alone. A cell's slot is the first plus the occupied cells below its bit.
             b = wp.vec3i(blo[0] + k % nbx, blo[1] + (k // nbx) % nby, blo[2] + k // (nbx * nby))
@@ -1597,8 +1592,6 @@ def mesh_vs_convex_cell_hits(
                     if out < hits.shape[0]:
                         hits[out] = wp.vec2i(pair_index, slot_index)
                 bits = bits & (bits - wp.uint64(1))
-            k += lanes
-        visited += n
 
 
 @wp.func

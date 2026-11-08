@@ -1917,54 +1917,45 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
             query_grid[i] = grid
 
 
-def _create_mesh_cell_hits_kernel(lanes: int):
-    """Midphase pass 2a of 3: ``lanes`` threads per mesh pair look up its cells (launch ``[blocks, block_dim]``)."""
-
-    # The pass is bound by its loads' latency: 64 registers keep more warps in flight.
-    @wp.kernel(enable_backward=False, module=f"narrow_phase_mesh_cell_hits_{lanes}", cuda_max_registers=64)
-    def narrow_phase_mesh_cell_hits_kernel(
-        shape_pairs_mesh_count: wp.array[int],
-        query_lower: wp.array[wp.vec3],
-        query_upper: wp.array[wp.vec3],
-        query_range: wp.array2d[wp.vec3i],
-        query_grid: wp.array[wp.int32],
-        query_slab0: wp.array[wp.vec4],
-        query_slab1: wp.array[wp.vec4],
-        query_slab2: wp.array[wp.vec4],
-        query_slab_half: wp.array[wp.vec3],
-        mesh_cells: MeshCells,
-        total_num_threads: int,
-        # outputs
-        hits: wp.array[wp.vec2i],  # (mesh pair, cell in mesh_cells.sorted_slots)
-        hit_count: wp.array[int],
-    ):
-        """Append each pair's hit cells (:func:`mesh_vs_convex_cell_hits`)."""
-        block, j = wp.tid()
-        thread = block * wp.block_dim() + j
-        group = thread // lanes
-        lane = thread - group * lanes
-        for i in range(group, shape_pairs_mesh_count[0], total_num_threads // lanes):
-            grid = query_grid[i]
-            if grid >= 0:
-                mesh_vs_convex_cell_hits(
-                    lane,
-                    lanes,
-                    i,
-                    grid,
-                    query_lower[i],
-                    query_upper[i],
-                    query_range[i, 0],
-                    query_range[i, 1],
-                    query_slab0[i],
-                    query_slab1[i],
-                    query_slab2[i],
-                    query_slab_half[i],
-                    mesh_cells,
-                    hits,
-                    hit_count,
-                )
-
-    return narrow_phase_mesh_cell_hits_kernel
+# The pass is bound by its loads' latency: 64 registers keep more warps in flight.
+@wp.kernel(enable_backward=False, cuda_max_registers=64)
+def narrow_phase_mesh_cell_hits_kernel(
+    shape_pairs_mesh_count: wp.array[int],
+    query_lower: wp.array[wp.vec3],
+    query_upper: wp.array[wp.vec3],
+    query_range: wp.array2d[wp.vec3i],
+    query_grid: wp.array[wp.int32],
+    query_slab0: wp.array[wp.vec4],
+    query_slab1: wp.array[wp.vec4],
+    query_slab2: wp.array[wp.vec4],
+    query_slab_half: wp.array[wp.vec3],
+    mesh_cells: MeshCells,
+    total_num_threads: int,
+    # outputs
+    hits: wp.array[wp.vec2i],  # (mesh pair, cell in mesh_cells.sorted_slots)
+    hit_count: wp.array[int],
+):
+    """Midphase pass 2a of 3, one thread per mesh pair (launch ``[blocks, block_dim]``): its hit cells
+    (:func:`mesh_vs_convex_cell_hits`)."""
+    block, j = wp.tid()
+    for i in range(block * wp.block_dim() + j, shape_pairs_mesh_count[0], total_num_threads):
+        grid = query_grid[i]
+        if grid >= 0:
+            mesh_vs_convex_cell_hits(
+                i,
+                grid,
+                query_lower[i],
+                query_upper[i],
+                query_range[i, 0],
+                query_range[i, 1],
+                query_slab0[i],
+                query_slab1[i],
+                query_slab2[i],
+                query_slab_half[i],
+                mesh_cells,
+                hits,
+                hit_count,
+            )
 
 
 @wp.kernel(enable_backward=False, cuda_max_registers=64)
@@ -2084,13 +2075,6 @@ def narrow_phase_mesh_buffer_report_kernel(
         wp.printf("Warning: Mesh midphase hit buffer overflowed %d > %d.\n", hit_count[0], max_hits)
         count = wp.max(count, max_triangle_pairs + 1)
     report[0] = count
-
-
-# Threads that share one mesh pair's block lookups on CUDA (2 on the real states; 1 and 4 measured).
-_MESH_MIDPHASE_LANES = 2
-
-narrow_phase_mesh_cell_hits_kernel = _create_mesh_cell_hits_kernel(_MESH_MIDPHASE_LANES)
-narrow_phase_mesh_cell_hits_kernel_cpu = _create_mesh_cell_hits_kernel(1)
 
 
 def create_narrow_phase_process_mesh_triangle_contacts_kernel(
@@ -3887,20 +3871,21 @@ class NarrowPhase:
         num_blocks = max(min_blocks, min(candidate_blocks, max_blocks_limit))
         self.total_num_threads = self.block_dim * num_blocks
         self.num_tile_blocks = num_blocks
-        # The mesh midphase's three passes: query boxes per pair, cell candidates per pair (groups of lanes), exact
-        # tests per candidate. The cell walk is latency bound: launch for full residency, or every pair's group.
+        # The mesh midphase's passes: query boxes per pair, hit cells per pair, candidates per hit, exact tests per
+        # candidate. The cell lookups are latency bound: launch for full residency, or a thread per pair.
         if device_obj.is_cuda:
-            self._mesh_cell_kernel = narrow_phase_mesh_cell_hits_kernel
             self._mesh_midphase_block_dim = 128
-            groups_per_block = self._mesh_midphase_block_dim // _MESH_MIDPHASE_LANES
             self._mesh_midphase_blocks = max(
-                1, min((max_candidate_pairs + groups_per_block - 1) // groups_per_block, device_obj.sm_count * 32)
+                1,
+                min(
+                    (max_candidate_pairs + self._mesh_midphase_block_dim - 1) // self._mesh_midphase_block_dim,
+                    device_obj.sm_count * 32,
+                ),
             )
             self._mesh_pair_threads = max(
                 self.block_dim, min(max_candidate_pairs, device_obj.sm_count * 2048) // self.block_dim * self.block_dim
             )
         else:
-            self._mesh_cell_kernel = narrow_phase_mesh_cell_hits_kernel_cpu
             self._mesh_midphase_block_dim = 1
             self._mesh_midphase_blocks = num_blocks
             self._mesh_pair_threads = num_blocks
@@ -4690,7 +4675,7 @@ class NarrowPhase:
                         self._mesh_query_slab_half,
                     ]
                     wp.launch(
-                        kernel=self._mesh_cell_kernel,
+                        kernel=narrow_phase_mesh_cell_hits_kernel,
                         dim=[self._mesh_midphase_blocks, self._mesh_midphase_block_dim],
                         inputs=[
                             self.shape_pairs_mesh_count,
