@@ -4,7 +4,7 @@
 """An exact multi-level sparse cell index of a triangle mesh, for the mesh-vs-convex midphase.
 
 Each mesh gets one index in its unscaled local frame (the frame of its vertices), so static and moving meshes and
-every shape scale share it. Space is cut into cubic cells of edge ``h * 2**l`` at level ``l``. A triangle sits at the
+every shape scale share it. Space is cut into cubic cells of edge ``h * 4**l`` at level ``l``. A triangle sits at the
 finest level where its bounding box covers at most :data:`MAX_BOX_CELLS` cells, and registers in the cells of that
 box that its surface meets (an exact, closed triangle-box test in float64). Every triangle therefore costs at most
 :data:`MAX_BOX_CELLS` entries whatever its size, so the index is O(triangles): a 100 m ground made of two triangles, a
@@ -20,7 +20,7 @@ cells emits it from the first registered one inside the query's cell range only 
 mask: no memory).
 
 A query visits, at every occupied level, the cells under its bound's box (level-0 cell coordinates shifted right by
-``l``: ``floor(x / (h 2^l)) = floor(floor(x / h) / 2^l)``, the same identity the build uses). A point of the bound
+``2 l``: ``floor(x / (h 4^l)) = floor(floor(x / h) / 4^l)``, the same identity the build uses). A point of the bound
 that lies on a triangle lies in a visited cell where that triangle is registered, so no triangle that meets the bound
 is missed. The box is padded by more than the float32 rounding of the cell coordinates. A level whose occupied cells
 are fewer than the cells of the range walks those cells instead of looking the range up.
@@ -42,8 +42,12 @@ _LEVEL_BITS = 4
 _MAX_LEVEL = (1 << _LEVEL_BITS) - 1
 _MAX_AXIS_CELLS = 1 << 14
 
-MAX_BOX_CELLS = 32
+MAX_BOX_CELLS = 64
 """Most cells a triangle's bounding box may cover at its level (the registration mask's width)."""
+
+_LEVEL_SHIFT = 2
+MESH_CELLS_LEVEL_SHIFT = wp.constant(_LEVEL_SHIFT)
+"""Each level's cells are ``2**MESH_CELLS_LEVEL_SHIFT`` times the previous level's per axis."""
 
 MESH_CELLS_EMPTY_KEY = wp.constant(wp.uint64(0xFFFFFFFFFFFFFFFF))
 _HASH_MULTIPLIER = wp.constant(wp.uint64(0xFF51AFD7ED558CCD))
@@ -60,9 +64,9 @@ _ORIGIN_OFFSET = 0.3183098861837907
 # Relative padding of the build's closed cell boxes (float64 rounding only).
 _BUILD_PAD = 1.0e-9
 
-# Entry boxes: 16-bit coordinates relative to the cell's lower corner, in cell / 512 (a triangle's box spans at most
-# MAX_BOX_CELLS = 32 cells, well inside the +-64 cells they reach).
-_BOX_STEPS = 512.0
+# Entry boxes: 16-bit coordinates relative to the cell's lower corner, in cell / 256 (a triangle's box spans at most
+# MAX_BOX_CELLS = 64 cells, inside the +-128 cells they reach).
+_BOX_STEPS = 256.0
 MESH_CELLS_BOX_STEPS = wp.constant(_BOX_STEPS)
 
 
@@ -73,7 +77,7 @@ class MeshGrid:
     origin: wp.vec3
     """Lower corner of cell (0, 0, 0) [m]."""
     cell: float
-    """Level-0 cell edge ``h`` [m]; level ``l`` cells have edge ``h * 2**l``."""
+    """Level-0 cell edge ``h`` [m]; level ``l`` cells have edge ``h * 4**l``."""
     inv_cell: float
     """``1 / h`` [1/m]."""
     levels: int
@@ -117,10 +121,10 @@ class MeshCellTriangle:
     """Second vertex [m]."""
     v2: wp.vec3
     """Third vertex [m]."""
-    registration: wp.vec4i
-    """``(mask, x | sx << 20, y | sy << 20, z | sz << 20)``: the base cell ``(x, y, z)`` and spans of the
-    triangle's box at its level, and bit ``dx + (sx + 1) (dy + (sy + 1) dz)`` set for each box cell it registered
-    in."""
+    cells_mask: wp.uint64
+    """Bit ``dx + (sx + 1) (dy + (sy + 1) dz)`` set for each cell of its box it registered in."""
+    cells_box: wp.vec3i
+    """``(x | sx << 20, y | sy << 20, z | sz << 20)``: its box's base cell ``(x, y, z)`` at its level, and spans."""
 
 
 @wp.struct
@@ -135,7 +139,7 @@ class MeshCells:
     """The hash slots of every mesh."""
     entries: wp.array[wp.vec4i]
     """Per cell, by ascending triangle: ``(triangle, lo_x | lo_y << 16, lo_z | hi_x << 16, hi_y | hi_z << 16)``, the
-    triangle id (local to the mesh) and its box relative to the cell's lower corner, each ``32768 + 512 x / edge``."""
+    triangle id (local to the mesh) and its box relative to the cell's lower corner, each ``32768 + 256 x / edge``."""
     triangles: wp.array[MeshCellTriangle]
     """Per triangle, by mesh: its vertices and registration."""
     sorted_slots: wp.array[MeshCellSlot]
@@ -255,29 +259,36 @@ def mesh_cells_range(grid: MeshGrid, lower: wp.vec3, upper: wp.vec3) -> tuple[wp
 
 
 @wp.func
-def mesh_cells_first_in_range(registration: wp.vec4i, cell: wp.vec3i, qlo: wp.vec3i, qhi: wp.vec3i) -> bool:
+def mesh_cells_first_in_range(
+    cells_mask: wp.uint64, cells_box: wp.vec3i, cell: wp.vec3i, qlo: wp.vec3i, qhi: wp.vec3i
+) -> bool:
     """Whether ``cell`` is its triangle's first registered cell inside the query range ``[qlo, qhi]``.
 
-    ``registration`` is the triangle's :attr:`MeshCellTriangle.registration`; box cells are ordered by mask bit.
+    ``cells_mask`` and ``cells_box`` are the triangle's (:class:`MeshCellTriangle`); box cells are ordered by mask
+    bit.
     """
-    bx = registration[1] & 0xFFFFF
-    by = registration[2] & 0xFFFFF
-    bz = registration[3] & 0xFFFFF
-    nx = (registration[1] >> 20) + 1
-    ny = (registration[2] >> 20) + 1
+    bx = cells_box[0] & 0xFFFFF
+    by = cells_box[1] & 0xFFFFF
+    bz = cells_box[2] & 0xFFFFF
+    nx = (cells_box[0] >> 20) + 1
+    ny = (cells_box[1] >> 20) + 1
+    nz = (cells_box[2] >> 20) + 1
     bit = (cell[0] - bx) + nx * ((cell[1] - by) + ny * (cell[2] - bz))
-    below = wp.int64(registration[0]) & wp.int64(0xFFFFFFFF) & ((wp.int64(1) << wp.int64(bit)) - wp.int64(1))
-    if below == wp.int64(0):
+    below = cells_mask & ((wp.uint64(1) << wp.uint64(bit)) - wp.uint64(1))
+    if below == wp.uint64(0):
         return True
     # The query range inside the box, as runs of bits along x.
     x0 = wp.max(qlo[0], bx) - bx
     x1 = wp.min(qhi[0], bx + nx - 1) - bx
-    run = ((wp.int64(1) << wp.int64(x1 - x0 + 1)) - wp.int64(1)) << wp.int64(x0)
-    inside = wp.int64(0)
-    for z in range(wp.max(qlo[2], bz) - bz, wp.min(qhi[2], bz + (registration[3] >> 20)) - bz + 1):
+    width = x1 - x0 + 1
+    run = ~wp.uint64(0)
+    if width < 64:
+        run = ((wp.uint64(1) << wp.uint64(width)) - wp.uint64(1)) << wp.uint64(x0)
+    inside = wp.uint64(0)
+    for z in range(wp.max(qlo[2], bz) - bz, wp.min(qhi[2], bz + nz - 1) - bz + 1):
         for y in range(wp.max(qlo[1], by) - by, wp.min(qhi[1], by + ny - 1) - by + 1):
-            inside = inside | (run << wp.int64(nx * (y + ny * z)))
-    return (below & inside) == wp.int64(0)
+            inside = inside | (run << wp.uint64(nx * (y + ny * z)))
+    return (below & inside) == wp.uint64(0)
 
 
 @wp.func
@@ -582,13 +593,15 @@ def build_mesh_grid(points: np.ndarray, indices: np.ndarray, cell: float | None 
         open_ = np.flatnonzero(level < 0)
         if open_.size == 0:
             break
-        span = (hi0[open_] >> lvl) - (lo0[open_] >> lvl) + 1
+        shift = _LEVEL_SHIFT * lvl
+        span = (hi0[open_] >> shift) - (lo0[open_] >> shift) + 1
         level[open_[span.prod(axis=1) <= MAX_BOX_CELLS]] = lvl
     assert (level >= 0).all(), "the top level holds every triangle"
 
-    base = lo0 >> level[:, None]
-    span = (hi0 >> level[:, None]) - base  # per axis, cells - 1
-    mask = np.zeros(nt, dtype=np.int64)
+    shift = _LEVEL_SHIFT * level[:, None]
+    base = lo0 >> shift
+    span = (hi0 >> shift) - base  # per axis, cells - 1
+    mask = np.zeros(nt, dtype=np.uint64)
     keys_chunks, tri_chunks = [], []
     level_counts = {int(lv): int(cnt) for lv, cnt in zip(*np.unique(level, return_counts=True), strict=True)}
     # Every box offset (dx, dy, dz) a triangle's box can hold.
@@ -605,13 +618,13 @@ def build_mesh_grid(points: np.ndarray, indices: np.ndarray, cell: float | None 
         if t.size == 0:
             continue
         k = base[t] + d
-        size = h * np.left_shift(1, level[t]).astype(np.float64)
+        size = h * np.left_shift(1, _LEVEL_SHIFT * level[t]).astype(np.float64)
         center = o + (k + 0.5) * size[:, None]
         half = np.repeat((0.5 * size * (1.0 + _BUILD_PAD))[:, None], 3, axis=1)
         hit = _triangles_meet_boxes(a[t], b[t], c[t], center, half)
         t, k = t[hit], k[hit]
         bit = dx + (span[t, 0] + 1) * (dy + (span[t, 1] + 1) * dz)
-        mask[t] |= np.left_shift(1, bit)
+        mask[t] |= np.left_shift(np.uint64(1), bit.astype(np.uint64))
         keys_chunks.append(
             (level[t].astype(np.uint64) << np.uint64(60))
             | (k[:, 0].astype(np.uint64) << np.uint64(40))
@@ -630,7 +643,7 @@ def build_mesh_grid(points: np.ndarray, indices: np.ndarray, cell: float | None 
             continue
         k = base[t] + d
         bit = dx + (span[t, 0] + 1) * (dy + (span[t, 1] + 1) * dz)
-        mask[t] |= np.left_shift(1, bit)
+        mask[t] |= np.left_shift(np.uint64(1), bit.astype(np.uint64))
         keys_chunks.append(
             (level[t].astype(np.uint64) << np.uint64(60))
             | (k[:, 0].astype(np.uint64) << np.uint64(40))
@@ -648,7 +661,7 @@ def build_mesh_grid(points: np.ndarray, indices: np.ndarray, cell: float | None 
     entry_cell = np.stack(
         [((keys >> np.uint64(s)) & np.uint64(0xFFFFF)).astype(np.int64) for s in (40, 20, 0)], axis=1
     )
-    entry_size = h * np.left_shift(1, entry_level).astype(np.float64)
+    entry_size = h * np.left_shift(1, _LEVEL_SHIFT * entry_level).astype(np.float64)
     cell_lo = o + entry_cell * entry_size[:, None]
     q_lo = np.floor((tmin[tris] - cell_lo) / entry_size[:, None] * _BOX_STEPS) - 1
     q_hi = np.ceil((tmax[tris] - cell_lo) / entry_size[:, None] * _BOX_STEPS) + 1
@@ -698,17 +711,14 @@ def build_mesh_grid(points: np.ndarray, indices: np.ndarray, cell: float | None 
         pending = pending[~placed[pending]]
         slot[pending] = (slot[pending] + 1) & table_mask
 
-    mask32 = mask.astype(np.uint32).view(np.int32)
-    registration = np.stack(
-        [mask32, base[:, 0] | (span[:, 0] << 20), base[:, 1] | (span[:, 1] << 20), base[:, 2] | (span[:, 2] << 20)],
-        axis=1,
-    ).astype(np.int32)
+    cells_box = (base | (span << 20)).astype(np.int32)
     levels = 0
     for lvl in level_counts:
         levels |= 1 << lvl
     records = np.zeros(nt, dtype=MeshCellTriangle.numpy_dtype())
     records["v0"], records["v1"], records["v2"] = v32[:, 0], v32[:, 1], v32[:, 2]
-    records["registration"] = registration
+    records["cells_mask"] = mask
+    records["cells_box"] = cells_box
     return {
         "origin": origin,
         "cell": np.float32(h),
@@ -850,7 +860,11 @@ def build_mesh_cells(
     def packed(name, dtype, width=None):
         parts = [x for x in chunks[name] if len(x)]
         if parts:
-            return wp.array(np.concatenate(parts), dtype=dtype, device=device)
+            data = np.concatenate(parts)
+            if dtype in (MeshCellTriangle, MeshCellSlot):
+                # Concatenation packs structured fields; restore the struct's aligned layout.
+                data = data.astype(np.dtype(dtype.numpy_dtype()))
+            return wp.array(data, dtype=dtype, device=device)
         if dtype in (MeshCellTriangle, MeshCellSlot):
             empty = np.zeros(1, dtype=dtype.numpy_dtype())
             if dtype == MeshCellSlot:
