@@ -631,6 +631,7 @@ class TerrainLawShadow:
         model: A finalized model.
         classes: Partner classes to run (:func:`parse_terrain_law_shadow`); each must have a kernel.
         pairs: The collision pipeline's explicit shape pairs, or ``None`` for the model's filter.
+        surfaces: The model's law surfaces when already classified (:class:`TerrainSurfaces`), or ``None``.
         status: The narrow phase's sticky buffer status word, or ``None`` for one of the shadow's own.
         spill_rows: Rows of the spill region, or ``None`` for :meth:`default_spill_rows` (from the listed pairs'
             bounds on their rows).
@@ -644,6 +645,7 @@ class TerrainLawShadow:
         classes,
         *,
         pairs=None,
+        surfaces: TerrainSurfaces | None = None,
         status: wp.array | None = None,
         spill_rows: int | None = None,
         job_scale: float | None = None,
@@ -656,7 +658,7 @@ class TerrainLawShadow:
             raise ValueError(f"The terrain law has no kernel for partner classes {missing}")
         if job_scale is not None and not (np.isfinite(float(job_scale)) and float(job_scale) > 0.0):
             raise ValueError(f"The terrain law's job capacities need a positive finite factor, not {job_scale!r}")
-        self.surfaces = TerrainSurfaces(model)
+        self.surfaces = TerrainSurfaces(model) if surfaces is None else surfaces
         """The shapes the law reads as surfaces: heightfields and the static meshes it reads whole."""
         self.shape_surface = wp.array(
             self.surfaces.shape_surface if model.shape_count else np.full(1, -1, np.int32),
