@@ -55,7 +55,7 @@ def _grid_mesh(z, hx, hy):
 
 
 def _stairs_mesh():
-    """Two stair treads with a riser on a lattice line, as closed boxes (the law cannot read risers yet)."""
+    """Two stair treads with a riser on a lattice line, as closed boxes (walls, bottoms and a riser: not read yet)."""
 
     def box(x0, x1, y0, y1, z0, z1):
         p = np.array([[x, y, zz] for zz in (z0, z1) for y in (y0, y1) for x in (x0, x1)], np.float32)
@@ -150,10 +150,22 @@ def test_mesh_with_risers_keeps_mesh_path(test, device):
     surfaces = TerrainSurfaces(model)
     test.assertEqual(surfaces.mesh_shapes, [])
     test.assertEqual(int(surfaces.shape_surface[terrain]), -1)
-    test.assertIn("riser", surfaces.mesh_reasons[terrain])
+    test.assertIn("not a height sheet", surfaces.mesh_reasons[terrain])
     pipeline, contacts, _rows = _law_rows(model)
     test.assertFalse(pipeline._terrain_law_writes)
     test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+
+
+def test_closed_box_keeps_mesh_path(test, device):
+    """A static closed box has a lattice of one cell, but bodies pass under it: the law's solid would fill that space."""
+    vertices, triangles = _stairs_mesh()
+    vertices, triangles = vertices[:8], triangles[:12]
+    builder = newton.ModelBuilder()
+    terrain = builder.add_shape_mesh(-1, mesh=newton.Mesh(vertices, triangles, compute_inertia=False))
+    model = builder.finalize(device=device)
+    surfaces = TerrainSurfaces(model)
+    test.assertEqual(int(surfaces.shape_surface[terrain]), -1)
+    test.assertIn("not a height sheet", surfaces.mesh_reasons[terrain])
 
 
 def test_mesh_without_lattice_keeps_mesh_path(test, device):
@@ -162,6 +174,10 @@ def test_mesh_without_lattice_keeps_mesh_path(test, device):
     vertices = rng.uniform(-1.0, 1.0, (300, 3)).astype(np.float32)
     vertices[:, 2] *= 0.05
     triangles = rng.integers(0, 300, (100, 3)).astype(np.int32)
+    # every triangle up-facing, so that the soup is a "sheet" the lattice test must reject
+    p = vertices[triangles]
+    down = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])[:, 2] < 0.0
+    triangles[down] = triangles[down][:, ::-1]
     builder = newton.ModelBuilder()
     terrain = builder.add_shape_mesh(-1, mesh=newton.Mesh(vertices, triangles, compute_inertia=False))
     model = builder.finalize(device=device)
@@ -183,6 +199,9 @@ add_function_test(
 )
 add_function_test(
     TestTerrainLawMesh, "test_mesh_with_risers_keeps_mesh_path", test_mesh_with_risers_keeps_mesh_path, devices=devices
+)
+add_function_test(
+    TestTerrainLawMesh, "test_closed_box_keeps_mesh_path", test_closed_box_keeps_mesh_path, devices=devices
 )
 add_function_test(
     TestTerrainLawMesh,
