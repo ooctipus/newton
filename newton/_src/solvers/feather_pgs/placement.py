@@ -519,12 +519,14 @@ class Placement:
 
     def follow_contacts(self, contacts: Contacts) -> None:
         """Hold at least ``contacts``' rigid rows, and grow with the pool of a pipeline's buffer from now on (staged where
-        the model holds articulations, whose rows own a contact pool)."""
+        the model holds articulations, whose rows own a contact pool). A fixed buffer's count, which keeps every contact
+        its pass found, is clamped to its rows first: the solver reads every row below the count."""
         pool = self.contact_pool
         rows = contacts._rigid_contact_rows
         try:
             source = getattr(contacts, "_rigid_contact_pool", None)
             if source is not None:
+                source.clamp_count(contacts.rigid_contact_count)
                 source.follow(pool)
             if rows > pool.ready:
                 pool.grow(rows)

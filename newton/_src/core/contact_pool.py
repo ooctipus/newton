@@ -109,9 +109,10 @@ virtual memory to bind, or rows that growth reallocates.
 :meth:`ContactPool.service` reports that such graphs must be recaptured once
 the pool holds more rows than they were captured with.
 
-Fixed buffers: a pool built ``fixed`` holds its initial rows for good, as Newton's contact buffers do: it
-publishes no more, grows no more from demand and never trims, and writers drop the contacts past its rows and
-flag the drop. This is the default: a :class:`~newton.CollisionPipeline` holds its resolved ``rigid_contact_max``
+Fixed buffers: a pool built ``fixed`` holds its initial rows for good, as Newton's contact buffers do: ordinary
+arrays, which publish no more rows, grow no more from demand and never trim; writers drop the contacts past the
+rows and flag the drop, and the count keeps every contact found (consumers read ``min(count, rows)``). This is the
+default: a :class:`~newton.CollisionPipeline` holds its resolved ``rigid_contact_max``
 rows in a fixed pool of its own, and a :class:`~newton.Contacts` built directly holds its rows so. Only a pipeline
 built with ``growable_contacts=True``, for a solver that follows the rows (FeatherPGS), shares the model's pool
 (:func:`model_contact_pool`), which grows from demand as above. Readers that keep per-contact buffers of their
@@ -364,6 +365,7 @@ def _record_demand(
     status: wp.array[wp.int32],
     record_drops: int,
     beat: int,
+    clamp: int,
 ):
     demand = count[0]
     rows = ready_rows[0]
@@ -421,10 +423,18 @@ def _record_demand(
     if rows_used.shape[0] > 0:
         wp.atomic_max(rows_used, 0, held)
     if demand > rows:
-        # Writers dropped the rows past the ready rows: consumers read every row below the count.
-        count[0] = rows
+        # Writers dropped the rows past the ready rows. A growable stream's consumers read every row below its
+        # count, which holds the rows; a fixed stream keeps every contact counted, as Newton's buffers do, and its
+        # consumers read the rows below min(count, rows).
+        if clamp != 0:
+            count[0] = rows
         if status.shape[0] > 0:
             wp.atomic_or(status, 0, CAPACITY_OVERFLOW)
+
+
+@wp.kernel(enable_backward=False)
+def _clamp_count(count: wp.array[wp.int32], rows: int):
+    count[0] = wp.min(count[0], rows)
 
 
 @dataclass(frozen=True)
@@ -604,9 +614,10 @@ class ContactRows:
             memory, the addresses each field reserves.
         device: The device of the fields.
         on_rows: Called with the rows after creation and every growth or trim.
+        virtual: Whether the rows may be CUDA virtual memory; ``False`` keeps ordinary arrays (a fixed pool's).
     """
 
-    def __init__(self, fields, *, rows: int, reserve: int, device, on_rows=None):
+    def __init__(self, fields, *, rows: int, reserve: int, device, on_rows=None, virtual: bool = True):
         self.fields = tuple(fields)
         self.rows = int(rows)
         self.reserve = int(reserve)
@@ -618,7 +629,7 @@ class ContactRows:
         # Arrays a reallocating growth replaced, with the graphs alive then (weakly): a stale replay of one of them
         # may still address the arrays, which live until every such graph is gone (_prune_superseded).
         self._superseded: list[tuple[tuple[weakref.ReferenceType, ...], list[wp.array]]] = []
-        self._vm = _virtual_rows(self.device, self.fields)
+        self._vm = _virtual_rows(self.device, self.fields) if virtual else None
         if self._vm is not None:
             self._mode = "virtual"
             self._allocate_virtual()
@@ -886,8 +897,9 @@ class ContactPool:
         device: The device of the buffers.
         rows: Initial ready rows; defaults to :data:`MIN_READY_ROWS`. Fewer rows also lower the floor a trim
             stops at to them: a model whose pairs can make fewer contacts holds no more.
-        fixed: Hold ``rows`` for good, as a fixed buffer: publish no more, grow no more from demand and never
-            trim; writers drop the contacts past them and flag the drop.
+        fixed: Hold ``rows`` for good in ordinary arrays, as a fixed buffer: publish no more, grow no more from
+            demand and never trim; writers drop the contacts past them and flag the drop, and the count keeps every
+            contact found.
         worlds: The worlds whose contacts the rows hold, each with a status of the contacts it dropped
             (:meth:`drops`); contacts of no world, or between two global shapes, share one more.
     """
@@ -1079,7 +1091,9 @@ class ContactPool:
                 f"{self.device} cannot back {self.ready} rigid contact rows of {row_bytes} bytes: it holds at most "
                 f"{bound}"
             )
-        rows = ContactRows(fields, rows=self.ready, reserve=bound, device=self.device, on_rows=on_rows)
+        rows = ContactRows(
+            fields, rows=self.ready, reserve=bound, device=self.device, on_rows=on_rows, virtual=not self.fixed
+        )
         self._members.append(weakref.ref(rows))
         self._bound = bound
         return rows
@@ -1112,6 +1126,13 @@ class ContactPool:
         self.ready = int(rows)
         if self.ready_rows is not None:
             self.ready_rows.fill_(self.ready)
+
+    def clamp_count(self, count: wp.array) -> None:
+        """Clamp a fixed stream's ``count`` (int32, shape 1) to its rows in stream order, for a consumer that reads
+        every row below the count, as a growable stream's consumers do; a growable stream's count holds its rows
+        already. Launches nothing for a growable pool."""
+        if self.fixed:
+            wp.launch(_clamp_count, dim=1, inputs=[count, self.ready], device=self.device, record_tape=False)
 
     def follow(self, other: ContactPool) -> None:
         """Make ``other`` grow with this pool: its rows stay at least this pool's ready rows.
@@ -1254,15 +1275,16 @@ class ContactPool:
         drops: bool = True,
         beat: bool = True,
     ) -> None:
-        """Record a pass's contact count as demand, then clamp it to the rows the writers held.
+        """Record a pass's contact count as demand, then clamp a growable stream's count to the rows the writers held.
 
         One launch, which graph capture records: it raises the sticky high-water
         mark and writes it, the pass's count, the forecast of a forecasting pass,
         the pass's fill and the contacts it dropped into the pinned host copy (a
         pool created during capture records no demand), picks whether the next
         pass forecasts, and when the count exceeds ``rows`` (the writers dropped
-        the rows past them) sets it to ``rows`` and :data:`CAPACITY_OVERFLOW` in
-        ``status``.
+        the rows past them) sets :data:`CAPACITY_OVERFLOW` in ``status`` and,
+        unless the pool is :attr:`fixed` (whose count keeps every contact found,
+        as Newton's buffers do), the count to ``rows``.
 
         Args:
             count: The pass's contact count (int32, shape 1), written by its writers.
@@ -1299,6 +1321,7 @@ class ContactPool:
                 int(drops),
                 # A fixed buffer forecasts nothing: no demand grows it.
                 int(beat and not self.fixed),
+                int(not self.fixed),
             ],
             device=self.device,
             record_tape=False,
